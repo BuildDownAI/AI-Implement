@@ -8,6 +8,7 @@ import { ConfiguredRunError, hasConfiguredIntent, prepareConfiguredRun, validate
 import { ClaudeCliExecutor } from "./pipeline/executor.js";
 import type { InvocationAttributionV1, InvokeParams, LLMResult } from "./pipeline/types.js";
 import { DEFAULT_MODEL } from "./pipeline/default-model.js";
+import { installSkills, skillAgentsForSnapshot } from "./pipeline/steps/install-skills.js";
 import { setupPlanningWritePolicy, type PlanningWritePolicy } from "./planning-write-policy.js";
 
 export type PlanningExecutor = (
@@ -94,6 +95,23 @@ function describeConfiguredFailure(err: unknown): string {
   const category =
     (err instanceof ConfiguredRunError ? safeCategory(e?.reason) : null) ?? safeCategory(e?.category) ?? safeCategory(e?.code) ?? "executor_error";
   return `Configured planning failed (${category})`;
+}
+
+/**
+ * Installs the selected project skills before any planning executor starts. The runner's `GITHUB_TOKEN` reaches only
+ * the clone child (through `gitProcessEnv`), never a model process. Bounded and non-fatal: failures only warn.
+ */
+function installPlanningSkills(skillsRepo: string | undefined, snapshot: ResolvedAgentSnapshotV1 | undefined): void {
+  if (!skillsRepo) return;
+  try {
+    installSkills({
+      skillsRepoUrl: skillsRepo,
+      githubToken: process.env.GITHUB_TOKEN?.trim() ?? "",
+      agents: skillAgentsForSnapshot(snapshot),
+    });
+  } catch {
+    // installSkills does not throw; planning must proceed regardless.
+  }
 }
 
 const INVALID_SNAPSHOT_REASON = "Configured planning failed (invalid_snapshot)";
@@ -206,6 +224,8 @@ export interface RunPlanningLocalOptions {
   executor?: PlanningExecutor;
   /** Resolved stage snapshot (AII-944). Present = configured run; absent = legacy behavior. */
   agentConfig?: ResolvedAgentSnapshotV1;
+  /** Project skills repository (envelope `skillsRepo`); absent = no install. */
+  skillsRepo?: string;
   /**
    * Local configured-run sources (protected credential port, injected client, trust, Codex seam), validated by the
    * shared `prepareConfiguredRun`. A snapshot without a source fails closed. An injected `modelAuthClient` stays
@@ -259,6 +279,7 @@ export async function runPlanningLocally(
     if (parsed.frontMatter.model) model = opts.model ?? parsed.frontMatter.model;
     if (parsed.body.trim()) prompt = parsed.body;
   }
+  installPlanningSkills(opts.skillsRepo, opts.agentConfig);
   if (configured) {
     const outcome = await invokeConfiguredPlanning({
       workspaceDir: opts.workspaceDir,
@@ -351,6 +372,7 @@ export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exit
   let envelopePlanningContext: { parent?: string; siblings?: string; dependencies?: string } | undefined;
   let envelopeCallbackUrl: string | undefined;
   let agentConfig: ResolvedAgentSnapshotV1 | undefined;
+  let skillsRepo: string | undefined;
   let malformedConfiguredIntent = false;
   const rawConfig = process.env.AI_IMPLEMENT_RUN_CONFIG;
   if (rawConfig) {
@@ -360,6 +382,7 @@ export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exit
       if (cfg.planningContext) envelopePlanningContext = cfg.planningContext;
       envelopeCallbackUrl = cfg.runnerCallbackUrl;
       agentConfig = cfg.agentConfig;
+      skillsRepo = cfg.skillsRepo;
     } catch {
       // Malformed envelope: fall back to env vars without failing — unless it shows configured intent (an
       // `agentConfig` or a protected grant), which is authoritative and must never degrade to legacy execution.
@@ -415,6 +438,7 @@ export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exit
     if (parsed.frontMatter.model) model = process.env.CLAUDE_MODEL || parsed.frontMatter.model;
     if (parsed.body.trim()) prompt = parsed.body;
   }
+  installPlanningSkills(skillsRepo, agentConfig);
   if (configured) {
     const outcome = await invokeConfiguredPlanning({ workspaceDir, prompt, configured, spawnImpl: opts.spawnImpl, ownsLifecycle: true });
     if (!outcome.ok) return failConfigured(outcome.reason);

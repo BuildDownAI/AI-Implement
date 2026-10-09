@@ -40,6 +40,7 @@ export async function runLocalPlanningFromEnv(
     ...(config.planningContext?.parent !== undefined ? { parent: config.planningContext.parent } : {}),
     ...(config.planningContext?.siblings !== undefined ? { siblings: config.planningContext.siblings } : {}),
     ...(config.planningContext?.dependencies !== undefined ? { dependencies: config.planningContext.dependencies } : {}),
+    ...(config.skillsRepo ? { skillsRepo: config.skillsRepo } : {}),
     ...(config.agentConfig ? { agentConfig: config.agentConfig } : {}),
     ...(deps.configured ? { configured: deps.configured } : {}),
   });

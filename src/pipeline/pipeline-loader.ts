@@ -5,6 +5,7 @@ import type { PipelineContext, PipelineDefinition, StepDefinition, StepType } fr
 import { resolveModule, type ResolveModuleOptions } from "./resolve-module.js";
 import { buildIssueBranchName } from "./branch-name.js";
 import { readCodeRepoFromSourcesYml, readSecondaryReposFromSourcesYml } from "./steps/kg-tracker-data.js";
+import { skillAgentsForSnapshot } from "./steps/install-skills.js";
 import type { ReferenceRepoResult } from "../reference-repos.js";
 
 const VALID_STEP_TYPES = new Set<StepType>([
@@ -171,6 +172,7 @@ function applyWiring(step: YamlStep): StepDefinition {
         inputs: (ctx: PipelineContext) => ({
           skillsRepoUrl: ctx.data.skillsRepo ?? "",
           githubToken: ctx.getOutputs("clone").githubToken,
+          agents: skillAgentsForSnapshot(ctx.data.agentConfig),
         }),
         skip: (ctx: PipelineContext) => !ctx.data.skillsRepo,
       };

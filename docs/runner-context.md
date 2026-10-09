@@ -36,13 +36,13 @@ Each setting below is documented in the same shape — what it gives a run, the 
 
 | Setting | `implementation` | `gap-analysis` | `planning` | `kg-refresh` |
 |---------|------------------|----------------|------------|--------------|
-| Skills repository | applied | applied | ignored | ignored |
+| Skills repository | applied | applied | installed (not yet usable) | ignored |
 | Dependency token scope | applied | applied | not sent | applied |
 | Reference repositories | applied | applied | not sent | not sent |
 
 Gap-analysis shares the implementation entry module — it is an implementation run with `prNumber` set — so the two columns will agree for any setting added here.
 
-**Planning applies nothing on this page.** `run-planning.js` invokes Claude directly and runs no pipeline, so there is no step to consume anything. The settings reach that boundary differently: dependency token scope and reference repositories are both guarded out of the planning envelope at dispatch, while a skills repository is encoded into it and then never read. Treat neither as a bug to fix in passing — giving planning access to pipeline-provided capabilities is tracked work with a wider scope than dropping a field.
+**Planning installs skills but applies nothing else on this page.** `run-planning.js` invokes the agent directly and runs no pipeline, so dependency token scope and reference repositories are guarded out of the planning envelope at dispatch. Both planning entry points do install the selected skills before the planning executor starts. They cannot be used yet: Claude planning denies the `Skill` tool and passes `--disable-slash-commands` (AII-1169 changes that policy), and the Codex app-server runs with an empty view `HOME` (AII-1163 changes that). Treat neither as a bug to fix in passing.
 
 **kg-refresh runs its own pipeline** (`pipelines/kg-refresh.yml`), which includes `dependency-auth` but neither `install-skills` nor `reference-repos`. Reference repositories are additionally guarded out of its envelope, so that phase never receives the field at all. Its dependency token is not optional in the way the table suggests: a later step depends on it, and `docs/issueless-runs.md` §5 covers that rail.
 
@@ -75,7 +75,7 @@ Discovery is deliberately shallow. Three roots are scanned exactly one level dee
 
 A repository may use more than one root, and the first root wins on a name collision. Arbitrary nesting is not scanned — that keeps the copy deterministic and avoids pulling `SKILL.md` files out of test fixtures or vendored dependencies.
 
-Each skill directory is copied to `$HOME/.claude/skills/<name>` with `force: true`. An installed skill therefore **overwrites** a same-named skill already present in the image. The temporary clone is removed in a `finally` block.
+Each skill directory is copied with `force: true` to `$HOME/.claude/skills/<name>` for Claude and `$HOME/.agents/skills/<name>` for Codex, chosen from the stage snapshot's agents (Claude only on legacy runs with no snapshot). An installed skill therefore **overwrites** a same-named skill already present in the image. The temporary clone is removed in a `finally` block.
 
 **What enabling it costs.** One named repository, cloned read-only into a directory that is deleted when the step ends. The cost is the overwrite: a skills repository shipping a name the image already uses replaces it silently for that run.
 
@@ -160,7 +160,7 @@ A missing repository never fails the run or changes its classification. That is 
 
 - **Dependency token scope is silently inert on a legacy-contract repository.** The setting saves, displays, and does nothing. The admin interface does not distinguish, so the only way to know is the target repository's workflow contract.
 - **Reference repositories are also inert on legacy-contract repositories.** The field is envelope-only; no dispatch input and no environment variable carry it, so the step never receives entries on a legacy workflow.
-- **A skills repository is encoded into every envelope, including phases that ignore it.** An envelope carrying `skillsRepo` proves nothing about whether the run will use it; the phase table above is what decides.
+- **An installed skill is not necessarily a usable one.** Planning installs skills, but Claude planning denies the `Skill` tool and Codex planning sees an empty `HOME`; the phase table above says what a phase can use.
 - **Both steps report success while doing nothing.** `install-skills` returns zero installed on every failure path, and `dependency-auth` returns `acquired: false`. Neither fails its step, so the `[skills]` and `[dependency-auth]` log lines are the only evidence a setting took effect.
 - **A skills repository can overwrite a skill the image ships.** The copy is forced and keyed on directory name, with no warning on collision.
 - **A missing reference repository does not fail the run.** The step records a cause and continues. The agent receives a prompt telling it the repository is unavailable; whether that makes the output wrong is the issue author's problem to anticipate, not the pipeline's to prevent.

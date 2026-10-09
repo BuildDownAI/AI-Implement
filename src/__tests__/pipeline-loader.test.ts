@@ -182,6 +182,14 @@ describe("loadPipelineDefinition", () => {
     const inputs = ctxWithSkills.resolveInputs(step.inputs);
     expect(inputs.skillsRepoUrl).toBe("https://github.com/org/skills");
     expect(inputs.githubToken).toBe("tok");
+    expect(inputs.agents).toEqual(["claude"]);
+
+    const ctxCodex = makeContext({
+      skillsRepo: "https://github.com/org/skills",
+      agentConfig: { stages: { implement: { agent: "codex" } } } as never,
+    });
+    ctxCodex.setOutputs("clone", { githubToken: "tok" });
+    expect(ctxCodex.resolveInputs(step.inputs).agents).toEqual(["codex"]);
   });
 
   it("applies install input wiring from clone outputs", () => {
