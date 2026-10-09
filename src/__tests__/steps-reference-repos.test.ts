@@ -1,37 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import {
-  mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { referenceReposStep } from "../pipeline/steps/reference-repos.js";
 import type { SpawnSyncFn } from "../pipeline/steps/reference-repos.js";
-import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
-import type { LLMExecutor } from "../pipeline/types.js";
 import type { ReferenceRepo } from "../reference-repos.js";
-
-const noopExec: LLMExecutor = {
-  async invoke() {
-    return { stdout: "", exitCode: 0, tokensUsed: 0 };
-  },
-};
-
-function ctx() {
-  return new DefaultPipelineContext(
-    {
-      jobId: 1,
-      issueId: "i",
-      issueIdentifier: "AII-1",
-      issueTitle: "T",
-      issueDescription: "D",
-      nonce: "n",
-      orchestratorUrl: "",
-    },
-    noopExec,
-  );
-}
+import { makeContext } from "./helpers/builders.js";
+import { fakeFetch, type Reply } from "./helpers/fake-fetch.js";
+import { testDir } from "./helpers/test-dir.js";
 
 function git(args: string[], cwd: string): string {
   const result = spawnSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
@@ -42,7 +19,7 @@ function git(args: string[], cwd: string): string {
 }
 
 function makeRepo(files: Record<string, string> = { "README.md": "hello" }): string {
-  const repoDir = mkdtempSync(join(tmpdir(), "ref-repo-"));
+  const repoDir = testDir("ref-repo");
   git(["init"], repoDir);
   git(["config", "user.email", "test@test.com"], repoDir);
   git(["config", "user.name", "Test"], repoDir);
@@ -82,26 +59,25 @@ function makeRedirectingSpawnSync(urlMap: Map<string, string>): SpawnSyncFn {
   };
 }
 
-/** Make a fetch mock that returns a single public-auth owner entry. */
-function mockPublicFetch(owner: string): typeof fetch {
-  return async () =>
-    new Response(
-      JSON.stringify({ owners: [{ owner, token: null, expiresAt: null, authMode: "public" }] }),
-      { status: 200, headers: { "Content-Type": "application/json" } },
-    );
+/** The orchestrator's reference-token endpoint, answering every request with `reply`. */
+function tokenEndpoint(reply: Reply): typeof fetch {
+  return fakeFetch({ "POST /api/runner/reference-token": reply }).fetch;
 }
 
-/** Make a fetch mock that returns a 403. */
-function mockFetchFail(): typeof fetch {
-  return async () => new Response(JSON.stringify({ error: "Unauthorized" }), { status: 403 });
+/** A reference-token endpoint that returns a single public-auth owner entry. */
+function publicTokenEndpoint(owner: string): typeof fetch {
+  return tokenEndpoint({ json: { owners: [{ owner, token: null, expiresAt: null, authMode: "public" }] } });
+}
+
+/** A reference-token endpoint that refuses the run's credential. */
+function rejectingTokenEndpoint(): typeof fetch {
+  return tokenEndpoint({ status: 403, json: { error: "Unauthorized" } });
 }
 
 let workspaceDir: string;
-let extraDirs: string[];
 
 beforeEach(() => {
-  workspaceDir = mkdtempSync(join(tmpdir(), "ref-workspace-"));
-  extraDirs = [];
+  workspaceDir = testDir("ref-workspace");
   // Initialize a git repo in the workspace so appendExcludePaths can write .git/info/exclude
   git(["init"], workspaceDir);
   git(["config", "user.email", "test@test.com"], workspaceDir);
@@ -113,16 +89,12 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env.WORKSPACE_DIR;
   delete process.env.RUN_PROGRESS_TOKEN;
-  try { rmSync(workspaceDir, { recursive: true, force: true }); } catch { /* ignore */ }
-  for (const dir of extraDirs) {
-    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
-  }
 });
 
 describe("referenceReposStep", () => {
   it("skips when referenceRepos is undefined", async () => {
     const out = await referenceReposStep.run(
-      ctx(),
+      makeContext(),
       { referenceRepos: undefined, callbackUrl: "http://localhost:8080" },
       new NoopStepReporter(),
     );
@@ -131,7 +103,7 @@ describe("referenceReposStep", () => {
 
   it("skips when referenceRepos is empty array", async () => {
     const out = await referenceReposStep.run(
-      ctx(),
+      makeContext(),
       { referenceRepos: [], callbackUrl: "http://localhost:8080" },
       new NoopStepReporter(),
     );
@@ -142,7 +114,7 @@ describe("referenceReposStep", () => {
     delete process.env.RUN_PROGRESS_TOKEN;
     const entries: ReferenceRepo[] = [{ repo: "https://github.com/acme/lib", path: "refs/lib" }];
     const out = await referenceReposStep.run(
-      ctx(),
+      makeContext(),
       { referenceRepos: entries, callbackUrl: "http://localhost:8080" },
       new NoopStepReporter(),
     );
@@ -152,7 +124,7 @@ describe("referenceReposStep", () => {
   it("skips when callbackUrl is not set", async () => {
     const entries: ReferenceRepo[] = [{ repo: "https://github.com/acme/lib", path: "refs/lib" }];
     const out = await referenceReposStep.run(
-      ctx(),
+      makeContext(),
       { referenceRepos: entries, callbackUrl: null },
       new NoopStepReporter(),
     );
@@ -161,17 +133,16 @@ describe("referenceReposStep", () => {
 
   it("clones to declared path on default branch", async () => {
     const repoDir = makeRepo({ "README.md": "hello from default branch" });
-    extraDirs.push(repoDir);
     const ghUrl = "https://github.com/acme/lib";
     const entries: ReferenceRepo[] = [{ repo: ghUrl, path: "refs/lib" }];
     const urlMap = new Map([[ghUrl, repoDir]]);
 
     const out = await referenceReposStep.run(
-      ctx(),
+      makeContext(),
       {
         referenceRepos: entries,
         callbackUrl: "http://localhost:8080",
-        fetchImpl: mockPublicFetch("acme"),
+        fetchImpl: publicTokenEndpoint("acme"),
         spawnSyncImpl: makeRedirectingSpawnSync(urlMap),
       },
       new NoopStepReporter(),
@@ -186,7 +157,6 @@ describe("referenceReposStep", () => {
 
   it("clones the correct branch when ref is a branch name", async () => {
     const repoDir = makeRepo({ "main.txt": "main content" });
-    extraDirs.push(repoDir);
     git(["checkout", "-b", "feature-x"], repoDir);
     writeFileSync(join(repoDir, "feature.txt"), "feature content");
     git(["add", "."], repoDir);
@@ -197,11 +167,11 @@ describe("referenceReposStep", () => {
     const urlMap = new Map([[ghUrl, repoDir]]);
 
     const out = await referenceReposStep.run(
-      ctx(),
+      makeContext(),
       {
         referenceRepos: entries,
         callbackUrl: "http://localhost:8080",
-        fetchImpl: mockPublicFetch("acme"),
+        fetchImpl: publicTokenEndpoint("acme"),
         spawnSyncImpl: makeRedirectingSpawnSync(urlMap),
       },
       new NoopStepReporter(),
@@ -213,7 +183,6 @@ describe("referenceReposStep", () => {
 
   it("clones the correct commit when ref is a 40-char SHA", async () => {
     const repoDir = makeRepo({ "first.txt": "first" });
-    extraDirs.push(repoDir);
     const sha = git(["rev-parse", "HEAD"], repoDir);
     writeFileSync(join(repoDir, "second.txt"), "second");
     git(["add", "."], repoDir);
@@ -224,11 +193,11 @@ describe("referenceReposStep", () => {
     const urlMap = new Map([[ghUrl, repoDir]]);
 
     const out = await referenceReposStep.run(
-      ctx(),
+      makeContext(),
       {
         referenceRepos: entries,
         callbackUrl: "http://localhost:8080",
-        fetchImpl: mockPublicFetch("acme"),
+        fetchImpl: publicTokenEndpoint("acme"),
         spawnSyncImpl: makeRedirectingSpawnSync(urlMap),
       },
       new NoopStepReporter(),
@@ -242,22 +211,17 @@ describe("referenceReposStep", () => {
 
   it("credential does not persist in clone .git/config or remote.origin.url", async () => {
     const repoDir = makeRepo();
-    extraDirs.push(repoDir);
     const ghUrl = "https://github.com/acme/lib";
     const entries: ReferenceRepo[] = [{ repo: ghUrl, path: "refs/clean" }];
     const urlMap = new Map([[ghUrl, repoDir]]);
 
     // Provide a token to verify it doesn't end up in the clone
-    const fetchImplWithToken: typeof fetch = async () =>
-      new Response(
-        JSON.stringify({
-          owners: [{ owner: "acme", token: "secret-token-xyz", expiresAt: "2030-01-01T00:00:00Z", authMode: "installation" }],
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
+    const fetchImplWithToken = tokenEndpoint({
+      json: { owners: [{ owner: "acme", token: "secret-token-xyz", expiresAt: "2030-01-01T00:00:00Z", authMode: "installation" }] },
+    });
 
     await referenceReposStep.run(
-      ctx(),
+      makeContext(),
       {
         referenceRepos: entries,
         callbackUrl: "http://localhost:8080",
@@ -279,17 +243,16 @@ describe("referenceReposStep", () => {
 
   it("appends cloned path to .git/info/exclude", async () => {
     const repoDir = makeRepo();
-    extraDirs.push(repoDir);
     const ghUrl = "https://github.com/acme/lib";
     const entries: ReferenceRepo[] = [{ repo: ghUrl, path: "refs/excluded" }];
     const urlMap = new Map([[ghUrl, repoDir]]);
 
     await referenceReposStep.run(
-      ctx(),
+      makeContext(),
       {
         referenceRepos: entries,
         callbackUrl: "http://localhost:8080",
-        fetchImpl: mockPublicFetch("acme"),
+        fetchImpl: publicTokenEndpoint("acme"),
         spawnSyncImpl: makeRedirectingSpawnSync(urlMap),
       },
       new NoopStepReporter(),
@@ -301,17 +264,16 @@ describe("referenceReposStep", () => {
 
   it("staging everything in workspace does not include cloned path", async () => {
     const repoDir = makeRepo({ "file.txt": "content" });
-    extraDirs.push(repoDir);
     const ghUrl = "https://github.com/acme/lib";
     const entries: ReferenceRepo[] = [{ repo: ghUrl, path: "refs/staged-test" }];
     const urlMap = new Map([[ghUrl, repoDir]]);
 
     await referenceReposStep.run(
-      ctx(),
+      makeContext(),
       {
         referenceRepos: entries,
         callbackUrl: "http://localhost:8080",
-        fetchImpl: mockPublicFetch("acme"),
+        fetchImpl: publicTokenEndpoint("acme"),
         spawnSyncImpl: makeRedirectingSpawnSync(urlMap),
       },
       new NoopStepReporter(),
@@ -346,11 +308,11 @@ describe("referenceReposStep", () => {
 
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const out = await referenceReposStep.run(
-      ctx(),
+      makeContext(),
       {
         referenceRepos: entries,
         callbackUrl: "http://localhost:8080",
-        fetchImpl: mockPublicFetch("acme"),
+        fetchImpl: publicTokenEndpoint("acme"),
         spawnSyncImpl: failingSpawn,
       },
       new NoopStepReporter(),
@@ -363,7 +325,6 @@ describe("referenceReposStep", () => {
 
   it("processes subsequent entries after one fails", async () => {
     const goodRepo = makeRepo({ "good.txt": "yes" });
-    extraDirs.push(goodRepo);
 
     const badGhUrl = "https://github.com/acme/bad";
     const goodGhUrl = "https://github.com/acme/good";
@@ -385,15 +346,11 @@ describe("referenceReposStep", () => {
       return redirectSpawn(cmd, args, opts);
     };
 
-    const fetchImpl: typeof fetch = async () =>
-      new Response(
-        JSON.stringify({ owners: [{ owner: "acme", token: null, expiresAt: null, authMode: "public" }] }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
+    const fetchImpl = publicTokenEndpoint("acme");
 
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const out = await referenceReposStep.run(
-      ctx(),
+      makeContext(),
       { referenceRepos: entries, callbackUrl: "http://localhost:8080", fetchImpl, spawnSyncImpl: spawnFn },
       new NoopStepReporter(),
     );
@@ -407,7 +364,6 @@ describe("referenceReposStep", () => {
 
   it("token fetch failure is non-fatal: proceeds (without credentials)", async () => {
     const repoDir = makeRepo({ "pub.txt": "public" });
-    extraDirs.push(repoDir);
 
     const ghUrl = "https://github.com/acme/lib";
     const entries: ReferenceRepo[] = [{ repo: ghUrl, path: "refs/public" }];
@@ -415,11 +371,11 @@ describe("referenceReposStep", () => {
 
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const out = await referenceReposStep.run(
-      ctx(),
+      makeContext(),
       {
         referenceRepos: entries,
         callbackUrl: "http://localhost:8080",
-        fetchImpl: mockFetchFail(),
+        fetchImpl: rejectingTokenEndpoint(),
         spawnSyncImpl: makeRedirectingSpawnSync(urlMap),
       },
       new NoopStepReporter(),
@@ -433,15 +389,11 @@ describe("referenceReposStep", () => {
   it("owner with authMode: error skips clone and reports token-error cause", async () => {
     const entries: ReferenceRepo[] = [{ repo: "https://github.com/acme/lib", path: "refs/err" }];
 
-    const fetchImpl: typeof fetch = async () =>
-      new Response(
-        JSON.stringify({ owners: [{ owner: "acme", token: null, expiresAt: null, authMode: "error" }] }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
+    const fetchImpl = tokenEndpoint({ json: { owners: [{ owner: "acme", token: null, expiresAt: null, authMode: "error" }] } });
 
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const out = await referenceReposStep.run(
-      ctx(),
+      makeContext(),
       { referenceRepos: entries, callbackUrl: "http://localhost:8080", fetchImpl },
       new NoopStepReporter(),
     );
@@ -454,17 +406,16 @@ describe("referenceReposStep", () => {
 
   it("result carries the declared repo, path, ref, and arrived flag", async () => {
     const repoDir = makeRepo();
-    extraDirs.push(repoDir);
     const ghUrl = "https://github.com/acme/lib";
     const entries: ReferenceRepo[] = [{ repo: ghUrl, path: "refs/lib", ref: undefined }];
     const urlMap = new Map([[ghUrl, repoDir]]);
 
     const out = await referenceReposStep.run(
-      ctx(),
+      makeContext(),
       {
         referenceRepos: entries,
         callbackUrl: "http://localhost:8080",
-        fetchImpl: mockPublicFetch("acme"),
+        fetchImpl: publicTokenEndpoint("acme"),
         spawnSyncImpl: makeRedirectingSpawnSync(urlMap),
       },
       new NoopStepReporter(),
@@ -542,10 +493,9 @@ describe("referenceReposStep — per-entry validation", () => {
   it("clones the valid entries when a sibling has an invalid path", async () => {
     const repoA = makeRepo({ "a.md": "A" });
     const repoB = makeRepo({ "b.md": "B" });
-    extraDirs.push(repoA, repoB);
 
     const out = await referenceReposStep.run(
-      ctx(),
+      makeContext(),
       {
         referenceRepos: [
           { repo: "https://github.com/org/a", path: "refs/a" },
@@ -553,7 +503,7 @@ describe("referenceReposStep — per-entry validation", () => {
           { repo: "https://github.com/org/b", path: "refs/b" },
         ],
         callbackUrl: "http://localhost:8080",
-        fetchImpl: mockPublicFetch("org"),
+        fetchImpl: publicTokenEndpoint("org"),
         spawnSyncImpl: makeRedirectingSpawnSync(new Map([
           ["https://github.com/org/a", repoA],
           ["https://github.com/org/b", repoB],
@@ -578,17 +528,16 @@ describe("referenceReposStep — per-entry validation", () => {
   it("rejects a second entry claiming a path the first already took", async () => {
     const repoA = makeRepo({ "a.md": "A" });
     const repoB = makeRepo({ "b.md": "B" });
-    extraDirs.push(repoA, repoB);
 
     const out = await referenceReposStep.run(
-      ctx(),
+      makeContext(),
       {
         referenceRepos: [
           { repo: "https://github.com/org/a", path: "refs/shared" },
           { repo: "https://github.com/org/b", path: "refs/shared" },
         ],
         callbackUrl: "http://localhost:8080",
-        fetchImpl: mockPublicFetch("org"),
+        fetchImpl: publicTokenEndpoint("org"),
         spawnSyncImpl: makeRedirectingSpawnSync(new Map([
           ["https://github.com/org/a", repoA],
           ["https://github.com/org/b", repoB],
@@ -612,14 +561,14 @@ describe("referenceReposStep — per-entry validation", () => {
 
   it("reports every entry when all of them are invalid", async () => {
     const out = await referenceReposStep.run(
-      ctx(),
+      makeContext(),
       {
         referenceRepos: [
           { repo: "https://github.com/org/a", path: "/absolute" },
           { repo: "https://github.com/org/b", path: "../outside" },
         ],
         callbackUrl: "http://localhost:8080",
-        fetchImpl: mockPublicFetch("org"),
+        fetchImpl: publicTokenEndpoint("org"),
       },
       new NoopStepReporter(),
     );
@@ -637,7 +586,7 @@ describe("referenceReposStep — per-entry validation", () => {
 
     try {
       const out = await referenceReposStep.run(
-        ctx(),
+        makeContext(),
         {
           referenceRepos: [{ repo: "https://github.com/org/a", path: "/absolute" }],
           callbackUrl: "http://localhost:8080",

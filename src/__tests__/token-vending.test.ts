@@ -1,13 +1,11 @@
 import { EventEmitter } from "node:events";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as TokenVendingModule from "../token-vending.js";
 import type * as LogModule from "../log.js";
-import type * as DedupModule from "../dedup.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
 import type * as RunnerCallbackModule from "../runner-callback.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
+import { testDb } from "./helpers/test-db.js";
 
 vi.mock("../github-app-auth.js", () => ({
   getScopedInstallationToken: vi.fn(),
@@ -55,10 +53,8 @@ class MockResponse {
   }
 }
 
-let dbPath: string;
 let tokenVending: typeof TokenVendingModule;
 let log: typeof LogModule;
-let dedup: typeof DedupModule;
 let runnerTokens: typeof RunnerTokensModule;
 let runnerCallback: typeof RunnerCallbackModule;
 
@@ -69,26 +65,26 @@ let mockWithLinearToken: ReturnType<typeof vi.fn>;
 const SECRET = "test-secret-with-enough-entropy-for-hmac";
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `token-vending-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  runnerTokens = await import("../runner-tokens.js");
-  tokenVending = await import("../token-vending.js");
-  runnerCallback = await import("../runner-callback.js");
-  const ghAuth = await import("../github-app-auth.js");
-  mockGetScopedInstallationToken = vi.mocked(ghAuth.getScopedInstallationToken);
-  const linearAuth = await import("../linear-app-auth.js");
-  mockIsLinearAuthConfigured = vi.mocked(linearAuth.isLinearAuthConfigured);
-  mockWithLinearToken = vi.mocked(linearAuth.withLinearToken);
-  log.initLogTable();
+  const modules = (
+    await testDb({
+      modules: {
+        log: () => import("../log.js"),
+        runnerTokens: () => import("../runner-tokens.js"),
+        tokenVending: () => import("../token-vending.js"),
+        runnerCallback: () => import("../runner-callback.js"),
+        ghAuth: () => import("../github-app-auth.js"),
+        linearAuth: () => import("../linear-app-auth.js"),
+      },
+    })
+  ).modules;
+  ({ log, runnerTokens, tokenVending, runnerCallback } = modules);
+  mockGetScopedInstallationToken = vi.mocked(modules.ghAuth.getScopedInstallationToken);
+  mockIsLinearAuthConfigured = vi.mocked(modules.linearAuth.isLinearAuthConfigured);
+  mockWithLinearToken = vi.mocked(modules.linearAuth.withLinearToken);
 });
 
 afterEach(() => {
   vi.restoreAllMocks();
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
 });
 
 async function callTokenEndpoint(body: unknown): Promise<{ statusCode: number; body: string }> {
@@ -363,19 +359,12 @@ describe("handleKgTrackerDataRequest", () => {
     let capturedQuery: string | null = null;
     mockWithLinearToken.mockImplementationOnce(
       async (cb: (token: string) => Promise<Response>) => {
-        const fetchSpy = vi.spyOn(global, "fetch").mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({
-            data: {
-              issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
-            },
-          }),
-        } as unknown as Response);
+        const linear = fakeFetch({
+          "POST /graphql": { json: { data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } },
+        });
+        linear.install();
         const resp = await cb("fake-linear-token");
-        const rawBody = fetchSpy.mock.calls[0]?.[1]?.body;
-        capturedQuery = (JSON.parse(rawBody as string) as Record<string, unknown>)
-          .query as string;
-        fetchSpy.mockRestore();
+        capturedQuery = (JSON.parse(linear.calls[0].body) as Record<string, unknown>).query as string;
         return resp;
       },
     );
@@ -399,19 +388,12 @@ describe("handleKgTrackerDataRequest", () => {
     let capturedVariables: Record<string, unknown> | null = null;
     mockWithLinearToken.mockImplementationOnce(
       async (cb: (token: string) => Promise<Response>) => {
-        const fetchSpy = vi.spyOn(global, "fetch").mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({
-            data: {
-              issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
-            },
-          }),
-        } as unknown as Response);
+        const linear = fakeFetch({
+          "POST /graphql": { json: { data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } },
+        });
+        linear.install();
         const resp = await cb("fake-linear-token");
-        const rawBody = fetchSpy.mock.calls[0]?.[1]?.body;
-        capturedVariables = (JSON.parse(rawBody as string) as Record<string, unknown>)
-          .variables as Record<string, unknown>;
-        fetchSpy.mockRestore();
+        capturedVariables = (JSON.parse(linear.calls[0].body) as Record<string, unknown>).variables as Record<string, unknown>;
         return resp;
       },
     );

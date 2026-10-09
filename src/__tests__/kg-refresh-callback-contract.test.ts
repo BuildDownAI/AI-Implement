@@ -9,11 +9,11 @@
  *   GET  /runner/planning-context
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { postRunnerResult } from "../runner-result.js";
 import { kgTrackerDataStep } from "../pipeline/steps/kg-tracker-data.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
+import { testDb } from "./helpers/test-db.js";
+import { testDir } from "./helpers/test-dir.js";
 
 const BASE = "http://orchestrator.test";
 
@@ -29,22 +29,17 @@ describe("kg-refresh callback-URL contract", () => {
   let dataRoot: string;
 
   beforeEach(() => {
-    dataRoot = mkdtempSync(join(tmpdir(), "kgroot-"));
+    dataRoot = testDir("kgroot");
   });
 
   afterEach(() => {
-    rmSync(dataRoot, { recursive: true, force: true });
     vi.clearAllMocks();
   });
 
   // ---- Runner-side client contracts ----
 
   it("postRunnerResult resolves to POST /runner/result — a served route", async () => {
-    const captured: string[] = [];
-    const mockFetch = vi.fn(async (url: string) => {
-      captured.push(url);
-      return new Response("{}", { status: 200 });
-    });
+    const orchestrator = fakeFetch({ "POST /runner/result": { json: {} } });
 
     const savedToken = process.env.RUN_TOKEN;
     process.env.RUN_TOKEN = "tok-123";
@@ -54,27 +49,23 @@ describe("kg-refresh callback-URL contract", () => {
         workspaceDir: dataRoot,
         outcome: "success",
         callbackUrl: BASE,
-        fetchImpl: mockFetch as typeof fetch,
+        fetchImpl: orchestrator.fetch,
       });
     } finally {
       if (savedToken === undefined) delete process.env.RUN_TOKEN;
       else process.env.RUN_TOKEN = savedToken;
     }
 
-    expect(captured).toHaveLength(1);
-    const path = new URL(captured[0]).pathname;
-    expect(path).toBe("/runner/result");
-    expect(SERVED_ROUTES.has(`POST ${path}`)).toBe(true);
+    expect(orchestrator.calls).toHaveLength(1);
+    expect(orchestrator.calls[0].path).toBe("/runner/result");
+    expect(SERVED_ROUTES.has(`${orchestrator.calls[0].method} ${orchestrator.calls[0].path}`)).toBe(true);
   });
 
   it("kgTrackerDataStep resolves to POST /api/runner/kg-tracker-data — a served route", async () => {
-    const captured: string[] = [];
-    const mockFetch = vi.fn(async (url: string) => {
-      captured.push(url);
-      return new Response(
-        JSON.stringify({ issues: [{ id: "1", identifier: "AII-1", title: "t", description: "", state: { name: "Todo", type: "unstarted" }, comments: [] }], pageInfo: { hasNextPage: false, endCursor: null } }),
-        { status: 200 },
-      );
+    const orchestrator = fakeFetch({
+      "POST /api/runner/kg-tracker-data": {
+        json: { issues: [{ id: "1", identifier: "AII-1", title: "t", description: "", state: { name: "Todo", type: "unstarted" }, comments: [] }], pageInfo: { hasNextPage: false, endCursor: null } },
+      },
     });
 
     const savedToken = process.env.RUN_PROGRESS_TOKEN;
@@ -85,7 +76,7 @@ describe("kg-refresh callback-URL contract", () => {
         {
           callbackUrl: BASE,
           workspaceDir: dataRoot,
-          fetchImpl: mockFetch as typeof fetch,
+          fetchImpl: orchestrator.fetch,
           writeFileSyncImpl: () => {},
           sourcesYmlReaderImpl: () => ["AII"],
         },
@@ -96,10 +87,9 @@ describe("kg-refresh callback-URL contract", () => {
       else process.env.RUN_PROGRESS_TOKEN = savedToken;
     }
 
-    expect(captured).toHaveLength(1);
-    const path = new URL(captured[0]).pathname;
-    expect(path).toBe("/api/runner/kg-tracker-data");
-    expect(SERVED_ROUTES.has(`POST ${path}`)).toBe(true);
+    expect(orchestrator.calls).toHaveLength(1);
+    expect(orchestrator.calls[0].path).toBe("/api/runner/kg-tracker-data");
+    expect(SERVED_ROUTES.has(`${orchestrator.calls[0].method} ${orchestrator.calls[0].path}`)).toBe(true);
   });
 });
 
@@ -107,24 +97,20 @@ describe("kg-refresh callback-URL contract", () => {
 describe("kg-refresh callback is verify-only and reports to the KgRefresh workflow (AII-899)", () => {
   const SECRET = "s3cret";
   const SLUG = "acme/kg-source";
-  let dbPath: string;
   let dedup: typeof import("../dedup.js");
   let tokens: typeof import("../runner-tokens.js");
   let callback: typeof import("../runner-callback.js");
 
   beforeEach(async () => {
-    vi.resetModules();
-    dbPath = join(tmpdir(), `kg-cb-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-    process.env.DEDUP_DB_PATH = dbPath;
-    dedup = await import("../dedup.js");
-    tokens = await import("../runner-tokens.js");
-    callback = await import("../runner-callback.js");
-    dedup.getDb();
-  });
-
-  afterEach(() => {
-    dedup.closeDb();
-    rmSync(dbPath, { force: true });
+    ({ dedup, tokens, callback } = (
+      await testDb({
+        modules: {
+          dedup: () => import("../dedup.js"),
+          tokens: () => import("../runner-tokens.js"),
+          callback: () => import("../runner-callback.js"),
+        },
+      })
+    ).modules);
   });
 
   function client(over: Record<string, unknown> = {}) {
@@ -244,7 +230,7 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
       seen.push({ url, status: out.status });
       return new Response(JSON.stringify(out.body), { status: out.status });
     });
-    const workspaceDir = mkdtempSync(join(tmpdir(), "kgreport-"));
+    const workspaceDir = testDir("kgreport");
     const savedToken = process.env.RUN_TOKEN;
     process.env.RUN_TOKEN = token;
     try {
@@ -260,7 +246,6 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
     } finally {
       if (savedToken === undefined) delete process.env.RUN_TOKEN;
       else process.env.RUN_TOKEN = savedToken;
-      rmSync(workspaceDir, { recursive: true, force: true });
     }
     expect(seen).toEqual([{ url: "http://orch.test/runner/result", status: 200 }]);
     expect(c.report).toHaveBeenCalledTimes(1);

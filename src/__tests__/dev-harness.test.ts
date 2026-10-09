@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { splitLocalRunnerEnv } from "../local-docker.js";
 import { decodeRunConfig } from "../run-config.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
 
 // Prevent real git invocations for branch and origin detection.
 vi.mock("node:child_process", () => ({
@@ -341,21 +342,21 @@ describe("startDevRun — kg-refresh tracker-data source resolution (AII-608)", 
     vi.stubEnv("ORCHESTRATOR_URL", "https://orch.example.com");
     vi.stubEnv("ADMIN_ACCESS_CODE", "secret-code");
     vi.stubEnv("AI_IMPLEMENT_ADMIN_TOKEN", "");
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ token: "session-token" }) })
-      .mockResolvedValueOnce({ ok: true, text: async () => JSON.stringify([{ id: "1" }]) });
-    vi.stubGlobal("fetch", fetchMock);
+    const orchestrator = fakeFetch({
+      "POST /api/auth": { json: { token: "session-token" } },
+      "GET /api/kg/tracker-data": { json: [{ id: "1" }] },
+    });
+    orchestrator.install();
 
     const handle = await startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh", artifactsDir: "/tmp/artifacts" });
 
-    expect(fetchMock).toHaveBeenNthCalledWith(1, "https://orch.example.com/api/auth", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code: "secret-code" }),
-    });
-    expect(fetchMock).toHaveBeenNthCalledWith(2, "https://orch.example.com/api/kg/tracker-data", {
-      headers: { Authorization: "Bearer session-token" },
-    });
+    expect(orchestrator.calls.map((c) => `${c.method} ${c.url.href}`)).toEqual([
+      "POST https://orch.example.com/api/auth",
+      "GET https://orch.example.com/api/kg/tracker-data",
+    ]);
+    expect(Object.fromEntries(orchestrator.calls[0].headers)).toEqual({ "content-type": "application/json" });
+    expect(orchestrator.calls[0].body).toBe(JSON.stringify({ code: "secret-code" }));
+    expect(Object.fromEntries(orchestrator.calls[1].headers)).toEqual({ authorization: "Bearer session-token" });
     expect(vi.mocked(writeFile)).toHaveBeenCalledWith(
       "/tmp/artifacts/tracker-data.json",
       JSON.stringify([{ id: "1" }]),
@@ -369,26 +370,25 @@ describe("startDevRun — kg-refresh tracker-data source resolution (AII-608)", 
     vi.stubEnv("ORCHESTRATOR_URL", "https://orch.example.com");
     vi.stubEnv("ADMIN_ACCESS_CODE", "");
     vi.stubEnv("AI_IMPLEMENT_ADMIN_TOKEN", "bearer-token");
-    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: true, text: async () => JSON.stringify([]) });
-    vi.stubGlobal("fetch", fetchMock);
+    const orchestrator = fakeFetch({ "GET /api/kg/tracker-data": { json: [] } });
+    orchestrator.install();
 
     await startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh", artifactsDir: "/tmp/artifacts" });
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock).toHaveBeenCalledWith("https://orch.example.com/api/kg/tracker-data", {
-      headers: { Authorization: "Bearer bearer-token" },
-    });
+    expect(orchestrator.calls).toHaveLength(1);
+    expect(orchestrator.calls[0].url.href).toBe("https://orch.example.com/api/kg/tracker-data");
+    expect(Object.fromEntries(orchestrator.calls[0].headers)).toEqual({ authorization: "Bearer bearer-token" });
   });
 
   it("--tracker-data always wins over the orchestrator env when both are present", async () => {
     vi.stubEnv("ORCHESTRATOR_URL", "https://orch.example.com");
     vi.stubEnv("ADMIN_ACCESS_CODE", "secret-code");
-    const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
+    const orchestrator = fakeFetch({});
+    orchestrator.install();
 
     await startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh", trackerData: "/tmp/td.json" });
 
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(orchestrator.calls).toHaveLength(0);
     const opts = vi.mocked(launchLocalSession).mock.calls[0]![0];
     expect(opts.extraVolumes).toContain("/tmp/td.json:/dev-tracker-data.json:ro");
   });
@@ -396,8 +396,7 @@ describe("startDevRun — kg-refresh tracker-data source resolution (AII-608)", 
   it("rejects when the tracker-data fetch fails", async () => {
     vi.stubEnv("ORCHESTRATOR_URL", "https://orch.example.com");
     vi.stubEnv("AI_IMPLEMENT_ADMIN_TOKEN", "bearer-token");
-    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: false, status: 500 });
-    vi.stubGlobal("fetch", fetchMock);
+    fakeFetch({ "GET /api/kg/tracker-data": { status: 500 } }).install();
 
     await expect(
       startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh" }),
@@ -407,8 +406,7 @@ describe("startDevRun — kg-refresh tracker-data source resolution (AII-608)", 
   it("rejects when the admin session mint fails", async () => {
     vi.stubEnv("ORCHESTRATOR_URL", "https://orch.example.com");
     vi.stubEnv("ADMIN_ACCESS_CODE", "bad-code");
-    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: false, status: 403 });
-    vi.stubGlobal("fetch", fetchMock);
+    fakeFetch({ "POST /api/auth": { status: 403 } }).install();
 
     await expect(
       startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh" }),
