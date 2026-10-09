@@ -260,6 +260,20 @@ describe("fakeFetch", () => {
     expect(api.calls[1].signal).toBeUndefined();
   });
 
+  it("records a Request input's signal, unless the init passes signal: null", async () => {
+    const api = fakeFetch({ "GET /ping": { text: "pong" } });
+    const controller = new AbortController();
+    const request = new Request(`${API}/ping`, { signal: controller.signal });
+
+    await api.fetch(request);
+    await api.fetch(request, { signal: undefined });
+    await api.fetch(request, { signal: null });
+
+    expect(api.calls[0].signal).toBe(request.signal);
+    expect(api.calls[1].signal).toBe(request.signal);
+    expect(api.calls[2].signal).toBeUndefined();
+  });
+
   it("lets a function reply that throws reject the request like a network error, without failing the test", async () => {
     const api = fakeFetch({
       "GET /down": () => {

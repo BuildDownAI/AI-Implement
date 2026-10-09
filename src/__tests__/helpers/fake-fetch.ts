@@ -16,6 +16,7 @@ export interface FetchCall {
   /** The request body as text; empty when there is none. */
   body: string;
   /** The caller's `AbortSignal`: `init.signal`, else the signal of a `Request` passed as input, else undefined.
+   *  An explicit `signal: null` means none, as in `fetch`; `signal: undefined` is the same as leaving it out.
    *  Read from the caller's arguments, because the `Request` built here carries a signal even when the caller passed none. */
   signal: AbortSignal | undefined;
 }
@@ -72,7 +73,7 @@ export function fakeFetch(routes: Routes): FakeFetch {
   const fakeFetchImpl: typeof fetch = async (input, init) => {
     const request = new Request(input, init);
     const url = new URL(request.url);
-    const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+    const signal = init?.signal === null ? undefined : (init?.signal ?? (input instanceof Request ? input.signal : undefined));
     const call: FetchCall = { method: request.method, url, path: url.pathname, headers: request.headers, body: await request.text(), signal };
     calls.push(call);
 

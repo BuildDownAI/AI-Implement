@@ -1,38 +1,24 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { makeMapping, makeProvider } from "./helpers/builders.js";
+import { fakeFetch, type FakeFetch, type Routes } from "./helpers/fake-fetch.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let dedup: typeof import("../dedup.js");
-let log: typeof import("../log.js");
-let stepLog: typeof import("../step-log.js");
 let recon: typeof import("../reconciliation.js");
 let mod: typeof import("../merge-capture.js");
 let reconcileMod: typeof import("../reconcile-merged.js");
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `mc-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  stepLog = await import("../step-log.js");
-  recon = await import("../reconciliation.js");
-  mod = await import("../merge-capture.js");
-  reconcileMod = await import("../reconcile-merged.js");
-  log.initLogTable();
-  stepLog.initStepLogTable();
-  recon.initReconciliationTable();
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    // ignore
-  }
+  ({ dedup, recon, mod, reconcileMod } = (
+    await testDb({
+      modules: {
+        dedup: () => import("../dedup.js"),
+        recon: () => import("../reconciliation.js"),
+        mod: () => import("../merge-capture.js"),
+        reconcileMod: () => import("../reconcile-merged.js"),
+      },
+    })
+  ).modules);
 });
 
 const APPROVAL_ISO = "2024-01-10T12:00:00Z";
@@ -62,48 +48,30 @@ function makeIssueComment(login: string, body: string, createdAt = POST_APPROVAL
   return { user: { login }, body, created_at: createdAt };
 }
 
-/**
- * commitStats: maps sha → single-commit payload (e.g. { stats: { additions: 5, deletions: 3 } }).
- * pr: PR metadata payload (must include merged_at).
- */
-function makeFetch(
-  commits: unknown[],
-  reviews: unknown[],
-  prComments: unknown[],
-  issueComments: unknown[] = [],
-  pr: unknown = { merged_at: null },
-  commitStats: Record<string, unknown> = {},
-): typeof fetch {
-  return vi.fn(async (url: string | URL | Request) => {
-    const s =
-      typeof url === "string"
-        ? url
-        : url instanceof URL
-          ? url.href
-          : (url as Request).url;
-    // list commits: /pulls/{n}/commits
-    if (s.includes("/pulls/") && s.includes("/commits"))
-      return { ok: true, json: async () => commits } as unknown as Response;
-    // reviews
-    if (s.includes("/reviews"))
-      return { ok: true, json: async () => reviews } as unknown as Response;
-    // inline PR review comments: /pulls/{n}/comments
-    if (s.includes("/pulls/") && s.includes("/comments"))
-      return { ok: true, json: async () => prComments } as unknown as Response;
-    // issue comments: /issues/{n}/comments
-    if (s.includes("/issues/") && s.includes("/comments"))
-      return { ok: true, json: async () => issueComments } as unknown as Response;
-    // single commit: /commits/{sha} (not under /pulls/)
-    if (/\/commits\/[0-9a-f]+/.test(s)) {
-      const sha = s.split("/commits/")[1]?.split("?")[0] ?? "";
-      const data = commitStats[sha] ?? { stats: { additions: 0, deletions: 0 } };
-      return { ok: true, json: async () => data } as unknown as Response;
-    }
-    // PR metadata: /pulls/{n} with no sub-path
-    if (/\/pulls\/\d+$/.test(s))
-      return { ok: true, json: async () => pr } as unknown as Response;
-    return { ok: false, status: 404 } as unknown as Response;
-  }) as unknown as typeof fetch;
+interface PrData {
+  /** PR metadata (must include merged_at). */
+  pr?: unknown;
+  commits?: unknown[];
+  reviews?: unknown[];
+  prComments?: unknown[];
+  issueComments?: unknown[];
+  /** sha → single-commit payload (e.g. { stats: { additions: 5, deletions: 3 } }), one route per sha. */
+  commitStats?: Record<string, unknown>;
+}
+
+/** GitHub's API for PR `prNumber` of o/r: the five reads capturePrMerge makes, and the single-commit reads in `commitStats`. */
+function github(prNumber: number, data: PrData = {}): FakeFetch {
+  const routes: Routes = {
+    [`GET /repos/o/r/pulls/${prNumber}` as const]: { json: data.pr ?? { merged_at: null } },
+    [`GET /repos/o/r/pulls/${prNumber}/commits` as const]: { json: data.commits ?? [] },
+    [`GET /repos/o/r/pulls/${prNumber}/reviews` as const]: { json: data.reviews ?? [] },
+    [`GET /repos/o/r/pulls/${prNumber}/comments` as const]: { json: data.prComments ?? [] },
+    [`GET /repos/o/r/issues/${prNumber}/comments` as const]: { json: data.issueComments ?? [] },
+  };
+  for (const [sha, commit] of Object.entries(data.commitStats ?? {})) {
+    routes[`GET /repos/o/r/commits/${sha}` as const] = { json: commit };
+  }
+  return fakeFetch(routes);
 }
 
 function insertApproval(issueId: string, endedAt: string): void {
@@ -144,22 +112,20 @@ function getCapture(repo: string, prNumber: number) {
 
 describe("capturePrMerge — commit bucketing", () => {
   it("buckets app slug → runner, x[bot] → bot, other → human", async () => {
-    const mockFetch = makeFetch(
-      [
+    const api = github(1, {
+      commits: [
         makeCommit(APP_BOT, POST_APPROVAL_DATE),
         makeCommit("dependabot[bot]", POST_APPROVAL_DATE),
         makeCommit("alice", POST_APPROVAL_DATE),
       ],
-      [],
-      [],
-    );
+    });
 
     await mod.capturePrMerge({
       repo: "o/r",
       prNumber: 1,
       token: "tok",
       appBotLogin: APP_BOT,
-      fetchImpl: mockFetch,
+      fetchImpl: api.fetch,
     });
 
     const row = getCapture("o/r", 1);
@@ -172,14 +138,18 @@ describe("capturePrMerge — commit bucketing", () => {
 describe("capturePrMerge — review_escape", () => {
   it("review_escape=1 for approved PR with one post-approval human commit", async () => {
     insertApproval("issue-2", APPROVAL_ISO);
-    const mockFetch = makeFetch([makeCommit("alice", POST_APPROVAL_DATE)], [], []);
+    const api = github(2, {
+      commits: [makeCommit("alice", POST_APPROVAL_DATE)],
+      // A post-approval commit's lines are read from the single-commit endpoint.
+      commitStats: { deadbeef: { stats: { additions: 0, deletions: 0 } } },
+    });
 
     await mod.capturePrMerge({
       repo: "o/r",
       prNumber: 2,
       issueId: "issue-2",
       token: "tok",
-      fetchImpl: mockFetch,
+      fetchImpl: api.fetch,
     });
 
     const row = getCapture("o/r", 2);
@@ -190,18 +160,17 @@ describe("capturePrMerge — review_escape", () => {
 
   it("review_escape=1 for approved PR with zero post-approval commits but two external findings", async () => {
     insertApproval("issue-3", APPROVAL_ISO);
-    const mockFetch = makeFetch(
-      [makeCommit("alice", PRE_APPROVAL_DATE)],
-      [],
-      [makeComment("bob"), makeComment("carol")],
-    );
+    const api = github(3, {
+      commits: [makeCommit("alice", PRE_APPROVAL_DATE)],
+      prComments: [makeComment("bob"), makeComment("carol")],
+    });
 
     await mod.capturePrMerge({
       repo: "o/r",
       prNumber: 3,
       issueId: "issue-3",
       token: "tok",
-      fetchImpl: mockFetch,
+      fetchImpl: api.fetch,
     });
 
     const row = getCapture("o/r", 3);
@@ -213,18 +182,14 @@ describe("capturePrMerge — review_escape", () => {
 
   it("review_escape=1 for approved PR with CHANGES_REQUESTED review from external reviewer", async () => {
     insertApproval("issue-5", APPROVAL_ISO);
-    const mockFetch = makeFetch(
-      [],
-      [makeReview("external-reviewer", "CHANGES_REQUESTED")],
-      [],
-    );
+    const api = github(5, { reviews: [makeReview("external-reviewer", "CHANGES_REQUESTED")] });
 
     await mod.capturePrMerge({
       repo: "o/r",
       prNumber: 5,
       issueId: "issue-5",
       token: "tok",
-      fetchImpl: mockFetch,
+      fetchImpl: api.fetch,
     });
 
     const row = getCapture("o/r", 5);
@@ -234,14 +199,14 @@ describe("capturePrMerge — review_escape", () => {
   });
 
   it("review_escape=0 when no approved review exists", async () => {
-    const mockFetch = makeFetch([makeCommit("alice", POST_APPROVAL_DATE)], [], []);
+    const api = github(4, { commits: [makeCommit("alice", POST_APPROVAL_DATE)] });
 
     await mod.capturePrMerge({
       repo: "o/r",
       prNumber: 4,
       issueId: "issue-4",
       token: "tok",
-      fetchImpl: mockFetch,
+      fetchImpl: api.fetch,
     });
 
     const row = getCapture("o/r", 4);
@@ -253,10 +218,10 @@ describe("capturePrMerge — review_escape", () => {
 
 describe("capturePrMerge — upsert", () => {
   it("re-capture of same (repo, pr_number) upserts, not duplicates", async () => {
-    const mockFetch = makeFetch([], [], []);
+    const api = github(10);
 
-    await mod.capturePrMerge({ repo: "o/r", prNumber: 10, token: "tok", fetchImpl: mockFetch });
-    await mod.capturePrMerge({ repo: "o/r", prNumber: 10, token: "tok", fetchImpl: mockFetch });
+    await mod.capturePrMerge({ repo: "o/r", prNumber: 10, token: "tok", fetchImpl: api.fetch });
+    await mod.capturePrMerge({ repo: "o/r", prNumber: 10, token: "tok", fetchImpl: api.fetch });
 
     const count = (
       dedup
@@ -280,20 +245,24 @@ describe("capturePrMerge — error isolation", () => {
       mergeCommitSha: "sha",
     });
 
-    const throwingFetch = vi.fn(async () => {
+    const networkError = () => {
       throw new Error("network error");
-    }) as unknown as typeof fetch;
-
-    vi.stubGlobal("fetch", throwingFetch);
+    };
+    fakeFetch({
+      "GET /repos/o/r/pulls/20": networkError,
+      "GET /repos/o/r/pulls/20/commits": networkError,
+      "GET /repos/o/r/pulls/20/reviews": networkError,
+      "GET /repos/o/r/pulls/20/comments": networkError,
+      "GET /repos/o/r/issues/20/comments": networkError,
+    }).install();
 
     const markMerged = vi.fn(async () => {});
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     try {
       await reconcileMod.runReconciliations({
-        resolveProvider: async () => ({ markMerged } as never),
-        mappingForRepo: () =>
-          ({ scopeKey: "team-o", mapping: { owner: "o", repo: "r" } } as never),
+        resolveProvider: async () => makeProvider({ markMerged }),
+        mappingForRepo: () => ({ scopeKey: "team-o", mapping: makeMapping({ owner: "o", repo: "r" }) }),
         tokenForOwner: async () => "tok",
         appBotLogin: APP_BOT,
       });
@@ -305,7 +274,6 @@ describe("capturePrMerge — error isolation", () => {
         expect.any(Error),
       );
     } finally {
-      vi.unstubAllGlobals();
       consoleSpy.mockRestore();
     }
   });
@@ -314,11 +282,7 @@ describe("capturePrMerge — error isolation", () => {
 describe("capturePrMerge — Gap 1: app-bot review excluded from findings", () => {
   it("review_escape=0 when only finding is the app-bot COMMENTED review", async () => {
     insertApproval("issue-gap1", APPROVAL_ISO);
-    const mockFetch = makeFetch(
-      [],
-      [makeReview(APP_BOT, "COMMENTED")],
-      [],
-    );
+    const api = github(100, { reviews: [makeReview(APP_BOT, "COMMENTED")] });
 
     await mod.capturePrMerge({
       repo: "o/r",
@@ -326,7 +290,7 @@ describe("capturePrMerge — Gap 1: app-bot review excluded from findings", () =
       issueId: "issue-gap1",
       token: "tok",
       appBotLogin: APP_BOT,
-      fetchImpl: mockFetch,
+      fetchImpl: api.fetch,
     });
 
     const row = getCapture("o/r", 100);
@@ -340,19 +304,16 @@ describe("capturePrMerge — Gap 1: app-bot review excluded from findings", () =
 describe("capturePrMerge — Gap 2: external Claude review via issue comment", () => {
   it("github-actions[bot] issue comment with 'Claude finished' body → claude-review finding and review_escape=1", async () => {
     insertApproval("issue-gap2", APPROVAL_ISO);
-    const mockFetch = makeFetch(
-      [],
-      [],
-      [],
-      [makeIssueComment("github-actions[bot]", "**Claude finished** reviewing this PR.\n\nFindings: none.")],
-    );
+    const api = github(101, {
+      issueComments: [makeIssueComment("github-actions[bot]", "**Claude finished** reviewing this PR.\n\nFindings: none.")],
+    });
 
     await mod.capturePrMerge({
       repo: "o/r",
       prNumber: 101,
       issueId: "issue-gap2",
       token: "tok",
-      fetchImpl: mockFetch,
+      fetchImpl: api.fetch,
     });
 
     const row = getCapture("o/r", 101);
@@ -364,19 +325,14 @@ describe("capturePrMerge — Gap 2: external Claude review via issue comment", (
 
   it("github-actions[bot] issue comment without 'Claude finished' body is bucketed as human", async () => {
     insertApproval("issue-gap2b", APPROVAL_ISO);
-    const mockFetch = makeFetch(
-      [],
-      [],
-      [],
-      [makeIssueComment("github-actions[bot]", "Some unrelated automation comment.")],
-    );
+    const api = github(102, { issueComments: [makeIssueComment("github-actions[bot]", "Some unrelated automation comment.")] });
 
     await mod.capturePrMerge({
       repo: "o/r",
       prNumber: 102,
       issueId: "issue-gap2b",
       token: "tok",
-      fetchImpl: mockFetch,
+      fetchImpl: api.fetch,
     });
 
     const row = getCapture("o/r", 102);
@@ -387,18 +343,14 @@ describe("capturePrMerge — Gap 2: external Claude review via issue comment", (
 
   it("human login containing 'claude' is not misbucketed as claude-review", async () => {
     insertApproval("issue-gap2c", APPROVAL_ISO);
-    const mockFetch = makeFetch(
-      [],
-      [makeReview("claudia", "CHANGES_REQUESTED")],
-      [],
-    );
+    const api = github(103, { reviews: [makeReview("claudia", "CHANGES_REQUESTED")] });
 
     await mod.capturePrMerge({
       repo: "o/r",
       prNumber: 103,
       issueId: "issue-gap2c",
       token: "tok",
-      fetchImpl: mockFetch,
+      fetchImpl: api.fetch,
     });
 
     const row = getCapture("o/r", 103);
@@ -411,18 +363,14 @@ describe("capturePrMerge — Gap 2: external Claude review via issue comment", (
 describe("capturePrMerge — Gap 4: findings time-filtered by approval_ts", () => {
   it("inline PR comment before approval_ts is not counted", async () => {
     insertApproval("issue-gap4a", APPROVAL_ISO);
-    const mockFetch = makeFetch(
-      [],
-      [],
-      [makeComment("bob", PRE_APPROVAL_DATE)],
-    );
+    const api = github(110, { prComments: [makeComment("bob", PRE_APPROVAL_DATE)] });
 
     await mod.capturePrMerge({
       repo: "o/r",
       prNumber: 110,
       issueId: "issue-gap4a",
       token: "tok",
-      fetchImpl: mockFetch,
+      fetchImpl: api.fetch,
     });
 
     const row = getCapture("o/r", 110);
@@ -433,18 +381,14 @@ describe("capturePrMerge — Gap 4: findings time-filtered by approval_ts", () =
 
   it("review before approval_ts is not counted", async () => {
     insertApproval("issue-gap4b", APPROVAL_ISO);
-    const mockFetch = makeFetch(
-      [],
-      [makeReview("reviewer", "CHANGES_REQUESTED", PRE_APPROVAL_DATE)],
-      [],
-    );
+    const api = github(111, { reviews: [makeReview("reviewer", "CHANGES_REQUESTED", PRE_APPROVAL_DATE)] });
 
     await mod.capturePrMerge({
       repo: "o/r",
       prNumber: 111,
       issueId: "issue-gap4b",
       token: "tok",
-      fetchImpl: mockFetch,
+      fetchImpl: api.fetch,
     });
 
     const row = getCapture("o/r", 111);
@@ -455,19 +399,16 @@ describe("capturePrMerge — Gap 4: findings time-filtered by approval_ts", () =
 
   it("issue comment before approval_ts is not counted", async () => {
     insertApproval("issue-gap4c", APPROVAL_ISO);
-    const mockFetch = makeFetch(
-      [],
-      [],
-      [],
-      [makeIssueComment("github-actions[bot]", "**Claude finished** with findings.", PRE_APPROVAL_DATE)],
-    );
+    const api = github(112, {
+      issueComments: [makeIssueComment("github-actions[bot]", "**Claude finished** with findings.", PRE_APPROVAL_DATE)],
+    });
 
     await mod.capturePrMerge({
       repo: "o/r",
       prNumber: 112,
       issueId: "issue-gap4c",
       token: "tok",
-      fetchImpl: mockFetch,
+      fetchImpl: api.fetch,
     });
 
     const row = getCapture("o/r", 112);
@@ -480,13 +421,13 @@ describe("capturePrMerge — Gap 4: findings time-filtered by approval_ts", () =
 describe("capturePrMerge — Gap 5: merged_at populated", () => {
   it("merged_at is stored as epoch ms from PR data", async () => {
     const mergedAtIso = "2024-01-20T15:00:00Z";
-    const mockFetch = makeFetch([], [], [], [], { merged_at: mergedAtIso });
+    const api = github(120, { pr: { merged_at: mergedAtIso } });
 
     await mod.capturePrMerge({
       repo: "o/r",
       prNumber: 120,
       token: "tok",
-      fetchImpl: mockFetch,
+      fetchImpl: api.fetch,
     });
 
     const row = getCapture("o/r", 120);
@@ -494,13 +435,13 @@ describe("capturePrMerge — Gap 5: merged_at populated", () => {
   });
 
   it("merged_at is null when PR has not been merged", async () => {
-    const mockFetch = makeFetch([], [], [], [], { merged_at: null });
+    const api = github(121, { pr: { merged_at: null } });
 
     await mod.capturePrMerge({
       repo: "o/r",
       prNumber: 121,
       token: "tok",
-      fetchImpl: mockFetch,
+      fetchImpl: api.fetch,
     });
 
     const row = getCapture("o/r", 121);
@@ -512,14 +453,10 @@ describe("capturePrMerge — Gap 6: post_approval_lines from single-commit endpo
   it("post_approval_lines sums additions+deletions from per-SHA fetch", async () => {
     insertApproval("issue-gap6", APPROVAL_ISO);
     const sha = "cafebabe";
-    const mockFetch = makeFetch(
-      [makeCommit("alice", POST_APPROVAL_DATE, sha)],
-      [],
-      [],
-      [],
-      { merged_at: null },
-      { [sha]: { stats: { additions: 10, deletions: 4 } } },
-    );
+    const api = github(130, {
+      commits: [makeCommit("alice", POST_APPROVAL_DATE, sha)],
+      commitStats: { [sha]: { stats: { additions: 10, deletions: 4 } } },
+    });
 
     await mod.capturePrMerge({
       repo: "o/r",
@@ -527,7 +464,7 @@ describe("capturePrMerge — Gap 6: post_approval_lines from single-commit endpo
       issueId: "issue-gap6",
       token: "tok",
       appBotLogin: APP_BOT,
-      fetchImpl: mockFetch,
+      fetchImpl: api.fetch,
     });
 
     const row = getCapture("o/r", 130);
@@ -536,20 +473,16 @@ describe("capturePrMerge — Gap 6: post_approval_lines from single-commit endpo
 
   it("post_approval_lines is 0 when no approval timestamp exists", async () => {
     const sha = "cafebabe";
-    const mockFetch = makeFetch(
-      [makeCommit("alice", POST_APPROVAL_DATE, sha)],
-      [],
-      [],
-      [],
-      { merged_at: null },
-      { [sha]: { stats: { additions: 10, deletions: 4 } } },
-    );
+    const api = github(131, {
+      commits: [makeCommit("alice", POST_APPROVAL_DATE, sha)],
+      commitStats: { [sha]: { stats: { additions: 10, deletions: 4 } } },
+    });
 
     await mod.capturePrMerge({
       repo: "o/r",
       prNumber: 131,
       token: "tok",
-      fetchImpl: mockFetch,
+      fetchImpl: api.fetch,
     });
 
     const row = getCapture("o/r", 131);
