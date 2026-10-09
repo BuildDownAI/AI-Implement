@@ -1,4 +1,4 @@
-import type { InvocationAttributionV1 } from "./pipeline/types.js";
+import { sanitizeAttribution, type InvocationAttributionV1 } from "./pipeline/types.js";
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
@@ -206,9 +206,30 @@ export interface RunAutonomousOptions {
   activityReporting?: RunnerActivityReporting;
 }
 
+/** Last pass carrying a valid attribution; projected through `sanitizeAttribution` so no consumer sees a raw claim. */
+function passAttribution(passes: unknown): InvocationAttributionV1 | undefined {
+  if (!Array.isArray(passes)) return undefined;
+  for (let i = passes.length - 1; i >= 0; i--) {
+    const clean = sanitizeAttribution((passes[i] as { attribution?: unknown } | null)?.attribution);
+    if (clean) return clean;
+  }
+  return undefined;
+}
+
+/** Attribution an executor attached to a thrown error (`err.attribution`, or its telemetry's). */
+function errorAttribution(err: unknown): InvocationAttributionV1 | undefined {
+  if (typeof err !== "object" || err === null) return undefined;
+  const e = err as { attribution?: unknown; telemetry?: { attribution?: unknown } };
+  return sanitizeAttribution(e.attribution) ?? sanitizeAttribution(e.telemetry?.attribution) ?? undefined;
+}
+
+function attributionField(attribution: InvocationAttributionV1 | undefined): { attribution?: InvocationAttributionV1 } {
+  return attribution ? { attribution } : {};
+}
+
 export interface RunAutonomousResult {
   exitCode: number;
-  /** Optional diagnostic attribution (AII-946); emission is AII-971. */
+  /** Optional diagnostic attribution (AII-946/954): the last implementation invocation; absent on legacy runs. */
   attribution?: InvocationAttributionV1;
 }
 
@@ -1283,6 +1304,11 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   // Snapshot env before the pipeline runs so we can diff after to find hook exports.
   const envSnap: Record<string, string | undefined> = shellMode ? { ...process.env } : {};
 
+  // The final result stands for the last implementation invocation the feedback loop recorded;
+  // per-pass records stay on the passes. No aggregation here (AII-954 owns it).
+  const finalAttribution = (): InvocationAttributionV1 | undefined =>
+    passAttribution(context.getOutputs("feedback-loop").passes);
+
   try {
     const pipeline = opts.pipeline ?? DEFAULT_PIPELINE;
     const runner = opts.runner ?? (await createDefaultRunner());
@@ -1337,6 +1363,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       await reportRunnerResult(reviewFix, outputCommit, process.env, {
         workspaceDir,
         phase: runnerPhase,
+        ...attributionField(finalAttribution()),
         outcome: "success",
         noWork: true,
         referenceRepoResults,
@@ -1346,7 +1373,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         fetchImpl: opts.fetchImpl,
       });
       runCompleted = true;
-      return { exitCode: 0 };
+      return { exitCode: 0, ...attributionField(finalAttribution()) };
     }
 
     // A gap-fill run updates an existing PR and intentionally does not create a
@@ -1384,6 +1411,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         await reportRunnerResult(reviewFix, outputCommit, process.env, {
           workspaceDir,
           phase: runnerPhase,
+          ...attributionField(finalAttribution()),
           outcome: "failure",
           failureCode: "INSTALL_FAILED",
           failureReason,
@@ -1394,7 +1422,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
           retryPolicy,
           fetchImpl: opts.fetchImpl,
         });
-        return { exitCode: 0 };
+        return { exitCode: 0, ...attributionField(finalAttribution()) };
       }
 
       const statPasses = Array.isArray(fbOutputs.passes) ? (fbOutputs.passes as RunAutopsyPasses) : [];
@@ -1429,6 +1457,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       await reportRunnerResult(reviewFix, outputCommit, process.env, {
         workspaceDir,
         phase: runnerPhase,
+        ...attributionField(finalAttribution()),
         outcome: "success",
         prUrl,
         referenceRepoResults,
@@ -1438,7 +1467,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         fetchImpl: opts.fetchImpl,
       });
       runCompleted = true;
-      return { exitCode: 0 };
+      return { exitCode: 0, ...attributionField(finalAttribution()) };
     }
 
     // The pipeline completed mechanically but either the internal loop or the
@@ -1538,6 +1567,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     await reportRunnerResult(reviewFix, outputCommit, process.env, {
       workspaceDir,
       phase: runnerPhase,
+      ...attributionField(finalAttribution()),
       outcome: "failure",
       failureCode,
       failureReason,
@@ -1549,7 +1579,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       retryPolicy,
       fetchImpl: opts.fetchImpl,
     });
-    return { exitCode: 0 };
+    return { exitCode: 0, ...attributionField(finalAttribution()) };
   } catch (err) {
     console.error(`Pipeline failed: ${err}`);
     disposition = `failed: ${err instanceof Error ? err.message : String(err)}`;
@@ -1572,6 +1602,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     await reportRunnerResult(reviewFix, outputCommitOnError, process.env, {
       workspaceDir,
       phase: runnerPhase,
+      ...attributionField(errorAttribution(err) ?? finalAttribution()),
       outcome: "failure",
       failureReason: err instanceof Error ? err.message : String(err),
       failureCode: err instanceof SensitiveFilesError ? err.code
@@ -1584,7 +1615,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       retryPolicy,
       fetchImpl: opts.fetchImpl,
     });
-    return { exitCode: 1 };
+    return { exitCode: 1, ...attributionField(errorAttribution(err) ?? finalAttribution()) };
   } finally {
     try {
       if (timing.records().length > 0) {
@@ -1679,7 +1710,7 @@ export interface RunLocalAutonomousOptions {
 
 export interface RunLocalAutonomousResult {
   exitCode: number;
-  /** Optional diagnostic attribution (AII-946); emission is AII-971. */
+  /** Optional diagnostic attribution (AII-946/954): the last implementation invocation; absent on legacy runs. */
   attribution?: InvocationAttributionV1;
   approved: boolean;
   terminationReason: string;
@@ -1868,6 +1899,7 @@ export async function runAutonomousLocally(
             effectiveMaxTurns,
             effectiveMaxIterations,
             tokenSummary: buildTokenSummary(passes),
+            ...attributionField(passAttribution(passes)),
           };
         }
       } catch (err) {
@@ -1881,6 +1913,7 @@ export async function runAutonomousLocally(
           effectiveMaxTurns,
           effectiveMaxIterations,
           tokenSummary: buildTokenSummary(passes),
+          ...attributionField(passAttribution(passes)),
         };
       }
     }
@@ -1896,6 +1929,7 @@ export async function runAutonomousLocally(
       effectiveMaxTurns,
       effectiveMaxIterations,
       tokenSummary: buildTokenSummary(passes),
+      ...attributionField(passAttribution(passes)),
     };
   } catch (err) {
     return {
@@ -1908,6 +1942,7 @@ export async function runAutonomousLocally(
       effectiveMaxTurns,
       effectiveMaxIterations,
       tokenSummary: null,
+      ...attributionField(errorAttribution(err) ?? passAttribution(context.getOutputs("feedback-loop").passes)),
     };
   } finally {
     if (setupRan && teardownHook) {

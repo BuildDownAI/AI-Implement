@@ -129,6 +129,10 @@ Walk every row and cite the line.
 - Strippers: `RUNNER_CREDENTIAL_KEYS` in `src/pipeline/process-env.ts`, and which builder each spawned process uses.
 - Tests: the setup file that disarms, and the tests that assert a stray post is refused.
 
+## Invocation attribution (AII-971)
+
+The terminal result may carry one optional `attribution` (`InvocationAttributionV1`): the last implementation invocation for an autonomous run, the planning invocation for a planning run. The runner sanitizes it before sending; the orchestrator sanitizes it again, then normalizes it against the dispatch's stored `run_agent_config_snapshots` row (`normalizeInvocation`) and inserts one `model_invocation_attribution` row, ignoring a repeated `invocation_id`. Identity comes from the snapshot, never the claim; a claim naming another snapshot stores nothing. A legacy dispatch (no snapshot) stores nothing. Persistence failures log a count-only warning and never stall the terminal callback. `Job.attribution` and the local `summary.json` project the same bounded shape. Per-pass records ride the feedback-loop passes, not the callback.
+
 ## Related
 
 - AII-567 and PR #467: the incident and the one-file fix. AII-588: the suite-wide disarm.

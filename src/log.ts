@@ -1,4 +1,5 @@
-import type { InvocationAttributionV1 } from "./pipeline/types.js";
+import { sanitizeAttribution, type InvocationAttributionV1 } from "./pipeline/types.js";
+import type { InvocationUsageRow } from "./agent-usage.js";
 import { getDb } from "./dedup.js";
 import { getMappings } from "./config.js";
 import { markCommentGapfillRunTerminal, requeueGapfillAfterPushFailure } from "./comment-gapfill-queue.js";
@@ -69,8 +70,9 @@ export interface Job {
    *  🟡 one. Distinct from `failure`, which is persisted for every phase (including
    *  gap-analysis, which the callback never comments for and so never stamps this field). */
   failureCommentedAt: number | null;
-  /** Diagnostic attribution (AII-946). No column exists yet (AII-971 persists it): legacy reads
-   *  project `null`. Optional so undeclared `Job` literals keep compiling. */
+  /** Bounded safe projection of the latest persisted invocation record for this dispatch
+   *  (`model_invocation_attribution`, AII-971); legacy dispatches read `null` with no inferred cost.
+   *  Optional so undeclared `Job` literals keep compiling. */
   attribution?: InvocationAttributionV1 | null;
 }
 
@@ -806,6 +808,7 @@ interface RawRow {
 }
 
 function mapRows(rows: RawRow[]): Job[] {
+  const attributions = readAttributionsByDispatch(rows.map((r) => r.dispatch_id));
   return rows.map((row) => ({
     id: row.id,
     issueId: row.issue_id,
@@ -835,8 +838,115 @@ function mapRows(rows: RawRow[]): Job[] {
     approved: row.approved === 1,
     failure: parseFailureJson(row.failure_json),
     failureCommentedAt: row.failure_commented_at ?? null,
-    attribution: null,
+    attribution: (row.dispatch_id && attributions.get(row.dispatch_id)) || null,
   }));
+}
+
+interface AttributionRow {
+  invocation_id: string;
+  dispatch_id: string;
+  stage: string;
+  profile_id: string;
+  agent: string;
+  provider: string;
+  model: string;
+  auth_mode: string;
+  snapshot_id: string | null;
+  usage_json: string;
+}
+
+/** Projects stored invocation rows through `sanitizeAttribution`, so Job reads, callbacks and local
+ *  summaries share one bounded shape. The latest row per dispatch wins; a malformed row reads as absent. */
+function readAttributionsByDispatch(dispatchIds: Array<string | null>): Map<string, InvocationAttributionV1> {
+  const out = new Map<string, InvocationAttributionV1>();
+  const ids = [...new Set(dispatchIds.filter((d): d is string => typeof d === "string"))];
+  if (ids.length === 0) return out;
+  let rows: AttributionRow[];
+  try {
+    rows = getDb()
+      .prepare(
+        `SELECT invocation_id, dispatch_id, stage, profile_id, agent, provider, model, auth_mode, snapshot_id, usage_json
+         FROM model_invocation_attribution WHERE dispatch_id IN (${ids.map(() => "?").join(",")}) ORDER BY rowid`,
+      )
+      .all(...ids) as AttributionRow[];
+  } catch {
+    return out;
+  }
+  for (const row of rows) {
+    try {
+      const u = JSON.parse(row.usage_json) as Record<string, unknown>;
+      const hasUsage = typeof u.availability === "string";
+      const projected = sanitizeAttribution({
+        version: 1,
+        invocationId: row.invocation_id,
+        stage: row.stage,
+        snapshotId: row.snapshot_id,
+        agent: row.agent,
+        provider: row.provider,
+        model: row.model,
+        profileId: row.profile_id,
+        authMode: row.auth_mode,
+        limit: u.limit ?? null,
+        outcome: u.outcome,
+        usage: hasUsage
+          ? { availability: u.availability, tokensIn: u.tokensIn, tokensOut: u.tokensOut, costUsd: u.costUsd ?? null, costStatus: u.costStatus }
+          : null,
+      });
+      if (projected) out.set(row.dispatch_id, projected);
+    } catch {
+      // unreadable usage_json reads as absent
+    }
+  }
+  return out;
+}
+
+const INVOCATION_STATUS: Record<InvocationUsageRow["outcome"], string> = {
+  success: "succeeded",
+  max_turns: "failed",
+  error: "failed",
+  unknown: "failed",
+};
+
+/**
+ * Persists one normalized invocation record (AII-954 `normalizeInvocation` output) for a dispatch.
+ * Insert-or-ignore on `invocation_id`, so a repeated delivery never double-counts. Rows without an
+ * invocation id cannot be deduplicated and are not stored. Returns whether a row was inserted.
+ */
+export function recordInvocationAttribution(
+  dispatchId: string,
+  row: InvocationUsageRow,
+  opts: { timedOut?: boolean; now?: number } = {},
+): boolean {
+  if (row.invocationId === null) return false;
+  const now = opts.now ?? Date.now();
+  const status = opts.timedOut ? "timed_out" : INVOCATION_STATUS[row.outcome];
+  const usage = {
+    availability: row.usage.availability,
+    tokensIn: row.usage.tokensIn,
+    tokensOut: row.usage.tokensOut,
+    cacheReadTokens: row.usage.cacheReadTokens,
+    cacheCreationTokens: row.usage.cacheCreationTokens,
+    costUsd: row.usage.costUsd,
+    costStatus: row.usage.costStatus,
+    limit: row.limit,
+    outcome: row.outcome,
+    attempts: row.attempts,
+    attribution: row.attribution,
+    mismatches: row.mismatches,
+  };
+  const info = getDb()
+    .prepare(
+      `INSERT OR IGNORE INTO model_invocation_attribution
+         (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode,
+          config_revision_id, snapshot_id, status, started_at, completed_at, usage_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      row.invocationId, dispatchId, row.stage, row.profileId, row.profileRevision, row.agent, row.provider,
+      row.model, row.authMode, row.configRevisions.project.configRevisionId, row.snapshotId, status, now, now,
+      JSON.stringify(usage),
+    );
+  return info.changes > 0;
 }
 
 /** Best-effort parse: a malformed or pre-migration row reads as "no failure" rather than throwing. */

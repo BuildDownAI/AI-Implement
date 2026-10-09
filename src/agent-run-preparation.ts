@@ -230,6 +230,12 @@ function snapshotFromRow(row: SnapshotRow): ResolvedAgentSnapshotV1 | null {
   }
 }
 
+/** The frozen snapshot stored for a dispatch; null for legacy dispatches and rows that no longer validate. */
+export function loadStoredSnapshot(dispatchId: string): ResolvedAgentSnapshotV1 | null {
+  const row = readSnapshotRow(dispatchId);
+  return row ? snapshotFromRow(row) : null;
+}
+
 type Resolved =
   | { readonly kind: "legacy" }
   | { readonly kind: "snapshot"; readonly snapshot: ResolvedAgentSnapshotV1; readonly stored: boolean }
