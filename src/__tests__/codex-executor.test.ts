@@ -1,3 +1,4 @@
+import { parse as parseToml } from "smol-toml";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
@@ -5,7 +6,7 @@ import { execFileSync, type spawn, type ChildProcessWithoutNullStreams } from "n
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { CODEX_SHELL_ENV_EXCLUDE, CodexExecutor, CodexPlanningPolicyUnprovenError, CodexRecoveryRequiredError, matchesSchema, type CodexExecutorOptions } from "../pipeline/codex-executor.js";
+import { CHATGPT_PLAN_PROVIDER, CODEX_SHELL_ENV_EXCLUDE, CodexExecutor, chatgptPlanProviderArgs, CodexPlanningPolicyUnprovenError, CodexRecoveryRequiredError, matchesSchema, type CodexExecutorOptions } from "../pipeline/codex-executor.js";
 import { ModelAuthClientError, type ModelAuthClient, type ModelInvocation } from "../model-auth-client.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { READ_ONLY_TOOL_PARAMS } from "../pipeline/steps/read-only-tools.js";
@@ -1261,5 +1262,178 @@ describe("invocation deadline across attempts", () => {
     expect(result.failure).toMatchObject({ code: "INVOCATION_TIMEOUT" });
     expect(log).toHaveLength(0);
     expect(auth.events).toEqual([]);
+  });
+});
+
+describe("ChatGPT plan provider", () => {
+  const TOKEN = "chatgpt-plan-synthetic-token";
+  const PAIRS = [
+    'model_provider="chatgpt_plan"',
+    'model_providers.chatgpt_plan.name="ChatGPT plan"',
+    'model_providers.chatgpt_plan.base_url="https://api.openai.com/v1"',
+    'model_providers.chatgpt_plan.env_key="CHATGPT_PLAN_ACCESS_TOKEN"',
+    'model_providers.chatgpt_plan.wire_api="responses"',
+    "model_providers.chatgpt_plan.requires_openai_auth=false",
+    "model_providers.chatgpt_plan.supports_websockets=false",
+  ];
+  let selected: string;
+  let calls: Array<{ opts: unknown }>;
+  beforeEach(() => {
+    selected = mkdtempSync(join(tmpdir(), "selected-home-"));
+    writeFileSync(join(selected, "auth.json"), '{"tokens":{"account_id":"acct-S","refresh_token":"original"}}');
+    calls = [];
+  });
+  afterEach(() => rmSync(selected, { recursive: true, force: true }));
+
+  const planAuth = (provider: boolean): Pick<ModelAuthClient, "invoke"> => ({
+    async invoke<T>(_id: string, cb: (i: ModelInvocation) => Promise<T>, opts?: unknown): Promise<T> {
+      calls.push({ opts });
+      return cb({
+        env: { PATH: "/usr/bin", CODEX_HOME: selected, CHATGPT_PLAN_ACCESS_TOKEN: TOKEN, OPENAI_BASE_URL: "http://local-feedback-provider:8080/v1" },
+        strippedKeys: [],
+        ...(provider ? { codexProvider: "chatgpt-plan" as const } : {}),
+      });
+    },
+  });
+  const build = (provider: boolean, scripts: Script[], extra: Partial<CodexExecutorOptions> = {}) => {
+    const log: Spawned[] = [];
+    const executor = new CodexExecutor(workspace, {
+      auth: planAuth(provider),
+      profileId: "p1",
+      allowRepositoryWrites: true,
+      spawnImpl: makeSpawn(scripts, log),
+      sleepImpl: async () => {},
+      termWaitMs: 30,
+      killWaitMs: 30,
+      ...extra,
+    });
+    return { executor, log };
+  };
+  const okDriver = (): CodexTransportResult => ({
+    result: {
+      stdout: "plan",
+      stderr: "",
+      exitCode: 0,
+      tokensUsed: 0,
+      telemetry: { outcome: "success", numTurns: null, durationMs: null, costUsd: null, tokensIn: null, tokensOut: null },
+      terminalStatus: { subtype: "success", isError: false },
+      signal: null,
+    },
+    sawUnsafe: false,
+    stopReason: null,
+  });
+
+  it("returns the seven pairs from the helper", () => {
+    const args = chatgptPlanProviderArgs();
+    expect(args.filter((a) => a === "-c")).toHaveLength(7);
+    expect(args.filter((a) => a !== "-c")).toEqual(PAIRS);
+    expect(CHATGPT_PLAN_PROVIDER).toBe("chatgpt_plan");
+  });
+
+  it("exec: uses the pairs after the ignore flags, no openai provider and no openai_base_url", async () => {
+    const { executor, log } = build(true, [{ stdout: message("done") }]);
+    await executor.invoke(base);
+    const args = log[0].args;
+    const flat = PAIRS.flatMap((p) => ["-c", p]);
+    const at = args.findIndex((a, i) => a === flat[0] && args[i + 1] === flat[1]);
+    expect(at).toBeGreaterThan(args.indexOf("--ignore-rules"));
+    expect(args.slice(at, at + flat.length)).toEqual(flat);
+    expect(args).not.toContain('model_provider="openai"');
+    expect(args.some((a) => a.startsWith("openai_base_url"))).toBe(false);
+    expect(args).toContain(`shell_environment_policy.exclude=${JSON.stringify(CODEX_SHELL_ENV_EXCLUDE)}`);
+  });
+
+  it("exec: keeps the openai provider when the invocation has no codexProvider", async () => {
+    const { executor, log } = build(false, [{ stdout: message("done") }]);
+    await executor.invoke(base);
+    expect(log[0].args).toContain('model_provider="openai"');
+    expect(log[0].args.some((a) => a.includes("chatgpt_plan"))).toBe(false);
+  });
+
+  it("app-server: carries the pairs, writes the provider table, copies no auth.json and never syncs back", async () => {
+    const log: Spawned[] = [];
+    let seen: { files: string[]; config: string; input: CodexTransportRunInput } | undefined;
+    const original = readFileSync(join(selected, "auth.json"), "utf8");
+    const { executor } = {
+      executor: new CodexExecutor(workspace, {
+        auth: planAuth(true),
+        profileId: "p1",
+        allowRepositoryWrites: true,
+        protocolDriver: {
+          run: async (input) => {
+            const home = log[0].env.CODEX_HOME;
+            seen = { files: readdirSync(home).sort(), config: readFileSync(join(home, "config.toml"), "utf8"), input };
+            return okDriver();
+          },
+        },
+        spawnImpl: makeSpawn([{ hang: true, dieOn: ["SIGTERM"] }], log),
+        sleepImpl: async () => {},
+        termWaitMs: 30,
+        killWaitMs: 30,
+      }),
+    };
+    await executor.invoke(base);
+    const flat = PAIRS.flatMap((p) => ["-c", p]);
+    const args = log[0].args;
+    const at = args.indexOf(flat[1]);
+    expect(args.slice(at - 1, at - 1 + flat.length)).toEqual(flat);
+    expect(args).not.toContain('model_provider="openai"');
+    expect(args).toContain("--strict-config");
+    expect(args).toContain(`shell_environment_policy.exclude=${JSON.stringify(CODEX_SHELL_ENV_EXCLUDE)}`);
+    expect(seen!.files).toEqual(["config.toml"]);
+    const parsed = parseToml(seen!.config) as { model_provider?: string; model_providers?: Record<string, Record<string, unknown>> };
+    expect(parsed.model_provider).toBe("chatgpt_plan");
+    expect(parsed.model_providers?.chatgpt_plan).toMatchObject({
+      name: "ChatGPT plan",
+      base_url: "https://api.openai.com/v1",
+      env_key: "CHATGPT_PLAN_ACCESS_TOKEN",
+      wire_api: "responses",
+      requires_openai_auth: false,
+      supports_websockets: false,
+    });
+    expect(seen!.config).toContain('model_provider = "chatgpt_plan"');
+    expect(seen!.config).toContain("[model_providers.chatgpt_plan]");
+    expect(seen!.config).toContain('env_key = "CHATGPT_PLAN_ACCESS_TOKEN"');
+    expect(seen!.config).toContain("requires_openai_auth = false");
+    expect(seen!.config).not.toContain("openai_base_url");
+    expect(seen!.input.modelProvider).toBe("chatgpt_plan");
+    expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe(original);
+  });
+
+  it("passes requiredMs to auth.invoke: the remaining deadline, or the invocation timeout", async () => {
+    let t = 1_000;
+    const { executor } = build(true, [{ stdout: message("done") }], { nowImpl: () => t });
+    await executor.invoke({ ...base, invocationTimeoutMs: 60_000 });
+    expect(calls[0].opts).toEqual({ requiredMs: 60_000 });
+  });
+
+  it("passes a strictly smaller requiredMs to a retry attempt after the clock advances", async () => {
+    let t = 1_000;
+    const transient: Script = {
+      exitCode: 1,
+      stderr: "stream error: 503 service unavailable",
+      stdout: [ev({ type: "turn.started" }), ev({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } })],
+    };
+    const { executor } = build(true, [transient, { stdout: message("done") }], {
+      nowImpl: () => t,
+      sleepImpl: async (ms) => void (t += ms + 5_000),
+    });
+    const result = await executor.invoke({
+      ...base,
+      invocationTimeoutMs: 60_000,
+      retry: { policy: { ...DEFAULT_RETRY_POLICY, requestRetries: 2, backoffInitialMs: 10, backoffMaxMs: 10 }, toolUseIsSafe: false },
+    });
+    expect(result.failure).toBeUndefined();
+    expect(calls).toHaveLength(2);
+    const [first, second] = calls.map((c) => (c.opts as { requiredMs: number }).requiredMs);
+    expect(first).toBe(60_000);
+    expect(second).toBeGreaterThan(0);
+    expect(second).toBeLessThan(first);
+  });
+
+  it("passes no requiredMs when there is neither a deadline nor an invocation timeout", async () => {
+    const { executor } = build(true, [{ stdout: message("done") }]);
+    await executor.invoke(base);
+    expect(calls[0].opts).toBeUndefined();
   });
 });
