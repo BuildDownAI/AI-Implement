@@ -1031,8 +1031,8 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     // Wait for the projection rather than reading once: the journaled step is the authority, the row follows it.
     const readCompletedAt = () => (getDb().prepare("SELECT completed_at FROM review_fix_attempts WHERE attempt_id = ?")
       .get(attemptId) as { completed_at: number | null } | undefined)?.completed_at ?? null;
-    await eventually(readCompletedAt, (v) => v !== null, { timeoutMs: 5_000, label: "review_fix_attempts.completed_at !== null" });
-    expect(readCompletedAt()).toBe(journaled.completedAt);
+    const completedAt = await eventually(readCompletedAt, (v) => v !== null, { timeoutMs: 5_000, label: "review_fix_attempts.completed_at !== null" });
+    expect(completedAt).toBe(journaled.completedAt);
 
     const text = journalText(entries);
     expect(text).not.toContain(secret);
