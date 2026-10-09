@@ -112,7 +112,7 @@ const isFlyNotFound = (err: unknown): boolean => err instanceof Error && /\(404\
  * With one it reconciles first: `started` for this dispatch means an earlier try of the step already ran
  * (return it, no second `update`, which would reboot it); `started` for another dispatch means the hold is
  * wrong (throw); `destroyed` or 404 falls back to create; anything else is `update` then `start`. A machine
- * still replacing, starting or stopping is waited out first (bounded). `update` makes Fly replace the instance, so
+ * still replacing, starting, stopping or created is waited out first (bounded). `update` makes Fly replace the instance, so
  * the launch waits for the replacement to reach `stopped` before `start`, and repeats a call Fly refused inside the
  * replace window once (409 on `update`, 412 on `start`). A lookup error, or a window that outlasts the bound,
  * throws so the step retries. `machineNonce` is the one the new config carries, or, for an
@@ -142,18 +142,16 @@ export async function launchKeptMachine(
     const t0 = Date.now();
     try { return await work; } finally { waitedMs += Date.now() - t0; }
   };
+  const gone = () => {
+    console.log(`[kg-refresh] kept machine ${keptMachineId} is gone; creating a new one`);
+    return create(keptMachineId);
+  };
   if (UNSETTLED_STATES.has(existing.state)) {
     const settled = await timed(fly.waitSettled(keptMachineId, settleMs));
-    if (settled === null) {
-      console.log(`[kg-refresh] kept machine ${keptMachineId} is gone (404); creating a new one`);
-      return create(keptMachineId);
-    }
+    if (settled === null) return gone();
     existing = settled;
   }
-  if (existing.state === "destroyed") {
-    console.log(`[kg-refresh] kept machine ${keptMachineId} is destroyed; creating a new one`);
-    return create(keptMachineId);
-  }
+  if (existing.state === "destroyed") return gone();
   if (existing.state === "started") {
     if (existing.config?.metadata?.[DURABLE_RUNNER_DISPATCH_ID_KEY] === dispatchId) {
       return { machineId: keptMachineId, machineNonce: existing.config.env?.MACHINE_NONCE ?? machineNonce, created: false, reused: true };
@@ -166,7 +164,8 @@ export async function launchKeptMachine(
   } catch (err) {
     if (!isReplaceWindow(err, 409, /concurrent update in progress|machine is replacing/i)) throw err;
     // An earlier update is still applying: wait it out, then update once more.
-    await timed(fly.waitSettled(keptMachineId, settleMs));
+    const settled = await timed(fly.waitSettled(keptMachineId, settleMs));
+    if (settled === null || settled.state === "destroyed") return gone();
     updated = await fly.updateMachine(keptMachineId, machineConfig.config);
   }
   const instanceId = (updated as { instance_id?: unknown } | null | undefined)?.instance_id;
@@ -177,7 +176,8 @@ export async function launchKeptMachine(
     await fly.startMachine(keptMachineId);
   } catch (err) {
     if (!isReplaceWindow(err, 412, /replac/i)) throw err;
-    await timed(fly.waitSettled(keptMachineId, settleMs));
+    const settled = await timed(fly.waitSettled(keptMachineId, settleMs));
+    if (settled === null || settled.state === "destroyed") return gone();
     await fly.startMachine(keptMachineId);
   }
   const waitedSeconds = Math.round(waitedMs / 1000);

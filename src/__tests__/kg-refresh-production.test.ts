@@ -945,6 +945,31 @@ describe("launchKeptMachine: the dispatch step's Fly write", () => {
     expect(fly.waitForStopped).toHaveBeenCalledWith("m-1", "inst-2", 60);
   });
 
+  it("waits and starts once more on a 412 start refusal", async () => {
+    const { fly, calls } = makeFly(async () => ({ state: "stopped" }));
+    let n = 0;
+    vi.mocked(fly.startMachine).mockImplementation(async () => {
+      calls.push("start");
+      if (n++ === 0) throw new Error("Failed to start machine m-1 (412): machine getting replaced, refusing to start");
+    });
+    await expect(launch(fly, "m-1")).resolves.toMatchObject({ machineId: "m-1", reused: true });
+    expect(calls).toEqual(["get", "update", "start", "settle", "start"]);
+  });
+
+  it("creates a replacement when the machine is destroyed during the 409 or 412 wait", async () => {
+    const a = makeFly(async () => ({ state: "stopped" }));
+    vi.mocked(a.fly.updateMachine).mockRejectedValue(new Error("Failed to update machine m-1 (409): machine is replacing"));
+    vi.mocked(a.fly.waitSettled).mockResolvedValue({ state: "destroyed" } as never);
+    await expect(launch(a.fly, "m-1")).resolves.toMatchObject({ machineId: "m-new", created: true, replaced: "m-1" });
+    expect(a.fly.updateMachine).toHaveBeenCalledTimes(1);
+
+    const b = makeFly(async () => ({ state: "stopped" }));
+    vi.mocked(b.fly.startMachine).mockRejectedValue(new Error("Failed to start machine m-1 (412): machine getting replaced"));
+    vi.mocked(b.fly.waitSettled).mockResolvedValue(null);
+    await expect(launch(b.fly, "m-1")).resolves.toMatchObject({ machineId: "m-new", created: true, replaced: "m-1" });
+    expect(b.fly.startMachine).toHaveBeenCalledTimes(1);
+  });
+
   it("settles a machine that is still replacing before it updates", async () => {
     const { fly, calls } = makeFly(async () => ({ state: "replacing" }));
     await launch(fly, "m-1");
