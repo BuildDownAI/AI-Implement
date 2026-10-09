@@ -174,7 +174,9 @@ function ensureLogColumns(): void {
   // Migrate legacy rows: jobs that were never actually tracked by the run
   // monitor should show 'unknown', not a misleading terminal status.
   // Exclude fly-machines jobs — they use machine_id, not run_id.
-  db.exec("UPDATE dispatch_log SET status = 'unknown' WHERE run_id IS NULL AND status != 'unknown' AND (execution_mode IS NULL OR execution_mode = 'github-actions')");
+  // Only open rows are rewritten; closed rows (failed, completed, ...) keep
+  // their status and conclusion.
+  db.exec("UPDATE dispatch_log SET status = 'unknown' WHERE run_id IS NULL AND status IN ('dispatched', 'running') AND (execution_mode IS NULL OR execution_mode = 'github-actions')");
 
   // Fix data corruption: when multiple jobs share the same run_id, the
   // matching was wrong (findWorkflowRunId returned the same run for all).

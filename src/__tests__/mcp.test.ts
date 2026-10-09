@@ -33,7 +33,7 @@ import {
   kgProvenance,
   triggerKgRefreshTool,
   setRunnerModeTool,
-  setKgFlyMachineTool,
+  setFlyMachineProfileTool,
   pauseProjectTool,
   addProjectTool,
   triggerWorkflowSyncTool,
@@ -99,7 +99,7 @@ const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
   kg_provenance: kgProvenance,
   trigger_kg_refresh: triggerKgRefreshTool,
   set_runner_mode: setRunnerModeTool,
-  set_kg_fly_machine: setKgFlyMachineTool,
+  set_fly_machine_profile: setFlyMachineProfileTool,
   pause_project: pauseProjectTool,
   add_project: addProjectTool,
   trigger_workflow_sync: triggerWorkflowSyncTool,
@@ -112,7 +112,7 @@ const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
 const WRITE_TOOL_NAMES = new Set([
   "trigger_kg_refresh",
   "set_runner_mode",
-  "set_kg_fly_machine",
+  "set_fly_machine_profile",
   "pause_project",
   "add_project",
   "trigger_workflow_sync",
@@ -143,6 +143,7 @@ function fakeRestateContext(handlerName: string): restate.Context {
       trigger: (opts: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string }) => kgTriggerFake!(opts),
       status: async () => null,
       lastAdminDryRun: async () => null,
+      get: async () => ({ config: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000 }, source: "default" }),
     }),
     run: async (name: unknown, action?: unknown) => {
       const fn = typeof name === "function" ? (name as () => unknown) : (action as () => unknown);
@@ -168,7 +169,7 @@ vi.mock("../access-entries.js", () => ({
 vi.mock("../runner-mode.js", () => ({
   VALID_RUNNER_MODES: ["default", "gha", "fly", "local", "shadow"],
   getRunnerMode: vi.fn(),
-  getKgMaterializeDirect: vi.fn(() => true),
+  getKgMaterializeDirect: vi.fn(() => ({ enabled: true, source: "db" as const })),
   getKgFlyMachineOverride: vi.fn(() => ({})),
   setKgFlyMachineOverride: vi.fn(),
 }));
@@ -1482,7 +1483,8 @@ describe("handleMcpRequest", () => {
         lastDryRun: null,
         stage: "serving",
         materialize: "direct",
-        flyMachine: { cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "default" },
+        flyMachine: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000, source: "default" },
+        restate: null,
       };
 
       const result = await callMcp(

@@ -294,30 +294,38 @@ describe("runner-mode", () => {
       expect(enabled).toBe(false);
     });
 
-    it("env var wins over DB", () => {
-      runnerMode.setKgMaterializeDirect(false);
+    it("ignores the env var at read time", () => {
       process.env.KG_MATERIALIZE_DIRECT = "true";
-      const { enabled, source } = runnerMode.getKgMaterializeDirect();
-      expect(enabled).toBe(true);
-      expect(source).toBe("env");
+      expect(runnerMode.getKgMaterializeDirect()).toEqual({ enabled: false, source: "default" });
     });
 
-    it("a non-'true' env value is an explicit off, still sourced from env", () => {
-      runnerMode.setKgMaterializeDirect(true);
-      process.env.KG_MATERIALIZE_DIRECT = "false";
-      const { enabled, source } = runnerMode.getKgMaterializeDirect();
-      expect(enabled).toBe(false);
-      expect(source).toBe("env");
-    });
+    describe("seedKgMaterializeDirectFromEnv (AII-1109)", () => {
+      const rowCount = () =>
+        (dedup.getDb().prepare("SELECT COUNT(*) AS n FROM settings WHERE key = 'kg_materialize_direct'").get() as { n: number }).n;
 
-    it.each(["", " "])(
-      "env var value %j is blank, falls through to DB/default",
-      (val) => {
-        process.env.KG_MATERIALIZE_DIRECT = val;
-        const { source } = runnerMode.getKgMaterializeDirect();
-        expect(source).not.toBe("env");
-      },
-    );
+      it("env true, no row → seeds the row", () => {
+        runnerMode.seedKgMaterializeDirectFromEnv("true");
+        expect(runnerMode.getKgMaterializeDirect()).toEqual({ enabled: true, source: "db" });
+      });
+
+      it("env false, no row → seeds a false row", () => {
+        runnerMode.seedKgMaterializeDirectFromEnv("false");
+        expect(rowCount()).toBe(1);
+        expect(runnerMode.getKgMaterializeDirect()).toEqual({ enabled: false, source: "db" });
+      });
+
+      it("env true, row false → row stays false", () => {
+        runnerMode.setKgMaterializeDirect(false);
+        runnerMode.seedKgMaterializeDirectFromEnv("true");
+        expect(runnerMode.getKgMaterializeDirect()).toEqual({ enabled: false, source: "db" });
+      });
+
+      it.each([undefined, "", "  "])("env %j writes no row", (val) => {
+        runnerMode.seedKgMaterializeDirectFromEnv(val);
+        expect(rowCount()).toBe(0);
+        expect(runnerMode.getKgMaterializeDirect()).toEqual({ enabled: false, source: "default" });
+      });
+    });
 
     it("returns disabled default when DB is unavailable", () => {
       dedup.closeDb();

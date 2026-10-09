@@ -25,8 +25,8 @@ import {
 } from "../review-fix-ports.js";
 import { awaitOwnedRun } from "./owned-run-wait.js";
 import { reviewFixPRKey } from "./review-fix-pr.js";
+import { restateRetentionMs } from "./retention.js";
 
-export const REVIEW_FIX_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const INSPECTION_INTERVAL_MS = 1_000;
 const RECONCILE_INTERVAL_MS = 1_000;
 
@@ -39,6 +39,8 @@ export interface ReviewFixApprovalEvidence {
 }
 
 export interface ReviewFixAttemptDependencies {
+  /** Test seam; production leaves it unset and reads `restate_retention_days` at build time. */
+  retentionMs?: number;
   store: ReviewFixAttemptStorePort;
   worker: ReviewFixWorkerPort;
   finalizer: ReviewFixFinalizerPort;
@@ -88,6 +90,7 @@ function sameScope(a: PreparedReviewFixAttempt, b: ReviewFixResultMetadataV1): b
  * endpoint with these same durable doubles must not erase the admitted attempt. */
 export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
   const { store, worker, finalizer } = deps;
+  const retentionMs = deps.retentionMs ?? restateRetentionMs();
   const unknownLaunchAlertMs = deps.unknownLaunchAlertMs ?? REVIEW_FIX_UNKNOWN_LAUNCH_ALERT_MINUTES * 60_000;
 
   async function alert(ctx: WorkflowSharedContext, attemptId: AttemptId, reason: string, step: string): Promise<void> {
@@ -330,17 +333,17 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
     name: "ReviewFixAttempt",
     handlers: {
       run: restate.handlers.workflow.workflow({
-        journalRetention: REVIEW_FIX_RETENTION_MS,
+        journalRetention: retentionMs,
       }, run),
       result: restate.handlers.workflow.shared({
-        journalRetention: REVIEW_FIX_RETENTION_MS,
-        idempotencyRetention: REVIEW_FIX_RETENTION_MS,
+        journalRetention: retentionMs,
+        idempotencyRetention: retentionMs,
       }, result),
       cancel: restate.handlers.workflow.shared({
-        journalRetention: REVIEW_FIX_RETENTION_MS,
-        idempotencyRetention: REVIEW_FIX_RETENTION_MS,
+        journalRetention: retentionMs,
+        idempotencyRetention: retentionMs,
       }, cancel),
     },
-    options: { workflowRetention: REVIEW_FIX_RETENTION_MS },
+    options: { workflowRetention: retentionMs },
   });
 }
