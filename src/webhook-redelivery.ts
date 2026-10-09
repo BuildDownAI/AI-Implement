@@ -58,10 +58,11 @@ function nextCursor(link: string | null): string | null {
 }
 
 /**
- * Asks GitHub to redeliver the App's failed review-related webhook deliveries from the last window.
- * GitHub never retries on its own, so this recovers events the webhook route refused with 503 while
- * Restate was down. A redelivery keeps the delivery GUID, so Restate's idempotency key absorbs duplicates.
- * Never throws: failures are logged and skipped.
+ * Asks GitHub to redeliver the App's failed deliveries of the four review-related events from the
+ * last window. GitHub never retries on its own. Today the only route that refuses a delivery with 503
+ * while Restate is unavailable is the KG PR-check route; the three review handlers gain that path with
+ * AII-1184 (see the module comment above). A redelivery keeps the delivery GUID, so Restate's
+ * idempotency key absorbs duplicates. Never throws: failures are logged and skipped.
  */
 export async function redeliverFailedAppDeliveries(deps: RedeliveryDeps): Promise<RedeliveryResult> {
   const doFetch = deps.fetchImpl ?? fetch;
