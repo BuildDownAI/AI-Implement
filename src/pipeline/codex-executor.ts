@@ -14,6 +14,20 @@ import type { ModelAuthClient } from "../model-auth-client.js";
 /** Provider pinned for every Codex invocation; Codex runs never switch provider or billing mode. */
 export const CODEX_PROVIDER = "openai";
 
+/**
+ * Credential names removed from the environment of every shell command the model runs. Codex's own process
+ * keeps them; only the commands it spawns lose them. Add a name here to extend both launch paths.
+ */
+export const CODEX_SHELL_ENV_EXCLUDE = [
+  "CODEX_API_KEY",
+  "CODEX_HOME",
+  "CHATGPT_PLAN_ACCESS_TOKEN",
+  "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
+] as const;
+
+const shellEnvPolicyArgs = (): string[] => ["-c", `shell_environment_policy.exclude=${JSON.stringify(CODEX_SHELL_ENV_EXCLUDE)}`];
+
 const DEFAULT_TERM_WAIT_MS = 5_000;
 const DEFAULT_KILL_WAIT_MS = 5_000;
 const POLL_MS = 10;
@@ -488,6 +502,7 @@ export class CodexExecutor implements LLMExecutor {
       params.model,
       "-c",
       `model_provider="${CODEX_PROVIDER}"`,
+      ...shellEnvPolicyArgs(),
       ...(baseUrl ? ["-c", `openai_base_url=${JSON.stringify(baseUrl)}`] : []),
       ...this.sandboxArgs(params),
     ];
@@ -525,6 +540,7 @@ export class CodexExecutor implements LLMExecutor {
       "features.unified_exec=false",
       "-c",
       'web_search="disabled"',
+      ...shellEnvPolicyArgs(),
     ];
   }
 
