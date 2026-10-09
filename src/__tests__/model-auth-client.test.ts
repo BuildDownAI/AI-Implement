@@ -47,7 +47,7 @@ function grant(overrides: Partial<ModelAuthGrantBootstrapV1> = {}): ModelAuthGra
     expiresAt: NOW + 60_000,
     bearer: S_BEARER,
     bindings: [
-      { stage: "implementation", profileId: "sub", profileRevision: 1, authMode: "codex-subscription", ownerGeneration: 3 },
+      { stage: "implementation", profileId: "sub", profileRevision: 1, authMode: "claude-subscription", ownerGeneration: 3 },
       { stage: "review", profileId: "api", profileRevision: 1, authMode: "openai-api-key" },
       { stage: "planning", profileId: "bed", profileRevision: 1, authMode: "bedrock" },
     ],
@@ -278,7 +278,7 @@ describe("client", () => {
           now: () => NOW,
           sleep: async () => {},
         });
-        await client.checkout({ profileId: "sub", authMode: "codex-subscription" as const });
+        await client.checkout({ profileId: "sub", authMode: "claude-subscription" as const });
         await client.invoke("sub", async (inv) => {
           for (const k of UNLISTED) expect(inv.env).not.toHaveProperty(k);
           expect(JSON.stringify(inv.env)).not.toContain("synthetic-");
@@ -310,7 +310,7 @@ describe("client", () => {
       version: 1,
       ok: true,
       profileId: "sub",
-      authMode: "codex-subscription",
+      authMode: "claude-subscription",
       ownerGeneration: 3,
       secret: { kind: "session", sessionData: S_SESSION, stateSequence: 5 },
       ...over,
@@ -337,7 +337,7 @@ describe("client", () => {
     });
   }
 
-  const sub = { profileId: "sub", authMode: "codex-subscription" as const };
+  const sub = { profileId: "sub", authMode: "claude-subscription" as const };
 
   it("writes a private 0700 dir with 0600 session file outside the workspace, then checkpoints after a successful invocation", async () => {
     const { transport, calls } = fakeTransport((route) => (reply(route, ack())));
@@ -346,14 +346,14 @@ describe("client", () => {
     const [dir] = readdirSync(authRoot);
     const full = join(authRoot, dir!);
     expect(statSync(full).mode & 0o777).toBe(0o700);
-    const file = join(full, "auth.json");
+    const file = join(full, ".credentials.json");
     expect(statSync(file).mode & 0o777).toBe(0o600);
-    expect(readdirSync(full)).toEqual(["auth.json"]); // no leftover temp file
+    expect(readdirSync(full)).toEqual([".credentials.json"]); // no leftover temp file
     expect(full.startsWith(workspace)).toBe(false);
 
     let argvSeen = "";
     const result = await client.invoke("sub", async (inv) => {
-      expect(realpathSync(inv.env.CODEX_HOME!)).toBe(realpathSync(full));
+      expect(realpathSync(inv.env.CLAUDE_CONFIG_DIR!)).toBe(realpathSync(full));
       expect(JSON.stringify(inv.env)).not.toContain(S_INHERITED);
       argvSeen = JSON.stringify(process.argv);
       writeFileSync(file, S_REFRESHED);
@@ -381,7 +381,7 @@ describe("client", () => {
     const { transport, calls } = fakeTransport((route) => (reply(route, ack())));
     const client = make(transport);
     await client.checkout(sub);
-    const file = join(authRoot, readdirSync(authRoot)[0]!, "auth.json");
+    const file = join(authRoot, readdirSync(authRoot)[0]!, ".credentials.json");
     const boom = new Error("model crashed");
     await expect(
       client.invoke("sub", async () => {
@@ -399,7 +399,6 @@ describe("client", () => {
   describe("checkout authorization happens before any file is written", () => {
     const cases: Array<[string, Record<string, unknown>]> = [
       ["cross-profile response", { profileId: "api" }],
-      ["wrong auth mode", { authMode: "claude-subscription" }],
       ["stale owner generation", { ownerGeneration: 2 }],
     ];
     for (const [name, over] of cases) {
@@ -435,11 +434,19 @@ describe("client", () => {
       );
     });
 
+    it("wrong auth mode", async () => {
+      const { transport } = fakeTransport(() => okCheckout({ authMode: "codex-subscription" }));
+      const client = make(transport);
+      expect(await categoryAsync(client.checkout(sub))).toBe("checkout_response_invalid");
+      expect(readdirSync(authRoot)).toEqual([]);
+      expect(client.status("sub")).toBe("unknown");
+    });
+
     it("rejects an unlisted profile, a mode differing from the binding, an unknown mode and an expired grant without a request", async () => {
       const { transport } = fakeTransport(() => okCheckout());
       const client = make(transport);
       expect(await categoryAsync(client.checkout({ profileId: "nope", authMode: "bedrock" }))).toBe("profile_not_allowed");
-      expect(await categoryAsync(client.checkout({ profileId: "sub", authMode: "claude-subscription" }))).toBe("binding_mismatch");
+      expect(await categoryAsync(client.checkout({ profileId: "sub", authMode: "codex-subscription" }))).toBe("binding_mismatch");
       expect(await categoryAsync(client.checkout({ profileId: "sub", authMode: "weird" as never }))).toBe("unsupported_auth_mode");
       expect(await categoryAsync(make(transport, {}, grant({ expiresAt: NOW - 1 })).checkout(sub))).toBe("bootstrap_expired");
       expect(transport.post).not.toHaveBeenCalled();
@@ -656,7 +663,7 @@ describe("client", () => {
       inheritedEnv: { OPENAI_API_KEY: S_INHERITED },
     });
     await client.checkout(sub);
-    const file = join(authRoot, readdirSync(authRoot)[0]!, "auth.json");
+    const file = join(authRoot, readdirSync(authRoot)[0]!, ".credentials.json");
     await client.invoke("sub", async (inv) => {
       expect(inv.env).not.toHaveProperty("OPENAI_API_KEY");
       writeFileSync(file, S_REFRESHED);

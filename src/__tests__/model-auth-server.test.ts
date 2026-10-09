@@ -51,7 +51,7 @@ let checkpointSpy: Mock<(...args: any[]) => any>;
 let lookupSpy: Mock<(...args: any[]) => any>;
 let transportSpy: Mock<(...args: any[]) => any>;
 
-const SUB: ModelAuthGrantBinding = { stage: "implementation", profileId: "sub1", profileRevision: 3, authMode: "codex-subscription", ownerGeneration: 1 };
+const SUB: ModelAuthGrantBinding = { stage: "implementation", profileId: "sub1", profileRevision: 3, authMode: "claude-subscription", ownerGeneration: 1 };
 const KEYB: ModelAuthGrantBinding = { stage: "review", profileId: "key1", profileRevision: 2, authMode: "openai-api-key" };
 
 function build(): ServerModule.ModelAuthHandlers {
@@ -215,7 +215,7 @@ describe("checkout", () => {
   it("returns session state with the verified generation and the real sequence", async () => {
     const res = await checkout("sub1");
     expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ ok: true, authMode: "codex-subscription", ownerGeneration: 1, secret: { kind: "session", sessionData: `${SESSION}-0`, stateSequence: 0 } });
+    expect(res.body).toMatchObject({ ok: true, authMode: "claude-subscription", ownerGeneration: 1, secret: { kind: "session", sessionData: `${SESSION}-0`, stateSequence: 0 } });
     expectNoLeak(res, [SESSION]);
   });
 
