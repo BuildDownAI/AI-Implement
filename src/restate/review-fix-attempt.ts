@@ -107,8 +107,9 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
       throw new restate.TerminalError("review-fix attempt is not prepared under this workflow key");
     }
 
-    if (await ctx.date.now() >= attempt.deadlineAt) {
-      const revokedAt = await ctx.date.now();
+    const startedAt = await ctx.date.now();
+    if (startedAt >= attempt.deadlineAt) {
+      const revokedAt = startedAt;
       await ctx.run("revoke-expired-before-launch", () => store.revokeAuthority(attemptId, revokedAt));
       const recordedAt = await ctx.date.now();
       await ctx.run("record-expired-before-launch", () => finalizer.recordOutcome({
