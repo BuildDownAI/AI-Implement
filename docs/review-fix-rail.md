@@ -120,7 +120,9 @@ Findings are collected from bot comments, and the rail itself posts bot comments
 - Any comment body containing `<!-- ai-implement` is skipped during collection.
 - A review whose body carries the native-review marker, or begins with `AI-Implement post-push review`, is ignored at the webhook.
 
-Trusted comment authors are an explicit allowlist (`ai-implement`, `claude`, and their `[bot]` forms), so an arbitrary bot commenting on a PR cannot inject findings.
+Trusted comment authors come from the project's review process (`src/review-process.ts`, ADR 038) plus the project's `trustedReviewAuthors`, through `isTrustedReviewAuthor`. The webhook reads both from the project mapping; the in-run ledger receives them as the `{ process, extraAuthors }` options argument, defaulting to the `ai-implement` process. The built-in authors stay trusted whatever the extra list holds, and `webhook.ts` and `review-ledger.ts` hold no author list of their own.
+
+Inline-comment severity follows the process. `ai-implement` keeps `medium` for every inline webhook comment. `claude-code-review` classifies a trusted bot's comment by its leading marker: 🔴 `blocking`, 🟡 or untagged `minor`, and 🟣 is skipped (the webhook answers `{ ignored: true, reason: "pre_existing" }` and stores nothing). Under that process a bot that is not trusted is ignored (`untrusted_author`). A human's inline comment is always `medium` and always enqueues (ADR 027), and a CHANGES_REQUESTED author's thread stays `blocking` whatever its marker.
 
 ## The review-findings contract
 

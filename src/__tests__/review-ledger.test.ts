@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { resolveReviewProcess } from "../review-process.js";
 import {
   classifyReviewIssueComment,
   collectExternalReviewFindingsFromGh,
@@ -2053,3 +2054,72 @@ function isPullReviewsRequest(args: string[]): boolean {
 function isIssueCommentsRequest(args: string[]): boolean {
   return args.includes("repos/:owner/:repo/issues/42/comments?per_page=100");
 }
+
+describe("collectExternalReviewFindingsFromGh review process options (AII-1181)", () => {
+  function spawnWithThreads(threads: Array<{ login: string; body: string }>, reviews: unknown[] = []): GhSpawn {
+    return (args) => {
+      if (isPullReviewsRequest(args)) return { exitCode: 0, stdout: JSON.stringify(reviews) };
+      if (isIssueCommentsRequest(args)) return { exitCode: 0, stdout: "[]" };
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  nodes: threads.map((t, i) => ({
+                    isResolved: false,
+                    isOutdated: false,
+                    path: "src/x.ts",
+                    line: i + 1,
+                    comments: { nodes: [{ body: t.body, url: `https://example.com/t${i}`, author: { login: t.login } }] },
+                  })),
+                },
+              },
+            },
+          },
+        }),
+      };
+    };
+  }
+
+  const ccr = { process: resolveReviewProcess("claude-code-review"), extraAuthors: [] as string[] };
+  const threads = [
+    { login: "claude", body: "🔴 bug" },
+    { login: "claude", body: "untagged" },
+    { login: "claude", body: "🟣 old" },
+    { login: "claude", body: "🟡 nit" },
+  ];
+
+  it("maps 🔴 to blocking, untagged and 🟡 to minor, and skips 🟣 under claude-code-review", () => {
+    const result = collectExternalReviewFindingsFromGh(spawnWithThreads(threads), "42", ccr);
+    expect(result.findings.map((f) => [f.body, f.severity])).toEqual([
+      ["🔴 bug", "blocking"],
+      ["untagged", "minor"],
+      ["🟡 nit", "minor"],
+    ]);
+  });
+
+  it("stays medium for every thread with no options", () => {
+    const result = collectExternalReviewFindingsFromGh(spawnWithThreads(threads), "42");
+    expect(result.findings.map((f) => f.severity)).toEqual(["medium", "medium", "medium", "medium"]);
+  });
+
+  it("keeps a human thread medium under claude-code-review", () => {
+    const result = collectExternalReviewFindingsFromGh(spawnWithThreads([{ login: "a-human", body: "🟣 note" }]), "42", ccr);
+    expect(result.findings.map((f) => f.severity)).toEqual(["medium"]);
+  });
+
+  it("keeps blocking for a CHANGES_REQUESTED author whatever the marker", () => {
+    const reviews = [{ state: "CHANGES_REQUESTED", user: { login: "claude[bot]" }, body: "", html_url: "https://example.com/r" }];
+    const result = collectExternalReviewFindingsFromGh(spawnWithThreads([{ login: "claude", body: "🟡 nit" }], reviews), "42", ccr);
+    expect(result.findings.filter((f) => f.source === "github-review-thread").map((f) => f.severity)).toEqual(["blocking"]);
+  });
+
+  it("applies the extra authors to trusted-author comment classification", () => {
+    const comment = { body: "### Code Review\n\n## Blocking\n- A finding.", user: { login: "topia-ai-implement-bot[bot]", type: "Bot" } };
+    expect(classifyReviewIssueComment(comment)).toBeNull();
+    const withExtra = { process: resolveReviewProcess("ai-implement"), extraAuthors: ["topia-ai-implement-bot[bot]"] };
+    expect(classifyReviewIssueComment(comment, withExtra)?.findings.length).toBeGreaterThan(0);
+  });
+});

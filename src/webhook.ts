@@ -6,6 +6,7 @@ import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { acceptReviewFixWebhookEvent } from "./review-fix-queue.js";
 import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, classifyReviewIssueComment, type ReviewLedgerFinding } from "./pipeline/review-ledger.js";
 import { getMappings } from "./config.js";
+import { classifyClaudeInlineMarker, isTrustedReviewAuthor, resolveReviewProcess } from "./review-process.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { resolveWorkflowContract } from "./workflow-probe.js";
 import { enqueueCommentGapfill } from "./comment-gapfill-queue.js";
@@ -514,6 +515,15 @@ export async function handleGitHubWebhook(
   res.end(JSON.stringify({ queued: true, reconciliationId }));
 }
 
+/** The review process and the project's extra authors for a repository; an unmapped repository gets the defaults. */
+function resolveRepoReviewProcess(repoFullName: string) {
+  const mapping = Object.values(getMappings()).find((m) => `${m.owner}/${m.repo}` === repoFullName);
+  return {
+    process: resolveReviewProcess(mapping?.reviewProcess),
+    extraAuthors: mapping?.trustedReviewAuthors ?? [],
+  };
+}
+
 function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse, deliveryId: string | undefined): void {
   if (payload.action !== "submitted" || payload.review?.state?.toUpperCase() !== "CHANGES_REQUESTED") {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -542,6 +552,17 @@ function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse, d
   if (isAiImplementNativeReviewBody(body)) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true, reason: "self_review" }));
+    return;
+  }
+
+  // A bot review counts only from a trusted author of the project's review process; humans always pass (ADR 027).
+  const reviewProcess = resolveRepoReviewProcess(repoFullName);
+  if (
+    payload.review?.user?.type === "Bot" &&
+    !isTrustedReviewAuthor(payload.review.user.login ?? "", reviewProcess.process, reviewProcess.extraAuthors)
+  ) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "untrusted_author" }));
     return;
   }
 
@@ -640,6 +661,26 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
     return;
   }
 
+  // Marker severity is a `claude-code-review` rule: the internal reviewers emit the ADR 020 block. Humans stay
+  // `medium`; an unlisted bot is ignored under every process.
+  const reviewProcess = resolveRepoReviewProcess(repoFullName);
+  let severity: ReviewLedgerFinding["severity"] = "medium";
+  const isBotAuthor = payload.comment?.user?.type === "Bot";
+  if (isBotAuthor && !isTrustedReviewAuthor(payload.comment?.user?.login ?? "", reviewProcess.process, reviewProcess.extraAuthors)) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "untrusted_author" }));
+    return;
+  }
+  if (reviewProcess.process.id === "claude-code-review" && isBotAuthor) {
+    const marker = classifyClaudeInlineMarker(body);
+    if (marker === null) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ignored: true, reason: "pre_existing" }));
+      return;
+    }
+    severity = marker === "blocking" ? "blocking" : "minor";
+  }
+
   const line = typeof payload.comment?.line === "number"
     ? payload.comment.line
     : typeof payload.comment?.original_line === "number"
@@ -652,7 +693,7 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
   // feedback flowing to the fixer without overriding an approving reviewer.
   const finding: ReviewLedgerFinding = {
     source: "github-review-thread",
-    severity: "medium",
+    severity,
     body,
     ...(payload.comment?.path ? { path: payload.comment.path } : {}),
     ...(typeof line === "number" ? { line } : {}),
@@ -880,7 +921,10 @@ async function handleIssueCommentWebhook(
     return;
   }
 
-  const classified = classifyReviewIssueComment((payload.comment ?? {}) as Record<string, unknown>);
+  const classified = classifyReviewIssueComment(
+    (payload.comment ?? {}) as Record<string, unknown>,
+    resolveRepoReviewProcess(payload.repository?.full_name ?? ""),
+  );
   if (classified === null) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));

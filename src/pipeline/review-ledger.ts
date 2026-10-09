@@ -1,3 +1,5 @@
+import { classifyClaudeInlineMarker, isTrustedReviewAuthor, resolveReviewProcess, type ReviewProcessDefinition } from "../review-process.js";
+
 export type ReviewLedgerSource =
   | "claude-review-summary"
   | "github-review"
@@ -39,17 +41,20 @@ export interface ExternalReviewFindingsResult {
   verdictSource?: ReviewLedgerSource;
 }
 
-export const TRUSTED_REVIEW_COMMENT_AUTHORS = new Set([
-  "ai-implement",
-  "ai-implement[bot]",
-  "claude",
-  "claude[bot]",
-  "claude-code[bot]",
-]);
+export interface ReviewLedgerOptions {
+  process: ReviewProcessDefinition;
+  extraAuthors: readonly string[];
+}
+
+const DEFAULT_REVIEW_LEDGER_OPTIONS: ReviewLedgerOptions = { process: resolveReviewProcess(null), extraAuthors: [] };
 
 const GITHUB_ACTIONS_REVIEW_AUTHOR = "github-actions";
 
-export function collectExternalReviewFindingsFromGh(ghSpawn: GhSpawn, prNumber: string): ExternalReviewFindingsResult {
+export function collectExternalReviewFindingsFromGh(
+  ghSpawn: GhSpawn,
+  prNumber: string,
+  options: ReviewLedgerOptions = DEFAULT_REVIEW_LEDGER_OPTIONS,
+): ExternalReviewFindingsResult {
   const findings: ReviewLedgerFinding[] = [];
   const out: { findingsUnavailable: boolean; verdict?: ReviewFindingsVerdict; verdictSource?: ReviewLedgerSource } = { findingsUnavailable: false };
 
@@ -57,8 +62,8 @@ export function collectExternalReviewFindingsFromGh(ghSpawn: GhSpawn, prNumber: 
   // CHANGES_REQUESTED state contribute blocking inline threads. Leftover nit threads from
   // a reviewer who has since approved (or only commented) are surfaced as non-blocking context.
   const blockingReviewerLogins = collectChangesRequestedReviews(ghSpawn, prNumber, findings);
-  collectClaudeIssueComments(ghSpawn, prNumber, findings, out);
-  collectUnresolvedReviewThreads(ghSpawn, prNumber, findings, blockingReviewerLogins);
+  collectClaudeIssueComments(ghSpawn, prNumber, findings, out, options);
+  collectUnresolvedReviewThreads(ghSpawn, prNumber, findings, blockingReviewerLogins, options);
 
   return {
     findings: dedupeReviewFindings(findings),
@@ -630,7 +635,10 @@ export interface ReviewCommentResult {
  * eligible author. Shared by the post-push-review ledger collector and the `issue_comment`
  * webhook so both read the same fenced `review-findings` contract and the same author rule.
  */
-export function classifyReviewIssueComment(comment: Record<string, unknown>): ReviewCommentResult | null {
+export function classifyReviewIssueComment(
+  comment: Record<string, unknown>,
+  options: ReviewLedgerOptions = DEFAULT_REVIEW_LEDGER_OPTIONS,
+): ReviewCommentResult | null {
   if (typeof comment.body !== "string" || isAiImplementComment(comment.body)) return null;
 
   const url = typeof comment.html_url === "string" ? comment.html_url : undefined;
@@ -638,7 +646,7 @@ export function classifyReviewIssueComment(comment: Record<string, unknown>): Re
   // Verdict marker path: accept only from the GitHub Actions bot or an
   // already-trusted Claude author. Other integrations must not be able to
   // supersede the latest Claude review by emitting a lookalike marker.
-  if (isVerdictEligibleAuthor(comment)) {
+  if (isVerdictEligibleAuthor(comment, options)) {
     const result = extractReviewFindingsBlock(comment.body, url);
     if (result !== null) {
       return {
@@ -651,7 +659,7 @@ export function classifyReviewIssueComment(comment: Record<string, unknown>): Re
 
   // Heading-based extraction (backward compat with target repos using trusted-author
   // Claude App identity that posts without a verdict marker).
-  if (isLikelyClaudeReviewComment(comment)) {
+  if (isLikelyClaudeReviewComment(comment, options)) {
     return { findings: extractClaudeSummaryFindings(comment.body, url), findingsUnavailable: false };
   }
 
@@ -672,6 +680,7 @@ function collectClaudeIssueComments(
   prNumber: string,
   findings: ReviewLedgerFinding[],
   out: { findingsUnavailable: boolean; verdict?: ReviewFindingsVerdict; verdictSource?: ReviewLedgerSource },
+  options: ReviewLedgerOptions,
 ): void {
   const result = safeGhSpawn(ghSpawn, [
     "api",
@@ -693,7 +702,7 @@ function collectClaudeIssueComments(
   for (const comment of comments) {
     if (!isRecord(comment)) continue;
 
-    const classified = classifyReviewIssueComment(comment);
+    const classified = classifyReviewIssueComment(comment, options);
     if (classified === null) continue;
 
     findings.push(...classified.findings);
@@ -722,6 +731,7 @@ function collectUnresolvedReviewThreads(
   prNumber: string,
   findings: ReviewLedgerFinding[],
   blockingReviewerLogins: Set<string>,
+  options: ReviewLedgerOptions,
 ): void {
   let after: string | undefined;
 
@@ -733,7 +743,7 @@ function collectUnresolvedReviewThreads(
     const reviewThreads = getReviewThreadsConnection(payload);
     if (!reviewThreads) return;
 
-    collectReviewThreadFindings(reviewThreads.nodes, findings, blockingReviewerLogins);
+    collectReviewThreadFindings(reviewThreads.nodes, findings, blockingReviewerLogins, options);
 
     if (reviewThreads.pageInfo?.hasNextPage !== true) return;
     if (typeof reviewThreads.pageInfo.endCursor !== "string" || !reviewThreads.pageInfo.endCursor) return;
@@ -791,6 +801,7 @@ function collectReviewThreadFindings(
   nodes: unknown[],
   findings: ReviewLedgerFinding[],
   blockingReviewerLogins: Set<string>,
+  options: ReviewLedgerOptions,
 ): void {
   for (const thread of nodes) {
     if (!isRecord(thread) || thread.isResolved !== false || thread.isOutdated === true) continue;
@@ -807,9 +818,18 @@ function collectReviewThreadFindings(
     // non-blocking nit that should not override the reviewer's approval.
     const author = latestComment.author;
     const authorLogin = isRecord(author) && typeof author.login === "string" ? author.login : "";
-    const severity: ReviewLedgerSeverity = authorLogin && blockingReviewerLogins.has(normalizeReviewerLogin(authorLogin))
-      ? "blocking"
-      : "medium";
+    let severity: ReviewLedgerSeverity = "medium";
+    if (authorLogin && blockingReviewerLogins.has(normalizeReviewerLogin(authorLogin))) {
+      severity = "blocking";
+    } else if (
+      options.process.id === "claude-code-review"
+      && authorLogin
+      && isTrustedReviewAuthor(authorLogin, options.process, options.extraAuthors)
+    ) {
+      const marker = classifyClaudeInlineMarker(body);
+      if (marker === null) continue;
+      severity = marker === "blocking" ? "blocking" : "minor";
+    }
 
     findings.push({
       source: "github-review-thread",
@@ -868,9 +888,12 @@ function getCommentNodes(thread: Record<string, unknown>): unknown[] | undefined
   return Array.isArray(comments.nodes) ? comments.nodes : undefined;
 }
 
-function isLikelyClaudeReviewComment(comment: Record<string, unknown>): comment is Record<string, unknown> & { body: string } {
+function isLikelyClaudeReviewComment(
+  comment: Record<string, unknown>,
+  options: ReviewLedgerOptions,
+): comment is Record<string, unknown> & { body: string } {
   if (typeof comment.body !== "string" || isAiImplementComment(comment.body)) return false;
-  return isClaudeAuthor(comment) && hasClaudeReviewHeading(comment.body);
+  return isClaudeAuthor(comment, options) && hasClaudeReviewHeading(comment.body);
 }
 
 function isGithubActionsClaudeReviewComment(comment: Record<string, unknown>): comment is Record<string, unknown> & { body: string } {
@@ -884,10 +907,12 @@ function isAiImplementComment(body: string): boolean {
   return body.includes("<!-- ai-implement");
 }
 
-function isClaudeAuthor(comment: Record<string, unknown>): boolean {
+function isClaudeAuthor(comment: Record<string, unknown>, options: ReviewLedgerOptions): boolean {
   const user = comment.user;
   if (!isRecord(user) || typeof user.login !== "string") return false;
-  return TRUSTED_REVIEW_COMMENT_AUTHORS.has(user.login.toLowerCase());
+  // The Actions bot is trusted by the process but reads through `isGithubActionsBotAuthor`, which also checks its type.
+  if (normalizeReviewerLogin(user.login) === GITHUB_ACTIONS_REVIEW_AUTHOR) return false;
+  return isTrustedReviewAuthor(user.login, options.process, options.extraAuthors);
 }
 
 function isGithubActionsBotAuthor(comment: Record<string, unknown>): boolean {
@@ -897,8 +922,8 @@ function isGithubActionsBotAuthor(comment: Record<string, unknown>): boolean {
     && normalizeReviewerLogin(user.login) === GITHUB_ACTIONS_REVIEW_AUTHOR;
 }
 
-function isVerdictEligibleAuthor(comment: Record<string, unknown>): boolean {
-  return isGithubActionsBotAuthor(comment) || isClaudeAuthor(comment);
+function isVerdictEligibleAuthor(comment: Record<string, unknown>, options: ReviewLedgerOptions): boolean {
+  return isGithubActionsBotAuthor(comment) || isClaudeAuthor(comment, options);
 }
 
 function hasClaudeReviewHeading(body: string): boolean {

@@ -2072,7 +2072,7 @@ describe("bot review gate integration (AII-745)", () => {
         html_url: "https://github.com/org/repo/pull/50#discussion_r99",
         path: "src/x.ts",
         line: 5,
-        user: { login: "codex[bot]", type: "Bot" },
+        user: { login: "claude[bot]", type: "Bot" },
         commit_id: "sha-current",
         created_at: new Date().toISOString(),
       },
@@ -2102,7 +2102,7 @@ describe("bot review gate integration (AII-745)", () => {
       comment: {
         body: "Still missing a null check here.",
         html_url: "https://github.com/org/repo/pull/51#discussion_r100",
-        user: { login: "codex[bot]", type: "Bot" },
+        user: { login: "claude[bot]", type: "Bot" },
         commit_id: "sha-old",
         created_at: new Date().toISOString(),
       },
@@ -2171,7 +2171,7 @@ describe("bot review gate integration (AII-745)", () => {
       comment: {
         body: "Still missing a null check here.",
         html_url: "https://github.com/org/repo/pull/54#discussion_r102",
-        user: { login: "codex[bot]", type: "Bot" },
+        user: { login: "claude[bot]", type: "Bot" },
         commit_id: "sha-current",
         created_at: eventAt,
       },
@@ -2199,7 +2199,7 @@ describe("bot review gate integration (AII-745)", () => {
     const jobId = log.appendLog({ issueId: "issue-55", issueIdentifier: "AII-55", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/55");
 
-    for (const author of [{ login: "codex[bot]", type: "Bot" }, { login: "a-human", type: "User" }]) {
+    for (const author of [{ login: "claude[bot]", type: "Bot" }, { login: "a-human", type: "User" }]) {
       const { req, res } = makeRequest(SECRET, "pull_request_review", {
         action: "submitted",
         review: {
@@ -2231,7 +2231,7 @@ describe("bot review gate integration (AII-745)", () => {
     const jobId = log.appendLog({ issueId: "issue-56", issueIdentifier: "AII-56", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/56");
 
-    for (const author of [{ login: "codex[bot]", type: "Bot" }, { login: "a-human", type: "User" }]) {
+    for (const author of [{ login: "claude[bot]", type: "Bot" }, { login: "a-human", type: "User" }]) {
       const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
         action: "created",
         comment: {
@@ -2554,5 +2554,137 @@ describe("/ai-implement comment trigger", () => {
     expect(reviewStore.listOpenReviewFindings("org/repo", 45)).toHaveLength(1);
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
     expect(commentGapfillQueue.claimPendingCommentGapfills(10)).toHaveLength(0);
+  });
+});
+
+describe("review process on inline review comments (AII-1181)", () => {
+  async function postInline(
+    pr: number,
+    user: { login: string; type: string },
+    body: string,
+    mapping?: { reviewProcess?: string | null; trustedReviewAuthors?: string[] },
+  ) {
+    const jobId = log.appendLog({ issueId: `issue-${pr}`, issueIdentifier: `AII-${pr}`, repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", `https://github.com/org/repo/pull/${pr}`);
+    if (mapping) {
+      const base = makeMappedEnvelopeRepo();
+      hoisted.getMappings.mockReturnValue({
+        "team-key": { ...base["team-key"]!, ...mapping } as RepoMapping,
+      });
+    } else {
+      hoisted.getMappings.mockReturnValue({});
+    }
+    const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+      action: "created",
+      comment: {
+        id: pr * 10,
+        body,
+        html_url: `https://github.com/org/repo/pull/${pr}#discussion_r${pr}`,
+        path: "src/x.ts",
+        line: 5,
+        user,
+        commit_id: "sha-current",
+        created_at: new Date().toISOString(),
+      },
+      pull_request: {
+        number: pr,
+        html_url: `https://github.com/org/repo/pull/${pr}`,
+        head: { ref: `ai-implement/AII-${pr}-fix`, sha: "sha-current" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+    return { body: JSON.parse(res.body), severities: reviewStore.listOpenReviewFindings("org/repo", pr).map((f) => f.severity) };
+  }
+
+  const CLAUDE = { login: "claude[bot]", type: "Bot" };
+  const TOPIA = { login: "topia-ai-implement-bot[bot]", type: "Bot" };
+
+  it("stores minor / blocking / minor for untagged / 🔴 / 🟡 from claude[bot] on a claude-code-review project", async () => {
+    const cases: Array<[string, string]> = [["plain note", "minor"], ["🔴 bug", "blocking"], ["🟡 nit", "minor"]];
+    let pr = 700;
+    for (const [text, severity] of cases) {
+      const out = await postInline(pr, CLAUDE, text, { reviewProcess: "claude-code-review" });
+      expect(out.body).toMatchObject({ queued: true });
+      expect(out.severities).toEqual([severity]);
+      pr++;
+    }
+  });
+
+  it("skips a 🟣 comment as pre_existing and stores nothing", async () => {
+    const out = await postInline(710, CLAUDE, "🟣 old code", { reviewProcess: "claude-code-review" });
+    expect(out.body).toEqual({ ignored: true, reason: "pre_existing" });
+    expect(out.severities).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("keeps medium for every marker on an ai-implement project and on an unmapped one", async () => {
+    let pr = 720;
+    for (const mapping of [{ reviewProcess: "ai-implement" }, { reviewProcess: null }, undefined]) {
+      for (const text of ["plain", "🔴 bug", "🟡 nit", "🟣 old"]) {
+        const out = await postInline(pr, CLAUDE, text, mapping);
+        expect(out.severities).toEqual(["medium"]);
+        pr++;
+      }
+    }
+  });
+
+  it("ignores an unlisted bot on claude-code-review and reads it with the project list", async () => {
+    const without = await postInline(740, TOPIA, "🔴 bug", { reviewProcess: "claude-code-review", trustedReviewAuthors: [] });
+    expect(without.body).toEqual({ ignored: true, reason: "untrusted_author" });
+    expect(without.severities).toEqual([]);
+
+    const withList = await postInline(741, TOPIA, "🔴 bug", {
+      reviewProcess: "claude-code-review",
+      trustedReviewAuthors: ["topia-ai-implement-bot[bot]"],
+    });
+    expect(withList.severities).toEqual(["blocking"]);
+  });
+
+  it("ignores an unlisted bot on ai-implement and unmapped projects, and reads it with the project list", async () => {
+    let pr = 750;
+    for (const base of [{ reviewProcess: "ai-implement" }, { reviewProcess: null }, undefined]) {
+      const without = await postInline(pr, TOPIA, "note", base ? { ...base, trustedReviewAuthors: [] } : undefined);
+      expect(without.body).toEqual({ ignored: true, reason: "untrusted_author" });
+      expect(without.severities).toEqual([]);
+      const withList = await postInline(pr + 1, TOPIA, "🔴 note", { ...(base ?? {}), trustedReviewAuthors: ["topia-ai-implement-bot[bot]"] });
+      expect(withList.severities).toEqual(["medium"]);
+      pr += 2;
+    }
+  });
+
+  it("ignores an unlisted bot's CHANGES_REQUESTED review under every process, and reads it when listed", async () => {
+    let pr = 770;
+    const postReview = async (user: { login: string; type: string }, mapping: { reviewProcess?: string | null; trustedReviewAuthors?: string[] }) => {
+      const jobId = log.appendLog({ issueId: `issue-${pr}`, issueIdentifier: `AII-${pr}`, repo: "org/repo" });
+      log.updateJobStatus(jobId, "completed", "success", `https://github.com/org/repo/pull/${pr}`);
+      const base = makeMappedEnvelopeRepo();
+      hoisted.getMappings.mockReturnValue({ "team-key": { ...base["team-key"]!, ...mapping } as RepoMapping });
+      const { req, res } = makeRequest(SECRET, "pull_request_review", {
+        action: "submitted",
+        review: { id: pr, state: "changes_requested", body: "Fix this.", user, commit_id: "sha-current", submitted_at: new Date().toISOString() },
+        pull_request: { number: pr, html_url: `https://github.com/org/repo/pull/${pr}`, head: { ref: `ai-implement/AII-${pr}-fix`, sha: "sha-current" } },
+        repository: { full_name: "org/repo" },
+      });
+      webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+      await res.done;
+      pr++;
+      return JSON.parse(res.body);
+    };
+    for (const reviewProcess of ["ai-implement", "claude-code-review"]) {
+      expect(await postReview(TOPIA, { reviewProcess, trustedReviewAuthors: [] })).toEqual({ ignored: true, reason: "untrusted_author" });
+      expect(await postReview(TOPIA, { reviewProcess, trustedReviewAuthors: ["topia-ai-implement-bot[bot]"] })).toMatchObject({ queued: true });
+    }
+  });
+
+  it("keeps a built-in author trusted with an unrelated extra list", async () => {
+    const out = await postInline(742, CLAUDE, "🔴 bug", { reviewProcess: "claude-code-review", trustedReviewAuthors: ["other[bot]"] });
+    expect(out.severities).toEqual(["blocking"]);
+  });
+
+  it("keeps a human's inline comment medium, even with a 🟣 marker, under claude-code-review", async () => {
+    const out = await postInline(743, { login: "a-human", type: "User" }, "🟣 note", { reviewProcess: "claude-code-review" });
+    expect(out.severities).toEqual(["medium"]);
   });
 });
