@@ -193,3 +193,6 @@ export function createReviewFixPR(deps: ReviewFixPRDependencies) {
 
   return restate.object({ name: "ReviewFixPR", handlers: { feedback, check, completed, capacityAvailable } });
 }
+
+/** The `ReviewFixPR` object's type, for the SDK's typed ingress client. */
+export type ReviewFixPRDefinition = ReturnType<typeof createReviewFixPR>;

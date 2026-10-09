@@ -668,3 +668,48 @@ describe("no launch/finalize/recovery decisions leak into this module", () => {
     }
   });
 });
+
+describe("createReviewFixIngressClient (AII-1184)", () => {
+  const event = {
+    eventId: "gh-delivery:d1", deliveryId: "d1", issueId: "i", issueIdentifier: "AII-1",
+    repo: "acme/app", prNumber: 42, reason: "review_comment",
+  };
+
+  it("posts the event to /ReviewFixPR/<key>/feedback with the idempotency-key and maps a 2xx to accepted", async () => {
+    const calls: Array<{ url: string; headers: Headers }> = [];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      calls.push({ url: request.url, headers: request.headers });
+      return new Response("null", { status: 200, headers: { "content-type": "application/json" } });
+    });
+    const ingress = client.createReviewFixIngressClient("http://sidecar", { fetchImpl: fetchImpl as unknown as typeof fetch });
+    const outcome = await ingress.feedback(makeDestination(), event, { idempotencyKey: "d1" });
+    expect(outcome).toEqual({ status: "accepted" });
+    expect(calls).toHaveLength(1);
+    expect(decodeURIComponent(calls[0]!.url)).toBe(`http://sidecar/ReviewFixPR/${JSON.stringify([7, "acme/app", 42])}/feedback`);
+    expect(calls[0]!.headers.get("idempotency-key")).toBe("d1");
+  });
+
+  it("maps a connection error to unavailable", async () => {
+    const fetchImpl = vi.fn(async () => { throw new Error("ECONNREFUSED"); });
+    const ingress = client.createReviewFixIngressClient("http://sidecar", { fetchImpl: fetchImpl as unknown as typeof fetch });
+    expect(await ingress.feedback(makeDestination(), event, { idempotencyKey: "d1" })).toEqual({ status: "unavailable" });
+  });
+
+  it("maps a timeout to unavailable", async () => {
+    const fetchImpl = vi.fn(
+      (_input: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+    );
+    const ingress = client.createReviewFixIngressClient("http://sidecar", { fetchImpl: fetchImpl as unknown as typeof fetch, timeoutMs: 20 });
+    expect(await ingress.feedback(makeDestination(), event, { idempotencyKey: "d1" })).toEqual({ status: "unavailable" });
+  });
+
+  it("maps a non-2xx to unavailable", async () => {
+    const fetchImpl = vi.fn(async () => new Response("boom", { status: 503 }));
+    const ingress = client.createReviewFixIngressClient("http://sidecar", { fetchImpl: fetchImpl as unknown as typeof fetch });
+    expect(await ingress.feedback(makeDestination(), event, { idempotencyKey: "d1" })).toEqual({ status: "unavailable" });
+  });
+});

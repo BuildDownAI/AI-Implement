@@ -22,7 +22,8 @@ import {
   retryDelivery,
   type ReviewFixDelivery,
 } from "../review-fix-inbox.js";
-import { reviewFixPRKey } from "./review-fix-pr.js";
+import * as restateClients from "@restatedev/restate-sdk-clients";
+import { reviewFixPRKey, type ReviewFixFeedbackEvent, type ReviewFixPRDefinition } from "./review-fix-pr.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 
 // Re-exported so an authenticated caller (the runner-callback / webhook routes that own
@@ -115,6 +116,41 @@ export function createRestateReviewFixFacade(deps: RestateReviewFixFacadeDeps = 
       invoke(resolved, "ReviewFixAttempt", result.attemptId, "result", result, idempotencyKey),
     deliverCancel: (attemptId, idempotencyKey) =>
       invoke(resolved, "ReviewFixAttempt", attemptId, "cancel", { attemptId }, idempotencyKey),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Typed ingress client for the webhook route (AII-1184)
+// ---------------------------------------------------------------------------
+
+/** Webhook intake forwards one authenticated event; there is no inbox behind it. */
+export interface ReviewFixIngressClient {
+  /** Forwards the validated event to `ReviewFixPR.feedback`; `idempotencyKey` is the GitHub delivery id. Never throws. */
+  feedback(scope: ScopedPrIdentity, event: ReviewFixFeedbackEvent, opts: { idempotencyKey: string }): Promise<ReviewFixFacadeOutcome>;
+}
+
+export interface ReviewFixIngressClientDeps {
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+}
+
+/** Real client on the SDK's typed ingress client. A connection error, timeout, or non-2xx resolves `unavailable`. */
+export function createReviewFixIngressClient(
+  baseUrl: string = RESTATE_INGRESS_BASE_URL,
+  deps: ReviewFixIngressClientDeps = {},
+): ReviewFixIngressClient {
+  const ingress = restateClients.connect({ url: baseUrl, ...(deps.fetchImpl ? { fetch: deps.fetchImpl } : {}) });
+  const timeout = deps.timeoutMs ?? DEFAULT_FACADE_TIMEOUT_MS;
+  return {
+    async feedback(scope, event, opts) {
+      try {
+        const rpc = restateClients.rpc.opts<ReviewFixFeedbackEvent, void>({ timeout, idempotencyKey: opts.idempotencyKey });
+        await ingress.objectClient<ReviewFixPRDefinition>({ name: "ReviewFixPR" }, reviewFixPRKey(scope)).feedback(event, rpc);
+        return { status: "accepted" };
+      } catch {
+        return { status: "unavailable" };
+      }
+    },
   };
 }
 

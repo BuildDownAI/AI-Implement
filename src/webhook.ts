@@ -5,7 +5,9 @@ import { enqueueReconciliation, hasReconciliationForPr } from "./reconciliation.
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { acceptReviewFixWebhookEvent } from "./review-fix-queue.js";
 import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, classifyReviewIssueComment, type ReviewLedgerFinding } from "./pipeline/review-ledger.js";
-import { getMappings } from "./config.js";
+import { getMappings, resolveReviewFixLifecycle } from "./config.js";
+import type { ReviewFixIngressClient } from "./restate/review-fix-client.js";
+import { REVIEW_FIX_EVENT_BODY_MAX_BYTES, type ReviewFixFeedbackEvent } from "./restate/review-fix-pr.js";
 import { classifyClaudeInlineMarker, isTrustedReviewAuthor, resolveReviewProcess } from "./review-process.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { resolveWorkflowContract } from "./workflow-probe.js";
@@ -273,6 +275,7 @@ async function handleKgPrCheckWebhook(
 
 interface ReviewPayload {
   action?: string;
+  installation?: { id?: number };
   review?: {
     id?: number;
     state?: string;
@@ -294,6 +297,7 @@ interface ReviewPayload {
 
 interface ReviewCommentPayload {
   action?: string;
+  installation?: { id?: number };
   comment?: {
     id?: number;
     body?: string;
@@ -317,6 +321,7 @@ interface ReviewCommentPayload {
 
 interface IssueCommentPayload {
   action?: string;
+  installation?: { id?: number };
   comment?: {
     id?: number;
     body?: string;
@@ -384,6 +389,7 @@ export async function handleGitHubWebhook(
   selfDeploy?: SelfDeployTarget,
   kgPrCheck?: KgPrCheckConfig,
   onReviewFixPrClosed?: (repository: string, prNumber: number) => void | Promise<void>,
+  reviewFixIngress?: ReviewFixIngressClient,
 ): Promise<void> {
   const body = await readRawBody(req);
   const signature = req.headers["x-hub-signature-256"] as string | undefined;
@@ -407,17 +413,17 @@ export async function handleGitHubWebhook(
   }
 
   if (event === "pull_request_review") {
-    handleReviewWebhook(payload as ReviewPayload, res, deliveryId);
+    await handleReviewWebhook(payload as ReviewPayload, res, deliveryId, reviewFixIngress);
     return;
   }
 
   if (event === "pull_request_review_comment") {
-    handleReviewCommentWebhook(payload as ReviewCommentPayload, res, deliveryId);
+    await handleReviewCommentWebhook(payload as ReviewCommentPayload, res, deliveryId, reviewFixIngress);
     return;
   }
 
   if (event === "issue_comment") {
-    await handleIssueCommentWebhook(payload as IssueCommentPayload, res, appId, privateKey, deliveryId);
+    await handleIssueCommentWebhook(payload as IssueCommentPayload, res, appId, privateKey, deliveryId, reviewFixIngress);
     return;
   }
 
@@ -519,12 +525,63 @@ export async function handleGitHubWebhook(
 function resolveRepoReviewProcess(repoFullName: string) {
   const mapping = Object.values(getMappings()).find((m) => `${m.owner}/${m.repo}` === repoFullName);
   return {
+    restate: mapping !== undefined && resolveReviewFixLifecycle(mapping) === "restate",
     process: resolveReviewProcess(mapping?.reviewProcess),
     extraAuthors: mapping?.trustedReviewAuthors ?? [],
   };
 }
 
-function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse, deliveryId: string | undefined): void {
+/** Cuts `text` to at most `maxBytes` UTF-8 bytes without splitting a code point. */
+function truncateUtf8(text: string, maxBytes: number): string {
+  const bytes = Buffer.from(text, "utf8");
+  if (bytes.length <= maxBytes) return text;
+  let end = maxBytes;
+  while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end--;
+  return bytes.subarray(0, end).toString("utf8");
+}
+
+/**
+ * Restate lifecycle (AII-1184): forwards the validated event to `ReviewFixPR.feedback` with the GitHub
+ * delivery id as the idempotency key, and writes nothing to SQLite. 503 on an unreachable ingress leaves the
+ * failed delivery for GitHub to redeliver (AII-1178) under the same id.
+ */
+async function forwardReviewFixEvent(
+  res: http.ServerResponse,
+  ingress: ReviewFixIngressClient | undefined,
+  input: Omit<ReviewFixFeedbackEvent, "deliveryId">,
+  deliveryId: string | undefined,
+  installationId: number | undefined,
+): Promise<void> {
+  const send = (status: number, body: unknown) => {
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(body));
+  };
+  if (!deliveryId) return send(400, { error: "missing_delivery_id" });
+  if (!installationId) return send(400, { error: "missing_installation" });
+  const event: ReviewFixFeedbackEvent = {
+    ...input,
+    reason: truncateUtf8(input.reason, REVIEW_FIX_EVENT_BODY_MAX_BYTES),
+    deliveryId,
+    ...(input.findings
+      ? { findings: input.findings.map((f) => ({ ...f, body: truncateUtf8(f.body, REVIEW_FIX_EVENT_BODY_MAX_BYTES) })) }
+      : {}),
+  };
+  const scope = { installationId, repository: input.repo, prNumber: input.prNumber };
+  const outcome = ingress ? await ingress.feedback(scope, event, { idempotencyKey: deliveryId }) : { status: "unavailable" as const };
+  if (outcome.status === "accepted") {
+    console.log(`[webhook] review event ${deliveryId} forwarded to ReviewFixPR ${JSON.stringify([installationId, input.repo, input.prNumber])}`);
+    return send(202, { forwarded: true });
+  }
+  console.warn(`[webhook] restate_unavailable: review event ${deliveryId} for ${input.repo}#${input.prNumber} not forwarded`);
+  send(503, { error: "restate_unavailable" });
+}
+
+async function handleReviewWebhook(
+  payload: ReviewPayload,
+  res: http.ServerResponse,
+  deliveryId: string | undefined,
+  ingress?: ReviewFixIngressClient,
+): Promise<void> {
   if (payload.action !== "submitted" || payload.review?.state?.toUpperCase() !== "CHANGES_REQUESTED") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
@@ -589,7 +646,7 @@ function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse, d
     body,
     ...(payload.review?.html_url ? { url: payload.review.html_url } : {}),
   };
-  const outcome = acceptReviewFixWebhookEvent({
+  const input = {
     eventId: resolveReviewFixEventId(deliveryId, {
       repo: repoFullName,
       prNumber,
@@ -608,7 +665,12 @@ function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse, d
     sourceUrl: payload.review?.html_url,
     actor: payload.review?.user?.login,
     findings: [finding],
-  });
+  };
+  if (reviewProcess.restate) {
+    await forwardReviewFixEvent(res, ingress, input, deliveryId, payload.installation?.id);
+    return;
+  }
+  const outcome = acceptReviewFixWebhookEvent(input);
 
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({
@@ -619,7 +681,12 @@ function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse, d
   }));
 }
 
-function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.ServerResponse, deliveryId: string | undefined): void {
+async function handleReviewCommentWebhook(
+  payload: ReviewCommentPayload,
+  res: http.ServerResponse,
+  deliveryId: string | undefined,
+  ingress?: ReviewFixIngressClient,
+): Promise<void> {
   if (payload.action !== "created") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
@@ -699,7 +766,7 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
     ...(typeof line === "number" ? { line } : {}),
     ...(payload.comment?.html_url ? { url: payload.comment.html_url } : {}),
   };
-  const outcome = acceptReviewFixWebhookEvent({
+  const input = {
     eventId: resolveReviewFixEventId(deliveryId, {
       repo: repoFullName,
       prNumber,
@@ -720,7 +787,12 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
     sourceUrl: payload.comment?.html_url,
     actor: payload.comment?.user?.login,
     findings: [finding],
-  });
+  };
+  if (reviewProcess.restate) {
+    await forwardReviewFixEvent(res, ingress, input, deliveryId, payload.installation?.id);
+    return;
+  }
+  const outcome = acceptReviewFixWebhookEvent(input);
 
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({
@@ -829,6 +901,7 @@ async function handleIssueCommentWebhook(
   appId?: string,
   privateKey?: string,
   deliveryId?: string,
+  ingress?: ReviewFixIngressClient,
 ): Promise<void> {
   if (payload.action !== "created") {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -984,7 +1057,7 @@ async function handleIssueCommentWebhook(
   }
 
   const reviewFixReason = classified.verdictSource === "review-contract" ? "review_contract" : "claude_review_summary";
-  const outcome = acceptReviewFixWebhookEvent({
+  const input = {
     eventId: resolveReviewFixEventId(deliveryId, {
       repo: repoFullName,
       prNumber,
@@ -1003,7 +1076,12 @@ async function handleIssueCommentWebhook(
     sourceUrl: payload.comment?.html_url,
     actor: payload.comment?.user?.login,
     findings: classified.findings,
-  });
+  };
+  if (resolveRepoReviewProcess(repoFullName).restate) {
+    await forwardReviewFixEvent(res, ingress, input, deliveryId, payload.installation?.id);
+    return;
+  }
+  const outcome = acceptReviewFixWebhookEvent(input);
 
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({

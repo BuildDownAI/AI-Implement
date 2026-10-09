@@ -13,7 +13,8 @@
 // constraint `endpoint.restate.test.ts` (AII-727) documents — see that file's header and
 // docs/restate-testing.md's "Container-to-host reachability" section. CI subsequently ran
 // it against pinned Restate 1.7.10; that is container evidence, not live-pilot evidence.
-import { randomUUID, createHash } from "node:crypto";
+import { randomUUID, createHash, createHmac } from "node:crypto";
+import { EventEmitter } from "node:events";
 import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getDb } from "../../dedup.js";
@@ -53,7 +54,9 @@ import { handleRunnerActivity, handleRunnerResult, type RunnerActivityBody } fro
 import { mintPreparedReviewFixToken } from "../../runner-tokens.js";
 import type { ReviewFixActivityEvent } from "../../review-fix-contract.js";
 import { acquire as acquireDispatchAdmission, release as releaseDispatchAdmission } from "../../dispatch-admission.js";
-import { createRestateReviewFixFacade, ReviewFixDeliveryPump } from "../../restate/review-fix-client.js";
+import { handleGitHubWebhook } from "../../webhook.js";
+import { appendLog, initLogTable, updateJobStatus } from "../../log.js";
+import { createRestateReviewFixFacade, createReviewFixIngressClient, ReviewFixDeliveryPump } from "../../restate/review-fix-client.js";
 import { createReviewFixAttempt, type ReviewFixAttemptCompletion } from "../../restate/review-fix-attempt.js";
 import { createReviewFixPR, reviewFixPRKey } from "../../restate/review-fix-pr.js";
 import {
@@ -447,6 +450,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     getDb();
     initMappingsTable();
     initDispatchBreakerTable();
+    initLogTable();
     environments = await startVariants([pr, attemptWorkflow]);
   }, 60_000);
   afterAll(async () => { if (environments) await stopAll(environments); });
@@ -1298,5 +1302,46 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const rows = await queryInvocations(env.adminAPIBaseUrl(),
       `target_service_name = 'ReviewFixPR' AND target_service_key = '${key}' AND target_handler_name = 'feedback'`);
     expect(journalText(await journalEntries(env.adminAPIBaseUrl(), rows[0].id as string))).toContain(event.deliveryId);
+  }, 20_000);
+  it.each(VARIANTS.map(([label]) => label))("a signed review comment webhook forwards through the ingress client to one finding and one queue row, once per delivery id (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("webhook-forward", { paused: true });
+    const [owner, repo] = fixture.scope.repository.split("/") as [string, string];
+    getDb().prepare("UPDATE mappings SET review_fix_lifecycle = 'restate' WHERE team_key = ?").run(owner);
+    const jobId = appendLog({ issueId: "issue-wh", issueIdentifier: "AII-9", repo: fixture.scope.repository });
+    updateJobStatus(jobId, "completed", "success", `https://github.com/${owner}/${repo}/pull/1`);
+
+    const secret = "webhook-forward-secret";
+    const ingress = createReviewFixIngressClient(env.baseUrl());
+    const body = JSON.stringify({
+      action: "created",
+      installation: { id: fixture.scope.installationId },
+      comment: { id: 99, body: "unchecked null in parser", html_url: "https://github.com/x/c", path: "a.ts", line: 4,
+        user: { login: "reviewer", type: "User" }, commit_id: "sha-1", created_at: new Date().toISOString() },
+      pull_request: { number: 1, html_url: `https://github.com/${owner}/${repo}/pull/1`, head: { ref: "ai-implement/AII-9-fix", sha: "sha-1" } },
+      repository: { full_name: fixture.scope.repository },
+    });
+    const deliver = async (deliveryId: string) => {
+      const req = Object.assign(new EventEmitter(), { headers: {
+        "x-hub-signature-256": `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`,
+        "x-github-event": "pull_request_review_comment", "x-github-delivery": deliveryId,
+      } });
+      process.nextTick(() => { req.emit("data", Buffer.from(body)); req.emit("end"); });
+      let status = 0;
+      let text = "";
+      const res = { writeHead: (code: number) => { status = code; }, end: (chunk?: string) => { text = chunk ?? ""; } };
+      await handleGitHubWebhook(req as never, res as never, secret, undefined, undefined, undefined, undefined, undefined, ingress);
+      return { status, body: JSON.parse(text) as unknown };
+    };
+    const counts = () => ({
+      findings: (getDb().prepare("SELECT COUNT(*) AS n FROM review_findings WHERE repo = ?").get(fixture.scope.repository) as { n: number }).n,
+      queue: (getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_queue WHERE repo = ?").get(fixture.scope.repository) as { n: number }).n,
+    });
+
+    const deliveryId = `wh-${randomUUID()}`;
+    expect(await deliver(deliveryId)).toEqual({ status: 202, body: { forwarded: true } });
+    expect(counts()).toEqual({ findings: 1, queue: 1 });
+    expect(await deliver(deliveryId)).toEqual({ status: 202, body: { forwarded: true } });
+    expect(counts()).toEqual({ findings: 1, queue: 1 });
   }, 20_000);
 });
