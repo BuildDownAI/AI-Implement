@@ -2,8 +2,9 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": true,
-    "declaration": false
+    "declaration": false,
+    "rootDir": "."
   },
-  "include": ["src/__tests__/restate/**/*.ts", "src/__tests__/restate-*.test.ts", "src/__tests__/operator-object.test.ts", "src/__tests__/tools.test.ts", "src/restate/**/*.ts"],
+  "include": ["vitest.restate.sequencer.ts", "src/__tests__/restate/**/*.ts", "src/__tests__/restate-*.test.ts", "src/__tests__/operator-object.test.ts", "src/__tests__/tools.test.ts", "src/restate/**/*.ts"],
   "exclude": []
 }

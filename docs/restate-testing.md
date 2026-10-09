@@ -164,7 +164,7 @@ npm run test:restate
 npx tsc --noEmit --project tsconfig.restate-tests.json
 ```
 
-`kg-refresh-workflow-scenarios.ts` is split into one test file per variant because that one file set the wall time of the whole pass (176 tests in one fork, about 127 s while the other files finished inside it); to run one variant, use `npx vitest run --config vitest.restate.config.ts src/__tests__/restate/kg-refresh-workflow-always-replay.restate.test.ts` (or the `-disable-retries` file). `startVariants(services, { only })` starts just the named variants, and tests that are not per-variant register only in the `alwaysReplay` file.
+`kg-refresh-workflow-scenarios.ts` is split into one test file per variant because that one file set the wall time of the whole pass (176 tests in one fork, about 127 s while the other files finished inside it); to run one variant, use `npx vitest run --config vitest.restate.config.ts src/__tests__/restate/kg-refresh-workflow-always-replay.restate.test.ts` (or the `-disable-retries` file). `startVariants(services, { only })` starts just the named variants, and tests that are not per-variant register only in the `alwaysReplay` file. `vitest.restate.sequencer.ts` orders files by their own size plus the same-folder modules they import, so the two thin split files start first: with no results cache (a fresh CI runner) vitest orders by file size alone and would start them last (AII-1166).
 
 Two runtimes serve the same scenario files (AII-914):
 

@@ -1,4 +1,5 @@
 import { defineConfig } from "vitest/config";
+import { RestateSequencer } from "./vitest.restate.sequencer.js";
 
 // Isolated from vitest.config.ts on purpose (AII-612): these tests boot a Restate
 // container via testcontainers and need Docker. `npm test` never loads this file.
@@ -11,6 +12,9 @@ export default defineConfig({
       // RESTATE_LOGGING=INFO on the command line; that value wins here.
       RESTATE_LOGGING: process.env.RESTATE_LOGGING ?? "WARN",
     },
+    // Vitest starts files by byte size when it has no results cache (a fresh CI runner), which puts the
+    // thin kg-refresh split files last; RestateSequencer weighs imports too (AII-1166).
+    sequence: { sequencer: RestateSequencer },
     pool: "forks",
     setupFiles: ["src/__tests__/setup/clear-runner-credentials.ts"],
     include: ["src/__tests__/restate/**/*.restate.test.ts"],
