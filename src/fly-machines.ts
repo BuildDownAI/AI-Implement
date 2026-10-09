@@ -115,6 +115,19 @@ export async function createMachine(
   return (await res.json()) as Machine;
 }
 
+/** A non-2xx Fly Machines answer. The message text is unchanged; `status` and `retryAfterSeconds` let callers branch without parsing it. */
+export class FlyApiError extends Error {
+  readonly status: number;
+  readonly retryAfterSeconds: number | null;
+  constructor(message: string, res: { status: number; headers?: { get(name: string): string | null } }) {
+    super(message);
+    this.name = "FlyApiError";
+    this.status = res.status;
+    const raw = Number(res.headers?.get("retry-after"));
+    this.retryAfterSeconds = Number.isFinite(raw) && raw > 0 ? raw : null;
+  }
+}
+
 export async function getMachine(
   token: string,
   appName: string,
@@ -125,7 +138,7 @@ export async function getMachine(
 
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`Failed to get machine ${machineId} (${res.status}): ${body}`);
+    throw new FlyApiError(`Failed to get machine ${machineId} (${res.status}): ${body}`, res);
   }
 
   return (await res.json()) as Machine;
@@ -196,32 +209,107 @@ export async function updateMachine(
 
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`Failed to update machine ${machineId} (${res.status}): ${body}`);
+    throw new FlyApiError(`Failed to update machine ${machineId} (${res.status}): ${body}`, res);
   }
 
   return (await res.json()) as Machine;
 }
 
+export interface SettleOptions {
+  timeoutMs?: number;
+  intervalMs?: number;
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
 /**
- * Reads the machine, then replaces its config with the same one and `env: {}`. Fly's update on a
- * stopped machine applies the config without starting it (AII-1123), so this never calls `start`.
- * Optional `metadata` is merged into the same update: Fly applies the update after the API
- * answers, so a separate metadata write afterwards is overwritten by the update's older snapshot.
+ * Polls the machine until its state is not `replacing` (Fly is still applying an update) and
+ * returns it; null when the machine is gone (404). Throws on timeout, naming the last state.
+ * `/wait?state=` cannot express "anything but replacing", so this polls `getMachine`.
+ */
+export async function waitForMachineSettled(
+  token: string,
+  appName: string,
+  machineId: string,
+  { timeoutMs = 60_000, intervalMs = 1_000 }: SettleOptions = {},
+): Promise<Machine | null> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let machine: Machine;
+    try {
+      machine = await getMachine(token, appName, machineId);
+    } catch (err) {
+      if (err instanceof FlyApiError && err.status === 404) return null;
+      throw err;
+    }
+    if (machine.state !== "replacing") return machine;
+    if (Date.now() + intervalMs > deadline) {
+      throw new Error(`Timeout waiting for machine ${machineId} to leave "replacing" (state=${machine.state})`);
+    }
+    await sleep(intervalMs);
+  }
+}
+
+const CLEAR_ATTEMPTS = 3;
+const DEFAULT_RATE_LIMIT_WAIT_MS = 2_000;
+
+function isEnvCleared(machine: Machine, metadata?: Record<string, string>): boolean {
+  if (Object.keys(machine.config.env ?? {}).length > 0) return false;
+  return Object.entries(metadata ?? {}).every(([k, v]) => machine.config.metadata?.[k] === v);
+}
+
+/**
+ * Settles the machine, replaces its config with the same one and `env: {}`, settles again and
+ * reads it back; returns only when the env is empty and the requested metadata keys are present.
+ * Fly's update on a stopped machine applies the config without starting it (AII-1123), so this
+ * never calls `start`. Optional `metadata` is merged into the same update: Fly applies the update
+ * after the API answers, so a separate metadata write afterwards is overwritten by the update's
+ * older snapshot.
+ *
+ * A 409 "concurrent update in progress" and a 429 are waits, not failures (AII-1190): the 409
+ * means an update is applying, the 429 waits `retry-after` (else 2 s); both re-read and, if the
+ * env is still set, update again, up to three attempts.
  */
 export async function clearMachineEnv(
   token: string,
   appName: string,
   machineId: string,
   metadata?: Record<string, string>,
+  settle: SettleOptions = {},
 ): Promise<void> {
-  const machine = await getMachine(token, appName, machineId);
-  const config = { ...machine.config, env: {} };
-  await updateMachine(
-    token,
-    appName,
-    machineId,
-    metadata ? { ...config, metadata: { ...machine.config.metadata, ...metadata } } : config,
-  );
+  let last: Machine | null = null;
+  for (let attempt = 1; attempt <= CLEAR_ATTEMPTS; attempt++) {
+    const machine = await waitForMachineSettled(token, appName, machineId, settle);
+    if (!machine) throw new Error(`Failed to get machine ${machineId} (404): gone before the scrub`);
+    // Already clean (e.g. an SDK retry of a scrub Fly applied): no second update, no second replace window.
+    if (isEnvCleared(machine, metadata)) return;
+    const config = { ...machine.config, env: {} };
+    try {
+      await updateMachine(
+        token,
+        appName,
+        machineId,
+        metadata ? { ...config, metadata: { ...machine.config.metadata, ...metadata } } : config,
+      );
+    } catch (err) {
+      if (err instanceof FlyApiError && err.status === 409 && /concurrent update in progress/i.test(err.message)) {
+        // An update is applying; the settle at the top of the next pass waits it out.
+      } else if (err instanceof FlyApiError && err.status === 429) {
+        await sleep(err.retryAfterSeconds !== null ? err.retryAfterSeconds * 1000 : DEFAULT_RATE_LIMIT_WAIT_MS);
+      } else {
+        throw err;
+      }
+      const after = await waitForMachineSettled(token, appName, machineId, settle);
+      if (after && isEnvCleared(after, metadata)) return;
+      last = after;
+      continue;
+    }
+    const after = await waitForMachineSettled(token, appName, machineId, settle);
+    if (after && isEnvCleared(after, metadata)) return;
+    last = after;
+    break;
+  }
+  throw new Error(`Scrub of machine ${machineId} not verified: state=${last?.state ?? "gone"}, env keys=[${Object.keys(last?.config.env ?? {}).join(",")}]`);
 }
 
 /**

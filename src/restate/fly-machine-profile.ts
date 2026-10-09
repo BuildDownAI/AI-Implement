@@ -183,6 +183,17 @@ export function mergeProfile(base: FlyMachineProfileConfig | null, patch: Partia
   return validateConfig(merged as FlyMachineProfileConfig);
 }
 
+/**
+ * Fly's replace window outlasts the SDK's 50 ms default backoff, so the scrub retries slowly:
+ * waits of 2 + 4 + 8 + 10 s (about 24 s) between five attempts before `destroy-unscrubbed` can run.
+ */
+const SCRUB_RETRY = {
+  maxRetryAttempts: 5,
+  initialRetryInterval: { seconds: 2 },
+  retryIntervalFactor: 2,
+  maxRetryInterval: { seconds: 10 },
+};
+
 export function createFlyMachineProfile(deps: FlyMachineProfileDeps) {
   async function read(ctx: ObjectSharedContext): Promise<FlyMachineProfileView | null> {
     const stored = await ctx.get<FlyMachineProfileConfig>(PROFILE_KEY);
@@ -247,7 +258,7 @@ export function createFlyMachineProfile(deps: FlyMachineProfileDeps) {
     try {
       await ctx.run("scrub", async () => {
         await deps.fly.clearMachineEnv(machineId, { [DURABLE_UNTIL_KEY]: String(Math.floor((now + idleTimeoutMs + ONE_DAY_MS) / 1000)) });
-      }, { maxRetryAttempts: 3 });
+      }, SCRUB_RETRY);
     } catch (err) {
       if (restate.internal.isSuspendedError(err)) throw err;
       scrubbed = false;
