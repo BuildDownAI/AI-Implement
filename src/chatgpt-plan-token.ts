@@ -107,15 +107,6 @@ export type RefreshResult =
   | { ok: true; record: ChatGptPlanRecordV1 }
   | { ok: false; failure: RefreshFailure; status: number | null; code: string | null };
 
-const REAUTH_CODES = new Set([
-  "invalid_grant",
-  "invalid_refresh_token",
-  "token_expired",
-  "refresh_token_expired",
-  "refresh_token_invalidated",
-  "refresh_token_reused",
-]);
-
 function fail(failure: RefreshFailure, status: number | null, code: string | null = null): RefreshResult {
   return { ok: false, failure, status, code };
 }
@@ -127,7 +118,7 @@ function safeCode(value: unknown): string | null {
 function classifyError(status: number, code: string | null): RefreshFailure {
   if (code === "invalid_client") return "invalid_client";
   if (status >= 500 || status === 429) return "transient";
-  if ((status === 400 || status === 401) && code !== null && REAUTH_CODES.has(code)) return "reauth_required";
+  // 400/401 with a known reauth code and every other 4xx both need a new sign-in.
   if (status >= 400 && status < 500) return "reauth_required";
   return "transient";
 }
