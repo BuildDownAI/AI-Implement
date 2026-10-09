@@ -1,6 +1,14 @@
 import { createAppJwt, githubAppHeaders } from "./github-app-auth.js";
 import { defaultFetchSignal } from "./github.js";
 
+/**
+ * Redelivers the GitHub App's failed webhook deliveries when Restate registers.
+ *
+ * Today only the KG PR-check route (`handleKgPrCheckWebhook`) answers 503 while
+ * Restate is unavailable. The three review handlers still write SQLite and answer
+ * 200; they gain the 503 path with AII-1184, and this sweep lands first so that
+ * path is recoverable from its first day.
+ */
 const API = "https://api.github.com";
 const DEFAULT_WINDOW_MS = 24 * 60 * 60 * 1000;
 // Bounds the sweep if a Link header never ends; 100 per page covers 5000 deliveries.
