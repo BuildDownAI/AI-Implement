@@ -855,6 +855,19 @@ interface AttributionRow {
   usage_json: string;
 }
 
+const attributionReadWarned = new Set<string>();
+
+/** A failed attribution read degrades to "no attribution". Warns once per process per error class, by
+ *  class name only (never message or values). A missing table (pre-migration database) stays silent. */
+function warnAttributionReadFailure(err: unknown): void {
+  const message = err instanceof Error ? err.message : "";
+  if (/no such table/i.test(message)) return;
+  const cls = err instanceof Error ? err.constructor.name || err.name : typeof err;
+  if (attributionReadWarned.has(cls)) return;
+  attributionReadWarned.add(cls);
+  console.warn(`[log] attribution read failed (${cls}); jobs will show no attribution`);
+}
+
 /** Projects stored invocation rows through `sanitizeAttribution`, so Job reads, callbacks and local
  *  summaries share one bounded shape. The latest row per dispatch wins; a malformed row reads as absent. */
 function readAttributionsByDispatch(dispatchIds: Array<string | null>): Map<string, InvocationAttributionV1> {
@@ -869,7 +882,8 @@ function readAttributionsByDispatch(dispatchIds: Array<string | null>): Map<stri
          FROM model_invocation_attribution WHERE dispatch_id IN (${ids.map(() => "?").join(",")}) ORDER BY rowid`,
       )
       .all(...ids) as AttributionRow[];
-  } catch {
+  } catch (err) {
+    warnAttributionReadFailure(err);
     return out;
   }
   for (const row of rows) {

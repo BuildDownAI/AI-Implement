@@ -5086,7 +5086,19 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
     expect(job.attribution).toMatchObject({ invocationId: "inv-1", usage: { availability: "complete", tokensIn: 100, tokensOut: 10, costUsd: 0.5 } });
   });
 
-  it("does not store a claim from another snapshot", async () => {
+  it("does not store a clean claim from another snapshot", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const res = await deliver(claim({ snapshotId: "other-snap" }));
+    expect(res.status).toBe(200);
+    expect(rows()).toHaveLength(0);
+    const job = log.getJobByDispatchId("disp-attr")!;
+    expect(job.attribution).toBeNull();
+    expect(job.status).toBe("completed");
+    expect(warn.mock.calls.join(" ")).toContain("not matching the dispatch snapshot");
+    expect(warn.mock.calls.join(" ")).not.toContain("invalid attribution");
+  });
+
+  it("does not store a secret-shaped claim from another snapshot", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const res = await deliver(claim({ snapshotId: "other-snap", model: PLANTED }));
     expect(res.status).toBe(200);

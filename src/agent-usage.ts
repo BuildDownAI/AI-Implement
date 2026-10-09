@@ -236,7 +236,9 @@ const isSubscription = (m: AccountAuthMode): boolean => m === "claude-subscripti
 
 /** Deduplicates by snapshot-scoped invocation identity and aggregates. Byte-equivalent repeats are
  *  ignored; a repeated identity within one snapshot with different content is counted in
- *  `conflicts` and the first record wins. Identical ids under different snapshots stay distinct. */
+ *  `conflicts` and the first record wins. Identical ids under different snapshots stay distinct here.
+ *  The persisted `model_invocation_attribution` table is stricter: its primary key is `invocation_id`
+ *  alone, so `INSERT OR IGNORE` deduplicates by `invocation_id`, which must be globally unique. */
 export function aggregateUsage(input: readonly InvocationUsageRow[]): AgentUsageAggregate {
   const seen = new Map<string, string>();
   const rows: InvocationUsageRow[] = [];
