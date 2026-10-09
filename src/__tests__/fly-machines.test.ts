@@ -7,6 +7,7 @@ import {
   startMachine,
   updateMachine,
   clearMachineEnv,
+  waitForMachineSettled,
   destroyMachine,
   waitForMachine,
   generateSessionToken,
@@ -1122,62 +1123,153 @@ describe("startMachine / updateMachine (AII-1123)", () => {
 
 describe("clearMachineEnv", () => {
   beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
+  afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
-  it("reads the machine and posts the same config with env: {}; never starts it", async () => {
+  const url = `https://api.machines.dev/v1/apps/${APP}/machines/machine-123`;
+  const ok = (body: unknown) => ({ ok: true, status: 200, json: async () => body }) as Response;
+  const fail = (status: number, text: string, headers: Record<string, string> = {}) =>
+    ({ ok: false, status, text: async () => text, headers: new Headers(headers) }) as Response;
+  const posts = () => vi.mocked(fetch).mock.calls.filter(([, o]) => (o as RequestInit | undefined)?.method === "POST");
+  const fast = { intervalMs: 1, timeoutMs: 1000 };
+
+  it("settles, posts the same config with env: {}, reads back; never starts it", async () => {
     const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { GITHUB_TOKEN: "x" } } };
     vi.mocked(fetch)
-      .mockResolvedValueOnce({ ok: true, json: async () => withEnv } as Response)
-      .mockResolvedValueOnce({ ok: true, json: async () => mockMachine } as Response);
+      .mockResolvedValueOnce(ok(withEnv))
+      .mockResolvedValueOnce(ok(mockMachine))
+      .mockResolvedValueOnce(ok({ ...mockMachine, config: { ...mockMachine.config, env: {} } }));
 
-    await clearMachineEnv(TOKEN, APP, "machine-123");
+    await clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast);
 
     const calls = vi.mocked(fetch).mock.calls;
-    expect(calls).toHaveLength(2);
-    expect(calls[0][0]).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123`);
+    expect(calls).toHaveLength(3);
+    expect(calls[0][0]).toBe(url);
     expect((calls[0][1] as RequestInit | undefined)?.method).toBeUndefined();
-    expect(calls[1][0]).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123`);
-    expect((calls[1][1] as RequestInit).method).toBe("POST");
-    expect(JSON.parse((calls[1][1] as RequestInit).body as string)).toEqual({ config: { ...withEnv.config, env: {} } });
-    expect(calls.some(([url]) => String(url).endsWith("/start"))).toBe(false);
+    expect(posts()).toHaveLength(1);
+    expect(JSON.parse((posts()[0][1] as RequestInit).body as string)).toEqual({ config: { ...withEnv.config, env: {} } });
+    expect(calls.some(([u]) => String(u).endsWith("/start"))).toBe(false);
   });
 
-  it("merges metadata into the one update and never calls the metadata endpoint", async () => {
-    const m = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" }, metadata: { purpose: "durable-runner", durable_until: "1" } } };
+  it("waits out `replacing` reads, then makes exactly one update", async () => {
+    const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { GITHUB_TOKEN: "x" } } };
+    const replacing = { ...withEnv, state: "replacing" };
+    const stopped = { ...withEnv, state: "stopped" };
+    const cleared = { ...mockMachine, state: "stopped", config: { ...mockMachine.config, env: {} } };
     vi.mocked(fetch)
-      .mockResolvedValueOnce({ ok: true, json: async () => m } as Response)
-      .mockResolvedValueOnce({ ok: true, json: async () => mockMachine } as Response);
+      .mockResolvedValueOnce(ok(replacing))
+      .mockResolvedValueOnce(ok(replacing))
+      .mockResolvedValueOnce(ok(stopped))
+      .mockResolvedValueOnce(ok(cleared))
+      .mockResolvedValueOnce(ok(cleared));
+    await clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast);
+    expect(posts()).toHaveLength(1);
+  });
 
-    await clearMachineEnv(TOKEN, APP, "machine-123", { durable_until: "123" });
+  it("merges metadata into the one update, never calls the metadata endpoint, and verifies it", async () => {
+    const m = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" }, metadata: { purpose: "durable-runner", durable_until: "1" } } };
+    const done = { ...m, config: { ...m.config, env: {}, metadata: { purpose: "durable-runner", durable_until: "123" } } };
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(ok(m))
+      .mockResolvedValueOnce(ok(m))
+      .mockResolvedValueOnce(ok(done));
 
-    const calls = vi.mocked(fetch).mock.calls;
-    expect(calls).toHaveLength(2);
-    expect(calls.some(([url]) => String(url).includes("/metadata"))).toBe(false);
-    expect(JSON.parse((calls[1][1] as RequestInit).body as string)).toEqual({
+    await clearMachineEnv(TOKEN, APP, "machine-123", { durable_until: "123" }, fast);
+
+    expect(vi.mocked(fetch).mock.calls.some(([u]) => String(u).includes("/metadata"))).toBe(false);
+    expect(JSON.parse((posts()[0][1] as RequestInit).body as string)).toEqual({
       config: { ...m.config, env: {}, metadata: { purpose: "durable-runner", durable_until: "123" } },
     });
   });
 
   it("adds metadata when the machine has none", async () => {
     const m = { ...mockMachine, config: { ...mockMachine.config, metadata: undefined } };
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({ ok: true, json: async () => m } as Response)
-      .mockResolvedValueOnce({ ok: true, json: async () => mockMachine } as Response);
-    await clearMachineEnv(TOKEN, APP, "m", { durable_until: "5" });
-    const body = JSON.parse((vi.mocked(fetch).mock.calls[1][1] as RequestInit).body as string);
+    const done = { ...m, config: { ...m.config, env: {}, metadata: { durable_until: "5" } } };
+    vi.mocked(fetch).mockResolvedValueOnce(ok(m)).mockResolvedValueOnce(ok(m)).mockResolvedValueOnce(ok(done));
+    await clearMachineEnv(TOKEN, APP, "m", { durable_until: "5" }, fast);
+    const body = JSON.parse((posts()[0][1] as RequestInit).body as string);
     expect(body.config.metadata).toEqual({ durable_until: "5" });
   });
 
-  it("throws when the read fails, without posting", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 404, text: async () => "gone" } as Response);
-    await expect(clearMachineEnv(TOKEN, APP, "m")).rejects.toThrow("(404)");
+  it("treats a 409 concurrent update as a wait and succeeds once the env is clear", async () => {
+    const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
+    const cleared = { ...mockMachine, config: { ...mockMachine.config, env: {} } };
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(ok(withEnv))
+      .mockResolvedValueOnce(fail(409, '{"error":"aborted: machine is replacing: concurrent update in progress"}'))
+      .mockResolvedValueOnce(ok(cleared));
+    await expect(clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast)).resolves.toBeUndefined();
+    expect(posts()).toHaveLength(1);
+  });
+
+  it("waits the retry-after interval on a 429, then re-reads", async () => {
+    vi.useFakeTimers();
+    const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
+    const cleared = { ...mockMachine, config: { ...mockMachine.config, env: {} } };
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(ok(withEnv))
+      .mockResolvedValueOnce(fail(429, "resource_exhausted: rate limit exceeded", { "retry-after": "7" }))
+      .mockResolvedValueOnce(ok(cleared));
+    const p = clearMachineEnv(TOKEN, APP, "machine-123");
+    await vi.advanceTimersByTimeAsync(6_900);
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(200);
+    await expect(p).resolves.toBeUndefined();
+  });
+
+  it("waits 2 s on a 429 without retry-after", async () => {
+    vi.useFakeTimers();
+    const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
+    const cleared = { ...mockMachine, config: { ...mockMachine.config, env: {} } };
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(ok(withEnv))
+      .mockResolvedValueOnce(fail(429, "rate limit"))
+      .mockResolvedValueOnce(ok(cleared));
+    const p = clearMachineEnv(TOKEN, APP, "machine-123");
+    await vi.advanceTimersByTimeAsync(1_900);
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(200);
+    await expect(p).resolves.toBeUndefined();
+  });
+
+  it("throws naming the machine and state when the env never clears", async () => {
+    const withEnv = { ...mockMachine, state: "stopped", config: { ...mockMachine.config, env: { A: "1" } } };
+    vi.mocked(fetch).mockResolvedValue(ok(withEnv));
+    await expect(clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast)).rejects.toThrow(/machine-123.*state=stopped/);
+  });
+
+  it("skips the update when the env is already clear and the metadata present", async () => {
+    const clean = { ...mockMachine, config: { ...mockMachine.config, env: {}, metadata: { durable_until: "5" } } };
+    vi.mocked(fetch).mockResolvedValueOnce(ok(clean));
+    await clearMachineEnv(TOKEN, APP, "machine-123", { durable_until: "5" }, fast);
+    expect(posts()).toHaveLength(0);
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
-  it("throws when the update fails", async () => {
+  it("throws when the read fails, without posting", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(fail(404, "gone"));
+    await expect(clearMachineEnv(TOKEN, APP, "m", undefined, fast)).rejects.toThrow("(404)");
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws when the update fails with a non-wait status", async () => {
     vi.mocked(fetch)
-      .mockResolvedValueOnce({ ok: true, json: async () => mockMachine } as Response)
-      .mockResolvedValueOnce({ ok: false, status: 500, text: async () => "boom" } as Response);
-    await expect(clearMachineEnv(TOKEN, APP, "m")).rejects.toThrow("(500)");
+      .mockResolvedValueOnce(ok({ ...mockMachine, config: { ...mockMachine.config, env: { A: "b" } } }))
+      .mockResolvedValueOnce(fail(500, "boom"));
+    await expect(clearMachineEnv(TOKEN, APP, "m", undefined, fast)).rejects.toThrow("(500)");
+  });
+});
+
+describe("waitForMachineSettled", () => {
+  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it("returns null when the machine is gone", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 404, text: async () => "nope", headers: new Headers() } as Response);
+    expect(await waitForMachineSettled(TOKEN, APP, "m", { intervalMs: 1 })).toBeNull();
+  });
+
+  it("throws on timeout naming the machine and the state", async () => {
+    vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200, json: async () => ({ ...mockMachine, state: "replacing" }) } as Response);
+    await expect(waitForMachineSettled(TOKEN, APP, "machine-123", { intervalMs: 5, timeoutMs: 20 })).rejects.toThrow(/machine-123.*replacing/);
   });
 });
