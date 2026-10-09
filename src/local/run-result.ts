@@ -68,7 +68,7 @@ export interface LocalArtifactInput {
   endedAt: Date;
   passes: LocalRunPass[];
   tokenSummary?: LocalRunTokenSummary | null;
-  /** Optional final-result attribution (AII-946); not written by writeRunArtifacts until AII-971. */
+  /** Optional final-result attribution (AII-946); re-sanitized and written to summary.json by writeRunArtifacts when valid. */
   attribution?: InvocationAttributionV1 | null;
   /** Machine-readable failure code, e.g. "REVIEW_UNAPPROVED", "MAX_TURNS_EXHAUSTED", or "INSTALL_FAILED". */
   failureCode?: string | null;

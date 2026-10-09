@@ -314,3 +314,28 @@ describe("feedbackLoopStep — planning context routing", () => {
     expect(mockImplementRun.mock.calls[1][1].planningContext).toBe(barOnlyContext);
   });
 });
+
+describe("feedbackLoopStep — pass attribution (AII-971)", () => {
+  const attribution = {
+    version: 1 as const, invocationId: "inv-1", stage: "implementation" as const, snapshotId: "snap-1",
+    agent: "codex" as const, provider: "openai" as const, model: "gpt-synthetic", profileId: "p1",
+    authMode: "openai-api-key" as const, limit: null, outcome: "success" as const, usage: null,
+  };
+  const run = async () => {
+    const out = await feedbackLoopStep.run(
+      makeCtx(),
+      { workspaceDir: "/tmp", issueTitle: "T", issueDescription: "D", planningContext: "", maxIterations: 1 },
+      { report: vi.fn(async () => undefined) },
+    );
+    return out as { passes: Array<Record<string, unknown>> };
+  };
+
+  it("carries the implement telemetry's attribution onto the pass", async () => {
+    mockImplementRun.mockResolvedValue({ ...IMPLEMENT_SUCCESS, telemetry: { ...IMPLEMENT_SUCCESS.telemetry, attribution } });
+    expect((await run()).passes[0].attribution).toEqual(attribution);
+  });
+
+  it("leaves legacy passes without an attribution key", async () => {
+    expect(await run()).toSatisfy((o: { passes: Array<Record<string, unknown>> }) => !("attribution" in o.passes[0]));
+  });
+});

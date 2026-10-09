@@ -166,7 +166,7 @@ export async function postRunnerResult(params: {
    * orchestrator to record them against.
    */
   cycleSummaries?: CycleSummary[];
-  /** Optional diagnostic attribution (AII-946). Sanitized before serialization; dropped if malformed. No caller emits it yet (AII-971). */
+  /** Optional diagnostic attribution (AII-946). Sanitized before serialization; dropped if malformed. */
   attribution?: InvocationAttributionV1;
   /** SHA of the snapshot commit pushed by a kg-refresh runner. Only meaningful for phase=kg-refresh. */
   snapshotCommit?: string | null;

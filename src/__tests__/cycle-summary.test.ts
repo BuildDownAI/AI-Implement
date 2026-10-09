@@ -280,7 +280,7 @@ describe("cycle-summary", () => {
 });
 
 import { sanitizeAttribution, type InvocationAttributionV1 } from "../pipeline/types.js";
-import { isCycleSummary, sanitizeCycleSummaries } from "../pipeline/cycle-summary.js";
+import { isCycleSummary, sanitizeCycleSummaries, stripCycleAttribution } from "../pipeline/cycle-summary.js";
 
 describe("attribution contract (AII-946)", () => {
   const attr = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
@@ -344,5 +344,13 @@ describe("attribution contract (AII-946)", () => {
     expect(valid).toHaveLength(2);
     expect(valid[0]).not.toHaveProperty("attribution");
     expect((valid[1].attribution as InvocationAttributionV1).invocationId).toBe("inv-1");
+  });
+
+  it("projects a cycle attribution identically to the shared sanitizer and leaves attribution-free summaries untouched (AII-971)", () => {
+    const base = { ...baseInput(), completedAt: 1, truncated: false, limitReached: false, usage: { tokensIn: null, tokensOut: null, costUsd: null } };
+    const legacy = stripCycleAttribution(base);
+    expect(legacy).toEqual({ value: base, stripped: false });
+    const withExtra = stripCycleAttribution({ ...base, attribution: { ...attr(), usage: null } });
+    expect((withExtra.value as { attribution: unknown }).attribution).toEqual(sanitizeAttribution({ ...attr(), usage: null }));
   });
 });

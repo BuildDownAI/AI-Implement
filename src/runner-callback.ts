@@ -4,6 +4,7 @@ import {
   markJobFailureCommented,
   stampJobApproved,
   updateJobFailure,
+  recordInvocationAttribution,
   updateJobPrUrl,
   updateJobStatus,
   type Job,
@@ -40,6 +41,8 @@ import {
 import { isLinearAuthConfigured, withLinearToken } from "./linear-app-auth.js";
 import { isFailureRecord, projectFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
 import { sanitizeFindingDispositions, type FindingDisposition } from "./pipeline/finding-dispositions.js";
+import { loadStoredSnapshot } from "./agent-run-preparation.js";
+import { normalizeInvocation } from "./agent-usage.js";
 import { sanitizeAttribution, type InvocationAttributionV1 } from "./pipeline/types.js";
 import { isCycleSummary, stripCycleAttribution, sanitizeCycleSummaries, type CycleSummary, type CycleDisposition } from "./pipeline/cycle-summary.js";
 import { recordReviewFixCycleSummary, type ReviewFixCycleSummaryOutcome } from "./review-fix-evidence.js";
@@ -830,6 +833,24 @@ export async function handleRunnerResult(
     else {
       delete input.body.attribution;
       console.warn("[runner-callback] Dropped 1 invalid attribution record(s)");
+    }
+  }
+  // Persist against the dispatch's frozen snapshot, never the claim: identity comes from the
+  // snapshot and a claim naming another snapshot yields no row. Best-effort — a failure here
+  // must not stall the terminal callback (token already consumed, no retry).
+  if (input.body.attribution) {
+    try {
+      const snapshot = loadStoredSnapshot(claims.dispatchId);
+      const row = snapshot ? normalizeInvocation(snapshot, { attribution: input.body.attribution }) : null;
+      if (row && row.attribution !== "rejected") {
+        recordInvocationAttribution(claims.dispatchId, row, {
+          timedOut: input.body.failureCode === "INVOCATION_TIMEOUT" || failure?.code === "INVOCATION_TIMEOUT",
+        });
+      } else if (snapshot) {
+        console.warn("[runner-callback] Dropped 1 attribution record(s) not matching the dispatch snapshot");
+      }
+    } catch {
+      console.warn("[runner-callback] Could not persist 1 attribution record (count only)");
     }
   }
 

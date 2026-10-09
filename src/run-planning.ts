@@ -242,7 +242,7 @@ export interface RunPlanningLocalOptions {
 
 export interface RunPlanningLocalResult {
   exitCode: number;
-  /** Optional diagnostic attribution (AII-946); emission is AII-971. */
+  /** Optional diagnostic attribution (AII-946/954) of the planning invocation; absent on legacy runs. */
   attribution?: InvocationAttributionV1;
   planningContext: string;
   /** True when at least one readable Markdown plan file was produced. */
@@ -361,7 +361,7 @@ function recoverCallbackUrl(encoded: string): string | undefined {
   }
 }
 
-export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exitCode: number }> {
+export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exitCode: number; attribution?: InvocationAttributionV1 }> {
   const workspaceDir = opts.workspaceDir ?? process.env.WORKSPACE_DIR ?? "/workspace";
 
   // Resolve issue fields + planning context + callback URL: prefer the envelope,
@@ -391,12 +391,13 @@ export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exit
     }
   }
   const callbackUrl = envelopeCallbackUrl ?? process.env.RUNNER_CALLBACK_URL?.trim() ?? null;
-  const failConfigured = async (failureReason: string): Promise<{ exitCode: number }> => {
+  const failConfigured = async (failureReason: string, attribution?: InvocationAttributionV1): Promise<{ exitCode: number; attribution?: InvocationAttributionV1 }> => {
     await postRunnerResult({
       phase: "planning",
       workspaceDir,
       outcome: "failure",
       failureReason,
+      ...(attribution ? { attribution } : {}),
       callbackUrl,
       fetchImpl: opts.fetchImpl,
     });
@@ -441,15 +442,16 @@ export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exit
   installPlanningSkills(skillsRepo, agentConfig);
   if (configured) {
     const outcome = await invokeConfiguredPlanning({ workspaceDir, prompt, configured, spawnImpl: opts.spawnImpl, ownsLifecycle: true });
-    if (!outcome.ok) return failConfigured(outcome.reason);
+    if (!outcome.ok) return failConfigured(outcome.reason, outcome.attribution);
     await postRunnerResult({
       phase: "planning",
       workspaceDir,
       outcome: "success",
+      ...(outcome.attribution ? { attribution: outcome.attribution } : {}),
       callbackUrl,
       fetchImpl: opts.fetchImpl,
     });
-    return { exitCode: 0 };
+    return { exitCode: 0, ...(outcome.attribution ? { attribution: outcome.attribution } : {}) };
   }
   let policy: PlanningWritePolicy;
   try {

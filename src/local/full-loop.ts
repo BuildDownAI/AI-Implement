@@ -59,7 +59,7 @@ export interface LocalFullLoopOptions {
 
 export interface LocalFullLoopResult {
   exitCode: number;
-  /** Optional diagnostic attribution (AII-946); emission is AII-971. */
+  /** Optional diagnostic attribution (AII-946/954), forwarded as produced by the runners; never aggregated here. */
   attribution?: InvocationAttributionV1;
   classification: LocalExitClassification;
   planningExitCode: number;
@@ -183,6 +183,7 @@ export async function runLocalFullLoop(
         effectiveMaxTurns,
         effectiveMaxIterations,
         tokenSummary: null,
+        ...(planResult.attribution ? { attribution: planResult.attribution } : {}),
       };
       return result;
     }
@@ -240,6 +241,7 @@ export async function runLocalFullLoop(
       exitCode = 0;
     }
 
+    const finalAttribution = implResult.attribution ?? planResult.attribution;
     result = {
       exitCode,
       classification,
@@ -256,6 +258,7 @@ export async function runLocalFullLoop(
       effectiveMaxTurns: implResult.effectiveMaxTurns,
       effectiveMaxIterations: implResult.effectiveMaxIterations,
       tokenSummary: implResult.tokenSummary,
+      ...(finalAttribution ? { attribution: finalAttribution } : {}),
     };
     return result;
   } finally {

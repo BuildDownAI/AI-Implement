@@ -5006,3 +5006,140 @@ describe("handleRunnerActivity (AII-777/AII-803)", () => {
     errorSpy.mockRestore();
   });
 });
+
+describe("handleRunnerResult — attribution persistence (AII-971)", () => {
+  const PLANTED = "sk-SYNTHETICSECRET123456";
+  const stage = (n: string) => ({
+    sel: { agent: "codex", provider: "openai", model: `m-${n}`, accountProfileId: `p-${n}`, invocationTimeoutMs: 60_000 },
+    src: { agent: "project", provider: "project", model: "project", accountProfileId: "project", invocationTimeoutMs: "job-deadline" },
+    prof: { id: `p-${n}`, identity: "acct", revision: 2, agent: "codex", provider: "openai", authMode: "openai-api-key" },
+  });
+
+  function storeSnapshot(dispatchId: string, snapshotId = "snap-1") {
+    const s = { planning: stage("planning"), implementation: stage("implementation"), review: stage("review") };
+    const pick = (k: "sel" | "src" | "prof") => ({ planning: s.planning[k], implementation: s.implementation[k], review: s.review[k] });
+    dedup.getDb().prepare(
+      `INSERT INTO run_agent_config_snapshots
+         (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+       VALUES (?, ?, 'ENG', ?, ?, ?, 1)`,
+    ).run(
+      snapshotId,
+      dispatchId,
+      JSON.stringify({ stages: pick("sel"), profiles: pick("prof") }),
+      JSON.stringify(pick("src")),
+      JSON.stringify({
+        orchestratorDefault: { configRevisionId: "r1", revision: 1 },
+        project: { configRevisionId: "r2", revision: 1 },
+      }),
+    );
+  }
+
+  const claim = (over: Record<string, unknown> = {}) => ({
+    version: 1,
+    invocationId: "inv-1",
+    stage: "implementation",
+    snapshotId: "snap-1",
+    agent: "codex",
+    provider: "openai",
+    model: "m-implementation",
+    profileId: "p-implementation",
+    authMode: "openai-api-key",
+    limit: null,
+    outcome: "success",
+    usage: { availability: "complete", tokensIn: 100, tokensOut: 10, costUsd: 0.5, costStatus: "reported" },
+    ...over,
+  });
+
+  async function deliver(attribution: unknown, opts: { snapshot?: boolean; extra?: Record<string, unknown>; dispatchId?: string } = {}) {
+    const dispatchId = opts.dispatchId ?? "disp-attr";
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i", mappingTeamKey: "ENG", phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET, dispatchId,
+    });
+    if (!log.findLogIdByDispatchId(dispatchId)) {
+      log.appendLog({ issueId: "i", issueIdentifier: "ENG-1", issueTitle: "t", teamKey: "ENG", repo: "o/r", dispatchId, executionMode: "github-actions", phase: "implementation" });
+    }
+    if (opts.snapshot !== false && !dedup.getDb().prepare("SELECT 1 FROM run_agent_config_snapshots WHERE dispatch_id = ?").get(dispatchId)) {
+      storeSnapshot(dispatchId, `snap-${dispatchId}`);
+    }
+    // The claim names the dispatch's own snapshot unless a test deliberately points it elsewhere.
+    if (attribution && typeof attribution === "object" && (attribution as { snapshotId?: string }).snapshotId === "snap-1") {
+      attribution = { ...(attribution as object), snapshotId: `snap-${dispatchId}` };
+    }
+    return runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1", attribution: attribution as never, ...(opts.extra ?? {}) },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+  }
+
+  const rows = () => dedup.getDb().prepare("SELECT * FROM model_invocation_attribution").all() as Array<Record<string, string | number | null>>;
+
+  it("persists identity from the stored snapshot and reads it back on the job", async () => {
+    const res = await deliver(claim());
+    expect(res.status).toBe(200);
+    const [row] = rows();
+    expect(rows()).toHaveLength(1);
+    expect(row).toMatchObject({ stage: "implementation", profile_id: "p-implementation", profile_revision: 2, agent: "codex", provider: "openai", model: "m-implementation", auth_mode: "openai-api-key", snapshot_id: "snap-disp-attr", status: "succeeded" });
+    const job = log.getJobByDispatchId("disp-attr")!;
+    expect(job.attribution).toMatchObject({ invocationId: "inv-1", usage: { availability: "complete", tokensIn: 100, tokensOut: 10, costUsd: 0.5 } });
+  });
+
+  it("does not store a claim from another snapshot", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const res = await deliver(claim({ snapshotId: "other-snap", model: PLANTED }));
+    expect(res.status).toBe(200);
+    expect(rows()).toHaveLength(0);
+    expect(log.getJobByDispatchId("disp-attr")!.attribution).toBeNull();
+    expect(warn.mock.calls.join(" ")).not.toContain(PLANTED);
+  });
+
+  it("stores the snapshot identity, not a disagreeing claim", async () => {
+    await deliver(claim({ model: "claimed-other-model", provider: "anthropic", agent: "claude" }));
+    expect(rows()[0]).toMatchObject({ model: "m-implementation", provider: "openai", agent: "codex" });
+    expect(JSON.parse(rows()[0].usage_json as string).attribution).toBe("mismatch");
+  });
+
+  it("keeps partial and unavailable usage as null, never zero or derived cost", async () => {
+    await deliver(claim({ invocationId: "inv-partial", usage: { availability: "partial", tokensIn: 5, tokensOut: null, costUsd: null, costStatus: "unavailable" } }), { dispatchId: "d-partial" });
+    await deliver(claim({ invocationId: "inv-none", usage: { availability: "unavailable", tokensIn: null, tokensOut: null, costUsd: null, costStatus: "unavailable" } }), { dispatchId: "d-none" });
+    expect(log.getJobByDispatchId("d-partial")!.attribution!.usage).toEqual({ availability: "partial", tokensIn: 5, tokensOut: null, costUsd: null, costStatus: "unavailable" });
+    expect(log.getJobByDispatchId("d-none")!.attribution!.usage).toEqual({ availability: "unavailable", tokensIn: null, tokensOut: null, costUsd: null, costStatus: "unavailable" });
+  });
+
+  it("records a timeout as timed_out with the actual limit, and no invented turns", async () => {
+    await deliver(claim({ outcome: "error", limit: { kind: "timeout_ms", value: 60000 }, usage: null }), { extra: { outcome: "failure", failureCode: "INVOCATION_TIMEOUT", prUrl: undefined } });
+    expect(rows()[0].status).toBe("timed_out");
+    expect(log.getJobByDispatchId("disp-attr")!.attribution).toMatchObject({ outcome: "error", limit: { kind: "timeout_ms", value: 60000 }, usage: { availability: "unavailable", tokensIn: null, tokensOut: null, costUsd: null, costStatus: "unavailable" } });
+    expect(rows()[0].usage_json as string).not.toContain("numTurns");
+  });
+
+  it("does not double-count a repeated invocation id", async () => {
+    await deliver(claim());
+    await deliver(claim(), { dispatchId: "disp-2" });
+    expect(rows()).toHaveLength(1);
+  });
+
+  it("keeps legacy dispatches (no snapshot) readable with no row and no inferred cost", async () => {
+    const res = await deliver(claim(), { snapshot: false });
+    expect(res.status).toBe(200);
+    expect(rows()).toHaveLength(0);
+    expect(log.getJobByDispatchId("disp-attr")!.attribution).toBeNull();
+  });
+
+  it("still completes the terminal callback when persistence throws, without echoing payload", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    dedup.getDb().exec("DROP TABLE model_invocation_attribution");
+    const res = await deliver(claim({ model: "m-implementation" }));
+    expect(res.status).toBe(200);
+    expect(warn.mock.calls.map((c) => c.join(" ")).join("\n")).toContain("Could not persist 1 attribution record");
+  });
+
+  it("never persists sentinel credentials", async () => {
+    await deliver(claim({ invocationId: PLANTED, profileId: PLANTED }));
+    await deliver(claim({ apiKey: PLANTED }), { dispatchId: "d2" });
+    expect(JSON.stringify(rows())).not.toContain(PLANTED);
+    expect(rows()).toHaveLength(0);
+  });
+});

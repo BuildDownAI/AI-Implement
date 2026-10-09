@@ -578,6 +578,23 @@ describe("postRunnerResult attribution", () => {
     expect((body.attribution as { stage: string }).stage).toBe("review");
   });
 
+  it("carries attribution on capped and failed outcomes, with the actual limit", async () => {
+    for (const [outcome, failureCode, limit] of [
+      ["failure", "MAX_TURNS_EXHAUSTED", { kind: "max_turns", value: 50 }],
+      ["failure", "INVOCATION_TIMEOUT", { kind: "timeout_ms", value: 60000 }],
+    ] as const) {
+      const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      await postRunnerResult({
+        workspaceDir: "/tmp", phase: "implementation", outcome, failureCode, failureReason: "x", callbackUrl: "https://cb",
+        fetchImpl, attribution: { ...attr, outcome: "error", limit } as never,
+      });
+      const body = JSON.parse(fetchImpl.mock.calls[0][1].body as string) as { attribution: { limit: unknown; outcome: string } };
+      expect(body.attribution.limit).toEqual(limit);
+      expect(body.attribution.outcome).toBe("error");
+      expect(JSON.stringify(body)).not.toContain("numTurns");
+    }
+  });
+
   it("drops credential-bearing attribution before it is serialized but still delivers the result", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const body = await send({ ...attr, authorization: "Bearer sk-SYNTHETICSECRET123456" });

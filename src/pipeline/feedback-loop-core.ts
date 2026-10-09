@@ -1,4 +1,4 @@
-import type { RunTelemetry, Step } from "./types.js";
+import type { InvocationAttributionV1, RunTelemetry, Step } from "./types.js";
 import type { ReferenceRepoResult } from "../reference-repos.js";
 import { wrapWithPlanningGuard } from "../planning-context-assembly.js";
 import { classifyThrown, type FailureRecord } from "./failure-classification.js";
@@ -81,6 +81,8 @@ export interface PassStat extends Record<string, unknown> {
   attempts?: number;
   /** Spawn attempts the review call made for this pass, when review ran (>1 only under a retried transient failure). */
   reviewAttempts?: number;
+  /** Optional implement-invocation attribution (AII-946/954), carried from telemetry; absent on legacy executors. */
+  attribution?: InvocationAttributionV1;
 }
 
 export interface FeedbackLoopOutputs extends Record<string, unknown> {
@@ -387,6 +389,7 @@ export async function runFeedbackLoop(
         cacheReadTokens: implementProviderUnavailableTelemetry?.cacheReadTokens ?? null,
         cacheCreationTokens: implementProviderUnavailableTelemetry?.cacheCreationTokens ?? null,
         attempts: implementAttemptsTotal,
+        ...(implementProviderUnavailableTelemetry?.attribution ? { attribution: implementProviderUnavailableTelemetry.attribution } : {}),
       });
       effects.writeCycleSummary({
         id: `feedback-loop.${iteration}`,
@@ -420,6 +423,7 @@ export async function runFeedbackLoop(
       cacheReadTokens: implementTelemetry?.cacheReadTokens ?? null,
       cacheCreationTokens: implementTelemetry?.cacheCreationTokens ?? null,
       attempts: implementAttemptsTotal,
+      ...(implementTelemetry?.attribution ? { attribution: implementTelemetry.attribution } : {}),
     };
     passes.push(pass);
 
