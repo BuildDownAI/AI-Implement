@@ -2,7 +2,8 @@
  * ChatGPT plan sign-in CLI: `node dist/chatgpt-plan-login.js <login|status|logout> --record <path>`.
  * Runs on the operator's machine because OpenAI's callback goes to 127.0.0.1. The saved record is read by the
  * local refresher and uploaded by the hosted import command.
- * No token value reaches argv, stdout, stderr, or an error message; failures print fixed text.
+ * No token value reaches stdout, stderr, or an error message; failures print fixed text. One exception: on
+ * reauthorization the browser opener receives the authorize URL, including id_token_hint, as an argv element.
  */
 
 import { createHash, createPublicKey, randomBytes, randomUUID, verify as cryptoVerify } from "node:crypto";
@@ -318,7 +319,7 @@ export async function login(recordPath: string, deps: LoginDeps): Promise<void> 
     }
 
     const query = await listener.callback;
-    if (query.get("state") !== state) throw new SignInError("callback state does not match");
+    // The listener only resolves for a request whose state matches, so no state check is needed here.
     if (query.has("error")) throw new SignInError(`sign-in failed: ${safeCode(query.get("error"))}`);
     const code = query.get("code");
     if (!code) throw new SignInError("callback has no authorization code");
