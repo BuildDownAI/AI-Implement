@@ -108,9 +108,9 @@ describe("resolveModelCredential", () => {
   });
 
   it("rebinds subscription state to the authorized generation and keeps the stored sequence", () => {
-    save({ profileId: "sub", agent: "codex", provider: "openai", authMode: "codex-subscription", metadata: {} });
+    save({ profileId: "sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", metadata: {} });
     const r = cred.resolveModelCredential(
-      req({ profileId: "sub", provider: "openai", authMode: "codex-subscription", ownerGeneration: 3 }),
+      req({ profileId: "sub", provider: "anthropic", authMode: "claude-subscription", ownerGeneration: 3 }),
       deps(),
     );
     expect(r).toMatchObject({ ok: true, ownerGeneration: 3, secret: { kind: "session", sessionData: SESSION_SENTINEL, stateSequence: 7 } });
@@ -119,15 +119,15 @@ describe("resolveModelCredential", () => {
   });
 
   it("requires an owner generation for subscriptions before reading", () => {
-    save({ profileId: "sub", agent: "codex", provider: "openai", authMode: "codex-subscription", metadata: {} });
-    const r = cred.resolveModelCredential(req({ profileId: "sub", provider: "openai", authMode: "codex-subscription" }), deps());
+    save({ profileId: "sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", metadata: {} });
+    const r = cred.resolveModelCredential(req({ profileId: "sub", provider: "anthropic", authMode: "claude-subscription" }), deps());
     expect(r).toMatchObject({ ok: false, category: "stale_owner" });
     expect(readCalls).toEqual([]);
   });
 
   it("maps session store failures to categories without leaking the reason", () => {
-    save({ profileId: "sub", agent: "codex", provider: "openai", authMode: "codex-subscription", metadata: {} });
-    const sub = req({ profileId: "sub", provider: "openai", authMode: "codex-subscription", ownerGeneration: 1 });
+    save({ profileId: "sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", metadata: {} });
+    const sub = req({ profileId: "sub", provider: "anthropic", authMode: "claude-subscription", ownerGeneration: 1 });
     for (const [category, reason] of [["stale_owner", "stale_generation"], ["recovery_required", "no_state"], ["authentication_required", "key_unavailable"]] as const) {
       readResult = { ok: false, category, reason };
       const r = cred.resolveModelCredential(sub, deps());
@@ -137,7 +137,7 @@ describe("resolveModelCredential", () => {
   });
 
   it("never lets a codex subscription yield an api key, nor an api profile read sessions", () => {
-    save({ profileId: "sub", agent: "codex", provider: "openai", authMode: "codex-subscription", metadata: { credentialRef: "model-account:anth" } });
+    save({ profileId: "sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", metadata: { credentialRef: "model-account:anth" } });
     const r = cred.resolveModelCredential(req({ profileId: "sub", provider: "openai", authMode: "openai-api-key", ownerGeneration: 1 }), deps());
     expect(r).toMatchObject({ ok: false, code: "account_mismatch" });
     expect(resolverCalls).toEqual([]);
@@ -213,12 +213,12 @@ describe("getCredentialStatus", () => {
   it("contains no secret material for any mode", () => {
     save();
     save({ profileId: "bed", provider: "bedrock", authMode: "bedrock", metadata: { credentialRef: "model-account:bed" } });
-    save({ profileId: "sub", agent: "codex", provider: "openai", authMode: "codex-subscription", metadata: { credentialRef: "model-account:sub" } });
+    save({ profileId: "sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", metadata: { credentialRef: "model-account:sub" } });
     secrets.set("model-account:bed", BEDROCK);
     const requests = [
       req(),
       req({ profileId: "bed", provider: "bedrock", authMode: "bedrock" }),
-      req({ profileId: "sub", provider: "openai", authMode: "codex-subscription", ownerGeneration: 1 }),
+      req({ profileId: "sub", provider: "anthropic", authMode: "claude-subscription", ownerGeneration: 1 }),
       req({ projectKey: "OTHER" }),
       req({ profileId: "missing" }),
     ];

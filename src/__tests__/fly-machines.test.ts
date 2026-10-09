@@ -1192,7 +1192,7 @@ describe("buildSessionMachineConfig — protected model bootstrap (AII-500)", ()
       backend: "fly",
       expiresAt: 1_700_000_060_000,
       bearer: S_BEARER,
-      bindings: [{ stage: "implementation", profileId: "sub", profileRevision: 1, authMode: "codex-subscription", ownerGeneration: 3 }],
+      bindings: [{ stage: "implementation", profileId: "sub", profileRevision: 1, authMode: "claude-subscription", ownerGeneration: 3 }],
     },
     protectionKey: { ref: MODEL_AUTH_ENV.protectionKey, key: protectionKey },
   });
