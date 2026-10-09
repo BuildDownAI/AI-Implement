@@ -90,7 +90,9 @@ export interface PipelineContextData {
   referenceRepos?: ReferenceRepo[];
   /** Autonomous runner: project reviewer selection from the trusted run_config envelope. */
   reviewers?: ReviewerSelection[];
+  /** Autonomous runner: project review process from the trusted run_config envelope; defaults to "ai-implement". */
   reviewProcess?: ReviewProcessId;
+  /** Autonomous runner: extra GitHub logins whose approve block can gate a merge, from the trusted run_config envelope. */
   trustedReviewAuthors?: string[];
   /** Autonomous runner: selected image-baked reviewer code resolved from the trusted package root, never the checked-out workspace. */
   trustedReviewerDefinitions?: ReadonlyMap<string, ReviewerDefinition>;
