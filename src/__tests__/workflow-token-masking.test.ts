@@ -97,7 +97,7 @@ for (const file of files) {
       bearer: "AII982-grant-bearer-" + "A".repeat(32),
       bindings: [
         { stage: "planning", profileId: "prof-api", profileRevision: 2, authMode: "openai-api-key" },
-        { stage: "implementation", profileId: "prof-sub", profileRevision: 1, authMode: "codex-subscription", ownerGeneration: 3 },
+        { stage: "implementation", profileId: "prof-sub", profileRevision: 1, authMode: "claude-subscription", ownerGeneration: 3 },
       ],
     };
     const sealedGrant = {

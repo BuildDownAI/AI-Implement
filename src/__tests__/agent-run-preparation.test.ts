@@ -49,16 +49,16 @@ function seedProfiles() {
     authMode: "anthropic-api-key", allowedProjectKeys: ["AII"], metadata: { credentialRef: "model-account:api" },
   });
   store.saveAccountProfileRevision({
-    profileId: "sub", identity: "Sub", revision: 1, agent: "codex", provider: "openai",
-    authMode: "codex-subscription", allowedProjectKeys: ["AII"],
+    profileId: "sub", identity: "Sub", revision: 1, agent: "claude", provider: "anthropic",
+    authMode: "claude-subscription", allowedProjectKeys: ["AII"],
   });
   store.saveAccountProfileRevision({
-    profileId: "sub2", identity: "Sub2", revision: 1, agent: "codex", provider: "openai",
-    authMode: "codex-subscription", allowedProjectKeys: ["AII"],
+    profileId: "sub2", identity: "Sub2", revision: 1, agent: "claude", provider: "anthropic",
+    authMode: "claude-subscription", allowedProjectKeys: ["AII"],
   });
   store.setOrchestratorDefaults({
     version: 1, mode: "configured",
-    stages: { planning: stage("api", "claude", "anthropic"), implementation: stage("sub", "codex", "openai"), review: stage("api", "claude", "anthropic") },
+    stages: { planning: stage("api", "claude", "anthropic"), implementation: stage("sub", "claude", "anthropic"), review: stage("api", "claude", "anthropic") },
   });
 }
 
@@ -184,7 +184,7 @@ describe("ready", () => {
     expect(bootstrap.backend).toBe("gha");
     expect(bootstrap.snapshotId).toBe(r.snapshot.snapshotId);
     expect(bootstrap.bindings.find((b) => b.stage === "implementation")).toMatchObject({
-      profileId: "sub", profileRevision: 1, authMode: "codex-subscription", ownerGeneration: r.reservations[0]!.generation,
+      profileId: "sub", profileRevision: 1, authMode: "claude-subscription", ownerGeneration: r.reservations[0]!.generation,
     });
     expect(bootstrap.bindings.find((b) => b.stage === "planning")!.ownerGeneration).toBeUndefined();
     expect(r.takeBootstrap()).toBeUndefined();
@@ -223,8 +223,8 @@ describe("snapshot immutability and idempotence", () => {
     const before = JSON.stringify(rows("run_agent_config_snapshots"));
     store.setProjectStageConfig("AII", { version: 1, mode: "configured", stages: { review: { model: "changed" } } });
     store.saveAccountProfileRevision({
-      profileId: "sub", identity: "Sub", revision: 2, agent: "codex", provider: "openai",
-      authMode: "codex-subscription", allowedProjectKeys: ["AII"],
+      profileId: "sub", identity: "Sub", revision: 2, agent: "claude", provider: "anthropic",
+      authMode: "claude-subscription", allowedProjectKeys: ["AII"],
     });
     const again = ready(await prep.prepareAgentRun(request(), deps));
     expect(JSON.stringify(rows("run_agent_config_snapshots"))).toBe(before);
@@ -316,7 +316,7 @@ describe("queueing and recovery", () => {
   it("is all-or-nothing across a multi-profile set", async () => {
     store.setOrchestratorDefaults({
       version: 1, mode: "configured",
-      stages: { planning: stage("sub2", "codex", "openai"), implementation: stage("sub", "codex", "openai"), review: stage("sub2", "codex", "openai") },
+      stages: { planning: stage("sub2", "claude", "anthropic"), implementation: stage("sub", "claude", "anthropic"), review: stage("sub2", "claude", "anthropic") },
     });
     ownership.reserve({ dispatchId: "holder", profiles: [{ profileId: "sub", authMode: "subscription" }] });
     expect((await prep.prepareAgentRun(request(), deps)).status).toBe("queued");
@@ -457,12 +457,12 @@ describe("credential readiness", () => {
 
   it("returns authentication-required for missing session state and releases the fresh lease", async () => {
     store.saveAccountProfileRevision({
-      profileId: "fresh", identity: "Fresh", revision: 1, agent: "codex", provider: "openai",
-      authMode: "codex-subscription", allowedProjectKeys: ["AII"],
+      profileId: "fresh", identity: "Fresh", revision: 1, agent: "claude", provider: "anthropic",
+      authMode: "claude-subscription", allowedProjectKeys: ["AII"],
     });
     store.setOrchestratorDefaults({
       version: 1, mode: "configured",
-      stages: { planning: stage("api", "claude", "anthropic"), implementation: stage("fresh", "codex", "openai"), review: stage("api", "claude", "anthropic") },
+      stages: { planning: stage("api", "claude", "anthropic"), implementation: stage("fresh", "claude", "anthropic"), review: stage("api", "claude", "anthropic") },
     });
     const r = await prep.prepareAgentRun(request(), deps);
     expect(r).toMatchObject({ status: "authentication-required", code: "session_unavailable", profileId: "fresh" });
@@ -475,7 +475,7 @@ describe("credential readiness", () => {
 
   it("does not accept usable status alone: a subscription needs readable session state", async () => {
     const status = (await import("../model-credentials.js")).getCredentialStatus(
-      { projectKey: "AII", profileId: "sub", revision: 1, provider: "openai", authMode: "codex-subscription" },
+      { projectKey: "AII", profileId: "sub", revision: 1, provider: "anthropic", authMode: "claude-subscription" },
       deps.credentials,
     );
     expect(status.usable).toBe(true);
@@ -543,7 +543,7 @@ describe("cleanup ownership completeness", () => {
   function twoOwners() {
     store.setOrchestratorDefaults({
       version: 1, mode: "configured",
-      stages: { planning: stage("api", "claude", "anthropic"), implementation: stage("sub", "codex", "openai"), review: stage("sub2", "codex", "openai") },
+      stages: { planning: stage("api", "claude", "anthropic"), implementation: stage("sub", "claude", "anthropic"), review: stage("sub2", "claude", "anthropic") },
     });
   }
   const entries = [
@@ -650,7 +650,7 @@ describe("inspectAgentReadiness", () => {
     });
     store.setOrchestratorDefaults({
       version: 1, mode: "configured",
-      stages: { planning: stage("api", "claude", "anthropic"), implementation: stage("sub", "codex", "openai"), review: stage("api", "claude", "anthropic") },
+      stages: { planning: stage("api", "claude", "anthropic"), implementation: stage("sub", "claude", "anthropic"), review: stage("api", "claude", "anthropic") },
     });
     expect(await prep.inspectAgentReadiness(request(), deps)).toEqual({ status: "not-ready", code: "credential_unavailable" });
   });

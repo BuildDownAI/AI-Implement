@@ -26,7 +26,7 @@ function grant(overrides: Partial<ModelAuthGrantBootstrapV1> = {}): ModelAuthGra
     backend: "fly",
     expiresAt: NOW + 60_000,
     bearer: S_BEARER,
-    bindings: [{ stage: "implementation", profileId: "sub", profileRevision: 1, authMode: "codex-subscription", ownerGeneration: 3 }],
+    bindings: [{ stage: "implementation", profileId: "sub", profileRevision: 1, authMode: "claude-subscription", ownerGeneration: 3 }],
     ...overrides,
   };
 }

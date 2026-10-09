@@ -53,7 +53,7 @@ export function makeGrant(snapshot: ResolvedAgentSnapshotV1, over: Partial<Model
         profileId: p.id,
         profileRevision: p.revision,
         authMode: p.authMode,
-        ...(p.authMode === "codex-subscription" || p.authMode === "claude-subscription" ? { ownerGeneration: 3 } : {}),
+        ...(p.authMode === "claude-subscription" ? { ownerGeneration: 3 } : {}),
       };
     }),
     ...over,

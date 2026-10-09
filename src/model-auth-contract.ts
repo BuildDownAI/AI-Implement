@@ -64,7 +64,10 @@ const _authModesExhaustive: MissingAuthModes extends never ? true : never = true
 void _authModesExhaustive;
 
 export const MODEL_AUTH_AUTH_MODES: readonly AccountAuthMode[] = AUTH_MODE_LIST;
+/** Plan-based credential modes. Ownership checks use `RESERVED_AUTH_MODES` instead. */
 export const SUBSCRIPTION_AUTH_MODES: readonly AccountAuthMode[] = ["claude-subscription", "codex-subscription"];
+/** Modes that reserve an account (owner generation, session state, checkpoints). */
+export const RESERVED_AUTH_MODES: readonly AccountAuthMode[] = ["claude-subscription"];
 export const MODEL_AUTH_BACKENDS = ["fly", "gha", "local"] as const;
 export type ModelAuthBackend = (typeof MODEL_AUTH_BACKENDS)[number];
 
@@ -182,8 +185,17 @@ function validateAuthMode(value: unknown, label: string): ValidationResult<Accou
   return ok(value as AccountAuthMode);
 }
 
+/**
+ * Plan-based credential class. Ownership checks (owner generation, session
+ * secret, checkpoint) use `reservesModelAccount`, not `isSubscriptionAuthMode`.
+ */
 export function isSubscriptionAuthMode(mode: AccountAuthMode): boolean {
   return SUBSCRIPTION_AUTH_MODES.includes(mode);
+}
+
+/** True when the mode reserves an account: owner generation, session secret, checkpoints. */
+export function reservesModelAccount(mode: AccountAuthMode): boolean {
+  return RESERVED_AUTH_MODES.includes(mode);
 }
 
 function validateBackend(value: unknown, label: string): ValidationResult<ModelAuthBackend> {
@@ -207,7 +219,7 @@ export interface ModelAuthGrantBinding {
   readonly profileId: string;
   readonly profileRevision: number;
   readonly authMode: AccountAuthMode;
-  /** Present (positive) exactly when `authMode` is a subscription mode. */
+  /** Present (positive) exactly when `reservesModelAccount(authMode)`. */
   readonly ownerGeneration?: number;
 }
 
@@ -234,13 +246,13 @@ export function validateModelAuthGrantBinding(raw: unknown): ValidationResult<Mo
     profileRevision: profileRevision.value,
     authMode: authMode.value,
   };
-  if (isSubscriptionAuthMode(authMode.value)) {
+  if (reservesModelAccount(authMode.value)) {
     const gen = validatePositiveInt(r.ownerGeneration, "binding ownerGeneration");
     if (!gen.ok) return gen;
     return ok({ ...base, ownerGeneration: gen.value });
   }
   if (r.ownerGeneration !== undefined) {
-    return err("binding ownerGeneration is only allowed for subscription auth modes");
+    return err("binding ownerGeneration is only allowed for reserved auth modes");
   }
   return ok(base);
 }
@@ -492,14 +504,41 @@ function parseAwsBedrockSecret(s: Record<string, unknown>): ValidationResult<Aws
   return ok({ ...base, sessionToken: sessionToken.value });
 }
 
-/** Subscription session state (Claude and Codex). Secret-bearing. */
+/** Reserved-account session state (Claude subscription). Secret-bearing. */
 export interface SessionStateSecret {
   readonly kind: "session";
   readonly sessionData: string;
   readonly stateSequence: number;
 }
 
-export type ModelAuthSecret = ApiCredentialSecret | AwsBedrockSecret | SessionStateSecret;
+/** ChatGPT plan access token (codex-subscription). Secret-bearing; lives about 1 hour. */
+export interface ChatGptAccessTokenSecret {
+  readonly kind: "chatgpt-access-token";
+  /** Bounded by `MAX_API_CREDENTIAL_LENGTH`. */
+  readonly accessToken: string;
+  /** Epoch ms, positive safe integer. Shape-only: staleness is the consumer's check. */
+  readonly expiresAt: number;
+}
+
+export type ModelAuthSecret =
+  | ApiCredentialSecret
+  | AwsBedrockSecret
+  | SessionStateSecret
+  | ChatGptAccessTokenSecret;
+
+/** Strict shape check; errors name fields only, never values. */
+function parseChatGptAccessTokenSecret(s: Record<string, unknown>): ValidationResult<ChatGptAccessTokenSecret> {
+  const unknown = rejectUnknownKeys(s, ["kind", "accessToken", "expiresAt"], "checkout secret");
+  if (!unknown.ok) return unknown;
+  if (s.kind !== "chatgpt-access-token") {
+    return err("checkout secret kind must be 'chatgpt-access-token' for codex-subscription");
+  }
+  const accessToken = validateBoundedSecret(s.accessToken, "accessToken", MAX_API_CREDENTIAL_LENGTH);
+  if (!accessToken.ok) return accessToken;
+  const expiresAt = validatePositiveInt(s.expiresAt, "expiresAt");
+  if (!expiresAt.ok) return expiresAt;
+  return ok({ kind: "chatgpt-access-token", accessToken: accessToken.value, expiresAt: expiresAt.value });
+}
 
 /** Secret-bearing; send only over authenticated transport. Never persist, log, or project. */
 export interface ModelAuthCheckoutResponseV1 {
@@ -507,7 +546,7 @@ export interface ModelAuthCheckoutResponseV1 {
   readonly ok: true;
   readonly profileId: string;
   readonly authMode: AccountAuthMode;
-  /** Present exactly when `authMode` is a subscription mode. */
+  /** Present (positive) exactly when `reservesModelAccount(authMode)`. */
   readonly ownerGeneration?: number;
   readonly secret: ModelAuthSecret;
 }
@@ -556,7 +595,19 @@ export function parseModelAuthCheckoutResponse(raw: unknown): ValidationResult<M
   const secretObj = objectOf(r.secret, "checkout secret");
   if (!secretObj.ok) return secretObj;
   const s = secretObj.value;
-  if (isSubscriptionAuthMode(authMode.value)) {
+  if (authMode.value === "codex-subscription") {
+    if (r.ownerGeneration !== undefined) return err("ownerGeneration is only allowed for reserved auth modes");
+    const chatgpt = parseChatGptAccessTokenSecret(s);
+    if (!chatgpt.ok) return chatgpt;
+    return ok({
+      version: 1,
+      ok: true,
+      profileId: profileId.value,
+      authMode: authMode.value,
+      secret: chatgpt.value,
+    });
+  }
+  if (reservesModelAccount(authMode.value)) {
     const gen = validatePositiveInt(r.ownerGeneration, "ownerGeneration");
     if (!gen.ok) return gen;
     const su = rejectUnknownKeys(s, ["kind", "sessionData", "stateSequence"], "checkout secret");
@@ -575,7 +626,7 @@ export function parseModelAuthCheckoutResponse(raw: unknown): ValidationResult<M
       secret: { kind: "session", sessionData: data.value, stateSequence: seq.value },
     });
   }
-  if (r.ownerGeneration !== undefined) return err("ownerGeneration is only allowed for subscription auth modes");
+  if (r.ownerGeneration !== undefined) return err("ownerGeneration is only allowed for reserved auth modes");
   if (authMode.value === "bedrock") {
     const bedrock = parseAwsBedrockSecret(s);
     if (!bedrock.ok) return bedrock;
@@ -615,9 +666,9 @@ export function checkCheckoutResponseAgainstBindings(
   const binding = bindings.find((b) => b.profileId === requestedProfileId);
   if (!binding) return err("profile is not allowed by the grant");
   if (binding.authMode !== response.authMode) return err("checkout auth mode does not match the grant binding");
-  const subscription = isSubscriptionAuthMode(binding.authMode);
-  if (subscription !== (binding.ownerGeneration !== undefined)) return err("grant binding owner generation is inconsistent");
-  if (subscription) {
+  const reserved = reservesModelAccount(binding.authMode);
+  if (reserved !== (binding.ownerGeneration !== undefined)) return err("grant binding owner generation is inconsistent");
+  if (reserved) {
     if (response.ownerGeneration === undefined) return err("checkout response is missing the owner generation");
     if (response.ownerGeneration !== binding.ownerGeneration) {
       return err("checkout owner generation does not match the grant binding");
@@ -689,7 +740,8 @@ export function checkCheckpointAgainstBindings(
 ): ValidationResult<ModelAuthGrantBinding> {
   const binding = bindings.find((b) => b.profileId === request.profileId);
   if (!binding) return err("profile is not allowed by the grant");
-  if (!isSubscriptionAuthMode(binding.authMode) || binding.ownerGeneration === undefined) {
+  if (binding.authMode === "codex-subscription") return err("checkpoint is not allowed for codex-subscription");
+  if (!reservesModelAccount(binding.authMode) || binding.ownerGeneration === undefined) {
     return err("checkpoint is only valid for subscription bindings");
   }
   if (binding.ownerGeneration !== request.ownerGeneration) {
