@@ -6,8 +6,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity, WorkerTerminalOutcome } from "../../review-fix-contract.js";
 import type { PreparedReviewFixAttempt, ReviewFixFindingVersion } from "../../review-fix-ports.js";
 import { createReviewFixAttempt } from "../../restate/review-fix-attempt.js";
-import { createReviewFixPR, reviewFixPRKey, REVIEW_FIX_COLLECTION_WINDOW_MS } from "../../restate/review-fix-pr.js";
-import { VARIANTS, eventually, settle, attachWorkflow, callObject, callWorkflow, startVariants, stopAll } from "./harness.js";
+import { createReviewFixPR, reviewFixPRKey, REVIEW_FIX_COLLECTION_WINDOW_MS, REVIEW_FIX_EVENT_BODY_MAX_BYTES, type ReviewFixFeedbackEvent } from "../../restate/review-fix-pr.js";
+import { VARIANTS, eventually, settle, attachWorkflow, callObject, callWorkflow, journalEntries, journalEntryNames, journalText, queryInvocations, startVariants, stopAll } from "./harness.js";
 
 const SHA = "a".repeat(40);
 interface PRState {
@@ -133,7 +133,9 @@ describe("ReviewFixPR durable coordination", () => {
     },
     loadApprovalEvidence: async () => ({ currentPrHeadSha: SHA, findingDispositions: [], policyAllows: false }),
   });
-  const coordinator = createReviewFixPR({ attempts: store, collectionWindowMs: async (scope) => stateFor(scope).windowMs,
+  const recorded: ReviewFixFeedbackEvent[] = [];
+  const coordinator = createReviewFixPR({ attempts: store,
+    recordFeedback: async (event) => { recorded.push(event); return { status: "accepted", findingIds: [1], reviewFixId: 1 }; }, collectionWindowMs: async (scope) => stateFor(scope).windowMs,
     load: async (scope) => {
     const pr = stateFor(scope);
     return { closed: pr.closed, jobTimeoutMinutes: 90,
@@ -236,4 +238,70 @@ describe("ReviewFixPR durable coordination", () => {
       expect([closed.launches, closed.admissionCalls]).toEqual([0, 0]);
     } finally { capacity = 10; }
   }, 40_000);
+  function eventFor(pr: PRState, over: Partial<ReviewFixFeedbackEvent> = {}): ReviewFixFeedbackEvent {
+    return { eventId: `evt-${randomUUID()}`, deliveryId: `delivery-${randomUUID()}`, issueId: "issue-1",
+      issueIdentifier: "AII-1", repo: pr.scope.repository, prNumber: pr.scope.prNumber, reason: "review feedback",
+      findings: [{ source: "github-review", severity: "medium", body: "fix this" }], ...over };
+  }
+  async function lastFeedbackJournal(env: RestateTestEnvironment, pr: PRState) {
+    const rows = await queryInvocations(env.adminAPIBaseUrl(),
+      `target_service_name = 'ReviewFixPR' AND target_service_key = '${reviewFixPRKey(pr.scope)}' AND target_handler_name = 'feedback'`);
+    return rows[rows.length - 1].id as string;
+  }
+
+  it.each(VARIANTS.map(([label]) => label))("an event is recorded before the window load; the signal form records nothing (%s)", async (label) => {
+    const env = envFor(label);
+    const pr = makePR();
+    pr.windowMs = 250;
+    const event = eventFor(pr);
+    await callObject(env.baseUrl(), "ReviewFixPR", reviewFixPRKey(pr.scope), "feedback", event);
+    expect(recorded.filter((e) => e.deliveryId === event.deliveryId)).toEqual([event]);
+    const id = await lastFeedbackJournal(env, pr);
+    const names = await journalEntryNames(env.adminAPIBaseUrl(), id);
+    expect(names.indexOf("record-feedback")).toBeGreaterThanOrEqual(0);
+    expect(names.indexOf("record-feedback")).toBeLessThan(names.indexOf("load-collection-window"));
+    const text = journalText(await journalEntries(env.adminAPIBaseUrl(), id));
+    expect(text).toContain(event.deliveryId);
+    expect(text).not.toContain("runnerTokenSecret");
+
+    const before = recorded.length;
+    const bare = makePR();
+    await callObject(env.baseUrl(), "ReviewFixPR", reviewFixPRKey(bare.scope), "feedback", {});
+    expect(recorded.length).toBe(before);
+    expect(await journalEntryNames(env.adminAPIBaseUrl(), await lastFeedbackJournal(env, bare))).not.toContain("record-feedback");
+  }, 20_000);
+
+  it.each(VARIANTS.map(([label]) => label))("a second event still records while a wake is scheduled (%s)", async (label) => {
+    const env = envFor(label);
+    const pr = makePR();
+    pr.windowMs = 2_000;
+    await callObject(env.baseUrl(), "ReviewFixPR", reviewFixPRKey(pr.scope), "feedback", eventFor(pr));
+    const second = eventFor(pr);
+    await callObject(env.baseUrl(), "ReviewFixPR", reviewFixPRKey(pr.scope), "feedback", second);
+    expect(recorded.filter((e) => e.deliveryId === second.deliveryId)).toEqual([second]);
+  }, 20_000);
+
+  it.each(VARIANTS.map(([label]) => label))("the body cap is in UTF-8 bytes; bad shapes and foreign PRs are terminal (%s)", async (label) => {
+    const env = envFor(label);
+    const pr = makePR();
+    pr.windowMs = 250;
+    const call = (event: unknown) => callObject(env.baseUrl(), "ReviewFixPR", reviewFixPRKey(pr.scope), "feedback", event);
+    const withBody = (body: string) => eventFor(pr, { findings: [{ source: "github-review", severity: "medium", body }] });
+    const before = recorded.length;
+    await call(withBody("a".repeat(REVIEW_FIX_EVENT_BODY_MAX_BYTES)));
+    await call(withBody("é".repeat(REVIEW_FIX_EVENT_BODY_MAX_BYTES / 2)));
+    expect(recorded.length).toBe(before + 2);
+    await expect(call(withBody("a".repeat(REVIEW_FIX_EVENT_BODY_MAX_BYTES + 1)))).rejects.toThrow();
+    await expect(call(withBody("é".repeat(REVIEW_FIX_EVENT_BODY_MAX_BYTES / 2 + 1)))).rejects.toThrow();
+    await expect(call(eventFor(pr, { reason: "r".repeat(REVIEW_FIX_EVENT_BODY_MAX_BYTES + 1) }))).rejects.toThrow();
+    await expect(call({ ...eventFor(pr), deliveryId: 5 })).rejects.toThrow();
+    await expect(call({ ...eventFor(pr), eventId: undefined })).rejects.toThrow();
+    await expect(call({ ...eventFor(pr), prNumber: 1.5 })).rejects.toThrow();
+    await expect(call(eventFor(pr, { findings: [{ source: "github-review", severity: "critical" as never, body: "x" }] }))).rejects.toThrow();
+    await expect(call(eventFor(pr, { findings: [{ source: "made-up" as never, severity: "minor", body: "x" }] }))).rejects.toThrow();
+    await expect(call(eventFor(pr, { findings: [{ source: "github-review", severity: "minor", body: "x", line: "3" as never }] }))).rejects.toThrow();
+    await expect(call(eventFor(pr, { prNumber: pr.scope.prNumber + 1 }))).rejects.toThrow();
+    await expect(call(eventFor(pr, { repo: "Other/repo" }))).rejects.toThrow();
+    expect(recorded.length).toBe(before + 2);
+  }, 30_000);
 });
