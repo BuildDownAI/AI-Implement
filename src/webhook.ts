@@ -3,16 +3,16 @@ import http from "node:http";
 import { listLog, getLatestDispatchForPr } from "./log.js";
 import { enqueueReconciliation, hasReconciliationForPr } from "./reconciliation.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
-import { enqueueReviewFix } from "./review-fix-queue.js";
-import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, extractClaudeSummaryFindings } from "./pipeline/review-ledger.js";
-import { upsertReviewFinding } from "./review-ledger-store.js";
+import { acceptReviewFixWebhookEvent } from "./review-fix-queue.js";
+import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, extractClaudeSummaryFindings, type ReviewLedgerFinding } from "./pipeline/review-ledger.js";
 import { getMappings } from "./config.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { resolveWorkflowContract } from "./workflow-probe.js";
 import { enqueueCommentGapfill } from "./comment-gapfill-queue.js";
 import { addCommentReaction, listPullRequestFiles } from "./github.js";
 import { refreshAvailability, type SelfDeployTarget } from "./deploy-availability.js";
-import { MAX_TRACKED_PRS } from "./kg-refresh.js";
+import type { KgDryRunReportTarget } from "./kg-refresh.js";
+import { KG_SNAPSHOT_BRANCH_PREFIX } from "./pipeline/steps/kg-snapshot-push.js";
 
 function readRawBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -55,18 +55,6 @@ interface PullRequestPayload {
   };
 }
 
-/**
- * KG PR-triggered dry-run rail (AII-633): wired by the caller when a kg-refresh handle
- * exists. `trigger`/`reportDryRun` are `KgRefreshHandle` methods; kept as a narrow
- * structural type here to avoid an import cycle with kg-refresh.ts.
- */
-export interface KgDryRunReportTarget {
-  repo: string;
-  prNumber: number;
-  sha: string;
-  acceptBaseline?: boolean;
-}
-
 export interface KgPrCheckConfig {
   /** The bound KG source repo (`kg.source_repo`), owner/repo. Null disables the check for it. */
   kgSourceRepo: string | null;
@@ -74,26 +62,25 @@ export interface KgPrCheckConfig {
   kgBaseRepo: string | null;
   githubAppId?: string;
   githubAppPrivateKey?: string;
-  trigger: (opts: {
-    dryRun?: boolean;
-    ref?: string;
-    report?: KgDryRunReportTarget;
-  }) => Promise<{ status: number; body: Record<string, unknown> }>;
+  /**
+   * Hands a PR-check dry-run to the `KgRepo` object (AII-730), which runs it now or holds it
+   * until the in-flight refresh releases. `idempotencyKey` is the delivery id, so Restate
+   * absorbs a redelivered event. Never throws in production; `unavailable` and `conflict`
+   * are reported, not retried.
+   */
+  enqueueDryRun: (
+    key: string,
+    entry: { ref: string; report: KgDryRunReportTarget },
+    opts?: { idempotencyKey?: string },
+  ) => Promise<
+    | { status: "accepted"; value?: { triggerId: string } | { queued: true } | { duplicate: true } | { closed: true } }
+    | { status: "conflict" }
+    | { status: "unavailable" }
+  >;
   /** Returns whether it actually posted — false on a silent no-op (AII-636). */
-  reportDryRun: (report: KgDryRunReportTarget) => Promise<boolean>;
-  /**
-   * Registers a listener fired whenever a kg-refresh dispatch settles for any reason —
-   * a dry-run completion, a real refresh completion, a failure, or a deploy hold
-   * clearing (`KgRefreshHandle.onRefreshSettled`, AII-636). Used to dispatch a
-   * superseding head queued while some refresh was already in flight (AII-633).
-   */
-  onRefreshSettled?: (cb: () => void) => () => void;
-  /**
-   * Evicts `KgRefreshHandle`'s stored dry-run outcome for `repo`#`prNumber` (AII-636).
-   * Called from this module's own `closed` handling below, alongside its own
-   * `kgDryRunLastSha`/`kgDryRunPending` eviction for the same PR.
-   */
-  forgetKgPr?: (repo: string, prNumber: number) => void;
+  reportDryRun: (report: KgDryRunReportTarget) => Promise<"reported" | "no-outcome" | "unavailable">;
+  /** Evicts the `KgRepo` object's stored dry-run outcome for `repo`#`prNumber` (AII-636), on `closed`. */
+  forgetKgPr?: (repo: string, prNumber: number) => void | Promise<void>;
 }
 
 /** Paths whose change on a KG repo PR proves the dry-run rail before merge (AII-633). */
@@ -112,80 +99,16 @@ function hasAcceptBaselineLabel(payload: PullRequestPayload): boolean {
 }
 
 /**
- * Tracks the last sha a dry-run was dispatched for, per PR, so a redelivered/duplicate
- * webhook does not re-dispatch. Bounded to MAX_TRACKED_PRS entries (shared with
- * kg-refresh.ts's own per-PR cache, AII-636) — oldest evicted first on insert past the
- * cap — and cleared per-PR on PR close via forgetKgPr().
- */
-const kgDryRunLastSha = new Map<string, string>();
-
-interface KgDryRunPendingEntry {
-  ref: string;
-  report: KgDryRunReportTarget;
-}
-
-/**
- * Heads queued while a dry-run was already in flight for the same PR, keyed by
- * `repo#prNumber` (AII-633). At most one entry per PR — a newer head replaces the
- * pending one rather than queuing alongside it, so only the latest ever dispatches.
- * Bounded and evicted the same way as kgDryRunLastSha (AII-636).
- */
-const kgDryRunPending = new Map<string, KgDryRunPendingEntry>();
-
-/**
- * Evicts `repo`#`prNumber`'s entries from both webhook-local caches, plus the
- * kg-refresh handle's own stored dry-run outcome for the same PR when
- * `kgPrCheck.forgetKgPr` is wired (AII-636). Called on `pull_request` `closed` — a
+ * Evicts the `KgRepo` object's stored dry-run outcome and held head for `repo`#`prNumber`
+ * when `kgPrCheck.forgetKgPr` is wired (AII-636, AII-977); a rejection is logged, not thrown.
+ * Called on `pull_request` `closed` — a
  * closed PR can never legitimately receive another `labeled` re-report, so there is
- * no reason to wait for the MAX_TRACKED_PRS cap to evict it naturally.
+ * no reason to wait for the MAX_TRACKED_PRS cap to evict it.
  */
 function forgetKgPr(kgPrCheck: KgPrCheckConfig | undefined, repoFullName: string, prNumber: number): void {
-  const key = `${repoFullName}#${prNumber}`;
-  kgDryRunLastSha.delete(key);
-  kgDryRunPending.delete(key);
-  kgPrCheck?.forgetKgPr?.(repoFullName, prNumber);
-}
-
-/**
- * Queues `entry` as the pending dispatch for `key`, replacing any earlier pending
- * head, and arms a one-shot listener that dispatches it on the next dry-run
- * completion. Called both when a fresh webhook delivery collides with an in-flight
- * dry-run (trigger() → 409) and when a queued dispatch itself races into another
- * in-flight run.
- */
-function queueKgDryRun(kgPrCheck: KgPrCheckConfig, key: string, entry: KgDryRunPendingEntry): void {
-  kgDryRunPending.delete(key);
-  kgDryRunPending.set(key, entry);
-  if (kgDryRunPending.size > MAX_TRACKED_PRS) {
-    const oldestKey = kgDryRunPending.keys().next().value;
-    if (oldestKey !== undefined) kgDryRunPending.delete(oldestKey);
-  }
-  if (!kgPrCheck.onRefreshSettled) return;
-  const unregister = kgPrCheck.onRefreshSettled(() => {
-    unregister();
-    void dispatchPendingKgDryRun(kgPrCheck, key);
+  Promise.resolve(kgPrCheck?.forgetKgPr?.(repoFullName, prNumber)).catch((err) => {
+    console.warn(`[webhook] kg-refresh forgetPr failed for ${repoFullName}#${prNumber}:`, err);
   });
-}
-
-/** Dispatches the pending head for `key`, if any, once the in-flight dry-run has settled. */
-async function dispatchPendingKgDryRun(kgPrCheck: KgPrCheckConfig, key: string): Promise<void> {
-  const entry = kgDryRunPending.get(key);
-  if (!entry) return;
-  kgDryRunPending.delete(key);
-
-  const result = await kgPrCheck.trigger({ dryRun: true, ref: entry.ref, report: entry.report }).catch((err) => {
-    console.error(`[webhook] kg-refresh dry-run: failed to dispatch queued head for ${key}:`, err);
-    return { status: 500, body: {} as Record<string, unknown> };
-  });
-
-  if (result.status === 409) {
-    // Still busy — another dispatch raced in ahead of this one. Re-queue and wait
-    // for the next completion rather than dropping the superseding head.
-    queueKgDryRun(kgPrCheck, key, entry);
-    return;
-  }
-
-  console.log(`[kg-refresh] dry-run for ${entry.report.repo}@${entry.report.sha} (queued dispatch)`);
 }
 
 /**
@@ -199,6 +122,7 @@ async function handleKgPrCheckWebhook(
   payload: PullRequestPayload,
   res: http.ServerResponse,
   kgPrCheck: KgPrCheckConfig | undefined,
+  deliveryId?: string,
 ): Promise<boolean> {
   if (!kgPrCheck) return false;
   if (
@@ -256,9 +180,15 @@ async function handleKgPrCheckWebhook(
       // GitHub having already dropped it from `pull_request.labels` by delivery time.
       acceptBaseline: payload.action === "labeled" ? hasAcceptBaselineLabel(payload) : false,
     });
+    if (posted === "unavailable") {
+      // 503 so GitHub redelivers: the outcome store was unreachable, not empty.
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "restate-unavailable" }));
+      return true;
+    }
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(
-      posted
+      posted === "reported"
         ? JSON.stringify({ reported: true })
         : JSON.stringify({ ignored: true, reason: "no_dry_run_outcome" }),
     );
@@ -269,11 +199,13 @@ async function handleKgPrCheckWebhook(
     return answer(200, { ignored: true, reason: "missing_pr_fields" }, "missing PR fields");
   }
 
-  const key = `${repoFullName}#${prNumber}`;
-  if (kgDryRunLastSha.get(key) === sha) {
-    return answer(200, { ignored: true, reason: "duplicate_sha" }, "duplicate sha");
+  // The refresh's own snapshot PR is merged and its branch deleted within seconds, so a dry-run
+  // of it can never start (AII-1107).
+  if (headRef.startsWith(KG_SNAPSHOT_BRANCH_PREFIX)) {
+    return answer(200, { ignored: true, reason: "rail_snapshot_pr" }, "rail snapshot PR");
   }
 
+  const key = `${repoFullName}#${prNumber}`;
   if (!kgPrCheck.githubAppId || !kgPrCheck.githubAppPrivateKey) {
     return answer(200, { ignored: true, reason: "no_app_credentials" }, "no App credentials");
   }
@@ -300,15 +232,6 @@ async function handleKgPrCheckWebhook(
     return answer(200, { ignored: true, reason: "no_guard_relevant_change" }, "no guard-relevant change");
   }
 
-  // Record before dispatch (not after) so a burst of redeliveries for the same sha
-  // while the trigger call is in flight still collapses to one dispatch.
-  kgDryRunLastSha.delete(key);
-  kgDryRunLastSha.set(key, sha);
-  if (kgDryRunLastSha.size > MAX_TRACKED_PRS) {
-    const oldestKey = kgDryRunLastSha.keys().next().value;
-    if (oldestKey !== undefined) kgDryRunLastSha.delete(oldestKey);
-  }
-
   const report: KgDryRunReportTarget = {
     repo: repoFullName,
     prNumber,
@@ -316,25 +239,41 @@ async function handleKgPrCheckWebhook(
     acceptBaseline: hasAcceptBaselineLabel(payload),
   };
 
-  const result = await kgPrCheck.trigger({ dryRun: true, ref: headRef, report }).catch((err) => {
-    console.error(`[webhook] kg-refresh dry-run trigger failed for ${repoFullName}#${prNumber}:`, err);
-    return { status: 500, body: {} as Record<string, unknown> };
-  });
+  const result = await kgPrCheck
+    .enqueueDryRun(key, { ref: headRef, report }, deliveryId ? { idempotencyKey: deliveryId } : undefined)
+    .catch((err) => {
+      console.error(`[webhook] kg-refresh dry-run enqueue failed for ${repoFullName}#${prNumber}:`, err);
+      return { status: "unavailable" as const };
+    });
 
-  if (result.status === 409) {
-    // A refresh is already running — supersede any previously queued head for this
-    // PR with this one and dispatch it once the in-flight dry-run completes.
-    queueKgDryRun(kgPrCheck, key, { ref: headRef, report });
-    return answer(202, { queued: true }, "queued behind the running refresh");
+  if (result.status !== "accepted") {
+    // No inbox, queue, or retry loop here: a lost delivery leaves the required check
+    // pending, and a re-push or manual redelivery recovers it.
+    console.warn(`[webhook] kg-refresh dry-run enqueue ${result.status} for ${repoFullName}#${prNumber}`);
+    return answer(502, { error: "kg_refresh_enqueue_failed", status: result.status }, `enqueue ${result.status}`);
   }
 
-  console.log(`[kg-refresh] dry-run for ${repoFullName}@${sha}`);
-  return answer(result.status === 202 ? 202 : 200, { triggered: result.status === 202, status: result.status }, `dispatched (status ${result.status})`);
+  const value = result.value;
+  if (value && "duplicate" in value) {
+    console.log(`[kg-refresh] dry-run for ${repoFullName}@${sha} skipped (duplicate sha)`);
+    return answer(200, { ignored: true, reason: "duplicate_sha" }, "duplicate head sha");
+  }
+  if (value && "closed" in value) {
+    console.log(`[kg-refresh] dry-run for ${repoFullName}@${sha} skipped (PR closed)`);
+    return answer(200, { ignored: true, reason: "pr_closed" }, "PR already closed");
+  }
+  if (value && "queued" in value) {
+    console.log(`[kg-refresh] dry-run for ${repoFullName}@${sha} (queued dispatch)`);
+    return answer(202, { queued: true }, "queued behind the running refresh");
+  }
+  console.log(`[kg-refresh] dry-run for ${repoFullName}@${sha}${value ? ` (trigger ${value.triggerId})` : ""}`);
+  return answer(202, { triggered: true, ...(value ? { triggerId: value.triggerId } : {}) }, "dispatched");
 }
 
 interface ReviewPayload {
   action?: string;
   review?: {
+    id?: number;
     state?: string;
     body?: string | null;
     html_url?: string;
@@ -355,6 +294,7 @@ interface ReviewPayload {
 interface ReviewCommentPayload {
   action?: string;
   comment?: {
+    id?: number;
     body?: string;
     html_url?: string;
     path?: string;
@@ -450,6 +390,7 @@ export async function handleGitHubWebhook(
   privateKey?: string,
   selfDeploy?: SelfDeployTarget,
   kgPrCheck?: KgPrCheckConfig,
+  onReviewFixPrClosed?: (repository: string, prNumber: number) => void | Promise<void>,
 ): Promise<void> {
   const body = await readRawBody(req);
   const signature = req.headers["x-hub-signature-256"] as string | undefined;
@@ -461,6 +402,7 @@ export async function handleGitHubWebhook(
   }
 
   const event = req.headers["x-github-event"] as string | undefined;
+  const deliveryId = req.headers["x-github-delivery"] as string | undefined;
 
   let payload: PullRequestPayload;
   try {
@@ -472,17 +414,17 @@ export async function handleGitHubWebhook(
   }
 
   if (event === "pull_request_review") {
-    handleReviewWebhook(payload as ReviewPayload, res);
+    handleReviewWebhook(payload as ReviewPayload, res, deliveryId);
     return;
   }
 
   if (event === "pull_request_review_comment") {
-    handleReviewCommentWebhook(payload as ReviewCommentPayload, res);
+    handleReviewCommentWebhook(payload as ReviewCommentPayload, res, deliveryId);
     return;
   }
 
   if (event === "issue_comment") {
-    await handleIssueCommentWebhook(payload as IssueCommentPayload, res, appId, privateKey);
+    await handleIssueCommentWebhook(payload as IssueCommentPayload, res, appId, privateKey, deliveryId);
     return;
   }
 
@@ -506,7 +448,7 @@ export async function handleGitHubWebhook(
     // The KG PR check owns `opened`, `labeled`, and `unlabeled` responses; on `synchronize`
     // it runs as a side effect and returns false so handlePullRequestSynchronize below
     // still runs (AII-639).
-    const handled = await handleKgPrCheckWebhook(payload, res, kgPrCheck);
+    const handled = await handleKgPrCheckWebhook(payload, res, kgPrCheck, deliveryId);
     if (handled) return;
   }
 
@@ -524,6 +466,9 @@ export async function handleGitHubWebhook(
     const kgPrNumber = payload.pull_request?.number;
     if (kgRepoFullName && kgPrNumber && (kgRepoFullName === kgPrCheck?.kgSourceRepo || kgRepoFullName === kgPrCheck?.kgBaseRepo)) {
       forgetKgPr(kgPrCheck, kgRepoFullName, kgPrNumber);
+    }
+    if (kgRepoFullName && kgPrNumber && onReviewFixPrClosed) {
+      await onReviewFixPrClosed(kgRepoFullName, kgPrNumber);
     }
   }
 
@@ -577,7 +522,7 @@ export async function handleGitHubWebhook(
   res.end(JSON.stringify({ queued: true, reconciliationId }));
 }
 
-function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse): void {
+function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse, deliveryId: string | undefined): void {
   if (payload.action !== "submitted" || payload.review?.state?.toUpperCase() !== "CHANGES_REQUESTED") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
@@ -609,12 +554,13 @@ function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse): 
   }
 
   const [reviewOwner, reviewRepo] = repoFullName.split("/");
+  const eventAt = parseEventTimestamp(payload.review?.submitted_at);
   const gate = shouldEnqueueReviewEvent({
     authorType: payload.review?.user?.type,
     body,
     commitId: payload.review?.commit_id,
     headSha: payload.pull_request?.head?.sha,
-    eventAt: parseEventTimestamp(payload.review?.submitted_at),
+    eventAt,
     latestRunDispatchedAt: getLatestDispatchForPr(reviewOwner, reviewRepo, prNumber)?.dispatchedAt ?? null,
   });
   if (!gate.enqueue) {
@@ -624,15 +570,23 @@ function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse): 
     return;
   }
 
-  const findingId = upsertReviewFinding({
-    repo: repoFullName,
-    prNumber,
+  const finding: ReviewLedgerFinding = {
     source: "github-review",
     severity: "blocking",
     body,
     ...(payload.review?.html_url ? { url: payload.review.html_url } : {}),
-  });
-  const reviewFixId = enqueueReviewFix({
+  };
+  const outcome = acceptReviewFixWebhookEvent({
+    eventId: resolveReviewFixEventId(deliveryId, {
+      repo: repoFullName,
+      prNumber,
+      kind: "pull_request_review",
+      sourceId: payload.review?.id,
+      actor: payload.review?.user?.login,
+      body,
+      commitId: payload.review?.commit_id,
+      eventAt,
+    }),
     issueId: match.issueId,
     issueIdentifier: match.issueIdentifier,
     repo: repoFullName,
@@ -640,14 +594,19 @@ function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse): 
     reason: "changes_requested",
     sourceUrl: payload.review?.html_url,
     actor: payload.review?.user?.login,
-    findingIds: [findingId],
+    findings: [finding],
   });
 
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ queued: true, findingId, reviewFixId }));
+  res.end(JSON.stringify({
+    queued: true,
+    duplicate: outcome.status === "duplicate",
+    findingId: outcome.findingIds[0],
+    reviewFixId: outcome.reviewFixId,
+  }));
 }
 
-function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.ServerResponse): void {
+function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.ServerResponse, deliveryId: string | undefined): void {
   if (payload.action !== "created") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
@@ -673,12 +632,13 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
   }
 
   const [commentOwner, commentRepo] = repoFullName.split("/");
+  const eventAt = parseEventTimestamp(payload.comment?.created_at);
   const gate = shouldEnqueueReviewEvent({
     authorType: payload.comment?.user?.type,
     body,
     commitId: payload.comment?.commit_id,
     headSha: payload.pull_request?.head?.sha,
-    eventAt: parseEventTimestamp(payload.comment?.created_at),
+    eventAt,
     latestRunDispatchedAt: getLatestDispatchForPr(commentOwner, commentRepo, prNumber)?.dispatchedAt ?? null,
   });
   if (!gate.enqueue) {
@@ -698,17 +658,27 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
   // genuine "changes requested" verdict arrives separately via handleReviewWebhook
   // (state=CHANGES_REQUESTED), which records the blocking finding. This keeps tool
   // feedback flowing to the fixer without overriding an approving reviewer.
-  const findingId = upsertReviewFinding({
-    repo: repoFullName,
-    prNumber,
+  const finding: ReviewLedgerFinding = {
     source: "github-review-thread",
     severity: "medium",
     body,
     ...(payload.comment?.path ? { path: payload.comment.path } : {}),
     ...(typeof line === "number" ? { line } : {}),
     ...(payload.comment?.html_url ? { url: payload.comment.html_url } : {}),
-  });
-  const reviewFixId = enqueueReviewFix({
+  };
+  const outcome = acceptReviewFixWebhookEvent({
+    eventId: resolveReviewFixEventId(deliveryId, {
+      repo: repoFullName,
+      prNumber,
+      kind: "pull_request_review_comment",
+      sourceId: payload.comment?.id,
+      path: payload.comment?.path,
+      line,
+      actor: payload.comment?.user?.login,
+      body,
+      commitId: payload.comment?.commit_id,
+      eventAt,
+    }),
     issueId: match.issueId,
     issueIdentifier: match.issueIdentifier,
     repo: repoFullName,
@@ -716,11 +686,16 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
     reason: "review_comment",
     sourceUrl: payload.comment?.html_url,
     actor: payload.comment?.user?.login,
-    findingIds: [findingId],
+    findings: [finding],
   });
 
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ queued: true, findingId, reviewFixId }));
+  res.end(JSON.stringify({
+    queued: true,
+    duplicate: outcome.status === "duplicate",
+    findingId: outcome.findingIds[0],
+    reviewFixId: outcome.reviewFixId,
+  }));
 }
 
 function handlePullRequestSynchronize(payload: PullRequestPayload, res: http.ServerResponse): void {
@@ -820,6 +795,7 @@ async function handleIssueCommentWebhook(
   res: http.ServerResponse,
   appId?: string,
   privateKey?: string,
+  deliveryId?: string,
 ): Promise<void> {
   if (payload.action !== "created") {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -944,12 +920,13 @@ async function handleIssueCommentWebhook(
   }
 
   const [issueCommentOwner, issueCommentRepo] = repoFullName.split("/");
+  const eventAt = parseEventTimestamp(payload.comment?.created_at);
   const gate = shouldEnqueueReviewEvent({
     authorType: payload.comment?.user?.type,
     body,
     commitId: undefined,
     headSha: undefined,
-    eventAt: parseEventTimestamp(payload.comment?.created_at),
+    eventAt,
     latestRunDispatchedAt: getLatestDispatchForPr(issueCommentOwner, issueCommentRepo, prNumber)?.dispatchedAt ?? null,
   });
   if (!gate.enqueue) {
@@ -959,8 +936,17 @@ async function handleIssueCommentWebhook(
     return;
   }
 
-  const findingIds = findings.map((finding) => upsertReviewFinding({ repo: repoFullName, prNumber, ...finding }));
-  const reviewFixId = enqueueReviewFix({
+  const outcome = acceptReviewFixWebhookEvent({
+    eventId: resolveReviewFixEventId(deliveryId, {
+      repo: repoFullName,
+      prNumber,
+      kind: "issue_comment",
+      sourceId: payload.comment?.id,
+      actor: payload.comment?.user?.login,
+      body,
+      commitId: undefined,
+      eventAt,
+    }),
     issueId: match.issueId,
     issueIdentifier: match.issueIdentifier,
     repo: repoFullName,
@@ -968,11 +954,16 @@ async function handleIssueCommentWebhook(
     reason: "claude_review_summary",
     sourceUrl: payload.comment?.html_url,
     actor: payload.comment?.user?.login,
-    findingIds,
+    findings,
   });
 
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ queued: true, findingIds, reviewFixId }));
+  res.end(JSON.stringify({
+    queued: true,
+    duplicate: outcome.status === "duplicate",
+    findingIds: outcome.findingIds,
+    reviewFixId: outcome.reviewFixId,
+  }));
 }
 
 function isAiImplementNativeReviewBody(body: string): boolean {
@@ -986,6 +977,50 @@ function parseEventTimestamp(value: string | undefined): number | undefined {
   if (!value) return undefined;
   const ms = Date.parse(value);
   return Number.isNaN(ms) ? undefined : ms;
+}
+
+/**
+ * A stable identity for one webhook-sourced review event, scoped to `acceptReviewFixWebhookEvent`'s
+ * per-repo dedup key (AII-792). GitHub's delivery id (`x-github-delivery`) is preferred — a genuine
+ * redelivery of the same webhook carries the identical GUID. When it is absent (a caller without that
+ * header, a GitHub review/comment id identifies the source object. If neither exists,
+ * a deterministic hash of the fields that
+ * make two events "the same" stands in: two calls with identical repo/PR/kind/actor/body/commit/eventAt/path/line
+ * synthesize to the same id, while a genuinely distinct event (different timestamp, different body, ...)
+ * does not.
+ */
+function resolveReviewFixEventId(
+  deliveryId: string | undefined,
+  parts: {
+    repo: string;
+    prNumber: number;
+    kind: "pull_request_review" | "pull_request_review_comment" | "issue_comment";
+    sourceId?: number;
+    path?: string;
+    line?: number;
+    actor: string | undefined;
+    body: string;
+    commitId: string | undefined;
+    eventAt: number | undefined;
+  },
+): string {
+  if (deliveryId) return `gh-delivery:${deliveryId}`;
+  if (parts.sourceId !== undefined) return `gh-object:${parts.kind}:${parts.sourceId}`;
+  const digest = crypto
+    .createHash("sha256")
+    .update(JSON.stringify([
+      parts.repo,
+      parts.prNumber,
+      parts.kind,
+      parts.actor ?? null,
+      parts.body,
+      parts.commitId ?? null,
+      parts.eventAt ?? null,
+      parts.path ?? null,
+      parts.line ?? null,
+    ]))
+    .digest("hex");
+  return `synthesized:${digest}`;
 }
 
 /**

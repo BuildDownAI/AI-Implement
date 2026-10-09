@@ -10,6 +10,7 @@ import { classifyThrown } from "../pipeline/failure-classification.js";
 import type { ReviewerDefinition } from "../pipeline/reviewers/registry.js";
 import { REVIEWER_VERDICT_SCHEMA } from "../pipeline/reviewers/schema.js";
 import { DISPOSITIONS_FILE, buildDispositionInstructions, stableReviewFindingKey } from "../pipeline/finding-dispositions.js";
+import { CYCLE_SUMMARY_MAX_BYTES } from "../pipeline/cycle-summary.js";
 
 function makeCtx(execMock: any, dataOverrides: Record<string, unknown> = {}) {
   return {
@@ -463,7 +464,7 @@ describe("postPushReviewStep", () => {
       vi.useRealTimers();
     }
 
-    const reviewerRow = report.mock.calls.map((call) => call[0]).find((step) => step.id === "post-push-review.1.reviewer.0.trusted.code-review");
+    const reviewerRow = (report.mock.calls as any[][]).map((call) => call[0]).find((step) => step.id === "post-push-review.1.reviewer.0.trusted.code-review");
     expect(reviewerRow.started_at).toBe("2026-09-14T20:00:00.000Z");
     expect(reviewerRow.ended_at).toBe("2026-09-14T20:00:05.000Z");
   });
@@ -3941,7 +3942,7 @@ describe("postPushReviewStep", () => {
     );
 
     expect(out.approved).toBe(false);
-    expect(invoke.mock.calls.map((call) => call[0].stage)).toEqual([
+    expect((invoke.mock.calls as any[][]).map((call) => call[0].stage)).toEqual([
       "post-push-review/gap-analysis-review-1",
       "post-push-review/code-review-review-1",
     ]);
@@ -4706,7 +4707,7 @@ describe("postPushReviewStep", () => {
     expect(sleep).toHaveBeenCalledTimes(1);
   });
 
-  it("satisfies the gate when a matching check concluded 'failure'", async () => {
+  it("does not satisfy the gate when a matching check concluded 'failure'", async () => {
     const reviewerOutput = { approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 };
     const sleep = vi.fn(async () => undefined);
     let checkProbes = 0;
@@ -4736,10 +4737,114 @@ describe("postPushReviewStep", () => {
       { report: vi.fn(async () => undefined) },
     );
 
-    // A "failure" conclusion is a real reviewer verdict — the gate should proceed to completion.
+    // A failed review check carries no verdict: the review-findings/v1 emitter fails its check
+    // only when it has none to post, and claude-code-action fails only when its run errors.
     expect(sleep).toHaveBeenCalled();
     expect(checkProbes).toBeGreaterThanOrEqual(2);
-    expect(out.approved).toBe(true);
+    expect(out.approved).toBe(false);
+    expect(out.terminationReason).toBe("invalid_review");
+  });
+
+  describe("a review check that finished without a verdict (AII-1103)", () => {
+    const failedRunComment = {
+      user: { login: "github-actions[bot]", type: "Bot" },
+      created_at: "2026-10-06T17:05:53Z",
+      updated_at: "2026-10-06T17:09:51Z",
+      html_url: "https://example.com/progress",
+      body: "**Claude encountered an error after 3m 43s** —— [View job](https://example.com/job)\n\n---\nI'll analyze this and get back to you.",
+    };
+    const contractComment = (createdAt: string, verdict: string, findings: unknown[]) => ({
+      user: { login: "github-actions[bot]", type: "Bot" },
+      created_at: createdAt,
+      updated_at: createdAt,
+      html_url: `https://example.com/review-${createdAt}`,
+      body: ["## Claude review", "", "```json review-findings", JSON.stringify({ schema: "review-findings/v1", verdict, findings }), "```"].join("\n"),
+    });
+    const olderHeadApproval = contractComment("2026-10-06T15:00:00Z", "approve", []);
+
+    async function runGate({ conclusion, comments }: { conclusion: string; comments: unknown[] }) {
+      const reviewerOutput = { approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 };
+      const ghComments: string[] = [];
+      const ghSpawn = vi.fn((args: string[]) => {
+        if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+        if (args[0] === "pr" && args[1] === "comment") {
+          ghComments.push(args[args.indexOf("--body") + 1]);
+          return { stdout: "", exitCode: 0 };
+        }
+        if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+          return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+        }
+        if (args[0] === "api" && args.some((a) => a.includes("commits/deadbeef/check-runs"))) {
+          return { stdout: JSON.stringify({ check_runs: [{ name: "claude-review", status: "completed", conclusion }] }), exitCode: 0 };
+        }
+        if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+          return { stdout: "[]", exitCode: 0 };
+        }
+        if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+          return { stdout: JSON.stringify(comments), exitCode: 0 };
+        }
+        return { stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } }), exitCode: 0 };
+      });
+      const out = await postPushReviewStep.run(
+        makeCtx(vi.fn(async () => structuredReviewResult(reviewerOutput))),
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+        { report: vi.fn(async () => undefined) },
+      );
+      return { out, ghComments };
+    }
+
+    function expectVerdictUnavailableEnding(out: { approved: boolean; terminationReason: string; finalFeedback: string }, ghComments: string[]) {
+      expect(out.approved).toBe(false);
+      expect(out.terminationReason).toBe("invalid_review");
+      expect(out.finalFeedback).toContain("finished without a verdict");
+      const comment = ghComments.find((c) => c.includes("invalid-external-review"));
+      expect(comment).toContain("Manual review required; external review verdict unavailable.");
+      expect(comment).not.toContain("could not be parsed");
+      expect(ghComments.some((c) => c.includes("Ready to merge"))).toBe(false);
+    }
+
+    it("takes the verdict-unavailable ending when the failed run left only its error comment", async () => {
+      const { out, ghComments } = await runGate({ conclusion: "failure", comments: [failedRunComment] });
+      expectVerdictUnavailableEnding(out, ghComments);
+    });
+
+    it("does not approve on an older head's approval below the failed run's error comment", async () => {
+      const { out, ghComments } = await runGate({ conclusion: "failure", comments: [olderHeadApproval, failedRunComment] });
+      expectVerdictUnavailableEnding(out, ghComments);
+    });
+
+    it("does not approve on an approving block when the check itself failed", async () => {
+      const { out, ghComments } = await runGate({ conclusion: "failure", comments: [contractComment("2026-10-06T17:09:00Z", "approve", [])] });
+      expectVerdictUnavailableEnding(out, ghComments);
+    });
+
+    // A reviewer whose check fails on findings still gates through what it posted; only the
+    // approval the failed check used to grant is gone.
+    it("still blocks on a gating finding the reviewer posted before its check failed", async () => {
+      const finding = { severity: "blocking", body: "buildCacheKey collides for an empty tenant." };
+      const { out, ghComments } = await runGate({ conclusion: "failure", comments: [contractComment("2026-10-06T17:09:00Z", "changes_requested", [finding])] });
+      expect(out.approved).toBe(false);
+      expect(out.terminationReason).toBe("iterations_exhausted");
+      expect(ghComments.find((c) => c.includes("Not ready to merge"))).toContain(finding.body);
+    });
+
+    it("names the missing verdict, not an older blocking verdict, when both are present", async () => {
+      const { out, ghComments } = await runGate({ conclusion: "failure", comments: [contractComment("2026-10-06T15:00:00Z", "changes_requested", [])] });
+      expectVerdictUnavailableEnding(out, ghComments);
+      expect(out.finalFeedback).not.toContain("blocks merge");
+    });
+
+    it("reports a cancelled check through the same ending, not as a review still running", async () => {
+      const { out, ghComments } = await runGate({ conclusion: "cancelled", comments: [] });
+      expectVerdictUnavailableEnding(out, ghComments);
+    });
+
+    it("approves on an approving block when the check succeeded", async () => {
+      const { out, ghComments } = await runGate({ conclusion: "success", comments: [contractComment("2026-10-06T17:09:00Z", "approve", [])] });
+      expect(out.approved).toBe(true);
+      expect(out.terminationReason).toBe("approved");
+      expect(ghComments.some((c) => c.includes("Ready to merge"))).toBe(true);
+    });
   });
 
   it("satisfies the gate when a mixed set contains one skipped and one success check", async () => {
@@ -5086,8 +5191,8 @@ describe("postPushReviewStep", () => {
   });
 
   it("T-6: CI gate excludes the external review check's own failure — not double-counted as a CI blocker", async () => {
-    // When the external review check concludes "failure" (reviewer found issues), the CI gate
-    // must not also report it as a failing CI check. The external review path handles it.
+    // A failed external review check belongs to the external review path, which reads it as a
+    // check without a verdict; the CI gate must not also report it as a failing CI check.
     const reviewerOutput = {
       approved: false,
       blocking_issues: [{ title: "Bug", problem: "Null ref in foo method", required_fix: "Guard against null." }],
@@ -5106,7 +5211,7 @@ describe("postPushReviewStep", () => {
         return { stdout: JSON.stringify({ head: { sha: "deadbeef45" } }), exitCode: 0 };
       }
       if (args[0] === "api" && args.some((a) => a.includes("deadbeef45/check-runs"))) {
-        // The external review check itself concluded "failure" — reviewer found issues.
+        // The external review check itself concluded "failure".
         return {
           stdout: JSON.stringify({
             check_runs: [{ name: "review", status: "completed", conclusion: "failure" }],
@@ -6126,6 +6231,263 @@ Minor issue worth addressing.
       expect(fixPassCount).toBe(2);
       expect(out.findingDispositions).toEqual([{ findingKey, disposition: "follow-up", reason: "pass 2" }]);
       expect(out.approved).toBe(true);
+
+      // Each fix-pass cycle summary carries only that iteration's own disposition
+      // (AII-801) — never the cumulative findingDispositions the run-level output above
+      // reports — so a later push's disposition for the same key does not retroactively
+      // rewrite an earlier, already-recorded cycle.
+      const cycleSummaryPath = path.join(workspaceDir, "ai-output", "cycle-summaries.jsonl");
+      const summaries = fs.readFileSync(cycleSummaryPath, "utf-8")
+        .split("\n")
+        .filter((line) => line.trim().length > 0)
+        .map((line) => JSON.parse(line));
+      const fix1 = summaries.find((s: { id: string }) => s.id === "post-push-review.fix-1");
+      const fix2 = summaries.find((s: { id: string }) => s.id === "post-push-review.fix-2");
+      expect(fix1.dispositions).toEqual([{ key: findingKey, disposition: "invalid" }]);
+      expect(fix2.dispositions).toEqual([{ key: findingKey, disposition: "follow-up" }]);
+      expect(fix1.verdict).toMatchObject({ approved: null, reason: "fixed" });
+      expect(fix1.outputCommitStatus).toBe("committed");
+    } finally {
+      fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("postPushReviewStep — cycle summaries (AII-801)", () => {
+  function makeWorkspaceDir(): string {
+    return fs.mkdtempSync(path.join(os.tmpdir(), "post-push-review-cycle-summary-"));
+  }
+
+  function readCycleSummaries(workspaceDir: string): Array<{
+    id: string;
+    stage: string;
+    cycle: number;
+    inputCommit: string | null;
+    outputCommit: string | null;
+    outputCommitStatus: string;
+    dispositions: { key: string; disposition: string }[];
+    tests: { name: string; status: string }[];
+    verdict: { approved: boolean | null; reason: string; summary?: string };
+    usage: { tokensIn: number | null; tokensOut: number | null; costUsd: number | null };
+    truncated: boolean;
+    limitReached: boolean;
+  }> {
+    const filePath = path.join(workspaceDir, "ai-output", "cycle-summaries.jsonl");
+    if (!fs.existsSync(filePath)) return [];
+    return fs.readFileSync(filePath, "utf-8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0)
+      .map((line) => JSON.parse(line));
+  }
+
+  it("records a committed cycle summary with an unobserved (not inferred-passed) test status after a successful fix-pass push", async () => {
+    const workspaceDir = makeWorkspaceDir();
+    try {
+      const ghSpawn = vi.fn((args: string[]) => {
+        if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+        return { stdout: "", exitCode: 0 };
+      });
+      const gitSpawn = vi.fn((args: string[]) => {
+        if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "fix-branch\n", exitCode: 0 };
+        if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234", exitCode: 0 };
+        if (args[0] === "rev-parse" && args[1] === "HEAD") return { stdout: "abc1234567890abc1234567890abc1234567890", exitCode: 0 };
+        if (args[0] === "status") return { stdout: "M file.ts", exitCode: 0 };
+        return { stdout: "", exitCode: 0 };
+      });
+      const invoke = vi.fn(async (params: any) => {
+        if (params.stage === "post-push-review/review-1") {
+          return structuredReviewResult({
+            approved: false,
+            blocking_issues: [{ title: "Missing null check", problem: "Crashes on null", required_fix: "Add a guard" }],
+            score: 40,
+            progress_delta: 10,
+            feedback: "Needs a fix",
+          });
+        }
+        if (params.stage === "post-push-review/fix-1") {
+          return {
+            stdout: JSON.stringify({ fixed: ["Added null guard"], testing: ["npm test -- all passed"], notes: "" }),
+            exitCode: 0,
+            telemetry: { outcome: "success" as const, numTurns: 3, durationMs: 500, costUsd: 0.1, tokensIn: 50, tokensOut: 25 },
+          };
+        }
+        if (params.stage === "post-push-review/review-2") {
+          return structuredReviewResult({ approved: true, blocking_issues: [], score: 90, progress_delta: 100, feedback: "ok" });
+        }
+        throw new Error(`unexpected stage ${params.stage}`);
+      });
+
+      const out = await postPushReviewStep.run(
+        makeCtx(invoke),
+        { prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [], ghSpawn, gitSpawn },
+        { report: vi.fn(async () => undefined) },
+      );
+
+      expect(out.approved).toBe(true);
+      const summaries = readCycleSummaries(workspaceDir);
+      expect(summaries).toHaveLength(1);
+      const [summary] = summaries;
+      expect(summary!.id).toBe("post-push-review.fix-1");
+      expect(summary!.stage).toBe("post-push-review-fix");
+      expect(summary!.inputCommit).toBe("abc1234567890abc1234567890abc1234567890");
+      expect(summary!.outputCommitStatus).toBe("committed");
+      expect(summary!.outputCommit).toBe("abc1234567890abc1234567890abc1234567890");
+      expect(summary!.verdict).toMatchObject({ approved: null, reason: "fixed" });
+      // The fix agent's testing[] note ("npm test -- all passed") is self-reported, not an
+      // observed tool result — it must never be read as an inferred "passed" (AII-801 review).
+      expect(summary!.tests.length).toBeGreaterThan(0);
+      expect(summary!.tests.every((t) => t.status === "unobserved")).toBe(true);
+      expect(summary!.usage).toMatchObject({ tokensIn: 50, tokensOut: 25, costUsd: 0.1 });
+    } finally {
+      fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("records a fix_failed verdict with an explicit missing test status when the fix-pass LLM invocation fails", async () => {
+    const workspaceDir = makeWorkspaceDir();
+    try {
+      const ghSpawn = vi.fn((args: string[]) => {
+        if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+        return { stdout: "", exitCode: 0 };
+      });
+      const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+      const invoke = vi.fn(async (params: any) => {
+        if (params.stage === "post-push-review/review-1") {
+          return structuredReviewResult({
+            approved: false,
+            blocking_issues: [{ title: "Missing null check", problem: "Crashes on null", required_fix: "Add a guard" }],
+            score: 40,
+            progress_delta: 10,
+            feedback: "Needs a fix",
+          });
+        }
+        if (params.stage === "post-push-review/fix-1") {
+          return { stdout: "", stderr: "socket hang up", exitCode: 1 };
+        }
+        throw new Error(`unexpected stage ${params.stage}`);
+      });
+
+      const out = await postPushReviewStep.run(
+        makeCtx(invoke),
+        { prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [], ghSpawn, gitSpawn },
+        { report: vi.fn(async () => undefined) },
+      );
+
+      expect(out.terminationReason).toBe("fix_failed");
+      const summaries = readCycleSummaries(workspaceDir);
+      expect(summaries).toHaveLength(1);
+      expect(summaries[0]!.verdict).toMatchObject({ approved: null, reason: "fix_failed" });
+      expect(summaries[0]!.outputCommit).toBeNull();
+      expect(summaries[0]!.outputCommitStatus).toBe("not_applicable");
+      expect(summaries[0]!.tests).toEqual([{ name: "test execution", status: "missing" }]);
+    } finally {
+      fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("records a no_changes verdict when the fix pass leaves blockers unresolved with nothing to push", async () => {
+    const workspaceDir = makeWorkspaceDir();
+    try {
+      const ghSpawn = vi.fn((args: string[]) => {
+        if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+        return { stdout: "", exitCode: 0 };
+      });
+      const gitSpawn = vi.fn((args: string[]) => {
+        if (args[0] === "status") return { stdout: "", exitCode: 0 };
+        return { stdout: "", exitCode: 0 };
+      });
+      const invoke = vi.fn(async (params: any) => {
+        if (params.stage === "post-push-review/review-1") {
+          return structuredReviewResult({
+            approved: false,
+            blocking_issues: [{ title: "Missing null check", problem: "Crashes on null", required_fix: "Add a guard" }],
+            score: 40,
+            progress_delta: 10,
+            feedback: "Needs a fix",
+          });
+        }
+        if (params.stage === "post-push-review/fix-1") {
+          return { stdout: JSON.stringify({ fixed: [], testing: [], notes: "" }), exitCode: 0 };
+        }
+        throw new Error(`unexpected stage ${params.stage}`);
+      });
+
+      const out = await postPushReviewStep.run(
+        makeCtx(invoke),
+        { prNumber: "42", workspaceDir, maxIterations: 2, reviewProviders: [], ghSpawn, gitSpawn },
+        { report: vi.fn(async () => undefined) },
+      );
+
+      expect(out.terminationReason).toBe("no_changes");
+      const summaries = readCycleSummaries(workspaceDir);
+      expect(summaries).toHaveLength(1);
+      expect(summaries[0]!.verdict).toMatchObject({ approved: null, reason: "no_changes" });
+      expect(summaries[0]!.outputCommitStatus).toBe("not_applicable");
+      expect(summaries[0]!.dispositions).toEqual([]);
+    } finally {
+      fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("caps an oversized fix-pass testing/notes block instead of silently dropping it", async () => {
+    const workspaceDir = makeWorkspaceDir();
+    try {
+      const ghSpawn = vi.fn((args: string[]) => {
+        if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+        return { stdout: "", exitCode: 0 };
+      });
+      const gitSpawn = vi.fn((args: string[]) => {
+        if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "fix-branch\n", exitCode: 0 };
+        if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234", exitCode: 0 };
+        if (args[0] === "rev-parse" && args[1] === "HEAD") return { stdout: "abc1234567890abc1234567890abc1234567890", exitCode: 0 };
+        if (args[0] === "status") return { stdout: "M file.ts", exitCode: 0 };
+        return { stdout: "", exitCode: 0 };
+      });
+      // Oversized on two axes: a `notes` blob far past the per-field char cap, and a
+      // `testing[]` block with far more entries than the record's cap allows.
+      const oversizedNotes = "n".repeat(5000);
+      const oversizedTesting = Array.from({ length: 60 }, (_, i) => `npm test -- suite ${i} passed`);
+      const invoke = vi.fn(async (params: any) => {
+        if (params.stage === "post-push-review/review-1") {
+          return structuredReviewResult({
+            approved: false,
+            blocking_issues: [{ title: "Missing null check", problem: "Crashes on null", required_fix: "Add a guard" }],
+            score: 40,
+            progress_delta: 10,
+            feedback: "Needs a fix",
+          });
+        }
+        if (params.stage === "post-push-review/fix-1") {
+          return {
+            stdout: JSON.stringify({ fixed: ["Added null guard"], testing: oversizedTesting, notes: oversizedNotes }),
+            exitCode: 0,
+            telemetry: { outcome: "success" as const, numTurns: 3, durationMs: 500, costUsd: 0.1, tokensIn: 50, tokensOut: 25 },
+          };
+        }
+        if (params.stage === "post-push-review/review-2") {
+          return structuredReviewResult({ approved: true, blocking_issues: [], score: 90, progress_delta: 100, feedback: "ok" });
+        }
+        throw new Error(`unexpected stage ${params.stage}`);
+      });
+
+      const out = await postPushReviewStep.run(
+        makeCtx(invoke),
+        { prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [], ghSpawn, gitSpawn },
+        { report: vi.fn(async () => undefined) },
+      );
+
+      expect(out.approved).toBe(true);
+      const summaries = readCycleSummaries(workspaceDir);
+      expect(summaries).toHaveLength(1);
+      const [summary] = summaries;
+      expect(summary!.id).toBe("post-push-review.fix-1");
+      // Capped, not dropped: the field still carries content, just bounded.
+      expect(summary!.verdict.summary).toBeTruthy();
+      expect(summary!.verdict.summary!.length).toBeLessThan(oversizedNotes.length);
+      expect(summary!.tests.length).toBeGreaterThan(0);
+      expect(summary!.tests.length).toBeLessThan(oversizedTesting.length);
+      expect(summary!.truncated).toBe(true);
+      expect(Buffer.byteLength(JSON.stringify(summary), "utf-8")).toBeLessThanOrEqual(CYCLE_SUMMARY_MAX_BYTES);
     } finally {
       fs.rmSync(workspaceDir, { recursive: true, force: true });
     }

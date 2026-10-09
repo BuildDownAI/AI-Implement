@@ -1,7 +1,12 @@
 import type { RepoMapping } from "../config.js";
 import { resolveProvider } from "./index.js";
-import type { ProviderConfig, TicketingProvider } from "./types.js";
+import type { ProviderConfig, TicketIssue, TicketingProvider } from "./types.js";
 import { getRunnerMode } from "../runner-mode.js";
+
+export type KeyLookupResult =
+  | { kind: "found"; provider: TicketingProvider; issue: TicketIssue; failedProviderIds: string[] }
+  | { kind: "ambiguous"; providerIds: string[] }
+  | { kind: "none"; failedProviderIds: string[] };
 
 /**
  * Resolves and caches TicketingProvider instances per provider id.
@@ -60,6 +65,24 @@ export class ProviderRegistry {
       }
     }
     return providers;
+  }
+
+  /** Look key up in every tracker that has a mapping, in provider-id order. */
+  async findByKeyInAnyTracker(key: string): Promise<KeyLookupResult> {
+    const providers = (await this.forAllMappings(Object.values(this.getMappings()))).sort((a, b) =>
+      a.id.localeCompare(b.id),
+    );
+    const settled = await Promise.allSettled(providers.map((p) => p.findByKey(key)));
+    const hits: { provider: TicketingProvider; issue: TicketIssue }[] = [];
+    const failedProviderIds: string[] = [];
+    settled.forEach((r, i) => {
+      const provider = providers[i];
+      if (r.status === "rejected") failedProviderIds.push(provider.id);
+      else if (r.value) hits.push({ provider, issue: r.value });
+    });
+    if (hits.length >= 2) return { kind: "ambiguous", providerIds: hits.map((h) => h.provider.id) };
+    if (hits.length === 1) return { kind: "found", ...hits[0], failedProviderIds };
+    return { kind: "none", failedProviderIds };
   }
 
   /** Drop cached provider instances. Called when admin upserts a mapping. */

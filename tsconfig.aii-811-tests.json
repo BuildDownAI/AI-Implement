@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": true, "declaration": false },
+  "include": [
+    "src/__tests__/admin.test.ts",
+    "src/__tests__/dispatch-admission.test.ts",
+    "src/__tests__/restate-endpoint.test.ts",
+    "src/__tests__/restate/review-fix-pr.restate.test.ts",
+    "src/__tests__/review-fix-attempt-store.test.ts",
+    "src/__tests__/review-fix-client.test.ts",
+    "src/__tests__/review-fix-drain.test.ts",
+    "src/__tests__/review-fix-github-adapter.test.ts",
+    "src/__tests__/review-fix-worker.test.ts",
+    "src/__tests__/webhook.test.ts"
+  ],
+  "exclude": []
+}

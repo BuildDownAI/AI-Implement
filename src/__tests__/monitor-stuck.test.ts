@@ -7,6 +7,11 @@ import { shouldSkipCompletionNotice } from "../monitor-status.js";
 
 vi.mock("../github.js", () => ({
   cancelWorkflowRun: vi.fn().mockResolvedValue(true),
+  // These tests exercise the requeue/give-up/notification bookkeeping, not the
+  // accepted-cancel-vs-confirmed-terminated distinction (covered in
+  // stuck-watchdog.test.ts) — default the run's observed status to already
+  // "completed" so the existing confirmed-stop assertions below are unaffected.
+  getWorkflowRunStatus: vi.fn().mockResolvedValue({ status: "completed", conclusion: "cancelled", html_url: "https://x" }),
 }));
 
 vi.mock("../fly-machines.js", () => ({
@@ -150,7 +155,7 @@ describe("remediateStuckJob", () => {
 
       await remediateStuckJob(mockConfig, provider, job, "queued");
 
-      expect(updateJobStatus).toHaveBeenCalledWith(job.id, "timed_out", "stuck_requeued");
+      expect(updateJobStatus).toHaveBeenCalledWith(job.id, "timed_out", "stuck_requeued", undefined, { backendTerminated: true });
       expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "ENG");
       expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
       expect(provider.postComment).not.toHaveBeenCalled();
@@ -163,7 +168,7 @@ describe("remediateStuckJob", () => {
 
       await remediateStuckJob(mockConfig, provider, makeJob(), "in_progress");
 
-      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued");
+      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued", undefined, { backendTerminated: true });
       expect(deleteDispatched).toHaveBeenCalled();
       expect(notifyStuckGiveUp).not.toHaveBeenCalled();
     });
@@ -174,7 +179,7 @@ describe("remediateStuckJob", () => {
 
       await remediateStuckJob(mockConfig, provider, makeJob(), "queued");
 
-      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued");
+      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued", undefined, { backendTerminated: true });
       expect(deleteDispatched).toHaveBeenCalled();
       expect(notifyStuckGiveUp).not.toHaveBeenCalled();
     });
@@ -187,7 +192,7 @@ describe("remediateStuckJob", () => {
 
       await remediateStuckJob(mockConfig, provider, makeJob(), "queued");
 
-      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_giveup");
+      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_giveup", undefined, { backendTerminated: true });
     });
 
     it("clears working state but does NOT clear dedup on hard-stop", async () => {
@@ -343,7 +348,7 @@ describe("remediateStuckJob", () => {
         remediateStuckJob(mockConfig, null, makeJob(), "queued"),
       ).resolves.not.toThrow();
 
-      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued");
+      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued", undefined, { backendTerminated: true });
       expect(deleteDispatched).not.toHaveBeenCalled();
     });
 
@@ -354,7 +359,7 @@ describe("remediateStuckJob", () => {
         remediateStuckJob(mockConfig, null, makeJob(), "queued"),
       ).resolves.not.toThrow();
 
-      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_giveup");
+      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_giveup", undefined, { backendTerminated: true });
     });
   });
 });
@@ -413,6 +418,18 @@ describe("monitorJobs TTL check (AII-743)", () => {
     vi.mocked(getMappings).mockReturnValue({});
   });
 
+  it("leaves a kg-refresh GHA row to the workflow: no GitHub call, no status write (AII-901)", async () => {
+    const job = makeJob({ issueId: "kg-refresh", phase: "kg-refresh", repo: "org/kg", runId: 4242, dispatchedAt: Date.now() - 200 * 60 * 1000 });
+    vi.mocked(getInFlightJobs).mockReturnValue([job]);
+    vi.mocked(updateJobStatus).mockClear();
+    vi.mocked(cancelWorkflowRun).mockClear();
+
+    await monitorJobs(mockAppConfig, makeRegistry(null));
+
+    expect(cancelWorkflowRun).not.toHaveBeenCalled();
+    expect(updateJobStatus).not.toHaveBeenCalled();
+  });
+
   it("times out a no-mapping, no-run-id job past 105 minutes with conclusion ttl_expired", async () => {
     vi.mocked(incrementStuckAttempts).mockReturnValue(1);
     const job = makeJob({
@@ -428,10 +445,13 @@ describe("monitorJobs TTL check (AII-743)", () => {
     // remediateStuckJob's own requeue/give-up bookkeeping writes its own
     // conclusion afterward — the *last* write for this job must still be
     // ttl_expired, not stuck_requeued/stuck_giveup.
+    // No runId means remediateStuckJob's default GHA-cancel path never even attempts a
+    // cancel (job.runId && job.repo is false) — the backend's death is unconfirmed, so
+    // AII-783's admission-release gating must hold the reservation here.
     const callsForJob = vi
       .mocked(updateJobStatus)
       .mock.calls.filter(([id]) => id === job.id);
-    expect(callsForJob.at(-1)).toEqual([job.id, "timed_out", "ttl_expired"]);
+    expect(callsForJob.at(-1)).toEqual([job.id, "timed_out", "ttl_expired", undefined, { skipAdmissionRelease: true }]);
     expect(incrementStuckAttempts).toHaveBeenCalledWith(job.issueId);
     expect(cancelWorkflowRun).not.toHaveBeenCalled();
   });
@@ -454,7 +474,7 @@ describe("monitorJobs TTL check (AII-743)", () => {
     const callsForJob = vi
       .mocked(updateJobStatus)
       .mock.calls.filter(([id]) => id === job.id);
-    expect(callsForJob.at(-1)).toEqual([job.id, "timed_out", "ttl_expired"]);
+    expect(callsForJob.at(-1)).toEqual([job.id, "timed_out", "ttl_expired", undefined, { backendTerminated: true }]);
     expect(cancelWorkflowRun).toHaveBeenCalledWith("gh-token-mock", "org", "repo", 555);
   });
 
@@ -474,10 +494,8 @@ describe("monitorJobs TTL check (AII-743)", () => {
     expect(incrementStuckAttempts).not.toHaveBeenCalled();
   });
 
-  it("does not TTL a Fly job under its own 75-minute limit even when the mapping's GHA-only maxJobMinutes would have expired it", async () => {
-    // maxJobMinutes is a GHA-only setting; a Fly job must use FLY_MACHINE_TIMEOUT_MS (60m) + 15m
-    // grace = 75m, not the mapping's low GHA value (20m + 15m = 35m, which this 40m-old job
-    // would fail under the old, wrong logic).
+  it("TTLs a Fly job at the mapping's Job Timeout plus grace (20m + 15m = 35m), not a fixed 60m", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
     vi.mocked(getMappings).mockReturnValue({ AII: makeMapping({ maxJobMinutes: 20 }) });
     const job = makeJob({
       teamKey: "AII",
@@ -491,9 +509,64 @@ describe("monitorJobs TTL check (AII-743)", () => {
 
     await monitorJobs(mockAppConfig, makeRegistry(makeProvider()));
 
-    expect(updateJobStatus).not.toHaveBeenCalled();
-    expect(incrementStuckAttempts).not.toHaveBeenCalled();
-    expect(destroyMachine).not.toHaveBeenCalled();
+    const callsForJob = vi.mocked(updateJobStatus).mock.calls.filter(([id]) => id === job.id);
+    expect(callsForJob.at(-1)?.[2]).toBe("ttl_expired");
+    expect(destroyMachine).toHaveBeenCalled();
+  });
+
+  describe.each(["fly-machines", "local-docker"] as const)("%s Job Timeout (AII-1105)", (executionMode) => {
+    const jobAged = (minutes: number) =>
+      makeJob({
+        teamKey: "AII",
+        repo: "org/repo",
+        executionMode,
+        machineId: "machine-456",
+        runId: null,
+        dispatchedAt: Date.now() - minutes * 60 * 1000,
+      });
+    const statusCalls = (job: Job) =>
+      vi.mocked(updateJobStatus).mock.calls.filter(([id]) => id === job.id);
+
+    it("does not time out or TTL a 70m job on a 90m mapping", async () => {
+      vi.mocked(getMappings).mockReturnValue({ AII: makeMapping({ maxJobMinutes: 90 }) });
+      const job = jobAged(70);
+      vi.mocked(getInFlightJobs).mockReturnValue([job]);
+
+      await monitorJobs(mockAppConfig, makeRegistry(makeProvider()));
+
+      expect(updateJobStatus).not.toHaveBeenCalled();
+      expect(destroyMachine).not.toHaveBeenCalled();
+      expect(removeLocalContainer).not.toHaveBeenCalled();
+    });
+
+    it("times out at 31m on a 30m mapping without a TTL, then TTLs at 46m", async () => {
+      vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+      vi.mocked(getMappings).mockReturnValue({ AII: makeMapping({ maxJobMinutes: 30 }) });
+      const timedOut = jobAged(31);
+      vi.mocked(getInFlightJobs).mockReturnValue([timedOut]);
+      await monitorJobs(mockAppConfig, makeRegistry(makeProvider()));
+      expect(statusCalls(timedOut).length).toBeGreaterThan(0);
+      expect(statusCalls(timedOut).some((c) => c[2] === "ttl_expired")).toBe(false);
+
+      vi.mocked(updateJobStatus).mockClear();
+      const ttl = jobAged(46);
+      vi.mocked(getInFlightJobs).mockReturnValue([ttl]);
+      await monitorJobs(mockAppConfig, makeRegistry(makeProvider()));
+      expect(statusCalls(ttl).at(-1)?.[2]).toBe("ttl_expired");
+    });
+
+    it("defaults to 90m with no maxJobMinutes: 89m is left alone, 91m times out", async () => {
+      vi.mocked(getMappings).mockReturnValue({ AII: makeMapping({ maxJobMinutes: undefined }) });
+      const young = jobAged(89);
+      vi.mocked(getInFlightJobs).mockReturnValue([young]);
+      await monitorJobs(mockAppConfig, makeRegistry(makeProvider()));
+      expect(updateJobStatus).not.toHaveBeenCalled();
+
+      const old = jobAged(91);
+      vi.mocked(getInFlightJobs).mockReturnValue([old]);
+      await monitorJobs(mockAppConfig, makeRegistry(makeProvider()));
+      expect(statusCalls(old).length).toBeGreaterThan(0);
+    });
   });
 
   it("never TTLs a kg-refresh job, however old", async () => {
@@ -533,7 +606,7 @@ describe("monitorJobs TTL check (AII-743)", () => {
     const callsForJob = vi
       .mocked(updateJobStatus)
       .mock.calls.filter(([id]) => id === job.id);
-    expect(callsForJob.at(-1)).toEqual([job.id, "timed_out", "ttl_expired"]);
+    expect(callsForJob.at(-1)).toEqual([job.id, "timed_out", "ttl_expired", undefined, { backendTerminated: true }]);
   });
 
   it("removes the local Docker container when a local-docker job TTLs out (no GHA-only fallback)", async () => {
@@ -556,7 +629,7 @@ describe("monitorJobs TTL check (AII-743)", () => {
     const callsForJob = vi
       .mocked(updateJobStatus)
       .mock.calls.filter(([id]) => id === job.id);
-    expect(callsForJob.at(-1)).toEqual([job.id, "timed_out", "ttl_expired"]);
+    expect(callsForJob.at(-1)).toEqual([job.id, "timed_out", "ttl_expired", undefined, { backendTerminated: true }]);
   });
 
   it("skips the TTL branch entirely for a job whose fresh conclusion is operator_cancelled", async () => {

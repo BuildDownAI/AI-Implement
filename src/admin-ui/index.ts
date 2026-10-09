@@ -10,6 +10,7 @@ import { settingsHtml, settingsScript } from "./pages/settings.js";
 import { projectsHtml, projectsScript } from "./pages/projects.js";
 import { pipelinesHtml, pipelinesScript } from "./pages/pipelines.js";
 import { reaperHtml, reaperScript } from "./pages/reaper.js";
+import { journalHtml, journalScript } from "./pages/journal.js";
 import { sessionsHtml, sessionsScript } from "./pages/sessions.js";
 import { auditHtml, auditScript } from "./pages/audit.js";
 import { issuesHtml, issuesScript } from "./pages/issues.js";
@@ -20,6 +21,7 @@ import { pipelinesAndStepsHtml, pipelinesAndStepsScript } from "./pages/pipeline
 import { modelsAndProvidersHtml, modelsAndProvidersScript } from "./pages/models-and-providers.js";
 import { runnersHtml, runnersScript } from "./pages/runners.js";
 import { reportsHtml, reportsScript } from "./pages/reports.js";
+import { kgPipelinesHtml, kgPipelinesScript } from "./pages/kg-pipelines.js";
 import { deploymentsHtml, deploymentsScript } from "./pages/deployments.js";
 import { stubsHtml } from "./pages/stubs.js";
 import { noAccessHtml } from "./pages/no-access.js";
@@ -48,6 +50,7 @@ const shell = `<div id="admin-page" class="app-shell hidden">
     ${projectsHtml}
     ${pipelinesHtml}
     ${reaperHtml}
+    ${journalHtml}
     ${sessionsHtml}
     ${auditHtml}
     ${issuesHtml}
@@ -58,6 +61,7 @@ const shell = `<div id="admin-page" class="app-shell hidden">
     ${modelsAndProvidersHtml}
     ${runnersHtml}
     ${reportsHtml}
+    ${kgPipelinesHtml}
     ${deploymentsHtml}
     ${accessHtml}
     ${stubsHtml}
@@ -110,6 +114,7 @@ ${pageScript('settings', settingsScript)}
 ${pageScript('projects', projectsScript)}
 ${pageScript('jobs', pipelinesScript)}
 ${pageScript('reaper', reaperScript)}
+${pageScript('journal', journalScript)}
 ${pageScript('sessions', sessionsScript)}
 ${pageScript('audit', auditScript)}
 ${pageScript('issues', issuesScript)}
@@ -120,6 +125,7 @@ ${pageScript('pipelines', pipelinesAndStepsScript)}
 ${pageScript('models', modelsAndProvidersScript)}
 ${pageScript('runners', runnersScript)}
 ${pageScript('reports', reportsScript)}
+${pageScript('kg-pipelines', kgPipelinesScript)}
 ${pageScript('deployments', deploymentsScript)}
 ${pageScript('access', accessScript)}
 ${pageScript('drawer', drawerScript)}

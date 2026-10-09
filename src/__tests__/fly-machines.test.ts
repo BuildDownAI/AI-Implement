@@ -4,6 +4,9 @@ import {
   getMachine,
   listMachines,
   stopMachine,
+  startMachine,
+  updateMachine,
+  clearMachineEnv,
   destroyMachine,
   waitForMachine,
   generateSessionToken,
@@ -14,6 +17,7 @@ import {
   unsetAppSecret,
   fetchMachineLogs,
   updateMachineMetadata,
+  readMachineExit,
 } from "../fly-machines.js";
 import type { SessionMachineInput } from "../fly-machines.js";
 import { encodeRunConfig, decodeRunConfig, type RunConfigV1 } from "../run-config.js";
@@ -466,6 +470,11 @@ describe("buildSessionMachineConfig", () => {
     expect(result.config.guest).toEqual({ cpu_kind: "shared", cpus: 1, memory_mb: 1024 });
   });
 
+  it("allows performance cpu kind", () => {
+    const result = buildSessionMachineConfig({ ...baseInput, cpus: 2, memoryMb: 4096, cpuKind: "performance" });
+    expect(result.config.guest).toEqual({ cpu_kind: "performance", cpus: 2, memory_mb: 4096 });
+  });
+
   it("allows custom guest spec", () => {
     const result = buildSessionMachineConfig({ ...baseInput, cpus: 2, memoryMb: 2048 });
     expect(result.config.guest).toEqual({ cpu_kind: "shared", cpus: 2, memory_mb: 2048 });
@@ -474,6 +483,10 @@ describe("buildSessionMachineConfig", () => {
   it("generates sanitized machine name from issue identifier", () => {
     const result = buildSessionMachineConfig(baseInput);
     expect(result.name).toBe("session-eng-42");
+  });
+
+  it("uses an explicit machineName instead of the issue-key name", () => {
+    expect(buildSessionMachineConfig({ ...baseInput, machineName: "planning-d-1" }).name).toBe("planning-d-1");
   });
 
   it("defaults region to iad", () => {
@@ -516,6 +529,18 @@ describe("buildSessionMachineConfig", () => {
       repo: "test-org/test-repo",
       session_mode: "autonomous",
     });
+  });
+
+  it("stamps purpose, pipeline and dispatch_id for a durable runner", () => {
+    const result = buildSessionMachineConfig({ ...baseInput, purpose: "durable-runner", pipeline: "kg-refresh", dispatchId: "d1" });
+    expect(result.config.metadata).toMatchObject({ purpose: "durable-runner", pipeline: "kg-refresh", dispatch_id: "d1" });
+  });
+
+  it("leaves pipeline and dispatch_id out of a default session machine", () => {
+    const metadata = buildSessionMachineConfig(baseInput).config.metadata!;
+    expect(metadata.purpose).toBe("session");
+    expect(metadata).not.toHaveProperty("pipeline");
+    expect(metadata).not.toHaveProperty("dispatch_id");
   });
 
   it("includes session_mode in metadata", () => {
@@ -1032,5 +1057,127 @@ describe("fetchMachineLogs", () => {
 
     await expect(fetchMachineLogs(TOKEN, APP, "machine-123"))
       .rejects.toThrow("Failed to fetch logs for machine machine-123 (404)");
+  });
+});
+
+describe("readMachineExit", () => {
+  const withEvents = (events?: Array<Record<string, unknown>>) =>
+    ({ ...mockMachine, events }) as unknown as Parameters<typeof readMachineExit>[0];
+  const nulls = { exitCode: null, signal: null, oomKilled: null, timestamp: null };
+
+  it("returns all-null for missing or empty events", () => {
+    expect(readMachineExit(withEvents(undefined))).toEqual(nulls);
+    expect(readMachineExit(withEvents([]))).toEqual(nulls);
+  });
+
+  it("reads exit code, signal, oom flag, and timestamp from the first exit event", () => {
+    const m = withEvents([
+      { type: "start", timestamp: 9 },
+      { type: "crash", timestamp: 5, request: { exit_event: { exit_code: -1, guest_signal: 9, oom_killed: true } } },
+      { type: "exit", timestamp: 1, request: { exit_event: { exit_code: 3 } } },
+    ]);
+    expect(readMachineExit(m)).toEqual({ exitCode: -1, signal: 9, oomKilled: true, timestamp: 5 });
+  });
+
+  it("leaves exitCode null for a clean exit", () => {
+    expect(readMachineExit(withEvents([{ type: "exit", timestamp: 2, request: { exit_event: {} } }])))
+      .toEqual({ exitCode: null, signal: null, oomKilled: null, timestamp: 2 });
+  });
+});
+
+describe("startMachine / updateMachine (AII-1123)", () => {
+  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it("startMachine posts to /start with no body", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true } as Response);
+    await startMachine(TOKEN, APP, "machine-123");
+    const [url, opts] = vi.mocked(fetch).mock.calls[0];
+    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123/start`);
+    expect((opts as RequestInit).method).toBe("POST");
+    expect((opts as RequestInit).body).toBeUndefined();
+  });
+
+  it("startMachine throws with status and body", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 412, text: async () => "bad state" } as Response);
+    await expect(startMachine(TOKEN, APP, "machine-123")).rejects.toThrow("Failed to start machine machine-123 (412): bad state");
+  });
+
+  it("updateMachine posts { config } and returns the machine", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, json: async () => mockMachine } as Response);
+    const result = await updateMachine(TOKEN, APP, "machine-123", mockMachine.config as never);
+    expect(result.id).toBe("machine-123");
+    const [url, opts] = vi.mocked(fetch).mock.calls[0];
+    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123`);
+    expect((opts as RequestInit).method).toBe("POST");
+    expect(JSON.parse((opts as RequestInit).body as string)).toEqual({ config: mockMachine.config });
+  });
+
+  it("updateMachine throws with status and body", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 422, text: async () => "invalid config" } as Response);
+    await expect(updateMachine(TOKEN, APP, "machine-123", mockMachine.config as never))
+      .rejects.toThrow("Failed to update machine machine-123 (422): invalid config");
+  });
+});
+
+describe("clearMachineEnv", () => {
+  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it("reads the machine and posts the same config with env: {}; never starts it", async () => {
+    const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { GITHUB_TOKEN: "x" } } };
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({ ok: true, json: async () => withEnv } as Response)
+      .mockResolvedValueOnce({ ok: true, json: async () => mockMachine } as Response);
+
+    await clearMachineEnv(TOKEN, APP, "machine-123");
+
+    const calls = vi.mocked(fetch).mock.calls;
+    expect(calls).toHaveLength(2);
+    expect(calls[0][0]).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123`);
+    expect((calls[0][1] as RequestInit | undefined)?.method).toBeUndefined();
+    expect(calls[1][0]).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123`);
+    expect((calls[1][1] as RequestInit).method).toBe("POST");
+    expect(JSON.parse((calls[1][1] as RequestInit).body as string)).toEqual({ config: { ...withEnv.config, env: {} } });
+    expect(calls.some(([url]) => String(url).endsWith("/start"))).toBe(false);
+  });
+
+  it("merges metadata into the one update and never calls the metadata endpoint", async () => {
+    const m = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" }, metadata: { purpose: "durable-runner", durable_until: "1" } } };
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({ ok: true, json: async () => m } as Response)
+      .mockResolvedValueOnce({ ok: true, json: async () => mockMachine } as Response);
+
+    await clearMachineEnv(TOKEN, APP, "machine-123", { durable_until: "123" });
+
+    const calls = vi.mocked(fetch).mock.calls;
+    expect(calls).toHaveLength(2);
+    expect(calls.some(([url]) => String(url).includes("/metadata"))).toBe(false);
+    expect(JSON.parse((calls[1][1] as RequestInit).body as string)).toEqual({
+      config: { ...m.config, env: {}, metadata: { purpose: "durable-runner", durable_until: "123" } },
+    });
+  });
+
+  it("adds metadata when the machine has none", async () => {
+    const m = { ...mockMachine, config: { ...mockMachine.config, metadata: undefined } };
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({ ok: true, json: async () => m } as Response)
+      .mockResolvedValueOnce({ ok: true, json: async () => mockMachine } as Response);
+    await clearMachineEnv(TOKEN, APP, "m", { durable_until: "5" });
+    const body = JSON.parse((vi.mocked(fetch).mock.calls[1][1] as RequestInit).body as string);
+    expect(body.config.metadata).toEqual({ durable_until: "5" });
+  });
+
+  it("throws when the read fails, without posting", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 404, text: async () => "gone" } as Response);
+    await expect(clearMachineEnv(TOKEN, APP, "m")).rejects.toThrow("(404)");
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws when the update fails", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({ ok: true, json: async () => mockMachine } as Response)
+      .mockResolvedValueOnce({ ok: false, status: 500, text: async () => "boom" } as Response);
+    await expect(clearMachineEnv(TOKEN, APP, "m")).rejects.toThrow("(500)");
   });
 });

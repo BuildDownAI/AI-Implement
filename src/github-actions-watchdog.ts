@@ -50,8 +50,8 @@ export interface JobTtlDecision {
 /**
  * A backstop TTL for every in-flight job, independent of run status: `maxJobMinutes` + 15
  * minutes, so it only catches records the normal status-based paths miss (no repo, no
- * mapping, no run ID, unreachable run status). For non-GHA jobs the caller passes the
- * execution mode's own timeout in place of `maxJobMinutes`, which is a GHA-only setting.
+ * mapping, no run ID, unreachable run status). The mapping's `maxJobMinutes` applies to
+ * every execution mode.
  */
 export function jobTtlDecision(input: JobTtlInput): JobTtlDecision {
   const jobTimeoutMinutes = normalizeGithubActionsJobTimeoutMinutes(input.maxJobMinutes);

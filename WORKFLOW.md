@@ -1,5 +1,5 @@
 ---
-model: claude-sonnet-5
+model: claude-sonnet-5-5
 ---
 
 <!--

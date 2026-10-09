@@ -54,6 +54,14 @@ The KG is served by the testing orchestrator's `/mcp` (`https://ai-implement-tes
 Project-specific orchestrator instances can override the bundled graph with `KG_SOURCE_REPO=owner/repo`.
 The value is a GitHub repo identifier, not a URL; see `docs/kg-sidecar.md`.
 
+## Standing rules
+
+Three operator rules apply to every plan, issue, ADR, review, and change. **Full reference: [docs/standing-rules.md](docs/standing-rules.md).**
+
+1. Verify each claim in code, or by an experiment against the pinned version, before you present it. A theory is not a finding.
+2. Prefer the design that needs no new GitHub or GitHub Actions right: runner image or orchestrator first, then a `run_config` field, then a template change, then an App permission last.
+3. As Restate use grows, re-check an ADR's rule and its rejection reasons before you rely on them; amend the ADR when a reason no longer holds.
+
 ## Architecture
 
 ```
@@ -81,6 +89,8 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 |---|---|---|
 | Pipeline, steps, custom overrides | `src/pipeline/` | [docs/pipeline-architecture.md](docs/pipeline-architecture.md) |
 | Review findings → fix dispatches | `src/review-fix-queue.ts` | [docs/review-fix-rail.md](docs/review-fix-rail.md) |
+| Restate review-fix pilot setup, recovery, drain, rollback | `src/restate/review-fix-attempt.ts`, `src/restate/review-fix-pr.ts` | [docs/restate-review-fix-pilot.md](docs/restate-review-fix-pilot.md) |
+| Per-review-cycle evidence (input/output commit, dispositions, tests, verdict, usage) | `src/pipeline/cycle-summary.ts` | [docs/cycle-summary-evidence.md](docs/cycle-summary-evidence.md) |
 | Parent/child grouping and roll-up | `src/feature-branch.ts`, `src/merge-up.ts` | [docs/feature-branch-grouping.md](docs/feature-branch-grouping.md) |
 | Issueless run kinds (kg-refresh lifecycle and pattern) | `src/kg-refresh.ts`, `src/index.ts` | [docs/issueless-runs.md](docs/issueless-runs.md) |
 | Dispatch envelope (`RunConfigV1`) | `src/run-config.ts` | [docs/workflow-envelope.md](docs/workflow-envelope.md) |
@@ -91,9 +101,10 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | KG sidecar, its OAuth flow, and the image build | `src/mcp.ts`, `src/mcp-oauth.ts` | [docs/kg-sidecar.md](docs/kg-sidecar.md) |
 | MCP door, identity contract, tools service, entry points, roles | `src/restate/tools.ts`, `src/mcp.ts`, `src/mcp-oauth.ts`, `src/mcp-identity.ts` | [docs/mcp-server.md](docs/mcp-server.md), [ADR 025](docs/adr/025-mcp-tools-are-restate-handlers-and-the-operator-object-is-the-refresh-authority.md) |
 | Deploying, clients, Bedrock | `src/deploy.ts` and its `deploy-*` siblings | [docs/deployment.md](docs/deployment.md) |
-| Ticketing provider abstraction | `src/providers/` — `linear.ts`, `jira.ts`, `registry.ts` | |
+| Ticketing provider abstraction | `src/providers/` — `linear.ts`, `jira.ts`, `registry.ts` | [docs/ticketing-providers.md](docs/ticketing-providers.md) |
 | Jira base branch (per-issue PR target) | `src/base-branch.ts` | [docs/jira-base-branch.md](docs/jira-base-branch.md) |
-| Execution backends | `src/fly-machines.ts`, `src/local-docker.ts`, `src/github.ts` | |
+| Execution backends | `src/fly-machines.ts`, `src/local-docker.ts`, `src/github.ts` | [docs/fly-machine-lifecycle.md](docs/fly-machine-lifecycle.md) |
+| Durable runner (kept Fly machine per pipeline) | `src/restate/fly-machine-profile.ts` | [docs/fly-machine-lifecycle.md](docs/fly-machine-lifecycle.md), [ADR 037](docs/adr/037-a-durable-runner-is-a-profile-object-that-owns-one-kept-machine.md) |
 | Runner callbacks and tokens | `src/runner-callback.ts`, `src/runner-token.ts`, `src/token-vending.ts` | [docs/runner-callbacks.md](docs/runner-callbacks.md) |
 | Merge reconciliation | `src/reconciliation.ts`, `src/reconcile-merged.ts`, `src/poll-merged-prs.ts` | |
 | Workflow sync to target repos | `src/workflow-sync.ts`, `src/workflow-sync-queue.ts` | [docs/workflow-sync.md](docs/workflow-sync.md) |
@@ -103,7 +114,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Run classification and autopsy | `src/completion-classification.ts`, `src/run-autopsy.ts` | |
 | Admin SSO / OIDC, roles, page grants | `src/oauth/`, `src/admin-session.ts`, `src/access-entries.ts`, `src/access-page-grants.ts` | [docs/access-model.md](docs/access-model.md) |
 | Admin SPA | `src/admin-ui/` | |
-| Restate engine: sidecar, endpoint, workflows, testcontainers job | `src/restate/endpoint.ts`, `src/restate/` | [docs/restate.md](docs/restate.md), [docs/restate-testing.md](docs/restate-testing.md) |
+| Restate engine: sidecar, endpoint, workflows, testcontainers job | `src/restate/endpoint.ts`, `src/restate/planning-run-workflow.ts`, `src/restate/` | [docs/restate.md](docs/restate.md), [docs/restate-testing.md](docs/restate-testing.md) |
 
 **Diagram convention:** flow diagrams in `docs/`, issue bodies, and PR descriptions are mermaid (validated with `mermaid-cli` before commit); tabular data is a table; ASCII only in this file. Full rule: [docs/README.md](docs/README.md).
 
@@ -168,7 +179,7 @@ The operator's `GH_TOKEN` (or `GITHUB_TOKEN`) is injected as `AI_IMPLEMENT_DEP_T
 ```bash
 npm test          # vitest run
 npm run typecheck # tsc --noEmit
-npm run test:restate # src/__tests__/restate/**/*.restate.test.ts — needs Docker, not part of npm test
+npm run test:restate # src/__tests__/restate/**/*.restate.test.ts — two runtimes: container (Docker) or binary (`restate-server` from node_modules, `RESTATE_TEST_RUNTIME=binary`); Docker is optional; not part of npm test
 ```
 
 **`typecheck` excludes `src/__tests__`, and vitest strips types without checking them** — so type errors in a test file are caught by nothing. Type-check a new test file explicitly with a throwaway tsconfig. `src/admin-ui/__tests__/` *is* covered and can break the build.
@@ -225,7 +236,7 @@ Non-obvious behaviour:
 - **Model IDs pass through verbatim**, and nothing validates them against the provider. A Bedrock mapping with an Anthropic-style `model:` fails at Claude invocation time rather than at dispatch. Per-phase model selection lives in `.ai-implement/config.yml`, not front matter.
 - **Prompt assembly** — the runner uses `WORKFLOW.md`'s body with front matter and HTML comments stripped and `${UPPER_SNAKE}` substituted, then appends its own blocks. Any *unrecognised* `${TOKEN}` becomes an empty string, so a shell example containing one is silently blanked. Never put `${PLANNING_CONTEXT}` in the body: it is substituted *and* appended, emitting the block twice.
 - **The pipeline owns repository writes on every autonomous run.** Initial runs create the branch, commit, push, and PR. Gap-fill runs leave the existing PR branch checked out, then the pipeline commits and pushes reviewed changes to it. Templates must tell the agent to leave changes uncommitted in both modes.
-- **Unapproved runs still ship** as a draft PR carrying the reviewer's final feedback and per-pass stats, reported as a coded failure (`REVIEW_UNAPPROVED` / `MAX_TURNS_EXHAUSTED`) so the ticket updates and notifications fire, while the GHA job stays green with a `::warning::`. If the repo plan rejects draft PRs (422), it opens normally prefixed `[NEEDS REVIEW — unapproved]`.
+- **Unapproved runs still ship** as a draft PR carrying the reviewer's final feedback and per-pass stats, reported as a coded failure (`REVIEW_UNAPPROVED` / `MAX_TURNS_EXHAUSTED` / `INSTALL_FAILED`) so the ticket updates and notifications fire, while the GHA job stays green with a `::warning::`. If the repo plan rejects draft PRs (422), it opens normally prefixed `[NEEDS REVIEW — unapproved]`.
 - **Hooks work in every execution mode.** `setup` / `verify` / `teardown` front-matter paths run around the implement loop — setup failure aborts early, teardown always runs. All three modes enter through `session/entrypoint.sh`, which populates the workspace before the runner starts.
 - **Planning writes files, it does not post.** A planning run writes `ai-output/comments/NN-*.md`; the orchestrator posts them to the ticket. Runner-written files are collected in lexicographic order — avoid the `90-` prefix, which the run autopsy uses.
 
@@ -239,7 +250,7 @@ Editable per mapping; blank means the default.
 |---|---|---|
 | Max Turns | `50` | Claude turns per implement pass |
 | Max Iterations | bedrock `2`, anthropic `3` | implement/review cycles |
-| Job Timeout (min) | `90` | GHA only |
+| Job Timeout (min) | `90` | All execution modes; the monitor times a Fly or local-docker run out at this limit |
 | Branch Prefix | none | Path segment prepended to the implementation branch |
 | Sensitive Add / Allow Globs | none | Extends or un-blocks the push step's blocklist; **allow always wins** |
 | Dependency Token Scope | off | `installation` lets the run read private sibling repos during dependency install |
@@ -264,7 +275,7 @@ Optional, in the target repo. Parsed with a real YAML parser; a missing file, ma
 
 | Key | Effect |
 |---|---|
-| `packageManager` | Overrides the install step's lockfile detection |
+| `packageManager` | Overrides the install step's lockfile detection; `none` turns off the built-in install entirely (do the real install from a `setup:` hook instead) |
 | `models.implement` / `models.review` | Per-phase models |
 | `reviewProviders` | External review sources; `github-claude-code-review` is the only recognised value |
 | `reviewCheckNames` | Check-run names that identify the external review gate. Defaults to `review`, `code-review-plugin`, `claude-review`, `claude code review`, `claude-code-review`, plus any name containing both `claude` and `review`. A target repo with an unrelated CI job named `review` should set this to avoid that job becoming the review gate |
@@ -280,7 +291,7 @@ The two `.ai-implement/` files read from different refs: `image.yml` from the **
 
 A file at `custom/<path>` overrides the corresponding built-in. Resolution searches the workspace root, then `AI_IMPLEMENT_CUSTOM_ROOT`, then the package root — see [docs/pipeline-architecture.md](docs/pipeline-architecture.md) for the mechanics and the step contract.
 
-Built-in step keys, in pipeline order: `clone`, `reference-repos`, `install-skills`, `dependency-auth`, `install`, `setup`, `feedback-loop`, `preflight`, `push`, `verify`, `post-push-review`.
+Built-in step keys, in pipeline order: `clone`, `reference-repos`, `install-skills`, `dependency-auth`, `install`, `setup`, `feedback-loop`, `install-retry`, `preflight`, `push`, `verify`, `post-push-review`.
 
 - `custom/` belongs to an AI-Implement **fork**, not a target repo; sync never creates it there.
 - **Place client-specific behaviour in `custom/`** rather than editing built-in modules — that is what keeps a fork rebasing cleanly.
@@ -328,7 +339,7 @@ Five routes (`channels`, `policies`, `secrets`, `webhooks`, `updates`) are still
 
 ## Backend outage playbook
 
-The global **runner mode** is the failover lever: `/admin#runners` or `POST /api/runner-mode` with `fly` forces Fly Machines, `gha` forces GitHub Actions, `default` restores per-project modes. In-flight runs keep their monitors; only new dispatches reroute.
+The global **runner mode** is the failover lever: `/admin#runners` or `POST /api/runner-mode` with `fly` forces Fly Machines, `gha` forces GitHub Actions, `default` restores per-project modes. In-flight runs keep their monitors; only new dispatches reroute. Runner mode `gha` also sends the next KG refresh to the KG repo's Actions and leaves the kept machine untouched.
 
 Ineligible mappings are **skipped at dispatch** — `provider=bedrock` is GHA-only, and Fly needs a sessions app — staying queued with dedup untouched and appearing in the Runners banner and `GET /api/runner-mode`. Flip back to `default` afterward; skipped issues dispatch on the next poll.
 

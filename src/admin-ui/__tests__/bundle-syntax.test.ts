@@ -9,6 +9,7 @@ import { settingsScript } from "../pages/settings.js";
 import { projectsScript } from "../pages/projects.js";
 import { pipelinesScript } from "../pages/pipelines.js";
 import { reaperScript } from "../pages/reaper.js";
+import { journalScript } from "../pages/journal.js";
 import { sessionsScript } from "../pages/sessions.js";
 import { auditScript } from "../pages/audit.js";
 import { issuesScript } from "../pages/issues.js";
@@ -19,6 +20,7 @@ import { pipelinesAndStepsScript } from "../pages/pipelines-and-steps.js";
 import { modelsAndProvidersScript } from "../pages/models-and-providers.js";
 import { runnersScript } from "../pages/runners.js";
 import { reportsScript } from "../pages/reports.js";
+import { kgPipelinesScript } from "../pages/kg-pipelines.js";
 import { deploymentsScript } from "../pages/deployments.js";
 import { accessScript } from "../pages/access.js";
 import { drawerScript } from "../drawer.js";
@@ -71,6 +73,7 @@ describe("per-module script parse", () => {
     ["projects", projectsScript],
     ["pipelines", pipelinesScript],
     ["reaper", reaperScript],
+    ["journal", journalScript],
     ["sessions", sessionsScript],
     ["audit", auditScript],
     ["issues", issuesScript],
@@ -81,6 +84,7 @@ describe("per-module script parse", () => {
     ["models-and-providers", modelsAndProvidersScript],
     ["runners", runnersScript],
     ["reports", reportsScript],
+    ["kg-pipelines", kgPipelinesScript],
     ["deployments", deploymentsScript],
     ["access", accessScript],
     ["drawer", drawerScript],

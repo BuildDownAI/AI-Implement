@@ -68,6 +68,41 @@ async function callHandler(
 }
 
 describe("handlePublicationTokenRequest", () => {
+  it("binds pilot issuance and subsequent push checks to the live attempt and exact run", async () => {
+    const attemptId = "pilot-attempt-1";
+    const db = dedup.getDb();
+    db.prepare(`INSERT INTO dispatch_admissions
+      (dispatch_id, mapping_key, issue_scope, issue_id, installation_id, repository,
+       pr_number, lifecycle_owner, phase, backend, created_at)
+      VALUES (?, 'AII', 'pr', 'acme/app#42', '7', 'acme/app', 42, ?,
+              'implementation', 'github-actions', ?)`)
+      .run(attemptId, `restate:${attemptId}`, Date.now());
+    db.prepare(`INSERT INTO review_fix_attempts
+      (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
+       issue_scope, issue_id, owner, state, created_at, deadline_at,
+       github_run_id, github_run_attempt, task_snapshot_json, finding_versions_json)
+      VALUES (?, ?, 'AII', '7', 'acme/app', 42, 'pr', 'acme/app#42', ?,
+              'launch_intent', ?, ?, 123, 2, '{}', '[]')`)
+      .run(attemptId, attemptId, attemptId, Date.now(), Date.now() + 60_000);
+    const publication = runnerTokens.mintPreparedReviewFixToken({ attemptId, audience: "publication", secret: SECRET });
+    const result = runnerTokens.mintPreparedReviewFixToken({ attemptId, audience: "result", secret: SECRET });
+    const request = {
+      secret: SECRET, githubAppId: "app-id", githubAppPrivateKey: "fake-key",
+      repository: "acme/app", githubRunId: 123, githubRunAttempt: 2,
+    };
+    mockGetScopedToken.mockRejectedValueOnce(new Error("GitHub unavailable"))
+      .mockResolvedValue({ token: "ghs_fresh", expiresAt: "2030-01-01T00:00:00Z" });
+    expect((await publicationToken.handlePublicationTokenRequest({ ...request,
+      authorization: `Bearer ${publication.token}`, githubRunAttempt: 3 })).status).toBe(403);
+    expect((await publicationToken.handlePublicationTokenRequest({ ...request,
+      authorization: `Bearer ${publication.token}` })).status).toBe(500);
+    expect((await publicationToken.handlePublicationTokenRequest({ ...request,
+      authorization: `Bearer ${publication.token}` })).status).toBe(200);
+    expect(publicationToken.handlePublicationAuthorityCheck({ ...request, authorization: `Bearer ${result.token}` }).status).toBe(200);
+    db.prepare("UPDATE review_fix_attempts SET authority_revoked_at = ? WHERE attempt_id = ?").run(Date.now(), attemptId);
+    expect(publicationToken.handlePublicationAuthorityCheck({ ...request, authorization: `Bearer ${result.token}` }).status).toBe(403);
+    expect(mockGetScopedToken).toHaveBeenCalledTimes(2);
+  });
   it("mints a fresh write token bound to the repository recorded at dispatch", async () => {
     const token = mintPublicationToken("implementation", "original-owner/original-repo");
     mockGetScopedToken.mockResolvedValueOnce({
@@ -93,6 +128,26 @@ describe("handlePublicationTokenRequest", () => {
     );
   });
 
+  it("logs one line per mint without the token value (AII-922)", async () => {
+    const token = mintPublicationToken("implementation", "acme/app");
+    mockGetScopedToken.mockResolvedValueOnce({
+      token: "ghs_secret_value",
+      expiresAt: "2030-01-01T00:00:00Z",
+      installationId: 4242,
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await callHandler(token);
+
+    const lines = log.mock.calls.map((c) => c.join(" ")).filter((l) => l.includes("[publication-token] minted"));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("repo=acme/app");
+    expect(lines[0]).toContain("installation=4242");
+    expect(lines[0]).toContain("expires_at=2030-01-01T00:00:00Z");
+    expect(lines[0]).toMatch(/dispatch=\S+/);
+    expect(lines[0]).not.toContain("ghs_secret_value");
+  });
+
   it("is single-use", async () => {
     const token = mintPublicationToken();
     mockGetScopedToken.mockResolvedValue({
@@ -105,12 +160,29 @@ describe("handlePublicationTokenRequest", () => {
     expect(mockGetScopedToken).toHaveBeenCalledTimes(1);
   });
 
-  it("consumes the credential before a failed GitHub mint", async () => {
+  it("releases the credential after a failed GitHub mint", async () => {
     const token = mintPublicationToken();
     mockGetScopedToken.mockRejectedValueOnce(new Error("GitHub unavailable"));
+    mockGetScopedToken.mockResolvedValueOnce({ token: "ghs_retry", expiresAt: "2030-01-01T00:00:00Z" });
 
     expect((await callHandler(token)).status).toBe(500);
+    expect((await callHandler(token)).status).toBe(200);
     expect((await callHandler(token)).status).toBe(403);
+    expect(mockGetScopedToken).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects a concurrent exchange while a mint is in flight and keeps a successful claim consumed", async () => {
+    const token = mintPublicationToken();
+    let finishMint: ((value: { token: string; expiresAt: string }) => void) | undefined;
+    mockGetScopedToken.mockImplementationOnce(() => new Promise((resolve) => { finishMint = resolve; }));
+
+    const first = callHandler(token);
+    expect(mockGetScopedToken).toHaveBeenCalledTimes(1);
+    expect((await callHandler(token)).status).toBe(403);
+    finishMint?.({ token: "ghs_first", expiresAt: "2030-01-01T00:00:00Z" });
+    expect((await first).status).toBe(200);
+    expect((await callHandler(token)).status).toBe(403);
+    expect(mockGetScopedToken).toHaveBeenCalledTimes(1);
   });
 
   it("rejects missing, wrong-audience, and planning credentials identically", async () => {

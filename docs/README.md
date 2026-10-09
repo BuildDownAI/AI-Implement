@@ -10,8 +10,10 @@ Two tiers, distinguished by what a file *is* rather than what it covers.
 
 | Document | Covers |
 |----------|--------|
+| [standing-rules.md](standing-rules.md) | The operator's rules for all design and analysis work: verify every claim in code before presenting it, do not expand the rights a deployment needs, re-evaluate ADR rules as Restate use grows |
 | [pipeline-architecture.md](pipeline-architecture.md) | The step contract, the built-in steps, how `applyWiring` supplies inputs, and how a fork overrides steps or the pipeline |
 | [review-fix-rail.md](review-fix-rail.md) | The finding ledger, the four `review_*` tables, the webhook events that feed the fix queue, and the drain loop |
+| [restate-review-fix-pilot.md](restate-review-fix-pilot.md) | Pilot setup, attempt recovery, drain and rollback procedures, automated evidence and remaining SAN checks |
 | [feature-branch-grouping.md](feature-branch-grouping.md) | Parent/child issue grouping, cascade branch creation, and automatic roll-up |
 | [workflow-envelope.md](workflow-envelope.md) | The `RunConfigV1` dispatch envelope and the legacy per-field contract |
 | [runner-images.md](runner-images.md) | The image resolution ladder, publishing channels, and why a private image constrains the execution mode |
@@ -19,15 +21,19 @@ Two tiers, distinguished by what a file *is* rather than what it covers.
 | [mcp-server.md](mcp-server.md) | The `/mcp` door, the identity contract (kind, role, the caller object, the refresh path), which client holds which token, what ends a session, the tools service and discovery, the three entry points, every tool with its role, run identities, failure behaviour |
 | [deployment.md](deployment.md) | Deploy paths, client instances, and the AWS Bedrock setup |
 | [access-model.md](access-model.md) | Who may sign in and what they may see: the allowlist and its env-to-database handover, the Admin/User split and per-page grants, provider binding, the per-request re-check, the audit trail, and host recovery from lockout |
-| [issueless-runs.md](issueless-runs.md) | The pattern for run kinds dispatched without a tracker issue: envelope shape, jobs-store tracking row, credential flow, state machine lifecycle, reaper reconciliation, operator cancel, observability, and a checklist for adding a new issueless run kind |
+| [issueless-runs.md](issueless-runs.md) | The pattern for run kinds dispatched without a tracker issue: envelope shape, jobs-store tracking row, credential flow, the workflow lifecycle (reserve, deadlines, report), operator cancel, observability, and a checklist for adding a new issueless run kind |
 | [runner-context.md](runner-context.md) | Per-project settings that provision something into a run: the shared mapping-to-effect shape, which run phases apply each one, and what enabling each costs |
 | [runner-callbacks.md](runner-callbacks.md) | The run tokens and callback endpoints: who mints, carries, reads, verifies, and consumes each credential; the process boundary inside the runner; the blast radius of one stray use |
 | [private-npm-registry.md](private-npm-registry.md) | Private npm registry auth for the built-in `install` step: the three values, why the token rides the forwarded-secrets rail as `NPM_TOKEN`, the per-run `NPM_CONFIG_USERCONFIG` file, and where the token does and does not exist during a run |
 | [restate-adoption.md](restate-adoption.md) | An assessment of what adopting Restate buys AI-Implement and what it costs: the code it deletes, the concurrency it fixes, and each downside with its path forward (the transition gate, the enforced pitfalls, determinism, the single machine, the dependency and the one-datastore path, licensing) |
 | [restate.md](restate.md) | The Restate engine: the sidecar process and its ports, the SDK endpoint the orchestrator hosts, the testcontainers job and the default-suite exclusion, the `Operator` refresh object and the tools service, a plain-terms primer on `ctx.run` and the two retry levels, the patterns and pitfalls of working with Restate, and how a run kind's workflow is written |
 | [restate-testing.md](restate-testing.md) | The two Restate test tiers walked through one file: the harness components, the variants, the fixture services, the process-side fakes, the unit-tier fakes, the rule for choosing a Restate test over a unit test, and the coverage gaps as of the AII-687 tree |
+| [restate-feature-map.md](restate-feature-map.md) | The Restate feature inventory: which of kg-refresh, the review-fix pilot and the tools service use each feature, what kg-refresh uses that the pilot does not, the features nothing uses yet, the hand-rolled mechanisms that remain, and the review findings with their status |
 | [review-findings-contract.md](review-findings-contract.md) | The `review-findings/v1` fenced-JSON-block contract a reviewer posts: schema, a full example, emitter obligations, and how a non-Claude reviewer emits one |
 | [workflow-sync.md](workflow-sync.md) | Workflow sync: what a sync writes, removes, and seeds; the sync branch and PR; triggers and recovery; failures |
+| [fly-machine-lifecycle.md](fly-machine-lifecycle.md) | How a pipeline's Fly machine is created, reused, stopped, and destroyed: the one-shot session path, the kept `kg-refresh` machine owned by the `FlyMachineProfile` object, and the scrub and idle-expiry rules |
+| [dispatch-dedup.md](dispatch-dedup.md) | The `dispatched` table: schema, who writes, reads and clears a row, and the per-tracker reconcile loop with its case table |
+| [ticketing-providers.md](ticketing-providers.md) | The `TicketingProvider` interface, the built-in and custom providers, per-mapping provider choice, how each provider finds work, mapping-key rules, and the limits of a mixed Linear/Jira deployment |
 | [bug-fix-tests.md](bug-fix-tests.md) | The bug-fix pattern: reproduce with a failing test before the fix, ship both in one pull request, which tier of test to write, and two worked examples |
 
 Two references live outside this directory because they are consumed directly rather than read: `.env.example` is the canonical list of orchestrator environment variables, and `CLAUDE.md` is the index that points at everything here.

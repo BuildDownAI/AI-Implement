@@ -108,4 +108,39 @@ describe("TokenStepReporter", () => {
       githubRunId: 32595525188,
     });
   });
+
+  it("posts no githubToken or machineNonce in inputs or outputs", async () => {
+    const calls: Array<{ init: RequestInit }> = [];
+    const reporter = new TokenStepReporter("https://orchestrator.example", "progress-token", {
+      fetchImpl: async (_url, init) => {
+        calls.push({ init: init! });
+        return response(200);
+      },
+      retryDelaysMs: [],
+    });
+
+    await reporter.report({
+      ...STEP,
+      inputs: { githubToken: "ghs_secret", machineNonce: "nonce-secret", repoOwner: "org" },
+      outputs: { githubToken: "ghs_secret", workspaceDir: "/w" },
+    });
+
+    const body = String(calls[0].init.body);
+    expect(body).not.toContain("ghs_secret");
+    expect(body).not.toContain("nonce-secret");
+    expect(JSON.parse(body).step.inputs).toEqual({ repoOwner: "org" });
+    expect(JSON.parse(body).step.outputs).toEqual({ workspaceDir: "/w" });
+  });
+
+  it("never throws when every attempt fails", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const fetchImpl = vi.fn().mockRejectedValue(new Error("network down"));
+    const reporter = new TokenStepReporter("https://orchestrator.example", "progress-token", {
+      fetchImpl,
+      retryDelaysMs: [0],
+    });
+
+    await expect(reporter.report(STEP)).resolves.toBeUndefined();
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
 });

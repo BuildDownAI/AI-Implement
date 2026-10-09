@@ -1,6 +1,6 @@
 # Deploying the orchestrator
 
-How an orchestrator instance gets deployed, how a new client instance is stood up, and how to point a target repo at AWS Bedrock.
+How an orchestrator instance is deployed, how a new client instance is stood up, and how to point a target repo at AWS Bedrock.
 
 Reference for `src/deploy.ts`, `scripts/provision-client.sh`, `clients/`, `.github/workflows/deploy-clients.yml`, and the Bedrock path in the synced workflows. `CLAUDE.md` carries the summary and points here.
 
@@ -96,6 +96,8 @@ The app it deploys is never configured: Fly injects `FLY_APP_NAME` into every ma
 
 - **One attempt per commit**, remembered across restarts. A commit is deployed at most once whether the attempt succeeds or fails, so a failed automatic deploy waits for the next push or a manual trigger rather than being retried. Without that rule a persistently failing build would re-take the hold every poll cycle and dispatch would never resume.
 - **The hold is taken by the poll that notices the commit**, before the build starts, so nothing is dispatched into a version that is about to be replaced.
+- **A drain that waits on a reservation.** Each held `dispatch_admissions` row counts as in-flight work (`getInFlightWork`), even when its run has ended, so a reservation that was never released keeps the deploy in "Draining". `/admin#deployments` lists every held reservation under the status tile (also the `list_dispatch_reservations` tool). Click **Release** on the stuck row: it releases when the backend run is confirmed ended (a terminal job row alone is refused, because the planning callback closes the row while the run may still execute), and otherwise shows why it refused and offers a forced release behind a confirm. Force only when the run is dead — a Restate-owned or job-less row is never confirmed and needs it. `release_dispatch_reservation` is the same action for MCP/`POST /api/tools/release_dispatch_reservation`. Do not edit `/data/dedup.sqlite` over `fly ssh`.
+- **What callers see during a hold.** Every MCP `tools/call` and `POST /api/tools/<name>` answers `409 { "error": "deploy-in-progress", "deployStartedAt": <ms> }` without contacting Restate (admission stays closed so the drain can finish), where a real outage still answers `503 restate-unavailable`. The kg-refresh endpoints answer the same 409. The unauthenticated `GET /` health body carries `deploy: { held, startedAt }` (`false` / `null` when no hold is set), so a deploy is distinguishable from an outage.
 
 Switching it on does not reach back for a commit that has already been announced; that one needs the manual trigger. The trigger itself applies no availability check, so it will rebuild and re-release a commit that is already running — which is how a degraded release gets repaired.
 
@@ -196,6 +198,8 @@ fly secrets set GITHUB_APP_ID=... GITHUB_APP_PRIVATE_KEY=... --app <app_name>
 ```
 
 The Fly volume `dedup_data` mounts at `/data` and holds the SQLite database. Only the GitHub App pair is required for the orchestrator to boot; ticketing credentials are needed for it to poll anything. See `.env.example` for the full set.
+
+At boot the orchestrator sets the snapshot retention of every volume in its own Fly app to the `volume_snapshot_retention_days` setting (default 14 days; Fly's own default is 5, its range 1–60), using `FLY_DEPLOY_TOKEN` and the injected `FLY_APP_NAME` through the Machines API (`src/fly-volumes.ts`). Only volumes whose retention differs are updated, and every volume in the app is covered, not just `dedup_data`. The volume also holds the Restate store under `/data/restate`, so a longer window keeps Restate history recoverable. A Fly error or a missing token or app name is logged as `[fly-volumes] snapshot retention not applied: <reason>` and never blocks boot; local runs have neither and always log it. The value is changed on `/admin#deployments` (Retention card, `GET`/`POST /api/retention`): a new volume value is applied to the Fly volumes at once, while a new `restate_retention_days` value applies at the next deploy or restart.
 
 ### The matrix workflow does not currently deploy clients
 
@@ -299,7 +303,7 @@ To repair a degraded image, re-deploy with `--no-cache` and a working `--build-s
 `kgDegraded` only says whether embeddings are present. A sidecar can also be up and still reject every call — on 2026-09-13 it answered `400 Missing session ID` to each proxied request while every health read stayed green (AII-648, KGB-28). The orchestrator now probes the sidecar after it reports ready (`tools/list` must list the six `kg_*` tools, then one `kg_neighbors` on the spine) and surfaces the result beside `kgDegraded` on every health read (AII-650):
 
 - **`GET /`**, **`GET /api/kg/status`** / `get_kg_status`, and `get_tenant_health` carry `kgUnavailable: boolean` and `sidecar: { reachable, toolsListed, lastError, checkedAt }`. `reachable` means a well-formed HTTP answer came back; `toolsListed` means the six tools were present; `checkedAt` is `null` until the first probe has run.
-- The **Deployments page** KG card shows _⚠️ KG sidecar not serving — <lastError>_ when `kgUnavailable` is true, and a one-line "KG sidecar: reachable" once a probe has succeeded.
+- The **Knowledge Graph Pipelines page** KG card shows _⚠️ KG sidecar not serving — <lastError>_ when `kgUnavailable` is true, and a one-line "KG sidecar: reachable" once a probe has succeeded. The Deployments page keeps the deploy record.
 - The **`deployed` / `restarted` deploy notification** adds _⚠️ KG sidecar not serving — <lastError>_ next to the embeddings warning, and the deploy record reads `deployed-not-serving` instead of `deployed-ok` when the boot probe fails.
 
 A failed probe re-runs in the background (throttled) on the next proxied failure, so the fields recover on their own once the sidecar does. The boot probe has one overall deadline (30 s); a timeout is recorded as a failed probe.
@@ -309,6 +313,8 @@ A failed probe re-runs in the background (throttled) on the next proxied failure
 `restate-server` runs as a second child-process sidecar of the orchestrator, spawned and stopped alongside the KG sidecar with the same non-fatal contract (ADR 023; full reference: [docs/restate.md](restate.md) § "Deployment and operations"). It adds no deployment surface of its own — no separate Fly app, no new health endpoint, no `fly.toml` change — because every listener it and its SDK endpoint expose binds to `127.0.0.1` only, and the orchestrator process is the only thing on the machine that talks to any of them.
 
 `RESTATE_DATA_DIR` is the one operator-facing knob (`.env.example`): unset, the embedded store lives under the dedup DB's directory (`/data/restate` on Fly), so a Fly volume that already covers `DEDUP_DB_PATH` covers it without a config change. On macOS, a long checkout path can push the sidecar's unix-socket paths past the platform's 104-byte limit and make `restate-server` exit at boot with `RT0004 … path must be shorter than 104 bytes` — set `RESTATE_DATA_DIR` to a short path (e.g. `/tmp/restate-dev`) in that case (full detail: [docs/restate.md](restate.md) § "Deployment and operations").
+
+**Required checks (operator step).** Mark `unit-tests`, `restate-tests`, `restate-tests-binary (1)`, `restate-tests-binary (2)`, and `restate-tests-binary (3)` as required checks on `testing` (Settings → Branches). The branch has no required status checks by default, so until this is done a red job does not block a merge.
 
 ### Local image boot check
 

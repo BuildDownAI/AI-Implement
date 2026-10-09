@@ -7,14 +7,17 @@
 import { readFileSync } from "node:fs";
 import * as restate from "@restatedev/restate-sdk";
 import { z } from "zod";
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   tool,
   listProjects,
   getProjectBinding,
   kgPath,
   kgHybridSearch,
+  kgStageForRunnerStep,
   getKgStatusTool,
+  setFlyMachineProfileTool,
+  getTenantHealth,
   getIssueReportCardTool,
   getFleetReportTool,
   triggerKgRefreshTool,
@@ -24,16 +27,28 @@ import {
   addProjectArgsSchema,
   triggerWorkflowSyncTool,
   clearDispatchDedupTool,
+  listDispatchReservationsTool,
+  releaseDispatchReservationTool,
+  setAdmissionTerminationCheck,
   setProviderRegistry,
+  setKgRefreshToolDeps,
+  getReviewFixAttemptTool,
+  getReviewFixActivityTool,
+  setReviewFixAttemptsFacade,
 } from "../restate/tools.js";
+import { KG_REFRESH_RUNNER_STEPS } from "../restate/kg-refresh-types.js";
 import { discoverTools, callTool, callToolAsSystem, toolCatalog } from "../restate/tools-client.js";
 import type { Caller } from "../mcp-identity.js";
 import { setKgMemoryProvider } from "../kg-provider.js";
 import type { MemoryProvider } from "../kg-provider.js";
-import { setActiveKgRefresh, type KgRefreshHandle } from "../kg-refresh.js";
+import type { PreflightCheckResult, RefreshOutcome } from "../kg-refresh.js";
+import type { KgRefreshToolDeps } from "../restate/kg-refresh-production.js";
 import { getMappings } from "../config.js";
 import { setOrchestratorSetting } from "../orchestrator-settings.js";
 import { initSettingsTable } from "../runner-mode.js";
+import { FLY_MACHINE_PROFILE_DEFAULTS, mergeProfile, type FlyMachineProfileConfig } from "../restate/fly-machine-profile.js";
+import { initLogTable } from "../log.js";
+import { getRestateStatus, setRestateStatus, resetRestateStatus } from "../restate/status.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import {
   setRunnerModeAction,
@@ -46,6 +61,11 @@ import {
 vi.mock("../report-card.js", () => ({
   getIssueReportCard: vi.fn(),
   getFleetReport: vi.fn(),
+}));
+
+vi.mock("../fly-machines.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../fly-machines.js")>()),
+  getMachine: vi.fn(),
 }));
 
 vi.mock("../config.js", async (importOriginal) => ({
@@ -87,6 +107,59 @@ function fakeContext(handlerName: string, runCalls: RunCall[] = []): restate.Con
       return result;
     },
   } as unknown as restate.Context;
+}
+
+/**
+ * A fetchImpl that never settles unless its request's AbortSignal fires — the only way a
+ * fixture can prove a fetch is actually bounded by `signal` rather than merely accepting an
+ * ignored option (AII-728). Rejects with the signal's abort reason once the signal fires.
+ */
+function hangingFetch(): typeof fetch {
+  return vi.fn((_url: unknown, init?: RequestInit) => {
+    return new Promise((_resolve, reject) => {
+      const signal = init?.signal;
+      if (!signal) return; // no signal given: hangs forever, same as before AII-728
+      if (signal.aborted) {
+        reject(signal.reason);
+        return;
+      }
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  }) as unknown as typeof fetch;
+}
+
+/**
+ * vitest's fake timers do not intercept Node's AbortSignal.timeout — verified empirically,
+ * it schedules through an internal timer rather than the patchable global setTimeout — so
+ * these tests bound the wait by stubbing AbortSignal.timeout's own implementation instead of
+ * the clock. Asserts the exact ms value production code passes (proving the configured bound,
+ * not just "some" bound), then fires the abort on the next microtask so the test does not
+ * block on real wall-clock time.
+ */
+function stubAbortTimeout(expectedMs: number): ReturnType<typeof vi.spyOn> {
+  return vi.spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+    expect(ms).toBe(expectedMs);
+    const controller = new AbortController();
+    queueMicrotask(() => controller.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError")));
+    return controller.signal;
+  });
+}
+
+const PREFLIGHT_OK: PreflightCheckResult = { ok: true, checkedAt: 1, results: [] } as PreflightCheckResult;
+
+function kgToolDeps(overrides: Partial<KgRefreshToolDeps> = {}): KgRefreshToolDeps {
+  return {
+    kgSourceRepo: "org/kg",
+    isDeployHeld: () => false,
+    callbackConfigured: () => true,
+    mappingExists: () => true,
+    freeBytes: () => Number.MAX_SAFE_INTEGER,
+    runPreflight: async () => PREFLIGHT_OK,
+    persistPreflightFailure: () => {},
+    readStatusRecord: () => null,
+    readServedStamp: async () => null,
+    ...overrides,
+  };
 }
 
 const SYSTEM_ADMIN: Caller = { kind: "system", email: null, role: "admin" };
@@ -227,6 +300,119 @@ describe("tool()", () => {
 
       expect(logSpy).not.toHaveBeenCalled();
     });
+
+    it("does not log write audit lines for an explicit admin read", async () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const handlerBody = vi.fn(async () => ({ content: [{ type: "text", text: "done" }] }));
+      const myAdminRead = tool({ description: "d", input: z.object({}), role: "admin", operation: "read" }, handlerBody);
+
+      await myAdminRead(fakeContext("my_admin_read"), { caller: SYSTEM_ADMIN, args: {} });
+
+      expect(handlerBody).toHaveBeenCalledOnce();
+      expect(logSpy).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe("review-fix read tools", () => {
+  afterEach(() => {
+    setReviewFixAttemptsFacade(null);
+    vi.restoreAllMocks();
+  });
+
+  it("forwards get_review_fix_attempt to the injected facade and preserves status/detail fields", async () => {
+    const getAttempt = vi.fn(async () => ({
+      status: "ok" as const,
+      attempt: {
+        attemptId: "attempt-1",
+        owner: { kind: "restate", attemptId: "attempt-1" },
+        execution: { githubRunId: "123", githubRunAttempt: 1 },
+        deadlineAt: 123456,
+        pendingFeedback: false,
+        snapshot: { taskText: "fix it", findings: [{ findingKey: "F1", version: 2 }] },
+        state: "succeeded",
+        evidenceComplete: true,
+        terminationConfirmed: true,
+        cycles: [],
+      },
+    }));
+    setReviewFixAttemptsFacade({ getAttempt, getActivity: vi.fn() });
+
+    const result = await getReviewFixAttemptTool(fakeContext("get_review_fix_attempt"), {
+      caller: SYSTEM_ADMIN,
+      args: { attemptId: "attempt-1" },
+    });
+
+    expect(JSON.parse(result.content[0].text)).toEqual({
+      status: "ok",
+      attempt: expect.objectContaining({
+        attemptId: "attempt-1",
+        evidenceComplete: true,
+        terminationConfirmed: true,
+      }),
+    });
+    expect(getAttempt).toHaveBeenCalledWith("attempt-1", { role: "admin", email: null });
+  });
+
+  it("forwards get_review_fix_activity pagination and preserves cursor/truncated status", async () => {
+    const getActivity = vi.fn(async () => ({
+      status: "ok" as const,
+      page: {
+        events: [
+          {
+            producerId: "runner",
+            sequence: 7,
+            cycle: 1,
+            kind: "tool",
+            occurredAt: 1700000000000,
+            payload: "{}",
+            truncated: false,
+            byteCount: 2,
+          },
+        ],
+        nextCursor: { producerId: "runner", sequence: 7 },
+        truncated: true,
+      },
+    }));
+    setReviewFixAttemptsFacade({ getAttempt: vi.fn(), getActivity });
+
+    const result = await getReviewFixActivityTool(fakeContext("get_review_fix_activity"), {
+      caller: { kind: "human", email: "admin@example.com", role: "admin" },
+      args: { attemptId: "attempt-1", pageSize: 2, cursor: { producerId: "runner", sequence: 6 } },
+    });
+
+    expect(JSON.parse(result.content[0].text)).toEqual({
+      status: "ok",
+      page: {
+        events: [expect.objectContaining({ producerId: "runner", sequence: 7 })],
+        nextCursor: { producerId: "runner", sequence: 7 },
+        truncated: true,
+      },
+    });
+    expect(getActivity).toHaveBeenCalledWith(
+      "attempt-1",
+      { pageSize: 2, cursor: { producerId: "runner", sequence: 6 } },
+      { role: "admin", email: "admin@example.com" },
+    );
+  });
+
+  it("uses activity pageSize 100 by default and preserves unavailable/not_found envelopes", async () => {
+    const getActivity = vi.fn(async () => ({ status: "unavailable" as const }));
+    const getAttempt = vi.fn(async () => ({ status: "not_found" as const }));
+    setReviewFixAttemptsFacade({ getAttempt, getActivity });
+
+    const attempt = await getReviewFixAttemptTool(fakeContext("get_review_fix_attempt"), {
+      caller: SYSTEM_ADMIN,
+      args: { attemptId: "attempt-1" },
+    });
+    const activity = await getReviewFixActivityTool(fakeContext("get_review_fix_activity"), {
+      caller: SYSTEM_ADMIN,
+      args: { attemptId: "attempt-1" },
+    });
+
+    expect(JSON.parse(attempt.content[0].text)).toEqual({ status: "not_found" });
+    expect(JSON.parse(activity.content[0].text)).toEqual({ status: "unavailable" });
+    expect(getActivity).toHaveBeenCalledWith("attempt-1", { pageSize: 100, cursor: undefined }, { role: "admin", email: null });
   });
 });
 
@@ -297,9 +483,28 @@ describe("discoverTools", () => {
     })) as unknown as typeof fetch;
     expect(await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl })).toEqual([]);
   });
+
+  it("bounds admin discovery at 5s — a never-resolving fetch degrades to [] once the bound fires (AII-728)", async () => {
+    const timeoutSpy = stubAbortTimeout(5_000);
+    try {
+      const result = await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl: hangingFetch() });
+      expect(result).toEqual([]);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
 });
 
 describe("callTool", () => {
+  it("returns deploy-held without an ingress request when drain admission closes", async () => {
+    const fetchImpl = vi.fn() as unknown as typeof fetch;
+    const result = await callTool("get_widget", {}, HUMAN_USER, {
+      ingressBaseUrl: "http://ingress.example", fetchImpl,
+      permitsExternalCall: () => false,
+    });
+    expect(result).toEqual({ status: "deploy-held" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
   it("maps a 200 ToolResponse body to status: \"ok\"", async () => {
     const fetchImpl = vi.fn(async () => ({
       ok: true,
@@ -375,9 +580,30 @@ describe("callTool", () => {
 
     expect(capturedUrl).toBe("http://ingress.example/orchestratorTools/..%2FOperator%2Fx%2Frevoke");
   });
+
+  it("bounds tool ingress at 60s — a never-resolving fetch degrades to unavailable once the bound fires (AII-728)", async () => {
+    const timeoutSpy = stubAbortTimeout(60_000);
+    try {
+      const result = await callTool("get_widget", {}, HUMAN_USER, {
+        ingressBaseUrl: "http://ingress.example",
+        fetchImpl: hangingFetch(),
+      });
+      expect(result).toEqual({ status: "unavailable" });
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
 });
 
 describe("callToolAsSystem", () => {
+  it("uses the same drain admission barrier", async () => {
+    const fetchImpl = vi.fn() as unknown as typeof fetch;
+    expect(await callToolAsSystem("get_tenant_health", {}, {
+      ingressBaseUrl: "http://ingress.example", fetchImpl,
+      permitsExternalCall: () => false,
+    })).toEqual({ status: "deploy-held" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
   it("posts with a systemCaller() caller and returns the same result shape as callTool", async () => {
     let capturedBody: unknown;
     const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
@@ -514,10 +740,204 @@ describe("migrated read handlers (AII-711)", () => {
     setKgMemoryProvider(null);
   });
 
-  it("get_kg_status without an active kg-refresh handle answers the unconfigured error object", async () => {
-    setActiveKgRefresh(null);
+  it("get_kg_status without kg-refresh tool deps answers the unconfigured error object", async () => {
+    setKgRefreshToolDeps(null);
     const result = await getKgStatusTool(fakeContext("get_kg_status"), { caller: system, args: {} });
     expect(JSON.parse(result.content[0].text)).toEqual({ error: "KG refresh is not configured" });
+  });
+
+  describe("get_kg_status stage table (AII-683)", () => {
+    const ok: RefreshOutcome = { ok: true, at: 1, detail: "d", stampBefore: "a", stampAfter: "b" };
+    const failed = (gate: string): RefreshOutcome =>
+      ({ ok: false, at: 1, gate, detail: "d", stampBefore: "a", stampAfter: null }) as RefreshOutcome;
+
+    async function stageFor(opts: {
+      last?: RefreshOutcome | null; inFlight?: { triggerId: string; startedAt: number } | null; step?: string | null; statusThrows?: boolean;
+      runnerStep?: { id: string; status: string } | null;
+      dryRun?: RefreshOutcome | null; readServedStamp?: () => Promise<string | null>;
+    }) {
+      setKgRefreshToolDeps(kgToolDeps({
+        readStatusRecord: () => opts.last ?? null,
+        ...(opts.readServedStamp ? { readServedStamp: opts.readServedStamp } : {}),
+      }));
+      const ctx = {
+        ...fakeContext("get_kg_status"),
+        objectClient: () => ({
+          status: async () => opts.inFlight ?? null,
+          lastAdminDryRun: async () => opts.dryRun ?? null,
+          get: async () => ({ config: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 1 }, source: "default" }),
+        }),
+        workflowClient: () => ({
+          status: async () => {
+            if (opts.statusThrows) throw new Error("no such workflow");
+            return { step: opts.step ?? null, startedAt: 1, triggerId: "t1", runId: null, dryRun: false, runnerStep: opts.runnerStep ?? null };
+          },
+        }),
+      } as unknown as restate.Context;
+      const result = await getKgStatusTool(ctx, { caller: system, args: {} });
+      return JSON.parse(result.content[0].text);
+    }
+
+    it("kgStageForRunnerStep answers every (runner step x status) pair", () => {
+      const statuses = ["running", "passed", "failed", "skipped", "cancelled"] as const;
+      const expected = (id: string, status: string) => {
+        if (id === "kg-ingest") return "ingest-running";
+        if (id === "kg-snapshot-push") return status === "passed" ? "snapshot-landed" : "ingest-running";
+        return "checking";
+      };
+      for (const id of KG_REFRESH_RUNNER_STEPS) {
+        for (const status of statuses) expect(kgStageForRunnerStep(id, status), `${id}/${status}`).toBe(expected(id, status));
+      }
+    });
+
+    it("an in-flight runnerStep sets stage and is reported; without one the workflow step maps as before", async () => {
+      const inFlight = { triggerId: "t1", startedAt: 1 };
+      const live = await stageFor({ inFlight, step: "await-progress", runnerStep: { id: "kg-ingest", status: "running" } });
+      expect(live.stage).toBe("ingest-running");
+      expect(live.runnerStep).toEqual({ id: "kg-ingest", status: "running" });
+      const early = await stageFor({ inFlight, step: "await-progress", runnerStep: { id: "clone", status: "passed" } });
+      expect(early.stage).toBe("checking");
+      const none = await stageFor({ inFlight, step: "merge", runnerStep: null });
+      expect(none.stage).toBe("snapshot-landed");
+      expect(none).not.toHaveProperty("runnerStep");
+    });
+
+    it.each([
+      ["no record", null, "idle"],
+      ["ok", ok, "serving"],
+      ["answers", failed("answers"), "reverted"],
+      ["vectors", failed("vectors"), "reverted"],
+      ["canary", failed("canary"), "reverted"],
+      ["stamp", failed("stamp"), "reverted"],
+      ["ingest-needed", failed("ingest-needed"), "idle"],
+      ["preflight", failed("preflight"), "failed"],
+    ])("idle: %s → %s", async (_name, last, stage) => {
+      const status = await stageFor({ last });
+      expect(status.stage).toBe(stage);
+      expect(status.running).toBe(false);
+    });
+
+    it.each([
+      ["reserve", "checking"], ["dispatch", "checking"],
+      ["await-progress", "ingest-running"], ["cancelling", "ingest-running"], ["dry-run-report", "ingest-running"],
+      ["merge", "snapshot-landed"], ["delete-branch", "snapshot-landed"],
+      ["fetch", "staging"], ["stage", "staging"], ["swap", "staging"], ["verify", "staging"], ["revert", "staging"],
+      ["persist", "staging"], ["close-row", "staging"], ["outcome", "staging"], ["settled", "staging"],
+    ])("in flight: step %s → %s", async (step, stage) => {
+      const status = await stageFor({ inFlight: { triggerId: "t1", startedAt: 1 }, step });
+      expect(status.stage).toBe(stage);
+      expect(status.running).toBe(true);
+    });
+
+    it("in flight with a workflow status failure reports ingest-running, still running, no error", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const status = await stageFor({ inFlight: { triggerId: "t1", startedAt: 1 }, statusThrows: true });
+      expect(status.stage).toBe("ingest-running");
+      expect(status.running).toBe(true);
+      warn.mockRestore();
+    });
+
+    it("returns the last admin dry-run as lastDryRun, null when none", async () => {
+      expect((await stageFor({})).lastDryRun).toBeNull();
+      const partTable = [{ part: "a", prev: "10", new: "9" }];
+      const dry = { ok: false, at: 5, detail: "guard refused", stampBefore: null, stampAfter: null, dryRun: true, partTable } as RefreshOutcome;
+      expect((await stageFor({ dryRun: dry })).lastDryRun).toEqual({ ok: false, at: 5, detail: "guard refused", partTable });
+    });
+
+    it("servedStamp falls back to readServedStamp when the record has no stamp", async () => {
+      const read = vi.fn(async () => "live-stamp");
+      const failedEarly = { ok: false, at: 1, detail: "timed out", stampBefore: null, stampAfter: null } as RefreshOutcome;
+      expect((await stageFor({ last: failedEarly, readServedStamp: read })).servedStamp).toBe("live-stamp");
+      expect((await stageFor({ last: null, readServedStamp: read })).servedStamp).toBe("live-stamp");
+      expect(read).toHaveBeenCalledTimes(2);
+    });
+
+    it("servedStamp does not call readServedStamp when the record has a stamp", async () => {
+      const read = vi.fn(async () => "live-stamp");
+      expect((await stageFor({ last: ok, readServedStamp: read })).servedStamp).toBe("b");
+      expect(read).not.toHaveBeenCalled();
+    });
+
+    it("servedStamp is null when readServedStamp rejects", async () => {
+      const status = await stageFor({ readServedStamp: async () => { throw new Error("sidecar down"); } });
+      expect(status.servedStamp).toBeNull();
+    });
+
+    it("restate: marker triggerId wins, else lastRefresh.dispatchId, else null", async () => {
+      const withId = { ...ok, dispatchId: "d-last" } as RefreshOutcome;
+      expect((await stageFor({ inFlight: { triggerId: "t1", startedAt: 1 }, last: withId })).restate).toEqual({ service: "KgRefresh", key: "t1" });
+      expect((await stageFor({ last: withId })).restate).toEqual({ service: "KgRefresh", key: "d-last" });
+      expect((await stageFor({ last: ok })).restate).toBeNull();
+      expect((await stageFor({})).restate).toBeNull();
+    });
+
+    it("a stored last-refresh record without steps still reads, and one with steps passes them through", async () => {
+      const status = await stageFor({ last: ok });
+      expect(status.lastRefresh).toBeTruthy();
+      expect(status.lastRefresh).not.toHaveProperty("steps");
+      const steps = [{ id: "clone", status: "passed", startedAt: "t0", endedAt: "t1", durationMs: 1 }];
+      const withSteps = await stageFor({ last: { ...ok, steps } as RefreshOutcome });
+      expect((withSteps.lastRefresh as { steps?: unknown }).steps).toEqual(steps);
+    });
+
+    it("keeps the KgRefreshStatus shape", async () => {
+      const status = await stageFor({ last: ok });
+      expect(Object.keys(status).sort()).toEqual(
+        ["deployHeld", "flyMachine", "kgDegraded", "kgUnavailable", "lastDryRun", "lastRefresh", "materialize", "restate", "running", "servedStamp", "sidecar", "stage"].sort(),
+      );
+    });
+  });
+});
+
+// ---- get_tenant_health's restate field (AII-807): reports the shared status contract
+// (src/restate/status.ts, AII-773) the same way GET / does — same source of truth, no
+// second copy of sidecar/registration state.
+describe("get_tenant_health restate health field (AII-807)", () => {
+  const system: Caller = SYSTEM_ADMIN;
+
+  beforeAll(() => {
+    initSettingsTable();
+    initLogTable();
+  });
+
+  afterEach(() => {
+    resetRestateStatus();
+  });
+
+  it("reports the not-attempted/starting default before any sidecar write", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
+    const parsed = JSON.parse(result.content[0].text) as { restate: unknown };
+    expect(parsed.restate).toEqual({ sidecar: { state: "starting" }, registration: { state: "not-attempted" } });
+  });
+
+  it("includes both retention settings", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
+    const parsed = JSON.parse(result.content[0].text) as { restateRetentionDays: unknown; volumeSnapshotRetentionDays: unknown };
+    expect(typeof parsed.restateRetentionDays).toBe("number");
+    expect(typeof parsed.volumeSnapshotRetentionDays).toBe("number");
+  });
+
+  it("reflects a ready sidecar with a declined-conflict registration", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "declined-conflict" } });
+
+    const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
+    const parsed = JSON.parse(result.content[0].text) as { restate: unknown };
+
+    expect(parsed.restate).toEqual(getRestateStatus());
+    expect(parsed.restate).toEqual({ sidecar: { state: "ready" }, registration: { state: "declined-conflict" } });
+  });
+
+  it("reflects an exited sidecar with code/signal and an unreachable registration", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    setRestateStatus({ sidecar: { state: "exited", code: 1, signal: null }, registration: { state: "unreachable" } });
+
+    const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
+    const parsed = JSON.parse(result.content[0].text) as { restate: unknown };
+
+    expect(parsed.restate).toEqual({ sidecar: { state: "exited", code: 1, signal: null }, registration: { state: "unreachable" } });
   });
 });
 
@@ -679,40 +1099,121 @@ describe("get_issue_report_card and get_fleet_report thread their arguments (AII
 describe("migrated write handlers (AII-713)", () => {
   const admin: Caller = SYSTEM_ADMIN;
 
-  afterEach(() => {
-    setActiveKgRefresh(null);
-  });
-
   describe("trigger_kg_refresh", () => {
-    it("throws \"KG refresh is not configured\" when no handle is active", async () => {
-      const result = await triggerKgRefreshTool(fakeContext("trigger_kg_refresh"), { caller: admin, args: {} });
-      expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("KG refresh is not configured");
+    const answer = (result: { content: { text: string }[] }) => JSON.parse(result.content[0].text);
+    const trigger = vi.fn();
+    function ctxWithKgRepo(runCalls: RunCall[] = []): restate.Context {
+      return { ...fakeContext("trigger_kg_refresh", runCalls), objectClient: () => ({ trigger }) } as unknown as restate.Context;
+    }
+    const call = (args: Record<string, unknown> = {}, caller: Caller = admin, runCalls: RunCall[] = []) =>
+      triggerKgRefreshTool(ctxWithKgRepo(runCalls), { caller, args });
+
+    beforeEach(() => {
+      trigger.mockReset();
+      trigger.mockResolvedValue({ triggerId: "trig-1" });
+      setKgRefreshToolDeps(kgToolDeps());
+    });
+    afterEach(() => setKgRefreshToolDeps(null));
+
+    it("answers 501 when the tool deps are unset", async () => {
+      setKgRefreshToolDeps(null);
+      expect(answer(await call())).toEqual({ status: 501, body: { error: "kg-source-repo-not-configured" } });
     });
 
-    it("forwards dryRun, acceptNewBaseline, and the caller's email to the active handle through ctx.run, and returns its result verbatim", async () => {
-      const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
-      setActiveKgRefresh({ trigger: triggerMock } as unknown as KgRefreshHandle);
-      const runCalls: RunCall[] = [];
-      const result = await triggerKgRefreshTool(fakeContext("trigger_kg_refresh", runCalls), {
-        caller: { kind: "human", email: "user@example.com", role: "admin" },
-        args: { dryRun: true, acceptNewBaseline: true },
+    it("answers 409 deploy-in-progress first, even when every later gate also fails", async () => {
+      setKgRefreshToolDeps(kgToolDeps({
+        isDeployHeld: () => true, callbackConfigured: () => false, mappingExists: () => false, freeBytes: () => 0,
+        runPreflight: async () => ({ ...PREFLIGHT_OK, ok: false }),
+      }));
+      expect(answer(await call())).toEqual({
+        status: 409, body: { error: "deploy-in-progress", detail: "a deploy holds the machine; refresh refused" },
       });
-      expect(triggerMock).toHaveBeenCalledWith({ dryRun: true, acceptNewBaseline: true, actorEmail: "user@example.com" });
-      expect(JSON.parse(result.content[0].text)).toEqual({ status: 202, body: { accepted: true } });
-      expect(runCalls).toEqual([{ name: "kg-refresh-trigger", options: { maxRetryAttempts: 1 }, result: { status: 202, body: { accepted: true } } }]);
+      expect(trigger).not.toHaveBeenCalled();
     });
 
-    it("defaults dryRun and acceptNewBaseline to false when omitted, and actorEmail to undefined for a null-email caller", async () => {
-      const triggerMock = vi.fn(async () => ({ status: 202, body: {} }));
-      setActiveKgRefresh({ trigger: triggerMock } as unknown as KgRefreshHandle);
-      await triggerKgRefreshTool(fakeContext("trigger_kg_refresh"), { caller: admin, args: {} });
-      expect(triggerMock).toHaveBeenCalledWith({ dryRun: false, acceptNewBaseline: false, actorEmail: undefined });
+    it("answers 501 when no KG source repo is configured, before the callback check", async () => {
+      setKgRefreshToolDeps(kgToolDeps({ kgSourceRepo: null as unknown as string, callbackConfigured: () => false }));
+      expect(answer(await call())).toEqual({ status: 501, body: { error: "kg-source-repo-not-configured" } });
+    });
+
+    it("answers 422 callback-unconfigured before the mapping check", async () => {
+      setKgRefreshToolDeps(kgToolDeps({ callbackConfigured: () => false, mappingExists: () => false }));
+      const res = answer(await call());
+      expect(res.status).toBe(422);
+      expect(res.body.error).toBe("callback-unconfigured");
+      expect(res.body.precondition).toBe("callback-unconfigured");
+      expect(res.body.detail).toContain("RUNNER_CALLBACK_BASE_URL and RUNNER_TOKEN_SECRET");
+    });
+
+    it("answers 422 kg-mapping-not-found before the disk check", async () => {
+      setKgRefreshToolDeps(kgToolDeps({ mappingExists: () => false, freeBytes: () => 0 }));
+      const res = answer(await call());
+      expect(res).toEqual({
+        status: 422,
+        body: {
+          error: "kg-mapping-not-found",
+          precondition: "kg-mapping-not-found",
+          detail: "no project mapping found for kgSourceRepo=org/kg — add it at /admin and set dependencyTokenScope=installation",
+        },
+      });
+    });
+
+    it("answers 507 insufficient-storage before the preflight", async () => {
+      const runPreflight = vi.fn(async () => PREFLIGHT_OK);
+      setKgRefreshToolDeps(kgToolDeps({ freeBytes: () => 1, runPreflight }));
+      const res = answer(await call());
+      expect(res.status).toBe(507);
+      expect(res.body.error).toBe("insufficient-storage");
+      expect(res.body.detail).toMatch(/^less than \d+ bytes free on the volume$/);
+      expect(runPreflight).not.toHaveBeenCalled();
+    });
+
+    it("a throwing freeBytes does not refuse", async () => {
+      setKgRefreshToolDeps(kgToolDeps({ freeBytes: () => { throw new Error("statfs"); } }));
+      expect(answer(await call()).status).toBe(202);
+    });
+
+    it("answers 422 preflight-failed and persists the failure inside the same ctx.run step", async () => {
+      const failing = {
+        ok: false, checkedAt: 5,
+        results: [{ repo: "org/dep", grant: "contents", ok: false, status: 404, hint: "grant it" }, { repo: "org/kg", grant: "contents", ok: true, status: 200 }],
+      } as PreflightCheckResult;
+      const persistPreflightFailure = vi.fn();
+      setKgRefreshToolDeps(kgToolDeps({ runPreflight: async () => failing, persistPreflightFailure }));
+      const runCalls: RunCall[] = [];
+      const res = answer(await call({}, admin, runCalls));
+      const detail = "org/dep — contents — HTTP 404 — grant it";
+      expect(res).toEqual({ status: 422, body: { error: "preflight-failed", precondition: "preflight-failed", detail } });
+      expect(persistPreflightFailure).toHaveBeenCalledWith(failing);
+      expect(runCalls.find((c) => c.name === "preflight")).toMatchObject({ options: { maxRetryAttempts: 1 }, result: detail });
+      expect(trigger).not.toHaveBeenCalled();
+    });
+
+    it("answers 202 { refreshing, triggerId } and forwards every option to KgRepo.trigger", async () => {
+      const res = answer(await call(
+        { dryRun: true, acceptNewBaseline: true, ref: "feature/x" },
+        { kind: "human", email: "user@example.com", role: "admin" },
+      ));
+      expect(res).toEqual({ status: 202, body: { refreshing: true, triggerId: "trig-1" } });
+      expect(trigger).toHaveBeenCalledWith({ dryRun: true, acceptNewBaseline: true, kgSourceRef: "feature/x", actorEmail: "user@example.com" });
+    });
+
+    it("passes ref through as kgSourceRef to KgRepo.trigger", async () => {
+      await call({ ref: "release/1.2" });
+      expect(trigger).toHaveBeenCalledWith(expect.objectContaining({ kgSourceRef: "release/1.2" }));
+    });
+
+    it("defaults dryRun and acceptNewBaseline to false, omits ref, and leaves actorEmail undefined for a null-email caller", async () => {
+      await call();
+      expect(trigger).toHaveBeenCalledWith({ dryRun: false, acceptNewBaseline: false, actorEmail: undefined });
+    });
+
+    it("answers 409 refresh-in-progress when KgRepo reports a live refresh", async () => {
+      trigger.mockResolvedValue({ status: "refresh-in-progress", triggerId: "other" });
+      expect(answer(await call())).toEqual({ status: 409, body: { error: "refresh-in-progress" } });
     });
 
     it("answers isError with the wrapper's standard wording when ctx.run rejects with a TerminalError", async () => {
-      const triggerMock = vi.fn(async () => ({ status: 202, body: {} }));
-      setActiveKgRefresh({ trigger: triggerMock } as unknown as KgRefreshHandle);
       const failingCtx = {
         request: () => ({ target: { handler: "trigger_kg_refresh" } }),
         run: async () => {
@@ -726,7 +1227,7 @@ describe("migrated write handlers (AII-713)", () => {
         isError: true,
         content: [{ type: "text", text: "trigger_kg_refresh failed: kg-refresh dispatch rejected" }],
       });
-      expect(triggerMock).not.toHaveBeenCalled();
+      expect(trigger).not.toHaveBeenCalled();
     });
   });
 
@@ -974,5 +1475,180 @@ describe("add_project uses the registry the boot shares (AII-713 review)", () =>
     } finally {
       setProviderRegistry(null);
     }
+  });
+});
+
+// ---- AII-1069: list_dispatch_reservations / release_dispatch_reservation.
+describe("dispatch reservation tools (AII-1069)", () => {
+  const admin: Caller = { kind: "human", email: "op@example.com", role: "admin" };
+  let seq = 0;
+  const parse = (r: { content: { text: string }[] }) => JSON.parse(r.content[0].text);
+
+  beforeAll(() => {
+    initLogTable();
+  });
+  afterEach(() => {
+    setAdmissionTerminationCheck(null);
+    vi.restoreAllMocks();
+  });
+
+  async function hold(owner: { kind: "legacy" } | { kind: "restate"; attemptId: string } = { kind: "legacy" }, jobStatus?: "running" | "completed") {
+    const { acquire } = await import("../dispatch-admission.js");
+    const { appendLog, updateJobStatus } = await import("../log.js");
+    const dispatchId = `res-${Date.now()}-${seq++}`;
+    const decision = acquire({
+      dispatchId,
+      mappingKey: "AII",
+      scope: { kind: "issue", issueScope: "AII", issueId: dispatchId },
+      kind: "planning",
+      backend: "github-actions",
+      lifecycleOwner: owner,
+      cap: 100,
+    });
+    if (!decision.ok) throw new Error("acquire failed");
+    if (jobStatus) {
+      const id = appendLog({ issueId: dispatchId, issueIdentifier: "AII-1", repo: "o/r", dispatchId, admissionGeneration: decision.record.generation, executionMode: "github-actions" });
+      if (jobStatus === "completed") updateJobStatus(id, "completed", "success");
+    }
+    return dispatchId;
+  }
+  const heldNow = async (dispatchId: string) => (await import("../dispatch-admission.js")).read(dispatchId)?.releasedAt === null;
+  const runnerJobCount = async () =>
+    (await import("../in-flight-work.js")).getInFlightWork().find((w) => w.kind === "runner-job")?.count ?? 0;
+
+  it("lists held rows and not released ones, for a user caller", async () => {
+    const held = await hold({ kind: "legacy" }, "running");
+    const gone = await hold();
+    (await import("../dispatch-admission.js")).releaseByDispatchId(gone, "finalized");
+    const result = await listDispatchReservationsTool(fakeContext("list_dispatch_reservations"), { caller: HUMAN_USER, args: {} });
+    const rows = parse(result) as Array<Record<string, unknown>>;
+    const row = rows.find((r) => r.dispatchId === held);
+    expect(row).toMatchObject({ team: "AII", issueIdentifier: "AII-1", phase: "planning", backend: "github-actions", lifecycleOwner: "legacy", jobStatus: "dispatched", jobConclusion: null });
+    expect(typeof row?.ageSeconds).toBe("number");
+    expect(rows.some((r) => r.dispatchId === gone)).toBe(false);
+  });
+
+  it("refuses a user caller as forbidden and leaves the row held", async () => {
+    const id = await hold();
+    const result = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: HUMAN_USER, args: { dispatchId: id, force: true } });
+    expect(result.content[0].text).toBe("forbidden: release_dispatch_reservation requires the admin role");
+    expect(await heldNow(id)).toBe(true);
+  });
+
+  it("refuses a row whose job is terminal without force, naming the status, and the row stays held", async () => {
+    const id = await hold({ kind: "restate", attemptId: "a" }, "completed");
+    setAdmissionTerminationCheck(async () => false);
+    const before = await runnerJobCount();
+    const result = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id } });
+    expect(result.isError).toBe(true);
+    expect(parse(result)).toMatchObject({ status: "refused", dispatchId: id });
+    expect(parse(result).reason).toMatch(/completed/);
+    expect(parse(result).reason).toMatch(/force/);
+    expect(await heldNow(id)).toBe(true);
+    expect(await runnerJobCount()).toBe(before);
+  });
+
+  it("refuses without force while the run executes, then releases with force", async () => {
+    const id = await hold({ kind: "legacy" }, "running");
+    setAdmissionTerminationCheck(async () => false);
+    const refused = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id } });
+    expect(refused.isError).toBe(true);
+    expect(parse(refused)).toMatchObject({ status: "refused", dispatchId: id });
+    expect(parse(refused).reason).toMatch(/force/);
+    expect(await heldNow(id)).toBe(true);
+
+    const forced = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id, force: true } });
+    expect(parse(forced)).toMatchObject({ status: "released", forced: true, basis: "forced" });
+    expect(await heldNow(id)).toBe(false);
+  });
+
+  it("releases without force when the backend run is confirmed ended", async () => {
+    const id = await hold({ kind: "legacy" }, "running");
+    setAdmissionTerminationCheck(async (c) => c.dispatchId === id);
+    const result = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id } });
+    expect(parse(result)).toMatchObject({ status: "released", basis: "backend_confirmed" });
+  });
+
+  it("answers nothing_to_release for an unknown or already released id", async () => {
+    const id = await hold();
+    await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id, force: true } });
+    for (const dispatchId of [id, "no-such-dispatch"]) {
+      const result = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId, force: true } });
+      expect(result.isError).toBeUndefined();
+      expect(parse(result)).toEqual({ status: "nothing_to_release", dispatchId });
+    }
+  });
+
+  it("writes one audit line naming actor, dispatch id, owner and force", async () => {
+    const id = await hold({ kind: "restate", attemptId: "b" });
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id, force: true } });
+    const lines = log.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith("[mcp] write tool=release_dispatch_reservation"));
+    expect(lines).toEqual([
+      `[mcp] write tool=release_dispatch_reservation actor=op@example.com role=admin result=ok kind=human dispatch=${id} owner=restate:b force=true`,
+    ]);
+  });
+});
+
+describe("set_fly_machine_profile / get_kg_status flyMachine (AII-1130)", () => {
+  // A stand-in for the FlyMachineProfile object that runs the real merge/validation.
+  const store: { current: FlyMachineProfileConfig | null } = { current: null };
+  const setKeys: string[] = [];
+  const profileClient = (key: string) => ({
+    get: async () => ({ config: store.current ?? { ...FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"] }, source: store.current ? "profile" : "default" }),
+    set: async (patch: Partial<FlyMachineProfileConfig>) => {
+      setKeys.push(key);
+      store.current = mergeProfile(store.current ?? FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"], patch);
+      return { config: store.current, source: "profile" };
+    },
+  });
+  const ctxFor = (name: string) => ({
+    ...fakeContext(name),
+    objectClient: (_def: unknown, key: string) => profileClient(key),
+  }) as unknown as restate.Context;
+
+  beforeEach(() => {
+    store.current = null;
+    setKeys.length = 0;
+    setKgRefreshToolDeps(kgToolDeps());
+  });
+  afterEach(() => setKgRefreshToolDeps(null));
+
+  const call = async (args: Record<string, unknown>, caller: Caller = SYSTEM_ADMIN) =>
+    JSON.parse((await setFlyMachineProfileTool(ctxFor("set_fly_machine_profile"), { caller, args: { pipeline: "kg-refresh", ...args } })).content[0].text);
+
+  it("sets on the pipeline's key and returns the object's answer", async () => {
+    const res = await call({ memoryMb: 4096 });
+    expect(setKeys).toEqual(["kg-refresh"]);
+    expect(res).toEqual({ config: { cpuKind: "performance", cpus: 2, memoryMb: 4096, idleTimeoutMs: FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"].idleTimeoutMs }, source: "profile" });
+  });
+
+  it.each([
+    [{ cpus: 3 }, "cpus"],
+    [{ memoryMb: 100 }, "memoryMb"],
+    [{ memoryMb: 70000 }, "memoryMb"],
+  ])("answers 400 naming %s from the object's rejection", async (args, field) => {
+    const res = await call(args);
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain(field);
+  });
+
+  it("refuses a user caller", async () => {
+    const result = await setFlyMachineProfileTool(ctxFor("set_fly_machine_profile"), { caller: HUMAN_USER, args: { pipeline: "kg-refresh", cpus: 2 } });
+    expect(result.content[0].text).toBe("forbidden: set_fly_machine_profile requires the admin role");
+    expect(setKeys).toEqual([]);
+  });
+
+  it("get_kg_status reports flyMachine as the profile's config and source", async () => {
+    await call({ memoryMb: 4096 });
+    const ctx = {
+      ...fakeContext("get_kg_status"),
+      objectClient: (def: { name: string }, key: string) =>
+        def.name === "FlyMachineProfile" ? profileClient(key) : { status: async () => null, lastAdminDryRun: async () => null },
+    } as unknown as restate.Context;
+    const status = JSON.parse((await getKgStatusTool(ctx, { caller: SYSTEM_ADMIN, args: {} })).content[0].text);
+    expect(status.flyMachine).toEqual({
+      cpuKind: "performance", cpus: 2, memoryMb: 4096, idleTimeoutMs: FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"].idleTimeoutMs, source: "profile",
+    });
   });
 });

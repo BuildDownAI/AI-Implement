@@ -69,14 +69,15 @@ function insertDispatch(opts: {
   conclusion?: string;
   prUrl?: string;
   dispatchedAt?: number;
+  dispatchId?: string;
 }): number {
   const db = dedup.getDb();
   const now = opts.dispatchedAt ?? Date.now();
   const result = db
     .prepare(
       `INSERT INTO dispatch_log
-         (issue_id, issue_identifier, repo, dispatched_at, phase, status, conclusion, pr_url)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         (issue_id, issue_identifier, repo, dispatched_at, phase, status, conclusion, pr_url, dispatch_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       opts.issueId ?? "issue-default",
@@ -87,6 +88,7 @@ function insertDispatch(opts: {
       opts.status ?? "completed",
       opts.conclusion ?? null,
       opts.prUrl ?? null,
+      opts.dispatchId ?? null,
     );
   return Number(result.lastInsertRowid);
 }
@@ -934,5 +936,39 @@ describe("getFleetReport", () => {
       const r = report.byRepo.find((x) => x.repo === "org/rfe");
       expect(r!.avgPasses).toBeCloseTo(1.0);
     });
+  });
+});
+
+describe("getIssueReportCard restate (AII-1129)", () => {
+  it("maps kg-refresh, planning and implementation rows; null dispatch_id and non-restate rows are null", () => {
+    const issueIdentifier = "AII-RS";
+    insertDispatch({ issueIdentifier, phase: "kg-refresh", dispatchId: "kg-1", dispatchedAt: 1 });
+    insertDispatch({ issueIdentifier, phase: "planning", dispatchId: "plan-1", dispatchedAt: 2 });
+    insertDispatch({ issueIdentifier, phase: "implementation", dispatchId: "impl-1", dispatchedAt: 3 });
+    insertDispatch({ issueIdentifier, phase: "planning", dispatchedAt: 4 });
+    insertDispatch({ issueIdentifier, phase: "gap-fill", dispatchId: "legacy-1", dispatchedAt: 5 });
+    const card = rc.getIssueReportCard(issueIdentifier)!;
+    expect(card.runs.map((r) => r.restate)).toEqual([
+      { service: "KgRefresh", key: "kg-1" },
+      { service: "PlanningRun", key: "plan-1" },
+      null,
+      null,
+      null,
+    ]);
+  });
+
+  it("maps a restate-owned non-planning row to ReviewFixAttempt", async () => {
+    const admission = await import("../dispatch-admission.js");
+    admission.acquire({
+      dispatchId: "rf-1",
+      mappingKey: "m",
+      scope: { kind: "issue", issueScope: "s", issueId: "issue-default" },
+      kind: "gap-fill",
+      backend: "fly-machines",
+      lifecycleOwner: { kind: "restate" } as never,
+      cap: 5,
+    });
+    insertDispatch({ issueIdentifier: "AII-RF", phase: "gap-fill", dispatchId: "rf-1" });
+    expect(rc.getIssueReportCard("AII-RF")!.runs[0].restate).toEqual({ service: "ReviewFixAttempt", key: "rf-1" });
   });
 });

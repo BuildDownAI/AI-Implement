@@ -1,7 +1,7 @@
 // The SDK endpoint for the run lifecycle's durable-execution engine (ADR 017, ADR 018),
 // the `Operator` Virtual Object (AII-709), and the `orchestratorTools` service /mcp
-// discovers and calls tools through (AII-710). No run kind has migrated onto Restate yet,
-// so a workflow module joins the service set here once one does. The Restate server
+// discovers and calls tools through (AII-710). kg-refresh is migrated: `src/index.ts`
+// composes the `KgRepo` / `KgRefresh` services and registers them here. The Restate server
 // (RestateSidecar, ../restate/server.ts, AII-627) reaches this endpoint by push, over
 // HTTP/2 — nothing else calls it, which is why the bind address defaults to loopback and
 // never leaves it (ADR 023).
@@ -12,7 +12,6 @@ import type {
   VirtualObjectDefinition,
   WorkflowDefinition,
 } from "@restatedev/restate-sdk";
-import { getInFlightJobs as defaultGetInFlightJobs } from "../log.js";
 import { RESTATE_ADMIN_BASE_URL } from "./server.js";
 import { operatorObject } from "./operator-object.js";
 import { orchestratorTools } from "./tools.js";
@@ -43,17 +42,40 @@ export function restateBindAddress(): RestateBindAddress {
   return { host, port };
 }
 
-export function createRestateEndpointHandler(services: RestateService[] = RESTATE_SERVICES) {
-  return createEndpointHandler({ services });
+let warnedUnsigned = false;
+
+/**
+ * Request-identity keys for the endpoint (AII-976): the sidecar's own key, else
+ * RESTATE_IDENTITY_KEY for an external server. With neither, the SDK accepts unsigned
+ * requests and the warning is logged once.
+ */
+export function resolveIdentityKeys(sidecarKey?: string, env: NodeJS.ProcessEnv = process.env): string[] | undefined {
+  const key = sidecarKey || env.RESTATE_IDENTITY_KEY?.trim();
+  if (key) return [key];
+  if (!warnedUnsigned) {
+    warnedUnsigned = true;
+    console.error("[restate] no request identity key — the endpoint accepts unsigned requests (loopback binding is the only control)");
+  }
+  return undefined;
+}
+
+export function createRestateEndpointHandler(
+  services: RestateService[] = RESTATE_SERVICES,
+  identityKeys?: string[],
+) {
+  return createEndpointHandler(identityKeys ? { services, identityKeys } : { services });
 }
 
 // Starts the SDK endpoint as an HTTP/2 server. Called from orchestrator boot
 // (src/index.ts) once the RestateSidecar reports readiness, then followed by register().
 export function startRestateEndpoint(
   services: RestateService[] = RESTATE_SERVICES,
+  sidecarIdentityKey?: string,
 ): Promise<http2.Http2Server> {
   const { host, port } = restateBindAddress();
-  const server = http2.createServer(createRestateEndpointHandler(services));
+  const server = http2.createServer(
+    createRestateEndpointHandler(services, resolveIdentityKeys(sidecarIdentityKey)),
+  );
   return new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, () => resolve(server));
@@ -71,34 +93,128 @@ export interface RestateRegisterResult {
   detail?: string;
 }
 
+/** Signature of the drain check `register()` runs on a META0004 conflict before forcing. */
+export type QueryNonCompletedInvocations = (
+  fetchImpl: typeof fetch,
+  adminBaseUrl: string,
+  uri: string,
+) => Promise<number | null>;
+
 /** For testing: override the admin API base URL, the fetch implementation, and the drain check. */
 export interface RegisterDeps {
   adminBaseUrl?: string;
   fetchImpl?: typeof fetch;
-  getInFlightJobs?: () => unknown[];
+  queryNonCompletedInvocations?: QueryNonCompletedInvocations;
 }
 
 const META0004_CONFLICT = "META0004";
 
+/** Registration bound (AII-728): a hung admin API must not hang boot indefinitely. Applies to both the no-force call and the forced retry, and (AII-721) the invocation-count query run in between. */
+const REGISTER_TIMEOUT_MS = 10_000;
+
+interface IntrospectionRow {
+  [column: string]: unknown;
+}
+
+export async function runIntrospectionQuery(
+  fetchImpl: typeof fetch,
+  adminBaseUrl: string,
+  sql: string,
+): Promise<IntrospectionRow[]> {
+  const response = await fetchImpl(`${adminBaseUrl}/query`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ query: sql }),
+    signal: AbortSignal.timeout(REGISTER_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    throw new Error(`admin API query failed: HTTP ${response.status}`);
+  }
+  const body = (await response.json()) as { rows?: unknown };
+  if (!Array.isArray(body.rows)) {
+    throw new Error("unexpected admin API query response shape (no rows array)");
+  }
+  return body.rows as IntrospectionRow[];
+}
+
+export function sqlQuote(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
 /**
- * Registers the SDK endpoint with the Restate admin API's POST /deployments, once,
- * at boot, without `force`. Verified against the Restate admin API (2026-09-14): an
- * unchanged endpoint at the same URI answers 200/201, which is success — the server
- * does not require a diff for that to happen. A changed service set at the same URI
- * that the server refuses to apply outright answers a META0004 conflict; `force: true`
- * overrides the deployment at that URI and "can lead inflight invocations to an
- * unrecoverable error state" per Restate's own guidance, so `register()` only retries
- * with `force` after confirming zero in-flight kg-refresh rows via getInFlightJobs()
- * (src/log.ts) — the self-deploy interlock has already drained them before a redeploy
- * replaces this process, so the check is a guard against calling this function outside
- * that path, not against a race it needs to win. Every path is logged once. Boot never
- * fails on the result: the kg-refresh trigger seam (AII-683) answers 503 restate-unavailable
- * while no successful registration has completed.
+ * Counts non-completed invocations pinned to the deployment currently registered at `uri` —
+ * the deployment a forced re-registration would replace. Verified against the pinned 1.7.10
+ * admin API (2026-09-25, spawned locally from the @restatedev/restate-server platform binary
+ * this repo already depends on): `POST {adminBaseUrl}/query` with an `Accept: application/json`
+ * header runs a DataFusion SQL statement over the server's introspection tables and answers
+ * `{ rows: [...] }` as plain JSON — omitting that header answers Arrow IPC instead, which would
+ * need `apache-arrow`, an undeclared transitive dependency (pulled in only by the testcontainers
+ * devDependency) this production module has no business on.
+ *
+ * `sys_deployment.endpoint` holds the registered URI with a trailing slash this module's own
+ * `uri` never carries, so both forms are matched. Restate 1.7.10 does not always set
+ * `pinned_deployment_id`: a running handler suspended on an awakeable has
+ * `last_attempt_deployment_id` instead, while an exclusive handler queued behind it has
+ * neither deployment ID yet. For that last case, `sys_service` maps its target service
+ * to the deployment currently serving it. Count all three forms, scoped to deployments
+ * registered at this URI. `status != 'completed'` covers every other
+ * non-terminal state (pending, ready, running, backing-off, suspended, paused) with one
+ * comparison rather than an enumerated allowlist. `scheduled` is deliberately excluded: it is
+ * a delayed send whose timer has not fired, so it has no journal and no pinned deployment, and
+ * when it fires it starts as a new invocation on whichever deployment then serves the service.
+ * Counting it would hold a deploy for the whole delay — `KgRepo.expire` is scheduled
+ * 4 h 10 min out on every refresh trigger (AII-1031). Persistent Virtual Object state lives in the separate
+ * `state` table and never appears in `sys_invocation`, so it is never counted — durable state
+ * alone is not active work (AII-721).
+ *
+ * A query error, a non-2xx response, or a response shape this function doesn't recognize all
+ * resolve to `null` ("unknown"); `register()` treats that the same as a nonzero count and
+ * declines the force. No deployment registered yet at `uri` resolves to `0` — nothing to drain.
+ */
+export async function queryNonCompletedInvocations(
+  fetchImpl: typeof fetch,
+  adminBaseUrl: string,
+  uri: string,
+): Promise<number | null> {
+  try {
+    const normalized = uri.replace(/\/+$/, "");
+    const escaped = sqlQuote(normalized);
+    const oldDeployments =
+      `(SELECT id FROM sys_deployment WHERE endpoint = '${escaped}' OR endpoint = '${escaped}/')`;
+    const rows = await runIntrospectionQuery(
+      fetchImpl,
+      adminBaseUrl,
+      "SELECT COUNT(*) AS count FROM sys_invocation WHERE status != 'completed' AND status != 'scheduled' AND (" +
+        `pinned_deployment_id IN ${oldDeployments} OR ` +
+        `last_attempt_deployment_id IN ${oldDeployments} OR ` +
+        "(pinned_deployment_id IS NULL AND last_attempt_deployment_id IS NULL AND " +
+        `target_service_name IN (SELECT name FROM sys_service WHERE deployment_id IN ${oldDeployments})))`,
+    );
+    const count = rows[0]?.count;
+    return typeof count === "number" ? count : null;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[restate] invocation-count query failed (${message}) — treating as unknown`);
+    return null;
+  }
+}
+
+/**
+ * Registers the SDK endpoint with Restate. On pinned server 1.7.10, the first
+ * registration answers 201, but re-registering an existing URI answers 200
+ * without re-discovering the endpoint at all — even if its service set changed.
+ * Treat that duplicate 200 like META0004: only force discovery after confirming
+ * zero non-completed invocations on the deployment it would replace. A forced
+ * replacement with active invocations could strand their journals. The deploy
+ * interlock normally drains them first; a caller that finds registration
+ * declined should retry on a timer (createRestateRegistrationGate, src/index.ts).
+ * Every path is logged once. Boot never fails on the result: the kg-refresh trigger seam
+ * (AII-683) answers 503 restate-unavailable while no successful registration has completed.
  */
 export async function register(deps: RegisterDeps = {}): Promise<RestateRegisterResult> {
   const adminBaseUrl = deps.adminBaseUrl ?? RESTATE_ADMIN_BASE_URL;
   const fetchImpl = deps.fetchImpl ?? fetch;
-  const getInFlight = deps.getInFlightJobs ?? defaultGetInFlightJobs;
+  const queryInvocations = deps.queryNonCompletedInvocations ?? queryNonCompletedInvocations;
   const { host, port } = restateBindAddress();
   const uri = `http://${host}:${port}`;
 
@@ -111,26 +227,43 @@ export async function register(deps: RegisterDeps = {}): Promise<RestateRegister
     return { outcome: "unreachable", detail: message };
   }
 
-  if (response.ok) {
+  if (response.ok && response.status !== 200) {
     console.error(`[restate] endpoint registered at ${uri} (no-force, HTTP ${response.status})`);
     return { outcome: "registered-no-force" };
   }
 
-  const body = await safeJson(response);
+  const body = response.ok ? undefined : await safeJson(response);
   const code = typeof body?.restate_code === "string" ? body.restate_code : undefined;
 
-  if (code !== META0004_CONFLICT) {
+  if (!response.ok && code !== META0004_CONFLICT) {
     const message = typeof body?.message === "string" ? body.message : `HTTP ${response.status}`;
     console.error(`[restate] endpoint registration failed: ${message}`);
     return { outcome: "unreachable", detail: message };
   }
 
-  const inFlight = getInFlight();
-  if (inFlight.length > 0) {
+  let nonCompleted: number | null;
+  try {
+    nonCompleted = await queryInvocations(fetchImpl, adminBaseUrl, uri);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
     console.error(
-      `[restate] endpoint registration conflict at ${uri} — ${inFlight.length} in-flight kg-refresh job(s), declining force`,
+      `[restate] endpoint registration conflict at ${uri} — invocation query threw (${message}), declining force`,
     );
-    return { outcome: "declined-conflict", detail: `${inFlight.length} in-flight job(s)` };
+    return { outcome: "declined-conflict", detail: "invocation count unknown" };
+  }
+
+  if (nonCompleted === null) {
+    console.error(
+      `[restate] endpoint registration conflict at ${uri} — could not determine non-completed invocations on the old deployment, declining force`,
+    );
+    return { outcome: "declined-conflict", detail: "invocation count unknown" };
+  }
+
+  if (nonCompleted > 0) {
+    console.error(
+      `[restate] endpoint registration conflict at ${uri} — ${nonCompleted} non-completed invocation(s) on the old deployment, declining force`,
+    );
+    return { outcome: "declined-conflict", detail: `${nonCompleted} non-completed invocation(s)` };
   }
 
   let forced: Response;
@@ -149,7 +282,7 @@ export async function register(deps: RegisterDeps = {}): Promise<RestateRegister
     return { outcome: "unreachable", detail: message };
   }
 
-  console.error(`[restate] endpoint registered at ${uri} (drained-force, zero in-flight jobs, HTTP ${forced.status})`);
+  console.error(`[restate] endpoint registered at ${uri} (drained-force, zero non-completed invocations, HTTP ${forced.status})`);
   return { outcome: "registered-drained-force" };
 }
 
@@ -163,6 +296,7 @@ function postDeployment(
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(force ? { uri, force: true } : { uri }),
+    signal: AbortSignal.timeout(REGISTER_TIMEOUT_MS),
   });
 }
 

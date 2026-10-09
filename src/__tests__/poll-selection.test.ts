@@ -1,7 +1,14 @@
-import { describe, expect, it } from "vitest";
-import { selectIssuesToDispatch, selectBlockers, parseDeclaredFiles, selectFileOverlapDeferrals, rememberCandidates, resolveInFlightSiblings, resetSeenCandidates, getCachedPlanningContext, setCachedPlanningContext, resetPlanningContextCache, needsPlanningContextFetch, getPlanningContextCacheSize, PLANNING_CONTEXT_CACHE_MAX } from "../poll-selection.js";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import os from "node:os";
+import path from "node:path";
+import fs from "node:fs";
+import { selectIssuesToDispatch, selectBlockers, mappingForProvider, mergeProviderSnapshots, selectForeignTrackerBlockers, parseDeclaredFiles, selectFileOverlapDeferrals, rememberCandidates, diffSkipReasons, logSkipReasons, resetSkipReasons, resolveInFlightSiblings, resetSeenCandidates, getCachedPlanningContext, setCachedPlanningContext, resetPlanningContextCache, needsPlanningContextFetch, getPlanningContextCacheSize, PLANNING_CONTEXT_CACHE_MAX } from "../poll-selection.js";
 import type { RepoMapping } from "../config.js";
-import type { TicketIssue } from "../providers/types.js";
+import type { AIImplementSnapshot, TicketIssue } from "../providers/types.js";
+import type * as DedupModule from "../dedup.js";
+import type * as GateModule from "../dispatch-gate.js";
+import type * as AdmissionModule from "../dispatch-admission.js";
+import type * as BreakerModule from "../dispatch-breaker.js";
 
 function makeIssue(id: string, identifier: string, teamKey: string, overrides?: Partial<TicketIssue>): TicketIssue {
   return {
@@ -47,12 +54,24 @@ function makeMapping(maxInProgressAiIssues = 3): RepoMapping {
     planningEnabled: false,
     planningWorkflowFile: "",
     autoApprovePlans: true,
+    autoMerge: false,
     extraEnv: {},
     provider: "anthropic",
     ticketingProvider: "linear",
     ticketingConfig: { kind: "linear" },
     awsRegion: null,
     paused: false,
+    maxTurns: null,
+    maxIterations: null,
+    maxJobMinutes: null,
+    branchPrefix: null,
+    skillsRepo: null,
+    referenceRepos: null,
+    sensitiveAddPatterns: null,
+    sensitiveAllowPatterns: null,
+    dependencyTokenScope: null,
+    memoryProviderId: null,
+    reviewers: null,
   };
 }
 
@@ -131,6 +150,7 @@ describe("selectBlockers", () => {
       { APP: makeMapping(3) },
       {},
       () => false,
+      () => null,
     );
     expect(blockers).toHaveLength(1);
     expect(blockers[0].reason).toBe("no-mapping");
@@ -144,6 +164,7 @@ describe("selectBlockers", () => {
       { APP: makeMapping(1) },
       { APP: 1 }, // at cap
       (id) => id === "1",
+      () => null,
     );
     expect(blockers).toHaveLength(1);
     expect(blockers[0].reason).toBe("dedup");
@@ -155,6 +176,7 @@ describe("selectBlockers", () => {
       { APP: makeMapping(2) },
       { APP: 2 },
       () => false,
+      () => null,
     );
     expect(blockers).toHaveLength(1);
     expect(blockers[0].reason).toBe("concurrency");
@@ -167,6 +189,7 @@ describe("selectBlockers", () => {
       { APP: makeMapping(3) },
       { APP: 1 },
       () => false,
+      () => null,
     );
     expect(blockers).toHaveLength(0);
   });
@@ -182,6 +205,7 @@ describe("selectBlockers", () => {
       { APP: makeMapping(1) },
       { APP: 1 }, // APP at cap
       (id) => id === "2",
+      () => null,
     );
     // issue "2" (APP-1) → dedup; issue "3" (API-1) → no-mapping; issues "1","4" → concurrency
     // sorted: concurrency/APP/APP-2, concurrency/APP/APP-3, dedup/APP/APP-1, no-mapping/API/API-1
@@ -190,6 +214,112 @@ describe("selectBlockers", () => {
     expect(blockers[1]).toMatchObject({ reason: "concurrency", issueIdentifier: "APP-3" });
     expect(blockers[2]).toMatchObject({ reason: "dedup", issueIdentifier: "APP-1" });
     expect(blockers[3]).toMatchObject({ reason: "no-mapping", issueIdentifier: "API-1" });
+  });
+
+  it("logs the exclusion with issue, team, count, and cap when a concurrency blocker fires", () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    selectBlockers(
+      [makeIssue("1", "APP-1", "APP")],
+      { APP: makeMapping(2) },
+      { APP: 2 },
+      () => false,
+      () => null,
+    );
+    expect(logSpy).toHaveBeenCalledWith(
+      "[poll-selection] Capacity exclusion: issue=APP-1 team=APP count=2 cap=2",
+    );
+    logSpy.mockRestore();
+  });
+
+  it("does not log an exclusion for an issue that clears the cap", () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    selectBlockers(
+      [makeIssue("1", "APP-1", "APP")],
+      { APP: makeMapping(3) },
+      { APP: 1 },
+      () => false,
+      () => null,
+    );
+    expect(logSpy).not.toHaveBeenCalled();
+    logSpy.mockRestore();
+  });
+});
+
+// AII-569: selectBlockers's concurrency check is fed the same DB-backed
+// dispatch_admissions reservation count acquireDispatch checks capacity against
+// (src/dispatch-admission.ts#count), never a tracker-label count — a stranded label
+// (never advanced, or advanced late) must not hide a real reservation, and a
+// reservation with no run ID yet (acquireDispatch's transaction commits before the
+// external launch call returns) must still count as used.
+describe("selectBlockers — reservation-backed concurrency, not tracker labels", () => {
+  let dbPath: string;
+  let dedup: typeof DedupModule;
+  let gate: typeof GateModule;
+  let admission: typeof AdmissionModule;
+  let breaker: typeof BreakerModule;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    dbPath = path.join(
+      os.tmpdir(),
+      `poll-selection-blockers-admission-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
+    );
+    process.env.DEDUP_DB_PATH = dbPath;
+    dedup = await import("../dedup.js");
+    gate = await import("../dispatch-gate.js");
+    admission = await import("../dispatch-admission.js");
+    breaker = await import("../dispatch-breaker.js");
+    breaker.initDispatchBreakerTable();
+  });
+
+  afterEach(() => {
+    dedup.closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  it("a prepared reservation with no run ID yet still blocks, even when the tracker label is stranded (idle)", () => {
+    const held = gate.acquireDispatch({
+      dispatchId: "prepared-1",
+      issueId: "AII-held",
+      issueIdentifier: "AII-held",
+      kind: "implementation",
+      teamKey: "AII",
+      maxInProgressAiIssues: 1,
+      backend: "fly-machines",
+    });
+    expect(held.ok).toBe(true);
+
+    // Tracker label snapshot says idle (0) — a stale/never-advanced label must not mask
+    // the live reservation.
+    const staleTrackerCounts = { AII: 0 };
+    const reservedCounts = { AII: admission.count("AII") };
+    expect(reservedCounts.AII).toBe(1);
+
+    const candidate = makeIssue("AII-2", "AII-2", "AII");
+    const usingStaleTracker = selectBlockers([candidate], { AII: makeMapping(1) }, staleTrackerCounts, () => false, () => null);
+    const usingReservations = selectBlockers([candidate], { AII: makeMapping(1) }, reservedCounts, () => false, () => null);
+
+    expect(usingStaleTracker).toHaveLength(0);
+    expect(usingReservations).toHaveLength(1);
+    expect(usingReservations[0].reason).toBe("concurrency");
+  });
+
+  it("releasing the reservation frees the slot for the next blocker check", () => {
+    const held = gate.acquireDispatch({
+      dispatchId: "prepared-2",
+      issueId: "AII-held-2",
+      issueIdentifier: "AII-held-2",
+      kind: "planning",
+      teamKey: "AII",
+      maxInProgressAiIssues: 1,
+      backend: "github-actions",
+    });
+    expect(held.ok).toBe(true);
+    if (held.ok) held.release("finalized");
+
+    const candidate = makeIssue("AII-3", "AII-3", "AII");
+    const blockers = selectBlockers([candidate], { AII: makeMapping(1) }, { AII: admission.count("AII") }, () => false, () => null);
+    expect(blockers).toHaveLength(0);
   });
 });
 
@@ -602,5 +732,246 @@ describe("planning context cache (AII-390)", () => {
     // The last entry (issue-PLANNING_CONTEXT_CACHE_MAX) should still be present.
     expect(getCachedPlanningContext(`issue-${PLANNING_CONTEXT_CACHE_MAX}`)).toBe(`ctx-${PLANNING_CONTEXT_CACHE_MAX}`);
     resetPlanningContextCache();
+  });
+});
+
+// AII-783: selectIssuesToDispatch stays a pure sizing function — these tests show that
+// poll() must feed it the DB-backed dispatch_admissions count (src/dispatch-admission.ts)
+// rather than the tracker-label snapshot, by exercising both against a real acquired
+// reservation. The tracker-label count remains available as a diagnostic only.
+describe("selectIssuesToDispatch — sized from DB-backed admission reservations, not tracker-label counts", () => {
+  let dbPath: string;
+  let dedup: typeof DedupModule;
+  let gate: typeof GateModule;
+  let admission: typeof AdmissionModule;
+  let breaker: typeof BreakerModule;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    dbPath = path.join(
+      os.tmpdir(),
+      `poll-selection-admission-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
+    );
+    process.env.DEDUP_DB_PATH = dbPath;
+    dedup = await import("../dedup.js");
+    gate = await import("../dispatch-gate.js");
+    admission = await import("../dispatch-admission.js");
+    breaker = await import("../dispatch-breaker.js");
+    breaker.initDispatchBreakerTable();
+  });
+
+  afterEach(() => {
+    dedup.closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  it("a live reservation excludes a candidate even when the tracker-label snapshot reports the team idle", () => {
+    const mapping = makeMapping(1);
+    const teamRepoMap = { AII: mapping };
+
+    const held = gate.acquireDispatch({
+      dispatchId: "held-1",
+      issueId: "AII-held",
+      issueIdentifier: "AII-held",
+      kind: "implementation",
+      teamKey: "AII",
+      maxInProgressAiIssues: 1,
+      backend: "fly-machines",
+    });
+    expect(held.ok).toBe(true);
+
+    // A stale/lagging tracker-label snapshot (e.g. the label hasn't propagated yet)
+    // reports the team as idle — selection must not trust it.
+    const staleTrackerCounts = { AII: 0 };
+    const admissionCounts = { AII: admission.count("AII") };
+    expect(admissionCounts.AII).toBe(1);
+
+    const candidate = makeIssue("AII-2", "AII-2", "AII");
+    const selectedUsingStaleTracker = selectIssuesToDispatch([candidate], teamRepoMap, staleTrackerCounts, () => false);
+    const selectedUsingAdmission = selectIssuesToDispatch([candidate], teamRepoMap, admissionCounts, () => false);
+
+    expect(selectedUsingStaleTracker).toEqual([candidate]);
+    expect(selectedUsingAdmission).toEqual([]);
+  });
+
+  it("releasing a reservation frees the DB-backed count for the next selection", () => {
+    const mapping = makeMapping(1);
+    const teamRepoMap = { AII: mapping };
+
+    const held = gate.acquireDispatch({
+      dispatchId: "held-2",
+      issueId: "AII-held-2",
+      issueIdentifier: "AII-held-2",
+      kind: "planning",
+      teamKey: "AII",
+      maxInProgressAiIssues: 1,
+      backend: "github-actions",
+    });
+    expect(held.ok).toBe(true);
+    if (held.ok) held.release("finalized");
+
+    const candidate = makeIssue("AII-3", "AII-3", "AII");
+    const selected = selectIssuesToDispatch([candidate], teamRepoMap, { AII: admission.count("AII") }, () => false);
+    expect(selected).toEqual([candidate]);
+  });
+});
+
+describe("tracker-scoped mapping match", () => {
+  const jiraEng: RepoMapping = { ...makeMapping(), ticketingProvider: "jira", ticketingConfig: { kind: "jira", jql: "project = ENG", repoFieldValue: "org/repo" } as RepoMapping["ticketingConfig"] };
+  const mappings = { ENG: jiraEng, APP: makeMapping() };
+  const snap = (over: Partial<AIImplementSnapshot> = {}): AIImplementSnapshot => ({
+    needsPlanning: [],
+    readyForImplementation: [],
+    inProgressCountsByScope: {},
+    parentsToFinalize: [],
+    ...over,
+  });
+
+  it("mappingForProvider returns the mapping only for its own tracker", () => {
+    expect(mappingForProvider("jira", "ENG", mappings)).toBe(jiraEng);
+    expect(mappingForProvider("linear", "ENG", mappings)).toBeNull();
+    expect(mappingForProvider("linear", "NOPE", mappings)).toBeNull();
+  });
+
+  it("drops a Linear issue that shares a key with a Jira mapping and reports it as foreign", () => {
+    const foreignReady = makeIssue("1", "ENG-1", "ENG");
+    const foreignPlan = makeIssue("2", "ENG-2", "ENG");
+    const { snapshot, foreign } = mergeProviderSnapshots(
+      [{ providerId: "linear", snapshot: snap({ readyForImplementation: [foreignReady], needsPlanning: [foreignPlan] }) }],
+      mappings,
+    );
+    expect(snapshot.readyForImplementation).toEqual([]);
+    expect(snapshot.needsPlanning).toEqual([]);
+    expect(foreign).toEqual([
+      { issue: foreignPlan, providerId: "linear", mappingProvider: "jira" },
+      { issue: foreignReady, providerId: "linear", mappingProvider: "jira" },
+    ]);
+  });
+
+  it("keeps the Jira mapping's own issues and unmapped keys", () => {
+    const own = makeIssue("1", "ENG-1", "ENG");
+    const unmapped = makeIssue("2", "UNK-1", "UNK");
+    const { snapshot, foreign } = mergeProviderSnapshots(
+      [
+        { providerId: "jira", snapshot: snap({ readyForImplementation: [own] }) },
+        { providerId: "linear", snapshot: snap({ readyForImplementation: [unmapped] }) },
+      ],
+      mappings,
+    );
+    expect(snapshot.readyForImplementation).toEqual([own, unmapped]);
+    expect(foreign).toEqual([]);
+  });
+
+  it("drops foreign parentsToFinalize and count keys, still summing same-tracker counts", () => {
+    const { snapshot, foreign } = mergeProviderSnapshots(
+      [
+        {
+          providerId: "linear",
+          snapshot: snap({
+            inProgressCountsByScope: { ENG: 2, APP: 1 },
+            parentsToFinalize: [
+              { issueId: "p1", identifier: "ENG-9", scopeKey: "ENG" },
+              { issueId: "p2", identifier: "APP-9", scopeKey: "APP" },
+            ],
+          }),
+        },
+        { providerId: "linear", snapshot: snap({ inProgressCountsByScope: { APP: 2 } }) },
+        { providerId: "jira", snapshot: snap({ inProgressCountsByScope: { ENG: 3 } }) },
+      ],
+      mappings,
+    );
+    expect(snapshot.inProgressCountsByScope).toEqual({ APP: 3, ENG: 3 });
+    expect(snapshot.parentsToFinalize).toEqual([{ issueId: "p2", identifier: "APP-9", scopeKey: "APP" }]);
+    expect(foreign).toEqual([]);
+  });
+
+  it("leaves a single-tracker snapshot unchanged", () => {
+    const a = makeIssue("1", "APP-1", "APP");
+    const b = makeIssue("2", "APP-2", "APP");
+    const { snapshot, foreign } = mergeProviderSnapshots(
+      [
+        { providerId: "linear", snapshot: snap({ readyForImplementation: [a], inProgressCountsByScope: { APP: 1 } }) },
+        { providerId: "linear", snapshot: snap({ readyForImplementation: [b], needsPlanning: [a], inProgressCountsByScope: { APP: 2 } }) },
+      ],
+      { APP: makeMapping() },
+    );
+    expect(snapshot).toEqual({
+      readyForImplementation: [a, b],
+      needsPlanning: [a],
+      inProgressCountsByScope: { APP: 3 },
+      parentsToFinalize: [],
+    });
+    expect(foreign).toEqual([]);
+  });
+
+  it("selectForeignTrackerBlockers emits one no-mapping blocker per foreign issue", () => {
+    const issue = makeIssue("1", "ENG-1", "ENG");
+    expect(selectForeignTrackerBlockers([{ issue, providerId: "linear", mappingProvider: "jira" }])).toEqual([
+      {
+        issueId: "1",
+        issueIdentifier: "ENG-1",
+        issueTitle: "ENG-1",
+        teamKey: "ENG",
+        reason: "no-mapping",
+        detail: "Mapping ENG is a jira mapping; this linear issue has no linear mapping.",
+      },
+    ]);
+  });
+});
+
+describe("selectBlockers parked", () => {
+  it("lists a parked issue with its failure count, not also as dedup or concurrency", () => {
+    const blockers = selectBlockers(
+      [makeIssue("1", "APP-1", "APP")],
+      { APP: makeMapping(1) },
+      { APP: 1 },
+      () => true,
+      () => ({ failures: 3 }),
+    );
+    expect(blockers).toEqual([
+      expect.objectContaining({
+        reason: "parked",
+        issueIdentifier: "APP-1",
+        detail: "Parked after 3 failed runs. Unpark it on the Runners page.",
+      }),
+    ]);
+  });
+});
+
+describe("diffSkipReasons", () => {
+  const parked = { id: "1", identifier: "AII-737", phase: "implementation" as const, reason: "parked" as const, failures: 3 };
+
+  it("logs a new parked reason once, not again with the same reason", () => {
+    const last = new Map();
+    expect(diffSkipReasons(last, [parked])).toEqual([
+      "[poll] Skipping AII-737: parked for implementation after 3 failed runs — unpark at /admin#runners",
+    ]);
+    expect(diffSkipReasons(last, [parked])).toEqual([]);
+  });
+
+  it("logs when the reason changes, and when the issue is no longer blocked", () => {
+    const last = new Map();
+    diffSkipReasons(last, [parked]);
+    expect(diffSkipReasons(last, [{ ...parked, reason: "dedup" }])).toEqual(["[poll] Skipping AII-737: dedup"]);
+    expect(diffSkipReasons(last, [{ ...parked, reason: null }])).toEqual(["[poll] AII-737 is no longer blocked"]);
+    expect(last.size).toBe(0);
+    expect(diffSkipReasons(last, [{ ...parked, reason: null }])).toEqual([]);
+  });
+
+  it("drops an issue that left the snapshot silently, then logs again if it returns blocked", () => {
+    const last = new Map();
+    diffSkipReasons(last, [{ ...parked, reason: "in_flight" }]);
+    expect(diffSkipReasons(last, [])).toEqual([]);
+    expect(last.size).toBe(0);
+    expect(diffSkipReasons(last, [{ ...parked, reason: "in_flight" }])).toEqual(["[poll] Skipping AII-737: in_flight"]);
+  });
+
+  it("keeps module-level state until reset", () => {
+    resetSkipReasons();
+    expect(logSkipReasons([parked])).toHaveLength(1);
+    expect(logSkipReasons([parked])).toEqual([]);
+    resetSkipReasons();
+    expect(logSkipReasons([parked])).toHaveLength(1);
+    resetSkipReasons();
   });
 });

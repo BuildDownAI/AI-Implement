@@ -3,6 +3,41 @@ import { safeDestroyMachine, sweepOrphanedMachines, getLastSweepAt } from "../re
 import type { ReaperConfig, ReaperHelpers } from "../reaper.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { ProviderRegistry } from "../providers/registry.js";
+import type { Job } from "../log.js";
+
+function makeJob(overrides: Partial<Job>): Job {
+  return {
+    id: 0,
+    issueId: "issue",
+    issueIdentifier: null,
+    issueTitle: null,
+    teamKey: null,
+    repo: null,
+    dispatchedAt: Date.now(),
+    dispatchId: null,
+    admissionGeneration: null,
+    dispatchNumber: 1,
+    issueState: null,
+    runId: null,
+    status: "dispatched",
+    conclusion: null,
+    prUrl: null,
+    completedAt: null,
+    notifiedAt: null,
+    machineNonce: null,
+    executionMode: "fly-machines",
+    machineId: null,
+    runnerMode: null,
+    sessionImage: null,
+    phase: "implementation",
+    contract: null,
+    groupingParent: false,
+    approved: false,
+    failure: null,
+    failureCommentedAt: null,
+    ...overrides,
+  };
+}
 
 function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
   return {
@@ -21,7 +56,6 @@ vi.mock("../log.js", () => ({
   getJobByMachineId: vi.fn(),
   updateJobStatus: vi.fn(),
   invalidateNonce: vi.fn(),
-  getInFlightKgRefreshJobs: vi.fn(() => []),
 }));
 
 vi.mock("../dedup.js", () => ({
@@ -32,10 +66,18 @@ vi.mock("../notify.js", () => ({
   notifyReaperBurst: vi.fn(() => Promise.resolve()),
 }));
 
+// Default: no admission row for any dispatchId, so every existing test (none of which
+// cares about the Restate-owner fence) keeps exercising the pre-AII-791 code paths.
+// Restate-owner tests below override this per-case with mockReturnValueOnce.
+vi.mock("../dispatch-admission.js", () => ({
+  read: vi.fn(() => null),
+}));
+
 import { listMachines, destroyMachine } from "../fly-machines.js";
-import { getJobByMachineId, updateJobStatus, invalidateNonce, getInFlightKgRefreshJobs } from "../log.js";
+import { getJobByMachineId, updateJobStatus, invalidateNonce } from "../log.js";
 import { recordReaperAction } from "../dedup.js";
 import { notifyReaperBurst } from "../notify.js";
+import { read as readAdmission } from "../dispatch-admission.js";
 
 const TOKEN = "fly-test-token";
 const APP = "test-sessions-app";
@@ -57,7 +99,6 @@ function makeHelpers(): ReaperHelpers {
     resetTicket: vi.fn(() => Promise.resolve()),
     postSessionLogs: vi.fn(() => Promise.resolve()),
     findPrForIssue: vi.fn(() => Promise.resolve(null)),
-    failKgRefreshMachine: vi.fn(),
   };
 }
 
@@ -137,21 +178,36 @@ describe("safeDestroyMachine", () => {
     );
   });
 
-  it("swallows 404 errors in live mode", async () => {
+  it("swallows 404 errors in live mode and reports the machine confirmed gone", async () => {
     vi.mocked(destroyMachine).mockRejectedValueOnce(new Error("404 not found"));
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const config = makeConfig(false);
 
-    await expect(safeDestroyMachine(config, "gone-machine", "orphan")).resolves.toBeUndefined();
+    await expect(safeDestroyMachine(config, "gone-machine", "orphan")).resolves.toBe(true);
     expect(consoleError).not.toHaveBeenCalled();
   });
 
-  it("returns early when token is missing", async () => {
+  it("returns early (not confirmed) when token is missing", async () => {
     const config: ReaperConfig = { ...makeConfig(false), flySessionsToken: null };
 
-    await safeDestroyMachine(config, "machine-abc", "orphan");
+    await expect(safeDestroyMachine(config, "machine-abc", "orphan")).resolves.toBe(false);
 
     expect(destroyMachine).not.toHaveBeenCalled();
+  });
+
+  it("resolves true on a successful live destroy", async () => {
+    vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
+    const config = makeConfig(false);
+
+    await expect(safeDestroyMachine(config, "machine-abc", "orphan")).resolves.toBe(true);
+  });
+
+  it("resolves false when destroy fails with a non-404 error", async () => {
+    vi.mocked(destroyMachine).mockRejectedValueOnce(new Error("500 internal error"));
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const config = makeConfig(false);
+
+    await expect(safeDestroyMachine(config, "machine-abc", "orphan")).resolves.toBe(false);
   });
 });
 
@@ -161,7 +217,7 @@ describe("sweepOrphanedMachines — orphan rule", () => {
   it("destroys orphaned machine in live mode", async () => {
     const machine = makeMachine("m-orphan");
     vi.mocked(listMachines).mockResolvedValueOnce([machine] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
+    vi.mocked(getJobByMachineId).mockReturnValue(null);
     vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
 
     await sweepOrphanedMachines(makeConfig(false), makeHelpers());
@@ -173,7 +229,7 @@ describe("sweepOrphanedMachines — orphan rule", () => {
   it("does not destroy orphaned machine in dry-run mode", async () => {
     const machine = makeMachine("m-orphan");
     vi.mocked(listMachines).mockResolvedValueOnce([machine] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
+    vi.mocked(getJobByMachineId).mockReturnValue(null);
 
     await sweepOrphanedMachines(makeConfig(true), makeHelpers());
 
@@ -183,7 +239,7 @@ describe("sweepOrphanedMachines — orphan rule", () => {
   it("records reaper action for orphaned machine", async () => {
     const machine = makeMachine("m-orphan");
     vi.mocked(listMachines).mockResolvedValueOnce([machine] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
+    vi.mocked(getJobByMachineId).mockReturnValue(null);
     vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
 
     await sweepOrphanedMachines(makeConfig(false), makeHelpers());
@@ -198,7 +254,7 @@ describe("sweepOrphanedMachines — orphan rule", () => {
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const machine = makeMachine("m-orphan");
     vi.mocked(listMachines).mockResolvedValueOnce([machine] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
+    vi.mocked(getJobByMachineId).mockReturnValue(null);
 
     await sweepOrphanedMachines(makeConfig(true), makeHelpers());
 
@@ -211,7 +267,7 @@ describe("sweepOrphanedMachines — orphan rule", () => {
 // ---------- sweepOrphanedMachines — stale terminal job ----------
 
 describe("sweepOrphanedMachines — stale terminal job rule", () => {
-  const terminalJob = {
+  const terminalJob = makeJob({
     id: 1,
     issueId: "issue-1",
     issueIdentifier: "ENG-1",
@@ -231,7 +287,7 @@ describe("sweepOrphanedMachines — stale terminal job rule", () => {
     executionMode: "fly-machines",
     machineId: "m-terminal",
     runnerMode: "autonomous",
-  };
+  });
 
   it("destroys stale terminal-job machine in live mode", async () => {
     const machine = makeMachine("m-terminal");
@@ -291,7 +347,7 @@ describe("sweepOrphanedMachines — stale terminal job rule", () => {
 // ---------- sweepOrphanedMachines — side effects guarded in dry-run ----------
 
 describe("sweepOrphanedMachines — side effects skipped in dry-run", () => {
-  const inflight = {
+  const inflight = makeJob({
     id: 2,
     issueId: "issue-2",
     issueIdentifier: "ENG-2",
@@ -311,7 +367,7 @@ describe("sweepOrphanedMachines — side effects skipped in dry-run", () => {
     executionMode: "fly-machines",
     machineId: "m-aged",
     runnerMode: "autonomous",
-  };
+  });
 
   it("skips updateJobStatus and invalidateNonce in dry-run for max-age rule", async () => {
     const oldMachine = makeMachine("m-aged", {
@@ -339,9 +395,180 @@ describe("sweepOrphanedMachines — side effects skipped in dry-run", () => {
 
     await sweepOrphanedMachines(makeConfig(false), helpers);
 
-    expect(updateJobStatus).toHaveBeenCalledWith(inflight.id, "timed_out", "machine_max_age_sweep");
+    expect(updateJobStatus).toHaveBeenCalledWith(inflight.id, "timed_out", "machine_max_age_sweep", undefined, { backendTerminated: true });
     expect(invalidateNonce).toHaveBeenCalledWith(inflight.id);
     expect(helpers.resetTicket).toHaveBeenCalledWith(inflight);
+  });
+
+  // AII-783 gap-fill (review finding on PR #681): a destroy call that fails (and isn't a
+  // 404-already-gone) must not read as verified termination — log.ts's updateJobStatus
+  // only releases the admission reservation when skipAdmissionRelease is unset/false, so
+  // this uncertain case must be written with it set.
+  it("marks skipAdmissionRelease when the machine destroy fails with a non-404 error (max-age rule)", async () => {
+    const oldMachine = makeMachine("m-aged", {
+      created_at: new Date(Date.now() - 5 * 3600_000).toISOString(),
+    });
+    vi.mocked(listMachines).mockResolvedValueOnce([oldMachine] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(inflight);
+    vi.mocked(destroyMachine).mockRejectedValueOnce(new Error("500 internal error"));
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const helpers = makeHelpers();
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    expect(updateJobStatus).toHaveBeenCalledWith(
+      inflight.id,
+      "timed_out",
+      "machine_max_age_sweep",
+      undefined,
+      { skipAdmissionRelease: true },
+    );
+    // The job is still finalized (ticket reset, nonce invalidated) — only the admission
+    // release is withheld, not the rest of the sweep's cleanup.
+    expect(invalidateNonce).toHaveBeenCalledWith(inflight.id);
+    expect(helpers.resetTicket).toHaveBeenCalledWith(inflight);
+  });
+
+  it("does not mark skipAdmissionRelease when the machine destroy 404s (already gone)", async () => {
+    const oldMachine = makeMachine("m-aged", {
+      created_at: new Date(Date.now() - 5 * 3600_000).toISOString(),
+    });
+    vi.mocked(listMachines).mockResolvedValueOnce([oldMachine] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(inflight);
+    vi.mocked(destroyMachine).mockRejectedValueOnce(new Error("404 not found"));
+    const helpers = makeHelpers();
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    expect(updateJobStatus).toHaveBeenCalledWith(inflight.id, "timed_out", "machine_max_age_sweep", undefined, { backendTerminated: true });
+  });
+});
+
+// ---------- sweepOrphanedMachines — Restate-owned reservation fence (AII-791) ----------
+
+describe("sweepOrphanedMachines — Restate-owned reservation fence (AII-791)", () => {
+  function restateOwnedRecord(attemptId = "attempt-1") {
+    return { lifecycleOwner: { kind: "restate", attemptId } } as never;
+  }
+
+  const inflightJob = makeJob({
+    id: 2,
+    issueId: "issue-2",
+    issueIdentifier: "ENG-2",
+    issueTitle: "Another",
+    teamKey: "ENG",
+    repo: "org/repo",
+    dispatchedAt: Date.now() - 6 * 3600_000,
+    dispatchNumber: 2,
+    issueState: null,
+    runId: null,
+    status: "running" as const,
+    conclusion: null,
+    prUrl: null,
+    completedAt: null,
+    notifiedAt: null,
+    machineNonce: "nonce-abc",
+    executionMode: "fly-machines",
+    machineId: "m-aged",
+    runnerMode: "autonomous",
+    sessionImage: null,
+    phase: "implementation",
+    contract: null,
+    groupingParent: false,
+    approved: false,
+    failure: null,
+    failureCommentedAt: null,
+  });
+
+  it("does not destroy or finalize a Restate-owned max-age-exceeded machine", async () => {
+    const restateJob = { ...inflightJob, id: 30, dispatchId: "disp-restate-1" };
+    const oldMachine = makeMachine("m-restate-aged", {
+      created_at: new Date(Date.now() - 5 * 3600_000).toISOString(),
+    });
+    vi.mocked(listMachines).mockResolvedValueOnce([oldMachine] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(restateJob);
+    vi.mocked(readAdmission).mockReturnValueOnce(restateOwnedRecord());
+    const helpers = makeHelpers();
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    expect(destroyMachine).not.toHaveBeenCalled();
+    expect(updateJobStatus).not.toHaveBeenCalled();
+    expect(invalidateNonce).not.toHaveBeenCalled();
+    expect(helpers.resetTicket).not.toHaveBeenCalled();
+    expect(recordReaperAction).not.toHaveBeenCalled();
+  });
+
+  it("does not destroy or finalize a young, in-flight Restate-owned machine even though it resolves an admission row", async () => {
+    const restateJob = { ...inflightJob, id: 31, dispatchId: "disp-restate-2" };
+    const machine = makeMachine("m-restate-terminal");
+    vi.mocked(listMachines).mockResolvedValueOnce([machine] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(restateJob);
+    vi.mocked(readAdmission).mockReturnValueOnce(restateOwnedRecord());
+
+    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
+
+    expect(destroyMachine).not.toHaveBeenCalled();
+    expect(updateJobStatus).not.toHaveBeenCalled();
+    expect(invalidateNonce).not.toHaveBeenCalled();
+  });
+
+  it("does not destroy a Restate-owned stale-terminal-job machine", async () => {
+    const restateTerminalJob = makeJob({
+      id: 32,
+      issueId: "issue-restate",
+      issueIdentifier: "ENG-9",
+      issueTitle: "Restate-owned",
+      teamKey: "ENG",
+      repo: "org/repo",
+      dispatchedAt: Date.now() - 3600_000,
+      dispatchId: "disp-restate-3",
+      dispatchNumber: 1,
+      issueState: null,
+      runId: null,
+      status: "completed" as const,
+      conclusion: "success",
+      prUrl: null,
+      completedAt: Date.now() - 1800_000,
+      notifiedAt: null,
+      machineNonce: null,
+      executionMode: "fly-machines",
+      machineId: "m-restate-stale",
+      runnerMode: "autonomous",
+      sessionImage: null,
+      phase: "implementation",
+      contract: null,
+      groupingParent: false,
+      approved: false,
+      failure: null,
+      failureCommentedAt: null,
+    });
+    const machine = makeMachine("m-restate-stale");
+    vi.mocked(listMachines).mockResolvedValueOnce([machine] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(restateTerminalJob);
+    vi.mocked(readAdmission).mockReturnValueOnce(restateOwnedRecord());
+
+    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
+
+    expect(destroyMachine).not.toHaveBeenCalled();
+    expect(recordReaperAction).not.toHaveBeenCalled();
+  });
+
+  it("still destroys a Legacy-owned max-age-exceeded machine (regression: owner check does not over-fence)", async () => {
+    const legacyJob = { ...inflightJob, id: 33, dispatchId: "disp-legacy-1" };
+    const oldMachine = makeMachine("m-legacy-aged", {
+      created_at: new Date(Date.now() - 5 * 3600_000).toISOString(),
+    });
+    vi.mocked(listMachines).mockResolvedValueOnce([oldMachine] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(legacyJob);
+    vi.mocked(readAdmission).mockReturnValueOnce({ lifecycleOwner: { kind: "legacy" } } as never);
+    vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
+    const helpers = makeHelpers();
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    expect(destroyMachine).toHaveBeenCalledWith(TOKEN, APP, "m-legacy-aged");
+    expect(updateJobStatus).toHaveBeenCalledWith(legacyJob.id, "timed_out", "machine_max_age_sweep", undefined, { backendTerminated: true });
   });
 });
 
@@ -387,7 +614,7 @@ describe("sweepOrphanedMachines — lastSweepAt", () => {
   it("sets lastSweepAt after a sweep that destroys machines", async () => {
     const machine = makeMachine("m-orphan");
     vi.mocked(listMachines).mockResolvedValueOnce([machine] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
+    vi.mocked(getJobByMachineId).mockReturnValue(null);
     vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
 
     const before = Date.now();
@@ -403,7 +630,7 @@ describe("sweepOrphanedMachines — threshold alert", () => {
   it("fires notifyReaperBurst when destroyed count exceeds threshold", async () => {
     const machines = Array.from({ length: 3 }, (_, i) => makeMachine(`m-burst-${i}`));
     vi.mocked(listMachines).mockResolvedValueOnce(machines as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
+    vi.mocked(getJobByMachineId).mockReturnValue(null);
     vi.mocked(destroyMachine).mockResolvedValue(undefined);
 
     const config = makeConfig(false, {
@@ -423,7 +650,7 @@ describe("sweepOrphanedMachines — threshold alert", () => {
   it("does not fire notifyReaperBurst when destroyed count is at or below threshold", async () => {
     const machines = [makeMachine("m-solo")];
     vi.mocked(listMachines).mockResolvedValueOnce(machines as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
+    vi.mocked(getJobByMachineId).mockReturnValue(null);
     vi.mocked(destroyMachine).mockResolvedValue(undefined);
 
     const config = makeConfig(false, {
@@ -438,7 +665,7 @@ describe("sweepOrphanedMachines — threshold alert", () => {
   it("does not fire notifyReaperBurst in dry-run mode even when threshold exceeded", async () => {
     const machines = Array.from({ length: 5 }, (_, i) => makeMachine(`m-dry-${i}`));
     vi.mocked(listMachines).mockResolvedValueOnce(machines as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
+    vi.mocked(getJobByMachineId).mockReturnValue(null);
 
     const config = makeConfig(true, {
       reaperAlertThreshold: 1,
@@ -452,7 +679,7 @@ describe("sweepOrphanedMachines — threshold alert", () => {
   it("does not fire notifyReaperBurst when webhook URL is not set", async () => {
     const machines = Array.from({ length: 5 }, (_, i) => makeMachine(`m-nowh-${i}`));
     vi.mocked(listMachines).mockResolvedValueOnce(machines as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
+    vi.mocked(getJobByMachineId).mockReturnValue(null);
     vi.mocked(destroyMachine).mockResolvedValue(undefined);
 
     const config = makeConfig(false, { reaperAlertThreshold: 1, notifyWebhookUrl: null });
@@ -462,9 +689,9 @@ describe("sweepOrphanedMachines — threshold alert", () => {
   });
 });
 
-// ---------- sweepOrphanedMachines — kg-refresh machine-absent rule ----------
+// ---------- sweepOrphanedMachines — kg-refresh job fixture ----------
 
-const kgRefreshJob = {
+const kgRefreshJob = makeJob({
   id: 10,
   issueId: "kg-refresh",
   issueIdentifier: null,
@@ -489,173 +716,6 @@ const kgRefreshJob = {
   phase: "kg-refresh",
   contract: null,
   groupingParent: false,
-};
-
-describe("sweepOrphanedMachines — kg-refresh machine-absent rule", () => {
-  it("calls failKgRefreshMachine when machine absent", async () => {
-    // No machines in the registry — m-kg is absent
-    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([kgRefreshJob]);
-    const helpers = makeHelpers();
-
-    await sweepOrphanedMachines(makeConfig(false), helpers);
-
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledOnce();
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(kgRefreshJob);
-  });
-
-  it("records reaper action with ruleMatched=kg-refresh-machine-absent", async () => {
-    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([kgRefreshJob]);
-
-    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
-
-    expect(recordReaperAction).toHaveBeenCalledWith(
-      expect.objectContaining({
-        ruleMatched: "kg-refresh-machine-absent",
-        machineId: "m-kg",
-        tenantId: null,
-        issueIdentifier: null,
-        dryRun: false,
-      }),
-    );
-  });
-
-  it("logs structured [reaper] line for absent kg-refresh machine", async () => {
-    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([kgRefreshJob]);
-
-    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
-
-    expect(consoleSpy).toHaveBeenCalledWith(
-      expect.stringMatching(/\[reaper\] rule=kg-refresh-machine-absent machine=m-kg job=10/),
-    );
-  });
-
-  it("does not call failKgRefreshMachine when machine is present", async () => {
-    // Machine m-kg is alive in the registry
-    const machine = makeMachine("m-kg");
-    vi.mocked(listMachines).mockResolvedValueOnce([machine] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([kgRefreshJob]);
-    vi.mocked(destroyMachine).mockResolvedValue(undefined);
-    const helpers = makeHelpers();
-
-    await sweepOrphanedMachines(makeConfig(false), helpers);
-
-    expect(helpers.failKgRefreshMachine).not.toHaveBeenCalled();
-  });
-
-  it("dry-run: records action but does not call failKgRefreshMachine", async () => {
-    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([kgRefreshJob]);
-    const helpers = makeHelpers();
-
-    await sweepOrphanedMachines(makeConfig(true), helpers);
-
-    expect(helpers.failKgRefreshMachine).not.toHaveBeenCalled();
-    expect(recordReaperAction).toHaveBeenCalledWith(
-      expect.objectContaining({ ruleMatched: "kg-refresh-machine-absent", dryRun: true }),
-    );
-    expect(consoleSpy).toHaveBeenCalledWith(
-      expect.stringMatching(/dry_run=true/),
-    );
-  });
-
-  it("skips job with no machineId (local Docker)", async () => {
-    const localJob = { ...kgRefreshJob, machineId: null };
-    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([localJob]);
-    const helpers = makeHelpers();
-
-    await sweepOrphanedMachines(makeConfig(false), helpers);
-
-    expect(helpers.failKgRefreshMachine).not.toHaveBeenCalled();
-    expect(recordReaperAction).not.toHaveBeenCalled();
-  });
-
-  it("no error when failKgRefreshMachine is absent from helpers", async () => {
-    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([kgRefreshJob]);
-    const helpers: ReaperHelpers = {
-      resetTicket: vi.fn(() => Promise.resolve()),
-      postSessionLogs: vi.fn(() => Promise.resolve()),
-      findPrForIssue: vi.fn(() => Promise.resolve(null)),
-      // failKgRefreshMachine intentionally absent
-    };
-
-    await expect(sweepOrphanedMachines(makeConfig(false), helpers)).resolves.toBeUndefined();
-  });
-
-  it("handles multiple running kg-refresh jobs — absent fires, present skips", async () => {
-    const machine2 = makeMachine("m-kg2");
-    vi.mocked(listMachines).mockResolvedValueOnce([machine2] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
-    const job2 = { ...kgRefreshJob, id: 11, machineId: "m-kg2" };
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([kgRefreshJob, job2]);
-    vi.mocked(destroyMachine).mockResolvedValue(undefined);
-    const helpers = makeHelpers();
-
-    await sweepOrphanedMachines(makeConfig(false), helpers);
-
-    // Only m-kg is absent; m-kg2 is alive
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledOnce();
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(kgRefreshJob);
-  });
-
-  it("issue-keyed jobs are unaffected by kg-refresh sweep (regression pin)", async () => {
-    // An issue-keyed machine plus a kg-refresh machine; kg-refresh machine is absent.
-    const issueMachine = makeMachine("m-issue");
-    const issueJob = {
-      id: 20,
-      issueId: "issue-123",
-      issueIdentifier: "ENG-100",
-      issueTitle: "Fix thing",
-      teamKey: "ENG",
-      repo: "org/repo",
-      dispatchedAt: Date.now() - 60_000,
-      dispatchId: null,
-      dispatchNumber: 1,
-      issueState: null,
-      runId: null,
-      status: "running" as const,
-      conclusion: null,
-      prUrl: null,
-      completedAt: null,
-      notifiedAt: null,
-      machineNonce: "nonce-issue",
-      executionMode: "fly-machines",
-      machineId: "m-issue",
-      runnerMode: "autonomous",
-      sessionImage: null,
-      phase: "implementation",
-      contract: null,
-      groupingParent: false,
-    };
-    vi.mocked(listMachines).mockResolvedValueOnce([issueMachine] as never);
-    vi.mocked(getJobByMachineId).mockImplementation((id) =>
-      id === "m-issue" ? issueJob : null,
-    );
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([kgRefreshJob]);
-    vi.mocked(destroyMachine).mockResolvedValue(undefined);
-    const helpers = makeHelpers();
-
-    await sweepOrphanedMachines(makeConfig(false), helpers);
-
-    // Issue-keyed machine is alive — no destruction
-    expect(destroyMachine).not.toHaveBeenCalled();
-    // kg-refresh machine absent — failKgRefreshMachine called
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledOnce();
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(kgRefreshJob);
-  });
 });
 
 // ---------- sweepOrphanedMachines — kg-refresh max-age rule ----------
@@ -674,27 +734,23 @@ describe("sweepOrphanedMachines — kg-refresh max-age rule", () => {
     vi.mocked(listMachines).mockResolvedValueOnce([oldMachine] as never);
     vi.mocked(getJobByMachineId).mockReturnValue(kgRefreshInflight);
     vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([]);
 
     await sweepOrphanedMachines(makeConfig(false), makeHelpers());
 
     expect(destroyMachine).toHaveBeenCalledWith(TOKEN, APP, "m-kg");
   });
 
-  it("calls failKgRefreshMachine (not resetTicket) for an aged-out kg-refresh machine", async () => {
+  it("does not call resetTicket for an aged-out kg-refresh machine", async () => {
     const oldMachine = makeMachine("m-kg", {
       created_at: new Date(Date.now() - 5 * 3600_000).toISOString(),
     });
     vi.mocked(listMachines).mockResolvedValueOnce([oldMachine] as never);
     vi.mocked(getJobByMachineId).mockReturnValue(kgRefreshInflight);
     vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([]);
     const helpers = makeHelpers();
 
     await sweepOrphanedMachines(makeConfig(false), helpers);
 
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledOnce();
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(kgRefreshInflight);
     expect(helpers.resetTicket).not.toHaveBeenCalled();
   });
 
@@ -705,7 +761,6 @@ describe("sweepOrphanedMachines — kg-refresh max-age rule", () => {
     vi.mocked(listMachines).mockResolvedValueOnce([oldMachine] as never);
     vi.mocked(getJobByMachineId).mockReturnValue(kgRefreshInflight);
     vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([]);
     const helpers = makeHelpers();
 
     await sweepOrphanedMachines(makeConfig(false), helpers);
@@ -720,16 +775,15 @@ describe("sweepOrphanedMachines — kg-refresh max-age rule", () => {
     vi.mocked(listMachines).mockResolvedValueOnce([oldMachine] as never);
     vi.mocked(getJobByMachineId).mockReturnValue(kgRefreshInflight);
     vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([]);
 
     await sweepOrphanedMachines(makeConfig(false), makeHelpers());
 
-    expect(updateJobStatus).toHaveBeenCalledWith(kgRefreshInflight.id, "timed_out", "machine_max_age_sweep");
+    expect(updateJobStatus).toHaveBeenCalledWith(kgRefreshInflight.id, "timed_out", "machine_max_age_sweep", undefined, { backendTerminated: true });
     expect(invalidateNonce).toHaveBeenCalledWith(kgRefreshInflight.id);
   });
 
-  it("issue-keyed max-age still calls resetTicket and NOT failKgRefreshMachine (regression pin)", async () => {
-    const issueJob = {
+  it("issue-keyed max-age still calls resetTicket (regression pin)", async () => {
+    const issueJob = makeJob({
       id: 20,
       issueId: "issue-100",
       issueIdentifier: "ENG-100",
@@ -754,181 +808,18 @@ describe("sweepOrphanedMachines — kg-refresh max-age rule", () => {
       phase: "implementation",
       contract: null,
       groupingParent: false,
-    };
+    });
     const oldMachine = makeMachine("m-issue", {
       created_at: new Date(Date.now() - 5 * 3600_000).toISOString(),
     });
     vi.mocked(listMachines).mockResolvedValueOnce([oldMachine] as never);
     vi.mocked(getJobByMachineId).mockReturnValue(issueJob);
     vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([]);
     const helpers = makeHelpers();
 
     await sweepOrphanedMachines(makeConfig(false), helpers);
 
     expect(helpers.resetTicket).toHaveBeenCalledWith(issueJob);
-    expect(helpers.failKgRefreshMachine).not.toHaveBeenCalled();
-  });
-});
-
-// ---------- sweepOrphanedMachines — kg-refresh stopped/failed machine triggers close ----------
-
-describe("sweepOrphanedMachines — kg-refresh stopped/failed machine triggers close", () => {
-  it("stopped machine present in registry still triggers sweep close", async () => {
-    const machine = makeMachine("m-kg", { state: "stopped" });
-    vi.mocked(listMachines).mockResolvedValueOnce([machine] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([kgRefreshJob]);
-    vi.mocked(destroyMachine).mockResolvedValue(undefined);
-    const helpers = makeHelpers();
-
-    await sweepOrphanedMachines(makeConfig(false), helpers);
-
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledOnce();
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(kgRefreshJob);
-    expect(recordReaperAction).toHaveBeenCalledWith(
-      expect.objectContaining({ ruleMatched: "kg-refresh-machine-absent", dryRun: false }),
-    );
-  });
-
-  it("failed machine present in registry still triggers sweep close", async () => {
-    const machine = makeMachine("m-kg", { state: "failed" });
-    vi.mocked(listMachines).mockResolvedValueOnce([machine] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([kgRefreshJob]);
-    vi.mocked(destroyMachine).mockResolvedValue(undefined);
-    const helpers = makeHelpers();
-
-    await sweepOrphanedMachines(makeConfig(false), helpers);
-
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledOnce();
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(kgRefreshJob);
-    expect(recordReaperAction).toHaveBeenCalledWith(
-      expect.objectContaining({ ruleMatched: "kg-refresh-machine-absent", dryRun: false }),
-    );
-  });
-
-  it("started machine mid-ingest is never reaped (regression pin)", async () => {
-    const machine = makeMachine("m-kg"); // default state: "started"
-    vi.mocked(listMachines).mockResolvedValueOnce([machine] as never);
-    vi.mocked(getJobByMachineId).mockImplementation((id) => (id === "m-kg" ? kgRefreshJob : null));
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([kgRefreshJob]);
-    const helpers = makeHelpers();
-
-    await sweepOrphanedMachines(makeConfig(false), helpers);
-
-    expect(helpers.failKgRefreshMachine).not.toHaveBeenCalled();
-    expect(destroyMachine).not.toHaveBeenCalled();
-  });
-});
-
-// ---------- sweepOrphanedMachines — kg-refresh bootstrap deadline ----------
-
-describe("sweepOrphanedMachines — kg-refresh bootstrap deadline", () => {
-  it("dispatched row with null machineId past deadline closes with bootstrap_timeout", async () => {
-    const dispatchedJob = { ...kgRefreshJob, status: "dispatched" as const, machineId: null, dispatchedAt: Date.now() - 10 * 60_000 };
-    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([dispatchedJob]);
-    const helpers = makeHelpers();
-
-    await sweepOrphanedMachines(makeConfig(false), helpers);
-
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledOnce();
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(dispatchedJob, { failureCode: "bootstrap_timeout" });
-    expect(recordReaperAction).toHaveBeenCalledWith(
-      expect.objectContaining({ ruleMatched: "kg-refresh-bootstrap-timeout", dryRun: false }),
-    );
-  });
-
-  it("dispatched row with null machineId within deadline is skipped", async () => {
-    const dispatchedJob = { ...kgRefreshJob, status: "dispatched" as const, machineId: null, dispatchedAt: Date.now() - 60_000 };
-    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([dispatchedJob]);
-    const helpers = makeHelpers();
-
-    await sweepOrphanedMachines(makeConfig(false), helpers);
-
-    expect(helpers.failKgRefreshMachine).not.toHaveBeenCalled();
-    expect(recordReaperAction).not.toHaveBeenCalled();
-  });
-
-  it("dispatched row with machineId past deadline closes via bootstrap (not double-fired)", async () => {
-    const dispatchedJob = { ...kgRefreshJob, status: "dispatched" as const, machineId: "m-kg", dispatchedAt: Date.now() - 10 * 60_000 };
-    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([dispatchedJob]);
-    const helpers = makeHelpers();
-
-    await sweepOrphanedMachines(makeConfig(false), helpers);
-
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledOnce();
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(dispatchedJob, { failureCode: "bootstrap_timeout" });
-  });
-
-  it("dry-run: bootstrap timeout records action but does not call failKgRefreshMachine", async () => {
-    const dispatchedJob = { ...kgRefreshJob, status: "dispatched" as const, machineId: null, dispatchedAt: Date.now() - 10 * 60_000 };
-    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([dispatchedJob]);
-    const helpers = makeHelpers();
-
-    await sweepOrphanedMachines(makeConfig(true), helpers);
-
-    expect(recordReaperAction).toHaveBeenCalledWith(
-      expect.objectContaining({ ruleMatched: "kg-refresh-bootstrap-timeout", dryRun: true }),
-    );
-    expect(helpers.failKgRefreshMachine).not.toHaveBeenCalled();
-  });
-
-  it("dispatched row with machineId in 'created' state within deadline is skipped", async () => {
-    // Machine is still booting (created state); job is within the grace period.
-    // Neither bootstrap-timeout nor machine-absent should fire.
-    const dispatchedJob = { ...kgRefreshJob, status: "dispatched" as const, machineId: "m-kg", dispatchedAt: Date.now() - 60_000 };
-    const createdMachine = makeMachine("m-kg", { state: "created" });
-    vi.mocked(listMachines).mockResolvedValueOnce([createdMachine] as never);
-    vi.mocked(getJobByMachineId).mockImplementation((id) => (id === "m-kg" ? dispatchedJob : null));
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([dispatchedJob]);
-    const helpers = makeHelpers();
-
-    await sweepOrphanedMachines(makeConfig(false), helpers);
-
-    expect(helpers.failKgRefreshMachine).not.toHaveBeenCalled();
-    expect(recordReaperAction).not.toHaveBeenCalled();
-  });
-
-  it("dispatched row with machineId in 'starting' state within deadline is skipped", async () => {
-    const dispatchedJob = { ...kgRefreshJob, status: "dispatched" as const, machineId: "m-kg", dispatchedAt: Date.now() - 60_000 };
-    const startingMachine = makeMachine("m-kg", { state: "starting" });
-    vi.mocked(listMachines).mockResolvedValueOnce([startingMachine] as never);
-    vi.mocked(getJobByMachineId).mockImplementation((id) => (id === "m-kg" ? dispatchedJob : null));
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([dispatchedJob]);
-    const helpers = makeHelpers();
-
-    await sweepOrphanedMachines(makeConfig(false), helpers);
-
-    expect(helpers.failKgRefreshMachine).not.toHaveBeenCalled();
-    expect(recordReaperAction).not.toHaveBeenCalled();
-  });
-
-  it("running row past 5 min triggers machine-absent path, not bootstrap", async () => {
-    const runningJob = { ...kgRefreshJob, status: "running" as const, machineId: "m-kg", dispatchedAt: Date.now() - 10 * 60_000 };
-    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([runningJob]);
-    const helpers = makeHelpers();
-
-    await sweepOrphanedMachines(makeConfig(false), helpers);
-
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledOnce();
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(runningJob);
-    expect(recordReaperAction).toHaveBeenCalledWith(
-      expect.objectContaining({ ruleMatched: "kg-refresh-machine-absent" }),
-    );
-    expect(recordReaperAction).not.toHaveBeenCalledWith(
-      expect.objectContaining({ ruleMatched: "kg-refresh-bootstrap-timeout" }),
-    );
   });
 });
 
@@ -941,7 +832,6 @@ describe("sweepOrphanedMachines — kg-refresh issue-terminal exclusion", () => 
     const machine = makeMachine("m-kg");
     vi.mocked(listMachines).mockResolvedValueOnce([machine] as never);
     vi.mocked(getJobByMachineId).mockReturnValue(kgRefreshJob);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([]);
     const fakeProv = new FakeProvider();
     const fetchSpy = vi.spyOn(fakeProv, "fetchLifecycleStates");
     const registry = makeFakeRegistry(fakeProv);
@@ -958,48 +848,98 @@ describe("sweepOrphanedMachines — kg-refresh issue-terminal exclusion", () => 
   });
 });
 
-// ---------- sweepOrphanedKgRefreshJobs — GHA rows skipped by reaper ----------
+// ---------- sweepOrphanedMachines — durable-runner machines ----------
 
-describe("sweepOrphanedKgRefreshJobs — GHA rows skipped by reaper", () => {
-  it("GHA row (any age, any runId) is skipped — no failKgRefreshMachine, no reaper action", async () => {
-    const ghaRow = {
-      ...kgRefreshJob,
-      id: 30,
-      executionMode: "github-actions",
-      machineId: null,
-      runId: 12345,
-      repo: "owner/kg-repo",
-      dispatchedAt: Date.now() - 10 * 60_000,
-    };
-    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([ghaRow]);
-    const helpers = makeHelpers();
+describe("sweepOrphanedMachines — durable-runner machines", () => {
+  const terminalJob = makeJob({ id: 7, status: "completed", teamKey: "ENG", issueIdentifier: "ENG-7" });
 
-    await sweepOrphanedMachines(makeConfig(false), helpers);
+  function durableMachine(id: string, extra: Record<string, string> = {}, purpose = "durable-runner") {
+    return makeMachine(id, {
+      config: {
+        ...makeMachine(id).config,
+        metadata: { orchestrator_app: "my-orchestrator", purpose, ...extra },
+      },
+    });
+  }
+  const nowSec = () => Math.floor(Date.now() / 1000);
 
-    expect(helpers.failKgRefreshMachine).not.toHaveBeenCalled();
+  it("skips a durable-runner machine with no durable_until, recording nothing", async () => {
+    vi.mocked(listMachines).mockResolvedValueOnce([durableMachine("m-d")] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(terminalJob);
+    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
+    expect(destroyMachine).not.toHaveBeenCalled();
     expect(recordReaperAction).not.toHaveBeenCalled();
   });
 
-  it("GHA row with null runId past 10 min is also skipped — monitor owns it now", async () => {
-    const ghaRow = {
-      ...kgRefreshJob,
-      id: 31,
-      executionMode: "github-actions",
-      machineId: null,
-      runId: null,
-      repo: "owner/kg-repo",
-      dispatchedAt: Date.now() - 10 * 60_000,
-    };
-    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
-    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
-    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([ghaRow]);
-    const helpers = makeHelpers();
-
-    await sweepOrphanedMachines(makeConfig(false), helpers);
-
-    expect(helpers.failKgRefreshMachine).not.toHaveBeenCalled();
+  it("skips a durable-runner machine with no job row (not an orphan)", async () => {
+    vi.mocked(listMachines).mockResolvedValueOnce([durableMachine("m-d")] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(null);
+    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
+    expect(destroyMachine).not.toHaveBeenCalled();
     expect(recordReaperAction).not.toHaveBeenCalled();
+  });
+
+  it("skips a durable-runner machine whose durable_until is in the future", async () => {
+    const m = durableMachine("m-d", { durable_until: String(nowSec() + 3600) });
+    vi.mocked(listMachines).mockResolvedValueOnce([m] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(terminalJob);
+    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
+    expect(destroyMachine).not.toHaveBeenCalled();
+    expect(recordReaperAction).not.toHaveBeenCalled();
+  });
+
+  it("destroys a durable-runner machine past durable_until with rule durable-expired", async () => {
+    const m = durableMachine("m-d", { durable_until: String(nowSec() - 3600) });
+    vi.mocked(listMachines).mockResolvedValueOnce([m] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(terminalJob);
+    vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
+    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
+    expect(destroyMachine).toHaveBeenCalledWith(TOKEN, APP, "m-d");
+    expect(recordReaperAction).toHaveBeenCalledTimes(1);
+    expect(recordReaperAction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ruleMatched: "durable-expired",
+        machineId: "m-d",
+        tenantId: null,
+        issueIdentifier: null,
+        ageSeconds: expect.any(Number),
+        dryRun: false,
+      }),
+    );
+  });
+
+  it.each(["soon", "", "NaN"])("treats durable_until %j as expired with one warning", async (bad) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.mocked(listMachines).mockResolvedValueOnce([durableMachine("m-d", { durable_until: bad })] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(terminalJob);
+    vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
+    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(destroyMachine).toHaveBeenCalledWith(TOKEN, APP, "m-d");
+    expect(recordReaperAction).toHaveBeenCalledWith(expect.objectContaining({ ruleMatched: "durable-expired" }));
+  });
+
+  it("still destroys a session machine with a terminal job via stale-terminal-job", async () => {
+    vi.mocked(listMachines).mockResolvedValueOnce([durableMachine("m-s", {}, "session")] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(terminalJob);
+    vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
+    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
+    expect(destroyMachine).toHaveBeenCalledWith(TOKEN, APP, "m-s");
+    expect(recordReaperAction).toHaveBeenCalledWith(expect.objectContaining({ ruleMatched: "stale-terminal-job" }));
+  });
+
+  it("dry run logs would-destroy for durable-expired and makes no Fly call", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const m = durableMachine("m-d", { durable_until: String(nowSec() - 3600) });
+    vi.mocked(listMachines).mockResolvedValueOnce([m] as never);
+    await sweepOrphanedMachines(makeConfig(true), makeHelpers());
+    expect(destroyMachine).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(
+      expect.stringMatching(/\[reaper\] rule=durable-expired machine=m-d tenant=- issue=- age_s=\d+ dry_run=true/),
+    );
+    expect(recordReaperAction).toHaveBeenCalledWith(
+      expect.objectContaining({ ruleMatched: "durable-expired", dryRun: true }),
+    );
   });
 });

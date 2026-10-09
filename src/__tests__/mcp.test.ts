@@ -5,9 +5,9 @@ import type * as restate from "@restatedev/restate-sdk";
 import { handleMcpRequest } from "../mcp.js";
 import { SidecarMemoryProvider, sidecarHealth, sidecarHealthFields, setKgMemoryProvider } from "../kg-provider.js";
 import type { MemoryProvider, KgToolResult } from "../kg-provider.js";
-import { setActiveKgRefresh } from "../kg-refresh.js";
+import { setKgRefreshToolDeps } from "../restate/tools.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
-import type { PreflightCheckResult, KgRefreshStatus } from "../kg-refresh.js";
+import type { PreflightCheckResult } from "../kg-refresh.js";
 import type { Caller } from "../mcp-identity.js";
 import {
   GET_TENANT_HEALTH_DESCRIPTION,
@@ -15,11 +15,16 @@ import {
   getRunnerModeTool,
   listProjects,
   listInFlightJobs,
+  getSessionMachine,
+  listSessionMachines,
   getIssueDispatchStatus,
   getIssueReportCardTool,
   getFleetReportTool,
   getDeployPostureTool,
   getKgStatusTool,
+  getReviewFixAttemptTool,
+  getReviewFixActivityTool,
+  setReviewFixAttemptsFacade,
   kgHybridSearch,
   kgSearch,
   kgSemanticSearch,
@@ -28,10 +33,13 @@ import {
   kgProvenance,
   triggerKgRefreshTool,
   setRunnerModeTool,
+  setFlyMachineProfileTool,
   pauseProjectTool,
   addProjectTool,
   triggerWorkflowSyncTool,
   clearDispatchDedupTool,
+  listDispatchReservationsTool,
+  releaseDispatchReservationTool,
   tool,
   type ToolResponse,
 } from "../restate/tools.js";
@@ -64,19 +72,25 @@ vi.mock("../admin.js", () => ({
  * real handler bodies too — calling one here exercises the real tool() wrapper's role check
  * and audit line, not just a stub.
  */
-const TOOL_HANDLERS: Record<
-  string,
-  (ctx: restate.Context, input: { caller: Caller; args: Record<string, unknown> }) => Promise<ToolResponse>
-> = {
+// The transport fixture erases individual argument shapes, as the ingress does before
+// each handler's serde validation. Method variance permits that heterogeneous catalog.
+type FixtureToolHandler = {
+  invoke(ctx: restate.Context, input: { caller: Caller; args: Record<string, unknown> }): Promise<ToolResponse>;
+}["invoke"];
+const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
   get_tenant_health: getTenantHealth,
   get_runner_mode: getRunnerModeTool,
   list_projects: listProjects,
   list_in_flight_jobs: listInFlightJobs,
+  get_session_machine: getSessionMachine,
+  list_session_machines: listSessionMachines,
   get_issue_dispatch_status: getIssueDispatchStatus,
   get_issue_report_card: getIssueReportCardTool,
   get_fleet_report: getFleetReportTool,
   get_deploy_posture: getDeployPostureTool,
   get_kg_status: getKgStatusTool,
+  get_review_fix_attempt: getReviewFixAttemptTool,
+  get_review_fix_activity: getReviewFixActivityTool,
   kg_hybrid_search: kgHybridSearch,
   kg_search: kgSearch,
   kg_semantic_search: kgSemanticSearch,
@@ -85,36 +99,52 @@ const TOOL_HANDLERS: Record<
   kg_provenance: kgProvenance,
   trigger_kg_refresh: triggerKgRefreshTool,
   set_runner_mode: setRunnerModeTool,
+  set_fly_machine_profile: setFlyMachineProfileTool,
   pause_project: pauseProjectTool,
   add_project: addProjectTool,
   trigger_workflow_sync: triggerWorkflowSyncTool,
   clear_dispatch_dedup: clearDispatchDedupTool,
+  list_dispatch_reservations: listDispatchReservationsTool,
+  release_dispatch_reservation: releaseDispatchReservationTool,
 };
 
-/** The six writes declare role: "admin" (src/restate/tools.ts); every other discoverable tool is "user". */
+/** The seven writes plus two privileged review-fix reads declare role: "admin"; every other discoverable tool is "user". */
 const WRITE_TOOL_NAMES = new Set([
   "trigger_kg_refresh",
   "set_runner_mode",
+  "set_fly_machine_profile",
   "pause_project",
   "add_project",
   "trigger_workflow_sync",
   "clear_dispatch_dedup",
+  "release_dispatch_reservation",
 ]);
+const ADMIN_READ_TOOL_NAMES = new Set(["get_review_fix_attempt", "get_review_fix_activity"]);
 
 const DISCOVERED_TOOLS = Object.keys(TOOL_HANDLERS).map((name) => ({
   name,
   description: name === "get_tenant_health" ? GET_TENANT_HEALTH_DESCRIPTION : name,
   inputSchema: { type: "object", properties: {} },
-  role: (WRITE_TOOL_NAMES.has(name) ? "admin" : "user") as "admin" | "user",
+  role: (WRITE_TOOL_NAMES.has(name) || ADMIN_READ_TOOL_NAMES.has(name) ? "admin" : "user") as "admin" | "user",
 }));
 
 // AII-717: every write handler now runs its side effect through ctx.run — this fake just
 // invokes the closure immediately and returns its result, the same first-attempt behaviour a
 // real (non-replayed) Restate invocation has. Replay-specific behaviour is exercised only at
 // the Restate tier (tools.restate.test.ts's alwaysReplay counter fixture).
+// AII-683: the kg-refresh handlers call the KgRepo object / KgRefresh workflow natively; these
+// fakes stand in for both clients. Reset in beforeEach.
+let kgTriggerFake: ((opts: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string }) => Promise<unknown>) | null = null;
+
 function fakeRestateContext(handlerName: string): restate.Context {
   return {
     request: () => ({ target: { handler: handlerName } }),
+    objectClient: () => ({
+      trigger: (opts: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string }) => kgTriggerFake!(opts),
+      status: async () => null,
+      lastAdminDryRun: async () => null,
+      get: async () => ({ config: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000 }, source: "default" }),
+    }),
     run: async (name: unknown, action?: unknown) => {
       const fn = typeof name === "function" ? (name as () => unknown) : (action as () => unknown);
       return fn();
@@ -139,10 +169,13 @@ vi.mock("../access-entries.js", () => ({
 vi.mock("../runner-mode.js", () => ({
   VALID_RUNNER_MODES: ["default", "gha", "fly", "local", "shadow"],
   getRunnerMode: vi.fn(),
+  getKgMaterializeDirect: vi.fn(() => ({ enabled: true, source: "db" as const })),
+  getKgFlyMachineOverride: vi.fn(() => ({})),
+  setKgFlyMachineOverride: vi.fn(),
 }));
 
 vi.mock("../config.js", () => ({
-  getMappings: vi.fn(),
+  getMappings: vi.fn(() => ({})),
 }));
 
 vi.mock("../log.js", () => ({
@@ -164,6 +197,11 @@ vi.mock("../deploy-posture.js", () => ({
 vi.mock("../report-card.js", () => ({
   getIssueReportCard: vi.fn(),
   getFleetReport: vi.fn(),
+}));
+
+vi.mock("../deploy-hold.js", () => ({
+  getDeployStartedAt: vi.fn(() => null),
+  isDeployHeld: vi.fn(() => false),
 }));
 
 vi.mock("../restate/tools-client.js", () => ({
@@ -335,7 +373,8 @@ beforeEach(async () => {
     },
   );
   setKgMemoryProvider(null);
-  setActiveKgRefresh(null);
+  setKgRefreshToolDeps(null);
+  kgTriggerFake = null;
 
   (mcpOauth.resolveClientPath as ReturnType<typeof vi.fn>).mockReturnValue("unknown");
   (mcpOauth.getRefreshExpiry as ReturnType<typeof vi.fn>).mockResolvedValue(null);
@@ -357,6 +396,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  setReviewFixAttemptsFacade(null);
 });
 
 /** Set up a successful proxy response mock. */
@@ -422,11 +462,21 @@ async function callMcp(
   // cases below still hand their fakes in positionally, so translate them into the module
   // mocks the handlers actually read. The two `_legacy*` slots keep older call sites aligned.
   if (triggerKgRefresh) {
-    setActiveKgRefresh({
-      trigger: ({ dryRun, acceptNewBaseline, actorEmail }: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string }) =>
-        triggerKgRefresh(dryRun, acceptNewBaseline, actorEmail),
-      status: async () => ({}),
-    } as never);
+    setKgRefreshToolDeps({
+      kgSourceRepo: "org/kg",
+      isDeployHeld: () => false,
+      callbackConfigured: () => true,
+      mappingExists: () => true,
+      freeBytes: () => Number.MAX_SAFE_INTEGER,
+      runPreflight: async () => ({ ok: true, checkedAt: 0, results: [] }) as PreflightCheckResult,
+      persistPreflightFailure: () => {},
+      readStatusRecord: () => null,
+      readServedStamp: async () => null,
+    });
+    kgTriggerFake = async ({ dryRun, acceptNewBaseline, actorEmail }) => {
+      await triggerKgRefresh(dryRun, acceptNewBaseline, actorEmail);
+      return { triggerId: "trig-1" };
+    };
   }
   if (writeContext?.setRunnerMode) (setRunnerModeAction as ReturnType<typeof vi.fn>).mockImplementation((_cfg: unknown, patch: { mode?: string }) => writeContext.setRunnerMode!(patch));
   if (writeContext?.pauseProject) (pauseProjectAction as ReturnType<typeof vi.fn>).mockImplementation((teamKey: string, paused: boolean) => writeContext.pauseProject!(teamKey, paused));
@@ -919,6 +969,52 @@ describe("handleMcpRequest", () => {
       expect(JSON.parse(result.body)).toEqual({ error: "restate-unavailable" });
     });
 
+    it("returns 409 deploy-in-progress with deployStartedAt and never contacts the ingress during a hold", async () => {
+      const { callTool: realCallTool } = await vi.importActual<typeof import("../restate/tools-client.js")>("../restate/tools-client.js");
+      const deployHold = await import("../deploy-hold.js");
+      (deployHold.getDeployStartedAt as ReturnType<typeof vi.fn>).mockReturnValue(1_700_000_000_000);
+      const fetchImpl = vi.fn();
+      (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mockImplementationOnce(
+        (name: string, args: Record<string, unknown>, caller: Caller) =>
+          realCallTool(name, args, caller, { fetchImpl: fetchImpl as unknown as typeof fetch, permitsExternalCall: () => false }),
+      );
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 18, method: "tools/call", params: { name: "get_tenant_health", arguments: {} } }),
+      );
+      expect(result.statusCode).toBe(409);
+      expect(JSON.parse(result.body)).toEqual({ error: "deploy-in-progress", deployStartedAt: 1_700_000_000_000 });
+      expect(fetchImpl).not.toHaveBeenCalled();
+      (deployHold.getDeployStartedAt as ReturnType<typeof vi.fn>).mockReturnValue(null);
+    });
+
+    it.each([
+      ["a refused connection", () => Promise.reject(new Error("ECONNREFUSED"))],
+      ["a 5xx answer", () => Promise.resolve(new Response("boom", { status: 502 }))],
+    ])("keeps 503 restate-unavailable with no hold and %s", async (_label, fetchResult) => {
+      const { callTool: realCallTool } = await vi.importActual<typeof import("../restate/tools-client.js")>("../restate/tools-client.js");
+      const fetchImpl = vi.fn(fetchResult);
+      (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mockImplementationOnce(
+        (name: string, args: Record<string, unknown>, caller: Caller) =>
+          realCallTool(name, args, caller, { fetchImpl: fetchImpl as unknown as typeof fetch, permitsExternalCall: () => true }),
+      );
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 19, method: "tools/call", params: { name: "get_tenant_health", arguments: {} } }),
+      );
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      expect(result.statusCode).toBe(503);
+      expect(JSON.parse(result.body)).toEqual({ error: "restate-unavailable" });
+    });
+
     it("handles get_runner_mode", async () => {
       (runnerModeMock.getRunnerMode as ReturnType<typeof vi.fn>).mockReturnValue({ mode: "fly", source: "env" });
 
@@ -1363,22 +1459,33 @@ describe("handleMcpRequest", () => {
       expect(result.statusCode).toBe(401);
     });
 
-    it("handles get_kg_status — returns the active kg-refresh handle's status verbatim", async () => {
-      const status: KgRefreshStatus = {
-        running: true,
+    it("handles get_kg_status — composes the status from the KgRepo marker and the last-refresh record", async () => {
+      const lastRefresh = { ok: true as const, at: 1735689600000, detail: "no diff", stampBefore: "a", stampAfter: "b" };
+      // AII-683: get_kg_status reads the boot-time tool deps and the KgRepo object, not a handle.
+      setKgRefreshToolDeps({
+        kgSourceRepo: "org/kg",
+        isDeployHeld: () => false,
+        callbackConfigured: () => true,
+        mappingExists: () => true,
+        freeBytes: () => Number.MAX_SAFE_INTEGER,
+        runPreflight: async () => ({ ok: true, checkedAt: 0, results: [] }) as PreflightCheckResult,
+        persistPreflightFailure: () => {},
+        readStatusRecord: () => lastRefresh,
+        readServedStamp: async () => null,
+      });
+      const status = {
+        running: false,
         deployHeld: false,
         kgDegraded: false,
-        servedStamp: "2026-09-01T00:00:00Z",
-        lastRefresh: { ok: true, at: 1735689600000, detail: "no diff", stampBefore: "a", stampAfter: "b" },
-        stage: "ingest-running",
+        ...sidecarHealthFields(),
+        servedStamp: "b",
+        lastRefresh,
+        lastDryRun: null,
+        stage: "serving",
         materialize: "direct",
-        kgUnavailable: false,
-        sidecar: { reachable: false, toolsListed: false, lastError: null, checkedAt: null },
+        flyMachine: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000, source: "default" },
+        restate: null,
       };
-      const statusMock = vi.fn(async () => status);
-      // AII-711: get_kg_status is a Restate handler that reads the boot-time singleton, not a
-      // per-request callback threaded through handleMcpRequest.
-      setActiveKgRefresh({ status: statusMock } as never);
 
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -1392,7 +1499,6 @@ describe("handleMcpRequest", () => {
       expect(mockHttpRequest).not.toHaveBeenCalled();
       expect(result.statusCode).toBe(200);
       expect(toolsClientMock.callTool).toHaveBeenCalledWith("get_kg_status", {}, expect.objectContaining({ kind: "human" }), undefined);
-      expect(statusMock).toHaveBeenCalledOnce();
       const parsed = JSON.parse(result.body);
       const data = JSON.parse(parsed.result.content[0].text);
       expect(data).toEqual(status);
@@ -1573,6 +1679,7 @@ describe("handleMcpRequest", () => {
         "add_project",
         "trigger_workflow_sync",
         "clear_dispatch_dedup",
+        "release_dispatch_reservation",
       ]));
     });
 
@@ -1594,6 +1701,7 @@ describe("handleMcpRequest", () => {
         "add_project",
         "trigger_workflow_sync",
         "clear_dispatch_dedup",
+        "release_dispatch_reservation",
       ]) {
         expect(names).not.toContain(writeTool);
       }
@@ -1605,6 +1713,8 @@ describe("handleMcpRequest", () => {
         "get_runner_mode",
         "list_projects",
         "list_in_flight_jobs",
+        "get_session_machine",
+        "list_session_machines",
         "get_issue_dispatch_status",
         "get_issue_report_card",
         "get_fleet_report",
@@ -1639,6 +1749,124 @@ describe("handleMcpRequest", () => {
         expect(adminNames).toContain(name);
         expect(userNames).toContain(name);
       }
+    });
+
+    it("lists review-fix read tools for admins only", async () => {
+      mockRole("admin");
+      const adminResult = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      const adminNames = JSON.parse(adminResult.body).result.tools.map((t: { name: string }) => t.name);
+
+      mockRole("user");
+      const userResult = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      const userNames = JSON.parse(userResult.body).result.tools.map((t: { name: string }) => t.name);
+
+      expect(adminNames).toEqual(expect.arrayContaining(["get_review_fix_attempt", "get_review_fix_activity"]));
+      expect(userNames).not.toContain("get_review_fix_attempt");
+      expect(userNames).not.toContain("get_review_fix_activity");
+    });
+  });
+
+  describe("tools/call — review-fix read tools", () => {
+    afterEach(() => {
+      setReviewFixAttemptsFacade(null);
+    });
+
+    it("as admin, calls get_review_fix_attempt and returns the status envelope", async () => {
+      mockRole("admin");
+      setReviewFixAttemptsFacade({
+        getAttempt: vi.fn(async () => ({
+          status: "ok" as const,
+          attempt: {
+            attemptId: "attempt-1",
+            owner: { kind: "restate", attemptId: "attempt-1" },
+            execution: null,
+            deadlineAt: 1,
+            pendingFeedback: false,
+            snapshot: null,
+            state: "running",
+            evidenceComplete: false,
+            terminationConfirmed: false,
+            cycles: [],
+          },
+        })),
+        getActivity: vi.fn(),
+      });
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 80,
+          method: "tools/call",
+          params: {
+            name: "get_review_fix_attempt",
+            arguments: { attemptId: "attempt-1" },
+            _meta: { idempotencyKey: "not-validated-for-reads!" },
+          },
+        }),
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).not.toBe(true);
+      expect(JSON.parse(parsed.result.content[0].text)).toEqual({
+        status: "ok",
+        attempt: expect.objectContaining({
+          attemptId: "attempt-1",
+          evidenceComplete: false,
+          terminationConfirmed: false,
+        }),
+      });
+      expect(toolsClientMock.callTool).toHaveBeenLastCalledWith(
+        "get_review_fix_attempt",
+        { attemptId: "attempt-1" },
+        { kind: "human", email: "user@example.com", role: "admin" },
+        undefined,
+      );
+    });
+
+    it("as user, refuses get_review_fix_activity before the facade runs", async () => {
+      mockRole("user");
+      const getActivity = vi.fn();
+      setReviewFixAttemptsFacade({ getAttempt: vi.fn(), getActivity });
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 81,
+          method: "tools/call",
+          params: { name: "get_review_fix_activity", arguments: { attemptId: "attempt-1" } },
+        }),
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).toBe(true);
+      expect(parsed.result.content[0].text).toBe("forbidden: get_review_fix_activity requires the admin role");
+      expect(getActivity).not.toHaveBeenCalled();
     });
   });
 
@@ -1680,7 +1908,7 @@ describe("handleMcpRequest", () => {
       const parsed = JSON.parse(result.body);
       expect(parsed.result.isError).not.toBe(true);
       const data = JSON.parse(parsed.result.content[0].text);
-      expect(data).toEqual({ status: 202, body: { accepted: true } });
+      expect(data).toEqual({ status: 202, body: { refreshing: true, triggerId: "trig-1" } });
       expect(triggerMock).toHaveBeenCalledOnce();
       expect(logSpy).toHaveBeenCalledWith(
         expect.stringMatching(/\[mcp\] write tool=trigger_kg_refresh actor=user@example\.com role=admin result=ok/),
@@ -1830,7 +2058,7 @@ describe("handleMcpRequest", () => {
       expect(triggerMock).not.toHaveBeenCalled();
     });
 
-    it("when triggerKgRefresh is not wired, returns isError with 'KG refresh is not configured'", async () => {
+    it("when the kg-refresh tool deps are not set, answers 501 kg-source-repo-not-configured", async () => {
       mockRole("admin");
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -1843,8 +2071,8 @@ describe("handleMcpRequest", () => {
 
       expect(result.statusCode).toBe(200);
       const parsed = JSON.parse(result.body);
-      expect(parsed.result.isError).toBe(true);
-      expect(parsed.result.content[0].text).toContain("KG refresh is not configured");
+      expect(parsed.result.isError).not.toBe(true);
+      expect(JSON.parse(parsed.result.content[0].text)).toEqual({ status: 501, body: { error: "kg-source-repo-not-configured" } });
     });
 
     it("unauthenticated request returns 401 before any tool dispatch", async () => {

@@ -131,7 +131,7 @@ describe("filesystem ticket lifecycle", () => {
   it("retries an eligible failed ticket and clears dispatch guards before restoring it", async () => {
     const id = issueId("FS-101");
     writeTicket("FS-101", { location: "failed", status: "failed", phase: "implementation" });
-    dedup.markDispatched(id, "FS-101", "Retry me");
+    dedup.markDispatched(id, "TEAM", "FS-101", "Retry me");
     breaker.recordDispatchFailure(id, "implementation", "failure");
     breaker.recordDispatchFailure(id, "implementation", "failure");
     breaker.recordDispatchFailure(id, "implementation", "failure");
@@ -163,7 +163,7 @@ describe("filesystem ticket lifecycle", () => {
       phase: "implementation",
       prUrls: ["https://github.com/BuildDownAI/AI-Implement/pull/102"],
     });
-    dedup.markDispatched(id, "FS-102", "Has a PR");
+    dedup.markDispatched(id, "TEAM", "FS-102", "Has a PR");
 
     await expect(lifecycle.retryFilesystemTicket(provider, id, "FS")).resolves.toEqual({
       retried: false,
@@ -177,7 +177,7 @@ describe("filesystem ticket lifecycle", () => {
   it("archives a terminal filesystem ticket when watchdog attempts are exhausted after state reset", async () => {
     const id = issueId("FS-201");
     writeTicket("FS-201", { status: "plan-approved" });
-    dedup.markDispatched(id, "FS-201", "Exhausted");
+    dedup.markDispatched(id, "TEAM", "FS-201", "Exhausted");
     dedup.getDb().prepare("INSERT INTO stuck_attempts (issue_id, attempts, last_attempt_at) VALUES (?, 4, ?)").run(id, Date.now());
     log.updateJobStatus(log.appendLog({ issueId: id, issueIdentifier: "FS-201", teamKey: "FS", phase: "implementation" }), "failed", "failure");
 
@@ -220,7 +220,7 @@ describe("filesystem ticket lifecycle", () => {
   it("uses provider archiveFailed to stamp failed state for exhausted tickets reset to ready", async () => {
     const id = issueId("FS-204");
     writeTicket("FS-204", { status: "ready" });
-    dedup.markDispatched(id, "FS-204", "Reset exhausted");
+    dedup.markDispatched(id, "TEAM", "FS-204", "Reset exhausted");
     dedup.getDb().prepare("INSERT INTO stuck_attempts (issue_id, attempts, last_attempt_at) VALUES (?, 4, ?)").run(id, Date.now());
     log.updateJobStatus(log.appendLog({ issueId: id, issueIdentifier: "FS-204", teamKey: "FS", phase: "planning" }), "timed_out", "failure");
 
@@ -244,9 +244,9 @@ describe("filesystem ticket lifecycle", () => {
       prUrls: ["https://github.com/BuildDownAI/AI-Implement/pull/302"],
     });
     writeTicket("FS-303", { status: "failed", phase: "implementation" });
-    dedup.markDispatched(requeued, "FS-301", "Requeue");
-    dedup.markDispatched(withPr, "FS-302", "PR");
-    dedup.markDispatched(inFlight, "FS-303", "Inflight");
+    dedup.markDispatched(requeued, "TEAM", "FS-301", "Requeue");
+    dedup.markDispatched(withPr, "TEAM", "FS-302", "PR");
+    dedup.markDispatched(inFlight, "TEAM", "FS-303", "Inflight");
     dedup.getDb().prepare("INSERT INTO stuck_attempts (issue_id, attempts, last_attempt_at) VALUES (?, 4, ?)").run(requeued, Date.now());
     dedup.getDb().prepare("INSERT INTO stuck_attempts (issue_id, attempts, last_attempt_at) VALUES (?, 4, ?)").run(withPr, Date.now());
     dedup.getDb().prepare("INSERT INTO stuck_attempts (issue_id, attempts, last_attempt_at) VALUES (?, 4, ?)").run(inFlight, Date.now());

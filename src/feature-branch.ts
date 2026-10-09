@@ -1,6 +1,6 @@
 import type { RepoMapping } from "./config.js";
 import type { TicketIssue } from "./providers/types.js";
-import { ensureBranchExists, findPullRequestByBranches } from "./github.js";
+import { ensureBranchExists, findPullRequestByBranches, getBranchSha } from "./github.js";
 import { buildGroupingBranchName } from "./pipeline/branch-name.js";
 
 /**
@@ -91,6 +91,39 @@ export async function resolveBaseBranch(opts: {
       { cause: err },
     );
   }
+}
+
+/**
+ * Read-only counterpart to resolveBaseBranch for planning dispatch (AII-898): resolves
+ * the branch a chain's tip WOULD target, without ever creating it — planning must not
+ * create branches, only observe whether the implementation-side one already exists.
+ *
+ * Returns the chain's target branch name when it exists on GitHub, or null when the
+ * chain is empty (nothing to resolve) or the branch hasn't been cut yet — e.g. a parent
+ * labelled before any child has merged into it. Callers fall back to
+ * mapping.defaultBranch in the null case; a missing (as opposed to absent) chain logs
+ * one line naming the fallback.
+ */
+export async function resolvePlanningBranch(opts: {
+  ghToken: string;
+  issue: TicketIssue;
+  mapping: RepoMapping;
+}): Promise<string | null> {
+  const { ghToken, issue, mapping } = opts;
+  const chain = issue.featureBranchChain ?? [];
+  if (chain.length === 0) return null;
+
+  const last = chain[chain.length - 1];
+  const branch = buildGroupingBranchName(last.identifier, last.mode);
+  const sha = await getBranchSha(ghToken, mapping.owner, mapping.repo, branch);
+  if (sha === null) {
+    console.log(
+      `[poll] Planning for ${issue.identifier}: feature branch "${branch}" does not exist yet — ` +
+        `falling back to default branch "${mapping.defaultBranch}"`,
+    );
+    return null;
+  }
+  return branch;
 }
 
 /** AII-264 r3 churn-loop guard: a grouping parent whose top-of-tree roll-up PR is

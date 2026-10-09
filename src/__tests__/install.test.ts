@@ -95,14 +95,14 @@ describe("parseReviewersConfig", () => {
 
   it("builds data-only reviewer definitions with the shared verdict schema", () => {
     const reviewers = parseReviewersConfig([
-      { id: " accessibility-review ", model: " claude-sonnet-5 ", prompt: " Review accessibility. ", gates: true },
+      { id: " accessibility-review ", model: " claude-sonnet-5-5 ", prompt: " Review accessibility. ", gates: true },
       { id: "architecture-review", prompt: "Review boundaries." },
     ]);
 
     expect(reviewers).toHaveLength(2);
     expect(reviewers?.[0]).toEqual({
       id: "accessibility-review",
-      model: "claude-sonnet-5",
+      model: "claude-sonnet-5-5",
       buildPrompt: expect.any(Function),
       outputSchema: REVIEWER_VERDICT_SCHEMA,
     });
@@ -138,7 +138,7 @@ describe("installStep reviewers output", () => {
     writeFileSync(join(workspaceDir, ".ai-implement", "config.yml"), [
       "reviewers:",
       "  - id: domain-review",
-      "    model: claude-sonnet-5",
+      "    model: claude-sonnet-5-5",
       "    gates: true",
       "    prompt: |",
       "      Review the diff for domain mistakes.",
@@ -168,7 +168,7 @@ describe("installStep reviewers output", () => {
       gates: (reviewer as unknown as { gates?: unknown }).gates,
     }))).toEqual([{
       id: "domain-review",
-      model: "claude-sonnet-5",
+      model: "claude-sonnet-5-5",
       prompt: "Review the diff for domain mistakes.\n",
       outputSchema: REVIEWER_VERDICT_SCHEMA,
       gates: undefined,
@@ -188,7 +188,7 @@ describe("installStep reviewers output", () => {
     const fetchImpl = mockContentsFetch(200, contentsApiResponse([
       "reviewers:",
       "  - id: domain-review",
-      "    model: claude-sonnet-5",
+      "    model: claude-sonnet-5-5",
       "    prompt: trusted default prompt",
       "  - id: unselected-review",
       "    prompt: should not be fetched into outputs",
@@ -216,7 +216,7 @@ describe("installStep reviewers output", () => {
     }));
     expect(reviewerPrompt(outputs.reviewers![0]!)).toBe("malicious PR prompt");
     expect(outputs.trustedConfigReviewers.map((reviewer) => ({ id: reviewer.id, model: reviewer.model }))).toEqual([
-      { id: "domain-review", model: "claude-sonnet-5" },
+      { id: "domain-review", model: "claude-sonnet-5-5" },
     ]);
     expect(reviewerPrompt(outputs.trustedConfigReviewers[0]!)).toBe("trusted default prompt");
   });

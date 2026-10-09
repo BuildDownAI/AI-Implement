@@ -7,6 +7,9 @@ import { openOrFindPullRequest } from "../step-utils.js";
 import { postPrComment } from "../../github.js";
 import { readCodeRepoFromSourcesYml, readSecondaryReposFromSourcesYml } from "./kg-tracker-data.js";
 
+/** Head-branch prefix of the rail's own snapshot PRs; the PR-check webhook ignores PRs from it. */
+export const KG_SNAPSHOT_BRANCH_PREFIX = "kg-refresh/";
+
 /** Coded failure raised when the snapshot parts or embeddings file are absent. */
 export class KgSnapshotMissingError extends Error {
   readonly code = "KG_SNAPSHOT_MISSING";
@@ -737,7 +740,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       repo: repoRepo ?? "",
       workspaceDir,
     });
-    const branchName = `kg-refresh/${stampCompact}`;
+    const branchName = `${KG_SNAPSHOT_BRANCH_PREFIX}${stampCompact}`;
     // Push with that token embedded in the origin URL — the shape push.ts uses.
     // The entrypoint strips the token from origin at start, and in GitHub Actions
     // mode the refresh does not re-embed it, so without this the push falls to

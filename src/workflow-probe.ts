@@ -1,11 +1,22 @@
 const CACHE_TTL_MS = 300_000;
 const RUN_CONFIG_RE = /^\s{2,}run_config:\s*$/m;
 const RUN_PUBLICATION_TOKEN_RE = /^\s{2,}run_publication_token:\s*$/m;
+/**
+ * Declared-input marker for the Restate review-fix pilot's attempt-correlation and
+ * versioned-callback support (AII-778). No concrete workflow input name existed yet at
+ * authoring time — this mirrors `run_publication_token`'s naming (`run_token`,
+ * `run_progress_token`, `run_publication_token`, ...) so a target workflow opts in the same
+ * way: declare a `run_attempt_token:` input. AII-776 ("carry attempt identity through the
+ * runner envelope") should either adopt this name or update this regex to match.
+ */
+const RUN_ATTEMPT_TOKEN_RE = /^\s{2,}run_attempt_token:\s*$/m;
 
 export type WorkflowContract = "envelope" | "legacy";
 export interface WorkflowCapabilities {
   contract: WorkflowContract;
   supportsRunPublicationToken: boolean;
+  /** True when the workflow declares `run_attempt_token`, gating attempt-correlation / versioned-callback support. */
+  supportsAttemptCorrelation: boolean;
 }
 
 type CacheEntry = { expiresAt: number; capabilities: WorkflowCapabilities };
@@ -66,6 +77,7 @@ async function probeCapabilities(
   const legacy = (): WorkflowCapabilities => ({
     contract: "legacy",
     supportsRunPublicationToken: false,
+    supportsAttemptCorrelation: false,
   });
   let res: Response;
   try {
@@ -108,5 +120,6 @@ async function probeCapabilities(
   return {
     contract,
     supportsRunPublicationToken: contract === "envelope" && RUN_PUBLICATION_TOKEN_RE.test(yamlText),
+    supportsAttemptCorrelation: contract === "envelope" && RUN_ATTEMPT_TOKEN_RE.test(yamlText),
   };
 }

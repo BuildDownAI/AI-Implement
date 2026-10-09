@@ -522,4 +522,25 @@ describe("reviewStep", () => {
     // Approval contract must always appear regardless
     expect(call.prompt).toContain("Approval contract");
   });
+
+  it("includes the dependency install note when installFailed is true", async () => {
+    const executor = makeExecutor(APPROVED_VERDICT);
+    await reviewStep.run(makeContext(executor), { installFailed: true }, new NoopStepReporter());
+
+    const call = vi.mocked(executor.invoke).mock.calls[0][0];
+    expect(call.prompt).toContain("Dependencies did not install");
+  });
+
+  it("does not include the dependency install note when installFailed is false or absent", async () => {
+    const executor = makeExecutor(APPROVED_VERDICT);
+    await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());
+
+    const call = vi.mocked(executor.invoke).mock.calls[0][0];
+    expect(call.prompt).not.toContain("Dependencies did not install");
+
+    const executor2 = makeExecutor(APPROVED_VERDICT);
+    await reviewStep.run(makeContext(executor2), { installFailed: false }, new NoopStepReporter());
+    const call2 = vi.mocked(executor2.invoke).mock.calls[0][0];
+    expect(call2.prompt).not.toContain("Dependencies did not install");
+  });
 });
