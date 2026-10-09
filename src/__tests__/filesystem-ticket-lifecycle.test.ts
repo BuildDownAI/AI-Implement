@@ -32,11 +32,9 @@ beforeEach(async () => {
   vi.doMock("../config.js", () => ({ getMappings: () => mappings }));
   vi.doMock("../runner-mode.js", () => ({ getRunnerMode: () => ({ mode: "local", source: "env" }) }));
 
-  // "none": the two mocks above have no init functions for boot's table creation to call.
   let providerModule: typeof import("../providers/filesystem.js");
   ({ dedup, log, breaker, providerModule, lifecycle } = (
     await testDb({
-      tables: "none",
       modules: {
         dedup: () => import("../dedup.js"),
         log: () => import("../log.js"),
@@ -46,8 +44,6 @@ beforeEach(async () => {
       },
     })
   ).modules);
-  log.initLogTable();
-  breaker.initDispatchBreakerTable();
   provider = new providerModule.FilesystemProvider(() => mappings);
 });
 

@@ -326,13 +326,10 @@ describe("recordDispatch", () => {
 
 describe("job row after a non-GHA dispatch (real log.ts, scratch database)", () => {
   it("lets getJobByMachineId and getJobByNonce resolve the kg-refresh row", async () => {
-    // No boot tables: the runner-mode.js mock above has no initSettingsTable. The real log.ts
-    // comes through importActual, since this file mocks it.
+    // The real log.ts comes through importActual, since this file mocks it.
     const { log } = (await testDb({
-      tables: "none",
       modules: { log: () => vi.importActual<typeof import("../log.js")>("../log.js") },
     })).modules;
-    log.initLogTable();
     const id = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-workflow", executionMode: "fly-machines", repo: "acme/kg" });
     vi.doUnmock("../log.js"); // the fresh module must share the scratch database's log.js instance
     const { recordKgDispatchDetails } = await import("../restate/kg-refresh-production.js");

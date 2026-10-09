@@ -8,20 +8,21 @@ import type * as DedupModule from "../../dedup.js";
 import { testDir } from "./test-dir.js";
 
 /** The table-creating functions `main()` in src/index.ts calls at boot, in its order. `harnesses.test.ts`
- *  fails when the two lists differ. */
+ *  fails when the two lists differ. Each is called on the real module, never on a test's mock of it: a mock may
+ *  lack the function, or carry a copy still bound to the database open when its factory ran. */
 const BOOT_TABLE_INITS: ReadonlyArray<() => Promise<void>> = [
-  async () => (await import("../../config.js")).initMappingsTable(),
-  async () => (await import("../../log.js")).initLogTable(),
-  async () => (await import("../../dispatch-breaker.js")).initDispatchBreakerTable(),
-  async () => (await import("../../runner-mode.js")).initSettingsTable(),
-  async () => (await import("../../access-entries.js")).initAccessEntriesTable(),
-  async () => (await import("../../reconciliation.js")).initReconciliationTable(),
-  async () => (await import("../../step-log.js")).initStepLogTable(),
-  async () => (await import("../../mcp-oauth.js")).initMcpOAuthTables(),
-  async () => (await import("../../access-audit.js")).initAccessAuditTable(),
-  async () => (await import("../../access-page-grants.js")).initAccessPageGrantsTable(),
-  async () => (await import("../../mcp-auth-events.js")).initAuthEventsTable(),
-  async () => (await import("../../review-fix-evidence.js")).initReviewFixEvidenceTable(),
+  async () => (await vi.importActual<typeof import("../../config.js")>("../../config.js")).initMappingsTable(),
+  async () => (await vi.importActual<typeof import("../../log.js")>("../../log.js")).initLogTable(),
+  async () => (await vi.importActual<typeof import("../../dispatch-breaker.js")>("../../dispatch-breaker.js")).initDispatchBreakerTable(),
+  async () => (await vi.importActual<typeof import("../../runner-mode.js")>("../../runner-mode.js")).initSettingsTable(),
+  async () => (await vi.importActual<typeof import("../../access-entries.js")>("../../access-entries.js")).initAccessEntriesTable(),
+  async () => (await vi.importActual<typeof import("../../reconciliation.js")>("../../reconciliation.js")).initReconciliationTable(),
+  async () => (await vi.importActual<typeof import("../../step-log.js")>("../../step-log.js")).initStepLogTable(),
+  async () => (await vi.importActual<typeof import("../../mcp-oauth.js")>("../../mcp-oauth.js")).initMcpOAuthTables(),
+  async () => (await vi.importActual<typeof import("../../access-audit.js")>("../../access-audit.js")).initAccessAuditTable(),
+  async () => (await vi.importActual<typeof import("../../access-page-grants.js")>("../../access-page-grants.js")).initAccessPageGrantsTable(),
+  async () => (await vi.importActual<typeof import("../../mcp-auth-events.js")>("../../mcp-auth-events.js")).initAuthEventsTable(),
+  async () => (await vi.importActual<typeof import("../../review-fix-evidence.js")>("../../review-fix-evidence.js")).initReviewFixEvidenceTable(),
 ];
 
 type Loaders = Record<string, () => Promise<unknown>>;
