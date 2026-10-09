@@ -62,157 +62,155 @@ export const installSkillsStep: StepModule<InstallSkillsInputs, InstallSkillsOut
 
 /** Shared by the pipeline step and the planning entry points, which have no pipeline context. Never throws. */
 export function installSkills(inputs: InstallSkillsInputs): InstallSkillsOutputs {
-  {
-    let { skillsRepoUrl, githubToken, homeDir = os.homedir() } = inputs;
-    const agents = inputs.agents?.length ? [...new Set(inputs.agents)] : (["claude"] as SkillAgent[]);
+  let { skillsRepoUrl, githubToken, homeDir = os.homedir() } = inputs;
+  const agents = inputs.agents?.length ? [...new Set(inputs.agents)] : (["claude"] as SkillAgent[]);
 
-    // Redact every occurrence of the token before any value is logged (a single
-    // .replace() would miss repeats; guard the empty-token case so we don't splice
-    // "***" between every character).
-    const redactToken = (s: string): string =>
-      githubToken ? s.split(githubToken).join("***") : s;
+  // Redact every occurrence of the token before any value is logged (a single
+  // .replace() would miss repeats; guard the empty-token case so we don't splice
+  // "***" between every character).
+  const redactToken = (s: string): string =>
+    githubToken ? s.split(githubToken).join("***") : s;
 
-    if (!skillsRepoUrl) {
+  if (!skillsRepoUrl) {
+    return { skillsInstalled: 0, skillsRepoRef: null };
+  }
+
+  // owner/repo shorthand → https://github.com/owner/repo (handles AI_IMPLEMENT_SKILLS_REPO env var path)
+  if (/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(skillsRepoUrl)) {
+    skillsRepoUrl = `https://github.com/${skillsRepoUrl}`;
+  }
+
+  let tmpDir: string | undefined;
+  try {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-implement-skills-"));
+
+    // Local paths (used in tests) pass through unchanged; github.com remotes get the token embedded.
+    const isLocalPath = skillsRepoUrl.startsWith("/") || skillsRepoUrl.startsWith("file://");
+    // Only https:// remotes are cloneable on the runner — auth is the orchestrator-minted
+    // token embedded in the URL. SSH (git@…) or http:// would need keys the runner lacks, so
+    // fail loudly here rather than letting git emit a confusing credential-less clone error.
+    if (!isLocalPath && !skillsRepoUrl.startsWith("https://")) {
+      console.warn(
+        "[skills] skillsRepoUrl must be an https:// URL (token auth) — got a non-https URL; skipping install",
+      );
       return { skillsInstalled: 0, skillsRepoRef: null };
     }
-
-    // owner/repo shorthand → https://github.com/owner/repo (handles AI_IMPLEMENT_SKILLS_REPO env var path)
-    if (/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(skillsRepoUrl)) {
-      skillsRepoUrl = `https://github.com/${skillsRepoUrl}`;
+    // The GitHub App installation token is only valid for github.com — embedding it
+    // in the clone URL for any other host would hand an org-scoped credential to a
+    // third party as HTTP basic auth. Exact host match only ("github.com",
+    // case-insensitive; "www.github.com" is deliberately excluded — GitHub serves
+    // git remotes on the apex host, and a redirect must never carry credentials).
+    // Cross-host https remotes are cloned WITHOUT credentials: public repos still
+    // work, private ones fail fast under GIT_TERMINAL_PROMPT=0 instead of leaking.
+    let isGitHubHost = false;
+    if (!isLocalPath) {
+      try {
+        isGitHubHost = new URL(skillsRepoUrl).hostname.toLowerCase() === "github.com";
+      } catch {
+        // unparseable URL — treat as non-GitHub; the clone below fails on its own
+      }
     }
+    const remote =
+      isLocalPath || !isGitHubHost
+        ? skillsRepoUrl
+        : githubToken
+          ? skillsRepoUrl.replace("https://", `https://x-access-token:${githubToken}@`)
+          : skillsRepoUrl;
 
-    let tmpDir: string | undefined;
-    try {
-      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-implement-skills-"));
-
-      // Local paths (used in tests) pass through unchanged; github.com remotes get the token embedded.
-      const isLocalPath = skillsRepoUrl.startsWith("/") || skillsRepoUrl.startsWith("file://");
-      // Only https:// remotes are cloneable on the runner — auth is the orchestrator-minted
-      // token embedded in the URL. SSH (git@…) or http:// would need keys the runner lacks, so
-      // fail loudly here rather than letting git emit a confusing credential-less clone error.
-      if (!isLocalPath && !skillsRepoUrl.startsWith("https://")) {
-        console.warn(
-          "[skills] skillsRepoUrl must be an https:// URL (token auth) — got a non-https URL; skipping install",
-        );
-        return { skillsInstalled: 0, skillsRepoRef: null };
-      }
-      // The GitHub App installation token is only valid for github.com — embedding it
-      // in the clone URL for any other host would hand an org-scoped credential to a
-      // third party as HTTP basic auth. Exact host match only ("github.com",
-      // case-insensitive; "www.github.com" is deliberately excluded — GitHub serves
-      // git remotes on the apex host, and a redirect must never carry credentials).
-      // Cross-host https remotes are cloned WITHOUT credentials: public repos still
-      // work, private ones fail fast under GIT_TERMINAL_PROMPT=0 instead of leaking.
-      let isGitHubHost = false;
-      if (!isLocalPath) {
-        try {
-          isGitHubHost = new URL(skillsRepoUrl).hostname.toLowerCase() === "github.com";
-        } catch {
-          // unparseable URL — treat as non-GitHub; the clone below fails on its own
-        }
-      }
-      const remote =
-        isLocalPath || !isGitHubHost
-          ? skillsRepoUrl
-          : githubToken
-            ? skillsRepoUrl.replace("https://", `https://x-access-token:${githubToken}@`)
-            : skillsRepoUrl;
-
-      const cloneResult = spawnSync(
-        "git",
-        ["clone", "--depth", "1", remote, tmpDir],
-        {
-          stdio: ["ignore", "pipe", "pipe"],
-          // Bound the clone so a slow/hung remote (DNS, TCP, credential negotiation)
-          // can't block the runner's event loop for the entire job timeout. On hit,
-          // spawnSync kills the child and sets error.code === "ETIMEDOUT".
-          timeout: 60_000,
-          // Never wait on an interactive credential prompt — fail fast instead of
-          // hanging until the timeout when auth is missing/wrong.
-          env: gitProcessEnv({ GIT_TERMINAL_PROMPT: "0" }),
-        },
-      );
-
-      if (cloneResult.status !== 0) {
-        const timedOut =
-          (cloneResult.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT";
-        const reason = timedOut
-          ? "timed out after 60s"
-          : redactToken(cloneResult.stderr?.toString() ?? "");
-        console.warn(`[skills] clone failed: ${reason}`);
-        return { skillsInstalled: 0, skillsRepoRef: null };
-      }
-
-      const revResult = spawnSync("git", ["rev-parse", "HEAD"], {
-        cwd: tmpDir,
+    const cloneResult = spawnSync(
+      "git",
+      ["clone", "--depth", "1", remote, tmpDir],
+      {
         stdio: ["ignore", "pipe", "pipe"],
-        env: gitProcessEnv(),
-      });
-      const skillsRepoRef =
-        revResult.status === 0 ? revResult.stdout.toString().trim() : null;
+        // Bound the clone so a slow/hung remote (DNS, TCP, credential negotiation)
+        // can't block the runner's event loop for the entire job timeout. On hit,
+        // spawnSync kills the child and sets error.code === "ETIMEDOUT".
+        timeout: 60_000,
+        // Never wait on an interactive credential prompt — fail fast instead of
+        // hanging until the timeout when auth is missing/wrong.
+        env: gitProcessEnv({ GIT_TERMINAL_PROMPT: "0" }),
+      },
+    );
 
-      // Collect skill directories from the layouts real skills repos use. A
-      // directory is a skill iff it contains a SKILL.md *directly* inside it; we
-      // look for those one level under each of these roots:
-      //   <repo>/<name>/SKILL.md               — flat convention (e.g. BuildDownAI/skills)
-      //   <repo>/skills/<name>/SKILL.md         — Claude Code plugin layout (e.g. compound-engineering)
-      //   <repo>/.claude/skills/<name>/SKILL.md — project-scoped skills
-      // A repo may use more than one root; dedup by skill name (first root wins).
-      // Deeper/arbitrary nesting is intentionally NOT scanned — that keeps the
-      // copy deterministic and avoids pulling SKILL.md files out of test
-      // fixtures, vendored deps, or docs.
-      const searchRoots = [
-        tmpDir,
-        path.join(tmpDir, "skills"),
-        path.join(tmpDir, ".claude", "skills"),
-      ];
-      const seenSkillNames = new Set<string>();
-      const skillDirs: Array<{ name: string; src: string }> = [];
-      for (const root of searchRoots) {
-        let rootEntries: fs.Dirent[];
-        try {
-          rootEntries = fs.readdirSync(root, { withFileTypes: true });
-        } catch {
-          continue; // root doesn't exist in this repo — skip
-        }
-        for (const e of rootEntries) {
-          if (!e.isDirectory() || e.name.startsWith(".")) continue;
-          if (!fs.existsSync(path.join(root, e.name, "SKILL.md"))) continue;
-          if (seenSkillNames.has(e.name)) continue; // earlier root wins on a name collision
-          seenSkillNames.add(e.name);
-          skillDirs.push({ name: e.name, src: path.join(root, e.name) });
-        }
-      }
-
-      let skillsInstalled = 0;
-      for (const agent of agents) {
-        const targetBase = path.join(homeDir, SKILLS_SUBDIR_BY_AGENT[agent]);
-        let installedForAgent = 0;
-        for (const dir of skillDirs) {
-          const dest = path.join(targetBase, dir.name);
-          fs.mkdirSync(dest, { recursive: true });
-          fs.cpSync(dir.src, dest, { recursive: true, force: true });
-          installedForAgent++;
-        }
-        // Report distinct skills, not copies, so a mixed run matches a single-agent run.
-        skillsInstalled = Math.max(skillsInstalled, installedForAgent);
-      }
-
-      console.log(
-        `[skills] cloned ref=${skillsRepoRef ?? "unknown"} installed=${skillsInstalled} skill(s)`,
-      );
-      return { skillsInstalled, skillsRepoRef };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`[skills] install failed: ${redactToken(msg)}`);
+    if (cloneResult.status !== 0) {
+      const timedOut =
+        (cloneResult.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT";
+      const reason = timedOut
+        ? "timed out after 60s"
+        : redactToken(cloneResult.stderr?.toString() ?? "");
+      console.warn(`[skills] clone failed: ${reason}`);
       return { skillsInstalled: 0, skillsRepoRef: null };
-    } finally {
-      if (tmpDir) {
-        try {
-          fs.rmSync(tmpDir, { recursive: true, force: true });
-        } catch {
-          // ignore cleanup errors
-        }
+    }
+
+    const revResult = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: tmpDir,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: gitProcessEnv(),
+    });
+    const skillsRepoRef =
+      revResult.status === 0 ? revResult.stdout.toString().trim() : null;
+
+    // Collect skill directories from the layouts real skills repos use. A
+    // directory is a skill iff it contains a SKILL.md *directly* inside it; we
+    // look for those one level under each of these roots:
+    //   <repo>/<name>/SKILL.md               — flat convention (e.g. BuildDownAI/skills)
+    //   <repo>/skills/<name>/SKILL.md         — Claude Code plugin layout (e.g. compound-engineering)
+    //   <repo>/.claude/skills/<name>/SKILL.md — project-scoped skills
+    // A repo may use more than one root; dedup by skill name (first root wins).
+    // Deeper/arbitrary nesting is intentionally NOT scanned — that keeps the
+    // copy deterministic and avoids pulling SKILL.md files out of test
+    // fixtures, vendored deps, or docs.
+    const searchRoots = [
+      tmpDir,
+      path.join(tmpDir, "skills"),
+      path.join(tmpDir, ".claude", "skills"),
+    ];
+    const seenSkillNames = new Set<string>();
+    const skillDirs: Array<{ name: string; src: string }> = [];
+    for (const root of searchRoots) {
+      let rootEntries: fs.Dirent[];
+      try {
+        rootEntries = fs.readdirSync(root, { withFileTypes: true });
+      } catch {
+        continue; // root doesn't exist in this repo — skip
+      }
+      for (const e of rootEntries) {
+        if (!e.isDirectory() || e.name.startsWith(".")) continue;
+        if (!fs.existsSync(path.join(root, e.name, "SKILL.md"))) continue;
+        if (seenSkillNames.has(e.name)) continue; // earlier root wins on a name collision
+        seenSkillNames.add(e.name);
+        skillDirs.push({ name: e.name, src: path.join(root, e.name) });
+      }
+    }
+
+    let skillsInstalled = 0;
+    for (const agent of agents) {
+      const targetBase = path.join(homeDir, SKILLS_SUBDIR_BY_AGENT[agent]);
+      let installedForAgent = 0;
+      for (const dir of skillDirs) {
+        const dest = path.join(targetBase, dir.name);
+        fs.mkdirSync(dest, { recursive: true });
+        fs.cpSync(dir.src, dest, { recursive: true, force: true });
+        installedForAgent++;
+      }
+      // Report distinct skills, not copies, so a mixed run matches a single-agent run.
+      skillsInstalled = Math.max(skillsInstalled, installedForAgent);
+    }
+
+    console.log(
+      `[skills] cloned ref=${skillsRepoRef ?? "unknown"} installed=${skillsInstalled} skill(s)`,
+    );
+    return { skillsInstalled, skillsRepoRef };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[skills] install failed: ${redactToken(msg)}`);
+    return { skillsInstalled: 0, skillsRepoRef: null };
+  } finally {
+    if (tmpDir) {
+      try {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      } catch {
+        // ignore cleanup errors
       }
     }
   }
