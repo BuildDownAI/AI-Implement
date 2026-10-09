@@ -13,7 +13,7 @@ A reference for the two test tiers that cover the Restate code under `src/restat
 | What it proves | The branch logic, the error mapping, the wire shapes, the time boundaries | What the engine does with the handler: serialisation, retry, idempotency, suspension, discovery metadata, ingress serde |
 | Cost | Milliseconds per test | About a second per scenario, plus one container boot per variant per file (seconds) |
 | Type-check | `npm run typecheck` excludes `src/__tests__` | `npx tsc --noEmit --project tsconfig.restate-tests.json` (the `restate-tests` CI job runs it) |
-| CI job | `unit-tests` in `.github/workflows/unit-tests.yml` | `restate-tests` in the same workflow, in parallel with `unit-tests`, on every PR to `testing`, `main`, and the grouping branches |
+| CI job | `unit-tests` in `.github/workflows/unit-tests.yml` | `restate-tests` (container runtime, one pass) and `restate-tests-binary` (binary runtime; three passes as a three-job matrix since AII-1158, kept from AII-993 so a scenario that fails one run in three fails the PR that adds it) in the same workflow, all in parallel with `unit-tests`, on every PR to `testing`, `main`, and the grouping branches |
 
 The default suite excludes `src/__tests__/restate/**` in `vitest.config.ts`, so a dispatched runner without Docker never sees these files.
 
@@ -163,6 +163,8 @@ An issue that adds or changes Restate behaviour writes the unit tests first, the
 npm run test:restate
 npx tsc --noEmit --project tsconfig.restate-tests.json
 ```
+
+The scenario runs set the Restate SDK log level to `WARN` (`vitest.restate.config.ts`, AII-1161), so the SDK's one-line-per-step `INFO` output stays out of the log. To see those lines for a local repro, run `RESTATE_LOGGING=INFO npm run test:restate`; the config accepts the SDK's five names (`TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`) in any case, keeps `WARN` for an empty value, and warns once and keeps `WARN` for an unknown name (`src/restate/log-level.ts`).
 
 Two runtimes serve the same scenario files (AII-914):
 
