@@ -1066,8 +1066,11 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         ? finalFeedback || "The model provider was unavailable and the run could not complete."
         : checksPermissionDenied
           ? finalFeedback || "Check runs could not be read due to a missing permission and the run could not complete review."
-          : `Automated review did not approve (${terminationReason} after ${iterations} iteration(s)). ` +
-            finalFeedback.slice(0, 500);
+          : terminationReason === "max_turns"
+            ? `The implementation did not finish within its turn budget (after ${iterations} iteration(s)). ` +
+              finalFeedback.slice(0, 500)
+            : `Automated review did not approve (${terminationReason} after ${iterations} iteration(s)). ` +
+              finalFeedback.slice(0, 500);
 
     const prKind = pushOutputs.draft === true ? "draft PR" : "PR";
     const prDisposition = prUrl
@@ -1079,7 +1082,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         ? `${prDisposition} — provider unavailable after ${iterations} iteration(s) (${terminationReason})`
         : checksPermissionDenied
           ? `${prDisposition} — check runs could not be read due to a missing permission after ${iterations} iteration(s) (${terminationReason})`
-          : `${prDisposition} — review unapproved after ${iterations} iteration(s) (${terminationReason})`;
+          : terminationReason === "max_turns"
+            ? `${prDisposition} — implementation ran out of turns after ${iterations} iteration(s) (max_turns)`
+            : `${prDisposition} — review unapproved after ${iterations} iteration(s) (${terminationReason})`;
 
     writeRunAutopsy(workspaceDir, {
       issueIdentifier,
@@ -1102,8 +1107,11 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
           : checksPermissionDenied
             ? `::warning::AI-Implement: check runs could not be read due to a missing permission after ${iterations} iteration(s) (${terminationReason}) — ` +
               (prUrl ? `${prKind} opened: ${prUrl}` : "no PR opened")
-            : `::warning::AI-Implement: review did not approve after ${iterations} iteration(s) (${terminationReason}) — ` +
-              (prUrl ? `${prKind} opened: ${prUrl}` : "no PR opened"),
+            : terminationReason === "max_turns"
+              ? `::warning::AI-Implement: implementation ran out of turns after ${iterations} iteration(s) (max_turns) — ` +
+                (prUrl ? `${prKind} opened: ${prUrl}` : "no PR opened")
+              : `::warning::AI-Implement: review did not approve after ${iterations} iteration(s) (${terminationReason}) — ` +
+                (prUrl ? `${prKind} opened: ${prUrl}` : "no PR opened"),
     );
     await reportRunnerResult(reviewFix, outputCommit, process.env, {
       workspaceDir,

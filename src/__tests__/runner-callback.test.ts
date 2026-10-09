@@ -2836,8 +2836,16 @@ describe("unapproved-run failure codes", () => {
 
   it("formatFailureComment renders MAX_TURNS_EXHAUSTED distinctly", () => {
     const comment = formatFailureComment("MAX_TURNS_EXHAUSTED", "hit the cap");
-    expect(comment).toContain("turn cap");
+    expect(comment).toContain("did not finish");
+    expect(comment).toContain("full turn budget");
+    expect(comment).not.toContain("finished without review approval");
     expect(comment).toContain("No PR could be opened");
+  });
+
+  it("formatFailureComment keeps the REVIEW_UNAPPROVED summary wording", () => {
+    expect(formatFailureComment("REVIEW_UNAPPROVED", "nope")).toContain(
+      "Implementation finished without review approval — the automated reviewer did not approve within the allotted iterations.",
+    );
   });
 
   it("unknown failureCode still falls through to the generic summary", () => {
