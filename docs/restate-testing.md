@@ -164,6 +164,8 @@ npm run test:restate
 npx tsc --noEmit --project tsconfig.restate-tests.json
 ```
 
+The scenario runs set the Restate SDK log level to `WARN` (`vitest.restate.config.ts`, AII-1161), so the SDK's one-line-per-step `INFO` output stays out of the log. To see those lines for a local repro, run `RESTATE_LOGGING=INFO npm run test:restate`; the config accepts the SDK's five names (`TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`) in any case, keeps `WARN` for an empty value, and warns once and keeps `WARN` for an unknown name (`src/restate/log-level.ts`).
+
 Two runtimes serve the same scenario files (AII-914):
 
 - **`container`**: `@restatedev/restate-sdk-testcontainers` boots `restatedev/restate:1.7.10`. Needs Docker; the first run pulls the image.
