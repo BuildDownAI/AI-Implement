@@ -164,6 +164,8 @@ npm run test:restate
 npx tsc --noEmit --project tsconfig.restate-tests.json
 ```
 
+`kg-refresh-workflow-scenarios.ts` is split into one test file per variant because that one file set the wall time of the whole pass (176 tests in one fork, about 127 s while the other files finished inside it); to run one variant, use `npx vitest run --config vitest.restate.config.ts src/__tests__/restate/kg-refresh-workflow-always-replay.restate.test.ts` (or the `-disable-retries` file). `startVariants(services, { only })` starts just the named variants, and tests that are not per-variant register only in the `alwaysReplay` file.
+
 Two runtimes serve the same scenario files (AII-914):
 
 - **`container`**: `@restatedev/restate-sdk-testcontainers` boots `restatedev/restate:1.7.10`. Needs Docker; the first run pulls the image.
@@ -249,7 +251,7 @@ tsconfig.restate-tests.json` passes as of the commit that added this section.
 
 ## `kg-refresh-pilot.restate.test.ts`: the switched kg-refresh path against production services (AII-896)
 
-`kg-refresh-workflow.restate.test.ts` (AII-894) runs `KgRefresh` and `KgRepo` against fakes for every
+`kg-refresh-workflow-scenarios.ts` (AII-894) runs `KgRefresh` and `KgRepo` against fakes for every
 dependency. This file composes them through `createProductionKgRefreshServices` and registers them with the
 real `orchestratorTools` service, so the gap between the two is covered before AII-685 deletes the legacy path.
 It adds no production file.
@@ -360,7 +362,7 @@ did not test). Scenarios follow four rules, and
    ```
 
 4. **A scenario that does not test a deadline runs with deadlines that are long against its own work; a scenario that
-   tests a deadline uses its own short-deadline environment.** `kg-refresh-workflow.restate.test.ts` serves both:
+   tests a deadline uses its own short-deadline environment.** `kg-refresh-workflow-always-replay.restate.test.ts` and `kg-refresh-workflow-disable-retries.restate.test.ts` serve both, through the shared `kg-refresh-workflow-scenarios.ts`:
    `envFor(label)` (30 s / 60 s) and `deadlineEnvFor(label)` (the short deadlines).
 
 `settle(ms)` is the only permitted wait, and only before a **negative** assertion ("nothing more happens"). A raw
