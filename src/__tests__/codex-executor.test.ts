@@ -5,7 +5,7 @@ import { execFileSync, type spawn, type ChildProcessWithoutNullStreams } from "n
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { CodexExecutor, CodexPlanningPolicyUnprovenError, CodexRecoveryRequiredError, matchesSchema, type CodexExecutorOptions } from "../pipeline/codex-executor.js";
+import { CODEX_SHELL_ENV_EXCLUDE, CodexExecutor, CodexPlanningPolicyUnprovenError, CodexRecoveryRequiredError, matchesSchema, type CodexExecutorOptions } from "../pipeline/codex-executor.js";
 import { ModelAuthClientError, type ModelAuthClient, type ModelInvocation } from "../model-auth-client.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { READ_ONLY_TOOL_PARAMS } from "../pipeline/steps/read-only-tools.js";
@@ -637,14 +637,24 @@ describe("publication credential guard", () => {
   }
 });
 
+const SHELL_POLICY = `shell_environment_policy.exclude=${JSON.stringify(CODEX_SHELL_ENV_EXCLUDE)}`;
+
+describe("shell environment exclude list (AII-1193)", () => {
+  it("names exactly the credential variables, in order", () => {
+    expect([...CODEX_SHELL_ENV_EXCLUDE]).toEqual(["CODEX_API_KEY", "CODEX_HOME", "CHATGPT_PLAN_ACCESS_TOKEN", "OPENAI_API_KEY", "OPENAI_BASE_URL"]);
+  });
+});
+
 describe("default exec path is unchanged (AII-1001)", () => {
   it("passes the exact pinned exec argv and never selects the app-server transport", async () => {
     const { executor, log } = make([{ stdout: message("done") }]);
     await executor.invoke({ ...base, builtinTools: ["Read"] });
     expect(log[0].cmd).toBe("codex");
     expect(log[0].args).toEqual([
-      "exec", "--json", "--ignore-user-config", "--ignore-rules", "--model", "gpt-synthetic", "-c", 'model_provider="openai"', "--sandbox", "read-only", "-",
+      "exec", "--json", "--ignore-user-config", "--ignore-rules", "--model", "gpt-synthetic", "-c", 'model_provider="openai"', "-c", SHELL_POLICY, "--sandbox", "read-only", "-",
     ]);
+    expect(log[0].args.indexOf(SHELL_POLICY)).toBeGreaterThan(log[0].args.indexOf("--ignore-rules"));
+    expect(log[0].args.join(" ")).not.toContain("inherit");
   });
 });
 
@@ -694,6 +704,7 @@ describe("protocol driver seam (AII-1001)", () => {
       "-c", "features.goals=false",
       "-c", "features.unified_exec=false",
       "-c", 'web_search="disabled"',
+      "-c", SHELL_POLICY,
     ]);
     expect(log[0].args).not.toContain("exec");
     expect(log[0].args).not.toContain("--ignore-user-config");
