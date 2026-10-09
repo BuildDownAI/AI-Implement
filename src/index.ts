@@ -1,3 +1,5 @@
+// Must stay first: sets RESTATE_LOGGING before the Restate SDK loads and reads it (AII-1189).
+import "./restate/log-level-boot.js";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
