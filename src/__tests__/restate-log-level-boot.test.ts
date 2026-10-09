@@ -27,9 +27,10 @@ describe("log-level-boot", () => {
     const cases: Array<[string, string, number]> = [
       ["", "WARN", 0],
       ["off", "WARN", 1],
-      ["debug", "DEBUG", 1],
+      ["debug", "DEBUG", 0],
     ];
     for (const [input, expected, warnings] of cases) {
+      warn.mockClear();
       vi.resetModules();
       process.env.RESTATE_LOGGING = input;
       await import("../restate/log-level-boot.js");
