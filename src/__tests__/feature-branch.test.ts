@@ -1,43 +1,19 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { resolveBaseBranch, resolvePlanningBranch, nonTerminalDesignatedChildren, type FeatureChildState } from "../feature-branch.js";
-import type { RepoMapping } from "../config.js";
-import type { FeatureBranchChainEntry, TicketIssue } from "../providers/types.js";
+import { describe, it, expect, vi, afterEach } from "vitest";
+import {
+  findOpenRollUpPr,
+  nonTerminalDesignatedChildren,
+  resolveBaseBranch,
+  resolvePlanningBranch,
+  type FeatureChildState,
+} from "../feature-branch.js";
+import { makeIssue, makeMapping } from "./helpers/builders.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
 
-function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
-  return {
-    owner: "acme",
-    repo: "widget",
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "testing",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: false,
-    planningWorkflowFile: "",
-    autoApprovePlans: true,
-    extraEnv: {},
-    provider: "anthropic",
-    ticketingProvider: "linear",
-    ticketingConfig: { kind: "linear" },
-    awsRegion: null,
-    paused: false,
-    ...overrides,
-  };
-}
-
-function makeIssue(featureBranchChain?: FeatureBranchChainEntry[]): TicketIssue {
-  return {
-    id: "child-uuid",
-    identifier: "OOL-87",
-    title: "Child work",
-    description: null,
-    scopeKey: "OOL",
-    nativeStatus: "Todo (unstarted)",
-    ...(featureBranchChain ? { featureBranchChain } : {}),
-  };
-}
+const mapping = makeMapping({ defaultBranch: "testing" });
+const REFS = "/repos/test-org/test-repo/git/ref/heads";
+const ool78 = { identifier: "OOL-78", mode: "feature" as const };
+const ool96 = { identifier: "OOL-96", mode: "feature" as const };
+const sha = (value: string) => ({ json: { object: { sha: value } } });
 
 // AII-609: "terminal" means the tracker's own workflow state — completed or cancelled —
 // independent of whether an orchestrator job row exists for the child. A child mid
@@ -73,104 +49,95 @@ describe("nonTerminalDesignatedChildren", () => {
 });
 
 describe("resolveBaseBranch", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("returns the feature branch and ensures it from defaultBranch for a single-entry chain", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({ ok: false, status: 404 } as Response)                               // feature branch missing
-      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ object: { sha: "base-sha" } }) } as Response) // base head
-      .mockResolvedValueOnce({ ok: true, status: 201 } as Response);                                // create ref
+    const github = fakeFetch({
+      [`GET ${REFS}/ai-implement/feature/ool-78`]: { status: 404 },
+      [`GET ${REFS}/testing`]: sha("base-sha"),
+      "POST /repos/test-org/test-repo/git/refs": { status: 201 },
+    });
+    github.install();
 
-    const base = await resolveBaseBranch({ ghToken: "t", issue: makeIssue([{ identifier: "OOL-78", mode: "feature" }]), mapping: makeMapping() });
+    const base = await resolveBaseBranch({ ghToken: "t", issue: makeIssue({ featureBranchChain: [ool78] }), mapping });
 
     expect(base).toBe("ai-implement/feature/ool-78");
-    const createBody = JSON.parse((vi.mocked(fetch).mock.calls[2][1] as RequestInit).body as string);
-    expect(createBody).toEqual({ ref: "refs/heads/ai-implement/feature/ool-78", sha: "base-sha" });
+    expect(JSON.parse(github.calls[2].body)).toEqual({ ref: "refs/heads/ai-implement/feature/ool-78", sha: "base-sha" });
   });
 
   it("cascades a multi-entry chain: each branch cut from the previous one", async () => {
-    vi.mocked(fetch)
-      // ensure OOL-78 (missing → cut from testing)
-      .mockResolvedValueOnce({ ok: false, status: 404 } as Response)
-      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ object: { sha: "testing-sha" } }) } as Response)
-      .mockResolvedValueOnce({ ok: true, status: 201 } as Response)
-      // ensure OOL-96 (missing → cut from OOL-78 branch)
-      .mockResolvedValueOnce({ ok: false, status: 404 } as Response)
-      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ object: { sha: "f78-sha" } }) } as Response)
-      .mockResolvedValueOnce({ ok: true, status: 201 } as Response);
-
-    const base = await resolveBaseBranch({
-      ghToken: "t",
-      issue: makeIssue([{ identifier: "OOL-78", mode: "feature" }, { identifier: "OOL-96", mode: "feature" }]),
-      mapping: makeMapping(),
+    const github = fakeFetch({
+      // OOL-78 is missing until it is created; OOL-96 is then cut from its head.
+      [`GET ${REFS}/ai-implement/feature/ool-78`]: [{ status: 404 }, sha("f78-sha")],
+      [`GET ${REFS}/testing`]: sha("testing-sha"),
+      [`GET ${REFS}/ai-implement/feature/ool-96`]: { status: 404 },
+      "POST /repos/test-org/test-repo/git/refs": [{ status: 201 }, { status: 201 }],
     });
+    github.install();
+
+    const base = await resolveBaseBranch({ ghToken: "t", issue: makeIssue({ featureBranchChain: [ool78, ool96] }), mapping });
 
     expect(base).toBe("ai-implement/feature/ool-96");
-    // The OOL-78 branch is read from refs/heads/testing; the OOL-96 branch is cut from the OOL-78 branch head.
-    const f78Sha = JSON.parse((vi.mocked(fetch).mock.calls[2][1] as RequestInit).body as string).sha;
-    expect(f78Sha).toBe("testing-sha");
-    const f96Sha = JSON.parse((vi.mocked(fetch).mock.calls[5][1] as RequestInit).body as string).sha;
-    expect(f96Sha).toBe("f78-sha");
-    expect(vi.mocked(fetch).mock.calls[4][0]).toContain("ai-implement/feature/ool-78");
+    expect(github.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      `GET ${REFS}/ai-implement/feature/ool-78`,
+      `GET ${REFS}/testing`,
+      "POST /repos/test-org/test-repo/git/refs",
+      `GET ${REFS}/ai-implement/feature/ool-96`,
+      `GET ${REFS}/ai-implement/feature/ool-78`,
+      "POST /repos/test-org/test-repo/git/refs",
+    ]);
+    expect(JSON.parse(github.calls[2].body).sha).toBe("testing-sha");
+    expect(JSON.parse(github.calls[5].body)).toEqual({ ref: "refs/heads/ai-implement/feature/ool-96", sha: "f78-sha" });
   });
 
   it("returns defaultBranch and creates nothing when there is no chain", async () => {
-    const base = await resolveBaseBranch({ ghToken: "t", issue: makeIssue(undefined), mapping: makeMapping() });
+    const github = fakeFetch({});
+    github.install();
+
+    const base = await resolveBaseBranch({ ghToken: "t", issue: makeIssue(), mapping });
+
     expect(base).toBe("testing");
-    expect(vi.mocked(fetch).mock.calls.length).toBe(0);
+    expect(github.calls).toHaveLength(0);
   });
 
   it("fails closed when a grouped branch cannot be resolved", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 500, text: async () => "boom" } as Response);
+    fakeFetch({ [`GET ${REFS}/ai-implement/feature/ool-78`]: { status: 500, text: "boom" } }).install();
 
-    await expect(resolveBaseBranch({
-      ghToken: "t",
-      issue: makeIssue([{ identifier: "OOL-78", mode: "feature" }]),
-      mapping: makeMapping(),
-    })).rejects.toThrow(/refusing to dispatch against "testing"/);
+    await expect(resolveBaseBranch({ ghToken: "t", issue: makeIssue({ featureBranchChain: [ool78] }), mapping }))
+      .rejects.toThrow(/refusing to dispatch against "testing"/);
   });
 });
 
 // AII-898: read-only counterpart used by planning dispatch — must never create a branch.
 describe("resolvePlanningBranch", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
   afterEach(() => { vi.restoreAllMocks(); });
 
   it("returns the chain's target branch when it already exists", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ object: { sha: "tip-sha" } }) } as Response);
+    const github = fakeFetch({ [`GET ${REFS}/ai-implement/feature/ool-78`]: sha("tip-sha") });
+    github.install();
 
-    const branch = await resolvePlanningBranch({
-      ghToken: "t",
-      issue: makeIssue([{ identifier: "OOL-78", mode: "feature" }]),
-      mapping: makeMapping(),
-    });
+    const branch = await resolvePlanningBranch({ ghToken: "t", issue: makeIssue({ featureBranchChain: [ool78] }), mapping });
 
     expect(branch).toBe("ai-implement/feature/ool-78");
-    expect(vi.mocked(fetch).mock.calls.length).toBe(1); // one existence check, no branch creation
+    expect(github.calls).toHaveLength(1); // one existence check, no branch creation
   });
 
   it("only checks the chain's last entry for a multi-entry chain", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ object: { sha: "tip-sha" } }) } as Response);
+    const github = fakeFetch({ [`GET ${REFS}/ai-implement/feature/ool-96`]: sha("tip-sha") });
+    github.install();
 
-    const branch = await resolvePlanningBranch({
-      ghToken: "t",
-      issue: makeIssue([{ identifier: "OOL-78", mode: "feature" }, { identifier: "OOL-96", mode: "feature" }]),
-      mapping: makeMapping(),
-    });
+    const branch = await resolvePlanningBranch({ ghToken: "t", issue: makeIssue({ featureBranchChain: [ool78, ool96] }), mapping });
 
     expect(branch).toBe("ai-implement/feature/ool-96");
-    expect(vi.mocked(fetch).mock.calls.length).toBe(1);
+    expect(github.calls).toHaveLength(1);
   });
 
   it("returns null and logs once when the chain's branch does not exist yet", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 404 } as Response);
+    fakeFetch({ [`GET ${REFS}/ai-implement/feature/ool-78`]: { status: 404 } }).install();
 
     const branch = await resolvePlanningBranch({
       ghToken: "t",
-      issue: makeIssue([{ identifier: "OOL-78", mode: "feature" }]),
-      mapping: makeMapping(),
+      issue: makeIssue({ identifier: "OOL-87", scopeKey: "OOL", featureBranchChain: [ool78] }),
+      mapping,
     });
 
     expect(branch).toBeNull();
@@ -181,38 +148,37 @@ describe("resolvePlanningBranch", () => {
   });
 
   it("returns null and makes no request when there is no chain", async () => {
-    const branch = await resolvePlanningBranch({ ghToken: "t", issue: makeIssue(undefined), mapping: makeMapping() });
+    const github = fakeFetch({});
+    github.install();
+
+    const branch = await resolvePlanningBranch({ ghToken: "t", issue: makeIssue(), mapping });
+
     expect(branch).toBeNull();
-    expect(vi.mocked(fetch).mock.calls.length).toBe(0);
+    expect(github.calls).toHaveLength(0);
   });
 });
 
 describe("findOpenRollUpPr (parent no-work churn guard)", () => {
-  const mapping = { owner: "o", repo: "r", defaultBranch: "testing" } as never;
-  const parent = (id: string) => ({
-    id, identifier: id, title: "t", description: null, scopeKey: "T", nativeStatus: "todo",
-    featureBranchChain: [{ identifier: id, mode: "feature" as const }],
-  }) as never;
+  const parent = (identifier: string) =>
+    makeIssue({ identifier, scopeKey: "P", featureBranchChain: [{ identifier, mode: "feature" }] });
 
   it("returns the PR when an open roll-up exists for the parent's feature branch", async () => {
     const finder = vi.fn(async () => ({ number: 42, url: "u", state: "open" as const, merged: false }));
-    const { findOpenRollUpPr } = await import("../feature-branch.js");
     const pr = await findOpenRollUpPr({ ghToken: "tok", issue: parent("P-1"), mapping, finder });
     expect(pr).toEqual({ number: 42, url: "u" });
-    expect(finder).toHaveBeenCalledWith("tok", "o", "r", "ai-implement/feature/p-1", "testing");
+    expect(finder).toHaveBeenCalledWith("tok", "test-org", "test-repo", "ai-implement/feature/p-1", "testing");
   });
 
   it("returns null for merged/closed roll-ups and for non-parent (leaf) chains", async () => {
-    const { findOpenRollUpPr } = await import("../feature-branch.js");
     const merged = vi.fn(async () => ({ number: 1, url: "u", state: "closed" as const, merged: true }));
     expect(await findOpenRollUpPr({ ghToken: "t", issue: parent("P-2"), mapping, finder: merged })).toBeNull();
     // leaf: chain ends at an ancestor, not itself -> guard does not apply, finder never called
     const leafFinder = vi.fn();
-    const leaf = { ...(parent("C-1") as object), featureBranchChain: [{ identifier: "P-9", mode: "feature" }] } as never;
+    const leaf = makeIssue({ featureBranchChain: [{ identifier: "P-9", mode: "feature" }] });
     expect(await findOpenRollUpPr({ ghToken: "t", issue: leaf, mapping, finder: leafFinder })).toBeNull();
     expect(leafFinder).not.toHaveBeenCalled();
     // empty chain
-    const bare = { ...(parent("X-1") as object), featureBranchChain: [] } as never;
+    const bare = makeIssue({ featureBranchChain: [] });
     expect(await findOpenRollUpPr({ ghToken: "t", issue: bare, mapping, finder: leafFinder })).toBeNull();
   });
 });

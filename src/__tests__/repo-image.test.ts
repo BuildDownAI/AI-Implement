@@ -1,27 +1,17 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveSessionImage, resolveDefaultRunnerImage, selectRunnerImageInput, resolveRunnerImageForDispatch, resolveChannelCommit, stripImageTag, __clearRepoImageCacheForTests } from "../repo-image.js";
+import { fakeFetch, hangUntilAborted, type FakeFetch, type Reply, type Routes } from "./helpers/fake-fetch.js";
 
 const DEFAULT_IMAGE = "ghcr.io/builddownai/ai-implement-runner:latest";
 
-function mockFetch(
-  status: number,
-  body: string | null,
-): ReturnType<typeof vi.fn> {
-  return vi.fn().mockResolvedValue({
-    ok: status >= 200 && status < 300,
-    status,
-    text: async () => body ?? "",
-    json: async () => (body ? JSON.parse(body) : null),
-  });
+/** GitHub's contents API answering for acme/widgets' `.ai-implement/image.yml`. */
+function imageYml(reply: Reply): FakeFetch {
+  return fakeFetch({ "GET /repos/acme/widgets/contents/.ai-implement/image.yml": reply });
 }
 
 // GitHub contents API returns JSON with base64-encoded `content` for file blobs.
-function contentsApiResponse(fileBody: string): string {
-  return JSON.stringify({
-    type: "file",
-    encoding: "base64",
-    content: Buffer.from(fileBody, "utf8").toString("base64"),
-  });
+function contentsApiResponse(fileBody: string): Reply {
+  return { json: { type: "file", encoding: "base64", content: Buffer.from(fileBody, "utf8").toString("base64") } };
 }
 
 describe("resolveSessionImage", () => {
@@ -30,62 +20,62 @@ describe("resolveSessionImage", () => {
   });
 
   it("returns the override when image.yml has a valid image:", async () => {
-    const fetchImpl = mockFetch(200, contentsApiResponse("image: ghcr.io/acme/my-runner:v3\n"));
+    const github = imageYml(contentsApiResponse("image: ghcr.io/acme/my-runner:v3\n"));
     const result = await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: github.fetch,
     });
     expect(result).toEqual({ image: "ghcr.io/acme/my-runner:v3", source: "override" });
-    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(github.calls).toHaveLength(1);
   });
 
   it("returns the default when the file is 404", async () => {
-    const fetchImpl = mockFetch(404, "Not Found");
+    const github = imageYml({ status: 404, text: "Not Found" });
     const result = await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: github.fetch,
     });
     expect(result).toEqual({ image: DEFAULT_IMAGE, source: "default" });
   });
 
   it("returns the default when YAML is malformed (no image: key)", async () => {
-    const fetchImpl = mockFetch(200, contentsApiResponse("something: else\n"));
+    const github = imageYml(contentsApiResponse("something: else\n"));
     const result = await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: github.fetch,
     });
     expect(result).toEqual({ image: DEFAULT_IMAGE, source: "default" });
   });
 
   it("returns the default when image: value fails validation (whitespace)", async () => {
-    const fetchImpl = mockFetch(200, contentsApiResponse("image: not a valid image\n"));
+    const github = imageYml(contentsApiResponse("image: not a valid image\n"));
     const result = await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: github.fetch,
     });
     expect(result).toEqual({ image: DEFAULT_IMAGE, source: "default" });
   });
 
   it("returns the default when image: value lacks a tag (no colon)", async () => {
-    const fetchImpl = mockFetch(200, contentsApiResponse("image: ghcr.io/acme/runner\n"));
+    const github = imageYml(contentsApiResponse("image: ghcr.io/acme/runner\n"));
     const result = await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: github.fetch,
     });
     expect(result).toEqual({ image: DEFAULT_IMAGE, source: "default" });
   });
@@ -93,80 +83,77 @@ describe("resolveSessionImage", () => {
   it("accepts digest references (@sha256:...)", async () => {
     const digestRef =
       "ghcr.io/acme/my-runner@sha256:deadbeefcafebabe0000000000000000000000000000000000000000000000ab";
-    const fetchImpl = mockFetch(200, contentsApiResponse(`image: ${digestRef}\n`));
+    const github = imageYml(contentsApiResponse(`image: ${digestRef}\n`));
     const result = await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: github.fetch,
     });
     expect(result).toEqual({ image: digestRef, source: "override" });
   });
 
   it("ignores other keys in the YAML", async () => {
-    const fetchImpl = mockFetch(
-      200,
-      contentsApiResponse("image: ghcr.io/acme/my-runner:v3\napt: [terraform]\nfuture_knob: 42\n"),
-    );
+    const github = imageYml(contentsApiResponse("image: ghcr.io/acme/my-runner:v3\napt: [terraform]\nfuture_knob: 42\n"));
     const result = await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: github.fetch,
     });
     expect(result).toEqual({ image: "ghcr.io/acme/my-runner:v3", source: "override" });
   });
 
   it("caches results for 60 seconds per owner/repo", async () => {
-    const fetchImpl = mockFetch(200, contentsApiResponse("image: ghcr.io/acme/my-runner:v3\n"));
+    const github = imageYml(contentsApiResponse("image: ghcr.io/acme/my-runner:v3\n"));
     await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: github.fetch,
     });
     await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: github.fetch,
     });
-    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(github.calls).toHaveLength(1);
   });
 
   it("does not cache 404s forever — negative result is also cached for TTL but returns default", async () => {
-    const fetchImpl = mockFetch(404, "Not Found");
+    const github = imageYml({ status: 404, text: "Not Found" });
     const a = await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: github.fetch,
     });
     const b = await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: github.fetch,
     });
     expect(a).toEqual({ image: DEFAULT_IMAGE, source: "default" });
     expect(b).toEqual({ image: DEFAULT_IMAGE, source: "default" });
-    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(github.calls).toHaveLength(1);
   });
 
   it("returns the default and does not throw when the API returns 500", async () => {
-    const fetchImpl = mockFetch(500, "Internal Server Error");
+    const github = imageYml({ status: 500, text: "Internal Server Error" });
     const result = await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: github.fetch,
     });
     expect(result).toEqual({ image: DEFAULT_IMAGE, source: "default" });
   });
@@ -238,40 +225,40 @@ describe("resolveRunnerImageForDispatch", () => {
   });
 
   it("forwards a per-repo override even when the orchestrator default is implicit", async () => {
-    const fetchImpl = mockFetch(200, contentsApiResponse("image: ghcr.io/acme/my-runner:v3\n"));
+    const github = imageYml(contentsApiResponse("image: ghcr.io/acme/my-runner:v3\n"));
     const image = await resolveRunnerImageForDispatch({
       owner: "acme",
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
       runnerImageExplicit: false,
-      fetchImpl,
+      fetchImpl: github.fetch,
     });
     expect(image).toBe("ghcr.io/acme/my-runner:v3");
   });
 
   it("forwards the orchestrator default when it is explicitly set (e.g. testing pinned to :next)", async () => {
-    const fetchImpl = mockFetch(404, null); // no per-repo override
+    const github = imageYml({ status: 404 }); // no per-repo override
     const image = await resolveRunnerImageForDispatch({
       owner: "acme",
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: "ghcr.io/builddownai/ai-implement-runner:next",
       runnerImageExplicit: true,
-      fetchImpl,
+      fetchImpl: github.fetch,
     });
     expect(image).toBe("ghcr.io/builddownai/ai-implement-runner:next");
   });
 
   it("forwards nothing when neither an override nor an explicit default is set", async () => {
-    const fetchImpl = mockFetch(404, null);
+    const github = imageYml({ status: 404 });
     const image = await resolveRunnerImageForDispatch({
       owner: "acme",
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
       runnerImageExplicit: false,
-      fetchImpl,
+      fetchImpl: github.fetch,
     });
     expect(image).toBeUndefined();
   });
@@ -303,87 +290,29 @@ describe("stripImageTag", () => {
 
 // ── resolveChannelCommit ──────────────────────────────────────────────────────
 
-// Builds a controlled fetch mock for the two-round-trip OCI label flow.
-// Supports an optional 401 challenge before the manifest, and routes config blob
-// fetches separately.
-function buildChannelCommitFetch(opts: {
-  manifestStatus?: number;
-  manifestBody?: object | null;
-  configStatus?: number;
-  configBody?: object | null;
-  useAuthChallenge?: boolean;
-}): typeof fetch {
-  const {
-    manifestStatus = 200,
-    manifestBody = {
-      config: { digest: "sha256:configdigest" },
-    },
-    configStatus = 200,
-    configBody = {
-      config: {
-        Labels: { "org.opencontainers.image.revision": "abc1234567890" },
-      },
-    },
-    useAuthChallenge = false,
-  } = opts;
+const MANIFEST = "GET /v2/builddownai/ai-implement-runner/manifests/next";
+const CONFIG_BLOB = "GET /v2/builddownai/ai-implement-runner/blobs/sha256:configdigest";
+const AUTH_CHALLENGE =
+  'Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:builddownai/ai-implement-runner:pull"';
 
-  let manifestCallCount = 0;
-  return vi.fn(async (url: string, init?: RequestInit) => {
-    const urlStr = String(url);
+/** The registry's two-round-trip OCI label flow: the manifest names the config blob, whose labels carry the commit. */
+function registry(overrides: Routes = {}): FakeFetch {
+  return fakeFetch({
+    [MANIFEST]: { json: { config: { digest: "sha256:configdigest" } } },
+    [CONFIG_BLOB]: { json: { config: { Labels: { "org.opencontainers.image.revision": "abc1234567890" } } } },
+    ...overrides,
+  });
+}
 
-    // Token endpoint
-    if (urlStr.includes("ghcr.io/token")) {
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({ token: "test-token" }),
-        headers: { get: () => null },
-      } as unknown as Response;
-    }
-
-    // Manifest endpoint
-    if (urlStr.includes("/manifests/")) {
-      manifestCallCount++;
-      const headers = (init?.headers as Record<string, string>) ?? {};
-      if (useAuthChallenge && !headers["Authorization"]) {
-        return {
-          ok: false,
-          status: 401,
-          json: async () => ({}),
-          headers: {
-            get: (k: string) =>
-              k === "www-authenticate"
-                ? 'Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:builddownai/ai-implement-runner:pull"'
-                : null,
-          },
-        } as unknown as Response;
-      }
-      if (manifestStatus !== 200) {
-        return { ok: false, status: manifestStatus, json: async () => ({}), headers: { get: () => null } } as unknown as Response;
-      }
-      return {
-        ok: true,
-        status: 200,
-        json: async () => manifestBody ?? {},
-        headers: { get: () => null },
-      } as unknown as Response;
-    }
-
-    // Config blob endpoint
-    if (urlStr.includes("/blobs/")) {
-      if (configStatus !== 200) {
-        return { ok: false, status: configStatus, json: async () => ({}), headers: { get: () => null } } as unknown as Response;
-      }
-      return {
-        ok: true,
-        status: 200,
-        json: async () => configBody ?? {},
-        headers: { get: () => null },
-      } as unknown as Response;
-    }
-
-    return { ok: false, status: 404, json: async () => ({}), headers: { get: () => null } } as unknown as Response;
-  }) as unknown as typeof fetch;
+/** A registry that answers the manifest with a 401 challenge until a bearer token from its token endpoint is sent. */
+function challengingRegistry(): FakeFetch {
+  return registry({
+    [MANIFEST]: ({ headers }) =>
+      headers.has("authorization")
+        ? { json: { config: { digest: "sha256:configdigest" } } }
+        : { status: 401, json: {}, headers: { "www-authenticate": AUTH_CHALLENGE } },
+    "GET /token": { json: { token: "test-token" } },
+  });
 }
 
 describe("resolveChannelCommit", () => {
@@ -391,143 +320,99 @@ describe("resolveChannelCommit", () => {
   const CHANNEL_TAG = "next";
 
   it("returns SHA from org.opencontainers.image.revision label (happy path)", async () => {
-    const fetchImpl = buildChannelCommitFetch({});
-    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    const ghcr = registry();
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, ghcr.fetch);
     expect(result).toBe("abc1234567890");
   });
 
   it("falls back to AI_IMPLEMENT_SOURCE_COMMIT label when revision is absent", async () => {
-    const fetchImpl = buildChannelCommitFetch({
-      configBody: {
-        config: { Labels: { AI_IMPLEMENT_SOURCE_COMMIT: "fallbacksha" } },
-      },
-    });
-    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    const ghcr = registry({ [CONFIG_BLOB]: { json: { config: { Labels: { AI_IMPLEMENT_SOURCE_COMMIT: "fallbacksha" } } } } });
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, ghcr.fetch);
     expect(result).toBe("fallbacksha");
   });
 
   it("returns null when both labels are absent", async () => {
-    const fetchImpl = buildChannelCommitFetch({
-      configBody: { config: { Labels: { unrelated: "value" } } },
-    });
-    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    const ghcr = registry({ [CONFIG_BLOB]: { json: { config: { Labels: { unrelated: "value" } } } } });
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, ghcr.fetch);
     expect(result).toBeNull();
   });
 
   it("returns null when config has no Labels field", async () => {
-    const fetchImpl = buildChannelCommitFetch({
-      configBody: { config: {} },
-    });
-    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    const ghcr = registry({ [CONFIG_BLOB]: { json: { config: {} } } });
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, ghcr.fetch);
     expect(result).toBeNull();
   });
 
   it("handles auth challenge: 401 → token fetch → retry manifest with Bearer", async () => {
-    const fetchImpl = buildChannelCommitFetch({ useAuthChallenge: true });
-    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    const ghcr = challengingRegistry();
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, ghcr.fetch);
     expect(result).toBe("abc1234567890");
     // Should have called: manifest (401), token, manifest (200), config blob = 4 calls
-    expect((fetchImpl as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(4);
+    expect(ghcr.calls.map((c) => `${c.method} ${c.path}`)).toEqual([MANIFEST, "GET /token", MANIFEST, CONFIG_BLOB]);
+    expect(ghcr.calls[2].headers.get("authorization")).toBe("Bearer test-token");
   });
 
   it("returns null when 401 has no www-authenticate realm", async () => {
-    const fetchImpl = vi.fn(async () => ({
-      ok: false,
-      status: 401,
-      json: async () => ({}),
-      headers: { get: () => null },
-    })) as unknown as typeof fetch;
-    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    const ghcr = fakeFetch({ [MANIFEST]: { status: 401, json: {} } });
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, ghcr.fetch);
     expect(result).toBeNull();
   });
 
   it("returns null on manifest 404", async () => {
-    const fetchImpl = buildChannelCommitFetch({ manifestStatus: 404 });
-    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    const ghcr = registry({ [MANIFEST]: { status: 404, json: {} } });
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, ghcr.fetch);
     expect(result).toBeNull();
   });
 
   it("returns null on network error (fetch throws)", async () => {
-    const fetchImpl = vi.fn(async () => {
-      throw new Error("ECONNREFUSED");
-    }) as unknown as typeof fetch;
-    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    const ghcr = fakeFetch({
+      [MANIFEST]: () => {
+        throw new Error("ECONNREFUSED");
+      },
+    });
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, ghcr.fetch);
     expect(result).toBeNull();
   });
 
   it("returns null when manifest JSON has no config digest", async () => {
-    const fetchImpl = buildChannelCommitFetch({
-      manifestBody: { schemaVersion: 2 },
-    });
-    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    const ghcr = registry({ [MANIFEST]: { json: { schemaVersion: 2 } } });
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, ghcr.fetch);
     expect(result).toBeNull();
   });
 
   it("returns null on config blob fetch failure", async () => {
-    const fetchImpl = buildChannelCommitFetch({ configStatus: 500 });
-    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    const ghcr = registry({ [CONFIG_BLOB]: { status: 500, json: {} } });
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, ghcr.fetch);
     expect(result).toBeNull();
   });
 
   it("returns null when config json() throws (malformed JSON)", async () => {
-    const fetchImpl = vi.fn(async (url: string) => {
-      const urlStr = String(url);
-      if (urlStr.includes("/manifests/")) {
-        return {
-          ok: true,
-          status: 200,
-          json: async () => ({ config: { digest: "sha256:xyz" } }),
-          headers: { get: () => null },
-        } as unknown as Response;
-      }
-      if (urlStr.includes("/blobs/")) {
-        return {
-          ok: true,
-          status: 200,
-          json: async () => { throw new SyntaxError("Unexpected token"); },
-          headers: { get: () => null },
-        } as unknown as Response;
-      }
-      return { ok: false, status: 404, json: async () => ({}), headers: { get: () => null } } as unknown as Response;
-    }) as unknown as typeof fetch;
-    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    const ghcr = registry({ [CONFIG_BLOB]: { text: "{ not json" } });
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, ghcr.fetch);
     expect(result).toBeNull();
   });
 
   it("returns null when imageBase has no slash (unparseable ref)", async () => {
-    const fetchImpl = vi.fn() as unknown as typeof fetch;
-    const result = await resolveChannelCommit("ubuntu", "next", fetchImpl);
+    const ghcr = fakeFetch({});
+    const result = await resolveChannelCommit("ubuntu", "next", ghcr.fetch);
     expect(result).toBeNull();
-    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(ghcr.calls).toHaveLength(0);
   });
 
   it("passes AbortSignal to every fetch call", async () => {
-    const signals: (AbortSignal | null | undefined)[] = [];
-    const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
-      signals.push(init?.signal ?? null);
-      return buildChannelCommitFetch({})(url, init);
-    }) as unknown as typeof fetch;
-    await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
-    expect(signals.length).toBeGreaterThan(0);
-    for (const signal of signals) {
-      expect(signal).toBeInstanceOf(AbortSignal);
+    const ghcr = challengingRegistry();
+    await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, ghcr.fetch);
+    expect(ghcr.calls).toHaveLength(4);
+    for (const call of ghcr.calls) {
+      expect(call.signal).toBeInstanceOf(AbortSignal);
     }
   });
 
   it("returns null when registry hangs and the timeout fires", async () => {
     vi.useFakeTimers();
-    const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => {
-      return new Promise<Response>((_resolve, reject) => {
-        const signal = init?.signal as AbortSignal | undefined;
-        if (signal) {
-          signal.addEventListener("abort", () =>
-            reject(new DOMException("Aborted", "AbortError")),
-          );
-        }
-      });
-    }) as unknown as typeof fetch;
+    const ghcr = fakeFetch({ [MANIFEST]: hangUntilAborted });
 
-    const resultPromise = resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl, 5_000);
+    const resultPromise = resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, ghcr.fetch, 5_000);
     await vi.advanceTimersByTimeAsync(5_001);
     const result = await resultPromise;
     expect(result).toBeNull();

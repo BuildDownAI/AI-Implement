@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import os from "node:os";
-import path from "node:path";
 import { readFileSync } from "node:fs";
 import type * as DeployModule from "../deploy.js";
 import { RestateDrainCoordinator } from "../restate/drain.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
+import { testDb } from "./helpers/test-db.js";
+import { testDir } from "./helpers/test-dir.js";
 
 let deploy: typeof DeployModule;
 
@@ -16,12 +18,20 @@ const DRAINED_PROBES = {
 
 beforeEach(async () => {
   vi.resetModules();
-  // deploy.ts reaches dedup.ts through deploy-hold.ts, and dedup resolves its path at
-  // module load. Point it somewhere writable so the import doesn't warn; no test here
-  // opens the database.
-  process.env.DEDUP_DB_PATH = path.join(os.tmpdir(), `deploy-test-${Date.now()}.sqlite`);
   deploy = await import("../deploy.js");
 });
+
+/** Prepares a test whose deploy runs past `start()` in the background: its scratch directory goes
+ *  under a `testDir` instead of the OS temp directory, and its flyctl download gets a 404, so it
+ *  fails before any subprocess. The download is a stubbed global, not a `fakeFetch` route, because
+ *  its URL embeds an unexported version and the runtime arch. Undone by `vi.unstubAllEnvs()` and
+ *  `vi.unstubAllGlobals()`. */
+function containBackgroundDeploy(): void {
+  // deployScratch() creates its directory under os.tmpdir(), which reads these per call.
+  const tempRoot = testDir("deploy");
+  for (const name of ["TMPDIR", "TEMP", "TMP"]) vi.stubEnv(name, tempRoot);
+  vi.stubGlobal("fetch", vi.fn(async () => new Response("nope", { status: 404 })));
+}
 
 const ARGS = {
   app: "orchestrator",
@@ -228,45 +238,39 @@ describe("makeStartDeploy", () => {
     expect(typeof deploy.makeStartDeploy({ ...configured, kgSourceRepo: null })).toBe("function");
   });
 
-  it("clears the hold when resolving HEAD throws, rather than pausing dispatch forever", async () => {
-    const { initSettingsTable } = await import("../runner-mode.js");
-    const { isDeployHeld } = await import("../deploy-hold.js");
-    const { closeDb } = await import("../dedup.js");
-    initSettingsTable();
+  /** The hold lives in the database, so these tests take deploy.js and deploy-hold.js over one of their own. */
+  async function withDatabase(): Promise<typeof import("../deploy-hold.js")> {
+    let hold: typeof import("../deploy-hold.js");
+    ({ deploy, hold } = (
+      await testDb({ modules: { deploy: () => import("../deploy.js"), hold: () => import("../deploy-hold.js") } })
+    ).modules);
+    return hold;
+  }
 
-    try {
-      // Only a 404 is soft on these calls; anything else throws. `configured` carries a
-      // stub private key so the App-token mint throws before any request, standing in
-      // for the 5xx or 422 this has to survive — the hold is claimed by then.
-      const start = deploy.makeStartDeploy(configured)!;
-      await expect(start()).rejects.toThrow();
-      expect(isDeployHeld()).toBe(false);
-    } finally {
-      closeDb();
-    }
+  it("clears the hold when resolving HEAD throws, rather than pausing dispatch forever", async () => {
+    const hold = await withDatabase();
+
+    // Only a 404 is soft on these calls; anything else throws. `configured` carries a
+    // stub private key so the App-token mint throws before any request, standing in
+    // for the 5xx or 422 this has to survive — the hold is claimed by then.
+    const start = deploy.makeStartDeploy(configured)!;
+    await expect(start()).rejects.toThrow();
+    expect(hold.isDeployHeld()).toBe(false);
   });
 
   it("refuses while a deploy already holds, before reaching the network", async () => {
-    const { initSettingsTable } = await import("../runner-mode.js");
-    const { setDeployHold } = await import("../deploy-hold.js");
-    const { closeDb } = await import("../dedup.js");
-    initSettingsTable();
-    setDeployHold();
+    const hold = await withDatabase();
+    hold.setDeployHold();
 
     // Asserting that nothing is fetched is the point: it is the only observable
     // difference between claiming the hold before the awaits and after them, and the
     // "after" ordering is the one that lets two triggers both start a deploy.
-    const fetchSpy = vi.fn();
-    vi.stubGlobal("fetch", fetchSpy);
+    const network = fakeFetch({});
+    network.install();
 
-    try {
-      const start = deploy.makeStartDeploy(configured)!;
-      await expect(start()).resolves.toEqual({ started: false, reason: "deploy-in-progress" });
-      expect(fetchSpy).not.toHaveBeenCalled();
-    } finally {
-      vi.unstubAllGlobals();
-      closeDb();
-    }
+    const start = deploy.makeStartDeploy(configured)!;
+    await expect(start()).resolves.toEqual({ started: false, reason: "deploy-in-progress" });
+    expect(network.calls).toHaveLength(0);
   });
 });
 
@@ -333,13 +337,8 @@ describe("makeStartDeploy onBuildFailure callback", () => {
   // Needs real SQLite (deploy-hold.ts writes to it), but mocks the two GitHub helpers
   // so we can control what commit is returned and skip the App-token mint.
   let localDeploy: typeof DeployModule;
-  let closeDb: () => void;
 
   beforeEach(async () => {
-    // Re-reset so the mocks below are visible when deploy.js is imported.
-    vi.resetModules();
-    process.env.DEDUP_DB_PATH = path.join(os.tmpdir(), `deploy-onbf-${Date.now()}.sqlite`);
-
     vi.doMock("../github-app-auth.js", () => ({
       getScopedInstallationToken: vi.fn().mockResolvedValue({ token: "tok", expiresAt: "" }),
       mintSourceTokenOrJwt: vi.fn().mockResolvedValue({ token: "tok", authMode: "installation" }),
@@ -349,24 +348,22 @@ describe("makeStartDeploy onBuildFailure callback", () => {
       getRefSha: vi.fn().mockResolvedValue("def5678"),
     }));
 
-    localDeploy = await import("../deploy.js");
-    const { initSettingsTable } = await import("../runner-mode.js");
-    initSettingsTable();
-    const dedup = await import("../dedup.js");
-    closeDb = dedup.closeDb;
+    // testDb resets the module registry, so deploy.js is imported with the mocks above.
+    ({ deploy: localDeploy } = (await testDb({ modules: { deploy: () => import("../deploy.js") } })).modules);
+    containBackgroundDeploy();
   });
 
   afterEach(() => {
-    closeDb?.();
     vi.doUnmock("../github-app-auth.js");
     vi.doUnmock("../github.js");
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
   });
 
   it("uses the installation token path by default (auth=installation)", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("nope", { status: 404 })));
-
-    const onBuildFailure = vi.fn();
+    let signalCalled = () => {};
+    const called = new Promise<void>((resolve) => { signalCalled = resolve; });
+    const onBuildFailure = vi.fn(() => signalCalled());
     const start = localDeploy.makeStartDeploy({
       flyDeployToken: "fly-token",
       flyOrchestratorApp: "orchestrator",
@@ -382,12 +379,10 @@ describe("makeStartDeploy onBuildFailure callback", () => {
     const result = await start();
     // HEAD resolved → started even though runDeploy will fail later at flyctl
     expect(result).toMatchObject({ started: true, commit: "def5678" });
+    await called; // the deploy runs on in the background; it must end inside this test
   });
 
   it("calls onBuildFailure when runDeploy rejects", async () => {
-    // resolveFlyctl uses global fetch; a 404 makes it reject before any subprocess.
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("nope", { status: 404 })));
-
     // Resolved by the callback itself rather than waited out: runDeploy is fire-and-forget,
     // so the test needs a signal, and a fixed sleep is a guess that gets tighter under load.
     let signalCalled = () => {};
@@ -417,12 +412,11 @@ describe("makeStartDeploy onBuildFailure callback", () => {
 describe("makeStartDeploy — public mode (no App installation on source owner)", () => {
   // Re-setup with public auth mode: App not installed on source owner; reads are unauthenticated.
   let localDeploy: typeof DeployModule;
-  let closeDb: () => void;
+  let hold: typeof import("../deploy-hold.js");
+  let github: typeof import("../github.js");
+  let githubAuth: typeof import("../github-app-auth.js");
 
   beforeEach(async () => {
-    vi.resetModules();
-    process.env.DEDUP_DB_PATH = path.join(os.tmpdir(), `deploy-public-${Date.now()}.sqlite`);
-
     vi.doMock("../github-app-auth.js", () => ({
       getScopedInstallationToken: vi.fn().mockResolvedValue({ token: "kg-tok", expiresAt: "" }),
       mintSourceTokenOrJwt: vi.fn().mockResolvedValue({ token: null, authMode: "public" }),
@@ -432,24 +426,30 @@ describe("makeStartDeploy — public mode (no App installation on source owner)"
       getRefSha: vi.fn().mockResolvedValue("def5678"),
     }));
 
-    localDeploy = await import("../deploy.js");
-    const { initSettingsTable } = await import("../runner-mode.js");
-    initSettingsTable();
-    // dispatch_log is queried by waitForQuiet → getInFlightWork → getInFlightJobs.
-    const log = await import("../log.js");
-    log.initLogTable();
-    const dedup = await import("../dedup.js");
-    closeDb = dedup.closeDb;
+    // testDb resets the module registry, so deploy.js and these loaders get the mocks above.
+    ({ deploy: localDeploy, hold, github, githubAuth } = (
+      await testDb({
+        modules: {
+          deploy: () => import("../deploy.js"),
+          hold: () => import("../deploy-hold.js"),
+          github: () => import("../github.js"),
+          githubAuth: () => import("../github-app-auth.js"),
+        },
+      })
+    ).modules);
+    containBackgroundDeploy();
   });
 
   afterEach(() => {
-    closeDb?.();
     vi.doUnmock("../github-app-auth.js");
     vi.doUnmock("../github.js");
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
   });
 
   it("resolves HEAD and returns started:true when the source uses public (unauthenticated) fallback", async () => {
+    let signalCalled = () => {};
+    const called = new Promise<void>((resolve) => { signalCalled = resolve; });
     const start = localDeploy.makeStartDeploy({
       flyDeployToken: "fly-token",
       flyOrchestratorApp: "orchestrator",
@@ -458,17 +458,17 @@ describe("makeStartDeploy — public mode (no App installation on source owner)"
       githubAppId: "1",
       githubAppPrivateKey: "key",
       kgSourceRepo: null,
-      onBuildFailure: vi.fn(),
+      onBuildFailure: vi.fn(() => signalCalled()),
       restateDrainProbes: DRAINED_PROBES,
     })!;
 
     const result = await start();
     expect(result).toMatchObject({ started: true, commit: "def5678" });
+    await called; // the deploy runs on in the background; it must end inside this test
   });
 
   it("surfaces a fix message via onBuildFailure when tarball fails in public mode (private out-of-installation repo)", async () => {
     // fetchRepoTarball fails: private repo returns error when accessed without auth
-    const github = await import("../github.js");
     vi.mocked(github.fetchRepoTarball).mockRejectedValue(new Error("fetchRepoTarball failed: HTTP 404"));
 
     let signalCalled = () => {};
@@ -498,10 +498,7 @@ describe("makeStartDeploy — public mode (no App installation on source owner)"
   });
 
   it("does not fall back when a non-404 mint error occurs — clears the hold and rethrows", async () => {
-    const githubAuth = await import("../github-app-auth.js");
     vi.mocked(githubAuth.mintSourceTokenOrJwt).mockRejectedValue(new Error("GitHub 422 Unprocessable Entity"));
-
-    const { isDeployHeld } = await import("../deploy-hold.js");
 
     const start = localDeploy.makeStartDeploy({
       flyDeployToken: "fly-token",
@@ -514,6 +511,6 @@ describe("makeStartDeploy — public mode (no App installation on source owner)"
     })!;
 
     await expect(start()).rejects.toThrow("422");
-    expect(isDeployHeld()).toBe(false);
+    expect(hold.isDeployHeld()).toBe(false);
   });
 });
