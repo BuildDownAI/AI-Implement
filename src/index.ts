@@ -140,6 +140,7 @@ import {
 } from "./restate/retention.js";
 import { applyVolumeSnapshotRetention, applyVolumeSnapshotRetentionAtBoot } from "./fly-volumes.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
+import { sweepOnRegistered } from "./webhook-redelivery.js";
 import { createKgFindRunByTitle, seedFlyMachineProfileFromOverride, createProductionKgRefreshServices, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
@@ -5114,7 +5115,10 @@ async function main(): Promise<void> {
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
     startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices], restateSidecar.identityKey),
     registerRestateEndpoint,
-    onRegistered: () => seedFlyMachineProfileFromOverride(),
+    onRegistered: async () => {
+      sweepOnRegistered(config);
+      await seedFlyMachineProfileFromOverride();
+    },
   });
   // A sidecar which becomes ready after its initial timeout still registers the
   // same fully composed service set; the gate starts the endpoint only once.
