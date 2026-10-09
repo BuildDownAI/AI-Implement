@@ -17,7 +17,7 @@ Two reviewers matter now:
 
 **1. A review process is one definition in one table.** `src/review-process.ts` exports `REVIEW_PROCESSES`, keyed by `ReviewProcessId` (`ai-implement`, `claude-code-review`). Each entry names its trusted authors, its check pairs, a verdict reader, and its fixer. The functions are plain: no `ctx`, no store writes, no I/O. The table has the shape of `src/restate/kg-refresh-senders.ts`.
 
-**2. A check pair is a name set plus the app that posts it.** A run matches a pair only when its `app.slug` and its name (case-insensitive) both match. The marker `project-review-check-names` stands for the project's `reviewCheckNames`, or `DEFAULT_REVIEW_CHECK_NAMES` when none are set; the module holds a copy of the defaults because it has no project settings. So `Claude Code Review` from `github-actions` is not the `claude` pair, and its severity line is not read.
+**2. A check pair is a name set plus the app that posts it.** A run matches a pair only when its `app.slug` and its name (case-insensitive) both match. The marker `project-review-check-names` stands for the project's `reviewCheckNames`, or `DEFAULT_REVIEW_CHECK_NAMES` when none are set; the module holds a copy of the defaults because it has no project settings. So `Claude Code Review` from `github-actions` is not the `claude` pair, and its severity line is not read. The marker resolves to the literal list only: the heuristic fallback in `isExternalReviewCheckName` (any name containing both `claude` and `review`) is not reproduced, on purpose, so a check such as `Claude PR Review` is not matched here. A consumer that wants that heuristic (AII-822) must add it when it wires the module.
 
 **3. The verdict is read from the strongest source present.** For `claude-code-review`:
 
