@@ -33,7 +33,7 @@ import {
   SEALED_BOOTSTRAP_ALGORITHM,
   checkCheckoutResponseAgainstBindings,
   checkSealedBinding,
-  isSubscriptionAuthMode,
+  reservesModelAccount,
   parseModelAuthCheckoutResponse,
   parseModelAuthCheckpointResponse,
   parseModelAuthFailureResponse,
@@ -363,6 +363,10 @@ export function buildModelInvocationEnv(input: {
       env.CLAUDE_CONFIG_DIR = input.authDir;
       break;
     case "codex-subscription":
+      if (secret.kind === "chatgpt-access-token") {
+        env[CHATGPT_PLAN_ACCESS_TOKEN_ENV] = secret.accessToken;
+        break;
+      }
       if (secret.kind !== "session" || !input.authDir) fail("credential_source_mismatch");
       env.CODEX_HOME = input.authDir;
       break;
@@ -371,6 +375,12 @@ export function buildModelInvocationEnv(input: {
   }
   return { env, strippedKeys };
 }
+
+/** Environment variable that carries the ChatGPT plan access token to the Codex child. */
+export const CHATGPT_PLAN_ACCESS_TOKEN_ENV = "CHATGPT_PLAN_ACCESS_TOKEN";
+
+/** Renew when the token would expire within this margin after the invocation's expected duration. */
+const CHATGPT_RENEWAL_MARGIN_MS = 60_000;
 
 function sessionFileName(mode: AccountAuthMode): string {
   return mode === "codex-subscription" ? "auth.json" : ".credentials.json";
@@ -472,6 +482,13 @@ export interface ModelAuthClientOptions {
 export interface ModelInvocation {
   readonly env: Record<string, string>;
   readonly strippedKeys: readonly string[];
+  /** Set only when the secret is a ChatGPT plan access token. */
+  readonly codexProvider?: "chatgpt-plan";
+}
+
+export interface ModelInvokeOptions {
+  /** Expected invocation duration; a ChatGPT plan token is renewed first if it would expire sooner. */
+  requiredMs?: number;
 }
 
 type ProfileState = "ready" | "invoking" | "uncertain" | "rejected" | "finished";
@@ -480,7 +497,8 @@ interface ProfileEntry {
   readonly profileId: string;
   readonly authMode: AccountAuthMode;
   readonly stage?: StageName;
-  readonly secret: ModelAuthSecret;
+  secret: ModelAuthSecret;
+  expiresAt?: number;
   readonly ownerGeneration?: number;
   dir?: string;
   sessionFile?: string;
@@ -506,7 +524,11 @@ export interface ModelAuthClient {
   /** Checks out and authorizes the credential for `profileId`; writes files only after every check passes. */
   checkout(request: { profileId: string; authMode: AccountAuthMode }): Promise<void>;
   /** Runs one model invocation; subscription state is checkpointed before this resolves. */
-  invoke<T>(profileId: string, run: (invocation: ModelInvocation) => Promise<T>): Promise<T>;
+  invoke<T>(
+    profileId: string,
+    run: (invocation: ModelInvocation) => Promise<T>,
+    opts?: ModelInvokeOptions,
+  ): Promise<T>;
   /** Resolves an uncertain checkpoint through the injected reconciler. */
   reconcile(profileId: string): Promise<void>;
   /** Acknowledges credential handling, then removes this client's temporary credentials. */
@@ -692,7 +714,7 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
   }
 
   async function checkpointAfterInvocation(entry: ProfileEntry): Promise<void> {
-    if (!isSubscriptionAuthMode(entry.authMode)) {
+    if (entry.secret.kind !== "session") {
       entry.state = "ready";
       return;
     }
@@ -772,9 +794,13 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
       return tracked(() => checkoutImpl(request));
     },
 
-    async invoke<T>(profileId: string, run: (invocation: ModelInvocation) => Promise<T>): Promise<T> {
+    async invoke<T>(
+      profileId: string,
+      run: (invocation: ModelInvocation) => Promise<T>,
+      opts?: ModelInvokeOptions,
+    ): Promise<T> {
       requireLive(profileId);
-      return tracked(() => invokeImpl(profileId, run));
+      return tracked(() => invokeImpl(profileId, run, opts));
     },
 
     async reconcile(profileId) {
@@ -813,7 +839,7 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
       // A refreshed subscription session with nowhere to go would be silently lost.
       if (
         options.source.kind === "local" &&
-        isSubscriptionAuthMode(request.authMode) &&
+        reservesModelAccount(request.authMode) &&
         typeof options.source.port.persistSession !== "function"
       ) {
         fail("credential_source_failed", { profileId: request.profileId });
@@ -828,16 +854,30 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
       }
 
       const { secret, ownerGeneration } = await obtainSecret(request, binding);
-      const subscription = isSubscriptionAuthMode(request.authMode);
-      const expectedKind =
-        request.authMode === "bedrock" ? "aws-bedrock" : subscription ? "session" : "api-key";
-      if (secret.kind !== expectedKind) fail("credential_source_mismatch", { profileId: request.profileId });
+      const expectedKinds: readonly string[] =
+        request.authMode === "bedrock"
+          ? ["aws-bedrock"]
+          : request.authMode === "codex-subscription"
+            ? ["chatgpt-access-token", "session"]
+            : request.authMode === "claude-subscription"
+              ? ["session"]
+              : ["api-key"];
+      if (!expectedKinds.includes(secret.kind)) fail("credential_source_mismatch", { profileId: request.profileId });
+      // A refreshed session with nowhere to go would be silently lost.
+      if (
+        options.source.kind === "local" &&
+        secret.kind === "session" &&
+        typeof options.source.port.persistSession !== "function"
+      ) {
+        fail("credential_source_failed", { profileId: request.profileId });
+      }
 
       const entry: ProfileEntry = {
         profileId: request.profileId,
         authMode: request.authMode,
         ...(binding ? { stage: binding.stage } : {}),
         secret,
+        ...(secret.kind === "chatgpt-access-token" ? { expiresAt: secret.expiresAt } : {}),
         ...(ownerGeneration !== undefined ? { ownerGeneration } : {}),
         lastSequence: secret.kind === "session" ? secret.stateSequence : 0,
         state: "ready",
@@ -859,12 +899,33 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
     }
   }
 
-  async function invokeImpl<T>(profileId: string, run: (invocation: ModelInvocation) => Promise<T>): Promise<T> {
+  async function invokeImpl<T>(
+    profileId: string,
+    run: (invocation: ModelInvocation) => Promise<T>,
+    opts?: ModelInvokeOptions,
+  ): Promise<T> {
     {
       const entry = requireEntry(profileId);
       if (entry.state === "invoking") fail("invocation_in_progress", { profileId });
       if (entry.state === "uncertain" || entry.state === "rejected") fail("checkpoint_uncertain", { profileId });
       if (entry.state === "finished") fail("not_checked_out", { profileId });
+      if (entry.secret.kind === "chatgpt-access-token") {
+        const requiredMs = opts?.requiredMs ?? 0;
+        if (entry.expiresAt === undefined || entry.expiresAt - now() < requiredMs + CHATGPT_RENEWAL_MARGIN_MS) {
+          // Once per invocation; the state stays `ready` if this throws, and no run starts.
+          const binding =
+            options.source.kind === "hosted"
+              ? options.source.grant.bindings.find((b) => b.profileId === profileId)
+              : undefined;
+          const renewed = await obtainSecret({ profileId, authMode: entry.authMode }, binding);
+          if (renewed.secret.kind !== "chatgpt-access-token") {
+            fail("credential_source_mismatch", { profileId });
+          }
+          entry.secret = renewed.secret;
+          entry.expiresAt = renewed.secret.expiresAt;
+          if (options.source.kind === "hosted") diagnose("checkout", profileId, entry.stage);
+        }
+      }
       const built = buildModelInvocationEnv({
         authMode: entry.authMode,
         secret: entry.secret,
@@ -877,7 +938,11 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
       let runError: unknown;
       let runFailed = false;
       try {
-        result = await run({ env: built.env, strippedKeys: built.strippedKeys });
+        result = await run({
+          env: built.env,
+          strippedKeys: built.strippedKeys,
+          ...(entry.secret.kind === "chatgpt-access-token" ? { codexProvider: "chatgpt-plan" as const } : {}),
+        });
       } catch (e) {
         runFailed = true;
         runError = e;

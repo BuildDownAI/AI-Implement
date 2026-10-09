@@ -7,6 +7,7 @@ import {
   ModelAuthClientError,
   acceptModelAuthBootstrap,
   buildModelInvocationEnv,
+  CHATGPT_PLAN_ACCESS_TOKEN_ENV,
   createModelAuthClient,
   createModelAuthTransport,
   openSealedModelAuthBootstrap,
@@ -885,5 +886,206 @@ describe("createModelAuthTransport", () => {
     const [url, init] = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
     expect(url).toBe("https://orch.example/runner/model-auth/checkpoint");
     expect((init.headers as Record<string, string>).Authorization).toBe(`Bearer ${S_BEARER}`);
+  });
+});
+
+describe("ChatGPT plan access token (codex-subscription)", () => {
+  const S_TOKEN = "SENTINEL-chatgpt-token-0010";
+  const S_TOKEN2 = "SENTINEL-chatgpt-token-0011";
+  const REQ = 120_000;
+  const cg = { profileId: "cx", authMode: "codex-subscription" as const };
+  let root: string;
+  let authRoot: string;
+  let clock: number;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "model-auth-cg-"));
+    authRoot = join(root, "auth");
+    mkdirSync(authRoot);
+    clock = NOW;
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  const tok = (accessToken: string, expiresAt: number) => ({ kind: "chatgpt-access-token" as const, accessToken, expiresAt });
+  const diagnostics: unknown[] = [];
+
+  function local(loads: Array<ReturnType<typeof tok> | Error>) {
+    const load = vi.fn(async () => {
+      const next = loads.shift()!;
+      if (next instanceof Error) throw next;
+      return next;
+    });
+    const persistSession = vi.fn(async () => undefined);
+    const client = createModelAuthClient({
+      source: { kind: "local", port: { load, persistSession } },
+      authRoot,
+      forbiddenRoots: [join(root, "ws")],
+      inheritedEnv: { PATH: "/bin" },
+      now: () => clock,
+      onDiagnostic: (d) => void diagnostics.push(d),
+    });
+    return { client, load, persistSession };
+  }
+
+  function hosted(responses: Array<ReturnType<typeof tok> | "reject" | "throw">) {
+    const calls: string[] = [];
+    const transport: ModelAuthTransport = {
+      post: vi.fn(async (route: string) => {
+        calls.push(route);
+        if (route !== MODEL_AUTH_ROUTES.checkout) return { status: 200, body: {} };
+        const next = responses.shift()!;
+        if (next === "throw") throw new Error("boom");
+        if (next === "reject") return { status: 403, body: { version: 1, ok: false, category: "unauthorized" } };
+        return {
+          status: 200,
+          body: { version: 1, ok: true, profileId: "cx", authMode: "codex-subscription", secret: next },
+        };
+      }),
+    };
+    const g = grant({
+      bindings: [{ stage: "implementation", profileId: "cx", profileRevision: 1, authMode: "codex-subscription" }],
+    });
+    const client = createModelAuthClient({
+      source: { kind: "hosted", grant: g, transport },
+      authRoot,
+      forbiddenRoots: [join(root, "ws")],
+      inheritedEnv: { PATH: "/bin" },
+      now: () => clock,
+      sleep: async () => {},
+      onDiagnostic: (d) => void diagnostics.push(d),
+    });
+    return { client, calls, checkouts: () => calls.filter((c) => c === MODEL_AUTH_ROUTES.checkout).length };
+  }
+
+  type Variant = { name: string; make: (r: Array<ReturnType<typeof tok> | "fail">) => { client: ReturnType<typeof createModelAuthClient>; loads: () => number; extra: () => string[] } };
+  const variants: Variant[] = [
+    {
+      name: "local",
+      make: (r) => {
+        const l = local(r.map((x) => (x === "fail" ? new Error("nope") : x)));
+        return { client: l.client, loads: () => l.load.mock.calls.length, extra: () => (l.persistSession.mock.calls.length ? ["persist"] : []) };
+      },
+    },
+    {
+      name: "hosted",
+      make: (r) => {
+        const h = hosted(r.map((x) => (x === "fail" ? ("reject" as const) : x)));
+        return { client: h.client, loads: h.checkouts, extra: () => h.calls.filter((c) => c !== MODEL_AUTH_ROUTES.checkout) };
+      },
+    },
+  ];
+
+  for (const v of variants) {
+    describe(v.name, () => {
+      it("enough time: no renewal, env holds the token, no files, no write-back", async () => {
+        const t = v.make([tok(S_TOKEN, NOW + REQ + 60_000)]);
+        await t.client.checkout(cg);
+        expect(readdirSync(authRoot)).toEqual([]);
+        await t.client.invoke("cx", async (inv) => {
+          expect(inv.env[CHATGPT_PLAN_ACCESS_TOKEN_ENV]).toBe(S_TOKEN);
+          expect(inv.env).not.toHaveProperty("CODEX_HOME");
+          expect(inv.codexProvider).toBe("chatgpt-plan");
+        }, { requiredMs: REQ });
+        expect(t.loads()).toBe(1);
+        expect(t.extra()).toEqual([]);
+        expect(t.client.status("cx")).toBe("ready");
+        expect(readdirSync(authRoot)).toEqual([]);
+        await t.client.dispose();
+      });
+
+      it("one ms short: renews once, uses the new token, even if it is still short", async () => {
+        const t = v.make([tok(S_TOKEN, NOW + REQ + 59_999), tok(S_TOKEN2, NOW + 1)]);
+        await t.client.checkout(cg);
+        await t.client.invoke("cx", async (inv) => {
+          expect(inv.env[CHATGPT_PLAN_ACCESS_TOKEN_ENV]).toBe(S_TOKEN2);
+        }, { requiredMs: REQ });
+        expect(t.loads()).toBe(2);
+        expect(t.extra()).toEqual([]);
+      });
+
+      it("renewal failure: fails with the source category, never runs, stays ready", async () => {
+        const t = v.make([tok(S_TOKEN, NOW + 1), "fail"]);
+        await t.client.checkout(cg);
+        const run = vi.fn(async () => undefined);
+        const cat = await categoryAsync(t.client.invoke("cx", run, { requiredMs: REQ }));
+        expect(cat).toBe(v.name === "local" ? "credential_source_failed" : "server_rejected");
+        expect(run).not.toHaveBeenCalled();
+        expect(t.client.status("cx")).toBe("ready");
+        expect(t.extra()).toEqual([]);
+      });
+
+      it("a throwing run still writes nothing back", async () => {
+        const t = v.make([tok(S_TOKEN, NOW + 10 * REQ)]);
+        await t.client.checkout(cg);
+        await expect(t.client.invoke("cx", async () => { throw new Error("x"); })).rejects.toThrow("x");
+        expect(t.extra()).toEqual([]);
+        expect(t.client.status("cx")).toBe("ready");
+      });
+    });
+  }
+
+  it("renews exactly at the boundary only below requiredMs + 60s", async () => {
+    const l = local([tok(S_TOKEN, NOW + REQ + 60_000)]);
+    await l.client.checkout(cg);
+    await l.client.invoke("cx", async () => undefined, { requiredMs: REQ });
+    expect(l.load).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the injected clock for renewal", async () => {
+    const l = local([tok(S_TOKEN, NOW + 10 * REQ), tok(S_TOKEN2, NOW + 20 * REQ)]);
+    await l.client.checkout(cg);
+    clock = NOW + 10 * REQ;
+    await l.client.invoke("cx", async (inv) => expect(inv.env[CHATGPT_PLAN_ACCESS_TOKEN_ENV]).toBe(S_TOKEN2));
+    expect(l.load).toHaveBeenCalledTimes(2);
+  });
+
+  it("hosted renewal transport throw surfaces transport_failed", async () => {
+    const h = hosted([tok(S_TOKEN, NOW + 1), "throw"]);
+    await h.client.checkout(cg);
+    expect(await categoryAsync(h.client.invoke("cx", async () => undefined))).toBe("transport_failed");
+  });
+
+  it("a local token source needs no persistSession; Claude subscription still does", async () => {
+    const load = vi.fn(async () => tok(S_TOKEN, NOW + 10 * REQ));
+    const c = createModelAuthClient({ source: { kind: "local", port: { load } }, authRoot, forbiddenRoots: [] });
+    await c.checkout(cg);
+    expect(await categoryAsync(c.checkout({ profileId: "sub", authMode: "claude-subscription" }))).toBe("credential_source_failed");
+  });
+
+  it("session secret on codex still uses CODEX_HOME, checkpoints, and does no expiry check", async () => {
+    const load = vi.fn(async () => ({ kind: "session" as const, sessionData: S_SESSION, stateSequence: 0 }));
+    const persistSession = vi.fn(async () => undefined);
+    const c = createModelAuthClient({ source: { kind: "local", port: { load, persistSession } }, authRoot, forbiddenRoots: [], inheritedEnv: {} });
+    await c.checkout(cg);
+    await c.invoke("cx", async (inv) => {
+      expect(inv.env.CODEX_HOME).toBeTruthy();
+      expect(inv.codexProvider).toBeUndefined();
+    }, { requiredMs: 10 ** 12 });
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(persistSession).toHaveBeenCalledTimes(1);
+    await c.dispose();
+  });
+
+  it("the sentinel appears only in the env, never in diagnostics or errors", async () => {
+    diagnostics.length = 0;
+    const h = hosted([tok(S_TOKEN, NOW + 1), "reject"]);
+    await h.client.checkout(cg);
+    let err: unknown;
+    try {
+      await h.client.invoke("cx", async () => undefined);
+    } catch (e) {
+      err = e;
+    }
+    expect(JSON.stringify(diagnostics)).not.toContain("SENTINEL-chatgpt");
+    expect(JSON.stringify(err, Object.getOwnPropertyNames(err as object))).not.toContain("SENTINEL-chatgpt");
+  });
+
+  it("the env helper sets only the token", () => {
+    const { env } = buildModelInvocationEnv({
+      authMode: "codex-subscription",
+      secret: tok(S_TOKEN, NOW),
+      inheritedEnv: { PATH: "/bin", CODEX_HOME: "/x", OPENAI_API_KEY: "y" },
+    });
+    expect(env[CHATGPT_PLAN_ACCESS_TOKEN_ENV]).toBe(S_TOKEN);
+    for (const k of ["CODEX_HOME", "CODEX_API_KEY", "OPENAI_API_KEY"]) expect(env).not.toHaveProperty(k);
   });
 });
