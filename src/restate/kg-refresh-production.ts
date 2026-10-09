@@ -4,6 +4,7 @@
  * `review-fix-production.ts` and `review-fix-client.ts`. `src/index.ts` composes and registers
  * the services; this file is the allowed SDK boundary where the orchestrator's existing
  * kg-refresh closures become Restate services. */
+import { createHmac } from "node:crypto";
 import * as restateClients from "@restatedev/restate-sdk-clients";
 import { getMappings } from "../config.js";
 import { getDb } from "../dedup.js";
@@ -22,25 +23,27 @@ import {
 import { readServedStamp, type KgRailDeps } from "../kg-refresh-rail.js";
 import { KG_DIR, getServedNamespace } from "../kg-sidecar.js";
 import { parseKgSourceRepo } from "../deploy.js";
-import { RUN_TITLE_PREFIX, buildKgRefreshGhaDispatchBody, defaultFetchSignal, postWorkflowDispatch } from "../github.js";
+import { RUN_TITLE_PREFIX, defaultFetchSignal } from "../github.js";
 import { resolveWorkflowCapabilities } from "../workflow-probe.js";
-import { resolveRunnerImageForDispatch } from "../repo-image.js";
-import { encodeRunConfig, type RunConfigV1 } from "../run-config.js";
+import { buildKgRefreshRunConfig } from "../run-config.js";
 import { readBackendRun, stopBackendRun } from "../backend-run.js";
 import { getRunnerMode, getKgFlyMachineOverride, setKgFlyMachineOverride, type KgFlyMachineOverride } from "../runner-mode.js";
 import { mintRunToken } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
-import { appendLogIfAbsent, findLogIdByDispatchId, updateJobMachineDetails, updateJobPrUrl, updateJobRunId } from "../log.js";
+import { appendLogIfAbsent, findLogIdByDispatchId, setJobMachineId, setJobMachineNonce, updateJobPrUrl, updateJobRunId } from "../log.js";
 import { clearMachineEnv, createMachine, destroyMachine, getMachine, startMachine, updateMachine, type CreateMachineOpts, type Machine, type MachineConfig } from "../fly-machines.js";
 import type { RestateService } from "./endpoint.js";
 import {
   createKgRefreshWorkflow,
   type KgDispatchInput,
+  type KgDispatchRecord,
   type KgDispatchResult,
+  type KgDispatchRowDetails,
   type KgRefreshReportBody,
   type KgRefreshStatusResult,
   type KgRefreshWorkflowDependencies,
 } from "./kg-refresh-workflow.js";
+import { createKgRefreshSenders, type KgRefreshSender, type KgRefreshSenderDeps } from "./kg-refresh-senders.js";
 import { DURABLE_RUNNER_DISPATCH_ID_KEY, FLY_MACHINE_PROFILE_DEFAULTS, createFlyMachineProfile, type FlyMachineProfileConfig, type FlyMachineProfileDefinition, type FlyMachineProfileDeps } from "./fly-machine-profile.js";
 import { createKgRepo, type KgRepoEnqueueInput, type KgRepoEnqueueResult, type KgRepoPrInput, type KgRepoTriggerResult, type StoredDryRunOutcome } from "./kg-repo.js";
 import type { Step } from "../pipeline/types.js";
@@ -56,7 +59,6 @@ export function createKgFindRunByTitle(opts: {
   owner: string;
   repo: string;
   getToken: () => Promise<string>;
-  recordDetails: (dispatchId: string, details: { workflowRunId: number; logsUrl?: string }) => void;
 }): KgRefreshWorkflowDependencies["findRunByTitle"] {
   return async (title) => {
     const res = await fetch(
@@ -67,12 +69,8 @@ export function createKgFindRunByTitle(opts: {
     const data = (await res.json()) as { workflow_runs: Array<{ id: number; display_title?: string; html_url?: string }> };
     const match = data.workflow_runs.find((r) => r.display_title === `${RUN_TITLE_PREFIX}${title}`);
     if (!match) return null;
-    // The title is `KG-REFRESH · <dispatchId>`; a bare identifier carries no dispatch id to record against.
-    const dispatchIdPrefix = "KG-REFRESH · ";
-    if (title.startsWith(dispatchIdPrefix)) {
-      opts.recordDetails(title.slice(dispatchIdPrefix.length), { workflowRunId: match.id, logsUrl: match.html_url });
-    }
-    return { runId: match.id };
+    // A read only: the workflow projects the found run onto the row in its own `record-reconcile` step.
+    return { runId: match.id, ...(match.html_url ? { logsUrl: match.html_url } : {}) };
   };
 }
 const GHA_EXECUTION_MODE = "github-actions";
@@ -138,41 +136,48 @@ export async function launchKeptMachine(
   return { machineId: keptMachineId, machineNonce, created: false, reused: true };
 }
 
-type LegacyDispatch = (opts: {
-  runToken: string;
-  runProgressToken: string;
-  dispatchId: string;
-  runConfig: string;
-  executionPath?: string;
-  machine: FlyMachineProfileConfig;
-  /** The machine the pipeline keeps (from `FlyMachineProfile.claim`); null when none is kept. */
-  machineId: string | null;
-}) => Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number; created?: boolean; replaced?: string }>;
+/** The machine nonce for one attempt: HMAC-SHA256 of `${dispatchId}:${attempt}` under the token secret, 32 hex characters
+ *  (the length `generateMachineNonce` produces). A credential: derived inside a step, never returned from one. */
+export function deriveMachineNonce(secret: string, dispatchId: string, attempt: number): string {
+  if (!secret) throw new Error("RUNNER_TOKEN_SECRET is not configured");
+  return createHmac("sha256", secret).update(`${dispatchId}:${attempt}`).digest("hex").slice(0, 32);
+}
 
-export interface KgDispatchDetails {
-  machineId?: string;
-  machineNonce?: string;
-  logsUrl?: string;
-  workflowRunId?: number;
+/** Re-arms the row to the nonce a reused kept machine actually carries. A no-op when it equals the derived one or the row is
+ *  missing. Written inside the dispatch step and never returned, so the credential stays out of the journal. */
+export function syncRowToMachineNonce(dispatchId: string, derivedNonce: string, machineNonce: string): void {
+  if (machineNonce === derivedNonce) return;
+  const jobId = findLogIdByDispatchId(dispatchId);
+  if (jobId !== undefined) setJobMachineNonce(jobId, machineNonce);
 }
 
 /**
- * Writes a kg-refresh dispatch's machine and run details onto its job row (legacy `updateJobMachine`):
- * the machine nonce wins, else the logs URL, plus the run id. A dispatch id with no row is a no-op.
+ * Projects a kg-refresh dispatch's journaled machine and run details onto its job row. The machine id
+ * is a plain write: the row stays `dispatched` until the machine read moves it. A dispatch id with no row is a no-op.
  */
-export function recordKgDispatchDetails(dispatchId: string, d: KgDispatchDetails): void {
+export function recordKgDispatchDetails(dispatchId: string, d: KgDispatchRowDetails): void {
   const jobId = findLogIdByDispatchId(dispatchId);
   if (jobId === undefined) return;
-  if (d.machineNonce) updateJobMachineDetails(jobId, { machineNonce: d.machineNonce, machineId: d.machineId, logsUrl: d.logsUrl });
-  else if (d.logsUrl) updateJobPrUrl(jobId, d.logsUrl);
+  if (d.machineId) setJobMachineId(jobId, d.machineId);
+  if (d.logsUrl) updateJobPrUrl(jobId, d.logsUrl);
   if (d.workflowRunId !== undefined) updateJobRunId(jobId, d.workflowRunId);
+}
+
+/** Writes the `dispatch_log` row from the journaled record. Idempotent on the dispatch id. */
+export function recordKgDispatchRow(record: KgDispatchRecord): void {
+  appendLogIfAbsent({
+    issueId: record.issueId, phase: record.phase, dispatchId: record.dispatchId,
+    executionMode: record.executionMode, repo: record.repo,
+  });
 }
 
 export interface KgRefreshProductionInput {
   kgSourceRepo: string;
   config: Pick<AppConfig,
     "githubAppId" | "githubAppPrivateKey" | "sessionImage" | "runnerImageExplicit"
-    | "runnerCallbackBaseUrl" | "runnerTokenSecret" | "flySessionsToken" | "flySessionsApp">;
+    | "runnerCallbackBaseUrl" | "runnerTokenSecret" | "flySessionsToken" | "flySessionsApp"
+    | "flySessionsRegion" | "localRunnerImage" | "localRunnerOrchestratorUrl" | "healthPort"
+    | "anthropicApiKey" | "claudeOAuthToken">;
   mintToken: KgRailDeps["mintToken"];
   fetchTarball: KgRailDeps["fetchTarball"];
   fetchDefaultBranch: KgRailDeps["fetchDefaultBranch"];
@@ -186,18 +191,19 @@ export interface KgRefreshProductionInput {
   mergePullRequestFn: KgRailDeps["mergePullRequestFn"];
   closePullRequestFn: KgRailDeps["closePullRequestFn"];
   deleteBranchFn: KgRailDeps["deleteBranchFn"];
-  /** The legacy dispatcher (`dispatchKgRefreshRun` in `src/index.ts`). Used only when the
-   *  resolved execution path is not GitHub Actions; the GHA path is dispatched by this
-   *  module so it can request `return_run_details`. */
-  dispatchKgRefreshRun: LegacyDispatch;
-  /** Overrides `resolveKgExecutionMode` for the dispatch. A test seam: it keeps the GitHub Actions branch exercisable until AII-1110 decides when GHA is used. */
+  /** The sender deps the backends need and `config` cannot supply (AII-1148). */
+  getInstallationToken: KgRefreshSenderDeps["getInstallationToken"];
+  resolveRunnerImage: KgRefreshSenderDeps["resolveRunnerImage"];
+  postWorkflowDispatch: KgRefreshSenderDeps["postWorkflowDispatch"];
+  keptMachineFly: KgRefreshSenderDeps["keptMachineFly"];
+  startLocalRunnerContainer: KgRefreshSenderDeps["startLocalRunnerContainer"];
+  /** Overrides `resolveKgExecutionMode` for the dispatch. A test seam: the workflow's `resolveDispatchRecord` dependency calls it. */
   resolveExecutionMode?: () => string;
   /** Probes the KG source repo's dispatch workflow for `run_publication_token` support. Defaults to `resolveWorkflowCapabilities`. */
   resolveWorkflowCapabilities?: typeof resolveWorkflowCapabilities;
   updateJobStatus: (jobId: number, status: JobStatus, conclusion?: string | null) => void;
-  /** Writes the backend's machine and run details onto the job row for `dispatchId` (a missing row is a no-op).
-   *  Called inside the dispatch closure so `machineNonce` reaches SQLite and never the journal. */
-  recordDispatch: (dispatchId: string, details: KgDispatchDetails) => void;
+  /** Projects journaled machine and run details onto the job row for `dispatchId` (a missing row is a no-op). */
+  recordDispatchDetails?: (dispatchId: string, details: KgDispatchRowDetails) => void;
   /** Recovers the dispatch_log id after a restart (journaled `reserve` does not re-run).
    *  Defaults to a `dispatch_log.dispatch_id` lookup. */
   findJobId?: (dispatchId: string) => number | undefined;
@@ -238,89 +244,34 @@ export function findKgMapping(kgSourceRepo: string) {
   return Object.entries(getMappings()).find(([, m]) => `${m.owner}/${m.repo}` === kgSourceRepo);
 }
 
-/** The execution mode a kg-refresh dispatch resolves to: Fly in every runner mode except `local`
- *  (local Docker). Without a Fly sessions app `createKgRefreshDispatch` rejects with its own "not configured"
- *  message (the run ends `dispatch_rejected`); the GitHub Actions fallback is AII-1110. `createKgRefreshDispatch` acts on it and
- *  `appendJobLog` records it, so both read one answer. */
-export function resolveKgExecutionMode(): string {
-  return getRunnerMode().mode === "local" ? "local-docker" : "fly-machines";
+/** The backend a kg-refresh run uses, resolved one time by the workflow's `reserve` step (the journaled result is the record).
+ *  `local` is local Docker and `gha` is GitHub Actions. Every other mode uses Fly when it is configured, else GitHub Actions
+ *  (retrying cannot configure Fly). `shadow` stays on one backend: two concurrent ingests race to push the same snapshot commit. */
+export function resolveKgExecutionMode(fly: Pick<AppConfig, "flySessionsToken" | "flySessionsApp">): string {
+  const mode = getRunnerMode().mode;
+  if (mode === "local") return "local-docker";
+  if (mode === "gha") return GHA_EXECUTION_MODE;
+  return fly.flySessionsToken && fly.flySessionsApp ? "fly-machines" : GHA_EXECUTION_MODE;
 }
 
-/** Builds the GHA-first dispatch the workflow calls inside `ctx.run`. */
+/** Builds the dispatch the workflow calls inside `ctx.run`: a lookup in the sender table keyed by the journaled
+ *  `executionMode`. An unknown mode is a definitive `rejected`, since a throw would retry a value that cannot change. */
 export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispatch: KgDispatchInput) => Promise<KgDispatchResult> {
-  const { config } = input;
-  const repo = parseKgSourceRepo(input.kgSourceRepo);
-  return async ({ runConfig, tokens, issueIdentifier, dispatchId, machine, machineId }) => {
-    const executionMode = (input.resolveExecutionMode ?? resolveKgExecutionMode)();
-    const mapping = findKgMapping(input.kgSourceRepo)?.[1];
-    const envelope: RunConfigV1 = {
-      v: 1,
-      issue: { id: "kg-refresh", identifier: issueIdentifier, title: "KG ingest", description: "" },
-      runnerPhase: "kg-refresh",
-      kgSourceRepo: input.kgSourceRepo,
-      ...(config.runnerCallbackBaseUrl ? { runnerCallbackUrl: config.runnerCallbackBaseUrl } : {}),
-      ...(mapping?.dependencyTokenScope != null ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
-      ...(runConfig.dryRun ? { kgDryRun: true as const } : {}),
-      ...(runConfig.kgSourceRef ? { kgSourceRef: runConfig.kgSourceRef } : {}),
-      ...(runConfig.acceptNewBaseline ? { kgAcceptNewBaseline: true as const } : {}),
-      ...(runConfig.actorEmail ? { kgBaselineActor: runConfig.actorEmail } : {}),
-    };
-    const encoded = encodeRunConfig(envelope);
-
-    if (executionMode !== GHA_EXECUTION_MODE) {
-      if (executionMode === "fly-machines" && (!config.flySessionsToken || !config.flySessionsApp)) {
-        // A definitive rejection: retrying cannot configure the app, and the workflow ends the run dispatch_rejected.
-        console.error("[kg-refresh] fly-machines execution path selected but FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured");
-        return { outcome: "rejected", jobId: null, executionMode };
-      }
-      const legacy = await input.dispatchKgRefreshRun({
-        runToken: tokens.runToken, runProgressToken: tokens.progressToken,
-        dispatchId, runConfig: encoded, executionPath: executionMode, machine, machineId,
-      });
-      input.recordDispatch(dispatchId, {
-        machineId: legacy.machineId, machineNonce: legacy.machineNonce,
-        logsUrl: legacy.logsUrl, workflowRunId: legacy.workflowRunId,
-      });
-      // The nonce authenticates the machine to /api/token: it goes to the row above, never into the journaled result.
-      // Only a Fly machine is kept; a local container is always one-shot.
-      const kept = executionMode === "fly-machines" && legacy.machineId !== undefined;
-      return { outcome: "accepted", runId: legacy.workflowRunId, runUrl: legacy.logsUrl,
-        jobId: legacy.machineId ?? null, executionMode,
-        machineId: kept ? legacy.machineId! : null, created: kept && legacy.created === true,
-        ...(kept && legacy.created === true && legacy.replaced !== undefined && { replaced: legacy.replaced }) };
-    }
-
-    const { token } = await input.mintToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
-    const defaultBranch = await input.fetchDefaultBranch(token, repo.owner, repo.repo).catch(() => "main");
-    const runnerImage = await resolveRunnerImageForDispatch({
-      owner: repo.owner, repo: repo.repo, token,
-      defaultImage: config.sessionImage, runnerImageExplicit: config.runnerImageExplicit,
-    });
-    const ref = runConfig.kgSourceRef ?? defaultBranch;
-    const { supportsRunPublicationToken } = await (input.resolveWorkflowCapabilities ?? resolveWorkflowCapabilities)({
-      owner: repo.owner, repo: repo.repo, workflowFile: KG_REFRESH_WORKFLOW_FILE, token, ref,
-    });
-    const inputs = buildKgRefreshGhaDispatchBody({
-      runConfig: encoded, runToken: tokens.runToken, runProgressToken: tokens.progressToken,
-      ...(supportsRunPublicationToken ? { runPublicationToken: tokens.publicationToken } : {}),
-      runnerImage, runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
-      runnerPhase: "kg-refresh", jobTimeoutMinutes: "240", issueIdentifier,
-    });
-    const result = await postWorkflowDispatch({
-      token, owner: repo.owner, repo: repo.repo, workflowFile: KG_REFRESH_WORKFLOW_FILE,
-      ref, inputs, returnRunDetails: true,
-    });
-    if (result.runId !== undefined) {
-      input.recordDispatch(dispatchId, { workflowRunId: result.runId, logsUrl: result.runUrl });
-    }
-    return {
-      outcome: result.outcome ?? (result.success ? "accepted" : "unknown"),
-      runId: result.runId,
-      runUrl: result.runUrl,
-      // The GitHub run id once known; the workflow keys its own job row by dispatch id.
-      jobId: result.runId !== undefined ? String(result.runId) : null,
-      executionMode,
-    };
+  const senders = createKgRefreshSenders({
+    config: { ...input.config, kgSourceRepo: input.kgSourceRepo },
+    getInstallationToken: input.getInstallationToken,
+    mintToken: input.mintToken,
+    fetchDefaultBranch: input.fetchDefaultBranch,
+    resolveRunnerImage: input.resolveRunnerImage,
+    resolveWorkflowCapabilities: input.resolveWorkflowCapabilities ?? resolveWorkflowCapabilities,
+    postWorkflowDispatch: input.postWorkflowDispatch,
+    keptMachineFly: input.keptMachineFly,
+    startLocalRunnerContainer: input.startLocalRunnerContainer,
+  });
+  return async (dispatch) => {
+    const send = (senders as Record<string, KgRefreshSender | undefined>)[dispatch.executionMode];
+    if (!send) return { outcome: "rejected", jobId: null, executionMode: dispatch.executionMode };
+    return send(dispatch);
   };
 }
 
@@ -377,13 +328,30 @@ export function createProductionKgRefreshServices(
       };
     },
     dispatch: createKgRefreshDispatch(input),
+    buildEnvelope: (run, issueIdentifier) => buildKgRefreshRunConfig({
+      kgSourceRepo: input.kgSourceRepo,
+      issueIdentifier,
+      runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
+      dependencyTokenScope: findKgMapping(input.kgSourceRepo)?.[1]?.dependencyTokenScope ?? undefined,
+      dryRun: run.dryRun,
+      kgSourceRef: run.kgSourceRef,
+      acceptNewBaseline: run.acceptNewBaseline,
+      actorEmail: run.actorEmail,
+    }),
     // Idempotent on dispatch_id: a replay after a crash between the insert and the journal write reuses the row.
-    appendJobLog: ({ dispatchId }) => {
-      return appendLogIfAbsent({
-        issueId: "kg-refresh", phase: "kg-refresh", dispatchId, executionMode: resolveKgExecutionMode(),
-        repo: parseKgSourceRepo(input.kgSourceRepo).fullName,
-      });
+    resolveDispatchRecord: (dispatchId) => ({
+      dispatchId, issueId: "kg-refresh", phase: "kg-refresh",
+      repo: parseKgSourceRepo(input.kgSourceRepo).fullName,
+      executionMode: (input.resolveExecutionMode ?? (() => resolveKgExecutionMode(config)))(),
+    }),
+    recordDispatchRow: recordKgDispatchRow,
+    deriveMachineNonce: (dispatchId, attempt) => deriveMachineNonce(config.runnerTokenSecret ?? "", dispatchId, attempt),
+    armMachineNonce: (dispatchId, attempt) => {
+      const jobId = findJobId(dispatchId);
+      if (jobId === undefined) throw new Error(`no dispatch_log row for ${dispatchId}; reserve must run first`);
+      setJobMachineNonce(jobId, deriveMachineNonce(config.runnerTokenSecret ?? "", dispatchId, attempt));
     },
+    recordDispatchDetails: input.recordDispatchDetails ?? recordKgDispatchDetails,
     closeJobLog: (jobId, status, conclusion) => {
       const id = findJobId(jobId);
       if (id === undefined) return;

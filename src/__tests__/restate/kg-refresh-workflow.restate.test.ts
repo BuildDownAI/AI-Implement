@@ -10,6 +10,7 @@
 // (each dispatches through `KgRepo.trigger` for that reason); every other scenario still
 // dispatches `KgRefresh.run` directly with a test-chosen triggerId, and the real KgRepo's
 // `release` send for that unrelated key is a harmless no-op.
+import { buildKgRefreshRunConfig } from "../../run-config.js";
 import { randomUUID } from "node:crypto";
 import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -29,6 +30,9 @@ import { createKgRepo, type KgRepoTriggerResult } from "../../restate/kg-repo.js
 import {
   createKgRefreshWorkflow,
   type KgDispatchInput,
+  type KgRefreshWorkflowDependencies,
+  type KgDispatchRecord,
+  type KgDispatchRowDetails,
   type KgDispatchResult,
   type KgRefreshReportBody,
 } from "../../restate/kg-refresh-workflow.js";
@@ -36,6 +40,9 @@ import { registerOwnedRunContract } from "./owned-run-contract.js";
 import {
   VARIANTS, attachWorkflow, callObject, callService, callWorkflow, eventually, gate, queryInvocations, replaceEndpoint, settle,
   startRetryEnabled, startVariants, stopAll, type Gate,
+  journalEntries,
+  journalEntryNames,
+  journalText,
 } from "./harness.js";
 
 const NAMESPACE = "https://kg.test.example/";
@@ -118,17 +125,6 @@ async function pastDeadlineAtTick(scenario: RunScenario, deadlineMs: number, lab
   await scenario.tickGate!.reached();
   const at = scenario.tickGateReachedAt! + deadlineMs;
   await eventually(() => Date.now(), (now) => now > at, { label: `wall clock past ${label}` });
-}
-
-/** The names of an invocation's journal entries, read through `sys_journal`. */
-async function journalStepNames(adminBaseUrl: string, invocationId: string): Promise<string[]> {
-  const response = await fetch(`${adminBaseUrl}/query`, { // restate-test-allow: sys_journal read, not an invocation lookup
-    method: "POST",
-    headers: { "content-type": "application/json", accept: "application/json" },
-    body: JSON.stringify({ query: `SELECT name FROM sys_journal WHERE id = '${invocationId}'` }),
-  });
-  const rows = ((await response.json()) as { rows: Array<{ name: string | null }> }).rows;
-  return rows.map((r) => r.name).filter((n): n is string => typeof n === "string" && n !== "");
 }
 
 describe("KgRefresh durable workflow", () => {
@@ -295,11 +291,21 @@ describe("KgRefresh durable workflow", () => {
   // ---- non-rail deps: recorded in-process, per-run scenarios keyed by triggerId ----
   const scenarios = new Map<string, RunScenario>();
   const runIdIndex = new Map<number, string>();
-  const appendJobLogCalls: Array<{ dispatchId: string; jobId: string }> = [];
+  const appendJobLogCalls: KgDispatchRecord[] = [];
+  const resolveExecutionModeCalls: string[] = [];
+  const recordedDetails: Array<{ dispatchId: string; details: KgDispatchRowDetails }> = [];
+  const armedNonces: Array<{ dispatchId: string; attempt: number; nonce: string }> = [];
+  const dispatchedNonces: Array<string | null> = [];
+  const dispatchResults: KgDispatchResult[] = [];
+  /** A recognizable stand-in for the HMAC derivation; the test proves it never reaches the journal. */
+  const fakeNonce = (dispatchId: string, attempt: number) => `derived-nonce-${dispatchId}-${attempt}`;
   const dispatchedIds: string[] = [];
   /** triggerId -> the run the backend "committed" before the ack was lost. */
   const dispatchThrowAfterCommit = new Map<string, number>();
+  /** Triggers whose first dispatch call fails before anything commits, so the retry dispatches again. */
+  const dispatchThrowOnce = new Set<string>();
   const dispatchedTokens: KgDispatchInput["tokens"][] = [];
+  const dispatchedEnvelopes: Array<{ dispatchId: string; envelope: KgDispatchInput["envelope"] }> = [];
   const mintedDispatchIds: string[] = [];
   const closeRowCalls: Array<{ jobId: string; status: string; conclusion?: string }> = [];
   const persistCalls: RefreshOutcome[] = [];
@@ -345,6 +351,8 @@ describe("KgRefresh durable workflow", () => {
   // A counting stand-in for FlyMachineProfile that runs the real merge/validation, so a test can tell a
   // journaled replay from a second read.
   let profileGets = 0;
+  const claimCalls: string[] = [];
+  const attachCalls: string[] = [];
   const dispatchedMachines: FlyMachineProfileConfig[] = [];
   const flyMachineProfile = restate.object({
     name: "FlyMachineProfile",
@@ -359,32 +367,58 @@ describe("KgRefresh durable workflow", () => {
         ctx.set("profile", mergeProfile(stored ?? FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"], patch));
       }),
       // AII-1136: the workflow claims, attaches and releases the kept machine; this stand-in keeps none (the real object is exercised below).
-      claim: restate.handlers.object.exclusive(async (): Promise<{ machineId: string | null }> => ({ machineId: null })),
-      attach: restate.handlers.object.exclusive(async (): Promise<void> => {}),
+      claim: restate.handlers.object.exclusive(async (_ctx: restate.ObjectContext, req: { dispatchId: string }): Promise<{ machineId: string | null }> => {
+        claimCalls.push(req.dispatchId);
+        return { machineId: null };
+      }),
+      attach: restate.handlers.object.exclusive(async (_ctx: restate.ObjectContext, req: { dispatchId: string }): Promise<void> => { attachCalls.push(req.dispatchId); }),
       release: restate.handlers.object.exclusive(async (): Promise<void> => {}),
     },
   });
 
+  /** The workflow dependency: the pending scenario's backend, keyed by dispatch id (which is the trigger id). */
+  function resolveDispatchRecordFn(dispatchId: string): KgDispatchRecord {
+    resolveExecutionModeCalls.push(dispatchId);
+    adoptPendingScenario(dispatchId);
+    return {
+      dispatchId, issueId: "kg-refresh", phase: "kg-refresh", repo: KG_SOURCE_REPO,
+      executionMode: scenarios.get(dispatchId)?.executionMode ?? "fly-machines",
+    };
+  }
+  const projectionFakes = {
+    deriveMachineNonce: fakeNonce,
+    armMachineNonce: (dispatchId: string, attempt: number) => { armedNonces.push({ dispatchId, attempt, nonce: fakeNonce(dispatchId, attempt) }); },
+    recordDispatchDetails: (dispatchId: string, details: KgDispatchRowDetails) => { recordedDetails.push({ dispatchId, details }); },
+  };
+
   async function dispatchFn(input: KgDispatchInput): Promise<KgDispatchResult> {
-    const triggerId = input.runConfig.triggerId;
+    const triggerId = input.dispatchId; // the workflow key equals the trigger id
     adoptPendingScenario(triggerId);
     const scenario = scenarios.get(triggerId);
     if (!scenario) throw new Error(`no scenario registered for trigger ${triggerId}`);
+    expect(input.envelope.issue.identifier).toBe(`KG-REFRESH · ${triggerId}`);
+    expect(input.envelope.runnerPhase).toBe("kg-refresh");
+    dispatchedEnvelopes.push({ dispatchId: input.dispatchId, envelope: input.envelope });
     contractCalls?.push("launch");
     scenario.dispatchCalls++;
     dispatchedIds.push(input.dispatchId);
     dispatchedMachines.push(input.machine);
     dispatchedTokens.push(input.tokens);
+    dispatchedNonces.push(input.machineNonce);
+    if (dispatchThrowOnce.delete(triggerId)) throw new Error("dispatch failed before commit");
     const committedRunId = dispatchThrowAfterCommit.get(triggerId);
     if (committedRunId !== undefined) {
       dispatchThrowAfterCommit.delete(triggerId);
       scenario.findByTitleResult = { runId: committedRunId }; // visible to the retry's title lookup
       throw new Error("dispatch ack lost after commit");
     }
-    return {
+    const result: KgDispatchResult = {
       outcome: scenario.dispatchOutcome, runId: scenario.runId,
       jobId: scenario.jobIdUnknown ? null : `job-${triggerId}`, executionMode: scenario.executionMode,
+      ...(scenario.runId !== undefined ? { runUrl: `https://example.test/runs/${scenario.runId}` } : {}),
     };
+    dispatchResults.push(result);
+    return result;
   }
 
   async function getWorkflowRunStatusFn(runId: number): Promise<{ status: string; conclusion: string | null }> {
@@ -400,7 +434,7 @@ describe("KgRefresh durable workflow", () => {
     return scenario.runStatusSequence[idx];
   }
 
-  async function findRunByTitleFn(title: string): Promise<{ runId: number } | null> {
+  async function findRunByTitleFn(title: string): Promise<{ runId: number; logsUrl?: string } | null> {
     const match = /KG-REFRESH · (.+)$/.exec(title);
     const triggerId = match?.[1];
     adoptPendingScenario(triggerId);
@@ -457,6 +491,11 @@ describe("KgRefresh durable workflow", () => {
     return true;
   }
 
+  const buildEnvelopeFn: KgRefreshWorkflowDependencies["buildEnvelope"] = (run, issueIdentifier) => buildKgRefreshRunConfig({
+    kgSourceRepo: KG_SOURCE_REPO, issueIdentifier, dryRun: run.dryRun, kgSourceRef: run.kgSourceRef,
+    acceptNewBaseline: run.acceptNewBaseline, actorEmail: run.actorEmail,
+  });
+
   const TEST_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
   const workflowDeps: Omit<Parameters<typeof createKgRefreshWorkflow>[0], "bootstrapDeadlineMs" | "totalDeadlineMs"> = {
     retentionMs: TEST_RETENTION_MS,
@@ -467,7 +506,10 @@ describe("KgRefresh durable workflow", () => {
       return { runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" };
     },
     dispatch: dispatchFn,
-    appendJobLog: (input) => {
+    buildEnvelope: buildEnvelopeFn,
+    resolveDispatchRecord: resolveDispatchRecordFn,
+    ...projectionFakes,
+    recordDispatchRow: (input) => {
       appendJobLogCalls.push(input);
       contractCalls?.push("reserve");
       if (reserveFailuresRemaining > 0) {
@@ -1190,6 +1232,167 @@ describe("KgRefresh durable workflow", () => {
     }, 15_000);
   });
 
+  // ---- AII-1146: the backend resolves one time, in `reserve`; only a Fly run claims the kept machine ----
+  describe("AII-1146: one backend resolution per run", () => {
+    it.each(VARIANTS.map(([label]) => label))("a github-actions run records no claim and no attach, and the row carries the mode (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions" });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      expect(claimCalls).not.toContain(triggerId);
+      expect(attachCalls).not.toContain(triggerId);
+      expect(appendJobLogCalls.filter((c) => c.dispatchId === triggerId)).toEqual([{ dispatchId: triggerId, issueId: "kg-refresh", phase: "kg-refresh", repo: KG_SOURCE_REPO, executionMode: "github-actions" }]);
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a fly-machines run records one claim and resolves the backend once across dispatch retries (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      dispatchThrowAfterCommit.set(triggerId, scenario.runId!);
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenario.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      expect(claimCalls.filter((id) => id === triggerId)).toHaveLength(1);
+      expect(resolveExecutionModeCalls.filter((id) => id === triggerId)).toHaveLength(1);
+      expect(appendJobLogCalls.find((c) => c.dispatchId === triggerId)?.executionMode).toBe("fly-machines");
+    }, 30_000);
+  });
+
+  // ---- AII-1150: the journal is the record; every row write is a projection of journaled values ----
+  describe("AII-1150: journal projections", () => {
+    /** The run invocation's journal id, once the workflow has started. */
+    async function runInvocationId(env: ReturnType<typeof envFor>, triggerId: string): Promise<string> {
+      const rows = await eventually(
+        () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`),
+        (r) => r.length === 1,
+        { label: "the KgRefresh run invocation" },
+      );
+      return rows[0].id as string;
+    }
+
+    it.each(VARIANTS.map(([label]) => label))("a fly-machines run journals resolve, reserve, nonce-1, dispatch-1, record-dispatch-1 in order (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const names = await journalEntryNames(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+      expect(names.filter((n) => ["resolve", "reserve", "nonce-1", "dispatch-1", "record-dispatch-1"].includes(n)))
+        .toEqual(["resolve", "reserve", "nonce-1", "dispatch-1", "record-dispatch-1"]);
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("the envelope is journaled after reserve and before dispatch-1 (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions" });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const names = await journalEntryNames(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+      expect(names.filter((n) => n === "envelope")).toHaveLength(1);
+      expect(names.indexOf("envelope")).toBeGreaterThan(names.indexOf("reserve"));
+      expect(names.indexOf("envelope")).toBeLessThan(names.indexOf("dispatch-1"));
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a dispatch retry receives the same envelope as the first attempt (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      dispatchThrowOnce.add(triggerId);
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenario.dispatchCalls >= 2, (ok) => ok, { label: "dispatch retry" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const seen = dispatchedEnvelopes.filter((e) => e.dispatchId === triggerId);
+      expect(seen).toHaveLength(2);
+      expect(seen[1].envelope).toEqual(seen[0].envelope);
+      const names = await journalEntryNames(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+      expect(names.filter((n) => n === "envelope")).toHaveLength(1);
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a local-docker run arms a nonce too (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "local-docker" });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const names = await journalEntryNames(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+      expect(names).toContain("nonce-1");
+      expect(armedNonces.filter((a) => a.dispatchId === triggerId)).toEqual([{ dispatchId: triggerId, attempt: 1, nonce: fakeNonce(triggerId, 1) }]);
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a github-actions run journals no nonce step and dispatches a null nonce (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions" });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const names = await journalEntryNames(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+      expect(names.filter((n) => ["resolve", "reserve", "nonce-1", "dispatch-1", "record-dispatch-1"].includes(n)))
+        .toEqual(["resolve", "reserve", "dispatch-1", "record-dispatch-1"]);
+      expect(armedNonces.filter((a) => a.dispatchId === triggerId)).toEqual([]);
+      expect(dispatchedNonces.at(-1)).toBeNull();
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("the projections receive exactly the journaled values, and the nonce is in no journal entry (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const runId = runIdCounter++;
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId, executionMode: "fly-machines" });
+      const rowsBefore = appendJobLogCalls.length;
+      const resultsBefore = dispatchResults.length;
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+
+      // `recordDispatchRow` receives the journaled `resolve` record.
+      const record = appendJobLogCalls.slice(rowsBefore).find((r) => r.dispatchId === triggerId);
+      expect(record).toEqual({ dispatchId: triggerId, issueId: "kg-refresh", phase: "kg-refresh", repo: KG_SOURCE_REPO, executionMode: "fly-machines" });
+
+      // `recordDispatchDetails` receives the journaled dispatch result's machine id, URL and run id, and nothing else.
+      const result = dispatchResults.slice(resultsBefore).at(-1)!;
+      expect(recordedDetails.filter((d) => d.dispatchId === triggerId)).toEqual([
+        { dispatchId: triggerId, details: { machineId: result.jobId, logsUrl: result.runUrl, workflowRunId: result.runId } },
+      ]);
+
+      // The dispatcher got the nonce the arm step wrote, and the journal holds it nowhere.
+      const nonce = fakeNonce(triggerId, 1);
+      expect(dispatchedNonces.at(-1)).toBe(nonce);
+      expect(armedNonces.filter((a) => a.dispatchId === triggerId).map((a) => a.nonce)).toEqual([nonce]);
+      const entries = await journalEntries(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+      const journal = journalText(entries);
+      expect(journal).toContain(triggerId); // the decoder reads the payloads, so the absence below means something
+      expect(journal).not.toContain(nonce);
+      expect(journal).not.toContain(Buffer.from(nonce).toString("base64"));
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a github-actions run projects the run id and URL but no machine id (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const runId = runIdCounter++;
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId, executionMode: "github-actions" });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      expect(recordedDetails.filter((d) => d.dispatchId === triggerId)).toEqual([
+        { dispatchId: triggerId, details: { logsUrl: `https://example.test/runs/${runId}`, workflowRunId: runId } },
+      ]);
+    }, 30_000);
+  });
+
   // ---- AII-1066: bounded reads (watch-N, reconcile-N, watch-cancel-N, reconcile-cancel-N) ----
   // A read that fails on each attempt is "no new evidence" and never holds the workflow past its
   // deadline. The deadline workflow serves a 1 s bootstrap deadline and a 2.6 s total deadline.
@@ -1450,7 +1653,10 @@ describe("KgRefresh durable workflow", () => {
       kgSourceRepo: KG_SOURCE_REPO,
       mintRunTokens: () => ({ runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" }),
       dispatch: dispatchFn,
-      appendJobLog: (input) => { appendJobLogCalls.push(input); },
+      buildEnvelope: buildEnvelopeFn,
+      resolveDispatchRecord: resolveDispatchRecordFn,
+      ...projectionFakes,
+      recordDispatchRow: (input) => { appendJobLogCalls.push(input); },
       closeJobLog: (jobId, status, conclusion) => { closeRowCalls.push({ jobId, status, conclusion }); },
       getWorkflowRunStatus: getWorkflowRunStatusFn,
       findRunByTitle: findRunByTitleFn,
@@ -1578,7 +1784,10 @@ describe("KgRefresh durable workflow", () => {
       kgSourceRepo: KG_SOURCE_REPO,
       mintRunTokens: () => ({ runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" }),
       dispatch: dispatchFn,
-      appendJobLog: (input) => { appendJobLogCalls.push(input); },
+      buildEnvelope: buildEnvelopeFn,
+      resolveDispatchRecord: resolveDispatchRecordFn,
+      ...projectionFakes,
+      recordDispatchRow: (input) => { appendJobLogCalls.push(input); },
       closeJobLog: (jobId, status, conclusion) => { closeRowCalls.push({ jobId, status, conclusion }); },
       getWorkflowRunStatus: getWorkflowRunStatusFn,
       findRunByTitle: findRunByTitleFn,
@@ -1919,14 +2128,9 @@ describe("KgRefresh durable workflow", () => {
         { label: "the KgRefresh run invocation" },
       );
       const invocation = invocationRows[0];
-      const journalResponse = await fetch(`${env.adminAPIBaseUrl()}/query`, { // restate-test-allow: sys_journal read, not an invocation lookup
-        method: "POST",
-        headers: { "content-type": "application/json", accept: "application/json" },
-        body: JSON.stringify({ query: `SELECT * FROM sys_journal WHERE id = '${invocation.id}'` }),
-      });
-      const journal = JSON.stringify(((await journalResponse.json()) as { rows: unknown[] }).rows);
-      expect(await journalStepNames(env.adminAPIBaseUrl(), invocation.id as string)).toEqual(expect.arrayContaining(["dispatch-1"]));
-      expect(await journalStepNames(env.adminAPIBaseUrl(), invocation.id as string)).not.toContain("dispatch");
+      const journal = JSON.stringify(await journalEntries(env.adminAPIBaseUrl(), invocation.id as string));
+      expect(await journalEntryNames(env.adminAPIBaseUrl(), invocation.id as string)).toEqual(expect.arrayContaining(["dispatch-1"]));
+      expect(await journalEntryNames(env.adminAPIBaseUrl(), invocation.id as string)).not.toContain("dispatch");
       expect(journal).not.toContain("mint-tokens");
       for (const token of ["run-token", "progress-token", "publication-token"]) {
         expect(journal).not.toContain(token);
@@ -2325,8 +2529,10 @@ describe("KgRefresh durable workflow", () => {
       callWorkflow<{ runnerStep: { id: string; status: string } | null }>(baseUrl, "KgRefresh", triggerId, "status").then((st) => st.runnerStep);
 
     // `runWorkflow` returns the run's own promise; wrapping it in an object keeps `await` from waiting for the whole run.
-    async function parkedRun(baseUrl: string, triggerId: string): Promise<{ done: Promise<RefreshOutcome> }> {
-      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+    async function parkedRun(
+      baseUrl: string, triggerId: string, executionMode: "fly-machines" | "github-actions" = "fly-machines",
+    ): Promise<{ done: Promise<RefreshOutcome> }> {
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode });
       const done = runWorkflow(baseUrl, triggerId);
       await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
       return { done };
@@ -2420,6 +2626,24 @@ describe("KgRefresh durable workflow", () => {
 
       // A repeated delivery is left alone, and an older step does not move the report backwards.
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "running"));
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "kg-ingest", status: "running" });
+
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      expect((await done).ok).toBe(true);
+    }, 20_000);
+
+    // AII-1149: the step report is one contract for every backend; the GitHub Actions backend resolves the same promises.
+    it.each(VARIANTS.map(([label]) => label))("a GitHub Actions run names the runner step in flight (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId, "github-actions");
+      expect(await runnerStep(env.baseUrl(), triggerId)).toBeNull();
+
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "running"));
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "running" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "passed"));
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "passed" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("kg-ingest", "running"));
       expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "kg-ingest", status: "running" });
 
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
@@ -2627,7 +2851,10 @@ describe("KgRefresh durable workflow", () => {
       return { runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" };
     },
       dispatch: dispatchFn,
-      appendJobLog: (input) => { appendJobLogCalls.push(input); },
+      buildEnvelope: buildEnvelopeFn,
+      resolveDispatchRecord: resolveDispatchRecordFn,
+      ...projectionFakes,
+      recordDispatchRow: (input) => { appendJobLogCalls.push(input); },
       closeJobLog: (jobId, status, conclusion) => { closeRowCalls.push({ jobId, status, conclusion }); },
       getWorkflowRunStatus: getWorkflowRunStatusFn,
       findRunByTitle: findRunByTitleFn,
@@ -2742,7 +2969,7 @@ describe("KgRefresh durable workflow", () => {
     });
 
     async function keptDispatch(input: KgDispatchInput): Promise<KgDispatchResult> {
-      const scenario = scenarios.get(input.runConfig.triggerId)!;
+      const scenario = scenarios.get(input.dispatchId)!;
       scenario.dispatchCalls++;
       const machineConfig = {
         config: { image: "img", env: { MACHINE_NONCE: `nonce-${input.dispatchId}` }, metadata: { dispatch_id: input.dispatchId } },

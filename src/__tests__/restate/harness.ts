@@ -227,6 +227,63 @@ export async function queryInvocations(adminBaseUrl: string, where: string): Pro
   return ((await response.json()) as { rows: Array<Record<string, unknown>> }).rows;
 }
 
+/** The full `sys_journal` rows of one invocation. A test that must prove a value is absent from the journal searches these. */
+export async function journalEntries(adminBaseUrl: string, invocationId: string): Promise<Array<Record<string, unknown>>> {
+  const response = await fetch(`${adminBaseUrl}/query`, { // restate-test-allow: sys_journal read, not an invocation lookup
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ query: `SELECT * FROM sys_journal WHERE id = '${invocationId}'` }),
+  });
+  if (!response.ok) throw new Error(`POST /query failed: HTTP ${response.status}`);
+  return ((await response.json()) as { rows: Array<Record<string, unknown>> }).rows;
+}
+
+/** The journal rows as searchable text: JSON as given, plus every byte array in it (Restate stores payloads as
+ *  `[123,34,...]`) decoded as UTF-8. A "this value is not in the journal" assertion searches this, not the raw JSON. */
+export function journalText(entries: Array<Record<string, unknown>>): string {
+  const parts: string[] = [];
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      if (value.length > 0 && value.every((n) => Number.isInteger(n) && (n as number) >= 0 && (n as number) < 256)) {
+        parts.push(Buffer.from(value as number[]).toString("utf8"));
+      } else {
+        value.forEach(visit);
+      }
+    } else if (value && typeof value === "object") {
+      Object.values(value).forEach(visit);
+    }
+  };
+  for (const entry of entries) {
+    parts.push(JSON.stringify(entry));
+    if (typeof entry.entry_json === "string") visit(JSON.parse(entry.entry_json));
+  }
+  return parts.join("\n");
+}
+
+/** The JSON value a named `ctx.run` step journaled: the `Run` command's completion id, matched to its completion notification. */
+export function journaledRunResult(entries: Array<Record<string, unknown>>, stepName: string): unknown {
+  const parsed = entries.map((e) => JSON.parse(String(e.entry_json ?? "null")) as Record<string, any> | null);
+  const command = parsed.find((e) => e?.Command?.Run?.name === stepName);
+  if (!command) throw new Error(`no journal entry for step ${stepName}`);
+  const completionId = command.Command.Run.completion_id;
+  const done = parsed.find((e) => e?.Notification?.Completion?.Run?.completion_id === completionId);
+  const success = done?.Notification?.Completion?.Run?.result?.Success as number[] | undefined;
+  if (!success) throw new Error(`step ${stepName} has no journaled success result`);
+  return success.length === 0 ? undefined : JSON.parse(Buffer.from(success).toString("utf8"));
+}
+
+/** The names of an invocation's journal entries, in journal order: `ctx.run` step names show the order a workflow ran its steps. */
+export async function journalEntryNames(adminBaseUrl: string, invocationId: string): Promise<string[]> {
+  const response = await fetch(`${adminBaseUrl}/query`, { // restate-test-allow: sys_journal read, not an invocation lookup
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ query: `SELECT name FROM sys_journal WHERE id = '${invocationId}'` }),
+  });
+  if (!response.ok) throw new Error(`POST /query failed: HTTP ${response.status}`);
+  const rows = ((await response.json()) as { rows: Array<{ name?: string | null }> }).rows;
+  return rows.map((r) => r.name ?? "").filter((n) => n !== "");
+}
+
 /** Cancels one invocation through the admin API (`PATCH /invocations/<id>/cancel`); `id` is a `sys_invocation` row id. */
 export async function cancelInvocation(adminBaseUrl: string, id: string): Promise<void> {
   const response = await fetch(`${adminBaseUrl}/invocations/${encodeURIComponent(id)}/cancel`, { method: "PATCH" });

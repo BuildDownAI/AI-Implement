@@ -64,7 +64,7 @@ import { orchestratorTools, setKgRefreshToolDeps } from "../../restate/tools.js"
 import { callToolAsSystem } from "../../restate/tools-client.js";
 import { makeKgRefreshAdminDeps, sweepLegacyKgRefreshRows } from "../../index.js";
 import type { RestateService } from "../../restate/endpoint.js";
-import { VARIANTS, eventually, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, eventually, journalEntries, journaledRunResult, queryInvocations, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
 
 const KG_SOURCE_REPO = "TestOrg/test-kg-source";
 const NAMESPACE = "https://kg.test.example/";
@@ -193,14 +193,20 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
       config: {
         githubAppId: "test-app-id", githubAppPrivateKey: "test-private-key", sessionImage: "runner:test",
         runnerImageExplicit: false, runnerCallbackBaseUrl: "https://orchestrator.test", runnerTokenSecret: SECRET,
-        flySessionsToken: null, flySessionsApp: null,
+        flySessionsToken: null, flySessionsApp: null, flySessionsRegion: null,
+        localRunnerImage: "local:img", localRunnerOrchestratorUrl: null, healthPort: 8080,
+        anthropicApiKey: null, claudeOAuthToken: null,
       },
       ...railFakes,
-      dispatchKgRefreshRun: async () => { throw new Error("the legacy dispatcher must not run on the GHA path"); },
+      // Sender deps: the GitHub Actions path uses the faked dispatch POST; the machine backends must not run.
+      getInstallationToken: async () => "tok",
+      resolveRunnerImage: async () => undefined,
+      postWorkflowDispatch: ((opts: { inputs: Record<string, string | undefined> }) => sim.postWorkflowDispatch(opts)) as never,
+      keptMachineFly: () => { throw new Error("the Fly sender must not run on the GHA path"); },
+      startLocalRunnerContainer: async () => { throw new Error("the local Docker sender must not run on the GHA path"); },
       // No runner mode resolves KG to GitHub Actions now (AII-1130); the seam keeps this branch under test until AII-1110.
       resolveExecutionMode: () => "github-actions",
       updateJobStatus,
-      recordDispatch: () => {},
       getWorkflowRunStatus: async (runId) => { gh.statusCalls.push(runId); return { ...gh.runState }; },
       findRunByTitle: async () => gh.findResult(++gh.findCalls),
       cancelWorkflowRun: async (runId) => { gh.cancelCalls.push(runId); return true; },
@@ -339,6 +345,34 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     expect(JSON.parse(status.content[0].text)).toMatchObject({ stage: "serving", running: false });
     expect(await markerOf(client)).toBeNull();
     expect(triggerId).toBeTruthy();
+  }, 40_000);
+
+  // P1b ------------------------------------------------------------------------------
+  async function runJournal(env: RestateTestEnvironment, triggerId: string): Promise<Array<Record<string, unknown>>> {
+    const invocations = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`);
+    return journalEntries(env.adminAPIBaseUrl(), invocations[0].id as string);
+  }
+
+  it.each(VARIANTS.map(([label]) => label))("P1b: the row carries the journaled resolve and dispatch-1 values (%s)", async (label) => {
+    const env = envFor(label);
+    const client = clientFor(env);
+    const triggerId = await triggerRefresh(env);
+    await eventually(dispatched, (ok) => ok, { label: "dispatch", timeoutMs: 15_000 });
+    await postReport(env, runToken(), SUCCESS_REPORT);
+    await eventually(() => kgRows().some((r) => r.status === "completed"), (ok) => ok, { label: "durable effect", timeoutMs: 15_000 });
+    await untilMarkerClear(client);
+
+    const journal = await runJournal(env, triggerId);
+    const record = journaledRunResult(journal, "resolve") as Record<string, unknown>;
+    const dispatchResult = journaledRunResult(journal, "dispatch-1") as Record<string, unknown>;
+    const row = getDb().prepare("SELECT execution_mode, run_id, pr_url, issue_id, phase, repo, machine_nonce FROM dispatch_log WHERE dispatch_id = ?").get(triggerId) as Record<string, unknown>;
+    expect(row).toMatchObject({
+      execution_mode: record.executionMode, issue_id: record.issueId, phase: record.phase, repo: record.repo,
+      run_id: dispatchResult.runId, pr_url: dispatchResult.runUrl,
+    });
+    expect(row.execution_mode).toBe("github-actions");
+    expect(row.run_id).toBe(gh.dispatchRunId);
+    expect(row.machine_nonce).toBeNull();
   }, 40_000);
 
   // P2 -------------------------------------------------------------------------------
@@ -509,7 +543,8 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
 
     expect(gh.cancelCalls).toEqual([9_001]);
     expect(await markerOf(client)).not.toBeNull();
-    expect(kgRows()).toMatchObject([{ status: "dispatched" }]);
+    // The `record-dispatch-1` projection wrote the run id, which marks the row running (`updateJobRunId`).
+    expect(kgRows()).toMatchObject([{ status: "running" }]);
 
     gh.runState = { status: "completed", conclusion: "cancelled" };
     await untilMarkerClear(client);

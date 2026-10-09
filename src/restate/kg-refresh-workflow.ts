@@ -41,6 +41,7 @@ import type { BackendRunRead } from "../backend-run.js";
 import type { MachineExit } from "../fly-machines.js";
 import { parseKgSourceRepo } from "../deploy.js";
 import type { Step } from "../pipeline/types.js";
+import type { RunConfigV1 } from "../run-config.js";
 import { KG_REFRESH_RUNNER_STEPS, type KgRepoDefinition } from "./kg-refresh-types.js";
 import { readBoundedOwnedRun } from "./owned-run-lifecycle.js";
 import { awaitOwnedRun, type OwnedRunStatus } from "./owned-run-wait.js";
@@ -93,15 +94,35 @@ export interface KgRefreshReportBody {
 }
 
 export interface KgDispatchInput {
-  runConfig: KgRefreshRunInput;
+  /** The run's configuration, built once by the journaled `envelope` step. Carries no token. */
+  envelope: RunConfigV1;
   tokens: { runToken: string; progressToken: string; publicationToken: string };
-  issueIdentifier: string;
   /** The workflow's own dispatch id — the one its run tokens and `dispatch_log` row carry. */
   dispatchId: string;
   /** The Fly machine size for this run, read once from `FlyMachineProfile/kg-refresh` before the dispatch step. */
   machine: FlyMachineProfileConfig;
   /** The pipeline's kept Fly machine from `FlyMachineProfile.claim`; null when none is kept. */
   machineId: string | null;
+  /** The backend the `resolve` step journaled; the dispatch acts on it and does not resolve again. */
+  executionMode: string;
+  /** The machine nonce derived for this attempt; null for GitHub Actions. A credential: it reaches the dispatcher and never a step result. */
+  machineNonce: string | null;
+}
+
+/** The `dispatch_log` row's values, journaled by the `resolve` step and projected by `reserve`. */
+export interface KgDispatchRecord {
+  dispatchId: string;
+  issueId: "kg-refresh";
+  phase: "kg-refresh";
+  repo: string;
+  executionMode: string;
+}
+
+/** The backend details a journaled dispatch or reconcile result projects onto the row. */
+export interface KgDispatchRowDetails {
+  machineId?: string;
+  logsUrl?: string;
+  workflowRunId?: number;
 }
 
 export interface KgRefreshStatusResult {
@@ -160,11 +181,21 @@ export interface KgRefreshWorkflowDependencies {
   kgSourceRepo: string;
   mintRunTokens(input: { dispatchId: string; ttlSeconds: number }): { runToken: string; progressToken: string; publicationToken: string };
   dispatch(input: KgDispatchInput): Promise<KgDispatchResult>;
-  /** Idempotent on `dispatchId`; returns the dispatch_log row id. */
-  appendJobLog(input: { dispatchId: string; jobId: string }): number | void;
+  /** Builds the run's `RunConfigV1` from the run input and the run title. Pure; the `envelope` step journals the result. */
+  buildEnvelope(run: KgRefreshRunInput, issueIdentifier: string): RunConfigV1;
+  /** Computes the row's values from config and the environment, with no store I/O; the `resolve` step journals the answer. */
+  resolveDispatchRecord(dispatchId: string): KgDispatchRecord;
+  /** Projects the journaled record onto the `dispatch_log` row. Idempotent on `dispatchId`. */
+  recordDispatchRow(record: KgDispatchRecord): void;
+  /** Derives the attempt's machine nonce from the token secret and journaled inputs. Pure; the result is a credential and never a step result. */
+  deriveMachineNonce(dispatchId: string, attempt: number): string;
+  /** Derives the nonce and writes it on the row, before the dispatch creates the machine. Returns nothing: a step result is journaled. */
+  armMachineNonce(dispatchId: string, attempt: number): void;
+  /** Projects journaled dispatch or reconcile values onto the row. */
+  recordDispatchDetails(dispatchId: string, details: KgDispatchRowDetails): void;
   closeJobLog(jobId: string, status: "completed" | "failed" | "timed_out", conclusion?: string): void;
   getWorkflowRunStatus(runId: number): Promise<{ status: string; conclusion: string | null }>;
-  findRunByTitle(title: string): Promise<{ runId: number } | null>;
+  findRunByTitle(title: string): Promise<{ runId: number; logsUrl?: string } | null>;
   cancelWorkflowRun(runId: number): Promise<boolean>;
   /** One status read of a non-GitHub-Actions run by its backend id: its state, plus the machine's exit. */
   readMachineRun(executionMode: string, jobId: string): Promise<BackendRunRead>;
@@ -319,10 +350,14 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     // merge/delete-branch failure) returns through `finish` normally and never reaches
     // this catch.
     try {
-      await ctx.run("reserve", () => deps.appendJobLog({ dispatchId, jobId }));
+      const record = await ctx.run("resolve", () => deps.resolveDispatchRecord(dispatchId));
+      await ctx.run("reserve", () => deps.recordDispatchRow(record));
+      const { executionMode } = record;
 
       const ttlSeconds = Math.ceil(totalDeadlineMs / 1000);
       const issueIdentifier = `KG-REFRESH · ${triggerId}`;
+      // Journaled once: every retry of the dispatch step sends this same envelope.
+      const envelope = await ctx.run("envelope", () => deps.buildEnvelope(input, issueIdentifier));
 
       // Tokens are minted inside the journaled step and never leave it: the step result
       // carries no secret, so none reaches the Restate journal. Minted at most once per
@@ -336,7 +371,12 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       // The resume path that raises this is AII-1032's; the claim, the step names and `attach` carry it.
       const attempt = 1;
       // A journaled call: a replay reuses the claim. The Fly write stays in the dispatch step, which holds the run's tokens.
-      const claim = await ctx.objectClient(FlyMachineProfile, "kg-refresh").claim({ dispatchId, attempt });
+      // Only a Fly run holds the kept machine.
+      const claim = executionMode === "fly-machines"
+        ? await ctx.objectClient(FlyMachineProfile, "kg-refresh").claim({ dispatchId, attempt })
+        : { machineId: null };
+      // Armed before the dispatch creates the machine, so `/api/token` never sees a row with no nonce.
+      if (executionMode !== GHA_EXECUTION_MODE) await ctx.run(`nonce-${attempt}`, () => deps.armMachineNonce(dispatchId, attempt));
       const dispatchResult = await ctx.run(
         `dispatch-${attempt}`,
         async (): Promise<KgDispatchResult> => {
@@ -344,10 +384,14 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           // Reconcile first: a retry after a committed-but-unacknowledged dispatch must adopt that run.
           const existing = await deps.findRunByTitle(issueIdentifier);
           if (existing) {
-            return { outcome: "accepted", runId: existing.runId, jobId: String(existing.runId), executionMode: GHA_EXECUTION_MODE };
+            return {
+              outcome: "accepted", runId: existing.runId, jobId: String(existing.runId), executionMode: GHA_EXECUTION_MODE,
+              ...(existing.logsUrl ? { runUrl: existing.logsUrl } : {}),
+            };
           }
           minted ??= deps.mintRunTokens({ dispatchId, ttlSeconds });
-          const result = await deps.dispatch({ runConfig: input, tokens: minted, issueIdentifier, dispatchId, machine, machineId: claim.machineId });
+          const machineNonce = executionMode === GHA_EXECUTION_MODE ? null : deps.deriveMachineNonce(dispatchId, attempt);
+          const result = await deps.dispatch({ envelope, tokens: minted, dispatchId, machine, machineId: claim.machineId, executionMode, machineNonce });
           return {
             outcome: result.outcome, runId: result.runId, runUrl: result.runUrl,
             jobId: result.jobId, executionMode: result.executionMode,
@@ -363,6 +407,12 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         ctx.objectSendClient(FlyMachineProfile, "kg-refresh").attach({ dispatchId, machineId: dispatchResult.machineId, attempt,
           ...(dispatchResult.replaced !== undefined && { replaces: dispatchResult.replaced }) });
       }
+
+      await ctx.run(`record-dispatch-${attempt}`, () => deps.recordDispatchDetails(dispatchId, {
+        ...(dispatchResult.jobId && dispatchResult.executionMode !== GHA_EXECUTION_MODE ? { machineId: dispatchResult.jobId } : {}),
+        ...(dispatchResult.runUrl ? { logsUrl: dispatchResult.runUrl } : {}),
+        ...(dispatchResult.runId !== undefined ? { workflowRunId: dispatchResult.runId } : {}),
+      }));
 
       if (dispatchResult.runId !== undefined) ctx.set("runId", dispatchResult.runId);
 
@@ -403,6 +453,14 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         }
       }
 
+      /** Projects a run the reconcile found onto the row, in its own step; the read itself writes nothing. */
+      async function recordReconcile(n: number | string, found: { runId: number; logsUrl?: string }): Promise<void> {
+        await ctx.run(`record-reconcile-${n}`, () => deps.recordDispatchDetails(dispatchId, {
+          workflowRunId: found.runId,
+          ...(found.logsUrl ? { logsUrl: found.logsUrl } : {}),
+        }));
+      }
+
       async function waitForOutcome(): Promise<WaitOutcome> {
         let startedSeen = false;
         let watchIndex = 0;
@@ -419,8 +477,10 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             return "started";
           }
           if (runId === undefined) {
-            const found = await readBoundedOwnedRun(ctx, `reconcile-${reconcileIndex++}`, () => deps.findRunByTitle(issueIdentifier), null);
+            const n = reconcileIndex++;
+            const found = await readBoundedOwnedRun(ctx, `reconcile-${n}`, () => deps.findRunByTitle(issueIdentifier), null);
             if (found) {
+              await recordReconcile(n, found);
               runId = found.runId;
               ctx.set("runId", runId);
             }
@@ -522,8 +582,10 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           const noRunDeadlineAt = Math.min(totalDeadlineAt, cancelAt + bootstrapDeadlineMs);
           for (;;) {
             if (runId === undefined) {
-              const found = await readBoundedOwnedRun(ctx, `reconcile-cancel-${reconcileIndex++}`, () => deps.findRunByTitle(issueIdentifier), null);
+              const n = reconcileIndex++;
+              const found = await readBoundedOwnedRun(ctx, `reconcile-cancel-${n}`, () => deps.findRunByTitle(issueIdentifier), null);
               if (found) {
+                await recordReconcile(`cancel-${n}`, found);
                 runId = found.runId;
                 ctx.set("runId", runId);
                 const foundId = runId;

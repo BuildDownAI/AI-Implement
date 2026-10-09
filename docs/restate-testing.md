@@ -324,6 +324,24 @@ check that `workflows/claude-plan.yml`'s `run-name` contains `PLANNING_RUN_TITLE
 
 **Adding the suite to a run kind's scenario file:** start the environments with `startVariants` in `beforeAll`, write the adapter over the run kind's workflow and its recording fakes, and call `registerOwnedRunContract(adapter, (label) => environments.get(label)!)` at the top level of the file. `owned-run-lifecycle.restate.test.ts` is the worked example, with a small fixture workflow. Each effect the adapter passes must be safe to run twice.
 
+## Testing a journal projection (two tiers)
+
+A run kind that follows the [journal projection rule](restate.md#journal-projections) (ADR 018 amendment, 2026-10-08) tests it in two tiers. The worked example is kg-refresh (AII-1150).
+
+**Restate tier** (`kg-refresh-workflow.restate.test.ts`, "AII-1150: journal projections"; `kg-refresh-pilot.restate.test.ts`, P1b). It uses the shared harness helpers of § 6, `journalEntryNames`, `journalEntries`, `journalText`, and `journaledRunResult` in `src/__tests__/restate/harness.ts`; no scenario file keeps a private copy of a journal reader.
+
+- (a) **Order.** `journalEntryNames` shows the `resolve`, `reserve`, `nonce-N`, `dispatch-N`, `record-dispatch-N` order for each backend: a Fly or local-Docker run has `nonce-1`; a GitHub Actions run has none.
+- (b) **The projection receives the journaled values.** The `recordDispatchRow` and `recordDispatchDetails` fakes receive exactly the journaled values, compared with `toEqual` against the step result (the record the `resolve` fake returned; the dispatch result the dispatch fake returned). In the production-composed file, `journaledRunResult(journal, "resolve")` reads the journaled result itself and the real SQLite row is compared to it.
+- (c) **No credential in the journal.** `journalText(await journalEntries(...))` holds no credential string. Use `journalText` and not `JSON.stringify` of the rows: Restate stores payloads as byte arrays, which the helper decodes. Assert a known payload value appears (the dispatch id) so the absence check can fail.
+
+**Unit tier** (`kg-refresh-production.test.ts`).
+
+- (d) The resolve function returns the record for each input state (`resolveDispatchRecord`, one case for each backend), and does no store I/O.
+- (e) The projection function writes each column from the record, asserted on a real SQLite row in a scratch database (`recordKgDispatchRow`: `issue_id`, `phase`, `repo`, `execution_mode`; `recordKgDispatchDetails`: `machine_id`, `pr_url`, `run_id`, and `status` unchanged for the machine write).
+- (f) A derivation is deterministic and differs across attempts (`deriveMachineNonce`: same triple gives one value, a new attempt, dispatch id, or secret gives another, 32 hex characters).
+
+Every fake that a workflow test adds for a projection (`recordDispatchRow`, `recordDispatchDetails`, `armMachineNonce`) is a recording fake: it appends to an array the scenario asserts on, and does no I/O.
+
 ## Timing rules
 
 Four flakes cost gap-fill rounds (a base URL captured before a restart, a scenario that outran a shortened
