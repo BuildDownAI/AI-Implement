@@ -1005,27 +1005,31 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const env = envFor(label);
     const fixture = freshScenario("journal-projection");
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    // Pin the attempt now: `fixture.attemptId` is reassigned by every launch, and the fixture's pending
+    // feedback never clears, so once this attempt releases, the PR admits an identical-content `-1` attempt
+    // whose dispatch overwrites it. The journal and row below must be this attempt's, not that one's.
+    const attemptId = fixture.attemptId!;
     await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
-    const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
+    const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;
     const result = resultOf(fixture, prepared);
     const secret = "journal-projection-secret";
     // Minting needs a live authority, so mint before the attempt finishes.
     const tokens = (["result", "progress", "publication"] as const)
-      .map((audience) => mintPreparedReviewFixToken({ attemptId: fixture.attemptId!, audience, secret }).token);
-    await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", result);
-    const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!);
+      .map((audience) => mintPreparedReviewFixToken({ attemptId, audience, secret }).token);
+    await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "result", result);
+    const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
     expect(done).toMatchObject({ status: "finalized", approval: "applied" });
 
     const rows = await queryInvocations(env.adminAPIBaseUrl(),
-      `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${fixture.attemptId!}' AND target_handler_name = 'run'`);
+      `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${attemptId}' AND target_handler_name = 'run'`);
     expect(rows).toHaveLength(1);
     const entries = await journalEntries(env.adminAPIBaseUrl(), rows[0].id as string);
 
     const journaled = journaledRunResult(entries, "record-success-outcome") as { status: string; completedAt: number };
     expect(journaled.status).toBe("recorded");
     const row = getDb().prepare("SELECT completed_at FROM review_fix_attempts WHERE attempt_id = ?")
-      .get(fixture.attemptId!) as { completed_at: number };
+      .get(attemptId) as { completed_at: number };
     expect(row.completed_at).toBe(journaled.completedAt);
 
     const text = journalText(entries);
