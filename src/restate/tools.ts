@@ -280,7 +280,7 @@ export const listProjects = tool(
 );
 
 export const GET_PROJECT_BINDING_DESCRIPTION =
-  "Returns the binding a skill needs for its own project: team key, repo, default branch, tracker kind, the effective pickup label (the live ADR 022 settings value, not a hardcoded default), and the knowledge-graph binding (present, orchestratorUrl, sourceRepo, baseRepo, searchTool). Pass `repo` (owner/repo) or `team` to select one project, returned as a single object; omit both to list every mapping as an array. Never includes extraEnv or a token.";
+  "Returns the binding a skill needs for its own project: team key, repo, default branch, tracker kind, the resolved review process (reviewProcess: ai-implement or claude-code-review), the effective pickup label (the live ADR 022 settings value, not a hardcoded default), and the knowledge-graph binding (present, orchestratorUrl, sourceRepo, baseRepo, searchTool). Pass `repo` (owner/repo) or `team` to select one project, returned as a single object; omit both to list every mapping as an array. Never includes extraEnv or a token.";
 
 export const getProjectBinding = tool(
   {
