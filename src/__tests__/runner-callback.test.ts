@@ -1255,6 +1255,64 @@ describe("handleRunnerResult — implementation", () => {
     });
   });
 
+  describe("submitLateExternalReview (AII-1227)", () => {
+    const SHA = "0123456789abcdef0123456789abcdef01234567";
+    async function run(id: string, phase: "implementation" | "gap-analysis", extra: Record<string, unknown>, submit?: (i: unknown) => Promise<void>) {
+      const { token, dispatchId } = runnerTokens.mintRunToken({
+        issueId: id, mappingTeamKey: "ENG", phase,
+        ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+      });
+      log.appendLog({
+        issueId: id, issueIdentifier: "ENG-9", teamKey: "ENG", repo: "o/r", dispatchId, executionMode: "github-actions",
+      });
+      const hook = vi.fn(submit ?? (async () => {}));
+      const res = await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: {
+          phase, outcome: "failure", failureCode: "REVIEW_UNAPPROVED", comments: [],
+          prUrl: "https://github.com/o/r/pull/99", ...extra,
+        } as never,
+        secret: SECRET,
+        resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+        submitLateExternalReview: hook as never,
+      });
+      return { res, hook, dispatchId };
+    }
+
+    it.each(["implementation", "gap-analysis"] as const)("submits once with the right input (%s)", async (phase) => {
+      const { res, hook, dispatchId } = await run("i-late-" + phase, phase, { externalReviewPending: { headSha: SHA } });
+      expect(res.status).toBe(200);
+      expect(hook).toHaveBeenCalledTimes(1);
+      expect(hook).toHaveBeenCalledWith({
+        dispatchId, owner: "o", repo: "r", prNumber: 99, prUrl: "https://github.com/o/r/pull/99", headSha: SHA,
+      });
+    });
+
+    it("does not submit without the field, without prUrl, or with a malformed field", async () => {
+      const absent = await run("i-late-absent", "implementation", {});
+      const noUrl = await run("i-late-nourl", "implementation", { externalReviewPending: { headSha: SHA }, prUrl: undefined });
+      const bad = await run("i-late-bad", "implementation", { externalReviewPending: { headSha: "xyz" } });
+      for (const r of [absent, noUrl, bad]) {
+        expect(r.hook).not.toHaveBeenCalled();
+        expect(r.res.status).toBe(200);
+      }
+      expect(noUrl.res.body).toEqual(absent.res.body);
+    });
+
+    it("does not change the response when the hook throws", async () => {
+      const absent = await run("i-late-base", "implementation", {});
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const thrown = await run("i-late-throw", "implementation", { externalReviewPending: { headSha: SHA } }, async () => {
+        throw new Error("boom");
+      });
+      warn.mockRestore();
+      expect(thrown.hook).toHaveBeenCalledTimes(1);
+      expect(thrown.res.status).toBe(absent.res.status);
+      // Like every other best-effort step here, the error surfaces as a warning only.
+      expect(thrown.res.body).toEqual({ ...absent.res.body, warnings: ["submitLateExternalReview: boom"] });
+    });
+  });
+
   it("does NOT write runner_approved on INSTALL_FAILED coded failure", async () => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i-install-failed",
