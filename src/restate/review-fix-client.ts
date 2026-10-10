@@ -13,7 +13,7 @@
  * against redelivery once Restate's own idempotency-key retention window has expired —
  * nothing tracked in this module does that job.
  */
-import type { AttemptId, ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
+import type { AttemptId, ResultIntakeOutcome, ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
 import { validateAttemptId, validateReviewFixResultMetadata } from "../review-fix-contract.js";
 import { isDeployHeld } from "../deploy-hold.js";
 import {
@@ -22,7 +22,9 @@ import {
   retryDelivery,
   type ReviewFixDelivery,
 } from "../review-fix-inbox.js";
+import { createHash } from "node:crypto";
 import * as restateClients from "@restatedev/restate-sdk-clients";
+import type { ReviewFixAttemptDefinition } from "./review-fix-attempt-types.js";
 import { reviewFixPRKey, type ReviewFixFeedbackEvent, type ReviewFixPRDefinition } from "./review-fix-pr.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 
@@ -127,7 +129,19 @@ export function createRestateReviewFixFacade(deps: RestateReviewFixFacadeDeps = 
 export interface ReviewFixIngressClient {
   /** Forwards the validated event to `ReviewFixPR.feedback`; `idempotencyKey` is the GitHub delivery id. Never throws. */
   feedback(scope: ScopedPrIdentity, event: ReviewFixFeedbackEvent, opts: { idempotencyKey: string }): Promise<ReviewFixFacadeOutcome>;
+  /**
+   * Forwards the validated runner result to `ReviewFixAttempt.result` (AII-1185); `idempotencyKey` is
+   * `reviewFixResultForwardKey(result)`. `accepted` carries the handler's own outcome (`stored`, `duplicate`, `conflict`,
+   * `stale`); the transport-level `conflict` (409) and `not-found` (404) are separate. Never throws.
+   */
+  result(attemptId: AttemptId, result: ReviewFixResultMetadataV1, opts: { idempotencyKey: string }): Promise<ReviewFixResultForwardOutcome>;
 }
+
+export type ReviewFixResultForwardOutcome =
+  | { readonly status: "accepted"; readonly outcome: ResultIntakeOutcome }
+  | { readonly status: "conflict" }
+  | { readonly status: "not-found" }
+  | { readonly status: "unavailable" };
 
 export interface ReviewFixIngressClientDeps {
   fetchImpl?: typeof fetch;
@@ -151,7 +165,51 @@ export function createReviewFixIngressClient(
         return { status: "unavailable" };
       }
     },
+    async result(attemptId, result, opts) {
+      try {
+        const rpc = restateClients.rpc.opts<ReviewFixResultMetadataV1, ResultIntakeOutcome>({ timeout, idempotencyKey: opts.idempotencyKey });
+        const outcome = await ingress
+          .workflowClient<ReviewFixAttemptDefinition>({ name: "ReviewFixAttempt" }, attemptId)
+          .result(result, rpc);
+        return { status: "accepted", outcome: outcome as ResultIntakeOutcome };
+      } catch (err) {
+        if (err instanceof restateClients.HttpCallError) {
+          if (err.status === 409) return { status: "conflict" };
+          if (err.status === 404) return { status: "not-found" };
+        }
+        return { status: "unavailable" };
+      }
+    },
   };
+}
+
+/**
+ * Idempotency key for the callback's result forward: `<attemptId>.result.<sha256 of the body>`.
+ * Restate answers a repeated key with the first response whatever the body, so a bare
+ * `<attemptId>.result` would hide a conflicting second result behind the cached `stored`
+ * and never set `result_conflict_at`. Keying on the body keeps an identical retry on the
+ * cached acknowledgement while a different body reaches the handler's conflict path.
+ */
+export function reviewFixResultForwardKey(result: ReviewFixResultMetadataV1): string {
+  return `${result.attemptId}.result.${createHash("sha256").update(JSON.stringify(result)).digest("hex")}`;
+}
+
+/**
+ * Maps the ingress client's transport outcome to the callback's `ResultIntakeOutcome`; `null` means Restate
+ * was unavailable, which the route answers 503 with nothing written. Shared by `onReviewFixResult` and the
+ * restate scenario so neither re-implements the mapping.
+ */
+export function reviewFixResultIntakeFromForward(attemptId: AttemptId, out: ReviewFixResultForwardOutcome): ResultIntakeOutcome | null {
+  switch (out.status) {
+    case "accepted":
+      return out.outcome;
+    case "conflict":
+      return { status: "conflict", attemptId, reason: "result conflicts with the recorded result" };
+    case "not-found":
+      return { status: "stale", attemptId, reason: "unknown attempt" };
+    case "unavailable":
+      return null;
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -310,10 +310,10 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
     const receivedAt = await ctx.date.now();
     const outcome = await ctx.run("store-result", () => store.recordResult(attemptId, checked.value, receivedAt));
     if (outcome.status === "stored" || outcome.status === "duplicate") {
-      // The authenticated HTTP callback commits the result before its durable
-      // inbox delivers this signal. Delivery therefore normally sees a
-      // byte-identical duplicate, not a fresh store write. It must still wake
-      // the workflow; recordResult only returns duplicate for that same body.
+      // The runner callback forwards here over the ingress and writes nothing itself, so
+      // `store-result` is the only writer of the accepted result. A first call stores; an
+      // identical retry (a fresh key past the idempotency retention) returns `duplicate`
+      // without a second write. Either way the workflow must wake.
       const wake = ctx.promise<Wake>("wake");
       if (await wake.peek() === undefined) await wake.resolve({ kind: "result", result: outcome.status === "stored" ? outcome.result : checked.value });
     } else if (outcome.status === "conflict") {

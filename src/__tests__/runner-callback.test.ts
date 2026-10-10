@@ -4252,6 +4252,23 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
     ).rejects.toThrow("sqlite disk I/O error");
   });
 
+  it("answers 503 when the intake reports Restate unreachable, without consuming anything", async () => {
+    const fake = new FakeProvider({ recordCalls: true });
+    const token = preparedResultToken("attempt-restate-down");
+    const out = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation", outcome: "success", comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        reviewFix: { ...validReviewFix, attemptId: "attempt-restate-down" },
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+      onReviewFixResult: async () => { throw new runnerCallback.ReviewFixIntakeUnavailableError(); },
+    });
+    expect(out.status).toBe(503);
+  });
+
   it("ACKs 'stored' when the seam's durable write succeeds even though it also reports a simulated delivery-sidecar outage (best-effort, non-blocking)", async () => {
     const fake = new FakeProvider({ recordCalls: true });
     const token = preparedResultToken("attempt-sidecar-outage");
