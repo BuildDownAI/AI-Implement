@@ -561,6 +561,15 @@ describe("KgRefresh durable workflow", () => {
     totalDeadlineMs: TOTAL_DEADLINE_MS,
   });
 
+  // The bootstrap deadline is short and the total deadline is long against the work, for a scenario that must act
+  // after the bootstrap deadline and cannot be ordered against a later short deadline: a gate holds only a lower bound.
+  const BOOTSTRAP_ONLY_TOTAL_DEADLINE_MS = 30_000;
+  const bootstrapOnlyWorkflow = createKgRefreshWorkflow({
+    ...workflowDeps,
+    bootstrapDeadlineMs: BOOTSTRAP_DEADLINE_MS,
+    totalDeadlineMs: BOOTSTRAP_ONLY_TOTAL_DEADLINE_MS,
+  });
+
   const kgRepo = createKgRepo({ workflowName: "KgRefresh" });
   const starter = restate.service({
     name: "KgRefreshStarter",
@@ -592,17 +601,21 @@ describe("KgRefresh durable workflow", () => {
 
   let envs: Map<string, RestateTestEnvironment>;
   let deadlineEnvs: Map<string, RestateTestEnvironment>;
+  let bootstrapEnvs: Map<string, RestateTestEnvironment>;
   beforeAll(async () => {
     envs = await startVariants([workflow, kgRepo, starter, flyMachineProfile]);
     deadlineEnvs = await startVariants([deadlineWorkflow, kgRepo, starter, flyMachineProfile]);
+    bootstrapEnvs = await startVariants([bootstrapOnlyWorkflow, kgRepo, starter, flyMachineProfile]);
   }, 120_000);
   afterAll(async () => {
     if (envs) await stopAll(envs);
     if (deadlineEnvs) await stopAll(deadlineEnvs);
+    if (bootstrapEnvs) await stopAll(bootstrapEnvs);
   });
 
   // A scenario that does not test a deadline runs in envFor, whose deadlines are long against its own work.
   // A scenario that tests a deadline runs in deadlineEnvFor, which serves the short deadlines.
+  // A scenario that tests the bootstrap deadline only runs in bootstrapEnvFor, whose total deadline is long.
   function envFor(label: string): RestateTestEnvironment {
     const env = envs.get(label);
     if (!env) throw new Error(`missing Restate variant ${label}`);
@@ -612,6 +625,12 @@ describe("KgRefresh durable workflow", () => {
   function deadlineEnvFor(label: string): RestateTestEnvironment {
     const env = deadlineEnvs.get(label);
     if (!env) throw new Error(`missing Restate deadline variant ${label}`);
+    return env;
+  }
+
+  function bootstrapEnvFor(label: string): RestateTestEnvironment {
+    const env = bootstrapEnvs.get(label);
+    if (!env) throw new Error(`missing Restate bootstrap variant ${label}`);
     return env;
   }
 
@@ -1568,10 +1587,10 @@ describe("KgRefresh durable workflow", () => {
   }, 15_000);
 
   it.each(VARIANTS.map(([label]) => label))("AII-1125: a started read holds off the bootstrap timeout until the machine ends dispatch_lost (%s)", async (label) => {
-    const env = deadlineEnvFor(label);
+    const env = bootstrapEnvFor(label);
     const triggerId = newTriggerId();
     makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "fly-machines" });
-    // Twelve started reads span more than the 1 s bootstrap deadline (100 ms interval) but not the 1.8 s total.
+    // Twelve started reads always span more than the 1 s bootstrap deadline (a sleep never fires early); the long total deadline is no limit.
     const started = { state: "started" as const, exit: null };
     machineReads.set(triggerId, [
       ...Array.from({ length: 12 }, () => started),
@@ -1656,14 +1675,18 @@ describe("KgRefresh durable workflow", () => {
       const env = envFor(label);
       const triggerId = newTriggerId();
       const runId = runIdCounter++;
+      const held = gate("W6 first status read");
       makeScenario(triggerId, {
         dispatchOutcome: "accepted", runId, executionMode: "github-actions",
-        runStatusSequence: [{ status: "in_progress", conclusion: null }],
+        runStatusSequence: [{ status: "in_progress", conclusion: null }], tickGate: held,
       });
 
       const done = runWorkflow(env.baseUrl(), triggerId);
-      await eventually(() => scenarios.get(triggerId)!.runStatusCalls >= 1, (ok) => ok, { label: "durable effect" });
+      // The first status read is held, so no tick can fire while the report is sent: the report is resolved
+      // before the workflow races its signal arms, in both variants. The order is fixed by the fake, not a tick.
+      await held.reached();
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      held.release();
 
       const outcome = await done;
       expect(outcome.ok).toBe(true);
@@ -1903,7 +1926,7 @@ describe("KgRefresh durable workflow", () => {
   it.each(VARIANTS.map(([label]) => label))(
     "AII-1029: GHA backend — in_progress status reads with no progress call outlive the bootstrap deadline (%s)",
     async (label) => {
-      const env = deadlineEnvFor(label);
+      const env = bootstrapEnvFor(label);
       const triggerId = newTriggerId();
       const held = gate("AII-1029 first status read");
       const scenario = makeScenario(triggerId, {
@@ -1911,7 +1934,7 @@ describe("KgRefresh durable workflow", () => {
         runStatusSequence: [{ status: "in_progress", conclusion: null }], tickGate: held,
       });
       const done = runWorkflow(env.baseUrl(), triggerId);
-      // Past the 1s bootstrap deadline and still before the total deadline.
+      // Past the 1s bootstrap deadline; the total deadline is long, so no limit is raced.
       await pastDeadlineAtTick(scenario, BOOTSTRAP_DEADLINE_MS, "bootstrap deadline");
       held.release();
       // A second status read means the wait went on past the bootstrap deadline.
@@ -2105,7 +2128,7 @@ describe("KgRefresh durable workflow", () => {
   it.each(VARIANTS.map(([label]) => label))(
     "AII-1010: cancel with no run ever found completes within the bootstrap window, not the total deadline (%s)",
     async (label) => {
-      const env = deadlineEnvFor(label);
+      const env = bootstrapEnvFor(label);
       const triggerId = newTriggerId();
       const held = gate("cancel first title lookup");
       const heldCancelWait = gate("cancel phase title lookup");
@@ -2125,8 +2148,8 @@ describe("KgRefresh durable workflow", () => {
       await done;
       expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
       expect(scenarios.get(triggerId)!.cancelCalls).toBe(0);
-      // Bounded by cancel time + BOOTSTRAP_DEADLINE_MS (1s); the total deadline is 1.8s after dispatch.
-      expect(Date.now() - started).toBeLessThan(TOTAL_DEADLINE_MS);
+      // No elapsed-time assertion: the total deadline here is 30 s and the test timeout 15 s, so a cancel that
+      // ended at the total deadline could not pass. The cancel phase ended at the bootstrap window.
     },
     15_000,
   );

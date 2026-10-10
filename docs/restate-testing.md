@@ -380,8 +380,9 @@ did not test). Scenarios follow four rules, and
    ```
 
 4. **A scenario that does not test a deadline runs with deadlines that are long against its own work; a scenario that
-   tests a deadline uses its own short-deadline environment.** `kg-refresh-workflow.restate.test.ts` serves both:
-   `envFor(label)` (30 s / 60 s) and `deadlineEnvFor(label)` (the short deadlines). The short deadlines are a 1 s bootstrap and a 1.8 s total, with a 100 ms watch tick. The
+   tests a deadline uses its own short-deadline environment.** `kg-refresh-workflow.restate.test.ts` serves three:
+   `envFor(label)` (30 s / 60 s), `deadlineEnvFor(label)` (the short deadlines), and `bootstrapEnvFor(label)` (the 1 s
+   bootstrap deadline with a 30 s total, for a scenario that must act after the bootstrap deadline and has no upper bound to beat). The short deadlines are a 1 s bootstrap and a 1.8 s total, with a 100 ms watch tick. The
    bootstrap deadline is the one that cannot shrink: AII-1125's started read must arrive inside it, AII-1111 raised a 400 ms
    bootstrap to avoid that race, and AII-1028 measured invocation start delays up to 1.08 s on a loaded runner.
 
@@ -396,7 +397,7 @@ This is the gated race test pattern. A scenario of an owned-run wait sets the or
 * **Gate a fake.** A fake dependency awaits a gate that the test holds (`gate` in `harness.ts`). The gate reports when the workflow reaches it. The test releases it at the exact point.
 * **Wait for a step, then act.** Before the test sends a signal, it waits for the named step with `waitForStep`.
 * **Order against a fake, not a test-body event.** In a scenario that asserts the order of a signal against a fake's answer, the fake changes its answer only on state the workflow controls (for example, the wait-call number the fixture passes in), or on a gate the test releases after the workflow has acted on the signal. It never changes on a test-body event alone: `send` returning means the signal was delivered, not consumed, and the owned-run wait reads status before it races the signals. Example: [AII-1049](https://linear.app/eudoxus/issue/AII-1049/owned-run-wait-scenario-a-second-call-after-report-returns-ended-can), the `owned-run-wait.restate.test.ts` scenario "a second call after report returns ended", where a flag set after `send` returned still raced.
-* **Deadline scenarios.** Hold the workflow at a gate until the deadline has passed, then release it. Prove the scenario fails when the deadline branch, or the `peek` at the deadline, is removed.
+* **Deadline scenarios.** Hold the workflow at a gate until the deadline has passed, then release it. Prove the scenario fails when the deadline branch, or the `peek` at the deadline, is removed. A scenario that must act after one deadline and before a later one runs where the later deadline is long against its work, because a gate can hold only the lower bound.
 * **Teardown.** Await the workflow's terminal output before a test ends.
 * **Tiers.** The deadline decision is tested in the unit tier with no timers. The Restate tier proves the journal, replay, and exclusivity.
 * **Signals from the test body are not the producer proof.** A scenario may resolve a promise from the test body. Each promise also has a `contract: <Workflow>.<promise>` test in the default suite, and `src/__tests__/restate-producer-guard.test.ts` fails when one is missing.
