@@ -46,6 +46,8 @@ export interface ReviewLedgerOptions {
   extraAuthors: readonly string[];
   /** When set, a review thread whose latest comment was written on another commit is not a finding. */
   headSha?: string;
+  /** A successful `issues/{pr}/comments` read the caller already made; when set, the readers reuse it instead of fetching again. */
+  issueComments?: GhResult;
 }
 
 const DEFAULT_REVIEW_LEDGER_OPTIONS: ReviewLedgerOptions = { process: resolveReviewProcess(null), extraAuthors: [] };
@@ -684,12 +686,7 @@ function collectClaudeIssueComments(
   out: { findingsUnavailable: boolean; verdict?: ReviewFindingsVerdict; verdictSource?: ReviewLedgerSource },
   options: ReviewLedgerOptions,
 ): void {
-  const result = safeGhSpawn(ghSpawn, [
-    "api",
-    "--paginate",
-    "--slurp",
-    `repos/:owner/:repo/issues/${prNumber}/comments?per_page=100`,
-  ]);
+  const result = readIssueComments(ghSpawn, prNumber, options);
   if (!result || result.exitCode !== 0) return;
 
   const comments = parseReviewPages(result.stdout)
@@ -723,12 +720,7 @@ export function collectReviewFindingsBlocksFromGh(
   prNumber: string,
   options: ReviewLedgerOptions,
 ): ReviewFindingsBlockResult[] | null {
-  const result = safeGhSpawn(ghSpawn, [
-    "api",
-    "--paginate",
-    "--slurp",
-    `repos/:owner/:repo/issues/${prNumber}/comments?per_page=100`,
-  ]);
+  const result = readIssueComments(ghSpawn, prNumber, options);
   if (!result || result.exitCode !== 0) return null;
   const blocks: ReviewFindingsBlockResult[] = [];
   const comments = parseReviewPages(result.stdout)
@@ -874,6 +866,15 @@ function collectReviewThreadFindings(
       ...(typeof latestComment.url === "string" ? { url: latestComment.url } : {}),
     });
   }
+}
+
+function readIssueComments(ghSpawn: GhSpawn, prNumber: string, options: ReviewLedgerOptions): GhResult | undefined {
+  return options.issueComments ?? safeGhSpawn(ghSpawn, [
+    "api",
+    "--paginate",
+    "--slurp",
+    `repos/:owner/:repo/issues/${prNumber}/comments?per_page=100`,
+  ]);
 }
 
 function safeGhSpawn(ghSpawn: GhSpawn, args: string[]): GhResult | undefined {
