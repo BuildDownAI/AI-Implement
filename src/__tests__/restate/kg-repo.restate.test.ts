@@ -3,7 +3,7 @@
 // count and inspect the sends without depending on the real workflow module.
 import { randomUUID } from "node:crypto";
 import * as restate from "@restatedev/restate-sdk";
-import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { MAX_TRACKED_PRS } from "../../kg-refresh.js";
 import { KG_REFRESH_TOTAL_DEADLINE_MS, KG_REPO_STALE_MARGIN_MS } from "../../restate/kg-refresh-workflow.js";
@@ -53,7 +53,7 @@ describe("KgRepo durable single-flight lock", () => {
   const kgRepo = createKgRepo({ workflowName: FAKE_WORKFLOW_NAME });
 
 
-  let envs: Map<string, RestateTestEnvironment>;
+  let envs: Map<string, RestateEnvironment>;
   beforeAll(async () => {
     envs = await startVariants([kgRepo, fakeKgRefresh, privateCaller]);
   }, 60_000);
@@ -61,7 +61,7 @@ describe("KgRepo durable single-flight lock", () => {
     if (envs) await stopAll(envs);
   });
 
-  function envFor(label: string): RestateTestEnvironment {
+  function envFor(label: string): RestateEnvironment {
     const env = envs.get(label);
     if (!env) throw new Error(`missing Restate variant ${label}`);
     return env;
@@ -577,8 +577,8 @@ describe("KgRepo object-owned lease expiry", () => {
     handlers: { run: async (): Promise<void> => {} },
   });
 
-  let production: Map<string, RestateTestEnvironment>;
-  let short: Map<string, RestateTestEnvironment>;
+  let production: Map<string, RestateEnvironment>;
+  let short: Map<string, RestateEnvironment>;
   beforeAll(async () => {
     production = await startVariants([createKgRepo({ workflowName: FAKE_WORKFLOW_NAME }), fakeKgRefresh, privateCaller]);
     short = await startVariants([
@@ -592,13 +592,13 @@ describe("KgRepo object-owned lease expiry", () => {
     if (short) await stopAll(short);
   });
 
-  const pick = (envs: Map<string, RestateTestEnvironment>, label: string): RestateTestEnvironment => {
+  const pick = (envs: Map<string, RestateEnvironment>, label: string): RestateEnvironment => {
     const env = envs.get(label);
     if (!env) throw new Error(`missing Restate variant ${label}`);
     return env;
   };
   const slugOf = () => `buildDownAI/kg-source-${randomUUID()}`;
-  const markerOf = (env: RestateTestEnvironment, slug: string) =>
+  const markerOf = (env: RestateEnvironment, slug: string) =>
     callObject<{ triggerId: string } | null>(env.baseUrl(), "KgRepo", slug, "status", {});
 
   it.each(VARIANTS.map(([label]) => label))(

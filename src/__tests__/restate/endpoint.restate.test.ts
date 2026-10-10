@@ -1,101 +1,47 @@
 // Real-endpoint, real-registration coverage for src/restate/endpoint.ts (AII-727). Every
-// other Restate-tier test in this repo boots its container through
-// RestateTestEnvironment.start() (src/__tests__/restate/harness.ts), which auto-registers
-// its OWN internal endpoint — proving the harness, not this file's own
-// startRestateEndpoint()/register(). This file manages a RestateContainer directly so it
-// can call those two functions itself, against a real server 1.7.10 admin API.
+// other Restate-tier test in this repo boots its server through startVariants()
+// (src/__tests__/restate/harness.ts), which auto-registers its OWN internal endpoint —
+// proving the harness, not this file's own startRestateEndpoint()/register(). This file
+// starts a `restate-server` binary whose only registered service is a probe, then calls
+// those two functions itself against the server's admin API (AII-1195: the block formerly
+// ran in a container behind a tunnelling fetch).
 //
-// Container-to-host reachability (the acceptance bar asks this be documented, since the
-// planning notes flagged it as unverified by reading the SDK alone): this process's own SDK
-// endpoint stays bound to the production default, 127.0.0.1 (restateBindAddress(),
-// unmodified — ADR 023's loopback-only rule is never relaxed for this test). The container
-// reaches it via TestContainers.exposeHostPorts(), the same "testcontainers"
-// service-endpoint-access mode RestateTestEnvironment.start() itself offers
-// (@restatedev/restate-sdk-testcontainers's restate_test_environment.ts, DEFAULT_START_OPTIONS
-// aside — that default is "docker-host", but the "testcontainers" branch is the same library
-// code, just the other of the two options it ships): it starts a small proxy container and
-// tunnels host.testcontainers.internal:<port>, as seen from any container in this test run,
-// back to 127.0.0.1:<port> on the host — so the loopback bind itself never has to change.
+// The server and this process's SDK endpoint are both on the host, so the production
+// loopback bind (127.0.0.1, restateBindAddress() unmodified — ADR 023) is also the address
+// the server dials, and register() needs no fetch rewriting.
 //
-// One wrinkle is specific to calling register() directly rather than going through the
-// harness: restateBindAddress() supplies both this process's bind address and, inside
-// register(), the registered `uri` — one value serving two different purposes here (the
-// interface this process listens on, and the address the container must be told to dial).
-// tunnelingFetch below rewrites that one substring in the outgoing request body, from the
-// real bind address to the tunnel address — the `fetchImpl` seam register() already exposes
-// for testing. It changes no code in src/restate/endpoint.ts.
-//
-// Run with `npm run test:restate` (Docker required); excluded from `npm test`.
+// Run with `npm run test:restate`; excluded from `npm test`.
 import * as http2 from "node:http2";
 import crypto from "node:crypto";
 import { randomUUID } from "node:crypto";
 import * as restate from "@restatedev/restate-sdk";
 import { createEndpointHandler } from "@restatedev/restate-sdk/node";
-import { RestateContainer } from "@restatedev/restate-sdk-testcontainers";
-import { TestContainers } from "testcontainers";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { RESTATE_SERVICES, queryNonCompletedInvocations, register, restateBindAddress, startRestateEndpoint } from "../../restate/endpoint.js";
 import { orchestratorTools } from "../../restate/tools.js";
 import * as dedup from "../../dedup.js";
 import { initSettingsTable } from "../../runner-mode.js";
 import { startBinaryEnvironment, type BinaryEnvironment } from "./binary-environment.js";
-import { RESTATE_IMAGE_VERSION, callObject, callService, eventually, queryInvocations, restateTestRuntime } from "./harness.js";
+import { callObject, callService, eventually } from "./harness.js";
 
 function sha256(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex");
 }
 
-/**
- * Mirrors @restatedev/restate-sdk-testcontainers's own PartitionsReadyWaitStrategy, without
- * pulling in its apache-arrow dependency: a non-2xx response or a connection error just
- * means "not ready yet," not a fatal error. RestateContainer's default wait strategy
- * (Wait.forListeningPorts()) only proves the TCP ports are open, not that the admin API's
- * partitions are queryable yet — register() needs the latter.
- */
-async function waitForPartitionsReady(adminBaseUrl: string, timeoutMs = 60_000): Promise<void> {
-  await eventually(
-    async () => {
-      try {
-        await queryInvocations(adminBaseUrl, "true LIMIT 1");
-        return true;
-      } catch {
-        // Admin API not accepting connections yet, or partitions not queryable.
-        return false;
-      }
-    },
-    Boolean,
-    { timeoutMs, intervalMs: 200, label: "Restate admin API partitions to be ready" },
-  );
-}
+const probe = restate.service({
+  name: "registrationProbe",
+  handlers: { ping: async (_ctx: restate.Context) => "pong" },
+});
 
-/**
- * Rewrites the one literal `realHostPort` substring in an outgoing request body to
- * `tunnelHostPort` — see the file header for why register()'s own `uri` and this process's
- * bind address can't independently vary through env vars alone. Applies to every call
- * register() makes (the /deployments POST and, on a conflict, the internal /query POST for
- * queryNonCompletedInvocations), since both embed the same literal host:port text.
- */
-function tunnelingFetch(realHostPort: string, tunnelHostPort: string): typeof fetch {
-  return (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
-    if (init && typeof init.body === "string" && init.body.includes(realHostPort)) {
-      init = { ...init, body: init.body.split(realHostPort).join(tunnelHostPort) };
-    }
-    return fetch(input, init);
-  }) as typeof fetch;
-}
-
-// Builds its own RestateContainer, so it needs Docker (AII-914).
-describe.skipIf(restateTestRuntime() === "binary")("startRestateEndpoint() / register() against a real server 1.7.10 (AII-727)", () => {
+describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-727)", () => {
   let server: http2.Http2Server;
   let port: number;
   let bindHost: string;
-  let started: Awaited<ReturnType<RestateContainer["start"]>>;
+  let env: BinaryEnvironment;
   let adminBaseUrl: string;
   let ingressBaseUrl: string;
-  let registerFetch: typeof fetch;
   let changedServer: http2.Http2Server;
   let changedPort: number;
-  let changedFetch: typeof fetch;
   let changedHandler = createEndpointHandler({ services: RESTATE_SERVICES });
 
   beforeAll(async () => {
@@ -118,45 +64,37 @@ describe.skipIf(restateTestRuntime() === "binary")("startRestateEndpoint() / reg
     vi.stubEnv("RESTATE_ENDPOINT_PORT", String(port));
     bindHost = restateBindAddress().host;
 
-    // A second endpoint has a swappable handler on one live HTTP/2 server. Keeping
-    // the connection alive matters: a closed server can still serve discovery on
-    // an existing HTTP/2 session through TestContainers' host-port proxy.
+    // A second endpoint has a swappable handler on one live HTTP/2 server.
     changedServer = http2.createServer((request, response) => changedHandler(request, response));
     await new Promise<void>((resolve) => changedServer.listen(0, bindHost, resolve));
     const changedAddress = changedServer.address();
     if (changedAddress === null || typeof changedAddress === "string") throw new Error("expected second TCP port");
     changedPort = changedAddress.port;
 
-    await TestContainers.exposeHostPorts(port, changedPort);
-    registerFetch = tunnelingFetch(`${bindHost}:${port}`, `host.testcontainers.internal:${port}`);
-    changedFetch = tunnelingFetch(`${bindHost}:${changedPort}`, `host.testcontainers.internal:${changedPort}`);
-
-    const container = new RestateContainer(RESTATE_IMAGE_VERSION).withExposedPorts(8080, 9070);
-    started = await container.start();
-    adminBaseUrl = `http://${started.getHost()}:${started.getMappedPort(9070)}`;
-    ingressBaseUrl = `http://${started.getHost()}:${started.getMappedPort(8080)}`;
-    await waitForPartitionsReady(adminBaseUrl);
+    env = await startBinaryEnvironment({ services: [probe] });
+    adminBaseUrl = env.adminAPIBaseUrl();
+    ingressBaseUrl = env.baseUrl();
   }, 120_000);
 
   afterAll(async () => {
-    await started?.stop();
+    await env?.stop();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await new Promise<void>((resolve) => changedServer.close(() => resolve()));
     vi.unstubAllEnvs();
   });
 
   it(
-    "registers the real endpoint, safely re-discovers the same URI, and both bound services answer through the container ingress",
+    "registers the real endpoint, safely re-discovers the same URI, and both bound services answer through the ingress",
     async () => {
-      const first = await register({ adminBaseUrl, fetchImpl: registerFetch });
+      const first = await register({ adminBaseUrl });
       expect(first).toEqual({ outcome: "registered-no-force" });
 
       // The pinned server answers 200 for the existing URI without re-discovery;
       // register() checks zero active invocations before forcing discovery.
-      const again = await register({ adminBaseUrl, fetchImpl: registerFetch });
+      const again = await register({ adminBaseUrl });
       expect(again).toEqual({ outcome: "registered-drained-force" });
 
-      // Operator (the Virtual Object) answers through the container's real ingress.
+      // Operator (the Virtual Object) answers through the real ingress.
       const key = randomUUID();
       const hash = sha256(randomUUID());
       await callObject(ingressBaseUrl, "Operator", key, "issue", {
@@ -173,7 +111,7 @@ describe.skipIf(restateTestRuntime() === "binary")("startRestateEndpoint() / reg
 
       // orchestratorTools (the service) answers through the same real ingress. If a future
       // edit drops either service from RESTATE_SERVICES, this call — or the Operator calls
-      // above — fails, since the dropped service is simply absent from the container.
+      // above — fails, since the dropped service is simply absent from the server.
       const runnerMode = await callService<{ content?: Array<{ text: string }>; isError?: boolean }>(
         ingressBaseUrl,
         "orchestratorTools",
@@ -193,7 +131,7 @@ describe.skipIf(restateTestRuntime() === "binary")("startRestateEndpoint() / reg
       // test's production endpoint intact while making the second endpoint the
       // current deployment for both services.
       vi.stubEnv("RESTATE_ENDPOINT_PORT", String(changedPort));
-      expect(await register({ adminBaseUrl, fetchImpl: changedFetch })).toEqual({ outcome: "registered-no-force" });
+      expect(await register({ adminBaseUrl })).toEqual({ outcome: "registered-no-force" });
 
       // A genuinely in-flight, non-completed invocation against that deployment — held open
       // by the refresh test seam (AII-727, src/restate/operator-object.ts's sleepMs), not a
@@ -214,7 +152,7 @@ describe.skipIf(restateTestRuntime() === "binary")("startRestateEndpoint() / reg
       void inFlight.catch(() => undefined);
       // Observe the actual non-completed invocation before swapping endpoints;
       // a fixed sleep can race Restate's admission on a busy CI host.
-      const oldUri = `http://host.testcontainers.internal:${changedPort}`;
+      const oldUri = `http://${bindHost}:${changedPort}`;
       await eventually(
         () => queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri),
         (count) => count !== null && count > 0,
@@ -227,14 +165,14 @@ describe.skipIf(restateTestRuntime() === "binary")("startRestateEndpoint() / reg
       // and force after the active Operator invocation finishes.
       changedHandler = createEndpointHandler({ services: [orchestratorTools] });
 
-      const declined = await register({ adminBaseUrl, fetchImpl: changedFetch });
+      const declined = await register({ adminBaseUrl });
       expect(declined.outcome).toBe("declined-conflict");
 
       // Let the in-flight invocation complete — the old deployment now has zero
       // non-completed invocations pinned to it.
       await inFlight;
 
-      const forced = await register({ adminBaseUrl, fetchImpl: changedFetch });
+      const forced = await register({ adminBaseUrl });
       expect(forced).toEqual({ outcome: "registered-drained-force" });
       const deployments = await (await fetch(`${adminBaseUrl}/deployments`)).json() as {
         deployments: Array<{ uri: string; services: Array<{ name: string }> }>;
@@ -246,9 +184,9 @@ describe.skipIf(restateTestRuntime() === "binary")("startRestateEndpoint() / reg
   );
 });
 
-// Request identity (AII-976) runs on the binary runtime: it spawns a real server given the
-// private key, with the endpoint given the public one. Skipped on the container runtime.
-describe.skipIf(restateTestRuntime() !== "binary")("request identity (AII-976)", () => {
+// Request identity (AII-976): spawns a real server given the private key, with the endpoint
+// given the public one.
+describe("request identity (AII-976)", () => {
   const echo = restate.service({
     name: "identityEcho",
     handlers: { ping: async (_ctx: restate.Context, input: { value: string }) => ({ echoed: input.value }) },

@@ -9,12 +9,10 @@
 // including the fixed 5s coalescing window's exact timing — this file does not re-prove that
 // here (see docs/restate-testing.md's coverage table for the split).
 //
-// This suite was authored without a local Docker daemon (no `docker info`), the same
-// constraint `endpoint.restate.test.ts` (AII-727) documents — see that file's header and
-// docs/restate-testing.md's "Container-to-host reachability" section. CI subsequently ran
-// it against pinned Restate 1.7.10; that is container evidence, not live-pilot evidence.
+// It runs on the `restate-server` binary (AII-1195), the runtime production uses; that is
+// engine evidence, not live-pilot evidence.
 import { randomUUID, createHash } from "node:crypto";
-import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getDb } from "../../dedup.js";
 import { initMappingsTable } from "../../config.js";
@@ -433,7 +431,7 @@ function pumpFor(baseUrl: string, fetchImpl: typeof fetch = fetch): ReviewFixDel
 }
 
 describe("Restate review-fix pilot: production-composition fault matrix", () => {
-  let environments: Map<string, RestateTestEnvironment>;
+  let environments: Map<string, RestateEnvironment>;
   beforeAll(async () => {
     getDb();
     initMappingsTable();
@@ -442,13 +440,13 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
   }, 60_000);
   afterAll(async () => { if (environments) await stopAll(environments); });
 
-  function envFor(label: string): RestateTestEnvironment {
+  function envFor(label: string): RestateEnvironment {
     const env = environments.get(label);
     if (!env) throw new Error(`missing Restate variant ${label}`);
     return env;
   }
 
-  async function triggerFeedback(env: RestateTestEnvironment, scope: ScopedPrIdentity, n = 1): Promise<void> {
+  async function triggerFeedback(env: RestateEnvironment, scope: ScopedPrIdentity, n = 1): Promise<void> {
     const accepted = acceptDelivery({
       authenticatedSource: "test-tracker", deliveryId: feedbackDeliveryId(scope, n),
       kind: "feedback", destination: scope, payload: {},
@@ -457,7 +455,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     await pumpFor(env.baseUrl()).tick();
   }
 
-  async function admitOne(env: RestateTestEnvironment, fixture: GithubFixture, findings: Array<{ findingKey: string; version: number }>): Promise<void> {
+  async function admitOne(env: RestateEnvironment, fixture: GithubFixture, findings: Array<{ findingKey: string; version: number }>): Promise<void> {
     fixture.pending = { taskText: `Fix ${findings.length} finding versions`, findings };
     await triggerFeedback(env, fixture.scope);
     await eventually(() => latestAttemptRow(fixture.scope) !== undefined, Boolean, { timeoutMs: 8_000, label: "latestAttemptRow(fixture.scope) !== undefined" });
@@ -881,7 +879,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect(fixture.commentPosts).toBe(0);
   }, 25_000);
 
-  // A restate-sdk-testcontainers RestateTestEnvironment exposes no virtual-clock or
+  // A RestateEnvironment exposes no virtual-clock or
   // timer-control API (confirmed: no clock/time symbol anywhere in its type
   // declarations) — ctx.date.now()/ctx.sleep inside the workflow are real wall-clock
   // time against the real pinned container, so there is no seam the harness could add
@@ -1108,7 +1106,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
       expect(fixture.commentPosts).toBe(0);
 
       replacement = await replaceEndpoint(env, [pr, attemptWorkflow]);
-      await env.startedRestateContainer.restart();
+      await env.startedRestateServer.restart();
       await eventually(() => fixture.cancelCalls > 1, Boolean, { timeoutMs: 10_000, label: "fixture.cancelCalls > 1" });
       admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
         .get(attemptId) as { released_at: number | null };
@@ -1192,7 +1190,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
       await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 10_000, label: "fixture.runId !== null" });
 
       replacement = await replaceEndpoint(env, [pr, attemptWorkflow]);
-      await env.startedRestateContainer.restart(); // same disk-backed container/journal
+      await env.startedRestateServer.restart(); // same disk-backed server/journal
 
       fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
       const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;

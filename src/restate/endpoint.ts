@@ -148,8 +148,8 @@ export function sqlQuote(value: string): string {
  * this repo already depends on): `POST {adminBaseUrl}/query` with an `Accept: application/json`
  * header runs a DataFusion SQL statement over the server's introspection tables and answers
  * `{ rows: [...] }` as plain JSON — omitting that header answers Arrow IPC instead, which would
- * need `apache-arrow`, an undeclared transitive dependency (pulled in only by the testcontainers
- * devDependency) this production module has no business on.
+ * need `apache-arrow`, an undeclared transitive dependency (once pulled in only by a
+ * since-removed test devDependency) this production module has no business on.
  *
  * `sys_deployment.endpoint` holds the registered URI with a trailing slash this module's own
  * `uri` never carries, so both forms are matched. Restate 1.7.10 does not always set

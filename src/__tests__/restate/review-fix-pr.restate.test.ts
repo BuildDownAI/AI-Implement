@@ -1,7 +1,7 @@
 // AII-800: the production PR object and attempt workflow on pinned Restate.
 // SQLite/worker doubles live outside the endpoint so replay cannot erase them.
 import { randomUUID } from "node:crypto";
-import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity, WorkerTerminalOutcome } from "../../review-fix-contract.js";
 import type { PreparedReviewFixAttempt, ReviewFixFindingVersion } from "../../review-fix-ports.js";
@@ -140,21 +140,21 @@ describe("ReviewFixPR durable coordination", () => {
       pending: pr.pending.length ? { taskText: `Fix ${pr.pending.length} finding versions`, findings: [...pr.pending] } : null };
   } });
 
-  let envs: Map<string, RestateTestEnvironment>;
+  let envs: Map<string, RestateEnvironment>;
   beforeAll(async () => { envs = await startVariants([coordinator, attempt]); }, 60_000);
   afterAll(async () => { if (envs) await stopAll(envs); });
-  function envFor(label: string): RestateTestEnvironment {
+  function envFor(label: string): RestateEnvironment {
     const env = envs.get(label);
     if (!env) throw new Error(`missing ${label}`);
     return env;
   }
-  async function feedback(env: RestateTestEnvironment, pr: PRState, count = 1): Promise<void> {
+  async function feedback(env: RestateEnvironment, pr: PRState, count = 1): Promise<void> {
     for (let i = 0; i < count; i++) {
       pr.pending.push({ findingKey: `finding-${pr.pending.length + pr.prepared.reduce((n, p) => n + p.findings.length, 0) + 1}`, version: 1 });
       await callObject(env.baseUrl(), "ReviewFixPR", reviewFixPRKey(pr.scope), "feedback", {});
     }
   }
-  async function finish(env: RestateTestEnvironment, pr: PRState, index: number): Promise<void> {
+  async function finish(env: RestateEnvironment, pr: PRState, index: number): Promise<void> {
     const prepared = pr.prepared[index];
     const state = attemptFor(prepared.attemptId);
     await eventually(() => !!state.execution, Boolean, { label: "!!state.execution" });

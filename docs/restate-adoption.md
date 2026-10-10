@@ -1,5 +1,7 @@
 # How Restate simplifies the code and improves AI-Implement
 
+> Historical note (2026-10-10, AII-1195): the `@restatedev/restate-sdk-testcontainers` dependency listed below was removed; the tests run on the `restate-server` binary only.
+
 An assessment, not a decision. The decisions are ADR 017 (move the run lifecycle onto a durable-execution engine), ADR 018 (adopt one run kind at a time, gated on evidence), ADR 023 (run the server as a sidecar), ADR 025 (MCP tools are Restate handlers, the Operator object is the refresh authority), and ADR 015 (reads open, writes declared). This page synthesises what those decisions buy, what they cost, and where each cost has a path to becoming an advantage. It is written after the AII-687 tree landed the foundation — the harness, the sidecar, the tools service, and the `Operator` object — and before any run kind has migrated.
 
 ## The gains

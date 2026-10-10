@@ -1,7 +1,7 @@
 // Real Restate 1.7.10 coordination tests for AII-796. The fake business state is
 // outside the SDK endpoint, as the later SQLite adapters will be in production.
 import { randomUUID } from "node:crypto";
-import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ReviewFixResultMetadataV1, WorkerTerminalOutcome } from "../../review-fix-contract.js";
 import type { PreparedReviewFixAttempt } from "../../review-fix-ports.js";
@@ -159,11 +159,11 @@ describe("ReviewFixAttempt durable workflow", () => {
         disposition: "addressed" as const })), policyAllows: true }),
   });
 
-  let environments: Map<string, RestateTestEnvironment>;
+  let environments: Map<string, RestateEnvironment>;
   beforeAll(async () => { environments = await startVariants([workflow]); }, 60_000);
   afterAll(async () => { if (environments) await stopAll(environments); });
 
-  function envFor(label: string): RestateTestEnvironment {
+  function envFor(label: string): RestateEnvironment {
     const env = environments.get(label);
     if (!env) throw new Error(`missing Restate variant ${label}`);
     return env;
@@ -320,7 +320,7 @@ describe("ReviewFixAttempt durable workflow", () => {
       void originalCall.catch(() => undefined); // ingress may disconnect during restart
       await eventually(() => recovering.bound, Boolean, { timeoutMs: 10_000, label: "recovering.bound" });
       replacement = await replaceEndpoint(env, [workflow]);
-      await env.startedRestateContainer.restart(); // same disk-backed container/journal
+      await env.startedRestateServer.restart(); // same disk-backed server/journal
       recovering.terminal = { status: "succeeded", outputCommit: SHA };
       await callWorkflow(env.baseUrl(), "ReviewFixAttempt", recovering.prepared.attemptId,
         "result", resultOf(recovering));

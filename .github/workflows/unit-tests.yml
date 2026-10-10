@@ -48,55 +48,12 @@ jobs:
       - run: npx tsc --noEmit --project tsconfig.review-fix-finalize-tests.json
       - run: npx tsc --noEmit --project tsconfig.aii-806-tests.json
 
-  # Restate harness (AII-612): src/__tests__/restate/**/*.restate.test.ts, isolated from
-  # `unit-tests` above because it needs Docker for testcontainers. No `on:` block
-  # here on purpose — a job inherits the workflow's triggers only by staying in
-  # this file, which is what gets it onto ai-implement/feature/** PRs (AII-467
-  # pattern). No `needs:` either: it runs in parallel with `unit-tests` so this
-  # job's own time, not the sum, is what the ~2-minutes budget has to cover.
-  restate-tests:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    env:
-      # Pinned (not `latest`) so the image cache key below is stable and so a
-      # new Restate release can't silently change the harness's behavior.
-      # Keep in sync with the `RESTATE_IMAGE_VERSION` constant in
-      # src/__tests__/restate/harness.ts.
-      RESTATE_IMAGE_TAG: "1.7.10"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-      - run: npm ci
-      # testcontainers pulls this image on every RestateTestEnvironment.start();
-      # caching the `docker save` tar keeps that pull off the network on a cache
-      # hit, which is what keeps this job's added time near ~2 minutes.
-      - name: Cache Restate container image
-        id: restate-image-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/restate-image-cache
-          key: restate-image-${{ env.RESTATE_IMAGE_TAG }}
-      - name: Load cached Restate image
-        if: steps.restate-image-cache.outputs.cache-hit == 'true'
-        run: docker load -i ~/restate-image-cache/restate.tar
-      - name: Pull and cache Restate image
-        if: steps.restate-image-cache.outputs.cache-hit != 'true'
-        run: |
-          docker pull "docker.io/restatedev/restate:${RESTATE_IMAGE_TAG}"
-          mkdir -p ~/restate-image-cache
-          docker save "docker.io/restatedev/restate:${RESTATE_IMAGE_TAG}" -o ~/restate-image-cache/restate.tar
-      - name: npm run test:restate (ambient CI vars scrubbed)
-        run: |
-          unset GITHUB_RUN_ID GITHUB_ENV GITHUB_REPOSITORY GITHUB_REF_NAME                 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS GITHUB_ACTION
-          npm run test:restate
-      - run: npx tsc --noEmit --project tsconfig.restate-tests.json
-
-  # Binary runtime (AII-915): the same suite on the runtime a dispatched runner
-  # uses — restate-server from node_modules, no Docker. Sibling of
-  # `restate-tests` so a PR proves both runtimes. The suite runs three times
+  # Restate harness (AII-612): src/__tests__/restate/**/*.restate.test.ts on the
+  # `restate-server` binary from node_modules — the runtime the orchestrator sidecar
+  # and a dispatched runner use (AII-1195); no Docker. No `on:` block here on
+  # purpose — a job inherits the workflow's triggers only by staying in this file,
+  # which is what gets it onto ai-implement/feature/** PRs (AII-467 pattern). No
+  # `needs:` either: it runs in parallel with `unit-tests`. The suite runs three times
   # (AII-993 flake detector: a scenario that fails one run in three must fail
   # the PR that adds it) as a three-job matrix rather than one serial step
   # (AII-1157 wall time). fail-fast is off so the evidence of which passes
@@ -115,9 +72,9 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - name: npm run test:restate on the binary runtime, pass ${{ matrix.pass }} of 3 (ambient CI vars scrubbed)
-        env:
-          RESTATE_TEST_RUNTIME: binary
+      - name: npm run test:restate pass ${{ matrix.pass }} of 3 (ambient CI vars scrubbed)
         run: |
           unset GITHUB_RUN_ID GITHUB_ENV GITHUB_REPOSITORY GITHUB_REF_NAME                 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS GITHUB_ACTION
           npm run test:restate
+      - run: npx tsc --noEmit --project tsconfig.restate-tests.json
+        if: matrix.pass == 1
