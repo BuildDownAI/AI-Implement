@@ -194,6 +194,24 @@ export function reviewFixResultForwardKey(result: ReviewFixResultMetadataV1): st
   return `${result.attemptId}.result.${createHash("sha256").update(JSON.stringify(result)).digest("hex")}`;
 }
 
+/**
+ * Maps the ingress client's transport outcome to the callback's `ResultIntakeOutcome`; `null` means Restate
+ * was unavailable, which the route answers 503 with nothing written. Shared by `onReviewFixResult` and the
+ * restate scenario so neither re-implements the mapping.
+ */
+export function reviewFixResultIntakeFromForward(attemptId: AttemptId, out: ReviewFixResultForwardOutcome): ResultIntakeOutcome | null {
+  switch (out.status) {
+    case "accepted":
+      return out.outcome;
+    case "conflict":
+      return { status: "conflict", attemptId, reason: "result conflicts with the recorded result" };
+    case "not-found":
+      return { status: "stale", attemptId, reason: "unknown attempt" };
+    case "unavailable":
+      return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Stable idempotency key
 // ---------------------------------------------------------------------------

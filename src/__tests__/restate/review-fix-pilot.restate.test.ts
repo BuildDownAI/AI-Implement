@@ -56,7 +56,7 @@ import type { ReviewFixActivityEvent } from "../../review-fix-contract.js";
 import { acquire as acquireDispatchAdmission, release as releaseDispatchAdmission } from "../../dispatch-admission.js";
 import { handleGitHubWebhook } from "../../webhook.js";
 import { appendLog, initLogTable, updateJobStatus } from "../../log.js";
-import { createRestateReviewFixFacade, createReviewFixIngressClient, ReviewFixDeliveryPump, reviewFixResultForwardKey } from "../../restate/review-fix-client.js";
+import { createRestateReviewFixFacade, createReviewFixIngressClient, ReviewFixDeliveryPump, reviewFixResultForwardKey, reviewFixResultIntakeFromForward } from "../../restate/review-fix-client.js";
 import { createReviewFixAttempt, type ReviewFixAttemptCompletion } from "../../restate/review-fix-attempt.js";
 import { createReviewFixPR, reviewFixPRKey } from "../../restate/review-fix-pr.js";
 import {
@@ -858,15 +858,14 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const secret = "result-ingress-secret";
     const token = mintPreparedReviewFixToken({ attemptId, audience: "result", secret }).token;
     let legacyProviderLookups = 0;
-    // Mirrors `onReviewFixResult` in src/index.ts: forward only, no SQLite write.
+    // Same forward as `onReviewFixResult` in src/index.ts: key, client call and shared outcome mapping.
     const forwardTo = (baseUrl: string) => {
       const ingress = createReviewFixIngressClient(baseUrl);
       return async (validated: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> => {
         const out = await ingress.result(validated.attemptId, validated, { idempotencyKey: reviewFixResultForwardKey(validated) });
-        if (out.status === "accepted") return out.outcome;
-        if (out.status === "conflict") return { status: "conflict", attemptId: validated.attemptId, reason: "conflict" };
-        if (out.status === "not-found") return { status: "stale", attemptId: validated.attemptId, reason: "unknown attempt" };
-        throw new ReviewFixIntakeUnavailableError();
+        const outcome = reviewFixResultIntakeFromForward(validated.attemptId, out);
+        if (!outcome) throw new ReviewFixIntakeUnavailableError();
+        return outcome;
       };
     };
     const intake = (candidate: ReviewFixResultMetadataV1, baseUrl = env.baseUrl()) => handleRunnerResult({

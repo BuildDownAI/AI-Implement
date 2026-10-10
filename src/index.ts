@@ -80,7 +80,7 @@ import { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
 import { createReviewFixAdminFacade } from "./review-fix-admin-facade.js";
 import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "./review-fix-worker.js";
 import { listActiveRestateReviewFixPrs, queueReviewFixCancellationForClosedPr } from "./review-fix-close.js";
-import { acceptDelivery as acceptReviewFixDelivery, createReviewFixIngressClient, ReviewFixDeliveryPump, reviewFixResultForwardKey } from "./restate/review-fix-client.js";
+import { acceptDelivery as acceptReviewFixDelivery, createReviewFixIngressClient, ReviewFixDeliveryPump, reviewFixResultForwardKey, reviewFixResultIntakeFromForward } from "./restate/review-fix-client.js";
 import { appendReviewFixActivityBatch, isReviewFixEvidenceTombstoned } from "./review-fix-evidence.js";
 import type { ReviewFixResultMetadataV1, ResultIntakeOutcome } from "./review-fix-contract.js";
 import { handleMcpRequest } from "./mcp.js";
@@ -4137,16 +4137,9 @@ async function onReviewFixResult(result: ReviewFixResultMetadataV1): Promise<Res
   // Restate unreachable throws, which the route answers 503 with nothing written;
   // the runner retries the same body under the same key.
   const out = await reviewFixIngressClient.result(result.attemptId, result, { idempotencyKey: reviewFixResultForwardKey(result) });
-  switch (out.status) {
-    case "accepted":
-      return out.outcome;
-    case "conflict":
-      return { status: "conflict", attemptId: result.attemptId, reason: "result conflicts with the recorded result" };
-    case "not-found":
-      return { status: "stale", attemptId: result.attemptId, reason: "unknown attempt" };
-    case "unavailable":
-      throw new ReviewFixIntakeUnavailableError();
-  }
+  const outcome = reviewFixResultIntakeFromForward(result.attemptId, out);
+  if (!outcome) throw new ReviewFixIntakeUnavailableError();
+  return outcome;
 }
 
 function onReviewFixActivity(batch: RunnerActivityBody): ActivityIntakeOutcome {
