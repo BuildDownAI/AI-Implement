@@ -272,44 +272,6 @@ export function claimDeliveries(options: ClaimDeliveriesOptions = {}): ReviewFix
   })();
 }
 
-export type ClaimDeliveryOutcome =
-  | { readonly status: "claimed"; readonly delivery: ReviewFixDelivery }
-  | { readonly status: "already_leased"; readonly delivery: ReviewFixDelivery }
-  | { readonly status: "delivered" }
-  | { readonly status: "not_found" };
-
-/**
- * Claims exactly one delivery by identity, atomically, without touching any other row —
- * unlike `claimDeliveries`, which leases a batch across every source and would sweep in
- * unrelated deliveries if used to reconcile a single one. Used by a caller that must
- * deliberately retry one specific terminal effect (e.g. `review-fix-finalize.ts`'s
- * `retryApprovalEffect`) after finding it left `pending` by a crashed prior attempt: the
- * claim proves no other retry currently holds it, so the effect is safe to (re-)apply.
- */
-export function claimDelivery(authenticatedSource: string, deliveryId: string, options: { leaseMs?: number; now?: number } = {}): ClaimDeliveryOutcome {
-  const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
-  const now = options.now ?? Date.now();
-  const db = getDb();
-
-  return db.transaction((): ClaimDeliveryOutcome => {
-    const existing = db.prepare(SELECT_ONE).get(authenticatedSource, deliveryId) as ReviewFixInboxRow | undefined;
-    if (!existing) return { status: "not_found" };
-    if (existing.delivery_state === "delivered") return { status: "delivered" };
-    if (existing.delivery_state === "claimed" && existing.retry_at != null && existing.retry_at > now) {
-      return { status: "already_leased", delivery: mapRow(existing) };
-    }
-
-    const leasedUntil = now + leaseMs;
-    db.prepare(`
-      UPDATE review_fix_inbox SET delivery_state = 'claimed', retry_at = ?
-      WHERE authenticated_source = ? AND event_id = ?
-    `).run(leasedUntil, authenticatedSource, deliveryId);
-
-    const updated = db.prepare(SELECT_ONE).get(authenticatedSource, deliveryId) as ReviewFixInboxRow;
-    return { status: "claimed", delivery: mapRow(updated) };
-  })();
-}
-
 export type RetryDeliveryOutcome =
   | { readonly status: "scheduled"; readonly delivery: ReviewFixDelivery }
   | { readonly status: "already_delivered" }

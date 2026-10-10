@@ -125,7 +125,6 @@ function fakeGithub(overrides: Partial<ReviewFixGitHubAdapter> = {}): ReviewFixG
     async getPrHeadSha() { return OUTPUT_COMMIT; },
     async evaluateMergePolicy() { return true; },
     async applyApprovalEffect() { calls.applyApprovalEffect++; },
-    async hasAppliedApprovalEffect() { return false; },
     ...overrides,
   };
 }

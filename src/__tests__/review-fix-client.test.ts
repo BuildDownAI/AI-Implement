@@ -48,10 +48,21 @@ function makeFakeFacade(overrides: Partial<ClientModule.ReviewFixDeliveryFacade>
   return {
     deliverFeedback: vi.fn(async () => ({ status: "accepted" }) as const),
     deliverResult: vi.fn(async () => ({ status: "accepted" }) as const),
-    deliverCancel: vi.fn(async () => ({ status: "accepted" }) as const),
     ...overrides,
   };
 }
+
+const resultFixture = {
+  version: 1,
+  attemptId: "attempt-1",
+  installationId: 7,
+  repository: "acme/app",
+  prNumber: 42,
+  deadlineAt: Date.now() + 1000,
+  githubRunId: 1,
+  githubRunAttempt: 1,
+  outputCommit: "a".repeat(40),
+} as const;
 
 describe("createRestateReviewFixFacade", () => {
   it("posts to the ReviewFixPR object's feedback handler with an idempotency-key header", async () => {
@@ -77,7 +88,7 @@ describe("createRestateReviewFixFacade", () => {
     });
     const facade = client.createRestateReviewFixFacade({ fetchImpl: fetchImpl as unknown as typeof fetch });
 
-    const outcome = await facade.deliverCancel("attempt-1", "cancellation:github:evt-1");
+    const outcome = await facade.deliverResult(resultFixture, "result:github:evt-1");
     expect(outcome).toEqual({ status: "unavailable" });
   });
 
@@ -116,7 +127,7 @@ describe("createRestateReviewFixFacade", () => {
       timeoutMs: 20,
     });
 
-    const outcome = await facade.deliverCancel("attempt-1", "cancellation:github:evt-1");
+    const outcome = await facade.deliverResult(resultFixture, "result:github:evt-1");
 
     expect(outcome).toEqual({ status: "unavailable" });
     expect((fetchImpl.mock.calls[0]![1] as RequestInit).signal).toBeInstanceOf(AbortSignal);
@@ -467,7 +478,7 @@ describe("ReviewFixDeliveryPump — routing", () => {
     expect(Object.keys(forwarded)).not.toContain("apiToken");
   });
 
-  it("leaves a terminal-effect row unclaimed for exact-identity finalizer reconciliation", async () => {
+  it("leaves a row of an unrouted kind unclaimed (routableOnly filters it out)", async () => {
     const destination = makeDestination();
     inbox.acceptDelivery({
       authenticatedSource: "runner",
@@ -485,7 +496,6 @@ describe("ReviewFixDeliveryPump — routing", () => {
     expect(delivered).toBe(0);
     expect(facade.deliverFeedback).not.toHaveBeenCalled();
     expect(facade.deliverResult).not.toHaveBeenCalled();
-    expect(facade.deliverCancel).not.toHaveBeenCalled();
     const row = inbox.getDelivery("runner", "evt-terminal");
     expect(row?.deliveryState).toBe("pending");
     expect(pump.status().lastTickUnavailable).toBe(0);

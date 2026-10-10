@@ -85,10 +85,6 @@ export interface ReviewFixGitHubAdapter {
     result: ReviewFixResultMetadataV1,
     dispositions: readonly ReviewFixFindingDisposition[],
   ): Promise<void>;
-  /** Observes, by this attempt's stable identity, whether the approval effect has already
-   *  landed on GitHub (e.g. an existing sticky comment/approval carrying this attempt's marker).
-   *  No longer consulted by finalization: the journaled step and the upsert make a repeat write safe. */
-  hasAppliedApprovalEffect(scope: ScopedPrIdentity, attemptId: AttemptId): Promise<boolean>;
 }
 
 /**

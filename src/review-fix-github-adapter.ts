@@ -99,9 +99,6 @@ export function createReviewFixGithubAdapter(deps: ReviewFixGithubAdapterDeps): 
         return ![...latest.values()].includes("CHANGES_REQUESTED") && !nextPage(reviews);
       } catch { return false; }
     },
-    async hasAppliedApprovalEffect(scope, attemptId) {
-      return (await comments(scope)).some((comment) => comment.body.startsWith(marker(attemptId)));
-    },
     async applyApprovalEffect(scope, attemptId, result, dispositions) {
       if ((await comments(scope)).some((comment) => comment.body.startsWith(marker(attemptId)))) return;
       const body = `${marker(attemptId)}\nReview-fix attempt completed for commit \`${result.outputCommit}\`.\n\n` +

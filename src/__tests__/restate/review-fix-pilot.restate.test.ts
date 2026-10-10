@@ -346,7 +346,6 @@ const rawGithub = createReviewFixGithubAdapter({ credentials: fakeCredentials, f
 const github: ReviewFixGitHubAdapter = {
   getPrHeadSha: (scope) => rawGithub.getPrHeadSha(scope),
   evaluateMergePolicy: (scope, dispositions) => rawGithub.evaluateMergePolicy(scope, dispositions),
-  hasAppliedApprovalEffect: (scope, attemptId) => rawGithub.hasAppliedApprovalEffect(scope, attemptId),
   applyApprovalEffect: (scope, attemptId, result, dispositions) => {
     const fixture = findFixture(scope.repository);
     const impl = fixture.applyApprovalEffectOverride ?? rawGithub.applyApprovalEffect;

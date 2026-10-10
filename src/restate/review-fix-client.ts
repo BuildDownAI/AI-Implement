@@ -51,7 +51,6 @@ export interface ReviewFixDeliveryFacade {
    *  durable "something is pending" nudge, so no finding content ever crosses this seam. */
   deliverFeedback(destination: ScopedPrIdentity, idempotencyKey: string): Promise<ReviewFixFacadeOutcome>;
   deliverResult(result: ReviewFixResultMetadataV1, idempotencyKey: string): Promise<ReviewFixFacadeOutcome>;
-  deliverCancel(attemptId: AttemptId, idempotencyKey: string): Promise<ReviewFixFacadeOutcome>;
 }
 
 /** For testing: override the ingress base URL, the fetch implementation, and the
@@ -116,8 +115,6 @@ export function createRestateReviewFixFacade(deps: RestateReviewFixFacadeDeps = 
     },
     deliverResult: (result, idempotencyKey) =>
       invoke(resolved, "ReviewFixAttempt", result.attemptId, "result", result, idempotencyKey),
-    deliverCancel: (attemptId, idempotencyKey) =>
-      invoke(resolved, "ReviewFixAttempt", attemptId, "cancel", { attemptId }, idempotencyKey),
   };
 }
 
