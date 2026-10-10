@@ -27,7 +27,7 @@ import { RUN_TITLE_PREFIX, defaultFetchSignal } from "../github.js";
 import { resolveWorkflowCapabilities } from "../workflow-probe.js";
 import { buildKgRefreshRunConfig } from "../run-config.js";
 import { readBackendRun, stopBackendRun } from "../backend-run.js";
-import { getRunnerMode, getKgFlyMachineOverride, setKgFlyMachineOverride, type KgFlyMachineOverride } from "../runner-mode.js";
+import { getRunnerMode, getKgExecutionMode, resolveKgBackend, type KgBackendResolution, getKgFlyMachineOverride, setKgFlyMachineOverride, type KgFlyMachineOverride } from "../runner-mode.js";
 import { mintRunToken } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
 import { appendLogIfAbsent, findLogIdByDispatchId, setJobMachineId, setJobMachineNonce, updateJobPrUrl, updateJobRunId } from "../log.js";
@@ -73,7 +73,6 @@ export function createKgFindRunByTitle(opts: {
     return { runId: match.id, ...(match.html_url ? { logsUrl: match.html_url } : {}) };
   };
 }
-const GHA_EXECUTION_MODE = "github-actions";
 
 /** The Fly calls the kept-machine launch makes; a fake in tests. */
 export interface KeptMachineFly {
@@ -293,13 +292,12 @@ export function findKgMapping(kgSourceRepo: string) {
 }
 
 /** The backend a kg-refresh run uses, resolved one time by the workflow's `reserve` step (the journaled result is the record).
- *  `local` is local Docker and `gha` is GitHub Actions. Every other mode uses Fly when it is configured, else GitHub Actions
- *  (retrying cannot configure Fly). `shadow` stays on one backend: two concurrent ingests race to push the same snapshot commit. */
-export function resolveKgExecutionMode(fly: Pick<AppConfig, "flySessionsToken" | "flySessionsApp">): string {
-  const mode = getRunnerMode().mode;
-  if (mode === "local") return "local-docker";
-  if (mode === "gha") return GHA_EXECUTION_MODE;
-  return fly.flySessionsToken && fly.flySessionsApp ? "fly-machines" : GHA_EXECUTION_MODE;
+ *  Rule: runner mode (`local`, `gha`, `fly`) wins, else the KG page's Backend setting (default: Fly when configured, else
+ *  GitHub Actions). `shadow` stays on the setting's one backend: two concurrent ingests race to push the same snapshot commit.
+ *  Fly without configuration falls back to GitHub Actions (retrying cannot configure Fly). */
+export function resolveKgExecutionMode(fly: Pick<AppConfig, "flySessionsToken" | "flySessionsApp">): KgBackendResolution {
+  const flyConfigured = !!(fly.flySessionsToken && fly.flySessionsApp);
+  return resolveKgBackend(getRunnerMode().mode, getKgExecutionMode(flyConfigured), flyConfigured);
 }
 
 /** Builds the dispatch the workflow calls inside `ctx.run`: a lookup in the sender table keyed by the journaled
@@ -390,7 +388,7 @@ export function createProductionKgRefreshServices(
     resolveDispatchRecord: (dispatchId) => ({
       dispatchId, issueId: "kg-refresh", phase: "kg-refresh",
       repo: parseKgSourceRepo(input.kgSourceRepo).fullName,
-      executionMode: (input.resolveExecutionMode ?? (() => resolveKgExecutionMode(config)))(),
+      executionMode: (input.resolveExecutionMode ?? (() => resolveKgExecutionMode(config).mode))(),
     }),
     recordDispatchRow: recordKgDispatchRow,
     deriveMachineNonce: (dispatchId, attempt) => deriveMachineNonce(config.runnerTokenSecret ?? "", dispatchId, attempt),

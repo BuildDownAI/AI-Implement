@@ -16,7 +16,7 @@ import * as restate from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { AccessRole } from "../access-entries.js";
-import { getRunnerMode, getKgMaterializeDirect } from "../runner-mode.js";
+import { getRunnerMode, getKgMaterializeDirect, getKgExecutionMode, resolveKgBackend } from "../runner-mode.js";
 import { getMappings, type RepoMapping } from "../config.js";
 import { getInFlightJobs, getRunRecordMergeVerdict, getJobById, getJobByMachineId, type Job } from "../log.js";
 import {
@@ -731,6 +731,10 @@ export const getKgStatusTool = tool(
       }
     }
     const restateKey = inFlight?.triggerId ?? lastRefresh?.dispatchId;
+    const flyCfg = mcpAdminConfig();
+    const flyConfigured = !!(flyCfg.flySessionsToken && flyCfg.flySessionsApp);
+    const kgSetting = getKgExecutionMode(flyConfigured);
+    const kgBackend = resolveKgBackend(getRunnerMode().mode, kgSetting, flyConfigured);
     const result: KgRefreshStatus = {
       running: inFlight !== null && inFlight !== undefined,
       deployHeld: toolDeps.isDeployHeld(),
@@ -742,6 +746,7 @@ export const getKgStatusTool = tool(
       stage,
       ...(runnerStep ? { runnerStep } : {}),
       materialize: getKgMaterializeDirect().enabled ? "direct" : "rdflib",
+      executionMode: { effective: kgBackend.mode, source: kgBackend.source, setting: kgSetting.mode },
       ...(flyProfile ? { flyMachine: { ...flyProfile.config, source: flyProfile.source } } : {}),
       restate: restateKey ? { service: "KgRefresh", key: restateKey } : null,
     };

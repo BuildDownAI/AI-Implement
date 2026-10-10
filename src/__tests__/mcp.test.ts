@@ -170,6 +170,8 @@ vi.mock("../runner-mode.js", () => ({
   VALID_RUNNER_MODES: ["default", "gha", "fly", "local", "shadow"],
   getRunnerMode: vi.fn(),
   getKgMaterializeDirect: vi.fn(() => ({ enabled: true, source: "db" as const })),
+  getKgExecutionMode: vi.fn(() => ({ mode: "github-actions" as const, source: "db" as const })),
+  resolveKgBackend: vi.fn(() => ({ mode: "github-actions" as const, source: "kg-setting" as const })),
   getKgFlyMachineOverride: vi.fn(() => ({})),
   setKgFlyMachineOverride: vi.fn(),
 }));
@@ -1483,6 +1485,7 @@ describe("handleMcpRequest", () => {
         lastDryRun: null,
         stage: "serving",
         materialize: "direct",
+        executionMode: { effective: "github-actions", source: "kg-setting", setting: "github-actions" },
         flyMachine: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000, source: "default" },
         restate: null,
       };

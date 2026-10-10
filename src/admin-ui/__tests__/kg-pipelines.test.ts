@@ -330,3 +330,70 @@ describe("kg fly machine profile control (AII-1116)", () => {
     expect(el("kg-fly-memory-mb").value).toBe("4096");
   });
 });
+
+describe("kg backend control (AII-1218)", () => {
+  function mount(executionMode: unknown) {
+    const dom = new JSDOM(`<!DOCTYPE html><body>${kgPipelinesHtml}</body>`, { runScripts: "dangerously", url: "http://localhost/admin#kg-pipelines" });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const win = dom.window as any;
+    const esc = (v: unknown) => String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    win.esc = esc;
+    win.escAttr = esc;
+    win.registerPage = () => {};
+    win.api = async (url: string) => {
+      if (url === "/api/tools/get_kg_status") {
+        const payload = { executionMode, flyMachine: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000, source: "default" } };
+        return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: JSON.stringify(payload) }] }) };
+      }
+      if (url === "/api/kg/execution-mode") return { ok: true, status: 200, json: async () => ({ mode: "fly-machines", source: "db" }) };
+      return { ok: false, status: 404, json: async () => ({}) };
+    };
+    const script = dom.window.document.createElement("script");
+    script.textContent = kgPipelinesScript;
+    dom.window.document.head.appendChild(script);
+    const doc = dom.window.document;
+    return { win, text: (id: string) => doc.getElementById(id)!.textContent, hidden: (id: string) => (doc.getElementById(id) as HTMLElement).hidden, doc };
+  }
+
+  it("declares the Backend buttons wired to setKgExecutionMode, and fetches the endpoint", () => {
+    expect(kgPipelinesHtml).toContain("onclick=\"window.setKgExecutionMode('github-actions')\"");
+    expect(kgPipelinesHtml).toContain("onclick=\"window.setKgExecutionMode('fly-machines')\"");
+    for (const id of ["btn-kg-backend-gha", "btn-kg-backend-fly", "kg-backend-source", "kg-backend-effective"]) {
+      expect(kgPipelinesHtml).toContain(`id="${id}"`);
+    }
+    expect(kgPipelinesScript).toContain("/api/kg/execution-mode");
+  });
+
+  it("paints the buttons and source from GET /api/kg/execution-mode", async () => {
+    const { win, doc, text } = mount({ effective: "fly-machines", source: "kg-setting", setting: "fly-machines" });
+    await win.loadKgExecutionMode();
+    expect(doc.getElementById("btn-kg-backend-fly")!.classList.contains("btn-primary")).toBe(true);
+    expect(doc.getElementById("btn-kg-backend-gha")!.classList.contains("btn-primary")).toBe(false);
+    expect(text("kg-backend-source")).toBe("(db)");
+  });
+
+  it("shows the Fly rows when the effective backend is Fly", async () => {
+    const { win, text, hidden } = mount({ effective: "fly-machines", source: "kg-setting", setting: "fly-machines" });
+    await win.loadKgFlyMachine();
+    expect(hidden("kg-fly-machine-controls")).toBe(false);
+    expect(hidden("kg-fly-machine-effective")).toBe(false);
+    expect(text("kg-backend-effective")).toBe("next run: Fly machines (KG setting)");
+  });
+
+  it("hides the Fly rows when the effective backend is GitHub Actions", async () => {
+    const { win, hidden } = mount({ effective: "github-actions", source: "kg-setting", setting: "github-actions" });
+    await win.loadKgFlyMachine();
+    expect(hidden("kg-fly-machine-controls")).toBe(true);
+    expect(hidden("kg-fly-machine-effective")).toBe(true);
+  });
+
+  it.each([
+    [{ effective: "fly-machines", source: "runner-mode", setting: "fly-machines" }, "next run: Fly machines (runner mode fly)"],
+    [{ effective: "github-actions", source: "runner-mode", setting: "fly-machines" }, "next run: GitHub Actions (runner mode gha overrides the KG setting)"],
+    [{ effective: "github-actions", source: "fly-unconfigured", setting: "fly-machines" }, "next run: GitHub Actions (Fly not configured)"],
+  ])("names the source on the effective line: %j", async (em, line) => {
+    const { win, text } = mount(em);
+    await win.loadKgFlyMachine();
+    expect(text("kg-backend-effective")).toBe(line);
+  });
+});
