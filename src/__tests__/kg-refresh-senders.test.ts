@@ -37,6 +37,7 @@ function makeFly() {
   const created: CreateMachineOpts[] = [];
   const fly: KeptMachineFly = {
     getMachine: vi.fn(async (id: string) => ({ id, state: "stopped" }) as unknown as Machine),
+    listMachines: vi.fn(async () => [] as Machine[]),
     createMachine: vi.fn(async (c: CreateMachineOpts) => { created.push(c); return { id: "m-new" } as unknown as Machine; }),
     updateMachine: vi.fn(async () => ({})),
     startMachine: vi.fn(async () => {}),
@@ -122,6 +123,21 @@ describe("fly-machines sender", () => {
     const result = await createKgRefreshSenders(deps)["fly-machines"](makeInput({ machineId: "m-kept" }));
     expect(syncRowToMachineNonce).toHaveBeenCalledWith("d-1", NONCE, "attempt-1-nonce");
     expect(JSON.stringify(result)).not.toContain("attempt-1-nonce");
+  });
+
+  it("adopts the machine tagged with the dispatch id, re-arms its nonce and logs it", async () => {
+    const { deps, fly, created } = makeDeps();
+    (fly.listMachines as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      { id: "m-orphan", state: "started", config: { metadata: { dispatch_id: "d-1", purpose: "durable-runner" }, env: { MACHINE_NONCE: "orphan-nonce" } } },
+    ]);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const result = await createKgRefreshSenders(deps)["fly-machines"](makeInput());
+    expect(created).toHaveLength(0);
+    expect(result).toMatchObject({ machineId: "m-orphan", created: true });
+    expect(syncRowToMachineNonce).toHaveBeenCalledWith("d-1", NONCE, "orphan-nonce");
+    expect(log.mock.calls.flat().join("\n")).toContain("(adopted machine m-orphan)");
+    expect(JSON.stringify(result)).not.toContain("orphan-nonce");
+    log.mockRestore();
   });
 
   it("returns no nonce and no token in the journaled result", async () => {

@@ -64,7 +64,7 @@ sequenceDiagram
 
 | `claim.machineId` | `getMachine` answer | Action |
 |---|---|---|
-| null | not called | `createMachine`; `attach` after the step |
+| null | `listMachines` | adopt the live `durable-runner` machine tagged with this `dispatch_id` (`attach` records it); else `createMachine`; `attach` after the step |
 | set | `stopped` (or any state but the ones below) | `updateMachine` then `startMachine` |
 | set | `started`, same `dispatch_id` | already dispatched (a retry); return the machine, no `update` (it would reboot a started machine) |
 | set | `started`, other `dispatch_id` | throw (the hold is wrong); the step retries, then the run ends `dispatch_rejected` |
@@ -75,9 +75,9 @@ The `attach` for a replacement carries `replaces` (the destroyed machine's id), 
 
 `updateMachine` makes Fly replace the instance, so the dispatch does not `start` straight after it. It waits (Fly's `/wait?instance_id=<the update's instance_id>&state=stopped`, bounded at 60 s) for the replaced instance to reach `stopped`, then starts. Before the `update`, a machine still `replacing`, `starting` or `stopping` is polled until it is `stopped` or `started`. A 409 `concurrent update in progress` / `machine is replacing` on `update`, or a 412 `machine getting replaced` on `start`, waits the same way and repeats that call once inside the attempt; a window that outlasts the bound throws and the step retries. Fly event evidence, 2026-10-09 21:05Z: `update`/`replacing` 21:05:24.07Z, replaced instance `stopped` 21:05:25.21Z, `start` refused 412, the retry's `update` 21:05:25.38Z, 409. An `update` also resets the machine's event history, so the events do not name earlier updates.
 
-The step keeps `maxRetryAttempts: 3`, with a 3 s initial delay that doubles (`DISPATCH_RETRY_INITIAL_INTERVAL`), so retries can outlast a replace window. The reconcile read makes a retry after a lost ack safe. A lost ack after a `create` that had no kept machine to reconcile against creates a second machine; the first is left with no `durable_until` until the object records one (see Gaps).
+The step keeps `maxRetryAttempts: 3`, with a 3 s initial delay that doubles (`DISPATCH_RETRY_INITIAL_INTERVAL`), so retries can outlast a replace window. The reconcile read makes a retry after a lost ack safe. With no kept machine the create path reconciles by dispatch id: it lists the sessions app's machines and adopts a live `durable-runner` machine whose `dispatch_id` metadata equals the dispatch id (a lookup error throws, so the step retries without creating), so a lost ack of the first `create` does not make a second machine.
 
-The log line is `[kg-refresh] dispatched via Fly (reused machine <id>)` or `(created machine <id>)`, followed by `(waited <n> s for the replace)` when the launch waited at least a second; `get_session_machine` shows the metadata.
+The log line is `[kg-refresh] dispatched via Fly (reused machine <id>)`, `(created machine <id>)` or `(adopted machine <id>)` (an earlier try of the step created it), followed by `(waited <n> s for the replace)` when the launch waited at least a second; `get_session_machine` shows the metadata.
 
 ### Step names carry the attempt
 
@@ -102,5 +102,4 @@ Revert the change. A kept machine left behind is destroyed by the reaper once it
 
 ## Gaps
 
-- A step retry after a lost ack of the first `create` (no kept machine yet) creates a second machine, because there is no recorded id to reconcile against. The orphan is a `durable-runner` with no `durable_until`, so the reaper does not remove it; destroy it by hand.
 - The resume path (attempt above 1) is AII-1032's; only attempt 1 is sent today.

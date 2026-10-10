@@ -31,7 +31,7 @@ import { getRunnerMode, getKgExecutionMode, resolveKgBackend, type KgBackendReso
 import { mintRunToken } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
 import { appendLogIfAbsent, findLogIdByDispatchId, setJobMachineId, setJobMachineNonce, updateJobPrUrl, updateJobRunId } from "../log.js";
-import { clearMachineEnv, createMachine, destroyMachine, getMachine, startMachine, updateMachine, waitForMachine, waitForMachineSettled, type CreateMachineOpts, type Machine, type MachineConfig } from "../fly-machines.js";
+import { clearMachineEnv, createMachine, destroyMachine, getMachine, listMachines, startMachine, updateMachine, waitForMachine, waitForMachineSettled, type CreateMachineOpts, type Machine, type MachineConfig } from "../fly-machines.js";
 import type { RestateService } from "./endpoint.js";
 import {
   createKgRefreshWorkflow,
@@ -44,6 +44,7 @@ import {
   type KgRefreshWorkflowDependencies,
 } from "./kg-refresh-workflow.js";
 import { createKgRefreshSenders, type KgRefreshSender, type KgRefreshSenderDeps } from "./kg-refresh-senders.js";
+import { DURABLE_RUNNER_PURPOSE_KEY, DURABLE_RUNNER_PURPOSE_VALUE } from "../durable-runner.js";
 import { DURABLE_RUNNER_DISPATCH_ID_KEY, FLY_MACHINE_PROFILE_DEFAULTS, createFlyMachineProfile, type FlyMachineProfileConfig, type FlyMachineProfileDefinition, type FlyMachineProfileDeps } from "./fly-machine-profile.js";
 import { createKgRepo, type KgRepoEnqueueInput, type KgRepoEnqueueResult, type KgRepoPrInput, type KgRepoTriggerResult, type StoredDryRunOutcome } from "./kg-repo.js";
 import type { Step } from "../pipeline/types.js";
@@ -77,6 +78,8 @@ export function createKgFindRunByTitle(opts: {
 /** The Fly calls the kept-machine launch makes; a fake in tests. */
 export interface KeptMachineFly {
   getMachine(id: string): Promise<Machine>;
+  /** Every machine in the sessions app; the create path looks a dispatch's machine up here before it creates one. */
+  listMachines(): Promise<Machine[]>;
   createMachine(config: CreateMachineOpts): Promise<Machine>;
   updateMachine(id: string, config: MachineConfig): Promise<unknown>;
   startMachine(id: string): Promise<void>;
@@ -93,6 +96,7 @@ const UNSETTLED_STATES = new Set(["replacing", "starting", "stopping", "created"
 export function bindKeptMachineFly(token: string, app: string): KeptMachineFly {
   return {
     getMachine: (id) => getMachine(token, app, id),
+    listMachines: () => listMachines(token, app),
     createMachine: (config) => createMachine(token, app, config),
     updateMachine: (id, config) => updateMachine(token, app, id, config),
     startMachine: (id) => startMachine(token, app, id),
@@ -107,7 +111,8 @@ const isReplaceWindow = (err: unknown, status: number, text: RegExp): boolean =>
 const isFlyNotFound = (err: unknown): boolean => err instanceof Error && /\(404\)/.test(err.message);
 
 /**
- * The dispatch step's Fly write for a kept machine (AII-1136). With no kept machine id it creates one.
+ * The dispatch step's Fly write for a kept machine (AII-1136). With no kept machine id it lists the app's machines and adopts
+ * the live `durable-runner` one stamped with this dispatch id (an earlier try of the step created it and lost the ack), else creates one.
  * With one it reconciles first: `started` for this dispatch means an earlier try of the step already ran
  * (return it, no second `update`, which would reboot it); `started` for another dispatch means the hold is
  * wrong (throw); `destroyed` or 404 falls back to create; anything else is `update` then `start`. A machine
@@ -120,13 +125,24 @@ const isFlyNotFound = (err: unknown): boolean => err instanceof Error && /\(404\
 export async function launchKeptMachine(
   fly: KeptMachineFly,
   opts: { keptMachineId: string | null; dispatchId: string; machineConfig: CreateMachineOpts; machineNonce: string; settleMs?: number },
-): Promise<{ machineId: string; machineNonce: string; created: boolean; reused: boolean; replaced?: string; waitedSeconds?: number }> {
+): Promise<{ machineId: string; machineNonce: string; created: boolean; reused: boolean; adopted?: boolean; replaced?: string; waitedSeconds?: number }> {
   const { keptMachineId, dispatchId, machineConfig, machineNonce, settleMs = KEPT_MACHINE_SETTLE_MS } = opts;
   const create = async (replaced?: string) => {
     const machine = await fly.createMachine(machineConfig);
     return { machineId: machine.id, machineNonce, created: true, reused: false, ...(replaced !== undefined && { replaced }) };
   };
-  if (keptMachineId === null) return create();
+  if (keptMachineId === null) {
+    // A lookup error throws before any create, so the step retries rather than making a second machine.
+    const machines = await fly.listMachines();
+    const found = machines.find((m) =>
+      m.state !== "destroyed"
+      && m.config?.metadata?.[DURABLE_RUNNER_DISPATCH_ID_KEY] === dispatchId
+      && m.config?.metadata?.[DURABLE_RUNNER_PURPOSE_KEY] === DURABLE_RUNNER_PURPOSE_VALUE);
+    if (found) {
+      return { machineId: found.id, machineNonce: found.config?.env?.MACHINE_NONCE ?? machineNonce, created: true, reused: false, adopted: true };
+    }
+    return create();
+  }
 
   let existing: Machine;
   try {

@@ -2946,6 +2946,9 @@ describe("KgRefresh durable workflow", () => {
         if (!m) throw new Error(`Failed to get machine ${id} (404): not found`);
         return { id, state: m.state, config: m.config } as unknown as Machine;
       }
+      async listMachines(): Promise<Machine[]> {
+        return [...this.machines].map(([id, m]) => ({ id, state: m.state, config: m.config }) as unknown as Machine);
+      }
       async createMachine(opts: CreateMachineOpts): Promise<Machine> {
         const id = `m-${this.nextId++}`;
         this.machines.set(id, { state: "started", config: opts.config });
