@@ -222,6 +222,14 @@ export interface HandleRunnerPlanningContextInput {
   resolveProvider: (mappingTeamKey: string) => Promise<TicketingProvider | null>;
 }
 
+/** Thrown by an intake seam whose Restate forward failed; the route answers 503 and the runner retries. */
+export class ReviewFixIntakeUnavailableError extends Error {
+  constructor() {
+    super("review-fix intake unavailable");
+    this.name = "ReviewFixIntakeUnavailableError";
+  }
+}
+
 function bad(status: number, error: string): HandleRunnerResultOutput {
   return { status, body: { error } };
 }
@@ -677,7 +685,13 @@ export async function handleRunnerResult(
     }
 
     if (!input.onReviewFixResult) return bad(503, "reviewfix_result_intake_unavailable");
-    const outcome = await input.onReviewFixResult(validated.value);
+    let outcome: ResultIntakeOutcome;
+    try {
+      outcome = await input.onReviewFixResult(validated.value);
+    } catch (e) {
+      if (e instanceof ReviewFixIntakeUnavailableError) return bad(503, "reviewfix_result_intake_unavailable");
+      throw e;
+    }
 
     // The result marker may have committed just before a process crash, leaving
     // its attached cycles unwritten. A byte-identical duplicate may repair only

@@ -50,13 +50,13 @@ import {
 } from "../../review-fix-worker.js";
 import { acceptDelivery } from "../../review-fix-inbox.js";
 import { appendReviewFixActivityBatch, getReviewFixActivityGaps, getReviewFixCycleSummary, listReviewFixActivity, recordReviewFixCycleSummary } from "../../review-fix-evidence.js";
-import { handleRunnerActivity, handleRunnerResult, type RunnerActivityBody } from "../../runner-callback.js";
+import { handleRunnerActivity, handleRunnerResult, ReviewFixIntakeUnavailableError, type RunnerActivityBody } from "../../runner-callback.js";
 import { mintPreparedReviewFixToken } from "../../runner-tokens.js";
 import type { ReviewFixActivityEvent } from "../../review-fix-contract.js";
 import { acquire as acquireDispatchAdmission, release as releaseDispatchAdmission } from "../../dispatch-admission.js";
 import { handleGitHubWebhook } from "../../webhook.js";
 import { appendLog, initLogTable, updateJobStatus } from "../../log.js";
-import { createRestateReviewFixFacade, createReviewFixIngressClient, ReviewFixDeliveryPump } from "../../restate/review-fix-client.js";
+import { createRestateReviewFixFacade, createReviewFixIngressClient, ReviewFixDeliveryPump, reviewFixResultForwardKey } from "../../restate/review-fix-client.js";
 import { createReviewFixAttempt, type ReviewFixAttemptCompletion } from "../../restate/review-fix-attempt.js";
 import { createReviewFixPR, reviewFixPRKey } from "../../restate/review-fix-pr.js";
 import {
@@ -847,7 +847,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect(fixture.commentPosts).toBe(1);
   }, 25_000);
 
-  it("authenticated result ingress commits one inbox delivery, classifies retries/conflicts, and withholds approval", async () => {
+  it("authenticated result callback forwards over the ingress keyed by attempt and body, writes only through store-result, classifies retries/conflicts, and never approves", async () => {
     const env = envFor("alwaysReplay");
     const fixture = freshScenario("result-ingress");
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
@@ -858,36 +858,53 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const secret = "result-ingress-secret";
     const token = mintPreparedReviewFixToken({ attemptId, audience: "result", secret }).token;
     let legacyProviderLookups = 0;
-    const intake = (candidate: ReviewFixResultMetadataV1) => handleRunnerResult({
+    // Mirrors `onReviewFixResult` in src/index.ts: forward only, no SQLite write.
+    const forwardTo = (baseUrl: string) => {
+      const ingress = createReviewFixIngressClient(baseUrl);
+      return async (validated: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> => {
+        const out = await ingress.result(validated.attemptId, validated, { idempotencyKey: reviewFixResultForwardKey(validated) });
+        if (out.status === "accepted") return out.outcome;
+        if (out.status === "conflict") return { status: "conflict", attemptId: validated.attemptId, reason: "conflict" };
+        if (out.status === "not-found") return { status: "stale", attemptId: validated.attemptId, reason: "unknown attempt" };
+        throw new ReviewFixIntakeUnavailableError();
+      };
+    };
+    const intake = (candidate: ReviewFixResultMetadataV1, baseUrl = env.baseUrl()) => handleRunnerResult({
       authorization: `Bearer ${token}`, secret,
       body: { phase: "gap-analysis", outcome: "success", comments: [], reviewFix: candidate },
       resolveProvider: async () => { legacyProviderLookups++; return null; },
-      onReviewFixResult: (validated) => sqliteStore.recordResult(validated.attemptId, validated, Date.now(), () => {
-        const delivery = acceptDelivery({
-          authenticatedSource: "runner-callback", deliveryId: `${validated.attemptId}.result`,
-          kind: "result", destination: fixture.scope, payload: validated,
-        });
-        if (delivery.status !== "accepted") throw new Error(`result delivery was ${delivery.status}`);
-      }),
+      onReviewFixResult: forwardTo(baseUrl),
     });
+    const rowOf = () => getDb().prepare(`SELECT accepted_result_json, result_conflict_at FROM review_fix_attempts WHERE attempt_id = ?`)
+      .get(attemptId) as { accepted_result_json: string | null; result_conflict_at: number | null };
+    const inboxCount = () => (getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_inbox
+      WHERE authenticated_source = 'runner-callback' AND event_id = ?`).get(`${attemptId}.result`) as { n: number }).n;
 
+    // Restate unreachable: 503, nothing written.
+    expect(await intake(result, "http://127.0.0.1:1")).toMatchObject({ status: 503 });
+    expect(rowOf().accepted_result_json).toBeNull();
+    expect(inboxCount()).toBe(0);
+
+    // A later retry of the same body succeeds, and store-result is the writer.
     expect(await intake(result)).toMatchObject({ status: 200, body: { outcome: "stored" } });
-    expect(await intake(result)).toMatchObject({ status: 200, body: { outcome: "duplicate" } });
+    const stored = rowOf().accepted_result_json;
+    expect(stored).not.toBeNull();
+    expect(inboxCount()).toBe(0);
+
+    // Identical retry: same acknowledgement, row unchanged.
+    expect(await intake(result)).toMatchObject({ status: 200, body: { outcome: "stored" } });
+    expect(rowOf().accepted_result_json).toBe(stored);
+
     expect(await intake(resultOf(fixture, prepared, { outputCommit: sha("callback-conflict") })))
       .toMatchObject({ status: 409, body: { outcome: "conflict" } });
     expect(legacyProviderLookups).toBe(0);
-    const inbox = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_inbox
-      WHERE authenticated_source = 'runner-callback' AND event_id = ?`)
-      .get(`${attemptId}.result`) as { n: number };
-    expect(inbox.n).toBe(1);
-    const conflict = getDb().prepare(`SELECT result_conflict_at FROM review_fix_attempts WHERE attempt_id = ?`)
-      .get(attemptId) as { result_conflict_at: number | null };
-    expect(conflict.result_conflict_at).not.toBeNull();
+    expect(rowOf().result_conflict_at).not.toBeNull();
+    expect(inboxCount()).toBe(0);
 
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: fixture.runAttempt };
-    await pumpFor(env.baseUrl()).tick();
+    // The conflicting result reached the handler, which revoked authority: approval never applies.
     const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
-    expect(done).toMatchObject({ status: "finalized", approval: "withheld" });
+    expect(done).toMatchObject({ status: "finalized", approval: "not_applicable" });
     expect(fixture.commentPosts).toBe(0);
     expect(fixture.dispatchCalls).toBe(1);
   }, 25_000);

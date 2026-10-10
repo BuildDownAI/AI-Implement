@@ -72,7 +72,7 @@ import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, getRetryPolicy } from "./orchestrator-settings.js";
-import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
+import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
 import { mintRunToken, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
@@ -80,7 +80,7 @@ import { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
 import { createReviewFixAdminFacade } from "./review-fix-admin-facade.js";
 import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "./review-fix-worker.js";
 import { listActiveRestateReviewFixPrs, queueReviewFixCancellationForClosedPr } from "./review-fix-close.js";
-import { acceptDelivery as acceptReviewFixDelivery, createReviewFixIngressClient, ReviewFixDeliveryPump } from "./restate/review-fix-client.js";
+import { acceptDelivery as acceptReviewFixDelivery, createReviewFixIngressClient, ReviewFixDeliveryPump, reviewFixResultForwardKey } from "./restate/review-fix-client.js";
 import { appendReviewFixActivityBatch, isReviewFixEvidenceTombstoned } from "./review-fix-evidence.js";
 import type { ReviewFixResultMetadataV1, ResultIntakeOutcome } from "./review-fix-contract.js";
 import { handleMcpRequest } from "./mcp.js";
@@ -4132,22 +4132,21 @@ export function sweepLegacyKgRefreshRows(): number {
 }
 
 async function onReviewFixResult(result: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> {
-  // The accepted result and its delivery entry commit together. The callback
-  // also runs on an identical retry, repairing an older result that somehow
-  // lacks its inbox row; a rejected or conflicted identity aborts the write.
-  // This callback performs synchronous SQLite work only, never a Restate call.
-  return reviewFixAttemptStore.recordResult(result.attemptId, result, Date.now(), () => {
-    const delivery = acceptReviewFixDelivery({
-      authenticatedSource: "runner-callback",
-      deliveryId: `${result.attemptId}.result`,
-      kind: "result",
-      destination: { installationId: result.installationId, repository: result.repository, prNumber: result.prNumber },
-      payload: result,
-    });
-    if (delivery.status !== "accepted") {
-      throw new Error(`review-fix result delivery was ${delivery.status}`);
-    }
-  });
+  // Verify-only (AII-1185): the callback forwards the validated result to
+  // ReviewFixAttempt.result, whose `store-result` step is the sole SQLite writer.
+  // Restate unreachable throws, which the route answers 503 with nothing written;
+  // the runner retries the same body under the same key.
+  const out = await reviewFixIngressClient.result(result.attemptId, result, { idempotencyKey: reviewFixResultForwardKey(result) });
+  switch (out.status) {
+    case "accepted":
+      return out.outcome;
+    case "conflict":
+      return { status: "conflict", attemptId: result.attemptId, reason: "result conflicts with the recorded result" };
+    case "not-found":
+      return { status: "stale", attemptId: result.attemptId, reason: "unknown attempt" };
+    case "unavailable":
+      throw new ReviewFixIntakeUnavailableError();
+  }
 }
 
 function onReviewFixActivity(batch: RunnerActivityBody): ActivityIntakeOutcome {

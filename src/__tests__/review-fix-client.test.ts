@@ -712,4 +712,42 @@ describe("createReviewFixIngressClient (AII-1184)", () => {
     const ingress = client.createReviewFixIngressClient("http://sidecar", { fetchImpl: fetchImpl as unknown as typeof fetch });
     expect(await ingress.feedback(makeDestination(), event, { idempotencyKey: "d1" })).toEqual({ status: "unavailable" });
   });
+
+  describe("result (AII-1185)", () => {
+    const stored = { status: "stored", result: { attemptId: "att-1" } };
+    const run = async (respond: () => Response | Promise<Response>) => {
+      const calls: Array<{ url: string; headers: Headers }> = [];
+      const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init);
+        calls.push({ url: request.url, headers: request.headers });
+        return respond();
+      });
+      const ingress = client.createReviewFixIngressClient("http://sidecar", { fetchImpl: fetchImpl as unknown as typeof fetch });
+      const outcome = await ingress.result("att-1" as never, { attemptId: "att-1" } as never, { idempotencyKey: "att-1.result.k" });
+      return { outcome, calls };
+    };
+
+    it("posts to /ReviewFixAttempt/<id>/result with the idempotency-key and returns the handler outcome", async () => {
+      const { outcome, calls } = await run(() => new Response(JSON.stringify(stored), { status: 200, headers: { "content-type": "application/json" } }));
+      expect(outcome).toEqual({ status: "accepted", outcome: stored });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.url).toBe("http://sidecar/ReviewFixAttempt/att-1/result");
+      expect(calls[0]!.headers.get("idempotency-key")).toBe("att-1.result.k");
+    });
+
+    it("maps 409 to conflict, 404 to not-found, and other failures to unavailable", async () => {
+      expect((await run(() => new Response("x", { status: 409 }))).outcome).toEqual({ status: "conflict" });
+      expect((await run(() => new Response("x", { status: 404 }))).outcome).toEqual({ status: "not-found" });
+      expect((await run(() => new Response("x", { status: 503 }))).outcome).toEqual({ status: "unavailable" });
+      expect((await run(() => { throw new Error("ECONNREFUSED"); })).outcome).toEqual({ status: "unavailable" });
+    });
+
+    it("keys on attempt and body so a conflicting body never shares a key with the first", () => {
+      const a = { attemptId: "att-1", outputCommit: "a" } as never;
+      const b = { attemptId: "att-1", outputCommit: "b" } as never;
+      expect(client.reviewFixResultForwardKey(a)).toBe(client.reviewFixResultForwardKey({ ...(a as object) } as never));
+      expect(client.reviewFixResultForwardKey(a)).not.toBe(client.reviewFixResultForwardKey(b));
+      expect(client.reviewFixResultForwardKey(a)).toMatch(/^att-1\.result\.[0-9a-f]{64}$/);
+    });
+  });
 });
