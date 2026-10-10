@@ -204,6 +204,23 @@ describe("postRunnerResult", () => {
     expect(body.findingDispositions).toEqual(findingDispositions);
   });
 
+  it("serializes externalReviewPending only when provided", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const base = {
+      workspaceDir: "/tmp",
+      phase: "implementation" as const,
+      outcome: "failure" as const,
+      callbackUrl: "https://cb",
+      fetchImpl,
+    };
+    const headSha = "0123456789abcdef0123456789abcdef01234567";
+    await postRunnerResult({ ...base, externalReviewPending: { headSha } });
+    await postRunnerResult(base);
+    const [withField, without] = vi.mocked(fetchImpl).mock.calls.map((c) => JSON.parse(c[1]!.body as string));
+    expect(withField.externalReviewPending).toEqual({ headSha });
+    expect(without).not.toHaveProperty("externalReviewPending");
+  });
+
   it("omits findingDispositions from body when array is empty", async () => {
     const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
 

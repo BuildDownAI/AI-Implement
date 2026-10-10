@@ -1194,6 +1194,67 @@ describe("handleRunnerResult — implementation", () => {
     expect(log.getJobById(jobId)?.conclusion).not.toBe("runner_approved");
   });
 
+  describe("externalReviewPending", () => {
+    const GOOD = "0123456789abcdef0123456789abcdef01234567";
+    async function send(id: string, extra: Record<string, unknown>) {
+      const { token, dispatchId } = runnerTokens.mintRunToken({
+        issueId: id,
+        mappingTeamKey: "ENG",
+        phase: "implementation",
+        ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+        secret: SECRET,
+      });
+      log.appendLog({
+        issueId: id, issueIdentifier: "ENG-9", teamKey: "ENG", repo: "o/r", dispatchId, executionMode: "github-actions",
+      });
+      const body = {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "REVIEW_UNAPPROVED",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/99",
+        ...extra,
+      } as Record<string, unknown>;
+      const provider = new FakeProvider({ recordCalls: true });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const res = await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: body as never,
+        secret: SECRET,
+        resolveProvider: makeResolve(provider),
+      });
+      const warnings = warn.mock.calls.filter((c) => String(c[0]).includes("externalReviewPending")).length;
+      warn.mockRestore();
+      return { res, body, warnings };
+    }
+
+    it("keeps a valid field without warning", async () => {
+      const { res, body, warnings } = await send("i-erp-ok", { externalReviewPending: { headSha: GOOD } });
+      expect(res.status).toBe(200);
+      expect(body.externalReviewPending).toEqual({ headSha: GOOD });
+      expect(warnings).toBe(0);
+    });
+
+    it.each([
+      ["uppercase hex", { headSha: GOOD.toUpperCase() }],
+      ["39 chars", { headSha: GOOD.slice(1) }],
+      ["41 chars", { headSha: GOOD + "a" }],
+      ["non-hex", { headSha: "g".repeat(40) }],
+      ["non-string", { headSha: 123 }],
+      ["missing headSha", {}],
+      ["non-object", "abc"],
+      ["null", null],
+    ])("drops a malformed field (%s) with one warning and the same response", async (_n, value) => {
+      const absent = await send("i-erp-absent-" + _n, {});
+      const { res, body, warnings } = await send("i-erp-bad-" + _n, { externalReviewPending: value });
+      expect(res.status).toBe(200);
+      expect(res.status).toBe(absent.res.status);
+      expect(res.body).toEqual(absent.res.body);
+      expect(body).not.toHaveProperty("externalReviewPending");
+      expect(warnings).toBe(1);
+    });
+  });
+
   it("does NOT write runner_approved on INSTALL_FAILED coded failure", async () => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i-install-failed",
