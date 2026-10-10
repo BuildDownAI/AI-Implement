@@ -19,7 +19,7 @@ vi.mock("../review-ledger-store.js", () => ({
 
 import { getCombinedChecksState, getPullRequestState, listPrComments, postPrComment } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
-import { getJobByDispatchId } from "../log.js";
+import { getJobByDispatchId, stampJobApproved } from "../log.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
 import {
   createProductionLateExternalReviewDependencies,
@@ -107,5 +107,12 @@ describe("postComment", () => {
     await deps.postComment(input, "body");
     expect(getInstallationToken).toHaveBeenCalledWith("1", "k", "owner");
     expect(postPrComment).toHaveBeenCalledWith("tok", "owner", "repo", 12, "body");
+  });
+});
+
+describe("stampApproved", () => {
+  it("forwards the job id and PR url to stampJobApproved", async () => {
+    await deps.stampApproved(7, input.prUrl);
+    expect(stampJobApproved).toHaveBeenCalledWith(7, input.prUrl);
   });
 });
