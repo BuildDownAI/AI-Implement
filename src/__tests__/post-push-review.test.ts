@@ -6597,6 +6597,28 @@ describe("postPushReviewStep review process gate", () => {
     expect(out.terminationReason).toBe("external_review_pending");
   });
 
+  it("logs the captured verdict and source when the wait times out on a block with no verdict", async () => {
+    const block = {
+      user: { login: "claude[bot]", type: "Bot" }, created_at: "2026-01-01T00:00:00Z", html_url: "https://x/c",
+      body: "```json review-findings\n" + JSON.stringify({ schema: "review-findings/v1", findings: [] }) + "\n```",
+    };
+    const { out, logs } = await run(fixture({ runs: [actions("success")], issueComments: [block] }));
+    expect(out.terminationReason).toBe("external_review_pending");
+    const line = logs.find((l) => l.includes("review process claude-code-review:"));
+    expect(line).toBeDefined();
+    expect(line).not.toContain("verdict running from check-conclusion");
+    expect(line).toMatch(/verdict incomplete from (?!check-conclusion)\S+/);
+  });
+
+  it("reads the issue comments once per step run, sharing the poll's read with the findings read", async () => {
+    const f = fixture({ runs: [actions("success")] });
+    await run(f);
+    const urls = f.ghSpawn.mock.calls.map(([args]) => args.find((x) => x.startsWith("repos/:owner/:repo/")) ?? "");
+    // From the first check-runs read (the poll) through the post-wait findings reads, up to the unrelated reviews-API read after the CI gate.
+    const span = urls.slice(urls.findIndex((u) => u.includes("/check-runs")), urls.findIndex((u) => u === "repos/:owner/:repo/pulls/42/reviews"));
+    expect(span.filter((u) => u.includes("/issues/42/comments"))).toHaveLength(1);
+  });
+
   it("still counts an unresolved thread on an older commit under ai-implement", async () => {
     const f = fixture({ runs: [actions("success")], threads: [thread("🔴 old finding", "oldsha")] });
     const { out } = await run(f, {

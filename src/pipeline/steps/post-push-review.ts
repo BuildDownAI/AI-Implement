@@ -723,6 +723,8 @@ interface ExternalReviewProbe {
   state: ExternalReviewProbeState;
   /** The review process's verdict, set only when its reader ran. */
   verdict?: ReviewVerdictResult;
+  /** The issue-comments read behind `verdict`, so the findings read after the wait does not repeat it. */
+  issueComments?: SpawnResult;
 }
 
 function probeExternalReviewCheck(
@@ -803,7 +805,14 @@ function readProcessVerdict(
 ): ExternalReviewProbe {
   const commentsRes = ghSpawn(["api", "--paginate", "--slurp", `repos/:owner/:repo/pulls/${prNumber}/comments?per_page=100`]);
   if (commentsRes.exitCode !== 0) return { state: "unreadable" };
-  const blocks = collectReviewFindingsBlocksFromGh(ghSpawn, prNumber, { process: opts.process, extraAuthors: opts.extraAuthors });
+  let issueComments: SpawnResult;
+  try {
+    issueComments = ghSpawn(["api", "--paginate", "--slurp", `repos/:owner/:repo/issues/${prNumber}/comments?per_page=100`]);
+  } catch {
+    return { state: "unreadable" };
+  }
+  if (issueComments.exitCode !== 0) return { state: "unreadable" };
+  const blocks = collectReviewFindingsBlocksFromGh(ghSpawn, prNumber, { process: opts.process, extraAuthors: opts.extraAuthors, issueComments });
   if (blocks === null) return { state: "unreadable" };
 
   let payload: unknown;
@@ -839,9 +848,9 @@ function readProcessVerdict(
     inlineComments,
     blocks,
   });
-  if (verdict.verdict === "approve" || verdict.verdict === "changes_requested") return { state: "completed", verdict };
-  if (verdict.verdict === "incomplete" && verdict.source !== "none") return { state: "running", verdict };
-  return { state: "no-real-verdict", verdict };
+  if (verdict.verdict === "approve" || verdict.verdict === "changes_requested") return { state: "completed", verdict, issueComments };
+  if (verdict.verdict === "incomplete" && verdict.source !== "none") return { state: "running", verdict, issueComments };
+  return { state: "no-real-verdict", verdict, issueComments };
 }
 
 /**
@@ -870,7 +879,7 @@ async function waitForExternalReviewCompletion(
     process?: ReviewProcessDefinition;
     extraAuthors?: readonly string[];
   },
-): Promise<{ state: ExternalReviewState; headSha: string; reviewVerdict?: ReviewVerdictResult }> {
+): Promise<{ state: ExternalReviewState; headSha: string; reviewVerdict?: ReviewVerdictResult; issueComments?: SpawnResult }> {
   const probeOpts = {
     configuredCheckNames: opts.configuredCheckNames,
     process: opts.process ?? resolveReviewProcess(null),
@@ -917,7 +926,10 @@ async function waitForExternalReviewCompletion(
       ? probeExternalReviewCheck(ghSpawn, prNumber, headSha, probeOpts, warnOnce)
       : { state: "unreadable" };
     const state = probe.state;
-    const reviewVerdict = probe.verdict ? { reviewVerdict: probe.verdict } : {};
+    const reviewVerdict = {
+      ...(probe.verdict ? { reviewVerdict: probe.verdict } : {}),
+      ...(probe.issueComments ? { issueComments: probe.issueComments } : {}),
+    };
 
     // Immediate, unambiguous terminal return — deliberately ahead of the sawMatching/
     // pendingSettle machinery below. That machinery exists to avoid mistaking a single bad
@@ -952,7 +964,7 @@ async function waitForExternalReviewCompletion(
       pendingSettle = null;
       if (observed !== "running" && observed !== "unreadable") return { state: observed, headSha, ...reviewVerdict };
     }
-    if (elapsed >= opts.timeoutMs) return { state: "running", headSha };
+    if (elapsed >= opts.timeoutMs) return { state: "running", headSha, ...reviewVerdict };
     await opts.sleep(opts.pollMs);
     elapsed += opts.pollMs;
   }
@@ -2219,6 +2231,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
             process: reviewProcess,
             extraAuthors: trustedReviewAuthors,
             ...(externalReviewResult.headSha && reviewProcess.id !== "ai-implement" ? { headSha: externalReviewResult.headSha } : {}),
+            ...("issueComments" in externalReviewResult && externalReviewResult.issueComments ? { issueComments: externalReviewResult.issueComments } : {}),
           });
       const externalFindings = processVerdict?.verdict === "changes_requested" && externalFindingsResult.findings.length === 0
         ? processVerdict.findings

@@ -79,8 +79,10 @@ export interface RepoMapping {
   /**
    * Which lifecycle coordinates this project's *automatic GitHub Actions review-fix* runs.
    * NULL (including an old row predating this column) means Legacy — see
-   * resolveReviewFixLifecycle(). Local review-fix and human comment-triggered runs always
-   * stay on Legacy admission regardless of this setting. Selecting "restate" is validated at
+   * resolveReviewFixLifecycle(). Under "restate", the project's review webhook events (reviews,
+   * inline comments, review-summary issue comments) forward to ReviewFixPR.feedback and are
+   * admitted through Restate; the `/ai-implement` comment rail (comment_gapfill_queue) is
+   * unchanged, and local review-fix stays on Legacy admission. Selecting "restate" is validated at
    * save time (src/admin.ts's upsertMappingAction) and applies only to new attempts; it never
    * changes the owner of an attempt already in flight.
    */

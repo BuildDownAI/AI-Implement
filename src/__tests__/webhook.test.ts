@@ -2764,9 +2764,10 @@ describe("Restate review-fix lifecycle forwards instead of writing (AII-1184)", 
 
   const issueBody = "## Review\n\nBlocking issue found.\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[{\"severity\":\"blocking\",\"path\":\"src/x.ts\",\"line\":10,\"body\":\"Missing null check.\"}]}\n```";
 
-  async function post(kind: string, pr: number, opts: { ingress?: ReturnType<typeof fakeIngress>; delivery?: string | null; body?: string; commit?: string } = {}) {
+  async function post(kind: string, pr: number, opts: { ingress?: ReturnType<typeof fakeIngress>; delivery?: string | null; body?: string; commit?: string; installation?: false } = {}) {
     const body = opts.body ?? (kind === "issueComment" ? issueBody : "Please fix this.");
     const { event, payload } = payloads[kind]!(pr, body, opts.commit);
+    if (opts.installation === false) delete (payload as { installation?: unknown }).installation;
     const headers: Record<string, string> = {};
     if (opts.delivery !== null) headers["x-github-delivery"] = opts.delivery ?? `delivery-${pr}`;
     const { req, res } = makeRequest(SECRET, event, payload, undefined, headers);
@@ -2848,6 +2849,16 @@ describe("Restate review-fix lifecycle forwards instead of writing (AII-1184)", 
     const ingress = fakeIngress();
     const out = await post("review", 16, { ingress, delivery: null });
     expect(out.status).toBe(400);
+    expect(ingress.feedback).not.toHaveBeenCalled();
+  });
+
+  it("answers 400 without forwarding when the installation id is absent", async () => {
+    mapRepo("restate");
+    seedDispatch(40);
+    const ingress = fakeIngress();
+    const out = await post("review", 40, { ingress, installation: false });
+    expect(out.status).toBe(400);
+    expect(out.body).toEqual({ error: "missing_installation" });
     expect(ingress.feedback).not.toHaveBeenCalled();
   });
 
