@@ -45,13 +45,17 @@ vi.mock("../log.js", async (importOriginal) => ({
 }));
 vi.mock("../repo-image.js", () => ({ resolveRunnerImageForDispatch: vi.fn(async () => "runner:test") }));
 const resolvedPath = { current: "github-actions" };
-vi.mock("../runner-mode.js", () => ({
+vi.mock("../runner-mode.js", async (importOriginal) => ({
+  resolveKgBackend: (await importOriginal<typeof import("../runner-mode.js")>()).resolveKgBackend,
+  getKgExecutionMode: (flyConfigured = false) =>
+    kgSetting.current ?? { mode: flyConfigured ? "fly-machines" : "github-actions", source: "default" },
   getRunnerMode: () => ({ mode: runnerMode.current }),
   getKgMaterializeDirect: () => ({ enabled: false }),
   getKgFlyMachineOverride: () => kgFlyOverride.current,
   setKgFlyMachineOverride: (v: unknown) => { if (v === null) kgFlyOverride.current = {}; },
 }));
 const runnerMode = { current: "default" };
+const kgSetting: { current: { mode: "github-actions" | "fly-machines"; source: "db" | "env" | "default" } | null } = { current: null };
 const kgFlyOverride: { current: { cpus?: number; memoryMb?: number; cpuKind?: "auto" | "shared" | "performance" } } = { current: {} };
 const kgMappingSize: { current: { machineCpus?: number; machineMemoryMb?: number } } = { current: {} };
 vi.mock("../config.js", async (importOriginal) => ({
@@ -732,31 +736,40 @@ describe("createKgFindRunByTitle", () => {
   });
 });
 
-describe("resolveKgExecutionMode (AII-1130)", () => {
-  afterEach(() => { runnerMode.current = "default"; });
+describe("resolveKgExecutionMode (AII-1130, AII-1218)", () => {
+  afterEach(() => { runnerMode.current = "default"; kgSetting.current = null; });
   const configured = { flySessionsToken: "t", flySessionsApp: "a" };
   const unconfigured = { flySessionsToken: null, flySessionsApp: null };
+  const gha = { mode: "github-actions" as const, source: "db" as const };
+  const fly = { mode: "fly-machines" as const, source: "db" as const };
 
   it.each([
-    ["local", configured, "local-docker"],
-    ["local", unconfigured, "local-docker"],
-    ["gha", configured, "github-actions"],
-    ["gha", unconfigured, "github-actions"],
-    ["default", configured, "fly-machines"],
-    ["default", unconfigured, "github-actions"],
-    ["fly", configured, "fly-machines"],
-    ["fly", unconfigured, "github-actions"],
-    ["shadow", configured, "fly-machines"],
-    ["shadow", unconfigured, "github-actions"],
-  ])("runner mode %s, Fly %j answers %s", (mode, fly, expected) => {
+    ["default", gha, configured, "github-actions", "kg-setting"],
+    ["default", fly, configured, "fly-machines", "kg-setting"],
+    ["default", fly, unconfigured, "github-actions", "fly-unconfigured"],
+    ["gha", fly, configured, "github-actions", "runner-mode"],
+    ["gha", gha, unconfigured, "github-actions", "runner-mode"],
+    ["fly", gha, configured, "fly-machines", "runner-mode"],
+    ["fly", gha, unconfigured, "github-actions", "fly-unconfigured"],
+    ["local", fly, configured, "local-docker", "runner-mode"],
+    ["local", gha, unconfigured, "local-docker", "runner-mode"],
+    ["shadow", gha, configured, "github-actions", "kg-setting"],
+    ["shadow", fly, configured, "fly-machines", "kg-setting"],
+    ["shadow", fly, unconfigured, "github-actions", "fly-unconfigured"],
+  ] as const)("runner mode %s, setting %j, Fly %j answers %s (%s)", (mode, setting, flyCfg, expected, source) => {
     runnerMode.current = mode;
-    expect(resolveKgExecutionMode(fly)).toBe(expected);
+    kgSetting.current = setting;
+    expect(resolveKgExecutionMode(flyCfg)).toEqual({ mode: expected, source });
+  });
+
+  it("with nothing set, keeps today's result", () => {
+    expect(resolveKgExecutionMode(configured)).toEqual({ mode: "fly-machines", source: "default" });
+    expect(resolveKgExecutionMode(unconfigured)).toEqual({ mode: "github-actions", source: "default" });
   });
 
   it("counts a half-set Fly configuration as not configured", () => {
-    runnerMode.current = "default";
-    expect(resolveKgExecutionMode({ flySessionsToken: "t", flySessionsApp: null })).toBe("github-actions");
-    expect(resolveKgExecutionMode({ flySessionsToken: null, flySessionsApp: "a" })).toBe("github-actions");
+    expect(resolveKgExecutionMode({ flySessionsToken: "t", flySessionsApp: null }).mode).toBe("github-actions");
+    expect(resolveKgExecutionMode({ flySessionsToken: null, flySessionsApp: "a" }).mode).toBe("github-actions");
   });
 });
 

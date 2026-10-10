@@ -8,7 +8,7 @@ export const kgPipelinesHtml = `
       <div class="page-subtitle">Refresh the knowledge graph and watch its runs</div>
     </div>
     <div class="page-header-actions">
-      <button class="btn btn-sm" onclick="loadKgStatus(); loadKgMaterializeMode(); loadKgFlyMachine()">&#8635; Refresh</button>
+      <button class="btn btn-sm" onclick="loadKgStatus(); loadKgExecutionMode(); loadKgMaterializeMode(); loadKgFlyMachine()">&#8635; Refresh</button>
     </div>
   </header>
   <div class="page-body">
@@ -27,6 +27,15 @@ export const kgPipelinesHtml = `
           <span class="kpi-trend text-secondary" style="margin-left: 8px">Refresh fetches the KG source repo's committed snapshot and restarts the sidecar — no deploy, no dispatch pause. Dry-run runs the same job with the push skipped and reports the guard table below; the served graph never changes. Accept new baseline pushes even if the guard table above shows a shrink — review it first.</span>
         </div>
         <div class="kpi-trend text-secondary" id="kg-dry-run-last" style="margin-top: 8px" hidden></div>
+        <div style="margin-top: 12px; display:flex; align-items:center; gap:12px; flex-wrap:wrap">
+          <span class="kpi-trend text-secondary">Backend:</span>
+          <span class="seg" id="kg-backend-controls">
+            <button class="btn btn-sm" id="btn-kg-backend-gha" data-backend="github-actions" onclick="window.setKgExecutionMode('github-actions')">GitHub Actions</button>
+            <button class="btn btn-sm" id="btn-kg-backend-fly" data-backend="fly-machines" onclick="window.setKgExecutionMode('fly-machines')">Fly machines</button>
+          </span>
+          <span class="kpi-trend text-secondary" id="kg-backend-source"></span>
+        </div>
+        <div class="kpi-trend text-secondary" id="kg-backend-effective"></div>
         <div style="margin-top: 12px; display:flex; align-items:center; gap:12px; flex-wrap:wrap">
           <span class="kpi-trend text-secondary">Materialize:</span>
           <span class="seg" id="kg-materialize-controls">
@@ -232,6 +241,51 @@ export const kgPipelinesScript = `
     setTimeout(loadKgStatus, 1000);
   };
 
+  async function loadKgExecutionMode() {
+    try {
+      const res = await window.api('/api/kg/execution-mode');
+      if (!res.ok) return;
+      const data = await res.json();
+      document.getElementById('btn-kg-backend-gha').classList.toggle('btn-primary', data.mode === 'github-actions');
+      document.getElementById('btn-kg-backend-fly').classList.toggle('btn-primary', data.mode === 'fly-machines');
+      document.getElementById('kg-backend-source').textContent = '(' + data.source + ')';
+    } catch (e) { /* transient \u2014 next poll retries */ }
+  }
+
+  window.setKgExecutionMode = async function (mode) {
+    try {
+      const res = await window.api('/api/kg/execution-mode', { method: 'POST', body: JSON.stringify({ mode: mode }) });
+      if (!res.ok && res.status !== 401) {
+        const body = await res.json().catch(function () { return {}; });
+        showMessage('warning', 'Could not change the KG backend \u2014 ' + (body.error || res.status));
+      }
+    } catch (err) {
+      showMessage('warning', 'Could not change the KG backend \u2014 ' + String(err));
+    }
+    loadKgExecutionMode();
+    loadKgFlyMachine();
+  };
+
+  var KG_BACKEND_LABELS = { 'github-actions': 'GitHub Actions', 'fly-machines': 'Fly machines', 'local-docker': 'local Docker' };
+
+  // The effective line comes from get_kg_status.executionMode; the Fly machine row shows only for a Fly backend.
+  function renderKgExecutionMode(em) {
+    const effectiveEl = document.getElementById('kg-backend-effective');
+    const isFly = !!em && em.effective === 'fly-machines';
+    document.getElementById('kg-fly-machine-controls').hidden = !isFly;
+    document.getElementById('kg-fly-machine-effective').hidden = !isFly;
+    if (!em) { effectiveEl.textContent = ''; return; }
+    const label = KG_BACKEND_LABELS[em.effective] || em.effective;
+    let why;
+    if (em.source === 'kg-setting') why = 'KG setting';
+    else if (em.source === 'fly-unconfigured') why = 'Fly not configured';
+    else if (em.source === 'runner-mode') {
+      const rm = em.effective === 'fly-machines' ? 'fly' : em.effective === 'local-docker' ? 'local' : 'gha';
+      why = 'runner mode ' + rm + (em.effective === em.setting ? '' : ' overrides the KG setting');
+    } else why = em.source;
+    effectiveEl.innerHTML = window.esc('next run: ' + label + ' (' + why + ')');
+  }
+
   async function loadKgMaterializeMode() {
     try {
       const res = await window.api('/api/kg/materialize-mode');
@@ -326,6 +380,7 @@ export const kgPipelinesScript = `
           'next Fly run: profile unavailable (' + (out.status === 403 ? 'admin only' : out.status) + ')';
         return;
       }
+      renderKgExecutionMode(out.body.executionMode);
       const fm = out.body.flyMachine;
       if (!fm || typeof fm.cpus !== 'number') return;
       document.getElementById('kg-fly-machine-effective').textContent =
@@ -371,14 +426,17 @@ export const kgPipelinesScript = `
   };
 
   window.loadKgStatus = loadKgStatus;
+  window.loadKgExecutionMode = loadKgExecutionMode;
   window.loadKgMaterializeMode = loadKgMaterializeMode;
   window.loadKgFlyMachine = loadKgFlyMachine;
 
   window.registerPage('kg-pipelines', function () {
     loadKgStatus();
+    loadKgExecutionMode();
     loadKgMaterializeMode();
     loadKgFlyMachine();
     setInterval(loadKgStatus, 15000);
+    setInterval(loadKgExecutionMode, 15000);
     setInterval(loadKgMaterializeMode, 15000);
     setInterval(loadKgFlyMachine, 15000);
     // createDispatchLog comes from the Pipelines page script; the card works without it.
