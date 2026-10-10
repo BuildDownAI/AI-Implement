@@ -132,9 +132,9 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
 export type LateExternalReviewDefinition = ReturnType<typeof createLateExternalReviewWorkflow>;
 
 /** Production deps. A fresh installation token per call; it is never journaled. */
-export function createProductionLateExternalReviewServices(config: Pick<AppConfig, "githubAppId" | "githubAppPrivateKey">): { services: RestateService[] } {
+export function createProductionLateExternalReviewDependencies(config: Pick<AppConfig, "githubAppId" | "githubAppPrivateKey">): LateExternalReviewDependencies {
   const token = (owner: string) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
-  const deps: LateExternalReviewDependencies = {
+  return {
     async readTick(input) {
       const t = await token(input.owner);
       const pr = await getPullRequestState(t, input.owner, input.repo, input.prNumber);
@@ -163,7 +163,10 @@ export function createProductionLateExternalReviewServices(config: Pick<AppConfi
       await postPrComment(await token(input.owner), input.owner, input.repo, input.prNumber, body);
     },
   };
-  return { services: [createLateExternalReviewWorkflow(deps)] };
+}
+
+export function createProductionLateExternalReviewServices(config: Pick<AppConfig, "githubAppId" | "githubAppPrivateKey">): { services: RestateService[] } {
+  return { services: [createLateExternalReviewWorkflow(createProductionLateExternalReviewDependencies(config))] };
 }
 
 export type LateExternalReviewSubmitResult = "accepted" | "conflict" | "unavailable";
