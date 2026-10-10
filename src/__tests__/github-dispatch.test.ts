@@ -269,6 +269,19 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
 
     expect(decodeRunConfig(inputs.run_config!).reviewers).toEqual(reviewers);
   });
+
+  it("carries reviewProcess and trustedReviewAuthors inside run_config when set", () => {
+    const mapping = makeMapping({ reviewProcess: "claude-code-review", trustedReviewAuthors: ["review-bot"] });
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
+      runnerPhase: "implementation",
+      runToken: "",
+      runProgressToken: "",
+    });
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.reviewProcess).toBe("claude-code-review");
+    expect(decoded.trustedReviewAuthors).toEqual(["review-bot"]);
+  });
 });
 
 // ---------- Case (b): Legacy mode regression pin ----------

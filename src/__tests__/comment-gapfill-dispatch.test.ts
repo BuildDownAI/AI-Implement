@@ -233,13 +233,17 @@ function seedGapAnalysisDispatch(issueId: string, owner: string, repo: string, p
   log.updateJobPrUrl(jobId, `https://github.com/${owner}/${repo}/pull/${prNumber}`);
 }
 
-async function dispatchFlyGapfillAndDecodeReviewers(reviewers: RepoMapping["reviewers"]) {
+async function dispatchFlyGapfillAndDecodeReviewers(
+  reviewers: RepoMapping["reviewers"],
+  extra: Partial<RepoMapping> = {},
+) {
   const { decodeRunConfig } = await import("../run-config.js");
   const mapping = makeMapping({
     owner: "acme",
     repo: "billing",
     executionMode: "fly-machines",
     reviewers,
+    ...extra,
   });
 
   queue.enqueueCommentGapfill({
@@ -735,6 +739,23 @@ describe("drainCommentGapfillQueue", () => {
     const decoded = await dispatchFlyGapfillAndDecodeReviewers([]);
 
     expect(decoded.reviewers).toEqual([]);
+  });
+
+  it("carries reviewProcess and trustedReviewAuthors into Fly Machines gap-fill run_config", async () => {
+    const decoded = await dispatchFlyGapfillAndDecodeReviewers(null, {
+      reviewProcess: "claude-code-review",
+      trustedReviewAuthors: ["review-bot"],
+    });
+
+    expect(decoded.reviewProcess).toBe("claude-code-review");
+    expect(decoded.trustedReviewAuthors).toEqual(["review-bot"]);
+  });
+
+  it("omits reviewProcess and trustedReviewAuthors from Fly Machines gap-fill run_config when null", async () => {
+    const decoded = await dispatchFlyGapfillAndDecodeReviewers(null, { reviewProcess: null, trustedReviewAuthors: null });
+
+    expect("reviewProcess" in decoded).toBe(false);
+    expect("trustedReviewAuthors" in decoded).toBe(false);
   });
 
   it("omits reviewers from Fly Machines gap-fill run_config when mapping reviewers are null", async () => {

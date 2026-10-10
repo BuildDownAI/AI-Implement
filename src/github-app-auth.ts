@@ -93,7 +93,7 @@ export function createAppJwt(appId: string, privateKey: string): string {
   return `${signing}.${sig}`;
 }
 
-function githubAppHeaders(authValue: string): Record<string, string> {
+export function githubAppHeaders(authValue: string): Record<string, string> {
   return {
     Authorization: `Bearer ${authValue}`,
     Accept: "application/vnd.github+json",

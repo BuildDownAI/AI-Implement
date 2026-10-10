@@ -1,6 +1,7 @@
 import type { ReferenceRepo } from "./reference-repos.js";
 import type { RetryPolicy } from "./pipeline/retry-backoff.js";
 import type { RepoMapping, ReviewerSelection } from "./config.js";
+import { isReviewProcessId, type ReviewProcessId } from "./review-process.js";
 import { validateReviewFixMetadata, type ReviewFixMetadataV1 } from "./review-fix-contract.js";
 
 /**
@@ -47,6 +48,10 @@ export interface RunConfigV1 {
   referenceRepos?: ReferenceRepo[];
   /** Which reviewers run on this project's PRs. Absent = runner uses DEFAULT_REVIEWER_SELECTION. */
   reviewers?: ReviewerSelection[];
+  /** The project's review process (ADR 038). Absent = `ai-implement`. */
+  reviewProcess?: ReviewProcessId;
+  /** Extra GitHub logins trusted as review authors. Absent = the process's own authors; the list adds, never replaces. */
+  trustedReviewAuthors?: string[];
   /** Global retry/backoff policy and reviewer turn cap. Absent = runner uses DEFAULT_RETRY_POLICY. */
   retryPolicy?: RetryPolicy;
   /** Restate review-fix pilot attempt identity (AII-776), the canonical shape defined by the
@@ -165,6 +170,8 @@ export function buildImplRunConfig(input: ImplRunConfigInput): RunConfigV1 {
     ...(groupingParent ? { groupingParent: true } : {}),
     ...(mapping.dependencyTokenScope != null ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
     ...(mapping.reviewers != null ? { reviewers: mapping.reviewers } : {}),
+    ...(mapping.reviewProcess != null ? { reviewProcess: mapping.reviewProcess } : {}),
+    ...(mapping.trustedReviewAuthors != null ? { trustedReviewAuthors: mapping.trustedReviewAuthors } : {}),
     retryPolicy,
   };
 }
@@ -204,6 +211,10 @@ export function buildKgRefreshRunConfig(input: KgRefreshRunConfigInput): RunConf
   };
 }
 
+function isNonEmptyStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((s) => typeof s === "string" && s.length > 0);
+}
+
 function isReviewerSelectionArray(value: unknown): value is ReviewerSelection[] {
   if (!Array.isArray(value)) return false;
   const seen = new Set<string>();
@@ -228,7 +239,7 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
     runnerCallbackUrl, maxTurns, maxIterations, commentInstruction, sensitiveFiles,
     profiles, assigneeName, planningContext, groupingParent, dependencyTokenScope, kgSourceRepo,
     kgDryRun, kgSourceRef, kgAcceptNewBaseline, kgBaselineActor, referenceRepos,
-    reviewers, retryPolicy, reviewFix } = cfg;
+    reviewers, reviewProcess, trustedReviewAuthors, retryPolicy, reviewFix } = cfg;
   const out: RunConfigV1 = { v, issue };
   if (prNumber !== undefined) out.prNumber = prNumber;
   if (baseBranch !== undefined) out.baseBranch = baseBranch;
@@ -256,6 +267,20 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
       out.reviewers = reviewers;
     } else {
       console.warn("[run-config] Ignoring invalid reviewers field; using default reviewer selection");
+    }
+  }
+  if (reviewProcess !== undefined) {
+    if (isReviewProcessId(reviewProcess)) {
+      out.reviewProcess = reviewProcess;
+    } else {
+      console.warn("[run-config] Ignoring invalid reviewProcess field; using ai-implement");
+    }
+  }
+  if (trustedReviewAuthors !== undefined) {
+    if (isNonEmptyStringArray(trustedReviewAuthors)) {
+      out.trustedReviewAuthors = trustedReviewAuthors;
+    } else {
+      console.warn("[run-config] Ignoring invalid trustedReviewAuthors field; using the process's own authors");
     }
   }
   if (retryPolicy !== undefined) out.retryPolicy = retryPolicy;

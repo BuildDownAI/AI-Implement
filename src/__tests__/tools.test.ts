@@ -693,6 +693,8 @@ describe("migrated read handlers (AII-711)", () => {
         branchPrefix: null, skillsRepo: null, referenceRepos: [], dependencyTokenScope: null,
         sensitiveAddPatterns: [], sensitiveAllowPatterns: [], machineCpus: 2, machineMemoryMb: 4096,
         awsRegion: null, planningWorkflowFile: "claude-plan.yml", autoApprovePlans: true, reviewers: null,
+        trustedReviewAuthors: ["codex-reviewer[bot]"],
+        reviewProcess: "claude-code-review",
         extraEnv: { SUPER_SECRET: "leak-me" },
       },
     });
@@ -702,6 +704,8 @@ describe("migrated read handlers (AII-711)", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].teamKey).toBe("BDS");
     expect(rows[0].repo).toBe("BuildDownAI/skills");
+    expect(rows[0].trustedReviewAuthors).toEqual(["codex-reviewer[bot]"]);
+    expect(rows[0].reviewProcess).toBe("claude-code-review");
     expect(result.content[0].text).not.toContain("extraEnv");
     expect(result.content[0].text).not.toContain("leak-me");
   });
@@ -987,6 +991,7 @@ describe("get_project_binding (AII-715)", () => {
       defaultBranch: "testing",
       tracker: { kind: "linear", team: "BDS" },
       pickupLabel: "AI-Implement-Custom",
+      reviewProcess: "ai-implement",
       kg: {
         present: true,
         orchestratorUrl: "https://ai-implement-testing-orchestrator.fly.dev",
@@ -995,6 +1000,16 @@ describe("get_project_binding (AII-715)", () => {
         searchTool: "kg_hybrid_search",
       },
     });
+  });
+
+  it("returns the resolved reviewProcess in the single and list shapes", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
+      BDS: fixtureMapping({ reviewProcess: "claude-code-review" }),
+    });
+    const single = await getProjectBinding(fakeContext("get_project_binding"), { caller: system, args: { team: "BDS" } });
+    expect(JSON.parse(single.content[0].text).reviewProcess).toBe("claude-code-review");
+    const all = await getProjectBinding(fakeContext("get_project_binding"), { caller: system, args: {} });
+    expect(JSON.parse(all.content[0].text)[0].reviewProcess).toBe("claude-code-review");
   });
 
   it("reflects a pickup-label change on the very next call in the same process, no restart (AII-696 criterion 1)", async () => {
@@ -1337,6 +1352,7 @@ describe("migrated write handlers (AII-713)", () => {
         owner: "org",
         repo: "repo",
         reviewers: null,
+        trustedReviewAuthors: null,
         maxTurns: null,
         maxIterations: null,
         prDispatchBudget: null,
@@ -1351,6 +1367,27 @@ describe("migrated write handlers (AII-713)", () => {
 
       expect(addProjectArgsSchema.safeParse({ teamKey: null, owner: "org", repo: "repo" }).success).toBe(false);
       expect(addProjectArgsSchema.safeParse({ teamKey: "AII", owner: "org", repo: "repo", reviewers: "x" }).success).toBe(false);
+    });
+
+    it("safeParse accepts the reviewProcess ids, null, and omission, and rejects github", () => {
+      const base = { teamKey: "AII", owner: "org", repo: "repo" };
+      for (const reviewProcess of ["claude-code-review", "ai-implement", null]) {
+        expect(addProjectArgsSchema.safeParse({ ...base, reviewProcess }).success).toBe(true);
+      }
+      expect(addProjectArgsSchema.safeParse(base).success).toBe(true);
+      expect(addProjectArgsSchema.safeParse({ ...base, reviewProcess: "github" }).success).toBe(false);
+    });
+
+    it("safeParse accepts a valid trustedReviewAuthors list and rejects a non-string entry", () => {
+      expect(addProjectArgsSchema.safeParse({
+        teamKey: "AII", owner: "org", repo: "repo",
+        trustedReviewAuthors: ["codex-reviewer[bot]"],
+      }).success).toBe(true);
+
+      expect(addProjectArgsSchema.safeParse({
+        teamKey: "AII", owner: "org", repo: "repo",
+        trustedReviewAuthors: [123],
+      }).success).toBe(false);
     });
   });
 

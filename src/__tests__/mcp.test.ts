@@ -176,7 +176,8 @@ vi.mock("../runner-mode.js", () => ({
   setKgFlyMachineOverride: vi.fn(),
 }));
 
-vi.mock("../config.js", () => ({
+vi.mock("../config.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../config.js")>()),
   getMappings: vi.fn(() => ({})),
 }));
 

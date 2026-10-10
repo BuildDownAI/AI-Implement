@@ -52,9 +52,13 @@ const NEW_STAMP = "2026-08-24T12:00:00+00:00";
 const SNAPSHOT_SHA = "abc123def456abc123def456abc123def456abc1";
 const KG_SOURCE_REPO = "TestOrg/test-kg-source";
 
+// The bootstrap deadline stays at 1 s: AII-1125's scenario needs the started read to arrive inside it, AII-1111 raised a
+// 400 ms bootstrap to avoid exactly that race, and AII-1028 measured invocation start delays up to 1.08 s on a loaded runner.
+// The total deadline keeps an 800 ms margin after the bootstrap deadline (eight 100 ms ticks); every scenario that reaches it
+// has already passed bootstrap with a progress call.
 const BOOTSTRAP_DEADLINE_MS = 1_000;
-const TOTAL_DEADLINE_MS = 2_600;
-const WATCH_INTERVAL_MS = 300;
+const TOTAL_DEADLINE_MS = 1_800;
+const WATCH_INTERVAL_MS = 100;
 
 /** extractSource strips one leading path component, so wrap the fixture in a top-level dir — copied from src/__tests__/kg-refresh-rail.test.ts. */
 function makeTarball(dir: string): Buffer {
@@ -148,9 +152,12 @@ describe("KgRefresh durable workflow", () => {
   let mintTokenImpl: () => Promise<{ token: string; expiresAt: string }>;
   let loadSnapshotShaImpl: () => string | null;
   let mergeDelayMs: number;
-  // Set per-test (W13) to hold the next sidecar call open, inside verify's own ctx.run, for a
-  // concurrent status() poll; null keeps every other scenario running with no added latency.
+  // W13 sets it to hold the next kg_hybrid_search call (verify's canary) open inside verify's
+  // ctx.run; null keeps every other scenario running with no added latency.
   let holdNextMcpCall: Promise<void> | null = null;
+  // Fired by mcpToolCall as the held call parks, so the test body learns the workflow is inside
+  // verify from the fake itself rather than by polling. Null outside W13.
+  let onMcpCallHeld: (() => void) | null = null;
   // Reassigned per-test for the release-leak regression: forces `reserve` (and, once
   // failurePath is reached, `persist`) to fail terminally, so the outer catch's KgRepo
   // release is the only thing standing between a forced double-failure and a leaked lock.
@@ -173,11 +180,14 @@ describe("KgRefresh durable workflow", () => {
     return { promise, release };
   }
   const STATUS_LATCH_MAX_MS = 5_000;
+  // W13's safety bound only: the scenario releases the latch itself once it has read `status`.
+  const W13_LATCH_MAX_MS = 1_000;
 
   const mcpToolCall = async (_url: string, tool: string): Promise<unknown> => {
-    if (holdNextMcpCall) {
+    if (holdNextMcpCall && tool === "kg_hybrid_search") {
       const held = holdNextMcpCall;
       holdNextMcpCall = null;
+      onMcpCallHeld?.();
       await held;
       sidecarUp = false; // the held call and every canary retry after it find a dead sidecar
     }
@@ -269,6 +279,7 @@ describe("KgRefresh durable workflow", () => {
     fetchSnapshotShaFailure = false;
     gateOrder = [];
     holdNextMcpCall = null;
+    onMcpCallHeld = null;
     reserveFailuresRemaining = 0;
     persistHold = null;
     forceReserveFailure = false;
@@ -550,6 +561,15 @@ describe("KgRefresh durable workflow", () => {
     totalDeadlineMs: TOTAL_DEADLINE_MS,
   });
 
+  // The bootstrap deadline is short and the total deadline is long against the work, for a scenario that must act
+  // after the bootstrap deadline and cannot be ordered against a later short deadline: a gate holds only a lower bound.
+  const BOOTSTRAP_ONLY_TOTAL_DEADLINE_MS = 30_000;
+  const bootstrapOnlyWorkflow = createKgRefreshWorkflow({
+    ...workflowDeps,
+    bootstrapDeadlineMs: BOOTSTRAP_DEADLINE_MS,
+    totalDeadlineMs: BOOTSTRAP_ONLY_TOTAL_DEADLINE_MS,
+  });
+
   const kgRepo = createKgRepo({ workflowName: "KgRefresh" });
   const starter = restate.service({
     name: "KgRefreshStarter",
@@ -581,17 +601,21 @@ describe("KgRefresh durable workflow", () => {
 
   let envs: Map<string, RestateTestEnvironment>;
   let deadlineEnvs: Map<string, RestateTestEnvironment>;
+  let bootstrapEnvs: Map<string, RestateTestEnvironment>;
   beforeAll(async () => {
     envs = await startVariants([workflow, kgRepo, starter, flyMachineProfile]);
     deadlineEnvs = await startVariants([deadlineWorkflow, kgRepo, starter, flyMachineProfile]);
+    bootstrapEnvs = await startVariants([bootstrapOnlyWorkflow, kgRepo, starter, flyMachineProfile]);
   }, 120_000);
   afterAll(async () => {
     if (envs) await stopAll(envs);
     if (deadlineEnvs) await stopAll(deadlineEnvs);
+    if (bootstrapEnvs) await stopAll(bootstrapEnvs);
   });
 
   // A scenario that does not test a deadline runs in envFor, whose deadlines are long against its own work.
   // A scenario that tests a deadline runs in deadlineEnvFor, which serves the short deadlines.
+  // A scenario that tests the bootstrap deadline only runs in bootstrapEnvFor, whose total deadline is long.
   function envFor(label: string): RestateTestEnvironment {
     const env = envs.get(label);
     if (!env) throw new Error(`missing Restate variant ${label}`);
@@ -601,6 +625,12 @@ describe("KgRefresh durable workflow", () => {
   function deadlineEnvFor(label: string): RestateTestEnvironment {
     const env = deadlineEnvs.get(label);
     if (!env) throw new Error(`missing Restate deadline variant ${label}`);
+    return env;
+  }
+
+  function bootstrapEnvFor(label: string): RestateTestEnvironment {
+    const env = bootstrapEnvs.get(label);
+    if (!env) throw new Error(`missing Restate bootstrap variant ${label}`);
     return env;
   }
 
@@ -1413,7 +1443,7 @@ describe("KgRefresh durable workflow", () => {
 
   // ---- AII-1066: bounded reads (watch-N, reconcile-N, watch-cancel-N, reconcile-cancel-N) ----
   // A read that fails on each attempt is "no new evidence" and never holds the workflow past its
-  // deadline. The deadline workflow serves a 1 s bootstrap deadline and a 2.6 s total deadline.
+  // deadline. The deadline workflow serves a 1 s bootstrap deadline and a 1.8 s total deadline.
   describe("AII-1066: a failing read does not hold the workflow", () => {
     it.each(VARIANTS.map(([label]) => label))("a status read that fails on each attempt ends at bootstrap_timeout, cancels the run (%s)", async (label) => {
       const triggerId = newTriggerId();
@@ -1557,13 +1587,13 @@ describe("KgRefresh durable workflow", () => {
   }, 15_000);
 
   it.each(VARIANTS.map(([label]) => label))("AII-1125: a started read holds off the bootstrap timeout until the machine ends dispatch_lost (%s)", async (label) => {
-    const env = deadlineEnvFor(label);
+    const env = bootstrapEnvFor(label);
     const triggerId = newTriggerId();
     makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "fly-machines" });
-    // Five started reads span more than the 1 s bootstrap deadline (300 ms interval) but not the total.
+    // Twelve started reads always span more than the 1 s bootstrap deadline (a sleep never fires early); the long total deadline is no limit.
     const started = { state: "started" as const, exit: null };
     machineReads.set(triggerId, [
-      started, started, started, started, started,
+      ...Array.from({ length: 12 }, () => started),
       { state: "ended", exit: { exitCode: 137, signal: 9, oomKilled: true, timestamp: 1 } },
     ]);
     const closedBefore = closeRowCalls.length;
@@ -1645,14 +1675,18 @@ describe("KgRefresh durable workflow", () => {
       const env = envFor(label);
       const triggerId = newTriggerId();
       const runId = runIdCounter++;
+      const held = gate("W6 first status read");
       makeScenario(triggerId, {
         dispatchOutcome: "accepted", runId, executionMode: "github-actions",
-        runStatusSequence: [{ status: "in_progress", conclusion: null }],
+        runStatusSequence: [{ status: "in_progress", conclusion: null }], tickGate: held,
       });
 
       const done = runWorkflow(env.baseUrl(), triggerId);
-      await eventually(() => scenarios.get(triggerId)!.runStatusCalls >= 1, (ok) => ok, { label: "durable effect" });
+      // The first status read is held, so no tick can fire while the report is sent: the report is resolved
+      // before the workflow races its signal arms, in both variants. The order is fixed by the fake, not a tick.
+      await held.reached();
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      held.release();
 
       const outcome = await done;
       expect(outcome.ok).toBe(true);
@@ -1892,7 +1926,7 @@ describe("KgRefresh durable workflow", () => {
   it.each(VARIANTS.map(([label]) => label))(
     "AII-1029: GHA backend — in_progress status reads with no progress call outlive the bootstrap deadline (%s)",
     async (label) => {
-      const env = deadlineEnvFor(label);
+      const env = bootstrapEnvFor(label);
       const triggerId = newTriggerId();
       const held = gate("AII-1029 first status read");
       const scenario = makeScenario(triggerId, {
@@ -1900,7 +1934,7 @@ describe("KgRefresh durable workflow", () => {
         runStatusSequence: [{ status: "in_progress", conclusion: null }], tickGate: held,
       });
       const done = runWorkflow(env.baseUrl(), triggerId);
-      // Past the 1s bootstrap deadline and still before the total deadline.
+      // Past the 1s bootstrap deadline; the total deadline is long, so no limit is raced.
       await pastDeadlineAtTick(scenario, BOOTSTRAP_DEADLINE_MS, "bootstrap deadline");
       held.release();
       // A second status read means the wait went on past the bootstrap deadline.
@@ -2094,7 +2128,7 @@ describe("KgRefresh durable workflow", () => {
   it.each(VARIANTS.map(([label]) => label))(
     "AII-1010: cancel with no run ever found completes within the bootstrap window, not the total deadline (%s)",
     async (label) => {
-      const env = deadlineEnvFor(label);
+      const env = bootstrapEnvFor(label);
       const triggerId = newTriggerId();
       const held = gate("cancel first title lookup");
       const heldCancelWait = gate("cancel phase title lookup");
@@ -2114,8 +2148,8 @@ describe("KgRefresh durable workflow", () => {
       await done;
       expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
       expect(scenarios.get(triggerId)!.cancelCalls).toBe(0);
-      // Bounded by cancel time + BOOTSTRAP_DEADLINE_MS (1s); the total deadline is 2.6s after dispatch.
-      expect(Date.now() - started).toBeLessThan(TOTAL_DEADLINE_MS);
+      // No elapsed-time assertion: the total deadline here is 30 s and the test timeout 15 s, so a cancel that
+      // ended at the total deadline could not pass. The cancel phase ended at the bootstrap window.
     },
     15_000,
   );
@@ -2228,7 +2262,7 @@ describe("KgRefresh durable workflow", () => {
 
   // ---- W13/W14: RailGateError conversion and revert ----
   it.each(VARIANTS.map(([label]) => label))(
-    "W13: a RailGateError at verify reverts once and fails, status named verify beforehand (%s)",
+    "W13: a RailGateError at verify reverts once and fails, the run journaled verify beforehand (%s)",
     async (label) => {
       const env = envFor(label);
       const triggerId = newTriggerId();
@@ -2237,44 +2271,41 @@ describe("KgRefresh durable workflow", () => {
       const done = runWorkflow(env.baseUrl(), triggerId);
       await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
 
-      // verifyGate's first check (the "answers" gate) is a synchronous env-var read with no
-      // suspension point of its own, so the step is set and the gate fails within the same
-      // tick — well under a 10ms poll's granularity. Verify's canary is its first call into
-      // the rail fakes, so hold that sidecar call open until the poll has actually observed
-      // "verify", then let the sidecar die so the gate fails, at the canary, as a real one would.
-      const verifyLatch = boundedLatch(STATUS_LATCH_MAX_MS);
-      const releaseVerifyGate = verifyLatch.release;
+      // Hold verify's canary, the `kg_hybrid_search` call. The mcpToolCall fake lets fetch's
+      // `kg_neighbors` served-stamp read through and parks only the canary, signalling `canaryHeld`
+      // as it parks, so the body knows the run is inside verify without polling. While it is held
+      // the body reads `status` once and asserts it answers `verify` (form a); then it releases the
+      // latch and the sidecar dies so the gate fails at the canary, as a real one would. The bound
+      // is a safety net, not the wait.
+      const canaryHeld = gate("verify canary (kg_hybrid_search) held");
+      const verifyLatch = boundedLatch(W13_LATCH_MAX_MS);
       holdNextMcpCall = verifyLatch.promise;
-
-      // Poll `status` concurrently with the run so it observes the "verify" step while the
-      // workflow is still executing it — a single point-in-time check would race the failure
-      // path, which reverts and completes soon after. Collecting every observed step over
-      // the run's lifetime proves `ctx.set("step", "verify")` was visible before the failure,
-      // the same timing-sensitive polling pattern `eventually()` uses elsewhere in this suite.
-      const observedSteps = new Set<string | null>();
-      let polling = true;
-      const statusPoll = (async () => {
-        while (polling) {
-          try {
-            const status = await callWorkflow<{ step: string | null }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
-            observedSteps.add(status.step);
-            if (status.step === "verify") releaseVerifyGate();
-          } catch {
-            // the workflow may be mid-transition between invocations; retry on the next tick.
-          }
-          await new Promise((resolve) => setTimeout(resolve, 10)); // restate-test-allow: samples the step over the run's lifetime
-        }
-      })();
+      // canaryHeld is only a signal (no release()); verifyLatch does the park and release.
+      onMcpCallHeld = () => void canaryHeld.wait();
 
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await canaryHeld.reached();
+      const heldStatus = await callWorkflow<{ step: string | null }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
+      expect(heldStatus.step).toBe("verify");
+      // The journal assertion below still pins the order: swap, verify, revert, failed.
+      verifyLatch.release();
+
       const outcome = await done;
-      polling = false;
-      releaseVerifyGate(); // no-op if already released; unblocks the poll loop regardless
-      await statusPoll;
+      const status = await callWorkflow<{ step: string | null }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
+      const runs = await eventually(
+        () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`),
+        (r) => r.length === 1,
+        { label: "the KgRefresh run invocation" },
+      );
+      const journaledSteps = (await journalEntries(env.adminAPIBaseUrl(), runs[0].id as string)).flatMap((entry) => {
+        const set = JSON.parse(String(entry.entry_json ?? "null"))?.Command?.SetState as { key: string; value: number[] } | undefined;
+        return set?.key === "step" ? [JSON.parse(Buffer.from(set.value).toString("utf8")) as string] : [];
+      });
 
       expect(outcome.ok).toBe(false);
       expect(outcome.gate).toBe("canary");
-      expect(observedSteps.has("verify"), `step "verify" was not observed within the ${STATUS_LATCH_MAX_MS}ms latch bound`).toBe(true);
+      expect(status.step).toBe("failed");
+      expect(journaledSteps.slice(journaledSteps.indexOf("swap"))).toEqual(["swap", "verify", "revert", "failed"]);
       // swap's own restart (1) plus revertRail's restart while reverting (1).
       expect(restartCallCount).toBe(2);
       expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("canary");
@@ -2308,7 +2339,7 @@ describe("KgRefresh durable workflow", () => {
       await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
 
       // Poll `status` concurrently with the run so it observes the "swap" step while the
-      // workflow is still executing it, mirroring W13's polling pattern.
+      // workflow is still executing it.
       const observedSteps = new Set<string | null>();
       let polling = true;
       const statusPoll = (async () => {

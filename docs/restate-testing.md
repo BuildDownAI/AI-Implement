@@ -211,12 +211,11 @@ Known gaps, for the next issue that touches the area:
 `review-fix-attempt.restate.test.ts` (AII-796) and `review-fix-pr.restate.test.ts` (AII-800)
 prove the durable workflow and PR coordinator against fully in-memory `store`/`worker`/
 `finalizer` doubles — fast, but they never exercise `SqliteReviewFixAttemptStore`'s real
-admission SQL, `review-fix-finalize.ts`'s real approval-effect idempotency, `review-fix-inbox.ts`'s
-real delivery ledger, or `GithubReviewFixWorker`/`createReviewFixGithubAdapter`'s real
+admission SQL, `review-fix-finalize.ts`'s real approval-effect idempotency, or `GithubReviewFixWorker`/`createReviewFixGithubAdapter`'s real
 reconciliation logic. `review-fix-pilot.restate.test.ts` composes those production modules for
 real — the same `createReviewFixPR` / `createReviewFixAttempt` / `SqliteReviewFixAttemptStore` /
 `createReviewFixFinalizer` / `GithubReviewFixWorker` / `createReviewFixGithubAdapter` /
-`ReviewFixDeliveryPump` a live pilot would run — and fakes only the external GitHub transport,
+`createReviewFixIngressClient` a live pilot would run — and fakes only the external GitHub transport,
 the GitHub REST fetch layer, and the PR coordinator's admission-eligibility/pending-feedback
 reads (the same seams `review-fix-production.ts` itself calls out to GitHub for). Both files stay
 in the tree; this one does not re-prove the fixed 5-second coalescing window's exact timing,
@@ -228,10 +227,11 @@ which AII-800's suite already covers precisely against a faster-to-assert fake.
 |---|---|---|
 | Admission SQL (capacity, PR budget, pause, 30-finding cap, re-admission of a re-reported finding) is race-free and idempotent under real `dispatch_admissions`/`dispatch_budget_entries`/`review_fix_attempts` writes | Real engine + real SQLite | every "Admission:" scenario |
 | A crashed `ctx.run` step (admission commit before journal, result commit before ACK) converges to exactly one durable effect on engine retry | Real engine + real SQLite | the two `alwaysReplay`-only "crash window" scenarios, `crashAfterFirstCall` |
-| A crashed inbox delivery (HTTP ack lost after the real handler ran) redelivers to exactly one outcome | Real engine + real SQLite + real `ReviewFixDeliveryPump`/facade | "inbox commit before ACK" |
+| A feedback forward whose HTTP ack is lost after the real handler ran, retried under the same idempotency key, yields exactly one outcome | Real engine + real SQLite + real ingress client | "lost acknowledgement" |
 | Authenticated runner activity enforces the 16 KiB event and 10 MiB attempt caps, records sequence gaps/final markers, and still accepts cycle evidence after the stream limit | Real callback validator + real SQLite activity/evidence stores; admission uses the real engine, while runner payloads are simulated | "authenticated activity intake preserves gaps" |
-| Authenticated runner result intake commits one durable inbox delivery, acknowledges identical retries, and records conflicting retries without approval | Real callback validator + real SQLite result/inbox stores + real delivery pump and engine; runner result payloads are simulated | "authenticated result ingress commits one inbox delivery" |
-| A crashed approval-effect write reconciles via `retryApprovalEffect` without a second GitHub write | Real engine + real SQLite + real finalizer, simulated GitHub write (fake `fetch`) | "final approval effect before acknowledgement" |
+| Authenticated runner result intake forwards over the ingress, acknowledges identical retries, and records conflicting retries without approval | Real callback validator + real ingress client + real SQLite result store and engine; runner result payloads are simulated | "authenticated result ingress" |
+| A crashed `apply-approval-once` step is retried by the engine and leaves exactly one approval (the adapter's upsert) | Real engine + real SQLite + real finalizer, simulated GitHub write (fake `fetch`) | "a crash after the approval write is retried by the engine" |
+| A closed PR and an operator cancel forward `cancel` over the ingress client under `<attemptId>.closed` / `<attemptId>.cancel`; a repeat key is absorbed | Real engine + real SQLite + real ingress client | "a closed PR revokes authority and forwards cancel", "an operator cancel forwards" |
 | Cancellation whose accepted GitHub stop response is lost preserves occupancy across SDK endpoint and Restate container restart until the exact run is verified stopped | Real engine + real SQLite, simulated GitHub Actions cancel/status API | "a lost cancellation acknowledgement and endpoint restart" |
 | Launch response loss, uncertain-launch reconciliation (including the two-minute-equivalent unknown-launch alert actually firing), definitive rejection, duplicate/conflicting result intake, a stale result delivered after the attempt's final outcome (alerts, never rewrites the recorded outcome), GitHub-success-without-result, cancel/closed-PR/unverifiable-termination | Real engine + real SQLite + real worker/finalizer adapters, simulated GitHub Actions API (fake transport/fetch) | the matching named scenarios |
 | GitHub-success-without-result specifically never approves *before* the deadline, not just *at* it | Real engine + real SQLite, checked directly against `review_fix_attempts.terminal_outcome_json`/`accepted_result_json` and `dispatch_admissions.released_at` partway through a real (short) deadline window — `RestateTestEnvironment` has no virtual-clock/timer-control API to fast-forward past the wait instead (confirmed against its type declarations), so this mid-window SQLite read, not a simulated clock, is the deterministic "not yet" proof | "GitHub success without a stored result never approves and stops without approval at the deadline" |
@@ -380,8 +380,11 @@ did not test). Scenarios follow four rules, and
    ```
 
 4. **A scenario that does not test a deadline runs with deadlines that are long against its own work; a scenario that
-   tests a deadline uses its own short-deadline environment.** `kg-refresh-workflow.restate.test.ts` serves both:
-   `envFor(label)` (30 s / 60 s) and `deadlineEnvFor(label)` (the short deadlines).
+   tests a deadline uses its own short-deadline environment.** `kg-refresh-workflow.restate.test.ts` serves three:
+   `envFor(label)` (30 s / 60 s), `deadlineEnvFor(label)` (the short deadlines), and `bootstrapEnvFor(label)` (the 1 s
+   bootstrap deadline with a 30 s total, for a scenario that must act after the bootstrap deadline and has no upper bound to beat). The short deadlines are a 1 s bootstrap and a 1.8 s total, with a 100 ms watch tick. The
+   bootstrap deadline is the one that cannot shrink: AII-1125's started read must arrive inside it, AII-1111 raised a 400 ms
+   bootstrap to avoid that race, and AII-1028 measured invocation start delays up to 1.08 s on a loaded runner.
 
 `settle(ms)` is the only permitted wait, and only before a **negative** assertion ("nothing more happens"). A raw
 `setTimeout(` is allowed only inside a fake dependency that simulates a slow call, carrying a
@@ -394,7 +397,7 @@ This is the gated race test pattern. A scenario of an owned-run wait sets the or
 * **Gate a fake.** A fake dependency awaits a gate that the test holds (`gate` in `harness.ts`). The gate reports when the workflow reaches it. The test releases it at the exact point.
 * **Wait for a step, then act.** Before the test sends a signal, it waits for the named step with `waitForStep`.
 * **Order against a fake, not a test-body event.** In a scenario that asserts the order of a signal against a fake's answer, the fake changes its answer only on state the workflow controls (for example, the wait-call number the fixture passes in), or on a gate the test releases after the workflow has acted on the signal. It never changes on a test-body event alone: `send` returning means the signal was delivered, not consumed, and the owned-run wait reads status before it races the signals. Example: [AII-1049](https://linear.app/eudoxus/issue/AII-1049/owned-run-wait-scenario-a-second-call-after-report-returns-ended-can), the `owned-run-wait.restate.test.ts` scenario "a second call after report returns ended", where a flag set after `send` returned still raced.
-* **Deadline scenarios.** Hold the workflow at a gate until the deadline has passed, then release it. Prove the scenario fails when the deadline branch, or the `peek` at the deadline, is removed.
+* **Deadline scenarios.** Hold the workflow at a gate until the deadline has passed, then release it. Prove the scenario fails when the deadline branch, or the `peek` at the deadline, is removed. A scenario that must act after one deadline and before a later one runs where the later deadline is long against its work, because a gate can hold only the lower bound.
 * **Teardown.** Await the workflow's terminal output before a test ends.
 * **Tiers.** The deadline decision is tested in the unit tier with no timers. The Restate tier proves the journal, replay, and exclusivity.
 * **Signals from the test body are not the producer proof.** A scenario may resolve a promise from the test body. Each promise also has a `contract: <Workflow>.<promise>` test in the default suite, and `src/__tests__/restate-producer-guard.test.ts` fails when one is missing.
