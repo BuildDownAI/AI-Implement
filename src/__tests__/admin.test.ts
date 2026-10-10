@@ -2139,6 +2139,35 @@ describe("admin kg materialize-mode", () => {
     expect(JSON.parse(get.body).direct).toBe(false);
   });
 
+  it("GET /api/kg/execution-mode reports the default and its source, 501 without KG refresh", async () => {
+    const token = await login("secret");
+    expect((await kgRequest("/api/kg/execution-mode", "GET", token, undefined, false)).statusCode).toBe(501);
+    const res = await kgRequest("/api/kg/execution-mode", "GET", token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ mode: "github-actions", source: "default" });
+  });
+
+  it("POST /api/kg/execution-mode persists for an admin, and a follow-up GET reports source db", async () => {
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/execution-mode", "POST", token, { mode: "fly-machines" });
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ mode: "fly-machines", source: "db" });
+    const get = await kgRequest("/api/kg/execution-mode", "GET", token);
+    expect(JSON.parse(get.body)).toEqual({ mode: "fly-machines", source: "db" });
+  });
+
+  it.each([{ mode: "both" }, { mode: "local-docker" }, { mode: 3 }, {}])("POST /api/kg/execution-mode rejects %j with 400", async (body) => {
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/execution-mode", "POST", token, body);
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("POST /api/kg/execution-mode refuses a non-admin session with 403", async () => {
+    const token = adminSession.createSession({ email: "reader@eudoxus.ai", sub: "google|reader", provider: "google", name: "Reader" });
+    const res = await kgRequest("/api/kg/execution-mode", "POST", token, { mode: "fly-machines" });
+    expect(res.statusCode).toBe(403);
+  });
+
   it("rejects an unauthenticated request with 401", async () => {
     const req = new MockRequest("/api/kg/materialize-mode", "GET");
     const res = new MockResponse();
@@ -5653,7 +5682,8 @@ describe("admin sessions — kg-refresh destroy", () => {
   it("destroys the machine and returns 200 for an in-flight kg-refresh job", async () => {
     const token = await login("secret");
     const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
-    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel" });
+    log.setJobMachineNonce(jobId, "nonce-kg");
+    log.setJobMachineId(jobId, "m-kg-cancel");
     log.updateJobMachineId(jobId, "m-kg-cancel");
 
     const res = await deleteSession("m-kg-cancel", token);
@@ -5665,7 +5695,8 @@ describe("admin sessions — kg-refresh destroy", () => {
   it("stamps the job row operator_cancelled", async () => {
     const token = await login("secret");
     const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
-    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel3" });
+    log.setJobMachineNonce(jobId, "nonce-kg");
+    log.setJobMachineId(jobId, "m-kg-cancel3");
     log.updateJobMachineId(jobId, "m-kg-cancel3");
 
     await deleteSession("m-kg-cancel3", token);
@@ -5678,7 +5709,8 @@ describe("admin sessions — kg-refresh destroy", () => {
   it("sends exactly one notification and does not call provider.clearWorkingState (regression pin)", async () => {
     const token = await login("secret");
     const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
-    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel4" });
+    log.setJobMachineNonce(jobId, "nonce-kg");
+    log.setJobMachineId(jobId, "m-kg-cancel4");
     log.updateJobMachineId(jobId, "m-kg-cancel4");
 
     const clearWorkingState = vi.spyOn(provider, "clearWorkingState");
@@ -5691,7 +5723,8 @@ describe("admin sessions — kg-refresh destroy", () => {
   it("Fly-mode kg-refresh cancel destroys the machine and also calls the workflow cancel, tolerating a non-200", async () => {
     const token = await login("secret");
     const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines", dispatchId: "t-fly" });
-    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel5" });
+    log.setJobMachineNonce(jobId, "nonce-kg");
+    log.setJobMachineId(jobId, "m-kg-cancel5");
     log.updateJobMachineId(jobId, "m-kg-cancel5");
     const cancel = vi.fn(async () => ({ status: 409, body: { error: "no-refresh-in-flight" } }));
     const res = await deleteSession("m-kg-cancel5", token, { trigger: vi.fn(), status: vi.fn(), cancel });

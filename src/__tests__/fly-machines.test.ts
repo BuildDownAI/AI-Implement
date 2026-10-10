@@ -7,6 +7,8 @@ import {
   startMachine,
   updateMachine,
   clearMachineEnv,
+  CLEAR_MACHINE_ENV_MAX_MS,
+  MAX_RATE_LIMIT_WAIT_MS,
   waitForMachineSettled,
   destroyMachine,
   waitForMachine,
@@ -1214,6 +1216,39 @@ describe("clearMachineEnv", () => {
     expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
     await vi.advanceTimersByTimeAsync(200);
     await expect(p).resolves.toBeUndefined();
+  });
+
+  it("caps a 429 retry-after at the maximum wait", async () => {
+    vi.useFakeTimers();
+    const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
+    const cleared = { ...mockMachine, config: { ...mockMachine.config, env: {} } };
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(ok(withEnv))
+      .mockResolvedValueOnce(fail(429, "rate limit", { "retry-after": "3600" }))
+      .mockResolvedValueOnce(ok(cleared));
+    const p = clearMachineEnv(TOKEN, APP, "machine-123");
+    await vi.advanceTimersByTimeAsync(MAX_RATE_LIMIT_WAIT_MS - 100);
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(200);
+    await expect(p).resolves.toBeUndefined();
+  });
+
+  it("treats a 409 'machine is replacing' without the concurrent-update text as a wait", async () => {
+    const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
+    const cleared = { ...mockMachine, config: { ...mockMachine.config, env: {} } };
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(ok(withEnv))
+      .mockResolvedValueOnce(fail(409, '{"error":"machine is replacing"}'))
+      .mockResolvedValueOnce(ok(cleared));
+    await expect(clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast)).resolves.toBeUndefined();
+  });
+
+  it("still throws on an unrelated 409", async () => {
+    const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(ok(withEnv))
+      .mockResolvedValueOnce(fail(409, '{"error":"something else"}'));
+    await expect(clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast)).rejects.toThrow(/409/);
   });
 
   it("waits 2 s on a 429 without retry-after", async () => {

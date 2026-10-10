@@ -3,7 +3,8 @@ import { randomUUID } from "node:crypto";
 import * as restate from "@restatedev/restate-sdk";
 import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { FLY_MACHINE_PROFILE_DEFAULTS, createFlyMachineProfile, type FlyMachineProfileConfig, type FlyMachineProfileDeps, type KeptMachineState } from "../../restate/fly-machine-profile.js";
+import { CLEAR_MACHINE_ENV_MAX_MS } from "../../fly-machines.js";
+import { FLY_MACHINE_PROFILE_DEFAULTS, OBJECT_ABORT_TIMEOUT_MS, OBJECT_INACTIVITY_TIMEOUT_MS, createFlyMachineProfile, type FlyMachineProfileConfig, type FlyMachineProfileDeps, type KeptMachineState } from "../../restate/fly-machine-profile.js";
 import { VARIANTS, callObject, callService, eventually, queryInvocations, startVariants, stopAll } from "./harness.js";
 
 // `set` is ingressPrivate: this forwarder plays the tools service's part.
@@ -66,6 +67,16 @@ function fakeFly(idleTimeoutMsOverride?: number): FakeFly {
 
 interface View { config: FlyMachineProfileConfig; source: "profile" | "default" }
 const defaults = FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"];
+
+describe("FlyMachineProfile object options", () => {
+  it("sets timeouts that outlast one clearMachineEnv call", () => {
+    const def = createFlyMachineProfile(fakeFly()) as unknown as { options?: { inactivityTimeout?: number; abortTimeout?: number } };
+    expect(def.options?.inactivityTimeout).toBe(OBJECT_INACTIVITY_TIMEOUT_MS);
+    expect(def.options?.abortTimeout).toBe(OBJECT_ABORT_TIMEOUT_MS);
+    expect(OBJECT_INACTIVITY_TIMEOUT_MS).toBeGreaterThan(CLEAR_MACHINE_ENV_MAX_MS);
+    expect(OBJECT_ABORT_TIMEOUT_MS).toBeGreaterThanOrEqual(OBJECT_INACTIVITY_TIMEOUT_MS);
+  });
+});
 
 describe("FlyMachineProfile", () => {
   let envs: Map<string, RestateTestEnvironment>;
