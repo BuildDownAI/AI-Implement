@@ -186,6 +186,8 @@ export function mergeProfile(base: FlyMachineProfileConfig | null, patch: Partia
 /**
  * One scrub call (`clearMachineEnv`) is bounded by CLEAR_MACHINE_ENV_MAX_MS in fly-machines.ts (450 s: 3 passes x (60 s settle +
  * 30 s capped 429 sleep + 60 s settle)), plus HTTP time. The server defaults (about 1 minute each) would abort it.
+ * The bound is per call, not per scrub step: SCRUB_RETRY allows five attempts, so a Fly that stays at the worst case on every attempt
+ * could still outlast the abort timeout. An aborted invocation is retried by the server, so that costs retry budget, not correctness.
  */
 export const OBJECT_INACTIVITY_TIMEOUT_MS = 10 * 60 * 1000;
 export const OBJECT_ABORT_TIMEOUT_MS = 15 * 60 * 1000;
