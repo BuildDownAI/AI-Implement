@@ -292,7 +292,7 @@ export type KgExecutionBackend = "github-actions" | "fly-machines";
 
 export interface KgExecutionModeStatus {
   mode: KgExecutionBackend;
-  source: "db" | "env" | "default";
+  source: "db" | "default";
 }
 
 const KG_EXECUTION_MODE_SETTING_KEY = "kg_execution_mode";
