@@ -67,7 +67,7 @@ import { classifyFlyMachine, classifyLocalContainer, destroyMachineRecorded } fr
 import { createMachine, getMachine, listMachines, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
 import { isDurableRunnerMachine, safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
 import type { ReaperHelpers } from "./reaper.js";
-import { seedKgMaterializeDirectFromEnv, getRunnerMode, getFlySecretsMinVersion, getFlyProcessLevelSecrets, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
+import { seedKgMaterializeDirectFromEnv, seedKgExecutionModeFromEnv, getRunnerMode, getFlySecretsMinVersion, getFlyProcessLevelSecrets, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
 import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
@@ -4977,6 +4977,7 @@ async function main(): Promise<void> {
   initSettingsTable();
   seedKgBaseRepoFromEnv(process.env.KG_BASE_REPO); // AII-633: seeds once, inert thereafter
   seedKgMaterializeDirectFromEnv(process.env.KG_MATERIALIZE_DIRECT); // AII-1109: seeds once, inert thereafter
+  seedKgExecutionModeFromEnv(process.env.KG_EXECUTION_MODE); // seeds once, inert thereafter
   seedLinearPickupLabelFromEnv(process.env.LINEAR_PICKUP_LABEL); // AII-694: seeds once, inert thereafter
   initAccessEntriesTable();
   initReconciliationTable();

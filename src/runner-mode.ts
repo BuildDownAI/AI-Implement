@@ -8,6 +8,7 @@ declare global {
       PORT?: string;
       FLY_PROCESS_LEVEL_SECRETS?: string;
       KG_MATERIALIZE_DIRECT?: string;
+      KG_EXECUTION_MODE?: string;
     }
   }
 }
@@ -285,6 +286,77 @@ export function setKgMaterializeDirect(enabled: boolean): void {
   getDb()
     .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
     .run(KG_MATERIALIZE_DIRECT_SETTING_KEY, String(enabled));
+}
+
+export type KgExecutionBackend = "github-actions" | "fly-machines";
+
+export interface KgExecutionModeStatus {
+  mode: KgExecutionBackend;
+  source: "db" | "default";
+}
+
+const KG_EXECUTION_MODE_SETTING_KEY = "kg_execution_mode";
+
+/** Accepts only the two backends; blank or unknown is undefined so an empty `KG_EXECUTION_MODE=` seeds nothing. */
+export function parseKgExecutionModeEnv(val: string | undefined): KgExecutionBackend | undefined {
+  const v = val?.trim();
+  return v === "github-actions" || v === "fly-machines" ? v : undefined;
+}
+
+/**
+ * The KG refresh backend chosen on the KG page. Priority: DB row > default. The default is
+ * today's behaviour: Fly when it is configured (`flyConfigured`), else GitHub Actions.
+ * KG_EXECUTION_MODE only seeds the row (see seedKgExecutionModeFromEnv).
+ */
+export function getKgExecutionMode(flyConfigured = false): KgExecutionModeStatus {
+  try {
+    const row = getDb()
+      .prepare("SELECT value FROM settings WHERE key = ?")
+      .get(KG_EXECUTION_MODE_SETTING_KEY) as { value: string } | undefined;
+    const parsed = parseKgExecutionModeEnv(row?.value);
+    if (parsed) return { mode: parsed, source: "db" };
+  } catch {
+    // DB unavailable — fall through to default
+  }
+  return { mode: flyConfigured ? "fly-machines" : "github-actions", source: "default" };
+}
+
+/** Seeds the row from KG_EXECUTION_MODE on first boot only; inert once a row exists. */
+export function seedKgExecutionModeFromEnv(envValue: string | undefined): void {
+  const parsed = parseKgExecutionModeEnv(envValue);
+  if (parsed === undefined) return;
+  getDb()
+    .prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)")
+    .run(KG_EXECUTION_MODE_SETTING_KEY, parsed);
+}
+
+export function setKgExecutionMode(mode: KgExecutionBackend): void {
+  getDb()
+    .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+    .run(KG_EXECUTION_MODE_SETTING_KEY, mode);
+}
+
+export interface KgBackendResolution {
+  mode: KgExecutionBackend | "local-docker";
+  source: "runner-mode" | "kg-setting" | "default" | "fly-unconfigured";
+}
+
+/**
+ * Pure KG refresh backend rule: runner mode, then the KG setting, then whether Fly is configured.
+ * `shadow` ("both") collapses to the setting's own mode: two concurrent ingests race on the snapshot commit.
+ * An unconfigured Fly falls back to GitHub Actions (retrying cannot configure Fly).
+ */
+export function resolveKgBackend(
+  runnerMode: RunnerMode,
+  setting: KgExecutionModeStatus,
+  flyConfigured: boolean,
+): KgBackendResolution {
+  const path = resolveExecutionPath(runnerMode, setting.mode);
+  const mode = path === "both" ? setting.mode : path;
+  if (mode === "fly-machines" && !flyConfigured) return { mode: "github-actions", source: "fly-unconfigured" };
+  if (runnerMode !== "default" && runnerMode !== "shadow") return { mode, source: "runner-mode" };
+  const source = setting.source === "db" ? "kg-setting" : setting.source;
+  return { mode, source };
 }
 
 export type KgFlyCpuKind = "auto" | "shared" | "performance";

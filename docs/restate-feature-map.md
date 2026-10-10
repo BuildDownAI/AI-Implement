@@ -83,7 +83,7 @@ and handler types that the typed clients use are in `src/restate/kg-refresh-type
 | Admin API: registration with drain check | shared | shared | shared | `endpoint.ts` |
 | Admin API: SQL introspection (`sys_invocation` …) | shared | shared | shared | deploy drain, census |
 | Admin API: cancel / kill / purge / restart | no | no | no | |
-| Two-runtime scenario tests (container + binary, `alwaysReplay` / `disableRetries`) | yes | yes | yes | |
+| Binary-runtime scenario tests (`alwaysReplay` / `disableRetries`) | yes | yes | yes | |
 
 ### 2.1 Review-fix journal re-check (AII-1176)
 

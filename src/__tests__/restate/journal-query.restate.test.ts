@@ -5,7 +5,7 @@
 // Run with `npm run test:restate`; excluded from `npm test`.
 import { randomUUID } from "node:crypto";
 import * as restate from "@restatedev/restate-sdk";
-import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { readJournal } from "../../restate/journal-query.js";
 import { callWorkflow, eventually, settle, startVariants, stopAll } from "./harness.js";
@@ -34,7 +34,7 @@ const journalProbe = restate.workflow({
 });
 
 describe("readJournal against the real admin API", () => {
-  let envs: Map<string, RestateTestEnvironment>;
+  let envs: Map<string, RestateEnvironment>;
   beforeAll(async () => {
     envs = await startVariants([journalProbe, objectProbe]);
   }, 60_000);

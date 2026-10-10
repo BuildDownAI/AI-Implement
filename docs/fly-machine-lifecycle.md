@@ -64,20 +64,20 @@ sequenceDiagram
 
 | `claim.machineId` | `getMachine` answer | Action |
 |---|---|---|
-| null | not called | `createMachine`; `attach` after the step |
+| null | `listMachines` | adopt the live `durable-runner` machine tagged with this `dispatch_id` (`attach` records it); else `createMachine`; `attach` after the step |
 | set | `stopped` (or any state but the ones below) | `updateMachine` then `startMachine` |
 | set | `started`, same `dispatch_id` | already dispatched (a retry); return the machine, no `update` (it would reboot a started machine) |
 | set | `started`, other `dispatch_id` | throw (the hold is wrong); the step retries, then the run ends `dispatch_rejected` |
-| set | `destroyed` or 404 | `createMachine`; `attach` carries `replaces: <old id>` and replaces the object's machine id |
+| set | `destroyed` or 404 | adopt a live `durable-runner` machine tagged with this `dispatch_id` (not the kept id), else `createMachine`; `attach` carries `replaces: <old id>` and replaces the object's machine id |
 | set | lookup error | throw; the step retries |
 
 The `attach` for a replacement carries `replaces` (the destroyed machine's id), so the object accepts it at attempt 1; without it the attempt rule would refuse the swap and the new machine would run unrecorded and unreleased.
 
 `updateMachine` makes Fly replace the instance, so the dispatch does not `start` straight after it. It waits (Fly's `/wait?instance_id=<the update's instance_id>&state=stopped`, bounded at 60 s) for the replaced instance to reach `stopped`, then starts. Before the `update`, a machine still `replacing`, `starting` or `stopping` is polled until it is `stopped` or `started`. A 409 `concurrent update in progress` / `machine is replacing` on `update`, or a 412 `machine getting replaced` on `start`, waits the same way and repeats that call once inside the attempt; a window that outlasts the bound throws and the step retries. Fly event evidence, 2026-10-09 21:05Z: `update`/`replacing` 21:05:24.07Z, replaced instance `stopped` 21:05:25.21Z, `start` refused 412, the retry's `update` 21:05:25.38Z, 409. An `update` also resets the machine's event history, so the events do not name earlier updates.
 
-The step keeps `maxRetryAttempts: 3`, with a 3 s initial delay that doubles (`DISPATCH_RETRY_INITIAL_INTERVAL`), so retries can outlast a replace window. The reconcile read makes a retry after a lost ack safe. A lost ack after a `create` that had no kept machine to reconcile against creates a second machine; the first is left with no `durable_until` until the object records one (see Gaps).
+The step keeps `maxRetryAttempts: 3`, with a 3 s initial delay that doubles (`DISPATCH_RETRY_INITIAL_INTERVAL`), so retries can outlast a replace window. The reconcile read makes a retry after a lost ack safe. Every create path, with or without a kept machine, reconciles by dispatch id: it lists the sessions app's machines and adopts a live `durable-runner` machine whose `dispatch_id` metadata equals the dispatch id and whose id is not the kept machine's (a lookup error throws, so the step retries without creating), so a lost ack of a `create` does not make a second machine, including when a gone kept machine is replaced.
 
-The log line is `[kg-refresh] dispatched via Fly (reused machine <id>)` or `(created machine <id>)`, followed by `(waited <n> s for the replace)` when the launch waited at least a second; `get_session_machine` shows the metadata.
+The log line is `[kg-refresh] dispatched via Fly (reused machine <id>)`, `(created machine <id>)` or `(adopted machine <id>)` (an earlier try of the step created it), followed by `(waited <n> s for the replace)` when the launch waited at least a second; `get_session_machine` shows the metadata.
 
 ### Step names carry the attempt
 
@@ -89,6 +89,8 @@ The dispatch step is journaled as `dispatch-<attempt>`; the `step` state value s
 - **Release** runs in `finish` and in the `finally` of the outer catch, beside `KgRepo.release`. A duplicate send is a no-op in the object. It scrubs the machine with one `update` (`clearMachineEnv`) that clears the env and writes `durable_until` together, because a separate metadata write after the update is overwritten by it (Fly applies the update after the API answers, with the older metadata snapshot). It clears the hold, and schedules `expire` after the profile's `idleTimeoutMs` (default 7 days). If the scrub fails across its retry policy (five attempts, waits of 2, 4, 8 and 10 s) the machine is destroyed instead.
 
   The scrub waits for the machine to settle and verifies the result before it reports failure (AII-1190). `clearMachineEnv` polls until the machine is out of `replacing`, sends the update, waits again, and reads the machine back; it succeeds only when `config.env` is empty and the requested `durable_until` is present. A 409 `concurrent update in progress` and a 429 from Fly are waits, not failures: the 409 means an update is applying, the 429 waits the `retry-after` interval (else 2 s), and both re-read the machine instead of throwing. Only an env that is still set after the verified read, or a `replacing` state that outlasts the 60 s settle timeout, fails the attempt.
+
+  **Per-call bound.** The 429 sleep is capped at 30 s whatever `retry-after` says, and both Fly replace-window 409 messages (`concurrent update in progress`, `machine is replacing`) count as waits. One `clearMachineEnv` call therefore takes at most 3 passes x (60 s settle + 30 s 429 sleep + 60 s settle) = 450 s plus HTTP time. The `FlyMachineProfile` object sets `inactivityTimeout` to 10 minutes and `abortTimeout` to 15 minutes (the same option pair as `KgRefresh`), so a slow scrub call is not aborted by the server's 1-minute defaults. The bound is per call, not per scrub step: `SCRUB_RETRY` (unchanged) allows five attempts, so a Fly that stays at the worst case on every attempt (about 5 x 450 s plus 24 s of backoff, roughly 38 minutes) can still outlast the 15-minute abort timeout. The server then retries the aborted invocation, which costs retry budget but not correctness. The timeouts apply to every handler on the object.
 - **Expire** destroys the machine only if it was released at exactly `releasedAt` and nobody holds it since. A newer `claim` and `release` moves `lastUsedAt`, so the older timer does nothing.
 - **Reaper backstop (`durable-expired`).** The reaper skips every `purpose: durable-runner` machine, bypassing the dispatch_log rules, and destroys one only when `durable_until` is in the past. A missing `durable_until` keeps the machine; a corrupt one counts as expired. This covers an owner lost with the Restate store.
 
@@ -100,5 +102,4 @@ Revert the change. A kept machine left behind is destroyed by the reaper once it
 
 ## Gaps
 
-- A step retry after a lost ack of the first `create` (no kept machine yet) creates a second machine, because there is no recorded id to reconcile against. The orphan is a `durable-runner` with no `durable_until`, so the reaper does not remove it; destroy it by hand.
 - The resume path (attempt above 1) is AII-1032's; only attempt 1 is sent today.

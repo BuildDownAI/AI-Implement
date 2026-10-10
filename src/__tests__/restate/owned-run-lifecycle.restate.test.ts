@@ -6,7 +6,7 @@
 // Run with `npm run test:restate`; excluded from `npm test`.
 import * as restate from "@restatedev/restate-sdk";
 import type { WorkflowContext, WorkflowSharedContext } from "@restatedev/restate-sdk";
-import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll } from "vitest";
 import { cleanupOwnedRun, readOwnedRunStatus, reportOwnedRunOutcome, reserveOwnedRun } from "../../restate/owned-run-lifecycle.js";
 import { awaitOwnedRun, type OwnedRunStatus } from "../../restate/owned-run-wait.js";
@@ -127,7 +127,7 @@ const adapter: OwnedRunAdapter = {
   calls: (key) => [...world(key).calls],
 };
 
-let environments: Map<string, RestateTestEnvironment>;
+let environments: Map<string, RestateEnvironment>;
 
 beforeAll(async () => {
   environments = await startVariants([fixture]);

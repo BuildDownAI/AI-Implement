@@ -6688,11 +6688,12 @@ describe("postPushReviewStep review process gate", () => {
 
   it("an empty selection runs on claude-code-review, and still fails on ai-implement", async () => {
     const ok = await run(fixture({ runs: [actions("success")] }));
-    expect(ok.out.terminationReason).not.toBe("reviewer_selection_failed");
+    expect(ok.out.terminationReason).not.toBe("invalid_review");
     expect(ok.invoke).not.toHaveBeenCalled();
     const f = fixture({ runs: [actions("success")] });
     const blocked = await run(f, { reviewProcess: "ai-implement" });
     expect(blocked.out.approved).toBe(false);
+    expect(blocked.out.terminationReason).toBe("invalid_review");
     expect(f.posted.join("\n")).toContain("Project reviewer selection is empty");
   });
 });

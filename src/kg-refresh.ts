@@ -194,6 +194,12 @@ export interface KgRefreshStatus {
   runnerStep?: { id: string; status: StepStatus };
   /** Which materialize path the next refresh will stage (AII-602). */
   materialize: "rdflib" | "direct";
+  /** The backend the next refresh uses, the rule's source, and the KG page's own setting. */
+  executionMode: {
+    effective: "github-actions" | "fly-machines" | "local-docker";
+    source: "runner-mode" | "kg-setting" | "default" | "fly-unconfigured";
+    setting: "github-actions" | "fly-machines";
+  };
   /** The `kg-refresh` Fly machine profile the next refresh will use (`set_fly_machine_profile`). */
   flyMachine?: { cpuKind: "shared" | "performance"; cpus: number; memoryMb: number; idleTimeoutMs: number; source: "profile" | "default" };
   /** The `KgRefresh` workflow to look up in the journal: the in-flight run, else the last refresh's; null when neither is known. */

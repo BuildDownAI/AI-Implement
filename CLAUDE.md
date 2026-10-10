@@ -114,7 +114,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Run classification and autopsy | `src/completion-classification.ts`, `src/run-autopsy.ts` | |
 | Admin SSO / OIDC, roles, page grants | `src/oauth/`, `src/admin-session.ts`, `src/access-entries.ts`, `src/access-page-grants.ts` | [docs/access-model.md](docs/access-model.md) |
 | Admin SPA | `src/admin-ui/` | |
-| Restate engine: sidecar, endpoint, workflows, testcontainers job | `src/restate/endpoint.ts`, `src/restate/planning-run-workflow.ts`, `src/restate/` | [docs/restate.md](docs/restate.md), [docs/restate-testing.md](docs/restate-testing.md) |
+| Restate engine: sidecar, endpoint, workflows, test job | `src/restate/endpoint.ts`, `src/restate/planning-run-workflow.ts`, `src/restate/` | [docs/restate.md](docs/restate.md), [docs/restate-testing.md](docs/restate-testing.md) |
 
 **Diagram convention:** flow diagrams in `docs/`, issue bodies, and PR descriptions are mermaid (validated with `mermaid-cli` before commit); tabular data is a table; ASCII only in this file. Full rule: [docs/README.md](docs/README.md).
 
@@ -179,7 +179,7 @@ The operator's `GH_TOKEN` (or `GITHUB_TOKEN`) is injected as `AI_IMPLEMENT_DEP_T
 ```bash
 npm test          # vitest run
 npm run typecheck # tsc --noEmit
-npm run test:restate # src/__tests__/restate/**/*.restate.test.ts — two runtimes: container (Docker) or binary (`restate-server` from node_modules, `RESTATE_TEST_RUNTIME=binary`); Docker is optional; not part of npm test
+npm run test:restate # src/__tests__/restate/**/*.restate.test.ts — one runtime, the `restate-server` binary from node_modules (the one production runs); Docker is not needed; not part of npm test
 ```
 
 **`typecheck` excludes `src/__tests__`, and vitest strips types without checking them** — so type errors in a test file are caught by nothing. Type-check a new test file explicitly with a throwaway tsconfig. `src/admin-ui/__tests__/` *is* covered and can break the build.
@@ -256,7 +256,7 @@ Editable per mapping; blank means the default.
 | Dependency Token Scope | off | `installation` lets the run read private sibling repos during dependency install |
 | PR Dispatch Budget | 4 | Gap-fill runs per PR per rolling 24 h; at the limit the PR is parked for a human |
 | Trusted Review Authors | none | Extra GitHub logins (additive to the built-ins) whose `approve` block can gate a merge |
-| Review process | `ai-implement` | Who reviews a PR and who fixes it (ADR 038): `ai-implement` or `claude-code-review`. Stored as NULL for the default. Applies only under the Restate review-fix lifecycle; a Legacy project stores it inert. Set in the project drawer next to the lifecycle select; read by the webhook, the in-run gate, and `ReviewFixPR.check`. `claude-code-review` trusts `claude[bot]` and reads the verdict from the review check run and Claude's inline comments. Full reference: [docs/review-fix-rail.md](docs/review-fix-rail.md) |
+| Review process | `ai-implement` | Who reviews a PR and who fixes it (ADR 038): `ai-implement` or `claude-code-review`. Stored as NULL for the default. The process and its trusted authors apply to every project; only the forward to `ReviewFixPR.feedback` needs the Restate review-fix lifecycle. Set in the project drawer next to the lifecycle select; read by the webhook, the in-run gate, and `ReviewFixPR.check`. `claude-code-review` trusts `claude[bot]` and reads the verdict from the review check run and Claude's inline comments. Full reference: [docs/review-fix-rail.md](docs/review-fix-rail.md) |
 
 **Secrets** seeded via the Projects-row action stop at the hooks — they are stripped from the model process and the agent never sees them. On Fly, they are also excluded at the Fly boundary by default (process-level mode). **Extra Env** entries are passed through to the model process and are visible to the agent.
 
@@ -340,7 +340,7 @@ Five routes (`channels`, `policies`, `secrets`, `webhooks`, `updates`) are still
 
 ## Backend outage playbook
 
-The global **runner mode** is the failover lever: `/admin#runners` or `POST /api/runner-mode` with `fly` forces Fly Machines, `gha` forces GitHub Actions, `default` restores per-project modes. In-flight runs keep their monitors; only new dispatches reroute. Runner mode `gha` also sends the next KG refresh to the KG repo's Actions and leaves the kept machine untouched.
+The global **runner mode** is the failover lever: `/admin#runners` or `POST /api/runner-mode` with `fly` forces Fly Machines, `gha` forces GitHub Actions, `default` restores per-project modes. In-flight runs keep their monitors; only new dispatches reroute. Runner mode `gha` also sends the next KG refresh to the KG repo's Actions and leaves the kept machine untouched; the KG page's Backend setting picks the backend in `default` mode.
 
 Ineligible mappings are **skipped at dispatch** — `provider=bedrock` is GHA-only, and Fly needs a sessions app — staying queued with dedup untouched and appearing in the Runners banner and `GET /api/runner-mode`. Flip back to `default` afterward; skipped issues dispatch on the next poll.
 

@@ -33,6 +33,9 @@ import {
   getFlyProcessLevelSecrets,
   setFlyProcessLevelSecrets,
   getKgMaterializeDirect,
+  getKgExecutionMode,
+  setKgExecutionMode,
+  parseKgExecutionModeEnv,
   setKgMaterializeDirect,
   type RunnerMode,
 } from "./runner-mode.js";
@@ -872,6 +875,25 @@ export function handleAdminRequest(
         return true;
       }
       handleSetKgMaterializeMode(req, res);
+      return true;
+    }
+
+    if (url === "/api/kg/execution-mode" && method === "GET") {
+      if (!deps.kgRefresh) {
+        json(res, 501, { error: "KG refresh is not configured" });
+        return true;
+      }
+      const status = getKgExecutionMode(!!(config.flySessionsToken && config.flySessionsApp));
+      json(res, 200, { mode: status.mode, source: status.source });
+      return true;
+    }
+
+    if (url === "/api/kg/execution-mode" && method === "POST") {
+      if (!deps.kgRefresh) {
+        json(res, 501, { error: "KG refresh is not configured" });
+        return true;
+      }
+      handleSetKgExecutionMode(req, res, config);
       return true;
     }
 
@@ -1759,6 +1781,28 @@ async function handleSetKgMaterializeMode(
     const status = getKgMaterializeDirect();
 
     json(res, 200, { direct: status.enabled, source: status.source });
+  } catch {
+    json(res, 400, { error: "Invalid request body" });
+  }
+}
+
+async function handleSetKgExecutionMode(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  config: AdminConfig,
+): Promise<void> {
+  try {
+    const body = JSON.parse(await readBody(req)) as { mode?: unknown };
+    const mode = typeof body.mode === "string" ? parseKgExecutionModeEnv(body.mode) : undefined;
+    if (!mode) {
+      json(res, 400, { error: "mode must be github-actions or fly-machines" });
+      return;
+    }
+
+    setKgExecutionMode(mode);
+    const status = getKgExecutionMode(!!(config.flySessionsToken && config.flySessionsApp));
+
+    json(res, 200, { mode: status.mode, source: status.source });
   } catch {
     json(res, 400, { error: "Invalid request body" });
   }
@@ -3285,7 +3329,7 @@ export async function upsertMappingAction(
     }
   }
 
-  // No enablement check: the process applies only under the Restate lifecycle at read time, so a Legacy project stores it inert.
+  // No enablement check: the process and its trusted authors apply to every project; only the forward to `ReviewFixPR.feedback` needs the Restate lifecycle.
   let reviewProcess: ReviewProcessId | null;
   if (body.reviewProcess === undefined) {
     reviewProcess = existingMapping?.reviewProcess ?? null;

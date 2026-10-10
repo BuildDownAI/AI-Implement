@@ -45,13 +45,17 @@ vi.mock("../log.js", async (importOriginal) => ({
 }));
 vi.mock("../repo-image.js", () => ({ resolveRunnerImageForDispatch: vi.fn(async () => "runner:test") }));
 const resolvedPath = { current: "github-actions" };
-vi.mock("../runner-mode.js", () => ({
+vi.mock("../runner-mode.js", async (importOriginal) => ({
+  resolveKgBackend: (await importOriginal<typeof import("../runner-mode.js")>()).resolveKgBackend,
+  getKgExecutionMode: (flyConfigured = false) =>
+    kgSetting.current ?? { mode: flyConfigured ? "fly-machines" : "github-actions", source: "default" },
   getRunnerMode: () => ({ mode: runnerMode.current }),
   getKgMaterializeDirect: () => ({ enabled: false }),
   getKgFlyMachineOverride: () => kgFlyOverride.current,
   setKgFlyMachineOverride: (v: unknown) => { if (v === null) kgFlyOverride.current = {}; },
 }));
 const runnerMode = { current: "default" };
+const kgSetting: { current: { mode: "github-actions" | "fly-machines"; source: "db" | "env" | "default" } | null } = { current: null };
 const kgFlyOverride: { current: { cpus?: number; memoryMb?: number; cpuKind?: "auto" | "shared" | "performance" } } = { current: {} };
 const kgMappingSize: { current: { machineCpus?: number; machineMemoryMb?: number } } = { current: {} };
 vi.mock("../config.js", async (importOriginal) => ({
@@ -78,6 +82,7 @@ function makeKeptFly(): KeptMachineFly {
   return {
     createMachine: vi.fn(async () => ({ id: "m-1" })),
     getMachine: vi.fn(async () => ({ state: "stopped" })),
+    listMachines: vi.fn(async () => []),
     updateMachine: vi.fn(async () => ({})),
     startMachine: vi.fn(async () => ({})),
   } as unknown as KeptMachineFly;
@@ -472,7 +477,8 @@ describe("row projections (real log.ts, scratch database)", () => {
   it("setJobMachineNonce re-arms the nonce without clearing machine_id", async () => {
     await withScratchDb((log, _prod, db) => {
       const id = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-rearm", executionMode: "fly-machines", repo: "acme/kg" });
-      log.updateJobMachineDetails(id, { machineNonce: "n1", machineId: "m-1" });
+      log.setJobMachineNonce(id, "n1");
+      log.setJobMachineId(id, "m-1");
       log.setJobMachineNonce(id, "n2");
       expect(db.prepare("SELECT machine_nonce, machine_id FROM dispatch_log WHERE id = ?").get(id)).toEqual({ machine_nonce: "n2", machine_id: "m-1" });
     });
@@ -481,7 +487,8 @@ describe("row projections (real log.ts, scratch database)", () => {
   it("syncRowToMachineNonce re-arms the row to a reused machine's nonce and keeps machine_id", async () => {
     await withScratchDb((log, prod, db) => {
       const id = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-reuse", executionMode: "fly-machines", repo: "acme/kg" });
-      log.updateJobMachineDetails(id, { machineNonce: "attempt2", machineId: "m-1" });
+      log.setJobMachineNonce(id, "attempt2");
+      log.setJobMachineId(id, "m-1");
       prod.syncRowToMachineNonce("d-reuse", "attempt2", "attempt1");
       expect(log.getJobByNonce("attempt1")?.id).toBe(id);
       expect(log.getJobByNonce("attempt2")).toBeFalsy();
@@ -517,7 +524,7 @@ describe("row projections (real log.ts, scratch database)", () => {
     await withScratchDb((log, prod) => {
       const id = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-arm", executionMode: "fly-machines", repo: "acme/kg" });
       const nonce = prod.deriveMachineNonce("secret", "d-arm", 1);
-      log.updateJobMachineDetails(id, { machineNonce: nonce });
+      log.setJobMachineNonce(id, nonce);
       expect(log.getJobByNonce(nonce)?.id).toBe(id);
       expect(log.getJobById(id)?.machineId ?? null).toBeNull();
       prod.recordKgDispatchDetails("d-arm", { machineId: "m-arm" });
@@ -732,31 +739,40 @@ describe("createKgFindRunByTitle", () => {
   });
 });
 
-describe("resolveKgExecutionMode (AII-1130)", () => {
-  afterEach(() => { runnerMode.current = "default"; });
+describe("resolveKgExecutionMode (AII-1130, AII-1218)", () => {
+  afterEach(() => { runnerMode.current = "default"; kgSetting.current = null; });
   const configured = { flySessionsToken: "t", flySessionsApp: "a" };
   const unconfigured = { flySessionsToken: null, flySessionsApp: null };
+  const gha = { mode: "github-actions" as const, source: "db" as const };
+  const fly = { mode: "fly-machines" as const, source: "db" as const };
 
   it.each([
-    ["local", configured, "local-docker"],
-    ["local", unconfigured, "local-docker"],
-    ["gha", configured, "github-actions"],
-    ["gha", unconfigured, "github-actions"],
-    ["default", configured, "fly-machines"],
-    ["default", unconfigured, "github-actions"],
-    ["fly", configured, "fly-machines"],
-    ["fly", unconfigured, "github-actions"],
-    ["shadow", configured, "fly-machines"],
-    ["shadow", unconfigured, "github-actions"],
-  ])("runner mode %s, Fly %j answers %s", (mode, fly, expected) => {
+    ["default", gha, configured, "github-actions", "kg-setting"],
+    ["default", fly, configured, "fly-machines", "kg-setting"],
+    ["default", fly, unconfigured, "github-actions", "fly-unconfigured"],
+    ["gha", fly, configured, "github-actions", "runner-mode"],
+    ["gha", gha, unconfigured, "github-actions", "runner-mode"],
+    ["fly", gha, configured, "fly-machines", "runner-mode"],
+    ["fly", gha, unconfigured, "github-actions", "fly-unconfigured"],
+    ["local", fly, configured, "local-docker", "runner-mode"],
+    ["local", gha, unconfigured, "local-docker", "runner-mode"],
+    ["shadow", gha, configured, "github-actions", "kg-setting"],
+    ["shadow", fly, configured, "fly-machines", "kg-setting"],
+    ["shadow", fly, unconfigured, "github-actions", "fly-unconfigured"],
+  ] as const)("runner mode %s, setting %j, Fly %j answers %s (%s)", (mode, setting, flyCfg, expected, source) => {
     runnerMode.current = mode;
-    expect(resolveKgExecutionMode(fly)).toBe(expected);
+    kgSetting.current = setting;
+    expect(resolveKgExecutionMode(flyCfg)).toEqual({ mode: expected, source });
+  });
+
+  it("with nothing set, keeps today's result", () => {
+    expect(resolveKgExecutionMode(configured)).toEqual({ mode: "fly-machines", source: "default" });
+    expect(resolveKgExecutionMode(unconfigured)).toEqual({ mode: "github-actions", source: "default" });
   });
 
   it("counts a half-set Fly configuration as not configured", () => {
-    runnerMode.current = "default";
-    expect(resolveKgExecutionMode({ flySessionsToken: "t", flySessionsApp: null })).toBe("github-actions");
-    expect(resolveKgExecutionMode({ flySessionsToken: null, flySessionsApp: "a" })).toBe("github-actions");
+    expect(resolveKgExecutionMode({ flySessionsToken: "t", flySessionsApp: null }).mode).toBe("github-actions");
+    expect(resolveKgExecutionMode({ flySessionsToken: null, flySessionsApp: "a" }).mode).toBe("github-actions");
   });
 });
 
@@ -874,9 +890,10 @@ describe("launchKeptMachine: the dispatch step's Fly write", () => {
   const machineConfig = { config: { image: "img", env: { MACHINE_NONCE: "fresh-nonce" }, metadata: { dispatch_id: "d1" } } } as never;
   const notFound = () => new Error("Failed to get machine m-1 (404): not found");
 
-  function makeFly(get: () => Promise<unknown>) {
+  function makeFly(get: () => Promise<unknown>, list: () => Promise<unknown[]> = async () => []) {
     const calls: string[] = [];
     const fly: KeptMachineFly = {
+      listMachines: vi.fn(async () => { calls.push("list"); return list() as never; }),
       getMachine: vi.fn(async () => { calls.push("get"); return get() as never; }),
       createMachine: vi.fn(async () => { calls.push("create"); return { id: "m-new" } as never; }),
       updateMachine: vi.fn(async () => { calls.push("update"); }),
@@ -889,12 +906,36 @@ describe("launchKeptMachine: the dispatch step's Fly write", () => {
   const launch = (fly: KeptMachineFly, keptMachineId: string | null) =>
     launchKeptMachine(fly, { keptMachineId, dispatchId: "d1", machineConfig, machineNonce: "fresh-nonce" });
 
-  it("creates a machine when none is kept, without a lookup", async () => {
-    const { fly, calls } = makeFly(async () => ({}));
+  it("lists by dispatch id and creates a machine when none is kept and none is tagged", async () => {
+    const tagged = (id: string, dispatch: string, purpose = "durable-runner", state = "started") =>
+      ({ id, state, config: { metadata: { dispatch_id: dispatch, purpose }, env: { MACHINE_NONCE: "x" } } });
+    const { fly, calls } = makeFly(async () => ({}), async () => [tagged("o1", "other"), tagged("o2", "d1", "session"), tagged("o3", "d1", "durable-runner", "destroyed"), { id: "o4", state: "started" }]);
     const result = await launch(fly, null);
     expect(result).toMatchObject({ machineId: "m-new", created: true });
     expect(result).not.toHaveProperty("replaced");
-    expect(calls).toEqual(["create"]);
+    expect(result).not.toHaveProperty("adopted");
+    expect(calls).toEqual(["list", "create"]);
+  });
+
+  it("adopts the machine tagged with the dispatch id instead of creating one", async () => {
+    const { fly, calls } = makeFly(async () => ({}), async () => [
+      { id: "m-orphan", state: "started", config: { metadata: { dispatch_id: "d1", purpose: "durable-runner" }, env: { MACHINE_NONCE: "adopted-nonce" } } },
+    ]);
+    const result = await launch(fly, null);
+    expect(result).toEqual({ machineId: "m-orphan", machineNonce: "adopted-nonce", created: true, reused: false, adopted: true });
+    expect(calls).toEqual(["list"]);
+  });
+
+  it("throws and does not create when the list fails", async () => {
+    const { fly, calls } = makeFly(async () => ({}), async () => { throw new Error("Failed to list machines (500): boom"); });
+    await expect(launch(fly, null)).rejects.toThrow(/Failed to list machines/);
+    expect(calls).toEqual(["list"]);
+  });
+
+  it("does not list when a kept machine is updated and started", async () => {
+    const { fly, calls } = makeFly(async () => ({ state: "stopped" }));
+    await launch(fly, "m-1");
+    expect(calls).not.toContain("list");
   });
 
   it("updates then starts a stopped kept machine", async () => {
@@ -991,13 +1032,49 @@ describe("launchKeptMachine: the dispatch step's Fly write", () => {
   it("creates a replacement when the kept machine is destroyed", async () => {
     const { fly, calls } = makeFly(async () => ({ state: "destroyed" }));
     await expect(launch(fly, "m-1")).resolves.toMatchObject({ machineId: "m-new", created: true, replaced: "m-1" });
-    expect(calls).toEqual(["get", "create"]);
+    expect(calls).toEqual(["get", "list", "create"]);
   });
 
   it("creates a replacement when the lookup answers 404", async () => {
     const { fly, calls } = makeFly(async () => { throw notFound(); });
     await expect(launch(fly, "m-1")).resolves.toMatchObject({ machineId: "m-new", created: true, replaced: "m-1" });
-    expect(calls).toEqual(["get", "create"]);
+    expect(calls).toEqual(["get", "list", "create"]);
+  });
+
+  const orphan = { id: "m-orphan", state: "started", config: { metadata: { dispatch_id: "d1", purpose: "durable-runner" }, env: { MACHINE_NONCE: "adopted-nonce" } } };
+  const adoptedResult = { machineId: "m-orphan", machineNonce: "adopted-nonce", created: true, reused: false, adopted: true, replaced: "m-1" };
+
+  it("adopts the dispatch's machine on every gone path instead of creating", async () => {
+    const a = makeFly(async () => { throw notFound(); }, async () => [orphan]);
+    await expect(launch(a.fly, "m-1")).resolves.toEqual(adoptedResult);
+    expect(a.fly.createMachine).not.toHaveBeenCalled();
+
+    const b = makeFly(async () => ({ state: "replacing" }), async () => [orphan]);
+    vi.mocked(b.fly.waitSettled).mockResolvedValue(null);
+    await expect(launch(b.fly, "m-1")).resolves.toEqual(adoptedResult);
+    expect(b.fly.createMachine).not.toHaveBeenCalled();
+
+    const c = makeFly(async () => ({ state: "destroyed" }), async () => [orphan]);
+    await expect(launch(c.fly, "m-1")).resolves.toEqual(adoptedResult);
+    expect(c.fly.createMachine).not.toHaveBeenCalled();
+
+    const d = makeFly(async () => ({ state: "stopped" }), async () => [orphan]);
+    vi.mocked(d.fly.updateMachine).mockRejectedValue(new Error("Failed to update machine m-1 (409): machine is replacing"));
+    vi.mocked(d.fly.waitSettled).mockResolvedValue({ state: "destroyed" } as never);
+    await expect(launch(d.fly, "m-1")).resolves.toEqual(adoptedResult);
+    expect(d.fly.createMachine).not.toHaveBeenCalled();
+  });
+
+  it("ignores the kept id itself when adopting on a gone path", async () => {
+    const { fly } = makeFly(async () => { throw notFound(); }, async () => [{ ...orphan, id: "m-1" }]);
+    await expect(launch(fly, "m-1")).resolves.toMatchObject({ machineId: "m-new", replaced: "m-1" });
+    expect(fly.createMachine).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws without creating when the list fails on a gone path", async () => {
+    const { fly } = makeFly(async () => { throw notFound(); }, async () => { throw new Error("Failed to list machines (500): boom"); });
+    await expect(launch(fly, "m-1")).rejects.toThrow(/Failed to list machines/);
+    expect(fly.createMachine).not.toHaveBeenCalled();
   });
 
   it("throws on any other lookup error so the step retries", async () => {
