@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as restate from "@restatedev/restate-sdk";
-import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CreateMachineOpts, Machine, MachineExit } from "../../fly-machines.js";
 import type { RefreshOutcome } from "../../kg-refresh.js";
@@ -590,8 +590,8 @@ describe("KgRefresh durable workflow", () => {
     await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "workflow started" });
   }
 
-  let envs: Map<string, RestateTestEnvironment>;
-  let deadlineEnvs: Map<string, RestateTestEnvironment>;
+  let envs: Map<string, RestateEnvironment>;
+  let deadlineEnvs: Map<string, RestateEnvironment>;
   beforeAll(async () => {
     envs = await startVariants([workflow, kgRepo, starter, flyMachineProfile]);
     deadlineEnvs = await startVariants([deadlineWorkflow, kgRepo, starter, flyMachineProfile]);
@@ -603,13 +603,13 @@ describe("KgRefresh durable workflow", () => {
 
   // A scenario that does not test a deadline runs in envFor, whose deadlines are long against its own work.
   // A scenario that tests a deadline runs in deadlineEnvFor, which serves the short deadlines.
-  function envFor(label: string): RestateTestEnvironment {
+  function envFor(label: string): RestateEnvironment {
     const env = envs.get(label);
     if (!env) throw new Error(`missing Restate variant ${label}`);
     return env;
   }
 
-  function deadlineEnvFor(label: string): RestateTestEnvironment {
+  function deadlineEnvFor(label: string): RestateEnvironment {
     const env = deadlineEnvs.get(label);
     if (!env) throw new Error(`missing Restate deadline variant ${label}`);
     return env;
@@ -2919,7 +2919,7 @@ describe("KgRefresh durable workflow", () => {
       await eventually(() => existsSync(stagingMarker) && stageCommittedAttempts.length >= 1, (ok) => ok, { label: "durable effect", timeoutMs: 12_000 });
 
       replacement = await replaceEndpoint(env, [replacementWorkflow, kgRepo, flyMachineProfile]);
-      await env.startedRestateContainer.restart();
+      await env.startedRestateServer.restart();
 
       // The restart severs the blocked first attempt's connection; Restate retries the
       // step on the replacement endpoint, which is the not-yet-blocked second call.
@@ -3032,7 +3032,7 @@ describe("KgRefresh durable workflow", () => {
 
     const profileStatus = (baseUrl: string) =>
       callObject<{ machine: KeptMachineState | null }>(baseUrl, "FlyMachineProfile", "kg-refresh", "status", undefined);
-    const expireSends = (env: RestateTestEnvironment) => queryInvocations(
+    const expireSends = (env: RestateEnvironment) => queryInvocations(
       env.adminAPIBaseUrl(),
       "target_service_name = 'FlyMachineProfile' AND target_service_key = 'kg-refresh' AND target_handler_name = 'expire'",
     );
@@ -3044,7 +3044,7 @@ describe("KgRefresh durable workflow", () => {
       keptStopCalls.length = 0;
     });
 
-    async function startRun(env: RestateTestEnvironment): Promise<{ triggerId: string; done: Promise<RefreshOutcome> }> {
+    async function startRun(env: RestateEnvironment): Promise<{ triggerId: string; done: Promise<RefreshOutcome> }> {
       const triggerId = newTriggerId();
       const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "fly-machines" });
       const done = runWorkflow(env.baseUrl(), triggerId);
@@ -3136,7 +3136,7 @@ describe("KgRefresh durable workflow", () => {
         await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-1", { label: "attach recorded" });
 
         replacement = await replaceEndpoint(env, [buildKeptWorkflow(), kgRepo, starter, profileObject]);
-        await env.startedRestateContainer.restart();
+        await env.startedRestateServer.restart();
         readGate.release();
 
         await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", GENERIC_FAILURE_REPORT);

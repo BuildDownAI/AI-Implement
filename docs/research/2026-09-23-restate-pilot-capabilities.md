@@ -4,6 +4,8 @@ Date: 2026-09-23. Primary-source research against current upstream documentation
 
 ## Starting point in this repository
 
+> Historical note (2026-10-10, AII-1195): the tests no longer use testcontainers or a server image; they run on the `restate-server` binary only.
+
 - The lockfile resolves TypeScript SDK, Zod integration, and testcontainers to **1.17.1**, and the server to **1.7.10**; manifest ranges use carets. The shared test harness also selects server image 1.7.10. Current documentation can describe optional features that these packages do not enable automatically. [Package manifest](../../package.json), [lockfile](../../package-lock.json), [harness](../../src/__tests__/restate/harness.ts).
 - The endpoint binds `Operator` and `orchestratorTools`, with no run workflow registered. Some early paragraphs in `docs/restate.md` still describe an empty service set. Code is the stronger evidence for current wiring. [Endpoint](../../src/restate/endpoint.ts), [existing documentation](../restate.md).
 - ADRs 017/018 keep SQLite as run-history authority and propose incremental run-kind migration, including a CI feedback-loop experiment. ADR 023 colocates Restate and the SDK endpoint on one machine; ADR 025 adds an identity object outside run-kind migration. These remain Proposed. [ADR 017](../adr/017-move-the-run-lifecycle-onto-a-durable-execution-engine.md), [ADR 018](../adr/018-adopt-restate-one-run-kind-at-a-time.md), [ADR 023](../adr/023-run-the-restate-server-as-an-orchestrator-sidecar.md), [ADR 025](../adr/025-mcp-tools-are-restate-handlers-and-the-operator-object-is-the-refresh-authority.md).

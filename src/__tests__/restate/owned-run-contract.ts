@@ -2,7 +2,7 @@
 // workflow with an OwnedRunAdapter and calls registerOwnedRunContract inside a describe block of
 // its own `*.restate.test.ts` file. The file is not named `.test.ts`, so vitest does not collect
 // it. Scenarios hold the workflow with `waitForStep` and never sleep.
-import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { describe, expect, it } from "vitest";
 import { VARIANTS, waitForStep } from "./harness.js";
 
@@ -64,7 +64,7 @@ export interface OwnedRunContractOptions {
 
 export function registerOwnedRunContract(
   adapter: OwnedRunAdapter,
-  envFor: (label: string) => RestateTestEnvironment,
+  envFor: (label: string) => RestateEnvironment,
   options: OwnedRunContractOptions = {},
 ): void {
   const labels = VARIANTS.map(([label]) => label);
