@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { FLY_MACHINE_PROFILE_DEFAULTS, decideAttach, decideClaim, decideExpire, mergeProfile, type KeptMachineState, type FlyMachineProfileConfig } from "../restate/fly-machine-profile.js";
+import { FLY_MACHINE_PROFILE_DEFAULTS, decideAttach, decideClaim, decideExpire, mergeProfile, type KeptMachineState, type FlyMachineProfileConfig, OBJECT_INACTIVITY_TIMEOUT_MS, OBJECT_ABORT_TIMEOUT_MS } from "../restate/fly-machine-profile.js";
+import { CLEAR_MACHINE_ENV_MAX_MS } from "../fly-machines.js";
 
 const base: FlyMachineProfileConfig = FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"];
 
@@ -123,5 +124,12 @@ describe("decideExpire", () => {
     expect(decideExpire(held("A", "d1", 1, 100), 100)).toEqual({ kind: "noop" });
     expect(decideExpire(null, 100)).toEqual({ kind: "noop" });
     expect(decideExpire(held(undefined, "d1", 1, 100), 100)).toEqual({ kind: "noop" });
+  });
+});
+
+describe("object invocation timeouts", () => {
+  it("outlast one capped scrub call, and abort after inactivity", () => {
+    expect(OBJECT_INACTIVITY_TIMEOUT_MS).toBeGreaterThan(CLEAR_MACHINE_ENV_MAX_MS);
+    expect(OBJECT_ABORT_TIMEOUT_MS).toBeGreaterThan(OBJECT_INACTIVITY_TIMEOUT_MS);
   });
 });
