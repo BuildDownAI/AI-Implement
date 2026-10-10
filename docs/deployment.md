@@ -90,6 +90,8 @@ The first two and the app name collapse into a single `501`, which says the orch
 
 The app it deploys is never configured: Fly injects `FLY_APP_NAME` into every machine, so an orchestrator can only ever deploy itself.
 
+**CI boots the image before merge.** `.github/workflows/orchestrator-image.yml` builds the root `Dockerfile` on every PR (without the knowledge graph, base image resolved from the ECR Public mirror at the pinned digest) and runs it with its real entrypoint, a throwaway GitHub App key and `DEDUP_DB_PATH` under `/tmp`. The `orchestrator-image` check passes only when `GET /` answers 200 with `status: "ok"`, the Restate sidecar `ready` and registration `registered`, the container still running, and the sidecar reported as unreachable and never probed. That proves the image builds, the entrypoint boots, and Restate comes up, which `fly.toml` (no health check) would not catch before a self-deploy. It does not prove a real KG query, ticketing or GitHub App calls, or anything that needs a secret.
+
 ### Automatic self-deploy
 
 `/admin#deployments` can release every new commit on the watched branch without being asked. Two properties make that safe to leave on:

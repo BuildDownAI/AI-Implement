@@ -1,0 +1,133 @@
+# Orchestrator image boot gate (AII-1221).
+#
+# Builds the root Dockerfile and boots it with its real entrypoint, so a release
+# whose machine crashes at boot is caught before merge instead of by Fly's
+# self-deploy (fly.toml defines no health check). Pattern: the entrypoint gate
+# in build-runner.yml.
+#
+# Named orchestrator-image.yml deliberately: the claude-*.yml files here are
+# TEMPLATES synced to target repos — this file is not, and must never be
+# distributed by sync.
+#
+# The job holds no repository secret. The GitHub App key is a throwaway RSA key
+# generated inside the job.
+#
+# Operator step after first merge: mark the "orchestrator-image" check REQUIRED
+# on the testing branch (Settings -> Branches), as for unit-tests.yml.
+#
+# Base image: the Dockerfile FROM lines pin node:24.15.0-slim by digest on Docker
+# Hub, whose anonymous pull limit has failed CI jobs (AII-1195). For this build
+# only, a buildx named context remaps that exact reference to the ECR Public
+# mirror at the same digest. The Dockerfile is untouched; Fly's builder keeps
+# using Docker Hub. Keep NODE_REF in sync with the Dockerfile FROM lines.
+name: orchestrator-image
+
+on:
+  pull_request:
+    branches: [testing, main, "ai-implement/feature/**", "ai-implement/multi-issue/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  orchestrator-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NODE_REF: node:24.15.0-slim@sha256:4e6b70dd6cbfc88c8157ba19aa3d9f9cce6ba4703576d55459e45efcbc9c5f5d
+      NODE_MIRROR: public.ecr.aws/docker/library/node@sha256:4e6b70dd6cbfc88c8157ba19aa3d9f9cce6ba4703576d55459e45efcbc9c5f5d
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # No KG_SOURCE_REPO build arg and no kg_token secret: the image builds
+      # without a knowledge graph (AII-1220 decision).
+      - name: Build orchestrator image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: orchestrator-ci:test
+          build-contexts: |
+            ${{ env.NODE_REF }}=docker-image://${{ env.NODE_MIRROR }}
+          build-args: |
+            SOURCE_COMMIT=${{ github.event.pull_request.head.sha }}
+            SOURCE_REPO=${{ github.repository }}
+            SOURCE_BRANCH=${{ github.head_ref }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Boot the image with its real entrypoint
+        run: |
+          set -euo pipefail
+          GITHUB_APP_PRIVATE_KEY=$(openssl genrsa 2048 2>/dev/null)
+          export GITHUB_APP_PRIVATE_KEY
+
+          # /data is root-owned in the image (Fly volume mount point) and the
+          # image runs as node, so the DB path goes to /tmp. The Restate data
+          # dir follows DEDUP_DB_PATH.
+          docker run -d --name orchestrator-ci \
+            -p 8080:8080 \
+            -e GITHUB_APP_ID=123456 \
+            -e GITHUB_APP_PRIVATE_KEY \
+            -e DEDUP_DB_PATH=/tmp/dedup.sqlite \
+            orchestrator-ci:test
+
+          ok=0
+          body=""
+          for _i in $(seq 1 60); do
+            if [ "$(docker inspect -f '{{.State.Running}}' orchestrator-ci)" != "true" ]; then
+              echo "FAIL: container exited during boot"
+              break
+            fi
+            if body=$(curl -sf http://localhost:8080/ 2>/dev/null) \
+              && printf '%s' "$body" | jq -e '
+                .status == "ok"
+                and .restate.sidecar.state == "ready"
+                and .restate.registration.state == "registered"' >/dev/null; then
+              ok=1
+              break
+            fi
+            sleep 2
+          done
+
+          echo "--- Health body ---"
+          printf '%s\n' "$body" | jq . || printf '%s\n' "$body"
+
+          if [ "$ok" != "1" ]; then
+            echo "FAIL: health check did not report ok + restate ready + registered within 120 s"
+            echo "--- Container log ---"
+            docker logs orchestrator-ci 2>&1 || true
+            exit 1
+          fi
+
+          if [ "$(docker inspect -f '{{.State.Running}}' orchestrator-ci)" != "true" ]; then
+            echo "FAIL: container is not running after a healthy response"
+            docker logs orchestrator-ci 2>&1 || true
+            exit 1
+          fi
+          echo "PASS: status ok, restate sidecar ready, registration registered, container running"
+
+          # Sidecar-less mode must be reported, not hidden. With no
+          # KG_SOURCE_REPO the sidecar never starts and is never probed, so the
+          # body reports the sidecar as unreachable and never checked
+          # (kgUnavailable stays false: it means "a probe failed", AII-650).
+          printf '%s' "$body" | jq -e '
+            has("kgUnavailable")
+            and .sidecar.reachable == false
+            and .sidecar.checkedAt == null' >/dev/null || {
+            echo "FAIL: sidecar-less mode not reported as expected"
+            docker logs orchestrator-ci 2>&1 || true
+            exit 1
+          }
+          echo "PASS: sidecar-less mode reported (sidecar.reachable=false, never probed)"
+
+      - name: Container log
+        if: always()
+        run: docker logs orchestrator-ci 2>&1 || true
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f orchestrator-ci || true
