@@ -882,7 +882,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
   // A RestateEnvironment exposes no virtual-clock or
   // timer-control API (confirmed: no clock/time symbol anywhere in its type
   // declarations) — ctx.date.now()/ctx.sleep inside the workflow are real wall-clock
-  // time against the real pinned container, so there is no seam the harness could add
+  // time against the real `restate-server` binary, so there is no seam the harness could add
   // to fast-forward past the deadline without a real wait. What the harness *can* make
   // deterministic is the deadline's absolute size (SUCCESS_NO_RESULT_JOB_TIMEOUT_MINUTES,
   // above) and an explicit "not yet" checkpoint partway through that window read
