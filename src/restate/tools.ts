@@ -1154,7 +1154,7 @@ export const addProjectArgsSchema = z.object({
     "Extra GitHub logins trusted as review authors for this project, additive to the built-in trusted authors (ai-implement, ai-implement[bot], and the Claude logins — github-actions[bot] is trusted separately). Omit to keep the stored value; pass null to reset to built-ins only.",
   ),
   reviewProcess: z.enum(["ai-implement", "claude-code-review"]).nullable().optional().describe(
-    "The project's review process. Omit to keep the stored value; pass null or \"ai-implement\" for the default. It applies only under the Restate review-fix lifecycle; a Legacy project stores it inert.",
+    "The project's review process. Omit to keep the stored value; pass null or \"ai-implement\" for the default. It applies to every project; only the forward to the Restate fix attempt needs the Restate lifecycle.",
   ),
 });
 
