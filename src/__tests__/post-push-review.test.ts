@@ -6493,3 +6493,177 @@ describe("postPushReviewStep — cycle summaries (AII-801)", () => {
     }
   });
 });
+
+describe("postPushReviewStep review process gate", () => {
+  type Run = { name: string; app?: string; status?: string; conclusion: string | null; text?: string };
+  const SHA = "deadbeef";
+  const SEVERITY = (normal: number) => `body\n<!-- bughunter-severity: {"normal": ${normal}, "nit": 0, "pre_existing": 0} -->`;
+  const inline = (body: string, commit_id = SHA) => ({
+    user: { login: "claude[bot]", type: "Bot" }, body, path: "a.ts", line: 3, commit_id, html_url: "https://x/1",
+  });
+  const thread = (body: string, oid = SHA) => ({
+    isResolved: false, isOutdated: false, path: "a.ts", line: 3,
+    comments: { nodes: [{ body, url: "https://x/1", commit: { oid }, author: { login: "claude" } }] },
+  });
+
+  function fixture(opts: { runs: Run[]; inlineComments?: unknown[]; threads?: unknown[]; issueComments?: unknown[] }) {
+    const posted: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") posted.push(args[args.indexOf("--body") + 1]);
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42")) return { stdout: JSON.stringify({ head: { sha: SHA } }), exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a.includes(`commits/${SHA}/check-runs`))) {
+        return {
+          stdout: JSON.stringify({
+            check_runs: opts.runs.map((r) => ({
+              name: r.name, status: r.status ?? "completed", conclusion: r.conclusion,
+              ...(r.app ? { app: { slug: r.app } } : {}),
+              ...(r.text !== undefined ? { output: { text: r.text } } : {}),
+            })),
+          }),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42/comments?per_page=100")) {
+        return { stdout: JSON.stringify([opts.inlineComments ?? []]), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/issues/42/comments?per_page=100")) {
+        return { stdout: JSON.stringify([opts.issueComments ?? []]), exitCode: 0 };
+      }
+      if (args[0] === "api" && args[1] === "graphql") {
+        return { stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: opts.threads ?? [], pageInfo: { hasNextPage: false } } } } } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews")) return { stdout: "[]", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    return { ghSpawn, posted };
+  }
+
+  async function run(f: ReturnType<typeof fixture>, extra: Record<string, unknown> = {}, reviewerOutput: unknown = { approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 }) {
+    const invoke = vi.fn(async () => structuredReviewResult(reviewerOutput));
+    const logs: string[] = [];
+    const log = vi.spyOn(console, "log").mockImplementation((...a) => { logs.push(a.join(" ")); });
+    const warns: string[] = [];
+    const warn = vi.spyOn(console, "warn").mockImplementation((...a) => { warns.push(a.join(" ")); });
+    try {
+      const out = await postPushReviewStep.run(
+        makeCtx(invoke),
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn: f.ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+          sleep: vi.fn(async () => undefined), reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000,
+          reviewProcess: "claude-code-review", reviewers: [], ...extra },
+        { report: vi.fn(async () => undefined) },
+      );
+      return { out, logs, warns, invoke };
+    } finally {
+      log.mockRestore();
+      warn.mockRestore();
+    }
+  }
+
+  const actions = (conclusion: string | null): Run => ({ name: "review", app: "github-actions", conclusion });
+
+  it("approves: review/github-actions success with no findings", async () => {
+    const { out, logs } = await run(fixture({ runs: [actions("success")] }));
+    expect(out.approved).toBe(true);
+    expect(logs.some((l) => l.includes("review process claude-code-review: verdict approve from check-and-comments"))).toBe(true);
+  });
+
+  it("approves: success with only 🟡 and untagged findings", async () => {
+    const { out } = await run(fixture({ runs: [actions("success")], inlineComments: [inline("🟡 nit"), inline("plain remark")] }));
+    expect(out.approved).toBe(true);
+  });
+
+  it("requests changes with the finding on one 🔴 on head", async () => {
+    const f = fixture({ runs: [actions("success")], inlineComments: [inline("🔴 null deref")], threads: [thread("🔴 null deref")] });
+    const { out } = await run(f);
+    expect(out.approved).toBe(false);
+    expect(f.posted.join("\n")).toContain("null deref");
+  });
+
+  it("does not count a 🔴 thread written on an older commit", async () => {
+    const f = fixture({ runs: [actions("success")], inlineComments: [inline("🔴 old", "oldsha")], threads: [thread("🔴 old", "oldsha")] });
+    const { out } = await run(f);
+    expect(out.approved).toBe(true);
+    expect(f.posted.join("\n")).not.toContain("🔴 old");
+  });
+
+  it("keeps waiting when a trusted block carries no verdict (incomplete with a source)", async () => {
+    const block = {
+      user: { login: "claude[bot]", type: "Bot" }, created_at: "2026-01-01T00:00:00Z", html_url: "https://x/c",
+      body: "```json review-findings\n" + JSON.stringify({ schema: "review-findings/v1", findings: [] }) + "\n```",
+    };
+    const { out } = await run(fixture({ runs: [actions("success")], issueComments: [block] }));
+    expect(out.approved).toBe(false);
+    expect(out.terminationReason).toBe("external_review_pending");
+  });
+
+  it("still counts an unresolved thread on an older commit under ai-implement", async () => {
+    const f = fixture({ runs: [actions("success")], threads: [thread("🔴 old finding", "oldsha")] });
+    const { out } = await run(f, {
+      reviewProcess: "ai-implement",
+      reviewers: [{ id: "code-review", gates: true }],
+      trustedReviewerDefinitions: new Map([["code-review", { id: "code-review", buildPrompt: () => "p", outputSchema: { type: "object" } }]]),
+    }, { approved: true, findings: [] });
+    expect(out.approved).toBe(false);
+    expect(f.posted.join("\n")).toContain("old finding");
+  });
+
+  it("is no real verdict when the matched check failed", async () => {
+    const { out } = await run(fixture({ runs: [actions("failure")] }));
+    expect(out.approved).toBe(false);
+  });
+
+  it("approves when Claude Code Review reports normal: 0", async () => {
+    const { out } = await run(fixture({
+      runs: [{ name: "Claude Code Review", app: "claude", conclusion: "neutral", text: SEVERITY(0) }],
+      inlineComments: [inline("🔴 ignored: the severity line decides")],
+    }));
+    expect(out.approved).toBe(true);
+  });
+
+  it("requests changes when Claude Code Review reports normal > 0", async () => {
+    const { out } = await run(fixture({ runs: [{ name: "Claude Code Review", app: "claude", conclusion: "neutral", text: SEVERITY(2) }] }));
+    expect(out.approved).toBe(false);
+  });
+
+  it("is no real verdict when the severity line is absent", async () => {
+    const { out } = await run(fixture({ runs: [{ name: "Claude Code Review", app: "claude", conclusion: "neutral", text: "no marker" }] }));
+    expect(out.approved).toBe(false);
+  });
+
+  it("does not match Claude Code Review posted by another app, and lists it as present", async () => {
+    const { out, warns } = await run(fixture({ runs: [{ name: "Claude Code Review", app: "github-actions", conclusion: "success", text: SEVERITY(0) }] }));
+    expect(out.approved).toBe(false);
+    const warning = warns.find((w) => w.includes("No external review check matched")) ?? "";
+    expect(warning).toContain("Claude Code Review (app: github-actions)");
+    expect(warning).toContain("Claude Code Review (app: claude)");
+  });
+
+  it("ends incomplete when no matched check completes before the timeout", async () => {
+    const { out } = await run(fixture({ runs: [{ name: "Claude Code Review", app: "claude", status: "in_progress", conclusion: null }] }));
+    expect(out.approved).toBe(false);
+    expect(out.terminationReason).toBe("external_review_pending");
+  });
+
+  it("lets a trusted review-findings block win over the check and comments", async () => {
+    const block = (verdict: string, login: string) => ({
+      user: { login, type: "Bot" }, created_at: "2026-01-01T00:00:00Z", html_url: "https://x/c",
+      body: "```json review-findings\n" + JSON.stringify({ schema: "review-findings/v1", verdict, findings: [] }) + "\n```",
+    });
+    const sev = { name: "Claude Code Review", app: "claude", conclusion: "neutral", text: SEVERITY(3) };
+    const trusted = await run(fixture({ runs: [sev], issueComments: [block("approve", "claude[bot]")] }));
+    expect(trusted.out.approved).toBe(true);
+    const untrusted = await run(fixture({ runs: [sev], issueComments: [block("approve", "someone-else[bot]")] }));
+    expect(untrusted.out.approved).toBe(false);
+  });
+
+  it("an empty selection runs on claude-code-review, and still fails on ai-implement", async () => {
+    const ok = await run(fixture({ runs: [actions("success")] }));
+    expect(ok.out.terminationReason).not.toBe("reviewer_selection_failed");
+    expect(ok.invoke).not.toHaveBeenCalled();
+    const f = fixture({ runs: [actions("success")] });
+    const blocked = await run(f, { reviewProcess: "ai-implement" });
+    expect(blocked.out.approved).toBe(false);
+    expect(f.posted.join("\n")).toContain("Project reviewer selection is empty");
+  });
+});

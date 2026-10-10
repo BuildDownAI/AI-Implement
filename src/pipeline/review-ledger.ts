@@ -44,6 +44,8 @@ export interface ExternalReviewFindingsResult {
 export interface ReviewLedgerOptions {
   process: ReviewProcessDefinition;
   extraAuthors: readonly string[];
+  /** When set, a review thread whose latest comment was written on another commit is not a finding. */
+  headSha?: string;
 }
 
 const DEFAULT_REVIEW_LEDGER_OPTIONS: ReviewLedgerOptions = { process: resolveReviewProcess(null), extraAuthors: [] };
@@ -715,6 +717,33 @@ function collectClaudeIssueComments(
   }
 }
 
+/** Trusted `review-findings` blocks on the PR's top-level comments, newest first. `null` when the read failed. */
+export function collectReviewFindingsBlocksFromGh(
+  ghSpawn: GhSpawn,
+  prNumber: string,
+  options: ReviewLedgerOptions,
+): ReviewFindingsBlockResult[] | null {
+  const result = safeGhSpawn(ghSpawn, [
+    "api",
+    "--paginate",
+    "--slurp",
+    `repos/:owner/:repo/issues/${prNumber}/comments?per_page=100`,
+  ]);
+  if (!result || result.exitCode !== 0) return null;
+  const blocks: ReviewFindingsBlockResult[] = [];
+  const comments = parseReviewPages(result.stdout)
+    .map((comment, index) => ({ comment, index, timestamp: reviewCommentTimestamp(comment) }))
+    .sort((a, b) => b.timestamp - a.timestamp || b.index - a.index);
+  for (const { comment } of comments) {
+    if (!isRecord(comment) || typeof comment.body !== "string" || isAiImplementComment(comment.body)) continue;
+    if (!isVerdictEligibleAuthor(comment, options)) continue;
+    const url = typeof comment.html_url === "string" ? comment.html_url : undefined;
+    const block = extractReviewFindingsBlock(comment.body, url);
+    if (block) blocks.push(block);
+  }
+  return blocks;
+}
+
 function reviewCommentTimestamp(comment: unknown): number {
   if (!isRecord(comment)) return 0;
   const value = typeof comment.updated_at === "string"
@@ -809,6 +838,11 @@ function collectReviewThreadFindings(
     const comments = getCommentNodes(thread);
     const latestComment = comments?.at(-1);
     if (!isRecord(latestComment) || typeof latestComment.body !== "string") continue;
+    if (options.headSha) {
+      const commit = latestComment.commit;
+      const oid = isRecord(commit) && typeof commit.oid === "string" ? commit.oid : "";
+      if (oid && oid !== options.headSha) continue;
+    }
 
     const body = latestComment.body.trim();
     if (!body) continue;
@@ -979,6 +1013,9 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
             nodes {
               body
               url
+              commit {
+                oid
+              }
               author {
                 login
               }
