@@ -7,7 +7,7 @@
 // Run with `npm run test:restate`; excluded from `npm test`.
 import * as restate from "@restatedev/restate-sdk";
 import type { WorkflowContext, WorkflowSharedContext } from "@restatedev/restate-sdk";
-import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { awaitOwnedRun, type OwnedRunEvent, type OwnedRunStatus } from "../../restate/owned-run-wait.js";
 import { VARIANTS, callWorkflow, eventually, gate, startVariants, stopAll, waitForStep, type Gate } from "./harness.js";
@@ -138,7 +138,7 @@ const fixture = restate.workflow({
 });
 
 describe("awaitOwnedRun (Restate)", () => {
-  let environments: Map<string, RestateTestEnvironment>;
+  let environments: Map<string, RestateEnvironment>;
   let counter = 0;
 
   beforeAll(async () => {
@@ -149,7 +149,7 @@ describe("awaitOwnedRun (Restate)", () => {
     await stopAll(environments);
   });
 
-  function envFor(label: string): RestateTestEnvironment {
+  function envFor(label: string): RestateEnvironment {
     const env = environments.get(label);
     if (!env) throw new Error(`environment "${label}" did not start`);
     return env;

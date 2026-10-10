@@ -16,7 +16,7 @@
 // the tick, confirm and deadline intervals. Each scenario holds the workflow with `gate` and `waitForStep`.
 //
 // Run with `npm run test:restate`; excluded from `npm test`.
-import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const SLOW = { tickMs: 50, confirmTickMs: 50, confirmWindowMs: 60_000, bootstrapMs: 120_000, totalMs: 240_000, stopMarginMs: 60_000, escapeWaitMs: 4_000, escapeTickMs: 100 };
@@ -208,8 +208,8 @@ const comments: string[] = [];
 const issues = new Map<string, { id: string; identifier: string; title: string; scopeKey: string; nativeStatus: string }>();
 
 describe("Restate PlanningRun pilot: production-composition proof", () => {
-  let environments: Map<string, RestateTestEnvironment>;
-  let deadlineEnvironments: Map<string, RestateTestEnvironment>;
+  let environments: Map<string, RestateEnvironment>;
+  let deadlineEnvironments: Map<string, RestateEnvironment>;
   let counter = 0;
 
   beforeAll(async () => {
@@ -331,7 +331,7 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
 
   const labels = VARIANTS.map(([label]) => label);
 
-  function baseUrl(label: string, envs: Map<string, RestateTestEnvironment> = environments): string {
+  function baseUrl(label: string, envs: Map<string, RestateEnvironment> = environments): string {
     const env = envs.get(label);
     if (!env) throw new Error(`missing Restate variant ${label}`);
     return env.baseUrl();
@@ -340,7 +340,7 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
   /** Submits the run; the workflow takes the reservation in its first step. */
   async function dispatch(
     label: string, identifier: string,
-    backend: PlanningRunInput["backend"] = "github-actions", envs: Map<string, RestateTestEnvironment> = environments,
+    backend: PlanningRunInput["backend"] = "github-actions", envs: Map<string, RestateEnvironment> = environments,
   ) {
     const dispatchId = `plan-${label}-${counter++}`;
     const issue = { id: `id-${dispatchId}`, identifier, title: `Issue ${identifier}`, scopeKey: TEAM, nativeStatus: "Todo" };

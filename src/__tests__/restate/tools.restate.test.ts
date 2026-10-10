@@ -1,12 +1,12 @@
-// Docker-backed round-trip coverage for the orchestratorTools service (src/restate/tools.ts,
-// AII-710) — a real Restate server (via testcontainers) journals the ingress body and
+// Binary-backed round-trip coverage for the orchestratorTools service (src/restate/tools.ts,
+// AII-710) — a real Restate server (the binary) journals the ingress body and
 // delivers it to our in-process endpoint, proving the role assertion and the discovery
 // metadata work through the real wire, not just against the unit-level fakes in
 // tools.test.ts. Shape mirrors src/__tests__/restate/harness.restate.test.ts exactly.
 //
-// Run with `npm run test:restate` (Docker required); excluded from `npm test`.
+// Run with `npm run test:restate` (binary runtime, no Docker); excluded from `npm test`.
 import * as restate from "@restatedev/restate-sdk";
-import { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { z } from "zod";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { orchestratorTools, tool, setReviewFixAttemptsFacade, type ToolResponse } from "../../restate/tools.js";
@@ -113,7 +113,7 @@ interface ToolCallResult {
 const SYSTEM = { kind: "system", email: null, role: "admin" } as const;
 
 describe("orchestratorTools (Restate)", () => {
-  let environments: Map<string, RestateTestEnvironment>;
+  let environments: Map<string, RestateEnvironment>;
 
   beforeAll(async () => {
     // get_tenant_health reads comment_gapfill_queue via dedup.getDb(); DEDUP_DB_PATH is

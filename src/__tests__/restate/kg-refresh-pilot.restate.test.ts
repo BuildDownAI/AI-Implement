@@ -19,7 +19,7 @@ import { execSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const sim = vi.hoisted(() => ({
@@ -128,7 +128,7 @@ let tarball: Buffer;
 let fixtureRepo: string;
 
 describe("Restate kg-refresh pilot: production-composition proof", () => {
-  let environments: Map<string, RestateTestEnvironment>;
+  let environments: Map<string, RestateEnvironment>;
   let services: RestateService[];
 
   beforeAll(async () => {
@@ -250,33 +250,33 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
   });
   afterEach(() => { sim.fetchGate = undefined; sim.afterStage = undefined; });
 
-  function envFor(label: string): RestateTestEnvironment {
+  function envFor(label: string): RestateEnvironment {
     const env = environments.get(label);
     if (!env) throw new Error(`missing Restate variant ${label}`);
     return env;
   }
 
-  function clientFor(env: RestateTestEnvironment): KgRefreshIngressClient {
+  function clientFor(env: RestateEnvironment): KgRefreshIngressClient {
     return createKgRefreshIngressClient(env.baseUrl());
   }
 
-  const asSystem = (env: RestateTestEnvironment) => (name: string, args: Record<string, unknown>) =>
+  const asSystem = (env: RestateEnvironment) => (name: string, args: Record<string, unknown>) =>
     callToolAsSystem(name, args, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true });
 
-  async function toolAnswer(env: RestateTestEnvironment, name: string, args: Record<string, unknown> = {}): Promise<{ status: number; body: Record<string, unknown> }> {
+  async function toolAnswer(env: RestateEnvironment, name: string, args: Record<string, unknown> = {}): Promise<{ status: number; body: Record<string, unknown> }> {
     const result = await asSystem(env)(name, args);
     if (result.status !== "ok") throw new Error(`${name} unavailable`);
     return JSON.parse(result.content[0].text) as { status: number; body: Record<string, unknown> };
   }
 
-  async function triggerRefresh(env: RestateTestEnvironment): Promise<string> {
+  async function triggerRefresh(env: RestateEnvironment): Promise<string> {
     const answer = await toolAnswer(env, "trigger_kg_refresh");
     expect(answer).toMatchObject({ status: 202, body: { refreshing: true } });
     return answer.body.triggerId as string;
   }
 
   /** The runner's POST /runner/result, through the real callback and ingress client. */
-  function postReport(env: RestateTestEnvironment, token: string, report: Partial<RunnerResultBody>): Promise<HandleRunnerResultOutput> {
+  function postReport(env: RestateEnvironment, token: string, report: Partial<RunnerResultBody>): Promise<HandleRunnerResultOutput> {
     return handleRunnerResult({
       authorization: `Bearer ${token}`,
       body: { phase: "kg-refresh", outcome: "success", comments: [], ...report } as RunnerResultBody,
@@ -310,7 +310,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
   }
 
   /** Ends a run that a scenario left in flight, so the next scenario finds the marker clear. */
-  async function abandon(env: RestateTestEnvironment): Promise<void> {
+  async function abandon(env: RestateEnvironment): Promise<void> {
     const client = clientFor(env);
     if ((await markerOf(client)) === null) return;
     await postReport(env, runToken(), FAILURE_REPORT);
@@ -348,7 +348,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
   }, 40_000);
 
   // P1b ------------------------------------------------------------------------------
-  async function runJournal(env: RestateTestEnvironment, triggerId: string): Promise<Array<Record<string, unknown>>> {
+  async function runJournal(env: RestateEnvironment, triggerId: string): Promise<Array<Record<string, unknown>>> {
     const invocations = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`);
     return journalEntries(env.adminAPIBaseUrl(), invocations[0].id as string);
   }
@@ -389,7 +389,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
 
   // P3 -------------------------------------------------------------------------------
   // The restart scenarios need the engine's normal retry policy and a journal that survives
-  // a container restart, so they run on the retry-enabled disk environment (the pilot's
+  // a server restart, so they run on the retry-enabled disk environment (the pilot's
   // restart scenarios do the same) rather than on the two harness variants.
   it("P3: restart during dispatch — one dispatch in total, the run completes afterwards", async () => {
     const env = await startRetryEnabled(services);
@@ -406,8 +406,8 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
       );
 
       replacement = await replaceEndpoint(env, services);
-      await env.startedRestateContainer.restart();
-      // A container restart remaps the ingress port; the old client would keep the stale one.
+      await env.startedRestateServer.restart();
+      // Rebuild the client after the restart rather than reuse one built before it.
       client = clientFor(env);
       await eventually(() => clientFor(env).repoStatus(KG_SOURCE_REPO), (marker) => marker.status === "accepted", { label: "ingress reachable after restart", timeoutMs: 30_000 });
 
@@ -440,8 +440,8 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
       await eventually(() => stageCommittedCalls >= 1, (ok) => ok, { label: "durable effect", timeoutMs: 30_000 });
 
       replacement = await replaceEndpoint(env, services);
-      await env.startedRestateContainer.restart();
-      // A container restart remaps the ingress port; the old client would keep the stale one.
+      await env.startedRestateServer.restart();
+      // Rebuild the client after the restart rather than reuse one built before it.
       client = clientFor(env);
       await eventually(() => stageCommittedCalls >= 2, (ok) => ok, { label: "durable effect", timeoutMs: 30_000 });
       await eventually(() => kgRows().some((r) => r.status === "completed"), (ok) => ok, { label: "durable effect", timeoutMs: 30_000 });
