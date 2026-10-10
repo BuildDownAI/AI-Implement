@@ -82,6 +82,7 @@ function makeKeptFly(): KeptMachineFly {
   return {
     createMachine: vi.fn(async () => ({ id: "m-1" })),
     getMachine: vi.fn(async () => ({ state: "stopped" })),
+    listMachines: vi.fn(async () => []),
     updateMachine: vi.fn(async () => ({})),
     startMachine: vi.fn(async () => ({})),
   } as unknown as KeptMachineFly;
@@ -889,9 +890,10 @@ describe("launchKeptMachine: the dispatch step's Fly write", () => {
   const machineConfig = { config: { image: "img", env: { MACHINE_NONCE: "fresh-nonce" }, metadata: { dispatch_id: "d1" } } } as never;
   const notFound = () => new Error("Failed to get machine m-1 (404): not found");
 
-  function makeFly(get: () => Promise<unknown>) {
+  function makeFly(get: () => Promise<unknown>, list: () => Promise<unknown[]> = async () => []) {
     const calls: string[] = [];
     const fly: KeptMachineFly = {
+      listMachines: vi.fn(async () => { calls.push("list"); return list() as never; }),
       getMachine: vi.fn(async () => { calls.push("get"); return get() as never; }),
       createMachine: vi.fn(async () => { calls.push("create"); return { id: "m-new" } as never; }),
       updateMachine: vi.fn(async () => { calls.push("update"); }),
@@ -904,12 +906,36 @@ describe("launchKeptMachine: the dispatch step's Fly write", () => {
   const launch = (fly: KeptMachineFly, keptMachineId: string | null) =>
     launchKeptMachine(fly, { keptMachineId, dispatchId: "d1", machineConfig, machineNonce: "fresh-nonce" });
 
-  it("creates a machine when none is kept, without a lookup", async () => {
-    const { fly, calls } = makeFly(async () => ({}));
+  it("lists by dispatch id and creates a machine when none is kept and none is tagged", async () => {
+    const tagged = (id: string, dispatch: string, purpose = "durable-runner", state = "started") =>
+      ({ id, state, config: { metadata: { dispatch_id: dispatch, purpose }, env: { MACHINE_NONCE: "x" } } });
+    const { fly, calls } = makeFly(async () => ({}), async () => [tagged("o1", "other"), tagged("o2", "d1", "session"), tagged("o3", "d1", "durable-runner", "destroyed"), { id: "o4", state: "started" }]);
     const result = await launch(fly, null);
     expect(result).toMatchObject({ machineId: "m-new", created: true });
     expect(result).not.toHaveProperty("replaced");
-    expect(calls).toEqual(["create"]);
+    expect(result).not.toHaveProperty("adopted");
+    expect(calls).toEqual(["list", "create"]);
+  });
+
+  it("adopts the machine tagged with the dispatch id instead of creating one", async () => {
+    const { fly, calls } = makeFly(async () => ({}), async () => [
+      { id: "m-orphan", state: "started", config: { metadata: { dispatch_id: "d1", purpose: "durable-runner" }, env: { MACHINE_NONCE: "adopted-nonce" } } },
+    ]);
+    const result = await launch(fly, null);
+    expect(result).toEqual({ machineId: "m-orphan", machineNonce: "adopted-nonce", created: true, reused: false, adopted: true });
+    expect(calls).toEqual(["list"]);
+  });
+
+  it("throws and does not create when the list fails", async () => {
+    const { fly, calls } = makeFly(async () => ({}), async () => { throw new Error("Failed to list machines (500): boom"); });
+    await expect(launch(fly, null)).rejects.toThrow(/Failed to list machines/);
+    expect(calls).toEqual(["list"]);
+  });
+
+  it("does not list when a machine is kept", async () => {
+    const { fly, calls } = makeFly(async () => ({ state: "stopped" }));
+    await launch(fly, "m-1");
+    expect(calls).not.toContain("list");
   });
 
   it("updates then starts a stopped kept machine", async () => {
