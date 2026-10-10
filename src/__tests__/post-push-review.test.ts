@@ -6580,6 +6580,77 @@ describe("postPushReviewStep review process gate", () => {
     expect(f.posted.join("\n")).toContain("null deref");
   });
 
+  describe("inline fallback honours review thread state", () => {
+    const urlInline = (body: string, id: number) => ({ ...inline(body), html_url: `https://x/pull/42#discussion_r${id}` });
+    const urlThread = (urls: string[], state: { isResolved?: boolean; isOutdated?: boolean }, body = "x") => ({
+      isResolved: false, isOutdated: false, path: "a.ts", line: 3, ...state,
+      comments: { nodes: urls.map((url) => ({ body, url, commit: { oid: SHA }, author: { login: "claude" } })) },
+    });
+    const u = (id: number) => `https://x/pull/42#discussion_r${id}`;
+
+    it("does not block on a 🔴 comment whose thread is resolved", async () => {
+      const f = fixture({ runs: [actions("success")], inlineComments: [urlInline("🔴 gone", 1)], threads: [urlThread([u(1)], { isResolved: true })] });
+      const { out } = await run(f);
+      expect(out.approved).toBe(true);
+      expect(f.posted.join("\n")).not.toContain("gone");
+    });
+
+    it("still blocks on the same comment when its thread is open", async () => {
+      const f = fixture({ runs: [actions("success")], inlineComments: [urlInline("🔴 live", 1)], threads: [urlThread([u(1)], {}, "🔴 live")] });
+      const { out } = await run(f);
+      expect(out.approved).toBe(false);
+      expect(f.posted.join("\n")).toContain("live");
+    });
+
+    it("drops a 🔴 comment on an outdated thread", async () => {
+      const f = fixture({ runs: [actions("success")], inlineComments: [urlInline("🔴 stale", 1)], threads: [urlThread([u(1)], { isOutdated: true })] });
+      expect((await run(f)).out.approved).toBe(true);
+    });
+
+    it("keeps only the open finding when one is resolved and one is open", async () => {
+      const f = fixture({
+        runs: [actions("success")],
+        inlineComments: [urlInline("🔴 resolved one", 1), urlInline("🔴 open one", 2)],
+        threads: [urlThread([u(1)], { isResolved: true }), urlThread([u(2)], {}, "🔴 open one")],
+      });
+      const { out } = await run(f);
+      expect(out.approved).toBe(false);
+      const posted = f.posted.join("\n");
+      expect(posted).toContain("open one");
+      expect(posted).not.toContain("resolved one");
+    });
+
+    it("matches a comment that is not the last in its resolved thread", async () => {
+      const f = fixture({
+        runs: [actions("success")],
+        inlineComments: [urlInline("🔴 first", 1)],
+        threads: [urlThread([u(1), u(9)], { isResolved: true })],
+      });
+      expect((await run(f)).out.approved).toBe(true);
+    });
+
+    it("finds a resolved thread on the second page of threads", async () => {
+      const f = fixture({ runs: [actions("success")], inlineComments: [urlInline("🔴 paged", 1)] });
+      const base = f.ghSpawn.getMockImplementation()!;
+      const page = (nodes: unknown[], next: boolean) => ({
+        stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes, pageInfo: { hasNextPage: next, endCursor: next ? "c1" : null } } } } } }),
+        exitCode: 0,
+      });
+      f.ghSpawn.mockImplementation((args: string[]) => {
+        if (args[1] !== "graphql") return base(args);
+        return args.includes("after=c1") ? page([urlThread([u(1)], { isResolved: true })], false) : page([urlThread([u(5)], { isOutdated: true })], true);
+      });
+      expect((await run(f)).out.approved).toBe(true);
+    });
+
+    it("keeps the findings and blocks when the thread read fails", async () => {
+      const f = fixture({ runs: [actions("success")], inlineComments: [urlInline("🔴 unknown", 1)] });
+      const base = f.ghSpawn.getMockImplementation()!;
+      f.ghSpawn.mockImplementation((args: string[]) => (args[1] === "graphql" ? { stdout: "", exitCode: 1 } : base(args)));
+      expect((await run(f)).out.approved).toBe(false);
+    });
+  });
+
   it("does not count a 🔴 thread written on an older commit", async () => {
     const f = fixture({ runs: [actions("success")], inlineComments: [inline("🔴 old", "oldsha")], threads: [thread("🔴 old", "oldsha")] });
     const { out } = await run(f);

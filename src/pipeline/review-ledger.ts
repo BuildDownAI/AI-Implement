@@ -773,6 +773,36 @@ function collectUnresolvedReviewThreads(
   }
 }
 
+/**
+ * URLs of every comment on a review thread that is resolved or outdated, or undefined when the
+ * thread read fails (the caller must then treat every comment as open). Matching is by comment URL,
+ * which the REST `html_url` and the GraphQL `url` share, so a thread with replies still matches.
+ */
+export function collectClosedReviewThreadCommentUrls(ghSpawn: GhSpawn, prNumber: string): Set<string> | undefined {
+  const closed = new Set<string>();
+  let after: string | undefined;
+
+  for (;;) {
+    const result = safeGhSpawn(ghSpawn, buildReviewThreadsArgs(prNumber, after, closedThreadCommentsQuery));
+    if (!result || result.exitCode !== 0) return undefined;
+
+    const reviewThreads = getReviewThreadsConnection(parseJson(result.stdout));
+    if (!reviewThreads) return undefined;
+
+    for (const thread of reviewThreads.nodes) {
+      if (!isRecord(thread) || (thread.isResolved !== true && thread.isOutdated !== true)) continue;
+      for (const comment of getCommentNodes(thread) ?? []) {
+        if (isRecord(comment) && typeof comment.url === "string" && comment.url) closed.add(comment.url);
+      }
+    }
+
+    if (reviewThreads.pageInfo?.hasNextPage !== true) return closed;
+    if (typeof reviewThreads.pageInfo.endCursor !== "string" || !reviewThreads.pageInfo.endCursor) return undefined;
+
+    after = reviewThreads.pageInfo.endCursor;
+  }
+}
+
 function dedupeReviewFindings(findings: ReviewLedgerFinding[]): ReviewLedgerFinding[] {
   const deduped: ReviewLedgerFinding[] = [];
   const indexByNormalizedBody = new Map<string, number>();
@@ -797,7 +827,7 @@ function dedupeReviewFindings(findings: ReviewLedgerFinding[]): ReviewLedgerFind
   return deduped;
 }
 
-function buildReviewThreadsArgs(prNumber: string, after?: string): string[] {
+function buildReviewThreadsArgs(prNumber: string, after?: string, query: string = reviewThreadsQuery): string[] {
   const args = [
     "api",
     "graphql",
@@ -808,7 +838,7 @@ function buildReviewThreadsArgs(prNumber: string, after?: string): string[] {
     "-F",
     `number=${prNumber}`,
     "-f",
-    `query=${reviewThreadsQuery}`,
+    `query=${query}`,
   ];
 
   if (after) {
@@ -1020,6 +1050,30 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
               author {
                 login
               }
+            }
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+}
+`;
+
+const closedThreadCommentsQuery = `
+query($owner: String!, $repo: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $after) {
+        nodes {
+          isResolved
+          isOutdated
+          comments(first: 100) {
+            nodes {
+              url
             }
           }
         }
