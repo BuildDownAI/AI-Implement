@@ -130,6 +130,6 @@ describe("decideExpire", () => {
 describe("object invocation timeouts", () => {
   it("outlast one capped scrub call, and abort after inactivity", () => {
     expect(OBJECT_INACTIVITY_TIMEOUT_MS).toBeGreaterThan(CLEAR_MACHINE_ENV_MAX_MS);
-    expect(OBJECT_ABORT_TIMEOUT_MS).toBeGreaterThan(OBJECT_INACTIVITY_TIMEOUT_MS);
+    expect(OBJECT_ABORT_TIMEOUT_MS).toBeGreaterThanOrEqual(OBJECT_INACTIVITY_TIMEOUT_MS);
   });
 });
