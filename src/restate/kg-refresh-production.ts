@@ -111,11 +111,11 @@ const isReplaceWindow = (err: unknown, status: number, text: RegExp): boolean =>
 const isFlyNotFound = (err: unknown): boolean => err instanceof Error && /\(404\)/.test(err.message);
 
 /**
- * The dispatch step's Fly write for a kept machine (AII-1136). With no kept machine id it lists the app's machines and adopts
+ * The dispatch step's Fly write for a kept machine (AII-1136). Every create first lists the app's machines and adopts
  * the live `durable-runner` one stamped with this dispatch id (an earlier try of the step created it and lost the ack), else creates one.
  * With one it reconciles first: `started` for this dispatch means an earlier try of the step already ran
  * (return it, no second `update`, which would reboot it); `started` for another dispatch means the hold is
- * wrong (throw); `destroyed` or 404 falls back to create; anything else is `update` then `start`. A machine
+ * wrong (throw); `destroyed` or 404 falls back to that adopt-or-create; anything else is `update` then `start`. A machine
  * still replacing, starting, stopping or created is waited out first (bounded). `update` makes Fly replace the instance, so
  * the launch waits for the replacement to reach `stopped` before `start`, and repeats a call Fly refused inside the
  * replace window once (409 on `update`, 412 on `start`). A lookup error, or a window that outlasts the bound,
@@ -128,21 +128,23 @@ export async function launchKeptMachine(
 ): Promise<{ machineId: string; machineNonce: string; created: boolean; reused: boolean; adopted?: boolean; replaced?: string; waitedSeconds?: number }> {
   const { keptMachineId, dispatchId, machineConfig, machineNonce, settleMs = KEPT_MACHINE_SETTLE_MS } = opts;
   const create = async (replaced?: string) => {
-    const machine = await fly.createMachine(machineConfig);
-    return { machineId: machine.id, machineNonce, created: true, reused: false, ...(replaced !== undefined && { replaced }) };
-  };
-  if (keptMachineId === null) {
     // A lookup error throws before any create, so the step retries rather than making a second machine.
     const machines = await fly.listMachines();
     const found = machines.find((m) =>
-      m.state !== "destroyed"
+      m.id !== keptMachineId
+      && m.state !== "destroyed"
       && m.config?.metadata?.[DURABLE_RUNNER_DISPATCH_ID_KEY] === dispatchId
       && m.config?.metadata?.[DURABLE_RUNNER_PURPOSE_KEY] === DURABLE_RUNNER_PURPOSE_VALUE);
     if (found) {
-      return { machineId: found.id, machineNonce: found.config?.env?.MACHINE_NONCE ?? machineNonce, created: true, reused: false, adopted: true };
+      return {
+        machineId: found.id, machineNonce: found.config?.env?.MACHINE_NONCE ?? machineNonce, created: true, reused: false, adopted: true,
+        ...(replaced !== undefined && { replaced }),
+      };
     }
-    return create();
-  }
+    const machine = await fly.createMachine(machineConfig);
+    return { machineId: machine.id, machineNonce, created: true, reused: false, ...(replaced !== undefined && { replaced }) };
+  };
+  if (keptMachineId === null) return create();
 
   let existing: Machine;
   try {
