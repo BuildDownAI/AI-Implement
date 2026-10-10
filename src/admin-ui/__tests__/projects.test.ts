@@ -430,3 +430,52 @@ describe("projects page review-fix lifecycle field", () => {
     expect(unsupportedExecutionMessage).not.toContain("registered, healthy Restate endpoint");
   });
 });
+
+describe("projects page review process and trusted review authors", () => {
+  it("declares both controls with the exact hints", () => {
+    expect(projectsHtml).toContain('id="md-review-process"');
+    expect(projectsHtml).toContain('<option value="ai-implement">AI-Implement</option>');
+    expect(projectsHtml).toContain('<option value="claude-code-review">Claude Code Review</option>');
+    expect(projectsHtml).toContain("Who reviews this project's PRs and who fixes. Claude Code Review trusts claude[bot], reads the verdict from the review check run and Claude's inline comments, and keeps AI-Implement's fix attempt. Applies only with the Restate lifecycle; a Legacy project stores it and ignores it.");
+    expect(projectsHtml).toContain('id="md-trusted-review-authors"');
+    expect(projectsHtml).toContain("Extra bot or user logins whose review findings count, in addition to the review process's own authors. A trusted author can approve a PR.");
+  });
+
+  it("loads stored values, defaulting when null", async () => {
+    const { win, doc } = mountProjects(baseMapping({ reviewProcess: "claude-code-review", trustedReviewAuthors: ["a[bot]", "b"] }));
+    await win.loadMappings();
+    win.openMappingDialog("AII");
+    expect((doc.getElementById("md-review-process") as HTMLSelectElement).value).toBe("claude-code-review");
+    expect((doc.getElementById("md-trusted-review-authors") as HTMLTextAreaElement).value).toBe("a[bot]\nb");
+
+    const { win: win2, doc: doc2 } = mountProjects(baseMapping({ reviewProcess: null, trustedReviewAuthors: null }));
+    await win2.loadMappings();
+    win2.openMappingDialog("AII");
+    expect((doc2.getElementById("md-review-process") as HTMLSelectElement).value).toBe("ai-implement");
+    expect((doc2.getElementById("md-trusted-review-authors") as HTMLTextAreaElement).value).toBe("");
+  });
+
+  it("saves the select value and a cleaned author array, or null when blank", async () => {
+    const { win, doc, posts } = mountProjects(baseMapping());
+    await win.loadMappings();
+    win.openMappingDialog("AII");
+    (doc.getElementById("md-review-process") as HTMLSelectElement).value = "claude-code-review";
+    (doc.getElementById("md-trusted-review-authors") as HTMLTextAreaElement).value = " x \n\n y ";
+    await save(win);
+    expect(posts[0]).toMatchObject({ reviewProcess: "claude-code-review", trustedReviewAuthors: ["x", "y"] });
+
+    win.openMappingDialog("AII");
+    (doc.getElementById("md-trusted-review-authors") as HTMLTextAreaElement).value = "  \n ";
+    await save(win);
+    expect(posts[1]).toMatchObject({ trustedReviewAuthors: null });
+  });
+
+  it.each(["reviewProcess invalid: nope", "trustedReviewAuthors invalid: bad login"])("shows the API error %s", async (error) => {
+    const { win, doc } = mountProjects(baseMapping());
+    await win.loadMappings();
+    win.openMappingDialog("AII");
+    win.api = async () => ({ ok: false, status: 400, json: async () => ({ error }) });
+    await save(win);
+    expect(doc.getElementById("md-error")?.textContent).toContain(error);
+  });
+});

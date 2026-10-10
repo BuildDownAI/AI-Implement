@@ -21,6 +21,7 @@ import {
   setMappingPaused,
   deleteMapping,
 } from "./config.js";
+import type { ReviewProcessId } from "./review-process.js";
 import type { RepoMapping, ExecutionMode, SessionMode, ClaudeProvider, ReviewerSelection } from "./config.js";
 import {
   getRunnerMode,
@@ -169,6 +170,38 @@ function normalizeReviewers(raw: unknown): ReviewerSelection[] {
 
 function validReviewerMaxTurns(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 200;
+}
+
+const TRUSTED_REVIEW_AUTHOR_RE = /^[a-z0-9][a-z0-9-]*(\[bot\])?$/;
+
+function normalizeTrustedReviewAuthors(raw: unknown): string[] | null {
+  if (raw === null || raw === undefined) return null;
+  if (!Array.isArray(raw)) {
+    throw new Error("must be an array of strings or null");
+  }
+  if (raw.length > 20) {
+    throw new Error(`too many entries (${raw.length}); maximum is 20`);
+  }
+  const seen = new Set<string>();
+  const result: string[] = [];
+  raw.forEach((entry, index) => {
+    if (typeof entry !== "string") {
+      throw new Error(`[${index}] must be a string`);
+    }
+    const normalized = entry.trim().toLowerCase();
+    if (normalized.length === 0) {
+      throw new Error(`[${index}] must not be empty`);
+    }
+    if (!TRUSTED_REVIEW_AUTHOR_RE.test(normalized)) {
+      throw new Error(`[${index}] "${entry}" is not a valid GitHub login`);
+    }
+    if (seen.has(normalized)) {
+      throw new Error(`duplicate entry "${normalized}"`);
+    }
+    seen.add(normalized);
+    result.push(normalized);
+  });
+  return result.length > 0 ? result : null;
 }
 
 /**
@@ -3012,6 +3045,8 @@ export interface UpsertMappingBody {
   reviewers?: unknown;
   prDispatchBudget?: number | null;
   reviewFixLifecycle?: string | null;
+  trustedReviewAuthors?: unknown;
+  reviewProcess?: unknown;
 }
 
 export async function upsertMappingAction(
@@ -3235,6 +3270,33 @@ export async function upsertMappingAction(
     }
   }
 
+  let trustedReviewAuthors: string[] | null;
+  if (body.trustedReviewAuthors === undefined) {
+    // Preserve stored value on omit — a PATCH-style save must not silently strip a project's trusted-author grant.
+    trustedReviewAuthors = existingMapping?.trustedReviewAuthors ?? null;
+  } else if (body.trustedReviewAuthors === null) {
+    // Explicit null resets to the NULL default (built-ins only), mirroring reviewers above.
+    trustedReviewAuthors = null;
+  } else {
+    try {
+      trustedReviewAuthors = normalizeTrustedReviewAuthors(body.trustedReviewAuthors);
+    } catch (err) {
+      return { status: 400, body: { error: `trustedReviewAuthors invalid: ${err instanceof Error ? err.message : String(err)}` } };
+    }
+  }
+
+  // No enablement check: the process applies only under the Restate lifecycle at read time, so a Legacy project stores it inert.
+  let reviewProcess: ReviewProcessId | null;
+  if (body.reviewProcess === undefined) {
+    reviewProcess = existingMapping?.reviewProcess ?? null;
+  } else if (body.reviewProcess === null || body.reviewProcess === "ai-implement") {
+    reviewProcess = null;
+  } else if (body.reviewProcess === "claude-code-review") {
+    reviewProcess = "claude-code-review";
+  } else {
+    return { status: 400, body: { error: `reviewProcess invalid: must be null, "ai-implement", or "claude-code-review"` } };
+  }
+
   const mapping: RepoMapping = {
     owner: body.owner,
     repo: body.repo,
@@ -3272,6 +3334,8 @@ export async function upsertMappingAction(
     reviewers,
     prDispatchBudget,
     reviewFixLifecycle,
+    trustedReviewAuthors,
+    reviewProcess,
   };
 
   // Existing attempts keep their stored owner. Revalidate only when a save first enables

@@ -134,13 +134,13 @@ describe("ReviewFixAttempt durable workflow", () => {
       },
     },
     finalizer: {
-      recordOutcome: async (outcome) => {
+      recordOutcome: async (outcome, now) => {
         const fake = get(outcome.attemptId);
         if (fake.outcome) return { status: "already_recorded", outcome: {
           attemptId: outcome.attemptId, scope: outcome.scope, terminal: fake.outcome,
         } } as const;
         fake.outcome = outcome.terminal;
-        return { status: "recorded" } as const;
+        return { status: "recorded", completedAt: now } as const;
       },
       applyApproval: async (input) => {
         const fake = get(input.attemptId);

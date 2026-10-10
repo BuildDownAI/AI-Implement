@@ -285,6 +285,19 @@ export const projectsHtml = `
             <div class="field-hint">Also selects the planning lifecycle: with Restate, each planning dispatch (any backend) is owned by a PlanningRun workflow with a deadline. Coordinates this project's automatic GitHub Actions review-fix runs. Local review-fix (the dev harness) and human comment-triggered gap-fill runs always stay on Legacy regardless of this selection &mdash; this control cannot move those paths to Restate. Changing this does not cancel or migrate anything already in flight: an attempt already dispatched keeps the lifecycle that dispatched it, and only future automatic dispatches follow the new selection. Restate needs the current workflow file in the target repo (use Sync workflows and merge its PR) and the GitHub Actions execution mode.</div>
           </div>
           <div class="field">
+            <label class="field-label">Review process</label>
+            <select class="select" id="md-review-process">
+              <option value="ai-implement">AI-Implement</option>
+              <option value="claude-code-review">Claude Code Review</option>
+            </select>
+            <div class="field-hint">Who reviews this project's PRs and who fixes. Claude Code Review trusts claude[bot], reads the verdict from the review check run and Claude's inline comments, and keeps AI-Implement's fix attempt. Applies only with the Restate lifecycle; a Legacy project stores it and ignores it.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Trusted Review Authors</label>
+            <textarea class="textarea" id="md-trusted-review-authors" rows="3" placeholder="topia-ai-implement-bot[bot]"></textarea>
+            <div class="field-hint">Extra bot or user logins whose review findings count, in addition to the review process's own authors. A trusted author can approve a PR.</div>
+          </div>
+          <div class="field">
             <label class="field-label">Extra Env</label>
             <textarea class="textarea" id="md-env" rows="4" placeholder="LOG_LEVEL=debug&#10;FEATURE_FLAG=on"></textarea>
             <div class="field-hint">One KEY=VALUE per line. Unlike secrets, these reach the model process and are visible to the agent.</div>
@@ -792,6 +805,8 @@ export const projectsScript = `
     // Absent/null means the backend resolves it to "legacy" (resolveReviewFixLifecycle) —
     // default the control to match rather than leaving it on whichever option is first.
     document.getElementById('md-review-fix-lifecycle').value = m.reviewFixLifecycle || 'legacy';
+    document.getElementById('md-review-process').value = m.reviewProcess || 'ai-implement';
+    document.getElementById('md-trusted-review-authors').value = (m.trustedReviewAuthors || []).join('\\n');
     // slice() so editing the draft never mutates the cached mapping behind it.
     refRepoDraft = (m.referenceRepos || []).slice();
     // The add row survives a Cancel, so an abandoned attempt would reappear on the next open.
@@ -1215,6 +1230,8 @@ export const projectsScript = `
       sensitiveAllowPatterns: (function(){ var v = document.getElementById('md-sensitive-allow').value.trim(); return v === '' ? null : v; })(),
       dependencyTokenScope: (function(){ var v = document.getElementById('md-dep-token-scope').value; return v === '' ? null : v; })(),
       reviewFixLifecycle: document.getElementById('md-review-fix-lifecycle').value,
+      reviewProcess: document.getElementById('md-review-process').value,
+      trustedReviewAuthors: (function(){ var l = document.getElementById('md-trusted-review-authors').value.split('\\n').map(function(x){ return x.trim(); }).filter(Boolean); return l.length ? l : null; })(),
       referenceRepos: refRepoValue(),
       reviewers: reviewerValue(),
     };

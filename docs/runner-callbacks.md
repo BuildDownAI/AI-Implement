@@ -78,11 +78,11 @@ The workflow key is the dispatch id: the kg-refresh callback addresses `KgRefres
 
 The pilot branch now authenticates the prepared result credential and checks the
 marker against its attempt before any Legacy token consumption or provider
-effect. The injected result seam records the canonical result and its durable
-delivery row in one SQLite transaction. An identical retry returns `200`
-`duplicate` and checks/repairs the same delivery identity; a conflicting result
-returns `409`, and a stale one returns `410`. The delivery pump contacts Restate
-afterward, so a sidecar outage does not reverse SQLite acceptance. A failed
+effect. The injected result seam records the canonical result and forwards it to
+`ReviewFixAttempt.result` through the ingress client. An identical retry returns
+`200` `duplicate` under the same forward key; a conflicting result returns `409`,
+and a stale one returns `410`. The callback answers `503` when Restate is
+unreachable; there is no delivery pump. A failed
 database write or missing persistence seam does not acknowledge the callback.
 Explicit pilot metadata cannot fall through to Legacy completion, finding
 resolution, or approval.
