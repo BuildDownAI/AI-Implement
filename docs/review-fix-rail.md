@@ -134,6 +134,8 @@ Trusted comment authors come from the project's review process (`src/review-proc
 
 Inline-comment severity follows the process. `ai-implement` keeps `medium` for every inline webhook comment. `claude-code-review` classifies a trusted bot's comment by its leading marker: 🔴 `blocking`, 🟡 or untagged `minor`, and 🟣 is skipped (the webhook answers `{ ignored: true, reason: "pre_existing" }` and stores nothing). Under that process a bot that is not trusted is ignored (`untrusted_author`). A human's inline comment is always `medium` and always enqueues (ADR 027), and a CHANGES_REQUESTED author's thread stays `blocking` whatever its marker.
 
+**The in-run gate's inline fallback honours thread state.** Under `claude-code-review`, when the resolution-aware thread list is empty but the check-and-comments verdict is `changes_requested`, the gate falls back to the REST inline findings. Those carry no thread state, so `collectClosedReviewThreadCommentUrls` (`src/pipeline/review-ledger.ts`) reads the review threads and the gate drops each finding whose comment URL sits on a resolved or outdated thread. If no blocking finding remains, the verdict is treated as `approve`. A failed thread read keeps every finding, so the gate stays blocked.
+
 ## The review-findings contract
 
 `extractReviewFindingsBlock` (`src/pipeline/review-ledger.ts`) reads a machine-readable verdict from a reviewer comment. It has precedence over heading-based prose extraction and returns early when it finds a fenced block, so a comment that carries one is never also scanned for prose.
