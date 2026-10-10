@@ -14,7 +14,7 @@
  * nothing tracked in this module does that job.
  */
 import type { AttemptId, ResultIntakeOutcome, ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
-import { validateAttemptId, validateReviewFixResultMetadata } from "../review-fix-contract.js";
+import { validateReviewFixResultMetadata } from "../review-fix-contract.js";
 import { isDeployHeld } from "../deploy-hold.js";
 import {
   ackDelivery,
@@ -51,7 +51,6 @@ export interface ReviewFixDeliveryFacade {
    *  durable "something is pending" nudge, so no finding content ever crosses this seam. */
   deliverFeedback(destination: ScopedPrIdentity, idempotencyKey: string): Promise<ReviewFixFacadeOutcome>;
   deliverResult(result: ReviewFixResultMetadataV1, idempotencyKey: string): Promise<ReviewFixFacadeOutcome>;
-  deliverCancel(attemptId: AttemptId, idempotencyKey: string): Promise<ReviewFixFacadeOutcome>;
 }
 
 /** For testing: override the ingress base URL, the fetch implementation, and the
@@ -116,8 +115,6 @@ export function createRestateReviewFixFacade(deps: RestateReviewFixFacadeDeps = 
     },
     deliverResult: (result, idempotencyKey) =>
       invoke(resolved, "ReviewFixAttempt", result.attemptId, "result", result, idempotencyKey),
-    deliverCancel: (attemptId, idempotencyKey) =>
-      invoke(resolved, "ReviewFixAttempt", attemptId, "cancel", { attemptId }, idempotencyKey),
   };
 }
 
@@ -135,7 +132,14 @@ export interface ReviewFixIngressClient {
    * `stale`); the transport-level `conflict` (409) and `not-found` (404) are separate. Never throws.
    */
   result(attemptId: AttemptId, result: ReviewFixResultMetadataV1, opts: { idempotencyKey: string }): Promise<ReviewFixResultForwardOutcome>;
+  /**
+   * Forwards a cancellation to `ReviewFixAttempt.cancel` (AII-1186); `idempotencyKey` is `<attemptId>.closed` for a
+   * closed PR and `<attemptId>.cancel` for an operator cancel. Any error resolves `unavailable`. Never throws.
+   */
+  cancel(attemptId: AttemptId, opts: { idempotencyKey: string }): Promise<ReviewFixCancelForwardOutcome>;
 }
+
+export type ReviewFixCancelForwardOutcome = { readonly status: "accepted" } | { readonly status: "unavailable" };
 
 export type ReviewFixResultForwardOutcome =
   | { readonly status: "accepted"; readonly outcome: ResultIntakeOutcome }
@@ -177,6 +181,17 @@ export function createReviewFixIngressClient(
           if (err.status === 409) return { status: "conflict" };
           if (err.status === 404) return { status: "not-found" };
         }
+        return { status: "unavailable" };
+      }
+    },
+    async cancel(attemptId, opts) {
+      try {
+        const rpc = restateClients.rpc.opts<{ attemptId: AttemptId }, void>({ timeout, idempotencyKey: opts.idempotencyKey });
+        await ingress
+          .workflowClient<ReviewFixAttemptDefinition>({ name: "ReviewFixAttempt" }, attemptId)
+          .cancel({ attemptId }, rpc);
+        return { status: "accepted" };
+      } catch {
         return { status: "unavailable" };
       }
     },
@@ -228,14 +243,6 @@ export function reviewFixDeliveryIdempotencyKey(
   delivery: Pick<ReviewFixDelivery, "kind" | "authenticatedSource" | "deliveryId">,
 ): string {
   return `${delivery.kind}:${delivery.authenticatedSource}:${delivery.deliveryId}`;
-}
-
-function extractAttemptId(payload: unknown): AttemptId | null {
-  if (payload !== null && typeof payload === "object" && "attemptId" in payload) {
-    const validated = validateAttemptId((payload as { attemptId: unknown }).attemptId);
-    if (validated.ok) return validated.value;
-  }
-  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -474,17 +481,10 @@ export class ReviewFixDeliveryPump {
         if (!validated.ok) return { status: "invalid", reason: "invalid_result_metadata" };
         return toRouteOutcome(await this.facade.deliverResult(validated.value, idempotencyKey), "facade unavailable (sidecar unreachable or non-2xx response)");
       }
-      case "cancellation": {
-        const attemptId = extractAttemptId(delivery.payload);
-        if (!attemptId) return { status: "invalid", reason: "missing or invalid attemptId in cancellation payload" };
-        return toRouteOutcome(await this.facade.deliverCancel(attemptId, idempotencyKey), "facade unavailable (sidecar unreachable or non-2xx response)");
-      }
-      case "terminal-effect":
       default:
-        // Not yet wired to a Restate handler (AII-811 composes the production adapters
-        // that own this decision) — never dropped, never marked delivered; left claimed
-        // for a later redelivery once a route exists. This is a known gap, not a
-        // malformed event, so it is reported as "unavailable" rather than "invalid".
+        // Cancellations and terminal effects no longer travel through the inbox (AII-1186):
+        // cancellations go over the ingress client, effects run in a journaled step. A row of
+        // either kind is never dropped or marked delivered; it is reported "unavailable".
         return { status: "unavailable", reason: "no Restate route registered yet for this delivery kind" };
     }
   }

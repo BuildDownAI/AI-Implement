@@ -6,7 +6,7 @@ import { getDb } from "../dedup.js";
 import { getInstallationId, getInstallationToken } from "../github-app-auth.js";
 import { getPullRequestState } from "../github.js";
 import { listReviewFixCycleSummaries } from "../review-fix-evidence.js";
-import { createReviewFixFinalizer, retryApprovalEffect } from "../review-fix-finalize.js";
+import { createReviewFixFinalizer } from "../review-fix-finalize.js";
 import { createReviewFixGithubAdapter } from "../review-fix-github-adapter.js";
 import { resolveReviewProcess, type ReviewFixer } from "../review-process.js";
 import { acceptReviewFixWebhookEvent, updateReviewFixStatus } from "../review-fix-queue.js";
@@ -122,13 +122,7 @@ export function createProductionReviewFixServices(
         return { status: "withheld", reason: "current PR head or merge policy changed" };
       }
       const current = { ...input, currentAuthority: true, currentPrHeadSha: head };
-      const effect = await baseFinalizer.applyApproval(current);
-      if (effect.status === "withheld" && effect.reason.includes("reconcile via retryApprovalEffect")) {
-        // A previous effect may have reached GitHub before its local ACK was
-        // lost. The explicit retry observes the stable attempt marker first.
-        return retryApprovalEffect({ attemptStore: store, github }, current);
-      }
-      return effect;
+      return baseFinalizer.applyApproval(current);
     },
   };
   const pr = createReviewFixPR({

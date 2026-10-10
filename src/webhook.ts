@@ -467,7 +467,15 @@ export async function handleGitHubWebhook(
       forgetKgPr(kgPrCheck, kgRepoFullName, kgPrNumber);
     }
     if (kgRepoFullName && kgPrNumber && onReviewFixPrClosed) {
-      await onReviewFixPrClosed(kgRepoFullName, kgPrNumber);
+      try {
+        await onReviewFixPrClosed(kgRepoFullName, kgPrNumber);
+      } catch (err) {
+        // Authority is already revoked; the cancel forward did not land. 503 makes GitHub redeliver (AII-1178).
+        console.warn(`[webhook] review-fix cancellation for ${kgRepoFullName}#${kgPrNumber} unavailable:`, err);
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Review-fix cancellation unavailable" }));
+        return;
+      }
     }
   }
 

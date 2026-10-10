@@ -39,7 +39,7 @@ import { upsertReviewFinding } from "../../review-ledger-store.js";
 import { acceptReviewFixWebhookEvent, enqueueReviewFix, updateReviewFixStatus } from "../../review-fix-queue.js";
 import { REVIEW_PROCESSES, resolveReviewProcess } from "../../review-process.js";
 import { loadPendingReviewFixFeedback } from "../../review-fix-pending.js";
-import { createReviewFixFinalizer, retryApprovalEffect } from "../../review-fix-finalize.js";
+import { createReviewFixFinalizer } from "../../review-fix-finalize.js";
 import type { ReviewFixGitHubAdapter } from "../../review-fix-finalize.js";
 import { createReviewFixGithubAdapter } from "../../review-fix-github-adapter.js";
 import {
@@ -49,6 +49,8 @@ import {
   type ReviewFixWorkerTransport,
 } from "../../review-fix-worker.js";
 import { acceptDelivery } from "../../review-fix-inbox.js";
+import { queueReviewFixCancellationForClosedPr } from "../../review-fix-close.js";
+import { createReviewFixAdminFacade } from "../../review-fix-admin-facade.js";
 import { appendReviewFixActivityBatch, getReviewFixActivityGaps, getReviewFixCycleSummary, listReviewFixActivity, recordReviewFixCycleSummary } from "../../review-fix-evidence.js";
 import { handleRunnerActivity, handleRunnerResult, ReviewFixIntakeUnavailableError, type RunnerActivityBody } from "../../runner-callback.js";
 import { mintPreparedReviewFixToken } from "../../runner-tokens.js";
@@ -334,8 +336,7 @@ const transport: ReviewFixWorkerTransport = {
 // ---------------------------------------------------------------------------
 // Production composition: real store, real GitHub adapter (fake fetch), real
 // worker adapter (fake transport), real finalizer (with the same
-// applyApproval -> retryApprovalEffect reconciliation review-fix-production.ts
-// wires), real PR coordinator and attempt workflow. Per-attempt override hooks
+// applyApproval wrapper review-fix-production.ts wires), real PR coordinator and attempt workflow. Per-attempt override hooks
 // (never touched by a scenario that doesn't need them) are the only seam this
 // file adds beyond what review-fix-production.ts itself composes.
 // ---------------------------------------------------------------------------
@@ -345,7 +346,6 @@ const rawGithub = createReviewFixGithubAdapter({ credentials: fakeCredentials, f
 const github: ReviewFixGitHubAdapter = {
   getPrHeadSha: (scope) => rawGithub.getPrHeadSha(scope),
   evaluateMergePolicy: (scope, dispositions) => rawGithub.evaluateMergePolicy(scope, dispositions),
-  hasAppliedApprovalEffect: (scope, attemptId) => rawGithub.hasAppliedApprovalEffect(scope, attemptId),
   applyApprovalEffect: (scope, attemptId, result, dispositions) => {
     const fixture = findFixture(scope.repository);
     const impl = fixture.applyApprovalEffectOverride ?? rawGithub.applyApprovalEffect;
@@ -359,9 +359,8 @@ const worker = new GithubReviewFixWorker({
 
 const baseFinalizer = createReviewFixFinalizer({ attemptStore: sqliteStore, github });
 // Mirrors review-fix-production.ts's own applyApproval wrapper verbatim: re-check evidence,
-// then fall back to the explicit retryApprovalEffect reconciliation on the "already accepted,
-// not yet delivered" withhold — the exact path the "final effect before acknowledgement"
-// crash window (#5) needs.
+// then apply. A crash window after the GitHub write is the journaled step's retry plus the
+// adapter's upsert, not a second ledger.
 const finalizer = {
   recordOutcome: baseFinalizer.recordOutcome,
   applyApproval: async (input: Parameters<typeof baseFinalizer.applyApproval>[0]) => {
@@ -378,11 +377,7 @@ const finalizer = {
       return { status: "withheld" as const, reason: "current PR head or merge policy changed" };
     }
     const current = { ...input, currentAuthority: true, currentPrHeadSha: head };
-    const effect = await baseFinalizer.applyApproval(current);
-    if (effect.status === "withheld" && effect.reason.includes("reconcile via retryApprovalEffect")) {
-      return retryApprovalEffect({ attemptStore: sqliteStore, github }, current);
-    }
-    return effect;
+    return baseFinalizer.applyApproval(current);
   },
 };
 
@@ -1027,12 +1022,11 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
 
   // -------------------------------------------------------------------------
   // Crash window #5 (final effect before acknowledgement) — alwaysReplay only:
-  // baseFinalizer.applyApproval's ctx.run("apply-approval-once", ...) callback
-  // has no internal catch around the GitHub write, so recovery depends on the
-  // engine retrying the step and this file's finalizer wrapper falling through
-  // to retryApprovalEffect on the "already accepted" withhold.
+  // the GitHub write inside ctx.run("apply-approval-once") lands, then the step
+  // crashes. The engine retries the step, and the adapter's upsert makes the
+  // repeat write a no-op, so there is no inbox row to reconcile (AII-1186).
   // -------------------------------------------------------------------------
-  it("final approval effect before acknowledgement reconciles via retryApprovalEffect without a second GitHub write (alwaysReplay)", async () => {
+  it("a crash after the approval write is retried by the engine and leaves exactly one approval (alwaysReplay)", async () => {
     const env = envFor("alwaysReplay");
     const fixture = freshScenario("effect-crash");
     fixture.applyApprovalEffectOverride = crashAfterFirstCall(rawGithub.applyApprovalEffect.bind(rawGithub));
@@ -1044,7 +1038,8 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", result);
     const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!);
     expect(done).toMatchObject({ status: "finalized", approval: "applied" });
-    expect(fixture.commentPosts).toBe(1); // the crashed call's write actually landed; the retry only observed and acked it
+    expect(fixture.commentPosts).toBe(1); // the crashed call's write landed; the retry's upsert did not post a second comment
+    expect(getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox WHERE kind IN ('cancellation', 'terminal-effect')").get()).toEqual({ n: 0 });
   }, 25_000);
 
   it.each(VARIANTS.map(([label]) => label))("completed_at is the timestamp the record-success-outcome step journaled, and the journal holds no secret (%s)", async (label) => {
@@ -1105,6 +1100,43 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!)).status).toBe("finalized");
     admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`).get(fixture.attemptId!) as { released_at: number | null };
     expect(admission.released_at).not.toBeNull();
+  }, 25_000);
+
+  it.each(VARIANTS.map(([label]) => label))("a closed PR revokes authority and forwards cancel under <attemptId>.closed through the ingress client (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("closed-forward");
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+    const attemptId = fixture.attemptId!;
+    const ingress = createReviewFixIngressClient(env.baseUrl());
+    expect(await queueReviewFixCancellationForClosedPr(fixture.scope.repository, fixture.scope.prNumber, ingress)).toBe(true);
+    await eventually(() => fixture.cancelCalls > 0, Boolean, { timeoutMs: 5_000, label: "fixture.cancelCalls > 0" });
+    const row = getDb().prepare(`SELECT authority_revoked_at FROM review_fix_attempts WHERE attempt_id = ?`)
+      .get(attemptId) as { authority_revoked_at: number | null };
+    expect(row.authority_revoked_at).not.toBeNull();
+    fixture.runDetail = { status: "completed", conclusion: "cancelled", runAttempt: 1 };
+    expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId)).status).toBe("finalized");
+    expect(getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox WHERE kind IN ('cancellation', 'terminal-effect')").get()).toEqual({ n: 0 });
+  }, 25_000);
+
+  it.each(VARIANTS.map(([label]) => label))("an operator cancel forwards under <attemptId>.cancel and a repeat with the same key is absorbed (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("operator-forward");
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+    const attemptId = fixture.attemptId!;
+    const ingress = createReviewFixIngressClient(env.baseUrl());
+    const facade = createReviewFixAdminFacade(sqliteStore, { reconcile: async () => ({ status: "unknown" }) }, ingress);
+    const admin = { role: "admin" as const, email: "operator@example.com" };
+    expect(await facade.revokeAuthority(attemptId, admin)).toEqual({ status: "accepted" });
+    expect(await facade.requestCancellation(attemptId, admin)).toEqual({ status: "accepted" });
+    expect(await facade.requestCancellation(attemptId, admin)).toEqual({ status: "accepted" });
+    await eventually(() => fixture.cancelCalls > 0, Boolean, { timeoutMs: 5_000, label: "fixture.cancelCalls > 0" });
+    const rows = await queryInvocations(env.adminAPIBaseUrl(),
+      `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${attemptId}' AND target_handler_name = 'cancel'`);
+    expect(rows).toHaveLength(1);
+    fixture.runDetail = { status: "completed", conclusion: "cancelled", runAttempt: 1 };
+    expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId)).status).toBe("finalized");
   }, 25_000);
 
   it("authenticated activity intake preserves gaps, enforces both byte caps, and leaves cycle evidence independent", async () => {

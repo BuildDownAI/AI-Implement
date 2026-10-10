@@ -899,7 +899,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
       const state = await getPullRequestState(token, owner, repo, active.prNumber);
       if (state && shouldSkipReviewFix(state)) {
-        queueReviewFixCancellationForClosedPr(active.repository, active.prNumber);
+        await queueReviewFixCancellationForClosedPr(active.repository, active.prNumber, reviewFixIngressClient);
       }
     } catch (err) {
       console.warn(`[review-fix] Could not reconcile PR closure for ${active.repository}#${active.prNumber}:`, err);
@@ -4182,7 +4182,7 @@ function startServer(
   const reviewFixAttempts = createReviewFixAdminFacade(reviewFixAttemptStore, new GithubReviewFixWorker({
     credentials: createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey),
     scopeStore: reviewFixAttemptStoreScopeStore(reviewFixAttemptStore),
-  }));
+  }), reviewFixIngressClient);
   setReviewFixAttemptsFacade(reviewFixAttempts);
   const kgRefresh: KgRefreshHandle = makeKgRefresh({
     githubAppId: config.githubAppId,
@@ -4424,7 +4424,7 @@ function startServer(
             ? kgRefreshIngressClient.enqueueDryRun(parseKgSourceRepo(config.kgSourceRepo).fullName, { key, ...entry }, opts)
             : Promise.resolve({ status: "unavailable" as const }),
         forgetKgPr: (repo, prNumber) => kgRefresh.forgetPr(repo, prNumber),
-      }, (repository, prNumber) => { queueReviewFixCancellationForClosedPr(repository, prNumber); }, reviewFixIngressClient).catch((err) => {
+      }, async (repository, prNumber) => { await queueReviewFixCancellationForClosedPr(repository, prNumber, reviewFixIngressClient); }, reviewFixIngressClient).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });

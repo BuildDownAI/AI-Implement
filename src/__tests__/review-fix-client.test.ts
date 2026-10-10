@@ -48,10 +48,21 @@ function makeFakeFacade(overrides: Partial<ClientModule.ReviewFixDeliveryFacade>
   return {
     deliverFeedback: vi.fn(async () => ({ status: "accepted" }) as const),
     deliverResult: vi.fn(async () => ({ status: "accepted" }) as const),
-    deliverCancel: vi.fn(async () => ({ status: "accepted" }) as const),
     ...overrides,
   };
 }
+
+const resultFixture = {
+  version: 1,
+  attemptId: "attempt-1",
+  installationId: 7,
+  repository: "acme/app",
+  prNumber: 42,
+  deadlineAt: Date.now() + 1000,
+  githubRunId: 1,
+  githubRunAttempt: 1,
+  outputCommit: "a".repeat(40),
+} as const;
 
 describe("createRestateReviewFixFacade", () => {
   it("posts to the ReviewFixPR object's feedback handler with an idempotency-key header", async () => {
@@ -77,7 +88,7 @@ describe("createRestateReviewFixFacade", () => {
     });
     const facade = client.createRestateReviewFixFacade({ fetchImpl: fetchImpl as unknown as typeof fetch });
 
-    const outcome = await facade.deliverCancel("attempt-1", "cancellation:github:evt-1");
+    const outcome = await facade.deliverResult(resultFixture, "result:github:evt-1");
     expect(outcome).toEqual({ status: "unavailable" });
   });
 
@@ -116,7 +127,7 @@ describe("createRestateReviewFixFacade", () => {
       timeoutMs: 20,
     });
 
-    const outcome = await facade.deliverCancel("attempt-1", "cancellation:github:evt-1");
+    const outcome = await facade.deliverResult(resultFixture, "result:github:evt-1");
 
     expect(outcome).toEqual({ status: "unavailable" });
     expect((fetchImpl.mock.calls[0]![1] as RequestInit).signal).toBeInstanceOf(AbortSignal);
@@ -151,28 +162,6 @@ describe("ReviewFixDeliveryPump — mark-delivered only on acceptance", () => {
     expect(claim).toHaveBeenLastCalledWith(expect.objectContaining({ completionOnly: false }));
   });
 
-  it("delivers cancellation during a real deploy hold and resumes queued feedback afterward", async () => {
-    const { initSettingsTable } = await import("../runner-mode.js");
-    const { setDeployHold, clearDeployHold } = await import("../deploy-hold.js");
-    initSettingsTable();
-    const destination = makeDestination();
-    inbox.acceptDelivery({ authenticatedSource: "github", deliveryId: "feedback-held", kind: "feedback", destination, payload: {} });
-    inbox.acceptDelivery({ authenticatedSource: "github", deliveryId: "cancel-live", kind: "cancellation", destination, payload: { attemptId: "attempt-1" } });
-    const facade = makeFakeFacade();
-    const pump = new client.ReviewFixDeliveryPump({ facade, now: () => 1_000 });
-    setDeployHold();
-    try {
-      expect(await pump.tick()).toBe(1);
-      expect(facade.deliverFeedback).not.toHaveBeenCalled();
-      expect(facade.deliverCancel).toHaveBeenCalledTimes(1);
-      expect(inbox.getDelivery("github", "feedback-held")?.deliveryState).toBe("pending");
-    } finally {
-      clearDeployHold();
-    }
-    expect(await pump.tick()).toBe(1);
-    expect(facade.deliverFeedback).toHaveBeenCalledTimes(1);
-    expect(inbox.getDelivery("github", "feedback-held")?.deliveryState).toBe("delivered");
-  });
   it("never acks when the facade reports unavailable, leaving the row claimed", async () => {
     const destination = makeDestination();
     inbox.acceptDelivery({
@@ -342,26 +331,6 @@ describe("ReviewFixDeliveryPump — drain pause", () => {
 });
 
 describe("ReviewFixDeliveryPump — barrier re-check mid-batch", () => {
-  it("finishes cancellation but starts no new feedback after the deploy hold begins", async () => {
-    const destination = makeDestination();
-    for (const [index, deliveryId, kind] of [[1, "feedback-a", "feedback"], [2, "feedback-b", "feedback"], [3, "cancel-c", "cancellation"]] as const) {
-      inbox.acceptDelivery({ authenticatedSource: "github", deliveryId, kind, destination, payload: { attemptId: "attempt-1" } });
-      dedup.getDb().prepare("UPDATE review_fix_inbox SET accepted_at = ? WHERE event_id = ?").run(index, deliveryId);
-    }
-    let admissionOpen = true;
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    const deliverFeedback = vi.fn(async () => { await gate; return { status: "accepted" } as const; });
-    const deliverCancel = vi.fn(async () => ({ status: "accepted" }) as const);
-    const pump = new client.ReviewFixDeliveryPump({ facade: makeFakeFacade({ deliverFeedback, deliverCancel }), permitsNewFeedback: () => admissionOpen, now: () => 1_000 });
-    const pending = pump.tick();
-    admissionOpen = false;
-    release();
-    expect(await pending).toBe(2);
-    expect(deliverFeedback).toHaveBeenCalledTimes(1);
-    expect(deliverCancel).toHaveBeenCalledTimes(1);
-    expect(inbox.getDelivery("github", "feedback-b")).toMatchObject({ deliveryState: "pending", retryAt: 6_000 });
-  });
   // Regression for a stop()/pause() called while a multi-row batch is still awaiting its
   // first endpoint call: without a re-check before every row, the in-flight tick would
   // keep initiating endpoint calls for the rest of the claimed batch even after the
@@ -422,34 +391,6 @@ describe("ReviewFixDeliveryPump — barrier re-check mid-batch", () => {
 });
 
 describe("ReviewFixDeliveryPump — invalid payload vs. facade unavailable", () => {
-  it("reports a locally-invalid cancellation payload separately from a genuine facade outage, in both the reschedule cadence and status()", async () => {
-    const destination = makeDestination();
-    inbox.acceptDelivery({
-      authenticatedSource: "runner",
-      deliveryId: "evt-poison",
-      kind: "cancellation",
-      // No attemptId: extractAttemptId() will fail — this can never succeed by retrying
-      // the sidecar, unlike a real outage.
-      destination,
-      payload: {},
-    });
-
-    const facade = makeFakeFacade();
-    const pump = new client.ReviewFixDeliveryPump({ facade, now: () => 1_000, retryDelayMs: 500, invalidRetryDelayMs: 60_000 });
-
-    const delivered = await pump.tick();
-
-    expect(delivered).toBe(0);
-    expect(facade.deliverCancel).not.toHaveBeenCalled(); // never touches the network
-    const status = pump.status();
-    expect(status.lastTickInvalid).toBe(1);
-    expect(status.lastTickUnavailable).toBe(0);
-    // Rescheduled at the longer invalid-payload cadence, not the short transient-retry one.
-    const row = inbox.getDelivery("runner", "evt-poison");
-    expect(row?.deliveryState).toBe("pending");
-    expect(row?.retryAt).toBe(1_000 + 60_000);
-  });
-
   it("counts a genuine facade outage under lastTickUnavailable, not lastTickInvalid", async () => {
     const destination = makeDestination();
     inbox.acceptDelivery({ authenticatedSource: "github", deliveryId: "evt-down", kind: "feedback", destination, payload: {} });
@@ -537,26 +478,7 @@ describe("ReviewFixDeliveryPump — routing", () => {
     expect(Object.keys(forwarded)).not.toContain("apiToken");
   });
 
-  it("routes a cancellation event to deliverCancel with the attemptId extracted from the payload", async () => {
-    const destination = makeDestination();
-    inbox.acceptDelivery({
-      authenticatedSource: "runner",
-      deliveryId: "evt-cancel",
-      kind: "cancellation",
-      destination,
-      payload: { attemptId: "attempt-99" },
-    });
-
-    const facade = makeFakeFacade();
-    const pump = new client.ReviewFixDeliveryPump({ facade, now: () => 1_000 });
-
-    const delivered = await pump.tick();
-
-    expect(delivered).toBe(1);
-    expect(facade.deliverCancel).toHaveBeenCalledWith("attempt-99", expect.any(String));
-  });
-
-  it("leaves a terminal-effect row unclaimed for exact-identity finalizer reconciliation", async () => {
+  it("leaves a row of an unrouted kind unclaimed (routableOnly filters it out)", async () => {
     const destination = makeDestination();
     inbox.acceptDelivery({
       authenticatedSource: "runner",
@@ -574,7 +496,6 @@ describe("ReviewFixDeliveryPump — routing", () => {
     expect(delivered).toBe(0);
     expect(facade.deliverFeedback).not.toHaveBeenCalled();
     expect(facade.deliverResult).not.toHaveBeenCalled();
-    expect(facade.deliverCancel).not.toHaveBeenCalled();
     const row = inbox.getDelivery("runner", "evt-terminal");
     expect(row?.deliveryState).toBe("pending");
     expect(pump.status().lastTickUnavailable).toBe(0);
@@ -629,24 +550,6 @@ describe("ReviewFixDeliveryPump — producer contract", () => {
     expect(sent.attemptId).toBe("attempt-wake");
   });
 
-  it("contract: ReviewFixAttempt.cancel — a cancellation delivery posts { attemptId } to the attempt's cancel handler", async () => {
-    inbox.acceptDelivery({
-      authenticatedSource: "runner",
-      deliveryId: "evt-contract-cancel",
-      kind: "cancellation",
-      destination: makeDestination(),
-      payload: { attemptId: "attempt-cancel" },
-    });
-    const { calls, pump } = recordingPump();
-
-    expect(await pump.tick()).toBe(1);
-
-    expect(calls).toHaveLength(1);
-    expect(calls[0]!.url).toBe("http://ingress.test/ReviewFixAttempt/attempt-cancel/cancel");
-    expect(calls[0]!.init.method).toBe("POST");
-    expect((calls[0]!.init.headers as Record<string, string>)["idempotency-key"]).toBe("cancellation:runner:evt-contract-cancel");
-    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ attemptId: "attempt-cancel" });
-  });
 });
 
 describe("no launch/finalize/recovery decisions leak into this module", () => {
@@ -711,6 +614,33 @@ describe("createReviewFixIngressClient (AII-1184)", () => {
     const fetchImpl = vi.fn(async () => new Response("boom", { status: 503 }));
     const ingress = client.createReviewFixIngressClient("http://sidecar", { fetchImpl: fetchImpl as unknown as typeof fetch });
     expect(await ingress.feedback(makeDestination(), event, { idempotencyKey: "d1" })).toEqual({ status: "unavailable" });
+  });
+
+  describe("cancel (AII-1186)", () => {
+    const run = async (respond: () => Response | Promise<Response>) => {
+      const calls: Array<{ url: string; headers: Headers; body: string }> = [];
+      const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init);
+        calls.push({ url: request.url, headers: request.headers, body: await request.text() });
+        return respond();
+      });
+      const ingress = client.createReviewFixIngressClient("http://sidecar", { fetchImpl: fetchImpl as unknown as typeof fetch });
+      return { calls, outcome: await ingress.cancel("att-1", { idempotencyKey: "att-1.closed" }) };
+    };
+
+    it("contract: ReviewFixAttempt.cancel — the ingress client posts { attemptId } to the attempt's cancel handler with the idempotency key and maps a 2xx to accepted", async () => {
+      const { calls, outcome } = await run(() => new Response("null", { status: 200, headers: { "content-type": "application/json" } }));
+      expect(outcome).toEqual({ status: "accepted" });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.url).toBe("http://sidecar/ReviewFixAttempt/att-1/cancel");
+      expect(calls[0]!.headers.get("idempotency-key")).toBe("att-1.closed");
+      expect(JSON.parse(calls[0]!.body)).toEqual({ attemptId: "att-1" });
+    });
+
+    it("maps a non-2xx and a connection error to unavailable", async () => {
+      expect((await run(() => new Response("boom", { status: 503 }))).outcome).toEqual({ status: "unavailable" });
+      expect((await run(() => { throw new Error("ECONNREFUSED"); })).outcome).toEqual({ status: "unavailable" });
+    });
   });
 
   describe("result (AII-1185)", () => {
