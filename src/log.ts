@@ -264,7 +264,7 @@ export function appendLog(entry: {
   // never evict a row correlated to a Restate review-fix pilot attempt (via
   // dispatch_id) that is still unresolved (review_fix_attempts.completed_at IS
   // NULL) or completed within the last 7 days (AII-795). A terminal attempt
-  // stays exempt while delivery, reservation, result conflict, or execution
+  // stays exempt while reservation, result conflict, or execution
   // identity is unresolved, matching review-fix-evidence's retention guard.
   db.prepare(
     `DELETE FROM dispatch_log
