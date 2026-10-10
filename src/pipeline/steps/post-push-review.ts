@@ -28,6 +28,7 @@ import {
   type FindingDisposition,
 } from "../finding-dispositions.js";
 import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
+import type { ReviewProcessId } from "../../review-process.js";
 import { REVIEWER_VERDICT_SCHEMA, resolveTrustedReviewer, type ReviewerDefinition, type ReviewerFinding, type ReviewerVerdict } from "../reviewers/registry.js";
 import { isChecksPermissionError } from "../../checks-permission.js";
 import { inferTestResults, sumUsage, toolTraceLines, writeCycleSummary, type CycleDisposition } from "../cycle-summary.js";
@@ -43,6 +44,10 @@ interface PostPushReviewInputs extends Record<string, unknown> {
   reviewCheckNames?: string[];
   /** Project reviewer selections from trusted run_config. Absent keeps direct-call legacy behavior. */
   reviewers?: ReviewerSelection[];
+  /** Project review process from trusted run_config. Carried only; the step does not read it yet. */
+  reviewProcess?: ReviewProcessId;
+  /** Extra trusted review author logins from trusted run_config. Carried only; the step does not read it yet. */
+  trustedReviewAuthors?: string[];
   /** Selected image-baked reviewer code resolved before workspace reviewer config is consulted. */
   trustedReviewerDefinitions?: ReadonlyMap<string, ReviewerDefinition>;
   /** Prompt-only reviewer definitions parsed from the trusted default branch config. */

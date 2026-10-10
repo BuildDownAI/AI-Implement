@@ -386,6 +386,8 @@ describe("loadPipelineDefinition", () => {
     const repoReviewerDefinitions = [{ id: "repo-reviewer" }];
     const trustedConfigReviewerDefinitions = [{ id: "domain-reviewer" }];
     ctx.data.reviewers = selectedReviewers;
+    ctx.data.reviewProcess = "claude-code-review";
+    ctx.data.trustedReviewAuthors = ["x[bot]"];
     ctx.data.trustedReviewerDefinitions = trustedDefinitions;
     ctx.setOutputs("install", {
       reviewProviders: ["github-claude-code-review"],
@@ -400,6 +402,8 @@ describe("loadPipelineDefinition", () => {
     expect(inputs.prNumber).toBe("42");
     expect(inputs.reviewProviders).toEqual(["github-claude-code-review"]);
     expect(inputs.reviewers).toBe(selectedReviewers);
+    expect(inputs.reviewProcess).toBe("claude-code-review");
+    expect(inputs.trustedReviewAuthors).toEqual(["x[bot]"]);
     expect(inputs.trustedReviewerDefinitions).toBe(trustedDefinitions);
     expect(inputs.reviewerDefinitions).toBe(repoReviewerDefinitions);
     expect(inputs.trustedConfigReviewerDefinitions).toBe(trustedConfigReviewerDefinitions);
