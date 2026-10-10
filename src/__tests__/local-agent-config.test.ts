@@ -491,3 +491,179 @@ describe("ownership and port", () => {
     await expectCategory(new LocalSessionOwnership({ forbiddenRoots: [repo] }).acquire(sub), "session_busy");
   });
 });
+
+describe("chatgpt-sign-in references", () => {
+  const NOW = 1_800_000_000_000;
+  const MIN = 60_000;
+  const REFRESH_TOKEN = "rt-synthetic-refresh-0000";
+  const ID_TOKEN = "idt-synthetic-id-0000";
+  const OLD_ACCESS = "at-synthetic-old-0000";
+  const NEW_ACCESS = "at-synthetic-new-0000";
+  const NEW_REFRESH = "rt-synthetic-rotated-0000";
+  const recordPath = () => join(outside, "plan.json");
+
+  function record(overrides: Record<string, unknown> = {}) {
+    return {
+      version: 1, email: "a@example.com", issuer: "https://auth.openai.com", subject: "sub-1", clientId: "client-1",
+      extAgentHostId: "host-1", idToken: ID_TOKEN, accessToken: OLD_ACCESS, refreshToken: REFRESH_TOKEN, tokenType: "Bearer",
+      scopes: ["chatgpt.tokens.use.direct"], accessTokenExpiresAt: NOW + 10 * MIN, earliestRefreshAt: null, savedAt: NOW - MIN,
+      ...overrides,
+    };
+  }
+
+  function okResponse() {
+    return new Response(JSON.stringify({ access_token: NEW_ACCESS, refresh_token: NEW_REFRESH, id_token: ID_TOKEN, expires_in: 3600 }), { status: 200 });
+  }
+  function errResponse(status: number, error?: string) {
+    return new Response(JSON.stringify(error ? { error } : {}), { status });
+  }
+
+  async function setup(rec: unknown, io: Record<string, unknown> = {}) {
+    await privateFile(recordPath(), typeof rec === "string" ? rec : JSON.stringify(rec));
+    const cfg = baseConfig();
+    (cfg.profiles[2] as Record<string, unknown>).sessionPath = recordPath();
+    (cfg.profiles[2] as Record<string, unknown>).sessionSource = "chatgpt-sign-in";
+    const loaded = await loadLocalAgentConfig(opts(await writeConfig(cfg)));
+    const ownership = new LocalSessionOwnership({ forbiddenRoots: [repo], onDiagnostic: (d) => diagnostics.push(d) });
+    const port = createLocalCredentialPort({
+      references: loaded.references, forbiddenRoots: [repo], ownership, onDiagnostic: (d) => diagnostics.push(d),
+      io: { now: () => NOW, ...io },
+    });
+    const sub = loaded.references.get("sub-a")!;
+    return { loaded, ownership, port, sub };
+  }
+  const load = (port: ReturnType<typeof createLocalCredentialPort>) => port.load({ profileId: "sub-a", authMode: "codex-subscription" });
+  const secrets = [REFRESH_TOKEN, ID_TOKEN, NEW_REFRESH];
+
+  it("parses only for codex-subscription and keeps the session kind", async () => {
+    const { sub } = await setup(record());
+    expect(sub).toMatchObject({ kind: "session", sessionSource: "chatgpt-sign-in" });
+    const claude = baseConfig({
+      stages: { planning: stageBlock("c", "claude", "anthropic"), implementation: stageBlock("c", "claude", "anthropic"), review: stageBlock("c", "claude", "anthropic") },
+      profiles: [{ id: "c", identity: "c", revision: 1, agent: "claude", provider: "anthropic", authMode: "claude-subscription",
+        sessionPath: recordPath(), sessionSource: "chatgpt-sign-in", trustedPrivateTesting: true }],
+    });
+    await expect(loadLocalAgentConfig(opts(await writeConfig(claude)))).rejects.toMatchObject({ category: "config_invalid" });
+    const api = baseConfig();
+    (api.profiles[0] as Record<string, unknown>).sessionSource = "chatgpt-sign-in";
+    await expect(loadLocalAgentConfig(opts(await writeConfig(api)))).rejects.toMatchObject({ category: "config_invalid" });
+    const untrusted = baseConfig();
+    (untrusted.profiles[2] as Record<string, unknown>).sessionSource = "chatgpt-sign-in";
+    delete (untrusted.profiles[2] as Record<string, unknown>).trustedPrivateTesting;
+    await expect(loadLocalAgentConfig(opts(await writeConfig(untrusted)))).rejects.toMatchObject({ category: "subscription_unauthorized" });
+  });
+
+  it("returns the current token without a refresh call when it has enough life", async () => {
+    const fetchMock = vi.fn();
+    const { ownership, port, sub } = await setup(record({ accessTokenExpiresAt: NOW + 56 * MIN }), { fetch: fetchMock });
+    await ownership.acquire(sub);
+    const secret = await load(port);
+    expect(secret).toEqual({ kind: "chatgpt-access-token", accessToken: OLD_ACCESS, expiresAt: NOW + 56 * MIN });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("refreshes when earliestRefreshAt has passed even if the token is fresh", async () => {
+    const fetchMock = vi.fn(async () => okResponse());
+    const { ownership, port, sub } = await setup(record({ accessTokenExpiresAt: NOW + 59 * MIN, earliestRefreshAt: NOW - 1 }), { fetch: fetchMock });
+    await ownership.acquire(sub);
+    expect(await load(port)).toMatchObject({ accessToken: NEW_ACCESS });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("ok: writes the new record atomically and returns only the access token", async () => {
+    const { ownership, port, sub } = await setup(record(), { fetch: vi.fn(async () => okResponse()) });
+    const lease = await ownership.acquire(sub);
+    const secret = await load(port);
+    expect(secret).toEqual({ kind: "chatgpt-access-token", accessToken: NEW_ACCESS, expiresAt: NOW + 3600_000 });
+    const text = JSON.stringify(secret) + JSON.stringify(diagnostics);
+    for (const s of secrets) expect(text).not.toContain(s);
+    const saved = JSON.parse(await readFile(recordPath(), "utf8"));
+    expect(saved).toMatchObject({ accessToken: NEW_ACCESS, refreshToken: NEW_REFRESH });
+    expect((await stat(recordPath())).mode & 0o777).toBe(0o600);
+    expect((await readdir(outside)).filter((n) => n.endsWith(".tmp"))).toEqual([]);
+    // The host record is durable, so the lease releases without a container persist.
+    await ownership.release(lease, { confirmTermination: async () => "confirmed" });
+    expect(lease.status).toBe("released");
+  });
+
+  it("transient with more than 2 minutes left returns the old token and leaves the file unchanged", async () => {
+    const original = JSON.stringify(record({ accessTokenExpiresAt: NOW + 2 * MIN + 1 }));
+    const { ownership, port, sub } = await setup(original, { fetch: vi.fn(async () => errResponse(503)) });
+    await ownership.acquire(sub);
+    expect(await load(port)).toEqual({ kind: "chatgpt-access-token", accessToken: OLD_ACCESS, expiresAt: NOW + 2 * MIN + 1 });
+    expect(await readFile(recordPath(), "utf8")).toBe(original);
+  });
+
+  it("transient with 2 minutes or less left fails credential_unreadable", async () => {
+    const original = JSON.stringify(record({ accessTokenExpiresAt: NOW + 2 * MIN }));
+    const { ownership, port, sub } = await setup(original, { fetch: vi.fn(async () => errResponse(503)) });
+    await ownership.acquire(sub);
+    await expectCategory(load(port), "credential_unreadable", secrets);
+    expect(await readFile(recordPath(), "utf8")).toBe(original);
+  });
+
+  it("reauth_required fails authentication_required and names the login command", async () => {
+    const original = JSON.stringify(record());
+    const { ownership, port, sub } = await setup(original, { fetch: vi.fn(async () => errResponse(400, "invalid_grant")) });
+    await ownership.acquire(sub);
+    const error = await load(port).catch((e: unknown) => e);
+    expect(error).toMatchObject({ category: "authentication_required" });
+    expect((error as Error).message).toContain("chatgpt-plan-login.js login");
+    expect(await readFile(recordPath(), "utf8")).toBe(original);
+  });
+
+  it("invalid_client fails config_invalid and leaves the file unchanged", async () => {
+    const original = JSON.stringify(record());
+    const { ownership, port, sub } = await setup(original, { fetch: vi.fn(async () => errResponse(401, "invalid_client")) });
+    await ownership.acquire(sub);
+    await expectCategory(load(port), "config_invalid", secrets);
+    expect(await readFile(recordPath(), "utf8")).toBe(original);
+  });
+
+  it("returns no token when the rename fails, and keeps the original record", async () => {
+    const original = JSON.stringify(record());
+    const { ownership, port, sub } = await setup(original, {
+      fetch: vi.fn(async () => okResponse()),
+      rename: vi.fn(async () => { throw new Error(`boom ${NEW_REFRESH}`); }),
+    });
+    await ownership.acquire(sub);
+    await expectCategory(load(port), "persistence_failed", secrets);
+    expect(await readFile(recordPath(), "utf8")).toBe(original);
+    expect((await readdir(outside)).filter((n) => n.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it("returns no token when the directory sync fails", async () => {
+    const { ownership, port, sub } = await setup(record(), {
+      fetch: vi.fn(async () => okResponse()),
+      syncDir: vi.fn(async () => { throw new Error("sync"); }),
+    });
+    await ownership.acquire(sub);
+    await expectCategory(load(port), "persistence_failed", secrets);
+  });
+
+  it("requires the lease and rejects unparsable records", async () => {
+    const { ownership, port, sub } = await setup(record());
+    await expectCategory(load(port), "session_not_owned");
+    await ownership.acquire(sub);
+    await privateFile(recordPath(), '{"version":1}');
+    await expectCategory(load(port), "credential_invalid");
+    await privateFile(recordPath(), "not json");
+    await expectCategory(load(port), "credential_invalid");
+  });
+
+  it("serializes concurrent loads so only one refresh runs", async () => {
+    const fetchMock = vi.fn(async () => okResponse());
+    const { ownership, port, sub } = await setup(record(), { fetch: fetchMock });
+    await ownership.acquire(sub);
+    const [a, b] = await Promise.all([load(port), load(port)]);
+    expect(a).toMatchObject({ accessToken: NEW_ACCESS });
+    expect(b).toMatchObject({ accessToken: NEW_ACCESS });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects container persistence into a ChatGPT record", async () => {
+    const { ownership, port, sub } = await setup(record());
+    await ownership.acquire(sub);
+    await expectCategory(port.persistSession!({ profileId: "sub-a", sessionData: "x" }), "persistence_failed");
+  });
+});

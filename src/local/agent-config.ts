@@ -13,6 +13,13 @@ import {
   type StageAgentConfigurationV1,
   type StageConfigResolution,
 } from "../agent-config.js";
+import {
+  accessTokenUsableFor,
+  parseChatGptPlanRecord,
+  refreshChatGptPlanRecord,
+  serializeChatGptPlanRecord,
+  shouldRefresh,
+} from "../chatgpt-plan-token.js";
 import type { LocalCredentialPort } from "../model-auth-client.js";
 import {
   MAX_API_CREDENTIAL_LENGTH,
@@ -37,7 +44,10 @@ import {
  *       "id", "identity", "revision", "agent", "provider", "authMode",
  *       "credentialPath"            // API-key modes: separately protected local file
  *       "sessionPath"               // subscription modes: separately protected local file
- *       "sessionSource": "local-login"      // subscription only; "hosted-copy" is rejected
+ *       "sessionSource": "local-login" | "chatgpt-sign-in"
+ *                                           // subscription only; "hosted-copy" is rejected.
+ *                                           // "chatgpt-sign-in" is codex-subscription only: sessionPath is a
+ *                                           // ChatGPT plan record that the host refreshes
  *       "trustedPrivateTesting": true       // subscription only; explicit authorization
  *     }]
  *   }
@@ -59,6 +69,7 @@ export type LocalAgentConfigFailure =
   | "unsafe_permissions"
   | "credential_unreadable"
   | "credential_invalid"
+  | "authentication_required"
   | "subscription_unauthorized"
   | "hosted_session_copy"
   | "resolution_rejected"
@@ -225,6 +236,8 @@ export interface LocalCredentialReference {
   readonly kind: "api-key" | "session";
   /** Canonical (realpath) location of the protected file. */
   readonly canonicalPath: string;
+  /** Subscription references only: how the session file is produced. */
+  readonly sessionSource?: "local-login" | "chatgpt-sign-in";
 }
 
 export interface LocalAgentConfigOptions {
@@ -248,6 +261,7 @@ interface ParsedProfile {
   readonly profile: AccountProfile;
   readonly path: string;
   readonly kind: "api-key" | "session";
+  readonly sessionSource?: "local-login" | "chatgpt-sign-in";
 }
 
 const PROFILE_KEYS = [
@@ -293,8 +307,12 @@ function parseProfile(raw: unknown, index: number, projectKey: string): ParsedPr
     if (raw.sessionSource === "hosted-copy") {
       fail("hosted_session_copy", `${ctx} copied hosted session state is not an independent local login`);
     }
-    if (raw.sessionSource !== "local-login") {
-      fail("config_invalid", `${ctx}.sessionSource must be local-login`);
+    if (raw.sessionSource === "chatgpt-sign-in") {
+      if (authMode !== "codex-subscription") {
+        fail("config_invalid", `${ctx}.sessionSource chatgpt-sign-in is valid only for codex-subscription`);
+      }
+    } else if (raw.sessionSource !== "local-login") {
+      fail("config_invalid", `${ctx}.sessionSource must be local-login or chatgpt-sign-in`);
     }
     if (raw.trustedPrivateTesting !== true) {
       fail("subscription_unauthorized", `${ctx} subscription use requires explicit trusted private testing authorization`);
@@ -324,6 +342,7 @@ function parseProfile(raw: unknown, index: number, projectKey: string): ParsedPr
     },
     path,
     kind: isSubscription ? "session" : "api-key",
+    ...(isSubscription ? { sessionSource: raw.sessionSource as "local-login" | "chatgpt-sign-in" } : {}),
   };
 }
 
@@ -399,6 +418,7 @@ async function loadImpl(options: LocalAgentConfigOptions): Promise<LoadedLocalAg
       authMode: entry.profile.authMode,
       kind: entry.kind,
       canonicalPath: file.canonicalPath,
+      ...(entry.sessionSource ? { sessionSource: entry.sessionSource } : {}),
     });
   }
   return { resolution, references };
@@ -730,8 +750,19 @@ export interface LocalCredentialPortOptions {
   ownership?: LocalSessionOwnership;
   onDiagnostic?: (diagnostic: LocalAgentConfigDiagnostic) => void;
   /** Test seam for failure injection. */
-  io?: { rename?: typeof rename; syncDir?: (dir: string) => Promise<void>; afterVerifyOwner?: () => Promise<void> };
+  io?: {
+    rename?: typeof rename;
+    syncDir?: (dir: string) => Promise<void>;
+    afterVerifyOwner?: () => Promise<void>;
+    fetch?: typeof fetch;
+    now?: () => number;
+  };
 }
+
+/** A ChatGPT access token is refreshed when it has less than this left. */
+const CHATGPT_REQUIRED_MS = 55 * 60_000;
+/** On a transient refresh failure the old token is still returned while it has more than this left. */
+const CHATGPT_FALLBACK_MS = 2 * 60_000;
 
 /**
  * `LocalCredentialPort` over the selected protected files only. Never scans ambient logins
@@ -766,12 +797,107 @@ export function createLocalCredentialPort(options: LocalCredentialPortOptions): 
     return lease;
   }
 
+  /** Temp, fsync, rename, directory sync. The caller owns the lease and the error mapping. */
+  async function writeSessionFile(
+    reference: LocalCredentialReference,
+    lease: LocalSessionLease,
+    state: LeaseState,
+    data: string,
+    onTemp: (tempPath: string | undefined) => void,
+  ): Promise<void> {
+    const roots = await prepareForbiddenRoots(options.forbiddenRoots);
+    const file = await validateProtectedFile(reference.canonicalPath, roots, "session reference", { singleLink: true });
+    if (file.canonicalPath !== state.canonicalPath) {
+      fail("unsafe_path", "session reference moved while owned");
+    }
+    const target = file.canonicalPath;
+    const tempPath = join(dirname(target), `.${basename(target)}.${randomBytes(6).toString("hex")}.tmp`);
+    const handle = await open(tempPath, "wx", 0o600);
+    onTemp(tempPath);
+    try {
+      await handle.writeFile(data, "utf8");
+      await handle.chmod(0o600);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    if (!(await lstat(target)).isFile()) fail("unsafe_path", "session reference must be a regular file");
+    await options.ownership!.verifyOwner(lease);
+    await renameFile(tempPath, target);
+    onTemp(undefined);
+    // Not acknowledged until the rename itself is durable.
+    await syncDir(dirname(target));
+  }
+
+  /** Serializes ChatGPT loads per profile so concurrent bridge calls cannot both rotate the refresh token. */
+  const chatGptLoads = new Map<string, Promise<unknown>>();
+
+  async function loadChatGptAccessToken(reference: LocalCredentialReference): Promise<ModelAuthSecret> {
+    // Read inside the queue so a waiting load sees the record the previous load wrote.
+    const roots = await prepareForbiddenRoots(options.forbiddenRoots);
+    const file = await validateProtectedFile(reference.canonicalPath, roots, "credential reference", { singleLink: true });
+    let content: string;
+    try {
+      content = await readBounded(file.canonicalPath, MAX_SESSION_DATA_LENGTH);
+    } catch {
+      return fail("credential_unreadable", "credential reference could not be read");
+    }
+    if (content.length === 0 || content.length > MAX_SESSION_DATA_LENGTH) {
+      fail("credential_invalid", "session reference is empty or too large");
+    }
+    let parsedJson: unknown;
+    try {
+      parsedJson = JSON.parse(content);
+    } catch {
+      return fail("credential_invalid", "ChatGPT plan record is not valid JSON");
+    }
+    const parsed = parseChatGptPlanRecord(parsedJson);
+    if (!parsed.ok) fail("credential_invalid", "ChatGPT plan record is invalid");
+    let record = parsed.value;
+    const now = options.io?.now ?? Date.now;
+    if (shouldRefresh(record, now(), CHATGPT_REQUIRED_MS)) {
+      const result = await refreshChatGptPlanRecord(record, { fetch: options.io?.fetch ?? fetch, now });
+      if (result.ok) {
+        const lease = await currentLease(reference, false, true);
+        const state = leaseStates.get(lease)!;
+        let tempPath: string | undefined;
+        try {
+          // Write first: a rotated refresh token that is not saved loses the session.
+          await writeSessionFile(reference, lease, state, serializeChatGptPlanRecord(result.record), (p) => {
+            tempPath = p;
+          });
+        } catch (error) {
+          if (tempPath) await unlink(tempPath).catch(() => undefined);
+          throw toSafeError(error, "persistence_failed", "refreshed ChatGPT plan record could not be saved");
+        }
+        record = result.record;
+      } else if (result.failure === "reauth_required") {
+        fail("authentication_required", "ChatGPT sign-in has expired; run `node dist/chatgpt-plan-login.js login` again");
+      } else if (result.failure === "invalid_client") {
+        fail("config_invalid", "ChatGPT plan record client is not accepted; run `node dist/chatgpt-plan-login.js login` again");
+      } else if (!accessTokenUsableFor(record, now(), CHATGPT_FALLBACK_MS + 1)) {
+        fail("credential_unreadable", "ChatGPT access token could not be refreshed and is about to expire");
+      }
+    }
+    // The host record is always durable, so release has nothing further to persist.
+    const lease = options.ownership?.leaseFor(reference.profileId);
+    const state = lease ? leaseStates.get(lease) : undefined;
+    if (state) state.refreshed = true;
+    return { kind: "chatgpt-access-token", accessToken: record.accessToken, expiresAt: record.accessTokenExpiresAt };
+  }
+
   const port: LocalCredentialPort = {
     async load(request): Promise<ModelAuthSecret> {
       try {
         const reference = referenceFor(request.profileId, request.authMode);
-        const roots = await prepareForbiddenRoots(options.forbiddenRoots);
         if (isSubscriptionAuthMode(reference.authMode)) await currentLease(reference, false, true);
+        if (reference.kind === "session" && reference.sessionSource === "chatgpt-sign-in") {
+          const previous = chatGptLoads.get(reference.profileId) ?? Promise.resolve();
+          const run = previous.catch(() => undefined).then(() => loadChatGptAccessToken(reference));
+          chatGptLoads.set(reference.profileId, run);
+          return await run;
+        }
+        const roots = await prepareForbiddenRoots(options.forbiddenRoots);
         const file = await validateProtectedFile(reference.canonicalPath, roots, "credential reference", {
           singleLink: reference.kind === "session",
         });
@@ -810,6 +936,9 @@ export function createLocalCredentialPort(options: LocalCredentialPortOptions): 
         if (!reference || reference.kind !== "session") {
           fail("credential_unreadable", "profile is not a selected subscription session");
         }
+        if (reference.sessionSource === "chatgpt-sign-in") {
+          fail("persistence_failed", "ChatGPT plan records are refreshed by the host only");
+        }
         // A held lease is still the current owner; a late refresh must remain persistable.
         const lease = await currentLease(reference, true, true);
         state = leaseStates.get(lease)!;
@@ -821,27 +950,9 @@ export function createLocalCredentialPort(options: LocalCredentialPortOptions): 
         ) {
           fail("credential_invalid", "refreshed session state is empty or too large");
         }
-        const roots = await prepareForbiddenRoots(options.forbiddenRoots);
-        const file = await validateProtectedFile(reference.canonicalPath, roots, "session reference", { singleLink: true });
-        if (file.canonicalPath !== state.canonicalPath) {
-          fail("unsafe_path", "session reference moved while owned");
-        }
-        const target = file.canonicalPath;
-        tempPath = join(dirname(target), `.${basename(target)}.${randomBytes(6).toString("hex")}.tmp`);
-        const handle = await open(tempPath, "wx", 0o600);
-        try {
-          await handle.writeFile(request.sessionData, "utf8");
-          await handle.chmod(0o600);
-          await handle.sync();
-        } finally {
-          await handle.close();
-        }
-        if (!(await lstat(target)).isFile()) fail("unsafe_path", "session reference must be a regular file");
-        await options.ownership!.verifyOwner(lease);
-        await renameFile(tempPath, target);
-        tempPath = undefined;
-        // Not acknowledged until the rename itself is durable.
-        await syncDir(dirname(target));
+        await writeSessionFile(reference, lease, state, request.sessionData, (p) => {
+          tempPath = p;
+        });
         state.refreshed = true;
       } catch (error) {
         if (tempPath) await unlink(tempPath).catch(() => undefined);

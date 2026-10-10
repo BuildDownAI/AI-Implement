@@ -657,6 +657,66 @@ async function runSubscriptionLifecycleSimulation(root) {
   }
 }
 
+export async function runChatGptSignInScenario(root) {
+  const [{ loadLocalAgentConfig, LocalSessionOwnership, createLocalCredentialPort }, { createModelAuthClient }] = await Promise.all([
+    import(pathToFileURL(join(REPO_ROOT, "dist", "local", "agent-config.js")).href),
+    import(pathToFileURL(join(REPO_ROOT, "dist", "model-auth-client.js")).href),
+  ]);
+  const runRoot = mkdtempSync(join(root, "chatgpt-sign-in-"));
+  try {
+    const fixture = await makeSubscriptionFixture(runRoot, "chatgpt");
+    const now = Date.now();
+    const oldRecord = {
+      version: 1, email: "synthetic@example.invalid", issuer: "https://auth.openai.com", subject: "synthetic-subject",
+      clientId: "synthetic-client", extAgentHostId: "synthetic-host", idToken: "synthetic-id-token", accessToken: "synthetic-old-access",
+      refreshToken: "synthetic-old-refresh", tokenType: "Bearer", scopes: ["chatgpt.tokens.use.direct"],
+      accessTokenExpiresAt: now + 60_000, earliestRefreshAt: null, savedAt: now - 3_000_000,
+    };
+    await writePrivateFile(fixture.authPath, JSON.stringify(oldRecord));
+    const config = JSON.parse(await readFile(fixture.configPath, "utf8"));
+    config.profiles[0].sessionSource = "chatgpt-sign-in";
+    await writePrivateFile(fixture.configPath, JSON.stringify(config));
+    const loaded = await loadLocalAgentConfig({ configPath: fixture.configPath, projectKey: "local-demo", forbiddenRoots: [fixture.repo] });
+    const ownership = new LocalSessionOwnership({ forbiddenRoots: [fixture.repo] });
+    // The fake token endpoint is injected in-process, so no network call is made.
+    let fetchCalls = 0;
+    const fakeFetch = async () => {
+      fetchCalls += 1;
+      return new Response(JSON.stringify({ access_token: "synthetic-new-access", refresh_token: "synthetic-new-refresh", expires_in: 3600 }), { status: 200 });
+    };
+    const port = createLocalCredentialPort({ references: loaded.references, forbiddenRoots: [fixture.repo], ownership, io: { fetch: fakeFetch } });
+    const client = createModelAuthClient({
+      source: { kind: "local", port },
+      authRoot: fixture.authRoot,
+      forbiddenRoots: [fixture.repo],
+      inheritedEnv: { PATH: process.env.PATH ?? "/usr/bin" },
+    });
+    const lease = await ownership.acquire(loaded.references.get("sub"));
+    const capture = {};
+    await client.checkout({ profileId: "sub", authMode: "codex-subscription" });
+    await client.invoke("sub", async ({ env }) => {
+      capture.hasAccessToken = env.CHATGPT_PLAN_ACCESS_TOKEN === "synthetic-new-access";
+      capture.leakedRefresh = Object.values(env).some((v) => typeof v === "string" && (v.includes("synthetic-new-refresh") || v.includes("synthetic-old-refresh") || v.includes("synthetic-id-token")));
+      capture.noAuthJson = !(typeof env.CODEX_HOME === "string" && existsSync(join(env.CODEX_HOME, "auth.json")));
+    });
+    await client.finish("sub", "completed");
+    await client.dispose();
+    await ownership.release(lease, { confirmTermination: async () => "confirmed" });
+    const saved = JSON.parse(await readFile(fixture.authPath, "utf8"));
+    const checks = {
+      containerEnvHasAccessToken: capture.hasAccessToken === true,
+      containerEnvHasNoRefreshOrIdToken: capture.leakedRefresh === false,
+      noAuthJson: capture.noAuthJson === true,
+      refreshedOnce: fetchCalls === 1,
+      recordRotatedOnHost: saved.refreshToken === "synthetic-new-refresh",
+      leaseReleased: lease.status === "released",
+    };
+    return { name: "chatgpt-sign-in", ok: Object.values(checks).every(Boolean), checks };
+  } finally {
+    await rm(runRoot, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
 async function runNetworkIsolationScenario({ root, imageId, providerScript }) {
   const peer = await createNetworkAndPeer({ root: join(root, "network-isolation"), imageId, providerScript, providerPort: DEFAULT_PROVIDER_PORT, bridgePort: DEFAULT_BRIDGE_PORT, bridgeTargetPort: DEFAULT_BRIDGE_PORT });
   try {
@@ -863,6 +923,7 @@ async function runSyntheticGate(options) {
     scenarios.push(await runInvalidConfigScenario({ root: artifactsDir, cliModule, imageId: image.imageId, fixture }));
     scenarios.push(await runNodePreloadScenario());
     scenarios.push(await runSubscriptionLifecycleSimulation(privateRoot));
+    scenarios.push(await runChatGptSignInScenario(privateRoot));
     scenarios.push(await runCliScenario({ name: "provider500", root: artifactsDir, cliModule, imageId: image.imageId, providerScript, fixture, agent, failureMode: "500" }));
     scenarios.push(await runCliScenario({ name: "cancel-hang", root: artifactsDir, cliModule, imageId: image.imageId, providerScript, fixture, agent, failureMode: "hang", cancelAfterMs: 5000 }));
     const success = await runCliScenario({ name: "success", root: artifactsDir, cliModule, imageId: image.imageId, providerScript, fixture, agent });
@@ -916,7 +977,7 @@ function detectProjectKey(workspace) {
   return projectKey;
 }
 
-function assertLiveReferencesOutsideActiveAuth(references) {
+export function assertLiveReferencesOutsideActiveAuth(references) {
   const home = process.env.HOME ? join(process.env.HOME, ".codex", "auth.json") : undefined;
   const codexHome = process.env.CODEX_HOME ? join(process.env.CODEX_HOME, "auth.json") : undefined;
   const active = [home, codexHome].filter(Boolean).map((p) => safeRealpath(p));
