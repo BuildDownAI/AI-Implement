@@ -338,7 +338,7 @@ export function setKgExecutionMode(mode: KgExecutionBackend): void {
 
 export interface KgBackendResolution {
   mode: KgExecutionBackend | "local-docker";
-  source: "runner-mode" | "kg-setting" | "env" | "default" | "fly-unconfigured";
+  source: "runner-mode" | "kg-setting" | "default" | "fly-unconfigured";
 }
 
 /**
