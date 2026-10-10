@@ -355,7 +355,7 @@ did not test). Scenarios follow four rules, and
    ```
 
 3. **`env.baseUrl()` and `env.adminAPIBaseUrl()` are read at the point of use**, never stored in a `const` that outlives
-   a `restart()` (a restart can change what it returns):
+   a `restart()` (rebuild the client after a restart rather than reuse one built before it):
 
    ```ts
    await eventually(() => clientFor(env).repoStatus(slug), (marker) => marker.status === "accepted");

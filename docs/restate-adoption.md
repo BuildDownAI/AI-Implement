@@ -73,7 +73,7 @@ The concern is that depending on a Business Source License 1.1 component pressur
 |---|---|---|
 | AI-Implement, BuildDownAI/skills | Apache-2.0 | our own source |
 | `@restatedev/restate-sdk` | MIT | imported into our code, shipped in our image |
-| `@restatedev/restate-sdk-testcontainers` | MIT | test-only dependency |
+| `@restatedev/restate-sdk-testcontainers` | MIT | removed 2026-10-10 (AII-1195); no longer a dependency |
 | `@restatedev/restate-server` (v1.7.10) | BSL 1.1 | run unmodified as a sidecar binary |
 
 The code we compile and distribute — the SDK — is MIT and imposes nothing. Only the server binary is BSL, and we run it unmodified as a separate process; we do not distribute a modified Restate server, which is what BSL's terms govern. A dependency's licence does not propagate to a project that merely runs it, and BSL 1.1 additionally converts to an open licence at its change date (Apache-2.0 for Restate; read the server's own `LICENSE` for the exact date and the additional-use grant). **Keep AI-Implement and the skills repo Apache-2.0.** There is no legal or practical reason to move our code to BSL, and doing so would give away the permissive terms our own users rely on for no benefit. The one thing worth doing is recording, in a dependency note, that the server binary is BSL and why that is acceptable — which is what ADR 017 already states.
