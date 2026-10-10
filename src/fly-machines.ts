@@ -235,7 +235,7 @@ export async function waitForMachineSettled(
   token: string,
   appName: string,
   machineId: string,
-  { timeoutMs = 60_000, intervalMs = 1_000, until }: SettleOptions = {},
+  { timeoutMs = SETTLE_TIMEOUT_MS, intervalMs = 1_000, until }: SettleOptions = {},
 ): Promise<Machine | null> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -254,8 +254,13 @@ export async function waitForMachineSettled(
   }
 }
 
-const CLEAR_ATTEMPTS = 3;
+export const CLEAR_ATTEMPTS = 3;
+export const SETTLE_TIMEOUT_MS = 60_000;
 const DEFAULT_RATE_LIMIT_WAIT_MS = 2_000;
+/** Longest a 429 `Retry-After` may stall one `clearMachineEnv` pass, whatever Fly asks for. */
+export const MAX_RATE_LIMIT_WAIT_MS = 30_000;
+/** Upper bound of one `clearMachineEnv` call, excluding HTTP latency: each pass settles twice and may sleep once on a 429. */
+export const CLEAR_MACHINE_ENV_MAX_MS = CLEAR_ATTEMPTS * (2 * SETTLE_TIMEOUT_MS + MAX_RATE_LIMIT_WAIT_MS);
 
 function isEnvCleared(machine: Machine, metadata?: Record<string, string>): boolean {
   if (Object.keys(machine.config.env ?? {}).length > 0) return false;
@@ -296,10 +301,10 @@ export async function clearMachineEnv(
         metadata ? { ...config, metadata: { ...machine.config.metadata, ...metadata } } : config,
       );
     } catch (err) {
-      if (err instanceof FlyApiError && err.status === 409 && /concurrent update in progress/i.test(err.message)) {
+      if (err instanceof FlyApiError && err.status === 409 && /concurrent update in progress|machine is replacing/i.test(err.message)) {
         // An update is applying; the settle at the top of the next pass waits it out.
       } else if (err instanceof FlyApiError && err.status === 429) {
-        await sleep(err.retryAfterSeconds !== null ? err.retryAfterSeconds * 1000 : DEFAULT_RATE_LIMIT_WAIT_MS);
+        await sleep(err.retryAfterSeconds !== null ? Math.min(err.retryAfterSeconds * 1000, MAX_RATE_LIMIT_WAIT_MS) : DEFAULT_RATE_LIMIT_WAIT_MS);
       } else {
         throw err;
       }
