@@ -321,6 +321,8 @@ function buildLaunchInputs(plan: WorkerLaunchPlan, mapping: RepoMapping): Dispat
       ? { sensitiveFiles: { add: mapping.sensitiveAddPatterns ?? undefined, allow: mapping.sensitiveAllowPatterns ?? undefined } }
       : {}),
     ...(mapping.reviewers != null ? { reviewers: mapping.reviewers } : {}),
+    ...(mapping.reviewProcess != null ? { reviewProcess: mapping.reviewProcess } : {}),
+    ...(mapping.trustedReviewAuthors != null ? { trustedReviewAuthors: mapping.trustedReviewAuthors } : {}),
     ...(mapping.dependencyTokenScope != null ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
   };
 

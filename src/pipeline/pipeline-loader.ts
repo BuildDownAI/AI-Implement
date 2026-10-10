@@ -341,6 +341,8 @@ function applyWiring(step: YamlStep): StepDefinition {
           reviewProviders: ctx.getOutputs("install").reviewProviders,
           reviewCheckNames: ctx.getOutputs("install").reviewCheckNames,
           reviewers: ctx.data.reviewers,
+          reviewProcess: ctx.data.reviewProcess,
+          trustedReviewAuthors: ctx.data.trustedReviewAuthors,
           trustedReviewerDefinitions: ctx.data.trustedReviewerDefinitions,
           reviewerDefinitions: ctx.getOutputs("install").reviewers,
           trustedConfigReviewerDefinitions: ctx.getOutputs("install").trustedConfigReviewers,

@@ -29,9 +29,7 @@ describe("production review-fix GitHub effect", () => {
       credentials: { resolve: async () => ({ token: "secret-token", installationId: 7 }) },
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
-    expect(await adapter.hasAppliedApprovalEffect(scope, attemptId)).toBe(false);
     await adapter.applyApprovalEffect(scope, attemptId, result, [{ findingKey: "f1", disposition: "addressed" }]);
-    expect(await adapter.hasAppliedApprovalEffect(scope, attemptId)).toBe(true);
     await adapter.applyApprovalEffect(scope, attemptId, result, [{ findingKey: "f1", disposition: "addressed" }]);
     expect(posts).toBe(1);
     expect(comments[0].body).toContain("f1");

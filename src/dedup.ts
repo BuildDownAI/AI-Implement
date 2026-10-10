@@ -47,26 +47,6 @@ function ensureAdminSessionColumns(): void {
   if (!names.has("name")) db.exec("ALTER TABLE admin_sessions ADD COLUMN name TEXT");
 }
 
-/** AII-781: tombstones are tracked independently of payload retention — a delivery
- *  can be tombstoned without its payload_json being purged, and a later payload-purge
- *  path (if one is ever added) must not clear this column. `conflict_at` /
- *  `conflict_count` mark that an identity was reused with different content
- *  (rejected, not overwritten) without disturbing the originally accepted row. */
-function ensureReviewFixInboxColumns(): void {
-  if (!db) return;
-  const info = db.prepare("PRAGMA table_info(review_fix_inbox)").all() as Array<{ name: string }>;
-  const names = new Set(info.map((c) => c.name));
-  if (!names.has("tombstoned_at")) {
-    db.exec("ALTER TABLE review_fix_inbox ADD COLUMN tombstoned_at INTEGER");
-  }
-  if (!names.has("conflict_at")) {
-    db.exec("ALTER TABLE review_fix_inbox ADD COLUMN conflict_at INTEGER");
-  }
-  if (!names.has("conflict_count")) {
-    db.exec("ALTER TABLE review_fix_inbox ADD COLUMN conflict_count INTEGER NOT NULL DEFAULT 0");
-  }
-}
-
 /** AII-792: the source event identity a webhook-intake caller supplies to
  *  `acceptReviewFixWebhookEvent` (review-fix-queue.ts) — the GitHub delivery id when
  *  present, else a synthesized hash. NULL for the pre-existing internal producers
@@ -339,28 +319,9 @@ export function getDb(): Database.Database {
       BEFORE UPDATE OF owner ON review_fix_attempts
       WHEN NEW.owner <> OLD.owner
       BEGIN SELECT RAISE(ABORT, 'review-fix attempt owner is immutable'); END`);
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS review_fix_inbox (
-        authenticated_source TEXT NOT NULL,
-        event_id TEXT NOT NULL,
-        installation_id TEXT NOT NULL,
-        repository TEXT NOT NULL,
-        pr_number INTEGER NOT NULL,
-        kind TEXT NOT NULL,
-        payload_json TEXT NOT NULL,
-        payload_hash TEXT NOT NULL,
-        accepted_at INTEGER NOT NULL,
-        delivery_state TEXT NOT NULL DEFAULT 'pending',
-        retry_at INTEGER,
-        delivered_at INTEGER,
-        PRIMARY KEY (authenticated_source, event_id)
-      )
-    `);
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_inbox_due
-      ON review_fix_inbox(delivery_state, retry_at, accepted_at)`);
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_inbox_pr
-      ON review_fix_inbox(installation_id, repository, pr_number, accepted_at)`);
-    ensureReviewFixInboxColumns();
+    // The `review_fix_inbox` table (AII-781) is no longer created or read: review-fix events go
+    // straight to Restate ingress (AII-1187, ADR 031). An existing table is left in place, rows
+    // and all, for history; nothing drops it.
     // AII-779: retain bounded redacted activity independently from completed
     // cycle evidence. The byte tally is updated only after a new event insert,
     // so replayed identities cannot consume the allowance again.
