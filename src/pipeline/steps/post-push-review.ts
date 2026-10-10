@@ -2218,7 +2218,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         : collectExternalReviewFindingsFromGh(ghSpawn, prNumber, {
             process: reviewProcess,
             extraAuthors: trustedReviewAuthors,
-            ...(externalReviewResult.headSha ? { headSha: externalReviewResult.headSha } : {}),
+            ...(externalReviewResult.headSha && reviewProcess.id !== "ai-implement" ? { headSha: externalReviewResult.headSha } : {}),
           });
       const externalFindings = processVerdict?.verdict === "changes_requested" && externalFindingsResult.findings.length === 0
         ? processVerdict.findings

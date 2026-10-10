@@ -6539,8 +6539,8 @@ describe("postPushReviewStep review process gate", () => {
     return { ghSpawn, posted };
   }
 
-  async function run(f: ReturnType<typeof fixture>, extra: Record<string, unknown> = {}) {
-    const invoke = vi.fn(async () => structuredReviewResult({ approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 }));
+  async function run(f: ReturnType<typeof fixture>, extra: Record<string, unknown> = {}, reviewerOutput: unknown = { approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 }) {
+    const invoke = vi.fn(async () => structuredReviewResult(reviewerOutput));
     const logs: string[] = [];
     const log = vi.spyOn(console, "log").mockImplementation((...a) => { logs.push(a.join(" ")); });
     const warns: string[] = [];
@@ -6585,6 +6585,27 @@ describe("postPushReviewStep review process gate", () => {
     const { out } = await run(f);
     expect(out.approved).toBe(true);
     expect(f.posted.join("\n")).not.toContain("🔴 old");
+  });
+
+  it("keeps waiting when a trusted block carries no verdict (incomplete with a source)", async () => {
+    const block = {
+      user: { login: "claude[bot]", type: "Bot" }, created_at: "2026-01-01T00:00:00Z", html_url: "https://x/c",
+      body: "```json review-findings\n" + JSON.stringify({ schema: "review-findings/v1", findings: [] }) + "\n```",
+    };
+    const { out } = await run(fixture({ runs: [actions("success")], issueComments: [block] }));
+    expect(out.approved).toBe(false);
+    expect(out.terminationReason).toBe("external_review_pending");
+  });
+
+  it("still counts an unresolved thread on an older commit under ai-implement", async () => {
+    const f = fixture({ runs: [actions("success")], threads: [thread("🔴 old finding", "oldsha")] });
+    const { out } = await run(f, {
+      reviewProcess: "ai-implement",
+      reviewers: [{ id: "code-review", gates: true }],
+      trustedReviewerDefinitions: new Map([["code-review", { id: "code-review", buildPrompt: () => "p", outputSchema: { type: "object" } }]]),
+    }, { approved: true, findings: [] });
+    expect(out.approved).toBe(false);
+    expect(f.posted.join("\n")).toContain("old finding");
   });
 
   it("is no real verdict when the matched check failed", async () => {
