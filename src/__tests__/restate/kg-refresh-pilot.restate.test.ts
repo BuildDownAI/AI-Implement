@@ -407,7 +407,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
 
       replacement = await replaceEndpoint(env, services);
       await env.startedRestateServer.restart();
-      // A server restart remaps the ingress port; the old client would keep the stale one.
+      // Rebuild the client after the restart rather than reuse one built before it.
       client = clientFor(env);
       await eventually(() => clientFor(env).repoStatus(KG_SOURCE_REPO), (marker) => marker.status === "accepted", { label: "ingress reachable after restart", timeoutMs: 30_000 });
 
@@ -441,7 +441,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
 
       replacement = await replaceEndpoint(env, services);
       await env.startedRestateServer.restart();
-      // A server restart remaps the ingress port; the old client would keep the stale one.
+      // Rebuild the client after the restart rather than reuse one built before it.
       client = clientFor(env);
       await eventually(() => stageCommittedCalls >= 2, (ok) => ok, { label: "durable effect", timeoutMs: 30_000 });
       await eventually(() => kgRows().some((r) => r.status === "completed"), (ok) => ok, { label: "durable effect", timeoutMs: 30_000 });
