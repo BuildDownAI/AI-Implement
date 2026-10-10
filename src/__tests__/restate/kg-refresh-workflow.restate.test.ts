@@ -2319,50 +2319,36 @@ describe("KgRefresh durable workflow", () => {
       const env = envFor(label);
       const triggerId = newTriggerId();
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
-      // swapGate's restart call fails with no suspension point of its own, so hold it open
-      // until a concurrent status poll has actually observed "swap", then fail it exactly as
-      // before. The latch is bounded: if the poll never sees "swap" the restart proceeds after
-      // STATUS_LATCH_MAX_MS and the assertion below fails with a named message.
-      // Only the first restart fails (inside swapGate itself); revertRail's own restart call
-      // afterward must still succeed so the workflow can report a reverted outcome.
-      const swapLatch = boundedLatch(STATUS_LATCH_MAX_MS);
-      const releaseSwapGate = swapLatch.release;
+      // Hold swapGate's restart call open on a gate: the `step` write runs just before the gate,
+      // so while the restart is parked the run is inside swap and one `status` read answers
+      // "swap". Then release it and fail it with the same RailGateError.
+      // Only the first restart is held and fails (inside swapGate itself); revertRail's own
+      // restart call afterward must still succeed so the workflow can report a reverted outcome.
+      const swapHeld = gate("swap restart held");
       let swapAttempts = 0;
       restartImpl = async () => {
         swapAttempts++;
         if (swapAttempts !== 1) return;
-        await swapLatch.promise;
+        await swapHeld.wait();
         throw new RailGateError("staging", "forced swap failure for W14");
       };
 
       const done = runWorkflow(env.baseUrl(), triggerId);
       await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
 
-      // Poll `status` concurrently with the run so it observes the "swap" step while the
-      // workflow is still executing it.
-      const observedSteps = new Set<string | null>();
-      let polling = true;
-      const statusPoll = (async () => {
-        while (polling) {
-          try {
-            const status = await callWorkflow<{ step: string | null }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
-            observedSteps.add(status.step);
-            if (status.step === "swap") releaseSwapGate();
-          } catch {
-            // the workflow may be mid-transition between invocations; retry on the next tick.
-          }
-          await new Promise((resolve) => setTimeout(resolve, 10)); // restate-test-allow: samples the step over the run's lifetime
-        }
-      })();
-
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
-      const outcome = await done;
-      polling = false;
-      releaseSwapGate(); // no-op if already released; unblocks the poll loop regardless
-      await statusPoll;
+      let outcome;
+      try {
+        await swapHeld.reached();
+        const heldStatus = await callWorkflow<{ step: string | null }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
+        expect(heldStatus.step).toBe("swap");
+      } finally {
+        // Release even when the assertion fails, so the run is not left held in the shared environment.
+        swapHeld.release();
+        outcome = await done;
+      }
 
       expect(outcome.ok).toBe(false);
-      expect(observedSteps.has("swap"), `step "swap" was not observed within the ${STATUS_LATCH_MAX_MS}ms latch bound`).toBe(true);
       expect(restartCallCount).toBe(2);
       expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("staging");
     },
