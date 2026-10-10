@@ -380,8 +380,9 @@ did not test). Scenarios follow four rules, and
    ```
 
 4. **A scenario that does not test a deadline runs with deadlines that are long against its own work; a scenario that
-   tests a deadline uses its own short-deadline environment.** `kg-refresh-workflow.restate.test.ts` serves both:
-   `envFor(label)` (30 s / 60 s) and `deadlineEnvFor(label)` (the short deadlines). The short deadlines are a 1 s bootstrap and a 1.8 s total, with a 100 ms watch tick. The
+   tests a deadline uses its own short-deadline environment.** `kg-refresh-workflow.restate.test.ts` serves three:
+   `envFor(label)` (30 s / 60 s), `deadlineEnvFor(label)` (the short deadlines), and `bootstrapEnvFor(label)` (the 1 s
+   bootstrap deadline with a 30 s total, for a scenario that must act after the bootstrap deadline and has no upper bound to beat). The short deadlines are a 1 s bootstrap and a 1.8 s total, with a 100 ms watch tick. The
    bootstrap deadline is the one that cannot shrink: AII-1125's started read must arrive inside it, AII-1111 raised a 400 ms
    bootstrap to avoid that race, and AII-1028 measured invocation start delays up to 1.08 s on a loaded runner.
 
