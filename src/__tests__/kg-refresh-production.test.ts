@@ -932,7 +932,7 @@ describe("launchKeptMachine: the dispatch step's Fly write", () => {
     expect(calls).toEqual(["list"]);
   });
 
-  it("does not list when a machine is kept", async () => {
+  it("does not list when a kept machine is updated and started", async () => {
     const { fly, calls } = makeFly(async () => ({ state: "stopped" }));
     await launch(fly, "m-1");
     expect(calls).not.toContain("list");
@@ -1032,13 +1032,49 @@ describe("launchKeptMachine: the dispatch step's Fly write", () => {
   it("creates a replacement when the kept machine is destroyed", async () => {
     const { fly, calls } = makeFly(async () => ({ state: "destroyed" }));
     await expect(launch(fly, "m-1")).resolves.toMatchObject({ machineId: "m-new", created: true, replaced: "m-1" });
-    expect(calls).toEqual(["get", "create"]);
+    expect(calls).toEqual(["get", "list", "create"]);
   });
 
   it("creates a replacement when the lookup answers 404", async () => {
     const { fly, calls } = makeFly(async () => { throw notFound(); });
     await expect(launch(fly, "m-1")).resolves.toMatchObject({ machineId: "m-new", created: true, replaced: "m-1" });
-    expect(calls).toEqual(["get", "create"]);
+    expect(calls).toEqual(["get", "list", "create"]);
+  });
+
+  const orphan = { id: "m-orphan", state: "started", config: { metadata: { dispatch_id: "d1", purpose: "durable-runner" }, env: { MACHINE_NONCE: "adopted-nonce" } } };
+  const adoptedResult = { machineId: "m-orphan", machineNonce: "adopted-nonce", created: true, reused: false, adopted: true, replaced: "m-1" };
+
+  it("adopts the dispatch's machine on every gone path instead of creating", async () => {
+    const a = makeFly(async () => { throw notFound(); }, async () => [orphan]);
+    await expect(launch(a.fly, "m-1")).resolves.toEqual(adoptedResult);
+    expect(a.fly.createMachine).not.toHaveBeenCalled();
+
+    const b = makeFly(async () => ({ state: "replacing" }), async () => [orphan]);
+    vi.mocked(b.fly.waitSettled).mockResolvedValue(null);
+    await expect(launch(b.fly, "m-1")).resolves.toEqual(adoptedResult);
+    expect(b.fly.createMachine).not.toHaveBeenCalled();
+
+    const c = makeFly(async () => ({ state: "destroyed" }), async () => [orphan]);
+    await expect(launch(c.fly, "m-1")).resolves.toEqual(adoptedResult);
+    expect(c.fly.createMachine).not.toHaveBeenCalled();
+
+    const d = makeFly(async () => ({ state: "stopped" }), async () => [orphan]);
+    vi.mocked(d.fly.updateMachine).mockRejectedValue(new Error("Failed to update machine m-1 (409): machine is replacing"));
+    vi.mocked(d.fly.waitSettled).mockResolvedValue({ state: "destroyed" } as never);
+    await expect(launch(d.fly, "m-1")).resolves.toEqual(adoptedResult);
+    expect(d.fly.createMachine).not.toHaveBeenCalled();
+  });
+
+  it("ignores the kept id itself when adopting on a gone path", async () => {
+    const { fly } = makeFly(async () => { throw notFound(); }, async () => [{ ...orphan, id: "m-1" }]);
+    await expect(launch(fly, "m-1")).resolves.toMatchObject({ machineId: "m-new", replaced: "m-1" });
+    expect(fly.createMachine).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws without creating when the list fails on a gone path", async () => {
+    const { fly } = makeFly(async () => { throw notFound(); }, async () => { throw new Error("Failed to list machines (500): boom"); });
+    await expect(launch(fly, "m-1")).rejects.toThrow(/Failed to list machines/);
+    expect(fly.createMachine).not.toHaveBeenCalled();
   });
 
   it("throws on any other lookup error so the step retries", async () => {
