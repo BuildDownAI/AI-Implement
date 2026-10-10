@@ -43,6 +43,7 @@ function mapping(overrides: Partial<RepoMapping> & Pick<RepoMapping, "owner" | "
     referenceRepos: null,
     reviewers: null,
     reviewFixLifecycle: null,
+    reviewProcess: null,
     ...overrides,
   };
 }
@@ -607,6 +608,83 @@ describe("config", () => {
     expect(config.resolvePrDispatchBudget({ prDispatchBudget: null })).toBe(4);
     expect(config.resolvePrDispatchBudget({ prDispatchBudget: 6 })).toBe(6);
     expect(config.DEFAULT_PR_DISPATCH_BUDGET).toBe(4);
+  });
+
+  it("round-trips trustedReviewAuthors (including null)", () => {
+    config.initMappingsTable();
+    config.upsertMapping("TRUSTED", mapping({ owner: "org", repo: "repo", trustedReviewAuthors: ["codex-reviewer[bot]"] }));
+    config.upsertMapping("UNTRUSTED", mapping({ owner: "org", repo: "repo", trustedReviewAuthors: null }));
+
+    const all = config.getMappings();
+    expect(all.TRUSTED.trustedReviewAuthors).toEqual(["codex-reviewer[bot]"]);
+    expect(all.UNTRUSTED.trustedReviewAuthors).toBeNull();
+  });
+
+  it("migrates a pre-existing mappings table to include the trusted_review_authors column, reading back null", () => {
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE mappings (
+        team_key TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        workflow_file TEXT NOT NULL,
+        default_branch TEXT NOT NULL,
+        max_in_progress_ai_issues INTEGER NOT NULL DEFAULT 3,
+        execution_mode TEXT NOT NULL DEFAULT 'github-actions',
+        session_mode TEXT NOT NULL DEFAULT 'autonomous',
+        machine_cpus INTEGER NOT NULL DEFAULT 2,
+        machine_memory_mb INTEGER NOT NULL DEFAULT 4096,
+        planning_enabled INTEGER NOT NULL DEFAULT 0,
+        planning_workflow_file TEXT NOT NULL DEFAULT 'claude-plan.yml',
+        auto_approve_plans INTEGER NOT NULL DEFAULT 1,
+        extra_env TEXT,
+        provider TEXT NOT NULL DEFAULT 'anthropic',
+        ticketing_provider TEXT NOT NULL DEFAULT 'linear',
+        ticketing_config TEXT NOT NULL DEFAULT '{"kind":"linear"}',
+        aws_region TEXT
+      )
+    `);
+    db.prepare("INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES (?, ?, ?, ?, ?)")
+      .run("LEG", "org", "legacy", "claude-implement.yml", "main");
+    db.close();
+
+    config.initMappingsTable();
+    expect(config.getMappings().LEG.trustedReviewAuthors).toBeNull();
+  });
+
+  it("round-trips reviewProcess and resolves it to a process id", () => {
+    config.initMappingsTable();
+    config.upsertMapping("CCR", mapping({ owner: "org", repo: "repo", reviewProcess: "claude-code-review" }));
+    config.upsertMapping("DEF", mapping({ owner: "org", repo: "repo", reviewProcess: null }));
+
+    const all = config.getMappings();
+    expect(all.CCR.reviewProcess).toBe("claude-code-review");
+    expect(config.resolveReviewProcessId(all.CCR)).toBe("claude-code-review");
+    expect(all.DEF.reviewProcess).toBeNull();
+    expect(config.resolveReviewProcessId(all.DEF)).toBe("ai-implement");
+  });
+
+  it("resolveReviewProcessId reads an unknown stored string as the default", () => {
+    expect(config.resolveReviewProcessId({ reviewProcess: "future" as never })).toBe("ai-implement");
+  });
+
+  it("migrates a pre-existing mappings table to include the review_process column, reading back null", () => {
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE mappings (
+        team_key TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        workflow_file TEXT NOT NULL,
+        default_branch TEXT NOT NULL
+      )
+    `);
+    db.prepare("INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES (?, ?, ?, ?, ?)")
+      .run("LEG", "org", "legacy", "claude-implement.yml", "main");
+    db.close();
+
+    config.initMappingsTable();
+    expect(config.getMappings().LEG.reviewProcess).toBeNull();
   });
 
   it("round-trips branchPrefix (including null)", () => {

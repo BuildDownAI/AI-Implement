@@ -461,6 +461,8 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
               ? { sensitiveFiles: { add: mapping.sensitiveAddPatterns ?? undefined, allow: mapping.sensitiveAllowPatterns ?? undefined } }
               : {}),
             ...(mapping.reviewers != null ? { reviewers: mapping.reviewers } : {}),
+            ...(mapping.reviewProcess != null ? { reviewProcess: mapping.reviewProcess } : {}),
+            ...(mapping.trustedReviewAuthors != null ? { trustedReviewAuthors: mapping.trustedReviewAuthors } : {}),
             ...(item.instruction ? { commentInstruction: item.instruction } : {}),
             retryPolicy: getRetryPolicy(),
           };

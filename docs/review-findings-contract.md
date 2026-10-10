@@ -168,3 +168,25 @@ fenced block) and calls `gh pr comment`. Nothing about `probeExternalReviewCheck
 (`src/pipeline/steps/post-push-review.ts`) cares which reviewer produced the
 check run — it matches on the check-run **name**, configurable via
 `reviewCheckNames` in `.ai-implement/config.yml` (see the root `CLAUDE.md`).
+
+## Who reads the block
+
+Two readers share one parser and one author rule, both via
+`classifyReviewIssueComment` in `src/pipeline/review-ledger.ts`: the in-run
+`post-push-review` step, and the `issue_comment` webhook handler
+(`src/webhook.ts`), which reads the block from a comment posted *after* the
+run already ended — a reviewer that finishes late still starts a review-fix
+run instead of being silently dropped. See
+[docs/review-fix-rail.md](review-fix-rail.md) for the post-run half of the
+rail and the full author-eligibility and dispatch-gating rules.
+
+## Claude Code Review as the reviewer
+
+A project whose review process is `claude-code-review` (ADR 038, `src/review-process.ts`) does not need to emit the block. The reader takes the strongest source present, in this order:
+
+1. **A `review-findings` block** from a trusted comment: its verdict and findings win (`source: "review-contract"`). A block with no verdict reads as `incomplete`.
+2. **The hosted service's check run**, `Claude Code Review` from app `claude`. Its conclusion is always `neutral` and is not read. The verdict comes from the line ending its Details, `<!-- bughunter-severity: {"normal":N,"nit":N,"pre_existing":N} -->`: `normal > 0` is `changes_requested`, else `approve` (`source: "bughunter-severity"`).
+3. **The repository's own `claude-code-action` job**, a completed check from app `github-actions` (named `review` by default). `success` with no blocking inline comment on the head is `approve`; a blocking comment is `changes_requested`; any other conclusion is `no-real-verdict` (`source: "check-and-comments"`).
+4. **No completed matching check** is `incomplete`.
+
+Inline comments count only from a trusted author of type `Bot`, on the head commit (or with no commit id). A body starting 🔴 is `blocking`, 🟡 is `minor`, 🟣 (pre-existing) adds no finding, and an untagged comment is recorded as `minor`, so a reviewer that emits no markers never blocks a merge by itself. The `claude` check is matched by app slug and name together: a check named `Claude Code Review` from `github-actions` is not the hosted one.

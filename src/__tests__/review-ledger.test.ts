@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { resolveReviewProcess } from "../review-process.js";
 import {
+  classifyReviewIssueComment,
   collectExternalReviewFindingsFromGh,
   extractClaudeSummaryFindings,
   extractGithubActionsClaudeReviewFindings,
@@ -1939,6 +1941,112 @@ describe("collectExternalReviewFindingsFromGh", () => {
   });
 });
 
+describe("classifyReviewIssueComment", () => {
+  it("returns null for an author outside the trusted allowlist, even with a valid block", () => {
+    expect(
+      classifyReviewIssueComment({
+        user: { login: "random-user" },
+        body: "```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[{\"severity\":\"blocking\",\"body\":\"Nope.\"}]}\n```",
+        html_url: "https://example.com/1",
+      }),
+    ).toBeNull();
+  });
+
+  it("returns null for the rail's own self-marked comment, regardless of author", () => {
+    expect(
+      classifyReviewIssueComment({
+        user: { login: "claude" },
+        body: "<!-- ai-implement post-push iter=1 review-feedback -->\n### Code Review\n\n## Blocking\n- Ignore our own marker comment.",
+        html_url: "https://example.com/2",
+      }),
+    ).toBeNull();
+  });
+
+  it("returns null for an eligible github-actions[bot] author with no block and no Claude heading", () => {
+    expect(
+      classifyReviewIssueComment({
+        user: { login: "github-actions[bot]", type: "Bot" },
+        body: "Deployed a preview environment for this PR.",
+        html_url: "https://example.com/3",
+      }),
+    ).toBeNull();
+  });
+
+  it("returns an approve verdict with empty findings and verdictSource review-contract", () => {
+    expect(
+      classifyReviewIssueComment({
+        user: { login: "github-actions[bot]", type: "Bot" },
+        body: "```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"approve\",\"findings\":[]}\n```",
+        html_url: "https://example.com/4",
+      }),
+    ).toEqual({
+      findings: [],
+      findingsUnavailable: false,
+      verdict: "approve",
+      verdictSource: "review-contract",
+    });
+  });
+
+  it("returns review-contract findings tagged with source review-contract", () => {
+    expect(
+      classifyReviewIssueComment({
+        user: { login: "github-actions[bot]", type: "Bot" },
+        body: "```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[{\"severity\":\"blocking\",\"path\":\"src/x.ts\",\"line\":10,\"body\":\"Missing null check.\"}]}\n```",
+        html_url: "https://example.com/5",
+      }),
+    ).toEqual({
+      findings: [
+        {
+          source: "review-contract",
+          severity: "blocking",
+          path: "src/x.ts",
+          line: 10,
+          body: "Missing null check.",
+          url: "https://example.com/5",
+        },
+      ],
+      findingsUnavailable: false,
+      verdict: "changes_requested",
+      verdictSource: "review-contract",
+    });
+  });
+
+  it("flags an unclosed block as findingsUnavailable with verdict incomplete", () => {
+    expect(
+      classifyReviewIssueComment({
+        user: { login: "github-actions[bot]", type: "Bot" },
+        body: "```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[",
+        html_url: "https://example.com/6",
+      }),
+    ).toEqual({
+      findings: [],
+      findingsUnavailable: true,
+      verdict: "incomplete",
+      verdictSource: "review-contract",
+    });
+  });
+
+  it("falls back to heading-based prose extraction for a trusted Claude author with no block", () => {
+    expect(
+      classifyReviewIssueComment({
+        user: { login: "claude" },
+        body: "### Code Review\n\n## Blocking\n- Validate path params before database access.",
+        html_url: "https://example.com/7",
+      }),
+    ).toEqual({
+      findings: [
+        {
+          source: "claude-review-summary",
+          severity: "blocking",
+          body: "Validate path params before database access.",
+          url: "https://example.com/7",
+        },
+      ],
+      findingsUnavailable: false,
+    });
+  });
+});
+
 function isPullReviewsRequest(args: string[]): boolean {
   return args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100");
 }
@@ -1946,3 +2054,72 @@ function isPullReviewsRequest(args: string[]): boolean {
 function isIssueCommentsRequest(args: string[]): boolean {
   return args.includes("repos/:owner/:repo/issues/42/comments?per_page=100");
 }
+
+describe("collectExternalReviewFindingsFromGh review process options (AII-1181)", () => {
+  function spawnWithThreads(threads: Array<{ login: string; body: string }>, reviews: unknown[] = []): GhSpawn {
+    return (args) => {
+      if (isPullReviewsRequest(args)) return { exitCode: 0, stdout: JSON.stringify(reviews) };
+      if (isIssueCommentsRequest(args)) return { exitCode: 0, stdout: "[]" };
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  nodes: threads.map((t, i) => ({
+                    isResolved: false,
+                    isOutdated: false,
+                    path: "src/x.ts",
+                    line: i + 1,
+                    comments: { nodes: [{ body: t.body, url: `https://example.com/t${i}`, author: { login: t.login } }] },
+                  })),
+                },
+              },
+            },
+          },
+        }),
+      };
+    };
+  }
+
+  const ccr = { process: resolveReviewProcess("claude-code-review"), extraAuthors: [] as string[] };
+  const threads = [
+    { login: "claude", body: "🔴 bug" },
+    { login: "claude", body: "untagged" },
+    { login: "claude", body: "🟣 old" },
+    { login: "claude", body: "🟡 nit" },
+  ];
+
+  it("maps 🔴 to blocking, untagged and 🟡 to minor, and skips 🟣 under claude-code-review", () => {
+    const result = collectExternalReviewFindingsFromGh(spawnWithThreads(threads), "42", ccr);
+    expect(result.findings.map((f) => [f.body, f.severity])).toEqual([
+      ["🔴 bug", "blocking"],
+      ["untagged", "minor"],
+      ["🟡 nit", "minor"],
+    ]);
+  });
+
+  it("stays medium for every thread with no options", () => {
+    const result = collectExternalReviewFindingsFromGh(spawnWithThreads(threads), "42");
+    expect(result.findings.map((f) => f.severity)).toEqual(["medium", "medium", "medium", "medium"]);
+  });
+
+  it("keeps a human thread medium under claude-code-review", () => {
+    const result = collectExternalReviewFindingsFromGh(spawnWithThreads([{ login: "a-human", body: "🟣 note" }]), "42", ccr);
+    expect(result.findings.map((f) => f.severity)).toEqual(["medium"]);
+  });
+
+  it("keeps blocking for a CHANGES_REQUESTED author whatever the marker", () => {
+    const reviews = [{ state: "CHANGES_REQUESTED", user: { login: "claude[bot]" }, body: "", html_url: "https://example.com/r" }];
+    const result = collectExternalReviewFindingsFromGh(spawnWithThreads([{ login: "claude", body: "🟡 nit" }], reviews), "42", ccr);
+    expect(result.findings.filter((f) => f.source === "github-review-thread").map((f) => f.severity)).toEqual(["blocking"]);
+  });
+
+  it("applies the extra authors to trusted-author comment classification", () => {
+    const comment = { body: "### Code Review\n\n## Blocking\n- A finding.", user: { login: "topia-ai-implement-bot[bot]", type: "Bot" } };
+    expect(classifyReviewIssueComment(comment)).toBeNull();
+    const withExtra = { process: resolveReviewProcess("ai-implement"), extraAuthors: ["topia-ai-implement-bot[bot]"] };
+    expect(classifyReviewIssueComment(comment, withExtra)?.findings.length).toBeGreaterThan(0);
+  });
+});

@@ -255,6 +255,8 @@ Editable per mapping; blank means the default.
 | Sensitive Add / Allow Globs | none | Extends or un-blocks the push step's blocklist; **allow always wins** |
 | Dependency Token Scope | off | `installation` lets the run read private sibling repos during dependency install |
 | PR Dispatch Budget | 4 | Gap-fill runs per PR per rolling 24 h; at the limit the PR is parked for a human |
+| Trusted Review Authors | none | Extra GitHub logins (additive to the built-ins) whose `approve` block can gate a merge |
+| Review process | `ai-implement` | Who reviews a PR and who fixes it (ADR 038): `ai-implement` or `claude-code-review`. Stored as NULL for the default. Applies only under the Restate review-fix lifecycle; a Legacy project stores it inert. Set in the project drawer next to the lifecycle select; read by the webhook, the in-run gate, and `ReviewFixPR.check`. `claude-code-review` trusts `claude[bot]` and reads the verdict from the review check run and Claude's inline comments. Full reference: [docs/review-fix-rail.md](docs/review-fix-rail.md) |
 
 **Secrets** seeded via the Projects-row action stop at the hooks — they are stripped from the model process and the agent never sees them. On Fly, they are also excluded at the Fly boundary by default (process-level mode). **Extra Env** entries are passed through to the model process and are visible to the agent.
 
@@ -277,7 +279,7 @@ Optional, in the target repo. Parsed with a real YAML parser; a missing file, ma
 | `packageManager` | Overrides the install step's lockfile detection; `none` turns off the built-in install entirely (do the real install from a `setup:` hook instead) |
 | `models.implement` / `models.review` | Per-phase models |
 | `reviewProviders` | External review sources; `github-claude-code-review` is the only recognised value |
-| `reviewCheckNames` | Check-run names that identify the external review gate. Defaults to `review`, `code-review-plugin`, `claude-review`, `claude code review`, `claude-code-review`, plus any name containing both `claude` and `review`. A target repo with an unrelated CI job named `review` should set this to avoid that job becoming the review gate |
+| `reviewCheckNames` | Check-run names that identify the external review gate. Defaults to `review`, `code-review-plugin`, `claude-review`, `claude code review`, `claude-code-review`, plus any name containing both `claude` and `review`. A target repo with an unrelated CI job named `review` should set this to avoid that job becoming the review gate. Under a non-default review process (`claude-code-review`) a check run must also come from the process's posting app (`app.slug`), so a same-named check from another app never counts |
 | `reviewers` | Prompt-only definitions with required `id` and `prompt`, and optional `model`. Project settings grant gating authority. A selected gating config reviewer uses its trusted default-branch definition; a changed branch version also runs as advisory, while identical definitions run once. New or selected non-gating reviewers use the branch definition as advisory. Missing trusted gating definitions fail closed. Built-in and image-baked definitions take precedence over matching config ids |
 
 **This is where per-phase model selection lives.** Both keys take precedence over `WORKFLOW.md`'s `model:` — the chain is `config.yml` → front matter → built-in default. Pairing a strong implement model with a cheap review model is the supported way to hold down review cost.

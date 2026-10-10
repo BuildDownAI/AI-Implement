@@ -74,7 +74,7 @@ import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, getRetryPolicy } from "./orchestrator-settings.js";
-import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
+import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
 import { mintRunToken, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
@@ -82,7 +82,7 @@ import { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
 import { createReviewFixAdminFacade } from "./review-fix-admin-facade.js";
 import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "./review-fix-worker.js";
 import { listActiveRestateReviewFixPrs, queueReviewFixCancellationForClosedPr } from "./review-fix-close.js";
-import { acceptDelivery as acceptReviewFixDelivery, ReviewFixDeliveryPump } from "./restate/review-fix-client.js";
+import { createReviewFixIngressClient, reviewFixResultForwardKey, reviewFixResultIntakeFromForward } from "./restate/review-fix-client.js";
 import { appendReviewFixActivityBatch, isReviewFixEvidenceTombstoned } from "./review-fix-evidence.js";
 import type { ReviewFixResultMetadataV1, ResultIntakeOutcome } from "./review-fix-contract.js";
 import { handleMcpRequest } from "./mcp.js";
@@ -142,6 +142,7 @@ import {
 } from "./restate/retention.js";
 import { applyVolumeSnapshotRetention, applyVolumeSnapshotRetentionAtBoot } from "./fly-volumes.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
+import { sweepOnRegistered } from "./webhook-redelivery.js";
 import { createKgFindRunByTitle, seedFlyMachineProfileFromOverride, createProductionKgRefreshServices, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
@@ -869,8 +870,8 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   // Bounded cleanup of Restate review-fix pilot evidence (AII-795): purges activity/cycle
   // rows past the 7-day-since-completion retention floor, skipping any attempt whose
-  // ownership is still unresolved (pending delivery, active reservation, result conflict,
-  // or unbound execution). SQLite-only and synchronous — safe on every poll regardless of
+  // ownership is still unresolved (active reservation, result conflict, or unbound
+  // execution). SQLite-only and synchronous — safe on every poll regardless of
   // runner mode.
   const evidenceSweep = sweepExpiredReviewFixEvidence();
   if (evidenceSweep.purgedAttemptIds.length > 0) {
@@ -900,7 +901,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
       const state = await getPullRequestState(token, owner, repo, active.prNumber);
       if (state && shouldSkipReviewFix(state)) {
-        queueReviewFixCancellationForClosedPr(active.repository, active.prNumber);
+        await queueReviewFixCancellationForClosedPr(active.repository, active.prNumber, reviewFixIngressClient);
       }
     } catch (err) {
       console.warn(`[review-fix] Could not reconcile PR closure for ${active.repository}#${active.prNumber}:`, err);
@@ -3521,14 +3522,12 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           // Periodic, identity-stable nudges repair a missed signal or a project
           // toggled away from and back to Restate while the same queue row waits.
           // ReviewFixPR's existing wake never extends its first 5-second window.
-          const delivery = acceptReviewFixDelivery({
-            authenticatedSource: "review-fix-queue",
-            deliveryId: `${fix.id}.${lastEvent.id}.${Math.floor(Date.now() / 30_000)}`,
-            kind: "feedback",
-            destination: { installationId, repository: fix.repo, prNumber: fix.prNumber },
-            payload: {},
-          });
-          if (delivery.status !== "accepted") console.error(`[review-fix] Could not queue Restate feedback for #${fix.id}: ${delivery.status}`);
+          const nudge = await reviewFixIngressClient.feedback(
+            { installationId, repository: fix.repo, prNumber: fix.prNumber },
+            undefined,
+            { idempotencyKey: `${fix.id}.${lastEvent.id}.${Math.floor(Date.now() / 30_000)}` },
+          );
+          if (nudge.status !== "accepted") console.error(`[review-fix] Could not queue Restate feedback for #${fix.id}: ${nudge.status}`);
         } catch (err) {
           console.warn(`[review-fix] Could not signal Restate feedback for #${fix.id}; keeping pending:`, err);
         }
@@ -4036,16 +4035,15 @@ async function handleKgRefreshOutcome(
 
 // ---------------------------------------------------------------------------
 // Restate review-fix pilot callback wiring (AII-769/AII-803): the injected,
-// non-SDK seams handleRunnerResult/handleRunnerActivity call. Both persist to
-// SQLite (the sole authority an ACK depends on) before ever touching Restate —
-// delivery to the sidecar is the pre-existing async pump (ReviewFixDeliveryPump,
-// src/restate/review-fix-client.ts), so a sidecar outage never blocks or fails
-// an ACK that SQLite already accepted, while a SQLite failure here throws and
-// is never acknowledged (caught by the route wrapper below as a 500).
+// non-SDK seams handleRunnerResult/handleRunnerActivity call. Results and
+// cancellations reach Restate through the ingress client with the sender's
+// event id as the idempotency key; an unavailable sidecar answers the caller
+// rather than being stored for later.
 // ---------------------------------------------------------------------------
 
 const reviewFixAttemptStore = new SqliteReviewFixAttemptStore();
 const kgRefreshIngressClient = createKgRefreshIngressClient();
+const reviewFixIngressClient = createReviewFixIngressClient();
 
 /** Maps a `callToolAsSystem` result carrying `{ status, body }` text onto the REST shape (AII-901). */
 function kgToolAnswer(
@@ -4132,22 +4130,14 @@ export function sweepLegacyKgRefreshRows(): number {
 }
 
 async function onReviewFixResult(result: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> {
-  // The accepted result and its delivery entry commit together. The callback
-  // also runs on an identical retry, repairing an older result that somehow
-  // lacks its inbox row; a rejected or conflicted identity aborts the write.
-  // This callback performs synchronous SQLite work only, never a Restate call.
-  return reviewFixAttemptStore.recordResult(result.attemptId, result, () => {
-    const delivery = acceptReviewFixDelivery({
-      authenticatedSource: "runner-callback",
-      deliveryId: `${result.attemptId}.result`,
-      kind: "result",
-      destination: { installationId: result.installationId, repository: result.repository, prNumber: result.prNumber },
-      payload: result,
-    });
-    if (delivery.status !== "accepted") {
-      throw new Error(`review-fix result delivery was ${delivery.status}`);
-    }
-  });
+  // Verify-only (AII-1185): the callback forwards the validated result to
+  // ReviewFixAttempt.result, whose `store-result` step is the sole SQLite writer.
+  // Restate unreachable throws, which the route answers 503 with nothing written;
+  // the runner retries the same body under the same key.
+  const out = await reviewFixIngressClient.result(result.attemptId, result, { idempotencyKey: reviewFixResultForwardKey(result) });
+  const outcome = reviewFixResultIntakeFromForward(result.attemptId, out);
+  if (!outcome) throw new ReviewFixIntakeUnavailableError();
+  return outcome;
 }
 
 function onReviewFixActivity(batch: RunnerActivityBody): ActivityIntakeOutcome {
@@ -4190,7 +4180,7 @@ function startServer(
   const reviewFixAttempts = createReviewFixAdminFacade(reviewFixAttemptStore, new GithubReviewFixWorker({
     credentials: createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey),
     scopeStore: reviewFixAttemptStoreScopeStore(reviewFixAttemptStore),
-  }));
+  }), reviewFixIngressClient);
   setReviewFixAttemptsFacade(reviewFixAttempts);
   const kgRefresh: KgRefreshHandle = makeKgRefresh({
     githubAppId: config.githubAppId,
@@ -4432,7 +4422,7 @@ function startServer(
             ? kgRefreshIngressClient.enqueueDryRun(parseKgSourceRepo(config.kgSourceRepo).fullName, { key, ...entry }, opts)
             : Promise.resolve({ status: "unavailable" as const }),
         forgetKgPr: (repo, prNumber) => kgRefresh.forgetPr(repo, prNumber),
-      }, (repository, prNumber) => { queueReviewFixCancellationForClosedPr(repository, prNumber); }).catch((err) => {
+      }, async (repository, prNumber) => { await queueReviewFixCancellationForClosedPr(repository, prNumber, reviewFixIngressClient); }, reviewFixIngressClient).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
@@ -5116,15 +5106,16 @@ async function main(): Promise<void> {
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
     startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices], restateSidecar.identityKey),
     registerRestateEndpoint,
-    onRegistered: () => seedFlyMachineProfileFromOverride(),
+    onRegistered: async () => {
+      sweepOnRegistered(config);
+      await seedFlyMachineProfileFromOverride();
+    },
   });
   // A sidecar which becomes ready after its initial timeout still registers the
   // same fully composed service set; the gate starts the endpoint only once.
   void restateSidecar.whenReady().then((ready) => {
     if (ready) void restateRegistration.attempt();
   });
-  const reviewFixPump = new ReviewFixDeliveryPump();
-  reviewFixPump.start();
 
   const teamRepoMap = getMappings();
 
@@ -5199,7 +5190,6 @@ async function main(): Promise<void> {
     console.log(`[main] Received ${signal}, shutting down...`);
     clearInterval(interval);
     restateRegistration.stopRetrying();
-    reviewFixPump.stop();
 
     // forced exit armed before any awaiting, so shutdowns aren't dependent on notifications settling
     setTimeout(() => {

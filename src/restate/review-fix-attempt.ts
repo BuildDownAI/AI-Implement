@@ -107,20 +107,24 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
       throw new restate.TerminalError("review-fix attempt is not prepared under this workflow key");
     }
 
-    if (await ctx.date.now() >= attempt.deadlineAt) {
-      await ctx.run("revoke-expired-before-launch", () => store.revokeAuthority(attemptId));
+    const startedAt = await ctx.date.now();
+    if (startedAt >= attempt.deadlineAt) {
+      const revokedAt = startedAt;
+      await ctx.run("revoke-expired-before-launch", () => store.revokeAuthority(attemptId, revokedAt));
+      const recordedAt = await ctx.date.now();
       await ctx.run("record-expired-before-launch", () => finalizer.recordOutcome({
         attemptId, scope: attempt.scope, terminal: { status: "cancelled" },
-      }));
+      }, recordedAt));
       await ctx.run("release-expired-before-launch", () => store.releaseOwner(attempt.owner, "deadline_exceeded"));
       return { completion: { status: "deadline_before_launch" }, scope: attempt.scope };
     }
 
     // A cancellation or conflicting early result can revoke authority before run starts.
     if (!await ctx.run("check-prelaunch-authority", () => store.hasCurrentAuthority(attemptId))) {
+      const recordedAt = await ctx.date.now();
       await ctx.run("record-cancelled-before-launch", () => finalizer.recordOutcome({
         attemptId, scope: attempt.scope, terminal: { status: "cancelled" },
-      }));
+      }, recordedAt));
       await ctx.run("release-before-launch", () => store.releaseOwner(attempt.owner, "cancelled"));
       return { completion: { status: "not_owner" }, scope: attempt.scope };
     }
@@ -148,9 +152,10 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
     });
 
     if (launch.status === "rejected") {
+      const recordedAt = await ctx.date.now();
       await ctx.run("record-rejected-outcome", () => finalizer.recordOutcome({
         attemptId, scope: attempt.scope, terminal: { status: "failed", reason: launch.reason },
-      }));
+      }, recordedAt));
       await ctx.run("release-rejected-launch", () => store.releaseOwner(attempt.owner, "launch_rejected"));
       return { completion: { status: "launch_rejected" }, scope: attempt.scope };
     }
@@ -176,16 +181,18 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
           warned = true;
         }
         if (now >= attempt.deadlineAt) {
-          await ctx.run("revoke-unresolved-launch", () => store.revokeAuthority(attemptId));
+          await ctx.run("revoke-unresolved-launch", () => store.revokeAuthority(attemptId, now));
         }
         await ctx.sleep(RECONCILE_INTERVAL_MS);
       }
     }
 
-    const bound = await ctx.run("bind-exact-execution", () => store.bindExecution(attemptId, execution));
+    const boundAt = await ctx.date.now();
+    const bound = await ctx.run("bind-exact-execution", () => store.bindExecution(attemptId, execution, boundAt));
     if (bound.status === "not_owner") return { completion: { status: "not_owner" }, scope: attempt.scope };
     if (bound.status === "already_bound" && !sameExecution(bound.execution, execution)) {
-      await ctx.run("revoke-conflicting-execution", () => store.revokeAuthority(attemptId));
+      const revokedAt = await ctx.date.now();
+      await ctx.run("revoke-conflicting-execution", () => store.revokeAuthority(attemptId, revokedAt));
       await alert(ctx, attemptId, "different execution already bound; occupancy retained", "alert-conflicting-execution");
       throw new restate.TerminalError("attempt was already bound to a different execution");
     }
@@ -211,7 +218,8 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
       && sameExecution(execution, wake.result)) {
       validResult = wake.result;
     } else {
-      await ctx.run("revoke-after-cancel-or-invalid-result", () => store.revokeAuthority(attemptId));
+      const revokedAt = await ctx.date.now();
+      await ctx.run("revoke-after-cancel-or-invalid-result", () => store.revokeAuthority(attemptId, revokedAt));
     }
 
     // Cancellation can arrive after a valid result woke the main workflow. Its
@@ -225,9 +233,10 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
       if (!cancelled && await ctx.promise<boolean>("cancel").peek()) {
         cancelled = true;
       }
-      if (!cancelled && await ctx.date.now() >= attempt.deadlineAt) {
+      const checkedAt = await ctx.date.now();
+      if (!cancelled && checkedAt >= attempt.deadlineAt) {
         cancelled = true;
-        await ctx.run("revoke-at-deadline", () => store.revokeAuthority(attemptId));
+        await ctx.run("revoke-at-deadline", () => store.revokeAuthority(attemptId, checkedAt));
       }
       if (cancelled) {
         await ctx.run(`cancel-worker-${inspectionIndex}`, () => worker.cancel(attemptId, execution));
@@ -247,9 +256,10 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
     let approval: Extract<ReviewFixAttemptCompletion, { status: "finalized" }>["approval"] = "not_applicable";
     if (terminal.status === "succeeded" && validResult && !cancelled
       && terminal.outputCommit === validResult.outputCommit) {
+      const recordedAt = await ctx.date.now();
       await ctx.run("record-success-outcome", () => finalizer.recordOutcome({
         attemptId, scope: attempt.scope, terminal,
-      }));
+      }, recordedAt));
       const currentAuthority = await ctx.run("check-final-authority", () => store.hasCurrentAuthority(attemptId));
       if (currentAuthority) {
         const evidence = await ctx.run("load-approval-evidence", () => deps.loadApprovalEvidence(attempt, validResult));
@@ -265,9 +275,10 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
         approval = "withheld";
       }
     } else {
+      const recordedAt = await ctx.date.now();
       await ctx.run("record-terminal-outcome", () => finalizer.recordOutcome({
         attemptId, scope: attempt.scope, terminal,
-      }));
+      }, recordedAt));
     }
 
     await ctx.run("release-confirmed-terminal", () => store.releaseOwner(
@@ -296,16 +307,18 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
     // separate redacted diagnostic path at the adapter boundary.
     if (!checked.ok) throw new restate.TerminalError("invalid review-fix result metadata");
     const attemptId = validKey(ctx.key, checked.value.attemptId);
-    const outcome = await ctx.run("store-result", () => store.recordResult(attemptId, checked.value));
+    const receivedAt = await ctx.date.now();
+    const outcome = await ctx.run("store-result", () => store.recordResult(attemptId, checked.value, receivedAt));
     if (outcome.status === "stored" || outcome.status === "duplicate") {
-      // The authenticated HTTP callback commits the result before its durable
-      // inbox delivers this signal. Delivery therefore normally sees a
-      // byte-identical duplicate, not a fresh store write. It must still wake
-      // the workflow; recordResult only returns duplicate for that same body.
+      // The runner callback forwards here over the ingress and writes nothing itself, so
+      // `store-result` is the only writer of the accepted result. A first call stores; an
+      // identical retry (a fresh key past the idempotency retention) returns `duplicate`
+      // without a second write. Either way the workflow must wake.
       const wake = ctx.promise<Wake>("wake");
       if (await wake.peek() === undefined) await wake.resolve({ kind: "result", result: outcome.status === "stored" ? outcome.result : checked.value });
     } else if (outcome.status === "conflict") {
-      await ctx.run("revoke-conflicting-result", () => store.revokeAuthority(attemptId));
+      const revokedAt = await ctx.date.now();
+      await ctx.run("revoke-conflicting-result", () => store.revokeAuthority(attemptId, revokedAt));
       const cancellation = ctx.promise<boolean>("cancel");
       if (await cancellation.peek() === undefined) await cancellation.resolve(true);
       const wake = ctx.promise<Wake>("wake");
@@ -322,7 +335,8 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
 
   async function cancel(ctx: WorkflowSharedContext, raw: { attemptId: string }): Promise<void> {
     const attemptId = validKey(ctx.key, raw?.attemptId);
-    await ctx.run("revoke-cancelled-attempt", () => store.revokeAuthority(attemptId));
+    const revokedAt = await ctx.date.now();
+    await ctx.run("revoke-cancelled-attempt", () => store.revokeAuthority(attemptId, revokedAt));
     const cancellation = ctx.promise<boolean>("cancel");
     if (await cancellation.peek() === undefined) await cancellation.resolve(true);
     const wake = ctx.promise<Wake>("wake");

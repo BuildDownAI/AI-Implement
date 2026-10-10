@@ -96,6 +96,7 @@ function mapping(overrides: Partial<RepoMapping> & Pick<RepoMapping, "owner" | "
     referenceRepos: null,
     reviewers: null,
     reviewFixLifecycle: null,
+    reviewProcess: null,
     ...overrides,
   };
 }
@@ -169,9 +170,10 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     const store = new storeModule.SqliteReviewFixAttemptStore();
     const admitted = await store.admit(admissionRequest());
     if (admitted.status !== "prepared") throw new Error("expected prepared");
+    const cancels: Array<{ attemptId: string; key: string }> = [];
     const facade = adminFacade.createReviewFixAdminFacade(store, {
       reconcile: async () => ({ status: "unknown" }),
-    });
+    }, { cancel: async (attemptId, opts) => { cancels.push({ attemptId, key: opts.idempotencyKey }); return { status: "accepted" }; } });
     const user = { role: "user" as const, email: "reader@example.com" };
     const admin = { role: "admin" as const, email: "operator@example.com" };
     expect(await facade.getAttempt(admitted.attempt.attemptId, user)).toEqual({ status: "not_found" });
@@ -186,7 +188,7 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     expect(await facade.revokeAuthority(admitted.attempt.attemptId, user)).toEqual({ status: "not_found" });
     expect(await facade.revokeAuthority(admitted.attempt.attemptId, admin)).toEqual({ status: "accepted" });
     expect(await facade.requestCancellation(admitted.attempt.attemptId, admin)).toEqual({ status: "accepted" });
-    expect((dedup.getDb().prepare("SELECT kind FROM review_fix_inbox").get() as { kind: string }).kind).toBe("cancellation");
+    expect(cancels).toEqual([{ attemptId: admitted.attempt.attemptId, key: `${admitted.attempt.attemptId}.cancel` }]);
     expect(dedup.getDb().prepare("SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?")
       .get(admitted.attempt.attemptId)).toMatchObject({ released_at: null });
   });
@@ -199,7 +201,7 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     const execution = { githubRunId: 9001, githubRunAttempt: 2 };
     const facade = adminFacade.createReviewFixAdminFacade(store, {
       reconcile: async () => ({ status: "found", execution }),
-    });
+    }, { cancel: async () => ({ status: "accepted" }) });
     const admin = { role: "admin" as const, email: "operator@example.com" };
     expect(await facade.adopt(admitted.attempt.attemptId,
       { githubRunId: "9002", githubRunAttempt: 2 }, admin)).toEqual({ status: "unverified" });
@@ -215,12 +217,16 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     const admitted = await store.admit(admissionRequest());
     if (admitted.status !== "prepared") throw new Error("expected prepared");
     expect(close.listActiveRestateReviewFixPrs()).toEqual([{ repository: SCOPE.repository, prNumber: SCOPE.prNumber }]);
-    expect(close.queueReviewFixCancellationForClosedPr(SCOPE.repository, SCOPE.prNumber)).toBe(true);
+    const keys: string[] = [];
+    const ingress = { cancel: async (_id: string, opts: { idempotencyKey: string }) => { keys.push(opts.idempotencyKey); return { status: "accepted" as const }; } };
+    expect(await close.queueReviewFixCancellationForClosedPr(SCOPE.repository, SCOPE.prNumber, ingress)).toBe(true);
     expect(await store.hasCurrentAuthority(admitted.attempt.attemptId)).toBe(false);
-    expect(close.queueReviewFixCancellationForClosedPr(SCOPE.repository, SCOPE.prNumber)).toBe(true);
-    const rows = dedup.getDb().prepare("SELECT kind, delivery_state FROM review_fix_inbox").all() as
-      Array<{ kind: string; delivery_state: string }>;
-    expect(rows).toEqual([{ kind: "cancellation", delivery_state: "pending" }]);
+    expect(await close.queueReviewFixCancellationForClosedPr(SCOPE.repository, SCOPE.prNumber, ingress)).toBe(true);
+    expect(keys).toEqual([`${admitted.attempt.attemptId}.closed`, `${admitted.attempt.attemptId}.closed`]);
+    // Restate unavailable: the revocation stays and the caller sees the failure so the webhook answers 503.
+    await expect(close.queueReviewFixCancellationForClosedPr(SCOPE.repository, SCOPE.prNumber,
+      { cancel: async () => ({ status: "unavailable" }) })).rejects.toThrow("unavailable");
+    expect(await store.hasCurrentAuthority(admitted.attempt.attemptId)).toBe(false);
     expect(dedup.getDb().prepare("SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?")
       .get(admitted.attempt.attemptId)).toMatchObject({ released_at: null });
     await store.releaseOwner(admitted.attempt.owner, "cancelled");
@@ -469,14 +475,14 @@ describe("SqliteReviewFixAttemptStore: launch intent and execution binding", () 
     if (outcome.status !== "prepared") throw new Error("expected prepared");
     const execution = { githubRunId: 123, githubRunAttempt: 1 };
 
-    expect((await store.bindExecution("unknown-attempt", execution)).status).toBe("not_owner");
+    expect((await store.bindExecution("unknown-attempt", execution, Date.now())).status).toBe("not_owner");
 
-    const bound = await store.bindExecution(outcome.attempt.attemptId, execution);
+    const bound = await store.bindExecution(outcome.attempt.attemptId, execution, Date.now());
     expect(bound.status).toBe("bound");
-    const rebind = await store.bindExecution(outcome.attempt.attemptId, execution);
+    const rebind = await store.bindExecution(outcome.attempt.attemptId, execution, Date.now());
     expect(rebind).toEqual({ status: "already_bound", execution });
 
-    const different = await store.bindExecution(outcome.attempt.attemptId, { githubRunId: 999, githubRunAttempt: 1 });
+    const different = await store.bindExecution(outcome.attempt.attemptId, { githubRunId: 999, githubRunAttempt: 1 }, Date.now());
     expect(different).toEqual({ status: "already_bound", execution });
   });
 
@@ -486,7 +492,7 @@ describe("SqliteReviewFixAttemptStore: launch intent and execution binding", () 
     const outcome = await store.admit(admissionRequest());
     if (outcome.status !== "prepared") throw new Error("expected prepared");
     await store.releaseOwner(outcome.attempt.owner, "finalized");
-    const bind = await store.bindExecution(outcome.attempt.attemptId, { githubRunId: 1, githubRunAttempt: 1 });
+    const bind = await store.bindExecution(outcome.attempt.attemptId, { githubRunId: 1, githubRunAttempt: 1 }, Date.now());
     expect(bind).toEqual({ status: "not_owner" });
   });
 });
@@ -498,8 +504,8 @@ describe("SqliteReviewFixAttemptStore: authority", () => {
     const outcome = await store.admit(admissionRequest());
     if (outcome.status !== "prepared") throw new Error("expected prepared");
     expect(await store.hasCurrentAuthority(outcome.attempt.attemptId)).toBe(true);
-    await store.revokeAuthority(outcome.attempt.attemptId);
-    await store.revokeAuthority(outcome.attempt.attemptId);
+    await store.revokeAuthority(outcome.attempt.attemptId, Date.now());
+    await store.revokeAuthority(outcome.attempt.attemptId, Date.now());
     expect(await store.hasCurrentAuthority(outcome.attempt.attemptId)).toBe(false);
     expect(await store.hasCurrentAuthority("unknown-attempt")).toBe(false);
   });
@@ -543,64 +549,33 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
     const outcome = await store.admit(admissionRequest());
     if (outcome.status !== "prepared") throw new Error("expected prepared");
     const execution = { githubRunId: 555, githubRunAttempt: 1 };
-    await store.bindExecution(outcome.attempt.attemptId, execution);
+    await store.bindExecution(outcome.attempt.attemptId, execution, Date.now());
     return { store, attemptId: outcome.attempt.attemptId, deadlineAt: outcome.attempt.deadlineAt, execution };
   }
 
   it("stores a fresh result and returns duplicate on an identical retry", async () => {
     const { store, attemptId, deadlineAt, execution } = await prepareBound();
     const r = result({ attemptId, deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt });
-    const first = await store.recordResult(attemptId, r);
+    const first = await store.recordResult(attemptId, r, Date.now());
     expect(first).toEqual({ status: "stored", result: r });
-    const second = await store.recordResult(attemptId, r);
+    const second = await store.recordResult(attemptId, r, Date.now());
     expect(second).toEqual({ status: "duplicate", attemptId });
   });
 
-  it("commits the canonical result and its delivery together, and repairs an identical retry", async () => {
+  it("runs the in-transaction hook with the canonical result, rolls back when it throws, and re-runs it on an identical retry", async () => {
     const { store, attemptId, deadlineAt, execution } = await prepareBound();
-    const inbox = await import("../review-fix-inbox.js");
     const r = result({ attemptId, deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt });
-    const queue = () => {
-      const accepted = inbox.acceptDelivery({
-        authenticatedSource: "runner-callback", deliveryId: `${attemptId}.result`, kind: "result",
-        destination: { installationId: r.installationId, repository: r.repository, prNumber: r.prNumber },
-        payload: r,
-      });
-      if (accepted.status !== "accepted") throw new Error(`delivery ${accepted.status}`);
-    };
+    const hook = vi.fn();
 
-    await expect(store.recordResult(attemptId, r, () => { throw new Error("inbox write failed"); }))
-      .rejects.toThrow("inbox write failed");
+    await expect(store.recordResult(attemptId, r, Date.now(), () => { throw new Error("hook failed"); }))
+      .rejects.toThrow("hook failed");
     expect((await store.getAcceptedResult(attemptId))?.result).toBeNull();
-    expect(inbox.getDelivery("runner-callback", `${attemptId}.result`)).toBeNull();
 
-    expect((await store.recordResult(attemptId, r, queue)).status).toBe("stored");
-    const first = inbox.getDelivery("runner-callback", `${attemptId}.result`);
-    expect(first?.deliveryState).toBe("pending");
-
+    expect((await store.recordResult(attemptId, r, Date.now(), hook)).status).toBe("stored");
     // A lost HTTP ACK repeats the same credential and payload after a restart.
     const restarted = new storeModule.SqliteReviewFixAttemptStore();
-    expect((await restarted.recordResult(attemptId, r, queue)).status).toBe("duplicate");
-    expect(inbox.getDelivery("runner-callback", `${attemptId}.result`)?.payloadHash).toBe(first?.payloadHash);
-  });
-
-  it("repairs a previously accepted result whose delivery row is missing", async () => {
-    const { store, attemptId, deadlineAt, execution } = await prepareBound();
-    const inbox = await import("../review-fix-inbox.js");
-    const r = result({ attemptId, deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt });
-    expect((await store.recordResult(attemptId, r)).status).toBe("stored");
-    expect(inbox.getDelivery("runner-callback", `${attemptId}.result`)).toBeNull();
-
-    const retried = await store.recordResult(attemptId, r, () => {
-      const accepted = inbox.acceptDelivery({
-        authenticatedSource: "runner-callback", deliveryId: `${attemptId}.result`, kind: "result",
-        destination: { installationId: r.installationId, repository: r.repository, prNumber: r.prNumber },
-        payload: r,
-      });
-      if (accepted.status !== "accepted") throw new Error(`delivery ${accepted.status}`);
-    });
-    expect(retried.status).toBe("duplicate");
-    expect(inbox.getDelivery("runner-callback", `${attemptId}.result`)?.deliveryState).toBe("pending");
+    expect((await restarted.recordResult(attemptId, r, Date.now(), hook)).status).toBe("duplicate");
+    expect(hook).toHaveBeenCalledTimes(2);
   });
 
   it("rejects a result whose scope or deadline does not match the prepared attempt, including an early result before binding", async () => {
@@ -612,15 +587,15 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
     const deadlineAt = outcome.attempt.deadlineAt;
 
     const wrongPr = result({ attemptId, deadlineAt, prNumber: SCOPE.prNumber + 1 });
-    expect(await store.recordResult(attemptId, wrongPr)).toEqual({
+    expect(await store.recordResult(attemptId, wrongPr, Date.now())).toEqual({
       status: "stale", attemptId, reason: "result scope or deadline does not match the prepared attempt",
     });
 
     const wrongRepository = result({ attemptId, deadlineAt, repository: "eudoxus/some-other-repo" });
-    expect((await store.recordResult(attemptId, wrongRepository)).status).toBe("stale");
+    expect((await store.recordResult(attemptId, wrongRepository, Date.now())).status).toBe("stale");
 
     const wrongDeadline = result({ attemptId, deadlineAt: deadlineAt + 1 });
-    expect((await store.recordResult(attemptId, wrongDeadline)).status).toBe("stale");
+    expect((await store.recordResult(attemptId, wrongDeadline, Date.now())).status).toBe("stale");
 
     // None of the rejected results became the first accepted result.
     const row = dedup.getDb().prepare("SELECT accepted_result_json FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as
@@ -629,7 +604,7 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
 
     // The matching-scope result is still accepted, before binding.
     const valid = result({ attemptId, deadlineAt, githubRunId: 777, githubRunAttempt: 1 });
-    expect((await store.recordResult(attemptId, valid)).status).toBe("stored");
+    expect((await store.recordResult(attemptId, valid, Date.now())).status).toBe("stored");
   });
 
   it("accepts an early result before binding, then treats a later bind for a genuinely different execution as a conflict", async () => {
@@ -641,14 +616,14 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
     const deadlineAt = outcome.attempt.deadlineAt;
     const early = { githubRunId: 777, githubRunAttempt: 1 };
     const r = result({ attemptId, deadlineAt, githubRunId: early.githubRunId, githubRunAttempt: early.githubRunAttempt });
-    expect((await store.recordResult(attemptId, r)).status).toBe("stored");
+    expect((await store.recordResult(attemptId, r, Date.now())).status).toBe("stored");
 
     // A later bind for a different execution than the accepted early result
     // must not silently succeed — it must surface the original execution
     // identity (matching the already-bound-mismatch handling used post-launch)
     // and persist the conflict, not leave accepted_result_json and the bound
     // columns permanently inconsistent with nothing recorded.
-    const mismatched = await store.bindExecution(attemptId, { githubRunId: 888, githubRunAttempt: 1 });
+    const mismatched = await store.bindExecution(attemptId, { githubRunId: 888, githubRunAttempt: 1 }, Date.now());
     expect(mismatched).toEqual({ status: "already_bound", execution: early });
 
     const row = dedup.getDb().prepare("SELECT github_run_id, github_run_attempt, result_conflict_at FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as
@@ -658,16 +633,16 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
     expect(row.result_conflict_at).not.toBeNull();
 
     // A later bind matching the accepted early result's execution still succeeds.
-    expect(await store.bindExecution(attemptId, early)).toEqual({ status: "bound" });
+    expect(await store.bindExecution(attemptId, early, Date.now())).toEqual({ status: "bound" });
   });
 
   it("persists a conflict before finalization and never rewrites the finalized outcome afterward", async () => {
     const { store, attemptId, deadlineAt, execution } = await prepareBound();
     const stored = result({ attemptId, deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt, outputCommit: "a".repeat(40) });
-    expect((await store.recordResult(attemptId, stored)).status).toBe("stored");
+    expect((await store.recordResult(attemptId, stored, Date.now())).status).toBe("stored");
 
     const conflicting = { ...stored, outputCommit: "b".repeat(40) };
-    const conflictOutcome = await store.recordResult(attemptId, conflicting);
+    const conflictOutcome = await store.recordResult(attemptId, conflicting, Date.now());
     expect(conflictOutcome.status).toBe("conflict");
 
     const rowAfterConflict = dedup.getDb().prepare("SELECT accepted_result_json, result_conflict_at FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as
@@ -675,9 +650,9 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
     expect(JSON.parse(rowAfterConflict.accepted_result_json)).toEqual(stored);
     expect(rowAfterConflict.result_conflict_at).not.toBeNull();
 
-    const finalized = await store.recordOutcome({ attemptId, scope: SCOPE, terminal: { status: "succeeded", outputCommit: stored.outputCommit } });
+    const finalized = await store.recordOutcome({ attemptId, scope: SCOPE, terminal: { status: "succeeded", outputCommit: stored.outputCommit } }, Date.now());
     expect(finalized.status).toBe("recorded");
-    const secondFinalize = await store.recordOutcome({ attemptId, scope: SCOPE, terminal: { status: "failed", reason: "should never apply" } });
+    const secondFinalize = await store.recordOutcome({ attemptId, scope: SCOPE, terminal: { status: "failed", reason: "should never apply" } }, Date.now());
     expect(secondFinalize).toEqual({
       status: "already_recorded",
       outcome: { attemptId, scope: SCOPE, terminal: { status: "succeeded", outputCommit: stored.outputCommit } },
@@ -686,7 +661,7 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
     const rowBeforeSecondConflict = dedup.getDb().prepare("SELECT terminal_outcome_json FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as { terminal_outcome_json: string };
 
     const anotherConflict = { ...stored, outputCommit: "c".repeat(40) };
-    const postFinalOutcome = await store.recordResult(attemptId, anotherConflict);
+    const postFinalOutcome = await store.recordResult(attemptId, anotherConflict, Date.now());
     expect(postFinalOutcome.status).toBe("conflict");
 
     const rowAfterSecondConflict = dedup.getDb().prepare("SELECT terminal_outcome_json FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as { terminal_outcome_json: string };
@@ -695,14 +670,14 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
 
   it("reports stale for an unknown attempt, a mismatched attemptId, and a released attempt", async () => {
     const { store, attemptId, deadlineAt, execution } = await prepareBound();
-    const unknown = await store.recordResult("nonexistent", result({ attemptId: "nonexistent", deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt }));
+    const unknown = await store.recordResult("nonexistent", result({ attemptId: "nonexistent", deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt }), Date.now());
     expect(unknown.status).toBe("stale");
 
-    const mismatched = await store.recordResult(attemptId, result({ attemptId: "different", deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt }));
+    const mismatched = await store.recordResult(attemptId, result({ attemptId: "different", deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt }), Date.now());
     expect(mismatched.status).toBe("stale");
 
     await store.releaseOwner(attemptId, "finalized");
-    const afterRelease = await store.recordResult(attemptId, result({ attemptId, deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt }));
+    const afterRelease = await store.recordResult(attemptId, result({ attemptId, deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt }), Date.now());
     expect(afterRelease).toEqual({ status: "stale", attemptId, reason: "attempt has been released or superseded" });
   });
 
@@ -715,7 +690,7 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
     // is durable rather than held only in an in-memory store instance.
     dedup.closeDb();
     const reopenedStore = new storeModule.SqliteReviewFixAttemptStore();
-    const outcome = await reopenedStore.recordResult(attemptId, wrongExecution);
+    const outcome = await reopenedStore.recordResult(attemptId, wrongExecution, Date.now());
     expect(outcome.status).toBe("conflict");
 
     dedup.closeDb();
@@ -741,29 +716,68 @@ describe("SqliteReviewFixAttemptStore: release", () => {
   });
 });
 
-describe("SqliteReviewFixAttemptStore: terminal effect outbox", () => {
-  it("records a terminal effect once and collapses a duplicate write", async () => {
+describe("SqliteReviewFixAttemptStore: journaled timestamps", () => {
+  const SENTINEL = 1_234_567_890_123;
+
+  /** Records the stack of every `Date.now()` read made by the store under test; restored by the file's `afterEach` via `vi.restoreAllMocks`. */
+  function spyOnClock(): string[] {
+    const reads: string[] = [];
+    const real = Date.now.bind(Date);
+    vi.spyOn(Date, "now").mockImplementation(() => {
+      const stack = new Error().stack ?? "";
+      if (stack.includes("/src/review-fix-attempt-store.ts")) reads.push(stack);
+      return real();
+    });
+    return reads;
+  }
+
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it("writes the now it receives and never reads the clock", async () => {
+    seedMapping();
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const admitted = await store.admit(admissionRequest());
+    if (admitted.status !== "prepared") throw new Error("expected prepared");
+    const { attemptId, deadlineAt } = admitted.attempt;
+    const execution = { githubRunId: 555, githubRunAttempt: 1 };
+    await store.bindExecution(attemptId, execution, Date.now());
+    const clockReads = spyOnClock();
+    const read = (column: string) => (dedup.getDb().prepare(`SELECT ${column} AS v FROM review_fix_attempts WHERE attempt_id = ?`).get(attemptId) as { v: number | null }).v;
+
+    // recordResult: conflicting identity against the bound execution.
+    const stored = result({ attemptId, deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt });
+    expect((await store.recordResult(attemptId, { ...stored, githubRunId: execution.githubRunId + 1 }, SENTINEL)).status).toBe("conflict");
+    expect(read("result_conflict_at")).toBe(SENTINEL);
+    dedup.getDb().prepare("UPDATE review_fix_attempts SET result_conflict_at = NULL WHERE attempt_id = ?").run(attemptId);
+
+    // recordResult: a different result than the stored one.
+    expect((await store.recordResult(attemptId, stored, SENTINEL + 1)).status).toBe("stored");
+    expect((await store.recordResult(attemptId, { ...stored, outputCommit: "d".repeat(40) }, SENTINEL + 2)).status).toBe("conflict");
+    expect(read("result_conflict_at")).toBe(SENTINEL + 2);
+
+    await store.revokeAuthority(attemptId, SENTINEL + 3);
+    expect(read("authority_revoked_at")).toBe(SENTINEL + 3);
+
+    const recorded = await store.recordOutcome({ attemptId, scope: SCOPE, terminal: { status: "succeeded", outputCommit: stored.outputCommit } }, SENTINEL + 4);
+    expect(recorded).toEqual({ status: "recorded", completedAt: SENTINEL + 4 });
+    expect(read("completed_at")).toBe(SENTINEL + 4);
+    await store.recordOutcome({ attemptId, scope: SCOPE, terminal: { status: "failed", reason: "later" } }, SENTINEL + 5);
+    expect(read("completed_at")).toBe(SENTINEL + 4);
+
+    expect(clockReads).toEqual([]);
+  });
+
+  it("bindExecution writes the received now on an early-result mismatch", async () => {
     seedMapping();
     const store = new storeModule.SqliteReviewFixAttemptStore();
     const outcome = await store.admit(admissionRequest());
     if (outcome.status !== "prepared") throw new Error("expected prepared");
     const attemptId = outcome.attempt.attemptId;
-
-    const first = store.recordTerminalEffect(attemptId, "approval-1", { note: "approved" });
-    expect(first.status).toBe("accepted");
-    const duplicate = store.recordTerminalEffect(attemptId, "approval-1", { note: "approved" });
-    expect(duplicate.status).toBe("accepted");
-    if (duplicate.status === "accepted" && first.status === "accepted") {
-      expect(duplicate.delivery.deliveryId).toBe(first.delivery.deliveryId);
-    }
-
-    const rows = dedup.getDb().prepare("SELECT COUNT(*) as n FROM review_fix_inbox WHERE kind = 'terminal-effect'").get() as { n: number };
-    expect(rows.n).toBe(1);
-
-    const conflicting = store.recordTerminalEffect(attemptId, "approval-1", { note: "different payload" });
-    expect(conflicting.status).toBe("conflict");
-
-    const unknown = store.recordTerminalEffect("nonexistent-attempt", "approval-1", {});
-    expect(unknown).toEqual({ status: "rejected", reason: "unknown attempt nonexistent-attempt" });
+    await store.recordResult(attemptId, result({ attemptId, deadlineAt: outcome.attempt.deadlineAt, githubRunId: 777, githubRunAttempt: 1 }), Date.now());
+    const clockReads = spyOnClock();
+    await store.bindExecution(attemptId, { githubRunId: 888, githubRunAttempt: 1 }, SENTINEL);
+    const row = dedup.getDb().prepare("SELECT result_conflict_at FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as { result_conflict_at: number };
+    expect(row.result_conflict_at).toBe(SENTINEL);
+    expect(clockReads).toEqual([]);
   });
 });

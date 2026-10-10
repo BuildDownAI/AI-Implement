@@ -4219,7 +4219,7 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
       body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1", reviewFix: forged },
       secret: SECRET,
       resolveProvider: makeResolve(fake),
-      onReviewFixResult: (result) => attemptStore.recordResult(result.attemptId, result),
+      onReviewFixResult: (result) => attemptStore.recordResult(result.attemptId, result, Date.now()),
     });
 
     expect(res.status).toBe(410);
@@ -4252,12 +4252,29 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
     ).rejects.toThrow("sqlite disk I/O error");
   });
 
+  it("answers 503 when the intake reports Restate unreachable, without consuming anything", async () => {
+    const fake = new FakeProvider({ recordCalls: true });
+    const token = preparedResultToken("attempt-restate-down");
+    const out = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation", outcome: "success", comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        reviewFix: { ...validReviewFix, attemptId: "attempt-restate-down" },
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+      onReviewFixResult: async () => { throw new runnerCallback.ReviewFixIntakeUnavailableError(); },
+    });
+    expect(out.status).toBe(503);
+  });
+
   it("ACKs 'stored' when the seam's durable write succeeds even though it also reports a simulated delivery-sidecar outage (best-effort, non-blocking)", async () => {
     const fake = new FakeProvider({ recordCalls: true });
     const token = preparedResultToken("attempt-sidecar-outage");
     const onReviewFixResult = vi.fn(async (result: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> => {
       // Durable write succeeds; a simulated Restate delivery attempt reports
-      // "unavailable" internally (mirrors ReviewFixDeliveryFacade's degrade-to-
+      // "unavailable" internally (mirrors the ingress client's degrade-to-
       // unavailable contract) — this must never affect the ack.
       return { status: "stored", result };
     });
@@ -4294,7 +4311,7 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
       body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1", reviewFix: result },
       secret: SECRET,
       resolveProvider: makeResolve(fake),
-      onReviewFixResult: (r) => attemptStore.recordResult(r.attemptId, r),
+      onReviewFixResult: (r) => attemptStore.recordResult(r.attemptId, r, Date.now()),
     });
 
     expect(res.status).toBe(200);

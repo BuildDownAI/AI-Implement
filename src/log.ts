@@ -264,7 +264,7 @@ export function appendLog(entry: {
   // never evict a row correlated to a Restate review-fix pilot attempt (via
   // dispatch_id) that is still unresolved (review_fix_attempts.completed_at IS
   // NULL) or completed within the last 7 days (AII-795). A terminal attempt
-  // stays exempt while delivery, reservation, result conflict, or execution
+  // stays exempt while reservation, result conflict, or execution
   // identity is unresolved, matching review-fix-evidence's retention guard.
   db.prepare(
     `DELETE FROM dispatch_log
@@ -280,10 +280,6 @@ export function appendLog(entry: {
                OR a.result_conflict_at IS NOT NULL OR a.github_run_id IS NULL
                OR EXISTS (SELECT 1 FROM dispatch_admissions d
                           WHERE d.dispatch_id = a.dispatch_id AND d.released_at IS NULL)
-               OR EXISTS (SELECT 1 FROM review_fix_inbox i
-                          WHERE i.installation_id = a.installation_id
-                            AND i.repository = a.repository AND i.pr_number = a.pr_number
-                            AND i.delivery_state != 'delivered')
              )
          )
        )`,

@@ -51,7 +51,7 @@ and handler types that the typed clients use are in `src/restate/kg-refresh-type
 | Workflow `run` handler | yes | yes | — | |
 | Shared workflow handlers | yes: `report`, `progress`, `cancel`, `status` | yes: `result`, `cancel` | — | |
 | Durable promises (`ctx.promise` get/peek/resolve) | yes (`report`, `cancel`, `progress`) | yes | — | RF uses peek-then-resolve (§ 6 P1) |
-| `ctx.run` named steps | yes | yes (~25) | yes (one per write) | |
+| `ctx.run` named steps | yes | yes (28 sites in `ReviewFixAttempt`, 5 in `ReviewFixPR`; § 2.1) | yes (one per write) | RF kinds are tabulated in § 2.1 |
 | `ctx.run` retry options | `maxRetryAttempts: 3` on the gate, `dispatch`, `outcome`, `merge` and `delete-branch` steps | none | `maxRetryAttempts: 1` | No `initialRetryInterval`, `maxRetryDuration` anywhere |
 | Handler `retryPolicy` | none | none | `{ maxAttempts: 1, onMaxAttempts: "kill" }` on writes | |
 | `ctx.sleep` | yes (race arm, cancel watch) | yes (1 s polling loops) | test seam only | |
@@ -69,7 +69,7 @@ and handler types that the typed clients use are in `src/restate/kg-refresh-type
 | `TerminalError` with `errorCode` | yes: 404 and 409 (AII-975) | no | no | |
 | Invocation cancellation (`ctx.cancel`, admin cancel) | no (own `cancel` promise) | no (own `cancel` promise) | no | § 5.1 |
 | `ctx.attach` / `/restate/attach` | tests only | no | no | |
-| Ingress `idempotency-key` | yes: runner report (dispatch id), webhook enqueue (delivery id) | yes: delivery pump key | when the caller supplies one | |
+| Ingress `idempotency-key` | yes: runner report (dispatch id), webhook enqueue (delivery id) | yes: webhook delivery id, attempt result key (`<attemptId>.result.<body hash>`), cancel keys (`<attemptId>.closed`, `<attemptId>.cancel`), drain nudge (`<queue id>.<event id>.<30 s bucket>`) | when the caller supplies one | |
 | SDK ingress client (`@restatedev/restate-sdk-clients`) | yes: `createKgRefreshIngressClient` (AII-975) | no | no | |
 | Service options: `workflowRetention`, `journalRetention` | yes | yes | no | |
 | Service options: `idempotencyRetention` | on `report`, `cancel` | on `result`, `cancel` | no | KG `status` and `progress` carry no retention (AII-973) |
@@ -84,6 +84,59 @@ and handler types that the typed clients use are in `src/restate/kg-refresh-type
 | Admin API: cancel / kill / purge / restart | no | no | no | |
 | Two-runtime scenario tests (container + binary, `alwaysReplay` / `disableRetries`) | yes | yes | yes | |
 
+### 2.1 Review-fix journal re-check (AII-1176)
+
+Re-check of every `ctx.run` step against the journal rule of ADR 018 (amendment 2026-10-08): a value a SQLite row carries is a journaled step result, and a SQLite write is a projection of journaled values (`docs/restate.md` § "Journal projections"). Kinds: `read`; `external` (GitHub or the worker); `atomic SQLite step` (admission only); `projection` (a SQLite write of a journaled value, named in the last column).
+
+Step names are unchanged; `docs/restate-review-fix-pilot.md` and the job drawer read them. The count differs from the issue text: `review-fix-attempt.ts` has 28 `ctx.run` sites (the `alert` helper is one site that runs under four step names; the `reconcile-N`, `cancel-worker-N` and `inspect-terminal-N` names are indexed), and `review-fix-pr.ts` has five.
+
+**`ReviewFixAttempt`**
+
+| Step | Kind | Journaled value written |
+|---|---|---|
+| `load-prepared-attempt` | read | |
+| `revoke-expired-before-launch` | projection | `authority_revoked_at` = `ctx.date.now()` |
+| `record-expired-before-launch` | projection | `terminal_outcome_json`, `completed_at` = `ctx.date.now()` (returned as `completedAt`) |
+| `release-expired-before-launch` | projection | `dispatch_admissions` release; the store's shared release stamps `released_at` itself (open, below) |
+| `check-prelaunch-authority` | read | |
+| `record-cancelled-before-launch` | projection | `terminal_outcome_json`, `completed_at` = `ctx.date.now()` |
+| `release-before-launch` | projection | release, as above |
+| `launch-once` | external | none returned to SQLite; the closure also records launch intent (`state = 'launch_intent'`, no clock) and carries no token or secret out |
+| `record-rejected-outcome` | projection | `terminal_outcome_json`, `completed_at` = `ctx.date.now()` |
+| `release-rejected-launch` | projection | release, as above |
+| `reconcile-N` | external | |
+| `alert-unknown-launch`, `alert-conflicting-execution`, `alert-unconfirmed-stop`, `alert-stale-result` (the `alert` helper) | external | |
+| `revoke-unresolved-launch` | projection | `authority_revoked_at` = the `ctx.date.now()` read in the same loop pass |
+| `bind-exact-execution` | projection | `github_run_id`, `github_run_attempt` from the launch or reconcile result; `result_conflict_at` = `ctx.date.now()` on an early-result mismatch |
+| `revoke-conflicting-execution` | projection | `authority_revoked_at` = `ctx.date.now()` |
+| `revoke-after-cancel-or-invalid-result` | projection | `authority_revoked_at` = `ctx.date.now()` |
+| `revoke-at-deadline` | projection | `authority_revoked_at` = the `ctx.date.now()` that crossed the deadline |
+| `cancel-worker-N` | external | |
+| `inspect-terminal-N` | external | |
+| `record-success-outcome` | projection | `terminal_outcome_json`, `completed_at` = `ctx.date.now()` |
+| `check-final-authority` | read | |
+| `load-approval-evidence` | read | |
+| `apply-approval-once` | external | |
+| `record-terminal-outcome` | projection | `terminal_outcome_json`, `completed_at` = `ctx.date.now()` |
+| `release-confirmed-terminal` | projection | release, as above |
+| `store-result` | projection | `accepted_result_json` from the validated result; `result_conflict_at` = `ctx.date.now()` on a conflict |
+| `revoke-conflicting-result` | projection | `authority_revoked_at` = `ctx.date.now()` |
+| `revoke-cancelled-attempt` | projection | `authority_revoked_at` = `ctx.date.now()` |
+
+**`ReviewFixPR`**
+
+| Step | Kind | Journaled value written |
+|---|---|---|
+| `load-collection-window` | read | |
+| `load-pending` | read | |
+| `admit-pending` | atomic SQLite step | none: `store.admit` computes the attempt id, `deadlineAt`, the task snapshot and the reservation in one transaction over `dispatch_admissions` (ADR 031, amendment 2026-10-09) |
+| `load-after-completion` | read | |
+| `load-after-capacity` | read | |
+
+Every store method that takes a `now` is also called outside the workflow, with `Date.now()` at that caller's boundary and no journal: the admin facade (`bindExecution`, `revokeAuthority`), the runner-callback result route (`recordResult`), and `finalizeReviewFixAttempt` (`revokeAuthority`, `recordOutcome`). Those writes are not journaled, so the replay argument does not apply to them. `store-result` runs in a shared handler, but the callback route has normally committed the result first, so the journaled `now` there is mostly a no-op (`result_conflict_at` uses `COALESCE`, so the first writer wins).
+
+Open: `releaseOwner` writes `dispatch_admissions.released_at` with a clock read inside `releaseDispatchAdmission`, which Legacy and Restate owners share. It is not in AII-1176's scope; converting it means changing the shared release signature for every caller.
+
 ## 3. What kg-refresh uses that the review-fix pilot does not
 
 These are the features the fully migrated run kind picked up. Each one replaced a hand-built
@@ -93,7 +146,7 @@ mechanism the pilot still carries (§ 5.2).
 |---|---|---|
 | **Virtual Object as the lock** (exclusive `trigger`, `inFlight` state, `release` from the workflow) | `KgRepo` (ADR 032) | `dispatch_admissions` rows + lifecycle-owner stamps + `isRestateOwnedJob` fences |
 | **Object state as the queue** (`pending` map, drained by `release`) | `KgRepo.enqueueDryRun` (AII-730) | `ReviewFixPR` deferred recheck every 30 s; `capacityAvailable` (never called) |
-| **Direct ingress from the authenticated route with an idempotency key** (ADR 023 amendment) | runner callback → `KgRefresh/{id}/report`; webhook → `KgRepo/{slug}/enqueueDryRun` | SQLite inbox + `ReviewFixDeliveryPump` (2 s `setInterval`) |
+| **Direct ingress from the authenticated route with an idempotency key** (ADR 023 amendment) | runner callback → `KgRefresh/{id}/report`; webhook → `KgRepo/{slug}/enqueueDryRun` | ingress client with the sender's event id as key (AII-1187 retired the inbox and pump) |
 | **Request-response calls between services** (`ctx.objectClient`, `ctx.workflowClient`) | tools handlers call `KgRepo.trigger` / `KgRefresh.status` natively | none; the pilot only sends |
 | **Race of durable promises against a timer** (`RestatePromise.race`) | wait loop: report / cancel / progress / tick | 1 s `ctx.sleep` loop with a GitHub call per tick |
 | **Awakeables / signals** | A durable external signal into a workflow | Only through a channel every deployment already has (ADR 033); no GitHub App event or setting may be required |
@@ -151,7 +204,6 @@ Not changed by this tree.
 
 | Mechanism | Code | Restate primitive once the kind migrates whole |
 |---|---|---|
-| SQLite inbox + delivery pump (2 s `setInterval`) | `review-fix-inbox.ts`, `review-fix-client.ts` ~199–397 | direct ingress with `idempotency-key`; longer `idempotencyRetention` |
 | `dispatch_admissions` rows | `dispatch-admission.ts`, `dedup.ts` ~255–294 | a per-mapping capacity Virtual Object (`acquire`/`release`, waiters woken by send) |
 | Lifecycle-owner stamps (`lifecycle_owner`) | `dispatch-admission.ts` ~31, `runner-tokens.ts` ~213, `deploy.ts` ~123 | implicit: the workflow key exists; `sys_invocation` census |
 | `isRestateOwnedJob` fences (three copies) | `index.ts` ~2434, `stuck-watchdog.ts` ~19, `reaper.ts` ~22 | deleted with the Legacy owner |
@@ -181,7 +233,6 @@ the first review's; the Status column is the state on the feature branch.
 | C9 | **No endpoint or ingress security features.** No `identityKeys`; no `ingressPrivate`. Loopback binding was the only control (ADR 023). | all | medium | fixed (AII-976): request identity key on the sidecar, endpoint-wide; `ingressPrivate` on the kg-refresh handlers only other services call. The pilot handlers are not marked |
 | P1 | **Peek-then-resolve on durable promises is not atomic** across `result` and `cancel` shared handlers (`review-fix-attempt.ts` ~295–318). | RF | low–medium | not addressed, by decision (pilot) |
 | P2 | **Default infinite retries** on every pilot step; `tool()` swallows all non-suspension errors with an internal API (`restate.internal.isSuspendedError`). | RF, Tools | low | not addressed, by decision (pilot) |
-| P3 | **Pump retries 4xx forever.** A `TerminalError` from a key/scope mismatch becomes a poison row retried every 5 s (`review-fix-client.ts` ~89–92). | RF | low–medium | not addressed, by decision (pilot) |
 | P4 | Dead handler `ReviewFixPR.capacityAvailable`; stale "nothing uses the workflow" comments. | all | cleanup | kg-refresh comments fixed (AII-975); pilot part not addressed, by decision |
 
 ## 7. Record: what landed and what remains
