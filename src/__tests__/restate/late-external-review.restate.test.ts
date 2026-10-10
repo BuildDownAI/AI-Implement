@@ -2,7 +2,7 @@
 // in-process fake keyed by dispatch id; the workflow's own `ctx.sleep` is the only wait.
 //
 // Run with `npm run test:restate`; excluded from `npm test`.
-import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   LATE_EXTERNAL_APPROVAL_MARKER,
@@ -84,8 +84,8 @@ function makeDeps(): LateExternalReviewDependencies {
 }
 
 describe("LateExternalReview workflow", () => {
-  let envs: Map<string, RestateTestEnvironment>;
-  let retryEnv: RestateTestEnvironment;
+  let envs: Map<string, RestateEnvironment>;
+  let retryEnv: RestateEnvironment;
   let counter = 0;
 
   beforeAll(async () => {
