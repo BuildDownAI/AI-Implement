@@ -254,8 +254,6 @@ describe("createReviewFixFinalizer.applyApproval: idempotency", () => {
 
     expect(await finalizer.applyApproval(input)).toEqual({ status: "applied", effectId: `${attempt.attemptId}.approval` });
     expect(github.calls.applyApprovalEffect).toBe(1);
-    const rows = dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get() as { n: number };
-    expect(rows.n).toBe(0);
   });
 
   it("repeats the adapter call after a crash; at-most-once is the journaled step's and the adapter upsert's job", async () => {

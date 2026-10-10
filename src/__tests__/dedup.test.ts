@@ -139,7 +139,26 @@ describe("dispatch admission schema", () => {
   });
 });
 
-describe("review-fix attempt and inbox schema", () => {
+describe("review-fix attempt schema", () => {
+  it("leaves an existing review_fix_inbox table and its rows in place without altering it", () => {
+    const old = new Database(dbPath);
+    old.exec(`CREATE TABLE review_fix_inbox (
+      authenticated_source TEXT NOT NULL, event_id TEXT NOT NULL, installation_id TEXT NOT NULL,
+      repository TEXT NOT NULL, pr_number INTEGER NOT NULL, kind TEXT NOT NULL,
+      payload_json TEXT NOT NULL, payload_hash TEXT NOT NULL, accepted_at INTEGER NOT NULL,
+      delivery_state TEXT NOT NULL DEFAULT 'pending', retry_at INTEGER, delivered_at INTEGER,
+      PRIMARY KEY (authenticated_source, event_id))`);
+    old.prepare(`INSERT INTO review_fix_inbox
+      (authenticated_source, event_id, installation_id, repository, pr_number, kind, payload_json, payload_hash, accepted_at)
+      VALUES ('github', 'event-1', '7', 'acme/app', 42, 'feedback', '{}', 'h', 20)`).run();
+    old.close();
+
+    const db = dedup.getDb();
+    expect(db.prepare("SELECT event_id FROM review_fix_inbox").all()).toEqual([{ event_id: "event-1" }]);
+    expect((db.prepare("PRAGMA table_info(review_fix_inbox)").all() as Array<{ name: string }>).map((c) => c.name))
+      .not.toContain("tombstoned_at");
+  });
+
   it("upgrades old findings and queue history twice without rewriting legacy rows", () => {
     const old = new Database(dbPath);
     old.exec(`
@@ -176,7 +195,7 @@ describe("review-fix attempt and inbox schema", () => {
     expect((db.prepare("PRAGMA table_info(review_findings)").all() as Array<{ name: string }>)
       .filter((column) => column.name === "revision")).toHaveLength(1);
     expect((db.prepare("SELECT COUNT(*) AS n FROM review_fix_attempts").get() as { n: number }).n).toBe(0);
-    expect((db.prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get() as { n: number }).n).toBe(0);
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'review_fix_inbox'").get()).toBeUndefined();
   });
 
   it("keeps attempt ownership immutable and duplicate identities from allocating another record", () => {
@@ -204,19 +223,6 @@ describe("review-fix attempt and inbox schema", () => {
       SET accepted_result_json = '{}', accepted_result_hash = 'hash-1'
       WHERE attempt_id = 'attempt-1'`).run();
 
-    const insertEvent = db.prepare(`INSERT INTO review_fix_inbox
-      (authenticated_source, event_id, installation_id, repository, pr_number,
-       kind, payload_json, payload_hash, accepted_at)
-      VALUES (?, ?, '7', 'acme/app', 42, ?, '{}', 'hash-1', 20)`);
-    insertEvent.run("github", "event-1", "feedback");
-    db.prepare("UPDATE review_fix_inbox SET delivery_state = 'delivered', delivered_at = 30 WHERE event_id = 'event-1'").run();
-    expect(() => insertEvent.run("github", "event-1", "feedback")).toThrow(/UNIQUE/);
-    insertEvent.run("runner", "event-1", "result");
-    expect(db.prepare("SELECT authenticated_source, event_id, kind FROM review_fix_inbox ORDER BY authenticated_source").all())
-      .toEqual([
-        { authenticated_source: "github", event_id: "event-1", kind: "feedback" },
-        { authenticated_source: "runner", event_id: "event-1", kind: "result" },
-      ]);
     expect((db.prepare("SELECT COUNT(*) AS n FROM review_fix_dispatches").get() as { n: number }).n).toBe(0);
   });
 });

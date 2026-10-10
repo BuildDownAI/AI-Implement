@@ -80,7 +80,7 @@ import { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
 import { createReviewFixAdminFacade } from "./review-fix-admin-facade.js";
 import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "./review-fix-worker.js";
 import { listActiveRestateReviewFixPrs, queueReviewFixCancellationForClosedPr } from "./review-fix-close.js";
-import { acceptDelivery as acceptReviewFixDelivery, createReviewFixIngressClient, ReviewFixDeliveryPump, reviewFixResultForwardKey, reviewFixResultIntakeFromForward } from "./restate/review-fix-client.js";
+import { createReviewFixIngressClient, reviewFixResultForwardKey, reviewFixResultIntakeFromForward } from "./restate/review-fix-client.js";
 import { appendReviewFixActivityBatch, isReviewFixEvidenceTombstoned } from "./review-fix-evidence.js";
 import type { ReviewFixResultMetadataV1, ResultIntakeOutcome } from "./review-fix-contract.js";
 import { handleMcpRequest } from "./mcp.js";
@@ -868,8 +868,8 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   // Bounded cleanup of Restate review-fix pilot evidence (AII-795): purges activity/cycle
   // rows past the 7-day-since-completion retention floor, skipping any attempt whose
-  // ownership is still unresolved (pending delivery, active reservation, result conflict,
-  // or unbound execution). SQLite-only and synchronous — safe on every poll regardless of
+  // ownership is still unresolved (active reservation, result conflict, or unbound
+  // execution). SQLite-only and synchronous — safe on every poll regardless of
   // runner mode.
   const evidenceSweep = sweepExpiredReviewFixEvidence();
   if (evidenceSweep.purgedAttemptIds.length > 0) {
@@ -3520,14 +3520,12 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           // Periodic, identity-stable nudges repair a missed signal or a project
           // toggled away from and back to Restate while the same queue row waits.
           // ReviewFixPR's existing wake never extends its first 5-second window.
-          const delivery = acceptReviewFixDelivery({
-            authenticatedSource: "review-fix-queue",
-            deliveryId: `${fix.id}.${lastEvent.id}.${Math.floor(Date.now() / 30_000)}`,
-            kind: "feedback",
-            destination: { installationId, repository: fix.repo, prNumber: fix.prNumber },
-            payload: {},
-          });
-          if (delivery.status !== "accepted") console.error(`[review-fix] Could not queue Restate feedback for #${fix.id}: ${delivery.status}`);
+          const nudge = await reviewFixIngressClient.feedback(
+            { installationId, repository: fix.repo, prNumber: fix.prNumber },
+            undefined,
+            { idempotencyKey: `${fix.id}.${lastEvent.id}.${Math.floor(Date.now() / 30_000)}` },
+          );
+          if (nudge.status !== "accepted") console.error(`[review-fix] Could not queue Restate feedback for #${fix.id}: ${nudge.status}`);
         } catch (err) {
           console.warn(`[review-fix] Could not signal Restate feedback for #${fix.id}; keeping pending:`, err);
         }
@@ -4035,12 +4033,10 @@ async function handleKgRefreshOutcome(
 
 // ---------------------------------------------------------------------------
 // Restate review-fix pilot callback wiring (AII-769/AII-803): the injected,
-// non-SDK seams handleRunnerResult/handleRunnerActivity call. Both persist to
-// SQLite (the sole authority an ACK depends on) before ever touching Restate —
-// delivery to the sidecar is the pre-existing async pump (ReviewFixDeliveryPump,
-// src/restate/review-fix-client.ts), so a sidecar outage never blocks or fails
-// an ACK that SQLite already accepted, while a SQLite failure here throws and
-// is never acknowledged (caught by the route wrapper below as a 500).
+// non-SDK seams handleRunnerResult/handleRunnerActivity call. Results and
+// cancellations reach Restate through the ingress client with the sender's
+// event id as the idempotency key; an unavailable sidecar answers the caller
+// rather than being stored for later.
 // ---------------------------------------------------------------------------
 
 const reviewFixAttemptStore = new SqliteReviewFixAttemptStore();
@@ -5118,8 +5114,6 @@ async function main(): Promise<void> {
   void restateSidecar.whenReady().then((ready) => {
     if (ready) void restateRegistration.attempt();
   });
-  const reviewFixPump = new ReviewFixDeliveryPump();
-  reviewFixPump.start();
 
   const teamRepoMap = getMappings();
 
@@ -5194,7 +5188,6 @@ async function main(): Promise<void> {
     console.log(`[main] Received ${signal}, shutting down...`);
     clearInterval(interval);
     restateRegistration.stopRetrying();
-    reviewFixPump.stop();
 
     // forced exit armed before any awaiting, so shutdowns aren't dependent on notifications settling
     setTimeout(() => {

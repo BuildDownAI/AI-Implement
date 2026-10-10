@@ -189,7 +189,6 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     expect(await facade.revokeAuthority(admitted.attempt.attemptId, admin)).toEqual({ status: "accepted" });
     expect(await facade.requestCancellation(admitted.attempt.attemptId, admin)).toEqual({ status: "accepted" });
     expect(cancels).toEqual([{ attemptId: admitted.attempt.attemptId, key: `${admitted.attempt.attemptId}.cancel` }]);
-    expect(dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get()).toEqual({ n: 0 });
     expect(dedup.getDb().prepare("SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?")
       .get(admitted.attempt.attemptId)).toMatchObject({ released_at: null });
   });
@@ -224,7 +223,6 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     expect(await store.hasCurrentAuthority(admitted.attempt.attemptId)).toBe(false);
     expect(await close.queueReviewFixCancellationForClosedPr(SCOPE.repository, SCOPE.prNumber, ingress)).toBe(true);
     expect(keys).toEqual([`${admitted.attempt.attemptId}.closed`, `${admitted.attempt.attemptId}.closed`]);
-    expect(dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get()).toEqual({ n: 0 });
     // Restate unavailable: the revocation stays and the caller sees the failure so the webhook answers 503.
     await expect(close.queueReviewFixCancellationForClosedPr(SCOPE.repository, SCOPE.prNumber,
       { cancel: async () => ({ status: "unavailable" }) })).rejects.toThrow("unavailable");
@@ -564,51 +562,20 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
     expect(second).toEqual({ status: "duplicate", attemptId });
   });
 
-  it("commits the canonical result and its delivery together, and repairs an identical retry", async () => {
+  it("runs the in-transaction hook with the canonical result, rolls back when it throws, and re-runs it on an identical retry", async () => {
     const { store, attemptId, deadlineAt, execution } = await prepareBound();
-    const inbox = await import("../review-fix-inbox.js");
     const r = result({ attemptId, deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt });
-    const queue = () => {
-      const accepted = inbox.acceptDelivery({
-        authenticatedSource: "runner-callback", deliveryId: `${attemptId}.result`, kind: "result",
-        destination: { installationId: r.installationId, repository: r.repository, prNumber: r.prNumber },
-        payload: r,
-      });
-      if (accepted.status !== "accepted") throw new Error(`delivery ${accepted.status}`);
-    };
+    const hook = vi.fn();
 
-    await expect(store.recordResult(attemptId, r, Date.now(), () => { throw new Error("inbox write failed"); }))
-      .rejects.toThrow("inbox write failed");
+    await expect(store.recordResult(attemptId, r, Date.now(), () => { throw new Error("hook failed"); }))
+      .rejects.toThrow("hook failed");
     expect((await store.getAcceptedResult(attemptId))?.result).toBeNull();
-    expect(inbox.getDelivery("runner-callback", `${attemptId}.result`)).toBeNull();
 
-    expect((await store.recordResult(attemptId, r, Date.now(), queue)).status).toBe("stored");
-    const first = inbox.getDelivery("runner-callback", `${attemptId}.result`);
-    expect(first?.deliveryState).toBe("pending");
-
+    expect((await store.recordResult(attemptId, r, Date.now(), hook)).status).toBe("stored");
     // A lost HTTP ACK repeats the same credential and payload after a restart.
     const restarted = new storeModule.SqliteReviewFixAttemptStore();
-    expect((await restarted.recordResult(attemptId, r, Date.now(), queue)).status).toBe("duplicate");
-    expect(inbox.getDelivery("runner-callback", `${attemptId}.result`)?.payloadHash).toBe(first?.payloadHash);
-  });
-
-  it("repairs a previously accepted result whose delivery row is missing", async () => {
-    const { store, attemptId, deadlineAt, execution } = await prepareBound();
-    const inbox = await import("../review-fix-inbox.js");
-    const r = result({ attemptId, deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt });
-    expect((await store.recordResult(attemptId, r, Date.now())).status).toBe("stored");
-    expect(inbox.getDelivery("runner-callback", `${attemptId}.result`)).toBeNull();
-
-    const retried = await store.recordResult(attemptId, r, Date.now(), () => {
-      const accepted = inbox.acceptDelivery({
-        authenticatedSource: "runner-callback", deliveryId: `${attemptId}.result`, kind: "result",
-        destination: { installationId: r.installationId, repository: r.repository, prNumber: r.prNumber },
-        payload: r,
-      });
-      if (accepted.status !== "accepted") throw new Error(`delivery ${accepted.status}`);
-    });
-    expect(retried.status).toBe("duplicate");
-    expect(inbox.getDelivery("runner-callback", `${attemptId}.result`)?.deliveryState).toBe("pending");
+    expect((await restarted.recordResult(attemptId, r, Date.now(), hook)).status).toBe("duplicate");
+    expect(hook).toHaveBeenCalledTimes(2);
   });
 
   it("rejects a result whose scope or deadline does not match the prepared attempt, including an early result before binding", async () => {

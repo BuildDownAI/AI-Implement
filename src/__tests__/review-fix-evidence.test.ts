@@ -111,13 +111,6 @@ function insertActiveReservation(db: Database.Database, dispatchId: string) {
     .run({ dispatchId });
 }
 
-function insertPendingInboxDelivery(db: Database.Database, opts: { installationId: string; repository: string; prNumber: number; eventId: string }) {
-  db.prepare(`INSERT INTO review_fix_inbox
-    (authenticated_source, event_id, installation_id, repository, pr_number, kind, payload_json, payload_hash, accepted_at, delivery_state)
-    VALUES ('github-webhook', @eventId, @installationId, @repository, @prNumber, 'feedback', '{}', 'hash', 10, 'pending')`)
-    .run(opts);
-}
-
 describe("appendReviewFixActivityBatch", () => {
   it("identical batch retry stores no extra bytes or events", () => {
     const attemptId = "attempt-idem";
@@ -577,27 +570,5 @@ describe("retention and tombstones", () => {
     const result = evidence.sweepExpiredReviewFixEvidence(now);
     expect(result.purgedAttemptIds).not.toContain("attempt-conflicted");
     expect(evidence.listReviewFixActivity("attempt-conflicted", { pageSize: 10 }).events).toHaveLength(1);
-  });
-
-  it("never purges a long-completed attempt while its PR still has a non-delivered inbox event, and purges it once delivered", () => {
-    const db = dedup.getDb();
-    const now = 1_700_000_000_000;
-    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
-
-    insertAttemptWithCompletion(db, "attempt-pending-delivery", now - sevenDaysMs - 1_000, {
-      installationId: "9", repository: "acme/pending", prNumber: 7,
-    });
-    insertPendingInboxDelivery(db, { installationId: "9", repository: "acme/pending", prNumber: 7, eventId: "evt-1" });
-    evidence.appendReviewFixActivityBatch({
-      attemptId: "attempt-pending-delivery", producerId: "producer-1",
-      events: [makeEvent({ attemptId: "attempt-pending-delivery", producerId: "producer-1", sequence: 0, payload: "x" })],
-    });
-
-    const held = evidence.sweepExpiredReviewFixEvidence(now);
-    expect(held.purgedAttemptIds).not.toContain("attempt-pending-delivery");
-
-    db.prepare(`UPDATE review_fix_inbox SET delivery_state = 'delivered' WHERE event_id = 'evt-1'`).run();
-    const released = evidence.sweepExpiredReviewFixEvidence(now);
-    expect(released.purgedAttemptIds).toContain("attempt-pending-delivery");
   });
 });

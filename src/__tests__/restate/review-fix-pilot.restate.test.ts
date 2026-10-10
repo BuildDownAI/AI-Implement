@@ -1,6 +1,6 @@
 // Fault-injection matrix for the Restate review-fix pilot (AII-769/AII-813), against real
 // Restate 1.7.10 and the *production* PR coordinator, attempt workflow, SQLite repository,
-// finalizer, inbox, and worker adapter. Only external GitHub/tracker edges are faked — the
+// finalizer, and worker adapter. Only external GitHub/tracker edges are faked — the
 // worker's transport, the GitHub adapter's fetch, and the PR coordinator's admission
 // eligibility/pending-feedback reads (the same seams `review-fix-production.ts` itself calls
 // out to GitHub for) — plus explicit fault controls built from `harness.ts#crashAfterFirstCall`.
@@ -48,7 +48,6 @@ import {
   type ReviewFixWorkerCredentialResolver,
   type ReviewFixWorkerTransport,
 } from "../../review-fix-worker.js";
-import { acceptDelivery } from "../../review-fix-inbox.js";
 import { queueReviewFixCancellationForClosedPr } from "../../review-fix-close.js";
 import { createReviewFixAdminFacade } from "../../review-fix-admin-facade.js";
 import { appendReviewFixActivityBatch, getReviewFixActivityGaps, getReviewFixCycleSummary, listReviewFixActivity, recordReviewFixCycleSummary } from "../../review-fix-evidence.js";
@@ -58,7 +57,7 @@ import type { ReviewFixActivityEvent } from "../../review-fix-contract.js";
 import { acquire as acquireDispatchAdmission, release as releaseDispatchAdmission } from "../../dispatch-admission.js";
 import { handleGitHubWebhook } from "../../webhook.js";
 import { appendLog, initLogTable, updateJobStatus } from "../../log.js";
-import { createRestateReviewFixFacade, createReviewFixIngressClient, ReviewFixDeliveryPump, reviewFixResultForwardKey, reviewFixResultIntakeFromForward } from "../../restate/review-fix-client.js";
+import { createReviewFixIngressClient, reviewFixResultForwardKey, reviewFixResultIntakeFromForward } from "../../restate/review-fix-client.js";
 import { createReviewFixAttempt, type ReviewFixAttemptCompletion } from "../../restate/review-fix-attempt.js";
 import { createReviewFixPR, reviewFixPRKey } from "../../restate/review-fix-pr.js";
 import {
@@ -110,13 +109,8 @@ function sha(seed: string): string {
   return createHash("sha256").update(seed).digest("hex").slice(0, 40);
 }
 
-/** A stable, `review-fix-inbox.ts`-legal delivery id for one PR's Nth feedback
- *  signal. `reviewFixPRKey(scope)` is a JSON array string (`[installationId,
- *  "owner/repo",prNumber]`) — embedding it directly, as an earlier version of
- *  this suite did, produces `[`, `"`, `,`, and `/` characters that `acceptDelivery`'s
- *  `ID_PATTERN` rejects before any test reaches the workflow. Hashing keeps the
- *  charset legal while staying deterministic per (scope, n) so a retried delivery
- *  (e.g. the "inbox commit before ACK" crash window) still resolves to the same row. */
+/** A stable ingress idempotency key for one PR's Nth feedback signal, deterministic per
+ *  (scope, n) so a retried forward (the "lost acknowledgement" crash window) is absorbed. */
 function feedbackDeliveryId(scope: ScopedPrIdentity, n: number): string {
   return `feedback-${sha(`${reviewFixPRKey(scope)}#${n}`)}`;
 }
@@ -125,7 +119,7 @@ function feedbackDeliveryId(scope: ScopedPrIdentity, n: number): string {
 // One controllable GitHub-side fixture per scenario's PR (always prNumber 1,
 // under a uniquely owned repo — see freshScope). Every field here stands in for
 // an external GitHub fact or a fault-injection knob; nothing here replaces
-// SQLite admission, finalization, or inbox logic, which all run for real.
+// SQLite admission or finalization logic, which all run for real.
 // ---------------------------------------------------------------------------
 interface GithubFixture {
   scope: ScopedPrIdentity;
@@ -431,14 +425,9 @@ const attemptWorkflow = createReviewFixAttempt({
 });
 
 // ---------------------------------------------------------------------------
-// Delivery helper: routes an external event through the real durable inbox and
-// the real ReviewFixDeliveryPump/facade — the "callback ingress" the issue asks
-// this suite to exercise, rather than calling a Restate handler directly.
+// Delivery helper: forwards an external event through the real ingress client, the
+// same path the webhook route uses, rather than calling a Restate handler directly.
 // ---------------------------------------------------------------------------
-function pumpFor(baseUrl: string, fetchImpl: typeof fetch = fetch): ReviewFixDeliveryPump {
-  return new ReviewFixDeliveryPump({ facade: createRestateReviewFixFacade({ ingressBaseUrl: baseUrl, fetchImpl }), intervalMs: 60_000 });
-}
-
 describe("Restate review-fix pilot: production-composition fault matrix", () => {
   let environments: Map<string, RestateTestEnvironment>;
   beforeAll(async () => {
@@ -457,12 +446,8 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
   }
 
   async function triggerFeedback(env: RestateTestEnvironment, scope: ScopedPrIdentity, n = 1): Promise<void> {
-    const accepted = acceptDelivery({
-      authenticatedSource: "test-tracker", deliveryId: feedbackDeliveryId(scope, n),
-      kind: "feedback", destination: scope, payload: {},
-    });
-    expect(accepted.status).toBe("accepted");
-    await pumpFor(env.baseUrl()).tick();
+    const out = await createReviewFixIngressClient(env.baseUrl()).feedback(scope, undefined, { idempotencyKey: feedbackDeliveryId(scope, n) });
+    expect(out.status).toBe("accepted");
   }
 
   async function admitOne(env: RestateTestEnvironment, fixture: GithubFixture, findings: Array<{ findingKey: string; version: number }>): Promise<void> {
@@ -694,36 +679,20 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
   }, 20_000);
 
   // -------------------------------------------------------------------------
-  // Crash window #1 (inbox commit before ACK), via the real durable inbox and
-  // the real ReviewFixDeliveryPump/facade — the production callback ingress.
+  // Crash window #1 (acknowledgement lost), via the real ingress client with the
+  // sender's event id as the idempotency key.
   // -------------------------------------------------------------------------
-  it.each(VARIANTS.map(([label]) => label))("inbox commit before ACK: a feedback delivery whose HTTP acknowledgement is lost still becomes exactly one admitted attempt (%s)", async (label) => {
+  it.each(VARIANTS.map(([label]) => label))("lost acknowledgement: a feedback forward whose HTTP acknowledgement is lost still becomes exactly one admitted attempt (%s)", async (label) => {
     const env = envFor(label);
-    const fixture = freshScenario("inbox-crash");
+    const fixture = freshScenario("ack-lost");
     fixture.pending = { taskText: "Fix 1 finding version", findings: [{ findingKey: "f1", version: 1 }] };
-    const deliveryId = feedbackDeliveryId(fixture.scope, 1);
-    const accepted = acceptDelivery({
-      authenticatedSource: "test-tracker", deliveryId,
-      kind: "feedback", destination: fixture.scope, payload: {},
-    });
-    expect(accepted.status).toBe("accepted");
-    // The first tick's HTTP call really reaches the Restate ingress and the real
-    // feedback() handler really runs — then the local process "crashes" before
-    // observing the 2xx, so the pump reschedules the row as if it were unavailable.
-    const crashyFetch = crashAfterFirstCall(fetch);
-    let now = Date.now();
-    const pump = new ReviewFixDeliveryPump({
-      facade: createRestateReviewFixFacade({ ingressBaseUrl: env.baseUrl(), fetchImpl: crashyFetch }),
-      intervalMs: 60_000,
-      now: () => now,
-    });
-    await pump.tick();
-    expect(getDb().prepare(`SELECT delivery_state FROM review_fix_inbox WHERE event_id = ?`)
-      .get(deliveryId)).toMatchObject({ delivery_state: "pending" });
-    now += 5_001; // advance past the pump's durable unavailable-delivery retry delay
-    await pump.tick();
-    expect(getDb().prepare(`SELECT delivery_state FROM review_fix_inbox WHERE event_id = ?`)
-      .get(deliveryId)).toMatchObject({ delivery_state: "delivered" });
+    const idempotencyKey = feedbackDeliveryId(fixture.scope, 1);
+    // The first call really reaches the Restate ingress and the real feedback() handler
+    // really runs, then the local process "crashes" before observing the 2xx, so the client
+    // reports unavailable. The sender retries under the same key and Restate absorbs it.
+    const ingress = createReviewFixIngressClient(env.baseUrl(), { fetchImpl: crashAfterFirstCall(fetch) });
+    expect(await ingress.feedback(fixture.scope, undefined, { idempotencyKey })).toEqual({ status: "unavailable" });
+    expect(await ingress.feedback(fixture.scope, undefined, { idempotencyKey })).toEqual({ status: "accepted" });
     await eventually(() => latestAttemptRow(fixture.scope) !== undefined, Boolean, { timeoutMs: 5_000, label: "latestAttemptRow(fixture.scope) !== undefined" });
     const rows = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_attempts WHERE repository = ? AND pr_number = ?`)
       .get(fixture.scope.repository, fixture.scope.prNumber) as { n: number };
@@ -871,19 +840,15 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     });
     const rowOf = () => getDb().prepare(`SELECT accepted_result_json, result_conflict_at FROM review_fix_attempts WHERE attempt_id = ?`)
       .get(attemptId) as { accepted_result_json: string | null; result_conflict_at: number | null };
-    const inboxCount = () => (getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_inbox
-      WHERE authenticated_source = 'runner-callback' AND event_id = ?`).get(`${attemptId}.result`) as { n: number }).n;
 
     // Restate unreachable: 503, nothing written.
     expect(await intake(result, "http://127.0.0.1:1")).toMatchObject({ status: 503 });
     expect(rowOf().accepted_result_json).toBeNull();
-    expect(inboxCount()).toBe(0);
 
     // A later retry of the same body succeeds, and store-result is the writer.
     expect(await intake(result)).toMatchObject({ status: 200, body: { outcome: "stored" } });
     const stored = rowOf().accepted_result_json;
     expect(stored).not.toBeNull();
-    expect(inboxCount()).toBe(0);
 
     // Identical retry: same acknowledgement, row unchanged.
     expect(await intake(result)).toMatchObject({ status: 200, body: { outcome: "stored" } });
@@ -893,7 +858,6 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
       .toMatchObject({ status: 409, body: { outcome: "conflict" } });
     expect(legacyProviderLookups).toBe(0);
     expect(rowOf().result_conflict_at).not.toBeNull();
-    expect(inboxCount()).toBe(0);
 
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: fixture.runAttempt };
     // The conflicting result reached the handler, which revoked authority: approval never applies.
@@ -1024,7 +988,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
   // Crash window #5 (final effect before acknowledgement) — alwaysReplay only:
   // the GitHub write inside ctx.run("apply-approval-once") lands, then the step
   // crashes. The engine retries the step, and the adapter's upsert makes the
-  // repeat write a no-op, so there is no inbox row to reconcile (AII-1186).
+  // repeat write a no-op (AII-1186).
   // -------------------------------------------------------------------------
   it("a crash after the approval write is retried by the engine and leaves exactly one approval (alwaysReplay)", async () => {
     const env = envFor("alwaysReplay");
@@ -1039,7 +1003,6 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!);
     expect(done).toMatchObject({ status: "finalized", approval: "applied" });
     expect(fixture.commentPosts).toBe(1); // the crashed call's write landed; the retry's upsert did not post a second comment
-    expect(getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox WHERE kind IN ('cancellation', 'terminal-effect')").get()).toEqual({ n: 0 });
   }, 25_000);
 
   it.each(VARIANTS.map(([label]) => label))("completed_at is the timestamp the record-success-outcome step journaled, and the journal holds no secret (%s)", async (label) => {
@@ -1116,7 +1079,6 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect(row.authority_revoked_at).not.toBeNull();
     fixture.runDetail = { status: "completed", conclusion: "cancelled", runAttempt: 1 };
     expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId)).status).toBe("finalized");
-    expect(getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox WHERE kind IN ('cancellation', 'terminal-effect')").get()).toEqual({ n: 0 });
   }, 25_000);
 
   it.each(VARIANTS.map(([label]) => label))("an operator cancel forwards under <attemptId>.cancel and a repeat with the same key is absorbed (%s)", async (label) => {

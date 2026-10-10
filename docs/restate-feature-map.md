@@ -69,7 +69,7 @@ and handler types that the typed clients use are in `src/restate/kg-refresh-type
 | `TerminalError` with `errorCode` | yes: 404 and 409 (AII-975) | no | no | |
 | Invocation cancellation (`ctx.cancel`, admin cancel) | no (own `cancel` promise) | no (own `cancel` promise) | no | § 5.1 |
 | `ctx.attach` / `/restate/attach` | tests only | no | no | |
-| Ingress `idempotency-key` | yes: runner report (dispatch id), webhook enqueue (delivery id) | yes: delivery pump key | when the caller supplies one | |
+| Ingress `idempotency-key` | yes: runner report (dispatch id), webhook enqueue (delivery id) | yes: webhook delivery id, attempt result key (`<attemptId>.result.<body hash>`), cancel keys (`<attemptId>.closed`, `<attemptId>.cancel`), drain nudge (`<queue id>.<event id>.<30 s bucket>`) | when the caller supplies one | |
 | SDK ingress client (`@restatedev/restate-sdk-clients`) | yes: `createKgRefreshIngressClient` (AII-975) | no | no | |
 | Service options: `workflowRetention`, `journalRetention` | yes | yes | no | |
 | Service options: `idempotencyRetention` | on `report`, `cancel` | on `result`, `cancel` | no | KG `status` and `progress` carry no retention (AII-973) |
@@ -146,7 +146,7 @@ mechanism the pilot still carries (§ 5.2).
 |---|---|---|
 | **Virtual Object as the lock** (exclusive `trigger`, `inFlight` state, `release` from the workflow) | `KgRepo` (ADR 032) | `dispatch_admissions` rows + lifecycle-owner stamps + `isRestateOwnedJob` fences |
 | **Object state as the queue** (`pending` map, drained by `release`) | `KgRepo.enqueueDryRun` (AII-730) | `ReviewFixPR` deferred recheck every 30 s; `capacityAvailable` (never called) |
-| **Direct ingress from the authenticated route with an idempotency key** (ADR 023 amendment) | runner callback → `KgRefresh/{id}/report`; webhook → `KgRepo/{slug}/enqueueDryRun` | SQLite inbox + `ReviewFixDeliveryPump` (2 s `setInterval`) |
+| **Direct ingress from the authenticated route with an idempotency key** (ADR 023 amendment) | runner callback → `KgRefresh/{id}/report`; webhook → `KgRepo/{slug}/enqueueDryRun` | ingress client with the sender's event id as key (AII-1187 retired the inbox and pump) |
 | **Request-response calls between services** (`ctx.objectClient`, `ctx.workflowClient`) | tools handlers call `KgRepo.trigger` / `KgRefresh.status` natively | none; the pilot only sends |
 | **Race of durable promises against a timer** (`RestatePromise.race`) | wait loop: report / cancel / progress / tick | 1 s `ctx.sleep` loop with a GitHub call per tick |
 | **Awakeables / signals** | A durable external signal into a workflow | Only through a channel every deployment already has (ADR 033); no GitHub App event or setting may be required |
@@ -204,7 +204,6 @@ Not changed by this tree.
 
 | Mechanism | Code | Restate primitive once the kind migrates whole |
 |---|---|---|
-| SQLite inbox + delivery pump (2 s `setInterval`) | `review-fix-inbox.ts`, `review-fix-client.ts` ~199–397 | direct ingress with `idempotency-key`; longer `idempotencyRetention` |
 | `dispatch_admissions` rows | `dispatch-admission.ts`, `dedup.ts` ~255–294 | a per-mapping capacity Virtual Object (`acquire`/`release`, waiters woken by send) |
 | Lifecycle-owner stamps (`lifecycle_owner`) | `dispatch-admission.ts` ~31, `runner-tokens.ts` ~213, `deploy.ts` ~123 | implicit: the workflow key exists; `sys_invocation` census |
 | `isRestateOwnedJob` fences (three copies) | `index.ts` ~2434, `stuck-watchdog.ts` ~19, `reaper.ts` ~22 | deleted with the Legacy owner |
@@ -234,7 +233,6 @@ the first review's; the Status column is the state on the feature branch.
 | C9 | **No endpoint or ingress security features.** No `identityKeys`; no `ingressPrivate`. Loopback binding was the only control (ADR 023). | all | medium | fixed (AII-976): request identity key on the sidecar, endpoint-wide; `ingressPrivate` on the kg-refresh handlers only other services call. The pilot handlers are not marked |
 | P1 | **Peek-then-resolve on durable promises is not atomic** across `result` and `cancel` shared handlers (`review-fix-attempt.ts` ~295–318). | RF | low–medium | not addressed, by decision (pilot) |
 | P2 | **Default infinite retries** on every pilot step; `tool()` swallows all non-suspension errors with an internal API (`restate.internal.isSuspendedError`). | RF, Tools | low | not addressed, by decision (pilot) |
-| P3 | **Pump retries 4xx forever.** A `TerminalError` from a key/scope mismatch becomes a poison row retried every 5 s (`review-fix-client.ts` ~89–92). | RF | low–medium | not addressed, by decision (pilot) |
 | P4 | Dead handler `ReviewFixPR.capacityAvailable`; stale "nothing uses the workflow" comments. | all | cleanup | kg-refresh comments fixed (AII-975); pilot part not addressed, by decision |
 
 ## 7. Record: what landed and what remains

@@ -4274,7 +4274,7 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
     const token = preparedResultToken("attempt-sidecar-outage");
     const onReviewFixResult = vi.fn(async (result: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> => {
       // Durable write succeeds; a simulated Restate delivery attempt reports
-      // "unavailable" internally (mirrors ReviewFixDeliveryFacade's degrade-to-
+      // "unavailable" internally (mirrors the ingress client's degrade-to-
       // unavailable contract) — this must never affect the ack.
       return { status: "stored", result };
     });

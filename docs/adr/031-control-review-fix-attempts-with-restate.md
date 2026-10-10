@@ -36,8 +36,8 @@ The following defaults were approved with the architecture at Gate 1 on 2026-09-
 
 | Situation | Required behavior |
 | --- | --- |
-| Duplicate authenticated event | One durable delivery record and one application of findings. |
-| Restate unavailable | Keep accepted feedback pending in SQLite; retry delivery. Never acknowledge data held only in process memory. |
+| Duplicate authenticated event | One application of findings; Restate ingress absorbs a repeated sender event id. |
+| Restate unavailable | Restate ingress with the sender's event id: answer the sender non-2xx so the redelivery sweep or a manual redelivery retries under the same id. Never acknowledge data held only in process memory. |
 | Invalid webhook or unavailable SQLite | Reject acceptance. Do not claim durability. Failed GitHub delivery requires the documented redelivery path. |
 | Feedback burst | Check after a fixed five-second coalescing window. Later arrivals do not extend the window indefinitely. |
 | PR already active, capacity full, or project paused | Preserve pending feedback. Do not create another runner. |
@@ -121,3 +121,9 @@ An unknown launch or unconfirmed termination can hold capacity and delay incompa
 ## Amendment (2026-10-09): admission is the one atomic SQLite step; every other write projects a journaled value
 
 Admission stays one atomic SQLite step. Legacy and Restate owners share `dispatch_admissions` (`acquireGapfillAdmission` in `src/index.ts`), so only an atomic SQLite reservation can arbitrate between them; `store.admit` computes the attempt id, `deadlineAt`, the task snapshot and the reservation inside one transaction. Every other review-fix write is a projection of a journaled value: the workflow reads `ctx.date.now()` and passes it through the step's input, and the store writes the value it receives (`completed_at`, `result_conflict_at`, `authority_revoked_at`). The step-by-step table is in `docs/restate-feature-map.md` § 2.1.
+
+## Amendment (2026-10-10): the delivery mechanism is Restate ingress with the sender's event id
+
+The SQLite delivery record (`review_fix_inbox`, AII-781) and its pump (AII-802) are retired (AII-1187). Feedback, runner results and cancellations now go straight to Restate ingress, each keyed by the sender's event id: the GitHub delivery id, the attempt result key, and the cancel keys. The drain's periodic nudge uses the same client with a `<queue id>.<event id>.<30 s bucket>` key. The operating-contract rows for a duplicate event and for Restate being unavailable read accordingly.
+
+The reason for the inbox, "GitHub does not automatically redeliver a failed webhook", is answered two ways. The redelivery sweep (AII-1178) redelivers failed GitHub App webhook deliveries once Restate registers, and the one-route pattern (ADR 023 amendment, 2026-09-29) lets the route answer non-2xx without holding data only in memory. Validated review events are still committed to the SQLite event/finding queue before the forward, so no accepted data is lost. Existing `review_fix_inbox` tables are left in place for history, as this ADR requires of SQLite records; nothing creates, reads or drops them.
