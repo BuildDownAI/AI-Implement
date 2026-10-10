@@ -151,6 +151,9 @@ describe("KgRefresh durable workflow", () => {
   // Set per-test (W13) to hold the next sidecar call open, inside verify's own ctx.run, for a
   // concurrent status() poll; null keeps every other scenario running with no added latency.
   let holdNextMcpCall: Promise<void> | null = null;
+  // Fired by mcpToolCall as the held call parks, so the test body learns the workflow is inside
+  // verify from the fake itself rather than by polling. Null outside W13.
+  let onMcpCallHeld: (() => void) | null = null;
   // Reassigned per-test for the release-leak regression: forces `reserve` (and, once
   // failurePath is reached, `persist`) to fail terminally, so the outer catch's KgRepo
   // release is the only thing standing between a forced double-failure and a leaked lock.
@@ -173,11 +176,14 @@ describe("KgRefresh durable workflow", () => {
     return { promise, release };
   }
   const STATUS_LATCH_MAX_MS = 5_000;
+  // W13's safety bound only: the scenario releases the latch itself once it has read `status`.
+  const W13_LATCH_MAX_MS = 1_000;
 
   const mcpToolCall = async (_url: string, tool: string): Promise<unknown> => {
     if (holdNextMcpCall) {
       const held = holdNextMcpCall;
       holdNextMcpCall = null;
+      onMcpCallHeld?.();
       await held;
       sidecarUp = false; // the held call and every canary retry after it find a dead sidecar
     }
@@ -269,6 +275,7 @@ describe("KgRefresh durable workflow", () => {
     fetchSnapshotShaFailure = false;
     gateOrder = [];
     holdNextMcpCall = null;
+    onMcpCallHeld = null;
     reserveFailuresRemaining = 0;
     persistHold = null;
     forceReserveFailure = false;
@@ -2228,7 +2235,7 @@ describe("KgRefresh durable workflow", () => {
 
   // ---- W13/W14: RailGateError conversion and revert ----
   it.each(VARIANTS.map(([label]) => label))(
-    "W13: a RailGateError at verify reverts once and fails, status named verify beforehand (%s)",
+    "W13: a RailGateError at verify reverts once and fails, the run journaled verify beforehand (%s)",
     async (label) => {
       const env = envFor(label);
       const triggerId = newTriggerId();
@@ -2237,44 +2244,41 @@ describe("KgRefresh durable workflow", () => {
       const done = runWorkflow(env.baseUrl(), triggerId);
       await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
 
-      // verifyGate's first check (the "answers" gate) is a synchronous env-var read with no
-      // suspension point of its own, so the step is set and the gate fails within the same
-      // tick — well under a 10ms poll's granularity. Verify's canary is its first call into
-      // the rail fakes, so hold that sidecar call open until the poll has actually observed
-      // "verify", then let the sidecar die so the gate fails, at the canary, as a real one would.
-      const verifyLatch = boundedLatch(STATUS_LATCH_MAX_MS);
-      const releaseVerifyGate = verifyLatch.release;
+      // Verify's canary is its first call into the rail fakes. The fake signals `canaryHeld` as the
+      // call parks, so the test body knows the workflow is inside verify without polling; the call
+      // stays held until the body releases it, then the sidecar dies so the gate fails at the
+      // canary, as a real one would. The bound is a safety net, not the wait.
+      const canaryHeld = gate("verify canary held");
+      const verifyLatch = boundedLatch(W13_LATCH_MAX_MS);
       holdNextMcpCall = verifyLatch.promise;
-
-      // Poll `status` concurrently with the run so it observes the "verify" step while the
-      // workflow is still executing it — a single point-in-time check would race the failure
-      // path, which reverts and completes soon after. Collecting every observed step over
-      // the run's lifetime proves `ctx.set("step", "verify")` was visible before the failure,
-      // the same timing-sensitive polling pattern `eventually()` uses elsewhere in this suite.
-      const observedSteps = new Set<string | null>();
-      let polling = true;
-      const statusPoll = (async () => {
-        while (polling) {
-          try {
-            const status = await callWorkflow<{ step: string | null }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
-            observedSteps.add(status.step);
-            if (status.step === "verify") releaseVerifyGate();
-          } catch {
-            // the workflow may be mid-transition between invocations; retry on the next tick.
-          }
-          await new Promise((resolve) => setTimeout(resolve, 10)); // restate-test-allow: samples the step over the run's lifetime
-        }
-      })();
+      onMcpCallHeld = () => void canaryHeld.wait();
 
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await canaryHeld.reached();
+      // A shared `status` read cannot see `verify` here: it reads the state the server has committed,
+      // and the exclusive `run` invocation is parked inside verify's `ctx.run`, so its `ctx.set`
+      // writes since the last flush (fetch, stage, swap, verify) are not yet visible. Form (b), the
+      // order the engine can prove: the canary call happened (the gate above was reached), the
+      // outcome is the canary gate failure, `status` answers the terminal step once the run is
+      // done, and the run's own journal shows `verify` set between `swap` and `revert`.
+      verifyLatch.release();
+
       const outcome = await done;
-      polling = false;
-      releaseVerifyGate(); // no-op if already released; unblocks the poll loop regardless
-      await statusPoll;
+      const status = await callWorkflow<{ step: string | null }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
+      const runs = await eventually(
+        () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`),
+        (r) => r.length === 1,
+        { label: "the KgRefresh run invocation" },
+      );
+      const journaledSteps = (await journalEntries(env.adminAPIBaseUrl(), runs[0].id as string)).flatMap((entry) => {
+        const set = JSON.parse(String(entry.entry_json ?? "null"))?.Command?.SetState as { key: string; value: number[] } | undefined;
+        return set?.key === "step" ? [JSON.parse(Buffer.from(set.value).toString("utf8")) as string] : [];
+      });
 
       expect(outcome.ok).toBe(false);
       expect(outcome.gate).toBe("canary");
-      expect(observedSteps.has("verify"), `step "verify" was not observed within the ${STATUS_LATCH_MAX_MS}ms latch bound`).toBe(true);
+      expect(status.step).toBe("failed");
+      expect(journaledSteps.slice(journaledSteps.indexOf("swap"))).toEqual(["swap", "verify", "revert", "failed"]);
       // swap's own restart (1) plus revertRail's restart while reverting (1).
       expect(restartCallCount).toBe(2);
       expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("canary");
