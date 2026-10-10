@@ -52,9 +52,13 @@ const NEW_STAMP = "2026-08-24T12:00:00+00:00";
 const SNAPSHOT_SHA = "abc123def456abc123def456abc123def456abc1";
 const KG_SOURCE_REPO = "TestOrg/test-kg-source";
 
+// The bootstrap deadline stays at 1 s: AII-1125's scenario needs the started read to arrive inside it, AII-1111 raised a
+// 400 ms bootstrap to avoid exactly that race, and AII-1028 measured invocation start delays up to 1.08 s on a loaded runner.
+// The total deadline keeps an 800 ms margin after the bootstrap deadline (eight 100 ms ticks); every scenario that reaches it
+// has already passed bootstrap with a progress call.
 const BOOTSTRAP_DEADLINE_MS = 1_000;
-const TOTAL_DEADLINE_MS = 2_600;
-const WATCH_INTERVAL_MS = 300;
+const TOTAL_DEADLINE_MS = 1_800;
+const WATCH_INTERVAL_MS = 100;
 
 /** extractSource strips one leading path component, so wrap the fixture in a top-level dir — copied from src/__tests__/kg-refresh-rail.test.ts. */
 function makeTarball(dir: string): Buffer {
@@ -1420,7 +1424,7 @@ describe("KgRefresh durable workflow", () => {
 
   // ---- AII-1066: bounded reads (watch-N, reconcile-N, watch-cancel-N, reconcile-cancel-N) ----
   // A read that fails on each attempt is "no new evidence" and never holds the workflow past its
-  // deadline. The deadline workflow serves a 1 s bootstrap deadline and a 2.6 s total deadline.
+  // deadline. The deadline workflow serves a 1 s bootstrap deadline and a 1.8 s total deadline.
   describe("AII-1066: a failing read does not hold the workflow", () => {
     it.each(VARIANTS.map(([label]) => label))("a status read that fails on each attempt ends at bootstrap_timeout, cancels the run (%s)", async (label) => {
       const triggerId = newTriggerId();
@@ -1567,10 +1571,10 @@ describe("KgRefresh durable workflow", () => {
     const env = deadlineEnvFor(label);
     const triggerId = newTriggerId();
     makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "fly-machines" });
-    // Five started reads span more than the 1 s bootstrap deadline (300 ms interval) but not the total.
+    // Twelve started reads span more than the 1 s bootstrap deadline (100 ms interval) but not the 1.8 s total.
     const started = { state: "started" as const, exit: null };
     machineReads.set(triggerId, [
-      started, started, started, started, started,
+      ...Array.from({ length: 12 }, () => started),
       { state: "ended", exit: { exitCode: 137, signal: 9, oomKilled: true, timestamp: 1 } },
     ]);
     const closedBefore = closeRowCalls.length;
@@ -2121,7 +2125,7 @@ describe("KgRefresh durable workflow", () => {
       await done;
       expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
       expect(scenarios.get(triggerId)!.cancelCalls).toBe(0);
-      // Bounded by cancel time + BOOTSTRAP_DEADLINE_MS (1s); the total deadline is 2.6s after dispatch.
+      // Bounded by cancel time + BOOTSTRAP_DEADLINE_MS (1s); the total deadline is 1.8s after dispatch.
       expect(Date.now() - started).toBeLessThan(TOTAL_DEADLINE_MS);
     },
     15_000,
