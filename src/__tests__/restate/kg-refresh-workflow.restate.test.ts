@@ -180,7 +180,7 @@ describe("KgRefresh durable workflow", () => {
   const W13_LATCH_MAX_MS = 1_000;
 
   const mcpToolCall = async (_url: string, tool: string): Promise<unknown> => {
-    if (holdNextMcpCall) {
+    if (holdNextMcpCall && tool === "kg_hybrid_search") {
       const held = holdNextMcpCall;
       holdNextMcpCall = null;
       onMcpCallHeld?.();
@@ -2244,23 +2244,22 @@ describe("KgRefresh durable workflow", () => {
       const done = runWorkflow(env.baseUrl(), triggerId);
       await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
 
-      // Verify's canary is its first call into the rail fakes. The fake signals `canaryHeld` as the
-      // call parks, so the test body knows the workflow is inside verify without polling; the call
-      // stays held until the body releases it, then the sidecar dies so the gate fails at the
-      // canary, as a real one would. The bound is a safety net, not the wait.
-      const canaryHeld = gate("verify canary held");
+      // Hold verify's canary, the `kg_hybrid_search` call. The mcpToolCall fake lets fetch's
+      // `kg_neighbors` served-stamp read through and parks only the canary, signalling `canaryHeld`
+      // as it parks, so the body knows the run is inside verify without polling. While it is held
+      // the body reads `status` once and asserts it answers `verify` (form a); then it releases the
+      // latch and the sidecar dies so the gate fails at the canary, as a real one would. The bound
+      // is a safety net, not the wait.
+      const canaryHeld = gate("verify canary (kg_hybrid_search) held");
       const verifyLatch = boundedLatch(W13_LATCH_MAX_MS);
       holdNextMcpCall = verifyLatch.promise;
       onMcpCallHeld = () => void canaryHeld.wait();
 
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
       await canaryHeld.reached();
-      // A shared `status` read cannot see `verify` here: it reads the state the server has committed,
-      // and the exclusive `run` invocation is parked inside verify's `ctx.run`, so its `ctx.set`
-      // writes since the last flush (fetch, stage, swap, verify) are not yet visible. Form (b), the
-      // order the engine can prove: the canary call happened (the gate above was reached), the
-      // outcome is the canary gate failure, `status` answers the terminal step once the run is
-      // done, and the run's own journal shows `verify` set between `swap` and `revert`.
+      const heldStatus = await callWorkflow<{ step: string | null }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
+      expect(heldStatus.step).toBe("verify");
+      // The journal assertion below still pins the order: swap, verify, revert, failed.
       verifyLatch.release();
 
       const outcome = await done;
