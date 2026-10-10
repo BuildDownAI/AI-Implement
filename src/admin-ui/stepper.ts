@@ -332,7 +332,7 @@ export const stepperHtml = `
               <option value="ai-implement">AI-Implement</option>
               <option value="claude-code-review">Claude Code Review</option>
             </select>
-            <div class="field-hint">Who reviews this project's PRs and who fixes. Claude Code Review trusts claude[bot], reads the verdict from the review check run and Claude's inline comments, and keeps AI-Implement's fix attempt. Applies only with the Restate lifecycle; a Legacy project stores it and ignores it.</div>
+            <div class="field-hint">Who reviews this project's PRs and who fixes. Claude Code Review trusts claude[bot], reads the verdict from the review check run and Claude's inline comments, and keeps AI-Implement's fix attempt. Applies to every project; only the forward to the Restate fix attempt needs the Restate lifecycle.</div>
           </div>
           <div class="field">
             <label class="field-label">Trusted Review Authors <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>

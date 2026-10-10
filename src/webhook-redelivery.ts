@@ -4,10 +4,9 @@ import { defaultFetchSignal } from "./github.js";
 /**
  * Redelivers the GitHub App's failed webhook deliveries when Restate registers.
  *
- * Today only the KG PR-check route (`handleKgPrCheckWebhook`) answers 503 while
- * Restate is unavailable. The three review handlers still write SQLite and answer
- * 200; they gain the 503 path with AII-1184, and this sweep lands first so that
- * path is recoverable from its first day.
+ * The KG PR-check route (`handleKgPrCheckWebhook`) and the three review handlers on a
+ * Restate-lifecycle project (AII-1184) answer 503 while Restate is unavailable; this sweep
+ * recovers those deliveries.
  */
 const API = "https://api.github.com";
 const DEFAULT_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -59,9 +58,8 @@ function nextCursor(link: string | null): string | null {
 
 /**
  * Asks GitHub to redeliver the App's failed deliveries of the four review-related events from the
- * last window. GitHub never retries on its own. Today the only route that refuses a delivery with 503
- * while Restate is unavailable is the KG PR-check route; the three review handlers gain that path with
- * AII-1184 (see the module comment above). A redelivery keeps the delivery GUID, so Restate's
+ * last window. GitHub never retries on its own. The KG PR-check route and the review handlers on a
+ * Restate-lifecycle project refuse a delivery with 503 while Restate is unavailable (see the module comment above). A redelivery keeps the delivery GUID, so Restate's
  * idempotency key absorbs duplicates. Never throws: failures are logged and skipped.
  */
 export async function redeliverFailedAppDeliveries(deps: RedeliveryDeps): Promise<RedeliveryResult> {

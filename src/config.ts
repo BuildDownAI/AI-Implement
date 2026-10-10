@@ -99,7 +99,7 @@ export interface RepoMapping {
   prDispatchBudget?: number | null;
   /** Extra GitHub logins trusted as review authors for this project, additive to the built-in trusted authors (`ai-implement`, `ai-implement[bot]`, and the Claude logins — `github-actions[bot]` is trusted separately). NULL means built-ins only. */
   trustedReviewAuthors?: string[] | null;
-  /** The project's review process (ADR 038). NULL means `ai-implement`; read it through resolveReviewProcessId(). Applies only under the Restate review-fix lifecycle — a Legacy project stores it inert. */
+  /** The project's review process (ADR 038). NULL means `ai-implement`; read it through resolveReviewProcessId(). Applies to every project; only the forward to `ReviewFixPR.feedback` needs the Restate review-fix lifecycle. */
   reviewProcess?: ReviewProcessId | null;
 }
 

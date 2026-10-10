@@ -6,7 +6,7 @@
 
 ## Context
 
-The orchestrator has no named definition of who reviews a PR and who fixes it. Two fixed author lists (`TRUSTED_REVIEW_COMMENT_AUTHORS` in `src/webhook.ts` and in `src/pipeline/review-ledger.ts`) and one fixed set of check names (`DEFAULT_REVIEW_CHECK_NAMES` in `src/pipeline/steps/post-push-review.ts`) stand in for one. Nothing ties them together as one process, so a project cannot select another.
+The orchestrator has no named definition of who reviews a PR and who fixes it. Two fixed trusted-author constants (one in `src/webhook.ts`, one in `src/pipeline/review-ledger.ts`, since deleted) and one fixed set of check names (`DEFAULT_REVIEW_CHECK_NAMES` in `src/pipeline/steps/post-push-review.ts`) stand in for one. Nothing ties them together as one process, so a project cannot select another.
 
 Two reviewers matter now:
 
@@ -40,6 +40,6 @@ Two reviewers matter now:
 
 ## Consequences
 
-- Nothing reads the table yet. The consumers are the project setting (AII-1179), the webhook and ledger (AII-1181), `post-push-review` (AII-822), and the fix hand-off (AII-1188). `TRUSTED_REVIEW_COMMENT_AUTHORS` stays where it is until then.
+- The consumers have landed: the project setting (AII-1179), the webhook and ledger (AII-1181), `post-push-review` (AII-822), and the fix hand-off (AII-1188). The fixed author constants are deleted; trusted authors come from the review process plus the project's Trusted Review Authors. The process applies to every project; only the forward to `ReviewFixPR.feedback` needs the Restate lifecycle.
 - A repository can add the ADR 020 block to its review prompt to reach source 1. That is optional.
 - Rollback is a revert.

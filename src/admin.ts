@@ -3285,7 +3285,7 @@ export async function upsertMappingAction(
     }
   }
 
-  // No enablement check: the process applies only under the Restate lifecycle at read time, so a Legacy project stores it inert.
+  // No enablement check: the process and its trusted authors apply to every project; only the forward to `ReviewFixPR.feedback` needs the Restate lifecycle.
   let reviewProcess: ReviewProcessId | null;
   if (body.reviewProcess === undefined) {
     reviewProcess = existingMapping?.reviewProcess ?? null;

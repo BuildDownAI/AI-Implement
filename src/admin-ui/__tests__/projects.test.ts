@@ -436,7 +436,7 @@ describe("projects page review process and trusted review authors", () => {
     expect(projectsHtml).toContain('id="md-review-process"');
     expect(projectsHtml).toContain('<option value="ai-implement">AI-Implement</option>');
     expect(projectsHtml).toContain('<option value="claude-code-review">Claude Code Review</option>');
-    expect(projectsHtml).toContain("Who reviews this project's PRs and who fixes. Claude Code Review trusts claude[bot], reads the verdict from the review check run and Claude's inline comments, and keeps AI-Implement's fix attempt. Applies only with the Restate lifecycle; a Legacy project stores it and ignores it.");
+    expect(projectsHtml).toContain("Who reviews this project's PRs and who fixes. Claude Code Review trusts claude[bot], reads the verdict from the review check run and Claude's inline comments, and keeps AI-Implement's fix attempt. Applies to every project; only the forward to the Restate fix attempt needs the Restate lifecycle.");
     expect(projectsHtml).toContain('id="md-trusted-review-authors"');
     expect(projectsHtml).toContain("Extra bot or user logins whose review findings count, in addition to the review process's own authors. A trusted author can approve a PR.");
   });
