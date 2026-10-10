@@ -881,8 +881,8 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     if (!decision.ok) throw new Error("admission deferred");
 
     expect(listActiveRestateReviewFixPrs()).toEqual([]);
-    expect(queueReviewFixCancellationForClosedPr(`${OWNER}/${REPO}`, 1)).toBe(false);
-    const facade = createReviewFixAdminFacade(new SqliteReviewFixAttemptStore(), { reconcile: async () => ({ status: "unknown" }) });
+    expect(await queueReviewFixCancellationForClosedPr(`${OWNER}/${REPO}`, 1, { cancel: async () => ({ status: "accepted" }) })).toBe(false);
+    const facade = createReviewFixAdminFacade(new SqliteReviewFixAttemptStore(), { reconcile: async () => ({ status: "unknown" }) }, { cancel: async () => ({ status: "accepted" }) });
     expect(await facade.getAttempt(dispatchId, { role: "admin", email: "operator@example.com" })).toEqual({ status: "not_found" });
     expect(() => mintPreparedReviewFixToken({ attemptId: dispatchId, audience: "result", secret: "s" })).toThrow(/no current authority/);
     expect(getDb().prepare("SELECT COUNT(*) AS n FROM runner_tokens WHERE dispatch_id = ?").get(dispatchId)).toEqual({ n: 0 });

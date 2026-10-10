@@ -15,12 +15,9 @@
  *    `recordOutcome` delegates straight to the attempt repository's
  *    write-once column (AII-785); `applyApproval` enforces the three gates a
  *    single evidence object can carry (authority, head-sha-equals-output,
- *    policy) and applies the GitHub effect at most once, tracked by a
- *    durable effect identity in `review_fix_inbox` (AII-781) under this
- *    module's own `authenticatedSource` — independent of the attempt
- *    repository's own `recordTerminalEffect` helper, so this module's
- *    idempotency bookkeeping never depends on that helper's internal source
- *    string.
+ *    policy) and then calls the GitHub effect. At-most-once comes from the
+ *    workflow's journaled `apply-approval-once` step plus the adapter's upsert,
+ *    not from a second bookkeeping layer here.
  *  - `finalizeReviewFixAttempt` is the orchestration a caller (the future
  *    Restate workflow, AII-796 — not this issue) uses. When the backend is
  *    confirmed terminal it records the immutable verdict *before* any
@@ -40,14 +37,6 @@
  *    positively confirmed. This module owns no clock and no polling loop; it
  *    is a pure decision given the caller's evidence plus what the attempt
  *    repository has durably recorded.
- *
- * A third, standalone export, `retryApprovalEffect`, is the explicit terminal-effect retry: an
- * ordinary `applyApproval` call that finds its delivery already existed (accepted, but not
- * necessarily delivered) withholds rather than guessing whether the external write already ran;
- * `retryApprovalEffect` is the deliberate path that claims that specific delivery, observes
- * GitHub's own state by this attempt's stable identity (a lease alone cannot prove the earlier
- * write actually failed), and completes it — reconciling silently rather than duplicating the
- * effect when the remote write had in fact already landed.
  */
 import type {
   AttemptId,
@@ -55,12 +44,6 @@ import type {
   ResultIntakeOutcome,
   ScopedPrIdentity,
 } from "./review-fix-contract.js";
-import {
-  acceptDelivery,
-  ackDelivery,
-  claimDelivery,
-  retryDelivery,
-} from "./review-fix-inbox.js";
 import type {
   ApprovalEffectOutcome,
   PreparedReviewFixAttempt,
@@ -73,11 +56,6 @@ import type {
   ReviewFixReleaseOutcome,
   WorkerTerminalInspection,
 } from "./review-fix-ports.js";
-
-/** Identifies this module's own effect deliveries in `review_fix_inbox`, distinct from the
- *  attempt repository's `recordTerminalEffect` ("review-fix-attempt-store") — this module
- *  tracks approval-effect idempotency itself rather than depending on that helper's identity. */
-const FINALIZE_SOURCE = "review-fix-finalize";
 
 // ---------------------------------------------------------------------------
 // Injected adapters
@@ -109,8 +87,7 @@ export interface ReviewFixGitHubAdapter {
   ): Promise<void>;
   /** Observes, by this attempt's stable identity, whether the approval effect has already
    *  landed on GitHub (e.g. an existing sticky comment/approval carrying this attempt's marker).
-   *  `retryApprovalEffect` uses this to tell "the earlier write actually failed" apart from "it
-   *  succeeded and only the local acknowledgement was lost" — a local lease alone cannot. */
+   *  No longer consulted by finalization: the journaled step and the upsert make a repeat write safe. */
   hasAppliedApprovalEffect(scope: ScopedPrIdentity, attemptId: AttemptId): Promise<boolean>;
 }
 
@@ -135,8 +112,7 @@ export interface ReviewFixFinalizeAttemptStore extends ReviewFixAttemptStorePort
    *  to — see `SqliteReviewFixAttemptStore.getAcceptedResult`. */
   getAcceptedResult(attemptId: AttemptId): Promise<ReviewFixAcceptedResultView | null>;
   /** The attempt's immutable terminal verdict, or `null` if none has been recorded yet — a
-   *  read-only peek at what `recordOutcome` has durably written, never itself writing. Used by
-   *  `retryApprovalEffect` to withhold when a since-recorded verdict is incompatible with
+   *  read-only peek at what `recordOutcome` has durably written, never itself writing. Lets a caller withhold when a since-recorded verdict is incompatible with
    *  approval — see `SqliteReviewFixAttemptStore.getRecordedOutcome`. */
   getRecordedOutcome(attemptId: AttemptId): Promise<ReviewFixImmutableOutcome | null>;
 }
@@ -153,20 +129,6 @@ export interface ReviewFixAcceptedResultView {
 // ---------------------------------------------------------------------------
 // ReviewFixFinalizerPort production implementation
 // ---------------------------------------------------------------------------
-
-function canonicalDispositionPayload(dispositions: readonly ReviewFixFindingDisposition[]): unknown {
-  return [...dispositions]
-    .sort((a, b) => a.findingKey.localeCompare(b.findingKey))
-    .map((d) => ({ findingKey: d.findingKey, disposition: d.disposition }));
-}
-
-/** The exact payload shape an approval delivery is accepted under (see `acceptDelivery` calls
- *  below) — shared so `retryApprovalEffect` can verify a retry's caller-supplied result and
- *  dispositions still match what the delivery's identity was originally accepted for, rather
- *  than trusting the caller not to have changed them. */
-function approvalDeliveryPayload(result: ReviewFixResultMetadataV1, dispositions: readonly ReviewFixFindingDisposition[]): unknown {
-  return { outputCommit: result.outputCommit, dispositions: canonicalDispositionPayload(dispositions) };
-}
 
 /**
  * Builds the production `ReviewFixFinalizerPort`. `recordOutcome` is a direct pass-through to
@@ -198,167 +160,11 @@ export function createReviewFixFinalizer(deps: {
         return { status: "withheld", reason: "review/merge policy does not allow this PR to proceed" };
       }
 
-      const deliveryId = `${input.attemptId}.approval`;
-
-      const accepted = acceptDelivery({
-        authenticatedSource: FINALIZE_SOURCE,
-        deliveryId,
-        kind: "terminal-effect",
-        destination: input.scope,
-        payload: approvalDeliveryPayload(input.result, input.findingDispositions),
-      });
-      if (accepted.status === "rejected") {
-        return { status: "withheld", reason: `unable to record approval effect: ${accepted.reason}` };
-      }
-      if (accepted.status === "conflict") {
-        // A different approval payload was already accepted for this attempt — never apply
-        // a second, divergent effect. This should not happen in practice: the attempt
-        // repository's own recordResult already refuses a second, different result before
-        // it ever reaches here.
-        return { status: "withheld", reason: accepted.reason };
-      }
-
-      if (!accepted.isNew) {
-        // This identity already existed before this call's `acceptDelivery` ran — either fully
-        // delivered (a plain idempotent retry: report it and stop), or left `pending`/`claimed`
-        // by a prior call that crashed somewhere between accepting the delivery and acknowledging
-        // it, possibly *after* it had already invoked the GitHub adapter — exactly the
-        // "commit/effect-before-acknowledgement" window. An ordinary `applyApproval` call cannot
-        // tell which, so it must never blindly redo the external write to find out (mirrors the
-        // worker port's own rule for an uncertain launch: "never blindly dispatch again").
-        // Reconciling that state is `retryApprovalEffect`'s job, invoked deliberately — not this
-        // call's, which only ever applies the effect for an identity it created itself.
-        return accepted.delivery.deliveryState === "delivered"
-          ? { status: "already_applied", effectId: deliveryId }
-          : {
-              status: "withheld",
-              reason: `approval effect for ${deliveryId} is already ${accepted.delivery.deliveryState} from a prior attempt; reconcile via retryApprovalEffect rather than retrying applyApproval`,
-            };
-      }
-
+      const effectId = `${input.attemptId}.approval`;
       await deps.github.applyApprovalEffect(input.scope, input.attemptId, input.result, input.findingDispositions);
-      ackDelivery(FINALIZE_SOURCE, deliveryId);
-      return { status: "applied", effectId: deliveryId };
+      return { status: "applied", effectId };
     },
   };
-}
-
-/**
- * The explicit terminal-effect retry the issue calls for: deliberately reconciles an approval
- * effect delivery left `pending` (or `claimed`) by a prior `applyApproval` call that crashed
- * before acknowledging it, without redoing any agent work. Claims the delivery by exact identity
- * (never a batch — `claimDelivery`, not `claimDeliveries`, so no unrelated delivery is touched),
- * re-checks the same three evidence gates `applyApproval` does (fresh evidence may have changed
- * since the crash), and applies the GitHub effect at most once for the claim it holds. The
- * `ReviewFixGitHubAdapter.applyApprovalEffect` contract requires the underlying write to tolerate
- * a repeat call (an upsert, mirroring `github.ts#postOrUpdateStickyComment`) precisely so that a
- * crash between this call's own effect application and its ack remains recoverable by calling
- * this function again.
- *
- * Two further safeguards, beyond what `applyApproval` itself needs, exist because a retry can be
- * separated from the original accept by an arbitrary amount of time and by a caller that recomputed
- * its evidence from scratch:
- *  - The caller-supplied `result`/`findingDispositions` are compared against the payload the
- *    claimed delivery was originally accepted under (`approvalDeliveryPayload`) before any remote
- *    reconciliation or write. A retry carrying changed dispositions must never post a different
- *    GitHub effect while acknowledging the identity accepted for the original one.
- *  - The durable attempt state is re-read directly (not merely trusted from `input`): approval is
- *    bound to an accepted result that exists, carries no conflict, and matches this delivery's own
- *    output commit, and to an immutable terminal verdict recorded as `succeeded` — an absent
- *    accepted result, an absent recorded verdict, a mismatched output commit, a conflict, or any
- *    verdict other than `succeeded` all withhold. A pending delivery must not be completed while
- *    any of that evidence is still missing or has since diverged, even though the caller's own
- *    booleans might still say "proceed".
- */
-export async function retryApprovalEffect(
-  deps: { github: ReviewFixGitHubAdapter; attemptStore: ReviewFixFinalizeAttemptStore },
-  input: ReviewFixApprovalInput,
-): Promise<ApprovalEffectOutcome> {
-  if (!input.currentAuthority) {
-    return { status: "withheld", reason: "attempt does not currently hold approval authority" };
-  }
-  if (input.currentPrHeadSha !== input.result.outputCommit) {
-    return {
-      status: "withheld",
-      reason: `PR head sha ${input.currentPrHeadSha || "(unknown)"} does not match result outputCommit ${input.result.outputCommit}`,
-    };
-  }
-  if (!input.policyAllows) {
-    return { status: "withheld", reason: "review/merge policy does not allow this PR to proceed" };
-  }
-
-  const deliveryId = `${input.attemptId}.approval`;
-  const claimed = claimDelivery(FINALIZE_SOURCE, deliveryId);
-  if (claimed.status === "not_found") {
-    return { status: "withheld", reason: `no approval effect delivery found for ${deliveryId}; call applyApproval first` };
-  }
-  if (claimed.status === "delivered") {
-    return { status: "already_applied", effectId: deliveryId };
-  }
-  if (claimed.status === "already_leased") {
-    return { status: "withheld", reason: `approval effect delivery ${deliveryId} is currently leased by another retry` };
-  }
-
-  // Below this point the delivery is held under this call's claim/lease. Any withhold from here
-  // releases it back to `pending` immediately (rather than leaving it leased until the lease
-  // naturally expires) so a corrected retry is not needlessly blocked in the meantime.
-  const withholdClaim = (reason: string): ApprovalEffectOutcome => {
-    retryDelivery(FINALIZE_SOURCE, deliveryId);
-    return { status: "withheld", reason };
-  };
-
-  // Safeguard 1: the retry must reconcile the same effect it claimed, not a different one. A
-  // caller supplying changed dispositions (or a different result) for the same attempt/delivery
-  // identity must withhold rather than post a divergent GitHub effect under the original identity.
-  const expectedPayload = approvalDeliveryPayload(input.result, input.findingDispositions);
-  if (JSON.stringify(expectedPayload) !== JSON.stringify(claimed.delivery.payload)) {
-    return withholdClaim(
-      `retry payload for ${deliveryId} does not match the delivery originally accepted for this attempt; reconcile with the accepted result and dispositions before retrying`,
-    );
-  }
-
-  // Safeguard 2: re-read the durable attempt state directly rather than trusting only the
-  // caller's evidence — a conflict or an incompatible recorded verdict may have been persisted
-  // after the original `applyApproval` call accepted this delivery. Unlike `applyApproval`
-  // (whose gates only ever see the caller-supplied `input`), this reconciliation path must bind
-  // to what the attempt repository has actually durably accepted: a pending delivery with no
-  // accepted result, or one whose accepted result has diverged from this delivery's own
-  // identity, or an attempt with no recorded `succeeded` verdict, must never be completed —
-  // `getAcceptedResult`/`getRecordedOutcome` returning `null` is not itself proof of "safe to
-  // proceed" and must withhold exactly like a conflicting or incompatible value would.
-  const accepted = await deps.attemptStore.getAcceptedResult(input.attemptId);
-  if (!accepted || !accepted.result) {
-    return withholdClaim("no durably accepted runner result is on record for this attempt");
-  }
-  if (accepted.hasConflict) {
-    return withholdClaim("a conflicting result has been recorded for this attempt since the approval delivery was accepted");
-  }
-  if (accepted.result.outputCommit !== input.result.outputCommit) {
-    return withholdClaim(
-      `accepted result outputCommit ${accepted.result.outputCommit} does not match the approval delivery's outputCommit ${input.result.outputCommit}`,
-    );
-  }
-  const recordedOutcome = await deps.attemptStore.getRecordedOutcome(input.attemptId);
-  if (!recordedOutcome || recordedOutcome.terminal.status !== "succeeded") {
-    return withholdClaim(
-      recordedOutcome
-        ? `attempt's recorded terminal outcome is '${recordedOutcome.terminal.status}', not 'succeeded'`
-        : "attempt has no recorded terminal outcome yet",
-    );
-  }
-
-  // The claim above only proves no other local retry holds this delivery — it is not evidence
-  // that the earlier write actually failed. Observe GitHub's own state by this attempt's stable
-  // identity before deciding to repeat the write: a crash after the remote write landed but
-  // before `ackDelivery` ran must reconcile silently here, not post a duplicate.
-  if (await deps.github.hasAppliedApprovalEffect(input.scope, input.attemptId)) {
-    ackDelivery(FINALIZE_SOURCE, deliveryId);
-    return { status: "already_applied", effectId: deliveryId };
-  }
-
-  await deps.github.applyApprovalEffect(input.scope, input.attemptId, input.result, input.findingDispositions);
-  ackDelivery(FINALIZE_SOURCE, deliveryId);
-  return { status: "applied", effectId: deliveryId };
 }
 
 // ---------------------------------------------------------------------------

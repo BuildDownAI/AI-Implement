@@ -6,7 +6,7 @@ import type { ReviewFixAttemptsFacade, ReviewFixAttemptCaller, ReviewFixAttemptC
 import { getDb } from "./dedup.js";
 import { getReviewFixActivityGaps, isReviewFixEvidenceTombstoned,
   listReviewFixActivity, listReviewFixCycleSummaries } from "./review-fix-evidence.js";
-import { acceptDelivery } from "./review-fix-inbox.js";
+import type { ReviewFixCancelForwarder } from "./review-fix-close.js";
 import { loadPendingReviewFixFeedback } from "./review-fix-pending.js";
 import type { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
 import type { ReviewFixImmutableOutcome, ReviewFixWorkerPort } from "./review-fix-ports.js";
@@ -74,7 +74,11 @@ function evidenceComplete(attemptId: string, cycles: ReviewFixAttemptCycleSummar
   });
 }
 
-export function createReviewFixAdminFacade(store: SqliteReviewFixAttemptStore, worker: Pick<ReviewFixWorkerPort, "reconcile">): ReviewFixAttemptsFacade {
+export function createReviewFixAdminFacade(
+  store: SqliteReviewFixAttemptStore,
+  worker: Pick<ReviewFixWorkerPort, "reconcile">,
+  ingress: ReviewFixCancelForwarder,
+): ReviewFixAttemptsFacade {
   return {
     async getAttempt(attemptId, caller) {
       if (!allowed(caller)) return { status: "not_found" };
@@ -153,13 +157,9 @@ export function createReviewFixAdminFacade(store: SqliteReviewFixAttemptStore, w
       if (!row) return { status: "not_found" };
       if (row.released_at !== null) return { status: "rejected", reason: "attempt is already released" };
       if (row.authority_revoked_at === null) return { status: "rejected", reason: "revoke authority before cancellation" };
-      const accepted = acceptDelivery({ authenticatedSource: "operator",
-        deliveryId: `${attemptId}.cancel`, kind: "cancellation",
-        destination: { installationId: Number(row.installation_id), repository: row.repository, prNumber: row.pr_number },
-        payload: { attemptId },
-      });
-      return accepted.status === "accepted" ? { status: "accepted" }
-        : { status: "rejected", reason: "cancellation delivery could not be persisted" };
+      const forwarded = await ingress.cancel(attemptId, { idempotencyKey: `${attemptId}.cancel` });
+      return forwarded.status === "accepted" ? { status: "accepted" }
+        : { status: "rejected", reason: "cancellation could not be delivered to Restate" };
     },
   };
 }

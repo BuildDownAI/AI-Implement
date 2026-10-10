@@ -274,6 +274,18 @@ describe("event filtering", () => {
     expect(invalid.res.statusCode).toBe(401);
     expect(onClosed).not.toHaveBeenCalled();
   });
+
+  it("answers 503 when forwarding the pilot cancellation fails, so GitHub redelivers", async () => {
+    const onClosed = vi.fn(async () => { throw new Error("review-fix cancellation forward unavailable"); });
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const payload = { action: "closed", pull_request: { number: 5, merged: false },
+      repository: { full_name: "org/repo" } };
+    const closed = makeRequest(SECRET, "pull_request", payload);
+    webhook.handleGitHubWebhook(closed.req as never, closed.res as never, SECRET,
+      undefined, undefined, undefined, undefined, onClosed);
+    await closed.res.done;
+    expect(closed.res.statusCode).toBe(503);
+  });
 });
 
 describe("workflow_run delivery", () => {

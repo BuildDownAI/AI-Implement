@@ -170,9 +170,10 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     const store = new storeModule.SqliteReviewFixAttemptStore();
     const admitted = await store.admit(admissionRequest());
     if (admitted.status !== "prepared") throw new Error("expected prepared");
+    const cancels: Array<{ attemptId: string; key: string }> = [];
     const facade = adminFacade.createReviewFixAdminFacade(store, {
       reconcile: async () => ({ status: "unknown" }),
-    });
+    }, { cancel: async (attemptId, opts) => { cancels.push({ attemptId, key: opts.idempotencyKey }); return { status: "accepted" }; } });
     const user = { role: "user" as const, email: "reader@example.com" };
     const admin = { role: "admin" as const, email: "operator@example.com" };
     expect(await facade.getAttempt(admitted.attempt.attemptId, user)).toEqual({ status: "not_found" });
@@ -187,7 +188,8 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     expect(await facade.revokeAuthority(admitted.attempt.attemptId, user)).toEqual({ status: "not_found" });
     expect(await facade.revokeAuthority(admitted.attempt.attemptId, admin)).toEqual({ status: "accepted" });
     expect(await facade.requestCancellation(admitted.attempt.attemptId, admin)).toEqual({ status: "accepted" });
-    expect((dedup.getDb().prepare("SELECT kind FROM review_fix_inbox").get() as { kind: string }).kind).toBe("cancellation");
+    expect(cancels).toEqual([{ attemptId: admitted.attempt.attemptId, key: `${admitted.attempt.attemptId}.cancel` }]);
+    expect(dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get()).toEqual({ n: 0 });
     expect(dedup.getDb().prepare("SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?")
       .get(admitted.attempt.attemptId)).toMatchObject({ released_at: null });
   });
@@ -200,7 +202,7 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     const execution = { githubRunId: 9001, githubRunAttempt: 2 };
     const facade = adminFacade.createReviewFixAdminFacade(store, {
       reconcile: async () => ({ status: "found", execution }),
-    });
+    }, { cancel: async () => ({ status: "accepted" }) });
     const admin = { role: "admin" as const, email: "operator@example.com" };
     expect(await facade.adopt(admitted.attempt.attemptId,
       { githubRunId: "9002", githubRunAttempt: 2 }, admin)).toEqual({ status: "unverified" });
@@ -216,12 +218,17 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     const admitted = await store.admit(admissionRequest());
     if (admitted.status !== "prepared") throw new Error("expected prepared");
     expect(close.listActiveRestateReviewFixPrs()).toEqual([{ repository: SCOPE.repository, prNumber: SCOPE.prNumber }]);
-    expect(close.queueReviewFixCancellationForClosedPr(SCOPE.repository, SCOPE.prNumber)).toBe(true);
+    const keys: string[] = [];
+    const ingress = { cancel: async (_id: string, opts: { idempotencyKey: string }) => { keys.push(opts.idempotencyKey); return { status: "accepted" as const }; } };
+    expect(await close.queueReviewFixCancellationForClosedPr(SCOPE.repository, SCOPE.prNumber, ingress)).toBe(true);
     expect(await store.hasCurrentAuthority(admitted.attempt.attemptId)).toBe(false);
-    expect(close.queueReviewFixCancellationForClosedPr(SCOPE.repository, SCOPE.prNumber)).toBe(true);
-    const rows = dedup.getDb().prepare("SELECT kind, delivery_state FROM review_fix_inbox").all() as
-      Array<{ kind: string; delivery_state: string }>;
-    expect(rows).toEqual([{ kind: "cancellation", delivery_state: "pending" }]);
+    expect(await close.queueReviewFixCancellationForClosedPr(SCOPE.repository, SCOPE.prNumber, ingress)).toBe(true);
+    expect(keys).toEqual([`${admitted.attempt.attemptId}.closed`, `${admitted.attempt.attemptId}.closed`]);
+    expect(dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get()).toEqual({ n: 0 });
+    // Restate unavailable: the revocation stays and the caller sees the failure so the webhook answers 503.
+    await expect(close.queueReviewFixCancellationForClosedPr(SCOPE.repository, SCOPE.prNumber,
+      { cancel: async () => ({ status: "unavailable" }) })).rejects.toThrow("unavailable");
+    expect(await store.hasCurrentAuthority(admitted.attempt.attemptId)).toBe(false);
     expect(dedup.getDb().prepare("SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?")
       .get(admitted.attempt.attemptId)).toMatchObject({ released_at: null });
     await store.releaseOwner(admitted.attempt.owner, "cancelled");
@@ -739,33 +746,6 @@ describe("SqliteReviewFixAttemptStore: release", () => {
     expect(released.status).toBe("released");
     const secondRelease = await store.releaseOwner(outcome.attempt.owner, "finalized");
     expect(secondRelease.status).toBe("not_owner");
-  });
-});
-
-describe("SqliteReviewFixAttemptStore: terminal effect outbox", () => {
-  it("records a terminal effect once and collapses a duplicate write", async () => {
-    seedMapping();
-    const store = new storeModule.SqliteReviewFixAttemptStore();
-    const outcome = await store.admit(admissionRequest());
-    if (outcome.status !== "prepared") throw new Error("expected prepared");
-    const attemptId = outcome.attempt.attemptId;
-
-    const first = store.recordTerminalEffect(attemptId, "approval-1", { note: "approved" });
-    expect(first.status).toBe("accepted");
-    const duplicate = store.recordTerminalEffect(attemptId, "approval-1", { note: "approved" });
-    expect(duplicate.status).toBe("accepted");
-    if (duplicate.status === "accepted" && first.status === "accepted") {
-      expect(duplicate.delivery.deliveryId).toBe(first.delivery.deliveryId);
-    }
-
-    const rows = dedup.getDb().prepare("SELECT COUNT(*) as n FROM review_fix_inbox WHERE kind = 'terminal-effect'").get() as { n: number };
-    expect(rows.n).toBe(1);
-
-    const conflicting = store.recordTerminalEffect(attemptId, "approval-1", { note: "different payload" });
-    expect(conflicting.status).toBe("conflict");
-
-    const unknown = store.recordTerminalEffect("nonexistent-attempt", "approval-1", {});
-    expect(unknown).toEqual({ status: "rejected", reason: "unknown attempt nonexistent-attempt" });
   });
 });
 

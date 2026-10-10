@@ -32,19 +32,13 @@
  * content while that id is still active returns the same prepared attempt
  * without spending a second reservation or budget entry.
  *
- * Two capabilities beyond the strict `ReviewFixAttemptStorePort` shape are
- * exposed here because the schema and this issue's task both call for them,
+ * One capability beyond the strict `ReviewFixAttemptStorePort` shape is
+ * exposed here because the schema and this issue's task both call for it,
  * even though `ReviewFixFinalizerPort` itself (AII-790) is a later issue:
  *  - `recordOutcome` writes `review_fix_attempts.terminal_outcome_json` exactly
  *    once (write-once, idempotent on retry) — the "immutable terminal outcome"
  *    the issue asks this repository to expose.
- *  - `recordTerminalEffect` is a thin idempotent-effect helper over the
- *    already-approved inbox schema (`review_fix_inbox`, `kind: "terminal-effect"`,
- *    AII-774/781), keyed by `attemptId.effectId` (the inbox's delivery-id charset
- *    excludes `:`) so replay can reconcile a tracker/approval effect without
- *    treating the inbox write as atomic with the SQLite transaction that
- *    produced it.
- * Neither performs the network calls or authority/policy checks a full
+ * It does not perform the network calls or authority/policy checks a full
  * `ReviewFixFinalizerPort.applyApproval` needs — those remain out of scope here.
  */
 import { createHash } from "node:crypto";
@@ -52,7 +46,6 @@ import { getDb } from "./dedup.js";
 import { isDeployHeld } from "./deploy-hold.js";
 import { isParked } from "./dispatch-breaker.js";
 import { getMappings, resolvePrDispatchBudget, type RepoMapping } from "./config.js";
-import { acceptDelivery } from "./review-fix-inbox.js";
 import { unprocessedOpenReviewFindings } from "./review-fix-pending.js";
 import {
   acquire as acquireDispatchAdmission,
@@ -510,8 +503,8 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
 
   /**
    * Read-only peek at the attempt's immutable terminal verdict, or `null` if `recordOutcome` has
-   * never written one — never itself writes, unlike `recordOutcome`. `retryApprovalEffect`
-   * (AII-790) uses this to withhold a reconciliation when a verdict recorded after the original
+   * never written one — never itself writes, unlike `recordOutcome`. The finalizer
+   * uses this to withhold an approval when a verdict recorded after the original
    * approval delivery was accepted turns out incompatible with approval.
    */
   async getRecordedOutcome(attemptId: AttemptId): Promise<ReviewFixImmutableOutcome | null> {
@@ -520,29 +513,5 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
       | undefined;
     if (!row || row.terminal_outcome_json === null) return null;
     return JSON.parse(row.terminal_outcome_json) as ReviewFixImmutableOutcome;
-  }
-
-  /**
-   * Idempotent outbox entry for one attempt's terminal effect (e.g. one
-   * approval attempt), over the already-approved inbox schema (AII-774/781):
-   * `review_fix_inbox` with `kind: "terminal-effect"`, keyed by
-   * `attemptId.effectId` so a duplicate write collapses to the original rather
-   * than reapplying, and replay can reconcile without the inbox write being
-   * atomic with whatever external effect it records.
-   */
-  recordTerminalEffect(attemptId: AttemptId, effectId: string, payload: unknown): ReturnType<typeof acceptDelivery> {
-    const row = getDb().prepare("SELECT installation_id, repository, pr_number FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as
-      | Pick<AttemptRow, "installation_id" | "repository" | "pr_number">
-      | undefined;
-    if (!row) {
-      return { status: "rejected", reason: `unknown attempt ${attemptId}` };
-    }
-    return acceptDelivery({
-      authenticatedSource: "review-fix-attempt-store",
-      deliveryId: `${attemptId}.${effectId}`,
-      kind: "terminal-effect",
-      destination: toScope(row),
-      payload,
-    });
   }
 }
