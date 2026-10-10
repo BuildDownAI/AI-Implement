@@ -15,6 +15,7 @@ import { getPublicationCredential } from "../../publication-credential.js";
 import {
   AI_IMPLEMENT_NATIVE_REVIEW_MARKER,
   collectExternalReviewFindingsFromGh,
+  collectReviewFindingsBlocksFromGh,
   formatReviewLedgerForPrompt,
   type ReviewLedgerFinding,
   type ReviewLedgerSource,
@@ -28,7 +29,7 @@ import {
   type FindingDisposition,
 } from "../finding-dispositions.js";
 import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
-import type { ReviewProcessId } from "../../review-process.js";
+import { resolveReviewProcess, type ReviewProcessDefinition, type ReviewProcessId, type ReviewVerdictResult } from "../../review-process.js";
 import { REVIEWER_VERDICT_SCHEMA, resolveTrustedReviewer, type ReviewerDefinition, type ReviewerFinding, type ReviewerVerdict } from "../reviewers/registry.js";
 import { isChecksPermissionError } from "../../checks-permission.js";
 import { inferTestResults, sumUsage, toolTraceLines, writeCycleSummary, type CycleDisposition } from "../cycle-summary.js";
@@ -44,9 +45,9 @@ interface PostPushReviewInputs extends Record<string, unknown> {
   reviewCheckNames?: string[];
   /** Project reviewer selections from trusted run_config. Absent keeps direct-call legacy behavior. */
   reviewers?: ReviewerSelection[];
-  /** Project review process from trusted run_config. Carried only; the step does not read it yet. */
+  /** Project review process from trusted run_config: which check/app pairs, verdict reader, and authors gate the PR. */
   reviewProcess?: ReviewProcessId;
-  /** Extra trusted review author logins from trusted run_config. Carried only; the step does not read it yet. */
+  /** Extra trusted review author logins from trusted run_config. */
   trustedReviewAuthors?: string[];
   /** Selected image-baked reviewer code resolved before workspace reviewer config is consulted. */
   trustedReviewerDefinitions?: ReadonlyMap<string, ReviewerDefinition>;
@@ -558,6 +559,7 @@ function findFailingCiChecks(
   headSha: string,
   configuredCheckNames: string[] | undefined,
   excludeExternalReviewChecks = true,
+  process: ReviewProcessDefinition = resolveReviewProcess(null),
 ): CiChecksReadResult {
   if (!headSha) return { failingChecks: [], unreadable: false, permissionDenied: false };
   const res = ghSpawn(["api", `repos/:owner/:repo/commits/${headSha}/check-runs?per_page=100`]);
@@ -570,7 +572,7 @@ function findFailingCiChecks(
   }
   return {
     failingChecks: parseCheckRuns(res.stdout)
-      .filter((run) => run.conclusion === "failure" && (!excludeExternalReviewChecks || !isExternalReviewCheckName(run.name, configuredCheckNames)))
+      .filter((run) => run.conclusion === "failure" && (!excludeExternalReviewChecks || !matchesReviewCheck(run, process, configuredCheckNames)))
       .map((run) => run.name),
     unreadable: false,
     permissionDenied: false,
@@ -594,6 +596,36 @@ function isExternalReviewCheckName(name: string, configured: string[] | undefine
     || (normalized.includes("claude") && normalized.includes("review"));
 }
 
+/**
+ * Whether a check run is the review process's check. The `ai-implement` process keeps today's name-only match
+ * (including the claude+review heuristic). Any other process matches a pair: the name AND the posting app, so a
+ * same-named check from another app cannot approve a PR.
+ */
+function matchesReviewCheck(
+  run: { name: string; appSlug: string },
+  process: ReviewProcessDefinition,
+  configured: string[] | undefined,
+): boolean {
+  if (process.id === "ai-implement") return isExternalReviewCheckName(run.name, configured);
+  const name = run.name.trim().toLowerCase();
+  const appSlug = run.appSlug.trim().toLowerCase();
+  if (!name) return false;
+  const listed = (pair: ReviewProcessDefinition["checkPairs"][number]) =>
+    expectedPairNames(pair.names, configured).some((candidate) => candidate.trim().toLowerCase() === name);
+  return process.checkPairs.some((pair) => {
+    if (pair.appSlug.trim().toLowerCase() !== appSlug || !listed(pair)) return false;
+    // A name another pair spells out exactly belongs to that pair's app: the hosted service's "Claude Code Review"
+    // is also in the default list, but only the posting app `claude` may use it.
+    return !process.checkPairs.some((other) => other !== pair && Array.isArray(other.names) && listed(other)
+      && other.appSlug.trim().toLowerCase() !== appSlug);
+  });
+}
+
+function expectedPairNames(names: string[] | "project-review-check-names", configured: string[] | undefined): string[] {
+  if (names !== "project-review-check-names") return names;
+  return configured && configured.length > 0 ? configured : DEFAULT_REVIEW_CHECK_NAMES;
+}
+
 /** The PR's head SHA, or "" when the API answered but carried no head.sha, or null when the
  *  call itself failed. The distinction matters: "" is information, null is the ABSENCE of
  *  information and must never be read as "this PR has no reviewer". */
@@ -608,7 +640,15 @@ function resolvePrHeadSha(ghSpawn: (args: string[]) => SpawnResult, prNumber: st
   }
 }
 
-function parseCheckRuns(stdout: string): { name: string; status: string; conclusion: string }[] {
+interface ParsedCheckRun {
+  name: string;
+  status: string;
+  conclusion: string;
+  appSlug: string;
+  outputText: string | null;
+}
+
+function parseCheckRuns(stdout: string): ParsedCheckRun[] {
   let payload: unknown;
   try {
     payload = JSON.parse(stdout);
@@ -617,7 +657,7 @@ function parseCheckRuns(stdout: string): { name: string; status: string; conclus
   }
   // `gh api` returns { check_runs: [...] }; with --slurp/--paginate it can be an array of pages.
   const pages = Array.isArray(payload) ? payload : [payload];
-  const runs: { name: string; status: string; conclusion: string }[] = [];
+  const runs: ParsedCheckRun[] = [];
   for (const page of pages) {
     const record = asRecord(page);
     const checkRuns = record?.check_runs;
@@ -627,7 +667,16 @@ function parseCheckRuns(stdout: string): { name: string; status: string; conclus
       const name = stringProp(r, "name");
       const status = stringProp(r, "status");
       const conclusion = stringProp(r, "conclusion");
-      if (name) runs.push({ name, status, conclusion });
+      const outputText = recordProp(r, "output")?.text;
+      if (name) {
+        runs.push({
+          name,
+          status,
+          conclusion,
+          appSlug: stringProp(recordProp(r, "app"), "slug"),
+          outputText: typeof outputText === "string" ? outputText : null,
+        });
+      }
     }
   }
   return runs;
@@ -668,12 +717,22 @@ function createWarnOnce(): WarnOnce {
   };
 }
 
+type ExternalReviewProbeState = "absent" | "running" | "completed" | "no-real-verdict" | "unreadable" | "permission-denied";
+
+interface ExternalReviewProbe {
+  state: ExternalReviewProbeState;
+  /** The review process's verdict, set only when its reader ran. */
+  verdict?: ReviewVerdictResult;
+}
+
 function probeExternalReviewCheck(
   ghSpawn: (args: string[]) => SpawnResult,
+  prNumber: string,
   headSha: string,
-  configuredCheckNames: string[] | undefined,
+  opts: { configuredCheckNames: string[] | undefined; process: ReviewProcessDefinition; extraAuthors: readonly string[] },
   warnOnce: WarnOnce,
-): "absent" | "running" | "completed" | "no-real-verdict" | "unreadable" | "permission-denied" {
+): ExternalReviewProbe {
+  const { configuredCheckNames, process } = opts;
   // --paginate --slurp, not a bare per_page=100: on a busy SHA the review check can fall
   // outside the first page, and a truncated page is indistinguishable from "no reviewer" —
   // which resolves to "absent" and fails OPEN. parseCheckRuns already accepts the array-of-
@@ -692,13 +751,13 @@ function probeExternalReviewCheck(
   if (res.exitCode !== 0) {
     if (isChecksPermissionError({ text: res.stderr || res.stdout })) {
       warnOnce(`permission-denied:${headSha}`, `[post-push-review] Cannot read check runs at ${headSha}: the GitHub App lacks Checks: read, or the installation hasn't accepted updated permissions: ${res.stderr || `exit ${res.exitCode}`}`);
-      return "permission-denied";
+      return { state: "permission-denied" };
     }
     warnOnce(`unreadable:${headSha}`, `[post-push-review] Could not read check runs at ${headSha}: ${res.stderr || `exit ${res.exitCode}`}`);
-    return "unreadable";
+    return { state: "unreadable" };
   }
   const allRuns = parseCheckRuns(res.stdout);
-  const matching = allRuns.filter((run) => isExternalReviewCheckName(run.name, configuredCheckNames));
+  const matching = allRuns.filter((run) => matchesReviewCheck(run, process, configuredCheckNames));
   if (matching.length === 0) {
     // Both shapes are worth surfacing — "no runs at all" and "runs present but none matched" are
     // the two most common causes of a silent fail-open — but once each, not once per probe. This
@@ -709,21 +768,80 @@ function probeExternalReviewCheck(
     if (allRuns.length === 0) {
       warnOnce(`no-runs:${headSha}`, `[post-push-review] No check runs present at ${headSha}`);
     } else {
-      const presentNames = allRuns.map((r) => r.name).join(", ");
-      const expected = (configuredCheckNames && configuredCheckNames.length > 0) ? configuredCheckNames : DEFAULT_REVIEW_CHECK_NAMES;
+      const presentNames = allRuns.map((r) => (r.appSlug ? `${r.name} (app: ${r.appSlug})` : r.name)).join(", ");
+      const expected = process.id === "ai-implement"
+        ? ((configuredCheckNames && configuredCheckNames.length > 0) ? configuredCheckNames : DEFAULT_REVIEW_CHECK_NAMES)
+        : process.checkPairs.flatMap((pair) => expectedPairNames(pair.names, configuredCheckNames).map((name) => `${name} (app: ${pair.appSlug})`));
       warnOnce(`no-match:${headSha}`, `[post-push-review] No external review check matched; present: ${presentNames}; expected one of: ${expected.join(", ")}`);
     }
-    return "absent";
+    return { state: "absent" };
   }
-  if (matching.some((run) => run.status !== "completed")) return "running";
+  if (matching.some((run) => run.status !== "completed")) return { state: "running" };
+  if (process.id !== "ai-implement") return readProcessVerdict(ghSpawn, prNumber, headSha, matching, opts);
   // Only conclusions a reviewer actually produces count as a real review. Cancelled, skipped,
   // neutral, timed_out, action_required, and any future conclusion GitHub adds all fail closed —
   // an unknown conclusion should never silently approve.
   const hasRealReview = matching.some((run) => REAL_REVIEW_CONCLUSIONS.has(run.conclusion));
-  if (hasRealReview) return "completed";
+  if (hasRealReview) return { state: "completed" };
   // Every matching run is completed but none produced a real verdict. Return "no-real-verdict" so
   // the caller can fail closed immediately rather than approving as if no check existed.
-  return "no-real-verdict";
+  return { state: "no-real-verdict" };
+}
+
+/**
+ * Reads a non-default review process's verdict once every matched check run has completed. The reader takes the
+ * check runs, the bot-authored inline comments, and the trusted `review-findings` blocks (a trusted block wins).
+ * A completed set the reader cannot read a verdict from is `no-real-verdict` (fail closed); only a block that
+ * carries no verdict keeps the wait going.
+ */
+function readProcessVerdict(
+  ghSpawn: (args: string[]) => SpawnResult,
+  prNumber: string,
+  headSha: string,
+  matchedRuns: ParsedCheckRun[],
+  opts: { process: ReviewProcessDefinition; extraAuthors: readonly string[] },
+): ExternalReviewProbe {
+  const commentsRes = ghSpawn(["api", "--paginate", "--slurp", `repos/:owner/:repo/pulls/${prNumber}/comments?per_page=100`]);
+  if (commentsRes.exitCode !== 0) return { state: "unreadable" };
+  const blocks = collectReviewFindingsBlocksFromGh(ghSpawn, prNumber, { process: opts.process, extraAuthors: opts.extraAuthors });
+  if (blocks === null) return { state: "unreadable" };
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(commentsRes.stdout);
+  } catch {
+    return { state: "unreadable" };
+  }
+  const inlineComments: Parameters<ReviewProcessDefinition["readVerdict"]>[0]["inlineComments"] = [];
+  for (const page of Array.isArray(payload) ? payload : [payload]) {
+    for (const item of Array.isArray(page) ? page : [page]) {
+      const c = asRecord(item);
+      const user = recordProp(c, "user");
+      const body = stringProp(c, "body");
+      const authorLogin = stringProp(user, "login");
+      if (!c || !body || !authorLogin) continue;
+      const line = c.line;
+      inlineComments.push({
+        authorLogin,
+        authorType: stringProp(user, "type"),
+        body,
+        ...(stringProp(c, "path") ? { path: stringProp(c, "path") } : {}),
+        ...(typeof line === "number" ? { line } : {}),
+        ...(stringProp(c, "commit_id") ? { commitId: stringProp(c, "commit_id") } : {}),
+        ...(stringProp(c, "html_url") ? { url: stringProp(c, "html_url") } : {}),
+      });
+    }
+  }
+
+  const verdict = opts.process.readVerdict({
+    headSha,
+    checkRuns: matchedRuns.map((run) => ({ ...run, conclusion: run.conclusion || null })),
+    inlineComments,
+    blocks,
+  });
+  if (verdict.verdict === "approve" || verdict.verdict === "changes_requested") return { state: "completed", verdict };
+  if (verdict.verdict === "incomplete" && verdict.source !== "none") return { state: "running", verdict };
+  return { state: "no-real-verdict", verdict };
 }
 
 /**
@@ -749,8 +867,15 @@ async function waitForExternalReviewCompletion(
     pollMs: number;
     timeoutMs: number;
     configuredCheckNames: string[] | undefined;
+    process?: ReviewProcessDefinition;
+    extraAuthors?: readonly string[];
   },
-): Promise<{ state: ExternalReviewState; headSha: string }> {
+): Promise<{ state: ExternalReviewState; headSha: string; reviewVerdict?: ReviewVerdictResult }> {
+  const probeOpts = {
+    configuredCheckNames: opts.configuredCheckNames,
+    process: opts.process ?? resolveReviewProcess(null),
+    extraAuthors: opts.extraAuthors ?? [],
+  };
   // The head-SHA read is retried inside the loop, not resolved once above it. A failed read
   // used to short-circuit to "absent" — the fail-OPEN state — BEFORE the loop, so none of the
   // hardening below could act. That is the same defect the "unreadable" probe state fixes, one
@@ -788,9 +913,11 @@ async function waitForExternalReviewCompletion(
       }
     }
 
-    const state = headSha
-      ? probeExternalReviewCheck(ghSpawn, headSha, opts.configuredCheckNames, warnOnce)
-      : "unreadable";
+    const probe: ExternalReviewProbe = headSha
+      ? probeExternalReviewCheck(ghSpawn, prNumber, headSha, probeOpts, warnOnce)
+      : { state: "unreadable" };
+    const state = probe.state;
+    const reviewVerdict = probe.verdict ? { reviewVerdict: probe.verdict } : {};
 
     // Immediate, unambiguous terminal return — deliberately ahead of the sawMatching/
     // pendingSettle machinery below. That machinery exists to avoid mistaking a single bad
@@ -819,11 +946,11 @@ async function waitForExternalReviewCompletion(
     // local to this code, and nothing fails if it stops holding — a cached verdict, an early
     // exit, or a cheap review model would quietly narrow the real protection to these 5s.
     if (observed === "absent" || observed === "no-real-verdict") {
-      if (pendingSettle === observed) return { state: observed, headSha };
+      if (pendingSettle === observed) return { state: observed, headSha, ...reviewVerdict };
       pendingSettle = observed;
     } else {
       pendingSettle = null;
-      if (observed !== "running" && observed !== "unreadable") return { state: observed, headSha };
+      if (observed !== "running" && observed !== "unreadable") return { state: observed, headSha, ...reviewVerdict };
     }
     if (elapsed >= opts.timeoutMs) return { state: "running", headSha };
     await opts.sleep(opts.pollMs);
@@ -1912,7 +2039,11 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
           configReviewerResolution.branchDefinitions,
         )
       : null;
-    if (configuredReviewerSelection?.length === 0) {
+    // A non-default review process gates on its external verdict, so it may run with no internal reviewer.
+    const reviewProcess = resolveReviewProcess(inputs.reviewProcess);
+    const trustedReviewAuthors = inputs.trustedReviewAuthors ?? [];
+    const externalOnlyReview = reviewProcess.id !== "ai-implement" && configuredReviewerSelection?.length === 0;
+    if (configuredReviewerSelection?.length === 0 && !externalOnlyReview) {
       return reportReviewerSelectionFailure(
         reporter,
         ghSpawn,
@@ -1925,7 +2056,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       console.warn(`[post-push-review] ${message}`);
       return reportReviewerSelectionFailure(reporter, ghSpawn, prNumber, message);
     }
-    if (selectedReviewerResolution && selectedReviewerResolution.reviewers.length === 0) {
+    if (selectedReviewerResolution && selectedReviewerResolution.reviewers.length === 0 && !externalOnlyReview) {
       const message = selectionFailureMessage("empty-internal");
       console.warn(`[post-push-review] ${message}`);
       return reportReviewerSelectionFailure(reporter, ghSpawn, prNumber, message);
@@ -2054,6 +2185,8 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
             pollMs: reviewWaitPollMs,
             timeoutMs: reviewWaitTimeoutMs,
             configuredCheckNames: inputs.reviewCheckNames,
+            process: reviewProcess,
+            extraAuthors: trustedReviewAuthors,
           })
         : {
             state: "skipped" as ExternalReviewState,
@@ -2072,18 +2205,31 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       }
       const externalReviewPending = externalReviewState === "running";
       // Findings read below may belong to an older head, so a check without a verdict never approves.
-      const externalReviewNoVerdict = externalReviewState === "no-real-verdict";
+      // With no internal reviewer the external verdict is the only review, so a skipped or absent
+      // external check leaves nothing that reviewed the PR and fails closed.
+      const externalReviewNoVerdict = externalReviewState === "no-real-verdict"
+        || (externalOnlyReview && (externalReviewState === "skipped" || externalReviewState === "absent"));
+      const processVerdict = externalReviewResult.reviewVerdict;
+      if (externalReviewState !== "skipped") {
+        console.log(`[post-push-review] review process ${reviewProcess.id}: verdict ${processVerdict?.verdict ?? externalReviewState} from ${processVerdict?.source ?? "check-conclusion"}`);
+      }
       const externalFindingsResult = externalReviewState === "skipped"
         ? { findings: [] as ReviewLedgerFinding[], findingsUnavailable: false }
-        : collectExternalReviewFindingsFromGh(ghSpawn, prNumber);
-      const externalFindings = externalFindingsResult.findings;
+        : collectExternalReviewFindingsFromGh(ghSpawn, prNumber, {
+            process: reviewProcess,
+            extraAuthors: trustedReviewAuthors,
+            ...(externalReviewResult.headSha ? { headSha: externalReviewResult.headSha } : {}),
+          });
+      const externalFindings = processVerdict?.verdict === "changes_requested" && externalFindingsResult.findings.length === 0
+        ? processVerdict.findings
+        : externalFindingsResult.findings;
       const findingsUnavailable = externalFindingsResult.findingsUnavailable;
 
       // CI gate: collect failing non-review checks so a red build can never produce
       // "Ready to merge". Filesystem projects still check CI when external review is
       // unconfigured, including CI jobs whose names happen to resemble review checks.
       const ciChecksResult = ((externalReviewState !== "skipped" || filesystemWithoutExternalReviewer) && externalReviewResult.headSha)
-        ? findFailingCiChecks(ghSpawn, externalReviewResult.headSha, inputs.reviewCheckNames, !filesystemWithoutExternalReviewer)
+        ? findFailingCiChecks(ghSpawn, externalReviewResult.headSha, inputs.reviewCheckNames, !filesystemWithoutExternalReviewer, reviewProcess)
         : { failingChecks: [] as string[], unreadable: false, permissionDenied: false };
 
       if (ciChecksResult.permissionDenied) {
@@ -2125,8 +2271,9 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       const hasGatingExternalFindings = gatingExternalFindings.length > 0;
       const advisoryExternalFindings = advisoryReviewFindings;
       let issues = internalIssuesFromReviewLedger(gatingReviewFindings);
-      const externalReviewVerdictBlocks = externalFindingsResult.verdictSource === "review-contract"
-        && (externalFindingsResult.verdict === "changes_requested" || externalFindingsResult.verdict === "incomplete");
+      const externalReviewVerdictBlocks = (externalFindingsResult.verdictSource === "review-contract"
+        && (externalFindingsResult.verdict === "changes_requested" || externalFindingsResult.verdict === "incomplete"))
+        || processVerdict?.verdict === "changes_requested";
       console.log(
         `[post-push-review] Review ledger findings: gating=${gatingReviewFindings.length} advisory=${advisoryReviewFindings.length}`,
       );
