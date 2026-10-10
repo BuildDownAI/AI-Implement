@@ -80,7 +80,9 @@ jobs:
           for _i in $(seq 1 60); do
             if [ "$(docker inspect -f '{{.State.Running}}' orchestrator-ci)" != "true" ]; then
               echo "FAIL: container exited during boot"
-              break
+              echo "--- Container log ---"
+              docker logs orchestrator-ci 2>&1 || true
+              exit 1
             fi
             if body=$(curl -sf http://localhost:8080/ 2>/dev/null) \
               && printf '%s' "$body" | jq -e '
