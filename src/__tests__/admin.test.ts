@@ -5653,7 +5653,8 @@ describe("admin sessions — kg-refresh destroy", () => {
   it("destroys the machine and returns 200 for an in-flight kg-refresh job", async () => {
     const token = await login("secret");
     const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
-    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel" });
+    log.setJobMachineNonce(jobId, "nonce-kg");
+    log.setJobMachineId(jobId, "m-kg-cancel");
     log.updateJobMachineId(jobId, "m-kg-cancel");
 
     const res = await deleteSession("m-kg-cancel", token);
@@ -5665,7 +5666,8 @@ describe("admin sessions — kg-refresh destroy", () => {
   it("stamps the job row operator_cancelled", async () => {
     const token = await login("secret");
     const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
-    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel3" });
+    log.setJobMachineNonce(jobId, "nonce-kg");
+    log.setJobMachineId(jobId, "m-kg-cancel3");
     log.updateJobMachineId(jobId, "m-kg-cancel3");
 
     await deleteSession("m-kg-cancel3", token);
@@ -5678,7 +5680,8 @@ describe("admin sessions — kg-refresh destroy", () => {
   it("sends exactly one notification and does not call provider.clearWorkingState (regression pin)", async () => {
     const token = await login("secret");
     const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
-    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel4" });
+    log.setJobMachineNonce(jobId, "nonce-kg");
+    log.setJobMachineId(jobId, "m-kg-cancel4");
     log.updateJobMachineId(jobId, "m-kg-cancel4");
 
     const clearWorkingState = vi.spyOn(provider, "clearWorkingState");
@@ -5691,7 +5694,8 @@ describe("admin sessions — kg-refresh destroy", () => {
   it("Fly-mode kg-refresh cancel destroys the machine and also calls the workflow cancel, tolerating a non-200", async () => {
     const token = await login("secret");
     const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines", dispatchId: "t-fly" });
-    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel5" });
+    log.setJobMachineNonce(jobId, "nonce-kg");
+    log.setJobMachineId(jobId, "m-kg-cancel5");
     log.updateJobMachineId(jobId, "m-kg-cancel5");
     const cancel = vi.fn(async () => ({ status: 409, body: { error: "no-refresh-in-flight" } }));
     const res = await deleteSession("m-kg-cancel5", token, { trigger: vi.fn(), status: vi.fn(), cancel });

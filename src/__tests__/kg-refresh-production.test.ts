@@ -472,7 +472,8 @@ describe("row projections (real log.ts, scratch database)", () => {
   it("setJobMachineNonce re-arms the nonce without clearing machine_id", async () => {
     await withScratchDb((log, _prod, db) => {
       const id = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-rearm", executionMode: "fly-machines", repo: "acme/kg" });
-      log.updateJobMachineDetails(id, { machineNonce: "n1", machineId: "m-1" });
+      log.setJobMachineNonce(id, "n1");
+      log.setJobMachineId(id, "m-1");
       log.setJobMachineNonce(id, "n2");
       expect(db.prepare("SELECT machine_nonce, machine_id FROM dispatch_log WHERE id = ?").get(id)).toEqual({ machine_nonce: "n2", machine_id: "m-1" });
     });
@@ -481,7 +482,8 @@ describe("row projections (real log.ts, scratch database)", () => {
   it("syncRowToMachineNonce re-arms the row to a reused machine's nonce and keeps machine_id", async () => {
     await withScratchDb((log, prod, db) => {
       const id = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-reuse", executionMode: "fly-machines", repo: "acme/kg" });
-      log.updateJobMachineDetails(id, { machineNonce: "attempt2", machineId: "m-1" });
+      log.setJobMachineNonce(id, "attempt2");
+      log.setJobMachineId(id, "m-1");
       prod.syncRowToMachineNonce("d-reuse", "attempt2", "attempt1");
       expect(log.getJobByNonce("attempt1")?.id).toBe(id);
       expect(log.getJobByNonce("attempt2")).toBeFalsy();
@@ -517,7 +519,7 @@ describe("row projections (real log.ts, scratch database)", () => {
     await withScratchDb((log, prod) => {
       const id = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-arm", executionMode: "fly-machines", repo: "acme/kg" });
       const nonce = prod.deriveMachineNonce("secret", "d-arm", 1);
-      log.updateJobMachineDetails(id, { machineNonce: nonce });
+      log.setJobMachineNonce(id, nonce);
       expect(log.getJobByNonce(nonce)?.id).toBe(id);
       expect(log.getJobById(id)?.machineId ?? null).toBeNull();
       prod.recordKgDispatchDetails("d-arm", { machineId: "m-arm" });
