@@ -15,7 +15,7 @@ import * as dedup from "../../dedup.js";
 import { initLogTable } from "../../log.js";
 import { initMappingsTable, getMappings } from "../../config.js";
 import { initSettingsTable } from "../../runner-mode.js";
-import { setKgMemoryProvider } from "../../kg-provider.js";
+import { setKgMemoryProvider, type KgToolResult, type MemoryProvider } from "../../kg-provider.js";
 import { VARIANTS, callService, startVariants, stopAll } from "./harness.js";
 
 // A second service, built with tool(), whose only handler throws — proves the wrapper's
@@ -412,6 +412,113 @@ describe("orchestratorTools (Restate)", () => {
       });
       expect(body?.isError).toBe(true);
       expect(body?.content?.[0]?.text).toBe("no memory provider is configured");
+    },
+  );
+
+  // ---- AII-1223: the other three answers kgTool gives, against a fake MemoryProvider. The
+  // endpoint runs in this process, so the fake's recorded calls are visible to assertions.
+  function fakeKgProvider(
+    answer: KgToolResult,
+    capabilities: Partial<MemoryProvider["capabilities"]> = {},
+  ): { provider: MemoryProvider; calls: Array<{ name: string; args: Record<string, unknown> }> } {
+    const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+    const provider: MemoryProvider = {
+      id: "fake",
+      capabilities: { hybridSearch: true, neighbors: true, path: true, provenance: true, stalenessStamp: true, ...capabilities },
+      listTools: async () => [],
+      proxyCall: () => {
+        throw new Error("proxyCall is not used by the Restate handlers");
+      },
+      callKgTool: async (name, args) => {
+        calls.push({ name, args });
+        return answer;
+      },
+    };
+    return { provider, calls };
+  }
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "kg_hybrid_search passes the provider's answer through, degraded flag included (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const result = { results: [{ id: "n1", score: 0.9 }], degraded: true };
+      const { provider, calls } = fakeKgProvider({ ok: true, result });
+      setKgMemoryProvider(provider);
+      try {
+        const args = { query: "x", limit: 3 };
+        const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "kg_hybrid_search", {
+          caller: SYSTEM,
+          args,
+        });
+        expect(body?.isError).toBeFalsy();
+        expect(JSON.parse(body?.content?.[0]?.text ?? "null")).toEqual(result);
+        expect(calls).toEqual([{ name: "kg_hybrid_search", args }]);
+      } finally {
+        setKgMemoryProvider(null);
+      }
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "kg_semantic_search answers isError without calling a provider that lacks the capability (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      // kg_semantic_search is gated by the hybridSearch capability (KG_TOOL_CAPABILITY).
+      const { provider, calls } = fakeKgProvider({ ok: true, result: { results: [] } }, { hybridSearch: false });
+      setKgMemoryProvider(provider);
+      try {
+        const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "kg_semantic_search", {
+          caller: SYSTEM,
+          args: { query: "x" },
+        });
+        expect(body?.isError).toBe(true);
+        expect(body?.content?.[0]?.text).toBe("Tool not supported by this memory provider: kg_semantic_search");
+        expect(calls).toHaveLength(0);
+      } finally {
+        setKgMemoryProvider(null);
+      }
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "kg_hybrid_search answers isError with the provider's error text on failure (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const { provider } = fakeKgProvider({ ok: false, error: "KG sidecar unavailable: connection refused" });
+      setKgMemoryProvider(provider);
+      try {
+        const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "kg_hybrid_search", {
+          caller: SYSTEM,
+          args: { query: "x" },
+        });
+        expect(body?.isError).toBe(true);
+        expect(body?.content?.[0]?.text).toBe("KG sidecar unavailable: connection refused");
+      } finally {
+        setKgMemoryProvider(null);
+      }
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "kg_hybrid_search with an empty result is not an error (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const { provider } = fakeKgProvider({ ok: true, result: { results: [] } });
+      setKgMemoryProvider(provider);
+      try {
+        const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "kg_hybrid_search", {
+          caller: SYSTEM,
+          args: { query: "nothing matches" },
+        });
+        expect(body?.isError).toBeFalsy();
+        expect(JSON.parse(body?.content?.[0]?.text ?? "null")).toEqual({ results: [] });
+      } finally {
+        setKgMemoryProvider(null);
+      }
     },
   );
 
