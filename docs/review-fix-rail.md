@@ -99,7 +99,7 @@ An unreachable ingress answers 503 rather than falling back to SQLite: a half-wr
 
 The ingress client never throws: a connection error, a timeout, and a non-2xx all resolve `unavailable`.
 
-The internal automatic producers (`guardOpenPrBeforeImplementationDispatch` for `open_pr`, `handleLeaseRejectedFailure` for `lease_rejected`) still use `acceptReviewFixWebhookEvent` directly, and the drain's periodic nudge still goes through the inbox until AII-1187 retires it. `/ai-implement` (`enqueueCommentGapfill`, `src/comment-gapfill-queue.ts`) uses a separate queue.
+The internal automatic producers (`guardOpenPrBeforeImplementationDispatch` for `open_pr`, `handleLeaseRejectedFailure` for `lease_rejected`) still use `acceptReviewFixWebhookEvent` directly, and the drain's periodic nudge calls `createReviewFixIngressClient(...).feedback(scope, undefined, { idempotencyKey: "<queue id>.<event id>.<30 s bucket>" })`; an `unavailable` result is logged and the next tick retries. `/ai-implement` (`enqueueCommentGapfill`, `src/comment-gapfill-queue.ts`) uses a separate queue.
 
 ## Source, severity, and why an inline comment does not block
 

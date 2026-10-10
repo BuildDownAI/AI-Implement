@@ -42,6 +42,18 @@ vi.mock("../github-app-auth.js", async (importOriginal) => {
   };
 });
 
+const ingressMocks = vi.hoisted(() => ({
+  feedback: vi.fn<(scope: unknown, event: unknown, opts: { idempotencyKey: string }) => Promise<{ status: "accepted" | "unavailable" }>>(),
+}));
+
+vi.mock("../restate/review-fix-client.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../restate/review-fix-client.js")>();
+  return {
+    ...actual,
+    createReviewFixIngressClient: () => ({ ...actual.createReviewFixIngressClient(), feedback: ingressMocks.feedback }),
+  };
+});
+
 let dbPath: string;
 let dedup: typeof DedupModule;
 let log: typeof LogModule;
@@ -144,6 +156,7 @@ beforeEach(async () => {
 
   githubAppAuthMocks.getInstallationToken.mockResolvedValue("gh-token");
   githubAppAuthMocks.getInstallationId.mockResolvedValue(778899);
+  ingressMocks.feedback.mockResolvedValue({ status: "accepted" });
   findByKeyMock.mockReset();
   findByKeyMock.mockResolvedValue(null);
   localGapfillMocks.dispatchLocalGapfill.mockResolvedValue({
@@ -171,6 +184,7 @@ afterEach(() => {
   localGapfillMocks.dispatchLocalGapfill.mockReset();
   githubAppAuthMocks.getInstallationToken.mockReset();
   githubAppAuthMocks.getInstallationId.mockReset();
+  ingressMocks.feedback.mockReset();
   trackerPostCommentMock.mockClear();
 });
 
@@ -180,7 +194,7 @@ describe("processReviewFixQueue — owner selection", () => {
       repo: "acme/billing", prNumber: 42, reason: "review_feedback", sourceEventId: "event-pilot" });
   }
 
-  it("signals the durable inbox for selected automatic GHA work and leaves Legacy dispatch inert", async () => {
+  it("nudges Restate ingress once per 30 s bucket for selected automatic GHA work and leaves Legacy dispatch inert", async () => {
     process.env.RUNNER_MODE = "gha";
     configModule.upsertMapping("TEAM", makeMapping({ reviewFixLifecycle: "restate" }));
     restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
@@ -193,9 +207,41 @@ describe("processReviewFixQueue — owner selection", () => {
     expect(reviewFixQueue.getPendingReviewFixes().map((item) => item.id)).toContain(queueId);
     expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
     expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM dispatch_admissions").get() as { n: number }).n).toBe(0);
-    const rows = dedup.getDb().prepare("SELECT kind, authenticated_source FROM review_fix_inbox").all() as
-      Array<{ kind: string; authenticated_source: string }>;
-    expect(rows).toEqual([{ kind: "feedback", authenticated_source: "review-fix-queue" }]);
+    const eventId = reviewFixQueue.listReviewFixEvents(queueId).at(-1)!.id;
+    const bucket = Math.floor(Date.now() / 30_000);
+    expect(ingressMocks.feedback).toHaveBeenCalledTimes(1);
+    const [scope, event, opts] = ingressMocks.feedback.mock.calls[0]!;
+    expect(scope).toEqual({ installationId: 778899, repository: "acme/billing", prNumber: 42 });
+    expect(event).toBeUndefined();
+    expect(opts.idempotencyKey).toMatch(new RegExp(`^${queueId}\\.${eventId}\\.\\d+$`));
+    expect(Math.abs(Number(opts.idempotencyKey.split(".").at(-1)) - bucket)).toBeLessThanOrEqual(1);
+  });
+
+  it("reuses the key inside a 30 s bucket, mints a new one in the next, and keeps the row pending on unavailable", async () => {
+    process.env.RUNNER_MODE = "gha";
+    configModule.upsertMapping("TEAM", makeMapping({ reviewFixLifecycle: "restate" }));
+    restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
+    const queueId = queueOne();
+    const pilotConfig = { ...mockConfig, runnerCallbackBaseUrl: "https://callback.example",
+      runnerTokenSecret: "test-secret" };
+    const base = 1_700_000_010_000 - (1_700_000_010_000 % 30_000);
+    const now = vi.spyOn(Date, "now");
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    ingressMocks.feedback.mockResolvedValue({ status: "unavailable" });
+
+    now.mockReturnValue(base + 1_000);
+    await indexModule.processReviewFixQueue(pilotConfig, mockRegistry);
+    now.mockReturnValue(base + 29_000);
+    await indexModule.processReviewFixQueue(pilotConfig, mockRegistry);
+    now.mockReturnValue(base + 31_000);
+    await indexModule.processReviewFixQueue(pilotConfig, mockRegistry);
+
+    const keys = ingressMocks.feedback.mock.calls.map((c) => c[2].idempotencyKey);
+    const eventId = reviewFixQueue.listReviewFixEvents(queueId).at(-1)!.id;
+    const bucket = base / 30_000;
+    expect(keys).toEqual([`${queueId}.${eventId}.${bucket}`, `${queueId}.${eventId}.${bucket}`, `${queueId}.${eventId}.${bucket + 1}`]);
+    expect(errors).toHaveBeenCalledWith(expect.stringContaining(`Could not queue Restate feedback for #${queueId}: unavailable`));
+    expect(reviewFixQueue.getPendingReviewFixes().map((item) => item.id)).toContain(queueId);
   });
 
   it("keeps selected work pending when registration or the runner mode is unavailable", async () => {
@@ -206,13 +252,13 @@ describe("processReviewFixQueue — owner selection", () => {
       runnerTokenSecret: "test-secret" };
     await indexModule.processReviewFixQueue(pilotConfig, mockRegistry);
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
-    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get() as { n: number }).n).toBe(0);
+    expect(ingressMocks.feedback).not.toHaveBeenCalled();
 
     restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
     process.env.RUNNER_MODE = "fly";
     await indexModule.processReviewFixQueue(pilotConfig, mockRegistry);
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
-    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get() as { n: number }).n).toBe(0);
+    expect(ingressMocks.feedback).not.toHaveBeenCalled();
   });
 
   it("keeps a local review-fix run on Legacy even when the project selects Restate for GHA", async () => {
@@ -224,7 +270,7 @@ describe("processReviewFixQueue — owner selection", () => {
     await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
 
     expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
-    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get() as { n: number }).n).toBe(0);
+    expect(ingressMocks.feedback).not.toHaveBeenCalled();
   });
 
   it("retires selected automatic feedback when GitHub confirms the PR is closed", async () => {
@@ -239,7 +285,7 @@ describe("processReviewFixQueue — owner selection", () => {
     await indexModule.processReviewFixQueue(pilotConfig, mockRegistry);
 
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
-    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get() as { n: number }).n).toBe(0);
+    expect(ingressMocks.feedback).not.toHaveBeenCalled();
   });
 });
 

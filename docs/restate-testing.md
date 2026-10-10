@@ -211,12 +211,11 @@ Known gaps, for the next issue that touches the area:
 `review-fix-attempt.restate.test.ts` (AII-796) and `review-fix-pr.restate.test.ts` (AII-800)
 prove the durable workflow and PR coordinator against fully in-memory `store`/`worker`/
 `finalizer` doubles — fast, but they never exercise `SqliteReviewFixAttemptStore`'s real
-admission SQL, `review-fix-finalize.ts`'s real approval-effect idempotency, `review-fix-inbox.ts`'s
-real delivery ledger, or `GithubReviewFixWorker`/`createReviewFixGithubAdapter`'s real
+admission SQL, `review-fix-finalize.ts`'s real approval-effect idempotency, or `GithubReviewFixWorker`/`createReviewFixGithubAdapter`'s real
 reconciliation logic. `review-fix-pilot.restate.test.ts` composes those production modules for
 real — the same `createReviewFixPR` / `createReviewFixAttempt` / `SqliteReviewFixAttemptStore` /
 `createReviewFixFinalizer` / `GithubReviewFixWorker` / `createReviewFixGithubAdapter` /
-`ReviewFixDeliveryPump` a live pilot would run — and fakes only the external GitHub transport,
+`createReviewFixIngressClient` a live pilot would run — and fakes only the external GitHub transport,
 the GitHub REST fetch layer, and the PR coordinator's admission-eligibility/pending-feedback
 reads (the same seams `review-fix-production.ts` itself calls out to GitHub for). Both files stay
 in the tree; this one does not re-prove the fixed 5-second coalescing window's exact timing,
@@ -228,10 +227,10 @@ which AII-800's suite already covers precisely against a faster-to-assert fake.
 |---|---|---|
 | Admission SQL (capacity, PR budget, pause, 30-finding cap, re-admission of a re-reported finding) is race-free and idempotent under real `dispatch_admissions`/`dispatch_budget_entries`/`review_fix_attempts` writes | Real engine + real SQLite | every "Admission:" scenario |
 | A crashed `ctx.run` step (admission commit before journal, result commit before ACK) converges to exactly one durable effect on engine retry | Real engine + real SQLite | the two `alwaysReplay`-only "crash window" scenarios, `crashAfterFirstCall` |
-| A crashed inbox delivery (HTTP ack lost after the real handler ran) redelivers to exactly one outcome | Real engine + real SQLite + real `ReviewFixDeliveryPump`/facade | "inbox commit before ACK" |
+| A feedback forward whose HTTP ack is lost after the real handler ran, retried under the same idempotency key, yields exactly one outcome | Real engine + real SQLite + real ingress client | "lost acknowledgement" |
 | Authenticated runner activity enforces the 16 KiB event and 10 MiB attempt caps, records sequence gaps/final markers, and still accepts cycle evidence after the stream limit | Real callback validator + real SQLite activity/evidence stores; admission uses the real engine, while runner payloads are simulated | "authenticated activity intake preserves gaps" |
-| Authenticated runner result intake commits one durable inbox delivery, acknowledges identical retries, and records conflicting retries without approval | Real callback validator + real SQLite result/inbox stores + real delivery pump and engine; runner result payloads are simulated | "authenticated result ingress commits one inbox delivery" |
-| A crashed `apply-approval-once` step is retried by the engine and leaves exactly one approval (the adapter's upsert; no inbox row) | Real engine + real SQLite + real finalizer, simulated GitHub write (fake `fetch`) | "a crash after the approval write is retried by the engine" |
+| Authenticated runner result intake forwards over the ingress, acknowledges identical retries, and records conflicting retries without approval | Real callback validator + real ingress client + real SQLite result store and engine; runner result payloads are simulated | "authenticated result ingress" |
+| A crashed `apply-approval-once` step is retried by the engine and leaves exactly one approval (the adapter's upsert) | Real engine + real SQLite + real finalizer, simulated GitHub write (fake `fetch`) | "a crash after the approval write is retried by the engine" |
 | A closed PR and an operator cancel forward `cancel` over the ingress client under `<attemptId>.closed` / `<attemptId>.cancel`; a repeat key is absorbed | Real engine + real SQLite + real ingress client | "a closed PR revokes authority and forwards cancel", "an operator cancel forwards" |
 | Cancellation whose accepted GitHub stop response is lost preserves occupancy across SDK endpoint and Restate container restart until the exact run is verified stopped | Real engine + real SQLite, simulated GitHub Actions cancel/status API | "a lost cancellation acknowledgement and endpoint restart" |
 | Launch response loss, uncertain-launch reconciliation (including the two-minute-equivalent unknown-launch alert actually firing), definitive rejection, duplicate/conflicting result intake, a stale result delivered after the attempt's final outcome (alerts, never rewrites the recorded outcome), GitHub-success-without-result, cancel/closed-PR/unverifiable-termination | Real engine + real SQLite + real worker/finalizer adapters, simulated GitHub Actions API (fake transport/fetch) | the matching named scenarios |

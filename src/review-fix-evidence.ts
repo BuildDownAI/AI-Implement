@@ -686,11 +686,6 @@ interface AttemptOwnershipRow {
  *    attempt (never bound, by design — see `restate/review-fix-attempt.ts`) never reaches
  *    this check in practice: it never streams activity or a cycle summary, so it's never a
  *    sweep candidate to begin with.
- *  - **pending delivery** — `review_fix_inbox` still holds a non-`delivered` row for the
- *    same `(installationId, repository, prNumber)`. Inbox deliveries are scoped to the PR,
- *    not the attempt (an attempt doesn't exist yet when its admitting delivery arrives), so
- *    this is deliberately PR-scoped and can hold back an older attempt's cleanup while a
- *    newer delivery for the same PR is still in flight — retention erring wide, not narrow.
  */
 function hasUnresolvedOwnership(db: ReturnType<typeof getDb>, attempt: AttemptOwnershipRow): boolean {
   const activeReservation = db
@@ -701,11 +696,6 @@ function hasUnresolvedOwnership(db: ReturnType<typeof getDb>, attempt: AttemptOw
   if (attempt.resultConflictAt !== null) return true;
 
   if (attempt.githubRunId === null) return true;
-
-  const pendingDelivery = db
-    .prepare(`SELECT 1 FROM review_fix_inbox WHERE installation_id = ? AND repository = ? AND pr_number = ? AND delivery_state != 'delivered'`)
-    .get(attempt.installationId, attempt.repository, attempt.prNumber) !== undefined;
-  if (pendingDelivery) return true;
 
   return false;
 }

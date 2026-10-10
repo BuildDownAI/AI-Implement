@@ -280,10 +280,6 @@ export function appendLog(entry: {
                OR a.result_conflict_at IS NOT NULL OR a.github_run_id IS NULL
                OR EXISTS (SELECT 1 FROM dispatch_admissions d
                           WHERE d.dispatch_id = a.dispatch_id AND d.released_at IS NULL)
-               OR EXISTS (SELECT 1 FROM review_fix_inbox i
-                          WHERE i.installation_id = a.installation_id
-                            AND i.repository = a.repository AND i.pr_number = a.pr_number
-                            AND i.delivery_state != 'delivered')
              )
          )
        )`,
