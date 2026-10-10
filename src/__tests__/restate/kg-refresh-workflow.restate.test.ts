@@ -148,8 +148,8 @@ describe("KgRefresh durable workflow", () => {
   let mintTokenImpl: () => Promise<{ token: string; expiresAt: string }>;
   let loadSnapshotShaImpl: () => string | null;
   let mergeDelayMs: number;
-  // Set per-test (W13) to hold the next sidecar call open, inside verify's own ctx.run, for a
-  // concurrent status() poll; null keeps every other scenario running with no added latency.
+  // W13 sets it to hold the next kg_hybrid_search call (verify's canary) open inside verify's
+  // ctx.run; null keeps every other scenario running with no added latency.
   let holdNextMcpCall: Promise<void> | null = null;
   // Fired by mcpToolCall as the held call parks, so the test body learns the workflow is inside
   // verify from the fake itself rather than by polling. Null outside W13.
@@ -2253,6 +2253,7 @@ describe("KgRefresh durable workflow", () => {
       const canaryHeld = gate("verify canary (kg_hybrid_search) held");
       const verifyLatch = boundedLatch(W13_LATCH_MAX_MS);
       holdNextMcpCall = verifyLatch.promise;
+      // canaryHeld is only a signal (no release()); verifyLatch does the park and release.
       onMcpCallHeld = () => void canaryHeld.wait();
 
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
@@ -2311,7 +2312,7 @@ describe("KgRefresh durable workflow", () => {
       await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
 
       // Poll `status` concurrently with the run so it observes the "swap" step while the
-      // workflow is still executing it, mirroring W13's polling pattern.
+      // workflow is still executing it.
       const observedSteps = new Set<string | null>();
       let polling = true;
       const statusPoll = (async () => {
