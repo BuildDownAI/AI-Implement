@@ -1036,6 +1036,12 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       : postPushReviewRejected
         ? "post_push_review_unapproved"
         : "unknown";
+    const externalReviewPendingHeadSha =
+      terminationReason === "external_review_pending" &&
+      typeof authoritativeReviewOutputs.reviewedHeadSha === "string" &&
+      authoritativeReviewOutputs.reviewedHeadSha
+        ? authoritativeReviewOutputs.reviewedHeadSha
+        : undefined;
     const iterations = typeof authoritativeReviewOutputs.iterations === "number"
       ? authoritativeReviewOutputs.iterations
       : 0;
@@ -1126,6 +1132,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       prUrl,
       referenceRepoResults,
       findingDispositions,
+      ...(externalReviewPendingHeadSha ? { externalReviewPending: { headSha: externalReviewPendingHeadSha } } : {}),
       callbackUrl,
       retryPolicy,
       fetchImpl: opts.fetchImpl,

@@ -165,6 +165,8 @@ export async function postRunnerResult(params: {
    * orchestrator to record them against.
    */
   cycleSummaries?: CycleSummary[];
+  /** Head SHA the internal review approved when the run ended `external_review_pending`. */
+  externalReviewPending?: { headSha: string };
   /** SHA of the snapshot commit pushed by a kg-refresh runner. Only meaningful for phase=kg-refresh. */
   snapshotCommit?: string | null;
   /** Number of the refresh PR opened alongside snapshotCommit. Only meaningful for phase=kg-refresh. */
@@ -225,6 +227,7 @@ export async function postRunnerResult(params: {
   if (params.cycleSummaries && params.cycleSummaries.length > 0) {
     body.cycleSummaries = params.cycleSummaries;
   }
+  if (params.externalReviewPending) body.externalReviewPending = params.externalReviewPending;
   if (params.snapshotCommit) body.snapshotCommit = params.snapshotCommit;
   if (params.snapshotPr) body.snapshotPr = params.snapshotPr;
   if (params.snapshotBranch) body.snapshotBranch = params.snapshotBranch;

@@ -155,6 +155,11 @@ export interface RunnerResultBody {
    * above, it is never dropped-and-warned into the legacy success branch.
    */
   reviewFix?: ReviewFixResultMetadataV1;
+  /**
+   * Head SHA the internal review approved when the run ended `external_review_pending`. Kept only
+   * when `headSha` is 40 lowercase hex characters; otherwise dropped with a warning. Not consumed yet.
+   */
+  externalReviewPending?: { headSha: string };
 }
 
 export interface HandleRunnerResultInput {
@@ -631,6 +636,7 @@ export async function handleRunnerResult(
     findingDispositions?: unknown;
     cycleSummaries?: unknown;
     reviewFix?: unknown;
+    externalReviewPending?: unknown;
   } | null | undefined;
   if (!body || typeof body !== "object") return bad(400, "invalid_body");
   if (
@@ -811,6 +817,19 @@ export async function handleRunnerResult(
   input.body.cycleSummaries = sanitizedCycleSummaries;
   if (droppedCycleSummaries > 0) {
     console.warn(`[runner-callback] Dropped ${droppedCycleSummaries} invalid cycle summary record(s)`);
+  }
+
+  if (body.externalReviewPending !== undefined) {
+    const pending = body.externalReviewPending as { headSha?: unknown } | null;
+    const headSha = pending && typeof pending === "object" ? pending.headSha : undefined;
+    if (typeof headSha === "string" && /^[0-9a-f]{40}$/.test(headSha)) {
+      input.body.externalReviewPending = { headSha };
+    } else {
+      delete input.body.externalReviewPending;
+      console.warn(
+        `[runner-callback] dropping malformed externalReviewPending for dispatchId=${claims.dispatchId}`,
+      );
+    }
   }
 
   if (

@@ -98,6 +98,9 @@ interface PostPushReviewOutputs extends Record<string, unknown> {
   /** Set only for terminationReason "reviewer_turns_exhausted" — the classified failure the
    *  runner callback reports through `postRunnerResult`/`formatFailureComment`. */
   failure?: FailureRecord;
+  /** Set only for terminationReason "external_review_pending" — the head SHA the internal review
+   *  approved while the external review check was still running. */
+  reviewedHeadSha?: string;
   /** Sum of every review invocation (including superseded retry attempts) and every fix-pass
    *  invocation this step ran. Mirrors report-card.ts's extraCostUsd for this same step id
    *  prefix, so run-autonomous.ts can add it to the ticket-facing "Total cost" and agree with
@@ -1993,6 +1996,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     let loggedLeaseFallback = false;
     let terminationReason: PostPushReviewTerminationReason = "iterations_exhausted";
     let reviewerFailure: FailureRecord | undefined;
+    let reviewedHeadSha: string | undefined;
     const reviewHistory: ReviewFinding[] = [];
     // Every review invocation (including superseded retry attempts) and every fix-pass
     // invocation this step runs, summed — mirrors report-card.ts's extraCostUsd so the
@@ -2357,6 +2361,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       }
       if (cleanInternalNoGatingFindings && externalReviewPending) {
         terminationReason = "external_review_pending";
+        reviewedHeadSha = externalReviewResult.headSha || undefined;
         feedback = "External review did not complete within the wait budget; not auto-approving.";
         await reporter.report({
           id: `post-push-review.${iteration}`,
@@ -2366,7 +2371,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
           ended_at: new Date().toISOString(),
           parent_step_id: "post-push-review",
           inputs: { iteration, prNumber },
-          outputs: { approved: false, feedback, issues: [], blockingIssues: [], telemetry: reviewResult.telemetry },
+          outputs: { approved: false, feedback, issues: [], blockingIssues: [], telemetry: reviewResult.telemetry, ...(reviewedHeadSha ? { reviewedHeadSha } : {}) },
           logs_url: null,
         });
         const marker = `<!-- ai-implement post-push iter=${iteration} external-pending -->`;
@@ -2805,6 +2810,7 @@ ${externalFindingsFixBlock}
       costUsd,
       findingDispositions: [...findingDispositionsByKey.values()],
       ...(reviewerFailure ? { failure: reviewerFailure } : {}),
+      ...(terminationReason === "external_review_pending" && reviewedHeadSha ? { reviewedHeadSha } : {}),
     };
   },
 };
