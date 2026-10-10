@@ -114,6 +114,9 @@ jobs:
           # KG_SOURCE_REPO the sidecar never starts and is never probed, so the
           # body reports the sidecar as unreachable and never checked
           # (kgUnavailable stays false: it means "a probe failed", AII-650).
+          # NOTE: AII-1221 task 5 asked for kgUnavailable == true; that premise
+          # was wrong (isKgUnavailable() is lastError !== null in
+          # src/kg-provider.ts), so this asserts the never-probed state instead.
           printf '%s' "$body" | jq -e '
             has("kgUnavailable")
             and .sidecar.reachable == false
