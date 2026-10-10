@@ -1,5 +1,5 @@
 // Restate scenario for the AII-721 drain check: `queryNonCompletedInvocations()`
-// (src/restate/endpoint.ts) against a real pinned 1.7.10 admin API. Nothing under
+// (src/restate/endpoint.ts) against a real 1.7.10 admin API. Nothing under
 // src/restate/ or docs/restate-*.md queried invocations by deployment before this issue —
 // the exact route (`POST /query`), the header that selects JSON over Arrow IPC, and
 // whether persistent Virtual Object state leaks into the count were all unknowns the unit
@@ -7,10 +7,10 @@
 // unknowns get proven against the real server; the META0004/zero/nonzero/unknown decision
 // tree in register() itself stays a unit test.
 //
-// Run with `npm run test:restate` (Docker required); excluded from `npm test`.
+// Run with `npm run test:restate` (binary runtime, no Docker); excluded from `npm test`.
 import { randomUUID } from "node:crypto";
 import * as restate from "@restatedev/restate-sdk";
-import { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { queryNonCompletedInvocations } from "../../restate/endpoint.js";
 import { operatorObject } from "../../restate/operator-object.js";
@@ -57,8 +57,8 @@ interface DeploymentsResponse {
 
 /**
  * `register()` (src/restate/endpoint.ts) already knows its own endpoint's URI — it built
- * the deployment. A test has no equivalent: `RestateTestEnvironment.start()` registers the
- * endpoint at a container-network address it picks itself (`serviceEndpointAccess`), so the
+ * the deployment. A test has no equivalent: `startVariants()` registers the
+ * endpoint at an address it picks itself (`serviceEndpointAccess`), so the
  * only way to learn the exact string `sys_deployment.endpoint` holds is to ask the admin API
  * that registered it, the same way an operator inspecting a live server would.
  */
@@ -71,8 +71,8 @@ async function registeredDeploymentUri(adminBaseUrl: string): Promise<string> {
   return uri;
 }
 
-describe("queryNonCompletedInvocations against a real pinned 1.7.10 admin API (AII-721)", () => {
-  let environments: Map<string, RestateTestEnvironment>;
+describe("queryNonCompletedInvocations against a real 1.7.10 admin API (AII-721)", () => {
+  let environments: Map<string, RestateEnvironment>;
 
   beforeAll(async () => {
     environments = await startVariants([operatorObject, drainProbe]);
@@ -149,7 +149,7 @@ describe("queryNonCompletedInvocations against a real pinned 1.7.10 admin API (A
 // deployment. It must not hold a deploy (KgRepo.expire is delayed 4 h 10 min). Own
 // environment: the describe above leaves a suspended invocation behind on purpose.
 describe("queryNonCompletedInvocations ignores a scheduled call that has not started", () => {
-  let environments: Map<string, RestateTestEnvironment>;
+  let environments: Map<string, RestateEnvironment>;
 
   beforeAll(async () => {
     environments = await startVariants([drainProbe]);

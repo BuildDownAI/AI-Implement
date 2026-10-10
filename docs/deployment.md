@@ -90,6 +90,8 @@ The first two and the app name collapse into a single `501`, which says the orch
 
 The app it deploys is never configured: Fly injects `FLY_APP_NAME` into every machine, so an orchestrator can only ever deploy itself.
 
+**CI boots the image before merge.** `.github/workflows/orchestrator-image.yml` builds the root `Dockerfile` on every PR (without the knowledge graph, base image resolved from the ECR Public mirror at the pinned digest) and runs it with its real entrypoint, a throwaway GitHub App key and `DEDUP_DB_PATH` under `/tmp`. The `orchestrator-image` check passes only when `GET /` answers 200 with `status: "ok"`, the Restate sidecar `ready` and registration `registered`, the container still running, and the sidecar reported as unreachable and never probed (`kgUnavailable` is deliberately not asserted `true`: it means "a probe failed", so it stays `false` when no sidecar is ever probed). That proves the image builds, the entrypoint boots, and Restate comes up, which `fly.toml` (no health check) would not catch before a self-deploy. It does not prove a real KG query, ticketing or GitHub App calls, or anything that needs a secret.
+
 ### Automatic self-deploy
 
 `/admin#deployments` can release every new commit on the watched branch without being asked. Two properties make that safe to leave on:
@@ -314,7 +316,7 @@ A failed probe re-runs in the background (throttled) on the next proxied failure
 
 `RESTATE_DATA_DIR` is the one operator-facing knob (`.env.example`): unset, the embedded store lives under the dedup DB's directory (`/data/restate` on Fly), so a Fly volume that already covers `DEDUP_DB_PATH` covers it without a config change. On macOS, a long checkout path can push the sidecar's unix-socket paths past the platform's 104-byte limit and make `restate-server` exit at boot with `RT0004 … path must be shorter than 104 bytes` — set `RESTATE_DATA_DIR` to a short path (e.g. `/tmp/restate-dev`) in that case (full detail: [docs/restate.md](restate.md) § "Deployment and operations").
 
-**Required checks (operator step).** Mark `unit-tests`, `restate-tests`, `restate-tests-binary (1)`, `restate-tests-binary (2)`, and `restate-tests-binary (3)` as required checks on `testing` (Settings → Branches). The branch has no required status checks by default, so until this is done a red job does not block a merge.
+**Required checks (operator step).** Mark `unit-tests`, `restate-tests-binary (1)`, `restate-tests-binary (2)`, and `restate-tests-binary (3)` as required checks on `testing` (Settings → Branches). The branch has no required status checks by default, so until this is done a red job does not block a merge.
 
 ### Local image boot check
 

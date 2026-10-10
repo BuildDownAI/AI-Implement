@@ -1,8 +1,8 @@
 import { defineConfig } from "vitest/config";
 import { resolveRestateLogLevel } from "./src/restate/log-level.js";
 
-// Isolated from vitest.config.ts on purpose (AII-612): these tests boot a Restate
-// container via testcontainers and need Docker. `npm test` never loads this file.
+// Isolated from vitest.config.ts on purpose (AII-612): these tests boot the
+// `restate-server` binary from node_modules (no Docker). `npm test` never loads this file.
 export default defineConfig({
   test: {
     env: {

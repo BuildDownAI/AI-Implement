@@ -8,9 +8,9 @@ export default defineConfig({
     pool: "forks",
     setupFiles: ["src/__tests__/setup/clear-runner-credentials.ts"],
     include: ["src/**/*.test.ts"],
-    // src/__tests__/restate/** needs Docker (testcontainers) and runs separately via
+    // src/__tests__/restate/** boots a `restate-server` and runs separately via
     // `npm run test:restate` / vitest.restate.config.ts — never here, so the
-    // default suite stays Docker-free on every machine, including dispatched runners.
+    // default suite stays fast and server-free on every machine, including dispatched runners.
     exclude: ["node_modules/**", "dist/**", ".worktrees/**", "src/__tests__/restate/**"],
     testTimeout: 30000,
     hookTimeout: 30000,

@@ -1,7 +1,7 @@
 // Real Restate coordination tests for the FlyMachineProfile object (AII-1126).
 import { randomUUID } from "node:crypto";
 import * as restate from "@restatedev/restate-sdk";
-import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { CLEAR_MACHINE_ENV_MAX_MS } from "../../fly-machines.js";
 import { FLY_MACHINE_PROFILE_DEFAULTS, OBJECT_ABORT_TIMEOUT_MS, OBJECT_INACTIVITY_TIMEOUT_MS, createFlyMachineProfile, type FlyMachineProfileConfig, type FlyMachineProfileDeps, type KeptMachineState } from "../../restate/fly-machine-profile.js";
@@ -79,7 +79,7 @@ describe("FlyMachineProfile object options", () => {
 });
 
 describe("FlyMachineProfile", () => {
-  let envs: Map<string, RestateTestEnvironment>;
+  let envs: Map<string, RestateEnvironment>;
   beforeAll(async () => {
     envs = await startVariants([createFlyMachineProfile(fakeFly()), profileCaller]);
   }, 60_000);
@@ -158,8 +158,8 @@ describe("FlyMachineProfile", () => {
 describe("FlyMachineProfile kept machine", () => {
   const fly = fakeFly();
   const shortFly = fakeFly(300);
-  let production: Map<string, RestateTestEnvironment>;
-  let short: Map<string, RestateTestEnvironment>;
+  let production: Map<string, RestateEnvironment>;
+  let short: Map<string, RestateEnvironment>;
   beforeAll(async () => {
     production = await startVariants([createFlyMachineProfile(fly), profileCaller]);
     short = await startVariants([createFlyMachineProfile(shortFly), profileCaller]);
@@ -171,8 +171,8 @@ describe("FlyMachineProfile kept machine", () => {
 
   const labels = VARIANTS.map(([label]) => label);
   const fresh = (): string => `kg-refresh-${randomUUID()}`;
-  const mk = (envs: () => Map<string, RestateTestEnvironment>, label: string, key: string) => {
-    const env = (): RestateTestEnvironment => envs().get(label)!;
+  const mk = (envs: () => Map<string, RestateEnvironment>, label: string, key: string) => {
+    const env = (): RestateEnvironment => envs().get(label)!;
     const call = <T>(method: string, body: unknown) => callService<T>(env().baseUrl(), "FlyMachineProfilePrivateCaller", "call", { key, method, body });
     const status = () => callObject<{ machine: KeptMachineState | null }>(env().baseUrl(), "FlyMachineProfile", key, "status", undefined).then((r) => r.machine);
     const expires = () => queryInvocations(env().adminAPIBaseUrl(), `target_service_name = 'FlyMachineProfile' AND target_service_key = '${key}' AND target_handler_name = 'expire'`);

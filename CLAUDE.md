@@ -114,7 +114,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Run classification and autopsy | `src/completion-classification.ts`, `src/run-autopsy.ts` | |
 | Admin SSO / OIDC, roles, page grants | `src/oauth/`, `src/admin-session.ts`, `src/access-entries.ts`, `src/access-page-grants.ts` | [docs/access-model.md](docs/access-model.md) |
 | Admin SPA | `src/admin-ui/` | |
-| Restate engine: sidecar, endpoint, workflows, testcontainers job | `src/restate/endpoint.ts`, `src/restate/planning-run-workflow.ts`, `src/restate/` | [docs/restate.md](docs/restate.md), [docs/restate-testing.md](docs/restate-testing.md) |
+| Restate engine: sidecar, endpoint, workflows, test job | `src/restate/endpoint.ts`, `src/restate/planning-run-workflow.ts`, `src/restate/` | [docs/restate.md](docs/restate.md), [docs/restate-testing.md](docs/restate-testing.md) |
 
 **Diagram convention:** flow diagrams in `docs/`, issue bodies, and PR descriptions are mermaid (validated with `mermaid-cli` before commit); tabular data is a table; ASCII only in this file. Full rule: [docs/README.md](docs/README.md).
 
@@ -179,7 +179,7 @@ The operator's `GH_TOKEN` (or `GITHUB_TOKEN`) is injected as `AI_IMPLEMENT_DEP_T
 ```bash
 npm test          # vitest run
 npm run typecheck # tsc --noEmit
-npm run test:restate # src/__tests__/restate/**/*.restate.test.ts — two runtimes: container (Docker) or binary (`restate-server` from node_modules, `RESTATE_TEST_RUNTIME=binary`); Docker is optional; not part of npm test
+npm run test:restate # src/__tests__/restate/**/*.restate.test.ts — one runtime, the `restate-server` binary from node_modules (the one production runs); Docker is not needed; not part of npm test
 ```
 
 **`typecheck` excludes `src/__tests__`, and vitest strips types without checking them** — so type errors in a test file are caught by nothing. Type-check a new test file explicitly with a throwaway tsconfig. `src/admin-ui/__tests__/` *is* covered and can break the build.
