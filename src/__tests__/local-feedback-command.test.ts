@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it } from "vitest";
 // @ts-ignore no declaration file for the repo-local .mjs command module
 const localFeedbackCommand = await import("../../scripts/local-feedback.mjs");
 const {
+  assertLiveReferencesOutsideActiveAuth,
   assertSafeEnvironment,
   createSourceContext,
   buildDevHarnessArgs,
@@ -67,6 +68,27 @@ describe("local feedback command helpers", () => {
     expect(() => assertSafeEnvironment({ PATH: "/bin", OPENAI_BASE_URL: "http://ambient.invalid" }, "synthetic")).toThrow(/OPENAI_BASE_URL/);
     expect(() => assertSafeEnvironment({ PATH: "/bin", AI_IMPLEMENT_MODEL_AUTH_TOKEN: "secret" }, "synthetic")).toThrow(/AI_IMPLEMENT_MODEL_AUTH_TOKEN/);
     expect(() => assertSafeEnvironment({ PATH: "/bin", NODE_OPTIONS: "--require ./preload.js" }, "synthetic")).toThrow(/NODE_OPTIONS/);
+  });
+
+  it("refuses a live reference at Codex's own auth.json but accepts a chatgpt-sign-in record elsewhere", () => {
+    const home = tempDir("live-home");
+    const codexDir = join(home, ".codex");
+    const planDir = join(home, "plan");
+    mkdirSync(codexDir);
+    mkdirSync(planDir);
+    writeFileSync(join(codexDir, "auth.json"), "{}");
+    writeFileSync(join(planDir, "credentials.json"), "{}");
+    const saved = { HOME: process.env.HOME, CODEX_HOME: process.env.CODEX_HOME };
+    process.env.HOME = home;
+    delete process.env.CODEX_HOME;
+    try {
+      const ref = (canonicalPath: string) => new Map([["p", { profileId: "p", authMode: "codex-subscription", kind: "session", sessionSource: "chatgpt-sign-in", canonicalPath }]]);
+      expect(() => assertLiveReferencesOutsideActiveAuth(ref(join(codexDir, "auth.json")))).toThrow(/active app auth/);
+      expect(() => assertLiveReferencesOutsideActiveAuth(ref(join(planDir, "credentials.json")))).not.toThrow();
+    } finally {
+      if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
+      if (saved.CODEX_HOME !== undefined) process.env.CODEX_HOME = saved.CODEX_HOME;
+    }
   });
 
   it("keeps the live gate marker outside the checkout", () => {

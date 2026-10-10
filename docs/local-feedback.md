@@ -140,25 +140,26 @@ npm run local:feedback -- \
   --task "$TASK_FILE"
 ```
 
-Use a dedicated local Codex profile for this smoke. Do not reuse the active
-Codex app profile, and keep the profile and agent config outside both the target
-repository and artifact directory. The
-[Codex authentication documentation](https://learn.chatgpt.com/docs/auth) states
-that `cli_auth_credentials_store = "file"` stores credentials in `auth.json`
-under `CODEX_HOME`, and that `codex login --device-auth` supports device-code
-login for headless environments.
-
-Create the dedicated profile:
+Use a dedicated ChatGPT plan record for this smoke. Keep the record and the agent
+config outside both the target repository and artifact directory. The record
+is written by the sign-in command, not by Codex:
 
 ```bash
-LOCAL_CODEX_PROFILE_DIR="$HOME/.ai-implement-local-codex-profile"
-
-install -d -m 700 "$LOCAL_CODEX_PROFILE_DIR"
-env CODEX_HOME="$LOCAL_CODEX_PROFILE_DIR" \
-  codex -c 'cli_auth_credentials_store="file"' login --device-auth
-
-chmod 600 "$LOCAL_CODEX_PROFILE_DIR/auth.json"
+npm run build
+install -d -m 700 "$HOME/.ai-implement/chatgpt-plan"
+node dist/chatgpt-plan-login.js login --record ~/.ai-implement/chatgpt-plan/credentials.json
 ```
+
+The host refreshes the access token when it has less than 55 minutes left and
+writes the rotated record back atomically before the container sees anything. The
+container receives only `CHATGPT_PLAN_ACCESS_TOKEN`; the refresh token and ID
+token stay on the host, and no `auth.json` is created. If the sign-in expires,
+the run fails with `authentication_required`; run `login` again.
+
+Profiles that use `codex login` and Codex's own `auth.json` (`"sessionSource":
+"local-login"`) still work until the Codex `auth.json` path is removed. Prefer
+`chatgpt-sign-in`. Either way the harness refuses a record that is Codex's active
+`auth.json`.
 
 Create an external stage-agent config. This example writes only file references;
 it does not embed credential material.
@@ -168,21 +169,19 @@ AI_IMPLEMENT_PRIVATE_DIR="$HOME/.ai-implement-local-feedback"
 AGENT_CONFIG="$AI_IMPLEMENT_PRIVATE_DIR/agent-config.json"
 TARGET_REPO="$HOME/src/private-target-repo"
 MODEL_NAME="<chosen-supported-model>"
-LOCAL_CODEX_PROFILE_DIR="$HOME/.ai-implement-local-codex-profile"
-
 install -d -m 700 "$AI_IMPLEMENT_PRIVATE_DIR"
 
 # Must exactly match the target repository's GitHub origin owner/repo.
 PROJECT_KEY="owner/private-target-repo"
 
-export AGENT_CONFIG PROJECT_KEY MODEL_NAME LOCAL_CODEX_PROFILE_DIR
+export AGENT_CONFIG PROJECT_KEY MODEL_NAME
 
 node <<'NODE'
 const fs = require("node:fs");
 const configPath = process.env.AGENT_CONFIG;
 const projectKey = process.env.PROJECT_KEY;
 const model = process.env.MODEL_NAME;
-const sessionPath = `${process.env.LOCAL_CODEX_PROFILE_DIR}/auth.json`;
+const sessionPath = `${process.env.HOME}/.ai-implement/chatgpt-plan/credentials.json`;
 const stage = {
   agent: "codex",
   provider: "openai",
@@ -207,7 +206,7 @@ const config = {
     provider: "openai",
     authMode: "codex-subscription",
     sessionPath,
-    sessionSource: "local-login",
+    sessionSource: "chatgpt-sign-in",
     trustedPrivateTesting: true
   }]
 };
@@ -248,6 +247,6 @@ harness exit code, matching `result.json`. A summary that still says
 `mode: live-preflight` means the command stopped before the run finished.
 
 Use a clean target checkout. If a cancelled or failed run leaves a session lock
-held for the same `auth.json`, inspect the artifact directory before trying
+held for the same session file, inspect the artifact directory before trying
 again. A partial artifact set should still show the source proof, image proof,
 selected stages, and the step where execution stopped.
