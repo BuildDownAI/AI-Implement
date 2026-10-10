@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { resolveReviewProcess } from "../review-process.js";
 import {
   classifyReviewIssueComment,
+  collectClosedReviewThreadCommentUrls,
   collectExternalReviewFindingsFromGh,
   extractClaudeSummaryFindings,
   extractGithubActionsClaudeReviewFindings,
@@ -2121,5 +2122,37 @@ describe("collectExternalReviewFindingsFromGh review process options (AII-1181)"
     expect(classifyReviewIssueComment(comment)).toBeNull();
     const withExtra = { process: resolveReviewProcess("ai-implement"), extraAuthors: ["topia-ai-implement-bot[bot]"] };
     expect(classifyReviewIssueComment(comment, withExtra)?.findings.length).toBeGreaterThan(0);
+  });
+});
+
+describe("collectClosedReviewThreadCommentUrls", () => {
+  const page = (nodes: unknown[], hasNextPage = false, endCursor: string | null = null): ReturnType<GhSpawn> => ({
+    exitCode: 0,
+    stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage, endCursor }, nodes } } } } }),
+  });
+  const thread = (isResolved: boolean, isOutdated: boolean, urls: string[]) => ({
+    isResolved,
+    isOutdated,
+    comments: { nodes: urls.map((url) => ({ url })) },
+  });
+
+  it("collects every comment URL on resolved or outdated threads and skips open ones", () => {
+    const spawn: GhSpawn = () =>
+      page([thread(true, false, ["u1", "u2"]), thread(false, true, ["u3"]), thread(false, false, ["u4"])]);
+    expect(collectClosedReviewThreadCommentUrls(spawn, "42")).toEqual(new Set(["u1", "u2", "u3"]));
+  });
+
+  it("follows pagination across pages", () => {
+    const spawn: GhSpawn = (args) =>
+      args.some((a) => a === "after=c1")
+        ? page([thread(true, false, ["p2"])])
+        : page([thread(true, false, ["p1"])], true, "c1");
+    expect(collectClosedReviewThreadCommentUrls(spawn, "42")).toEqual(new Set(["p1", "p2"]));
+  });
+
+  it("returns undefined when the read fails, errors, or cannot page on", () => {
+    expect(collectClosedReviewThreadCommentUrls(() => ({ exitCode: 1, stdout: "" }), "42")).toBeUndefined();
+    expect(collectClosedReviewThreadCommentUrls(() => ({ exitCode: 0, stdout: "not json" }), "42")).toBeUndefined();
+    expect(collectClosedReviewThreadCommentUrls(() => page([], true, null), "42")).toBeUndefined();
   });
 });

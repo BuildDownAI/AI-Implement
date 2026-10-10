@@ -14,6 +14,7 @@ import { assertRunnerPublicationAuthority, refreshRunnerGithubCredentials } from
 import { getPublicationCredential } from "../../publication-credential.js";
 import {
   AI_IMPLEMENT_NATIVE_REVIEW_MARKER,
+  collectClosedReviewThreadCommentUrls,
   collectExternalReviewFindingsFromGh,
   collectReviewFindingsBlocksFromGh,
   formatReviewLedgerForPrompt,
@@ -2225,7 +2226,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       // external check leaves nothing that reviewed the PR and fails closed.
       const externalReviewNoVerdict = externalReviewState === "no-real-verdict"
         || (externalOnlyReview && (externalReviewState === "skipped" || externalReviewState === "absent"));
-      const processVerdict = externalReviewResult.reviewVerdict;
+      let processVerdict = externalReviewResult.reviewVerdict;
       if (externalReviewState !== "skipped") {
         console.log(`[post-push-review] review process ${reviewProcess.id}: verdict ${processVerdict?.verdict ?? externalReviewState} from ${processVerdict?.source ?? "check-conclusion"}`);
       }
@@ -2237,9 +2238,21 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
             ...(externalReviewResult.headSha && reviewProcess.id !== "ai-implement" ? { headSha: externalReviewResult.headSha } : {}),
             ...("issueComments" in externalReviewResult && externalReviewResult.issueComments ? { issueComments: externalReviewResult.issueComments } : {}),
           });
-      const externalFindings = processVerdict?.verdict === "changes_requested" && externalFindingsResult.findings.length === 0
-        ? processVerdict.findings
-        : externalFindingsResult.findings;
+      let externalFindings = externalFindingsResult.findings;
+      if (processVerdict?.verdict === "changes_requested" && externalFindings.length === 0) {
+        externalFindings = processVerdict.findings;
+        if (processVerdict.source === "check-and-comments") {
+          // The REST inline comments behind this fallback carry no thread state, so drop the ones on
+          // resolved or outdated threads. A failed thread read keeps them all: unknown is open.
+          const closedUrls = collectClosedReviewThreadCommentUrls(ghSpawn, prNumber);
+          if (closedUrls) {
+            externalFindings = externalFindings.filter((finding) => !(finding.url && closedUrls.has(finding.url)));
+            if (!externalFindings.some((finding) => finding.severity === "blocking")) {
+              processVerdict = { ...processVerdict, verdict: "approve", findings: externalFindings };
+            }
+          }
+        }
+      }
       const findingsUnavailable = externalFindingsResult.findingsUnavailable;
 
       // CI gate: collect failing non-review checks so a red build can never produce
