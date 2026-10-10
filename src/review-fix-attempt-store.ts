@@ -388,7 +388,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
    * `onAccepted` runs inside the same SQLite transaction as the canonical result
    * write, on both a first acceptance and a byte-identical retry. It may only
    * perform synchronous SQLite work; a thrown error rolls the result write back.
-   * The callback route uses it to commit the durable delivery inbox atomically.
+   * No production caller passes it now that results go over the Restate ingress.
    */
   async recordResult(
     attemptId: AttemptId,
