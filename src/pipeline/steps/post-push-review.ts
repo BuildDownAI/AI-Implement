@@ -98,6 +98,9 @@ interface PostPushReviewOutputs extends Record<string, unknown> {
   /** Set only for terminationReason "reviewer_turns_exhausted" — the classified failure the
    *  runner callback reports through `postRunnerResult`/`formatFailureComment`. */
   failure?: FailureRecord;
+  /** Set only for terminationReason "external_review_pending" — the head SHA the internal review
+   *  approved while the external review check was still running. */
+  reviewedHeadSha?: string;
   /** Sum of every review invocation (including superseded retry attempts) and every fix-pass
    *  invocation this step ran. Mirrors report-card.ts's extraCostUsd for this same step id
    *  prefix, so run-autonomous.ts can add it to the ticket-facing "Total cost" and agree with
