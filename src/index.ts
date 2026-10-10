@@ -868,8 +868,8 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   // Bounded cleanup of Restate review-fix pilot evidence (AII-795): purges activity/cycle
   // rows past the 7-day-since-completion retention floor, skipping any attempt whose
-  // ownership is still unresolved (pending delivery, active reservation, result conflict,
-  // or unbound execution). SQLite-only and synchronous — safe on every poll regardless of
+  // ownership is still unresolved (active reservation, result conflict, or unbound
+  // execution). SQLite-only and synchronous — safe on every poll regardless of
   // runner mode.
   const evidenceSweep = sweepExpiredReviewFixEvidence();
   if (evidenceSweep.purgedAttemptIds.length > 0) {

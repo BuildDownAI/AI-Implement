@@ -708,7 +708,7 @@ function hasUnresolvedOwnership(db: ReturnType<typeof getDb>, attempt: AttemptOw
  * silently starting a fresh record. An attempt with no row in `review_fix_attempts`,
  * or with `completed_at` still null, is never purged — unresolved/unknown status
  * fails closed toward retention, not deletion. Past the retention floor, `hasUnresolvedOwnership`
- * still holds the row back when pending delivery, active reservation, result conflict, or
+ * still holds the row back when active reservation, result conflict, or
  * unknown execution evidence would be needed to resolve ownership.
  *
  * After a purge, `listReviewFixActivity`/`getReviewFixCycleSummary`/`listReviewFixCycleSummaries`
