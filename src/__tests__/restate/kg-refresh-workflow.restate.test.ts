@@ -324,6 +324,13 @@ describe("KgRefresh durable workflow", () => {
   const persistCalls: RefreshOutcome[] = [];
   const onOutcomeCalls: Array<{ kind: "success" | "no-new-data" | "failure"; outcome: RefreshOutcome; meta: { failureCode?: string; timedOut?: boolean; dispatchId?: string } }> = [];
   let runIdCounter = 9_000;
+  /** This scenario's own close rows: the workflow closes its job log under the trigger id. */
+  const closeRowsFor = (triggerId: string) => closeRowCalls.filter((c) => c.jobId === triggerId);
+  /** Waits for this scenario's close row and returns the latest one, so another scenario's late close cannot be read. */
+  const closeRowFor = (triggerId: string) =>
+    eventually(() => closeRowsFor(triggerId).at(-1), (row) => row !== undefined, { label: `close row for ${triggerId}` }) as Promise<{ jobId: string; status: string; conclusion?: string }>;
+  /** Outcome calls for this scenario's dispatch only (the workflow stamps meta.dispatchId with the trigger id). */
+  const outcomesFor = (triggerId: string) => onOutcomeCalls.filter((c) => c.meta.dispatchId === triggerId);
 
   function newTriggerId(): string {
     return randomUUID();
@@ -669,7 +676,6 @@ describe("KgRefresh durable workflow", () => {
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
 
       const beforePersist = persistCalls.length;
-      const beforeOutcome = onOutcomeCalls.length;
       const beforeMerge = mergePullRequestFn.mock.calls.length;
       const beforeDeleteBranch = deleteBranchFn.mock.calls.length;
       const beforeFetchTarball = fetchTarballCallCount;
@@ -705,8 +711,8 @@ describe("KgRefresh durable workflow", () => {
       expect(materializeCallCount - beforeMaterialize).toBe(1);
       expect(restartCallCount - beforeRestart).toBe(1);
       expect(persistCalls.length - beforePersist).toBe(1);
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
-      expect(onOutcomeCalls[onOutcomeCalls.length - 1].kind).toBe("success");
+      expect(outcomesFor(triggerId).length).toBe(1);
+      expect(outcomesFor(triggerId).at(-1)!.kind).toBe("success");
 
       // W11: the release actually cleared KgRepo's marker for this repo, proven through the
       // real object's own state, and a follow-up trigger mints a fresh workflow rather than
@@ -741,7 +747,6 @@ describe("KgRefresh durable workflow", () => {
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
       loadSnapshotShaImpl = () => SNAPSHOT_SHA; // collides with the fixture's fixed fetchSnapshotCommitSha() value
 
-      const beforeOutcome = onOutcomeCalls.length;
       const beforeRestart = restartCallCount;
       const beforePersistSnapshot = persistSnapshotShaFn.mock.calls.length;
       const beforeMerge = mergePullRequestFn.mock.calls.length;
@@ -755,9 +760,9 @@ describe("KgRefresh durable workflow", () => {
       expect(outcome.detail).toContain("Graph is current");
       // the snapshot PR still merges — only the local rail short-circuits after fetch.
       expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "completed" });
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
-      expect(onOutcomeCalls[onOutcomeCalls.length - 1]).toMatchObject({ kind: "no-new-data", meta: { failureCode: "ingest-needed" } });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "completed" });
+      expect(outcomesFor(triggerId).length).toBe(1);
+      expect(outcomesFor(triggerId).at(-1)!).toMatchObject({ kind: "no-new-data", meta: { failureCode: "ingest-needed" } });
       // no stage/swap/verify/revert: the sidecar never restarts, nothing is persisted again,
       // and no staging directory is ever created.
       expect(restartCallCount - beforeRestart).toBe(0);
@@ -831,7 +836,7 @@ describe("KgRefresh durable workflow", () => {
       expect(materializeCallCount).toBe(0);
       expect(restartCallCount).toBe(0);
       expect(existsSync(join(dataRoot, "staging"))).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("staging");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("staging");
     },
     15_000,
   );
@@ -901,7 +906,6 @@ describe("KgRefresh durable workflow", () => {
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
       mergePullRequestFn.mockImplementationOnce(async () => "conflict");
 
-      const beforeOutcome = onOutcomeCalls.length;
       const beforeDeleteBranch = deleteBranchFn.mock.calls.length;
       const beforeFetchTarball = fetchTarballCallCount;
       const beforeMaterialize = materializeCallCount;
@@ -915,15 +919,15 @@ describe("KgRefresh durable workflow", () => {
       const outcome = await done;
       expect(outcome.ok).toBe(false);
       expect(outcome.detail).toContain("conflict");
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "failed", conclusion: "merge_failed" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "failed", conclusion: "merge_failed" });
       // no delete-branch and no rail gate ran after a failed merge.
       expect(deleteBranchFn.mock.calls.length - beforeDeleteBranch).toBe(0);
       expect(fetchTarballCallCount - beforeFetchTarball).toBe(0);
       expect(materializeCallCount - beforeMaterialize).toBe(0);
       expect(restartCallCount - beforeRestart).toBe(0);
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
-      expect(onOutcomeCalls[onOutcomeCalls.length - 1]).toMatchObject({ kind: "failure", meta: { failureCode: "merge_failed" } });
-      expect(onOutcomeCalls[onOutcomeCalls.length - 1].meta.timedOut).toBeUndefined();
+      expect(outcomesFor(triggerId).length).toBe(1);
+      expect(outcomesFor(triggerId).at(-1)!).toMatchObject({ kind: "failure", meta: { failureCode: "merge_failed" } });
+      expect(outcomesFor(triggerId).at(-1)!.meta.timedOut).toBeUndefined();
       await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
     },
     15_000,
@@ -1097,7 +1101,6 @@ describe("KgRefresh durable workflow", () => {
       // run immediately, and with a 1s bootstrap deadline a call recorded even a moment
       // late risks folding an already-fired outcome into the "before" snapshot instead of
       // the "after" delta.
-      const beforeOutcome = onOutcomeCalls.length;
       const triggered = await triggerViaKgRepo(env.baseUrl());
       const triggerId = (triggered as { triggerId: string }).triggerId;
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
@@ -1106,9 +1109,9 @@ describe("KgRefresh durable workflow", () => {
       const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
 
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
-      expect(onOutcomeCalls[onOutcomeCalls.length - 1]).toMatchObject({ kind: "failure", meta: { failureCode: "bootstrap_timeout", timedOut: true } });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+      expect(outcomesFor(triggerId).length).toBe(1);
+      expect(outcomesFor(triggerId).at(-1)!).toMatchObject({ kind: "failure", meta: { failureCode: "bootstrap_timeout", timedOut: true } });
       await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
     },
     15_000,
@@ -1127,7 +1130,7 @@ describe("KgRefresh durable workflow", () => {
 
       const outcome = await done;
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
     },
     15_000,
   );
@@ -1140,13 +1143,12 @@ describe("KgRefresh durable workflow", () => {
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
       const report = { repo: KG_SOURCE_REPO, prNumber: 11, sha: "b".repeat(40) };
       const beforePersist = persistCalls.length;
-      const beforeOutcome = onOutcomeCalls.length;
       const beforeStatus = setCommitStatusFn.mock.calls.length;
 
       const outcome = await (await runWorkflow(env.baseUrl(), triggerId, { dryRun: true, report }));
 
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
       expect(setCommitStatusFn.mock.calls.length - beforeStatus).toBe(1);
       expect((setCommitStatusFn.mock.calls[beforeStatus] as unknown[])[4]).toMatchObject({ state: "failure" });
       const stored = await eventually(
@@ -1157,7 +1159,8 @@ describe("KgRefresh durable workflow", () => {
       expect(stored!.sha).toBe(report.sha);
       expect(stored!.outcome.ok).toBe(false);
       expect(persistCalls.length - beforePersist).toBe(0);
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(0);
+      await closeRowFor(triggerId);
+      expect(outcomesFor(triggerId).length).toBe(0);
     },
     15_000,
   );
@@ -1174,7 +1177,7 @@ describe("KgRefresh durable workflow", () => {
       stopCalls.length = 0;
       const outcome = await runWorkflow(env.baseUrl(), triggerId);
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
       expect(stopCalls).toEqual([{ executionMode: backend, jobId: `job-${triggerId}` }]);
     }, 15_000);
 
@@ -1188,7 +1191,7 @@ describe("KgRefresh durable workflow", () => {
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", {});
       const outcome = await done;
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
       expect(stopCalls).toEqual([{ executionMode: backend, jobId: `job-${triggerId}` }]);
     }, 15_000);
 
@@ -1201,7 +1204,7 @@ describe("KgRefresh durable workflow", () => {
       await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "operator requested" });
       await done;
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("operator_cancelled");
       expect(stopCalls).toEqual([{ executionMode: backend, jobId: `job-${triggerId}` }]);
     }, 15_000);
 
@@ -1212,7 +1215,7 @@ describe("KgRefresh durable workflow", () => {
       stopCalls.length = 0;
       const outcome = await runWorkflow(env.baseUrl(), triggerId);
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
       expect(stopCalls).toEqual([]);
     }, 15_000);
 
@@ -1225,7 +1228,7 @@ describe("KgRefresh durable workflow", () => {
       await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "operator requested" });
       await done;
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("operator_cancelled");
       expect(stopCalls).toEqual([]);
     }, 15_000);
 
@@ -1237,7 +1240,7 @@ describe("KgRefresh durable workflow", () => {
         makeScenario(timedOutId, { dispatchOutcome: "accepted", executionMode: backend });
         const timedOut = await runWorkflow(timeoutEnv.baseUrl(), timedOutId);
         expect(timedOut.ok).toBe(false);
-        expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+        expect(await closeRowFor(timedOutId)).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
 
         const env = envFor(label);
         const cancelledId = newTriggerId();
@@ -1246,7 +1249,7 @@ describe("KgRefresh durable workflow", () => {
         await eventually(() => scenarios.get(cancelledId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
         await callWorkflow(env.baseUrl(), "KgRefresh", cancelledId, "cancel", { reason: "operator requested" });
         await done;
-        expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+        expect((await closeRowFor(cancelledId)).conclusion).toBe("operator_cancelled");
       } finally {
         stopFailure = false;
       }
@@ -1450,7 +1453,7 @@ describe("KgRefresh durable workflow", () => {
       const scenario = makeScenario(triggerId, { runId: runIdCounter++, executionMode: "github-actions", statusAlwaysThrows: true });
       const outcome = await runWorkflow(deadlineEnvFor(label).baseUrl(), triggerId);
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
       expect(scenario.cancelCalls).toBe(1);
       expect(scenario.runStatusCalls).toBeGreaterThanOrEqual(3);
     }, 30_000);
@@ -1460,7 +1463,7 @@ describe("KgRefresh durable workflow", () => {
       const scenario = makeScenario(triggerId, { dispatchOutcome: "unknown", executionMode: "github-actions", findAlwaysThrows: true });
       const outcome = await runWorkflow(deadlineEnvFor(label).baseUrl(), triggerId);
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
       expect(scenario.cancelCalls).toBe(0);
       expect(scenario.findByTitleCalls).toBeGreaterThanOrEqual(4);
     }, 30_000);
@@ -1475,7 +1478,7 @@ describe("KgRefresh durable workflow", () => {
       const callsAtCancel = scenario.runStatusCalls;
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "operator requested" });
       await done;
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("operator_cancelled");
       expect(scenario.runStatusCalls - callsAtCancel).toBeGreaterThanOrEqual(3);
     }, 30_000);
 
@@ -1487,7 +1490,7 @@ describe("KgRefresh durable workflow", () => {
       await eventually(() => scenario.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "operator requested" });
       await done;
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("operator_cancelled");
       expect(scenario.cancelCalls).toBe(0);
     }, 30_000);
 
@@ -1571,7 +1574,7 @@ describe("KgRefresh durable workflow", () => {
     const outcome = await runWorkflow(env.baseUrl(), triggerId);
     expect(outcome.ok).toBe(false);
     expect(outcome.detail).toBe("machine stopped with no report (exit 137, signal 9, oomKilled)");
-    expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("dispatch_lost");
+    expect((await closeRowFor(triggerId)).conclusion).toBe("dispatch_lost");
     await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
   }, 15_000);
 
@@ -1583,7 +1586,7 @@ describe("KgRefresh durable workflow", () => {
     const outcome = await runWorkflow(env.baseUrl(), triggerId);
     expect(outcome.ok).toBe(false);
     expect(outcome.detail).toContain("machine stopped with no report (exit 0)");
-    expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("dispatch_lost");
+    expect((await closeRowFor(triggerId)).conclusion).toBe("dispatch_lost");
   }, 15_000);
 
   it.each(VARIANTS.map(([label]) => label))("AII-1125: a started read holds off the bootstrap timeout until the machine ends dispatch_lost (%s)", async (label) => {
@@ -1596,12 +1599,11 @@ describe("KgRefresh durable workflow", () => {
       ...Array.from({ length: 12 }, () => started),
       { state: "ended", exit: { exitCode: 137, signal: 9, oomKilled: true, timestamp: 1 } },
     ]);
-    const closedBefore = closeRowCalls.length;
     const outcome = await runWorkflow(env.baseUrl(), triggerId);
     expect(outcome.ok).toBe(false);
     expect(outcome.detail).toBe("machine stopped with no report (exit 137, signal 9, oomKilled)");
-    expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("dispatch_lost");
-    expect(closeRowCalls.slice(closedBefore).some((c) => c.conclusion === "bootstrap_timeout")).toBe(false);
+    expect((await closeRowFor(triggerId)).conclusion).toBe("dispatch_lost");
+    expect(closeRowsFor(triggerId).some((c) => c.conclusion === "bootstrap_timeout")).toBe(false);
     await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
   }, 15_000);
 
@@ -1660,7 +1662,7 @@ describe("KgRefresh durable workflow", () => {
       const outcome = await runWorkflow(env.baseUrl(), triggerId);
       expect(outcome.ok).toBe(false);
       expect(outcome.detail).toContain("failure");
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("dispatch_lost");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("dispatch_lost");
 
       const callsAtFinish = scenarios.get(triggerId)!.runStatusCalls;
       await settle(WATCH_INTERVAL_MS * 2);
@@ -1860,7 +1862,7 @@ describe("KgRefresh durable workflow", () => {
       });
       const outcome = await runWorkflow(cadenceEnv.baseUrl(), triggerId);
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("bootstrap_timeout");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("bootstrap_timeout");
       // One lookup inside dispatch plus about ten reconcile attempts across the deadline.
       expect(scenarios.get(triggerId)!.findByTitleCalls).toBeGreaterThanOrEqual(6);
     } finally {
@@ -1877,7 +1879,7 @@ describe("KgRefresh durable workflow", () => {
 
       const outcome = await runWorkflow(env.baseUrl(), triggerId);
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("dispatch_rejected");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("dispatch_rejected");
       expect(scenarios.get(triggerId)!.findByTitleCalls).toBe(1);
     },
     15_000,
@@ -1900,7 +1902,6 @@ describe("KgRefresh durable workflow", () => {
         ],
       });
 
-      const beforeOutcome = onOutcomeCalls.length;
 
       await workflowDispatched(triggerId);
       const done = attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
@@ -1912,10 +1913,10 @@ describe("KgRefresh durable workflow", () => {
       expect(await kgRepoStatus(env.baseUrl())).not.toBeNull();
 
       const outcome = await done;
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("operator_cancelled");
       expect(scenarios.get(triggerId)!.cancelCalls).toBe(1);
       // The operator-cancelled path must not call onOutcome — only persistLastRefresh/closeJobLog fire.
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(0);
+      expect(outcomesFor(triggerId).length).toBe(0);
       await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
       void outcome;
     },
@@ -1944,7 +1945,7 @@ describe("KgRefresh durable workflow", () => {
 
       const outcome = await done;
       expect(outcome.ok).toBe(true);
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).not.toBe("bootstrap_timeout");
+      expect((await closeRowFor(triggerId)).conclusion).not.toBe("bootstrap_timeout");
     },
     15_000,
   );
@@ -1964,7 +1965,7 @@ describe("KgRefresh durable workflow", () => {
       held.release();
       const outcome = await done;
       expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
       expect(scenarios.get(triggerId)!.cancelCalls).toBe(1);
     },
     15_000,
@@ -1981,7 +1982,6 @@ describe("KgRefresh durable workflow", () => {
       const held = gate("total timeout first status read");
       const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", runId, executionMode: "github-actions", tickGate: held });
       const beforePersist = persistCalls.length;
-      const beforeOutcome = onOutcomeCalls.length;
 
       await workflowDispatched(triggerId);
       const done = attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
@@ -1993,10 +1993,10 @@ describe("KgRefresh durable workflow", () => {
 
       expect(outcome.ok).toBe(false);
       expect(scenarios.get(triggerId)!.cancelCalls).toBe(1);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
       // A real (non-dry-run) timeout still persists and notifies.
       expect(persistCalls.length - beforePersist).toBe(1);
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
+      expect(outcomesFor(triggerId).length).toBe(1);
       await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
     },
     15_000,
@@ -2009,7 +2009,6 @@ describe("KgRefresh durable workflow", () => {
       const triggerId = newTriggerId();
       const held = gate("cancel failure first status read");
       const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions", tickGate: held });
-      const beforeOutcome = onOutcomeCalls.length;
       cancelTerminalFailure = true;
       try {
         const done = runWorkflow(env.baseUrl(), triggerId);
@@ -2019,8 +2018,8 @@ describe("KgRefresh durable workflow", () => {
         held.release();
         const outcome = await done;
         expect(outcome.ok).toBe(false);
-        expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
-        expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
+        expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
+        expect(outcomesFor(triggerId).length).toBe(1);
       } finally {
         cancelTerminalFailure = false;
       }
@@ -2046,7 +2045,7 @@ describe("KgRefresh durable workflow", () => {
       held.release();
       const outcome = await done;
       expect(outcome.ok).toBe(true);
-      expect(closeRowCalls[closeRowCalls.length - 1].status).toBe("completed");
+      expect((await closeRowFor(triggerId)).status).toBe("completed");
     },
     15_000,
   );
@@ -2068,8 +2067,8 @@ describe("KgRefresh durable workflow", () => {
       held.release();
       const outcome = await done;
       expect(outcome.ok).toBe(true);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "completed" });
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).not.toBe("bootstrap_timeout");
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "completed" });
+      expect((await closeRowFor(triggerId)).conclusion).not.toBe("bootstrap_timeout");
     },
     15_000,
   );
@@ -2093,7 +2092,7 @@ describe("KgRefresh durable workflow", () => {
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: true });
       const outcome = await done;
       expect(outcome.ok).toBe(true);
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).not.toBe("bootstrap_timeout");
+      expect((await closeRowFor(triggerId)).conclusion).not.toBe("bootstrap_timeout");
     },
     15_000,
   );
@@ -2120,7 +2119,7 @@ describe("KgRefresh durable workflow", () => {
       scenarios.get(triggerId)!.findByTitleResult = { runId };
       await done;
       expect(scenarios.get(triggerId)!.cancelCalls).toBe(1);
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("operator_cancelled");
     },
     15_000,
   );
@@ -2146,7 +2145,7 @@ describe("KgRefresh durable workflow", () => {
       await eventually(() => Date.now(), (now) => now > started + BOOTSTRAP_DEADLINE_MS, { label: "wall clock past bootstrap window" });
       heldCancelWait.release();
       await done;
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("operator_cancelled");
       expect(scenarios.get(triggerId)!.cancelCalls).toBe(0);
       // No elapsed-time assertion: the total deadline here is 30 s and the test timeout 15 s, so a cancel that
       // ended at the total deadline could not pass. The cancel phase ended at the bootstrap window.
@@ -2308,7 +2307,7 @@ describe("KgRefresh durable workflow", () => {
       expect(journaledSteps.slice(journaledSteps.indexOf("swap"))).toEqual(["swap", "verify", "revert", "failed"]);
       // swap's own restart (1) plus revertRail's restart while reverting (1).
       expect(restartCallCount).toBe(2);
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("canary");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("canary");
     },
     15_000,
   );
@@ -2350,7 +2349,7 @@ describe("KgRefresh durable workflow", () => {
 
       expect(outcome.ok).toBe(false);
       expect(restartCallCount).toBe(2);
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("staging");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("staging");
     },
     15_000,
   );
@@ -2380,7 +2379,7 @@ describe("KgRefresh durable workflow", () => {
       expect(existsSync(join(dataRoot, "rejected"))).toBe(false);
       expect(existsSync(join(dataRoot, "staging"))).toBe(false);
       expect(restartCallCount).toBe(0);
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("staging");
+      expect((await closeRowFor(triggerId)).conclusion).toBe("staging");
       await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
     },
     15_000,
@@ -2406,7 +2405,7 @@ describe("KgRefresh durable workflow", () => {
       expect(outcome.ok).toBe(false);
       // swap's own failing restart (1) plus revertRail's restart while reverting (1).
       expect(restartCallCount).toBe(2);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "failed" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "failed" });
     },
     15_000,
   );
@@ -2445,7 +2444,7 @@ describe("KgRefresh durable workflow", () => {
       await eventually(async () => (await recordSends()).length - beforeRecorded, (n) => n >= 1, { label: "durable effect" });
       await settle(300);
       expect((await recordSends()).length - beforeRecorded).toBe(1);
-      expect(closeRowCalls[closeRowCalls.length - 1].status).toBe("completed");
+      expect((await closeRowFor(triggerId)).status).toBe("completed");
     },
     15_000,
   );
@@ -2460,7 +2459,6 @@ describe("KgRefresh durable workflow", () => {
       const triggerId = newTriggerId();
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
       const beforePersist = persistCalls.length;
-      const beforeOutcome = onOutcomeCalls.length;
       const done = runWorkflow(env.baseUrl(), triggerId, { dryRun: true });
       await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: true });
@@ -2468,7 +2466,8 @@ describe("KgRefresh durable workflow", () => {
       const stored = await eventually(() => readAdminDryRun(env.baseUrl()), (v) => v?.at === outcome.at, { label: "durable effect" });
       expect(stored).toEqual(outcome);
       expect(persistCalls.length - beforePersist).toBe(0);
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(0);
+      await closeRowFor(triggerId);
+      expect(outcomesFor(triggerId).length).toBe(0);
     },
     15_000,
   );
@@ -2497,13 +2496,13 @@ describe("KgRefresh durable workflow", () => {
       const triggerId = newTriggerId();
       makeScenario(triggerId, { dispatchOutcome: "rejected", executionMode: "fly-machines" });
       const beforePersist = persistCalls.length;
-      const beforeOutcome = onOutcomeCalls.length;
       const outcome = await runWorkflow(env.baseUrl(), triggerId, { dryRun: true });
       expect(outcome.ok).toBe(false);
       const stored = await eventually(() => readAdminDryRun(env.baseUrl()), (v) => v?.at === outcome.at, { label: "durable effect" });
       expect(stored).toMatchObject({ ok: false, dryRun: true, detail: outcome.detail });
       expect(persistCalls.length - beforePersist).toBe(0);
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(0);
+      await closeRowFor(triggerId);
+      expect(outcomesFor(triggerId).length).toBe(0);
     },
     15_000,
   );
@@ -2515,7 +2514,6 @@ describe("KgRefresh durable workflow", () => {
       const triggerId = newTriggerId();
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
       const beforeMerge = mergePullRequestFn.mock.calls.length;
-      const beforeOutcome = onOutcomeCalls.length;
 
       const done = runWorkflow(env.baseUrl(), triggerId);
       await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
@@ -2524,9 +2522,9 @@ describe("KgRefresh durable workflow", () => {
       const outcome = await done;
       expect(outcome.ok).toBe(true);
       expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
-      expect(closeRowCalls[closeRowCalls.length - 1].status).toBe("completed");
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
-      expect(onOutcomeCalls[onOutcomeCalls.length - 1]).toMatchObject({ kind: "no-new-data", meta: { failureCode: "KG_SNAPSHOT_STALE" } });
+      expect((await closeRowFor(triggerId)).status).toBe("completed");
+      expect(outcomesFor(triggerId).length).toBe(1);
+      expect(outcomesFor(triggerId).at(-1)!).toMatchObject({ kind: "no-new-data", meta: { failureCode: "KG_SNAPSHOT_STALE" } });
     },
     15_000,
   );
