@@ -74,6 +74,7 @@ import {
   DEFAULT_LINEAR_PICKUP_LABEL,
   DEFAULT_RETRY_POLICY,
   type RetryPolicy,
+  getFlySessionsConfig,
 } from "./orchestrator-settings.js";
 import { getInstallationToken, mintSourceTokenOrJwt, getScopedInstallationToken } from "./github-app-auth.js";
 import { GitHubApiError } from "./github-errors.js";
@@ -2693,21 +2694,22 @@ async function handleUnsetSecret(
 function handleGetSettings(
   _req: http.IncomingMessage,
   res: http.ServerResponse,
-  config: AdminConfig,
+  _config: AdminConfig,
 ): void {
   const dbSettings = getOrchestratorSettings();
+  const fly = getFlySessionsConfig();
   const envApp = process.env.FLY_SESSIONS_APP || null;
   const envRegion = process.env.FLY_SESSIONS_REGION || null;
 
   json(res, 200, {
     flySessionsApp: {
-      runtimeValue: config.flySessionsApp,
+      runtimeValue: fly.app,
       dbValue: dbSettings.flySessionsApp,
       envValue: envApp,
       overriddenByEnv: envApp !== null,
     },
     flySessionsRegion: {
-      runtimeValue: config.flySessionsRegion,
+      runtimeValue: fly.region,
       dbValue: dbSettings.flySessionsRegion,
       envValue: envRegion,
       overriddenByEnv: envRegion !== null,
@@ -2731,7 +2733,7 @@ function handleGetSettings(
 async function handlePostSettings(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  config: AdminConfig,
+  _config: AdminConfig,
 ): Promise<void> {
   let body: {
     flySessionsApp?: string | null;
@@ -2812,19 +2814,17 @@ async function handlePostSettings(
   const envApp = process.env.FLY_SESSIONS_APP || null;
   const envRegion = process.env.FLY_SESSIONS_REGION || null;
 
-  const nextApp = envApp ?? dbSettings.flySessionsApp;
-  const nextRegion = envRegion ?? dbSettings.flySessionsRegion;
-  const restartRequired = nextApp !== config.flySessionsApp || nextRegion !== config.flySessionsRegion;
+  const fly = getFlySessionsConfig();
 
   json(res, 200, {
     flySessionsApp: {
-      runtimeValue: config.flySessionsApp,
+      runtimeValue: fly.app,
       dbValue: dbSettings.flySessionsApp,
       envValue: envApp,
       overriddenByEnv: envApp !== null,
     },
     flySessionsRegion: {
-      runtimeValue: config.flySessionsRegion,
+      runtimeValue: fly.region,
       dbValue: dbSettings.flySessionsRegion,
       envValue: envRegion,
       overriddenByEnv: envRegion !== null,
@@ -2842,7 +2842,6 @@ async function handlePostSettings(
     },
     retryPolicy: getRetryPolicy(),
     retryPolicyDefaults: DEFAULT_RETRY_POLICY,
-    restartRequired,
   });
 }
 

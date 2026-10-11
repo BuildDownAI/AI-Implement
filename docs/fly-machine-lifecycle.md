@@ -2,6 +2,8 @@
 
 How a pipeline's Fly machine is created, reused, stopped, and destroyed. Today only `kg-refresh` keeps a machine (AII-1106); every other Fly run (`purpose: session`) is one-shot: created per run and destroyed by the stop path or the reaper. Decision record: [ADR 037](adr/037-a-durable-runner-is-a-profile-object-that-owns-one-kept-machine.md).
 
+The sessions app and region come from `getFlySessionsConfig` (`src/orchestrator-settings.ts`), read at the moment each module needs a value: a Settings-page change takes effect at the next dispatch, with no restart.
+
 ## Why a kept machine
 
 `create` pulls the runner image every time (5 to 39 s measured on 2026-10-06 and 2026-10-07). `update` then `start` on a stopped machine gives a clean disk, the new env, the new size, and the current image in about 2.5 s (`update` about 0.5 s, `start` about 2 s). Fly facts the design relies on: `update` takes the whole config; `update` on a stopped machine applies it and does not start it; `update` on a running machine reboots it; `update` resets the machine's event history.
