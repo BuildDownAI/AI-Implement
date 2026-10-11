@@ -1902,7 +1902,6 @@ describe("KgRefresh durable workflow", () => {
         ],
       });
 
-
       await workflowDispatched(triggerId);
       const done = attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
       await eventually(() => scenarios.get(triggerId)!.runStatusCalls >= 1, (ok) => ok, { label: "durable effect" });
