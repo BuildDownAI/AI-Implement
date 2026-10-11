@@ -6666,6 +6666,13 @@ describe("postPushReviewStep review process gate", () => {
     const { out } = await run(fixture({ runs: [actions("success")], issueComments: [block] }));
     expect(out.approved).toBe(false);
     expect(out.terminationReason).toBe("external_review_pending");
+    expect(out.reviewedHeadSha).toBe(SHA);
+  });
+
+  it("omits reviewedHeadSha when the run is approved", async () => {
+    const { out } = await run(fixture({ runs: [actions("success")] }));
+    expect(out.approved).toBe(true);
+    expect(out).not.toHaveProperty("reviewedHeadSha");
   });
 
   it("logs the captured verdict and source when the wait times out on a block with no verdict", async () => {

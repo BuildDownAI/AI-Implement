@@ -2295,6 +2295,108 @@ describe("runAutonomous", () => {
     expect(body.failure).toEqual(reviewerFailure);
   });
 
+  it("forwards reviewedHeadSha as externalReviewPending.headSha when the run ends external_review_pending", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", passes: [] }) },
+      ],
+      [
+        "push",
+        {
+          run: vi.fn().mockResolvedValue({
+            prUrl: "https://github.com/o/r/pull/11",
+            prNumber: 11,
+            branchPushed: true,
+            draft: true,
+          }),
+        },
+      ],
+      [
+        "post-push-review",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 1,
+            finalFeedback: "waiting",
+            terminationReason: "external_review_pending",
+            forcePushedRevisions: 0,
+            reviewedHeadSha: "a".repeat(40),
+          }),
+        },
+      ],
+    ]);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      externalReviewPending?: { headSha: string };
+    };
+    expect(body.externalReviewPending).toEqual({ headSha: "a".repeat(40) });
+  });
+
+  it("omits externalReviewPending for any other termination reason even if reviewedHeadSha is present", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", passes: [] }) },
+      ],
+      [
+        "push",
+        {
+          run: vi.fn().mockResolvedValue({
+            prUrl: "https://github.com/o/r/pull/11",
+            prNumber: 11,
+            branchPushed: true,
+            draft: true,
+          }),
+        },
+      ],
+      [
+        "post-push-review",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 1,
+            finalFeedback: "waiting",
+            terminationReason: "iterations_exhausted",
+            forcePushedRevisions: 0,
+            reviewedHeadSha: "a".repeat(40),
+          }),
+        },
+      ],
+    ]);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      externalReviewPending?: { headSha: string };
+    };
+    expect(body.externalReviewPending).toBeUndefined();
+  });
+
   it("uses CHECKS_PERMISSION_DENIED with the classified failure when post-push review terminates on a check-runs permission error (AII-736)", async () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");

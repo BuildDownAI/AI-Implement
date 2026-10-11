@@ -27,12 +27,13 @@ Companion documents: [restate.md](restate.md) (engine, patterns), [restate-revie
 | `KgRepo` | Virtual Object | KG source repo slug | `src/restate/kg-repo.ts` |
 | `FlyMachineProfile` | Virtual Object | pipeline phase (`kg-refresh`) | `src/restate/fly-machine-profile.ts` |
 | `PlanningRun` | Workflow | dispatch id | `src/restate/planning-run-workflow.ts` |
+| `LateExternalReview` | Workflow | dispatch id | `src/restate/late-external-review.ts` |
 | `ReviewFixAttempt` | Workflow | attempt id | `src/restate/review-fix-attempt.ts` |
 | `ReviewFixPR` | Virtual Object | PR key | `src/restate/review-fix-pr.ts` |
 | `Operator` | Virtual Object | operator identity | `src/restate/operator-object.ts` |
 | `orchestratorTools` | Service | — | `src/restate/tools.ts` |
 
-All eight register through one endpoint (`src/restate/endpoint.ts`, `src/index.ts`). The service
+All nine register through one endpoint (`src/restate/endpoint.ts`, `src/index.ts`). The service
 and handler types that the typed clients use are in `src/restate/kg-refresh-types.ts`.
 
 ### Lifecycle kit and contract suite
@@ -249,6 +250,7 @@ Landed on the feature branch, in merge order:
 8. AII-1026 — the `workflow_run` path and awakeable are removed; the run watch is one 60 s status read (ADR 033).
 9. AII-1018 — `PlanningRun`: one workflow owns each planning run of a `restate` project from reservation to release, on GitHub Actions, Fly Machines, and local Docker, through `awaitOwnedRun` (AII-1052, AII-1053, AII-1019, AII-1020, AII-1054, AII-1021). See [restate.md](restate.md#the-planning-run).
 10. AII-1062 to AII-1069, AII-1067 — the owned-run lifecycle kit (ADR 036). `PlanningRun` uses all steps: `reserveOwnedRun`, `readOwnedRunStatus`, `cleanupOwnedRun`, `reportOwnedRunOutcome`; its reservation moved into the workflow's first step, each machine is named from the dispatch id, and a cancel during the reserve or launch step leaves no run or reservation. `KgRefresh` uses only the bounded read, `readBoundedOwnedRun`. Operators list and release a held reservation (`list_dispatch_reservations`, `release_dispatch_reservation`). See [restate.md](restate.md#the-owned-run-lifecycle-kit).
+11. AII-1227 — `LateExternalReview`: for a run that ended `external_review_pending`, a workflow reads the PR every 60 s for up to 30 min and writes the approval mark when the external review passes on the same head with no open blocking finding. Started from `handleRunnerResult` for any project when Restate is ready; see [feature-branch-grouping.md](feature-branch-grouping.md) §8.
 
 Remains:
 
