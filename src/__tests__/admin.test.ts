@@ -2726,17 +2726,9 @@ describe("admin settings", () => {
     const post = JSON.parse(res.body);
     expect(post.flySessionsApp.runtimeValue).toBe("new-app");
     expect(post.flySessionsApp.dbValue).toBe("new-app");
-    expect(post.restartRequired).toBe(false);
     const get = JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
     expect(get.flySessionsApp.runtimeValue).toBe("new-app");
     expect(get.flySessionsApp.dbValue).toBe("new-app");
-  });
-
-  it("POST /api/settings sets restartRequired false when value matches runtime", async () => {
-    const token = await login("secret");
-    const res = await request("/api/settings", "POST", "secret", { flySessionsApp: null }, token);
-    expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body).restartRequired).toBe(false);
   });
 
   it("POST /api/settings trims whitespace-only string to null", async () => {

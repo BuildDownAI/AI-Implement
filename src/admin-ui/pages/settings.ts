@@ -26,7 +26,6 @@ export const settingsHtml = `
             <button class="btn btn-primary btn-sm" onclick="saveSessionsRegion()">Save</button>
           </div>
         </div>
-        <div id="settings-restart-notice" class="warning hidden">&#x25B6; Restart the orchestrator for these changes to take effect.</div>
         <div id="settings-error" class="error hidden"></div>
       </div>
     </div>
@@ -289,8 +288,6 @@ export const settingsScript = `
       const res = await window.api('/api/settings', { method: 'POST', body: JSON.stringify(payload) });
       const data = await res.json();
       if (!res.ok) { errEl.textContent = data.error || 'Failed to save settings.'; errEl.classList.remove('hidden'); return; }
-      const noticeEl = document.getElementById('settings-restart-notice');
-      noticeEl.classList.toggle('hidden', !data.restartRequired);
       await loadSettings();
     } catch (err) {
       errEl.textContent = String(err);

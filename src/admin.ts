@@ -2815,8 +2815,6 @@ async function handlePostSettings(
   const envRegion = process.env.FLY_SESSIONS_REGION || null;
 
   const fly = getFlySessionsConfig();
-  // Every reader takes the live accessor, so a saved change never needs a restart.
-  const restartRequired = false;
 
   json(res, 200, {
     flySessionsApp: {
@@ -2844,7 +2842,6 @@ async function handlePostSettings(
     },
     retryPolicy: getRetryPolicy(),
     retryPolicyDefaults: DEFAULT_RETRY_POLICY,
-    restartRequired,
   });
 }
 
