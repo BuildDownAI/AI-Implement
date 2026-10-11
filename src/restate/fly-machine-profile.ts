@@ -194,7 +194,8 @@ export const OBJECT_ABORT_TIMEOUT_MS = 15 * 60 * 1000;
 /** Longest the `scrub` step may hold the object's exclusive lock; below OBJECT_INACTIVITY_TIMEOUT_MS. */
 export const SCRUB_BUDGET_MS = 5 * 60 * 1000;
 /**
- * Per-poll settle timeout of the scrub: the machine must reach `stopped`, and the runner may still be exiting after it reported.
+ * Total deadline (`timeoutMs`) of each settle wait in the scrub; the wait polls every second until then. The machine must reach
+ * `stopped`, and the runner may still be exiting after it reported. Each `clearMachineEnv` pass makes two such waits.
  * One `clearMachineEnv` call is at most CLEAR_ATTEMPTS x (2 x settle + MAX_RATE_LIMIT_WAIT_MS) = 3 x (30 + 30) s = 180 s.
  * The literals mirror CLEAR_ATTEMPTS and MAX_RATE_LIMIT_WAIT_MS (a test pins them; fly-machines.js is mocked wholesale in other suites).
  */
