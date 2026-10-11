@@ -15,6 +15,7 @@ import type { ObjectContext, ObjectSharedContext } from "@restatedev/restate-sdk
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { Machine, SettleOptions } from "../fly-machines.js";
+import { GONE_BEFORE_SCRUB } from "../fly-machines.js";
 
 export interface FlyMachineProfileConfig {
   cpuKind: "shared" | "performance";
@@ -283,8 +284,14 @@ export function createFlyMachineProfile(deps: FlyMachineProfileDeps) {
     let scrubbed = true;
     try {
       await ctx.run("scrub", async () => {
-        await deps.fly.clearMachineEnv(machineId, { [DURABLE_UNTIL_KEY]: String(Math.floor((now + idleTimeoutMs + ONE_DAY_MS) / 1000)) },
-          { until: ["stopped"], timeoutMs: SCRUB_SETTLE_MS });
+        try {
+          await deps.fly.clearMachineEnv(machineId, { [DURABLE_UNTIL_KEY]: String(Math.floor((now + idleTimeoutMs + ONE_DAY_MS) / 1000)) },
+            { until: ["stopped", "destroyed"], timeoutMs: SCRUB_SETTLE_MS });
+        } catch (err) {
+          // A machine that is gone cannot be scrubbed; retrying only holds the object lock.
+          if (err instanceof Error && err.message.includes(GONE_BEFORE_SCRUB)) throw new restate.TerminalError(err.message, { errorCode: 404 });
+          throw err;
+        }
       }, SCRUB_RETRY);
     } catch (err) {
       if (restate.internal.isSuspendedError(err)) throw err;

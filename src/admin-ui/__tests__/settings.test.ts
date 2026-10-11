@@ -12,6 +12,13 @@ describe("linear pickup label card", () => {
     }
   });
 
+  it("warns under the Sessions App Name field that a change leaves in-flight runs in the old app", () => {
+    const note = "A change applies to the next dispatch. Runs in flight and the kept KG machine stay in the old app. Change it only when no Fly run is in flight.";
+    const noteIdx = settingsHtml.indexOf(note);
+    expect(noteIdx).toBeGreaterThan(settingsHtml.indexOf('id="settings-sessions-app-source"'));
+    expect(noteIdx).toBeLessThan(settingsHtml.indexOf("Sessions Region"));
+  });
+
   it("is positioned right after the Fly Sessions App card", () => {
     const flyIdx = settingsHtml.indexOf("Fly Sessions App");
     const pickupIdx = settingsHtml.indexOf("Linear Pickup Label");

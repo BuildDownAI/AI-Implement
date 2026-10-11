@@ -1312,6 +1312,15 @@ describe("clearMachineEnv", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it("ends at once, without polling, on a machine Fly reports as destroyed", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(ok({ ...mockMachine, state: "destroyed" }));
+    await expect(
+      clearMachineEnv(TOKEN, APP, "m", undefined, { ...fast, until: ["stopped", "destroyed"] }),
+    ).rejects.toThrow(/gone before the scrub/);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(posts()).toHaveLength(0);
+  });
+
   it("throws when the update fails with a non-wait status", async () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce(ok({ ...mockMachine, config: { ...mockMachine.config, env: { A: "b" } } }))
