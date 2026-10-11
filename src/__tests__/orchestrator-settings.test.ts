@@ -290,6 +290,17 @@ describe("getFlySessionsConfig", () => {
     expect(settings.getFlySessionsConfig().app).toBe("row-app-2");
   });
 
+  it("resolves each field on its own: env app with a row region", () => {
+    process.env.FLY_SESSIONS_APP = "env-app";
+    settings.setOrchestratorSetting("flySessionsApp", "row-app");
+    settings.setOrchestratorSetting("flySessionsRegion", "row-region");
+    expect(settings.getFlySessionsConfig()).toMatchObject({
+      app: "env-app",
+      region: "row-region",
+      source: { app: "env", region: "settings" },
+    });
+  });
+
   it("takes the token from FLY_SESSIONS_TOKEN only", () => {
     settings.setOrchestratorSetting("flySessionsApp", "row-app");
     expect(settings.getFlySessionsConfig().token).toBeNull();
