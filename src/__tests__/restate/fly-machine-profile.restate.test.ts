@@ -1,10 +1,12 @@
 // Real Restate coordination tests for the FlyMachineProfile object (AII-1126).
+import { GONE_BEFORE_SCRUB } from "../../fly-machines.js";
 import { randomUUID } from "node:crypto";
 import * as restate from "@restatedev/restate-sdk";
 import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { CLEAR_MACHINE_ENV_MAX_MS } from "../../fly-machines.js";
-import { FLY_MACHINE_PROFILE_DEFAULTS, OBJECT_ABORT_TIMEOUT_MS, OBJECT_INACTIVITY_TIMEOUT_MS, createFlyMachineProfile, type FlyMachineProfileConfig, type FlyMachineProfileDeps, type KeptMachineState } from "../../restate/fly-machine-profile.js";
+import { CLEAR_ATTEMPTS, MAX_RATE_LIMIT_WAIT_MS } from "../../fly-machines.js";
+import { SCRUB_BUDGET_MS, SCRUB_CALL_MAX_MS, SCRUB_MAX_RETRY_DURATION_MS, SCRUB_SETTLE_MS, FLY_MACHINE_PROFILE_DEFAULTS, OBJECT_ABORT_TIMEOUT_MS, OBJECT_INACTIVITY_TIMEOUT_MS, createFlyMachineProfile, type FlyMachineProfileConfig, type FlyMachineProfileDeps, type KeptMachineState } from "../../restate/fly-machine-profile.js";
 import { VARIANTS, callObject, callService, eventually, queryInvocations, startVariants, stopAll } from "./harness.js";
 
 // `set` is ingressPrivate: this forwarder plays the tools service's part.
@@ -36,6 +38,11 @@ interface FakeFly extends FlyMachineProfileDeps {
   calls: string[];
   failClear: boolean;
   failClearOnce409: boolean;
+  /** Models a machine that never reaches `stopped`: the scrub's settle times out. */
+  stayStarted: boolean;
+  /** Models a machine Fly reports as destroyed: the scrub ends as gone. */
+  gone: boolean;
+  settles: unknown[];
   fail404OnDestroy: boolean;
 }
 function fakeFly(idleTimeoutMsOverride?: number): FakeFly {
@@ -44,12 +51,18 @@ function fakeFly(idleTimeoutMsOverride?: number): FakeFly {
     calls,
     failClear: false,
     failClearOnce409: false,
+    stayStarted: false,
+    gone: false,
+    settles: [],
     fail404OnDestroy: false,
     idleTimeoutMsOverride,
     fly: {
       getMachine: async () => { throw new Error("unexpected getMachine"); },
-      clearMachineEnv: async (id, metadata) => {
+      clearMachineEnv: async (id, metadata, settle) => {
         calls.push(metadata ? `clear:${id}:${JSON.stringify(metadata)}` : `clear:${id}`);
+        fake.settles.push(settle);
+        if (fake.stayStarted) throw new Error(`Timeout waiting for machine ${id} to settle (state=started)`);
+        if (fake.gone) throw new Error(`Machine ${id} is destroyed (404): ${GONE_BEFORE_SCRUB}`);
         if (fake.failClear) throw new Error("fly down");
         if (fake.failClearOnce409) {
           fake.failClearOnce409 = false;
@@ -152,6 +165,14 @@ describe("FlyMachineProfile", () => {
     await seed(label, key, defaults);
     await expect(set(label, key, { memoryMB: 4096 })).rejects.toThrow();
     expect(await get(label, key)).toEqual({ config: defaults, source: "profile" });
+  });
+});
+
+describe("scrub budget", () => {
+  it("worst case (maxRetryDuration plus one call) fits SCRUB_BUDGET_MS, which is below the inactivity timeout", () => {
+    expect(SCRUB_CALL_MAX_MS).toBe(CLEAR_ATTEMPTS * (2 * SCRUB_SETTLE_MS + MAX_RATE_LIMIT_WAIT_MS));
+    expect(SCRUB_MAX_RETRY_DURATION_MS + SCRUB_CALL_MAX_MS).toBeLessThanOrEqual(SCRUB_BUDGET_MS);
+    expect(SCRUB_BUDGET_MS).toBeLessThan(OBJECT_INACTIVITY_TIMEOUT_MS);
   });
 });
 
@@ -294,6 +315,49 @@ describe("FlyMachineProfile kept machine", () => {
     expect(fly.calls).toContain(`destroy:${machineId}`);
     expect(await h.status()).toBeNull();
     await eventually(() => h.expires(), (found) => found.length === 1, { label: "expire still scheduled", timeoutMs: 30_000 });
+  }, 60_000);
+
+  it.each(labels)("a machine that stays started ends release through destroy-unscrubbed inside the budget, and a claim is answered (%s)", async (label) => {
+    const key = fresh();
+    const h = forKey(label, key);
+    const machineId = `m-${randomUUID()}`;
+    await h.call("claim", { dispatchId: "d1" });
+    await h.call("attach", { dispatchId: "d1", machineId });
+    const before = mark(fly);
+    fly.stayStarted = true;
+    const startedAt = Date.now();
+    try {
+      await h.call("release", { dispatchId: "d1" });
+    } finally {
+      fly.stayStarted = false;
+    }
+    expect(Date.now() - startedAt).toBeLessThan(SCRUB_BUDGET_MS);
+    expect(fly.settles.at(-1)).toEqual({ until: ["stopped", "destroyed"], timeoutMs: SCRUB_SETTLE_MS });
+    expect(fly.calls.slice(before).filter((c) => c === `destroy:${machineId}`)).toHaveLength(1);
+    expect(await h.status()).toBeNull();
+    expect(await h.call("claim", { dispatchId: "d2" })).toEqual({ machineId: null });
+  }, 90_000);
+
+  it.each(labels)("a destroyed machine ends release through destroy-unscrubbed after one scrub attempt, and a claim is answered (%s)", async (label) => {
+    const key = fresh();
+    const h = forKey(label, key);
+    const machineId = `m-${randomUUID()}`;
+    await h.call("claim", { dispatchId: "d1" });
+    await h.call("attach", { dispatchId: "d1", machineId });
+    const before = mark(fly);
+    fly.gone = true;
+    const startedAt = Date.now();
+    try {
+      await h.call("release", { dispatchId: "d1" });
+    } finally {
+      fly.gone = false;
+    }
+    expect(Date.now() - startedAt).toBeLessThan(10_000);
+    const calls = fly.calls.slice(before);
+    expect(calls.filter((c) => c.startsWith("clear:"))).toHaveLength(1);
+    expect(calls.filter((c) => c === `destroy:${machineId}`)).toHaveLength(1);
+    expect(await h.status()).toBeNull();
+    expect(await h.call("claim", { dispatchId: "d2" })).toEqual({ machineId: null });
   }, 60_000);
 
   it.each(labels)("a scrub that fails once with a 409 is retried and keeps the machine (%s)", async (label) => {

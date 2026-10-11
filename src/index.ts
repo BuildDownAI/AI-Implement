@@ -73,7 +73,7 @@ import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable 
 import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
-import { getOrchestratorSettings, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, getRetryPolicy } from "./orchestrator-settings.js";
+import { getOrchestratorSettings, getFlySessionsConfig, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, getRetryPolicy } from "./orchestrator-settings.js";
 import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
@@ -302,17 +302,15 @@ function loadConfig(): AppConfig {
     pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "60000", 10),
     pollCycleTimeoutMs: Number(process.env.POLL_CYCLE_TIMEOUT_MS) || 10 * 60 * 1000,
     healthPort: parseInt(process.env.PORT || "8080", 10),
-    flySessionsToken: process.env.FLY_SESSIONS_TOKEN || null,
-    flySessionsApp: (() => {
-      const envVal = process.env.FLY_SESSIONS_APP || null;
-      if (envVal) return envVal;
-      return getOrchestratorSettings().flySessionsApp;
-    })(),
-    flySessionsRegion: (() => {
-      const envVal = process.env.FLY_SESSIONS_REGION || null;
-      if (envVal) return envVal;
-      return getOrchestratorSettings().flySessionsRegion;
-    })(),
+    get flySessionsToken() {
+      return getFlySessionsConfig().token;
+    },
+    get flySessionsApp() {
+      return getFlySessionsConfig().app;
+    },
+    get flySessionsRegion() {
+      return getFlySessionsConfig().region;
+    },
     flyOrchestratorApp: process.env.FLY_APP_NAME || null,
     flyDeployToken: process.env.FLY_DEPLOY_TOKEN || null,
     tenantId: process.env.CLIENT_SLUG || process.env.FLY_APP_NAME || null,

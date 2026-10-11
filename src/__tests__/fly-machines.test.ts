@@ -1266,6 +1266,32 @@ describe("clearMachineEnv", () => {
     await expect(p).resolves.toBeUndefined();
   });
 
+  it("with until: stopped, sends the update only after the machine reads stopped", async () => {
+    const started = { ...mockMachine, state: "started", config: { ...mockMachine.config, env: { A: "1" } } };
+    const stopped = { ...started, state: "stopped" };
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(ok(started))
+      .mockResolvedValueOnce(ok(stopped))
+      .mockResolvedValueOnce(ok(stopped))
+      .mockResolvedValueOnce(ok({ ...stopped, config: { ...stopped.config, env: {} } }));
+
+    await clearMachineEnv(TOKEN, APP, "machine-123", undefined, { ...fast, until: ["stopped"] });
+
+    const calls = vi.mocked(fetch).mock.calls;
+    const updateIdx = calls.findIndex(([, o]) => (o as RequestInit | undefined)?.method === "POST");
+    expect(updateIdx).toBe(2);
+    expect(calls).toHaveLength(4);
+  });
+
+  it("with until: stopped, a machine that stays started times out with no update sent", async () => {
+    const started = { ...mockMachine, state: "started", config: { ...mockMachine.config, env: { A: "1" } } };
+    vi.mocked(fetch).mockResolvedValue(ok(started));
+    await expect(
+      clearMachineEnv(TOKEN, APP, "machine-123", undefined, { intervalMs: 1, timeoutMs: 20, until: ["stopped"] }),
+    ).rejects.toThrow(/machine-123.*state=started/);
+    expect(posts()).toHaveLength(0);
+  });
+
   it("throws naming the machine and state when the env never clears", async () => {
     const withEnv = { ...mockMachine, state: "stopped", config: { ...mockMachine.config, env: { A: "1" } } };
     vi.mocked(fetch).mockResolvedValue(ok(withEnv));
@@ -1284,6 +1310,15 @@ describe("clearMachineEnv", () => {
     vi.mocked(fetch).mockResolvedValueOnce(fail(404, "gone"));
     await expect(clearMachineEnv(TOKEN, APP, "m", undefined, fast)).rejects.toThrow("(404)");
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("ends at once, without polling, on a machine Fly reports as destroyed", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(ok({ ...mockMachine, state: "destroyed" }));
+    await expect(
+      clearMachineEnv(TOKEN, APP, "m", undefined, { ...fast, until: ["stopped", "destroyed"] }),
+    ).rejects.toThrow(/gone before the scrub/);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(posts()).toHaveLength(0);
   });
 
   it("throws when the update fails with a non-wait status", async () => {

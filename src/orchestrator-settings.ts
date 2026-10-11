@@ -60,6 +60,38 @@ export function getOrchestratorSettings(): OrchestratorSettings {
   }
 }
 
+export interface FlySessionsConfig {
+  /** FLY_SESSIONS_TOKEN only; never stored in the settings table. */
+  token: string | null;
+  app: string | null;
+  region: string | null;
+  source: { app: "env" | "settings" | null; region: "env" | "settings" | null };
+}
+
+/**
+ * The Fly sessions token, app, and region, read live on every call: app and region come from the
+ * env var, else the settings row, else null. Callers read it at the moment they need a value so a
+ * Settings-page change takes effect without a restart.
+ */
+export function getFlySessionsConfig(): FlySessionsConfig {
+  const envApp = process.env.FLY_SESSIONS_APP || null;
+  const envRegion = process.env.FLY_SESSIONS_REGION || null;
+  const rows = envApp && envRegion ? null : getOrchestratorSettings();
+  const pick = (env: string | null, row: string | null | undefined) => {
+    if (env) return { value: env, source: "env" as const };
+    if (row) return { value: row, source: "settings" as const };
+    return { value: null, source: null };
+  };
+  const app = pick(envApp, rows?.flySessionsApp);
+  const region = pick(envRegion, rows?.flySessionsRegion);
+  return {
+    token: process.env.FLY_SESSIONS_TOKEN || null,
+    app: app.value,
+    region: region.value,
+    source: { app: app.source, region: region.source },
+  };
+}
+
 /**
  * Seeds `kgBaseRepo` from KG_BASE_REPO on first boot only (AII-633) — a no-op once the
  * DB already holds a value, so a later env removal or edit at /admin#settings is never

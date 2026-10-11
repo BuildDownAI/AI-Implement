@@ -81,8 +81,7 @@ export function createPlanningFindExistingRun(opts: {
   getMapping: (teamKey: string) => RepoMapping | undefined;
   getToken: (owner: string) => Promise<string>;
   /** The Fly sessions credentials for the by-name machine lookup; absent values throw. */
-  flySessionsToken?: string | null;
-  flySessionsApp?: string | null;
+  getFlySessions?: () => { token: string | null; app: string | null };
 }): PlanningRunDependencies["findExistingRun"] {
   return async (input, dispatchedAt) => {
     const backend = containerBackend(input);
@@ -92,10 +91,11 @@ export function createPlanningFindExistingRun(opts: {
       if (recorded) return recorded;
       const name = planningSessionName(input.dispatchId);
       if (backend === "local-docker") return findLocalContainerIdByName(name);
-      if (!opts.flySessionsToken || !opts.flySessionsApp) {
+      const fly = opts.getFlySessions?.();
+      if (!fly?.token || !fly.app) {
         throw new Error("findExistingRun: FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP not set");
       }
-      const machines = await listMachines(opts.flySessionsToken, opts.flySessionsApp);
+      const machines = await listMachines(fly.token, fly.app);
       return machines.find((m) => m.name === name)?.id ?? null;
     }
     const mapping = requireMapping(opts.getMapping, input.teamKey);
@@ -284,7 +284,7 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
 
   const deps: PlanningRunDependencies = {
     reserve,
-    findExistingRun: createPlanningFindExistingRun({ getMapping, getToken, flySessionsToken: config.flySessionsToken, flySessionsApp: config.flySessionsApp }),
+    findExistingRun: createPlanningFindExistingRun({ getMapping, getToken, getFlySessions: () => ({ token: config.flySessionsToken, app: config.flySessionsApp }) }),
     launch,
     readStatus,
     stop,

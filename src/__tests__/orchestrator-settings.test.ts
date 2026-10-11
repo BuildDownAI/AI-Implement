@@ -263,3 +263,48 @@ describe("setRetryPolicy", () => {
     expect(settings.getRetryPolicy().reviewMaxTurns).toBe(30);
   });
 });
+
+describe("getFlySessionsConfig", () => {
+  const KEYS = ["FLY_SESSIONS_APP", "FLY_SESSIONS_REGION", "FLY_SESSIONS_TOKEN"] as const;
+  beforeEach(() => { for (const k of KEYS) delete process.env[k]; });
+  afterEach(() => { for (const k of KEYS) delete process.env[k]; });
+
+  it("returns nulls when neither env nor row is set", () => {
+    expect(settings.getFlySessionsConfig()).toEqual({ token: null, app: null, region: null, source: { app: null, region: null } });
+  });
+
+  it("env wins over the row", () => {
+    settings.setOrchestratorSetting("flySessionsApp", "row-app");
+    settings.setOrchestratorSetting("flySessionsRegion", "row-region");
+    process.env.FLY_SESSIONS_APP = "env-app";
+    process.env.FLY_SESSIONS_REGION = "env-region";
+    expect(settings.getFlySessionsConfig()).toMatchObject({ app: "env-app", region: "env-region", source: { app: "env", region: "env" } });
+  });
+
+  it("uses the row when env is unset or empty, and sees a row change with no restart", () => {
+    process.env.FLY_SESSIONS_APP = "";
+    expect(settings.getFlySessionsConfig().app).toBeNull();
+    settings.setOrchestratorSetting("flySessionsApp", "row-app");
+    expect(settings.getFlySessionsConfig()).toMatchObject({ app: "row-app", source: { app: "settings" } });
+    settings.setOrchestratorSetting("flySessionsApp", "row-app-2");
+    expect(settings.getFlySessionsConfig().app).toBe("row-app-2");
+  });
+
+  it("resolves each field on its own: env app with a row region", () => {
+    process.env.FLY_SESSIONS_APP = "env-app";
+    settings.setOrchestratorSetting("flySessionsApp", "row-app");
+    settings.setOrchestratorSetting("flySessionsRegion", "row-region");
+    expect(settings.getFlySessionsConfig()).toMatchObject({
+      app: "env-app",
+      region: "row-region",
+      source: { app: "env", region: "settings" },
+    });
+  });
+
+  it("takes the token from FLY_SESSIONS_TOKEN only", () => {
+    settings.setOrchestratorSetting("flySessionsApp", "row-app");
+    expect(settings.getFlySessionsConfig().token).toBeNull();
+    process.env.FLY_SESSIONS_TOKEN = "tok";
+    expect(settings.getFlySessionsConfig().token).toBe("tok");
+  });
+});
