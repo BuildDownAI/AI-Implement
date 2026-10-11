@@ -2719,11 +2719,17 @@ describe("admin settings", () => {
     expect(body.flySessionsApp.dbValue).toBe("my-sessions-app");
   });
 
-  it("POST /api/settings sets restartRequired true when value differs from runtime", async () => {
+  it("POST /api/settings reports runtimeValue equal to dbValue, and GET agrees, with no restart", async () => {
     const token = await login("secret");
     const res = await request("/api/settings", "POST", "secret", { flySessionsApp: "new-app" }, token);
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body).restartRequired).toBe(true);
+    const post = JSON.parse(res.body);
+    expect(post.flySessionsApp.runtimeValue).toBe("new-app");
+    expect(post.flySessionsApp.dbValue).toBe("new-app");
+    expect(post.restartRequired).toBe(false);
+    const get = JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
+    expect(get.flySessionsApp.runtimeValue).toBe("new-app");
+    expect(get.flySessionsApp.dbValue).toBe("new-app");
   });
 
   it("POST /api/settings sets restartRequired false when value matches runtime", async () => {

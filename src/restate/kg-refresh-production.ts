@@ -9,6 +9,7 @@ import * as restateClients from "@restatedev/restate-sdk-clients";
 import { getMappings } from "../config.js";
 import { getDb } from "../dedup.js";
 import type { AppConfig } from "../index.js";
+import { getFlySessionsConfig } from "../orchestrator-settings.js";
 import {
   CANARY_DEADLINE_MS,
   CANARY_RETRY_MS,
@@ -322,7 +323,8 @@ export function resolveKgExecutionMode(fly: Pick<AppConfig, "flySessionsToken" |
  *  `executionMode`. An unknown mode is a definitive `rejected`, since a throw would retry a value that cannot change. */
 export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispatch: KgDispatchInput) => Promise<KgDispatchResult> {
   const senders = createKgRefreshSenders({
-    config: { ...input.config, kgSourceRepo: input.kgSourceRepo },
+    // Inherit from the live config: a spread would read every getter once and freeze the Fly values at boot.
+    config: Object.create(input.config, { kgSourceRepo: { value: input.kgSourceRepo, enumerable: true } }) as AppConfig,
     getInstallationToken: input.getInstallationToken,
     mintToken: input.mintToken,
     fetchDefaultBranch: input.fetchDefaultBranch,
@@ -469,13 +471,12 @@ export function createProductionKgRefreshServices(
 }
 
 /**
- * Binds the profile object's Fly calls to FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP. When either is unset
+ * Binds the profile object's Fly calls to `getFlySessionsConfig()`, read at call time. When either is unset
  * the object still registers (boot stays non-fatal) and a handler that needs Fly fails when it runs.
  */
-export function buildFlyMachineProfileDeps(env: NodeJS.ProcessEnv = process.env): FlyMachineProfileDeps {
-  const token = env.FLY_SESSIONS_TOKEN;
-  const app = env.FLY_SESSIONS_APP;
+export function buildFlyMachineProfileDeps(): FlyMachineProfileDeps {
   const bound = <A extends unknown[], R>(fn: (token: string, app: string, ...args: A) => Promise<R>) => async (...args: A): Promise<R> => {
+    const { token, app } = getFlySessionsConfig();
     if (!token || !app) throw new Error("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured");
     return fn(token, app, ...args);
   };

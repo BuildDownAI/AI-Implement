@@ -40,7 +40,7 @@ import type { StepStatus } from "../pipeline/types.js";
 import { FlyMachineProfile } from "./fly-machine-profile.js";
 import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
-import { getOrchestratorSettings, getLinearPickupLabel } from "../orchestrator-settings.js";
+import { getOrchestratorSettings, getFlySessionsConfig, getLinearPickupLabel } from "../orchestrator-settings.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import { getDeployPosture } from "../deploy-posture.js";
 import {
@@ -896,11 +896,12 @@ export const kgProvenance = kgTool("kg_provenance");
  * boot warnings and configures OAuth/Linear auth as a side effect and must run exactly once.
  */
 function mcpAdminConfig(): AdminConfig {
+  const fly = getFlySessionsConfig();
   return {
     adminAccessCode: process.env.ADMIN_ACCESS_CODE || null,
-    flySessionsToken: process.env.FLY_SESSIONS_TOKEN || null,
-    flySessionsApp: process.env.FLY_SESSIONS_APP || getOrchestratorSettings().flySessionsApp,
-    flySessionsRegion: process.env.FLY_SESSIONS_REGION || getOrchestratorSettings().flySessionsRegion,
+    flySessionsToken: fly.token,
+    flySessionsApp: fly.app,
+    flySessionsRegion: fly.region,
     githubAppId: process.env.GITHUB_APP_ID ?? "",
     githubAppPrivateKey: process.env.GITHUB_APP_PRIVATE_KEY ?? "",
     notifyWebhookUrl: process.env.NOTIFY_WEBHOOK_URL || null,
