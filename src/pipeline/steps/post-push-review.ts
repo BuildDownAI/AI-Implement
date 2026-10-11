@@ -2298,13 +2298,15 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       const reportedGatingExternalFindings = gatingReviewFindings
         .filter((finding) => finding.source !== "ai-implement-internal")
         .filter((finding) => !deferredKeys.has(stableReviewFindingKey(finding)));
+      let issues = internalIssuesFromReviewLedger(gatingReviewFindings);
       // While the external check on the current head is still running, the findings read above may
       // belong to an older head (a fix pass may already have fixed them). They do not gate; the
       // LateExternalReview workflow ignores findings the current head's review has not reported again.
-      const gatingExternalFindings = externalReviewPending ? [] : reportedGatingExternalFindings;
+      // An unapproved internal verdict keeps them visible so a fix pass never runs with no feedback.
+      const gatingExternalFindings =
+        externalReviewPending && verdict.approved === true && issues.length === 0 ? [] : reportedGatingExternalFindings;
       const hasGatingExternalFindings = gatingExternalFindings.length > 0;
       const advisoryExternalFindings = advisoryReviewFindings;
-      let issues = internalIssuesFromReviewLedger(gatingReviewFindings);
       const externalReviewVerdictBlocks = (externalFindingsResult.verdictSource === "review-contract"
         && (externalFindingsResult.verdict === "changes_requested" || externalFindingsResult.verdict === "incomplete"))
         || processVerdict?.verdict === "changes_requested";
