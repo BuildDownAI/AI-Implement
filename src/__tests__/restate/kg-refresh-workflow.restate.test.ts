@@ -1097,10 +1097,6 @@ describe("KgRefresh durable workflow", () => {
     "W3: no progress within the bootstrap deadline fails with a timed_out row and one outcome call (%s)",
     async (label) => {
       const env = deadlineEnvFor(label);
-      // Captured before the trigger (not after): the trigger's genericSend dispatches the
-      // run immediately, and with a 1s bootstrap deadline a call recorded even a moment
-      // late risks folding an already-fired outcome into the "before" snapshot instead of
-      // the "after" delta.
       const triggered = await triggerViaKgRepo(env.baseUrl());
       const triggerId = (triggered as { triggerId: string }).triggerId;
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
