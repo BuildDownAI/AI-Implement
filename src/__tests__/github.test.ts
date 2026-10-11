@@ -30,6 +30,12 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     skillsRepo: null,
     referenceRepos: null,
     autoMerge: false,
+    sensitiveAddPatterns: null,
+    sensitiveAllowPatterns: null,
+    dependencyTokenScope: null,
+    reviewFixLifecycle: null,
+    memoryProviderId: null,
+    reviewers: null,
     ...overrides,
   };
 }
@@ -637,12 +643,12 @@ describe("buildEnvelopeDispatchInputs", () => {
   });
 
   it("carries assigneeName in run_config when present", () => {
-    const inputs = buildEnvelopeDispatchInputs(mockMapping, { ...baseIssue, assigneeName: "Paz" }, { runnerPhase: "implementation" });
+    const inputs = buildEnvelopeDispatchInputs(mockMapping, { ...baseIssue, assigneeName: "Paz" }, { runnerPhase: "implementation", retryPolicy: null });
     expect(decodeRunConfig(inputs.run_config as string).assigneeName).toBe("Paz");
   });
 
   it("omits assigneeName from run_config when absent", () => {
-    const inputs = buildEnvelopeDispatchInputs(mockMapping, baseIssue, { runnerPhase: "implementation" });
+    const inputs = buildEnvelopeDispatchInputs(mockMapping, baseIssue, { runnerPhase: "implementation", retryPolicy: null });
     expect(decodeRunConfig(inputs.run_config as string).assigneeName).toBeUndefined();
   });
 

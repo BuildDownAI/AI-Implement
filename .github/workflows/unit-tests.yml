@@ -47,6 +47,7 @@ jobs:
       - run: npx tsc --noEmit --project tsconfig.review-fix-attempt-store-tests.json
       - run: npx tsc --noEmit --project tsconfig.review-fix-finalize-tests.json
       - run: npx tsc --noEmit --project tsconfig.aii-806-tests.json
+      - run: npx tsc --noEmit --project tsconfig.github-tests.json
 
   # Restate harness (AII-612): src/__tests__/restate/**/*.restate.test.ts on the
   # `restate-server` binary from node_modules — the runtime the orchestrator sidecar
