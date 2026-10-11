@@ -18,6 +18,7 @@ export const settingsHtml = `
             <button class="btn btn-primary btn-sm" onclick="saveSessionsApp()">Save</button>
           </div>
           <div id="settings-sessions-app-source" class="text-tertiary" style="font-size:11px;margin-top:3px"></div>
+          <div id="settings-sessions-app-note" class="text-tertiary" style="font-size:11px;margin-top:3px">A change applies to the next dispatch. Runs in flight and the kept KG machine stay in the old app. Change it only when no Fly run is in flight.</div>
         </div>
         <div class="field">
           <label>Sessions Region (optional)</label>

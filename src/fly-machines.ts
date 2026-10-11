@@ -279,6 +279,8 @@ function isEnvCleared(machine: Machine, metadata?: Record<string, string>): bool
  * means an update is applying, the 429 waits `retry-after` (else 2 s); both re-read and, if the
  * env is still set, update again, up to three attempts.
  */
+export const GONE_BEFORE_SCRUB = "gone before the scrub";
+
 export async function clearMachineEnv(
   token: string,
   appName: string,
@@ -289,7 +291,9 @@ export async function clearMachineEnv(
   let last: Machine | null = null;
   for (let attempt = 1; attempt <= CLEAR_ATTEMPTS; attempt++) {
     const machine = await waitForMachineSettled(token, appName, machineId, settle);
-    if (!machine) throw new Error(`Failed to get machine ${machineId} (404): gone before the scrub`);
+    if (!machine) throw new Error(`Failed to get machine ${machineId} (404): ${GONE_BEFORE_SCRUB}`);
+    // Fly reports a destroyed machine as a state rather than a 404; it is gone all the same.
+    if (machine.state === "destroyed") throw new Error(`Machine ${machineId} is destroyed (404): ${GONE_BEFORE_SCRUB}`);
     // Already clean (e.g. an SDK retry of a scrub Fly applied): no second update, no second replace window.
     if (isEnvCleared(machine, metadata)) return;
     const config = { ...machine.config, env: {} };
