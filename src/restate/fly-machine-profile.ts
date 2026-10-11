@@ -14,7 +14,7 @@ import * as restate from "@restatedev/restate-sdk";
 import type { ObjectContext, ObjectSharedContext } from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
-import type { Machine } from "../fly-machines.js";
+import type { Machine, SettleOptions } from "../fly-machines.js";
 
 export interface FlyMachineProfileConfig {
   cpuKind: "shared" | "performance";
@@ -62,7 +62,7 @@ export interface FlyMachineProfileDeps {
   fly: {
     getMachine(id: string): Promise<Machine>;
     /** getMachine, then updateMachine with `env: {}` and the same config otherwise. Update on a stopped machine does not start it. */
-    clearMachineEnv(id: string, metadata?: Record<string, string>): Promise<void>;
+    clearMachineEnv(id: string, metadata?: Record<string, string>, settle?: SettleOptions): Promise<void>;
     destroyMachine(id: string): Promise<void>;
   };
   /** Test seam for a short idle timeout; production leaves it unset. */
@@ -186,11 +186,27 @@ export function mergeProfile(base: FlyMachineProfileConfig | null, patch: Partia
 /**
  * One scrub call (`clearMachineEnv`) is bounded by CLEAR_MACHINE_ENV_MAX_MS in fly-machines.ts (450 s: 3 passes x (60 s settle +
  * 30 s capped 429 sleep + 60 s settle)), plus HTTP time. The server defaults (about 1 minute each) would abort it.
- * The bound is per call, not per scrub step: SCRUB_RETRY allows five attempts, so a Fly that stays at the worst case on every attempt
- * could still outlast the abort timeout. An aborted invocation is retried by the server, so that costs retry budget, not correctness.
+ * The whole scrub step is bounded separately by SCRUB_BUDGET_MS (below), so `release` holds the object's lock for at most that long.
  */
 export const OBJECT_INACTIVITY_TIMEOUT_MS = 10 * 60 * 1000;
 export const OBJECT_ABORT_TIMEOUT_MS = 15 * 60 * 1000;
+
+/** Longest the `scrub` step may hold the object's exclusive lock; below OBJECT_INACTIVITY_TIMEOUT_MS. */
+export const SCRUB_BUDGET_MS = 5 * 60 * 1000;
+/**
+ * Total deadline (`timeoutMs`) of each settle wait in the scrub; the wait polls every second until then. The machine must reach
+ * `stopped`, and the runner may still be exiting after it reported. Each `clearMachineEnv` pass makes two such waits.
+ * One `clearMachineEnv` call is at most CLEAR_ATTEMPTS x (2 x settle + MAX_RATE_LIMIT_WAIT_MS) = 3 x (30 + 30) s = 180 s.
+ * The literals mirror CLEAR_ATTEMPTS and MAX_RATE_LIMIT_WAIT_MS (a test pins them; fly-machines.js is mocked wholesale in other suites).
+ */
+export const SCRUB_SETTLE_MS = 15_000;
+export const SCRUB_CALL_MAX_MS = 3 * (2 * SCRUB_SETTLE_MS + 30_000);
+/**
+ * Restate checks `maxRetryDuration` only after a failed attempt and never interrupts a running one, so an attempt that starts
+ * just before it elapses runs a full call: worst case = maxRetryDuration + one call = 120 s + 180 s = 300 s = SCRUB_BUDGET_MS.
+ * The retry waits (2 + 4 + 8 + 10 s) count inside maxRetryDuration.
+ */
+export const SCRUB_MAX_RETRY_DURATION_MS = SCRUB_BUDGET_MS - SCRUB_CALL_MAX_MS;
 
 /**
  * Fly's replace window outlasts the SDK's 50 ms default backoff, so the scrub retries slowly:
@@ -201,6 +217,7 @@ const SCRUB_RETRY = {
   initialRetryInterval: { seconds: 2 },
   retryIntervalFactor: 2,
   maxRetryInterval: { seconds: 10 },
+  maxRetryDuration: { milliseconds: SCRUB_MAX_RETRY_DURATION_MS },
 };
 
 export function createFlyMachineProfile(deps: FlyMachineProfileDeps) {
@@ -266,7 +283,8 @@ export function createFlyMachineProfile(deps: FlyMachineProfileDeps) {
     let scrubbed = true;
     try {
       await ctx.run("scrub", async () => {
-        await deps.fly.clearMachineEnv(machineId, { [DURABLE_UNTIL_KEY]: String(Math.floor((now + idleTimeoutMs + ONE_DAY_MS) / 1000)) });
+        await deps.fly.clearMachineEnv(machineId, { [DURABLE_UNTIL_KEY]: String(Math.floor((now + idleTimeoutMs + ONE_DAY_MS) / 1000)) },
+          { until: ["stopped"], timeoutMs: SCRUB_SETTLE_MS });
       }, SCRUB_RETRY);
     } catch (err) {
       if (restate.internal.isSuspendedError(err)) throw err;
