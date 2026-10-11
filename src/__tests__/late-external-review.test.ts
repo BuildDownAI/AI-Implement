@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 vi.mock("../github.js", () => ({
   getPullRequestState: vi.fn(),
   getCombinedChecksState: vi.fn(),
+  getCommitTime: vi.fn(),
   listPrComments: vi.fn(),
   postPrComment: vi.fn(),
 }));
@@ -17,7 +18,7 @@ vi.mock("../review-ledger-store.js", () => ({
   listOpenReviewFindings: vi.fn(),
 }));
 
-import { getCombinedChecksState, getPullRequestState, listPrComments, postPrComment } from "../github.js";
+import { getCombinedChecksState, getCommitTime, getPullRequestState, listPrComments, postPrComment } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { getJobByDispatchId, stampJobApproved } from "../log.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
@@ -32,7 +33,7 @@ const input: LateExternalReviewInput = {
 };
 const deps = createProductionLateExternalReviewDependencies({ githubAppId: "1", githubAppPrivateKey: "k" });
 const prState = (state: string, headSha: string) => ({ state, headSha }) as never;
-const finding = (severity: string) => ({ severity }) as never;
+const finding = (severity: string, lastSeenAt = 0) => ({ severity, lastSeenAt }) as never;
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -42,7 +43,7 @@ describe("readTick", () => {
   it("returns without a checks read when the PR is closed", async () => {
     vi.mocked(getPullRequestState).mockResolvedValue(prState("closed", "sha-a"));
     const tick = await deps.readTick(input);
-    expect(tick).toEqual({ open: false, headSha: "sha-a", checks: "pending", blockingCount: 0 });
+    expect(tick).toEqual({ open: false, headSha: "sha-a", checks: "pending", headCommittedAtMs: null, blockingLastSeenAtMs: [] });
     expect(getCombinedChecksState).not.toHaveBeenCalled();
     expect(listOpenReviewFindings).not.toHaveBeenCalled();
   });
@@ -50,7 +51,7 @@ describe("readTick", () => {
   it("returns without a checks read when the head moved", async () => {
     vi.mocked(getPullRequestState).mockResolvedValue(prState("open", "sha-b"));
     const tick = await deps.readTick(input);
-    expect(tick).toEqual({ open: true, headSha: "sha-b", checks: "pending", blockingCount: 0 });
+    expect(tick).toEqual({ open: true, headSha: "sha-b", checks: "pending", headCommittedAtMs: null, blockingLastSeenAtMs: [] });
     expect(getCombinedChecksState).not.toHaveBeenCalled();
     expect(listOpenReviewFindings).not.toHaveBeenCalled();
   });
@@ -64,12 +65,22 @@ describe("readTick", () => {
     vi.mocked(getPullRequestState).mockResolvedValue(prState("open", "sha-a"));
     vi.mocked(getCombinedChecksState).mockResolvedValue("success");
     vi.mocked(listOpenReviewFindings).mockReturnValue([
-      finding("blocking"), finding("medium"), finding("blocking"), finding("minor"),
+      finding("blocking", 10), finding("medium", 20), finding("blocking", 30), finding("minor", 40),
     ]);
+    vi.mocked(getCommitTime).mockResolvedValue(25);
     const tick = await deps.readTick(input);
-    expect(tick).toEqual({ open: true, headSha: "sha-a", checks: "success", blockingCount: 2 });
+    expect(tick).toEqual({ open: true, headSha: "sha-a", checks: "success", headCommittedAtMs: 25, blockingLastSeenAtMs: [10, 30] });
+    expect(getCommitTime).toHaveBeenCalledWith("tok", "owner", "repo", "sha-a");
     expect(getCombinedChecksState).toHaveBeenCalledWith("tok", "owner", "repo", "sha-a");
     expect(listOpenReviewFindings).toHaveBeenCalledWith("owner/repo", 12);
+  });
+
+  it("throws when the head commit is unreadable", async () => {
+    vi.mocked(getPullRequestState).mockResolvedValue(prState("open", "sha-a"));
+    vi.mocked(getCombinedChecksState).mockResolvedValue("success");
+    vi.mocked(listOpenReviewFindings).mockReturnValue([]);
+    vi.mocked(getCommitTime).mockRejectedValue(new Error("boom"));
+    await expect(deps.readTick(input)).rejects.toThrow(/boom/);
   });
 });
 

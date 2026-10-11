@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles } from "../github.js";
+import { dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, getCommitTime } from "../github.js";
 import { decodeRunConfig, encodeRunConfig } from "../run-config.js";
 import type { RepoMapping } from "../config.js";
 
@@ -1095,5 +1095,34 @@ describe("listRepoBranchesAndTags pagination", () => {
     const result = await listRepoBranchesAndTags("tok", "o", "r");
     expect(result.branches).toEqual(["main", "dev"]);
     expect(result.tags).toEqual(["v1.0"]);
+  });
+});
+
+describe("getCommitTime", () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+  const stub = (res: unknown) => vi.stubGlobal("fetch", vi.fn(async () => res));
+
+  it("parses commit.committer.date to epoch ms", async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true, json: async () => ({ commit: { committer: { date: "2026-10-10T19:10:30Z" } } }) }));
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await getCommitTime("t", "o", "r", "abc")).toBe(Date.parse("2026-10-10T19:10:30Z"));
+    expect((fetchMock.mock.calls[0] as unknown as [string])[0]).toBe("https://api.github.com/repos/o/r/commits/abc");
+  });
+
+  it("throws on a non-ok response", async () => {
+    stub({ ok: false, status: 404, json: async () => ({}) });
+    await expect(getCommitTime("t", "o", "r", "abc")).rejects.toThrow(/404/);
+  });
+
+  it("throws on a missing or invalid date", async () => {
+    stub({ ok: true, json: async () => ({ commit: {} }) });
+    await expect(getCommitTime("t", "o", "r", "abc")).rejects.toThrow(/valid committer date/);
+    stub({ ok: true, json: async () => ({ commit: { committer: { date: "nope" } } }) });
+    await expect(getCommitTime("t", "o", "r", "abc")).rejects.toThrow(/valid committer date/);
+  });
+
+  it("throws on a fetch error", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("net"); }));
+    await expect(getCommitTime("t", "o", "r", "abc")).rejects.toThrow(/net/);
   });
 });

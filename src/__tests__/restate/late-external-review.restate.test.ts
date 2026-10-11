@@ -38,7 +38,8 @@ const scenarioOf = (id: string): Scenario => {
   return sc;
 };
 
-const pending: LateReviewTick = { open: true, headSha: SHA, checks: "pending", blockingCount: 0 };
+const COMMIT_MS = 1_000_000;
+const pending: LateReviewTick = { open: true, headSha: SHA, checks: "pending", headCommittedAtMs: COMMIT_MS, blockingLastSeenAtMs: [] };
 const passed: LateReviewTick = { ...pending, checks: "success" };
 
 function makeDeps(): LateExternalReviewDependencies {
@@ -120,9 +121,35 @@ describe("LateExternalReview workflow", () => {
         expect(sc.comments[0]).toContain(LATE_EXTERNAL_APPROVAL_MARKER);
       });
 
-      it("approves when only non-blocking findings are open (blockingCount counts blocking only)", async () => {
-        const { result } = await runScenario(url(), { ticks: [{ ...passed, blockingCount: 0 }] });
+      it("approves when no blocking finding is open", async () => {
+        const { result } = await runScenario(url(), { ticks: [passed] });
         expect(result.outcome).toBe("approved");
+      });
+
+      it("approves past a blocking finding last seen before the head's commit time", async () => {
+        const old = { ...passed, blockingLastSeenAtMs: [COMMIT_MS - 1] };
+        const { result, sc } = await runScenario(url(), { ticks: [{ ...pending, blockingLastSeenAtMs: [COMMIT_MS - 1] }, old] });
+        expect(result).toEqual({ outcome: "approved" });
+        expect(sc.stamps).toEqual([sc.jobId]);
+        expect(sc.comments).toHaveLength(1);
+      });
+
+      it("ends findings on a blocking finding last seen after the head's commit time", async () => {
+        const { result, sc } = await runScenario(url(), { ticks: [{ ...passed, blockingLastSeenAtMs: [COMMIT_MS + 1] }] });
+        expect(result).toEqual({ outcome: "findings" });
+        expect(sc.stamps).toEqual([]);
+      });
+
+      it("ends findings on a blocking finding last seen exactly at the commit time", async () => {
+        const { result } = await runScenario(url(), { ticks: [{ ...passed, blockingLastSeenAtMs: [COMMIT_MS] }] });
+        expect(result.outcome).toBe("findings");
+      });
+
+      it("ends findings when a finding absent at first is re-reported after the commit time", async () => {
+        const { result, sc } = await runScenario(url(), { ticks: [pending, { ...pending, blockingLastSeenAtMs: [COMMIT_MS + 5] }, passed] });
+        expect(result).toEqual({ outcome: "findings" });
+        expect(sc.stamps).toEqual([]);
+        expect(sc.comments).toEqual([]);
       });
 
       it("ends superseded when the head changes while waiting", async () => {
@@ -146,7 +173,7 @@ describe("LateExternalReview workflow", () => {
       });
 
       it("ends findings on an open blocking finding", async () => {
-        const { result, sc } = await runScenario(url(), { ticks: [{ ...passed, blockingCount: 1 }] });
+        const { result, sc } = await runScenario(url(), { ticks: [{ ...passed, blockingLastSeenAtMs: [COMMIT_MS + 1] }] });
         expect(result).toEqual({ outcome: "findings" });
         expect(sc.stamps).toEqual([]);
         expect(sc.comments).toEqual([]);
@@ -166,6 +193,15 @@ describe("LateExternalReview workflow", () => {
       });
     });
   }
+
+  it("approves on replay after a crash with an old blocking finding present", async () => {
+    const { result, sc } = await runScenario(retryEnv.baseUrl(), {
+      ticks: [{ ...passed, blockingLastSeenAtMs: [COMMIT_MS - 1] }], crashAfterComment: true,
+    });
+    expect(result).toEqual({ outcome: "approved" });
+    expect(sc.stamps).toEqual([sc.jobId]);
+    expect(sc.comments).toHaveLength(1);
+  });
 
   it("writes the mark once and posts one comment when the approve step crashes after the comment", async () => {
     const { result, sc } = await runScenario(retryEnv.baseUrl(), { crashAfterComment: true });

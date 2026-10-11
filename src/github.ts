@@ -1002,6 +1002,27 @@ export async function getCommitAuthorType(
   }
 }
 
+/**
+ * Returns the committer date of a commit as epoch milliseconds. Unlike `getCommitAuthorType`
+ * it throws on any failure (bad status, missing or invalid date, fetch error): a caller that
+ * compares against it must not read an unreadable commit as "nothing to compare".
+ */
+export async function getCommitTime(
+  token: string,
+  owner: string,
+  repo: string,
+  ref: string,
+): Promise<number> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}`;
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+  if (!res.ok) throw new Error(`getCommitTime: ${owner}/${repo}@${ref} returned ${res.status}`);
+  const data = (await res.json()) as { commit?: { committer?: { date?: unknown } | null } | null };
+  const date = data.commit?.committer?.date;
+  const ms = typeof date === "string" ? Date.parse(date) : NaN;
+  if (!Number.isFinite(ms)) throw new Error(`getCommitTime: ${owner}/${repo}@${ref} has no valid committer date`);
+  return ms;
+}
+
 // ---------- Feature-branch roll-up (merge-up) helpers ----------
 
 /**

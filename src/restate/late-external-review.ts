@@ -14,7 +14,7 @@ import * as restateClients from "@restatedev/restate-sdk-clients";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { AppConfig } from "../index.js";
-import { getCombinedChecksState, getPullRequestState, listPrComments, postPrComment } from "../github.js";
+import { getCombinedChecksState, getCommitTime, getPullRequestState, listPrComments, postPrComment } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { getJobByDispatchId, stampJobApproved } from "../log.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
@@ -54,8 +54,10 @@ export interface LateReviewTick {
   open: boolean;
   headSha: string | null;
   checks: "success" | "pending" | "failure";
-  /** Open findings with severity `blocking` in the orchestrator's ledger. */
-  blockingCount: number;
+  /** Committer time of the reviewed head, epoch ms; `null` when the head is not the reviewed one. */
+  headCommittedAtMs: number | null;
+  /** `last_seen_at` (epoch ms) of every open `blocking` finding in the orchestrator's ledger. */
+  blockingLastSeenAtMs: number[];
 }
 
 /** Plain functions, every one called inside `ctx.run`. */
@@ -95,7 +97,10 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
       const tick = await ctx.run(`read-${i}`, () => deps.readTick(input), { maxRetryAttempts: 5 });
       if (!tick.open || tick.headSha !== input.headSha) return end("superseded");
       if (tick.checks === "failure") return end("external-failed");
-      if (tick.blockingCount > 0) return end("findings");
+      // A finding last seen before the head was committed was not reported by a review of this head
+      // (a fix pass may have fixed it); one seen at or after the commit time blocks.
+      const commitMs = tick.headCommittedAtMs;
+      if (tick.blockingLastSeenAtMs.some((seen) => commitMs === null || seen >= commitMs)) return end("findings");
       if (tick.checks === "success") break;
       if ((await ctx.date.now()) - startedAt >= deadlineMs) return end("timed-out");
       await ctx.sleep(intervalMs);
@@ -142,13 +147,15 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
       if (!pr) throw new Error(`late-external-review: PR #${input.prNumber} unreadable`);
       const open = pr.state === "open";
       if (!open || pr.headSha !== input.headSha) {
-        return { open, headSha: pr.headSha, checks: "pending", blockingCount: 0 };
+        return { open, headSha: pr.headSha, checks: "pending", headCommittedAtMs: null, blockingLastSeenAtMs: [] };
       }
       const checks = await getCombinedChecksState(t, input.owner, input.repo, pr.headSha);
       // The ledger is keyed by "owner/repo" (see the review-fix queue in src/index.ts).
-      const blockingCount = listOpenReviewFindings(`${input.owner}/${input.repo}`, input.prNumber)
-        .filter((f) => f.severity === "blocking").length;
-      return { open, headSha: pr.headSha, checks, blockingCount };
+      const blockingLastSeenAtMs = listOpenReviewFindings(`${input.owner}/${input.repo}`, input.prNumber)
+        .filter((f) => f.severity === "blocking").map((f) => f.lastSeenAt);
+      // Throws on an unreadable commit, so the step retries rather than reading "no findings".
+      const headCommittedAtMs = await getCommitTime(t, input.owner, input.repo, pr.headSha);
+      return { open, headSha: pr.headSha, checks, headCommittedAtMs, blockingLastSeenAtMs };
     },
     findJob(dispatchId) {
       const job = getJobByDispatchId(dispatchId);

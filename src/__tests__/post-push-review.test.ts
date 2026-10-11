@@ -6708,6 +6708,41 @@ describe("postPushReviewStep review process gate", () => {
     expect(f.posted.join("\n")).toContain("old finding");
   });
 
+  describe("older-head external findings while the current head's check is running", () => {
+    const aiImplement = {
+      reviewProcess: "ai-implement",
+      reviewers: [{ id: "code-review", gates: true }],
+      trustedReviewerDefinitions: new Map([["code-review", { id: "code-review", buildPrompt: () => "p", outputSchema: { type: "object" } }]]),
+      maxIterations: 2,
+    };
+    const running: Run = { name: "review", app: "github-actions", status: "in_progress", conclusion: null };
+
+    it("ends external_review_pending on the new head and starts no fix pass", async () => {
+      const f = fixture({ runs: [running], threads: [thread("🔴 old finding", "oldsha")] });
+      const { out, invoke } = await run(f, aiImplement, { approved: true, findings: [] });
+      expect(out.approved).toBe(false);
+      expect(out.terminationReason).toBe("external_review_pending");
+      expect(out.reviewedHeadSha).toBe(SHA);
+      expect(invoke).toHaveBeenCalledTimes(1);
+      expect(f.posted.join("\n")).not.toContain("starting fix pass");
+    });
+
+    it("still starts a fix pass for an internal blocking issue", async () => {
+      const f = fixture({ runs: [running], threads: [thread("🔴 old finding", "oldsha")] });
+      const { out } = await run(f, aiImplement, { approved: false, findings: [{ severity: "blocking", body: "Null dereference in handler" }] });
+      expect(out.terminationReason).not.toBe("external_review_pending");
+      expect(f.posted.join("\n")).toContain("starting fix pass");
+    });
+
+    it("gates on the external finding once the current head's check completed", async () => {
+      const f = fixture({ runs: [actions("success")], threads: [thread("🔴 old finding", "oldsha")] });
+      const { out } = await run(f, aiImplement, { approved: true, findings: [] });
+      expect(out.approved).toBe(false);
+      expect(out.terminationReason).not.toBe("external_review_pending");
+      expect(f.posted.join("\n")).toContain("old finding");
+    });
+  });
+
   it("is no real verdict when the matched check failed", async () => {
     const { out } = await run(fixture({ runs: [actions("failure")] }));
     expect(out.approved).toBe(false);

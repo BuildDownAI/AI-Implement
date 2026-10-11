@@ -2295,12 +2295,18 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       // A finding the fix agent disposed as "follow-up" on an earlier iteration is dropped here,
       // before the merge-readiness decision and before it can reappear in the next fix prompt.
       // An "invalid" disposition is not filtered — it stays gating so the next review decides.
-      const gatingExternalFindings = gatingReviewFindings
+      const reportedGatingExternalFindings = gatingReviewFindings
         .filter((finding) => finding.source !== "ai-implement-internal")
         .filter((finding) => !deferredKeys.has(stableReviewFindingKey(finding)));
+      let issues = internalIssuesFromReviewLedger(gatingReviewFindings);
+      // While the external check on the current head is still running, the findings read above may
+      // belong to an older head (a fix pass may already have fixed them). They do not gate; the
+      // LateExternalReview workflow ignores findings the current head's review has not reported again.
+      // An unapproved internal verdict keeps them visible so a fix pass never runs with no feedback.
+      const gatingExternalFindings =
+        externalReviewPending && verdict.approved === true && issues.length === 0 ? [] : reportedGatingExternalFindings;
       const hasGatingExternalFindings = gatingExternalFindings.length > 0;
       const advisoryExternalFindings = advisoryReviewFindings;
-      let issues = internalIssuesFromReviewLedger(gatingReviewFindings);
       const externalReviewVerdictBlocks = (externalFindingsResult.verdictSource === "review-contract"
         && (externalFindingsResult.verdict === "changes_requested" || externalFindingsResult.verdict === "incomplete"))
         || processVerdict?.verdict === "changes_requested";
@@ -2309,7 +2315,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       );
 
       feedback = suppressDuplicateExternalFeedback(verdict.feedback, externalFindings);
-      if (gatingIncompleteReviews.length === 0 && issues.length === 0 && verdict.approved === false && gatingExternalFindings.length === 0 && !findingsUnavailable && !externalReviewVerdictBlocks) {
+      if (gatingIncompleteReviews.length === 0 && issues.length === 0 && verdict.approved === false && reportedGatingExternalFindings.length === 0 && !findingsUnavailable && !externalReviewVerdictBlocks) {
         terminationReason = "invalid_review";
         feedback = "Reviewer returned invalid structured review output: approved=false requires at least one blocking_issues[] entry.";
         await reportInvalidStructuredReview(reporter, ghSpawn, prNumber, iteration, feedback, reviewResult.telemetry);
