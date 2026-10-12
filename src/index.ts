@@ -3533,6 +3533,13 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         }
         continue;
       }
+      // The repository's auto-fix owns the PR: the ledger findings stay for LateExternalReview, nothing dispatches.
+      if (resolveReviewProcess(mapping.reviewProcess).fixer === "repository") {
+        updateReviewFixStatus(fix.id, "skipped");
+        console.log(`[review-fix] Project ${fix.repo} delegates fixes to the repository `
+          + `(${resolveReviewProcess(mapping.reviewProcess).id}), skipping review fix #${fix.id}`);
+        continue;
+      }
       if (mapping.ticketingProvider === "filesystem" && runnerMode !== "local") {
         console.warn(`[review-fix] Filesystem project ${scopeKey} requires local runner mode`);
         updateReviewFixStatus(fix.id, "skipped");

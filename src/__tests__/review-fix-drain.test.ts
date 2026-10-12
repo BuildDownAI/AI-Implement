@@ -289,6 +289,34 @@ describe("processReviewFixQueue — owner selection", () => {
   });
 });
 
+describe("processReviewFixQueue — repository fixer", () => {
+  function queueOne(): number {
+    return reviewFixQueue.enqueueReviewFix({ issueId: "issue-repo-fix", issueIdentifier: "AII-43",
+      repo: "acme/billing", prNumber: 43, reason: "review_feedback", sourceEventId: "event-repo-fix" });
+  }
+
+  it("skips the row and dispatches nothing when the process hands fixes to the repository", async () => {
+    configModule.upsertMapping("TEAM", makeMapping({ reviewProcess: "claude-code-review-repository-fix" }));
+    const queueId = queueOne();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    expect(reviewFixQueue.getPendingReviewFixes().map((i) => i.id)).not.toContain(queueId);
+    expect(logSpy.mock.calls.some(([m]) => typeof m === "string" && m.includes(`delegates fixes to the repository`) && m.includes(`#${queueId}`))).toBe(true);
+  });
+
+  it("still dispatches on the claude-code-review process", async () => {
+    configModule.upsertMapping("TEAM", makeMapping({ reviewProcess: "claude-code-review" }));
+    queueOne();
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("processReviewFixQueue — dispatch gate", () => {
   it("leaves a pending row untouched when its issue has an in-flight dispatch_log row", async () => {
     const mapping = makeMapping();

@@ -237,6 +237,14 @@ describe("LateExternalReview workflow", () => {
           expect(sc.comments).toEqual([]);
         });
 
+        it("ends timed-out with no mark when the new head's review check was skipped", async () => {
+          // readTick reads a `completed` + `skipped` review run as not done, so the tick stays pending.
+          const { result, sc } = await runScenario(url(), { ticks: [pending, onB] }, true);
+          expect(result).toEqual({ outcome: "timed-out" });
+          expect(sc.stamps).toEqual([]);
+          expect(sc.comments).toEqual([]);
+        });
+
         it("ends superseded with no mark when the PR closes while waiting", async () => {
           const { result, sc } = await runScenario(url(), { ticks: [pending, onB, { ...onB, open: false }] }, true);
           expect(result).toEqual({ outcome: "superseded" });
