@@ -25,6 +25,7 @@ import type { RefreshOutcome } from "../../kg-refresh.js";
 import { RailGateError, type KgRailDeps } from "../../kg-refresh-rail.js";
 import { COMPLETION_MARKER } from "../../kg-sidecar.js";
 import { createKgRefreshIngressClient, launchKeptMachine, type KeptMachineFly } from "../../restate/kg-refresh-production.js";
+import { GHA_RUN_PROFILE_DEFAULTS } from "../../restate/gha-run-profile.js";
 import { FLY_MACHINE_PROFILE_DEFAULTS, createFlyMachineProfile, mergeProfile, type FlyMachineProfileConfig, type KeptMachineState } from "../../restate/fly-machine-profile.js";
 import { createKgRepo, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
 import {
@@ -396,6 +397,23 @@ describe("KgRefresh durable workflow", () => {
     },
   });
 
+  // AII-1244: a counting stand-in for GhaRunProfile; the workflow reads it only on a GitHub Actions run.
+  let ghaProfileGets = 0;
+  const dispatchedTimeouts: Array<number | null> = [];
+  const ghaRunProfile = restate.object({
+    name: "GhaRunProfile",
+    handlers: {
+      get: restate.handlers.object.shared(async (ctx: restate.ObjectSharedContext) => {
+        ghaProfileGets++;
+        const stored = await ctx.get<{ jobTimeoutMinutes: number }>("profile");
+        return stored ? { config: stored, source: "profile" } : { config: { ...GHA_RUN_PROFILE_DEFAULTS["kg-refresh"] }, source: "default" };
+      }),
+      set: restate.handlers.object.exclusive(async (ctx: restate.ObjectContext, patch: { jobTimeoutMinutes: number }) => {
+        ctx.set("profile", patch);
+      }),
+    },
+  });
+
   /** The workflow dependency: the pending scenario's backend, keyed by dispatch id (which is the trigger id). */
   function resolveDispatchRecordFn(dispatchId: string): KgDispatchRecord {
     resolveExecutionModeCalls.push(dispatchId);
@@ -423,6 +441,7 @@ describe("KgRefresh durable workflow", () => {
     scenario.dispatchCalls++;
     dispatchedIds.push(input.dispatchId);
     dispatchedMachines.push(input.machine);
+    dispatchedTimeouts.push(input.jobTimeoutMinutes);
     dispatchedTokens.push(input.tokens);
     dispatchedNonces.push(input.machineNonce);
     dispatchTimes.set(triggerId, [...(dispatchTimes.get(triggerId) ?? []), Date.now()]);
@@ -610,9 +629,9 @@ describe("KgRefresh durable workflow", () => {
   let deadlineEnvs: Map<string, RestateEnvironment>;
   let bootstrapEnvs: Map<string, RestateEnvironment>;
   beforeAll(async () => {
-    envs = await startVariants([workflow, kgRepo, starter, flyMachineProfile]);
-    deadlineEnvs = await startVariants([deadlineWorkflow, kgRepo, starter, flyMachineProfile]);
-    bootstrapEnvs = await startVariants([bootstrapOnlyWorkflow, kgRepo, starter, flyMachineProfile]);
+    envs = await startVariants([workflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
+    deadlineEnvs = await startVariants([deadlineWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
+    bootstrapEnvs = await startVariants([bootstrapOnlyWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
   }, 120_000);
   afterAll(async () => {
     if (envs) await stopAll(envs);
@@ -1719,7 +1738,7 @@ describe("KgRefresh durable workflow", () => {
       totalDeadlineMs: scaledTick * 24,
       watchIntervalMs: scaledTick,
     });
-    const scaledEnv = await startRetryEnabled([scaledWorkflow, kgRepo, starter, flyMachineProfile]);
+    const scaledEnv = await startRetryEnabled([scaledWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
     try {
       const triggerId = newTriggerId();
       const runId = runIdCounter++;
@@ -1850,7 +1869,7 @@ describe("KgRefresh durable workflow", () => {
       totalDeadlineMs: 5_000,
       watchIntervalMs: 100,
     });
-    const cadenceEnv = await startRetryEnabled([cadenceWorkflow, kgRepo, starter, flyMachineProfile]);
+    const cadenceEnv = await startRetryEnabled([cadenceWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
     try {
       const triggerId = newTriggerId();
       makeScenario(triggerId, {
@@ -2250,6 +2269,44 @@ describe("KgRefresh durable workflow", () => {
       for (const m of seen) expect(m).toEqual({ ...defaults, cpus: 4, memoryMb: 8192 });
 
       await setProfile({ cpus: defaults.cpus, memoryMb: defaults.memoryMb });
+    },
+    60_000,
+  );
+
+  // ---- AII-1244: the GitHub Actions dispatch reads GhaRunProfile once, before the step ----
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1244: a GitHub Actions dispatch gets the stored jobTimeoutMinutes, a retried dispatch keeps the journaled one, and a Fly run reads no GHA profile (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const setGha = (patch: { jobTimeoutMinutes: number }) => callObject(env.baseUrl(), "GhaRunProfile", "kg-refresh", "set", patch);
+
+      const fly = newTriggerId();
+      makeScenario(fly, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      const flyDone = runWorkflow(env.baseUrl(), fly);
+      await eventually(() => scenarios.get(fly)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      expect(dispatchedTimeouts.at(-1)).toBeNull();
+      await callWorkflow(env.baseUrl(), "KgRefresh", fly, "report", SUCCESS_REPORT);
+      await flyDone;
+
+      await setGha({ jobTimeoutMinutes: 120 });
+      const gha = newTriggerId();
+      const retried = makeScenario(gha, { dispatchOutcome: "accepted", executionMode: "github-actions", runId: undefined });
+      const runId = runIdCounter++;
+      dispatchThrowAfterCommit.set(gha, runId);
+      const beforeGets = ghaProfileGets;
+      const beforeTimeouts = dispatchedTimeouts.length;
+      const done = runWorkflow(env.baseUrl(), gha);
+      await eventually(() => retried.dispatchCalls >= 1, (ok) => ok, { label: "durable effect" });
+      await setGha({ jobTimeoutMinutes: 300 }); // after the journaled read: a retry must not see it
+      await eventually(() => retried.runId === runId, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", gha, "report", SUCCESS_REPORT);
+      await done;
+      expect(ghaProfileGets - beforeGets).toBe(1);
+      const seen = dispatchedTimeouts.slice(beforeTimeouts);
+      expect(seen.length).toBeGreaterThanOrEqual(1);
+      for (const t of seen) expect(t).toBe(120);
+
+      await setGha({ jobTimeoutMinutes: GHA_RUN_PROFILE_DEFAULTS["kg-refresh"].jobTimeoutMinutes });
     },
     60_000,
   );
@@ -2818,7 +2875,7 @@ describe("KgRefresh durable workflow", () => {
   it("W18b: a workflow built with a ten-day retentionMs registers ten days", async () => {
     const tenDays = 10 * 24 * 60 * 60 * 1000;
     const tenDayWorkflow = createKgRefreshWorkflow({ ...workflowDeps, retentionMs: tenDays, bootstrapDeadlineMs: 30_000, totalDeadlineMs: 60_000 });
-    const tenDayEnv = await startRetryEnabled([tenDayWorkflow, kgRepo, starter, flyMachineProfile]);
+    const tenDayEnv = await startRetryEnabled([tenDayWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
     try {
       const triggerId = newTriggerId();
       makeScenario(triggerId, { dispatchOutcome: "rejected", executionMode: "fly-machines" });
@@ -2902,7 +2959,7 @@ describe("KgRefresh durable workflow", () => {
     const crashWorkflow = buildCrashWorkflow("original");
     const replacementWorkflow = buildCrashWorkflow("replacement");
 
-    const env = await startRetryEnabled([crashWorkflow, kgRepo, flyMachineProfile]);
+    const env = await startRetryEnabled([crashWorkflow, kgRepo, flyMachineProfile, ghaRunProfile]);
     let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
     try {
       // Dispatches through the real KgRepo.trigger (not a direct KgRefresh.run call) so the
@@ -2920,7 +2977,7 @@ describe("KgRefresh durable workflow", () => {
       const stagingMarker = join(dataRoot, "staging", COMPLETION_MARKER);
       await eventually(() => existsSync(stagingMarker) && stageCommittedAttempts.length >= 1, (ok) => ok, { label: "durable effect", timeoutMs: 12_000 });
 
-      replacement = await replaceEndpoint(env, [replacementWorkflow, kgRepo, flyMachineProfile]);
+      replacement = await replaceEndpoint(env, [replacementWorkflow, kgRepo, flyMachineProfile, ghaRunProfile]);
       await env.startedRestateServer.restart();
 
       // The restart severs the blocked first attempt's connection; Restate retries the

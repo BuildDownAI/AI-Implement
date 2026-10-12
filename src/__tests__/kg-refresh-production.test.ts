@@ -144,6 +144,7 @@ const dispatchInput = {
   tokens: { runToken: "rt", progressToken: "pt", publicationToken: "pub" },
   dispatchId: "d-workflow",
   machineId: null,
+  jobTimeoutMinutes: 240 as number | null,
   machineNonce: null as string | null,
   /** What the workflow's `reserve` step resolved; the tests steer it through `resolvedPath`. */
   get executionMode() { return resolvedPath.current; },
@@ -158,7 +159,7 @@ beforeEach(() => {
 describe("createProductionKgRefreshServices", () => {
   it("returns the KgRepo and KgRefresh services and the nine tool deps", () => {
     const { services, toolDeps } = createProductionKgRefreshServices(makeInput());
-    expect(services.map((s) => s.name)).toEqual(["KgRepo", "FlyMachineProfile", "KgRefresh"]);
+    expect(services.map((s) => s.name)).toEqual(["KgRepo", "FlyMachineProfile", "GhaRunProfile", "KgRefresh"]);
     expect(Object.keys(toolDeps).sort()).toEqual([
       "callbackConfigured", "freeBytes", "isDeployHeld", "kgSourceRepo", "mappingExists",
       "persistPreflightFailure", "readServedStamp", "readStatusRecord", "runPreflight",

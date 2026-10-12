@@ -37,6 +37,7 @@ import {
   verifyGate,
 } from "../kg-refresh-rail.js";
 import { FlyMachineProfile, type FlyMachineProfileConfig } from "./fly-machine-profile.js";
+import { GhaRunProfile } from "./gha-run-profile.js";
 import type { BackendRunRead } from "../backend-run.js";
 import type { MachineExit } from "../fly-machines.js";
 import { parseKgSourceRepo } from "../deploy.js";
@@ -104,6 +105,8 @@ export interface KgDispatchInput {
   dispatchId: string;
   /** The Fly machine size for this run, read once from `FlyMachineProfile/kg-refresh` before the dispatch step. */
   machine: FlyMachineProfileConfig;
+  /** The GitHub Actions job timeout, read once from `GhaRunProfile/kg-refresh` before the dispatch step; null off GitHub Actions. */
+  jobTimeoutMinutes: number | null;
   /** The pipeline's kept Fly machine from `FlyMachineProfile.claim`; null when none is kept. */
   machineId: string | null;
   /** The backend the `resolve` step journaled; the dispatch acts on it and does not resolve again. */
@@ -371,6 +374,13 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       const profile = await ctx.objectClient(FlyMachineProfile, "kg-refresh").get();
       if (!profile) throw new restate.TerminalError("no FlyMachineProfile default exists for kg-refresh", { errorCode: 500 });
       const machine = profile.config;
+      // Journaled like the Fly read: a replay after a later `set` keeps this run's timeout. Only a GitHub Actions run needs it.
+      let jobTimeoutMinutes: number | null = null;
+      if (executionMode === GHA_EXECUTION_MODE) {
+        const ghaProfile = await ctx.objectClient(GhaRunProfile, "kg-refresh").get();
+        if (!ghaProfile) throw new restate.TerminalError("no GhaRunProfile default exists for kg-refresh", { errorCode: 500 });
+        jobTimeoutMinutes = ghaProfile.config.jobTimeoutMinutes;
+      }
       // The resume path that raises this is AII-1032's; the claim, the step names and `attach` carry it.
       const attempt = 1;
       // A journaled call: a replay reuses the claim. The Fly write stays in the dispatch step, which holds the run's tokens.
@@ -394,7 +404,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           }
           minted ??= deps.mintRunTokens({ dispatchId, ttlSeconds });
           const machineNonce = executionMode === GHA_EXECUTION_MODE ? null : deps.deriveMachineNonce(dispatchId, attempt);
-          const result = await deps.dispatch({ envelope, tokens: minted, dispatchId, machine, machineId: claim.machineId, executionMode, machineNonce });
+          const result = await deps.dispatch({ envelope, tokens: minted, dispatchId, machine, jobTimeoutMinutes, machineId: claim.machineId, executionMode, machineNonce });
           return {
             outcome: result.outcome, runId: result.runId, runUrl: result.runUrl,
             jobId: result.jobId, executionMode: result.executionMode,
