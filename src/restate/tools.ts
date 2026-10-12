@@ -38,6 +38,7 @@ import { readKgSourceRepo } from "../deploy.js";
 import { runKgRefreshPreflight, MIN_FREE_BYTES, type KgRefreshStage, type KgRefreshStatus } from "../kg-refresh.js";
 import type { StepStatus } from "../pipeline/types.js";
 import { FlyMachineProfile } from "./fly-machine-profile.js";
+import { RunnerBackend } from "./runner-backend.js";
 import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { getOrchestratorSettings, getFlySessionsConfig, getLinearPickupLabel } from "../orchestrator-settings.js";
@@ -1074,6 +1075,51 @@ export const setFlyMachineProfileTool = tool(
   },
 );
 
+export const SET_RUNNER_BACKEND_DESCRIPTION =
+  "Set a runner backend's deployment-wide settings (admin role): backend (fly-machines, github-actions) and patch. fly-machines takes app and region (a string or null); github-actions takes no fields. Given fields merge into the stored state; an unknown backend or field is refused with 400. No secret is accepted. Returns the stored state.";
+
+export const setRunnerBackendTool = tool(
+  {
+    description: SET_RUNNER_BACKEND_DESCRIPTION,
+    input: z.object({
+      backend: z.string().describe("The backend whose settings to set: fly-machines or github-actions"),
+      patch: z.record(z.string(), z.unknown()).describe("Fields to merge, e.g. { app, region } for fly-machines"),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
+    const { backend, patch } = input.args;
+    try {
+      return reply(await ctx.objectClient(RunnerBackend, backend).set(patch));
+    } catch (err) {
+      if (err instanceof restate.TerminalError && err.code === 400) return reply({ status: 400, body: { error: err.message } });
+      throw err;
+    }
+  },
+);
+
+export const GET_RUNNER_BACKEND_DESCRIPTION =
+  "Returns a runner backend's deployment-wide settings (fly-machines: app, region), or null when none were stored yet.";
+
+export const getRunnerBackendTool = tool(
+  {
+    description: GET_RUNNER_BACKEND_DESCRIPTION,
+    input: z.object({ backend: z.string().describe("The backend to read: fly-machines or github-actions") }),
+    role: "user",
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
+    try {
+      return reply(await ctx.objectClient(RunnerBackend, input.args.backend).get());
+    } catch (err) {
+      if (err instanceof restate.TerminalError && err.code === 400) return reply({ status: 400, body: { error: err.message } });
+      throw err;
+    }
+  },
+);
+
 export const PAUSE_PROJECT_DESCRIPTION =
   "Pause or resume a project mapping (admin role). Same as the paused update of PATCH /api/mappings/<teamKey>.";
 
@@ -1308,6 +1354,8 @@ export const orchestratorTools = restate.service({
     trigger_kg_refresh: triggerKgRefreshTool,
     set_runner_mode: setRunnerModeTool,
     set_fly_machine_profile: setFlyMachineProfileTool,
+    set_runner_backend: setRunnerBackendTool,
+    get_runner_backend: getRunnerBackendTool,
     pause_project: pauseProjectTool,
     add_project: addProjectTool,
     trigger_workflow_sync: triggerWorkflowSyncTool,

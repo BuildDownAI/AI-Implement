@@ -73,7 +73,7 @@ import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable 
 import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
-import { getOrchestratorSettings, getFlySessionsConfig, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, getRetryPolicy } from "./orchestrator-settings.js";
+import { getOrchestratorSettings, getFlySessionsConfig, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, getRetryPolicy, seedRunnerBackends, refreshRunnerBackendCache } from "./orchestrator-settings.js";
 import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
@@ -421,6 +421,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   const timeoutMs = config.pollCycleTimeoutMs;
 
+  await refreshRunnerBackendCache();
   await runWithDeadline(
     cycleId,
     started,
@@ -5119,6 +5120,8 @@ async function main(): Promise<void> {
     onRegistered: async () => {
       sweepOnRegistered(config);
       await seedFlyMachineProfileFromOverride();
+      await seedRunnerBackends();
+      await refreshRunnerBackendCache();
     },
   });
   // A sidecar which becomes ready after its initial timeout still registers the
