@@ -889,38 +889,27 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect(fixture.commentPosts).toBe(0);
   }, 25_000);
 
-  // A RestateEnvironment exposes no virtual-clock or
-  // timer-control API (confirmed: no clock/time symbol anywhere in its type
-  // declarations) — ctx.date.now()/ctx.sleep inside the workflow are real wall-clock
-  // time against the real `restate-server` binary, so there is no seam the harness could add
-  // to fast-forward past the deadline without a real wait. What the harness *can* make
-  // deterministic is the deadline's absolute size (SUCCESS_NO_RESULT_JOB_TIMEOUT_MINUTES,
-  // above) and an explicit "not yet" checkpoint partway through that window read
-  // directly off the durable SQLite row — recordOutcome/recordResult are the only
-  // writers of terminal_outcome_json/accepted_result_json, and neither runs until the
-  // deadline path fires, so a null read here is real proof of "not yet approved", not a
-  // timing assumption about the workflow's internal scheduling.
-  it.each(VARIANTS.map(([label]) => label))("GitHub success without a stored result never approves and stops without approval at the deadline (%s)", async (label) => {
+  // GitHub reports the run completed but no result is ever delivered. The attempt's status
+  // read sees `ended` on its first tick, so it finalizes without approval and releases the
+  // slot long before the (large) deadline (AII-1273).
+  it.each(VARIANTS.map(([label]) => label))("GitHub success without a stored result never approves and releases when the run ends (%s)", async (label) => {
     const env = envFor(label);
     const fixture = freshScenario("success-no-result");
     fixture.jobTimeoutMinutes = SUCCESS_NO_RESULT_JOB_TIMEOUT_MINUTES;
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
     await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
-    // No "result" is ever delivered for this attempt. Check well before the deadline
-    // that GitHub's success has not been turned into an approval or a terminal outcome.
-    await settle(1_000);
-    const midFlight = getDb().prepare(
-      `SELECT terminal_outcome_json, accepted_result_json FROM review_fix_attempts WHERE attempt_id = ?`,
-    ).get(fixture.attemptId!) as { terminal_outcome_json: string | null; accepted_result_json: string | null };
-    expect(midFlight.terminal_outcome_json).toBeNull();
-    expect(midFlight.accepted_result_json).toBeNull();
-    const midAdmission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
-      .get(fixture.attemptId!) as { released_at: number | null };
-    expect(midAdmission.released_at).toBeNull(); // still occupied — no stop-without-approval yet either
-
+    // No "result" is ever delivered for this attempt. GitHub's success must never become an
+    // approval, but the run having ended releases the slot at once (AII-1273) rather than at
+    // the deadline.
     const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!);
     expect(done).toEqual({ status: "finalized", terminal: { status: "succeeded", outputCommit: fixture.headSha }, approval: "not_applicable" });
+    const admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
+      .get(fixture.attemptId!) as { released_at: number | null };
+    expect(admission.released_at).not.toBeNull();
+    const stored = getDb().prepare(`SELECT accepted_result_json FROM review_fix_attempts WHERE attempt_id = ?`)
+      .get(fixture.attemptId!) as { accepted_result_json: string | null };
+    expect(stored.accepted_result_json).toBeNull();
     expect(fixture.commentPosts).toBe(0);
   }, 20_000);
 
