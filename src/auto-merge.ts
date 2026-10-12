@@ -34,35 +34,26 @@ export function isGroupingBranch(base: string): boolean {
   return base.startsWith("ai-implement/feature/") || base.startsWith("ai-implement/multi-issue/");
 }
 
+/**
+ * Merge approved child PRs into grouping branches (feature/multi-issue). A mapping is
+ * processed only when its `autoMerge` setting is on and it is not paused; a child merges
+ * only then, and only when its run left the approval mark. With the setting off, approved
+ * children are left for a person to merge. The top-of-tree feature→base PR still requires
+ * human review.
+ */
 export async function runAutoMerges(mappings: RepoMapping[], deps: AutoMergeDeps): Promise<void> {
   const seen = new Set<string>();
-  for (const mapping of mappings) {
-    if (!mapping.autoMerge || mapping.paused) continue;
-    const repoKey = `${mapping.owner}/${mapping.repo}`;
-    if (seen.has(repoKey)) continue;
-    seen.add(repoKey);
-    try {
-      await autoMergeRepo(mapping, deps);
-    } catch (err) {
-      console.error(`[auto-merge] Failed for ${repoKey}:`, err);
-    }
-  }
-}
-
-/**
- * Merge approved child PRs into grouping branches (feature/multi-issue) for all non-paused
- * mappings, regardless of the mapping's `autoMerge` setting. The top-of-tree feature→base PR
- * still requires human review.
- *
- * Unlike `runAutoMerges` this is unconditional — it runs every poll for cascade self-healing
- * so that a reopened parent's approved children merge without requiring per-project opt-in.
- * (AII-349 reopen re-arm.)
- */
-export async function runGroupingBranchAutoMerge(mappings: RepoMapping[], deps: AutoMergeDeps): Promise<void> {
-  const seen = new Set<string>();
+  const offLogged = new Set<string>();
   for (const mapping of mappings) {
     if (mapping.paused) continue;
     const repoKey = `${mapping.owner}/${mapping.repo}`;
+    if (!mapping.autoMerge) {
+      if (!offLogged.has(repoKey)) {
+        offLogged.add(repoKey);
+        console.log(`[auto-merge] Skipping ${repoKey}: Auto-merge setting is off — approved child PRs are left for a person to merge`);
+      }
+      continue;
+    }
     if (seen.has(repoKey)) continue;
     seen.add(repoKey);
     try {

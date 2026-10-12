@@ -222,32 +222,43 @@ describe("runAutoMerges", () => {
   });
 });
 
-describe("runGroupingBranchAutoMerge (AII-349 cascade self-healing)", () => {
-  it("merges into grouping branches even when mapping.autoMerge is false", async () => {
+describe("runAutoMerges honours the Auto-merge setting", () => {
+  it("does not merge or list PRs when autoMerge is false, and logs why", async () => {
     const id = log.appendLog({ issueId: "issue-aii-300", issueIdentifier: "AII-300", executionMode: "github-actions" });
     log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/o/r/pull/5");
-
     vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
-    await autoMerge.runGroupingBranchAutoMerge([mapping({ autoMerge: false })], deps());
-    expect(vi.mocked(mergePullRequest)).toHaveBeenCalledWith(
-      "tok", "BuildDownAI", "AI-Implement", 5, "sha5", "merge",
-    );
+    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await autoMerge.runAutoMerges([mapping({ autoMerge: false })], deps());
+    expect(vi.mocked(listOpenPullRequests)).not.toHaveBeenCalled();
+    expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
+    expect(spy.mock.calls.some(c => String(c[0]).includes("[auto-merge]") && String(c[0]).includes("BuildDownAI/AI-Implement") && String(c[0]).includes("Auto-merge setting is off"))).toBe(true);
+    spy.mockRestore();
   });
 
-  it("still skips paused mappings", async () => {
-    await autoMerge.runGroupingBranchAutoMerge([mapping({ paused: true })], deps());
-    expect(vi.mocked(listOpenPullRequests)).not.toHaveBeenCalled();
+  it("does not log the setting-off message for a paused mapping", async () => {
+    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await autoMerge.runAutoMerges([mapping({ autoMerge: false, paused: true })], deps());
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it("an autoMerge:false mapping does not block a later autoMerge:true mapping for the same repo", async () => {
+    vi.mocked(listOpenPullRequests).mockResolvedValue([]);
+    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await autoMerge.runAutoMerges([mapping({ autoMerge: false }), mapping({ autoMerge: true })], deps());
+    spy.mockRestore();
+    expect(vi.mocked(listOpenPullRequests)).toHaveBeenCalledTimes(1);
   });
 
   it("deduplicates by owner/repo — calls listOpenPullRequests once per repo", async () => {
     vi.mocked(listOpenPullRequests).mockResolvedValue([]);
-    await autoMerge.runGroupingBranchAutoMerge([mapping(), mapping()], deps());
+    await autoMerge.runAutoMerges([mapping(), mapping()], deps());
     expect(vi.mocked(listOpenPullRequests)).toHaveBeenCalledTimes(1);
   });
 
-  it("still only merges into grouping branches, never the default branch", async () => {
+  it("only merges into grouping branches, never the default branch", async () => {
     vi.mocked(listOpenPullRequests).mockResolvedValue([pr({ base: "main" })]);
-    await autoMerge.runGroupingBranchAutoMerge([mapping({ autoMerge: false, defaultBranch: "main" })], deps());
+    await autoMerge.runAutoMerges([mapping({ defaultBranch: "main" })], deps());
     expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
   });
 });
@@ -364,7 +375,7 @@ describe("approval gate (AII-460) — run record verdict replaces hasInFlightJob
 
     vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    await autoMerge.runGroupingBranchAutoMerge([mapping()], deps());
+    await autoMerge.runAutoMerges([mapping()], deps());
     expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
     expect(logSpy.mock.calls.some((c) => String(c[0]).includes("in flight"))).toBe(true);
     logSpy.mockRestore();
@@ -376,7 +387,7 @@ describe("approval gate (AII-460) — run record verdict replaces hasInFlightJob
 
     vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    await autoMerge.runGroupingBranchAutoMerge([mapping()], deps());
+    await autoMerge.runAutoMerges([mapping()], deps());
     expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
     expect(logSpy.mock.calls.some((c) => String(c[0]).includes("no approval mark"))).toBe(true);
     logSpy.mockRestore();
@@ -387,7 +398,7 @@ describe("approval gate (AII-460) — run record verdict replaces hasInFlightJob
     log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/o/r/pull/5");
 
     vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
-    await autoMerge.runGroupingBranchAutoMerge([mapping()], deps());
+    await autoMerge.runAutoMerges([mapping()], deps());
     expect(vi.mocked(mergePullRequest)).toHaveBeenCalledWith(
       "tok", "BuildDownAI", "AI-Implement", 5, "sha5", "merge",
     );
@@ -396,7 +407,7 @@ describe("approval gate (AII-460) — run record verdict replaces hasInFlightJob
   it("holds (no merge) when no run record exists for the issue", async () => {
     vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    await autoMerge.runGroupingBranchAutoMerge([mapping()], deps());
+    await autoMerge.runAutoMerges([mapping()], deps());
     expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
     expect(logSpy.mock.calls.some((c) => String(c[0]).includes("no approval mark"))).toBe(true);
     logSpy.mockRestore();
@@ -405,7 +416,7 @@ describe("approval gate (AII-460) — run record verdict replaces hasInFlightJob
   it("holds when PR title has no parseable issue key", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     vi.mocked(listOpenPullRequests).mockResolvedValue([pr({ title: "Refactor something" })]);
-    await autoMerge.runGroupingBranchAutoMerge([mapping()], deps());
+    await autoMerge.runAutoMerges([mapping()], deps());
     expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
     expect(logSpy.mock.calls.some((c) => String(c[0]).includes("no issue key"))).toBe(true);
     logSpy.mockRestore();
@@ -436,7 +447,7 @@ describe("approval gate (AII-460) — run record verdict replaces hasInFlightJob
       pr({ number: 5, headSha: "sha5", base: "ai-implement/feature/aii-200-feat", title: "AII-300: Add thing" }),
       pr({ number: 6, url: "https://github.com/o/r/pull/6", headSha: "sha6", base: "ai-implement/feature/aii-201-feat", title: "AII-301: Other thing" }),
     ]);
-    await autoMerge.runGroupingBranchAutoMerge([mapping()], deps());
+    await autoMerge.runAutoMerges([mapping()], deps());
     expect(vi.mocked(mergePullRequest)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(mergePullRequest)).toHaveBeenCalledWith(
       "tok", "BuildDownAI", "AI-Implement", 6, "sha6", "merge",

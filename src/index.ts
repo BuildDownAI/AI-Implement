@@ -113,7 +113,7 @@ import { type RunConfigV1, encodeRunConfig, buildImplRunConfig } from "./run-con
 import { resolveBaseBranch, findOpenRollUpPr, resolvePlanningBranch } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
-import { runGroupingBranchAutoMerge } from "./auto-merge.js";
+import { runAutoMerges } from "./auto-merge.js";
 import { getPendingReviewFixes, listReviewFixEvents, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, acceptReviewFixWebhookEvent, buildReviewFixTaskDescription, MAX_TASK_FINDINGS } from "./review-fix-queue.js";
 import { initReviewFixEvidenceTable, sweepExpiredReviewFixEvidence } from "./review-fix-evidence.js";
 import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
@@ -594,12 +594,12 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     }
 
     // Merge approved child PRs into grouping branches (cascade self-healing). Runs for all
-    // non-paused projects — the top-of-tree feature→base PR still requires human review.
-    // (AII-349: always-on so a reopened parent's approved children merge without per-project opt-in.)
+    // non-paused projects whose Auto-merge setting is on (runAutoMerges checks the flag); a project
+    // with it off leaves approved children for a person. The top-of-tree feature→base PR still requires human review.
     try {
       const nonPausedMappings = Object.values(teamRepoMap);
       if (nonPausedMappings.length > 0) {
-        await runGroupingBranchAutoMerge(nonPausedMappings, {
+        await runAutoMerges(nonPausedMappings, {
           githubAppId: config.githubAppId,
           githubAppPrivateKey: config.githubAppPrivateKey,
           notify: config.notifyWebhookUrl
