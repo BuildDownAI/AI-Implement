@@ -24,6 +24,9 @@ import type { CreateMachineOpts, Machine, MachineExit } from "../../fly-machines
 import type { RefreshOutcome } from "../../kg-refresh.js";
 import { RailGateError, type KgRailDeps } from "../../kg-refresh-rail.js";
 import { COMPLETION_MARKER } from "../../kg-sidecar.js";
+import { orchestratorTools, setKgRefreshToolDeps } from "../../restate/tools.js";
+import type { KgRefreshToolDeps } from "../../restate/kg-refresh-production.js";
+import { callToolAsSystem } from "../../restate/tools-client.js";
 import { createKgRefreshIngressClient, launchKeptMachine, type KeptMachineFly } from "../../restate/kg-refresh-production.js";
 import { FLY_MACHINE_PROFILE_DEFAULTS, createFlyMachineProfile, mergeProfile, type FlyMachineProfileConfig, type KeptMachineState } from "../../restate/fly-machine-profile.js";
 import { createKgRepo, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
@@ -3186,10 +3189,12 @@ describe("KgRefresh durable workflow", () => {
     let heldEnvs: Map<string, RestateEnvironment>;
     let shortHeldEnvs: Map<string, RestateEnvironment>;
     beforeAll(async () => {
-      heldEnvs = await startVariants([heldWorkflow, kgRepo, starter, flyMachineProfile]);
+      heldEnvs = await startVariants([heldWorkflow, kgRepo, starter, flyMachineProfile, orchestratorTools]);
+      setKgRefreshToolDeps({ kgSourceRepo: KG_SOURCE_REPO } as unknown as KgRefreshToolDeps);
       shortHeldEnvs = await startVariants([shortHeldWorkflow, kgRepo, starter, flyMachineProfile]);
     }, 120_000);
     afterAll(async () => {
+      setKgRefreshToolDeps(null);
       await stopAll(heldEnvs);
       await stopAll(shortHeldEnvs);
     });
@@ -3236,6 +3241,46 @@ describe("KgRefresh durable workflow", () => {
 
         await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "cleanup@example.com" });
         await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+      },
+      60_000,
+    );
+
+    const decideTool = async (env: RestateEnvironment, action: string) => {
+      const result = await callToolAsSystem("decide_kg_refresh", { action }, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true });
+      if (result.status !== "ok") throw new Error("decide_kg_refresh unavailable");
+      return { isError: result.isError === true, text: result.content[0].text };
+    };
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "contract: KgRefresh.decide — the real decide_kg_refresh tool decides a run held at the gate, the workflow merges, and a second decision is already-decided (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env);
+        const first = await decideTool(env, "accept");
+        expect(first.isError).toBe(false);
+        expect(JSON.parse(first.text)).toEqual({ decided: "accept" });
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        expect(outcome.ok).toBe(true);
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
+        await closeRowFor(triggerId);
+      },
+      60_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "decide_kg_refresh cancel at the gate closes the held PR without a merge, and with no run in flight answers no-refresh-in-flight (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env);
+        const answer = await decideTool(env, "cancel");
+        expect(JSON.parse(answer.text)).toEqual({ decided: "cancel" });
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
+        await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "marker cleared" });
+        expect(await decideTool(env, "accept")).toEqual({ isError: true, text: "no-refresh-in-flight" });
+        await closeRowFor(triggerId);
       },
       60_000,
     );

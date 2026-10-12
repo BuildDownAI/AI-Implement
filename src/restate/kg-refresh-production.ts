@@ -40,6 +40,7 @@ import {
   type KgDispatchRecord,
   type KgDispatchResult,
   type KgDispatchRowDetails,
+  type KgRefreshDecideInput,
   type KgRefreshReportBody,
   type KgRefreshStatusResult,
   type KgRefreshWorkflowDependencies,
@@ -496,7 +497,7 @@ export function buildFlyMachineProfileDeps(): FlyMachineProfileDeps {
 /** `accepted` carries the handler's JSON result when it returned one (an empty 2xx body has none). */
 export type KgIngressResult<T = undefined> =
   | { readonly status: "accepted"; readonly value?: T }
-  | { readonly status: "conflict" }
+  | { readonly status: "conflict"; readonly error?: string }
   | { readonly status: "not-found" }
   | { readonly status: "unavailable" };
 
@@ -504,6 +505,8 @@ export interface KgRefreshIngressClient {
   report(triggerId: string, body: KgRefreshReportBody, opts?: { idempotencyKey?: string }): Promise<KgIngressResult<{ status: "accepted" | "duplicate" }>>;
   progress(triggerId: string, step?: Step): Promise<KgIngressResult>;
   cancel(triggerId: string, reason: string): Promise<KgIngressResult>;
+  /** The operator's gate decision; `conflict` carries the handler's text (`no-decision-open` or `already-decided`). */
+  decide(triggerId: string, input: KgRefreshDecideInput): Promise<KgIngressResult>;
   status(triggerId: string): Promise<KgIngressResult<KgRefreshStatusResult>>;
   repoStatus(slug: string): Promise<KgIngressResult<{ triggerId: string; startedAt: number } | null>>;
   /** Hands a PR-check dry-run to the `KgRepo` object: it runs now (`{ triggerId }`) or is held (`{ queued }`). */
@@ -525,6 +528,17 @@ export interface KgRefreshIngressClientDeps {
 
 const INGRESS_TIMEOUT_MS = 10_000;
 
+/** The handler's `TerminalError` text: the ingress answers `{ code, message }`, which `HttpCallError.message` wraps. */
+function handlerErrorText(err: InstanceType<typeof restateClients.HttpCallError>): string {
+  try {
+    const parsed = JSON.parse(err.responseText) as { message?: unknown };
+    if (typeof parsed.message === "string" && parsed.message) return parsed.message;
+  } catch {
+    // Not JSON: fall back to the raw text.
+  }
+  return err.responseText || err.message;
+}
+
 /** Real client for the Restate ingress, on the SDK's typed client. Never throws: a connection error or timeout resolves `unavailable`. */
 export function createKgRefreshIngressClient(
   baseUrl: string = RESTATE_INGRESS_BASE_URL,
@@ -540,7 +554,7 @@ export function createKgRefreshIngressClient(
   /** 404 is `not-found` for the workflow only; 409 is `conflict` where the caller asked for it. */
   async function invoke<T = undefined>(
     call: () => PromiseLike<unknown>,
-    statuses: { notFound?: boolean; conflict?: boolean } = {},
+    statuses: { notFound?: boolean; conflict?: boolean; conflictText?: boolean } = {},
   ): Promise<KgIngressResult<T>> {
     try {
       const value = await call();
@@ -549,7 +563,7 @@ export function createKgRefreshIngressClient(
     } catch (err) {
       if (err instanceof restateClients.HttpCallError) {
         if (statuses.notFound && err.status === 404) return { status: "not-found" };
-        if (statuses.conflict && err.status === 409) return { status: "conflict" };
+        if (statuses.conflict && err.status === 409) return statuses.conflictText ? { status: "conflict", error: handlerErrorText(err) } : { status: "conflict" };
       }
       return { status: "unavailable" };
     }
@@ -560,6 +574,7 @@ export function createKgRefreshIngressClient(
       invoke<{ status: "accepted" | "duplicate" }>(() => refresh(triggerId).report(body, callOpts(opts?.idempotencyKey)), { notFound: true, conflict: true }),
     progress: (triggerId, step) => invoke(() => refresh(triggerId).progress(step ? { step } : {}, callOpts()), { notFound: true }),
     cancel: (triggerId, reason) => invoke(() => refresh(triggerId).cancel({ reason }, callOpts()), { notFound: true }),
+    decide: (triggerId, input) => invoke(() => refresh(triggerId).decide(input, callOpts()), { notFound: true, conflict: true, conflictText: true }),
     status: (triggerId) => invoke<KgRefreshStatusResult>(() => refresh(triggerId).status(callOpts()), { notFound: true }),
     repoStatus: (slug) => invoke<{ triggerId: string; startedAt: number } | null>(() => repo(slug).status(callOpts())),
     enqueueDryRun: (slug, entry, opts) =>
