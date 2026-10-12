@@ -176,14 +176,14 @@ describe("ReviewFixAttempt durable workflow", () => {
     const done = callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,
       "run", { attemptId: fake.prepared.attemptId });
     await eventually(() => fake.bound, Boolean, { label: "fake.bound" });
-    fake.terminal = { status: "succeeded", outputCommit: SHA };
     expect(await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId, "result", resultOf(fake)))
       .toEqual({ status: "stored", result: resultOf(fake) });
+    fake.terminal = { status: "succeeded", outputCommit: SHA };
     expect(await done).toEqual({ status: "finalized", terminal: fake.terminal, approval: "applied" });
     expect([fake.launchEffects, fake.approvalEffects, fake.releaseEffects, fake.occupied]).toEqual([1, 1, 1, false]);
   }, 20_000);
 
-  it.each(VARIANTS.map(([label]) => label))("success without a valid result waits to deadline and never approves (%s)", async (label) => {
+  it.each(VARIANTS.map(([label]) => label))("success without a valid result never approves (%s)", async (label) => {
     const fake = newFake("accepted", 2_500);
     fake.terminal = { status: "succeeded", outputCommit: SHA };
     attempts.set(fake.prepared.attemptId, fake);
@@ -191,6 +191,23 @@ describe("ReviewFixAttempt durable workflow", () => {
       fake.prepared.attemptId, "run", { attemptId: fake.prepared.attemptId });
     expect(done).toEqual({ status: "finalized", terminal: fake.terminal, approval: "not_applicable" });
     expect([fake.approvalEffects, fake.releaseEffects]).toEqual([0, 1]);
+  }, 20_000);
+
+  it.each(VARIANTS.map(([label]) => label))("releases at once when the run ends without a result (%s)", async (label) => {
+    // Deadline far away: only the status read can end the wait. The binding gate holds the
+    // attempt until the backend reports terminal, so the first status read sees `ended`.
+    const fake = newFake("accepted", 10 * 60_000);
+    fake.holdBinding = gate("execution binding");
+    attempts.set(fake.prepared.attemptId, fake);
+    const env = envFor(label);
+    const done = callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,
+      "run", { attemptId: fake.prepared.attemptId });
+    await eventually(() => fake.launchEffects === 1, Boolean, { label: "fake.launchEffects === 1" });
+    expect(fake.occupied).toBe(true);
+    fake.terminal = { status: "succeeded", outputCommit: SHA };
+    fake.holdBinding.release();
+    expect(await done).toEqual({ status: "finalized", terminal: fake.terminal, approval: "not_applicable" });
+    expect([fake.approvalEffects, fake.releaseEffects, fake.occupied, fake.result]).toEqual([0, 1, false, null]);
   }, 20_000);
 
   it.each(VARIANTS.map(([label]) => label))("an early result waits for exact execution binding before approval (%s)", async (label) => {
@@ -308,8 +325,8 @@ describe("ReviewFixAttempt durable workflow", () => {
       const retried = callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt",
         retry.prepared.attemptId, "run", { attemptId: retry.prepared.attemptId });
       await eventually(() => retry.bound, Boolean, { timeoutMs: 20_000, label: "retry.bound" });
-      retry.terminal = { status: "succeeded", outputCommit: SHA };
       await callWorkflow(env.baseUrl(), "ReviewFixAttempt", retry.prepared.attemptId, "result", resultOf(retry));
+      retry.terminal = { status: "succeeded", outputCommit: SHA };
       expect((await retried).status).toBe("finalized");
       expect([retry.loadCalls, retry.launchEffects, retry.approvalEffects]).toEqual([2, 1, 1]);
 
@@ -321,9 +338,9 @@ describe("ReviewFixAttempt durable workflow", () => {
       await eventually(() => recovering.bound, Boolean, { timeoutMs: 10_000, label: "recovering.bound" });
       replacement = await replaceEndpoint(env, [workflow]);
       await env.startedRestateServer.restart(); // same disk-backed server/journal
-      recovering.terminal = { status: "succeeded", outputCommit: SHA };
       await callWorkflow(env.baseUrl(), "ReviewFixAttempt", recovering.prepared.attemptId,
         "result", resultOf(recovering));
+      recovering.terminal = { status: "succeeded", outputCommit: SHA };
       const attached = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt",
         recovering.prepared.attemptId);
       expect(attached).toMatchObject({ status: "finalized", approval: "applied" });
