@@ -95,7 +95,7 @@ interface RunScenario {
   /** Dispatch result carries no job id, as when the backend returned no machine or container id. */
   jobIdUnknown?: boolean;
   /** AII-1246: a Fly create, as the sender reports it; `app` is the app the machine was created in. */
-  flyCreate?: { machineId: string; app?: string };
+  flyCreate?: { machineId: string; app?: string; reused?: boolean };
   runStatusSequence: Array<{ status: string; conclusion: string | null }>;
   findByTitleResult: { runId: number } | null;
   /** Title lookups that throw, by 1-based call number. */
@@ -459,7 +459,7 @@ describe("KgRefresh durable workflow", () => {
       outcome: scenario.dispatchOutcome, runId: scenario.runId,
       jobId: scenario.jobIdUnknown ? null : `job-${triggerId}`, executionMode: scenario.executionMode,
       ...(scenario.runId !== undefined ? { runUrl: `https://example.test/runs/${scenario.runId}` } : {}),
-      ...(scenario.flyCreate ? { machineId: scenario.flyCreate.machineId, created: true, ...(scenario.flyCreate.app !== undefined && { app: scenario.flyCreate.app }) } : {}),
+      ...(scenario.flyCreate ? { machineId: scenario.flyCreate.machineId, created: scenario.flyCreate.reused !== true, ...(scenario.flyCreate.app !== undefined && { app: scenario.flyCreate.app }) } : {}),
     };
     dispatchResults.push(result);
     return result;
@@ -1316,6 +1316,24 @@ describe("KgRefresh durable workflow", () => {
         if (app === undefined) expect("app" in req).toBe(false);
         else expect(req.app).toBe(app);
       }
+    }, 60_000);
+
+    it.each(VARIANTS.map(([label]) => label))("AII-1276: a reuse sends attach with the current app; a reuse without an app sends none (%s)", async (label) => {
+      const env = envFor(label);
+      const withApp = newTriggerId();
+      const noApp = newTriggerId();
+      makeScenario(withApp, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines", flyCreate: { machineId: "m-kept", app: "app-a", reused: true } });
+      makeScenario(noApp, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines", flyCreate: { machineId: "m-kept", reused: true } });
+      for (const id of [withApp, noApp]) {
+        const done = runWorkflow(env.baseUrl(), id);
+        await eventually(() => scenarios.get(id)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", id, "report", SUCCESS_REPORT);
+        await done;
+      }
+      const req = attachRequests.find((r) => r.dispatchId === withApp)!;
+      expect(req).toMatchObject({ machineId: "m-kept", app: "app-a" });
+      expect("replaces" in req).toBe(false);
+      expect(attachCalls).not.toContain(noApp);
     }, 60_000);
 
     it.each(VARIANTS.map(([label]) => label))("a fly-machines run records one claim and resolves the backend once across dispatch retries (%s)", async (label) => {

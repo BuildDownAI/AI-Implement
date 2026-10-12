@@ -240,6 +240,19 @@ describe("FlyMachineProfile kept machine", () => {
     expect(fly.calls.length).toBe(before);
   });
 
+  it.each(labels)("AII-1276: a same-machine attach backfills a missing app, keeps the hold, and never changes a recorded app (%s)", async (label) => {
+    const h = forKey(label, fresh());
+    const machineId = `m-${randomUUID()}`;
+    await h.call("claim", { dispatchId: "d1" });
+    await h.call("attach", { dispatchId: "d1", machineId });
+    expect((await h.status())?.app).toBeUndefined();
+    await h.call("attach", { dispatchId: "d1", machineId, app: "app-a" });
+    expect(await h.status()).toMatchObject({ machineId, app: "app-a", heldBy: { dispatchId: "d1" } });
+    await h.call("attach", { dispatchId: "d1", machineId, app: "app-b" });
+    expect(await h.status()).toMatchObject({ machineId, app: "app-a", heldBy: { dispatchId: "d1" } });
+    await expect(h.call("attach", { dispatchId: "d2", machineId, app: "app-b" })).rejects.toThrow();
+  });
+
   it.each(labels)("attach then release scrubs once, clears the hold, and schedules one expire (%s)", async (label) => {
     const key = fresh();
     const h = forKey(label, key);
