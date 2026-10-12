@@ -10,7 +10,6 @@ export const settingsHtml = `
     <div class="card">
       <div class="card-header"><h2 class="card-title">Fly Sessions App</h2></div>
       <div class="card-body">
-        <div id="settings-env-warning" class="warning hidden">&#x26A0; One or more settings are overridden by environment variables. Changes saved here take effect on next restart only if the env var is removed.</div>
         <div class="field">
           <label>Sessions App Name</label>
           <div style="display:flex;gap:6px">
@@ -161,9 +160,8 @@ export const settingsScript = `
       const appInput = document.getElementById('settings-sessions-app');
       const regionInput = document.getElementById('settings-sessions-region');
       const sourceEl = document.getElementById('settings-sessions-app-source');
-      const envWarn = document.getElementById('settings-env-warning');
-      appInput.value = appInfo.dbValue || '';
-      regionInput.value = regionInfo.dbValue || '';
+      appInput.value = appInfo.runtimeValue || '';
+      regionInput.value = regionInfo.runtimeValue || '';
       const kgReportInput = document.getElementById('settings-kg-report-issue');
       kgReportInput.value = (data.kgRefreshReportIssue && data.kgRefreshReportIssue.value) || '';
       const kgBaseRepoInput = document.getElementById('settings-kg-base-repo');
@@ -173,10 +171,8 @@ export const settingsScript = `
       pickupLabelInput.value = data.linearPickupLabel.value || '';
       pickupLabelSource.textContent = 'Active: ' + data.linearPickupLabel.effective
         + (data.linearPickupLabel.value === null ? ' (default)' : ' (from settings)');
-      const overridden = appInfo.overriddenByEnv || regionInfo.overriddenByEnv;
-      envWarn.classList.toggle('hidden', !overridden);
       const srcText = appInfo.runtimeValue
-        ? ('Active: ' + window.esc(appInfo.runtimeValue) + (appInfo.overriddenByEnv ? ' (from env var)' : ' (from DB)'))
+        ? ('Active: ' + window.esc(appInfo.runtimeValue) + (data.runnerBackendSource === 'restate' ? ' (source: restate)' : ' (source: fallback \u2014 Restate not read yet; env var or DB row)'))
         : 'Not configured — add a sessions app name to enable Fly dispatch';
       sourceEl.textContent = srcText;
       populateRetryPolicy(data.retryPolicy, data.retryPolicyDefaults);
