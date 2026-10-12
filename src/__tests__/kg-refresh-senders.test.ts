@@ -27,6 +27,7 @@ function makeInput(overrides: Partial<KgRefreshSendInput> = {}): KgRefreshSendIn
     tokens: TOKENS,
     dispatchId: "d-1",
     machine: { cpuKind: "performance", cpus: 4, memoryMb: 16384, idleTimeoutMs: 1000 },
+    jobTimeoutMinutes: 240,
     machineId: null,
     machineNonce: NONCE,
     ...overrides,
@@ -188,7 +189,7 @@ describe("github-actions sender", () => {
 
   it("posts with returnRunDetails and includes the publication token when supported", async () => {
     const { deps } = makeDeps();
-    const result = await createKgRefreshSenders(deps)["github-actions"](makeInput({ machineNonce: null }));
+    await createKgRefreshSenders(deps)["github-actions"](makeInput({ machineNonce: null }));
     const posted = postedInputs(deps);
     expect(posted.returnRunDetails).toBe(true);
     expect(posted.ref).toBe("trunk");
@@ -196,6 +197,22 @@ describe("github-actions sender", () => {
     expect(posted.inputs.issue_identifier).toBe(IDENTIFIER);
     expect(posted.inputs.runner_phase).toBe("kg-refresh");
     expect(posted.inputs.job_timeout_minutes).toBe("240");
+  });
+
+  it("sends the profile's jobTimeoutMinutes as job_timeout_minutes", async () => {
+    const { deps } = makeDeps();
+    await createKgRefreshSenders(deps)["github-actions"](makeInput({ machineNonce: null, jobTimeoutMinutes: 120 }));
+    expect(postedInputs(deps).inputs.job_timeout_minutes).toBe("120");
+  });
+
+  it("refuses to dispatch without a profile timeout", async () => {
+    const { deps } = makeDeps();
+    await expect(createKgRefreshSenders(deps)["github-actions"](makeInput({ machineNonce: null, jobTimeoutMinutes: null }))).rejects.toThrow(/jobTimeoutMinutes/);
+  });
+
+  it("returns the accepted run", async () => {
+    const { deps } = makeDeps();
+    const result = await createKgRefreshSenders(deps)["github-actions"](makeInput({ machineNonce: null }));
     expect(result).toEqual({ outcome: "accepted", runId: 42, runUrl: "https://gh/run/42", jobId: "42", executionMode: "github-actions" });
   });
 

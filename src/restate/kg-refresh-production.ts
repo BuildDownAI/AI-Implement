@@ -46,6 +46,7 @@ import {
 } from "./kg-refresh-workflow.js";
 import { createKgRefreshSenders, type KgRefreshSender, type KgRefreshSenderDeps } from "./kg-refresh-senders.js";
 import { DURABLE_RUNNER_PURPOSE_KEY, DURABLE_RUNNER_PURPOSE_VALUE } from "../durable-runner.js";
+import { createGhaRunProfile } from "./gha-run-profile.js";
 import { DURABLE_RUNNER_DISPATCH_ID_KEY, FLY_MACHINE_PROFILE_DEFAULTS, createFlyMachineProfile, type FlyMachineProfileConfig, type FlyMachineProfileDefinition, type FlyMachineProfileDeps } from "./fly-machine-profile.js";
 import { createKgRepo, type KgRepoEnqueueInput, type KgRepoEnqueueResult, type KgRepoPrInput, type KgRepoTriggerResult, type StoredDryRunOutcome } from "./kg-repo.js";
 import type { Step } from "../pipeline/types.js";
@@ -465,7 +466,7 @@ export function createProductionKgRefreshServices(
   };
 
   return {
-    services: [createKgRepo({ workflowName: "KgRefresh" }), createFlyMachineProfile(buildFlyMachineProfileDeps()), createKgRefreshWorkflow(deps)],
+    services: [createKgRepo({ workflowName: "KgRefresh" }), createFlyMachineProfile(buildFlyMachineProfileDeps()), createGhaRunProfile(), createKgRefreshWorkflow(deps)],
     toolDeps,
   };
 }

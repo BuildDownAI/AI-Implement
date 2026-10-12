@@ -1487,6 +1487,7 @@ describe("handleMcpRequest", () => {
         stage: "serving",
         materialize: "direct",
         executionMode: { effective: "github-actions", source: "kg-setting", setting: "github-actions" },
+        runProfile: { backend: "github-actions", config: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000 }, source: "default" },
         flyMachine: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000, source: "default" },
         restate: null,
       };

@@ -38,6 +38,7 @@ import { readKgSourceRepo } from "../deploy.js";
 import { runKgRefreshPreflight, MIN_FREE_BYTES, type KgRefreshStage, type KgRefreshStatus } from "../kg-refresh.js";
 import type { StepStatus } from "../pipeline/types.js";
 import { FlyMachineProfile } from "./fly-machine-profile.js";
+import { RUN_PROFILE_OBJECTS, isRunProfileBackend, type RunProfileBackend } from "./run-profile.js";
 import { RunnerBackend } from "./runner-backend.js";
 import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
@@ -739,6 +740,14 @@ export const getKgStatusTool = tool(
     const flyConfigured = !!(flyCfg.flySessionsToken && flyCfg.flySessionsApp);
     const kgSetting = getKgExecutionMode(flyConfigured);
     const kgBackend = resolveKgBackend(getRunnerMode().mode, kgSetting, flyConfigured);
+    // The effective backend's profile; local-docker has none.
+    let runProfile: { backend: RunProfileBackend; config: unknown; source: "profile" | "default" } | undefined;
+    if (isRunProfileBackend(kgBackend.mode)) {
+      const view = kgBackend.mode === "fly-machines"
+        ? flyProfile
+        : await ctx.objectClient(RUN_PROFILE_OBJECTS["github-actions"], "kg-refresh").get();
+      if (view) runProfile = { backend: kgBackend.mode, config: view.config, source: view.source };
+    }
     const result: KgRefreshStatus = {
       running: inFlight !== null && inFlight !== undefined,
       deployHeld: toolDeps.isDeployHeld(),
@@ -751,6 +760,7 @@ export const getKgStatusTool = tool(
       ...(runnerStep ? { runnerStep } : {}),
       materialize: getKgMaterializeDirect().enabled ? "direct" : "rdflib",
       executionMode: { effective: kgBackend.mode, source: kgBackend.source, setting: kgSetting.mode },
+      ...(runProfile ? { runProfile } : {}),
       ...(flyProfile ? { flyMachine: { ...flyProfile.config, source: flyProfile.source } } : {}),
       restate: restateKey ? { service: "KgRefresh", key: restateKey } : null,
     };
@@ -1066,12 +1076,38 @@ export const setFlyMachineProfileTool = tool(
       ...(memoryMb !== undefined ? { memoryMb } : {}),
       ...(idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),
     };
-    try {
-      return reply(await ctx.objectClient(FlyMachineProfile, pipeline).set(fields));
-    } catch (err) {
-      if (err instanceof restate.TerminalError && err.code === 400) return reply({ status: 400, body: { error: err.message } });
-      throw err;
-    }
+    return reply(await runProfileSet(() => ctx.objectClient(FlyMachineProfile, pipeline).set(fields)));
+  },
+);
+
+/** Runs a run-profile `set`; a 400 comes back as a reply body, as the other set tools do. */
+async function runProfileSet(set: () => Promise<unknown>): Promise<unknown> {
+  try {
+    return await set();
+  } catch (err) {
+    if (err instanceof restate.TerminalError && err.code === 400) return { status: 400, body: { error: err.message } };
+    throw err;
+  }
+}
+
+export const SET_RUN_PROFILE_DESCRIPTION =
+  "Set a pipeline's run profile on one backend (admin role): pipeline (kg-refresh), backend (fly-machines, github-actions) and patch. fly-machines takes cpuKind, cpus, memoryMb, idleTimeoutMs; github-actions takes jobTimeoutMinutes (an integer from 10 to 360). Given fields merge into the stored profile; an unknown field or out-of-range value is refused with 400. Applies to the next run, not one in flight. Returns the profile as { config, source }.";
+
+export const setRunProfileTool = tool(
+  {
+    description: SET_RUN_PROFILE_DESCRIPTION,
+    input: z.object({
+      pipeline: z.string().describe("The pipeline phase whose profile to set, e.g. kg-refresh"),
+      backend: z.enum(["fly-machines", "github-actions"]).describe("The backend whose profile to set"),
+      patch: z.record(z.string(), z.unknown()).describe("Fields to merge, e.g. { jobTimeoutMinutes } for github-actions"),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const { pipeline, backend, patch } = input.args;
+    const result = await runProfileSet(() => ctx.objectClient(RUN_PROFILE_OBJECTS[backend], pipeline).set(patch));
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
 );
 
@@ -1354,6 +1390,7 @@ export const orchestratorTools = restate.service({
     trigger_kg_refresh: triggerKgRefreshTool,
     set_runner_mode: setRunnerModeTool,
     set_fly_machine_profile: setFlyMachineProfileTool,
+    set_run_profile: setRunProfileTool,
     set_runner_backend: setRunnerBackendTool,
     get_runner_backend: getRunnerBackendTool,
     pause_project: pauseProjectTool,
