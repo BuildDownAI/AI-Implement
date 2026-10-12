@@ -139,6 +139,13 @@ export interface KgDispatchRowDetails {
   workflowRunId?: number;
 }
 
+/** What a status reader may see of the held snapshot; the commit and branch stay inside the workflow. */
+export interface KgRefreshHeldView {
+  snapshotPr: number;
+  partTable: Array<{ part: string; prev: string; new: string }>;
+  decideBy: number;
+}
+
 export interface KgRefreshStatusResult {
   step: string | null;
   startedAt: number | null;
@@ -147,6 +154,10 @@ export interface KgRefreshStatusResult {
   dryRun: boolean;
   /** The last runner step with a resolved step promise, in pipeline order; `null` before the first report. */
   runnerStep: { id: string; status: string } | null;
+  /** `["accept", "cancel"]` while the decision gate is open and undecided; `[]` otherwise. */
+  decisions: Array<"accept" | "cancel">;
+  /** The held snapshot PR and its part table while step is `decision`; `null` otherwise. */
+  held: KgRefreshHeldView | null;
 }
 
 export interface KgDispatchResult {
@@ -990,7 +1001,14 @@ function toStepRecord(step: Step): KgRefreshStepRecord {
       const running = await ctx.promise<Step>(`step:${id}:running`).peek();
       if (running !== undefined) runnerStep = { id, status: running.status };
     }
-    return { step: step ?? null, startedAt: startedAt ?? null, triggerId: triggerId ?? null, runId: runId ?? null, dryRun: dryRun === true, runnerStep };
+    let decisions: KgRefreshStatusResult["decisions"] = [];
+    let held: KgRefreshStatusResult["held"] = null;
+    if (step === "decision") {
+      const stored = await ctx.get<{ snapshotPr: number; partTable?: KgRefreshHeldView["partTable"]; decideBy: number }>("held");
+      if (stored) held = { snapshotPr: stored.snapshotPr, partTable: stored.partTable ?? [], decideBy: stored.decideBy };
+      if ((await ctx.promise<KgRefreshDecideInput>("decide").peek()) === undefined) decisions = ["accept", "cancel"];
+    }
+    return { step: step ?? null, startedAt: startedAt ?? null, triggerId: triggerId ?? null, runId: runId ?? null, dryRun: dryRun === true, runnerStep, decisions, held };
   }
 
   return restate.workflow({

@@ -162,6 +162,7 @@ export interface KgPreflightInput {
  * checking         → runRefresh() is in progress
  * ingest-running   → kg-refresh runner dispatched, waiting for callback
  * snapshot-landed  → runner callback received, snapshot commit verified
+ * awaiting-decision → a held run waits for accept or cancel at the decision gate
  * staging          → local rail is running (fetch→stage→swap→verify)
  * serving          → rail succeeded; sidecar is serving the new graph
  * reverted         → rail failed and reverted to the previous overlay
@@ -173,6 +174,7 @@ export type KgRefreshStage =
   | "checking"
   | "ingest-running"
   | "snapshot-landed"
+  | "awaiting-decision"
   | "staging"
   | "serving"
   | "reverted"
@@ -190,6 +192,13 @@ export interface KgRefreshStatus {
   /** The last dry-run with no PR report target (admin page or tool); never written to `lastRefresh`. */
   lastDryRun: { ok: boolean; at: number; detail: string; partTable?: Array<{ part: string; prev: string; new: string }> } | null;
   stage: KgRefreshStage;
+  /** The in-flight run's step and open decisions; `null` with no run in flight. */
+  currentRun: {
+    triggerId: string;
+    step: string | null;
+    decisions: Array<"accept" | "cancel">;
+    held: { snapshotPr: number; partTable: Array<{ part: string; prev: string; new: string }>; decideBy: number } | null;
+  } | null;
   /** The runner step in flight, when the workflow has one (AII-1134). */
   runnerStep?: { id: string; status: StepStatus };
   /** Which materialize path the next refresh will stage (AII-602). */

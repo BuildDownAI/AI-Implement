@@ -235,6 +235,7 @@ or these steps by hand.
 | `checking` | Refresh triggered; comparing snapshot SHA against last recorded |
 | `ingest-running` | Runner job dispatched; waiting for callback |
 | `snapshot-landed` | Callback received; snapshot commit verified |
+| `awaiting-decision` | A run is held at the decision gate with its snapshot PR open; `currentRun.decisions` is `["accept", "cancel"]` |
 | `staging` | Local rail running (fetch → materialize → swap) |
 | `serving` | Rail succeeded; sidecar serving new graph |
 | `reverted` | Gate failed; rolled back to previous overlay |

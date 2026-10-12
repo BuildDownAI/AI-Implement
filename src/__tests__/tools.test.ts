@@ -15,6 +15,8 @@ import {
   kgPath,
   kgHybridSearch,
   kgStageForRunnerStep,
+  kgStageForStep,
+  GET_KG_STATUS_DESCRIPTION,
   getKgStatusTool,
   setFlyMachineProfileTool,
   getTenantHealth,
@@ -757,6 +759,7 @@ describe("migrated read handlers (AII-711)", () => {
     async function stageFor(opts: {
       last?: RefreshOutcome | null; inFlight?: { triggerId: string; startedAt: number } | null; step?: string | null; statusThrows?: boolean;
       runnerStep?: { id: string; status: string } | null;
+      decisions?: string[]; held?: unknown; calls?: string[];
       dryRun?: RefreshOutcome | null; readServedStamp?: () => Promise<string | null>;
     }) {
       setKgRefreshToolDeps(kgToolDeps({
@@ -766,14 +769,18 @@ describe("migrated read handlers (AII-711)", () => {
       const ctx = {
         ...fakeContext("get_kg_status"),
         objectClient: () => ({
-          status: async () => opts.inFlight ?? null,
+          status: async () => { opts.calls?.push("KgRepo.status"); return opts.inFlight ?? null; },
           lastAdminDryRun: async () => opts.dryRun ?? null,
           get: async () => ({ config: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 1 }, source: "default" }),
         }),
         workflowClient: () => ({
           status: async () => {
+            opts.calls?.push("KgRefresh.status");
             if (opts.statusThrows) throw new Error("no such workflow");
-            return { step: opts.step ?? null, startedAt: 1, triggerId: "t1", runId: null, dryRun: false, runnerStep: opts.runnerStep ?? null };
+            return {
+              step: opts.step ?? null, startedAt: 1, triggerId: "t1", runId: null, dryRun: false, runnerStep: opts.runnerStep ?? null,
+              decisions: opts.decisions ?? [], held: opts.held ?? null,
+            };
           },
         }),
       } as unknown as restate.Context;
@@ -832,6 +839,67 @@ describe("migrated read handlers (AII-711)", () => {
       expect(status.running).toBe(true);
     });
 
+    describe("currentRun and awaiting-decision (AII-1258)", () => {
+      const inFlight = { triggerId: "t1", startedAt: 1 };
+      const held = { snapshotPr: 77, partTable: [{ part: "graph", prev: "100", new: "40" }], decideBy: 99 };
+
+      it("kgStageForStep maps decision to awaiting-decision", () => {
+        expect(kgStageForStep("decision")).toBe("awaiting-decision");
+      });
+
+      it("no run in flight: currentRun is null and stage comes from the last refresh", async () => {
+        const status = await stageFor({ last: ok });
+        expect(status.currentRun).toBeNull();
+        expect(status.stage).toBe("serving");
+      });
+
+      it("in flight before the gate: currentRun is set with no decisions", async () => {
+        const status = await stageFor({ inFlight, step: "await-progress", runnerStep: { id: "kg-ingest", status: "running" } });
+        expect(status.currentRun).toEqual({ triggerId: "t1", step: "await-progress", decisions: [], held: null });
+        expect(status.stage).toBe("ingest-running");
+      });
+
+      it("held and undecided: awaiting-decision wins over the finished runner step", async () => {
+        const status = await stageFor({
+          inFlight, step: "decision", decisions: ["accept", "cancel"], held,
+          runnerStep: { id: "kg-snapshot-push", status: "passed" },
+        });
+        expect(status.stage).toBe("awaiting-decision");
+        expect(status.currentRun).toEqual({ triggerId: "t1", step: "decision", decisions: ["accept", "cancel"], held });
+      });
+
+      it("decided and still finishing: no decisions, stage as today for the step", async () => {
+        const status = await stageFor({ inFlight, step: "decision", decisions: [], held });
+        expect(status.stage).toBe("staging");
+        expect(status.currentRun.decisions).toEqual([]);
+      });
+
+      it("a run that has ended leaves currentRun null", async () => {
+        const status = await stageFor({ inFlight: null, last: failed("preflight") });
+        expect(status.currentRun).toBeNull();
+        expect(status.running).toBe(false);
+      });
+
+      it("a workflow status failure leaves currentRun null and stage ingest-running", async () => {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        const status = await stageFor({ inFlight, statusThrows: true });
+        expect(status.currentRun).toBeNull();
+        expect(status.stage).toBe("ingest-running");
+        warn.mockRestore();
+      });
+
+      it("makes no Restate call beyond the existing reads", async () => {
+        const calls: string[] = [];
+        await stageFor({ inFlight, step: "decision", decisions: ["accept", "cancel"], held, calls });
+        expect(calls.filter((c) => c === "KgRefresh.status")).toHaveLength(1);
+      });
+
+      it("the description names currentRun and awaiting-decision", () => {
+        expect(GET_KG_STATUS_DESCRIPTION).toContain("currentRun");
+        expect(GET_KG_STATUS_DESCRIPTION).toContain("awaiting-decision");
+      });
+    });
+
     it("in flight with a workflow status failure reports ingest-running, still running, no error", async () => {
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       const status = await stageFor({ inFlight: { triggerId: "t1", startedAt: 1 }, statusThrows: true });
@@ -886,7 +954,7 @@ describe("migrated read handlers (AII-711)", () => {
     it("keeps the KgRefreshStatus shape", async () => {
       const status = await stageFor({ last: ok });
       expect(Object.keys(status).sort()).toEqual(
-        ["deployHeld", "executionMode", "flyMachine", "kgDegraded", "kgUnavailable", "lastDryRun", "lastRefresh", "materialize", "restate", "running", "servedStamp", "sidecar", "stage"].sort(),
+        ["currentRun", "deployHeld", "executionMode", "flyMachine", "kgDegraded", "kgUnavailable", "lastDryRun", "lastRefresh", "materialize", "restate", "running", "servedStamp", "sidecar", "stage"].sort(),
       );
     });
   });

@@ -621,7 +621,7 @@ export const getDeployPostureTool = tool(
 );
 
 export const GET_KG_STATUS_DESCRIPTION =
-  "Returns the KG refresh rail state: stage (idle | staging | ingest-running | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), the last refresh outcome with its gate, and lastDryRun (verdict and part table of the last dry-run with no PR report target, or null). The served stamp falls back to a live read when the last-refresh record carries none. Poll it after `POST /api/kg/refresh`.";
+  "Returns the KG refresh rail state: stage (idle | checking | ingest-running | snapshot-landed | awaiting-decision | staging | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), the last refresh outcome with its gate, and lastDryRun (verdict and part table of the last dry-run with no PR report target, or null). The served stamp falls back to a live read when the last-refresh record carries none. currentRun is the in-flight run only (triggerId, step, decisions, held), or null with no run in flight; decisions is [\"accept\", \"cancel\"] only while the run waits at the decision gate (stage awaiting-decision), and held carries the snapshot PR, its part table, and the decide-by time. Poll it after `POST /api/kg/refresh`.";
 
 // Type-only client handles: the real definitions are built with dependencies at boot
 // (createProductionKgRefreshServices); a client needs only the service name and handler types.
@@ -643,6 +643,7 @@ export function setKgRefreshToolDeps(deps: KgRefreshToolDeps | null): void {
 export function kgStageForStep(step: string | null): KgRefreshStage {
   if (step === null || step === "reserve" || step === "dispatch") return "checking";
   if (step === "await-progress" || step === "cancelling" || step === "dry-run-report") return "ingest-running";
+  if (step === "decision") return "awaiting-decision";
   if (step === "merge" || step === "delete-branch") return "snapshot-landed";
   // fetch, stage, swap, verify, revert, persist, close-row, outcome, settled, and the
   // short-lived terminal steps (failed, closed, no-new-data) whose marker is about to clear.
@@ -754,12 +755,22 @@ export const getKgStatusTool = tool(
     }
     let stage: KgRefreshStage;
     let runnerStep: KgRefreshStatus["runnerStep"];
+    let currentRun: KgRefreshStatus["currentRun"] = null;
     if (inFlight === null || inFlight === undefined) {
       stage = kgStageFromLastRefresh(lastRefresh);
     } else {
       try {
         const wf = await ctx.workflowClient(KgRefresh, inFlight.triggerId).status();
-        if (wf.runnerStep) {
+        // Older in-flight workflows lack the decision fields during a deploy.
+        const decisions = wf.decisions ?? [];
+        currentRun = { triggerId: inFlight.triggerId, step: wf.step, decisions, held: wf.held ?? null };
+        if (wf.step === "decision" && decisions.length > 0) {
+          // The runner has finished by the gate, so its last step must not decide the stage.
+          stage = "awaiting-decision";
+        } else if (wf.step === "decision") {
+          // Decided, or timed out, and finishing: the step is not cleared until the next one is set.
+          stage = "staging";
+        } else if (wf.runnerStep) {
           runnerStep = { id: wf.runnerStep.id, status: wf.runnerStep.status as StepStatus };
           stage = kgStageForRunnerStep(runnerStep.id, runnerStep.status);
         } else {
@@ -788,6 +799,7 @@ export const getKgStatusTool = tool(
       lastRefresh,
       lastDryRun,
       stage,
+      currentRun,
       ...(runnerStep ? { runnerStep } : {}),
       materialize: getKgMaterializeDirect().enabled ? "direct" : "rdflib",
       executionMode: { effective: kgBackend.mode, source: kgBackend.source, setting: kgSetting.mode },

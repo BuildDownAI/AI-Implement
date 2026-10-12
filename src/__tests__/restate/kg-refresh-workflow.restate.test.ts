@@ -3410,6 +3410,32 @@ describe("KgRefresh durable workflow", () => {
       60_000,
     );
 
+    it.each(VARIANTS.map(([label]) => label))(
+      "status answers the open decisions and the held PR at the gate, and none after decide (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const triggered = await triggerViaKgRepo(env.baseUrl());
+        const triggerId = (triggered as { triggerId: string }).triggerId;
+        makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+        await workflowDispatched(triggerId);
+        const before = await callWorkflow<{ decisions: string[]; held: unknown }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
+        expect(before.decisions).toEqual([]);
+        expect(before.held).toBeNull();
+
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", HELD_REPORT);
+        await waitForStep(() => readStatus(env.baseUrl(), triggerId), "decision");
+        const open = await callWorkflow<{ decisions: string[]; held: unknown }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
+        expect(open.decisions).toEqual(["accept", "cancel"]);
+        expect(open.held).toEqual({ snapshotPr: 77, partTable: [{ part: "graph", prev: "100", new: "40" }], decideBy: expect.any(Number) });
+
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ada@example.com" });
+        const after = await callWorkflow<{ decisions: string[] }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
+        expect(after.decisions).toEqual([]);
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+      },
+      60_000,
+    );
+
     it("a restart of the endpoint during the wait replays to the same gate without a second release or extend", async () => {
       const env = await startRetryEnabled([heldWorkflow, kgRepo, starter, flyMachineProfile]);
       let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
