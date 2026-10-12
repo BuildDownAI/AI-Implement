@@ -88,10 +88,8 @@ const SHORT_DEADLINE_MS = 3_000;
 const SHORT_DEADLINE_JOB_TIMEOUT_MINUTES = SHORT_DEADLINE_MS / 60_000 - REVIEW_FIX_DEADLINE_BUFFER_MINUTES;
 const LONG_DEADLINE_JOB_TIMEOUT_MINUTES = 90;
 
-// A wider deadline than SHORT_DEADLINE_MS, reserved for the "GitHub success without a
-// stored result" scenario: it needs real elapsed time both for an explicit mid-window
-// "not yet approved" checkpoint and for the deadline itself, so it gets its own budget
-// rather than sharing the tighter one used by scenarios with no such checkpoint.
+// The deadline for the "GitHub success without a stored result" scenario. The attempt ends
+// at its first status read that sees the run ended (AII-1273), or at this deadline.
 const SUCCESS_NO_RESULT_DEADLINE_MS = 6_000;
 const SUCCESS_NO_RESULT_JOB_TIMEOUT_MINUTES = SUCCESS_NO_RESULT_DEADLINE_MS / 60_000 - REVIEW_FIX_DEADLINE_BUFFER_MINUTES;
 
@@ -889,9 +887,9 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect(fixture.commentPosts).toBe(0);
   }, 25_000);
 
-  // GitHub reports the run completed but no result is ever delivered. The attempt's status
-  // read sees `ended` on its first tick, so it finalizes without approval and releases the
-  // slot long before the (large) deadline (AII-1273).
+  // GitHub reports the run completed but no result is ever delivered. The attempt ends at its
+  // first status read that sees the run ended (AII-1273), or at the short deadline above.
+  // Either way it finalizes without approval and releases the slot.
   it.each(VARIANTS.map(([label]) => label))("GitHub success without a stored result never approves and releases when the run ends (%s)", async (label) => {
     const env = envFor(label);
     const fixture = freshScenario("success-no-result");

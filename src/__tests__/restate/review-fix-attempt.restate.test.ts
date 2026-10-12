@@ -183,7 +183,7 @@ describe("ReviewFixAttempt durable workflow", () => {
     expect([fake.launchEffects, fake.approvalEffects, fake.releaseEffects, fake.occupied]).toEqual([1, 1, 1, false]);
   }, 20_000);
 
-  it.each(VARIANTS.map(([label]) => label))("success without a valid result waits to deadline and never approves (%s)", async (label) => {
+  it.each(VARIANTS.map(([label]) => label))("success without a valid result never approves (%s)", async (label) => {
     const fake = newFake("accepted", 2_500);
     fake.terminal = { status: "succeeded", outputCommit: SHA };
     attempts.set(fake.prepared.attemptId, fake);
