@@ -317,7 +317,7 @@ const LEARNINGS_MARKER = "# ai-implement-kg-refresh-learnings";
  */
 const COUNT_STEP_LEARNING_THRESHOLD = 0.2;
 
-export type RefreshAnomalyClass = "guard-refused" | "source-missing" | "count-step" | "ingest-warnings";
+export type RefreshAnomalyClass = "guard-refused" | "guard-held" | "source-missing" | "count-step" | "ingest-warnings";
 
 export interface RefreshAnomaly {
   class: RefreshAnomalyClass;
@@ -329,12 +329,10 @@ export interface RefreshAnomaly {
 
 interface ClassifyRefreshAnomalyInput {
   /**
-   * "clean" once every push guard has passed. At the one call site in this file
-   * (after openOrFindPullRequest resolves) this is always "clean" — a non-clean
-   * guard verdict throws before any push or PR exists, so nothing survives to be
-   * classified. This param exists so the classifier stays generic for a future
-   * guard that reports a verdict instead of throwing, and so it can be tested in
-   * isolation with a non-clean verdict without needing that guard to exist yet.
+   * "clean" once every push guard has passed; "held" for a soft shrink, where the
+   * snapshot is pushed and the PR is open but waits for an operator decision. Any
+   * other non-clean value classifies as "guard-refused" — no call site passes one
+   * today, since a refusal throws before any push or PR exists.
    */
   guardVerdict: string;
   partRows: Array<{ part: string; prev: string; next: string; delta: string }>;
@@ -352,12 +350,36 @@ interface ClassifyRefreshAnomalyInput {
   ingestWarnings: string[];
 }
 
+function shrunkRows(rows: ClassifyRefreshAnomalyInput["partRows"]): ClassifyRefreshAnomalyInput["partRows"] {
+  return rows.filter((r) => {
+    const prev = Number(r.prev);
+    const next = Number(r.next);
+    return Number.isFinite(prev) && Number.isFinite(next) && next < prev;
+  });
+}
+
+function partShrinkFacts(rows: ClassifyRefreshAnomalyInput["partRows"]): string[] {
+  const shrunk = shrunkRows(rows);
+  return [
+    "gate verdict: held",
+    ...shrunk.map((r) => `${r.part}: ${r.prev} → ${r.next} lines (${r.delta})`),
+  ];
+}
+
+function heldSubjects(rows: ClassifyRefreshAnomalyInput["partRows"]): string[] {
+  const shrunk = shrunkRows(rows);
+  return shrunk.length > 0 ? shrunk.map((r) => r.part) : ["held"];
+}
+
 /**
- * Classifies a refresh into at most one of the four learning classes, in the
- * precedence order the ticket lists them (guard-refused, source-missing,
+ * Classifies a refresh into at most one of the five learning classes, in the
+ * precedence order the ticket lists them (guard-refused, guard-held, source-missing,
  * count-step, ingest-warnings). Returns null for a clean run — nothing to post.
  */
 export function classifyRefreshAnomaly(input: ClassifyRefreshAnomalyInput): RefreshAnomaly | null {
+  if (input.guardVerdict === "held") {
+    return { class: "guard-held", facts: partShrinkFacts(input.partRows), subjects: heldSubjects(input.partRows) };
+  }
   if (input.guardVerdict !== "clean") {
     return { class: "guard-refused", facts: [`gate verdict: ${input.guardVerdict}`], subjects: [input.guardVerdict] };
   }
@@ -407,6 +429,7 @@ export function classifyRefreshAnomaly(input: ClassifyRefreshAnomalyInput): Refr
 /** Mechanical, factual explanation per class — never speculation about root cause. */
 const CLASS_WHY: Record<RefreshAnomalyClass, string> = {
   "guard-refused": "The push guard reported a non-clean verdict; the gate text above is the guard's own reasoning for refusing the push.",
+  "guard-held": "The push guard held a shrink: the snapshot was pushed and this PR is open, and it waits for an operator decision to merge or close it.",
   "source-missing": "clone-secondary-repos soft-fails per entry rather than aborting the pipeline, so a failed or skipped clone for a secondary repo leaves no repos/<slug> checkout without failing the run; a configured code repo whose checkout has no content is included here too, since kg-ingest only checks that a code-repo directory was produced, not that it has content.",
   "count-step": `The push guard only refuses a part below ${PART_SHRINK_THRESHOLD * 100}% of its previous line count (or any shrink of a non-empty tracker part); a move past the ${COUNT_STEP_LEARNING_THRESHOLD * 100}% learnings threshold in either direction clears that guard but is still a large enough step to record.`,
   "ingest-warnings": "ai-output/kg-ingest.log recorded at least one WARN or ERROR line during this run's ingest; the lines above are copied verbatim.",

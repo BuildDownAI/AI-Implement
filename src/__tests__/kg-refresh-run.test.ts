@@ -1121,6 +1121,23 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
     expect(refs).toContain(`refs/heads/${err.branchName}`);
   });
 
+  it("the learnings comment on a held PR says the shrink waits, never that the push was refused", async () => {
+    const clonedRef = setupShrink({ "comment.nt": makeLines(9995) }, { "comment.nt": makeLines(3793) });
+    stubPrCreate(26, "https://github.com/acme/kg-repo/pull/26");
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 201, json: async () => ({}), text: async () => "" } as Response);
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 744 });
+    await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch(() => undefined);
+
+    const commentCall = vi.mocked(fetch).mock.calls.find(([url]) => String(url).endsWith("/issues/26/comments"));
+    expect(commentCall).toBeTruthy();
+    const commentBody = JSON.parse((commentCall![1] as RequestInit).body as string).body as string;
+    expect(commentBody).toContain("**Class:** guard-held");
+    expect(commentBody).toContain("comment.nt: 9995 → 3793 lines");
+    expect(commentBody).toContain("waits for an operator decision");
+    expect(commentBody).not.toContain("refusing the push");
+  });
+
   it("a general (non-tracker) 50% shrink is also held", async () => {
     const clonedRef = setupShrink({ "doc.nt": makeLines(100) }, { "doc.nt": makeLines(10) });
     stubPrCreate(22, "https://github.com/acme/kg-repo/pull/22");
@@ -5359,6 +5376,20 @@ describe("classifyRefreshAnomaly", () => {
     const result = classifyRefreshAnomaly({ ...clean, guardVerdict: "refused: shrink below threshold" });
     expect(result?.class).toBe("guard-refused");
     expect(result?.facts.join(" ")).toContain("refused: shrink below threshold");
+  });
+
+  it("classifies a held verdict as guard-held, naming the shrunk parts", () => {
+    const result = classifyRefreshAnomaly({
+      ...clean,
+      guardVerdict: "held",
+      partRows: [
+        { part: "comment.nt", prev: "9995", next: "3793", delta: "-6202" },
+        { part: "docs.nt", prev: "100", next: "130", delta: "+30" },
+      ],
+    });
+    expect(result?.class).toBe("guard-held");
+    expect(result?.facts).toContain("comment.nt: 9995 → 3793 lines (-6202)");
+    expect(result?.subjects).toEqual(["comment.nt"]);
   });
 
   it("classifies count-step on a >20% growth", () => {
