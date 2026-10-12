@@ -55,6 +55,26 @@ describe.skipIf(isWindows)("runHookScript", () => {
     expect(captured).toContain("GITHUB_ENV=");
   });
 
+  it("does not pass run tokens to hook scripts", () => {
+    const captureFile = join(dir, "hook-env.txt");
+    writeFileSync(join(dir, "setup.sh"), `env > "${captureFile}"\n`);
+    process.env.RUN_TOKEN = "sentinel-run-token-hook";
+    process.env.RUN_PROGRESS_TOKEN = "sentinel-progress-token-hook";
+    process.env.RUN_PUBLICATION_TOKEN = "sentinel-publication-token-hook";
+    try {
+      const result = runHookScript("setup", "setup.sh", dir);
+      expect(result.exitCode).toBe(0);
+      const captured = readFileSync(captureFile, "utf-8");
+      expect(captured).not.toContain("sentinel-run-token-hook");
+      expect(captured).not.toContain("sentinel-progress-token-hook");
+      expect(captured).not.toContain("sentinel-publication-token-hook");
+    } finally {
+      delete process.env.RUN_TOKEN;
+      delete process.env.RUN_PROGRESS_TOKEN;
+      delete process.env.RUN_PUBLICATION_TOKEN;
+    }
+  });
+
   it("forwarded secrets are present in hook spawn env", () => {
     const captureFile = join(dir, "hook-env.txt");
     writeFileSync(join(dir, "setup.sh"), `env > "${captureFile}"\n`);

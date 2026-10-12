@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { repoProcessEnv, modelProcessEnv } from "../pipeline/process-env.js";
+import { repoProcessEnv, modelProcessEnv, RUNNER_CREDENTIAL_KEYS } from "../pipeline/process-env.js";
 
 const SAVED: Record<string, string | undefined> = {};
 
@@ -59,6 +59,26 @@ describe("repoProcessEnv", () => {
     process.env.ANTHROPIC_API_KEY = "sentinel-api-key";
     repoProcessEnv();
     expect(process.env.ANTHROPIC_API_KEY).toBe("sentinel-api-key");
+  });
+});
+
+describe("repoProcessEnv run tokens", () => {
+  it("strips every runner credential without mutating process.env", () => {
+    for (const key of RUNNER_CREDENTIAL_KEYS) saveAndSet(key, `sentinel-${key}`);
+    const env = repoProcessEnv();
+    for (const key of RUNNER_CREDENTIAL_KEYS) {
+      expect(env).not.toHaveProperty(key);
+      expect(process.env[key]).toBe(`sentinel-${key}`);
+    }
+  });
+
+  it("keeps forwarded secrets while stripping run tokens", () => {
+    saveAndSet("AI_IMPLEMENT_FORWARDED_SECRETS", "QA_TOKEN");
+    saveAndSet("QA_TOKEN", "sentinel-qa");
+    saveAndSet("RUN_TOKEN", "sentinel-run");
+    const env = repoProcessEnv();
+    expect(env.QA_TOKEN).toBe("sentinel-qa");
+    expect(env).not.toHaveProperty("RUN_TOKEN");
   });
 });
 

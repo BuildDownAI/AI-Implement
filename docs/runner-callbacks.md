@@ -18,7 +18,7 @@ sequenceDiagram
     O->>O: mintRunToken(result), mintRunToken(progress)
     O->>D: RUN_TOKEN, RUN_PROGRESS_TOKEN, callback URL
     D->>R: container environment
-    R->>P: repoProcessEnv() keeps the run tokens
+    R->>P: repoProcessEnv() strips the run tokens
     R->>M: modelProcessEnv() strips the run tokens
     R->>O: POST /runner/progress (progress token, reusable)
     R->>O: POST /runner/result (result token, consumed on first use)
@@ -49,10 +49,10 @@ Unmarked Legacy callbacks retain the single-use result token above.
 | Process | Environment builder | Run tokens | Model credentials | Forwarded secrets | GitHub write tokens |
 |---|---|---|---|---|---|
 | The pipeline itself (Node) | `process.env` | present | present | present | present |
-| Repository processes: `install`, `setup`, `verify`, `teardown` hooks, and `preflight`, which runs the repository's `typecheck`, `lint`, and `test` scripts | `repoProcessEnv()` | **present** | stripped | present | present |
+| Repository processes: `install`, `setup`, `verify`, `teardown` hooks, and `preflight`, which runs the repository's `typecheck`, `lint`, and `test` scripts | `repoProcessEnv()` | stripped (`RUNNER_CREDENTIAL_KEYS`) | stripped | present | present |
 | The model process and everything it spawns | `modelProcessEnv()` | stripped (`RUNNER_CREDENTIAL_KEYS`, since AII-396 on 2026-09-02) | one of the two | stripped | stripped unless a gap-fill owns its branch |
 
-The consequence to remember: any code the repository runs under `preflight` or a hook holds the run's own authority. A test suite is repository code. The model process cannot reach the tokens, so "the agent did it" is the wrong model of this failure.
+The consequence to remember: only the runner's own Node process holds the run's authority. Code the repository runs under `preflight`, `install` or a hook (a test suite is repository code) cannot read the run tokens, so it cannot post a report or consume the single-use result token. Forwarded secrets stay available to those processes.
 
 ## Blast radius
 
