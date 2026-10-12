@@ -84,7 +84,7 @@ export interface KeptMachineState {
   heldBy: MachineHold | null;
 }
 
-const claimSchema = z.object({ dispatchId: z.string().min(1), attempt: z.number().int().min(1).optional() }).strict();
+const claimSchema = z.object({ dispatchId: z.string().min(1), attempt: z.number().int().min(1).optional(), app: z.string().min(1).optional() }).strict();
 const attachSchema = z.object({ dispatchId: z.string().min(1), machineId: z.string().min(1), app: z.string().min(1).optional(), attempt: z.number().int().min(1).optional(), replaces: z.string().min(1).optional() }).strict();
 const releaseSchema = z.object({ dispatchId: z.string().min(1) }).strict();
 const expireSchema = z.object({ releasedAt: z.number() }).strict();
@@ -249,6 +249,20 @@ export function createFlyMachineProfile(deps: FlyMachineProfileDeps) {
     const machine = await ctx.get<KeptMachineState>(MACHINE_KEY);
     const decision = decideClaim(machine, input.dispatchId, attempt, await ctx.date.now());
     if (decision.kind === "conflict") throw conflict(decision.message);
+    // The sessions app changed since the machine was created: destroy it where it lives, so the dispatch creates one in the current app.
+    if (input.app !== undefined && machine?.machineId !== undefined && machine.app !== undefined && machine.app !== input.app) {
+      const { machineId, app } = machine;
+      await ctx.run("destroy-other-app", async () => {
+        try {
+          await deps.fly.destroyMachine(machineId, app);
+        } catch (err) {
+          if (!is404(err)) throw err;
+        }
+      }, { maxRetryAttempts: 3 });
+      ctx.set<KeptMachineState>(MACHINE_KEY, { lastUsedAt: decision.next.lastUsedAt, heldBy: decision.next.heldBy });
+      ctx.console.info(`[FlyMachineProfile] claim ${ctx.key} dispatch=${input.dispatchId} attempt=${attempt} destroyed ${machineId} in app ${app} (current app ${input.app})`);
+      return { machineId: null };
+    }
     if (decision.next !== machine) ctx.set<KeptMachineState>(MACHINE_KEY, decision.next);
     ctx.console.info(`[FlyMachineProfile] claim ${ctx.key} dispatch=${input.dispatchId} attempt=${attempt} machine=${decision.machineId ?? "none"}`);
     return { machineId: decision.machineId };
