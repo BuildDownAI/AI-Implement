@@ -711,9 +711,9 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     fixture.dispatchImpl = crashAfterFirstCall(realDispatch);
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
     await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
-    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
     const done = await callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", resultOf(fixture, prepared));
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     expect(done).toMatchObject({ status: "stored" });
     expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!)).status).toBe("finalized");
     expect(fixture.dispatchCalls).toBe(1);
@@ -798,10 +798,10 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const fixture = freshScenario("duplicate-result");
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
     await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
-    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
     const result = resultOf(fixture, prepared);
     const first = await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", result);
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     expect(first).toEqual({ status: "stored", result });
     const second = await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", result);
     expect(second).toEqual({ status: "duplicate", attemptId: fixture.attemptId });
