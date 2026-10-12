@@ -267,6 +267,69 @@ describe("FlyMachineProfile kept machine", () => {
     expect(fly.apps[`clear:${machineId}`]).toEqual(["app-a", "app-a"]);
   }, 30_000);
 
+  it.each(labels)("a claim with another app destroys the machine in its recorded app and answers null (%s)", async (label) => {
+    const key = fresh();
+    const h = forKey(label, key);
+    const machineId = `m-${randomUUID()}`;
+    await h.call("claim", { dispatchId: "d1" });
+    await h.call("attach", { dispatchId: "d1", machineId, app: "app-a" });
+    await h.call("release", { dispatchId: "d1" });
+    expect(await h.call("claim", { dispatchId: "d2", app: "app-b" })).toEqual({ machineId: null });
+    expect(fly.apps[`destroy:${machineId}`]).toEqual(["app-a"]);
+    const machine = await h.status();
+    expect(machine).toMatchObject({ heldBy: { dispatchId: "d2", attempt: 1 } });
+    expect(machine?.machineId).toBeUndefined();
+    expect(machine?.app).toBeUndefined();
+    await h.call("attach", { dispatchId: "d2", machineId: `${machineId}-new`, app: "app-b" });
+    expect(await h.status()).toMatchObject({ machineId: `${machineId}-new`, app: "app-b" });
+  }, 30_000);
+
+  it.each(labels)("a claim with another app treats a 404 from the destroy as done (%s)", async (label) => {
+    const key = fresh();
+    const h = forKey(label, key);
+    const machineId = `m-${randomUUID()}`;
+    await h.call("claim", { dispatchId: "d1" });
+    await h.call("attach", { dispatchId: "d1", machineId, app: "app-a" });
+    await h.call("release", { dispatchId: "d1" });
+    fly.fail404OnDestroy = true;
+    try {
+      expect(await h.call("claim", { dispatchId: "d2", app: "app-b" })).toEqual({ machineId: null });
+    } finally {
+      fly.fail404OnDestroy = false;
+    }
+    expect((await h.status())?.machineId).toBeUndefined();
+  }, 30_000);
+
+  it.each(labels)("a claim with the same app, or with no recorded app, returns the machine and destroys nothing (%s)", async (label) => {
+    const key = fresh();
+    const h = forKey(label, key);
+    const machineId = `m-${randomUUID()}`;
+    await h.call("claim", { dispatchId: "d1" });
+    await h.call("attach", { dispatchId: "d1", machineId, app: "app-a" });
+    await h.call("release", { dispatchId: "d1" });
+    expect(await h.call("claim", { dispatchId: "d2", app: "app-a" })).toEqual({ machineId });
+    expect(fly.apps[`destroy:${machineId}`]).toBeUndefined();
+
+    const key2 = fresh();
+    const h2 = forKey(label, key2);
+    const legacyId = `m-${randomUUID()}`;
+    await h2.call("claim", { dispatchId: "d1" });
+    await h2.call("attach", { dispatchId: "d1", machineId: legacyId });
+    await h2.call("release", { dispatchId: "d1" });
+    expect(await h2.call("claim", { dispatchId: "d2", app: "app-b" })).toEqual({ machineId: legacyId });
+    expect(fly.apps[`destroy:${legacyId}`]).toBeUndefined();
+  }, 30_000);
+
+  it.each(labels)("a claim by another dispatch with another app still 409s and destroys nothing (%s)", async (label) => {
+    const key = fresh();
+    const h = forKey(label, key);
+    const machineId = `m-${randomUUID()}`;
+    await h.call("claim", { dispatchId: "d1" });
+    await h.call("attach", { dispatchId: "d1", machineId, app: "app-a" });
+    await expect(h.call("claim", { dispatchId: "d2", app: "app-b" })).rejects.toThrow(/held by d1/);
+    expect(fly.apps[`destroy:${machineId}`]).toBeUndefined();
+  }, 30_000);
+
   it.each(labels)("expire destroys in the recorded app (%s)", async (label) => {
     const key = fresh();
     const h = mk(() => short, label, key);

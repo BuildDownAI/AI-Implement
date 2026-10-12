@@ -411,6 +411,7 @@ export function createProductionKgRefreshServices(
       repo: parseKgSourceRepo(input.kgSourceRepo).fullName,
       executionMode: (input.resolveExecutionMode ?? (() => resolveKgExecutionMode(config).mode))(),
     }),
+    resolveFlyApp: () => config.flySessionsApp,
     recordDispatchRow: recordKgDispatchRow,
     deriveMachineNonce: (dispatchId, attempt) => deriveMachineNonce(config.runnerTokenSecret ?? "", dispatchId, attempt),
     armMachineNonce: (dispatchId, attempt) => {

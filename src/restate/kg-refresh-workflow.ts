@@ -193,6 +193,8 @@ export interface KgRefreshWorkflowDependencies {
   buildEnvelope(run: KgRefreshRunInput, issueIdentifier: string): RunConfigV1;
   /** Computes the row's values from config and the environment, with no store I/O; the `resolve` step journals the answer. */
   resolveDispatchRecord(dispatchId: string): KgDispatchRecord;
+  /** The Fly sessions app a new kept machine would be created in; `claim` destroys a kept machine recorded in another app. Absent: no app check. */
+  resolveFlyApp?(): string | null;
   /** Projects the journaled record onto the `dispatch_log` row. Idempotent on `dispatchId`. */
   recordDispatchRow(record: KgDispatchRecord): void;
   /** Derives the attempt's machine nonce from the token secret and journaled inputs. Pure; the result is a credential and never a step result. */
@@ -387,9 +389,11 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       const attempt = 1;
       // A journaled call: a replay reuses the claim. The Fly write stays in the dispatch step, which holds the run's tokens.
       // Only a Fly run holds the kept machine.
-      const claim = executionMode === "fly-machines"
-        ? await ctx.objectClient(FlyMachineProfile, "kg-refresh").claim({ dispatchId, attempt })
-        : { machineId: null };
+      let claim: { machineId: string | null } = { machineId: null };
+      if (executionMode === "fly-machines") {
+        const flyApp = deps.resolveFlyApp ? await ctx.run("fly-app", () => deps.resolveFlyApp!()) : null;
+        claim = await ctx.objectClient(FlyMachineProfile, "kg-refresh").claim({ dispatchId, attempt, ...(flyApp ? { app: flyApp } : {}) });
+      }
       // Armed before the dispatch creates the machine, so `/api/token` never sees a row with no nonce.
       if (executionMode !== GHA_EXECUTION_MODE) await ctx.run(`nonce-${attempt}`, () => deps.armMachineNonce(dispatchId, attempt));
       const dispatchResult = await ctx.run(

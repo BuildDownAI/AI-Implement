@@ -3076,9 +3076,11 @@ describe("KgRefresh durable workflow", () => {
       fly: {
         getMachine: (id) => fly.getMachine(id),
         clearMachineEnv: async (id, metadata) => { profileFlyCalls.push(`clear-env:${id}:${Object.keys(metadata ?? {}).join(",")}`); },
-        destroyMachine: async (id) => { profileFlyCalls.push(`destroy:${id}`); },
+        destroyMachine: async (id, app) => { profileFlyCalls.push(`destroy:${id}${app ? `@${app}` : ""}`); },
       },
     });
+    // The sessions app the dispatch creates in and `resolveFlyApp` reports; unset leaves the app check off.
+    let currentFlyApp: string | undefined;
 
     async function keptDispatch(input: KgDispatchInput): Promise<KgDispatchResult> {
       const scenario = scenarios.get(input.dispatchId)!;
@@ -3089,7 +3091,7 @@ describe("KgRefresh durable workflow", () => {
       const launched = await launchKeptMachine(fly, {
         keptMachineId: input.machineId, dispatchId: input.dispatchId, machineConfig, machineNonce: `nonce-${input.dispatchId}`,
       });
-      return { outcome: "accepted", jobId: launched.machineId, executionMode: "fly-machines", machineId: launched.machineId, created: launched.created, replaced: launched.replaced };
+      return { outcome: "accepted", jobId: launched.machineId, executionMode: "fly-machines", machineId: launched.machineId, created: launched.created, replaced: launched.replaced, ...(currentFlyApp && { app: currentFlyApp }) };
     }
 
     const keptStopCalls: Array<{ jobId: string; keep: boolean }> = [];
@@ -3097,6 +3099,7 @@ describe("KgRefresh durable workflow", () => {
       return createKgRefreshWorkflow({
         ...workflowDeps,
         dispatch: keptDispatch,
+        resolveFlyApp: () => currentFlyApp ?? null,
         stopMachineRun: async (_mode, jobId, keep) => {
           keptStopCalls.push({ jobId, keep: keep === true });
           if (keep) await fly.stopMachine(jobId);
@@ -3182,6 +3185,34 @@ describe("KgRefresh durable workflow", () => {
         expect(profileFlyCalls).toContain("clear-env:m-2:durable_until");
         expect(profileFlyCalls.filter((c) => c.endsWith(":m-1"))).toEqual([]);
       } finally {
+        await env.stop();
+      }
+    }, 60_000);
+
+    it("a refresh after a sessions-app change destroys the old kept machine in its app and creates one in the current app", async () => {
+      const env = await startRetryEnabled([buildKeptWorkflow(), kgRepo, starter, profileObject]);
+      try {
+        currentFlyApp = "app-a";
+        const first = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-1", { label: "attach recorded" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", first.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await first.done;
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "first release" });
+        expect((await profileStatus(env.baseUrl())).machine).toMatchObject({ machineId: "m-1", app: "app-a" });
+
+        fly.calls.length = 0;
+        profileFlyCalls.length = 0;
+        currentFlyApp = "app-b";
+        const second = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-2", { label: "new machine recorded" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", second.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await second.done;
+        const status = await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "second release" });
+        expect(status.machine).toMatchObject({ machineId: "m-2", app: "app-b" });
+        expect(fly.calls).toEqual(["create:m-2"]);
+        expect(profileFlyCalls).toContain("destroy:m-1@app-a");
+      } finally {
+        currentFlyApp = undefined;
         await env.stop();
       }
     }, 60_000);
