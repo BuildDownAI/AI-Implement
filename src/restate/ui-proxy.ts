@@ -22,7 +22,7 @@ function matchRoute(method: string, pathname: string): { target: "admin" | "ingr
   const admin = { target: "admin" as const, strip: 0 };
   if (pathname === "/ui" || pathname.startsWith("/ui/")) return admin;
   if (pathname === "/invocations" || pathname.startsWith("/invocations/")) return admin;
-  const read = method === "GET";
+  const read = method === "GET" || method === "HEAD";
   if (read && (pathname === "/health" || pathname === "/version")) return admin;
   if (read && (pathname === "/services" || pathname.startsWith("/services/"))) return admin;
   if (read && (pathname === "/deployments" || pathname.startsWith("/deployments/"))) return admin;
@@ -58,7 +58,7 @@ export function handleRestateUiRequest(
     return true;
   }
   if (gate.role !== "admin") {
-    json(403, "Forbidden");
+    json(403, "This action requires an admin");
     return true;
   }
 
