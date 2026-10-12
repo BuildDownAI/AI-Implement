@@ -1,0 +1,137 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
+
+const gate = vi.hoisted(() => ({ current: null as unknown }));
+vi.mock("../admin-session.js", () => ({ authenticateAdminRequest: () => gate.current }));
+
+import { handleRestateUiRequest } from "../restate/ui-proxy.js";
+
+interface Hit { method: string; url: string; headers: http.IncomingHttpHeaders; body: string }
+
+function stub(hits: Hit[], onReq?: (res: http.ServerResponse) => void) {
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      hits.push({ method: req.method!, url: req.url!, headers: req.headers, body: Buffer.concat(chunks).toString() });
+      if (onReq) return onReq(res);
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("ok");
+    });
+  });
+  return new Promise<http.Server>((r) => server.listen(0, "127.0.0.1", () => r(server)));
+}
+const urlOf = (s: http.Server) => `http://127.0.0.1:${(s.address() as AddressInfo).port}`;
+
+const adminOk = { ok: true, identity: { email: "a@x.com" }, entry: null, role: "admin" };
+
+describe("handleRestateUiRequest", () => {
+  let adminHits: Hit[], ingressHits: Hit[];
+  let adminStub: http.Server, ingressStub: http.Server, front: http.Server;
+  let handled: boolean[];
+  let adminUrl = "", ingressUrl = "";
+  let adminOnReq: ((res: http.ServerResponse) => void) | undefined;
+  let logSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(async () => {
+    adminHits = []; ingressHits = []; handled = []; adminOnReq = undefined;
+    gate.current = adminOk;
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    adminStub = await stub(adminHits, (res) => (adminOnReq ? adminOnReq(res) : (res.writeHead(200, { "content-type": "text/plain" }), res.end("ok"))));
+    ingressStub = await stub(ingressHits);
+    adminUrl = urlOf(adminStub); ingressUrl = urlOf(ingressStub);
+    front = http.createServer((req, res) => {
+      const h = handleRestateUiRequest(req, res, { adminConfigured: true, adminBaseUrl: adminUrl, ingressBaseUrl: ingressUrl });
+      handled.push(h);
+      if (!h) { res.writeHead(418); res.end("fallthrough"); }
+    });
+    await new Promise<void>((r) => front.listen(0, "127.0.0.1", () => r()));
+  });
+  afterEach(async () => {
+    for (const s of [front, adminStub, ingressStub]) { s.closeAllConnections(); if (s.listening) await new Promise((r) => s.close(r)); }
+    logSpy.mockRestore();
+  });
+
+  const call = (method: string, path: string, body?: string, headers: Record<string, string> = {}) =>
+    fetch(`${urlOf(front)}${path}`, { method, body, headers });
+
+  it("401 without a session and 403 for a user role; no upstream is hit", async () => {
+    gate.current = { ok: false, status: 401, error: "Unauthorized" };
+    expect((await call("GET", "/ui/")).status).toBe(401);
+    gate.current = { ok: true, identity: { email: "u@x.com" }, entry: null, role: "user" };
+    expect((await call("GET", "/services")).status).toBe(403);
+    expect((await call("POST", "/admin/restate/ingress/restate/call/S/k/h")).status).toBe(403);
+    expect(adminHits).toHaveLength(0);
+    expect(ingressHits).toHaveLength(0);
+  });
+
+  it("routes each allowlist row to the right upstream and path", async () => {
+    const admin: Array<[string, string]> = [
+      ["GET", "/ui"], ["GET", "/ui/assets/x.js"], ["GET", "/health"], ["GET", "/version"],
+      ["GET", "/services"], ["GET", "/services/x/openapi"], ["GET", "/deployments"], ["GET", "/deployments/d1"],
+      ["POST", "/query"], ["PATCH", "/invocations/x/cancel"], ["DELETE", "/invocations/x/purge"], ["POST", "/deployments"],
+    ];
+    for (const [m, p] of admin) expect((await call(m, `${p}?a=1`)).status).toBe(200);
+    expect(adminHits.map((h) => `${h.method} ${h.url}`)).toEqual(admin.map(([m, p]) => `${m} ${p}?a=1`));
+    expect(ingressHits).toHaveLength(0);
+
+    await call("POST", "/admin/restate/ingress/restate/call/S/k/h?x=y", "{}");
+    expect(ingressHits.map((h) => `${h.method} ${h.url} ${h.body}`)).toEqual(["POST /restate/call/S/k/h?x=y {}"]);
+  });
+
+  it("does not handle other paths or methods and reaches no upstream", async () => {
+    for (const [m, p] of [["GET", "/api/kg/status"], ["GET", "/"], ["POST", "/mcp"], ["GET", "/uix"], ["POST", "/health"], ["DELETE", "/services"], ["GET", "/query"]]) {
+      const r = await call(m, p);
+      expect(r.status).toBe(418);
+    }
+    expect(handled.every((h) => h === false)).toBe(true);
+    expect(adminHits).toHaveLength(0);
+    expect(ingressHits).toHaveLength(0);
+  });
+
+  it("strips cookie and authorization but forwards other headers", async () => {
+    await call("POST", "/admin/restate/ingress/restate/call/S/k/h", "{}", { cookie: "s=1", authorization: "Bearer t", "content-type": "application/json" });
+    await call("GET", "/services", undefined, { cookie: "s=1", authorization: "Bearer t" });
+    for (const h of [...ingressHits, ...adminHits]) {
+      expect(h.headers.cookie).toBeUndefined();
+      expect(h.headers.authorization).toBeUndefined();
+    }
+    expect(ingressHits[0].headers["content-type"]).toBe("application/json");
+  });
+
+  it("logs non-read requests except POST /query", async () => {
+    await call("PATCH", "/invocations/x/cancel");
+    await call("GET", "/services");
+    await call("POST", "/query", "{}");
+    const lines = logSpy.mock.calls.map((c: unknown[]) => String(c[0])).filter((l: string) => l.startsWith("[restate-ui]"));
+    expect(lines).toEqual(["[restate-ui] a@x.com PATCH /invocations/x/cancel"]);
+  });
+
+  it("does not throw for an access-code session (no identity)", async () => {
+    gate.current = { ok: true, identity: null, entry: null, role: "admin" };
+    expect((await call("PATCH", "/invocations/x/cancel")).status).toBe(200);
+  });
+
+  it("streams the upstream body chunk by chunk and drops transfer-encoding", async () => {
+    let finish!: () => void;
+    adminOnReq = (res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write("first");
+      finish = () => res.end("second");
+    };
+    const r = await call("GET", "/services");
+    expect(r.headers.get("content-type")).toBe("text/event-stream");
+    const reader = r.body!.getReader();
+    const first = await reader.read();
+    expect(new TextDecoder().decode(first.value)).toBe("first");
+    finish();
+    const second = await reader.read();
+    expect(new TextDecoder().decode(second.value)).toBe("second");
+  });
+
+  it("answers 502 when the upstream is unreachable", async () => {
+    await new Promise((r) => { adminStub.closeAllConnections(); adminStub.close(r); });
+    expect((await call("GET", "/health")).status).toBe(502);
+  });
+});

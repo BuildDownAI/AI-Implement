@@ -260,6 +260,34 @@ describe("env allowlist (AII-728)", () => {
     }
   });
 
+  it("advertises the ingress through the orchestrator origin when OAUTH_REDIRECT_BASE_URL is set (AII-1261)", async () => {
+    const run = async (base: string | undefined) => {
+      const dataDir = makeTmpDir();
+      const script = join(dataDir, "fake-server.sh");
+      writeScript(script, "sleep 60");
+      if (base === undefined) vi.stubEnv("OAUTH_REDIRECT_BASE_URL", ""); else vi.stubEnv("OAUTH_REDIRECT_BASE_URL", base);
+      const spawnSpy = vi.fn(testSpawn);
+      const sidecar = new RestateSidecar(
+        { dataDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+        { httpGet: async () => true, spawn: spawnSpy, resolveBinary: () => script },
+      );
+      try {
+        await sidecar.start();
+        const [, , o] = spawnSpy.mock.calls[0] as [string, string[], { env?: NodeJS.ProcessEnv }];
+        return o.env ?? {};
+      } finally {
+        await sidecar.stop();
+        vi.unstubAllEnvs();
+      }
+    };
+    const withBase = await run("https://orch.example/");
+    expect(withBase.RESTATE_INGRESS__ADVERTISED_ADDRESS).toBe("https://orch.example/admin/restate/ingress/");
+    expect(withBase.RESTATE_INGRESS__BIND_ADDRESS).toBe(RESTATE_INGRESS_BIND_ADDRESS);
+    expect(withBase.RESTATE_ADMIN__BIND_ADDRESS).toBe(new URL(RESTATE_ADMIN_BASE_URL).host);
+    const without = await run(undefined);
+    expect(without).not.toHaveProperty("RESTATE_INGRESS__ADVERTISED_ADDRESS");
+  });
+
   it("a fixed RESTATE_* constant wins over an operator-set override of the same key", async () => {
     const dataDir = makeTmpDir();
     const script = join(dataDir, "fake-server.sh");

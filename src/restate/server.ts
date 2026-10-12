@@ -21,6 +21,9 @@ export const RESTATE_ADMIN_BASE_URL = "http://127.0.0.1:9070";
 export const RESTATE_INGRESS_BIND_ADDRESS = "127.0.0.1:8081";
 export const RESTATE_INGRESS_BASE_URL = `http://${RESTATE_INGRESS_BIND_ADDRESS}`;
 
+/** Path on the orchestrator origin that forwards to the ingress for admins (src/restate/ui-proxy.ts). */
+export const RESTATE_UI_INGRESS_PREFIX = "/admin/restate/ingress";
+
 const RESTATE_ADMIN_BIND_ADDRESS = new URL(RESTATE_ADMIN_BASE_URL).host; // "127.0.0.1:9070"
 const RESTATE_HEALTH_URL = `${RESTATE_ADMIN_BASE_URL}/health`;
 
@@ -269,6 +272,9 @@ export class RestateSidecar {
       RESTATE_DEFAULT_NUM_PARTITIONS: RESTATE_DEFAULT_NUM_PARTITIONS,
       RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE: RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE,
     });
+    // The address the UI playground calls (AII-1261, ADR 039). Unset leaves the loopback default for local dev.
+    const publicBase = process.env.OAUTH_REDIRECT_BASE_URL?.trim().replace(/\/+$/, "");
+    if (publicBase) childEnv.RESTATE_INGRESS__ADVERTISED_ADDRESS = `${publicBase}${RESTATE_UI_INGRESS_PREFIX}/`;
 
     const child = this._spawn(bin, ["--no-logo"], {
       stdio: ["ignore", "inherit", "inherit"],
