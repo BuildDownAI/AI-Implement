@@ -197,7 +197,7 @@ describe("kg fly machine profile control (AII-1116)", () => {
   type Reply = { status: number; body: unknown };
   const profile = { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000, source: "profile" };
 
-  function mount(opts: { flyMachine?: unknown; saveReply?: Reply }) {
+  function mount(opts: { flyMachine?: unknown; runProfile?: unknown; saveReply?: Reply }) {
     const dom = new JSDOM(`<!DOCTYPE html><body>${kgPipelinesHtml}</body>`, {
       runScripts: "dangerously",
       url: "http://localhost/admin#kg-pipelines",
@@ -212,10 +212,11 @@ describe("kg fly machine profile control (AII-1116)", () => {
     win.api = async (url: string, init?: { body?: string }) => {
       calls.push({ url, body: init?.body ? JSON.parse(init.body) : undefined });
       if (url === "/api/tools/get_kg_status") {
-        const payload = { flyMachine: opts.flyMachine ?? profile };
+        const { source, ...config } = (opts.flyMachine ?? profile) as typeof profile;
+        const payload = { runProfile: opts.runProfile ?? { backend: "fly-machines", config, source } };
         return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: JSON.stringify(payload) }] }) };
       }
-      if (url === "/api/tools/set_fly_machine_profile") {
+      if (url === "/api/tools/set_run_profile") {
         const r = opts.saveReply ?? { status: 200, body: { content: [{ type: "text", text: "{}" }] } };
         return { ok: r.status >= 200 && r.status < 300, status: r.status, json: async () => r.body };
       }
@@ -268,8 +269,8 @@ describe("kg fly machine profile control (AII-1116)", () => {
     win.refreshKgFlyDirty();
     await win.saveKgFlyMachine();
     await settle();
-    const save = calls.find((c) => c.url === "/api/tools/set_fly_machine_profile");
-    expect(save?.body).toEqual({ args: { pipeline: "kg-refresh", memoryMb: 4096 } });
+    const save = calls.find((c) => c.url === "/api/tools/set_run_profile");
+    expect(save?.body).toEqual({ args: { pipeline: "kg-refresh", backend: "fly-machines", patch: { memoryMb: 4096 } } });
     expect(calls.filter((c) => c.url === "/api/tools/get_kg_status").length).toBe(2);
   });
 
@@ -279,8 +280,8 @@ describe("kg fly machine profile control (AII-1116)", () => {
     el("kg-fly-idle-hours").value = "1.5";
     win.setKgFlyCpuKind("shared");
     await win.saveKgFlyMachine();
-    const save = calls.find((c) => c.url === "/api/tools/set_fly_machine_profile");
-    expect(save?.body).toEqual({ args: { pipeline: "kg-refresh", cpuKind: "shared", idleTimeoutMs: 5400000 } });
+    const save = calls.find((c) => c.url === "/api/tools/set_run_profile");
+    expect(save?.body).toEqual({ args: { pipeline: "kg-refresh", backend: "fly-machines", patch: { cpuKind: "shared", idleTimeoutMs: 5400000 } } });
   });
 
   it("shows a 400 answer's error in #kg-pipelines-error", async () => {
@@ -297,7 +298,7 @@ describe("kg fly machine profile control (AII-1116)", () => {
   it("shows 'admin only' for a 403 and leaves the inputs alone", async () => {
     for (const reply of [
       { status: 403, body: { error: "forbidden" } },
-      { status: 200, body: { isError: true, content: [{ type: "text", text: "forbidden: set_fly_machine_profile requires the admin role" }] } },
+      { status: 200, body: { isError: true, content: [{ type: "text", text: "forbidden: set_run_profile requires the admin role" }] } },
     ]) {
       const { win, el } = mount({ saveReply: reply });
       await win.loadKgFlyMachine();
@@ -342,7 +343,14 @@ describe("kg backend control (AII-1218)", () => {
     win.registerPage = () => {};
     win.api = async (url: string) => {
       if (url === "/api/tools/get_kg_status") {
-        const payload = { executionMode, flyMachine: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000, source: "default" } };
+        const backend = (executionMode as { effective: string }).effective;
+        const runProfile =
+          backend === "fly-machines"
+            ? { backend, config: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000 }, source: "default" }
+            : backend === "github-actions"
+              ? { backend, config: { jobTimeoutMinutes: 90 }, source: "default" }
+              : undefined;
+        const payload = { executionMode, runProfile };
         return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: JSON.stringify(payload) }] }) };
       }
       if (url === "/api/kg/execution-mode") return { ok: true, status: 200, json: async () => ({ mode: "fly-machines", source: "db" }) };
@@ -387,6 +395,19 @@ describe("kg backend control (AII-1218)", () => {
     expect(hidden("kg-fly-machine-effective")).toBe(true);
   });
 
+  it("shows only the GitHub Actions row when the effective backend is GitHub Actions", async () => {
+    const { win, hidden } = mount({ effective: "github-actions", source: "kg-setting", setting: "github-actions" });
+    await win.loadKgFlyMachine();
+    expect(hidden("kg-gha-controls")).toBe(false);
+    expect(hidden("kg-gha-note")).toBe(false);
+  });
+
+  it("hides every run-profile row for local Docker", async () => {
+    const { win, hidden } = mount({ effective: "local-docker", source: "runner-mode", setting: "fly-machines" });
+    await win.loadKgFlyMachine();
+    for (const id of ["kg-fly-machine-controls", "kg-fly-machine-effective", "kg-gha-controls", "kg-gha-note"]) expect(hidden(id)).toBe(true);
+  });
+
   it.each([
     [{ effective: "fly-machines", source: "runner-mode", setting: "fly-machines" }, "next run: Fly machines (runner mode fly)"],
     [{ effective: "github-actions", source: "runner-mode", setting: "fly-machines" }, "next run: GitHub Actions (runner mode gha overrides the KG setting)"],
@@ -395,5 +416,84 @@ describe("kg backend control (AII-1218)", () => {
     const { win, text } = mount(em);
     await win.loadKgFlyMachine();
     expect(text("kg-backend-effective")).toBe(line);
+  });
+});
+
+describe("kg github-actions run profile (AII-1245)", () => {
+  const ghaProfile = { backend: "github-actions", config: { jobTimeoutMinutes: 90 }, source: "default" };
+
+  function mount(saveReply?: { status: number; body: unknown }) {
+    const dom = new JSDOM(`<!DOCTYPE html><body>${kgPipelinesHtml}</body>`, { runScripts: "dangerously", url: "http://localhost/admin#kg-pipelines" });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const win = dom.window as any;
+    const esc = (v: unknown) => String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    win.esc = esc;
+    win.escAttr = esc;
+    win.registerPage = () => {};
+    const calls: { url: string; body: unknown }[] = [];
+    win.api = async (url: string, init?: { body?: string }) => {
+      calls.push({ url, body: init?.body ? JSON.parse(init.body) : undefined });
+      if (url === "/api/tools/get_kg_status") {
+        return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: JSON.stringify({ runProfile: ghaProfile }) }] }) };
+      }
+      if (url === "/api/tools/set_run_profile") {
+        const r = saveReply ?? { status: 200, body: { content: [{ type: "text", text: "{}" }] } };
+        return { ok: r.status >= 200 && r.status < 300, status: r.status, json: async () => r.body };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    };
+    const script = dom.window.document.createElement("script");
+    script.textContent = kgPipelinesScript;
+    dom.window.document.head.appendChild(script);
+    const doc = dom.window.document;
+    const el = (id: string) => doc.getElementById(id) as HTMLInputElement;
+    return { win, el, calls };
+  }
+
+  it("renders the stored timeout, the note, and no Fly controls", async () => {
+    const { win, el } = mount();
+    await win.loadKgFlyMachine();
+    expect(el("kg-gha-job-timeout").value).toBe("90");
+    expect(el("kg-gha-controls").hidden).toBe(false);
+    expect(el("kg-fly-machine-controls").hidden).toBe(true);
+    expect(el("kg-gha-note").textContent).toBe(
+      "Runner size comes from the KG repo's `AI_IMPLEMENT_RUNNER_LABEL` Actions variable. GitHub owns the machines, so there is no kept machine or idle time.",
+    );
+    expect(el("btn-kg-gha-save").disabled).toBe(true);
+  });
+
+  it("saves through set_run_profile with the github-actions backend", async () => {
+    const { win, el, calls } = mount();
+    await win.loadKgFlyMachine();
+    el("kg-gha-job-timeout").value = "120";
+    win.refreshKgGhaDirty();
+    expect(el("btn-kg-gha-save").disabled).toBe(false);
+    await win.saveKgGhaProfile();
+    const save = calls.find((c) => c.url === "/api/tools/set_run_profile");
+    expect(save?.body).toEqual({ args: { pipeline: "kg-refresh", backend: "github-actions", patch: { jobTimeoutMinutes: 120 } } });
+  });
+
+  it("blocks out-of-range and non-integer timeouts", async () => {
+    const { win, el, calls } = mount();
+    await win.loadKgFlyMachine();
+    for (const v of ["5", "400", "90.5", ""]) {
+      el("kg-gha-job-timeout").value = v;
+      win.refreshKgGhaDirty();
+      expect(el("btn-kg-gha-save").disabled).toBe(true);
+    }
+    await win.saveKgGhaProfile();
+    expect(calls.some((c) => c.url === "/api/tools/set_run_profile")).toBe(false);
+  });
+
+  it("keeps a dirty value across a poll and after a 403", async () => {
+    const { win, el } = mount({ status: 403, body: { error: "forbidden" } });
+    await win.loadKgFlyMachine();
+    el("kg-gha-job-timeout").value = "120";
+    win.refreshKgGhaDirty();
+    await win.loadKgFlyMachine();
+    expect(el("kg-gha-job-timeout").value).toBe("120");
+    await win.saveKgGhaProfile();
+    expect(el("kg-pipelines-error").textContent).toBe("admin only");
+    expect(el("kg-gha-job-timeout").value).toBe("120");
   });
 });
