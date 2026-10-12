@@ -476,6 +476,17 @@ describe("kg github-actions run profile (AII-1245)", () => {
     expect(save?.body).toEqual({ args: { pipeline: "kg-refresh", backend: "github-actions", patch: { jobTimeoutMinutes: 120 } } });
   });
 
+  it("shows a 400 answer's error in #kg-pipelines-error", async () => {
+    const wrapped = { content: [{ type: "text", text: JSON.stringify({ status: 400, body: { error: "jobTimeoutMinutes must be between 10 and 360" } }) }] };
+    const { win, el } = mount({ status: 200, body: wrapped });
+    await win.loadKgRunProfile();
+    el("kg-gha-job-timeout").value = "120";
+    win.refreshKgGhaDirty();
+    await win.saveKgGhaProfile();
+    expect(el("kg-pipelines-error").textContent).toContain("jobTimeoutMinutes must be between 10 and 360");
+    expect(el("kg-pipelines-error").hidden).toBe(false);
+  });
+
   it("blocks out-of-range and non-integer timeouts", async () => {
     const { win, el, calls } = mount();
     await win.loadKgRunProfile();
