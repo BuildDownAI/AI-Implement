@@ -373,7 +373,7 @@ function heldSubjects(rows: ClassifyRefreshAnomalyInput["partRows"]): string[] {
 
 /**
  * Classifies a refresh into at most one of the five learning classes, in the
- * precedence order the ticket lists them (guard-refused, guard-held, source-missing,
+ * precedence order the ticket lists them (guard-held, guard-refused, source-missing,
  * count-step, ingest-warnings). Returns null for a clean run — nothing to post.
  */
 export function classifyRefreshAnomaly(input: ClassifyRefreshAnomalyInput): RefreshAnomaly | null {
