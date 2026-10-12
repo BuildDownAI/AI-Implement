@@ -2156,3 +2156,33 @@ describe("collectClosedReviewThreadCommentUrls", () => {
     expect(collectClosedReviewThreadCommentUrls(() => page([], true, null), "42")).toBeUndefined();
   });
 });
+
+describe("🔴/🟡 headings in a Claude summary", () => {
+  const claude = (body: string) => ({ user: { login: "claude[bot]", type: "Bot" }, body, html_url: "https://x/c" });
+
+  it("records a 🔴 heading as blocking from a trusted claude[bot] summary", () => {
+    const result = classifyReviewIssueComment(claude("## Code Review\n\n### 🔴 Not actually 'no behavior change'\n- New guard added.\n"));
+    expect(result?.findings).toEqual([
+      expect.objectContaining({ source: "claude-review-summary", severity: "blocking", body: "New guard added." }),
+    ]);
+  });
+
+  it("records no blocking finding for 🟡 and 🟣 sections only", () => {
+    const result = classifyReviewIssueComment(claude("## Code Review\n\n### 🟡 Nit\n- a\n\n### 🟣 Old\n- b\n"));
+    expect(result?.findings.filter((f) => f.severity === "blocking")).toEqual([]);
+  });
+
+  it("ignores the same 🔴 body from an untrusted author", () => {
+    const result = classifyReviewIssueComment({ user: { login: "mallory", type: "User" }, body: "## Code Review\n\n### 🔴 Bad\n- x\n" });
+    expect(result).toBeNull();
+  });
+
+  it("maps 🔴/🟡 headings in the github-actions shape and keeps word rules otherwise", () => {
+    const body = (heading: string) => `**Claude finished**\n\n### ${heading}\n- item one\n`;
+    const sev = (h: string) => extractGithubActionsClaudeReviewFindings(body(h)).findings[0]?.severity;
+    expect(sev("🔴 Not actually fine")).toBe("blocking");
+    expect(sev("🟡 Something")).toBe("minor");
+    expect(sev("Minor notes")).toBe("minor");
+    expect(sev("Findings")).toBe("medium");
+  });
+});

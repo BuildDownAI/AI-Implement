@@ -344,6 +344,7 @@ describe("new-project stepper — review step", () => {
 describe("new-project stepper — review process and trusted authors", () => {
   it("renders the select options and the exact hints", () => {
     expect(stepperHtml).toContain('<option value="claude-code-review">Claude Code Review</option>');
+    expect(stepperHtml).toContain('<option value="claude-code-review-repository-fix">Claude Code Review, repository auto-fix</option>');
     expect(stepperHtml).toContain("Extra bot or user logins whose review findings count, in addition to the review process's own authors. A trusted author can approve a PR.");
   });
 

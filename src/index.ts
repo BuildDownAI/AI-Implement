@@ -113,7 +113,7 @@ import { type RunConfigV1, encodeRunConfig, buildImplRunConfig } from "./run-con
 import { resolveBaseBranch, findOpenRollUpPr, resolvePlanningBranch } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
-import { runGroupingBranchAutoMerge } from "./auto-merge.js";
+import { runAutoMerges } from "./auto-merge.js";
 import { getPendingReviewFixes, listReviewFixEvents, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, acceptReviewFixWebhookEvent, buildReviewFixTaskDescription, MAX_TASK_FINDINGS } from "./review-fix-queue.js";
 import { initReviewFixEvidenceTable, sweepExpiredReviewFixEvidence } from "./review-fix-evidence.js";
 import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
@@ -148,6 +148,7 @@ import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANN
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
+import { resolveReviewProcess } from "./review-process.js";
 import { createLateExternalReviewIngressClient, createLateExternalReviewSubmitHook, createProductionLateExternalReviewServices } from "./restate/late-external-review.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
 import { handleJournalRequest } from "./restate/journal-query.js";
@@ -594,12 +595,12 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     }
 
     // Merge approved child PRs into grouping branches (cascade self-healing). Runs for all
-    // non-paused projects — the top-of-tree feature→base PR still requires human review.
-    // (AII-349: always-on so a reopened parent's approved children merge without per-project opt-in.)
+    // non-paused projects whose Auto-merge setting is on (runAutoMerges checks the flag); a project
+    // with it off leaves approved children for a person. The top-of-tree feature→base PR still requires human review.
     try {
       const nonPausedMappings = Object.values(teamRepoMap);
       if (nonPausedMappings.length > 0) {
-        await runGroupingBranchAutoMerge(nonPausedMappings, {
+        await runAutoMerges(nonPausedMappings, {
           githubAppId: config.githubAppId,
           githubAppPrivateKey: config.githubAppPrivateKey,
           notify: config.notifyWebhookUrl
@@ -3532,6 +3533,13 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         }
         continue;
       }
+      // The repository's auto-fix owns the PR: the ledger findings stay for LateExternalReview, nothing dispatches.
+      if (resolveReviewProcess(mapping.reviewProcess).fixer === "repository") {
+        updateReviewFixStatus(fix.id, "skipped");
+        console.log(`[review-fix] Project ${fix.repo} delegates fixes to the repository `
+          + `(${resolveReviewProcess(mapping.reviewProcess).id}), skipping review fix #${fix.id}`);
+        continue;
+      }
       if (mapping.ticketingProvider === "filesystem" && runnerMode !== "local") {
         console.warn(`[review-fix] Filesystem project ${scopeKey} requires local runner mode`);
         updateReviewFixStatus(fix.id, "skipped");
@@ -4043,13 +4051,19 @@ async function handleKgRefreshOutcome(
 const reviewFixAttemptStore = new SqliteReviewFixAttemptStore();
 const kgRefreshIngressClient = createKgRefreshIngressClient();
 // AII-1227: starts LateExternalReview only while the sidecar is ready and the endpoint registered.
-const lateExternalReviewSubmitHook = createLateExternalReviewSubmitHook({
+const submitLateExternalReview = createLateExternalReviewSubmitHook({
   ingress: createLateExternalReviewIngressClient(),
   restateReady: () => {
     const restate = getRestateStatus();
     return restate.sidecar.state === "ready" && restate.registration.state === "registered";
   },
 });
+// A repository-fix project's workflow follows the auto-fix to its new head (ADR 038); the mode rides the input.
+const lateExternalReviewSubmitHook: typeof submitLateExternalReview = (input) => {
+  const mapping = Object.values(getMappings()).find((m) => m.owner === input.owner && m.repo === input.repo);
+  const followHead = resolveReviewProcess(mapping?.reviewProcess).fixer === "repository";
+  return submitLateExternalReview(followHead ? { ...input, followHead } : input);
+};
 const reviewFixIngressClient = createReviewFixIngressClient();
 
 /** Maps a `callToolAsSystem` result carrying `{ status, body }` text onto the REST shape (AII-901). */

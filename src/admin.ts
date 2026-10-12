@@ -21,7 +21,7 @@ import {
   setMappingPaused,
   deleteMapping,
 } from "./config.js";
-import type { ReviewProcessId } from "./review-process.js";
+import { isReviewProcessId, type ReviewProcessId } from "./review-process.js";
 import type { RepoMapping, ExecutionMode, SessionMode, ClaudeProvider, ReviewerSelection } from "./config.js";
 import {
   getRunnerMode,
@@ -3334,10 +3334,10 @@ export async function upsertMappingAction(
     reviewProcess = existingMapping?.reviewProcess ?? null;
   } else if (body.reviewProcess === null || body.reviewProcess === "ai-implement") {
     reviewProcess = null;
-  } else if (body.reviewProcess === "claude-code-review") {
-    reviewProcess = "claude-code-review";
+  } else if (isReviewProcessId(body.reviewProcess)) {
+    reviewProcess = body.reviewProcess;
   } else {
-    return { status: 400, body: { error: `reviewProcess invalid: must be null, "ai-implement", or "claude-code-review"` } };
+    return { status: 400, body: { error: `reviewProcess invalid: must be null, "ai-implement", "claude-code-review", or "claude-code-review-repository-fix"` } };
   }
 
   const mapping: RepoMapping = {

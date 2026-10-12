@@ -18,6 +18,7 @@ import { getCombinedChecksState, getCommitTime, getPullRequestState, listPrComme
 import { getInstallationToken } from "../github-app-auth.js";
 import { getJobByDispatchId, stampJobApproved } from "../log.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
+import { reviewCheckSucceeded } from "../review-head-clean.js";
 import type { RestateService } from "./endpoint.js";
 import { restateRetentionMs } from "./retention.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
@@ -36,12 +37,14 @@ export const lateExternalReviewInputSchema = z.object({
   prNumber: z.number().int().positive(),
   prUrl: z.string().min(1),
   headSha: z.string().min(1),
+  /** Repository-fix review process: follow the PR's head past the reviewed commit instead of ending `superseded`. Optional so an in-flight workflow still parses. */
+  followHead: z.boolean().optional(),
 }).strict();
 
 export type LateExternalReviewInput = z.infer<typeof lateExternalReviewInputSchema>;
 
 /** `superseded`: PR closed or head moved. `external-failed`: checks failed. `findings`: an open blocking
- *  finding (the review-fix rail owns it). `timed-out`: today's behaviour, manual review. `no-job`: the
+ *  finding (the review-fix rail owns it; not in follow mode, which keeps waiting). `timed-out`: today's behaviour, manual review. `no-job`: the
  *  dispatch row is gone, so there is no mark to write and no comment is posted. */
 export type LateExternalReviewOutcome =
   | "approved" | "superseded" | "external-failed" | "findings" | "timed-out" | "no-job";
@@ -54,7 +57,7 @@ export interface LateReviewTick {
   open: boolean;
   headSha: string | null;
   checks: "success" | "pending" | "failure";
-  /** Committer time of the reviewed head, epoch ms; `null` when the head is not the reviewed one. */
+  /** Committer time of the head, epoch ms; `null` when the head is not the one this tick reads (the reviewed head, or the current head in follow mode). */
   headCommittedAtMs: number | null;
   /** `last_seen_at` (epoch ms) of every open `blocking` finding in the orchestrator's ledger. */
   blockingLastSeenAtMs: number[];
@@ -93,15 +96,22 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
       return { outcome };
     }
 
+    let approvedHeadSha = input.headSha;
     for (let i = 0; ; i++) {
       const tick = await ctx.run(`read-${i}`, () => deps.readTick(input), { maxRetryAttempts: 5 });
-      if (!tick.open || tick.headSha !== input.headSha) return end("superseded");
+      // Follow mode: the head moving is the expected result of the repository's auto-fix, so only a close ends it.
+      if (!tick.open || (!input.followHead && tick.headSha !== input.headSha)) return end("superseded");
       if (tick.checks === "failure") return end("external-failed");
       // A finding last seen before the head was committed was not reported by a review of this head
       // (a fix pass may have fixed it); one seen at or after the commit time blocks.
       const commitMs = tick.headCommittedAtMs;
-      if (tick.blockingLastSeenAtMs.some((seen) => commitMs === null || seen >= commitMs)) return end("findings");
-      if (tick.checks === "success") break;
+      const blocked = tick.blockingLastSeenAtMs.some((seen) => commitMs === null || seen >= commitMs);
+      // Follow mode keeps waiting on a 🔴: the repository's auto-fix may push again, and the next head is read afresh.
+      if (blocked && !input.followHead) return end("findings");
+      if (tick.checks === "success" && !blocked) {
+        if (input.followHead && tick.headSha) approvedHeadSha = tick.headSha;
+        break;
+      }
       if ((await ctx.date.now()) - startedAt >= deadlineMs) return end("timed-out");
       await ctx.sleep(intervalMs);
     }
@@ -114,7 +124,7 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
       if (!(await deps.hasComment(input, LATE_EXTERNAL_APPROVAL_MARKER))) {
         await deps.postComment(
           input,
-          `${LATE_EXTERNAL_APPROVAL_MARKER}\nThe external review passed on \`${input.headSha}\` after the run ended, with no open blocking finding. The run's approval mark is written, so auto-merge can proceed.`,
+          `${LATE_EXTERNAL_APPROVAL_MARKER}\nThe external review passed on \`${approvedHeadSha}\` after the run ended, with no open blocking finding. The run's approval mark is written, so auto-merge can proceed.`,
         );
       }
       return "approved";
@@ -146,10 +156,15 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
       // An unreadable PR throws so the step retries; it is not evidence that the PR closed.
       if (!pr) throw new Error(`late-external-review: PR #${input.prNumber} unreadable`);
       const open = pr.state === "open";
-      if (!open || pr.headSha !== input.headSha) {
+      if (!open || !pr.headSha || (!input.followHead && pr.headSha !== input.headSha)) {
         return { open, headSha: pr.headSha, checks: "pending", headCommittedAtMs: null, blockingLastSeenAtMs: [] };
       }
-      const checks = await getCombinedChecksState(t, input.owner, input.repo, pr.headSha);
+      let checks = await getCombinedChecksState(t, input.owner, input.repo, pr.headSha);
+      if (input.followHead && checks === "success" && !(await reviewCheckSucceeded(t, input.owner, input.repo, pr.headSha))) {
+        // A head pushed a moment ago has no check runs yet, which reads as "success". Its own review must
+        // have completed with `success` before the head can count as clean (a skipped run is not a review).
+        checks = "pending";
+      }
       // The ledger is keyed by "owner/repo" (see the review-fix queue in src/index.ts).
       const blockingLastSeenAtMs = listOpenReviewFindings(`${input.owner}/${input.repo}`, input.prNumber)
         .filter((f) => f.severity === "blocking").map((f) => f.lastSeenAt);
