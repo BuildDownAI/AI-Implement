@@ -237,6 +237,16 @@ describe("LateExternalReview workflow", () => {
           expect(sc.comments).toEqual([]);
         });
 
+        it("ends timed-out with no mark when the new head's review never reads as done", async () => {
+          // The fake readTick returns fixtures, so this covers the workflow side only: a new head whose
+          // checks stay "pending" (what a completed+skipped run reads as) never approves. The
+          // skipped-to-pending mapping itself is asserted in late-external-review-tick.test.ts.
+          const { result, sc } = await runScenario(url(), { ticks: [pending, onB] }, true);
+          expect(result).toEqual({ outcome: "timed-out" });
+          expect(sc.stamps).toEqual([]);
+          expect(sc.comments).toEqual([]);
+        });
+
         it("ends superseded with no mark when the PR closes while waiting", async () => {
           const { result, sc } = await runScenario(url(), { ticks: [pending, onB, { ...onB, open: false }] }, true);
           expect(result).toEqual({ outcome: "superseded" });

@@ -14,11 +14,11 @@ import * as restateClients from "@restatedev/restate-sdk-clients";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { AppConfig } from "../index.js";
-import { getCombinedChecksState, getCommitTime, getPullRequestState, listCheckRuns, listPrComments, postPrComment } from "../github.js";
+import { getCombinedChecksState, getCommitTime, getPullRequestState, listPrComments, postPrComment } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { getJobByDispatchId, stampJobApproved } from "../log.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
-import { isReviewCheckRun, REVIEW_PROCESSES } from "../review-process.js";
+import { reviewCheckSucceeded } from "../review-head-clean.js";
 import type { RestateService } from "./endpoint.js";
 import { restateRetentionMs } from "./retention.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
@@ -160,12 +160,10 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
         return { open, headSha: pr.headSha, checks: "pending", headCommittedAtMs: null, blockingLastSeenAtMs: [] };
       }
       let checks = await getCombinedChecksState(t, input.owner, input.repo, pr.headSha);
-      if (input.followHead && checks === "success") {
+      if (input.followHead && checks === "success" && !(await reviewCheckSucceeded(t, input.owner, input.repo, pr.headSha))) {
         // A head pushed a moment ago has no check runs yet, which reads as "success". Its own review must
-        // have completed before the head can count as clean.
-        const runs = await listCheckRuns(t, input.owner, input.repo, pr.headSha);
-        const reviewDone = runs.some((r) => r.status === "completed" && isReviewCheckRun(r, REVIEW_PROCESSES["claude-code-review-repository-fix"]));
-        if (!reviewDone) checks = "pending";
+        // have completed with `success` before the head can count as clean (a skipped run is not a review).
+        checks = "pending";
       }
       // The ledger is keyed by "owner/repo" (see the review-fix queue in src/index.ts).
       const blockingLastSeenAtMs = listOpenReviewFindings(`${input.owner}/${input.repo}`, input.prNumber)

@@ -15,6 +15,8 @@ vi.mock("../github.js", () => ({
   getCombinedChecksState: vi.fn(),
   hasChangesRequestedReview: vi.fn(),
   mergePullRequest: vi.fn(),
+  listCheckRuns: vi.fn(),
+  getCommitTime: vi.fn(),
 }));
 vi.mock("../comment-gapfill-queue.js", () => ({
   hasPendingConflictResolution: vi.fn(),
@@ -22,7 +24,7 @@ vi.mock("../comment-gapfill-queue.js", () => ({
   enqueueConflictResolution: vi.fn(),
 }));
 
-import { listOpenPullRequests, getCombinedChecksState, hasChangesRequestedReview, mergePullRequest } from "../github.js";
+import { listOpenPullRequests, getCombinedChecksState, hasChangesRequestedReview, mergePullRequest, listCheckRuns, getCommitTime } from "../github.js";
 import { hasPendingConflictResolution, countConflictAttempts, enqueueConflictResolution } from "../comment-gapfill-queue.js";
 
 // Dynamic imports so auto-merge shares the same DB instance as the test (follows runner-callback.test.ts pattern)
@@ -49,6 +51,8 @@ beforeEach(async () => {
   vi.mocked(getCombinedChecksState).mockResolvedValue("success");
   vi.mocked(hasChangesRequestedReview).mockResolvedValue(false);
   vi.mocked(mergePullRequest).mockResolvedValue("merged");
+  vi.mocked(listCheckRuns).mockResolvedValue([]);
+  vi.mocked(getCommitTime).mockResolvedValue(Date.now());
   vi.mocked(hasPendingConflictResolution).mockReturnValue(false);
   vi.mocked(countConflictAttempts).mockReturnValue(0);
   vi.mocked(enqueueConflictResolution).mockReturnValue(1);
@@ -103,6 +107,71 @@ describe("isGroupingBranch", () => {
 
   it("false for a leaf child branch (ai-implement/<key>-<slug>)", () => {
     expect(autoMerge.isGroupingBranch("ai-implement/aii-300-add-thing")).toBe(false);
+  });
+});
+
+describe("runAutoMerges — repository-fix review process", () => {
+  const claudeRun = (status: string, conclusion: string | null) =>
+    ({ name: "Claude Code Review", appSlug: "claude", status, conclusion });
+
+  async function setup(): Promise<void> {
+    const id = log.appendLog({ issueId: "issue-aii-300", issueIdentifier: "AII-300", executionMode: "github-actions" });
+    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/o/r/pull/5");
+    vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
+  }
+  const repoFix = () => mapping({ reviewProcess: "claude-code-review-repository-fix" });
+
+  it("holds when the current head has no completed review check", async () => {
+    await setup();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    await autoMerge.runAutoMerges([repoFix()], deps());
+    expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith("[auto-merge] Holding PR #5 -> ai-implement/feature/aii-200-feat: current head not reviewed clean");
+    logSpy.mockRestore();
+  });
+
+  it("holds when the review check on the head was skipped", async () => {
+    await setup();
+    vi.mocked(listCheckRuns).mockResolvedValue([claudeRun("completed", "skipped")]);
+    await autoMerge.runAutoMerges([repoFix()], deps());
+    expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
+  });
+
+  it("holds when the review succeeded but a 🔴 was seen after the head's commit time", async () => {
+    await setup();
+    vi.mocked(listCheckRuns).mockResolvedValue([claudeRun("completed", "success")]);
+    vi.mocked(getCommitTime).mockResolvedValue(Date.now() - 60_000);
+    const ledger = await import("../review-ledger-store.js");
+    ledger.upsertReviewFinding({ repo: "BuildDownAI/AI-Implement", prNumber: 5, source: "github-review", severity: "blocking", body: "bug" });
+    await autoMerge.runAutoMerges([repoFix()], deps());
+    expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
+  });
+
+  it("merges when the review succeeded and no 🔴 is newer than the head", async () => {
+    await setup();
+    vi.mocked(listCheckRuns).mockResolvedValue([claudeRun("completed", "success")]);
+    vi.mocked(getCommitTime).mockResolvedValue(Date.now() + 60_000);
+    const ledger = await import("../review-ledger-store.js");
+    ledger.upsertReviewFinding({ repo: "BuildDownAI/AI-Implement", prNumber: 5, source: "github-review", severity: "blocking", body: "bug" });
+    await autoMerge.runAutoMerges([repoFix()], deps());
+    expect(vi.mocked(mergePullRequest)).toHaveBeenCalledWith("tok", "BuildDownAI", "AI-Implement", 5, "sha5", "merge");
+  });
+
+  it("holds rather than merges when the commit time is unreadable", async () => {
+    await setup();
+    vi.mocked(listCheckRuns).mockResolvedValue([claudeRun("completed", "success")]);
+    vi.mocked(getCommitTime).mockRejectedValue(new Error("boom"));
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await autoMerge.runAutoMerges([repoFix()], deps());
+    expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
+  it("merges on the ai-implement process without reading check runs", async () => {
+    await setup();
+    await autoMerge.runAutoMerges([mapping({ reviewProcess: "ai-implement" })], deps());
+    expect(vi.mocked(mergePullRequest)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(listCheckRuns)).not.toHaveBeenCalled();
   });
 });
 

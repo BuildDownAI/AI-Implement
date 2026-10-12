@@ -7,6 +7,8 @@ import {
   countConflictAttempts, enqueueConflictResolution, hasPendingConflictResolution,
 } from "./comment-gapfill-queue.js";
 import { getRunRecordMergeVerdict } from "./log.js";
+import { resolveReviewProcess } from "./review-process.js";
+import { headReviewedClean } from "./review-head-clean.js";
 
 export interface AutoMergeDeps {
   githubAppId: string;
@@ -93,6 +95,12 @@ async function autoMergeRepo(mapping: RepoMapping, deps: AutoMergeDeps): Promise
       }
       if (verdict === "hold") {
         console.log(`[auto-merge] Holding PR #${pr.number} -> ${pr.base}: no approval mark`);
+        continue;
+      }
+      // The repository's auto-fix pushes by design, so the mark may predate the current head.
+      if (resolveReviewProcess(mapping.reviewProcess).fixer === "repository"
+        && !(await headReviewedClean(token, owner, repo, pr.number, pr.headSha))) {
+        console.log(`[auto-merge] Holding PR #${pr.number} -> ${pr.base}: current head not reviewed clean`);
         continue;
       }
       const result = await mergePullRequest(token, owner, repo, pr.number, pr.headSha, "merge");
