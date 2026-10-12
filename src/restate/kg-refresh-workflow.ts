@@ -26,6 +26,7 @@ import {
   type RailContext,
   RailGateError,
   closeSnapshotPr,
+  postBaselineAcceptNote,
   deleteSnapshotBranch,
   fetchGate,
   discardStaging,
@@ -56,6 +57,8 @@ export const KG_REFRESH_BOOTSTRAP_DEADLINE_MS = 10 * 60 * 1000;
 /** How often the GHA backend's watch loop reads the dispatched run's status (ADR 033). A run that ends with no
  *  report is found by this read; the same interval paces the reconcile read and the cancel-confirm read. */
 export const KG_REFRESH_WATCH_INTERVAL_MS = 60 * 1000;
+/** How long a held snapshot waits for a `decide` before the run closes the PR and records `decision_timeout`. Fixed by decision, not a setting. */
+export const KG_REFRESH_DECISION_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
 const GHA_EXECUTION_MODE = "github-actions";
 
@@ -85,6 +88,14 @@ export const kgRefreshRunInputSchema = kgRefreshOptionsSchema.extend({
 }).strict();
 
 export type KgRefreshRunInput = z.infer<typeof kgRefreshRunInputSchema> & { report?: KgDryRunReportTarget };
+
+/** The `decide` handler's input: who decided, and whether the held snapshot lands or is dropped. */
+export const kgRefreshDecideSchema = z.object({
+  action: z.enum(["accept", "cancel"]),
+  actor: z.string().min(1).max(200).regex(/^[^\x00-\x1f\x7f]+$/, "actor must not contain control characters"),
+}).strict();
+
+export type KgRefreshDecideInput = z.infer<typeof kgRefreshDecideSchema>;
 
 export interface KgRefreshReportBody {
   ok: boolean;
@@ -216,6 +227,8 @@ export interface KgRefreshWorkflowDependencies {
   totalDeadlineMs?: number;
   /** Overrides `KG_REFRESH_WATCH_INTERVAL_MS` for a deterministic watch-loop test. Production leaves this unset. */
   watchIntervalMs?: number;
+  /** Overrides `KG_REFRESH_DECISION_TIMEOUT_MS` for a deterministic decision-timeout test. Production leaves this unset. */
+  decisionTimeoutMs?: number;
   /** Invoked, via its own `ctx.run` entry, once the "stage" gate's own result is already
    *  durable — before "swap" begins. A fault-injection test uses this to simulate a process
    *  crash in that exact window: the four gate functions convert any dependency throw into a
@@ -260,6 +273,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
   const bootstrapDeadlineMs = deps.bootstrapDeadlineMs ?? KG_REFRESH_BOOTSTRAP_DEADLINE_MS;
   const totalDeadlineMs = deps.totalDeadlineMs ?? KG_REFRESH_TOTAL_DEADLINE_MS;
   const watchIntervalMs = deps.watchIntervalMs ?? KG_REFRESH_WATCH_INTERVAL_MS;
+  const decisionTimeoutMs = deps.decisionTimeoutMs ?? KG_REFRESH_DECISION_TIMEOUT_MS;
 
   async function runGate(
     ctx: WorkflowContext,
@@ -540,6 +554,127 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         }
       }
 
+      /** The merge, branch delete and four rail gates for a snapshot PR the run may land: the success path and the accepted decision both end here. */
+      async function mergeAndRunGates(report: KgRefreshReportBody): Promise<RefreshOutcome> {
+        // Success: a fresh snapshot landed. Merge it, then run the four rail gates one at a time.
+        // mergeSnapshotPr resolves "blocked"/"conflict" rather than throwing (the same contract
+        // src/kg-refresh.ts's pre-migration caller checks explicitly) — a merge conflict or an
+        // already-closed PR must fail the run, not be treated as a silent success, and must not
+        // retry forever. Neither step has staged or swapped anything yet, so `revertRail` does
+        // not apply to either failure.
+        ctx.set("step", "merge");
+        try {
+          const mergeResult = await ctx.run(
+            "merge",
+            () => mergeSnapshotPr(deps.rail, owner, repoName, report.snapshotPr!, report.snapshotCommit!),
+            { maxRetryAttempts: 3 },
+          );
+          if (mergeResult !== "merged") {
+            throw new Error(`merging snapshot PR #${report.snapshotPr} returned '${mergeResult}'`);
+          }
+          ctx.set("step", "delete-branch");
+          await ctx.run(
+            "delete-branch",
+            () => deleteSnapshotBranch(deps.rail, owner, repoName, report.snapshotBranch ?? ""),
+            { maxRetryAttempts: 3 },
+          );
+        } catch (err) {
+          if (restate.internal.isSuspendedError(err)) throw err;
+          ctx.set("step", "failed");
+          const at = await ctx.date.now();
+          const detail = err instanceof Error ? err.message : String(err);
+          const outcome = await failurePath(buildFailureOutcome(at, detail), "merge_failed");
+          return finish(outcome);
+        }
+
+        let railCtx: RailContext = {};
+        let gateFailure: { gate: RefreshGate; detail: string } | null = null;
+        let failedGate: string | null = null;
+        const gates: Array<[string, (rail: KgRailDeps, input: RailContext) => Promise<RailContext>]> = [
+          ["fetch", fetchGate],
+          ["stage", stageGate],
+          ["swap", swapGate],
+          ["verify", verifyGate],
+        ];
+        for (const [name, gate] of gates) {
+          ctx.set("step", name);
+          const result = await runGate(ctx, name, gate, railCtx);
+          if (!result.ok) {
+            gateFailure = { gate: result.gate, detail: result.detail };
+            failedGate = name;
+            if (result.stampBefore !== undefined) railCtx = { ...railCtx, stampBefore: result.stampBefore };
+            if (result.namespace !== undefined) railCtx = { ...railCtx, namespace: result.namespace };
+            break;
+          }
+          railCtx = result.railCtx;
+
+          // fetchGate's documented short-circuit (kg-refresh-rail.ts:164-196): the just-fetched
+          // source's snapshot/-touching commit already matches the persisted SHA, so there is
+          // nothing to stage/swap/verify. Feeding a `sourceDir`-less context into
+          // `stageGate` would throw and trigger a spurious revert of a healthy overlay.
+          if (name === "fetch" && railCtx.gate === "ingest-needed") {
+            ctx.set("step", "no-new-data");
+            const at = await ctx.date.now();
+            const outcome: RefreshOutcome = {
+              ok: true, at,
+              detail: railCtx.detail ?? "Graph is current — a new ingest is required to refresh",
+              stampBefore: railCtx.stampBefore ?? null, stampAfter: railCtx.stampBefore ?? null,
+            };
+            await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
+            await notifyOutcome("no-new-data", outcome, { failureCode: "ingest-needed" });
+            return finish(outcome);
+          }
+
+          if (name === "stage") {
+            await ctx.run("stage-committed", () => deps.afterStageCommitted?.());
+          }
+        }
+
+        if (gateFailure && (failedGate === "fetch" || failedGate === "stage")) {
+          // Nothing was swapped: only staging/ needs removing. Reverting here would move the
+          // healthy current/ aside and put an older overlay into service.
+          ctx.set("step", "discard-staging");
+          await ctx.run("discard-staging", () => discardStaging(deps.rail));
+          ctx.set("step", "failed");
+          const at = await ctx.date.now();
+          const stampBefore = railCtx.stampBefore ?? null;
+          const outcome = await failurePath(
+            { ok: false, at, gate: gateFailure.gate, detail: gateFailure.detail, stampBefore, stampAfter: stampBefore },
+            gateFailure.gate,
+          );
+          return finish(outcome);
+        }
+
+        if (gateFailure) {
+          ctx.set("step", "revert");
+          const revertOutcome = await ctx.run("revert", () => revertRail(deps.rail, {
+            namespace: railCtx.namespace ?? null,
+            gate: gateFailure!.gate,
+            detail: gateFailure!.detail,
+            stampBefore: railCtx.stampBefore ?? null,
+            stagedAt: railCtx.stagedAt ?? null,
+          }));
+          ctx.set("step", "failed");
+          const outcome = await failurePath(revertOutcome, gateFailure.gate);
+          return finish(outcome);
+        }
+
+        ctx.set("step", "persist");
+        const at = await ctx.date.now();
+        const successOutcome: RefreshOutcome = {
+          ok: true, at,
+          detail: `refreshed: ${railCtx.stampBefore ?? "baked"} -> ${railCtx.stampAfter}`,
+          stampBefore: railCtx.stampBefore ?? null, stampAfter: railCtx.stampAfter ?? null,
+        };
+        if (stepTable.length > 0) successOutcome.steps = stepTable;
+        await ctx.run("persist", () => deps.persistLastRefresh({ ...successOutcome, dispatchId }));
+        ctx.set("step", "close-row");
+        await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
+        ctx.set("step", "outcome");
+        await notifyOutcome("success", successOutcome);
+        return finish(successOutcome);
+      }
+
       ctx.set("step", "await-progress");
       const waitResult = await waitForOutcome();
 
@@ -657,6 +792,65 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         return finish(outcome);
       }
 
+      // A held dry-run never reaches here: the dry-run branch above has already returned.
+      if (!report.ok && report.failureCode === "KG_SNAPSHOT_HELD" && report.snapshotPr !== undefined) {
+        // Decision gate: the runner opened the snapshot PR and finished. Free the machine, keep the lease, wait for a decision.
+        const heldPr = report.snapshotPr;
+        ctx.set("step", "decision");
+        const heldAt = await ctx.date.now();
+        const decideBy = heldAt + decisionTimeoutMs;
+        ctx.set("held", {
+          snapshotPr: heldPr,
+          snapshotCommit: report.snapshotCommit,
+          snapshotBranch: report.snapshotBranch,
+          partTable: report.partTable,
+          decideBy,
+        });
+        ctx.console.log(`[KgRefresh] held: dispatch ${dispatchId} snapshot PR #${heldPr} awaits a decision until ${new Date(decideBy).toISOString()}`);
+        ctx.objectSendClient(FlyMachineProfile, "kg-refresh").release({ dispatchId });
+        ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).extend({
+          triggerId,
+          until: decideBy + KG_REPO_STALE_MARGIN_MS,
+        });
+
+        const decision = await awaitOwnedRun(ctx, {
+          signals: ["decide", "cancel"],
+          resultSignal: "decide",
+          totalDeadlineAt: decideBy,
+          tickMs: watchIntervalMs,
+        });
+
+        if (decision.kind === "signal" && decision.name === "decide") {
+          const decided = decision.value as KgRefreshDecideInput;
+          if (decided.action === "accept") {
+            ctx.console.log(`[KgRefresh] decided accept by ${decided.actor}: dispatch ${dispatchId} snapshot PR #${heldPr}`);
+            await ctx.run("baseline-accept-note", () => postBaselineAcceptNote(deps.rail, owner, repoName, heldPr, decided.actor), { maxRetryAttempts: 3 });
+            return mergeAndRunGates(report);
+          }
+          ctx.console.log(`[KgRefresh] decided cancel by ${decided.actor}: dispatch ${dispatchId} snapshot PR #${heldPr}`);
+          return cancelHeld();
+        }
+        if (decision.kind === "signal") {
+          ctx.console.log(`[KgRefresh] cancel signal while held: dispatch ${dispatchId} snapshot PR #${heldPr}`);
+          return cancelHeld();
+        }
+
+        ctx.console.log(`[KgRefresh] decision timeout: dispatch ${dispatchId} snapshot PR #${heldPr}`);
+        await ctx.run("close-snapshot-pr", () => closeSnapshotPr(deps.rail, owner, repoName, heldPr, "decision_timeout", report.snapshotBranch));
+        ctx.set("step", "failed");
+        const at = await ctx.date.now();
+        const outcome = await failurePath(buildFailureOutcome(at, "no decision within the decision timeout"), "decision_timeout");
+        return finish(outcome);
+
+        async function cancelHeld(): Promise<RefreshOutcome> {
+          await ctx.run("close-snapshot-pr", () => closeSnapshotPr(deps.rail, owner, repoName, heldPr, "operator_cancelled", report.snapshotBranch));
+          ctx.set("step", "failed");
+          const cancelledAt = await ctx.date.now();
+          const cancelled = await failurePath(buildFailureOutcome(cancelledAt, "cancelled by operator"), "operator_cancelled", { skipOutcome: true });
+          return finish(cancelled);
+        }
+      }
+
       if (!report.ok || report.snapshotPr === undefined || report.snapshotCommit === undefined) {
         ctx.set("step", "failed");
         const at = await ctx.date.now();
@@ -671,123 +865,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         return finish(outcome);
       }
 
-      // Success: a fresh snapshot landed. Merge it, then run the four rail gates one at a time.
-      // mergeSnapshotPr resolves "blocked"/"conflict" rather than throwing (the same contract
-      // src/kg-refresh.ts's pre-migration caller checks explicitly) — a merge conflict or an
-      // already-closed PR must fail the run, not be treated as a silent success, and must not
-      // retry forever. Neither step has staged or swapped anything yet, so `revertRail` does
-      // not apply to either failure.
-      ctx.set("step", "merge");
-      try {
-        const mergeResult = await ctx.run(
-          "merge",
-          () => mergeSnapshotPr(deps.rail, owner, repoName, report.snapshotPr!, report.snapshotCommit!),
-          { maxRetryAttempts: 3 },
-        );
-        if (mergeResult !== "merged") {
-          throw new Error(`merging snapshot PR #${report.snapshotPr} returned '${mergeResult}'`);
-        }
-        ctx.set("step", "delete-branch");
-        await ctx.run(
-          "delete-branch",
-          () => deleteSnapshotBranch(deps.rail, owner, repoName, report.snapshotBranch ?? ""),
-          { maxRetryAttempts: 3 },
-        );
-      } catch (err) {
-        if (restate.internal.isSuspendedError(err)) throw err;
-        ctx.set("step", "failed");
-        const at = await ctx.date.now();
-        const detail = err instanceof Error ? err.message : String(err);
-        const outcome = await failurePath(buildFailureOutcome(at, detail), "merge_failed");
-        return finish(outcome);
-      }
-
-      let railCtx: RailContext = {};
-      let gateFailure: { gate: RefreshGate; detail: string } | null = null;
-      let failedGate: string | null = null;
-      const gates: Array<[string, (rail: KgRailDeps, input: RailContext) => Promise<RailContext>]> = [
-        ["fetch", fetchGate],
-        ["stage", stageGate],
-        ["swap", swapGate],
-        ["verify", verifyGate],
-      ];
-      for (const [name, gate] of gates) {
-        ctx.set("step", name);
-        const result = await runGate(ctx, name, gate, railCtx);
-        if (!result.ok) {
-          gateFailure = { gate: result.gate, detail: result.detail };
-          failedGate = name;
-          if (result.stampBefore !== undefined) railCtx = { ...railCtx, stampBefore: result.stampBefore };
-          if (result.namespace !== undefined) railCtx = { ...railCtx, namespace: result.namespace };
-          break;
-        }
-        railCtx = result.railCtx;
-
-        // fetchGate's documented short-circuit (kg-refresh-rail.ts:164-196): the just-fetched
-        // source's snapshot/-touching commit already matches the persisted SHA, so there is
-        // nothing to stage/swap/verify. Feeding a `sourceDir`-less context into
-        // `stageGate` would throw and trigger a spurious revert of a healthy overlay.
-        if (name === "fetch" && railCtx.gate === "ingest-needed") {
-          ctx.set("step", "no-new-data");
-          const at = await ctx.date.now();
-          const outcome: RefreshOutcome = {
-            ok: true, at,
-            detail: railCtx.detail ?? "Graph is current — a new ingest is required to refresh",
-            stampBefore: railCtx.stampBefore ?? null, stampAfter: railCtx.stampBefore ?? null,
-          };
-          await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
-          await notifyOutcome("no-new-data", outcome, { failureCode: "ingest-needed" });
-          return finish(outcome);
-        }
-
-        if (name === "stage") {
-          await ctx.run("stage-committed", () => deps.afterStageCommitted?.());
-        }
-      }
-
-      if (gateFailure && (failedGate === "fetch" || failedGate === "stage")) {
-        // Nothing was swapped: only staging/ needs removing. Reverting here would move the
-        // healthy current/ aside and put an older overlay into service.
-        ctx.set("step", "discard-staging");
-        await ctx.run("discard-staging", () => discardStaging(deps.rail));
-        ctx.set("step", "failed");
-        const at = await ctx.date.now();
-        const stampBefore = railCtx.stampBefore ?? null;
-        const outcome = await failurePath(
-          { ok: false, at, gate: gateFailure.gate, detail: gateFailure.detail, stampBefore, stampAfter: stampBefore },
-          gateFailure.gate,
-        );
-        return finish(outcome);
-      }
-
-      if (gateFailure) {
-        ctx.set("step", "revert");
-        const revertOutcome = await ctx.run("revert", () => revertRail(deps.rail, {
-          namespace: railCtx.namespace ?? null,
-          gate: gateFailure!.gate,
-          detail: gateFailure!.detail,
-          stampBefore: railCtx.stampBefore ?? null,
-          stagedAt: railCtx.stagedAt ?? null,
-        }));
-        ctx.set("step", "failed");
-        const outcome = await failurePath(revertOutcome, gateFailure.gate);
-        return finish(outcome);
-      }
-
-      ctx.set("step", "persist");
-      const at = await ctx.date.now();
-      const successOutcome: RefreshOutcome = {
-        ok: true, at,
-        detail: `refreshed: ${railCtx.stampBefore ?? "baked"} -> ${railCtx.stampAfter}`,
-        stampBefore: railCtx.stampBefore ?? null, stampAfter: railCtx.stampAfter ?? null,
-      };
-      if (stepTable.length > 0) successOutcome.steps = stepTable;
-      await ctx.run("persist", () => deps.persistLastRefresh({ ...successOutcome, dispatchId }));
-      ctx.set("step", "close-row");
-      await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
-      ctx.set("step", "outcome");
-      await notifyOutcome("success", successOutcome);
-      return finish(successOutcome);
+      return mergeAndRunGates(report);
     } catch (err) {
       if (restate.internal.isSuspendedError(err)) throw err;
       if (await ctx.get<boolean>("completed")) throw err;
@@ -881,6 +959,19 @@ function toStepRecord(step: Step): KgRefreshStepRecord {
   };
 }
 
+  async function decide(ctx: WorkflowSharedContext, input: KgRefreshDecideInput): Promise<void> {
+    await requireStarted(ctx);
+    if ((await ctx.get<string>("step")) !== "decision") {
+      throw new restate.TerminalError("no-decision-open", { errorCode: 409 });
+    }
+    // Producers: AII-1257. The value is the input object, never undefined, so the deadline peek sees it.
+    const promise = ctx.promise<KgRefreshDecideInput>("decide");
+    if ((await promise.peek()) !== undefined) {
+      throw new restate.TerminalError("already-decided", { errorCode: 409 });
+    }
+    await promise.resolve(input);
+  }
+
   async function status(ctx: WorkflowSharedContext): Promise<KgRefreshStatusResult> {
     const [step, startedAt, triggerId, runId, dryRun] = await Promise.all([
       ctx.get<string>("step"),
@@ -919,6 +1010,11 @@ function toStepRecord(step: Step): KgRefreshStepRecord {
         journalRetention: retentionMs,
         idempotencyRetention: retentionMs,
       }, cancel),
+      decide: restate.handlers.workflow.shared({
+        input: serde.zod(kgRefreshDecideSchema),
+        journalRetention: retentionMs,
+        idempotencyRetention: retentionMs,
+      }, decide),
       status: restate.handlers.workflow.shared(status),
     },
     options: {

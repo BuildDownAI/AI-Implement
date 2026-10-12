@@ -245,6 +245,39 @@ blocking all future refreshes for the remainder of the 4-hour ingest TTL. A live
 dispatched a runner and received no callback within the TTL self-heals at the next `POST
 /api/kg/refresh` call.
 
+### Decision gate (AII-1248)
+
+A snapshot shrink is one decision inside the same run, not a failed run and a second ingest. When
+the runner's `report` is `failureCode: "KG_SNAPSHOT_HELD"` with a `snapshotPr`, `KgRefresh` stops
+at a gate (`src/restate/kg-refresh-workflow.ts`):
+
+1. Sets step `decision` and stores `held` in workflow state: `snapshotPr`, `snapshotCommit`,
+   `snapshotBranch`, `partTable`, and `decideBy` (now + 24 h). `held` is state only; `status`
+   does not expose it yet.
+2. Sends `FlyMachineProfile("kg-refresh").release({ dispatchId })`: the runner has finished, so the
+   machine returns to the profile now rather than after the wait.
+3. Sends `KgRepo.extend({ triggerId, until: decideBy + KG_REPO_STALE_MARGIN_MS })`. The lease is
+   kept, so a `KgRepo.trigger` during the wait answers `refresh-in-progress`.
+4. Waits with `awaitOwnedRun` on the `decide` and `cancel` signals until `decideBy`.
+
+| Event | Action | Outcome |
+| -- | -- | -- |
+| `decide { action: "accept", actor }` | Posts a `### Baseline` comment naming the actor on the PR, then runs the normal merge, delete-branch and fetch/stage/swap/verify gates | as a normal success |
+| `decide { action: "cancel", actor }` | Closes the PR (gate `operator_cancelled`), closes the row, releases | `operator_cancelled` |
+| `cancel` signal (the page's Stop) | Same as `decide` cancel | `operator_cancelled` |
+| 24 h elapse (`KG_REFRESH_DECISION_TIMEOUT_MS`, fixed, no setting) | Closes the PR (gate `decision_timeout`), closes the row, releases | `decision_timeout` |
+
+`decide` is a shared handler with a zod-validated body; `actor` is required, and the PR note and the
+`[KgRefresh]` log line name it. It answers 409 `no-decision-open` unless the step is `decision`, and 409
+`already-decided` once a decision is recorded. A cancel that lands at the very moment of the deadline
+is recorded as `decision_timeout`. A held dry-run never reaches the gate. Any other report takes the
+unchanged success or failure paths; a `KG_SNAPSHOT_HELD` report with no `snapshotPr` takes the failure path.
+
+The deploy drain counts a suspended invocation, so a held run holds a deploy for up to 24 h.
+
+A Stop sent before the gate opens also cancels the held run: the `cancel` promise is durable, so the gate sees it at once.
+
+
 ### Dry run (AII-632)
 
 `trigger_kg_refresh { dryRun: true }` (the MCP tool, admin role) dispatches the same runner job
