@@ -67,7 +67,9 @@ function mapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     planningWorkflowFile: "", autoApprovePlans: true, extraEnv: {}, provider: "anthropic",
     ticketingProvider: "linear", ticketingConfig: { kind: "linear" }, awsRegion: null, paused: false,
     autoMerge: true, maxTurns: null, maxIterations: null, maxJobMinutes: null,
-    branchPrefix: null, skillsRepo: null,
+    branchPrefix: null, skillsRepo: null, referenceRepos: null, sensitiveAddPatterns: null,
+    sensitiveAllowPatterns: null, dependencyTokenScope: null, reviewFixLifecycle: null,
+    memoryProviderId: null, reviewers: null,
     ...overrides,
   };
 }
@@ -326,7 +328,7 @@ describe("conflict detection in autoMergeRepo", () => {
   });
 
   it("calls notify and skips enqueue when cap is exhausted (2 prior attempts)", async () => {
-    const notify = vi.fn(async () => {});
+    const notify = vi.fn(async (_message: string) => {});
     vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
     vi.mocked(mergePullRequest).mockResolvedValue("conflict");
     vi.mocked(hasPendingConflictResolution).mockReturnValue(false);
