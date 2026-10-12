@@ -142,6 +142,7 @@ export function decideExpire(machine: KeptMachineState | null, releasedAt: numbe
 
 const conflict = (message: string): restate.TerminalError => new restate.TerminalError(message, { errorCode: 409 });
 const is404 = (err: unknown): boolean => err instanceof Error && /\(404\)/.test(err.message);
+const isAuthDenied = (err: unknown): boolean => err instanceof Error && /\((401|403)\)/.test(err.message);
 
 const configSchema = z.object({
   cpuKind: z.enum(["shared", "performance"]),
@@ -252,13 +253,20 @@ export function createFlyMachineProfile(deps: FlyMachineProfileDeps) {
     // The sessions app changed since the machine was created: destroy it where it lives, so the dispatch creates one in the current app.
     if (input.app !== undefined && machine?.machineId !== undefined && machine.app !== undefined && machine.app !== input.app) {
       const { machineId, app } = machine;
-      await ctx.run("destroy-other-app", async () => {
+      const denied = await ctx.run("destroy-other-app", async () => {
         try {
           await deps.fly.destroyMachine(machineId, app);
+          return false;
         } catch (err) {
-          if (!is404(err)) throw err;
+          if (is404(err)) return false;
+          // The sessions token usually belongs to the new app; retrying cannot help.
+          if (isAuthDenied(err)) return true;
+          throw err;
         }
       }, { maxRetryAttempts: 3 });
+      if (denied) {
+        ctx.console.warn(`[FlyMachineProfile] claim ${ctx.key} left machine ${machineId} in app ${app}: the sessions token cannot reach that app (current app ${input.app}); destroy the machine by hand`);
+      }
       ctx.set<KeptMachineState>(MACHINE_KEY, { lastUsedAt: decision.next.lastUsedAt, heldBy: decision.next.heldBy });
       ctx.console.info(`[FlyMachineProfile] claim ${ctx.key} dispatch=${input.dispatchId} attempt=${attempt} destroyed ${machineId} in app ${app} (current app ${input.app})`);
       return { machineId: null };
