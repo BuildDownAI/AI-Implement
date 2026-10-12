@@ -2,6 +2,8 @@ import { getCommitTime, listCheckRuns } from "./github.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
 import { isReviewCheckRun, REVIEW_PROCESSES } from "./review-process.js";
 
+// Matches the check pairs of the one process with `fixer: "repository"`. A second repository-fixer
+// process with different pairs must pass its own process here instead of this constant.
 export async function reviewCheckSucceeded(token: string, owner: string, repo: string, headSha: string): Promise<boolean> {
   const runs = await listCheckRuns(token, owner, repo, headSha);
   return runs.some((r) => r.status === "completed" && r.conclusion === "success"
