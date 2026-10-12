@@ -41,7 +41,9 @@ export function parseForwardedSecrets(): string[] {
 
 /**
  * Environment for runner-owned repository processes (install, setup, verify, teardown).
- * Strips model credentials so repository code cannot read the model authorization.
+ * Strips model credentials so repository code cannot read the model authorization,
+ * and the run tokens (RUNNER_CREDENTIAL_KEYS) so repository code cannot act with the
+ * run's authority. Only the runner's own Node process holds the run tokens.
  * Forwarded secrets (AI_IMPLEMENT_FORWARDED_SECRETS) are kept so hooks can use them.
  *
  * Note: a hook that exports ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN into
@@ -53,6 +55,7 @@ export function parseForwardedSecrets(): string[] {
 export function repoProcessEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
   for (const key of MODEL_CREDENTIAL_KEYS) delete env[key];
+  for (const key of RUNNER_CREDENTIAL_KEYS) delete env[key];
   return env;
 }
 
