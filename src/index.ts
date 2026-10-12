@@ -73,7 +73,7 @@ import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable 
 import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
-import { getOrchestratorSettings, getFlySessionsConfig, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, getRetryPolicy, seedRunnerBackends, refreshRunnerBackendCache } from "./orchestrator-settings.js";
+import { getOrchestratorSettings, getRunnerBackendSource, getFlySessionsConfig, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, getRetryPolicy, seedRunnerBackends, refreshRunnerBackendCache } from "./orchestrator-settings.js";
 import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
@@ -4866,6 +4866,36 @@ export interface RestateEndpointWireDeps {
   onRegistered?: () => Promise<void>;
 }
 
+/**
+ * Boot-time machine reconciliation must list the app saved in `RunnerBackend/fly-machines`, not the
+ * env-then-row fallback. `atBoot()` runs it when the cache already came from Restate; otherwise it
+ * defers to `onRegistered()` (after that hook's cache refresh), which runs it at most once.
+ */
+export function createBootReconciliation(
+  reconcile: () => Promise<void>,
+  source: () => "restate" | "fallback",
+) {
+  let deferred = false;
+  let done = false;
+  async function run(path: string): Promise<void> {
+    if (done) return;
+    done = true;
+    console.log(`[main] Startup reconciliation running from ${path}`);
+    await reconcile();
+  }
+  return {
+    async atBoot(): Promise<void> {
+      if (source() === "restate") return run("main (runner backend loaded from Restate)");
+      deferred = true;
+      console.log("[main] Runner backend cache is on the fallback; startup reconciliation deferred to Restate registration");
+    },
+    async onRegistered(): Promise<void> {
+      if (!deferred) return;
+      await run("onRegistered (after runner backend refresh)");
+    },
+  };
+}
+
 /** How often a declined registration retries (AII-721) — the old deployment's non-completed invocations are expected to drain on their own; this just keeps checking back. */
 const RESTATE_REGISTRATION_RETRY_MS = 60_000;
 
@@ -5114,6 +5144,10 @@ async function main(): Promise<void> {
     sessionDeps: { dispatchSession, isDefinitiveFlyRejectionError, isDefinitiveLocalDockerLaunchFailure, shouldReleaseAdmissionOnDispatchError },
   }).services;
   const lateExternalReviewServices = createProductionLateExternalReviewServices(config).services;
+  const bootReconciliation = createBootReconciliation(
+    () => startupReconciliation(config, registry),
+    () => getRunnerBackendSource(),
+  );
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
     startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...lateExternalReviewServices], restateSidecar.identityKey),
     registerRestateEndpoint,
@@ -5121,6 +5155,7 @@ async function main(): Promise<void> {
       sweepOnRegistered(config);
       await seedRunnerBackends();
       await refreshRunnerBackendCache();
+      await bootReconciliation.onRegistered();
     },
   });
   // A sidecar which becomes ready after its initial timeout still registers the
@@ -5178,7 +5213,8 @@ async function main(): Promise<void> {
   void postBootNotice(config, { holdWasSet, sidecarProbeError });
 
   // Reconcile machines from any previous run before starting the poll loop
-  await startupReconciliation(config, registry);
+  await refreshRunnerBackendCache();
+  await bootReconciliation.atBoot();
 
   // Run first poll immediately
   await poll(config, registry);
