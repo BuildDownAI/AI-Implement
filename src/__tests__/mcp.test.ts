@@ -1489,6 +1489,7 @@ describe("handleMcpRequest", () => {
         executionMode: { effective: "github-actions", source: "kg-setting", setting: "github-actions" },
         flyMachine: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000, source: "default" },
         restate: null,
+        currentRun: null,
       };
 
       const result = await callMcp(

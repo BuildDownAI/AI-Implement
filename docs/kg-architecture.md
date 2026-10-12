@@ -235,6 +235,7 @@ or these steps by hand.
 | `checking` | Refresh triggered; comparing snapshot SHA against last recorded |
 | `ingest-running` | Runner job dispatched; waiting for callback |
 | `snapshot-landed` | Callback received; snapshot commit verified |
+| `awaiting-decision` | A run is held at the decision gate with its snapshot PR open; `currentRun.decisions` is `["accept", "cancel"]` |
 | `staging` | Local rail running (fetch → materialize → swap) |
 | `serving` | Rail succeeded; sidecar serving new graph |
 | `reverted` | Gate failed; rolled back to previous overlay |
@@ -252,8 +253,9 @@ the runner's `report` is `failureCode: "KG_SNAPSHOT_HELD"` with a `snapshotPr`, 
 at a gate (`src/restate/kg-refresh-workflow.ts`):
 
 1. Sets step `decision` and stores `held` in workflow state: `snapshotPr`, `snapshotCommit`,
-   `snapshotBranch`, `partTable`, and `decideBy` (now + 24 h). `held` is state only; `status`
-   does not expose it yet.
+   `snapshotBranch`, `partTable`, and `decideBy` (now + 24 h). `status` exposes `snapshotPr`,
+   `partTable`, and `decideBy` (not the commit or branch) as `held`, which `get_kg_status` surfaces
+   as `currentRun.held`.
 2. Sends `FlyMachineProfile("kg-refresh").release({ dispatchId })`: the runner has finished, so the
    machine returns to the profile now rather than after the wait.
 3. Sends `KgRepo.extend({ triggerId, until: decideBy + KG_REPO_STALE_MARGIN_MS })`. The lease is
