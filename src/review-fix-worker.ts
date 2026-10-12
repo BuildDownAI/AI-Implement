@@ -288,7 +288,7 @@ function matchesAttemptMarker(displayTitle: string, attemptId: AttemptId): boole
   return displayTitle.endsWith(` · attempt ${attemptId}`);
 }
 
-function buildLaunchInputs(plan: WorkerLaunchPlan, mapping: RepoMapping): DispatchInputs {
+function buildLaunchInputs(plan: WorkerLaunchPlan, mapping: RepoMapping, runnerCallbackUrl?: string): DispatchInputs {
   const identifier = `review-fix-${plan.scope.prNumber}`;
   const runConfig: RunConfigV1 = {
     v: 1,
@@ -302,6 +302,8 @@ function buildLaunchInputs(plan: WorkerLaunchPlan, mapping: RepoMapping): Dispat
       description: plan.taskText,
     },
     runnerPhase: "gap-analysis",
+    // The runner reads the callback URL only from the envelope; tokens stay workflow inputs.
+    ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
     prNumber: String(plan.scope.prNumber),
     commentInstruction: plan.taskText,
     reviewFix: {
@@ -440,6 +442,8 @@ export interface GithubReviewFixWorkerDeps {
    *  instances, e.g. in a test) to route `cancel`/`inspectTerminal` without a preceding
    *  `prepare`/`reconcile` on that instance. */
   scopeStore?: ReviewFixWorkerScopeStore;
+  /** Orchestrator callback base URL, carried in the run envelope (not a secret). */
+  runnerCallbackUrl?: string;
 }
 
 export class GithubReviewFixWorker implements ReviewFixWorkerPort {
@@ -447,12 +451,14 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
   private readonly transport: ReviewFixWorkerTransport;
   private readonly scopeStore: ReviewFixWorkerScopeStore;
   private readonly callbackInputs?: GithubReviewFixWorkerDeps["callbackInputs"];
+  private readonly runnerCallbackUrl?: string;
 
   constructor(deps: GithubReviewFixWorkerDeps) {
     this.credentials = deps.credentials;
     this.transport = deps.transport ?? githubActionsReviewFixWorkerTransport;
     this.scopeStore = deps.scopeStore ?? inMemoryReviewFixWorkerScopeStore();
     this.callbackInputs = deps.callbackInputs;
+    this.runnerCallbackUrl = deps.runnerCallbackUrl;
   }
 
   private async remember(attemptId: AttemptId, scope: ScopedPrIdentity, execution?: WorkerExecutionIdentity): Promise<void> {
@@ -485,7 +491,7 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
     // under is not evidence the dispatch was rejected — it is unresolved identity.
     if (credential.installationId !== plan.scope.installationId) return { status: "unknown" };
 
-    let inputs = buildLaunchInputs(plan, mapping);
+    let inputs = buildLaunchInputs(plan, mapping, this.runnerCallbackUrl);
     try {
       if (this.callbackInputs) inputs = { ...inputs, ...await this.callbackInputs(plan.attemptId) };
     } catch {

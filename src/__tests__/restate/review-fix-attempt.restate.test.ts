@@ -193,6 +193,23 @@ describe("ReviewFixAttempt durable workflow", () => {
     expect([fake.approvalEffects, fake.releaseEffects]).toEqual([0, 1]);
   }, 20_000);
 
+  it.each(VARIANTS.map(([label]) => label))("releases at once when the run ends without a result (%s)", async (label) => {
+    // Deadline far away: only the status read can end the wait. The binding gate holds the
+    // attempt until the backend reports terminal, so the first status read sees `ended`.
+    const fake = newFake("accepted", 10 * 60_000);
+    fake.holdBinding = gate("execution binding");
+    attempts.set(fake.prepared.attemptId, fake);
+    const env = envFor(label);
+    const done = callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,
+      "run", { attemptId: fake.prepared.attemptId });
+    await eventually(() => fake.launchEffects === 1, Boolean, { label: "fake.launchEffects === 1" });
+    expect(fake.occupied).toBe(true);
+    fake.terminal = { status: "succeeded", outputCommit: SHA };
+    fake.holdBinding.release();
+    expect(await done).toEqual({ status: "finalized", terminal: fake.terminal, approval: "not_applicable" });
+    expect([fake.approvalEffects, fake.releaseEffects, fake.occupied, fake.result]).toEqual([0, 1, false, null]);
+  }, 20_000);
+
   it.each(VARIANTS.map(([label]) => label))("an early result waits for exact execution binding before approval (%s)", async (label) => {
     const fake = newFake("accepted");
     fake.holdBinding = gate("execution binding");

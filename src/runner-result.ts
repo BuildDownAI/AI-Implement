@@ -205,7 +205,13 @@ export async function postRunnerResult(params: {
 }): Promise<void> {
   const callbackUrl = params.callbackUrl ?? process.env.RUNNER_CALLBACK_URL;
   const runToken = process.env.RUN_TOKEN;
-  if (!callbackUrl || !runToken) return;
+  if (!callbackUrl || !runToken) {
+    if (params.reviewFix) {
+      const missing = [!callbackUrl && "callback URL", !runToken && "RUN_TOKEN"].filter(Boolean).join(" and ");
+      console.warn(`[runner-callback] review-fix result not sent: ${missing} missing`);
+    }
+    return;
+  }
   let comments: Array<{ body: string }> = [];
   try {
     comments = collectRunnerComments(params.workspaceDir);

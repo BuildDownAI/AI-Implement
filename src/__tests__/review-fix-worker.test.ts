@@ -281,6 +281,39 @@ describe("GithubReviewFixWorker.launch", () => {
     expect(runConfig.dependencyTokenScope).toBe("installation");
   });
 
+  it("carries runnerCallbackUrl in the run config envelope and no token (AII-1273)", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9004 }));
+    const callbackInputs = vi.fn(async () => ({
+      run_token: "secret-result", run_progress_token: "secret-progress", run_publication_token: "secret-publication",
+      runner_callback_url: "https://callback.example/runner",
+    }));
+    const worker = new workerModule.GithubReviewFixWorker({
+      credentials: resolver, transport: t.transport, callbackInputs, runnerCallbackUrl: "https://callback.example/runner",
+    });
+    await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-cb-url" })));
+
+    const dispatched = t.dispatchCalls[0] as { inputs: Record<string, unknown> };
+    const decoded = Buffer.from(dispatched.inputs.run_config as string, "base64").toString("utf8");
+    expect(JSON.parse(decoded).runnerCallbackUrl).toBe("https://callback.example/runner");
+    for (const token of ["secret-result", "secret-progress", "secret-publication"]) expect(decoded).not.toContain(token);
+  });
+
+  it("omits runnerCallbackUrl from the run config when none is configured", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9005 }));
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-no-cb-url" })));
+
+    const dispatched = t.dispatchCalls[0] as { inputs: Record<string, unknown> };
+    const runConfig = JSON.parse(Buffer.from(dispatched.inputs.run_config as string, "base64").toString("utf8"));
+    expect(runConfig).not.toHaveProperty("runnerCallbackUrl");
+  });
+
   it("omits dependencyTokenScope from the run config when the mapping has none set", async () => {
     seedMapping();
     const { resolver } = makeCredentials();

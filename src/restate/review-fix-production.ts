@@ -92,6 +92,7 @@ export function createProductionReviewFixServices(
   const credentials = createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey);
   const github = createReviewFixGithubAdapter({ credentials });
   const worker = new GithubReviewFixWorker({ credentials, scopeStore: reviewFixAttemptStoreScopeStore(store),
+    runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
     callbackInputs: async (attemptId) => {
       if (!config.runnerTokenSecret || !config.runnerCallbackBaseUrl) throw new Error("pilot callbacks unavailable");
       return {
