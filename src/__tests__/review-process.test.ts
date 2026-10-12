@@ -39,6 +39,21 @@ describe("definitions", () => {
     expect(claude.fixer).toBe("ai-implement");
   });
 
+  it("claude-code-review-repository-fix reads like claude-code-review but the repository fixes", () => {
+    const repoFix = resolveReviewProcess("claude-code-review-repository-fix");
+    expect(repoFix.id).toBe("claude-code-review-repository-fix");
+    expect(repoFix.label).toBe("Claude Code Review, repository auto-fix");
+    expect(repoFix.fixer).toBe("repository");
+    expect(repoFix.trustedAuthors).toEqual(claude.trustedAuthors);
+    expect(repoFix.checkPairs).toEqual(claude.checkPairs);
+    expect(repoFix.readVerdict).toBe(claude.readVerdict);
+    expect(repoFix.claudeInlineMarkers).toBe(true);
+    expect(repoFix.summaryBlockingGates).toBe(true);
+    expect(claude.fixer).toBe("ai-implement");
+    expect(aiImplement.summaryBlockingGates).toBe(false);
+    expect(aiImplement.claudeInlineMarkers).toBe(false);
+  });
+
   it("keeps trusted authors lowercase", () => {
     for (const p of Object.values(REVIEW_PROCESSES)) {
       for (const a of p.trustedAuthors) expect(a).toBe(a.toLowerCase());
@@ -56,6 +71,7 @@ describe("resolveReviewProcess", () => {
 
   it("isReviewProcessId", () => {
     expect(isReviewProcessId("ai-implement")).toBe(true);
+    expect(isReviewProcessId("claude-code-review-repository-fix")).toBe(true);
     expect(isReviewProcessId("constructor")).toBe(false);
     expect(isReviewProcessId(null)).toBe(false);
   });

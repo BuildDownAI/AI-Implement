@@ -6573,6 +6573,68 @@ describe("postPushReviewStep review process gate", () => {
     expect(out.approved).toBe(true);
   });
 
+  describe("claude-code-review-repository-fix hand-off", () => {
+    const REPO_FIX = { reviewProcess: "claude-code-review-repository-fix", maxIterations: 3 };
+    // With no internal reviewer configured, a failing CI check is the internal blocking finding.
+    const ciRed: Run = { name: "build", app: "github-actions", conclusion: "failure" };
+    const redInline = () => inline("🔴 null deref");
+
+    it("Claude blocking, internal clean: starts no fix pass and reports the reviewed head", async () => {
+      const f = fixture({ runs: [actions("success")], inlineComments: [redInline()] });
+      const { out, invoke } = await run(f, REPO_FIX);
+      expect(out.approved).toBe(false);
+      expect(out.terminationReason).toBe("external_review_pending");
+      expect(out.reviewedHeadSha).toBe(SHA);
+      expect(invoke).not.toHaveBeenCalled();
+      expect(f.posted.join("\n")).not.toContain("starting fix pass");
+    });
+
+    it("internal blocking, Claude clean: runs the fix pass as today", async () => {
+      const f = fixture({ runs: [actions("success"), ciRed] });
+      const { out, invoke } = await run(f, REPO_FIX);
+      expect(out.terminationReason).not.toBe("external_review_pending");
+      expect(f.posted.join("\n")).toContain("starting fix pass");
+      expect(invoke).toHaveBeenCalled();
+    });
+
+    it("both blocking: starts no fix pass and ends unapproved for a person", async () => {
+      const f = fixture({ runs: [actions("success"), ciRed], inlineComments: [redInline()] });
+      const { out, invoke } = await run(f, REPO_FIX);
+      expect(out.approved).toBe(false);
+      expect(out.terminationReason).toBe("iterations_exhausted");
+      expect(out.reviewedHeadSha).toBeUndefined();
+      expect(invoke).not.toHaveBeenCalled();
+      expect(f.posted.join("\n")).not.toContain("starting fix pass");
+    });
+
+    it("neither blocking: approves", async () => {
+      const { out } = await run(fixture({ runs: [actions("success")] }), REPO_FIX);
+      expect(out.approved).toBe(true);
+      expect(out.terminationReason).toBe("approved");
+    });
+
+    it("withholds approval for a 🔴 summary and hands off instead of fixing", async () => {
+      const f = fixture({
+        runs: [actions("success")],
+        issueComments: [{
+          user: { login: "claude[bot]", type: "Bot" }, created_at: "2026-01-01T00:00:00Z", html_url: "https://x/summary",
+          body: "## Code Review\n\n### 🔴 Guard rejects archived simulations\n- Breaks the flow.\n",
+        }],
+      });
+      const { out, invoke } = await run(f, REPO_FIX);
+      expect(out.approved).toBe(false);
+      expect(out.terminationReason).toBe("external_review_pending");
+      expect(invoke).not.toHaveBeenCalled();
+    });
+
+    it("claude-code-review with Claude blocking and internal clean still runs the fix pass", async () => {
+      const f = fixture({ runs: [actions("success")], inlineComments: [redInline()] });
+      const { out } = await run(f, { reviewProcess: "claude-code-review", maxIterations: 3 });
+      expect(out.terminationReason).not.toBe("external_review_pending");
+      expect(f.posted.join("\n")).toContain("starting fix pass");
+    });
+  });
+
   describe("🔴 heading in Claude's summary comment", () => {
     const summary = (sections: string) => ({
       user: { login: "claude[bot]", type: "Bot" }, created_at: "2026-01-01T00:00:00Z", html_url: "https://x/summary",
