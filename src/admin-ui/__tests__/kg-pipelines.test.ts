@@ -317,9 +317,21 @@ describe("kg fly machine profile control (AII-1116)", () => {
     const before = el("kg-fly-memory-mb").value;
     win.api = async () => ({ ok: false, status: 503, json: async () => ({}) });
     await win.loadKgRunProfile();
-    expect(el("kg-fly-machine-effective").textContent).toBe("next Fly run: profile unavailable (503)");
+    expect(el("kg-run-profile-error").textContent).toBe("run profile unavailable (503)");
     expect(el("kg-fly-memory-mb").value).toBe(before);
     expect(el("btn-kg-fly-save").disabled).toBe(true);
+  });
+
+  it("hides every run-profile row and shows 'admin only' when the read answers 403", async () => {
+    const { win, el } = mount({});
+    await win.loadKgRunProfile();
+    win.api = async () => ({ ok: false, status: 403, json: async () => ({}) });
+    await win.loadKgRunProfile();
+    expect(el("kg-run-profile-error").textContent).toBe("run profile unavailable (admin only)");
+    expect(el("kg-run-profile-error").hidden).toBe(false);
+    for (const id of ["kg-fly-machine-controls", "kg-fly-machine-effective", "kg-gha-controls", "kg-gha-note"]) {
+      expect(el(id).hidden).toBe(true);
+    }
   });
 
   it("does not overwrite edited inputs on a poll", async () => {
