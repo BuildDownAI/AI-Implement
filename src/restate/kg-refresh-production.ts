@@ -32,7 +32,7 @@ import { getRunnerMode, getKgExecutionMode, resolveKgBackend, type KgBackendReso
 import { mintRunToken } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
 import { appendLogIfAbsent, findLogIdByDispatchId, setJobMachineId, setJobMachineNonce, updateJobPrUrl, updateJobRunId } from "../log.js";
-import { clearMachineEnv, createMachine, destroyMachine, getMachine, listMachines, startMachine, updateMachine, waitForMachine, waitForMachineSettled, type CreateMachineOpts, type Machine, type MachineConfig } from "../fly-machines.js";
+import { clearMachineEnv, createMachine, destroyMachine, getMachine, listMachines, startMachine, updateMachine, waitForMachine, waitForMachineSettled, type CreateMachineOpts, type Machine, type MachineConfig, type SettleOptions } from "../fly-machines.js";
 import type { RestateService } from "./endpoint.js";
 import {
   createKgRefreshWorkflow,
@@ -476,16 +476,21 @@ export function createProductionKgRefreshServices(
  * the object still registers (boot stays non-fatal) and a handler that needs Fly fails when it runs.
  */
 export function buildFlyMachineProfileDeps(): FlyMachineProfileDeps {
-  const bound = <A extends unknown[], R>(fn: (token: string, app: string, ...args: A) => Promise<R>) => async (...args: A): Promise<R> => {
+  // `appOf` picks the per-call app override out of the arguments; the accessor's app is the fallback.
+  const bound = <A extends unknown[], R>(fn: (token: string, app: string, ...args: A) => Promise<R>, appOf: (args: A) => string | undefined) => async (...args: A): Promise<R> => {
     const { token, app } = getFlySessionsConfig();
-    if (!token || !app) throw new Error("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured");
-    return fn(token, app, ...args);
+    const useApp = appOf(args) ?? app;
+    if (!token || !useApp) throw new Error("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured");
+    return fn(token, useApp, ...args);
   };
   return {
     fly: {
-      getMachine: bound(getMachine),
-      clearMachineEnv: bound(clearMachineEnv),
-      destroyMachine: bound((t, a, id: string) => destroyMachine(t, a, id)),
+      getMachine: bound((t, a, id: string) => getMachine(t, a, id), () => undefined),
+      clearMachineEnv: bound(
+        (t, a, id: string, metadata?: Record<string, string>, settle?: SettleOptions, _app?: string) => clearMachineEnv(t, a, id, metadata, settle),
+        (args) => args[3],
+      ),
+      destroyMachine: bound((t, a, id: string, _app?: string) => destroyMachine(t, a, id), (args) => args[1]),
     },
   };
 }

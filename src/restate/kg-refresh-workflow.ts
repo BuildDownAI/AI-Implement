@@ -152,6 +152,8 @@ export interface KgDispatchResult {
   machineId?: string | null;
   /** True when the dispatch created the machine, so the workflow must `attach` it. */
   created?: boolean;
+  /** The Fly app the machine was created or reused in, read inside the dispatch step. */
+  app?: string;
   /** The kept machine id the dispatch found destroyed or 404 and replaced; sent as `replaces` on `attach`. */
   replaced?: string;
 }
@@ -409,6 +411,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             outcome: result.outcome, runId: result.runId, runUrl: result.runUrl,
             jobId: result.jobId, executionMode: result.executionMode,
             machineId: result.machineId ?? null, created: result.created === true,
+            ...(result.app !== undefined && { app: result.app }),
             ...(result.replaced !== undefined && { replaced: result.replaced }),
           };
         },
@@ -419,6 +422,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       // One-way and idempotent in the object; a replay after a crash here sends it again.
       if (dispatchResult.created && dispatchResult.machineId) {
         ctx.objectSendClient(FlyMachineProfile, "kg-refresh").attach({ dispatchId, machineId: dispatchResult.machineId, attempt,
+          ...(dispatchResult.app !== undefined && { app: dispatchResult.app }),
           ...(dispatchResult.replaced !== undefined && { replaces: dispatchResult.replaced }) });
       }
 

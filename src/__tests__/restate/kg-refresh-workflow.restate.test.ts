@@ -94,6 +94,8 @@ interface RunScenario {
   cancelCalls: number;
   /** Dispatch result carries no job id, as when the backend returned no machine or container id. */
   jobIdUnknown?: boolean;
+  /** AII-1246: a Fly create, as the sender reports it; `app` is the app the machine was created in. */
+  flyCreate?: { machineId: string; app?: string };
   runStatusSequence: Array<{ status: string; conclusion: string | null }>;
   findByTitleResult: { runId: number } | null;
   /** Title lookups that throw, by 1-based call number. */
@@ -374,6 +376,7 @@ describe("KgRefresh durable workflow", () => {
   let profileGets = 0;
   const claimCalls: string[] = [];
   const attachCalls: string[] = [];
+  const attachRequests: Array<Record<string, unknown>> = [];
   const dispatchedMachines: FlyMachineProfileConfig[] = [];
   const flyMachineProfile = restate.object({
     name: "FlyMachineProfile",
@@ -392,7 +395,7 @@ describe("KgRefresh durable workflow", () => {
         claimCalls.push(req.dispatchId);
         return { machineId: null };
       }),
-      attach: restate.handlers.object.exclusive(async (_ctx: restate.ObjectContext, req: { dispatchId: string }): Promise<void> => { attachCalls.push(req.dispatchId); }),
+      attach: restate.handlers.object.exclusive(async (_ctx: restate.ObjectContext, req: { dispatchId: string }): Promise<void> => { attachCalls.push(req.dispatchId); attachRequests.push(req); }),
       release: restate.handlers.object.exclusive(async (): Promise<void> => {}),
     },
   });
@@ -456,6 +459,7 @@ describe("KgRefresh durable workflow", () => {
       outcome: scenario.dispatchOutcome, runId: scenario.runId,
       jobId: scenario.jobIdUnknown ? null : `job-${triggerId}`, executionMode: scenario.executionMode,
       ...(scenario.runId !== undefined ? { runUrl: `https://example.test/runs/${scenario.runId}` } : {}),
+      ...(scenario.flyCreate ? { machineId: scenario.flyCreate.machineId, created: true, ...(scenario.flyCreate.app !== undefined && { app: scenario.flyCreate.app }) } : {}),
     };
     dispatchResults.push(result);
     return result;
@@ -1297,6 +1301,22 @@ describe("KgRefresh durable workflow", () => {
       expect(attachCalls).not.toContain(triggerId);
       expect(appendJobLogCalls.filter((c) => c.dispatchId === triggerId)).toEqual([{ dispatchId: triggerId, issueId: "kg-refresh", phase: "kg-refresh", repo: KG_SOURCE_REPO, executionMode: "github-actions" }]);
     }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("AII-1246: attach receives the dispatch result's app, and no app key when there is none (%s)", async (label) => {
+      const env = envFor(label);
+      for (const app of ["app-a", undefined]) {
+        const triggerId = newTriggerId();
+        makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines", flyCreate: { machineId: "m-app", ...(app !== undefined && { app }) } });
+        const done = runWorkflow(env.baseUrl(), triggerId);
+        await eventually(() => attachRequests.find((r) => r.dispatchId === triggerId), (r) => r !== undefined, { label: "attach" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+        await done;
+        const req = attachRequests.find((r) => r.dispatchId === triggerId)!;
+        expect(req.machineId).toBe("m-app");
+        if (app === undefined) expect("app" in req).toBe(false);
+        else expect(req.app).toBe(app);
+      }
+    }, 60_000);
 
     it.each(VARIANTS.map(([label]) => label))("a fly-machines run records one claim and resolves the backend once across dispatch retries (%s)", async (label) => {
       const env = envFor(label);
