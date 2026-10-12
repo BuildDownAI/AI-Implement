@@ -61,7 +61,7 @@ export const DURABLE_UNTIL_KEY = "durable_until";
 export interface FlyMachineProfileDeps {
   /** Bound to FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP by the composer; a fake in tests. */
   fly: {
-    getMachine(id: string, app?: string): Promise<Machine>;
+    getMachine(id: string): Promise<Machine>;
     /** getMachine, then updateMachine with `env: {}` and the same config otherwise. Update on a stopped machine does not start it. */
     clearMachineEnv(id: string, metadata?: Record<string, string>, settle?: SettleOptions, app?: string): Promise<void>;
     destroyMachine(id: string, app?: string): Promise<void>;
@@ -137,7 +137,7 @@ export type ExpireDecision = { kind: "destroy"; machineId: string; app?: string 
 /** Pure: destroy only the machine released at exactly `releasedAt` and not re-held since. */
 export function decideExpire(machine: KeptMachineState | null, releasedAt: number): ExpireDecision {
   if (!machine || machine.heldBy !== null || machine.lastUsedAt !== releasedAt || machine.machineId === undefined) return { kind: "noop" };
-  return { kind: "destroy", machineId: machine.machineId, ...(machine.app && { app: machine.app }) };
+  return { kind: "destroy", machineId: machine.machineId, ...(machine.app !== undefined && { app: machine.app }) };
 }
 
 const conflict = (message: string): restate.TerminalError => new restate.TerminalError(message, { errorCode: 409 });

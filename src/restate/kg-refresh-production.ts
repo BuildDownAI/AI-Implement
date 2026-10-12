@@ -485,7 +485,7 @@ export function buildFlyMachineProfileDeps(): FlyMachineProfileDeps {
   };
   return {
     fly: {
-      getMachine: bound((t, a, id: string, _app?: string) => getMachine(t, a, id), (args) => args[1]),
+      getMachine: bound((t, a, id: string) => getMachine(t, a, id), () => undefined),
       clearMachineEnv: bound(
         (t, a, id: string, metadata?: Record<string, string>, settle?: SettleOptions, _app?: string) => clearMachineEnv(t, a, id, metadata, settle),
         (args) => args[3],
