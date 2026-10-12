@@ -95,7 +95,7 @@ interface RunScenario {
   /** Dispatch result carries no job id, as when the backend returned no machine or container id. */
   jobIdUnknown?: boolean;
   /** AII-1246: a Fly create, as the sender reports it; `app` is the app the machine was created in. */
-  flyCreate?: { machineId: string; app?: string };
+  flyCreate?: { machineId: string; app?: string; reused?: boolean };
   runStatusSequence: Array<{ status: string; conclusion: string | null }>;
   findByTitleResult: { runId: number } | null;
   /** Title lookups that throw, by 1-based call number. */
@@ -459,7 +459,7 @@ describe("KgRefresh durable workflow", () => {
       outcome: scenario.dispatchOutcome, runId: scenario.runId,
       jobId: scenario.jobIdUnknown ? null : `job-${triggerId}`, executionMode: scenario.executionMode,
       ...(scenario.runId !== undefined ? { runUrl: `https://example.test/runs/${scenario.runId}` } : {}),
-      ...(scenario.flyCreate ? { machineId: scenario.flyCreate.machineId, created: true, ...(scenario.flyCreate.app !== undefined && { app: scenario.flyCreate.app }) } : {}),
+      ...(scenario.flyCreate ? { machineId: scenario.flyCreate.machineId, created: scenario.flyCreate.reused !== true, ...(scenario.flyCreate.app !== undefined && { app: scenario.flyCreate.app }) } : {}),
     };
     dispatchResults.push(result);
     return result;
@@ -1316,6 +1316,24 @@ describe("KgRefresh durable workflow", () => {
         if (app === undefined) expect("app" in req).toBe(false);
         else expect(req.app).toBe(app);
       }
+    }, 60_000);
+
+    it.each(VARIANTS.map(([label]) => label))("AII-1276: a reuse sends attach with the current app; a reuse without an app sends none (%s)", async (label) => {
+      const env = envFor(label);
+      const withApp = newTriggerId();
+      const noApp = newTriggerId();
+      makeScenario(withApp, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines", flyCreate: { machineId: "m-kept", app: "app-a", reused: true } });
+      makeScenario(noApp, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines", flyCreate: { machineId: "m-kept", reused: true } });
+      for (const id of [withApp, noApp]) {
+        const done = runWorkflow(env.baseUrl(), id);
+        await eventually(() => scenarios.get(id)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", id, "report", SUCCESS_REPORT);
+        await done;
+      }
+      const req = (await eventually(() => attachRequests.find((r) => r.dispatchId === withApp), (r) => r !== undefined, { label: "attach" }))!;
+      expect(req).toMatchObject({ machineId: "m-kept", app: "app-a" });
+      expect("replaces" in req).toBe(false);
+      expect(attachCalls).not.toContain(noApp);
     }, 60_000);
 
     it.each(VARIANTS.map(([label]) => label))("a fly-machines run records one claim and resolves the backend once across dispatch retries (%s)", async (label) => {
@@ -3211,6 +3229,59 @@ describe("KgRefresh durable workflow", () => {
         expect(status.machine).toMatchObject({ machineId: "m-2", app: "app-b" });
         expect(fly.calls).toEqual(["create:m-2"]);
         expect(profileFlyCalls).toContain("destroy:m-1@app-a");
+      } finally {
+        currentFlyApp = undefined;
+        await env.stop();
+      }
+    }, 60_000);
+
+    it("AII-1276: a reuse of a kept machine with no recorded app backfills the app, and the hold is released", async () => {
+      const env = await startRetryEnabled([buildKeptWorkflow(), kgRepo, starter, profileObject]);
+      try {
+        currentFlyApp = undefined;
+        const first = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-1", { label: "attach recorded" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", first.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await first.done;
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "first release" });
+        expect((await profileStatus(env.baseUrl())).machine?.app).toBeUndefined();
+        fly.runnerExits("m-1");
+
+        fly.calls.length = 0;
+        currentFlyApp = "app-a";
+        const second = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.app === "app-a", { label: "app backfilled" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", second.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await second.done;
+        const status = await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "second release" });
+        expect(status.machine).toMatchObject({ machineId: "m-1", app: "app-a" });
+        expect(fly.calls).toEqual(["update:m-1", "start:m-1"]);
+      } finally {
+        currentFlyApp = undefined;
+        await env.stop();
+      }
+    }, 60_000);
+
+    it("AII-1276: a reuse where the app is already recorded leaves the machine and app unchanged", async () => {
+      const env = await startRetryEnabled([buildKeptWorkflow(), kgRepo, starter, profileObject]);
+      try {
+        currentFlyApp = "app-a";
+        const first = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-1", { label: "attach recorded" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", first.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await first.done;
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "first release" });
+        fly.runnerExits("m-1");
+
+        fly.calls.length = 0;
+        profileFlyCalls.length = 0;
+        const second = await startRun(env);
+        await callWorkflow(env.baseUrl(), "KgRefresh", second.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await second.done;
+        const status = await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "second release" });
+        expect(status.machine).toMatchObject({ machineId: "m-1", app: "app-a" });
+        expect(fly.calls).toEqual(["update:m-1", "start:m-1"]);
+        expect(profileFlyCalls.filter((c) => c.startsWith("destroy:"))).toEqual([]);
       } finally {
         currentFlyApp = undefined;
         await env.stop();

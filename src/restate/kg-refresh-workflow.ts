@@ -424,7 +424,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       );
 
       // One-way and idempotent in the object; a replay after a crash here sends it again.
-      if (dispatchResult.created && dispatchResult.machineId) {
+      // A reuse that carries the app also sends it, so a machine recorded without an app gets one.
+      if (dispatchResult.machineId && (dispatchResult.created || dispatchResult.app !== undefined)) {
         ctx.objectSendClient(FlyMachineProfile, "kg-refresh").attach({ dispatchId, machineId: dispatchResult.machineId, attempt,
           ...(dispatchResult.app !== undefined && { app: dispatchResult.app }),
           ...(dispatchResult.replaced !== undefined && { replaces: dispatchResult.replaced }) });

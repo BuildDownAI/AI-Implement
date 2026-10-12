@@ -121,7 +121,11 @@ export function decideAttach(machine: KeptMachineState | null, dispatchId: strin
   if (!machine || !held || held.dispatchId !== dispatchId) {
     return { kind: "conflict", message: `attach by ${dispatchId}, which does not hold the machine${held ? ` (held by ${held.dispatchId} attempt ${held.attempt})` : ""}` };
   }
-  if (machine.machineId === machineId) return { kind: "unchanged" };
+  if (machine.machineId === machineId) {
+    // A reuse backfills the app of a machine recorded before it was tracked; a recorded app is never changed.
+    if (machine.app === undefined && app !== undefined) return { kind: "record", next: { ...machine, app }, replaced: null };
+    return { kind: "unchanged" };
+  }
   const next: KeptMachineState = { machineId, ...(app !== undefined && { app }), lastUsedAt: now, heldBy: held };
   if (machine.machineId === undefined) return { kind: "record", next, replaced: null };
   // The dispatch step found the recorded machine destroyed or 404 and created this one: replace at any attempt.
