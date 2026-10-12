@@ -52,7 +52,7 @@ Rule 8 required the review-fix pilot's live restart recovery and one week of ope
 
 **Basis.** The gate closes on integrated test evidence, not on live operating evidence. The SAN live evaluation (AII-815) and the live kg-refresh proof on the testing orchestrator continue. If either fails its criteria, this amendment is reopened.
 
-**The run-ledger program (AII-611) is narrowed.** Verify-only token handling is no longer part of AII-611: each migration flips its own callback branch (rule 4). The signed report payload and credential scoping at the process boundary stay as the scope of AII-611 and get their own decision. Their two design records are in draft PR #495 and are not merged.
+**The run-ledger program (AII-611) is narrowed.** Verify-only token handling is no longer part of AII-611: each migration flips its own callback branch (rule 4). The signed report payload and credential scoping at the process boundary stayed as the scope of AII-611 and got their own decision in AII-1241 (2026-10-12). Credential scoping was narrowed to one change and landed: repository processes no longer receive the run tokens (AII-1242). The signed report payload was cancelled as a separate program; each run kind gets verify-only report handling when it migrates (rule 4). The September design drafts stay readable in closed PR #495.
 
 **End state for tokens.** The split in "Consequences" is temporary. Each report path becomes verify-only when its run kind migrates. No path stays on single-use tokens after the last migration.
 
