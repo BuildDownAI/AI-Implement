@@ -131,9 +131,29 @@ None of the four is an admin-UI setting — every consumer is a same-machine pee
 - `RESTATE_BASE_DIR` → the top-level `base-dir` config key, set to `restateDataDir()`
 - `RESTATE_BIND_ADDRESS` → the top-level `bind-address` config key (the fabric port, above)
 
+### Restate UI through the orchestrator (AII-1261)
+
+Admins reach the Restate UI without `flyctl`: `src/restate/ui-proxy.ts` (`handleRestateUiRequest`, dispatched in `handleRequest` before the admin route block) forwards an allowlist of root paths to the loopback listeners. No new listener is opened. The UI cannot live under a path prefix (its router base is `/ui/`), so the paths are at the orchestrator's root. Decision record: [ADR 039](adr/039-admins-reach-the-restate-ui-through-the-orchestrator.md).
+
+| Incoming path | Forwarded to |
+|---|---|
+| `/ui`, `/ui/*` (any method) | admin API (9070), path unchanged |
+| `GET /health`, `/version`, `/services`, `/services/*`, `/deployments`, `/deployments/*` | admin API |
+| `POST /query`, `POST /deployments` | admin API |
+| `/invocations/*` (any method) | admin API |
+| `/admin/restate/ingress/*` | ingress (8081), the prefix removed |
+
+Any other path or method is not handled and the orchestrator's routing continues.
+
+- **Advertised ingress address.** When `OAUTH_REDIRECT_BASE_URL` is set, the sidecar gets `RESTATE_INGRESS__ADVERTISED_ADDRESS=<base>/admin/restate/ingress/`, so the playground calls the gate rather than the loopback ingress. Unset (local dev) keeps the default, and the playground cannot reach the ingress. The UI caches the value, so a deploy that changes it needs a hard refresh. The orchestrator's own calls keep `RESTATE_INGRESS_BASE_URL`.
+- **Role rule.** Every handled path runs `authenticateAdminRequest`: no session is 401, an unavailable access list is 503, and a role other than `admin` is 403. Page grants never apply.
+- **Header stripping.** `cookie` and `authorization` are removed from the forwarded request, because the ingress journals request headers and bodies (§ "The ingress journals request and response bodies") and a session token must never reach a journal.
+- **Logging.** Each handled request that is not GET, HEAD, or `POST /query` logs `[restate-ui] <email> <METHOD> <path>`. The UI polls `/query` about once a second, so those are not logged.
+- **Reserved paths.** An orchestrator route under `/ui`, `/health`, `/version`, `/services`, `/deployments`, `/query`, or `/invocations` would collide.
+
 ### Reading an invocation's journal (AII-1128)
 
-The admin API is loopback, so `GET /api/restate/journal` reads it for the operator (`src/restate/journal-query.ts`, route in `src/admin.ts`). It reuses `runIntrospectionQuery` and `sqlQuote` from `endpoint.ts` to query `sys_invocation`, `sys_journal` and `sys_promise`. `/query` itself is never exposed: a free SQL endpoint over the introspection tables is a different trust decision.
+The admin API is loopback, so `GET /api/restate/journal` reads it for the operator (`src/restate/journal-query.ts`, route in `src/admin.ts`). It reuses `runIntrospectionQuery` and `sqlQuote` from `endpoint.ts` to query `sys_invocation`, `sys_journal` and `sys_promise`. `/query` is exposed to the admin role only, through the Restate UI door (§ "Restate UI through the orchestrator", ADR 039).
 
 - **Lookup:** `?service=<name>&key=<key>` (a lookup by service and key answers the key's `run` invocation when there is one (a workflow), so shared `status` / `progress` calls never shadow it, and the newest invocation otherwise (a virtual object)) or `?id=<invocation id>`. Each value is 1-128 characters of `[A-Za-z0-9._:-]`, checked by `validateJournalLookup` and then still passed through `sqlQuote`. A bad lookup is a 400 naming the field.
 - **Answer:** `{ invocation, entries, promises }`. Entries are trimmed to `index, entryType, name, completed, promiseName, appendedAt, sleepWakeupAt, entry`. `entry` is the parsed `entry_json`, or `null` when it is over 4096 characters or unparseable, so one read stays near 100 KB even with a large `report` body. Promises are scoped by the invocation's own service and key, so the `id` form finds them too; a keyless service has no key (`NULL`), so it has no promise rows and the promises list is empty.

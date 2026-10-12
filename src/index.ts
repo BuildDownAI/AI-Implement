@@ -130,6 +130,7 @@ import { KgSidecar } from "./kg-sidecar.js";
 import type { KgRefreshIngressClient } from "./restate/kg-refresh-production.js";
 import { createKgRefreshIngressClient } from "./restate/kg-refresh-production.js";
 import { RestateSidecar } from "./restate/server.js";
+import { handleRestateUiRequest } from "./restate/ui-proxy.js";
 import { startRestateEndpoint, register as registerRestateEndpoint, RESTATE_SERVICES } from "./restate/endpoint.js";
 import {
   getRestateRetentionDays,
@@ -4785,6 +4786,9 @@ function startServer(
       res.end(JSON.stringify({ error: "Not found" }));
       return;
     }
+
+    // Restate UI, its admin API paths and ingress (AII-1261, ADR 039): admin role only.
+    if (handleRestateUiRequest(req, res, { adminConfigured: Boolean(config.adminAccessCode) || isOAuthConfigured() })) return;
 
     // Admin routes - match on the path only, so query params can still be read when needed
     if (url.split("?")[0] === "/admin" || url.startsWith("/api/")) {
