@@ -140,6 +140,14 @@ describe("LateExternalReview workflow", () => {
         expect(sc.stamps).toEqual([]);
       });
 
+      it("ends findings on a blocking finding recorded from a 🔴 summary after the commit time, writing no mark", async () => {
+        // The ledger records a trusted summary's 🔴 heading as an ordinary blocking finding (AII-1251).
+        const { result, sc } = await runScenario(url(), { ticks: [pending, { ...passed, blockingLastSeenAtMs: [COMMIT_MS + 5] }] });
+        expect(result).toEqual({ outcome: "findings" });
+        expect(sc.stamps).toEqual([]);
+        expect(sc.comments).toEqual([]);
+      });
+
       it("ends findings on a blocking finding last seen exactly at the commit time", async () => {
         const { result } = await runScenario(url(), { ticks: [{ ...passed, blockingLastSeenAtMs: [COMMIT_MS] }] });
         expect(result.outcome).toBe("findings");

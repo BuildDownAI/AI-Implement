@@ -32,6 +32,8 @@ Two reviewers matter now:
 
 **4. Inline comments count only from a trusted bot on the head.** The author must be trusted, `authorType` must be `Bot`, and `commitId` must equal the head SHA or be absent. 🔴 is `blocking`, 🟡 is `minor`, 🟣 is no finding, and an untagged comment is recorded as `minor`. The webhook already stores an inline comment as non-blocking, and a process must not turn every nit into a merge block.
 
+**4a. A 🔴 heading in a trusted Claude summary comment blocks too (AII-1251).** `claudeCodeReviewVerdict` still never reads the summary, so a green check with no inline comments is `approve` at the verdict. The block comes through the external-findings path instead: the ledger records a heading that starts with 🔴 as `blocking` (🟡 as `minor`, using the same marker mapping as item 4), and under this process a `blocking` `claude-review-summary` finding gates the approval. A summary with only 🟡 and 🟣 sections still approves.
+
 **5. An unknown id resolves to `ai-implement`, silently.** A stored value from a newer orchestrator must not stop every review on an older one.
 
 **6. Trust is spelled out.** The definition can approve a PR, so every entry's author list and `appSlug` are asserted in `src/__tests__/review-process.test.ts`. A project can add authors through `isTrustedReviewAuthor`'s `extra` list; it cannot remove built-in ones. `ai-implement` trusts `github-actions[bot]`, which the ledger's current set does not; consumers widen what that author can approve when they adopt this table.

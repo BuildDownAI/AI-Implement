@@ -435,10 +435,16 @@ function internalReviewerGates(
   return reviewers.find((reviewer) => reviewer.id === reviewerId)?.gates ?? false;
 }
 
+/**
+ * `summaryBlockingGates` is set under the Claude Code Review process: a `blocking` finding from a
+ * trusted Claude summary (a 🔴 heading) gates there, while minor and medium summary findings stay advisory.
+ */
 export function isReviewLedgerFindingGating(
-  finding: Pick<ReviewLedgerFinding, "source" | "reviewerId" | "reviewerProvenance">,
+  finding: Pick<ReviewLedgerFinding, "source" | "severity" | "reviewerId" | "reviewerProvenance">,
   reviewers?: ReviewerSelection[],
+  summaryBlockingGates = false,
 ): boolean {
+  if (summaryBlockingGates && finding.source === "claude-review-summary" && finding.severity === "blocking") return true;
   return isReviewLedgerSourceGating(finding.source, reviewers, finding.reviewerId, finding.reviewerProvenance);
 }
 
@@ -491,6 +497,7 @@ function buildReviewLedger(
   internalIssues: ReviewIssue[],
   externalFindings: ReviewLedgerFinding[],
   reviewers?: ReviewerSelection[],
+  summaryBlockingGates = false,
 ): PostPushReviewLedgerFinding[] {
   const ledger: PostPushReviewLedgerFinding[] = [];
   const indexByKey = new Map<string, number>();
@@ -502,7 +509,7 @@ function buildReviewLedger(
     const existingIndex = keys.map((key) => indexByKey.get(key)).find((index) => index !== undefined);
     if (existingIndex !== undefined) {
       const existing = ledger[existingIndex];
-      if (!isReviewLedgerFindingGating(existing, reviewers) && isReviewLedgerFindingGating(finding, reviewers)) {
+      if (!isReviewLedgerFindingGating(existing, reviewers, summaryBlockingGates) && isReviewLedgerFindingGating(finding, reviewers, summaryBlockingGates)) {
         ledger[existingIndex] = finding;
       }
       continue;
@@ -2289,9 +2296,10 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         });
       }
 
-      const reviewLedger = buildReviewLedger(internalIssues, [...selectedInternalFindings, ...externalFindings], effectiveReviewerPolicy);
-      const gatingReviewFindings = reviewLedger.filter((finding) => isReviewLedgerFindingGating(finding, effectiveReviewerPolicy));
-      const advisoryReviewFindings = reviewLedger.filter((finding) => !isReviewLedgerFindingGating(finding, effectiveReviewerPolicy));
+      const summaryBlockingGates = reviewProcess.id === "claude-code-review";
+      const reviewLedger = buildReviewLedger(internalIssues, [...selectedInternalFindings, ...externalFindings], effectiveReviewerPolicy, summaryBlockingGates);
+      const gatingReviewFindings = reviewLedger.filter((finding) => isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates));
+      const advisoryReviewFindings = reviewLedger.filter((finding) => !isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates));
       // A finding the fix agent disposed as "follow-up" on an earlier iteration is dropped here,
       // before the merge-readiness decision and before it can reappear in the next fix prompt.
       // An "invalid" disposition is not filtered — it stays gating so the next review decides.
