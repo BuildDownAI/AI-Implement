@@ -264,11 +264,12 @@ export function createFlyMachineProfile(deps: FlyMachineProfileDeps) {
           throw err;
         }
       }, { maxRetryAttempts: 3 });
+      ctx.set<KeptMachineState>(MACHINE_KEY, { lastUsedAt: decision.next.lastUsedAt, heldBy: decision.next.heldBy });
       if (denied) {
         ctx.console.warn(`[FlyMachineProfile] claim ${ctx.key} left machine ${machineId} in app ${app}: the sessions token cannot reach that app (current app ${input.app}); destroy the machine by hand`);
+      } else {
+        ctx.console.info(`[FlyMachineProfile] claim ${ctx.key} dispatch=${input.dispatchId} attempt=${attempt} destroyed ${machineId} in app ${app} (current app ${input.app})`);
       }
-      ctx.set<KeptMachineState>(MACHINE_KEY, { lastUsedAt: decision.next.lastUsedAt, heldBy: decision.next.heldBy });
-      ctx.console.info(`[FlyMachineProfile] claim ${ctx.key} dispatch=${input.dispatchId} attempt=${attempt} destroyed ${machineId} in app ${app} (current app ${input.app})`);
       return { machineId: null };
     }
     if (decision.next !== machine) ctx.set<KeptMachineState>(MACHINE_KEY, decision.next);

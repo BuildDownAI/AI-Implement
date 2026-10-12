@@ -108,4 +108,5 @@ Revert the change. A kept machine left behind is destroyed by the reaper once it
 
 ## Gaps
 
+- A kept machine left in an old sessions app (the destroy answered 401 or 403) has no automated cleanup: the reaper's `durable-expired` backstop only sees the current app and token, so the operator destroys it by hand.
 - The resume path (attempt above 1) is AII-1032's; only attempt 1 is sent today.

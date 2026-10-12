@@ -304,8 +304,7 @@ describe("FlyMachineProfile kept machine", () => {
     expect((await h.status())?.machineId).toBeUndefined();
   }, 30_000);
 
-  it.each(["401", "403"])("a claim with another app clears the machine without retrying when the destroy answers %s", async (status) => {
-    const label = labels[0];
+  it.each(labels.flatMap((l) => ["401", "403"].map((s) => [l, s] as const)))("a claim with another app clears the machine without retrying when the destroy answers (%s) %s", async (label, status) => {
     const key = fresh();
     const h = forKey(label, key);
     const machineId = `m-${randomUUID()}`;
