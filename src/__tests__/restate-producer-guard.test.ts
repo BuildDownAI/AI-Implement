@@ -43,7 +43,7 @@ describe("restate producer guard (ADR 034 rule 4)", () => {
   it("finds the promises that exist today", () => {
     const pairs = sources.flatMap((s) => findPromisePairs(s.source)).sort();
     expect(pairs).toEqual([
-      "KgRefresh.cancel", "KgRefresh.progress", "KgRefresh.report", "PlanningRun.report", "ReviewFixAttempt.cancel",
+      "KgRefresh.cancel", "KgRefresh.decide", "KgRefresh.progress", "KgRefresh.report", "PlanningRun.report", "ReviewFixAttempt.cancel",
       "ReviewFixAttempt.wake",
     ]);
   });

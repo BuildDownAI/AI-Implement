@@ -429,6 +429,24 @@ export async function closeSnapshotPr(
   if (branch) await deleteSnapshotBranch(deps, owner, repoName, branch);
 }
 
+/** Notes on the held snapshot PR who accepted the shrink, before it merges. Throws on failure so the step retries. */
+export async function postBaselineAcceptNote(
+  deps: KgRailDeps,
+  owner: string,
+  repoName: string,
+  prNumber: number,
+  actor: string,
+): Promise<void> {
+  const { token } = await deps.mintToken(deps.githubAppId, deps.githubAppPrivateKey, owner, {
+    permissions: { contents: "write", pull_requests: "write" },
+    repositories: [repoName],
+  });
+  await deps.postPrCommentFn(
+    token, owner, repoName, prNumber,
+    `### Baseline\n\nThe new baseline was accepted by ${actor}. Merging this snapshot.`,
+  );
+}
+
 /** Renders the per-part {part, prev, new} rows as a markdown table, or a placeholder when absent. */
 function renderPartTable(partTable?: Array<{ part: string; prev: string; new: string }>): string {
   if (!partTable || partTable.length === 0) return "_no per-part counts reported_";

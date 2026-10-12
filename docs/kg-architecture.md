@@ -245,24 +245,35 @@ blocking all future refreshes for the remainder of the 4-hour ingest TTL. A live
 dispatched a runner and received no callback within the TTL self-heals at the next `POST
 /api/kg/refresh` call.
 
-### Dry run (AII-632)
+### Decision gate (AII-1248)
 
-`trigger_kg_refresh { dryRun: true }` (the MCP tool, admin role) dispatches the same runner job
-as a normal trigger, with the push skipped: every guard in `kg-snapshot-push` still runs against
-the freshly ingested snapshot, but nothing is committed or pushed. The verdict and the per-part
-line-count table land on `get_kg_status` as `lastRefresh.dryRun`, `lastRefresh.detail`
-(`"dry-run: guard passed: ..."` / `"dry-run: guard refused: ..."` / `"dry-run: failed: ..."`), and
-`lastRefresh.partTable`. `servedStamp` and `current/` never change, and `stage` is restored to
-whatever it held before the dispatch rather than advancing through `staging`/`serving`/`reverted`.
-A dry-run and a real run of the same KG head print the same part table. The same dry-run is
-reachable from the admin REST route, `POST /api/kg/refresh` with body `{ "dryRun": true }` (the
-response echoes `dryRun` beside the trigger's fields; no body is the unchanged real refresh), and
-from the **Dry-run refresh** button beside **Refresh graph now** on the Knowledge Graph Pipelines page
-(AII-635). When the last terminal outcome was a dry-run, the Knowledge graph card on that page shows its
-verdict and the per-part table (`part | previous | new | delta`). A guard refusal carries the same
-`lastRefresh.partTable` and a part-naming `detail` on `get_kg_status` whether it came from a
-dry-run or a real (non-dry-run) refresh (AII-638) — only a real success omits `guardVerdict`/
-`partTable`, since it reports a snapshot commit instead.
+A snapshot shrink is one decision inside the same run, not a failed run and a second ingest. When
+the runner's `report` is `failureCode: "KG_SNAPSHOT_HELD"` with a `snapshotPr`, `KgRefresh` stops
+at a gate (`src/restate/kg-refresh-workflow.ts`):
+
+1. Sets step `decision` and stores `held` in workflow state: `snapshotPr`, `snapshotCommit`,
+   `snapshotBranch`, `partTable`, and `decideBy` (now + 24 h). `held` is state only; `status`
+   does not expose it yet.
+2. Sends `FlyMachineProfile("kg-refresh").release({ dispatchId })`: the runner has finished, so the
+   machine returns to the profile now rather than after the wait.
+3. Sends `KgRepo.extend({ triggerId, until: decideBy + KG_REPO_STALE_MARGIN_MS })`. The lease is
+   kept, so a `KgRepo.trigger` during the wait answers `refresh-in-progress`.
+4. Waits with `awaitOwnedRun` on the `decide` and `cancel` signals until `decideBy`.
+
+| Event | Action | Outcome |
+| -- | -- | -- |
+| `decide { action: "accept", actor }` | Posts a `### Baseline` comment naming the actor on the PR, then runs the normal merge, delete-branch and fetch/stage/swap/verify gates | as a normal success |
+| `decide { action: "cancel", actor }` | Closes the PR (gate `operator_cancelled`), closes the row, releases | `operator_cancelled` |
+| `cancel` signal (the page's Stop) | Same as `decide` cancel | `operator_cancelled` |
+| 24 h elapse (`KG_REFRESH_DECISION_TIMEOUT_MS`, fixed, no setting) | Closes the PR (gate `decision_timeout`), closes the row, releases | `decision_timeout` |
+
+`decide` is a shared handler with a zod-validated body; `actor` is required, and the PR note and the
+`[KgRefresh]` log line name it. It answers 409 `no-decision-open` unless the step is `decision`, and 409
+`already-decided` once a decision is recorded. A cancel that lands at the very moment of the deadline
+is recorded as `decision_timeout`. A held dry-run never reaches the gate. Any other report takes the
+unchanged success or failure paths; a `KG_SNAPSHOT_HELD` report with no `snapshotPr` takes the failure path.
+
+The deploy drain counts a suspended invocation, so a held run holds a deploy for up to 24 h.
 
 **Redeploy remains the path for code, not data** — a change that touches the sidecar's code rather
 than its data ships by deploy, and the image build reads whatever snapshot is on the KG repo's default
