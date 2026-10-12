@@ -677,6 +677,47 @@ export function kgStageForRunnerStep(id: string, status: StepStatus): KgRefreshS
 
 const REVERT_GATES = new Set(["answers", "vectors", "canary", "stamp"]);
 
+export const DECIDE_KG_REFRESH_DESCRIPTION =
+  "Decide the current in-flight KG refresh (admin role). Acts only on the run KgRepo reports in flight; there is no trigger id argument, so a past run cannot be decided. `accept` lands the held snapshot, `cancel` drops it. When the run is not at the decision gate, `accept` answers no-decision-open and `cancel` stops the run through the cancel signal. A second decision answers already-decided; with no run in flight the answer is no-refresh-in-flight.";
+
+export const decideKgRefreshTool = tool(
+  {
+    description: DECIDE_KG_REFRESH_DESCRIPTION,
+    input: z.object({
+      action: z.enum(["accept", "cancel"]).describe("accept lands the held snapshot; cancel drops it (or stops the run when no decision is open)."),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
+    const toolDeps = kgRefreshToolDeps;
+    if (!toolDeps) return toolError("KG refresh is not configured");
+    const inFlight = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).status();
+    if (inFlight === null || inFlight === undefined) return toolError("no-refresh-in-flight");
+    const { triggerId } = inFlight;
+    const { action } = input.args;
+    const actor = input.caller.email ?? (input.caller.kind === "system" ? "system" : "unknown");
+    try {
+      await ctx.workflowClient(KgRefresh, triggerId).decide({ action, actor });
+      return reply({ decided: action });
+    } catch (err) {
+      if (!(err instanceof restate.TerminalError) || err.code !== 409) throw err;
+      if (err.message === "already-decided") return toolError("already-decided");
+      if (err.message !== "no-decision-open") throw err;
+    }
+    if (action === "accept") return toolError("no-decision-open");
+    try {
+      await ctx.workflowClient(KgRefresh, triggerId).cancel({ reason: "operator_cancelled" });
+    } catch (err) {
+      // The run finished between the status read and the signal.
+      if (err instanceof restate.TerminalError && (err.code === 404 || err.code === 409)) return toolError("no-refresh-in-flight");
+      throw err;
+    }
+    return reply({ cancelled: true });
+  },
+);
+
 function kgStageFromLastRefresh(last: KgRefreshStatus["lastRefresh"]): KgRefreshStage {
   if (!last) return "idle";
   if (last.ok) return "serving";
@@ -1306,6 +1347,7 @@ export const orchestratorTools = restate.service({
     kg_path: kgPath,
     kg_provenance: kgProvenance,
     trigger_kg_refresh: triggerKgRefreshTool,
+    decide_kg_refresh: decideKgRefreshTool,
     set_runner_mode: setRunnerModeTool,
     set_fly_machine_profile: setFlyMachineProfileTool,
     pause_project: pauseProjectTool,

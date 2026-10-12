@@ -628,6 +628,15 @@ describe("createKgRefreshIngressClient", () => {
     expect(await clientWith(respond(500, body)).report("t-1", { ok: true })).toEqual({ status: "unavailable" });
   });
 
+  it("decide maps accepted, a 409 to conflict with the handler's text, 404 to not-found, and a 500 to unavailable", async () => {
+    const input = { action: "accept", actor: "ada@example.com" } as const;
+    expect(await clientWith(respond(200)).decide("t-1", input)).toEqual({ status: "accepted" });
+    expect(await clientWith(respond(409, JSON.stringify({ code: 409, message: "already-decided" }))).decide("t-1", input))
+      .toEqual({ status: "conflict", error: "already-decided" });
+    expect(await clientWith(respond(404, JSON.stringify({ code: 404, message: "not found" }))).decide("t-1", input)).toEqual({ status: "not-found" });
+    expect(await clientWith(respond(500, JSON.stringify({ code: 500, message: "boom" }))).decide("t-1", input)).toEqual({ status: "unavailable" });
+  });
+
   it("does not map a 409 from enqueueDryRun to conflict", async () => {
     const entry = { key: "acme/kg#1", ref: "br", report: { repo: "acme/kg", prNumber: 1, sha: "s" } };
     const body = JSON.stringify({ code: 409, message: "conflict" });

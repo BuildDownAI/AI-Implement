@@ -21,6 +21,7 @@ import {
   getIssueReportCardTool,
   getFleetReportTool,
   triggerKgRefreshTool,
+  decideKgRefreshTool,
   setRunnerModeTool,
   pauseProjectTool,
   addProjectTool,
@@ -1241,6 +1242,88 @@ describe("migrated write handlers (AII-713)", () => {
         content: [{ type: "text", text: "trigger_kg_refresh failed: kg-refresh dispatch rejected" }],
       });
       expect(trigger).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("decide_kg_refresh", () => {
+    const answer = (result: { content: { text: string }[]; isError?: boolean }) => ({ isError: result.isError === true, text: result.content[0].text });
+    const status = vi.fn();
+    const decide = vi.fn();
+    const cancel = vi.fn();
+    const ctx = () => ({
+      ...fakeContext("decide_kg_refresh"),
+      objectClient: () => ({ status }),
+      workflowClient: () => ({ decide, cancel }),
+    }) as unknown as restate.Context;
+    const call = (args: Record<string, unknown>, caller: Caller = { kind: "human", email: "ada@example.com", role: "admin" }) =>
+      decideKgRefreshTool(ctx(), { caller, args });
+    const terminal = (code: number, message: string) => new restate.TerminalError(message, { errorCode: code });
+
+    beforeEach(() => {
+      status.mockReset().mockResolvedValue({ triggerId: "trig-1", startedAt: 1 });
+      decide.mockReset().mockResolvedValue(undefined);
+      cancel.mockReset().mockResolvedValue(undefined);
+      setKgRefreshToolDeps(kgToolDeps());
+    });
+    afterEach(() => setKgRefreshToolDeps(null));
+
+    it("is role: admin and refuses a user caller without touching the workflow", async () => {
+      const result = await call({ action: "accept" }, HUMAN_USER);
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("requires the admin role");
+      expect(status).not.toHaveBeenCalled();
+      expect(decide).not.toHaveBeenCalled();
+    });
+
+    it("answers no-refresh-in-flight with no run in flight, and calls no workflow", async () => {
+      status.mockResolvedValue(null);
+      expect(answer(await call({ action: "accept" }))).toEqual({ isError: true, text: "no-refresh-in-flight" });
+      expect(decide).not.toHaveBeenCalled();
+      expect(cancel).not.toHaveBeenCalled();
+    });
+
+    it("answers not configured when the tool deps are unset", async () => {
+      setKgRefreshToolDeps(null);
+      expect(answer(await call({ action: "accept" }))).toEqual({ isError: true, text: "KG refresh is not configured" });
+    });
+
+    it("decides the run KgRepo reports, with the caller's email as the actor", async () => {
+      expect(answer(await call({ action: "accept" }))).toEqual({ isError: false, text: JSON.stringify({ decided: "accept" }, null, 2) });
+      expect(decide).toHaveBeenCalledWith({ action: "accept", actor: "ada@example.com" });
+    });
+
+    it("never sends an undefined actor when the caller has no email", async () => {
+      await call({ action: "accept" }, SYSTEM_ADMIN);
+      expect(decide).toHaveBeenCalledWith({ action: "accept", actor: "system" });
+    });
+
+    it("answers no-decision-open for accept when the run is not at the gate", async () => {
+      decide.mockRejectedValue(terminal(409, "no-decision-open"));
+      expect(answer(await call({ action: "accept" }))).toEqual({ isError: true, text: "no-decision-open" });
+      expect(cancel).not.toHaveBeenCalled();
+    });
+
+    it("sends the cancel signal for cancel when the run is not at the gate", async () => {
+      decide.mockRejectedValue(terminal(409, "no-decision-open"));
+      expect(JSON.parse(answer(await call({ action: "cancel" })).text)).toEqual({ cancelled: true });
+      expect(cancel).toHaveBeenCalledWith({ reason: "operator_cancelled" });
+    });
+
+    it("answers already-decided for a second decision, and never falls through to cancel", async () => {
+      decide.mockRejectedValue(terminal(409, "already-decided"));
+      expect(answer(await call({ action: "cancel" }))).toEqual({ isError: true, text: "already-decided" });
+      expect(cancel).not.toHaveBeenCalled();
+    });
+
+    it("answers no-refresh-in-flight when the run finished before the cancel signal", async () => {
+      decide.mockRejectedValue(terminal(409, "no-decision-open"));
+      cancel.mockRejectedValue(terminal(404, "not found"));
+      expect(answer(await call({ action: "cancel" }))).toEqual({ isError: true, text: "no-refresh-in-flight" });
+    });
+
+    it("does not report success or a conflict when Restate is unavailable", async () => {
+      decide.mockRejectedValue(new Error("connect ECONNREFUSED"));
+      await expect(call({ action: "accept" })).resolves.toMatchObject({ isError: true });
     });
   });
 
