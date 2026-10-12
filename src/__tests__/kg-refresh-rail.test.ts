@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import {
   fetchGate, stageGate, swapGate, verifyGate, revertRail,
   RailGateError, readServedStamp, readNamespace,
-  mergeSnapshotPr, deleteSnapshotBranch, closeSnapshotPr, postDryRunReport,
+  mergeSnapshotPr, deleteSnapshotBranch, closeSnapshotPr, postBaselineAcceptNote, postDryRunReport,
   type KgRailDeps, type RailContext,
 } from "../kg-refresh-rail.js";
 import { COMPLETION_MARKER } from "../kg-sidecar.js";
@@ -455,6 +455,19 @@ describe("kg-refresh-rail", () => {
       expect(postPrCommentFn).toHaveBeenCalledTimes(1);
       expect(closePullRequestFn).toHaveBeenCalledTimes(1);
       expect(deleteBranchFn).toHaveBeenCalledTimes(1);
+    });
+
+    it("postBaselineAcceptNote mints a scoped token and comments naming the actor", async () => {
+      const postPrCommentFn = vi.fn(async () => {});
+      const mintToken = vi.fn(async () => ({ token: "tok" }));
+      const deps = makeDeps({ postPrCommentFn: postPrCommentFn as never, mintToken: mintToken as never });
+      await postBaselineAcceptNote(deps, "TestOrg", "test-kg", 9, "alice@example.com");
+      expect(mintToken).toHaveBeenCalledWith(
+        expect.anything(), expect.anything(), "TestOrg",
+        { permissions: { contents: "write", pull_requests: "write" }, repositories: ["test-kg"] },
+      );
+      expect(postPrCommentFn).toHaveBeenCalledWith("tok", "TestOrg", "test-kg", 9, expect.stringContaining("alice@example.com"));
+      expect(postPrCommentFn.mock.calls[0]![4]).toContain("### Baseline");
     });
 
     it("postDryRunReport posts the sticky comment and sets the commit status on success", async () => {

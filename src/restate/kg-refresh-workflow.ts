@@ -92,7 +92,7 @@ export type KgRefreshRunInput = z.infer<typeof kgRefreshRunInputSchema> & { repo
 /** The `decide` handler's input: who decided, and whether the held snapshot lands or is dropped. */
 export const kgRefreshDecideSchema = z.object({
   action: z.enum(["accept", "cancel"]),
-  actor: z.string().min(1),
+  actor: z.string().min(1).max(200).regex(/^[^\x00-\x1f\x7f]+$/, "actor must not contain control characters"),
 }).strict();
 
 export type KgRefreshDecideInput = z.infer<typeof kgRefreshDecideSchema>;

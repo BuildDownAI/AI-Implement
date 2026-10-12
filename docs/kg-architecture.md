@@ -293,6 +293,43 @@ the rail alone.
 Steps 5 to 7 exist entirely because of the monolith. In a two-service design the data would be
 reloadable on its own; here it rides a release, so the release has to be sequenced and verified.
 
+### Dry run (AII-632)
+
+`trigger_kg_refresh { dryRun: true }` (the MCP tool, admin role) dispatches the same runner job
+as a normal trigger, with the push skipped: every guard in `kg-snapshot-push` still runs against
+the freshly ingested snapshot, but nothing is committed or pushed. The verdict and the per-part
+line-count table land on `get_kg_status` as `lastRefresh.dryRun`, `lastRefresh.detail`
+(`"dry-run: guard passed: ..."` / `"dry-run: guard refused: ..."` / `"dry-run: failed: ..."`), and
+`lastRefresh.partTable`. `servedStamp` and `current/` never change, and `stage` is restored to
+whatever it held before the dispatch rather than advancing through `staging`/`serving`/`reverted`.
+A dry-run and a real run of the same KG head print the same part table. The same dry-run is
+reachable from the admin REST route, `POST /api/kg/refresh` with body `{ "dryRun": true }` (the
+response echoes `dryRun` beside the trigger's fields; no body is the unchanged real refresh), and
+from the **Dry-run refresh** button beside **Refresh graph now** on the Knowledge Graph Pipelines page
+(AII-635). When the last terminal outcome was a dry-run, the Knowledge graph card on that page shows its
+verdict and the per-part table (`part | previous | new | delta`). A guard refusal carries the same
+`lastRefresh.partTable` and a part-naming `detail` on `get_kg_status` whether it came from a
+dry-run or a real (non-dry-run) refresh (AII-638) — only a real success omits `guardVerdict`/
+`partTable`, since it reports a snapshot commit instead.
+
+**Redeploy remains the path for code, not data** — a change that touches the sidecar's code rather
+than its data ships by deploy, and the image build reads whatever snapshot is on the KG repo's default
+branch at that moment (the rail keeps it current):
+
+1. **Refresh the data first if it must be current** — `POST /api/kg/refresh`, wait for `serving`.
+2. **Self-deploy** — `POST /api/deploy` with an admin session token. Expect `202`, or `409` if one is
+   already running. Never a plain `fly deploy`; see [deployment.md](deployment.md#deploy-paths).
+3. **Verify live.** Non-empty results, `degraded: false`, and an age stamp equal to the served stamp
+   from step 1. Check `kgDegraded` on `GET /` as well — a lexical-only image answers queries and looks
+   healthy.
+
+An orchestrator that predates the rail (the route answers 404) is upgraded, not worked around: the
+laptop ingest-and-push path is retired (AII-593), and `snapshot/` on the default branch is written by
+the rail alone.
+
+Steps 5 to 7 exist entirely because of the monolith. In a two-service design the data would be
+reloadable on its own; here it rides a release, so the release has to be sequenced and verified.
+
 ### PR check (AII-633)
 
 A PR that touches `kg_ingest/**`, `sources.yml`, `ontology/**`, or `snapshot/**` on the bound KG
