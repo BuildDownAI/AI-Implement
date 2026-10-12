@@ -2003,6 +2003,15 @@ describe("admin mappings", () => {
     expect(JSON.parse(reset.body).reviewProcess).toBeNull();
   });
 
+  it("stores reviewProcess claude-code-review-repository-fix", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RP4", owner: "org", repo: "app", reviewProcess: "claude-code-review-repository-fix",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).reviewProcess).toBe("claude-code-review-repository-fix");
+  });
+
   it("stores null reviewProcess when absent on a new mapping", async () => {
     const token = await login("secret");
     const res = await request("/api/mappings", "POST", "secret", { teamKey: "RP2", owner: "org", repo: "app" }, token);
@@ -2015,7 +2024,7 @@ describe("admin mappings", () => {
       teamKey: "RP3", owner: "org", repo: "app", reviewProcess: "github",
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toBe('reviewProcess invalid: must be null, "ai-implement", or "claude-code-review"');
+    expect(JSON.parse(res.body).error).toBe('reviewProcess invalid: must be null, "ai-implement", "claude-code-review", or "claude-code-review-repository-fix"');
   });
 
   it("resets trustedReviewAuthors to the null default via an explicit null", async () => {

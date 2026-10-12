@@ -887,7 +887,7 @@ function collectReviewThreadFindings(
     if (authorLogin && blockingReviewerLogins.has(normalizeReviewerLogin(authorLogin))) {
       severity = "blocking";
     } else if (
-      options.process.id === "claude-code-review"
+      options.process.claudeInlineMarkers
       && authorLogin
       && isTrustedReviewAuthor(authorLogin, options.process, options.extraAuthors)
     ) {
