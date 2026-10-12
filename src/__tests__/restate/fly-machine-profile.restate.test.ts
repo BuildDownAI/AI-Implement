@@ -43,6 +43,8 @@ interface FakeFly extends FlyMachineProfileDeps {
   /** Models a machine Fly reports as destroyed: the scrub ends as gone. */
   gone: boolean;
   settles: unknown[];
+  /** The app each Fly call was made with, keyed `clear:<id>` / `destroy:<id>`; undefined is the accessor's app. */
+  apps: Record<string, (string | undefined)[]>;
   fail404OnDestroy: boolean;
 }
 function fakeFly(idleTimeoutMsOverride?: number): FakeFly {
@@ -54,11 +56,13 @@ function fakeFly(idleTimeoutMsOverride?: number): FakeFly {
     stayStarted: false,
     gone: false,
     settles: [],
+    apps: {},
     fail404OnDestroy: false,
     idleTimeoutMsOverride,
     fly: {
       getMachine: async () => { throw new Error("unexpected getMachine"); },
-      clearMachineEnv: async (id, metadata, settle) => {
+      clearMachineEnv: async (id, metadata, settle, app) => {
+        (fake.apps[`clear:${id}`] ??= []).push(app);
         calls.push(metadata ? `clear:${id}:${JSON.stringify(metadata)}` : `clear:${id}`);
         fake.settles.push(settle);
         if (fake.stayStarted) throw new Error(`Timeout waiting for machine ${id} to settle (state=started)`);
@@ -69,7 +73,8 @@ function fakeFly(idleTimeoutMsOverride?: number): FakeFly {
           throw new Error(`Failed to update machine ${id} (409): {"error":"aborted: machine is replacing: concurrent update in progress"}`);
         }
       },
-      destroyMachine: async (id) => {
+      destroyMachine: async (id, app) => {
+        (fake.apps[`destroy:${id}`] ??= []).push(app);
         calls.push(`destroy:${id}`);
         if (fake.fail404OnDestroy) throw new Error(`Failed to destroy machine ${id} (404): gone`);
       },
@@ -246,6 +251,59 @@ describe("FlyMachineProfile kept machine", () => {
     const rows = await eventually(() => h.expires(), (found) => found.length === 1, { label: "one scheduled FlyMachineProfile.expire", timeoutMs: 30_000 });
     expect(rows).toHaveLength(1);
   }, 30_000);
+
+  it.each(labels)("the recorded app is used by release and expire, and survives a re-claim (%s)", async (label) => {
+    const key = fresh();
+    const h = forKey(label, key);
+    const machineId = `m-${randomUUID()}`;
+    await h.call("claim", { dispatchId: "d1" });
+    await h.call("attach", { dispatchId: "d1", machineId, app: "app-a" });
+    await h.call("release", { dispatchId: "d1" });
+    expect(fly.apps[`clear:${machineId}`]).toEqual(["app-a"]);
+    expect(await h.status()).toMatchObject({ machineId, app: "app-a", heldBy: null });
+    await h.call("claim", { dispatchId: "d2" });
+    expect(await h.status()).toMatchObject({ machineId, app: "app-a" });
+    await h.call("release", { dispatchId: "d2" });
+    expect(fly.apps[`clear:${machineId}`]).toEqual(["app-a", "app-a"]);
+  }, 30_000);
+
+  it.each(labels)("expire destroys in the recorded app (%s)", async (label) => {
+    const key = fresh();
+    const h = mk(() => short, label, key);
+    const machineId = `m-${randomUUID()}`;
+    await h.call("claim", { dispatchId: "d1" });
+    await h.call("attach", { dispatchId: "d1", machineId, app: "app-a" });
+    await h.call("release", { dispatchId: "d1" });
+    await eventually(() => h.status(), (m) => m === null, { label: "machine cleared by expire", timeoutMs: 20_000, intervalMs: 50 });
+    expect(shortFly.apps[`clear:${machineId}`]).toEqual(["app-a"]);
+    expect(shortFly.apps[`destroy:${machineId}`]).toEqual(["app-a"]);
+  }, 30_000);
+
+  it.each(labels)("a state with no app releases with the accessor's app (%s)", async (label) => {
+    const key = fresh();
+    const h = forKey(label, key);
+    const machineId = `m-${randomUUID()}`;
+    await h.call("claim", { dispatchId: "d1" });
+    await h.call("attach", { dispatchId: "d1", machineId });
+    await h.call("release", { dispatchId: "d1" });
+    expect(fly.apps[`clear:${machineId}`]).toEqual([undefined]);
+    expect((await h.status())?.app).toBeUndefined();
+  }, 30_000);
+
+  it.each(labels)("destroy-unscrubbed uses the recorded app (%s)", async (label) => {
+    const key = fresh();
+    const h = forKey(label, key);
+    const machineId = `m-${randomUUID()}`;
+    await h.call("claim", { dispatchId: "d1" });
+    await h.call("attach", { dispatchId: "d1", machineId, app: "app-a" });
+    fly.gone = true;
+    try {
+      await h.call("release", { dispatchId: "d1" });
+    } finally {
+      fly.gone = false;
+    }
+    expect(fly.apps[`destroy:${machineId}`]).toEqual(["app-a"]);
+  }, 60_000);
 
   it.each(labels)("release by a non-holder is a no-op (%s)", async (label) => {
     const key = fresh();

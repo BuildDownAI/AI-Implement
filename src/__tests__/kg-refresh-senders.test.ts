@@ -93,7 +93,7 @@ describe("fly-machines sender", () => {
     expect(JSON.stringify(created[0])).toContain("durable-runner");
     expect(JSON.stringify(created[0])).toContain("kg-refresh");
     expect(result).toEqual({
-      outcome: "accepted", jobId: "m-new", machineId: "m-new", created: true,
+      outcome: "accepted", jobId: "m-new", machineId: "m-new", created: true, app: "fly-app",
       runUrl: "https://fly.io/apps/fly-app/machines/m-new", executionMode: "fly-machines",
     });
   });
@@ -103,7 +103,7 @@ describe("fly-machines sender", () => {
     (fly.getMachine as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("Fly API error (404)"));
     const result = await createKgRefreshSenders(deps)["fly-machines"](makeInput({ machineId: "m-old" }));
     expect(fly.getMachine).toHaveBeenCalledWith("m-old");
-    expect(result).toMatchObject({ jobId: "m-new", machineId: "m-new", created: true, replaced: "m-old" });
+    expect(result).toMatchObject({ jobId: "m-new", machineId: "m-new", created: true, replaced: "m-old", app: "fly-app" });
   });
 
   it("reuses a stopped kept machine", async () => {
@@ -111,7 +111,7 @@ describe("fly-machines sender", () => {
     const result = await createKgRefreshSenders(deps)["fly-machines"](makeInput({ machineId: "m-kept" }));
     expect(fly.getMachine).toHaveBeenCalledWith("m-kept");
     expect(fly.startMachine).toHaveBeenCalledWith("m-kept");
-    expect(result).toMatchObject({ jobId: "m-kept", machineId: "m-kept", created: false });
+    expect(result).toMatchObject({ jobId: "m-kept", machineId: "m-kept", created: false, app: "fly-app" });
     expect(result.replaced).toBeUndefined();
   });
 

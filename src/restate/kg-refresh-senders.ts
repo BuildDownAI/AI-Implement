@@ -113,6 +113,8 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
       pipeline: "kg-refresh",
       dispatchId: input.dispatchId,
     });
+    // Read once, inside the step: this is the app the machine lives in, whatever the accessor says later.
+    const app = config.flySessionsApp;
     const launched = await launchKeptMachine(deps.keptMachineFly(), {
       keptMachineId: input.machineId, dispatchId: input.dispatchId, machineConfig, machineNonce,
     });
@@ -127,6 +129,7 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
       executionMode,
       machineId: launched.machineId,
       created: launched.created,
+      app,
       ...(launched.created && launched.replaced !== undefined && { replaced: launched.replaced }),
     };
   };
