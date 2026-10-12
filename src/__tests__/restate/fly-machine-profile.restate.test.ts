@@ -3,7 +3,7 @@ import { GONE_BEFORE_SCRUB } from "../../fly-machines.js";
 import { randomUUID } from "node:crypto";
 import * as restate from "@restatedev/restate-sdk";
 import type { RestateEnvironment } from "./harness.js";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { CLEAR_MACHINE_ENV_MAX_MS } from "../../fly-machines.js";
 import { CLEAR_ATTEMPTS, MAX_RATE_LIMIT_WAIT_MS } from "../../fly-machines.js";
 import { SCRUB_BUDGET_MS, SCRUB_CALL_MAX_MS, SCRUB_MAX_RETRY_DURATION_MS, SCRUB_SETTLE_MS, FLY_MACHINE_PROFILE_DEFAULTS, OBJECT_ABORT_TIMEOUT_MS, OBJECT_INACTIVITY_TIMEOUT_MS, createFlyMachineProfile, type FlyMachineProfileConfig, type FlyMachineProfileDeps, type KeptMachineState } from "../../restate/fly-machine-profile.js";
@@ -46,6 +46,8 @@ interface FakeFly extends FlyMachineProfileDeps {
   /** The app each Fly call was made with, keyed `clear:<id>` / `destroy:<id>`; undefined is the accessor's app. */
   apps: Record<string, (string | undefined)[]>;
   fail404OnDestroy: boolean;
+  /** Fails every destroy with this message when set. */
+  failDestroyWith: string | null;
 }
 function fakeFly(idleTimeoutMsOverride?: number): FakeFly {
   const calls: string[] = [];
@@ -58,6 +60,7 @@ function fakeFly(idleTimeoutMsOverride?: number): FakeFly {
     settles: [],
     apps: {},
     fail404OnDestroy: false,
+    failDestroyWith: null,
     idleTimeoutMsOverride,
     fly: {
       getMachine: async () => { throw new Error("unexpected getMachine"); },
@@ -76,6 +79,7 @@ function fakeFly(idleTimeoutMsOverride?: number): FakeFly {
       destroyMachine: async (id, app) => {
         (fake.apps[`destroy:${id}`] ??= []).push(app);
         calls.push(`destroy:${id}`);
+        if (fake.failDestroyWith) throw new Error(`Failed to destroy machine ${id} ${fake.failDestroyWith}`);
         if (fake.fail404OnDestroy) throw new Error(`Failed to destroy machine ${id} (404): gone`);
       },
     },
@@ -299,6 +303,47 @@ describe("FlyMachineProfile kept machine", () => {
     }
     expect((await h.status())?.machineId).toBeUndefined();
   }, 30_000);
+
+  it.each(labels.flatMap((l) => ["401", "403"].map((s) => [l, s] as const)))("a claim with another app clears the machine without retrying when the destroy answers (%s) %s", async (label, status) => {
+    const key = fresh();
+    const h = forKey(label, key);
+    const machineId = `m-${randomUUID()}`;
+    await h.call("claim", { dispatchId: "d1" });
+    await h.call("attach", { dispatchId: "d1", machineId, app: "app-a" });
+    await h.call("release", { dispatchId: "d1" });
+    const warn = vi.spyOn(console, "warn");
+    fly.failDestroyWith = `(${status}): denied`;
+    try {
+      expect(await h.call("claim", { dispatchId: "d2", app: "app-b" })).toEqual({ machineId: null });
+    } finally {
+      fly.failDestroyWith = null;
+    }
+    const logged = warn.mock.calls.map((c) => c.join(" ")).filter((l) => l.includes(machineId));
+    warn.mockRestore();
+    expect(fly.apps[`destroy:${machineId}`]).toEqual(["app-a"]);
+    const machine = await h.status();
+    expect(machine).toMatchObject({ heldBy: { dispatchId: "d2", attempt: 1 } });
+    expect(machine?.machineId).toBeUndefined();
+    expect(machine?.app).toBeUndefined();
+    expect(logged.length).toBe(1);
+    expect(logged[0]).toMatch(/app-a.*token cannot reach.*by hand/);
+  }, 30_000);
+
+  it.each(labels)("a claim with another app fails and keeps the machine when the destroy fails otherwise (%s)", async (label) => {
+    const key = fresh();
+    const h = forKey(label, key);
+    const machineId = `m-${randomUUID()}`;
+    await h.call("claim", { dispatchId: "d1" });
+    await h.call("attach", { dispatchId: "d1", machineId, app: "app-a" });
+    await h.call("release", { dispatchId: "d1" });
+    fly.failDestroyWith = "(500): boom 401";
+    try {
+      await expect(h.call("claim", { dispatchId: "d2", app: "app-b" })).rejects.toThrow();
+    } finally {
+      fly.failDestroyWith = null;
+    }
+    expect(await h.status()).toMatchObject({ machineId, app: "app-a" });
+  }, 60_000);
 
   it.each(labels)("a claim with the same app, or with no recorded app, returns the machine and destroys nothing (%s)", async (label) => {
     const key = fresh();
