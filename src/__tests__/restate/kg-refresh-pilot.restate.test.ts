@@ -663,8 +663,20 @@ describe("Restate kg-refresh pilot: Fly sessions settings are live", () => {
     await eventually(() => createdApps.length >= 1, (ok) => ok, { label: "fly dispatch", timeoutMs: 20_000 });
     expect(createdApps[0]).toBe("late-app");
     const invocations = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`);
-    const journal = await journalEntries(env.adminAPIBaseUrl(), invocations[0].id as string);
-    expect(journaledRunResult(journal, "resolve")).toMatchObject({ executionMode: "fly-machines" });
-    expect(journaledRunResult(journal, "dispatch-1")).toMatchObject({ outcome: "accepted", executionMode: "fly-machines", runUrl: expect.stringContaining("/apps/late-app/") });
+    // The fake createMachine runs inside the dispatch-1 step; its completion entry is journaled only after the step returns.
+    const polled = await eventually(
+      async () => {
+        const journal = await journalEntries(env.adminAPIBaseUrl(), invocations[0].id as string);
+        try {
+          return { journal, dispatchResult: journaledRunResult(journal, "dispatch-1") };
+        } catch {
+          return undefined;
+        }
+      },
+      (v) => v !== undefined,
+      { label: "dispatch-1 journaled result", timeoutMs: 20_000 },
+    );
+    expect(journaledRunResult(polled!.journal, "resolve")).toMatchObject({ executionMode: "fly-machines" });
+    expect(polled!.dispatchResult).toMatchObject({ outcome: "accepted", executionMode: "fly-machines", runUrl: expect.stringContaining("/apps/late-app/") });
   }, 40_000);
 });
