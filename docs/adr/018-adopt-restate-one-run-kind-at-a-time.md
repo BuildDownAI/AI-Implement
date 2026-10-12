@@ -35,7 +35,7 @@ We adopt Restate one run kind at a time and make the run-ledger program continge
 
 - Easier: evidence precedes program. Each step deletes hand-rolled lifecycle glue instead of adding a parallel system. A failure at any step is local and reversible: the switch slice reverts alone.
 - Harder: token handling is heterogeneous during the transition — unmigrated paths consume single-use tokens while migrated paths verify only. The evaluation gate must resolve the end state so the split does not become permanent.
-- The run-ledger ADRs stay Proposed longer, and draft PR #495 stays a draft until the gate.
+- The run-ledger ADRs stay Proposed longer, and draft PR #495 stays a draft until the gate. (The gate closed on 2026-10-01; PR #495 was closed on 2026-10-12, and its two decisions were made in AII-1241.)
 
 ## Amendment (2026-09-28): kg-refresh starts on the pilot's integrated evidence
 
