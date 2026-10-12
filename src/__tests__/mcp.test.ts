@@ -172,8 +172,6 @@ vi.mock("../runner-mode.js", () => ({
   getKgMaterializeDirect: vi.fn(() => ({ enabled: true, source: "db" as const })),
   getKgExecutionMode: vi.fn(() => ({ mode: "github-actions" as const, source: "db" as const })),
   resolveKgBackend: vi.fn(() => ({ mode: "github-actions" as const, source: "kg-setting" as const })),
-  getKgFlyMachineOverride: vi.fn(() => ({})),
-  setKgFlyMachineOverride: vi.fn(),
 }));
 
 vi.mock("../config.js", async (importOriginal) => ({

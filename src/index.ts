@@ -143,7 +143,7 @@ import {
 import { applyVolumeSnapshotRetention, applyVolumeSnapshotRetentionAtBoot } from "./fly-volumes.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
 import { sweepOnRegistered } from "./webhook-redelivery.js";
-import { createKgFindRunByTitle, seedFlyMachineProfileFromOverride, createProductionKgRefreshServices, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
+import { createKgFindRunByTitle, createProductionKgRefreshServices, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
@@ -5119,7 +5119,6 @@ async function main(): Promise<void> {
     registerRestateEndpoint,
     onRegistered: async () => {
       sweepOnRegistered(config);
-      await seedFlyMachineProfileFromOverride();
       await seedRunnerBackends();
       await refreshRunnerBackendCache();
     },

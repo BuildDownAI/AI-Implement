@@ -51,12 +51,9 @@ vi.mock("../runner-mode.js", async (importOriginal) => ({
     kgSetting.current ?? { mode: flyConfigured ? "fly-machines" : "github-actions", source: "default" },
   getRunnerMode: () => ({ mode: runnerMode.current }),
   getKgMaterializeDirect: () => ({ enabled: false }),
-  getKgFlyMachineOverride: () => kgFlyOverride.current,
-  setKgFlyMachineOverride: (v: unknown) => { if (v === null) kgFlyOverride.current = {}; },
 }));
 const runnerMode = { current: "default" };
 const kgSetting: { current: { mode: "github-actions" | "fly-machines"; source: "db" | "env" | "default" } | null } = { current: null };
-const kgFlyOverride: { current: { cpus?: number; memoryMb?: number; cpuKind?: "auto" | "shared" | "performance" } } = { current: {} };
 const kgMappingSize: { current: { machineCpus?: number; machineMemoryMb?: number } } = { current: {} };
 vi.mock("../config.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../config.js")>()),
@@ -72,7 +69,6 @@ import {
   launchKeptMachine,
   type KeptMachineFly,
   resolveKgExecutionMode,
-  seedFlyMachineProfileFromOverride,
   type KgRefreshProductionInput,
 } from "../restate/kg-refresh-production.js";
 import { buildKgRefreshRunConfig, decodeRunConfig } from "../run-config.js";
@@ -806,44 +802,6 @@ describe("KG dispatch sizes the machine from the profile (AII-1130)", () => {
     const guest = (createMachine.mock.calls[0][0] as { config: { guest: Record<string, unknown> } }).config.guest;
     expect(guest).toMatchObject({ cpu_kind: "performance", cpus: 2, memory_mb: 8192 });
     kgMappingSize.current = {};
-  });
-});
-
-describe("seedFlyMachineProfileFromOverride (AII-1130)", () => {
-  const DAY7 = 7 * 24 * 60 * 60 * 1000;
-
-  it("sends the merged seed with the idempotency key, then deletes the row", async () => {
-    const sendSeed = vi.fn(async () => {});
-    const clearOverride = vi.fn();
-    await seedFlyMachineProfileFromOverride({ getOverride: () => ({ memoryMb: 4096, cpuKind: "auto" }), sendSeed, clearOverride });
-    expect(sendSeed).toHaveBeenCalledWith({ cpuKind: "performance", cpus: 2, memoryMb: 4096, idleTimeoutMs: DAY7 }, "seed:kg-refresh");
-    expect(clearOverride).toHaveBeenCalledTimes(1);
-  });
-
-  it("falls back to shared CPUs when performance would be below 2048 MB per CPU", async () => {
-    const sendSeed = vi.fn(async () => {});
-    await seedFlyMachineProfileFromOverride({ getOverride: () => ({ memoryMb: 1024 }), sendSeed, clearOverride: vi.fn() });
-    expect(sendSeed).toHaveBeenCalledWith({ cpuKind: "shared", cpus: 2, memoryMb: 1024, idleTimeoutMs: DAY7 }, "seed:kg-refresh");
-    await seedFlyMachineProfileFromOverride({ getOverride: () => ({ cpus: 8 }), sendSeed, clearOverride: vi.fn() });
-    expect(sendSeed).toHaveBeenLastCalledWith(expect.objectContaining({ cpuKind: "shared", cpus: 8 }), "seed:kg-refresh");
-  });
-
-  it("sends nothing with no stored override", async () => {
-    const sendSeed = vi.fn(async () => {});
-    const clearOverride = vi.fn();
-    await seedFlyMachineProfileFromOverride({ getOverride: () => ({}), sendSeed, clearOverride });
-    expect(sendSeed).not.toHaveBeenCalled();
-    expect(clearOverride).not.toHaveBeenCalled();
-  });
-
-  it("keeps the row when the send fails", async () => {
-    const err = vi.spyOn(console, "error").mockImplementation(() => {});
-    const clearOverride = vi.fn();
-    await seedFlyMachineProfileFromOverride({
-      getOverride: () => ({ cpus: 8 }), sendSeed: async () => { throw new Error("ingress down"); }, clearOverride,
-    });
-    expect(clearOverride).not.toHaveBeenCalled();
-    err.mockRestore();
   });
 });
 
