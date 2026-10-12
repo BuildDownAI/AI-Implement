@@ -407,10 +407,15 @@ describe("KgRefresh durable workflow", () => {
       executionMode: scenarios.get(dispatchId)?.executionMode ?? "fly-machines",
     };
   }
+  /** A test parks `recordDispatchDetails` here so signals can land before the workflow starts waiting. */
+  let detailsHold: Promise<void> | null = null;
   const projectionFakes = {
     deriveMachineNonce: fakeNonce,
     armMachineNonce: (dispatchId: string, attempt: number) => { armedNonces.push({ dispatchId, attempt, nonce: fakeNonce(dispatchId, attempt) }); },
-    recordDispatchDetails: (dispatchId: string, details: KgDispatchRowDetails) => { recordedDetails.push({ dispatchId, details }); },
+    recordDispatchDetails: async (dispatchId: string, details: KgDispatchRowDetails) => {
+      recordedDetails.push({ dispatchId, details });
+      await detailsHold;
+    },
   };
 
   async function dispatchFn(input: KgDispatchInput): Promise<KgDispatchResult> {
@@ -3281,6 +3286,40 @@ describe("KgRefresh durable workflow", () => {
         expect(outcomesFor(triggerId)).toHaveLength(0);
         await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "marker cleared" });
         expect(await countSends(env, "FlyMachineProfile", "kg-refresh", "release")).toBeGreaterThanOrEqual(1);
+      },
+      60_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "a Stop sent before the held report cancels the held run without a decide (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        let release!: () => void;
+        detailsHold = new Promise<void>((resolve) => { release = resolve; });
+        let triggerId: string;
+        try {
+          const triggered = await triggerViaKgRepo(env.baseUrl());
+          triggerId = (triggered as { triggerId: string }).triggerId;
+          makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+          await workflowDispatched(triggerId);
+          // The workflow is parked before its first wait, so the report and the Stop are both durable when it starts waiting.
+          await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", HELD_REPORT);
+          await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "stop" });
+        } finally {
+          release();
+          detailsHold = null;
+        }
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
+        const comment = postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!;
+        expect(comment).toContain("operator_cancelled");
+        expect(await closeRowFor(triggerId)).toMatchObject({ status: "failed", conclusion: "operator_cancelled" });
+        expect(outcomesFor(triggerId)).toHaveLength(0);
       },
       60_000,
     );
