@@ -972,13 +972,14 @@ function toStepRecord(step: Step): KgRefreshStepRecord {
 
   async function decide(ctx: WorkflowSharedContext, input: KgRefreshDecideInput): Promise<void> {
     await requireStarted(ctx);
-    if ((await ctx.get<string>("step")) !== "decision") {
-      throw new restate.TerminalError("no-decision-open", { errorCode: 409 });
-    }
+    // Peek first: once decided the workflow may leave the decision step, and a second call must still answer already-decided.
     // Producers: AII-1257. The value is the input object, never undefined, so the deadline peek sees it.
     const promise = ctx.promise<KgRefreshDecideInput>("decide");
     if ((await promise.peek()) !== undefined) {
       throw new restate.TerminalError("already-decided", { errorCode: 409 });
+    }
+    if ((await ctx.get<string>("step")) !== "decision") {
+      throw new restate.TerminalError("no-decision-open", { errorCode: 409 });
     }
     await promise.resolve(input);
   }
