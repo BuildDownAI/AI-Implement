@@ -110,10 +110,6 @@ export interface PipelineContextData {
   retryPolicy?: RetryPolicy;
   /** kg-refresh dev-harness: when true, kg-snapshot-push prints the guard table but skips commit and push. */
   kgDryRun?: boolean;
-  /** kg-refresh: when true, kg-snapshot-push downgrades the zero-shrink/50% guards to warnings and pushes anyway (AII-628). */
-  kgAcceptNewBaseline?: boolean;
-  /** kg-refresh: email of the admin who set kgAcceptNewBaseline, for the guard-override log line and the refresh PR's ### Baseline section. */
-  kgBaselineActor?: string;
   /**
    * Optional runner-activity/cycle sink (AII-788). Mirrors `PipelineContext.activitySink`
    * so a context constructed from a plain `PipelineContextData` bag (e.g. the dev harness,

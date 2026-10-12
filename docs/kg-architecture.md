@@ -524,23 +524,23 @@ them into `kg-snapshot-push`'s `acceptNewBaseline`/`baselineActor` inputs, the s
 whether to push (and writes the refresh PR body) runs in the dispatched container, a separate
 process from whichever door the operator called.
 
-Inside `kg-snapshot-push.ts`, guard 0b's regressions split into two classes: a part missing
-entirely is a **hard regression** and always refuses, flag or not; a part shrinking (the zero-shrink
-rule or the general 50% rule) is a **soft regression** — when `acceptNewBaseline` is set, these are
-logged (`[kg-refresh] baseline accepted by <email>`) and the run proceeds instead of throwing. The
-per-part table already prints unconditionally before either check fires, so an accepted run's table
-looks identical to a refused one; only the guard verdict and the new `### Baseline` section in the
-refresh report (which becomes the PR body on a real push, or is printed on a dry run) distinguish
-them. Guard 0 (the `fetched=false` tracker-regression check, a different failure — the tracker
-fetch itself failed, not a content reclassification) is never overridden by this flag.
+**Runner side: a soft shrink is held (AII-1253).** The runner no longer reads `kgAcceptNewBaseline`
+or `kgBaselineActor`; the step inputs, context fields and the `### Baseline` PR section are gone, and
+an envelope that still carries the fields (until AII-1264 removes them) has no effect. Inside
+`kg-snapshot-push.ts`, guard 0b's regressions split into two classes:
 
-**The flag is never persisted** (unlike `dryRun`, which is written into the same stage envelope as
-`dispatchId`/`jobId` so a callback arriving after an orchestrator restart is still recognized as a
-dry run). `acceptNewBaseline` only changes runner-side guard evaluation inside the one dispatched
-job; there is no "callback arrives after restart and needs reclassifying" case for it, because the
-orchestrator's own handling of the callback (success or failure) does not change based on whether a
-shrink was accepted — only the pushed content and the PR body do, and those are already decided by
-the time the callback lands.
+| Case | Push and PR | Report |
+|---|---|---|
+| No regression | yes | success |
+| Hard regression (a part missing), with or without soft | no | failure `KG_SNAPSHOT_TRACKER_REGRESSION`, `guardVerdict: "refused"`, part table, no `snapshot*` fields |
+| Soft only (zero-shrink or 50% rule) | yes | failure `KG_SNAPSHOT_HELD`, `guardVerdict: "held"`, part table, `snapshotPr`/`snapshotCommit`/`snapshotBranch` |
+| Guard 0 (tracker fetch failed) | no | `KG_SNAPSHOT_TRACKER_REGRESSION` |
+| Dry run, soft only | no | `refused` with the table, never `held` |
+
+A held run commits, pushes `kg-refresh/<stamp>` and opens the PR (body: `Guard verdict: held — a shrink
+waits for an operator decision`), then throws `KgSnapshotHeldError`. It is never reported as `success`,
+so an orchestrator without the decision gate treats it as a failure and closes the PR, as it did with
+the old refusal.
 
 ### The `index.ts` budget
 

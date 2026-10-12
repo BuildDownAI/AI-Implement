@@ -271,6 +271,60 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
     );
   });
 
+  it("contract: KgRefresh.report — a real KG_SNAPSHOT_HELD failure body reaches the workflow with ok:false, the PR fields and the part table (AII-1253)", async () => {
+    const { token, dispatchId } = mint();
+    const c = client();
+    const fetchImpl = vi.fn(async (_url: string, init: RequestInit) => {
+      const headers = init.headers as Record<string, string>;
+      const out = await callback.handleRunnerResult({
+        authorization: headers.Authorization,
+        body: JSON.parse(String(init.body)),
+        secret: SECRET,
+        resolveProvider: async () => null,
+        kgRefreshClient: c as never,
+        kgSourceRepo: SLUG,
+      });
+      return new Response(JSON.stringify(out.body), { status: out.status });
+    });
+    const workspaceDir = mkdtempSync(join(tmpdir(), "kgreport-held-"));
+    const savedToken = process.env.RUN_TOKEN;
+    process.env.RUN_TOKEN = token;
+    const partTable = [{ part: "comment.nt", prev: "9995", new: "3793" }];
+    try {
+      await postRunnerResult({
+        phase: "kg-refresh",
+        workspaceDir,
+        outcome: "failure",
+        failureCode: "KG_SNAPSHOT_HELD",
+        failureReason: "KG_SNAPSHOT_HELD: content regression detected",
+        guardVerdict: "held",
+        partTable,
+        snapshotPr: 21,
+        snapshotCommit: "abc",
+        snapshotBranch: "kg-refresh/20260912T100000Z",
+        callbackUrl: "http://orch.test",
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      });
+    } finally {
+      if (savedToken === undefined) delete process.env.RUN_TOKEN;
+      else process.env.RUN_TOKEN = savedToken;
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+    expect(c.report).toHaveBeenCalledTimes(1);
+    expect(c.report).toHaveBeenCalledWith(
+      dispatchId,
+      expect.objectContaining({
+        ok: false,
+        failureCode: "KG_SNAPSHOT_HELD",
+        snapshotPr: 21,
+        snapshotCommit: "abc",
+        snapshotBranch: "kg-refresh/20260912T100000Z",
+        partTable,
+      }),
+      { idempotencyKey: dispatchId },
+    );
+  });
+
   it("contract: KgRefresh.cancel — the real admin cancel dep cancels the clicked row's dispatchId and answers 200", async () => {
     const idx = await import("../index.js");
     const ingress = { repoStatus: vi.fn(), cancel: vi.fn().mockResolvedValue({ status: "accepted" }) };
