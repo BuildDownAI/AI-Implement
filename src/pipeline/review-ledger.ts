@@ -338,7 +338,16 @@ export function extractClaudeSummaryFindings(body: string, url?: string): Review
   }));
 }
 
+// A leading 🔴/🟡 on a heading decides severity before the word rules, using
+// the same marker mapping as inline comments. 🟣 and untagged fall through.
+function classifyClaudeHeadingMarker(value: string): "blocking" | "minor" | null {
+  const marker = classifyClaudeInlineMarker(value.replace(/^[\s*_]+/, ""));
+  return marker === "blocking" || marker === "minor" ? marker : null;
+}
+
 function classifyClaudeFindingHeading(value: string): ReviewLedgerSeverity | null {
+  const marked = classifyClaudeHeadingMarker(value);
+  if (marked) return marked;
   const normalized = normalizeText(value).replace(/:$/, "");
   if (/\b(?:fixed|resolved|verified|ready to merge|holds up)\b/i.test(normalized)) return null;
   // Check minor/non-blocking before blocking so "non-blocking" cannot escalate.
@@ -996,6 +1005,7 @@ function hasClaudeReviewHeading(body: string): boolean {
 }
 
 function isClaudeBlockingHeading(value: string): boolean {
+  if (classifyClaudeHeadingMarker(value) === "blocking") return true;
   const normalized = normalizeText(value);
   if (/approved|complete/i.test(normalized) && !/changes requested/i.test(normalized)) return false;
   return /^blocking\b/i.test(normalized) || /changes requested/i.test(normalized);

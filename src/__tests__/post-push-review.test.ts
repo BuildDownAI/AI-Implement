@@ -6573,6 +6573,31 @@ describe("postPushReviewStep review process gate", () => {
     expect(out.approved).toBe(true);
   });
 
+  describe("🔴 heading in Claude's summary comment", () => {
+    const summary = (sections: string) => ({
+      user: { login: "claude[bot]", type: "Bot" }, created_at: "2026-01-01T00:00:00Z", html_url: "https://x/summary",
+      body: `## Code Review\n\n${sections}`,
+    });
+
+    it("withholds approval for a 🔴 section with no inline comments", async () => {
+      const f = fixture({
+        runs: [actions("success")],
+        issueComments: [summary("### 🔴 Not actually 'no behavior change': a new archived-simulation guard was added\n- The guard rejects archived simulations.\n")],
+      });
+      const { out } = await run(f);
+      expect(out.approved).toBe(false);
+      expect(f.posted.join("\n")).toContain("guard rejects archived simulations");
+    });
+
+    it("still approves a summary with only 🟡 and 🟣 sections", async () => {
+      const f = fixture({
+        runs: [actions("success")],
+        issueComments: [summary("### 🟡 Naming nit\n- Rename x.\n\n### 🟣 Pre-existing\n- Old code.\n")],
+      });
+      expect((await run(f)).out.approved).toBe(true);
+    });
+  });
+
   it("requests changes with the finding on one 🔴 on head", async () => {
     const f = fixture({ runs: [actions("success")], inlineComments: [inline("🔴 null deref")], threads: [thread("🔴 null deref")] });
     const { out } = await run(f);
