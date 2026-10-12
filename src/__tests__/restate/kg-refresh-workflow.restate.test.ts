@@ -24,7 +24,8 @@ import type { CreateMachineOpts, Machine, MachineExit } from "../../fly-machines
 import type { RefreshOutcome } from "../../kg-refresh.js";
 import { RailGateError, type KgRailDeps } from "../../kg-refresh-rail.js";
 import { COMPLETION_MARKER } from "../../kg-sidecar.js";
-import { orchestratorTools, setKgRefreshToolDeps, type KgRefreshToolDeps } from "../../restate/tools.js";
+import { orchestratorTools, setKgRefreshToolDeps } from "../../restate/tools.js";
+import type { KgRefreshToolDeps } from "../../restate/kg-refresh-production.js";
 import { callToolAsSystem } from "../../restate/tools-client.js";
 import { createKgRefreshIngressClient, launchKeptMachine, type KeptMachineFly } from "../../restate/kg-refresh-production.js";
 import { FLY_MACHINE_PROFILE_DEFAULTS, createFlyMachineProfile, mergeProfile, type FlyMachineProfileConfig, type KeptMachineState } from "../../restate/fly-machine-profile.js";

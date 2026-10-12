@@ -1255,7 +1255,7 @@ describe("migrated write handlers (AII-713)", () => {
       objectClient: () => ({ status }),
       workflowClient: () => ({ decide, cancel }),
     }) as unknown as restate.Context;
-    const call = (args: Record<string, unknown>, caller: Caller = { kind: "human", email: "ada@example.com", role: "admin" }) =>
+    const call = (args: { action: "accept" | "cancel" }, caller: Caller = { kind: "human", email: "ada@example.com", role: "admin" }) =>
       decideKgRefreshTool(ctx(), { caller, args });
     const terminal = (code: number, message: string) => new restate.TerminalError(message, { errorCode: code });
 
