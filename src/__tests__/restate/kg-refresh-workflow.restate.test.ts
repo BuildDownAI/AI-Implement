@@ -3198,13 +3198,14 @@ describe("KgRefresh durable workflow", () => {
       )).length;
 
     /** Triggers through the real KgRepo, delivers the held report, and returns once the run sits at the gate. */
-    async function holdRun(env: RestateEnvironment): Promise<string> {
+    async function holdRun(env: RestateEnvironment, opts: { awaitGate?: boolean } = {}): Promise<string> {
       const triggered = await triggerViaKgRepo(env.baseUrl());
       const triggerId = (triggered as { triggerId: string }).triggerId;
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
       await workflowDispatched(triggerId);
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", HELD_REPORT);
-      await waitForStep(() => readStatus(env.baseUrl(), triggerId), "decision");
+      // The short-timer scenario skips this: on a slow runner the timer can fire before a poll sees `decision`.
+      if (opts.awaitGate !== false) await waitForStep(() => readStatus(env.baseUrl(), triggerId), "decision");
       return triggerId;
     }
 
@@ -3289,7 +3290,7 @@ describe("KgRefresh durable workflow", () => {
       async (label) => {
         const env = shortHeldEnvs.get(label)!;
         const beforeClose = closePullRequestFn.mock.calls.length;
-        const triggerId = await holdRun(env);
+        const triggerId = await holdRun(env, { awaitGate: false });
         const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
 
         expect(outcome.ok).toBe(false);
