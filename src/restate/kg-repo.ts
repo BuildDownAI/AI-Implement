@@ -197,7 +197,7 @@ export function createKgRepo(deps: KgRepoDependencies) {
 
   /**
    * Moves the lease out to `until` (epoch ms) and schedules an `expire` for it. A trigger-id mismatch or an
-   * `until` that is not later than the current lease is a no-op. The superseded `expire` stays scheduled; it
+   * `until` that is not later than the current lease (or than now) is a no-op. The superseded `expire` stays scheduled; it
    * finds `now < leaseUntil` and does nothing.
    */
   async function extend(ctx: ObjectContext, input: { triggerId: string; until: number }): Promise<{ extended: boolean }> {
@@ -205,6 +205,8 @@ export function createKgRepo(deps: KgRepoDependencies) {
     if (!inFlight || inFlight.triggerId !== input.triggerId) return { extended: false };
     if (inFlight.leaseUntil !== undefined && input.until <= inFlight.leaseUntil) return { extended: false };
     const now = await ctx.date.now();
+    // A legacy marker has no lease to compare with, so a lease that is already over is the only bad `until`.
+    if (input.until <= now) return { extended: false };
     ctx.set<InFlightMarker>("inFlight", { ...inFlight, leaseUntil: input.until });
     ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, ctx.key).expire(
       { triggerId: input.triggerId },

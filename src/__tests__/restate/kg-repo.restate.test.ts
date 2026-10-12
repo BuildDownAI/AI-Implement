@@ -811,6 +811,19 @@ describe("KgRepo object-owned lease expiry", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
+    "extend on a marker without leaseUntil rejects an until that is not in the future (%s)",
+    async (label) => {
+      const env = pick(legacy, label);
+      const slug = slugOf();
+      const { triggerId } = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", slug, "trigger", {});
+      expect(await callPrivate(env.baseUrl(), slug, "extend", { triggerId, until: Date.now() - 60_000 })).toEqual({ extended: false });
+      expect((await leaseOf(env, slug))?.leaseUntil).toBeUndefined();
+      expect(await callPrivate(env.baseUrl(), slug, "extend", { triggerId, until: Date.now() + 1e9 })).toEqual({ extended: true });
+    },
+    30_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
     "a marker written without leaseUntil is cleared by expire (%s)",
     async (label) => {
       const env = pick(legacy, label);
