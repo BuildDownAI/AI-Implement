@@ -8,7 +8,7 @@ export const kgPipelinesHtml = `
       <div class="page-subtitle">Refresh the knowledge graph and watch its runs</div>
     </div>
     <div class="page-header-actions">
-      <button class="btn btn-sm" onclick="loadKgStatus(); loadKgExecutionMode(); loadKgMaterializeMode(); loadKgFlyMachine()">&#8635; Refresh</button>
+      <button class="btn btn-sm" onclick="loadKgStatus(); loadKgExecutionMode(); loadKgMaterializeMode(); loadKgRunProfile()">&#8635; Refresh</button>
     </div>
   </header>
   <div class="page-body">
@@ -269,7 +269,7 @@ export const kgPipelinesScript = `
       showMessage('warning', 'Could not change the KG backend \u2014 ' + String(err));
     }
     loadKgExecutionMode();
-    loadKgFlyMachine();
+    loadKgRunProfile();
   };
 
   var KG_BACKEND_LABELS = { 'github-actions': 'GitHub Actions', 'fly-machines': 'Fly machines', 'local-docker': 'local Docker' };
@@ -378,7 +378,7 @@ export const kgPipelinesScript = `
     document.getElementById('btn-kg-fly-cpu-performance').classList.toggle('btn-primary', kgFlyKind === 'performance');
   }
 
-  async function loadKgFlyMachine() {
+  async function loadKgRunProfile() {
     try {
       const res = await window.api('/api/tools/get_kg_status', { method: 'POST', body: JSON.stringify({ args: {} }) });
       const out = unwrapToolAnswer(res, await res.json().catch(function () { return {}; }));
@@ -445,7 +445,7 @@ export const kgPipelinesScript = `
       document.getElementById('kg-pipelines-error').hidden = true;
       savedKgFly = null;
       savedKgGha = null;
-      loadKgFlyMachine();
+      loadKgRunProfile();
     } catch (err) {
       showMessage('warning', 'Could not change the run profile \u2014 ' + String(err));
     }
@@ -481,17 +481,17 @@ export const kgPipelinesScript = `
   window.loadKgStatus = loadKgStatus;
   window.loadKgExecutionMode = loadKgExecutionMode;
   window.loadKgMaterializeMode = loadKgMaterializeMode;
-  window.loadKgFlyMachine = loadKgFlyMachine;
+  window.loadKgRunProfile = loadKgRunProfile;
 
   window.registerPage('kg-pipelines', function () {
     loadKgStatus();
     loadKgExecutionMode();
     loadKgMaterializeMode();
-    loadKgFlyMachine();
+    loadKgRunProfile();
     setInterval(loadKgStatus, 15000);
     setInterval(loadKgExecutionMode, 15000);
     setInterval(loadKgMaterializeMode, 15000);
-    setInterval(loadKgFlyMachine, 15000);
+    setInterval(loadKgRunProfile, 15000);
     // createDispatchLog comes from the Pipelines page script; the card works without it.
     if (window.createDispatchLog) window.createDispatchLog('kglog', { filter: function (e) { return e.phase === 'kg-refresh'; } }).start();
   });

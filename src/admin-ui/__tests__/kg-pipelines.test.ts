@@ -239,7 +239,7 @@ describe("kg fly machine profile control (AII-1116)", () => {
 
   it("renders the effective line and the inputs from get_kg_status", async () => {
     const { win, el, calls, settle } = mount({});
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     expect(calls[0]).toEqual({ url: "/api/tools/get_kg_status", body: { args: {} } });
     expect(el("kg-fly-machine-effective").textContent).toBe("next Fly run: performance, 2 CPU / 8192 MB, idle 7 d (profile)");
     expect(el("kg-fly-cpus").value).toBe("2");
@@ -252,13 +252,13 @@ describe("kg fly machine profile control (AII-1116)", () => {
 
   it("ends the line in (default) for a default profile", async () => {
     const { win, el } = mount({ flyMachine: { ...profile, source: "default" } });
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     expect(el("kg-fly-machine-effective").textContent).toMatch(/\(default\)$/);
   });
 
   it("enables Save on change, disables it on revert, and posts only the changed field", async () => {
     const { win, el, calls, settle } = mount({});
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     el("kg-fly-memory-mb").value = "4096";
     win.refreshKgFlyDirty();
     expect(el("btn-kg-fly-save").disabled).toBe(false);
@@ -276,7 +276,7 @@ describe("kg fly machine profile control (AII-1116)", () => {
 
   it("posts the idle hours as whole milliseconds and the cpu kind when it changes", async () => {
     const { win, el, calls } = mount({});
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     el("kg-fly-idle-hours").value = "1.5";
     win.setKgFlyCpuKind("shared");
     await win.saveKgFlyMachine();
@@ -287,7 +287,7 @@ describe("kg fly machine profile control (AII-1116)", () => {
   it("shows a 400 answer's error in #kg-pipelines-error", async () => {
     const wrapped = { content: [{ type: "text", text: JSON.stringify({ status: 400, body: { error: "memoryMb must be at least 2048 per CPU" } }) }] };
     const { win, el } = mount({ saveReply: { status: 200, body: wrapped } });
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     el("kg-fly-memory-mb").value = "1024";
     win.refreshKgFlyDirty();
     await win.saveKgFlyMachine();
@@ -301,7 +301,7 @@ describe("kg fly machine profile control (AII-1116)", () => {
       { status: 200, body: { isError: true, content: [{ type: "text", text: "forbidden: set_run_profile requires the admin role" }] } },
     ]) {
       const { win, el } = mount({ saveReply: reply });
-      await win.loadKgFlyMachine();
+      await win.loadKgRunProfile();
       el("kg-fly-memory-mb").value = "4096";
       win.refreshKgFlyDirty();
       await win.saveKgFlyMachine();
@@ -313,10 +313,10 @@ describe("kg fly machine profile control (AII-1116)", () => {
 
   it("shows 'profile unavailable (503)' on a failed read and leaves the inputs alone", async () => {
     const { win, el } = mount({});
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     const before = el("kg-fly-memory-mb").value;
     win.api = async () => ({ ok: false, status: 503, json: async () => ({}) });
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     expect(el("kg-fly-machine-effective").textContent).toBe("next Fly run: profile unavailable (503)");
     expect(el("kg-fly-memory-mb").value).toBe(before);
     expect(el("btn-kg-fly-save").disabled).toBe(true);
@@ -324,10 +324,10 @@ describe("kg fly machine profile control (AII-1116)", () => {
 
   it("does not overwrite edited inputs on a poll", async () => {
     const { win, el } = mount({});
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     el("kg-fly-memory-mb").value = "4096";
     win.refreshKgFlyDirty();
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     expect(el("kg-fly-memory-mb").value).toBe("4096");
   });
 });
@@ -382,7 +382,7 @@ describe("kg backend control (AII-1218)", () => {
 
   it("shows the Fly rows when the effective backend is Fly", async () => {
     const { win, text, hidden } = mount({ effective: "fly-machines", source: "kg-setting", setting: "fly-machines" });
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     expect(hidden("kg-fly-machine-controls")).toBe(false);
     expect(hidden("kg-fly-machine-effective")).toBe(false);
     expect(text("kg-backend-effective")).toBe("next run: Fly machines (KG setting)");
@@ -390,21 +390,21 @@ describe("kg backend control (AII-1218)", () => {
 
   it("hides the Fly rows when the effective backend is GitHub Actions", async () => {
     const { win, hidden } = mount({ effective: "github-actions", source: "kg-setting", setting: "github-actions" });
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     expect(hidden("kg-fly-machine-controls")).toBe(true);
     expect(hidden("kg-fly-machine-effective")).toBe(true);
   });
 
   it("shows only the GitHub Actions row when the effective backend is GitHub Actions", async () => {
     const { win, hidden } = mount({ effective: "github-actions", source: "kg-setting", setting: "github-actions" });
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     expect(hidden("kg-gha-controls")).toBe(false);
     expect(hidden("kg-gha-note")).toBe(false);
   });
 
   it("hides every run-profile row for local Docker", async () => {
     const { win, hidden } = mount({ effective: "local-docker", source: "runner-mode", setting: "fly-machines" });
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     for (const id of ["kg-fly-machine-controls", "kg-fly-machine-effective", "kg-gha-controls", "kg-gha-note"]) expect(hidden(id)).toBe(true);
   });
 
@@ -414,7 +414,7 @@ describe("kg backend control (AII-1218)", () => {
     [{ effective: "github-actions", source: "fly-unconfigured", setting: "fly-machines" }, "next run: GitHub Actions (Fly not configured)"],
   ])("names the source on the effective line: %j", async (em, line) => {
     const { win, text } = mount(em);
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     expect(text("kg-backend-effective")).toBe(line);
   });
 });
@@ -422,7 +422,10 @@ describe("kg backend control (AII-1218)", () => {
 describe("kg github-actions run profile (AII-1245)", () => {
   const ghaProfile = { backend: "github-actions", config: { jobTimeoutMinutes: 90 }, source: "default" };
 
+  let current: unknown = ghaProfile;
+
   function mount(saveReply?: { status: number; body: unknown }) {
+    current = ghaProfile;
     const dom = new JSDOM(`<!DOCTYPE html><body>${kgPipelinesHtml}</body>`, { runScripts: "dangerously", url: "http://localhost/admin#kg-pipelines" });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const win = dom.window as any;
@@ -434,7 +437,7 @@ describe("kg github-actions run profile (AII-1245)", () => {
     win.api = async (url: string, init?: { body?: string }) => {
       calls.push({ url, body: init?.body ? JSON.parse(init.body) : undefined });
       if (url === "/api/tools/get_kg_status") {
-        return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: JSON.stringify({ runProfile: ghaProfile }) }] }) };
+        return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: JSON.stringify({ runProfile: current }) }] }) };
       }
       if (url === "/api/tools/set_run_profile") {
         const r = saveReply ?? { status: 200, body: { content: [{ type: "text", text: "{}" }] } };
@@ -452,7 +455,7 @@ describe("kg github-actions run profile (AII-1245)", () => {
 
   it("renders the stored timeout, the note, and no Fly controls", async () => {
     const { win, el } = mount();
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     expect(el("kg-gha-job-timeout").value).toBe("90");
     expect(el("kg-gha-controls").hidden).toBe(false);
     expect(el("kg-fly-machine-controls").hidden).toBe(true);
@@ -464,7 +467,7 @@ describe("kg github-actions run profile (AII-1245)", () => {
 
   it("saves through set_run_profile with the github-actions backend", async () => {
     const { win, el, calls } = mount();
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     el("kg-gha-job-timeout").value = "120";
     win.refreshKgGhaDirty();
     expect(el("btn-kg-gha-save").disabled).toBe(false);
@@ -475,7 +478,7 @@ describe("kg github-actions run profile (AII-1245)", () => {
 
   it("blocks out-of-range and non-integer timeouts", async () => {
     const { win, el, calls } = mount();
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     for (const v of ["5", "400", "90.5", ""]) {
       el("kg-gha-job-timeout").value = v;
       win.refreshKgGhaDirty();
@@ -487,13 +490,31 @@ describe("kg github-actions run profile (AII-1245)", () => {
 
   it("keeps a dirty value across a poll and after a 403", async () => {
     const { win, el } = mount({ status: 403, body: { error: "forbidden" } });
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     el("kg-gha-job-timeout").value = "120";
     win.refreshKgGhaDirty();
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     expect(el("kg-gha-job-timeout").value).toBe("120");
     await win.saveKgGhaProfile();
     expect(el("kg-pipelines-error").textContent).toBe("admin only");
     expect(el("kg-gha-job-timeout").value).toBe("120");
+  });
+
+  it("drops a half-typed edit when the effective backend flips and flips back", async () => {
+    const flyProfile = { backend: "fly-machines", config: { cpuKind: "shared", cpus: 1, memoryMb: 2048, idleTimeoutMs: 3600000 }, source: "default" };
+    const { win, el } = mount();
+    current = flyProfile;
+    await win.loadKgRunProfile();
+    el("kg-fly-cpus").value = "4";
+    win.refreshKgFlyDirty();
+    expect(el("btn-kg-fly-save").disabled).toBe(false);
+    current = ghaProfile;
+    await win.loadKgRunProfile();
+    expect(el("kg-fly-machine-controls").hidden).toBe(true);
+    expect(el("kg-gha-job-timeout").value).toBe("90");
+    current = flyProfile;
+    await win.loadKgRunProfile();
+    expect(el("kg-fly-cpus").value).toBe("1");
+    expect(el("btn-kg-fly-save").disabled).toBe(true);
   });
 });
