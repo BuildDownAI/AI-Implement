@@ -75,7 +75,7 @@ and handler types that the typed clients use are in `src/restate/kg-refresh-type
 | Service options: `workflowRetention`, `journalRetention` | yes | yes | no | |
 | Service options: `idempotencyRetention` | on `report`, `cancel` | on `result`, `cancel` | no | KG `status` and `progress` carry no retention (AII-973) |
 | Service options: `inactivityTimeout`, `abortTimeout` | yes (15 m / 20 m) | no | no | § 6 C6 |
-| Service options: `ingressPrivate` | yes: `KgRefresh.run`, `KgRepo.release`, `expire`, `recordDryRunOutcome` (AII-976) | no | no | |
+| Service options: `ingressPrivate` | yes: `KgRefresh.run`, `KgRepo.release`, `expire`, `extend`, `recordDryRunOutcome` (AII-976) | no | no | |
 | Service options: `enableLazyState` | no | no | no | |
 | Zod input schemas (`serde.zod`, `.strict()`) | yes (AII-938) | no | yes | |
 | Hooks | no | no | no | |
@@ -160,7 +160,7 @@ mechanism the pilot still carries (§ 5.2).
 | **Saga shape** (one `ctx.run` per rail gate, `revert` as compensation) | fetch → stage → swap → verify, `revert` | the pilot has no compensating step |
 | **Exact run identity** (`returnRunDetails: true`, reconcile by title, reconcile-first `dispatch`) | `dispatch` step | reconcile loop by polling |
 | **Credentials minted inside the dispatch step, never journaled** (AII-933, AII-973) | `mintRunTokens` is called inside `ctx.run("dispatch")`; the step result carries no token | `mintPreparedReviewFixToken` at launch (SQLite consume-once claim) |
-| **`ingressPrivate` handlers** (AII-976) | `KgRefresh.run`, `KgRepo.release`, `expire`, `recordDryRunOutcome` | none; the pilot handlers are not marked |
+| **`ingressPrivate` handlers** (AII-976) | `KgRefresh.run`, `KgRepo.release`, `expire`, `extend`, `recordDryRunOutcome` | none; the pilot handlers are not marked |
 
 ## 4. Restate features neither pipeline uses yet
 
