@@ -1,6 +1,6 @@
 import http from "node:http";
 import { authenticateAdminRequest } from "../admin-session.js";
-import { getOperatorLegacyScrubCompletedAt } from "./operator-legacy-scrub.js";
+import { getOperatorLegacyScrubCompletedAt, isOperatorLegacyCheckConfirmed } from "./operator-legacy-scrub.js";
 import { RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BASE_URL, RESTATE_UI_INGRESS_PREFIX } from "./server.js";
 
 /**
@@ -27,7 +27,7 @@ function matchRoute(method: string, pathname: string): { target: "admin" | "ingr
   if (read && (pathname === "/health" || pathname === "/version")) return admin;
   if (read && (pathname === "/services" || pathname.startsWith("/services/"))) return admin;
   if (read && (pathname === "/deployments" || pathname.startsWith("/deployments/"))) return admin;
-  // "refused" until the AII-1287 scrub row exists (AII-1286, AII-1299); then forwarded to the admin upstream.
+  // "refused" until the AII-1287 scrub row exists and this process confirmed no legacy token (AII-1286, AII-1299, AII-1306); then forwarded to the admin upstream.
   if (method === "POST" && pathname === "/query") return { target: "refused", strip: 0 };
   if (method === "POST" && pathname === "/deployments") return admin;
   return null;
@@ -91,8 +91,9 @@ export function handleRestateUiRequest(
     return true;
   }
   // Read per request, uncached, so the gate opens without a restart. An unreadable row reads as null: closed.
-  if (match.target === "refused" && getOperatorLegacyScrubCompletedAt() === null) {
-    json(403, "/query is disabled until the one-time MCP refresh-token cleanup has run (or its record is unreadable) (AII-1287)");
+  // The row can predate a rollback, so this process must also have confirmed no legacy token (AII-1306).
+  if (match.target === "refused" && (getOperatorLegacyScrubCompletedAt() === null || !isOperatorLegacyCheckConfirmed())) {
+    json(403, "/query is disabled until the MCP refresh-token cleanup check has run in this process (AII-1287, AII-1306), or while its record is unreadable");
     return true;
   }
   if (match.target === "ingress") {

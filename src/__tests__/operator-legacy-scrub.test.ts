@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetRestateStatus, setRestateStatus } from "../restate/status.js";
-import { scrubOperatorLegacyTokens } from "../restate/operator-legacy-scrub.js";
+import { isOperatorLegacyCheckConfirmed, resetOperatorLegacyCheckConfirmed, scrubOperatorLegacyTokens } from "../restate/operator-legacy-scrub.js";
 
 function store(initial: string | null = null, log: string[] = []) {
   let row = initial;
@@ -15,7 +15,12 @@ function store(initial: string | null = null, log: string[] = []) {
 const legacyFamily = { service_key: "op1", value_utf8: JSON.stringify({ currentToken: "raw" }) };
 
 describe("scrubOperatorLegacyTokens", () => {
+  beforeEach(() => resetOperatorLegacyCheckConfirmed());
   afterEach(() => resetRestateStatus());
+
+  it("starts unconfirmed", () => {
+    expect(isOperatorLegacyCheckConfirmed()).toBe(false);
+  });
 
   it("makes no call and writes no row when Restate is not registered", async () => {
     const fetchImpl = vi.fn();
@@ -26,6 +31,7 @@ describe("scrubOperatorLegacyTokens", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(log).toEqual([]);
     expect(rowStore.get()).toBe("2026-10-13T00:00:00.000Z");
+    expect(isOperatorLegacyCheckConfirmed()).toBe(false);
   });
 
   it("defaults readiness to getRestateStatus: unreachable registration skips", async () => {
@@ -54,6 +60,7 @@ describe("scrubOperatorLegacyTokens", () => {
     expect(queries[0]).toContain("FROM state");
     expect(log).toEqual([]);
     expect(rowStore.get()).toBe("2026-10-13T00:00:00.000Z");
+    expect(isOperatorLegacyCheckConfirmed()).toBe(true);
   });
 
   it("closes the row before scrubbing when the row exists and a legacy token is found", async () => {
@@ -72,6 +79,7 @@ describe("scrubOperatorLegacyTokens", () => {
     expect(result).toEqual({ ran: true, scrubbed: 1, purged: 1 });
     expect(log).toEqual(["query", "clear", "drop", "query", "purge", "write"]);
     expect(rowStore.get()).toBe("2026-10-14T00:00:00.000Z");
+    expect(isOperatorLegacyCheckConfirmed()).toBe(true);
   });
 
   it("leaves no row when a scrub step fails after the row was cleared", async () => {
@@ -83,6 +91,7 @@ describe("scrubOperatorLegacyTokens", () => {
     const result = await scrubOperatorLegacyTokens({ fetchImpl: fetchImpl as unknown as typeof fetch, rowStore, restateReady: () => true });
     expect(result.ran).toBe(false);
     expect(rowStore.get()).toBeNull();
+    expect(isOperatorLegacyCheckConfirmed()).toBe(false);
   });
 
   it("writes no row when a purge fails, so the next boot retries", async () => {
@@ -97,6 +106,7 @@ describe("scrubOperatorLegacyTokens", () => {
     const result = await scrubOperatorLegacyTokens({ fetchImpl: fetchImpl as unknown as typeof fetch, rowStore, restateReady: () => true });
     expect(result.ran).toBe(false);
     expect(rowStore.get()).toBeNull();
+    expect(isOperatorLegacyCheckConfirmed()).toBe(false);
   });
 
   it("treats an already-purged invocation (404) as success and writes the row", async () => {
@@ -111,5 +121,34 @@ describe("scrubOperatorLegacyTokens", () => {
     const result = await scrubOperatorLegacyTokens({ fetchImpl: fetchImpl as unknown as typeof fetch, rowStore, restateReady: () => true, now: () => new Date("2026-10-13T01:02:03.000Z") });
     expect(result).toEqual({ ran: true, scrubbed: 0, purged: 1 });
     expect(rowStore.get()).toBe("2026-10-13T01:02:03.000Z");
+    expect(isOperatorLegacyCheckConfirmed()).toBe(true);
+  });
+
+  it("stays unconfirmed when the state query fails, leaving the row as it was", async () => {
+    const fetchImpl = vi.fn(async () => new Response("boom", { status: 500 }));
+    const rowStore = store("2026-10-13T00:00:00.000Z");
+    const result = await scrubOperatorLegacyTokens({ fetchImpl: fetchImpl as unknown as typeof fetch, rowStore, restateReady: () => true });
+    expect(result.ran).toBe(false);
+    expect(rowStore.get()).toBe("2026-10-13T00:00:00.000Z");
+    expect(isOperatorLegacyCheckConfirmed()).toBe(false);
+  });
+
+  it("stays unconfirmed when the row write throws", async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ rows: [] }), { status: 200 }));
+    const rowStore = { ...store(), write: () => { throw new Error("disk"); } };
+    const result = await scrubOperatorLegacyTokens({ fetchImpl: fetchImpl as unknown as typeof fetch, rowStore, restateReady: () => true });
+    expect(result.ran).toBe(false);
+    expect(isOperatorLegacyCheckConfirmed()).toBe(false);
+  });
+
+  it("drops back to unconfirmed when a later run finds a legacy token", async () => {
+    const clean = vi.fn(async () => new Response(JSON.stringify({ rows: [] }), { status: 200 }));
+    const rowStore = store("2026-10-13T00:00:00.000Z");
+    await scrubOperatorLegacyTokens({ fetchImpl: clean as unknown as typeof fetch, rowStore, restateReady: () => true });
+    expect(isOperatorLegacyCheckConfirmed()).toBe(true);
+    const dirty = vi.fn(async (url: string) =>
+      url.endsWith("/query") ? new Response(JSON.stringify({ rows: [legacyFamily] }), { status: 200 }) : new Response("boom", { status: 500 }));
+    await scrubOperatorLegacyTokens({ fetchImpl: dirty as unknown as typeof fetch, rowStore, restateReady: () => true });
+    expect(isOperatorLegacyCheckConfirmed()).toBe(false);
   });
 });
