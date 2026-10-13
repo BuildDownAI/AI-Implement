@@ -157,7 +157,7 @@ Any other path or method is not handled and the orchestrator's routing continues
 
 ### Journal queries and the Restate UI (AII-1128)
 
-The admin API is loopback. `runIntrospectionQuery` and `sqlQuote` in `endpoint.ts` query `sys_invocation` for the deploy drain (`queryNonCompletedInvocations`). The Restate UI door forwards `POST /query` to admins once the AII-1287 scrub row exists and refuses it before that (§ "Restate UI through the orchestrator", ADR 040, AII-1286, AII-1299). The orchestrator has no journal route: `GET /api/restate/journal` answers 404 (AII-1265), and there is no `journal` page grant (removed from `PAGE_ROUTES`, AII-1262). Journal viewing is through the Restate UI (§ "Reading a run's journal").
+The admin API is loopback. `runIntrospectionQuery` and `sqlQuote` in `endpoint.ts` query `sys_invocation` for the deploy drain (`queryNonCompletedInvocations`). The Restate UI door forwards `POST /query` to admins once the AII-1287 scrub row exists and this process's legacy-token check has confirmed none left (AII-1306), and refuses it before that (§ "Restate UI through the orchestrator", ADR 040, AII-1286, AII-1299). The orchestrator has no journal route: `GET /api/restate/journal` answers 404 (AII-1265), and there is no `journal` page grant (removed from `PAGE_ROUTES`, AII-1262). Journal viewing is through the Restate UI (§ "Reading a run's journal").
 
 ### Sidecar environment is an explicit allowlist, never `...process.env` (AII-728)
 
