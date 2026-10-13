@@ -15,7 +15,7 @@ export interface RestateUiProxyDeps {
   ingressBaseUrl?: string;
 }
 
-function matchRoute(method: string, pathname: string): { target: "admin" | "ingress"; strip: number } | null {
+function matchRoute(method: string, pathname: string): { target: "admin" | "ingress" | "refused"; strip: number } | null {
   if (pathname === RESTATE_UI_INGRESS_PREFIX || pathname.startsWith(`${RESTATE_UI_INGRESS_PREFIX}/`)) {
     return { target: "ingress", strip: RESTATE_UI_INGRESS_PREFIX.length };
   }
@@ -26,7 +26,9 @@ function matchRoute(method: string, pathname: string): { target: "admin" | "ingr
   if (read && (pathname === "/health" || pathname === "/version")) return admin;
   if (read && (pathname === "/services" || pathname.startsWith("/services/"))) return admin;
   if (read && (pathname === "/deployments" || pathname.startsWith("/deployments/"))) return admin;
-  if (method === "POST" && (pathname === "/query" || pathname === "/deployments")) return admin;
+  // Matched so it is refused rather than left to other handlers (AII-1286).
+  if (method === "POST" && pathname === "/query") return { target: "refused", strip: 0 };
+  if (method === "POST" && pathname === "/deployments") return admin;
   return null;
 }
 
@@ -78,12 +80,16 @@ export function handleRestateUiRequest(
 
   const who = gate.identity?.email ?? "access-code";
   const isRead = method === "GET" || method === "HEAD";
-  if (match.target === "ingress" || (!isRead && !(method === "POST" && pathname === "/query"))) {
+  if (match.target === "ingress" || !isRead) {
     console.log(`[restate-ui] ${who} ${method} ${pathname}`);
   }
 
   if (UNSAFE_PATH.test(pathname)) {
     json(400, "Bad request path");
+    return true;
+  }
+  if (match.target === "refused") {
+    json(403, "/query is disabled until MCP refresh tokens are no longer stored in Restate (AII-1287)");
     return true;
   }
   if (match.target === "ingress") {
