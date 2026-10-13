@@ -1,10 +1,10 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import { readFileSync, readdirSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { getDiff } from "../pipeline/steps/feedback-loop.js";
-import { testDir } from "./helpers/test-dir.js";
+import { testDir, testTempRoot } from "./helpers/test-dir.js";
 
 function git(cwd: string, args: string[]): void {
   const r = spawnSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
@@ -260,21 +260,13 @@ describe("getDiff index state preservation", () => {
 
 describe("getDiff exclusive temp dir cleanup", () => {
   let repo: string;
-  let workerRoot: string;
-  let savedTmpdir: string | undefined;
-  let savedTemp: string | undefined;
 
   beforeEach(() => {
     // Each test gets its own private tmpdir so concurrent getDiff calls in other
     // parallel worker processes cannot pollute the before/after dir counts.
     // The redirect is per-process (pool: 'forks' in vitest.config.ts ensures it),
-    // so this assignment is invisible to other test-file processes. testDir() runs before the
-    // redirect, so workerRoot sits in the real temp directory.
-    workerRoot = testDir("diff-cleanup-worker");
-    savedTmpdir = process.env.TMPDIR;
-    savedTemp = process.env.TEMP;
-    process.env.TMPDIR = workerRoot;
-    process.env.TEMP = workerRoot;
+    // so it is invisible to other test-file processes.
+    testTempRoot("diff-cleanup-worker");
 
     repo = testDir("diff-cleanup");
     spawnSync("git", ["init", "-q", repo], { stdio: ["ignore", "pipe", "pipe"] });
@@ -283,19 +275,6 @@ describe("getDiff exclusive temp dir cleanup", () => {
     writeFileSync(join(repo, "seed.ts"), "export const s = 0;\n");
     spawnSync("git", ["add", "-A"], { cwd: repo, stdio: ["ignore", "pipe", "pipe"] });
     spawnSync("git", ["commit", "-qm", "seed"], { cwd: repo, stdio: ["ignore", "pipe", "pipe"] });
-  });
-
-  afterEach(() => {
-    if (savedTmpdir === undefined) {
-      delete process.env.TMPDIR;
-    } else {
-      process.env.TMPDIR = savedTmpdir;
-    }
-    if (savedTemp === undefined) {
-      delete process.env.TEMP;
-    } else {
-      process.env.TEMP = savedTemp;
-    }
   });
 
   function reviewIndexDirs(): string[] {
