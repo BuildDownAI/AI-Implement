@@ -769,7 +769,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     warnSpy.mockRestore();
   });
 
-  it("a closed event evicts this PR's stored dry-run state, (AII-636)", async () => {
+  it("a closed event evicts this PR's stored dry-run state (AII-636)", async () => {
     const outcomeStore = new Set<string>();
     const storeKey = (repo: string, prNumber: number) => `${repo}#${prNumber}`;
     outcomeStore.add(storeKey(KG_SOURCE_REPO, 55));
