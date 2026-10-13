@@ -43,7 +43,7 @@ import {
 } from "../../restate/kg-refresh-workflow.js";
 import { registerOwnedRunContract } from "./owned-run-contract.js";
 import {
-  VARIANTS, attachWorkflow, callObject, callService, callWorkflow, eventually, gate, queryInvocations, replaceEndpoint, settle,
+  VARIANTS, attachWorkflow, callObject, callService, callWorkflow, cancelInvocation, eventually, gate, queryInvocations, replaceEndpoint, settle,
   startRetryEnabled, startVariants, stopAll, type Gate,
   journalEntries,
   waitForStep,
@@ -171,6 +171,8 @@ describe("KgRefresh durable workflow", () => {
   // Fail the next N `reserve` steps (a one-shot version of forceReserveFailure), and hold the
   // next `persist` open until the promise settles, to stage the failure-path overlap scenario.
   let reserveFailuresRemaining = 0;
+  // Parks `reserve` until the promise settles, so a run stays before its dispatch.
+  let reserveHold: Promise<void> | null = null;
   let persistHold: Promise<void> | null = null;
 
   /** A latch that releases itself after `maxMs`, so a missed observation fails fast at the
@@ -286,6 +288,7 @@ describe("KgRefresh durable workflow", () => {
     holdNextMcpCall = null;
     onMcpCallHeld = null;
     reserveFailuresRemaining = 0;
+    reserveHold = null;
     persistHold = null;
     forceReserveFailure = false;
     forcePersistFailure = false;
@@ -548,6 +551,8 @@ describe("KgRefresh durable workflow", () => {
         throw new restate.TerminalError("forced one-shot reserve failure for the release-order test");
       }
       if (forceReserveFailure) throw new restate.TerminalError("forced reserve failure for the outer-catch release test");
+      // The step awaits what its closure returns, so a parked reserve is a returned promise.
+      if (reserveHold) return reserveHold as unknown as void;
     },
     closeJobLog: (jobId, status, conclusion) => { closeRowCalls.push({ jobId, status, conclusion }); },
     getWorkflowRunStatus: getWorkflowRunStatusFn,
@@ -3435,6 +3440,119 @@ describe("KgRefresh durable workflow", () => {
       },
       60_000,
     );
+
+    // ---- AII-1259: a Restate cancel of `run` does the same cleanup as the `cancel` signal, at every step ----
+    const runInvocation = async (env: RestateEnvironment, triggerId: string) =>
+      (await eventually(
+        () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`),
+        (found) => found.length === 1,
+        { label: "the run invocation" },
+      ))[0];
+    const restateCancel = async (env: RestateEnvironment, triggerId: string) =>
+      cancelInvocation(env.adminAPIBaseUrl(), String((await runInvocation(env, triggerId)).id));
+    const runReleases = async (env: RestateEnvironment, triggerId: string) =>
+      (await queryInvocations(
+        env.adminAPIBaseUrl(),
+        `target_service_name = 'KgRepo' AND target_service_key = '${KG_SOURCE_REPO}' AND target_handler_name = 'release' AND invoked_by_target LIKE 'KgRefresh/${triggerId}/%'`,
+      )).length;
+    const expectClosedAndReleasedOnce = async (env: RestateEnvironment, triggerId: string) => {
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "failed", conclusion: "operator_cancelled" });
+      await eventually(() => runReleases(env, triggerId), (n) => n >= 1, { label: "the release" });
+      await settle(500);
+      expect(await runReleases(env, triggerId)).toBe(1);
+      expect(outcomesFor(triggerId)).toHaveLength(0);
+    };
+
+    it.each(VARIANTS.map(([label]) => label))("a Restate cancel before the dispatch closes the row and releases, with no stop call (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const hold = boundedLatch(STATUS_LATCH_MAX_MS * 4);
+      reserveHold = hold.promise;
+      stopCalls.length = 0;
+      let triggerId: string;
+      try {
+        const triggered = await triggerViaKgRepo(env.baseUrl());
+        triggerId = (triggered as { triggerId: string }).triggerId;
+        makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+        await eventually(() => appendJobLogCalls.some((c) => c.dispatchId === triggerId), (ok) => ok, { label: "the reserve attempt" });
+        await restateCancel(env, triggerId);
+      } finally {
+        hold.release();
+        reserveHold = null;
+      }
+      await expectClosedAndReleasedOnce(env, triggerId);
+      expect(stopCalls).toEqual([]);
+      expect(scenarios.get(triggerId)!.cancelCalls).toBe(0);
+      expect(scenarios.get(triggerId)!.dispatchCalls).toBe(0);
+    }, 60_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a Restate cancel during await-progress on GitHub Actions cancels the run, closes the row and releases (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const triggered = await triggerViaKgRepo(env.baseUrl());
+      const triggerId = (triggered as { triggerId: string }).triggerId;
+      const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions" });
+      stopCalls.length = 0;
+      await workflowDispatched(triggerId);
+      await waitForStep(() => readStatus(env.baseUrl(), triggerId), "await-progress");
+      await restateCancel(env, triggerId);
+      await expectClosedAndReleasedOnce(env, triggerId);
+      expect(scenario.cancelCalls).toBe(1);
+      expect(stopCalls).toEqual([]);
+    }, 60_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a Restate cancel during await-progress on Fly stops the machine, closes the row and releases (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const triggered = await triggerViaKgRepo(env.baseUrl());
+      const triggerId = (triggered as { triggerId: string }).triggerId;
+      const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      stopCalls.length = 0;
+      await workflowDispatched(triggerId);
+      await waitForStep(() => readStatus(env.baseUrl(), triggerId), "await-progress");
+      await restateCancel(env, triggerId);
+      await expectClosedAndReleasedOnce(env, triggerId);
+      expect(stopCalls).toEqual([{ executionMode: "fly-machines", jobId: `job-${triggerId}` }]);
+      expect(scenario.cancelCalls).toBe(1);
+    }, 60_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a Restate cancel during the merge closes the row and releases once, without closing the snapshot PR (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const beforeMerge = mergePullRequestFn.mock.calls.length;
+      mergeDelayMs = 1_500; // parks `run` inside the merge step
+      const triggerId = await holdRun(env);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
+      await eventually(() => mergePullRequestFn.mock.calls.length - beforeMerge, (n) => n >= 1, { label: "the merge call" });
+      await restateCancel(env, triggerId);
+      await expectClosedAndReleasedOnce(env, triggerId);
+      expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(0);
+    }, 60_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a Restate cancel at the gate and the cancel signal make the same calls and end operator_cancelled (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const observe = async (via: "restate" | "signal") => {
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const beforePersist = persistCalls.length;
+        stopCalls.length = 0;
+        const triggerId = await holdRun(env);
+        const scenario = scenarios.get(triggerId)!;
+        if (via === "restate") await restateCancel(env, triggerId);
+        else await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "stop" });
+        await expectClosedAndReleasedOnce(env, triggerId);
+        await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "marker cleared" });
+        return {
+          closed: closePullRequestFn.mock.calls.length - beforeClose,
+          merged: mergePullRequestFn.mock.calls.length - beforeMerge,
+          persists: persistCalls.slice(beforePersist).map((o) => ({ ok: o.ok, detail: o.detail })),
+          stops: stopCalls.length,
+          runCancels: scenario.cancelCalls,
+          row: await closeRowFor(triggerId),
+        };
+      };
+      const signal = await observe("signal");
+      const restateCancelled = await observe("restate");
+      expect({ ...restateCancelled, row: { ...restateCancelled.row, jobId: "" } }).toEqual({ ...signal, row: { ...signal.row, jobId: "" } });
+      expect(signal).toMatchObject({ closed: 1, merged: 0, stops: 0, runCancels: 0, row: { conclusion: "operator_cancelled" } });
+    }, 90_000);
 
     it("a restart of the endpoint during the wait replays to the same gate without a second release or extend", async () => {
       const env = await startRetryEnabled([heldWorkflow, kgRepo, starter, flyMachineProfile]);
