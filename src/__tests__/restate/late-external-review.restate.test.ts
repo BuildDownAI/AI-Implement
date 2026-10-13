@@ -29,6 +29,9 @@ interface Scenario {
   stamps: number[];
   comments: string[];
   crashAfterComment?: boolean;
+  /** Head the gap-fill's `readHead` returns; counts the reads. */
+  head: string;
+  headReads: number;
 }
 
 const scenarios = new Map<string, Scenario>();
@@ -53,6 +56,11 @@ function makeDeps(): LateExternalReviewDependencies {
   return {
     intervalMs: INTERVAL_MS,
     deadlineMs: DEADLINE_MS,
+    async readHead(input) {
+      const sc = scenarioOf(input.dispatchId);
+      sc.headReads++;
+      return sc.head;
+    },
     async readTick(input) {
       const sc = scenarioOf(input.dispatchId);
       const tick = sc.ticks[Math.min(sc.reads, sc.ticks.length - 1)];
@@ -98,12 +106,13 @@ describe("LateExternalReview workflow", () => {
     await Promise.all([stopAll(envs), retryEnv?.stop()]);
   });
 
-  async function runScenario(url: string, overrides: Partial<Scenario>, follow = false) {
+  async function runScenario(url: string, overrides: Partial<Scenario>, follow = false, gapFill = false) {
     const dispatchId = `late-${counter++}`;
-    const sc: Scenario = { ticks: [passed], reads: 0, jobApproved: false, hasJob: true, jobId: 1000 + counter, stamps: [], comments: [], ...overrides };
+    const sc: Scenario = { ticks: [passed], reads: 0, jobApproved: false, hasJob: true, jobId: 1000 + counter, stamps: [], comments: [], head: SHA, headReads: 0, ...overrides };
     scenarios.set(dispatchId, sc);
     const input: LateExternalReviewInput = {
-      dispatchId, owner: "o", repo: "r", prNumber: 5, prUrl: "https://github.com/o/r/pull/5", headSha: SHA,
+      dispatchId, owner: "o", repo: "r", prNumber: 5, prUrl: "https://github.com/o/r/pull/5",
+      ...(gapFill ? { gapFill: true } : { headSha: SHA }),
       ...(follow ? { followHead: true } : {}),
     };
     const result = await callWorkflow<LateExternalReviewResult>(url, "LateExternalReview", dispatchId, "run", input);
@@ -193,6 +202,45 @@ describe("LateExternalReview workflow", () => {
         expect(result).toEqual({ outcome: "timed-out" });
         expect(sc.stamps).toEqual([]);
         expect(sc.comments).toEqual([]);
+      });
+
+      describe("gap-fill (AII-1291)", () => {
+        const gap = (overrides: Partial<Scenario>) => runScenario(url(), overrides, false, true);
+
+        it("reads the head once, then ends findings on a blocking finding seen after the head (PR #1066 sequence)", async () => {
+          const { result, sc } = await gap({ ticks: [pending, { ...passed, blockingLastSeenAtMs: [COMMIT_MS + 5] }] });
+          expect(result).toEqual({ outcome: "findings" });
+          expect(sc.stamps).toEqual([]);
+          expect(sc.comments).toEqual([]);
+          expect(sc.headReads).toBe(1);
+        });
+
+        it("writes the mark once the review check passed with no blocking finding", async () => {
+          const { result, sc } = await gap({ ticks: [pending, passed] });
+          expect(result).toEqual({ outcome: "approved" });
+          expect(sc.stamps).toEqual([sc.jobId]);
+          expect(sc.comments).toHaveLength(1);
+          expect(sc.headReads).toBe(1);
+        });
+
+        it("a head with no review check inside the grace reads pending and times out", async () => {
+          // The tick folds the grace into `checks`: inside the grace it reads pending.
+          const { result, sc } = await gap({ ticks: [pending] });
+          expect(result).toEqual({ outcome: "timed-out" });
+          expect(sc.stamps).toEqual([]);
+        });
+
+        it("a head with no reviewer after the grace reads success and is approved", async () => {
+          const { result, sc } = await gap({ ticks: [pending, passed] });
+          expect(result.outcome).toBe("approved");
+          expect(sc.stamps).toEqual([sc.jobId]);
+        });
+
+        it("ends superseded when the head moves after the journaled read", async () => {
+          const { result, sc } = await gap({ ticks: [pending, { ...pending, headSha: OTHER_SHA }] });
+          expect(result).toEqual({ outcome: "superseded" });
+          expect(sc.stamps).toEqual([]);
+        });
       });
 
       describe("repository-fix process (followHead)", () => {
