@@ -341,7 +341,7 @@ the PR.
 
 A refused tracker-file shrink fails the commit status and the comment says so. There is no PR label that accepts it: a shrink is accepted at the decision gate of the refresh that runs after the PR merges, so the dry-run never decides on the baseline.
 
-The PR check is a check run and its sticky comment on the PR's own head SHA, posted by the workflow's
+The PR check is a commit status and its sticky comment on the PR's own head SHA, posted by the workflow's
 `dry-run-report` step; nothing is stored or read back, so each report carries only that PR's own verdict
 (AII-636, AII-977). `forgetPr` on PR close drops any held head. The old `kg_refresh_dry_run_outcomes`
 settings row is deleted at boot. `KgRepo.recordDryRunOutcome` is a no-op kept until 2026-11-13 for the

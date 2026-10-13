@@ -213,9 +213,8 @@ export interface KgRefreshStatus {
 
 export interface KgRefreshHandle {
   /**
-   * Evicts any stored dry-run outcome (and held head) for `repo`#`prNumber` (AII-636), called when the
-   * webhook observes that PR close — a closed PR's outcome can never be legitimately
-   * re-reported, so there is no reason to hold it until the cap evicts it naturally.
+   * Clears the held head for `repo`#`prNumber` (AII-636), called when the webhook observes that PR
+   * close, and any outcome an older release stored for it.
    */
   forgetPr(repo: string, prNumber: number): Promise<void>;
 }

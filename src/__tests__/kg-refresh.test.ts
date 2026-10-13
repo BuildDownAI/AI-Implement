@@ -60,8 +60,8 @@ describe("kg-refresh", () => {
   });
 
   // ---- The dry-run PR-check surface (AII-633, AII-636, AII-640, AII-977) --------
-  // The refresh lifecycle runs in the KgRefresh workflow; the outcome lives on the KgRepo
-  // object. The handle reads and evicts it through the ingress client, faked here.
+  // The refresh lifecycle runs in the KgRefresh workflow; no outcome is stored. The handle
+  // only evicts the PR's held head through the ingress client, faked here.
 
   describe("dry-run report surface", () => {
     const REPORT = { repo: "TestOrg/test-kg", prNumber: 42, sha: "deadbeef" };
