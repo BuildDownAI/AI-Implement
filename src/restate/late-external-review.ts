@@ -14,7 +14,7 @@ import * as restateClients from "@restatedev/restate-sdk-clients";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { AppConfig } from "../index.js";
-import { getCombinedChecksState, getCommitTime, getPullRequestState, listCheckRuns, listPrComments, postPrComment } from "../github.js";
+import { getCombinedChecksState, getCommitTime, getPullRequestState, listCheckRuns, listPrComments, listPullRequestCommits, postPrComment } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { getJobByDispatchId, stampJobApproved } from "../log.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
@@ -27,7 +27,7 @@ import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 export const LATE_EXTERNAL_REVIEW_INTERVAL_MS = 60 * 1000;
 /** How long the workflow keeps looking before it ends `timed-out`. */
 export const LATE_EXTERNAL_REVIEW_DEADLINE_MS = 30 * 60 * 1000;
-/** A gap-fill head with no review check run at all, older than this, has no reviewer; the check counts as passed. */
+/** A gap-fill head with no review check run at all, older than this, has no reviewer; the check counts as passed. Applies only when no earlier commit of the PR had a review run (AII-1302). */
 export const LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS = 5 * 60 * 1000;
 /** Marker of the PR comment the approve step posts; also the once-only check. */
 export const LATE_EXTERNAL_APPROVAL_MARKER = "<!-- ai-implement late-external-approval -->";
@@ -72,9 +72,11 @@ export interface LateReviewTick {
 export interface LateExternalReviewDependencies {
   retentionMs?: number;
   /** One tick's read. `headSha` is always set: the input's, or the journaled read of a gap-fill. */
-  readTick(input: LateExternalReviewInput & { headSha: string }): Promise<LateReviewTick>;
+  readTick(input: LateExternalReviewInput & { headSha: string; reviewerExpected?: boolean }): Promise<LateReviewTick>;
   /** The PR's current head (gap-fill only); throws when the PR or its head is unreadable. */
   readHead(input: LateExternalReviewInput): Promise<string>;
+  /** Gap-fill only (AII-1302): `true` when any earlier commit of the PR (newest 20, head excluded) had a review check run. Throws when unreadable. */
+  readReviewerExpected?(input: LateExternalReviewInput & { headSha: string }): Promise<boolean>;
   /** The dispatch row's id and whether it already carries the mark, or `null` when the row is gone. */
   findJob(dispatchId: string): { id: number; approved: boolean } | null | Promise<{ id: number; approved: boolean } | null>;
   stampApproved(jobId: number, prUrl: string): void | Promise<void>;
@@ -84,6 +86,11 @@ export interface LateExternalReviewDependencies {
   /** Test seams; production leaves them unset. */
   intervalMs?: number;
   deadlineMs?: number;
+}
+
+/** Decodes the `read-head` journal entry. A bare SHA string was journaled before AII-1302; it reads as "reviewer expected" (fail closed, no grace). */
+export function decodeReadHead(read: string | { headSha: string; reviewerExpected?: boolean }): { headSha: string; reviewerExpected: boolean | undefined } {
+  return typeof read === "string" ? { headSha: read, reviewerExpected: true } : { headSha: read.headSha, reviewerExpected: read.reviewerExpected };
 }
 
 export function createLateExternalReviewWorkflow(deps: LateExternalReviewDependencies) {
@@ -104,9 +111,23 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
     }
 
     // A gap-fill names no head: the PR's head when the workflow starts is the one it reviews. Journaled, so a replay keeps it.
-    const headSha = input.headSha
-      ?? await ctx.run("read-head", () => deps.readHead(input), { maxRetryAttempts: 5 });
-    const tickInput = { ...input, headSha };
+    // The PR's own history decides "no reviewer" once (AII-1302): an earlier commit with a review run means the repo has one.
+    // It rides in the same journal entry as the head, so the `ctx.run` sequence of an in-flight workflow is unchanged
+    // (Restate replays by call position). An entry journaled before AII-1302 is a bare SHA string; it reads as
+    // "reviewer expected", which fails closed (no grace) for that workflow.
+    let headSha = input.headSha;
+    let reviewerExpected: boolean | undefined;
+    if (!headSha) {
+      const read = await ctx.run("read-head", async (): Promise<{ headSha: string; reviewerExpected?: boolean }> => {
+        const head = await deps.readHead(input);
+        const expected = input.gapFill && !input.followHead && deps.readReviewerExpected
+          ? await deps.readReviewerExpected({ ...input, headSha: head })
+          : undefined;
+        return expected === undefined ? { headSha: head } : { headSha: head, reviewerExpected: expected };
+      }, { maxRetryAttempts: 5 });
+      ({ headSha, reviewerExpected } = decodeReadHead(read));
+    }
+    const tickInput = { ...input, headSha, ...(reviewerExpected === undefined ? {} : { reviewerExpected }) };
     let approvedHeadSha = headSha;
     for (let i = 0; ; i++) {
       const tick = await ctx.run(`read-${i}`, () => deps.readTick(tickInput), { maxRetryAttempts: 5 });
@@ -166,6 +187,16 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
       if (!pr?.headSha) throw new Error(`late-external-review: PR #${input.prNumber} head unreadable`);
       return pr.headSha;
     },
+    async readReviewerExpected(input) {
+      const t = await token(input.owner);
+      const commits = await listPullRequestCommits(t, input.owner, input.repo, input.prNumber);
+      const earlier = commits.filter((sha) => sha !== input.headSha).slice(-20).reverse();
+      for (const sha of earlier) {
+        const runs = await listCheckRuns(t, input.owner, input.repo, sha);
+        if (runs.some((r) => isReviewCheckRun(r, REVIEW_PROCESSES["claude-code-review-repository-fix"]))) return true;
+      }
+      return false;
+    },
     async readTick(input) {
       const t = await token(input.owner);
       const pr = await getPullRequestState(t, input.owner, input.repo, input.prNumber);
@@ -185,7 +216,7 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
           .filter((r) => isReviewCheckRun(r, REVIEW_PROCESSES["claude-code-review-repository-fix"]));
         const succeeded = reviewRuns.some((r) => r.status === "completed" && r.conclusion === "success");
         // A gap-fill whose head has no review run after the grace belongs to a repo with no reviewer.
-        const noReviewer = input.gapFill && !input.followHead && reviewRuns.length === 0
+        const noReviewer = input.gapFill && !input.followHead && !input.reviewerExpected && reviewRuns.length === 0
           && Date.now() - headCommittedAtMs >= LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS;
         if (!succeeded && !noReviewer) checks = "pending";
       }

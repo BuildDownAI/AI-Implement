@@ -707,6 +707,32 @@ export async function listPullRequestFiles(
 }
 
 /**
+ * SHAs of the commits on a PR, oldest first (the head is last). Follows `Link: rel="next"`;
+ * GitHub caps the list at 250 commits. Throws on a non-OK response so a caller never reads
+ * a failed call as "no commits".
+ */
+export async function listPullRequestCommits(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+): Promise<string[]> {
+  const shas: string[] = [];
+  let url: string | null = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/commits?per_page=100`;
+  while (url) {
+    const res: Response = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`listPullRequestCommits failed: HTTP ${res.status}: ${text}`);
+    }
+    const data = (await res.json()) as Array<{ sha?: string }>;
+    shas.push(...data.map((c) => c.sha).filter((c): c is string => typeof c === "string"));
+    url = parseLinkNext(res.headers.get("link"));
+  }
+  return shas;
+}
+
+/**
  * Returns the commit SHA a branch points at, or null if the branch does not exist.
  */
 export async function getBranchSha(

@@ -32,6 +32,9 @@ interface Scenario {
   /** Head the gap-fill's `readHead` returns; counts the reads. */
   head: string;
   headReads: number;
+  /** What `readReviewerExpected` returns; counts the reads. */
+  reviewerExpected: boolean;
+  reviewerReads: number;
 }
 
 const scenarios = new Map<string, Scenario>();
@@ -60,6 +63,11 @@ function makeDeps(): LateExternalReviewDependencies {
       const sc = scenarioOf(input.dispatchId);
       sc.headReads++;
       return sc.head;
+    },
+    async readReviewerExpected(input) {
+      const sc = scenarioOf(input.dispatchId);
+      sc.reviewerReads++;
+      return sc.reviewerExpected;
     },
     async readTick(input) {
       const sc = scenarioOf(input.dispatchId);
@@ -108,7 +116,7 @@ describe("LateExternalReview workflow", () => {
 
   async function runScenario(url: string, overrides: Partial<Scenario>, follow = false, gapFill = false) {
     const dispatchId = `late-${counter++}`;
-    const sc: Scenario = { ticks: [passed], reads: 0, jobApproved: false, hasJob: true, jobId: 1000 + counter, stamps: [], comments: [], head: SHA, headReads: 0, ...overrides };
+    const sc: Scenario = { ticks: [passed], reads: 0, jobApproved: false, hasJob: true, jobId: 1000 + counter, stamps: [], comments: [], head: SHA, headReads: 0, reviewerExpected: false, reviewerReads: 0, ...overrides };
     scenarios.set(dispatchId, sc);
     const input: LateExternalReviewInput = {
       dispatchId, owner: "o", repo: "r", prNumber: 5, prUrl: "https://github.com/o/r/pull/5",
@@ -234,6 +242,14 @@ describe("LateExternalReview workflow", () => {
           const { result, sc } = await gap({ ticks: [pending, passed] });
           expect(result.outcome).toBe("approved");
           expect(sc.stamps).toEqual([sc.jobId]);
+        });
+
+        it("reviewer expected and no review ever on the head ends timed-out with no mark; the step ran once (AII-1302)", async () => {
+          const { result, sc } = await gap({ ticks: [pending], reviewerExpected: true });
+          expect(result).toEqual({ outcome: "timed-out" });
+          expect(sc.stamps).toEqual([]);
+          expect(sc.comments).toEqual([]);
+          expect(sc.reviewerReads).toBe(1);
         });
 
         it("ends superseded when the head moves after the journaled read", async () => {

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, getCommitTime } from "../github.js";
+import { dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime } from "../github.js";
 import { decodeRunConfig, encodeRunConfig } from "../run-config.js";
 import type { RepoMapping } from "../config.js";
 
@@ -1028,6 +1028,33 @@ describe("listPullRequestFiles (AII-639)", () => {
   it("throws on a non-OK page so the caller can report files_fetch_failed instead of treating it as no change", async () => {
     vi.mocked(fetch).mockResolvedValueOnce(new Response("nope", { status: 502 }));
     await expect(listPullRequestFiles("tok", "o", "r", 7)).rejects.toThrow(/listPullRequestFiles failed: HTTP 502/);
+  });
+});
+
+describe("listPullRequestCommits (AII-1302)", () => {
+  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
+
+  it("follows Link rel=\"next\" and returns SHAs oldest first across pages", async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => ({ sha: `sha-${i}` }));
+    const page2 = [{ sha: "head" }];
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(JSON.stringify(page1), {
+        status: 200,
+        headers: { link: '<https://api.github.com/repos/o/r/pulls/7/commits?per_page=100&page=2>; rel="next"' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(page2), { status: 200 }));
+    const shas = await listPullRequestCommits("tok", "o", "r", 7);
+    expect(shas).toHaveLength(101);
+    expect(shas[0]).toBe("sha-0");
+    expect(shas[100]).toBe("head");
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+    expect(String(vi.mocked(fetch).mock.calls[0][0])).toContain("/pulls/7/commits?per_page=100");
+    expect(String(vi.mocked(fetch).mock.calls[1][0])).toContain("page=2");
+  });
+
+  it("throws on a non-OK page rather than reading it as no commits", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response("nope", { status: 502 }));
+    await expect(listPullRequestCommits("tok", "o", "r", 7)).rejects.toThrow(/listPullRequestCommits failed: HTTP 502/);
   });
 });
 

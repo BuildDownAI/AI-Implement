@@ -7,13 +7,14 @@ vi.mock("../github.js", () => ({
   getPullRequestState: vi.fn(),
   listCheckRuns: vi.fn(),
   listPrComments: vi.fn(),
+  listPullRequestCommits: vi.fn(),
   postPrComment: vi.fn(),
 }));
 vi.mock("../review-ledger-store.js", () => ({ listOpenReviewFindings: vi.fn(() => []) }));
 
-import { getCombinedChecksState, getCommitTime, getPullRequestState, listCheckRuns } from "../github.js";
+import { getCombinedChecksState, getCommitTime, getPullRequestState, listCheckRuns, listPullRequestCommits } from "../github.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
-import { createProductionLateExternalReviewDependencies, LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS } from "../restate/late-external-review.js";
+import { decodeReadHead, createProductionLateExternalReviewDependencies, LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS } from "../restate/late-external-review.js";
 import { headReviewedClean } from "../review-head-clean.js";
 
 const run = (status: string, conclusion: string | null) => ({ name: "Claude Code Review", appSlug: "claude", status, conclusion });
@@ -88,9 +89,63 @@ describe("readTick for a gap-fill (AII-1291)", () => {
       vi.mocked(getCommitTime).mockResolvedValue(Date.now() - 3600_000);
       expect((await tickOf()).checks).toBe("pending");
     });
+  it("keeps zero review runs pending after the grace when a reviewer is expected (AII-1302)", async () => {
+    vi.mocked(listCheckRuns).mockResolvedValue([other]);
+    vi.mocked(getCommitTime).mockResolvedValue(Date.now() - LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS - 1000);
+    const tick = await createProductionLateExternalReviewDependencies({ githubAppId: "1", githubAppPrivateKey: "k" })
+      .readTick({ ...gapInput, reviewerExpected: true });
+    expect(tick.checks).toBe("pending");
+  });
+  it("reads a successful review as success when a reviewer is expected", async () => {
+    vi.mocked(listCheckRuns).mockResolvedValue([run("completed", "success")]);
+    vi.mocked(getCommitTime).mockResolvedValue(Date.now() - 1000);
+    const tick = await createProductionLateExternalReviewDependencies({ githubAppId: "1", githubAppPrivateKey: "k" })
+      .readTick({ ...gapInput, reviewerExpected: true });
+    expect(tick.checks).toBe("success");
+  });
   it("reads a successful review check as success inside the grace", async () => {
     vi.mocked(listCheckRuns).mockResolvedValue([run("completed", "success")]);
     vi.mocked(getCommitTime).mockResolvedValue(Date.now() - 1000);
     expect((await tickOf()).checks).toBe("success");
+  });
+});
+
+describe("readReviewerExpected (AII-1302)", () => {
+  const deps = () => createProductionLateExternalReviewDependencies({ githubAppId: "1", githubAppPrivateKey: "k" });
+  const gapInput = { dispatchId: "d", owner: "o", repo: "r", prNumber: 5, prUrl: "u", gapFill: true, headSha: "h" };
+  const other = { name: "ci", appSlug: "github-actions", status: "completed", conclusion: "success" };
+
+  it("is true when an earlier commit had a review run of any status, and never checks the head", async () => {
+    vi.mocked(listPullRequestCommits).mockResolvedValue(["c1", "c2", "h"]);
+    vi.mocked(listCheckRuns).mockImplementation(async (_t, _o, _r, sha) => (sha === "c1" ? [run("completed", "skipped")] : [other]) as never);
+    expect(await deps().readReviewerExpected!(gapInput)).toBe(true);
+    expect(vi.mocked(listCheckRuns).mock.calls.map((c) => c[3])).not.toContain("h");
+  });
+  it("is false when no earlier commit had a review run", async () => {
+    vi.mocked(listPullRequestCommits).mockResolvedValue(["c1", "h"]);
+    vi.mocked(listCheckRuns).mockResolvedValue([other] as never);
+    expect(await deps().readReviewerExpected!(gapInput)).toBe(false);
+  });
+  it("checks only the newest 20 earlier commits", async () => {
+    const shas = Array.from({ length: 30 }, (_, i) => `c${i}`);
+    vi.mocked(listPullRequestCommits).mockResolvedValue([...shas, "h"]);
+    vi.mocked(listCheckRuns).mockClear();
+    vi.mocked(listCheckRuns).mockResolvedValue([other] as never);
+    await deps().readReviewerExpected!(gapInput);
+    expect(vi.mocked(listCheckRuns).mock.calls.map((c) => c[3])).toEqual(shas.slice(-20).reverse());
+  });
+  it("throws rather than reading false when GitHub fails", async () => {
+    vi.mocked(listPullRequestCommits).mockRejectedValue(new Error("HTTP 502"));
+    await expect(deps().readReviewerExpected!(gapInput)).rejects.toThrow("HTTP 502");
+  });
+});
+
+describe("decodeReadHead (journal entries from before AII-1302)", () => {
+  it("reads a bare SHA string as reviewer expected, failing closed", () => {
+    expect(decodeReadHead("abc123")).toEqual({ headSha: "abc123", reviewerExpected: true });
+  });
+  it("reads the object shape as journaled", () => {
+    expect(decodeReadHead({ headSha: "abc123", reviewerExpected: false })).toEqual({ headSha: "abc123", reviewerExpected: false });
+    expect(decodeReadHead({ headSha: "abc123" })).toEqual({ headSha: "abc123", reviewerExpected: undefined });
   });
 });
