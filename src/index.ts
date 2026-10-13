@@ -1,3 +1,5 @@
+// Must stay first: sets RESTATE_LOGGING before the Restate SDK loads and reads it (AII-1189).
+import "./restate/log-level-boot.js";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -10,7 +12,7 @@ import {
   resolveReviewFixLifecycle,
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
-import { markDispatched, closeDb, getDb, getDispatchedRows, deleteDispatched } from "./dedup.js";
+import { recordReaperAction, markDispatched, closeDb, getDb, getDispatchedRows, deleteDispatched } from "./dedup.js";
 import { reconcileDispatched } from "./dedup-reconcile.js";
 import { canDispatch, acquireDispatch, type DispatchKind, type AcquireDispatchOutcome } from "./dispatch-gate.js";
 import {
@@ -23,7 +25,7 @@ import {
   type StaleAdmissionCandidate,
 } from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
-import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, postPrComment, defaultFetchSignal, getRepoDefaultBranch, fetchRepoTarball, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, type DispatchInputs } from "./github.js";
+import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, postPrComment, defaultFetchSignal, fetchRepoTarball, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, type DispatchInputs } from "./github.js";
 import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -61,18 +63,18 @@ import { handleReferenceTokenRequest } from "./reference-token-vending.js";
 import { handleStatusUpdate, handleStepReport } from "./session-api.js";
 import { postStatusComment } from "./status-events.js";
 import { buildRunUrl, classifyCompletion, deriveLastSuccessfulStage, monitorFailureCommentPrefix, renderClassification, shouldPostMonitorClassificationComment } from "./completion-classification.js";
-import { classifyFlyMachine, classifyLocalContainer } from "./backend-run.js";
-import { createMachine, getMachine, listMachines, destroyMachine, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
-import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
+import { classifyFlyMachine, classifyLocalContainer, destroyMachineRecorded } from "./backend-run.js";
+import { createMachine, getMachine, listMachines, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
+import { isDurableRunnerMachine, safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
 import type { ReaperHelpers } from "./reaper.js";
-import { seedKgMaterializeDirectFromEnv, getRunnerMode, getFlySecretsMinVersion, getFlyProcessLevelSecrets, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
+import { seedKgMaterializeDirectFromEnv, seedKgExecutionModeFromEnv, getRunnerMode, getFlySecretsMinVersion, getFlyProcessLevelSecrets, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
 import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
-import { getOrchestratorSettings, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, getRetryPolicy } from "./orchestrator-settings.js";
-import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
+import { getOrchestratorSettings, getRunnerBackendSource, getFlySessionsConfig, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, getRetryPolicy, seedRunnerBackends, refreshRunnerBackendCache } from "./orchestrator-settings.js";
+import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
 import { mintRunToken, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
@@ -80,7 +82,7 @@ import { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
 import { createReviewFixAdminFacade } from "./review-fix-admin-facade.js";
 import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "./review-fix-worker.js";
 import { listActiveRestateReviewFixPrs, queueReviewFixCancellationForClosedPr } from "./review-fix-close.js";
-import { acceptDelivery as acceptReviewFixDelivery, ReviewFixDeliveryPump } from "./restate/review-fix-client.js";
+import { createReviewFixIngressClient, reviewFixResultForwardKey, reviewFixResultIntakeFromForward } from "./restate/review-fix-client.js";
 import { appendReviewFixActivityBatch, isReviewFixEvidenceTombstoned } from "./review-fix-evidence.js";
 import type { ReviewFixResultMetadataV1, ResultIntakeOutcome } from "./review-fix-contract.js";
 import { handleMcpRequest } from "./mcp.js";
@@ -111,7 +113,7 @@ import { type RunConfigV1, type RunCredentialsV1, encodeRunConfig, buildImplRunC
 import { resolveBaseBranch, findOpenRollUpPr, resolvePlanningBranch } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
-import { runGroupingBranchAutoMerge } from "./auto-merge.js";
+import { runAutoMerges } from "./auto-merge.js";
 import { getPendingReviewFixes, listReviewFixEvents, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, acceptReviewFixWebhookEvent, prepareReviewFixTask, previewReviewFixText } from "./review-fix-queue.js";
 import { initReviewFixEvidenceTable, sweepExpiredReviewFixEvidence } from "./review-fix-evidence.js";
 import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
@@ -128,7 +130,7 @@ import { KgSidecar } from "./kg-sidecar.js";
 import type { KgRefreshIngressClient } from "./restate/kg-refresh-production.js";
 import { createKgRefreshIngressClient } from "./restate/kg-refresh-production.js";
 import { RestateSidecar } from "./restate/server.js";
-import type { FlyMachineProfileConfig } from "./restate/fly-machine-profile.js";
+import { handleRestateUiRequest } from "./restate/ui-proxy.js";
 import { startRestateEndpoint, register as registerRestateEndpoint, RESTATE_SERVICES } from "./restate/endpoint.js";
 import {
   getRestateRetentionDays,
@@ -141,13 +143,15 @@ import {
 } from "./restate/retention.js";
 import { applyVolumeSnapshotRetention, applyVolumeSnapshotRetentionAtBoot } from "./fly-volumes.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
-import { createKgFindRunByTitle, seedFlyMachineProfileFromOverride, createProductionKgRefreshServices, recordKgDispatchDetails, launchKeptMachine, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
+import { sweepOnRegistered } from "./webhook-redelivery.js";
+import { createKgFindRunByTitle, createProductionKgRefreshServices, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
+import { resolveReviewProcess } from "./review-process.js";
+import { createLateExternalReviewIngressClient, createLateExternalReviewSubmitHook, createProductionLateExternalReviewServices } from "./restate/late-external-review.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
-import { handleJournalRequest } from "./restate/journal-query.js";
 import type { RestateRegistrationStatus } from "./restate/status.js";
 import { setAdmissionTerminationCheck, setProviderRegistry, setReviewFixAttemptsFacade } from "./restate/tools.js";
 import { callTool, callToolAsSystem } from "./restate/tools-client.js";
@@ -299,17 +303,15 @@ function loadConfig(): AppConfig {
     pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "60000", 10),
     pollCycleTimeoutMs: Number(process.env.POLL_CYCLE_TIMEOUT_MS) || 10 * 60 * 1000,
     healthPort: parseInt(process.env.PORT || "8080", 10),
-    flySessionsToken: process.env.FLY_SESSIONS_TOKEN || null,
-    flySessionsApp: (() => {
-      const envVal = process.env.FLY_SESSIONS_APP || null;
-      if (envVal) return envVal;
-      return getOrchestratorSettings().flySessionsApp;
-    })(),
-    flySessionsRegion: (() => {
-      const envVal = process.env.FLY_SESSIONS_REGION || null;
-      if (envVal) return envVal;
-      return getOrchestratorSettings().flySessionsRegion;
-    })(),
+    get flySessionsToken() {
+      return getFlySessionsConfig().token;
+    },
+    get flySessionsApp() {
+      return getFlySessionsConfig().app;
+    },
+    get flySessionsRegion() {
+      return getFlySessionsConfig().region;
+    },
     flyOrchestratorApp: process.env.FLY_APP_NAME || null,
     flyDeployToken: process.env.FLY_DEPLOY_TOKEN || null,
     tenantId: process.env.CLIENT_SLUG || process.env.FLY_APP_NAME || null,
@@ -436,6 +438,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   const timeoutMs = config.pollCycleTimeoutMs;
 
+  await refreshRunnerBackendCache();
   await runWithDeadline(
     cycleId,
     started,
@@ -609,12 +612,12 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     }
 
     // Merge approved child PRs into grouping branches (cascade self-healing). Runs for all
-    // non-paused projects — the top-of-tree feature→base PR still requires human review.
-    // (AII-349: always-on so a reopened parent's approved children merge without per-project opt-in.)
+    // non-paused projects whose Auto-merge setting is on (runAutoMerges checks the flag); a project
+    // with it off leaves approved children for a person. The top-of-tree feature→base PR still requires human review.
     try {
       const nonPausedMappings = Object.values(teamRepoMap);
       if (nonPausedMappings.length > 0) {
-        await runGroupingBranchAutoMerge(nonPausedMappings, {
+        await runAutoMerges(nonPausedMappings, {
           githubAppId: config.githubAppId,
           githubAppPrivateKey: config.githubAppPrivateKey,
           notify: config.notifyWebhookUrl
@@ -884,8 +887,8 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   // Bounded cleanup of Restate review-fix pilot evidence (AII-795): purges activity/cycle
   // rows past the 7-day-since-completion retention floor, skipping any attempt whose
-  // ownership is still unresolved (pending delivery, active reservation, result conflict,
-  // or unbound execution). SQLite-only and synchronous — safe on every poll regardless of
+  // ownership is still unresolved (active reservation, result conflict, or unbound
+  // execution). SQLite-only and synchronous — safe on every poll regardless of
   // runner mode.
   const evidenceSweep = sweepExpiredReviewFixEvidence();
   if (evidenceSweep.purgedAttemptIds.length > 0) {
@@ -915,7 +918,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
       const state = await getPullRequestState(token, owner, repo, active.prNumber);
       if (state && shouldSkipReviewFix(state)) {
-        queueReviewFixCancellationForClosedPr(active.repository, active.prNumber);
+        await queueReviewFixCancellationForClosedPr(active.repository, active.prNumber, reviewFixIngressClient);
       }
     } catch (err) {
       console.warn(`[review-fix] Could not reconcile PR closure for ${active.repository}#${active.prNumber}:`, err);
@@ -2215,13 +2218,11 @@ function isRestateOwnedJob(job: Job): boolean {
 function ttlStopRunnerForJob(config: AppConfig, job: Job): (() => Promise<boolean>) | undefined {
   if (job.executionMode === "fly-machines") {
     if (!config.flySessionsToken || !config.flySessionsApp || !job.machineId) return undefined;
-    const token = config.flySessionsToken;
-    const app = config.flySessionsApp;
     const machineId = job.machineId;
     return async () => {
       let confirmed = false;
       try {
-        await destroyMachine(token, app, machineId);
+        await destroyMachineRecorded(config, machineId, "ttl-stop", { issueIdentifier: job.issueIdentifier });
         confirmed = true;
         console.log(`[monitor] Destroyed timed-out machine ${machineId}`);
       } catch (err) {
@@ -2750,7 +2751,7 @@ async function monitorFlyMachineJob(
     const stopRunner = async () => {
       let confirmed = false;
       try {
-        await destroyMachine(config.flySessionsToken!, config.flySessionsApp!, job.machineId!);
+        await destroyMachineRecorded(config, job.machineId!, "monitor-timeout", { issueIdentifier: job.issueIdentifier });
         confirmed = true;
         console.log(`[monitor] Destroyed timed-out machine ${job.machineId}`);
       } catch (err) {
@@ -2802,7 +2803,7 @@ async function monitorFlyMachineJob(
 
   if (machineDone) {
     // Determine success/failure before destroying: move findPrForIssue before
-    // destroyMachine so we can decide whether to fetch logs while the machine
+    // destroyMachineRecorded so we can decide whether to fetch logs while the machine
     // is still accessible.
     const matchedPr = await findPrForIssue(config, job.repo, job.issueIdentifier);
     const prUrl = matchedPr?.url ?? null;
@@ -2845,7 +2846,7 @@ async function monitorFlyMachineJob(
       }
 
       try {
-        await destroyMachine(config.flySessionsToken, config.flySessionsApp, job.machineId);
+        await destroyMachineRecorded(config, job.machineId, "monitor-stopped", { issueIdentifier: job.issueIdentifier });
         console.log(`[monitor] Destroyed stopped machine ${job.machineId}`);
       } catch (err) {
         if (!(err instanceof Error && err.message.includes("404"))) {
@@ -3386,6 +3387,26 @@ async function startupReconciliation(config: AppConfig, registry: ProviderRegist
       continue;
     }
 
+    // A durable-runner machine is owned by a FlyMachineProfile object, not a dispatch_log
+    // row: a missing or terminal row is its normal state, so neither rule below may see it.
+    // Only the object's expire and the reaper's durable-expired may destroy it.
+    if (isDurableRunnerMachine(machine)) {
+      console.log(`[startup] Keeping durable-runner machine ${machine.id} (owned by FlyMachineProfile)`);
+      try {
+        recordReaperAction({
+          ruleMatched: "durable-skip:startup-reconcile",
+          machineId: machine.id,
+          tenantId: null,
+          issueIdentifier: null,
+          ageSeconds: Math.floor((Date.now() - new Date(machine.created_at).getTime()) / 1000),
+          dryRun: config.reaperDryRun,
+        });
+      } catch (err) {
+        console.error("[startup] Failed to record durable-skip:", err);
+      }
+      continue;
+    }
+
     const job = getJobByMachineId(machine.id);
 
     if (!job) {
@@ -3533,17 +3554,22 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           // Periodic, identity-stable nudges repair a missed signal or a project
           // toggled away from and back to Restate while the same queue row waits.
           // ReviewFixPR's existing wake never extends its first 5-second window.
-          const delivery = acceptReviewFixDelivery({
-            authenticatedSource: "review-fix-queue",
-            deliveryId: `${fix.id}.${lastEvent.id}.${Math.floor(Date.now() / 30_000)}`,
-            kind: "feedback",
-            destination: { installationId, repository: fix.repo, prNumber: fix.prNumber },
-            payload: {},
-          });
-          if (delivery.status !== "accepted") console.error(`[review-fix] Could not queue Restate feedback for #${fix.id}: ${delivery.status}`);
+          const nudge = await reviewFixIngressClient.feedback(
+            { installationId, repository: fix.repo, prNumber: fix.prNumber },
+            undefined,
+            { idempotencyKey: `${fix.id}.${lastEvent.id}.${Math.floor(Date.now() / 30_000)}` },
+          );
+          if (nudge.status !== "accepted") console.error(`[review-fix] Could not queue Restate feedback for #${fix.id}: ${nudge.status}`);
         } catch (err) {
           console.warn(`[review-fix] Could not signal Restate feedback for #${fix.id}; keeping pending:`, err);
         }
+        continue;
+      }
+      // The repository's auto-fix owns the PR: the ledger findings stay for LateExternalReview, nothing dispatches.
+      if (resolveReviewProcess(mapping.reviewProcess).fixer === "repository") {
+        updateReviewFixStatus(fix.id, "skipped");
+        console.log(`[review-fix] Project ${fix.repo} delegates fixes to the repository `
+          + `(${resolveReviewProcess(mapping.reviewProcess).id}), skipping review fix #${fix.id}`);
         continue;
       }
       if (mapping.ticketingProvider === "filesystem" && runnerMode !== "local") {
@@ -4053,127 +4079,31 @@ async function handleKgRefreshOutcome(
   }
 }
 
-export async function dispatchKgRefreshRun(
-  config: AppConfig,
-  opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string; executionPath?: string; machine: FlyMachineProfileConfig; machineId: string | null },
-): Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; created?: boolean }> {
-  if (!config.kgSourceRepo) throw new Error("KG_SOURCE_REPO not configured");
-  const repo = parseKgSourceRepo(config.kgSourceRepo);
-  const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
-  const defaultBranch = (await getRepoDefaultBranch(ghToken, repo.owner, repo.repo)) ?? "main";
-  const executionPath = opts.executionPath;
-  if (executionPath === "fly-machines") {
-    if (!config.flySessionsToken || !config.flySessionsApp) {
-      throw new Error(
-        "[kg-refresh] fly-machines execution path selected but FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured",
-      );
-    }
-    // Narrow mint first: a failure aborts the launch with no fallback to controlToken.
-    const bootToken = await getTargetRepoToken(config, repo.owner, repo.repo);
-    const sessionToken = generateSessionToken();
-    const machineNonce = generateMachineNonce();
-    const extraEnv: Record<string, string> = {
-      AI_IMPLEMENT_RUN_CONFIG: opts.runConfig,
-      RUN_PROGRESS_TOKEN: opts.runProgressToken,
-    };
-    const flySessionImage = await resolveRunnerImageForDispatch({
-      owner: repo.owner,
-      repo: repo.repo,
-      token: bootToken,
-      defaultImage: config.sessionImage,
-      runnerImageExplicit: config.runnerImageExplicit,
-    }) ?? config.sessionImage;
-    const machineConfig = buildSessionMachineConfig({
-      image: flySessionImage,
-      issueId: "kg-refresh",
-      issueIdentifier: "KG-REFRESH",
-      issueTitle: "KG ingest",
-      issueDescription: "",
-      owner: repo.owner,
-      repo: repo.repo,
-      defaultBranch,
-      anthropicApiKey: config.anthropicApiKey ?? undefined,
-      claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-      githubToken: bootToken,
-      sessionToken,
-      machineNonce,
-      phase: "kg-refresh",
-      orchestratorUrl: config.runnerCallbackBaseUrl ?? undefined,
-      runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
-      runToken: opts.runToken,
-      orchestratorApp: process.env.FLY_APP_NAME,
-      expectedTtlSeconds: 4 * 60 * 60,
-      extraEnv,
-      cpuKind: opts.machine.cpuKind,
-      cpus: opts.machine.cpus,
-      memoryMb: opts.machine.memoryMb,
-      region: config.flySessionsRegion ?? undefined,
-      purpose: "durable-runner",
-      pipeline: "kg-refresh",
-      dispatchId: opts.dispatchId,
-    });
-    const launched = await launchKeptMachine(bindKeptMachineFly(config.flySessionsToken, config.flySessionsApp), {
-      keptMachineId: opts.machineId, dispatchId: opts.dispatchId, machineConfig, machineNonce,
-    });
-    console.log(`[kg-refresh] dispatched via Fly (${launched.reused ? "reused" : "created"} machine ${launched.machineId}) (dispatchId=${opts.dispatchId})`);
-    return {
-      machineId: launched.machineId, machineNonce: launched.machineNonce, created: launched.created,
-      logsUrl: `https://fly.io/apps/${config.flySessionsApp}/machines/${launched.machineId}`,
-    };
-
-  } else if (executionPath === "local-docker") {
-    if (!config.localRunnerImage) {
-      throw new Error(
-        "[kg-refresh] local-docker execution path selected but LOCAL_RUNNER_IMAGE is not configured",
-      );
-    }
-    const bootToken = await getTargetRepoToken(config, repo.owner, repo.repo);
-    const sessionToken = generateSessionToken();
-    const machineNonce = generateMachineNonce();
-    const extraEnv: Record<string, string> = { AI_IMPLEMENT_RUN_CONFIG: opts.runConfig, RUN_PROGRESS_TOKEN: opts.runProgressToken };
-    const localOrchestratorUrl =
-      config.localRunnerOrchestratorUrl ??
-      config.runnerCallbackBaseUrl ??
-      `http://host.docker.internal:${config.healthPort}`;
-    const { containerId } = await startLocalRunnerContainer({
-      image: config.localRunnerImage,
-      issueId: "kg-refresh",
-      issueIdentifier: "KG-REFRESH",
-      issueTitle: "KG ingest",
-      issueDescription: "",
-      owner: repo.owner,
-      repo: repo.repo,
-      defaultBranch,
-      anthropicApiKey: config.anthropicApiKey ?? undefined,
-      claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-      githubToken: bootToken,
-      sessionToken,
-      machineNonce,
-      phase: "kg-refresh",
-      orchestratorUrl: localOrchestratorUrl,
-      runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
-      runToken: opts.runToken,
-      extraEnv,
-    });
-    console.log(`[kg-refresh] dispatched via local Docker (dispatchId=${opts.dispatchId})`);
-    return { machineId: containerId, machineNonce };
-  } else {
-    throw new Error(`[kg-refresh] unsupported execution path "${String(executionPath)}": the GitHub Actions run is dispatched by the KgRefresh workflow`);
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Restate review-fix pilot callback wiring (AII-769/AII-803): the injected,
-// non-SDK seams handleRunnerResult/handleRunnerActivity call. Both persist to
-// SQLite (the sole authority an ACK depends on) before ever touching Restate —
-// delivery to the sidecar is the pre-existing async pump (ReviewFixDeliveryPump,
-// src/restate/review-fix-client.ts), so a sidecar outage never blocks or fails
-// an ACK that SQLite already accepted, while a SQLite failure here throws and
-// is never acknowledged (caught by the route wrapper below as a 500).
+// non-SDK seams handleRunnerResult/handleRunnerActivity call. Results and
+// cancellations reach Restate through the ingress client with the sender's
+// event id as the idempotency key; an unavailable sidecar answers the caller
+// rather than being stored for later.
 // ---------------------------------------------------------------------------
 
 const reviewFixAttemptStore = new SqliteReviewFixAttemptStore();
 const kgRefreshIngressClient = createKgRefreshIngressClient();
+// AII-1227: starts LateExternalReview only while the sidecar is ready and the endpoint registered.
+const submitLateExternalReview = createLateExternalReviewSubmitHook({
+  ingress: createLateExternalReviewIngressClient(),
+  restateReady: () => {
+    const restate = getRestateStatus();
+    return restate.sidecar.state === "ready" && restate.registration.state === "registered";
+  },
+});
+// A repository-fix project's workflow follows the auto-fix to its new head (ADR 038); the mode rides the input.
+const lateExternalReviewSubmitHook: typeof submitLateExternalReview = (input) => {
+  const mapping = Object.values(getMappings()).find((m) => m.owner === input.owner && m.repo === input.repo);
+  const followHead = resolveReviewProcess(mapping?.reviewProcess).fixer === "repository";
+  return submitLateExternalReview(followHead ? { ...input, followHead } : input);
+};
+const reviewFixIngressClient = createReviewFixIngressClient();
 
 /** Maps a `callToolAsSystem` result carrying `{ status, body }` text onto the REST shape (AII-901). */
 function kgToolAnswer(
@@ -4260,22 +4190,14 @@ export function sweepLegacyKgRefreshRows(): number {
 }
 
 async function onReviewFixResult(result: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> {
-  // The accepted result and its delivery entry commit together. The callback
-  // also runs on an identical retry, repairing an older result that somehow
-  // lacks its inbox row; a rejected or conflicted identity aborts the write.
-  // This callback performs synchronous SQLite work only, never a Restate call.
-  return reviewFixAttemptStore.recordResult(result.attemptId, result, () => {
-    const delivery = acceptReviewFixDelivery({
-      authenticatedSource: "runner-callback",
-      deliveryId: `${result.attemptId}.result`,
-      kind: "result",
-      destination: { installationId: result.installationId, repository: result.repository, prNumber: result.prNumber },
-      payload: result,
-    });
-    if (delivery.status !== "accepted") {
-      throw new Error(`review-fix result delivery was ${delivery.status}`);
-    }
-  });
+  // Verify-only (AII-1185): the callback forwards the validated result to
+  // ReviewFixAttempt.result, whose `store-result` step is the sole SQLite writer.
+  // Restate unreachable throws, which the route answers 503 with nothing written;
+  // the runner retries the same body under the same key.
+  const out = await reviewFixIngressClient.result(result.attemptId, result, { idempotencyKey: reviewFixResultForwardKey(result) });
+  const outcome = reviewFixResultIntakeFromForward(result.attemptId, out);
+  if (!outcome) throw new ReviewFixIntakeUnavailableError();
+  return outcome;
 }
 
 function onReviewFixActivity(batch: RunnerActivityBody): ActivityIntakeOutcome {
@@ -4318,7 +4240,7 @@ function startServer(
   const reviewFixAttempts = createReviewFixAdminFacade(reviewFixAttemptStore, new GithubReviewFixWorker({
     credentials: createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey),
     scopeStore: reviewFixAttemptStoreScopeStore(reviewFixAttemptStore),
-  }));
+  }), reviewFixIngressClient);
   setReviewFixAttemptsFacade(reviewFixAttempts);
   const kgRefresh: KgRefreshHandle = makeKgRefresh({
     githubAppId: config.githubAppId,
@@ -4554,13 +4476,12 @@ function startServer(
         kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
-        reportDryRun: (report) => kgRefresh.reportDryRun(report),
         enqueueDryRun: (key, entry, opts) =>
           config.kgSourceRepo
             ? kgRefreshIngressClient.enqueueDryRun(parseKgSourceRepo(config.kgSourceRepo).fullName, { key, ...entry }, opts)
             : Promise.resolve({ status: "unavailable" as const }),
         forgetKgPr: (repo, prNumber) => kgRefresh.forgetPr(repo, prNumber),
-      }, (repository, prNumber) => { queueReviewFixCancellationForClosedPr(repository, prNumber); }).catch((err) => {
+      }, async (repository, prNumber) => { await queueReviewFixCancellationForClosedPr(repository, prNumber, reviewFixIngressClient); }, reviewFixIngressClient).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
@@ -4649,6 +4570,7 @@ function startServer(
             ingress: createPlanningRunIngressClient(),
             legacy: (dispatchId) => tryFastReleasePlanningAdmission(config, dispatchId),
           }),
+          submitLateExternalReview: lateExternalReviewSubmitHook,
           onReviewFixResult,
           kgRefreshClient: kgRefreshIngressClient,
           kgSourceRepo: config.kgSourceRepo,
@@ -4916,6 +4838,9 @@ function startServer(
       return;
     }
 
+    // Restate UI, its admin API paths and ingress (AII-1261, ADR 040): admin role only.
+    if (handleRestateUiRequest(req, res, { adminConfigured: Boolean(config.adminAccessCode) || isOAuthConfigured() })) return;
+
     // Admin routes - match on the path only, so query params can still be read when needed
     if (url.split("?")[0] === "/admin" || url.startsWith("/api/")) {
       if (!config.adminAccessCode && !isOAuthConfigured()) {
@@ -4956,7 +4881,7 @@ function startServer(
           min: RESTATE_RETENTION_DAYS_MIN,
           max: RESTATE_RETENTION_DAYS_MAX,
         },
-        reviewFixAttempts, readJournal: handleJournalRequest })) return;
+        reviewFixAttempts })) return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
@@ -4993,6 +4918,36 @@ export interface RestateEndpointWireDeps {
   registerRestateEndpoint: () => Promise<RestateRegisterResult>;
   /** Runs after a registration that took effect (never after `declined-conflict`); must not throw. */
   onRegistered?: () => Promise<void>;
+}
+
+/**
+ * Boot-time machine reconciliation must list the app saved in `RunnerBackend/fly-machines`, not the
+ * env-then-row fallback. `atBoot()` runs it when the cache already came from Restate; otherwise it
+ * defers to `onRegistered()` (after that hook's cache refresh), which runs it at most once.
+ */
+export function createBootReconciliation(
+  reconcile: () => Promise<void>,
+  source: () => "restate" | "fallback",
+) {
+  let deferred = false;
+  let done = false;
+  async function run(path: string): Promise<void> {
+    if (done) return;
+    done = true;
+    console.log(`[main] Startup reconciliation running from ${path}`);
+    await reconcile();
+  }
+  return {
+    async atBoot(): Promise<void> {
+      if (source() === "restate") return run("main (runner backend loaded from Restate)");
+      deferred = true;
+      console.log("[main] Runner backend cache is on the fallback; startup reconciliation deferred to Restate registration");
+    },
+    async onRegistered(): Promise<void> {
+      if (!deferred) return;
+      await run("onRegistered (after runner backend refresh)");
+    },
+  };
 }
 
 /** How often a declined registration retries (AII-721) — the old deployment's non-completed invocations are expected to drain on their own; this just keeps checking back. */
@@ -5105,6 +5060,7 @@ async function main(): Promise<void> {
   initSettingsTable();
   seedKgBaseRepoFromEnv(process.env.KG_BASE_REPO); // AII-633: seeds once, inert thereafter
   seedKgMaterializeDirectFromEnv(process.env.KG_MATERIALIZE_DIRECT); // AII-1109: seeds once, inert thereafter
+  seedKgExecutionModeFromEnv(process.env.KG_EXECUTION_MODE); // seeds once, inert thereafter
   seedLinearPickupLabelFromEnv(process.env.LINEAR_PICKUP_LABEL); // AII-694: seeds once, inert thereafter
   initAccessEntriesTable();
   initReconciliationTable();
@@ -5201,16 +5157,21 @@ async function main(): Promise<void> {
       setCommitStatusFn: setCommitStatus,
       mergePullRequestFn: mergePullRequest,
       closePullRequestFn: closePullRequest,
+      getPullRequestStateFn: getPullRequestState,
       deleteBranchFn: deleteBranch,
-      dispatchKgRefreshRun: (opts) => dispatchKgRefreshRun(config, opts),
+      getInstallationToken,
+      getScopedInstallationToken,
+      resolveRunnerImage: resolveRunnerImageForDispatch,
+      postWorkflowDispatch,
+      keptMachineFly: () => bindKeptMachineFly(config.flySessionsToken!, config.flySessionsApp!),
+      startLocalRunnerContainer,
       updateJobStatus,
-      recordDispatch: recordKgDispatchDetails,
       getWorkflowRunStatus: async (runId) => {
         const run = await getWorkflowRunStatus(await kgWorkflowToken(), kgSlug.owner, kgSlug.repo, runId);
         if (!run) throw new Error(`workflow run ${runId} status unavailable`);
         return { status: run.status, conclusion: run.conclusion };
       },
-      findRunByTitle: createKgFindRunByTitle({ owner: kgSlug.owner, repo: kgSlug.repo, getToken: kgWorkflowToken, recordDetails: recordKgDispatchDetails }),
+      findRunByTitle: createKgFindRunByTitle({ owner: kgSlug.owner, repo: kgSlug.repo, getToken: kgWorkflowToken }),
       cancelWorkflowRun: async (runId) => cancelWorkflowRun(await kgWorkflowToken(), kgSlug.owner, kgSlug.repo, runId),
       persistLastRefresh: defaultPersistLastRefresh,
       handleKgRefreshOutcome: (outcome, data) => handleKgRefreshOutcome(config, registry, outcome, data),
@@ -5238,18 +5199,26 @@ async function main(): Promise<void> {
     reportTerminalJob: (job) => reportTerminalJob(config, registry, job, { ownerCall: true }),
     sessionDeps: { dispatchSession, isDefinitiveFlyRejectionError, isDefinitiveLocalDockerLaunchFailure, shouldReleaseAdmissionOnDispatchError },
   }).services;
+  const lateExternalReviewServices = createProductionLateExternalReviewServices(config).services;
+  const bootReconciliation = createBootReconciliation(
+    () => startupReconciliation(config, registry),
+    () => getRunnerBackendSource(),
+  );
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
-    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices], restateSidecar.identityKey),
+    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...lateExternalReviewServices], restateSidecar.identityKey),
     registerRestateEndpoint,
-    onRegistered: () => seedFlyMachineProfileFromOverride(),
+    onRegistered: async () => {
+      sweepOnRegistered(config);
+      await seedRunnerBackends();
+      await refreshRunnerBackendCache();
+      await bootReconciliation.onRegistered();
+    },
   });
   // A sidecar which becomes ready after its initial timeout still registers the
   // same fully composed service set; the gate starts the endpoint only once.
   void restateSidecar.whenReady().then((ready) => {
     if (ready) void restateRegistration.attempt();
   });
-  const reviewFixPump = new ReviewFixDeliveryPump();
-  reviewFixPump.start();
 
   const teamRepoMap = getMappings();
 
@@ -5300,7 +5269,8 @@ async function main(): Promise<void> {
   void postBootNotice(config, { holdWasSet, sidecarProbeError });
 
   // Reconcile machines from any previous run before starting the poll loop
-  await startupReconciliation(config, registry);
+  await refreshRunnerBackendCache();
+  await bootReconciliation.atBoot();
 
   // Run first poll immediately
   await poll(config, registry);
@@ -5324,7 +5294,6 @@ async function main(): Promise<void> {
     console.log(`[main] Received ${signal}, shutting down...`);
     clearInterval(interval);
     restateRegistration.stopRetrying();
-    reviewFixPump.stop();
 
     // forced exit armed before any awaiting, so shutdowns aren't dependent on notifications settling
     setTimeout(() => {

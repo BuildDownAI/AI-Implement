@@ -1,12 +1,12 @@
-// Docker-backed round-trip coverage for the orchestratorTools service (src/restate/tools.ts,
-// AII-710) — a real Restate server (via testcontainers) journals the ingress body and
+// Binary-backed round-trip coverage for the orchestratorTools service (src/restate/tools.ts,
+// AII-710) — a real Restate server (the binary) journals the ingress body and
 // delivers it to our in-process endpoint, proving the role assertion and the discovery
 // metadata work through the real wire, not just against the unit-level fakes in
 // tools.test.ts. Shape mirrors src/__tests__/restate/harness.restate.test.ts exactly.
 //
-// Run with `npm run test:restate` (Docker required); excluded from `npm test`.
+// Run with `npm run test:restate` (binary runtime, no Docker); excluded from `npm test`.
 import * as restate from "@restatedev/restate-sdk";
-import { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { z } from "zod";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { orchestratorTools, tool, setReviewFixAttemptsFacade, type ToolResponse } from "../../restate/tools.js";
@@ -15,7 +15,7 @@ import * as dedup from "../../dedup.js";
 import { initLogTable } from "../../log.js";
 import { initMappingsTable, getMappings } from "../../config.js";
 import { initSettingsTable } from "../../runner-mode.js";
-import { setKgMemoryProvider } from "../../kg-provider.js";
+import { setKgMemoryProvider, type KgToolResult, type MemoryProvider } from "../../kg-provider.js";
 import { VARIANTS, callService, startVariants, stopAll } from "./harness.js";
 
 // A second service, built with tool(), whose only handler throws — proves the wrapper's
@@ -113,7 +113,7 @@ interface ToolCallResult {
 const SYSTEM = { kind: "system", email: null, role: "admin" } as const;
 
 describe("orchestratorTools (Restate)", () => {
-  let environments: Map<string, RestateTestEnvironment>;
+  let environments: Map<string, RestateEnvironment>;
 
   beforeAll(async () => {
     // get_tenant_health reads comment_gapfill_queue via dedup.getDb(); DEDUP_DB_PATH is
@@ -415,6 +415,113 @@ describe("orchestratorTools (Restate)", () => {
     },
   );
 
+  // ---- AII-1223: the other three answers kgTool gives, against a fake MemoryProvider. The
+  // endpoint runs in this process, so the fake's recorded calls are visible to assertions.
+  function fakeKgProvider(
+    answer: KgToolResult,
+    capabilities: Partial<MemoryProvider["capabilities"]> = {},
+  ): { provider: MemoryProvider; calls: Array<{ name: string; args: Record<string, unknown> }> } {
+    const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+    const provider: MemoryProvider = {
+      id: "fake",
+      capabilities: { hybridSearch: true, neighbors: true, path: true, provenance: true, stalenessStamp: true, ...capabilities },
+      listTools: async () => [],
+      proxyCall: () => {
+        throw new Error("proxyCall is not used by the Restate handlers");
+      },
+      callKgTool: async (name, args) => {
+        calls.push({ name, args });
+        return answer;
+      },
+    };
+    return { provider, calls };
+  }
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "kg_hybrid_search passes the provider's answer through, degraded flag included (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const result = { results: [{ id: "n1", score: 0.9 }], degraded: true };
+      const { provider, calls } = fakeKgProvider({ ok: true, result });
+      setKgMemoryProvider(provider);
+      try {
+        const args = { query: "x", limit: 3 };
+        const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "kg_hybrid_search", {
+          caller: SYSTEM,
+          args,
+        });
+        expect(body?.isError).toBeFalsy();
+        expect(JSON.parse(body?.content?.[0]?.text ?? "null")).toEqual(result);
+        expect(calls).toEqual([{ name: "kg_hybrid_search", args }]);
+      } finally {
+        setKgMemoryProvider(null);
+      }
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "kg_semantic_search answers isError without calling a provider that lacks the capability (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      // kg_semantic_search is gated by the hybridSearch capability (KG_TOOL_CAPABILITY).
+      const { provider, calls } = fakeKgProvider({ ok: true, result: { results: [] } }, { hybridSearch: false });
+      setKgMemoryProvider(provider);
+      try {
+        const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "kg_semantic_search", {
+          caller: SYSTEM,
+          args: { query: "x" },
+        });
+        expect(body?.isError).toBe(true);
+        expect(body?.content?.[0]?.text).toBe("Tool not supported by this memory provider: kg_semantic_search");
+        expect(calls).toHaveLength(0);
+      } finally {
+        setKgMemoryProvider(null);
+      }
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "kg_hybrid_search answers isError with the provider's error text on failure (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const { provider } = fakeKgProvider({ ok: false, error: "KG sidecar unavailable: connection refused" });
+      setKgMemoryProvider(provider);
+      try {
+        const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "kg_hybrid_search", {
+          caller: SYSTEM,
+          args: { query: "x" },
+        });
+        expect(body?.isError).toBe(true);
+        expect(body?.content?.[0]?.text).toBe("KG sidecar unavailable: connection refused");
+      } finally {
+        setKgMemoryProvider(null);
+      }
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "kg_hybrid_search with an empty result is not an error (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const { provider } = fakeKgProvider({ ok: true, result: { results: [] } });
+      setKgMemoryProvider(provider);
+      try {
+        const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "kg_hybrid_search", {
+          caller: SYSTEM,
+          args: { query: "nothing matches" },
+        });
+        expect(body?.isError).toBeFalsy();
+        expect(JSON.parse(body?.content?.[0]?.text ?? "null")).toEqual({ results: [] });
+      } finally {
+        setKgMemoryProvider(null);
+      }
+    },
+  );
+
   // ---- AII-713: the six writes, migrated off WRITE_TOOLS in src/mcp.ts onto this same
   // service. Business-logic parity (each action's own status codes and validation) is unit
   // tested in tools.test.ts against a mocked src/admin.ts; what's real-ingress-only here is
@@ -471,7 +578,7 @@ describe("orchestratorTools (Restate)", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
-    "trigger_kg_refresh's discovered schema declares dryRun/acceptNewBaseline booleans, and add_project's reviewers array matches the pre-migration shape (%s)",
+    "trigger_kg_refresh's discovered schema still declares the removed dryRun/acceptNewBaseline booleans (so zod does not strip them), and add_project's reviewers array matches the pre-migration shape (%s)",
     async (label) => {
       const env = environments.get(label);
       if (!env) throw new Error(`environment "${label}" did not start`);
@@ -499,6 +606,25 @@ describe("orchestratorTools (Restate)", () => {
       const reviewersArrayVariant = reviewers?.anyOf?.find((v) => v.items !== undefined);
       expect(reviewersArrayVariant?.items?.required).toEqual(["id", "gates"]);
       expect(reviewersArrayVariant?.items?.properties?.maxTurns).toMatchObject({ type: "integer", minimum: 1, maximum: 200 });
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "trigger_kg_refresh refuses dryRun: true and acceptNewBaseline: true with 400 option-removed before any dispatch (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      for (const option of ["dryRun", "acceptNewBaseline"] as const) {
+        const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "trigger_kg_refresh", {
+          caller: SYSTEM,
+          args: { [option]: true },
+        });
+        // The refusal runs before the deploy-held check, preflight and KgRepo.trigger, so it is
+        // the 400 answer and not the 501/409 a later gate would give.
+        const result = JSON.parse(body?.content?.[0]?.text as string) as { status: number; body: Record<string, unknown> };
+        expect(result.status).toBe(400);
+        expect(result.body).toEqual({ error: "option-removed", option });
+      }
     },
   );
 

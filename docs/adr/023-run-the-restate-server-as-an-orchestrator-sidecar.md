@@ -44,7 +44,7 @@ The operator gate's image boot check measured `restate-server`'s footprint with 
 
 Use the Restate primitive in place of a hand-built one: the idempotency key in place of a consume-once token or a dedup table; object state in place of an in-memory queue; a durable promise in place of a status poll; a journaled step in place of a state-machine row.
 
-**Scope.** This is the rule for run kinds that are fully on Restate. Today those are the MCP tools service (ADR 025) and kg-refresh (AII-682). The review-fix pilot keeps its SQLite inbox and delivery pump while a Legacy owner runs beside it (ADR 031). The main pipeline adopts the rule when it migrates; until then its routes do not change.
+**Scope.** This is the rule for run kinds that are fully on Restate. Today those are the MCP tools service (ADR 025) and kg-refresh (AII-682). The review-fix pilot kept a SQLite inbox and delivery pump while a Legacy owner ran beside it (ADR 031). *Amended 2026-10-10: both were retired by AII-1187; the pilot now reaches Restate through the ingress client alone.* The main pipeline adopts the rule when it migrates; until then its routes do not change.
 
 **A webhook may be the only trigger** when the sender retries (the runner does) or when a lost event is visible and recoverable (a required check that stays pending, a poll detector). Otherwise the run kind keeps a poll backstop.
 

@@ -2,7 +2,6 @@
 // here only — it is never registered in src/restate/endpoint.ts — and its journaled steps
 // run the real production control flow (src/pipeline/feedback-loop-core.ts) with injected
 // fake effects. No live callback, credential, or model call is involved.
-import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import * as restate from "@restatedev/restate-sdk";
 import type { WorkflowContext } from "@restatedev/restate-sdk";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -15,7 +14,7 @@ import {
   type LoopReviewResult,
 } from "../../pipeline/feedback-loop-core.js";
 import type { RunTelemetry } from "../../pipeline/types.js";
-import { VARIANTS, attachWorkflow, callWorkflow, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, attachWorkflow, callWorkflow, startVariants, stopAll, type RestateEnvironment } from "./harness.js";
 
 const WORKFLOW = "FeedbackLoopTest";
 
@@ -108,7 +107,7 @@ const workflow = restate.workflow({
 });
 
 describe("feedback-loop core as a Restate workflow", () => {
-  let environments: Map<string, RestateTestEnvironment>;
+  let environments: Map<string, RestateEnvironment>;
   beforeAll(async () => { environments = await startVariants([workflow]); }, 60_000);
   afterAll(async () => { if (environments) await stopAll(environments); });
 

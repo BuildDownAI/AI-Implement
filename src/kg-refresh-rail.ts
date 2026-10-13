@@ -13,7 +13,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { getScopedInstallationToken } from "./github-app-auth.js";
 import {
-  fetchRepoTarball, mergePullRequest, closePullRequest, postPrComment, deleteBranch,
+  fetchRepoTarball, mergePullRequest, closePullRequest, getPullRequestState, postPrComment, deleteBranch,
   postOrUpdateStickyComment, setCommitStatus,
 } from "./github.js";
 import { extractSource, parseKgSourceRepo } from "./deploy.js";
@@ -61,6 +61,7 @@ export interface KgRailDeps {
   loadSnapshotSha: () => string | null;
   mergePullRequestFn: typeof mergePullRequest;
   closePullRequestFn: typeof closePullRequest;
+  getPullRequestStateFn: typeof getPullRequestState;
   deleteBranchFn: typeof deleteBranch;
   postPrCommentFn: typeof postPrComment;
   postOrUpdateStickyCommentFn: typeof postOrUpdateStickyComment;
@@ -420,13 +421,44 @@ export async function closeSnapshotPr(
     permissions: { contents: "write", pull_requests: "write" },
     repositories: [repoName],
   });
+  // Close first: a real failure throws before any comment, so the capped step's retries cannot repost it; the comment below is best effort for the same reason.
+  try {
+    await deps.closePullRequestFn(token, owner, repoName, prNumber);
+    console.log(`[kg-refresh] closed snapshot PR #${prNumber} (gate=${gate})`);
+  } catch (err) {
+    // Only a PR a person already merged or closed is "done"; any other failure must throw so the step retries.
+    const state = await deps.getPullRequestStateFn(token, owner, repoName, prNumber).catch(() => null);
+    if (!state || state.state === "open") throw err;
+    console.warn(`[kg-refresh] snapshot PR #${prNumber} already ${state.merged ? "merged" : "closed"}: ${String(err)}`);
+  }
+  // The PR is closed by now, so a comment failure must not throw: the capped step's retry would repost it.
+  try {
+    await deps.postPrCommentFn(
+      token, owner, repoName, prNumber,
+      `AI-Implement: closing this refresh PR — the run failed (\`${gate}\`). The default branch was left untouched.`,
+    );
+  } catch (err) {
+    console.warn(`[kg-refresh] could not comment on closed snapshot PR #${prNumber}: ${String(err)}`);
+  }
+  if (branch) await deleteSnapshotBranch(deps, owner, repoName, branch);
+}
+
+/** Notes on the held snapshot PR who accepted the shrink, before it merges. Throws on failure so the step retries. */
+export async function postBaselineAcceptNote(
+  deps: KgRailDeps,
+  owner: string,
+  repoName: string,
+  prNumber: number,
+  actor: string,
+): Promise<void> {
+  const { token } = await deps.mintToken(deps.githubAppId, deps.githubAppPrivateKey, owner, {
+    permissions: { contents: "write", pull_requests: "write" },
+    repositories: [repoName],
+  });
   await deps.postPrCommentFn(
     token, owner, repoName, prNumber,
-    `AI-Implement: closing this refresh PR — the run failed (\`${gate}\`). The default branch was left untouched.`,
+    `### Baseline\n\nThe new baseline was accepted by ${actor}. Merging this snapshot.`,
   );
-  await deps.closePullRequestFn(token, owner, repoName, prNumber);
-  console.log(`[kg-refresh] closed snapshot PR #${prNumber} (gate=${gate})`);
-  if (branch) await deleteSnapshotBranch(deps, owner, repoName, branch);
 }
 
 /** Renders the per-part {part, prev, new} rows as a markdown table, or a placeholder when absent. */
@@ -443,14 +475,10 @@ function isDryRunRefusal(outcome: RefreshOutcome): boolean {
 
 /** Builds the sticky comment body for a dry-run outcome. */
 function buildDryRunCommentBody(report: KgDryRunReportTarget, outcome: RefreshOutcome): string {
-  const acceptedByLabel = isDryRunRefusal(outcome) && report.acceptBaseline === true;
-  const verdict = acceptedByLabel
-    ? `refused, accepted by label \`accept-baseline\` — ${outcome.detail}`
-    : outcome.detail;
-  const note = acceptedByLabel
-    ? "\n\n_The label only changes what this check reports — a real refresh still refuses this shrink unless an admin accepts the new baseline at refresh time._"
+  const note = isDryRunRefusal(outcome)
+    ? "\n\nA shrink is accepted at the decision gate of the refresh that runs after this PR merges."
     : "";
-  return `${KG_DRY_RUN_COMMENT_MARKER} — ${report.sha}\n\n${verdict}\n\n${renderPartTable(outcome.partTable)}${note}`;
+  return `${KG_DRY_RUN_COMMENT_MARKER} — ${report.sha}\n\n${outcome.detail}\n\n${renderPartTable(outcome.partTable)}${note}`;
 }
 
 /**
@@ -486,8 +514,7 @@ export async function postDryRunReport(
     console.error(`[kg-refresh] failed to post dry-run comment on ${report.repo}#${report.prNumber}: ${String(err)}`);
   }
 
-  const acceptedByLabel = isDryRunRefusal(outcome) && report.acceptBaseline === true;
-  const statusOk = outcome.ok || acceptedByLabel;
+  const statusOk = outcome.ok;
   try {
     const { token: statusToken } = await deps.mintToken(deps.githubAppId, deps.githubAppPrivateKey, owner, {
       permissions: { statuses: "write" },

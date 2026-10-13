@@ -201,7 +201,8 @@ describe("stampJobApproved", () => {
 
   it("clears machine_nonce so the row is not exempt from the retention sweep", () => {
     const id = log.appendLog({ issueId: "sa3", issueIdentifier: "AII-202", executionMode: "github-actions" });
-    log.updateJobMachineDetails(id, { machineNonce: "nonce-abc", machineId: "m1" });
+    log.setJobMachineNonce(id, "nonce-abc");
+    log.setJobMachineId(id, "m1");
     expect(log.getJobById(id)?.machineNonce).toBe("nonce-abc");
     log.stampJobApproved(id, "https://github.com/o/r/pull/3");
     expect(log.getJobById(id)?.machineNonce).toBeNull();
@@ -339,7 +340,6 @@ describe("appendLog retains pilot-correlated rows beyond MAX_LOG_ENTRIES (AII-79
     const old = Date.now() - SEVEN_DAYS_MS - 1_000;
     const cases = [
       { name: "reservation", prNumber: 51 },
-      { name: "delivery", prNumber: 52 },
       { name: "conflict", prNumber: 53 },
       { name: "execution", prNumber: 54 },
     ];
@@ -359,11 +359,6 @@ describe("appendLog retains pilot-correlated rows beyond MAX_LOG_ENTRIES (AII-79
        pr_number, lifecycle_owner, phase, backend, created_at)
       VALUES ('dispatch-reservation', 'APP', 'pr', 'issue-reservation', '7', 'acme/app',
               51, 'restate', 'implementation', 'github-actions', 10)`).run();
-    db.prepare(`INSERT INTO review_fix_inbox
-      (authenticated_source, event_id, installation_id, repository, pr_number,
-       kind, payload_json, payload_hash, accepted_at, delivery_state)
-      VALUES ('github-webhook', 'event-delivery', '7', 'acme/app', 52,
-              'feedback', '{}', 'hash', 10, 'pending')`).run();
 
     floodWithUnrelatedJobs(501);
     for (const id of ids) expect(log.getJobById(id)).not.toBeNull();

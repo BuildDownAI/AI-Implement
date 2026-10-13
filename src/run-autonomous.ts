@@ -60,6 +60,7 @@ import { parsePlanningBlock } from "./planning-block.js";
 import type { LocalRunTokenSummary } from "./local/run-result.js";
 import { prepareScratchExclusionIfGit } from "./pipeline/scratch-exclude.js";
 import type { ReferenceRepo, ReferenceRepoResult } from "./reference-repos.js";
+import type { ReviewProcessId } from "./review-process.js";
 import { DEFAULT_REVIEWER_SELECTION, type ReviewerSelection } from "./config.js";
 import { resolveTrustedReviewer, type ReviewerDefinition } from "./pipeline/reviewers/registry.js";
 import {
@@ -427,6 +428,8 @@ export interface ResolvedRunnerInputs {
   dependencyTokenScope: "installation" | undefined;
   referenceRepos: ReferenceRepo[] | undefined;
   reviewers: ReviewerSelection[];
+  reviewProcess: ReviewProcessId;
+  trustedReviewAuthors: string[];
   baseBranch: string | undefined;
   profiles: string[];
   assigneeName: string | undefined;
@@ -641,6 +644,8 @@ function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRun
     dependencyTokenScope: cfg.dependencyTokenScope,
     referenceRepos: cfg.referenceRepos,
     reviewers: validReviewerSelectionArray(cfg.reviewers) ? cfg.reviewers : DEFAULT_REVIEWER_SELECTION,
+    reviewProcess: cfg.reviewProcess ?? "ai-implement",
+    trustedReviewAuthors: cfg.trustedReviewAuthors ?? [],
     baseBranch: cfg.baseBranch,
     profiles: cfg.profiles
       ? cfg.profiles
@@ -726,6 +731,8 @@ export function resolveRunnerInputs(env: NodeJS.ProcessEnv): ResolvedRunnerInput
     dependencyTokenScope,
     referenceRepos,
     reviewers,
+    reviewProcess: "ai-implement",
+    trustedReviewAuthors: [],
     baseBranch: undefined,
     profiles,
     assigneeName,
@@ -1152,6 +1159,8 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     dependencyTokenScope,
     referenceRepos,
     reviewers,
+    reviewProcess,
+    trustedReviewAuthors,
     baseBranch,
     profiles,
     assigneeName,
@@ -1276,6 +1285,8 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       dependencyTokenScope,
       referenceRepos,
       reviewers,
+      reviewProcess,
+      trustedReviewAuthors,
       trustedReviewerDefinitions,
       profiles,
       assigneeName,
@@ -1484,6 +1495,12 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       : postPushReviewRejected
         ? "post_push_review_unapproved"
         : "unknown";
+    const externalReviewPendingHeadSha =
+      terminationReason === "external_review_pending" &&
+      typeof authoritativeReviewOutputs.reviewedHeadSha === "string" &&
+      authoritativeReviewOutputs.reviewedHeadSha
+        ? authoritativeReviewOutputs.reviewedHeadSha
+        : undefined;
     const iterations = typeof authoritativeReviewOutputs.iterations === "number"
       ? authoritativeReviewOutputs.iterations
       : 0;
@@ -1575,6 +1592,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       prUrl,
       referenceRepoResults,
       findingDispositions,
+      ...(externalReviewPendingHeadSha ? { externalReviewPending: { headSha: externalReviewPendingHeadSha } } : {}),
       callbackUrl,
       retryPolicy,
       fetchImpl: opts.fetchImpl,

@@ -333,6 +333,8 @@ function buildLaunchInputs(
       ? { sensitiveFiles: { add: mapping.sensitiveAddPatterns ?? undefined, allow: mapping.sensitiveAllowPatterns ?? undefined } }
       : {}),
     ...(mapping.reviewers != null ? { reviewers: mapping.reviewers } : {}),
+    ...(mapping.reviewProcess != null ? { reviewProcess: mapping.reviewProcess } : {}),
+    ...(mapping.trustedReviewAuthors != null ? { trustedReviewAuthors: mapping.trustedReviewAuthors } : {}),
     ...(mapping.dependencyTokenScope != null ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
   };
 
@@ -477,6 +479,11 @@ export interface GithubReviewFixWorkerDeps {
   /** True when this work must travel over protected (private-envelope) transport and may never
    *  fall back to legacy top-level credentials. No review-fix work requires it today. */
   requiresProtectedTransport?: (plan: WorkerLaunchPlan) => boolean;
+  /** Orchestrator callback base URL, carried in the run envelope (not a secret). */
+  runnerCallbackUrl?: string;
+  /** Resolves the `runner_image` workflow input for the target repo, as the implementation
+   *  dispatch does. `undefined` leaves the workflow's own image resolution in place. */
+  runnerImage?: (target: { owner: string; repo: string; token: string }) => Promise<string | undefined>;
 }
 
 export class GithubReviewFixWorker implements ReviewFixWorkerPort {
@@ -486,6 +493,8 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
   private readonly callbackInputs?: GithubReviewFixWorkerDeps["callbackInputs"];
   private readonly resolveCapabilities: NonNullable<GithubReviewFixWorkerDeps["resolveCapabilities"]>;
   private readonly requiresProtectedTransport?: GithubReviewFixWorkerDeps["requiresProtectedTransport"];
+  private readonly runnerCallbackUrl?: string;
+  private readonly runnerImage?: GithubReviewFixWorkerDeps["runnerImage"];
 
   constructor(deps: GithubReviewFixWorkerDeps) {
     this.credentials = deps.credentials;
@@ -494,6 +503,8 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
     this.callbackInputs = deps.callbackInputs;
     this.resolveCapabilities = deps.resolveCapabilities ?? resolveWorkflowCapabilities;
     this.requiresProtectedTransport = deps.requiresProtectedTransport;
+    this.runnerCallbackUrl = deps.runnerCallbackUrl;
+    this.runnerImage = deps.runnerImage;
   }
 
   private async remember(attemptId: AttemptId, scope: ScopedPrIdentity, execution?: WorkerExecutionIdentity): Promise<void> {
@@ -556,12 +567,21 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
           : { ...buildLaunchInputs(plan, mapping, runner_callback_url), run_token, run_progress_token, run_publication_token };
       } else {
         if (this.requiresProtectedTransport?.(plan)) return { status: "unknown" };
-        inputs = buildLaunchInputs(plan, mapping);
+        inputs = buildLaunchInputs(plan, mapping, this.runnerCallbackUrl);
       }
     } catch {
       // A missing/expired prepared credential is not proof that an earlier
       // dispatch did not happen. The workflow reconciles under its launch intent.
       return { status: "unknown" };
+    }
+    if (this.runnerImage) {
+      try {
+        const runnerImage = await this.runnerImage({ owner: mapping.owner, repo: mapping.repo, token: credential.token });
+        if (runnerImage !== undefined) inputs = { ...inputs, runner_image: runnerImage };
+      } catch (err) {
+        console.warn(`[review-fix] Runner image resolution failed for ${mapping.owner}/${mapping.repo}; `
+          + `launching without runner_image: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
     // Backstop: the outer envelope silently truncates oversized descriptions, so prove the
     // encoded payload still carries the admitted task text in both fields before any dispatch.

@@ -7,18 +7,18 @@ import { createProductionReviewFixServices } from "../restate/review-fix-product
 // only catches it in endpoint.restate.test.ts — this is the fast, no-Docker half of that
 // same regression.
 describe("RESTATE_SERVICES", () => {
-  it("names exactly Operator and orchestratorTools", () => {
-    expect(RESTATE_SERVICES.map((service) => service.name)).toEqual(["Operator", "orchestratorTools"]);
+  it("names exactly Operator, orchestratorTools and RunnerBackend", () => {
+    expect(RESTATE_SERVICES.map((service) => service.name)).toEqual(["Operator", "orchestratorTools", "RunnerBackend"]);
   });
 });
 
 describe("production review-fix services", () => {
   it("composes both durable services beside the operator and tool endpoint", () => {
     const services = createProductionReviewFixServices({ githubAppId: "test", githubAppPrivateKey: "test",
-      runnerCallbackBaseUrl: null, runnerTokenSecret: null },
+      runnerCallbackBaseUrl: null, runnerTokenSecret: null, sessionImage: "ghcr.io/x/runner:latest", runnerImageExplicit: false },
       { forMapping: async () => null } as never);
     expect([...RESTATE_SERVICES, ...services].map((service) => service.name)).toEqual([
-      "Operator", "orchestratorTools", "ReviewFixPR", "ReviewFixAttempt",
+      "Operator", "orchestratorTools", "RunnerBackend", "ReviewFixPR", "ReviewFixAttempt",
     ]);
   });
 });

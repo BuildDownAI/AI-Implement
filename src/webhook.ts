@@ -4,8 +4,11 @@ import { listLog, getLatestDispatchForPr } from "./log.js";
 import { enqueueReconciliation, hasReconciliationForPr } from "./reconciliation.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { acceptReviewFixWebhookEvent } from "./review-fix-queue.js";
-import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, extractClaudeSummaryFindings, type ReviewLedgerFinding } from "./pipeline/review-ledger.js";
-import { getMappings } from "./config.js";
+import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, classifyReviewIssueComment, type ReviewLedgerFinding } from "./pipeline/review-ledger.js";
+import { getMappings, resolveReviewFixLifecycle } from "./config.js";
+import type { ReviewFixIngressClient } from "./restate/review-fix-client.js";
+import { REVIEW_FIX_EVENT_BODY_MAX_BYTES, type ReviewFixFeedbackEvent } from "./restate/review-fix-pr.js";
+import { classifyClaudeInlineMarker, isTrustedReviewAuthor, resolveReviewProcess } from "./review-process.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { resolveWorkflowContract } from "./workflow-probe.js";
 import { enqueueCommentGapfill } from "./comment-gapfill-queue.js";
@@ -46,10 +49,7 @@ interface PullRequestPayload {
     html_url?: string;
     head?: { ref?: string; sha?: string };
     merge_commit_sha?: string;
-    labels?: Array<{ name?: string }>;
   };
-  /** The single label added or removed by a `labeled`/`unlabeled` action — distinct from `pull_request.labels`, the cumulative list. */
-  label?: { name?: string };
   repository?: {
     full_name?: string;
   };
@@ -77,8 +77,6 @@ export interface KgPrCheckConfig {
     | { status: "conflict" }
     | { status: "unavailable" }
   >;
-  /** Returns whether it actually posted — false on a silent no-op (AII-636). */
-  reportDryRun: (report: KgDryRunReportTarget) => Promise<"reported" | "no-outcome" | "unavailable">;
   /** Evicts the `KgRepo` object's stored dry-run outcome for `repo`#`prNumber` (AII-636), on `closed`. */
   forgetKgPr?: (repo: string, prNumber: number) => void | Promise<void>;
 }
@@ -87,23 +85,17 @@ export interface KgPrCheckConfig {
 const KG_GUARD_PATH_PATTERNS: RegExp[] = [/^kg_ingest\//, /^sources\.yml$/, /^ontology\//, /^snapshot\//];
 /** Head branch names that indicate an upstream merge, guard-relevant regardless of changed files. */
 const KG_GUARD_BRANCH_PATTERNS: RegExp[] = [/^kg-upstream\//, /^sync\/upstream-/];
-const KG_ACCEPT_BASELINE_LABEL = "accept-baseline";
 
 function matchesKgGuard(files: string[], headRef: string): boolean {
   if (KG_GUARD_BRANCH_PATTERNS.some((re) => re.test(headRef))) return true;
   return files.some((f) => KG_GUARD_PATH_PATTERNS.some((re) => re.test(f)));
 }
 
-function hasAcceptBaselineLabel(payload: PullRequestPayload): boolean {
-  return (payload.pull_request?.labels ?? []).some((l) => l.name === KG_ACCEPT_BASELINE_LABEL);
-}
-
 /**
  * Evicts the `KgRepo` object's stored dry-run outcome and held head for `repo`#`prNumber`
  * when `kgPrCheck.forgetKgPr` is wired (AII-636, AII-977); a rejection is logged, not thrown.
- * Called on `pull_request` `closed` — a
- * closed PR can never legitimately receive another `labeled` re-report, so there is
- * no reason to wait for the MAX_TRACKED_PRS cap to evict it.
+ * Called on `pull_request` `closed` — a closed PR's stored outcome and held head are
+ * not needed, so they are not left to wait for the MAX_TRACKED_PRS cap.
  */
 function forgetKgPr(kgPrCheck: KgPrCheckConfig | undefined, repoFullName: string, prNumber: number): void {
   Promise.resolve(kgPrCheck?.forgetKgPr?.(repoFullName, prNumber)).catch((err) => {
@@ -125,12 +117,7 @@ async function handleKgPrCheckWebhook(
   deliveryId?: string,
 ): Promise<boolean> {
   if (!kgPrCheck) return false;
-  if (
-    payload.action !== "opened" &&
-    payload.action !== "synchronize" &&
-    payload.action !== "labeled" &&
-    payload.action !== "unlabeled"
-  ) {
+  if (payload.action !== "opened" && payload.action !== "synchronize") {
     return false;
   }
 
@@ -143,7 +130,7 @@ async function handleKgPrCheckWebhook(
   const headRef = payload.pull_request?.head?.ref;
 
   // AII-639: this check owns the HTTP response only for events nothing else handles
-  // (`opened`, `labeled`, `unlabeled`). On `synchronize` it runs as a side effect and returns false,
+  // (`opened`). On `synchronize` it runs as a side effect and returns false,
   // so the existing pull_request handling (gap-fill matching via findMatchingDispatch,
   // merge reconciliation) still runs for the KG repos — they are ordinary onboarded
   // projects too. Outcomes on `synchronize` go to the log instead of the response.
@@ -157,43 +144,6 @@ async function handleKgPrCheckWebhook(
     }
     return owns;
   };
-
-  if (payload.action === "labeled" || payload.action === "unlabeled") {
-    // Only the accept-baseline label re-reports anything — any other label on any
-    // other PR must never touch the check (AII-636: a stray label on an unrelated
-    // PR previously re-posted whatever the process had last computed, for any PR).
-    if (payload.label?.name !== KG_ACCEPT_BASELINE_LABEL) {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ignored: true, reason: "not_accept_baseline_label" }));
-      return true;
-    }
-    // Re-report the last computed verdict for this PR — never re-runs the rail.
-    // reportDryRun() itself is scoped to (and no-ops outside of) this PR's own
-    // stored outcome, so this can never surface another PR's verdict.
-    const posted = await kgPrCheck.reportDryRun({
-      repo: repoFullName,
-      prNumber,
-      sha: sha ?? "",
-      // `unlabeled` forces acceptBaseline:false regardless of what the payload's
-      // (now-stale) `labels` array might say (AII-640) — removing the label must
-      // always revert the comment/status to plain-refusal wording, not depend on
-      // GitHub having already dropped it from `pull_request.labels` by delivery time.
-      acceptBaseline: payload.action === "labeled" ? hasAcceptBaselineLabel(payload) : false,
-    });
-    if (posted === "unavailable") {
-      // 503 so GitHub redelivers: the outcome store was unreachable, not empty.
-      res.writeHead(503, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "restate-unavailable" }));
-      return true;
-    }
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      posted === "reported"
-        ? JSON.stringify({ reported: true })
-        : JSON.stringify({ ignored: true, reason: "no_dry_run_outcome" }),
-    );
-    return true;
-  }
 
   if (!sha || !headRef) {
     return answer(200, { ignored: true, reason: "missing_pr_fields" }, "missing PR fields");
@@ -236,7 +186,6 @@ async function handleKgPrCheckWebhook(
     repo: repoFullName,
     prNumber,
     sha,
-    acceptBaseline: hasAcceptBaselineLabel(payload),
   };
 
   const result = await kgPrCheck
@@ -272,6 +221,7 @@ async function handleKgPrCheckWebhook(
 
 interface ReviewPayload {
   action?: string;
+  installation?: { id?: number };
   review?: {
     id?: number;
     state?: string;
@@ -293,6 +243,7 @@ interface ReviewPayload {
 
 interface ReviewCommentPayload {
   action?: string;
+  installation?: { id?: number };
   comment?: {
     id?: number;
     body?: string;
@@ -316,6 +267,7 @@ interface ReviewCommentPayload {
 
 interface IssueCommentPayload {
   action?: string;
+  installation?: { id?: number };
   comment?: {
     id?: number;
     body?: string;
@@ -337,14 +289,6 @@ interface PushPayload {
   ref?: string;
   repository?: { full_name?: string };
 }
-
-const TRUSTED_REVIEW_COMMENT_AUTHORS = new Set([
-  "ai-implement",
-  "ai-implement[bot]",
-  "claude",
-  "claude[bot]",
-  "claude-code[bot]",
-]);
 
 /**
  * Finds a dispatch log entry that matches the merged PR.
@@ -391,6 +335,7 @@ export async function handleGitHubWebhook(
   selfDeploy?: SelfDeployTarget,
   kgPrCheck?: KgPrCheckConfig,
   onReviewFixPrClosed?: (repository: string, prNumber: number) => void | Promise<void>,
+  reviewFixIngress?: ReviewFixIngressClient,
 ): Promise<void> {
   const body = await readRawBody(req);
   const signature = req.headers["x-hub-signature-256"] as string | undefined;
@@ -414,17 +359,17 @@ export async function handleGitHubWebhook(
   }
 
   if (event === "pull_request_review") {
-    handleReviewWebhook(payload as ReviewPayload, res, deliveryId);
+    await handleReviewWebhook(payload as ReviewPayload, res, deliveryId, reviewFixIngress);
     return;
   }
 
   if (event === "pull_request_review_comment") {
-    handleReviewCommentWebhook(payload as ReviewCommentPayload, res, deliveryId);
+    await handleReviewCommentWebhook(payload as ReviewCommentPayload, res, deliveryId, reviewFixIngress);
     return;
   }
 
   if (event === "issue_comment") {
-    await handleIssueCommentWebhook(payload as IssueCommentPayload, res, appId, privateKey, deliveryId);
+    await handleIssueCommentWebhook(payload as IssueCommentPayload, res, appId, privateKey, deliveryId, reviewFixIngress);
     return;
   }
 
@@ -439,13 +384,8 @@ export async function handleGitHubWebhook(
     return;
   }
 
-  if (
-    payload.action === "opened" ||
-    payload.action === "synchronize" ||
-    payload.action === "labeled" ||
-    payload.action === "unlabeled"
-  ) {
-    // The KG PR check owns `opened`, `labeled`, and `unlabeled` responses; on `synchronize`
+  if (payload.action === "opened" || payload.action === "synchronize") {
+    // The KG PR check owns the `opened` response; on `synchronize`
     // it runs as a side effect and returns false so handlePullRequestSynchronize below
     // still runs (AII-639).
     const handled = await handleKgPrCheckWebhook(payload, res, kgPrCheck, deliveryId);
@@ -459,16 +399,23 @@ export async function handleGitHubWebhook(
 
   if (payload.action === "closed") {
     // Evict this PR's KG PR-check state regardless of merged status — a closed PR
-    // (merged or not) can never legitimately receive another `labeled` re-report, and
-    // holding its entry until the MAX_TRACKED_PRS cap evicts it naturally only widens
-    // the window a stray `labeled` redelivery could exploit (AII-636).
+    // (merged or not) has no use for its stored outcome, so it is not held until the
+    // MAX_TRACKED_PRS cap evicts it (AII-636).
     const kgRepoFullName = payload.repository?.full_name;
     const kgPrNumber = payload.pull_request?.number;
     if (kgRepoFullName && kgPrNumber && (kgRepoFullName === kgPrCheck?.kgSourceRepo || kgRepoFullName === kgPrCheck?.kgBaseRepo)) {
       forgetKgPr(kgPrCheck, kgRepoFullName, kgPrNumber);
     }
     if (kgRepoFullName && kgPrNumber && onReviewFixPrClosed) {
-      await onReviewFixPrClosed(kgRepoFullName, kgPrNumber);
+      try {
+        await onReviewFixPrClosed(kgRepoFullName, kgPrNumber);
+      } catch (err) {
+        // Authority is already revoked; the cancel forward did not land. 503 makes GitHub redeliver (AII-1178).
+        console.warn(`[webhook] review-fix cancellation for ${kgRepoFullName}#${kgPrNumber} unavailable:`, err);
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Review-fix cancellation unavailable" }));
+        return;
+      }
     }
   }
 
@@ -522,7 +469,67 @@ export async function handleGitHubWebhook(
   res.end(JSON.stringify({ queued: true, reconciliationId }));
 }
 
-function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse, deliveryId: string | undefined): void {
+/** The review process and the project's extra authors for a repository; an unmapped repository gets the defaults. */
+function resolveRepoReviewProcess(repoFullName: string) {
+  const mapping = Object.values(getMappings()).find((m) => `${m.owner}/${m.repo}` === repoFullName);
+  return {
+    restate: mapping !== undefined && resolveReviewFixLifecycle(mapping) === "restate",
+    process: resolveReviewProcess(mapping?.reviewProcess),
+    extraAuthors: mapping?.trustedReviewAuthors ?? [],
+  };
+}
+
+/** Cuts `text` to at most `maxBytes` UTF-8 bytes without splitting a code point. */
+function truncateUtf8(text: string, maxBytes: number): string {
+  const bytes = Buffer.from(text, "utf8");
+  if (bytes.length <= maxBytes) return text;
+  let end = maxBytes;
+  while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end--;
+  return bytes.subarray(0, end).toString("utf8");
+}
+
+/**
+ * Restate lifecycle (AII-1184): forwards the validated event to `ReviewFixPR.feedback` with the GitHub
+ * delivery id as the idempotency key, and writes nothing to SQLite. 503 on an unreachable ingress leaves the
+ * failed delivery for GitHub to redeliver (AII-1178) under the same id.
+ */
+async function forwardReviewFixEvent(
+  res: http.ServerResponse,
+  ingress: ReviewFixIngressClient | undefined,
+  input: Omit<ReviewFixFeedbackEvent, "deliveryId">,
+  deliveryId: string | undefined,
+  installationId: number | undefined,
+): Promise<void> {
+  const send = (status: number, body: unknown) => {
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(body));
+  };
+  if (!deliveryId) return send(400, { error: "missing_delivery_id" });
+  if (!installationId) return send(400, { error: "missing_installation" });
+  const event: ReviewFixFeedbackEvent = {
+    ...input,
+    reason: truncateUtf8(input.reason, REVIEW_FIX_EVENT_BODY_MAX_BYTES),
+    deliveryId,
+    ...(input.findings
+      ? { findings: input.findings.map((f) => ({ ...f, body: truncateUtf8(f.body, REVIEW_FIX_EVENT_BODY_MAX_BYTES) })) }
+      : {}),
+  };
+  const scope = { installationId, repository: input.repo, prNumber: input.prNumber };
+  const outcome = ingress ? await ingress.feedback(scope, event, { idempotencyKey: deliveryId }) : { status: "unavailable" as const };
+  if (outcome.status === "accepted") {
+    console.log(`[webhook] review event ${deliveryId} forwarded to ReviewFixPR ${JSON.stringify([installationId, input.repo, input.prNumber])}`);
+    return send(202, { forwarded: true });
+  }
+  console.warn(`[webhook] restate_unavailable: review event ${deliveryId} for ${input.repo}#${input.prNumber} not forwarded`);
+  send(503, { error: "restate_unavailable" });
+}
+
+async function handleReviewWebhook(
+  payload: ReviewPayload,
+  res: http.ServerResponse,
+  deliveryId: string | undefined,
+  ingress?: ReviewFixIngressClient,
+): Promise<void> {
   if (payload.action !== "submitted" || payload.review?.state?.toUpperCase() !== "CHANGES_REQUESTED") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
@@ -553,6 +560,17 @@ function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse, d
     return;
   }
 
+  // A bot review counts only from a trusted author of the project's review process; humans always pass (ADR 027).
+  const reviewProcess = resolveRepoReviewProcess(repoFullName);
+  if (
+    payload.review?.user?.type === "Bot" &&
+    !isTrustedReviewAuthor(payload.review.user.login ?? "", reviewProcess.process, reviewProcess.extraAuthors)
+  ) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "untrusted_author" }));
+    return;
+  }
+
   const [reviewOwner, reviewRepo] = repoFullName.split("/");
   const eventAt = parseEventTimestamp(payload.review?.submitted_at);
   const gate = shouldEnqueueReviewEvent({
@@ -576,7 +594,7 @@ function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse, d
     body,
     ...(payload.review?.html_url ? { url: payload.review.html_url } : {}),
   };
-  const outcome = acceptReviewFixWebhookEvent({
+  const input = {
     eventId: resolveReviewFixEventId(deliveryId, {
       repo: repoFullName,
       prNumber,
@@ -595,7 +613,12 @@ function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse, d
     sourceUrl: payload.review?.html_url,
     actor: payload.review?.user?.login,
     findings: [finding],
-  });
+  };
+  if (reviewProcess.restate) {
+    await forwardReviewFixEvent(res, ingress, input, deliveryId, payload.installation?.id);
+    return;
+  }
+  const outcome = acceptReviewFixWebhookEvent(input);
 
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({
@@ -606,7 +629,12 @@ function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse, d
   }));
 }
 
-function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.ServerResponse, deliveryId: string | undefined): void {
+async function handleReviewCommentWebhook(
+  payload: ReviewCommentPayload,
+  res: http.ServerResponse,
+  deliveryId: string | undefined,
+  ingress?: ReviewFixIngressClient,
+): Promise<void> {
   if (payload.action !== "created") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
@@ -648,6 +676,26 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
     return;
   }
 
+  // Marker severity is a `claude-code-review` rule: the internal reviewers emit the ADR 020 block. Humans stay
+  // `medium`; an unlisted bot is ignored under every process.
+  const reviewProcess = resolveRepoReviewProcess(repoFullName);
+  let severity: ReviewLedgerFinding["severity"] = "medium";
+  const isBotAuthor = payload.comment?.user?.type === "Bot";
+  if (isBotAuthor && !isTrustedReviewAuthor(payload.comment?.user?.login ?? "", reviewProcess.process, reviewProcess.extraAuthors)) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "untrusted_author" }));
+    return;
+  }
+  if (reviewProcess.process.claudeInlineMarkers && isBotAuthor) {
+    const marker = classifyClaudeInlineMarker(body);
+    if (marker === null) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ignored: true, reason: "pre_existing" }));
+      return;
+    }
+    severity = marker === "blocking" ? "blocking" : "minor";
+  }
+
   const line = typeof payload.comment?.line === "number"
     ? payload.comment.line
     : typeof payload.comment?.original_line === "number"
@@ -660,13 +708,13 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
   // feedback flowing to the fixer without overriding an approving reviewer.
   const finding: ReviewLedgerFinding = {
     source: "github-review-thread",
-    severity: "medium",
+    severity,
     body,
     ...(payload.comment?.path ? { path: payload.comment.path } : {}),
     ...(typeof line === "number" ? { line } : {}),
     ...(payload.comment?.html_url ? { url: payload.comment.html_url } : {}),
   };
-  const outcome = acceptReviewFixWebhookEvent({
+  const input = {
     eventId: resolveReviewFixEventId(deliveryId, {
       repo: repoFullName,
       prNumber,
@@ -687,7 +735,12 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
     sourceUrl: payload.comment?.html_url,
     actor: payload.comment?.user?.login,
     findings: [finding],
-  });
+  };
+  if (reviewProcess.restate) {
+    await forwardReviewFixEvent(res, ingress, input, deliveryId, payload.installation?.id);
+    return;
+  }
+  const outcome = acceptReviewFixWebhookEvent(input);
 
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({
@@ -796,6 +849,7 @@ async function handleIssueCommentWebhook(
   appId?: string,
   privateKey?: string,
   deliveryId?: string,
+  ingress?: ReviewFixIngressClient,
 ): Promise<void> {
   if (payload.action !== "created") {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -888,8 +942,11 @@ async function handleIssueCommentWebhook(
     return;
   }
 
-  const login = payload.comment?.user?.login?.toLowerCase() ?? "";
-  if (!TRUSTED_REVIEW_COMMENT_AUTHORS.has(login)) {
+  const classified = classifyReviewIssueComment(
+    (payload.comment ?? {}) as Record<string, unknown>,
+    resolveRepoReviewProcess(payload.repository?.full_name ?? ""),
+  );
+  if (classified === null) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
     return;
@@ -905,10 +962,21 @@ async function handleIssueCommentWebhook(
     return;
   }
 
-  const findings = extractClaudeSummaryFindings(body, payload.comment?.html_url);
-  if (findings.length === 0) {
+  // A broken/unclosed block flags findingsUnavailable directly; a well-formed block whose
+  // reviewer explicitly gave up (`verdict: "incomplete"`, no findings) parses cleanly but
+  // carries the same "nothing actionable, and not an approval" signal.
+  const findingsUnavailable = classified.findingsUnavailable
+    || (classified.verdict === "incomplete" && classified.findings.length === 0);
+  if (findingsUnavailable) {
+    console.warn(`[webhook] Review findings unavailable on PR #${prNumber}: unparseable or incomplete review-findings block`);
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ignored: true }));
+    res.end(JSON.stringify({ ignored: true, reason: "findings_unavailable" }));
+    return;
+  }
+
+  if (classified.findings.length === 0) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(classified.verdict === "approve" ? { ignored: true, reason: "approved" } : { ignored: true }));
     return;
   }
 
@@ -936,7 +1004,8 @@ async function handleIssueCommentWebhook(
     return;
   }
 
-  const outcome = acceptReviewFixWebhookEvent({
+  const reviewFixReason = classified.verdictSource === "review-contract" ? "review_contract" : "claude_review_summary";
+  const input = {
     eventId: resolveReviewFixEventId(deliveryId, {
       repo: repoFullName,
       prNumber,
@@ -951,11 +1020,16 @@ async function handleIssueCommentWebhook(
     issueIdentifier: match.issueIdentifier,
     repo: repoFullName,
     prNumber,
-    reason: "claude_review_summary",
+    reason: reviewFixReason,
     sourceUrl: payload.comment?.html_url,
     actor: payload.comment?.user?.login,
-    findings,
-  });
+    findings: classified.findings,
+  };
+  if (resolveRepoReviewProcess(repoFullName).restate) {
+    await forwardReviewFixEvent(res, ingress, input, deliveryId, payload.installation?.id);
+    return;
+  }
+  const outcome = acceptReviewFixWebhookEvent(input);
 
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({

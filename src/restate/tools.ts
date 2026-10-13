@@ -16,8 +16,8 @@ import * as restate from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { AccessRole } from "../access-entries.js";
-import { getRunnerMode, getKgMaterializeDirect } from "../runner-mode.js";
-import { getMappings, type RepoMapping } from "../config.js";
+import { getRunnerMode, getKgMaterializeDirect, getKgExecutionMode, resolveKgBackend } from "../runner-mode.js";
+import { getMappings, resolveReviewProcessId, type RepoMapping } from "../config.js";
 import { getInFlightJobs, getRunRecordMergeVerdict, getJobById, getJobByMachineId, type Job } from "../log.js";
 import {
   getMachine, listMachines, fetchMachineLogs, readMachineExit,
@@ -38,9 +38,11 @@ import { readKgSourceRepo } from "../deploy.js";
 import { runKgRefreshPreflight, MIN_FREE_BYTES, type KgRefreshStage, type KgRefreshStatus } from "../kg-refresh.js";
 import type { StepStatus } from "../pipeline/types.js";
 import { FlyMachineProfile } from "./fly-machine-profile.js";
+import { RUN_PROFILE_OBJECTS, isRunProfileBackend, type RunProfileBackend } from "./run-profile.js";
+import { RunnerBackend } from "./runner-backend.js";
 import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
-import { getOrchestratorSettings, getLinearPickupLabel } from "../orchestrator-settings.js";
+import { getOrchestratorSettings, getFlySessionsConfig, getLinearPickupLabel } from "../orchestrator-settings.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import { getDeployPosture } from "../deploy-posture.js";
 import {
@@ -272,13 +274,15 @@ export const listProjects = tool(
       planningWorkflowFile: m.planningWorkflowFile,
       autoApprovePlans: m.autoApprovePlans,
       reviewers: m.reviewers,
+      trustedReviewAuthors: m.trustedReviewAuthors,
+      reviewProcess: resolveReviewProcessId(m),
     }));
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
 );
 
 export const GET_PROJECT_BINDING_DESCRIPTION =
-  "Returns the binding a skill needs for its own project: team key, repo, default branch, tracker kind, the effective pickup label (the live ADR 022 settings value, not a hardcoded default), and the knowledge-graph binding (present, orchestratorUrl, sourceRepo, baseRepo, searchTool). Pass `repo` (owner/repo) or `team` to select one project, returned as a single object; omit both to list every mapping as an array. Never includes extraEnv or a token.";
+  "Returns the binding a skill needs for its own project: team key, repo, default branch, tracker kind, the resolved review process (reviewProcess: ai-implement or claude-code-review), the effective pickup label (the live ADR 022 settings value, not a hardcoded default), and the knowledge-graph binding (present, orchestratorUrl, sourceRepo, baseRepo, searchTool). Pass `repo` (owner/repo) or `team` to select one project, returned as a single object; omit both to list every mapping as an array. Never includes extraEnv or a token.";
 
 export const getProjectBinding = tool(
   {
@@ -313,6 +317,7 @@ export const getProjectBinding = tool(
       defaultBranch: m.defaultBranch,
       tracker: { kind: m.ticketingConfig.kind, team: key },
       pickupLabel: m.ticketingConfig.kind === "linear" ? getLinearPickupLabel() : null,
+      reviewProcess: resolveReviewProcessId(m),
       kg,
     });
 
@@ -618,7 +623,7 @@ export const getDeployPostureTool = tool(
 );
 
 export const GET_KG_STATUS_DESCRIPTION =
-  "Returns the KG refresh rail state: stage (idle | staging | ingest-running | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), the last refresh outcome with its gate, and lastDryRun (verdict and part table of the last dry-run with no PR report target, or null). The served stamp falls back to a live read when the last-refresh record carries none. Poll it after `POST /api/kg/refresh`.";
+  "Returns the KG refresh rail state: stage (idle | checking | ingest-running | snapshot-landed | awaiting-decision | staging | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), the last refresh outcome with its gate. The served stamp falls back to a live read when the last-refresh record carries none. currentRun is the in-flight run only (triggerId, step, decisions, held), or null with no run in flight; decisions is [\"accept\", \"cancel\"] only while the run waits at the decision gate (stage awaiting-decision), and held carries the snapshot PR, its part table, and the decide-by time. Poll it after `POST /api/kg/refresh`.";
 
 // Type-only client handles: the real definitions are built with dependencies at boot
 // (createProductionKgRefreshServices); a client needs only the service name and handler types.
@@ -640,6 +645,7 @@ export function setKgRefreshToolDeps(deps: KgRefreshToolDeps | null): void {
 export function kgStageForStep(step: string | null): KgRefreshStage {
   if (step === null || step === "reserve" || step === "dispatch") return "checking";
   if (step === "await-progress" || step === "cancelling" || step === "dry-run-report") return "ingest-running";
+  if (step === "decision") return "awaiting-decision";
   if (step === "merge" || step === "delete-branch") return "snapshot-landed";
   // fetch, stage, swap, verify, revert, persist, close-row, outcome, settled, and the
   // short-lived terminal steps (failed, closed, no-new-data) whose marker is about to clear.
@@ -674,6 +680,47 @@ export function kgStageForRunnerStep(id: string, status: StepStatus): KgRefreshS
 
 const REVERT_GATES = new Set(["answers", "vectors", "canary", "stamp"]);
 
+export const DECIDE_KG_REFRESH_DESCRIPTION =
+  "Decide the current in-flight KG refresh (admin role). Acts only on the run KgRepo reports in flight; there is no trigger id argument, so a past run cannot be decided. `accept` lands the held snapshot, `cancel` drops it. When the run is not at the decision gate, `accept` answers no-decision-open and `cancel` stops the run through the cancel signal. A second decision answers already-decided; with no run in flight the answer is no-refresh-in-flight.";
+
+export const decideKgRefreshTool = tool(
+  {
+    description: DECIDE_KG_REFRESH_DESCRIPTION,
+    input: z.object({
+      action: z.enum(["accept", "cancel"]).describe("accept lands the held snapshot; cancel drops it (or stops the run when no decision is open)."),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
+    const toolDeps = kgRefreshToolDeps;
+    if (!toolDeps) return toolError("KG refresh is not configured");
+    const inFlight = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).status();
+    if (inFlight === null || inFlight === undefined) return toolError("no-refresh-in-flight");
+    const { triggerId } = inFlight;
+    const { action } = input.args;
+    const actor = input.caller.email ?? (input.caller.kind === "system" ? "system" : "unknown");
+    try {
+      await ctx.workflowClient(KgRefresh, triggerId).decide({ action, actor });
+      return reply({ decided: action });
+    } catch (err) {
+      if (!(err instanceof restate.TerminalError) || err.code !== 409) throw err;
+      if (err.message === "already-decided") return toolError("already-decided");
+      if (err.message !== "no-decision-open") throw err;
+    }
+    if (action === "accept") return toolError("no-decision-open");
+    try {
+      await ctx.workflowClient(KgRefresh, triggerId).cancel({ reason: "operator_cancelled" });
+    } catch (err) {
+      // The run finished between the status read and the signal.
+      if (err instanceof restate.TerminalError && (err.code === 404 || err.code === 409)) return toolError("no-refresh-in-flight");
+      throw err;
+    }
+    return reply({ cancelled: true });
+  },
+);
+
 function kgStageFromLastRefresh(last: KgRefreshStatus["lastRefresh"]): KgRefreshStage {
   if (!last) return "idle";
   if (last.ok) return "serving";
@@ -693,10 +740,6 @@ export const getKgStatusTool = tool(
     const inFlight = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).status();
     const flyProfile = await ctx.objectClient(FlyMachineProfile, "kg-refresh").get();
     const lastRefresh = toolDeps.readStatusRecord();
-    const dryRun = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).lastAdminDryRun();
-    const lastDryRun = dryRun
-      ? { ok: dryRun.ok, at: dryRun.at, detail: dryRun.detail, ...(dryRun.partTable ? { partTable: dryRun.partTable } : {}) }
-      : null;
     let recordStamp = lastRefresh ? (lastRefresh.ok ? lastRefresh.stampAfter : lastRefresh.stampBefore) : null;
     if (!recordStamp) {
       // A failure before the rail leaves no stamp on the record while a graph still serves.
@@ -710,12 +753,22 @@ export const getKgStatusTool = tool(
     }
     let stage: KgRefreshStage;
     let runnerStep: KgRefreshStatus["runnerStep"];
+    let currentRun: KgRefreshStatus["currentRun"] = null;
     if (inFlight === null || inFlight === undefined) {
       stage = kgStageFromLastRefresh(lastRefresh);
     } else {
       try {
         const wf = await ctx.workflowClient(KgRefresh, inFlight.triggerId).status();
-        if (wf.runnerStep) {
+        // Older in-flight workflows lack the decision fields during a deploy.
+        const decisions = wf.decisions ?? [];
+        currentRun = { triggerId: inFlight.triggerId, step: wf.step, decisions, held: wf.held ? { ...wf.held, snapshotPrUrl: `https://github.com/${toolDeps.kgSourceRepo}/pull/${wf.held.snapshotPr}` } : null };
+        if (wf.step === "decision" && decisions.length > 0) {
+          // The runner has finished by the gate, so its last step must not decide the stage.
+          stage = "awaiting-decision";
+        } else if (wf.step === "decision") {
+          // Decided, or timed out, and finishing: the step is not cleared until the next one is set.
+          stage = "staging";
+        } else if (wf.runnerStep) {
           runnerStep = { id: wf.runnerStep.id, status: wf.runnerStep.status as StepStatus };
           stage = kgStageForRunnerStep(runnerStep.id, runnerStep.status);
         } else {
@@ -731,6 +784,18 @@ export const getKgStatusTool = tool(
       }
     }
     const restateKey = inFlight?.triggerId ?? lastRefresh?.dispatchId;
+    const flyCfg = mcpAdminConfig();
+    const flyConfigured = !!(flyCfg.flySessionsToken && flyCfg.flySessionsApp);
+    const kgSetting = getKgExecutionMode(flyConfigured);
+    const kgBackend = resolveKgBackend(getRunnerMode().mode, kgSetting, flyConfigured);
+    // The effective backend's profile; local-docker has none.
+    let runProfile: { backend: RunProfileBackend; config: unknown; source: "profile" | "default" } | undefined;
+    if (isRunProfileBackend(kgBackend.mode)) {
+      const view = kgBackend.mode === "fly-machines"
+        ? flyProfile
+        : await ctx.objectClient(RUN_PROFILE_OBJECTS["github-actions"], "kg-refresh").get();
+      if (view) runProfile = { backend: kgBackend.mode, config: view.config, source: view.source };
+    }
     const result: KgRefreshStatus = {
       running: inFlight !== null && inFlight !== undefined,
       deployHeld: toolDeps.isDeployHeld(),
@@ -738,10 +803,12 @@ export const getKgStatusTool = tool(
       ...sidecarHealthFields(),
       servedStamp: recordStamp ?? null,
       lastRefresh,
-      lastDryRun,
       stage,
+      currentRun,
       ...(runnerStep ? { runnerStep } : {}),
       materialize: getKgMaterializeDirect().enabled ? "direct" : "rdflib",
+      executionMode: { effective: kgBackend.mode, source: kgBackend.source, setting: kgSetting.mode },
+      ...(runProfile ? { runProfile } : {}),
       ...(flyProfile ? { flyMachine: { ...flyProfile.config, source: flyProfile.source } } : {}),
       restate: restateKey ? { service: "KgRefresh", key: restateKey } : null,
     };
@@ -888,11 +955,12 @@ export const kgProvenance = kgTool("kg_provenance");
  * boot warnings and configures OAuth/Linear auth as a side effect and must run exactly once.
  */
 function mcpAdminConfig(): AdminConfig {
+  const fly = getFlySessionsConfig();
   return {
     adminAccessCode: process.env.ADMIN_ACCESS_CODE || null,
-    flySessionsToken: process.env.FLY_SESSIONS_TOKEN || null,
-    flySessionsApp: process.env.FLY_SESSIONS_APP || getOrchestratorSettings().flySessionsApp,
-    flySessionsRegion: process.env.FLY_SESSIONS_REGION || getOrchestratorSettings().flySessionsRegion,
+    flySessionsToken: fly.token,
+    flySessionsApp: fly.app,
+    flySessionsRegion: fly.region,
     githubAppId: process.env.GITHUB_APP_ID ?? "",
     githubAppPrivateKey: process.env.GITHUB_APP_PRIVATE_KEY ?? "",
     notifyWebhookUrl: process.env.NOTIFY_WEBHOOK_URL || null,
@@ -924,18 +992,14 @@ function providerRegistryForTools(): ProviderRegistry {
 }
 
 export const TRIGGER_KG_REFRESH_DESCRIPTION =
-  "Trigger the KG refresh rail (admin role). Same handler as POST /api/kg/refresh: runs the credential preflight, then dispatches the refresh. Poll get_kg_status afterwards. dryRun=true runs the same runner job with kg-snapshot-push's push skipped — all guards run and the guard verdict plus per-part table are reported via get_kg_status as lastDryRun (the last dry-run with no PR report target; it never writes lastRefresh), but nothing is pushed, no PR opens, and the served graph never changes. acceptNewBaseline=true downgrades the zero-shrink and 50%-shrink content guards to warnings for this one dispatch and pushes anyway — use only after reviewing a guard refusal's part table and confirming the shrink is an intentional reclassification, not data loss; the accepting identity's email is logged and written into the refresh PR's ### Baseline section.";
+  "Trigger the KG refresh rail (admin role). Same handler as POST /api/kg/refresh: runs the credential preflight, then dispatches the refresh. Poll get_kg_status afterwards. There is no dry-run and no trigger-time accept: dryRun=true and acceptNewBaseline=true are refused with the error option-removed. A refresh whose snapshot shrinks holds the run at a decision gate (get_kg_status shows it as awaiting-decision, with the snapshot PR and its part table); decide it with decide_kg_refresh.";
 
 export const triggerKgRefreshTool = tool(
   {
     description: TRIGGER_KG_REFRESH_DESCRIPTION,
     input: z.object({
-      dryRun: z.boolean().optional().describe(
-        "Run the rail without pushing the snapshot or touching the served graph; reports the guard table via get_kg_status.",
-      ),
-      acceptNewBaseline: z.boolean().optional().describe(
-        "Push even though a tracked part (issue.nt/comment.nt) shrank or a part dropped below 50% of its previous size — a one-shot override of the zero-shrink guard, applied to this dispatch only.",
-      ),
+      dryRun: z.boolean().optional().describe("Removed: true is refused with option-removed. Omit it."),
+      acceptNewBaseline: z.boolean().optional().describe("Removed: true is refused with option-removed. Decide a held run with decide_kg_refresh."),
       ref: z.string().optional().describe(
         "Dispatch against this branch instead of the KG source repo's default branch (used to run the rail against a PR head).",
       ),
@@ -946,6 +1010,10 @@ export const triggerKgRefreshTool = tool(
   async (ctx, input): Promise<ToolResponse> => {
     const answer = (status: number, body: Record<string, unknown>): ToolResponse =>
       ({ content: [{ type: "text", text: JSON.stringify({ status, body }, null, 2) }] });
+    // Refuse before any side effect: zod would strip an unknown key, and a real refresh pushes to the KG repo.
+    for (const option of ["dryRun", "acceptNewBaseline"] as const) {
+      if (input.args[option] === true) return answer(400, { error: "option-removed", option });
+    }
     const toolDeps = kgRefreshToolDeps;
     const deployHeld = await ctx.run("deploy-held", () => toolDeps ? toolDeps.isDeployHeld() : false);
     if (deployHeld) {
@@ -993,8 +1061,6 @@ export const triggerKgRefreshTool = tool(
       return answer(422, { error: "preflight-failed", precondition: "preflight-failed", detail: preflightFailure });
     }
     const opts = {
-      dryRun: input.args.dryRun === true,
-      acceptNewBaseline: input.args.acceptNewBaseline === true,
       ...(input.args.ref !== undefined ? { kgSourceRef: input.args.ref } : {}),
       actorEmail: input.caller.email ?? undefined,
     };
@@ -1056,8 +1122,79 @@ export const setFlyMachineProfileTool = tool(
       ...(memoryMb !== undefined ? { memoryMb } : {}),
       ...(idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),
     };
+    return reply(await runProfileSet(() => ctx.objectClient(FlyMachineProfile, pipeline).set(fields)));
+  },
+);
+
+/** Runs a run-profile `set`; a 400 comes back as a reply body, as the other set tools do. */
+async function runProfileSet(set: () => Promise<unknown>): Promise<unknown> {
+  try {
+    return await set();
+  } catch (err) {
+    if (err instanceof restate.TerminalError && err.code === 400) return { status: 400, body: { error: err.message } };
+    throw err;
+  }
+}
+
+export const SET_RUN_PROFILE_DESCRIPTION =
+  "Set a pipeline's run profile on one backend (admin role): pipeline (kg-refresh), backend (fly-machines, github-actions) and patch. fly-machines takes cpuKind, cpus, memoryMb, idleTimeoutMs; github-actions takes jobTimeoutMinutes (an integer from 10 to 360). Given fields merge into the stored profile; an unknown field or out-of-range value is refused with 400. Applies to the next run, not one in flight. Returns the profile as { config, source }.";
+
+export const setRunProfileTool = tool(
+  {
+    description: SET_RUN_PROFILE_DESCRIPTION,
+    input: z.object({
+      pipeline: z.string().describe("The pipeline phase whose profile to set, e.g. kg-refresh"),
+      backend: z.enum(["fly-machines", "github-actions"]).describe("The backend whose profile to set"),
+      patch: z.record(z.string(), z.unknown()).describe("Fields to merge, e.g. { jobTimeoutMinutes } for github-actions"),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const { pipeline, backend, patch } = input.args;
+    const result = await runProfileSet(() => ctx.objectClient(RUN_PROFILE_OBJECTS[backend], pipeline).set(patch));
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const SET_RUNNER_BACKEND_DESCRIPTION =
+  "Set a runner backend's deployment-wide settings (admin role): backend (fly-machines, github-actions) and patch. fly-machines takes app and region (a string or null); github-actions takes no fields. Given fields merge into the stored state; an unknown backend or field is refused with 400. No secret is accepted. Returns the stored state.";
+
+export const setRunnerBackendTool = tool(
+  {
+    description: SET_RUNNER_BACKEND_DESCRIPTION,
+    input: z.object({
+      backend: z.string().describe("The backend whose settings to set: fly-machines or github-actions"),
+      patch: z.record(z.string(), z.unknown()).describe("Fields to merge, e.g. { app, region } for fly-machines"),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
+    const { backend, patch } = input.args;
     try {
-      return reply(await ctx.objectClient(FlyMachineProfile, pipeline).set(fields));
+      return reply(await ctx.objectClient(RunnerBackend, backend).set(patch));
+    } catch (err) {
+      if (err instanceof restate.TerminalError && err.code === 400) return reply({ status: 400, body: { error: err.message } });
+      throw err;
+    }
+  },
+);
+
+export const GET_RUNNER_BACKEND_DESCRIPTION =
+  "Returns a runner backend's deployment-wide settings (fly-machines: app, region), or null when none were stored yet.";
+
+export const getRunnerBackendTool = tool(
+  {
+    description: GET_RUNNER_BACKEND_DESCRIPTION,
+    input: z.object({ backend: z.string().describe("The backend to read: fly-machines or github-actions") }),
+    role: "user",
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
+    try {
+      return reply(await ctx.objectClient(RunnerBackend, input.args.backend).get());
     } catch (err) {
       if (err instanceof restate.TerminalError && err.code === 400) return reply({ status: 400, body: { error: err.message } });
       throw err;
@@ -1098,8 +1235,9 @@ export const ADD_PROJECT_DESCRIPTION =
 /**
  * Exported so the unit tier can `safeParse` the documented "pass null to reset" contract
  * without going through the Restate ingress (AII-720). The nullable fields here must match
- * `upsertMappingAction`'s null-accepting set exactly (src/admin.ts) — reviewers and the four
- * caps, branchPrefix, skillsRepo, dependencyTokenScope, and the two sensitive-glob fields.
+ * `upsertMappingAction`'s null-accepting set exactly (src/admin.ts) — reviewers,
+ * trustedReviewAuthors, reviewProcess, and the four caps, branchPrefix, skillsRepo, dependencyTokenScope,
+ * and the two sensitive-glob fields.
  */
 export const addProjectArgsSchema = z.object({
   teamKey: z.string().optional().describe("Team key, e.g. the Linear team key or Jira project key"),
@@ -1140,6 +1278,12 @@ export const addProjectArgsSchema = z.object({
     ),
   })).nullable().optional().describe(
     "Which reviewers run on this project's PRs. Omit to keep the stored value; pass null to reset to the default (gap-analysis and code-review, both gating).",
+  ),
+  trustedReviewAuthors: z.array(z.string()).nullable().optional().describe(
+    "Extra GitHub logins trusted as review authors for this project, additive to the built-in trusted authors (ai-implement, ai-implement[bot], and the Claude logins — github-actions[bot] is trusted separately). Omit to keep the stored value; pass null to reset to built-ins only.",
+  ),
+  reviewProcess: z.enum(["ai-implement", "claude-code-review", "claude-code-review-repository-fix"]).nullable().optional().describe(
+    "The project's review process. Omit to keep the stored value; pass null or \"ai-implement\" for the default. It applies to every project; only the forward to the Restate fix attempt needs the Restate lifecycle.",
   ),
 });
 
@@ -1290,8 +1434,12 @@ export const orchestratorTools = restate.service({
     kg_path: kgPath,
     kg_provenance: kgProvenance,
     trigger_kg_refresh: triggerKgRefreshTool,
+    decide_kg_refresh: decideKgRefreshTool,
     set_runner_mode: setRunnerModeTool,
     set_fly_machine_profile: setFlyMachineProfileTool,
+    set_run_profile: setRunProfileTool,
+    set_runner_backend: setRunnerBackendTool,
+    get_runner_backend: getRunnerBackendTool,
     pause_project: pauseProjectTool,
     add_project: addProjectTool,
     trigger_workflow_sync: triggerWorkflowSyncTool,

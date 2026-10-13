@@ -11,7 +11,7 @@ describe("kg pipelines page", () => {
   });
 
   it("carries every card id, and Deployments carries none", () => {
-    for (const id of ["kg-refresh-card", "kg-refresh-badge", "kg-refresh-stamp", "kg-refresh-last", "kg-sidecar-status", "kg-refresh-btn", "kg-dry-run-btn", "kg-accept-baseline-btn", "kg-dry-run-last", "kg-materialize-controls", "btn-kg-materialize-rdflib", "btn-kg-materialize-direct", "kg-materialize-source"]) {
+    for (const id of ["kg-refresh-card", "kg-refresh-badge", "kg-refresh-stamp", "kg-refresh-last", "kg-sidecar-status", "kg-refresh-btn", "kg-accept-btn", "kg-cancel-btn", "kg-current-run", "kg-materialize-controls", "btn-kg-materialize-rdflib", "btn-kg-materialize-direct", "kg-materialize-source"]) {
       expect(kgPipelinesHtml).toContain(`id="${id}"`);
       expect(deploymentsHtml).not.toContain(id);
     }
@@ -67,32 +67,6 @@ describe("kg refresh card", () => {
     expect(kgPipelinesScript).toContain("window.triggerKgRefresh");
   });
 
-  it("declares the dry-run element ids (AII-635)", () => {
-    for (const id of ["kg-dry-run-btn", "kg-dry-run-last"]) {
-      expect(kgPipelinesHtml).toContain(`id="${id}"`);
-    }
-    expect(kgPipelinesHtml).toContain('onclick="window.triggerKgRefresh(true)"');
-  });
-
-  it("posts { dryRun: true } for the dry-run trigger and renders the part table (AII-635)", () => {
-    expect(kgPipelinesScript).toContain("window.api('/api/kg/refresh', { method: 'POST', body: JSON.stringify({ dryRun: true }) })");
-    expect(kgPipelinesScript).toContain("function renderKgDryRun(");
-    expect(kgPipelinesScript).toContain("['part', 'previous', 'new', 'delta']");
-    expect(kgPipelinesScript).toContain("document.getElementById('kg-dry-run-btn').disabled = busy");
-  });
-
-  it("declares the accept-baseline button and gates it behind confirm() (AII-628)", () => {
-    expect(kgPipelinesHtml).toContain('id="kg-accept-baseline-btn"');
-    expect(kgPipelinesHtml).toContain('onclick="window.triggerKgAcceptBaseline()"');
-    expect(kgPipelinesScript).toContain("window.triggerKgAcceptBaseline = ");
-    expect(kgPipelinesScript).toContain("if (!confirm(");
-    expect(kgPipelinesScript).toContain("JSON.stringify({ acceptNewBaseline: true })");
-    expect(kgPipelinesScript).toContain("document.getElementById('kg-accept-baseline-btn').disabled = busy");
-    // All three buttons share one refusal-to-message mapping and disable each other while a request is in flight.
-    expect(kgPipelinesScript).toContain("function showKgRefreshRefusal(res, body)");
-    expect((kgPipelinesScript.match(/showKgRefreshRefusal\(res, await/g) || []).length).toBe(2);
-  });
-
   it("posts to /api/kg/refresh for the refresh trigger", () => {
     expect(kgPipelinesScript).toContain("window.api('/api/kg/refresh', { method: 'POST' })");
   });
@@ -105,6 +79,7 @@ describe("kg refresh card", () => {
       ["running", "landing"],   // snapshot-landed
       ["running", "staging"],
       ["ok", "serving"],
+      ["warn", "awaiting decision"],
       ["warn", "reverted"],
       ["fail", "failed"],
       ["warn", "degraded"],     // kgDegraded fallback
@@ -197,7 +172,7 @@ describe("kg fly machine profile control (AII-1116)", () => {
   type Reply = { status: number; body: unknown };
   const profile = { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000, source: "profile" };
 
-  function mount(opts: { flyMachine?: unknown; saveReply?: Reply }) {
+  function mount(opts: { flyMachine?: unknown; runProfile?: unknown; saveReply?: Reply }) {
     const dom = new JSDOM(`<!DOCTYPE html><body>${kgPipelinesHtml}</body>`, {
       runScripts: "dangerously",
       url: "http://localhost/admin#kg-pipelines",
@@ -212,10 +187,11 @@ describe("kg fly machine profile control (AII-1116)", () => {
     win.api = async (url: string, init?: { body?: string }) => {
       calls.push({ url, body: init?.body ? JSON.parse(init.body) : undefined });
       if (url === "/api/tools/get_kg_status") {
-        const payload = { flyMachine: opts.flyMachine ?? profile };
+        const { source, ...config } = (opts.flyMachine ?? profile) as typeof profile;
+        const payload = { runProfile: opts.runProfile ?? { backend: "fly-machines", config, source } };
         return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: JSON.stringify(payload) }] }) };
       }
-      if (url === "/api/tools/set_fly_machine_profile") {
+      if (url === "/api/tools/set_run_profile") {
         const r = opts.saveReply ?? { status: 200, body: { content: [{ type: "text", text: "{}" }] } };
         return { ok: r.status >= 200 && r.status < 300, status: r.status, json: async () => r.body };
       }
@@ -238,7 +214,7 @@ describe("kg fly machine profile control (AII-1116)", () => {
 
   it("renders the effective line and the inputs from get_kg_status", async () => {
     const { win, el, calls, settle } = mount({});
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     expect(calls[0]).toEqual({ url: "/api/tools/get_kg_status", body: { args: {} } });
     expect(el("kg-fly-machine-effective").textContent).toBe("next Fly run: performance, 2 CPU / 8192 MB, idle 7 d (profile)");
     expect(el("kg-fly-cpus").value).toBe("2");
@@ -251,13 +227,13 @@ describe("kg fly machine profile control (AII-1116)", () => {
 
   it("ends the line in (default) for a default profile", async () => {
     const { win, el } = mount({ flyMachine: { ...profile, source: "default" } });
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     expect(el("kg-fly-machine-effective").textContent).toMatch(/\(default\)$/);
   });
 
   it("enables Save on change, disables it on revert, and posts only the changed field", async () => {
     const { win, el, calls, settle } = mount({});
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     el("kg-fly-memory-mb").value = "4096";
     win.refreshKgFlyDirty();
     expect(el("btn-kg-fly-save").disabled).toBe(false);
@@ -268,25 +244,25 @@ describe("kg fly machine profile control (AII-1116)", () => {
     win.refreshKgFlyDirty();
     await win.saveKgFlyMachine();
     await settle();
-    const save = calls.find((c) => c.url === "/api/tools/set_fly_machine_profile");
-    expect(save?.body).toEqual({ args: { pipeline: "kg-refresh", memoryMb: 4096 } });
+    const save = calls.find((c) => c.url === "/api/tools/set_run_profile");
+    expect(save?.body).toEqual({ args: { pipeline: "kg-refresh", backend: "fly-machines", patch: { memoryMb: 4096 } } });
     expect(calls.filter((c) => c.url === "/api/tools/get_kg_status").length).toBe(2);
   });
 
   it("posts the idle hours as whole milliseconds and the cpu kind when it changes", async () => {
     const { win, el, calls } = mount({});
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     el("kg-fly-idle-hours").value = "1.5";
     win.setKgFlyCpuKind("shared");
     await win.saveKgFlyMachine();
-    const save = calls.find((c) => c.url === "/api/tools/set_fly_machine_profile");
-    expect(save?.body).toEqual({ args: { pipeline: "kg-refresh", cpuKind: "shared", idleTimeoutMs: 5400000 } });
+    const save = calls.find((c) => c.url === "/api/tools/set_run_profile");
+    expect(save?.body).toEqual({ args: { pipeline: "kg-refresh", backend: "fly-machines", patch: { cpuKind: "shared", idleTimeoutMs: 5400000 } } });
   });
 
   it("shows a 400 answer's error in #kg-pipelines-error", async () => {
     const wrapped = { content: [{ type: "text", text: JSON.stringify({ status: 400, body: { error: "memoryMb must be at least 2048 per CPU" } }) }] };
     const { win, el } = mount({ saveReply: { status: 200, body: wrapped } });
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     el("kg-fly-memory-mb").value = "1024";
     win.refreshKgFlyDirty();
     await win.saveKgFlyMachine();
@@ -297,10 +273,10 @@ describe("kg fly machine profile control (AII-1116)", () => {
   it("shows 'admin only' for a 403 and leaves the inputs alone", async () => {
     for (const reply of [
       { status: 403, body: { error: "forbidden" } },
-      { status: 200, body: { isError: true, content: [{ type: "text", text: "forbidden: set_fly_machine_profile requires the admin role" }] } },
+      { status: 200, body: { isError: true, content: [{ type: "text", text: "forbidden: set_run_profile requires the admin role" }] } },
     ]) {
       const { win, el } = mount({ saveReply: reply });
-      await win.loadKgFlyMachine();
+      await win.loadKgRunProfile();
       el("kg-fly-memory-mb").value = "4096";
       win.refreshKgFlyDirty();
       await win.saveKgFlyMachine();
@@ -312,21 +288,370 @@ describe("kg fly machine profile control (AII-1116)", () => {
 
   it("shows 'profile unavailable (503)' on a failed read and leaves the inputs alone", async () => {
     const { win, el } = mount({});
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     const before = el("kg-fly-memory-mb").value;
     win.api = async () => ({ ok: false, status: 503, json: async () => ({}) });
-    await win.loadKgFlyMachine();
-    expect(el("kg-fly-machine-effective").textContent).toBe("next Fly run: profile unavailable (503)");
+    await win.loadKgRunProfile();
+    expect(el("kg-run-profile-error").textContent).toBe("run profile unavailable (503)");
     expect(el("kg-fly-memory-mb").value).toBe(before);
     expect(el("btn-kg-fly-save").disabled).toBe(true);
   });
 
+  it("hides every run-profile row and shows 'admin only' when the read answers 403", async () => {
+    const { win, el } = mount({});
+    await win.loadKgRunProfile();
+    win.api = async () => ({ ok: false, status: 403, json: async () => ({}) });
+    await win.loadKgRunProfile();
+    expect(el("kg-run-profile-error").textContent).toBe("run profile unavailable (admin only)");
+    expect(el("kg-run-profile-error").hidden).toBe(false);
+    for (const id of ["kg-fly-machine-controls", "kg-fly-machine-effective", "kg-gha-controls", "kg-gha-note"]) {
+      expect(el(id).hidden).toBe(true);
+    }
+  });
+
   it("does not overwrite edited inputs on a poll", async () => {
     const { win, el } = mount({});
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     el("kg-fly-memory-mb").value = "4096";
     win.refreshKgFlyDirty();
-    await win.loadKgFlyMachine();
+    await win.loadKgRunProfile();
     expect(el("kg-fly-memory-mb").value).toBe("4096");
+  });
+});
+
+describe("kg backend control (AII-1218)", () => {
+  function mount(executionMode: unknown) {
+    const dom = new JSDOM(`<!DOCTYPE html><body>${kgPipelinesHtml}</body>`, { runScripts: "dangerously", url: "http://localhost/admin#kg-pipelines" });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const win = dom.window as any;
+    const esc = (v: unknown) => String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    win.esc = esc;
+    win.escAttr = esc;
+    win.registerPage = () => {};
+    win.api = async (url: string) => {
+      if (url === "/api/tools/get_kg_status") {
+        const backend = (executionMode as { effective: string }).effective;
+        const runProfile =
+          backend === "fly-machines"
+            ? { backend, config: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000 }, source: "default" }
+            : backend === "github-actions"
+              ? { backend, config: { jobTimeoutMinutes: 90 }, source: "default" }
+              : undefined;
+        const payload = { executionMode, runProfile };
+        return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: JSON.stringify(payload) }] }) };
+      }
+      if (url === "/api/kg/execution-mode") return { ok: true, status: 200, json: async () => ({ mode: "fly-machines", source: "db" }) };
+      return { ok: false, status: 404, json: async () => ({}) };
+    };
+    const script = dom.window.document.createElement("script");
+    script.textContent = kgPipelinesScript;
+    dom.window.document.head.appendChild(script);
+    const doc = dom.window.document;
+    return { win, text: (id: string) => doc.getElementById(id)!.textContent, hidden: (id: string) => (doc.getElementById(id) as HTMLElement).hidden, doc };
+  }
+
+  it("declares the Backend buttons wired to setKgExecutionMode, and fetches the endpoint", () => {
+    expect(kgPipelinesHtml).toContain("onclick=\"window.setKgExecutionMode('github-actions')\"");
+    expect(kgPipelinesHtml).toContain("onclick=\"window.setKgExecutionMode('fly-machines')\"");
+    for (const id of ["btn-kg-backend-gha", "btn-kg-backend-fly", "kg-backend-source", "kg-backend-effective"]) {
+      expect(kgPipelinesHtml).toContain(`id="${id}"`);
+    }
+    expect(kgPipelinesScript).toContain("/api/kg/execution-mode");
+  });
+
+  it("paints the buttons and source from GET /api/kg/execution-mode", async () => {
+    const { win, doc, text } = mount({ effective: "fly-machines", source: "kg-setting", setting: "fly-machines" });
+    await win.loadKgExecutionMode();
+    expect(doc.getElementById("btn-kg-backend-fly")!.classList.contains("btn-primary")).toBe(true);
+    expect(doc.getElementById("btn-kg-backend-gha")!.classList.contains("btn-primary")).toBe(false);
+    expect(text("kg-backend-source")).toBe("(db)");
+  });
+
+  it("shows the Fly rows when the effective backend is Fly", async () => {
+    const { win, text, hidden } = mount({ effective: "fly-machines", source: "kg-setting", setting: "fly-machines" });
+    await win.loadKgRunProfile();
+    expect(hidden("kg-fly-machine-controls")).toBe(false);
+    expect(hidden("kg-fly-machine-effective")).toBe(false);
+    expect(text("kg-backend-effective")).toBe("next run: Fly machines (KG setting)");
+  });
+
+  it("hides the Fly rows when the effective backend is GitHub Actions", async () => {
+    const { win, hidden } = mount({ effective: "github-actions", source: "kg-setting", setting: "github-actions" });
+    await win.loadKgRunProfile();
+    expect(hidden("kg-fly-machine-controls")).toBe(true);
+    expect(hidden("kg-fly-machine-effective")).toBe(true);
+  });
+
+  it("shows only the GitHub Actions row when the effective backend is GitHub Actions", async () => {
+    const { win, hidden } = mount({ effective: "github-actions", source: "kg-setting", setting: "github-actions" });
+    await win.loadKgRunProfile();
+    expect(hidden("kg-gha-controls")).toBe(false);
+    expect(hidden("kg-gha-note")).toBe(false);
+  });
+
+  it("hides every run-profile row for local Docker", async () => {
+    const { win, hidden } = mount({ effective: "local-docker", source: "runner-mode", setting: "fly-machines" });
+    await win.loadKgRunProfile();
+    for (const id of ["kg-fly-machine-controls", "kg-fly-machine-effective", "kg-gha-controls", "kg-gha-note"]) expect(hidden(id)).toBe(true);
+  });
+
+  it.each([
+    [{ effective: "fly-machines", source: "runner-mode", setting: "fly-machines" }, "next run: Fly machines (runner mode fly)"],
+    [{ effective: "github-actions", source: "runner-mode", setting: "fly-machines" }, "next run: GitHub Actions (runner mode gha overrides the KG setting)"],
+    [{ effective: "github-actions", source: "fly-unconfigured", setting: "fly-machines" }, "next run: GitHub Actions (Fly not configured)"],
+  ])("names the source on the effective line: %j", async (em, line) => {
+    const { win, text } = mount(em);
+    await win.loadKgRunProfile();
+    expect(text("kg-backend-effective")).toBe(line);
+  });
+});
+
+describe("kg github-actions run profile (AII-1245)", () => {
+  const ghaProfile = { backend: "github-actions", config: { jobTimeoutMinutes: 90 }, source: "default" };
+
+  let current: unknown = ghaProfile;
+
+  function mount(saveReply?: { status: number; body: unknown }) {
+    current = ghaProfile;
+    const dom = new JSDOM(`<!DOCTYPE html><body>${kgPipelinesHtml}</body>`, { runScripts: "dangerously", url: "http://localhost/admin#kg-pipelines" });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const win = dom.window as any;
+    const esc = (v: unknown) => String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    win.esc = esc;
+    win.escAttr = esc;
+    win.registerPage = () => {};
+    const calls: { url: string; body: unknown }[] = [];
+    win.api = async (url: string, init?: { body?: string }) => {
+      calls.push({ url, body: init?.body ? JSON.parse(init.body) : undefined });
+      if (url === "/api/tools/get_kg_status") {
+        return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: JSON.stringify({ runProfile: current }) }] }) };
+      }
+      if (url === "/api/tools/set_run_profile") {
+        const r = saveReply ?? { status: 200, body: { content: [{ type: "text", text: "{}" }] } };
+        return { ok: r.status >= 200 && r.status < 300, status: r.status, json: async () => r.body };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    };
+    const script = dom.window.document.createElement("script");
+    script.textContent = kgPipelinesScript;
+    dom.window.document.head.appendChild(script);
+    const doc = dom.window.document;
+    const el = (id: string) => doc.getElementById(id) as HTMLInputElement;
+    return { win, el, calls };
+  }
+
+  it("renders the stored timeout, the note, and no Fly controls", async () => {
+    const { win, el } = mount();
+    await win.loadKgRunProfile();
+    expect(el("kg-gha-job-timeout").value).toBe("90");
+    expect(el("kg-gha-controls").hidden).toBe(false);
+    expect(el("kg-fly-machine-controls").hidden).toBe(true);
+    expect(el("kg-gha-note").textContent).toBe(
+      "Runner size comes from the KG repo's `AI_IMPLEMENT_RUNNER_LABEL` Actions variable. GitHub owns the machines, so there is no kept machine or idle time.",
+    );
+    expect(el("btn-kg-gha-save").disabled).toBe(true);
+  });
+
+  it("saves through set_run_profile with the github-actions backend", async () => {
+    const { win, el, calls } = mount();
+    await win.loadKgRunProfile();
+    el("kg-gha-job-timeout").value = "120";
+    win.refreshKgGhaDirty();
+    expect(el("btn-kg-gha-save").disabled).toBe(false);
+    await win.saveKgGhaProfile();
+    const save = calls.find((c) => c.url === "/api/tools/set_run_profile");
+    expect(save?.body).toEqual({ args: { pipeline: "kg-refresh", backend: "github-actions", patch: { jobTimeoutMinutes: 120 } } });
+  });
+
+  it("shows a 400 answer's error in #kg-pipelines-error", async () => {
+    const wrapped = { content: [{ type: "text", text: JSON.stringify({ status: 400, body: { error: "jobTimeoutMinutes must be between 10 and 360" } }) }] };
+    const { win, el } = mount({ status: 200, body: wrapped });
+    await win.loadKgRunProfile();
+    el("kg-gha-job-timeout").value = "120";
+    win.refreshKgGhaDirty();
+    await win.saveKgGhaProfile();
+    expect(el("kg-pipelines-error").textContent).toContain("jobTimeoutMinutes must be between 10 and 360");
+    expect(el("kg-pipelines-error").hidden).toBe(false);
+  });
+
+  it("blocks out-of-range and non-integer timeouts", async () => {
+    const { win, el, calls } = mount();
+    await win.loadKgRunProfile();
+    for (const v of ["5", "400", "90.5", ""]) {
+      el("kg-gha-job-timeout").value = v;
+      win.refreshKgGhaDirty();
+      expect(el("btn-kg-gha-save").disabled).toBe(true);
+    }
+    await win.saveKgGhaProfile();
+    expect(calls.some((c) => c.url === "/api/tools/set_run_profile")).toBe(false);
+  });
+
+  it("keeps a dirty value across a poll and after a 403", async () => {
+    const { win, el } = mount({ status: 403, body: { error: "forbidden" } });
+    await win.loadKgRunProfile();
+    el("kg-gha-job-timeout").value = "120";
+    win.refreshKgGhaDirty();
+    await win.loadKgRunProfile();
+    expect(el("kg-gha-job-timeout").value).toBe("120");
+    await win.saveKgGhaProfile();
+    expect(el("kg-pipelines-error").textContent).toBe("admin only");
+    expect(el("kg-gha-job-timeout").value).toBe("120");
+  });
+
+  it("drops a half-typed edit when the effective backend flips and flips back", async () => {
+    const flyProfile = { backend: "fly-machines", config: { cpuKind: "shared", cpus: 1, memoryMb: 2048, idleTimeoutMs: 3600000 }, source: "default" };
+    const { win, el } = mount();
+    current = flyProfile;
+    await win.loadKgRunProfile();
+    el("kg-fly-cpus").value = "4";
+    win.refreshKgFlyDirty();
+    expect(el("btn-kg-fly-save").disabled).toBe(false);
+    current = ghaProfile;
+    await win.loadKgRunProfile();
+    expect(el("kg-fly-machine-controls").hidden).toBe(true);
+    expect(el("kg-gha-job-timeout").value).toBe("90");
+    current = flyProfile;
+    await win.loadKgRunProfile();
+    expect(el("kg-fly-cpus").value).toBe("1");
+    expect(el("btn-kg-fly-save").disabled).toBe(true);
+  });
+});
+
+describe("kg current run card (AII-1260)", () => {
+  type Run = { triggerId: string; step: string | null; decisions: string[]; held: unknown };
+  const held = {
+    snapshotPr: 7,
+    snapshotPrUrl: "https://github.com/o/kg/pull/7",
+    decideBy: 1760000000000,
+    partTable: [{ part: "<img src=x onerror=alert(1)>", prev: "100", new: "40" }],
+  };
+
+  function mount(opts: { currentRun: Run | null; stage?: string; statusOk?: boolean; decideReply?: unknown; confirm?: boolean; deployPolls?: number }) {
+    const dom = new JSDOM(`<!DOCTYPE html><body>${kgPipelinesHtml}</body>`, { runScripts: "dangerously", url: "http://localhost/admin#kg-pipelines" });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const win = dom.window as any;
+    const esc = (v: unknown) => String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    win.esc = esc;
+    win.escAttr = esc;
+    win.safeUrl = (u: string) => (/^https?:/.test(u) ? u : "#");
+    win.confirm = () => opts.confirm ?? true;
+    win.registerPage = () => {};
+    const calls: { url: string; body: unknown }[] = [];
+    win.api = async (url: string, init?: { body?: string }) => {
+      calls.push({ url, body: init?.body ? JSON.parse(init.body) : undefined });
+      if (url === "/api/kg/status") {
+        if (opts.deployPolls && opts.deployPolls-- > 0) return { ok: false, status: 409, json: async () => ({ error: "deploy-in-progress" }) };
+        if (opts.statusOk === false) return { ok: false, status: 500, json: async () => ({}) };
+        const stage = opts.stage ?? (opts.currentRun ? "ingest-running" : "serving");
+        return { ok: true, status: 200, json: async () => ({ stage, servedStamp: "abc", lastRefresh: null, currentRun: opts.currentRun }) };
+      }
+      if (url === "/api/tools/decide_kg_refresh") {
+        return { ok: true, status: 200, json: async () => opts.decideReply ?? { content: [{ type: "text", text: "{}" }] } };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    };
+    const script = dom.window.document.createElement("script");
+    script.textContent = kgPipelinesScript;
+    dom.window.document.head.appendChild(script);
+    const doc = dom.window.document;
+    const visibleButtons = () =>
+      ["kg-refresh-btn", "kg-accept-btn", "kg-cancel-btn"]
+        .map((id) => doc.getElementById(id) as HTMLElement)
+        .filter((b) => !(b as HTMLElement).hidden)
+        .map((b) => (b.textContent ?? "").trim());
+    return { win, doc, calls, visibleButtons };
+  }
+
+  it("no current run: stamp, last outcome and Refresh graph now only", async () => {
+    const { win, doc, visibleButtons } = mount({ currentRun: null });
+    await win.loadKgStatus();
+    expect(doc.getElementById("kg-refresh-stamp")?.textContent).toBe("Served graph stamp: abc");
+    expect(doc.getElementById("kg-refresh-last")?.textContent).toBe("No refresh has run since boot.");
+    expect(visibleButtons()).toEqual(["Refresh graph now"]);
+    expect((doc.getElementById("kg-current-run") as HTMLElement).hidden).toBe(true);
+  });
+
+  it("links the current run to the Restate UI, and idle has no link", async () => {
+    const m = mount({ currentRun: { triggerId: "trg/1", step: "ingest", decisions: [], held: null } });
+    await m.win.loadKgStatus();
+    const a = m.doc.querySelector("#kg-current-run a") as HTMLAnchorElement;
+    expect(a.textContent).toBe("Open in Restate UI");
+    expect(a.getAttribute("href")).toBe("/ui/workflows/KgRefresh/trg%2F1");
+    const idle = mount({ currentRun: null });
+    await idle.win.loadKgStatus();
+    expect(idle.doc.querySelector("#kg-current-run a")).toBeNull();
+  });
+
+  it("run in flight: the step and Cancel only, never printing null", async () => {
+    const m = mount({ currentRun: { triggerId: "t", step: "<b>ingest</b>", decisions: [], held: null } });
+    await m.win.loadKgStatus();
+    expect(m.doc.getElementById("kg-current-run")?.firstChild?.textContent).toBe("Run in flight: <b>ingest</b>");
+    expect(m.doc.querySelector("#kg-current-run b")).toBeNull();
+    expect(m.visibleButtons()).toEqual(["Cancel"]);
+    const n = mount({ currentRun: { triggerId: "t", step: null, decisions: [], held: null } });
+    await n.win.loadKgStatus();
+    expect(n.doc.getElementById("kg-current-run")?.firstChild?.textContent).toBe("Run in flight");
+  });
+
+  it("held run: deadline, part table, PR link, Accept and Cancel", async () => {
+    const m = mount({ currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held }, stage: "awaiting-decision" });
+    await m.win.loadKgStatus();
+    const cur = m.doc.getElementById("kg-current-run") as HTMLElement;
+    expect(cur.textContent).toContain("Held for a decision until ");
+    expect(Array.from(cur.querySelectorAll("th")).map((t) => t.textContent)).toEqual(["part", "previous", "new", "delta"]);
+    expect(Array.from(cur.querySelectorAll("td")).map((t) => t.textContent)).toEqual(["<img src=x onerror=alert(1)>", "100", "40", "-60"]);
+    expect(cur.querySelector("img")).toBeNull();
+    expect(cur.querySelector("a[href^=\"https\"]")?.getAttribute("href")).toBe("https://github.com/o/kg/pull/7");
+    expect(m.visibleButtons()).toEqual(["Accept new baseline & refresh", "Cancel"]);
+    expect(m.doc.getElementById("kg-refresh-badge")?.textContent).toContain("awaiting decision");
+  });
+
+  it("re-enables Accept and Cancel after a deploy-in-progress poll", async () => {
+    const m = mount({ currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held }, stage: "awaiting-decision", deployPolls: 1 });
+    await m.win.loadKgStatus();
+    expect((m.doc.getElementById("kg-accept-btn") as HTMLButtonElement).disabled).toBe(true);
+    expect((m.doc.getElementById("kg-cancel-btn") as HTMLButtonElement).disabled).toBe(true);
+    await m.win.loadKgStatus();
+    expect((m.doc.getElementById("kg-accept-btn") as HTMLButtonElement).disabled).toBe(false);
+    expect((m.doc.getElementById("kg-cancel-btn") as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("status failure hides the card", async () => {
+    const m = mount({ currentRun: null, statusOk: false });
+    await m.win.loadKgStatus();
+    expect((m.doc.getElementById("kg-refresh-card") as HTMLElement).hidden).toBe(true);
+  });
+
+  it("posts the exact decision bodies and reloads the status", async () => {
+    const m = mount({ currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held }, stage: "awaiting-decision" });
+    await m.win.decideKgRefresh("accept");
+    await m.win.decideKgRefresh("cancel");
+    const posts = m.calls.filter((c) => c.url === "/api/tools/decide_kg_refresh");
+    expect(posts.map((c) => c.body)).toEqual([{ args: { action: "accept" } }, { args: { action: "cancel" } }]);
+    expect(m.calls.filter((c) => c.url === "/api/kg/status")).toHaveLength(2);
+  });
+
+  it("a declined confirm makes no call", async () => {
+    const m = mount({ currentRun: null, confirm: false });
+    await m.win.decideKgRefresh("cancel");
+    expect(m.calls).toEqual([]);
+  });
+
+  it("shows a tool error such as already-decided", async () => {
+    const m = mount({
+      currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held },
+      decideReply: { isError: true, content: [{ type: "text", text: "already-decided" }] },
+    });
+    await m.win.decideKgRefresh("accept");
+    const err = m.doc.getElementById("kg-pipelines-error") as HTMLElement;
+    expect(err.hidden).toBe(false);
+    expect(err.textContent).toContain("already-decided");
+  });
+
+  it("the page source drops the dry-run and trigger-time accept code", () => {
+    const src = kgPipelinesHtml + kgPipelinesScript;
+    for (const gone of ["kg-dry-run-btn", "kg-accept-baseline-btn", "kg-dry-run-last", "renderKgDryRun", "last" + "DryRun", "triggerKgAcceptBaseline"]) {
+      expect(src).not.toContain(gone);
+    }
   });
 });

@@ -15,12 +15,15 @@ import {
   kgPath,
   kgHybridSearch,
   kgStageForRunnerStep,
+  kgStageForStep,
+  GET_KG_STATUS_DESCRIPTION,
   getKgStatusTool,
   setFlyMachineProfileTool,
   getTenantHealth,
   getIssueReportCardTool,
   getFleetReportTool,
   triggerKgRefreshTool,
+  decideKgRefreshTool,
   setRunnerModeTool,
   pauseProjectTool,
   addProjectTool,
@@ -693,6 +696,8 @@ describe("migrated read handlers (AII-711)", () => {
         branchPrefix: null, skillsRepo: null, referenceRepos: [], dependencyTokenScope: null,
         sensitiveAddPatterns: [], sensitiveAllowPatterns: [], machineCpus: 2, machineMemoryMb: 4096,
         awsRegion: null, planningWorkflowFile: "claude-plan.yml", autoApprovePlans: true, reviewers: null,
+        trustedReviewAuthors: ["codex-reviewer[bot]"],
+        reviewProcess: "claude-code-review",
         extraEnv: { SUPER_SECRET: "leak-me" },
       },
     });
@@ -702,6 +707,8 @@ describe("migrated read handlers (AII-711)", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].teamKey).toBe("BDS");
     expect(rows[0].repo).toBe("BuildDownAI/skills");
+    expect(rows[0].trustedReviewAuthors).toEqual(["codex-reviewer[bot]"]);
+    expect(rows[0].reviewProcess).toBe("claude-code-review");
     expect(result.content[0].text).not.toContain("extraEnv");
     expect(result.content[0].text).not.toContain("leak-me");
   });
@@ -752,7 +759,8 @@ describe("migrated read handlers (AII-711)", () => {
     async function stageFor(opts: {
       last?: RefreshOutcome | null; inFlight?: { triggerId: string; startedAt: number } | null; step?: string | null; statusThrows?: boolean;
       runnerStep?: { id: string; status: string } | null;
-      dryRun?: RefreshOutcome | null; readServedStamp?: () => Promise<string | null>;
+      decisions?: string[]; held?: unknown; calls?: string[];
+      readServedStamp?: () => Promise<string | null>;
     }) {
       setKgRefreshToolDeps(kgToolDeps({
         readStatusRecord: () => opts.last ?? null,
@@ -761,14 +769,17 @@ describe("migrated read handlers (AII-711)", () => {
       const ctx = {
         ...fakeContext("get_kg_status"),
         objectClient: () => ({
-          status: async () => opts.inFlight ?? null,
-          lastAdminDryRun: async () => opts.dryRun ?? null,
+          status: async () => { opts.calls?.push("KgRepo.status"); return opts.inFlight ?? null; },
           get: async () => ({ config: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 1 }, source: "default" }),
         }),
         workflowClient: () => ({
           status: async () => {
+            opts.calls?.push("KgRefresh.status");
             if (opts.statusThrows) throw new Error("no such workflow");
-            return { step: opts.step ?? null, startedAt: 1, triggerId: "t1", runId: null, dryRun: false, runnerStep: opts.runnerStep ?? null };
+            return {
+              step: opts.step ?? null, startedAt: 1, triggerId: "t1", runId: null, dryRun: false, runnerStep: opts.runnerStep ?? null,
+              decisions: opts.decisions ?? [], held: opts.held ?? null,
+            };
           },
         }),
       } as unknown as restate.Context;
@@ -827,6 +838,67 @@ describe("migrated read handlers (AII-711)", () => {
       expect(status.running).toBe(true);
     });
 
+    describe("currentRun and awaiting-decision (AII-1258)", () => {
+      const inFlight = { triggerId: "t1", startedAt: 1 };
+      const held = { snapshotPr: 77, partTable: [{ part: "graph", prev: "100", new: "40" }], decideBy: 99 };
+
+      it("kgStageForStep maps decision to awaiting-decision", () => {
+        expect(kgStageForStep("decision")).toBe("awaiting-decision");
+      });
+
+      it("no run in flight: currentRun is null and stage comes from the last refresh", async () => {
+        const status = await stageFor({ last: ok });
+        expect(status.currentRun).toBeNull();
+        expect(status.stage).toBe("serving");
+      });
+
+      it("in flight before the gate: currentRun is set with no decisions", async () => {
+        const status = await stageFor({ inFlight, step: "await-progress", runnerStep: { id: "kg-ingest", status: "running" } });
+        expect(status.currentRun).toEqual({ triggerId: "t1", step: "await-progress", decisions: [], held: null });
+        expect(status.stage).toBe("ingest-running");
+      });
+
+      it("held and undecided: awaiting-decision wins over the finished runner step", async () => {
+        const status = await stageFor({
+          inFlight, step: "decision", decisions: ["accept", "cancel"], held,
+          runnerStep: { id: "kg-snapshot-push", status: "passed" },
+        });
+        expect(status.stage).toBe("awaiting-decision");
+        expect(status.currentRun).toEqual({ triggerId: "t1", step: "decision", decisions: ["accept", "cancel"], held: { ...held, snapshotPrUrl: "https://github.com/org/kg/pull/77" } });
+      });
+
+      it("decided and still finishing: no decisions, stage as today for the step", async () => {
+        const status = await stageFor({ inFlight, step: "decision", decisions: [], held });
+        expect(status.stage).toBe("staging");
+        expect(status.currentRun.decisions).toEqual([]);
+      });
+
+      it("a run that has ended leaves currentRun null", async () => {
+        const status = await stageFor({ inFlight: null, last: failed("preflight") });
+        expect(status.currentRun).toBeNull();
+        expect(status.running).toBe(false);
+      });
+
+      it("a workflow status failure leaves currentRun null and stage ingest-running", async () => {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        const status = await stageFor({ inFlight, statusThrows: true });
+        expect(status.currentRun).toBeNull();
+        expect(status.stage).toBe("ingest-running");
+        warn.mockRestore();
+      });
+
+      it("makes no Restate call beyond the existing reads", async () => {
+        const calls: string[] = [];
+        await stageFor({ inFlight, step: "decision", decisions: ["accept", "cancel"], held, calls });
+        expect(calls.filter((c) => c === "KgRefresh.status")).toHaveLength(1);
+      });
+
+      it("the description names currentRun and awaiting-decision", () => {
+        expect(GET_KG_STATUS_DESCRIPTION).toContain("currentRun");
+        expect(GET_KG_STATUS_DESCRIPTION).toContain("awaiting-decision");
+      });
+    });
+
     it("in flight with a workflow status failure reports ingest-running, still running, no error", async () => {
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       const status = await stageFor({ inFlight: { triggerId: "t1", startedAt: 1 }, statusThrows: true });
@@ -835,11 +907,8 @@ describe("migrated read handlers (AII-711)", () => {
       warn.mockRestore();
     });
 
-    it("returns the last admin dry-run as lastDryRun, null when none", async () => {
-      expect((await stageFor({})).lastDryRun).toBeNull();
-      const partTable = [{ part: "a", prev: "10", new: "9" }];
-      const dry = { ok: false, at: 5, detail: "guard refused", stampBefore: null, stampAfter: null, dryRun: true, partTable } as RefreshOutcome;
-      expect((await stageFor({ dryRun: dry })).lastDryRun).toEqual({ ok: false, at: 5, detail: "guard refused", partTable });
+    it("has no dry-run key", async () => {
+      expect(Object.keys(await stageFor({}))).not.toContain("last" + "DryRun");
     });
 
     it("servedStamp falls back to readServedStamp when the record has no stamp", async () => {
@@ -881,7 +950,7 @@ describe("migrated read handlers (AII-711)", () => {
     it("keeps the KgRefreshStatus shape", async () => {
       const status = await stageFor({ last: ok });
       expect(Object.keys(status).sort()).toEqual(
-        ["deployHeld", "flyMachine", "kgDegraded", "kgUnavailable", "lastDryRun", "lastRefresh", "materialize", "restate", "running", "servedStamp", "sidecar", "stage"].sort(),
+        ["currentRun", "deployHeld", "executionMode", "flyMachine", "kgDegraded", "kgUnavailable", "lastRefresh", "materialize", "restate", "runProfile", "running", "servedStamp", "sidecar", "stage"].sort(),
       );
     });
   });
@@ -987,6 +1056,7 @@ describe("get_project_binding (AII-715)", () => {
       defaultBranch: "testing",
       tracker: { kind: "linear", team: "BDS" },
       pickupLabel: "AI-Implement-Custom",
+      reviewProcess: "ai-implement",
       kg: {
         present: true,
         orchestratorUrl: "https://ai-implement-testing-orchestrator.fly.dev",
@@ -995,6 +1065,16 @@ describe("get_project_binding (AII-715)", () => {
         searchTool: "kg_hybrid_search",
       },
     });
+  });
+
+  it("returns the resolved reviewProcess in the single and list shapes", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
+      BDS: fixtureMapping({ reviewProcess: "claude-code-review" }),
+    });
+    const single = await getProjectBinding(fakeContext("get_project_binding"), { caller: system, args: { team: "BDS" } });
+    expect(JSON.parse(single.content[0].text).reviewProcess).toBe("claude-code-review");
+    const all = await getProjectBinding(fakeContext("get_project_binding"), { caller: system, args: {} });
+    expect(JSON.parse(all.content[0].text)[0].reviewProcess).toBe("claude-code-review");
   });
 
   it("reflects a pickup-label change on the very next call in the same process, no restart (AII-696 criterion 1)", async () => {
@@ -1187,13 +1267,13 @@ describe("migrated write handlers (AII-713)", () => {
       expect(trigger).not.toHaveBeenCalled();
     });
 
-    it("answers 202 { refreshing, triggerId } and forwards every option to KgRepo.trigger", async () => {
+    it("answers 202 { refreshing, triggerId } and forwards ref and the actor to KgRepo.trigger", async () => {
       const res = answer(await call(
-        { dryRun: true, acceptNewBaseline: true, ref: "feature/x" },
+        { ref: "feature/x" },
         { kind: "human", email: "user@example.com", role: "admin" },
       ));
       expect(res).toEqual({ status: 202, body: { refreshing: true, triggerId: "trig-1" } });
-      expect(trigger).toHaveBeenCalledWith({ dryRun: true, acceptNewBaseline: true, kgSourceRef: "feature/x", actorEmail: "user@example.com" });
+      expect(trigger).toHaveBeenCalledWith({ kgSourceRef: "feature/x", actorEmail: "user@example.com" });
     });
 
     it("passes ref through as kgSourceRef to KgRepo.trigger", async () => {
@@ -1201,9 +1281,24 @@ describe("migrated write handlers (AII-713)", () => {
       expect(trigger).toHaveBeenCalledWith(expect.objectContaining({ kgSourceRef: "release/1.2" }));
     });
 
-    it("defaults dryRun and acceptNewBaseline to false, omits ref, and leaves actorEmail undefined for a null-email caller", async () => {
+    it("omits ref and leaves actorEmail undefined for a null-email caller", async () => {
       await call();
-      expect(trigger).toHaveBeenCalledWith({ dryRun: false, acceptNewBaseline: false, actorEmail: undefined });
+      expect(trigger).toHaveBeenCalledWith({ actorEmail: undefined });
+    });
+
+    it.each(["dryRun", "acceptNewBaseline"])("refuses %s:true with option-removed before any other gate, with no side effect", async (option) => {
+      const runPreflight = vi.fn(async () => PREFLIGHT_OK);
+      setKgRefreshToolDeps(kgToolDeps({ isDeployHeld: () => true, runPreflight }));
+      const runCalls: RunCall[] = [];
+      expect(answer(await call({ [option]: true }, admin, runCalls))).toEqual({ status: 400, body: { error: "option-removed", option } });
+      expect(runCalls).toEqual([]);
+      expect(runPreflight).not.toHaveBeenCalled();
+      expect(trigger).not.toHaveBeenCalled();
+    });
+
+    it("runs a real refresh for dryRun:false and acceptNewBaseline:false", async () => {
+      expect(answer(await call({ dryRun: false, acceptNewBaseline: false })).status).toBe(202);
+      expect(trigger).toHaveBeenCalledWith({ actorEmail: undefined });
     });
 
     it("answers 409 refresh-in-progress when KgRepo reports a live refresh", async () => {
@@ -1226,6 +1321,88 @@ describe("migrated write handlers (AII-713)", () => {
         content: [{ type: "text", text: "trigger_kg_refresh failed: kg-refresh dispatch rejected" }],
       });
       expect(trigger).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("decide_kg_refresh", () => {
+    const answer = (result: { content: { text: string }[]; isError?: boolean }) => ({ isError: result.isError === true, text: result.content[0].text });
+    const status = vi.fn();
+    const decide = vi.fn();
+    const cancel = vi.fn();
+    const ctx = () => ({
+      ...fakeContext("decide_kg_refresh"),
+      objectClient: () => ({ status }),
+      workflowClient: () => ({ decide, cancel }),
+    }) as unknown as restate.Context;
+    const call = (args: { action: "accept" | "cancel" }, caller: Caller = { kind: "human", email: "ada@example.com", role: "admin" }) =>
+      decideKgRefreshTool(ctx(), { caller, args });
+    const terminal = (code: number, message: string) => new restate.TerminalError(message, { errorCode: code });
+
+    beforeEach(() => {
+      status.mockReset().mockResolvedValue({ triggerId: "trig-1", startedAt: 1 });
+      decide.mockReset().mockResolvedValue(undefined);
+      cancel.mockReset().mockResolvedValue(undefined);
+      setKgRefreshToolDeps(kgToolDeps());
+    });
+    afterEach(() => setKgRefreshToolDeps(null));
+
+    it("is role: admin and refuses a user caller without touching the workflow", async () => {
+      const result = await call({ action: "accept" }, HUMAN_USER);
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("requires the admin role");
+      expect(status).not.toHaveBeenCalled();
+      expect(decide).not.toHaveBeenCalled();
+    });
+
+    it("answers no-refresh-in-flight with no run in flight, and calls no workflow", async () => {
+      status.mockResolvedValue(null);
+      expect(answer(await call({ action: "accept" }))).toEqual({ isError: true, text: "no-refresh-in-flight" });
+      expect(decide).not.toHaveBeenCalled();
+      expect(cancel).not.toHaveBeenCalled();
+    });
+
+    it("answers not configured when the tool deps are unset", async () => {
+      setKgRefreshToolDeps(null);
+      expect(answer(await call({ action: "accept" }))).toEqual({ isError: true, text: "KG refresh is not configured" });
+    });
+
+    it("decides the run KgRepo reports, with the caller's email as the actor", async () => {
+      expect(answer(await call({ action: "accept" }))).toEqual({ isError: false, text: JSON.stringify({ decided: "accept" }, null, 2) });
+      expect(decide).toHaveBeenCalledWith({ action: "accept", actor: "ada@example.com" });
+    });
+
+    it("never sends an undefined actor when the caller has no email", async () => {
+      await call({ action: "accept" }, SYSTEM_ADMIN);
+      expect(decide).toHaveBeenCalledWith({ action: "accept", actor: "system" });
+    });
+
+    it("answers no-decision-open for accept when the run is not at the gate", async () => {
+      decide.mockRejectedValue(terminal(409, "no-decision-open"));
+      expect(answer(await call({ action: "accept" }))).toEqual({ isError: true, text: "no-decision-open" });
+      expect(cancel).not.toHaveBeenCalled();
+    });
+
+    it("sends the cancel signal for cancel when the run is not at the gate", async () => {
+      decide.mockRejectedValue(terminal(409, "no-decision-open"));
+      expect(JSON.parse(answer(await call({ action: "cancel" })).text)).toEqual({ cancelled: true });
+      expect(cancel).toHaveBeenCalledWith({ reason: "operator_cancelled" });
+    });
+
+    it("answers already-decided for a second decision, and never falls through to cancel", async () => {
+      decide.mockRejectedValue(terminal(409, "already-decided"));
+      expect(answer(await call({ action: "cancel" }))).toEqual({ isError: true, text: "already-decided" });
+      expect(cancel).not.toHaveBeenCalled();
+    });
+
+    it("answers no-refresh-in-flight when the run finished before the cancel signal", async () => {
+      decide.mockRejectedValue(terminal(409, "no-decision-open"));
+      cancel.mockRejectedValue(terminal(404, "not found"));
+      expect(answer(await call({ action: "cancel" }))).toEqual({ isError: true, text: "no-refresh-in-flight" });
+    });
+
+    it("does not report success or a conflict when Restate is unavailable", async () => {
+      decide.mockRejectedValue(new Error("connect ECONNREFUSED"));
+      await expect(call({ action: "accept" })).resolves.toMatchObject({ isError: true });
     });
   });
 
@@ -1337,6 +1514,7 @@ describe("migrated write handlers (AII-713)", () => {
         owner: "org",
         repo: "repo",
         reviewers: null,
+        trustedReviewAuthors: null,
         maxTurns: null,
         maxIterations: null,
         prDispatchBudget: null,
@@ -1351,6 +1529,27 @@ describe("migrated write handlers (AII-713)", () => {
 
       expect(addProjectArgsSchema.safeParse({ teamKey: null, owner: "org", repo: "repo" }).success).toBe(false);
       expect(addProjectArgsSchema.safeParse({ teamKey: "AII", owner: "org", repo: "repo", reviewers: "x" }).success).toBe(false);
+    });
+
+    it("safeParse accepts the reviewProcess ids, null, and omission, and rejects github", () => {
+      const base = { teamKey: "AII", owner: "org", repo: "repo" };
+      for (const reviewProcess of ["claude-code-review", "ai-implement", null]) {
+        expect(addProjectArgsSchema.safeParse({ ...base, reviewProcess }).success).toBe(true);
+      }
+      expect(addProjectArgsSchema.safeParse(base).success).toBe(true);
+      expect(addProjectArgsSchema.safeParse({ ...base, reviewProcess: "github" }).success).toBe(false);
+    });
+
+    it("safeParse accepts a valid trustedReviewAuthors list and rejects a non-string entry", () => {
+      expect(addProjectArgsSchema.safeParse({
+        teamKey: "AII", owner: "org", repo: "repo",
+        trustedReviewAuthors: ["codex-reviewer[bot]"],
+      }).success).toBe(true);
+
+      expect(addProjectArgsSchema.safeParse({
+        teamKey: "AII", owner: "org", repo: "repo",
+        trustedReviewAuthors: [123],
+      }).success).toBe(false);
     });
   });
 
@@ -1629,11 +1828,22 @@ describe("set_fly_machine_profile / get_kg_status flyMachine (AII-1130)", () => 
     const ctx = {
       ...fakeContext("get_kg_status"),
       objectClient: (def: { name: string }, key: string) =>
-        def.name === "FlyMachineProfile" ? profileClient(key) : { status: async () => null, lastAdminDryRun: async () => null },
+        def.name === "FlyMachineProfile" ? profileClient(key) : { status: async () => null, get: async () => ({ config: { jobTimeoutMinutes: 240 }, source: "default" }) },
     } as unknown as restate.Context;
     const status = JSON.parse((await getKgStatusTool(ctx, { caller: SYSTEM_ADMIN, args: {} })).content[0].text);
     expect(status.flyMachine).toEqual({
       cpuKind: "performance", cpus: 2, memoryMb: 4096, idleTimeoutMs: FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"].idleTimeoutMs, source: "profile",
     });
+  });
+
+  it("get_kg_status reports executionMode with the effective backend, its source and the setting", async () => {
+    const ctx = {
+      ...fakeContext("get_kg_status"),
+      objectClient: (def: { name: string }, key: string) =>
+        def.name === "FlyMachineProfile" ? profileClient(key) : { status: async () => null, get: async () => ({ config: { jobTimeoutMinutes: 240 }, source: "default" }) },
+    } as unknown as restate.Context;
+    const status = JSON.parse((await getKgStatusTool(ctx, { caller: SYSTEM_ADMIN, args: {} })).content[0].text);
+    expect(status.executionMode).toMatchObject({ effective: expect.any(String), source: expect.any(String), setting: expect.any(String) });
+    expect(status.runProfile.backend).toBe(status.executionMode.effective);
   });
 });

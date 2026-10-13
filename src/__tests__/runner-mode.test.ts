@@ -337,6 +337,42 @@ describe("runner-mode", () => {
       });
     });
 
+    describe("kg execution mode (AII-1218)", () => {
+      const rowCount = () =>
+        (dedup.getDb().prepare("SELECT COUNT(*) AS n FROM settings WHERE key = 'kg_execution_mode'").get() as { n: number }).n;
+
+      it("defaults to today's behaviour by Fly configuration", () => {
+        expect(runnerMode.getKgExecutionMode(true)).toEqual({ mode: "fly-machines", source: "default" });
+        expect(runnerMode.getKgExecutionMode(false)).toEqual({ mode: "github-actions", source: "default" });
+      });
+
+      it("parses only the two values", () => {
+        expect(runnerMode.parseKgExecutionModeEnv("github-actions")).toBe("github-actions");
+        expect(runnerMode.parseKgExecutionModeEnv("fly-machines")).toBe("fly-machines");
+        for (const v of [undefined, "", "  ", "local-docker", "both", "fly"]) {
+          expect(runnerMode.parseKgExecutionModeEnv(v)).toBeUndefined();
+        }
+      });
+
+      it("a saved value wins over the default", () => {
+        runnerMode.setKgExecutionMode("github-actions");
+        expect(runnerMode.getKgExecutionMode(true)).toEqual({ mode: "github-actions", source: "db" });
+      });
+
+      it("seeds once and is inert after a save", () => {
+        runnerMode.seedKgExecutionModeFromEnv("fly-machines");
+        expect(runnerMode.getKgExecutionMode(false)).toEqual({ mode: "fly-machines", source: "db" });
+        runnerMode.setKgExecutionMode("github-actions");
+        runnerMode.seedKgExecutionModeFromEnv("fly-machines");
+        expect(runnerMode.getKgExecutionMode(false).mode).toBe("github-actions");
+      });
+
+      it.each([undefined, "", "  ", "bogus"])("env %j writes no row", (val) => {
+        runnerMode.seedKgExecutionModeFromEnv(val);
+        expect(rowCount()).toBe(0);
+      });
+    });
+
     it("returns disabled default when DB is unavailable", () => {
       dedup.closeDb();
       vi.spyOn(dedup, "getDb").mockImplementation(() => {
@@ -440,31 +476,4 @@ describe("runner-mode", () => {
     });
   });
 
-  describe("getKgFlyMachineOverride / setKgFlyMachineOverride (AII-1120)", () => {
-    const row = () => dedup.getDb().prepare("SELECT value FROM settings WHERE key = 'kg_fly_machine_override'").get();
-
-    it("returns {} with no row", () => {
-      expect(runnerMode.getKgFlyMachineOverride()).toEqual({});
-    });
-
-    it("round-trips a value and deletes the row on null", () => {
-      runnerMode.setKgFlyMachineOverride({ cpus: 4, memoryMb: 8192, cpuKind: "performance" });
-      expect(runnerMode.getKgFlyMachineOverride()).toEqual({ cpus: 4, memoryMb: 8192, cpuKind: "performance" });
-      runnerMode.setKgFlyMachineOverride(null);
-      expect(row()).toBeUndefined();
-      expect(runnerMode.getKgFlyMachineOverride()).toEqual({});
-    });
-
-    it("returns {} for garbage and logs once", () => {
-      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-      try {
-        dedup.getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('kg_fly_machine_override', ?)").run("{nope");
-        expect(runnerMode.getKgFlyMachineOverride()).toEqual({});
-        expect(runnerMode.getKgFlyMachineOverride()).toEqual({});
-        expect(warn).toHaveBeenCalledTimes(1);
-      } finally {
-        warn.mockRestore();
-      }
-    });
-  });
 });

@@ -18,7 +18,7 @@ sequenceDiagram
     O->>O: mintRunToken(result), mintRunToken(progress)
     O->>D: RUN_TOKEN, RUN_PROGRESS_TOKEN, callback URL
     D->>R: container environment
-    R->>P: repoProcessEnv() keeps the run tokens
+    R->>P: repoProcessEnv() strips the run tokens
     R->>M: modelProcessEnv() strips the run tokens
     R->>O: POST /runner/progress (progress token, reusable)
     R->>O: POST /runner/result (result token, consumed on first use)
@@ -49,10 +49,10 @@ Unmarked Legacy callbacks retain the single-use result token above.
 | Process | Environment builder | Run tokens | Model credentials | Forwarded secrets | GitHub write tokens |
 |---|---|---|---|---|---|
 | The pipeline itself (Node) | `process.env` | present | present | present | present |
-| Repository processes: `install`, `setup`, `verify`, `teardown` hooks, and `preflight`, which runs the repository's `typecheck`, `lint`, and `test` scripts | `repoProcessEnv()` | **present** | stripped | present | present |
+| Repository processes: `install`, `setup`, `verify`, `teardown` hooks, and `preflight`, which runs the repository's `typecheck`, `lint`, and `test` scripts | `repoProcessEnv()` | stripped (`RUNNER_CREDENTIAL_KEYS`) | stripped | present | present |
 | The model process and everything it spawns | `modelProcessEnv()` | stripped (`RUNNER_CREDENTIAL_KEYS`, since AII-396 on 2026-09-02) | one of the two | stripped | stripped unless a gap-fill owns its branch |
 
-The consequence to remember: any code the repository runs under `preflight` or a hook holds the run's own authority. A test suite is repository code. The model process cannot reach the tokens, so "the agent did it" is the wrong model of this failure.
+The consequence to remember: only the runner's own Node process holds the run's authority. Code the repository runs under `preflight`, `install` or a hook (a test suite is repository code) cannot read the run tokens, so it cannot post a report or consume the single-use result token. Forwarded secrets stay available to those processes.
 
 ## Configured-run model bootstrap (AII-951)
 
@@ -88,11 +88,11 @@ The workflow key is the dispatch id: the kg-refresh callback addresses `KgRefres
 
 The pilot branch now authenticates the prepared result credential and checks the
 marker against its attempt before any Legacy token consumption or provider
-effect. The injected result seam records the canonical result and its durable
-delivery row in one SQLite transaction. An identical retry returns `200`
-`duplicate` and checks/repairs the same delivery identity; a conflicting result
-returns `409`, and a stale one returns `410`. The delivery pump contacts Restate
-afterward, so a sidecar outage does not reverse SQLite acceptance. A failed
+effect. The injected result seam records the canonical result and forwards it to
+`ReviewFixAttempt.result` through the ingress client. An identical retry returns
+`200` `duplicate` under the same forward key; a conflicting result returns `409`,
+and a stale one returns `410`. The callback answers `503` when Restate is
+unreachable; there is no delivery pump. A failed
 database write or missing persistence seam does not acknowledge the callback.
 Explicit pilot metadata cannot fall through to Legacy completion, finding
 resolution, or approval.

@@ -27,12 +27,13 @@ Companion documents: [restate.md](restate.md) (engine, patterns), [restate-revie
 | `KgRepo` | Virtual Object | KG source repo slug | `src/restate/kg-repo.ts` |
 | `FlyMachineProfile` | Virtual Object | pipeline phase (`kg-refresh`) | `src/restate/fly-machine-profile.ts` |
 | `PlanningRun` | Workflow | dispatch id | `src/restate/planning-run-workflow.ts` |
+| `LateExternalReview` | Workflow | dispatch id | `src/restate/late-external-review.ts` |
 | `ReviewFixAttempt` | Workflow | attempt id | `src/restate/review-fix-attempt.ts` |
 | `ReviewFixPR` | Virtual Object | PR key | `src/restate/review-fix-pr.ts` |
 | `Operator` | Virtual Object | operator identity | `src/restate/operator-object.ts` |
 | `orchestratorTools` | Service | — | `src/restate/tools.ts` |
 
-All eight register through one endpoint (`src/restate/endpoint.ts`, `src/index.ts`). The service
+All nine register through one endpoint (`src/restate/endpoint.ts`, `src/index.ts`). The service
 and handler types that the typed clients use are in `src/restate/kg-refresh-types.ts`.
 
 ### Lifecycle kit and contract suite
@@ -51,7 +52,7 @@ and handler types that the typed clients use are in `src/restate/kg-refresh-type
 | Workflow `run` handler | yes | yes | — | |
 | Shared workflow handlers | yes: `report`, `progress`, `cancel`, `status` | yes: `result`, `cancel` | — | |
 | Durable promises (`ctx.promise` get/peek/resolve) | yes (`report`, `cancel`, `progress`) | yes | — | RF uses peek-then-resolve (§ 6 P1) |
-| `ctx.run` named steps | yes | yes (~25) | yes (one per write) | |
+| `ctx.run` named steps | yes | yes (28 sites in `ReviewFixAttempt`, 5 in `ReviewFixPR`; § 2.1) | yes (one per write) | RF kinds are tabulated in § 2.1 |
 | `ctx.run` retry options | `maxRetryAttempts: 3` on the gate, `dispatch`, `outcome`, `merge` and `delete-branch` steps | none | `maxRetryAttempts: 1` | No `initialRetryInterval`, `maxRetryDuration` anywhere |
 | Handler `retryPolicy` | none | none | `{ maxAttempts: 1, onMaxAttempts: "kill" }` on writes | |
 | `ctx.sleep` | yes (race arm, cancel watch) | yes (1 s polling loops) | test seam only | |
@@ -61,20 +62,20 @@ and handler types that the typed clients use are in `src/restate/kg-refresh-type
 | One-way send | yes, typed (`objectSendClient`, `workflowSendClient`; AII-975) | yes, untyped (`genericSend`) | — | |
 | Delayed send | yes: `KgRepo.expire` self-send (AII-973) | yes (`ReviewFixPR.check` self-timer) | no | |
 | Request-response call (`objectClient`, `workflowClient`) | yes (from tools handlers, typed) | no | yes | |
-| Virtual Object state (`get`/`set`/`clear`) | yes (`inFlight`, `pending`, `outcome:<repo>#<pr>`, `sha:<repo>#<pr>`) | yes | yes (+ `clearAll`) | |
+| Virtual Object state (`get`/`set`/`clear`) | yes (`inFlight`, `pending`, `closedKeys`, `sha:<repo>#<pr>`) | yes | yes (+ `clearAll`) | |
 | Workflow state (`ctx.set` inside `run`) | yes (`step`, `runId`, …) | no | — | |
-| Exclusive vs shared object handlers | yes (`status`, `dryRunOutcome` shared) | no (all exclusive) | yes (`describe`, `identity` shared) | |
+| Exclusive vs shared object handlers | yes (`status` shared) | no (all exclusive) | yes (`describe`, `identity` shared) | |
 | `ctx.rand`, `ctx.date` | yes | yes | yes | |
 | `TerminalError` | yes | yes | no (wrapper answers `isError`) | |
 | `TerminalError` with `errorCode` | yes: 404 and 409 (AII-975) | no | no | |
 | Invocation cancellation (`ctx.cancel`, admin cancel) | no (own `cancel` promise) | no (own `cancel` promise) | no | § 5.1 |
 | `ctx.attach` / `/restate/attach` | tests only | no | no | |
-| Ingress `idempotency-key` | yes: runner report (dispatch id), webhook enqueue (delivery id) | yes: delivery pump key | when the caller supplies one | |
+| Ingress `idempotency-key` | yes: runner report (dispatch id), webhook enqueue (delivery id) | yes: webhook delivery id, attempt result key (`<attemptId>.result.<body hash>`), cancel keys (`<attemptId>.closed`, `<attemptId>.cancel`), drain nudge (`<queue id>.<event id>.<30 s bucket>`) | when the caller supplies one | |
 | SDK ingress client (`@restatedev/restate-sdk-clients`) | yes: `createKgRefreshIngressClient` (AII-975) | no | no | |
 | Service options: `workflowRetention`, `journalRetention` | yes | yes | no | |
 | Service options: `idempotencyRetention` | on `report`, `cancel` | on `result`, `cancel` | no | KG `status` and `progress` carry no retention (AII-973) |
 | Service options: `inactivityTimeout`, `abortTimeout` | yes (15 m / 20 m) | no | no | § 6 C6 |
-| Service options: `ingressPrivate` | yes: `KgRefresh.run`, `KgRepo.release`, `expire`, `recordDryRunOutcome` (AII-976) | no | no | |
+| Service options: `ingressPrivate` | yes: `KgRefresh.run`, `KgRepo.release`, `expire`, `extend`, `recordDryRunOutcome` (AII-976) | no | no | |
 | Service options: `enableLazyState` | no | no | no | |
 | Zod input schemas (`serde.zod`, `.strict()`) | yes (AII-938) | no | yes | |
 | Hooks | no | no | no | |
@@ -82,7 +83,60 @@ and handler types that the typed clients use are in `src/restate/kg-refresh-type
 | Admin API: registration with drain check | shared | shared | shared | `endpoint.ts` |
 | Admin API: SQL introspection (`sys_invocation` …) | shared | shared | shared | deploy drain, census |
 | Admin API: cancel / kill / purge / restart | no | no | no | |
-| Two-runtime scenario tests (container + binary, `alwaysReplay` / `disableRetries`) | yes | yes | yes | |
+| Binary-runtime scenario tests (`alwaysReplay` / `disableRetries`) | yes | yes | yes | |
+
+### 2.1 Review-fix journal re-check (AII-1176)
+
+Re-check of every `ctx.run` step against the journal rule of ADR 018 (amendment 2026-10-08): a value a SQLite row carries is a journaled step result, and a SQLite write is a projection of journaled values (`docs/restate.md` § "Journal projections"). Kinds: `read`; `external` (GitHub or the worker); `atomic SQLite step` (admission only); `projection` (a SQLite write of a journaled value, named in the last column).
+
+Step names are unchanged; `docs/restate-review-fix-pilot.md` and the job drawer read them. The count differs from the issue text: `review-fix-attempt.ts` has 28 `ctx.run` sites (the `alert` helper is one site that runs under four step names; the `reconcile-N`, `cancel-worker-N` and `inspect-terminal-N` names are indexed), and `review-fix-pr.ts` has five.
+
+**`ReviewFixAttempt`**
+
+| Step | Kind | Journaled value written |
+|---|---|---|
+| `load-prepared-attempt` | read | |
+| `revoke-expired-before-launch` | projection | `authority_revoked_at` = `ctx.date.now()` |
+| `record-expired-before-launch` | projection | `terminal_outcome_json`, `completed_at` = `ctx.date.now()` (returned as `completedAt`) |
+| `release-expired-before-launch` | projection | `dispatch_admissions` release; the store's shared release stamps `released_at` itself (open, below) |
+| `check-prelaunch-authority` | read | |
+| `record-cancelled-before-launch` | projection | `terminal_outcome_json`, `completed_at` = `ctx.date.now()` |
+| `release-before-launch` | projection | release, as above |
+| `launch-once` | external | none returned to SQLite; the closure also records launch intent (`state = 'launch_intent'`, no clock) and carries no token or secret out |
+| `record-rejected-outcome` | projection | `terminal_outcome_json`, `completed_at` = `ctx.date.now()` |
+| `release-rejected-launch` | projection | release, as above |
+| `reconcile-N` | external | |
+| `alert-unknown-launch`, `alert-conflicting-execution`, `alert-unconfirmed-stop`, `alert-stale-result` (the `alert` helper) | external | |
+| `revoke-unresolved-launch` | projection | `authority_revoked_at` = the `ctx.date.now()` read in the same loop pass |
+| `bind-exact-execution` | projection | `github_run_id`, `github_run_attempt` from the launch or reconcile result; `result_conflict_at` = `ctx.date.now()` on an early-result mismatch |
+| `revoke-conflicting-execution` | projection | `authority_revoked_at` = `ctx.date.now()` |
+| `revoke-after-cancel-or-invalid-result` | projection | `authority_revoked_at` = `ctx.date.now()` |
+| `revoke-at-deadline` | projection | `authority_revoked_at` = the `ctx.date.now()` that crossed the deadline |
+| `cancel-worker-N` | external | |
+| `inspect-terminal-N` | external | |
+| `record-success-outcome` | projection | `terminal_outcome_json`, `completed_at` = `ctx.date.now()` |
+| `check-final-authority` | read | |
+| `load-approval-evidence` | read | |
+| `apply-approval-once` | external | |
+| `record-terminal-outcome` | projection | `terminal_outcome_json`, `completed_at` = `ctx.date.now()` |
+| `release-confirmed-terminal` | projection | release, as above |
+| `store-result` | projection | `accepted_result_json` from the validated result; `result_conflict_at` = `ctx.date.now()` on a conflict |
+| `revoke-conflicting-result` | projection | `authority_revoked_at` = `ctx.date.now()` |
+| `revoke-cancelled-attempt` | projection | `authority_revoked_at` = `ctx.date.now()` |
+
+**`ReviewFixPR`**
+
+| Step | Kind | Journaled value written |
+|---|---|---|
+| `load-collection-window` | read | |
+| `load-pending` | read | |
+| `admit-pending` | atomic SQLite step | none: `store.admit` computes the attempt id, `deadlineAt`, the task snapshot and the reservation in one transaction over `dispatch_admissions` (ADR 031, amendment 2026-10-09) |
+| `load-after-completion` | read | |
+| `load-after-capacity` | read | |
+
+Every store method that takes a `now` is also called outside the workflow, with `Date.now()` at that caller's boundary and no journal: the admin facade (`bindExecution`, `revokeAuthority`), the runner-callback result route (`recordResult`), and `finalizeReviewFixAttempt` (`revokeAuthority`, `recordOutcome`). Those writes are not journaled, so the replay argument does not apply to them. `store-result` runs in a shared handler, but the callback route has normally committed the result first, so the journaled `now` there is mostly a no-op (`result_conflict_at` uses `COALESCE`, so the first writer wins).
+
+Open: `releaseOwner` writes `dispatch_admissions.released_at` with a clock read inside `releaseDispatchAdmission`, which Legacy and Restate owners share. It is not in AII-1176's scope; converting it means changing the shared release signature for every caller.
 
 ## 3. What kg-refresh uses that the review-fix pilot does not
 
@@ -93,20 +147,20 @@ mechanism the pilot still carries (§ 5.2).
 |---|---|---|
 | **Virtual Object as the lock** (exclusive `trigger`, `inFlight` state, `release` from the workflow) | `KgRepo` (ADR 032) | `dispatch_admissions` rows + lifecycle-owner stamps + `isRestateOwnedJob` fences |
 | **Object state as the queue** (`pending` map, drained by `release`) | `KgRepo.enqueueDryRun` (AII-730) | `ReviewFixPR` deferred recheck every 30 s; `capacityAvailable` (never called) |
-| **Direct ingress from the authenticated route with an idempotency key** (ADR 023 amendment) | runner callback → `KgRefresh/{id}/report`; webhook → `KgRepo/{slug}/enqueueDryRun` | SQLite inbox + `ReviewFixDeliveryPump` (2 s `setInterval`) |
+| **Direct ingress from the authenticated route with an idempotency key** (ADR 023 amendment) | runner callback → `KgRefresh/{id}/report`; webhook → `KgRepo/{slug}/enqueueDryRun` | ingress client with the sender's event id as key (AII-1187 retired the inbox and pump) |
 | **Request-response calls between services** (`ctx.objectClient`, `ctx.workflowClient`) | tools handlers call `KgRepo.trigger` / `KgRefresh.status` natively | none; the pilot only sends |
 | **Race of durable promises against a timer** (`RestatePromise.race`) | wait loop: report / cancel / progress / tick | 1 s `ctx.sleep` loop with a GitHub call per tick |
 | **Awakeables / signals** | A durable external signal into a workflow | Only through a channel every deployment already has (ADR 033); no GitHub App event or setting may be required |
 | **Typed send clients and an SDK ingress client** (AII-975) | `objectSendClient` / `workflowSendClient` over `src/restate/kg-refresh-types.ts`; `createKgRefreshIngressClient` maps 404 and 409 | `genericSend`; hand-written `fetch` wrappers |
 | **Zod `.strict()` inputs** (AII-938) | `KgRefresh.run` and every `KgRepo` handler with an input | none |
 | **Lease expiry owned by the object** (AII-973) | `KgRepo` sends itself a delayed `expire` at the workflow's total deadline plus `KG_REPO_STALE_MARGIN_MS` | missed-close recovery poll |
-| **Per-PR verdict and same-sha dedup in object state** (AII-977) | `KgRepo.recordDryRunOutcome`, `dryRunOutcome`, `forgetPr`; keys `outcome:<repo>#<pr>`, `sha:<repo>#<pr>` | SQLite rows and process memory |
+| **Per-PR same-sha dedup and closed-PR record in object state** (AII-977) | `KgRepo.forgetPr`; keys `sha:<repo>#<pr>`, `closedKeys` | SQLite rows and process memory |
 | **Workflow state for progress** (`ctx.set("step", …)`) read by a shared `status` handler | `get_kg_status` stage derivation (`kgStageForStep`, `src/restate/tools.ts`) | SQLite row is the only progress record |
 | **`inactivityTimeout` / `abortTimeout`** | 15 m / 20 m on `KgRefresh` | unset (defaults) |
 | **Saga shape** (one `ctx.run` per rail gate, `revert` as compensation) | fetch → stage → swap → verify, `revert` | the pilot has no compensating step |
 | **Exact run identity** (`returnRunDetails: true`, reconcile by title, reconcile-first `dispatch`) | `dispatch` step | reconcile loop by polling |
 | **Credentials minted inside the dispatch step, never journaled** (AII-933, AII-973) | `mintRunTokens` is called inside `ctx.run("dispatch")`; the step result carries no token | `mintPreparedReviewFixToken` at launch (SQLite consume-once claim) |
-| **`ingressPrivate` handlers** (AII-976) | `KgRefresh.run`, `KgRepo.release`, `expire`, `recordDryRunOutcome` | none; the pilot handlers are not marked |
+| **`ingressPrivate` handlers** (AII-976) | `KgRefresh.run`, `KgRepo.release`, `expire`, `extend`, `recordDryRunOutcome` | none; the pilot handlers are not marked |
 
 ## 4. Restate features neither pipeline uses yet
 
@@ -140,7 +194,7 @@ use them yet.
 | Untyped `genericSend`, cast handles | typed send clients | done (AII-975) |
 | Gate failure JSON-encoded into a `TerminalError` message | a result union from `ctx.run` (`GateResult`) | done (AII-975) |
 | Dead branch: `kgStageForStep` matched `watch-`/`reconcile-` that `step` never holds | — | done (AII-975) |
-| `dryRunOutcomesByPr` (memory + the `kg_refresh_dry_run_outcomes` settings row), `kgDryRunLastSha` (memory) | `KgRepo` state (per-PR keys) | done (AII-977); the settings row is deleted at boot (`src/kg-refresh.ts`) |
+| `dryRunOutcomesByPr`, `kgDryRunLastSha` | `KgRepo` state (per-PR keys); the outcome is no longer stored | done (AII-977, AII-1285); the settings row is deleted at boot (`src/kg-refresh.ts`) |
 | Own `cancel` promise + poll until GitHub confirms | invocation cancellation | stays, justified: the cancel path must hold the marker until GitHub confirms that the run stopped |
 | Job-row id in a process `Map` with SQL fallback (`jobIds`, `src/restate/kg-refresh-production.ts`) | return the id from `ctx.run("reserve")` | done (AII-1011): the map is gone; `closeJobLog` resolves the row by dispatch id |
 | `kg_refresh_last_refresh` / `kg_refresh_snapshot_sha` settings rows (`src/kg-refresh.ts`) | `KgRepo` state | stays; the served-snapshot record is read outside Restate at boot |
@@ -151,7 +205,6 @@ Not changed by this tree.
 
 | Mechanism | Code | Restate primitive once the kind migrates whole |
 |---|---|---|
-| SQLite inbox + delivery pump (2 s `setInterval`) | `review-fix-inbox.ts`, `review-fix-client.ts` ~199–397 | direct ingress with `idempotency-key`; longer `idempotencyRetention` |
 | `dispatch_admissions` rows | `dispatch-admission.ts`, `dedup.ts` ~255–294 | a per-mapping capacity Virtual Object (`acquire`/`release`, waiters woken by send) |
 | Lifecycle-owner stamps (`lifecycle_owner`) | `dispatch-admission.ts` ~31, `runner-tokens.ts` ~213, `deploy.ts` ~123 | implicit: the workflow key exists; `sys_invocation` census |
 | `isRestateOwnedJob` fences (three copies) | `index.ts` ~2434, `stuck-watchdog.ts` ~19, `reaper.ts` ~22 | deleted with the Legacy owner |
@@ -181,7 +234,6 @@ the first review's; the Status column is the state on the feature branch.
 | C9 | **No endpoint or ingress security features.** No `identityKeys`; no `ingressPrivate`. Loopback binding was the only control (ADR 023). | all | medium | fixed (AII-976): request identity key on the sidecar, endpoint-wide; `ingressPrivate` on the kg-refresh handlers only other services call. The pilot handlers are not marked |
 | P1 | **Peek-then-resolve on durable promises is not atomic** across `result` and `cancel` shared handlers (`review-fix-attempt.ts` ~295–318). | RF | low–medium | not addressed, by decision (pilot) |
 | P2 | **Default infinite retries** on every pilot step; `tool()` swallows all non-suspension errors with an internal API (`restate.internal.isSuspendedError`). | RF, Tools | low | not addressed, by decision (pilot) |
-| P3 | **Pump retries 4xx forever.** A `TerminalError` from a key/scope mismatch becomes a poison row retried every 5 s (`review-fix-client.ts` ~89–92). | RF | low–medium | not addressed, by decision (pilot) |
 | P4 | Dead handler `ReviewFixPR.capacityAvailable`; stale "nothing uses the workflow" comments. | all | cleanup | kg-refresh comments fixed (AII-975); pilot part not addressed, by decision |
 
 ## 7. Record: what landed and what remains
@@ -198,6 +250,7 @@ Landed on the feature branch, in merge order:
 8. AII-1026 — the `workflow_run` path and awakeable are removed; the run watch is one 60 s status read (ADR 033).
 9. AII-1018 — `PlanningRun`: one workflow owns each planning run of a `restate` project from reservation to release, on GitHub Actions, Fly Machines, and local Docker, through `awaitOwnedRun` (AII-1052, AII-1053, AII-1019, AII-1020, AII-1054, AII-1021). See [restate.md](restate.md#the-planning-run).
 10. AII-1062 to AII-1069, AII-1067 — the owned-run lifecycle kit (ADR 036). `PlanningRun` uses all steps: `reserveOwnedRun`, `readOwnedRunStatus`, `cleanupOwnedRun`, `reportOwnedRunOutcome`; its reservation moved into the workflow's first step, each machine is named from the dispatch id, and a cancel during the reserve or launch step leaves no run or reservation. `KgRefresh` uses only the bounded read, `readBoundedOwnedRun`. Operators list and release a held reservation (`list_dispatch_reservations`, `release_dispatch_reservation`). See [restate.md](restate.md#the-owned-run-lifecycle-kit).
+11. AII-1227 — `LateExternalReview`: for a run that ended `external_review_pending`, a workflow reads the PR every 60 s for up to 30 min and writes the approval mark when the external review passes on the same head with no open blocking finding. Started from `handleRunnerResult` for any project when Restate is ready; see [feature-branch-grouping.md](feature-branch-grouping.md) §8.
 
 Remains:
 

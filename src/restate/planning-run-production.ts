@@ -8,14 +8,14 @@ import { getMappings } from "../config.js";
 import { acquireDispatch } from "../dispatch-gate.js";
 import { read as readAdmission, releaseByDispatchId } from "../dispatch-admission.js";
 import type { AppConfig, HeldReservation } from "../index.js";
-import { classifyFlyMachine, classifyLocalContainer, stopBackendRun } from "../backend-run.js";
+import { classifyFlyMachine, classifyLocalContainer, destroyMachineRecorded, stopBackendRun } from "../backend-run.js";
 import { getRunnerMode } from "../runner-mode.js";
 import type { TicketIssue, TicketingProvider } from "../providers/types.js";
 import { defaultFetchSignal, cancelWorkflowRun, getWorkflowRunStatus } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { findLogIdByDispatchId, getJobByDispatchId, getStuckAttemptStampedAt, updateJobRunId, updateJobStatus, type Job } from "../log.js";
 import { planningSessionName, type launchPlanningRun, type launchPlanningSession, type preparePlanningLaunch } from "../planning-launch.js";
-import { destroyMachine, listMachines } from "../fly-machines.js";
+import { listMachines } from "../fly-machines.js";
 import { findLocalContainerIdByName, removeLocalContainer } from "../local-docker.js";
 import { remediateFailedJob, type StuckWatchdogConfig } from "../stuck-watchdog.js";
 import type { RestateService } from "./endpoint.js";
@@ -81,8 +81,7 @@ export function createPlanningFindExistingRun(opts: {
   getMapping: (teamKey: string) => RepoMapping | undefined;
   getToken: (owner: string) => Promise<string>;
   /** The Fly sessions credentials for the by-name machine lookup; absent values throw. */
-  flySessionsToken?: string | null;
-  flySessionsApp?: string | null;
+  getFlySessions?: () => { token: string | null; app: string | null };
 }): PlanningRunDependencies["findExistingRun"] {
   return async (input, dispatchedAt) => {
     const backend = containerBackend(input);
@@ -92,10 +91,11 @@ export function createPlanningFindExistingRun(opts: {
       if (recorded) return recorded;
       const name = planningSessionName(input.dispatchId);
       if (backend === "local-docker") return findLocalContainerIdByName(name);
-      if (!opts.flySessionsToken || !opts.flySessionsApp) {
+      const fly = opts.getFlySessions?.();
+      if (!fly?.token || !fly.app) {
         throw new Error("findExistingRun: FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP not set");
       }
-      const machines = await listMachines(opts.flySessionsToken, opts.flySessionsApp);
+      const machines = await listMachines(fly.token, fly.app);
       return machines.find((m) => m.name === name)?.id ?? null;
     }
     const mapping = requireMapping(opts.getMapping, input.teamKey);
@@ -247,7 +247,7 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
     try {
       if (run.backend === "fly-machines") {
         if (!config.flySessionsToken || !config.flySessionsApp) throw new Error("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured");
-        await destroyMachine(config.flySessionsToken, config.flySessionsApp, jobId);
+        await destroyMachineRecorded(config, jobId, "planning-end");
       } else if (run.backend === "local-docker") {
         await removeLocalContainer(jobId);
       }
@@ -284,7 +284,7 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
 
   const deps: PlanningRunDependencies = {
     reserve,
-    findExistingRun: createPlanningFindExistingRun({ getMapping, getToken, flySessionsToken: config.flySessionsToken, flySessionsApp: config.flySessionsApp }),
+    findExistingRun: createPlanningFindExistingRun({ getMapping, getToken, getFlySessions: () => ({ token: config.flySessionsToken, app: config.flySessionsApp }) }),
     launch,
     readStatus,
     stop,

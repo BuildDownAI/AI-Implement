@@ -95,6 +95,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllEnvs();
   dedup.closeDb();
   try {
     fs.unlinkSync(dbPath);
@@ -1208,6 +1209,125 @@ describe("handleRunnerResult — implementation", () => {
     expect(log.getJobById(jobId)?.conclusion).not.toBe("runner_approved");
   });
 
+  describe("externalReviewPending", () => {
+    const GOOD = "0123456789abcdef0123456789abcdef01234567";
+    async function send(id: string, extra: Record<string, unknown>) {
+      const { token, dispatchId } = runnerTokens.mintRunToken({
+        issueId: id,
+        mappingTeamKey: "ENG",
+        phase: "implementation",
+        ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+        secret: SECRET,
+      });
+      log.appendLog({
+        issueId: id, issueIdentifier: "ENG-9", teamKey: "ENG", repo: "o/r", dispatchId, executionMode: "github-actions",
+      });
+      const body = {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "REVIEW_UNAPPROVED",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/99",
+        ...extra,
+      } as Record<string, unknown>;
+      const provider = new FakeProvider({ recordCalls: true });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const res = await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: body as never,
+        secret: SECRET,
+        resolveProvider: makeResolve(provider),
+      });
+      const warnings = warn.mock.calls.filter((c) => String(c[0]).includes("externalReviewPending")).length;
+      warn.mockRestore();
+      return { res, body, warnings };
+    }
+
+    it("keeps a valid field without warning", async () => {
+      const { res, body, warnings } = await send("i-erp-ok", { externalReviewPending: { headSha: GOOD } });
+      expect(res.status).toBe(200);
+      expect(body.externalReviewPending).toEqual({ headSha: GOOD });
+      expect(warnings).toBe(0);
+    });
+
+    it.each([
+      ["uppercase hex", { headSha: GOOD.toUpperCase() }],
+      ["39 chars", { headSha: GOOD.slice(1) }],
+      ["41 chars", { headSha: GOOD + "a" }],
+      ["non-hex", { headSha: "g".repeat(40) }],
+      ["non-string", { headSha: 123 }],
+      ["missing headSha", {}],
+      ["non-object", "abc"],
+      ["null", null],
+    ])("drops a malformed field (%s) with one warning and the same response", async (_n, value) => {
+      const absent = await send("i-erp-absent-" + _n, {});
+      const { res, body, warnings } = await send("i-erp-bad-" + _n, { externalReviewPending: value });
+      expect(res.status).toBe(200);
+      expect(res.status).toBe(absent.res.status);
+      expect(res.body).toEqual(absent.res.body);
+      expect(body).not.toHaveProperty("externalReviewPending");
+      expect(warnings).toBe(1);
+    });
+  });
+
+  describe("submitLateExternalReview (AII-1227)", () => {
+    const SHA = "0123456789abcdef0123456789abcdef01234567";
+    async function run(id: string, phase: "implementation" | "gap-analysis", extra: Record<string, unknown>, submit?: (i: unknown) => Promise<void>) {
+      const { token, dispatchId } = runnerTokens.mintRunToken({
+        issueId: id, mappingTeamKey: "ENG", phase,
+        ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+      });
+      log.appendLog({
+        issueId: id, issueIdentifier: "ENG-9", teamKey: "ENG", repo: "o/r", dispatchId, executionMode: "github-actions",
+      });
+      const hook = vi.fn(submit ?? (async () => {}));
+      const res = await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: {
+          phase, outcome: "failure", failureCode: "REVIEW_UNAPPROVED", comments: [],
+          prUrl: "https://github.com/o/r/pull/99", ...extra,
+        } as never,
+        secret: SECRET,
+        resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+        submitLateExternalReview: hook as never,
+      });
+      return { res, hook, dispatchId };
+    }
+
+    it.each(["implementation", "gap-analysis"] as const)("submits once with the right input (%s)", async (phase) => {
+      const { res, hook, dispatchId } = await run("i-late-" + phase, phase, { externalReviewPending: { headSha: SHA } });
+      expect(res.status).toBe(200);
+      expect(hook).toHaveBeenCalledTimes(1);
+      expect(hook).toHaveBeenCalledWith({
+        dispatchId, owner: "o", repo: "r", prNumber: 99, prUrl: "https://github.com/o/r/pull/99", headSha: SHA,
+      });
+    });
+
+    it("does not submit without the field, without prUrl, or with a malformed field", async () => {
+      const absent = await run("i-late-absent", "implementation", {});
+      const noUrl = await run("i-late-nourl", "implementation", { externalReviewPending: { headSha: SHA }, prUrl: undefined });
+      const bad = await run("i-late-bad", "implementation", { externalReviewPending: { headSha: "xyz" } });
+      for (const r of [absent, noUrl, bad]) {
+        expect(r.hook).not.toHaveBeenCalled();
+        expect(r.res.status).toBe(200);
+      }
+      expect(noUrl.res.body).toEqual(absent.res.body);
+    });
+
+    it("does not change the response when the hook throws", async () => {
+      const absent = await run("i-late-base", "implementation", {});
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const thrown = await run("i-late-throw", "implementation", { externalReviewPending: { headSha: SHA } }, async () => {
+        throw new Error("boom");
+      });
+      warn.mockRestore();
+      expect(thrown.hook).toHaveBeenCalledTimes(1);
+      expect(thrown.res.status).toBe(absent.res.status);
+      // Like every other best-effort step here, the error surfaces as a warning only.
+      expect(thrown.res.body).toEqual({ ...absent.res.body, warnings: ["submitLateExternalReview: boom"] });
+    });
+  });
+
   it("does NOT write runner_approved on INSTALL_FAILED coded failure", async () => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i-install-failed",
@@ -1981,13 +2101,20 @@ describe("handleRunnerProgress", () => {
       expect((sent as { inputs: unknown }).inputs).toEqual({ repoOwner: "org" });
     });
 
-    it("contract: KgRefresh.progress — a real TokenStepReporter step post is accepted by the real handler", async () => {
+    // A loop, not `it.each`: the producer guard (restate-producer-guard.test.ts) scans for a literal `it("contract: ...` title.
+    for (const { shape, runId } of [
+      { shape: "without GITHUB_RUN_ID", runId: "" },
+      { shape: "with GITHUB_RUN_ID (GitHub Actions)", runId: "123456" },
+    ]) it(`contract: KgRefresh.progress — a real TokenStepReporter step post is accepted by the real handler (${shape})`, async () => {
+      vi.stubEnv("GITHUB_RUN_ID", runId);
       const { token, dispatchId } = kgToken();
       const kgRefreshClient = { progress: vi.fn(async () => ({ status: "accepted" })) };
       const responses: Array<{ status: number }> = [];
       const urls: string[] = [];
+      const bodies: Array<Record<string, unknown>> = [];
       const fetchImpl = (async (url: string, init?: RequestInit) => {
         urls.push(url);
+        bodies.push(JSON.parse(init?.body as string));
         const headers = init?.headers as Record<string, string>;
         const res = await runnerCallback.handleRunnerProgress({
           authorization: headers.Authorization,
@@ -2005,6 +2132,8 @@ describe("handleRunnerProgress", () => {
       expect(urls).toEqual(["http://orchestrator.test/runner/progress"]);
       expect(responses.map((r) => r.status)).toEqual([200]);
       expect(kgRefreshClient.progress).toHaveBeenCalledWith(dispatchId, expect.objectContaining({ id: "kg-ingest" }));
+      if (runId) expect(bodies[0]).toMatchObject({ githubRunId: Number(runId) });
+      else expect(bodies[0]).not.toHaveProperty("githubRunId");
     });
   });
 });
@@ -4285,7 +4414,7 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
       body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1", reviewFix: forged },
       secret: SECRET,
       resolveProvider: makeResolve(fake),
-      onReviewFixResult: (result) => attemptStore.recordResult(result.attemptId, result),
+      onReviewFixResult: (result) => attemptStore.recordResult(result.attemptId, result, Date.now()),
     });
 
     expect(res.status).toBe(410);
@@ -4318,12 +4447,29 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
     ).rejects.toThrow("sqlite disk I/O error");
   });
 
+  it("answers 503 when the intake reports Restate unreachable, without consuming anything", async () => {
+    const fake = new FakeProvider({ recordCalls: true });
+    const token = preparedResultToken("attempt-restate-down");
+    const out = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation", outcome: "success", comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        reviewFix: { ...validReviewFix, attemptId: "attempt-restate-down" },
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+      onReviewFixResult: async () => { throw new runnerCallback.ReviewFixIntakeUnavailableError(); },
+    });
+    expect(out.status).toBe(503);
+  });
+
   it("ACKs 'stored' when the seam's durable write succeeds even though it also reports a simulated delivery-sidecar outage (best-effort, non-blocking)", async () => {
     const fake = new FakeProvider({ recordCalls: true });
     const token = preparedResultToken("attempt-sidecar-outage");
     const onReviewFixResult = vi.fn(async (result: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> => {
       // Durable write succeeds; a simulated Restate delivery attempt reports
-      // "unavailable" internally (mirrors ReviewFixDeliveryFacade's degrade-to-
+      // "unavailable" internally (mirrors the ingress client's degrade-to-
       // unavailable contract) — this must never affect the ack.
       return { status: "stored", result };
     });
@@ -4360,7 +4506,7 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
       body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1", reviewFix: result },
       secret: SECRET,
       resolveProvider: makeResolve(fake),
-      onReviewFixResult: (r) => attemptStore.recordResult(r.attemptId, r),
+      onReviewFixResult: (r) => attemptStore.recordResult(r.attemptId, r, Date.now()),
     });
 
     expect(res.status).toBe(200);
