@@ -1345,6 +1345,19 @@ describe("handleRunnerResult — implementation", () => {
       // Idempotent through the workflow key: the real hook answers `conflict` and the row is unchanged.
     });
 
+    it("re-submits a pending review-fix attempt with its attemptId once, then clears it (AII-1307)", async () => {
+      log.recordPendingAttemptReview("att-1", "d-att", "https://github.com/o/r/pull/7", NOW - HOUR);
+      const submit = vi.fn(async () => {});
+      expect(await runnerCallback.resubmitPendingGapFillReviews({ ready: () => false, submit, now: NOW })).toBe(0);
+      expect(submit).not.toHaveBeenCalled();
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
+      expect(submit).toHaveBeenCalledWith({
+        dispatchId: "d-att", owner: "o", repo: "r", prNumber: 7, prUrl: "https://github.com/o/r/pull/7", gapFill: true, attemptId: "att-1",
+      });
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
+      expect(submit).toHaveBeenCalledTimes(1);
+    });
+
     it("respects the 24 h window", async () => {
       const old = pendingRow("i-old");
       const fresh = pendingRow("i-fresh");

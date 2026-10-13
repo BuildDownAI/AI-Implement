@@ -8,6 +8,8 @@ import {
   updateJobStatus,
   type Job,
   getGapFillRowsAwaitingLateReview,
+  getPendingAttemptReviews,
+  clearPendingAttemptReview,
 } from "./log.js";
 import { redactStepCredentials } from "./pipeline/step-redaction.js";
 import type { Step } from "./pipeline/types.js";
@@ -1598,7 +1600,7 @@ const LATE_REVIEW_RESUBMIT_WINDOW_MS = 24 * 60 * 60 * 1000;
  */
 export async function resubmitPendingGapFillReviews(opts: {
   ready: () => boolean;
-  submit: (input: { dispatchId: string; owner: string; repo: string; prNumber: number; prUrl: string; gapFill: true }) => Promise<void> | void;
+  submit: (input: { dispatchId: string; owner: string; repo: string; prNumber: number; prUrl: string; gapFill: true; attemptId?: string }) => Promise<void> | void;
   now?: number;
 }): Promise<number> {
   if (!opts.ready()) return 0;
@@ -1612,6 +1614,19 @@ export async function resubmitPendingGapFillReviews(opts: {
       submitted++;
     } catch (err) {
       console.warn(`[late-review-sweep] submit failed dispatch=${job.dispatchId}:`, err);
+    }
+  }
+  // AII-1307: a succeeded review-fix attempt's submit, keyed `<dispatchId>-<attemptId>`; cleared once accepted.
+  for (const pending of getPendingAttemptReviews((opts.now ?? Date.now()) - LATE_REVIEW_RESUBMIT_WINDOW_MS)) {
+    const target = parsePrUrlTarget(pending.prUrl);
+    if (!target) continue;
+    console.log(`[late-review-sweep] re-submitting LateExternalReview dispatch=${pending.dispatchId} attempt=${pending.attemptId} pr=${pending.prUrl}`);
+    try {
+      await opts.submit({ dispatchId: pending.dispatchId, ...target, prUrl: pending.prUrl, gapFill: true, attemptId: pending.attemptId });
+      clearPendingAttemptReview(pending.attemptId);
+      submitted++;
+    } catch (err) {
+      console.warn(`[late-review-sweep] submit failed dispatch=${pending.dispatchId} attempt=${pending.attemptId}:`, err);
     }
   }
   return submitted;

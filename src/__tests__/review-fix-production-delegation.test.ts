@@ -14,10 +14,12 @@ vi.mock("../runner-mode.js", () => ({
 }));
 const getLatestWorkRowForPr = vi.fn();
 const stampJobApproved = vi.fn();
+const recordPendingAttemptReview = vi.fn();
 vi.mock("../log.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../log.js")>()),
   getLatestWorkRowForPr: (...args: unknown[]) => getLatestWorkRowForPr(...args),
   stampJobApproved: (...args: unknown[]) => stampJobApproved(...args),
+  recordPendingAttemptReview: (...args: unknown[]) => recordPendingAttemptReview(...args),
 }));
 vi.mock("../review-fix-queue.js", () => ({
   acceptReviewFixWebhookEvent: vi.fn(),
@@ -68,6 +70,7 @@ describe("review-fix production delegation", () => {
       expect(submit).toHaveBeenCalledWith({ dispatchId: "d-9", owner: "acme", repo: "app", prNumber: 7,
         prUrl: "https://github.com/acme/app/pull/7", gapFill: true, attemptId: "att-1" });
       expect(stampJobApproved).not.toHaveBeenCalled();
+      expect(recordPendingAttemptReview).toHaveBeenCalledWith("att-1", "d-9", "https://github.com/acme/app/pull/7");
     });
 
     it("submits nothing and logs when the PR has no run row", async () => {
@@ -84,6 +87,8 @@ describe("review-fix production delegation", () => {
       getLatestWorkRowForPr.mockReturnValue({ id: 9, dispatchId: "d-9" });
       const log = vi.spyOn(console, "log").mockImplementation(() => {});
       await expect(submitLateReviewForAttempt(repoScope, "att-1", vi.fn().mockRejectedValue(new Error("boom")))).resolves.toBeUndefined();
+      // The pending marker is written first, so the poll sweep retries the submit.
+      expect(recordPendingAttemptReview).toHaveBeenCalledWith("att-1", "d-9", "https://github.com/acme/app/pull/7");
       log.mockRestore();
     });
   });

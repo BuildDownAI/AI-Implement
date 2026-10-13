@@ -25,7 +25,7 @@ import { createReviewFixAttempt } from "./review-fix-attempt.js";
 import { createReviewFixPR } from "./review-fix-pr.js";
 import type { RestateService } from "./endpoint.js";
 import type { LateExternalReviewInput } from "./late-external-review.js";
-import { getLatestWorkRowForPr } from "../log.js";
+import { getLatestWorkRowForPr, recordPendingAttemptReview } from "../log.js";
 
 export interface ReviewFixProductionConfig {
   githubAppId: string;
@@ -108,6 +108,8 @@ export async function submitLateReviewForAttempt(
       console.log(`[review-fix] No run row with a dispatch id for ${prUrl}, not submitting late external review (attempt ${attemptId})`);
       return;
     }
+    // Held for the poll sweep (resubmitPendingGapFillReviews) in case Restate is not ready and the hook only logs.
+    recordPendingAttemptReview(attemptId, row.dispatchId, prUrl);
     await submit({ dispatchId: row.dispatchId, owner, repo, prNumber: scope.prNumber, prUrl, gapFill: true, attemptId });
   } catch (err) {
     console.log(`[review-fix] Late external review submit failed for attempt ${attemptId}: ${err instanceof Error ? err.message : String(err)}`);

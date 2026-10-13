@@ -95,6 +95,15 @@ export function initLogTable(): void {
       last_attempt_at INTEGER
     )
   `);
+  // AII-1307: a succeeded review-fix attempt's LateExternalReview submit, held until the poll sweep sees it accepted.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS attempt_review_pending (
+      attempt_id TEXT PRIMARY KEY,
+      dispatch_id TEXT NOT NULL,
+      pr_url TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    )
+  `);
   ensureLogColumns();
 }
 
@@ -593,6 +602,27 @@ export function getGapFillRowsAwaitingLateReview(sinceMs: number): Job[] {
       )
       .all(sinceMs) as RawRow[],
   );
+}
+
+export interface PendingAttemptReview { attemptId: string; dispatchId: string; prUrl: string }
+
+/** Records that a review-fix attempt's late review still needs submitting (AII-1307). Idempotent per attempt. */
+export function recordPendingAttemptReview(attemptId: string, dispatchId: string, prUrl: string, now = Date.now()): void {
+  getDb()
+    .prepare("INSERT OR IGNORE INTO attempt_review_pending (attempt_id, dispatch_id, pr_url, created_at) VALUES (?, ?, ?, ?)")
+    .run(attemptId, dispatchId, prUrl, now);
+}
+
+/** Pending attempt reviews recorded at or after `sinceMs`, oldest first. */
+export function getPendingAttemptReviews(sinceMs: number): PendingAttemptReview[] {
+  const rows = getDb()
+    .prepare("SELECT attempt_id, dispatch_id, pr_url FROM attempt_review_pending WHERE created_at >= ? ORDER BY created_at ASC")
+    .all(sinceMs) as Array<{ attempt_id: string; dispatch_id: string; pr_url: string }>;
+  return rows.map((r) => ({ attemptId: r.attempt_id, dispatchId: r.dispatch_id, prUrl: r.pr_url }));
+}
+
+export function clearPendingAttemptReview(attemptId: string): void {
+  getDb().prepare("DELETE FROM attempt_review_pending WHERE attempt_id = ?").run(attemptId);
 }
 
 export function getInFlightIssueIds(): Set<string> {
