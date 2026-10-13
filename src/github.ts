@@ -593,7 +593,9 @@ export interface PrComment {
  * completion via the response's `Link: rel="next"` header — a PR with more than
  * 100 comments before the sticky one must still be found, or `postOrUpdateStickyComment`
  * duplicates it instead of updating it in place. Used to find a previously-posted
- * sticky comment to update in place.
+ * sticky comment to update in place. By default a non-OK page ends the walk and returns
+ * what was read so far; pass `{ strict: true }` when the caller must not mistake an
+ * unreadable page for an empty list (the call then throws so the step can retry).
  */
 export async function listPrComments(
   token: string,

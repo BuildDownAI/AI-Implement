@@ -157,7 +157,8 @@ describe("LateExternalReview workflow", () => {
       });
 
       it("initial-run late review ends findings with no mark on Claude's newest changes_requested verdict (AII-1309)", async () => {
-        // readTick folds a non-approve newest verdict into blockingLastSeenAtMs for every late review but follow mode.
+        // The workflow loop is run-kind agnostic: readTick (injected here) folds a non-approve newest verdict into
+        // blockingLastSeenAtMs; the initial-run gating itself is covered in late-external-review-tick.test.ts.
         const { result, sc } = await runScenario(url(), { ticks: [pending, { ...passed, blockingLastSeenAtMs: [COMMIT_MS + 60_000] }] });
         expect(result).toEqual({ outcome: "findings" });
         expect(sc.stamps).toEqual([]);
