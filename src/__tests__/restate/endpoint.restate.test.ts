@@ -38,7 +38,9 @@ const probe = restate.service({
 // The service set the new deployment brings in the AII-1281 scenario: a service the old registered
 // deployment lacks, and an orchestratorTools that no longer has get_tenant_health. A call to that
 // handler is routed by Restate to the old deployment's manifest, reaches the new endpoint, which
-// lacks it (RT0018), and Restate retries it forever.
+// lacks it (RT0018), and Restate retries it forever. Only the missing get_tenant_health handler
+// pins the drain; get_runner_mode and declinedWindowProbe are never invoked, they only make the new
+// service set differ from the old one so the registration is a real, conflicting change.
 const declinedWindowProbe = restate.service({
   name: "declinedWindowProbe",
   handlers: { ping: async (_ctx: restate.Context) => "pong" },
