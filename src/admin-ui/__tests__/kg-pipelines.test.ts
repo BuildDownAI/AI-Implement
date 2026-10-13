@@ -427,15 +427,26 @@ describe("kg current run card (AII-1260)", () => {
     expect((doc.getElementById("kg-current-run") as HTMLElement).hidden).toBe(true);
   });
 
+  it("links the current run to the Restate UI, and idle has no link", async () => {
+    const m = mount({ currentRun: { triggerId: "trg/1", step: "ingest", decisions: [], held: null } });
+    await m.win.loadKgStatus();
+    const a = m.doc.querySelector("#kg-current-run a") as HTMLAnchorElement;
+    expect(a.textContent).toBe("Open in Restate UI");
+    expect(a.getAttribute("href")).toBe("/ui/workflows/KgRefresh/trg%2F1");
+    const idle = mount({ currentRun: null });
+    await idle.win.loadKgStatus();
+    expect(idle.doc.querySelector("#kg-current-run a")).toBeNull();
+  });
+
   it("run in flight: the step and Cancel only, never printing null", async () => {
     const m = mount({ currentRun: { triggerId: "t", step: "<b>ingest</b>", decisions: [], held: null } });
     await m.win.loadKgStatus();
-    expect(m.doc.getElementById("kg-current-run")?.textContent).toBe("Run in flight: <b>ingest</b>");
+    expect(m.doc.getElementById("kg-current-run")?.firstChild?.textContent).toBe("Run in flight: <b>ingest</b>");
     expect(m.doc.querySelector("#kg-current-run b")).toBeNull();
     expect(m.visibleButtons()).toEqual(["Cancel"]);
     const n = mount({ currentRun: { triggerId: "t", step: null, decisions: [], held: null } });
     await n.win.loadKgStatus();
-    expect(n.doc.getElementById("kg-current-run")?.textContent).toBe("Run in flight");
+    expect(n.doc.getElementById("kg-current-run")?.firstChild?.textContent).toBe("Run in flight");
   });
 
   it("held run: deadline, part table, PR link, Accept and Cancel", async () => {
@@ -446,7 +457,7 @@ describe("kg current run card (AII-1260)", () => {
     expect(Array.from(cur.querySelectorAll("th")).map((t) => t.textContent)).toEqual(["part", "previous", "new", "delta"]);
     expect(Array.from(cur.querySelectorAll("td")).map((t) => t.textContent)).toEqual(["<img src=x onerror=alert(1)>", "100", "40", "-60"]);
     expect(cur.querySelector("img")).toBeNull();
-    expect(cur.querySelector("a")?.getAttribute("href")).toBe("https://github.com/o/kg/pull/7");
+    expect(cur.querySelector("a[href^=\"https\"]")?.getAttribute("href")).toBe("https://github.com/o/kg/pull/7");
     expect(m.visibleButtons()).toEqual(["Accept new baseline & refresh", "Cancel"]);
     expect(m.doc.getElementById("kg-refresh-badge")?.textContent).toContain("awaiting decision");
   });
