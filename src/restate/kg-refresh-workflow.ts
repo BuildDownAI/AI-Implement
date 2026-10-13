@@ -691,6 +691,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           );
         } catch (err) {
           if (restate.internal.isSuspendedError(err)) throw err;
+          if (err instanceof restate.TerminalError && err.code === 409) throw err; // a cancel is not a merge failure: the outer catch cleans up
           ctx.set("step", "failed");
           const at = await ctx.date.now();
           const detail = err instanceof Error ? err.message : String(err);
@@ -897,7 +898,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           if (decided.action === "accept") {
             ctx.console.log(`[KgRefresh] decided accept by ${decided.actor}: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
             await ctx.run("baseline-accept-note", () => postBaselineAcceptNote(deps.rail, owner, repoName, heldPrNumber, decided.actor), { maxRetryAttempts: 3 });
-            return mergeAndRunGates(report);
+            return await mergeAndRunGates(report);
           }
           ctx.console.log(`[KgRefresh] decided cancel by ${decided.actor}: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
           return cleanupCancelled("signal");
@@ -929,7 +930,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         return finish(outcome);
       }
 
-      return mergeAndRunGates(report);
+      return await mergeAndRunGates(report);
     } catch (err) {
       if (restate.internal.isSuspendedError(err)) throw err;
       if (err instanceof restate.TerminalError && err.code === 409) {

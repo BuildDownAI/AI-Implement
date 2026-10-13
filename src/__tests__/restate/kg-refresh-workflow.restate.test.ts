@@ -3513,6 +3513,19 @@ describe("KgRefresh durable workflow", () => {
       expect(scenario.cancelCalls).toBe(1);
     }, 60_000);
 
+    it.each(VARIANTS.map(([label]) => label))("a Restate cancel during the merge closes the row and releases once, without closing the snapshot PR (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const beforeMerge = mergePullRequestFn.mock.calls.length;
+      mergeDelayMs = 1_500; // parks `run` inside the merge step
+      const triggerId = await holdRun(env);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
+      await eventually(() => mergePullRequestFn.mock.calls.length - beforeMerge, (n) => n >= 1, { label: "the merge call" });
+      await restateCancel(env, triggerId);
+      await expectClosedAndReleasedOnce(env, triggerId);
+      expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(0);
+    }, 60_000);
+
     it.each(VARIANTS.map(([label]) => label))("a Restate cancel at the gate and the cancel signal make the same calls and end operator_cancelled (%s)", async (label) => {
       const env = heldEnvs.get(label)!;
       const observe = async (via: "restate" | "signal") => {
