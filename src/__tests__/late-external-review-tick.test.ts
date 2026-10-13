@@ -7,12 +7,14 @@ vi.mock("../github.js", () => ({
   getPullRequestState: vi.fn(),
   listCheckRuns: vi.fn(),
   listPrComments: vi.fn(),
+  getDefaultBranchFileText: vi.fn(),
   listPullRequestCommits: vi.fn(),
   postPrComment: vi.fn(),
 }));
+vi.mock("../config.js", () => ({ getMappings: vi.fn(() => ({})) }));
 vi.mock("../review-ledger-store.js", () => ({ listOpenReviewFindings: vi.fn(() => []) }));
 
-import { getCombinedChecksState, getCommitTime, getPullRequestState, listCheckRuns, listPullRequestCommits } from "../github.js";
+import { getCombinedChecksState, getCommitTime, getDefaultBranchFileText, getPullRequestState, listCheckRuns, listPrComments, listPullRequestCommits } from "../github.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
 import { decodeReadHead, createProductionLateExternalReviewDependencies, LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS } from "../restate/late-external-review.js";
 import { headReviewedClean } from "../review-head-clean.js";
@@ -25,6 +27,8 @@ beforeEach(() => {
   vi.mocked(getCombinedChecksState).mockResolvedValue("success");
   vi.mocked(getCommitTime).mockResolvedValue(1000);
   vi.mocked(listOpenReviewFindings).mockReturnValue([]);
+  vi.mocked(listPrComments).mockReset().mockResolvedValue([]);
+  vi.mocked(getDefaultBranchFileText).mockReset().mockResolvedValue(null);
 });
 
 describe("headReviewedClean", () => {
@@ -147,5 +151,67 @@ describe("decodeReadHead (journal entries from before AII-1302)", () => {
   it("reads the object shape as journaled", () => {
     expect(decodeReadHead({ headSha: "abc123", reviewerExpected: false })).toEqual({ headSha: "abc123", reviewerExpected: false });
     expect(decodeReadHead({ headSha: "abc123" })).toEqual({ headSha: "abc123", reviewerExpected: undefined });
+  });
+});
+
+describe("readTick reads Claude's verdict for a gap-fill (AII-1303)", () => {
+  const COMMIT_MS = 1_700_000_000_000;
+  const gapInput = { dispatchId: "d", owner: "o", repo: "r", prNumber: 5, prUrl: "u", headSha: "b", gapFill: true };
+  const tickOf = (extra: Record<string, unknown> = {}) =>
+    createProductionLateExternalReviewDependencies({ githubAppId: "1", githubAppPrivateKey: "k" }).readTick({ ...gapInput, ...extra } as never);
+  const review = (verdict: string, atMs: number, over: Record<string, unknown> = {}) => {
+    const block = JSON.stringify({ schema: "review-findings/v1", verdict, findings: [{ severity: "minor", body: "nit" }] });
+    return { id: 1, body: "Review\n\n```json review-findings\n" + block + "\n```\n", user: { login: "claude[bot]", type: "Bot" }, createdAt: new Date(atMs).toISOString(), ...over };
+  };
+  const blocked = (t: { blockingLastSeenAtMs: number[] }) => t.blockingLastSeenAtMs.some((s) => s >= COMMIT_MS);
+
+  beforeEach(() => {
+    vi.mocked(getCommitTime).mockResolvedValue(COMMIT_MS);
+    vi.mocked(listCheckRuns).mockResolvedValue([run("completed", "success")]);
+  });
+
+  it("blocks when the newest Claude review on this head is changes_requested with only minor findings", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([review("changes_requested", COMMIT_MS + 1000)] as never);
+    expect(blocked(await tickOf())).toBe(true);
+  });
+  it("does not block an approve verdict with only minor findings", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([review("approve", COMMIT_MS + 1000)] as never);
+    expect(blocked(await tickOf())).toBe(false);
+  });
+  it("ignores a changes_requested review of an older head", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([review("changes_requested", COMMIT_MS - 1000)] as never);
+    expect(blocked(await tickOf())).toBe(false);
+  });
+  it("lets a newer approve supersede an older changes_requested", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([review("changes_requested", COMMIT_MS + 1000), review("approve", COMMIT_MS + 2000, { id: 2 })] as never);
+    expect(blocked(await tickOf())).toBe(false);
+  });
+  it("ignores a changes_requested block from a non-Claude author", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([review("changes_requested", COMMIT_MS + 1000, { user: { login: "mallory", type: "User" } })] as never);
+    expect(blocked(await tickOf())).toBe(false);
+  });
+  it("does not read comments in follow mode or for a non-gap-fill tick", async () => {
+    await tickOf({ followHead: true });
+    await tickOf({ gapFill: undefined });
+    expect(listPrComments).not.toHaveBeenCalled();
+  });
+  it("throws when the comment read fails, rather than reading no verdict", async () => {
+    vi.mocked(listPrComments).mockRejectedValue(new Error("boom"));
+    await expect(tickOf()).rejects.toThrow("boom");
+  });
+  it("counts a review check named by the project's reviewCheckNames, for success and for the grace", async () => {
+    vi.mocked(getDefaultBranchFileText).mockResolvedValue("reviewCheckNames:\n  - acme-review\n");
+    vi.mocked(getCommitTime).mockResolvedValue(Date.now() - LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS - 1000);
+    vi.mocked(listCheckRuns).mockResolvedValue([{ name: "acme-review", appSlug: "github-actions", status: "completed", conclusion: "success" }]);
+    expect((await tickOf({ reviewerExpected: true })).checks).toBe("success");
+    // present but not success: a configured-name run exists, so the grace does not apply
+    vi.mocked(listCheckRuns).mockResolvedValue([{ name: "acme-review", appSlug: "github-actions", status: "in_progress", conclusion: null }]);
+    expect((await tickOf()).checks).toBe("pending");
+  });
+  it("does not treat a default-named run as the review when names are configured", async () => {
+    vi.mocked(getDefaultBranchFileText).mockResolvedValue("reviewCheckNames: [acme-review]\n");
+    vi.mocked(getCommitTime).mockResolvedValue(Date.now() - 1000);
+    vi.mocked(listCheckRuns).mockResolvedValue([{ name: "review", appSlug: "github-actions", status: "completed", conclusion: "success" }]);
+    expect((await tickOf({ reviewerExpected: true })).checks).toBe("pending");
   });
 });

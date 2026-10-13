@@ -223,6 +223,14 @@ describe("LateExternalReview workflow", () => {
           expect(sc.headReads).toBe(1);
         });
 
+        it("ends findings with no mark when the tick reports Claude's changes_requested verdict (minor findings only, AII-1303)", async () => {
+          // readTick folds a non-approve verdict on this head into blockingLastSeenAtMs.
+          const { result, sc } = await gap({ ticks: [pending, { ...passed, blockingLastSeenAtMs: [COMMIT_MS + 60_000] }] });
+          expect(result).toEqual({ outcome: "findings" });
+          expect(sc.stamps).toEqual([]);
+          expect(sc.comments).toEqual([]);
+        });
+
         it("writes the mark once the review check passed with no blocking finding", async () => {
           const { result, sc } = await gap({ ticks: [pending, passed] });
           expect(result).toEqual({ outcome: "approved" });
