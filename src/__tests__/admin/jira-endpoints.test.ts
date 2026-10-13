@@ -1,23 +1,16 @@
 import { EventEmitter } from "node:events";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type * as AdminModule from "../../admin.js";
-import type * as ConfigModule from "../../config.js";
-import type * as DedupModule from "../../dedup.js";
-import type * as RunnerModeModule from "../../runner-mode.js";
-import type * as LogModule from "../../log.js";
-import type * as StepLogModule from "../../step-log.js";
-import { FakeProvider } from "../providers/fake.js";
-import type { ProviderRegistry } from "../../providers/registry.js";
+import { makeRegistry } from "../helpers/builders.js";
+import { fakeFetch, type Routes } from "../helpers/fake-fetch.js";
+import { testDb } from "../helpers/test-db.js";
 
-function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
-  return {
-    forMapping: async () => provider,
-    forAllMappings: async () => [provider],
-    invalidate: () => {},
-  } as unknown as ProviderRegistry;
+// The OAuth gateway's REST base for JIRA_CLOUD_ID=c.
+const GATEWAY = "/ex/jira/c/rest/api/3";
+
+// The Jira API as this test expects it; with no routes, any Jira request fails the test.
+function jiraApi(routes: Routes = {}): void {
+  fakeFetch(routes).install();
 }
 
 class MockRequest extends EventEmitter {
@@ -58,15 +51,7 @@ class MockResponse {
   }
 }
 
-let dbPath: string;
 let admin: typeof AdminModule;
-let config: typeof ConfigModule;
-let dedup: typeof DedupModule;
-let runnerMode: typeof RunnerModeModule;
-let log: typeof LogModule;
-let stepLog: typeof StepLogModule;
-let provider: FakeProvider;
-const fetchMock = vi.fn();
 const origToken = process.env.JIRA_TOKEN;
 const origCloud = process.env.JIRA_CLOUD_ID;
 const origSite = process.env.JIRA_SITE_URL;
@@ -75,34 +60,13 @@ const origClientId = process.env.LINEAR_CLIENT_ID;
 const origClientSecret = process.env.LINEAR_CLIENT_SECRET;
 
 beforeEach(async () => {
-  vi.resetModules();
-  fetchMock.mockReset();
-  global.fetch = fetchMock as unknown as typeof fetch;
   delete process.env.JIRA_EMAIL;
-  dbPath = path.join(os.tmpdir(), `admin-jira-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  provider = new FakeProvider();
-  admin = await import("../../admin.js");
-  config = await import("../../config.js");
-  dedup = await import("../../dedup.js");
-  runnerMode = await import("../../runner-mode.js");
-  log = await import("../../log.js");
-  stepLog = await import("../../step-log.js");
-  config.initMappingsTable();
-  log.initLogTable();
-  stepLog.initStepLogTable();
-  runnerMode.initSettingsTable();
-  // vi.resetModules() in beforeEach gives each test a fresh admin module
+  // testDb's module reset gives each test a fresh admin module
   // (and therefore a fresh _adminJiraClient singleton).
+  ({ admin } = (await testDb({ modules: { admin: () => import("../../admin.js") } })).modules);
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
   if (origToken === undefined) delete process.env.JIRA_TOKEN;
   else process.env.JIRA_TOKEN = origToken;
   if (origCloud === undefined) delete process.env.JIRA_CLOUD_ID;
@@ -142,7 +106,7 @@ async function request(
     body === undefined ? undefined : JSON.stringify(body),
   );
   const res = new MockResponse();
-  admin.handleAdminRequest(req as never, res as never, adminConfig(accessCode), makeFakeRegistry(provider));
+  admin.handleAdminRequest(req as never, res as never, adminConfig(accessCode), makeRegistry());
   await res.done;
   return { statusCode: res.statusCode, body: res.body };
 }
@@ -158,10 +122,8 @@ describe("/api/jira/validate-jql", () => {
     process.env.JIRA_CLOUD_ID = "c";
     // JiraClient.validateJql posts to /rest/api/3/jql/parse and treats any
     // 2xx as valid.
-    fetchMock.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => ({ queries: [{ query: "project = P", structure: {} }] }),
+    jiraApi({
+      [`POST ${GATEWAY}/jql/parse`]: [{ json: { queries: [{ query: "project = P", structure: {} }] } }],
     });
     const token = await login("secret");
     const res = await request("/api/jira/validate-jql", "POST", "secret", { jql: "project = P" }, token);
@@ -172,6 +134,7 @@ describe("/api/jira/validate-jql", () => {
   it("returns 501 when JIRA_TOKEN not set", async () => {
     delete process.env.JIRA_TOKEN;
     delete process.env.JIRA_CLOUD_ID;
+    jiraApi();
     const token = await login("secret");
     const res = await request("/api/jira/validate-jql", "POST", "secret", { jql: "project = P" }, token);
     expect(res.statusCode).toBe(501);
@@ -181,6 +144,7 @@ describe("/api/jira/validate-jql", () => {
   it("returns 400 when jql field missing", async () => {
     process.env.JIRA_TOKEN = "t";
     process.env.JIRA_CLOUD_ID = "c";
+    jiraApi();
     const token = await login("secret");
     const res = await request("/api/jira/validate-jql", "POST", "secret", {}, token);
     expect(res.statusCode).toBe(400);
@@ -189,12 +153,7 @@ describe("/api/jira/validate-jql", () => {
   it("returns 400 on invalid JQL (Jira returns 400)", async () => {
     process.env.JIRA_TOKEN = "t";
     process.env.JIRA_CLOUD_ID = "c";
-    fetchMock.mockResolvedValueOnce({
-      ok: false,
-      status: 400,
-      statusText: "Bad Request",
-      text: async () => "JQL parse error",
-    });
+    jiraApi({ [`POST ${GATEWAY}/jql/parse`]: [{ status: 400, text: "JQL parse error" }] });
     const token = await login("secret");
     const res = await request("/api/jira/validate-jql", "POST", "secret", { jql: "bogus =" }, token);
     expect(res.statusCode).toBe(400);
@@ -203,17 +162,21 @@ describe("/api/jira/validate-jql", () => {
 });
 
 describe("/api/jira/fields", () => {
+  const FIELDS: Routes = {
+    [`GET ${GATEWAY}/field`]: [
+      {
+        json: [
+          { id: "customfield_1", name: "AI-Implement Status", custom: true },
+          { id: "customfield_2", name: "Sprint", custom: true },
+        ],
+      },
+    ],
+  };
+
   it("returns 200 with full field list when no name filter", async () => {
     process.env.JIRA_TOKEN = "t";
     process.env.JIRA_CLOUD_ID = "c";
-    fetchMock.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => [
-        { id: "customfield_1", name: "AI-Implement Status", custom: true },
-        { id: "customfield_2", name: "Sprint", custom: true },
-      ],
-    });
+    jiraApi(FIELDS);
     const token = await login("secret");
     const res = await request("/api/jira/fields", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
@@ -223,14 +186,7 @@ describe("/api/jira/fields", () => {
   it("filters fields by case-insensitive name substring", async () => {
     process.env.JIRA_TOKEN = "t";
     process.env.JIRA_CLOUD_ID = "c";
-    fetchMock.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => [
-        { id: "customfield_1", name: "AI-Implement Status", custom: true },
-        { id: "customfield_2", name: "Sprint", custom: true },
-      ],
-    });
+    jiraApi(FIELDS);
     const token = await login("secret");
     const res = await request("/api/jira/fields?name=ai-implement", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
@@ -242,6 +198,7 @@ describe("/api/jira/fields", () => {
   it("returns 501 when JIRA env not set", async () => {
     delete process.env.JIRA_TOKEN;
     delete process.env.JIRA_CLOUD_ID;
+    jiraApi();
     const token = await login("secret");
     const res = await request("/api/jira/fields", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(501);
@@ -252,22 +209,19 @@ describe("/api/jira/field-options", () => {
   it("returns 200 with options for a select field", async () => {
     process.env.JIRA_TOKEN = "t";
     process.env.JIRA_CLOUD_ID = "c";
-    fetchMock
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ values: [{ id: "ctx1" }] }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({
-          values: [
-            { id: "o1", value: "Ready" },
-            { id: "o2", value: "Plan Approved" },
-          ],
-        }),
-      });
+    jiraApi({
+      [`GET ${GATEWAY}/field/customfield_1/context`]: [{ json: { values: [{ id: "ctx1" }] } }],
+      [`GET ${GATEWAY}/field/customfield_1/context/ctx1/option`]: [
+        {
+          json: {
+            values: [
+              { id: "o1", value: "Ready" },
+              { id: "o2", value: "Plan Approved" },
+            ],
+          },
+        },
+      ],
+    });
     const token = await login("secret");
     const res = await request("/api/jira/field-options?fieldId=customfield_1", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
@@ -280,12 +234,7 @@ describe("/api/jira/field-options", () => {
   it("returns 200 empty array for non-select field (404 on contexts)", async () => {
     process.env.JIRA_TOKEN = "t";
     process.env.JIRA_CLOUD_ID = "c";
-    fetchMock.mockResolvedValueOnce({
-      ok: false,
-      status: 404,
-      statusText: "Not Found",
-      text: async () => "no contexts",
-    });
+    jiraApi({ [`GET ${GATEWAY}/field/customfield_1/context`]: [{ status: 404, text: "no contexts" }] });
     const token = await login("secret");
     const res = await request("/api/jira/field-options?fieldId=customfield_1", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
@@ -295,6 +244,7 @@ describe("/api/jira/field-options", () => {
   it("returns 400 when fieldId param missing", async () => {
     process.env.JIRA_TOKEN = "t";
     process.env.JIRA_CLOUD_ID = "c";
+    jiraApi();
     const token = await login("secret");
     const res = await request("/api/jira/field-options", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(400);
@@ -303,6 +253,7 @@ describe("/api/jira/field-options", () => {
   it("returns 501 when JIRA env not set", async () => {
     delete process.env.JIRA_TOKEN;
     delete process.env.JIRA_CLOUD_ID;
+    jiraApi();
     const token = await login("secret");
     const res = await request("/api/jira/field-options?fieldId=customfield_1", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(501);
@@ -318,6 +269,7 @@ describe("/api/admin/config-status", () => {
     delete process.env.JIRA_SITE_URL;
     delete process.env.RUNNER_CALLBACK_BASE_URL;
     delete process.env.RUNNER_TOKEN_SECRET;
+    jiraApi();
   });
 
   it("returns linear: true / jira: false when only Linear client creds set", async () => {

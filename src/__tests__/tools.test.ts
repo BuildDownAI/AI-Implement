@@ -43,7 +43,7 @@ import { setKgMemoryProvider } from "../kg-provider.js";
 import type { MemoryProvider } from "../kg-provider.js";
 import type { PreflightCheckResult, RefreshOutcome } from "../kg-refresh.js";
 import type { KgRefreshToolDeps } from "../restate/kg-refresh-production.js";
-import { getMappings } from "../config.js";
+import { getMappings, type RepoMapping } from "../config.js";
 import { setOrchestratorSetting } from "../orchestrator-settings.js";
 import { initSettingsTable } from "../runner-mode.js";
 import { FLY_MACHINE_PROFILE_DEFAULTS, mergeProfile, type FlyMachineProfileConfig } from "../restate/fly-machine-profile.js";
@@ -57,6 +57,8 @@ import {
   triggerWorkflowSyncAction,
   clearDedupEntryAction,
 } from "../admin.js";
+import { makeMapping, makeRegistry } from "./helpers/builders.js";
+import { fakeFetch, hangUntilAborted } from "./helpers/fake-fetch.js";
 
 vi.mock("../report-card.js", () => ({
   getIssueReportCard: vi.fn(),
@@ -109,24 +111,10 @@ function fakeContext(handlerName: string, runCalls: RunCall[] = []): restate.Con
   } as unknown as restate.Context;
 }
 
-/**
- * A fetchImpl that never settles unless its request's AbortSignal fires — the only way a
- * fixture can prove a fetch is actually bounded by `signal` rather than merely accepting an
- * ignored option (AII-728). Rejects with the signal's abort reason once the signal fires.
- */
-function hangingFetch(): typeof fetch {
-  return vi.fn((_url: unknown, init?: RequestInit) => {
-    return new Promise((_resolve, reject) => {
-      const signal = init?.signal;
-      if (!signal) return; // no signal given: hangs forever, same as before AII-728
-      if (signal.aborted) {
-        reject(signal.reason);
-        return;
-      }
-      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-    });
-  }) as unknown as typeof fetch;
-}
+// The admin API's service metadata read, and the ingress calls the tests below make.
+const DISCOVERY = "GET /services/orchestratorTools";
+const GET_WIDGET = "POST /orchestratorTools/get_widget";
+const GET_TENANT_HEALTH = "POST /orchestratorTools/get_tenant_health";
 
 /**
  * vitest's fake timers do not intercept Node's AbortSignal.timeout — verified empirically,
@@ -417,39 +405,33 @@ describe("review-fix read tools", () => {
 });
 
 describe("discoverTools", () => {
-  function jsonResponse(status: number, body: unknown): Response {
-    return {
-      ok: status >= 200 && status < 300,
-      status,
-      json: async () => body,
-    } as Response;
-  }
-
   it("projects one entry per handler carrying mcp.type: \"tool\", with args-only inputSchema", async () => {
-    const fetchImpl = vi.fn(async () =>
-      jsonResponse(200, {
-        handlers: [
-          {
-            name: "get_widget",
-            documentation: "Gets a widget",
-            metadata: { "mcp.type": "tool", "mcp.role": "user" },
-            input_json_schema: {
-              properties: {
-                caller: { type: "object" },
-                args: { type: "object", properties: { id: { type: "string" } } },
+    const fake = fakeFetch({
+      [DISCOVERY]: [{
+        json: {
+          handlers: [
+            {
+              name: "get_widget",
+              documentation: "Gets a widget",
+              metadata: { "mcp.type": "tool", "mcp.role": "user" },
+              input_json_schema: {
+                properties: {
+                  caller: { type: "object" },
+                  args: { type: "object", properties: { id: { type: "string" } } },
+                },
               },
             },
-          },
-          {
-            name: "internalOnly",
-            documentation: "Not a tool",
-            metadata: {},
-          },
-        ],
-      }),
-    );
+            {
+              name: "internalOnly",
+              documentation: "Not a tool",
+              metadata: {},
+            },
+          ],
+        },
+      }],
+    });
 
-    const tools = await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl });
+    const tools = await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl: fake.fetch });
 
     expect(tools).toEqual([
       {
@@ -462,32 +444,29 @@ describe("discoverTools", () => {
   });
 
   it("returns [] on a connection error", async () => {
-    const fetchImpl = vi.fn(async () => {
-      throw new Error("ECONNREFUSED");
+    const fake = fakeFetch({
+      [DISCOVERY]: [() => {
+        throw new Error("ECONNREFUSED");
+      }],
     });
-    expect(await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl })).toEqual([]);
+    expect(await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl: fake.fetch })).toEqual([]);
   });
 
   it("returns [] on a non-2xx response", async () => {
-    const fetchImpl = vi.fn(async () => jsonResponse(404, {}));
-    expect(await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl })).toEqual([]);
+    const fake = fakeFetch({ [DISCOVERY]: [{ status: 404, json: {} }] });
+    expect(await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl: fake.fetch })).toEqual([]);
   });
 
   it("returns [] on an unparsable body", async () => {
-    const fetchImpl = vi.fn(async () => ({
-      ok: true,
-      status: 200,
-      json: async () => {
-        throw new SyntaxError("not json");
-      },
-    })) as unknown as typeof fetch;
-    expect(await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl })).toEqual([]);
+    const fake = fakeFetch({ [DISCOVERY]: [{ text: "not json" }] });
+    expect(await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl: fake.fetch })).toEqual([]);
   });
 
   it("bounds admin discovery at 5s — a never-resolving fetch degrades to [] once the bound fires (AII-728)", async () => {
     const timeoutSpy = stubAbortTimeout(5_000);
     try {
-      const result = await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl: hangingFetch() });
+      const fake = fakeFetch({ [DISCOVERY]: [hangUntilAborted] });
+      const result = await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl: fake.fetch });
       expect(result).toEqual([]);
     } finally {
       timeoutSpy.mockRestore();
@@ -497,96 +476,87 @@ describe("discoverTools", () => {
 
 describe("callTool", () => {
   it("returns deploy-held without an ingress request when drain admission closes", async () => {
-    const fetchImpl = vi.fn() as unknown as typeof fetch;
+    const fake = fakeFetch({});
     const result = await callTool("get_widget", {}, HUMAN_USER, {
-      ingressBaseUrl: "http://ingress.example", fetchImpl,
+      ingressBaseUrl: "http://ingress.example", fetchImpl: fake.fetch,
       permitsExternalCall: () => false,
     });
     expect(result).toEqual({ status: "deploy-held" });
-    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(fake.calls).toHaveLength(0);
   });
   it("maps a 200 ToolResponse body to status: \"ok\"", async () => {
-    const fetchImpl = vi.fn(async () => ({
-      ok: true,
-      status: 200,
-      json: async () => ({ content: [{ type: "text", text: "hello" }] }),
-    })) as unknown as typeof fetch;
+    const fake = fakeFetch({ [GET_WIDGET]: [{ json: { content: [{ type: "text", text: "hello" }] } }] });
 
     const result = await callTool("get_widget", { id: "1" }, HUMAN_USER, {
       ingressBaseUrl: "http://ingress.example",
-      fetchImpl,
+      fetchImpl: fake.fetch,
     });
 
     expect(result).toEqual({ status: "ok", content: [{ type: "text", text: "hello" }], isError: undefined });
   });
 
   it("maps a thrown fetch to status: \"unavailable\"", async () => {
-    const fetchImpl = vi.fn(async () => {
-      throw new Error("ECONNREFUSED");
+    const fake = fakeFetch({
+      [GET_WIDGET]: [() => {
+        throw new Error("ECONNREFUSED");
+      }],
     });
     const result = await callTool("get_widget", {}, HUMAN_USER, {
       ingressBaseUrl: "http://ingress.example",
-      fetchImpl,
+      fetchImpl: fake.fetch,
     });
     expect(result).toEqual({ status: "unavailable" });
   });
 
   it("answers a 4xx as a tool error carrying the real status, not as \"unavailable\" (AII-711)", async () => {
-    const fetchImpl = vi.fn(async () => ({ ok: false, status: 400, text: async () => "bad args" })) as unknown as typeof fetch;
-    const result = await callTool("get_widget", {}, HUMAN_USER, { ingressBaseUrl: "http://ingress.example", fetchImpl });
+    const fake = fakeFetch({ [GET_WIDGET]: [{ status: 400, text: "bad args" }] });
+    const result = await callTool("get_widget", {}, HUMAN_USER, { ingressBaseUrl: "http://ingress.example", fetchImpl: fake.fetch });
     expect(result).toEqual({ status: "ok", isError: true, content: [{ type: "text", text: "400 bad args" }] });
   });
 
   it("maps a 503 response to status: \"unavailable\"", async () => {
-    const fetchImpl = vi.fn(async () => ({ ok: false, status: 503, json: async () => ({}) })) as unknown as typeof fetch;
+    const fake = fakeFetch({ [GET_WIDGET]: [{ status: 503, json: {} }] });
     const result = await callTool("get_widget", {}, HUMAN_USER, {
       ingressBaseUrl: "http://ingress.example",
-      fetchImpl,
+      fetchImpl: fake.fetch,
     });
     expect(result).toEqual({ status: "unavailable" });
   });
 
   it("posts a body of exactly { caller, args } with no Authorization header", async () => {
-    let capturedInit: RequestInit | undefined;
-    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-      capturedInit = init;
-      return { ok: true, status: 200, json: async () => ({ content: [] }) } as Response;
-    });
+    const fake = fakeFetch({ [GET_WIDGET]: [{ json: { content: [] } }] });
 
     await callTool("get_widget", { id: "1" }, HUMAN_USER, {
       ingressBaseUrl: "http://ingress.example",
-      fetchImpl: fetchImpl as unknown as typeof fetch,
+      fetchImpl: fake.fetch,
     });
 
-    expect(capturedInit).toBeDefined();
-    const headers = capturedInit?.headers as Record<string, string>;
-    expect(Object.keys(headers).some((k) => k.toLowerCase() === "authorization")).toBe(false);
-    const body = JSON.parse(capturedInit?.body as string);
+    expect(fake.calls).toHaveLength(1);
+    const [call] = fake.calls;
+    expect(call.headers.has("authorization")).toBe(false);
+    const body = JSON.parse(call.body);
     expect(body).toEqual({ caller: HUMAN_USER, args: { id: "1" } });
     expect(Object.keys(body)).toEqual(["caller", "args"]);
   });
 
   it("percent-encodes a path-traversal name so it stays one path segment (defense in depth)", async () => {
-    let capturedUrl: string | undefined;
-    const fetchImpl = vi.fn(async (url: string | URL | Request) => {
-      capturedUrl = String(url);
-      return { ok: true, status: 200, json: async () => ({ content: [] }) } as Response;
-    });
+    const fake = fakeFetch({ "POST /orchestratorTools/..%2FOperator%2Fx%2Frevoke": [{ json: { content: [] } }] });
 
     await callTool("../Operator/x/revoke", {}, HUMAN_USER, {
       ingressBaseUrl: "http://ingress.example",
-      fetchImpl: fetchImpl as unknown as typeof fetch,
+      fetchImpl: fake.fetch,
     });
 
-    expect(capturedUrl).toBe("http://ingress.example/orchestratorTools/..%2FOperator%2Fx%2Frevoke");
+    expect(fake.calls[0].url.href).toBe("http://ingress.example/orchestratorTools/..%2FOperator%2Fx%2Frevoke");
   });
 
   it("bounds tool ingress at 60s — a never-resolving fetch degrades to unavailable once the bound fires (AII-728)", async () => {
     const timeoutSpy = stubAbortTimeout(60_000);
     try {
+      const fake = fakeFetch({ [GET_WIDGET]: [hangUntilAborted] });
       const result = await callTool("get_widget", {}, HUMAN_USER, {
         ingressBaseUrl: "http://ingress.example",
-        fetchImpl: hangingFetch(),
+        fetchImpl: fake.fetch,
       });
       expect(result).toEqual({ status: "unavailable" });
     } finally {
@@ -597,39 +567,37 @@ describe("callTool", () => {
 
 describe("callToolAsSystem", () => {
   it("uses the same drain admission barrier", async () => {
-    const fetchImpl = vi.fn() as unknown as typeof fetch;
+    const fake = fakeFetch({});
     expect(await callToolAsSystem("get_tenant_health", {}, {
-      ingressBaseUrl: "http://ingress.example", fetchImpl,
+      ingressBaseUrl: "http://ingress.example", fetchImpl: fake.fetch,
       permitsExternalCall: () => false,
     })).toEqual({ status: "deploy-held" });
-    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(fake.calls).toHaveLength(0);
   });
   it("posts with a systemCaller() caller and returns the same result shape as callTool", async () => {
-    let capturedBody: unknown;
-    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-      capturedBody = JSON.parse(init?.body as string);
-      return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: "health" }] }) } as Response;
-    });
+    const fake = fakeFetch({ [GET_TENANT_HEALTH]: [{ json: { content: [{ type: "text", text: "health" }] } }] });
 
     const result = await callToolAsSystem("get_tenant_health", {}, {
       ingressBaseUrl: "http://ingress.example",
-      fetchImpl: fetchImpl as unknown as typeof fetch,
+      fetchImpl: fake.fetch,
     });
 
     expect(result).toEqual({ status: "ok", content: [{ type: "text", text: "health" }], isError: undefined });
-    expect(capturedBody).toEqual({
+    expect(JSON.parse(fake.calls[0].body)).toEqual({
       caller: { kind: "system", email: null, role: "admin" },
       args: {},
     });
   });
 
   it("maps a connection failure to status: \"unavailable\", same as callTool", async () => {
-    const fetchImpl = vi.fn(async () => {
-      throw new Error("ECONNREFUSED");
+    const fake = fakeFetch({
+      [GET_TENANT_HEALTH]: [() => {
+        throw new Error("ECONNREFUSED");
+      }],
     });
     const result = await callToolAsSystem("get_tenant_health", {}, {
       ingressBaseUrl: "http://ingress.example",
-      fetchImpl,
+      fetchImpl: fake.fetch,
     });
     expect(result).toEqual({ status: "unavailable" });
   });
@@ -637,22 +605,22 @@ describe("callToolAsSystem", () => {
 
 describe("toolCatalog", () => {
   it("returns the same discovered names and schemas as discoverTools, sourced from the registry", async () => {
-    const fetchImpl = vi.fn(async () => ({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        handlers: [
-          {
-            name: "get_tenant_health",
-            documentation: "Health summary",
-            metadata: { "mcp.type": "tool", "mcp.role": "user" },
-            input_json_schema: { properties: { args: { type: "object", properties: {} } } },
-          },
-        ],
-      }),
-    })) as unknown as typeof fetch;
+    const fake = fakeFetch({
+      [DISCOVERY]: [{
+        json: {
+          handlers: [
+            {
+              name: "get_tenant_health",
+              documentation: "Health summary",
+              metadata: { "mcp.type": "tool", "mcp.role": "user" },
+              input_json_schema: { properties: { args: { type: "object", properties: {} } } },
+            },
+          ],
+        },
+      }],
+    });
 
-    const catalog = await toolCatalog({ adminBaseUrl: "http://admin.example", fetchImpl });
+    const catalog = await toolCatalog({ adminBaseUrl: "http://admin.example", fetchImpl: fake.fetch });
 
     expect(catalog).toEqual([
       {
@@ -665,10 +633,12 @@ describe("toolCatalog", () => {
   });
 
   it("returns [] when discovery cannot reach the admin API", async () => {
-    const fetchImpl = vi.fn(async () => {
-      throw new Error("ECONNREFUSED");
+    const fake = fakeFetch({
+      [DISCOVERY]: [() => {
+        throw new Error("ECONNREFUSED");
+      }],
     });
-    expect(await toolCatalog({ adminBaseUrl: "http://admin.example", fetchImpl })).toEqual([]);
+    expect(await toolCatalog({ adminBaseUrl: "http://admin.example", fetchImpl: fake.fetch })).toEqual([]);
   });
 });
 
@@ -685,16 +655,8 @@ describe("migrated read handlers (AII-711)", () => {
   const system: Caller = SYSTEM_ADMIN;
 
   it("list_projects selects its fields explicitly — extraEnv never leaves the handler", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
-      BDS: {
-        owner: "BuildDownAI", repo: "skills", executionMode: "gha", provider: "anthropic", paused: false,
-        planningEnabled: true, maxInProgressAiIssues: 2, defaultBranch: "testing", workflowFile: "claude.yml",
-        sessionMode: "fresh", autoMerge: false, maxTurns: null, maxIterations: null, maxJobMinutes: null,
-        branchPrefix: null, skillsRepo: null, referenceRepos: [], dependencyTokenScope: null,
-        sensitiveAddPatterns: [], sensitiveAllowPatterns: [], machineCpus: 2, machineMemoryMb: 4096,
-        awsRegion: null, planningWorkflowFile: "claude-plan.yml", autoApprovePlans: true, reviewers: null,
-        extraEnv: { SUPER_SECRET: "leak-me" },
-      },
+    vi.mocked(getMappings).mockReturnValue({
+      BDS: makeMapping({ owner: "BuildDownAI", repo: "skills", extraEnv: { SUPER_SECRET: "leak-me" } }),
     });
     const result = await listProjects(fakeContext("list_projects"), { caller: system, args: {} });
     expect(result.isError).toBeUndefined();
@@ -903,14 +865,14 @@ describe("get_tenant_health restate health field (AII-807)", () => {
   });
 
   it("reports the not-attempted/starting default before any sidecar write", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    vi.mocked(getMappings).mockReturnValue({});
     const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
     const parsed = JSON.parse(result.content[0].text) as { restate: unknown };
     expect(parsed.restate).toEqual({ sidecar: { state: "starting" }, registration: { state: "not-attempted" } });
   });
 
   it("includes both retention settings", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    vi.mocked(getMappings).mockReturnValue({});
     const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
     const parsed = JSON.parse(result.content[0].text) as { restateRetentionDays: unknown; volumeSnapshotRetentionDays: unknown };
     expect(typeof parsed.restateRetentionDays).toBe("number");
@@ -918,7 +880,7 @@ describe("get_tenant_health restate health field (AII-807)", () => {
   });
 
   it("reflects a ready sidecar with a declined-conflict registration", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    vi.mocked(getMappings).mockReturnValue({});
     setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "declined-conflict" } });
 
     const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
@@ -929,7 +891,7 @@ describe("get_tenant_health restate health field (AII-807)", () => {
   });
 
   it("reflects an exited sidecar with code/signal and an unreachable registration", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    vi.mocked(getMappings).mockReturnValue({});
     setRestateStatus({ sidecar: { state: "exited", code: 1, signal: null }, registration: { state: "unreachable" } });
 
     const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
@@ -945,17 +907,8 @@ describe("get_tenant_health restate health field (AII-807)", () => {
 describe("get_project_binding (AII-715)", () => {
   const system: Caller = SYSTEM_ADMIN;
 
-  const fixtureMapping = (overrides: Record<string, unknown> = {}) => ({
-    owner: "BuildDownAI", repo: "skills", executionMode: "gha", provider: "anthropic", paused: false,
-    planningEnabled: true, maxInProgressAiIssues: 2, defaultBranch: "testing", workflowFile: "claude.yml",
-    sessionMode: "fresh", autoMerge: false, maxTurns: null, maxIterations: null, maxJobMinutes: null,
-    branchPrefix: null, skillsRepo: null, referenceRepos: [], dependencyTokenScope: null,
-    sensitiveAddPatterns: [], sensitiveAllowPatterns: [], machineCpus: 2, machineMemoryMb: 4096,
-    awsRegion: null, planningWorkflowFile: "claude-plan.yml", autoApprovePlans: true, reviewers: null,
-    extraEnv: { NPM_TOKEN: "leak-me" },
-    ticketingProvider: "linear", ticketingConfig: { kind: "linear" },
-    ...overrides,
-  });
+  const fixtureMapping = (overrides: Partial<RepoMapping> = {}) =>
+    makeMapping({ owner: "BuildDownAI", repo: "skills", defaultBranch: "testing", extraEnv: { NPM_TOKEN: "leak-me" }, ...overrides });
 
   beforeAll(() => {
     initSettingsTable();
@@ -969,7 +922,7 @@ describe("get_project_binding (AII-715)", () => {
   });
 
   it("resolves the BDS mapping by repo, with the live pickup label and orchestrator-wide kg binding (AC1, AC2, AC3)", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({ BDS: fixtureMapping() });
+    vi.mocked(getMappings).mockReturnValue({ BDS: fixtureMapping() });
     setOrchestratorSetting("linearPickupLabel", "AI-Implement-Custom");
     setOrchestratorSetting("kgBaseRepo", "BuildDownAI/bd-knowledge-graph-base");
     process.env.KG_SOURCE_REPO = "BuildDownAI/knowledge-graph-ai-implement";
@@ -998,7 +951,7 @@ describe("get_project_binding (AII-715)", () => {
   });
 
   it("reflects a pickup-label change on the very next call in the same process, no restart (AII-696 criterion 1)", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({ BDS: fixtureMapping() });
+    vi.mocked(getMappings).mockReturnValue({ BDS: fixtureMapping() });
     setOrchestratorSetting("linearPickupLabel", "First-Label");
 
     const first = await getProjectBinding(fakeContext("get_project_binding"), { caller: system, args: { team: "BDS" } });
@@ -1010,7 +963,7 @@ describe("get_project_binding (AII-715)", () => {
   });
 
   it("never includes extraEnv or a token, in the single-project or the all-mappings shape (AC5)", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({ BDS: fixtureMapping() });
+    vi.mocked(getMappings).mockReturnValue({ BDS: fixtureMapping() });
 
     const single = await getProjectBinding(fakeContext("get_project_binding"), { caller: system, args: { team: "BDS" } });
     expect(single.content[0].text).not.toContain("extraEnv");
@@ -1022,7 +975,7 @@ describe("get_project_binding (AII-715)", () => {
   });
 
   it("returns every mapping as an array when neither repo nor team is given (AC6)", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
+    vi.mocked(getMappings).mockReturnValue({
       BDS: fixtureMapping(),
       AII: fixtureMapping({ repo: "AI-Implement" }),
     });
@@ -1033,7 +986,7 @@ describe("get_project_binding (AII-715)", () => {
   });
 
   it("answers isError for an unmatched repo or team, rather than silently returning every mapping (AC7)", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({ BDS: fixtureMapping() });
+    vi.mocked(getMappings).mockReturnValue({ BDS: fixtureMapping() });
 
     const byRepo = await getProjectBinding(fakeContext("get_project_binding"), { caller: system, args: { repo: "nope/nope" } });
     expect(byRepo.isError).toBe(true);
@@ -1043,8 +996,20 @@ describe("get_project_binding (AII-715)", () => {
   });
 
   it("returns pickupLabel: null for a non-Linear (Jira) mapping, regardless of the Linear setting", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
-      AII: fixtureMapping({ ticketingProvider: "jira", ticketingConfig: { kind: "jira" } }),
+    vi.mocked(getMappings).mockReturnValue({
+      // A Jira config as the mappings store reads one back: every field override present, unset as null.
+      AII: fixtureMapping({
+        ticketingProvider: "jira",
+        ticketingConfig: {
+          kind: "jira",
+          jql: "project = AII",
+          repoFieldValue: "BuildDownAI/skills",
+          statusFieldOverride: null,
+          repoFieldOverride: null,
+          profilesFieldOverride: null,
+          baseBranchFieldOverride: null,
+        },
+      }),
     });
     setOrchestratorSetting("linearPickupLabel", "AI-Implement-Custom");
 
@@ -1451,7 +1416,7 @@ describe("retryPolicy declarations (AII-717)", () => {
 
 describe("add_project uses the registry the boot shares (AII-713 review)", () => {
   it("passes the registry given to setProviderRegistry() to upsertMappingAction, so its invalidate() reaches the real one", async () => {
-    const registry = { invalidate: vi.fn() } as unknown as Parameters<typeof setProviderRegistry>[0];
+    const registry = makeRegistry();
     setProviderRegistry(registry);
     try {
       (upsertMappingAction as ReturnType<typeof vi.fn>).mockReturnValue({ status: 202, body: { teamKey: "AII" } });

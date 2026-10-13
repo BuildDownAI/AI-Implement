@@ -2,14 +2,16 @@ import { describe, it, expect, vi, beforeEach, afterEach, beforeAll, afterAll } 
 import os from "node:os";
 import path from "node:path";
 import { cloneStep } from "../pipeline/steps/clone.js";
-import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
+import { makeContext } from "./helpers/builders.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
 
 vi.mock("node:child_process", () => ({
   spawnSync: vi.fn(),
 }));
 
-vi.mock("node:fs", () => ({
+vi.mock("node:fs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:fs")>()),
   default: {
     existsSync: vi.fn(),
     mkdirSync: vi.fn(),
@@ -38,18 +40,6 @@ function mockSpawn(calls: Array<{ status: number; stdout?: string; stderr?: stri
       signal: null,
       error: undefined,
     };
-  });
-}
-
-function makeContext(): DefaultPipelineContext {
-  return new DefaultPipelineContext({
-    jobId: 1,
-    issueId: "issue-1",
-    issueIdentifier: "ENG-1",
-    issueTitle: "Test",
-    issueDescription: "Desc",
-    nonce: "nonce",
-    orchestratorUrl: "http://localhost:8080",
   });
 }
 
@@ -207,11 +197,7 @@ describe("cloneStep", () => {
     vi.mocked(fs.existsSync).mockReturnValue(false);
     vi.stubEnv("GITHUB_TOKEN", "secret-token");
     vi.stubEnv("GH_TOKEN", "secret-token");
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({ token: "fresh-token" }),
-    } as Response));
+    fakeFetch({ "POST /api/token": [{ json: { token: "fresh-token" } }] }).install();
     mockSpawn([
       { status: 0 },
       { status: 0 },
@@ -236,17 +222,13 @@ describe("cloneStep", () => {
         expect.objectContaining({ cwd: "/tmp/workspace" }),
       );
     } finally {
-      vi.unstubAllGlobals();
       vi.unstubAllEnvs();
     }
   });
 
   it("keeps the boot token when credential vending rejects the refresh", async () => {
     vi.mocked(fs.existsSync).mockReturnValue(false);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
-      ok: false,
-      status: 403,
-    } as Response));
+    fakeFetch({ "POST /api/token": [{ status: 403 }] }).install();
     mockSpawn([
       { status: 0 },
       { status: 0 },
@@ -255,23 +237,19 @@ describe("cloneStep", () => {
       { status: 0 },
     ]);
 
-    try {
-      const outputs = await cloneStep.run(makeContext(), {
-        ...PR_INPUTS,
-        orchestratorUrl: "https://orchestrator.example",
-        machineNonce: "machine-nonce",
-        baseBranch: undefined,
-      }, new NoopStepReporter());
+    const outputs = await cloneStep.run(makeContext(), {
+      ...PR_INPUTS,
+      orchestratorUrl: "https://orchestrator.example",
+      machineNonce: "machine-nonce",
+      baseBranch: undefined,
+    }, new NoopStepReporter());
 
-      expect(outputs.githubToken).toBe("secret-token");
-      expect(spawnSync).toHaveBeenLastCalledWith(
-        "git",
-        ["remote", "set-url", "origin", "https://x-access-token:secret-token@github.com/acme/app.git"],
-        expect.objectContaining({ cwd: "/tmp/workspace" }),
-      );
-    } finally {
-      vi.unstubAllGlobals();
-    }
+    expect(outputs.githubToken).toBe("secret-token");
+    expect(spawnSync).toHaveBeenLastCalledWith(
+      "git",
+      ["remote", "set-url", "origin", "https://x-access-token:secret-token@github.com/acme/app.git"],
+      expect.objectContaining({ cwd: "/tmp/workspace" }),
+    );
   });
 
   describe("PR-targeted (gap-fill) runs: base branch fetch", () => {
