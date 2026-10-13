@@ -301,10 +301,8 @@ line-count table land on `get_kg_status` as `lastRefresh.dryRun`, `lastRefresh.d
 whatever it held before the dispatch rather than advancing through `staging`/`serving`/`reverted`.
 A dry-run and a real run of the same KG head print the same part table. The same dry-run is
 reachable from the admin REST route, `POST /api/kg/refresh` with body `{ "dryRun": true }` (the
-response echoes `dryRun` beside the trigger's fields; no body is the unchanged real refresh), and
-from the **Dry-run refresh** button beside **Refresh graph now** on the Knowledge Graph Pipelines page
-(AII-635). When the last terminal outcome was a dry-run, the Knowledge graph card on that page shows its
-verdict and the per-part table (`part | previous | new | delta`). A guard refusal carries the same
+response echoes `dryRun` beside the trigger's fields; no body is the unchanged real refresh). The
+Knowledge Graph Pipelines page has no dry-run button and no last-dry-run table. A guard refusal carries the same
 `lastRefresh.partTable` and a part-naming `detail` on `get_kg_status` whether it came from a
 dry-run or a real (non-dry-run) refresh (AII-638) — only a real success omits `guardVerdict`/
 `partTable`, since it reports a snapshot commit instead.
@@ -432,10 +430,21 @@ with nothing to add logs `scope in sync` and leaves the file byte-for-byte uncha
 
 ### Where to watch a refresh
 
-`/admin#kg-pipelines` (admin only) shows the Knowledge graph card above a
-table of kg-refresh runs, which is the dispatch log filtered to `phase: kg-refresh`, with Logs and Stop
-on each row. The same runs also appear on the Pipelines page with the `kg` badge, because that page is
-the complete dispatch log. Deployments keeps only the deploy-side signals: the drain tile counts an
+`/admin#kg-pipelines` (admin only) shows one Knowledge graph card above a table of kg-refresh runs, which
+is the dispatch log filtered to `phase: kg-refresh`, with Logs and Stop on each row (rows are reference
+only; they carry no decision buttons). The card renders `GET /api/kg/status` and shows the one current run:
+
+| `currentRun` | Card shows |
+|---|---|
+| `null` | The served stamp, the last outcome line, **Refresh graph now** |
+| set, no open decision | "Run in flight: <step>" and **Cancel** |
+| set, `accept` open (`awaiting-decision`) | "Held for a decision until <decideBy>", the part table (part / previous / new / delta), a link to the held PR, **Accept new baseline & refresh** and **Cancel** |
+
+Both decision buttons ask `confirm()` and post `{ args: { action } }` to `/api/tools/decide_kg_refresh`,
+which takes no trigger id, so it can only act on the current run; an `already-decided` or
+`no-decision-open` answer is shown in the page's message box. If the status call fails the card is hidden
+and offers no action. The same runs also appear on the Pipelines page with the `kg` badge, because that
+page is the complete dispatch log. Deployments keeps only the deploy-side signals: the drain tile counts an
 in-flight KG ingest run, and a release whose sidecar does not serve records "Released, but the knowledge
 graph is not serving".
 
@@ -551,12 +560,8 @@ still recognized and handled as a dry run instead of falling through to the real
 
 ### Accept-new-baseline plumbing (AII-628)
 
-`trigger_kg_refresh { acceptNewBaseline: true }` (the MCP tool, admin role), `POST /api/kg/refresh`
-with body `{ "acceptNewBaseline": true }`, and the **Accept new baseline & refresh** button on the
-Knowledge Graph Pipelines page (a separate, confirm-gated control beside **Refresh graph now** and **Dry-run
-refresh** — deliberately not a third argument to the existing refresh button, so accepting a shrink
-is always a distinct, deliberate click after reading the guard table, never the default path) all
-carry the same flag through the same envelope path `dryRun` already established: `trigger(opts)`
+`trigger_kg_refresh { acceptNewBaseline: true }` (the MCP tool, admin role) and `POST /api/kg/refresh`
+with body `{ "acceptNewBaseline": true }` both carry the same flag through the same envelope path `dryRun` already established: `trigger(opts)`
 sets `kgAcceptNewBaseline: true` on the `RunConfigV1` it builds, along with `kgBaselineActor` (the
 caller's email — from `identity.email` on the MCP path, from the admin session on the REST path) —
 `resolveKgRefreshInputs` in `kg-refresh-run.ts` decodes both back out and puts them on
