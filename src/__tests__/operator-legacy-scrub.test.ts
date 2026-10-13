@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { resetRestateStatus, setRestateStatus } from "../restate/status.js";
 import { scrubOperatorLegacyTokens } from "../restate/operator-legacy-scrub.js";
 
 function store(initial: string | null = null, log: string[] = []) {
@@ -14,6 +15,8 @@ function store(initial: string | null = null, log: string[] = []) {
 const legacyFamily = { service_key: "op1", value_utf8: JSON.stringify({ currentToken: "raw" }) };
 
 describe("scrubOperatorLegacyTokens", () => {
+  afterEach(() => resetRestateStatus());
+
   it("makes no call and writes no row when Restate is not registered", async () => {
     const fetchImpl = vi.fn();
     const log: string[] = [];
@@ -26,10 +29,15 @@ describe("scrubOperatorLegacyTokens", () => {
   });
 
   it("defaults readiness to getRestateStatus: unreachable registration skips", async () => {
+    setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "unreachable" } });
     const fetchImpl = vi.fn();
-    const result = await scrubOperatorLegacyTokens({ fetchImpl: fetchImpl as unknown as typeof fetch, rowStore: store() });
+    const log: string[] = [];
+    const rowStore = store(null, log);
+    const result = await scrubOperatorLegacyTokens({ fetchImpl: fetchImpl as unknown as typeof fetch, rowStore });
     expect(result.ran).toBe(false);
     expect(fetchImpl).not.toHaveBeenCalled();
+    expect(log).toEqual([]);
+    expect(rowStore.get()).toBeNull();
   });
 
   it("does nothing when the row exists and no family holds a legacy token", async () => {
