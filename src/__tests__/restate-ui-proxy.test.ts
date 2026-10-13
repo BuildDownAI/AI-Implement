@@ -61,7 +61,7 @@ describe("handleRestateUiRequest", () => {
     expect((await call("GET", "/ui/")).status).toBe(401);
     gate.current = { ok: true, identity: { email: "u@x.com" }, entry: null, role: "user" };
     expect((await call("GET", "/services")).status).toBe(403);
-    expect((await call("POST", "/admin/restate/ingress/restate/call/S/k/h")).status).toBe(403);
+    expect((await call("POST", "/admin/restate/ingress/KgRefresh/abc/decide")).status).toBe(403);
     expect(adminHits).toHaveLength(0);
     expect(ingressHits).toHaveLength(0);
   });
@@ -76,8 +76,8 @@ describe("handleRestateUiRequest", () => {
     expect(adminHits.map((h) => `${h.method} ${h.url}`)).toEqual(admin.map(([m, p]) => `${m} ${p}?a=1`));
     expect(ingressHits).toHaveLength(0);
 
-    await call("POST", "/admin/restate/ingress/restate/call/S/k/h?x=y", "{}");
-    expect(ingressHits.map((h) => `${h.method} ${h.url} ${h.body}`)).toEqual(["POST /restate/call/S/k/h?x=y {}"]);
+    await call("POST", "/admin/restate/ingress/KgRefresh/abc/decide?x=y", "{}");
+    expect(ingressHits.map((h) => `${h.method} ${h.url} ${h.body}`)).toEqual(["POST /KgRefresh/abc/decide?x=y {}"]);
   });
 
   it("does not handle other paths or methods and reaches no upstream", async () => {
@@ -91,7 +91,7 @@ describe("handleRestateUiRequest", () => {
   });
 
   it("strips cookie and authorization but forwards other headers", async () => {
-    await call("POST", "/admin/restate/ingress/restate/call/S/k/h", "{}", { cookie: "s=1", authorization: "Bearer t", "content-type": "application/json" });
+    await call("POST", "/admin/restate/ingress/KgRefresh/abc/decide", "{}", { cookie: "s=1", authorization: "Bearer t", "content-type": "application/json" });
     await call("GET", "/services", undefined, { cookie: "s=1", authorization: "Bearer t" });
     for (const h of [...ingressHits, ...adminHits]) {
       expect(h.headers.cookie).toBeUndefined();
@@ -106,6 +106,75 @@ describe("handleRestateUiRequest", () => {
     await call("POST", "/query", "{}");
     const lines = logSpy.mock.calls.map((c: unknown[]) => String(c[0])).filter((l: string) => l.startsWith("[restate-ui]"));
     expect(lines).toEqual(["[restate-ui] a@x.com PATCH /invocations/x/cancel"]);
+  });
+
+  it("allows only KgRefresh decide/status on the ingress and answers 403 otherwise", async () => {
+    const base = "/admin/restate/ingress";
+    for (const p of ["/KgRefresh/abc/status", "/restate/call/KgRefresh/abc/decide", "/restate/send/KgRefresh/abc/decide", "/KgRefresh/abc/decide/send"]) {
+      expect((await call("POST", base + p)).status).toBe(200);
+    }
+    expect(ingressHits).toHaveLength(4);
+    ingressHits.length = 0;
+    for (const p of ["/Operator/x/issue", "/KgRefresh/abc/report", "/KgRefresh/abc/cancel", "/ReviewFixAttempt/x/result", "", "/", `/KgRefresh/${"a".repeat(129)}/decide`, "/KgRefresh/a b/decide", "/KgRefresh/a%20b/decide"]) {
+      expect((await call("POST", base + p)).status).toBe(403);
+    }
+    expect((await call("GET", `${base}/KgRefresh/abc/decide`)).status).toBe(403);
+    expect(ingressHits).toHaveLength(0);
+  });
+
+  it("rejects dot segments, double slashes and encoded separators with 400", async () => {
+    const raw = (path: string) => new Promise<number>((resolve, reject) => {
+      const u = new URL(urlOf(front));
+      http.request({ hostname: u.hostname, port: u.port, path, method: "GET" }, (r) => { r.resume(); resolve(r.statusCode!); }).on("error", reject).end();
+    });
+    for (const p of ["/ui/../deployments/x", "/invocations/%2e%2e/services/X", "/ui//x", "/ui/%2F", "/ui/%5C", "/ui/%2E", "/admin/restate/ingress/KgRefresh/%2fx/decide"]) {
+      expect(await raw(p)).toBe(400);
+    }
+    expect(adminHits).toHaveLength(0);
+    expect(ingressHits).toHaveLength(0);
+    expect(await raw("/api//x")).toBe(418);
+  });
+
+  it("allows only GET and HEAD on /ui", async () => {
+    expect((await call("DELETE", "/ui/x")).status).toBe(405);
+    expect((await call("POST", "/ui")).status).toBe(405);
+    expect((await call("GET", "/ui/x")).status).toBe(200);
+    expect((await call("HEAD", "/ui/x")).status).toBe(200);
+    expect(adminHits).toHaveLength(2);
+  });
+
+  it("drops hop-by-hop and forwarded request headers", async () => {
+    await new Promise<void>((resolve, reject) => {
+      const u = new URL(urlOf(front));
+      http.request({ hostname: u.hostname, port: u.port, path: "/services", method: "GET", headers: {
+        connection: "upgrade", upgrade: "websocket", "keep-alive": "5", te: "trailers", "proxy-authorization": "x", "x-forwarded-for": "1.2.3.4", "x-keep": "1",
+      } }, (r) => { r.resume(); r.on("end", resolve); }).on("error", reject).end();
+    });
+    const h = adminHits[0].headers;
+    for (const n of ["upgrade", "keep-alive", "te", "proxy-authorization", "x-forwarded-for"]) expect(h[n]).toBeUndefined();
+    expect(h.connection).not.toBe("upgrade");
+    expect(h["x-keep"]).toBe("1");
+  });
+
+  it("drops set-cookie and access-control-* from responses and adds nosniff", async () => {
+    adminOnReq = (res) => {
+      res.writeHead(200, { "set-cookie": "a=1", "access-control-allow-origin": "*", "content-type": "text/plain" });
+      res.end("ok");
+    };
+    const r = await call("GET", "/services");
+    expect(r.headers.get("set-cookie")).toBeNull();
+    expect(r.headers.get("access-control-allow-origin")).toBeNull();
+    expect(r.headers.get("x-content-type-options")).toBe("nosniff");
+  });
+
+  it("logs every ingress request, including denied ones", async () => {
+    await call("GET", "/admin/restate/ingress/KgRefresh/abc/decide");
+    await call("POST", "/admin/restate/ingress/Operator/x/issue");
+    const lines = logSpy.mock.calls.map((c: unknown[]) => String(c[0])).filter((l: string) => l.startsWith("[restate-ui]"));
+    expect(lines).toEqual([
+      "[restate-ui] a@x.com GET /admin/restate/ingress/KgRefresh/abc/decide",
+      "[restate-ui] a@x.com POST /admin/restate/ingress/Operator/x/issue",
+    ]);
   });
 
   it("does not throw for an access-code session (no identity)", async () => {
