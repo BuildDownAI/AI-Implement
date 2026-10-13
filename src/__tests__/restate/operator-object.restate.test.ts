@@ -464,7 +464,7 @@ describe("Operator legacy-token scrub (AII-1287)", () => {
     expect((await journalsText()).includes(legacyResult.token)).toBe(true);
 
     let row: string | null = null;
-    const rowStore = { read: () => row, write: (iso: string) => { row = iso; } };
+    const rowStore = { read: () => row, write: (iso: string) => { row = iso; }, clear: () => { row = null; } };
     const deps = { adminBaseUrl: env.adminAPIBaseUrl(), ingressBaseUrl: env.baseUrl(), rowStore };
 
     const first = await scrubOperatorLegacyTokens(deps);
