@@ -106,12 +106,24 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
     }
 
     // A gap-fill names no head: the PR's head when the workflow starts is the one it reviews. Journaled, so a replay keeps it.
-    const headSha = input.headSha
-      ?? await ctx.run("read-head", () => deps.readHead(input), { maxRetryAttempts: 5 });
-    // The PR's own history decides "no reviewer" once: an earlier commit with a review run means the repo has one. Journaled.
-    const reviewerExpected = input.gapFill && !input.followHead && deps.readReviewerExpected
-      ? await ctx.run("reviewer-expected", () => deps.readReviewerExpected!({ ...input, headSha }), { maxRetryAttempts: 5 })
-      : undefined;
+    // The PR's own history decides "no reviewer" once (AII-1302): an earlier commit with a review run means the repo has one.
+    // It rides in the same journal entry as the head, so the `ctx.run` sequence of an in-flight workflow is unchanged
+    // (Restate replays by call position). An entry journaled before AII-1302 is a bare SHA string; it reads as
+    // "reviewer expected", which fails closed (no grace) for that workflow.
+    let headSha = input.headSha;
+    let reviewerExpected: boolean | undefined;
+    if (!headSha) {
+      const read = await ctx.run("read-head", async (): Promise<{ headSha: string; reviewerExpected?: boolean }> => {
+        const head = await deps.readHead(input);
+        const expected = input.gapFill && !input.followHead && deps.readReviewerExpected
+          ? await deps.readReviewerExpected({ ...input, headSha: head })
+          : undefined;
+        return expected === undefined ? { headSha: head } : { headSha: head, reviewerExpected: expected };
+      }, { maxRetryAttempts: 5 });
+      const legacy = typeof read === "string";
+      headSha = legacy ? read : read.headSha;
+      reviewerExpected = legacy ? true : read.reviewerExpected;
+    }
     const tickInput = { ...input, headSha, ...(reviewerExpected === undefined ? {} : { reviewerExpected }) };
     let approvedHeadSha = headSha;
     for (let i = 0; ; i++) {
