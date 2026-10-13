@@ -345,7 +345,7 @@ The PR check is a check run and its sticky comment on the PR's own head SHA, pos
 `dry-run-report` step; nothing is stored or read back, so each report carries only that PR's own verdict
 (AII-636, AII-977). `forgetPr` on PR close drops any held head. The old `kg_refresh_dry_run_outcomes`
 settings row is deleted at boot. `KgRepo.recordDryRunOutcome` is a no-op kept until 2026-11-13 for the
-send a dry-run workflow in flight at deploy has journaled. The webhook keeps no sha dedup: the delivery id is
+send that a dry-run workflow in flight at deploy has journaled. The webhook keeps no sha dedup: the delivery id is
 the `enqueueDryRun` idempotency key, and the object keeps one `sha:<repo>#<pr>` state key holding the
 last head sha it accepted for the PR — a second event for that sha (any delivery id) returns
 `{ duplicate: true }`, neither submitting nor queuing, and the webhook answers 200. `forgetPr` clears the key. A PR dry-run queued behind a

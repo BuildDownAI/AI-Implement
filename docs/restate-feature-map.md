@@ -62,7 +62,7 @@ and handler types that the typed clients use are in `src/restate/kg-refresh-type
 | One-way send | yes, typed (`objectSendClient`, `workflowSendClient`; AII-975) | yes, untyped (`genericSend`) | — | |
 | Delayed send | yes: `KgRepo.expire` self-send (AII-973) | yes (`ReviewFixPR.check` self-timer) | no | |
 | Request-response call (`objectClient`, `workflowClient`) | yes (from tools handlers, typed) | no | yes | |
-| Virtual Object state (`get`/`set`/`clear`) | yes (`inFlight`, `pending`, `outcome:<repo>#<pr>`, `sha:<repo>#<pr>`) | yes | yes (+ `clearAll`) | |
+| Virtual Object state (`get`/`set`/`clear`) | yes (`inFlight`, `pending`, `closedKeys`, `sha:<repo>#<pr>`) | yes | yes (+ `clearAll`) | |
 | Workflow state (`ctx.set` inside `run`) | yes (`step`, `runId`, …) | no | — | |
 | Exclusive vs shared object handlers | yes (`status` shared) | no (all exclusive) | yes (`describe`, `identity` shared) | |
 | `ctx.rand`, `ctx.date` | yes | yes | yes | |

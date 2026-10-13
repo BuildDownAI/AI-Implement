@@ -230,7 +230,7 @@ interface KgRefreshInput {
   githubAppPrivateKey: string;
   /** owner/repo of the KG source (config.kgSourceRepo — never hard-code the slug). */
   kgSourceRepo: string | null;
-  /** The `KgRepo` ingress calls the dry-run report surface reads and evicts through (AII-977). */
+  /** The `KgRepo` ingress calls the dry-run report surface evicts through (AII-977). */
   dryRunOutcomes: KgDryRunOutcomeStore;
 }
 
