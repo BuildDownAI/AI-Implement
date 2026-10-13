@@ -86,7 +86,10 @@ export const kgPipelinesScript = `
         const held = await res.json().catch(() => ({}));
         if (held.error === 'deploy-in-progress') {
           card.hidden = false;
-          document.getElementById('kg-refresh-btn').disabled = true;
+          ['kg-refresh-btn', 'kg-accept-btn', 'kg-cancel-btn'].forEach(function (id) {
+            const b = document.getElementById(id);
+            if (b) b.disabled = true;
+          });
           document.getElementById('kg-refresh-last').textContent =
             'A deploy is in progress \u2014 the refresh status returns after it completes.';
           return;
@@ -238,7 +241,7 @@ export const kgPipelinesScript = `
   window.decideKgRefresh = async function (action) {
     const prompt = action === 'accept'
       ? 'Accept the new baseline? This lands the held snapshot even though a tracked part shrank, overriding the zero-shrink/50% guard for this run. Review the part table first.'
-      : 'Cancel the current refresh? The run stops and its held PR is closed.';
+      : 'Cancel the current refresh? The run stops, and a held PR, if there is one, is closed.';
     if (!confirm(prompt)) return;
     const accept = document.getElementById('kg-accept-btn');
     const cancel = document.getElementById('kg-cancel-btn');
