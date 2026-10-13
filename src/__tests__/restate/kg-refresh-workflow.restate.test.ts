@@ -215,6 +215,8 @@ describe("KgRefresh durable workflow", () => {
     return "merged";
   });
   const closePullRequestFn = vi.fn(async (): Promise<void> => {});
+  // What a failed close finds when it re-reads the PR: merged by default, open for the keeps-failing scenarios.
+  let pullRequestState: { merged: boolean; state: string } = { merged: true, state: "closed" };
   const deleteBranchFn = vi.fn(async (): Promise<void> => {});
   const postPrCommentFn = vi.fn(async (): Promise<void> => {});
   const postOrUpdateStickyCommentFn = vi.fn(async (): Promise<void> => {});
@@ -251,7 +253,7 @@ describe("KgRefresh durable workflow", () => {
     loadSnapshotSha: () => loadSnapshotShaImpl(),
     mergePullRequestFn: mergePullRequestFn as unknown as KgRailDeps["mergePullRequestFn"],
     closePullRequestFn: closePullRequestFn as unknown as KgRailDeps["closePullRequestFn"],
-    getPullRequestStateFn: (async () => ({ merged: true, state: "closed", headRef: null, headSha: null })) as unknown as KgRailDeps["getPullRequestStateFn"],
+    getPullRequestStateFn: (async () => ({ ...pullRequestState, headRef: null, headSha: null })) as unknown as KgRailDeps["getPullRequestStateFn"],
     deleteBranchFn: deleteBranchFn as unknown as KgRailDeps["deleteBranchFn"],
     postPrCommentFn: postPrCommentFn as unknown as KgRailDeps["postPrCommentFn"],
     postOrUpdateStickyCommentFn: postOrUpdateStickyCommentFn as unknown as KgRailDeps["postOrUpdateStickyCommentFn"],
@@ -298,7 +300,9 @@ describe("KgRefresh durable workflow", () => {
     forcePersistFailure = false;
 
     mergePullRequestFn.mockClear();
-    closePullRequestFn.mockClear();
+    closePullRequestFn.mockReset();
+    closePullRequestFn.mockImplementation(async () => {});
+    pullRequestState = { merged: true, state: "closed" };
     deleteBranchFn.mockClear();
     postPrCommentFn.mockClear();
     postOrUpdateStickyCommentFn.mockClear();
@@ -3527,6 +3531,44 @@ describe("KgRefresh durable workflow", () => {
         expect(closePullRequestFn).toHaveBeenCalledTimes(1);
         expect(postPrCommentFn.mock.calls.length - beforeComments).toBe(1);
         expect(await closeRowFor(triggerId)).toMatchObject({ conclusion: "decision_timeout" });
+        await eventually(() => countSends(env, "FlyMachineProfile", "kg-refresh", "release"), (n) => n >= 1, { label: "release" });
+      },
+      60_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "AII-1284: a timeout whose close keeps failing on an open PR still ends decision_timeout and releases (%s)",
+      async (label) => {
+        const env = shortHeldEnvs.get(label)!;
+        pullRequestState = { merged: false, state: "open" };
+        closePullRequestFn.mockRejectedValue(new Error("GitHub 502"));
+        const releasesBefore = await countSends(env, "FlyMachineProfile", "kg-refresh", "release");
+        const triggerId = await holdRun(env, { awaitGate: false });
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn.mock.calls.length).toBeGreaterThanOrEqual(1);
+        expect(await closeRowFor(triggerId)).toMatchObject({ conclusion: "decision_timeout" });
+        expect(outcomesFor(triggerId).map((c) => c.meta.failureCode)).toEqual(["decision_timeout"]);
+        // The held report's release plus the finally's release; a failing close adds none.
+        await eventually(() => countSends(env, "FlyMachineProfile", "kg-refresh", "release"), (n) => n >= releasesBefore + 1, { label: "release" });
+      },
+      60_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "AII-1284: a cancel whose close keeps failing on an open PR still ends operator_cancelled and releases (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        pullRequestState = { merged: false, state: "open" };
+        closePullRequestFn.mockRejectedValue(new Error("GitHub 502"));
+        const triggerId = await holdRun(env);
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "stop" });
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn.mock.calls.length).toBeGreaterThanOrEqual(1);
+        expect(await closeRowFor(triggerId)).toMatchObject({ status: "failed", conclusion: "operator_cancelled" });
         await eventually(() => countSends(env, "FlyMachineProfile", "kg-refresh", "release"), (n) => n >= 1, { label: "release" });
       },
       60_000,
