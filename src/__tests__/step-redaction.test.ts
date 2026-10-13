@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { DefaultPipelineContext } from "../pipeline/context.js";
 import { loadPipelineDefinition } from "../pipeline/pipeline-loader.js";
 import { redactStepCredentials } from "../pipeline/step-redaction.js";
-import type { PipelineContextData, Step } from "../pipeline/types.js";
+import type { Step } from "../pipeline/types.js";
+import { makeContext } from "./helpers/builders.js";
 
 const TOKEN = "ghs_SENTINEL_TOKEN_VALUE";
 const NONCE = "SENTINEL_NONCE_VALUE";
@@ -25,14 +25,14 @@ describe("redactStepCredentials", () => {
   it("strips credentials from the clone step's real inputs and outputs shape", () => {
     const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml");
     const cloneDef = pipeline.steps.find((s) => s.id === "clone")!;
-    const context = new DefaultPipelineContext({
+    const context = makeContext({
       githubToken: TOKEN,
       nonce: NONCE,
       githubOwner: "org",
       githubRepo: "repo",
       branch: "main",
       workspaceDir: "/workspace",
-    } as unknown as PipelineContextData);
+    });
     const inputs = context.resolveInputs(cloneDef.inputs);
     expect(inputs.githubToken).toBe(TOKEN);
     expect(inputs.machineNonce).toBe(NONCE);

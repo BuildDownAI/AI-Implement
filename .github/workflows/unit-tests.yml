@@ -15,7 +15,7 @@ name: unit-tests
 
 on:
   pull_request:
-    branches: [testing, main, "ai-implement/feature/**", "ai-implement/multi-issue/**", integration/test-suite-gate]
+    branches: [testing, main, "ai-implement/feature/**", "ai-implement/multi-issue/**", AII-215-integration/test-suite-gate]
 
 jobs:
   unit-tests:

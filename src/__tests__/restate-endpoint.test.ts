@@ -209,12 +209,15 @@ describe("register", () => {
   it("bounds the forced retry at 10s — a never-resolving fetch on the retry after a META0004 conflict degrades to unreachable (AII-728)", async () => {
     const timeoutSpy = stubAbortTimeout(10_000);
     try {
+      const fake = deployments(META0004, hangUntilAborted);
       const result = await register({
         adminBaseUrl: "http://127.0.0.1:9070",
-        fetchImpl: deployments(META0004, hangUntilAborted).fetch,
+        fetchImpl: fake.fetch,
         queryNonCompletedInvocations: async () => 0,
       });
       expect(result.outcome).toBe("unreachable");
+      // The request that hung is the forced retry.
+      expect(JSON.parse(fake.calls[1].body)).toMatchObject({ force: true });
     } finally {
       timeoutSpy.mockRestore();
     }

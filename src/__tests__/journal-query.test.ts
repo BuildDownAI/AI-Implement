@@ -6,6 +6,7 @@ import {
   readJournal,
   validateJournalLookup,
 } from "../restate/journal-query.js";
+import { fakeFetch, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
 
 describe("validateJournalLookup", () => {
   it("accepts service+key and id", () => {
@@ -49,11 +50,16 @@ describe("buildJournalQueries", () => {
   });
 });
 
-function rowsFetch(responses: Array<unknown[] | Error>): ReturnType<typeof vi.fn> {
-  return vi.fn(async () => {
-    const next = responses.shift();
-    if (next instanceof Error) throw next;
-    return new Response(JSON.stringify({ rows: next }), { status: 200 });
+// The admin API's /query endpoint, answering each query in order with its rows, or failing it.
+function introspection(...replies: Array<unknown[] | Error>): FakeFetch {
+  return fakeFetch({
+    "POST /query": replies.map((reply): Reply =>
+      reply instanceof Error
+        ? () => {
+            throw reply;
+          }
+        : { json: { rows: reply } },
+    ),
   });
 }
 
@@ -61,13 +67,13 @@ describe("readJournal", () => {
   const invocation = { id: "inv_1", target_service_name: "KgRefresh", target_service_key: "k", status: "completed" };
 
   it("returns null without further queries when no invocation matches", async () => {
-    const fetchImpl = rowsFetch([[]]);
-    expect(await readJournal({ id: "nope" }, { fetchImpl: fetchImpl as never, adminBaseUrl: "http://x" })).toBeNull();
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const fake = introspection([]);
+    expect(await readJournal({ id: "nope" }, { fetchImpl: fake.fetch, adminBaseUrl: "http://x" })).toBeNull();
+    expect(fake.calls).toHaveLength(1);
   });
 
   it("trims entries, parses entry_json, and nulls oversized or malformed ones", async () => {
-    const fetchImpl = rowsFetch([
+    const fake = introspection(
       [invocation],
       [
         { index: 0, entry_type: "Run", name: "step", completed: true, promise_name: null, entry_json: '{"a":1}', appended_at: 1, sleep_wakeup_at: null, extra: "dropped" },
@@ -75,8 +81,8 @@ describe("readJournal", () => {
         { index: 2, entry_type: "Run", name: "bad", completed: true, entry_json: "{not json" },
       ],
       [{ service_name: "KgRefresh", service_key: "k", key: "report", completed: true }],
-    ]);
-    const result = await readJournal({ id: "inv_1" }, { fetchImpl: fetchImpl as never, adminBaseUrl: "http://x" });
+    );
+    const result = await readJournal({ id: "inv_1" }, { fetchImpl: fake.fetch, adminBaseUrl: "http://x" });
     expect(result?.invocation).toEqual(invocation);
     expect(result?.entries.map((e) => e.entry)).toEqual([{ a: 1 }, null, null]);
     expect(result?.entries[0]).toEqual({
@@ -84,32 +90,32 @@ describe("readJournal", () => {
     });
     expect(result?.promises).toHaveLength(1);
     // The promises query uses the resolved invocation's service and key.
-    const lastBody = JSON.parse((fetchImpl.mock.calls[2][1] as { body: string }).body).query as string;
+    const lastBody = JSON.parse(fake.calls[2].body).query as string;
     expect(lastBody).toContain("service_name = 'KgRefresh' AND service_key = 'k'");
   });
 
   it("skips the promises query for a keyless service instead of matching the string 'null'", async () => {
     const keyless = { ...invocation, target_service_name: "orchestratorTools", target_service_key: null };
-    const fetchImpl = rowsFetch([[keyless], []]);
-    const result = await readJournal({ id: "inv_1" }, { fetchImpl: fetchImpl as never, adminBaseUrl: "http://x" });
+    const fake = introspection([keyless], []);
+    const result = await readJournal({ id: "inv_1" }, { fetchImpl: fake.fetch, adminBaseUrl: "http://x" });
     expect(result?.promises).toEqual([]);
     // invocation + journal only; no third (promises) query
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(fake.calls).toHaveLength(2);
   });
 });
 
 describe("handleJournalRequest", () => {
   it("answers 400 without calling the admin API on a bad lookup", async () => {
-    const fetchImpl = vi.fn();
-    const r = await handleJournalRequest({ service: "KgRefresh", key: "x'y" }, { fetchImpl: fetchImpl as never });
+    const fake = fakeFetch({});
+    const r = await handleJournalRequest({ service: "KgRefresh", key: "x'y" }, { fetchImpl: fake.fetch });
     expect(r.status).toBe(400);
-    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(fake.calls).toHaveLength(0);
   });
 
   it("answers 404 and 503", async () => {
-    expect(await handleJournalRequest({ id: "a" }, { fetchImpl: rowsFetch([[]]) as never })).toEqual({ status: 404, body: { error: "no invocation" } });
+    expect(await handleJournalRequest({ id: "a" }, { fetchImpl: introspection([]).fetch })).toEqual({ status: 404, body: { error: "no invocation" } });
     vi.spyOn(console, "error").mockImplementation(() => {});
-    expect(await handleJournalRequest({ id: "a" }, { fetchImpl: rowsFetch([new Error("down")]) as never })).toEqual({
+    expect(await handleJournalRequest({ id: "a" }, { fetchImpl: introspection(new Error("down")).fetch })).toEqual({
       status: 503,
       body: { error: "restate unavailable" },
     });

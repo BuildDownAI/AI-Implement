@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveSessionImage, resolveDefaultRunnerImage, selectRunnerImageInput, resolveRunnerImageForDispatch, resolveChannelCommit, stripImageTag, __clearRepoImageCacheForTests } from "../repo-image.js";
 import { fakeFetch, hangUntilAborted, type FakeFetch, type Reply, type Routes } from "./helpers/fake-fetch.js";
+import { githubFile } from "./helpers/github-replies.js";
 
 const DEFAULT_IMAGE = "ghcr.io/builddownai/ai-implement-runner:latest";
 
@@ -9,18 +10,13 @@ function imageYml(reply: Reply): FakeFetch {
   return fakeFetch({ "GET /repos/acme/widgets/contents/.ai-implement/image.yml": reply });
 }
 
-// GitHub contents API returns JSON with base64-encoded `content` for file blobs.
-function contentsApiResponse(fileBody: string): Reply {
-  return { json: { type: "file", encoding: "base64", content: Buffer.from(fileBody, "utf8").toString("base64") } };
-}
-
 describe("resolveSessionImage", () => {
   beforeEach(() => {
     __clearRepoImageCacheForTests();
   });
 
   it("returns the override when image.yml has a valid image:", async () => {
-    const github = imageYml(contentsApiResponse("image: ghcr.io/acme/my-runner:v3\n"));
+    const github = imageYml(githubFile("image: ghcr.io/acme/my-runner:v3\n"));
     const result = await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
@@ -45,7 +41,7 @@ describe("resolveSessionImage", () => {
   });
 
   it("returns the default when YAML is malformed (no image: key)", async () => {
-    const github = imageYml(contentsApiResponse("something: else\n"));
+    const github = imageYml(githubFile("something: else\n"));
     const result = await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
@@ -57,7 +53,7 @@ describe("resolveSessionImage", () => {
   });
 
   it("returns the default when image: value fails validation (whitespace)", async () => {
-    const github = imageYml(contentsApiResponse("image: not a valid image\n"));
+    const github = imageYml(githubFile("image: not a valid image\n"));
     const result = await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
@@ -69,7 +65,7 @@ describe("resolveSessionImage", () => {
   });
 
   it("returns the default when image: value lacks a tag (no colon)", async () => {
-    const github = imageYml(contentsApiResponse("image: ghcr.io/acme/runner\n"));
+    const github = imageYml(githubFile("image: ghcr.io/acme/runner\n"));
     const result = await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
@@ -83,7 +79,7 @@ describe("resolveSessionImage", () => {
   it("accepts digest references (@sha256:...)", async () => {
     const digestRef =
       "ghcr.io/acme/my-runner@sha256:deadbeefcafebabe0000000000000000000000000000000000000000000000ab";
-    const github = imageYml(contentsApiResponse(`image: ${digestRef}\n`));
+    const github = imageYml(githubFile(`image: ${digestRef}\n`));
     const result = await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
@@ -95,7 +91,7 @@ describe("resolveSessionImage", () => {
   });
 
   it("ignores other keys in the YAML", async () => {
-    const github = imageYml(contentsApiResponse("image: ghcr.io/acme/my-runner:v3\napt: [terraform]\nfuture_knob: 42\n"));
+    const github = imageYml(githubFile("image: ghcr.io/acme/my-runner:v3\napt: [terraform]\nfuture_knob: 42\n"));
     const result = await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
@@ -107,7 +103,7 @@ describe("resolveSessionImage", () => {
   });
 
   it("caches results for 60 seconds per owner/repo", async () => {
-    const github = imageYml(contentsApiResponse("image: ghcr.io/acme/my-runner:v3\n"));
+    const github = imageYml(githubFile("image: ghcr.io/acme/my-runner:v3\n"));
     await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
@@ -225,7 +221,7 @@ describe("resolveRunnerImageForDispatch", () => {
   });
 
   it("forwards a per-repo override even when the orchestrator default is implicit", async () => {
-    const github = imageYml(contentsApiResponse("image: ghcr.io/acme/my-runner:v3\n"));
+    const github = imageYml(githubFile("image: ghcr.io/acme/my-runner:v3\n"));
     const image = await resolveRunnerImageForDispatch({
       owner: "acme",
       repo: "widgets",

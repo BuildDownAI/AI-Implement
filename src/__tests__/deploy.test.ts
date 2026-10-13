@@ -5,7 +5,7 @@ import type * as DeployModule from "../deploy.js";
 import { RestateDrainCoordinator } from "../restate/drain.js";
 import { fakeFetch } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
-import { testDir } from "./helpers/test-dir.js";
+import { testTempRoot } from "./helpers/test-dir.js";
 
 let deploy: typeof DeployModule;
 
@@ -22,14 +22,12 @@ beforeEach(async () => {
 });
 
 /** Prepares a test whose deploy runs past `start()` in the background: its scratch directory goes
- *  under a `testDir` instead of the OS temp directory, and its flyctl download gets a 404, so it
+ *  under a `testTempRoot` instead of the OS temp directory, and its flyctl download gets a 404, so it
  *  fails before any subprocess. The download is a stubbed global, not a `fakeFetch` route, because
- *  its URL embeds an unexported version and the runtime arch. Undone by `vi.unstubAllEnvs()` and
- *  `vi.unstubAllGlobals()`. */
+ *  its URL embeds an unexported version and the runtime arch; `vi.unstubAllGlobals()` undoes it. */
 function containBackgroundDeploy(): void {
-  // deployScratch() creates its directory under os.tmpdir(), which reads these per call.
-  const tempRoot = testDir("deploy");
-  for (const name of ["TMPDIR", "TEMP", "TMP"]) vi.stubEnv(name, tempRoot);
+  // deployScratch() creates its directory under os.tmpdir(), which reads the temp variables per call.
+  testTempRoot("deploy");
   vi.stubGlobal("fetch", vi.fn(async () => new Response("nope", { status: 404 })));
 }
 
@@ -357,7 +355,6 @@ describe("makeStartDeploy onBuildFailure callback", () => {
     vi.doUnmock("../github-app-auth.js");
     vi.doUnmock("../github.js");
     vi.unstubAllGlobals();
-    vi.unstubAllEnvs();
   });
 
   it("uses the installation token path by default (auth=installation)", async () => {
@@ -444,7 +441,6 @@ describe("makeStartDeploy — public mode (no App installation on source owner)"
     vi.doUnmock("../github-app-auth.js");
     vi.doUnmock("../github.js");
     vi.unstubAllGlobals();
-    vi.unstubAllEnvs();
   });
 
   it("resolves HEAD and returns started:true when the source uses public (unauthenticated) fallback", async () => {

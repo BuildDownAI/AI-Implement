@@ -92,11 +92,12 @@ The credential `beforeEach` in `clear-runner-credentials.ts` predates the scrub 
 
 ### Harnesses
 
-A builder makes a value a test passes in. A harness makes something the code under test reaches for by itself, and removes it when the test finishes. `src/__tests__/helpers/` holds three:
+A builder makes a value a test passes in. A harness makes something the code under test reaches for by itself, and removes it when the test finishes. `src/__tests__/helpers/` holds these:
 
 | Harness | Gives a test | Replaces |
 |---|---|---|
 | `testDir(prefix?)`, `test-dir.ts` | An empty directory under the OS temp directory | `mkdtempSync` plus a removal list in `afterEach` |
+| `testTempRoot(prefix?)`, `test-dir.ts` | A `testDir` that the OS temp directory points at | Stubbing `TMPDIR`, `TEMP` and `TMP`, then restoring them by hand |
 | `testDb(options?)`, `test-db.ts` | Its own database file with every table boot creates, and the modules it asked for, imported against that file | Setting `DEDUP_DB_PATH`, `vi.resetModules()`, dynamic imports and table creation in `beforeEach`, then `closeDb()` and a file delete in `afterEach` |
 | `fakeFetch(routes)`, `fake-fetch.ts` | A `fetch` that answers from a route table and records every request | A per-file fake, or `vi.stubGlobal("fetch", vi.fn())` with queued replies |
 
@@ -105,6 +106,8 @@ A builder makes a value a test passes in. A harness makes something the code und
 **Naming.** A harness is named for what a test gets (`testDir`, `testDb`, `fakeFetch`), and the name says it belongs to a test, since it works only inside one. The `make*` prefix stays with the builders: plain data, buildable anywhere.
 
 **`testDir`.** It returns an empty directory, removed with everything in it when the test finishes. `prefix` goes into the directory's name (`ai-implement-<prefix>-…`), which identifies a leaked one.
+
+**`testTempRoot`.** For code that writes under `os.tmpdir()` itself rather than taking a directory, such as a background deploy's scratch directory or a container's secret env file. It creates a `testDir`, then points `TMPDIR`, `TEMP` and `TMP` at it, the variables `os.tmpdir()` reads first on POSIX and on Windows, so whatever the code creates there is removed with it. When the test finishes, each variable goes back to its earlier value, or is unset again, before the directory is removed. A `testDir` called after it lands inside it.
 
 **`testDb`.** `dedup.ts` resolves its database path once, when it is first imported. A test therefore gets its own database only by setting `DEDUP_DB_PATH`, resetting the module registry, and importing every database module again; `testDb` does these in that order, with the file inside a `testDir`. A test passes the modules it needs as loaders and gets them back, typed:
 
@@ -131,9 +134,11 @@ When the test finishes, the database is closed, the previous `DEDUP_DB_PATH` is 
 - `hangUntilAborted`, exported beside `fakeFetch`: a reply that never answers, and rejects with the abort's reason once the caller's signal fires, as `fetch` does. It proves a request is bounded by its timeout;
 - a list of any of these, served one per request, in order.
 
-Pass `fake.fetch` where a module takes `fetchImpl`, or call `fake.install()` when the code calls the global `fetch`; the original global comes back when the test finishes. Prefer `install()` to `vi.stubGlobal`, which stays in place until `vi.unstubAllGlobals()` because the vitest configs leave `unstubGlobals` off. `fake.calls` holds every request as received: method, URL, path, headers, body text, and the `AbortSignal` the caller passed, if any. A request no route matches, or one past the end of its route's list, throws to the caller and also fails the test when it finishes, naming the method and path. Production code often catches a failed `fetch`, and the test must not pass because it did.
+A reply shaped like one service's API that several test files need lives beside the harness, not in it: `githubFile(text)` in `github-replies.ts` answers as GitHub's contents API does for a file, with the text base64-encoded.
 
-**When a test needs more.** Use what the harness offers first; a function reply covers most needs. Write the rest in the test file. A harness grows once three test files share the same new need, as a type gets a builder once three files build it.
+Pass `fake.fetch` where a module takes `fetchImpl`, or call `fake.install()` when the code calls the global `fetch`; the original global comes back when the test finishes. Each `install()` restores the global it replaced, and cleanups run last-registered first, so a test that installs a second fake over its `beforeEach`'s still ends on the original. Prefer `install()` to `vi.stubGlobal`, which stays in place until `vi.unstubAllGlobals()` because the vitest configs leave `unstubGlobals` off. `fake.calls` holds every request as received: method, URL, path, headers, body text, and the `AbortSignal` the caller passed, if any. A request no route matches, or one past the end of its route's list, throws to the caller and also fails the test when it finishes, naming the method and path. Production code often catches a failed `fetch`, and the test must not pass because it did.
+
+**When a test needs more.** Use what the harness offers first; a function reply covers most needs. Write the rest in the test file. A harness grows once three test files share the same new need, as a type gets a builder once three files build it. Two things override the count. A harness that breaks a promise it makes is fixed however few files hit it: `testDb` creates tables through the real modules because a test file's mock of a table's module left that table missing from the test's database. And many per-file workarounds around one harness are a sign it is missing something, so raise them rather than adding another. Growth keeps a harness general: what belongs to one service goes beside it, as `github-replies.ts` does.
 
 **Per-file copies.** Many test files still build their own databases, fakes and directories, and some leave files in the OS temp directory. They move onto the harnesses file by file.
 

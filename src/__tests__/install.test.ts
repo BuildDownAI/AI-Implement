@@ -7,6 +7,7 @@ import { REVIEWER_VERDICT_SCHEMA } from "../pipeline/reviewers/schema.js";
 import type { PipelineContextData } from "../pipeline/types.js";
 import { makeContext } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
+import { githubFile } from "./helpers/github-replies.js";
 import { testDir } from "./helpers/test-dir.js";
 
 /** A pipeline context with `data`, and the clone step's outputs when given. */
@@ -25,16 +26,6 @@ function reviewerPrompt(reviewer: { buildPrompt(input: { issueIdentifier: string
     diff: "diff",
     previousFindings: "previous",
   });
-}
-
-function contentsApiResponse(fileBody: string): Reply {
-  return {
-    json: {
-      type: "file",
-      encoding: "base64",
-      content: Buffer.from(fileBody, "utf8").toString("base64"),
-    },
-  };
 }
 
 /** GitHub's contents API answering for acme/app's `.ai-implement/config.yml` on the default branch. */
@@ -183,7 +174,7 @@ describe("installStep reviewers output", () => {
       "    prompt: malicious PR prompt",
       "",
     ].join("\n"));
-    const github = trustedConfig(contentsApiResponse([
+    const github = trustedConfig(githubFile([
       "reviewers:",
       "  - id: domain-review",
       "    model: claude-sonnet-5-5",
@@ -218,7 +209,7 @@ describe("installStep reviewers output", () => {
 
   it("uses the current clone output credential without adding it to install inputs", async () => {
     const workspaceDir = testDir("ai-implement-install-reviewers");
-    const github = trustedConfig(contentsApiResponse([
+    const github = trustedConfig(githubFile([
       "reviewers:",
       "  - id: domain-review",
       "    prompt: trusted default prompt",
@@ -243,7 +234,7 @@ describe("installStep reviewers output", () => {
 
   it("fetches trusted config even when the PR branch deletes the local config entry", async () => {
     const workspaceDir = testDir("ai-implement-install-reviewers");
-    const github = trustedConfig(contentsApiResponse([
+    const github = trustedConfig(githubFile([
       "reviewers:",
       "  - id: domain-review",
       "    prompt: trusted default prompt",
@@ -329,8 +320,8 @@ describe("installStep reviewers output", () => {
     ["null JSON body", githubContext, { json: null }],
     ["array JSON body", githubContext, { json: [] }],
     ["malformed contents response", githubContext, { json: { type: "dir", encoding: "base64", content: "" } }],
-    ["malformed YAML", githubContext, contentsApiResponse("reviewers: [")],
-    ["missing selected reviewer", githubContext, contentsApiResponse("reviewers:\n  - id: other-review\n    prompt: other\n")],
+    ["malformed YAML", githubContext, githubFile("reviewers: [")],
+    ["missing selected reviewer", githubContext, githubFile("reviewers:\n  - id: other-review\n    prompt: other\n")],
   ])("returns no trusted config reviewers on %s so downstream selection fails closed", async (_name, contextData, reply) => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const workspaceDir = testDir("ai-implement-install-reviewers");

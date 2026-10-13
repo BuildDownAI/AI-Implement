@@ -13,6 +13,7 @@ vi.mock("../local-docker.js", async (importOriginal) => ({
 }));
 
 import { readBackendRun } from "../backend-run.js";
+import { makeAppConfig } from "./helpers/builders.js";
 
 const config = { flySessionsToken: "tok", flySessionsApp: "app" };
 const NO_EXIT = { exitCode: null, signal: null, oomKilled: null, timestamp: null };
@@ -63,7 +64,7 @@ describe("readBackendRun", () => {
   });
 
   it("reads unknown with no call when Fly credentials are missing", async () => {
-    expect(await readBackendRun({ flySessionsToken: undefined, flySessionsApp: "app" } as never, "fly-machines", "m1"))
+    expect(await readBackendRun(makeAppConfig({ flySessionsApp: "app" }), "fly-machines", "m1"))
       .toEqual({ state: "unknown", exit: null });
     expect(getMachine).not.toHaveBeenCalled();
   });

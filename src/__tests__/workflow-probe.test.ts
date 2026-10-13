@@ -5,6 +5,7 @@ import {
   __clearWorkflowProbeCacheForTests,
 } from "../workflow-probe.js";
 import { fakeFetch, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
+import { githubFile } from "./helpers/github-replies.js";
 
 const ENVELOPE_YML =
   "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n";
@@ -23,18 +24,13 @@ function contents(reply: Reply, workflowFile = "claude-implement.yml"): FakeFetc
   return fakeFetch({ [`GET /repos/o/r/contents/.github/workflows/${workflowFile}`]: reply });
 }
 
-/** The contents API's reply for a file, base64-encoded as GitHub sends it. */
-function yamlFile(yamlBody: string): Reply {
-  return { json: { type: "file", encoding: "base64", content: Buffer.from(yamlBody, "utf8").toString("base64") } };
-}
-
 describe("resolveWorkflowContract", () => {
   beforeEach(() => {
     __clearWorkflowProbeCacheForTests();
   });
 
   it("classifies a run_config-declaring workflow as envelope", async () => {
-    const github = contents(yamlFile(ENVELOPE_YML));
+    const github = contents(githubFile(ENVELOPE_YML));
     const mode = await resolveWorkflowContract({
       owner: "o",
       repo: "r",
@@ -47,7 +43,7 @@ describe("resolveWorkflowContract", () => {
   });
 
   it("reports publication-token support separately from ordinary envelope support", async () => {
-    const github = contents(yamlFile(PUBLICATION_TOKEN_YML));
+    const github = contents(githubFile(PUBLICATION_TOKEN_YML));
     const capabilities = await resolveWorkflowCapabilities({
       owner: "o",
       repo: "r",
@@ -64,7 +60,7 @@ describe("resolveWorkflowContract", () => {
   });
 
   it("does not require publication-token support for envelope compatibility", async () => {
-    const github = contents(yamlFile(ENVELOPE_YML));
+    const github = contents(githubFile(ENVELOPE_YML));
     const capabilities = await resolveWorkflowCapabilities({
       owner: "o",
       repo: "r",
@@ -83,7 +79,7 @@ describe("resolveWorkflowContract", () => {
   it("does not report publication-token support when the input is only mentioned in a YAML comment", async () => {
     const commentYml =
       "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n      # run_publication_token: would go here\n";
-    const github = contents(yamlFile(commentYml));
+    const github = contents(githubFile(commentYml));
     const capabilities = await resolveWorkflowCapabilities({
       owner: "o",
       repo: "r",
@@ -100,7 +96,7 @@ describe("resolveWorkflowContract", () => {
   });
 
   it("classifies a workflow without run_config as legacy", async () => {
-    const github = contents(yamlFile(LEGACY_YML));
+    const github = contents(githubFile(LEGACY_YML));
     const mode = await resolveWorkflowContract({
       owner: "o",
       repo: "r",
@@ -126,7 +122,7 @@ describe("resolveWorkflowContract", () => {
   });
 
   it("reports no optional capabilities when the workflow is legacy", async () => {
-    const github = contents(yamlFile(LEGACY_YML));
+    const github = contents(githubFile(LEGACY_YML));
     const capabilities = await resolveWorkflowCapabilities({
       owner: "o",
       repo: "r",
@@ -158,7 +154,7 @@ describe("resolveWorkflowContract", () => {
   });
 
   it("caches the result within TTL — second call performs zero extra fetches", async () => {
-    const github = contents(yamlFile(ENVELOPE_YML));
+    const github = contents(githubFile(ENVELOPE_YML));
     await resolveWorkflowContract({
       owner: "o",
       repo: "r",
@@ -179,7 +175,7 @@ describe("resolveWorkflowContract", () => {
   });
 
   it("re-probes after TTL expiry", async () => {
-    const github = contents(yamlFile(ENVELOPE_YML));
+    const github = contents(githubFile(ENVELOPE_YML));
     let fakeNow = 0;
     const nowMs = () => fakeNow;
 
@@ -209,8 +205,8 @@ describe("resolveWorkflowContract", () => {
   });
 
   it("uses separate cache entries per workflowFile", async () => {
-    const githubA = contents(yamlFile(ENVELOPE_YML));
-    const githubB = contents(yamlFile(LEGACY_YML), "claude-plan.yml");
+    const githubA = contents(githubFile(ENVELOPE_YML));
+    const githubB = contents(githubFile(LEGACY_YML), "claude-plan.yml");
 
     const modeA = await resolveWorkflowContract({
       owner: "o",
@@ -251,7 +247,7 @@ describe("resolveWorkflowContract", () => {
   it("does not classify run_config mentioned only in a YAML comment as envelope", async () => {
     const commentYml =
       "on:\n  workflow_dispatch:\n    inputs:\n      # run_config: would go here\n      issue_id:\n        required: true\n";
-    const github = contents(yamlFile(commentYml));
+    const github = contents(githubFile(commentYml));
     const mode = await resolveWorkflowContract({
       owner: "o",
       repo: "r",
@@ -264,7 +260,7 @@ describe("resolveWorkflowContract", () => {
   });
 
   it("probes the given ref, not the repo's implicit default branch", async () => {
-    const github = contents(yamlFile(ENVELOPE_YML), "claude-plan.yml");
+    const github = contents(githubFile(ENVELOPE_YML), "claude-plan.yml");
     await resolveWorkflowContract({
       owner: "o",
       repo: "r",
@@ -280,8 +276,8 @@ describe("resolveWorkflowContract", () => {
   });
 
   it("keeps separate cache entries per ref, so a stale-ref dispatch can't reuse a live-ref probe", async () => {
-    const githubMain = contents(yamlFile(LEGACY_YML), "claude-plan.yml");
-    const githubDev = contents(yamlFile(ENVELOPE_YML), "claude-plan.yml");
+    const githubMain = contents(githubFile(LEGACY_YML), "claude-plan.yml");
+    const githubDev = contents(githubFile(ENVELOPE_YML), "claude-plan.yml");
 
     const modeMain = await resolveWorkflowContract({
       owner: "o",
@@ -315,7 +311,7 @@ describe("resolveWorkflowCapabilities — supportsAttemptCorrelation", () => {
   });
 
   it("reports attempt-correlation support when the workflow declares run_attempt_token", async () => {
-    const github = contents(yamlFile(ATTEMPT_TOKEN_YML));
+    const github = contents(githubFile(ATTEMPT_TOKEN_YML));
     const capabilities = await resolveWorkflowCapabilities({
       owner: "o",
       repo: "r",
@@ -332,7 +328,7 @@ describe("resolveWorkflowCapabilities — supportsAttemptCorrelation", () => {
   });
 
   it("does not report attempt-correlation support for an otherwise-envelope workflow that lacks the marker", async () => {
-    const github = contents(yamlFile(ENVELOPE_YML));
+    const github = contents(githubFile(ENVELOPE_YML));
     const capabilities = await resolveWorkflowCapabilities({
       owner: "o",
       repo: "r",
@@ -347,7 +343,7 @@ describe("resolveWorkflowCapabilities — supportsAttemptCorrelation", () => {
   it("does not report attempt-correlation support when the marker is only mentioned in a YAML comment", async () => {
     const commentYml =
       "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n      # run_attempt_token: would go here\n";
-    const github = contents(yamlFile(commentYml));
+    const github = contents(githubFile(commentYml));
     const capabilities = await resolveWorkflowCapabilities({
       owner: "o",
       repo: "r",
@@ -366,7 +362,7 @@ describe("resolveWorkflowCapabilities — supportsAttemptCorrelation", () => {
     // pilot support.
     const legacyWithMarkerYml =
       "on:\n  workflow_dispatch:\n    inputs:\n      issue_id:\n        required: true\n      run_attempt_token:\n        required: false\n";
-    const github = contents(yamlFile(legacyWithMarkerYml));
+    const github = contents(githubFile(legacyWithMarkerYml));
     const capabilities = await resolveWorkflowCapabilities({
       owner: "o",
       repo: "r",
@@ -383,8 +379,8 @@ describe("resolveWorkflowCapabilities — supportsAttemptCorrelation", () => {
   });
 
   it("probes attempt-correlation support on the actual dispatch ref, not a cached different ref", async () => {
-    const githubMain = contents(yamlFile(ENVELOPE_YML));
-    const githubDev = contents(yamlFile(ATTEMPT_TOKEN_YML));
+    const githubMain = contents(githubFile(ENVELOPE_YML));
+    const githubDev = contents(githubFile(ATTEMPT_TOKEN_YML));
 
     const main = await resolveWorkflowCapabilities({
       owner: "o",

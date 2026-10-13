@@ -1,11 +1,12 @@
-import { beforeAll, beforeEach, describe, expect, it, onTestFailed } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, onTestFailed, onTestFinished } from "vitest";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type Database from "better-sqlite3";
-import { testDir } from "./test-dir.js";
+import { testDir, testTempRoot } from "./test-dir.js";
 import { testDb } from "./test-db.js";
 import { fakeFetch, hangUntilAborted } from "./fake-fetch.js";
+import { githubFile } from "./github-replies.js";
 
 // Cleanup runs after a test ends, so each "is gone" check lives in the test after the one that
 // created the directory. Tests in a file run in order unless marked concurrent, and none here is.
@@ -86,6 +87,37 @@ describe("testDir", () => {
       expect((thrown as Error).message).toMatch(/inside a test/);
       expect(readdirSync(tmpdir()).filter((name) => name.startsWith(`ai-implement-${prefix}-`))).toEqual([]);
     });
+  });
+});
+
+describe("testTempRoot", () => {
+  const TEMP_DIR_VARS = ["TMPDIR", "TEMP", "TMP"] as const;
+  const tempVars = () => Object.fromEntries(TEMP_DIR_VARS.map((name) => [name, process.env[name]]));
+  const before = tempVars();
+  let root: string;
+  let realTemp: string;
+  let tmpAfterRestore: string | undefined;
+
+  it("points every temp variable, and so os.tmpdir(), at a fresh testDir until the test finishes", () => {
+    realTemp = tmpdir();
+    // A variable set before the redirect: this cleanup is registered first, so it runs last and sees what was restored.
+    process.env.TMP = realTemp;
+    onTestFinished(() => {
+      tmpAfterRestore = process.env.TMP;
+      delete process.env.TMP;
+    });
+
+    root = testTempRoot("redirect");
+
+    expect(root.startsWith(join(realTemp, "ai-implement-redirect-"))).toBe(true);
+    expect(tmpdir()).toBe(root);
+    expect(tempVars()).toEqual({ TMPDIR: root, TEMP: root, TMP: root });
+  });
+
+  it("restored each variable, set or unset, and removed the directory, when the test finished", () => {
+    expect(tmpAfterRestore).toBe(realTemp);
+    expect(tempVars()).toEqual(before);
+    expect(existsSync(root)).toBe(false);
   });
 });
 
@@ -377,5 +409,30 @@ describe("fakeFetch", () => {
     it("restored the global fetch when the test finished", () => {
       expect(globalThis.fetch).toBe(original);
     });
+
+    it("lets a second install in the same test replace the first", async () => {
+      const first = fakeFetch({ "GET /ping": { text: "first" } });
+      const second = fakeFetch({ "GET /ping": { text: "second" } });
+      first.install();
+      second.install();
+
+      expect(await (await fetch(`${API}/ping`)).text()).toBe("second");
+      expect(first.calls).toHaveLength(0);
+    });
+
+    it("restored the original fetch, not the first fake, after two installs", () => {
+      expect(globalThis.fetch).toBe(original);
+    });
+  });
+});
+
+describe("githubFile", () => {
+  it("answers as the contents API does for a file: its text base64-encoded", async () => {
+    const github = fakeFetch({ "GET /repos/acme/app/contents/.ai-implement/image.yml": githubFile("image: custom\n") });
+
+    const file = await (await github.fetch("https://api.github.com/repos/acme/app/contents/.ai-implement/image.yml")).json();
+
+    expect(file).toMatchObject({ type: "file", encoding: "base64" });
+    expect(Buffer.from(file.content, "base64").toString("utf8")).toBe("image: custom\n");
   });
 });

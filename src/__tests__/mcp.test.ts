@@ -1038,7 +1038,14 @@ describe("handleMcpRequest", () => {
 
     it("handles list_projects — existing seven fields preserved", async () => {
       vi.mocked(configMock.getMappings).mockReturnValue({
-        "AII": makeMapping({ owner: "BuildDownAI", repo: "AI-Implement", planningEnabled: true }),
+        "AII": makeMapping({
+          owner: "BuildDownAI",
+          repo: "AI-Implement",
+          paused: true,
+          executionMode: "fly-machines",
+          planningEnabled: true,
+          maxInProgressAiIssues: 5,
+        }),
       });
 
       const result = await callMcp(
@@ -1055,11 +1062,11 @@ describe("handleMcpRequest", () => {
       expect(data).toHaveLength(1);
       expect(data[0].teamKey).toBe("AII");
       expect(data[0].repo).toBe("BuildDownAI/AI-Implement");
-      expect(data[0].paused).toBe(false);
-      expect(data[0].executionMode).toBe("github-actions");
+      expect(data[0].paused).toBe(true);
+      expect(data[0].executionMode).toBe("fly-machines");
       expect(data[0].provider).toBe("anthropic");
       expect(data[0].planningEnabled).toBe(true);
-      expect(data[0].maxInProgressAiIssues).toBe(3);
+      expect(data[0].maxInProgressAiIssues).toBe(5);
     });
 
     it("handles list_projects — extended per-project settings", async () => {
@@ -1081,6 +1088,7 @@ describe("handleMcpRequest", () => {
           machineCpus: 4,
           machineMemoryMb: 8192,
           awsRegion: "us-east-1",
+          planningWorkflowFile: "custom-plan.yml",
           autoApprovePlans: false,
         }),
       });
@@ -1117,7 +1125,7 @@ describe("handleMcpRequest", () => {
       expect(p.machineCpus).toBe(4);
       expect(p.machineMemoryMb).toBe(8192);
       expect(p.awsRegion).toBe("us-east-1");
-      expect(p.planningWorkflowFile).toBe("claude-plan.yml");
+      expect(p.planningWorkflowFile).toBe("custom-plan.yml");
       expect(p.autoApprovePlans).toBe(false);
     });
 

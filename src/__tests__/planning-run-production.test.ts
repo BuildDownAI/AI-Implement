@@ -1,8 +1,9 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { RepoMapping } from "../config.js";
 import type { PlanningRunDependencies, PlanningRunInput } from "../restate/planning-run-workflow.js";
+import { makeMapping } from "./helpers/builders.js";
+import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 
 const captured = vi.hoisted(() => ({ deps: undefined as unknown }));
 vi.mock("../restate/planning-run-workflow.js", async (importOriginal) => ({
@@ -47,7 +48,7 @@ import {
   type PlanningRunProductionInput,
 } from "../restate/planning-run-production.js";
 
-const MAPPING = { owner: "Org", repo: "repo", defaultBranch: "main", planningWorkflowFile: "claude-plan.yml" } as RepoMapping;
+const MAPPING = makeMapping({ owner: "Org", repo: "repo" });
 const INPUT: PlanningRunInput = {
   dispatchId: "d-1", teamKey: "ENG", issueId: "i-1", issueIdentifier: "ENG-1", planningContext: {}, backend: "github-actions",
 };
@@ -55,13 +56,14 @@ const DISPATCHED_AT = Date.parse("2026-10-03T12:00:10Z");
 const getMapping = (team: string) => (team === "ENG" ? MAPPING : undefined);
 const title = (id: string) => `${PLANNING_RUN_TITLE_PREFIX}${id}`;
 
-function stubRuns(runs: Array<Record<string, unknown>>, ok = true) {
-  const fetchMock = vi.fn().mockResolvedValue({ ok, status: ok ? 200 : 502, json: async () => ({ workflow_runs: runs }) });
-  vi.stubGlobal("fetch", fetchMock);
-  return fetchMock;
+// GitHub's run list for the mapping's planning workflow, answering one read.
+function githubRuns(runs: Array<Record<string, unknown>>, status = 200): FakeFetch {
+  const fake = fakeFetch({
+    "GET /repos/Org/repo/actions/workflows/claude-plan.yml/runs": [{ status, json: { workflow_runs: runs } }],
+  });
+  fake.install();
+  return fake;
 }
-
-afterEach(() => vi.unstubAllGlobals());
 
 describe("title prefix", () => {
   it("is contained in the run-name of workflows/claude-plan.yml", () => {
@@ -75,28 +77,28 @@ describe("findExistingRun", () => {
   const find = createPlanningFindExistingRun({ getMapping, getToken: async () => "tok", flySessionsToken: "fly-token", flySessionsApp: "fly-app" });
 
   it("returns the run titled for this issue created at or after the dispatch time", async () => {
-    const fetchMock = stubRuns([{ id: 5, display_title: title("ENG-1"), created_at: "2026-10-03T12:00:12Z" }]);
+    const github = githubRuns([{ id: 5, display_title: title("ENG-1"), created_at: "2026-10-03T12:00:12Z" }]);
     expect(await find(INPUT, DISPATCHED_AT)).toBe("5");
-    expect(String(fetchMock.mock.calls[0][0])).toContain("/repos/Org/repo/actions/workflows/claude-plan.yml/runs?event=workflow_dispatch");
+    expect(github.calls[0].url.href).toContain("/repos/Org/repo/actions/workflows/claude-plan.yml/runs?event=workflow_dispatch");
   });
 
   it("accepts a run stamped in the same second as the dispatch (GitHub truncates to seconds)", async () => {
-    stubRuns([{ id: 6, display_title: title("ENG-1"), created_at: "2026-10-03T12:00:10Z" }]);
+    githubRuns([{ id: 6, display_title: title("ENG-1"), created_at: "2026-10-03T12:00:10Z" }]);
     expect(await find(INPUT, DISPATCHED_AT + 400)).toBe("6");
   });
 
   it("returns null for a run titled for another issue", async () => {
-    stubRuns([{ id: 1, display_title: title("ENG-2"), created_at: "2026-10-03T12:01:00Z" }]);
+    githubRuns([{ id: 1, display_title: title("ENG-2"), created_at: "2026-10-03T12:01:00Z" }]);
     expect(await find(INPUT, DISPATCHED_AT)).toBeNull();
   });
 
   it("returns null for the same title created before the dispatch time", async () => {
-    stubRuns([{ id: 2, display_title: title("ENG-1"), created_at: "2026-10-03T12:00:05Z" }]);
+    githubRuns([{ id: 2, display_title: title("ENG-1"), created_at: "2026-10-03T12:00:05Z" }]);
     expect(await find(INPUT, DISPATCHED_AT)).toBeNull();
   });
 
   it("returns null for an untitled run and for the identifier-less fallback title", async () => {
-    stubRuns([
+    githubRuns([
       { id: 3, created_at: "2026-10-03T12:01:00Z" },
       { id: 4, display_title: "Claude AI Planning", created_at: "2026-10-03T12:01:00Z" },
       { id: 8, display_title: `${title("ENG-1")}0`, created_at: "2026-10-03T12:01:00Z" },
@@ -105,7 +107,7 @@ describe("findExistingRun", () => {
   });
 
   it("throws on an HTTP error rather than answering null", async () => {
-    stubRuns([], false);
+    githubRuns([], 502);
     await expect(find(INPUT, DISPATCHED_AT)).rejects.toThrow(/HTTP 502/);
   });
 
@@ -207,11 +209,11 @@ describe("production deps", () => {
 
     it("calls acquireDispatch with the dispatch id and the Restate owner", async () => {
       vi.mocked(acquireDispatch).mockReturnValue(grant as never);
-      const { d } = compose({ getMapping: (team) => (team === "ENG" ? ({ ...MAPPING, maxInProgressAiIssues: 3 } as RepoMapping) : undefined) });
+      const { d } = compose({ getMapping: (team) => (team === "ENG" ? { ...MAPPING, maxInProgressAiIssues: 5 } : undefined) });
       expect(await d.reserve({ ...INPUT, backend: "fly-machines" })).toBe(true);
       expect(acquireDispatch).toHaveBeenCalledWith({
         dispatchId: "d-1", issueId: "i-1", issueIdentifier: "ENG-1", kind: "planning", teamKey: "ENG",
-        maxInProgressAiIssues: 3, backend: "fly-machines", lifecycleOwner: { kind: "restate", attemptId: "d-1" },
+        maxInProgressAiIssues: 5, backend: "fly-machines", lifecycleOwner: { kind: "restate", attemptId: "d-1" },
       });
     });
 
