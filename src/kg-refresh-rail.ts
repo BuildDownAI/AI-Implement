@@ -13,7 +13,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { getScopedInstallationToken } from "./github-app-auth.js";
 import {
-  fetchRepoTarball, mergePullRequest, closePullRequest, postPrComment, deleteBranch,
+  fetchRepoTarball, mergePullRequest, closePullRequest, getPullRequestState, postPrComment, deleteBranch,
   postOrUpdateStickyComment, setCommitStatus,
 } from "./github.js";
 import { extractSource, parseKgSourceRepo } from "./deploy.js";
@@ -61,6 +61,7 @@ export interface KgRailDeps {
   loadSnapshotSha: () => string | null;
   mergePullRequestFn: typeof mergePullRequest;
   closePullRequestFn: typeof closePullRequest;
+  getPullRequestStateFn: typeof getPullRequestState;
   deleteBranchFn: typeof deleteBranch;
   postPrCommentFn: typeof postPrComment;
   postOrUpdateStickyCommentFn: typeof postOrUpdateStickyComment;
@@ -420,12 +421,25 @@ export async function closeSnapshotPr(
     permissions: { contents: "write", pull_requests: "write" },
     repositories: [repoName],
   });
-  await deps.postPrCommentFn(
-    token, owner, repoName, prNumber,
-    `AI-Implement: closing this refresh PR — the run failed (\`${gate}\`). The default branch was left untouched.`,
-  );
-  await deps.closePullRequestFn(token, owner, repoName, prNumber);
-  console.log(`[kg-refresh] closed snapshot PR #${prNumber} (gate=${gate})`);
+  // Close first: a real failure throws before any comment, so the capped step's retries cannot repost it; the comment below is best effort for the same reason.
+  try {
+    await deps.closePullRequestFn(token, owner, repoName, prNumber);
+    console.log(`[kg-refresh] closed snapshot PR #${prNumber} (gate=${gate})`);
+  } catch (err) {
+    // Only a PR a person already merged or closed is "done"; any other failure must throw so the step retries.
+    const state = await deps.getPullRequestStateFn(token, owner, repoName, prNumber).catch(() => null);
+    if (!state || state.state === "open") throw err;
+    console.warn(`[kg-refresh] snapshot PR #${prNumber} already ${state.merged ? "merged" : "closed"}: ${String(err)}`);
+  }
+  // The PR is closed by now, so a comment failure must not throw: the capped step's retry would repost it.
+  try {
+    await deps.postPrCommentFn(
+      token, owner, repoName, prNumber,
+      `AI-Implement: closing this refresh PR — the run failed (\`${gate}\`). The default branch was left untouched.`,
+    );
+  } catch (err) {
+    console.warn(`[kg-refresh] could not comment on closed snapshot PR #${prNumber}: ${String(err)}`);
+  }
   if (branch) await deleteSnapshotBranch(deps, owner, repoName, branch);
 }
 

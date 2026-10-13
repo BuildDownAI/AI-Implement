@@ -215,6 +215,8 @@ describe("KgRefresh durable workflow", () => {
     return "merged";
   });
   const closePullRequestFn = vi.fn(async (): Promise<void> => {});
+  // What a failed close finds when it re-reads the PR: merged by default, open for the keeps-failing scenarios.
+  let pullRequestState: { merged: boolean; state: string } = { merged: true, state: "closed" };
   const deleteBranchFn = vi.fn(async (): Promise<void> => {});
   const postPrCommentFn = vi.fn(async (): Promise<void> => {});
   const postOrUpdateStickyCommentFn = vi.fn(async (): Promise<void> => {});
@@ -251,6 +253,7 @@ describe("KgRefresh durable workflow", () => {
     loadSnapshotSha: () => loadSnapshotShaImpl(),
     mergePullRequestFn: mergePullRequestFn as unknown as KgRailDeps["mergePullRequestFn"],
     closePullRequestFn: closePullRequestFn as unknown as KgRailDeps["closePullRequestFn"],
+    getPullRequestStateFn: (async () => ({ ...pullRequestState, headRef: null, headSha: null })) as unknown as KgRailDeps["getPullRequestStateFn"],
     deleteBranchFn: deleteBranchFn as unknown as KgRailDeps["deleteBranchFn"],
     postPrCommentFn: postPrCommentFn as unknown as KgRailDeps["postPrCommentFn"],
     postOrUpdateStickyCommentFn: postOrUpdateStickyCommentFn as unknown as KgRailDeps["postOrUpdateStickyCommentFn"],
@@ -297,7 +300,9 @@ describe("KgRefresh durable workflow", () => {
     forcePersistFailure = false;
 
     mergePullRequestFn.mockClear();
-    closePullRequestFn.mockClear();
+    closePullRequestFn.mockReset();
+    closePullRequestFn.mockImplementation(async () => {});
+    pullRequestState = { merged: true, state: "closed" };
     deleteBranchFn.mockClear();
     postPrCommentFn.mockClear();
     postOrUpdateStickyCommentFn.mockClear();
@@ -3509,6 +3514,141 @@ describe("KgRefresh durable workflow", () => {
         expect(comment).toContain("decision_timeout");
         expect(await closeRowFor(triggerId)).toMatchObject({ conclusion: "decision_timeout" });
         expect(outcomesFor(triggerId).map((c) => c.meta.failureCode)).toEqual(["decision_timeout"]);
+      },
+      60_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "AII-1284: a timeout whose close GitHub refuses still ends decision_timeout with one comment (%s)",
+      async (label) => {
+        const env = shortHeldEnvs.get(label)!;
+        const beforeComments = postPrCommentFn.mock.calls.length;
+        closePullRequestFn.mockRejectedValueOnce(new Error("Pull request is already merged"));
+        const triggerId = await holdRun(env, { awaitGate: false });
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn).toHaveBeenCalledTimes(1);
+        expect(postPrCommentFn.mock.calls.length - beforeComments).toBe(1);
+        expect(await closeRowFor(triggerId)).toMatchObject({ conclusion: "decision_timeout" });
+        await eventually(() => countSends(env, "FlyMachineProfile", "kg-refresh", "release"), (n) => n >= 1, { label: "release" });
+      },
+      60_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "AII-1284: a timeout whose close keeps failing on an open PR still ends decision_timeout and releases (%s)",
+      async (label) => {
+        const env = shortHeldEnvs.get(label)!;
+        pullRequestState = { merged: false, state: "open" };
+        closePullRequestFn.mockRejectedValue(new Error("GitHub 502"));
+        const releasesBefore = await countSends(env, "FlyMachineProfile", "kg-refresh", "release");
+        const triggerId = await holdRun(env, { awaitGate: false });
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn.mock.calls.length).toBeGreaterThanOrEqual(1);
+        expect(await closeRowFor(triggerId)).toMatchObject({ conclusion: "decision_timeout" });
+        expect(outcomesFor(triggerId).map((c) => c.meta.failureCode)).toEqual(["decision_timeout"]);
+        // The held report's release plus the finally's release; a failing close adds none.
+        await eventually(() => countSends(env, "FlyMachineProfile", "kg-refresh", "release"), (n) => n >= releasesBefore + 1, { label: "release" });
+      },
+      60_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "AII-1284: a cancel whose close keeps failing on an open PR still ends operator_cancelled and releases (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        pullRequestState = { merged: false, state: "open" };
+        closePullRequestFn.mockRejectedValue(new Error("GitHub 502"));
+        const triggerId = await holdRun(env);
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "stop" });
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn.mock.calls.length).toBeGreaterThanOrEqual(1);
+        expect(await closeRowFor(triggerId)).toMatchObject({ status: "failed", conclusion: "operator_cancelled" });
+        await eventually(() => countSends(env, "FlyMachineProfile", "kg-refresh", "release"), (n) => n >= 1, { label: "release" });
+      },
+      60_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "AII-1284: the gate wait of a held run journals O(1) sleep entries, not one per tick (%s)",
+      async (label) => {
+        const env = shortHeldEnvs.get(label)!;
+        const triggerId = await holdRun(env, { awaitGate: false });
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`);
+        const entries = await journalEntries(env.adminAPIBaseUrl(), rows[0].id as string);
+        const sleeps = entries.filter((e) => /sleep/i.test(String(e.entry_type ?? e.type ?? "")));
+        // The 1.5 s hold at a 100 ms tick would journal ~15 sleeps if it still ticked; the fixed ones (bootstrap, lease) stay under 6.
+        expect(sleeps.length).toBeLessThanOrEqual(6);
+      },
+      60_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "AII-1284: a decide after the deadline fires answers 409 no-decision-open (%s)",
+      async (label) => {
+        const env = shortHeldEnvs.get(label)!;
+        let unblock!: () => void;
+        const blocked = new Promise<void>((resolve) => { unblock = resolve; });
+        closePullRequestFn.mockImplementationOnce(async () => { await blocked; });
+        const triggerId = await holdRun(env, { awaitGate: false });
+        try {
+          await waitForStep(() => readStatus(env.baseUrl(), triggerId), "closing");
+          await expect(
+            callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ada@example.com" }),
+          ).rejects.toThrow(/409.*no-decision-open/);
+        } finally {
+          unblock();
+        }
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        expect(outcome.ok).toBe(false);
+        expect(await closeRowFor(triggerId)).toMatchObject({ conclusion: "decision_timeout" });
+      },
+      60_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "AII-1284: an accept whose note fails three times still merges the PR (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        for (let i = 0; i < 3; i++) postPrCommentFn.mockRejectedValueOnce(new Error("comment API down"));
+        const triggerId = await holdRun(env);
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ada@example.com" });
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+
+        expect(outcome.ok).toBe(true);
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(0);
+        await closeRowFor(triggerId);
+        await eventually(() => countSends(env, "FlyMachineProfile", "kg-refresh", "release"), (n) => n >= 1, { label: "release" });
+      },
+      90_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "AII-1284: a held report with no snapshotPr deletes the pushed branch (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeDelete = deleteBranchFn.mock.calls.length;
+        const triggered = await triggerViaKgRepo(env.baseUrl());
+        const triggerId = (triggered as { triggerId: string }).triggerId;
+        makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+        await workflowDispatched(triggerId);
+        const { snapshotPr: _pr, ...noPr } = HELD_REPORT;
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", noPr);
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+
+        expect(outcome.ok).toBe(false);
+        expect(deleteBranchFn.mock.calls.length - beforeDelete).toBe(1);
+        expect(deleteBranchFn.mock.calls.at(-1)).toContain("kg-refresh/snapshot-77");
+        await closeRowFor(triggerId);
       },
       60_000,
     );

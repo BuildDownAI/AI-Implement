@@ -5119,6 +5119,7 @@ async function main(): Promise<void> {
       setCommitStatusFn: setCommitStatus,
       mergePullRequestFn: mergePullRequest,
       closePullRequestFn: closePullRequest,
+      getPullRequestStateFn: getPullRequestState,
       deleteBranchFn: deleteBranch,
       getInstallationToken,
       resolveRunnerImage: resolveRunnerImageForDispatch,

@@ -107,6 +107,7 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
     setCommitStatusFn: noop as never,
     mergePullRequestFn: noop as never,
     closePullRequestFn: noop as never,
+    getPullRequestStateFn: noop as never,
     deleteBranchFn: noop as never,
     getInstallationToken: vi.fn(async () => "gh-token"),
     resolveRunnerImage: vi.fn(async () => "runner:test"),
