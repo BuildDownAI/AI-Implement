@@ -760,7 +760,7 @@ describe("migrated read handlers (AII-711)", () => {
       last?: RefreshOutcome | null; inFlight?: { triggerId: string; startedAt: number } | null; step?: string | null; statusThrows?: boolean;
       runnerStep?: { id: string; status: string } | null;
       decisions?: string[]; held?: unknown; calls?: string[];
-      dryRun?: RefreshOutcome | null; readServedStamp?: () => Promise<string | null>;
+      readServedStamp?: () => Promise<string | null>;
     }) {
       setKgRefreshToolDeps(kgToolDeps({
         readStatusRecord: () => opts.last ?? null,
@@ -770,7 +770,6 @@ describe("migrated read handlers (AII-711)", () => {
         ...fakeContext("get_kg_status"),
         objectClient: () => ({
           status: async () => { opts.calls?.push("KgRepo.status"); return opts.inFlight ?? null; },
-          lastAdminDryRun: async () => opts.dryRun ?? null,
           get: async () => ({ config: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 1 }, source: "default" }),
         }),
         workflowClient: () => ({
@@ -908,11 +907,8 @@ describe("migrated read handlers (AII-711)", () => {
       warn.mockRestore();
     });
 
-    it("returns the last admin dry-run as lastDryRun, null when none", async () => {
-      expect((await stageFor({})).lastDryRun).toBeNull();
-      const partTable = [{ part: "a", prev: "10", new: "9" }];
-      const dry = { ok: false, at: 5, detail: "guard refused", stampBefore: null, stampAfter: null, dryRun: true, partTable } as RefreshOutcome;
-      expect((await stageFor({ dryRun: dry })).lastDryRun).toEqual({ ok: false, at: 5, detail: "guard refused", partTable });
+    it("has no dry-run key", async () => {
+      expect(Object.keys(await stageFor({}))).not.toContain("last" + "DryRun");
     });
 
     it("servedStamp falls back to readServedStamp when the record has no stamp", async () => {
@@ -954,7 +950,7 @@ describe("migrated read handlers (AII-711)", () => {
     it("keeps the KgRefreshStatus shape", async () => {
       const status = await stageFor({ last: ok });
       expect(Object.keys(status).sort()).toEqual(
-        ["currentRun", "deployHeld", "executionMode", "flyMachine", "kgDegraded", "kgUnavailable", "lastDryRun", "lastRefresh", "materialize", "restate", "runProfile", "running", "servedStamp", "sidecar", "stage"].sort(),
+        ["currentRun", "deployHeld", "executionMode", "flyMachine", "kgDegraded", "kgUnavailable", "lastRefresh", "materialize", "restate", "runProfile", "running", "servedStamp", "sidecar", "stage"].sort(),
       );
     });
   });
@@ -1271,13 +1267,13 @@ describe("migrated write handlers (AII-713)", () => {
       expect(trigger).not.toHaveBeenCalled();
     });
 
-    it("answers 202 { refreshing, triggerId } and forwards every option to KgRepo.trigger", async () => {
+    it("answers 202 { refreshing, triggerId } and forwards ref and the actor to KgRepo.trigger", async () => {
       const res = answer(await call(
-        { dryRun: true, acceptNewBaseline: true, ref: "feature/x" },
+        { ref: "feature/x" },
         { kind: "human", email: "user@example.com", role: "admin" },
       ));
       expect(res).toEqual({ status: 202, body: { refreshing: true, triggerId: "trig-1" } });
-      expect(trigger).toHaveBeenCalledWith({ dryRun: true, acceptNewBaseline: true, kgSourceRef: "feature/x", actorEmail: "user@example.com" });
+      expect(trigger).toHaveBeenCalledWith({ kgSourceRef: "feature/x", actorEmail: "user@example.com" });
     });
 
     it("passes ref through as kgSourceRef to KgRepo.trigger", async () => {
@@ -1285,9 +1281,24 @@ describe("migrated write handlers (AII-713)", () => {
       expect(trigger).toHaveBeenCalledWith(expect.objectContaining({ kgSourceRef: "release/1.2" }));
     });
 
-    it("defaults dryRun and acceptNewBaseline to false, omits ref, and leaves actorEmail undefined for a null-email caller", async () => {
+    it("omits ref and leaves actorEmail undefined for a null-email caller", async () => {
       await call();
-      expect(trigger).toHaveBeenCalledWith({ dryRun: false, acceptNewBaseline: false, actorEmail: undefined });
+      expect(trigger).toHaveBeenCalledWith({ actorEmail: undefined });
+    });
+
+    it.each(["dryRun", "acceptNewBaseline"])("refuses %s:true with option-removed before any other gate, with no side effect", async (option) => {
+      const runPreflight = vi.fn(async () => PREFLIGHT_OK);
+      setKgRefreshToolDeps(kgToolDeps({ isDeployHeld: () => true, runPreflight }));
+      const runCalls: RunCall[] = [];
+      expect(answer(await call({ [option]: true }, admin, runCalls))).toEqual({ status: 400, body: { error: "option-removed", option } });
+      expect(runCalls).toEqual([]);
+      expect(runPreflight).not.toHaveBeenCalled();
+      expect(trigger).not.toHaveBeenCalled();
+    });
+
+    it("runs a real refresh for dryRun:false and acceptNewBaseline:false", async () => {
+      expect(answer(await call({ dryRun: false, acceptNewBaseline: false })).status).toBe(202);
+      expect(trigger).toHaveBeenCalledWith({ actorEmail: undefined });
     });
 
     it("answers 409 refresh-in-progress when KgRepo reports a live refresh", async () => {
@@ -1817,7 +1828,7 @@ describe("set_fly_machine_profile / get_kg_status flyMachine (AII-1130)", () => 
     const ctx = {
       ...fakeContext("get_kg_status"),
       objectClient: (def: { name: string }, key: string) =>
-        def.name === "FlyMachineProfile" ? profileClient(key) : { status: async () => null, lastAdminDryRun: async () => null, get: async () => ({ config: { jobTimeoutMinutes: 240 }, source: "default" }) },
+        def.name === "FlyMachineProfile" ? profileClient(key) : { status: async () => null, get: async () => ({ config: { jobTimeoutMinutes: 240 }, source: "default" }) },
     } as unknown as restate.Context;
     const status = JSON.parse((await getKgStatusTool(ctx, { caller: SYSTEM_ADMIN, args: {} })).content[0].text);
     expect(status.flyMachine).toEqual({
@@ -1829,7 +1840,7 @@ describe("set_fly_machine_profile / get_kg_status flyMachine (AII-1130)", () => 
     const ctx = {
       ...fakeContext("get_kg_status"),
       objectClient: (def: { name: string }, key: string) =>
-        def.name === "FlyMachineProfile" ? profileClient(key) : { status: async () => null, lastAdminDryRun: async () => null, get: async () => ({ config: { jobTimeoutMinutes: 240 }, source: "default" }) },
+        def.name === "FlyMachineProfile" ? profileClient(key) : { status: async () => null, get: async () => ({ config: { jobTimeoutMinutes: 240 }, source: "default" }) },
     } as unknown as restate.Context;
     const status = JSON.parse((await getKgStatusTool(ctx, { caller: SYSTEM_ADMIN, args: {} })).content[0].text);
     expect(status.executionMode).toMatchObject({ effective: expect.any(String), source: expect.any(String), setting: expect.any(String) });

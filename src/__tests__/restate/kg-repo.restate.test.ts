@@ -458,17 +458,13 @@ describe("KgRepo durable single-flight lock", () => {
     callObject<{ sha: string; outcome: unknown } | null>(baseUrl, "KgRepo", slug, "dryRunOutcome", { repo: "org/kg-source", prNumber });
 
   it.each(VARIANTS.map(([label]) => label))(
-    "O0: recordAdminDryRun then lastAdminDryRun returns the outcome, last write wins, null when none; the per-PR key is untouched (%s)",
+    "O0: recordAdminDryRun accepts an in-flight workflow's old-shape send and stores nothing (%s)",
     async (label) => {
       const env = envFor(label);
       const slug = newKey();
-      const read = () => callObject<unknown>(env.baseUrl(), "KgRepo", slug, "lastAdminDryRun", undefined);
-      expect(await read()).toBeNull();
       await callPrivate(env.baseUrl(), slug, "recordAdminDryRun", { outcome: outcomeFor(1) });
-      expect(await read()).toEqual(outcomeFor(1));
-      await callPrivate(env.baseUrl(), slug, "recordAdminDryRun", { outcome: outcomeFor(2) });
-      expect(await read()).toEqual(outcomeFor(2));
       expect(await readOutcome(env.baseUrl(), slug, 1)).toBeNull();
+      expect(await repoStatus(env.baseUrl(), slug)).toBeNull();
     },
   );
 

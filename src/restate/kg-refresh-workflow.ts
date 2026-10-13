@@ -387,8 +387,6 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           const dryOutcome: RefreshOutcome = { ...outcome, dryRun: true };
           ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).recordDryRunOutcome({ report: input.report, outcome: dryOutcome });
           await ctx.run("dry-run-report", () => postDryRunReport(deps.rail, input.report!, dryOutcome));
-        } else {
-          ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).recordAdminDryRun({ outcome: { ...outcome, dryRun: true } });
         }
       } else if (!opts.skipOutcome) {
         await notifyOutcome("failure", outcome, { failureCode: conclusion, ...(opts.timedOut ? { timedOut: true } : {}) });
@@ -862,9 +860,6 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           // Stored on `KgRepo` so the accept-baseline label can re-report it; journaled, so a replay sends once.
           ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).recordDryRunOutcome({ report: input.report, outcome });
           await ctx.run("dry-run-report", () => postDryRunReport(deps.rail, input.report!, outcome));
-        } else {
-          // No report target (admin page or tool): the verdict is readable through get_kg_status, never the last-refresh record.
-          ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).recordAdminDryRun({ outcome });
         }
         ctx.set("step", "closed");
         await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));

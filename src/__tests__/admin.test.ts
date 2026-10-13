@@ -2327,9 +2327,9 @@ describe("admin kg materialize-mode", () => {
   });
 });
 
-describe("admin kg refresh dry-run (AII-635)", () => {
+describe("admin kg refresh options removed (AII-1263)", () => {
   const kgRefreshDeps = {
-    trigger: vi.fn(async (_opts?: { dryRun?: boolean }) => ({ status: 202, body: { accepted: true } })),
+    trigger: vi.fn(async (_opts?: { ref?: string; actorEmail?: string }) => ({ status: 202, body: { accepted: true } })),
     status: vi.fn(),
     cancel: vi.fn(),
   };
@@ -2338,9 +2338,6 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     kgRefreshDeps.trigger.mockClear();
     kgRefreshDeps.status.mockReset();
   });
-
-  // The listed SSO admin the suite seeds (see adminConfig): an identity-bearing session.
-  const ssoAdmin = { email: "ada@eudoxus.ai", sub: "google|123", provider: "google" };
 
   async function kgRequest(
     url: string,
@@ -2363,13 +2360,12 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     return { statusCode: res.statusCode, body: res.body };
   }
 
-  it("POST /api/kg/refresh with { dryRun: true } reaches the trigger with dryRun and echoes it", async () => {
+  it.each(["dryRun", "acceptNewBaseline"])("POST /api/kg/refresh with { %s: true } answers 400 option-removed and does not trigger", async (option) => {
     const token = await login("secret");
-    const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: true });
-    expect(res.statusCode).toBe(202);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledTimes(1);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith({ dryRun: true });
-    expect(JSON.parse(res.body)).toMatchObject({ accepted: true, dryRun: true });
+    const res = await kgRequest("/api/kg/refresh", "POST", token, { [option]: true });
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body)).toEqual({ error: "option-removed", option });
+    expect(kgRefreshDeps.trigger).not.toHaveBeenCalled();
   });
 
   it("POST /api/kg/refresh with no body reaches the trigger with no option — the unchanged real refresh", async () => {
@@ -2378,7 +2374,7 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     expect(res.statusCode).toBe(202);
     expect(kgRefreshDeps.trigger).toHaveBeenCalledTimes(1);
     expect(kgRefreshDeps.trigger.mock.calls[0]).toHaveLength(0);
-    expect(JSON.parse(res.body)).toMatchObject({ accepted: true, dryRun: false });
+    expect(JSON.parse(res.body)).toMatchObject({ accepted: true });
   });
 
   it("POST /api/kg/refresh with { dryRun: false } is the real refresh", async () => {
@@ -2386,7 +2382,7 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: false });
     expect(res.statusCode).toBe(202);
     expect(kgRefreshDeps.trigger.mock.calls[0]).toHaveLength(0);
-    expect(JSON.parse(res.body).dryRun).toBe(false);
+    expect(JSON.parse(res.body)).toEqual({ accepted: true });
   });
 
   it("POST /api/kg/refresh with an invalid JSON body returns 400 and does not trigger", async () => {
@@ -2395,30 +2391,6 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toBe("Invalid JSON body");
     expect(kgRefreshDeps.trigger).not.toHaveBeenCalled();
-  });
-
-  it("POST /api/kg/refresh with { acceptNewBaseline: true } from an SSO session reaches the trigger with the session's email as actor (AII-628)", async () => {
-    const token = adminSession.createSession(ssoAdmin);
-    const res = await kgRequest("/api/kg/refresh", "POST", token, { acceptNewBaseline: true });
-    expect(res.statusCode).toBe(202);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledTimes(1);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith({ acceptNewBaseline: true, actorEmail: "ada@eudoxus.ai" });
-    expect(JSON.parse(res.body)).toMatchObject({ accepted: true, dryRun: false, acceptNewBaseline: true });
-  });
-
-  it("POST /api/kg/refresh with { acceptNewBaseline: true } from an access-code session names the actor 'access-code session' (AII-628)", async () => {
-    const token = await login("secret");
-    const res = await kgRequest("/api/kg/refresh", "POST", token, { acceptNewBaseline: true });
-    expect(res.statusCode).toBe(202);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith({ acceptNewBaseline: true, actorEmail: "access-code session" });
-  });
-
-  it("POST /api/kg/refresh with { dryRun: true, acceptNewBaseline: true } passes both through (AII-628)", async () => {
-    const token = adminSession.createSession(ssoAdmin);
-    const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: true, acceptNewBaseline: true });
-    expect(res.statusCode).toBe(202);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith({ dryRun: true, acceptNewBaseline: true, actorEmail: "ada@eudoxus.ai" });
-    expect(JSON.parse(res.body)).toMatchObject({ dryRun: true, acceptNewBaseline: true });
   });
 
   it.each([
@@ -2445,7 +2417,7 @@ describe("admin kg refresh dry-run (AII-635)", () => {
   it("POST /api/kg/refresh answers 503 restate-unavailable with the body untouched", async () => {
     kgRefreshDeps.trigger.mockResolvedValueOnce({ status: 503, body: { error: "restate-unavailable" } } as never);
     const token = await login("secret");
-    const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: true });
+    const res = await kgRequest("/api/kg/refresh", "POST", token);
     expect(res.statusCode).toBe(503);
     expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
   });
