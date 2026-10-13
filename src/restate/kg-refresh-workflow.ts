@@ -426,6 +426,23 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     }
 
     /**
+     * The one close of a held snapshot PR, best effort: the step is capped, a failure is logged and
+     * swallowed, and `heldPr` is cleared so no later path closes it again. The closing comment is posted
+     * once inside the step, and a close GitHub refuses (already merged or closed) does not fail it.
+     */
+    async function closeHeldPr(gate: string): Promise<void> {
+      if (!heldPr) return;
+      const { number, branch } = heldPr;
+      heldPr = undefined;
+      try {
+        await ctx.run("close-snapshot-pr", () => closeSnapshotPr(deps.rail, owner, repoName, number, gate, branch), { maxRetryAttempts: 3 });
+      } catch (err) {
+        if (restate.internal.isSuspendedError(err)) throw err;
+        ctx.console.error(`[KgRefresh] closing snapshot PR #${number} failed for ${triggerId}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    /**
      * The one cancel cleanup, shared by the `cancel` signal and a Restate cancel of this invocation:
      * stop the runner, close any held snapshot PR, close the row, finish. Each step is best effort
      * when `bestEffort` is set (a Restate cancel must still reach the release), and a signal cancel
@@ -481,10 +498,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           }
         }
       }
-      if (heldPr) {
-        const { number, branch } = heldPr;
-        await attempt("close-snapshot-pr", () => ctx.run("close-snapshot-pr", () => closeSnapshotPr(deps.rail, owner, repoName, number, "operator_cancelled", branch)));
-      }
+      await closeHeldPr("operator_cancelled");
       ctx.set("step", "failed");
       const at = await ctx.date.now();
       let cancelled = buildFailureOutcome(at, "cancelled by operator");
@@ -904,14 +918,22 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           signals: ["decide", "cancel"],
           resultSignal: "decide",
           totalDeadlineAt: decideBy,
-          tickMs: watchIntervalMs,
+          // One sleep to the deadline: a signal still wins the race at once.
+          tickMs: Math.max(1, decideBy - heldAt),
         });
 
         if (decision.kind === "signal" && decision.name === "decide") {
           const decided = decision.value as KgRefreshDecideInput;
           if (decided.action === "accept") {
             ctx.console.log(`[KgRefresh] decided accept by ${decided.actor}: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
-            await ctx.run("baseline-accept-note", () => postBaselineAcceptNote(deps.rail, owner, repoName, heldPrNumber, decided.actor), { maxRetryAttempts: 3 });
+            // The note is best effort: the merge is what matters.
+            try {
+              await ctx.run("baseline-accept-note", () => postBaselineAcceptNote(deps.rail, owner, repoName, heldPrNumber, decided.actor), { maxRetryAttempts: 3 });
+            } catch (err) {
+              if (restate.internal.isSuspendedError(err)) throw err;
+              if (err instanceof restate.TerminalError && err.code === 409) throw err; // a Restate cancel, not a note failure
+              ctx.console.error(`[KgRefresh] baseline accept note failed for PR #${heldPrNumber}: ${err instanceof Error ? err.message : String(err)}`);
+            }
             return await mergeAndRunGates(report);
           }
           ctx.console.log(`[KgRefresh] decided cancel by ${decided.actor}: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
@@ -923,7 +945,9 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         }
 
         ctx.console.log(`[KgRefresh] decision timeout: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
-        await ctx.run("close-snapshot-pr", () => closeSnapshotPr(deps.rail, owner, repoName, heldPrNumber, "decision_timeout", report.snapshotBranch));
+        // `decide` answers no-decision-open from here on.
+        ctx.set("step", "closing");
+        await closeHeldPr("decision_timeout");
         ctx.set("step", "failed");
         const at = await ctx.date.now();
         const outcome = await failurePath(buildFailureOutcome(at, "no decision within the decision timeout"), "decision_timeout");
@@ -931,6 +955,16 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       }
 
       if (!report.ok || report.snapshotPr === undefined || report.snapshotCommit === undefined) {
+        // A held report with no PR number still pushed its branch; nothing else will delete it.
+        if (report.failureCode === "KG_SNAPSHOT_HELD" && report.snapshotPr === undefined && report.snapshotBranch) {
+          const branch = report.snapshotBranch;
+          try {
+            await ctx.run("delete-held-branch", () => deleteSnapshotBranch(deps.rail, owner, repoName, branch), { maxRetryAttempts: 3 });
+          } catch (err) {
+            if (restate.internal.isSuspendedError(err)) throw err;
+            ctx.console.error(`[KgRefresh] deleting held branch ${branch} failed for ${triggerId}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
         ctx.set("step", "failed");
         const at = await ctx.date.now();
         const outcome = await failurePath(
@@ -951,6 +985,11 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         // A Restate cancel of this invocation: the same cleanup as the `cancel` signal, at whatever step it landed.
         ctx.console.log(`[KgRefresh] cancelled by Restate at step ${(await ctx.get<string>("step")) ?? "unknown"}: dispatch ${dispatchId}`);
         return cleanupCancelled("restate");
+      }
+      // A held PR is closed before the failure path, so the run never ends leaving it open with no owner.
+      if (heldPr) {
+        ctx.set("step", "closing");
+        await closeHeldPr("workflow_error");
       }
       // `release` goes out from `run`'s finally, after failurePath has written `persist` and `close-row`.
       ctx.set("step", "failed");

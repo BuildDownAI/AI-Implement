@@ -424,8 +424,13 @@ export async function closeSnapshotPr(
     token, owner, repoName, prNumber,
     `AI-Implement: closing this refresh PR — the run failed (\`${gate}\`). The default branch was left untouched.`,
   );
-  await deps.closePullRequestFn(token, owner, repoName, prNumber);
-  console.log(`[kg-refresh] closed snapshot PR #${prNumber} (gate=${gate})`);
+  // A PR a person already merged or closed makes GitHub refuse; that is "done", and a throw here would retry the step and repost the comment.
+  try {
+    await deps.closePullRequestFn(token, owner, repoName, prNumber);
+    console.log(`[kg-refresh] closed snapshot PR #${prNumber} (gate=${gate})`);
+  } catch (err) {
+    console.warn(`[kg-refresh] could not close snapshot PR #${prNumber} (already merged or closed?): ${String(err)}`);
+  }
   if (branch) await deleteSnapshotBranch(deps, owner, repoName, branch);
 }
 

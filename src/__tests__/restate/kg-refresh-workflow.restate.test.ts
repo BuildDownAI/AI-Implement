@@ -3514,6 +3514,88 @@ describe("KgRefresh durable workflow", () => {
     );
 
     it.each(VARIANTS.map(([label]) => label))(
+      "AII-1284: a timeout whose close GitHub refuses still ends decision_timeout with one comment (%s)",
+      async (label) => {
+        const env = shortHeldEnvs.get(label)!;
+        const beforeComments = postPrCommentFn.mock.calls.length;
+        closePullRequestFn.mockRejectedValueOnce(new Error("Pull request is already merged"));
+        const triggerId = await holdRun(env, { awaitGate: false });
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn).toHaveBeenCalledTimes(1);
+        expect(postPrCommentFn.mock.calls.length - beforeComments).toBe(1);
+        expect(await closeRowFor(triggerId)).toMatchObject({ conclusion: "decision_timeout" });
+        await eventually(() => countSends(env, "FlyMachineProfile", "kg-refresh", "release"), (n) => n >= 1, { label: "release" });
+      },
+      60_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "AII-1284: a decide after the deadline fires answers 409 no-decision-open (%s)",
+      async (label) => {
+        const env = shortHeldEnvs.get(label)!;
+        let unblock!: () => void;
+        const blocked = new Promise<void>((resolve) => { unblock = resolve; });
+        closePullRequestFn.mockImplementationOnce(async () => { await blocked; });
+        const triggerId = await holdRun(env, { awaitGate: false });
+        try {
+          await waitForStep(() => readStatus(env.baseUrl(), triggerId), "closing");
+          await expect(
+            callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ada@example.com" }),
+          ).rejects.toThrow(/409.*no-decision-open/);
+        } finally {
+          unblock();
+        }
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        expect(outcome.ok).toBe(false);
+        expect(await closeRowFor(triggerId)).toMatchObject({ conclusion: "decision_timeout" });
+      },
+      60_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "AII-1284: an accept whose note fails three times still merges the PR (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        for (let i = 0; i < 3; i++) postPrCommentFn.mockRejectedValueOnce(new Error("comment API down"));
+        const triggerId = await holdRun(env);
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ada@example.com" });
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+
+        expect(outcome.ok).toBe(true);
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(0);
+        await closeRowFor(triggerId);
+        await eventually(() => countSends(env, "FlyMachineProfile", "kg-refresh", "release"), (n) => n >= 1, { label: "release" });
+      },
+      90_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "AII-1284: a held report with no snapshotPr deletes the pushed branch (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeDelete = deleteBranchFn.mock.calls.length;
+        const triggered = await triggerViaKgRepo(env.baseUrl());
+        const triggerId = (triggered as { triggerId: string }).triggerId;
+        makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+        await workflowDispatched(triggerId);
+        const { snapshotPr: _pr, ...noPr } = HELD_REPORT;
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", noPr);
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+
+        expect(outcome.ok).toBe(false);
+        expect(deleteBranchFn.mock.calls.length - beforeDelete).toBe(1);
+        expect(deleteBranchFn.mock.calls.at(-1)).toContain("kg-refresh/snapshot-77");
+        await closeRowFor(triggerId);
+      },
+      60_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
       "decide answers 409 before the gate and 409 once decided (%s)",
       async (label) => {
         const env = heldEnvs.get(label)!;
