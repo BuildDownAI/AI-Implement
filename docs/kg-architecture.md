@@ -279,6 +279,16 @@ The deploy drain counts a suspended invocation, so a held run holds a deploy for
 
 A Stop sent before the gate opens also cancels the held run: the `cancel` promise is durable, so the gate sees it at once.
 
+A Restate cancel of the `run` invocation (from the Restate UI or the admin API) does the full cleanup at every step, through the same function as the `cancel` signal (`cleanupCancelled`): cancel the GitHub run and stop the machine while the runner has not yet reported, close the held snapshot PR (`operator_cancelled`), run the failure path without a notification, and close the row. It logs `[KgRefresh] cancelled by Restate at step <step>`, and each step is best effort. `run` sends the `KgRepo` and `FlyMachineProfile` releases from one `finally` on every exit except a suspension. A cancel at the gate stops no machine (already released) and one during `merge` or the gates adds no revert beyond the rail's own rules.
+
+| Cancelled while | Cleanup |
+| -- | -- |
+| `reserve` / `dispatch` (no run id) | row closed, released; no stop call |
+| `await-progress` (GitHub run known) | run cancelled, row closed, released |
+| `await-progress` (Fly) | machine stopped, row closed, released |
+| `decision` (held PR) | PR closed, row closed, released |
+| `merge` / gates | row closed, released |
+
 
 ### Dry run (AII-632)
 

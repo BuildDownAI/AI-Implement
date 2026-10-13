@@ -314,7 +314,27 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     );
   }
 
+  /**
+   * The one release site: every exit except a suspension frees `KgRepo` and the kept machine, once.
+   * `release` is sent only after the body's `persist` and `close-row` (ADR 032, Consequences), so a
+   * new refresh can never start while this run still has a last-refresh write pending.
+   */
   async function run(ctx: WorkflowContext, input: KgRefreshRunInput): Promise<RefreshOutcome> {
+    let suspended = false;
+    try {
+      return await runBody(ctx, input);
+    } catch (err) {
+      if (restate.internal.isSuspendedError(err)) suspended = true;
+      throw err;
+    } finally {
+      if (!suspended) {
+        ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).release({ triggerId: ctx.key });
+        ctx.objectSendClient(FlyMachineProfile, "kg-refresh").release({ dispatchId: ctx.key });
+      }
+    }
+  }
+
+  async function runBody(ctx: WorkflowContext, input: KgRefreshRunInput): Promise<RefreshOutcome> {
     const triggerId = validKey(ctx.key, input?.triggerId);
     const startedAt = await ctx.date.now();
     ctx.set("triggerId", triggerId);
@@ -328,8 +348,6 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
 
     async function finish(outcome: RefreshOutcome): Promise<RefreshOutcome> {
       ctx.set("completed", true);
-      ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).release({ triggerId });
-      ctx.objectSendClient(FlyMachineProfile, "kg-refresh").release({ dispatchId });
       return outcome;
     }
 
@@ -369,6 +387,106 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         await notifyOutcome("failure", outcome, { failureCode: conclusion, ...(opts.timedOut ? { timedOut: true } : {}) });
       }
       return outcome;
+    }
+
+    // State the cancel cleanup reads; set as the run advances, so a cancel before dispatch makes no stop call.
+    let dispatched: KgDispatchResult | undefined;
+    let runId: number | undefined;
+    let totalDeadlineAt = 0;
+    // The snapshot PR a cancel must close: set at the decision gate, cleared once the merge starts.
+    let heldPr: { number: number; branch: string | undefined } | undefined;
+    // Set when the runner's report arrives: the machine is finished and may already belong to another run.
+    let reported = false;
+    let recordReconcile: (n: number | string, found: { runId: number; logsUrl?: string }) => Promise<void> = async () => {};
+
+    // Stops a Fly machine or local container. The run's result is already decided, so a
+    // failed stop is logged and never changes the outcome.
+    async function stopMachine(reason: string): Promise<void> {
+      if (!dispatched || dispatched.executionMode === GHA_EXECUTION_MODE) return;
+      const { jobId: machineJobId, executionMode, machineId } = dispatched;
+      if (!machineJobId) {
+        ctx.console.warn(`[KgRefresh] no machine id to stop after ${reason} for dispatch ${dispatchId}`);
+        return;
+      }
+      // A kept Fly machine is stopped, not destroyed: the next refresh reuses it.
+      const keep = (machineId ?? null) !== null;
+      try {
+        const stopped = await ctx.run("stop-machine-run", () => deps.stopMachineRun(executionMode, machineJobId, keep), { maxRetryAttempts: 3 });
+        ctx.console.log(`[KgRefresh] stop after ${reason}: dispatch ${dispatchId} backend ${executionMode} stopped=${stopped}`);
+      } catch (err) {
+        if (restate.internal.isSuspendedError(err)) throw err;
+        if (!(err instanceof restate.TerminalError)) throw err;
+        ctx.console.error(`[KgRefresh] stop after ${reason} failed: dispatch ${dispatchId} backend ${executionMode}: ${err.message}`);
+      }
+    }
+
+    /**
+     * The one cancel cleanup, shared by the `cancel` signal and a Restate cancel of this invocation:
+     * stop the runner, close any held snapshot PR, close the row, finish. Each step is best effort
+     * when `bestEffort` is set (a Restate cancel must still reach the release), and a signal cancel
+     * additionally waits for the GitHub run to terminate.
+     */
+    async function cleanupCancelled(mode: "signal" | "restate"): Promise<RefreshOutcome> {
+      const bestEffort = mode === "restate";
+      const attempt = async (name: string, fn: () => Promise<unknown>): Promise<void> => {
+        if (!bestEffort) {
+          await fn();
+          return;
+        }
+        try {
+          await fn();
+        } catch (err) {
+          if (restate.internal.isSuspendedError(err)) throw err;
+          ctx.console.error(`[KgRefresh] cancel cleanup step ${name} failed for ${triggerId}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      };
+      ctx.set("step", "cancelling");
+      // A finished run's machine may already belong to another run; only a run still working is stopped.
+      if (dispatched && !reported) {
+        const isGha = dispatched.executionMode === GHA_EXECUTION_MODE;
+        if (runId !== undefined) {
+          await attempt("cancel-run", () => ctx.run("cancel-run", () => deps.cancelWorkflowRun(runId!)));
+        }
+        await attempt("stop-machine", () => stopMachine("cancel"));
+        if (isGha && !bestEffort) {
+          let watchIndex = 0;
+          let reconcileIndex = 0;
+          const cancelAt = await ctx.date.now();
+          // With no run id the wait is bounded by the bootstrap window rather than the total deadline.
+          const noRunDeadlineAt = Math.min(totalDeadlineAt, cancelAt + bootstrapDeadlineMs);
+          for (;;) {
+            if (runId === undefined) {
+              const n = reconcileIndex++;
+              const found = await readBoundedOwnedRun(ctx, `reconcile-cancel-${n}`, () => deps.findRunByTitle(`KG-REFRESH · ${triggerId}`), null);
+              if (found) {
+                await recordReconcile(`cancel-${n}`, found);
+                runId = found.runId;
+                ctx.set("runId", runId);
+                const foundId = runId;
+                await ctx.run("cancel-run-found", () => deps.cancelWorkflowRun(foundId));
+                continue;
+              }
+            } else {
+              const status = await readBoundedOwnedRun(ctx, `watch-cancel-${watchIndex++}`, () => deps.getWorkflowRunStatus(runId!), NO_EVIDENCE);
+              if (status.status === "completed") break;
+            }
+            const now = await ctx.date.now();
+            if (now >= (runId === undefined ? noRunDeadlineAt : totalDeadlineAt)) break;
+            await ctx.sleep(watchIntervalMs);
+          }
+        }
+      }
+      if (heldPr) {
+        const { number, branch } = heldPr;
+        await attempt("close-snapshot-pr", () => ctx.run("close-snapshot-pr", () => closeSnapshotPr(deps.rail, owner, repoName, number, "operator_cancelled", branch)));
+      }
+      ctx.set("step", "failed");
+      const at = await ctx.date.now();
+      let cancelled = buildFailureOutcome(at, "cancelled by operator");
+      await attempt("failure-path", async () => {
+        cancelled = await failurePath(cancelled, "operator_cancelled", { skipOutcome: true });
+      });
+      return finish(cancelled);
     }
 
     // Every escape from here on — a non-gate error surfacing after a bounded ctx.run
@@ -431,6 +549,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         { maxRetryAttempts: 3, initialRetryInterval: DISPATCH_RETRY_INITIAL_INTERVAL, retryIntervalFactor: 2 },
       );
 
+      dispatched = dispatchResult;
+
       // One-way and idempotent in the object; a replay after a crash here sends it again.
       if (dispatchResult.created && dispatchResult.machineId) {
         ctx.objectSendClient(FlyMachineProfile, "kg-refresh").attach({ dispatchId, machineId: dispatchResult.machineId, attempt,
@@ -444,6 +564,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       }));
 
       if (dispatchResult.runId !== undefined) ctx.set("runId", dispatchResult.runId);
+      runId = dispatchResult.runId;
 
       if (dispatchResult.outcome === "rejected") {
         ctx.set("step", "failed");
@@ -456,39 +577,17 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       // the GHA branch below reconciles the real runId via findRunByTitle, and fly-machines
       // has no such backend to reconcile against, so it simply proceeds without one.
       const isGha = dispatchResult.executionMode === GHA_EXECUTION_MODE;
-      let runId = dispatchResult.runId;
       const dispatchedAt = await ctx.date.now();
       const bootstrapDeadlineAt = dispatchedAt + bootstrapDeadlineMs;
-      const totalDeadlineAt = dispatchedAt + totalDeadlineMs;
-
-      // Stops a Fly machine or local container. The run's result is already decided, so a
-      // failed stop is logged and never changes the outcome.
-      async function stopMachine(reason: string): Promise<void> {
-        if (isGha) return;
-        const machineJobId = dispatchResult.jobId;
-        if (!machineJobId) {
-          ctx.console.warn(`[KgRefresh] no machine id to stop after ${reason} for dispatch ${dispatchId}`);
-          return;
-        }
-        // A kept Fly machine is stopped, not destroyed: the next refresh reuses it.
-        const keep = !isGha && (dispatchResult.machineId ?? null) !== null;
-        try {
-          const stopped = await ctx.run("stop-machine-run", () => deps.stopMachineRun(dispatchResult.executionMode, machineJobId, keep), { maxRetryAttempts: 3 });
-          ctx.console.log(`[KgRefresh] stop after ${reason}: dispatch ${dispatchId} backend ${dispatchResult.executionMode} stopped=${stopped}`);
-        } catch (err) {
-          if (restate.internal.isSuspendedError(err)) throw err;
-          if (!(err instanceof restate.TerminalError)) throw err;
-          ctx.console.error(`[KgRefresh] stop after ${reason} failed: dispatch ${dispatchId} backend ${dispatchResult.executionMode}: ${err.message}`);
-        }
-      }
+      totalDeadlineAt = dispatchedAt + totalDeadlineMs;
 
       /** Projects a run the reconcile found onto the row, in its own step; the read itself writes nothing. */
-      async function recordReconcile(n: number | string, found: { runId: number; logsUrl?: string }): Promise<void> {
+      recordReconcile = async (n, found) => {
         await ctx.run(`record-reconcile-${n}`, () => deps.recordDispatchDetails(dispatchId, {
           workflowRunId: found.runId,
           ...(found.logsUrl ? { logsUrl: found.logsUrl } : {}),
         }));
-      }
+      };
 
       async function waitForOutcome(): Promise<WaitOutcome> {
         let startedSeen = false;
@@ -574,6 +673,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         // retry forever. Neither step has staged or swapped anything yet, so `revertRail` does
         // not apply to either failure.
         ctx.set("step", "merge");
+        heldPr = undefined; // merged (or merging): a cancel past here must not close the PR
         try {
           const mergeResult = await ctx.run(
             "merge",
@@ -718,51 +818,11 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         return finish(outcome);
       }
 
-      if (waitResult.kind === "cancel") {
-        ctx.set("step", "cancelling");
-        if (runId !== undefined) {
-          await ctx.run("cancel-run", () => deps.cancelWorkflowRun(runId!));
-        }
-        await stopMachine("cancel");
-        if (isGha) {
-          let watchIndex = 0;
-          let reconcileIndex = 0;
-          const cancelAt = await ctx.date.now();
-          // With no run id the wait is bounded by the bootstrap window rather than the total deadline.
-          const noRunDeadlineAt = Math.min(totalDeadlineAt, cancelAt + bootstrapDeadlineMs);
-          for (;;) {
-            if (runId === undefined) {
-              const n = reconcileIndex++;
-              const found = await readBoundedOwnedRun(ctx, `reconcile-cancel-${n}`, () => deps.findRunByTitle(issueIdentifier), null);
-              if (found) {
-                await recordReconcile(`cancel-${n}`, found);
-                runId = found.runId;
-                ctx.set("runId", runId);
-                const foundId = runId;
-                await ctx.run("cancel-run-found", () => deps.cancelWorkflowRun(foundId));
-                continue;
-              }
-            } else {
-              const status = await readBoundedOwnedRun(ctx, `watch-cancel-${watchIndex++}`, () => deps.getWorkflowRunStatus(runId!), NO_EVIDENCE);
-              if (status.status === "completed") break;
-            }
-            const now = await ctx.date.now();
-            if (now >= (runId === undefined ? noRunDeadlineAt : totalDeadlineAt)) break;
-            await ctx.sleep(watchIntervalMs);
-          }
-        }
-        ctx.set("step", "failed");
-        const at = await ctx.date.now();
-        const outcome = await failurePath(
-          buildFailureOutcome(at, "cancelled by operator"),
-          "operator_cancelled",
-          { skipOutcome: true },
-        );
-        return finish(outcome);
-      }
+      if (waitResult.kind === "cancel") return cleanupCancelled("signal");
 
       // waitResult.kind === "report"
       const report = waitResult.value;
+      reported = true;
       // Journaled peeks, so a replay rebuilds the same table.
       stepTable = [];
       for (const id of KG_REFRESH_RUNNER_STEPS) {
@@ -806,18 +866,19 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       // A held dry-run never reaches here: the dry-run branch above has already returned.
       if (!report.ok && report.failureCode === "KG_SNAPSHOT_HELD" && report.snapshotPr !== undefined) {
         // Decision gate: the runner opened the snapshot PR and finished. Free the machine, keep the lease, wait for a decision.
-        const heldPr = report.snapshotPr;
+        const heldPrNumber = report.snapshotPr;
+        heldPr = { number: heldPrNumber, branch: report.snapshotBranch };
         ctx.set("step", "decision");
         const heldAt = await ctx.date.now();
         const decideBy = heldAt + decisionTimeoutMs;
         ctx.set("held", {
-          snapshotPr: heldPr,
+          snapshotPr: heldPrNumber,
           snapshotCommit: report.snapshotCommit,
           snapshotBranch: report.snapshotBranch,
           partTable: report.partTable,
           decideBy,
         });
-        ctx.console.log(`[KgRefresh] held: dispatch ${dispatchId} snapshot PR #${heldPr} awaits a decision until ${new Date(decideBy).toISOString()}`);
+        ctx.console.log(`[KgRefresh] held: dispatch ${dispatchId} snapshot PR #${heldPrNumber} awaits a decision until ${new Date(decideBy).toISOString()}`);
         ctx.objectSendClient(FlyMachineProfile, "kg-refresh").release({ dispatchId });
         ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).extend({
           triggerId,
@@ -834,32 +895,24 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         if (decision.kind === "signal" && decision.name === "decide") {
           const decided = decision.value as KgRefreshDecideInput;
           if (decided.action === "accept") {
-            ctx.console.log(`[KgRefresh] decided accept by ${decided.actor}: dispatch ${dispatchId} snapshot PR #${heldPr}`);
-            await ctx.run("baseline-accept-note", () => postBaselineAcceptNote(deps.rail, owner, repoName, heldPr, decided.actor), { maxRetryAttempts: 3 });
+            ctx.console.log(`[KgRefresh] decided accept by ${decided.actor}: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
+            await ctx.run("baseline-accept-note", () => postBaselineAcceptNote(deps.rail, owner, repoName, heldPrNumber, decided.actor), { maxRetryAttempts: 3 });
             return mergeAndRunGates(report);
           }
-          ctx.console.log(`[KgRefresh] decided cancel by ${decided.actor}: dispatch ${dispatchId} snapshot PR #${heldPr}`);
-          return cancelHeld();
+          ctx.console.log(`[KgRefresh] decided cancel by ${decided.actor}: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
+          return cleanupCancelled("signal");
         }
         if (decision.kind === "signal") {
-          ctx.console.log(`[KgRefresh] cancel signal while held: dispatch ${dispatchId} snapshot PR #${heldPr}`);
-          return cancelHeld();
+          ctx.console.log(`[KgRefresh] cancel signal while held: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
+          return cleanupCancelled("signal");
         }
 
-        ctx.console.log(`[KgRefresh] decision timeout: dispatch ${dispatchId} snapshot PR #${heldPr}`);
-        await ctx.run("close-snapshot-pr", () => closeSnapshotPr(deps.rail, owner, repoName, heldPr, "decision_timeout", report.snapshotBranch));
+        ctx.console.log(`[KgRefresh] decision timeout: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
+        await ctx.run("close-snapshot-pr", () => closeSnapshotPr(deps.rail, owner, repoName, heldPrNumber, "decision_timeout", report.snapshotBranch));
         ctx.set("step", "failed");
         const at = await ctx.date.now();
         const outcome = await failurePath(buildFailureOutcome(at, "no decision within the decision timeout"), "decision_timeout");
         return finish(outcome);
-
-        async function cancelHeld(): Promise<RefreshOutcome> {
-          await ctx.run("close-snapshot-pr", () => closeSnapshotPr(deps.rail, owner, repoName, heldPr, "operator_cancelled", report.snapshotBranch));
-          ctx.set("step", "failed");
-          const cancelledAt = await ctx.date.now();
-          const cancelled = await failurePath(buildFailureOutcome(cancelledAt, "cancelled by operator"), "operator_cancelled", { skipOutcome: true });
-          return finish(cancelled);
-        }
       }
 
       if (!report.ok || report.snapshotPr === undefined || report.snapshotCommit === undefined) {
@@ -879,23 +932,17 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       return mergeAndRunGates(report);
     } catch (err) {
       if (restate.internal.isSuspendedError(err)) throw err;
-      if (await ctx.get<boolean>("completed")) throw err;
-      // Release order (ADR 032, Consequences): `release` is sent only after failurePath has
-      // written `persist` and `close-row`, so a new refresh can never start while this failed
-      // run still has a last-refresh write pending — a late `persist` cannot overwrite a newer
-      // run's outcome. The `finally` still releases when failurePath itself throws (an
-      // invocation cancel), so the lock cannot leak. finish()'s own release is a harmless
-      // duplicate no-op.
-      try {
-        ctx.set("step", "failed");
-        const at = await ctx.date.now();
-        const detail = err instanceof Error ? err.message : String(err);
-        const outcome = await failurePath(buildFailureOutcome(at, detail), "workflow_error");
-        return await finish(outcome);
-      } finally {
-        ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).release({ triggerId });
-        ctx.objectSendClient(FlyMachineProfile, "kg-refresh").release({ dispatchId });
+      if (err instanceof restate.TerminalError && err.code === 409) {
+        // A Restate cancel of this invocation: the same cleanup as the `cancel` signal, at whatever step it landed.
+        ctx.console.log(`[KgRefresh] cancelled by Restate at step ${(await ctx.get<string>("step")) ?? "unknown"}: dispatch ${dispatchId}`);
+        return cleanupCancelled("restate");
       }
+      // `release` goes out from `run`'s finally, after failurePath has written `persist` and `close-row`.
+      ctx.set("step", "failed");
+      const at = await ctx.date.now();
+      const detail = err instanceof Error ? err.message : String(err);
+      const outcome = await failurePath(buildFailureOutcome(at, detail), "workflow_error");
+      return finish(outcome);
     }
   }
 
