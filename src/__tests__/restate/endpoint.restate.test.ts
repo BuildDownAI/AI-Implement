@@ -17,14 +17,14 @@ import { randomUUID } from "node:crypto";
 import * as restate from "@restatedev/restate-sdk";
 import { createEndpointHandler } from "@restatedev/restate-sdk/node";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { RESTATE_SERVICES, queryNonCompletedInvocations, register, runIntrospectionQuery, restateBindAddress, startRestateEndpoint } from "../../restate/endpoint.js";
+import { RESTATE_SERVICES, queryNonCompletedInvocations, register, restateBindAddress, startRestateEndpoint } from "../../restate/endpoint.js";
 import { callTool } from "../../restate/tools-client.js";
 import { resetRestateStatus, setRestateStatus } from "../../restate/status.js";
 import { systemCaller } from "../../mcp-identity.js";
 import * as dedup from "../../dedup.js";
 import { initSettingsTable } from "../../runner-mode.js";
 import { startBinaryEnvironment, type BinaryEnvironment } from "./binary-environment.js";
-import { callObject, callService, eventually } from "./harness.js";
+import { callObject, callService, eventually, queryInvocations } from "./harness.js";
 
 function sha256(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex");
@@ -187,12 +187,18 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
       const declined = await register({ adminBaseUrl });
       expect(declined.outcome).toBe("declined-conflict");
 
+      // Same scope as queryNonCompletedInvocations (src/restate/endpoint.ts), narrowed to the tool
+      // service: only orchestratorTools invocations on the deployment under test, never the Operator call.
+      const oldDeployments = `(SELECT id FROM sys_deployment WHERE endpoint = '${oldUri}' OR endpoint = '${oldUri}/')`;
       const pinnedToolInvocations = async (): Promise<string[]> =>
         (
-          await runIntrospectionQuery(
-            fetch,
+          await queryInvocations(
             adminBaseUrl,
-            "SELECT id FROM sys_invocation WHERE target_service_name = 'orchestratorTools' AND status != 'completed'",
+            "target_service_name = 'orchestratorTools' AND status != 'completed' AND status != 'scheduled' AND (" +
+              `pinned_deployment_id IN ${oldDeployments} OR ` +
+              `last_attempt_deployment_id IN ${oldDeployments} OR ` +
+              "(pinned_deployment_id IS NULL AND last_attempt_deployment_id IS NULL AND " +
+              `target_service_name IN (SELECT name FROM sys_service WHERE deployment_id IN ${oldDeployments})))`,
           )
         ).map((row) => String(row.id));
 
@@ -200,10 +206,9 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
       try {
         // Control: with the admission check bypassed, the call reaches a handler the live
         // endpoint lacks, retries forever on the old deployment, and pins the drain (AII-1281).
-        const before = await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri);
         const pinnedIds: string[] = [];
         try {
-          callTool("get_tenant_health", {}, systemCaller(), {
+          void callTool("get_tenant_health", {}, systemCaller(), {
             ingressBaseUrl,
             permitsExternalCall: () => true,
             restateReady: () => true,
@@ -225,11 +230,9 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
             await fetch(`${adminBaseUrl}/invocations/${id}/kill`, { method: "PATCH" });
           }
         }
-        await eventually(
-          () => queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri),
-          (count) => count !== null && count <= (before ?? 0),
-          { label: "the control invocation to be killed" },
-        );
+        await eventually(pinnedToolInvocations, (found) => found.length === 0, {
+          label: "the killed control invocation to leave the non-completed set",
+        });
 
         // Fixed: the default check refuses admission in the declined window and starts nothing.
         const beforeFixed = await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri);
