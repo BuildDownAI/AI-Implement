@@ -1,9 +1,12 @@
 /**
- * One-time scrub of the raw refresh tokens the pre-AII-1287 `Operator` kept in Restate (family
+ * Scrub of the raw refresh tokens the pre-AII-1287 `Operator` kept in Restate (family
  * state `currentToken`, plus journaled `refresh` inputs/outputs). Runs after the endpoint
  * registers: drop `currentToken` from every family, purge every completed `Operator`
  * invocation, then write the `operator_legacy_scrub_completed_at` settings row. A failure
  * writes no row, so the next boot retries. AII-1299 reads the row to reopen `POST /query`.
+ * AII-1301: the state check runs on every boot, because a rollback to a pre-AII-1287 image
+ * writes raw tokens again. When one is found the row is deleted first (closing `/query`),
+ * and rewritten only after the scrub and purge succeed.
  */
 import { getDb } from "../dedup.js";
 import { purgeInvocation, runIntrospectionQuery } from "./endpoint.js";
@@ -28,7 +31,7 @@ export interface OperatorLegacyScrubDeps {
   ingressBaseUrl?: string;
   now?: () => Date;
   /** Skips the settings row (read and write) — for the Restate test, which has no dedup DB. */
-  rowStore?: { read: () => string | null; write: (iso: string) => void };
+  rowStore?: { read: () => string | null; write: (iso: string) => void; clear: () => void };
 }
 
 export interface OperatorLegacyScrubResult {
@@ -55,10 +58,10 @@ export async function scrubOperatorLegacyTokens(deps: OperatorLegacyScrubDeps = 
     write: (iso: string) => {
       getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(SCRUB_KEY, iso);
     },
+    clear: () => {
+      getDb().prepare("DELETE FROM settings WHERE key = ?").run(SCRUB_KEY);
+    },
   };
-  if (store.read() !== null) {
-    return { ran: false, scrubbed: 0, purged: 0 };
-  }
 
   try {
     // (a) families that still hold a raw token.
@@ -67,9 +70,15 @@ export async function scrubOperatorLegacyTokens(deps: OperatorLegacyScrubDeps = 
       adminBaseUrl,
       "SELECT service_key, value_utf8 FROM state WHERE service_name = 'Operator' AND key = 'family'",
     );
+    const legacyRows = stateRows.filter((row) => hasLegacyToken(row.value_utf8));
+    const rowExisted = store.read() !== null;
+    if (legacyRows.length === 0 && rowExisted) {
+      return { ran: false, scrubbed: 0, purged: 0 };
+    }
+    // Close `POST /query` first: the proxy reads the row on every request.
+    if (rowExisted) store.clear();
     let scrubbed = 0;
-    for (const row of stateRows) {
-      if (!hasLegacyToken(row.value_utf8)) continue;
+    for (const row of legacyRows) {
       const response = await fetchImpl(`${ingressBaseUrl}/Operator/${encodeURIComponent(String(row.service_key))}/dropLegacyToken`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -96,7 +105,7 @@ export async function scrubOperatorLegacyTokens(deps: OperatorLegacyScrubDeps = 
 
     // (c) only now, record completion.
     store.write((deps.now?.() ?? new Date()).toISOString());
-    console.log(`[restate] Operator legacy-token scrub done: ${scrubbed} families scrubbed, ${purged} invocations purged`);
+    console.log(`[restate] Operator legacy-token scrub done (${rowExisted ? "row cleared: legacy tokens found" : "first run"}): ${scrubbed} families scrubbed, ${purged} invocations purged`);
     return { ran: true, scrubbed, purged };
   } catch (err) {
     console.error(`[restate] Operator legacy-token scrub failed (will retry next boot): ${err instanceof Error ? err.message : String(err)}`);
