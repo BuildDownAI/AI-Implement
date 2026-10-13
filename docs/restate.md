@@ -155,7 +155,7 @@ Any other path or method is not handled and the orchestrator's routing continues
 
 ### Journal queries and the Restate UI (AII-1128)
 
-The admin API is loopback. `runIntrospectionQuery` and `sqlQuote` in `endpoint.ts` query `sys_invocation` for the deploy drain (`queryNonCompletedInvocations`). `/query` is exposed to the admin role only, through the Restate UI door (§ "Restate UI through the orchestrator", ADR 040). The orchestrator has no journal route: `GET /api/restate/journal` answers 404 (AII-1265), and there is no `journal` page grant (removed from `PAGE_ROUTES`, AII-1262). Admins read journals in the Restate UI (§ "Reading a run's journal").
+The admin API is loopback. `runIntrospectionQuery` and `sqlQuote` in `endpoint.ts` query `sys_invocation` for the deploy drain (`queryNonCompletedInvocations`). The Restate UI door refuses `POST /query` for every role, admin included (§ "Restate UI through the orchestrator", ADR 040, AII-1286), so the proxy cannot be used to read journals until AII-1287 takes the MCP refresh tokens out of Restate. The orchestrator has no journal route: `GET /api/restate/journal` answers 404 (AII-1265), and there is no `journal` page grant (removed from `PAGE_ROUTES`, AII-1262). Journal viewing is unavailable meanwhile (§ "Reading a run's journal").
 
 ### Sidecar environment is an explicit allowlist, never `...process.env` (AII-728)
 
@@ -472,7 +472,7 @@ The failure branch of the planning callback also calls the termination hook, so 
 
 ## Reading a run's journal
 
-Admins read a run's journal in the Restate UI, served at `/ui/` and admin only (§ "Restate UI through the orchestrator"). The orchestrator has no journal route of its own (AII-1265 removed `GET /api/restate/journal` and `src/restate/journal-query.ts`; the route now answers 404). The admin UI shows an "Open in Restate UI" link to `/ui/workflows/<service>/<key>`:
+Reading a run's journal in the Restate UI is unavailable until AII-1287: the UI is served at `/ui/` (admin only, § "Restate UI through the orchestrator"), but its journal and invocation views load data through `POST /query`, which the proxy refuses with 403 (AII-1286). The orchestrator has no journal route of its own (AII-1265 removed `GET /api/restate/journal` and `src/restate/journal-query.ts`; the route now answers 404). The admin UI shows an "Open in Restate UI" link to `/ui/workflows/<service>/<key>`:
 
 - **Job drawer** — the key is the job's dispatch id. The service follows the job's phase (`journalServiceForJob`): `kg-refresh` → `KgRefresh`, `planning` → `PlanningRun`, `implementation` or no dispatch id → no link, any other phase → `ReviewFixAttempt`, linked only when the drawer's attempt read (`/api/review-fix/attempts/<dispatch id>`) just succeeded, so a legacy review-fix job gets none.
 - **KG pipelines current-run card** — the link for `currentRun.triggerId`, service `KgRefresh`. An idle page has none.
