@@ -213,7 +213,7 @@ function fakeObjectContext(
       store.clear();
     },
     date: { now: async (): Promise<number> => now },
-    } as unknown as ObjectContext;
+  } as unknown as ObjectContext;
   return { ctx, clearAllCalls: () => clearAllCalls, store };
 }
 
@@ -385,6 +385,28 @@ describe("RestateRefreshAuthority — invoke() bounded at 10s (AII-728)", () => 
 });
 
 describe("RestateRefreshAuthority — outcome mapping", () => {
+  it("answers unavailable (cause restate) without calling refresh when no secret is available", async () => {
+    const saved = process.env.GITHUB_APP_PRIVATE_KEY;
+    delete process.env.GITHUB_APP_PRIVATE_KEY;
+    try {
+      const fetchImpl = vi.fn(async (url: string) => {
+        if (isIdentityUrl(url)) return identityOkResponse();
+        return new Response("{}", { status: 200 });
+      });
+      const authority = new RestateRefreshAuthority({
+        ingressBaseUrl: UNROUTABLE_INGRESS,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      });
+      await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({
+        status: "unavailable",
+        cause: "restate",
+      });
+      expect(fetchImpl.mock.calls.some(([url]) => String(url).endsWith("/refresh"))).toBe(false);
+    } finally {
+      if (saved !== undefined) process.env.GITHUB_APP_PRIVATE_KEY = saved;
+    }
+  });
+
   it("maps a 5xx ingress response on the identity read to unavailable (cause restate), never reaching refresh", async () => {
     const fetchImpl = vi.fn(async () => new Response("", { status: 503 }));
     const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
