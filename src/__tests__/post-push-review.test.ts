@@ -3676,7 +3676,53 @@ describe("postPushReviewStep", () => {
     expect(fixComment).toContain("Notes:\nNo behavior changes.");
   });
 
-  it("withholds approval and initiates a fix pass when the review contract has only minor findings", async () => {
+  it("approves without a fix pass when an approve verdict carries only a minor contract finding", async () => {
+    const reviewerOutput = { approved: true, blocking_issues: [], feedback: "lgtm", score: 9, progress_delta: 0 };
+    const ghComments: string[] = [];
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+        return {
+          stdout: JSON.stringify([{
+            user: { login: "github-actions[bot]", type: "Bot" },
+            body: [
+              "```json review-findings",
+              JSON.stringify({
+                schema: "review-findings/v1",
+                verdict: "approve",
+                findings: [{ severity: "minor", body: "Consider extracting this to a helper function" }],
+              }),
+              "```",
+            ].join("\n"),
+            html_url: "https://example.com/verdict",
+          }]),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(ghComments.some((c) => c.includes("Reached review cap"))).toBe(false);
+    const approvedComment = ghComments.find((c) => c.includes("Advisory external review findings (do not block merge):"));
+    expect(approvedComment).toContain("Consider extracting this to a helper function");
+    expect(approvedComment).not.toContain("Unresolved external review findings");
+  });
+
+  it("withholds approval and initiates a fix pass when the review contract has only minor findings under changes_requested", async () => {
     const reviewerOutput = { approved: true, blocking_issues: [], feedback: "lgtm", score: 9, progress_delta: 0 };
     const ghComments: string[] = [];
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));

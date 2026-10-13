@@ -105,11 +105,11 @@ The internal automatic producers (`guardOpenPrBeforeImplementationDispatch` for 
 
 Severity is `blocking`, `medium`, or `minor`, and the rule for deciding it is the subtlest part of the rail.
 
-Merge gating is source-based, not severity-based:
+Merge gating is source-based, except that `review-contract` also reads severity and the contract verdict:
 
 | Source | Gates a merge? |
 |---|---|
-| `review-contract` | Yes |
+| `review-contract` | When `blocking`, or when the contract verdict is not `approve` (`reviewContractFindingGates`) |
 | `github-review` | Yes |
 | `github-review-thread` | Yes, when collected from a reviewer whose latest formal verdict is `CHANGES_REQUESTED` |
 | `ai-implement-internal` | Yes |
@@ -117,7 +117,7 @@ Merge gating is source-based, not severity-based:
 
 **Summary headings.** A heading that starts with 🔴 is a `blocking` finding and one that starts with 🟡 is `minor`, in both summary parsers (the trusted `claude[bot]` heading scan and the `github-actions[bot]` "Claude finished" shape). The marker mapping is `classifyClaudeInlineMarker` (`src/review-process.ts`), checked before the word rules; 🟣 and untagged headings fall through to those rules. Under the `claude-code-review` and `claude-code-review-repository-fix` processes (the definition's `summaryBlockingGates`) a `blocking` `claude-review-summary` finding gates the in-run approval even without a reviewer selection (`isReviewLedgerFindingGating`'s `summaryBlockingGates`), so a green review check with no inline comments cannot approve past a 🔴 section; `minor` and `medium` summary findings stay advisory. The gate goes through the external-findings path, not `claudeCodeReviewVerdict`. The ledger and the late-review workflow see the same finding.
 
-A `minor` `review-contract` finding gates because it came from the structured contract. A `blocking` `claude-review-summary` finding is advisory by default because it came from scraped prose. PR comments split those lists: gating findings stay under "Unresolved external review findings", while prose-only findings are shown under an advisory heading that says they do not block the merge.
+A `review-contract` finding gates when it is `blocking`, or when the verdict is not `approve`; a `minor` finding under an `approve` verdict is advisory, so the run approves. Under `changes_requested` or `incomplete` a `minor` finding keeps its fix pass, so the run never ends `invalid_review` with an empty gating set (`reviewContractFindingGates`, `src/pipeline/review-ledger.ts`). A `blocking` `claude-review-summary` finding is advisory by default because it came from scraped prose. PR comments split those lists: gating findings stay under "Unresolved external review findings", while prose-only findings are shown under an advisory heading that says they do not block the merge.
 
 **A reviewer's latest formal verdict is authoritative.** Only reviewers whose most recent actionable review is `CHANGES_REQUESTED` contribute blocking findings. Unresolved inline threads authored by someone who has since approved are recorded as `medium` advisory context unless their reviewer still has a changes-requested verdict. Without that rule, a stale nit thread from an approving reviewer would keep the PR blocked forever.
 
@@ -180,7 +180,7 @@ The trust boundary is unchanged: only a comment from an already-trusted Claude a
 
 The last step of the pipeline. It runs only when the feedback loop approved, something was actually pushed, and a PR number exists.
 
-**It is skipped on gap-fill runs.** The step's `skip` predicate returns early when `ctx.data.prNumber` is already set (`src/pipeline/pipeline-loader.ts:294-296`) — a gap-fill run updates an existing PR and keeps that PR's already-established review flow rather than starting a second post-push review cycle. This is also why a bot review of a review-fix run's own push is never evaluated by this step (see "The bot-review rule" above and ADR 027).
+**It is skipped on gap-fill runs.** The step's `skip` predicate returns early when `ctx.data.prNumber` is already set (`src/pipeline/pipeline-loader.ts:118-121` (`shouldSkipPostPushReview`) — a gap-fill run updates an existing PR and keeps that PR's already-established review flow rather than starting a second post-push review cycle. This is also why a bot review of a review-fix run's own push is never evaluated by this step (see "The bot-review rule" above and ADR 027).
 
 Built-in reviewers return a short `summary` and a `checks` list alongside their
 verdict and findings, including when they approve. Each check names what was
