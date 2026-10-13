@@ -421,7 +421,7 @@ export async function closeSnapshotPr(
     permissions: { contents: "write", pull_requests: "write" },
     repositories: [repoName],
   });
-  // Close first: a real failure throws before any comment, so the capped step's retries cannot repost it.
+  // Close first: a real failure throws before any comment, so the capped step's retries cannot repost it; the comment below is best effort for the same reason.
   try {
     await deps.closePullRequestFn(token, owner, repoName, prNumber);
     console.log(`[kg-refresh] closed snapshot PR #${prNumber} (gate=${gate})`);
@@ -431,10 +431,15 @@ export async function closeSnapshotPr(
     if (!state || state.state === "open") throw err;
     console.warn(`[kg-refresh] snapshot PR #${prNumber} already ${state.merged ? "merged" : "closed"}: ${String(err)}`);
   }
-  await deps.postPrCommentFn(
-    token, owner, repoName, prNumber,
-    `AI-Implement: closing this refresh PR — the run failed (\`${gate}\`). The default branch was left untouched.`,
-  );
+  // The PR is closed by now, so a comment failure must not throw: the capped step's retry would repost it.
+  try {
+    await deps.postPrCommentFn(
+      token, owner, repoName, prNumber,
+      `AI-Implement: closing this refresh PR — the run failed (\`${gate}\`). The default branch was left untouched.`,
+    );
+  } catch (err) {
+    console.warn(`[kg-refresh] could not comment on closed snapshot PR #${prNumber}: ${String(err)}`);
+  }
   if (branch) await deleteSnapshotBranch(deps, owner, repoName, branch);
 }
 

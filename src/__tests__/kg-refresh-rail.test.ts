@@ -476,6 +476,16 @@ describe("kg-refresh-rail", () => {
       expect(postPrCommentFn).not.toHaveBeenCalled();
     });
 
+    it("closeSnapshotPr does not throw when the closing comment fails, so a step retry cannot repost it", async () => {
+      const postPrCommentFn = vi.fn(async () => { throw new Error("comment API down"); });
+      const closePullRequestFn = vi.fn(async () => {});
+      const deleteBranchFn = vi.fn(async () => {});
+      const deps = makeDeps({ postPrCommentFn: postPrCommentFn as never, closePullRequestFn: closePullRequestFn as never, deleteBranchFn: deleteBranchFn as never });
+      await expect(closeSnapshotPr(deps, "TestOrg", "test-kg", 9, "canary", "kg-refresh/x")).resolves.toBeUndefined();
+      expect(closePullRequestFn).toHaveBeenCalledTimes(1);
+      expect(deleteBranchFn).toHaveBeenCalledTimes(1);
+    });
+
     it("postBaselineAcceptNote mints a scoped token and comments naming the actor", async () => {
       const postPrCommentFn = vi.fn(async () => {});
       const mintToken = vi.fn(async () => ({ token: "tok" }));
