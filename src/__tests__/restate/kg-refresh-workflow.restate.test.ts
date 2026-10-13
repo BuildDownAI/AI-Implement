@@ -28,6 +28,7 @@ import { orchestratorTools, setKgRefreshToolDeps } from "../../restate/tools.js"
 import type { KgRefreshToolDeps } from "../../restate/kg-refresh-production.js";
 import { callToolAsSystem } from "../../restate/tools-client.js";
 import { createKgRefreshIngressClient, launchKeptMachine, type KeptMachineFly } from "../../restate/kg-refresh-production.js";
+import { GHA_RUN_PROFILE_DEFAULTS } from "../../restate/gha-run-profile.js";
 import { FLY_MACHINE_PROFILE_DEFAULTS, createFlyMachineProfile, mergeProfile, type FlyMachineProfileConfig, type KeptMachineState } from "../../restate/fly-machine-profile.js";
 import { createKgRepo, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
 import {
@@ -98,6 +99,8 @@ interface RunScenario {
   cancelCalls: number;
   /** Dispatch result carries no job id, as when the backend returned no machine or container id. */
   jobIdUnknown?: boolean;
+  /** AII-1246: a Fly create, as the sender reports it; `app` is the app the machine was created in. */
+  flyCreate?: { machineId: string; app?: string; reused?: boolean };
   runStatusSequence: Array<{ status: string; conclusion: string | null }>;
   findByTitleResult: { runId: number } | null;
   /** Title lookups that throw, by 1-based call number. */
@@ -381,6 +384,7 @@ describe("KgRefresh durable workflow", () => {
   let profileGets = 0;
   const claimCalls: string[] = [];
   const attachCalls: string[] = [];
+  const attachRequests: Array<Record<string, unknown>> = [];
   const dispatchedMachines: FlyMachineProfileConfig[] = [];
   const flyMachineProfile = restate.object({
     name: "FlyMachineProfile",
@@ -399,8 +403,25 @@ describe("KgRefresh durable workflow", () => {
         claimCalls.push(req.dispatchId);
         return { machineId: null };
       }),
-      attach: restate.handlers.object.exclusive(async (_ctx: restate.ObjectContext, req: { dispatchId: string }): Promise<void> => { attachCalls.push(req.dispatchId); }),
+      attach: restate.handlers.object.exclusive(async (_ctx: restate.ObjectContext, req: { dispatchId: string }): Promise<void> => { attachCalls.push(req.dispatchId); attachRequests.push(req); }),
       release: restate.handlers.object.exclusive(async (): Promise<void> => {}),
+    },
+  });
+
+  // AII-1244: a counting stand-in for GhaRunProfile; the workflow reads it only on a GitHub Actions run.
+  let ghaProfileGets = 0;
+  const dispatchedTimeouts: Array<number | null> = [];
+  const ghaRunProfile = restate.object({
+    name: "GhaRunProfile",
+    handlers: {
+      get: restate.handlers.object.shared(async (ctx: restate.ObjectSharedContext) => {
+        ghaProfileGets++;
+        const stored = await ctx.get<{ jobTimeoutMinutes: number }>("profile");
+        return stored ? { config: stored, source: "profile" } : { config: { ...GHA_RUN_PROFILE_DEFAULTS["kg-refresh"] }, source: "default" };
+      }),
+      set: restate.handlers.object.exclusive(async (ctx: restate.ObjectContext, patch: { jobTimeoutMinutes: number }) => {
+        ctx.set("profile", patch);
+      }),
     },
   });
 
@@ -436,6 +457,7 @@ describe("KgRefresh durable workflow", () => {
     scenario.dispatchCalls++;
     dispatchedIds.push(input.dispatchId);
     dispatchedMachines.push(input.machine);
+    dispatchedTimeouts.push(input.jobTimeoutMinutes);
     dispatchedTokens.push(input.tokens);
     dispatchedNonces.push(input.machineNonce);
     dispatchTimes.set(triggerId, [...(dispatchTimes.get(triggerId) ?? []), Date.now()]);
@@ -450,6 +472,7 @@ describe("KgRefresh durable workflow", () => {
       outcome: scenario.dispatchOutcome, runId: scenario.runId,
       jobId: scenario.jobIdUnknown ? null : `job-${triggerId}`, executionMode: scenario.executionMode,
       ...(scenario.runId !== undefined ? { runUrl: `https://example.test/runs/${scenario.runId}` } : {}),
+      ...(scenario.flyCreate ? { machineId: scenario.flyCreate.machineId, created: scenario.flyCreate.reused !== true, ...(scenario.flyCreate.app !== undefined && { app: scenario.flyCreate.app }) } : {}),
     };
     dispatchResults.push(result);
     return result;
@@ -625,9 +648,9 @@ describe("KgRefresh durable workflow", () => {
   let deadlineEnvs: Map<string, RestateEnvironment>;
   let bootstrapEnvs: Map<string, RestateEnvironment>;
   beforeAll(async () => {
-    envs = await startVariants([workflow, kgRepo, starter, flyMachineProfile]);
-    deadlineEnvs = await startVariants([deadlineWorkflow, kgRepo, starter, flyMachineProfile]);
-    bootstrapEnvs = await startVariants([bootstrapOnlyWorkflow, kgRepo, starter, flyMachineProfile]);
+    envs = await startVariants([workflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
+    deadlineEnvs = await startVariants([deadlineWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
+    bootstrapEnvs = await startVariants([bootstrapOnlyWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
   }, 120_000);
   afterAll(async () => {
     if (envs) await stopAll(envs);
@@ -1294,6 +1317,40 @@ describe("KgRefresh durable workflow", () => {
       expect(appendJobLogCalls.filter((c) => c.dispatchId === triggerId)).toEqual([{ dispatchId: triggerId, issueId: "kg-refresh", phase: "kg-refresh", repo: KG_SOURCE_REPO, executionMode: "github-actions" }]);
     }, 30_000);
 
+    it.each(VARIANTS.map(([label]) => label))("AII-1246: attach receives the dispatch result's app, and no app key when there is none (%s)", async (label) => {
+      const env = envFor(label);
+      for (const app of ["app-a", undefined]) {
+        const triggerId = newTriggerId();
+        makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines", flyCreate: { machineId: "m-app", ...(app !== undefined && { app }) } });
+        const done = runWorkflow(env.baseUrl(), triggerId);
+        await eventually(() => attachRequests.find((r) => r.dispatchId === triggerId), (r) => r !== undefined, { label: "attach" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+        await done;
+        const req = attachRequests.find((r) => r.dispatchId === triggerId)!;
+        expect(req.machineId).toBe("m-app");
+        if (app === undefined) expect("app" in req).toBe(false);
+        else expect(req.app).toBe(app);
+      }
+    }, 60_000);
+
+    it.each(VARIANTS.map(([label]) => label))("AII-1276: a reuse sends attach with the current app; a reuse without an app sends none (%s)", async (label) => {
+      const env = envFor(label);
+      const withApp = newTriggerId();
+      const noApp = newTriggerId();
+      makeScenario(withApp, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines", flyCreate: { machineId: "m-kept", app: "app-a", reused: true } });
+      makeScenario(noApp, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines", flyCreate: { machineId: "m-kept", reused: true } });
+      for (const id of [withApp, noApp]) {
+        const done = runWorkflow(env.baseUrl(), id);
+        await eventually(() => scenarios.get(id)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", id, "report", SUCCESS_REPORT);
+        await done;
+      }
+      const req = (await eventually(() => attachRequests.find((r) => r.dispatchId === withApp), (r) => r !== undefined, { label: "attach" }))!;
+      expect(req).toMatchObject({ machineId: "m-kept", app: "app-a" });
+      expect("replaces" in req).toBe(false);
+      expect(attachCalls).not.toContain(noApp);
+    }, 60_000);
+
     it.each(VARIANTS.map(([label]) => label))("a fly-machines run records one claim and resolves the backend once across dispatch retries (%s)", async (label) => {
       const env = envFor(label);
       const triggerId = newTriggerId();
@@ -1734,7 +1791,7 @@ describe("KgRefresh durable workflow", () => {
       totalDeadlineMs: scaledTick * 24,
       watchIntervalMs: scaledTick,
     });
-    const scaledEnv = await startRetryEnabled([scaledWorkflow, kgRepo, starter, flyMachineProfile]);
+    const scaledEnv = await startRetryEnabled([scaledWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
     try {
       const triggerId = newTriggerId();
       const runId = runIdCounter++;
@@ -1865,7 +1922,7 @@ describe("KgRefresh durable workflow", () => {
       totalDeadlineMs: 5_000,
       watchIntervalMs: 100,
     });
-    const cadenceEnv = await startRetryEnabled([cadenceWorkflow, kgRepo, starter, flyMachineProfile]);
+    const cadenceEnv = await startRetryEnabled([cadenceWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
     try {
       const triggerId = newTriggerId();
       makeScenario(triggerId, {
@@ -2265,6 +2322,44 @@ describe("KgRefresh durable workflow", () => {
       for (const m of seen) expect(m).toEqual({ ...defaults, cpus: 4, memoryMb: 8192 });
 
       await setProfile({ cpus: defaults.cpus, memoryMb: defaults.memoryMb });
+    },
+    60_000,
+  );
+
+  // ---- AII-1244: the GitHub Actions dispatch reads GhaRunProfile once, before the step ----
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1244: a GitHub Actions dispatch gets the stored jobTimeoutMinutes, a retried dispatch keeps the journaled one, and a Fly run reads no GHA profile (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const setGha = (patch: { jobTimeoutMinutes: number }) => callObject(env.baseUrl(), "GhaRunProfile", "kg-refresh", "set", patch);
+
+      const fly = newTriggerId();
+      makeScenario(fly, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      const flyDone = runWorkflow(env.baseUrl(), fly);
+      await eventually(() => scenarios.get(fly)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      expect(dispatchedTimeouts.at(-1)).toBeNull();
+      await callWorkflow(env.baseUrl(), "KgRefresh", fly, "report", SUCCESS_REPORT);
+      await flyDone;
+
+      await setGha({ jobTimeoutMinutes: 120 });
+      const gha = newTriggerId();
+      const retried = makeScenario(gha, { dispatchOutcome: "accepted", executionMode: "github-actions", runId: undefined });
+      const runId = runIdCounter++;
+      dispatchThrowAfterCommit.set(gha, runId);
+      const beforeGets = ghaProfileGets;
+      const beforeTimeouts = dispatchedTimeouts.length;
+      const done = runWorkflow(env.baseUrl(), gha);
+      await eventually(() => retried.dispatchCalls >= 1, (ok) => ok, { label: "durable effect" });
+      await setGha({ jobTimeoutMinutes: 300 }); // after the journaled read: a retry must not see it
+      await eventually(() => retried.runId === runId, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", gha, "report", SUCCESS_REPORT);
+      await done;
+      expect(ghaProfileGets - beforeGets).toBe(1);
+      const seen = dispatchedTimeouts.slice(beforeTimeouts);
+      expect(seen.length).toBeGreaterThanOrEqual(1);
+      for (const t of seen) expect(t).toBe(120);
+
+      await setGha({ jobTimeoutMinutes: GHA_RUN_PROFILE_DEFAULTS["kg-refresh"].jobTimeoutMinutes });
     },
     60_000,
   );
@@ -2762,7 +2857,7 @@ describe("KgRefresh durable workflow", () => {
   it("W18b: a workflow built with a ten-day retentionMs registers ten days", async () => {
     const tenDays = 10 * 24 * 60 * 60 * 1000;
     const tenDayWorkflow = createKgRefreshWorkflow({ ...workflowDeps, retentionMs: tenDays, bootstrapDeadlineMs: 30_000, totalDeadlineMs: 60_000 });
-    const tenDayEnv = await startRetryEnabled([tenDayWorkflow, kgRepo, starter, flyMachineProfile]);
+    const tenDayEnv = await startRetryEnabled([tenDayWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
     try {
       const triggerId = newTriggerId();
       makeScenario(triggerId, { dispatchOutcome: "rejected", executionMode: "fly-machines" });
@@ -2846,7 +2941,7 @@ describe("KgRefresh durable workflow", () => {
     const crashWorkflow = buildCrashWorkflow("original");
     const replacementWorkflow = buildCrashWorkflow("replacement");
 
-    const env = await startRetryEnabled([crashWorkflow, kgRepo, flyMachineProfile]);
+    const env = await startRetryEnabled([crashWorkflow, kgRepo, flyMachineProfile, ghaRunProfile]);
     let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
     try {
       // Dispatches through the real KgRepo.trigger (not a direct KgRefresh.run call) so the
@@ -2864,7 +2959,7 @@ describe("KgRefresh durable workflow", () => {
       const stagingMarker = join(dataRoot, "staging", COMPLETION_MARKER);
       await eventually(() => existsSync(stagingMarker) && stageCommittedAttempts.length >= 1, (ok) => ok, { label: "durable effect", timeoutMs: 12_000 });
 
-      replacement = await replaceEndpoint(env, [replacementWorkflow, kgRepo, flyMachineProfile]);
+      replacement = await replaceEndpoint(env, [replacementWorkflow, kgRepo, flyMachineProfile, ghaRunProfile]);
       await env.startedRestateServer.restart();
 
       // The restart severs the blocked first attempt's connection; Restate retries the
@@ -2943,9 +3038,11 @@ describe("KgRefresh durable workflow", () => {
       fly: {
         getMachine: (id) => fly.getMachine(id),
         clearMachineEnv: async (id, metadata) => { profileFlyCalls.push(`clear-env:${id}:${Object.keys(metadata ?? {}).join(",")}`); },
-        destroyMachine: async (id) => { profileFlyCalls.push(`destroy:${id}`); },
+        destroyMachine: async (id, app) => { profileFlyCalls.push(`destroy:${id}${app ? `@${app}` : ""}`); },
       },
     });
+    // The sessions app the dispatch creates in and `resolveFlyApp` reports; unset leaves the app check off.
+    let currentFlyApp: string | undefined;
 
     async function keptDispatch(input: KgDispatchInput): Promise<KgDispatchResult> {
       const scenario = scenarios.get(input.dispatchId)!;
@@ -2956,7 +3053,7 @@ describe("KgRefresh durable workflow", () => {
       const launched = await launchKeptMachine(fly, {
         keptMachineId: input.machineId, dispatchId: input.dispatchId, machineConfig, machineNonce: `nonce-${input.dispatchId}`,
       });
-      return { outcome: "accepted", jobId: launched.machineId, executionMode: "fly-machines", machineId: launched.machineId, created: launched.created, replaced: launched.replaced };
+      return { outcome: "accepted", jobId: launched.machineId, executionMode: "fly-machines", machineId: launched.machineId, created: launched.created, replaced: launched.replaced, ...(currentFlyApp && { app: currentFlyApp }) };
     }
 
     const keptStopCalls: Array<{ jobId: string; keep: boolean }> = [];
@@ -2964,6 +3061,7 @@ describe("KgRefresh durable workflow", () => {
       return createKgRefreshWorkflow({
         ...workflowDeps,
         dispatch: keptDispatch,
+        resolveFlyApp: () => currentFlyApp ?? null,
         stopMachineRun: async (_mode, jobId, keep) => {
           keptStopCalls.push({ jobId, keep: keep === true });
           if (keep) await fly.stopMachine(jobId);
@@ -3053,6 +3151,87 @@ describe("KgRefresh durable workflow", () => {
       }
     }, 60_000);
 
+    it("a refresh after a sessions-app change destroys the old kept machine in its app and creates one in the current app", async () => {
+      const env = await startRetryEnabled([buildKeptWorkflow(), kgRepo, starter, profileObject]);
+      try {
+        currentFlyApp = "app-a";
+        const first = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-1", { label: "attach recorded" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", first.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await first.done;
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "first release" });
+        expect((await profileStatus(env.baseUrl())).machine).toMatchObject({ machineId: "m-1", app: "app-a" });
+
+        fly.calls.length = 0;
+        profileFlyCalls.length = 0;
+        currentFlyApp = "app-b";
+        const second = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-2", { label: "new machine recorded" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", second.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await second.done;
+        const status = await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "second release" });
+        expect(status.machine).toMatchObject({ machineId: "m-2", app: "app-b" });
+        expect(fly.calls).toEqual(["create:m-2"]);
+        expect(profileFlyCalls).toContain("destroy:m-1@app-a");
+      } finally {
+        currentFlyApp = undefined;
+        await env.stop();
+      }
+    }, 60_000);
+
+    it("AII-1276: a reuse of a kept machine with no recorded app backfills the app, and the hold is released", async () => {
+      const env = await startRetryEnabled([buildKeptWorkflow(), kgRepo, starter, profileObject]);
+      try {
+        currentFlyApp = undefined;
+        const first = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-1", { label: "attach recorded" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", first.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await first.done;
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "first release" });
+        expect((await profileStatus(env.baseUrl())).machine?.app).toBeUndefined();
+        fly.runnerExits("m-1");
+
+        fly.calls.length = 0;
+        currentFlyApp = "app-a";
+        const second = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.app === "app-a", { label: "app backfilled" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", second.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await second.done;
+        const status = await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "second release" });
+        expect(status.machine).toMatchObject({ machineId: "m-1", app: "app-a" });
+        expect(fly.calls).toEqual(["update:m-1", "start:m-1"]);
+      } finally {
+        currentFlyApp = undefined;
+        await env.stop();
+      }
+    }, 60_000);
+
+    it("AII-1276: a reuse where the app is already recorded leaves the machine and app unchanged", async () => {
+      const env = await startRetryEnabled([buildKeptWorkflow(), kgRepo, starter, profileObject]);
+      try {
+        currentFlyApp = "app-a";
+        const first = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-1", { label: "attach recorded" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", first.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await first.done;
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "first release" });
+        fly.runnerExits("m-1");
+
+        fly.calls.length = 0;
+        profileFlyCalls.length = 0;
+        const second = await startRun(env);
+        await callWorkflow(env.baseUrl(), "KgRefresh", second.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await second.done;
+        const status = await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "second release" });
+        expect(status.machine).toMatchObject({ machineId: "m-1", app: "app-a" });
+        expect(fly.calls).toEqual(["update:m-1", "start:m-1"]);
+        expect(profileFlyCalls.filter((c) => c.startsWith("destroy:"))).toEqual([]);
+      } finally {
+        currentFlyApp = undefined;
+        await env.stop();
+      }
+    }, 60_000);
+
     it("a cancel during the wait stops the kept machine, releases it, and keeps its id", async () => {
       const env = await startRetryEnabled([buildKeptWorkflow(), kgRepo, starter, profileObject]);
       try {
@@ -3123,9 +3302,9 @@ describe("KgRefresh durable workflow", () => {
     let heldEnvs: Map<string, RestateEnvironment>;
     let shortHeldEnvs: Map<string, RestateEnvironment>;
     beforeAll(async () => {
-      heldEnvs = await startVariants([heldWorkflow, kgRepo, starter, flyMachineProfile, orchestratorTools]);
+      heldEnvs = await startVariants([heldWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile, orchestratorTools]);
       setKgRefreshToolDeps({ kgSourceRepo: KG_SOURCE_REPO } as unknown as KgRefreshToolDeps);
-      shortHeldEnvs = await startVariants([shortHeldWorkflow, kgRepo, starter, flyMachineProfile]);
+      shortHeldEnvs = await startVariants([shortHeldWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
     }, 120_000);
     afterAll(async () => {
       setKgRefreshToolDeps(null);

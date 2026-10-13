@@ -316,6 +316,45 @@ describe("postRunnerResult", () => {
     expect(body.reviewFix).toEqual(reviewFix);
   });
 
+  describe("missing callback inputs (AII-1273)", () => {
+    const base = { workspaceDir: "/tmp", phase: "gap-analysis", outcome: "success" } as const;
+    const reviewFix = (): ReviewFixResultMetadataV1 => ({
+      version: 1, attemptId: "a", installationId: 1, repository: "o/r", prNumber: 1,
+      deadlineAt: Date.now() + 60_000, githubRunId: 1, githubRunAttempt: 1, outputCommit: "a".repeat(40),
+    } as ReviewFixResultMetadataV1);
+
+    it("warns once naming the callback URL when reviewFix is set and no URL is available", async () => {
+      vi.stubEnv("RUNNER_CALLBACK_URL", "");
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const fetchImpl = vi.fn();
+      await postRunnerResult({ ...base, reviewFix: reviewFix(), fetchImpl });
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).toContain("callback URL");
+      expect(String(warn.mock.calls[0][0])).not.toContain("RUN_TOKEN");
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("warns once naming RUN_TOKEN when the token is missing", async () => {
+      vi.stubEnv("RUN_TOKEN", "");
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const fetchImpl = vi.fn();
+      await postRunnerResult({ ...base, reviewFix: reviewFix(), callbackUrl: "https://cb", fetchImpl });
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).toContain("RUN_TOKEN");
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("stays silent without reviewFix", async () => {
+      vi.stubEnv("RUNNER_CALLBACK_URL", "");
+      vi.stubEnv("RUN_TOKEN", "");
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const fetchImpl = vi.fn();
+      await postRunnerResult({ ...base, fetchImpl });
+      expect(warn).not.toHaveBeenCalled();
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+  });
+
   it("omits reviewFix from body when not provided", async () => {
     const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
 

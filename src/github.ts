@@ -1288,6 +1288,18 @@ export async function getCombinedChecksState(
   return "success";
 }
 
+/** The check runs of `sha`. Throws on an unreadable response, so a caller never reads "no checks" from a failed read. */
+export async function listCheckRuns(
+  token: string, owner: string, repo: string, sha: string,
+): Promise<Array<{ name: string; appSlug: string; status: string; conclusion: string | null }>> {
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/commits/${sha}/check-runs?per_page=100`,
+    { headers: ghHeaders(token), signal: defaultFetchSignal() });
+  if (!res.ok) throw new Error(`check-runs read failed: HTTP ${res.status}`);
+  const data = (await res.json()) as { check_runs?: Array<{ name: string; status: string; conclusion: string | null; app?: { slug?: string } | null }> };
+  return (data.check_runs ?? []).map((c) => ({ name: c.name, appSlug: c.app?.slug ?? "", status: c.status, conclusion: c.conclusion }));
+}
+
 export async function hasChangesRequestedReview(
   token: string, owner: string, repo: string, prNumber: number,
 ): Promise<boolean> {

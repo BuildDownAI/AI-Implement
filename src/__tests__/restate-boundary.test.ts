@@ -39,7 +39,8 @@ describe("import allowlist: only the door adapters may import Restate from outsi
   // through an injected ingress client and takes the body cap and event type from src/restate/review-fix-pr.ts (AII-1184).
   // reaper.ts imports the durable-runner machine-metadata constants from
   // src/restate/fly-machine-profile.ts so the stamp and the reaper's reading of it share one definition (AII-1132).
-  const ALLOWLIST = new Set(["src/mcp.ts", "src/mcp-oauth.ts", "src/admin.ts", "src/index.ts", "src/deploy.ts", "src/runner-callback.ts", "src/reaper.ts", "src/webhook.ts"]);
+  // orchestrator-settings.ts is the RunnerBackend cache's reader and boot seed: it reaches the object through the ingress client (AII-1243).
+  const ALLOWLIST = new Set(["src/orchestrator-settings.ts", "src/mcp.ts", "src/mcp-oauth.ts", "src/admin.ts", "src/index.ts", "src/deploy.ts", "src/runner-callback.ts", "src/reaper.ts", "src/webhook.ts"]);
 
   function listTsFiles(dir: string): string[] {
     const entries = readdirSync(dir, { withFileTypes: true });
@@ -110,7 +111,7 @@ describe("import allowlist: only the door adapters may import Restate from outsi
   // makes the first test above fail with that file listed in `violations`, confirmed by hand
   // and reverted before this PR — see the PR description for the before/after transcript.
   it("sanity: the allowlist contains only the documented door and deployment adapters", () => {
-    expect([...ALLOWLIST].sort()).toEqual(["src/admin.ts", "src/deploy.ts", "src/index.ts", "src/mcp-oauth.ts", "src/mcp.ts", "src/reaper.ts", "src/runner-callback.ts", "src/webhook.ts"]);
+    expect([...ALLOWLIST].sort()).toEqual(["src/admin.ts", "src/deploy.ts", "src/index.ts", "src/mcp-oauth.ts", "src/mcp.ts", "src/orchestrator-settings.ts", "src/reaper.ts", "src/runner-callback.ts", "src/webhook.ts"]);
   });
 });
 
@@ -206,9 +207,9 @@ describe("every declared write handler wraps its side effect in ctx.run under a 
     return /role:\s*"admin"/.test(block) && /operation:\s*"read"/.test(block);
   });
 
-  it("found the nine documented write handlers as role: \"admin\" (not zero, not accidentally all of them)", () => {
+  it("found the eleven documented write handlers as role: \"admin\" (not zero, not accidentally all of them)", () => {
     expect(writeEntries.map((e) => e.toolName).sort()).toEqual(
-      ["add_project", "clear_dispatch_dedup", "decide_kg_refresh", "pause_project", "release_dispatch_reservation", "set_fly_machine_profile", "set_runner_mode", "trigger_kg_refresh", "trigger_workflow_sync"],
+      ["add_project", "clear_dispatch_dedup", "decide_kg_refresh", "pause_project", "release_dispatch_reservation", "set_fly_machine_profile", "set_run_profile", "set_runner_backend", "set_runner_mode", "trigger_kg_refresh", "trigger_workflow_sync"],
     );
   });
 

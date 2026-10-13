@@ -98,12 +98,13 @@ describe("LateExternalReview workflow", () => {
     await Promise.all([stopAll(envs), retryEnv?.stop()]);
   });
 
-  async function runScenario(url: string, overrides: Partial<Scenario>) {
+  async function runScenario(url: string, overrides: Partial<Scenario>, follow = false) {
     const dispatchId = `late-${counter++}`;
     const sc: Scenario = { ticks: [passed], reads: 0, jobApproved: false, hasJob: true, jobId: 1000 + counter, stamps: [], comments: [], ...overrides };
     scenarios.set(dispatchId, sc);
     const input: LateExternalReviewInput = {
       dispatchId, owner: "o", repo: "r", prNumber: 5, prUrl: "https://github.com/o/r/pull/5", headSha: SHA,
+      ...(follow ? { followHead: true } : {}),
     };
     const result = await callWorkflow<LateExternalReviewResult>(url, "LateExternalReview", dispatchId, "run", input);
     return { result, sc };
@@ -138,6 +139,14 @@ describe("LateExternalReview workflow", () => {
         const { result, sc } = await runScenario(url(), { ticks: [{ ...passed, blockingLastSeenAtMs: [COMMIT_MS + 1] }] });
         expect(result).toEqual({ outcome: "findings" });
         expect(sc.stamps).toEqual([]);
+      });
+
+      it("ends findings on a blocking finding recorded from a 🔴 summary after the commit time, writing no mark", async () => {
+        // The ledger records a trusted summary's 🔴 heading as an ordinary blocking finding (AII-1251).
+        const { result, sc } = await runScenario(url(), { ticks: [pending, { ...passed, blockingLastSeenAtMs: [COMMIT_MS + 5] }] });
+        expect(result).toEqual({ outcome: "findings" });
+        expect(sc.stamps).toEqual([]);
+        expect(sc.comments).toEqual([]);
       });
 
       it("ends findings on a blocking finding last seen exactly at the commit time", async () => {
@@ -184,6 +193,72 @@ describe("LateExternalReview workflow", () => {
         expect(result).toEqual({ outcome: "timed-out" });
         expect(sc.stamps).toEqual([]);
         expect(sc.comments).toEqual([]);
+      });
+
+      describe("repository-fix process (followHead)", () => {
+        const COMMIT_B_MS = COMMIT_MS + 10_000;
+        const COMMIT_C_MS = COMMIT_MS + 20_000;
+        const onB: LateReviewTick = { ...pending, headSha: OTHER_SHA, headCommittedAtMs: COMMIT_B_MS };
+        const THIRD_SHA = "c".repeat(40);
+        const onC: LateReviewTick = { ...pending, headSha: THIRD_SHA, headCommittedAtMs: COMMIT_C_MS };
+
+        it("approves on the auto-fix commit once its review is clean and checks pass: one mark, one comment", async () => {
+          const { result, sc } = await runScenario(url(), {
+            // A's 🔴 was last seen before B was committed; B's review has not completed on the second tick.
+            ticks: [{ ...pending, blockingLastSeenAtMs: [COMMIT_MS + 1] }, { ...onB, blockingLastSeenAtMs: [COMMIT_MS + 1] }, { ...onB, checks: "success", blockingLastSeenAtMs: [COMMIT_MS + 1] }],
+          }, true);
+          expect(result).toEqual({ outcome: "approved" });
+          expect(sc.stamps).toEqual([sc.jobId]);
+          expect(sc.comments).toHaveLength(1);
+          expect(sc.comments[0]).toContain(LATE_EXTERNAL_APPROVAL_MARKER);
+          expect(sc.comments[0]).toContain(OTHER_SHA);
+        });
+
+        it("approves only after the second auto-fix commit when the first still has a 🔴", async () => {
+          const { result, sc } = await runScenario(url(), {
+            ticks: [
+              pending,
+              // B's review finished with a 🔴; the workflow keeps waiting rather than ending findings.
+              { ...onB, checks: "success", blockingLastSeenAtMs: [COMMIT_B_MS + 1] },
+              onC,
+              { ...onC, checks: "success", blockingLastSeenAtMs: [COMMIT_B_MS + 1] },
+            ],
+          }, true);
+          expect(result).toEqual({ outcome: "approved" });
+          expect(sc.reads).toBeGreaterThanOrEqual(4);
+          expect(sc.stamps).toEqual([sc.jobId]);
+          expect(sc.comments).toHaveLength(1);
+        });
+
+        it("ends timed-out with no mark when no new commit arrives before the deadline", async () => {
+          const { result, sc } = await runScenario(url(), { ticks: [pending] }, true);
+          expect(result).toEqual({ outcome: "timed-out" });
+          expect(sc.stamps).toEqual([]);
+          expect(sc.comments).toEqual([]);
+        });
+
+        it("ends timed-out with no mark when the new head's review never reads as done", async () => {
+          // The fake readTick returns fixtures, so this covers the workflow side only: a new head whose
+          // checks stay "pending" (what a completed+skipped run reads as) never approves. The
+          // skipped-to-pending mapping itself is asserted in late-external-review-tick.test.ts.
+          const { result, sc } = await runScenario(url(), { ticks: [pending, onB] }, true);
+          expect(result).toEqual({ outcome: "timed-out" });
+          expect(sc.stamps).toEqual([]);
+          expect(sc.comments).toEqual([]);
+        });
+
+        it("ends superseded with no mark when the PR closes while waiting", async () => {
+          const { result, sc } = await runScenario(url(), { ticks: [pending, onB, { ...onB, open: false }] }, true);
+          expect(result).toEqual({ outcome: "superseded" });
+          expect(sc.stamps).toEqual([]);
+          expect(sc.comments).toEqual([]);
+        });
+      });
+
+      it("a run without followHead still ends superseded on a head change", async () => {
+        const { result, sc } = await runScenario(url(), { ticks: [pending, { ...pending, headSha: OTHER_SHA }] }, false);
+        expect(result).toEqual({ outcome: "superseded" });
+        expect(sc.stamps).toEqual([]);
       });
 
       it("ends no-job, posting nothing, when the dispatch row is gone", async () => {

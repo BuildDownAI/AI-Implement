@@ -8,6 +8,7 @@ import { getPullRequestState } from "../github.js";
 import { listReviewFixCycleSummaries } from "../review-fix-evidence.js";
 import { createReviewFixFinalizer } from "../review-fix-finalize.js";
 import { createReviewFixGithubAdapter } from "../review-fix-github-adapter.js";
+import { resolveRunnerImageForDispatch } from "../repo-image.js";
 import { resolveReviewProcess, type ReviewFixer } from "../review-process.js";
 import { acceptReviewFixWebhookEvent, updateReviewFixStatus } from "../review-fix-queue.js";
 import { loadPendingReviewFixFeedback } from "../review-fix-pending.js";
@@ -29,6 +30,8 @@ export interface ReviewFixProductionConfig {
   githubAppPrivateKey: string;
   runnerCallbackBaseUrl: string | null;
   runnerTokenSecret: string | null;
+  sessionImage: string;
+  runnerImageExplicit: boolean;
 }
 
 function selectedMapping(scope: ScopedPrIdentity): RepoMapping | null {
@@ -92,6 +95,9 @@ export function createProductionReviewFixServices(
   const credentials = createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey);
   const github = createReviewFixGithubAdapter({ credentials });
   const worker = new GithubReviewFixWorker({ credentials, scopeStore: reviewFixAttemptStoreScopeStore(store),
+    runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
+    runnerImage: (target) => resolveRunnerImageForDispatch({ ...target,
+      defaultImage: config.sessionImage, runnerImageExplicit: config.runnerImageExplicit }),
     callbackInputs: async (attemptId) => {
       if (!config.runnerTokenSecret || !config.runnerCallbackBaseUrl) throw new Error("pilot callbacks unavailable");
       return {

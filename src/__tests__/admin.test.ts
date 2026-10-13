@@ -2003,6 +2003,15 @@ describe("admin mappings", () => {
     expect(JSON.parse(reset.body).reviewProcess).toBeNull();
   });
 
+  it("stores reviewProcess claude-code-review-repository-fix", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RP4", owner: "org", repo: "app", reviewProcess: "claude-code-review-repository-fix",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).reviewProcess).toBe("claude-code-review-repository-fix");
+  });
+
   it("stores null reviewProcess when absent on a new mapping", async () => {
     const token = await login("secret");
     const res = await request("/api/mappings", "POST", "secret", { teamKey: "RP2", owner: "org", repo: "app" }, token);
@@ -2015,7 +2024,7 @@ describe("admin mappings", () => {
       teamKey: "RP3", owner: "org", repo: "app", reviewProcess: "github",
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toBe('reviewProcess invalid: must be null, "ai-implement", or "claude-code-review"');
+    expect(JSON.parse(res.body).error).toBe('reviewProcess invalid: must be null, "ai-implement", "claude-code-review", or "claude-code-review-repository-fix"');
   });
 
   it("resets trustedReviewAuthors to the null default via an explicit null", async () => {
@@ -2674,32 +2683,72 @@ describe("admin settings", () => {
     expect(body.flySessionsApp.dbValue).toBeNull();
   });
 
-  it("POST /api/settings saves flySessionsApp to DB", async () => {
-    const token = await login("secret");
-    const res = await request("/api/settings", "POST", "secret", { flySessionsApp: "my-sessions-app" }, token);
-    expect(res.statusCode).toBe(200);
-    const body = JSON.parse(res.body);
-    expect(body.flySessionsApp.dbValue).toBe("my-sessions-app");
-  });
+  /** A fake Restate: `set_runner_backend` merges into `state`, and the refresh reads it back through the real cache. */
+  function fakeRunnerBackend(opts: { down?: boolean } = {}) {
+    const state = { app: null as string | null, region: null as string | null };
+    const callTool = vi.fn(async (_name: string, args: Record<string, unknown>) => {
+      if (opts.down) return { status: "unavailable" as const };
+      Object.assign(state, args.patch);
+      return { status: "ok" as const, content: [{ type: "text", text: JSON.stringify(state) }] };
+    });
+    const refreshRunnerBackendCache = async () => {
+      const mod = await import("../orchestrator-settings.js");
+      await mod.refreshRunnerBackendCache({ readFlyMachines: async () => ({ ...state }) });
+    };
+    return { deps: { callTool: callTool as never, refreshRunnerBackendCache }, callTool, state };
+  }
 
-  it("POST /api/settings reports runtimeValue equal to dbValue, and GET agrees, with no restart", async () => {
+  it("POST /api/settings writes flySessionsApp through set_runner_backend and the next GET reports source restate", async () => {
     const token = await login("secret");
-    const res = await request("/api/settings", "POST", "secret", { flySessionsApp: "new-app" }, token);
+    const fake = fakeRunnerBackend();
+    const res = await requestWithDeps("/api/settings", "POST", token, fake.deps, { flySessionsApp: "my-sessions-app" });
     expect(res.statusCode).toBe(200);
-    const post = JSON.parse(res.body);
-    expect(post.flySessionsApp.runtimeValue).toBe("new-app");
-    expect(post.flySessionsApp.dbValue).toBe("new-app");
+    expect(fake.callTool).toHaveBeenCalledWith(
+      "set_runner_backend",
+      { backend: "fly-machines", patch: { app: "my-sessions-app" } },
+      expect.objectContaining({ role: "admin" }),
+    );
+    expect(JSON.parse(res.body).flySessionsApp).toMatchObject({ runtimeValue: "my-sessions-app", source: "restate" });
     const get = JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
-    expect(get.flySessionsApp.runtimeValue).toBe("new-app");
-    expect(get.flySessionsApp.dbValue).toBe("new-app");
+    expect(get.runnerBackendSource).toBe("restate");
+    expect(get.flySessionsApp).toMatchObject({ runtimeValue: "my-sessions-app", source: "restate", overriddenByEnv: false });
+    expect(get.flySessionsApp.dbValue).toBeNull();
   });
 
-  it("POST /api/settings trims whitespace-only string to null", async () => {
+  it("POST /api/settings stores null for a whitespace-only value", async () => {
     const token = await login("secret");
-    const res = await request("/api/settings", "POST", "secret", { flySessionsApp: "   " }, token);
+    const fake = fakeRunnerBackend();
+    const res = await requestWithDeps("/api/settings", "POST", token, fake.deps, { flySessionsApp: "   " });
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body).flySessionsApp.dbValue).toBeNull();
+    expect(fake.callTool.mock.calls[0][1]).toEqual({ backend: "fly-machines", patch: { app: null } });
+    expect(JSON.parse(res.body).flySessionsApp.runtimeValue).toBeNull();
   });
+
+  it("POST /api/settings answers 503 and writes no row when Restate is down", async () => {
+    const token = await login("secret");
+    const fake = fakeRunnerBackend({ down: true });
+    const res = await requestWithDeps("/api/settings", "POST", token, fake.deps, { flySessionsApp: "x", flySessionsRegion: "iad" });
+    expect(res.statusCode).toBe(503);
+    const get = JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
+    expect(get.flySessionsApp.dbValue).toBeNull();
+    expect(get.flySessionsRegion.dbValue).toBeNull();
+    expect(get.runnerBackendSource).toBe("fallback");
+  });
+
+  it("POST /api/settings answers 503 when callTool throws", async () => {
+    const token = await login("secret");
+    const res = await requestWithDeps("/api/settings", "POST", token, { callTool: (async () => { throw new Error("boom"); }) as never }, { flySessionsRegion: "iad" });
+    expect(res.statusCode).toBe(503);
+  });
+
+  it("GET /api/settings reports source fallback before any Restate read, with env as the runtime value", async () => {
+    process.env.FLY_SESSIONS_APP = "env-app";
+    const token = await login("secret");
+    const get = JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
+    expect(get.runnerBackendSource).toBe("fallback");
+    expect(get.flySessionsApp).toMatchObject({ runtimeValue: "env-app", source: "fallback" });
+  });
+
 
   it("GET and POST /api/settings require auth", async () => {
     const get = await request("/api/settings", "GET", "secret");
@@ -5272,7 +5321,7 @@ describe("per-page grants", () => {
     });
   });
 
-  describe("journal grant", () => {
+  describe("journal access (admin-only)", () => {
     const journalFetch = vi.fn();
     const journalDeps = {
       readJournal: (query: Record<string, string>) => journalModule.handleJournalRequest(query, { fetchImpl: journalFetch as never }),
@@ -5290,13 +5339,13 @@ describe("per-page grants", () => {
       expect(journalFetch).not.toHaveBeenCalled();
     });
 
-    it("refuses a user with no grant, and admits one with the grant despite the query string", async () => {
+    it("refuses a user with no grant, and a stored journal grant row grants nothing", async () => {
       const path = "/api/restate/journal?service=KgRefresh&key=abc";
       expect((await requestWithDeps(path, "GET", userSession(), journalDeps)).statusCode).toBe(403);
       accessGrants.savePageGrants(["journal"], "ada@eudoxus.ai");
-      journalFetch.mockResolvedValue(new Response(JSON.stringify({ rows: [] }), { status: 200 }));
-      expect((await requestWithDeps(path, "GET", userSession(), journalDeps)).statusCode).toBe(404);
-      expect(journalFetch).toHaveBeenCalledTimes(1);
+      expect((await requestWithDeps(path, "GET", userSession(), journalDeps)).statusCode).toBe(403);
+      expect(journalFetch).not.toHaveBeenCalled();
+      expect(Object.keys(accessGrants.PAGE_ROUTES)).not.toContain("journal");
     });
 
     it("admits an admin without a grant", async () => {
@@ -5325,6 +5374,18 @@ describe("per-page grants", () => {
       // Grantability comes from the route table, so Access itself can never appear here.
       expect(body.grantable).toContain("issues");
       expect(body.grantable).not.toContain("access");
+    });
+
+    it("lists no Journal page and still saves a grant while a stale journal row is stored", async () => {
+      const db = (await import("../dedup.js")).getDb();
+      db.prepare("INSERT INTO access_page_grants (page, granted_at, granted_by) VALUES ('journal', 'now', 'ada@eudoxus.ai')").run();
+      const token = adminSsoSession();
+      const got = JSON.parse((await request("/api/access-grants", "GET", "secret", undefined, token)).body);
+      expect(got.grantable).not.toContain("journal");
+      // The access page drops non-grantable keys from its draft, so this is what it posts.
+      const pages = got.granted.filter((k: string) => got.grantable.includes(k));
+      const res = await request("/api/access-grants", "POST", "secret", { pages: [...pages, "issues"] }, token);
+      expect(res.statusCode).toBe(200);
     });
 
     it("stores a grant an admin saves", async () => {

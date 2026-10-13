@@ -38,6 +38,7 @@ import {
   verifyGate,
 } from "../kg-refresh-rail.js";
 import { FlyMachineProfile, type FlyMachineProfileConfig } from "./fly-machine-profile.js";
+import { GhaRunProfile } from "./gha-run-profile.js";
 import type { BackendRunRead } from "../backend-run.js";
 import type { MachineExit } from "../fly-machines.js";
 import { parseKgSourceRepo } from "../deploy.js";
@@ -115,6 +116,8 @@ export interface KgDispatchInput {
   dispatchId: string;
   /** The Fly machine size for this run, read once from `FlyMachineProfile/kg-refresh` before the dispatch step. */
   machine: FlyMachineProfileConfig;
+  /** The GitHub Actions job timeout, read once from `GhaRunProfile/kg-refresh` before the dispatch step; null off GitHub Actions. */
+  jobTimeoutMinutes: number | null;
   /** The pipeline's kept Fly machine from `FlyMachineProfile.claim`; null when none is kept. */
   machineId: string | null;
   /** The backend the `resolve` step journaled; the dispatch acts on it and does not resolve again. */
@@ -171,6 +174,8 @@ export interface KgDispatchResult {
   machineId?: string | null;
   /** True when the dispatch created the machine, so the workflow must `attach` it. */
   created?: boolean;
+  /** The Fly app the machine was created or reused in, read inside the dispatch step. */
+  app?: string;
   /** The kept machine id the dispatch found destroyed or 404 and replaced; sent as `replaces` on `attach`. */
   replaced?: string;
 }
@@ -210,6 +215,8 @@ export interface KgRefreshWorkflowDependencies {
   buildEnvelope(run: KgRefreshRunInput, issueIdentifier: string): RunConfigV1;
   /** Computes the row's values from config and the environment, with no store I/O; the `resolve` step journals the answer. */
   resolveDispatchRecord(dispatchId: string): KgDispatchRecord;
+  /** The Fly sessions app a new kept machine would be created in; `claim` destroys a kept machine recorded in another app. Absent: no app check. */
+  resolveFlyApp?(): string | null;
   /** Projects the journaled record onto the `dispatch_log` row. Idempotent on `dispatchId`. */
   recordDispatchRow(record: KgDispatchRecord): void;
   /** Derives the attempt's machine nonce from the token secret and journaled inputs. Pure; the result is a credential and never a step result. */
@@ -512,13 +519,22 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       const profile = await ctx.objectClient(FlyMachineProfile, "kg-refresh").get();
       if (!profile) throw new restate.TerminalError("no FlyMachineProfile default exists for kg-refresh", { errorCode: 500 });
       const machine = profile.config;
+      // Journaled like the Fly read: a replay after a later `set` keeps this run's timeout. Only a GitHub Actions run needs it.
+      let jobTimeoutMinutes: number | null = null;
+      if (executionMode === GHA_EXECUTION_MODE) {
+        const ghaProfile = await ctx.objectClient(GhaRunProfile, "kg-refresh").get();
+        if (!ghaProfile) throw new restate.TerminalError("no GhaRunProfile default exists for kg-refresh", { errorCode: 500 });
+        jobTimeoutMinutes = ghaProfile.config.jobTimeoutMinutes;
+      }
       // The resume path that raises this is AII-1032's; the claim, the step names and `attach` carry it.
       const attempt = 1;
       // A journaled call: a replay reuses the claim. The Fly write stays in the dispatch step, which holds the run's tokens.
       // Only a Fly run holds the kept machine.
-      const claim = executionMode === "fly-machines"
-        ? await ctx.objectClient(FlyMachineProfile, "kg-refresh").claim({ dispatchId, attempt })
-        : { machineId: null };
+      let claim: { machineId: string | null } = { machineId: null };
+      if (executionMode === "fly-machines") {
+        const flyApp = deps.resolveFlyApp ? await ctx.run("fly-app", () => deps.resolveFlyApp!()) : null;
+        claim = await ctx.objectClient(FlyMachineProfile, "kg-refresh").claim({ dispatchId, attempt, ...(flyApp ? { app: flyApp } : {}) });
+      }
       // Armed before the dispatch creates the machine, so `/api/token` never sees a row with no nonce.
       if (executionMode !== GHA_EXECUTION_MODE) await ctx.run(`nonce-${attempt}`, () => deps.armMachineNonce(dispatchId, attempt));
       const dispatchResult = await ctx.run(
@@ -535,11 +551,12 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           }
           minted ??= deps.mintRunTokens({ dispatchId, ttlSeconds });
           const machineNonce = executionMode === GHA_EXECUTION_MODE ? null : deps.deriveMachineNonce(dispatchId, attempt);
-          const result = await deps.dispatch({ envelope, tokens: minted, dispatchId, machine, machineId: claim.machineId, executionMode, machineNonce });
+          const result = await deps.dispatch({ envelope, tokens: minted, dispatchId, machine, jobTimeoutMinutes, machineId: claim.machineId, executionMode, machineNonce });
           return {
             outcome: result.outcome, runId: result.runId, runUrl: result.runUrl,
             jobId: result.jobId, executionMode: result.executionMode,
             machineId: result.machineId ?? null, created: result.created === true,
+            ...(result.app !== undefined && { app: result.app }),
             ...(result.replaced !== undefined && { replaced: result.replaced }),
           };
         },
@@ -550,8 +567,10 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       dispatched = dispatchResult;
 
       // One-way and idempotent in the object; a replay after a crash here sends it again.
-      if (dispatchResult.created && dispatchResult.machineId) {
+      // A reuse that carries the app also sends it, so a machine recorded without an app gets one.
+      if (dispatchResult.machineId && (dispatchResult.created || dispatchResult.app !== undefined)) {
         ctx.objectSendClient(FlyMachineProfile, "kg-refresh").attach({ dispatchId, machineId: dispatchResult.machineId, attempt,
+          ...(dispatchResult.app !== undefined && { app: dispatchResult.app }),
           ...(dispatchResult.replaced !== undefined && { replaces: dispatchResult.replaced }) });
       }
 
