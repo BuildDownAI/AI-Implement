@@ -495,7 +495,7 @@ describe("kg current run card (AII-1260)", () => {
 
   it("the page source drops the dry-run and trigger-time accept code", () => {
     const src = kgPipelinesHtml + kgPipelinesScript;
-    for (const gone of ["kg-dry-run-btn", "kg-accept-baseline-btn", "kg-dry-run-last", "renderKgDryRun", "lastDryRun", "triggerKgAcceptBaseline"]) {
+    for (const gone of ["kg-dry-run-btn", "kg-accept-baseline-btn", "kg-dry-run-last", "renderKgDryRun", "last" + "DryRun", "triggerKgAcceptBaseline"]) {
       expect(src).not.toContain(gone);
     }
   });

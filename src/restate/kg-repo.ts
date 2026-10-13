@@ -81,10 +81,6 @@ const recordOutcomeInputSchema = z.object({
   outcome: z.custom<RefreshOutcome>((v) => typeof v === "object" && v !== null),
 }).strict();
 
-const recordAdminDryRunInputSchema = z.object({
-  outcome: z.custom<RefreshOutcome>((v) => typeof v === "object" && v !== null),
-}).strict();
-
 const leaseInputSchema = z.object({ triggerId: z.string().min(1) }).strict();
 
 const extendInputSchema = z.object({ triggerId: z.string().min(1), until: z.number() }).strict();
@@ -235,14 +231,9 @@ export function createKgRepo(deps: KgRepoDependencies) {
     ctx.set<StoredDryRunOutcome>(stateKey, { sha: report.sha, outcome });
   }
 
-  /** Stores the last dry-run that had no report target (admin page or tool), under one key; last write wins. */
-  async function recordAdminDryRun(ctx: ObjectContext, input: { outcome: RefreshOutcome }): Promise<void> {
-    ctx.set<RefreshOutcome>("lastAdminDryRun", input.outcome);
-  }
-
-  async function lastAdminDryRun(ctx: ObjectSharedContext): Promise<RefreshOutcome | null> {
-    return (await ctx.get<RefreshOutcome>("lastAdminDryRun")) ?? null;
-  }
+  // remove after 2026-11-13: a dry-run workflow in flight at deploy replays its send to this
+  // handler, and a send to a missing handler fails that invocation. It stores nothing.
+  async function recordAdminDryRun(_ctx: ObjectContext): Promise<void> {}
 
   async function dryRunOutcome(ctx: ObjectSharedContext, input: KgRepoPrInput): Promise<StoredDryRunOutcome | null> {
     return (await ctx.get<StoredDryRunOutcome>(outcomeStateKey(input.repo, input.prNumber))) ?? null;
@@ -287,8 +278,7 @@ export function createKgRepo(deps: KgRepoDependencies) {
       expire: restate.handlers.object.exclusive({ input: serde.zod(leaseInputSchema), ingressPrivate: true }, expire),
       extend: restate.handlers.object.exclusive({ input: serde.zod(extendInputSchema), ingressPrivate: true }, extend),
       recordDryRunOutcome: restate.handlers.object.exclusive({ input: serde.zod(recordOutcomeInputSchema), ingressPrivate: true }, recordDryRunOutcome),
-      recordAdminDryRun: restate.handlers.object.exclusive({ input: serde.zod(recordAdminDryRunInputSchema), ingressPrivate: true }, recordAdminDryRun),
-      lastAdminDryRun: restate.handlers.object.shared(lastAdminDryRun),
+      recordAdminDryRun: restate.handlers.object.exclusive({ ingressPrivate: true }, recordAdminDryRun),
       dryRunOutcome: restate.handlers.object.shared({ input: serde.zod(prInputSchema) }, dryRunOutcome),
       forgetPr: restate.handlers.object.exclusive({ input: serde.zod(prInputSchema) }, forgetPr),
       status: restate.handlers.object.shared(status),

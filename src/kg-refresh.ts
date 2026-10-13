@@ -189,8 +189,6 @@ export interface KgRefreshStatus {
   sidecar: SidecarHealth;
   servedStamp: string | null;
   lastRefresh: RefreshOutcome | null;
-  /** The last dry-run with no PR report target (admin page or tool); never written to `lastRefresh`. */
-  lastDryRun: { ok: boolean; at: number; detail: string; partTable?: Array<{ part: string; prev: string; new: string }> } | null;
   stage: KgRefreshStage;
   /** The in-flight run's step and open decisions; `null` with no run in flight. */
   currentRun: {

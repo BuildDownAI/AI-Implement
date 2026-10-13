@@ -292,17 +292,12 @@ A Restate cancel of the `run` invocation (from the Restate UI or the admin API) 
 
 ### Dry run (AII-632)
 
-`trigger_kg_refresh { dryRun: true }` (the MCP tool, admin role) dispatches the same runner job
-as a normal trigger, with the push skipped: every guard in `kg-snapshot-push` still runs against
-the freshly ingested snapshot, but nothing is committed or pushed. The verdict and the per-part
-line-count table land on `get_kg_status` as `lastRefresh.dryRun`, `lastRefresh.detail`
-(`"dry-run: guard passed: ..."` / `"dry-run: guard refused: ..."` / `"dry-run: failed: ..."`), and
-`lastRefresh.partTable`. `servedStamp` and `current/` never change, and `stage` is restored to
-whatever it held before the dispatch rather than advancing through `staging`/`serving`/`reverted`.
-A dry-run and a real run of the same KG head print the same part table. The same dry-run is
-reachable from the admin REST route, `POST /api/kg/refresh` with body `{ "dryRun": true }` (the
-response echoes `dryRun` beside the trigger's fields; no body is the unchanged real refresh). The
-Knowledge Graph Pipelines page has no dry-run button and no last-dry-run table. A guard refusal carries the same
+The admin dry run is removed: `trigger_kg_refresh` and `POST /api/kg/refresh` refuse `dryRun: true`
+with `option-removed` (a held run at the decision gate is the preview). The only dry run left is the
+KG-repo PR check below: the same runner job with the push skipped, so every guard in
+`kg-snapshot-push` still runs against the freshly ingested snapshot but nothing is committed or
+pushed. `servedStamp` and `current/` never change, and `stage` is restored to whatever it held before
+the dispatch. A dry-run and a real run of the same KG head print the same part table. A guard refusal carries the same
 `lastRefresh.partTable` and a part-naming `detail` on `get_kg_status` whether it came from a
 dry-run or a real (non-dry-run) refresh (AII-638) — only a real success omits `guardVerdict`/
 `partTable`, since it reports a snapshot commit instead.
@@ -338,8 +333,8 @@ does. A PR that changes nothing guard-relevant — docs, an unrelated code path 
 all.
 
 The verdict always lands as a sticky PR comment headed `## kg-refresh dry-run — <sha>`, updated in
-place (not duplicated) on every subsequent push, carrying the same per-part line-count table
-`get_kg_status` shows for a manual dry run. A `kg-refresh/dry-run` **commit status** is set alongside
+place (not duplicated) on every subsequent push, carrying the per-part line-count table
+the runner prints. A `kg-refresh/dry-run` **commit status** is set alongside
 it, but only when the GitHub App has been granted `statuses: write` on the PR's repo — see "Manual
 step" below. Losing that grant degrades the check to comment-only; it never blocks the dispatch or
 the PR.
@@ -560,10 +555,10 @@ still recognized and handled as a dry run instead of falling through to the real
 
 ### Accept-new-baseline plumbing (AII-628)
 
-`trigger_kg_refresh { acceptNewBaseline: true }` (the MCP tool, admin role) and `POST /api/kg/refresh`
-with body `{ "acceptNewBaseline": true }` both carry the same flag through the same envelope path `dryRun` already established: `trigger(opts)`
-sets `kgAcceptNewBaseline: true` on the `RunConfigV1` it builds, along with `kgBaselineActor` (the
-caller's email — from `identity.email` on the MCP path, from the admin session on the REST path) —
+The trigger-time accept is removed at the operator doors: `trigger_kg_refresh` and `POST /api/kg/refresh`
+refuse `acceptNewBaseline: true` with `option-removed`. The runner and envelope plumbing below
+(`kgAcceptNewBaseline`, `kgBaselineActor`) remain until AII-1253 / AII-1264. `trigger(opts)`
+sets `kgAcceptNewBaseline: true` on the `RunConfigV1` it builds, along with `kgBaselineActor`;
 `resolveKgRefreshInputs` in `kg-refresh-run.ts` decodes both back out and puts them on
 `PipelineContextData` as `kgAcceptNewBaseline`/`kgBaselineActor`, and `pipeline-loader.ts` forwards
 them into `kg-snapshot-push`'s `acceptNewBaseline`/`baselineActor` inputs, the same shape as

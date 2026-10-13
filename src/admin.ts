@@ -513,7 +513,7 @@ export interface AdminDeps {
   selfDeployTarget?: SelfDeployTarget | null;
   /** The KG refresh rail (AII-426). Absent when no KG source repo is configured. */
   kgRefresh?: {
-    trigger(opts?: { dryRun?: boolean; ref?: string; acceptNewBaseline?: boolean; actorEmail?: string }): Promise<{ status: number; body: Record<string, unknown> }>;
+    trigger(opts?: { ref?: string; actorEmail?: string }): Promise<{ status: number; body: Record<string, unknown> }>;
     status(): Promise<{ status: number; body: unknown }>;
     /** The operator-cancel path: asks the KgRefresh workflow to cancel and confirm termination (AII-901). */
     cancel(opts: { jobId: number; dispatchId?: string | null; reason: string }): Promise<{ status: number; body: Record<string, unknown> }>;
@@ -794,39 +794,29 @@ export function handleAdminRequest(
         json(res, 501, { error: "KG refresh is not configured" });
         return true;
       }
-      // AII-635: an optional JSON body `{ dryRun?: boolean }` selects the dry-run mode
-      // (AII-632): same runner job, push skipped, guard table on the status. No body,
-      // or `dryRun: false`, is the unchanged real refresh. The response echoes `dryRun`
-      // beside the trigger's own fields so the caller can tell which mode ran.
-      // AII-628: `{ acceptNewBaseline?: boolean }` carries the one-shot content-guard
-      // override through to the dispatched runner, tagged with this session's identity
-      // for the guard-override log line and the refresh PR's ### Baseline section.
+      // The admin dry-run and the trigger-time accept are gone (a held run is the preview, and
+      // accepting is a decision on that run). A body asking for either is refused: ignoring the
+      // key would run a real refresh that pushes to the KG repo for a caller who asked for a dry-run.
       const kgRefresh = deps.kgRefresh;
       readBody(req).then(
         (raw) => {
-          let dryRun = false;
-          let acceptNewBaseline = false;
           if (raw.trim()) {
+            let parsed: { dryRun?: unknown; acceptNewBaseline?: unknown } | null;
             try {
-              const parsed = JSON.parse(raw) as { dryRun?: unknown; acceptNewBaseline?: unknown };
-              dryRun = parsed.dryRun === true;
-              acceptNewBaseline = parsed.acceptNewBaseline === true;
+              parsed = JSON.parse(raw) as { dryRun?: unknown; acceptNewBaseline?: unknown } | null;
             } catch {
               json(res, 400, { error: "Invalid JSON body" });
               return;
             }
+            for (const option of ["dryRun", "acceptNewBaseline"] as const) {
+              if (parsed && typeof parsed === "object" && parsed[option] === true) {
+                json(res, 400, { error: "option-removed", option });
+                return;
+              }
+            }
           }
-          const opts: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string } = {};
-          if (dryRun) opts.dryRun = true;
-          if (acceptNewBaseline) {
-            opts.acceptNewBaseline = true;
-            // An access-code session has no email; name it so the log line and the
-            // ### Baseline section never read "unknown" for a real press.
-            opts.actorEmail = gate.identity?.email ?? "access-code session";
-          }
-          const pending = (dryRun || acceptNewBaseline) ? kgRefresh.trigger(opts) : kgRefresh.trigger();
-          return pending.then(
-            (r) => json(res, r.status, r.status === 503 ? r.body : { ...r.body, dryRun, acceptNewBaseline }),
+          return kgRefresh.trigger().then(
+            (r) => json(res, r.status, r.body),
             (err) => json(res, 500, { error: String(err) }),
           );
         },
