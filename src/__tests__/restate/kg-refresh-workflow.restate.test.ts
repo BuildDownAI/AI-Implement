@@ -251,6 +251,7 @@ describe("KgRefresh durable workflow", () => {
     loadSnapshotSha: () => loadSnapshotShaImpl(),
     mergePullRequestFn: mergePullRequestFn as unknown as KgRailDeps["mergePullRequestFn"],
     closePullRequestFn: closePullRequestFn as unknown as KgRailDeps["closePullRequestFn"],
+    getPullRequestStateFn: (async () => ({ merged: true, state: "closed", headRef: null, headSha: null })) as unknown as KgRailDeps["getPullRequestStateFn"],
     deleteBranchFn: deleteBranchFn as unknown as KgRailDeps["deleteBranchFn"],
     postPrCommentFn: postPrCommentFn as unknown as KgRailDeps["postPrCommentFn"],
     postOrUpdateStickyCommentFn: postOrUpdateStickyCommentFn as unknown as KgRailDeps["postOrUpdateStickyCommentFn"],
@@ -3527,6 +3528,21 @@ describe("KgRefresh durable workflow", () => {
         expect(postPrCommentFn.mock.calls.length - beforeComments).toBe(1);
         expect(await closeRowFor(triggerId)).toMatchObject({ conclusion: "decision_timeout" });
         await eventually(() => countSends(env, "FlyMachineProfile", "kg-refresh", "release"), (n) => n >= 1, { label: "release" });
+      },
+      60_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "AII-1284: the gate wait of a held run journals O(1) sleep entries, not one per tick (%s)",
+      async (label) => {
+        const env = shortHeldEnvs.get(label)!;
+        const triggerId = await holdRun(env, { awaitGate: false });
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`);
+        const entries = await journalEntries(env.adminAPIBaseUrl(), rows[0].id as string);
+        const sleeps = entries.filter((e) => /sleep/i.test(String(e.entry_type ?? e.type ?? "")));
+        // The 1.5 s hold at a 100 ms tick would journal ~15 sleeps if it still ticked; the fixed ones (bootstrap, lease) stay under 6.
+        expect(sleeps.length).toBeLessThanOrEqual(6);
       },
       60_000,
     );

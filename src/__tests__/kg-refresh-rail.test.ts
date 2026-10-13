@@ -69,6 +69,7 @@ describe("kg-refresh-rail", () => {
       loadSnapshotSha: vi.fn(() => null) as never,
       mergePullRequestFn: vi.fn(async () => "merged") as never,
       closePullRequestFn: vi.fn(async () => {}) as never,
+      getPullRequestStateFn: vi.fn(async () => null) as never,
       deleteBranchFn: vi.fn(async () => {}) as never,
       postPrCommentFn: vi.fn(async () => {}) as never,
       postOrUpdateStickyCommentFn: vi.fn(async () => {}) as never,
@@ -455,6 +456,24 @@ describe("kg-refresh-rail", () => {
       expect(postPrCommentFn).toHaveBeenCalledTimes(1);
       expect(closePullRequestFn).toHaveBeenCalledTimes(1);
       expect(deleteBranchFn).toHaveBeenCalledTimes(1);
+    });
+
+    it("closeSnapshotPr treats an already merged or closed PR as done", async () => {
+      const postPrCommentFn = vi.fn(async () => {});
+      const closePullRequestFn = vi.fn(async () => { throw new Error("422 already merged"); });
+      const getPullRequestStateFn = vi.fn(async () => ({ merged: true, state: "closed", headRef: null, headSha: null }));
+      const deps = makeDeps({ postPrCommentFn: postPrCommentFn as never, closePullRequestFn: closePullRequestFn as never, getPullRequestStateFn: getPullRequestStateFn as never });
+      await expect(closeSnapshotPr(deps, "TestOrg", "test-kg", 9, "canary")).resolves.toBeUndefined();
+      expect(postPrCommentFn).toHaveBeenCalledTimes(1);
+    });
+
+    it("closeSnapshotPr throws a real close failure while the PR is still open, without commenting", async () => {
+      const postPrCommentFn = vi.fn(async () => {});
+      const closePullRequestFn = vi.fn(async () => { throw new Error("502 bad gateway"); });
+      const getPullRequestStateFn = vi.fn(async () => ({ merged: false, state: "open", headRef: null, headSha: null }));
+      const deps = makeDeps({ postPrCommentFn: postPrCommentFn as never, closePullRequestFn: closePullRequestFn as never, getPullRequestStateFn: getPullRequestStateFn as never });
+      await expect(closeSnapshotPr(deps, "TestOrg", "test-kg", 9, "canary")).rejects.toThrow("502");
+      expect(postPrCommentFn).not.toHaveBeenCalled();
     });
 
     it("postBaselineAcceptNote mints a scoped token and comments naming the actor", async () => {

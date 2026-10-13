@@ -187,6 +187,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
       setCommitStatusFn: (async () => {}) as unknown as KgRailDeps["setCommitStatusFn"],
       mergePullRequestFn: (async () => { mergeCalls++; return "merged"; }) as unknown as KgRailDeps["mergePullRequestFn"],
       closePullRequestFn: (async () => {}) as unknown as KgRailDeps["closePullRequestFn"],
+      getPullRequestStateFn: (async () => null) as unknown as KgRailDeps["getPullRequestStateFn"],
       deleteBranchFn: (async () => {}) as unknown as KgRailDeps["deleteBranchFn"],
     };
 

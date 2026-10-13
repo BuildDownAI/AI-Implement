@@ -258,6 +258,7 @@ export interface KgRefreshProductionInput {
   setCommitStatusFn: KgRailDeps["setCommitStatusFn"];
   mergePullRequestFn: KgRailDeps["mergePullRequestFn"];
   closePullRequestFn: KgRailDeps["closePullRequestFn"];
+  getPullRequestStateFn: KgRailDeps["getPullRequestStateFn"];
   deleteBranchFn: KgRailDeps["deleteBranchFn"];
   /** The sender deps the backends need and `config` cannot supply (AII-1148). */
   getInstallationToken: KgRefreshSenderDeps["getInstallationToken"];
@@ -369,6 +370,7 @@ export function createProductionKgRefreshServices(
     loadSnapshotSha: defaultLoadSnapshotSha,
     mergePullRequestFn: input.mergePullRequestFn,
     closePullRequestFn: input.closePullRequestFn,
+    getPullRequestStateFn: input.getPullRequestStateFn,
     deleteBranchFn: input.deleteBranchFn,
     postPrCommentFn: input.postPrCommentFn,
     postOrUpdateStickyCommentFn: input.postOrUpdateStickyCommentFn,

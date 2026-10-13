@@ -438,6 +438,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         await ctx.run("close-snapshot-pr", () => closeSnapshotPr(deps.rail, owner, repoName, number, gate, branch), { maxRetryAttempts: 3 });
       } catch (err) {
         if (restate.internal.isSuspendedError(err)) throw err;
+        if (err instanceof restate.TerminalError && err.code === 409) throw err; // a Restate cancel, not a close failure
         ctx.console.error(`[KgRefresh] closing snapshot PR #${number} failed for ${triggerId}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
