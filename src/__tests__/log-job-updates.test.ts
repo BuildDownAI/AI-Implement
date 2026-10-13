@@ -68,6 +68,14 @@ describe("updateJobStatus CASE guard — runner_approved conclusion survives mon
     expect(job?.conclusion).toBe("operator_cancelled");
   });
 
+  it("preserves external_review_pending against monitor writes (AII-1304)", () => {
+    const id = log.appendLog({ issueId: "i-pend", executionMode: "github-actions" });
+    log.updateJobStatus(id, "completed", "external_review_pending", "https://github.com/o/r/pull/11");
+    log.updateJobStatus(id, "failed", "failure", null);
+    log.updateJobStatus(id, "completed", "success", null);
+    expect(log.getJobById(id)?.conclusion).toBe("external_review_pending");
+  });
+
   it("updates conclusion when not in the protected set", () => {
     const id = log.appendLog({ issueId: "i-plain", executionMode: "github-actions" });
     log.updateJobStatus(id, "completed", "success", null);

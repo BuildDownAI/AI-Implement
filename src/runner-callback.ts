@@ -7,6 +7,7 @@ import {
   updateJobPrUrl,
   updateJobStatus,
   type Job,
+  getGapFillRowsAwaitingLateReview,
 } from "./log.js";
 import { redactStepCredentials } from "./pipeline/step-redaction.js";
 import type { Step } from "./pipeline/types.js";
@@ -1586,4 +1587,32 @@ export async function handleRunnerPlanningContext(
     );
     return { status: 200, body: { planningContext: "" } };
   }
+}
+
+const LATE_REVIEW_RESUBMIT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * AII-1304: a gap-fill success submits LateExternalReview once; when Restate was not ready the
+ * row stays `external_review_pending`. Each poll tick with Restate ready re-submits those rows
+ * (completed within 24 h). The workflow key is the dispatch id, so a repeat submit is a no-op.
+ */
+export async function resubmitPendingGapFillReviews(opts: {
+  ready: () => boolean;
+  submit: (input: { dispatchId: string; owner: string; repo: string; prNumber: number; prUrl: string; gapFill: true }) => Promise<void> | void;
+  now?: number;
+}): Promise<number> {
+  if (!opts.ready()) return 0;
+  let submitted = 0;
+  for (const job of getGapFillRowsAwaitingLateReview((opts.now ?? Date.now()) - LATE_REVIEW_RESUBMIT_WINDOW_MS)) {
+    const target = parsePrUrlTarget(job.prUrl!);
+    if (!target) continue;
+    console.log(`[late-review-sweep] re-submitting LateExternalReview dispatch=${job.dispatchId} pr=${job.prUrl}`);
+    try {
+      await opts.submit({ dispatchId: job.dispatchId!, ...target, prUrl: job.prUrl!, gapFill: true });
+      submitted++;
+    } catch (err) {
+      console.warn(`[late-review-sweep] submit failed dispatch=${job.dispatchId}:`, err);
+    }
+  }
+  return submitted;
 }
