@@ -329,8 +329,7 @@ template repo", seeded once from `KG_BASE_REPO`), or whose head branch matches `
 `sync/upstream-*` (an upstream merge, guard-relevant regardless of which files it happens to touch),
 gets the same dry run described above run against the PR's head instead of the default branch: the
 webhook (`opened` / `synchronize`) dispatches `trigger({ dryRun: true, ref: <head branch>, report })`,
-which runs `kg-snapshot-push`'s guards without committing or pushing, exactly as a manual dry run
-does. A PR that changes nothing guard-relevant — docs, an unrelated code path — gets no dispatch at
+which runs `kg-snapshot-push`'s guards without committing or pushing. A PR that changes nothing guard-relevant — docs, an unrelated code path — gets no dispatch at
 all.
 
 The verdict always lands as a sticky PR comment headed `## kg-refresh dry-run — <sha>`, updated in
