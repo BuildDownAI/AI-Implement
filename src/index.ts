@@ -158,6 +158,7 @@ import { callTool, callToolAsSystem } from "./restate/tools-client.js";
 import { makeKgRefresh, migrateLegacyDryRunOutcomes, runKgRefreshPreflight, defaultFetchDefaultBranch, defaultFetchSnapshotCommitSha, defaultMaterialize, defaultMcpToolCall, defaultPersistLastRefresh, defaultLoadLastRefresh } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
 import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
+import { scrubOperatorLegacyTokens } from "./restate/operator-legacy-scrub.js";
 
 /**
  * The reaper's helper callbacks. The KgRefresh workflow owns kg-refresh rows, so the
@@ -5170,6 +5171,7 @@ async function main(): Promise<void> {
     registerRestateEndpoint,
     onRegistered: async () => {
       sweepOnRegistered(config);
+      await scrubOperatorLegacyTokens();
       await seedRunnerBackends();
       await refreshRunnerBackendCache();
       await bootReconciliation.onRegistered();
