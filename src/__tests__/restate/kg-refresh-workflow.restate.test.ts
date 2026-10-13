@@ -3364,7 +3364,7 @@ describe("KgRefresh durable workflow", () => {
     );
 
     const decideTool = async (env: RestateEnvironment, action: string) => {
-      const result = await callToolAsSystem("decide_kg_refresh", { action }, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true });
+      const result = await callToolAsSystem("decide_kg_refresh", { action }, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true, restateReady: () => true });
       if (result.status !== "ok") throw new Error("decide_kg_refresh unavailable");
       return { isError: result.isError === true, text: result.content[0].text };
     };

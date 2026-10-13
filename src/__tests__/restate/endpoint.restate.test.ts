@@ -19,6 +19,9 @@ import { createEndpointHandler } from "@restatedev/restate-sdk/node";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { RESTATE_SERVICES, queryNonCompletedInvocations, register, restateBindAddress, startRestateEndpoint } from "../../restate/endpoint.js";
 import { orchestratorTools } from "../../restate/tools.js";
+import { callTool } from "../../restate/tools-client.js";
+import { resetRestateStatus, setRestateStatus } from "../../restate/status.js";
+import { systemCaller } from "../../mcp-identity.js";
 import * as dedup from "../../dedup.js";
 import { initSettingsTable } from "../../runner-mode.js";
 import { startBinaryEnvironment, type BinaryEnvironment } from "./binary-environment.js";
@@ -167,6 +170,25 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
 
       const declined = await register({ adminBaseUrl });
       expect(declined.outcome).toBe("declined-conflict");
+
+      // AII-1281: in the declined window the registered deployment is the old one, so a tool call
+      // that reached a handler it lacks would retry forever and pin the drain. callTool answers
+      // unavailable instead, and starts no invocation.
+      setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "declined-conflict" } });
+      try {
+        const before = await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri);
+        const spy = vi.fn(fetch);
+        const answer = await callTool("get_tenant_health", {}, systemCaller(), {
+          ingressBaseUrl,
+          fetchImpl: spy as unknown as typeof fetch,
+          permitsExternalCall: () => true,
+        });
+        expect(answer).toEqual({ status: "unavailable" });
+        expect(spy).not.toHaveBeenCalled();
+        expect(await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri)).toBe(before);
+      } finally {
+        resetRestateStatus();
+      }
 
       // Let the in-flight invocation complete — the old deployment now has zero
       // non-completed invocations pinned to it.
