@@ -1697,7 +1697,7 @@ describe("review feedback ingestion", () => {
     const { req, res } = makeRequest(SECRET, "issue_comment", {
       action: "created",
       comment: {
-        body: "**Claude finished the review**\n\n### Issues\n- Real concern in src/x.ts that needs a change.\n\n**Merge readiness:** Ready to merge",
+        body: "**Claude finished the review**\n\n### Review\n\n### Issues\n- Real concern in src/x.ts that needs a change.\n\n**Merge readiness:** Ready to merge",
         html_url: "https://github.com/org/repo/issues/73#issuecomment-73",
         user: { login: "github-actions[bot]", type: "Bot" },
         created_at: new Date().toISOString(),
@@ -1713,7 +1713,7 @@ describe("review feedback ingestion", () => {
     webhook.handleGitHubWebhook(req as never, res as never, SECRET);
     await res.done;
 
-    expect(JSON.parse(res.body)).not.toEqual({ ignored: true, reason: "approved" });
+    expect(JSON.parse(res.body)).toMatchObject({ queued: true });
   });
 
   it("still enqueues an approve verdict that carries a blocking finding", async () => {
