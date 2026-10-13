@@ -25,7 +25,7 @@ import { createReviewFixAttempt } from "./review-fix-attempt.js";
 import { createReviewFixPR } from "./review-fix-pr.js";
 import type { RestateService } from "./endpoint.js";
 import type { LateExternalReviewInput } from "./late-external-review.js";
-import { getLatestWorkRowForPr, recordPendingAttemptReview } from "../log.js";
+import { clearPendingAttemptReview, getLatestWorkRowForPr, recordPendingAttemptReview } from "../log.js";
 
 export interface ReviewFixProductionConfig {
   githubAppId: string;
@@ -97,7 +97,7 @@ function dispositionsFor(attempt: PreparedReviewFixAttempt, result: ReviewFixRes
 export async function submitLateReviewForAttempt(
   scope: ScopedPrIdentity,
   attemptId: string,
-  submit: ((input: LateExternalReviewInput) => Promise<void>) | undefined,
+  submit: ((input: LateExternalReviewInput) => Promise<boolean | void>) | undefined,
 ): Promise<void> {
   if (!submit) return;
   try {
@@ -110,7 +110,9 @@ export async function submitLateReviewForAttempt(
     }
     // Held for the poll sweep (resubmitPendingGapFillReviews) in case Restate is not ready and the hook only logs.
     recordPendingAttemptReview(attemptId, row.dispatchId, prUrl);
-    await submit({ dispatchId: row.dispatchId, owner, repo, prNumber: scope.prNumber, prUrl, gapFill: true, attemptId });
+    const settled = await submit({ dispatchId: row.dispatchId, owner, repo, prNumber: scope.prNumber, prUrl, gapFill: true, attemptId });
+    // Accepted or already running: the workflow key is the idempotency, so the retry record is spent.
+    if (settled !== false) clearPendingAttemptReview(attemptId);
   } catch (err) {
     console.log(`[review-fix] Late external review submit failed for attempt ${attemptId}: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -120,7 +122,7 @@ export function createProductionReviewFixServices(
   config: ReviewFixProductionConfig,
   registry: ProviderRegistry,
   store = new SqliteReviewFixAttemptStore(),
-  submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<void>,
+  submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<boolean | void>,
 ): RestateService[] {
   const credentials = createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey);
   const github = createReviewFixGithubAdapter({ credentials });

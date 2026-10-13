@@ -15,11 +15,13 @@ vi.mock("../runner-mode.js", () => ({
 const getLatestWorkRowForPr = vi.fn();
 const stampJobApproved = vi.fn();
 const recordPendingAttemptReview = vi.fn();
+const clearPendingAttemptReview = vi.fn();
 vi.mock("../log.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../log.js")>()),
   getLatestWorkRowForPr: (...args: unknown[]) => getLatestWorkRowForPr(...args),
   stampJobApproved: (...args: unknown[]) => stampJobApproved(...args),
   recordPendingAttemptReview: (...args: unknown[]) => recordPendingAttemptReview(...args),
+  clearPendingAttemptReview: (...args: unknown[]) => clearPendingAttemptReview(...args),
 }));
 vi.mock("../review-fix-queue.js", () => ({
   acceptReviewFixWebhookEvent: vi.fn(),
@@ -71,6 +73,15 @@ describe("review-fix production delegation", () => {
         prUrl: "https://github.com/acme/app/pull/7", gapFill: true, attemptId: "att-1" });
       expect(stampJobApproved).not.toHaveBeenCalled();
       expect(recordPendingAttemptReview).toHaveBeenCalledWith("att-1", "d-9", "https://github.com/acme/app/pull/7");
+    });
+
+    it("clears the pending record only when the submit settled, and keeps it when the hook reports false", async () => {
+      getLatestWorkRowForPr.mockReturnValue({ id: 9, dispatchId: "d-9" });
+      clearPendingAttemptReview.mockClear();
+      await submitLateReviewForAttempt(repoScope, "att-1", vi.fn().mockResolvedValue(false));
+      expect(clearPendingAttemptReview).not.toHaveBeenCalled();
+      await submitLateReviewForAttempt(repoScope, "att-1", vi.fn().mockResolvedValue(true));
+      expect(clearPendingAttemptReview).toHaveBeenCalledWith("att-1");
     });
 
     it("submits nothing and logs when the PR has no run row", async () => {

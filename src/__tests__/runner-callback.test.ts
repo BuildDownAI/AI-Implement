@@ -1358,6 +1358,14 @@ describe("handleRunnerResult — implementation", () => {
       expect(submit).toHaveBeenCalledTimes(1);
     });
 
+    it("keeps a pending review-fix attempt when the hook reports the submit did not settle (AII-1307)", async () => {
+      log.recordPendingAttemptReview("att-2", "d-att2", "https://github.com/o/r/pull/7", NOW - HOUR);
+      const submit = vi.fn(async () => false);
+      expect(await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW })).toBe(0);
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
+      expect(submit).toHaveBeenCalledTimes(2);
+    });
+
     it("respects the 24 h window", async () => {
       const old = pendingRow("i-old");
       const fresh = pendingRow("i-fresh");

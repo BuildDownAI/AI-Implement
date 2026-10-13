@@ -211,7 +211,7 @@ export interface HandleRunnerResultInput {
    * result that ended `external_review_pending`. The hook itself decides whether Restate is ready;
    * an error it throws is logged and does not change the response.
    */
-  submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<void>;
+  submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<boolean | void>;
 }
 
 export interface HandleRunnerResultOutput {
@@ -1600,7 +1600,7 @@ const LATE_REVIEW_RESUBMIT_WINDOW_MS = 24 * 60 * 60 * 1000;
  */
 export async function resubmitPendingGapFillReviews(opts: {
   ready: () => boolean;
-  submit: (input: { dispatchId: string; owner: string; repo: string; prNumber: number; prUrl: string; gapFill: true; attemptId?: string }) => Promise<void> | void;
+  submit: (input: { dispatchId: string; owner: string; repo: string; prNumber: number; prUrl: string; gapFill: true; attemptId?: string }) => Promise<boolean | void> | boolean | void;
   now?: number;
 }): Promise<number> {
   if (!opts.ready()) return 0;
@@ -1622,7 +1622,9 @@ export async function resubmitPendingGapFillReviews(opts: {
     if (!target) continue;
     console.log(`[late-review-sweep] re-submitting LateExternalReview dispatch=${pending.dispatchId} attempt=${pending.attemptId} pr=${pending.prUrl}`);
     try {
-      await opts.submit({ dispatchId: pending.dispatchId, ...target, prUrl: pending.prUrl, gapFill: true, attemptId: pending.attemptId });
+      const settled = await opts.submit({ dispatchId: pending.dispatchId, ...target, prUrl: pending.prUrl, gapFill: true, attemptId: pending.attemptId });
+      // `false` = the hook could not reach Restate; keep the record for the next tick.
+      if (settled === false) continue;
       clearPendingAttemptReview(pending.attemptId);
       submitted++;
     } catch (err) {

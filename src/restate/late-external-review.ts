@@ -342,16 +342,21 @@ export interface LateExternalReviewSubmitHookDeps {
   restateReady: () => boolean;
 }
 
-/** The hook `handleRunnerResult` calls. One log line, no retry; a conflict (a repeated callback) counts as success. */
+/**
+ * The hook `handleRunnerResult` calls. One log line, no retry; a conflict (a repeated callback) counts as success.
+ * Resolves `false` when the submit did not reach Restate (not ready, or `unavailable`) so a caller that keeps a
+ * retry record can keep it; `true` when the workflow was accepted or already exists.
+ */
 export function createLateExternalReviewSubmitHook(
   deps: LateExternalReviewSubmitHookDeps,
-): (input: LateExternalReviewInput) => Promise<void> {
+): (input: LateExternalReviewInput) => Promise<boolean> {
   return async (input) => {
     if (!deps.restateReady()) {
       console.log(`[late-external-review] Restate not ready, not submitting dispatch=${input.dispatchId}`);
-      return;
+      return false;
     }
     const result = await deps.ingress.submit(input);
     console.log(`[late-external-review] submit ${result} dispatch=${input.dispatchId} pr=${input.owner}/${input.repo}#${input.prNumber}`);
+    return result !== "unavailable";
   };
 }
