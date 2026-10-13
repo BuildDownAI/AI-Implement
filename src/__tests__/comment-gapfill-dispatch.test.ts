@@ -1,7 +1,4 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import type * as DedupModule from "../dedup.js";
 import type * as QueueModule from "../comment-gapfill-queue.js";
 import type * as LogModule from "../log.js";
@@ -10,7 +7,11 @@ import type * as DrainModule from "../comment-gapfill-drain.js";
 import type * as FlyMachinesModule from "../fly-machines.js";
 import type * as RepoImageModule from "../repo-image.js";
 import type * as AdmissionModule from "../dispatch-admission.js";
+import type * as OrchestratorSettingsModule from "../orchestrator-settings.js";
 import type { RepoMapping } from "../config.js";
+import { makeMapping } from "./helpers/builders.js";
+import { fakeFetch, type Reply } from "./helpers/fake-fetch.js";
+import { testDb } from "./helpers/test-db.js";
 
 type DrainInput = DrainModule.DrainCommentGapfillsInput;
 type CreateMachineFn = typeof FlyMachinesModule.createMachine;
@@ -54,27 +55,28 @@ vi.mock("../local-gapfill.js", async (importOriginal) => {
   };
 });
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let queue: typeof QueueModule;
 let log: typeof LogModule;
 let breaker: typeof BreakerModule;
 let drain: typeof DrainModule;
 let admission: typeof AdmissionModule;
+let settings: typeof OrchestratorSettingsModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `comment-gapfill-dispatch-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  queue = await import("../comment-gapfill-queue.js");
-  log = await import("../log.js");
-  breaker = await import("../dispatch-breaker.js");
-  drain = await import("../comment-gapfill-drain.js");
-  admission = await import("../dispatch-admission.js");
+  ({ dedup, queue, log, breaker, drain, admission, settings } = (
+    await testDb({
+      modules: {
+        dedup: () => import("../dedup.js"),
+        queue: () => import("../comment-gapfill-queue.js"),
+        log: () => import("../log.js"),
+        breaker: () => import("../dispatch-breaker.js"),
+        drain: () => import("../comment-gapfill-drain.js"),
+        admission: () => import("../dispatch-admission.js"),
+        settings: () => import("../orchestrator-settings.js"),
+      },
+    })
+  ).modules);
   flyMocks.createMachine.mockResolvedValue({
     id: "fly-machine-1",
     name: "fly-machine-1",
@@ -93,30 +95,9 @@ beforeEach(async () => {
     sessionToken: "session-token-1",
     runConfig: {} as never,
   });
-  // Initialize tables
-  dedup.getDb();
-  log.initLogTable();
-  breaker.initDispatchBreakerTable();
 });
 
-afterEach(async () => {
-  // A test that calls setRetryPolicy() writes to the shared `settings` row; reset
-  // it explicitly rather than relying on dbPath rotation to isolate it. Most tests
-  // in this file never initialize the settings table, so a missing-table error
-  // here is expected and not a cleanup failure.
-  const { setRetryPolicy } = await import("../orchestrator-settings.js");
-  try {
-    setRetryPolicy(null);
-  } catch {
-    /* settings table not initialized in this test */
-  }
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
-  vi.unstubAllGlobals();
+afterEach(() => {
   vi.restoreAllMocks();
   flyMocks.createMachine.mockReset();
   flyMocks.listAppSecrets.mockReset();
@@ -124,50 +105,14 @@ afterEach(async () => {
   localGapfillMocks.dispatchLocalGapfill.mockReset();
 });
 
-/** Stub the GitHub PR lookup the roll-up fallback performs (drain calls
+/** Fake the GitHub PR lookup the roll-up fallback performs (drain calls
  *  getPullRequestState directly, not through the injected deps). */
-function stubPrLookup(headRef: string | null): void {
-  vi.stubGlobal("fetch", vi.fn(async () => ({
-    ok: true,
-    json: async () => ({ merged: false, state: "open", head: headRef ? { ref: headRef } : undefined }),
-  }) as Response));
+function prLookup(prNumber: number, reply: Reply): void {
+  fakeFetch({ [`GET /repos/acme/billing/pulls/${prNumber}`]: [reply] }).install();
 }
 
-function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
-  return {
-    owner: "acme",
-    repo: "billing",
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: false,
-    planningWorkflowFile: "",
-    autoApprovePlans: true,
-    autoMerge: false,
-    extraEnv: {},
-    provider: "anthropic",
-    awsRegion: null,
-    ticketingProvider: "linear",
-    ticketingConfig: { kind: "linear" },
-    paused: false,
-    maxTurns: null,
-    maxIterations: null,
-    maxJobMinutes: null,
-    branchPrefix: null,
-    skillsRepo: null,
-    referenceRepos: null,
-    sensitiveAddPatterns: null,
-    sensitiveAllowPatterns: null,
-    dependencyTokenScope: null,
-    memoryProviderId: null,
-    reviewers: null,
-    reviewFixLifecycle: null,
-    ...overrides,
-  };
+function openPrWithHead(headRef: string): Reply {
+  return { json: { merged: false, state: "open", head: { ref: headRef } } };
 }
 
 function makeBaseDrainOpts(overrides: Partial<DrainInput> = {}): DrainInput {
@@ -343,7 +288,7 @@ describe("drainCommentGapfillQueue", () => {
     });
     // No dispatch_log row for PR #99, and the PR's head is not a grouping branch,
     // so the roll-up fallback finds nothing either.
-    stubPrLookup("feature/manual-branch");
+    prLookup(99, openPrWithHead("feature/manual-branch"));
 
     const dispatchSpy = vi.fn<DrainInput["dispatch"]>(async () => ({ success: true, status: 204 }));
     const postCommentSpy = vi.fn<DrainInput["postComment"]>(async () => undefined);
@@ -688,10 +633,7 @@ describe("drainCommentGapfillQueue", () => {
 
   it("carries the effective retry policy into run_config on the /ai-implement gap-fill drain (BAC-27113)", async () => {
     const { decodeRunConfig } = await import("../run-config.js");
-    const { setRetryPolicy } = await import("../orchestrator-settings.js");
-    const { initSettingsTable } = await import("../runner-mode.js");
-    initSettingsTable();
-    setRetryPolicy({ reviewMaxTurns: 77 });
+    settings.setRetryPolicy({ reviewMaxTurns: 77 });
 
     const mapping = makeMapping({ owner: "acme", repo: "billing" });
 
@@ -760,7 +702,7 @@ describe("roll-up PR fallback (grouping feature→base PRs have no dispatch row)
       commenter: "carol",
       instruction: "widen the create-demo form",
     });
-    stubPrLookup("ai-implement/feature/tsai-196");
+    prLookup(89, openPrWithHead("ai-implement/feature/tsai-196"));
 
     const dispatchSpy = vi.fn<DrainInput["dispatch"]>(async () => ({ success: true, status: 204 }));
     const postCommentSpy = vi.fn<DrainInput["postComment"]>(async () => undefined);
@@ -793,7 +735,7 @@ describe("roll-up PR fallback (grouping feature→base PRs have no dispatch row)
       commenter: "carol",
       instruction: "something",
     });
-    stubPrLookup("ai-implement/feature/tsai-999");
+    prLookup(89, openPrWithHead("ai-implement/feature/tsai-999"));
 
     const dispatchSpy = vi.fn<DrainInput["dispatch"]>(async () => ({ success: true, status: 204 }));
     const postCommentSpy = vi.fn<DrainInput["postComment"]>(async () => undefined);
@@ -819,7 +761,9 @@ describe("roll-up PR fallback (grouping feature→base PRs have no dispatch row)
       commenter: "carol",
       instruction: "something",
     });
-    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("network down"); }));
+    prLookup(89, () => {
+      throw new Error("network down");
+    });
 
     const dispatchSpy = vi.fn<DrainInput["dispatch"]>(async () => ({ success: true, status: 204 }));
     const postCommentSpy = vi.fn<DrainInput["postComment"]>(async () => undefined);

@@ -1,64 +1,49 @@
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type * as DedupModule from "../dedup.js";
-import type * as RunnerModeModule from "../runner-mode.js";
 import type * as OrchestratorSettingsModule from "../orchestrator-settings.js";
-import type * as LinearAppAuthModule from "../linear-app-auth.js";
 import type { LinearProvider as LinearProviderClass } from "../providers/linear.js";
+import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
+import { testDb } from "./helpers/test-db.js";
 
 // AII-694: the Linear provider reads its pickup label from the settings table
 // (default "AI-Implement") instead of a hardcoded module constant. This suite
-// exercises the provider/settings integration end-to-end with a mocked fetch,
+// exercises the provider/settings integration end-to-end with a faked Linear API,
 // the same pattern src/__tests__/providers/linear.test.ts uses.
 
-let dbPath: string;
-let dedup: typeof DedupModule;
-let runnerMode: typeof RunnerModeModule;
 let settings: typeof OrchestratorSettingsModule;
-let linearAuth: typeof LinearAppAuthModule;
 let LinearProvider: typeof LinearProviderClass;
+let fake: FakeFetch;
+
+// Each GraphQL response in order, one per request; a request past the last fails the test.
+function linearAnswers(...data: unknown[]): void {
+  fake = fakeFetch({ "POST /graphql": data.map((d) => ({ json: { data: d } })) });
+  fake.install();
+}
 
 beforeEach(async () => {
-  vi.resetModules();
-  vi.stubGlobal("fetch", vi.fn());
-  dbPath = path.join(
-    os.tmpdir(),
-    `linear-pickup-label-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  runnerMode = await import("../runner-mode.js");
-  settings = await import("../orchestrator-settings.js");
-  linearAuth = await import("../linear-app-auth.js");
-  ({ LinearProvider } = await import("../providers/linear.js"));
-  runnerMode.initSettingsTable();
-  linearAuth.configureLinearAuth("client-id", "client-secret");
-  linearAuth.__setLinearTokenForTest("test-token");
+  const { modules } = await testDb({
+    modules: {
+      settings: () => import("../orchestrator-settings.js"),
+      linearAuth: () => import("../linear-app-auth.js"),
+      linear: () => import("../providers/linear.js"),
+    },
+  });
+  settings = modules.settings;
+  ({ LinearProvider } = modules.linear);
+  modules.linearAuth.configureLinearAuth("client-id", "client-secret");
+  modules.linearAuth.__setLinearTokenForTest("test-token");
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   vi.restoreAllMocks();
 });
 
-function mockJsonOnce(data: unknown) {
-  vi.mocked(fetch).mockResolvedValueOnce({
-    ok: true,
-    json: async () => ({ data }),
-  } as Response);
-}
-
 function lastCallBody(): { query: string; variables: Record<string, unknown> } {
-  const call = vi.mocked(fetch).mock.calls.at(-1)!;
-  return JSON.parse(call[1]?.body as string);
+  return JSON.parse(fake.calls.at(-1)!.body);
 }
 
 describe("LinearProvider.fetchAIImplementSnapshot — pickup label", () => {
   it("sends the default label as a variable when no row exists, and never inlines it in the query", async () => {
-    mockJsonOnce({ issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } });
+    linearAnswers({ issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } });
 
     const p = new LinearProvider({});
     await p.fetchAIImplementSnapshot();
@@ -71,7 +56,7 @@ describe("LinearProvider.fetchAIImplementSnapshot — pickup label", () => {
 
   it("sends the stored label as the variable once set", async () => {
     settings.setOrchestratorSetting("linearPickupLabel", "AI Implement - New");
-    mockJsonOnce({ issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } });
+    linearAnswers({ issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } });
 
     const p = new LinearProvider({});
     await p.fetchAIImplementSnapshot();
@@ -81,7 +66,7 @@ describe("LinearProvider.fetchAIImplementSnapshot — pickup label", () => {
 
   it("a leaf carrying the configured label under a parent carrying it is designated into the feature chain", async () => {
     settings.setOrchestratorSetting("linearPickupLabel", "AI Implement - New");
-    mockJsonOnce({
+    linearAnswers({
       issues: {
         nodes: [
           {
@@ -115,7 +100,7 @@ describe("LinearProvider.fetchAIImplementSnapshot — pickup label", () => {
 
   it("a parent whose child carries only the old default label is treated as undesignated, not the configured label", async () => {
     settings.setOrchestratorSetting("linearPickupLabel", "AI Implement - New");
-    mockJsonOnce({
+    linearAnswers({
       issues: {
         nodes: [
           {
@@ -154,14 +139,14 @@ describe("LinearProvider.fetchAIImplementSnapshot — pickup label", () => {
 
   it("re-reads the setting on every call — a later save takes effect without re-constructing the provider", async () => {
     const p = new LinearProvider({});
+    const empty = { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } };
+    linearAnswers(empty, empty);
 
-    mockJsonOnce({ issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } });
     await p.fetchAIImplementSnapshot();
     expect(lastCallBody().variables.label).toBe("AI-Implement");
 
     settings.setOrchestratorSetting("linearPickupLabel", "AI Implement - New");
 
-    mockJsonOnce({ issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } });
     await p.fetchAIImplementSnapshot();
     expect(lastCallBody().variables.label).toBe("AI Implement - New");
   });
@@ -169,7 +154,7 @@ describe("LinearProvider.fetchAIImplementSnapshot — pickup label", () => {
   it("logs one line naming the active label when the snapshot returns zero open issues", async () => {
     settings.setOrchestratorSetting("linearPickupLabel", "AI Implement - New");
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    mockJsonOnce({ issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } });
+    linearAnswers({ issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } });
 
     const p = new LinearProvider({});
     await p.fetchAIImplementSnapshot();
@@ -179,7 +164,7 @@ describe("LinearProvider.fetchAIImplementSnapshot — pickup label", () => {
 
   it("does not log the empty-poll line when at least one issue is returned", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    mockJsonOnce({
+    linearAnswers({
       issues: {
         nodes: [
           {
@@ -208,7 +193,7 @@ describe("LinearProvider.fetchAIImplementSnapshot — pickup label", () => {
 
 describe("LinearProvider.fetchFeatureNodeRollUps — pickup label", () => {
   it("sends the label as a GraphQL variable, never inlined in the query", async () => {
-    mockJsonOnce({ issues: { nodes: [] } });
+    linearAnswers({ issues: { nodes: [] } });
 
     const p = new LinearProvider({});
     await p.fetchFeatureNodeRollUps();
@@ -221,7 +206,7 @@ describe("LinearProvider.fetchFeatureNodeRollUps — pickup label", () => {
 
   it("sends the stored label and uses it to classify the parent as a feature node", async () => {
     settings.setOrchestratorSetting("linearPickupLabel", "AI Implement - New");
-    mockJsonOnce({
+    linearAnswers({
       issues: {
         nodes: [
           {
@@ -258,7 +243,7 @@ describe("LinearProvider.fetchFeatureNodeRollUps — pickup label", () => {
 
   it("a parent whose old-default-labeled ancestor no longer matches the configured label rolls up to base", async () => {
     settings.setOrchestratorSetting("linearPickupLabel", "AI Implement - New");
-    mockJsonOnce({
+    linearAnswers({
       issues: {
         nodes: [
           {

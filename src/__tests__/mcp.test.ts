@@ -9,6 +9,8 @@ import { setKgRefreshToolDeps } from "../restate/tools.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import type { PreflightCheckResult } from "../kg-refresh.js";
 import type { Caller } from "../mcp-identity.js";
+import { makeMapping } from "./helpers/builders.js";
+import { fakeFetch, type Reply } from "./helpers/fake-fetch.js";
 import {
   GET_TENANT_HEALTH_DESCRIPTION,
   getTenantHealth,
@@ -973,10 +975,10 @@ describe("handleMcpRequest", () => {
       const { callTool: realCallTool } = await vi.importActual<typeof import("../restate/tools-client.js")>("../restate/tools-client.js");
       const deployHold = await import("../deploy-hold.js");
       (deployHold.getDeployStartedAt as ReturnType<typeof vi.fn>).mockReturnValue(1_700_000_000_000);
-      const fetchImpl = vi.fn();
+      const fake = fakeFetch({});
       (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mockImplementationOnce(
         (name: string, args: Record<string, unknown>, caller: Caller) =>
-          realCallTool(name, args, caller, { fetchImpl: fetchImpl as unknown as typeof fetch, permitsExternalCall: () => false }),
+          realCallTool(name, args, caller, { fetchImpl: fake.fetch, permitsExternalCall: () => false }),
       );
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -988,19 +990,21 @@ describe("handleMcpRequest", () => {
       );
       expect(result.statusCode).toBe(409);
       expect(JSON.parse(result.body)).toEqual({ error: "deploy-in-progress", deployStartedAt: 1_700_000_000_000 });
-      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(fake.calls).toHaveLength(0);
       (deployHold.getDeployStartedAt as ReturnType<typeof vi.fn>).mockReturnValue(null);
     });
 
-    it.each([
-      ["a refused connection", () => Promise.reject(new Error("ECONNREFUSED"))],
-      ["a 5xx answer", () => Promise.resolve(new Response("boom", { status: 502 }))],
-    ])("keeps 503 restate-unavailable with no hold and %s", async (_label, fetchResult) => {
+    it.each<[string, Reply]>([
+      ["a refused connection", () => {
+        throw new Error("ECONNREFUSED");
+      }],
+      ["a 5xx answer", { status: 502, text: "boom" }],
+    ])("keeps 503 restate-unavailable with no hold and %s", async (_label, ingressReply) => {
       const { callTool: realCallTool } = await vi.importActual<typeof import("../restate/tools-client.js")>("../restate/tools-client.js");
-      const fetchImpl = vi.fn(fetchResult);
+      const fake = fakeFetch({ "POST /orchestratorTools/get_tenant_health": [ingressReply] });
       (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mockImplementationOnce(
         (name: string, args: Record<string, unknown>, caller: Caller) =>
-          realCallTool(name, args, caller, { fetchImpl: fetchImpl as unknown as typeof fetch, permitsExternalCall: () => true }),
+          realCallTool(name, args, caller, { fetchImpl: fake.fetch, permitsExternalCall: () => true }),
       );
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -1010,7 +1014,7 @@ describe("handleMcpRequest", () => {
         "POST",
         JSON.stringify({ jsonrpc: "2.0", id: 19, method: "tools/call", params: { name: "get_tenant_health", arguments: {} } }),
       );
-      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      expect(fake.calls).toHaveLength(1);
       expect(result.statusCode).toBe(503);
       expect(JSON.parse(result.body)).toEqual({ error: "restate-unavailable" });
     });
@@ -1033,34 +1037,8 @@ describe("handleMcpRequest", () => {
     });
 
     it("handles list_projects — existing seven fields preserved", async () => {
-      (configMock.getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
-        "AII": {
-          owner: "BuildDownAI",
-          repo: "AI-Implement",
-          executionMode: "github-actions",
-          provider: "anthropic",
-          paused: false,
-          planningEnabled: true,
-          maxInProgressAiIssues: 3,
-          defaultBranch: "main",
-          workflowFile: "claude-implement.yml",
-          sessionMode: "autonomous",
-          autoMerge: false,
-          maxTurns: null,
-          maxIterations: null,
-          maxJobMinutes: null,
-          branchPrefix: null,
-          skillsRepo: null,
-          dependencyTokenScope: null,
-          sensitiveAddPatterns: null,
-          sensitiveAllowPatterns: null,
-          machineCpus: 2,
-          machineMemoryMb: 4096,
-          awsRegion: null,
-          planningWorkflowFile: "claude-plan.yml",
-          autoApprovePlans: true,
-          extraEnv: { SECRET_KEY: "secret-value" },
-        },
+      vi.mocked(configMock.getMappings).mockReturnValue({
+        "AII": makeMapping({ owner: "BuildDownAI", repo: "AI-Implement", planningEnabled: true }),
       });
 
       const result = await callMcp(
@@ -1085,15 +1063,8 @@ describe("handleMcpRequest", () => {
     });
 
     it("handles list_projects — extended per-project settings", async () => {
-      (configMock.getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
-        "AII": {
-          owner: "BuildDownAI",
-          repo: "AI-Implement",
-          executionMode: "fly-machines",
-          provider: "bedrock",
-          paused: true,
-          planningEnabled: false,
-          maxInProgressAiIssues: 5,
+      vi.mocked(configMock.getMappings).mockReturnValue({
+        "AII": makeMapping({
           defaultBranch: "develop",
           workflowFile: "custom-implement.yml",
           sessionMode: "hybrid",
@@ -1110,10 +1081,8 @@ describe("handleMcpRequest", () => {
           machineCpus: 4,
           machineMemoryMb: 8192,
           awsRegion: "us-east-1",
-          planningWorkflowFile: "claude-plan.yml",
           autoApprovePlans: false,
-          extraEnv: { SHOULD_NOT_APPEAR: "hidden" },
-        },
+        }),
       });
 
       const result = await callMcp(
@@ -1153,35 +1122,7 @@ describe("handleMcpRequest", () => {
     });
 
     it("handles list_projects — null-able caps return null, not fabricated defaults", async () => {
-      (configMock.getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
-        "AII": {
-          owner: "BuildDownAI",
-          repo: "AI-Implement",
-          executionMode: "github-actions",
-          provider: "anthropic",
-          paused: false,
-          planningEnabled: true,
-          maxInProgressAiIssues: 3,
-          defaultBranch: "main",
-          workflowFile: "claude-implement.yml",
-          sessionMode: "autonomous",
-          autoMerge: false,
-          maxTurns: null,
-          maxIterations: null,
-          maxJobMinutes: null,
-          branchPrefix: null,
-          skillsRepo: null,
-          dependencyTokenScope: null,
-          sensitiveAddPatterns: null,
-          sensitiveAllowPatterns: null,
-          machineCpus: 2,
-          machineMemoryMb: 4096,
-          awsRegion: null,
-          planningWorkflowFile: "claude-plan.yml",
-          autoApprovePlans: true,
-          extraEnv: {},
-        },
-      });
+      vi.mocked(configMock.getMappings).mockReturnValue({ "AII": makeMapping() });
 
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -1207,34 +1148,8 @@ describe("handleMcpRequest", () => {
     });
 
     it("handles list_projects — extraEnv is absent from output", async () => {
-      (configMock.getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
-        "AII": {
-          owner: "BuildDownAI",
-          repo: "AI-Implement",
-          executionMode: "github-actions",
-          provider: "anthropic",
-          paused: false,
-          planningEnabled: true,
-          maxInProgressAiIssues: 3,
-          defaultBranch: "main",
-          workflowFile: "claude-implement.yml",
-          sessionMode: "autonomous",
-          autoMerge: false,
-          maxTurns: null,
-          maxIterations: null,
-          maxJobMinutes: null,
-          branchPrefix: null,
-          skillsRepo: null,
-          dependencyTokenScope: null,
-          sensitiveAddPatterns: null,
-          sensitiveAllowPatterns: null,
-          machineCpus: 2,
-          machineMemoryMb: 4096,
-          awsRegion: null,
-          planningWorkflowFile: "claude-plan.yml",
-          autoApprovePlans: true,
-          extraEnv: { API_KEY: "do-not-expose", DB_PASS: "also-secret" },
-        },
+      vi.mocked(configMock.getMappings).mockReturnValue({
+        "AII": makeMapping({ extraEnv: { API_KEY: "do-not-expose", DB_PASS: "also-secret" } }),
       });
 
       const result = await callMcp(
