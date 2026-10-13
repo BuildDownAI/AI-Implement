@@ -38,6 +38,8 @@ import { readKgSourceRepo } from "../deploy.js";
 import { runKgRefreshPreflight, MIN_FREE_BYTES, type KgRefreshStage, type KgRefreshStatus } from "../kg-refresh.js";
 import type { StepStatus } from "../pipeline/types.js";
 import { FlyMachineProfile } from "./fly-machine-profile.js";
+import { RUN_PROFILE_OBJECTS, isRunProfileBackend, type RunProfileBackend } from "./run-profile.js";
+import { RunnerBackend } from "./runner-backend.js";
 import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { getOrchestratorSettings, getFlySessionsConfig, getLinearPickupLabel } from "../orchestrator-settings.js";
@@ -790,6 +792,14 @@ export const getKgStatusTool = tool(
     const flyConfigured = !!(flyCfg.flySessionsToken && flyCfg.flySessionsApp);
     const kgSetting = getKgExecutionMode(flyConfigured);
     const kgBackend = resolveKgBackend(getRunnerMode().mode, kgSetting, flyConfigured);
+    // The effective backend's profile; local-docker has none.
+    let runProfile: { backend: RunProfileBackend; config: unknown; source: "profile" | "default" } | undefined;
+    if (isRunProfileBackend(kgBackend.mode)) {
+      const view = kgBackend.mode === "fly-machines"
+        ? flyProfile
+        : await ctx.objectClient(RUN_PROFILE_OBJECTS["github-actions"], "kg-refresh").get();
+      if (view) runProfile = { backend: kgBackend.mode, config: view.config, source: view.source };
+    }
     const result: KgRefreshStatus = {
       running: inFlight !== null && inFlight !== undefined,
       deployHeld: toolDeps.isDeployHeld(),
@@ -803,6 +813,7 @@ export const getKgStatusTool = tool(
       ...(runnerStep ? { runnerStep } : {}),
       materialize: getKgMaterializeDirect().enabled ? "direct" : "rdflib",
       executionMode: { effective: kgBackend.mode, source: kgBackend.source, setting: kgSetting.mode },
+      ...(runProfile ? { runProfile } : {}),
       ...(flyProfile ? { flyMachine: { ...flyProfile.config, source: flyProfile.source } } : {}),
       restate: restateKey ? { service: "KgRefresh", key: restateKey } : null,
     };
@@ -1118,8 +1129,79 @@ export const setFlyMachineProfileTool = tool(
       ...(memoryMb !== undefined ? { memoryMb } : {}),
       ...(idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),
     };
+    return reply(await runProfileSet(() => ctx.objectClient(FlyMachineProfile, pipeline).set(fields)));
+  },
+);
+
+/** Runs a run-profile `set`; a 400 comes back as a reply body, as the other set tools do. */
+async function runProfileSet(set: () => Promise<unknown>): Promise<unknown> {
+  try {
+    return await set();
+  } catch (err) {
+    if (err instanceof restate.TerminalError && err.code === 400) return { status: 400, body: { error: err.message } };
+    throw err;
+  }
+}
+
+export const SET_RUN_PROFILE_DESCRIPTION =
+  "Set a pipeline's run profile on one backend (admin role): pipeline (kg-refresh), backend (fly-machines, github-actions) and patch. fly-machines takes cpuKind, cpus, memoryMb, idleTimeoutMs; github-actions takes jobTimeoutMinutes (an integer from 10 to 360). Given fields merge into the stored profile; an unknown field or out-of-range value is refused with 400. Applies to the next run, not one in flight. Returns the profile as { config, source }.";
+
+export const setRunProfileTool = tool(
+  {
+    description: SET_RUN_PROFILE_DESCRIPTION,
+    input: z.object({
+      pipeline: z.string().describe("The pipeline phase whose profile to set, e.g. kg-refresh"),
+      backend: z.enum(["fly-machines", "github-actions"]).describe("The backend whose profile to set"),
+      patch: z.record(z.string(), z.unknown()).describe("Fields to merge, e.g. { jobTimeoutMinutes } for github-actions"),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const { pipeline, backend, patch } = input.args;
+    const result = await runProfileSet(() => ctx.objectClient(RUN_PROFILE_OBJECTS[backend], pipeline).set(patch));
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const SET_RUNNER_BACKEND_DESCRIPTION =
+  "Set a runner backend's deployment-wide settings (admin role): backend (fly-machines, github-actions) and patch. fly-machines takes app and region (a string or null); github-actions takes no fields. Given fields merge into the stored state; an unknown backend or field is refused with 400. No secret is accepted. Returns the stored state.";
+
+export const setRunnerBackendTool = tool(
+  {
+    description: SET_RUNNER_BACKEND_DESCRIPTION,
+    input: z.object({
+      backend: z.string().describe("The backend whose settings to set: fly-machines or github-actions"),
+      patch: z.record(z.string(), z.unknown()).describe("Fields to merge, e.g. { app, region } for fly-machines"),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
+    const { backend, patch } = input.args;
     try {
-      return reply(await ctx.objectClient(FlyMachineProfile, pipeline).set(fields));
+      return reply(await ctx.objectClient(RunnerBackend, backend).set(patch));
+    } catch (err) {
+      if (err instanceof restate.TerminalError && err.code === 400) return reply({ status: 400, body: { error: err.message } });
+      throw err;
+    }
+  },
+);
+
+export const GET_RUNNER_BACKEND_DESCRIPTION =
+  "Returns a runner backend's deployment-wide settings (fly-machines: app, region), or null when none were stored yet.";
+
+export const getRunnerBackendTool = tool(
+  {
+    description: GET_RUNNER_BACKEND_DESCRIPTION,
+    input: z.object({ backend: z.string().describe("The backend to read: fly-machines or github-actions") }),
+    role: "user",
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
+    try {
+      return reply(await ctx.objectClient(RunnerBackend, input.args.backend).get());
     } catch (err) {
       if (err instanceof restate.TerminalError && err.code === 400) return reply({ status: 400, body: { error: err.message } });
       throw err;
@@ -1207,7 +1289,7 @@ export const addProjectArgsSchema = z.object({
   trustedReviewAuthors: z.array(z.string()).nullable().optional().describe(
     "Extra GitHub logins trusted as review authors for this project, additive to the built-in trusted authors (ai-implement, ai-implement[bot], and the Claude logins — github-actions[bot] is trusted separately). Omit to keep the stored value; pass null to reset to built-ins only.",
   ),
-  reviewProcess: z.enum(["ai-implement", "claude-code-review"]).nullable().optional().describe(
+  reviewProcess: z.enum(["ai-implement", "claude-code-review", "claude-code-review-repository-fix"]).nullable().optional().describe(
     "The project's review process. Omit to keep the stored value; pass null or \"ai-implement\" for the default. It applies to every project; only the forward to the Restate fix attempt needs the Restate lifecycle.",
   ),
 });
@@ -1362,6 +1444,9 @@ export const orchestratorTools = restate.service({
     decide_kg_refresh: decideKgRefreshTool,
     set_runner_mode: setRunnerModeTool,
     set_fly_machine_profile: setFlyMachineProfileTool,
+    set_run_profile: setRunProfileTool,
+    set_runner_backend: setRunnerBackendTool,
+    get_runner_backend: getRunnerBackendTool,
     pause_project: pauseProjectTool,
     add_project: addProjectTool,
     trigger_workflow_sync: triggerWorkflowSyncTool,

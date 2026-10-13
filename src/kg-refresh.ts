@@ -211,6 +211,8 @@ export interface KgRefreshStatus {
   };
   /** The `kg-refresh` Fly machine profile the next refresh will use (`set_fly_machine_profile`). */
   flyMachine?: { cpuKind: "shared" | "performance"; cpus: number; memoryMb: number; idleTimeoutMs: number; source: "profile" | "default" };
+  /** The effective backend's run profile (AII-1244); absent for local-docker. */
+  runProfile?: { backend: "fly-machines" | "github-actions"; config: unknown; source: "profile" | "default" };
   /** The `KgRefresh` workflow to look up in the journal: the in-flight run, else the last refresh's; null when neither is known. */
   restate: { service: "KgRefresh"; key: string } | null;
 }

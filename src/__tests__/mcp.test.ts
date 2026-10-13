@@ -7,6 +7,7 @@ import { SidecarMemoryProvider, sidecarHealth, sidecarHealthFields, setKgMemoryP
 import type { MemoryProvider, KgToolResult } from "../kg-provider.js";
 import { setKgRefreshToolDeps } from "../restate/tools.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
+import { refreshRunnerBackendCache } from "../orchestrator-settings.js";
 import type { PreflightCheckResult } from "../kg-refresh.js";
 import type { Caller } from "../mcp-identity.js";
 import {
@@ -34,6 +35,7 @@ import {
   triggerKgRefreshTool,
   setRunnerModeTool,
   setFlyMachineProfileTool,
+  setRunProfileTool,
   pauseProjectTool,
   addProjectTool,
   triggerWorkflowSyncTool,
@@ -100,6 +102,7 @@ const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
   trigger_kg_refresh: triggerKgRefreshTool,
   set_runner_mode: setRunnerModeTool,
   set_fly_machine_profile: setFlyMachineProfileTool,
+  set_run_profile: setRunProfileTool,
   pause_project: pauseProjectTool,
   add_project: addProjectTool,
   trigger_workflow_sync: triggerWorkflowSyncTool,
@@ -113,6 +116,7 @@ const WRITE_TOOL_NAMES = new Set([
   "trigger_kg_refresh",
   "set_runner_mode",
   "set_fly_machine_profile",
+  "set_run_profile",
   "pause_project",
   "add_project",
   "trigger_workflow_sync",
@@ -172,8 +176,6 @@ vi.mock("../runner-mode.js", () => ({
   getKgMaterializeDirect: vi.fn(() => ({ enabled: true, source: "db" as const })),
   getKgExecutionMode: vi.fn(() => ({ mode: "github-actions" as const, source: "db" as const })),
   resolveKgBackend: vi.fn(() => ({ mode: "github-actions" as const, source: "kg-setting" as const })),
-  getKgFlyMachineOverride: vi.fn(() => ({})),
-  setKgFlyMachineOverride: vi.fn(),
 }));
 
 vi.mock("../config.js", async (importOriginal) => ({
@@ -205,6 +207,11 @@ vi.mock("../report-card.js", () => ({
 vi.mock("../deploy-hold.js", () => ({
   getDeployStartedAt: vi.fn(() => null),
   isDeployHeld: vi.fn(() => false),
+}));
+
+vi.mock("../orchestrator-settings.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../orchestrator-settings.js")>()),
+  refreshRunnerBackendCache: vi.fn(async () => {}),
 }));
 
 vi.mock("../restate/tools-client.js", () => ({
@@ -1487,6 +1494,7 @@ describe("handleMcpRequest", () => {
         stage: "serving",
         materialize: "direct",
         executionMode: { effective: "github-actions", source: "kg-setting", setting: "github-actions" },
+        runProfile: { backend: "github-actions", config: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000 }, source: "default" },
         flyMachine: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000, source: "default" },
         restate: null,
         currentRun: null,
@@ -3018,5 +3026,69 @@ describe("write idempotency key names one request, not one JSON-RPC id (AII-719,
     expect(result.statusCode).toBe(200);
     expect(JSON.parse(result.body).error).toBeUndefined();
     expect(toolsClientMock.callTool).toHaveBeenCalledWith("get_runner_mode", {}, expect.objectContaining({ kind: "human" }), undefined);
+  });
+});
+
+describe("/mcp runner-backend writes (AII-1271)", () => {
+  const callNamed = (name: string, args: Record<string, unknown>) =>
+    callMcp(
+      { authorization: "Bearer tok" },
+      true,
+      null,
+      BASE_URL,
+      "POST",
+      JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }),
+    );
+  let callToolMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    callToolMock = toolsClientMock.callTool as ReturnType<typeof vi.fn>;
+    mockRole("admin");
+    (refreshRunnerBackendCache as ReturnType<typeof vi.fn>).mockClear();
+  });
+
+  it("set_run_profile reaches the tools service for an admin", async () => {
+    callToolMock.mockResolvedValueOnce({ status: "ok", content: [{ type: "text", text: "{}" }] });
+    const result = await callNamed("set_run_profile", { pipeline: "kg-refresh", backend: "github-actions", patch: {} });
+    expect(JSON.parse(result.body).error).toBeUndefined();
+    expect(callToolMock).toHaveBeenCalledWith("set_run_profile", expect.any(Object), expect.objectContaining({ kind: "human" }), undefined);
+    expect(refreshRunnerBackendCache).not.toHaveBeenCalled();
+  });
+
+  it("set_run_profile is refused for a user role by the tool wrapper", async () => {
+    mockRole("user");
+    const result = await callNamed("set_run_profile", { pipeline: "kg-refresh", backend: "github-actions", patch: {} });
+    expect(JSON.parse(result.body).result.isError).toBe(true);
+  });
+
+  it("set_runner_backend refreshes the cache after callTool resolves and before the response", async () => {
+    const log: string[] = [];
+    callToolMock.mockImplementationOnce(async () => {
+      log.push("callTool");
+      return { status: "ok", content: [{ type: "text", text: "{}" }] };
+    });
+    (refreshRunnerBackendCache as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
+      log.push("refresh");
+    });
+    const result = await callNamed("set_runner_backend", { backend: "fly-machines", patch: { app: "x" } });
+    log.push("response");
+    expect(result.statusCode).toBe(200);
+    expect(log).toEqual(["callTool", "refresh", "response"]);
+  });
+
+  it.each([
+    ["deploy-held", { status: "deploy-held" }],
+    ["unavailable", { status: "unavailable" }],
+    ["isError", { status: "ok", content: [], isError: true }],
+  ])("set_runner_backend skips the refresh on %s", async (_label, outcome) => {
+    callToolMock.mockResolvedValueOnce(outcome);
+    await callNamed("set_runner_backend", { backend: "fly-machines", patch: {} });
+    expect(refreshRunnerBackendCache).not.toHaveBeenCalled();
+  });
+
+  it("another write does not trigger the refresh", async () => {
+    callToolMock.mockResolvedValueOnce({ status: "ok", content: [{ type: "text", text: "{}" }] });
+    await callNamed("set_runner_mode", { mode: "fly" });
+    expect(refreshRunnerBackendCache).not.toHaveBeenCalled();
   });
 });

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { RestateSidecar, restateDataDir, ensureRequestIdentityKey, identityKeyFromPem, RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BIND_ADDRESS } from "../restate/server.js";
 import { getRestateStatus, resetRestateStatus } from "../restate/status.js";
-import { createRestateRegistrationGate, stopSidecarsConcurrently } from "../index.js";
+import { createRestateRegistrationGate, createBootReconciliation, stopSidecarsConcurrently } from "../index.js";
 
 // ---------------------------------------------------------------------------
 // Helpers — mirrors src/__tests__/kg-sidecar.test.ts
@@ -1048,5 +1048,26 @@ describe("request identity key", () => {
   it("derives a stable key from the PEM", () => {
     const dataDir = makeTmpDir();
     expect(ensureRequestIdentityKey(dataDir).publicKey).toBe(ensureRequestIdentityKey(dataDir).publicKey);
+  });
+});
+
+describe("createBootReconciliation (AII-1271)", () => {
+  it("runs in main() when the cache came from Restate, and not again from onRegistered", async () => {
+    const reconcile = vi.fn(async () => {});
+    const boot = createBootReconciliation(reconcile, () => "restate");
+    await boot.atBoot();
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    await boot.onRegistered();
+    expect(reconcile).toHaveBeenCalledTimes(1);
+  });
+
+  it("on the fallback skips main() and runs once from onRegistered, even if it fires again", async () => {
+    const reconcile = vi.fn(async () => {});
+    const boot = createBootReconciliation(reconcile, () => "fallback");
+    await boot.atBoot();
+    expect(reconcile).not.toHaveBeenCalled();
+    await boot.onRegistered();
+    await boot.onRegistered();
+    expect(reconcile).toHaveBeenCalledTimes(1);
   });
 });

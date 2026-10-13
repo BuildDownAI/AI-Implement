@@ -73,7 +73,7 @@ import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable 
 import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
-import { getOrchestratorSettings, getFlySessionsConfig, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, getRetryPolicy } from "./orchestrator-settings.js";
+import { getOrchestratorSettings, getRunnerBackendSource, getFlySessionsConfig, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, getRetryPolicy, seedRunnerBackends, refreshRunnerBackendCache } from "./orchestrator-settings.js";
 import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
@@ -113,7 +113,7 @@ import { type RunConfigV1, encodeRunConfig, buildImplRunConfig } from "./run-con
 import { resolveBaseBranch, findOpenRollUpPr, resolvePlanningBranch } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
-import { runGroupingBranchAutoMerge } from "./auto-merge.js";
+import { runAutoMerges } from "./auto-merge.js";
 import { getPendingReviewFixes, listReviewFixEvents, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, acceptReviewFixWebhookEvent, buildReviewFixTaskDescription, MAX_TASK_FINDINGS } from "./review-fix-queue.js";
 import { initReviewFixEvidenceTable, sweepExpiredReviewFixEvidence } from "./review-fix-evidence.js";
 import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
@@ -144,11 +144,12 @@ import {
 import { applyVolumeSnapshotRetention, applyVolumeSnapshotRetentionAtBoot } from "./fly-volumes.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
 import { sweepOnRegistered } from "./webhook-redelivery.js";
-import { createKgFindRunByTitle, seedFlyMachineProfileFromOverride, createProductionKgRefreshServices, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
+import { createKgFindRunByTitle, createProductionKgRefreshServices, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
+import { resolveReviewProcess } from "./review-process.js";
 import { createLateExternalReviewIngressClient, createLateExternalReviewSubmitHook, createProductionLateExternalReviewServices } from "./restate/late-external-review.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
 import { handleJournalRequest } from "./restate/journal-query.js";
@@ -422,6 +423,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   const timeoutMs = config.pollCycleTimeoutMs;
 
+  await refreshRunnerBackendCache();
   await runWithDeadline(
     cycleId,
     started,
@@ -595,12 +597,12 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     }
 
     // Merge approved child PRs into grouping branches (cascade self-healing). Runs for all
-    // non-paused projects — the top-of-tree feature→base PR still requires human review.
-    // (AII-349: always-on so a reopened parent's approved children merge without per-project opt-in.)
+    // non-paused projects whose Auto-merge setting is on (runAutoMerges checks the flag); a project
+    // with it off leaves approved children for a person. The top-of-tree feature→base PR still requires human review.
     try {
       const nonPausedMappings = Object.values(teamRepoMap);
       if (nonPausedMappings.length > 0) {
-        await runGroupingBranchAutoMerge(nonPausedMappings, {
+        await runAutoMerges(nonPausedMappings, {
           githubAppId: config.githubAppId,
           githubAppPrivateKey: config.githubAppPrivateKey,
           notify: config.notifyWebhookUrl
@@ -3533,6 +3535,13 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         }
         continue;
       }
+      // The repository's auto-fix owns the PR: the ledger findings stay for LateExternalReview, nothing dispatches.
+      if (resolveReviewProcess(mapping.reviewProcess).fixer === "repository") {
+        updateReviewFixStatus(fix.id, "skipped");
+        console.log(`[review-fix] Project ${fix.repo} delegates fixes to the repository `
+          + `(${resolveReviewProcess(mapping.reviewProcess).id}), skipping review fix #${fix.id}`);
+        continue;
+      }
       if (mapping.ticketingProvider === "filesystem" && runnerMode !== "local") {
         console.warn(`[review-fix] Filesystem project ${scopeKey} requires local runner mode`);
         updateReviewFixStatus(fix.id, "skipped");
@@ -4044,13 +4053,19 @@ async function handleKgRefreshOutcome(
 const reviewFixAttemptStore = new SqliteReviewFixAttemptStore();
 const kgRefreshIngressClient = createKgRefreshIngressClient();
 // AII-1227: starts LateExternalReview only while the sidecar is ready and the endpoint registered.
-const lateExternalReviewSubmitHook = createLateExternalReviewSubmitHook({
+const submitLateExternalReview = createLateExternalReviewSubmitHook({
   ingress: createLateExternalReviewIngressClient(),
   restateReady: () => {
     const restate = getRestateStatus();
     return restate.sidecar.state === "ready" && restate.registration.state === "registered";
   },
 });
+// A repository-fix project's workflow follows the auto-fix to its new head (ADR 038); the mode rides the input.
+const lateExternalReviewSubmitHook: typeof submitLateExternalReview = (input) => {
+  const mapping = Object.values(getMappings()).find((m) => m.owner === input.owner && m.repo === input.repo);
+  const followHead = resolveReviewProcess(mapping?.reviewProcess).fixer === "repository";
+  return submitLateExternalReview(followHead ? { ...input, followHead } : input);
+};
 const reviewFixIngressClient = createReviewFixIngressClient();
 
 /** Maps a `callToolAsSystem` result carrying `{ status, body }` text onto the REST shape (AII-901). */
@@ -4869,6 +4884,36 @@ export interface RestateEndpointWireDeps {
   onRegistered?: () => Promise<void>;
 }
 
+/**
+ * Boot-time machine reconciliation must list the app saved in `RunnerBackend/fly-machines`, not the
+ * env-then-row fallback. `atBoot()` runs it when the cache already came from Restate; otherwise it
+ * defers to `onRegistered()` (after that hook's cache refresh), which runs it at most once.
+ */
+export function createBootReconciliation(
+  reconcile: () => Promise<void>,
+  source: () => "restate" | "fallback",
+) {
+  let deferred = false;
+  let done = false;
+  async function run(path: string): Promise<void> {
+    if (done) return;
+    done = true;
+    console.log(`[main] Startup reconciliation running from ${path}`);
+    await reconcile();
+  }
+  return {
+    async atBoot(): Promise<void> {
+      if (source() === "restate") return run("main (runner backend loaded from Restate)");
+      deferred = true;
+      console.log("[main] Runner backend cache is on the fallback; startup reconciliation deferred to Restate registration");
+    },
+    async onRegistered(): Promise<void> {
+      if (!deferred) return;
+      await run("onRegistered (after runner backend refresh)");
+    },
+  };
+}
+
 /** How often a declined registration retries (AII-721) — the old deployment's non-completed invocations are expected to drain on their own; this just keeps checking back. */
 const RESTATE_REGISTRATION_RETRY_MS = 60_000;
 
@@ -5117,12 +5162,18 @@ async function main(): Promise<void> {
     sessionDeps: { dispatchSession, isDefinitiveFlyRejectionError, isDefinitiveLocalDockerLaunchFailure, shouldReleaseAdmissionOnDispatchError },
   }).services;
   const lateExternalReviewServices = createProductionLateExternalReviewServices(config).services;
+  const bootReconciliation = createBootReconciliation(
+    () => startupReconciliation(config, registry),
+    () => getRunnerBackendSource(),
+  );
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
     startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...lateExternalReviewServices], restateSidecar.identityKey),
     registerRestateEndpoint,
     onRegistered: async () => {
       sweepOnRegistered(config);
-      await seedFlyMachineProfileFromOverride();
+      await seedRunnerBackends();
+      await refreshRunnerBackendCache();
+      await bootReconciliation.onRegistered();
     },
   });
   // A sidecar which becomes ready after its initial timeout still registers the
@@ -5180,7 +5231,8 @@ async function main(): Promise<void> {
   void postBootNotice(config, { holdWasSet, sidecarProbeError });
 
   // Reconcile machines from any previous run before starting the poll loop
-  await startupReconciliation(config, registry);
+  await refreshRunnerBackendCache();
+  await bootReconciliation.atBoot();
 
   // Run first poll immediately
   await poll(config, registry);

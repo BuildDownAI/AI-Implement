@@ -21,7 +21,7 @@ import {
   setMappingPaused,
   deleteMapping,
 } from "./config.js";
-import type { ReviewProcessId } from "./review-process.js";
+import { isReviewProcessId, type ReviewProcessId } from "./review-process.js";
 import type { RepoMapping, ExecutionMode, SessionMode, ClaudeProvider, ReviewerSelection } from "./config.js";
 import {
   getRunnerMode,
@@ -75,6 +75,8 @@ import {
   DEFAULT_RETRY_POLICY,
   type RetryPolicy,
   getFlySessionsConfig,
+  getRunnerBackendSource,
+  refreshRunnerBackendCache,
 } from "./orchestrator-settings.js";
 import { getInstallationToken, mintSourceTokenOrJwt, getScopedInstallationToken } from "./github-app-auth.js";
 import { GitHubApiError } from "./github-errors.js";
@@ -520,6 +522,8 @@ export interface AdminDeps {
   };
   /** The tools-service ingress caller (src/restate/tools-client.ts, AII-710). Absent only in tests that don't exercise POST /api/tools/<name>. */
   callTool?: typeof callTool;
+  /** Re-reads `RunnerBackend/fly-machines` into the cache after a Settings write. Defaults to `refreshRunnerBackendCache`; a test seam. */
+  refreshRunnerBackendCache?: () => Promise<void>;
   /**
    * Reads the Restate sidecar/endpoint status (src/restate/status.ts's getRestateStatus,
    * AII-773/AII-804). Injected rather than imported at runtime because this file may only
@@ -1227,7 +1231,7 @@ export function handleAdminRequest(
     }
 
     if (url === "/api/settings" && method === "POST") {
-      handlePostSettings(req, res, config);
+      handlePostSettings(req, res, config, gate, deps);
       return true;
     }
 
@@ -2691,29 +2695,41 @@ async function handleUnsetSecret(
   }
 }
 
+function flySettingsView(): Record<string, unknown> {
+  const dbSettings = getOrchestratorSettings();
+  const fly = getFlySessionsConfig();
+  const envApp = process.env.FLY_SESSIONS_APP || null;
+  const envRegion = process.env.FLY_SESSIONS_REGION || null;
+  // Once RunnerBackend/fly-machines has been read, the env vars and rows are inert for these values.
+  const source = getRunnerBackendSource();
+  return {
+    runnerBackendSource: source,
+    flySessionsApp: {
+      runtimeValue: fly.app,
+      dbValue: dbSettings.flySessionsApp,
+      envValue: envApp,
+      overriddenByEnv: source === "fallback" && envApp !== null,
+      source,
+    },
+    flySessionsRegion: {
+      runtimeValue: fly.region,
+      dbValue: dbSettings.flySessionsRegion,
+      envValue: envRegion,
+      overriddenByEnv: source === "fallback" && envRegion !== null,
+      source,
+    },
+  };
+}
+
 function handleGetSettings(
   _req: http.IncomingMessage,
   res: http.ServerResponse,
   _config: AdminConfig,
 ): void {
   const dbSettings = getOrchestratorSettings();
-  const fly = getFlySessionsConfig();
-  const envApp = process.env.FLY_SESSIONS_APP || null;
-  const envRegion = process.env.FLY_SESSIONS_REGION || null;
 
   json(res, 200, {
-    flySessionsApp: {
-      runtimeValue: fly.app,
-      dbValue: dbSettings.flySessionsApp,
-      envValue: envApp,
-      overriddenByEnv: envApp !== null,
-    },
-    flySessionsRegion: {
-      runtimeValue: fly.region,
-      dbValue: dbSettings.flySessionsRegion,
-      envValue: envRegion,
-      overriddenByEnv: envRegion !== null,
-    },
+    ...flySettingsView(),
     kgRefreshReportIssue: {
       value: dbSettings.kgRefreshReportIssue,
     },
@@ -2734,6 +2750,8 @@ async function handlePostSettings(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   _config: AdminConfig,
+  gate: Extract<AdminGate, { ok: true }>,
+  deps: AdminDeps,
 ): Promise<void> {
   let body: {
     flySessionsApp?: string | null;
@@ -2785,17 +2803,47 @@ async function handlePostSettings(
     setOrchestratorSetting("linearPickupLabel", trimmed ? trimmed : null);
   }
 
-  if ("flySessionsApp" in body) {
-    const val = typeof body.flySessionsApp === "string" && body.flySessionsApp.trim()
-      ? body.flySessionsApp.trim()
-      : null;
-    setOrchestratorSetting("flySessionsApp", val);
+  const flyPatch: Record<string, string | null> = {};
+  for (const [field, key] of [["flySessionsApp", "app"], ["flySessionsRegion", "region"]] as const) {
+    if (field in body) {
+      const raw = body[field];
+      flyPatch[key] = typeof raw === "string" && raw.trim() ? raw.trim() : null;
+    }
   }
-  if ("flySessionsRegion" in body) {
-    const val = typeof body.flySessionsRegion === "string" && body.flySessionsRegion.trim()
-      ? body.flySessionsRegion.trim()
-      : null;
-    setOrchestratorSetting("flySessionsRegion", val);
+  if (Object.keys(flyPatch).length > 0) {
+    // The Restate object owns these values; a failure answers 503 rather than writing a row it would ignore.
+    if (!deps.callTool) {
+      json(res, 503, { error: "restate-unavailable" });
+      return;
+    }
+    const caller: Caller = { kind: "human", email: gate.identity?.email ?? null, role: gate.role };
+    let result: Awaited<ReturnType<NonNullable<AdminDeps["callTool"]>>>;
+    try {
+      result = await deps.callTool("set_runner_backend", { backend: "fly-machines", patch: flyPatch }, caller);
+    } catch (err) {
+      console.error("[admin] set_runner_backend failed:", err);
+      json(res, 503, { error: "restate-unavailable" });
+      return;
+    }
+    if (result.status !== "ok") {
+      json(res, result.status === "deploy-held" ? 409 : 503, { error: result.status === "deploy-held" ? "deploy-in-progress" : "restate-unavailable" });
+      return;
+    }
+    const text = result.content?.[0]?.text ?? "";
+    if (result.isError) {
+      json(res, 502, { error: text || "set_runner_backend failed" });
+      return;
+    }
+    try {
+      const parsed = JSON.parse(text) as { status?: number; body?: { error?: string } };
+      if (parsed.status === 400) {
+        json(res, 400, { error: parsed.body?.error ?? "invalid runner backend settings" });
+        return;
+      }
+    } catch {
+      /* a non-JSON reply is the stored state's absence; the refresh below settles it */
+    }
+    await (deps.refreshRunnerBackendCache ?? refreshRunnerBackendCache)();
   }
   if ("kgRefreshReportIssue" in body) {
     const val = typeof body.kgRefreshReportIssue === "string" && body.kgRefreshReportIssue.trim()
@@ -2811,24 +2859,9 @@ async function handlePostSettings(
   }
 
   const dbSettings = getOrchestratorSettings();
-  const envApp = process.env.FLY_SESSIONS_APP || null;
-  const envRegion = process.env.FLY_SESSIONS_REGION || null;
-
-  const fly = getFlySessionsConfig();
 
   json(res, 200, {
-    flySessionsApp: {
-      runtimeValue: fly.app,
-      dbValue: dbSettings.flySessionsApp,
-      envValue: envApp,
-      overriddenByEnv: envApp !== null,
-    },
-    flySessionsRegion: {
-      runtimeValue: fly.region,
-      dbValue: dbSettings.flySessionsRegion,
-      envValue: envRegion,
-      overriddenByEnv: envRegion !== null,
-    },
+    ...flySettingsView(),
     kgRefreshReportIssue: {
       value: dbSettings.kgRefreshReportIssue,
     },
@@ -3334,10 +3367,10 @@ export async function upsertMappingAction(
     reviewProcess = existingMapping?.reviewProcess ?? null;
   } else if (body.reviewProcess === null || body.reviewProcess === "ai-implement") {
     reviewProcess = null;
-  } else if (body.reviewProcess === "claude-code-review") {
-    reviewProcess = "claude-code-review";
+  } else if (isReviewProcessId(body.reviewProcess)) {
+    reviewProcess = body.reviewProcess;
   } else {
-    return { status: 400, body: { error: `reviewProcess invalid: must be null, "ai-implement", or "claude-code-review"` } };
+    return { status: 400, body: { error: `reviewProcess invalid: must be null, "ai-implement", "claude-code-review", or "claude-code-review-repository-fix"` } };
   }
 
   const mapping: RepoMapping = {

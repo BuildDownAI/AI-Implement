@@ -746,7 +746,7 @@ async function handleReviewCommentWebhook(
     res.end(JSON.stringify({ ignored: true, reason: "untrusted_author" }));
     return;
   }
-  if (reviewProcess.process.id === "claude-code-review" && isBotAuthor) {
+  if (reviewProcess.process.claudeInlineMarkers && isBotAuthor) {
     const marker = classifyClaudeInlineMarker(body);
     if (marker === null) {
       res.writeHead(200, { "Content-Type": "application/json" });

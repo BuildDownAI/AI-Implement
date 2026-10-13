@@ -24,11 +24,13 @@ import {
   type ReviewFixWorkerPort,
 } from "../review-fix-ports.js";
 import { awaitOwnedRun } from "./owned-run-wait.js";
+import { readOwnedRunStatus } from "./owned-run-lifecycle.js";
 import { reviewFixPRKey } from "./review-fix-pr.js";
 import { restateRetentionMs } from "./retention.js";
 
 const INSPECTION_INTERVAL_MS = 1_000;
 const RECONCILE_INTERVAL_MS = 1_000;
+const RUN_STATUS_TICK_MS = 60_000;
 
 /** The adapter supplying approval facts must read the current PR head and policy,
  * including persisted result conflicts. None may be inferred from the runner result. */
@@ -198,15 +200,23 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
     }
 
     let wake: Wake;
-    const remaining = Math.max(1, attempt.deadlineAt - await ctx.date.now());
+    let readIndex = 0;
     const event = await awaitOwnedRun(ctx, {
       signals: ["wake"],
       resultSignal: "wake",
       totalDeadlineAt: attempt.deadlineAt,
-      tickMs: remaining,
+      tickMs: RUN_STATUS_TICK_MS,
+      readStatus: () => readOwnedRunStatus(ctx, `read-run-status-${readIndex++}`, async () => {
+        const inspection = await worker.inspectTerminal(execution);
+        return inspection.reached ? "ended" : "unknown";
+      }),
     });
     if (event.kind === "signal" && event.name === "wake") {
       wake = event.value as Wake;
+    } else if (event.kind === "status" && event.status === "ended") {
+      // The run ended: a result that already arrived wins; otherwise take the stop-and-confirm path.
+      const peeked = await ctx.promise<Wake>("wake").peek();
+      wake = peeked ?? { kind: "cancel" };
     } else if (event.kind === "total_timeout") {
       wake = { kind: "cancel" }; // deadline follows the same stop-and-confirm path
     } else {

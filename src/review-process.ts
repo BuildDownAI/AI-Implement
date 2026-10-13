@@ -3,7 +3,7 @@
  * The definition is trusted input that can approve a PR, so every author and `appSlug` is spelled out. */
 import type { ReviewFindingsBlockResult, ReviewLedgerFinding } from "./pipeline/review-ledger.js";
 
-export type ReviewProcessId = "ai-implement" | "claude-code-review";
+export type ReviewProcessId = "ai-implement" | "claude-code-review" | "claude-code-review-repository-fix";
 export type ReviewFixer = "ai-implement" | "repository";
 
 export interface ReviewCheckPair {
@@ -34,6 +34,10 @@ export interface ReviewProcessDefinition {
   checkPairs: readonly ReviewCheckPair[];
   readVerdict(input: ReviewVerdictInput): ReviewVerdictResult;
   fixer: ReviewFixer;
+  /** A trusted author's inline comment is classified by its 🔴/🟡/🟣 marker (webhook and review ledger). */
+  claudeInlineMarkers: boolean;
+  /** A 🔴 finding in a trusted Claude summary comment gates the in-run approval. */
+  summaryBlockingGates: boolean;
 }
 
 // Mirrors DEFAULT_REVIEW_CHECK_NAMES in `pipeline/steps/post-push-review.ts` (not exported there). The marker
@@ -71,6 +75,11 @@ function matchesPair(run: { name: string; appSlug: string }, pair: ReviewCheckPa
   const names = pair.names === "project-review-check-names" ? DEFAULT_REVIEW_CHECK_NAMES : pair.names;
   const name = run.name.trim().toLowerCase();
   return names.some((n) => n.trim().toLowerCase() === name);
+}
+
+/** `true` when `run` is a review check of `process`: its name and posting app match one of the process's check pairs. */
+export function isReviewCheckRun(run: { name: string; appSlug: string }, process: ReviewProcessDefinition): boolean {
+  return process.checkPairs.some((pair) => matchesPair(run, pair));
 }
 
 export function isTrustedReviewAuthor(login: string, process: ReviewProcessDefinition, extra: readonly string[]): boolean {
@@ -149,6 +158,8 @@ export const REVIEW_PROCESSES: Record<ReviewProcessId, ReviewProcessDefinition> 
     checkPairs: [GITHUB_ACTIONS_PAIR],
     readVerdict: (input) => readBlock(input.blocks) ?? noBlock(),
     fixer: "ai-implement",
+    claudeInlineMarkers: false,
+    summaryBlockingGates: false,
   },
   "claude-code-review": {
     id: "claude-code-review",
@@ -157,6 +168,19 @@ export const REVIEW_PROCESSES: Record<ReviewProcessId, ReviewProcessDefinition> 
     checkPairs: [GITHUB_ACTIONS_PAIR, CLAUDE_PAIR],
     readVerdict: claudeCodeReviewVerdict,
     fixer: "ai-implement",
+    claudeInlineMarkers: true,
+    summaryBlockingGates: true,
+  },
+  // Same reviewer as `claude-code-review`; the repository's own auto-fix is the only fixer for Claude's findings.
+  "claude-code-review-repository-fix": {
+    id: "claude-code-review-repository-fix",
+    label: "Claude Code Review, repository auto-fix",
+    trustedAuthors: CLAUDE_CODE_REVIEW_AUTHORS,
+    checkPairs: [GITHUB_ACTIONS_PAIR, CLAUDE_PAIR],
+    readVerdict: claudeCodeReviewVerdict,
+    fixer: "repository",
+    claudeInlineMarkers: true,
+    summaryBlockingGates: true,
   },
 };
 

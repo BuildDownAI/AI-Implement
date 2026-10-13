@@ -954,7 +954,7 @@ describe("migrated read handlers (AII-711)", () => {
     it("keeps the KgRefreshStatus shape", async () => {
       const status = await stageFor({ last: ok });
       expect(Object.keys(status).sort()).toEqual(
-        ["currentRun", "deployHeld", "executionMode", "flyMachine", "kgDegraded", "kgUnavailable", "lastDryRun", "lastRefresh", "materialize", "restate", "running", "servedStamp", "sidecar", "stage"].sort(),
+        ["currentRun", "deployHeld", "executionMode", "flyMachine", "kgDegraded", "kgUnavailable", "lastDryRun", "lastRefresh", "materialize", "restate", "runProfile", "running", "servedStamp", "sidecar", "stage"].sort(),
       );
     });
   });
@@ -1817,7 +1817,7 @@ describe("set_fly_machine_profile / get_kg_status flyMachine (AII-1130)", () => 
     const ctx = {
       ...fakeContext("get_kg_status"),
       objectClient: (def: { name: string }, key: string) =>
-        def.name === "FlyMachineProfile" ? profileClient(key) : { status: async () => null, lastAdminDryRun: async () => null },
+        def.name === "FlyMachineProfile" ? profileClient(key) : { status: async () => null, lastAdminDryRun: async () => null, get: async () => ({ config: { jobTimeoutMinutes: 240 }, source: "default" }) },
     } as unknown as restate.Context;
     const status = JSON.parse((await getKgStatusTool(ctx, { caller: SYSTEM_ADMIN, args: {} })).content[0].text);
     expect(status.flyMachine).toEqual({
@@ -1829,9 +1829,10 @@ describe("set_fly_machine_profile / get_kg_status flyMachine (AII-1130)", () => 
     const ctx = {
       ...fakeContext("get_kg_status"),
       objectClient: (def: { name: string }, key: string) =>
-        def.name === "FlyMachineProfile" ? profileClient(key) : { status: async () => null, lastAdminDryRun: async () => null },
+        def.name === "FlyMachineProfile" ? profileClient(key) : { status: async () => null, lastAdminDryRun: async () => null, get: async () => ({ config: { jobTimeoutMinutes: 240 }, source: "default" }) },
     } as unknown as restate.Context;
     const status = JSON.parse((await getKgStatusTool(ctx, { caller: SYSTEM_ADMIN, args: {} })).content[0].text);
     expect(status.executionMode).toMatchObject({ effective: expect.any(String), source: expect.any(String), setting: expect.any(String) });
+    expect(status.runProfile.backend).toBe(status.executionMode.effective);
   });
 });

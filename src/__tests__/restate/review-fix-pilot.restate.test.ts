@@ -88,10 +88,8 @@ const SHORT_DEADLINE_MS = 3_000;
 const SHORT_DEADLINE_JOB_TIMEOUT_MINUTES = SHORT_DEADLINE_MS / 60_000 - REVIEW_FIX_DEADLINE_BUFFER_MINUTES;
 const LONG_DEADLINE_JOB_TIMEOUT_MINUTES = 90;
 
-// A wider deadline than SHORT_DEADLINE_MS, reserved for the "GitHub success without a
-// stored result" scenario: it needs real elapsed time both for an explicit mid-window
-// "not yet approved" checkpoint and for the deadline itself, so it gets its own budget
-// rather than sharing the tighter one used by scenarios with no such checkpoint.
+// The deadline for the "GitHub success without a stored result" scenario. The attempt ends
+// at its first status read that sees the run ended (AII-1273), or at this deadline.
 const SUCCESS_NO_RESULT_DEADLINE_MS = 6_000;
 const SUCCESS_NO_RESULT_JOB_TIMEOUT_MINUTES = SUCCESS_NO_RESULT_DEADLINE_MS / 60_000 - REVIEW_FIX_DEADLINE_BUFFER_MINUTES;
 
@@ -521,9 +519,9 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     // Release the only budget slot's occupancy so a second admission attempt fails on
     // budget specifically, not merely because the PR is still occupied.
     await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
-    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", resultOf(fixture, prepared));
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!)).status).toBe("finalized");
 
     // A second, content-distinct feedback batch on the same, now-unoccupied PR must still
@@ -614,9 +612,9 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
 
     // Complete the first attempt so the PR is unoccupied again.
     await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
-    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const prepared1 = (await sqliteStore.getPreparedAttempt(attemptId1))!;
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId1, "result", resultOf(fixture, prepared1));
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId1)).status).toBe("finalized");
 
     // Finalizing the first attempt never touches review_findings — resolution is a
@@ -711,9 +709,9 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     fixture.dispatchImpl = crashAfterFirstCall(realDispatch);
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
     await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
-    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
     const done = await callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", resultOf(fixture, prepared));
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     expect(done).toMatchObject({ status: "stored" });
     expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!)).status).toBe("finalized");
     expect(fixture.dispatchCalls).toBe(1);
@@ -798,10 +796,10 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const fixture = freshScenario("duplicate-result");
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
     await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
-    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
     const result = resultOf(fixture, prepared);
     const first = await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", result);
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     expect(first).toEqual({ status: "stored", result });
     const second = await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", result);
     expect(second).toEqual({ status: "duplicate", attemptId: fixture.attemptId });
@@ -889,38 +887,27 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect(fixture.commentPosts).toBe(0);
   }, 25_000);
 
-  // A RestateEnvironment exposes no virtual-clock or
-  // timer-control API (confirmed: no clock/time symbol anywhere in its type
-  // declarations) — ctx.date.now()/ctx.sleep inside the workflow are real wall-clock
-  // time against the real `restate-server` binary, so there is no seam the harness could add
-  // to fast-forward past the deadline without a real wait. What the harness *can* make
-  // deterministic is the deadline's absolute size (SUCCESS_NO_RESULT_JOB_TIMEOUT_MINUTES,
-  // above) and an explicit "not yet" checkpoint partway through that window read
-  // directly off the durable SQLite row — recordOutcome/recordResult are the only
-  // writers of terminal_outcome_json/accepted_result_json, and neither runs until the
-  // deadline path fires, so a null read here is real proof of "not yet approved", not a
-  // timing assumption about the workflow's internal scheduling.
-  it.each(VARIANTS.map(([label]) => label))("GitHub success without a stored result never approves and stops without approval at the deadline (%s)", async (label) => {
+  // GitHub reports the run completed but no result is ever delivered. The attempt ends at its
+  // first status read that sees the run ended (AII-1273), or at the short deadline above.
+  // Either way it finalizes without approval and releases the slot.
+  it.each(VARIANTS.map(([label]) => label))("GitHub success without a stored result never approves and releases when the run ends (%s)", async (label) => {
     const env = envFor(label);
     const fixture = freshScenario("success-no-result");
     fixture.jobTimeoutMinutes = SUCCESS_NO_RESULT_JOB_TIMEOUT_MINUTES;
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
     await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
-    // No "result" is ever delivered for this attempt. Check well before the deadline
-    // that GitHub's success has not been turned into an approval or a terminal outcome.
-    await settle(1_000);
-    const midFlight = getDb().prepare(
-      `SELECT terminal_outcome_json, accepted_result_json FROM review_fix_attempts WHERE attempt_id = ?`,
-    ).get(fixture.attemptId!) as { terminal_outcome_json: string | null; accepted_result_json: string | null };
-    expect(midFlight.terminal_outcome_json).toBeNull();
-    expect(midFlight.accepted_result_json).toBeNull();
-    const midAdmission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
-      .get(fixture.attemptId!) as { released_at: number | null };
-    expect(midAdmission.released_at).toBeNull(); // still occupied — no stop-without-approval yet either
-
+    // No "result" is ever delivered for this attempt. GitHub's success must never become an
+    // approval, but the run having ended releases the slot at once (AII-1273) rather than at
+    // the deadline.
     const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!);
     expect(done).toEqual({ status: "finalized", terminal: { status: "succeeded", outputCommit: fixture.headSha }, approval: "not_applicable" });
+    const admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
+      .get(fixture.attemptId!) as { released_at: number | null };
+    expect(admission.released_at).not.toBeNull();
+    const stored = getDb().prepare(`SELECT accepted_result_json FROM review_fix_attempts WHERE attempt_id = ?`)
+      .get(fixture.attemptId!) as { accepted_result_json: string | null };
+    expect(stored.accepted_result_json).toBeNull();
     expect(fixture.commentPosts).toBe(0);
   }, 20_000);
 
@@ -933,10 +920,10 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const fixture = freshScenario("stale-after-final");
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
     await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
-    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
     const result = resultOf(fixture, prepared);
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", result);
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!);
     expect(done).toMatchObject({ status: "finalized", approval: "applied" });
     const outcomeBefore = await sqliteStore.getRecordedOutcome(fixture.attemptId!);
@@ -972,10 +959,10 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
     await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
     fixture.recordResultOverride = crashAfterFirstCall((id: AttemptId, result: ReviewFixResultMetadataV1, now: number) => sqliteStore.recordResult(id, result, now));
-    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
     const result = resultOf(fixture, prepared);
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", result);
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!)).status).toBe("finalized");
     const stored = await sqliteStore.getAcceptedResult(fixture.attemptId!);
     expect(stored?.result).toEqual(result);
@@ -994,10 +981,10 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     fixture.applyApprovalEffectOverride = crashAfterFirstCall(rawGithub.applyApprovalEffect.bind(rawGithub));
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
     await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
-    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
     const result = resultOf(fixture, prepared);
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", result);
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!);
     expect(done).toMatchObject({ status: "finalized", approval: "applied" });
     expect(fixture.commentPosts).toBe(1); // the crashed call's write landed; the retry's upsert did not post a second comment
@@ -1012,7 +999,6 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     // whose dispatch overwrites it. The journal and row below must be this attempt's, not that one's.
     const attemptId = fixture.attemptId!;
     await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
-    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;
     const result = resultOf(fixture, prepared);
     const secret = "journal-projection-secret";
@@ -1020,6 +1006,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const tokens = (["result", "progress", "publication"] as const)
       .map((audience) => mintPreparedReviewFixToken({ attemptId, audience, secret }).token);
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "result", result);
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
     expect(done).toMatchObject({ status: "finalized", approval: "applied" });
 
@@ -1219,9 +1206,9 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const fixture = freshScenario("closed-pr");
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
     await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
-    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", resultOf(fixture, prepared));
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!)).status).toBe("finalized");
     // The PR is now unoccupied — a normal feedback nudge here would admit a second attempt
     // (proven by the overflow/re-report scenarios above). Marking it closed is what must be
@@ -1275,9 +1262,9 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
       replacement = await replaceEndpoint(env, [pr, attemptWorkflow]);
       await env.startedRestateServer.restart(); // same disk-backed server/journal
 
-      fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
       const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;
       await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "result", resultOf(fixture, prepared));
+      fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
       const attached = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
       expect(attached).toMatchObject({ status: "finalized", approval: "applied" });
       expect(fixture.dispatchCalls).toBe(1);
