@@ -49,7 +49,7 @@ import { createKgRefreshSenders, type KgRefreshSender, type KgRefreshSenderDeps 
 import { DURABLE_RUNNER_PURPOSE_KEY, DURABLE_RUNNER_PURPOSE_VALUE } from "../durable-runner.js";
 import { createGhaRunProfile } from "./gha-run-profile.js";
 import { DURABLE_RUNNER_DISPATCH_ID_KEY, createFlyMachineProfile, type FlyMachineProfileDeps } from "./fly-machine-profile.js";
-import { createKgRepo, type KgRepoEnqueueInput, type KgRepoEnqueueResult, type KgRepoPrInput, type KgRepoTriggerResult, type StoredDryRunOutcome } from "./kg-repo.js";
+import { createKgRepo, type KgRepoEnqueueInput, type KgRepoEnqueueResult, type KgRepoPrInput, type KgRepoTriggerResult } from "./kg-repo.js";
 import type { Step } from "../pipeline/types.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
@@ -522,9 +522,7 @@ export interface KgRefreshIngressClient {
     entry: KgRepoEnqueueInput,
     opts?: { idempotencyKey?: string },
   ): Promise<Exclude<KgIngressResult<KgRepoEnqueueResult>, { readonly status: "not-found" }>>;
-  /** The stored dry-run verdict for a PR; `accepted` with `value: null` when none is held. */
-  dryRunOutcome(slug: string, pr: KgRepoPrInput): Promise<KgIngressResult<StoredDryRunOutcome | null>>;
-  /** Drops a closed PR's verdict and held dry-run head. */
+  /** Drops a closed PR's held dry-run head. */
   forgetPr(slug: string, pr: KgRepoPrInput): Promise<KgIngressResult>;
 }
 
@@ -586,7 +584,6 @@ export function createKgRefreshIngressClient(
     repoStatus: (slug) => invoke<{ triggerId: string; startedAt: number } | null>(() => repo(slug).status(callOpts())),
     enqueueDryRun: (slug, entry, opts) =>
       invoke<KgRepoEnqueueResult>(() => repo(slug).enqueueDryRun(entry, callOpts(opts?.idempotencyKey))) as ReturnType<KgRefreshIngressClient["enqueueDryRun"]>,
-    dryRunOutcome: (slug, pr) => invoke<StoredDryRunOutcome | null>(() => repo(slug).dryRunOutcome(pr, callOpts())),
     forgetPr: (slug, pr) => invoke(() => repo(slug).forgetPr(pr, callOpts())),
   };
 }

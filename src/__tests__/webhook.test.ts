@@ -13,7 +13,6 @@ import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
 import type { RepoMapping } from "../config.js";
 import type { KgPrCheckConfig } from "../webhook.js";
-import type { KgDryRunReportTarget } from "../kg-refresh.js";
 
 // ---------- Hoisted mocks for /ai-implement path ----------
 

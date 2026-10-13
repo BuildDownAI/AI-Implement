@@ -44,12 +44,6 @@ interface PendingDryRun {
   enqueuedAt: number;
 }
 
-/** The stored verdict of one PR's last dry run, in state under `outcome:<repo>#<prNumber>`. */
-export interface StoredDryRunOutcome {
-  sha: string;
-  outcome: RefreshOutcome;
-}
-
 export interface KgRepoDependencies {
   /** The Restate service name of the workflow this object starts — "KgRefresh" in production. */
   workflowName: string;
@@ -220,27 +214,17 @@ export function createKgRepo(deps: KgRepoDependencies) {
     }
   }
 
-  /** Stores the PR's verdict; one state key per PR, with `outcomeKeys` holding the insertion order for the cap. */
-  async function recordDryRunOutcome(ctx: ObjectContext, input: KgRepoRecordOutcomeInput): Promise<void> {
-    const { report, outcome } = input;
-    const stateKey = outcomeStateKey(report.repo, report.prNumber);
-    const order = ((await ctx.get<string[]>("outcomeKeys")) ?? []).filter((k) => k !== stateKey);
-    order.push(stateKey);
-    while (order.length > MAX_TRACKED_PRS) ctx.clear(order.shift()!);
-    ctx.set("outcomeKeys", order);
-    ctx.set<StoredDryRunOutcome>(stateKey, { sha: report.sha, outcome });
-  }
+  // remove after 2026-11-13: the workflow still journals a send to this handler (removing the send
+  // would break replay of a dry-run in flight at deploy). Nothing reads a stored outcome any more, so it stores nothing.
+  async function recordDryRunOutcome(_ctx: ObjectContext, _input: KgRepoRecordOutcomeInput): Promise<void> {}
 
   // remove after 2026-11-13: a dry-run workflow in flight at deploy replays its send to this
   // handler, and a send to a missing handler fails that invocation. It stores nothing.
   async function recordAdminDryRun(_ctx: ObjectContext): Promise<void> {}
 
-  async function dryRunOutcome(ctx: ObjectSharedContext, input: KgRepoPrInput): Promise<StoredDryRunOutcome | null> {
-    return (await ctx.get<StoredDryRunOutcome>(outcomeStateKey(input.repo, input.prNumber))) ?? null;
-  }
-
-  /** A closed PR can never be re-reported: drops its verdict and any held dry-run head. */
+  /** Records a closed PR and drops its held dry-run head and sha key. */
   async function forgetPr(ctx: ObjectContext, input: KgRepoPrInput): Promise<void> {
+    // remove after 2026-11-13: clears an `outcome:` entry stored by a release that still wrote them.
     const stateKey = outcomeStateKey(input.repo, input.prNumber);
     ctx.clear(stateKey);
     ctx.clear(shaStateKey(input.repo, input.prNumber));
@@ -279,7 +263,6 @@ export function createKgRepo(deps: KgRepoDependencies) {
       extend: restate.handlers.object.exclusive({ input: serde.zod(extendInputSchema), ingressPrivate: true }, extend),
       recordDryRunOutcome: restate.handlers.object.exclusive({ input: serde.zod(recordOutcomeInputSchema), ingressPrivate: true }, recordDryRunOutcome),
       recordAdminDryRun: restate.handlers.object.exclusive({ ingressPrivate: true }, recordAdminDryRun),
-      dryRunOutcome: restate.handlers.object.shared({ input: serde.zod(prInputSchema) }, dryRunOutcome),
       forgetPr: restate.handlers.object.exclusive({ input: serde.zod(prInputSchema) }, forgetPr),
       status: restate.handlers.object.shared(status),
     },

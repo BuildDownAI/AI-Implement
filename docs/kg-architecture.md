@@ -341,14 +341,11 @@ the PR.
 
 A refused tracker-file shrink fails the commit status and the comment says so. There is no PR label that accepts it: a shrink is accepted at the decision gate of the refresh that runs after the PR merges, so the dry-run never decides on the baseline.
 
-Outcomes are stored per PR on the `KgRepo` object, one `outcome:<repo>#<prNumber>` state key each,
-pinned to the head sha they ran against (AII-636, AII-977), so the check run and its sticky comment
-on the PR's own head SHA only ever carry that PR's own verdict — never another PR's — and `dryRunOutcome` returns nothing once a new
-push supersedes the stored sha. The `dry-run-report` step sends `recordDryRunOutcome`; the webhook reads it back with
-`dryRunOutcome`. At most `MAX_TRACKED_PRS` outcomes are kept (an `outcomeKeys` list gives the
-eviction order), and `forgetPr` on PR close drops the outcome and any held head. Outcomes survive a
-restart in Restate state; the old `kg_refresh_dry_run_outcomes` settings row is deleted at boot, and
-its live outcomes are re-posted by the next push. The webhook keeps no sha dedup: the delivery id is
+The PR check is a check run and its sticky comment on the PR's own head SHA, posted by the workflow's
+`dry-run-report` step; nothing is stored or read back, so each report carries only that PR's own verdict
+(AII-636, AII-977). `forgetPr` on PR close drops any held head. The old `kg_refresh_dry_run_outcomes`
+settings row is deleted at boot. `KgRepo.recordDryRunOutcome` is a no-op kept until 2026-11-13 for the
+send a dry-run workflow in flight at deploy has journaled. The webhook keeps no sha dedup: the delivery id is
 the `enqueueDryRun` idempotency key, and the object keeps one `sha:<repo>#<pr>` state key holding the
 last head sha it accepted for the PR — a second event for that sha (any delivery id) returns
 `{ duplicate: true }`, neither submitting nor queuing, and the webhook answers 200. `forgetPr` clears the key. A PR dry-run queued behind a
