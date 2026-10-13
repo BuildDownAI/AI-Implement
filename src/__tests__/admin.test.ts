@@ -2330,9 +2330,6 @@ describe("admin kg refresh options removed (AII-1263)", () => {
     kgRefreshDeps.status.mockReset();
   });
 
-  // The listed SSO admin the suite seeds (see adminConfig): an identity-bearing session.
-  const ssoAdmin = { email: "ada@eudoxus.ai", sub: "google|123", provider: "google" };
-
   async function kgRequest(
     url: string,
     method: string,
