@@ -1123,7 +1123,7 @@ export async function handleRunnerResult(
       // jobs (AII-277 livelock) and resets machine_nonce on terminal transition.
       // AII-1291: no approval mark here. The gap-fill pushed a head the external review has not
       // judged yet; LateExternalReview writes the mark once that review passes on the head.
-      // Without Restate no mark is written and the PR is held, as for an initial run.
+      // Without Restate no mark is written and the PR is held until the poll sweep resubmits (an initial-run success stamps the mark in the callback).
       updateJobStatus(job.id, "completed", "external_review_pending", job.prUrl!);
       const target = parsePrUrlTarget(job.prUrl!);
       if (input.submitLateExternalReview && target) {

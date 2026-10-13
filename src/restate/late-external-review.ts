@@ -14,11 +14,15 @@ import * as restateClients from "@restatedev/restate-sdk-clients";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { AppConfig } from "../index.js";
-import { getCombinedChecksState, getCommitTime, getPullRequestState, listCheckRuns, listPrComments, listPullRequestCommits, postPrComment } from "../github.js";
+import { parse as parseYaml } from "yaml";
+import { parseReviewCheckNamesConfig } from "../pipeline/steps/install.js";
+import { getCombinedChecksState, getCommitTime, getDefaultBranchFileText, getPullRequestState, listCheckRuns, listPrComments, listPullRequestCommits, postPrComment } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { getJobByDispatchId, stampJobApproved } from "../log.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
-import { isReviewCheckRun, REVIEW_PROCESSES } from "../review-process.js";
+import { getMappings } from "../config.js";
+import { classifyReviewIssueComment, type ReviewLedgerOptions } from "../pipeline/review-ledger.js";
+import { isReviewCheckRun, resolveReviewProcess, REVIEW_PROCESSES } from "../review-process.js";
 import type { RestateService } from "./endpoint.js";
 import { restateRetentionMs } from "./retention.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
@@ -178,6 +182,52 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
 
 export type LateExternalReviewDefinition = ReturnType<typeof createLateExternalReviewWorkflow>;
 
+/** The project's `reviewCheckNames` from `.ai-implement/config.yml` on the default branch (a PR head must not choose its own gate). Absent file, bad YAML or an unexpected shape read as "none configured"; an unreadable repo throws. */
+async function readReviewCheckNames(token: string, owner: string, repo: string): Promise<string[]> {
+  const text = await getDefaultBranchFileText(token, owner, repo, ".ai-implement/config.yml");
+  if (text === null) return [];
+  let names: unknown;
+  try {
+    names = (parseYaml(text) as { reviewCheckNames?: unknown } | null)?.reviewCheckNames;
+  } catch {
+    return [];
+  }
+  return parseReviewCheckNamesConfig(names) ?? [];
+}
+
+/** The review process and extra trusted authors of the project that maps `owner/repo`; an unmapped repo gets the defaults. */
+function reviewLedgerOptionsFor(owner: string, repo: string): ReviewLedgerOptions {
+  const mapping = Object.values(getMappings()).find((m) => m.owner === owner && m.repo === repo);
+  return { process: resolveReviewProcess(mapping?.reviewProcess), extraAuthors: mapping?.trustedReviewAuthors ?? [] };
+}
+
+/**
+ * `true` when Claude's newest review comment on the PR was written for the current head and does not approve it
+ * (AII-1303). The ledger stores no verdict, so a `changes_requested` review with only `minor` findings leaves no
+ * blocking row. The comment carries no SHA: "of this head" is `updated_at`/`created_at` at or after the head's commit
+ * time, the rule the ledger uses for findings. A recognised review with no verdict (the old heading format) does not
+ * block unless its findings could not be read; its blocking findings are in the ledger.
+ */
+async function newestReviewRejectsHead(token: string, input: { owner: string; repo: string; prNumber: number }, headCommittedAtMs: number): Promise<boolean> {
+  const options = reviewLedgerOptionsFor(input.owner, input.repo);
+  const comments = (await listPrComments(token, input.owner, input.repo, input.prNumber))
+    .map((c, index) => ({ c, index, at: Date.parse(c.updatedAt ?? c.createdAt ?? "") }))
+    .map((e) => ({ ...e, at: Number.isFinite(e.at) ? e.at : 0 }))
+    .sort((a, b) => b.at - a.at || b.index - a.index);
+  for (const { c, at } of comments) {
+    const classified = classifyReviewIssueComment({
+      body: c.body,
+      ...(c.htmlUrl ? { html_url: c.htmlUrl } : {}),
+      ...(c.user ? { user: { login: c.user.login, ...(c.user.type ? { type: c.user.type } : {}) } } : {}),
+    }, options);
+    if (classified === null) continue;
+    // The newest recognised review decides; an older head's review does not count.
+    if (at < headCommittedAtMs) return false;
+    return classified.findingsUnavailable || (classified.verdict !== undefined && classified.verdict !== "approve");
+  }
+  return false;
+}
+
 /** Production deps. A fresh installation token per call; it is never journaled. */
 export function createProductionLateExternalReviewDependencies(config: Pick<AppConfig, "githubAppId" | "githubAppPrivateKey">): LateExternalReviewDependencies {
   const token = (owner: string) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
@@ -191,9 +241,10 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
       const t = await token(input.owner);
       const commits = await listPullRequestCommits(t, input.owner, input.repo, input.prNumber);
       const earlier = commits.filter((sha) => sha !== input.headSha).slice(-20).reverse();
+      const names = await readReviewCheckNames(t, input.owner, input.repo);
       for (const sha of earlier) {
         const runs = await listCheckRuns(t, input.owner, input.repo, sha);
-        if (runs.some((r) => isReviewCheckRun(r, REVIEW_PROCESSES["claude-code-review-repository-fix"]))) return true;
+        if (runs.some((r) => isReviewCheckRun(r, REVIEW_PROCESSES["claude-code-review-repository-fix"], names))) return true;
       }
       return false;
     },
@@ -209,11 +260,13 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
       let checks = await getCombinedChecksState(t, input.owner, input.repo, pr.headSha);
       // Throws on an unreadable commit, so the step retries rather than reading "no findings".
       const headCommittedAtMs = await getCommitTime(t, input.owner, input.repo, pr.headSha);
+      const lateGapFill = input.gapFill === true && !input.followHead;
       if ((input.followHead || input.gapFill) && checks === "success") {
+        const names = lateGapFill ? await readReviewCheckNames(t, input.owner, input.repo) : [];
         // A head pushed a moment ago has no check runs yet, which reads as "success". Its own review must
         // have completed with `success` before the head can count as clean (a skipped run is not a review).
         const reviewRuns = (await listCheckRuns(t, input.owner, input.repo, pr.headSha))
-          .filter((r) => isReviewCheckRun(r, REVIEW_PROCESSES["claude-code-review-repository-fix"]));
+          .filter((r) => isReviewCheckRun(r, REVIEW_PROCESSES["claude-code-review-repository-fix"], names));
         const succeeded = reviewRuns.some((r) => r.status === "completed" && r.conclusion === "success");
         // A gap-fill whose head has no review run after the grace belongs to a repo with no reviewer.
         const noReviewer = input.gapFill && !input.followHead && !input.reviewerExpected && reviewRuns.length === 0
@@ -221,8 +274,11 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
         if (!succeeded && !noReviewer) checks = "pending";
       }
       // The ledger is keyed by "owner/repo" (see the review-fix queue in src/index.ts).
-      const blockingLastSeenAtMs = listOpenReviewFindings(`${input.owner}/${input.repo}`, input.prNumber)
+      const blockingLastSeenAtMs: number[] = listOpenReviewFindings(`${input.owner}/${input.repo}`, input.prNumber)
         .filter((f) => f.severity === "blocking").map((f) => f.lastSeenAt);
+      // A gap-fill head is never judged in-run, and the ledger has no verdict: read Claude's own (AII-1303).
+      // The tick reports it as a blocking finding seen now, which the workflow ends `findings` on.
+      if (lateGapFill && await newestReviewRejectsHead(t, input, headCommittedAtMs)) blockingLastSeenAtMs.push(Date.now());
       return { open, headSha: pr.headSha, checks, headCommittedAtMs, blockingLastSeenAtMs };
     },
     findJob(dispatchId) {

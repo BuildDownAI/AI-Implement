@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime } from "../github.js";
+import { dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime, getDefaultBranchFileText } from "../github.js";
 import { decodeRunConfig, encodeRunConfig } from "../run-config.js";
 import type { RepoMapping } from "../config.js";
 
@@ -1157,5 +1157,32 @@ describe("getCommitTime", () => {
   it("throws on a fetch error", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("net"); }));
     await expect(getCommitTime("t", "o", "r", "abc")).rejects.toThrow(/net/);
+  });
+});
+
+describe("getDefaultBranchFileText", () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+  const stub = (res: unknown) => vi.stubGlobal("fetch", vi.fn(async () => res));
+
+  it("decodes a base64 file and encodes each path segment", async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ type: "file", encoding: "base64", content: Buffer.from("a: 1\n").toString("base64") }) }));
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await getDefaultBranchFileText("t", "o", "r", ".ai-implement/my file#1.yml")).toBe("a: 1\n");
+    expect((fetchMock.mock.calls[0] as unknown as [string])[0]).toBe("https://api.github.com/repos/o/r/contents/.ai-implement/my%20file%231.yml");
+  });
+
+  it("returns null on 404", async () => {
+    stub({ ok: false, status: 404, json: async () => ({}) });
+    expect(await getDefaultBranchFileText("t", "o", "r", "x")).toBeNull();
+  });
+
+  it("throws on other non-ok responses", async () => {
+    stub({ ok: false, status: 500, json: async () => ({}) });
+    await expect(getDefaultBranchFileText("t", "o", "r", "x")).rejects.toThrow(/500/);
+  });
+
+  it("returns null when the path is not a file", async () => {
+    stub({ ok: true, status: 200, json: async () => ({ type: "dir" }) });
+    expect(await getDefaultBranchFileText("t", "o", "r", "x")).toBeNull();
   });
 });
