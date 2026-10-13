@@ -15,6 +15,7 @@ import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { AppConfig } from "../index.js";
 import { parse as parseYaml } from "yaml";
+import { parseReviewCheckNamesConfig } from "../pipeline/steps/install.js";
 import { getCombinedChecksState, getCommitTime, getDefaultBranchFileText, getPullRequestState, listCheckRuns, listPrComments, listPullRequestCommits, postPrComment } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { getJobByDispatchId, stampJobApproved } from "../log.js";
@@ -191,7 +192,7 @@ async function readReviewCheckNames(token: string, owner: string, repo: string):
   } catch {
     return [];
   }
-  return Array.isArray(names) ? names.filter((n): n is string => typeof n === "string" && n.trim().length > 0).map((n) => n.trim()) : [];
+  return parseReviewCheckNamesConfig(names) ?? [];
 }
 
 /** The review process and extra trusted authors of the project that maps `owner/repo`; an unmapped repo gets the defaults. */

@@ -1540,7 +1540,7 @@ export async function compareCommits(
  * Any other failure throws, so a caller inside a retried step never reads "no file" from an outage.
  */
 export async function getDefaultBranchFileText(token: string, owner: string, repo: string, path: string): Promise<string | null> {
-  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${path}`, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}`, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`getDefaultBranchFileText ${path} failed: HTTP ${res.status}`);
   const body = (await res.json()) as { content?: string; encoding?: string; type?: string };
