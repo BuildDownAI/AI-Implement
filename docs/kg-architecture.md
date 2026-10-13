@@ -301,10 +301,8 @@ line-count table land on `get_kg_status` as `lastRefresh.dryRun`, `lastRefresh.d
 whatever it held before the dispatch rather than advancing through `staging`/`serving`/`reverted`.
 A dry-run and a real run of the same KG head print the same part table. The same dry-run is
 reachable from the admin REST route, `POST /api/kg/refresh` with body `{ "dryRun": true }` (the
-response echoes `dryRun` beside the trigger's fields; no body is the unchanged real refresh), and
-from the **Dry-run refresh** button beside **Refresh graph now** on the Knowledge Graph Pipelines page
-(AII-635). When the last terminal outcome was a dry-run, the Knowledge graph card on that page shows its
-verdict and the per-part table (`part | previous | new | delta`). A guard refusal carries the same
+response echoes `dryRun` beside the trigger's fields; no body is the unchanged real refresh). The
+Knowledge Graph Pipelines page has no dry-run button and no last-dry-run table. A guard refusal carries the same
 `lastRefresh.partTable` and a part-naming `detail` on `get_kg_status` whether it came from a
 dry-run or a real (non-dry-run) refresh (AII-638) — only a real success omits `guardVerdict`/
 `partTable`, since it reports a snapshot commit instead.
@@ -562,12 +560,8 @@ still recognized and handled as a dry run instead of falling through to the real
 
 ### Accept-new-baseline plumbing (AII-628)
 
-`trigger_kg_refresh { acceptNewBaseline: true }` (the MCP tool, admin role), `POST /api/kg/refresh`
-with body `{ "acceptNewBaseline": true }`, and the **Accept new baseline & refresh** button on the
-Knowledge Graph Pipelines page (a separate, confirm-gated control beside **Refresh graph now** and **Dry-run
-refresh** — deliberately not a third argument to the existing refresh button, so accepting a shrink
-is always a distinct, deliberate click after reading the guard table, never the default path) all
-carry the same flag through the same envelope path `dryRun` already established: `trigger(opts)`
+`trigger_kg_refresh { acceptNewBaseline: true }` (the MCP tool, admin role) and `POST /api/kg/refresh`
+with body `{ "acceptNewBaseline": true }` both carry the same flag through the same envelope path `dryRun` already established: `trigger(opts)`
 sets `kgAcceptNewBaseline: true` on the `RunConfigV1` it builds, along with `kgBaselineActor` (the
 caller's email — from `identity.email` on the MCP path, from the admin session on the REST path) —
 `resolveKgRefreshInputs` in `kg-refresh-run.ts` decodes both back out and puts them on
