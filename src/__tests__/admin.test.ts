@@ -5300,7 +5300,7 @@ describe("per-page grants", () => {
     });
   });
 
-  describe("journal grant", () => {
+  describe("journal access (admin-only)", () => {
     const journalFetch = vi.fn();
     const journalDeps = {
       readJournal: (query: Record<string, string>) => journalModule.handleJournalRequest(query, { fetchImpl: journalFetch as never }),
