@@ -133,7 +133,7 @@ None of the four is an admin-UI setting — every consumer is a same-machine pee
 
 ### Restate UI through the orchestrator (AII-1261)
 
-Admins reach the Restate UI without `flyctl`: `src/restate/ui-proxy.ts` (`handleRestateUiRequest`, dispatched in `handleRequest` before the admin route block) forwards an allowlist of root paths to the loopback listeners. No new listener is opened. The UI cannot live under a path prefix (its router base is `/ui/`), so the paths are at the orchestrator's root. Decision record: [ADR 039](adr/039-admins-reach-the-restate-ui-through-the-orchestrator.md).
+Admins reach the Restate UI without `flyctl`: `src/restate/ui-proxy.ts` (`handleRestateUiRequest`, dispatched in `handleRequest` before the admin route block) forwards an allowlist of root paths to the loopback listeners. No new listener is opened. The UI cannot live under a path prefix (its router base is `/ui/`), so the paths are at the orchestrator's root. Decision record: [ADR 040](adr/040-admins-reach-the-restate-ui-through-the-orchestrator.md).
 
 | Incoming path | Forwarded to |
 |---|---|
@@ -153,7 +153,7 @@ Any other path or method is not handled and the orchestrator's routing continues
 
 ### Journal queries and the Restate UI (AII-1128)
 
-The admin API is loopback. `runIntrospectionQuery` and `sqlQuote` in `endpoint.ts` query `sys_invocation` for the deploy drain (`queryNonCompletedInvocations`). `/query` is exposed to the admin role only, through the Restate UI door (§ "Restate UI through the orchestrator", ADR 039). The orchestrator has no journal route: `GET /api/restate/journal` answers 404 (AII-1265), and there is no `journal` page grant (removed from `PAGE_ROUTES`, AII-1262). Admins read journals in the Restate UI (§ "Reading a run's journal").
+The admin API is loopback. `runIntrospectionQuery` and `sqlQuote` in `endpoint.ts` query `sys_invocation` for the deploy drain (`queryNonCompletedInvocations`). `/query` is exposed to the admin role only, through the Restate UI door (§ "Restate UI through the orchestrator", ADR 040). The orchestrator has no journal route: `GET /api/restate/journal` answers 404 (AII-1265), and there is no `journal` page grant (removed from `PAGE_ROUTES`, AII-1262). Admins read journals in the Restate UI (§ "Reading a run's journal").
 
 ### Sidecar environment is an explicit allowlist, never `...process.env` (AII-728)
 

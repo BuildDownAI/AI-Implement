@@ -4800,7 +4800,7 @@ function startServer(
       return;
     }
 
-    // Restate UI, its admin API paths and ingress (AII-1261, ADR 039): admin role only.
+    // Restate UI, its admin API paths and ingress (AII-1261, ADR 040): admin role only.
     if (handleRestateUiRequest(req, res, { adminConfigured: Boolean(config.adminAccessCode) || isOAuthConfigured() })) return;
 
     // Admin routes - match on the path only, so query params can still be read when needed

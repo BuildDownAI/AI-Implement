@@ -3,7 +3,7 @@ import { authenticateAdminRequest } from "../admin-session.js";
 import { RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BASE_URL, RESTATE_UI_INGRESS_PREFIX } from "./server.js";
 
 /**
- * Admin-only door to the Restate UI (AII-1261, ADR 039). The UI cannot live under a path
+ * Admin-only door to the Restate UI (AII-1261, ADR 040). The UI cannot live under a path
  * prefix, so this module owns an allowlist of root paths on the orchestrator origin plus
  * `/admin/restate/ingress/` for the playground's ingress calls.
  */

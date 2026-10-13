@@ -272,7 +272,7 @@ export class RestateSidecar {
       RESTATE_DEFAULT_NUM_PARTITIONS: RESTATE_DEFAULT_NUM_PARTITIONS,
       RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE: RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE,
     });
-    // The address the UI playground calls (AII-1261, ADR 039). Unset leaves the loopback default for local dev.
+    // The address the UI playground calls (AII-1261, ADR 040). Unset leaves the loopback default for local dev.
     const publicBase = process.env.OAUTH_REDIRECT_BASE_URL?.trim().replace(/\/+$/, "");
     if (publicBase) childEnv.RESTATE_INGRESS__ADVERTISED_ADDRESS = `${publicBase}${RESTATE_UI_INGRESS_PREFIX}/`;
 

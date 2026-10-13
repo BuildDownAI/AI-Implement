@@ -28,7 +28,7 @@ A workflow that owns a run outside Restate uses one wait, the **owned-run wait**
 | result | workflow promise `report` | the run ended and gave its result | one time, by the verify-only runner callback |
 | started evidence | workflow promise `progress` | the run executes | one time, by the first proof from any source |
 | stop request | workflow promise `cancel` | an operator or a newer trigger stops the run | one time |
-| decision | workflow promise `decide` | an operator accepts or cancels a snapshot held at the decision gate | one time, by `decide_kg_refresh` (the admin page and `/mcp`) or the Restate UI playground (ADR 039) |
+| decision | workflow promise `decide` | an operator accepts or cancels a snapshot held at the decision gate | one time, by `decide_kg_refresh` (the admin page and `/mcp`) or the Restate UI playground (ADR 040) |
 | runner step | workflow promise `step:<id>:running` / `step:<id>:ended` | the runner started or ended pipeline step `<id>` | one time each, by `TokenStepReporter` (`src/pipeline/reporter.ts`) through `POST /runner/progress` and the `progress` handler |
 | tick | durable timer (`ctx.sleep`) | time for the next status read or a deadline check | each interval |
 

@@ -1,4 +1,4 @@
-# 039. Admins reach the Restate UI through the orchestrator
+# 040. Admins reach the Restate UI through the orchestrator
 
 **Status:** Accepted
 **Date:** 2026-10-12
