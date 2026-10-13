@@ -297,10 +297,11 @@ with `option-removed` (a held run at the decision gate is the preview). The only
 KG-repo PR check below: the same runner job with the push skipped, so every guard in
 `kg-snapshot-push` still runs against the freshly ingested snapshot but nothing is committed or
 pushed. `servedStamp` and `current/` never change, and `stage` is restored to whatever it held before
-the dispatch. A dry-run and a real run of the same KG head print the same part table. A guard refusal carries the same
-`lastRefresh.partTable` and a part-naming `detail` on `get_kg_status` whether it came from a
-dry-run or a real (non-dry-run) refresh (AII-638) — only a real success omits `guardVerdict`/
-`partTable`, since it reports a snapshot commit instead.
+the dispatch. A dry-run and a real run of the same KG head print the same part table. A dry-run never
+writes `lastRefresh` (it reports through the PR check's sticky comment instead). A guard refusal on a
+real (non-dry-run) refresh carries `lastRefresh.partTable` and a part-naming `detail` on
+`get_kg_status` (AII-638) — only a real success omits `guardVerdict`/`partTable`, since it reports a
+snapshot commit instead.
 
 **Redeploy remains the path for code, not data** — a change that touches the sidecar's code rather
 than its data ships by deploy, and the image build reads whatever snapshot is on the KG repo's default
