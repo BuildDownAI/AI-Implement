@@ -4,7 +4,7 @@ import { listLog, getLatestDispatchForPr } from "./log.js";
 import { enqueueReconciliation, hasReconciliationForPr } from "./reconciliation.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { acceptReviewFixWebhookEvent } from "./review-fix-queue.js";
-import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, classifyReviewIssueComment, type ReviewLedgerFinding } from "./pipeline/review-ledger.js";
+import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, classifyReviewIssueComment, reviewContractFindingGates, type ReviewLedgerFinding } from "./pipeline/review-ledger.js";
 import { getMappings, resolveReviewFixLifecycle } from "./config.js";
 import type { ReviewFixIngressClient } from "./restate/review-fix-client.js";
 import { REVIEW_FIX_EVENT_BODY_MAX_BYTES, type ReviewFixFeedbackEvent } from "./restate/review-fix-pr.js";
@@ -1037,6 +1037,19 @@ async function handleIssueCommentWebhook(
   if (classified.findings.length === 0) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(classified.verdict === "approve" ? { ignored: true, reason: "approved" } : { ignored: true }));
+    return;
+  }
+
+  // An approve verdict whose findings are all non-gating (minor) never starts a fix run:
+  // no queue entry, no Restate forward, no ledger row. The inline-comment rail is unchanged.
+  // Only `review-contract` findings carry the blocking/minor contract; other sources (e.g. prose
+  // `claude-review-summary` findings with `medium` severity) keep queueing as before.
+  if (
+    classified.verdict === "approve" &&
+    classified.findings.every((f) => f.source === "review-contract" && !reviewContractFindingGates(f, classified.verdict))
+  ) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "approved" }));
     return;
   }
 

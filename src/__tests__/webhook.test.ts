@@ -1661,6 +1661,117 @@ describe("review feedback ingestion", () => {
     expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
   });
 
+  it("ignores an approve verdict with only minor findings as approved, without enqueueing", async () => {
+    const jobId = log.appendLog({ issueId: "issue-71", issueIdentifier: "AII-71", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/71");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "## Review\n\nNotes.\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"approve\",\"findings\":[{\"severity\":\"minor\",\"path\":\"src/x.ts\",\"line\":1,\"body\":\"Nit one.\"},{\"severity\":\"minor\",\"path\":\"src/y.ts\",\"line\":2,\"body\":\"Nit two.\"}]}\n```",
+        html_url: "https://github.com/org/repo/issues/71#issuecomment-71",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 71,
+        html_url: "https://github.com/org/repo/pull/71",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/71" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "approved" });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 71)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("still enqueues a prose Claude summary whose medium findings sit beside a ready-to-merge line", async () => {
+    const jobId = log.appendLog({ issueId: "issue-73", issueIdentifier: "AII-73", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/73");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "**Claude finished the review**\n\n### Review\n\n### Issues\n- Real concern in src/x.ts that needs a change.\n\n**Merge readiness:** Ready to merge",
+        html_url: "https://github.com/org/repo/issues/73#issuecomment-73",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 73,
+        html_url: "https://github.com/org/repo/pull/73",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/73" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(JSON.parse(res.body)).toMatchObject({ queued: true });
+  });
+
+  it("still enqueues an approve verdict that carries a blocking finding", async () => {
+    const jobId = log.appendLog({ issueId: "issue-72", issueIdentifier: "AII-72", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/72");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "## Review\n\nNotes.\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"approve\",\"findings\":[{\"severity\":\"blocking\",\"path\":\"src/x.ts\",\"line\":1,\"body\":\"Bug.\"}]}\n```",
+        html_url: "https://github.com/org/repo/issues/72#issuecomment-72",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 72,
+        html_url: "https://github.com/org/repo/pull/72",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/72" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ queued: true });
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+  });
+
+  it("still enqueues a changes_requested verdict with only a minor finding", async () => {
+    const jobId = log.appendLog({ issueId: "issue-73", issueIdentifier: "AII-73", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/73");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "## Review\n\nNotes.\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[{\"severity\":\"minor\",\"path\":\"src/x.ts\",\"line\":1,\"body\":\"Nit one.\"},{\"severity\":\"minor\",\"path\":\"src/y.ts\",\"line\":2,\"body\":\"Nit two.\"}]}\n```",
+        html_url: "https://github.com/org/repo/issues/73#issuecomment-73",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 73,
+        html_url: "https://github.com/org/repo/pull/73",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/73" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ queued: true });
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+  });
+
   it("upserts review-contract findings and enqueues a review-fix (reason=review_contract) from a findings block", async () => {
     const jobId = log.appendLog({ issueId: "issue-63", issueIdentifier: "AII-63", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/63");
@@ -2703,6 +2814,17 @@ describe("Restate review-fix lifecycle forwards instead of writing (AII-1184)", 
     expect(opts.idempotencyKey).toBe("d-abc");
     expect(reviewStore.listOpenReviewFindings("org/repo", 10)).toEqual([]);
     expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("issueComment: an approve verdict with only minor findings is not forwarded", async () => {
+    mapRepo("restate");
+    seedDispatch(12);
+    const ingress = fakeIngress();
+    const body = "## Review\n\nNits.\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"approve\",\"findings\":[{\"severity\":\"minor\",\"path\":\"src/x.ts\",\"line\":1,\"body\":\"Nit.\"}]}\n```";
+    const out = await post("issueComment", 12, { ingress, body });
+    expect(out.status).toBe(200);
+    expect(out.body).toEqual({ ignored: true, reason: "approved" });
+    expect(ingress.feedback).not.toHaveBeenCalled();
   });
 
   it("never calls acceptReviewFixWebhookEvent on the Restate path", async () => {
