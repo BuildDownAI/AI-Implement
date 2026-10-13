@@ -1690,6 +1690,32 @@ describe("review feedback ingestion", () => {
     expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
   });
 
+  it("still enqueues a prose Claude summary whose medium findings sit beside a ready-to-merge line", async () => {
+    const jobId = log.appendLog({ issueId: "issue-73", issueIdentifier: "AII-73", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/73");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "**Claude finished the review**\n\n### Issues\n- Real concern in src/x.ts that needs a change.\n\n**Merge readiness:** Ready to merge",
+        html_url: "https://github.com/org/repo/issues/73#issuecomment-73",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 73,
+        html_url: "https://github.com/org/repo/pull/73",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/73" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(JSON.parse(res.body)).not.toEqual({ ignored: true, reason: "approved" });
+  });
+
   it("still enqueues an approve verdict that carries a blocking finding", async () => {
     const jobId = log.appendLog({ issueId: "issue-72", issueIdentifier: "AII-72", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/72");

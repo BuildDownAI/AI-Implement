@@ -1042,7 +1042,12 @@ async function handleIssueCommentWebhook(
 
   // An approve verdict whose findings are all non-gating (minor) never starts a fix run:
   // no queue entry, no Restate forward, no ledger row. The inline-comment rail is unchanged.
-  if (classified.verdict === "approve" && !classified.findings.some((f) => reviewContractFindingGates(f, classified.verdict))) {
+  // Only `review-contract` findings carry the blocking/minor contract; other sources (e.g. prose
+  // `claude-review-summary` findings with `medium` severity) keep queueing as before.
+  if (
+    classified.verdict === "approve" &&
+    classified.findings.every((f) => f.source === "review-contract" && !reviewContractFindingGates(f, classified.verdict))
+  ) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true, reason: "approved" }));
     return;
