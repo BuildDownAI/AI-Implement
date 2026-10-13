@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import http from "node:http";
 import { parse as parseYaml } from "yaml";
 import { getScopedInstallationToken } from "./github-app-auth.js";
-import { fetchRepoTarball, postOrUpdateStickyComment, setCommitStatus } from "./github.js";
+import { fetchRepoTarball } from "./github.js";
 import { extractSource, parseKgSourceRepo } from "./deploy.js";
 import { parseSidecarRpcResponse } from "./kg-provider.js";
 import type { SidecarHealth } from "./kg-provider.js";
@@ -213,19 +213,14 @@ export interface KgRefreshStatus {
 
 export interface KgRefreshHandle {
   /**
-   * Evicts any stored dry-run outcome (and held head) for `repo`#`prNumber` (AII-636), called when the
-   * webhook observes that PR close — a closed PR's outcome can never be legitimately
-   * re-reported, so there is no reason to hold it until the cap evicts it naturally.
+   * Clears the held head for `repo`#`prNumber` (AII-636), called when the webhook observes that PR
+   * close, and any outcome an older release stored for it.
    */
   forgetPr(repo: string, prNumber: number): Promise<void>;
 }
 
-/** The two `KgRepo` calls the report surface needs; structural, so this module imports nothing from `src/restate/`. */
+/** The `KgRepo` call the report surface needs; structural, so this module imports nothing from `src/restate/`. */
 export interface KgDryRunOutcomeStore {
-  dryRunOutcome(
-    slug: string,
-    pr: { repo: string; prNumber: number },
-  ): Promise<{ status: string; value?: { sha: string; outcome: RefreshOutcome } | null }>;
   forgetPr(slug: string, pr: { repo: string; prNumber: number }): Promise<{ status: string }>;
 }
 
@@ -234,13 +229,7 @@ interface KgRefreshInput {
   githubAppPrivateKey: string;
   /** owner/repo of the KG source (config.kgSourceRepo — never hard-code the slug). */
   kgSourceRepo: string | null;
-  /** Overrides for tests. */
-  mintToken?: typeof getScopedInstallationToken;
-  /** Post or update the sticky dry-run PR comment (AII-633). Injectable for tests; defaults to postOrUpdateStickyComment from github.ts. */
-  postOrUpdateStickyCommentFn?: typeof postOrUpdateStickyComment;
-  /** Set the dry-run commit status (AII-633). Injectable for tests; defaults to setCommitStatus from github.ts. */
-  setCommitStatusFn?: typeof setCommitStatus;
-  /** The `KgRepo` ingress calls the dry-run report surface reads and evicts through (AII-977). */
+  /** The `KgRepo` ingress calls the dry-run report surface evicts through (AII-977). */
   dryRunOutcomes: KgDryRunOutcomeStore;
 }
 

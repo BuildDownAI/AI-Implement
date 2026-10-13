@@ -1189,13 +1189,6 @@ describe("KgRefresh durable workflow", () => {
       expect(await closeRowFor(triggerId)).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
       expect(setCommitStatusFn.mock.calls.length - beforeStatus).toBe(1);
       expect((setCommitStatusFn.mock.calls[beforeStatus] as unknown[])[4]).toMatchObject({ state: "failure" });
-      const stored = await eventually(
-        () => callObject<{ sha: string; outcome: RefreshOutcome } | null>(env.baseUrl(), "KgRepo", KG_SOURCE_REPO, "dryRunOutcome", { repo: report.repo, prNumber: report.prNumber }),
-        (v) => v !== null,
-        { label: "durable effect" },
-      );
-      expect(stored!.sha).toBe(report.sha);
-      expect(stored!.outcome.ok).toBe(false);
       expect(persistCalls.length - beforePersist).toBe(0);
       await closeRowFor(triggerId);
       expect(outcomesFor(triggerId).length).toBe(0);
@@ -2557,13 +2550,7 @@ describe("KgRefresh durable workflow", () => {
       expect(outcome.dryRun).toBe(true);
       expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
       expect(postOrUpdateStickyCommentFn.mock.calls.length - beforeSticky).toBe(1);
-      // Q7: the outcome goes to KgRepo for the PR's label path — one send, holding the outcome the report carried.
-      const stored = await eventually(
-        () => callObject<{ sha: string; outcome: unknown } | null>(env.baseUrl(), "KgRepo", KG_SOURCE_REPO, "dryRunOutcome", { repo: report.repo, prNumber: report.prNumber }),
-        (v) => v !== null,
-        { label: "durable effect" },
-      );
-      expect(stored).toEqual({ sha: report.sha, outcome });
+      // The journaled send to the no-op `recordDryRunOutcome` stays for one release; nothing is stored or read back.
       await eventually(async () => (await recordSends()).length - beforeRecorded, (n) => n >= 1, { label: "durable effect" });
       await settle(300);
       expect((await recordSends()).length - beforeRecorded).toBe(1);

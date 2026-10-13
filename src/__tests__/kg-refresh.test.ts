@@ -60,8 +60,8 @@ describe("kg-refresh", () => {
   });
 
   // ---- The dry-run PR-check surface (AII-633, AII-636, AII-640, AII-977) --------
-  // The refresh lifecycle runs in the KgRefresh workflow; the outcome lives on the KgRepo
-  // object. The handle reads and evicts it through the ingress client, faked here.
+  // The refresh lifecycle runs in the KgRefresh workflow; no outcome is stored. The handle
+  // only evicts the PR's held head through the ingress client, faked here.
 
   describe("dry-run report surface", () => {
     const REPORT = { repo: "TestOrg/test-kg", prNumber: 42, sha: "deadbeef" };
@@ -85,23 +85,17 @@ describe("kg-refresh", () => {
     };
     let postOrUpdateStickyCommentFn: ReturnType<typeof vi.fn>;
     let setCommitStatusFn: ReturnType<typeof vi.fn>;
-    let dryRunOutcome: ReturnType<typeof vi.fn>;
     let forgetPrCall: ReturnType<typeof vi.fn>;
 
-    /** `result` is what the KgRepo object answers `dryRunOutcome` with, whatever the PR asked. */
-    function buildHandle(result: unknown = { status: "accepted", value: null }): KgRefreshHandle {
+    function buildHandle(): KgRefreshHandle {
       postOrUpdateStickyCommentFn = vi.fn(async () => {});
       setCommitStatusFn = vi.fn(async () => {});
-      dryRunOutcome = vi.fn(async () => result);
       forgetPrCall = vi.fn(async () => ({ status: "accepted" }));
       return makeKgRefresh({
         githubAppId: "1",
         githubAppPrivateKey: "key",
         kgSourceRepo: "TestOrg/test-kg",
-        mintToken: vi.fn(async () => ({ token: "tok", expiresAt: "" })) as never,
-        postOrUpdateStickyCommentFn: postOrUpdateStickyCommentFn as never,
-        setCommitStatusFn: setCommitStatusFn as never,
-        dryRunOutcomes: { dryRunOutcome, forgetPr: forgetPrCall } as never,
+        dryRunOutcomes: { forgetPr: forgetPrCall } as never,
       });
     }
 
