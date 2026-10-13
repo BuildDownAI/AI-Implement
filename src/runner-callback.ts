@@ -1146,7 +1146,7 @@ export async function handleRunnerResult(
   return { status: 200, body: { acknowledged: true, warnings } };
 }
 
-export function parsePrUrlTarget(prUrl: string): { owner: string; repo: string; prNumber: number } | null {
+function parsePrUrlTarget(prUrl: string): { owner: string; repo: string; prNumber: number } | null {
   const match = prUrl.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:$|[?#])/);
   return match ? { owner: match[1], repo: match[2], prNumber: Number.parseInt(match[3], 10) } : null;
 }
