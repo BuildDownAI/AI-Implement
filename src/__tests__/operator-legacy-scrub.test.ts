@@ -14,6 +14,24 @@ function store(initial: string | null = null, log: string[] = []) {
 const legacyFamily = { service_key: "op1", value_utf8: JSON.stringify({ currentToken: "raw" }) };
 
 describe("scrubOperatorLegacyTokens", () => {
+  it("makes no call and writes no row when Restate is not registered", async () => {
+    const fetchImpl = vi.fn();
+    const log: string[] = [];
+    const rowStore = store("2026-10-13T00:00:00.000Z", log);
+    const result = await scrubOperatorLegacyTokens({ fetchImpl: fetchImpl as unknown as typeof fetch, rowStore, restateReady: () => false });
+    expect(result).toEqual({ ran: false, scrubbed: 0, purged: 0 });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(log).toEqual([]);
+    expect(rowStore.get()).toBe("2026-10-13T00:00:00.000Z");
+  });
+
+  it("defaults readiness to getRestateStatus: unreachable registration skips", async () => {
+    const fetchImpl = vi.fn();
+    const result = await scrubOperatorLegacyTokens({ fetchImpl: fetchImpl as unknown as typeof fetch, rowStore: store() });
+    expect(result.ran).toBe(false);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it("does nothing when the row exists and no family holds a legacy token", async () => {
     const queries: string[] = [];
     const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => {
@@ -22,7 +40,7 @@ describe("scrubOperatorLegacyTokens", () => {
     });
     const log: string[] = [];
     const rowStore = store("2026-10-13T00:00:00.000Z", log);
-    const result = await scrubOperatorLegacyTokens({ fetchImpl: fetchImpl as unknown as typeof fetch, rowStore });
+    const result = await scrubOperatorLegacyTokens({ fetchImpl: fetchImpl as unknown as typeof fetch, rowStore, restateReady: () => true });
     expect(result).toEqual({ ran: false, scrubbed: 0, purged: 0 });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(queries[0]).toContain("FROM state");
@@ -42,7 +60,7 @@ describe("scrubOperatorLegacyTokens", () => {
       return new Response("{}", { status: 200 });
     });
     const rowStore = store("2026-10-13T00:00:00.000Z", log);
-    const result = await scrubOperatorLegacyTokens({ fetchImpl: fetchImpl as unknown as typeof fetch, rowStore, now: () => new Date("2026-10-14T00:00:00.000Z") });
+    const result = await scrubOperatorLegacyTokens({ fetchImpl: fetchImpl as unknown as typeof fetch, rowStore, restateReady: () => true, now: () => new Date("2026-10-14T00:00:00.000Z") });
     expect(result).toEqual({ ran: true, scrubbed: 1, purged: 1 });
     expect(log).toEqual(["query", "clear", "drop", "query", "purge", "write"]);
     expect(rowStore.get()).toBe("2026-10-14T00:00:00.000Z");
@@ -54,7 +72,7 @@ describe("scrubOperatorLegacyTokens", () => {
       return new Response("boom", { status: 500 });
     });
     const rowStore = store("2026-10-13T00:00:00.000Z");
-    const result = await scrubOperatorLegacyTokens({ fetchImpl: fetchImpl as unknown as typeof fetch, rowStore });
+    const result = await scrubOperatorLegacyTokens({ fetchImpl: fetchImpl as unknown as typeof fetch, rowStore, restateReady: () => true });
     expect(result.ran).toBe(false);
     expect(rowStore.get()).toBeNull();
   });
@@ -68,7 +86,7 @@ describe("scrubOperatorLegacyTokens", () => {
       return new Response("boom", { status: 500 });
     });
     const rowStore = store();
-    const result = await scrubOperatorLegacyTokens({ fetchImpl: fetchImpl as unknown as typeof fetch, rowStore });
+    const result = await scrubOperatorLegacyTokens({ fetchImpl: fetchImpl as unknown as typeof fetch, rowStore, restateReady: () => true });
     expect(result.ran).toBe(false);
     expect(rowStore.get()).toBeNull();
   });
@@ -82,7 +100,7 @@ describe("scrubOperatorLegacyTokens", () => {
       return new Response("gone", { status: 404 });
     });
     const rowStore = store();
-    const result = await scrubOperatorLegacyTokens({ fetchImpl: fetchImpl as unknown as typeof fetch, rowStore, now: () => new Date("2026-10-13T01:02:03.000Z") });
+    const result = await scrubOperatorLegacyTokens({ fetchImpl: fetchImpl as unknown as typeof fetch, rowStore, restateReady: () => true, now: () => new Date("2026-10-13T01:02:03.000Z") });
     expect(result).toEqual({ ran: true, scrubbed: 0, purged: 1 });
     expect(rowStore.get()).toBe("2026-10-13T01:02:03.000Z");
   });

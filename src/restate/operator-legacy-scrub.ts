@@ -7,10 +7,14 @@
  * AII-1301: the state check runs on every boot, because a rollback to a pre-AII-1287 image
  * writes raw tokens again. When one is found the row is deleted first (closing `/query`),
  * and rewritten only after the scrub and purge succeed.
+ * AII-1305: the step runs only while the sidecar is `ready` and registration `registered`
+ * (the callTool rule). `onRegistered` also fires for `unreachable`, where an old deployment
+ * without `dropLegacyToken` could pin the call, hold the Operator key and deadlock (AII-1281).
  */
 import { getDb } from "../dedup.js";
 import { purgeInvocation, runIntrospectionQuery } from "./endpoint.js";
 import { RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BIND_ADDRESS } from "./server.js";
+import { getRestateStatus } from "./status.js";
 
 const SCRUB_KEY = "operator_legacy_scrub_completed_at";
 const CALL_TIMEOUT_MS = 10_000;
@@ -30,6 +34,8 @@ export interface OperatorLegacyScrubDeps {
   adminBaseUrl?: string;
   ingressBaseUrl?: string;
   now?: () => Date;
+  /** Defaults to sidecar `ready` and registration `registered`, the same rule as `callTool`. */
+  restateReady?: () => boolean;
   /** Skips the settings row (read and write) — for the Restate test, which has no dedup DB. */
   rowStore?: { read: () => string | null; write: (iso: string) => void; clear: () => void };
 }
@@ -50,6 +56,16 @@ function hasLegacyToken(valueUtf8: unknown): boolean {
 }
 
 export async function scrubOperatorLegacyTokens(deps: OperatorLegacyScrubDeps = {}): Promise<OperatorLegacyScrubResult> {
+  const restateReady =
+    deps.restateReady ??
+    (() => {
+      const restate = getRestateStatus();
+      return restate.sidecar.state === "ready" && restate.registration.state === "registered";
+    });
+  if (!restateReady()) {
+    console.log("[restate] Operator legacy-token scrub skipped: Restate is not ready and registered (next boot or registration retries)");
+    return { ran: false, scrubbed: 0, purged: 0 };
+  }
   const fetchImpl = deps.fetchImpl ?? fetch;
   const adminBaseUrl = deps.adminBaseUrl ?? RESTATE_ADMIN_BASE_URL;
   const ingressBaseUrl = deps.ingressBaseUrl ?? `http://${RESTATE_INGRESS_BIND_ADDRESS}`;
