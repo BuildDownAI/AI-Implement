@@ -18,14 +18,13 @@ import * as restate from "@restatedev/restate-sdk";
 import { createEndpointHandler } from "@restatedev/restate-sdk/node";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { RESTATE_SERVICES, queryNonCompletedInvocations, register, restateBindAddress, startRestateEndpoint } from "../../restate/endpoint.js";
-import { orchestratorTools } from "../../restate/tools.js";
 import { callTool } from "../../restate/tools-client.js";
 import { resetRestateStatus, setRestateStatus } from "../../restate/status.js";
 import { systemCaller } from "../../mcp-identity.js";
 import * as dedup from "../../dedup.js";
 import { initSettingsTable } from "../../runner-mode.js";
 import { startBinaryEnvironment, type BinaryEnvironment } from "./binary-environment.js";
-import { callObject, callService, eventually } from "./harness.js";
+import { callObject, callService, eventually, queryInvocations } from "./harness.js";
 
 function sha256(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex");
@@ -34,6 +33,23 @@ function sha256(value: string): string {
 const probe = restate.service({
   name: "registrationProbe",
   handlers: { ping: async (_ctx: restate.Context) => "pong" },
+});
+
+// The service set the new deployment brings in the AII-1281 scenario: a service the old registered
+// deployment lacks, and an orchestratorTools that no longer has get_tenant_health. A call to that
+// handler is routed by Restate to the old deployment's manifest, reaches the new endpoint, which
+// lacks it (RT0018), and Restate retries it forever. Only the missing get_tenant_health handler
+// pins the drain; get_runner_mode and declinedWindowProbe are never invoked, they only make the new
+// service set differ from the old one so the registration is a real, conflicting change.
+const declinedWindowProbe = restate.service({
+  name: "declinedWindowProbe",
+  handlers: { ping: async (_ctx: restate.Context) => "pong" },
+});
+const newOrchestratorTools = restate.service({
+  name: "orchestratorTools",
+  handlers: {
+    get_runner_mode: async (ctx: restate.Context) => ctx.serviceClient<typeof declinedWindowProbe>({ name: "declinedWindowProbe" }).ping(),
+  },
 });
 
 describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-727)", () => {
@@ -166,17 +182,60 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
       // Change the live endpoint's discovery manifest at the same URI. Restate's
       // duplicate-URI 200 does not rediscover it; register() must check drain
       // and force after the active Operator invocation finishes.
-      changedHandler = createEndpointHandler({ services: [orchestratorTools] });
+      changedHandler = createEndpointHandler({ services: [newOrchestratorTools, declinedWindowProbe] });
 
       const declined = await register({ adminBaseUrl });
       expect(declined.outcome).toBe("declined-conflict");
 
-      // AII-1281: in the declined window the registered deployment is the old one, so a tool call
-      // that reached a handler it lacks would retry forever and pin the drain. callTool answers
-      // unavailable instead, and starts no invocation.
+      // Same scope as queryNonCompletedInvocations (src/restate/endpoint.ts), narrowed to the tool
+      // service: only orchestratorTools invocations on the deployment under test, never the Operator call.
+      const oldDeployments = `(SELECT id FROM sys_deployment WHERE endpoint = '${oldUri}' OR endpoint = '${oldUri}/')`;
+      const pinnedToolInvocations = async (): Promise<string[]> =>
+        (
+          await queryInvocations(
+            adminBaseUrl,
+            "target_service_name = 'orchestratorTools' AND status != 'completed' AND status != 'scheduled' AND (" +
+              `pinned_deployment_id IN ${oldDeployments} OR ` +
+              `last_attempt_deployment_id IN ${oldDeployments} OR ` +
+              "(pinned_deployment_id IS NULL AND last_attempt_deployment_id IS NULL AND " +
+              `target_service_name IN (SELECT name FROM sys_service WHERE deployment_id IN ${oldDeployments})))`,
+          )
+        ).map((row) => String(row.id));
+
       setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "declined-conflict" } });
       try {
-        const before = await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri);
+        // Control: with the admission check bypassed, the call reaches a handler the live
+        // endpoint lacks, retries forever on the old deployment, and pins the drain (AII-1281).
+        const pinnedIds: string[] = [];
+        try {
+          void callTool("get_tenant_health", {}, systemCaller(), {
+            ingressBaseUrl,
+            permitsExternalCall: () => true,
+            restateReady: () => true,
+            fetchImpl: ((input: RequestInfo | URL, init?: RequestInit) =>
+              fetch(input, { ...init, signal: AbortSignal.timeout(2_000) })) as typeof fetch,
+          }).catch(() => undefined);
+          const ids = await eventually(
+            pinnedToolInvocations,
+            (found) => found.length > 0,
+            { label: "a pinned orchestratorTools invocation" },
+          );
+          pinnedIds.push(...ids);
+          expect(await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri)).toBeGreaterThanOrEqual(1);
+          // Still pinned: registration cannot complete.
+          expect((await register({ adminBaseUrl })).outcome).toBe("declined-conflict");
+        } finally {
+          // Cleanup only: the kill is never part of the assertion path.
+          for (const id of pinnedIds) {
+            await fetch(`${adminBaseUrl}/invocations/${id}/kill`, { method: "PATCH" });
+          }
+        }
+        await eventually(pinnedToolInvocations, (found) => found.length === 0, {
+          label: "the killed control invocation to leave the non-completed set",
+        });
+
+        // Fixed: the default check refuses admission in the declined window and starts nothing.
+        const beforeFixed = await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri);
         const spy = vi.fn(fetch);
         const answer = await callTool("get_tenant_health", {}, systemCaller(), {
           ingressBaseUrl,
@@ -185,7 +244,8 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
         });
         expect(answer).toEqual({ status: "unavailable" });
         expect(spy).not.toHaveBeenCalled();
-        expect(await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri)).toBe(before);
+        expect(await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri)).toBeLessThanOrEqual(beforeFixed ?? 0);
+        expect(await pinnedToolInvocations()).toEqual([]);
       } finally {
         resetRestateStatus();
       }
@@ -200,9 +260,9 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
         deployments: Array<{ uri: string; services: Array<{ name: string }> }>;
       };
       const current = deployments.deployments.find((deployment) => deployment.uri === `${oldUri}/`);
-      expect(current?.services.map((service) => service.name)).toEqual(["orchestratorTools"]);
+      expect(current?.services.map((service) => service.name)).toEqual(expect.arrayContaining(["orchestratorTools", "declinedWindowProbe"]));
     },
-    45_000,
+    90_000,
   );
 });
 
