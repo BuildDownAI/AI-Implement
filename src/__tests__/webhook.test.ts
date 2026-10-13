@@ -13,7 +13,6 @@ import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
 import type { RepoMapping } from "../config.js";
 import type { KgPrCheckConfig } from "../webhook.js";
-import type { KgDryRunReportTarget } from "../kg-refresh.js";
 
 // ---------- Hoisted mocks for /ai-implement path ----------
 
@@ -364,7 +363,6 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
       githubAppId: "app-id",
       githubAppPrivateKey: "app-key",
       enqueueDryRun: vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } }),
-      reportDryRun: vi.fn().mockResolvedValue(true),
       ...overrides,
     };
   }
@@ -420,7 +418,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     expect(enqueueDryRun).toHaveBeenCalledTimes(1);
     expect(enqueueDryRun).toHaveBeenCalledWith(
       `${KG_SOURCE_REPO}#42`,
-      { ref: "feature/x", report: { repo: KG_SOURCE_REPO, prNumber: 42, sha: "sha-42", acceptBaseline: false } },
+      { ref: "feature/x", report: { repo: KG_SOURCE_REPO, prNumber: 42, sha: "sha-42" } },
       undefined,
     );
     expect(res.statusCode).toBe(202);
@@ -485,7 +483,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     expect(enqueueDryRun).toHaveBeenCalledTimes(1);
     expect(enqueueDryRun).toHaveBeenCalledWith(
       `${KG_BASE_REPO}#5`,
-      { ref: "kg-upstream/2026-09-13", report: { repo: KG_BASE_REPO, prNumber: 5, sha: "sha-5", acceptBaseline: false } },
+      { ref: "kg-upstream/2026-09-13", report: { repo: KG_BASE_REPO, prNumber: 5, sha: "sha-5" } },
       undefined,
     );
     expect(res.statusCode).toBe(202);
@@ -508,42 +506,9 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     expect(JSON.parse(res.body).ignored).toBe(true);
   });
 
-  it("re-reports without re-triggering when the accept-baseline label is applied", async () => {
+  it.each(["labeled", "unlabeled"])("a %s accept-baseline event is ignored: no re-report, no 503", async (action) => {
     const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
-    const reportDryRun = vi.fn().mockResolvedValue("reported");
-    const kgPrCheck = makeKgPrCheck({ enqueueDryRun, reportDryRun });
-
-    const { req, res } = makeRequest(
-      SECRET,
-      "pull_request",
-      prPayload({
-        action: "labeled",
-        number: 8,
-        ref: "feature/y",
-        sha: "sha-8",
-        repo: KG_SOURCE_REPO,
-        labels: ["accept-baseline"],
-        label: "accept-baseline",
-      }),
-    );
-    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
-    await res.done;
-
-    expect(enqueueDryRun).not.toHaveBeenCalled();
-    expect(reportDryRun).toHaveBeenCalledTimes(1);
-    expect(reportDryRun).toHaveBeenCalledWith({
-      repo: KG_SOURCE_REPO,
-      prNumber: 8,
-      sha: "sha-8",
-      acceptBaseline: true,
-    });
-    expect(JSON.parse(res.body)).toEqual({ reported: true });
-  });
-
-  it.each(["labeled", "unlabeled"])("a %s accept-baseline event answers 503 when the outcome store is unavailable (AII-1014)", async (action) => {
-    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
-    const reportDryRun = vi.fn().mockResolvedValue("unavailable");
-    const kgPrCheck = makeKgPrCheck({ enqueueDryRun, reportDryRun });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
 
     const { req, res } = makeRequest(
       SECRET,
@@ -553,118 +518,8 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await res.done;
 
-    expect(res.statusCode).toBe(503);
-    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
-  });
-
-  it("an accept-baseline label on a PR with no stored dry-run outcome answers ignored, not reported (AII-636)", async () => {
-    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
-    const reportDryRun = vi.fn().mockResolvedValue("no-outcome");
-    const kgPrCheck = makeKgPrCheck({ enqueueDryRun, reportDryRun });
-
-    const { req, res } = makeRequest(
-      SECRET,
-      "pull_request",
-      prPayload({
-        action: "labeled",
-        number: 9,
-        ref: "feature/never-ran",
-        sha: "sha-9",
-        repo: KG_SOURCE_REPO,
-        labels: ["accept-baseline"],
-        label: "accept-baseline",
-      }),
-    );
-    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
-    await res.done;
-
     expect(enqueueDryRun).not.toHaveBeenCalled();
-    expect(reportDryRun).toHaveBeenCalledTimes(1);
-    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "no_dry_run_outcome" });
-  });
-
-  it("a non-accept-baseline label is ignored, even on a PR that never ran a dry-run (AII-636)", async () => {
-    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
-    const reportDryRun = vi.fn().mockResolvedValue(undefined);
-    const kgPrCheck = makeKgPrCheck({ enqueueDryRun, reportDryRun });
-
-    const { req, res } = makeRequest(
-      SECRET,
-      "pull_request",
-      prPayload({
-        action: "labeled",
-        number: 99,
-        ref: "feature/never-ran",
-        sha: "sha-99",
-        repo: KG_SOURCE_REPO,
-        labels: ["bug"],
-        label: "bug",
-      }),
-    );
-    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
-    await res.done;
-
-    expect(enqueueDryRun).not.toHaveBeenCalled();
-    expect(reportDryRun).not.toHaveBeenCalled();
-    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "not_accept_baseline_label" });
-  });
-
-  it("removing the accept-baseline label re-reports with acceptBaseline:false, reverting the wording (AII-640)", async () => {
-    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
-    const reportDryRun = vi.fn().mockResolvedValue("reported");
-    const kgPrCheck = makeKgPrCheck({ enqueueDryRun, reportDryRun });
-
-    const { req, res } = makeRequest(
-      SECRET,
-      "pull_request",
-      prPayload({
-        action: "unlabeled",
-        number: 8,
-        ref: "feature/y",
-        sha: "sha-8",
-        repo: KG_SOURCE_REPO,
-        labels: [],
-        label: "accept-baseline",
-      }),
-    );
-    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
-    await res.done;
-
-    expect(enqueueDryRun).not.toHaveBeenCalled();
-    expect(reportDryRun).toHaveBeenCalledTimes(1);
-    expect(reportDryRun).toHaveBeenCalledWith({
-      repo: KG_SOURCE_REPO,
-      prNumber: 8,
-      sha: "sha-8",
-      acceptBaseline: false,
-    });
-    expect(JSON.parse(res.body)).toEqual({ reported: true });
-  });
-
-  it("an unlabeled event for a label other than accept-baseline is ignored", async () => {
-    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
-    const reportDryRun = vi.fn().mockResolvedValue("reported");
-    const kgPrCheck = makeKgPrCheck({ enqueueDryRun, reportDryRun });
-
-    const { req, res } = makeRequest(
-      SECRET,
-      "pull_request",
-      prPayload({
-        action: "unlabeled",
-        number: 12,
-        ref: "feature/z",
-        sha: "sha-12",
-        repo: KG_SOURCE_REPO,
-        labels: [],
-        label: "bug",
-      }),
-    );
-    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
-    await res.done;
-
-    expect(enqueueDryRun).not.toHaveBeenCalled();
-    expect(reportDryRun).not.toHaveBeenCalled();
-    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "not_accept_baseline_label" });
+    expect(res.statusCode).not.toBe(503);
   });
 
   it("a transient listPullRequestFiles failure is reported distinctly from a genuine no-guard-relevant-change ignore", async () => {
@@ -881,7 +736,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     expect(enqueueDryRun).toHaveBeenCalledTimes(1);
     expect(enqueueDryRun).toHaveBeenCalledWith(
       `${KG_SOURCE_REPO}#21`,
-      { ref: "br1", report: { repo: KG_SOURCE_REPO, prNumber: 21, sha: "sha-1", acceptBaseline: false } },
+      { ref: "br1", report: { repo: KG_SOURCE_REPO, prNumber: 21, sha: "sha-1" } },
       { idempotencyKey: "delivery-abc" },
     );
     expect(JSON.parse(res.body)).toEqual({ triggered: true, triggerId: "t-1" });
@@ -910,7 +765,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     warnSpy.mockRestore();
   });
 
-  it("a closed event evicts this PR's stored dry-run state, so a later accept-baseline label finds nothing to re-report (AII-636)", async () => {
+  it("a closed event evicts this PR's stored dry-run state (AII-636)", async () => {
     const outcomeStore = new Set<string>();
     const storeKey = (repo: string, prNumber: number) => `${repo}#${prNumber}`;
     outcomeStore.add(storeKey(KG_SOURCE_REPO, 55));
@@ -919,10 +774,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     const forgetKgPr = vi.fn((repo: string, prNumber: number) => {
       outcomeStore.delete(storeKey(repo, prNumber));
     });
-    const reportDryRun = vi.fn((report: KgDryRunReportTarget) =>
-      Promise.resolve(outcomeStore.has(storeKey(report.repo, report.prNumber)) ? "reported" as const : "no-outcome" as const),
-    );
-    const kgPrCheck = makeKgPrCheck({ enqueueDryRun, forgetKgPr, reportDryRun });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun, forgetKgPr });
 
     const closed = makeRequest(SECRET, "pull_request", {
       action: "closed",
@@ -940,25 +792,6 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
 
     expect(forgetKgPr).toHaveBeenCalledWith(KG_SOURCE_REPO, 55);
     expect(outcomeStore.has(storeKey(KG_SOURCE_REPO, 55))).toBe(false);
-
-    const labeled = makeRequest(
-      SECRET,
-      "pull_request",
-      prPayload({
-        action: "labeled",
-        number: 55,
-        ref: "feature/a",
-        sha: "sha-55",
-        repo: KG_SOURCE_REPO,
-        labels: ["accept-baseline"],
-        label: "accept-baseline",
-      }),
-    );
-    webhook.handleGitHubWebhook(labeled.req as never, labeled.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
-    await labeled.res.done;
-
-    expect(reportDryRun).toHaveBeenCalledTimes(1);
-    expect(JSON.parse(labeled.res.body)).toEqual({ ignored: true, reason: "no_dry_run_outcome" });
   });
 });
 

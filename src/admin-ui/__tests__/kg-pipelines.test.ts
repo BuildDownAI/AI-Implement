@@ -11,7 +11,7 @@ describe("kg pipelines page", () => {
   });
 
   it("carries every card id, and Deployments carries none", () => {
-    for (const id of ["kg-refresh-card", "kg-refresh-badge", "kg-refresh-stamp", "kg-refresh-last", "kg-sidecar-status", "kg-refresh-btn", "kg-dry-run-btn", "kg-accept-baseline-btn", "kg-dry-run-last", "kg-materialize-controls", "btn-kg-materialize-rdflib", "btn-kg-materialize-direct", "kg-materialize-source"]) {
+    for (const id of ["kg-refresh-card", "kg-refresh-badge", "kg-refresh-stamp", "kg-refresh-last", "kg-sidecar-status", "kg-refresh-btn", "kg-accept-btn", "kg-cancel-btn", "kg-current-run", "kg-materialize-controls", "btn-kg-materialize-rdflib", "btn-kg-materialize-direct", "kg-materialize-source"]) {
       expect(kgPipelinesHtml).toContain(`id="${id}"`);
       expect(deploymentsHtml).not.toContain(id);
     }
@@ -67,32 +67,6 @@ describe("kg refresh card", () => {
     expect(kgPipelinesScript).toContain("window.triggerKgRefresh");
   });
 
-  it("declares the dry-run element ids (AII-635)", () => {
-    for (const id of ["kg-dry-run-btn", "kg-dry-run-last"]) {
-      expect(kgPipelinesHtml).toContain(`id="${id}"`);
-    }
-    expect(kgPipelinesHtml).toContain('onclick="window.triggerKgRefresh(true)"');
-  });
-
-  it("posts { dryRun: true } for the dry-run trigger and renders the part table (AII-635)", () => {
-    expect(kgPipelinesScript).toContain("window.api('/api/kg/refresh', { method: 'POST', body: JSON.stringify({ dryRun: true }) })");
-    expect(kgPipelinesScript).toContain("function renderKgDryRun(");
-    expect(kgPipelinesScript).toContain("['part', 'previous', 'new', 'delta']");
-    expect(kgPipelinesScript).toContain("document.getElementById('kg-dry-run-btn').disabled = busy");
-  });
-
-  it("declares the accept-baseline button and gates it behind confirm() (AII-628)", () => {
-    expect(kgPipelinesHtml).toContain('id="kg-accept-baseline-btn"');
-    expect(kgPipelinesHtml).toContain('onclick="window.triggerKgAcceptBaseline()"');
-    expect(kgPipelinesScript).toContain("window.triggerKgAcceptBaseline = ");
-    expect(kgPipelinesScript).toContain("if (!confirm(");
-    expect(kgPipelinesScript).toContain("JSON.stringify({ acceptNewBaseline: true })");
-    expect(kgPipelinesScript).toContain("document.getElementById('kg-accept-baseline-btn').disabled = busy");
-    // All three buttons share one refusal-to-message mapping and disable each other while a request is in flight.
-    expect(kgPipelinesScript).toContain("function showKgRefreshRefusal(res, body)");
-    expect((kgPipelinesScript.match(/showKgRefreshRefusal\(res, await/g) || []).length).toBe(2);
-  });
-
   it("posts to /api/kg/refresh for the refresh trigger", () => {
     expect(kgPipelinesScript).toContain("window.api('/api/kg/refresh', { method: 'POST' })");
   });
@@ -105,6 +79,7 @@ describe("kg refresh card", () => {
       ["running", "landing"],   // snapshot-landed
       ["running", "staging"],
       ["ok", "serving"],
+      ["warn", "awaiting decision"],
       ["warn", "reverted"],
       ["fail", "failed"],
       ["warn", "degraded"],     // kgDegraded fallback
@@ -539,5 +514,144 @@ describe("kg github-actions run profile (AII-1245)", () => {
     await win.loadKgRunProfile();
     expect(el("kg-fly-cpus").value).toBe("1");
     expect(el("btn-kg-fly-save").disabled).toBe(true);
+  });
+});
+
+describe("kg current run card (AII-1260)", () => {
+  type Run = { triggerId: string; step: string | null; decisions: string[]; held: unknown };
+  const held = {
+    snapshotPr: 7,
+    snapshotPrUrl: "https://github.com/o/kg/pull/7",
+    decideBy: 1760000000000,
+    partTable: [{ part: "<img src=x onerror=alert(1)>", prev: "100", new: "40" }],
+  };
+
+  function mount(opts: { currentRun: Run | null; stage?: string; statusOk?: boolean; decideReply?: unknown; confirm?: boolean; deployPolls?: number }) {
+    const dom = new JSDOM(`<!DOCTYPE html><body>${kgPipelinesHtml}</body>`, { runScripts: "dangerously", url: "http://localhost/admin#kg-pipelines" });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const win = dom.window as any;
+    const esc = (v: unknown) => String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    win.esc = esc;
+    win.escAttr = esc;
+    win.safeUrl = (u: string) => (/^https?:/.test(u) ? u : "#");
+    win.confirm = () => opts.confirm ?? true;
+    win.registerPage = () => {};
+    const calls: { url: string; body: unknown }[] = [];
+    win.api = async (url: string, init?: { body?: string }) => {
+      calls.push({ url, body: init?.body ? JSON.parse(init.body) : undefined });
+      if (url === "/api/kg/status") {
+        if (opts.deployPolls && opts.deployPolls-- > 0) return { ok: false, status: 409, json: async () => ({ error: "deploy-in-progress" }) };
+        if (opts.statusOk === false) return { ok: false, status: 500, json: async () => ({}) };
+        const stage = opts.stage ?? (opts.currentRun ? "ingest-running" : "serving");
+        return { ok: true, status: 200, json: async () => ({ stage, servedStamp: "abc", lastRefresh: null, currentRun: opts.currentRun }) };
+      }
+      if (url === "/api/tools/decide_kg_refresh") {
+        return { ok: true, status: 200, json: async () => opts.decideReply ?? { content: [{ type: "text", text: "{}" }] } };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    };
+    const script = dom.window.document.createElement("script");
+    script.textContent = kgPipelinesScript;
+    dom.window.document.head.appendChild(script);
+    const doc = dom.window.document;
+    const visibleButtons = () =>
+      ["kg-refresh-btn", "kg-accept-btn", "kg-cancel-btn"]
+        .map((id) => doc.getElementById(id) as HTMLElement)
+        .filter((b) => !(b as HTMLElement).hidden)
+        .map((b) => (b.textContent ?? "").trim());
+    return { win, doc, calls, visibleButtons };
+  }
+
+  it("no current run: stamp, last outcome and Refresh graph now only", async () => {
+    const { win, doc, visibleButtons } = mount({ currentRun: null });
+    await win.loadKgStatus();
+    expect(doc.getElementById("kg-refresh-stamp")?.textContent).toBe("Served graph stamp: abc");
+    expect(doc.getElementById("kg-refresh-last")?.textContent).toBe("No refresh has run since boot.");
+    expect(visibleButtons()).toEqual(["Refresh graph now"]);
+    expect((doc.getElementById("kg-current-run") as HTMLElement).hidden).toBe(true);
+  });
+
+  it("links the current run to the Restate UI, and idle has no link", async () => {
+    const m = mount({ currentRun: { triggerId: "trg/1", step: "ingest", decisions: [], held: null } });
+    await m.win.loadKgStatus();
+    const a = m.doc.querySelector("#kg-current-run a") as HTMLAnchorElement;
+    expect(a.textContent).toBe("Open in Restate UI");
+    expect(a.getAttribute("href")).toBe("/ui/workflows/KgRefresh/trg%2F1");
+    const idle = mount({ currentRun: null });
+    await idle.win.loadKgStatus();
+    expect(idle.doc.querySelector("#kg-current-run a")).toBeNull();
+  });
+
+  it("run in flight: the step and Cancel only, never printing null", async () => {
+    const m = mount({ currentRun: { triggerId: "t", step: "<b>ingest</b>", decisions: [], held: null } });
+    await m.win.loadKgStatus();
+    expect(m.doc.getElementById("kg-current-run")?.firstChild?.textContent).toBe("Run in flight: <b>ingest</b>");
+    expect(m.doc.querySelector("#kg-current-run b")).toBeNull();
+    expect(m.visibleButtons()).toEqual(["Cancel"]);
+    const n = mount({ currentRun: { triggerId: "t", step: null, decisions: [], held: null } });
+    await n.win.loadKgStatus();
+    expect(n.doc.getElementById("kg-current-run")?.firstChild?.textContent).toBe("Run in flight");
+  });
+
+  it("held run: deadline, part table, PR link, Accept and Cancel", async () => {
+    const m = mount({ currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held }, stage: "awaiting-decision" });
+    await m.win.loadKgStatus();
+    const cur = m.doc.getElementById("kg-current-run") as HTMLElement;
+    expect(cur.textContent).toContain("Held for a decision until ");
+    expect(Array.from(cur.querySelectorAll("th")).map((t) => t.textContent)).toEqual(["part", "previous", "new", "delta"]);
+    expect(Array.from(cur.querySelectorAll("td")).map((t) => t.textContent)).toEqual(["<img src=x onerror=alert(1)>", "100", "40", "-60"]);
+    expect(cur.querySelector("img")).toBeNull();
+    expect(cur.querySelector("a[href^=\"https\"]")?.getAttribute("href")).toBe("https://github.com/o/kg/pull/7");
+    expect(m.visibleButtons()).toEqual(["Accept new baseline & refresh", "Cancel"]);
+    expect(m.doc.getElementById("kg-refresh-badge")?.textContent).toContain("awaiting decision");
+  });
+
+  it("re-enables Accept and Cancel after a deploy-in-progress poll", async () => {
+    const m = mount({ currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held }, stage: "awaiting-decision", deployPolls: 1 });
+    await m.win.loadKgStatus();
+    expect((m.doc.getElementById("kg-accept-btn") as HTMLButtonElement).disabled).toBe(true);
+    expect((m.doc.getElementById("kg-cancel-btn") as HTMLButtonElement).disabled).toBe(true);
+    await m.win.loadKgStatus();
+    expect((m.doc.getElementById("kg-accept-btn") as HTMLButtonElement).disabled).toBe(false);
+    expect((m.doc.getElementById("kg-cancel-btn") as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("status failure hides the card", async () => {
+    const m = mount({ currentRun: null, statusOk: false });
+    await m.win.loadKgStatus();
+    expect((m.doc.getElementById("kg-refresh-card") as HTMLElement).hidden).toBe(true);
+  });
+
+  it("posts the exact decision bodies and reloads the status", async () => {
+    const m = mount({ currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held }, stage: "awaiting-decision" });
+    await m.win.decideKgRefresh("accept");
+    await m.win.decideKgRefresh("cancel");
+    const posts = m.calls.filter((c) => c.url === "/api/tools/decide_kg_refresh");
+    expect(posts.map((c) => c.body)).toEqual([{ args: { action: "accept" } }, { args: { action: "cancel" } }]);
+    expect(m.calls.filter((c) => c.url === "/api/kg/status")).toHaveLength(2);
+  });
+
+  it("a declined confirm makes no call", async () => {
+    const m = mount({ currentRun: null, confirm: false });
+    await m.win.decideKgRefresh("cancel");
+    expect(m.calls).toEqual([]);
+  });
+
+  it("shows a tool error such as already-decided", async () => {
+    const m = mount({
+      currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held },
+      decideReply: { isError: true, content: [{ type: "text", text: "already-decided" }] },
+    });
+    await m.win.decideKgRefresh("accept");
+    const err = m.doc.getElementById("kg-pipelines-error") as HTMLElement;
+    expect(err.hidden).toBe(false);
+    expect(err.textContent).toContain("already-decided");
+  });
+
+  it("the page source drops the dry-run and trigger-time accept code", () => {
+    const src = kgPipelinesHtml + kgPipelinesScript;
+    for (const gone of ["kg-dry-run-btn", "kg-accept-baseline-btn", "kg-dry-run-last", "renderKgDryRun", "last" + "DryRun", "triggerKgAcceptBaseline"]) {
+      expect(src).not.toContain(gone);
+    }
   });
 });

@@ -33,6 +33,8 @@ import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.j
 interface InFlightMarker {
   triggerId: string;
   startedAt: number;
+  /** Epoch ms when `expire` may clear the marker; `extend` moves it later. Absent on markers written before AII-1254. */
+  leaseUntil?: number;
 }
 
 /** One held PR-check dry-run request, keyed in state by `<repo>#<prNumber>`. */
@@ -42,12 +44,6 @@ interface PendingDryRun {
   enqueuedAt: number;
 }
 
-/** The stored verdict of one PR's last dry run, in state under `outcome:<repo>#<prNumber>`. */
-export interface StoredDryRunOutcome {
-  sha: string;
-  outcome: RefreshOutcome;
-}
-
 export interface KgRepoDependencies {
   /** The Restate service name of the workflow this object starts — "KgRefresh" in production. */
   workflowName: string;
@@ -55,6 +51,8 @@ export interface KgRepoDependencies {
   staleMarginMs?: number;
   /** Overrides `KG_REFRESH_TOTAL_DEADLINE_MS` in the expiry delay for a deterministic test. Production leaves this unset. */
   totalDeadlineMs?: number;
+  /** Test only: write the marker without `leaseUntil`, the shape written before AII-1254. Production leaves this unset. */
+  omitLeaseUntil?: boolean;
 }
 
 export type KgRepoTriggerResult = { triggerId: string } | { status: "refresh-in-progress"; triggerId: string };
@@ -77,11 +75,9 @@ const recordOutcomeInputSchema = z.object({
   outcome: z.custom<RefreshOutcome>((v) => typeof v === "object" && v !== null),
 }).strict();
 
-const recordAdminDryRunInputSchema = z.object({
-  outcome: z.custom<RefreshOutcome>((v) => typeof v === "object" && v !== null),
-}).strict();
-
 const leaseInputSchema = z.object({ triggerId: z.string().min(1) }).strict();
+
+const extendInputSchema = z.object({ triggerId: z.string().min(1), until: z.number() }).strict();
 
 export type KgRepoTriggerInput = z.infer<typeof kgRefreshOptionsSchema>;
 export type KgRepoPrInput = z.infer<typeof prInputSchema>;
@@ -118,14 +114,15 @@ export function createKgRepo(deps: KgRepoDependencies) {
   /** Marks a new refresh in flight and hands it to `KgRefresh.run` by one-way send. */
   function submit(ctx: ObjectContext, now: number, opts: KgRepoTriggerInput & { report?: KgDryRunReportTarget }): string {
     const triggerId = ctx.rand.uuidv4();
-    ctx.set<InFlightMarker>("inFlight", { triggerId, startedAt: now });
+    const leaseMs = (deps.totalDeadlineMs ?? KG_REFRESH_TOTAL_DEADLINE_MS) + (deps.staleMarginMs ?? KG_REPO_STALE_MARGIN_MS);
+    ctx.set<InFlightMarker>("inFlight", deps.omitLeaseUntil ? { triggerId, startedAt: now } : { triggerId, startedAt: now, leaseUntil: now + leaseMs });
     ctx.workflowSendClient<KgRefreshDefinition>({ name: deps.workflowName as "KgRefresh" }, triggerId).run(buildRunParameter(opts, triggerId));
     // The object owns the lease's expiry: a run that never reaches the workflow's dispatch step
     // still clears at the deadline plus margin. A normal `release` clears it first, and the
     // later `expire` no longer matches the trigger id.
     ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, ctx.key).expire(
       { triggerId },
-      restate.rpc.sendOpts({ delay: (deps.totalDeadlineMs ?? KG_REFRESH_TOTAL_DEADLINE_MS) + (deps.staleMarginMs ?? KG_REPO_STALE_MARGIN_MS) }),
+      restate.rpc.sendOpts({ delay: leaseMs }),
     );
     return triggerId;
   }
@@ -188,39 +185,46 @@ export function createKgRepo(deps: KgRepoDependencies) {
     await clearAndDrain(ctx, input.triggerId);
   }
 
-  /** The workflow's own deadline-plus-margin backstop for a run that never released. */
+  /**
+   * Moves the lease out to `until` (epoch ms) and schedules an `expire` for it. A trigger-id mismatch or an
+   * `until` that is not later than the current lease (or than now) is a no-op. The superseded `expire` stays scheduled; it
+   * finds `now < leaseUntil` and does nothing.
+   */
+  async function extend(ctx: ObjectContext, input: { triggerId: string; until: number }): Promise<{ extended: boolean }> {
+    const inFlight = await liveInFlight(ctx);
+    if (!inFlight || inFlight.triggerId !== input.triggerId) return { extended: false };
+    if (inFlight.leaseUntil !== undefined && input.until <= inFlight.leaseUntil) return { extended: false };
+    const now = await ctx.date.now();
+    // A legacy marker has no lease to compare with, so a lease that is already over is the only bad `until`.
+    if (input.until <= now) return { extended: false };
+    ctx.set<InFlightMarker>("inFlight", { ...inFlight, leaseUntil: input.until });
+    ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, ctx.key).expire(
+      { triggerId: input.triggerId },
+      restate.rpc.sendOpts({ delay: Math.max(0, input.until - now) }),
+    );
+    return { extended: true };
+  }
+
+  /** The deadline-plus-margin backstop for a run that never released. A lease the workflow extended outlives it. */
   async function expire(ctx: ObjectContext, input: { triggerId: string }): Promise<void> {
+    const inFlight = await liveInFlight(ctx);
+    if (inFlight?.leaseUntil !== undefined && (await ctx.date.now()) < inFlight.leaseUntil) return;
     if (await clearAndDrain(ctx, input.triggerId)) {
       ctx.console.warn(`[KgRepo] expired in-flight marker for ${ctx.key} (triggerId=${input.triggerId})`);
     }
   }
 
-  /** Stores the PR's verdict; one state key per PR, with `outcomeKeys` holding the insertion order for the cap. */
-  async function recordDryRunOutcome(ctx: ObjectContext, input: KgRepoRecordOutcomeInput): Promise<void> {
-    const { report, outcome } = input;
-    const stateKey = outcomeStateKey(report.repo, report.prNumber);
-    const order = ((await ctx.get<string[]>("outcomeKeys")) ?? []).filter((k) => k !== stateKey);
-    order.push(stateKey);
-    while (order.length > MAX_TRACKED_PRS) ctx.clear(order.shift()!);
-    ctx.set("outcomeKeys", order);
-    ctx.set<StoredDryRunOutcome>(stateKey, { sha: report.sha, outcome });
-  }
+  // remove after 2026-11-13: the workflow still journals a send to this handler (removing the send
+  // would break replay of a dry-run in flight at deploy). Nothing reads a stored outcome any more, so it stores nothing.
+  async function recordDryRunOutcome(_ctx: ObjectContext, _input: KgRepoRecordOutcomeInput): Promise<void> {}
 
-  /** Stores the last dry-run that had no report target (admin page or tool), under one key; last write wins. */
-  async function recordAdminDryRun(ctx: ObjectContext, input: { outcome: RefreshOutcome }): Promise<void> {
-    ctx.set<RefreshOutcome>("lastAdminDryRun", input.outcome);
-  }
+  // remove after 2026-11-13: a dry-run workflow in flight at deploy replays its send to this
+  // handler, and a send to a missing handler fails that invocation. It stores nothing.
+  async function recordAdminDryRun(_ctx: ObjectContext): Promise<void> {}
 
-  async function lastAdminDryRun(ctx: ObjectSharedContext): Promise<RefreshOutcome | null> {
-    return (await ctx.get<RefreshOutcome>("lastAdminDryRun")) ?? null;
-  }
-
-  async function dryRunOutcome(ctx: ObjectSharedContext, input: KgRepoPrInput): Promise<StoredDryRunOutcome | null> {
-    return (await ctx.get<StoredDryRunOutcome>(outcomeStateKey(input.repo, input.prNumber))) ?? null;
-  }
-
-  /** A closed PR can never be re-reported: drops its verdict and any held dry-run head. */
+  /** Records a closed PR and drops its held dry-run head and sha key. */
   async function forgetPr(ctx: ObjectContext, input: KgRepoPrInput): Promise<void> {
+    // remove after 2026-11-13: clears an `outcome:` entry stored by a release that still wrote them.
     const stateKey = outcomeStateKey(input.repo, input.prNumber);
     ctx.clear(stateKey);
     ctx.clear(shaStateKey(input.repo, input.prNumber));
@@ -256,10 +260,9 @@ export function createKgRepo(deps: KgRepoDependencies) {
       enqueueDryRun: restate.handlers.object.exclusive({ input: serde.zod(enqueueInputSchema) }, enqueueDryRun),
       release: restate.handlers.object.exclusive({ input: serde.zod(leaseInputSchema), ingressPrivate: true }, release),
       expire: restate.handlers.object.exclusive({ input: serde.zod(leaseInputSchema), ingressPrivate: true }, expire),
+      extend: restate.handlers.object.exclusive({ input: serde.zod(extendInputSchema), ingressPrivate: true }, extend),
       recordDryRunOutcome: restate.handlers.object.exclusive({ input: serde.zod(recordOutcomeInputSchema), ingressPrivate: true }, recordDryRunOutcome),
-      recordAdminDryRun: restate.handlers.object.exclusive({ input: serde.zod(recordAdminDryRunInputSchema), ingressPrivate: true }, recordAdminDryRun),
-      lastAdminDryRun: restate.handlers.object.shared(lastAdminDryRun),
-      dryRunOutcome: restate.handlers.object.shared({ input: serde.zod(prInputSchema) }, dryRunOutcome),
+      recordAdminDryRun: restate.handlers.object.exclusive({ ingressPrivate: true }, recordAdminDryRun),
       forgetPr: restate.handlers.object.exclusive({ input: serde.zod(prInputSchema) }, forgetPr),
       status: restate.handlers.object.shared(status),
     },

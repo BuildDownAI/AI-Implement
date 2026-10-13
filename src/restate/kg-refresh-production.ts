@@ -40,6 +40,7 @@ import {
   type KgDispatchRecord,
   type KgDispatchResult,
   type KgDispatchRowDetails,
+  type KgRefreshDecideInput,
   type KgRefreshReportBody,
   type KgRefreshStatusResult,
   type KgRefreshWorkflowDependencies,
@@ -48,7 +49,7 @@ import { createKgRefreshSenders, type KgRefreshSender, type KgRefreshSenderDeps 
 import { DURABLE_RUNNER_PURPOSE_KEY, DURABLE_RUNNER_PURPOSE_VALUE } from "../durable-runner.js";
 import { createGhaRunProfile } from "./gha-run-profile.js";
 import { DURABLE_RUNNER_DISPATCH_ID_KEY, createFlyMachineProfile, type FlyMachineProfileDeps } from "./fly-machine-profile.js";
-import { createKgRepo, type KgRepoEnqueueInput, type KgRepoEnqueueResult, type KgRepoPrInput, type KgRepoTriggerResult, type StoredDryRunOutcome } from "./kg-repo.js";
+import { createKgRepo, type KgRepoEnqueueInput, type KgRepoEnqueueResult, type KgRepoPrInput, type KgRepoTriggerResult } from "./kg-repo.js";
 import type { Step } from "../pipeline/types.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
@@ -257,6 +258,7 @@ export interface KgRefreshProductionInput {
   setCommitStatusFn: KgRailDeps["setCommitStatusFn"];
   mergePullRequestFn: KgRailDeps["mergePullRequestFn"];
   closePullRequestFn: KgRailDeps["closePullRequestFn"];
+  getPullRequestStateFn: KgRailDeps["getPullRequestStateFn"];
   deleteBranchFn: KgRailDeps["deleteBranchFn"];
   /** The sender deps the backends need and `config` cannot supply (AII-1148). */
   getInstallationToken: KgRefreshSenderDeps["getInstallationToken"];
@@ -368,6 +370,7 @@ export function createProductionKgRefreshServices(
     loadSnapshotSha: defaultLoadSnapshotSha,
     mergePullRequestFn: input.mergePullRequestFn,
     closePullRequestFn: input.closePullRequestFn,
+    getPullRequestStateFn: input.getPullRequestStateFn,
     deleteBranchFn: input.deleteBranchFn,
     postPrCommentFn: input.postPrCommentFn,
     postOrUpdateStickyCommentFn: input.postOrUpdateStickyCommentFn,
@@ -402,8 +405,6 @@ export function createProductionKgRefreshServices(
       dependencyTokenScope: findKgMapping(input.kgSourceRepo)?.[1]?.dependencyTokenScope ?? undefined,
       dryRun: run.dryRun,
       kgSourceRef: run.kgSourceRef,
-      acceptNewBaseline: run.acceptNewBaseline,
-      actorEmail: run.actorEmail,
     }),
     // Idempotent on dispatch_id: a replay after a crash between the insert and the journal write reuses the row.
     resolveDispatchRecord: (dispatchId) => ({
@@ -503,7 +504,7 @@ export function buildFlyMachineProfileDeps(): FlyMachineProfileDeps {
 /** `accepted` carries the handler's JSON result when it returned one (an empty 2xx body has none). */
 export type KgIngressResult<T = undefined> =
   | { readonly status: "accepted"; readonly value?: T }
-  | { readonly status: "conflict" }
+  | { readonly status: "conflict"; readonly error?: string }
   | { readonly status: "not-found" }
   | { readonly status: "unavailable" };
 
@@ -511,6 +512,8 @@ export interface KgRefreshIngressClient {
   report(triggerId: string, body: KgRefreshReportBody, opts?: { idempotencyKey?: string }): Promise<KgIngressResult<{ status: "accepted" | "duplicate" }>>;
   progress(triggerId: string, step?: Step): Promise<KgIngressResult>;
   cancel(triggerId: string, reason: string): Promise<KgIngressResult>;
+  /** The operator's gate decision; `conflict` carries the handler's text (`no-decision-open` or `already-decided`). */
+  decide(triggerId: string, input: KgRefreshDecideInput): Promise<KgIngressResult>;
   status(triggerId: string): Promise<KgIngressResult<KgRefreshStatusResult>>;
   repoStatus(slug: string): Promise<KgIngressResult<{ triggerId: string; startedAt: number } | null>>;
   /** Hands a PR-check dry-run to the `KgRepo` object: it runs now (`{ triggerId }`) or is held (`{ queued }`). */
@@ -519,9 +522,7 @@ export interface KgRefreshIngressClient {
     entry: KgRepoEnqueueInput,
     opts?: { idempotencyKey?: string },
   ): Promise<Exclude<KgIngressResult<KgRepoEnqueueResult>, { readonly status: "not-found" }>>;
-  /** The stored dry-run verdict for a PR; `accepted` with `value: null` when none is held. */
-  dryRunOutcome(slug: string, pr: KgRepoPrInput): Promise<KgIngressResult<StoredDryRunOutcome | null>>;
-  /** Drops a closed PR's verdict and held dry-run head. */
+  /** Drops a closed PR's held dry-run head. */
   forgetPr(slug: string, pr: KgRepoPrInput): Promise<KgIngressResult>;
 }
 
@@ -531,6 +532,17 @@ export interface KgRefreshIngressClientDeps {
 }
 
 const INGRESS_TIMEOUT_MS = 10_000;
+
+/** The handler's `TerminalError` text: the ingress answers `{ code, message }`, which `HttpCallError.message` wraps. */
+function handlerErrorText(err: InstanceType<typeof restateClients.HttpCallError>): string {
+  try {
+    const parsed = JSON.parse(err.responseText) as { message?: unknown };
+    if (typeof parsed.message === "string" && parsed.message) return parsed.message;
+  } catch {
+    // Not JSON: fall back to the raw text.
+  }
+  return err.responseText || err.message;
+}
 
 /** Real client for the Restate ingress, on the SDK's typed client. Never throws: a connection error or timeout resolves `unavailable`. */
 export function createKgRefreshIngressClient(
@@ -547,7 +559,7 @@ export function createKgRefreshIngressClient(
   /** 404 is `not-found` for the workflow only; 409 is `conflict` where the caller asked for it. */
   async function invoke<T = undefined>(
     call: () => PromiseLike<unknown>,
-    statuses: { notFound?: boolean; conflict?: boolean } = {},
+    statuses: { notFound?: boolean; conflict?: boolean; conflictText?: boolean } = {},
   ): Promise<KgIngressResult<T>> {
     try {
       const value = await call();
@@ -556,7 +568,7 @@ export function createKgRefreshIngressClient(
     } catch (err) {
       if (err instanceof restateClients.HttpCallError) {
         if (statuses.notFound && err.status === 404) return { status: "not-found" };
-        if (statuses.conflict && err.status === 409) return { status: "conflict" };
+        if (statuses.conflict && err.status === 409) return statuses.conflictText ? { status: "conflict", error: handlerErrorText(err) } : { status: "conflict" };
       }
       return { status: "unavailable" };
     }
@@ -567,11 +579,11 @@ export function createKgRefreshIngressClient(
       invoke<{ status: "accepted" | "duplicate" }>(() => refresh(triggerId).report(body, callOpts(opts?.idempotencyKey)), { notFound: true, conflict: true }),
     progress: (triggerId, step) => invoke(() => refresh(triggerId).progress(step ? { step } : {}, callOpts()), { notFound: true }),
     cancel: (triggerId, reason) => invoke(() => refresh(triggerId).cancel({ reason }, callOpts()), { notFound: true }),
+    decide: (triggerId, input) => invoke(() => refresh(triggerId).decide(input, callOpts()), { notFound: true, conflict: true, conflictText: true }),
     status: (triggerId) => invoke<KgRefreshStatusResult>(() => refresh(triggerId).status(callOpts()), { notFound: true }),
     repoStatus: (slug) => invoke<{ triggerId: string; startedAt: number } | null>(() => repo(slug).status(callOpts())),
     enqueueDryRun: (slug, entry, opts) =>
       invoke<KgRepoEnqueueResult>(() => repo(slug).enqueueDryRun(entry, callOpts(opts?.idempotencyKey))) as ReturnType<KgRefreshIngressClient["enqueueDryRun"]>,
-    dryRunOutcome: (slug, pr) => invoke<StoredDryRunOutcome | null>(() => repo(slug).dryRunOutcome(pr, callOpts())),
     forgetPr: (slug, pr) => invoke(() => repo(slug).forgetPr(pr, callOpts())),
   };
 }

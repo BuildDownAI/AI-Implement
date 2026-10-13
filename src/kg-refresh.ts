@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import http from "node:http";
 import { parse as parseYaml } from "yaml";
 import { getScopedInstallationToken } from "./github-app-auth.js";
-import { fetchRepoTarball, postOrUpdateStickyComment, setCommitStatus } from "./github.js";
+import { fetchRepoTarball } from "./github.js";
 import { extractSource, parseKgSourceRepo } from "./deploy.js";
 import { parseSidecarRpcResponse } from "./kg-provider.js";
 import type { SidecarHealth } from "./kg-provider.js";
@@ -19,7 +19,6 @@ import {
   readBaseRepoFromSourcesYml,
   DEFAULT_BASE_REPO,
 } from "./pipeline/steps/kg-tracker-data.js";
-import { postDryRunReport } from "./kg-refresh-rail.js";
 import type { StepStatus } from "./pipeline/types.js";
 
 const execFile = promisify(execFileCb);
@@ -90,16 +89,13 @@ export interface KgRefreshStepRecord {
 }
 
 /**
- * PR to report a dry-run's verdict against (AII-633). `acceptBaseline` is set by the
- * webhook when the PR carries the `accept-baseline` label at trigger time — it only
- * changes the report's wording, never the underlying guard outcome (a real refresh
- * still refuses the shrink unless an admin accepts the new baseline at refresh time).
+ * PR to report a dry-run's verdict against (AII-633). A refused shrink is accepted at the
+ * decision gate of the refresh that runs after the PR merges, never on the PR.
  */
 export interface KgDryRunReportTarget {
   repo: string;
   prNumber: number;
   sha: string;
-  acceptBaseline?: boolean;
 }
 
 /** Heading prefix used to find and update the sticky dry-run PR comment across pushes (AII-633).
@@ -162,6 +158,7 @@ export interface KgPreflightInput {
  * checking         → runRefresh() is in progress
  * ingest-running   → kg-refresh runner dispatched, waiting for callback
  * snapshot-landed  → runner callback received, snapshot commit verified
+ * awaiting-decision → a held run waits for accept or cancel at the decision gate
  * staging          → local rail is running (fetch→stage→swap→verify)
  * serving          → rail succeeded; sidecar is serving the new graph
  * reverted         → rail failed and reverted to the previous overlay
@@ -173,6 +170,7 @@ export type KgRefreshStage =
   | "checking"
   | "ingest-running"
   | "snapshot-landed"
+  | "awaiting-decision"
   | "staging"
   | "serving"
   | "reverted"
@@ -187,9 +185,14 @@ export interface KgRefreshStatus {
   sidecar: SidecarHealth;
   servedStamp: string | null;
   lastRefresh: RefreshOutcome | null;
-  /** The last dry-run with no PR report target (admin page or tool); never written to `lastRefresh`. */
-  lastDryRun: { ok: boolean; at: number; detail: string; partTable?: Array<{ part: string; prev: string; new: string }> } | null;
   stage: KgRefreshStage;
+  /** The in-flight run's step and open decisions; `null` with no run in flight. */
+  currentRun: {
+    triggerId: string;
+    step: string | null;
+    decisions: Array<"accept" | "cancel">;
+    held: { snapshotPr: number; snapshotPrUrl?: string; partTable: Array<{ part: string; prev: string; new: string }>; decideBy: number } | null;
+  } | null;
   /** The runner step in flight, when the workflow has one (AII-1134). */
   runnerStep?: { id: string; status: StepStatus };
   /** Which materialize path the next refresh will stage (AII-602). */
@@ -210,30 +213,14 @@ export interface KgRefreshStatus {
 
 export interface KgRefreshHandle {
   /**
-   * Re-posts a dry-run outcome's comment/status to `report` without triggering a new
-   * run (AII-633). Reads the outcome `KgRepo` holds for `report.repo`#`report.prNumber`
-   * (AII-636, AII-977) and posts only that PR's own outcome — never another PR's — and only
-   * when it ran against `report.sha`; otherwise a no-op (with a debug log line).
-   * Called on a `labeled` PR event (e.g. `accept-baseline` applied after the fact) so
-   * the report's wording updates without spending another dispatch. Returns whether
-   * it actually posted, so a caller can distinguish a real re-report from a silent
-   * no-op (AII-636) instead of always answering as if something was posted.
-   */
-  reportDryRun(report: KgDryRunReportTarget): Promise<"reported" | "no-outcome" | "unavailable">;
-  /**
-   * Evicts any stored dry-run outcome (and held head) for `repo`#`prNumber` (AII-636), called when the
-   * webhook observes that PR close — a closed PR's outcome can never be legitimately
-   * re-reported, so there is no reason to hold it until the cap evicts it naturally.
+   * Clears the held head for `repo`#`prNumber` (AII-636), called when the webhook observes that PR
+   * close, and any outcome an older release stored for it.
    */
   forgetPr(repo: string, prNumber: number): Promise<void>;
 }
 
-/** The two `KgRepo` calls the report surface needs; structural, so this module imports nothing from `src/restate/`. */
+/** The `KgRepo` call the report surface needs; structural, so this module imports nothing from `src/restate/`. */
 export interface KgDryRunOutcomeStore {
-  dryRunOutcome(
-    slug: string,
-    pr: { repo: string; prNumber: number },
-  ): Promise<{ status: string; value?: { sha: string; outcome: RefreshOutcome } | null }>;
   forgetPr(slug: string, pr: { repo: string; prNumber: number }): Promise<{ status: string }>;
 }
 
@@ -242,13 +229,7 @@ interface KgRefreshInput {
   githubAppPrivateKey: string;
   /** owner/repo of the KG source (config.kgSourceRepo — never hard-code the slug). */
   kgSourceRepo: string | null;
-  /** Overrides for tests. */
-  mintToken?: typeof getScopedInstallationToken;
-  /** Post or update the sticky dry-run PR comment (AII-633). Injectable for tests; defaults to postOrUpdateStickyComment from github.ts. */
-  postOrUpdateStickyCommentFn?: typeof postOrUpdateStickyComment;
-  /** Set the dry-run commit status (AII-633). Injectable for tests; defaults to setCommitStatus from github.ts. */
-  setCommitStatusFn?: typeof setCommitStatus;
-  /** The `KgRepo` ingress calls the dry-run report surface reads and evicts through (AII-977). */
+  /** The `KgRepo` ingress calls the dry-run report surface evicts through (AII-977). */
   dryRunOutcomes: KgDryRunOutcomeStore;
 }
 
@@ -548,39 +529,15 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
 }
 
 /**
- * The dry-run PR-check surface of the KG refresh: `reportDryRun`/`forgetPr`, which read and
- * evict the per-PR outcome `KgRepo` holds. The refresh lifecycle itself (dispatch, waits,
+ * The dry-run PR-check surface of the KG refresh: `forgetPr`, which evicts the
+ * per-PR outcome `KgRepo` holds. The refresh lifecycle itself (dispatch, waits,
  * deadlines, the local rail) runs in the `KgRefresh` workflow.
  */
 export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
-  /** What `postDryRunReport` reads, built once from this handle's resolved config. */
-  const reportDeps = {
-    githubAppId: input.githubAppId,
-    githubAppPrivateKey: input.githubAppPrivateKey,
-    mintToken: input.mintToken ?? getScopedInstallationToken,
-    postOrUpdateStickyCommentFn: input.postOrUpdateStickyCommentFn ?? postOrUpdateStickyComment,
-    setCommitStatusFn: input.setCommitStatusFn ?? setCommitStatus,
-  };
-
   /** The `KgRepo` object key — the bound KG source repo, the same one `enqueueDryRun` uses. */
   const reportSlug = (): string | null => (input.kgSourceRepo ? parseKgSourceRepo(input.kgSourceRepo).fullName : null);
 
   return {
-    async reportDryRun(report: KgDryRunReportTarget): Promise<"reported" | "no-outcome" | "unavailable"> {
-      const slug = reportSlug();
-      const result = slug
-        ? await input.dryRunOutcomes.dryRunOutcome(slug, { repo: report.repo, prNumber: report.prNumber })
-        : null;
-      if (result?.status === "unavailable") return "unavailable";
-      const stored = result?.status === "accepted" ? result.value : null;
-      if (!stored || stored.sha !== report.sha) {
-        console.debug(`[kg-refresh] dry-run report skipped: no outcome for ${report.repo}#${report.prNumber}`);
-        return "no-outcome";
-      }
-      await postDryRunReport(reportDeps, report, stored.outcome);
-      return "reported";
-    },
-
     async forgetPr(repo: string, prNumber: number): Promise<void> {
       const slug = reportSlug();
       if (!slug) return;

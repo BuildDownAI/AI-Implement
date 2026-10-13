@@ -578,7 +578,7 @@ describe("orchestratorTools (Restate)", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
-    "trigger_kg_refresh's discovered schema declares dryRun/acceptNewBaseline booleans, and add_project's reviewers array matches the pre-migration shape (%s)",
+    "trigger_kg_refresh's discovered schema still declares the removed dryRun/acceptNewBaseline booleans (so zod does not strip them), and add_project's reviewers array matches the pre-migration shape (%s)",
     async (label) => {
       const env = environments.get(label);
       if (!env) throw new Error(`environment "${label}" did not start`);
@@ -606,6 +606,25 @@ describe("orchestratorTools (Restate)", () => {
       const reviewersArrayVariant = reviewers?.anyOf?.find((v) => v.items !== undefined);
       expect(reviewersArrayVariant?.items?.required).toEqual(["id", "gates"]);
       expect(reviewersArrayVariant?.items?.properties?.maxTurns).toMatchObject({ type: "integer", minimum: 1, maximum: 200 });
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "trigger_kg_refresh refuses dryRun: true and acceptNewBaseline: true with 400 option-removed before any dispatch (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      for (const option of ["dryRun", "acceptNewBaseline"] as const) {
+        const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "trigger_kg_refresh", {
+          caller: SYSTEM,
+          args: { [option]: true },
+        });
+        // The refusal runs before the deploy-held check, preflight and KgRepo.trigger, so it is
+        // the 400 answer and not the 501/409 a later gate would give.
+        const result = JSON.parse(body?.content?.[0]?.text as string) as { status: number; body: Record<string, unknown> };
+        expect(result.status).toBe(400);
+        expect(result.body).toEqual({ error: "option-removed", option });
+      }
     },
   );
 

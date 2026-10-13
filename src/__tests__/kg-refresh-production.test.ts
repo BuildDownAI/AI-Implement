@@ -107,6 +107,7 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
     setCommitStatusFn: noop as never,
     mergePullRequestFn: noop as never,
     closePullRequestFn: noop as never,
+    getPullRequestStateFn: noop as never,
     deleteBranchFn: noop as never,
     getInstallationToken: vi.fn(async () => "gh-token"),
     resolveRunnerImage: vi.fn(async () => "runner:test"),
@@ -128,7 +129,7 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
 }
 
 /** The envelope the workflow's `envelope` step journals, built the way the production composition builds it. */
-function envelopeFor(run: { dryRun?: boolean; kgSourceRef?: string; acceptNewBaseline?: boolean; actorEmail?: string }) {
+function envelopeFor(run: { dryRun?: boolean; kgSourceRef?: string }) {
   return buildKgRefreshRunConfig({
     kgSourceRepo: "acme/kg", issueIdentifier: "KG-REFRESH · t-1", runnerCallbackUrl: "https://orch.example",
     dependencyTokenScope: "installation", ...run,
@@ -414,9 +415,9 @@ describe("buildEnvelope", () => {
       dependencyTokenScope: "installation",
       kgDryRun: true,
       kgSourceRef: "pr-head",
-      kgAcceptNewBaseline: true,
-      kgBaselineActor: "a@b",
     });
+    expect(envelope).not.toHaveProperty("kgAccept" + "NewBaseline");
+    expect(envelope).not.toHaveProperty("kgBaseline" + "Actor");
   });
 });
 
@@ -549,25 +550,25 @@ describe("GHA dispatch wrapper", () => {
     expect(result).toEqual({ outcome: "accepted", runId: 99, runUrl: "https://gh/run/99", jobId: "99", executionMode: "github-actions" });
   });
 
-  it("carries kgSourceRef, accept-baseline and the actor into the envelope, and the ref into the GHA dispatch", async () => {
+  it("carries kgSourceRef into the envelope, and the ref into the GHA dispatch", async () => {
     postWorkflowDispatch.mockResolvedValue({ success: true, status: 200, outcome: "accepted", runId: 5 });
     await createKgRefreshDispatch(makeInput())({
       ...dispatchInput,
-      envelope: envelopeFor({ kgSourceRef: "pr-head", acceptNewBaseline: true, actorEmail: "a@b" }),
+      envelope: envelopeFor({ kgSourceRef: "pr-head" }),
     });
     const call = postWorkflowDispatch.mock.calls[0][0];
     expect(call.ref).toBe("pr-head");
     expect(decodeRunConfig(call.inputs.run_config)).toMatchObject({
-      kgSourceRef: "pr-head", kgAcceptNewBaseline: true, kgBaselineActor: "a@b",
+      kgSourceRef: "pr-head",
     });
   });
 
-  it("omits the accept-baseline keys when the options are unset", async () => {
+  it("never carries the removed accept keys", async () => {
     postWorkflowDispatch.mockResolvedValue({ success: true, status: 200, outcome: "accepted", runId: 5 });
     await createKgRefreshDispatch(makeInput())({ ...dispatchInput, envelope: envelopeFor({}) });
     const decoded = decodeRunConfig(postWorkflowDispatch.mock.calls[0][0].inputs.run_config);
-    expect(decoded).not.toHaveProperty("kgAcceptNewBaseline");
-    expect(decoded).not.toHaveProperty("kgBaselineActor");
+    expect(decoded).not.toHaveProperty("kgAccept" + "NewBaseline");
+    expect(decoded).not.toHaveProperty("kgBaseline" + "Actor");
   });
 
   it("sends run_publication_token when the probe reports support", async () => {
@@ -623,6 +624,15 @@ describe("createKgRefreshIngressClient", () => {
     expect(await clientWith(respond(409, body)).cancel("t-1", "stop")).toEqual({ status: "unavailable" });
     // A 500 carrying the same body is not a conflict.
     expect(await clientWith(respond(500, body)).report("t-1", { ok: true })).toEqual({ status: "unavailable" });
+  });
+
+  it("decide maps accepted, a 409 to conflict with the handler's text, 404 to not-found, and a 500 to unavailable", async () => {
+    const input = { action: "accept", actor: "ada@example.com" } as const;
+    expect(await clientWith(respond(200)).decide("t-1", input)).toEqual({ status: "accepted" });
+    expect(await clientWith(respond(409, JSON.stringify({ code: 409, message: "already-decided" }))).decide("t-1", input))
+      .toEqual({ status: "conflict", error: "already-decided" });
+    expect(await clientWith(respond(404, JSON.stringify({ code: 404, message: "not found" }))).decide("t-1", input)).toEqual({ status: "not-found" });
+    expect(await clientWith(respond(500, JSON.stringify({ code: 500, message: "boom" }))).decide("t-1", input)).toEqual({ status: "unavailable" });
   });
 
   it("does not map a 409 from enqueueDryRun to conflict", async () => {

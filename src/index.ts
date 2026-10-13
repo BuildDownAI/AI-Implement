@@ -130,6 +130,7 @@ import { KgSidecar } from "./kg-sidecar.js";
 import type { KgRefreshIngressClient } from "./restate/kg-refresh-production.js";
 import { createKgRefreshIngressClient } from "./restate/kg-refresh-production.js";
 import { RestateSidecar } from "./restate/server.js";
+import { handleRestateUiRequest } from "./restate/ui-proxy.js";
 import { startRestateEndpoint, register as registerRestateEndpoint, RESTATE_SERVICES } from "./restate/endpoint.js";
 import {
   getRestateRetentionDays,
@@ -151,7 +152,6 @@ import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/en
 import { resolveReviewProcess } from "./review-process.js";
 import { createLateExternalReviewIngressClient, createLateExternalReviewSubmitHook, createProductionLateExternalReviewServices } from "./restate/late-external-review.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
-import { handleJournalRequest } from "./restate/journal-query.js";
 import type { RestateRegistrationStatus } from "./restate/status.js";
 import { setAdmissionTerminationCheck, setProviderRegistry, setReviewFixAttemptsFacade } from "./restate/tools.js";
 import { callTool, callToolAsSystem } from "./restate/tools-client.js";
@@ -4438,7 +4438,6 @@ function startServer(
         kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
-        reportDryRun: (report) => kgRefresh.reportDryRun(report),
         enqueueDryRun: (key, entry, opts) =>
           config.kgSourceRepo
             ? kgRefreshIngressClient.enqueueDryRun(parseKgSourceRepo(config.kgSourceRepo).fullName, { key, ...entry }, opts)
@@ -4801,6 +4800,9 @@ function startServer(
       return;
     }
 
+    // Restate UI, its admin API paths and ingress (AII-1261, ADR 040): admin role only.
+    if (handleRestateUiRequest(req, res, { adminConfigured: Boolean(config.adminAccessCode) || isOAuthConfigured() })) return;
+
     // Admin routes - match on the path only, so query params can still be read when needed
     if (url.split("?")[0] === "/admin" || url.startsWith("/api/")) {
       if (!config.adminAccessCode && !isOAuthConfigured()) {
@@ -4841,7 +4843,7 @@ function startServer(
           min: RESTATE_RETENTION_DAYS_MIN,
           max: RESTATE_RETENTION_DAYS_MAX,
         },
-        reviewFixAttempts, readJournal: handleJournalRequest })) return;
+        reviewFixAttempts })) return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
@@ -5117,6 +5119,7 @@ async function main(): Promise<void> {
       setCommitStatusFn: setCommitStatus,
       mergePullRequestFn: mergePullRequest,
       closePullRequestFn: closePullRequest,
+      getPullRequestStateFn: getPullRequestState,
       deleteBranchFn: deleteBranch,
       getInstallationToken,
       resolveRunnerImage: resolveRunnerImageForDispatch,

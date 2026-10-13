@@ -131,14 +131,31 @@ None of the four is an admin-UI setting — every consumer is a same-machine pee
 - `RESTATE_BASE_DIR` → the top-level `base-dir` config key, set to `restateDataDir()`
 - `RESTATE_BIND_ADDRESS` → the top-level `bind-address` config key (the fabric port, above)
 
-### Reading an invocation's journal (AII-1128)
+### Restate UI through the orchestrator (AII-1261)
 
-The admin API is loopback, so `GET /api/restate/journal` reads it for the operator (`src/restate/journal-query.ts`, route in `src/admin.ts`). It reuses `runIntrospectionQuery` and `sqlQuote` from `endpoint.ts` to query `sys_invocation`, `sys_journal` and `sys_promise`. `/query` itself is never exposed: a free SQL endpoint over the introspection tables is a different trust decision.
+Admins reach the Restate UI without `flyctl`: `src/restate/ui-proxy.ts` (`handleRestateUiRequest`, dispatched in `handleRequest` before the admin route block) forwards an allowlist of root paths to the loopback listeners. No new listener is opened. The UI cannot live under a path prefix (its router base is `/ui/`), so the paths are at the orchestrator's root. Decision record: [ADR 040](adr/040-admins-reach-the-restate-ui-through-the-orchestrator.md).
 
-- **Lookup:** `?service=<name>&key=<key>` (a lookup by service and key answers the key's `run` invocation when there is one (a workflow), so shared `status` / `progress` calls never shadow it, and the newest invocation otherwise (a virtual object)) or `?id=<invocation id>`. Each value is 1-128 characters of `[A-Za-z0-9._:-]`, checked by `validateJournalLookup` and then still passed through `sqlQuote`. A bad lookup is a 400 naming the field.
-- **Answer:** `{ invocation, entries, promises }`. Entries are trimmed to `index, entryType, name, completed, promiseName, appendedAt, sleepWakeupAt, entry`. `entry` is the parsed `entry_json`, or `null` when it is over 4096 characters or unparseable, so one read stays near 100 KB even with a large `report` body. Promises are scoped by the invocation's own service and key, so the `id` form finds them too; a keyless service has no key (`NULL`), so it has no promise rows and the promises list is empty.
-- **Status codes:** 404 `{ error: "no invocation" }` when nothing matches (rows survive only within the run kind's retention, 7 days today; see "Retention" below), 503 `{ error: "restate unavailable" }` when the admin API call throws.
-- **Access:** an admin, or a user granted the `journal` page (`PAGE_ROUTES.journal`). The Journal page (`/admin#journal`, sidebar entry Journal) and the job drawer's Restate journal section render the endpoint's answer (AII-1135).
+| Incoming path | Forwarded to |
+|---|---|
+| `GET`/`HEAD` `/ui`, `/ui/*` (other methods 405) | admin API (9070), path unchanged |
+| `GET /health`, `/version`, `/services`, `/services/*`, `/deployments`, `/deployments/*` | admin API |
+| `POST /deployments` | admin API |
+| `POST /query` | refused: 403, no upstream |
+| `/invocations/*` (any method) | admin API |
+| `POST /admin/restate/ingress/KgRefresh/<key>/(decide\|status)`, also under `/restate/call/` and `/restate/send/` or with a `/send` suffix | ingress (8081), the prefix removed |
+
+Any other path or method is not handled and the orchestrator's routing continues. Everything else under `/admin/restate/ingress/` answers 403 and reaches no upstream. The ingress is deny-by-default because it was loopback-only before this door: `Operator` holds each MCP client's raw refresh token and its handlers are not `ingressPrivate`, and `KgRefresh.report`/`progress`/`cancel` rely on the runner-token check in the callback route. `<key>` must match `^[A-Za-z0-9._-]{1,128}$`. A handled path containing `..`, `//`, or an encoded `%2e`, `%2f`, or `%5c` (any case) answers 400.
+
+- **`/query` is refused (AII-1286).** `POST /query` answers 403 and reaches no upstream, because `Operator` stores each MCP client's raw refresh token in state and its journal, and `/query` can read both. Until the tokens are out of Restate (AII-1287, which reopens this), the Restate UI cannot show invocation lists, journals, or state.
+- **Advertised ingress address.** When `OAUTH_REDIRECT_BASE_URL` is set, the sidecar gets `RESTATE_INGRESS__ADVERTISED_ADDRESS=<base>/admin/restate/ingress/`, so the playground calls the gate rather than the loopback ingress. Unset (local dev) keeps the default, and the playground cannot reach the ingress. The UI caches the value, so a deploy that changes it needs a hard refresh. The orchestrator's own calls keep `RESTATE_INGRESS_BASE_URL`.
+- **Role rule.** Every handled path runs `authenticateAdminRequest`: no session is 401, an unavailable access list is 503, and a role other than `admin` is 403. Page grants never apply.
+- **Header stripping.** `cookie`, `authorization`, the hop-by-hop headers (`connection`, `upgrade`, `keep-alive`, `te`, `trailer`, `proxy-*`) and `x-forwarded-*` are removed from the forwarded request; `set-cookie` and `access-control-*` are removed from the response, which carries `x-content-type-options: nosniff`. Cookie and authorization are removed because the ingress journals request headers and bodies (§ "The ingress journals request and response bodies") and a session token must never reach a journal.
+- **Logging.** Every request under `/admin/restate/ingress/` (any method, allowed or denied) and each other handled request that is not GET, HEAD, logs `[restate-ui] <email> <METHOD> <path>`, including the refused `POST /query`. The UI polls `/query` about once a second, so an open tab logs a line each time.
+- **Reserved paths.** An orchestrator route under `/ui`, `/health`, `/version`, `/services`, `/deployments`, `/query`, or `/invocations` would collide.
+
+### Journal queries and the Restate UI (AII-1128)
+
+The admin API is loopback. `runIntrospectionQuery` and `sqlQuote` in `endpoint.ts` query `sys_invocation` for the deploy drain (`queryNonCompletedInvocations`). The Restate UI door refuses `POST /query` for every role, admin included (§ "Restate UI through the orchestrator", ADR 040, AII-1286), so the proxy cannot be used to read journals until AII-1287 takes the MCP refresh tokens out of Restate. The orchestrator has no journal route: `GET /api/restate/journal` answers 404 (AII-1265), and there is no `journal` page grant (removed from `PAGE_ROUTES`, AII-1262). Journal viewing is unavailable meanwhile (§ "Reading a run's journal").
 
 ### Sidecar environment is an explicit allowlist, never `...process.env` (AII-728)
 
@@ -455,13 +472,11 @@ The failure branch of the planning callback also calls the termination hook, so 
 
 ## Reading a run's journal
 
-`GET /api/restate/journal` (AII-1128) answers one invocation's row, journal entries, and promises. Look it up by `service` + `key`, or by `id` (never both); values match `[A-Za-z0-9._:-]{1,128}`. A bad lookup is 400, no match is **404**, and an unreachable Restate admin API is **503**.
+Reading a run's journal in the Restate UI is unavailable until AII-1287: the UI is served at `/ui/` (admin only, § "Restate UI through the orchestrator"), but its journal and invocation views load data through `POST /query`, which the proxy refuses with 403 (AII-1286). The orchestrator has no journal route of its own (AII-1265 removed `GET /api/restate/journal` and `src/restate/journal-query.ts`; the route now answers 404). The admin UI shows an "Open in Restate UI" link to `/ui/workflows/<service>/<key>`:
 
-The admin UI shows it in two places, both rendered by the drawer's `window.renderRestateJournal`:
+- **Job drawer** — the key is the job's dispatch id. The service follows the job's phase (`journalServiceForJob`): `kg-refresh` → `KgRefresh`, `planning` → `PlanningRun`, `implementation` or no dispatch id → no link, any other phase → `ReviewFixAttempt`, linked only when the drawer's attempt read (`/api/review-fix/attempts/<dispatch id>`) just succeeded, so a legacy review-fix job gets none.
+- **KG pipelines current-run card** — the link for `currentRun.triggerId`, service `KgRefresh`. An idle page has none.
 
-- **Job drawer, "Restate journal"** — fetched with the job's dispatch id as the key. The service follows the job's phase: `kg-refresh` → `KgRefresh`, `planning` → `PlanningRun`, `implementation` or no dispatch id → no fetch, any other phase → `ReviewFixAttempt`, fetched only when the drawer's attempt read (`/api/review-fix/attempts/<dispatch id>`) just succeeded, so a legacy review-fix job never fetches. A 404 (retention has passed) shows "No journal (retention has passed)"; a 503 shows an "unavailable" alert.
-- **Journal page** (`/admin#journal`) — a form for a journal no drawer row shows. Granting it is a page grant at `/admin#access`.
-
-A lookup by service and key answers the key's `run` invocation when there is one (a workflow) and the newest invocation otherwise (a virtual object); the handler name shown next to the status says which invocation it is.
+The link is hidden for a `user` session. The Journal page and the drawer's "Restate journal" section are gone.
 
 For Restate's own UI, run `fly proxy 9070:9070 -a <app>` and open `http://127.0.0.1:9070/ui/invocations/<id>`.

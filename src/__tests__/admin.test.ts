@@ -2327,9 +2327,9 @@ describe("admin kg materialize-mode", () => {
   });
 });
 
-describe("admin kg refresh dry-run (AII-635)", () => {
+describe("admin kg refresh options removed (AII-1263)", () => {
   const kgRefreshDeps = {
-    trigger: vi.fn(async (_opts?: { dryRun?: boolean }) => ({ status: 202, body: { accepted: true } })),
+    trigger: vi.fn(async (_opts?: { ref?: string; actorEmail?: string }) => ({ status: 202, body: { accepted: true } })),
     status: vi.fn(),
     cancel: vi.fn(),
   };
@@ -2338,9 +2338,6 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     kgRefreshDeps.trigger.mockClear();
     kgRefreshDeps.status.mockReset();
   });
-
-  // The listed SSO admin the suite seeds (see adminConfig): an identity-bearing session.
-  const ssoAdmin = { email: "ada@eudoxus.ai", sub: "google|123", provider: "google" };
 
   async function kgRequest(
     url: string,
@@ -2363,13 +2360,12 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     return { statusCode: res.statusCode, body: res.body };
   }
 
-  it("POST /api/kg/refresh with { dryRun: true } reaches the trigger with dryRun and echoes it", async () => {
+  it.each(["dryRun", "acceptNewBaseline"])("POST /api/kg/refresh with { %s: true } answers 400 option-removed and does not trigger", async (option) => {
     const token = await login("secret");
-    const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: true });
-    expect(res.statusCode).toBe(202);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledTimes(1);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith({ dryRun: true });
-    expect(JSON.parse(res.body)).toMatchObject({ accepted: true, dryRun: true });
+    const res = await kgRequest("/api/kg/refresh", "POST", token, { [option]: true });
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body)).toEqual({ error: "option-removed", option });
+    expect(kgRefreshDeps.trigger).not.toHaveBeenCalled();
   });
 
   it("POST /api/kg/refresh with no body reaches the trigger with no option — the unchanged real refresh", async () => {
@@ -2378,7 +2374,7 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     expect(res.statusCode).toBe(202);
     expect(kgRefreshDeps.trigger).toHaveBeenCalledTimes(1);
     expect(kgRefreshDeps.trigger.mock.calls[0]).toHaveLength(0);
-    expect(JSON.parse(res.body)).toMatchObject({ accepted: true, dryRun: false });
+    expect(JSON.parse(res.body)).toMatchObject({ accepted: true });
   });
 
   it("POST /api/kg/refresh with { dryRun: false } is the real refresh", async () => {
@@ -2386,7 +2382,7 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: false });
     expect(res.statusCode).toBe(202);
     expect(kgRefreshDeps.trigger.mock.calls[0]).toHaveLength(0);
-    expect(JSON.parse(res.body).dryRun).toBe(false);
+    expect(JSON.parse(res.body)).toEqual({ accepted: true });
   });
 
   it("POST /api/kg/refresh with an invalid JSON body returns 400 and does not trigger", async () => {
@@ -2395,30 +2391,6 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toBe("Invalid JSON body");
     expect(kgRefreshDeps.trigger).not.toHaveBeenCalled();
-  });
-
-  it("POST /api/kg/refresh with { acceptNewBaseline: true } from an SSO session reaches the trigger with the session's email as actor (AII-628)", async () => {
-    const token = adminSession.createSession(ssoAdmin);
-    const res = await kgRequest("/api/kg/refresh", "POST", token, { acceptNewBaseline: true });
-    expect(res.statusCode).toBe(202);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledTimes(1);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith({ acceptNewBaseline: true, actorEmail: "ada@eudoxus.ai" });
-    expect(JSON.parse(res.body)).toMatchObject({ accepted: true, dryRun: false, acceptNewBaseline: true });
-  });
-
-  it("POST /api/kg/refresh with { acceptNewBaseline: true } from an access-code session names the actor 'access-code session' (AII-628)", async () => {
-    const token = await login("secret");
-    const res = await kgRequest("/api/kg/refresh", "POST", token, { acceptNewBaseline: true });
-    expect(res.statusCode).toBe(202);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith({ acceptNewBaseline: true, actorEmail: "access-code session" });
-  });
-
-  it("POST /api/kg/refresh with { dryRun: true, acceptNewBaseline: true } passes both through (AII-628)", async () => {
-    const token = adminSession.createSession(ssoAdmin);
-    const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: true, acceptNewBaseline: true });
-    expect(res.statusCode).toBe(202);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith({ dryRun: true, acceptNewBaseline: true, actorEmail: "ada@eudoxus.ai" });
-    expect(JSON.parse(res.body)).toMatchObject({ dryRun: true, acceptNewBaseline: true });
   });
 
   it.each([
@@ -2445,7 +2417,7 @@ describe("admin kg refresh dry-run (AII-635)", () => {
   it("POST /api/kg/refresh answers 503 restate-unavailable with the body untouched", async () => {
     kgRefreshDeps.trigger.mockResolvedValueOnce({ status: 503, body: { error: "restate-unavailable" } } as never);
     const token = await login("secret");
-    const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: true });
+    const res = await kgRequest("/api/kg/refresh", "POST", token);
     expect(res.statusCode).toBe(503);
     expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
   });
@@ -2473,15 +2445,6 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     const down = await kgRequest("/api/kg/status", "GET", token);
     expect(down.statusCode).toBe(503);
     expect(JSON.parse(down.body)).toEqual({ error: "restate-unavailable" });
-  });
-
-  it("the Deployments page carries the Dry-run refresh button and the last-dry-run block", async () => {
-    const page = await import("../admin-ui/pages/kg-pipelines.js");
-    expect(page.kgPipelinesHtml).toContain('id="kg-dry-run-btn"');
-    expect(page.kgPipelinesHtml).toContain("window.triggerKgRefresh(true)");
-    expect(page.kgPipelinesHtml).toContain('id="kg-dry-run-last"');
-    expect(page.kgPipelinesScript).toContain("JSON.stringify({ dryRun: true })");
-    expect(page.kgPipelinesScript).toContain("function renderKgDryRun(");
   });
 });
 
@@ -5358,46 +5321,10 @@ describe("per-page grants", () => {
     });
   });
 
-  describe("journal grant", () => {
-    const journalFetch = vi.fn();
-    const journalDeps = {
-      readJournal: (query: Record<string, string>) => journalModule.handleJournalRequest(query, { fetchImpl: journalFetch as never }),
-    };
-    let journalModule: typeof import("../restate/journal-query.js");
-    beforeEach(async () => {
-      journalFetch.mockReset();
-      journalModule = await import("../restate/journal-query.js");
-    });
-
-    it("answers 400 on a bad lookup and never calls the admin API", async () => {
-      const res = await requestWithDeps("/api/restate/journal?service=KgRefresh&key=x'y", "GET", adminSsoSession(), journalDeps);
-      expect(res.statusCode).toBe(400);
-      expect(JSON.parse(res.body).error).toMatch(/^key/);
-      expect(journalFetch).not.toHaveBeenCalled();
-    });
-
-    it("refuses a user with no grant, and admits one with the grant despite the query string", async () => {
-      const path = "/api/restate/journal?service=KgRefresh&key=abc";
-      expect((await requestWithDeps(path, "GET", userSession(), journalDeps)).statusCode).toBe(403);
-      accessGrants.savePageGrants(["journal"], "ada@eudoxus.ai");
-      journalFetch.mockResolvedValue(new Response(JSON.stringify({ rows: [] }), { status: 200 }));
-      expect((await requestWithDeps(path, "GET", userSession(), journalDeps)).statusCode).toBe(404);
-      expect(journalFetch).toHaveBeenCalledTimes(1);
-    });
-
-    it("admits an admin without a grant", async () => {
-      journalFetch.mockResolvedValue(new Response(JSON.stringify({ rows: [] }), { status: 200 }));
-      const res = await requestWithDeps("/api/restate/journal?id=inv_1", "GET", adminSsoSession(), journalDeps);
+  describe("removed journal route", () => {
+    it("answers 404 for an admin session", async () => {
+      const res = await request("/api/restate/journal?id=inv_1", "GET", "secret", undefined, adminSsoSession());
       expect(res.statusCode).toBe(404);
-      expect(JSON.parse(res.body)).toEqual({ error: "no invocation" });
-    });
-
-    it("answers 503 when the admin API throws", async () => {
-      vi.spyOn(console, "error").mockImplementation(() => {});
-      journalFetch.mockRejectedValue(new Error("down"));
-      const res = await requestWithDeps("/api/restate/journal?id=inv_1", "GET", adminSsoSession(), journalDeps);
-      expect(res.statusCode).toBe(503);
-      expect(JSON.parse(res.body)).toEqual({ error: "restate unavailable" });
     });
   });
 
@@ -5411,6 +5338,18 @@ describe("per-page grants", () => {
       // Grantability comes from the route table, so Access itself can never appear here.
       expect(body.grantable).toContain("issues");
       expect(body.grantable).not.toContain("access");
+    });
+
+    it("lists no Journal page and still saves a grant while a stale journal row is stored", async () => {
+      const db = (await import("../dedup.js")).getDb();
+      db.prepare("INSERT INTO access_page_grants (page, granted_at, granted_by) VALUES ('journal', 'now', 'ada@eudoxus.ai')").run();
+      const token = adminSsoSession();
+      const got = JSON.parse((await request("/api/access-grants", "GET", "secret", undefined, token)).body);
+      expect(got.grantable).not.toContain("journal");
+      // The access page drops non-grantable keys from its draft, so this is what it posts.
+      const pages = got.granted.filter((k: string) => got.grantable.includes(k));
+      const res = await request("/api/access-grants", "POST", "secret", { pages: [...pages, "issues"] }, token);
+      expect(res.statusCode).toBe(200);
     });
 
     it("stores a grant an admin saves", async () => {

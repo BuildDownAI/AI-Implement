@@ -28,6 +28,7 @@ A workflow that owns a run outside Restate uses one wait, the **owned-run wait**
 | result | workflow promise `report` | the run ended and gave its result | one time, by the verify-only runner callback |
 | started evidence | workflow promise `progress` | the run executes | one time, by the first proof from any source |
 | stop request | workflow promise `cancel` | an operator or a newer trigger stops the run | one time |
+| decision | workflow promise `decide` | an operator accepts or cancels a snapshot held at the decision gate | one time, by `decide_kg_refresh` (the admin page and `/mcp`) or the Restate UI playground (ADR 040) |
 | runner step | workflow promise `step:<id>:running` / `step:<id>:ended` | the runner started or ended pipeline step `<id>` | one time each, by `TokenStepReporter` (`src/pipeline/reporter.ts`) through `POST /runner/progress` and the `progress` handler |
 | tick | durable timer (`ctx.sleep`) | time for the next status read or a deadline check | each interval |
 
@@ -71,3 +72,7 @@ Rule for later run kinds: before a workflow waits for a signal, write its row in
 ## Amendment (2026-10-08): the per-step row
 
 The kg-refresh table carries one per-step row: `step:<id>:running` and `step:<id>:ended`, workflow promises, resolved one time each. The producer is `TokenStepReporter` (`src/pipeline/reporter.ts`), through `POST /runner/progress` and the `progress` handler. The contract test is "a real TokenStepReporter step post is accepted by the real handler" in `src/__tests__/runner-callback.test.ts`, which runs in both body shapes (with and without `githubRunId`, the GitHub Actions shape). `KG_REFRESH_RUNNER_STEPS` is held equal to `pipelines/kg-refresh.yml` by `src/__tests__/kg-refresh-runner-steps.test.ts`. The promises are evidence for `status`, never wait signals: the wait still ends on `report`, `cancel`, or a deadline.
+
+## Amendment (2026-10-12): the decision row
+
+The kg-refresh table carries a `decision` row: workflow promise `decide`, resolved one time by the shared `decide` handler of `KgRefresh` ([AII-1256](https://linear.app/eudoxus/issue/AII-1256/kgrefresh-a-decision-gate-wait-for-decide-or-24-hours-release-the)). The producer is the MCP tool `decide_kg_refresh` (`src/restate/tools.ts`), which the admin page reaches through `POST /api/tools/decide_kg_refresh` and agents through `/mcp`; the Restate UI playground is added as a producer by [AII-1261](https://linear.app/eudoxus/issue/AII-1261/admin-only-restate-ui-through-the-orchestrator-root-path-allowlist). The tool takes no trigger id: it decides only the run `KgRepo.status()` reports in flight, so a past run cannot be decided. The contract test is "contract: KgRefresh.decide" in `src/__tests__/kg-refresh-decide-contract.test.ts` (the handler) and the real-Restate scenario in `src/__tests__/restate/kg-refresh-workflow.restate.test.ts` (the tool resolving the real handler of a run held at the gate). The signal ends the gate wait; `cancel` still ends it too.

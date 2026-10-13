@@ -623,7 +623,7 @@ export const getDeployPostureTool = tool(
 );
 
 export const GET_KG_STATUS_DESCRIPTION =
-  "Returns the KG refresh rail state: stage (idle | staging | ingest-running | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), the last refresh outcome with its gate, and lastDryRun (verdict and part table of the last dry-run with no PR report target, or null). The served stamp falls back to a live read when the last-refresh record carries none. Poll it after `POST /api/kg/refresh`.";
+  "Returns the KG refresh rail state: stage (idle | checking | ingest-running | snapshot-landed | awaiting-decision | staging | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), the last refresh outcome with its gate. The served stamp falls back to a live read when the last-refresh record carries none. currentRun is the in-flight run only (triggerId, step, decisions, held), or null with no run in flight; decisions is [\"accept\", \"cancel\"] only while the run waits at the decision gate (stage awaiting-decision), and held carries the snapshot PR, its part table, and the decide-by time. Poll it after `POST /api/kg/refresh`.";
 
 // Type-only client handles: the real definitions are built with dependencies at boot
 // (createProductionKgRefreshServices); a client needs only the service name and handler types.
@@ -645,6 +645,7 @@ export function setKgRefreshToolDeps(deps: KgRefreshToolDeps | null): void {
 export function kgStageForStep(step: string | null): KgRefreshStage {
   if (step === null || step === "reserve" || step === "dispatch") return "checking";
   if (step === "await-progress" || step === "cancelling" || step === "dry-run-report") return "ingest-running";
+  if (step === "decision") return "awaiting-decision";
   if (step === "merge" || step === "delete-branch") return "snapshot-landed";
   // fetch, stage, swap, verify, revert, persist, close-row, outcome, settled, and the
   // short-lived terminal steps (failed, closed, no-new-data) whose marker is about to clear.
@@ -679,6 +680,47 @@ export function kgStageForRunnerStep(id: string, status: StepStatus): KgRefreshS
 
 const REVERT_GATES = new Set(["answers", "vectors", "canary", "stamp"]);
 
+export const DECIDE_KG_REFRESH_DESCRIPTION =
+  "Decide the current in-flight KG refresh (admin role). Acts only on the run KgRepo reports in flight; there is no trigger id argument, so a past run cannot be decided. `accept` lands the held snapshot, `cancel` drops it. When the run is not at the decision gate, `accept` answers no-decision-open and `cancel` stops the run through the cancel signal. A second decision answers already-decided; with no run in flight the answer is no-refresh-in-flight.";
+
+export const decideKgRefreshTool = tool(
+  {
+    description: DECIDE_KG_REFRESH_DESCRIPTION,
+    input: z.object({
+      action: z.enum(["accept", "cancel"]).describe("accept lands the held snapshot; cancel drops it (or stops the run when no decision is open)."),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
+    const toolDeps = kgRefreshToolDeps;
+    if (!toolDeps) return toolError("KG refresh is not configured");
+    const inFlight = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).status();
+    if (inFlight === null || inFlight === undefined) return toolError("no-refresh-in-flight");
+    const { triggerId } = inFlight;
+    const { action } = input.args;
+    const actor = input.caller.email ?? (input.caller.kind === "system" ? "system" : "unknown");
+    try {
+      await ctx.workflowClient(KgRefresh, triggerId).decide({ action, actor });
+      return reply({ decided: action });
+    } catch (err) {
+      if (!(err instanceof restate.TerminalError) || err.code !== 409) throw err;
+      if (err.message === "already-decided") return toolError("already-decided");
+      if (err.message !== "no-decision-open") throw err;
+    }
+    if (action === "accept") return toolError("no-decision-open");
+    try {
+      await ctx.workflowClient(KgRefresh, triggerId).cancel({ reason: "operator_cancelled" });
+    } catch (err) {
+      // The run finished between the status read and the signal.
+      if (err instanceof restate.TerminalError && (err.code === 404 || err.code === 409)) return toolError("no-refresh-in-flight");
+      throw err;
+    }
+    return reply({ cancelled: true });
+  },
+);
+
 function kgStageFromLastRefresh(last: KgRefreshStatus["lastRefresh"]): KgRefreshStage {
   if (!last) return "idle";
   if (last.ok) return "serving";
@@ -698,10 +740,6 @@ export const getKgStatusTool = tool(
     const inFlight = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).status();
     const flyProfile = await ctx.objectClient(FlyMachineProfile, "kg-refresh").get();
     const lastRefresh = toolDeps.readStatusRecord();
-    const dryRun = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).lastAdminDryRun();
-    const lastDryRun = dryRun
-      ? { ok: dryRun.ok, at: dryRun.at, detail: dryRun.detail, ...(dryRun.partTable ? { partTable: dryRun.partTable } : {}) }
-      : null;
     let recordStamp = lastRefresh ? (lastRefresh.ok ? lastRefresh.stampAfter : lastRefresh.stampBefore) : null;
     if (!recordStamp) {
       // A failure before the rail leaves no stamp on the record while a graph still serves.
@@ -715,12 +753,22 @@ export const getKgStatusTool = tool(
     }
     let stage: KgRefreshStage;
     let runnerStep: KgRefreshStatus["runnerStep"];
+    let currentRun: KgRefreshStatus["currentRun"] = null;
     if (inFlight === null || inFlight === undefined) {
       stage = kgStageFromLastRefresh(lastRefresh);
     } else {
       try {
         const wf = await ctx.workflowClient(KgRefresh, inFlight.triggerId).status();
-        if (wf.runnerStep) {
+        // Older in-flight workflows lack the decision fields during a deploy.
+        const decisions = wf.decisions ?? [];
+        currentRun = { triggerId: inFlight.triggerId, step: wf.step, decisions, held: wf.held ? { ...wf.held, snapshotPrUrl: `https://github.com/${toolDeps.kgSourceRepo}/pull/${wf.held.snapshotPr}` } : null };
+        if (wf.step === "decision" && decisions.length > 0) {
+          // The runner has finished by the gate, so its last step must not decide the stage.
+          stage = "awaiting-decision";
+        } else if (wf.step === "decision") {
+          // Decided, or timed out, and finishing: the step is not cleared until the next one is set.
+          stage = "staging";
+        } else if (wf.runnerStep) {
           runnerStep = { id: wf.runnerStep.id, status: wf.runnerStep.status as StepStatus };
           stage = kgStageForRunnerStep(runnerStep.id, runnerStep.status);
         } else {
@@ -755,8 +803,8 @@ export const getKgStatusTool = tool(
       ...sidecarHealthFields(),
       servedStamp: recordStamp ?? null,
       lastRefresh,
-      lastDryRun,
       stage,
+      currentRun,
       ...(runnerStep ? { runnerStep } : {}),
       materialize: getKgMaterializeDirect().enabled ? "direct" : "rdflib",
       executionMode: { effective: kgBackend.mode, source: kgBackend.source, setting: kgSetting.mode },
@@ -944,18 +992,14 @@ function providerRegistryForTools(): ProviderRegistry {
 }
 
 export const TRIGGER_KG_REFRESH_DESCRIPTION =
-  "Trigger the KG refresh rail (admin role). Same handler as POST /api/kg/refresh: runs the credential preflight, then dispatches the refresh. Poll get_kg_status afterwards. dryRun=true runs the same runner job with kg-snapshot-push's push skipped — all guards run and the guard verdict plus per-part table are reported via get_kg_status as lastDryRun (the last dry-run with no PR report target; it never writes lastRefresh), but nothing is pushed, no PR opens, and the served graph never changes. acceptNewBaseline=true downgrades the zero-shrink and 50%-shrink content guards to warnings for this one dispatch and pushes anyway — use only after reviewing a guard refusal's part table and confirming the shrink is an intentional reclassification, not data loss; the accepting identity's email is logged and written into the refresh PR's ### Baseline section.";
+  "Trigger the KG refresh rail (admin role). Same handler as POST /api/kg/refresh: runs the credential preflight, then dispatches the refresh. Poll get_kg_status afterwards. There is no dry-run and no trigger-time accept: dryRun=true and acceptNewBaseline=true are refused with the error option-removed. A refresh whose snapshot shrinks holds the run at a decision gate (get_kg_status shows it as awaiting-decision, with the snapshot PR and its part table); decide it with decide_kg_refresh.";
 
 export const triggerKgRefreshTool = tool(
   {
     description: TRIGGER_KG_REFRESH_DESCRIPTION,
     input: z.object({
-      dryRun: z.boolean().optional().describe(
-        "Run the rail without pushing the snapshot or touching the served graph; reports the guard table via get_kg_status.",
-      ),
-      acceptNewBaseline: z.boolean().optional().describe(
-        "Push even though a tracked part (issue.nt/comment.nt) shrank or a part dropped below 50% of its previous size — a one-shot override of the zero-shrink guard, applied to this dispatch only.",
-      ),
+      dryRun: z.boolean().optional().describe("Removed: true is refused with option-removed. Omit it."),
+      acceptNewBaseline: z.boolean().optional().describe("Removed: true is refused with option-removed. Decide a held run with decide_kg_refresh."),
       ref: z.string().optional().describe(
         "Dispatch against this branch instead of the KG source repo's default branch (used to run the rail against a PR head).",
       ),
@@ -966,6 +1010,10 @@ export const triggerKgRefreshTool = tool(
   async (ctx, input): Promise<ToolResponse> => {
     const answer = (status: number, body: Record<string, unknown>): ToolResponse =>
       ({ content: [{ type: "text", text: JSON.stringify({ status, body }, null, 2) }] });
+    // Refuse before any side effect: zod would strip an unknown key, and a real refresh pushes to the KG repo.
+    for (const option of ["dryRun", "acceptNewBaseline"] as const) {
+      if (input.args[option] === true) return answer(400, { error: "option-removed", option });
+    }
     const toolDeps = kgRefreshToolDeps;
     const deployHeld = await ctx.run("deploy-held", () => toolDeps ? toolDeps.isDeployHeld() : false);
     if (deployHeld) {
@@ -1013,8 +1061,6 @@ export const triggerKgRefreshTool = tool(
       return answer(422, { error: "preflight-failed", precondition: "preflight-failed", detail: preflightFailure });
     }
     const opts = {
-      dryRun: input.args.dryRun === true,
-      acceptNewBaseline: input.args.acceptNewBaseline === true,
       ...(input.args.ref !== undefined ? { kgSourceRef: input.args.ref } : {}),
       actorEmail: input.caller.email ?? undefined,
     };
@@ -1388,6 +1434,7 @@ export const orchestratorTools = restate.service({
     kg_path: kgPath,
     kg_provenance: kgProvenance,
     trigger_kg_refresh: triggerKgRefreshTool,
+    decide_kg_refresh: decideKgRefreshTool,
     set_runner_mode: setRunnerModeTool,
     set_fly_machine_profile: setFlyMachineProfileTool,
     set_run_profile: setRunProfileTool,

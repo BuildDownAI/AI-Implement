@@ -104,6 +104,7 @@ const RESTATE_TOOL_NAMES = new Set([
   "kg_provenance",
   "kg_path",
   "trigger_kg_refresh",
+  "decide_kg_refresh",
   "set_runner_mode",
   "set_fly_machine_profile",
   "set_runner_backend",
@@ -123,6 +124,7 @@ const RESTATE_TOOL_NAMES = new Set([
 // re-poll return a stale cached answer instead of running again, which reads never wanted.
 export const RESTATE_WRITE_TOOL_NAMES = new Set([
   "trigger_kg_refresh",
+  "decide_kg_refresh",
   "set_runner_mode",
   "set_fly_machine_profile",
   "set_runner_backend",

@@ -62,9 +62,9 @@ and handler types that the typed clients use are in `src/restate/kg-refresh-type
 | One-way send | yes, typed (`objectSendClient`, `workflowSendClient`; AII-975) | yes, untyped (`genericSend`) | — | |
 | Delayed send | yes: `KgRepo.expire` self-send (AII-973) | yes (`ReviewFixPR.check` self-timer) | no | |
 | Request-response call (`objectClient`, `workflowClient`) | yes (from tools handlers, typed) | no | yes | |
-| Virtual Object state (`get`/`set`/`clear`) | yes (`inFlight`, `pending`, `outcome:<repo>#<pr>`, `sha:<repo>#<pr>`) | yes | yes (+ `clearAll`) | |
+| Virtual Object state (`get`/`set`/`clear`) | yes (`inFlight`, `pending`, `closedKeys`, `sha:<repo>#<pr>`) | yes | yes (+ `clearAll`) | |
 | Workflow state (`ctx.set` inside `run`) | yes (`step`, `runId`, …) | no | — | |
-| Exclusive vs shared object handlers | yes (`status`, `dryRunOutcome` shared) | no (all exclusive) | yes (`describe`, `identity` shared) | |
+| Exclusive vs shared object handlers | yes (`status` shared) | no (all exclusive) | yes (`describe`, `identity` shared) | |
 | `ctx.rand`, `ctx.date` | yes | yes | yes | |
 | `TerminalError` | yes | yes | no (wrapper answers `isError`) | |
 | `TerminalError` with `errorCode` | yes: 404 and 409 (AII-975) | no | no | |
@@ -75,7 +75,7 @@ and handler types that the typed clients use are in `src/restate/kg-refresh-type
 | Service options: `workflowRetention`, `journalRetention` | yes | yes | no | |
 | Service options: `idempotencyRetention` | on `report`, `cancel` | on `result`, `cancel` | no | KG `status` and `progress` carry no retention (AII-973) |
 | Service options: `inactivityTimeout`, `abortTimeout` | yes (15 m / 20 m) | no | no | § 6 C6 |
-| Service options: `ingressPrivate` | yes: `KgRefresh.run`, `KgRepo.release`, `expire`, `recordDryRunOutcome` (AII-976) | no | no | |
+| Service options: `ingressPrivate` | yes: `KgRefresh.run`, `KgRepo.release`, `expire`, `extend`, `recordDryRunOutcome` (AII-976) | no | no | |
 | Service options: `enableLazyState` | no | no | no | |
 | Zod input schemas (`serde.zod`, `.strict()`) | yes (AII-938) | no | yes | |
 | Hooks | no | no | no | |
@@ -154,13 +154,13 @@ mechanism the pilot still carries (§ 5.2).
 | **Typed send clients and an SDK ingress client** (AII-975) | `objectSendClient` / `workflowSendClient` over `src/restate/kg-refresh-types.ts`; `createKgRefreshIngressClient` maps 404 and 409 | `genericSend`; hand-written `fetch` wrappers |
 | **Zod `.strict()` inputs** (AII-938) | `KgRefresh.run` and every `KgRepo` handler with an input | none |
 | **Lease expiry owned by the object** (AII-973) | `KgRepo` sends itself a delayed `expire` at the workflow's total deadline plus `KG_REPO_STALE_MARGIN_MS` | missed-close recovery poll |
-| **Per-PR verdict and same-sha dedup in object state** (AII-977) | `KgRepo.recordDryRunOutcome`, `dryRunOutcome`, `forgetPr`; keys `outcome:<repo>#<pr>`, `sha:<repo>#<pr>` | SQLite rows and process memory |
+| **Per-PR same-sha dedup and closed-PR record in object state** (AII-977) | `KgRepo.forgetPr`; keys `sha:<repo>#<pr>`, `closedKeys` | SQLite rows and process memory |
 | **Workflow state for progress** (`ctx.set("step", …)`) read by a shared `status` handler | `get_kg_status` stage derivation (`kgStageForStep`, `src/restate/tools.ts`) | SQLite row is the only progress record |
 | **`inactivityTimeout` / `abortTimeout`** | 15 m / 20 m on `KgRefresh` | unset (defaults) |
 | **Saga shape** (one `ctx.run` per rail gate, `revert` as compensation) | fetch → stage → swap → verify, `revert` | the pilot has no compensating step |
 | **Exact run identity** (`returnRunDetails: true`, reconcile by title, reconcile-first `dispatch`) | `dispatch` step | reconcile loop by polling |
 | **Credentials minted inside the dispatch step, never journaled** (AII-933, AII-973) | `mintRunTokens` is called inside `ctx.run("dispatch")`; the step result carries no token | `mintPreparedReviewFixToken` at launch (SQLite consume-once claim) |
-| **`ingressPrivate` handlers** (AII-976) | `KgRefresh.run`, `KgRepo.release`, `expire`, `recordDryRunOutcome` | none; the pilot handlers are not marked |
+| **`ingressPrivate` handlers** (AII-976) | `KgRefresh.run`, `KgRepo.release`, `expire`, `extend`, `recordDryRunOutcome` | none; the pilot handlers are not marked |
 
 ## 4. Restate features neither pipeline uses yet
 
@@ -194,7 +194,7 @@ use them yet.
 | Untyped `genericSend`, cast handles | typed send clients | done (AII-975) |
 | Gate failure JSON-encoded into a `TerminalError` message | a result union from `ctx.run` (`GateResult`) | done (AII-975) |
 | Dead branch: `kgStageForStep` matched `watch-`/`reconcile-` that `step` never holds | — | done (AII-975) |
-| `dryRunOutcomesByPr` (memory + the `kg_refresh_dry_run_outcomes` settings row), `kgDryRunLastSha` (memory) | `KgRepo` state (per-PR keys) | done (AII-977); the settings row is deleted at boot (`src/kg-refresh.ts`) |
+| `dryRunOutcomesByPr`, `kgDryRunLastSha` | `KgRepo` state (per-PR keys); the outcome is no longer stored | done (AII-977, AII-1285); the settings row is deleted at boot (`src/kg-refresh.ts`) |
 | Own `cancel` promise + poll until GitHub confirms | invocation cancellation | stays, justified: the cancel path must hold the marker until GitHub confirms that the run stopped |
 | Job-row id in a process `Map` with SQL fallback (`jobIds`, `src/restate/kg-refresh-production.ts`) | return the id from `ctx.run("reserve")` | done (AII-1011): the map is gone; `closeJobLog` resolves the row by dispatch id |
 | `kg_refresh_last_refresh` / `kg_refresh_snapshot_sha` settings rows (`src/kg-refresh.ts`) | `KgRepo` state | stays; the served-snapshot record is read outside Restate at boot |
