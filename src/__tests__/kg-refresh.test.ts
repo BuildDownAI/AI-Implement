@@ -109,7 +109,7 @@ describe("kg-refresh", () => {
     it("reportDryRun() re-posts the stored outcome's comment and status", async () => {
       const handle = buildHandle(stored(REPORT.sha, okOutcome));
 
-      await expect(handle.reportDryRun({ ...REPORT, acceptBaseline: true })).resolves.toBe("reported");
+      await expect(handle.reportDryRun(REPORT)).resolves.toBe("reported");
 
       expect(dryRunOutcome).toHaveBeenCalledWith("TestOrg/test-kg", { repo: REPORT.repo, prNumber: 42 });
       expect(postOrUpdateStickyCommentFn).toHaveBeenCalledTimes(1);
@@ -120,8 +120,7 @@ describe("kg-refresh", () => {
       expect(marker).toBe("## kg-refresh dry-run");
       expect(body).toContain("## kg-refresh dry-run — deadbeef");
       expect(body).toContain("comment.nt");
-      // Outcome was a success (no shrink), so the label has no wording effect here.
-      expect(body).not.toContain("accepted by label");
+      expect(body).not.toContain("decision gate");
       expect(setCommitStatusFn).toHaveBeenCalledTimes(1);
     });
 
@@ -164,15 +163,16 @@ describe("kg-refresh", () => {
       expect(forgetPrCall).toHaveBeenCalledWith("TestOrg/test-kg", { repo: REPORT.repo, prNumber: 42 });
     });
 
-    it("reportDryRun({ acceptBaseline: false }) reports plain-refusal wording, even for a PR the label was previously applied to (AII-640)", async () => {
+    it("a refused dry-run reads refused, points at the refresh decision gate, and fails the status even with a stale acceptBaseline", async () => {
       const handle = buildHandle(stored(REPORT.sha, refusedOutcome));
 
-      // Simulates the webhook's `unlabeled` branch: it always forces acceptBaseline:false.
-      await handle.reportDryRun({ ...REPORT, acceptBaseline: false });
+      // A queued input stored before the label was removed may still carry acceptBaseline.
+      await handle.reportDryRun({ ...REPORT, acceptBaseline: true } as typeof REPORT);
 
       expect(postOrUpdateStickyCommentFn).toHaveBeenCalledTimes(1);
       const body = postOrUpdateStickyCommentFn.mock.calls[0]![5] as string;
       expect(body).toContain("guard refused");
+      expect(body).toContain("A shrink is accepted at the decision gate of the refresh that runs after this PR merges.");
       expect(body).not.toContain("accepted by label");
       const statusCall = setCommitStatusFn.mock.calls[0] as [string, string, string, string, { state: string }];
       expect(statusCall[4].state).toBe("failure");

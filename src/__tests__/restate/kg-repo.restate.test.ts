@@ -183,7 +183,7 @@ describe("KgRepo durable single-flight lock", () => {
 
   // ---- AII-730: the PR-check dry-run queue ----
 
-  const reportFor = (prNumber: number, sha = `sha-${prNumber}`) => ({ repo: "org/kg-source", prNumber, sha, acceptBaseline: false });
+  const reportFor = (prNumber: number, sha = `sha-${prNumber}`) => ({ repo: "org/kg-source", prNumber, sha });
 
   async function enqueue(baseUrl: string, slug: string, prNumber: number, ref: string): Promise<KgRepoEnqueueResult> {
     return callObject<KgRepoEnqueueResult>(baseUrl, "KgRepo", slug, "enqueueDryRun", {
@@ -845,7 +845,7 @@ describe("KgRepo object-owned lease expiry", () => {
       const slug = slugOf();
       const first = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", slug, "trigger", {});
       await callObject(env.baseUrl(), "KgRepo", slug, "enqueueDryRun", {
-        key: "org/kg-source#1", ref: "held", report: { repo: "org/kg-source", prNumber: 1, sha: "sha-held", acceptBaseline: false },
+        key: "org/kg-source#1", ref: "held", report: { repo: "org/kg-source", prNumber: 1, sha: "sha-held" },
       });
       await eventually(
         () => countedSends.filter((s) => s.parameter.triggerId !== first.triggerId && s.parameter.kgSourceRef === "held").length,

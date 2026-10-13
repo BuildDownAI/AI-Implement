@@ -90,16 +90,13 @@ export interface KgRefreshStepRecord {
 }
 
 /**
- * PR to report a dry-run's verdict against (AII-633). `acceptBaseline` is set by the
- * webhook when the PR carries the `accept-baseline` label at trigger time — it only
- * changes the report's wording, never the underlying guard outcome (a real refresh
- * still refuses the shrink unless an admin accepts the new baseline at refresh time).
+ * PR to report a dry-run's verdict against (AII-633). A refused shrink is accepted at the
+ * decision gate of the refresh that runs after the PR merges, never on the PR.
  */
 export interface KgDryRunReportTarget {
   repo: string;
   prNumber: number;
   sha: string;
-  acceptBaseline?: boolean;
 }
 
 /** Heading prefix used to find and update the sticky dry-run PR comment across pushes (AII-633).
@@ -221,8 +218,7 @@ export interface KgRefreshHandle {
    * run (AII-633). Reads the outcome `KgRepo` holds for `report.repo`#`report.prNumber`
    * (AII-636, AII-977) and posts only that PR's own outcome — never another PR's — and only
    * when it ran against `report.sha`; otherwise a no-op (with a debug log line).
-   * Called on a `labeled` PR event (e.g. `accept-baseline` applied after the fact) so
-   * the report's wording updates without spending another dispatch. Returns whether
+   * Returns whether
    * it actually posted, so a caller can distinguish a real re-report from a silent
    * no-op (AII-636) instead of always answering as if something was posted.
    */

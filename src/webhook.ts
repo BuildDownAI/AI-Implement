@@ -90,15 +90,10 @@ export interface KgPrCheckConfig {
 const KG_GUARD_PATH_PATTERNS: RegExp[] = [/^kg_ingest\//, /^sources\.yml$/, /^ontology\//, /^snapshot\//];
 /** Head branch names that indicate an upstream merge, guard-relevant regardless of changed files. */
 const KG_GUARD_BRANCH_PATTERNS: RegExp[] = [/^kg-upstream\//, /^sync\/upstream-/];
-const KG_ACCEPT_BASELINE_LABEL = "accept-baseline";
 
 function matchesKgGuard(files: string[], headRef: string): boolean {
   if (KG_GUARD_BRANCH_PATTERNS.some((re) => re.test(headRef))) return true;
   return files.some((f) => KG_GUARD_PATH_PATTERNS.some((re) => re.test(f)));
-}
-
-function hasAcceptBaselineLabel(payload: PullRequestPayload): boolean {
-  return (payload.pull_request?.labels ?? []).some((l) => l.name === KG_ACCEPT_BASELINE_LABEL);
 }
 
 /**
@@ -128,12 +123,7 @@ async function handleKgPrCheckWebhook(
   deliveryId?: string,
 ): Promise<boolean> {
   if (!kgPrCheck) return false;
-  if (
-    payload.action !== "opened" &&
-    payload.action !== "synchronize" &&
-    payload.action !== "labeled" &&
-    payload.action !== "unlabeled"
-  ) {
+  if (payload.action !== "opened" && payload.action !== "synchronize") {
     return false;
   }
 
@@ -146,7 +136,7 @@ async function handleKgPrCheckWebhook(
   const headRef = payload.pull_request?.head?.ref;
 
   // AII-639: this check owns the HTTP response only for events nothing else handles
-  // (`opened`, `labeled`, `unlabeled`). On `synchronize` it runs as a side effect and returns false,
+  // (`opened`). On `synchronize` it runs as a side effect and returns false,
   // so the existing pull_request handling (gap-fill matching via findMatchingDispatch,
   // merge reconciliation) still runs for the KG repos — they are ordinary onboarded
   // projects too. Outcomes on `synchronize` go to the log instead of the response.
@@ -160,43 +150,6 @@ async function handleKgPrCheckWebhook(
     }
     return owns;
   };
-
-  if (payload.action === "labeled" || payload.action === "unlabeled") {
-    // Only the accept-baseline label re-reports anything — any other label on any
-    // other PR must never touch the check (AII-636: a stray label on an unrelated
-    // PR previously re-posted whatever the process had last computed, for any PR).
-    if (payload.label?.name !== KG_ACCEPT_BASELINE_LABEL) {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ignored: true, reason: "not_accept_baseline_label" }));
-      return true;
-    }
-    // Re-report the last computed verdict for this PR — never re-runs the rail.
-    // reportDryRun() itself is scoped to (and no-ops outside of) this PR's own
-    // stored outcome, so this can never surface another PR's verdict.
-    const posted = await kgPrCheck.reportDryRun({
-      repo: repoFullName,
-      prNumber,
-      sha: sha ?? "",
-      // `unlabeled` forces acceptBaseline:false regardless of what the payload's
-      // (now-stale) `labels` array might say (AII-640) — removing the label must
-      // always revert the comment/status to plain-refusal wording, not depend on
-      // GitHub having already dropped it from `pull_request.labels` by delivery time.
-      acceptBaseline: payload.action === "labeled" ? hasAcceptBaselineLabel(payload) : false,
-    });
-    if (posted === "unavailable") {
-      // 503 so GitHub redelivers: the outcome store was unreachable, not empty.
-      res.writeHead(503, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "restate-unavailable" }));
-      return true;
-    }
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      posted === "reported"
-        ? JSON.stringify({ reported: true })
-        : JSON.stringify({ ignored: true, reason: "no_dry_run_outcome" }),
-    );
-    return true;
-  }
 
   if (!sha || !headRef) {
     return answer(200, { ignored: true, reason: "missing_pr_fields" }, "missing PR fields");
@@ -239,7 +192,6 @@ async function handleKgPrCheckWebhook(
     repo: repoFullName,
     prNumber,
     sha,
-    acceptBaseline: hasAcceptBaselineLabel(payload),
   };
 
   const result = await kgPrCheck

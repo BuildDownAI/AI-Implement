@@ -66,12 +66,12 @@ const GHA_EXECUTION_MODE = "github-actions";
 /** First wait between dispatch-step attempts; doubles. Fly's replace window after an `update` lasts seconds (AII-1192). */
 export const DISPATCH_RETRY_INITIAL_INTERVAL = { seconds: 3 };
 
-/** The PR a dry-run reports back to — the wire shape of `KgDryRunReportTarget` (`src/kg-refresh.ts`), `acceptBaseline` included so it is not stripped. */
+/** The PR a dry-run reports back to — the wire shape of `KgDryRunReportTarget` (`src/kg-refresh.ts`). */
 export const kgDryRunReportSchema = z.object({
   repo: z.string(),
   prNumber: z.number(),
   sha: z.string(),
-  acceptBaseline: z.boolean().optional(),
+  acceptBaseline: z.boolean().optional(), // tolerated for queued inputs; remove after 2026-12-01
 });
 
 /** Options a caller may set on one refresh; `KgRepo.trigger` validates exactly these. */
@@ -857,7 +857,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         };
         if (stepTable.length > 0) outcome.steps = stepTable;
         if (input.report) {
-          // Stored on `KgRepo` so the accept-baseline label can re-report it; journaled, so a replay sends once.
+          // Stored on `KgRepo` so the outcome can be re-reported; journaled, so a replay sends once.
           ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).recordDryRunOutcome({ report: input.report, outcome });
           await ctx.run("dry-run-report", () => postDryRunReport(deps.rail, input.report!, outcome));
         }

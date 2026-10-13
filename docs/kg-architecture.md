@@ -339,17 +339,7 @@ it, but only when the GitHub App has been granted `statuses: write` on the PR's 
 step" below. Losing that grant degrades the check to comment-only; it never blocks the dispatch or
 the PR.
 
-The `accept-baseline` label changes only what the comment says, never what the guard decides: applying
-it to a PR whose dry run refused a tracker-file shrink changes the report's wording to "refused,
-accepted by label" (and, symmetrically, the commit status to success) without re-running anything —
-a `labeled` webhook event just re-posts the last computed verdict. Removing the label (`unlabeled`,
-AII-640) re-posts the same verdict with the plain refusal wording and the status back to failure;
-the check forces `acceptBaseline: false` on `unlabeled` rather than reading the payload's `labels`
-array, which GitHub does not guarantee to reflect the removal by delivery time. Both events act only
-on the `accept-baseline` label itself. The label is **report-only**. It
-is a distinct mechanism from an admin accepting a new baseline at refresh time (AII-628): a real
-refresh against that same source still refuses the shrink unless that refresh-time acceptance has
-happened. Treat the label as "we've seen this and it's expected," not as a bypass.
+A refused tracker-file shrink fails the commit status and the comment says so. There is no PR label that accepts it: a shrink is accepted at the decision gate of the refresh that runs after the PR merges, so the dry-run never decides on the baseline.
 
 Outcomes are stored per PR on the `KgRepo` object, one `outcome:<repo>#<prNumber>` state key each,
 pinned to the head sha they ran against (AII-636, AII-977), so a `labeled` re-report can only ever
