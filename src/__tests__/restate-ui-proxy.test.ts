@@ -70,7 +70,7 @@ describe("handleRestateUiRequest", () => {
     const admin: Array<[string, string]> = [
       ["GET", "/ui"], ["GET", "/ui/assets/x.js"], ["GET", "/health"], ["GET", "/version"],
       ["GET", "/services"], ["GET", "/services/x/openapi"], ["GET", "/deployments"], ["GET", "/deployments/d1"],
-      ["POST", "/query"], ["PATCH", "/invocations/x/cancel"], ["DELETE", "/invocations/x/purge"], ["POST", "/deployments"],
+      ["PATCH", "/invocations/x/cancel"], ["DELETE", "/invocations/x/purge"], ["POST", "/deployments"],
     ];
     for (const [m, p] of admin) expect((await call(m, `${p}?a=1`)).status).toBe(200);
     expect(adminHits.map((h) => `${h.method} ${h.url}`)).toEqual(admin.map(([m, p]) => `${m} ${p}?a=1`));
@@ -100,12 +100,28 @@ describe("handleRestateUiRequest", () => {
     expect(ingressHits[0].headers["content-type"]).toBe("application/json");
   });
 
-  it("logs non-read requests except POST /query", async () => {
+  it("refuses POST /query with 403 and reaches no upstream", async () => {
+    for (const p of ["/query", "/query?a=1"]) {
+      const r = await call("POST", p, "{}");
+      expect(r.status).toBe(403);
+      const text = await r.text();
+      expect(JSON.parse(text).error).toContain("AII-1287");
+      expect(text).toContain("/query");
+    }
+    gate.current = { ok: true, identity: { email: "u@x.com" }, entry: null, role: "user" };
+    expect((await call("POST", "/query", "{}")).status).toBe(403);
+    gate.current = { ok: false, status: 401, error: "Unauthorized" };
+    expect((await call("POST", "/query", "{}")).status).toBe(401);
+    expect(adminHits).toHaveLength(0);
+    expect(ingressHits).toHaveLength(0);
+  });
+
+  it("logs non-read requests, including the refused POST /query", async () => {
     await call("PATCH", "/invocations/x/cancel");
     await call("GET", "/services");
     await call("POST", "/query", "{}");
     const lines = logSpy.mock.calls.map((c: unknown[]) => String(c[0])).filter((l: string) => l.startsWith("[restate-ui]"));
-    expect(lines).toEqual(["[restate-ui] a@x.com PATCH /invocations/x/cancel"]);
+    expect(lines).toEqual(["[restate-ui] a@x.com PATCH /invocations/x/cancel", "[restate-ui] a@x.com POST /query"]);
   });
 
   it("allows only KgRefresh decide/status on the ingress and answers 403 otherwise", async () => {

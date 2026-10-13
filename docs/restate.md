@@ -139,16 +139,18 @@ Admins reach the Restate UI without `flyctl`: `src/restate/ui-proxy.ts` (`handle
 |---|---|
 | `GET`/`HEAD` `/ui`, `/ui/*` (other methods 405) | admin API (9070), path unchanged |
 | `GET /health`, `/version`, `/services`, `/services/*`, `/deployments`, `/deployments/*` | admin API |
-| `POST /query`, `POST /deployments` | admin API |
+| `POST /deployments` | admin API |
+| `POST /query` | refused: 403, no upstream |
 | `/invocations/*` (any method) | admin API |
 | `POST /admin/restate/ingress/KgRefresh/<key>/(decide\|status)`, also under `/restate/call/` and `/restate/send/` or with a `/send` suffix | ingress (8081), the prefix removed |
 
-Any other path or method is not handled and the orchestrator's routing continues. Everything else under `/admin/restate/ingress/` answers 403 and reaches no upstream. The ingress is deny-by-default because it was loopback-only before this door: `Operator` holds each MCP client's raw refresh token and its handlers are not `ingressPrivate`, and `KgRefresh.report`/`progress`/`cancel` rely on the runner-token check in the callback route. `<key>` must match `^[A-Za-z0-9._-]{1,128}$`. A handled path containing `..`, `//`, or an encoded `%2e`, `%2f`, or `%5c` (any case) answers 400. `POST /query` can still read state and journals; that is tracked on AII-1248.
+Any other path or method is not handled and the orchestrator's routing continues. Everything else under `/admin/restate/ingress/` answers 403 and reaches no upstream. The ingress is deny-by-default because it was loopback-only before this door: `Operator` holds each MCP client's raw refresh token and its handlers are not `ingressPrivate`, and `KgRefresh.report`/`progress`/`cancel` rely on the runner-token check in the callback route. `<key>` must match `^[A-Za-z0-9._-]{1,128}$`. A handled path containing `..`, `//`, or an encoded `%2e`, `%2f`, or `%5c` (any case) answers 400. 
 
+- **`/query` is refused (AII-1286).** `POST /query` answers 403 and reaches no upstream, because `Operator` stores each MCP client's raw refresh token in state and its journal, and `/query` can read both. Until the tokens are out of Restate (AII-1287, which reopens this), the Restate UI cannot show invocation lists, journals, or state.
 - **Advertised ingress address.** When `OAUTH_REDIRECT_BASE_URL` is set, the sidecar gets `RESTATE_INGRESS__ADVERTISED_ADDRESS=<base>/admin/restate/ingress/`, so the playground calls the gate rather than the loopback ingress. Unset (local dev) keeps the default, and the playground cannot reach the ingress. The UI caches the value, so a deploy that changes it needs a hard refresh. The orchestrator's own calls keep `RESTATE_INGRESS_BASE_URL`.
 - **Role rule.** Every handled path runs `authenticateAdminRequest`: no session is 401, an unavailable access list is 503, and a role other than `admin` is 403. Page grants never apply.
 - **Header stripping.** `cookie`, `authorization`, the hop-by-hop headers (`connection`, `upgrade`, `keep-alive`, `te`, `trailer`, `proxy-*`) and `x-forwarded-*` are removed from the forwarded request; `set-cookie` and `access-control-*` are removed from the response, which carries `x-content-type-options: nosniff`. Cookie and authorization are removed because the ingress journals request headers and bodies (§ "The ingress journals request and response bodies") and a session token must never reach a journal.
-- **Logging.** Every request under `/admin/restate/ingress/` (any method, allowed or denied) and each other handled request that is not GET, HEAD, or `POST /query` logs `[restate-ui] <email> <METHOD> <path>`. The UI polls `/query` about once a second, so those are not logged.
+- **Logging.** Every request under `/admin/restate/ingress/` (any method, allowed or denied) and each other handled request that is not GET, HEAD, logs `[restate-ui] <email> <METHOD> <path>`, including the refused `POST /query`. The UI polls `/query` about once a second, so an open tab logs a line each time.
 - **Reserved paths.** An orchestrator route under `/ui`, `/health`, `/version`, `/services`, `/deployments`, `/query`, or `/invocations` would collide.
 
 ### Journal queries and the Restate UI (AII-1128)
