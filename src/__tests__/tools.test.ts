@@ -865,7 +865,7 @@ describe("migrated read handlers (AII-711)", () => {
           runnerStep: { id: "kg-snapshot-push", status: "passed" },
         });
         expect(status.stage).toBe("awaiting-decision");
-        expect(status.currentRun).toEqual({ triggerId: "t1", step: "decision", decisions: ["accept", "cancel"], held });
+        expect(status.currentRun).toEqual({ triggerId: "t1", step: "decision", decisions: ["accept", "cancel"], held: { ...held, snapshotPrUrl: "https://github.com/org/kg/pull/77" } });
       });
 
       it("decided and still finishing: no decisions, stage as today for the step", async () => {

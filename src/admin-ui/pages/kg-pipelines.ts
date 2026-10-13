@@ -22,11 +22,11 @@ export const kgPipelinesHtml = `
         <div class="kpi-trend text-secondary" id="kg-sidecar-status" hidden></div>
         <div style="margin-top: 12px">
           <button class="btn btn-sm" id="kg-refresh-btn" onclick="window.triggerKgRefresh()">Refresh graph now</button>
-          <button class="btn btn-sm" id="kg-dry-run-btn" onclick="window.triggerKgRefresh(true)">Dry-run refresh</button>
-          <button class="btn btn-sm" id="kg-accept-baseline-btn" onclick="window.triggerKgAcceptBaseline()">Accept new baseline &amp; refresh</button>
-          <span class="kpi-trend text-secondary" style="margin-left: 8px">Refresh fetches the KG source repo's committed snapshot and restarts the sidecar — no deploy, no dispatch pause. Dry-run runs the same job with the push skipped and reports the guard table below; the served graph never changes. Accept new baseline pushes even if the guard table above shows a shrink — review it first.</span>
+          <button class="btn btn-sm" id="kg-accept-btn" onclick="window.decideKgRefresh('accept')" hidden>Accept new baseline &amp; refresh</button>
+          <button class="btn btn-sm" id="kg-cancel-btn" onclick="window.decideKgRefresh('cancel')" hidden>Cancel</button>
+          <span class="kpi-trend text-secondary" id="kg-refresh-help" style="margin-left: 8px">Refresh fetches the KG source repo's committed snapshot and restarts the sidecar — no deploy, no dispatch pause.</span>
         </div>
-        <div class="kpi-trend text-secondary" id="kg-dry-run-last" style="margin-top: 8px" hidden></div>
+        <div class="kpi-trend text-secondary" id="kg-current-run" style="margin-top: 8px" hidden></div>
         <div style="margin-top: 12px; display:flex; align-items:center; gap:12px; flex-wrap:wrap">
           <span class="kpi-trend text-secondary">Backend:</span>
           <span class="seg" id="kg-backend-controls">
@@ -87,8 +87,6 @@ export const kgPipelinesScript = `
         if (held.error === 'deploy-in-progress') {
           card.hidden = false;
           document.getElementById('kg-refresh-btn').disabled = true;
-          document.getElementById('kg-dry-run-btn').disabled = true;
-          document.getElementById('kg-accept-baseline-btn').disabled = true;
           document.getElementById('kg-refresh-last').textContent =
             'A deploy is in progress \u2014 the refresh status returns after it completes.';
           return;
@@ -109,6 +107,8 @@ export const kgPipelinesScript = `
         setBadge(badge, 'running', 'landing');
       } else if (stage === 'staging') {
         setBadge(badge, 'running', 'staging');
+      } else if (stage === 'awaiting-decision') {
+        setBadge(badge, 'warn', 'awaiting decision');
       } else if (stage === 'serving') {
         setBadge(badge, 'ok', 'serving');
       } else if (stage === 'reverted') {
@@ -149,25 +149,42 @@ export const kgPipelinesScript = `
       } else {
         sidecarEl.hidden = true;
       }
-      renderKgDryRun(document.getElementById('kg-dry-run-last'), data.lastDryRun);
+      renderKgCurrentRun(data.currentRun, stage);
       const busy = !!data.running || !!data.deployHeld;
       document.getElementById('kg-refresh-btn').disabled = busy;
-      document.getElementById('kg-dry-run-btn').disabled = busy;
-      document.getElementById('kg-accept-baseline-btn').disabled = busy;
     } catch (e) { card.hidden = true; }
   }
 
-  // AII-635: the last dry-run's verdict and per-part table, shown only when the last
-  // admin dry-run (get_kg_status lastDryRun, never lastRefresh). Cells are set with
-  // textContent, never innerHTML.
-  function renderKgDryRun(el, last) {
+  // The card shows the one current run: its step, and a button per open decision. Cells are
+  // set with textContent, never innerHTML; the PR link goes through safeUrl().
+  function renderKgCurrentRun(run, stage) {
+    const el = document.getElementById('kg-current-run');
+    const decisions = run && Array.isArray(run.decisions) ? run.decisions : [];
+    document.getElementById('kg-refresh-btn').hidden = !!run;
+    document.getElementById('kg-refresh-help').hidden = !!run;
+    document.getElementById('kg-accept-btn').hidden = decisions.indexOf('accept') < 0;
+    document.getElementById('kg-cancel-btn').hidden = !run;
     el.textContent = '';
-    if (!last) { el.hidden = true; return; }
+    if (!run) { el.hidden = true; return; }
     el.hidden = false;
+    const held = stage === 'awaiting-decision' && decisions.indexOf('accept') >= 0 && run.held ? run.held : null;
     const head = document.createElement('div');
-    head.textContent = 'Last dry-run (' + new Date(last.at).toLocaleString() + '): ' + last.detail;
+    if (!held) {
+      head.textContent = 'Run in flight' + (run.step ? ': ' + run.step : '');
+      el.appendChild(head);
+      return;
+    }
+    head.textContent = 'Held for a decision until ' + new Date(held.decideBy).toLocaleString();
     el.appendChild(head);
-    const rows = Array.isArray(last.partTable) ? last.partTable : [];
+    if (held.snapshotPrUrl) {
+      const link = document.createElement('a');
+      link.href = window.safeUrl(held.snapshotPrUrl);
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.textContent = 'Held PR #' + held.snapshotPr;
+      el.appendChild(link);
+    }
+    const rows = Array.isArray(held.partTable) ? held.partTable : [];
     if (!rows.length) return;
     const table = document.createElement('table');
     table.className = 'table';
@@ -194,25 +211,17 @@ export const kgPipelinesScript = `
     el.appendChild(table);
   }
 
-  // AII-635: dryRun=true posts { dryRun: true } so the rail runs with the push skipped
-  // and reports the guard table on the card instead of changing the served graph.
-  window.triggerKgRefresh = async function (dryRun) {
+  window.triggerKgRefresh = async function () {
     const btn = document.getElementById('kg-refresh-btn');
-    const dryBtn = document.getElementById('kg-dry-run-btn');
     btn.disabled = true;
-    dryBtn.disabled = true;
-    document.getElementById('kg-accept-baseline-btn').disabled = true;
     try {
-      const res = dryRun
-        ? await window.api('/api/kg/refresh', { method: 'POST', body: JSON.stringify({ dryRun: true }) })
-        : await window.api('/api/kg/refresh', { method: 'POST' });
+      const res = await window.api('/api/kg/refresh', { method: 'POST' });
       if (!res.ok) showKgRefreshRefusal(res, await res.json().catch(function () { return {}; }));
     } catch (err) { showMessage('warning', 'Refresh failed \u2014 ' + String(err)); }
     setTimeout(loadKgStatus, 1000);
   };
 
-  // One refusal-to-message mapping for all three refresh buttons (real, dry-run, accept-baseline):
-  // the same preconditions (callback-unconfigured, deploy-in-progress, already-running) apply to each.
+  // The refresh button's refusal-to-message mapping: callback-unconfigured, deploy-in-progress, already-running.
   function showKgRefreshRefusal(res, body) {
     if (res.status === 422 && body.precondition === 'callback-unconfigured') {
       showMessage('warning', 'Refresh requires a configured runner callback \u2014 set RUNNER_CALLBACK_BASE_URL and RUNNER_TOKEN_SECRET on the orchestrator.');
@@ -225,20 +234,26 @@ export const kgPipelinesScript = `
     }
   }
 
-  // AII-628: a one-shot override of the zero-shrink/50% push guards, gated by the same
-  // native confirm() this page uses for every other consequential action (see "Deploy now").
-  // A separate button/function from triggerKgRefresh rather than a third argument there,
-  // so an operator reads the shrink table first and opts in deliberately.
-  window.triggerKgAcceptBaseline = async function () {
-    if (!confirm('Accept the new baseline? This pushes the snapshot even though a tracked part (issue.nt/comment.nt) shrank, overriding the zero-shrink/50% guard for this one refresh. Review the guard table above first.')) return;
-    document.getElementById('kg-refresh-btn').disabled = true;
-    document.getElementById('kg-dry-run-btn').disabled = true;
-    document.getElementById('kg-accept-baseline-btn').disabled = true;
+  // Both decisions act on the current run through a route that takes no trigger id.
+  window.decideKgRefresh = async function (action) {
+    const prompt = action === 'accept'
+      ? 'Accept the new baseline? This lands the held snapshot even though a tracked part shrank, overriding the zero-shrink/50% guard for this run. Review the part table first.'
+      : 'Cancel the current refresh? The run stops and its held PR is closed.';
+    if (!confirm(prompt)) return;
+    const accept = document.getElementById('kg-accept-btn');
+    const cancel = document.getElementById('kg-cancel-btn');
+    accept.disabled = true;
+    cancel.disabled = true;
     try {
-      const res = await window.api('/api/kg/refresh', { method: 'POST', body: JSON.stringify({ acceptNewBaseline: true }) });
-      if (!res.ok) showKgRefreshRefusal(res, await res.json().catch(function () { return {}; }));
-    } catch (err) { showMessage('warning', 'Refresh failed \u2014 ' + String(err)); }
-    setTimeout(loadKgStatus, 1000);
+      const res = await window.api('/api/tools/decide_kg_refresh', { method: 'POST', body: JSON.stringify({ args: { action: action } }) });
+      const out = unwrapToolAnswer(res, await res.json().catch(function () { return {}; }));
+      if (out.status === 403) showMessage('warning', 'admin only');
+      else if (!out.ok) showMessage('warning', 'Could not ' + action + ' the refresh \u2014 ' + (out.body.error || out.status));
+      else document.getElementById('kg-pipelines-error').hidden = true;
+    } catch (err) { showMessage('warning', 'Could not ' + action + ' the refresh \u2014 ' + String(err)); }
+    accept.disabled = false;
+    cancel.disabled = false;
+    await loadKgStatus();
   };
 
   async function loadKgExecutionMode() {

@@ -432,10 +432,21 @@ with nothing to add logs `scope in sync` and leaves the file byte-for-byte uncha
 
 ### Where to watch a refresh
 
-`/admin#kg-pipelines` (admin only) shows the Knowledge graph card above a
-table of kg-refresh runs, which is the dispatch log filtered to `phase: kg-refresh`, with Logs and Stop
-on each row. The same runs also appear on the Pipelines page with the `kg` badge, because that page is
-the complete dispatch log. Deployments keeps only the deploy-side signals: the drain tile counts an
+`/admin#kg-pipelines` (admin only) shows one Knowledge graph card above a table of kg-refresh runs, which
+is the dispatch log filtered to `phase: kg-refresh`, with Logs and Stop on each row (rows are reference
+only; they carry no decision buttons). The card renders `GET /api/kg/status` and shows the one current run:
+
+| `currentRun` | Card shows |
+|---|---|
+| `null` | The served stamp, the last outcome line, **Refresh graph now** |
+| set, no open decision | "Run in flight: <step>" and **Cancel** |
+| set, `accept` open (`awaiting-decision`) | "Held for a decision until <decideBy>", the part table (part / previous / new / delta), a link to the held PR, **Accept new baseline & refresh** and **Cancel** |
+
+Both decision buttons ask `confirm()` and post `{ args: { action } }` to `/api/tools/decide_kg_refresh`,
+which takes no trigger id, so it can only act on the current run; an `already-decided` or
+`no-decision-open` answer is shown in the page's message box. If the status call fails the card is hidden
+and offers no action. The same runs also appear on the Pipelines page with the `kg` badge, because that
+page is the complete dispatch log. Deployments keeps only the deploy-side signals: the drain tile counts an
 in-flight KG ingest run, and a release whose sidecar does not serve records "Released, but the knowledge
 graph is not serving".
 

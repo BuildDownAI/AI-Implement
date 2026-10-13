@@ -763,7 +763,7 @@ export const getKgStatusTool = tool(
         const wf = await ctx.workflowClient(KgRefresh, inFlight.triggerId).status();
         // Older in-flight workflows lack the decision fields during a deploy.
         const decisions = wf.decisions ?? [];
-        currentRun = { triggerId: inFlight.triggerId, step: wf.step, decisions, held: wf.held ?? null };
+        currentRun = { triggerId: inFlight.triggerId, step: wf.step, decisions, held: wf.held ? { ...wf.held, snapshotPrUrl: `https://github.com/${toolDeps.kgSourceRepo}/pull/${wf.held.snapshotPr}` } : null };
         if (wf.step === "decision" && decisions.length > 0) {
           // The runner has finished by the gate, so its last step must not decide the stage.
           stage = "awaiting-decision";
