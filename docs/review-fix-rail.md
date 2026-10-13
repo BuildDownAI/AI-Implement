@@ -136,6 +136,8 @@ Trusted comment authors come from the project's review process (`src/review-proc
 
 Inline-comment severity follows the process. `ai-implement` keeps `medium` for every inline webhook comment. `claude-code-review` and `claude-code-review-repository-fix` (the definition's `claudeInlineMarkers`) classify a trusted bot's comment by its leading marker: 🔴 `blocking`, 🟡 or untagged `minor`, and 🟣 is skipped (the webhook answers `{ ignored: true, reason: "pre_existing" }` and stores nothing). Under that process a bot that is not trusted is ignored (`untrusted_author`). A human's inline comment is always `medium` and always enqueues (ADR 027), and a CHANGES_REQUESTED author's thread stays `blocking` whatever its marker.
 
+**An approve verdict with only non-gating findings starts no fix run.** In the `issue_comment` summary path, when the `review-findings` block's verdict is `approve` and no finding gates under `reviewContractFindingGates` (`src/pipeline/review-ledger.ts`; only `blocking` gates under `approve`), the webhook answers `{ ignored: true, reason: "approved" }` before any queue entry, `ReviewFixPR.feedback` forward, or ledger row. A `blocking` finding under `approve`, or any finding under `changes_requested`, still enqueues. The inline-comment rail above is unchanged: a 🟡 `minor` inline comment still queues a fix.
+
 **The in-run gate's inline fallback honours thread state.** Under `claude-code-review`, when the resolution-aware thread list is empty but the check-and-comments verdict is `changes_requested`, the gate falls back to the REST inline findings. Those carry no thread state, so `collectClosedReviewThreadCommentUrls` (`src/pipeline/review-ledger.ts`) reads the review threads and the gate drops each finding whose comment URL sits on a resolved or outdated thread. If no blocking finding remains, the verdict is treated as `approve`. A failed thread read keeps every finding, so the gate stays blocked.
 
 ## The review-findings contract
@@ -180,7 +182,7 @@ The trust boundary is unchanged: only a comment from an already-trusted Claude a
 
 The last step of the pipeline. It runs only when the feedback loop approved, something was actually pushed, and a PR number exists.
 
-**It is skipped on gap-fill runs.** The step's `skip` predicate returns early when `ctx.data.prNumber` is already set (`src/pipeline/pipeline-loader.ts:118-121` (`shouldSkipPostPushReview`) — a gap-fill run updates an existing PR and keeps that PR's already-established review flow rather than starting a second post-push review cycle. This is also why a bot review of a review-fix run's own push is never evaluated by this step (see "The bot-review rule" above and ADR 027).
+**It is skipped on gap-fill runs.** The step's `skip` predicate returns early when `ctx.data.prNumber` is already set (`src/pipeline/pipeline-loader.ts:118-121`, `shouldSkipPostPushReview`) — a gap-fill run updates an existing PR and keeps that PR's already-established review flow rather than starting a second post-push review cycle. This is also why a bot review of a review-fix run's own push is never evaluated by this step (see "The bot-review rule" above and ADR 027).
 
 Built-in reviewers return a short `summary` and a `checks` list alongside their
 verdict and findings, including when they approve. Each check names what was
