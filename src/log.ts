@@ -488,7 +488,7 @@ export function updateJobStatus(
     .prepare(
       `UPDATE dispatch_log
        SET status = ?,
-           conclusion = CASE WHEN conclusion IN ('operator_cancelled', 'runner_approved') THEN conclusion ELSE ? END,
+           conclusion = CASE WHEN conclusion IN ('operator_cancelled', 'runner_approved', 'external_review_pending') THEN conclusion ELSE ? END,
            pr_url = COALESCE(?, pr_url), completed_at = ?,
            machine_nonce = CASE WHEN ? = 1 THEN NULL ELSE machine_nonce END
        WHERE id = ?`,
@@ -570,6 +570,20 @@ export function getInFlightJobs(): Job[] {
         "SELECT * FROM dispatch_log WHERE status IN ('dispatched', 'running') ORDER BY dispatched_at ASC",
       )
       .all() as RawRow[],
+  );
+}
+
+/**
+ * Gap-fill rows still waiting on their late external review: completed with the pending
+ * conclusion, no approval mark, a PR, and finished at or after `sinceMs` (AII-1304).
+ */
+export function getGapFillRowsAwaitingLateReview(sinceMs: number): Job[] {
+  return mapRows(
+    getDb()
+      .prepare(
+        "SELECT * FROM dispatch_log WHERE phase = 'gap-analysis' AND status = 'completed' AND conclusion = 'external_review_pending' AND approved = 0 AND pr_url IS NOT NULL AND dispatch_id IS NOT NULL AND completed_at >= ? ORDER BY completed_at ASC",
+      )
+      .all(sinceMs) as RawRow[],
   );
 }
 

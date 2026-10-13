@@ -308,7 +308,7 @@ Labels: `AI-Implement` → `AI-Planning` → `Plan-Complete` → `AI-Working` �
 
 The cascade **self-advances** and self-heals: a child PR landing dirty is re-queued through the comment-gapfill rail (capped at 2 attempts), a parent with an open roll-up PR is held from dispatch, and siblings whose declared `Files:` overlap an in-flight sibling are deferred (failing open). Requires a publicly reachable runner callback, and the runner image channel paired to the orchestrator's.
 
-A child PR is auto-merged only when the project's Auto-merge setting is on and the runner has written an **approval mark** (`runner_approved` conclusion) on its run record; with the setting off, approved children are left for a person to merge. A PR with no run record (including human-opened PRs into a grouping branch) or a run that ended without approval is held — see §8 of `docs/feature-branch-grouping.md`.
+A child PR is auto-merged only when the project's Auto-merge setting is on and the run has an **approval mark** (`runner_approved` conclusion) on its run record — the result callback writes it for an initial run, while a gap-fill's mark comes from `LateExternalReview` (when Restate was not ready, the poll sweep submits it later); with the setting off, approved children are left for a person to merge. A PR with no run record (including human-opened PRs into a grouping branch) or a run that ended without approval is held — see §8 of `docs/feature-branch-grouping.md`.
 
 **Full reference: [docs/feature-branch-grouping.md](docs/feature-branch-grouping.md).**
 
