@@ -30,6 +30,20 @@ function matchRoute(method: string, pathname: string): { target: "admin" | "ingr
   return null;
 }
 
+const UNSAFE_PATH = /\.\.|\/\/|%2e|%2f|%5c/i;
+
+/**
+ * Deny-by-default ingress allowlist (AII-1283): only the KgRefresh decision gate. `Operator`
+ * holds raw refresh tokens and `KgRefresh.report/progress/cancel` rely on the runner token the
+ * callback route verifies, so neither may be reached through this door.
+ */
+const KEY = "[A-Za-z0-9._-]{1,128}";
+const INGRESS_ALLOWED = new RegExp(
+  `^(?:/restate/(?:call|send))?/KgRefresh/${KEY}/(?:decide|status)(?:/send(?:/[0-9A-Za-z]{1,32})?)?$`,
+);
+
+const STRIPPED_REQUEST_HEADERS = ["cookie", "authorization", "connection", "upgrade", "keep-alive", "te", "trailer"];
+
 export function handleRestateUiRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -62,24 +76,45 @@ export function handleRestateUiRequest(
     return true;
   }
 
+  const who = gate.identity?.email ?? "access-code";
   const isRead = method === "GET" || method === "HEAD";
-  if (!isRead && !(method === "POST" && pathname === "/query")) {
-    console.log(`[restate-ui] ${gate.identity?.email ?? "access-code"} ${method} ${pathname}`);
+  if (match.target === "ingress" || (!isRead && !(method === "POST" && pathname === "/query"))) {
+    console.log(`[restate-ui] ${who} ${method} ${pathname}`);
+  }
+
+  if (UNSAFE_PATH.test(pathname)) {
+    json(400, "Bad request path");
+    return true;
+  }
+  if (match.target === "ingress") {
+    if (method !== "POST" || !INGRESS_ALLOWED.test(pathname.slice(match.strip))) {
+      json(403, "This ingress path is not available through the proxy");
+      return true;
+    }
+  } else if ((pathname === "/ui" || pathname.startsWith("/ui/")) && !isRead) {
+    json(405, "Method not allowed");
+    return true;
   }
 
   const base = new URL(match.target === "admin" ? (deps.adminBaseUrl ?? RESTATE_ADMIN_BASE_URL) : (deps.ingressBaseUrl ?? RESTATE_INGRESS_BASE_URL));
   const upstreamPath = (pathname.slice(match.strip) || "/") + search;
 
   // The ingress journals request headers and bodies; a session token must never reach a journal.
-  const headers = { ...req.headers, host: base.host };
-  delete headers.cookie;
-  delete headers.authorization;
+  const headers: http.OutgoingHttpHeaders = { ...req.headers, host: base.host };
+  for (const name of Object.keys(headers)) {
+    if (STRIPPED_REQUEST_HEADERS.includes(name) || name.startsWith("proxy-") || name.startsWith("x-forwarded-")) {
+      delete headers[name];
+    }
+  }
 
   const proxyReq = http.request(
     { hostname: base.hostname, port: base.port || "80", path: upstreamPath, method, headers },
     (proxyRes) => {
       const outHeaders = { ...proxyRes.headers } as http.OutgoingHttpHeaders;
-      delete outHeaders["transfer-encoding"];
+      for (const name of Object.keys(outHeaders)) {
+        if (name === "transfer-encoding" || name === "set-cookie" || name.startsWith("access-control-")) delete outHeaders[name];
+      }
+      outHeaders["x-content-type-options"] = "nosniff";
       res.writeHead(proxyRes.statusCode ?? 502, outHeaders);
       proxyRes.on("data", (chunk: Buffer) => res.write(chunk));
       proxyRes.on("end", () => res.end());
