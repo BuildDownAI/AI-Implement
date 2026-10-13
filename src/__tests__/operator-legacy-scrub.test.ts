@@ -46,21 +46,43 @@ describe("scrubOperatorLegacyTokens", () => {
     expect(rowStore.get()).toBeNull();
   });
 
-  it("does nothing when the row exists and no family holds a legacy token", async () => {
-    const queries: string[] = [];
-    const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => {
-      queries.push(JSON.parse(init?.body as string).query as string);
-      return new Response(JSON.stringify({ rows: [{ service_key: "op1", value_utf8: JSON.stringify({ currentToken: "" }) }] }), { status: 200 });
+  function cleanFetch(log: string[], opts: { purgeStatus?: number } = {}) {
+    return vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.endsWith("/query")) {
+        const q = JSON.parse(init?.body as string).query as string;
+        log.push(q.includes("FROM state") ? "state" : "invocations");
+        if (q.includes("FROM state")) {
+          return new Response(JSON.stringify({ rows: [{ service_key: "op1", value_utf8: JSON.stringify({ currentToken: "" }) }] }), { status: 200 });
+        }
+        expect(q).toContain("target_service_name = 'Operator' AND status = 'completed'");
+        return new Response(JSON.stringify({ rows: [{ id: "inv_1" }, { id: "inv_2" }] }), { status: 200 });
+      }
+      log.push("purge");
+      return new Response("", { status: opts.purgeStatus ?? 200 });
     });
+  }
+
+  it("purges completed invocations before confirming when the row exists and no family holds a legacy token", async () => {
     const log: string[] = [];
+    const fetchImpl = cleanFetch(log);
+    const rowStore = store("2026-10-13T00:00:00.000Z", log);
+    const result = await scrubOperatorLegacyTokens({ fetchImpl: fetchImpl as unknown as typeof fetch, rowStore, restateReady: () => true });
+    expect(result).toEqual({ ran: false, scrubbed: 0, purged: 2 });
+    expect(log).toEqual(["state", "invocations", "purge", "purge"]);
+    expect(rowStore.get()).toBe("2026-10-13T00:00:00.000Z");
+    expect(isOperatorLegacyCheckConfirmed()).toBe(true);
+  });
+
+  it("keeps /query closed and the row when the purge fails on the clean path", async () => {
+    const log: string[] = [];
+    const fetchImpl = cleanFetch(log, { purgeStatus: 500 });
     const rowStore = store("2026-10-13T00:00:00.000Z", log);
     const result = await scrubOperatorLegacyTokens({ fetchImpl: fetchImpl as unknown as typeof fetch, rowStore, restateReady: () => true });
     expect(result).toEqual({ ran: false, scrubbed: 0, purged: 0 });
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
-    expect(queries[0]).toContain("FROM state");
-    expect(log).toEqual([]);
+    expect(log).not.toContain("clear");
+    expect(log).not.toContain("write");
     expect(rowStore.get()).toBe("2026-10-13T00:00:00.000Z");
-    expect(isOperatorLegacyCheckConfirmed()).toBe(true);
+    expect(isOperatorLegacyCheckConfirmed()).toBe(false);
   });
 
   it("closes the row before scrubbing when the row exists and a legacy token is found", async () => {
