@@ -148,6 +148,7 @@ function applyWiring(step: YamlStep): StepDefinition {
           prNumber: ctx.data.prNumber,
           orchestratorUrl: ctx.data.orchestratorUrl,
           machineNonce: ctx.data.nonce,
+          callbackUrl: ctx.data.callbackUrl,
           depth: step.depth,
         }),
       };

@@ -15,6 +15,7 @@ interface CloneInputs extends Record<string, unknown> {
   baseBranch?: string;
   prNumber?: string;
   orchestratorUrl?: string;
+  callbackUrl?: string;
   machineNonce?: string;
   /**
    * When set, clone into this subdirectory of workspaceDir rather than workspaceDir itself.
@@ -475,6 +476,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
       currentToken: githubToken,
       orchestratorUrl: inputs.orchestratorUrl,
       machineNonce: inputs.machineNonce,
+      callbackUrl: inputs.callbackUrl,
       owner: repoOwner,
       repo: repoRepo,
       workspaceDir,
