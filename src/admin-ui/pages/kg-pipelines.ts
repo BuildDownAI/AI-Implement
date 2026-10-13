@@ -155,6 +155,9 @@ export const kgPipelinesScript = `
       renderKgCurrentRun(data.currentRun, stage);
       const busy = !!data.running || !!data.deployHeld;
       document.getElementById('kg-refresh-btn').disabled = busy;
+      // A 409 deploy-in-progress poll disables these; a successful poll re-enables them.
+      document.getElementById('kg-accept-btn').disabled = false;
+      document.getElementById('kg-cancel-btn').disabled = false;
     } catch (e) { card.hidden = true; }
   }
 

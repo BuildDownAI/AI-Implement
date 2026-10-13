@@ -382,7 +382,7 @@ describe("kg current run card (AII-1260)", () => {
     partTable: [{ part: "<img src=x onerror=alert(1)>", prev: "100", new: "40" }],
   };
 
-  function mount(opts: { currentRun: Run | null; stage?: string; statusOk?: boolean; decideReply?: unknown; confirm?: boolean }) {
+  function mount(opts: { currentRun: Run | null; stage?: string; statusOk?: boolean; decideReply?: unknown; confirm?: boolean; deployPolls?: number }) {
     const dom = new JSDOM(`<!DOCTYPE html><body>${kgPipelinesHtml}</body>`, { runScripts: "dangerously", url: "http://localhost/admin#kg-pipelines" });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const win = dom.window as any;
@@ -396,6 +396,7 @@ describe("kg current run card (AII-1260)", () => {
     win.api = async (url: string, init?: { body?: string }) => {
       calls.push({ url, body: init?.body ? JSON.parse(init.body) : undefined });
       if (url === "/api/kg/status") {
+        if (opts.deployPolls && opts.deployPolls-- > 0) return { ok: false, status: 409, json: async () => ({ error: "deploy-in-progress" }) };
         if (opts.statusOk === false) return { ok: false, status: 500, json: async () => ({}) };
         const stage = opts.stage ?? (opts.currentRun ? "ingest-running" : "serving");
         return { ok: true, status: 200, json: async () => ({ stage, servedStamp: "abc", lastRefresh: null, currentRun: opts.currentRun }) };
@@ -448,6 +449,16 @@ describe("kg current run card (AII-1260)", () => {
     expect(cur.querySelector("a")?.getAttribute("href")).toBe("https://github.com/o/kg/pull/7");
     expect(m.visibleButtons()).toEqual(["Accept new baseline & refresh", "Cancel"]);
     expect(m.doc.getElementById("kg-refresh-badge")?.textContent).toContain("awaiting decision");
+  });
+
+  it("re-enables Accept and Cancel after a deploy-in-progress poll", async () => {
+    const m = mount({ currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held }, stage: "awaiting-decision", deployPolls: 1 });
+    await m.win.loadKgStatus();
+    expect((m.doc.getElementById("kg-accept-btn") as HTMLButtonElement).disabled).toBe(true);
+    expect((m.doc.getElementById("kg-cancel-btn") as HTMLButtonElement).disabled).toBe(true);
+    await m.win.loadKgStatus();
+    expect((m.doc.getElementById("kg-accept-btn") as HTMLButtonElement).disabled).toBe(false);
+    expect((m.doc.getElementById("kg-cancel-btn") as HTMLButtonElement).disabled).toBe(false);
   });
 
   it("status failure hides the card", async () => {
