@@ -444,6 +444,9 @@ export interface GithubReviewFixWorkerDeps {
   scopeStore?: ReviewFixWorkerScopeStore;
   /** Orchestrator callback base URL, carried in the run envelope (not a secret). */
   runnerCallbackUrl?: string;
+  /** Resolves the `runner_image` workflow input for the target repo, as the implementation
+   *  dispatch does. `undefined` leaves the workflow's own image resolution in place. */
+  runnerImage?: (target: { owner: string; repo: string; token: string }) => Promise<string | undefined>;
 }
 
 export class GithubReviewFixWorker implements ReviewFixWorkerPort {
@@ -452,6 +455,7 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
   private readonly scopeStore: ReviewFixWorkerScopeStore;
   private readonly callbackInputs?: GithubReviewFixWorkerDeps["callbackInputs"];
   private readonly runnerCallbackUrl?: string;
+  private readonly runnerImage?: GithubReviewFixWorkerDeps["runnerImage"];
 
   constructor(deps: GithubReviewFixWorkerDeps) {
     this.credentials = deps.credentials;
@@ -459,6 +463,7 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
     this.scopeStore = deps.scopeStore ?? inMemoryReviewFixWorkerScopeStore();
     this.callbackInputs = deps.callbackInputs;
     this.runnerCallbackUrl = deps.runnerCallbackUrl;
+    this.runnerImage = deps.runnerImage;
   }
 
   private async remember(attemptId: AttemptId, scope: ScopedPrIdentity, execution?: WorkerExecutionIdentity): Promise<void> {
@@ -492,6 +497,15 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
     if (credential.installationId !== plan.scope.installationId) return { status: "unknown" };
 
     let inputs = buildLaunchInputs(plan, mapping, this.runnerCallbackUrl);
+    if (this.runnerImage) {
+      try {
+        const runnerImage = await this.runnerImage({ owner: mapping.owner, repo: mapping.repo, token: credential.token });
+        if (runnerImage !== undefined) inputs = { ...inputs, runner_image: runnerImage };
+      } catch (err) {
+        console.warn(`[review-fix] Runner image resolution failed for ${mapping.owner}/${mapping.repo}; `
+          + `launching without runner_image: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
     try {
       if (this.callbackInputs) inputs = { ...inputs, ...await this.callbackInputs(plan.attemptId) };
     } catch {
