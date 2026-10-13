@@ -5300,7 +5300,7 @@ describe("per-page grants", () => {
     });
   });
 
-  describe("journal grant", () => {
+  describe("journal access (admin-only)", () => {
     const journalFetch = vi.fn();
     const journalDeps = {
       readJournal: (query: Record<string, string>) => journalModule.handleJournalRequest(query, { fetchImpl: journalFetch as never }),
@@ -5318,13 +5318,13 @@ describe("per-page grants", () => {
       expect(journalFetch).not.toHaveBeenCalled();
     });
 
-    it("refuses a user with no grant, and admits one with the grant despite the query string", async () => {
+    it("refuses a user with no grant, and a stored journal grant row grants nothing", async () => {
       const path = "/api/restate/journal?service=KgRefresh&key=abc";
       expect((await requestWithDeps(path, "GET", userSession(), journalDeps)).statusCode).toBe(403);
       accessGrants.savePageGrants(["journal"], "ada@eudoxus.ai");
-      journalFetch.mockResolvedValue(new Response(JSON.stringify({ rows: [] }), { status: 200 }));
-      expect((await requestWithDeps(path, "GET", userSession(), journalDeps)).statusCode).toBe(404);
-      expect(journalFetch).toHaveBeenCalledTimes(1);
+      expect((await requestWithDeps(path, "GET", userSession(), journalDeps)).statusCode).toBe(403);
+      expect(journalFetch).not.toHaveBeenCalled();
+      expect(Object.keys(accessGrants.PAGE_ROUTES)).not.toContain("journal");
     });
 
     it("admits an admin without a grant", async () => {
@@ -5353,6 +5353,18 @@ describe("per-page grants", () => {
       // Grantability comes from the route table, so Access itself can never appear here.
       expect(body.grantable).toContain("issues");
       expect(body.grantable).not.toContain("access");
+    });
+
+    it("lists no Journal page and still saves a grant while a stale journal row is stored", async () => {
+      const db = (await import("../dedup.js")).getDb();
+      db.prepare("INSERT INTO access_page_grants (page, granted_at, granted_by) VALUES ('journal', 'now', 'ada@eudoxus.ai')").run();
+      const token = adminSsoSession();
+      const got = JSON.parse((await request("/api/access-grants", "GET", "secret", undefined, token)).body);
+      expect(got.grantable).not.toContain("journal");
+      // The access page drops non-grantable keys from its draft, so this is what it posts.
+      const pages = got.granted.filter((k: string) => got.grantable.includes(k));
+      const res = await request("/api/access-grants", "POST", "secret", { pages: [...pages, "issues"] }, token);
+      expect(res.statusCode).toBe(200);
     });
 
     it("stores a grant an admin saves", async () => {

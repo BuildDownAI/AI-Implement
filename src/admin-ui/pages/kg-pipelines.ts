@@ -161,6 +161,18 @@ export const kgPipelinesScript = `
     } catch (e) { card.hidden = true; }
   }
 
+  // The kg-pipelines page is admin-only, as is the /ui/ proxy, so the link needs no role check.
+  function appendRestateLink(el, run) {
+    if (!run.triggerId) return;
+    const link = document.createElement('a');
+    link.href = '/ui/workflows/KgRefresh/' + encodeURIComponent(run.triggerId);
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.style.display = 'block';
+    link.textContent = 'Open in Restate UI';
+    el.appendChild(link);
+  }
+
   // The card shows the one current run: its step, and a button per open decision. Cells are
   // set with textContent, never innerHTML; the PR link goes through safeUrl().
   function renderKgCurrentRun(run, stage) {
@@ -178,10 +190,12 @@ export const kgPipelinesScript = `
     if (!held) {
       head.textContent = 'Run in flight' + (run.step ? ': ' + run.step : '');
       el.appendChild(head);
+      appendRestateLink(el, run);
       return;
     }
     head.textContent = 'Held for a decision until ' + new Date(held.decideBy).toLocaleString();
     el.appendChild(head);
+    appendRestateLink(el, run);
     if (held.snapshotPrUrl) {
       const link = document.createElement('a');
       link.href = window.safeUrl(held.snapshotPrUrl);

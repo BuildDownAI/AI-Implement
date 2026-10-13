@@ -117,7 +117,7 @@ describe("handleJournalRequest", () => {
 });
 
 describe("PAGE_ROUTES", () => {
-  it("grants the journal page its one route", () => {
-    expect(PAGE_ROUTES.journal).toEqual(["/api/restate/journal"]);
+  it("no longer grants the journal route to any page", () => {
+    expect(Object.values(PAGE_ROUTES).flat()).not.toContain("/api/restate/journal");
   });
 });
