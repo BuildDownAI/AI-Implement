@@ -25,6 +25,8 @@ interface Scenario {
   ticks: LateReviewTick[];
   reads: number;
   jobApproved: boolean;
+  /** The row is dispatched or running. */
+  jobInFlight?: boolean;
   hasJob: boolean;
   jobId: number;
   stamps: number[];
@@ -78,7 +80,7 @@ function makeDeps(): LateExternalReviewDependencies {
     },
     findJob(dispatchId) {
       const sc = scenarioOf(dispatchId);
-      return sc.hasJob ? { id: sc.jobId, approved: sc.jobApproved } : null;
+      return sc.hasJob ? { id: sc.jobId, approved: sc.jobApproved, inFlight: sc.jobInFlight } : null;
     },
     stampApproved(jobId) {
       // The fake mirrors stampJobApproved's effect: the row now carries the mark.
@@ -236,6 +238,20 @@ describe("LateExternalReview workflow", () => {
           expect(result).toEqual({ outcome: "findings" });
           expect(sc.stamps).toEqual([]);
           expect(sc.jobApproved).toBe(false);
+        });
+
+        it("ends superseded with no mark or comment when the newest row is still in flight", async () => {
+          const { result, sc } = await runScenario(url(), { ticks: [passed], jobInFlight: true }, false, true, undefined, "att-3");
+          expect(result).toEqual({ outcome: "superseded" });
+          expect(sc.stamps).toEqual([]);
+          expect(sc.comments).toEqual([]);
+          expect(sc.jobApproved).toBe(false);
+        });
+
+        it("control: an in-flight row without an attemptId keeps the existing behaviour (marked)", async () => {
+          const { result, sc } = await runScenario(url(), { ticks: [passed], jobInFlight: true }, false, true);
+          expect(result).toEqual({ outcome: "approved" });
+          expect(sc.stamps).toEqual([sc.jobId]);
         });
 
         it("a different attempt id starts a different workflow", () => {

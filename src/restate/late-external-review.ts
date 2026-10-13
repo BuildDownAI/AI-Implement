@@ -79,6 +79,9 @@ export interface LateReviewTick {
   blockingLastSeenAtMs: number[];
 }
 
+/** `inFlight`: the row is `dispatched` or `running`, so a run is still writing its outcome. */
+export interface LateReviewJob { id: number; approved: boolean; inFlight?: boolean }
+
 /** Plain functions, every one called inside `ctx.run`. */
 export interface LateExternalReviewDependencies {
   retentionMs?: number;
@@ -89,7 +92,7 @@ export interface LateExternalReviewDependencies {
   /** Gap-fill only (AII-1302): `true` when any earlier commit of the PR (newest 20, head excluded) had a review check run. Throws when unreadable. */
   readReviewerExpected?(input: LateExternalReviewInput & { headSha: string }): Promise<boolean>;
   /** The dispatch row's id and whether it already carries the mark, or `null` when the row is gone. */
-  findJob(dispatchId: string): { id: number; approved: boolean } | null | Promise<{ id: number; approved: boolean } | null>;
+  findJob(dispatchId: string): LateReviewJob | null | Promise<LateReviewJob | null>;
   stampApproved(jobId: number, prUrl: string): void | Promise<void>;
   /** `true` when a PR comment with `marker` exists already. */
   hasComment(input: LateExternalReviewInput, marker: string): Promise<boolean>;
@@ -163,6 +166,8 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
     const outcome = await ctx.run("approve", async (): Promise<LateExternalReviewOutcome> => {
       const job = await deps.findJob(input.dispatchId);
       if (!job) return "no-job";
+      // An attempt's submit picks the PR's newest row; a run that started since is not this review's to mark (AII-1307).
+      if (input.attemptId && job.inFlight && !job.approved) return "superseded";
       if (!job.approved) await deps.stampApproved(job.id, input.prUrl);
       if (!(await deps.hasComment(input, LATE_EXTERNAL_APPROVAL_MARKER))) {
         await deps.postComment(
@@ -290,7 +295,7 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
     },
     findJob(dispatchId) {
       const job = getJobByDispatchId(dispatchId);
-      return job ? { id: job.id, approved: job.approved } : null;
+      return job ? { id: job.id, approved: job.approved, inFlight: job.status === "dispatched" || job.status === "running" } : null;
     },
     stampApproved: (jobId, prUrl) => stampJobApproved(jobId, prUrl),
     async hasComment(input, marker) {

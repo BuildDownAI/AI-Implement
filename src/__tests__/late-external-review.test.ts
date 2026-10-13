@@ -91,9 +91,14 @@ describe("findJob", () => {
     expect(getJobByDispatchId).toHaveBeenCalledWith("nope");
   });
 
-  it.each([true, false])("returns only id and approved=%s for a known job", async (approved) => {
-    vi.mocked(getJobByDispatchId).mockReturnValue({ id: 7, approved, extra: "x" } as never);
-    expect(await deps.findJob("d-1")).toStrictEqual({ id: 7, approved });
+  it.each([true, false])("returns only id, approved=%s and inFlight for a known job", async (approved) => {
+    vi.mocked(getJobByDispatchId).mockReturnValue({ id: 7, approved, status: "completed", extra: "x" } as never);
+    expect(await deps.findJob("d-1")).toStrictEqual({ id: 7, approved, inFlight: false });
+  });
+
+  it.each(["dispatched", "running"])("reports a %s row as inFlight", async (status) => {
+    vi.mocked(getJobByDispatchId).mockReturnValue({ id: 7, approved: false, status } as never);
+    expect(await deps.findJob("d-1")).toStrictEqual({ id: 7, approved: false, inFlight: true });
   });
 });
 

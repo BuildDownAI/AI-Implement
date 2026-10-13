@@ -118,30 +118,18 @@ export async function submitLateReviewForAttempt(
   }
 }
 
-export function createProductionReviewFixServices(
-  config: ReviewFixProductionConfig,
-  registry: ProviderRegistry,
-  store = new SqliteReviewFixAttemptStore(),
-  submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<boolean | void>,
-): RestateService[] {
-  const credentials = createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey);
-  const github = createReviewFixGithubAdapter({ credentials });
-  const worker = new GithubReviewFixWorker({ credentials, scopeStore: reviewFixAttemptStoreScopeStore(store),
-    runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
-    runnerImage: (target) => resolveRunnerImageForDispatch({ ...target,
-      defaultImage: config.sessionImage, runnerImageExplicit: config.runnerImageExplicit }),
-    callbackInputs: async (attemptId) => {
-      if (!config.runnerTokenSecret || !config.runnerCallbackBaseUrl) throw new Error("pilot callbacks unavailable");
-      return {
-        run_token: mintPreparedReviewFixToken({ attemptId, audience: "result", secret: config.runnerTokenSecret }).token,
-        run_progress_token: mintPreparedReviewFixToken({ attemptId, audience: "progress", secret: config.runnerTokenSecret }).token,
-        run_publication_token: mintPreparedReviewFixToken({ attemptId, audience: "publication", secret: config.runnerTokenSecret }).token,
-        runner_callback_url: config.runnerCallbackBaseUrl,
-      };
-    },
-  });
-  const baseFinalizer = createReviewFixFinalizer({ attemptStore: store, github });
-  const finalizer: typeof baseFinalizer = {
+type ReviewFixFinalizer = ReturnType<typeof createReviewFixFinalizer>;
+
+/** The finalizer the attempt workflow runs: re-checks authority, head and policy, applies the approval,
+ * then (AII-1307) asks `LateExternalReview` to write the mark once the effect applied. */
+export function createProductionFinalizer(deps: {
+  store: Pick<SqliteReviewFixAttemptStore, "getAcceptedResult" | "getRecordedOutcome" | "hasCurrentAuthority">;
+  github: Pick<ReturnType<typeof createReviewFixGithubAdapter>, "getPrHeadSha" | "evaluateMergePolicy">;
+  baseFinalizer: ReviewFixFinalizer;
+  submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<boolean | void>;
+}): ReviewFixFinalizer {
+  const { store, github, baseFinalizer, submitLateExternalReview } = deps;
+  return {
     recordOutcome: baseFinalizer.recordOutcome,
     applyApproval: async (input) => {
       // The result handler may record a conflict after the workflow's earlier
@@ -165,6 +153,32 @@ export function createProductionReviewFixServices(
       return applied;
     },
   };
+}
+
+export function createProductionReviewFixServices(
+  config: ReviewFixProductionConfig,
+  registry: ProviderRegistry,
+  store = new SqliteReviewFixAttemptStore(),
+  submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<boolean | void>,
+): RestateService[] {
+  const credentials = createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey);
+  const github = createReviewFixGithubAdapter({ credentials });
+  const worker = new GithubReviewFixWorker({ credentials, scopeStore: reviewFixAttemptStoreScopeStore(store),
+    runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
+    runnerImage: (target) => resolveRunnerImageForDispatch({ ...target,
+      defaultImage: config.sessionImage, runnerImageExplicit: config.runnerImageExplicit }),
+    callbackInputs: async (attemptId) => {
+      if (!config.runnerTokenSecret || !config.runnerCallbackBaseUrl) throw new Error("pilot callbacks unavailable");
+      return {
+        run_token: mintPreparedReviewFixToken({ attemptId, audience: "result", secret: config.runnerTokenSecret }).token,
+        run_progress_token: mintPreparedReviewFixToken({ attemptId, audience: "progress", secret: config.runnerTokenSecret }).token,
+        run_publication_token: mintPreparedReviewFixToken({ attemptId, audience: "publication", secret: config.runnerTokenSecret }).token,
+        runner_callback_url: config.runnerCallbackBaseUrl,
+      };
+    },
+  });
+  const baseFinalizer = createReviewFixFinalizer({ attemptStore: store, github });
+  const finalizer = createProductionFinalizer({ store, github, baseFinalizer, submitLateExternalReview });
   const pr = createReviewFixPR({
     recordFeedback: async (event) => acceptReviewFixWebhookEvent(event),
     attempts: {
