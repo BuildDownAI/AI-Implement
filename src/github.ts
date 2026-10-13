@@ -593,19 +593,26 @@ export interface PrComment {
  * completion via the response's `Link: rel="next"` header — a PR with more than
  * 100 comments before the sticky one must still be found, or `postOrUpdateStickyComment`
  * duplicates it instead of updating it in place. Used to find a previously-posted
- * sticky comment to update in place.
+ * sticky comment to update in place. By default a non-OK page ends the walk and returns
+ * what was read so far; pass `{ strict: true }` when the caller must not mistake an
+ * unreadable page for an empty list (the call then throws so the step can retry).
  */
 export async function listPrComments(
   token: string,
   owner: string,
   repo: string,
   prNumber: number,
+  options: { strict?: boolean } = {},
 ): Promise<PrComment[]> {
   const comments: PrComment[] = [];
   let url: string | null = `https://api.github.com/repos/${owner}/${repo}/issues/${prNumber}/comments?per_page=100`;
   while (url) {
     const res: Response = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
-    if (!res.ok) break;
+    // Strict readers must not mistake an unreadable list for an empty one: throw so the caller retries.
+    if (!res.ok) {
+      if (options.strict) throw new Error(`listPrComments: ${owner}/${repo}#${prNumber} comments unreadable (HTTP ${res.status})`);
+      break;
+    }
     const data = (await res.json()) as Array<{ id: number; body?: string; user?: { login?: string; type?: string } | null; html_url?: string; created_at?: string; updated_at?: string }>;
     comments.push(...data.map((c) => ({
       id: c.id,
