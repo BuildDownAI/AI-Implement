@@ -370,6 +370,82 @@ describe("drainCommentGapfillQueue", () => {
     expect(pending).toHaveLength(0);
   });
 
+  describe("in-flight run of the PR's own branch (AII-1292)", () => {
+    function enqueue42(): void {
+      queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 42, commentId: 7001, commenter: "kim", instruction: "" });
+    }
+    function seedRunning(identifier: string, repo = "acme/billing"): number {
+      return log.appendLog({ issueId: `id-${identifier}`, issueIdentifier: identifier, teamKey: "TEAM", repo, phase: "implementation", status: "running" });
+    }
+
+    it("leaves the item pending, with no reply and no dispatch, then dispatches once pr_url is set", async () => {
+      const mapping = makeMapping();
+      enqueue42();
+      const jobId = seedRunning("AII-120");
+      stubPrLookup("ai-implement/aii-120");
+      const dispatchSpy = vi.fn<DrainInput["dispatch"]>(async () => ({ success: true, status: 204 }));
+      const postCommentSpy = vi.fn<DrainInput["postComment"]>(async () => undefined);
+      const fetchSpy = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+
+      await drain.drainCommentGapfillQueue(makeBaseDrainOpts({ getMappings: () => ({ TEAM: mapping }), dispatch: dispatchSpy, postComment: postCommentSpy }));
+
+      expect(dispatchSpy).not.toHaveBeenCalled();
+      expect(postCommentSpy).not.toHaveBeenCalled();
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+      // Run completes and records its PR.
+      log.updateJobPrUrl(jobId, "https://github.com/acme/billing/pull/42");
+      log.updateJobStatus(jobId, "completed");
+      await drain.drainCommentGapfillQueue(makeBaseDrainOpts({ getMappings: () => ({ TEAM: mapping }), dispatch: dispatchSpy, postComment: postCommentSpy }));
+      expect(dispatchSpy).toHaveBeenCalledTimes(1);
+      expect(postCommentSpy).not.toHaveBeenCalled();
+    });
+
+    it("does not match a longer identifier sharing a prefix, nor another repo's run, nor a finished run", async () => {
+      const mapping = makeMapping();
+      enqueue42();
+      seedRunning("AII-12");
+      seedRunning("AII-123", "acme/other");
+      log.appendLog({ issueId: "done", issueIdentifier: "AII-123", teamKey: "TEAM", repo: "acme/billing", phase: "implementation", status: "completed" });
+      stubPrLookup("ai-implement/aii-123");
+      const postCommentSpy = vi.fn<DrainInput["postComment"]>(async () => undefined);
+
+      await drain.drainCommentGapfillQueue(makeBaseDrainOpts({ getMappings: () => ({ TEAM: mapping }), postComment: postCommentSpy }));
+
+      expect(postCommentSpy).toHaveBeenCalledTimes(1);
+      expect(postCommentSpy.mock.calls[0]![4]).toContain("no record");
+      expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+    });
+
+    it("reads the PR once on the roll-up path", async () => {
+      const mapping = makeMapping();
+      enqueue42();
+      seedDispatchLog("issue-parent", "AII-130", "Parent", "acme", "billing", 5);
+      stubPrLookup("ai-implement/feature/aii-130");
+      const fetchSpy = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+      await drain.drainCommentGapfillQueue(makeBaseDrainOpts({ getMappings: () => ({ TEAM: mapping }) }));
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["null", "throw"])("a PR read failure (%s) gets the GitHub-read reply, not 'no record'", async (mode) => {
+      const mapping = makeMapping();
+      enqueue42();
+      vi.stubGlobal("fetch", vi.fn(async () => {
+        if (mode === "throw") throw new Error("net");
+        return { ok: false, status: 502 } as Response;
+      }));
+      const postCommentSpy = vi.fn<DrainInput["postComment"]>(async () => undefined);
+
+      await drain.drainCommentGapfillQueue(makeBaseDrainOpts({ getMappings: () => ({ TEAM: mapping }), postComment: postCommentSpy }));
+
+      expect(postCommentSpy).toHaveBeenCalledTimes(1);
+      const body = postCommentSpy.mock.calls[0]![4];
+      expect(body).toContain("could not read this PR");
+      expect(body).toContain("repost");
+      expect(body).not.toContain("no record");
+    });
+  });
+
   it("case (c): marks row failed and calls onDispatchFailure when dispatch fails", async () => {
     const mapping = makeMapping({ owner: "acme", repo: "billing" });
 

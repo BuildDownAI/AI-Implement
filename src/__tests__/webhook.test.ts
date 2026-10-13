@@ -2299,6 +2299,87 @@ describe("/ai-implement comment trigger", () => {
     expect(commentGapfillQueue.claimPendingCommentGapfills(10)).toHaveLength(0);
   });
 
+  describe("transient GitHub failures (AII-1292)", () => {
+    const reasonComments = () => mockFetch.mock.calls.filter(([url, init]) =>
+      String(url).includes("/issues/1/comments") && (init as RequestInit | undefined)?.method === "POST");
+    const reactions = () => mockFetch.mock.calls.filter(([url]) => String(url).includes("/reactions"));
+    const permOk = () => new Response(JSON.stringify({ permission: "write" }), { status: 200 });
+
+    async function post(): Promise<{ statusCode: number; body: Record<string, unknown> }> {
+      const { req, res } = makeRequest(SECRET, "issue_comment", makeAiImplComment("/ai-implement fix it"));
+      webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app-id", "private-key");
+      await res.done;
+      return { statusCode: res.statusCode, body: JSON.parse(res.body) };
+    }
+
+    it("probe failing twice posts one reason comment, no 👀, nothing queued, contract_probe_failed", async () => {
+      hoisted.getMappings.mockReturnValue(makeMappedEnvelopeRepo());
+      hoisted.resolveWorkflowContract.mockClear();
+      hoisted.resolveWorkflowContract.mockRejectedValue(new Error("probe"));
+      mockFetch.mockImplementation(() => Promise.resolve(new Response("{}", { status: 201 })));
+
+      const out = await post();
+
+      expect(out.body).toMatchObject({ ignored: true, reason: "contract_probe_failed" });
+      expect(hoisted.resolveWorkflowContract).toHaveBeenCalledTimes(2);
+      expect((hoisted.resolveWorkflowContract.mock.calls[0] as unknown[])[0]).toMatchObject({ failOnTransient: true });
+      expect(reasonComments()).toHaveLength(1);
+      expect(reactions()).toHaveLength(0);
+      expect(commentGapfillQueue.claimPendingCommentGapfills(10)).toHaveLength(0);
+    });
+
+    it("probe failing once then succeeding queues the comment with 👀", async () => {
+      hoisted.getMappings.mockReturnValue(makeMappedEnvelopeRepo());
+      hoisted.resolveWorkflowContract.mockRejectedValueOnce(new Error("probe")).mockResolvedValue("envelope");
+
+      const out = await post();
+
+      expect(out.body).toMatchObject({ queued: true });
+      expect(reasonComments()).toHaveLength(0);
+      expect(reactions()).toHaveLength(1);
+    });
+
+    it("permission API errors twice give permission_check_failed with one comment", async () => {
+      hoisted.getMappings.mockReturnValue(makeMappedEnvelopeRepo());
+      mockFetch.mockImplementation((url: string | URL | Request) =>
+        Promise.resolve(String(url).includes("/collaborators/") ? new Response("", { status: 503 }) : new Response("{}", { status: 201 })));
+
+      const out = await post();
+
+      expect(out.body).toMatchObject({ ignored: true, reason: "permission_check_failed" });
+      expect(reasonComments()).toHaveLength(1);
+      expect(reactions()).toHaveLength(0);
+      expect(commentGapfillQueue.claimPendingCommentGapfills(10)).toHaveLength(0);
+    });
+
+    it("a permission error then a 200 queues the comment", async () => {
+      hoisted.getMappings.mockReturnValue(makeMappedEnvelopeRepo());
+      let permCalls = 0;
+      mockFetch.mockImplementation((url: string | URL | Request) => {
+        if (String(url).includes("/collaborators/")) {
+          return Promise.resolve(++permCalls === 1 ? new Response("", { status: 500 }) : permOk());
+        }
+        return Promise.resolve(new Response("{}", { status: 201 }));
+      });
+
+      const out = await post();
+
+      expect(out.body).toMatchObject({ queued: true });
+      expect(reasonComments()).toHaveLength(0);
+    });
+
+    it("a 404 from the permission API is a non-writer, not an error", async () => {
+      hoisted.getMappings.mockReturnValue(makeMappedEnvelopeRepo());
+      mockFetch.mockImplementation((url: string | URL | Request) =>
+        Promise.resolve(String(url).includes("/collaborators/") ? new Response("", { status: 404 }) : new Response("{}", { status: 201 })));
+
+      const out = await post();
+
+      expect(out.body).toMatchObject({ ignored: true, reason: "insufficient_permission" });
+      expect(reasonComments()).toHaveLength(0);
+    });
+  });
+
   it("(f-i) non-PR issue comment is ignored", async () => {
     hoisted.getMappings.mockReturnValue(makeMappedEnvelopeRepo());
 

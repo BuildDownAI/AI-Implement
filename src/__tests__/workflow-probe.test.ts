@@ -415,3 +415,41 @@ describe("resolveWorkflowCapabilities — supportsAttemptCorrelation", () => {
     expect(dev.supportsAttemptCorrelation).toBe(true);
   });
 });
+
+describe("transient probe failures (AII-1292)", () => {
+  beforeEach(() => {
+    __clearWorkflowProbeCacheForTests();
+  });
+  const base = { owner: "o", repo: "r", workflowFile: "claude-implement.yml", token: "t", ref: "main" };
+  const transient: Array<[string, () => ReturnType<typeof vi.fn>]> = [
+    ["fetch throw", () => vi.fn().mockRejectedValue(new Error("net"))],
+    ["HTTP 500", () => mockFetch(500, {})],
+    ["bad JSON", () => vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => { throw new Error("bad"); } })],
+    ["non-file body", () => mockFetch(200, { type: "dir" })],
+  ];
+
+  it.each(transient)("%s is not cached and never throws by default", async (_n, make) => {
+    const fetchImpl = make();
+    const first = await resolveWorkflowCapabilities({ ...base, fetchImpl });
+    await resolveWorkflowCapabilities({ ...base, fetchImpl });
+    expect(first.contract).toBe("legacy");
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(transient)("%s throws with failOnTransient", async (_n, make) => {
+    await expect(resolveWorkflowCapabilities({ ...base, fetchImpl: make(), failOnTransient: true })).rejects.toThrow();
+  });
+
+  it("a 404 and a real legacy workflow stay cached and do not throw with failOnTransient", async () => {
+    const notFound = mockFetch(404, {});
+    expect(await resolveWorkflowContract({ ...base, fetchImpl: notFound, failOnTransient: true })).toBe("legacy");
+    await resolveWorkflowContract({ ...base, fetchImpl: notFound, failOnTransient: true });
+    expect(notFound).toHaveBeenCalledOnce();
+
+    __clearWorkflowProbeCacheForTests();
+    const legacy = mockContents(LEGACY_YML);
+    expect(await resolveWorkflowContract({ ...base, fetchImpl: legacy, failOnTransient: true })).toBe("legacy");
+    await resolveWorkflowContract({ ...base, fetchImpl: legacy });
+    expect(legacy).toHaveBeenCalledOnce();
+  });
+});

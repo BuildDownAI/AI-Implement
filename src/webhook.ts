@@ -10,9 +10,9 @@ import type { ReviewFixIngressClient } from "./restate/review-fix-client.js";
 import { REVIEW_FIX_EVENT_BODY_MAX_BYTES, type ReviewFixFeedbackEvent } from "./restate/review-fix-pr.js";
 import { classifyClaudeInlineMarker, isTrustedReviewAuthor, resolveReviewProcess } from "./review-process.js";
 import { getInstallationToken } from "./github-app-auth.js";
-import { resolveWorkflowContract } from "./workflow-probe.js";
+import { resolveWorkflowContract, type WorkflowContract } from "./workflow-probe.js";
 import { enqueueCommentGapfill } from "./comment-gapfill-queue.js";
-import { addCommentReaction, listPullRequestFiles } from "./github.js";
+import { addCommentReaction, listPullRequestFiles, postPrComment } from "./github.js";
 import { refreshAvailability, type SelfDeployTarget } from "./deploy-availability.js";
 import type { KgDryRunReportTarget } from "./kg-refresh.js";
 import { KG_SNAPSHOT_BRANCH_PREFIX } from "./pipeline/steps/kg-snapshot-push.js";
@@ -809,13 +809,17 @@ async function handlePushWebhook(
 
 const AI_IMPLEMENT_COMMENT_RE = /^\/ai-implement(?:\s+([\s\S]*))?$/;
 
+type WritePermission = "write" | "no_write" | "error";
+
+/** `error` is a failed lookup (fetch throw, 5xx/429, bad JSON), distinct from a real
+ *  non-writer. A 404 means the user is not a collaborator, so it is `no_write`. */
 async function checkCollaboratorWritePermission(
   token: string,
   owner: string,
   repo: string,
   username: string,
-): Promise<boolean> {
-  if (!username) return false;
+): Promise<WritePermission> {
+  if (!username) return "no_write";
   let res: Response;
   try {
     res = await fetch(
@@ -830,17 +834,46 @@ async function checkCollaboratorWritePermission(
       },
     );
   } catch {
-    return false;
+    return "error";
   }
-  if (res.status !== 200) return false;
+  if (res.status >= 500 || res.status === 429) return "error";
+  if (res.status !== 200) return "no_write";
   let data: unknown;
   try {
     data = await res.json();
   } catch {
-    return false;
+    return "error";
   }
   const perm = (data as { permission?: string }).permission;
-  return perm === "write" || perm === "maintain" || perm === "admin";
+  return perm === "write" || perm === "maintain" || perm === "admin" ? "write" : "no_write";
+}
+
+/** Retries `fn` once when it reports failure (throw or `isError`). Returns null if both attempts fail. */
+async function withOneRetry<T>(fn: () => Promise<T>, isError: (v: T) => boolean): Promise<T | null> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const v = await fn();
+      if (!isError(v)) return v;
+    } catch {
+      // fall through to the retry
+    }
+  }
+  return null;
+}
+
+async function replyWebhookFailure(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number | undefined,
+  body: string,
+): Promise<void> {
+  if (!prNumber) return;
+  try {
+    await postPrComment(token, owner, repo, prNumber, body);
+  } catch (err) {
+    console.error(`[webhook] /ai-implement: failed to post failure reply on ${owner}/${repo}#${prNumber}:`, err);
+  }
 }
 
 async function handleIssueCommentWebhook(
@@ -901,13 +934,27 @@ async function handleIssueCommentWebhook(
       return;
     }
 
-    const contract = await resolveWorkflowContract({
-      owner,
-      repo,
-      workflowFile: mapping.workflowFile,
-      token,
-      ref: mapping.defaultBranch,
-    }).catch(() => "legacy" as const);
+    const contract: WorkflowContract | null = await withOneRetry(
+      () => resolveWorkflowContract({
+        owner,
+        repo,
+        workflowFile: mapping.workflowFile,
+        token,
+        ref: mapping.defaultBranch,
+        failOnTransient: true,
+      }),
+      () => false,
+    );
+    if (contract === null) {
+      console.error(`[webhook] /ai-implement: workflow contract probe failed twice for ${owner}/${repo}`);
+      await replyWebhookFailure(
+        token, owner, repo, payload.issue?.number,
+        "AI-Implement could not read this repository's workflow from GitHub just now, so it did not queue your `/ai-implement` comment. Please repost it.",
+      );
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ignored: true, reason: "contract_probe_failed" }));
+      return;
+    }
 
     if (contract !== "envelope") {
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -916,8 +963,21 @@ async function handleIssueCommentWebhook(
     }
 
     const commenter = payload.comment?.user?.login ?? "";
-    const hasWriteAccess = await checkCollaboratorWritePermission(token, owner, repo, commenter);
-    if (!hasWriteAccess) {
+    const permission = await withOneRetry(
+      async () => checkCollaboratorWritePermission(token, owner, repo, commenter),
+      (v) => v === "error",
+    );
+    if (permission === null) {
+      console.error(`[webhook] /ai-implement: permission check failed twice for ${commenter} on ${owner}/${repo}`);
+      await replyWebhookFailure(
+        token, owner, repo, payload.issue?.number,
+        "AI-Implement could not check your permission on this repository with GitHub just now, so it did not queue your `/ai-implement` comment. Please repost it.",
+      );
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ignored: true, reason: "permission_check_failed" }));
+      return;
+    }
+    if (permission !== "write") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ignored: true, reason: "insufficient_permission" }));
       return;
