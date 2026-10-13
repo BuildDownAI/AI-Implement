@@ -190,14 +190,33 @@ describe("readTick reads Claude's verdict for a gap-fill (AII-1303)", () => {
     vi.mocked(listPrComments).mockResolvedValue([review("changes_requested", COMMIT_MS + 1000, { user: { login: "mallory", type: "User" } })] as never);
     expect(blocked(await tickOf())).toBe(false);
   });
-  it("does not read comments in follow mode or for a non-gap-fill tick", async () => {
+  it("does not read comments in follow mode", async () => {
     await tickOf({ followHead: true });
-    await tickOf({ gapFill: undefined });
     expect(listPrComments).not.toHaveBeenCalled();
+  });
+  it("reads the comments strictly, so an unreadable list throws instead of reading no review (AII-1309)", async () => {
+    await tickOf();
+    expect(vi.mocked(listPrComments).mock.calls[0][4]).toEqual({ strict: true });
   });
   it("throws when the comment read fails, rather than reading no verdict", async () => {
     vi.mocked(listPrComments).mockRejectedValue(new Error("boom"));
     await expect(tickOf()).rejects.toThrow("boom");
+    await expect(tickOf({ gapFill: undefined })).rejects.toThrow("boom");
+  });
+  describe("initial-run late review (AII-1309)", () => {
+    const initial = { gapFill: undefined };
+    it("blocks when the newest Claude review is changes_requested with only minor findings", async () => {
+      vi.mocked(listPrComments).mockResolvedValue([review("changes_requested", COMMIT_MS + 1000)] as never);
+      expect(blocked(await tickOf(initial))).toBe(true);
+    });
+    it("does not block an approve verdict with only minor findings", async () => {
+      vi.mocked(listPrComments).mockResolvedValue([review("approve", COMMIT_MS + 1000)] as never);
+      expect(blocked(await tickOf(initial))).toBe(false);
+    });
+    it("ignores a changes_requested review of an older head", async () => {
+      vi.mocked(listPrComments).mockResolvedValue([review("changes_requested", COMMIT_MS - 1000)] as never);
+      expect(blocked(await tickOf(initial))).toBe(false);
+    });
   });
   it("counts a review check named by the project's reviewCheckNames, for success and for the grace", async () => {
     vi.mocked(getDefaultBranchFileText).mockResolvedValue("reviewCheckNames:\n  - acme-review\n");

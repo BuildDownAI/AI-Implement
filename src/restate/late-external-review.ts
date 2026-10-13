@@ -222,7 +222,7 @@ function reviewLedgerOptionsFor(owner: string, repo: string): ReviewLedgerOption
  */
 async function newestReviewRejectsHead(token: string, input: { owner: string; repo: string; prNumber: number }, headCommittedAtMs: number): Promise<boolean> {
   const options = reviewLedgerOptionsFor(input.owner, input.repo);
-  const comments = (await listPrComments(token, input.owner, input.repo, input.prNumber))
+  const comments = (await listPrComments(token, input.owner, input.repo, input.prNumber, { strict: true }))
     .map((c, index) => ({ c, index, at: Date.parse(c.updatedAt ?? c.createdAt ?? "") }))
     .map((e) => ({ ...e, at: Number.isFinite(e.at) ? e.at : 0 }))
     .sort((a, b) => b.at - a.at || b.index - a.index);
@@ -288,9 +288,10 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
       // The ledger is keyed by "owner/repo" (see the review-fix queue in src/index.ts).
       const blockingLastSeenAtMs: number[] = listOpenReviewFindings(`${input.owner}/${input.repo}`, input.prNumber)
         .filter((f) => f.severity === "blocking").map((f) => f.lastSeenAt);
-      // A gap-fill head is never judged in-run, and the ledger has no verdict: read Claude's own (AII-1303).
-      // The tick reports it as a blocking finding seen now, which the workflow ends `findings` on.
-      if (lateGapFill && await newestReviewRejectsHead(t, input, headCommittedAtMs)) blockingLastSeenAtMs.push(Date.now());
+      // A late head (initial run or gap-fill) is never judged in-run, and the ledger has no verdict: read Claude's
+      // own (AII-1303). The tick reports it as a blocking finding seen now, which the workflow ends `findings` on.
+      // The read throws when the comment list is unreadable, so the step retries rather than reading "no review".
+      if (!input.followHead && await newestReviewRejectsHead(t, input, headCommittedAtMs)) blockingLastSeenAtMs.push(Date.now());
       return { open, headSha: pr.headSha, checks, headCommittedAtMs, blockingLastSeenAtMs };
     },
     findJob(dispatchId) {

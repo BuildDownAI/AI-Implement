@@ -156,6 +156,13 @@ describe("LateExternalReview workflow", () => {
         expect(sc.comments).toHaveLength(1);
       });
 
+      it("initial-run late review ends findings with no mark on Claude's newest changes_requested verdict (AII-1309)", async () => {
+        // readTick folds a non-approve newest verdict into blockingLastSeenAtMs for every late review but follow mode.
+        const { result, sc } = await runScenario(url(), { ticks: [pending, { ...passed, blockingLastSeenAtMs: [COMMIT_MS + 60_000] }] });
+        expect(result).toEqual({ outcome: "findings" });
+        expect(sc.stamps).toEqual([]);
+      });
+
       it("ends findings on a blocking finding last seen after the head's commit time", async () => {
         const { result, sc } = await runScenario(url(), { ticks: [{ ...passed, blockingLastSeenAtMs: [COMMIT_MS + 1] }] });
         expect(result).toEqual({ outcome: "findings" });

@@ -600,12 +600,17 @@ export async function listPrComments(
   owner: string,
   repo: string,
   prNumber: number,
+  options: { strict?: boolean } = {},
 ): Promise<PrComment[]> {
   const comments: PrComment[] = [];
   let url: string | null = `https://api.github.com/repos/${owner}/${repo}/issues/${prNumber}/comments?per_page=100`;
   while (url) {
     const res: Response = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
-    if (!res.ok) break;
+    // Strict readers must not mistake an unreadable list for an empty one: throw so the caller retries.
+    if (!res.ok) {
+      if (options.strict) throw new Error(`listPrComments: ${owner}/${repo}#${prNumber} comments unreadable (HTTP ${res.status})`);
+      break;
+    }
     const data = (await res.json()) as Array<{ id: number; body?: string; user?: { login?: string; type?: string } | null; html_url?: string; created_at?: string; updated_at?: string }>;
     comments.push(...data.map((c) => ({
       id: c.id,

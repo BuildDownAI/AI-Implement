@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime, getDefaultBranchFileText } from "../github.js";
+import { dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime, getDefaultBranchFileText, listPrComments } from "../github.js";
 import { decodeRunConfig, encodeRunConfig } from "../run-config.js";
 import type { RepoMapping } from "../config.js";
 
@@ -1184,5 +1184,28 @@ describe("getDefaultBranchFileText", () => {
   it("returns null when the path is not a file", async () => {
     stub({ ok: true, status: 200, json: async () => ({ type: "dir" }) });
     expect(await getDefaultBranchFileText("t", "o", "r", "x")).toBeNull();
+  });
+});
+
+describe("listPrComments strict option (AII-1309)", () => {
+  const page = (status: number, body: unknown, link?: string) =>
+    new Response(JSON.stringify(body), { status, ...(link ? { headers: { link } } : {}) });
+
+  it("stops quietly on a non-ok response by default", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => page(502, {})));
+    expect(await listPrComments("t", "o", "r", 5)).toEqual([]);
+  });
+
+  it.each([502, 403])("throws on a %s when strict", async (status) => {
+    vi.stubGlobal("fetch", vi.fn(async () => page(status, {})));
+    await expect(listPrComments("t", "o", "r", 5, { strict: true })).rejects.toThrow(new RegExp(String(status)));
+  });
+
+  it("throws when strict and a later page fails", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(page(200, [{ id: 1, body: "a" }], '<https://api.github.com/next>; rel="next"'))
+      .mockResolvedValueOnce(page(502, {}));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(listPrComments("t", "o", "r", 5, { strict: true })).rejects.toThrow(/502/);
   });
 });

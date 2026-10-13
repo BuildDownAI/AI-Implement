@@ -14,6 +14,7 @@ vi.mock("../log.js", () => ({
   getJobByDispatchId: vi.fn(),
   stampJobApproved: vi.fn(),
 }));
+vi.mock("../config.js", () => ({ getMappings: vi.fn(() => ({})) }));
 vi.mock("../review-ledger-store.js", () => ({
   listOpenReviewFindings: vi.fn(),
 }));
@@ -68,6 +69,7 @@ describe("readTick", () => {
       finding("blocking", 10), finding("medium", 20), finding("blocking", 30), finding("minor", 40),
     ]);
     vi.mocked(getCommitTime).mockResolvedValue(25);
+    vi.mocked(listPrComments).mockResolvedValue([]);
     const tick = await deps.readTick(input);
     expect(tick).toEqual({ open: true, headSha: "sha-a", checks: "success", headCommittedAtMs: 25, blockingLastSeenAtMs: [10, 30] });
     expect(getCommitTime).toHaveBeenCalledWith("tok", "owner", "repo", "sha-a");
