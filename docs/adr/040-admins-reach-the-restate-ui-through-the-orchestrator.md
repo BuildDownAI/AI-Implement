@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-10-12
-**References:** ADR 023, ADR 034, [AII-1248](https://linear.app/eudoxus/issue/AII-1248), [AII-1255](https://linear.app/eudoxus/issue/AII-1255), [AII-1261](https://linear.app/eudoxus/issue/AII-1261), [AII-1128](https://linear.app/eudoxus/issue/AII-1128)
+**References:** ADR 023, ADR 034, [AII-1248](https://linear.app/eudoxus/issue/AII-1248), [AII-1255](https://linear.app/eudoxus/issue/AII-1255), [AII-1261](https://linear.app/eudoxus/issue/AII-1261), [AII-1128](https://linear.app/eudoxus/issue/AII-1128), [AII-1286](https://linear.app/eudoxus/issue/AII-1286), [AII-1287](https://linear.app/eudoxus/issue/AII-1287)
 
 ## Context
 
@@ -23,11 +23,11 @@ The spike (AII-1255, server 1.7.10) found:
 
 **2. Admin role only.** Every handled path runs `authenticateAdminRequest` and requires role `admin`. Page grants never apply, because the door includes powers that no page grant describes.
 
+**2a. `POST /query` is refused for now (AII-1286).** `/query` runs any SQL over the introspection tables, including `state` and `sys_journal`. `Operator` keeps each MCP client's raw refresh token in state (`currentToken`) and `refresh` returns it, so the journal holds it too; an admin session, or a script on the orchestrator origin, could read every user's token. The proxy matches `POST /query` and answers 403 with a JSON error, and reaches no upstream. Until the tokens are out of Restate the Restate UI cannot show invocation lists, journals, or state, because the live view polls `/query`. AII-1287 (tokens out of Restate) reopens this decision.
+
 **3. Session credentials never reach Restate.** `cookie`, `authorization`, hop-by-hop headers, and `x-forwarded-*` are stripped from the forwarded request, and `set-cookie` and `access-control-*` from the response. The ingress journals request headers and bodies, and a session token must never reach a journal.
 
 **4. The advertised ingress address is derived, not configured.** With `OAUTH_REDIRECT_BASE_URL` set, the sidecar advertises `<base>/admin/restate/ingress/`. Unset, it keeps the loopback default.
-
-**2a. `POST /query` is refused for now (AII-1286).** `/query` runs any SQL over the introspection tables, including `state` and `sys_journal`. `Operator` keeps each MCP client's raw refresh token in state (`currentToken`) and `refresh` returns it, so the journal holds it too; an admin session, or a script on the orchestrator origin, could read every user's token. The proxy matches `POST /query` and answers 403 with a JSON error, and reaches no upstream. Until the tokens are out of Restate the Restate UI cannot show invocation lists, journals, or state, because the live view polls `/query`. AII-1287 (tokens out of Restate) reopens this decision.
 
 **5. Reserved paths.** `/ui`, `/health`, `/version`, `/services`, `/deployments`, `/query`, and `/invocations` belong to this door. A future orchestrator route there would collide.
 
