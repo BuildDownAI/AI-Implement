@@ -4439,7 +4439,6 @@ function startServer(
         kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
-        reportDryRun: (report) => kgRefresh.reportDryRun(report),
         enqueueDryRun: (key, entry, opts) =>
           config.kgSourceRepo
             ? kgRefreshIngressClient.enqueueDryRun(parseKgSourceRepo(config.kgSourceRepo).fullName, { key, ...entry }, opts)

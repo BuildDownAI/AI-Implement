@@ -342,8 +342,8 @@ the PR.
 A refused tracker-file shrink fails the commit status and the comment says so. There is no PR label that accepts it: a shrink is accepted at the decision gate of the refresh that runs after the PR merges, so the dry-run never decides on the baseline.
 
 Outcomes are stored per PR on the `KgRepo` object, one `outcome:<repo>#<prNumber>` state key each,
-pinned to the head sha they ran against (AII-636, AII-977), so `reportDryRun` can only ever
-surface that PR's own verdict — never another PR's — and `dryRunOutcome` returns nothing once a new
+pinned to the head sha they ran against (AII-636, AII-977), so the check run and its sticky comment
+on the PR's own head SHA only ever carry that PR's own verdict — never another PR's — and `dryRunOutcome` returns nothing once a new
 push supersedes the stored sha. The `dry-run-report` step sends `recordDryRunOutcome`; the webhook reads it back with
 `dryRunOutcome`. At most `MAX_TRACKED_PRS` outcomes are kept (an `outcomeKeys` list gives the
 eviction order), and `forgetPr` on PR close drops the outcome and any held head. Outcomes survive a

@@ -364,7 +364,6 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
       githubAppId: "app-id",
       githubAppPrivateKey: "app-key",
       enqueueDryRun: vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } }),
-      reportDryRun: vi.fn().mockResolvedValue(true),
       ...overrides,
     };
   }
@@ -510,8 +509,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
 
   it.each(["labeled", "unlabeled"])("a %s accept-baseline event is ignored: no re-report, no 503", async (action) => {
     const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
-    const reportDryRun = vi.fn().mockResolvedValue("unavailable");
-    const kgPrCheck = makeKgPrCheck({ enqueueDryRun, reportDryRun });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
 
     const { req, res } = makeRequest(
       SECRET,
@@ -522,7 +520,6 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     await res.done;
 
     expect(enqueueDryRun).not.toHaveBeenCalled();
-    expect(reportDryRun).not.toHaveBeenCalled();
     expect(res.statusCode).not.toBe(503);
   });
 
@@ -778,10 +775,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     const forgetKgPr = vi.fn((repo: string, prNumber: number) => {
       outcomeStore.delete(storeKey(repo, prNumber));
     });
-    const reportDryRun = vi.fn((report: KgDryRunReportTarget) =>
-      Promise.resolve(outcomeStore.has(storeKey(report.repo, report.prNumber)) ? "reported" as const : "no-outcome" as const),
-    );
-    const kgPrCheck = makeKgPrCheck({ enqueueDryRun, forgetKgPr, reportDryRun });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun, forgetKgPr });
 
     const closed = makeRequest(SECRET, "pull_request", {
       action: "closed",

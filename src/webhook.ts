@@ -49,7 +49,6 @@ interface PullRequestPayload {
     html_url?: string;
     head?: { ref?: string; sha?: string };
     merge_commit_sha?: string;
-    labels?: Array<{ name?: string }>;
   };
   repository?: {
     full_name?: string;
@@ -78,8 +77,6 @@ export interface KgPrCheckConfig {
     | { status: "conflict" }
     | { status: "unavailable" }
   >;
-  /** Returns whether it actually posted — false on a silent no-op (AII-636). */
-  reportDryRun: (report: KgDryRunReportTarget) => Promise<"reported" | "no-outcome" | "unavailable">;
   /** Evicts the `KgRepo` object's stored dry-run outcome for `repo`#`prNumber` (AII-636), on `closed`. */
   forgetKgPr?: (repo: string, prNumber: number) => void | Promise<void>;
 }
