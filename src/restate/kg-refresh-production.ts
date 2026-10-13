@@ -403,8 +403,6 @@ export function createProductionKgRefreshServices(
       dependencyTokenScope: findKgMapping(input.kgSourceRepo)?.[1]?.dependencyTokenScope ?? undefined,
       dryRun: run.dryRun,
       kgSourceRef: run.kgSourceRef,
-      acceptNewBaseline: run.acceptNewBaseline,
-      actorEmail: run.actorEmail,
     }),
     // Idempotent on dispatch_id: a replay after a crash between the insert and the journal write reuses the row.
     resolveDispatchRecord: (dispatchId) => ({

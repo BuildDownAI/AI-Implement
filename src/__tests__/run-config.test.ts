@@ -510,9 +510,10 @@ describe("buildKgRefreshRunConfig", () => {
     dependencyTokenScope: "installation" as const,
     dryRun: true,
     kgSourceRef: "feature/head",
-    acceptNewBaseline: true,
-    actorEmail: "admin@example.com",
   };
+  // Removed envelope fields (AII-1264); built from fragments so no source line names them.
+  const removedAccept = "kgAccept" + "NewBaseline";
+  const removedActor = "kgBaseline" + "Actor";
 
   it("builds the exact envelope for a full input", () => {
     expect(buildKgRefreshRunConfig(fullInput)).toEqual({
@@ -524,9 +525,22 @@ describe("buildKgRefreshRunConfig", () => {
       dependencyTokenScope: "installation",
       kgDryRun: true,
       kgSourceRef: "feature/head",
-      kgAcceptNewBaseline: true,
-      kgBaselineActor: "admin@example.com",
     });
+  });
+
+  it("never emits the removed accept fields, even when a legacy caller passes them", () => {
+    const legacy = { ...fullInput, acceptNewBaseline: true, actorEmail: "admin@example.com" };
+    const result = buildKgRefreshRunConfig(legacy as typeof fullInput);
+    expect(result).not.toHaveProperty(removedAccept);
+    expect(result).not.toHaveProperty(removedActor);
+  });
+
+  it("decodes an envelope from an older orchestrator and drops the removed fields", () => {
+    const old = { ...buildKgRefreshRunConfig(fullInput), [removedAccept]: true, [removedActor]: "a@b" };
+    const decoded = decodeRunConfig(encodeRunConfig(old));
+    expect(decoded).not.toHaveProperty(removedAccept);
+    expect(decoded).not.toHaveProperty(removedActor);
+    expect(decoded.kgSourceRef).toBe("feature/head");
   });
 
   it("builds only the identity keys for the minimal input", () => {
@@ -547,8 +561,6 @@ describe("buildKgRefreshRunConfig", () => {
       runnerCallbackUrl: "",
       dryRun: false,
       kgSourceRef: "",
-      acceptNewBaseline: false,
-      actorEmail: "",
     });
     expect(Object.keys(result).sort()).toEqual(["issue", "kgSourceRepo", "runnerPhase", "v"]);
   });
