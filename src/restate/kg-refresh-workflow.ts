@@ -78,7 +78,7 @@ export const kgDryRunReportSchema = z.object({
 export const kgRefreshOptionsSchema = z.object({
   dryRun: z.boolean().optional(),
   kgSourceRef: z.string().optional(),
-  acceptNewBaseline: z.boolean().optional(),
+  acceptNewBaseline: z.boolean().optional(), // tolerated for in-flight inputs; remove after 2026-11-13
   actorEmail: z.string().optional(),
 }).strict();
 

@@ -550,7 +550,6 @@ describe("KgRefresh durable workflow", () => {
 
   const buildEnvelopeFn: KgRefreshWorkflowDependencies["buildEnvelope"] = (run, issueIdentifier) => buildKgRefreshRunConfig({
     kgSourceRepo: KG_SOURCE_REPO, issueIdentifier, dryRun: run.dryRun, kgSourceRef: run.kgSourceRef,
-    acceptNewBaseline: run.acceptNewBaseline, actorEmail: run.actorEmail,
   });
 
   const TEST_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
@@ -1403,6 +1402,20 @@ describe("KgRefresh durable workflow", () => {
       expect(names.filter((n) => n === "envelope")).toHaveLength(1);
       expect(names.indexOf("envelope")).toBeGreaterThan(names.indexOf("reserve"));
       expect(names.indexOf("envelope")).toBeLessThan(names.indexOf("dispatch-1"));
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("AII-1264: a run input still carrying acceptNewBaseline is accepted and the envelope has no accept field (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions" });
+      const done = runWorkflow(env.baseUrl(), triggerId, { acceptNewBaseline: true, actorEmail: "a@b" });
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const sent = dispatchedEnvelopes.find((e) => e.dispatchId.includes(triggerId))?.envelope;
+      expect(sent).toBeDefined();
+      expect(sent).not.toHaveProperty("kgAccept" + "NewBaseline");
+      expect(sent).not.toHaveProperty("kgBaseline" + "Actor");
     }, 30_000);
 
     it.each(VARIANTS.map(([label]) => label))("a dispatch retry receives the same envelope as the first attempt (%s)", async (label) => {

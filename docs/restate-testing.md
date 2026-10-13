@@ -91,7 +91,7 @@ Nothing here is a mock in the `vi.mock` sense. The handlers run their real code 
 | `ctx.sleep` handler completes | The suspension round-trip (suspend, timer fires, resume, complete) works through the wrapper |
 | Read handlers (`get_runner_mode`, `list_projects`, `get_project_binding`, `get_issue_dispatch_status`) | Real handler bodies against the fixture tables, through the ingress. `get_project_binding` also reads a settings row written mid-test, proving the handler reads live state |
 | `identifier: 5` is refused with 4xx | The zod serde rejects before the handler body runs; `callService` surfaces the status in the thrown error |
-| Write metadata and discovered JSON schema | `trigger_kg_refresh` declares `dryRun`/`acceptNewBaseline` booleans and `add_project` declares the `reviewers` shape, as the admin API projects them. This is the schema an MCP client sees |
+| Write metadata and discovered JSON schema | `trigger_kg_refresh` declares the removed `dryRun`/`acceptNewBaseline` booleans (so zod does not strip them before the refusal) and `add_project` declares the `reviewers` shape, as the admin API projects them. This is the schema an MCP client sees |
 | User refused a write tool | The `admin` role gate holds over the real ingress and the action never runs |
 | `pause_project` with one idempotency key, called twice with opposite `paused` | Restate attaches the second call to the first result; the handler never sees the second `args`. The assertion reads `getMappings()` from the fixture DB, an observable effect, not a journal internal |
 | Raw handler throws once, then succeeds, then a keyed repeat does not run again | The engine's own retry (attempt count reaches 2) and the keyed dedup (count stays 2) |
