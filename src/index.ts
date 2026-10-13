@@ -5106,7 +5106,7 @@ async function main(): Promise<void> {
   console.log(`[restate] retention ${getRestateRetentionDays()} days`);
   // Fire-and-forget: the helper never throws, and boot must not wait on Fly.
   void applyVolumeSnapshotRetentionAtBoot(config.flyDeployToken, process.env.FLY_APP_NAME, getVolumeSnapshotRetentionDays);
-  const reviewFixServices = createProductionReviewFixServices(config, registry, reviewFixAttemptStore);
+  const reviewFixServices = createProductionReviewFixServices(config, registry, reviewFixAttemptStore, submitLateExternalReview);
   // The KgRepo object and KgRefresh workflow (AII-683). Skipped without KG_SOURCE_REPO: the
   // tool handlers then answer 501 from their unset deps.
   const kgSourceRepo = config.kgSourceRepo;

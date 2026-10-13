@@ -329,6 +329,14 @@ export function getRunRecordMergeVerdict(issueIdentifier: string, prUrl: string)
   return "hold";
 }
 
+/** The PR's latest `implementation` / `gap-analysis` row, the one `getRunRecordMergeVerdict` reads. */
+export function getLatestWorkRowForPr(prUrl: string): { id: number; dispatchId: string | null } | null {
+  const row = getDb()
+    .prepare("SELECT id, dispatch_id FROM dispatch_log WHERE pr_url = ? AND phase IN ('implementation', 'gap-analysis') ORDER BY id DESC LIMIT 1")
+    .get(prUrl) as { id: number; dispatch_id: string | null } | undefined;
+  return row ? { id: row.id, dispatchId: row.dispatch_id } : null;
+}
+
 /**
  * Counts prior dispatches for an issue. When `phase` is given, only the
  * matching phase family is counted: planning dispatches number independently
