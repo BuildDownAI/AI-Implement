@@ -314,6 +314,17 @@ describe("loadPipelineDefinition", () => {
     expect(preflightStep.skip?.(ctxRejected)).toBe(true);
   });
 
+  it("wires the callback URL into the clone step inputs", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+    const ctx = makeContext({ callbackUrl: "https://orchestrator.example/callback" });
+    const step = pipeline.steps.find((s) => s.id === "clone")!;
+    const inputs = ctx.resolveInputs(step.inputs);
+    expect(inputs.callbackUrl).toBe("https://orchestrator.example/callback");
+  });
+
   it("applies push input wiring with an issue-scoped implementation branch", () => {
     const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
       existsSyncImpl: () => false,
