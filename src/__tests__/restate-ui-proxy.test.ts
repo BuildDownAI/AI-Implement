@@ -4,8 +4,11 @@ import type { AddressInfo } from "node:net";
 
 const gate = vi.hoisted(() => ({ current: null as unknown }));
 vi.mock("../admin-session.js", () => ({ authenticateAdminRequest: () => gate.current }));
-const scrub = vi.hoisted(() => ({ completedAt: null as string | null }));
-vi.mock("../restate/operator-legacy-scrub.js", () => ({ getOperatorLegacyScrubCompletedAt: () => scrub.completedAt }));
+const scrub = vi.hoisted(() => ({ completedAt: null as string | null, confirmed: false }));
+vi.mock("../restate/operator-legacy-scrub.js", () => ({
+  getOperatorLegacyScrubCompletedAt: () => scrub.completedAt,
+  isOperatorLegacyCheckConfirmed: () => scrub.confirmed,
+}));
 
 import { handleRestateUiRequest } from "../restate/ui-proxy.js";
 
@@ -40,6 +43,7 @@ describe("handleRestateUiRequest", () => {
     adminHits = []; ingressHits = []; handled = []; adminOnReq = undefined;
     gate.current = adminOk;
     scrub.completedAt = null;
+    scrub.confirmed = true;
     logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     adminStub = await stub(adminHits, (res) => (adminOnReq ? adminOnReq(res) : (res.writeHead(200, { "content-type": "text/plain" }), res.end("ok"))));
     ingressStub = await stub(ingressHits);
@@ -108,10 +112,29 @@ describe("handleRestateUiRequest", () => {
     for (const p of ["/query", "/query?a=1"]) {
       const r = await call("POST", p, "{}");
       expect(r.status).toBe(403);
-      expect(JSON.parse(await r.text()).error).toContain("cleanup has run");
+      expect(JSON.parse(await r.text()).error).toContain("cleanup check has run in this process");
     }
     expect(adminHits).toHaveLength(0);
     expect(ingressHits).toHaveLength(0);
+  });
+
+  it("refuses POST /query when the row exists but this process has not confirmed the check", async () => {
+    scrub.completedAt = "2026-10-13T00:00:00.000Z";
+    scrub.confirmed = false;
+    const r = await call("POST", "/query", "{}");
+    expect(r.status).toBe(403);
+    expect(JSON.parse(await r.text()).error).toContain("has run in this process");
+    expect(adminHits).toHaveLength(0);
+    scrub.confirmed = true;
+    expect((await call("POST", "/query", "{}")).status).toBe(200);
+    expect(adminHits).toHaveLength(1);
+  });
+
+  it("refuses POST /query when the check is confirmed but the row is absent", async () => {
+    scrub.completedAt = null;
+    scrub.confirmed = true;
+    expect((await call("POST", "/query", "{}")).status).toBe(403);
+    expect(adminHits).toHaveLength(0);
   });
 
   it("forwards admin POST /query to the admin upstream once the row exists, read per request", async () => {

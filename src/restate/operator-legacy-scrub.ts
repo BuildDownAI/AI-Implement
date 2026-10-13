@@ -10,6 +10,9 @@
  * AII-1305: the step runs only while the sidecar is `ready` and registration `registered`
  * (the callTool rule). `onRegistered` also fires for `unreachable`, where an old deployment
  * without `dropLegacyToken` could pin the call, hold the Operator key and deadlock (AII-1281).
+ * AII-1306: the row alone can predate a rollback, so the proxy also needs an in-memory flag,
+ * set only when this process's check ends with no legacy token left (nothing found, or the
+ * scrub, purge and row write all succeeded). It starts false and is never persisted.
  */
 import { getDb } from "../dedup.js";
 import { purgeInvocation, runIntrospectionQuery } from "./endpoint.js";
@@ -27,6 +30,18 @@ export function getOperatorLegacyScrubCompletedAt(): string | null {
   } catch {
     return null;
   }
+}
+
+let legacyCheckConfirmed = false;
+
+/** True once this process's check confirmed no legacy token is left (AII-1306). */
+export function isOperatorLegacyCheckConfirmed(): boolean {
+  return legacyCheckConfirmed;
+}
+
+/** Test-only: put the flag back to its fresh-process value. */
+export function resetOperatorLegacyCheckConfirmed(): void {
+  legacyCheckConfirmed = false;
 }
 
 export interface OperatorLegacyScrubDeps {
@@ -89,9 +104,11 @@ export async function scrubOperatorLegacyTokens(deps: OperatorLegacyScrubDeps = 
     const legacyRows = stateRows.filter((row) => hasLegacyToken(row.value_utf8));
     const rowExisted = store.read() !== null;
     if (legacyRows.length === 0 && rowExisted) {
+      legacyCheckConfirmed = true;
       return { ran: false, scrubbed: 0, purged: 0 };
     }
     // Close `POST /query` first: the proxy reads the row on every request.
+    legacyCheckConfirmed = false;
     if (rowExisted) store.clear();
     let scrubbed = 0;
     for (const row of legacyRows) {
@@ -121,6 +138,7 @@ export async function scrubOperatorLegacyTokens(deps: OperatorLegacyScrubDeps = 
 
     // (c) only now, record completion.
     store.write((deps.now?.() ?? new Date()).toISOString());
+    legacyCheckConfirmed = true;
     console.log(`[restate] Operator legacy-token scrub done (${rowExisted ? "row cleared: legacy tokens found" : "first run"}): ${scrubbed} families scrubbed, ${purged} invocations purged`);
     return { ran: true, scrubbed, purged };
   } catch (err) {
