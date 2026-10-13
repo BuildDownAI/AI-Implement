@@ -266,7 +266,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
   }
 
   const asSystem = (env: RestateEnvironment) => (name: string, args: Record<string, unknown>) =>
-    callToolAsSystem(name, args, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true });
+    callToolAsSystem(name, args, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true, restateReady: () => true });
 
   async function toolAnswer(env: RestateEnvironment, name: string, args: Record<string, unknown> = {}): Promise<{ status: number; body: Record<string, unknown> }> {
     const result = await asSystem(env)(name, args);
@@ -586,7 +586,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
       KG_SOURCE_REPO,
       createKgRefreshIngressClient(UNROUTABLE_INGRESS),
       ((name: string, args: Record<string, unknown>) =>
-        callToolAsSystem(name, args, { ingressBaseUrl: UNROUTABLE_INGRESS, permitsExternalCall: () => true })) as typeof callToolAsSystem,
+        callToolAsSystem(name, args, { ingressBaseUrl: UNROUTABLE_INGRESS, permitsExternalCall: () => true, restateReady: () => true })) as typeof callToolAsSystem,
     );
     expect(await admin.trigger({})).toEqual({ status: 503, body: { error: "restate-unavailable" } });
     expect(kgRows()).toHaveLength(0);
@@ -658,7 +658,7 @@ describe("Restate kg-refresh pilot: Fly sessions settings are live", () => {
   it("P10: a row written after the build resolves fly-machines and the Fly sender uses the new app", async () => {
     const env = environments.get("disableRetries");
     if (!env) throw new Error("missing Restate variant");
-    const answer = await callToolAsSystem("trigger_kg_refresh", {}, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true });
+    const answer = await callToolAsSystem("trigger_kg_refresh", {}, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true, restateReady: () => true });
     if (answer.status !== "ok") throw new Error("trigger_kg_refresh unavailable");
     const triggerId = (JSON.parse(answer.content[0].text) as { body: { triggerId: string } }).body.triggerId;
     await eventually(() => createdApps.length >= 1, (ok) => ok, { label: "fly dispatch", timeoutMs: 20_000 });

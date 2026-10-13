@@ -8,6 +8,7 @@ import type { AccessRole } from "../access-entries.js";
 import type { Caller } from "../mcp-identity.js";
 import { systemCaller } from "../mcp-identity.js";
 import { isDeployHeld } from "../deploy-hold.js";
+import { getRestateStatus } from "./status.js";
 import { RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BASE_URL } from "./server.js";
 
 const ORCHESTRATOR_TOOLS_SERVICE = "orchestratorTools";
@@ -114,6 +115,12 @@ export interface CallToolDeps {
   /** Shared deploy drain admission check; injectable for deterministic tests. */
   permitsExternalCall?: () => boolean;
   /**
+   * `true` when the sidecar is `ready` and the endpoint `registered` (AII-1281). While registration
+   * is declined, the registered deployment is the old one, and a call that reaches a handler it lacks
+   * (RT0018) retries forever and pins the drain. Same name and meaning as the LateExternalReview hook.
+   */
+  restateReady?: () => boolean;
+  /**
    * Restate's own idempotency key (https://docs.restate.dev/operate/invocation#invoke-a-handler-idempotently),
    * sent as the `idempotency-key` header. Restate scopes it by (service, handler, key), so a
    * second call with the same key attaches to the first invocation's result instead of running
@@ -128,7 +135,8 @@ export interface CallToolDeps {
 /**
  * Posts `{ caller, args }` to the ingress at `<service>/<name>` and returns the handler's
  * ToolResponse. While a deploy hold refuses admission it answers `{ status: "deploy-held" }`
- * without contacting the ingress. A connection failure or a 5xx response answers `{ status: "unavailable" }`
+ * without contacting the ingress; with no hold, while Restate is not ready and registered it
+ * answers `{ status: "unavailable" }` the same way. A connection failure or a 5xx response answers `{ status: "unavailable" }`
  * — the signal src/mcp.ts maps to `503 { error: "restate-unavailable" }`.
  *
  * `name` is percent-encoded before it reaches the URL: an unencoded `../other-service/x`
@@ -146,6 +154,13 @@ export async function callTool(
   // Both MCP and POST /api/tools/<name> enter through this seam. Refuse before
   // contacting the old endpoint once deployment has closed external admission.
   if (!(deps.permitsExternalCall ?? (() => !isDeployHeld()))()) return { status: "deploy-held" };
+  const restateReady =
+    deps.restateReady ??
+    (() => {
+      const restate = getRestateStatus();
+      return restate.sidecar.state === "ready" && restate.registration.state === "registered";
+    });
+  if (!restateReady()) return { status: "unavailable" };
   const ingressBaseUrl = deps.ingressBaseUrl ?? RESTATE_INGRESS_BASE_URL;
   const fetchImpl = deps.fetchImpl ?? fetch;
 
