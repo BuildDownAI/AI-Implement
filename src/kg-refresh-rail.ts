@@ -461,14 +461,10 @@ function isDryRunRefusal(outcome: RefreshOutcome): boolean {
 
 /** Builds the sticky comment body for a dry-run outcome. */
 function buildDryRunCommentBody(report: KgDryRunReportTarget, outcome: RefreshOutcome): string {
-  const acceptedByLabel = isDryRunRefusal(outcome) && report.acceptBaseline === true;
-  const verdict = acceptedByLabel
-    ? `refused, accepted by label \`accept-baseline\` — ${outcome.detail}`
-    : outcome.detail;
-  const note = acceptedByLabel
-    ? "\n\n_The label only changes what this check reports — a real refresh still refuses this shrink unless an admin accepts the new baseline at refresh time._"
+  const note = isDryRunRefusal(outcome)
+    ? "\n\nA shrink is accepted at the decision gate of the refresh that runs after this PR merges."
     : "";
-  return `${KG_DRY_RUN_COMMENT_MARKER} — ${report.sha}\n\n${verdict}\n\n${renderPartTable(outcome.partTable)}${note}`;
+  return `${KG_DRY_RUN_COMMENT_MARKER} — ${report.sha}\n\n${outcome.detail}\n\n${renderPartTable(outcome.partTable)}${note}`;
 }
 
 /**
@@ -504,8 +500,7 @@ export async function postDryRunReport(
     console.error(`[kg-refresh] failed to post dry-run comment on ${report.repo}#${report.prNumber}: ${String(err)}`);
   }
 
-  const acceptedByLabel = isDryRunRefusal(outcome) && report.acceptBaseline === true;
-  const statusOk = outcome.ok || acceptedByLabel;
+  const statusOk = outcome.ok;
   try {
     const { token: statusToken } = await deps.mintToken(deps.githubAppId, deps.githubAppPrivateKey, owner, {
       permissions: { statuses: "write" },

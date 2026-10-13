@@ -49,10 +49,7 @@ interface PullRequestPayload {
     html_url?: string;
     head?: { ref?: string; sha?: string };
     merge_commit_sha?: string;
-    labels?: Array<{ name?: string }>;
   };
-  /** The single label added or removed by a `labeled`/`unlabeled` action — distinct from `pull_request.labels`, the cumulative list. */
-  label?: { name?: string };
   repository?: {
     full_name?: string;
   };
@@ -80,8 +77,6 @@ export interface KgPrCheckConfig {
     | { status: "conflict" }
     | { status: "unavailable" }
   >;
-  /** Returns whether it actually posted — false on a silent no-op (AII-636). */
-  reportDryRun: (report: KgDryRunReportTarget) => Promise<"reported" | "no-outcome" | "unavailable">;
   /** Evicts the `KgRepo` object's stored dry-run outcome for `repo`#`prNumber` (AII-636), on `closed`. */
   forgetKgPr?: (repo: string, prNumber: number) => void | Promise<void>;
 }
@@ -90,23 +85,17 @@ export interface KgPrCheckConfig {
 const KG_GUARD_PATH_PATTERNS: RegExp[] = [/^kg_ingest\//, /^sources\.yml$/, /^ontology\//, /^snapshot\//];
 /** Head branch names that indicate an upstream merge, guard-relevant regardless of changed files. */
 const KG_GUARD_BRANCH_PATTERNS: RegExp[] = [/^kg-upstream\//, /^sync\/upstream-/];
-const KG_ACCEPT_BASELINE_LABEL = "accept-baseline";
 
 function matchesKgGuard(files: string[], headRef: string): boolean {
   if (KG_GUARD_BRANCH_PATTERNS.some((re) => re.test(headRef))) return true;
   return files.some((f) => KG_GUARD_PATH_PATTERNS.some((re) => re.test(f)));
 }
 
-function hasAcceptBaselineLabel(payload: PullRequestPayload): boolean {
-  return (payload.pull_request?.labels ?? []).some((l) => l.name === KG_ACCEPT_BASELINE_LABEL);
-}
-
 /**
  * Evicts the `KgRepo` object's stored dry-run outcome and held head for `repo`#`prNumber`
  * when `kgPrCheck.forgetKgPr` is wired (AII-636, AII-977); a rejection is logged, not thrown.
- * Called on `pull_request` `closed` — a
- * closed PR can never legitimately receive another `labeled` re-report, so there is
- * no reason to wait for the MAX_TRACKED_PRS cap to evict it.
+ * Called on `pull_request` `closed` — a closed PR's stored outcome and held head are
+ * not needed, so they are not left to wait for the MAX_TRACKED_PRS cap.
  */
 function forgetKgPr(kgPrCheck: KgPrCheckConfig | undefined, repoFullName: string, prNumber: number): void {
   Promise.resolve(kgPrCheck?.forgetKgPr?.(repoFullName, prNumber)).catch((err) => {
@@ -128,12 +117,7 @@ async function handleKgPrCheckWebhook(
   deliveryId?: string,
 ): Promise<boolean> {
   if (!kgPrCheck) return false;
-  if (
-    payload.action !== "opened" &&
-    payload.action !== "synchronize" &&
-    payload.action !== "labeled" &&
-    payload.action !== "unlabeled"
-  ) {
+  if (payload.action !== "opened" && payload.action !== "synchronize") {
     return false;
   }
 
@@ -146,7 +130,7 @@ async function handleKgPrCheckWebhook(
   const headRef = payload.pull_request?.head?.ref;
 
   // AII-639: this check owns the HTTP response only for events nothing else handles
-  // (`opened`, `labeled`, `unlabeled`). On `synchronize` it runs as a side effect and returns false,
+  // (`opened`). On `synchronize` it runs as a side effect and returns false,
   // so the existing pull_request handling (gap-fill matching via findMatchingDispatch,
   // merge reconciliation) still runs for the KG repos — they are ordinary onboarded
   // projects too. Outcomes on `synchronize` go to the log instead of the response.
@@ -160,43 +144,6 @@ async function handleKgPrCheckWebhook(
     }
     return owns;
   };
-
-  if (payload.action === "labeled" || payload.action === "unlabeled") {
-    // Only the accept-baseline label re-reports anything — any other label on any
-    // other PR must never touch the check (AII-636: a stray label on an unrelated
-    // PR previously re-posted whatever the process had last computed, for any PR).
-    if (payload.label?.name !== KG_ACCEPT_BASELINE_LABEL) {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ignored: true, reason: "not_accept_baseline_label" }));
-      return true;
-    }
-    // Re-report the last computed verdict for this PR — never re-runs the rail.
-    // reportDryRun() itself is scoped to (and no-ops outside of) this PR's own
-    // stored outcome, so this can never surface another PR's verdict.
-    const posted = await kgPrCheck.reportDryRun({
-      repo: repoFullName,
-      prNumber,
-      sha: sha ?? "",
-      // `unlabeled` forces acceptBaseline:false regardless of what the payload's
-      // (now-stale) `labels` array might say (AII-640) — removing the label must
-      // always revert the comment/status to plain-refusal wording, not depend on
-      // GitHub having already dropped it from `pull_request.labels` by delivery time.
-      acceptBaseline: payload.action === "labeled" ? hasAcceptBaselineLabel(payload) : false,
-    });
-    if (posted === "unavailable") {
-      // 503 so GitHub redelivers: the outcome store was unreachable, not empty.
-      res.writeHead(503, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "restate-unavailable" }));
-      return true;
-    }
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      posted === "reported"
-        ? JSON.stringify({ reported: true })
-        : JSON.stringify({ ignored: true, reason: "no_dry_run_outcome" }),
-    );
-    return true;
-  }
 
   if (!sha || !headRef) {
     return answer(200, { ignored: true, reason: "missing_pr_fields" }, "missing PR fields");
@@ -239,7 +186,6 @@ async function handleKgPrCheckWebhook(
     repo: repoFullName,
     prNumber,
     sha,
-    acceptBaseline: hasAcceptBaselineLabel(payload),
   };
 
   const result = await kgPrCheck
@@ -438,13 +384,8 @@ export async function handleGitHubWebhook(
     return;
   }
 
-  if (
-    payload.action === "opened" ||
-    payload.action === "synchronize" ||
-    payload.action === "labeled" ||
-    payload.action === "unlabeled"
-  ) {
-    // The KG PR check owns `opened`, `labeled`, and `unlabeled` responses; on `synchronize`
+  if (payload.action === "opened" || payload.action === "synchronize") {
+    // The KG PR check owns the `opened` response; on `synchronize`
     // it runs as a side effect and returns false so handlePullRequestSynchronize below
     // still runs (AII-639).
     const handled = await handleKgPrCheckWebhook(payload, res, kgPrCheck, deliveryId);
@@ -458,9 +399,8 @@ export async function handleGitHubWebhook(
 
   if (payload.action === "closed") {
     // Evict this PR's KG PR-check state regardless of merged status — a closed PR
-    // (merged or not) can never legitimately receive another `labeled` re-report, and
-    // holding its entry until the MAX_TRACKED_PRS cap evicts it naturally only widens
-    // the window a stray `labeled` redelivery could exploit (AII-636).
+    // (merged or not) has no use for its stored outcome, so it is not held until the
+    // MAX_TRACKED_PRS cap evicts it (AII-636).
     const kgRepoFullName = payload.repository?.full_name;
     const kgPrNumber = payload.pull_request?.number;
     if (kgRepoFullName && kgPrNumber && (kgRepoFullName === kgPrCheck?.kgSourceRepo || kgRepoFullName === kgPrCheck?.kgBaseRepo)) {
