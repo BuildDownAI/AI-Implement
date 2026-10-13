@@ -396,6 +396,7 @@ describe("RestateRefreshAuthority — outcome mapping", () => {
       const authority = new RestateRefreshAuthority({
         ingressBaseUrl: UNROUTABLE_INGRESS,
         fetchImpl: fetchImpl as unknown as typeof fetch,
+        accessTokenTtlMs: 3600_000,
       });
       await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({
         status: "unavailable",
