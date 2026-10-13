@@ -151,14 +151,9 @@ Any other path or method is not handled and the orchestrator's routing continues
 - **Logging.** Each handled request that is not GET, HEAD, or `POST /query` logs `[restate-ui] <email> <METHOD> <path>`. The UI polls `/query` about once a second, so those are not logged.
 - **Reserved paths.** An orchestrator route under `/ui`, `/health`, `/version`, `/services`, `/deployments`, `/query`, or `/invocations` would collide.
 
-### Reading an invocation's journal (AII-1128)
+### Journal queries and the Restate UI (AII-1128)
 
-The admin API is loopback, so `GET /api/restate/journal` reads it for the operator (`src/restate/journal-query.ts`, route in `src/admin.ts`). It reuses `runIntrospectionQuery` and `sqlQuote` from `endpoint.ts` to query `sys_invocation`, `sys_journal` and `sys_promise`. `/query` is exposed to the admin role only, through the Restate UI door (§ "Restate UI through the orchestrator", ADR 039).
-
-- **Lookup:** `?service=<name>&key=<key>` (a lookup by service and key answers the key's `run` invocation when there is one (a workflow), so shared `status` / `progress` calls never shadow it, and the newest invocation otherwise (a virtual object)) or `?id=<invocation id>`. Each value is 1-128 characters of `[A-Za-z0-9._:-]`, checked by `validateJournalLookup` and then still passed through `sqlQuote`. A bad lookup is a 400 naming the field.
-- **Answer:** `{ invocation, entries, promises }`. Entries are trimmed to `index, entryType, name, completed, promiseName, appendedAt, sleepWakeupAt, entry`. `entry` is the parsed `entry_json`, or `null` when it is over 4096 characters or unparseable, so one read stays near 100 KB even with a large `report` body. Promises are scoped by the invocation's own service and key, so the `id` form finds them too; a keyless service has no key (`NULL`), so it has no promise rows and the promises list is empty.
-- **Status codes:** 404 `{ error: "no invocation" }` when nothing matches (rows survive only within the run kind's retention, 7 days today; see "Retention" below), 503 `{ error: "restate unavailable" }` when the admin API call throws.
-- **Access:** admin only. There is no `journal` page grant (removed from `PAGE_ROUTES`, AII-1262); a stored `journal` grant row grants nothing. The admin UI no longer renders this endpoint's answer: run links open the Restate UI instead (§ "Reading a run's journal").
+The admin API is loopback. `runIntrospectionQuery` and `sqlQuote` in `endpoint.ts` query `sys_invocation` for the deploy drain (`queryNonCompletedInvocations`). `/query` is exposed to the admin role only, through the Restate UI door (§ "Restate UI through the orchestrator", ADR 039). The orchestrator has no journal route: `GET /api/restate/journal` answers 404 (AII-1265), and there is no `journal` page grant (removed from `PAGE_ROUTES`, AII-1262). Admins read journals in the Restate UI (§ "Reading a run's journal").
 
 ### Sidecar environment is an explicit allowlist, never `...process.env` (AII-728)
 
@@ -475,15 +470,11 @@ The failure branch of the planning callback also calls the termination hook, so 
 
 ## Reading a run's journal
 
-`GET /api/restate/journal` (AII-1128) answers one invocation's row, journal entries, and promises. Look it up by `service` + `key`, or by `id` (never both); values match `[A-Za-z0-9._:-]{1,128}`. A bad lookup is 400, no match is **404**, and an unreachable Restate admin API is **503**.
-
-The admin UI no longer renders this endpoint (AII-1262). Instead, admins get an "Open in Restate UI" link to `/ui/workflows/<service>/<key>` (the Restate UI served at `/ui/`, admin only; § "Restate UI through the orchestrator"):
+Admins read a run's journal in the Restate UI, served at `/ui/` and admin only (§ "Restate UI through the orchestrator"). The orchestrator has no journal route of its own (AII-1265 removed `GET /api/restate/journal` and `src/restate/journal-query.ts`; the route now answers 404). The admin UI shows an "Open in Restate UI" link to `/ui/workflows/<service>/<key>`:
 
 - **Job drawer** — the key is the job's dispatch id. The service follows the job's phase (`journalServiceForJob`): `kg-refresh` → `KgRefresh`, `planning` → `PlanningRun`, `implementation` or no dispatch id → no link, any other phase → `ReviewFixAttempt`, linked only when the drawer's attempt read (`/api/review-fix/attempts/<dispatch id>`) just succeeded, so a legacy review-fix job gets none.
 - **KG pipelines current-run card** — the link for `currentRun.triggerId`, service `KgRefresh`. An idle page has none.
 
 The link is hidden for a `user` session. The Journal page and the drawer's "Restate journal" section are gone.
-
-A lookup by service and key answers the key's `run` invocation when there is one (a workflow) and the newest invocation otherwise (a virtual object); the handler name shown next to the status says which invocation it is.
 
 For Restate's own UI, run `fly proxy 9070:9070 -a <app>` and open `http://127.0.0.1:9070/ui/invocations/<id>`.

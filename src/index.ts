@@ -152,7 +152,6 @@ import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/en
 import { resolveReviewProcess } from "./review-process.js";
 import { createLateExternalReviewIngressClient, createLateExternalReviewSubmitHook, createProductionLateExternalReviewServices } from "./restate/late-external-review.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
-import { handleJournalRequest } from "./restate/journal-query.js";
 import type { RestateRegistrationStatus } from "./restate/status.js";
 import { setAdmissionTerminationCheck, setProviderRegistry, setReviewFixAttemptsFacade } from "./restate/tools.js";
 import { callTool, callToolAsSystem } from "./restate/tools-client.js";
@@ -4845,7 +4844,7 @@ function startServer(
           min: RESTATE_RETENTION_DAYS_MIN,
           max: RESTATE_RETENTION_DAYS_MAX,
         },
-        reviewFixAttempts, readJournal: handleJournalRequest })) return;
+        reviewFixAttempts })) return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
