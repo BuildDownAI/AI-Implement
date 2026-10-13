@@ -214,4 +214,31 @@ describe("preflightStep", () => {
     expect(capturedEnv).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
     expect(capturedEnv?.PATH).toBeDefined();
   });
+
+  it("does not pass run tokens to preflight command environment", async () => {
+    vi.stubEnv("RUN_TOKEN", "sentinel-r");
+    vi.stubEnv("RUN_PROGRESS_TOKEN", "sentinel-p");
+    vi.stubEnv("RUN_PUBLICATION_TOKEN", "sentinel-u");
+    vi.mocked(fs.existsSync).mockImplementation((p) => String(p).endsWith("package.json"));
+    vi.mocked(fs.readFileSync).mockReturnValue(
+      JSON.stringify({ scripts: { typecheck: "tsc" } }),
+    );
+
+    let capturedEnv: NodeJS.ProcessEnv | undefined;
+    vi.mocked(execSync).mockImplementation((_cmd, opts) => {
+      capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
+      return Buffer.from("");
+    });
+
+    await preflightStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(capturedEnv).not.toHaveProperty("RUN_TOKEN");
+    expect(capturedEnv).not.toHaveProperty("RUN_PROGRESS_TOKEN");
+    expect(capturedEnv).not.toHaveProperty("RUN_PUBLICATION_TOKEN");
+    expect(process.env.RUN_TOKEN).toBe("sentinel-r");
+  });
 });

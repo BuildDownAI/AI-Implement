@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { join } from "node:path";
+import { postDryRunReport } from "../kg-refresh-rail.js";
 import { makeKgRefresh, runKgRefreshPreflight, materializeArgs, type KgRefreshHandle, type RefreshOutcome, migrateLegacyDryRunOutcomes } from "../kg-refresh.js";
 import { testDb } from "./helpers/test-db.js";
 import { testDir } from "./helpers/test-dir.js";
@@ -60,8 +61,8 @@ describe("kg-refresh", () => {
   });
 
   // ---- The dry-run PR-check surface (AII-633, AII-636, AII-640, AII-977) --------
-  // The refresh lifecycle runs in the KgRefresh workflow; the outcome lives on the KgRepo
-  // object. The handle reads and evicts it through the ingress client, faked here.
+  // The refresh lifecycle runs in the KgRefresh workflow; no outcome is stored. The handle
+  // only evicts the PR's held head through the ingress client, faked here.
 
   describe("dry-run report surface", () => {
     const REPORT = { repo: "TestOrg/test-kg", prNumber: 42, sha: "deadbeef" };
@@ -85,34 +86,32 @@ describe("kg-refresh", () => {
     };
     let postOrUpdateStickyCommentFn: ReturnType<typeof vi.fn>;
     let setCommitStatusFn: ReturnType<typeof vi.fn>;
-    let dryRunOutcome: ReturnType<typeof vi.fn>;
     let forgetPrCall: ReturnType<typeof vi.fn>;
 
-    /** `result` is what the KgRepo object answers `dryRunOutcome` with, whatever the PR asked. */
-    function buildHandle(result: unknown = { status: "accepted", value: null }): KgRefreshHandle {
+    function buildHandle(): KgRefreshHandle {
       postOrUpdateStickyCommentFn = vi.fn(async () => {});
       setCommitStatusFn = vi.fn(async () => {});
-      dryRunOutcome = vi.fn(async () => result);
       forgetPrCall = vi.fn(async () => ({ status: "accepted" }));
       return makeKgRefresh({
         githubAppId: "1",
         githubAppPrivateKey: "key",
         kgSourceRepo: "TestOrg/test-kg",
-        mintToken: vi.fn(async () => ({ token: "tok", expiresAt: "" })) as never,
-        postOrUpdateStickyCommentFn: postOrUpdateStickyCommentFn as never,
-        setCommitStatusFn: setCommitStatusFn as never,
-        dryRunOutcomes: { dryRunOutcome, forgetPr: forgetPrCall } as never,
+        dryRunOutcomes: { forgetPr: forgetPrCall } as never,
       });
     }
 
-    const stored = (sha: string, outcome: RefreshOutcome) => ({ status: "accepted", value: { sha, outcome } });
+    const reportDeps = () => ({
+      githubAppId: "1",
+      githubAppPrivateKey: "key",
+      mintToken: vi.fn(async () => ({ token: "tok", expiresAt: "" })) as never,
+      postOrUpdateStickyCommentFn: postOrUpdateStickyCommentFn as never,
+      setCommitStatusFn: setCommitStatusFn as never,
+    });
 
-    it("reportDryRun() re-posts the stored outcome's comment and status", async () => {
-      const handle = buildHandle(stored(REPORT.sha, okOutcome));
+    it("postDryRunReport() posts the outcome's comment and status", async () => {
+      buildHandle();
+      await postDryRunReport(reportDeps(), REPORT, okOutcome);
 
-      await expect(handle.reportDryRun({ ...REPORT, acceptBaseline: true })).resolves.toBe("reported");
-
-      expect(dryRunOutcome).toHaveBeenCalledWith("TestOrg/test-kg", { repo: REPORT.repo, prNumber: 42 });
       expect(postOrUpdateStickyCommentFn).toHaveBeenCalledTimes(1);
       const [, owner, repo, prNumber, marker, body] = postOrUpdateStickyCommentFn.mock.calls[0] as [string, string, string, number, string, string];
       expect(owner).toBe("TestOrg");
@@ -121,40 +120,8 @@ describe("kg-refresh", () => {
       expect(marker).toBe("## kg-refresh dry-run");
       expect(body).toContain("## kg-refresh dry-run — deadbeef");
       expect(body).toContain("comment.nt");
-      // Outcome was a success (no shrink), so the label has no wording effect here.
-      expect(body).not.toContain("accepted by label");
+      expect(body).not.toContain("decision gate");
       expect(setCommitStatusFn).toHaveBeenCalledTimes(1);
-    });
-
-    it("reportDryRun() is a no-op when the stored outcome ran against a different sha", async () => {
-      const handle = buildHandle(stored(REPORT.sha, okOutcome));
-
-      // A label applied after a new push superseded the stored outcome's sha.
-      await expect(handle.reportDryRun({ ...REPORT, sha: "a-newer-sha" })).resolves.toBe("no-outcome");
-      expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
-      expect(setCommitStatusFn).not.toHaveBeenCalled();
-    });
-
-    it("reportDryRun() logs a debug line and posts nothing when the object holds no outcome", async () => {
-      const handle = buildHandle({ status: "accepted", value: null });
-      const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
-      try {
-        await expect(handle.reportDryRun({ repo: "TestOrg/test-kg", prNumber: 999, sha: "nope" })).resolves.toBe("no-outcome");
-        expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
-        expect(setCommitStatusFn).not.toHaveBeenCalled();
-        expect(debugSpy).toHaveBeenCalledWith(
-          "[kg-refresh] dry-run report skipped: no outcome for TestOrg/test-kg#999",
-        );
-      } finally {
-        debugSpy.mockRestore();
-      }
-    });
-
-    it("reportDryRun() reports unavailable when the store answers unavailable (AII-1014)", async () => {
-      const handle = buildHandle({ status: "unavailable" });
-
-      await expect(handle.reportDryRun(REPORT)).resolves.toBe("unavailable");
-      expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
     });
 
     it("forgetPr() asks the KgRepo object to drop the PR", async () => {
@@ -165,15 +132,16 @@ describe("kg-refresh", () => {
       expect(forgetPrCall).toHaveBeenCalledWith("TestOrg/test-kg", { repo: REPORT.repo, prNumber: 42 });
     });
 
-    it("reportDryRun({ acceptBaseline: false }) reports plain-refusal wording, even for a PR the label was previously applied to (AII-640)", async () => {
-      const handle = buildHandle(stored(REPORT.sha, refusedOutcome));
+    it("a refused dry-run reads refused, points at the refresh decision gate, and fails the status even with a stale acceptBaseline", async () => {
+      buildHandle();
 
-      // Simulates the webhook's `unlabeled` branch: it always forces acceptBaseline:false.
-      await handle.reportDryRun({ ...REPORT, acceptBaseline: false });
+      // A queued input stored before the label was removed may still carry acceptBaseline.
+      await postDryRunReport(reportDeps(), { ...REPORT, acceptBaseline: true } as typeof REPORT, refusedOutcome);
 
       expect(postOrUpdateStickyCommentFn).toHaveBeenCalledTimes(1);
       const body = postOrUpdateStickyCommentFn.mock.calls[0]![5] as string;
       expect(body).toContain("guard refused");
+      expect(body).toContain("A shrink is accepted at the decision gate of the refresh that runs after this PR merges.");
       expect(body).not.toContain("accepted by label");
       const statusCall = setCommitStatusFn.mock.calls[0] as [string, string, string, string, { state: string }];
       expect(statusCall[4].state).toBe("failure");

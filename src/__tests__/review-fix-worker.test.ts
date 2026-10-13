@@ -233,6 +233,103 @@ describe("GithubReviewFixWorker.launch", () => {
     expect(runConfig.dependencyTokenScope).toBe("installation");
   });
 
+  it("carries runnerCallbackUrl in the run config envelope and no token (AII-1273)", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9004 }));
+    const callbackInputs = vi.fn(async () => ({
+      run_token: "secret-result", run_progress_token: "secret-progress", run_publication_token: "secret-publication",
+      runner_callback_url: "https://callback.example/runner",
+    }));
+    const worker = new workerModule.GithubReviewFixWorker({
+      credentials: resolver, transport: t.transport, callbackInputs, runnerCallbackUrl: "https://callback.example/runner",
+    });
+    await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-cb-url" })));
+
+    const dispatched = t.dispatchCalls[0] as { inputs: Record<string, unknown> };
+    const decoded = Buffer.from(dispatched.inputs.run_config as string, "base64").toString("utf8");
+    expect(JSON.parse(decoded).runnerCallbackUrl).toBe("https://callback.example/runner");
+    for (const token of ["secret-result", "secret-progress", "secret-publication"]) expect(decoded).not.toContain(token);
+  });
+
+  it("sends the resolved runner_image as a top-level input, never in the envelope (AII-1280)", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9010 }));
+    const runnerImage = vi.fn(async () => "ghcr.io/x/runner:next");
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, runnerImage });
+    const outcome = await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-img" })));
+
+    expect(outcome.status).toBe("accepted");
+    expect(runnerImage).toHaveBeenCalledWith({ owner: "eudoxus", repo: "ai-implement", token: "gh-token" });
+    const inputs = (t.dispatchCalls[0] as { inputs: Record<string, unknown> }).inputs;
+    expect(inputs.runner_image).toBe("ghcr.io/x/runner:next");
+    expect(Buffer.from(inputs.run_config as string, "base64").toString("utf8")).not.toContain("runner_image");
+  });
+
+  it("keeps runner_image alongside callback inputs", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9011 }));
+    const callbackInputs = vi.fn(async () => ({
+      run_token: "a", run_progress_token: "b", run_publication_token: "c", runner_callback_url: "https://callback.example/runner",
+    }));
+    const worker = new workerModule.GithubReviewFixWorker({
+      credentials: resolver, transport: t.transport, callbackInputs, runnerImage: async () => "ghcr.io/x/runner:next",
+    });
+    await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-img2" })));
+    expect((t.dispatchCalls[0] as { inputs: Record<string, unknown> }).inputs).toEqual(expect.objectContaining({
+      runner_image: "ghcr.io/x/runner:next", run_token: "a",
+    }));
+  });
+
+  it("sends no runner_image key when resolution returns undefined", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9012 }));
+    const worker = new workerModule.GithubReviewFixWorker({
+      credentials: resolver, transport: t.transport, runnerImage: async () => undefined,
+    });
+    await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-img3" })));
+    expect("runner_image" in (t.dispatchCalls[0] as { inputs: Record<string, unknown> }).inputs).toBe(false);
+  });
+
+  it("launches without runner_image and warns once when resolution throws", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9013 }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const worker = new workerModule.GithubReviewFixWorker({
+        credentials: resolver, transport: t.transport, runnerImage: async () => { throw new Error("registry down"); },
+      });
+      const outcome = await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-img4" })));
+      expect(outcome.status).toBe("accepted");
+      expect("runner_image" in (t.dispatchCalls[0] as { inputs: Record<string, unknown> }).inputs).toBe(false);
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("omits runnerCallbackUrl from the run config when none is configured", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9005 }));
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-no-cb-url" })));
+
+    const dispatched = t.dispatchCalls[0] as { inputs: Record<string, unknown> };
+    const runConfig = JSON.parse(Buffer.from(dispatched.inputs.run_config as string, "base64").toString("utf8"));
+    expect(runConfig).not.toHaveProperty("runnerCallbackUrl");
+  });
+
   it("omits dependencyTokenScope from the run config when the mapping has none set", async () => {
     seedMapping();
     const { resolver } = makeCredentials();
@@ -246,6 +343,19 @@ describe("GithubReviewFixWorker.launch", () => {
     const dispatched = t.dispatchCalls[0] as { inputs: Record<string, unknown> };
     const runConfig = JSON.parse(Buffer.from(dispatched.inputs.run_config as string, "base64").toString("utf8"));
     expect(runConfig.dependencyTokenScope).toBeUndefined();
+  });
+
+  it("carries reviewProcess and trustedReviewAuthors into the run config, and omits them when null", async () => {
+    seedMapping({ reviewProcess: "claude-code-review", trustedReviewAuthors: ["review-bot"] });
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9004 }));
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-review-process" })));
+    const dispatched = t.dispatchCalls[0] as { inputs: Record<string, unknown> };
+    const runConfig = JSON.parse(Buffer.from(dispatched.inputs.run_config as string, "base64").toString("utf8"));
+    expect(runConfig.reviewProcess).toBe("claude-code-review");
+    expect(runConfig.trustedReviewAuthors).toEqual(["review-bot"]);
   });
 
   it("returns unknown, never throws, when the mapping cannot be resolved", async () => {
@@ -586,7 +696,7 @@ describe("durable scope lookup: cancel/inspectTerminal after a genuine adapter+s
 
     // The workflow binds the accepted execution to the persisted attempt row — the fact this
     // reconstruction test relies on to resolve scope with no shared in-memory state.
-    const bindOutcome = await storeA.bindExecution(attemptId, { githubRunId: 9200, githubRunAttempt: 1 });
+    const bindOutcome = await storeA.bindExecution(attemptId, { githubRunId: 9200, githubRunAttempt: 1 }, Date.now());
     expect(bindOutcome).toEqual({ status: "bound" });
 
     // A genuinely fresh store instance and a genuinely fresh adapter — the only thing shared

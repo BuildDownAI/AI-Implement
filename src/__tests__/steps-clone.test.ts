@@ -252,6 +252,51 @@ describe("cloneStep", () => {
     );
   });
 
+  describe("pilot publication authority", () => {
+    function stubPilot(): void {
+      const config = {
+        v: 1,
+        issue: { id: "issue-1", identifier: "AII-1282", title: "Test", description: "Test" },
+        reviewFix: { version: 1, attemptId: "attempt-1", installationId: 7,
+          repository: "acme/app", prNumber: 42, deadlineAt: Date.now() + 60_000 },
+      };
+      vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", Buffer.from(JSON.stringify(config)).toString("base64"));
+      vi.stubEnv("RUN_TOKEN", "result-token");
+    }
+
+    it("checks publication authority with the callback URL on a pilot run", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      stubPilot();
+      const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 } as Response);
+      vi.stubGlobal("fetch", fetchMock);
+      mockSpawn([{ status: 0 }, { status: 0 }, { status: 0 }, { status: 0, stdout: "sha1\n" }, { status: 0 }]);
+      try {
+        await cloneStep.run(makeContext(), {
+          ...PR_INPUTS, callbackUrl: "https://cb.example", baseBranch: undefined,
+        }, new NoopStepReporter());
+        expect(fetchMock).toHaveBeenCalledWith(
+          "https://cb.example/api/runner/publication-authority",
+          expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer result-token" }) }),
+        );
+      } finally {
+        vi.unstubAllGlobals();
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it("fails without the callback URL on a pilot run", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      stubPilot();
+      mockSpawn([{ status: 0 }, { status: 0 }, { status: 0 }, { status: 0, stdout: "sha1\n" }, { status: 0 }]);
+      try {
+        await expect(cloneStep.run(makeContext(), { ...PR_INPUTS, baseBranch: undefined }, new NoopStepReporter()))
+          .rejects.toThrow("Pilot publication authority unavailable");
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+  });
+
   describe("PR-targeted (gap-fill) runs: base branch fetch", () => {
     it("fetches base branch after clone and verifies merge-base on a fresh clone", async () => {
       vi.mocked(fs.existsSync).mockReturnValue(false);

@@ -74,7 +74,7 @@ describe("title prefix", () => {
 });
 
 describe("findExistingRun", () => {
-  const find = createPlanningFindExistingRun({ getMapping, getToken: async () => "tok", flySessionsToken: "fly-token", flySessionsApp: "fly-app" });
+  const find = createPlanningFindExistingRun({ getMapping, getToken: async () => "tok", getFlySessions: () => ({ token: "fly-token", app: "fly-app" }) });
 
   it("returns the run titled for this issue created at or after the dispatch time", async () => {
     const github = githubRuns([{ id: 5, display_title: title("ENG-1"), created_at: "2026-10-03T12:00:12Z" }]);
@@ -497,5 +497,22 @@ describe("production deps", () => {
       expect(updateJobStatus).toHaveBeenCalledTimes(1);
       expect(remediateFailedJob).toHaveBeenCalledTimes(2);
     });
+  });
+});
+
+describe("findExistingRun reads the Fly sessions app live (AII-1237)", () => {
+  it("uses the new app after a change, with no rebuild", async () => {
+    const listMachinesMock = vi.mocked(listMachines);
+    listMachinesMock.mockReset();
+    listMachinesMock.mockResolvedValue([] as never);
+    vi.mocked(getJobByDispatchId).mockReturnValue(null);
+    let app = "first-app";
+    const find = createPlanningFindExistingRun({ getMapping, getToken: async () => "tok", getFlySessions: () => ({ token: "t", app }) });
+    const input: PlanningRunInput = { ...INPUT, backend: "fly-machines" };
+    await find(input, DISPATCHED_AT);
+    app = "second-app";
+    await find(input, DISPATCHED_AT);
+    expect(listMachinesMock.mock.calls.map((c) => c[1])).toEqual(["first-app", "second-app"]);
+    vi.mocked(getJobByDispatchId).mockReset();
   });
 });

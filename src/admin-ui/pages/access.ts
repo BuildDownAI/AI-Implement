@@ -536,8 +536,10 @@ export const accessScript = `
   }
 
   function applyGrants(payload) {
-    grants.granted = payload.granted || [];
     grants.grantable = payload.grantable || [];
+    // A stored row for a page that is no longer grantable grants nothing; keeping it in the draft
+    // would make the server reject every save with 'not grantable'.
+    grants.granted = (payload.granted || []).filter(function (k) { return grants.grantable.indexOf(k) !== -1; });
   }
 
   async function saveGrants() {

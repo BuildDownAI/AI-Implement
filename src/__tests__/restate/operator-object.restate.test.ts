@@ -6,10 +6,10 @@
 // that boundary with an actual 30-second wait, and the operator rule keeps that class of
 // test in the default suite where it runs in milliseconds.
 //
-// Run with `npm run test:restate` (Docker required); excluded from `npm test`.
+// Run with `npm run test:restate` (binary runtime, no Docker); excluded from `npm test`.
 import crypto from "node:crypto";
 import { randomUUID } from "node:crypto";
-import { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { operatorObject, RestateRefreshAuthority } from "../../restate/operator-object.js";
 import { getEffectiveAllowlist, matchAccessEntry } from "../../access-entries.js";
@@ -63,7 +63,7 @@ function issueBody(overrides: Partial<IssueBody> = {}): IssueBody {
 }
 
 describe("Operator object", () => {
-  let environments: Map<string, RestateTestEnvironment>;
+  let environments: Map<string, RestateEnvironment>;
 
   beforeAll(async () => {
     environments = await startVariants([operatorObject]);
@@ -239,7 +239,7 @@ describe("Operator object", () => {
   );
 
   it("state after issue then two refresh calls is equivalent whether or not the server forces replay", async () => {
-    async function runSequence(env: RestateTestEnvironment): Promise<{
+    async function runSequence(env: RestateEnvironment): Promise<{
       rotateStatus: string;
       concurrentStatus: string;
       concurrentReturnedTheSameTokenAsTheRotation: boolean;

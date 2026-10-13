@@ -1,4 +1,5 @@
 import type { ReferenceRepo } from "../reference-repos.js";
+import type { ReviewProcessId } from "../review-process.js";
 import type { ReviewerSelection } from "../config.js";
 
 import type { RetryPolicy } from "./retry-backoff.js";
@@ -89,6 +90,10 @@ export interface PipelineContextData {
   referenceRepos?: ReferenceRepo[];
   /** Autonomous runner: project reviewer selection from the trusted run_config envelope. */
   reviewers?: ReviewerSelection[];
+  /** Autonomous runner: project review process from the trusted run_config envelope; defaults to "ai-implement". */
+  reviewProcess?: ReviewProcessId;
+  /** Autonomous runner: extra GitHub logins whose approve block can gate a merge, from the trusted run_config envelope. */
+  trustedReviewAuthors?: string[];
   /** Autonomous runner: selected image-baked reviewer code resolved from the trusted package root, never the checked-out workspace. */
   trustedReviewerDefinitions?: ReadonlyMap<string, ReviewerDefinition>;
   /** Autonomous runner: optional reviewer rubric appended to the review prompt (e.g. kg-refresh-specific approval criteria). */
@@ -105,10 +110,6 @@ export interface PipelineContextData {
   retryPolicy?: RetryPolicy;
   /** kg-refresh dev-harness: when true, kg-snapshot-push prints the guard table but skips commit and push. */
   kgDryRun?: boolean;
-  /** kg-refresh: when true, kg-snapshot-push downgrades the zero-shrink/50% guards to warnings and pushes anyway (AII-628). */
-  kgAcceptNewBaseline?: boolean;
-  /** kg-refresh: email of the admin who set kgAcceptNewBaseline, for the guard-override log line and the refresh PR's ### Baseline section. */
-  kgBaselineActor?: string;
   /**
    * Optional runner-activity/cycle sink (AII-788). Mirrors `PipelineContext.activitySink`
    * so a context constructed from a plain `PipelineContextData` bag (e.g. the dev harness,

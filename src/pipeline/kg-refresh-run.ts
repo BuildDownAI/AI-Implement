@@ -9,7 +9,7 @@ import { loadPipelineDefinition } from "./pipeline-loader.js";
 import { NoopStepReporter, TokenStepReporter } from "./reporter.js";
 import { cloneStep } from "./steps/clone.js";
 import { dependencyAuthStep } from "./steps/dependency-auth.js";
-import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError } from "./steps/kg-snapshot-push.js";
+import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError, KgSnapshotHeldError } from "./steps/kg-snapshot-push.js";
 import { kgTrackerDataStep, KgTrackerDataFetchError } from "./steps/kg-tracker-data.js";
 import { kgScopeReconcileStep } from "./steps/kg-scope-reconcile.js";
 import { kgIngestStep, KgIngestError } from "./steps/kg-ingest.js";
@@ -161,8 +161,6 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
   maxTurns: number | undefined;
   dependencyTokenScope: "installation" | undefined;
   kgDryRun: boolean;
-  kgAcceptNewBaseline: boolean;
-  kgBaselineActor: string | undefined;
 } {
   const rawConfig = env.AI_IMPLEMENT_RUN_CONFIG;
   let issueId = "";
@@ -173,8 +171,6 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
   let maxTurns: number | undefined;
   let dependencyTokenScope: "installation" | undefined;
   let kgDryRun = false;
-  let kgAcceptNewBaseline = false;
-  let kgBaselineActor: string | undefined;
 
   if (rawConfig) {
     try {
@@ -189,8 +185,6 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
       }
       dependencyTokenScope = cfg.dependencyTokenScope;
       kgDryRun = cfg.kgDryRun === true;
-      kgAcceptNewBaseline = cfg.kgAcceptNewBaseline === true;
-      kgBaselineActor = cfg.kgBaselineActor;
     } catch (err) {
       console.warn("[kg-refresh] Could not decode run_config envelope; using env fallbacks:", err);
     }
@@ -219,8 +213,6 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
     maxTurns,
     dependencyTokenScope,
     kgDryRun,
-    kgAcceptNewBaseline,
-    kgBaselineActor,
   };
 }
 
@@ -242,8 +234,6 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     maxTurns,
     dependencyTokenScope,
     kgDryRun: kgDryRunFromConfig,
-    kgAcceptNewBaseline,
-    kgBaselineActor,
   } = resolveKgRefreshInputs(process.env);
 
   // The env var stays as the dev-harness path (AII-586); the envelope field is the
@@ -273,8 +263,6 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
       callbackUrl: callbackUrl ?? undefined,
       dependencyTokenScope,
       kgDryRun,
-      kgAcceptNewBaseline,
-      kgBaselineActor,
     },
     opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, resolveLogLevel(process.env.AI_IMPLEMENT_LOG_LEVEL)),
   );
@@ -319,6 +307,8 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     const isStale = err instanceof KgSnapshotStaleError;
     const isTrackerDataError = err instanceof KgTrackerDataFetchError;
     const isTrackerRegression = err instanceof KgSnapshotTrackerRegressionError;
+    const held = err instanceof KgSnapshotHeldError ? err : undefined;
+    const isHeld = held !== undefined;
     const isIngestFailed = err instanceof KgIngestError;
     const failureCode = isMissing
       ? "KG_SNAPSHOT_MISSING"
@@ -328,9 +318,11 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
           ? "KG_TRACKER_DATA_FETCH_FAILED"
           : isTrackerRegression
             ? "KG_SNAPSHOT_TRACKER_REGRESSION"
-            : isIngestFailed
-              ? "KG_INGEST_FAILED"
-              : undefined;
+            : isHeld
+              ? "KG_SNAPSHOT_HELD"
+              : isIngestFailed
+                ? "KG_INGEST_FAILED"
+                : undefined;
     const failureReason = err instanceof Error ? err.message : String(err);
     console.error(`[kg-refresh] run failed: ${failureCode ?? "unknown"} — ${failureReason}`);
     // A guard refusal from kg-snapshot-push carries its per-part table on the error
@@ -338,14 +330,24 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     // get_kg_status (AII-638).
     const guardPartTable = isTrackerRegression
       ? (err as KgSnapshotTrackerRegressionError).partTable
-      : undefined;
+      : isHeld
+        ? held.partTable
+        : undefined;
     await postRunnerResult({
       phase: "kg-refresh",
       workspaceDir,
       outcome: "failure",
       failureReason: failureReason.slice(-4000),
       ...(failureCode ? { failureCode } : {}),
-      ...(guardPartTable ? { guardVerdict: "refused" as const, partTable: guardPartTable } : {}),
+      ...(guardPartTable ? { guardVerdict: isHeld ? ("held" as const) : ("refused" as const), partTable: guardPartTable } : {}),
+      // A held shrink already pushed its snapshot branch and opened the PR; report them so the orchestrator can act on it.
+      ...(held
+        ? {
+            ...(held.prNumber !== null ? { snapshotPr: held.prNumber } : {}),
+            ...(held.commitSha ? { snapshotCommit: held.commitSha } : {}),
+            snapshotBranch: held.branchName,
+          }
+        : {}),
       callbackUrl,
       fetchImpl: opts.fetchImpl,
     });

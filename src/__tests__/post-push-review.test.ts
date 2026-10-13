@@ -6493,3 +6493,400 @@ describe("postPushReviewStep — cycle summaries (AII-801)", () => {
     }
   });
 });
+
+describe("postPushReviewStep review process gate", () => {
+  type Run = { name: string; app?: string; status?: string; conclusion: string | null; text?: string };
+  const SHA = "deadbeef";
+  const SEVERITY = (normal: number) => `body\n<!-- bughunter-severity: {"normal": ${normal}, "nit": 0, "pre_existing": 0} -->`;
+  const inline = (body: string, commit_id = SHA) => ({
+    user: { login: "claude[bot]", type: "Bot" }, body, path: "a.ts", line: 3, commit_id, html_url: "https://x/1",
+  });
+  const thread = (body: string, oid = SHA) => ({
+    isResolved: false, isOutdated: false, path: "a.ts", line: 3,
+    comments: { nodes: [{ body, url: "https://x/1", commit: { oid }, author: { login: "claude" } }] },
+  });
+
+  function fixture(opts: { runs: Run[]; inlineComments?: unknown[]; threads?: unknown[]; issueComments?: unknown[] }) {
+    const posted: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") posted.push(args[args.indexOf("--body") + 1]);
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42")) return { stdout: JSON.stringify({ head: { sha: SHA } }), exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a.includes(`commits/${SHA}/check-runs`))) {
+        return {
+          stdout: JSON.stringify({
+            check_runs: opts.runs.map((r) => ({
+              name: r.name, status: r.status ?? "completed", conclusion: r.conclusion,
+              ...(r.app ? { app: { slug: r.app } } : {}),
+              ...(r.text !== undefined ? { output: { text: r.text } } : {}),
+            })),
+          }),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42/comments?per_page=100")) {
+        return { stdout: JSON.stringify([opts.inlineComments ?? []]), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/issues/42/comments?per_page=100")) {
+        return { stdout: JSON.stringify([opts.issueComments ?? []]), exitCode: 0 };
+      }
+      if (args[0] === "api" && args[1] === "graphql") {
+        return { stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: opts.threads ?? [], pageInfo: { hasNextPage: false } } } } } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews")) return { stdout: "[]", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    return { ghSpawn, posted };
+  }
+
+  async function run(f: ReturnType<typeof fixture>, extra: Record<string, unknown> = {}, reviewerOutput: unknown = { approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 }) {
+    const invoke = vi.fn(async () => structuredReviewResult(reviewerOutput));
+    const logs: string[] = [];
+    const log = vi.spyOn(console, "log").mockImplementation((...a) => { logs.push(a.join(" ")); });
+    const warns: string[] = [];
+    const warn = vi.spyOn(console, "warn").mockImplementation((...a) => { warns.push(a.join(" ")); });
+    try {
+      const out = await postPushReviewStep.run(
+        makeCtx(invoke),
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn: f.ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+          sleep: vi.fn(async () => undefined), reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000,
+          reviewProcess: "claude-code-review", reviewers: [], ...extra },
+        { report: vi.fn(async () => undefined) },
+      );
+      return { out, logs, warns, invoke };
+    } finally {
+      log.mockRestore();
+      warn.mockRestore();
+    }
+  }
+
+  const actions = (conclusion: string | null): Run => ({ name: "review", app: "github-actions", conclusion });
+
+  it("approves: review/github-actions success with no findings", async () => {
+    const { out, logs } = await run(fixture({ runs: [actions("success")] }));
+    expect(out.approved).toBe(true);
+    expect(logs.some((l) => l.includes("review process claude-code-review: verdict approve from check-and-comments"))).toBe(true);
+  });
+
+  it("approves: success with only 🟡 and untagged findings", async () => {
+    const { out } = await run(fixture({ runs: [actions("success")], inlineComments: [inline("🟡 nit"), inline("plain remark")] }));
+    expect(out.approved).toBe(true);
+  });
+
+  describe("claude-code-review-repository-fix hand-off", () => {
+    const REPO_FIX = { reviewProcess: "claude-code-review-repository-fix", maxIterations: 3 };
+    // With no internal reviewer configured, a failing CI check is the internal blocking finding.
+    const ciRed: Run = { name: "build", app: "github-actions", conclusion: "failure" };
+    const redInline = () => inline("🔴 null deref");
+
+    it("Claude blocking, internal clean: starts no fix pass and reports the reviewed head", async () => {
+      const f = fixture({ runs: [actions("success")], inlineComments: [redInline()] });
+      const { out, invoke } = await run(f, REPO_FIX);
+      expect(out.approved).toBe(false);
+      expect(out.terminationReason).toBe("external_review_pending");
+      expect(out.reviewedHeadSha).toBe(SHA);
+      expect(invoke).not.toHaveBeenCalled();
+      expect(f.posted.join("\n")).not.toContain("starting fix pass");
+    });
+
+    it("internal blocking, Claude clean: runs the fix pass as today", async () => {
+      const f = fixture({ runs: [actions("success"), ciRed] });
+      const { out, invoke } = await run(f, REPO_FIX);
+      expect(out.terminationReason).not.toBe("external_review_pending");
+      expect(f.posted.join("\n")).toContain("starting fix pass");
+      expect(invoke).toHaveBeenCalled();
+    });
+
+    it("both blocking: starts no fix pass and ends unapproved for a person", async () => {
+      const f = fixture({ runs: [actions("success"), ciRed], inlineComments: [redInline()] });
+      const { out, invoke } = await run(f, REPO_FIX);
+      expect(out.approved).toBe(false);
+      expect(out.terminationReason).toBe("iterations_exhausted");
+      expect(out.reviewedHeadSha).toBeUndefined();
+      expect(invoke).not.toHaveBeenCalled();
+      expect(f.posted.join("\n")).not.toContain("starting fix pass");
+    });
+
+    it("neither blocking: approves", async () => {
+      const { out } = await run(fixture({ runs: [actions("success")] }), REPO_FIX);
+      expect(out.approved).toBe(true);
+      expect(out.terminationReason).toBe("approved");
+    });
+
+    it("withholds approval for a 🔴 summary and hands off instead of fixing", async () => {
+      const f = fixture({
+        runs: [actions("success")],
+        issueComments: [{
+          user: { login: "claude[bot]", type: "Bot" }, created_at: "2026-01-01T00:00:00Z", html_url: "https://x/summary",
+          body: "## Code Review\n\n### 🔴 Guard rejects archived simulations\n- Breaks the flow.\n",
+        }],
+      });
+      const { out, invoke } = await run(f, REPO_FIX);
+      expect(out.approved).toBe(false);
+      expect(out.terminationReason).toBe("external_review_pending");
+      expect(invoke).not.toHaveBeenCalled();
+    });
+
+    it("claude-code-review with Claude blocking and internal clean still runs the fix pass", async () => {
+      const f = fixture({ runs: [actions("success")], inlineComments: [redInline()] });
+      const { out } = await run(f, { reviewProcess: "claude-code-review", maxIterations: 3 });
+      expect(out.terminationReason).not.toBe("external_review_pending");
+      expect(f.posted.join("\n")).toContain("starting fix pass");
+    });
+  });
+
+  describe("🔴 heading in Claude's summary comment", () => {
+    const summary = (sections: string) => ({
+      user: { login: "claude[bot]", type: "Bot" }, created_at: "2026-01-01T00:00:00Z", html_url: "https://x/summary",
+      body: `## Code Review\n\n${sections}`,
+    });
+
+    it("withholds approval for a 🔴 section with no inline comments", async () => {
+      const f = fixture({
+        runs: [actions("success")],
+        issueComments: [summary("### 🔴 Not actually 'no behavior change': a new archived-simulation guard was added\n- The guard rejects archived simulations.\n")],
+      });
+      const { out } = await run(f);
+      expect(out.approved).toBe(false);
+      expect(f.posted.join("\n")).toContain("guard rejects archived simulations");
+    });
+
+    it("still approves a summary with only 🟡 and 🟣 sections", async () => {
+      const f = fixture({
+        runs: [actions("success")],
+        issueComments: [summary("### 🟡 Naming nit\n- Rename x.\n\n### 🟣 Pre-existing\n- Old code.\n")],
+      });
+      expect((await run(f)).out.approved).toBe(true);
+    });
+  });
+
+  it("requests changes with the finding on one 🔴 on head", async () => {
+    const f = fixture({ runs: [actions("success")], inlineComments: [inline("🔴 null deref")], threads: [thread("🔴 null deref")] });
+    const { out } = await run(f);
+    expect(out.approved).toBe(false);
+    expect(f.posted.join("\n")).toContain("null deref");
+  });
+
+  describe("inline fallback honours review thread state", () => {
+    const urlInline = (body: string, id: number) => ({ ...inline(body), html_url: `https://x/pull/42#discussion_r${id}` });
+    const urlThread = (urls: string[], state: { isResolved?: boolean; isOutdated?: boolean }, body = "x") => ({
+      isResolved: false, isOutdated: false, path: "a.ts", line: 3, ...state,
+      comments: { nodes: urls.map((url) => ({ body, url, commit: { oid: SHA }, author: { login: "claude" } })) },
+    });
+    const u = (id: number) => `https://x/pull/42#discussion_r${id}`;
+
+    it("does not block on a 🔴 comment whose thread is resolved", async () => {
+      const f = fixture({ runs: [actions("success")], inlineComments: [urlInline("🔴 gone", 1)], threads: [urlThread([u(1)], { isResolved: true })] });
+      const { out } = await run(f);
+      expect(out.approved).toBe(true);
+      expect(f.posted.join("\n")).not.toContain("gone");
+    });
+
+    it("still blocks on the same comment when its thread is open", async () => {
+      const f = fixture({ runs: [actions("success")], inlineComments: [urlInline("🔴 live", 1)], threads: [urlThread([u(1)], {}, "🔴 live")] });
+      const { out } = await run(f);
+      expect(out.approved).toBe(false);
+      expect(f.posted.join("\n")).toContain("live");
+    });
+
+    it("drops a 🔴 comment on an outdated thread", async () => {
+      const f = fixture({ runs: [actions("success")], inlineComments: [urlInline("🔴 stale", 1)], threads: [urlThread([u(1)], { isOutdated: true })] });
+      expect((await run(f)).out.approved).toBe(true);
+    });
+
+    it("keeps only the open finding when one is resolved and one is open", async () => {
+      const f = fixture({
+        runs: [actions("success")],
+        inlineComments: [urlInline("🔴 resolved one", 1), urlInline("🔴 open one", 2)],
+        threads: [urlThread([u(1)], { isResolved: true }), urlThread([u(2)], {}, "🔴 open one")],
+      });
+      const { out } = await run(f);
+      expect(out.approved).toBe(false);
+      const posted = f.posted.join("\n");
+      expect(posted).toContain("open one");
+      expect(posted).not.toContain("resolved one");
+    });
+
+    it("matches a comment that is not the last in its resolved thread", async () => {
+      const f = fixture({
+        runs: [actions("success")],
+        inlineComments: [urlInline("🔴 first", 1)],
+        threads: [urlThread([u(1), u(9)], { isResolved: true })],
+      });
+      expect((await run(f)).out.approved).toBe(true);
+    });
+
+    it("finds a resolved thread on the second page of threads", async () => {
+      const f = fixture({ runs: [actions("success")], inlineComments: [urlInline("🔴 paged", 1)] });
+      const base = f.ghSpawn.getMockImplementation()!;
+      const page = (nodes: unknown[], next: boolean) => ({
+        stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes, pageInfo: { hasNextPage: next, endCursor: next ? "c1" : null } } } } } }),
+        exitCode: 0,
+      });
+      f.ghSpawn.mockImplementation((args: string[]) => {
+        if (args[1] !== "graphql") return base(args);
+        return args.includes("after=c1") ? page([urlThread([u(1)], { isResolved: true })], false) : page([urlThread([u(5)], { isOutdated: true })], true);
+      });
+      expect((await run(f)).out.approved).toBe(true);
+    });
+
+    it("keeps the findings and blocks when the thread read fails", async () => {
+      const f = fixture({ runs: [actions("success")], inlineComments: [urlInline("🔴 unknown", 1)] });
+      const base = f.ghSpawn.getMockImplementation()!;
+      f.ghSpawn.mockImplementation((args: string[]) => (args[1] === "graphql" ? { stdout: "", exitCode: 1 } : base(args)));
+      expect((await run(f)).out.approved).toBe(false);
+    });
+  });
+
+  it("does not count a 🔴 thread written on an older commit", async () => {
+    const f = fixture({ runs: [actions("success")], inlineComments: [inline("🔴 old", "oldsha")], threads: [thread("🔴 old", "oldsha")] });
+    const { out } = await run(f);
+    expect(out.approved).toBe(true);
+    expect(f.posted.join("\n")).not.toContain("🔴 old");
+  });
+
+  it("keeps waiting when a trusted block carries no verdict (incomplete with a source)", async () => {
+    const block = {
+      user: { login: "claude[bot]", type: "Bot" }, created_at: "2026-01-01T00:00:00Z", html_url: "https://x/c",
+      body: "```json review-findings\n" + JSON.stringify({ schema: "review-findings/v1", findings: [] }) + "\n```",
+    };
+    const { out } = await run(fixture({ runs: [actions("success")], issueComments: [block] }));
+    expect(out.approved).toBe(false);
+    expect(out.terminationReason).toBe("external_review_pending");
+    expect(out.reviewedHeadSha).toBe(SHA);
+  });
+
+  it("omits reviewedHeadSha when the run is approved", async () => {
+    const { out } = await run(fixture({ runs: [actions("success")] }));
+    expect(out.approved).toBe(true);
+    expect(out).not.toHaveProperty("reviewedHeadSha");
+  });
+
+  it("logs the captured verdict and source when the wait times out on a block with no verdict", async () => {
+    const block = {
+      user: { login: "claude[bot]", type: "Bot" }, created_at: "2026-01-01T00:00:00Z", html_url: "https://x/c",
+      body: "```json review-findings\n" + JSON.stringify({ schema: "review-findings/v1", findings: [] }) + "\n```",
+    };
+    const { out, logs } = await run(fixture({ runs: [actions("success")], issueComments: [block] }));
+    expect(out.terminationReason).toBe("external_review_pending");
+    const line = logs.find((l) => l.includes("review process claude-code-review:"));
+    expect(line).toBeDefined();
+    expect(line).not.toContain("verdict running from check-conclusion");
+    expect(line).toMatch(/verdict incomplete from (?!check-conclusion)\S+/);
+  });
+
+  it("reads the issue comments once per step run, sharing the poll's read with the findings read", async () => {
+    const f = fixture({ runs: [actions("success")] });
+    await run(f);
+    const urls = f.ghSpawn.mock.calls.map(([args]) => args.find((x) => x.startsWith("repos/:owner/:repo/")) ?? "");
+    // From the first check-runs read (the poll) through the post-wait findings reads, up to the unrelated reviews-API read after the CI gate.
+    const span = urls.slice(urls.findIndex((u) => u.includes("/check-runs")), urls.findIndex((u) => u === "repos/:owner/:repo/pulls/42/reviews"));
+    expect(span.filter((u) => u.includes("/issues/42/comments"))).toHaveLength(1);
+  });
+
+  it("still counts an unresolved thread on an older commit under ai-implement", async () => {
+    const f = fixture({ runs: [actions("success")], threads: [thread("🔴 old finding", "oldsha")] });
+    const { out } = await run(f, {
+      reviewProcess: "ai-implement",
+      reviewers: [{ id: "code-review", gates: true }],
+      trustedReviewerDefinitions: new Map([["code-review", { id: "code-review", buildPrompt: () => "p", outputSchema: { type: "object" } }]]),
+    }, { approved: true, findings: [] });
+    expect(out.approved).toBe(false);
+    expect(f.posted.join("\n")).toContain("old finding");
+  });
+
+  describe("older-head external findings while the current head's check is running", () => {
+    const aiImplement = {
+      reviewProcess: "ai-implement",
+      reviewers: [{ id: "code-review", gates: true }],
+      trustedReviewerDefinitions: new Map([["code-review", { id: "code-review", buildPrompt: () => "p", outputSchema: { type: "object" } }]]),
+      maxIterations: 2,
+    };
+    const running: Run = { name: "review", app: "github-actions", status: "in_progress", conclusion: null };
+
+    it("ends external_review_pending on the new head and starts no fix pass", async () => {
+      const f = fixture({ runs: [running], threads: [thread("🔴 old finding", "oldsha")] });
+      const { out, invoke } = await run(f, aiImplement, { approved: true, findings: [] });
+      expect(out.approved).toBe(false);
+      expect(out.terminationReason).toBe("external_review_pending");
+      expect(out.reviewedHeadSha).toBe(SHA);
+      expect(invoke).toHaveBeenCalledTimes(1);
+      expect(f.posted.join("\n")).not.toContain("starting fix pass");
+    });
+
+    it("still starts a fix pass for an internal blocking issue", async () => {
+      const f = fixture({ runs: [running], threads: [thread("🔴 old finding", "oldsha")] });
+      const { out } = await run(f, aiImplement, { approved: false, findings: [{ severity: "blocking", body: "Null dereference in handler" }] });
+      expect(out.terminationReason).not.toBe("external_review_pending");
+      expect(f.posted.join("\n")).toContain("starting fix pass");
+    });
+
+    it("gates on the external finding once the current head's check completed", async () => {
+      const f = fixture({ runs: [actions("success")], threads: [thread("🔴 old finding", "oldsha")] });
+      const { out } = await run(f, aiImplement, { approved: true, findings: [] });
+      expect(out.approved).toBe(false);
+      expect(out.terminationReason).not.toBe("external_review_pending");
+      expect(f.posted.join("\n")).toContain("old finding");
+    });
+  });
+
+  it("is no real verdict when the matched check failed", async () => {
+    const { out } = await run(fixture({ runs: [actions("failure")] }));
+    expect(out.approved).toBe(false);
+  });
+
+  it("approves when Claude Code Review reports normal: 0", async () => {
+    const { out } = await run(fixture({
+      runs: [{ name: "Claude Code Review", app: "claude", conclusion: "neutral", text: SEVERITY(0) }],
+      inlineComments: [inline("🔴 ignored: the severity line decides")],
+    }));
+    expect(out.approved).toBe(true);
+  });
+
+  it("requests changes when Claude Code Review reports normal > 0", async () => {
+    const { out } = await run(fixture({ runs: [{ name: "Claude Code Review", app: "claude", conclusion: "neutral", text: SEVERITY(2) }] }));
+    expect(out.approved).toBe(false);
+  });
+
+  it("is no real verdict when the severity line is absent", async () => {
+    const { out } = await run(fixture({ runs: [{ name: "Claude Code Review", app: "claude", conclusion: "neutral", text: "no marker" }] }));
+    expect(out.approved).toBe(false);
+  });
+
+  it("does not match Claude Code Review posted by another app, and lists it as present", async () => {
+    const { out, warns } = await run(fixture({ runs: [{ name: "Claude Code Review", app: "github-actions", conclusion: "success", text: SEVERITY(0) }] }));
+    expect(out.approved).toBe(false);
+    const warning = warns.find((w) => w.includes("No external review check matched")) ?? "";
+    expect(warning).toContain("Claude Code Review (app: github-actions)");
+    expect(warning).toContain("Claude Code Review (app: claude)");
+  });
+
+  it("ends incomplete when no matched check completes before the timeout", async () => {
+    const { out } = await run(fixture({ runs: [{ name: "Claude Code Review", app: "claude", status: "in_progress", conclusion: null }] }));
+    expect(out.approved).toBe(false);
+    expect(out.terminationReason).toBe("external_review_pending");
+  });
+
+  it("lets a trusted review-findings block win over the check and comments", async () => {
+    const block = (verdict: string, login: string) => ({
+      user: { login, type: "Bot" }, created_at: "2026-01-01T00:00:00Z", html_url: "https://x/c",
+      body: "```json review-findings\n" + JSON.stringify({ schema: "review-findings/v1", verdict, findings: [] }) + "\n```",
+    });
+    const sev = { name: "Claude Code Review", app: "claude", conclusion: "neutral", text: SEVERITY(3) };
+    const trusted = await run(fixture({ runs: [sev], issueComments: [block("approve", "claude[bot]")] }));
+    expect(trusted.out.approved).toBe(true);
+    const untrusted = await run(fixture({ runs: [sev], issueComments: [block("approve", "someone-else[bot]")] }));
+    expect(untrusted.out.approved).toBe(false);
+  });
+
+  it("an empty selection runs on claude-code-review, and still fails on ai-implement", async () => {
+    const ok = await run(fixture({ runs: [actions("success")] }));
+    expect(ok.out.terminationReason).not.toBe("invalid_review");
+    expect(ok.invoke).not.toHaveBeenCalled();
+    const f = fixture({ runs: [actions("success")] });
+    const blocked = await run(f, { reviewProcess: "ai-implement" });
+    expect(blocked.out.approved).toBe(false);
+    expect(blocked.out.terminationReason).toBe("invalid_review");
+    expect(f.posted.join("\n")).toContain("Project reviewer selection is empty");
+  });
+});

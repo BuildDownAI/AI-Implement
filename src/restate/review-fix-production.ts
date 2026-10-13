@@ -6,8 +6,11 @@ import { getDb } from "../dedup.js";
 import { getInstallationId, getInstallationToken } from "../github-app-auth.js";
 import { getPullRequestState } from "../github.js";
 import { listReviewFixCycleSummaries } from "../review-fix-evidence.js";
-import { createReviewFixFinalizer, retryApprovalEffect } from "../review-fix-finalize.js";
+import { createReviewFixFinalizer } from "../review-fix-finalize.js";
 import { createReviewFixGithubAdapter } from "../review-fix-github-adapter.js";
+import { resolveRunnerImageForDispatch } from "../repo-image.js";
+import { resolveReviewProcess, type ReviewFixer } from "../review-process.js";
+import { acceptReviewFixWebhookEvent, updateReviewFixStatus } from "../review-fix-queue.js";
 import { loadPendingReviewFixFeedback } from "../review-fix-pending.js";
 import { SqliteReviewFixAttemptStore } from "../review-fix-attempt-store.js";
 import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "../review-fix-worker.js";
@@ -27,6 +30,8 @@ export interface ReviewFixProductionConfig {
   githubAppPrivateKey: string;
   runnerCallbackBaseUrl: string | null;
   runnerTokenSecret: string | null;
+  sessionImage: string;
+  runnerImageExplicit: boolean;
 }
 
 function selectedMapping(scope: ScopedPrIdentity): RepoMapping | null {
@@ -54,6 +59,21 @@ async function canAdmit(scope: ScopedPrIdentity, config: ReviewFixProductionConf
   } catch { return false; }
 }
 
+/** Who fixes review findings for this mapping; an unmapped PR keeps ai-implement. */
+export function fixerFor(mapping: RepoMapping | null): ReviewFixer {
+  return mapping ? resolveReviewProcess(mapping.reviewProcess).fixer : "ai-implement";
+}
+
+/** Marks the queue row skipped and logs when the review process hands fixes to the repository. */
+export function recordDelegatedFix(scope: ScopedPrIdentity, queueCursor: { queueId: number } | null | undefined): void {
+  // Without a cursor no row is identified, so there is nothing to mark.
+  if (!queueCursor) return;
+  const mapping = selectedMapping(scope);
+  updateReviewFixStatus(queueCursor.queueId, "skipped");
+  console.log(`[review-fix] Project ${scope.repository} delegates fixes to the repository `
+    + `(${resolveReviewProcess(mapping?.reviewProcess).id}), skipping review fix #${queueCursor.queueId}`);
+}
+
 function dispositionsFor(attempt: PreparedReviewFixAttempt, result: ReviewFixResultMetadataV1): ReviewFixFindingDisposition[] {
   const summaries = listReviewFixCycleSummaries(attempt.attemptId);
   // A finding may have been addressed in an earlier cycle. Require the final
@@ -75,6 +95,9 @@ export function createProductionReviewFixServices(
   const credentials = createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey);
   const github = createReviewFixGithubAdapter({ credentials });
   const worker = new GithubReviewFixWorker({ credentials, scopeStore: reviewFixAttemptStoreScopeStore(store),
+    runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
+    runnerImage: (target) => resolveRunnerImageForDispatch({ ...target,
+      defaultImage: config.sessionImage, runnerImageExplicit: config.runnerImageExplicit }),
     callbackInputs: async (attemptId) => {
       if (!config.runnerTokenSecret || !config.runnerCallbackBaseUrl) throw new Error("pilot callbacks unavailable");
       return {
@@ -105,23 +128,20 @@ export function createProductionReviewFixServices(
         return { status: "withheld", reason: "current PR head or merge policy changed" };
       }
       const current = { ...input, currentAuthority: true, currentPrHeadSha: head };
-      const effect = await baseFinalizer.applyApproval(current);
-      if (effect.status === "withheld" && effect.reason.includes("reconcile via retryApprovalEffect")) {
-        // A previous effect may have reached GitHub before its local ACK was
-        // lost. The explicit retry observes the stable attempt marker first.
-        return retryApprovalEffect({ attemptStore: store, github }, current);
-      }
-      return effect;
+      return baseFinalizer.applyApproval(current);
     },
   };
   const pr = createReviewFixPR({
+    recordFeedback: async (event) => acceptReviewFixWebhookEvent(event),
     attempts: {
       admit: async (request) => await canAdmit(request.scope, config)
         ? store.admit(request) : { status: "deferred", reason: "paused" },
     },
+    recordDelegated: async (scope, queueCursor) => recordDelegatedFix(scope, queueCursor),
     load: async (scope) => {
       const mapping = selectedMapping(scope);
-      if (!mapping) return { closed: true, pending: null, jobTimeoutMinutes: DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES };
+      if (!mapping) return { closed: true, pending: null, fixer: fixerFor(null),
+        jobTimeoutMinutes: DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES };
       const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
       const prState = await getPullRequestState(token, mapping.owner, mapping.repo, scope.prNumber);
       const closed = prState !== null && (prState.state === "closed" || prState.merged);
@@ -135,6 +155,7 @@ export function createProductionReviewFixServices(
         } catch { /* Legacy's fallback text is also valid when the tracker is unavailable. */ }
       }
       return { closed, pending: loadPendingReviewFixFeedback(scope, issueDescription),
+        fixer: fixerFor(mapping),
         jobTimeoutMinutes: mapping.maxJobMinutes ?? DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES };
     },
   });

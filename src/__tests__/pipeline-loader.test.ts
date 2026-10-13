@@ -302,6 +302,17 @@ describe("loadPipelineDefinition", () => {
     expect(preflightStep.skip?.(ctxRejected)).toBe(true);
   });
 
+  it("wires the callback URL into the clone step inputs", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+    const ctx = makeContext({ callbackUrl: "https://orchestrator.example/callback" });
+    const step = pipeline.steps.find((s) => s.id === "clone")!;
+    const inputs = ctx.resolveInputs(step.inputs);
+    expect(inputs.callbackUrl).toBe("https://orchestrator.example/callback");
+  });
+
   it("applies push input wiring with an issue-scoped implementation branch", () => {
     const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
       existsSyncImpl: () => false,
@@ -374,6 +385,8 @@ describe("loadPipelineDefinition", () => {
     const repoReviewerDefinitions = [{ id: "repo-reviewer" }];
     const trustedConfigReviewerDefinitions = [{ id: "domain-reviewer" }];
     ctx.data.reviewers = selectedReviewers;
+    ctx.data.reviewProcess = "claude-code-review";
+    ctx.data.trustedReviewAuthors = ["x[bot]"];
     ctx.data.trustedReviewerDefinitions = trustedDefinitions;
     ctx.setOutputs("install", {
       reviewProviders: ["github-claude-code-review"],
@@ -388,6 +401,8 @@ describe("loadPipelineDefinition", () => {
     expect(inputs.prNumber).toBe("42");
     expect(inputs.reviewProviders).toEqual(["github-claude-code-review"]);
     expect(inputs.reviewers).toBe(selectedReviewers);
+    expect(inputs.reviewProcess).toBe("claude-code-review");
+    expect(inputs.trustedReviewAuthors).toEqual(["x[bot]"]);
     expect(inputs.trustedReviewerDefinitions).toBe(trustedDefinitions);
     expect(inputs.reviewerDefinitions).toBe(repoReviewerDefinitions);
     expect(inputs.trustedConfigReviewerDefinitions).toBe(trustedConfigReviewerDefinitions);

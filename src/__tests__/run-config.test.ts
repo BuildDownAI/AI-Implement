@@ -4,11 +4,12 @@ import {
   decodeRunConfig,
   runConfigFromTaskDocument,
   buildImplRunConfig,
+  buildKgRefreshRunConfig,
   type RunConfigV1,
   type TaskDocumentParams,
 } from "../run-config.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
-import type { ReviewerSelection } from "../config.js";
+import type { RepoMapping, ReviewerSelection } from "../config.js";
 import { makeMapping } from "./helpers/builders.js";
 
 const full: RunConfigV1 = {
@@ -353,6 +354,62 @@ describe("buildImplRunConfig", () => {
     expect(decodeRunConfig(encodeRunConfig(emptyConfig)).reviewers).toEqual([]);
   });
 
+  it("carries reviewProcess and trustedReviewAuthors when set, including an empty list, and omits them when null", () => {
+    const build = (overrides: Partial<RepoMapping>) => buildImplRunConfig({
+      issue: implBaseIssue,
+      mapping: makeMapping(overrides),
+      baseBranch: "main",
+      retryPolicy: DEFAULT_RETRY_POLICY,
+    });
+
+    const set = decodeRunConfig(encodeRunConfig(
+      build({ reviewProcess: "claude-code-review", trustedReviewAuthors: ["review-bot"] }),
+    ));
+    expect(set.reviewProcess).toBe("claude-code-review");
+    expect(set.trustedReviewAuthors).toEqual(["review-bot"]);
+
+    const empty = decodeRunConfig(encodeRunConfig(build({ trustedReviewAuthors: [] })));
+    expect(empty.trustedReviewAuthors).toEqual([]);
+
+    const nulls = build({ reviewProcess: null, trustedReviewAuthors: null });
+    expect("reviewProcess" in nulls).toBe(false);
+    expect("trustedReviewAuthors" in nulls).toBe(false);
+  });
+
+  it("drops a malformed reviewProcess with the exact warning and decodes the rest", () => {
+    for (const bad of ["github", 5]) {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const b64 = Buffer.from(JSON.stringify({ ...full, reviewProcess: bad }), "utf-8").toString("base64");
+        const decoded = decodeRunConfig(b64);
+        expect(decoded.issue.identifier).toBe("AII-1");
+        expect(decoded.reviewProcess).toBeUndefined();
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy).toHaveBeenCalledWith("[run-config] Ignoring invalid reviewProcess field; using ai-implement");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    }
+  });
+
+  it("drops a malformed trustedReviewAuthors with the exact warning and decodes the rest", () => {
+    for (const bad of ["review-bot", ["a", ""], [1]]) {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const b64 = Buffer.from(JSON.stringify({ ...full, trustedReviewAuthors: bad }), "utf-8").toString("base64");
+        const decoded = decodeRunConfig(b64);
+        expect(decoded.issue.identifier).toBe("AII-1");
+        expect(decoded.trustedReviewAuthors).toBeUndefined();
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy).toHaveBeenCalledWith(
+          "[run-config] Ignoring invalid trustedReviewAuthors field; using the process's own authors",
+        );
+      } finally {
+        warnSpy.mockRestore();
+      }
+    }
+  });
+
   it("round-trips kgDryRun: true", () => {
     const cfg: RunConfigV1 = {
       v: 1,
@@ -402,6 +459,75 @@ describe("buildImplRunConfig", () => {
     expect(decoded.kgDryRun).toBe(true);
     expect(decoded.kgSourceRef).toBe("feature/head");
     expect((decoded as unknown as Record<string, unknown>).bogusKey).toBeUndefined();
+  });
+});
+
+describe("buildKgRefreshRunConfig", () => {
+  const fullInput = {
+    kgSourceRepo: "org/kg",
+    issueIdentifier: "KG-REFRESH · trigger-1",
+    runnerCallbackUrl: "https://orch.example/api/runner",
+    dependencyTokenScope: "installation" as const,
+    dryRun: true,
+    kgSourceRef: "feature/head",
+  };
+  // Removed envelope fields (AII-1264); built from fragments so no source line names them.
+  const removedAccept = "kgAccept" + "NewBaseline";
+  const removedActor = "kgBaseline" + "Actor";
+
+  it("builds the exact envelope for a full input", () => {
+    expect(buildKgRefreshRunConfig(fullInput)).toEqual({
+      v: 1,
+      issue: { id: "kg-refresh", identifier: "KG-REFRESH · trigger-1", title: "KG ingest", description: "" },
+      runnerPhase: "kg-refresh",
+      kgSourceRepo: "org/kg",
+      runnerCallbackUrl: "https://orch.example/api/runner",
+      dependencyTokenScope: "installation",
+      kgDryRun: true,
+      kgSourceRef: "feature/head",
+    });
+  });
+
+  it("never emits the removed accept fields, even when a legacy caller passes them", () => {
+    const legacy = { ...fullInput, acceptNewBaseline: true, actorEmail: "admin@example.com" };
+    const result = buildKgRefreshRunConfig(legacy as typeof fullInput);
+    expect(result).not.toHaveProperty(removedAccept);
+    expect(result).not.toHaveProperty(removedActor);
+  });
+
+  it("decodes an envelope from an older orchestrator and drops the removed fields", () => {
+    const old = { ...buildKgRefreshRunConfig(fullInput), [removedAccept]: true, [removedActor]: "a@b" };
+    const decoded = decodeRunConfig(encodeRunConfig(old));
+    expect(decoded).not.toHaveProperty(removedAccept);
+    expect(decoded).not.toHaveProperty(removedActor);
+    expect(decoded.kgSourceRef).toBe("feature/head");
+  });
+
+  it("builds only the identity keys for the minimal input", () => {
+    const result = buildKgRefreshRunConfig({ kgSourceRepo: "org/kg", issueIdentifier: "KG-REFRESH · t" });
+    expect(result).toEqual({
+      v: 1,
+      issue: { id: "kg-refresh", identifier: "KG-REFRESH · t", title: "KG ingest", description: "" },
+      runnerPhase: "kg-refresh",
+      kgSourceRepo: "org/kg",
+    });
+    expect(Object.keys(result).sort()).toEqual(["issue", "kgSourceRepo", "runnerPhase", "v"]);
+  });
+
+  it("omits keys for falsy inputs", () => {
+    const result = buildKgRefreshRunConfig({
+      kgSourceRepo: "org/kg",
+      issueIdentifier: "KG-REFRESH · t",
+      runnerCallbackUrl: "",
+      dryRun: false,
+      kgSourceRef: "",
+    });
+    expect(Object.keys(result).sort()).toEqual(["issue", "kgSourceRepo", "runnerPhase", "v"]);
+  });
+
+  it("survives encode and decode unchanged", () => {
+    const built = buildKgRefreshRunConfig(fullInput);
+    expect(decodeRunConfig(encodeRunConfig(built))).toEqual(built);
   });
 });
 

@@ -49,6 +49,8 @@ export function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     memoryProviderId: null,
     reviewers: null,
     prDispatchBudget: null,
+    trustedReviewAuthors: null,
+    reviewProcess: null,
     ...overrides,
   };
 }

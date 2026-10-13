@@ -41,6 +41,7 @@ import { isLinearAuthConfigured, withLinearToken } from "./linear-app-auth.js";
 import { isFailureRecord, projectFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
 import { sanitizeFindingDispositions, type FindingDisposition } from "./pipeline/finding-dispositions.js";
 import { isCycleSummary, sanitizeCycleSummaries, type CycleSummary, type CycleDisposition } from "./pipeline/cycle-summary.js";
+import type { LateExternalReviewInput } from "./restate/late-external-review.js";
 import { recordReviewFixCycleSummary, type ReviewFixCycleSummaryOutcome } from "./review-fix-evidence.js";
 import type { ReviewFixFindingDisposition } from "./review-fix-ports.js";
 import {
@@ -129,9 +130,9 @@ export interface RunnerResultBody {
   snapshotPr?: number;
   /** The `kg-refresh/<stamp>` branch behind snapshotPr; deleted by the orchestrator after merge or close. */
   snapshotBranch?: string;
-  /** Guard verdict from kg-snapshot-push, present for a kg-refresh dry-run (AII-632) or a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638). */
-  guardVerdict?: "clean" | "refused";
-  /** Per-part {part, prev, new} table from kg-snapshot-push, present for a kg-refresh dry-run (AII-632) or a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638). */
+  /** Guard verdict from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
+  guardVerdict?: "clean" | "refused" | "held";
+  /** Per-part {part, prev, new} table from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
   partTable?: Array<{ part: string; prev: string; new: string }>;
   /** Reference repository clone outcomes, present only when the run declared entries. */
   referenceRepoResults?: ReferenceRepoResult[];
@@ -155,6 +156,12 @@ export interface RunnerResultBody {
    * above, it is never dropped-and-warned into the legacy success branch.
    */
   reviewFix?: ReviewFixResultMetadataV1;
+  /**
+   * Head SHA the internal review approved when the run ended `external_review_pending`. Kept only
+   * when `headSha` is 40 lowercase hex characters; otherwise dropped with a warning. A failed
+   * implementation or gap-analysis result that carries it starts `LateExternalReview` (AII-1227).
+   */
+  externalReviewPending?: { headSha: string };
 }
 
 export interface HandleRunnerResultInput {
@@ -196,6 +203,12 @@ export interface HandleRunnerResultInput {
    * then simply stays held, matching pre-fast-path behavior.
    */
   checkPlanningAdmissionTermination?: (dispatchId: string) => Promise<void>;
+  /**
+   * Starts the `LateExternalReview` workflow (AII-1227) for a failed implementation or gap-analysis
+   * result that ended `external_review_pending`. The hook itself decides whether Restate is ready;
+   * an error it throws is logged and does not change the response.
+   */
+  submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<void>;
 }
 
 export interface HandleRunnerResultOutput {
@@ -220,6 +233,14 @@ export interface HandleRunnerPlanningContextInput {
   authorization: string | undefined;
   secret: string;
   resolveProvider: (mappingTeamKey: string) => Promise<TicketingProvider | null>;
+}
+
+/** Thrown by an intake seam whose Restate forward failed; the route answers 503 and the runner retries. */
+export class ReviewFixIntakeUnavailableError extends Error {
+  constructor() {
+    super("review-fix intake unavailable");
+    this.name = "ReviewFixIntakeUnavailableError";
+  }
 }
 
 function bad(status: number, error: string): HandleRunnerResultOutput {
@@ -623,6 +644,7 @@ export async function handleRunnerResult(
     findingDispositions?: unknown;
     cycleSummaries?: unknown;
     reviewFix?: unknown;
+    externalReviewPending?: unknown;
   } | null | undefined;
   if (!body || typeof body !== "object") return bad(400, "invalid_body");
   if (
@@ -677,7 +699,13 @@ export async function handleRunnerResult(
     }
 
     if (!input.onReviewFixResult) return bad(503, "reviewfix_result_intake_unavailable");
-    const outcome = await input.onReviewFixResult(validated.value);
+    let outcome: ResultIntakeOutcome;
+    try {
+      outcome = await input.onReviewFixResult(validated.value);
+    } catch (e) {
+      if (e instanceof ReviewFixIntakeUnavailableError) return bad(503, "reviewfix_result_intake_unavailable");
+      throw e;
+    }
 
     // The result marker may have committed just before a process crash, leaving
     // its attached cycles unwritten. A byte-identical duplicate may repair only
@@ -799,6 +827,19 @@ export async function handleRunnerResult(
     console.warn(`[runner-callback] Dropped ${droppedCycleSummaries} invalid cycle summary record(s)`);
   }
 
+  if (body.externalReviewPending !== undefined) {
+    const pending = body.externalReviewPending as { headSha?: unknown } | null;
+    const headSha = pending && typeof pending === "object" ? pending.headSha : undefined;
+    if (typeof headSha === "string" && /^[0-9a-f]{40}$/.test(headSha)) {
+      input.body.externalReviewPending = { headSha };
+    } else {
+      delete input.body.externalReviewPending;
+      console.warn(
+        `[runner-callback] dropping malformed externalReviewPending for dispatchId=${claims.dispatchId}`,
+      );
+    }
+  }
+
   if (
     input.body.outcome === "success" &&
     input.body.phase === "implementation" &&
@@ -889,6 +930,30 @@ export async function handleRunnerResult(
     const isLeaseRejected = input.body.failureCode === "GIT_LEASE_REJECTED" || failure?.code === "GIT_LEASE_REJECTED";
     if (isLeaseRejected && job?.prUrl) {
       await handleLeaseRejectedFailure(job, input.watchdogConfig);
+    }
+
+    // AII-1227: the internal review approved but the external review was still running when the
+    // run gave up. Start the workflow that writes the approval mark if it passes later.
+    const pendingHeadSha = input.body.externalReviewPending?.headSha;
+    if (
+      input.submitLateExternalReview &&
+      pendingHeadSha &&
+      input.body.prUrl &&
+      (input.body.phase === "implementation" || input.body.phase === "gap-analysis")
+    ) {
+      const target = parsePrUrlTarget(input.body.prUrl);
+      if (target) {
+        try {
+          await input.submitLateExternalReview({
+            dispatchId: claims.dispatchId,
+            ...target,
+            prUrl: input.body.prUrl,
+            headSha: pendingHeadSha,
+          });
+        } catch (err) {
+          warn("submitLateExternalReview", err);
+        }
+      }
     }
 
     if (input.body.phase === "planning") {
@@ -1064,6 +1129,11 @@ export async function handleRunnerResult(
   }
 
   return { status: 200, body: { acknowledged: true, warnings } };
+}
+
+function parsePrUrlTarget(prUrl: string): { owner: string; repo: string; prNumber: number } | null {
+  const match = prUrl.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:$|[?#])/);
+  return match ? { owner: match[1], repo: match[2], prNumber: Number.parseInt(match[3], 10) } : null;
 }
 
 function parsePrNumber(prUrl: string | null): number | null {

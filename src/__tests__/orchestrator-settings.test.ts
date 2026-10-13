@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DedupModule from "../dedup.js";
 import type * as OrchestratorSettingsModule from "../orchestrator-settings.js";
 import { testDb } from "./helpers/test-db.js";
@@ -231,5 +231,124 @@ describe("setRetryPolicy", () => {
     expect(settings.getRetryPolicy().reviewMaxTurns).toBe(60);
     settings.setRetryPolicy({});
     expect(settings.getRetryPolicy().reviewMaxTurns).toBe(30);
+  });
+});
+
+describe("getFlySessionsConfig", () => {
+  const KEYS = ["FLY_SESSIONS_APP", "FLY_SESSIONS_REGION", "FLY_SESSIONS_TOKEN"] as const;
+  beforeEach(() => { for (const k of KEYS) delete process.env[k]; });
+  afterEach(() => { for (const k of KEYS) delete process.env[k]; });
+
+  it("returns nulls when neither env nor row is set", () => {
+    expect(settings.getFlySessionsConfig()).toEqual({ token: null, app: null, region: null, source: { app: null, region: null } });
+  });
+
+  it("env wins over the row", () => {
+    settings.setOrchestratorSetting("flySessionsApp", "row-app");
+    settings.setOrchestratorSetting("flySessionsRegion", "row-region");
+    process.env.FLY_SESSIONS_APP = "env-app";
+    process.env.FLY_SESSIONS_REGION = "env-region";
+    expect(settings.getFlySessionsConfig()).toMatchObject({ app: "env-app", region: "env-region", source: { app: "env", region: "env" } });
+  });
+
+  it("uses the row when env is unset or empty, and sees a row change with no restart", () => {
+    process.env.FLY_SESSIONS_APP = "";
+    expect(settings.getFlySessionsConfig().app).toBeNull();
+    settings.setOrchestratorSetting("flySessionsApp", "row-app");
+    expect(settings.getFlySessionsConfig()).toMatchObject({ app: "row-app", source: { app: "settings" } });
+    settings.setOrchestratorSetting("flySessionsApp", "row-app-2");
+    expect(settings.getFlySessionsConfig().app).toBe("row-app-2");
+  });
+
+  it("resolves each field on its own: env app with a row region", () => {
+    process.env.FLY_SESSIONS_APP = "env-app";
+    settings.setOrchestratorSetting("flySessionsApp", "row-app");
+    settings.setOrchestratorSetting("flySessionsRegion", "row-region");
+    expect(settings.getFlySessionsConfig()).toMatchObject({
+      app: "env-app",
+      region: "row-region",
+      source: { app: "env", region: "settings" },
+    });
+  });
+
+  it("takes the token from FLY_SESSIONS_TOKEN only", () => {
+    settings.setOrchestratorSetting("flySessionsApp", "row-app");
+    expect(settings.getFlySessionsConfig().token).toBeNull();
+    process.env.FLY_SESSIONS_TOKEN = "tok";
+    expect(settings.getFlySessionsConfig().token).toBe("tok");
+  });
+});
+
+describe("RunnerBackend cache (AII-1243)", () => {
+  const KEYS = ["FLY_SESSIONS_APP", "FLY_SESSIONS_REGION", "FLY_SESSIONS_TOKEN"] as const;
+  beforeEach(() => { for (const k of KEYS) delete process.env[k]; });
+  afterEach(() => { for (const k of KEYS) delete process.env[k]; vi.restoreAllMocks(); });
+
+  it("falls back to env then row before any successful read, with source fallback", () => {
+    settings.setOrchestratorSetting("flySessionsApp", "row-app");
+    process.env.FLY_SESSIONS_REGION = "env-region";
+    expect(settings.getRunnerBackendSource()).toBe("fallback");
+    expect(settings.getFlySessionsConfig()).toMatchObject({ app: "row-app", region: "env-region" });
+  });
+
+  it("replaces the fallback with the object's value, and a null value is a value", async () => {
+    process.env.FLY_SESSIONS_APP = "env-app";
+    await settings.refreshRunnerBackendCache({ readFlyMachines: async () => ({ app: "obj-app", region: null }) });
+    expect(settings.getRunnerBackendSource()).toBe("restate");
+    expect(settings.getFlySessionsConfig()).toMatchObject({ app: "obj-app", region: null, source: { app: "restate", region: null } });
+  });
+
+  it("treats an empty object as no value yet and keeps the fallback", async () => {
+    process.env.FLY_SESSIONS_APP = "env-app";
+    await settings.refreshRunnerBackendCache({ readFlyMachines: async () => null });
+    expect(settings.getRunnerBackendSource()).toBe("fallback");
+    expect(settings.getFlySessionsConfig().app).toBe("env-app");
+  });
+
+  it("keeps the last value on failure and logs once per outage, re-arming after a success", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await settings.refreshRunnerBackendCache({ readFlyMachines: async () => ({ app: "a", region: "r" }) });
+    const down = async () => { throw new Error("ECONNREFUSED"); };
+    await settings.refreshRunnerBackendCache({ readFlyMachines: down });
+    await settings.refreshRunnerBackendCache({ readFlyMachines: down });
+    expect(settings.getFlySessionsConfig()).toMatchObject({ app: "a", region: "r" });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain("[runner-backend] Restate unreachable; serving last value");
+    await settings.refreshRunnerBackendCache({ readFlyMachines: async () => ({ app: "a", region: "r" }) });
+    await settings.refreshRunnerBackendCache({ readFlyMachines: down });
+    expect(warn).toHaveBeenCalledTimes(2);
+  });
+
+  it("never throws when the very first read fails", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await expect(settings.refreshRunnerBackendCache({ readFlyMachines: async () => { throw new Error("down"); } })).resolves.toBeUndefined();
+    expect(settings.getRunnerBackendSource()).toBe("fallback");
+  });
+
+  it("takes the token from env only and no RunnerBackend schema has a token field", async () => {
+    process.env.FLY_SESSIONS_TOKEN = "tok";
+    await settings.refreshRunnerBackendCache({ readFlyMachines: async () => ({ app: "a", region: "r" }) });
+    expect(settings.getFlySessionsConfig().token).toBe("tok");
+    const { RUNNER_BACKEND_SCHEMAS } = await import("../restate/runner-backend.js");
+    expect(Object.keys(RUNNER_BACKEND_SCHEMAS["fly-machines"].shape).sort()).toEqual(["app", "region"]);
+    expect(Object.keys(RUNNER_BACKEND_SCHEMAS["github-actions"].shape)).toEqual([]);
+  });
+
+  it("seeds fly-machines from env, else rows, once, and github-actions with {}", async () => {
+    settings.setOrchestratorSetting("flySessionsApp", "row-app");
+    settings.setOrchestratorSetting("flySessionsRegion", "row-region");
+    process.env.FLY_SESSIONS_APP = "env-app";
+    const sendSeed = vi.fn(async (_backend: string, _state: Record<string, unknown>, _key: string) => undefined);
+    await settings.seedRunnerBackends({ sendSeed });
+    expect(sendSeed).toHaveBeenCalledWith("fly-machines", { app: "env-app", region: "row-region" }, "seed:runner-backend:fly-machines");
+    expect(sendSeed).toHaveBeenCalledWith("github-actions", {}, "seed:runner-backend:github-actions");
+  });
+
+  it("skips the fly-machines seed when nothing is configured, and survives a failed send", async () => {
+    const sendSeed = vi.fn(async (_backend: string, _state: Record<string, unknown>, _key: string) => undefined);
+    await settings.seedRunnerBackends({ sendSeed });
+    expect(sendSeed.mock.calls.map((c) => c[0])).toEqual(["github-actions"]);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await expect(settings.seedRunnerBackends({ sendSeed: async () => { throw new Error("down"); } })).resolves.toBeUndefined();
   });
 });

@@ -23,9 +23,7 @@ describe("production review-fix GitHub effect", () => {
       },
     });
     const adapter = createReviewFixGithubAdapter({ credentials, fetchImpl: github.fetch });
-    expect(await adapter.hasAppliedApprovalEffect(scope, attemptId)).toBe(false);
     await adapter.applyApprovalEffect(scope, attemptId, result, [{ findingKey: "f1", disposition: "addressed" }]);
-    expect(await adapter.hasAppliedApprovalEffect(scope, attemptId)).toBe(true);
     await adapter.applyApprovalEffect(scope, attemptId, result, [{ findingKey: "f1", disposition: "addressed" }]);
     expect(github.calls.filter((call) => call.method === "POST")).toHaveLength(1);
     expect(comments[0].body).toContain("f1");

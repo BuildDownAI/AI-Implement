@@ -128,6 +128,7 @@ import {
   KgSnapshotMissingError,
   KgSnapshotStaleError,
   KgSnapshotTrackerRegressionError,
+  KgSnapshotHeldError,
   classifyRefreshAnomaly,
   buildLearningsComment,
 } from "../pipeline/steps/kg-snapshot-push.js";
@@ -839,7 +840,7 @@ describe("kgSnapshotPushStep — content-based regression guard", () => {
 
     const ctx = makeContext();
     ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 500 });
-    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef, dryRun: true }), noopReporter).catch((e) => e);
     expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
     expect(err.message).toContain("doc.nt");
   });
@@ -854,7 +855,7 @@ describe("kgSnapshotPushStep — content-based regression guard", () => {
 
     const ctx = makeContext();
     ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 654 });
-    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef, dryRun: true }), noopReporter).catch((e) => e);
     expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
     expect(err.message).toContain("issue.nt");
   });
@@ -869,7 +870,7 @@ describe("kgSnapshotPushStep — content-based regression guard", () => {
 
     const ctx = makeContext();
     ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 654 });
-    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef, dryRun: true }), noopReporter).catch((e) => e);
     expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
     expect(err.message).toContain("comment.nt");
   });
@@ -967,7 +968,7 @@ describe("kgSnapshotPushStep — content-based regression guard", () => {
 
     const ctx = makeContext();
     ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 654 });
-    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef, dryRun: true }), noopReporter).catch((e) => e);
     expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
     expect(err.message).toContain("issue.nt");
     expect(err.message).toContain("9534");
@@ -1004,7 +1005,7 @@ describe("kgSnapshotPushStep — content-based regression guard", () => {
 
       const ctx = makeContext();
       ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 654 });
-      const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+      const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef, dryRun: true }), noopReporter).catch((e) => e);
 
       expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
       const logCall = logSpy.mock.calls.find((c) => String(c[0]).includes("[kg-snapshot-push] parts:"));
@@ -1020,13 +1021,13 @@ describe("kgSnapshotPushStep — content-based regression guard", () => {
   });
 });
 
-describe("kgSnapshotPushStep — acceptNewBaseline flag (AII-628)", () => {
+describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
   let tmpDir: string;
   let bareDir: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "kgpush-baseline-"));
-    bareDir = mkdtempSync(join(tmpdir(), "kgpush-baseline-bare-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "kgpush-held-"));
+    bareDir = mkdtempSync(join(tmpdir(), "kgpush-held-bare-"));
     execSync("git init --bare", { cwd: bareDir, stdio: "ignore" });
     delete process.env.AI_IMPLEMENT_WORKSPACE_MODE;
     vi.stubGlobal("fetch", vi.fn());
@@ -1091,61 +1092,78 @@ describe("kgSnapshotPushStep — acceptNewBaseline flag (AII-628)", () => {
     };
   }
 
-  it("without the flag, a shrinking comment.nt still refuses exactly as today", async () => {
+  function setupShrink(parts: Record<string, string>, shrunk: Record<string, string>): string {
     initGitRepo(tmpDir);
-    commitPreviousSnapshot({ "comment.nt": makeLines(9995) });
-    const clonedRef = resolveHead(tmpDir);
-    writeWorkingTree({ "comment.nt": makeLines(3793) });
-
-    const ctx = makeContext();
-    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 744 });
-    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
-    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
-    expect(err.message).toContain("comment.nt");
-  });
-
-  it("with acceptNewBaseline, a shrinking comment.nt does not throw and the push proceeds", async () => {
-    initGitRepo(tmpDir);
-    commitPreviousSnapshot({ "comment.nt": makeLines(9995) });
+    commitPreviousSnapshot(parts);
     execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
     execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
     const clonedRef = resolveHead(tmpDir);
     redirectGithubRemote();
-    writeWorkingTree({ "comment.nt": makeLines(3793) });
+    writeWorkingTree(shrunk);
+    return clonedRef;
+  }
+
+  it("a soft-only shrink pushes, opens the PR, then throws KgSnapshotHeldError", async () => {
+    const clonedRef = setupShrink({ "comment.nt": makeLines(9995) }, { "comment.nt": makeLines(3793) });
     stubPrCreate(21, "https://github.com/acme/kg-repo/pull/21");
 
     const ctx = makeContext();
     ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 744 });
-    const result = await kgSnapshotPushStep.run(
-      ctx,
-      makeInputs({ clonedRef, acceptNewBaseline: true, baselineActor: "operator@example.com" }),
-      noopReporter,
-    );
-    expect(result.snapshotPushed).toBe(true);
-    expect(result.prNumber).toBe(21);
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotHeldError);
+    expect(err.code).toBe("KG_SNAPSHOT_HELD");
+    expect(err.prNumber).toBe(21);
+    expect(err.branchName).toMatch(/^kg-refresh\//);
+    expect(err.commitSha).toMatch(/^[0-9a-f]{40}$/);
+    expect(err.partTable).toEqual([{ part: "comment.nt", prev: "9995", new: "3793" }]);
+    // The branch really reached the remote.
+    const refs = execSync("git for-each-ref --format='%(refname)'", { cwd: bareDir }).toString();
+    expect(refs).toContain(`refs/heads/${err.branchName}`);
   });
 
-  it("with acceptNewBaseline, a general (non-tracker) 50% shrink also does not throw", async () => {
-    initGitRepo(tmpDir);
-    commitPreviousSnapshot({ "doc.nt": makeLines(100) });
-    execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
-    execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
-    const clonedRef = resolveHead(tmpDir);
-    redirectGithubRemote();
-    writeWorkingTree({ "doc.nt": makeLines(10) });
-    stubPrCreate(22, "https://github.com/acme/kg-repo/pull/22");
+  it("the learnings comment on a held PR says the shrink waits, never that the push was refused", async () => {
+    const clonedRef = setupShrink({ "comment.nt": makeLines(9995) }, { "comment.nt": makeLines(3793) });
+    stubPrCreate(26, "https://github.com/acme/kg-repo/pull/26");
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 201, json: async () => ({}), text: async () => "" } as Response);
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 744 });
+    await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch(() => undefined);
 
+    const commentCall = vi.mocked(fetch).mock.calls.find(([url]) => String(url).endsWith("/issues/26/comments"));
+    expect(commentCall).toBeTruthy();
+    const commentBody = JSON.parse((commentCall![1] as RequestInit).body as string).body as string;
+    expect(commentBody).toContain("**Class:** guard-held");
+    expect(commentBody).toContain("comment.nt: 9995 → 3793 lines");
+    expect(commentBody).toContain("waits for an operator decision");
+    expect(commentBody).not.toContain("refusing the push");
+  });
+
+  it("a general (non-tracker) 50% shrink is also held", async () => {
+    const clonedRef = setupShrink({ "doc.nt": makeLines(100) }, { "doc.nt": makeLines(10) });
+    stubPrCreate(22, "https://github.com/acme/kg-repo/pull/22");
     const ctx = makeContext();
     ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 5 });
-    const result = await kgSnapshotPushStep.run(
-      ctx,
-      makeInputs({ clonedRef, acceptNewBaseline: true, baselineActor: "operator@example.com" }),
-      noopReporter,
-    );
-    expect(result.snapshotPushed).toBe(true);
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotHeldError);
+    expect(err.prNumber).toBe(22);
   });
 
-  it("acceptNewBaseline never overrides a missing-part regression", async () => {
+  it("the held PR body states the verdict and carries no Baseline section or accepted marker", async () => {
+    const clonedRef = setupShrink({ "comment.nt": makeLines(9995) }, { "comment.nt": makeLines(3793) });
+    stubPrCreate(25, "https://github.com/acme/kg-repo/pull/25");
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 744 });
+    await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch(() => undefined);
+
+    const prCall = vi.mocked(fetch).mock.calls.find(([url]) => String(url).includes("/pulls"));
+    expect(prCall).toBeTruthy();
+    const body = JSON.parse((prCall![1] as RequestInit).body as string);
+    expect(body.body).toContain("Guard verdict:** held — a shrink waits for an operator decision");
+    expect(body.body).not.toContain("### Baseline");
+    expect(body.body).not.toContain("← accepted");
+  });
+
+  it("a missing part is a hard refusal: no push, no PR", async () => {
     initGitRepo(tmpDir);
     commitPreviousSnapshot({ "issue.nt": makeLines(100) });
     const clonedRef = resolveHead(tmpDir);
@@ -1154,117 +1172,65 @@ describe("kgSnapshotPushStep — acceptNewBaseline flag (AII-628)", () => {
 
     const ctx = makeContext();
     ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 100 });
-    const err = await kgSnapshotPushStep
-      .run(ctx, makeInputs({ clonedRef, acceptNewBaseline: true, baselineActor: "operator@example.com" }), noopReporter)
-      .catch((e) => e);
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
     expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
     expect(err.message).toContain("missing");
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
   });
 
-  it("acceptNewBaseline is a no-op when nothing actually shrank — no log line, no Baseline section", async () => {
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
-    try {
-      initGitRepo(tmpDir);
-      commitPreviousSnapshot({ "doc.nt": makeLines(100) });
-      execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
-      execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
-      const clonedRef = resolveHead(tmpDir);
-      redirectGithubRemote();
-      writeWorkingTree({ "doc.nt": makeLines(110) });
-      stubPrCreate(23, "https://github.com/acme/kg-repo/pull/23");
-
-      const ctx = makeContext();
-      ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 5 });
-      const result = await kgSnapshotPushStep.run(
-        ctx,
-        makeInputs({ clonedRef, acceptNewBaseline: true, baselineActor: "operator@example.com" }),
-        noopReporter,
-      );
-      expect(result.snapshotPushed).toBe(true);
-      const acceptedCall = logSpy.mock.calls.find((c) => String(c[0]).includes("baseline accepted"));
-      expect(acceptedCall).toBeUndefined();
-    } finally {
-      logSpy.mockRestore();
-    }
-  });
-
-  it("logs '[kg-refresh] baseline accepted by <email>' exactly once when a shrink is accepted", async () => {
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
-    try {
-      initGitRepo(tmpDir);
-      commitPreviousSnapshot({ "comment.nt": makeLines(9995) });
-      execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
-      execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
-      const clonedRef = resolveHead(tmpDir);
-      redirectGithubRemote();
-      writeWorkingTree({ "comment.nt": makeLines(3793) });
-      stubPrCreate(24, "https://github.com/acme/kg-repo/pull/24");
-
-      const ctx = makeContext();
-      ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 744 });
-      await kgSnapshotPushStep.run(
-        ctx,
-        makeInputs({ clonedRef, acceptNewBaseline: true, baselineActor: "operator@example.com" }),
-        noopReporter,
-      );
-      const acceptedCalls = logSpy.mock.calls.filter((c) => String(c[0]).includes("baseline accepted"));
-      expect(acceptedCalls).toHaveLength(1);
-      expect(String(acceptedCalls[0][0])).toBe("[kg-refresh] baseline accepted by operator@example.com");
-    } finally {
-      logSpy.mockRestore();
-    }
-  });
-
-  it("the refresh PR body carries a ### Baseline section naming the actor and the shrunk part", async () => {
+  it("a missing part alongside a soft shrink is still a hard refusal", async () => {
     initGitRepo(tmpDir);
-    commitPreviousSnapshot({ "comment.nt": makeLines(9995) });
-    execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
-    execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+    commitPreviousSnapshot({ "a.nt": makeLines(100), "b.nt": makeLines(100) });
     const clonedRef = resolveHead(tmpDir);
-    redirectGithubRemote();
-    writeWorkingTree({ "comment.nt": makeLines(3793) });
-    stubPrCreate(25, "https://github.com/acme/kg-repo/pull/25");
+    rmSync(join(tmpDir, "snapshot", "parts", "b.nt"));
+    writeWorkingTree({ "a.nt": makeLines(10) });
 
     const ctx = makeContext();
-    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 744 });
-    await kgSnapshotPushStep.run(
-      ctx,
-      makeInputs({ clonedRef, acceptNewBaseline: true, baselineActor: "operator@example.com" }),
-      noopReporter,
-    );
-
-    // The step also posts a learnings comment; assert on the PR-create call, not the count.
-    const prCall = vi.mocked(fetch).mock.calls.find(([url]) => String(url).includes("/pulls"));
-    expect(prCall).toBeTruthy();
-    const [, req] = prCall!;
-    const body = JSON.parse((req as RequestInit).body as string);
-    expect(body.body).toContain("### Baseline");
-    // The accepted shrink is marked inline on its own table row (AII-628).
-    expect(body.body).toMatch(/\| comment\.nt \|[^\n]*← accepted \|/);
-    expect(body.body).toContain("operator@example.com");
-    expect(body.body).toContain("comment.nt");
-    expect(body.body).toContain("**Guard verdict:** clean (baseline accepted)");
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 1 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
   });
 
-  it("without acceptNewBaseline, the refresh PR body carries no ### Baseline section", async () => {
+  it("guard 0 (tracker fetch failed) still refuses with no push", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "issue.nt": makeLines(100) });
+    const clonedRef = resolveHead(tmpDir);
+    writeWorkingTree({ "issue.nt": makeLines(100) });
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: false });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
+  it("a dry run with a soft-only shrink refuses with the table and never holds", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "comment.nt": makeLines(9995) });
+    const clonedRef = resolveHead(tmpDir);
+    writeWorkingTree({ "comment.nt": makeLines(3793) });
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 744 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef, dryRun: true }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(err.partTable).toEqual([{ part: "comment.nt", prev: "9995", new: "3793" }]);
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
+  it("no regression: pushes and returns normally with a clean verdict body", async () => {
     initGitRepo(tmpDir);
     execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
     execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
     const clonedRef = resolveHead(tmpDir);
     redirectGithubRemote();
-    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
-    writeFileSync(join(tmpDir, "snapshot", "parts", "docs.nt"), makeLines(1));
-    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
-    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-12T10:00:00Z");
+    writeWorkingTree({ "docs.nt": makeLines(1) });
     stubPrCreate(26, "https://github.com/acme/kg-repo/pull/26");
 
     const ctx = makeContext();
     const result = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter);
     expect(result.snapshotPushed).toBe(true);
-
     const [, req] = vi.mocked(fetch).mock.calls[0];
     const body = JSON.parse((req as RequestInit).body as string);
-    expect(body.body).not.toContain("### Baseline");
     expect(body.body).toContain("**Guard verdict:** clean");
   });
 });
@@ -2106,36 +2072,6 @@ describe("applyWiring for kg-snapshot-push", () => {
     expect(inputs.repoRepo).toBe("repo");
   });
 
-  it("wires acceptNewBaseline and baselineActor from context (AII-628)", () => {
-    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
-      existsSyncImpl: () => false,
-      readFileSyncImpl: () => KG_REFRESH_PIPELINE_YAML,
-    });
-
-    const step = pipeline.steps.find((s) => s.id === "kg-snapshot-push");
-    const ctx = makeContext({ branch: "main", kgAcceptNewBaseline: true, kgBaselineActor: "operator@example.com" });
-    ctx.setOutputs("clone", { workspaceDir: "/ws" });
-
-    const inputs = ctx.resolveInputs(step!.inputs) as { acceptNewBaseline: boolean; baselineActor: string };
-    expect(inputs.acceptNewBaseline).toBe(true);
-    expect(inputs.baselineActor).toBe("operator@example.com");
-  });
-
-  it("defaults acceptNewBaseline to false and baselineActor to undefined when absent from context", () => {
-    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
-      existsSyncImpl: () => false,
-      readFileSyncImpl: () => KG_REFRESH_PIPELINE_YAML,
-    });
-
-    const step = pipeline.steps.find((s) => s.id === "kg-snapshot-push");
-    const ctx = makeContext({ branch: "main" });
-    ctx.setOutputs("clone", { workspaceDir: "/ws" });
-
-    const inputs = ctx.resolveInputs(step!.inputs) as { acceptNewBaseline: boolean; baselineActor: string | undefined };
-    expect(inputs.acceptNewBaseline).toBe(false);
-    expect(inputs.baselineActor).toBeUndefined();
-  });
-
   it("wires scope from kg-scope-reconcile outputs", () => {
     const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
       existsSyncImpl: () => false,
@@ -2338,6 +2274,54 @@ describe("runKgRefresh", () => {
     const failureResult = capturedResults.find((r) => r.failureCode === "KG_SNAPSHOT_TRACKER_REGRESSION");
     expect(failureResult?.guardVerdict).toBe("refused");
     expect(failureResult?.partTable).toEqual([{ part: "comment.nt", prev: "9995", new: "3793" }]);
+    expect(failureResult).not.toHaveProperty("snapshotPr");
+  });
+
+  it("reports a held shrink as a failure with guardVerdict 'held', the PR fields and the part table (AII-1253)", async () => {
+    process.env.RUNNER_CALLBACK_URL = "http://orch";
+    process.env.RUN_TOKEN = "run-tok";
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const captured: Array<Record<string, unknown>> = [];
+    try {
+      const result = await runKgRefresh({
+        workspaceDir: tmpDir,
+        stepsOverride: {
+          clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+          kgIngest: makeStepModule({ statsFile: null }),
+          kgSnapshotPush: makeStepModule(
+            {},
+            new KgSnapshotHeldError(
+              "content regression detected — comment.nt: shrank",
+              [{ part: "comment.nt", prev: "9995", new: "3793" }],
+              21,
+              "deadbeef",
+              "kg-refresh/20260912T100000Z",
+            ),
+          ),
+        },
+        reporter: { report: async () => undefined },
+        fetchImpl: async (_url, init) => {
+          captured.push(init?.body ? JSON.parse(init.body as string) : {});
+          return new Response(JSON.stringify({ acknowledged: true }), { status: 200 });
+        },
+      });
+      expect(result.exitCode).toBe(1);
+      const failure = captured.find((r) => r.failureCode === "KG_SNAPSHOT_HELD");
+      expect(failure).toMatchObject({
+        outcome: "failure",
+        guardVerdict: "held",
+        snapshotPr: 21,
+        snapshotCommit: "deadbeef",
+        snapshotBranch: "kg-refresh/20260912T100000Z",
+        partTable: [{ part: "comment.nt", prev: "9995", new: "3793" }],
+      });
+      expect(captured.some((r) => r.outcome === "success")).toBe(false);
+      expect(errSpy.mock.calls.some((c) => String(c[0]).includes("[kg-refresh] run failed: KG_SNAPSHOT_HELD"))).toBe(true);
+    } finally {
+      errSpy.mockRestore();
+      delete process.env.RUNNER_CALLBACK_URL;
+      delete process.env.RUN_TOKEN;
+    }
   });
 
   it("omits guardVerdict and partTable for a real (non-dry-run) failure that is not a tracker regression", async () => {
@@ -2504,7 +2488,7 @@ describe("kg-refresh execution path selection (resolveExecutionPath with github-
   it("shadow mode returns both, which kg-refresh collapses to github-actions", () => {
     const resolved = resolveExecutionPath("shadow", "github-actions");
     expect(resolved).toBe("both");
-    // dispatchKgRefreshRun collapses "both" to "github-actions" to prevent two
+    // the KG refresh senders collapses "both" to "github-actions" to prevent two
     // concurrent ingest runs racing to push the same snapshot commit.
     const effective = resolved === "both" ? "github-actions" : resolved;
     expect(effective).toBe("github-actions");
@@ -3263,10 +3247,10 @@ describe("runKgRefresh — KgIngestError maps to KG_INGEST_FAILED", () => {
 });
 
 // ── GHA kg-refresh dispatch — runner_image resolution ────────────────────────
-// Verifies that dispatchKgRefreshRun's GHA branch forwards runner_image using
+// Verifies that the KG refresh senders's GHA branch forwards runner_image using
 // the same channel-policy helper as the implement dispatch path.
 //
-// dispatchKgRefreshRun is not exported (index.ts is the application entry
+// the KG refresh senders is not exported (index.ts is the application entry
 // point with side-effectful startup; it has no exports). The tests below cover
 // two layers:
 //   1. resolveRunnerImageForDispatch in isolation — ensures the helper returns
@@ -3362,8 +3346,8 @@ describe("GHA kg-refresh dispatch — runner_image resolution via resolveRunnerI
 
 // ── GHA kg-refresh dispatch — inputs shape contract ───────────────────────────
 // Documents the expected shape of the workflow_dispatch inputs that
-// dispatchKgRefreshRun sends to claude-implement.yml with runner_phase=kg-refresh.
-// dispatchKgRefreshRun is not exported (index.ts is the application entry point
+// the KG refresh senders sends to claude-implement.yml with runner_phase=kg-refresh.
+// the KG refresh senders is not exported (index.ts is the application entry point
 // with side-effectful startup). These tests verify the contract by constructing
 // the expected inputs object inline, paired with template tests that verify
 // claude-implement.yml declares the matching inputs.
@@ -5392,6 +5376,20 @@ describe("classifyRefreshAnomaly", () => {
     const result = classifyRefreshAnomaly({ ...clean, guardVerdict: "refused: shrink below threshold" });
     expect(result?.class).toBe("guard-refused");
     expect(result?.facts.join(" ")).toContain("refused: shrink below threshold");
+  });
+
+  it("classifies a held verdict as guard-held, naming the shrunk parts", () => {
+    const result = classifyRefreshAnomaly({
+      ...clean,
+      guardVerdict: "held",
+      partRows: [
+        { part: "comment.nt", prev: "9995", next: "3793", delta: "-6202" },
+        { part: "docs.nt", prev: "100", next: "130", delta: "+30" },
+      ],
+    });
+    expect(result?.class).toBe("guard-held");
+    expect(result?.facts).toContain("comment.nt: 9995 → 3793 lines (-6202)");
+    expect(result?.subjects).toEqual(["comment.nt"]);
   });
 
   it("classifies count-step on a >20% growth", () => {

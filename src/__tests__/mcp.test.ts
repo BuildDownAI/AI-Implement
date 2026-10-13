@@ -7,6 +7,7 @@ import { SidecarMemoryProvider, sidecarHealth, sidecarHealthFields, setKgMemoryP
 import type { MemoryProvider, KgToolResult } from "../kg-provider.js";
 import { setKgRefreshToolDeps } from "../restate/tools.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
+import { refreshRunnerBackendCache } from "../orchestrator-settings.js";
 import type { PreflightCheckResult } from "../kg-refresh.js";
 import type { Caller } from "../mcp-identity.js";
 import { makeMapping } from "./helpers/builders.js";
@@ -36,6 +37,7 @@ import {
   triggerKgRefreshTool,
   setRunnerModeTool,
   setFlyMachineProfileTool,
+  setRunProfileTool,
   pauseProjectTool,
   addProjectTool,
   triggerWorkflowSyncTool,
@@ -102,6 +104,7 @@ const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
   trigger_kg_refresh: triggerKgRefreshTool,
   set_runner_mode: setRunnerModeTool,
   set_fly_machine_profile: setFlyMachineProfileTool,
+  set_run_profile: setRunProfileTool,
   pause_project: pauseProjectTool,
   add_project: addProjectTool,
   trigger_workflow_sync: triggerWorkflowSyncTool,
@@ -115,6 +118,7 @@ const WRITE_TOOL_NAMES = new Set([
   "trigger_kg_refresh",
   "set_runner_mode",
   "set_fly_machine_profile",
+  "set_run_profile",
   "pause_project",
   "add_project",
   "trigger_workflow_sync",
@@ -136,15 +140,14 @@ const DISCOVERED_TOOLS = Object.keys(TOOL_HANDLERS).map((name) => ({
 // the Restate tier (tools.restate.test.ts's alwaysReplay counter fixture).
 // AII-683: the kg-refresh handlers call the KgRepo object / KgRefresh workflow natively; these
 // fakes stand in for both clients. Reset in beforeEach.
-let kgTriggerFake: ((opts: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string }) => Promise<unknown>) | null = null;
+let kgTriggerFake: ((opts: { actorEmail?: string }) => Promise<unknown>) | null = null;
 
 function fakeRestateContext(handlerName: string): restate.Context {
   return {
     request: () => ({ target: { handler: handlerName } }),
     objectClient: () => ({
-      trigger: (opts: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string }) => kgTriggerFake!(opts),
+      trigger: (opts: { actorEmail?: string }) => kgTriggerFake!(opts),
       status: async () => null,
-      lastAdminDryRun: async () => null,
       get: async () => ({ config: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000 }, source: "default" }),
     }),
     run: async (name: unknown, action?: unknown) => {
@@ -172,11 +175,12 @@ vi.mock("../runner-mode.js", () => ({
   VALID_RUNNER_MODES: ["default", "gha", "fly", "local", "shadow"],
   getRunnerMode: vi.fn(),
   getKgMaterializeDirect: vi.fn(() => ({ enabled: true, source: "db" as const })),
-  getKgFlyMachineOverride: vi.fn(() => ({})),
-  setKgFlyMachineOverride: vi.fn(),
+  getKgExecutionMode: vi.fn(() => ({ mode: "github-actions" as const, source: "db" as const })),
+  resolveKgBackend: vi.fn(() => ({ mode: "github-actions" as const, source: "kg-setting" as const })),
 }));
 
-vi.mock("../config.js", () => ({
+vi.mock("../config.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../config.js")>()),
   getMappings: vi.fn(() => ({})),
 }));
 
@@ -204,6 +208,11 @@ vi.mock("../report-card.js", () => ({
 vi.mock("../deploy-hold.js", () => ({
   getDeployStartedAt: vi.fn(() => null),
   isDeployHeld: vi.fn(() => false),
+}));
+
+vi.mock("../orchestrator-settings.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../orchestrator-settings.js")>()),
+  refreshRunnerBackendCache: vi.fn(async () => {}),
 }));
 
 vi.mock("../restate/tools-client.js", () => ({
@@ -450,7 +459,7 @@ async function callMcp(
   providerDiagnostic?: string | null,
   _legacyRunKgRefreshPreflight?: unknown,
   _legacyGetKgStatus?: unknown,
-  triggerKgRefresh?: (dryRun?: boolean, acceptNewBaseline?: boolean, actorEmail?: string) => Promise<{ status: number; body: Record<string, unknown> }>,
+  triggerKgRefresh?: (actorEmail?: string) => Promise<{ status: number; body: Record<string, unknown> }>,
   writeContext?: {
     setRunnerMode?: (patch: { mode?: string }) => { status: number; body: Record<string, unknown> };
     pauseProject?: (teamKey: string, paused: boolean) => { status: number; body: Record<string, unknown> };
@@ -475,8 +484,8 @@ async function callMcp(
       readStatusRecord: () => null,
       readServedStamp: async () => null,
     });
-    kgTriggerFake = async ({ dryRun, acceptNewBaseline, actorEmail }) => {
-      await triggerKgRefresh(dryRun, acceptNewBaseline, actorEmail);
+    kgTriggerFake = async ({ actorEmail }) => {
+      await triggerKgRefresh(actorEmail);
       return { triggerId: "trig-1" };
     };
   }
@@ -1403,11 +1412,13 @@ describe("handleMcpRequest", () => {
         ...sidecarHealthFields(),
         servedStamp: "b",
         lastRefresh,
-        lastDryRun: null,
         stage: "serving",
         materialize: "direct",
+        executionMode: { effective: "github-actions", source: "kg-setting", setting: "github-actions" },
+        runProfile: { backend: "github-actions", config: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000 }, source: "default" },
         flyMachine: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000, source: "default" },
         restate: null,
+        currentRun: null,
       };
 
       const result = await callMcp(
@@ -1869,7 +1880,7 @@ describe("handleMcpRequest", () => {
 
 
 
-    it("as admin, dryRun:true is passed through to triggerKgRefresh (AII-632)", async () => {
+    it.each(["dryRun", "acceptNewBaseline"])("as admin, %s:true is refused with option-removed and triggerKgRefresh is never called (AII-1263)", async (option) => {
       mockRole("admin");
       const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
 
@@ -1879,7 +1890,7 @@ describe("handleMcpRequest", () => {
         null,
         BASE_URL,
         "POST",
-        JSON.stringify({ jsonrpc: "2.0", id: 45, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: { dryRun: true } } }),
+        JSON.stringify({ jsonrpc: "2.0", id: 45, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: { [option]: true } } }),
         undefined,
         undefined,
         undefined,
@@ -1888,11 +1899,11 @@ describe("handleMcpRequest", () => {
 
       expect(result.statusCode).toBe(200);
       const parsed = JSON.parse(result.body);
-      expect(parsed.result.isError).not.toBe(true);
-      expect(triggerMock).toHaveBeenCalledWith(true, false, "user@example.com");
+      expect(JSON.parse(parsed.result.content[0].text)).toEqual({ status: 400, body: { error: "option-removed", option } });
+      expect(triggerMock).not.toHaveBeenCalled();
     });
 
-    it("as admin, omitting dryRun passes false through to triggerKgRefresh", async () => {
+    it.each([{}, { dryRun: false, acceptNewBaseline: false }])("as admin, %j runs a real refresh with the actor's email", async (args) => {
       mockRole("admin");
       const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
 
@@ -1902,59 +1913,14 @@ describe("handleMcpRequest", () => {
         null,
         BASE_URL,
         "POST",
-        JSON.stringify({ jsonrpc: "2.0", id: 46, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: {} } }),
+        JSON.stringify({ jsonrpc: "2.0", id: 46, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: args } }),
         undefined,
         undefined,
         undefined,
         triggerMock,
       );
 
-      expect(triggerMock).toHaveBeenCalledWith(false, false, "user@example.com");
-    });
-
-
-
-    it("as admin, acceptNewBaseline:true is passed through to triggerKgRefresh with the actor's email (AII-628)", async () => {
-      mockRole("admin");
-      const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
-
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        null,
-        BASE_URL,
-        "POST",
-        JSON.stringify({ jsonrpc: "2.0", id: 49, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: { acceptNewBaseline: true } } }),
-        undefined,
-        undefined,
-        undefined,
-        triggerMock,
-      );
-
-      expect(result.statusCode).toBe(200);
-      const parsed = JSON.parse(result.body);
-      expect(parsed.result.isError).not.toBe(true);
-      expect(triggerMock).toHaveBeenCalledWith(false, true, "user@example.com");
-    });
-
-    it("as admin, omitting acceptNewBaseline passes false through to triggerKgRefresh", async () => {
-      mockRole("admin");
-      const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
-
-      await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        null,
-        BASE_URL,
-        "POST",
-        JSON.stringify({ jsonrpc: "2.0", id: 50, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: {} } }),
-        undefined,
-        undefined,
-        undefined,
-        triggerMock,
-      );
-
-      expect(triggerMock).toHaveBeenCalledWith(false, false, "user@example.com");
+      expect(triggerMock).toHaveBeenCalledWith("user@example.com");
     });
 
     it("as user, acceptNewBaseline:true is refused and triggerKgRefresh is never called (AII-628)", async () => {
@@ -2936,5 +2902,69 @@ describe("write idempotency key names one request, not one JSON-RPC id (AII-719,
     expect(result.statusCode).toBe(200);
     expect(JSON.parse(result.body).error).toBeUndefined();
     expect(toolsClientMock.callTool).toHaveBeenCalledWith("get_runner_mode", {}, expect.objectContaining({ kind: "human" }), undefined);
+  });
+});
+
+describe("/mcp runner-backend writes (AII-1271)", () => {
+  const callNamed = (name: string, args: Record<string, unknown>) =>
+    callMcp(
+      { authorization: "Bearer tok" },
+      true,
+      null,
+      BASE_URL,
+      "POST",
+      JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }),
+    );
+  let callToolMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    callToolMock = toolsClientMock.callTool as ReturnType<typeof vi.fn>;
+    mockRole("admin");
+    (refreshRunnerBackendCache as ReturnType<typeof vi.fn>).mockClear();
+  });
+
+  it("set_run_profile reaches the tools service for an admin", async () => {
+    callToolMock.mockResolvedValueOnce({ status: "ok", content: [{ type: "text", text: "{}" }] });
+    const result = await callNamed("set_run_profile", { pipeline: "kg-refresh", backend: "github-actions", patch: {} });
+    expect(JSON.parse(result.body).error).toBeUndefined();
+    expect(callToolMock).toHaveBeenCalledWith("set_run_profile", expect.any(Object), expect.objectContaining({ kind: "human" }), undefined);
+    expect(refreshRunnerBackendCache).not.toHaveBeenCalled();
+  });
+
+  it("set_run_profile is refused for a user role by the tool wrapper", async () => {
+    mockRole("user");
+    const result = await callNamed("set_run_profile", { pipeline: "kg-refresh", backend: "github-actions", patch: {} });
+    expect(JSON.parse(result.body).result.isError).toBe(true);
+  });
+
+  it("set_runner_backend refreshes the cache after callTool resolves and before the response", async () => {
+    const log: string[] = [];
+    callToolMock.mockImplementationOnce(async () => {
+      log.push("callTool");
+      return { status: "ok", content: [{ type: "text", text: "{}" }] };
+    });
+    (refreshRunnerBackendCache as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
+      log.push("refresh");
+    });
+    const result = await callNamed("set_runner_backend", { backend: "fly-machines", patch: { app: "x" } });
+    log.push("response");
+    expect(result.statusCode).toBe(200);
+    expect(log).toEqual(["callTool", "refresh", "response"]);
+  });
+
+  it.each([
+    ["deploy-held", { status: "deploy-held" }],
+    ["unavailable", { status: "unavailable" }],
+    ["isError", { status: "ok", content: [], isError: true }],
+  ])("set_runner_backend skips the refresh on %s", async (_label, outcome) => {
+    callToolMock.mockResolvedValueOnce(outcome);
+    await callNamed("set_runner_backend", { backend: "fly-machines", patch: {} });
+    expect(refreshRunnerBackendCache).not.toHaveBeenCalled();
+  });
+
+  it("another write does not trigger the refresh", async () => {
+    callToolMock.mockResolvedValueOnce({ status: "ok", content: [{ type: "text", text: "{}" }] });
+    await callNamed("set_runner_mode", { mode: "fly" });
+    expect(refreshRunnerBackendCache).not.toHaveBeenCalled();
   });
 });

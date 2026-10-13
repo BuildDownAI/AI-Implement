@@ -1944,6 +1944,156 @@ describe("admin mappings", () => {
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toContain("gap-analysis");
   });
+
+  it("round-trips trustedReviewAuthors, trimmed and lowercased", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRA1", owner: "org", repo: "app",
+      trustedReviewAuthors: ["  Codex-Reviewer[bot]  "],
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).trustedReviewAuthors).toEqual(["codex-reviewer[bot]"]);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).TRA1.trustedReviewAuthors).toEqual(["codex-reviewer[bot]"]);
+  });
+
+  it("treats absent trustedReviewAuthors as null on a new mapping", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRA2", owner: "org", repo: "app",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).trustedReviewAuthors).toBeNull();
+  });
+
+  it("preserves existing trustedReviewAuthors when omitted from update", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRA3", owner: "org", repo: "app",
+      trustedReviewAuthors: ["codex-reviewer[bot]"],
+    }, token);
+
+    const update = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRA3", owner: "org", repo: "app-updated",
+    }, token);
+    expect(update.statusCode).toBe(202);
+    expect(JSON.parse(update.body).trustedReviewAuthors).toEqual(["codex-reviewer[bot]"]);
+  });
+
+  it("stores reviewProcess claude-code-review on a Legacy project, and ai-implement or null as null", async () => {
+    const token = await login("secret");
+    const post = (reviewProcess?: unknown) => request("/api/mappings", "POST", "secret", {
+      teamKey: "RP1", owner: "org", repo: "app",
+      ...(reviewProcess === undefined ? {} : { reviewProcess }),
+    }, token);
+
+    const created = await post("claude-code-review");
+    expect(created.statusCode).toBe(202);
+    expect(JSON.parse(created.body).reviewProcess).toBe("claude-code-review");
+
+    const kept = await post();
+    expect(JSON.parse(kept.body).reviewProcess).toBe("claude-code-review");
+
+    const defaulted = await post("ai-implement");
+    expect(JSON.parse(defaulted.body).reviewProcess).toBeNull();
+
+    await post("claude-code-review");
+    const reset = await post(null);
+    expect(JSON.parse(reset.body).reviewProcess).toBeNull();
+  });
+
+  it("stores reviewProcess claude-code-review-repository-fix", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RP4", owner: "org", repo: "app", reviewProcess: "claude-code-review-repository-fix",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).reviewProcess).toBe("claude-code-review-repository-fix");
+  });
+
+  it("stores null reviewProcess when absent on a new mapping", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", { teamKey: "RP2", owner: "org", repo: "app" }, token);
+    expect(JSON.parse(res.body).reviewProcess).toBeNull();
+  });
+
+  it("rejects an unknown reviewProcess with the exact error", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RP3", owner: "org", repo: "app", reviewProcess: "github",
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe('reviewProcess invalid: must be null, "ai-implement", "claude-code-review", or "claude-code-review-repository-fix"');
+  });
+
+  it("resets trustedReviewAuthors to the null default via an explicit null", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRA4", owner: "org", repo: "app",
+      trustedReviewAuthors: ["codex-reviewer[bot]"],
+    }, token);
+
+    const reset = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRA4", owner: "org", repo: "app",
+      trustedReviewAuthors: null,
+    }, token);
+    expect(reset.statusCode).toBe(202);
+    expect(JSON.parse(reset.body).trustedReviewAuthors).toBeNull();
+  });
+
+  it("rejects a non-array, non-null trustedReviewAuthors with the exact error prefix", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRABAD1", owner: "org", repo: "app",
+      trustedReviewAuthors: "codex-reviewer[bot]",
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("trustedReviewAuthors invalid: must be an array of strings or null");
+  });
+
+  it("rejects an empty-string entry (post-trim) with the exact error prefix", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRABAD2", owner: "org", repo: "app",
+      trustedReviewAuthors: ["   "],
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("trustedReviewAuthors invalid: [0] must not be empty");
+  });
+
+  it("rejects an entry that fails the login regex with the exact error prefix", async () => {
+    const token = await login("secret");
+    for (const bad of ["Codex Reviewer", "-bad", "bot]"]) {
+      const res = await request("/api/mappings", "POST", "secret", {
+        teamKey: "TRABAD3", owner: "org", repo: "app",
+        trustedReviewAuthors: [bad],
+      }, token);
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toBe(`trustedReviewAuthors invalid: [0] "${bad}" is not a valid GitHub login`);
+    }
+  });
+
+  it("rejects more than 20 entries with the exact error prefix", async () => {
+    const token = await login("secret");
+    const many = Array.from({ length: 21 }, (_, i) => `bot-${i}`);
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRABAD4", owner: "org", repo: "app",
+      trustedReviewAuthors: many,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("trustedReviewAuthors invalid: too many entries (21); maximum is 20");
+  });
+
+  it("rejects a duplicate entry, including a duplicate created by lowercasing, with the exact error prefix", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRABAD5", owner: "org", repo: "app",
+      trustedReviewAuthors: ["Foo", "foo"],
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe('trustedReviewAuthors invalid: duplicate entry "foo"');
+  });
 });
 
 describe("admin runner-mode", () => {
@@ -2139,6 +2289,35 @@ describe("admin kg materialize-mode", () => {
     expect(JSON.parse(get.body).direct).toBe(false);
   });
 
+  it("GET /api/kg/execution-mode reports the default and its source, 501 without KG refresh", async () => {
+    const token = await login("secret");
+    expect((await kgRequest("/api/kg/execution-mode", "GET", token, undefined, false)).statusCode).toBe(501);
+    const res = await kgRequest("/api/kg/execution-mode", "GET", token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ mode: "github-actions", source: "default" });
+  });
+
+  it("POST /api/kg/execution-mode persists for an admin, and a follow-up GET reports source db", async () => {
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/execution-mode", "POST", token, { mode: "fly-machines" });
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ mode: "fly-machines", source: "db" });
+    const get = await kgRequest("/api/kg/execution-mode", "GET", token);
+    expect(JSON.parse(get.body)).toEqual({ mode: "fly-machines", source: "db" });
+  });
+
+  it.each([{ mode: "both" }, { mode: "local-docker" }, { mode: 3 }, {}])("POST /api/kg/execution-mode rejects %j with 400", async (body) => {
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/execution-mode", "POST", token, body);
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("POST /api/kg/execution-mode refuses a non-admin session with 403", async () => {
+    const token = adminSession.createSession({ email: "reader@eudoxus.ai", sub: "google|reader", provider: "google", name: "Reader" });
+    const res = await kgRequest("/api/kg/execution-mode", "POST", token, { mode: "fly-machines" });
+    expect(res.statusCode).toBe(403);
+  });
+
   it("rejects an unauthenticated request with 401", async () => {
     const req = new MockRequest("/api/kg/materialize-mode", "GET");
     const res = new MockResponse();
@@ -2148,9 +2327,9 @@ describe("admin kg materialize-mode", () => {
   });
 });
 
-describe("admin kg refresh dry-run (AII-635)", () => {
+describe("admin kg refresh options removed (AII-1263)", () => {
   const kgRefreshDeps = {
-    trigger: vi.fn(async (_opts?: { dryRun?: boolean }) => ({ status: 202, body: { accepted: true } })),
+    trigger: vi.fn(async (_opts?: { ref?: string; actorEmail?: string }) => ({ status: 202, body: { accepted: true } })),
     status: vi.fn(),
     cancel: vi.fn(),
   };
@@ -2159,9 +2338,6 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     kgRefreshDeps.trigger.mockClear();
     kgRefreshDeps.status.mockReset();
   });
-
-  // The listed SSO admin the suite seeds (see adminConfig): an identity-bearing session.
-  const ssoAdmin = { email: "ada@eudoxus.ai", sub: "google|123", provider: "google" };
 
   async function kgRequest(
     url: string,
@@ -2184,13 +2360,12 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     return { statusCode: res.statusCode, body: res.body };
   }
 
-  it("POST /api/kg/refresh with { dryRun: true } reaches the trigger with dryRun and echoes it", async () => {
+  it.each(["dryRun", "acceptNewBaseline"])("POST /api/kg/refresh with { %s: true } answers 400 option-removed and does not trigger", async (option) => {
     const token = await login("secret");
-    const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: true });
-    expect(res.statusCode).toBe(202);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledTimes(1);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith({ dryRun: true });
-    expect(JSON.parse(res.body)).toMatchObject({ accepted: true, dryRun: true });
+    const res = await kgRequest("/api/kg/refresh", "POST", token, { [option]: true });
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body)).toEqual({ error: "option-removed", option });
+    expect(kgRefreshDeps.trigger).not.toHaveBeenCalled();
   });
 
   it("POST /api/kg/refresh with no body reaches the trigger with no option — the unchanged real refresh", async () => {
@@ -2199,7 +2374,7 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     expect(res.statusCode).toBe(202);
     expect(kgRefreshDeps.trigger).toHaveBeenCalledTimes(1);
     expect(kgRefreshDeps.trigger.mock.calls[0]).toHaveLength(0);
-    expect(JSON.parse(res.body)).toMatchObject({ accepted: true, dryRun: false });
+    expect(JSON.parse(res.body)).toMatchObject({ accepted: true });
   });
 
   it("POST /api/kg/refresh with { dryRun: false } is the real refresh", async () => {
@@ -2207,7 +2382,7 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: false });
     expect(res.statusCode).toBe(202);
     expect(kgRefreshDeps.trigger.mock.calls[0]).toHaveLength(0);
-    expect(JSON.parse(res.body).dryRun).toBe(false);
+    expect(JSON.parse(res.body)).toEqual({ accepted: true });
   });
 
   it("POST /api/kg/refresh with an invalid JSON body returns 400 and does not trigger", async () => {
@@ -2216,30 +2391,6 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toBe("Invalid JSON body");
     expect(kgRefreshDeps.trigger).not.toHaveBeenCalled();
-  });
-
-  it("POST /api/kg/refresh with { acceptNewBaseline: true } from an SSO session reaches the trigger with the session's email as actor (AII-628)", async () => {
-    const token = adminSession.createSession(ssoAdmin);
-    const res = await kgRequest("/api/kg/refresh", "POST", token, { acceptNewBaseline: true });
-    expect(res.statusCode).toBe(202);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledTimes(1);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith({ acceptNewBaseline: true, actorEmail: "ada@eudoxus.ai" });
-    expect(JSON.parse(res.body)).toMatchObject({ accepted: true, dryRun: false, acceptNewBaseline: true });
-  });
-
-  it("POST /api/kg/refresh with { acceptNewBaseline: true } from an access-code session names the actor 'access-code session' (AII-628)", async () => {
-    const token = await login("secret");
-    const res = await kgRequest("/api/kg/refresh", "POST", token, { acceptNewBaseline: true });
-    expect(res.statusCode).toBe(202);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith({ acceptNewBaseline: true, actorEmail: "access-code session" });
-  });
-
-  it("POST /api/kg/refresh with { dryRun: true, acceptNewBaseline: true } passes both through (AII-628)", async () => {
-    const token = adminSession.createSession(ssoAdmin);
-    const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: true, acceptNewBaseline: true });
-    expect(res.statusCode).toBe(202);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith({ dryRun: true, acceptNewBaseline: true, actorEmail: "ada@eudoxus.ai" });
-    expect(JSON.parse(res.body)).toMatchObject({ dryRun: true, acceptNewBaseline: true });
   });
 
   it.each([
@@ -2266,7 +2417,7 @@ describe("admin kg refresh dry-run (AII-635)", () => {
   it("POST /api/kg/refresh answers 503 restate-unavailable with the body untouched", async () => {
     kgRefreshDeps.trigger.mockResolvedValueOnce({ status: 503, body: { error: "restate-unavailable" } } as never);
     const token = await login("secret");
-    const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: true });
+    const res = await kgRequest("/api/kg/refresh", "POST", token);
     expect(res.statusCode).toBe(503);
     expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
   });
@@ -2294,15 +2445,6 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     const down = await kgRequest("/api/kg/status", "GET", token);
     expect(down.statusCode).toBe(503);
     expect(JSON.parse(down.body)).toEqual({ error: "restate-unavailable" });
-  });
-
-  it("the Deployments page carries the Dry-run refresh button and the last-dry-run block", async () => {
-    const page = await import("../admin-ui/pages/kg-pipelines.js");
-    expect(page.kgPipelinesHtml).toContain('id="kg-dry-run-btn"');
-    expect(page.kgPipelinesHtml).toContain("window.triggerKgRefresh(true)");
-    expect(page.kgPipelinesHtml).toContain('id="kg-dry-run-last"');
-    expect(page.kgPipelinesScript).toContain("JSON.stringify({ dryRun: true })");
-    expect(page.kgPipelinesScript).toContain("function renderKgDryRun(");
   });
 });
 
@@ -2541,34 +2683,72 @@ describe("admin settings", () => {
     expect(body.flySessionsApp.dbValue).toBeNull();
   });
 
-  it("POST /api/settings saves flySessionsApp to DB", async () => {
+  /** A fake Restate: `set_runner_backend` merges into `state`, and the refresh reads it back through the real cache. */
+  function fakeRunnerBackend(opts: { down?: boolean } = {}) {
+    const state = { app: null as string | null, region: null as string | null };
+    const callTool = vi.fn(async (_name: string, args: Record<string, unknown>) => {
+      if (opts.down) return { status: "unavailable" as const };
+      Object.assign(state, args.patch);
+      return { status: "ok" as const, content: [{ type: "text", text: JSON.stringify(state) }] };
+    });
+    const refreshRunnerBackendCache = async () => {
+      const mod = await import("../orchestrator-settings.js");
+      await mod.refreshRunnerBackendCache({ readFlyMachines: async () => ({ ...state }) });
+    };
+    return { deps: { callTool: callTool as never, refreshRunnerBackendCache }, callTool, state };
+  }
+
+  it("POST /api/settings writes flySessionsApp through set_runner_backend and the next GET reports source restate", async () => {
     const token = await login("secret");
-    const res = await request("/api/settings", "POST", "secret", { flySessionsApp: "my-sessions-app" }, token);
+    const fake = fakeRunnerBackend();
+    const res = await requestWithDeps("/api/settings", "POST", token, fake.deps, { flySessionsApp: "my-sessions-app" });
     expect(res.statusCode).toBe(200);
-    const body = JSON.parse(res.body);
-    expect(body.flySessionsApp.dbValue).toBe("my-sessions-app");
+    expect(fake.callTool).toHaveBeenCalledWith(
+      "set_runner_backend",
+      { backend: "fly-machines", patch: { app: "my-sessions-app" } },
+      expect.objectContaining({ role: "admin" }),
+    );
+    expect(JSON.parse(res.body).flySessionsApp).toMatchObject({ runtimeValue: "my-sessions-app", source: "restate" });
+    const get = JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
+    expect(get.runnerBackendSource).toBe("restate");
+    expect(get.flySessionsApp).toMatchObject({ runtimeValue: "my-sessions-app", source: "restate", overriddenByEnv: false });
+    expect(get.flySessionsApp.dbValue).toBeNull();
   });
 
-  it("POST /api/settings sets restartRequired true when value differs from runtime", async () => {
+  it("POST /api/settings stores null for a whitespace-only value", async () => {
     const token = await login("secret");
-    const res = await request("/api/settings", "POST", "secret", { flySessionsApp: "new-app" }, token);
+    const fake = fakeRunnerBackend();
+    const res = await requestWithDeps("/api/settings", "POST", token, fake.deps, { flySessionsApp: "   " });
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body).restartRequired).toBe(true);
+    expect(fake.callTool.mock.calls[0][1]).toEqual({ backend: "fly-machines", patch: { app: null } });
+    expect(JSON.parse(res.body).flySessionsApp.runtimeValue).toBeNull();
   });
 
-  it("POST /api/settings sets restartRequired false when value matches runtime", async () => {
+  it("POST /api/settings answers 503 and writes no row when Restate is down", async () => {
     const token = await login("secret");
-    const res = await request("/api/settings", "POST", "secret", { flySessionsApp: null }, token);
-    expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body).restartRequired).toBe(false);
+    const fake = fakeRunnerBackend({ down: true });
+    const res = await requestWithDeps("/api/settings", "POST", token, fake.deps, { flySessionsApp: "x", flySessionsRegion: "iad" });
+    expect(res.statusCode).toBe(503);
+    const get = JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
+    expect(get.flySessionsApp.dbValue).toBeNull();
+    expect(get.flySessionsRegion.dbValue).toBeNull();
+    expect(get.runnerBackendSource).toBe("fallback");
   });
 
-  it("POST /api/settings trims whitespace-only string to null", async () => {
+  it("POST /api/settings answers 503 when callTool throws", async () => {
     const token = await login("secret");
-    const res = await request("/api/settings", "POST", "secret", { flySessionsApp: "   " }, token);
-    expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body).flySessionsApp.dbValue).toBeNull();
+    const res = await requestWithDeps("/api/settings", "POST", token, { callTool: (async () => { throw new Error("boom"); }) as never }, { flySessionsRegion: "iad" });
+    expect(res.statusCode).toBe(503);
   });
+
+  it("GET /api/settings reports source fallback before any Restate read, with env as the runtime value", async () => {
+    process.env.FLY_SESSIONS_APP = "env-app";
+    const token = await login("secret");
+    const get = JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
+    expect(get.runnerBackendSource).toBe("fallback");
+    expect(get.flySessionsApp).toMatchObject({ runtimeValue: "env-app", source: "fallback" });
+  });
+
 
   it("GET and POST /api/settings require auth", async () => {
     const get = await request("/api/settings", "GET", "secret");
@@ -5141,46 +5321,10 @@ describe("per-page grants", () => {
     });
   });
 
-  describe("journal grant", () => {
-    const journalFetch = vi.fn();
-    const journalDeps = {
-      readJournal: (query: Record<string, string>) => journalModule.handleJournalRequest(query, { fetchImpl: journalFetch as never }),
-    };
-    let journalModule: typeof import("../restate/journal-query.js");
-    beforeEach(async () => {
-      journalFetch.mockReset();
-      journalModule = await import("../restate/journal-query.js");
-    });
-
-    it("answers 400 on a bad lookup and never calls the admin API", async () => {
-      const res = await requestWithDeps("/api/restate/journal?service=KgRefresh&key=x'y", "GET", adminSsoSession(), journalDeps);
-      expect(res.statusCode).toBe(400);
-      expect(JSON.parse(res.body).error).toMatch(/^key/);
-      expect(journalFetch).not.toHaveBeenCalled();
-    });
-
-    it("refuses a user with no grant, and admits one with the grant despite the query string", async () => {
-      const path = "/api/restate/journal?service=KgRefresh&key=abc";
-      expect((await requestWithDeps(path, "GET", userSession(), journalDeps)).statusCode).toBe(403);
-      accessGrants.savePageGrants(["journal"], "ada@eudoxus.ai");
-      journalFetch.mockResolvedValue(new Response(JSON.stringify({ rows: [] }), { status: 200 }));
-      expect((await requestWithDeps(path, "GET", userSession(), journalDeps)).statusCode).toBe(404);
-      expect(journalFetch).toHaveBeenCalledTimes(1);
-    });
-
-    it("admits an admin without a grant", async () => {
-      journalFetch.mockResolvedValue(new Response(JSON.stringify({ rows: [] }), { status: 200 }));
-      const res = await requestWithDeps("/api/restate/journal?id=inv_1", "GET", adminSsoSession(), journalDeps);
+  describe("removed journal route", () => {
+    it("answers 404 for an admin session", async () => {
+      const res = await request("/api/restate/journal?id=inv_1", "GET", "secret", undefined, adminSsoSession());
       expect(res.statusCode).toBe(404);
-      expect(JSON.parse(res.body)).toEqual({ error: "no invocation" });
-    });
-
-    it("answers 503 when the admin API throws", async () => {
-      vi.spyOn(console, "error").mockImplementation(() => {});
-      journalFetch.mockRejectedValue(new Error("down"));
-      const res = await requestWithDeps("/api/restate/journal?id=inv_1", "GET", adminSsoSession(), journalDeps);
-      expect(res.statusCode).toBe(503);
-      expect(JSON.parse(res.body)).toEqual({ error: "restate unavailable" });
     });
   });
 
@@ -5194,6 +5338,18 @@ describe("per-page grants", () => {
       // Grantability comes from the route table, so Access itself can never appear here.
       expect(body.grantable).toContain("issues");
       expect(body.grantable).not.toContain("access");
+    });
+
+    it("lists no Journal page and still saves a grant while a stale journal row is stored", async () => {
+      const db = (await import("../dedup.js")).getDb();
+      db.prepare("INSERT INTO access_page_grants (page, granted_at, granted_by) VALUES ('journal', 'now', 'ada@eudoxus.ai')").run();
+      const token = adminSsoSession();
+      const got = JSON.parse((await request("/api/access-grants", "GET", "secret", undefined, token)).body);
+      expect(got.grantable).not.toContain("journal");
+      // The access page drops non-grantable keys from its draft, so this is what it posts.
+      const pages = got.granted.filter((k: string) => got.grantable.includes(k));
+      const res = await request("/api/access-grants", "POST", "secret", { pages: [...pages, "issues"] }, token);
+      expect(res.statusCode).toBe(200);
     });
 
     it("stores a grant an admin saves", async () => {
@@ -5653,7 +5809,8 @@ describe("admin sessions — kg-refresh destroy", () => {
   it("destroys the machine and returns 200 for an in-flight kg-refresh job", async () => {
     const token = await login("secret");
     const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
-    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel" });
+    log.setJobMachineNonce(jobId, "nonce-kg");
+    log.setJobMachineId(jobId, "m-kg-cancel");
     log.updateJobMachineId(jobId, "m-kg-cancel");
 
     const res = await deleteSession("m-kg-cancel", token);
@@ -5665,7 +5822,8 @@ describe("admin sessions — kg-refresh destroy", () => {
   it("stamps the job row operator_cancelled", async () => {
     const token = await login("secret");
     const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
-    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel3" });
+    log.setJobMachineNonce(jobId, "nonce-kg");
+    log.setJobMachineId(jobId, "m-kg-cancel3");
     log.updateJobMachineId(jobId, "m-kg-cancel3");
 
     await deleteSession("m-kg-cancel3", token);
@@ -5678,7 +5836,8 @@ describe("admin sessions — kg-refresh destroy", () => {
   it("sends exactly one notification and does not call provider.clearWorkingState (regression pin)", async () => {
     const token = await login("secret");
     const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
-    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel4" });
+    log.setJobMachineNonce(jobId, "nonce-kg");
+    log.setJobMachineId(jobId, "m-kg-cancel4");
     log.updateJobMachineId(jobId, "m-kg-cancel4");
 
     const clearWorkingState = vi.spyOn(provider, "clearWorkingState");
@@ -5691,7 +5850,8 @@ describe("admin sessions — kg-refresh destroy", () => {
   it("Fly-mode kg-refresh cancel destroys the machine and also calls the workflow cancel, tolerating a non-200", async () => {
     const token = await login("secret");
     const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines", dispatchId: "t-fly" });
-    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel5" });
+    log.setJobMachineNonce(jobId, "nonce-kg");
+    log.setJobMachineId(jobId, "m-kg-cancel5");
     log.updateJobMachineId(jobId, "m-kg-cancel5");
     const cancel = vi.fn(async () => ({ status: 409, body: { error: "no-refresh-in-flight" } }));
     const res = await deleteSession("m-kg-cancel5", token, { trigger: vi.fn(), status: vi.fn(), cancel });
