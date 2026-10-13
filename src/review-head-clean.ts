@@ -22,3 +22,14 @@ export async function headReviewedClean(token: string, owner: string, repo: stri
   return !listOpenReviewFindings(`${owner}/${repo}`, prNumber)
     .some((f) => f.severity === "blocking" && f.lastSeenAt >= commitMs);
 }
+
+/**
+ * The ledger half of `headReviewedClean`, for every review process: an open `blocking` finding was
+ * last seen at or after the head's commit time. No review-check requirement, so a repo with no
+ * reviewer is never held by it. Throws on an unreadable commit.
+ */
+export async function headHasBlockingFinding(token: string, owner: string, repo: string, prNumber: number, headSha: string): Promise<boolean> {
+  const commitMs = await getCommitTime(token, owner, repo, headSha);
+  return listOpenReviewFindings(`${owner}/${repo}`, prNumber)
+    .some((f) => f.severity === "blocking" && f.lastSeenAt >= commitMs);
+}

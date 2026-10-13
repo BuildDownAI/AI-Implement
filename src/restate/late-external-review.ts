@@ -14,11 +14,11 @@ import * as restateClients from "@restatedev/restate-sdk-clients";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { AppConfig } from "../index.js";
-import { getCombinedChecksState, getCommitTime, getPullRequestState, listPrComments, postPrComment } from "../github.js";
+import { getCombinedChecksState, getCommitTime, getPullRequestState, listCheckRuns, listPrComments, postPrComment } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { getJobByDispatchId, stampJobApproved } from "../log.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
-import { reviewCheckSucceeded } from "../review-head-clean.js";
+import { isReviewCheckRun, REVIEW_PROCESSES } from "../review-process.js";
 import type { RestateService } from "./endpoint.js";
 import { restateRetentionMs } from "./retention.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
@@ -27,6 +27,8 @@ import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 export const LATE_EXTERNAL_REVIEW_INTERVAL_MS = 60 * 1000;
 /** How long the workflow keeps looking before it ends `timed-out`. */
 export const LATE_EXTERNAL_REVIEW_DEADLINE_MS = 30 * 60 * 1000;
+/** A gap-fill head with no review check run at all, older than this, has no reviewer; the check counts as passed. */
+export const LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS = 5 * 60 * 1000;
 /** Marker of the PR comment the approve step posts; also the once-only check. */
 export const LATE_EXTERNAL_APPROVAL_MARKER = "<!-- ai-implement late-external-approval -->";
 
@@ -36,10 +38,13 @@ export const lateExternalReviewInputSchema = z.object({
   repo: z.string().min(1),
   prNumber: z.number().int().positive(),
   prUrl: z.string().min(1),
-  headSha: z.string().min(1),
+  /** Required unless `gapFill`, which reads the PR head in its first journaled step. */
+  headSha: z.string().min(1).optional(),
+  /** A gap-fill run (AII-1291): the head is whatever the PR holds when the workflow starts, and a head with no review check run for 5 min has no reviewer. */
+  gapFill: z.boolean().optional(),
   /** Repository-fix review process: follow the PR's head past the reviewed commit instead of ending `superseded`. Optional so an in-flight workflow still parses. */
   followHead: z.boolean().optional(),
-}).strict();
+}).strict().refine((i) => i.gapFill === true || !!i.headSha, { message: "headSha is required unless gapFill", path: ["headSha"] });
 
 export type LateExternalReviewInput = z.infer<typeof lateExternalReviewInputSchema>;
 
@@ -66,8 +71,10 @@ export interface LateReviewTick {
 /** Plain functions, every one called inside `ctx.run`. */
 export interface LateExternalReviewDependencies {
   retentionMs?: number;
-  /** One tick's read. */
-  readTick(input: LateExternalReviewInput): Promise<LateReviewTick>;
+  /** One tick's read. `headSha` is always set: the input's, or the journaled read of a gap-fill. */
+  readTick(input: LateExternalReviewInput & { headSha: string }): Promise<LateReviewTick>;
+  /** The PR's current head (gap-fill only); throws when the PR or its head is unreadable. */
+  readHead(input: LateExternalReviewInput): Promise<string>;
   /** The dispatch row's id and whether it already carries the mark, or `null` when the row is gone. */
   findJob(dispatchId: string): { id: number; approved: boolean } | null | Promise<{ id: number; approved: boolean } | null>;
   stampApproved(jobId: number, prUrl: string): void | Promise<void>;
@@ -96,11 +103,15 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
       return { outcome };
     }
 
-    let approvedHeadSha = input.headSha;
+    // A gap-fill names no head: the PR's head when the workflow starts is the one it reviews. Journaled, so a replay keeps it.
+    const headSha = input.headSha
+      ?? await ctx.run("read-head", () => deps.readHead(input), { maxRetryAttempts: 5 });
+    const tickInput = { ...input, headSha };
+    let approvedHeadSha = headSha;
     for (let i = 0; ; i++) {
-      const tick = await ctx.run(`read-${i}`, () => deps.readTick(input), { maxRetryAttempts: 5 });
+      const tick = await ctx.run(`read-${i}`, () => deps.readTick(tickInput), { maxRetryAttempts: 5 });
       // Follow mode: the head moving is the expected result of the repository's auto-fix, so only a close ends it.
-      if (!tick.open || (!input.followHead && tick.headSha !== input.headSha)) return end("superseded");
+      if (!tick.open || (!input.followHead && tick.headSha !== headSha)) return end("superseded");
       if (tick.checks === "failure") return end("external-failed");
       // A finding last seen before the head was committed was not reported by a review of this head
       // (a fix pass may have fixed it); one seen at or after the commit time blocks.
@@ -150,6 +161,11 @@ export type LateExternalReviewDefinition = ReturnType<typeof createLateExternalR
 export function createProductionLateExternalReviewDependencies(config: Pick<AppConfig, "githubAppId" | "githubAppPrivateKey">): LateExternalReviewDependencies {
   const token = (owner: string) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
   return {
+    async readHead(input) {
+      const pr = await getPullRequestState(await token(input.owner), input.owner, input.repo, input.prNumber);
+      if (!pr?.headSha) throw new Error(`late-external-review: PR #${input.prNumber} head unreadable`);
+      return pr.headSha;
+    },
     async readTick(input) {
       const t = await token(input.owner);
       const pr = await getPullRequestState(t, input.owner, input.repo, input.prNumber);
@@ -160,16 +176,22 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
         return { open, headSha: pr.headSha, checks: "pending", headCommittedAtMs: null, blockingLastSeenAtMs: [] };
       }
       let checks = await getCombinedChecksState(t, input.owner, input.repo, pr.headSha);
-      if (input.followHead && checks === "success" && !(await reviewCheckSucceeded(t, input.owner, input.repo, pr.headSha))) {
+      // Throws on an unreadable commit, so the step retries rather than reading "no findings".
+      const headCommittedAtMs = await getCommitTime(t, input.owner, input.repo, pr.headSha);
+      if ((input.followHead || input.gapFill) && checks === "success") {
         // A head pushed a moment ago has no check runs yet, which reads as "success". Its own review must
         // have completed with `success` before the head can count as clean (a skipped run is not a review).
-        checks = "pending";
+        const reviewRuns = (await listCheckRuns(t, input.owner, input.repo, pr.headSha))
+          .filter((r) => isReviewCheckRun(r, REVIEW_PROCESSES["claude-code-review-repository-fix"]));
+        const succeeded = reviewRuns.some((r) => r.status === "completed" && r.conclusion === "success");
+        // A gap-fill whose head has no review run after the grace belongs to a repo with no reviewer.
+        const noReviewer = input.gapFill && !input.followHead && reviewRuns.length === 0
+          && Date.now() - headCommittedAtMs >= LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS;
+        if (!succeeded && !noReviewer) checks = "pending";
       }
       // The ledger is keyed by "owner/repo" (see the review-fix queue in src/index.ts).
       const blockingLastSeenAtMs = listOpenReviewFindings(`${input.owner}/${input.repo}`, input.prNumber)
         .filter((f) => f.severity === "blocking").map((f) => f.lastSeenAt);
-      // Throws on an unreadable commit, so the step retries rather than reading "no findings".
-      const headCommittedAtMs = await getCommitTime(t, input.owner, input.repo, pr.headSha);
       return { open, headSha: pr.headSha, checks, headCommittedAtMs, blockingLastSeenAtMs };
     },
     findJob(dispatchId) {

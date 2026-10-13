@@ -1120,9 +1120,23 @@ export async function handleRunnerResult(
       }
       // updateJobStatus first: triggers markCommentGapfillRunTerminal for trigger='comment'
       // jobs (AII-277 livelock) and resets machine_nonce on terminal transition.
-      // stampJobApproved then sets approved=1 durably (updateJobStatus never touches that column).
-      updateJobStatus(job.id, "completed", "runner_approved", job.prUrl!);
-      stampJobApproved(job.id, job.prUrl!);
+      // AII-1291: no approval mark here. The gap-fill pushed a head the external review has not
+      // judged yet; LateExternalReview writes the mark once that review passes on the head.
+      // Without Restate no mark is written and the PR is held, as for an initial run.
+      updateJobStatus(job.id, "completed", "external_review_pending", job.prUrl!);
+      const target = parsePrUrlTarget(job.prUrl!);
+      if (input.submitLateExternalReview && target) {
+        try {
+          await input.submitLateExternalReview({
+            dispatchId: claims.dispatchId,
+            ...target,
+            prUrl: job.prUrl!,
+            gapFill: true,
+          });
+        } catch (err) {
+          warn("submitLateExternalReview", err);
+        }
+      }
     } else if (!job) {
       console.warn(`[runner-callback] no job row for dispatch=${claims.dispatchId} — gap-analysis approval mark not written`);
     }
