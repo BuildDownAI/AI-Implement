@@ -95,6 +95,15 @@ export function initLogTable(): void {
       last_attempt_at INTEGER
     )
   `);
+  // AII-1307: a succeeded review-fix attempt's LateExternalReview submit, held until the poll sweep sees it accepted.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS attempt_review_pending (
+      attempt_id TEXT PRIMARY KEY,
+      dispatch_id TEXT NOT NULL,
+      pr_url TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    )
+  `);
   ensureLogColumns();
 }
 
@@ -327,6 +336,14 @@ export function getRunRecordMergeVerdict(issueIdentifier: string, prUrl: string)
   if (!latest) return "hold";
   if (latest.status === "completed" && (latest.approved === 1 || latest.conclusion === "runner_approved")) return "approved";
   return "hold";
+}
+
+/** The PR's latest `implementation` / `gap-analysis` row, the one `getRunRecordMergeVerdict` reads. */
+export function getLatestWorkRowForPr(prUrl: string): { id: number; dispatchId: string | null; inFlight: boolean } | null {
+  const row = getDb()
+    .prepare("SELECT id, dispatch_id, status FROM dispatch_log WHERE pr_url = ? AND phase IN ('implementation', 'gap-analysis') ORDER BY id DESC LIMIT 1")
+    .get(prUrl) as { id: number; dispatch_id: string | null; status: string } | undefined;
+  return row ? { id: row.id, dispatchId: row.dispatch_id, inFlight: row.status === "dispatched" || row.status === "running" } : null;
 }
 
 /**
@@ -585,6 +602,30 @@ export function getGapFillRowsAwaitingLateReview(sinceMs: number): Job[] {
       )
       .all(sinceMs) as RawRow[],
   );
+}
+
+export interface PendingAttemptReview { attemptId: string; dispatchId: string; prUrl: string }
+
+/** Records that a review-fix attempt's late review still needs submitting (AII-1307). Idempotent per attempt. */
+export function recordPendingAttemptReview(attemptId: string, dispatchId: string, prUrl: string, now = Date.now()): void {
+  getDb()
+    .prepare("INSERT OR IGNORE INTO attempt_review_pending (attempt_id, dispatch_id, pr_url, created_at) VALUES (?, ?, ?, ?)")
+    .run(attemptId, dispatchId, prUrl, now);
+}
+
+/** Pending attempt reviews recorded at or after `sinceMs`, oldest first. */
+export function getPendingAttemptReviews(sinceMs: number): PendingAttemptReview[] {
+  // A record older than the window is never retried again; drop it rather than keep dead data.
+  const expired = getDb().prepare("DELETE FROM attempt_review_pending WHERE created_at < ?").run(sinceMs).changes;
+  if (expired > 0) console.log(`[review-fix] Dropped ${expired} expired pending attempt review(s)`);
+  const rows = getDb()
+    .prepare("SELECT attempt_id, dispatch_id, pr_url FROM attempt_review_pending WHERE created_at >= ? ORDER BY created_at ASC")
+    .all(sinceMs) as Array<{ attempt_id: string; dispatch_id: string; pr_url: string }>;
+  return rows.map((r) => ({ attemptId: r.attempt_id, dispatchId: r.dispatch_id, prUrl: r.pr_url }));
+}
+
+export function clearPendingAttemptReview(attemptId: string): void {
+  getDb().prepare("DELETE FROM attempt_review_pending WHERE attempt_id = ?").run(attemptId);
 }
 
 export function getInFlightIssueIds(): Set<string> {

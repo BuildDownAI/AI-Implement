@@ -48,9 +48,16 @@ export const lateExternalReviewInputSchema = z.object({
   gapFill: z.boolean().optional(),
   /** Repository-fix review process: follow the PR's head past the reviewed commit instead of ending `superseded`. Optional so an in-flight workflow still parses. */
   followHead: z.boolean().optional(),
+  /** A Restate review-fix attempt (AII-1307) submitted this review: the workflow key is `<dispatchId>-<attemptId>`, so an earlier workflow for the row that already ended does not block it. The mark is still stamped by `dispatchId`. */
+  attemptId: z.string().min(1).optional(),
 }).strict().refine((i) => i.gapFill === true || !!i.headSha, { message: "headSha is required unless gapFill", path: ["headSha"] });
 
 export type LateExternalReviewInput = z.infer<typeof lateExternalReviewInputSchema>;
+
+/** The workflow key: the dispatch id, or `<dispatchId>-<attemptId>` for a review-fix attempt's submit. */
+export function lateExternalReviewWorkflowKey(input: Pick<LateExternalReviewInput, "dispatchId" | "attemptId">): string {
+  return input.attemptId ? `${input.dispatchId}-${input.attemptId}` : input.dispatchId;
+}
 
 /** `superseded`: PR closed or head moved. `external-failed`: checks failed. `findings`: an open blocking
  *  finding (the review-fix rail owns it; not in follow mode, which keeps waiting). `timed-out`: today's behaviour, manual review. `no-job`: the
@@ -72,6 +79,9 @@ export interface LateReviewTick {
   blockingLastSeenAtMs: number[];
 }
 
+/** `inFlight`: the row is `dispatched` or `running`, so a run is still writing its outcome. */
+export interface LateReviewJob { id: number; approved: boolean; inFlight?: boolean }
+
 /** Plain functions, every one called inside `ctx.run`. */
 export interface LateExternalReviewDependencies {
   retentionMs?: number;
@@ -82,7 +92,7 @@ export interface LateExternalReviewDependencies {
   /** Gap-fill only (AII-1302): `true` when any earlier commit of the PR (newest 20, head excluded) had a review check run. Throws when unreadable. */
   readReviewerExpected?(input: LateExternalReviewInput & { headSha: string }): Promise<boolean>;
   /** The dispatch row's id and whether it already carries the mark, or `null` when the row is gone. */
-  findJob(dispatchId: string): { id: number; approved: boolean } | null | Promise<{ id: number; approved: boolean } | null>;
+  findJob(dispatchId: string): LateReviewJob | null | Promise<LateReviewJob | null>;
   stampApproved(jobId: number, prUrl: string): void | Promise<void>;
   /** `true` when a PR comment with `marker` exists already. */
   hasComment(input: LateExternalReviewInput, marker: string): Promise<boolean>;
@@ -103,7 +113,7 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
   const deadlineMs = deps.deadlineMs ?? LATE_EXTERNAL_REVIEW_DEADLINE_MS;
 
   async function run(ctx: WorkflowContext, input: LateExternalReviewInput): Promise<LateExternalReviewResult> {
-    if (input?.dispatchId !== ctx.key) {
+    if (!input?.dispatchId || lateExternalReviewWorkflowKey(input) !== ctx.key) {
       throw new restate.TerminalError("late-external-review dispatch id does not match workflow key");
     }
     const startedAt = await ctx.date.now();
@@ -156,6 +166,8 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
     const outcome = await ctx.run("approve", async (): Promise<LateExternalReviewOutcome> => {
       const job = await deps.findJob(input.dispatchId);
       if (!job) return "no-job";
+      // An attempt's submit picks the PR's newest row; a run that started since is not this review's to mark (AII-1307).
+      if (input.attemptId && job.inFlight && !job.approved) return "superseded";
       if (!job.approved) await deps.stampApproved(job.id, input.prUrl);
       if (!(await deps.hasComment(input, LATE_EXTERNAL_APPROVAL_MARKER))) {
         await deps.postComment(
@@ -283,7 +295,7 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
     },
     findJob(dispatchId) {
       const job = getJobByDispatchId(dispatchId);
-      return job ? { id: job.id, approved: job.approved } : null;
+      return job ? { id: job.id, approved: job.approved, inFlight: job.status === "dispatched" || job.status === "running" } : null;
     },
     stampApproved: (jobId, prUrl) => stampJobApproved(jobId, prUrl),
     async hasComment(input, marker) {
@@ -303,7 +315,7 @@ export function createProductionLateExternalReviewServices(config: Pick<AppConfi
 export type LateExternalReviewSubmitResult = "accepted" | "conflict" | "unavailable";
 
 export interface LateExternalReviewIngressClient {
-  /** Starts the workflow keyed by `dispatchId`; the workflow key is the idempotency. */
+  /** Starts the workflow keyed by `lateExternalReviewWorkflowKey(input)`; the workflow key is the idempotency. */
   submit(input: LateExternalReviewInput): Promise<LateExternalReviewSubmitResult>;
 }
 
@@ -318,7 +330,7 @@ export function createLateExternalReviewIngressClient(
     async submit(input) {
       try {
         await ingress
-          .workflowClient<LateExternalReviewDefinition>({ name: "LateExternalReview" }, input.dispatchId)
+          .workflowClient<LateExternalReviewDefinition>({ name: "LateExternalReview" }, lateExternalReviewWorkflowKey(input))
           .workflowSubmit(input, restateClients.rpc.sendOpts({ timeout }));
         return "accepted";
       } catch (err) {
@@ -335,16 +347,21 @@ export interface LateExternalReviewSubmitHookDeps {
   restateReady: () => boolean;
 }
 
-/** The hook `handleRunnerResult` calls. One log line, no retry; a conflict (a repeated callback) counts as success. */
+/**
+ * The hook `handleRunnerResult` calls. One log line, no retry; a conflict (a repeated callback) counts as success.
+ * Resolves `false` when the submit did not reach Restate (not ready, or `unavailable`) so a caller that keeps a
+ * retry record can keep it; `true` when the workflow was accepted or already exists.
+ */
 export function createLateExternalReviewSubmitHook(
   deps: LateExternalReviewSubmitHookDeps,
-): (input: LateExternalReviewInput) => Promise<void> {
+): (input: LateExternalReviewInput) => Promise<boolean> {
   return async (input) => {
     if (!deps.restateReady()) {
       console.log(`[late-external-review] Restate not ready, not submitting dispatch=${input.dispatchId}`);
-      return;
+      return false;
     }
     const result = await deps.ingress.submit(input);
     console.log(`[late-external-review] submit ${result} dispatch=${input.dispatchId} pr=${input.owner}/${input.repo}#${input.prNumber}`);
+    return result !== "unavailable";
   };
 }

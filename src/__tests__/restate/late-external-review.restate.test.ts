@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   LATE_EXTERNAL_APPROVAL_MARKER,
   createLateExternalReviewWorkflow,
+  lateExternalReviewWorkflowKey,
   type LateExternalReviewDependencies,
   type LateExternalReviewInput,
   type LateExternalReviewResult,
@@ -24,6 +25,8 @@ interface Scenario {
   ticks: LateReviewTick[];
   reads: number;
   jobApproved: boolean;
+  /** The row is dispatched or running. */
+  jobInFlight?: boolean;
   hasJob: boolean;
   jobId: number;
   stamps: number[];
@@ -77,7 +80,7 @@ function makeDeps(): LateExternalReviewDependencies {
     },
     findJob(dispatchId) {
       const sc = scenarioOf(dispatchId);
-      return sc.hasJob ? { id: sc.jobId, approved: sc.jobApproved } : null;
+      return sc.hasJob ? { id: sc.jobId, approved: sc.jobApproved, inFlight: sc.jobInFlight } : null;
     },
     stampApproved(jobId) {
       // The fake mirrors stampJobApproved's effect: the row now carries the mark.
@@ -114,16 +117,17 @@ describe("LateExternalReview workflow", () => {
     await Promise.all([stopAll(envs), retryEnv?.stop()]);
   });
 
-  async function runScenario(url: string, overrides: Partial<Scenario>, follow = false, gapFill = false) {
-    const dispatchId = `late-${counter++}`;
+  async function runScenario(url: string, overrides: Partial<Scenario>, follow = false, gapFill = false, fixedDispatchId?: string, attemptId?: string) {
+    const dispatchId = fixedDispatchId ?? `late-${counter++}`;
     const sc: Scenario = { ticks: [passed], reads: 0, jobApproved: false, hasJob: true, jobId: 1000 + counter, stamps: [], comments: [], head: SHA, headReads: 0, reviewerExpected: false, reviewerReads: 0, ...overrides };
     scenarios.set(dispatchId, sc);
     const input: LateExternalReviewInput = {
       dispatchId, owner: "o", repo: "r", prNumber: 5, prUrl: "https://github.com/o/r/pull/5",
       ...(gapFill ? { gapFill: true } : { headSha: SHA }),
       ...(follow ? { followHead: true } : {}),
+      ...(attemptId ? { attemptId } : {}),
     };
-    const result = await callWorkflow<LateExternalReviewResult>(url, "LateExternalReview", dispatchId, "run", input);
+    const result = await callWorkflow<LateExternalReviewResult>(url, "LateExternalReview", lateExternalReviewWorkflowKey(input), "run", input);
     return { result, sc };
   }
 
@@ -210,6 +214,50 @@ describe("LateExternalReview workflow", () => {
         expect(result).toEqual({ outcome: "timed-out" });
         expect(sc.stamps).toEqual([]);
         expect(sc.comments).toEqual([]);
+      });
+
+      describe("review-fix attempt submit (AII-1307)", () => {
+        it("starts a new workflow after the row's own workflow ended superseded; approve marks the row once", async () => {
+          const id = `late-attempt-${counter++}`;
+          const first = await runScenario(url(), { ticks: [{ ...pending, headSha: OTHER_SHA }] }, false, false, id);
+          expect(first.result.outcome).toBe("superseded");
+          const second = await runScenario(url(), { ticks: [pending, passed], jobId: first.sc.jobId }, false, true, id, "att-1");
+          expect(second.result).toEqual({ outcome: "approved" });
+          expect(second.sc.stamps).toEqual([second.sc.jobId]);
+          expect(second.sc.jobApproved).toBe(true);
+          // The same attempt again is the same workflow: no new run, no second mark or comment.
+          await expect(callWorkflow<LateExternalReviewResult>(url(), "LateExternalReview", `${id}-att-1`, "run",
+            { dispatchId: id, owner: "o", repo: "r", prNumber: 5, prUrl: "https://github.com/o/r/pull/5", gapFill: true, attemptId: "att-1" }))
+            .rejects.toThrow(/409/);
+          expect(second.sc.stamps).toHaveLength(1);
+          expect(second.sc.comments).toHaveLength(1);
+        });
+
+        it("writes no mark when Claude requests changes on the pushed head", async () => {
+          const { result, sc } = await runScenario(url(), { ticks: [pending, { ...passed, blockingLastSeenAtMs: [COMMIT_MS + 5] }] }, false, true, undefined, "att-2");
+          expect(result).toEqual({ outcome: "findings" });
+          expect(sc.stamps).toEqual([]);
+          expect(sc.jobApproved).toBe(false);
+        });
+
+        it("ends superseded with no mark or comment when the newest row is still in flight", async () => {
+          const { result, sc } = await runScenario(url(), { ticks: [passed], jobInFlight: true }, false, true, undefined, "att-3");
+          expect(result).toEqual({ outcome: "superseded" });
+          expect(sc.stamps).toEqual([]);
+          expect(sc.comments).toEqual([]);
+          expect(sc.jobApproved).toBe(false);
+        });
+
+        it("control: an in-flight row without an attemptId keeps the existing behaviour (marked)", async () => {
+          const { result, sc } = await runScenario(url(), { ticks: [passed], jobInFlight: true }, false, true);
+          expect(result).toEqual({ outcome: "approved" });
+          expect(sc.stamps).toEqual([sc.jobId]);
+        });
+
+        it("a different attempt id starts a different workflow", () => {
+          expect(lateExternalReviewWorkflowKey({ dispatchId: "d", attemptId: "a" })).not.toBe(lateExternalReviewWorkflowKey({ dispatchId: "d", attemptId: "b" }));
+          expect(lateExternalReviewWorkflowKey({ dispatchId: "d" })).toBe("d");
+        });
       });
 
       describe("gap-fill (AII-1291)", () => {
