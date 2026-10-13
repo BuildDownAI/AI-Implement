@@ -108,7 +108,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Runner callbacks and tokens | `src/runner-callback.ts`, `src/runner-token.ts`, `src/token-vending.ts` | [docs/runner-callbacks.md](docs/runner-callbacks.md) |
 | Merge reconciliation | `src/reconciliation.ts`, `src/reconcile-merged.ts`, `src/poll-merged-prs.ts` | |
 | Workflow sync to target repos | `src/workflow-sync.ts`, `src/workflow-sync-queue.ts` | [docs/workflow-sync.md](docs/workflow-sync.md) |
-| `/ai-implement` comment rail | `src/webhook.ts`, `src/comment-gapfill-drain.ts` | |
+| `/ai-implement` comment rail | `src/webhook.ts`, `src/comment-gapfill-drain.ts` | [docs/comment-gapfill-rail.md](docs/comment-gapfill-rail.md) |
 | Stuck-run recovery | `src/reaper.ts`, `src/stuck-watchdog.ts` | |
 | Per-team dispatch capacity | `src/poll-selection.ts` | |
 | Run classification and autopsy | `src/completion-classification.ts`, `src/run-autopsy.ts` | |
