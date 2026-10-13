@@ -138,6 +138,21 @@ export async function runIntrospectionQuery(
   return body.rows as IntrospectionRow[];
 }
 
+/**
+ * Purges one completed invocation (journal and all) through the admin API
+ * (`PATCH /invocations/{id}/purge`, restate-server 1.7.10). A 404/409 means it is already gone
+ * or not purgeable-as-completed; both are treated as done so callers stay idempotent.
+ */
+export async function purgeInvocation(fetchImpl: typeof fetch, adminBaseUrl: string, invocationId: string): Promise<void> {
+  const response = await fetchImpl(`${adminBaseUrl}/invocations/${encodeURIComponent(invocationId)}/purge`, {
+    method: "PATCH",
+    signal: AbortSignal.timeout(REGISTER_TIMEOUT_MS),
+  });
+  if (!response.ok && response.status !== 404 && response.status !== 409) {
+    throw new Error(`admin API purge of ${invocationId} failed: HTTP ${response.status}`);
+  }
+}
+
 export function sqlQuote(value: string): string {
   return value.replace(/'/g, "''");
 }
