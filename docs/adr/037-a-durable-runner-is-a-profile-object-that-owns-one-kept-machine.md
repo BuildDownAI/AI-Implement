@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-10-07
-**References:** ADR 032, ADR 036, [AII-1106](https://linear.app/eudoxus/issue/AII-1106/kg-refresh-on-a-durable-fly-runner-watched-one-shot-runs-per-pipeline), [AII-1123](https://linear.app/eudoxus/issue/AII-1123/temporary-admin-mcp-tool-probe-fly-machine-reuse-start-update-of-a), [AII-1126](https://linear.app/eudoxus/issue/AII-1126/add-the-flymachineprofile-restate-object-get-set-seed-with-a-kg), [AII-1131](https://linear.app/eudoxus/issue/AII-1131), [AII-1032](https://linear.app/eudoxus/issue/AII-1032/explore-the-runner-as-a-restate-service-advantages-platform-stability), ADR 039
+**References:** ADR 032, ADR 036, [AII-1106](https://linear.app/eudoxus/issue/AII-1106/kg-refresh-on-a-durable-fly-runner-watched-one-shot-runs-per-pipeline), [AII-1123](https://linear.app/eudoxus/issue/AII-1123/temporary-admin-mcp-tool-probe-fly-machine-reuse-start-update-of-a), [AII-1126](https://linear.app/eudoxus/issue/AII-1126/add-the-flymachineprofile-restate-object-get-set-seed-with-a-kg), [AII-1131](https://linear.app/eudoxus/issue/AII-1131), [AII-1032](https://linear.app/eudoxus/issue/AII-1032/explore-the-runner-as-a-restate-service-advantages-platform-stability), ADR 040
 
 ## Context
 
@@ -33,4 +33,4 @@ The decisions are the pure functions `decideClaim`, `decideAttach`, and `decideE
 
 ## Consequences
 
-The object touches Fly only inside `ctx.run` closures, through `FlyMachineProfileDeps.fly`, bound to `FLY_SESSIONS_TOKEN` + the sessions app (`getFlySessionsConfig`, backed by `RunnerBackend/fly-machines`, ADR 039) by the composer; if either is unset the object still registers and a handler that needs Fly fails when it runs. Nothing calls `claim`, `attach`, `release`, or `expire` yet; the workflow wiring is step 3b and the reaper rule is step 3c.
+The object touches Fly only inside `ctx.run` closures, through `FlyMachineProfileDeps.fly`, bound to `FLY_SESSIONS_TOKEN` + the sessions app (`getFlySessionsConfig`, backed by `RunnerBackend/fly-machines`, ADR 040) by the composer; if either is unset the object still registers and a handler that needs Fly fails when it runs. Nothing calls `claim`, `attach`, `release`, or `expire` yet; the workflow wiring is step 3b and the reaper rule is step 3c.

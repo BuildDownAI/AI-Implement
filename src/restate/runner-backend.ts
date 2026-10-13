@@ -1,6 +1,6 @@
 /**
  * `RunnerBackend` — a Virtual Object, one per execution backend, holding that backend's
- * deployment-wide, non-secret settings (AII-1243, ADR 039). `fly-machines` holds the sessions app
+ * deployment-wide, non-secret settings (AII-1243, ADR 040). `fly-machines` holds the sessions app
  * and region; `github-actions` has an empty schema, reserved. Per-pipeline settings live in the
  * `<Backend>RunProfile/<pipeline>` objects (ADR 037); secrets stay in env and never enter a schema,
  * because Restate journals every handler input.

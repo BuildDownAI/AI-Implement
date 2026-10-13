@@ -1,4 +1,4 @@
-# 039. Runner settings live in per-backend Restate objects with one contract
+# 040. Runner settings live in per-backend Restate objects with one contract
 
 **Status:** Accepted
 **Date:** 2026-10-12
