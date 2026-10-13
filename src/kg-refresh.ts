@@ -218,9 +218,9 @@ export interface KgRefreshHandle {
    * run (AII-633). Reads the outcome `KgRepo` holds for `report.repo`#`report.prNumber`
    * (AII-636, AII-977) and posts only that PR's own outcome — never another PR's — and only
    * when it ran against `report.sha`; otherwise a no-op (with a debug log line).
-   * Returns whether
-   * it actually posted, so a caller can distinguish a real re-report from a silent
-   * no-op (AII-636) instead of always answering as if something was posted.
+   * Returns whether it actually posted, so a caller can distinguish a real re-report
+   * from a silent no-op (AII-636). No production webhook path calls it now that the
+   * `labeled` re-report is gone; it stays wired on `KgPrCheckConfig` as the stored-outcome read.
    */
   reportDryRun(report: KgDryRunReportTarget): Promise<"reported" | "no-outcome" | "unavailable">;
   /**

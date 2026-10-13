@@ -51,8 +51,6 @@ interface PullRequestPayload {
     merge_commit_sha?: string;
     labels?: Array<{ name?: string }>;
   };
-  /** The single label added or removed by a `labeled`/`unlabeled` action — distinct from `pull_request.labels`, the cumulative list. */
-  label?: { name?: string };
   repository?: {
     full_name?: string;
   };
@@ -99,9 +97,8 @@ function matchesKgGuard(files: string[], headRef: string): boolean {
 /**
  * Evicts the `KgRepo` object's stored dry-run outcome and held head for `repo`#`prNumber`
  * when `kgPrCheck.forgetKgPr` is wired (AII-636, AII-977); a rejection is logged, not thrown.
- * Called on `pull_request` `closed` — a
- * closed PR can never legitimately receive another `labeled` re-report, so there is
- * no reason to wait for the MAX_TRACKED_PRS cap to evict it.
+ * Called on `pull_request` `closed` — a closed PR's stored outcome and held head are
+ * not needed, so they are not left to wait for the MAX_TRACKED_PRS cap.
  */
 function forgetKgPr(kgPrCheck: KgPrCheckConfig | undefined, repoFullName: string, prNumber: number): void {
   Promise.resolve(kgPrCheck?.forgetKgPr?.(repoFullName, prNumber)).catch((err) => {
@@ -390,13 +387,8 @@ export async function handleGitHubWebhook(
     return;
   }
 
-  if (
-    payload.action === "opened" ||
-    payload.action === "synchronize" ||
-    payload.action === "labeled" ||
-    payload.action === "unlabeled"
-  ) {
-    // The KG PR check owns `opened`, `labeled`, and `unlabeled` responses; on `synchronize`
+  if (payload.action === "opened" || payload.action === "synchronize") {
+    // The KG PR check owns the `opened` response; on `synchronize`
     // it runs as a side effect and returns false so handlePullRequestSynchronize below
     // still runs (AII-639).
     const handled = await handleKgPrCheckWebhook(payload, res, kgPrCheck, deliveryId);
@@ -410,9 +402,8 @@ export async function handleGitHubWebhook(
 
   if (payload.action === "closed") {
     // Evict this PR's KG PR-check state regardless of merged status — a closed PR
-    // (merged or not) can never legitimately receive another `labeled` re-report, and
-    // holding its entry until the MAX_TRACKED_PRS cap evicts it naturally only widens
-    // the window a stray `labeled` redelivery could exploit (AII-636).
+    // (merged or not) has no use for its stored outcome, so it is not held until the
+    // MAX_TRACKED_PRS cap evicts it (AII-636).
     const kgRepoFullName = payload.repository?.full_name;
     const kgPrNumber = payload.pull_request?.number;
     if (kgRepoFullName && kgPrNumber && (kgRepoFullName === kgPrCheck?.kgSourceRepo || kgRepoFullName === kgPrCheck?.kgBaseRepo)) {
