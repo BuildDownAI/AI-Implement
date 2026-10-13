@@ -7,6 +7,9 @@
  * AII-1301: the state check runs on every boot, because a rollback to a pre-AII-1287 image
  * writes raw tokens again. When one is found the row is deleted first (closing `/query`),
  * and rewritten only after the scrub and purge succeed.
+ * AII-1310: the purge of completed `Operator` invocations runs on every boot, including when
+ * the row exists and no legacy state is found, and always before the in-memory flag opens
+ * `/query`; a purge failure leaves the flag false and the row in place.
  * AII-1305: the step runs only while the sidecar is `ready` and registration `registered`
  * (the callTool rule). `onRegistered` also fires for `unreachable`, where an old deployment
  * without `dropLegacyToken` could pin the call, hold the Operator key and deadlock (AII-1281).
@@ -94,6 +97,20 @@ export async function scrubOperatorLegacyTokens(deps: OperatorLegacyScrubDeps = 
     },
   };
 
+  const purgeCompletedOperatorInvocations = async (): Promise<number> => {
+    const invocations = await runIntrospectionQuery(
+      fetchImpl,
+      adminBaseUrl,
+      "SELECT id FROM sys_invocation WHERE target_service_name = 'Operator' AND status = 'completed'",
+    );
+    let purged = 0;
+    for (const row of invocations) {
+      await purgeInvocation(fetchImpl, adminBaseUrl, String(row.id));
+      purged++;
+    }
+    return purged;
+  };
+
   try {
     // (a) families that still hold a raw token.
     const stateRows = await runIntrospectionQuery(
@@ -104,8 +121,12 @@ export async function scrubOperatorLegacyTokens(deps: OperatorLegacyScrubDeps = 
     const legacyRows = stateRows.filter((row) => hasLegacyToken(row.value_utf8));
     const rowExisted = store.read() !== null;
     if (legacyRows.length === 0 && rowExisted) {
+      // AII-1310: no legacy state, but a journal can still hold a raw token (a refresh on a
+      // rolled-back image, then a roll forward before this ran). Purge before opening `/query`.
+      const purged = await purgeCompletedOperatorInvocations();
       legacyCheckConfirmed = true;
-      return { ran: false, scrubbed: 0, purged: 0 };
+      console.log(`[restate] Operator legacy-token check done (row present, no legacy state): ${purged} invocations purged`);
+      return { ran: false, scrubbed: 0, purged };
     }
     // Close `POST /query` first: the proxy reads the row on every request.
     legacyCheckConfirmed = false;
@@ -125,16 +146,7 @@ export async function scrubOperatorLegacyTokens(deps: OperatorLegacyScrubDeps = 
     }
 
     // (b) every completed Operator invocation (journals hold the old raw tokens).
-    const invocations = await runIntrospectionQuery(
-      fetchImpl,
-      adminBaseUrl,
-      "SELECT id FROM sys_invocation WHERE target_service_name = 'Operator' AND status = 'completed'",
-    );
-    let purged = 0;
-    for (const row of invocations) {
-      await purgeInvocation(fetchImpl, adminBaseUrl, String(row.id));
-      purged++;
-    }
+    const purged = await purgeCompletedOperatorInvocations();
 
     // (c) only now, record completion.
     store.write((deps.now?.() ?? new Date()).toISOString());
