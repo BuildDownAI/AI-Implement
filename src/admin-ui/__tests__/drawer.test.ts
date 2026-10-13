@@ -1072,7 +1072,7 @@ describe("job drawer Open in Restate UI link", () => {
       return { ok: false, status: 404, json: async () => ({}) };
     };
     const link = () => doc.querySelector("#drawer-restate-link a") as HTMLAnchorElement | null;
-    const noJournal = () => expect(calls.some((u) => u.startsWith("/api/restate/journal"))).toBe(false);
+    const noJournal = () => expect(calls.some((u) => u.startsWith("/api/restate/"))).toBe(false);
     return { win, doc, link, noJournal };
   }
 

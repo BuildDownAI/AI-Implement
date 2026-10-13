@@ -13,7 +13,7 @@ export interface RunEntry {
   terminationReason: string | null;
   costUsd: number | null;
   maxTurnsHits: number;
-  /** The Restate workflow/object this run is keyed by, the lookup key for `GET /api/restate/journal?service=<service>&key=<key>` (endpoint added by AII-1128); null when not Restate-owned. */
+  /** The Restate workflow/object this run is keyed by, the lookup key for the Restate UI link `/ui/workflows/<service>/<key>`; null when not Restate-owned. */
   restate: { service: "KgRefresh" | "PlanningRun" | "ReviewFixAttempt"; key: string } | null;
 }
 
