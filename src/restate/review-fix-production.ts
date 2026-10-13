@@ -108,6 +108,12 @@ export async function submitLateReviewForAttempt(
       console.log(`[review-fix] No run row with a dispatch id for ${prUrl}, not submitting late external review (attempt ${attemptId})`);
       return;
     }
+    // A row still dispatched/running belongs to a run that writes its own outcome; stamping it from here could mark an
+    // unreviewed run (its status can turn terminal-unapproved while the workflow waits). A settled row cannot change.
+    if (row.inFlight) {
+      console.log(`[review-fix] Run ${row.dispatchId} for ${prUrl} is still in flight, not submitting late external review (attempt ${attemptId})`);
+      return;
+    }
     // Held for the poll sweep (resubmitPendingGapFillReviews) in case Restate is not ready and the hook only logs.
     recordPendingAttemptReview(attemptId, row.dispatchId, prUrl);
     const settled = await submit({ dispatchId: row.dispatchId, owner, repo, prNumber: scope.prNumber, prUrl, gapFill: true, attemptId });

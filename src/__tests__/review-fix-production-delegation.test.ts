@@ -84,6 +84,15 @@ describe("review-fix production delegation", () => {
       expect(clearPendingAttemptReview).toHaveBeenCalledWith("att-1");
     });
 
+    it("submits nothing when the latest run row is still in flight", async () => {
+      getLatestWorkRowForPr.mockReturnValue({ id: 9, dispatchId: "d-9", inFlight: true });
+      const submit = vi.fn();
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      await submitLateReviewForAttempt(repoScope, "att-1", submit);
+      expect(submit).not.toHaveBeenCalled();
+      log.mockRestore();
+    });
+
     it("submits nothing and logs when the PR has no run row", async () => {
       getLatestWorkRowForPr.mockReturnValue(null);
       const submit = vi.fn();

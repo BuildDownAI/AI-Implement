@@ -339,11 +339,11 @@ export function getRunRecordMergeVerdict(issueIdentifier: string, prUrl: string)
 }
 
 /** The PR's latest `implementation` / `gap-analysis` row, the one `getRunRecordMergeVerdict` reads. */
-export function getLatestWorkRowForPr(prUrl: string): { id: number; dispatchId: string | null } | null {
+export function getLatestWorkRowForPr(prUrl: string): { id: number; dispatchId: string | null; inFlight: boolean } | null {
   const row = getDb()
-    .prepare("SELECT id, dispatch_id FROM dispatch_log WHERE pr_url = ? AND phase IN ('implementation', 'gap-analysis') ORDER BY id DESC LIMIT 1")
-    .get(prUrl) as { id: number; dispatch_id: string | null } | undefined;
-  return row ? { id: row.id, dispatchId: row.dispatch_id } : null;
+    .prepare("SELECT id, dispatch_id, status FROM dispatch_log WHERE pr_url = ? AND phase IN ('implementation', 'gap-analysis') ORDER BY id DESC LIMIT 1")
+    .get(prUrl) as { id: number; dispatch_id: string | null; status: string } | undefined;
+  return row ? { id: row.id, dispatchId: row.dispatch_id, inFlight: row.status === "dispatched" || row.status === "running" } : null;
 }
 
 /**
@@ -615,6 +615,9 @@ export function recordPendingAttemptReview(attemptId: string, dispatchId: string
 
 /** Pending attempt reviews recorded at or after `sinceMs`, oldest first. */
 export function getPendingAttemptReviews(sinceMs: number): PendingAttemptReview[] {
+  // A record older than the window is never retried again; drop it rather than keep dead data.
+  const expired = getDb().prepare("DELETE FROM attempt_review_pending WHERE created_at < ?").run(sinceMs).changes;
+  if (expired > 0) console.log(`[review-fix] Dropped ${expired} expired pending attempt review(s)`);
   const rows = getDb()
     .prepare("SELECT attempt_id, dispatch_id, pr_url FROM attempt_review_pending WHERE created_at >= ? ORDER BY created_at ASC")
     .all(sinceMs) as Array<{ attempt_id: string; dispatch_id: string; pr_url: string }>;
