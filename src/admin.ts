@@ -21,6 +21,7 @@ import {
   setMappingPaused,
   deleteMapping,
 } from "./config.js";
+import { isReviewProcessId, type ReviewProcessId } from "./review-process.js";
 import type { RepoMapping, ExecutionMode, SessionMode, ClaudeProvider, ReviewerSelection } from "./config.js";
 import {
   getRunnerMode,
@@ -32,6 +33,9 @@ import {
   getFlyProcessLevelSecrets,
   setFlyProcessLevelSecrets,
   getKgMaterializeDirect,
+  getKgExecutionMode,
+  setKgExecutionMode,
+  parseKgExecutionModeEnv,
   setKgMaterializeDirect,
   type RunnerMode,
 } from "./runner-mode.js";
@@ -52,7 +56,8 @@ import { notifyText } from "./notify.js";
 import { getLastSweepAt } from "./reaper.js";
 import { listLog, getInFlightJobs, getInFlightIssueIds, updateJobStatus, getJobById, markJobNotified, getPulls, getIssueEnrichment } from "./log.js";
 import { getStepsByJobId } from "./step-log.js";
-import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret, fetchMachineLogs } from "./fly-machines.js";
+import { destroyMachineRecorded } from "./backend-run.js";
+import { listMachines, listAppSecrets, setAppSecrets, unsetAppSecret, fetchMachineLogs } from "./fly-machines.js";
 import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import { resolveInFlightSiblings, selectBlockers, mergeProviderSnapshots, selectForeignTrackerBlockers, type ForeignTrackerIssue, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
@@ -69,6 +74,9 @@ import {
   DEFAULT_LINEAR_PICKUP_LABEL,
   DEFAULT_RETRY_POLICY,
   type RetryPolicy,
+  getFlySessionsConfig,
+  getRunnerBackendSource,
+  refreshRunnerBackendCache,
 } from "./orchestrator-settings.js";
 import { getInstallationToken, mintSourceTokenOrJwt, getScopedInstallationToken } from "./github-app-auth.js";
 import { GitHubApiError } from "./github-errors.js";
@@ -168,6 +176,38 @@ function normalizeReviewers(raw: unknown): ReviewerSelection[] {
 
 function validReviewerMaxTurns(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 200;
+}
+
+const TRUSTED_REVIEW_AUTHOR_RE = /^[a-z0-9][a-z0-9-]*(\[bot\])?$/;
+
+function normalizeTrustedReviewAuthors(raw: unknown): string[] | null {
+  if (raw === null || raw === undefined) return null;
+  if (!Array.isArray(raw)) {
+    throw new Error("must be an array of strings or null");
+  }
+  if (raw.length > 20) {
+    throw new Error(`too many entries (${raw.length}); maximum is 20`);
+  }
+  const seen = new Set<string>();
+  const result: string[] = [];
+  raw.forEach((entry, index) => {
+    if (typeof entry !== "string") {
+      throw new Error(`[${index}] must be a string`);
+    }
+    const normalized = entry.trim().toLowerCase();
+    if (normalized.length === 0) {
+      throw new Error(`[${index}] must not be empty`);
+    }
+    if (!TRUSTED_REVIEW_AUTHOR_RE.test(normalized)) {
+      throw new Error(`[${index}] "${entry}" is not a valid GitHub login`);
+    }
+    if (seen.has(normalized)) {
+      throw new Error(`duplicate entry "${normalized}"`);
+    }
+    seen.add(normalized);
+    result.push(normalized);
+  });
+  return result.length > 0 ? result : null;
 }
 
 /**
@@ -475,13 +515,15 @@ export interface AdminDeps {
   selfDeployTarget?: SelfDeployTarget | null;
   /** The KG refresh rail (AII-426). Absent when no KG source repo is configured. */
   kgRefresh?: {
-    trigger(opts?: { dryRun?: boolean; ref?: string; acceptNewBaseline?: boolean; actorEmail?: string }): Promise<{ status: number; body: Record<string, unknown> }>;
+    trigger(opts?: { ref?: string; actorEmail?: string }): Promise<{ status: number; body: Record<string, unknown> }>;
     status(): Promise<{ status: number; body: unknown }>;
     /** The operator-cancel path: asks the KgRefresh workflow to cancel and confirm termination (AII-901). */
     cancel(opts: { jobId: number; dispatchId?: string | null; reason: string }): Promise<{ status: number; body: Record<string, unknown> }>;
   };
   /** The tools-service ingress caller (src/restate/tools-client.ts, AII-710). Absent only in tests that don't exercise POST /api/tools/<name>. */
   callTool?: typeof callTool;
+  /** Re-reads `RunnerBackend/fly-machines` into the cache after a Settings write. Defaults to `refreshRunnerBackendCache`; a test seam. */
+  refreshRunnerBackendCache?: () => Promise<void>;
   /**
    * Reads the Restate sidecar/endpoint status (src/restate/status.ts's getRestateStatus,
    * AII-773/AII-804). Injected rather than imported at runtime because this file may only
@@ -501,12 +543,6 @@ export interface AdminDeps {
    * don't exercise the five `/api/review-fix/attempts/*` routes, which then answer 501.
    */
   reviewFixAttempts?: ReviewFixAttemptsFacade;
-  /**
-   * Answers GET /api/restate/journal from the query parameters (src/restate/journal-query.ts's
-   * handleJournalRequest). Injected for the same reason as `getRestateStatus`: this file may
-   * only import src/restate/* as types. Absent only in tests that don't exercise the route, which then answers 501.
-   */
-  readJournal?: (query: Record<string, string>) => Promise<{ status: number; body: unknown }>;
 }
 
 /** Caller identity passed into every `reviewFixAttempts` facade call, so scope and
@@ -756,55 +792,32 @@ export function handleAdminRequest(
         json(res, 501, { error: "KG refresh is not configured" });
         return true;
       }
-      // AII-635: an optional JSON body `{ dryRun?: boolean }` selects the dry-run mode
-      // (AII-632): same runner job, push skipped, guard table on the status. No body,
-      // or `dryRun: false`, is the unchanged real refresh. The response echoes `dryRun`
-      // beside the trigger's own fields so the caller can tell which mode ran.
-      // AII-628: `{ acceptNewBaseline?: boolean }` carries the one-shot content-guard
-      // override through to the dispatched runner, tagged with this session's identity
-      // for the guard-override log line and the refresh PR's ### Baseline section.
+      // The admin dry-run and the trigger-time accept are gone (a held run is the preview, and
+      // accepting is a decision on that run). A body asking for either is refused: ignoring the
+      // key would run a real refresh that pushes to the KG repo for a caller who asked for a dry-run.
       const kgRefresh = deps.kgRefresh;
       readBody(req).then(
         (raw) => {
-          let dryRun = false;
-          let acceptNewBaseline = false;
           if (raw.trim()) {
+            let parsed: { dryRun?: unknown; acceptNewBaseline?: unknown } | null;
             try {
-              const parsed = JSON.parse(raw) as { dryRun?: unknown; acceptNewBaseline?: unknown };
-              dryRun = parsed.dryRun === true;
-              acceptNewBaseline = parsed.acceptNewBaseline === true;
+              parsed = JSON.parse(raw) as { dryRun?: unknown; acceptNewBaseline?: unknown } | null;
             } catch {
               json(res, 400, { error: "Invalid JSON body" });
               return;
             }
+            for (const option of ["dryRun", "acceptNewBaseline"] as const) {
+              if (parsed && typeof parsed === "object" && parsed[option] === true) {
+                json(res, 400, { error: "option-removed", option });
+                return;
+              }
+            }
           }
-          const opts: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string } = {};
-          if (dryRun) opts.dryRun = true;
-          if (acceptNewBaseline) {
-            opts.acceptNewBaseline = true;
-            // An access-code session has no email; name it so the log line and the
-            // ### Baseline section never read "unknown" for a real press.
-            opts.actorEmail = gate.identity?.email ?? "access-code session";
-          }
-          const pending = (dryRun || acceptNewBaseline) ? kgRefresh.trigger(opts) : kgRefresh.trigger();
-          return pending.then(
-            (r) => json(res, r.status, r.status === 503 ? r.body : { ...r.body, dryRun, acceptNewBaseline }),
+          return kgRefresh.trigger().then(
+            (r) => json(res, r.status, r.body),
             (err) => json(res, 500, { error: String(err) }),
           );
         },
-        (err) => json(res, 500, { error: String(err) }),
-      );
-      return true;
-    }
-
-    if (url.split("?")[0] === "/api/restate/journal" && method === "GET") {
-      if (!deps.readJournal) {
-        json(res, 501, { error: "journal is not configured" });
-        return true;
-      }
-      const query = Object.fromEntries(new URL(url, "http://localhost").searchParams);
-      deps.readJournal(query).then(
-        (r) => json(res, r.status, r.body),
         (err) => json(res, 500, { error: String(err) }),
       );
       return true;
@@ -838,6 +851,25 @@ export function handleAdminRequest(
         return true;
       }
       handleSetKgMaterializeMode(req, res);
+      return true;
+    }
+
+    if (url === "/api/kg/execution-mode" && method === "GET") {
+      if (!deps.kgRefresh) {
+        json(res, 501, { error: "KG refresh is not configured" });
+        return true;
+      }
+      const status = getKgExecutionMode(!!(config.flySessionsToken && config.flySessionsApp));
+      json(res, 200, { mode: status.mode, source: status.source });
+      return true;
+    }
+
+    if (url === "/api/kg/execution-mode" && method === "POST") {
+      if (!deps.kgRefresh) {
+        json(res, 501, { error: "KG refresh is not configured" });
+        return true;
+      }
+      handleSetKgExecutionMode(req, res, config);
       return true;
     }
 
@@ -1170,7 +1202,7 @@ export function handleAdminRequest(
     }
 
     if (url === "/api/settings" && method === "POST") {
-      handlePostSettings(req, res, config);
+      handlePostSettings(req, res, config, gate, deps);
       return true;
     }
 
@@ -1730,6 +1762,28 @@ async function handleSetKgMaterializeMode(
   }
 }
 
+async function handleSetKgExecutionMode(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  config: AdminConfig,
+): Promise<void> {
+  try {
+    const body = JSON.parse(await readBody(req)) as { mode?: unknown };
+    const mode = typeof body.mode === "string" ? parseKgExecutionModeEnv(body.mode) : undefined;
+    if (!mode) {
+      json(res, 400, { error: "mode must be github-actions or fly-machines" });
+      return;
+    }
+
+    setKgExecutionMode(mode);
+    const status = getKgExecutionMode(!!(config.flySessionsToken && config.flySessionsApp));
+
+    json(res, 200, { mode: status.mode, source: status.source });
+  } catch {
+    json(res, 400, { error: "Invalid request body" });
+  }
+}
+
 async function handleListSessions(
   _req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -1794,8 +1848,8 @@ async function handleDestroySession(
   if (job?.phase === "kg-refresh") {
     if (job.executionMode === "github-actions") {
       // The KgRefresh workflow requests the GitHub cancellation and waits for confirmed
-      // termination (AII-901); the Fly branch below also keeps destroyMachine because the
-      // workflow has no Fly dep.
+      // termination (AII-901); the Fly branch below destroys through destroyMachineRecorded
+      // (which guards durable-runner machines) because the workflow has no Fly dep.
       if (!deps.kgRefresh) {
         json(res, 501, { error: "KG refresh is not configured" });
         return;
@@ -1821,7 +1875,7 @@ async function handleDestroySession(
         return;
       }
       try {
-        await destroyMachine(config.flySessionsToken, config.flySessionsApp, machineId);
+        await destroyMachineRecorded(config, machineId, "admin-stop");
       } catch (err) {
         // 404 is fine — machine was already gone
         if (!(err instanceof Error && err.message.includes("404"))) {
@@ -1869,7 +1923,7 @@ async function handleDestroySession(
   }
 
   try {
-    await destroyMachine(config.flySessionsToken, config.flySessionsApp, machineId);
+    await destroyMachineRecorded(config, machineId, "admin-stop");
   } catch (err) {
     // 404 is fine — machine was already gone
     if (!(err instanceof Error && err.message.includes("404"))) {
@@ -2612,28 +2666,41 @@ async function handleUnsetSecret(
   }
 }
 
+function flySettingsView(): Record<string, unknown> {
+  const dbSettings = getOrchestratorSettings();
+  const fly = getFlySessionsConfig();
+  const envApp = process.env.FLY_SESSIONS_APP || null;
+  const envRegion = process.env.FLY_SESSIONS_REGION || null;
+  // Once RunnerBackend/fly-machines has been read, the env vars and rows are inert for these values.
+  const source = getRunnerBackendSource();
+  return {
+    runnerBackendSource: source,
+    flySessionsApp: {
+      runtimeValue: fly.app,
+      dbValue: dbSettings.flySessionsApp,
+      envValue: envApp,
+      overriddenByEnv: source === "fallback" && envApp !== null,
+      source,
+    },
+    flySessionsRegion: {
+      runtimeValue: fly.region,
+      dbValue: dbSettings.flySessionsRegion,
+      envValue: envRegion,
+      overriddenByEnv: source === "fallback" && envRegion !== null,
+      source,
+    },
+  };
+}
+
 function handleGetSettings(
   _req: http.IncomingMessage,
   res: http.ServerResponse,
-  config: AdminConfig,
+  _config: AdminConfig,
 ): void {
   const dbSettings = getOrchestratorSettings();
-  const envApp = process.env.FLY_SESSIONS_APP || null;
-  const envRegion = process.env.FLY_SESSIONS_REGION || null;
 
   json(res, 200, {
-    flySessionsApp: {
-      runtimeValue: config.flySessionsApp,
-      dbValue: dbSettings.flySessionsApp,
-      envValue: envApp,
-      overriddenByEnv: envApp !== null,
-    },
-    flySessionsRegion: {
-      runtimeValue: config.flySessionsRegion,
-      dbValue: dbSettings.flySessionsRegion,
-      envValue: envRegion,
-      overriddenByEnv: envRegion !== null,
-    },
+    ...flySettingsView(),
     kgRefreshReportIssue: {
       value: dbSettings.kgRefreshReportIssue,
     },
@@ -2653,7 +2720,9 @@ function handleGetSettings(
 async function handlePostSettings(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  config: AdminConfig,
+  _config: AdminConfig,
+  gate: Extract<AdminGate, { ok: true }>,
+  deps: AdminDeps,
 ): Promise<void> {
   let body: {
     flySessionsApp?: string | null;
@@ -2705,17 +2774,47 @@ async function handlePostSettings(
     setOrchestratorSetting("linearPickupLabel", trimmed ? trimmed : null);
   }
 
-  if ("flySessionsApp" in body) {
-    const val = typeof body.flySessionsApp === "string" && body.flySessionsApp.trim()
-      ? body.flySessionsApp.trim()
-      : null;
-    setOrchestratorSetting("flySessionsApp", val);
+  const flyPatch: Record<string, string | null> = {};
+  for (const [field, key] of [["flySessionsApp", "app"], ["flySessionsRegion", "region"]] as const) {
+    if (field in body) {
+      const raw = body[field];
+      flyPatch[key] = typeof raw === "string" && raw.trim() ? raw.trim() : null;
+    }
   }
-  if ("flySessionsRegion" in body) {
-    const val = typeof body.flySessionsRegion === "string" && body.flySessionsRegion.trim()
-      ? body.flySessionsRegion.trim()
-      : null;
-    setOrchestratorSetting("flySessionsRegion", val);
+  if (Object.keys(flyPatch).length > 0) {
+    // The Restate object owns these values; a failure answers 503 rather than writing a row it would ignore.
+    if (!deps.callTool) {
+      json(res, 503, { error: "restate-unavailable" });
+      return;
+    }
+    const caller: Caller = { kind: "human", email: gate.identity?.email ?? null, role: gate.role };
+    let result: Awaited<ReturnType<NonNullable<AdminDeps["callTool"]>>>;
+    try {
+      result = await deps.callTool("set_runner_backend", { backend: "fly-machines", patch: flyPatch }, caller);
+    } catch (err) {
+      console.error("[admin] set_runner_backend failed:", err);
+      json(res, 503, { error: "restate-unavailable" });
+      return;
+    }
+    if (result.status !== "ok") {
+      json(res, result.status === "deploy-held" ? 409 : 503, { error: result.status === "deploy-held" ? "deploy-in-progress" : "restate-unavailable" });
+      return;
+    }
+    const text = result.content?.[0]?.text ?? "";
+    if (result.isError) {
+      json(res, 502, { error: text || "set_runner_backend failed" });
+      return;
+    }
+    try {
+      const parsed = JSON.parse(text) as { status?: number; body?: { error?: string } };
+      if (parsed.status === 400) {
+        json(res, 400, { error: parsed.body?.error ?? "invalid runner backend settings" });
+        return;
+      }
+    } catch {
+      /* a non-JSON reply is the stored state's absence; the refresh below settles it */
+    }
+    await (deps.refreshRunnerBackendCache ?? refreshRunnerBackendCache)();
   }
   if ("kgRefreshReportIssue" in body) {
     const val = typeof body.kgRefreshReportIssue === "string" && body.kgRefreshReportIssue.trim()
@@ -2731,26 +2830,9 @@ async function handlePostSettings(
   }
 
   const dbSettings = getOrchestratorSettings();
-  const envApp = process.env.FLY_SESSIONS_APP || null;
-  const envRegion = process.env.FLY_SESSIONS_REGION || null;
-
-  const nextApp = envApp ?? dbSettings.flySessionsApp;
-  const nextRegion = envRegion ?? dbSettings.flySessionsRegion;
-  const restartRequired = nextApp !== config.flySessionsApp || nextRegion !== config.flySessionsRegion;
 
   json(res, 200, {
-    flySessionsApp: {
-      runtimeValue: config.flySessionsApp,
-      dbValue: dbSettings.flySessionsApp,
-      envValue: envApp,
-      overriddenByEnv: envApp !== null,
-    },
-    flySessionsRegion: {
-      runtimeValue: config.flySessionsRegion,
-      dbValue: dbSettings.flySessionsRegion,
-      envValue: envRegion,
-      overriddenByEnv: envRegion !== null,
-    },
+    ...flySettingsView(),
     kgRefreshReportIssue: {
       value: dbSettings.kgRefreshReportIssue,
     },
@@ -2764,7 +2846,6 @@ async function handlePostSettings(
     },
     retryPolicy: getRetryPolicy(),
     retryPolicyDefaults: DEFAULT_RETRY_POLICY,
-    restartRequired,
   });
 }
 
@@ -3011,6 +3092,8 @@ export interface UpsertMappingBody {
   reviewers?: unknown;
   prDispatchBudget?: number | null;
   reviewFixLifecycle?: string | null;
+  trustedReviewAuthors?: unknown;
+  reviewProcess?: unknown;
 }
 
 export async function upsertMappingAction(
@@ -3234,6 +3317,33 @@ export async function upsertMappingAction(
     }
   }
 
+  let trustedReviewAuthors: string[] | null;
+  if (body.trustedReviewAuthors === undefined) {
+    // Preserve stored value on omit — a PATCH-style save must not silently strip a project's trusted-author grant.
+    trustedReviewAuthors = existingMapping?.trustedReviewAuthors ?? null;
+  } else if (body.trustedReviewAuthors === null) {
+    // Explicit null resets to the NULL default (built-ins only), mirroring reviewers above.
+    trustedReviewAuthors = null;
+  } else {
+    try {
+      trustedReviewAuthors = normalizeTrustedReviewAuthors(body.trustedReviewAuthors);
+    } catch (err) {
+      return { status: 400, body: { error: `trustedReviewAuthors invalid: ${err instanceof Error ? err.message : String(err)}` } };
+    }
+  }
+
+  // No enablement check: the process and its trusted authors apply to every project; only the forward to `ReviewFixPR.feedback` needs the Restate lifecycle.
+  let reviewProcess: ReviewProcessId | null;
+  if (body.reviewProcess === undefined) {
+    reviewProcess = existingMapping?.reviewProcess ?? null;
+  } else if (body.reviewProcess === null || body.reviewProcess === "ai-implement") {
+    reviewProcess = null;
+  } else if (isReviewProcessId(body.reviewProcess)) {
+    reviewProcess = body.reviewProcess;
+  } else {
+    return { status: 400, body: { error: `reviewProcess invalid: must be null, "ai-implement", "claude-code-review", or "claude-code-review-repository-fix"` } };
+  }
+
   const mapping: RepoMapping = {
     owner: body.owner,
     repo: body.repo,
@@ -3271,6 +3381,8 @@ export async function upsertMappingAction(
     reviewers,
     prDispatchBudget,
     reviewFixLifecycle,
+    trustedReviewAuthors,
+    reviewProcess,
   };
 
   // Existing attempts keep their stored owner. Revalidate only when a save first enables

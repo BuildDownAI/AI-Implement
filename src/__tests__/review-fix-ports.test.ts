@@ -167,11 +167,11 @@ function createFinalizerDouble(): ReviewFixFinalizerPort {
   let nextEffectId = 1;
 
   return {
-    async recordOutcome(outcome: ReviewFixImmutableOutcome): Promise<RecordOutcomeResult> {
+    async recordOutcome(outcome: ReviewFixImmutableOutcome, now: number): Promise<RecordOutcomeResult> {
       const existing = outcomes.get(outcome.attemptId);
       if (existing) return { status: "already_recorded", outcome: existing };
       outcomes.set(outcome.attemptId, outcome);
-      return { status: "recorded" };
+      return { status: "recorded", completedAt: now };
     },
     async applyApproval(input: ReviewFixApprovalInput): Promise<ApprovalEffectOutcome> {
       if (!input.currentAuthority || input.currentPrHeadSha !== input.result.outputCommit || !input.policyAllows) {
@@ -272,9 +272,9 @@ describe("review-fix ports: representative doubles exercise the full lifecycle",
     const execution = await callerLaunchesAndReconcilesOnUnknown(worker, attempt!);
     expect(execution).not.toBeNull();
 
-    const bind = await store.bindExecution(attempt!.attemptId, execution!);
+    const bind = await store.bindExecution(attempt!.attemptId, execution!, Date.now());
     expect(bind.status).toBe("bound");
-    expect((await store.bindExecution(attempt!.attemptId, execution!)).status).toBe("already_bound");
+    expect((await store.bindExecution(attempt!.attemptId, execution!, Date.now())).status).toBe("already_bound");
 
     const found = await worker.reconcile(attempt!.attemptId, SCOPE);
     expect(found).toEqual({ status: "found", execution });
@@ -294,7 +294,7 @@ describe("review-fix ports: representative doubles exercise the full lifecycle",
 
     const execution = await callerLaunchesAndReconcilesOnUnknown(worker, attempt!);
     expect(execution).not.toBeNull();
-    await store.bindExecution(attempt!.attemptId, execution!);
+    await store.bindExecution(attempt!.attemptId, execution!, Date.now());
 
     const terminal = await worker.inspectTerminal(execution!);
     expect(terminal.reached).toBe(true);
@@ -313,9 +313,9 @@ describe("review-fix ports: representative doubles exercise the full lifecycle",
       githubRunAttempt: execution!.githubRunAttempt,
       outputCommit,
     };
-    const intake = await store.recordResult(attempt!.attemptId, result);
+    const intake = await store.recordResult(attempt!.attemptId, result, Date.now());
     expect(intake.status).toBe("stored");
-    expect((await store.recordResult(attempt!.attemptId, result)).status).toBe("duplicate");
+    expect((await store.recordResult(attempt!.attemptId, result, Date.now())).status).toBe("duplicate");
 
     const disposition: ReviewFixFindingDisposition = { findingKey: "f1", disposition: "addressed" };
     const approvalInput: ReviewFixApprovalInput = {
@@ -336,13 +336,13 @@ describe("review-fix ports: representative doubles exercise the full lifecycle",
       attemptId: attempt!.attemptId,
       scope: SCOPE,
       terminal: terminal.outcome,
-    });
+    }, Date.now());
     expect(outcomeRecord.status).toBe("recorded");
     const repeatOutcomeRecord = await finalizer.recordOutcome({
       attemptId: attempt!.attemptId,
       scope: SCOPE,
       terminal: terminal.outcome,
-    });
+    }, Date.now());
     expect(repeatOutcomeRecord).toEqual({
       status: "already_recorded",
       outcome: { attemptId: attempt!.attemptId, scope: SCOPE, terminal: terminal.outcome },
@@ -361,7 +361,7 @@ describe("review-fix ports: representative doubles exercise the full lifecycle",
       jobTimeoutMinutes: DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES,
     });
     expect(attempt).not.toBeNull();
-    await store.revokeAuthority(attempt!.attemptId);
+    await store.revokeAuthority(attempt!.attemptId, Date.now());
     expect(await store.hasCurrentAuthority(attempt!.attemptId)).toBe(false);
 
     const outputCommit = "b".repeat(40);

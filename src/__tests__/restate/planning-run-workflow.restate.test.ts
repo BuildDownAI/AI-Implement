@@ -4,7 +4,7 @@
 // deadlines), `window` (a short confirm window) and `deadline` (short bootstrap and total deadlines).
 //
 // Run with `npm run test:restate`; excluded from `npm test`.
-import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { DispatchAdmissionReleaseReason } from "../../dispatch-admission.js";
 import type { OwnedRunStatus } from "../../restate/owned-run-wait.js";
@@ -143,9 +143,9 @@ function makeDeps(seams: typeof SLOW): PlanningRunDependencies {
 }
 
 describe("PlanningRun durable workflow", () => {
-  let slow: Map<string, RestateTestEnvironment>;
-  let window: Map<string, RestateTestEnvironment>;
-  let deadline: Map<string, RestateTestEnvironment>;
+  let slow: Map<string, RestateEnvironment>;
+  let window: Map<string, RestateEnvironment>;
+  let deadline: Map<string, RestateEnvironment>;
   let counter = 0;
 
   beforeAll(async () => {
@@ -162,14 +162,14 @@ describe("PlanningRun durable workflow", () => {
 
   const labels = VARIANTS.map(([label]) => label);
 
-  function baseUrl(envs: Map<string, RestateTestEnvironment>, label: string): string {
+  function baseUrl(envs: Map<string, RestateEnvironment>, label: string): string {
     const env = envs.get(label);
     if (!env) throw new Error(`missing Restate variant ${label}`);
     return env.baseUrl();
   }
 
   /** Registers a scenario and starts `PlanningRun.run`; `done` settles with the run's result. */
-  function begin(envs: Map<string, RestateTestEnvironment>, label: string, overrides: Partial<Scenario> = {}) {
+  function begin(envs: Map<string, RestateEnvironment>, label: string, overrides: Partial<Scenario> = {}) {
     const dispatchId = `planning-${label}-${counter++}`;
     const sc: Scenario = {
       launchResult: { outcome: "accepted", jobId: `job-${dispatchId}` },
@@ -354,7 +354,7 @@ describe("PlanningRun durable workflow", () => {
   }, 60_000);
 
   /** Cancels the `run` invocation of a dispatch id. */
-  async function cancelRun(envs: Map<string, RestateTestEnvironment>, label: string, dispatchId: string): Promise<void> {
+  async function cancelRun(envs: Map<string, RestateEnvironment>, label: string, dispatchId: string): Promise<void> {
     const env = envs.get(label)!;
     const rows = await eventually(
       () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'PlanningRun' AND target_service_key = '${dispatchId}' AND target_handler_name = 'run'`),

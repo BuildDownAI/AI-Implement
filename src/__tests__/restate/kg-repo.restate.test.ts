@@ -3,7 +3,7 @@
 // count and inspect the sends without depending on the real workflow module.
 import { randomUUID } from "node:crypto";
 import * as restate from "@restatedev/restate-sdk";
-import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { MAX_TRACKED_PRS } from "../../kg-refresh.js";
 import { KG_REFRESH_TOTAL_DEADLINE_MS, KG_REPO_STALE_MARGIN_MS } from "../../restate/kg-refresh-workflow.js";
@@ -34,7 +34,7 @@ const privateCaller = restate.service({
       }),
   },
 });
-async function callPrivate(baseUrl: string, slug: string, handler: "release" | "expire" | "recordDryRunOutcome" | "recordAdminDryRun", body: unknown): Promise<unknown> {
+async function callPrivate(baseUrl: string, slug: string, handler: "release" | "expire" | "extend" | "recordDryRunOutcome" | "recordAdminDryRun", body: unknown): Promise<unknown> {
   return callService<unknown>(baseUrl, "KgRepoPrivateCaller", "call", { slug, handler, body });
 }
 
@@ -50,10 +50,12 @@ describe("KgRepo durable single-flight lock", () => {
     },
   });
 
-  const kgRepo = createKgRepo({ workflowName: FAKE_WORKFLOW_NAME });
+  // These scenarios drive expire by hand against a live marker; the legacy marker shape (no leaseUntil) keeps
+  // that clearing. The lease rules themselves are covered in "KgRepo object-owned lease expiry".
+  const kgRepo = createKgRepo({ workflowName: FAKE_WORKFLOW_NAME, omitLeaseUntil: true });
 
 
-  let envs: Map<string, RestateTestEnvironment>;
+  let envs: Map<string, RestateEnvironment>;
   beforeAll(async () => {
     envs = await startVariants([kgRepo, fakeKgRefresh, privateCaller]);
   }, 60_000);
@@ -61,7 +63,7 @@ describe("KgRepo durable single-flight lock", () => {
     if (envs) await stopAll(envs);
   });
 
-  function envFor(label: string): RestateTestEnvironment {
+  function envFor(label: string): RestateEnvironment {
     const env = envs.get(label);
     if (!env) throw new Error(`missing Restate variant ${label}`);
     return env;
@@ -181,7 +183,7 @@ describe("KgRepo durable single-flight lock", () => {
 
   // ---- AII-730: the PR-check dry-run queue ----
 
-  const reportFor = (prNumber: number, sha = `sha-${prNumber}`) => ({ repo: "org/kg-source", prNumber, sha, acceptBaseline: false });
+  const reportFor = (prNumber: number, sha = `sha-${prNumber}`) => ({ repo: "org/kg-source", prNumber, sha });
 
   async function enqueue(baseUrl: string, slug: string, prNumber: number, ref: string): Promise<KgRepoEnqueueResult> {
     return callObject<KgRepoEnqueueResult>(baseUrl, "KgRepo", slug, "enqueueDryRun", {
@@ -452,36 +454,24 @@ describe("KgRepo durable single-flight lock", () => {
   });
   const record = (baseUrl: string, slug: string, prNumber: number, sha = `sha-${prNumber}`) =>
     callPrivate(baseUrl, slug, "recordDryRunOutcome", { report: reportFor(prNumber, sha), outcome: outcomeFor(prNumber) });
-  const readOutcome = (baseUrl: string, slug: string, prNumber: number) =>
-    callObject<{ sha: string; outcome: unknown } | null>(baseUrl, "KgRepo", slug, "dryRunOutcome", { repo: "org/kg-source", prNumber });
 
   it.each(VARIANTS.map(([label]) => label))(
-    "O0: recordAdminDryRun then lastAdminDryRun returns the outcome, last write wins, null when none; the per-PR key is untouched (%s)",
+    "O0: recordAdminDryRun accepts an in-flight workflow's old-shape send and stores nothing (%s)",
     async (label) => {
       const env = envFor(label);
       const slug = newKey();
-      const read = () => callObject<unknown>(env.baseUrl(), "KgRepo", slug, "lastAdminDryRun", undefined);
-      expect(await read()).toBeNull();
       await callPrivate(env.baseUrl(), slug, "recordAdminDryRun", { outcome: outcomeFor(1) });
-      expect(await read()).toEqual(outcomeFor(1));
-      await callPrivate(env.baseUrl(), slug, "recordAdminDryRun", { outcome: outcomeFor(2) });
-      expect(await read()).toEqual(outcomeFor(2));
-      expect(await readOutcome(env.baseUrl(), slug, 1)).toBeNull();
+      expect(await repoStatus(env.baseUrl(), slug)).toBeNull();
     },
   );
 
   it.each(VARIANTS.map(([label]) => label))(
-    "O1: recordDryRunOutcome then dryRunOutcome returns the same sha and outcome; an unknown PR is null (%s)",
+    "O1: recordDryRunOutcome accepts a journaled send and stores nothing (%s)",
     async (label) => {
       const env = envFor(label);
       const slug = newKey();
       await record(env.baseUrl(), slug, 3, "sha-a");
-      expect(await readOutcome(env.baseUrl(), slug, 3)).toEqual({ sha: "sha-a", outcome: outcomeFor(3) });
-      expect(await readOutcome(env.baseUrl(), slug, 4)).toBeNull();
-
-      // A newer head for the same PR replaces it.
-      await record(env.baseUrl(), slug, 3, "sha-b");
-      expect((await readOutcome(env.baseUrl(), slug, 3))?.sha).toBe("sha-b");
+      expect(await repoStatus(env.baseUrl(), slug)).toBeNull();
     },
   );
 
@@ -515,39 +505,18 @@ describe("KgRepo durable single-flight lock", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
-    "O2: forgetPr clears the outcome and the PR's pending entry, and leaves other PRs (%s)",
+    "O2: forgetPr clears the PR's pending entry and leaves other PRs (%s)",
     async (label) => {
       const env = envFor(label);
       const slug = newKey();
       await trigger(env.baseUrl(), slug);
       await enqueue(env.baseUrl(), slug, 1, "one");
       await enqueue(env.baseUrl(), slug, 2, "two");
-      await record(env.baseUrl(), slug, 1);
-      await record(env.baseUrl(), slug, 2);
 
       await callObject(env.baseUrl(), "KgRepo", slug, "forgetPr", { repo: "org/kg-source", prNumber: 1 });
 
-      expect(await readOutcome(env.baseUrl(), slug, 1)).toBeNull();
-      expect(await readOutcome(env.baseUrl(), slug, 2)).not.toBeNull();
       expect((await repoStatus(env.baseUrl(), slug))?.pending).toEqual(["org/kg-source#2"]);
     },
-  );
-
-  it.each(VARIANTS.map(([label]) => label))(
-    "O3: MAX_TRACKED_PRS + 1 outcomes evict the oldest; re-recording moves a PR to the back (%s)",
-    async (label) => {
-      const env = envFor(label);
-      const slug = newKey();
-      for (let n = 1; n <= MAX_TRACKED_PRS; n++) await record(env.baseUrl(), slug, n);
-      // PR 1 is re-recorded, so PR 2 is now the oldest.
-      await record(env.baseUrl(), slug, 1);
-      await record(env.baseUrl(), slug, MAX_TRACKED_PRS + 1);
-
-      expect(await readOutcome(env.baseUrl(), slug, 2)).toBeNull();
-      expect(await readOutcome(env.baseUrl(), slug, 1)).not.toBeNull();
-      expect(await readOutcome(env.baseUrl(), slug, MAX_TRACKED_PRS + 1)).not.toBeNull();
-    },
-    120_000,
   );
 
   it.each(VARIANTS.map(([label]) => label))(
@@ -559,12 +528,8 @@ describe("KgRepo durable single-flight lock", () => {
         callPrivate(env.baseUrl(), slug, "recordDryRunOutcome", { report: reportFor(1), outcome: outcomeFor(1), extra: 1 }),
       ).rejects.toThrow();
       await expect(
-        callObject(env.baseUrl(), "KgRepo", slug, "dryRunOutcome", { repo: "org/kg-source", prNumber: 1, extra: 1 }),
-      ).rejects.toThrow();
-      await expect(
         callObject(env.baseUrl(), "KgRepo", slug, "forgetPr", { repo: "org/kg-source", prNumber: 1, extra: 1 }),
       ).rejects.toThrow();
-      expect(await readOutcome(env.baseUrl(), slug, 1)).toBeNull();
     },
   );
 });
@@ -577,8 +542,19 @@ describe("KgRepo object-owned lease expiry", () => {
     handlers: { run: async (): Promise<void> => {} },
   });
 
-  let production: Map<string, RestateTestEnvironment>;
-  let short: Map<string, RestateTestEnvironment>;
+  let production: Map<string, RestateEnvironment>;
+  let short: Map<string, RestateEnvironment>;
+  let legacy: Map<string, RestateEnvironment>;
+  let counted: Map<string, RestateEnvironment>;
+  const countedSends: Array<{ parameter: { triggerId: string; kgSourceRef?: string } }> = [];
+  const countingKgRefresh = restate.object({
+    name: "CountingKgRefresh",
+    handlers: {
+      run: async (_ctx: restate.ObjectContext, input: { triggerId: string; kgSourceRef?: string }): Promise<void> => {
+        countedSends.push({ parameter: input });
+      },
+    },
+  });
   beforeAll(async () => {
     production = await startVariants([createKgRepo({ workflowName: FAKE_WORKFLOW_NAME }), fakeKgRefresh, privateCaller]);
     short = await startVariants([
@@ -586,19 +562,32 @@ describe("KgRepo object-owned lease expiry", () => {
       fakeKgRefresh,
       privateCaller,
     ]);
-  }, 120_000);
+    legacy = await startVariants([createKgRepo({ workflowName: FAKE_WORKFLOW_NAME, omitLeaseUntil: true }), fakeKgRefresh, privateCaller]);
+    counted = await startVariants([
+      createKgRepo({ workflowName: "CountingKgRefresh", totalDeadlineMs: SHORT_TOTAL_MS, staleMarginMs: SHORT_MARGIN_MS }),
+      countingKgRefresh,
+      privateCaller,
+    ]);
+  }, 180_000);
   afterAll(async () => {
     if (production) await stopAll(production);
     if (short) await stopAll(short);
+    if (legacy) await stopAll(legacy);
+    if (counted) await stopAll(counted);
   });
 
-  const pick = (envs: Map<string, RestateTestEnvironment>, label: string): RestateTestEnvironment => {
+  const pick = (envs: Map<string, RestateEnvironment>, label: string): RestateEnvironment => {
     const env = envs.get(label);
     if (!env) throw new Error(`missing Restate variant ${label}`);
     return env;
   };
+  const expireRows = (env: RestateEnvironment, slug: string) =>
+    queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRepo' AND target_service_key = '${slug}' AND target_handler_name = 'expire'`);
+  const leaseOf = (env: RestateEnvironment, slug: string) =>
+    callObject<{ triggerId: string; leaseUntil?: number; pending: string[] } | null>(env.baseUrl(), "KgRepo", slug, "status", {});
+  const warnings = (spy: { mock: { calls: unknown[][] } }) => spy.mock.calls.filter((c) => String(c[1]).includes("expired in-flight marker"));
   const slugOf = () => `buildDownAI/kg-source-${randomUUID()}`;
-  const markerOf = (env: RestateTestEnvironment, slug: string) =>
+  const markerOf = (env: RestateEnvironment, slug: string) =>
     callObject<{ triggerId: string } | null>(env.baseUrl(), "KgRepo", slug, "status", {});
 
   it.each(VARIANTS.map(([label]) => label))(
@@ -670,11 +659,11 @@ describe("KgRepo object-owned lease expiry", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
-    "release, expire and recordDryRunOutcome are ingress-private; trigger and status stay public (%s)",
+    "release, expire, extend and recordDryRunOutcome are ingress-private; trigger and status stay public (%s)",
     async (label) => {
       const env = pick(production, label);
       const slug = slugOf();
-      for (const handler of ["release", "expire", "recordDryRunOutcome"]) {
+      for (const handler of ["release", "expire", "extend", "recordDryRunOutcome"]) {
         const response = await fetch(`${env.baseUrl()}/KgRepo/${encodeURIComponent(slug)}/${handler}`, {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -687,6 +676,150 @@ describe("KgRepo object-owned lease expiry", () => {
       // The workflow's own path still works: a forwarded release clears the marker.
       await callPrivate(env.baseUrl(), slug, "release", { triggerId: triggered.triggerId });
       expect(await callObject(env.baseUrl(), "KgRepo", slug, "status", {})).toBeNull();
+    },
+    30_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "submit stores leaseUntil equal to startedAt plus the delay; expire with the live id before it is a no-op (%s)",
+    async (label) => {
+      const env = pick(production, label);
+      const slug = slugOf();
+      const { triggerId } = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", slug, "trigger", {});
+      const marker = (await callObject<{ startedAt: number; leaseUntil?: number } | null>(env.baseUrl(), "KgRepo", slug, "status", {}))!;
+      expect(marker.leaseUntil).toBe(marker.startedAt + KG_REFRESH_TOTAL_DEADLINE_MS + KG_REPO_STALE_MARGIN_MS);
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        await callPrivate(env.baseUrl(), slug, "expire", { triggerId });
+        expect(warnings(warnSpy)).toHaveLength(0);
+      } finally {
+        warnSpy.mockRestore();
+      }
+      expect((await markerOf(env, slug))?.triggerId).toBe(triggerId);
+    },
+    30_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "extend with a later time sets leaseUntil and schedules a second expire about until-now out (%s)",
+    async (label) => {
+      const env = pick(production, label);
+      const slug = slugOf();
+      const { triggerId } = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", slug, "trigger", {});
+      const before = (await leaseOf(env, slug))!.leaseUntil!;
+      const newLease = before + 3_600_000;
+      expect(await callPrivate(env.baseUrl(), slug, "extend", { triggerId, until: newLease })).toEqual({ extended: true });
+      expect((await leaseOf(env, slug))?.leaseUntil).toBe(newLease);
+      const rows = await eventually(() => expireRows(env, slug), (found) => found.length === 2, { label: "two scheduled KgRepo.expire", timeoutMs: 30_000 });
+      const delays = rows.map((r) => Date.parse(String(r.scheduled_start_at)) - Date.parse(String(r.created_at))).sort((a, b) => a - b);
+      expect(Math.abs(delays[1] - (KG_REFRESH_TOTAL_DEADLINE_MS + KG_REPO_STALE_MARGIN_MS + 3_600_000))).toBeLessThan(10_000);
+    },
+    30_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "extend for another trigger id, to an equal or earlier time, or with no marker changes nothing (%s)",
+    async (label) => {
+      const env = pick(production, label);
+      const slug = slugOf();
+      expect(await callPrivate(env.baseUrl(), slug, "extend", { triggerId: "t", until: Date.now() + 1e9 })).toEqual({ extended: false });
+      expect(await leaseOf(env, slug)).toBeNull();
+
+      const { triggerId } = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", slug, "trigger", {});
+      const lease = (await leaseOf(env, slug))!.leaseUntil!;
+      await eventually(() => expireRows(env, slug), (found) => found.length === 1, { label: "one scheduled KgRepo.expire", timeoutMs: 30_000 });
+
+      expect(await callPrivate(env.baseUrl(), slug, "extend", { triggerId: "other", until: lease + 1e6 })).toEqual({ extended: false });
+      expect(await callPrivate(env.baseUrl(), slug, "extend", { triggerId, until: lease })).toEqual({ extended: false });
+      expect(await callPrivate(env.baseUrl(), slug, "extend", { triggerId, until: lease - 1_000 })).toEqual({ extended: false });
+      expect((await leaseOf(env, slug))?.leaseUntil).toBe(lease);
+      expect(await expireRows(env, slug)).toHaveLength(1);
+    },
+    30_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "extend rejects an empty trigger id, a non-numeric until, and unknown fields (%s)",
+    async (label) => {
+      const env = pick(production, label);
+      const slug = slugOf();
+      await expect(callPrivate(env.baseUrl(), slug, "extend", { triggerId: "", until: 1 })).rejects.toThrow();
+      await expect(callPrivate(env.baseUrl(), slug, "extend", { triggerId: "t", until: "soon" })).rejects.toThrow();
+      await expect(callPrivate(env.baseUrl(), slug, "extend", { triggerId: "t", until: 1, extra: 1 })).rejects.toThrow();
+    },
+    30_000,
+  );
+
+  // The first (short) expire fires while the lease is extended and leaves the marker; the one scheduled for the
+  // new time clears it. Order is decided by the lease, not by a wall-clock window on the first expire.
+  it.each(VARIANTS.map(([label]) => label))(
+    "an extended lease survives the first expire and is cleared by the second (%s)",
+    async (label) => {
+      const env = pick(short, label);
+      const slug = slugOf();
+      const { triggerId } = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", slug, "trigger", {});
+      const newLease = (await leaseOf(env, slug))!.leaseUntil! + 2_500;
+      expect(await callPrivate(env.baseUrl(), slug, "extend", { triggerId, until: newLease })).toEqual({ extended: true });
+
+      await eventually(
+        () => expireRows(env, slug),
+        (rows) => rows.length === 2 && rows.some((r) => r.status === "completed"),
+        { label: "first KgRepo.expire completed", timeoutMs: 15_000, intervalMs: 50 },
+      );
+      if (Date.now() < newLease) expect((await leaseOf(env, slug))?.triggerId).toBe(triggerId);
+      await eventually(() => markerOf(env, slug), (marker) => marker === null, { label: "KgRepo marker cleared", timeoutMs: 15_000, intervalMs: 50 });
+    },
+    40_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "extend on a marker without leaseUntil rejects an until that is not in the future (%s)",
+    async (label) => {
+      const env = pick(legacy, label);
+      const slug = slugOf();
+      const { triggerId } = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", slug, "trigger", {});
+      expect(await callPrivate(env.baseUrl(), slug, "extend", { triggerId, until: Date.now() - 60_000 })).toEqual({ extended: false });
+      expect((await leaseOf(env, slug))?.leaseUntil).toBeUndefined();
+      expect(await callPrivate(env.baseUrl(), slug, "extend", { triggerId, until: Date.now() + 1e9 })).toEqual({ extended: true });
+    },
+    30_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "a marker written without leaseUntil is cleared by expire (%s)",
+    async (label) => {
+      const env = pick(legacy, label);
+      const slug = slugOf();
+      const { triggerId } = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", slug, "trigger", {});
+      expect((await leaseOf(env, slug))?.leaseUntil).toBeUndefined();
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        await callPrivate(env.baseUrl(), slug, "expire", { triggerId });
+        expect(warnings(warnSpy)).toHaveLength(1);
+      } finally {
+        warnSpy.mockRestore();
+      }
+      expect(await markerOf(env, slug)).toBeNull();
+    },
+    30_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "expire at or after leaseUntil clears the marker and drains one pending head (%s)",
+    async (label) => {
+      const env = pick(counted, label);
+      const slug = slugOf();
+      const first = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", slug, "trigger", {});
+      await callObject(env.baseUrl(), "KgRepo", slug, "enqueueDryRun", {
+        key: "org/kg-source#1", ref: "held", report: { repo: "org/kg-source", prNumber: 1, sha: "sha-held" },
+      });
+      await eventually(
+        () => countedSends.filter((s) => s.parameter.triggerId !== first.triggerId && s.parameter.kgSourceRef === "held").length,
+        (n) => n === 1,
+        { label: "pending head drained once", timeoutMs: 15_000, intervalMs: 50 },
+      );
+      expect(countedSends.filter((s) => s.parameter.triggerId === first.triggerId)).toHaveLength(1);
     },
     30_000,
   );

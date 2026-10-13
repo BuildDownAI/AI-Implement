@@ -19,7 +19,7 @@ import { execSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const sim = vi.hoisted(() => ({
@@ -52,6 +52,7 @@ vi.mock("../../restate/kg-refresh-workflow.js", async (importOriginal) => {
 });
 
 import { getDb } from "../../dedup.js";
+import { getFlySessionsConfig, setOrchestratorSetting } from "../../orchestrator-settings.js";
 import { initMappingsTable } from "../../config.js";
 import { initLogTable, appendLog, updateJobStatus } from "../../log.js";
 import { initSettingsTable } from "../../runner-mode.js";
@@ -64,7 +65,7 @@ import { orchestratorTools, setKgRefreshToolDeps } from "../../restate/tools.js"
 import { callToolAsSystem } from "../../restate/tools-client.js";
 import { makeKgRefreshAdminDeps, sweepLegacyKgRefreshRows } from "../../index.js";
 import type { RestateService } from "../../restate/endpoint.js";
-import { VARIANTS, eventually, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, eventually, journalEntries, journaledRunResult, queryInvocations, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
 
 const KG_SOURCE_REPO = "TestOrg/test-kg-source";
 const NAMESPACE = "https://kg.test.example/";
@@ -126,9 +127,10 @@ let persistCalls = 0;
 let servedStamp = OLD_STAMP;
 let tarball: Buffer;
 let fixtureRepo: string;
+let compose: (over?: Partial<Parameters<typeof createProductionKgRefreshServices>[0]>) => ReturnType<typeof createProductionKgRefreshServices>;
 
 describe("Restate kg-refresh pilot: production-composition proof", () => {
-  let environments: Map<string, RestateTestEnvironment>;
+  let environments: Map<string, RestateEnvironment>;
   let services: RestateService[];
 
   beforeAll(async () => {
@@ -185,22 +187,30 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
       setCommitStatusFn: (async () => {}) as unknown as KgRailDeps["setCommitStatusFn"],
       mergePullRequestFn: (async () => { mergeCalls++; return "merged"; }) as unknown as KgRailDeps["mergePullRequestFn"],
       closePullRequestFn: (async () => {}) as unknown as KgRailDeps["closePullRequestFn"],
+      getPullRequestStateFn: (async () => null) as unknown as KgRailDeps["getPullRequestStateFn"],
       deleteBranchFn: (async () => {}) as unknown as KgRailDeps["deleteBranchFn"],
     };
 
-    const composed = createProductionKgRefreshServices({
+    compose = (over = {}) => createProductionKgRefreshServices({
       kgSourceRepo: KG_SOURCE_REPO,
       config: {
         githubAppId: "test-app-id", githubAppPrivateKey: "test-private-key", sessionImage: "runner:test",
         runnerImageExplicit: false, runnerCallbackBaseUrl: "https://orchestrator.test", runnerTokenSecret: SECRET,
-        flySessionsToken: null, flySessionsApp: null,
+        flySessionsToken: null, flySessionsApp: null, flySessionsRegion: null,
+        localRunnerImage: "local:img", localRunnerOrchestratorUrl: null, healthPort: 8080,
+        anthropicApiKey: null, claudeOAuthToken: null,
       },
       ...railFakes,
-      dispatchKgRefreshRun: async () => { throw new Error("the legacy dispatcher must not run on the GHA path"); },
+      // Sender deps: the GitHub Actions path uses the faked dispatch POST; the machine backends must not run.
+      getInstallationToken: async () => "tok",
+      getScopedInstallationToken: async () => ({ token: "scoped-tok", expiresAt: "", installationId: 1 }),
+      resolveRunnerImage: async () => undefined,
+      postWorkflowDispatch: ((opts: { inputs: Record<string, string | undefined> }) => sim.postWorkflowDispatch(opts)) as never,
+      keptMachineFly: () => { throw new Error("the Fly sender must not run on the GHA path"); },
+      startLocalRunnerContainer: async () => { throw new Error("the local Docker sender must not run on the GHA path"); },
       // No runner mode resolves KG to GitHub Actions now (AII-1130); the seam keeps this branch under test until AII-1110.
       resolveExecutionMode: () => "github-actions",
       updateJobStatus,
-      recordDispatch: () => {},
       getWorkflowRunStatus: async (runId) => { gh.statusCalls.push(runId); return { ...gh.runState }; },
       findRunByTitle: async () => gh.findResult(++gh.findCalls),
       cancelWorkflowRun: async (runId) => { gh.cancelCalls.push(runId); return true; },
@@ -217,7 +227,9 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
         fetchWorkflowFile: async () => ({ status: 200, content: ENVELOPE_WORKFLOW_YAML }),
         fetchCompare: async () => ({ status: 200, behindBy: 0 }),
       }),
+      ...over,
     });
+    const composed = compose();
     setKgRefreshToolDeps(composed.toolDeps);
     services = [...composed.services, orchestratorTools];
     environments = await startVariants(services);
@@ -244,33 +256,33 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
   });
   afterEach(() => { sim.fetchGate = undefined; sim.afterStage = undefined; });
 
-  function envFor(label: string): RestateTestEnvironment {
+  function envFor(label: string): RestateEnvironment {
     const env = environments.get(label);
     if (!env) throw new Error(`missing Restate variant ${label}`);
     return env;
   }
 
-  function clientFor(env: RestateTestEnvironment): KgRefreshIngressClient {
+  function clientFor(env: RestateEnvironment): KgRefreshIngressClient {
     return createKgRefreshIngressClient(env.baseUrl());
   }
 
-  const asSystem = (env: RestateTestEnvironment) => (name: string, args: Record<string, unknown>) =>
+  const asSystem = (env: RestateEnvironment) => (name: string, args: Record<string, unknown>) =>
     callToolAsSystem(name, args, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true });
 
-  async function toolAnswer(env: RestateTestEnvironment, name: string, args: Record<string, unknown> = {}): Promise<{ status: number; body: Record<string, unknown> }> {
+  async function toolAnswer(env: RestateEnvironment, name: string, args: Record<string, unknown> = {}): Promise<{ status: number; body: Record<string, unknown> }> {
     const result = await asSystem(env)(name, args);
     if (result.status !== "ok") throw new Error(`${name} unavailable`);
     return JSON.parse(result.content[0].text) as { status: number; body: Record<string, unknown> };
   }
 
-  async function triggerRefresh(env: RestateTestEnvironment): Promise<string> {
+  async function triggerRefresh(env: RestateEnvironment): Promise<string> {
     const answer = await toolAnswer(env, "trigger_kg_refresh");
     expect(answer).toMatchObject({ status: 202, body: { refreshing: true } });
     return answer.body.triggerId as string;
   }
 
   /** The runner's POST /runner/result, through the real callback and ingress client. */
-  function postReport(env: RestateTestEnvironment, token: string, report: Partial<RunnerResultBody>): Promise<HandleRunnerResultOutput> {
+  function postReport(env: RestateEnvironment, token: string, report: Partial<RunnerResultBody>): Promise<HandleRunnerResultOutput> {
     return handleRunnerResult({
       authorization: `Bearer ${token}`,
       body: { phase: "kg-refresh", outcome: "success", comments: [], ...report } as RunnerResultBody,
@@ -304,7 +316,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
   }
 
   /** Ends a run that a scenario left in flight, so the next scenario finds the marker clear. */
-  async function abandon(env: RestateTestEnvironment): Promise<void> {
+  async function abandon(env: RestateEnvironment): Promise<void> {
     const client = clientFor(env);
     if ((await markerOf(client)) === null) return;
     await postReport(env, runToken(), FAILURE_REPORT);
@@ -341,6 +353,34 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     expect(triggerId).toBeTruthy();
   }, 40_000);
 
+  // P1b ------------------------------------------------------------------------------
+  async function runJournal(env: RestateEnvironment, triggerId: string): Promise<Array<Record<string, unknown>>> {
+    const invocations = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`);
+    return journalEntries(env.adminAPIBaseUrl(), invocations[0].id as string);
+  }
+
+  it.each(VARIANTS.map(([label]) => label))("P1b: the row carries the journaled resolve and dispatch-1 values (%s)", async (label) => {
+    const env = envFor(label);
+    const client = clientFor(env);
+    const triggerId = await triggerRefresh(env);
+    await eventually(dispatched, (ok) => ok, { label: "dispatch", timeoutMs: 15_000 });
+    await postReport(env, runToken(), SUCCESS_REPORT);
+    await eventually(() => kgRows().some((r) => r.status === "completed"), (ok) => ok, { label: "durable effect", timeoutMs: 15_000 });
+    await untilMarkerClear(client);
+
+    const journal = await runJournal(env, triggerId);
+    const record = journaledRunResult(journal, "resolve") as Record<string, unknown>;
+    const dispatchResult = journaledRunResult(journal, "dispatch-1") as Record<string, unknown>;
+    const row = getDb().prepare("SELECT execution_mode, run_id, pr_url, issue_id, phase, repo, machine_nonce FROM dispatch_log WHERE dispatch_id = ?").get(triggerId) as Record<string, unknown>;
+    expect(row).toMatchObject({
+      execution_mode: record.executionMode, issue_id: record.issueId, phase: record.phase, repo: record.repo,
+      run_id: dispatchResult.runId, pr_url: dispatchResult.runUrl,
+    });
+    expect(row.execution_mode).toBe("github-actions");
+    expect(row.run_id).toBe(gh.dispatchRunId);
+    expect(row.machine_nonce).toBeNull();
+  }, 40_000);
+
   // P2 -------------------------------------------------------------------------------
   it.each(VARIANTS.map(([label]) => label))("P2: a second trigger while in flight answers refresh-in-progress (%s)", async (label) => {
     const env = envFor(label);
@@ -355,7 +395,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
 
   // P3 -------------------------------------------------------------------------------
   // The restart scenarios need the engine's normal retry policy and a journal that survives
-  // a container restart, so they run on the retry-enabled disk environment (the pilot's
+  // a server restart, so they run on the retry-enabled disk environment (the pilot's
   // restart scenarios do the same) rather than on the two harness variants.
   it("P3: restart during dispatch — one dispatch in total, the run completes afterwards", async () => {
     const env = await startRetryEnabled(services);
@@ -372,8 +412,8 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
       );
 
       replacement = await replaceEndpoint(env, services);
-      await env.startedRestateContainer.restart();
-      // A container restart remaps the ingress port; the old client would keep the stale one.
+      await env.startedRestateServer.restart();
+      // Rebuild the client after the restart rather than reuse one built before it.
       client = clientFor(env);
       await eventually(() => clientFor(env).repoStatus(KG_SOURCE_REPO), (marker) => marker.status === "accepted", { label: "ingress reachable after restart", timeoutMs: 30_000 });
 
@@ -406,8 +446,8 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
       await eventually(() => stageCommittedCalls >= 1, (ok) => ok, { label: "durable effect", timeoutMs: 30_000 });
 
       replacement = await replaceEndpoint(env, services);
-      await env.startedRestateContainer.restart();
-      // A container restart remaps the ingress port; the old client would keep the stale one.
+      await env.startedRestateServer.restart();
+      // Rebuild the client after the restart rather than reuse one built before it.
       client = clientFor(env);
       await eventually(() => stageCommittedCalls >= 2, (ok) => ok, { label: "durable effect", timeoutMs: 30_000 });
       await eventually(() => kgRows().some((r) => r.status === "completed"), (ok) => ok, { label: "durable effect", timeoutMs: 30_000 });
@@ -509,7 +549,8 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
 
     expect(gh.cancelCalls).toEqual([9_001]);
     expect(await markerOf(client)).not.toBeNull();
-    expect(kgRows()).toMatchObject([{ status: "dispatched" }]);
+    // The `record-dispatch-1` projection wrote the run id, which marks the row running (`updateJobRunId`).
+    expect(kgRows()).toMatchObject([{ status: "running" }]);
 
     gh.runState = { status: "completed", conclusion: "cancelled" };
     await untilMarkerClear(client);
@@ -568,4 +609,76 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     expect(getInFlightWork().filter((w) => w.kind === "kg-refresh")).toEqual([]);
     expect(sweepLegacyKgRefreshRows()).toBe(0);
   });
+});
+
+// P10 ------------------------------------------------------------------------------
+// The Fly settings are read live: the composition is built once, the `fly_sessions_app` row is written afterwards.
+describe("Restate kg-refresh pilot: Fly sessions settings are live", () => {
+  let environments: Map<string, RestateEnvironment>;
+  const envKeys = ["FLY_SESSIONS_APP", "FLY_SESSIONS_REGION", "FLY_SESSIONS_TOKEN"] as const;
+  const saved: Record<string, string | undefined> = {};
+  const createdApps: Array<string | null> = [];
+
+  beforeAll(async () => {
+    for (const k of envKeys) { saved[k] = process.env[k]; delete process.env[k]; }
+    process.env.FLY_SESSIONS_TOKEN = "fly-test-token";
+    getDb().prepare("DELETE FROM settings WHERE key = 'fly_sessions_app'").run();
+    const liveConfig = {
+      githubAppId: "test-app-id", githubAppPrivateKey: "test-private-key", sessionImage: "runner:test",
+      runnerImageExplicit: false, runnerCallbackBaseUrl: "https://orchestrator.test", runnerTokenSecret: SECRET,
+      get flySessionsToken() { return getFlySessionsConfig().token; },
+      get flySessionsApp() { return getFlySessionsConfig().app; },
+      get flySessionsRegion() { return getFlySessionsConfig().region; },
+      localRunnerImage: "local:img", localRunnerOrchestratorUrl: null, healthPort: 8080,
+      anthropicApiKey: null, claudeOAuthToken: null,
+    };
+    const fakeFly = {
+      getMachine: async () => { throw new Error("unexpected getMachine"); },
+      listMachines: async () => [],
+      createMachine: async () => { createdApps.push(getFlySessionsConfig().app); return { id: "m-live", state: "started" }; },
+      updateMachine: async () => ({}),
+      startMachine: async () => {},
+      waitSettled: async () => null,
+      waitForStopped: async () => {},
+    };
+    // Built once, with no resolveExecutionMode override.
+    const composed = compose({ config: liveConfig as never, keptMachineFly: (() => fakeFly) as never, resolveExecutionMode: undefined });
+    setKgRefreshToolDeps(composed.toolDeps);
+    environments = await startVariants([...composed.services, orchestratorTools]);
+    // After the services exist.
+    setOrchestratorSetting("flySessionsApp", "late-app");
+  }, 60_000);
+
+  afterAll(async () => {
+    setKgRefreshToolDeps(null);
+    for (const k of envKeys) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+    getDb().prepare("DELETE FROM settings WHERE key = 'fly_sessions_app'").run();
+    if (environments) await stopAll(environments);
+  });
+
+  it("P10: a row written after the build resolves fly-machines and the Fly sender uses the new app", async () => {
+    const env = environments.get("disableRetries");
+    if (!env) throw new Error("missing Restate variant");
+    const answer = await callToolAsSystem("trigger_kg_refresh", {}, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true });
+    if (answer.status !== "ok") throw new Error("trigger_kg_refresh unavailable");
+    const triggerId = (JSON.parse(answer.content[0].text) as { body: { triggerId: string } }).body.triggerId;
+    await eventually(() => createdApps.length >= 1, (ok) => ok, { label: "fly dispatch", timeoutMs: 20_000 });
+    expect(createdApps[0]).toBe("late-app");
+    const invocations = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`);
+    // The fake createMachine runs inside the dispatch-1 step; its completion entry is journaled only after the step returns.
+    const polled = await eventually(
+      async () => {
+        const journal = await journalEntries(env.adminAPIBaseUrl(), invocations[0].id as string);
+        try {
+          return { journal, dispatchResult: journaledRunResult(journal, "dispatch-1") };
+        } catch {
+          return undefined;
+        }
+      },
+      (v) => v !== undefined,
+      { label: "dispatch-1 journaled result", timeoutMs: 20_000 },
+    );
+    expect(journaledRunResult(polled!.journal, "resolve")).toMatchObject({ executionMode: "fly-machines" });
+    expect(polled!.dispatchResult).toMatchObject({ outcome: "accepted", executionMode: "fly-machines", runUrl: expect.stringContaining("/apps/late-app/") });
+  }, 40_000);
 });

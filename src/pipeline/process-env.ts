@@ -89,7 +89,9 @@ const DEPENDENCY_HELPER_KEYS = [
 /**
  * Environment for runner-owned repository processes (install, setup, verify, teardown).
  * Strips model credentials, session handles, the encoded run config and model-auth
- * bootstrap material so repository code cannot read the model authorization.
+ * bootstrap material so repository code cannot read the model authorization, and the
+ * run tokens (RUNNER_CREDENTIAL_KEYS) so repository code cannot act with the run's
+ * authority. Only the runner's own Node process holds the run tokens.
  * Forwarded secrets (AI_IMPLEMENT_FORWARDED_SECRETS) are kept so hooks can use them.
  *
  * Note: a hook that exports ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN into
@@ -112,6 +114,7 @@ export function repoProcessEnv(options: { configured?: boolean } = {}): NodeJS.P
       if (CONFIGURED_MODEL_PREFIXES.some((p) => key.startsWith(p))) delete env[key];
     }
   }
+  for (const key of RUNNER_CREDENTIAL_KEYS) delete env[key];
   deleteBootstrapKeys(env);
   return env;
 }

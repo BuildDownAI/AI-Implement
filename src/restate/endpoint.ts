@@ -15,6 +15,7 @@ import type {
 import { RESTATE_ADMIN_BASE_URL } from "./server.js";
 import { operatorObject } from "./operator-object.js";
 import { orchestratorTools } from "./tools.js";
+import { runnerBackend } from "./runner-backend.js";
 
 export type RestateService =
   | ServiceDefinition<string, unknown>
@@ -24,7 +25,7 @@ export type RestateService =
 // `Operator` (AII-709) is the first bound object, `orchestratorTools` (AII-710) the first
 // bound service; a run kind's workflow module joins them here once one migrates (ADR 018
 // case 1: kg-refresh).
-export const RESTATE_SERVICES: RestateService[] = [operatorObject, orchestratorTools];
+export const RESTATE_SERVICES: RestateService[] = [operatorObject, orchestratorTools, runnerBackend];
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 9080;
@@ -148,8 +149,8 @@ export function sqlQuote(value: string): string {
  * this repo already depends on): `POST {adminBaseUrl}/query` with an `Accept: application/json`
  * header runs a DataFusion SQL statement over the server's introspection tables and answers
  * `{ rows: [...] }` as plain JSON — omitting that header answers Arrow IPC instead, which would
- * need `apache-arrow`, an undeclared transitive dependency (pulled in only by the testcontainers
- * devDependency) this production module has no business on.
+ * need `apache-arrow`, an undeclared transitive dependency (once pulled in only by a
+ * since-removed test devDependency) this production module has no business on.
  *
  * `sys_deployment.endpoint` holds the registered URI with a trailing slash this module's own
  * `uri` never carries, so both forms are matched. Restate 1.7.10 does not always set

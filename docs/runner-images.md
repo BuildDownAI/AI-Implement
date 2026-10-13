@@ -61,6 +61,7 @@ Pair the runner channel with the orchestrator's channel — a testing orchestrat
 
 kg-refresh dispatches (both GitHub Actions and Fly Machines) resolve the runner image through the same `resolveRunnerImageForDispatch` path as every other run kind — per-repo `image.yml` override, then the orchestrator default, then the built-in channel tag.
 
+The Restate review-fix launch (`GithubReviewFixWorker.launch`) resolves the image the same way, using the target repo, a token from the launch credential, `config.sessionImage`, and `config.runnerImageExplicit`, and sends it as the `runner_image` workflow input (never in the envelope). If resolution fails, the launch omits `runner_image` and logs one warning; the workflow then falls back to the `:latest` channel.
 ## Baked agent CLIs
 
 The shared session image installs both supported agent CLIs in one image:

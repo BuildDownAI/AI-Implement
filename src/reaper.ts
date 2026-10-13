@@ -100,6 +100,11 @@ export async function safeDestroyMachine(
   }
 }
 
+/** Whether the machine is owned by a FlyMachineProfile object (purpose: durable-runner). */
+export function isDurableRunnerMachine(machine: { config?: { metadata?: Record<string, string> } }): boolean {
+  return machine.config?.metadata?.[DURABLE_RUNNER_PURPOSE_KEY] === DURABLE_RUNNER_PURPOSE_VALUE;
+}
+
 /**
  * Whether a durable-runner machine's `durable_until` stamp (epoch seconds) is past.
  * Absent keeps the machine; a present value that is not a finite number is a corrupt
@@ -206,8 +211,8 @@ export async function sweepOrphanedMachines(
     // row: its job row is terminal (or absent) by design, so none of the four rules below
     // may see it. The reaper is only the backstop for an owner lost with the Restate store.
     const metadata = machine.config?.metadata;
-    if (metadata?.[DURABLE_RUNNER_PURPOSE_KEY] === DURABLE_RUNNER_PURPOSE_VALUE) {
-      if (!isDurableExpired(machine.id, metadata[DURABLE_UNTIL_KEY])) continue;
+    if (isDurableRunnerMachine(machine)) {
+      if (!isDurableExpired(machine.id, metadata?.[DURABLE_UNTIL_KEY])) continue;
       recordReaperAction({
         ruleMatched: "durable-expired",
         machineId: machine.id,

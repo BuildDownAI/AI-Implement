@@ -168,15 +168,17 @@ export async function postRunnerResult(params: {
   cycleSummaries?: CycleSummary[];
   /** Optional diagnostic attribution (AII-946). Sanitized before serialization; dropped if malformed. */
   attribution?: InvocationAttributionV1;
+  /** Head SHA the internal review approved when the run ended `external_review_pending`. */
+  externalReviewPending?: { headSha: string };
   /** SHA of the snapshot commit pushed by a kg-refresh runner. Only meaningful for phase=kg-refresh. */
   snapshotCommit?: string | null;
   /** Number of the refresh PR opened alongside snapshotCommit. Only meaningful for phase=kg-refresh. */
   snapshotPr?: number | null;
   /** The `kg-refresh/<stamp>` branch the snapshot was pushed to; the orchestrator deletes it after merge or close. */
   snapshotBranch?: string | null;
-  /** Guard verdict from kg-snapshot-push, present for a kg-refresh dry-run (AII-632) or a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638). */
-  guardVerdict?: "clean" | "refused";
-  /** Per-part {part, prev, new} table from kg-snapshot-push, present for a kg-refresh dry-run (AII-632) or a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638). */
+  /** Guard verdict from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
+  guardVerdict?: "clean" | "refused" | "held";
+  /** Per-part {part, prev, new} table from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
   partTable?: Array<{ part: string; prev: string; new: string }>;
   /**
    * Optional pilot marker (AII-769 Restate review-fix pilot; AII-770 contract).
@@ -206,7 +208,13 @@ export async function postRunnerResult(params: {
 }): Promise<void> {
   const callbackUrl = params.callbackUrl ?? process.env.RUNNER_CALLBACK_URL;
   const runToken = process.env.RUN_TOKEN;
-  if (!callbackUrl || !runToken) return;
+  if (!callbackUrl || !runToken) {
+    if (params.reviewFix) {
+      const missing = [!callbackUrl && "callback URL", !runToken && "RUN_TOKEN"].filter(Boolean).join(" and ");
+      console.warn(`[runner-callback] review-fix result not sent: ${missing} missing`);
+    }
+    return;
+  }
   let comments: Array<{ body: string }> = [];
   try {
     comments = collectRunnerComments(params.workspaceDir);
@@ -233,6 +241,7 @@ export async function postRunnerResult(params: {
     if (attribution) body.attribution = attribution;
     else console.warn("[runner-callback] dropping invalid attribution before delivery");
   }
+  if (params.externalReviewPending) body.externalReviewPending = params.externalReviewPending;
   if (params.snapshotCommit) body.snapshotCommit = params.snapshotCommit;
   if (params.snapshotPr) body.snapshotPr = params.snapshotPr;
   if (params.snapshotBranch) body.snapshotBranch = params.snapshotBranch;

@@ -32,19 +32,13 @@
  * content while that id is still active returns the same prepared attempt
  * without spending a second reservation or budget entry.
  *
- * Two capabilities beyond the strict `ReviewFixAttemptStorePort` shape are
- * exposed here because the schema and this issue's task both call for them,
+ * One capability beyond the strict `ReviewFixAttemptStorePort` shape is
+ * exposed here because the schema and this issue's task both call for it,
  * even though `ReviewFixFinalizerPort` itself (AII-790) is a later issue:
  *  - `recordOutcome` writes `review_fix_attempts.terminal_outcome_json` exactly
  *    once (write-once, idempotent on retry) — the "immutable terminal outcome"
  *    the issue asks this repository to expose.
- *  - `recordTerminalEffect` is a thin idempotent-effect helper over the
- *    already-approved inbox schema (`review_fix_inbox`, `kind: "terminal-effect"`,
- *    AII-774/781), keyed by `attemptId.effectId` (the inbox's delivery-id charset
- *    excludes `:`) so replay can reconcile a tracker/approval effect without
- *    treating the inbox write as atomic with the SQLite transaction that
- *    produced it.
- * Neither performs the network calls or authority/policy checks a full
+ * It does not perform the network calls or authority/policy checks a full
  * `ReviewFixFinalizerPort.applyApproval` needs — those remain out of scope here.
  */
 import { createHash } from "node:crypto";
@@ -52,7 +46,6 @@ import { getDb } from "./dedup.js";
 import { isDeployHeld } from "./deploy-hold.js";
 import { isParked } from "./dispatch-breaker.js";
 import { getMappings, resolvePrDispatchBudget, type RepoMapping } from "./config.js";
-import { acceptDelivery } from "./review-fix-inbox.js";
 import { unprocessedOpenReviewFindings } from "./review-fix-pending.js";
 import {
   acquire as acquireDispatchAdmission,
@@ -336,7 +329,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
     })();
   }
 
-  async bindExecution(attemptId: AttemptId, execution: WorkerExecutionIdentity): Promise<ReviewFixExecutionBindOutcome> {
+  async bindExecution(attemptId: AttemptId, execution: WorkerExecutionIdentity, now: number): Promise<ReviewFixExecutionBindOutcome> {
     const db = getDb();
     return db.transaction((): ReviewFixExecutionBindOutcome => {
       const row = db.prepare("SELECT * FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as AttemptRow | undefined;
@@ -357,7 +350,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
         const accepted = JSON.parse(row.accepted_result_json) as ReviewFixResultMetadataV1;
         if (accepted.githubRunId !== execution.githubRunId || accepted.githubRunAttempt !== execution.githubRunAttempt) {
           db.prepare("UPDATE review_fix_attempts SET result_conflict_at = COALESCE(result_conflict_at, ?) WHERE attempt_id = ?")
-            .run(Date.now(), attemptId);
+            .run(now, attemptId);
           return { status: "already_bound", execution: { githubRunId: accepted.githubRunId, githubRunAttempt: accepted.githubRunAttempt } };
         }
       }
@@ -372,10 +365,10 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
     })();
   }
 
-  async revokeAuthority(attemptId: AttemptId): Promise<void> {
+  async revokeAuthority(attemptId: AttemptId, now: number): Promise<void> {
     getDb()
       .prepare("UPDATE review_fix_attempts SET authority_revoked_at = COALESCE(authority_revoked_at, ?) WHERE attempt_id = ?")
-      .run(Date.now(), attemptId);
+      .run(now, attemptId);
   }
 
   async hasCurrentAuthority(attemptId: AttemptId): Promise<boolean> {
@@ -395,11 +388,12 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
    * `onAccepted` runs inside the same SQLite transaction as the canonical result
    * write, on both a first acceptance and a byte-identical retry. It may only
    * perform synchronous SQLite work; a thrown error rolls the result write back.
-   * The callback route uses it to commit the durable delivery inbox atomically.
+   * No production caller passes it now that results go over the Restate ingress.
    */
   async recordResult(
     attemptId: AttemptId,
     result: ReviewFixResultMetadataV1,
+    now: number,
     onAccepted?: () => void,
   ): Promise<ResultIntakeOutcome> {
     const db = getDb();
@@ -423,7 +417,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
       if (row.github_run_id !== null
         && (row.github_run_id !== result.githubRunId || row.github_run_attempt !== result.githubRunAttempt)) {
         db.prepare("UPDATE review_fix_attempts SET result_conflict_at = COALESCE(result_conflict_at, ?) WHERE attempt_id = ?")
-          .run(Date.now(), attemptId);
+          .run(now, attemptId);
         return { status: "conflict", attemptId, reason: "result execution identity does not match the bound execution" };
       }
 
@@ -434,7 +428,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
           return { status: "duplicate", attemptId };
         }
         db.prepare("UPDATE review_fix_attempts SET result_conflict_at = COALESCE(result_conflict_at, ?) WHERE attempt_id = ?")
-          .run(Date.now(), attemptId);
+          .run(now, attemptId);
         return { status: "conflict", attemptId, reason: "a different result is already stored for this attempt" };
       }
 
@@ -491,7 +485,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
    * it needs no I/O beyond this transaction (recordResult above never rewrites
    * `terminal_outcome_json`, so once this is called nothing here can undo it).
    */
-  async recordOutcome(outcome: ReviewFixImmutableOutcome): Promise<RecordOutcomeResult> {
+  async recordOutcome(outcome: ReviewFixImmutableOutcome, now: number): Promise<RecordOutcomeResult> {
     const db = getDb();
     return db.transaction((): RecordOutcomeResult => {
       const row = db.prepare("SELECT terminal_outcome_json FROM review_fix_attempts WHERE attempt_id = ?").get(outcome.attemptId) as
@@ -502,15 +496,15 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
         return { status: "already_recorded", outcome: JSON.parse(row.terminal_outcome_json) as ReviewFixImmutableOutcome };
       }
       db.prepare("UPDATE review_fix_attempts SET terminal_outcome_json = ?, completed_at = ? WHERE attempt_id = ? AND terminal_outcome_json IS NULL")
-        .run(JSON.stringify(outcome), Date.now(), outcome.attemptId);
-      return { status: "recorded" };
+        .run(JSON.stringify(outcome), now, outcome.attemptId);
+      return { status: "recorded", completedAt: now };
     })();
   }
 
   /**
    * Read-only peek at the attempt's immutable terminal verdict, or `null` if `recordOutcome` has
-   * never written one — never itself writes, unlike `recordOutcome`. `retryApprovalEffect`
-   * (AII-790) uses this to withhold a reconciliation when a verdict recorded after the original
+   * never written one — never itself writes, unlike `recordOutcome`. The finalizer
+   * uses this to withhold an approval when a verdict recorded after the original
    * approval delivery was accepted turns out incompatible with approval.
    */
   async getRecordedOutcome(attemptId: AttemptId): Promise<ReviewFixImmutableOutcome | null> {
@@ -519,29 +513,5 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
       | undefined;
     if (!row || row.terminal_outcome_json === null) return null;
     return JSON.parse(row.terminal_outcome_json) as ReviewFixImmutableOutcome;
-  }
-
-  /**
-   * Idempotent outbox entry for one attempt's terminal effect (e.g. one
-   * approval attempt), over the already-approved inbox schema (AII-774/781):
-   * `review_fix_inbox` with `kind: "terminal-effect"`, keyed by
-   * `attemptId.effectId` so a duplicate write collapses to the original rather
-   * than reapplying, and replay can reconcile without the inbox write being
-   * atomic with whatever external effect it records.
-   */
-  recordTerminalEffect(attemptId: AttemptId, effectId: string, payload: unknown): ReturnType<typeof acceptDelivery> {
-    const row = getDb().prepare("SELECT installation_id, repository, pr_number FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as
-      | Pick<AttemptRow, "installation_id" | "repository" | "pr_number">
-      | undefined;
-    if (!row) {
-      return { status: "rejected", reason: `unknown attempt ${attemptId}` };
-    }
-    return acceptDelivery({
-      authenticatedSource: "review-fix-attempt-store",
-      deliveryId: `${attemptId}.${effectId}`,
-      kind: "terminal-effect",
-      destination: toScope(row),
-      payload,
-    });
   }
 }

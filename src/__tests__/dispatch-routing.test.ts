@@ -58,8 +58,7 @@ vi.mock("../workflow-probe.js", async (importOriginal) => {
 // already exists, and those tests need to control that answer without hitting GitHub.
 vi.mock("../github.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../github.js")>();
-  // getRepoDefaultBranch is mocked for the dispatchKgRefreshRun tests in the
-  // "scoped boot" describe block (AII-990); it hits GitHub over real HTTP.
+  // getRepoDefaultBranch is mocked so no test here reaches GitHub over real HTTP.
   return {
     ...actual,
     postWorkflowDispatch: vi.fn(),
@@ -776,73 +775,6 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
     expect(localDocker.startLocalRunnerContainer).not.toHaveBeenCalled();
     expect(githubAppAuth.getInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus");
     expectFreeSlot("local-docker", "planning");
-  });
-  describe("dispatchKgRefreshRun (AII-990)", () => {
-    const kgConfig = { ...config, kgSourceRepo: "eudoxus/AI-Implement" } as unknown as AppConfig;
-    const kgOpts = (executionPath: "fly-machines" | "local-docker" | "github-actions") => ({
-      runToken: "run-token",
-      runProgressToken: "progress-token",
-      dispatchId: "kg-dispatch-1",
-      machine: { cpuKind: "shared" as const, cpus: 1, memoryMb: 512 },
-      machineId: null,
-      runConfig: encodeRunConfig({ v: 1, issue: { id: "kg-refresh", identifier: "KG-REFRESH", title: "KG ingest", description: "" } }),
-      executionPath,
-    });
-    let github: typeof import("../github.js");
-
-    beforeEach(async () => {
-      github = await import("../github.js");
-      vi.mocked(github.getRepoDefaultBranch).mockReset().mockResolvedValue("main");
-      vi.mocked(github.postWorkflowDispatch).mockReset().mockResolvedValue({ success: true } as never);
-      vi.mocked(repoImage.resolveRunnerImageForDispatch).mockReset().mockResolvedValue("runner-image" as never);
-    });
-
-    function expectBroadControlPlaneOnly() {
-      expect(githubAppAuth.getInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus");
-      expect(github.getRepoDefaultBranch).toHaveBeenCalledWith("broad-token", "eudoxus", "AI-Implement");
-    }
-
-    it("Fly KG boot uses the scoped token and keeps the broad token for control-plane work", async () => {
-      await indexModule.dispatchKgRefreshRun(kgConfig, kgOpts("fly-machines"));
-
-      expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus", SCOPED_REQUEST);
-      expectBroadControlPlaneOnly();
-      const json = flyConfigJson();
-      expect(json).toContain("scoped-token");
-      expect(json).not.toContain("broad-token");
-      expect(repoImage.resolveRunnerImageForDispatch).toHaveBeenCalledWith(expect.objectContaining({ token: "scoped-token" }));
-    });
-
-    it("local KG boot uses the scoped token", async () => {
-      await indexModule.dispatchKgRefreshRun(kgConfig, kgOpts("local-docker"));
-
-      expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus", SCOPED_REQUEST);
-      expectBroadControlPlaneOnly();
-      expect(vi.mocked(localDocker.startLocalRunnerContainer).mock.calls[0]![0]).toEqual(
-        expect.objectContaining({ githubToken: "scoped-token", phase: "kg-refresh" }),
-      );
-    });
-
-    it("Fly KG: a narrow-mint failure launches nothing and never uses the broad token", async () => {
-      vi.mocked(githubAppAuth.getScopedInstallationToken).mockRejectedValue(new Error("mint failed"));
-
-      await expect(indexModule.dispatchKgRefreshRun(kgConfig, kgOpts("fly-machines"))).rejects.toThrow("mint failed");
-
-      expect(flyMachines.createMachine).not.toHaveBeenCalled();
-      expect(repoImage.resolveRunnerImageForDispatch).not.toHaveBeenCalled();
-    });
-
-    it("local KG: a narrow-mint failure launches nothing and never uses the broad token", async () => {
-      vi.mocked(githubAppAuth.getScopedInstallationToken).mockRejectedValue(new Error("mint failed"));
-
-      await expect(indexModule.dispatchKgRefreshRun(kgConfig, kgOpts("local-docker"))).rejects.toThrow("mint failed");
-
-      expect(localDocker.startLocalRunnerContainer).not.toHaveBeenCalled();
-    });
-
-    // The legacy direct GitHub Actions KG dispatch path was removed from production.
-    // Private-envelope body composition coverage now lives with the pure KG production
-    // composer tests; this block keeps only the remaining container launch regressions.
   });
 });
 

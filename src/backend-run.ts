@@ -2,6 +2,8 @@
  * (`planning-run-production.ts`, `kg-refresh-production.ts`), so each rule exists once. */
 import type { AppConfig } from "./index.js";
 import { destroyMachine, getMachine, readMachineExit, stopMachine, type Machine, type MachineExit } from "./fly-machines.js";
+import { recordReaperAction } from "./dedup.js";
+import { DURABLE_RUNNER_PURPOSE_KEY, DURABLE_RUNNER_PURPOSE_VALUE } from "./durable-runner.js";
 import { inspectLocalContainer, stopLocalContainer } from "./local-docker.js";
 
 export type BackendRunState = "ended" | "started" | "unknown";
@@ -45,6 +47,62 @@ export async function classifyLocalContainer(containerId: string): Promise<Backe
   }
 }
 
+export type DestroyReason =
+  | "monitor-stopped"
+  | "monitor-timeout"
+  | "ttl-stop"
+  | "stuck-remediate"
+  | "admin-stop"
+  | "planning-end"
+  | "backend-stop";
+
+/** The one orchestrator-side destroy (AII-1144). It logs and records the caller as `destroy:<reason>` in the
+ *  reaper actions table, and it refuses a `purpose: durable-runner` machine: that one is owned by a
+ *  FlyMachineProfile object, so it is stopped (if started) and recorded as `durable-skip:<reason>`. Only the
+ *  object's `expire` / `destroy-unscrubbed` and the reaper's `durable-expired` destroy such a machine, directly.
+ *  A 404 on the read proceeds to the destroy (the caller handles its 404); any other read error is rethrown,
+ *  since destroying blind would defeat the guard. */
+export async function destroyMachineRecorded(
+  config: FlyConfig,
+  machineId: string,
+  reason: DestroyReason,
+  opts: { issueIdentifier?: string | null } = {},
+): Promise<void> {
+  if (!config.flySessionsToken || !config.flySessionsApp) {
+    throw new Error("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured; cannot destroy the machine");
+  }
+  const { flySessionsToken: token, flySessionsApp: app } = config;
+  let machine: Machine | null = null;
+  try {
+    machine = await getMachine(token, app, machineId);
+  } catch (err) {
+    if (!(err instanceof Error && err.message.includes("404"))) throw err;
+  }
+  const record = (ruleMatched: string) => {
+    try {
+      recordReaperAction({
+        ruleMatched,
+        machineId,
+        tenantId: null,
+        issueIdentifier: opts.issueIdentifier ?? null,
+        ageSeconds: machine?.created_at ? Math.floor((Date.now() - new Date(machine.created_at).getTime()) / 1000) : null,
+        dryRun: false,
+      });
+    } catch (err) {
+      console.error(`[fly] Failed to record ${ruleMatched} for machine ${machineId}:`, err);
+    }
+  };
+  if (machine?.config?.metadata?.[DURABLE_RUNNER_PURPOSE_KEY] === DURABLE_RUNNER_PURPOSE_VALUE) {
+    console.log(`[fly] kept machine ${machineId} owned by FlyMachineProfile; stop instead of destroy (reason=${reason})`);
+    record(`durable-skip:${reason}`);
+    if (machine.state === "started") await stopMachine(token, app, machineId);
+    return;
+  }
+  console.log(`[fly] destroying machine ${machineId} reason=${reason}`);
+  record(`destroy:${reason}`);
+  await destroyMachine(token, app, machineId);
+}
+
 /** Stops the exact machine or container. `false` for a backend with no machine to stop. A Fly machine is
  *  destroyed, unless `keep` is set: a machine a pipeline keeps between runs is only stopped (AII-1136). */
 export async function stopBackendRun(config: FlyConfig, mode: string, id: string, opts: { keep?: boolean } = {}): Promise<boolean> {
@@ -53,7 +111,7 @@ export async function stopBackendRun(config: FlyConfig, mode: string, id: string
       throw new Error("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured; cannot stop the machine");
     }
     if (opts.keep) await stopMachine(config.flySessionsToken, config.flySessionsApp, id);
-    else await destroyMachine(config.flySessionsToken, config.flySessionsApp, id);
+    else await destroyMachineRecorded(config, id, "backend-stop");
     return true;
   }
   if (mode === "local-docker") {

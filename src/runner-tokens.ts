@@ -284,7 +284,7 @@ export function mintPreparedReviewFixToken(input: {
 }
 
 /** Validate a pilot bearer without burning result/progress authority before the
- * durable inbox commits. Publication alone may consume its one-shot claim, after
+ * result is accepted. Publication alone may consume its one-shot claim, after
  * all prepared-attempt scope and revocation checks pass in the same transaction. */
 export function verifyPreparedReviewFixToken(
   token: string,
