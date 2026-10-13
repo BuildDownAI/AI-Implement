@@ -1,5 +1,6 @@
 import http from "node:http";
 import { authenticateAdminRequest } from "../admin-session.js";
+import { getOperatorLegacyScrubCompletedAt } from "./operator-legacy-scrub.js";
 import { RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BASE_URL, RESTATE_UI_INGRESS_PREFIX } from "./server.js";
 
 /**
@@ -26,7 +27,7 @@ function matchRoute(method: string, pathname: string): { target: "admin" | "ingr
   if (read && (pathname === "/health" || pathname === "/version")) return admin;
   if (read && (pathname === "/services" || pathname.startsWith("/services/"))) return admin;
   if (read && (pathname === "/deployments" || pathname.startsWith("/deployments/"))) return admin;
-  // Matched so it is refused rather than left to other handlers (AII-1286).
+  // "refused" until the AII-1287 scrub row exists (AII-1286, AII-1299); then forwarded to the admin upstream.
   if (method === "POST" && pathname === "/query") return { target: "refused", strip: 0 };
   if (method === "POST" && pathname === "/deployments") return admin;
   return null;
@@ -35,9 +36,10 @@ function matchRoute(method: string, pathname: string): { target: "admin" | "ingr
 const UNSAFE_PATH = /\.\.|\/\/|%2e|%2f|%5c/i;
 
 /**
- * Deny-by-default ingress allowlist (AII-1283): only the KgRefresh decision gate. `Operator`
- * holds raw refresh tokens and `KgRefresh.report/progress/cancel` rely on the runner token the
- * callback route verifies, so neither may be reached through this door.
+ * Deny-by-default ingress allowlist (AII-1283): only the KgRefresh decision gate. `Operator`'s
+ * `issue` and other write handlers could plant a token family for any client id, and
+ * `KgRefresh.report/progress/cancel` rely on the runner token the callback route verifies, so
+ * neither may be reached through this door.
  */
 const KEY = "[A-Za-z0-9._-]{1,128}";
 const INGRESS_ALLOWED = new RegExp(
@@ -88,8 +90,9 @@ export function handleRestateUiRequest(
     json(400, "Bad request path");
     return true;
   }
-  if (match.target === "refused") {
-    json(403, "/query is disabled until MCP refresh tokens are no longer stored in Restate (AII-1287)");
+  // Read per request, uncached, so the gate opens without a restart. An unreadable row reads as null: closed.
+  if (match.target === "refused" && getOperatorLegacyScrubCompletedAt() === null) {
+    json(403, "/query is disabled until the one-time MCP refresh-token cleanup has run (or its record is unreadable) (AII-1287)");
     return true;
   }
   if (match.target === "ingress") {
@@ -102,7 +105,7 @@ export function handleRestateUiRequest(
     return true;
   }
 
-  const base = new URL(match.target === "admin" ? (deps.adminBaseUrl ?? RESTATE_ADMIN_BASE_URL) : (deps.ingressBaseUrl ?? RESTATE_INGRESS_BASE_URL));
+  const base = new URL(match.target !== "ingress" ? (deps.adminBaseUrl ?? RESTATE_ADMIN_BASE_URL) : (deps.ingressBaseUrl ?? RESTATE_INGRESS_BASE_URL));
   const upstreamPath = (pathname.slice(match.strip) || "/") + search;
 
   // The ingress journals request headers and bodies; a session token must never reach a journal.

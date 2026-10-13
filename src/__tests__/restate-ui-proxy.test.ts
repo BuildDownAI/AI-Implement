@@ -4,6 +4,8 @@ import type { AddressInfo } from "node:net";
 
 const gate = vi.hoisted(() => ({ current: null as unknown }));
 vi.mock("../admin-session.js", () => ({ authenticateAdminRequest: () => gate.current }));
+const scrub = vi.hoisted(() => ({ completedAt: null as string | null }));
+vi.mock("../restate/operator-legacy-scrub.js", () => ({ getOperatorLegacyScrubCompletedAt: () => scrub.completedAt }));
 
 import { handleRestateUiRequest } from "../restate/ui-proxy.js";
 
@@ -37,6 +39,7 @@ describe("handleRestateUiRequest", () => {
   beforeEach(async () => {
     adminHits = []; ingressHits = []; handled = []; adminOnReq = undefined;
     gate.current = adminOk;
+    scrub.completedAt = null;
     logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     adminStub = await stub(adminHits, (res) => (adminOnReq ? adminOnReq(res) : (res.writeHead(200, { "content-type": "text/plain" }), res.end("ok"))));
     ingressStub = await stub(ingressHits);
@@ -100,28 +103,47 @@ describe("handleRestateUiRequest", () => {
     expect(ingressHits[0].headers["content-type"]).toBe("application/json");
   });
 
-  it("refuses POST /query with 403 and reaches no upstream", async () => {
+  it("refuses POST /query with 403 until the scrub row exists and reaches no upstream", async () => {
+    scrub.completedAt = null;
     for (const p of ["/query", "/query?a=1"]) {
       const r = await call("POST", p, "{}");
       expect(r.status).toBe(403);
-      const text = await r.text();
-      expect(JSON.parse(text).error).toContain("AII-1287");
-      expect(text).toContain("/query");
+      expect(JSON.parse(await r.text()).error).toContain("cleanup has run");
     }
-    gate.current = { ok: true, identity: { email: "u@x.com" }, entry: null, role: "user" };
-    expect((await call("POST", "/query", "{}")).status).toBe(403);
-    gate.current = { ok: false, status: 401, error: "Unauthorized" };
-    expect((await call("POST", "/query", "{}")).status).toBe(401);
     expect(adminHits).toHaveLength(0);
     expect(ingressHits).toHaveLength(0);
   });
 
-  it("logs non-read requests, including the refused POST /query", async () => {
+  it("forwards admin POST /query to the admin upstream once the row exists, read per request", async () => {
+    scrub.completedAt = null;
+    expect((await call("POST", "/query?a=1", "{\"query\":\"x\"}")).status).toBe(403);
+    scrub.completedAt = "2026-10-13T00:00:00.000Z";
+    expect((await call("POST", "/query?a=1", "{\"query\":\"x\"}")).status).toBe(200);
+    expect(adminHits.map((h) => `${h.method} ${h.url} ${h.body}`)).toEqual(["POST /query?a=1 {\"query\":\"x\"}"]);
+    expect(ingressHits).toHaveLength(0);
+  });
+
+  it("answers 403 to a user and 401 to no session on /query whatever the row says", async () => {
+    for (const row of [null, "2026-10-13T00:00:00.000Z"]) {
+      scrub.completedAt = row;
+      gate.current = { ok: true, identity: { email: "u@x.com" }, entry: null, role: "user" };
+      expect((await call("POST", "/query", "{}")).status).toBe(403);
+      gate.current = { ok: false, status: 401, error: "Unauthorized" };
+      expect((await call("POST", "/query", "{}")).status).toBe(401);
+    }
+    expect(adminHits).toHaveLength(0);
+    expect(ingressHits).toHaveLength(0);
+  });
+
+  it("logs non-read requests, including POST /query in both gate states", async () => {
     await call("PATCH", "/invocations/x/cancel");
     await call("GET", "/services");
+    scrub.completedAt = null;
+    await call("POST", "/query", "{}");
+    scrub.completedAt = "2026-10-13T00:00:00.000Z";
     await call("POST", "/query", "{}");
     const lines = logSpy.mock.calls.map((c: unknown[]) => String(c[0])).filter((l: string) => l.startsWith("[restate-ui]"));
-    expect(lines).toEqual(["[restate-ui] a@x.com PATCH /invocations/x/cancel", "[restate-ui] a@x.com POST /query"]);
+    expect(lines).toEqual(["[restate-ui] a@x.com PATCH /invocations/x/cancel", "[restate-ui] a@x.com POST /query", "[restate-ui] a@x.com POST /query"]);
   });
 
   it("allows only KgRefresh decide/status on the ingress and answers 403 otherwise", async () => {
