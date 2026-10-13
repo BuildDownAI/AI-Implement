@@ -71,7 +71,7 @@ Open the PR's job drawer. Record the attempt ID, lifecycle owner, deadline, pend
 
 ## Callback URL and the "run ended without a result" path (AII-1273)
 
-The run envelope (`RunConfigV1`) carries `runnerCallbackUrl`, the orchestrator's callback base URL, as the implementation envelope does. The `claude-implement.yml` template no longer declares a `runner_callback_url` input, and in envelope mode the runner reads the URL only from the envelope. The result, progress and publication tokens stay workflow inputs and never enter the envelope. If a review-fix runner has no callback URL or `RUN_TOKEN`, `postRunnerResult` logs one `[runner-callback]` warning naming what is missing.
+The run envelope (`RunConfigV1`) carries `runnerCallbackUrl`, the orchestrator's callback base URL, as the implementation envelope does. The `claude-implement.yml` template no longer declares a `runner_callback_url` input, and in envelope mode the runner reads the URL only from the envelope. The result, progress and publication tokens stay workflow inputs and never enter the envelope. `runner_image` is likewise a workflow input, resolved by `resolveRunnerImageForDispatch` as in the implementation dispatch, so a review-fix run uses the same runner channel as the orchestrator (or the repo's `image.yml`) rather than the workflow's `:latest` fallback. If a review-fix runner has no callback URL or `RUN_TOKEN`, `postRunnerResult` logs one `[runner-callback]` warning naming what is missing.
 
 While waiting for the result, `ReviewFixAttempt` reads the backend status every 60 s (`worker.inspectTerminal` in a journaled `read-run-status-N` step; a failing read counts as unknown and the wait continues). When the backend reports the run ended:
 

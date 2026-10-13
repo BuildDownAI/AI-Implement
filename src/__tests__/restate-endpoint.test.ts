@@ -15,7 +15,7 @@ describe("RESTATE_SERVICES", () => {
 describe("production review-fix services", () => {
   it("composes both durable services beside the operator and tool endpoint", () => {
     const services = createProductionReviewFixServices({ githubAppId: "test", githubAppPrivateKey: "test",
-      runnerCallbackBaseUrl: null, runnerTokenSecret: null },
+      runnerCallbackBaseUrl: null, runnerTokenSecret: null, sessionImage: "ghcr.io/x/runner:latest", runnerImageExplicit: false },
       { forMapping: async () => null } as never);
     expect([...RESTATE_SERVICES, ...services].map((service) => service.name)).toEqual([
       "Operator", "orchestratorTools", "RunnerBackend", "ReviewFixPR", "ReviewFixAttempt",
