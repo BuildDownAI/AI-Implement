@@ -14,7 +14,7 @@ vi.mock("../review-ledger-store.js", () => ({ listOpenReviewFindings: vi.fn(() =
 
 import { getCombinedChecksState, getCommitTime, getPullRequestState, listCheckRuns, listPullRequestCommits } from "../github.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
-import { createProductionLateExternalReviewDependencies, LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS } from "../restate/late-external-review.js";
+import { decodeReadHead, createProductionLateExternalReviewDependencies, LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS } from "../restate/late-external-review.js";
 import { headReviewedClean } from "../review-head-clean.js";
 
 const run = (status: string, conclusion: string | null) => ({ name: "Claude Code Review", appSlug: "claude", status, conclusion });
@@ -137,5 +137,15 @@ describe("readReviewerExpected (AII-1302)", () => {
   it("throws rather than reading false when GitHub fails", async () => {
     vi.mocked(listPullRequestCommits).mockRejectedValue(new Error("HTTP 502"));
     await expect(deps().readReviewerExpected!(gapInput)).rejects.toThrow("HTTP 502");
+  });
+});
+
+describe("decodeReadHead (journal entries from before AII-1302)", () => {
+  it("reads a bare SHA string as reviewer expected, failing closed", () => {
+    expect(decodeReadHead("abc123")).toEqual({ headSha: "abc123", reviewerExpected: true });
+  });
+  it("reads the object shape as journaled", () => {
+    expect(decodeReadHead({ headSha: "abc123", reviewerExpected: false })).toEqual({ headSha: "abc123", reviewerExpected: false });
+    expect(decodeReadHead({ headSha: "abc123" })).toEqual({ headSha: "abc123", reviewerExpected: undefined });
   });
 });

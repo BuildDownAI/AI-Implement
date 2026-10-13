@@ -88,6 +88,11 @@ export interface LateExternalReviewDependencies {
   deadlineMs?: number;
 }
 
+/** Decodes the `read-head` journal entry. A bare SHA string was journaled before AII-1302; it reads as "reviewer expected" (fail closed, no grace). */
+export function decodeReadHead(read: string | { headSha: string; reviewerExpected?: boolean }): { headSha: string; reviewerExpected: boolean | undefined } {
+  return typeof read === "string" ? { headSha: read, reviewerExpected: true } : { headSha: read.headSha, reviewerExpected: read.reviewerExpected };
+}
+
 export function createLateExternalReviewWorkflow(deps: LateExternalReviewDependencies) {
   const retentionMs = deps.retentionMs ?? restateRetentionMs();
   const intervalMs = deps.intervalMs ?? LATE_EXTERNAL_REVIEW_INTERVAL_MS;
@@ -120,9 +125,7 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
           : undefined;
         return expected === undefined ? { headSha: head } : { headSha: head, reviewerExpected: expected };
       }, { maxRetryAttempts: 5 });
-      const legacy = typeof read === "string";
-      headSha = legacy ? read : read.headSha;
-      reviewerExpected = legacy ? true : read.reviewerExpected;
+      ({ headSha, reviewerExpected } = decodeReadHead(read));
     }
     const tickInput = { ...input, headSha, ...(reviewerExpected === undefined ? {} : { reviewerExpected }) };
     let approvedHeadSha = headSha;
