@@ -11,6 +11,18 @@ export type ReviewLedgerSeverity = "blocking" | "medium" | "minor";
 
 export type ReviewFindingsVerdict = "approve" | "changes_requested" | "incomplete";
 
+/**
+ * A `review-contract` finding gates when it is `blocking`, or when the contract verdict is not
+ * `approve` (a `minor` finding under `changes_requested`/`incomplete` still gets a fix pass).
+ * An undefined verdict gates, so the absence of a contract verdict never relaxes the gate.
+ */
+export function reviewContractFindingGates(
+  finding: Pick<ReviewLedgerFinding, "severity">,
+  verdict: ReviewFindingsVerdict | undefined,
+): boolean {
+  return finding.severity === "blocking" || verdict !== "approve";
+}
+
 export const AI_IMPLEMENT_NATIVE_REVIEW_MARKER = "<!-- ai-implement native-review -->";
 
 export interface ReviewLedgerFinding {
