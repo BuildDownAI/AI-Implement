@@ -63,8 +63,8 @@ export interface FlyMachineProfileDeps {
   fly: {
     getMachine(id: string): Promise<Machine>;
     /** getMachine, then updateMachine with `env: {}` and the same config otherwise. Update on a stopped machine does not start it. */
-    clearMachineEnv(id: string, metadata?: Record<string, string>, settle?: SettleOptions): Promise<void>;
-    destroyMachine(id: string): Promise<void>;
+    clearMachineEnv(id: string, metadata?: Record<string, string>, settle?: SettleOptions, app?: string): Promise<void>;
+    destroyMachine(id: string, app?: string): Promise<void>;
   };
   /** Test seam for a short idle timeout; production leaves it unset. */
   idleTimeoutMsOverride?: number;
@@ -78,12 +78,14 @@ export interface MachineHold {
 /** `machineId` is unset between a `claim` that found no machine and the `attach` that records one. */
 export interface KeptMachineState {
   machineId?: string;
+  /** The Fly app the machine was created in; unset in state written before it was recorded (the accessor's app is used). */
+  app?: string;
   lastUsedAt: number;
   heldBy: MachineHold | null;
 }
 
-const claimSchema = z.object({ dispatchId: z.string().min(1), attempt: z.number().int().min(1).optional() }).strict();
-const attachSchema = z.object({ dispatchId: z.string().min(1), machineId: z.string().min(1), attempt: z.number().int().min(1).optional(), replaces: z.string().min(1).optional() }).strict();
+const claimSchema = z.object({ dispatchId: z.string().min(1), attempt: z.number().int().min(1).optional(), app: z.string().min(1).optional() }).strict();
+const attachSchema = z.object({ dispatchId: z.string().min(1), machineId: z.string().min(1), app: z.string().min(1).optional(), attempt: z.number().int().min(1).optional(), replaces: z.string().min(1).optional() }).strict();
 const releaseSchema = z.object({ dispatchId: z.string().min(1) }).strict();
 const expireSchema = z.object({ releasedAt: z.number() }).strict();
 
@@ -104,7 +106,7 @@ export function decideClaim(machine: KeptMachineState | null, dispatchId: string
     if (attempt === held.attempt) return { kind: "grant", machineId: machine.machineId ?? null, next: machine };
     return { kind: "grant", machineId: machine.machineId ?? null, next: { ...machine, lastUsedAt: now, heldBy: { dispatchId, attempt } } };
   }
-  const next: KeptMachineState = { ...(machine?.machineId ? { machineId: machine.machineId } : {}), lastUsedAt: now, heldBy: { dispatchId, attempt } };
+  const next: KeptMachineState = { ...(machine?.machineId ? { machineId: machine.machineId } : {}), ...(machine?.app ? { app: machine.app } : {}), lastUsedAt: now, heldBy: { dispatchId, attempt } };
   return { kind: "grant", machineId: machine?.machineId ?? null, next };
 }
 
@@ -114,13 +116,17 @@ export type AttachDecision =
   | { kind: "record"; next: KeptMachineState; replaced: string | null };
 
 /** Pure: whether the machine the workflow created for this dispatch is recorded. */
-export function decideAttach(machine: KeptMachineState | null, dispatchId: string, machineId: string, attempt: number, now: number, replaces?: string): AttachDecision {
+export function decideAttach(machine: KeptMachineState | null, dispatchId: string, machineId: string, attempt: number, now: number, replaces?: string, app?: string): AttachDecision {
   const held = machine?.heldBy ?? null;
   if (!machine || !held || held.dispatchId !== dispatchId) {
     return { kind: "conflict", message: `attach by ${dispatchId}, which does not hold the machine${held ? ` (held by ${held.dispatchId} attempt ${held.attempt})` : ""}` };
   }
-  if (machine.machineId === machineId) return { kind: "unchanged" };
-  const next: KeptMachineState = { machineId, lastUsedAt: now, heldBy: held };
+  if (machine.machineId === machineId) {
+    // A reuse backfills the app of a machine recorded before it was tracked; a recorded app is never changed.
+    if (machine.app === undefined && app !== undefined) return { kind: "record", next: { ...machine, app }, replaced: null };
+    return { kind: "unchanged" };
+  }
+  const next: KeptMachineState = { machineId, ...(app !== undefined && { app }), lastUsedAt: now, heldBy: held };
   if (machine.machineId === undefined) return { kind: "record", next, replaced: null };
   // The dispatch step found the recorded machine destroyed or 404 and created this one: replace at any attempt.
   if (replaces !== undefined && replaces === machine.machineId) return { kind: "record", next, replaced: machine.machineId };
@@ -130,16 +136,17 @@ export function decideAttach(machine: KeptMachineState | null, dispatchId: strin
   return { kind: "conflict", message: `attach of ${machineId} at attempt ${attempt} cannot replace ${machine.machineId} held at attempt ${held.attempt}` };
 }
 
-export type ExpireDecision = { kind: "destroy"; machineId: string } | { kind: "noop" };
+export type ExpireDecision = { kind: "destroy"; machineId: string; app?: string } | { kind: "noop" };
 
 /** Pure: destroy only the machine released at exactly `releasedAt` and not re-held since. */
 export function decideExpire(machine: KeptMachineState | null, releasedAt: number): ExpireDecision {
   if (!machine || machine.heldBy !== null || machine.lastUsedAt !== releasedAt || machine.machineId === undefined) return { kind: "noop" };
-  return { kind: "destroy", machineId: machine.machineId };
+  return { kind: "destroy", machineId: machine.machineId, ...(machine.app !== undefined && { app: machine.app }) };
 }
 
 const conflict = (message: string): restate.TerminalError => new restate.TerminalError(message, { errorCode: 409 });
 const is404 = (err: unknown): boolean => err instanceof Error && /\(404\)/.test(err.message);
+const isAuthDenied = (err: unknown): boolean => err instanceof Error && /\((401|403)\)/.test(err.message);
 
 const configSchema = z.object({
   cpuKind: z.enum(["shared", "performance"]),
@@ -247,6 +254,28 @@ export function createFlyMachineProfile(deps: FlyMachineProfileDeps) {
     const machine = await ctx.get<KeptMachineState>(MACHINE_KEY);
     const decision = decideClaim(machine, input.dispatchId, attempt, await ctx.date.now());
     if (decision.kind === "conflict") throw conflict(decision.message);
+    // The sessions app changed since the machine was created: destroy it where it lives, so the dispatch creates one in the current app.
+    if (input.app !== undefined && machine?.machineId !== undefined && machine.app !== undefined && machine.app !== input.app) {
+      const { machineId, app } = machine;
+      const denied = await ctx.run("destroy-other-app", async () => {
+        try {
+          await deps.fly.destroyMachine(machineId, app);
+          return false;
+        } catch (err) {
+          if (is404(err)) return false;
+          // The sessions token usually belongs to the new app; retrying cannot help.
+          if (isAuthDenied(err)) return true;
+          throw err;
+        }
+      }, { maxRetryAttempts: 3 });
+      ctx.set<KeptMachineState>(MACHINE_KEY, { lastUsedAt: decision.next.lastUsedAt, heldBy: decision.next.heldBy });
+      if (denied) {
+        ctx.console.warn(`[FlyMachineProfile] claim ${ctx.key} left machine ${machineId} in app ${app}: the sessions token cannot reach that app (current app ${input.app}); destroy the machine by hand`);
+      } else {
+        ctx.console.info(`[FlyMachineProfile] claim ${ctx.key} dispatch=${input.dispatchId} attempt=${attempt} destroyed ${machineId} in app ${app} (current app ${input.app})`);
+      }
+      return { machineId: null };
+    }
     if (decision.next !== machine) ctx.set<KeptMachineState>(MACHINE_KEY, decision.next);
     ctx.console.info(`[FlyMachineProfile] claim ${ctx.key} dispatch=${input.dispatchId} attempt=${attempt} machine=${decision.machineId ?? "none"}`);
     return { machineId: decision.machineId };
@@ -255,7 +284,7 @@ export function createFlyMachineProfile(deps: FlyMachineProfileDeps) {
   async function attach(ctx: ObjectContext, input: z.infer<typeof attachSchema>): Promise<{ machineId: string }> {
     const attempt = input.attempt ?? 1;
     const machine = await ctx.get<KeptMachineState>(MACHINE_KEY);
-    const decision = decideAttach(machine, input.dispatchId, input.machineId, attempt, await ctx.date.now(), input.replaces);
+    const decision = decideAttach(machine, input.dispatchId, input.machineId, attempt, await ctx.date.now(), input.replaces, input.app);
     if (decision.kind === "conflict") throw conflict(decision.message);
     if (decision.kind === "record") {
       ctx.set<KeptMachineState>(MACHINE_KEY, decision.next);
@@ -274,6 +303,7 @@ export function createFlyMachineProfile(deps: FlyMachineProfileDeps) {
     }
     const now = await ctx.date.now();
     const machineId = machine.machineId;
+    const app = machine.app;
     if (machineId === undefined) {
       // A claim that found no machine and never attached one: nothing to scrub or time out.
       ctx.clear(MACHINE_KEY);
@@ -286,7 +316,7 @@ export function createFlyMachineProfile(deps: FlyMachineProfileDeps) {
       await ctx.run("scrub", async () => {
         try {
           await deps.fly.clearMachineEnv(machineId, { [DURABLE_UNTIL_KEY]: String(Math.floor((now + idleTimeoutMs + ONE_DAY_MS) / 1000)) },
-            { until: ["stopped", "destroyed"], timeoutMs: SCRUB_SETTLE_MS });
+            { until: ["stopped", "destroyed"], timeoutMs: SCRUB_SETTLE_MS }, app);
         } catch (err) {
           // A machine that is gone cannot be scrubbed; retrying only holds the object lock.
           if (err instanceof Error && err.message.includes(GONE_BEFORE_SCRUB)) throw new restate.TerminalError(err.message, { errorCode: 404 });
@@ -302,7 +332,7 @@ export function createFlyMachineProfile(deps: FlyMachineProfileDeps) {
       try {
         await ctx.run("destroy-unscrubbed", async () => {
           try {
-            await deps.fly.destroyMachine(machineId);
+            await deps.fly.destroyMachine(machineId, app);
           } catch (err) {
             if (!is404(err)) throw err;
           }
@@ -314,7 +344,7 @@ export function createFlyMachineProfile(deps: FlyMachineProfileDeps) {
       }
       ctx.clear(MACHINE_KEY);
     } else {
-      ctx.set<KeptMachineState>(MACHINE_KEY, { machineId, lastUsedAt: now, heldBy: null });
+      ctx.set<KeptMachineState>(MACHINE_KEY, { machineId, ...(app !== undefined && { app }), lastUsedAt: now, heldBy: null });
     }
     ctx.console.info(`[FlyMachineProfile] release ${ctx.key} by ${input.dispatchId} machine=${machineId} scrubbed=${scrubbed}`);
     // Scheduled on both paths (the machine is already gone on the failure path, so it is a no-op).
@@ -332,10 +362,10 @@ export function createFlyMachineProfile(deps: FlyMachineProfileDeps) {
     const machine = await ctx.get<KeptMachineState>(MACHINE_KEY);
     const decision = decideExpire(machine, input.releasedAt);
     if (decision.kind === "noop") return;
-    const { machineId } = decision;
+    const { machineId, app } = decision;
     await ctx.run("destroy", async () => {
       try {
-        await deps.fly.destroyMachine(machineId);
+        await deps.fly.destroyMachine(machineId, app);
       } catch (err) {
         if (!is404(err)) throw err;
       }

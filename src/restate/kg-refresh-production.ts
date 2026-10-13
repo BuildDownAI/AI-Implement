@@ -28,11 +28,11 @@ import { RUN_TITLE_PREFIX, defaultFetchSignal } from "../github.js";
 import { resolveWorkflowCapabilities } from "../workflow-probe.js";
 import { buildKgRefreshRunConfig } from "../run-config.js";
 import { readBackendRun, stopBackendRun } from "../backend-run.js";
-import { getRunnerMode, getKgExecutionMode, resolveKgBackend, type KgBackendResolution, getKgFlyMachineOverride, setKgFlyMachineOverride, type KgFlyMachineOverride } from "../runner-mode.js";
+import { getRunnerMode, getKgExecutionMode, resolveKgBackend, type KgBackendResolution } from "../runner-mode.js";
 import { mintRunToken } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
 import { appendLogIfAbsent, findLogIdByDispatchId, setJobMachineId, setJobMachineNonce, updateJobPrUrl, updateJobRunId } from "../log.js";
-import { clearMachineEnv, createMachine, destroyMachine, getMachine, listMachines, startMachine, updateMachine, waitForMachine, waitForMachineSettled, type CreateMachineOpts, type Machine, type MachineConfig } from "../fly-machines.js";
+import { clearMachineEnv, createMachine, destroyMachine, getMachine, listMachines, startMachine, updateMachine, waitForMachine, waitForMachineSettled, type CreateMachineOpts, type Machine, type MachineConfig, type SettleOptions } from "../fly-machines.js";
 import type { RestateService } from "./endpoint.js";
 import {
   createKgRefreshWorkflow,
@@ -46,7 +46,8 @@ import {
 } from "./kg-refresh-workflow.js";
 import { createKgRefreshSenders, type KgRefreshSender, type KgRefreshSenderDeps } from "./kg-refresh-senders.js";
 import { DURABLE_RUNNER_PURPOSE_KEY, DURABLE_RUNNER_PURPOSE_VALUE } from "../durable-runner.js";
-import { DURABLE_RUNNER_DISPATCH_ID_KEY, FLY_MACHINE_PROFILE_DEFAULTS, createFlyMachineProfile, type FlyMachineProfileConfig, type FlyMachineProfileDefinition, type FlyMachineProfileDeps } from "./fly-machine-profile.js";
+import { createGhaRunProfile } from "./gha-run-profile.js";
+import { DURABLE_RUNNER_DISPATCH_ID_KEY, createFlyMachineProfile, type FlyMachineProfileDeps } from "./fly-machine-profile.js";
 import { createKgRepo, type KgRepoEnqueueInput, type KgRepoEnqueueResult, type KgRepoPrInput, type KgRepoTriggerResult, type StoredDryRunOutcome } from "./kg-repo.js";
 import type { Step } from "../pipeline/types.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
@@ -410,6 +411,7 @@ export function createProductionKgRefreshServices(
       repo: parseKgSourceRepo(input.kgSourceRepo).fullName,
       executionMode: (input.resolveExecutionMode ?? (() => resolveKgExecutionMode(config).mode))(),
     }),
+    resolveFlyApp: () => config.flySessionsApp,
     recordDispatchRow: recordKgDispatchRow,
     deriveMachineNonce: (dispatchId, attempt) => deriveMachineNonce(config.runnerTokenSecret ?? "", dispatchId, attempt),
     armMachineNonce: (dispatchId, attempt) => {
@@ -465,7 +467,7 @@ export function createProductionKgRefreshServices(
   };
 
   return {
-    services: [createKgRepo({ workflowName: "KgRefresh" }), createFlyMachineProfile(buildFlyMachineProfileDeps()), createKgRefreshWorkflow(deps)],
+    services: [createKgRepo({ workflowName: "KgRefresh" }), createFlyMachineProfile(buildFlyMachineProfileDeps()), createGhaRunProfile(), createKgRefreshWorkflow(deps)],
     toolDeps,
   };
 }
@@ -475,16 +477,21 @@ export function createProductionKgRefreshServices(
  * the object still registers (boot stays non-fatal) and a handler that needs Fly fails when it runs.
  */
 export function buildFlyMachineProfileDeps(): FlyMachineProfileDeps {
-  const bound = <A extends unknown[], R>(fn: (token: string, app: string, ...args: A) => Promise<R>) => async (...args: A): Promise<R> => {
+  // `appOf` picks the per-call app override out of the arguments; the accessor's app is the fallback.
+  const bound = <A extends unknown[], R>(fn: (token: string, app: string, ...args: A) => Promise<R>, appOf: (args: A) => string | undefined) => async (...args: A): Promise<R> => {
     const { token, app } = getFlySessionsConfig();
-    if (!token || !app) throw new Error("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured");
-    return fn(token, app, ...args);
+    const useApp = appOf(args) ?? app;
+    if (!token || !useApp) throw new Error("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured");
+    return fn(token, useApp, ...args);
   };
   return {
     fly: {
-      getMachine: bound(getMachine),
-      clearMachineEnv: bound(clearMachineEnv),
-      destroyMachine: bound((t, a, id: string) => destroyMachine(t, a, id)),
+      getMachine: bound((t, a, id: string) => getMachine(t, a, id), () => undefined),
+      clearMachineEnv: bound(
+        (t, a, id: string, metadata?: Record<string, string>, settle?: SettleOptions, _app?: string) => clearMachineEnv(t, a, id, metadata, settle),
+        (args) => args[3],
+      ),
+      destroyMachine: bound((t, a, id: string, _app?: string) => destroyMachine(t, a, id), (args) => args[1]),
     },
   };
 }
@@ -570,50 +577,3 @@ export function createKgRefreshIngressClient(
 }
 
 export type { KgRepoTriggerResult };
-
-export interface FlyMachineProfileSeedDeps {
-  getOverride?: () => KgFlyMachineOverride;
-  clearOverride?: () => void;
-  /** Sends `seed` to `FlyMachineProfile/kg-refresh`; resolves once the ingress accepted it. */
-  sendSeed?: (config: FlyMachineProfileConfig, idempotencyKey: string) => Promise<void>;
-}
-
-/** The profile a stored `kg_fly_machine_override` becomes: the override merged over the built-in default, `auto` meaning `performance`. */
-export function overrideToProfileConfig(override: KgFlyMachineOverride): FlyMachineProfileConfig {
-  const base = FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"];
-  const merged: FlyMachineProfileConfig = {
-    ...base,
-    ...(override.cpus !== undefined ? { cpus: override.cpus } : {}),
-    ...(override.memoryMb !== undefined ? { memoryMb: override.memoryMb } : {}),
-    ...(override.cpuKind !== undefined ? { cpuKind: override.cpuKind === "auto" ? "performance" : override.cpuKind } : {}),
-  };
-  // The object rejects performance below 2048 MB per CPU; the old dispatch fell back to shared CPUs there.
-  if (merged.cpuKind === "performance" && merged.memoryMb < 2048 * merged.cpus) return { ...merged, cpuKind: "shared" };
-  return merged;
-}
-
-/**
- * One-time boot migration (AII-1130): moves the old `kg_fly_machine_override` settings row into
- * `FlyMachineProfile/kg-refresh`, then deletes the row. `seed` writes only when the object's state is
- * empty and the send carries an idempotency key, so a crash between the send and the delete repeats
- * safely. A failed send (ingress down, or a merged config the object rejects) logs and keeps the row.
- */
-export async function seedFlyMachineProfileFromOverride(deps: FlyMachineProfileSeedDeps = {}): Promise<void> {
-  const override = (deps.getOverride ?? getKgFlyMachineOverride)();
-  if (override.cpus === undefined && override.memoryMb === undefined && override.cpuKind === undefined) return;
-  const config = overrideToProfileConfig(override);
-  const idempotencyKey = "seed:kg-refresh";
-  const sendSeed = deps.sendSeed ?? (async (c, key) => {
-    const ingress = restateClients.connect({ url: RESTATE_INGRESS_BASE_URL });
-    await ingress.objectSendClient<FlyMachineProfileDefinition>({ name: "FlyMachineProfile" }, "kg-refresh")
-      .seed(c, restateClients.rpc.sendOpts({ idempotencyKey: key }));
-  });
-  try {
-    await sendSeed(config, idempotencyKey);
-  } catch (err) {
-    console.error(`[kg-refresh] could not seed FlyMachineProfile/kg-refresh from kg_fly_machine_override; the row stays: ${err instanceof Error ? err.message : String(err)}`);
-    return;
-  }
-  (deps.clearOverride ?? (() => setKgFlyMachineOverride(null)))();
-  console.log(`[kg-refresh] seeded FlyMachineProfile/kg-refresh from kg_fly_machine_override (${config.cpuKind}, ${config.cpus} CPU, ${config.memoryMb} MB) and removed the row`);
-}

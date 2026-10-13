@@ -6,6 +6,7 @@ import { recheckIdentity, type AccessRole } from "./access-entries.js";
 import { type MemoryProvider, KG_TOOL_CAPABILITY } from "./kg-provider.js";
 import type { Caller } from "./mcp-identity.js";
 import { discoverTools, callTool } from "./restate/tools-client.js";
+import { refreshRunnerBackendCache } from "./orchestrator-settings.js";
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -83,6 +84,7 @@ export function scopeIdempotencyKey(callerId: string, supplied: string): string 
 const RESTATE_TOOL_NAMES = new Set([
   "get_tenant_health",
   "get_runner_mode",
+  "get_runner_backend",
   "list_projects",
   "get_project_binding",
   "list_in_flight_jobs",
@@ -104,6 +106,8 @@ const RESTATE_TOOL_NAMES = new Set([
   "trigger_kg_refresh",
   "set_runner_mode",
   "set_fly_machine_profile",
+  "set_runner_backend",
+  "set_run_profile",
   "pause_project",
   "add_project",
   "trigger_workflow_sync",
@@ -121,6 +125,8 @@ export const RESTATE_WRITE_TOOL_NAMES = new Set([
   "trigger_kg_refresh",
   "set_runner_mode",
   "set_fly_machine_profile",
+  "set_runner_backend",
+  "set_run_profile",
   "pause_project",
   "add_project",
   "trigger_workflow_sync",
@@ -323,6 +329,11 @@ export async function handleMcpRequest(
       if (callResult.status === "unavailable") {
         json(res, 503, { error: "restate-unavailable" });
         return;
+      }
+      // The process cache behind getFlySessionsConfig() is filled by polling; refresh it here so
+      // a write through /mcp takes effect at the next dispatch, as the admin Settings path does.
+      if (toolName === "set_runner_backend" && callResult.status === "ok" && !callResult.isError) {
+        await refreshRunnerBackendCache();
       }
       json(res, 200, {
         jsonrpc: "2.0",

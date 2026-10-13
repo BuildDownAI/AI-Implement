@@ -8,7 +8,7 @@ export const kgPipelinesHtml = `
       <div class="page-subtitle">Refresh the knowledge graph and watch its runs</div>
     </div>
     <div class="page-header-actions">
-      <button class="btn btn-sm" onclick="loadKgStatus(); loadKgExecutionMode(); loadKgMaterializeMode(); loadKgFlyMachine()">&#8635; Refresh</button>
+      <button class="btn btn-sm" onclick="loadKgStatus(); loadKgExecutionMode(); loadKgMaterializeMode(); loadKgRunProfile()">&#8635; Refresh</button>
     </div>
   </header>
   <div class="page-body">
@@ -45,7 +45,7 @@ export const kgPipelinesHtml = `
           <span class="kpi-trend text-secondary" id="kg-materialize-source"></span>
         </div>
         <div style="margin-top: 12px; display:flex; align-items:center; gap:12px; flex-wrap:wrap" id="kg-fly-machine-controls">
-          <span class="kpi-trend text-secondary">Fly machine:</span>
+          <span class="kpi-trend text-secondary">Run profile:</span>
           <span class="seg">
             <button class="btn btn-sm" id="btn-kg-fly-cpu-shared" onclick="window.setKgFlyCpuKind('shared')">shared</button>
             <button class="btn btn-sm" id="btn-kg-fly-cpu-performance" onclick="window.setKgFlyCpuKind('performance')">performance</button>
@@ -56,6 +56,13 @@ export const kgPipelinesHtml = `
           <button class="btn btn-sm" id="btn-kg-fly-save" disabled onclick="window.saveKgFlyMachine()">Save</button>
         </div>
         <div class="kpi-trend text-secondary" id="kg-fly-machine-effective"></div>
+        <div class="kpi-trend text-secondary" id="kg-run-profile-error" hidden></div>
+        <div style="margin-top: 12px; display:flex; align-items:center; gap:12px; flex-wrap:wrap" id="kg-gha-controls" hidden>
+          <span class="kpi-trend text-secondary">Run profile:</span>
+          <label class="kpi-trend text-secondary">Job timeout (minutes) <input type="number" id="kg-gha-job-timeout" min="10" max="360" step="1" style="width: 80px" oninput="window.refreshKgGhaDirty()"></label>
+          <button class="btn btn-sm" id="btn-kg-gha-save" disabled onclick="window.saveKgGhaProfile()">Save</button>
+        </div>
+        <div class="kpi-trend text-secondary" id="kg-gha-note" hidden>Runner size comes from the KG repo's \`AI_IMPLEMENT_RUNNER_LABEL\` Actions variable. GitHub owns the machines, so there is no kept machine or idle time.</div>
       </div>
     </div>
     ${dispatchLogHtml("kglog", { title: "Runs", emptyText: "No knowledge-graph refresh runs in the selected time range" })}
@@ -263,17 +270,14 @@ export const kgPipelinesScript = `
       showMessage('warning', 'Could not change the KG backend \u2014 ' + String(err));
     }
     loadKgExecutionMode();
-    loadKgFlyMachine();
+    loadKgRunProfile();
   };
 
   var KG_BACKEND_LABELS = { 'github-actions': 'GitHub Actions', 'fly-machines': 'Fly machines', 'local-docker': 'local Docker' };
 
-  // The effective line comes from get_kg_status.executionMode; the Fly machine row shows only for a Fly backend.
+  // The effective line comes from get_kg_status.executionMode; the run-profile row follows get_kg_status.runProfile.
   function renderKgExecutionMode(em) {
     const effectiveEl = document.getElementById('kg-backend-effective');
-    const isFly = !!em && em.effective === 'fly-machines';
-    document.getElementById('kg-fly-machine-controls').hidden = !isFly;
-    document.getElementById('kg-fly-machine-effective').hidden = !isFly;
     if (!em) { effectiveEl.textContent = ''; return; }
     const label = KG_BACKEND_LABELS[em.effective] || em.effective;
     let why;
@@ -311,10 +315,14 @@ export const kgPipelinesScript = `
     loadKgMaterializeMode();
   };
 
+  // AII-1245: the run-profile row. One row for the effective backend: Fly machine controls,
+  // a GitHub Actions job timeout, or nothing for local Docker.
   // AII-1116: the kg-refresh FlyMachineProfile. Reads and writes go through the tools route;
   // a tool answer is { content: [{ text }], isError }, with a 400 carried inside the text.
-  let savedKgFly = null;
-  let kgFlyKind = null;
+  let savedFlyProfile = null;
+  let flyCpuKind = null;
+  let savedKgGha = null;
+  let kgProfileBackend = null;
 
   function unwrapToolAnswer(res, body) {
     let status = res.status;
@@ -345,7 +353,7 @@ export const kgPipelinesScript = `
 
   function kgFlyInputs() {
     return {
-      cpuKind: kgFlyKind,
+      cpuKind: flyCpuKind,
       cpus: Number(document.getElementById('kg-fly-cpus').value),
       memoryMb: Number(document.getElementById('kg-fly-memory-mb').value),
       idleTimeoutMs: Math.round(Number(document.getElementById('kg-fly-idle-hours').value) * 3600000),
@@ -353,11 +361,11 @@ export const kgPipelinesScript = `
   }
 
   function kgFlyChanges() {
-    if (!savedKgFly) return {};
+    if (!savedFlyProfile) return {};
     const now = kgFlyInputs();
     const changes = {};
     ['cpuKind', 'cpus', 'memoryMb', 'idleTimeoutMs'].forEach(function (k) {
-      if (now[k] !== savedKgFly[k]) changes[k] = now[k];
+      if (now[k] !== savedFlyProfile[k]) changes[k] = now[k];
     });
     return changes;
   }
@@ -367,29 +375,54 @@ export const kgPipelinesScript = `
   }
 
   function paintKgFlyKind() {
-    document.getElementById('btn-kg-fly-cpu-shared').classList.toggle('btn-primary', kgFlyKind === 'shared');
-    document.getElementById('btn-kg-fly-cpu-performance').classList.toggle('btn-primary', kgFlyKind === 'performance');
+    document.getElementById('btn-kg-fly-cpu-shared').classList.toggle('btn-primary', flyCpuKind === 'shared');
+    document.getElementById('btn-kg-fly-cpu-performance').classList.toggle('btn-primary', flyCpuKind === 'performance');
   }
 
-  async function loadKgFlyMachine() {
+  async function loadKgRunProfile() {
     try {
       const res = await window.api('/api/tools/get_kg_status', { method: 'POST', body: JSON.stringify({ args: {} }) });
       const out = unwrapToolAnswer(res, await res.json().catch(function () { return {}; }));
       if (!out.ok) {
-        document.getElementById('kg-fly-machine-effective').textContent =
-          'next Fly run: profile unavailable (' + (out.status === 403 ? 'admin only' : out.status) + ')';
+        ['kg-fly-machine-controls', 'kg-fly-machine-effective', 'kg-gha-controls', 'kg-gha-note'].forEach(function (id) {
+          document.getElementById(id).hidden = true;
+        });
+        const errEl = document.getElementById('kg-run-profile-error');
+        errEl.textContent = 'run profile unavailable (' + (out.status === 403 ? 'admin only' : out.status) + ')';
+        errEl.hidden = false;
         return;
       }
+      document.getElementById('kg-run-profile-error').hidden = true;
       renderKgExecutionMode(out.body.executionMode);
-      const fm = out.body.flyMachine;
-      if (!fm || typeof fm.cpus !== 'number') return;
+      const rp = out.body.runProfile;
+      const backend = rp && rp.config ? rp.backend : null;
+      const isFly = backend === 'fly-machines';
+      const isGha = backend === 'github-actions';
+      document.getElementById('kg-fly-machine-controls').hidden = !isFly;
+      document.getElementById('kg-fly-machine-effective').hidden = !isFly;
+      document.getElementById('kg-gha-controls').hidden = !isGha;
+      document.getElementById('kg-gha-note').hidden = !isGha;
+      // A backend switch drops any half-typed edit that belonged to the other backend.
+      if (backend !== kgProfileBackend) { savedFlyProfile = null; savedKgGha = null; kgProfileBackend = backend; }
+      if (isGha) {
+        const cfg = rp.config;
+        if (typeof cfg.jobTimeoutMinutes !== 'number') return;
+        if (savedKgGha && Object.keys(kgGhaChanges()).length) return;
+        savedKgGha = { jobTimeoutMinutes: cfg.jobTimeoutMinutes };
+        document.getElementById('kg-gha-job-timeout').value = String(cfg.jobTimeoutMinutes);
+        refreshKgGhaDirty();
+        return;
+      }
+      if (!isFly) return;
+      const fm = rp.config;
+      if (typeof fm.cpus !== 'number') return;
       document.getElementById('kg-fly-machine-effective').textContent =
         'next Fly run: ' + fm.cpuKind + ', ' + fm.cpus + ' CPU / ' + fm.memoryMb + ' MB, idle '
-        + formatKgIdle(fm.idleTimeoutMs) + ' (' + fm.source + ')';
+        + formatKgIdle(fm.idleTimeoutMs) + ' (' + rp.source + ')';
       // A poll must not overwrite values the admin is mid-edit on.
-      if (savedKgFly && Object.keys(kgFlyChanges()).length) return;
-      savedKgFly = { cpuKind: fm.cpuKind, cpus: fm.cpus, memoryMb: fm.memoryMb, idleTimeoutMs: fm.idleTimeoutMs };
-      kgFlyKind = fm.cpuKind;
+      if (savedFlyProfile && Object.keys(kgFlyChanges()).length) return;
+      savedFlyProfile = { cpuKind: fm.cpuKind, cpus: fm.cpus, memoryMb: fm.memoryMb, idleTimeoutMs: fm.idleTimeoutMs };
+      flyCpuKind = fm.cpuKind;
       paintKgFlyKind();
       document.getElementById('kg-fly-cpus').value = String(fm.cpus);
       document.getElementById('kg-fly-memory-mb').value = String(fm.memoryMb);
@@ -399,46 +432,72 @@ export const kgPipelinesScript = `
   }
 
   window.setKgFlyCpuKind = function (kind) {
-    kgFlyKind = kind;
+    flyCpuKind = kind;
     paintKgFlyKind();
     refreshKgFlyDirty();
   };
   window.refreshKgFlyDirty = refreshKgFlyDirty;
 
-  window.saveKgFlyMachine = async function () {
-    const changes = kgFlyChanges();
-    if (!Object.keys(changes).length) return;
-    const args = Object.assign({ pipeline: 'kg-refresh' }, changes);
+  async function saveKgRunProfile(backend, patch) {
     try {
-      const res = await window.api('/api/tools/set_fly_machine_profile', { method: 'POST', body: JSON.stringify({ args: args }) });
+      const args = { pipeline: 'kg-refresh', backend: backend, patch: patch };
+      const res = await window.api('/api/tools/set_run_profile', { method: 'POST', body: JSON.stringify({ args: args }) });
       const out = unwrapToolAnswer(res, await res.json().catch(function () { return {}; }));
       if (out.status === 403) { showMessage('warning', 'admin only'); return; }
       if (!out.ok) {
-        showMessage('warning', 'Could not change the Fly machine profile \u2014 ' + (out.body.error || out.status));
+        showMessage('warning', 'Could not change the run profile \u2014 ' + (out.body.error || out.status));
         return;
       }
       document.getElementById('kg-pipelines-error').hidden = true;
-      savedKgFly = null;
-      loadKgFlyMachine();
+      savedFlyProfile = null;
+      savedKgGha = null;
+      loadKgRunProfile();
     } catch (err) {
-      showMessage('warning', 'Could not change the Fly machine profile \u2014 ' + String(err));
+      showMessage('warning', 'Could not change the run profile \u2014 ' + String(err));
     }
+  }
+
+  window.saveKgFlyMachine = function () {
+    const changes = kgFlyChanges();
+    if (!Object.keys(changes).length) return Promise.resolve();
+    return saveKgRunProfile('fly-machines', changes);
+  };
+
+  function kgGhaChanges() {
+    if (!savedKgGha) return {};
+    const raw = document.getElementById('kg-gha-job-timeout').value;
+    const v = raw === '' ? NaN : Number(raw);
+    return v === savedKgGha.jobTimeoutMinutes ? {} : { jobTimeoutMinutes: v };
+  }
+
+  function refreshKgGhaDirty() {
+    const changes = kgGhaChanges();
+    const v = changes.jobTimeoutMinutes;
+    const valid = Number.isInteger(v) && v >= 10 && v <= 360;
+    document.getElementById('btn-kg-gha-save').disabled = !(valid);
+  }
+  window.refreshKgGhaDirty = refreshKgGhaDirty;
+
+  window.saveKgGhaProfile = function () {
+    const changes = kgGhaChanges();
+    if (!Number.isInteger(changes.jobTimeoutMinutes)) return Promise.resolve();
+    return saveKgRunProfile('github-actions', changes);
   };
 
   window.loadKgStatus = loadKgStatus;
   window.loadKgExecutionMode = loadKgExecutionMode;
   window.loadKgMaterializeMode = loadKgMaterializeMode;
-  window.loadKgFlyMachine = loadKgFlyMachine;
+  window.loadKgRunProfile = loadKgRunProfile;
 
   window.registerPage('kg-pipelines', function () {
     loadKgStatus();
     loadKgExecutionMode();
     loadKgMaterializeMode();
-    loadKgFlyMachine();
+    loadKgRunProfile();
     setInterval(loadKgStatus, 15000);
     setInterval(loadKgExecutionMode, 15000);
     setInterval(loadKgMaterializeMode, 15000);
-    setInterval(loadKgFlyMachine, 15000);
+    setInterval(loadKgRunProfile, 15000);
     // createDispatchLog comes from the Pipelines page script; the card works without it.
     if (window.createDispatchLog) window.createDispatchLog('kglog', { filter: function (e) { return e.phase === 'kg-refresh'; } }).start();
   });

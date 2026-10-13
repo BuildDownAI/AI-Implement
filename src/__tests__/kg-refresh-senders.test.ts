@@ -27,6 +27,7 @@ function makeInput(overrides: Partial<KgRefreshSendInput> = {}): KgRefreshSendIn
     tokens: TOKENS,
     dispatchId: "d-1",
     machine: { cpuKind: "performance", cpus: 4, memoryMb: 16384, idleTimeoutMs: 1000 },
+    jobTimeoutMinutes: 240,
     machineId: null,
     machineNonce: NONCE,
     ...overrides,
@@ -92,7 +93,7 @@ describe("fly-machines sender", () => {
     expect(JSON.stringify(created[0])).toContain("durable-runner");
     expect(JSON.stringify(created[0])).toContain("kg-refresh");
     expect(result).toEqual({
-      outcome: "accepted", jobId: "m-new", machineId: "m-new", created: true,
+      outcome: "accepted", jobId: "m-new", machineId: "m-new", created: true, app: "fly-app",
       runUrl: "https://fly.io/apps/fly-app/machines/m-new", executionMode: "fly-machines",
     });
   });
@@ -102,7 +103,7 @@ describe("fly-machines sender", () => {
     (fly.getMachine as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("Fly API error (404)"));
     const result = await createKgRefreshSenders(deps)["fly-machines"](makeInput({ machineId: "m-old" }));
     expect(fly.getMachine).toHaveBeenCalledWith("m-old");
-    expect(result).toMatchObject({ jobId: "m-new", machineId: "m-new", created: true, replaced: "m-old" });
+    expect(result).toMatchObject({ jobId: "m-new", machineId: "m-new", created: true, replaced: "m-old", app: "fly-app" });
   });
 
   it("reuses a stopped kept machine", async () => {
@@ -110,7 +111,7 @@ describe("fly-machines sender", () => {
     const result = await createKgRefreshSenders(deps)["fly-machines"](makeInput({ machineId: "m-kept" }));
     expect(fly.getMachine).toHaveBeenCalledWith("m-kept");
     expect(fly.startMachine).toHaveBeenCalledWith("m-kept");
-    expect(result).toMatchObject({ jobId: "m-kept", machineId: "m-kept", created: false });
+    expect(result).toMatchObject({ jobId: "m-kept", machineId: "m-kept", created: false, app: "fly-app" });
     expect(result.replaced).toBeUndefined();
   });
 
@@ -188,7 +189,7 @@ describe("github-actions sender", () => {
 
   it("posts with returnRunDetails and includes the publication token when supported", async () => {
     const { deps } = makeDeps();
-    const result = await createKgRefreshSenders(deps)["github-actions"](makeInput({ machineNonce: null }));
+    await createKgRefreshSenders(deps)["github-actions"](makeInput({ machineNonce: null }));
     const posted = postedInputs(deps);
     expect(posted.returnRunDetails).toBe(true);
     expect(posted.ref).toBe("trunk");
@@ -196,6 +197,22 @@ describe("github-actions sender", () => {
     expect(posted.inputs.issue_identifier).toBe(IDENTIFIER);
     expect(posted.inputs.runner_phase).toBe("kg-refresh");
     expect(posted.inputs.job_timeout_minutes).toBe("240");
+  });
+
+  it("sends the profile's jobTimeoutMinutes as job_timeout_minutes", async () => {
+    const { deps } = makeDeps();
+    await createKgRefreshSenders(deps)["github-actions"](makeInput({ machineNonce: null, jobTimeoutMinutes: 120 }));
+    expect(postedInputs(deps).inputs.job_timeout_minutes).toBe("120");
+  });
+
+  it("refuses to dispatch without a profile timeout", async () => {
+    const { deps } = makeDeps();
+    await expect(createKgRefreshSenders(deps)["github-actions"](makeInput({ machineNonce: null, jobTimeoutMinutes: null }))).rejects.toThrow(/jobTimeoutMinutes/);
+  });
+
+  it("returns the accepted run", async () => {
+    const { deps } = makeDeps();
+    const result = await createKgRefreshSenders(deps)["github-actions"](makeInput({ machineNonce: null }));
     expect(result).toEqual({ outcome: "accepted", runId: 42, runUrl: "https://gh/run/42", jobId: "42", executionMode: "github-actions" });
   });
 

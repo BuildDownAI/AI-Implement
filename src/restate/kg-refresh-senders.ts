@@ -22,6 +22,8 @@ export interface KgRefreshSendInput {
   tokens: { runToken: string; progressToken: string; publicationToken: string };
   dispatchId: string;
   machine: FlyMachineProfileConfig;
+  /** The GitHub Actions job timeout from `GhaRunProfile`; null off GitHub Actions. */
+  jobTimeoutMinutes: number | null;
   /** The kept machine from `FlyMachineProfile.claim`; null when none is kept. */
   machineId: string | null;
   /** The derived machine nonce the workflow already armed on the row; null for GitHub Actions. */
@@ -111,6 +113,8 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
       pipeline: "kg-refresh",
       dispatchId: input.dispatchId,
     });
+    // Read once, inside the step: this is the app the machine lives in, whatever the accessor says later.
+    const app = config.flySessionsApp;
     const launched = await launchKeptMachine(deps.keptMachineFly(), {
       keptMachineId: input.machineId, dispatchId: input.dispatchId, machineConfig, machineNonce,
     });
@@ -125,6 +129,7 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
       executionMode,
       machineId: launched.machineId,
       created: launched.created,
+      app,
       ...(launched.created && launched.replaced !== undefined && { replaced: launched.replaced }),
     };
   };
@@ -186,11 +191,12 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
     const { supportsRunPublicationToken } = await deps.resolveWorkflowCapabilities({
       owner: repo.owner, repo: repo.repo, workflowFile: KG_REFRESH_WORKFLOW_FILE, token, ref,
     });
+    if (input.jobTimeoutMinutes === null) throw new Error("GitHub Actions dispatch needs jobTimeoutMinutes from GhaRunProfile");
     const inputs = buildKgRefreshGhaDispatchBody({
       runConfig: encoded, runToken: input.tokens.runToken, runProgressToken: input.tokens.progressToken,
       ...(supportsRunPublicationToken ? { runPublicationToken: input.tokens.publicationToken } : {}),
       runnerImage, runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
-      runnerPhase: "kg-refresh", jobTimeoutMinutes: "240", issueIdentifier: input.envelope.issue.identifier,
+      runnerPhase: "kg-refresh", jobTimeoutMinutes: String(input.jobTimeoutMinutes), issueIdentifier: input.envelope.issue.identifier,
     });
     const result = await deps.postWorkflowDispatch({
       token, owner: repo.owner, repo: repo.repo, workflowFile: KG_REFRESH_WORKFLOW_FILE,
