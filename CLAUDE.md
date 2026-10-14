@@ -178,11 +178,11 @@ The operator's `GH_TOKEN` (or `GITHUB_TOKEN`) is injected as `AI_IMPLEMENT_DEP_T
 
 ```bash
 npm test          # vitest run
-npm run typecheck # tsc --noEmit
+npm run typecheck # tsc --noEmit, then tsc --noEmit -p tsconfig.tests.json (test files included)
 npm run test:restate # src/__tests__/restate/**/*.restate.test.ts — one runtime, the `restate-server` binary from node_modules (the one production runs); Docker is not needed; not part of npm test
 ```
 
-**`typecheck` excludes `src/__tests__`, and vitest strips types without checking them** — so type errors in a test file are caught by nothing. Type-check a new test file explicitly with a throwaway tsconfig. `src/admin-ui/__tests__/` *is* covered and can break the build.
+**Vitest strips types without checking them, so `npm run typecheck` is what catches a type error in a test file.** Its second pass, `tsconfig.tests.json`, covers every `src/**/*.ts` file except an explicit `exclude` list of test files that still fail (tracked by AII-1357 to AII-1360, which shrink it). A new test file is checked from the day it is added; never add a file to that list.
 
 Fixing a bug: write the failing test first, then the fix, in one pull request — see [docs/bug-fix-tests.md](docs/bug-fix-tests.md).
 

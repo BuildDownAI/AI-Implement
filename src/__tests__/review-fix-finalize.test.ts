@@ -2,9 +2,8 @@
  * Behavioral tests for `src/review-fix-finalize.ts` (AII-790), against the real
  * `SqliteReviewFixAttemptStore` (AII-785) and the real `createReviewFixFinalizer` —
  * per the issue's seam-test amendment, only the GitHub and tracker adapters are
- * fakes. `npm run typecheck` excludes `src/__tests__`, and vitest strips types
- * without checking them, so this file is additionally type-checked via
- * `npx tsc --noEmit -p tsconfig.review-fix-finalize-tests.json`.
+ * fakes. Vitest strips types without checking them, so this file is
+ * type-checked by `npm run typecheck` (its `tsconfig.tests.json` pass).
  */
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import os from "node:os";

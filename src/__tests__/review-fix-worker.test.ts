@@ -6,8 +6,7 @@
  * mocking global `fetch`, since the transport is the seam AII-793's approved
  * amendment asks for explicitly.
  *
- * `npm run typecheck` excludes `src/__tests__`; this file is additionally
- * type-checked via `npx tsc --noEmit -p tsconfig.review-fix-worker-tests.json`.
+ * This file is type-checked by `npm run typecheck` (its `tsconfig.tests.json` pass).
  */
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import os from "node:os";
