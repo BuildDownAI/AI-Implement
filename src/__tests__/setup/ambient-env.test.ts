@@ -1,12 +1,6 @@
+// Both vitest configs collect this file, so the guard below checks the scrub each config loads.
 import { describe, expect, it } from "vitest";
-import {
-  BASE_ENV_ALLOWLIST,
-  RESTATE_ENV_ALLOWLIST,
-  extendEnvAllowlist,
-  isAllowedEnvName,
-  scrubAmbientEnv,
-  type EnvAllowlist,
-} from "./ambient-env.js";
+import { BASE_ENV_ALLOWLIST, isAllowedEnvName, scrubAmbientEnv, type EnvAllowlist } from "./ambient-env.js";
 
 describe("the environment a test sees", () => {
   it("holds no variable outside the base allowlist", () => {
@@ -45,30 +39,12 @@ describe("scrubAmbientEnv", () => {
   });
 });
 
-describe("extendEnvAllowlist", () => {
-  it("keeps every base entry and adds the tier's own", () => {
-    expect(isAllowedEnvName(RESTATE_ENV_ALLOWLIST, "PATH")).toBe(true);
-    expect(isAllowedEnvName(RESTATE_ENV_ALLOWLIST, "DOCKER_HOST")).toBe(true);
-    expect(isAllowedEnvName(BASE_ENV_ALLOWLIST, "DOCKER_HOST")).toBe(false);
-    expect(RESTATE_ENV_ALLOWLIST.pinned).toEqual(BASE_ENV_ALLOWLIST.pinned);
-  });
-
-  it("does not change the base it extends", () => {
-    const before = structuredClone(BASE_ENV_ALLOWLIST);
-    extendEnvAllowlist(BASE_ENV_ALLOWLIST, { names: { EXTRA: "extra" } });
-    expect(BASE_ENV_ALLOWLIST).toEqual(before);
-  });
-});
-
 describe("allowlist entries", () => {
-  it.each([
-    ["BASE_ENV_ALLOWLIST", BASE_ENV_ALLOWLIST],
-    ["RESTATE_ENV_ALLOWLIST", RESTATE_ENV_ALLOWLIST],
-  ])("each entry in %s states its reason", (_label, allowlist) => {
+  it("each entry in BASE_ENV_ALLOWLIST states its reason", () => {
     const reasons = [
-      ...Object.values(allowlist.names),
-      ...Object.values(allowlist.prefixes),
-      ...Object.values(allowlist.pinned).map((pin) => pin.reason),
+      ...Object.values(BASE_ENV_ALLOWLIST.names),
+      ...Object.values(BASE_ENV_ALLOWLIST.prefixes),
+      ...Object.values(BASE_ENV_ALLOWLIST.pinned).map((pin) => pin.reason),
     ];
     for (const reason of reasons) expect(reason.trim()).not.toBe("");
   });

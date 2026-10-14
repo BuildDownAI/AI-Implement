@@ -49,33 +49,6 @@ export const BASE_ENV_ALLOWLIST: EnvAllowlist = {
   },
 };
 
-export function extendEnvAllowlist(base: EnvAllowlist, extra: Partial<EnvAllowlist>): EnvAllowlist {
-  return {
-    names: { ...base.names, ...extra.names },
-    prefixes: { ...base.prefixes, ...extra.prefixes },
-    pinned: { ...base.pinned, ...extra.pinned },
-  };
-}
-
-// The Restate tier must also find its infrastructure: which runtime to use, and where the Docker daemon is.
-// Each of these locates the test's engine; none configures the code under test.
-export const RESTATE_ENV_ALLOWLIST = extendEnvAllowlist(BASE_ENV_ALLOWLIST, {
-  names: {
-    RESTATE_TEST_RUNTIME:
-      "CI forces the runtime with it. " +
-      "Without it, restate/harness.ts picks the container runtime wherever a Docker socket is usable, " +
-      "so the binary job would silently test the wrong runtime.",
-    XDG_RUNTIME_DIR: "restate/harness.ts looks for a rootless Docker socket under it.",
-    SSH_AUTH_SOCK: "The Docker client reaches an ssh:// DOCKER_HOST through the SSH agent.",
-    RYUK_CONTAINER_IMAGE: "testcontainers reads its cleanup container's image override from it.",
-    SSHD_CONTAINER_IMAGE: "testcontainers reads its SSH tunnel container's image override from it.",
-  },
-  prefixes: {
-    DOCKER_: "The Docker client finds and authenticates to the daemon through DOCKER_HOST, DOCKER_TLS_VERIFY and the rest.",
-    TESTCONTAINERS_: "testcontainers reads its own configuration from these.",
-  },
-});
-
 export function isAllowedEnvName(allowlist: EnvAllowlist, name: string): boolean {
   return (
     name in allowlist.names ||
