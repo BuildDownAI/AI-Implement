@@ -71,6 +71,23 @@ export const settingsHtml = `
     </div>
 
     <div class="card">
+      <div class="card-header"><h2 class="card-title">Runner Image Prefixes</h2></div>
+      <div class="card-body">
+        <p class="text-secondary" style="margin-bottom:12px">The orchestrator checks the runner image before each launch. It always trusts ghcr.io/builddownai/ and ghcr.io/&lt;repo owner&gt;/. Add more prefixes here, comma-separated. Each prefix must end with /. On GitHub Actions the workflow checks the image against the separate repository variable AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES.</p>
+        <div class="field">
+          <label>Extra Prefixes</label>
+          <div style="display:flex;gap:6px">
+            <input class="input" id="settings-runner-image-prefixes" placeholder="ghcr.io/acme/" style="flex:1">
+            <button class="btn btn-primary btn-sm" onclick="saveRunnerImagePrefixes()">Save</button>
+            <button class="btn btn-sm" onclick="clearRunnerImagePrefixes()">Clear</button>
+          </div>
+          <div id="settings-runner-image-prefixes-source" class="text-tertiary" style="font-size:11px;margin-top:3px"></div>
+        </div>
+        <div id="settings-runner-image-prefixes-error" class="error hidden"></div>
+      </div>
+    </div>
+
+    <div class="card">
       <div class="card-header"><h2 class="card-title">Retry Policy</h2></div>
       <div class="card-body">
         <p class="text-secondary" style="margin-bottom:12px">Global retry/backoff policy and post-push reviewer turn cap. Blank fields fall back to the default shown as a placeholder.</p>
@@ -171,6 +188,13 @@ export const settingsScript = `
       pickupLabelInput.value = data.linearPickupLabel.value || '';
       pickupLabelSource.textContent = 'Active: ' + data.linearPickupLabel.effective
         + (data.linearPickupLabel.value === null ? ' (default)' : ' (from settings)');
+      const prefixes = data.runnerImageAllowedPrefixes;
+      if (prefixes) {
+        document.getElementById('settings-runner-image-prefixes').value = prefixes.value || '';
+        document.getElementById('settings-runner-image-prefixes-source').textContent =
+          'Built-in: ' + (prefixes.builtIn || []).join(', ')
+          + '  Extra: ' + ((prefixes.effective || []).join(', ') || 'none');
+      }
       const srcText = appInfo.runtimeValue
         ? ('Active: ' + window.esc(appInfo.runtimeValue) + (data.runnerBackendSource === 'restate' ? ' (source: restate)' : ' (source: fallback \u2014 Restate not read yet; env var or DB row)'))
         : 'Not configured — add a sessions app name to enable Fly dispatch';
@@ -277,6 +301,30 @@ export const settingsScript = `
     }
   }
   window.resetPickupLabel = resetPickupLabel;
+
+  async function postRunnerImagePrefixes(val) {
+    const errEl = document.getElementById('settings-runner-image-prefixes-error');
+    errEl.classList.add('hidden');
+    try {
+      const res = await window.api('/api/settings', { method: 'POST', body: JSON.stringify({ runnerImageAllowedPrefixes: val }) });
+      const data = await res.json();
+      if (!res.ok) { errEl.textContent = data.error || 'Failed to save setting.'; errEl.classList.remove('hidden'); return; }
+      await loadSettings();
+    } catch (err) {
+      errEl.textContent = String(err);
+      errEl.classList.remove('hidden');
+    }
+  }
+
+  async function saveRunnerImagePrefixes() {
+    await postRunnerImagePrefixes(document.getElementById('settings-runner-image-prefixes').value.trim() || null);
+  }
+  window.saveRunnerImagePrefixes = saveRunnerImagePrefixes;
+
+  async function clearRunnerImagePrefixes() {
+    await postRunnerImagePrefixes(null);
+  }
+  window.clearRunnerImagePrefixes = clearRunnerImagePrefixes;
 
   async function saveSettings(payload, errEl) {
     errEl = errEl || document.getElementById('settings-error');
