@@ -12,8 +12,9 @@
  * token returns `refresh_token_reused` and ends the session. A crash between OpenAI's rotation and the store
  * write still loses the session; that window is accepted and the profile then needs a new sign-in.
  *
- * Outcomes beyond the issue's table: a corrupt or unparsable record maps to `reauth_required`; an unavailable
- * key or store fault maps to `transient`.
+ * Outcomes beyond the issue's table: a corrupt or unparsable record maps to `reauth_required`, and so does a
+ * record sealed under a different `RUNNER_TOKEN_SECRET` (`key_mismatch`; it can never decrypt, so no retry);
+ * an unset secret (`key_unavailable`) or a store fault maps to `transient`.
  *
  * Scheduling: every run records `nextAt` in state and sends a delayed `refresh` carrying `scheduledFor: nextAt`.
  * A scheduled run whose `scheduledFor` no longer matches state is a superseded timer (a `requested` run
@@ -32,6 +33,7 @@ import {
   type ChatGptPlanRecordV1,
 } from "../chatgpt-plan-token.js";
 import { getDb } from "../dedup.js";
+import { createModelSessionKeyProvider } from "../model-session-keys.js";
 import { createModelSessionStore, type ModelSessionStore } from "../model-session-store.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 
@@ -72,10 +74,10 @@ export function planNextAt(record: ChatGptPlanRecordV1, now: number): number {
   return Math.max(due, now + MIN_DELAY_MS);
 }
 
-/** Fail-closed store for a deployment with no provisioned session key: nothing can be read or written. */
-function unprovisionedStore(): ModelSessionStore {
+/** Store keyed from `RUNNER_TOKEN_SECRET` (read per call). Plan-record methods use neither owner nor operator checks. */
+function hostedPlanStore(): ModelSessionStore {
   return createModelSessionStore({
-    keys: { current: () => undefined, get: () => undefined },
+    keys: createModelSessionKeyProvider(),
     verifyOwner: () => false,
     authorizeOperator: () => false,
     db: () => getDb(), // resolved per call, so importing this module opens no database
@@ -88,6 +90,7 @@ function readRecord(store: ModelSessionStore, profileId: string):
   const read = store.readPlanRecord(profileId);
   if (!read.ok) {
     if (read.reason === "no_state") return { kind: "outcome", outcome: "missing" };
+    if (read.reason === "key_mismatch") return { kind: "outcome", outcome: "reauth_required" };
     if (read.category === "authentication_required" || read.reason === "write_failed") {
       return { kind: "outcome", outcome: "transient" };
     }
@@ -172,11 +175,11 @@ export function createChatGptPlanAccount(deps: ChatGptPlanAccountDeps) {
 export type ChatGptPlanAccountDefinition = ReturnType<typeof createChatGptPlanAccount>;
 
 /**
- * The bound object. No session key provider exists yet (AII-1203/1204 provision one), so the production store
- * fails closed: an account with no readable record answers `missing`, one with an unreadable key `transient`.
+ * The bound object. Its store derives the session key from `RUNNER_TOKEN_SECRET` (AII-1355): an unset secret
+ * answers `transient`, a record sealed under another secret `reauth_required`, no record `missing`.
  */
 export const chatGptPlanAccount: ChatGptPlanAccountDefinition = createChatGptPlanAccount({
-  store: unprovisionedStore(),
+  store: hostedPlanStore(),
   fetch: (...args) => fetch(...args),
   now: Date.now,
 });

@@ -3,10 +3,16 @@
 //
 // Run with `npm run test:restate` (binary runtime, no Docker); excluded from `npm test`.
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { RestateEnvironment } from "./harness.js";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { serializeChatGptPlanRecord, parseChatGptPlanRecord, type ChatGptPlanRecordV1 } from "../../chatgpt-plan-token.js";
 import type { ModelSessionStore, SessionReadResult, SessionWriteResult } from "../../model-session-store.js";
+import { closeDb } from "../../dedup.js";
+import { createModelSessionStore } from "../../model-session-store.js";
+import { createModelSessionKeyProvider } from "../../model-session-keys.js";
 import { createChatGptPlanAccount, type ChatGptPlanRefreshResult } from "../../restate/chatgpt-plan-account.js";
 import { VARIANTS, callObject, eventually, journalEntries, journalText, queryInvocations, startVariants, stopAll } from "./harness.js";
 
@@ -245,6 +251,105 @@ describe("ChatGptPlanAccount object", () => {
         expect(stateRows.length).toBeGreaterThan(0);
         const stateText = JSON.stringify(stateRows);
         for (const s of [SENTINEL_ACCESS, SENTINEL_REFRESH, NEW_ACCESS, NEW_REFRESH]) expect(stateText).not.toContain(s);
+      });
+    });
+  }
+});
+
+// AII-1355: the real store, keyed from RUNNER_TOKEN_SECRET, behind the same object.
+describe("ChatGptPlanAccount with the hosted session key", () => {
+  const SECRET = "SENTINEL-RUNNER-TOKEN-SECRET-xyz";
+  const dbPath = path.join(os.tmpdir(), `chatgpt-plan-hosted-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
+  const previousDb = process.env.DEDUP_DB_PATH;
+  let environments: Map<string, RestateEnvironment>;
+  let fetchCalls = 0;
+  const logs: string[] = [];
+
+  const store = createModelSessionStore({
+    keys: createModelSessionKeyProvider(),
+    verifyOwner: () => false,
+    authorizeOperator: () => false,
+  });
+
+  beforeAll(async () => {
+    process.env.DEDUP_DB_PATH = dbPath;
+    for (const m of ["log", "info", "warn", "error"] as const) {
+      vi.spyOn(console, m).mockImplementation((...a: unknown[]) => { logs.push(a.map(String).join(" ")); });
+    }
+    const object = createChatGptPlanAccount({
+      store,
+      fetch: (async () => { fetchCalls += 1; throw new Error("unexpected network call"); }) as typeof fetch,
+      now: Date.now,
+    });
+    environments = await startVariants([object]);
+  }, 60_000);
+
+  afterAll(async () => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+    await stopAll(environments);
+    closeDb();
+    if (previousDb === undefined) delete process.env.DEDUP_DB_PATH; else process.env.DEDUP_DB_PATH = previousDb;
+    for (const suffix of ["", "-wal", "-shm"]) {
+      try { fs.unlinkSync(dbPath + suffix); } catch { /* ignore */ }
+    }
+  });
+
+  const refreshCall = (env: RestateEnvironment, key: string) =>
+    callObject<ChatGptPlanRefreshResult>(env.baseUrl(), "ChatGptPlanAccount", key, "refresh", { reason: "requested" });
+  const invocations = (env: RestateEnvironment, key: string) =>
+    queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'ChatGptPlanAccount' AND target_service_key = '${key}'`);
+
+  for (const [label] of VARIANTS) {
+    const env = () => {
+      const e = environments.get(label);
+      if (!e) throw new Error(`environment "${label}" did not start`);
+      return e;
+    };
+
+    describe(label, () => {
+      it("round-trips a record, maps key_mismatch/key_unavailable/no_state, and leaks neither secret nor key", async () => {
+        const derivedKey = (vi.stubEnv("RUNNER_TOKEN_SECRET", SECRET), createModelSessionKeyProvider().current()!.key);
+        const rec = record({ accessTokenExpiresAt: Date.now() + 2 * HOUR });
+
+        // set + none -> missing
+        const profile = `hosted-${randomUUID()}`;
+        expect(await refreshCall(env(), profile)).toEqual({ outcome: "missing", nextAt: null });
+
+        // set + same secret -> fresh
+        const written = store.writePlanRecord({ profileId: profile, expectedSequence: null, sessionData: serializeChatGptPlanRecord(rec) });
+        expect(written.ok).toBe(true);
+        const fresh = await refreshCall(env(), profile);
+        expect(fresh.outcome).toBe("fresh");
+        expect(fresh.nextAt).toBe(rec.accessTokenExpiresAt - 10 * 60_000);
+
+        // set + different secret -> reauth_required, nothing scheduled
+        vi.stubEnv("RUNNER_TOKEN_SECRET", `${SECRET}-rotated`);
+        const res = await refreshCall(env(), profile);
+        expect(res).toEqual({ outcome: "reauth_required", nextAt: null });
+
+        // unset -> transient, retry in 2 minutes
+        vi.stubEnv("RUNNER_TOKEN_SECRET", "");
+        const before = Date.now();
+        const unset = await refreshCall(env(), profile);
+        expect(unset.outcome).toBe("transient");
+        expect(unset.nextAt!).toBeGreaterThanOrEqual(before + 2 * 60_000);
+        expect(fetchCalls).toBe(0);
+
+        // nothing sensitive in logs, journal, or state
+        const secrets = [SECRET, derivedKey.toString("hex"), derivedKey.toString("base64"), SENTINEL_ACCESS, SENTINEL_REFRESH];
+        const rows = await invocations(env(), profile);
+        const journal = (await Promise.all(rows.map(async (r) => journalText(await journalEntries(env().adminAPIBaseUrl(), String(r.id)))))).join("\n");
+        const response = await fetch(`${env().adminAPIBaseUrl()}/query`, { // restate-test-allow: the one state-table read
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json" },
+          body: JSON.stringify({ query: `SELECT * FROM state WHERE service_name = 'ChatGptPlanAccount' AND service_key = '${profile}'` }),
+        });
+        const stateText = JSON.stringify(((await response.json()) as { rows: unknown[] }).rows);
+        for (const text of [journal, stateText, logs.join("\n")]) {
+          for (const s of secrets) expect(text).not.toContain(s);
+        }
+        vi.unstubAllEnvs();
       });
     });
   }
