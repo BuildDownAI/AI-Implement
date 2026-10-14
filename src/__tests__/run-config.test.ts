@@ -4,6 +4,7 @@ import {
   decodeRunConfig,
   runConfigFromTaskDocument,
   buildImplRunConfig,
+  buildRunConfig,
   buildKgRefreshRunConfig,
   type RunConfigV1,
   type TaskDocumentParams,
@@ -309,6 +310,90 @@ const implBaseIssue = {
   title: "Add feature X",
   description: "Implement the feature",
 };
+
+describe("buildRunConfig", () => {
+  const fullMapping = makeMapping({
+    branchPrefix: "pr",
+    skillsRepo: "org/skills",
+    maxTurns: 50,
+    maxIterations: 3,
+    sensitiveAddPatterns: ["*.secrets.toml"],
+    sensitiveAllowPatterns: [".env"],
+    dependencyTokenScope: "installation",
+    referenceRepos: [{ repo: "org/ref", ref: "main" }] as RepoMapping["referenceRepos"],
+    reviewers: [{ id: "gap-analysis", gates: true }],
+    reviewProcess: "claude-code-review",
+    trustedReviewAuthors: ["octocat"],
+  });
+  const issue = { ...implBaseIssue, profiles: ["backend"], assigneeName: "Ada" };
+  const retryPolicy = { ...DEFAULT_RETRY_POLICY, stageRetries: 0 };
+  const reviewFix = {
+    version: 1 as const,
+    attemptId: "attempt-1",
+    installationId: 123,
+    repository: "acme/widgets",
+    prNumber: 42,
+    deadlineAt: Date.parse("2026-01-01T00:00:00.000Z"),
+  };
+  const build = (runnerPhase: RunConfigV1["runnerPhase"] & string, extra: Partial<Parameters<typeof buildRunConfig>[0]> = {}) =>
+    buildRunConfig({
+      runnerPhase,
+      issue,
+      mapping: fullMapping,
+      baseBranch: "develop",
+      runnerCallbackUrl: "https://orch.example/runner",
+      prNumber: "42",
+      commentInstruction: "do it",
+      planningContext: { parent: "p" },
+      groupingParent: true,
+      retryPolicy,
+      ...extra,
+    });
+  const common = [
+    "v", "issue", "runnerPhase", "baseBranch", "branchPrefix", "skillsRepo", "runnerCallbackUrl",
+    "maxTurns", "maxIterations", "prNumber", "commentInstruction", "sensitiveFiles", "reviewers",
+    "reviewProcess", "trustedReviewAuthors", "profiles", "assigneeName", "planningContext", "groupingParent",
+  ];
+
+  it.each([
+    ["implementation", [...common, "dependencyTokenScope", "referenceRepos", "retryPolicy"]],
+    ["gap-analysis", [...common, "dependencyTokenScope", "referenceRepos", "retryPolicy"]],
+    ["planning", common],
+  ] as const)("emits each conditional key once for %s", (phase, expected) => {
+    const cfg = build(phase);
+    const keys = Object.keys(cfg);
+    expect(new Set(keys).size).toBe(keys.length);
+    expect([...keys].sort()).toEqual([...expected].sort());
+    expect(cfg.retryPolicy).toEqual(phase === "planning" ? undefined : retryPolicy);
+  });
+
+  it("omits referenceRepos and retryPolicy for kg-refresh", () => {
+    const cfg = build("kg-refresh");
+    expect("referenceRepos" in cfg).toBe(false);
+    expect("retryPolicy" in cfg).toBe(false);
+  });
+
+  it("falls back to DEFAULT_RETRY_POLICY on a null policy", () => {
+    expect(build("implementation", { retryPolicy: null }).retryPolicy).toEqual(DEFAULT_RETRY_POLICY);
+  });
+
+  it("includes reviewFix only when set", () => {
+    expect("reviewFix" in build("gap-analysis")).toBe(false);
+    const cfg = build("gap-analysis", { reviewFix });
+    expect(cfg.reviewFix).toEqual(reviewFix);
+    expect(decodeRunConfig(encodeRunConfig(cfg)).reviewFix).toEqual(reviewFix);
+  });
+
+  it("keeps the edge cases: empty description, empty profiles, falsy baseBranch", () => {
+    const cfg = build("implementation", {
+      issue: { ...implBaseIssue, description: "", profiles: [] },
+      baseBranch: "",
+    });
+    expect(cfg.issue.description).toBe(implBaseIssue.title);
+    expect("profiles" in cfg).toBe(false);
+    expect("baseBranch" in cfg).toBe(false);
+  });
+});
 
 // buildImplRunConfig backs both the Fly Machines and local Docker implementation
 // dispatch paths (BAC-27113) — a single shared builder, tested once here.

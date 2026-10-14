@@ -1,5 +1,5 @@
 import type { ReferenceRepo } from "./reference-repos.js";
-import type { RetryPolicy } from "./pipeline/retry-backoff.js";
+import { DEFAULT_RETRY_POLICY, type RetryPolicy } from "./pipeline/retry-backoff.js";
 import type { RepoMapping, ReviewerSelection } from "./config.js";
 import { isReviewProcessId, type ReviewProcessId } from "./review-process.js";
 import { validateReviewFixMetadata, type ReviewFixMetadataV1 } from "./review-fix-contract.js";
@@ -168,6 +168,66 @@ export function buildImplRunConfig(input: ImplRunConfigInput): RunConfigV1 {
     ...(mapping.reviewProcess != null ? { reviewProcess: mapping.reviewProcess } : {}),
     ...(mapping.trustedReviewAuthors != null ? { trustedReviewAuthors: mapping.trustedReviewAuthors } : {}),
     retryPolicy,
+  };
+}
+
+export interface RunConfigBuildInput {
+  runnerPhase: "implementation" | "gap-analysis" | "planning" | "kg-refresh";
+  issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[]; assigneeName?: string };
+  mapping: RepoMapping;
+  baseBranch?: string;
+  runnerCallbackUrl?: string;
+  prNumber?: string;
+  /** Operator instruction forwarded from an /ai-implement PR comment. */
+  commentInstruction?: string;
+  planningContext?: { parent?: string; siblings?: string; dependencies?: string };
+  groupingParent?: boolean;
+  /** Required (nullable), as in EnvelopeDispatchOpts: every caller states its intent. */
+  retryPolicy: RetryPolicy | null;
+  reviewFix?: ReviewFixMetadataV1;
+}
+
+/**
+ * Builds the RunConfigV1 envelope from a run phase, an issue, a mapping and the per-run
+ * values. Key order is part of the contract: encodeRunConfig is JSON.stringify, so the
+ * encoded bytes follow it. `baseBranch` is included when truthy; the caller decides
+ * whether to omit the default branch.
+ */
+export function buildRunConfig(input: RunConfigBuildInput): RunConfigV1 {
+  const { issue, mapping } = input;
+  return {
+    v: 1,
+    issue: {
+      id: issue.id,
+      identifier: issue.identifier,
+      title: issue.title,
+      description: issue.description || issue.title,
+    },
+    runnerPhase: input.runnerPhase,
+    ...(input.baseBranch ? { baseBranch: input.baseBranch } : {}),
+    ...(mapping.branchPrefix ? { branchPrefix: mapping.branchPrefix } : {}),
+    ...(mapping.skillsRepo ? { skillsRepo: mapping.skillsRepo } : {}),
+    ...(input.runnerCallbackUrl ? { runnerCallbackUrl: input.runnerCallbackUrl } : {}),
+    ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
+    ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
+    ...(input.prNumber ? { prNumber: input.prNumber } : {}),
+    ...(input.commentInstruction ? { commentInstruction: input.commentInstruction } : {}),
+    ...(mapping.sensitiveAddPatterns != null || mapping.sensitiveAllowPatterns != null
+      ? { sensitiveFiles: { add: mapping.sensitiveAddPatterns ?? undefined, allow: mapping.sensitiveAllowPatterns ?? undefined } }
+      : {}),
+    ...(mapping.dependencyTokenScope != null && input.runnerPhase !== "planning" ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
+    ...(mapping.referenceRepos != null && input.runnerPhase !== "planning" && input.runnerPhase !== "kg-refresh" ? { referenceRepos: mapping.referenceRepos } : {}),
+    ...(mapping.reviewers != null ? { reviewers: mapping.reviewers } : {}),
+    ...(mapping.reviewProcess != null ? { reviewProcess: mapping.reviewProcess } : {}),
+    ...(mapping.trustedReviewAuthors != null ? { trustedReviewAuthors: mapping.trustedReviewAuthors } : {}),
+    ...(issue.profiles && issue.profiles.length > 0 ? { profiles: issue.profiles } : {}),
+    ...(issue.assigneeName ? { assigneeName: issue.assigneeName } : {}),
+    ...(input.planningContext ? { planningContext: input.planningContext } : {}),
+    ...(input.groupingParent ? { groupingParent: true } : {}),
+    ...(input.runnerPhase !== "planning" && input.runnerPhase !== "kg-refresh"
+      ? { retryPolicy: input.retryPolicy ?? DEFAULT_RETRY_POLICY }
+      : {}),
+    ...(input.reviewFix ? { reviewFix: input.reviewFix } : {}),
   };
 }
 
