@@ -56,7 +56,7 @@ const HELD_ACTIONS: Record<HeldReason | "ledger" | "timed-out" | "generic", stri
 
 /** The held comment. `reason` is the tick's `heldBy` (absent on a tick journaled before it existed), or `timed-out`. */
 export function heldCommentBody(key: string, sha: string, reason: HeldReason | "ledger" | "timed-out" | undefined): string {
-  return `${lateExternalHeldMarker(key)}\n⚠️ AI-Implement did not write the approval mark for ${sha}, so auto-merge holds this PR.\n\n${HELD_ACTIONS[reason ?? "generic"]}`;
+  return `${lateExternalHeldMarker(key)}\n⚠️ AI-Implement did not write the approval mark for ${sha}, so AI-Implement does not merge this PR.\n\n${HELD_ACTIONS[reason ?? "generic"]}`;
 }
 
 export const lateExternalReviewInputSchema = z.object({
