@@ -45,6 +45,7 @@ describe("resolveCustomFieldIds", () => {
       statusOverride: "customfield_99",
       repoOverride: "customfield_98",
       profilesOverride: null,
+      baseBranchOverride: null,
     });
     expect(client.listFields).toHaveBeenCalledTimes(1);
   });
@@ -59,6 +60,7 @@ describe("resolveCustomFieldIds", () => {
       statusOverride: "customfield_status_override",
       repoOverride: null,
       profilesOverride: null,
+      baseBranchOverride: null,
     });
     expect(ids.statusFieldId).toBe("customfield_status_override");
     expect(ids.repoFieldId).toBe("customfield_x");
@@ -155,24 +157,24 @@ describe("getCachedFieldIds", () => {
   it("queries listFields once per cache key, then serves from cache", async () => {
     clearFieldCache();
     const client = { listFields: vi.fn().mockResolvedValue(baseFields) };
-    await getCachedFieldIds("k1", client as any, { statusOverride: null, repoOverride: null, profilesOverride: null });
-    await getCachedFieldIds("k1", client as any, { statusOverride: null, repoOverride: null, profilesOverride: null });
+    await getCachedFieldIds("k1", client as any, { statusOverride: null, repoOverride: null, profilesOverride: null, baseBranchOverride: null });
+    await getCachedFieldIds("k1", client as any, { statusOverride: null, repoOverride: null, profilesOverride: null, baseBranchOverride: null });
     expect(client.listFields).toHaveBeenCalledTimes(1);
   });
 
   it("treats different cache keys as separate entries", async () => {
     clearFieldCache();
     const client = { listFields: vi.fn().mockResolvedValue(baseFields) };
-    await getCachedFieldIds("k1", client as any, { statusOverride: null, repoOverride: null, profilesOverride: null });
-    await getCachedFieldIds("k2", client as any, { statusOverride: null, repoOverride: null, profilesOverride: null });
+    await getCachedFieldIds("k1", client as any, { statusOverride: null, repoOverride: null, profilesOverride: null, baseBranchOverride: null });
+    await getCachedFieldIds("k2", client as any, { statusOverride: null, repoOverride: null, profilesOverride: null, baseBranchOverride: null });
     expect(client.listFields).toHaveBeenCalledTimes(2);
   });
 
   it("re-resolves when the same cache key is called with a changed override", async () => {
     clearFieldCache();
     const client = { listFields: vi.fn().mockResolvedValue(baseFields) };
-    const a = await getCachedFieldIds("k1", client as any, { statusOverride: "customfield_A", repoOverride: null, profilesOverride: null });
-    const b = await getCachedFieldIds("k1", client as any, { statusOverride: "customfield_B", repoOverride: null, profilesOverride: null });
+    const a = await getCachedFieldIds("k1", client as any, { statusOverride: "customfield_A", repoOverride: null, profilesOverride: null, baseBranchOverride: null });
+    const b = await getCachedFieldIds("k1", client as any, { statusOverride: "customfield_B", repoOverride: null, profilesOverride: null, baseBranchOverride: null });
     expect(a.statusFieldId).toBe("customfield_A");
     expect(b.statusFieldId).toBe("customfield_B");
   });
@@ -180,8 +182,8 @@ describe("getCachedFieldIds", () => {
   it("re-resolves when profilesOverride changes for the same cache key", async () => {
     clearFieldCache();
     const client = { listFields: vi.fn().mockResolvedValue(baseFields) };
-    const a = await getCachedFieldIds("k1", client as any, { statusOverride: null, repoOverride: null, profilesOverride: null });
-    const b = await getCachedFieldIds("k1", client as any, { statusOverride: null, repoOverride: null, profilesOverride: "customfield_P" });
+    const a = await getCachedFieldIds("k1", client as any, { statusOverride: null, repoOverride: null, profilesOverride: null, baseBranchOverride: null });
+    const b = await getCachedFieldIds("k1", client as any, { statusOverride: null, repoOverride: null, profilesOverride: "customfield_P", baseBranchOverride: null });
     expect(a.profilesFieldId).toBeNull();
     expect(b.profilesFieldId).toBe("customfield_P");
     expect(client.listFields).toHaveBeenCalledTimes(2);
