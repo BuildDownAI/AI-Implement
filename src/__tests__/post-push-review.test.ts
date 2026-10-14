@@ -1,9 +1,9 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { readFileSync } from "node:fs";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
+import type { LLMExecutor, PipelineContextData } from "../pipeline/types.js";
 import { OperatorCancelledError, PrMergedError } from "../pipeline/operator-cancelled.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { classifyThrown } from "../pipeline/failure-classification.js";
@@ -11,16 +11,21 @@ import type { ReviewerDefinition } from "../pipeline/reviewers/registry.js";
 import { REVIEWER_VERDICT_SCHEMA } from "../pipeline/reviewers/schema.js";
 import { DISPOSITIONS_FILE, buildDispositionInstructions, stableReviewFindingKey } from "../pipeline/finding-dispositions.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "../pipeline/cycle-summary.js";
+import { makeContext } from "./helpers/builders.js";
+import { testDir } from "./helpers/test-dir.js";
 
-function makeCtx(execMock: any, dataOverrides: Record<string, unknown> = {}) {
-  return {
-    data: { issueIdentifier: "AII-200", issueTitle: "X", issueDescription: "Y", model: "claude-sonnet-4-6", ...dataOverrides },
-    llmExecutor: { invoke: execMock },
-    getOutputs: () => ({}),
-    setOutputs: () => {},
-    resolveInputs: (i: any) => i,
-  } as any;
+function makeCtx(invoke: LLMExecutor["invoke"], overrides: Partial<PipelineContextData> = {}) {
+  return makeContext(
+    { issueIdentifier: "AII-200", issueTitle: "X", model: "claude-sonnet-4-6", ...overrides },
+    { invoke },
+  );
 }
+
+// Each run writes its cycle summaries and other output under ai-output/ in the workspace.
+let workspaceDir: string;
+beforeEach(() => {
+  workspaceDir = testDir("post-push-review");
+});
 
 function structuredReviewResult(structuredOutput: unknown, stdout = "ignored final text") {
   return {
@@ -84,7 +89,7 @@ describe("postPushReviewStep", () => {
     const ctx = makeCtx(invoke);
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
     expect(out.approved).toBe(true);
@@ -108,7 +113,7 @@ describe("postPushReviewStep", () => {
 
     await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -133,7 +138,7 @@ describe("postPushReviewStep", () => {
       if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42")) {
         return {
           stdout: JSON.stringify({
-            html_url: "https://github.com/eudoxus-ai/thrivable-survey-dashboard/pull/42",
+            html_url: "https://github.com/acme/app/pull/42",
             state: "open",
             draft: false,
             user: { login: "ai-implement[bot]" },
@@ -141,12 +146,12 @@ describe("postPushReviewStep", () => {
               ref: "ai-implement/aii-200-x",
               sha: "abc1234567890",
               user: { login: "ai-implement[bot]" },
-              repo: { full_name: "eudoxus-ai/thrivable-survey-dashboard" },
+              repo: { full_name: "acme/app" },
             },
             base: {
               ref: "main",
               sha: "def9876543210",
-              repo: { full_name: "eudoxus-ai/thrivable-survey-dashboard" },
+              repo: { full_name: "acme/app" },
             },
             mergeable: true,
           }),
@@ -161,7 +166,7 @@ describe("postPushReviewStep", () => {
     try {
       await postPushReviewStep.run(
         ctx,
-        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+        { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
         { report: vi.fn(async () => undefined) },
       );
       warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
@@ -199,7 +204,7 @@ describe("postPushReviewStep", () => {
 
     await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -238,7 +243,7 @@ describe("postPushReviewStep", () => {
     });
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn, refreshCredentials },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn, refreshCredentials },
       { report: vi.fn(async () => undefined) },
     );
     expect(out.approved).toBe(false);
@@ -284,7 +289,7 @@ describe("postPushReviewStep", () => {
       ctx,
       {
         prNumber: "42",
-        workspaceDir: "/tmp",
+        workspaceDir,
         maxIterations: 1,
         ghSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
         gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
@@ -318,7 +323,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -351,7 +356,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -376,7 +381,7 @@ describe("postPushReviewStep", () => {
 
     await postPushReviewStep.run(
       makeCtx(invoke),
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, reviewProviders: [] },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, reviewProviders: [] },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -404,7 +409,7 @@ describe("postPushReviewStep", () => {
     const out = await postPushReviewStep.run(
       makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 45 } }),
       {
-        prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
+        prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
         reviewers: [
           { id: "custom-review", gates: true },
           { id: "code-review", gates: true },
@@ -454,7 +459,7 @@ describe("postPushReviewStep", () => {
       await postPushReviewStep.run(
         makeCtx(invoke),
         {
-          prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
+          prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
           reviewers: [{ id: "code-review", gates: true }],
           trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("code-review")]),
         },
@@ -479,7 +484,7 @@ describe("postPushReviewStep", () => {
     const out = await postPushReviewStep.run(
       makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 45 } }),
       {
-        prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
+        prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
         reviewers: [{ id: "gap-analysis", gates: true }, { id: "code-review", gates: true }],
       },
       { report: vi.fn(async () => undefined) },
@@ -520,7 +525,7 @@ describe("postPushReviewStep", () => {
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
       {
-        prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn, reviewProviders: [],
+        prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn, reviewProviders: [],
         reviewers: [{ id: "code-review", gates: true }, { id: "gap-analysis", gates: true }],
         trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("code-review"), selectedReviewerDefinition("gap-analysis")]),
       },
@@ -581,7 +586,7 @@ describe("postPushReviewStep", () => {
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
       {
-        prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn,
+        prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn,
         reviewers: [{ id: "code-review", gates: true }, { id: "gap-analysis", gates: true }],
         trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("code-review"), selectedReviewerDefinition("gap-analysis")]),
       },
@@ -614,7 +619,7 @@ describe("postPushReviewStep", () => {
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
       {
-        prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
+        prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
         reviewers: [{ id: "custom-review", gates: false }],
         trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("custom-review")]),
       },
@@ -642,7 +647,7 @@ describe("postPushReviewStep", () => {
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
       {
-        prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn, reviewProviders: [],
+        prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn, reviewProviders: [],
         reviewers: [{ id: "custom-review", gates: false }, { id: "code-review", gates: true }],
         trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("custom-review"), selectedReviewerDefinition("code-review")]),
       },
@@ -670,7 +675,7 @@ describe("postPushReviewStep", () => {
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
       {
-        prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
+        prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
         reviewers: [{ id: "custom-review", gates: true }],
         trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("custom-review", { maxTurns: 7 })]),
       },
@@ -693,7 +698,7 @@ describe("postPushReviewStep", () => {
     try {
       const out = await postPushReviewStep.run(
         makeCtx(invoke),
-        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewers: [{ id: "missing-review", gates: true }], trustedReviewerDefinitions: new Map() },
+        { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewers: [{ id: "missing-review", gates: true }], trustedReviewerDefinitions: new Map() },
         { report: vi.fn(async () => undefined) },
       );
       expect(out.approved).toBe(false);
@@ -716,7 +721,7 @@ describe("postPushReviewStep", () => {
       });
       const out = await postPushReviewStep.run(
         makeCtx(vi.fn()),
-        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewers, trustedReviewerDefinitions: new Map() },
+        { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewers, trustedReviewerDefinitions: new Map() },
         { report: vi.fn(async () => undefined) },
       );
       expect(out.approved).toBe(false);
@@ -734,7 +739,7 @@ describe("postPushReviewStep", () => {
         makeCtx(invoke),
         {
           prNumber: "42",
-          workspaceDir: "/tmp",
+          workspaceDir,
           maxIterations: 1,
           ghSpawn: vi.fn((args: string[]) => args[0] === "pr" && args[1] === "diff" ? { stdout: "diff", exitCode: 0 } : { stdout: "", exitCode: 0 }),
           gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
@@ -798,7 +803,7 @@ describe("postPushReviewStep", () => {
       makeCtx(invoke, { model: "run-review-model" }),
       {
         prNumber: "42",
-        workspaceDir: "/tmp",
+        workspaceDir,
         maxIterations: 2,
         ghSpawn,
         gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
@@ -842,7 +847,7 @@ describe("postPushReviewStep", () => {
       makeCtx(invoke),
       {
         prNumber: "42",
-        workspaceDir: "/tmp",
+        workspaceDir,
         maxIterations: 2,
         ghSpawn,
         gitSpawn: vi.fn((args: string[]) => args[0] === "status" ? { stdout: "", exitCode: 0 } : { stdout: "", exitCode: 0 }),
@@ -890,7 +895,7 @@ describe("postPushReviewStep", () => {
       makeCtx(invoke),
       {
         prNumber: "42",
-        workspaceDir: "/tmp",
+        workspaceDir,
         maxIterations: 2,
         ghSpawn,
         gitSpawn,
@@ -927,7 +932,7 @@ describe("postPushReviewStep", () => {
       makeCtx(invoke),
       {
         prNumber: "42",
-        workspaceDir: "/tmp",
+        workspaceDir,
         maxIterations: 2,
         ghSpawn: vi.fn((args: string[]) => {
           if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
@@ -970,7 +975,7 @@ describe("postPushReviewStep", () => {
       makeCtx(invoke),
       {
         prNumber: "42",
-        workspaceDir: "/tmp",
+        workspaceDir,
         maxIterations: 2,
         ghSpawn,
         gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
@@ -1004,7 +1009,7 @@ describe("postPushReviewStep", () => {
       makeCtx(invoke),
       {
         prNumber: "42",
-        workspaceDir: "/tmp",
+        workspaceDir,
         maxIterations: 1,
         ghSpawn: vi.fn((args: string[]) => {
           if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
@@ -1033,7 +1038,7 @@ describe("postPushReviewStep", () => {
       makeCtx(invoke),
       {
         prNumber: "42",
-        workspaceDir: "/tmp",
+        workspaceDir,
         maxIterations: 1,
         ghSpawn: vi.fn((args: string[]) => args[0] === "pr" && args[1] === "diff" ? { stdout: "diff", exitCode: 0 } : { stdout: "", exitCode: 0 }),
         gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
@@ -1101,7 +1106,7 @@ describe("postPushReviewStep", () => {
       makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }),
       {
         prNumber: "42",
-        workspaceDir: "/tmp",
+        workspaceDir,
         maxIterations: 1,
         ghSpawn: vi.fn((args: string[]) => {
           if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
@@ -1140,7 +1145,7 @@ describe("postPushReviewStep", () => {
       makeCtx(invoke),
       {
         prNumber: "42",
-        workspaceDir: "/tmp",
+        workspaceDir,
         maxIterations: 2,
         ghSpawn: vi.fn((args: string[]) => {
           if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
@@ -1171,7 +1176,7 @@ describe("postPushReviewStep", () => {
         makeCtx(invoke),
         {
           prNumber: "42",
-          workspaceDir: "/tmp",
+          workspaceDir,
           maxIterations: 1,
           ghSpawn: vi.fn((args: string[]) => {
             if (args[0] === "pr" && args[1] === "comment") ghComments.push(args[args.indexOf("--body") + 1]);
@@ -1202,7 +1207,7 @@ describe("postPushReviewStep", () => {
       makeCtx(invoke),
       {
         prNumber: "42",
-        workspaceDir: "/tmp",
+        workspaceDir,
         maxIterations: 1,
         ghSpawn: vi.fn((args: string[]) => {
           if (args[0] === "pr" && args[1] === "comment") ghComments.push(args[args.indexOf("--body") + 1]);
@@ -1250,7 +1255,7 @@ describe("postPushReviewStep", () => {
       makeCtx(invoke),
       {
         prNumber: "42",
-        workspaceDir: "/tmp",
+        workspaceDir,
         maxIterations: 1,
         ghSpawn: vi.fn((args: string[]) => args[0] === "pr" && args[1] === "diff" ? { stdout: "diff", exitCode: 0 } : { stdout: "", exitCode: 0 }),
         gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
@@ -1307,7 +1312,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewerDefinitions: [configReviewerDefinition("domain-review", "Domain prompt")] },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewerDefinitions: [configReviewerDefinition("domain-review", "Domain prompt")] },
       { report: vi.fn(async (record) => { reports.push(record); }) },
     );
 
@@ -1346,7 +1351,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewerDefinitions: [configReviewerDefinition("domain-review", "Domain prompt")] },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewerDefinitions: [configReviewerDefinition("domain-review", "Domain prompt")] },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -1376,7 +1381,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewers: [{ id: "domain-review", gates: true }], trustedConfigReviewerDefinitions: [configReviewerDefinition("domain-review", "Domain prompt")] },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewers: [{ id: "domain-review", gates: true }], trustedConfigReviewerDefinitions: [configReviewerDefinition("domain-review", "Domain prompt")] },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -1397,7 +1402,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewers: [{ id: "code-review", gates: true }], trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("code-review")]) },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewers: [{ id: "code-review", gates: true }], trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("code-review")]) },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -1423,7 +1428,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [] },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [] },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -1448,7 +1453,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [] },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [] },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -1466,7 +1471,7 @@ describe("postPushReviewStep", () => {
       ...overrides,
     }));
     const out = await postPushReviewStep.run(makeCtx(invoke), {
-      prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, reviewProviders: [],
+      prNumber: "42", workspaceDir, maxIterations: 2, reviewProviders: [],
       ghSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
       gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
     }, { report: vi.fn(async () => undefined) });
@@ -1485,7 +1490,7 @@ describe("postPushReviewStep", () => {
       telemetry: { outcome: "error" as const, numTurns: 6, durationMs: 12_000, costUsd: null, tokensIn: 10, tokensOut: 20 },
     }));
     const out = await postPushReviewStep.run(makeCtx(invoke), {
-      prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, reviewProviders: [],
+      prNumber: "42", workspaceDir, maxIterations: 2, reviewProviders: [],
       ghSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
       gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
     }, { report: vi.fn(async () => undefined) });
@@ -1513,7 +1518,7 @@ describe("postPushReviewStep", () => {
     }));
 
     const out = await postPushReviewStep.run(makeCtx(invoke), {
-      prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, reviewProviders: [],
+      prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [],
       ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
     }, { report });
 
@@ -1547,7 +1552,7 @@ describe("postPushReviewStep", () => {
     const ctx = makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 45 } });
 
     const out = await postPushReviewStep.run(ctx, {
-      prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, reviewProviders: [],
+      prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [],
       ghSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
     }, { report: vi.fn(async () => undefined) });
 
@@ -1562,7 +1567,7 @@ describe("postPushReviewStep", () => {
     }));
 
     const out = await postPushReviewStep.run(makeCtx(invoke), {
-      prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, reviewProviders: [],
+      prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [],
       ghSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
     }, { report });
 
@@ -1604,7 +1609,7 @@ describe("postPushReviewStep", () => {
         });
       }
       if (params.stage === "post-push-review/fix-1") {
-        return { stdout: JSON.stringify({ fixed: ["Added null guard"], testing: ["ran tests"], notes: "" }), exitCode: 0 };
+        return { stdout: JSON.stringify({ fixed: ["Added null guard"], testing: ["ran tests"], notes: "" }), exitCode: 0, tokensUsed: 100 };
       }
       if (params.stage === "post-push-review/review-2") {
         return {
@@ -1617,7 +1622,7 @@ describe("postPushReviewStep", () => {
     });
 
     const out = await postPushReviewStep.run(makeCtx(invoke), {
-      prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, reviewProviders: [],
+      prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [],
       ghSpawn, gitSpawn,
     }, { report });
 
@@ -1675,7 +1680,7 @@ describe("postPushReviewStep", () => {
       makeCtx(invoke),
       {
         prNumber: "42",
-        workspaceDir: "/tmp",
+        workspaceDir,
         maxIterations: 2,
         reviewProviders: [],
         ghSpawn,
@@ -1712,7 +1717,7 @@ describe("postPushReviewStep", () => {
       makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 1 } }),
       {
         prNumber: "42",
-        workspaceDir: "/tmp",
+        workspaceDir,
         maxIterations: 2,
         reviewProviders: [],
         ghSpawn,
@@ -1760,7 +1765,7 @@ describe("postPushReviewStep", () => {
         });
       }
       if (params.stage === "post-push-review/fix-1") {
-        return { stdout: JSON.stringify({ fixed: ["Added null guard"], testing: ["ran tests"], notes: "" }), exitCode: 0 };
+        return { stdout: JSON.stringify({ fixed: ["Added null guard"], testing: ["ran tests"], notes: "" }), exitCode: 0, tokensUsed: 100 };
       }
       if (params.stage === "post-push-review/review-2") {
         return { stdout: "", stderr: "upstream returned 529 overloaded_error", exitCode: 1, tokensUsed: 0 };
@@ -1772,7 +1777,7 @@ describe("postPushReviewStep", () => {
       makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }),
       {
         prNumber: "42",
-        workspaceDir: "/tmp",
+        workspaceDir,
         maxIterations: 3,
         reviewProviders: [],
         ghSpawn,
@@ -1824,7 +1829,7 @@ describe("postPushReviewStep", () => {
     const report = vi.fn(async () => undefined);
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report },
     );
 
@@ -1869,7 +1874,7 @@ describe("postPushReviewStep", () => {
     const report = vi.fn(async () => undefined);
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn, sleep: async () => {} },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn, sleep: async () => {} },
       { report },
     );
 
@@ -1903,7 +1908,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [] },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [] },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -1931,7 +1936,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn, reviewProviders: [] },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn, reviewProviders: [] },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -1961,7 +1966,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -2003,7 +2008,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -2057,7 +2062,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -2152,7 +2157,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -2210,7 +2215,7 @@ describe("postPushReviewStep", () => {
       ctx,
       {
         prNumber: "42",
-        workspaceDir: "/tmp",
+        workspaceDir,
         maxIterations: 2,
         ghSpawn,
         gitSpawn,
@@ -2282,7 +2287,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -2341,7 +2346,7 @@ describe("postPushReviewStep", () => {
       makeCtx(invoke),
       {
         prNumber: "42",
-        workspaceDir: "/tmp",
+        workspaceDir,
         maxIterations: 2,
         ghSpawn,
         gitSpawn,
@@ -2390,7 +2395,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -2429,7 +2434,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn, reviewProviders: [] },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn, reviewProviders: [] },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -2473,7 +2478,7 @@ describe("postPushReviewStep", () => {
       ctx,
       {
         prNumber: "42",
-        workspaceDir: "/tmp",
+        workspaceDir,
         maxIterations: 2,
         ghSpawn,
         gitSpawn,
@@ -2528,7 +2533,7 @@ describe("postPushReviewStep", () => {
 
     await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -2573,7 +2578,7 @@ describe("postPushReviewStep", () => {
 
     await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -2618,7 +2623,7 @@ describe("postPushReviewStep", () => {
 
     await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -2651,7 +2656,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -2678,7 +2683,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -2705,7 +2710,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -2736,7 +2741,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -2765,7 +2770,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -2792,7 +2797,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -2821,7 +2826,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn() },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn() },
       { report },
     );
 
@@ -2858,7 +2863,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn() },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn() },
       { report },
     );
 
@@ -2898,7 +2903,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -2925,7 +2930,7 @@ describe("postPushReviewStep", () => {
     await expect(
       postPushReviewStep.run(
         ctx,
-        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn },
+        { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
         { report: vi.fn(async () => undefined) },
       ),
     ).rejects.toThrow(/stale info/);
@@ -2957,7 +2962,7 @@ describe("postPushReviewStep", () => {
     try {
       await postPushReviewStep.run(
         ctx,
-        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn, pushedSha: "aaaaaaa" },
+        { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn, pushedSha: "aaaaaaa" },
         { report: vi.fn(async () => undefined) },
       );
     } catch (err) {
@@ -2999,7 +3004,7 @@ describe("postPushReviewStep", () => {
     try {
       await postPushReviewStep.run(
         ctx,
-        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn, pushedSha: "aaaaaaa" },
+        { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn, pushedSha: "aaaaaaa" },
         { report: vi.fn(async () => undefined) },
       );
     } catch (err) {
@@ -3039,7 +3044,7 @@ describe("postPushReviewStep", () => {
     try {
       await postPushReviewStep.run(
         ctx,
-        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn, pushedSha: "aaaaaaa" },
+        { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn, pushedSha: "aaaaaaa" },
         { report: vi.fn(async () => undefined) },
       );
     } catch (err) {
@@ -3081,7 +3086,7 @@ describe("postPushReviewStep", () => {
 
     await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn, pushedSha: "aaaaaaa" },
+      { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn, pushedSha: "aaaaaaa" },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -3114,7 +3119,7 @@ describe("postPushReviewStep", () => {
 
     await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -3146,7 +3151,7 @@ describe("postPushReviewStep", () => {
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(notApproved))));
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -3193,7 +3198,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -3215,7 +3220,7 @@ describe("postPushReviewStep", () => {
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(undefined, reviewerOutput))));
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -3246,7 +3251,7 @@ describe("postPushReviewStep", () => {
 
     await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -3285,7 +3290,7 @@ describe("postPushReviewStep", () => {
 
     await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -3347,7 +3352,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -3404,7 +3409,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -3448,7 +3453,7 @@ describe("postPushReviewStep", () => {
 
     await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -3490,7 +3495,7 @@ describe("postPushReviewStep", () => {
 
     await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -3528,7 +3533,7 @@ describe("postPushReviewStep", () => {
 
     await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -3577,7 +3582,7 @@ describe("postPushReviewStep", () => {
 
     await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -3613,7 +3618,7 @@ describe("postPushReviewStep", () => {
 
     await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -3664,7 +3669,7 @@ describe("postPushReviewStep", () => {
 
     await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -3713,7 +3718,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -3766,7 +3771,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -3809,7 +3814,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -3836,7 +3841,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -3886,7 +3891,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn, sleep },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn, sleep },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -3928,7 +3933,7 @@ describe("postPushReviewStep", () => {
       ctx,
       {
         prNumber: "42",
-        workspaceDir: "/tmp",
+        workspaceDir,
         maxIterations: 2,
         ghSpawn,
         gitSpawn,
@@ -3989,7 +3994,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -4027,7 +4032,7 @@ describe("postPushReviewStep", () => {
     try {
       await postPushReviewStep.run(
         ctx,
-        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn },
+        { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn },
         { report: vi.fn(async () => undefined) },
       );
       warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
@@ -4071,7 +4076,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(f.reviewerOutput)));
     return postPushReviewStep.run(
       makeCtx(invoke),
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations, ghSpawn: f.ghSpawn,
+      { prNumber: "42", workspaceDir, maxIterations, ghSpawn: f.ghSpawn,
         gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: vi.fn(async () => undefined),
         reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000 },
       { report: vi.fn(async () => undefined) },
@@ -4135,7 +4140,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 300000 },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 300000 },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -4174,7 +4179,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 300000 },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 300000 },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -4208,7 +4213,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000 },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000 },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -4246,7 +4251,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep: vi.fn(async () => undefined), reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000 },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep: vi.fn(async () => undefined), reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000 },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -4386,7 +4391,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn,
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn,
         gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: vi.fn(async () => undefined),
         reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000 },
       { report: vi.fn(async () => undefined) },
@@ -4479,7 +4484,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn, sleep },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn, sleep },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -4516,7 +4521,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitTimeoutMs: 1000, reviewWaitPollMs: 100 },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitTimeoutMs: 1000, reviewWaitPollMs: 100 },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -4556,7 +4561,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -4586,7 +4591,7 @@ describe("postPushReviewStep", () => {
     try {
       await postPushReviewStep.run(
         ctx,
-        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn },
+        { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn },
         { report: vi.fn(async () => undefined) },
       );
       warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
@@ -4620,7 +4625,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitTimeoutMs: 1000, reviewWaitPollMs: 100 },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitTimeoutMs: 1000, reviewWaitPollMs: 100 },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -4658,7 +4663,7 @@ describe("postPushReviewStep", () => {
 
       const out = await postPushReviewStep.run(
         ctx,
-        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitTimeoutMs: 1000, reviewWaitPollMs: 100 },
+        { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitTimeoutMs: 1000, reviewWaitPollMs: 100 },
         { report: vi.fn(async () => undefined) },
       );
 
@@ -4694,7 +4699,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitTimeoutMs: 1000, reviewWaitPollMs: 100 },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitTimeoutMs: 1000, reviewWaitPollMs: 100 },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -4733,7 +4738,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -4787,7 +4792,7 @@ describe("postPushReviewStep", () => {
       });
       const out = await postPushReviewStep.run(
         makeCtx(vi.fn(async () => structuredReviewResult(reviewerOutput))),
-        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+        { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
         { report: vi.fn(async () => undefined) },
       );
       return { out, ghComments };
@@ -4876,7 +4881,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -4916,7 +4921,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewCheckNames: ["my-custom-review"] },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewCheckNames: ["my-custom-review"] },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -4971,7 +4976,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5022,7 +5027,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5078,7 +5083,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5138,7 +5143,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5183,7 +5188,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5234,7 +5239,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5263,7 +5268,7 @@ describe("postPushReviewStep", () => {
     await expect(
       postPushReviewStep.run(
         ctx,
-        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+        { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
         { report: vi.fn(async () => undefined) },
       ),
     ).rejects.toThrow(OperatorCancelledError);
@@ -5282,7 +5287,7 @@ describe("postPushReviewStep", () => {
     const ctx = makeCtx(vi.fn(async () => ({ stdout: "", exitCode: 0, tokensUsed: 0 })));
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
       { report: vi.fn(async () => undefined) },
     );
     expect(out.approved).toBe(true);
@@ -5319,7 +5324,7 @@ describe("postPushReviewStep", () => {
     const ctx = makeCtx(vi.fn(async () => ({ stdout: "", exitCode: 1, tokensUsed: 0 })));
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
       { report: vi.fn(async () => undefined) },
     );
     // Genuine failure must surface — not masked by the operator-cancel benign event.
@@ -5345,7 +5350,7 @@ describe("postPushReviewStep", () => {
     await expect(
       postPushReviewStep.run(
         ctx,
-        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+        { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
         { report: vi.fn(async () => undefined) },
       ),
     ).rejects.toThrow(OperatorCancelledError);
@@ -5399,7 +5404,7 @@ describe("postPushReviewStep", () => {
     await expect(
       postPushReviewStep.run(
         ctx,
-        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+        { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
         { report: vi.fn(async () => undefined) },
       ),
     ).rejects.toThrow(OperatorCancelledError);
@@ -5422,7 +5427,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5450,7 +5455,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5477,7 +5482,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5500,7 +5505,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5529,7 +5534,7 @@ describe("postPushReviewStep", () => {
     const ctx = makeCtx(invoke);
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
       { report: vi.fn(async () => undefined) },
     );
     expect(out.approved).toBe(true);
@@ -5579,7 +5584,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5638,7 +5643,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, reviewProviders: [], ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [], ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5695,7 +5700,7 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       makeCtx(invoke),
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, reviewProviders: [], ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [], ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5728,7 +5733,7 @@ describe("postPushReviewStep", () => {
     await expect(
       postPushReviewStep.run(
         ctx,
-        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, reviewProviders: [], ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+        { prNumber: "42", workspaceDir, maxIterations: 1, reviewProviders: [], ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
         { report: vi.fn(async () => undefined) },
       ),
     ).rejects.toThrow("gh pr comment failed");
@@ -5792,12 +5797,12 @@ describe("independent incomplete reviewer results", () => {
         if (kind === "throws") throw new Error("review transport disconnected");
         if (kind === "provider") return { stdout: "", stderr: "upstream returned 529 overloaded_error", exitCode: 1, tokensUsed: 0 };
         if (kind === "invalid") return structuredReviewResult({ approved: "maybe" });
-        return { ...structuredReviewResult(partial), telemetry: { ...structuredReviewResult(partial).telemetry, outcome: "max_turns", numTurns: 12 } };
+        return { ...structuredReviewResult(partial), telemetry: { ...structuredReviewResult(partial).telemetry, outcome: "max_turns" as const, numTurns: 12 } };
       }
       return structuredReviewResult({ approved: true, findings: [], summary: "Checked error handling in src/api.ts.", checks: [{ check: "Error handling", result: "passed", evidence: "src/api.ts handles a missing response." }] });
     });
     const out = await postPushReviewStep.run(makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }), {
-      prNumber: "9", workspaceDir: "/tmp", maxIterations: 3, reviewProviders: [], ghSpawn,
+      prNumber: "9", workspaceDir, maxIterations: 3, reviewProviders: [], ghSpawn,
       gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
       reviewers: [{ id: "gap-analysis", gates, maxTurns: 12 }, { id: "code-review", gates: true }],
       trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("gap-analysis", { maxTurns: 3 }), selectedReviewerDefinition("code-review")]),
@@ -5828,7 +5833,7 @@ describe("independent incomplete reviewer results", () => {
   it("publishes actual code findings when another required reviewer is incomplete without starting a fix pass", async () => {
     const reviews: string[] = [];
     const invoke = vi.fn(async (params: any) => params.stage.includes("gap-analysis")
-      ? { ...structuredReviewResult(undefined), telemetry: { ...structuredReviewResult(undefined).telemetry, outcome: "max_turns" } }
+      ? { ...structuredReviewResult(undefined), telemetry: { ...structuredReviewResult(undefined).telemetry, outcome: "max_turns" as const } }
       : structuredReviewResult({ approved: false, findings: [{ severity: "blocking", body: "Null response crashes src/api.ts." }], summary: "Found missing null handling." }));
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
@@ -5836,7 +5841,7 @@ describe("independent incomplete reviewer results", () => {
       return { stdout: "", exitCode: 0 };
     });
     const out = await postPushReviewStep.run(makeCtx(invoke), {
-      prNumber: "9", workspaceDir: "/tmp", maxIterations: 3, reviewProviders: [], ghSpawn,
+      prNumber: "9", workspaceDir, maxIterations: 3, reviewProviders: [], ghSpawn,
       gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
       reviewers: [{ id: "gap-analysis", gates: true }, { id: "code-review", gates: true }],
       trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("gap-analysis"), selectedReviewerDefinition("code-review")]),
@@ -5860,10 +5865,6 @@ describe("finding dispositions in the fix pass (AII-751)", () => {
     path: findingPath,
     line: findingLine,
   });
-
-  function makeWorkspaceDir(): string {
-    return fs.mkdtempSync(path.join(os.tmpdir(), "post-push-review-dispositions-"));
-  }
 
   function writeDispositionsFile(workspaceDir: string, entries: unknown[]): void {
     const filePath = path.join(workspaceDir, DISPOSITIONS_FILE);
@@ -5938,58 +5939,51 @@ describe("finding dispositions in the fix pass (AII-751)", () => {
   }
 
   it("adds the finding key, disposition instructions, and issue text to the fix prompt, keeping the internal 'fix every listed issue' rule (AC1, AC4/AC8)", async () => {
-    const workspaceDir = makeWorkspaceDir();
-    try {
-      const { ghSpawn } = ghSpawnWithOneExternalFinding();
-      const cleanInternalReview = { approved: true, blocking_issues: [], feedback: "", score: 9, progress_delta: 0 };
-      const invoke = vi.fn(async () => structuredReviewResult(cleanInternalReview));
-      const ctx = makeCtx(invoke, { issueDescription: "Implement the widget exporter per AII-751's acceptance criteria." });
+    const { ghSpawn } = ghSpawnWithOneExternalFinding();
+    const cleanInternalReview = { approved: true, blocking_issues: [], feedback: "", score: 9, progress_delta: 0 };
+    const invoke = vi.fn(async () => structuredReviewResult(cleanInternalReview));
+    const ctx = makeCtx(invoke, { issueDescription: "Implement the widget exporter per AII-751's acceptance criteria." });
 
-      await postPushReviewStep.run(
-        ctx,
-        { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn() },
-        { report: vi.fn(async () => undefined) },
-      );
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn() },
+      { report: vi.fn(async () => undefined) },
+    );
 
-      const fixPrompt = invokePrompt(invoke, 1);
-      expect(fixPrompt).toContain(findingKey);
-      expect(fixPrompt).toContain(buildDispositionInstructions());
-      expect(fixPrompt).toContain("Issue requirements (the scope for every disposition):");
-      expect(fixPrompt).toContain("Implement the widget exporter per AII-751's acceptance criteria.");
-      expect(fixPrompt).toContain("Fix every listed issue");
-      // ADR 028's scope rule lives in the prompt text only — no severity/defect branch in code.
-      expect(fixPrompt).toContain("A finding that reports a defect in lines this PR changed is always in scope.");
-    } finally {
-      fs.rmSync(workspaceDir, { recursive: true, force: true });
-    }
+    const fixPrompt = invokePrompt(invoke, 1);
+    expect(fixPrompt).toContain(findingKey);
+    expect(fixPrompt).toContain(buildDispositionInstructions());
+    expect(fixPrompt).toContain("Issue requirements (the scope for every disposition):");
+    expect(fixPrompt).toContain("Implement the widget exporter per AII-751's acceptance criteria.");
+    expect(fixPrompt).toContain("Fix every listed issue");
+    // ADR 028's scope rule lives in the prompt text only — no severity/defect branch in code.
+    expect(fixPrompt).toContain("A finding that reports a defect in lines this PR changed is always in scope.");
   });
 
   it("is byte-identical to the pre-disposition prompt when there are no external findings (AC3)", async () => {
-    const workspaceDir = makeWorkspaceDir();
-    try {
-      const approvedWithIssue = {
-        approved: true,
-        blocking_issues: [{ title: "Escape quoted user input", problem: "Escape quoted user input", required_fix: "Escape quoted user input" }],
-        feedback: "Minor issue worth addressing.",
-        score: 8,
-        progress_delta: 0,
-      };
-      const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
-      const ghSpawn = vi.fn((args: string[]) => {
-        if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
-        return { stdout: "", exitCode: 0 };
-      });
-      const invoke = vi.fn(async () => structuredReviewResult(approvedWithIssue));
-      const ctx = makeCtx(invoke);
+    const approvedWithIssue = {
+      approved: true,
+      blocking_issues: [{ title: "Escape quoted user input", problem: "Escape quoted user input", required_fix: "Escape quoted user input" }],
+      feedback: "Minor issue worth addressing.",
+      score: 8,
+      progress_delta: 0,
+    };
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => structuredReviewResult(approvedWithIssue));
+    const ctx = makeCtx(invoke);
 
-      await postPushReviewStep.run(
-        ctx,
-        { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
-        { report: vi.fn(async () => undefined) },
-      );
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
 
-      const fixPrompt = invokePrompt(invoke, 1);
-      const expectedPrompt = `You are fixing reviewer feedback on PR #42 for issue AII-200: X.
+    const fixPrompt = invokePrompt(invoke, 1);
+    const expectedPrompt = `You are fixing reviewer feedback on PR #42 for issue AII-200: X.
 
 Do NOT create a new branch or PR. Make changes to the current working tree. After your changes, the harness will commit and push.
 
@@ -6029,235 +6023,198 @@ Summary:
 Minor issue worth addressing.
 
 </reviewer_feedback>`;
-      expect(fixPrompt).toBe(expectedPrompt);
-    } finally {
-      fs.rmSync(workspaceDir, { recursive: true, force: true });
-    }
+    expect(fixPrompt).toBe(expectedPrompt);
   });
 
   it("resolves a follow-up disposition's thread, deletes the dispositions file, and drops the finding from gating on the next iteration (AC2)", async () => {
-    const workspaceDir = makeWorkspaceDir();
-    try {
-      writeDispositionsFile(workspaceDir, [{ findingKey, disposition: "follow-up", reason: "Indexing is out of scope for this issue." }]);
-      const { ghSpawn, ghComments, graphqlCalls } = ghSpawnWithOneExternalFinding();
-      const cleanInternalReview = { approved: true, blocking_issues: [], feedback: "", score: 9, progress_delta: 0 };
-      const invoke = vi.fn(async () => structuredReviewResult(cleanInternalReview));
+    writeDispositionsFile(workspaceDir, [{ findingKey, disposition: "follow-up", reason: "Indexing is out of scope for this issue." }]);
+    const { ghSpawn, ghComments, graphqlCalls } = ghSpawnWithOneExternalFinding();
+    const cleanInternalReview = { approved: true, blocking_issues: [], feedback: "", score: 9, progress_delta: 0 };
+    const invoke = vi.fn(async () => structuredReviewResult(cleanInternalReview));
 
-      const out = await postPushReviewStep.run(
-        makeCtx(invoke),
-        { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn() },
-        { report: vi.fn(async () => undefined) },
-      );
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn() },
+      { report: vi.fn(async () => undefined) },
+    );
 
-      const replyCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("addPullRequestReviewThreadReply")));
-      expect(replyCall).toBeTruthy();
-      const replyBody = replyCall!.find((a) => a.startsWith("body="));
-      expect(replyBody).toContain("<!-- ai-implement finding-disposition -->");
-      expect(replyBody).toContain("Deferred as a follow-up: Indexing is out of scope for this issue.");
-      const resolveCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("resolveReviewThread")));
-      expect(resolveCall).toBeTruthy();
+    const replyCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("addPullRequestReviewThreadReply")));
+    expect(replyCall).toBeTruthy();
+    const replyBody = replyCall!.find((a) => a.startsWith("body="));
+    expect(replyBody).toContain("<!-- ai-implement finding-disposition -->");
+    expect(replyBody).toContain("Deferred as a follow-up: Indexing is out of scope for this issue.");
+    const resolveCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("resolveReviewThread")));
+    expect(resolveCall).toBeTruthy();
 
-      expect(fs.existsSync(path.join(workspaceDir, DISPOSITIONS_FILE))).toBe(false);
+    expect(fs.existsSync(path.join(workspaceDir, DISPOSITIONS_FILE))).toBe(false);
 
-      // Approved on the second (clean) review: the deferred finding no longer gates.
-      // Calls: iteration 1 review, iteration 1 fix pass, iteration 2 review (approves).
-      expect(out.approved).toBe(true);
-      expect(invoke).toHaveBeenCalledTimes(3);
-      const approvalComment = ghComments.find((comment) => comment.includes("Approved"));
-      expect(approvalComment).toBeTruthy();
-      expect(approvalComment).not.toContain(findingKey);
-    } finally {
-      fs.rmSync(workspaceDir, { recursive: true, force: true });
-    }
+    // Approved on the second (clean) review: the deferred finding no longer gates.
+    // Calls: iteration 1 review, iteration 1 fix pass, iteration 2 review (approves).
+    expect(out.approved).toBe(true);
+    expect(invoke).toHaveBeenCalledTimes(3);
+    const approvalComment = ghComments.find((comment) => comment.includes("Approved"));
+    expect(approvalComment).toBeTruthy();
+    expect(approvalComment).not.toContain(findingKey);
   });
 
   it("resolves a follow-up disposition's thread and drops the finding from gating even when the fix pass makes no code changes", async () => {
-    const workspaceDir = makeWorkspaceDir();
-    try {
-      writeDispositionsFile(workspaceDir, [{ findingKey, disposition: "follow-up", reason: "Indexing is out of scope for this issue." }]);
-      const { ghSpawn, ghComments, graphqlCalls } = ghSpawnWithOneExternalFinding();
-      const cleanInternalReview = { approved: true, blocking_issues: [], feedback: "", score: 9, progress_delta: 0 };
-      const invoke = vi.fn(async () => structuredReviewResult(cleanInternalReview));
-      // Unlike makeGitSpawn(), "status" is empty: the fix agent only wrote the (git-excluded)
-      // dispositions file and made no other tracked change — the feature's core no-op-fix case.
-      const gitSpawn = vi.fn((args: string[]) => {
-        if (args[0] === "status") return { stdout: "", exitCode: 0 };
-        if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "fix-branch\n", exitCode: 0 };
-        return { stdout: "", exitCode: 0 };
-      });
+    writeDispositionsFile(workspaceDir, [{ findingKey, disposition: "follow-up", reason: "Indexing is out of scope for this issue." }]);
+    const { ghSpawn, ghComments, graphqlCalls } = ghSpawnWithOneExternalFinding();
+    const cleanInternalReview = { approved: true, blocking_issues: [], feedback: "", score: 9, progress_delta: 0 };
+    const invoke = vi.fn(async () => structuredReviewResult(cleanInternalReview));
+    // Unlike makeGitSpawn(), "status" is empty: the fix agent only wrote the (git-excluded)
+    // dispositions file and made no other tracked change — the feature's core no-op-fix case.
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "fix-branch\n", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
 
-      const out = await postPushReviewStep.run(
-        makeCtx(invoke),
-        { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
-        { report: vi.fn(async () => undefined) },
-      );
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
 
-      const replyCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("addPullRequestReviewThreadReply")));
-      expect(replyCall).toBeTruthy();
-      const resolveCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("resolveReviewThread")));
-      expect(resolveCall).toBeTruthy();
-      expect(fs.existsSync(path.join(workspaceDir, DISPOSITIONS_FILE))).toBe(false);
+    const replyCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("addPullRequestReviewThreadReply")));
+    expect(replyCall).toBeTruthy();
+    const resolveCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("resolveReviewThread")));
+    expect(resolveCall).toBeTruthy();
+    expect(fs.existsSync(path.join(workspaceDir, DISPOSITIONS_FILE))).toBe(false);
 
-      // The no-op fix pass does not fail the run: the loop re-reviews, finds the deferred
-      // finding no longer gating, and approves on iteration 2 instead of stopping as no_changes.
-      expect(out.terminationReason).toBe("approved");
-      expect(out.approved).toBe(true);
-      expect(invoke).toHaveBeenCalledTimes(3);
-      const dispositionsOnlyComment = ghComments.find((comment) => comment.includes("made no code changes"));
-      expect(dispositionsOnlyComment).toBeTruthy();
-    } finally {
-      fs.rmSync(workspaceDir, { recursive: true, force: true });
-    }
+    // The no-op fix pass does not fail the run: the loop re-reviews, finds the deferred
+    // finding no longer gating, and approves on iteration 2 instead of stopping as no_changes.
+    expect(out.terminationReason).toBe("approved");
+    expect(out.approved).toBe(true);
+    expect(invoke).toHaveBeenCalledTimes(3);
+    const dispositionsOnlyComment = ghComments.find((comment) => comment.includes("made no code changes"));
+    expect(dispositionsOnlyComment).toBeTruthy();
   });
 
   it("keeps an invalid disposition's finding gating on the next iteration and does not resolve its thread (AC3)", async () => {
-    const workspaceDir = makeWorkspaceDir();
-    try {
-      writeDispositionsFile(workspaceDir, [{ findingKey, disposition: "invalid", reason: "The index already exists." }]);
-      const { ghSpawn, graphqlCalls } = ghSpawnWithOneExternalFinding();
-      const cleanInternalReview = { approved: true, blocking_issues: [], feedback: "", score: 9, progress_delta: 0 };
-      const invoke = vi.fn(async () => structuredReviewResult(cleanInternalReview));
+    writeDispositionsFile(workspaceDir, [{ findingKey, disposition: "invalid", reason: "The index already exists." }]);
+    const { ghSpawn, graphqlCalls } = ghSpawnWithOneExternalFinding();
+    const cleanInternalReview = { approved: true, blocking_issues: [], feedback: "", score: 9, progress_delta: 0 };
+    const invoke = vi.fn(async () => structuredReviewResult(cleanInternalReview));
 
-      const out = await postPushReviewStep.run(
-        makeCtx(invoke),
-        { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn() },
-        { report: vi.fn(async () => undefined) },
-      );
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn() },
+      { report: vi.fn(async () => undefined) },
+    );
 
-      const replyCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("addPullRequestReviewThreadReply")));
-      expect(replyCall).toBeTruthy();
-      const replyBody = replyCall!.find((a) => a.startsWith("body="));
-      expect(replyBody).toContain("Not changed: The index already exists.");
-      const resolveCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("resolveReviewThread")));
-      expect(resolveCall).toBeUndefined();
+    const replyCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("addPullRequestReviewThreadReply")));
+    expect(replyCall).toBeTruthy();
+    const replyBody = replyCall!.find((a) => a.startsWith("body="));
+    expect(replyBody).toContain("Not changed: The index already exists.");
+    const resolveCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("resolveReviewThread")));
+    expect(resolveCall).toBeUndefined();
 
-      // Still gating on iteration 2: internal review is clean, so approval hinges entirely on
-      // whether the finding still gates. It does, so the run stops on the review cap instead.
-      expect(out.approved).toBe(false);
-      expect(invokePrompt(invoke, 1)).toContain(findingKey);
-    } finally {
-      fs.rmSync(workspaceDir, { recursive: true, force: true });
-    }
+    // Still gating on iteration 2: internal review is clean, so approval hinges entirely on
+    // whether the finding still gates. It does, so the run stops on the review cap instead.
+    expect(out.approved).toBe(false);
+    expect(invokePrompt(invoke, 1)).toContain(findingKey);
   });
 
   it("still stops the loop as no_changes when an invalid disposition leaves the finding gating and the fix pass made no code changes", async () => {
-    const workspaceDir = makeWorkspaceDir();
-    try {
-      writeDispositionsFile(workspaceDir, [{ findingKey, disposition: "invalid", reason: "The index already exists." }]);
-      const { ghSpawn, graphqlCalls } = ghSpawnWithOneExternalFinding();
-      const cleanInternalReview = { approved: true, blocking_issues: [], feedback: "", score: 9, progress_delta: 0 };
-      const invoke = vi.fn(async () => structuredReviewResult(cleanInternalReview));
-      const gitSpawn = vi.fn((args: string[]) => {
-        if (args[0] === "status") return { stdout: "", exitCode: 0 };
-        if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "fix-branch\n", exitCode: 0 };
-        return { stdout: "", exitCode: 0 };
-      });
+    writeDispositionsFile(workspaceDir, [{ findingKey, disposition: "invalid", reason: "The index already exists." }]);
+    const { ghSpawn, graphqlCalls } = ghSpawnWithOneExternalFinding();
+    const cleanInternalReview = { approved: true, blocking_issues: [], feedback: "", score: 9, progress_delta: 0 };
+    const invoke = vi.fn(async () => structuredReviewResult(cleanInternalReview));
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "fix-branch\n", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
 
-      const out = await postPushReviewStep.run(
-        makeCtx(invoke),
-        { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
-        { report: vi.fn(async () => undefined) },
-      );
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
 
-      // The disposition is still processed (reply posted, thread left unresolved)...
-      const resolveCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("resolveReviewThread")));
-      expect(resolveCall).toBeUndefined();
-      // ...but since the finding still gates and no code changed, the pass fails as no_changes
-      // rather than silently looping.
-      expect(out.terminationReason).toBe("no_changes");
-      expect(out.approved).toBe(false);
-    } finally {
-      fs.rmSync(workspaceDir, { recursive: true, force: true });
-    }
+    // The disposition is still processed (reply posted, thread left unresolved)...
+    const resolveCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("resolveReviewThread")));
+    expect(resolveCall).toBeUndefined();
+    // ...but since the finding still gates and no code changed, the pass fails as no_changes
+    // rather than silently looping.
+    expect(out.terminationReason).toBe("no_changes");
+    expect(out.approved).toBe(false);
   });
 
   it("posts no thread reply and deletes nothing when the fix-pass push fails (AC7)", async () => {
-    const workspaceDir = makeWorkspaceDir();
+    writeDispositionsFile(workspaceDir, [{ findingKey, disposition: "follow-up", reason: "Out of scope." }]);
+    const { ghSpawn, graphqlCalls } = ghSpawnWithOneExternalFinding();
+    const notApproved = { approved: false, blocking_issues: [{ title: "x", problem: "x", required_fix: "x" }], feedback: "fix", score: 4, progress_delta: 0 };
+    const invoke = vi.fn(async () => structuredReviewResult(notApproved));
+
+    let caught: unknown;
     try {
-      writeDispositionsFile(workspaceDir, [{ findingKey, disposition: "follow-up", reason: "Out of scope." }]);
-      const { ghSpawn, graphqlCalls } = ghSpawnWithOneExternalFinding();
-      const notApproved = { approved: false, blocking_issues: [{ title: "x", problem: "x", required_fix: "x" }], feedback: "fix", score: 4, progress_delta: 0 };
-      const invoke = vi.fn(async () => structuredReviewResult(notApproved));
-
-      let caught: unknown;
-      try {
-        await postPushReviewStep.run(
-          makeCtx(invoke),
-          { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn({ pushFails: true }) },
-          { report: vi.fn(async () => undefined) },
-        );
-      } catch (err) {
-        caught = err;
-      }
-
-      expect(caught).toBeDefined();
-      expect(graphqlCalls.some((call) => call.some((a) => a.includes("addPullRequestReviewThreadReply") || a.includes("resolveReviewThread")))).toBe(false);
-      expect(fs.existsSync(path.join(workspaceDir, DISPOSITIONS_FILE))).toBe(true);
-    } finally {
-      fs.rmSync(workspaceDir, { recursive: true, force: true });
+      await postPushReviewStep.run(
+        makeCtx(invoke),
+        { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn({ pushFails: true }) },
+        { report: vi.fn(async () => undefined) },
+      );
+    } catch (err) {
+      caught = err;
     }
+
+    expect(caught).toBeDefined();
+    expect(graphqlCalls.some((call) => call.some((a) => a.includes("addPullRequestReviewThreadReply") || a.includes("resolveReviewThread")))).toBe(false);
+    expect(fs.existsSync(path.join(workspaceDir, DISPOSITIONS_FILE))).toBe(true);
   });
 
   it("reports one disposition per key in outputs.findingDispositions, with the later one across pushes winning (AC5/AC9)", async () => {
-    const workspaceDir = makeWorkspaceDir();
-    try {
-      const { ghSpawn } = ghSpawnWithOneExternalFinding();
-      // Iteration 1's fix pass writes "invalid"; the finding still gates, so a second fix
-      // pass runs and this time writes "follow-up" for the same key — the later read wins.
-      let fixPassCount = 0;
-      const gitSpawn = vi.fn((args: string[]) => {
-        if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
-        if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "fix-branch\n", exitCode: 0 };
-        return { stdout: "", exitCode: 0 };
-      });
-      const cleanInternalReview = { approved: true, blocking_issues: [], feedback: "", score: 9, progress_delta: 0 };
-      const invoke = vi.fn(async (params: any) => {
-        if (params.stage.startsWith("post-push-review/fix-")) {
-          fixPassCount++;
-          writeDispositionsFile(
-            workspaceDir,
-            [{ findingKey, disposition: fixPassCount === 1 ? "invalid" : "follow-up", reason: `pass ${fixPassCount}` }],
-          );
-        }
-        return structuredReviewResult(cleanInternalReview);
-      });
+    const { ghSpawn } = ghSpawnWithOneExternalFinding();
+    // Iteration 1's fix pass writes "invalid"; the finding still gates, so a second fix
+    // pass runs and this time writes "follow-up" for the same key — the later read wins.
+    let fixPassCount = 0;
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "fix-branch\n", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const cleanInternalReview = { approved: true, blocking_issues: [], feedback: "", score: 9, progress_delta: 0 };
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage.startsWith("post-push-review/fix-")) {
+        fixPassCount++;
+        writeDispositionsFile(
+          workspaceDir,
+          [{ findingKey, disposition: fixPassCount === 1 ? "invalid" : "follow-up", reason: `pass ${fixPassCount}` }],
+        );
+      }
+      return structuredReviewResult(cleanInternalReview);
+    });
 
-      const out = await postPushReviewStep.run(
-        makeCtx(invoke),
-        { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
-        { report: vi.fn(async () => undefined) },
-      );
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
 
-      expect(fixPassCount).toBe(2);
-      expect(out.findingDispositions).toEqual([{ findingKey, disposition: "follow-up", reason: "pass 2" }]);
-      expect(out.approved).toBe(true);
+    expect(fixPassCount).toBe(2);
+    expect(out.findingDispositions).toEqual([{ findingKey, disposition: "follow-up", reason: "pass 2" }]);
+    expect(out.approved).toBe(true);
 
-      // Each fix-pass cycle summary carries only that iteration's own disposition
-      // (AII-801) — never the cumulative findingDispositions the run-level output above
-      // reports — so a later push's disposition for the same key does not retroactively
-      // rewrite an earlier, already-recorded cycle.
-      const cycleSummaryPath = path.join(workspaceDir, "ai-output", "cycle-summaries.jsonl");
-      const summaries = fs.readFileSync(cycleSummaryPath, "utf-8")
-        .split("\n")
-        .filter((line) => line.trim().length > 0)
-        .map((line) => JSON.parse(line));
-      const fix1 = summaries.find((s: { id: string }) => s.id === "post-push-review.fix-1");
-      const fix2 = summaries.find((s: { id: string }) => s.id === "post-push-review.fix-2");
-      expect(fix1.dispositions).toEqual([{ key: findingKey, disposition: "invalid" }]);
-      expect(fix2.dispositions).toEqual([{ key: findingKey, disposition: "follow-up" }]);
-      expect(fix1.verdict).toMatchObject({ approved: null, reason: "fixed" });
-      expect(fix1.outputCommitStatus).toBe("committed");
-    } finally {
-      fs.rmSync(workspaceDir, { recursive: true, force: true });
-    }
+    // Each fix-pass cycle summary carries only that iteration's own disposition
+    // (AII-801) — never the cumulative findingDispositions the run-level output above
+    // reports — so a later push's disposition for the same key does not retroactively
+    // rewrite an earlier, already-recorded cycle.
+    const cycleSummaryPath = path.join(workspaceDir, "ai-output", "cycle-summaries.jsonl");
+    const summaries = fs.readFileSync(cycleSummaryPath, "utf-8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0)
+      .map((line) => JSON.parse(line));
+    const fix1 = summaries.find((s: { id: string }) => s.id === "post-push-review.fix-1");
+    const fix2 = summaries.find((s: { id: string }) => s.id === "post-push-review.fix-2");
+    expect(fix1.dispositions).toEqual([{ key: findingKey, disposition: "invalid" }]);
+    expect(fix2.dispositions).toEqual([{ key: findingKey, disposition: "follow-up" }]);
+    expect(fix1.verdict).toMatchObject({ approved: null, reason: "fixed" });
+    expect(fix1.outputCommitStatus).toBe("committed");
   });
 });
 
 describe("postPushReviewStep — cycle summaries (AII-801)", () => {
-  function makeWorkspaceDir(): string {
-    return fs.mkdtempSync(path.join(os.tmpdir(), "post-push-review-cycle-summary-"));
-  }
-
   function readCycleSummaries(workspaceDir: string): Array<{
     id: string;
     stage: string;
@@ -6281,216 +6238,198 @@ describe("postPushReviewStep — cycle summaries (AII-801)", () => {
   }
 
   it("records a committed cycle summary with an unobserved (not inferred-passed) test status after a successful fix-pass push", async () => {
-    const workspaceDir = makeWorkspaceDir();
-    try {
-      const ghSpawn = vi.fn((args: string[]) => {
-        if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
-        return { stdout: "", exitCode: 0 };
-      });
-      const gitSpawn = vi.fn((args: string[]) => {
-        if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "fix-branch\n", exitCode: 0 };
-        if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234", exitCode: 0 };
-        if (args[0] === "rev-parse" && args[1] === "HEAD") return { stdout: "abc1234567890abc1234567890abc1234567890", exitCode: 0 };
-        if (args[0] === "status") return { stdout: "M file.ts", exitCode: 0 };
-        return { stdout: "", exitCode: 0 };
-      });
-      const invoke = vi.fn(async (params: any) => {
-        if (params.stage === "post-push-review/review-1") {
-          return structuredReviewResult({
-            approved: false,
-            blocking_issues: [{ title: "Missing null check", problem: "Crashes on null", required_fix: "Add a guard" }],
-            score: 40,
-            progress_delta: 10,
-            feedback: "Needs a fix",
-          });
-        }
-        if (params.stage === "post-push-review/fix-1") {
-          return {
-            stdout: JSON.stringify({ fixed: ["Added null guard"], testing: ["npm test -- all passed"], notes: "" }),
-            exitCode: 0,
-            telemetry: { outcome: "success" as const, numTurns: 3, durationMs: 500, costUsd: 0.1, tokensIn: 50, tokensOut: 25 },
-          };
-        }
-        if (params.stage === "post-push-review/review-2") {
-          return structuredReviewResult({ approved: true, blocking_issues: [], score: 90, progress_delta: 100, feedback: "ok" });
-        }
-        throw new Error(`unexpected stage ${params.stage}`);
-      });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "fix-branch\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "HEAD") return { stdout: "abc1234567890abc1234567890abc1234567890", exitCode: 0 };
+      if (args[0] === "status") return { stdout: "M file.ts", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage === "post-push-review/review-1") {
+        return structuredReviewResult({
+          approved: false,
+          blocking_issues: [{ title: "Missing null check", problem: "Crashes on null", required_fix: "Add a guard" }],
+          score: 40,
+          progress_delta: 10,
+          feedback: "Needs a fix",
+        });
+      }
+      if (params.stage === "post-push-review/fix-1") {
+        return {
+          stdout: JSON.stringify({ fixed: ["Added null guard"], testing: ["npm test -- all passed"], notes: "" }),
+          exitCode: 0,
+          tokensUsed: 75,
+          telemetry: { outcome: "success" as const, numTurns: 3, durationMs: 500, costUsd: 0.1, tokensIn: 50, tokensOut: 25 },
+        };
+      }
+      if (params.stage === "post-push-review/review-2") {
+        return structuredReviewResult({ approved: true, blocking_issues: [], score: 90, progress_delta: 100, feedback: "ok" });
+      }
+      throw new Error(`unexpected stage ${params.stage}`);
+    });
 
-      const out = await postPushReviewStep.run(
-        makeCtx(invoke),
-        { prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [], ghSpawn, gitSpawn },
-        { report: vi.fn(async () => undefined) },
-      );
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [], ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
 
-      expect(out.approved).toBe(true);
-      const summaries = readCycleSummaries(workspaceDir);
-      expect(summaries).toHaveLength(1);
-      const [summary] = summaries;
-      expect(summary!.id).toBe("post-push-review.fix-1");
-      expect(summary!.stage).toBe("post-push-review-fix");
-      expect(summary!.inputCommit).toBe("abc1234567890abc1234567890abc1234567890");
-      expect(summary!.outputCommitStatus).toBe("committed");
-      expect(summary!.outputCommit).toBe("abc1234567890abc1234567890abc1234567890");
-      expect(summary!.verdict).toMatchObject({ approved: null, reason: "fixed" });
-      // The fix agent's testing[] note ("npm test -- all passed") is self-reported, not an
-      // observed tool result — it must never be read as an inferred "passed" (AII-801 review).
-      expect(summary!.tests.length).toBeGreaterThan(0);
-      expect(summary!.tests.every((t) => t.status === "unobserved")).toBe(true);
-      expect(summary!.usage).toMatchObject({ tokensIn: 50, tokensOut: 25, costUsd: 0.1 });
-    } finally {
-      fs.rmSync(workspaceDir, { recursive: true, force: true });
-    }
+    expect(out.approved).toBe(true);
+    const summaries = readCycleSummaries(workspaceDir);
+    expect(summaries).toHaveLength(1);
+    const [summary] = summaries;
+    expect(summary!.id).toBe("post-push-review.fix-1");
+    expect(summary!.stage).toBe("post-push-review-fix");
+    expect(summary!.inputCommit).toBe("abc1234567890abc1234567890abc1234567890");
+    expect(summary!.outputCommitStatus).toBe("committed");
+    expect(summary!.outputCommit).toBe("abc1234567890abc1234567890abc1234567890");
+    expect(summary!.verdict).toMatchObject({ approved: null, reason: "fixed" });
+    // The fix agent's testing[] note ("npm test -- all passed") is self-reported, not an
+    // observed tool result — it must never be read as an inferred "passed" (AII-801 review).
+    expect(summary!.tests.length).toBeGreaterThan(0);
+    expect(summary!.tests.every((t) => t.status === "unobserved")).toBe(true);
+    expect(summary!.usage).toMatchObject({ tokensIn: 50, tokensOut: 25, costUsd: 0.1 });
   });
 
   it("records a fix_failed verdict with an explicit missing test status when the fix-pass LLM invocation fails", async () => {
-    const workspaceDir = makeWorkspaceDir();
-    try {
-      const ghSpawn = vi.fn((args: string[]) => {
-        if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
-        return { stdout: "", exitCode: 0 };
-      });
-      const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
-      const invoke = vi.fn(async (params: any) => {
-        if (params.stage === "post-push-review/review-1") {
-          return structuredReviewResult({
-            approved: false,
-            blocking_issues: [{ title: "Missing null check", problem: "Crashes on null", required_fix: "Add a guard" }],
-            score: 40,
-            progress_delta: 10,
-            feedback: "Needs a fix",
-          });
-        }
-        if (params.stage === "post-push-review/fix-1") {
-          return { stdout: "", stderr: "socket hang up", exitCode: 1 };
-        }
-        throw new Error(`unexpected stage ${params.stage}`);
-      });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage === "post-push-review/review-1") {
+        return structuredReviewResult({
+          approved: false,
+          blocking_issues: [{ title: "Missing null check", problem: "Crashes on null", required_fix: "Add a guard" }],
+          score: 40,
+          progress_delta: 10,
+          feedback: "Needs a fix",
+        });
+      }
+      if (params.stage === "post-push-review/fix-1") {
+        return { stdout: "", stderr: "socket hang up", exitCode: 1, tokensUsed: 0 };
+      }
+      throw new Error(`unexpected stage ${params.stage}`);
+    });
 
-      const out = await postPushReviewStep.run(
-        makeCtx(invoke),
-        { prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [], ghSpawn, gitSpawn },
-        { report: vi.fn(async () => undefined) },
-      );
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [], ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
 
-      expect(out.terminationReason).toBe("fix_failed");
-      const summaries = readCycleSummaries(workspaceDir);
-      expect(summaries).toHaveLength(1);
-      expect(summaries[0]!.verdict).toMatchObject({ approved: null, reason: "fix_failed" });
-      expect(summaries[0]!.outputCommit).toBeNull();
-      expect(summaries[0]!.outputCommitStatus).toBe("not_applicable");
-      expect(summaries[0]!.tests).toEqual([{ name: "test execution", status: "missing" }]);
-    } finally {
-      fs.rmSync(workspaceDir, { recursive: true, force: true });
-    }
+    expect(out.terminationReason).toBe("fix_failed");
+    const summaries = readCycleSummaries(workspaceDir);
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]!.verdict).toMatchObject({ approved: null, reason: "fix_failed" });
+    expect(summaries[0]!.outputCommit).toBeNull();
+    expect(summaries[0]!.outputCommitStatus).toBe("not_applicable");
+    expect(summaries[0]!.tests).toEqual([{ name: "test execution", status: "missing" }]);
   });
 
   it("records a no_changes verdict when the fix pass leaves blockers unresolved with nothing to push", async () => {
-    const workspaceDir = makeWorkspaceDir();
-    try {
-      const ghSpawn = vi.fn((args: string[]) => {
-        if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
-        return { stdout: "", exitCode: 0 };
-      });
-      const gitSpawn = vi.fn((args: string[]) => {
-        if (args[0] === "status") return { stdout: "", exitCode: 0 };
-        return { stdout: "", exitCode: 0 };
-      });
-      const invoke = vi.fn(async (params: any) => {
-        if (params.stage === "post-push-review/review-1") {
-          return structuredReviewResult({
-            approved: false,
-            blocking_issues: [{ title: "Missing null check", problem: "Crashes on null", required_fix: "Add a guard" }],
-            score: 40,
-            progress_delta: 10,
-            feedback: "Needs a fix",
-          });
-        }
-        if (params.stage === "post-push-review/fix-1") {
-          return { stdout: JSON.stringify({ fixed: [], testing: [], notes: "" }), exitCode: 0 };
-        }
-        throw new Error(`unexpected stage ${params.stage}`);
-      });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage === "post-push-review/review-1") {
+        return structuredReviewResult({
+          approved: false,
+          blocking_issues: [{ title: "Missing null check", problem: "Crashes on null", required_fix: "Add a guard" }],
+          score: 40,
+          progress_delta: 10,
+          feedback: "Needs a fix",
+        });
+      }
+      if (params.stage === "post-push-review/fix-1") {
+        return { stdout: JSON.stringify({ fixed: [], testing: [], notes: "" }), exitCode: 0, tokensUsed: 100 };
+      }
+      throw new Error(`unexpected stage ${params.stage}`);
+    });
 
-      const out = await postPushReviewStep.run(
-        makeCtx(invoke),
-        { prNumber: "42", workspaceDir, maxIterations: 2, reviewProviders: [], ghSpawn, gitSpawn },
-        { report: vi.fn(async () => undefined) },
-      );
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir, maxIterations: 2, reviewProviders: [], ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
 
-      expect(out.terminationReason).toBe("no_changes");
-      const summaries = readCycleSummaries(workspaceDir);
-      expect(summaries).toHaveLength(1);
-      expect(summaries[0]!.verdict).toMatchObject({ approved: null, reason: "no_changes" });
-      expect(summaries[0]!.outputCommitStatus).toBe("not_applicable");
-      expect(summaries[0]!.dispositions).toEqual([]);
-    } finally {
-      fs.rmSync(workspaceDir, { recursive: true, force: true });
-    }
+    expect(out.terminationReason).toBe("no_changes");
+    const summaries = readCycleSummaries(workspaceDir);
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]!.verdict).toMatchObject({ approved: null, reason: "no_changes" });
+    expect(summaries[0]!.outputCommitStatus).toBe("not_applicable");
+    expect(summaries[0]!.dispositions).toEqual([]);
   });
 
   it("caps an oversized fix-pass testing/notes block instead of silently dropping it", async () => {
-    const workspaceDir = makeWorkspaceDir();
-    try {
-      const ghSpawn = vi.fn((args: string[]) => {
-        if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
-        return { stdout: "", exitCode: 0 };
-      });
-      const gitSpawn = vi.fn((args: string[]) => {
-        if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "fix-branch\n", exitCode: 0 };
-        if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234", exitCode: 0 };
-        if (args[0] === "rev-parse" && args[1] === "HEAD") return { stdout: "abc1234567890abc1234567890abc1234567890", exitCode: 0 };
-        if (args[0] === "status") return { stdout: "M file.ts", exitCode: 0 };
-        return { stdout: "", exitCode: 0 };
-      });
-      // Oversized on two axes: a `notes` blob far past the per-field char cap, and a
-      // `testing[]` block with far more entries than the record's cap allows.
-      const oversizedNotes = "n".repeat(5000);
-      const oversizedTesting = Array.from({ length: 60 }, (_, i) => `npm test -- suite ${i} passed`);
-      const invoke = vi.fn(async (params: any) => {
-        if (params.stage === "post-push-review/review-1") {
-          return structuredReviewResult({
-            approved: false,
-            blocking_issues: [{ title: "Missing null check", problem: "Crashes on null", required_fix: "Add a guard" }],
-            score: 40,
-            progress_delta: 10,
-            feedback: "Needs a fix",
-          });
-        }
-        if (params.stage === "post-push-review/fix-1") {
-          return {
-            stdout: JSON.stringify({ fixed: ["Added null guard"], testing: oversizedTesting, notes: oversizedNotes }),
-            exitCode: 0,
-            telemetry: { outcome: "success" as const, numTurns: 3, durationMs: 500, costUsd: 0.1, tokensIn: 50, tokensOut: 25 },
-          };
-        }
-        if (params.stage === "post-push-review/review-2") {
-          return structuredReviewResult({ approved: true, blocking_issues: [], score: 90, progress_delta: 100, feedback: "ok" });
-        }
-        throw new Error(`unexpected stage ${params.stage}`);
-      });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "fix-branch\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "HEAD") return { stdout: "abc1234567890abc1234567890abc1234567890", exitCode: 0 };
+      if (args[0] === "status") return { stdout: "M file.ts", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    // Oversized on two axes: a `notes` blob far past the per-field char cap, and a
+    // `testing[]` block with far more entries than the record's cap allows.
+    const oversizedNotes = "n".repeat(5000);
+    const oversizedTesting = Array.from({ length: 60 }, (_, i) => `npm test -- suite ${i} passed`);
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage === "post-push-review/review-1") {
+        return structuredReviewResult({
+          approved: false,
+          blocking_issues: [{ title: "Missing null check", problem: "Crashes on null", required_fix: "Add a guard" }],
+          score: 40,
+          progress_delta: 10,
+          feedback: "Needs a fix",
+        });
+      }
+      if (params.stage === "post-push-review/fix-1") {
+        return {
+          stdout: JSON.stringify({ fixed: ["Added null guard"], testing: oversizedTesting, notes: oversizedNotes }),
+          exitCode: 0,
+          tokensUsed: 75,
+          telemetry: { outcome: "success" as const, numTurns: 3, durationMs: 500, costUsd: 0.1, tokensIn: 50, tokensOut: 25 },
+        };
+      }
+      if (params.stage === "post-push-review/review-2") {
+        return structuredReviewResult({ approved: true, blocking_issues: [], score: 90, progress_delta: 100, feedback: "ok" });
+      }
+      throw new Error(`unexpected stage ${params.stage}`);
+    });
 
-      const out = await postPushReviewStep.run(
-        makeCtx(invoke),
-        { prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [], ghSpawn, gitSpawn },
-        { report: vi.fn(async () => undefined) },
-      );
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [], ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
 
-      expect(out.approved).toBe(true);
-      const summaries = readCycleSummaries(workspaceDir);
-      expect(summaries).toHaveLength(1);
-      const [summary] = summaries;
-      expect(summary!.id).toBe("post-push-review.fix-1");
-      // Capped, not dropped: the field still carries content, just bounded.
-      expect(summary!.verdict.summary).toBeTruthy();
-      expect(summary!.verdict.summary!.length).toBeLessThan(oversizedNotes.length);
-      expect(summary!.tests.length).toBeGreaterThan(0);
-      expect(summary!.tests.length).toBeLessThan(oversizedTesting.length);
-      expect(summary!.truncated).toBe(true);
-      expect(Buffer.byteLength(JSON.stringify(summary), "utf-8")).toBeLessThanOrEqual(CYCLE_SUMMARY_MAX_BYTES);
-    } finally {
-      fs.rmSync(workspaceDir, { recursive: true, force: true });
-    }
+    expect(out.approved).toBe(true);
+    const summaries = readCycleSummaries(workspaceDir);
+    expect(summaries).toHaveLength(1);
+    const [summary] = summaries;
+    expect(summary!.id).toBe("post-push-review.fix-1");
+    // Capped, not dropped: the field still carries content, just bounded.
+    expect(summary!.verdict.summary).toBeTruthy();
+    expect(summary!.verdict.summary!.length).toBeLessThan(oversizedNotes.length);
+    expect(summary!.tests.length).toBeGreaterThan(0);
+    expect(summary!.tests.length).toBeLessThan(oversizedTesting.length);
+    expect(summary!.truncated).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(summary), "utf-8")).toBeLessThanOrEqual(CYCLE_SUMMARY_MAX_BYTES);
   });
 });
 
@@ -6548,7 +6487,7 @@ describe("postPushReviewStep review process gate", () => {
     try {
       const out = await postPushReviewStep.run(
         makeCtx(invoke),
-        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn: f.ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+        { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: f.ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
           sleep: vi.fn(async () => undefined), reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000,
           reviewProcess: "claude-code-review", reviewers: [], ...extra },
         { report: vi.fn(async () => undefined) },
