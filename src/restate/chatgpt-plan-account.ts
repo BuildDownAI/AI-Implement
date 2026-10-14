@@ -164,10 +164,16 @@ export function createChatGptPlanAccount(deps: ChatGptPlanAccountDeps) {
     return result;
   }
 
+  /** Read-only view of the refresher's state for `chatgpt-status`; carries no token. */
+  async function lastOutcome(ctx: restate.ObjectSharedContext): Promise<PlanAccountState | null> {
+    return (await ctx.get<PlanAccountState>(STATE_KEY)) ?? null;
+  }
+
   return restate.object({
     name: "ChatGptPlanAccount",
     handlers: {
       refresh: restate.handlers.object.exclusive({ input: serde.zod(refreshSchema) }, refresh),
+      lastOutcome: restate.handlers.object.shared(lastOutcome),
     },
   });
 }
@@ -196,4 +202,16 @@ export async function requestChatGptPlanRefresh(
   await ingress
     .objectSendClient<ChatGptPlanAccountDefinition>({ name: "ChatGptPlanAccount" }, profileId)
     .refresh({ reason: "requested" });
+}
+
+/** Reads the refresher's last outcome for a profile; null when it has never run. */
+export async function readChatGptPlanState(
+  profileId: string,
+  deps: { baseUrl?: string; fetchImpl?: typeof fetch } = {},
+): Promise<{ lastOutcome: ChatGptPlanOutcome; lastAttemptAt: number; nextAt: number | null } | null> {
+  const ingress = restateClients.connect({
+    url: deps.baseUrl ?? RESTATE_INGRESS_BASE_URL,
+    ...(deps.fetchImpl ? { fetch: deps.fetchImpl } : {}),
+  });
+  return ingress.objectClient<ChatGptPlanAccountDefinition>({ name: "ChatGptPlanAccount" }, profileId).lastOutcome();
 }

@@ -422,7 +422,8 @@ export function status(recordPath: string, deps: Pick<LoginDeps, "now" | "stdout
   deps.stdout(`Seconds left: ${Math.floor((r.accessTokenExpiresAt - deps.now()) / 1000)}`);
 }
 
-async function revoke(saved: SavedRecord, deps: Pick<LoginDeps, "fetch">): Promise<boolean> {
+/** Revokes a refresh token at the issuer's `revocation_endpoint`. True only when OpenAI answered 200; never throws. */
+export async function revoke(saved: { refreshToken?: unknown; clientId: string }, deps: Pick<LoginDeps, "fetch">): Promise<boolean> {
   try {
     const config = await discover(deps);
     if (!config.revocationEndpoint) return false;
