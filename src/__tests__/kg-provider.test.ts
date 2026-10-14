@@ -13,7 +13,7 @@ import {
   sidecarHealth,
   sidecarHealthFields,
 } from "../kg-provider.js";
-import type { MemoryProvider, MemoryProviderCapabilities, SidecarHealth } from "../kg-provider.js";
+import type { KgToolResult, MemoryProvider, MemoryProviderCapabilities, SidecarHealth } from "../kg-provider.js";
 
 // ---- parseSidecarRpcResponse ----
 
@@ -279,7 +279,7 @@ describe("SidecarMemoryProvider session handling", () => {
   }
 
   function fakeRes(): http.ServerResponse & FakeRes {
-    const res: FakeRes & { writeHead: unknown; end: unknown; destroy: unknown } = {
+    const res: FakeRes & { writeHead: unknown; write: unknown; end: unknown; destroy: unknown } = {
       headersSent: false,
       writeHead(status: number, headers: http.OutgoingHttpHeaders) {
         res.headersSent = true;
@@ -1147,6 +1147,10 @@ class StubMemoryProvider implements MemoryProvider {
   proxyCall(_req: http.IncomingMessage, res: http.ServerResponse, _body: Buffer): void {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ jsonrpc: "2.0", id: null, result: { content: [] } }));
+  }
+
+  callKgTool(_name: string, _args: Record<string, unknown>): Promise<KgToolResult> {
+    return Promise.resolve({ ok: true, result: { content: [] } });
   }
 }
 

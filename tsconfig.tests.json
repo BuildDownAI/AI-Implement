@@ -3,25 +3,11 @@
   // excludes. `npm run typecheck` runs this after the plain pass.
   // The explicit "exclude" key is required: without one, `extends` inherits
   // "src/__tests__" from tsconfig.json and no test file is checked.
-  // The test files listed in "exclude" fail the check today. They are named in
-  // AII-1357, AII-1358, AII-1359 and AII-1360 ("test types" 1-4), and each of
-  // those issues removes its files from this list. Do not add a file here that
-  // those four issues do not name.
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": true,
     "declaration": false
   },
   "include": ["src/**/*.ts"],
-  "exclude": [
-    "node_modules",
-    "dist",
-    "src/__tests__/install.test.ts",
-    "src/__tests__/kg-provider.test.ts",
-    "src/__tests__/kg-refresh-run.test.ts",
-    "src/__tests__/mcp-identity.test.ts",
-    "src/__tests__/mcp.test.ts",
-    "src/__tests__/providers/jira-fields.test.ts",
-    "src/__tests__/providers/linear.test.ts"
-  ]
+  "exclude": []
 }
