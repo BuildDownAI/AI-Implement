@@ -8,8 +8,9 @@ import {
   updateJobStatus,
   type Job,
   getGapFillRowsAwaitingLateReview,
-  getPendingAttemptReviews,
-  clearPendingAttemptReview,
+  getPendingLateReviews,
+  clearPendingLateReview,
+  recordPendingLateReview,
 } from "./log.js";
 import { redactStepCredentials } from "./pipeline/step-redaction.js";
 import type { Step } from "./pipeline/types.js";
@@ -44,7 +45,7 @@ import { isLinearAuthConfigured, withLinearToken } from "./linear-app-auth.js";
 import { isFailureRecord, projectFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
 import { sanitizeFindingDispositions, type FindingDisposition } from "./pipeline/finding-dispositions.js";
 import { isCycleSummary, sanitizeCycleSummaries, type CycleSummary, type CycleDisposition } from "./pipeline/cycle-summary.js";
-import type { LateExternalReviewInput } from "./restate/late-external-review.js";
+import { lateExternalReviewWorkflowKey, type LateExternalReviewInput } from "./restate/late-external-review.js";
 import { recordReviewFixCycleSummary, type ReviewFixCycleSummaryOutcome } from "./review-fix-evidence.js";
 import type { ReviewFixFindingDisposition } from "./review-fix-ports.js";
 import {
@@ -942,17 +943,26 @@ export async function handleRunnerResult(
       input.submitLateExternalReview &&
       pendingHeadSha &&
       input.body.prUrl &&
-      (input.body.phase === "implementation" || input.body.phase === "gap-analysis")
+      input.body.phase === "implementation"
     ) {
       const target = parsePrUrlTarget(input.body.prUrl);
       if (target) {
+        // AII-1362: record before the submit; a settled submit clears it, otherwise the poll sweep retries.
+        const workflowKey = lateExternalReviewWorkflowKey({ dispatchId: claims.dispatchId });
         try {
-          await input.submitLateExternalReview({
+          recordPendingLateReview({
+            workflowKey,
+            dispatchId: claims.dispatchId,
+            prUrl: input.body.prUrl,
+            headSha: pendingHeadSha,
+          });
+          const settled = await input.submitLateExternalReview({
             dispatchId: claims.dispatchId,
             ...target,
             prUrl: input.body.prUrl,
             headSha: pendingHeadSha,
           });
+          if (settled !== false) clearPendingLateReview(workflowKey);
         } catch (err) {
           warn("submitLateExternalReview", err);
         }
@@ -1600,7 +1610,7 @@ const LATE_REVIEW_RESUBMIT_WINDOW_MS = 24 * 60 * 60 * 1000;
  */
 export async function resubmitPendingGapFillReviews(opts: {
   ready: () => boolean;
-  submit: (input: { dispatchId: string; owner: string; repo: string; prNumber: number; prUrl: string; gapFill: true; attemptId?: string }) => Promise<boolean | void> | boolean | void;
+  submit: (input: { dispatchId: string; owner: string; repo: string; prNumber: number; prUrl: string; gapFill?: true; attemptId?: string; headSha?: string }) => Promise<boolean | void> | boolean | void;
   now?: number;
 }): Promise<number> {
   if (!opts.ready()) return 0;
@@ -1616,19 +1626,25 @@ export async function resubmitPendingGapFillReviews(opts: {
       console.warn(`[late-review-sweep] submit failed dispatch=${job.dispatchId}:`, err);
     }
   }
-  // AII-1307: a succeeded review-fix attempt's submit, keyed `<dispatchId>-<attemptId>`; cleared once accepted.
-  for (const pending of getPendingAttemptReviews((opts.now ?? Date.now()) - LATE_REVIEW_RESUBMIT_WINDOW_MS)) {
+  // AII-1362: the outbox, for submits whose state is not in dispatch_log (initial runs, review-fix attempts).
+  for (const pending of getPendingLateReviews((opts.now ?? Date.now()) - LATE_REVIEW_RESUBMIT_WINDOW_MS)) {
     const target = parsePrUrlTarget(pending.prUrl);
     if (!target) continue;
-    console.log(`[late-review-sweep] re-submitting LateExternalReview dispatch=${pending.dispatchId} attempt=${pending.attemptId} pr=${pending.prUrl}`);
+    console.log(`[late-review-sweep] re-submitting LateExternalReview key=${pending.workflowKey} dispatch=${pending.dispatchId} pr=${pending.prUrl}`);
     try {
-      const settled = await opts.submit({ dispatchId: pending.dispatchId, ...target, prUrl: pending.prUrl, gapFill: true, attemptId: pending.attemptId });
+      const settled = await opts.submit({
+        dispatchId: pending.dispatchId,
+        ...target,
+        prUrl: pending.prUrl,
+        ...(pending.headSha ? { headSha: pending.headSha } : {}),
+        ...(pending.attemptId ? { gapFill: true as const, attemptId: pending.attemptId } : {}),
+      });
       // `false` = the hook could not reach Restate; keep the record for the next tick.
       if (settled === false) continue;
-      clearPendingAttemptReview(pending.attemptId);
+      clearPendingLateReview(pending.workflowKey);
       submitted++;
     } catch (err) {
-      console.warn(`[late-review-sweep] submit failed dispatch=${pending.dispatchId} attempt=${pending.attemptId}:`, err);
+      console.warn(`[late-review-sweep] submit failed key=${pending.workflowKey}:`, err);
     }
   }
   return submitted;

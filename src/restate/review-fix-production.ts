@@ -24,8 +24,8 @@ import type { ProviderRegistry } from "../providers/registry.js";
 import { createReviewFixAttempt } from "./review-fix-attempt.js";
 import { createReviewFixPR } from "./review-fix-pr.js";
 import type { RestateService } from "./endpoint.js";
-import type { LateExternalReviewInput } from "./late-external-review.js";
-import { clearPendingAttemptReview, getLatestWorkRowForPr, recordPendingAttemptReview } from "../log.js";
+import { lateExternalReviewWorkflowKey, type LateExternalReviewInput } from "./late-external-review.js";
+import { clearPendingLateReview, getLatestWorkRowForPr, recordPendingLateReview } from "../log.js";
 
 export interface ReviewFixProductionConfig {
   githubAppId: string;
@@ -115,10 +115,11 @@ export async function submitLateReviewForAttempt(
       return;
     }
     // Held for the poll sweep (resubmitPendingGapFillReviews) in case Restate is not ready and the hook only logs.
-    recordPendingAttemptReview(attemptId, row.dispatchId, prUrl);
+    const workflowKey = lateExternalReviewWorkflowKey({ dispatchId: row.dispatchId, attemptId });
+    recordPendingLateReview({ workflowKey, dispatchId: row.dispatchId, prUrl, attemptId });
     const settled = await submit({ dispatchId: row.dispatchId, owner, repo, prNumber: scope.prNumber, prUrl, gapFill: true, attemptId });
     // Accepted or already running: the workflow key is the idempotency, so the retry record is spent.
-    if (settled !== false) clearPendingAttemptReview(attemptId);
+    if (settled !== false) clearPendingLateReview(workflowKey);
   } catch (err) {
     console.log(`[review-fix] Late external review submit failed for attempt ${attemptId}: ${err instanceof Error ? err.message : String(err)}`);
   }
