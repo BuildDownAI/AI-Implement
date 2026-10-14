@@ -17,9 +17,10 @@
  * pre-reservation check passes):
  *   stored snapshot (reuse) -> persisted opt-in -> resolve + persist immutable snapshot
  *   -> agent/provider/auth/backend matrix -> workspace trust for every executed repo
- *   -> runner/template capability -> API-key credential readiness
- *   -> atomic reservation of the full subscription set -> owner-state inspection
- *   -> subscription credential readiness under the reserved generation -> grant.
+ *   -> runner/template capability -> credential readiness for unreserved profiles
+ *   (API key, bedrock, codex-subscription) -> atomic reservation of the reserved set
+ *   (`claude-subscription` only) -> owner-state inspection
+ *   -> credential readiness for reserved profiles under the reserved generation -> grant.
  *
  * A failure after a fresh reservation releases it through the certain-launch-rejection
  * path, so a failed preparation never leaves a falsely reusable lease. A released
@@ -49,6 +50,7 @@ import type { DispatchAdmissionBackend } from "./dispatch-admission.js";
 import {
   MODEL_AUTH_AUDIENCE,
   isSubscriptionAuthMode,
+  reservesModelAccount,
   parseModelAuthGrantBootstrap,
   toSafeGrantMetadata,
   type ModelAuthBackend,
@@ -401,8 +403,9 @@ function credentialRequest(projectKey: string, snapshot: ResolvedAgentSnapshotV1
 /**
  * Read-only readiness for administration and dispatch. Writes nothing, reserves nothing,
  * mints nothing. It reads no secret, so an API-key profile only proves its protected
- * reference is configured (`reference-configured`), and subscription session state is only
- * provable under a reservation (`deferred`); both are re-verified by `prepareAgentRun`.
+ * reference is configured (`reference-configured`), and reserved (`claude-subscription`)
+ * session state is only provable under a reservation (`deferred`); both are re-verified by
+ * `prepareAgentRun`. `codex-subscription` is not reserved, so it takes the unreserved path.
  * An unknown or unreadable input is `not-ready`.
  */
 export async function inspectAgentReadiness(request: AgentRunRequest, deps: AgentReadinessDeps): Promise<AgentReadiness> {
@@ -420,7 +423,7 @@ export async function inspectAgentReadiness(request: AgentRunRequest, deps: Agen
   if (failure) return { status: "not-ready", code: failure };
   const profiles: (PreparedProfile & { credential: "reference-configured" | "deferred" })[] = [];
   for (const p of profileList(snapshot)) {
-    if (isSubscriptionAuthMode(p.authMode)) {
+    if (reservesModelAccount(p.authMode)) {
       profiles.push({ ...p, credential: "deferred" });
       continue;
     }
@@ -441,7 +444,7 @@ export async function inspectAgentReadiness(request: AgentRunRequest, deps: Agen
 function profileRequests(snapshot: ResolvedAgentSnapshotV1): ProfileRequest[] {
   const byId = new Map<string, ProfileRequest>();
   for (const p of profileList(snapshot)) {
-    byId.set(p.profileId, { profileId: p.profileId, authMode: isSubscriptionAuthMode(p.authMode) ? "subscription" : "api_key" });
+    byId.set(p.profileId, { profileId: p.profileId, authMode: reservesModelAccount(p.authMode) ? "subscription" : "api_key" });
   }
   return [...byId.values()];
 }
@@ -451,7 +454,7 @@ function expectedBindings(snapshot: ResolvedAgentSnapshotV1, reservations: reado
   return profileList(snapshot).map((p) => {
     // The snapshot's profile revision is the resolver's `revision`.
     const base = { stage: p.stage, profileId: p.profileId, profileRevision: p.revision, authMode: p.authMode };
-    return isSubscriptionAuthMode(p.authMode) ? { ...base, ownerGeneration: generations.get(p.profileId) } : base;
+    return reservesModelAccount(p.authMode) ? { ...base, ownerGeneration: generations.get(p.profileId) } : base;
   });
 }
 
@@ -592,7 +595,7 @@ export async function prepareAgentRun(request: AgentRunRequest, deps: AgentRunPr
   const profiles = profileList(snapshot);
 
   // API-key and Bedrock readiness needs no ownership, so prove it before reserving anything.
-  for (const p of profiles.filter((x) => !isSubscriptionAuthMode(x.authMode))) {
+  for (const p of profiles.filter((x) => !reservesModelAccount(x.authMode))) {
     const result = resolveModelCredential(credentialRequest(request.projectKey, snapshot, p), deps.credentials);
     if (!result.ok) return credentialFailure(result, p);
   }
@@ -622,7 +625,7 @@ export async function prepareAgentRun(request: AgentRunRequest, deps: AgentRunPr
 
   // Subscription readiness under the reserved generation, through the real owner verifier.
   const generations = new Map(reservations.map((r) => [r.profileId, r.generation]));
-  for (const p of profiles.filter((x) => isSubscriptionAuthMode(x.authMode))) {
+  for (const p of profiles.filter((x) => reservesModelAccount(x.authMode))) {
     const generation = generations.get(p.profileId);
     let failed: AgentRunPreparation | null = null;
     if (generation === undefined || !sessionOwnerVerifier(getDb(), p.profileId, generation)) {
