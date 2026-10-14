@@ -265,6 +265,43 @@ describe("splitLocalRunnerEnv", () => {
     expect(publicEnv.RUN_PROGRESS_TOKEN).toBeUndefined();
     expect(secretEnv.RUN_PROGRESS_TOKEN).toBe("progress-token");
   });
+
+  it("keeps RUN_PUBLICATION_TOKEN out of docker argv env", () => {
+    const { publicEnv, secretEnv } = splitLocalRunnerEnv(buildLocalRunnerEnv({
+      ...baseInput,
+      runPublicationToken: "publication-token",
+    }));
+
+    expect(publicEnv.RUN_PUBLICATION_TOKEN).toBeUndefined();
+    expect(secretEnv.RUN_PUBLICATION_TOKEN).toBe("publication-token");
+  });
+
+  it("sets the progress and publication tokens only when non-empty", () => {
+    const set = buildLocalRunnerEnv({
+      ...baseInput,
+      runProgressToken: "progress-token",
+      runPublicationToken: "publication-token",
+    });
+    expect(set.RUN_PROGRESS_TOKEN).toBe("progress-token");
+    expect(set.RUN_PUBLICATION_TOKEN).toBe("publication-token");
+
+    for (const overrides of [{ runProgressToken: "", runPublicationToken: "" }, {}]) {
+      const env = buildLocalRunnerEnv({ ...baseInput, ...overrides });
+      expect(env).not.toHaveProperty("RUN_PROGRESS_TOKEN");
+      expect(env).not.toHaveProperty("RUN_PUBLICATION_TOKEN");
+    }
+  });
+
+  it("extraEnv overrides the progress and publication tokens", () => {
+    const env = buildLocalRunnerEnv({
+      ...baseInput,
+      runProgressToken: "progress-token",
+      runPublicationToken: "publication-token",
+      extraEnv: { RUN_PROGRESS_TOKEN: "extra-progress", RUN_PUBLICATION_TOKEN: "extra-publication" },
+    });
+    expect(env.RUN_PROGRESS_TOKEN).toBe("extra-progress");
+    expect(env.RUN_PUBLICATION_TOKEN).toBe("extra-publication");
+  });
 });
 
 describe("buildDockerEnvFileContent", () => {
