@@ -178,8 +178,8 @@ export function sqlQuote(value: string): string {
  * comparison rather than an enumerated allowlist. `scheduled` is deliberately excluded: it is
  * a delayed send whose timer has not fired, so it has no journal and no pinned deployment, and
  * when it fires it starts as a new invocation on whichever deployment then serves the service.
- * Counting it would hold a deploy for the whole delay — `KgRepo.expire` is scheduled
- * 4 h 10 min out on every refresh trigger (AII-1031). Persistent Virtual Object state lives in the separate
+ * Counting it would hold a deploy for the whole delay (AII-1031). A suspended `KgRepo.watch`
+ * is not scheduled but non-completed, so it counts: a live or paused refresh holds the drain (AII-1297). Persistent Virtual Object state lives in the separate
  * `state` table and never appears in `sys_invocation`, so it is never counted — durable state
  * alone is not active work (AII-721).
  *

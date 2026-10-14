@@ -258,8 +258,10 @@ at a gate (`src/restate/kg-refresh-workflow.ts`):
    as `currentRun.held`.
 2. Sends `FlyMachineProfile("kg-refresh").release({ dispatchId })`: the runner has finished, so the
    machine returns to the profile now rather than after the wait.
-3. Sends `KgRepo.extend({ triggerId, until: decideBy + KG_REPO_STALE_MARGIN_MS })`. The lease is
-   kept, so a `KgRepo.trigger` during the wait answers `refresh-in-progress`.
+3. Keeps `KgRepo` held: no call is needed, because the `run` invocation holds the lock for its whole life
+   (AII-1297), so a `KgRepo.trigger` during the wait answers `refresh-in-progress`. `KgRepo.watch` attaches to
+   the invocation and releases the lock when it ends however it ends, including a Restate kill or cancel.
+   A paused run holds the lock until an operator cancels it in the Restate UI.
 4. Waits with `awaitOwnedRun` on the `decide` and `cancel` signals until `decideBy`.
 
 | Event | Action | Outcome |

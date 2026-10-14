@@ -34,7 +34,6 @@ import { createKgRepo, type KgRepoTriggerResult } from "../../restate/kg-repo.js
 import {
   createKgRefreshWorkflow,
   DISPATCH_RETRY_INITIAL_INTERVAL,
-  KG_REPO_STALE_MARGIN_MS,
   type KgDispatchInput,
   type KgRefreshWorkflowDependencies,
   type KgDispatchRecord,
@@ -642,7 +641,7 @@ describe("KgRefresh durable workflow", () => {
     return callObject<KgRepoTriggerResult>(baseUrl, "KgRepo", KG_SOURCE_REPO, "trigger", opts);
   }
 
-  async function kgRepoStatus(baseUrl: string): Promise<{ triggerId: string; startedAt: number } | null> {
+  async function kgRepoStatus(baseUrl: string): Promise<{ triggerId: string; startedAt: number; invocationId?: string } | null> {
     return callObject(baseUrl, "KgRepo", KG_SOURCE_REPO, "status", {});
   }
 
@@ -3297,7 +3296,6 @@ describe("KgRefresh durable workflow", () => {
     }, 90_000);
   });
   describe("AII-1256: the decision gate", () => {
-    // Longer than the 4 h lease `trigger` writes, so `KgRepo.extend` moves it rather than no-op.
     const DECISION_TIMEOUT_MS = 8 * 3_600_000;
     const SHORT_DECISION_TIMEOUT_MS = 1_500;
     const HELD_REPORT: KgRefreshReportBody = {
@@ -3345,20 +3343,17 @@ describe("KgRefresh durable workflow", () => {
     }
 
     it.each(VARIANTS.map(([label]) => label))(
-      "a held report stops at the gate: one release, a lease past the timeout, no merge, no close, trigger refused (%s)",
+      "a held report stops at the gate: one release, no extend, no merge, no close, the run invocation holds the lock (%s)",
       async (label) => {
         const env = heldEnvs.get(label)!;
         const beforeClose = closePullRequestFn.mock.calls.length;
         const beforeMerge = mergePullRequestFn.mock.calls.length;
-        const before = Date.now();
         const triggerId = await holdRun(env);
-        const after = Date.now();
 
         await eventually(() => countSends(env, "FlyMachineProfile", "kg-refresh", "release"), (n) => n === 1, { label: "one release" });
-        await eventually(() => countSends(env, "KgRepo", KG_SOURCE_REPO, "extend"), (n) => n === 1, { label: "one extend" });
-        const marker = (await kgRepoStatus(env.baseUrl())) as unknown as { leaseUntil: number };
-        expect(marker.leaseUntil).toBeGreaterThanOrEqual(before + DECISION_TIMEOUT_MS + KG_REPO_STALE_MARGIN_MS);
-        expect(marker.leaseUntil).toBeLessThanOrEqual(after + DECISION_TIMEOUT_MS + KG_REPO_STALE_MARGIN_MS);
+        // The run invocation holds the lock (AII-1297): no lease, no extend.
+        expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, invocationId: expect.any(String) });
+        expect(await countSends(env, "KgRepo", KG_SOURCE_REPO, "extend")).toBe(0);
         expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
         expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(0);
 
@@ -3797,6 +3792,8 @@ describe("KgRefresh durable workflow", () => {
       const triggerId = await holdRun(env);
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
       await eventually(() => mergePullRequestFn.mock.calls.length - beforeMerge, (n) => n >= 1, { label: "the merge call" });
+      // Mid-merge, past the gate: the run invocation still holds the lock.
+      expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, invocationId: expect.any(String) });
       await restateCancel(env, triggerId);
       await expectRunSucceeded(env, triggerId);
       expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
@@ -3925,12 +3922,12 @@ describe("KgRefresh durable workflow", () => {
       expect(signal).toMatchObject({ closed: 1, merged: 0, stops: 0, runCancels: 0, row: { conclusion: "operator_cancelled" } });
     }, 90_000);
 
-    it("a restart of the endpoint during the wait replays to the same gate without a second release or extend", async () => {
+    it("a restart of the endpoint during the wait replays to the same gate without a second release", async () => {
       const env = await startRetryEnabled([heldWorkflow, kgRepo, starter, flyMachineProfile]);
       let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
       try {
         const triggerId = await holdRun(env);
-        await eventually(() => countSends(env, "KgRepo", KG_SOURCE_REPO, "extend"), (n) => n === 1, { label: "one extend" });
+        expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, invocationId: expect.any(String) });
 
         replacement = await replaceEndpoint(env, [createKgRefreshWorkflow({
           ...workflowDeps, bootstrapDeadlineMs: 30_000, totalDeadlineMs: 60_000, decisionTimeoutMs: DECISION_TIMEOUT_MS,
@@ -3939,7 +3936,7 @@ describe("KgRefresh durable workflow", () => {
 
         await waitForStep(() => readStatus(env.baseUrl(), triggerId), "decision");
         expect(await countSends(env, "FlyMachineProfile", "kg-refresh", "release")).toBe(1);
-        expect(await countSends(env, "KgRepo", KG_SOURCE_REPO, "extend")).toBe(1);
+        expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, invocationId: expect.any(String) });
 
         await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ada@example.com" });
         await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
