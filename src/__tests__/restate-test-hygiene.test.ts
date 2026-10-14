@@ -2,7 +2,7 @@
 // suite, no Docker: scans the Restate scenario sources for the patterns that caused timing
 // flakes — raw sleeps, direct admin `/query` reads, and per-file poll helpers.
 // It also guards Restate-tier membership.
-// A scenario gets that tier's config (allowlist, timeouts) only when it is named *.restate.test.ts under restate/.
+// A scenario gets that tier's config (timeouts, log level) only when it is named *.restate.test.ts under restate/.
 // A misnamed or misplaced one runs under the wrong config, or never runs.
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
@@ -79,7 +79,7 @@ describe("restate tier membership", () => {
       .filter((f) => ENGINE_STARTERS.test(readFileSync(join(SRC_DIR, f), "utf8")));
     expect(
       offenders,
-      "The default suite collects these, so they run without the Restate tier's allowlist and timeouts; " +
+      "The default suite collects these, so they run without the Restate tier's timeouts and log level; " +
         "move each under src/__tests__/restate/ as *.restate.test.ts",
     ).toEqual([]);
   });

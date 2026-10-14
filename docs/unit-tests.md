@@ -18,7 +18,7 @@ How the default test suite runs, what isolates it from the machine it runs on, w
 1. **The database isolation check.** `scripts/check-test-db-isolation.mjs` creates a SQLite file with a sentinel table, runs `src/__tests__/github-dispatch.test.ts` with `DEDUP_DB_PATH` pointed at that file, and fails when the run added a table or changed the sentinel row.
 2. **`vitest run` with `vitest.config.ts`.** The config sets `DEDUP_DB_PATH` to `:memory:` through `test.env`, because `dedup.ts` reads the path at import time. It runs each test file in its own forked process (`pool: "forks"`), loads two setup files one after the other (`scrub-ambient-env.ts`, then `clear-runner-credentials.ts`; `sequence.setupFiles: "list"` states the order explicitly), includes `src/**/*.test.ts`, and excludes `src/__tests__/restate/**`. Tests and hooks time out after 30 seconds.
 
-`npm run test:restate` uses `vitest.restate.config.ts`: the same database setting, the Restate tier's scrub (`scrub-ambient-env.restate.ts`) followed by `clear-runner-credentials.ts`, only `*.restate.test.ts` files, and 60-second timeouts.
+`npm run test:restate` uses `vitest.restate.config.ts`: the same database setting, the same two setup files in the same order, the `*.restate.test.ts` files plus the environment guard test, and 60-second timeouts.
 
 A test file never opts into any of this. Whichever config collects it decides its environment, setup files and timeouts, so a Restate scenario named outside the `*.restate.test.ts` shape is either collected by neither config or run under the default suite's settings. `src/__tests__/restate-test-hygiene.test.ts` fails on both: a test file under `restate/` without that suffix, and a test file outside `restate/` that starts a Restate engine.
 
@@ -36,7 +36,21 @@ A test result must not depend on the machine that runs it — a laptop, a CI run
 
 Each config lists a scrub file first in `setupFiles`. vitest runs setup files inside each test file's worker, before it imports the test file, so the scrub's top-level code runs before any test or module under test reads `process.env`. The scrub deletes every variable the allowlist does not cover, then sets each pinned value.
 
-The allowlists live in `src/__tests__/setup/ambient-env.ts`, as `EnvAllowlist` values with three parts: `names` kept as they are, `prefixes` that keep every variable starting with them, and `pinned` variables set to a fixed value whatever the machine set. Every entry carries its reason. `BASE_ENV_ALLOWLIST` serves the default suite: it keeps `PATH` and `DEDUP_DB_PATH`, and pins `NODE_ENV`, `TZ` and git's global and system configuration, so a developer's `~/.gitconfig` cannot sign or block a test's commits. `TZ` is the one preventive entry: no test depended on the time zone when it was pinned. `RESTATE_ENV_ALLOWLIST` extends the base, through `extendEnvAllowlist`, with the variables that locate the Restate tier's infrastructure — `RESTATE_TEST_RUNTIME`, which CI's `restate-tests-binary` job uses to force the binary runtime, and the Docker and testcontainers settings — none of which configures the code under test.
+The allowlist lives in `src/__tests__/setup/ambient-env.ts`, as an `EnvAllowlist` value with three parts: `names` kept as they are, `prefixes` that keep every variable starting with them, and `pinned` variables set to a fixed value whatever the machine set. Every entry carries its reason. `BASE_ENV_ALLOWLIST` serves both configs: it keeps `PATH` and `DEDUP_DB_PATH`, and pins `NODE_ENV`, `TZ` and git's global and system configuration, so a developer's `~/.gitconfig` cannot sign or block a test's commits. `TZ` is the one preventive entry: no test depended on the time zone when it was pinned. The Restate tier needs nothing more: its engine is the `restate-server` binary from `node_modules`, which `binary-environment.ts` starts with an environment of its own.
+
+**When a config needs more than the base.** Give it an allowlist of its own built from the base, so the base's entries stay in one place, and leave the other config's environment unchanged:
+
+```ts
+export function extendEnvAllowlist(base: EnvAllowlist, extra: Partial<EnvAllowlist>): EnvAllowlist {
+  return {
+    names: { ...base.names, ...extra.names },
+    prefixes: { ...base.prefixes, ...extra.prefixes },
+    pinned: { ...base.pinned, ...extra.pinned },
+  };
+}
+```
+
+Each added entry states its reason, like the base's. That config then gets a scrub setup file of its own, listed first in its `setupFiles`, and its guard test checks the new allowlist. The Restate tier worked this way while it could run its engine in a Docker container: its allowlist added `RESTATE_TEST_RUNTIME`, which chose the runtime, and the Docker and testcontainers settings that located the engine. AII-1195 removed that runtime, and the extra allowlist went with it.
 
 Three decisions shape it:
 
@@ -46,9 +60,7 @@ Three decisions shape it:
 
 A test that needs a variable sets it itself, at its top level or in a hook. An entry belongs in the allowlist only when tests need the machine's own value, and it goes in with the reason that shows it: a test that fails without it, or, for a preventive pin like `TZ`, the machine dependence it closes.
 
-Each tier has a guard test that fails when a test sees any variable outside that tier's allowlist, and names each one.
-- `src/__tests__/setup/ambient-env.test.ts` guards `BASE_ENV_ALLOWLIST` in the default suite; it also tests `scrubAmbientEnv` on an injected environment object and requires every entry to state its reason.
-- `src/__tests__/restate/ambient-env.restate.test.ts` guards `RESTATE_ENV_ALLOWLIST` under the Restate config, because the default suite's guard never runs there.
+A guard test, `src/__tests__/setup/ambient-env.test.ts`, fails when a test sees any variable outside the allowlist, and names each one. Both configs collect it, the Restate config by naming it in its `include`, so it checks the scrub each config loads. It also tests `scrubAmbientEnv` on an injected environment object and requires every entry to state its reason.
 
 The credential `beforeEach` in `clear-runner-credentials.ts` predates the scrub and stays: it deletes the five runner credentials again before every test. It runs after the test file's `beforeAll` hooks and before its `beforeEach` hooks, so a credential a test file sets in `beforeAll` is removed, while one it sets in its own `beforeEach` survives. It exists because a runner's own `npm test` once posted to the live orchestrator with the run's single-use token and consumed it; see [solutions/workflow-patterns/runner-test-suite-burned-the-run-token.md](solutions/workflow-patterns/runner-test-suite-burned-the-run-token.md).
 
@@ -56,7 +68,7 @@ The credential `beforeEach` in `clear-runner-credentials.ts` predates the scrub 
 
 - **vitest's main process.** The scrub runs in each test worker. The main process, which collects files and runs reporters, still sees the full environment.
 - **Production.** The scrub runs only under vitest. What the orchestrator and the runner pass to the processes they start is unaffected.
-- **The machine beyond its environment variables.** Files a test reads through a fixed path, and the network, still differ between machines. The Restate tier's container runtime is the clearest case: it depends on the container being able to reach the test process over the host's network.
+- **The machine beyond its environment variables.** Files a test reads through a fixed path, and the network, still differ between machines.
 
 ## Type checking
 
@@ -149,8 +161,7 @@ Pass `fake.fetch` where a module takes `fetchImpl`, or call `fake.install()` whe
 | Job | Runs |
 |---|---|
 | `unit-tests` | `npm ci`; `npm test`; `npm run typecheck`; five per-file test configs |
-| `restate-tests` | `npm run test:restate`, which picks the container runtime because the runner has Docker; `tsconfig.restate-tests.json` |
-| `restate-tests-binary` | `npm run test:restate` with `RESTATE_TEST_RUNTIME=binary`, three passes |
+| `restate-tests-binary` | `npm run test:restate`, once in each of three parallel passes |
 
 No job unsets anything before running tests: the scrub gives CI the same environment as every other machine.
 
