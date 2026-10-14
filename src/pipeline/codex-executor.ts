@@ -431,8 +431,9 @@ export class CodexExecutor implements LLMExecutor {
         attempt++;
       }
     } finally {
-      // The sessions directory lives exactly as long as the invocation, success or failure.
-      if (state.sessionsDir) rmSync(state.sessionsDir, { recursive: true, force: true });
+      // The sessions directory lives exactly as long as the invocation, success or failure —
+      // except while a child may still be alive: its CODEX_HOME must not be removed under it.
+      if (state.sessionsDir && !this.held) rmSync(state.sessionsDir, { recursive: true, force: true });
     }
   }
 

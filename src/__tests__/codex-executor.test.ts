@@ -1400,6 +1400,15 @@ describe("ChatGPT plan provider", () => {
     expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe(original);
   });
 
+  it("exec: leaves the sessions directory in place while a child may still be alive", async () => {
+    const { executor, log } = build(true, [{ hang: true, dieOn: [] }]);
+    await expect(executor.invoke({ ...base, invocationTimeoutMs: 10 })).rejects.toMatchObject({ reason: "child_not_terminated" });
+    const home = log[0].env.CODEX_HOME;
+    expect(home).not.toBe(selected);
+    expect(existsSync(home)).toBe(true);
+    rmSync(home, { recursive: true, force: true });
+  });
+
   it("passes requiredMs to auth.invoke: the remaining deadline, or the invocation timeout", async () => {
     let t = 1_000;
     const { executor } = build(true, [{ stdout: message("done") }], { nowImpl: () => t });
