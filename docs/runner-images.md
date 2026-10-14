@@ -40,7 +40,7 @@ The `fly-machines` path validates the image-reference format but applies no allo
 
 ## Private images constrain the execution mode
 
-A private GHCR image is usable **only in GitHub Actions mode**. Fly Machines pull anonymously with no credential mechanism, so a private image fails at machine-create time with `failed to get manifest ... unauthorized`. Local Docker does not pull: it runs the image from the local cache with the host daemon's own credentials. There is no workaround on Fly — choosing a private image is choosing GHA mode.
+Only some backends can pull a private GHCR image. GitHub Actions can pull it. Fly Machines cannot: they pull anonymously with no credential mechanism, so a private image fails at machine-create time with `failed to get manifest ... unauthorized`. Local Docker does not pull: it runs whatever image is in the host cache, private or public. There is no workaround on Fly. To run a private image that must be pulled, use GHA mode.
 
 On the GHA path, `claude-implement.yml` and `claude-plan.yml` authenticate the pull with the job's `GITHUB_TOKEN`: each requests `packages: read` **and** passes the token through the container `credentials:` block. A bare `packages: read` is not sufficient on its own, because GitHub Actions does not auto-authenticate a job-container image pull — the `credentials:` block is what performs the authenticated pull.
 
