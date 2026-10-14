@@ -95,6 +95,15 @@ function seedMapping(teamKey: string): void {
     maxIterations: null,
     maxJobMinutes: null,
     branchPrefix: null,
+    autoMerge: false,
+    skillsRepo: null,
+    referenceRepos: null,
+    sensitiveAddPatterns: null,
+    sensitiveAllowPatterns: null,
+    dependencyTokenScope: null,
+    reviewFixLifecycle: null,
+    memoryProviderId: null,
+    reviewers: null,
   });
 }
 

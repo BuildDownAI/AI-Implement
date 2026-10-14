@@ -291,6 +291,7 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     sensitiveAllowPatterns: null,
     autoMerge: false,
     dependencyTokenScope: null,
+    reviewFixLifecycle: null,
     memoryProviderId: null,
     reviewers: null,
   };

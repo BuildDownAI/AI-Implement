@@ -123,7 +123,7 @@ describe("review-fix production delegation", () => {
         } as never,
         github: { getPrHeadSha: async () => "abc", evaluateMergePolicy: async () => true } as never,
         baseFinalizer: { recordOutcome: vi.fn(), applyApproval: vi.fn().mockResolvedValue(applied) } as never,
-        submitLateExternalReview: submit,
+        submitLateExternalReview: submit as never,
       });
 
       it("submits once after an applied approval", async () => {
