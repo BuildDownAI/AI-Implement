@@ -1790,7 +1790,9 @@ export async function dispatchSession(
 
 // ---------- Dispatch: Fly Machines ----------
 
-async function dispatchFlyMachine(
+// Exported for direct testing of the launch contract — see the matching comment on
+// dispatchGitHubActions. Not part of the module's public API otherwise.
+export async function dispatchFlyMachine(
   config: AppConfig,
   provider: TicketingProvider,
   issue: DispatchableIssue,
