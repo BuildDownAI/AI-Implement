@@ -17,7 +17,9 @@ const PUBLICATION_TOKEN_YML =
 const ATTEMPT_TOKEN_YML =
   "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n      run_attempt_token:\n        required: false\n";
 
-function mockContents(yamlBody: string): ReturnType<typeof vi.fn> {
+type FetchMock = typeof fetch & ReturnType<typeof vi.fn>;
+
+function mockContents(yamlBody: string): FetchMock {
   return vi.fn().mockResolvedValue({
     ok: true,
     status: 200,
@@ -29,7 +31,7 @@ function mockContents(yamlBody: string): ReturnType<typeof vi.fn> {
   });
 }
 
-function mockFetch(status: number, body: unknown): ReturnType<typeof vi.fn> {
+function mockFetch(status: number, body: unknown): FetchMock {
   return vi.fn().mockResolvedValue({
     ok: status >= 200 && status < 300,
     status,
@@ -152,7 +154,7 @@ describe("resolveWorkflowContract", () => {
   });
 
   it("returns legacy when fetch throws without rethrowing", async () => {
-    const fetchImpl = vi.fn().mockRejectedValue(new Error("net"));
+    const fetchImpl = vi.fn().mockRejectedValue(new Error("net")) as FetchMock;
     const mode = await resolveWorkflowContract({
       owner: "o",
       repo: "r",
@@ -421,10 +423,10 @@ describe("transient probe failures (AII-1292)", () => {
     __clearWorkflowProbeCacheForTests();
   });
   const base = { owner: "o", repo: "r", workflowFile: "claude-implement.yml", token: "t", ref: "main" };
-  const transient: Array<[string, () => ReturnType<typeof vi.fn>]> = [
-    ["fetch throw", () => vi.fn().mockRejectedValue(new Error("net"))],
+  const transient: Array<[string, () => FetchMock]> = [
+    ["fetch throw", () => vi.fn().mockRejectedValue(new Error("net")) as FetchMock],
     ["HTTP 500", () => mockFetch(500, {})],
-    ["bad JSON", () => vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => { throw new Error("bad"); } })],
+    ["bad JSON", () => vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => { throw new Error("bad"); } }) as FetchMock],
     ["non-file body", () => mockFetch(200, { type: "dir" })],
   ];
 

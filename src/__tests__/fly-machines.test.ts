@@ -7,7 +7,6 @@ import {
   startMachine,
   updateMachine,
   clearMachineEnv,
-  CLEAR_MACHINE_ENV_MAX_MS,
   MAX_RATE_LIMIT_WAIT_MS,
   waitForMachineSettled,
   destroyMachine,
@@ -38,9 +37,9 @@ const mockMachine = {
   config: {
     image: "ghcr.io/builddownai/ai-implement-runner:latest",
     env: {},
-    guest: { cpu_kind: "shared", cpus: 1, memory_mb: 1024 },
+    guest: { cpu_kind: "shared" as const, cpus: 1, memory_mb: 1024 },
     auto_destroy: true,
-    restart: { policy: "no" },
+    restart: { policy: "no" as const },
   },
 };
 
@@ -798,7 +797,7 @@ describe("buildSessionMachineConfig", () => {
         extraEnv: { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(runConfig) },
       });
       const env = result.config.env!;
-      const decoded = decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG) as Record<string, unknown>;
+      const decoded = decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG) as unknown as Record<string, unknown>;
       expect(decoded.SESSION_TOKEN).toBeUndefined();
       expect(decoded.GITHUB_TOKEN).toBeUndefined();
       expect(decoded.ANTHROPIC_API_KEY).toBeUndefined();

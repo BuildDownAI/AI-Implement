@@ -36,7 +36,7 @@ describe("resolveSessionImage", () => {
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(result).toEqual({ image: "ghcr.io/acme/my-runner:v3", source: "override" });
     expect(fetchImpl).toHaveBeenCalledOnce();
@@ -49,7 +49,7 @@ describe("resolveSessionImage", () => {
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(result).toEqual({ image: DEFAULT_IMAGE, source: "default" });
   });
@@ -61,7 +61,7 @@ describe("resolveSessionImage", () => {
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(result).toEqual({ image: DEFAULT_IMAGE, source: "default" });
   });
@@ -73,7 +73,7 @@ describe("resolveSessionImage", () => {
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(result).toEqual({ image: DEFAULT_IMAGE, source: "default" });
   });
@@ -85,7 +85,7 @@ describe("resolveSessionImage", () => {
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(result).toEqual({ image: DEFAULT_IMAGE, source: "default" });
   });
@@ -99,7 +99,7 @@ describe("resolveSessionImage", () => {
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(result).toEqual({ image: digestRef, source: "override" });
   });
@@ -114,7 +114,7 @@ describe("resolveSessionImage", () => {
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(result).toEqual({ image: "ghcr.io/acme/my-runner:v3", source: "override" });
   });
@@ -126,14 +126,14 @@ describe("resolveSessionImage", () => {
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(fetchImpl).toHaveBeenCalledOnce();
   });
@@ -145,14 +145,14 @@ describe("resolveSessionImage", () => {
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     const b = await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(a).toEqual({ image: DEFAULT_IMAGE, source: "default" });
     expect(b).toEqual({ image: DEFAULT_IMAGE, source: "default" });
@@ -166,7 +166,7 @@ describe("resolveSessionImage", () => {
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(result).toEqual({ image: DEFAULT_IMAGE, source: "default" });
   });
@@ -245,7 +245,7 @@ describe("resolveRunnerImageForDispatch", () => {
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
       runnerImageExplicit: false,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(image).toBe("ghcr.io/acme/my-runner:v3");
   });
@@ -258,7 +258,7 @@ describe("resolveRunnerImageForDispatch", () => {
       token: "ghs_xxx",
       defaultImage: "ghcr.io/builddownai/ai-implement-runner:next",
       runnerImageExplicit: true,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(image).toBe("ghcr.io/builddownai/ai-implement-runner:next");
   });
@@ -271,7 +271,7 @@ describe("resolveRunnerImageForDispatch", () => {
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
       runnerImageExplicit: false,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(image).toBeUndefined();
   });

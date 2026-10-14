@@ -29,7 +29,7 @@ import {
   type LateExternalReviewInput,
 } from "../restate/late-external-review.js";
 
-const input: LateExternalReviewInput = {
+const input: LateExternalReviewInput & { headSha: string } = {
   dispatchId: "d-1", owner: "owner", repo: "repo", prNumber: 12, prUrl: "https://gh/pr/12", headSha: "sha-a",
 };
 const deps = createProductionLateExternalReviewDependencies({ githubAppId: "1", githubAppPrivateKey: "k" });
