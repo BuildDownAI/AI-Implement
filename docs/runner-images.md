@@ -74,3 +74,7 @@ Cancelled or failed runs can leave SHA-only images with no channel pointer. That
 ## Building a custom image
 
 The typical reason is a language runtime or tool the base image lacks (terraform, ruby, go). Build `FROM` the channel matching your orchestrator, add your tools, publish, and point `image.yml` at it. The customer owns building and publishing; the image should be publicly pullable for the broadest compatibility.
+
+## Extra trusted image prefixes (AII-1321)
+
+The orchestrator stores extra trusted runner-image prefixes in the `runner_image_allowed_prefixes` settings row (comma-separated, each ending in `/`). It seeds the row once from `RUNNER_IMAGE_ALLOWED_PREFIXES` and serves it on `GET`/`POST /api/settings` as `runnerImageAllowedPrefixes` (`value`, `effective`, `builtIn`). Only an admin can write it. `getRunnerImageAllowedPrefixes()` returns `[]` when the row is missing or unreadable, so a database fault never widens the allowlist. The built-in prefixes always apply. Nothing reads the setting yet (AII-1323); the repository Actions variable `AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES` is a separate store.

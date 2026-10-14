@@ -72,6 +72,7 @@ import {
   setRetryPolicy,
   getLinearPickupLabel,
   DEFAULT_LINEAR_PICKUP_LABEL,
+  getRunnerImageAllowedPrefixes,
   DEFAULT_RETRY_POLICY,
   type RetryPolicy,
   getFlySessionsConfig,
@@ -2692,6 +2693,32 @@ function flySettingsView(): Record<string, unknown> {
   };
 }
 
+/** Display text only; `<owner>` is literal. */
+const RUNNER_IMAGE_BUILT_IN_PREFIXES = ["ghcr.io/builddownai/", "ghcr.io/<owner>/"];
+
+/** Validates a runnerImageAllowedPrefixes POST value; returns the stored string (null = delete) or an error. */
+function parseRunnerImagePrefixes(raw: unknown): { value: string | null } | { error: string } {
+  if (raw !== null && typeof raw !== "string") {
+    return { error: "runnerImageAllowedPrefixes must be a string or null" };
+  }
+  if (raw === null || raw.trim() === "") return { value: null };
+  if (raw.length > 1000) return { error: "runnerImageAllowedPrefixes must be 1000 characters or fewer" };
+  const entries = raw.split(",").map((e) => e.trim()).filter((e) => e !== "");
+  for (const entry of entries) {
+    if (!/^[A-Za-z0-9._:/@-]+$/.test(entry)) {
+      return { error: "each prefix may contain only letters, digits and . _ : / @ -" };
+    }
+    if (!entry.endsWith("/")) return { error: 'each prefix must end with "/"' };
+    if (!entry.slice(0, -1).includes("/")) {
+      return { error: "each prefix must include a path after the registry host" };
+    }
+    if (entry.startsWith("/") || entry.includes("//")) {
+      return { error: "each prefix must not contain empty path segments" };
+    }
+  }
+  return { value: entries.length > 0 ? entries.join(",") : null };
+}
+
 function handleGetSettings(
   _req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -2712,6 +2739,11 @@ function handleGetSettings(
       effective: getLinearPickupLabel(),
       default: DEFAULT_LINEAR_PICKUP_LABEL,
     },
+    runnerImageAllowedPrefixes: {
+      value: dbSettings.runnerImageAllowedPrefixes,
+      effective: getRunnerImageAllowedPrefixes(),
+      builtIn: RUNNER_IMAGE_BUILT_IN_PREFIXES,
+    },
     retryPolicy: getRetryPolicy(),
     retryPolicyDefaults: DEFAULT_RETRY_POLICY,
   });
@@ -2730,6 +2762,7 @@ async function handlePostSettings(
     kgRefreshReportIssue?: string | null;
     kgBaseRepo?: string | null;
     linearPickupLabel?: string | null;
+    runnerImageAllowedPrefixes?: string | null;
     retryPolicy?: Partial<RetryPolicy> | null;
   };
   try {
@@ -2742,6 +2775,16 @@ async function handlePostSettings(
   } catch {
     json(res, 400, { error: "Invalid request body" });
     return;
+  }
+
+  let runnerImagePrefixes: string | null | undefined;
+  if ("runnerImageAllowedPrefixes" in body) {
+    const parsed = parseRunnerImagePrefixes(body.runnerImageAllowedPrefixes);
+    if ("error" in parsed) {
+      json(res, 400, { error: parsed.error });
+      return;
+    }
+    runnerImagePrefixes = parsed.value;
   }
 
   if ("retryPolicy" in body) {
@@ -2772,6 +2815,9 @@ async function handlePostSettings(
       return;
     }
     setOrchestratorSetting("linearPickupLabel", trimmed ? trimmed : null);
+  }
+  if (runnerImagePrefixes !== undefined) {
+    setOrchestratorSetting("runnerImageAllowedPrefixes", runnerImagePrefixes);
   }
 
   const flyPatch: Record<string, string | null> = {};
@@ -2843,6 +2889,11 @@ async function handlePostSettings(
       value: dbSettings.linearPickupLabel,
       effective: getLinearPickupLabel(),
       default: DEFAULT_LINEAR_PICKUP_LABEL,
+    },
+    runnerImageAllowedPrefixes: {
+      value: dbSettings.runnerImageAllowedPrefixes,
+      effective: getRunnerImageAllowedPrefixes(),
+      builtIn: RUNNER_IMAGE_BUILT_IN_PREFIXES,
     },
     retryPolicy: getRetryPolicy(),
     retryPolicyDefaults: DEFAULT_RETRY_POLICY,
