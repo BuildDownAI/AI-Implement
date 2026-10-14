@@ -425,4 +425,27 @@ describe("seedRunnerImageAllowedPrefixesFromEnv", () => {
     settings.seedRunnerImageAllowedPrefixesFromEnv("ghcr.io/env/");
     expect(settings.getOrchestratorSettings().runnerImageAllowedPrefixes).toBe("ghcr.io/set/");
   });
+
+  it.each([
+    ["ghcr.io", "each prefix must end with \"/\""],
+    ["ghcr.io/acme", "each prefix must end with \"/\""],
+    ["ghcr.io/a*/", "each prefix may contain only letters, digits and . _ : / @ -"],
+  ])("stores nothing and logs for the invalid env value %s", (value, error) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    settings.seedRunnerImageAllowedPrefixesFromEnv(value);
+    expect(settings.getOrchestratorSettings().runnerImageAllowedPrefixes).toBeNull();
+    expect(settings.getRunnerImageAllowedPrefixes()).toEqual([]);
+    expect(warn).toHaveBeenCalledWith(`[settings] RUNNER_IMAGE_ALLOWED_PREFIXES is invalid (${error}); not seeded`);
+    warn.mockRestore();
+  });
+
+  it("stores the normalized form of a valid list", () => {
+    settings.seedRunnerImageAllowedPrefixesFromEnv(" ghcr.io/acme/ , ghcr.io/b/ ");
+    expect(settings.getOrchestratorSettings().runnerImageAllowedPrefixes).toBe("ghcr.io/acme/,ghcr.io/b/");
+  });
+
+  it("stores nothing for a comma-only env value", () => {
+    settings.seedRunnerImageAllowedPrefixesFromEnv(",,");
+    expect(settings.getOrchestratorSettings().runnerImageAllowedPrefixes).toBeNull();
+  });
 });
