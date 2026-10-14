@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
-import { createModelSessionKeyProvider, MODEL_SESSION_KEY_ID } from "../model-session-keys.js";
+import { createModelSessionKeyProvider, deriveModelAuthProtectionKey, MODEL_SESSION_KEY_ID } from "../model-session-keys.js";
 
 const SECRET = "SENTINEL-RUNNER-TOKEN-SECRET-abc123";
 
@@ -102,5 +102,24 @@ describe("store integration", () => {
     env.RUNNER_TOKEN_SECRET = "rotated-secret";
     expect(store.readPlanRecord("acct")).toMatchObject({ ok: false, reason: "key_mismatch" });
     dedup.closeDb();
+  });
+});
+
+describe("deriveModelAuthProtectionKey", () => {
+  it("is a stable 32-byte key from its own HKDF label", () => {
+    const k = deriveModelAuthProtectionKey({ RUNNER_TOKEN_SECRET: SECRET })!;
+    expect(k).toHaveLength(32);
+    expect(k.equals(deriveModelAuthProtectionKey({ RUNNER_TOKEN_SECRET: SECRET })!)).toBe(true);
+    expect(k.equals(derive(SECRET, "ai-implement/model-auth-protection-key/v1"))).toBe(true);
+  });
+
+  it("differs from the session key for the same secret", () => {
+    const env = { RUNNER_TOKEN_SECRET: SECRET };
+    expect(deriveModelAuthProtectionKey(env)!.equals(createModelSessionKeyProvider(env).current()!.key)).toBe(false);
+  });
+
+  it("is undefined without a secret", () => {
+    expect(deriveModelAuthProtectionKey({})).toBeUndefined();
+    expect(deriveModelAuthProtectionKey({ RUNNER_TOKEN_SECRET: "" })).toBeUndefined();
   });
 });
