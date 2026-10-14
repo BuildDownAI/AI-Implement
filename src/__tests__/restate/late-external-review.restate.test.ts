@@ -51,7 +51,7 @@ const scenarioOf = (id: string): Scenario => {
 function expectOneHeld(sc: Scenario, text?: string, sha = SHA) {
   expect(sc.comments).toHaveLength(1);
   expect(sc.comments[0]).toContain("<!-- ai-implement late-external-held key=");
-  expect(sc.comments[0]).toContain(`for ${sha}, so auto-merge holds this PR.`);
+  expect(sc.comments[0]).toContain(`for ${sha}, so AI-Implement does not merge this PR.`);
   if (text) expect(sc.comments[0]).toContain(text);
 }
 
