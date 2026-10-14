@@ -16,6 +16,28 @@ import type * as StoreModule from "../agent-config-store.js";
 import type * as OwnershipModule from "../model-session-ownership.js";
 import type * as SessionModule from "../model-session-store.js";
 
+// The real resolver still treats codex-subscription as session-based (needs an owner
+// generation); the ChatGPT checkout resolver is a separate module. Stand in for it on the
+// `cdx` profile only, so Claude, API-key and Bedrock rows keep the real resolver.
+// `events` records resolver calls and reservations in order, to assert proof timing.
+let events: string[];
+let codexProof: { ok: true } | { ok: false; category: string; code: string };
+const mockCredentials = () => vi.doMock("../model-credentials.js", async () => {
+  const actual = await vi.importActual<typeof import("../model-credentials.js")>("../model-credentials.js");
+  return {
+    ...actual,
+    resolveModelCredential: (req: { profileId: string }, d: never) => {
+      if (req.profileId === "cdx") {
+        events.push("proof:cdx");
+        return codexProof.ok ? { ok: true, profileId: req.profileId } : codexProof;
+      }
+      const result = actual.resolveModelCredential(req as never, d);
+      events.push(`proof:${req.profileId}`);
+      return result;
+    },
+  };
+});
+
 const API_SENTINEL = "sk-synthetic-api-SENTINEL-0001";
 const SESSION_SENTINEL = "synthetic-session-SENTINEL-0002";
 const KEY = crypto.createHash("sha256").update("synthetic-prep-key").digest();
@@ -34,7 +56,7 @@ let ownership: OwnershipModule.ModelSessionOwnership;
 let deps: PrepModule.AgentRunPreparationDeps;
 let trust: Record<string, PrepModule.RepoTrust | "throw">;
 let files: Record<string, string | null> | "throw";
-let secrets: Map<string, string>;
+let secrets: Map<string, string | { region: string; accessKeyId: string; secretAccessKey: string }>;
 let secretReads: string[];
 
 const PRIVATE: PrepModule.RepoTrust = { visibility: "private", trustedForSubscription: true };
@@ -56,9 +78,24 @@ function seedProfiles() {
     profileId: "sub2", identity: "Sub2", revision: 1, agent: "claude", provider: "anthropic",
     authMode: "claude-subscription", allowedProjectKeys: ["AII"],
   });
+  store.saveAccountProfileRevision({
+    profileId: "cdx", identity: "Cdx", revision: 1, agent: "codex", provider: "openai",
+    authMode: "codex-subscription", allowedProjectKeys: ["AII"],
+  });
+  store.saveAccountProfileRevision({
+    profileId: "brk", identity: "Brk", revision: 1, agent: "claude", provider: "bedrock",
+    authMode: "bedrock", allowedProjectKeys: ["AII"], metadata: { credentialRef: "model-account:brk" },
+  });
   store.setOrchestratorDefaults({
     version: 1, mode: "configured",
     stages: { planning: stage("api", "claude", "anthropic"), implementation: stage("sub", "claude", "anthropic"), review: stage("api", "claude", "anthropic") },
+  });
+}
+
+function useStages(planning: [string, "claude" | "codex", "anthropic" | "openai" | "bedrock"], implementation: [string, "claude" | "codex", "anthropic" | "openai" | "bedrock"]) {
+  store.setOrchestratorDefaults({
+    version: 1, mode: "configured",
+    stages: { planning: stage(...(planning as [string, "claude", "anthropic"])), implementation: stage(...(implementation as [string, "claude", "anthropic"])), review: stage(...(planning as [string, "claude", "anthropic"])) },
   });
 }
 
@@ -104,6 +141,9 @@ beforeEach(async () => {
   dbPath = path.join(os.tmpdir(), `agent-run-prep-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
   vi.resetModules();
   process.env.DEDUP_DB_PATH = dbPath;
+  events = [];
+  codexProof = { ok: true };
+  mockCredentials();
   dedup = await import("../dedup.js");
   prep = await import("../agent-run-preparation.js");
   store = await import("../agent-config-store.js");
@@ -122,10 +162,16 @@ beforeEach(async () => {
     ".github/workflows/comment-trigger.yml": null,
     ".github/workflows/claude-kg-refresh.yml": null,
   };
-  secrets = new Map([["model-account:api", API_SENTINEL]]);
+  secrets = new Map<string, string | { region: string; accessKeyId: string; secretAccessKey: string }>([["model-account:api", API_SENTINEL], ["model-account:brk", { region: "us-east-1", accessKeyId: "AKIASYNTHETIC0001", secretAccessKey: "synthetic-secret-0003" }]]);
   secretReads = [];
   deps = {
-    ownership,
+    ownership: {
+      ...ownership,
+      reserve: (input) => {
+        events.push("reserve");
+        return ownership.reserve(input);
+      },
+    } as typeof ownership,
     getRepoTrust: async (repo) => {
       const t = trust[repo];
       if (t === "throw") throw new Error("boom");
@@ -658,5 +704,116 @@ describe("inspectAgentReadiness", () => {
   it("rejects malformed requests", async () => {
     expect(await prep.inspectAgentReadiness(request({ dispatchId: "bad id!" }), deps)).toEqual({ status: "not-ready", code: "invalid_request" });
     expect(await prep.prepareAgentRun(request({ backend: "nope" as never }), deps)).toEqual({ status: "configuration-error", code: "invalid_request" });
+  });
+});
+
+describe("codex-subscription is not reserved", () => {
+  const CODEX = ["cdx", "codex", "openai"] as ["cdx", "codex", "openai"];
+  const API = ["api", "claude", "anthropic"] as ["api", "claude", "anthropic"];
+
+  it("prepares without a reservation or ownerGeneration, and proves the credential", async () => {
+    useStages(API, CODEX);
+    const before = counts().reservations;
+    const r = ready(await prep.prepareAgentRun(request(), deps));
+    expect(r.reservations).toEqual([]);
+    expect(counts().reservations).toBe(before);
+    const b = r.takeBootstrap()!.bindings.find((x) => x.stage === "implementation")!;
+    expect(b).toMatchObject({ profileId: "cdx", authMode: "codex-subscription" });
+    expect(b.ownerGeneration).toBeUndefined();
+    expect(rows("model_credential_grant_profiles").find((x) => x.profile_id === "cdx")!.owner_generation).toBeNull();
+  });
+
+  it("lets two dispatches share one codex profile concurrently", async () => {
+    useStages(API, CODEX);
+    ready(await prep.prepareAgentRun(request({ dispatchId: "d1" }), deps));
+    ready(await prep.prepareAgentRun(request({ dispatchId: "d2" }), deps));
+  });
+
+  it("reserves only the Claude profile in a mixed snapshot", async () => {
+    useStages(CODEX, ["sub", "claude", "anthropic"]);
+    const r = ready(await prep.prepareAgentRun(request(), deps));
+    expect(r.reservations.map((x) => x.profileId)).toEqual(["sub"]);
+    const bindings = r.takeBootstrap()!.bindings;
+    expect(bindings.find((x) => x.stage === "planning")!.ownerGeneration).toBeUndefined();
+    expect(bindings.find((x) => x.stage === "implementation")!.ownerGeneration).toBe(r.reservations[0]!.generation);
+  });
+
+  it("retries an existing codex grant without grant_mismatch", async () => {
+    useStages(API, CODEX);
+    ready(await prep.prepareAgentRun(request(), deps));
+    expect(ready(await prep.prepareAgentRun(request(), deps)).reused).toBe(true);
+  });
+
+  it.each([
+    ["public", { visibility: "public", trustedForSubscription: true } as PrepModule.RepoTrust, "repository_public"],
+    ["unknown", { visibility: "unknown", trustedForSubscription: true } as PrepModule.RepoTrust, "repository_visibility_unknown"],
+    ["untrusted private", { visibility: "private", trustedForSubscription: false } as PrepModule.RepoTrust, "repository_not_trusted"],
+  ])("still fails the trust check on a %s repository", async (_n, value, code) => {
+    useStages(API, CODEX);
+    trust[REPO] = value;
+    expect(await prep.prepareAgentRun(request(), deps)).toEqual({ status: "configuration-error", code });
+    expect(rows("model_credential_grants")).toHaveLength(0);
+  });
+
+  it("fails a codex credential proof as session_unavailable before reserving anything", async () => {
+    useStages(API, CODEX);
+    codexProof = { ok: false, category: "authentication_required", code: "session_unavailable" };
+    const before = counts().reservations;
+    expect(await prep.prepareAgentRun(request(), deps)).toEqual({
+      status: "authentication-required", code: "session_unavailable", stage: "implementation", profileId: "cdx",
+    });
+    expect(events).not.toContain("reserve");
+    expect(counts().reservations).toBe(before);
+    expect(rows("model_credential_grants")).toHaveLength(0);
+    expect(rows("model_profile_reservations").filter((x) => x.dispatch_id === "d1")).toHaveLength(0);
+  });
+
+  it("reserves nothing in a mixed snapshot when the codex proof fails", async () => {
+    useStages(CODEX, ["sub", "claude", "anthropic"]);
+    codexProof = { ok: false, category: "authentication_required", code: "session_unavailable" };
+    const before = counts().reservations;
+    const r = await prep.prepareAgentRun(request(), deps);
+    expect(r).toMatchObject({ status: "authentication-required", code: "session_unavailable", profileId: "cdx" });
+    expect(events).not.toContain("reserve");
+    expect(counts().reservations).toBe(before);
+  });
+
+  it("is not deferred in inspectAgentReadiness; Claude stays deferred", async () => {
+    useStages(CODEX, ["sub", "claude", "anthropic"]);
+    const r = await prep.inspectAgentReadiness(request(), deps);
+    if (r.status !== "ready") throw new Error(JSON.stringify(r));
+    expect(r.profiles.find((p) => p.stage === "planning")!.credential).toBe("reference-configured");
+    expect(r.profiles.find((p) => p.stage === "implementation")!.credential).toBe("deferred");
+  });
+});
+
+describe("auth mode state table", () => {
+  const cases = [
+    { name: "claude-subscription", profile: ["sub", "claude", "anthropic"], trust: true, reserved: true },
+    { name: "codex-subscription", profile: ["cdx", "codex", "openai"], trust: true, reserved: false },
+    { name: "API key", profile: ["api", "claude", "anthropic"], trust: false, reserved: false },
+    { name: "bedrock", profile: ["brk", "claude", "bedrock"], trust: false, reserved: false },
+  ] as const;
+
+  it.each(cases)("$name", async (c) => {
+    useStages(["api", "claude", "anthropic"], c.profile as never);
+    // Trust check applies only to plan-based credentials.
+    trust[REPO] = { visibility: "private", trustedForSubscription: false };
+    const untrusted = await prep.prepareAgentRun(request(), deps);
+    if (c.trust) expect(untrusted).toEqual({ status: "configuration-error", code: "repository_not_trusted" });
+    else expect(untrusted.status).toBe("ready");
+    trust[REPO] = PRIVATE;
+    events.length = 0;
+    const r = ready(await prep.prepareAgentRun(request({ dispatchId: "d9" }), deps));
+    // Proof timing: the profile's credential is proven after reserve for Claude plans, before it otherwise.
+    const proof = events.indexOf(`proof:${c.profile[0]}`);
+    const reserveAt = events.indexOf("reserve");
+    expect(proof).toBeGreaterThanOrEqual(0);
+    expect(reserveAt).toBeGreaterThanOrEqual(0);
+    if (c.reserved) expect(proof).toBeGreaterThan(reserveAt);
+    else expect(proof).toBeLessThan(reserveAt);
+    expect(r.reservations.length).toBe(c.reserved ? 1 : 0);
+    const b = r.takeBootstrap()!.bindings.find((x) => x.stage === "implementation")!;
+    expect(b.ownerGeneration !== undefined).toBe(c.reserved);
   });
 });
