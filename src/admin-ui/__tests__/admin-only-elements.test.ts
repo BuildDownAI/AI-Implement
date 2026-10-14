@@ -4,6 +4,7 @@ import { authJs } from "../auth.js";
 import { routerJs } from "../router.js";
 import { auditHtml, auditScript } from "../pages/audit.js";
 import { sidebarHtml } from "../sidebar.js";
+import { fakeFetch, type FakeFetch } from "../../__tests__/helpers/fake-fetch.js";
 
 /**
  * The destructive controls on grantable pages are withheld from users by a `window.isAdmin()` guard
@@ -24,7 +25,7 @@ function identity(role: string) {
 }
 
 /** Boots the shell the way a browser does: markup, scripts, then DOMContentLoaded. */
-async function boot(role: string) {
+async function boot(role: string): Promise<FakeFetch> {
   document.body.innerHTML = `
     <div id="login-page"></div>
     <div id="admin-page" class="hidden">
@@ -32,11 +33,12 @@ async function boot(role: string) {
       <main>${auditHtml}</main>
     </div>`;
 
-  vi.stubGlobal("fetch", vi.fn(async (url: string) => ({
-    ok: true,
-    status: 200,
-    json: async () => (String(url).includes("/api/session-identity") ? identity(role) : DEDUP_ROW),
-  })));
+  const fake = fakeFetch({
+    "GET /api/session-identity": { json: identity(role) },
+    "GET /api/dedup": { json: DEDUP_ROW },
+  });
+  // The page fetches paths relative to its own origin, which a Request outside a browser refuses.
+  vi.stubGlobal("fetch", (input: string, init?: RequestInit) => fake.fetch(new URL(input, location.href), init));
 
   // Same order the page ships them in: auth defines isAdmin, the router defines registerPage.
   new Function(authJs)();
@@ -46,6 +48,7 @@ async function boot(role: string) {
   // Two turns: one for the identity fetch, one for the dedup fetch the page init starts.
   await Promise.resolve();
   await new Promise((r) => setTimeout(r, 0));
+  return fake;
 }
 
 describe("admin-only elements", () => {
@@ -56,7 +59,8 @@ describe("admin-only elements", () => {
   afterEach(() => vi.unstubAllGlobals());
 
   it("keeps the dedup Delete button for an admin", async () => {
-    await boot("admin");
+    const fake = await boot("admin");
+    expect(fake.calls.map((call) => `${call.method} ${call.path}`)).toEqual(["GET /api/session-identity", "GET /api/dedup"]);
     expect((window as unknown as { isAdmin(): boolean }).isAdmin()).toBe(true);
     const row = document.querySelector("#dedup-body tr");
     expect(row).not.toBeNull();
