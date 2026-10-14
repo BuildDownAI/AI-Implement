@@ -452,6 +452,38 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
     expect(retry.ok).toBe(true);
   });
 
+  it("dispatchLocalDocker: a run-token mint failure releases the reservation and never calls the backend", async () => {
+    vi.mocked(githubAppAuth.getInstallationToken).mockResolvedValue("gh-token");
+    const config = {
+      githubAppId: "id",
+      githubAppPrivateKey: "key",
+      anthropicApiKey: "sk-test",
+      localRunnerImage: "test-image",
+      localRunnerOrchestratorUrl: "http://localhost:9000",
+      runnerCallbackBaseUrl: "http://localhost:9000",
+      runnerTokenSecret: "secret",
+    } as unknown as AppConfig;
+    // Make every mint throw without touching the code under test.
+    dedup.getDb().exec("DROP TABLE runner_tokens");
+
+    await expect(
+      indexModule.dispatchLocalDocker(config, provider, issue, mapping, prior, "default", mapping.defaultBranch, null),
+    ).rejects.toThrow(/runner_tokens/);
+
+    expect(localDocker.startLocalRunnerContainer).not.toHaveBeenCalled();
+
+    const retry = gate.acquireDispatch({
+      dispatchId: "retry-local-mint",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      kind: "implementation",
+      teamKey: issue.scopeKey,
+      maxInProgressAiIssues: 1,
+      backend: "local-docker",
+    });
+    expect(retry.ok).toBe(true);
+  });
+
   it("dispatchLocalDocker: a throw after markLaunchAttempted (container launch failure) holds the reservation — docker's CLI response can be lost after the container was actually created (AII-783 review, second round, on PR #681)", async () => {
     vi.mocked(githubAppAuth.getInstallationToken).mockResolvedValue("gh-token");
     vi.mocked(localDocker.startLocalRunnerContainer).mockRejectedValue(new Error("docker run failed"));

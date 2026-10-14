@@ -77,7 +77,7 @@ import { getOrchestratorSettings, getRunnerBackendSource, getFlySessionsConfig, 
 import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, resubmitPendingGapFillReviews, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
-import { mintRunToken, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
+import { mintRunToken, mintLaunchTokens, IMPLEMENTATION_TTL_SECONDS, type LaunchTokens } from "./runner-tokens.js";
 import { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
 import { createReviewFixAdminFacade } from "./review-fix-admin-facade.js";
 import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "./review-fix-worker.js";
@@ -1152,28 +1152,21 @@ export async function dispatchGitHubActions(
       let runnerCallbackUrl = "";
       let runToken = "";
       let runProgressToken = "";
+      let mintedPublicationToken: string | undefined;
       if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
-        const minted = mintRunToken({
+        const minted = mintLaunchTokens({
           issueId: issue.id,
           mappingTeamKey: issue.scopeKey,
           phase: "implementation",
-          audience: "result",
           dispatchId,
-          ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-          secret: config.runnerTokenSecret,
-        });
-        const progressMinted = mintRunToken({
-          issueId: issue.id,
-          mappingTeamKey: issue.scopeKey,
-          phase: "implementation",
-          audience: "progress",
-          dispatchId,
+          repository: `${mapping.owner}/${mapping.repo}`,
           ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
           secret: config.runnerTokenSecret,
         });
         runnerCallbackUrl = config.runnerCallbackBaseUrl;
-        runToken = minted.token;
-        runProgressToken = progressMinted.token;
+        runToken = minted.runToken;
+        runProgressToken = minted.runProgressToken;
+        mintedPublicationToken = minted.runPublicationToken;
       }
 
       const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
@@ -1186,21 +1179,8 @@ export async function dispatchGitHubActions(
         ref: mapping.defaultBranch,
       });
       const { contract } = workflowCapabilities;
-      const runPublicationToken = contract === "envelope"
-        && workflowCapabilities.supportsRunPublicationToken
-        && dispatchId
-        && config.runnerCallbackBaseUrl
-        && config.runnerTokenSecret
-        ? mintRunToken({
-            issueId: issue.id,
-            mappingTeamKey: issue.scopeKey,
-            phase: "implementation",
-            audience: "publication",
-            dispatchId,
-            repository: `${mapping.owner}/${mapping.repo}`,
-            ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-            secret: config.runnerTokenSecret,
-          }).token
+      const runPublicationToken = contract === "envelope" && workflowCapabilities.supportsRunPublicationToken
+        ? mintedPublicationToken
         : undefined;
 
       const dispatchInputs = contract === "envelope"
@@ -1642,6 +1622,8 @@ export async function dispatchSession(
       machineNonce: string;
       runnerCallbackUrl: string;
       runToken: string;
+      runProgressToken: string;
+      runPublicationToken?: string;
       /** Call immediately before the actual launch call (createMachine / the local
        *  Docker spawn) — everything the backend does before this point (minting a
        *  credential, resolving an image) is provably side-effect-free for the
@@ -1689,22 +1671,6 @@ export async function dispatchSession(
     admission = decision;
   }
 
-  let runnerCallbackUrl = "";
-  let runToken = "";
-  if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
-    const minted = mintRunToken({
-      issueId: issue.id,
-      mappingTeamKey: issue.scopeKey,
-      phase: opts.phase,
-      audience: "result",
-      dispatchId,
-      ttlSeconds: opts.tokenTtlSeconds,
-      secret: config.runnerTokenSecret,
-    });
-    runnerCallbackUrl = config.runnerCallbackBaseUrl;
-    runToken = minted.token;
-  }
-
   let launchAttempted = false;
   const markLaunchAttempted = () => {
     launchAttempted = true;
@@ -1712,7 +1678,29 @@ export async function dispatchSession(
 
   let result: SessionBackendResult;
   try {
-    result = await opts.backend({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted });
+    let runnerCallbackUrl = "";
+    let tokens: Partial<LaunchTokens> = {};
+    if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
+      tokens = mintLaunchTokens({
+        issueId: issue.id,
+        mappingTeamKey: issue.scopeKey,
+        phase: opts.phase,
+        dispatchId,
+        repository: `${mapping.owner}/${mapping.repo}`,
+        ttlSeconds: opts.tokenTtlSeconds,
+        secret: config.runnerTokenSecret,
+      });
+      runnerCallbackUrl = config.runnerCallbackBaseUrl;
+    }
+    result = await opts.backend({
+      sessionToken,
+      machineNonce,
+      runnerCallbackUrl,
+      runToken: tokens.runToken ?? "",
+      runProgressToken: tokens.runProgressToken ?? "",
+      runPublicationToken: tokens.runPublicationToken,
+      markLaunchAttempted,
+    });
   } catch (err) {
     if (admission && shouldReleaseAdmissionOnDispatchError(launchAttempted, err, opts.isDefinitiveLaunchFailure)) {
       admission.release("launch_rejected");
@@ -1837,7 +1825,7 @@ export async function dispatchFlyMachine(
     backendKind: "fly-machines",
     isDefinitiveLaunchFailure: isDefinitiveFlyRejectionError,
     branchInfo: shadow ? undefined : { fieldValue: baseBranchFieldValue, defaultBranch: mapping.defaultBranch },
-    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted }) => {
+    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, runProgressToken, runPublicationToken, markLaunchAttempted }) => {
       const minSecretsVersion = getFlySecretsMinVersion();
 
       let allSecretNames: string[] = [];
@@ -1892,6 +1880,8 @@ export async function dispatchFlyMachine(
         orchestratorUrl: config.runnerCallbackBaseUrl ?? undefined,
         runnerCallbackUrl: runnerCallbackUrl || undefined,
         runToken: runToken || undefined,
+        runProgressToken: runProgressToken || undefined,
+        runPublicationToken,
         orchestratorApp: config.flyOrchestratorApp ?? undefined,
         tenantId: config.tenantId ?? undefined,
         expectedTtlSeconds: Math.round(SWEEP_MACHINE_MAX_AGE_MS / 1000),
@@ -1957,7 +1947,7 @@ export async function dispatchLocalDocker(
     backendKind: "local-docker",
     isDefinitiveLaunchFailure: isDefinitiveLocalDockerLaunchFailure,
     branchInfo: { fieldValue: baseBranchFieldValue, defaultBranch: mapping.defaultBranch },
-    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted }) => {
+    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, runProgressToken, runPublicationToken, markLaunchAttempted }) => {
       const localOrchestratorUrl =
         config.localRunnerOrchestratorUrl ??
         config.runnerCallbackBaseUrl ??
@@ -1993,6 +1983,8 @@ export async function dispatchLocalDocker(
         orchestratorUrl: localOrchestratorUrl,
         runnerCallbackUrl: runnerCallbackUrl || undefined,
         runToken: runToken || undefined,
+        runProgressToken: runProgressToken || undefined,
+        runPublicationToken,
         extraEnv: (() => {
           const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue), ...assigneeRunnerEnv(issue), AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(localImplRunConfig) };
           return Object.keys(merged).length > 0 ? merged : undefined;

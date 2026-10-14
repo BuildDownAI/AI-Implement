@@ -11,7 +11,7 @@ import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { notify } from "./notify.js";
 import { recordDispatchFailure } from "./dispatch-breaker.js";
 import { getInstallationToken } from "./github-app-auth.js";
-import { mintRunToken, PLANNING_TTL_SECONDS } from "./runner-tokens.js";
+import { mintLaunchTokens, PLANNING_TTL_SECONDS } from "./runner-tokens.js";
 import { buildPlanningContextInputs } from "./planning-context.js";
 import { postBranchComment } from "./base-branch.js";
 import { appendLog, countPriorDispatches } from "./log.js";
@@ -60,18 +60,20 @@ export async function preparePlanningLaunch(args: PreparePlanningLaunchArgs): Pr
 
   let runnerCallbackUrl = "";
   let runToken = "";
+  let runProgressToken = "";
   if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
-    const minted = mintRunToken({
+    const minted = mintLaunchTokens({
       issueId: issue.id,
       mappingTeamKey: issue.scopeKey,
       phase: "planning",
-      audience: "result",
       dispatchId,
+      repository: `${mapping.owner}/${mapping.repo}`,
       ttlSeconds: PLANNING_TTL_SECONDS,
       secret: config.runnerTokenSecret,
     });
     runnerCallbackUrl = config.runnerCallbackBaseUrl;
-    runToken = minted.token;
+    runToken = minted.runToken;
+    runProgressToken = minted.runProgressToken;
   }
 
   // Forward the resolved runner image so GHA planning honors the orchestrator's
@@ -104,7 +106,7 @@ export async function preparePlanningLaunch(args: PreparePlanningLaunchArgs): Pr
         baseBranch: planningSentBaseBranch ? resolvedPlanningBranch : undefined,
         runnerCallbackUrl: runnerCallbackUrl || undefined,
         runToken,
-        // No runProgressToken: planning dispatches don't mint progress tokens.
+        runProgressToken,
         runnerImage,
         planningContext: planningContextInputs,
         // Planning has no retry loop, so nothing is stamped — but retryPolicy is
@@ -343,7 +345,7 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
     shadow: false,
     backendKind: execPath,
     isDefinitiveLaunchFailure,
-    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted: markAttempted }) => {
+    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, runProgressToken, markLaunchAttempted: markAttempted }) => {
       const markLaunchAttempted = () => {
         launchAttempted = true;
         markAttempted();
@@ -421,6 +423,7 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
           orchestratorUrl: config.runnerCallbackBaseUrl ?? undefined,
           runnerCallbackUrl: runnerCallbackUrl || undefined,
           runToken: runToken || undefined,
+          runProgressToken: runProgressToken || undefined,
           orchestratorApp: config.flyOrchestratorApp ?? undefined,
           tenantId: config.tenantId ?? undefined,
           expectedTtlSeconds: Math.round(SWEEP_MACHINE_MAX_AGE_MS / 1000),
@@ -473,6 +476,7 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
           orchestratorUrl: localOrchestratorUrl,
           runnerCallbackUrl: runnerCallbackUrl || undefined,
           runToken: runToken || undefined,
+          runProgressToken: runProgressToken || undefined,
           extraEnv: (() => {
             const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...planningEnv, AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(planningRunConfig) };
             return Object.keys(merged).length > 0 ? merged : undefined;
