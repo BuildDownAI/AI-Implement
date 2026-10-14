@@ -623,8 +623,11 @@ GitHub token; it never pushes.
 
 The snapshot push step (`src/pipeline/steps/kg-snapshot-push.ts`) calls `refreshRunnerGithubCredentials`
 immediately before the push — the same pattern as `push.ts`. In Fly/local-docker mode this re-mints
-a fresh token via the machine nonce; in GHA mode it is a no-op (no publication token for kg-refresh)
-and the dispatch-time `GITHUB_TOKEN` is used directly.
+a fresh token via the machine nonce; in GHA mode it exchanges the run's single-use publication
+credential (`getPublicationCredential()`, dispatched as `run_publication_token`) for a fresh token, so an
+ingest that outlasts the ~1 h dispatch-time `GITHUB_TOKEN` still pushes. No earlier kg-refresh step
+exchanges that credential, and a dry run returns before reading it. The push, PR open and PR comment all
+use the refreshed token.
 
 **Snapshot push contract — content-based, not flag-based.** `kg-snapshot-push` judges the
 snapshot by comparing the working tree's `snapshot/parts/*.nt` line counts against the cloned
