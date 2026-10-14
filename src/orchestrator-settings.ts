@@ -256,13 +256,45 @@ export function getRunnerImageAllowedPrefixes(): string[] {
 }
 
 /**
+ * Validates a runner-image prefix list (AII-1397) for both the settings API and the env seed;
+ * returns the string to store (null = delete) or an error.
+ */
+export function validateRunnerImagePrefixes(raw: unknown): { value: string | null } | { error: string } {
+  if (raw !== null && typeof raw !== "string") {
+    return { error: "runnerImageAllowedPrefixes must be a string or null" };
+  }
+  if (raw === null || raw.trim() === "") return { value: null };
+  if (raw.length > 1000) return { error: "runnerImageAllowedPrefixes must be 1000 characters or fewer" };
+  const entries = raw.split(",").map((e) => e.trim()).filter((e) => e !== "");
+  for (const entry of entries) {
+    if (!/^[A-Za-z0-9._:/@-]+$/.test(entry)) {
+      return { error: "each prefix may contain only letters, digits and . _ : / @ -" };
+    }
+    if (!entry.endsWith("/")) return { error: 'each prefix must end with "/"' };
+    if (!entry.slice(0, -1).includes("/")) {
+      return { error: "each prefix must include a path after the registry host" };
+    }
+    if (entry.startsWith("/") || entry.includes("//")) {
+      return { error: "each prefix must not contain empty path segments" };
+    }
+  }
+  return { value: entries.length > 0 ? entries.join(",") : null };
+}
+
+/**
  * Seeds `runnerImageAllowedPrefixes` from RUNNER_IMAGE_ALLOWED_PREFIXES on first boot only
  * (AII-1321) — a no-op once the DB already holds a value. Call once during startup.
  */
 export function seedRunnerImageAllowedPrefixesFromEnv(envValue: string | null | undefined): void {
   if (!envValue?.trim()) return;
   if (getOrchestratorSettings().runnerImageAllowedPrefixes !== null) return;
-  setOrchestratorSetting("runnerImageAllowedPrefixes", envValue.trim());
+  const parsed = validateRunnerImagePrefixes(envValue);
+  if ("error" in parsed) {
+    console.warn(`[settings] RUNNER_IMAGE_ALLOWED_PREFIXES is invalid (${parsed.error}); not seeded`);
+    return;
+  }
+  if (parsed.value === null) return;
+  setOrchestratorSetting("runnerImageAllowedPrefixes", parsed.value);
 }
 
 export function setOrchestratorSetting(key: SettingKey, value: string | null): void {
