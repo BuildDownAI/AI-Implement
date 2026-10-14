@@ -13,6 +13,7 @@ const SECRET_ENV_KEYS = new Set([
   "GITHUB_TOKEN",
   "RUN_TOKEN",
   "RUN_PROGRESS_TOKEN",
+  "RUN_PUBLICATION_TOKEN",
   "SESSION_TOKEN",
 ]);
 
@@ -35,6 +36,8 @@ export interface LocalRunnerInput {
   orchestratorUrl?: string;
   runnerCallbackUrl?: string;
   runToken?: string;
+  runProgressToken?: string;
+  runPublicationToken?: string;
   extraEnv?: Record<string, string>;
 }
 
@@ -72,6 +75,8 @@ export function buildLocalRunnerEnv(input: LocalRunnerInput): Record<string, str
   if (input.orchestratorUrl) env.ORCHESTRATOR_URL = input.orchestratorUrl;
   if (input.runnerCallbackUrl) env.RUNNER_CALLBACK_URL = input.runnerCallbackUrl;
   if (input.runToken) env.RUN_TOKEN = input.runToken;
+  if (input.runProgressToken) env.RUN_PROGRESS_TOKEN = input.runProgressToken;
+  if (input.runPublicationToken) env.RUN_PUBLICATION_TOKEN = input.runPublicationToken;
   if (input.extraEnv) Object.assign(env, input.extraEnv);
 
   return env;
