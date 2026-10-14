@@ -17,9 +17,10 @@
  * pre-reservation check passes):
  *   stored snapshot (reuse) -> persisted opt-in -> resolve + persist immutable snapshot
  *   -> agent/provider/auth/backend matrix -> workspace trust for every executed repo
- *   -> runner/template capability -> API-key credential readiness
- *   -> atomic reservation of the full subscription set -> owner-state inspection
- *   -> subscription credential readiness under the reserved generation -> grant.
+ *   -> runner/template capability -> credential readiness for unreserved profiles
+ *   (API key, bedrock, codex-subscription) -> atomic reservation of the reserved set
+ *   (`claude-subscription` only) -> owner-state inspection
+ *   -> credential readiness for reserved profiles under the reserved generation -> grant.
  *
  * A failure after a fresh reservation releases it through the certain-launch-rejection
  * path, so a failed preparation never leaves a falsely reusable lease. A released
@@ -402,8 +403,9 @@ function credentialRequest(projectKey: string, snapshot: ResolvedAgentSnapshotV1
 /**
  * Read-only readiness for administration and dispatch. Writes nothing, reserves nothing,
  * mints nothing. It reads no secret, so an API-key profile only proves its protected
- * reference is configured (`reference-configured`), and subscription session state is only
- * provable under a reservation (`deferred`); both are re-verified by `prepareAgentRun`.
+ * reference is configured (`reference-configured`), and reserved (`claude-subscription`)
+ * session state is only provable under a reservation (`deferred`); both are re-verified by
+ * `prepareAgentRun`. `codex-subscription` is not reserved, so it takes the unreserved path.
  * An unknown or unreadable input is `not-ready`.
  */
 export async function inspectAgentReadiness(request: AgentRunRequest, deps: AgentReadinessDeps): Promise<AgentReadiness> {
