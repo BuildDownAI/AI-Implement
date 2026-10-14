@@ -95,7 +95,7 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
       localRunnerImage: "local:img", localRunnerOrchestratorUrl: null, healthPort: 8080,
       anthropicApiKey: null, claudeOAuthToken: null,
     },
-    mintToken: vi.fn(async () => ({ token: "gh-token", expiresAt: "" })),
+    mintToken: vi.fn(async () => ({ token: "gh-token", expiresAt: "", installationId: 1 })),
     fetchTarball: noop as never,
     fetchDefaultBranch: vi.fn(async () => "main"),
     fetchSnapshotCommitSha: vi.fn(async () => null),

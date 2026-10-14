@@ -47,7 +47,7 @@ describe("scripts/image-equiv-check.sh", () => {
 
   it("passes shellcheck", () => {
     const r = spawnSync("shellcheck", [scriptPath], { stdio: ["ignore", "pipe", "pipe"] });
-    if (r.error?.code === "ENOENT") return;
+    if ((r.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return;
     expect(r.status, r.stderr?.toString()).toBe(0);
   });
 

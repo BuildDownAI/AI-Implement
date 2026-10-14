@@ -76,6 +76,7 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     sensitiveAddPatterns: null,
     sensitiveAllowPatterns: null,
     dependencyTokenScope: null,
+    reviewFixLifecycle: null,
     memoryProviderId: null,
     reviewers: null,
     ...overrides,

@@ -16,21 +16,11 @@
   "exclude": [
     "node_modules",
     "dist",
-    "src/__tests__/dependency-token-vending.test.ts",
-    "src/__tests__/filesystem-ticket-lifecycle.test.ts",
-    "src/__tests__/github-dispatch.test.ts",
-    "src/__tests__/image-equiv-check.test.ts",
     "src/__tests__/install.test.ts",
     "src/__tests__/kg-provider.test.ts",
-    "src/__tests__/kg-refresh-production.test.ts",
-    "src/__tests__/kg-refresh-rail.test.ts",
     "src/__tests__/kg-refresh-run.test.ts",
     "src/__tests__/mcp-identity.test.ts",
     "src/__tests__/mcp.test.ts",
-    "src/__tests__/merge-up-multilevel.test.ts",
-    "src/__tests__/merge-up.test.ts",
-    "src/__tests__/poll-cycle-deadline.test.ts",
-    "src/__tests__/poll-selection.test.ts",
     "src/__tests__/providers/jira-fields.test.ts",
     "src/__tests__/providers/linear.test.ts"
   ]

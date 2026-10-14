@@ -36,7 +36,9 @@ function mapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     planningWorkflowFile: "", autoApprovePlans: true, extraEnv: {}, provider: "anthropic",
     ticketingProvider: "linear", ticketingConfig: { kind: "linear" }, awsRegion: null, paused: false,
     autoMerge: false, maxTurns: null, maxIterations: null, maxJobMinutes: null,
-    branchPrefix: null, skillsRepo: null,
+    branchPrefix: null, skillsRepo: null, referenceRepos: null,
+    sensitiveAddPatterns: null, sensitiveAllowPatterns: null, dependencyTokenScope: null,
+    reviewFixLifecycle: null, memoryProviderId: null, reviewers: null,
     ...overrides,
   };
 }
