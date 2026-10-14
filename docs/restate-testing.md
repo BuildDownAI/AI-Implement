@@ -12,7 +12,7 @@ A reference for the two test tiers that cover the Restate code under `src/restat
 | Engine present | No. The handler is called as a plain function | Yes. A real `restate-server` journals the call and delivers it over HTTP/2 to the in-process SDK endpoint |
 | What it proves | The branch logic, the error mapping, the wire shapes, the time boundaries | What the engine does with the handler: serialisation, retry, idempotency, suspension, discovery metadata, ingress serde |
 | Cost | Milliseconds per test | About a second per scenario, plus one server boot per variant per file (seconds) |
-| Type-check | `npm run typecheck` excludes `src/__tests__` | `npx tsc --noEmit --project tsconfig.restate-tests.json` (the `restate-tests-binary` CI job runs it, on pass 1) |
+| Type-check | `npm run typecheck` | `npm run typecheck` (covers `src/__tests__/restate/` through `tsconfig.tests.json`; the `unit-tests` CI job runs it) |
 | CI job | `unit-tests` in `.github/workflows/unit-tests.yml` | `restate-tests-binary` (the binary runtime, the one production runs; three passes as a three-job matrix since AII-1158, kept from AII-993 so a scenario that fails one run in three fails the PR that adds it) in the same workflow, in parallel with `unit-tests`, on every PR to `testing`, `main`, and the grouping branches |
 
 The default suite excludes `src/__tests__/restate/**` in `vitest.config.ts`, so a dispatched runner never starts a Restate server for them.
@@ -159,7 +159,7 @@ An issue that adds or changes Restate behaviour writes the unit tests first, the
 
 ```bash
 npm run test:restate
-npx tsc --noEmit --project tsconfig.restate-tests.json
+npm run typecheck
 ```
 
 The scenario runs set the Restate SDK log level to `WARN` (`vitest.restate.config.ts`, AII-1161), so the SDK's one-line-per-step `INFO` output stays out of the log. To see those lines for a local repro, run `RESTATE_LOGGING=INFO npm run test:restate`; the config accepts the SDK's five names (`TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`) in any case, keeps `WARN` for an empty value, and warns once and keeps `WARN` for an unknown name (`src/restate/log-level.ts`).
@@ -230,8 +230,7 @@ which AII-800's suite already covers precisely against a faster-to-assert fake.
 | Deployment drain (`register()`'s conflict/force-registration path) and the workflow/journal/idempotency retention configuration | Already proven elsewhere, not duplicated here | `endpoint.restate.test.ts` / `endpoint-registration.restate.test.ts` (drain); retention metadata assertion in `review-fix-attempt.restate.test.ts` (retention) |
 | Real Fly Machines/GitHub Actions runner container behavior under the pilot | **Not proven anywhere in this repo's test tree** | needs live evidence — this is the same class of gap the "real `restate-server` binary" row above already names for the engine itself |
 
-CI runs `npm run test:restate` against server 1.7.10 (the `restate-tests-binary` job); its pass/fail there — not this document — is the authoritative evidence for AII-813's "both variants and SDK boundary suite pass" acceptance criterion. This is binary-server evidence, not a live pilot rollout. `npx tsc --noEmit --project
-tsconfig.restate-tests.json` passes as of the commit that added this section.
+CI runs `npm run test:restate` against server 1.7.10 (the `restate-tests-binary` job); its pass/fail there — not this document — is the authoritative evidence for AII-813's "both variants and SDK boundary suite pass" acceptance criterion. This is binary-server evidence, not a live pilot rollout. `npm run typecheck` (which covers the Restate tests) passes as of the commit that added this section.
 
 ## `kg-refresh-pilot.restate.test.ts`: the switched kg-refresh path against production services (AII-896)
 

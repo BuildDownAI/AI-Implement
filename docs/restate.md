@@ -42,7 +42,7 @@ Every issue that adds or changes Restate behavior writes its tests in this order
 
 1. Unit tests first, in the default suite (`src/__tests__/<module>.test.ts`), for every pure part: parsers, formatters, state-table branches with the Restate client injected as a fake. They run with no Docker, inside every dispatched runner.
 2. Restate scenarios second, in `src/__tests__/restate/<module>.restate.test.ts`, built on `src/__tests__/restate/harness.ts`, run by `npm run test:restate` and the `restate-tests-binary` CI job, which runs in parallel with `unit-tests` (no `needs:`). Register exactly the services the scenario needs (`services: [...]`, passed to `startVariants`), one environment with `alwaysReplay: true` for the happy paths and one with `disableRetries: true` for the error paths. Each scenario asserts an observable effect, never a journal internal: a call count on a fake, a state read through a shared handler, a returned value. A Restate test never declares its own server, variants, or fetch helper — it imports them from the harness.
-3. Type-check the Restate file explicitly (a throwaway tsconfig); `typecheck` excludes `src/__tests__`.
+3. Type-check the Restate file with `npm run typecheck`, which covers `src/__tests__` through `tsconfig.tests.json`.
 
 An issue with no Restate surface says so in the same place ("unit tests only"), so the absence is a decision and not an omission. The AII-688 tree is the first set of issues that carries this rule.
 

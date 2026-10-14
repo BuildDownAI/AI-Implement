@@ -1,0 +1,59 @@
+{
+  // Type-checks every .ts file under src/, tests included, which tsconfig.json
+  // excludes. `npm run typecheck` runs this after the plain pass.
+  // The explicit "exclude" key is required: without one, `extends` inherits
+  // "src/__tests__" from tsconfig.json and no test file is checked.
+  // The test files listed in "exclude" fail the check today. They are named in
+  // AII-1357, AII-1358, AII-1359 and AII-1360 ("test types" 1-4), and each of
+  // those issues removes its files from this list. Do not add a file here that
+  // those four issues do not name.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/__tests__/dependency-token-vending.test.ts",
+    "src/__tests__/deploy-policy.test.ts",
+    "src/__tests__/destroy-recorded.test.ts",
+    "src/__tests__/entrypoint-shellcheck.test.ts",
+    "src/__tests__/feature-branch.test.ts",
+    "src/__tests__/filesystem-ticket-lifecycle.test.ts",
+    "src/__tests__/fly-machines.test.ts",
+    "src/__tests__/github-dispatch.test.ts",
+    "src/__tests__/image-equiv-check.test.ts",
+    "src/__tests__/install.test.ts",
+    "src/__tests__/jobs.test.ts",
+    "src/__tests__/kg-provider.test.ts",
+    "src/__tests__/kg-refresh-production.test.ts",
+    "src/__tests__/kg-refresh-rail.test.ts",
+    "src/__tests__/kg-refresh-run.test.ts",
+    "src/__tests__/kg-sidecar.test.ts",
+    "src/__tests__/late-external-review.test.ts",
+    "src/__tests__/mcp-identity.test.ts",
+    "src/__tests__/mcp.test.ts",
+    "src/__tests__/merge-up-multilevel.test.ts",
+    "src/__tests__/merge-up.test.ts",
+    "src/__tests__/poll-cycle-deadline.test.ts",
+    "src/__tests__/poll-selection.test.ts",
+    "src/__tests__/providers/filesystem.test.ts",
+    "src/__tests__/providers/jira-fields.test.ts",
+    "src/__tests__/providers/jira.test.ts",
+    "src/__tests__/providers/linear.test.ts",
+    "src/__tests__/providers/registry.test.ts",
+    "src/__tests__/providers/ticketing-config.test.ts",
+    "src/__tests__/reference-token-vending.test.ts",
+    "src/__tests__/repo-image.test.ts",
+    "src/__tests__/review-fix-production-delegation.test.ts",
+    "src/__tests__/run-config.test.ts",
+    "src/__tests__/run-planning.test.ts",
+    "src/__tests__/session-api.test.ts",
+    "src/__tests__/session-lib.test.ts",
+    "src/__tests__/workflow-probe.test.ts",
+    "src/__tests__/workflow-sync-queue.test.ts",
+    "src/__tests__/workflow-sync.test.ts"
+  ]
+}

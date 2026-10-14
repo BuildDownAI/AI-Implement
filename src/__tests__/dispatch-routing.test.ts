@@ -1484,7 +1484,6 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
   let dbPath: string;
   let dedup: typeof DedupModule;
   let admission: typeof import("../dispatch-admission.js");
-  let gate: typeof GateModule;
   let indexModule: typeof import("../index.js");
   let github: typeof import("../github.js");
   let restateStatus: typeof import("../restate/status.js");
@@ -1511,18 +1510,12 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
   });
   const activeRows = () =>
     (dedup.getDb().prepare("SELECT dispatch_id FROM dispatch_admissions WHERE released_at IS NULL").all() as { dispatch_id: string }[]);
-  const implementationAcquire = (id: string, issueId: string) =>
-    gate.acquireDispatch({
-      dispatchId: id, issueId, issueIdentifier: "X", kind: "implementation", teamKey: "AII",
-      maxInProgressAiIssues: 5, backend: "github-actions",
-    });
 
   beforeEach(async () => {
     vi.resetModules();
     dbPath = path.join(os.tmpdir(), `dispatch-pilot-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
     process.env.DEDUP_DB_PATH = dbPath;
     dedup = await import("../dedup.js");
-    gate = await import("../dispatch-gate.js");
     admission = await import("../dispatch-admission.js");
     (await import("../dispatch-breaker.js")).initDispatchBreakerTable();
     (await import("../log.js")).initLogTable();
