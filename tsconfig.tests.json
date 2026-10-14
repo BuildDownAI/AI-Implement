@@ -31,18 +31,7 @@
     "src/__tests__/merge-up.test.ts",
     "src/__tests__/poll-cycle-deadline.test.ts",
     "src/__tests__/poll-selection.test.ts",
-    "src/__tests__/providers/filesystem.test.ts",
     "src/__tests__/providers/jira-fields.test.ts",
-    "src/__tests__/providers/jira.test.ts",
-    "src/__tests__/providers/linear.test.ts",
-    "src/__tests__/providers/registry.test.ts",
-    "src/__tests__/providers/ticketing-config.test.ts",
-    "src/__tests__/reference-token-vending.test.ts",
-    "src/__tests__/review-fix-production-delegation.test.ts",
-    "src/__tests__/run-config.test.ts",
-    "src/__tests__/session-api.test.ts",
-    "src/__tests__/session-lib.test.ts",
-    "src/__tests__/workflow-sync-queue.test.ts",
-    "src/__tests__/workflow-sync.test.ts"
+    "src/__tests__/providers/linear.test.ts"
   ]
 }

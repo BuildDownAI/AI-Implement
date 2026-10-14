@@ -44,6 +44,19 @@ function makeMappingsFn(teamKey: string): () => Record<string, RepoMapping> {
     ticketingConfig: { kind: "linear" as const },
     awsRegion: null,
     paused: false,
+    autoMerge: false,
+    maxTurns: null,
+    maxIterations: null,
+    maxJobMinutes: null,
+    branchPrefix: null,
+    skillsRepo: null,
+    referenceRepos: null,
+    sensitiveAddPatterns: null,
+    sensitiveAllowPatterns: null,
+    dependencyTokenScope: null,
+    reviewFixLifecycle: null,
+    memoryProviderId: null,
+    reviewers: null,
   };
   return () => ({ [teamKey]: mapping });
 }
