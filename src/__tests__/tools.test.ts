@@ -499,6 +499,57 @@ describe("discoverTools", () => {
 });
 
 describe("callTool", () => {
+  beforeEach(() => setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } }));
+  afterEach(() => resetRestateStatus());
+
+  it("returns deploy-held without an ingress request even when Restate is not ready", async () => {
+    resetRestateStatus();
+    const fetchImpl = vi.fn() as unknown as typeof fetch;
+    const result = await callTool("get_widget", {}, HUMAN_USER, {
+      ingressBaseUrl: "http://ingress.example", fetchImpl,
+      permitsExternalCall: () => false,
+    });
+    expect(result).toEqual({ status: "deploy-held" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["sidecar starting", { sidecar: { state: "starting" } }],
+    ["sidecar timeout", { sidecar: { state: "timeout" } }],
+    ["sidecar exited", { sidecar: { state: "exited", code: 1, signal: null } }],
+    ["sidecar missing-binary", { sidecar: { state: "missing-binary" } }],
+    ["registration declined-conflict", { registration: { state: "declined-conflict" } }],
+    ["registration unreachable", { registration: { state: "unreachable" } }],
+    ["registration not-attempted", { registration: { state: "not-attempted" } }],
+  ] as const)("answers unavailable without an ingress request when %s (AII-1281)", async (_label, patch) => {
+    setRestateStatus(patch as Parameters<typeof setRestateStatus>[0]);
+    const fetchImpl = vi.fn() as unknown as typeof fetch;
+    const result = await callTool("get_widget", {}, HUMAN_USER, {
+      ingressBaseUrl: "http://ingress.example", fetchImpl,
+      permitsExternalCall: () => true,
+    });
+    expect(result).toEqual({ status: "unavailable" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("answers unavailable for callToolAsSystem when registration is declined", async () => {
+    setRestateStatus({ registration: { state: "declined-conflict" } });
+    const fetchImpl = vi.fn() as unknown as typeof fetch;
+    const result = await callToolAsSystem("get_widget", {}, { fetchImpl, permitsExternalCall: () => true });
+    expect(result).toEqual({ status: "unavailable" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("lets an injected restateReady override the status default", async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ content: [] }) })) as unknown as typeof fetch;
+    resetRestateStatus();
+    const result = await callTool("get_widget", {}, HUMAN_USER, {
+      ingressBaseUrl: "http://ingress.example", fetchImpl, restateReady: () => true,
+    });
+    expect(result.status).toBe("ok");
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
   it("returns deploy-held without an ingress request when drain admission closes", async () => {
     const fetchImpl = vi.fn() as unknown as typeof fetch;
     const result = await callTool("get_widget", {}, HUMAN_USER, {
@@ -599,6 +650,9 @@ describe("callTool", () => {
 });
 
 describe("callToolAsSystem", () => {
+  beforeEach(() => setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } }));
+  afterEach(() => resetRestateStatus());
+
   it("uses the same drain admission barrier", async () => {
     const fetchImpl = vi.fn() as unknown as typeof fetch;
     expect(await callToolAsSystem("get_tenant_health", {}, {

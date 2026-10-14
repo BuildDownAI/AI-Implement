@@ -74,7 +74,7 @@ import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings, getRunnerBackendSource, getFlySessionsConfig, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, getRetryPolicy, seedRunnerBackends, refreshRunnerBackendCache } from "./orchestrator-settings.js";
-import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
+import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, resubmitPendingGapFillReviews, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
 import { mintRunToken, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
@@ -158,6 +158,7 @@ import { callTool, callToolAsSystem } from "./restate/tools-client.js";
 import { makeKgRefresh, migrateLegacyDryRunOutcomes, runKgRefreshPreflight, defaultFetchDefaultBranch, defaultFetchSnapshotCommitSha, defaultMaterialize, defaultMcpToolCall, defaultPersistLastRefresh, defaultLoadLastRefresh } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
 import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
+import { scrubOperatorLegacyTokens } from "./restate/operator-legacy-scrub.js";
 
 /**
  * The reaper's helper callbacks. The KgRefresh workflow owns kg-refresh rows, so the
@@ -831,6 +832,13 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   // Monitor in-flight jobs and send completion notifications
   await monitorJobs(config, registry);
+
+  // AII-1304: retry LateExternalReview for gap-fill rows submitted while Restate was not ready.
+  try {
+    await resubmitPendingGapFillReviews({ ready: restateReady, submit: lateExternalReviewSubmitHook });
+  } catch (err) {
+    console.error("[poll] late-review sweep failed:", err);
+  }
 
   // Local mode: reap exited containers no in-flight job owns. A planning job
   // finalized by the runner callback goes terminal before the monitor's
@@ -2375,7 +2383,7 @@ export async function tryFastReleasePlanningAdmission(config: AppConfig, dispatc
   }
 }
 
-const TTL_STALE_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved"]);
+const TTL_STALE_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved", "external_review_pending"]);
 
 export async function monitorJobs(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const inFlightJobs = getInFlightJobs();
@@ -4052,12 +4060,13 @@ async function handleKgRefreshOutcome(
 const reviewFixAttemptStore = new SqliteReviewFixAttemptStore();
 const kgRefreshIngressClient = createKgRefreshIngressClient();
 // AII-1227: starts LateExternalReview only while the sidecar is ready and the endpoint registered.
+function restateReady(): boolean {
+  const restate = getRestateStatus();
+  return restate.sidecar.state === "ready" && restate.registration.state === "registered";
+}
 const submitLateExternalReview = createLateExternalReviewSubmitHook({
   ingress: createLateExternalReviewIngressClient(),
-  restateReady: () => {
-    const restate = getRestateStatus();
-    return restate.sidecar.state === "ready" && restate.registration.state === "registered";
-  },
+  restateReady,
 });
 // A repository-fix project's workflow follows the auto-fix to its new head (ADR 038); the mode rides the input.
 const lateExternalReviewSubmitHook: typeof submitLateExternalReview = (input) => {
@@ -5097,7 +5106,7 @@ async function main(): Promise<void> {
   console.log(`[restate] retention ${getRestateRetentionDays()} days`);
   // Fire-and-forget: the helper never throws, and boot must not wait on Fly.
   void applyVolumeSnapshotRetentionAtBoot(config.flyDeployToken, process.env.FLY_APP_NAME, getVolumeSnapshotRetentionDays);
-  const reviewFixServices = createProductionReviewFixServices(config, registry, reviewFixAttemptStore);
+  const reviewFixServices = createProductionReviewFixServices(config, registry, reviewFixAttemptStore, submitLateExternalReview);
   // The KgRepo object and KgRefresh workflow (AII-683). Skipped without KG_SOURCE_REPO: the
   // tool handlers then answer 501 from their unset deps.
   const kgSourceRepo = config.kgSourceRepo;
@@ -5170,6 +5179,7 @@ async function main(): Promise<void> {
     registerRestateEndpoint,
     onRegistered: async () => {
       sweepOnRegistered(config);
+      await scrubOperatorLegacyTokens();
       await seedRunnerBackends();
       await refreshRunnerBackendCache();
       await bootReconciliation.onRegistered();

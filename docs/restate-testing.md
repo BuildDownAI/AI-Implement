@@ -102,10 +102,11 @@ The last two scenarios are the ones the issue AII-713 was about. They cannot exi
 
 `operator-object.restate.test.ts` follows the same shape against the `Operator` Virtual Object and adds the properties a Virtual Object is for:
 
-- Two concurrent `refresh` calls presenting the same current hash both succeed with the identical new pair. Only an `exclusive` handler queue can prove this.
-- A presentation of the previous hash inside the grace window returns the same pair the rotation produced.
+- Two concurrent `refresh` calls presenting the same current hash both succeed with the same `ok` answer (the orchestrator derives the one new token outside Restate). Only an `exclusive` handler queue can prove this.
+- A presentation of the previous hash inside the grace window answers `ok` when its `nextHash` equals the rotated-in `currentHash`, and `unavailable` (nothing cleared) when it differs.
 - Unknown hash, expired family, `revoke`, sign-in after revoke, and `describe` each assert the state through a shared read, never a journal read.
-- One scenario runs the same sequence against both variants and asserts the two results are equal, which is the replay-determinism check for handlers that use `ctx.rand.uuidv4()` and `ctx.date.now()`.
+- One scenario runs the same sequence against both variants and asserts the two results are equal, which is the replay-determinism check for handlers that use `ctx.date.now()` (the `Operator` object no longer uses `ctx.rand`; the same scenario asserts the concurrent answer equals the rotation and carries no token).
+- One scenario seeds a legacy-shape family and legacy `refresh` invocations through a stand-in `Operator` registered with the pre-AII-1287 handlers, runs `scrubOperatorLegacyTokens` against the test server's admin API, and asserts `state`, `sys_invocation` and `sys_journal` hold no raw token and no completed legacy invocation, that the settings row is written (injected store), and that a second run is a no-op.
 
 The exact grace-window boundary is not here. A real server can only reach it with a 30 s wait, so `decideRefresh` was factored out as a pure function of state and time and is unit-tested in `src/__tests__/operator-object.test.ts` on both sides of the boundary.
 

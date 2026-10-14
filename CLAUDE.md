@@ -108,7 +108,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Runner callbacks and tokens | `src/runner-callback.ts`, `src/runner-token.ts`, `src/token-vending.ts` | [docs/runner-callbacks.md](docs/runner-callbacks.md) |
 | Merge reconciliation | `src/reconciliation.ts`, `src/reconcile-merged.ts`, `src/poll-merged-prs.ts` | |
 | Workflow sync to target repos | `src/workflow-sync.ts`, `src/workflow-sync-queue.ts` | [docs/workflow-sync.md](docs/workflow-sync.md) |
-| `/ai-implement` comment rail | `src/webhook.ts`, `src/comment-gapfill-drain.ts` | |
+| `/ai-implement` comment rail | `src/webhook.ts`, `src/comment-gapfill-drain.ts` | [docs/comment-gapfill-rail.md](docs/comment-gapfill-rail.md) |
 | Stuck-run recovery | `src/reaper.ts`, `src/stuck-watchdog.ts` | |
 | Per-team dispatch capacity | `src/poll-selection.ts` | |
 | Run classification and autopsy | `src/completion-classification.ts`, `src/run-autopsy.ts` | |
@@ -188,7 +188,7 @@ Fixing a bug: write the failing test first, then the fix, in one pull request �
 
 ## Data layer
 
-One SQLite file at `DEDUP_DB_PATH` (default `/data/dedup.sqlite`; `./dedup.sqlite` locally) holding 22 tables. `dedup.ts` owns the singleton — every other module imports `getDb` from it rather than opening its own handle.
+One SQLite file at `DEDUP_DB_PATH` (default `/data/dedup.sqlite`; `./dedup.sqlite` locally) holding 23 tables. `dedup.ts` owns the singleton — every other module imports `getDb` from it rather than opening its own handle.
 
 **Dedup has no TTL.** The `dispatched` table is a bare existence check with no retention logic: an entry clears only when something explicitly removes it — a failed or timed-out run, the reconcile loop reaching a terminal issue, or a manual delete. There is no time-based auto-retry. This is a recurring source of documentation errors claiming a 24-hour window; the only genuine 24-hour figure belongs to the reaper's summary statistic.
 
@@ -308,7 +308,7 @@ Labels: `AI-Implement` → `AI-Planning` → `Plan-Complete` → `AI-Working` �
 
 The cascade **self-advances** and self-heals: a child PR landing dirty is re-queued through the comment-gapfill rail (capped at 2 attempts), a parent with an open roll-up PR is held from dispatch, and siblings whose declared `Files:` overlap an in-flight sibling are deferred (failing open). Requires a publicly reachable runner callback, and the runner image channel paired to the orchestrator's.
 
-A child PR is auto-merged only when the project's Auto-merge setting is on and the runner has written an **approval mark** (`runner_approved` conclusion) on its run record; with the setting off, approved children are left for a person to merge. A PR with no run record (including human-opened PRs into a grouping branch) or a run that ended without approval is held — see §8 of `docs/feature-branch-grouping.md`.
+A child PR is auto-merged only when the project's Auto-merge setting is on and the run has an **approval mark** (`runner_approved` conclusion) on its run record — the result callback writes it for an initial run, while a gap-fill's mark comes from `LateExternalReview` (when Restate was not ready, the poll sweep submits it later); with the setting off, approved children are left for a person to merge. A PR with no run record (including human-opened PRs into a grouping branch) or a run that ended without approval is held — see §8 of `docs/feature-branch-grouping.md`.
 
 **Full reference: [docs/feature-branch-grouping.md](docs/feature-branch-grouping.md).**
 

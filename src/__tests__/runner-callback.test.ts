@@ -1313,6 +1313,82 @@ describe("handleRunnerResult — implementation", () => {
     });
   });
 
+  describe("resubmitPendingGapFillReviews (AII-1304)", () => {
+    const NOW = Date.UTC(2026, 0, 10, 12);
+    const HOUR = 3600_000;
+    function pendingRow(id: string, over: { phase?: string; prUrl?: string | null; agoMs?: number } = {}) {
+      const dispatchId = `d-${id}`;
+      const rowId = log.appendLog({
+        issueId: id, issueIdentifier: "ENG-9", teamKey: "ENG", repo: "o/r", dispatchId,
+        executionMode: "github-actions", phase: over.phase ?? "gap-analysis",
+      });
+      log.updateJobStatus(rowId, "completed", "external_review_pending", over.prUrl === undefined ? "https://github.com/o/r/pull/7" : over.prUrl);
+      return { rowId, dispatchId };
+    }
+    async function setCompleted(rowId: number, at: number) {
+      const { getDb } = await import("../dedup.js");
+      getDb().prepare("UPDATE dispatch_log SET completed_at = ? WHERE id = ?").run(at, rowId);
+    }
+
+    it("a not-ready callback leaves the row pending; the next ready tick submits once, a second submits nothing", async () => {
+      const { rowId, dispatchId } = pendingRow("i-sweep");
+      await setCompleted(rowId, NOW - HOUR);
+      const submit = vi.fn(async () => {});
+      expect(await runnerCallback.resubmitPendingGapFillReviews({ ready: () => false, submit, now: NOW })).toBe(0);
+      expect(submit).not.toHaveBeenCalled();
+      expect(log.getJobById(rowId)?.conclusion).toBe("external_review_pending");
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
+      expect(submit).toHaveBeenCalledTimes(1);
+      expect(submit).toHaveBeenCalledWith({
+        dispatchId, owner: "o", repo: "r", prNumber: 7, prUrl: "https://github.com/o/r/pull/7", gapFill: true,
+      });
+      // Idempotent through the workflow key: the real hook answers `conflict` and the row is unchanged.
+    });
+
+    it("re-submits a pending review-fix attempt with its attemptId once, then clears it (AII-1307)", async () => {
+      log.recordPendingAttemptReview("att-1", "d-att", "https://github.com/o/r/pull/7", NOW - HOUR);
+      const submit = vi.fn(async () => {});
+      expect(await runnerCallback.resubmitPendingGapFillReviews({ ready: () => false, submit, now: NOW })).toBe(0);
+      expect(submit).not.toHaveBeenCalled();
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
+      expect(submit).toHaveBeenCalledWith({
+        dispatchId: "d-att", owner: "o", repo: "r", prNumber: 7, prUrl: "https://github.com/o/r/pull/7", gapFill: true, attemptId: "att-1",
+      });
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
+      expect(submit).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps a pending review-fix attempt when the hook reports the submit did not settle (AII-1307)", async () => {
+      log.recordPendingAttemptReview("att-2", "d-att2", "https://github.com/o/r/pull/7", NOW - HOUR);
+      const submit = vi.fn(async () => false);
+      expect(await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW })).toBe(0);
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
+      expect(submit).toHaveBeenCalledTimes(2);
+    });
+
+    it("respects the 24 h window", async () => {
+      const old = pendingRow("i-old");
+      const fresh = pendingRow("i-fresh");
+      await setCompleted(old.rowId, NOW - 25 * HOUR);
+      await setCompleted(fresh.rowId, NOW - 23 * HOUR);
+      const submit = vi.fn(async () => {});
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
+      expect(submit).toHaveBeenCalledTimes(1);
+      expect(submit).toHaveBeenCalledWith(expect.objectContaining({ dispatchId: fresh.dispatchId }));
+    });
+
+    it("skips approved, non-gap-fill, and PR-less rows", async () => {
+      const approved = pendingRow("i-appr");
+      log.stampJobApproved(approved.rowId, "https://github.com/o/r/pull/7");
+      const impl = pendingRow("i-impl", { phase: "implementation" });
+      const noPr = pendingRow("i-nopr", { prUrl: null });
+      for (const r of [approved, impl, noPr]) await setCompleted(r.rowId, NOW - HOUR);
+      const submit = vi.fn(async () => {});
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
+      expect(submit).not.toHaveBeenCalled();
+    });
+  });
+
   it("does NOT write runner_approved on INSTALL_FAILED coded failure", async () => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i-install-failed",
@@ -2316,7 +2392,57 @@ describe("handleRunnerResult — gap-analysis", () => {
     ]);
   });
 
-  it("stamps runner_approved conclusion when conflict-resolution gap-analysis succeeds (no snapshot)", async () => {
+  it("writes no approval mark on gap-analysis success and submits LateExternalReview with the row's PR (AII-1291)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i", mappingTeamKey: "ENG", phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", issueIdentifier: "ENG-7", repo: "org/repo", dispatchId });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+    const hook = vi.fn(async () => {});
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "gap-analysis", outcome: "success", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+      submitLateExternalReview: hook as never,
+    });
+
+    expect(res.status).toBe(200);
+    const job = log.getJobByDispatchId(dispatchId);
+    expect(job?.status).toBe("completed");
+    expect(job?.conclusion).toBe("external_review_pending");
+    expect(job?.approved).toBe(false);
+    expect(log.getRunRecordMergeVerdict("ENG-7", "https://github.com/org/repo/pull/12")).toBe("hold");
+    expect(hook).toHaveBeenCalledTimes(1);
+    expect(hook).toHaveBeenCalledWith({
+      dispatchId, owner: "org", repo: "repo", prNumber: 12, prUrl: "https://github.com/org/repo/pull/12", gapFill: true,
+    });
+  });
+
+  it("still returns 200 and writes no mark when the LateExternalReview submit throws or is absent (AII-1291)", async () => {
+    for (const hook of [vi.fn(async () => { throw new Error("boom"); }), undefined]) {
+      const id = `i-gap-nohook-${hook ? "throw" : "absent"}`;
+      const { token, dispatchId } = runnerTokens.mintRunToken({
+        issueId: id, mappingTeamKey: "ENG", phase: "gap-analysis",
+        ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+      });
+      const jobId = log.appendLog({ issueId: id, repo: "org/repo", dispatchId });
+      log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+      const res = await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: { phase: "gap-analysis", outcome: "success", comments: [] },
+        secret: SECRET,
+        resolveProvider: makeResolve(new FakeProvider()),
+        ...(hook ? { submitLateExternalReview: hook as never } : {}),
+      });
+      expect(res.status).toBe(200);
+      expect(log.getJobByDispatchId(dispatchId)?.approved).toBe(false);
+    }
+  });
+
+  it("leaves conflict-resolution gap-analysis awaiting the external review (no snapshot)", async () => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i",
       mappingTeamKey: "ENG",
@@ -2337,8 +2463,8 @@ describe("handleRunnerResult — gap-analysis", () => {
     expect(res.status).toBe(200);
     const job = log.getJobByDispatchId(dispatchId);
     expect(job?.status).toBe("completed");
-    expect(job?.conclusion).toBe("runner_approved");
-    expect(job?.approved).toBe(true);
+    expect(job?.conclusion).toBe("external_review_pending");
+    expect(job?.approved).toBe(false);
   });
 
   it("warns when no job row exists for an approved gap-analysis result (AII-572)", async () => {
@@ -2360,7 +2486,7 @@ describe("handleRunnerResult — gap-analysis", () => {
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("no job row"));
   });
 
-  it("stamps runner_approved when review-fix gap-analysis succeeds (snapshot branch)", async () => {
+  it("resolves findings and leaves the mark to LateExternalReview when review-fix gap-analysis succeeds (snapshot branch)", async () => {
     reviewStore.upsertReviewFinding({
       repo: "org/repo",
       prNumber: 12,
@@ -2397,9 +2523,10 @@ describe("handleRunnerResult — gap-analysis", () => {
     });
 
     expect(res.status).toBe(200);
-    // Gap-fill's own post-push review approved the PR, so the approval mark is re-stamped (AII-460).
+    // AII-1291: the mark waits for the external review of the pushed head.
     const job = log.getJobByDispatchId(dispatchId);
-    expect(job?.conclusion).toBe("runner_approved");
+    expect(job?.conclusion).toBe("external_review_pending");
+    expect(job?.approved).toBe(false);
     // Findings scoped to the snapshot must still be resolved.
     expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toEqual([]);
   });
@@ -2467,10 +2594,10 @@ describe("handleRunnerResult — gap-analysis", () => {
     // Queue row must be terminalized so hasPendingConflictResolution returns false
     // and auto-merge can proceed (regression: stampJobApproved alone skipped this side effect).
     expect(commentGapfillQueue.hasPendingConflictResolution("org", "repo", 12)).toBe(false);
-    // Approval mark must still be stamped.
+    // AII-1291: the mark waits for LateExternalReview.
     const job = log.getJobByDispatchId(dispatchId);
-    expect(job?.conclusion).toBe("runner_approved");
-    expect(job?.approved).toBe(true);
+    expect(job?.conclusion).toBe("external_review_pending");
+    expect(job?.approved).toBe(false);
   });
 
   it("persists a failure record but never stamps failureCommentedAt — the callback doesn't comment for gap-analysis, so the monitor backstop must still fire (BAC-27112 follow-up)", async () => {

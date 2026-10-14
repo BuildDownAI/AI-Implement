@@ -1009,7 +1009,7 @@ describe("handleMcpRequest", () => {
       const fetchImpl = vi.fn(fetchResult);
       (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mockImplementationOnce(
         (name: string, args: Record<string, unknown>, caller: Caller) =>
-          realCallTool(name, args, caller, { fetchImpl: fetchImpl as unknown as typeof fetch, permitsExternalCall: () => true }),
+          realCallTool(name, args, caller, { fetchImpl: fetchImpl as unknown as typeof fetch, permitsExternalCall: () => true, restateReady: () => true }),
       );
       const result = await callMcp(
         { authorization: "Bearer tok" },

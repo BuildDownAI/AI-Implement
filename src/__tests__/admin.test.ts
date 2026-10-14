@@ -4213,7 +4213,7 @@ describe("POST /api/tools/<name>", () => {
     const fetchImpl = vi.fn(fetchResult);
     const token = await login("secret");
     const res = await toolRequest(token, { args: {} }, {
-      callTool: (name, args, caller) => callTool(name, args, caller, { fetchImpl: fetchImpl as unknown as typeof fetch, permitsExternalCall: () => true }),
+      callTool: (name, args, caller) => callTool(name, args, caller, { fetchImpl: fetchImpl as unknown as typeof fetch, permitsExternalCall: () => true, restateReady: () => true }),
     });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(res.statusCode).toBe(503);

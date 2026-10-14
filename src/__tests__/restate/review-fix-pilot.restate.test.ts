@@ -37,6 +37,7 @@ import { upsertReviewFinding } from "../../review-ledger-store.js";
 import { acceptReviewFixWebhookEvent, enqueueReviewFix, updateReviewFixStatus } from "../../review-fix-queue.js";
 import { REVIEW_PROCESSES, resolveReviewProcess } from "../../review-process.js";
 import { loadPendingReviewFixFeedback } from "../../review-fix-pending.js";
+import { createProductionFinalizer } from "../../restate/review-fix-production.js";
 import { createReviewFixFinalizer } from "../../review-fix-finalize.js";
 import type { ReviewFixGitHubAdapter } from "../../review-fix-finalize.js";
 import { createReviewFixGithubAdapter } from "../../review-fix-github-adapter.js";
@@ -348,28 +349,8 @@ const worker = new GithubReviewFixWorker({
 });
 
 const baseFinalizer = createReviewFixFinalizer({ attemptStore: sqliteStore, github });
-// Mirrors review-fix-production.ts's own applyApproval wrapper verbatim: re-check evidence,
-// then apply. A crash window after the GitHub write is the journaled step's retry plus the
-// adapter's upsert, not a second ledger.
-const finalizer = {
-  recordOutcome: baseFinalizer.recordOutcome,
-  applyApproval: async (input: Parameters<typeof baseFinalizer.applyApproval>[0]) => {
-    const accepted = await sqliteStore.getAcceptedResult(input.attemptId);
-    const outcome = await sqliteStore.getRecordedOutcome(input.attemptId);
-    if (!accepted?.result || accepted.hasConflict || outcome?.terminal.status !== "succeeded"
-      || JSON.stringify(accepted.result) !== JSON.stringify(input.result)
-      || !await sqliteStore.hasCurrentAuthority(input.attemptId)) {
-      return { status: "withheld" as const, reason: "current attempt authority or accepted result changed" };
-    }
-    const head = await github.getPrHeadSha(input.scope) ?? "";
-    if (head !== input.result.outputCommit || !input.policyAllows
-      || !await github.evaluateMergePolicy(input.scope, input.findingDispositions)) {
-      return { status: "withheld" as const, reason: "current PR head or merge policy changed" };
-    }
-    const current = { ...input, currentAuthority: true, currentPrHeadSha: head };
-    return baseFinalizer.applyApproval(current);
-  },
-};
+// The production wrapper itself (review-fix-production.ts), with no late-review submit wired.
+const finalizer = createProductionFinalizer({ store: sqliteStore, github, baseFinalizer });
 
 const alerts: Array<{ attemptId: string; reason: string }> = [];
 

@@ -24,6 +24,8 @@ import type { ProviderRegistry } from "../providers/registry.js";
 import { createReviewFixAttempt } from "./review-fix-attempt.js";
 import { createReviewFixPR } from "./review-fix-pr.js";
 import type { RestateService } from "./endpoint.js";
+import type { LateExternalReviewInput } from "./late-external-review.js";
+import { clearPendingAttemptReview, getLatestWorkRowForPr, recordPendingAttemptReview } from "../log.js";
 
 export interface ReviewFixProductionConfig {
   githubAppId: string;
@@ -87,29 +89,53 @@ function dispositionsFor(attempt: PreparedReviewFixAttempt, result: ReviewFixRes
   return [...latest.values()];
 }
 
-export function createProductionReviewFixServices(
-  config: ReviewFixProductionConfig,
-  registry: ProviderRegistry,
-  store = new SqliteReviewFixAttemptStore(),
-): RestateService[] {
-  const credentials = createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey);
-  const github = createReviewFixGithubAdapter({ credentials });
-  const worker = new GithubReviewFixWorker({ credentials, scopeStore: reviewFixAttemptStoreScopeStore(store),
-    runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
-    runnerImage: (target) => resolveRunnerImageForDispatch({ ...target,
-      defaultImage: config.sessionImage, runnerImageExplicit: config.runnerImageExplicit }),
-    callbackInputs: async (attemptId) => {
-      if (!config.runnerTokenSecret || !config.runnerCallbackBaseUrl) throw new Error("pilot callbacks unavailable");
-      return {
-        run_token: mintPreparedReviewFixToken({ attemptId, audience: "result", secret: config.runnerTokenSecret }).token,
-        run_progress_token: mintPreparedReviewFixToken({ attemptId, audience: "progress", secret: config.runnerTokenSecret }).token,
-        run_publication_token: mintPreparedReviewFixToken({ attemptId, audience: "publication", secret: config.runnerTokenSecret }).token,
-        runner_callback_url: config.runnerCallbackBaseUrl,
-      };
-    },
-  });
-  const baseFinalizer = createReviewFixFinalizer({ attemptStore: store, github });
-  const finalizer: typeof baseFinalizer = {
+/**
+ * After a review-fix attempt's approval effect applied (AII-1307), asks `LateExternalReview` to review the
+ * pushed head and write the PR's mark. The mark is never stamped here. Never throws: this runs inside the
+ * journaled `apply-approval-once` step, and a retry would re-run the approval effect.
+ */
+export async function submitLateReviewForAttempt(
+  scope: ScopedPrIdentity,
+  attemptId: string,
+  submit: ((input: LateExternalReviewInput) => Promise<boolean | void>) | undefined,
+): Promise<void> {
+  if (!submit) return;
+  try {
+    const [owner, repo] = scope.repository.split("/");
+    const prUrl = `https://github.com/${scope.repository}/pull/${scope.prNumber}`;
+    const row = getLatestWorkRowForPr(prUrl);
+    if (!row?.dispatchId) {
+      console.log(`[review-fix] No run row with a dispatch id for ${prUrl}, not submitting late external review (attempt ${attemptId})`);
+      return;
+    }
+    // A row still dispatched/running belongs to a run that writes its own outcome; stamping it from here could mark an
+    // unreviewed run (its status can turn terminal-unapproved while the workflow waits). A settled row cannot change.
+    if (row.inFlight) {
+      console.log(`[review-fix] Run ${row.dispatchId} for ${prUrl} is still in flight, not submitting late external review (attempt ${attemptId})`);
+      return;
+    }
+    // Held for the poll sweep (resubmitPendingGapFillReviews) in case Restate is not ready and the hook only logs.
+    recordPendingAttemptReview(attemptId, row.dispatchId, prUrl);
+    const settled = await submit({ dispatchId: row.dispatchId, owner, repo, prNumber: scope.prNumber, prUrl, gapFill: true, attemptId });
+    // Accepted or already running: the workflow key is the idempotency, so the retry record is spent.
+    if (settled !== false) clearPendingAttemptReview(attemptId);
+  } catch (err) {
+    console.log(`[review-fix] Late external review submit failed for attempt ${attemptId}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+type ReviewFixFinalizer = ReturnType<typeof createReviewFixFinalizer>;
+
+/** The finalizer the attempt workflow runs: re-checks authority, head and policy, applies the approval,
+ * then (AII-1307) asks `LateExternalReview` to write the mark once the effect applied. */
+export function createProductionFinalizer(deps: {
+  store: Pick<SqliteReviewFixAttemptStore, "getAcceptedResult" | "getRecordedOutcome" | "hasCurrentAuthority">;
+  github: Pick<ReturnType<typeof createReviewFixGithubAdapter>, "getPrHeadSha" | "evaluateMergePolicy">;
+  baseFinalizer: ReviewFixFinalizer;
+  submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<boolean | void>;
+}): ReviewFixFinalizer {
+  const { store, github, baseFinalizer, submitLateExternalReview } = deps;
+  return {
     recordOutcome: baseFinalizer.recordOutcome,
     applyApproval: async (input) => {
       // The result handler may record a conflict after the workflow's earlier
@@ -128,9 +154,37 @@ export function createProductionReviewFixServices(
         return { status: "withheld", reason: "current PR head or merge policy changed" };
       }
       const current = { ...input, currentAuthority: true, currentPrHeadSha: head };
-      return baseFinalizer.applyApproval(current);
+      const applied = await baseFinalizer.applyApproval(current);
+      if (applied.status === "applied") await submitLateReviewForAttempt(input.scope, input.attemptId, submitLateExternalReview);
+      return applied;
     },
   };
+}
+
+export function createProductionReviewFixServices(
+  config: ReviewFixProductionConfig,
+  registry: ProviderRegistry,
+  store = new SqliteReviewFixAttemptStore(),
+  submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<boolean | void>,
+): RestateService[] {
+  const credentials = createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey);
+  const github = createReviewFixGithubAdapter({ credentials });
+  const worker = new GithubReviewFixWorker({ credentials, scopeStore: reviewFixAttemptStoreScopeStore(store),
+    runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
+    runnerImage: (target) => resolveRunnerImageForDispatch({ ...target,
+      defaultImage: config.sessionImage, runnerImageExplicit: config.runnerImageExplicit }),
+    callbackInputs: async (attemptId) => {
+      if (!config.runnerTokenSecret || !config.runnerCallbackBaseUrl) throw new Error("pilot callbacks unavailable");
+      return {
+        run_token: mintPreparedReviewFixToken({ attemptId, audience: "result", secret: config.runnerTokenSecret }).token,
+        run_progress_token: mintPreparedReviewFixToken({ attemptId, audience: "progress", secret: config.runnerTokenSecret }).token,
+        run_publication_token: mintPreparedReviewFixToken({ attemptId, audience: "publication", secret: config.runnerTokenSecret }).token,
+        runner_callback_url: config.runnerCallbackBaseUrl,
+      };
+    },
+  });
+  const baseFinalizer = createReviewFixFinalizer({ attemptStore: store, github });
+  const finalizer = createProductionFinalizer({ store, github, baseFinalizer, submitLateExternalReview });
   const pr = createReviewFixPR({
     recordFeedback: async (event) => acceptReviewFixWebhookEvent(event),
     attempts: {

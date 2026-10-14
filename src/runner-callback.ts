@@ -7,6 +7,9 @@ import {
   updateJobPrUrl,
   updateJobStatus,
   type Job,
+  getGapFillRowsAwaitingLateReview,
+  getPendingAttemptReviews,
+  clearPendingAttemptReview,
 } from "./log.js";
 import { redactStepCredentials } from "./pipeline/step-redaction.js";
 import type { Step } from "./pipeline/types.js";
@@ -208,7 +211,7 @@ export interface HandleRunnerResultInput {
    * result that ended `external_review_pending`. The hook itself decides whether Restate is ready;
    * an error it throws is logged and does not change the response.
    */
-  submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<void>;
+  submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<boolean | void>;
 }
 
 export interface HandleRunnerResultOutput {
@@ -1120,9 +1123,23 @@ export async function handleRunnerResult(
       }
       // updateJobStatus first: triggers markCommentGapfillRunTerminal for trigger='comment'
       // jobs (AII-277 livelock) and resets machine_nonce on terminal transition.
-      // stampJobApproved then sets approved=1 durably (updateJobStatus never touches that column).
-      updateJobStatus(job.id, "completed", "runner_approved", job.prUrl!);
-      stampJobApproved(job.id, job.prUrl!);
+      // AII-1291: no approval mark here. The gap-fill pushed a head the external review has not
+      // judged yet; LateExternalReview writes the mark once that review passes on the head.
+      // Without Restate no mark is written and the PR is held until the poll sweep resubmits (an initial-run success stamps the mark in the callback).
+      updateJobStatus(job.id, "completed", "external_review_pending", job.prUrl!);
+      const target = parsePrUrlTarget(job.prUrl!);
+      if (input.submitLateExternalReview && target) {
+        try {
+          await input.submitLateExternalReview({
+            dispatchId: claims.dispatchId,
+            ...target,
+            prUrl: job.prUrl!,
+            gapFill: true,
+          });
+        } catch (err) {
+          warn("submitLateExternalReview", err);
+        }
+      }
     } else if (!job) {
       console.warn(`[runner-callback] no job row for dispatch=${claims.dispatchId} — gap-analysis approval mark not written`);
     }
@@ -1572,4 +1589,47 @@ export async function handleRunnerPlanningContext(
     );
     return { status: 200, body: { planningContext: "" } };
   }
+}
+
+const LATE_REVIEW_RESUBMIT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * AII-1304: a gap-fill success submits LateExternalReview once; when Restate was not ready the
+ * row stays `external_review_pending`. Each poll tick with Restate ready re-submits those rows
+ * (completed within 24 h). The workflow key is the dispatch id, so a repeat submit is a no-op.
+ */
+export async function resubmitPendingGapFillReviews(opts: {
+  ready: () => boolean;
+  submit: (input: { dispatchId: string; owner: string; repo: string; prNumber: number; prUrl: string; gapFill: true; attemptId?: string }) => Promise<boolean | void> | boolean | void;
+  now?: number;
+}): Promise<number> {
+  if (!opts.ready()) return 0;
+  let submitted = 0;
+  for (const job of getGapFillRowsAwaitingLateReview((opts.now ?? Date.now()) - LATE_REVIEW_RESUBMIT_WINDOW_MS)) {
+    const target = parsePrUrlTarget(job.prUrl!);
+    if (!target) continue;
+    console.log(`[late-review-sweep] re-submitting LateExternalReview dispatch=${job.dispatchId} pr=${job.prUrl}`);
+    try {
+      await opts.submit({ dispatchId: job.dispatchId!, ...target, prUrl: job.prUrl!, gapFill: true });
+      submitted++;
+    } catch (err) {
+      console.warn(`[late-review-sweep] submit failed dispatch=${job.dispatchId}:`, err);
+    }
+  }
+  // AII-1307: a succeeded review-fix attempt's submit, keyed `<dispatchId>-<attemptId>`; cleared once accepted.
+  for (const pending of getPendingAttemptReviews((opts.now ?? Date.now()) - LATE_REVIEW_RESUBMIT_WINDOW_MS)) {
+    const target = parsePrUrlTarget(pending.prUrl);
+    if (!target) continue;
+    console.log(`[late-review-sweep] re-submitting LateExternalReview dispatch=${pending.dispatchId} attempt=${pending.attemptId} pr=${pending.prUrl}`);
+    try {
+      const settled = await opts.submit({ dispatchId: pending.dispatchId, ...target, prUrl: pending.prUrl, gapFill: true, attemptId: pending.attemptId });
+      // `false` = the hook could not reach Restate; keep the record for the next tick.
+      if (settled === false) continue;
+      clearPendingAttemptReview(pending.attemptId);
+      submitted++;
+    } catch (err) {
+      console.warn(`[late-review-sweep] submit failed dispatch=${pending.dispatchId} attempt=${pending.attemptId}:`, err);
+    }
+  }
+  return submitted;
 }

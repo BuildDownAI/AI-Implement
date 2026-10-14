@@ -578,26 +578,50 @@ export async function postPrComment(
   }
 }
 
+/** A PR/issue comment. Author and timestamps are optional: callers that only need `id`/`body` ignore them. */
+export interface PrComment {
+  id: number;
+  body: string;
+  user?: { login: string; type?: string };
+  htmlUrl?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 /**
  * Lists all comments on a PR/issue (unified GitHub comment API), paginated to
  * completion via the response's `Link: rel="next"` header — a PR with more than
  * 100 comments before the sticky one must still be found, or `postOrUpdateStickyComment`
  * duplicates it instead of updating it in place. Used to find a previously-posted
- * sticky comment to update in place.
+ * sticky comment to update in place. By default a non-OK page ends the walk and returns
+ * what was read so far; pass `{ strict: true }` when the caller must not mistake an
+ * unreadable page for an empty list (the call then throws so the step can retry).
  */
 export async function listPrComments(
   token: string,
   owner: string,
   repo: string,
   prNumber: number,
-): Promise<Array<{ id: number; body: string }>> {
-  const comments: Array<{ id: number; body: string }> = [];
+  options: { strict?: boolean } = {},
+): Promise<PrComment[]> {
+  const comments: PrComment[] = [];
   let url: string | null = `https://api.github.com/repos/${owner}/${repo}/issues/${prNumber}/comments?per_page=100`;
   while (url) {
     const res: Response = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
-    if (!res.ok) break;
-    const data = (await res.json()) as Array<{ id: number; body?: string }>;
-    comments.push(...data.map((c) => ({ id: c.id, body: c.body ?? "" })));
+    // Strict readers must not mistake an unreadable list for an empty one: throw so the caller retries.
+    if (!res.ok) {
+      if (options.strict) throw new Error(`listPrComments: ${owner}/${repo}#${prNumber} comments unreadable (HTTP ${res.status})`);
+      break;
+    }
+    const data = (await res.json()) as Array<{ id: number; body?: string; user?: { login?: string; type?: string } | null; html_url?: string; created_at?: string; updated_at?: string }>;
+    comments.push(...data.map((c) => ({
+      id: c.id,
+      body: c.body ?? "",
+      ...(c.user?.login ? { user: { login: c.user.login, ...(c.user.type ? { type: c.user.type } : {}) } } : {}),
+      ...(c.html_url ? { htmlUrl: c.html_url } : {}),
+      ...(c.created_at ? { createdAt: c.created_at } : {}),
+      ...(c.updated_at ? { updatedAt: c.updated_at } : {}),
+    })));
     url = parseLinkNext(res.headers.get("link"));
   }
   return comments;
@@ -704,6 +728,32 @@ export async function listPullRequestFiles(
     url = parseLinkNext(res.headers.get("link"));
   }
   return files;
+}
+
+/**
+ * SHAs of the commits on a PR, oldest first (the head is last). Follows `Link: rel="next"`;
+ * GitHub caps the list at 250 commits. Throws on a non-OK response so a caller never reads
+ * a failed call as "no commits".
+ */
+export async function listPullRequestCommits(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+): Promise<string[]> {
+  const shas: string[] = [];
+  let url: string | null = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/commits?per_page=100`;
+  while (url) {
+    const res: Response = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`listPullRequestCommits failed: HTTP ${res.status}: ${text}`);
+    }
+    const data = (await res.json()) as Array<{ sha?: string }>;
+    shas.push(...data.map((c) => c.sha).filter((c): c is string => typeof c === "string"));
+    url = parseLinkNext(res.headers.get("link"));
+  }
+  return shas;
 }
 
 /**
@@ -1490,4 +1540,17 @@ export async function compareCommits(
   if (!res.ok) return null;
   const data = (await res.json()) as { behind_by?: unknown };
   return { behindBy: typeof data.behind_by === "number" ? data.behind_by : 0 };
+}
+
+/**
+ * A file's text from the repository's default branch (no `ref`), or `null` when it does not exist.
+ * Any other failure throws, so a caller inside a retried step never reads "no file" from an outage.
+ */
+export async function getDefaultBranchFileText(token: string, owner: string, repo: string, path: string): Promise<string | null> {
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}`, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`getDefaultBranchFileText ${path} failed: HTTP ${res.status}`);
+  const body = (await res.json()) as { content?: string; encoding?: string; type?: string };
+  if (body.type !== "file" || body.encoding !== "base64" || typeof body.content !== "string") return null;
+  return Buffer.from(body.content, "base64").toString("utf8");
 }
