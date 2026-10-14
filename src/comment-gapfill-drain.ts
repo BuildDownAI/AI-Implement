@@ -14,7 +14,7 @@ import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getInFligh
 import { resolveExecutionPath, getFlySecretsMinVersion, getFlyProcessLevelSecrets, type RunnerMode } from "./runner-mode.js";
 import { mintRunToken, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { buildEnvelopeDispatchInputs, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, capRunnerEnv, branchPrefixRunnerEnv, skillsRepoRunnerEnv, getPullRequestState, type DispatchResult } from "./github.js";
-import { encodeRunConfig, type RunConfigV1 } from "./run-config.js";
+import { buildRunConfig, encodeRunConfig } from "./run-config.js";
 import { getRetryPolicy } from "./orchestrator-settings.js";
 import { createMachine, listAppSecrets, generateSessionToken, generateMachineNonce, buildSessionMachineConfig } from "./fly-machines.js";
 import { resolveSessionImage } from "./repo-image.js";
@@ -475,31 +475,20 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           const sessionToken = generateSessionToken();
           machineNonce = generateMachineNonce();
 
-          const gapFillRunConfig: RunConfigV1 = {
-            v: 1,
+          const gapFillRunConfig = buildRunConfig({
+            runnerPhase: "gap-analysis",
             issue: {
               id: prLog.issueId,
               identifier: prLog.issueIdentifier ?? prLog.issueId,
               title: prLog.issueTitle ?? prLog.issueId,
               description: prLog.issueTitle ?? prLog.issueId,
             },
-            runnerPhase: "gap-analysis",
+            mapping,
+            runnerCallbackUrl: runnerCallbackUrl || undefined,
             prNumber: String(item.prNumber),
-            ...(mapping.branchPrefix ? { branchPrefix: mapping.branchPrefix } : {}),
-            ...(mapping.skillsRepo ? { skillsRepo: mapping.skillsRepo } : {}),
-            ...(mapping.referenceRepos != null ? { referenceRepos: mapping.referenceRepos } : {}),
-            ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
-            ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
-            ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
-            ...(mapping.sensitiveAddPatterns != null || mapping.sensitiveAllowPatterns != null
-              ? { sensitiveFiles: { add: mapping.sensitiveAddPatterns ?? undefined, allow: mapping.sensitiveAllowPatterns ?? undefined } }
-              : {}),
-            ...(mapping.reviewers != null ? { reviewers: mapping.reviewers } : {}),
-            ...(mapping.reviewProcess != null ? { reviewProcess: mapping.reviewProcess } : {}),
-            ...(mapping.trustedReviewAuthors != null ? { trustedReviewAuthors: mapping.trustedReviewAuthors } : {}),
-            ...(item.instruction ? { commentInstruction: item.instruction } : {}),
+            commentInstruction: item.instruction || undefined,
             retryPolicy: getRetryPolicy(),
-          };
+          });
 
           machineConfig = buildSessionMachineConfig({
             image: resolvedImage,

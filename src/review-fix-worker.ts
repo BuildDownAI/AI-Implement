@@ -73,7 +73,8 @@ import {
   type DispatchInputs,
   type DispatchResult,
 } from "./github.js";
-import { encodeRunConfig, type RunConfigV1 } from "./run-config.js";
+import { buildRunConfig, encodeRunConfig } from "./run-config.js";
+import type { RetryPolicy } from "./pipeline/retry-backoff.js";
 import { getMappings, type RepoMapping } from "./config.js";
 import type {
   AttemptId,
@@ -288,10 +289,10 @@ function matchesAttemptMarker(displayTitle: string, attemptId: AttemptId): boole
   return displayTitle.endsWith(` · attempt ${attemptId}`);
 }
 
-function buildLaunchInputs(plan: WorkerLaunchPlan, mapping: RepoMapping, runnerCallbackUrl?: string): DispatchInputs {
+function buildLaunchInputs(plan: WorkerLaunchPlan, mapping: RepoMapping, runnerCallbackUrl?: string, retryPolicy: RetryPolicy | null = null): DispatchInputs {
   const identifier = `review-fix-${plan.scope.prNumber}`;
-  const runConfig: RunConfigV1 = {
-    v: 1,
+  const runConfig = buildRunConfig({
+    runnerPhase: "gap-analysis",
     issue: {
       id: `review-fix:${plan.attemptId}`,
       identifier,
@@ -301,9 +302,9 @@ function buildLaunchInputs(plan: WorkerLaunchPlan, mapping: RepoMapping, runnerC
       // commentInstruction gap-fill dispatches already use for this purpose.
       description: plan.taskText,
     },
-    runnerPhase: "gap-analysis",
+    mapping,
     // The runner reads the callback URL only from the envelope; tokens stay workflow inputs.
-    ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
+    runnerCallbackUrl,
     prNumber: String(plan.scope.prNumber),
     commentInstruction: plan.taskText,
     reviewFix: {
@@ -314,19 +315,8 @@ function buildLaunchInputs(plan: WorkerLaunchPlan, mapping: RepoMapping, runnerC
       prNumber: plan.scope.prNumber,
       deadlineAt: plan.deadlineAt,
     },
-    ...(mapping.branchPrefix ? { branchPrefix: mapping.branchPrefix } : {}),
-    ...(mapping.skillsRepo ? { skillsRepo: mapping.skillsRepo } : {}),
-    ...(mapping.referenceRepos != null ? { referenceRepos: mapping.referenceRepos } : {}),
-    ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
-    ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
-    ...(mapping.sensitiveAddPatterns != null || mapping.sensitiveAllowPatterns != null
-      ? { sensitiveFiles: { add: mapping.sensitiveAddPatterns ?? undefined, allow: mapping.sensitiveAllowPatterns ?? undefined } }
-      : {}),
-    ...(mapping.reviewers != null ? { reviewers: mapping.reviewers } : {}),
-    ...(mapping.reviewProcess != null ? { reviewProcess: mapping.reviewProcess } : {}),
-    ...(mapping.trustedReviewAuthors != null ? { trustedReviewAuthors: mapping.trustedReviewAuthors } : {}),
-    ...(mapping.dependencyTokenScope != null ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
-  };
+    retryPolicy,
+  });
 
   return {
     run_config: encodeRunConfig(runConfig),
@@ -447,6 +437,9 @@ export interface GithubReviewFixWorkerDeps {
   /** Resolves the `runner_image` workflow input for the target repo, as the implementation
    *  dispatch does. `undefined` leaves the workflow's own image resolution in place. */
   runnerImage?: (target: { owner: string; repo: string; token: string }) => Promise<string | undefined>;
+  /** The operator's retry policy, read at each launch so a settings change applies to the next
+   *  one. Absent: the envelope carries DEFAULT_RETRY_POLICY. */
+  retryPolicy?: () => RetryPolicy;
 }
 
 export class GithubReviewFixWorker implements ReviewFixWorkerPort {
@@ -456,6 +449,7 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
   private readonly callbackInputs?: GithubReviewFixWorkerDeps["callbackInputs"];
   private readonly runnerCallbackUrl?: string;
   private readonly runnerImage?: GithubReviewFixWorkerDeps["runnerImage"];
+  private readonly retryPolicy?: GithubReviewFixWorkerDeps["retryPolicy"];
 
   constructor(deps: GithubReviewFixWorkerDeps) {
     this.credentials = deps.credentials;
@@ -464,6 +458,7 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
     this.callbackInputs = deps.callbackInputs;
     this.runnerCallbackUrl = deps.runnerCallbackUrl;
     this.runnerImage = deps.runnerImage;
+    this.retryPolicy = deps.retryPolicy;
   }
 
   private async remember(attemptId: AttemptId, scope: ScopedPrIdentity, execution?: WorkerExecutionIdentity): Promise<void> {
@@ -496,7 +491,7 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
     // under is not evidence the dispatch was rejected — it is unresolved identity.
     if (credential.installationId !== plan.scope.installationId) return { status: "unknown" };
 
-    let inputs = buildLaunchInputs(plan, mapping, this.runnerCallbackUrl);
+    let inputs = buildLaunchInputs(plan, mapping, this.runnerCallbackUrl, this.retryPolicy?.() ?? null);
     if (this.runnerImage) {
       try {
         const runnerImage = await this.runnerImage({ owner: mapping.owner, repo: mapping.repo, token: credential.token });
