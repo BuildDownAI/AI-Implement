@@ -324,3 +324,76 @@ describe("model session store", () => {
     expect(JSON.stringify(r)).not.toContain(SENTINEL);
   });
 });
+
+describe("plan records", () => {
+  const plan = (n: number) => `${SENTINEL}-plan-${n}`;
+
+  it("writes sequence 0 when no row exists, then +1, and reads the latest", () => {
+    const store = makeStore();
+    expect(store.writePlanRecord({ profileId: "plan1", expectedSequence: null, sessionData: plan(0) })).toMatchObject({ ok: true, stateSequence: 0, ownerGeneration: 1 });
+    expect(store.writePlanRecord({ profileId: "plan1", expectedSequence: 0, sessionData: plan(1) })).toMatchObject({ ok: true, stateSequence: 1 });
+    expect(store.readPlanRecord("plan1")).toMatchObject({ ok: true, stateSequence: 1, sessionData: plan(1), ownerGeneration: 1 });
+  });
+
+  it("refuses a stale expectedSequence and inserts nothing", () => {
+    const store = makeStore();
+    store.writePlanRecord({ profileId: "plan1", expectedSequence: null, sessionData: plan(0) });
+    store.writePlanRecord({ profileId: "plan1", expectedSequence: 0, sessionData: plan(1) });
+    for (const expectedSequence of [0, null, 5]) {
+      expect(store.writePlanRecord({ profileId: "plan1", expectedSequence, sessionData: plan(9) })).toMatchObject({ ok: false, reason: "stale_sequence" });
+    }
+    expect(store.writePlanRecord({ profileId: "plan2", expectedSequence: 0, sessionData: plan(9) })).toMatchObject({ ok: false, reason: "stale_sequence" });
+    expect(rowCount("plan1")).toBe(2);
+    expect(rowCount("plan2")).toBe(0);
+  });
+
+  it("keeps the newest 3 rows per profile and leaves other profiles alone", () => {
+    const store = makeStore();
+    store.writePlanRecord({ profileId: "other", expectedSequence: null, sessionData: plan(0) });
+    let expected: number | null = null;
+    for (let i = 0; i < 5; i++) {
+      const r = store.writePlanRecord({ profileId: "plan1", expectedSequence: expected, sessionData: plan(i) });
+      expect(r.ok).toBe(true);
+      expected = i;
+    }
+    expect(rowCount("plan1")).toBe(3);
+    const seqs = dedup.getDb().prepare("SELECT checkpoint_sequence AS s FROM model_session_generations WHERE profile_id = 'plan1' ORDER BY s").all();
+    expect(seqs).toEqual([{ s: 2 }, { s: 3 }, { s: 4 }]);
+    expect(rowCount("other")).toBe(1);
+    expect(store.readPlanRecord("plan1")).toMatchObject({ ok: true, stateSequence: 4, sessionData: plan(4) });
+  });
+
+  it("never calls verifyOwner, and owner-based methods still do", () => {
+    const verifyOwner = vi.fn(() => false);
+    const store = makeStore({ verifyOwner });
+    expect(store.writePlanRecord({ profileId: "plan1", expectedSequence: null, sessionData: plan(0) }).ok).toBe(true);
+    expect(store.readPlanRecord("plan1").ok).toBe(true);
+    expect(verifyOwner).not.toHaveBeenCalled();
+    expect(store.read("plan1", 1)).toMatchObject({ ok: false, reason: "owner_rejected" });
+    expect(verifyOwner).toHaveBeenCalledTimes(1);
+  });
+
+  it("authorizes a write that carries an operator", () => {
+    const store = makeStore();
+    expect(store.writePlanRecord({ profileId: "plan1", expectedSequence: null, sessionData: plan(0), operator: { bad: true } })).toMatchObject({ ok: false, category: "unauthorized", reason: "operator_not_authorized" });
+    expect(store.writePlanRecord({ profileId: "plan1", expectedSequence: null, sessionData: plan(0), operator: null })).toMatchObject({ ok: false, reason: "operator_not_authorized" });
+    expect(rowCount("plan1")).toBe(0);
+    expect(store.writePlanRecord({ profileId: "plan1", expectedSequence: null, sessionData: plan(0), operator: OPERATOR }).ok).toBe(true);
+  });
+
+  it("reports a missing record and rejects invalid input", () => {
+    const store = makeStore();
+    expect(store.readPlanRecord("nope")).toMatchObject({ ok: false, reason: "no_state" });
+    expect(store.readPlanRecord("bad id!")).toMatchObject({ ok: false, reason: "invalid_input" });
+    expect(store.writePlanRecord({ profileId: "bad id!", expectedSequence: null, sessionData: plan(0) })).toMatchObject({ ok: false, reason: "invalid_input" });
+    expect(store.writePlanRecord({ profileId: "plan1", expectedSequence: -1, sessionData: plan(0) })).toMatchObject({ ok: false, reason: "invalid_input" });
+    expect(store.writePlanRecord({ profileId: "plan1", expectedSequence: null, sessionData: "" })).toMatchObject({ ok: false, reason: "invalid_input" });
+  });
+
+  it("does not leak the sentinel into the database", () => {
+    const store = makeStore();
+    store.writePlanRecord({ profileId: "plan1", expectedSequence: null, sessionData: plan(0) });
+    const rows = dedup.getDb().prepare("SELECT * FROM model_session_generations").all();
+    expect(JSON.stringify(rows)).not.toContain(SENTINEL);
+  });
+});
