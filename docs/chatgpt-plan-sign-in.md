@@ -38,3 +38,9 @@ A signed-out record has no tokens, so it does not pass `parseChatGptPlanRecord`.
 No token appears in argv, stdout, stderr, or an error message. The authorize URL carries no ID token hint, so the printed URL is the same one the browser opener receives and works when pasted by hand.
 
 The loopback listener ignores requests to the callback path that carry a foreign `state` or neither `code` nor `error`, and keeps waiting until the 10-minute timeout.
+
+## Hosted session key
+
+The orchestrator stores hosted plan records encrypted. The key is derived (HKDF-SHA256, fixed label) from `RUNNER_TOKEN_SECRET`, which every hosted deployment already sets, and it stays in orchestrator memory. No other setup is needed and no new variable exists.
+
+Rotating `RUNNER_TOKEN_SECRET` makes every stored sign-in unreadable: the refresher answers `reauth_required` for each account and schedules nothing. Sign in and import again after a rotation. While the secret is unset, the refresher answers `transient` and retries every 2 minutes.
