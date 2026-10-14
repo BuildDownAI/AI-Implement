@@ -47,6 +47,10 @@ export const CODEX_SHELL_ENV_EXCLUDE = [
 
 const shellEnvPolicyArgs = (): string[] => ["-c", `shell_environment_policy.exclude=${JSON.stringify(CODEX_SHELL_ENV_EXCLUDE)}`];
 
+/** Resumes allowed per invocation after the ChatGPT plan access token expires mid-run. */
+const MAX_TOKEN_RESUMES = 2;
+const RESUME_PROMPT = "Continue the task from where you stopped. Your previous turn ended because a credential expired.";
+
 const DEFAULT_TERM_WAIT_MS = 5_000;
 const DEFAULT_KILL_WAIT_MS = 5_000;
 const POLL_MS = 10;
@@ -178,6 +182,8 @@ interface AppServerView {
   /** Trusted empty HOME so user-level fallbacks (~/.codex, ~/.agents, skills, rules) cannot load. */
   userHome: string;
   cwd: string;
+  /** True when the root belongs to the invocation (kept across resumes) rather than to one attempt. */
+  shared: boolean;
   authSource: string | null;
   initialAuth: string | null;
 }
@@ -188,6 +194,16 @@ interface Attempt {
   result: LLMResult;
   sawUnsafe: boolean;
   stop: StopReason | null;
+  /** ChatGPT plan only: the provider answered 401, so the access token expired. */
+  tokenExpired?: boolean;
+  /** Thread id Codex reported, needed to resume after a token expiry. */
+  threadId?: string | null;
+}
+
+/** Per-invocation state shared by every attempt: the sessions directory that lets `resume` find its thread. */
+interface InvocationState {
+  sessionsDir: string | null;
+  resumeThreadId: string | null;
 }
 
 type SpawnFailure = Error & { codexSpawnFailure: true; sawUnsafe: boolean };
@@ -343,52 +359,81 @@ export class CodexExecutor implements LLMExecutor {
     let attempt = 1;
     let totalSleptMs = 0;
     let carried: RunTelemetry | undefined;
+    let resumes = 0;
+    const state: InvocationState = { sessionsDir: null, resumeThreadId: null };
+    try {
+      for (;;) {
+        let outcome: Attempt;
+        // Recheck at loop entry before EVERY spawn: a backoff, scheduler delay or earlier attempt may have
+        // consumed the budget. An expired budget never reaches auth acquisition or spawn.
+        if (deadlineAt !== null && this.now() >= deadlineAt) {
+          outcome = expiredAttempt();
+        } else {
+          try {
+            outcome = await this.invokeOnce(params, deadlineAt, state);
+          } catch (err) {
+            if (isSpawnFailure(err)) {
+              const failure = classifySpawnError(err, { stage, attempt });
+              const decision = this.retryDecision(params, failure, attempt, err.sawUnsafe, totalSleptMs);
+              if (!decision.retry) throw Object.assign(err, { failure });
+              totalSleptMs += await this.boundedSleep(decision.backoffMs, deadlineAt);
+              attempt++;
+              continue;
+            }
+            throw err;
+          }
+        }
 
-    for (;;) {
-      let outcome: Attempt;
-      // Recheck at loop entry before EVERY spawn: a backoff, scheduler delay or earlier attempt may have
-      // consumed the budget. An expired budget never reaches auth acquisition or spawn.
-      if (deadlineAt !== null && this.now() >= deadlineAt) {
-        outcome = expiredAttempt();
-      } else {
-        try {
-          outcome = await this.invokeOnce(params, deadlineAt);
-        } catch (err) {
-          if (isSpawnFailure(err)) {
-            const failure = classifySpawnError(err, { stage, attempt });
-            const decision = this.retryDecision(params, failure, attempt, err.sawUnsafe, totalSleptMs);
-            if (!decision.retry) throw Object.assign(err, { failure });
-            totalSleptMs += await this.boundedSleep(decision.backoffMs, deadlineAt);
-            attempt++;
+        const merged = this.mergeTelemetry(carried, outcome.result.telemetry, startedAt);
+        carried = merged;
+        const settled: LLMResult = {
+          ...outcome.result,
+          telemetry: merged,
+          tokensUsed: merged ? (merged.tokensIn ?? 0) + (merged.tokensOut ?? 0) : outcome.result.tokensUsed,
+          attempts: attempt + resumes,
+        };
+
+        if (outcome.stop === "timeout") {
+          return { ...settled, failure: this.stopFailure("timeout", settled, stage, attempt, startedAt) };
+        }
+        if (outcome.stop === "cancel") {
+          return { ...settled, failure: this.stopFailure("cancel", settled, stage, attempt, startedAt) };
+        }
+
+        if (!isLlmResultFailure(settled, expectsStructuredOutput)) return settled;
+
+        let failure = this.classify(settled, stage, attempt, expectsStructuredOutput);
+        let retryAs = failure;
+        if (outcome.tokenExpired) {
+          // Only a ChatGPT plan attempt can report this. The next `auth.invoke` checks out a fresh token.
+          const threadId = outcome.threadId ?? state.resumeThreadId;
+          if (threadId) {
+            const overBudget = resumes >= MAX_TOKEN_RESUMES || (deadlineAt !== null && this.now() >= deadlineAt);
+            if (overBudget) {
+              return {
+                ...settled,
+                failure: { ...failure, category: "auth", code: "AUTHENTICATION_REQUIRED", retryable: false, message: "Codex access token expired and could not be renewed within the resume budget" },
+              };
+            }
+            resumes++;
+            state.resumeThreadId = threadId;
+            console.log(`[codex] token expired; resumed thread (${resumes}/${MAX_TOKEN_RESUMES})`);
             continue;
           }
-          throw err;
+          // No thread to resume: renew and start fresh under the ordinary retry rules.
+          retryAs = { ...failure, category: "transient" };
+          failure = { ...failure, category: "auth", code: "AUTHENTICATION_REQUIRED", retryable: false };
         }
+        const decision = this.retryDecision(params, retryAs, attempt, outcome.sawUnsafe, totalSleptMs);
+        if (!decision.retry) return { ...settled, failure };
+        state.resumeThreadId = null;
+        totalSleptMs += await this.boundedSleep(decision.backoffMs, deadlineAt);
+        attempt++;
       }
-
-      const merged = this.mergeTelemetry(carried, outcome.result.telemetry, startedAt);
-      carried = merged;
-      const settled: LLMResult = {
-        ...outcome.result,
-        telemetry: merged,
-        tokensUsed: merged ? (merged.tokensIn ?? 0) + (merged.tokensOut ?? 0) : outcome.result.tokensUsed,
-        attempts: attempt,
-      };
-
-      if (outcome.stop === "timeout") {
-        return { ...settled, failure: this.stopFailure("timeout", settled, stage, attempt, startedAt) };
-      }
-      if (outcome.stop === "cancel") {
-        return { ...settled, failure: this.stopFailure("cancel", settled, stage, attempt, startedAt) };
-      }
-
-      if (!isLlmResultFailure(settled, expectsStructuredOutput)) return settled;
-
-      const failure = this.classify(settled, stage, attempt, expectsStructuredOutput);
-      const decision = this.retryDecision(params, failure, attempt, outcome.sawUnsafe, totalSleptMs);
-      if (!decision.retry) return { ...settled, failure };
-      totalSleptMs += await this.boundedSleep(decision.backoffMs, deadlineAt);
-      attempt++;
+    } finally {
+      // The sessions directory lives exactly as long as the invocation, success or failure —
+      // except while a child may still be alive: its CODEX_HOME must not be removed under it.
+      if (state.sessionsDir && !this.held) rmSync(state.sessionsDir, { recursive: true, force: true });
     }
   }
 
@@ -461,7 +506,7 @@ export class CodexExecutor implements LLMExecutor {
   }
 
   /** One spawn inside one `ModelAuthClient.invoke`, so authentication is checkpointed even on failure. */
-  private async invokeOnce(params: InvokeParams, deadlineAt: number | null): Promise<Attempt> {
+  private async invokeOnce(params: InvokeParams, deadlineAt: number | null, state: InvocationState): Promise<Attempt> {
     let signalRecovery: (err: CodexRecoveryRequiredError) => void = () => {};
     const recovery = new Promise<never>((_, reject) => (signalRecovery = reject));
     const requiredMs = deadlineAt !== null ? Math.max(0, deadlineAt - this.now()) : params.invocationTimeoutMs;
@@ -473,7 +518,7 @@ export class CodexExecutor implements LLMExecutor {
       // recovery-required error to the caller.
       const invocation = this.options.auth.invoke(this.options.profileId, async (selected) => {
         try {
-          return await this.runChild(params, selected.env, deadlineAt, selected.codexProvider);
+          return await this.runChild(params, selected.env, deadlineAt, state, selected.codexProvider);
         } catch (err) {
           const held = this.held;
           if (held && (held.reason === "child_not_terminated" || held.reason === "auth_sync_failed")) {
@@ -510,11 +555,18 @@ export class CodexExecutor implements LLMExecutor {
     }
   }
 
-  private buildArgs(params: InvokeParams, schemaPath: string | null, baseUrl?: string, provider?: CodexProviderKind): string[] {
+  /** `codex exec resume` has no `--sandbox`; the same policy is passed as the `sandbox_mode` config override. */
+  private resumeSandboxArgs(params: InvokeParams): string[] {
+    const [, mode] = this.sandboxArgs(params);
+    return ["-c", `sandbox_mode=${JSON.stringify(mode)}`];
+  }
+
+  private buildArgs(params: InvokeParams, schemaPath: string | null, baseUrl?: string, provider?: CodexProviderKind, resumeThreadId?: string | null): string[] {
     // Pinned selection is placed on argv, after the ignore flags, so user or project config
     // cannot change it. No Claude-only flag and no bypass or approve-all flag is ever passed.
     const args = [
       "exec",
+      ...(resumeThreadId ? ["resume"] : []),
       "--json",
       "--ignore-user-config",
       "--ignore-rules",
@@ -523,10 +575,11 @@ export class CodexExecutor implements LLMExecutor {
       ...(provider === "chatgpt-plan" ? chatgptPlanProviderArgs() : ["-c", `model_provider="${CODEX_PROVIDER}"`]),
       ...shellEnvPolicyArgs(),
       ...(baseUrl && provider !== "chatgpt-plan" ? ["-c", `openai_base_url=${JSON.stringify(baseUrl)}`] : []),
-      ...this.sandboxArgs(params),
+      ...(resumeThreadId ? this.resumeSandboxArgs(params) : this.sandboxArgs(params)),
     ];
     if (schemaPath) args.push("--output-schema", schemaPath);
     // `-` reads the prompt from stdin: no argv size ceiling and nothing sensitive on the command line.
+    if (resumeThreadId) args.push(resumeThreadId);
     args.push("-");
     return args;
   }
@@ -567,31 +620,34 @@ export class CodexExecutor implements LLMExecutor {
    * the SELECTED profile's auth.json, an empty HOME, and an empty protocol cwd. Nothing else from the selected home,
    * the user home or the repository is visible to the child's config/rules/MCP loaders.
    */
-  private createAppServerView(selectedHome: string | undefined, model: string, baseUrl?: string, provider?: CodexProviderKind): AppServerView {
-    const root = mkdtempSync(join(tmpdir(), "codex-view-"));
+  private createAppServerView(selectedHome: string | undefined, model: string, baseUrl?: string, provider?: CodexProviderKind, state?: InvocationState): AppServerView {
+    // A ChatGPT plan view outlives one attempt: its CODEX_HOME holds the thread that `thread/resume` reloads.
+    const shared = provider === "chatgpt-plan" && !!state;
+    const root = shared && state.sessionsDir ? state.sessionsDir : mkdtempSync(join(tmpdir(), "codex-view-"));
+    if (shared) state.sessionsDir = root;
     const home = join(root, "home");
     const cwd = join(root, "cwd");
     const userHome = join(root, "user-home");
     try {
-      return this.populateAppServerView({ root, home, cwd, userHome }, selectedHome, model, baseUrl, provider);
+      return this.populateAppServerView({ root, home, cwd, userHome, shared }, selectedHome, model, baseUrl, provider);
     } catch (err) {
-      // No child exists yet, so removing a half-built view cannot race a live process.
-      rmSync(root, { recursive: true, force: true });
+      // No child exists yet, so removing a half-built view cannot race a live process. A shared root is the invocation's to remove.
+      if (!shared) rmSync(root, { recursive: true, force: true });
       throw err;
     }
   }
 
   private populateAppServerView(
-    { root, home, cwd, userHome }: Pick<AppServerView, "root" | "home" | "cwd" | "userHome">,
+    { root, home, cwd, userHome, shared }: Pick<AppServerView, "root" | "home" | "cwd" | "userHome" | "shared">,
     selectedHome: string | undefined,
     model: string,
     baseUrl?: string,
     provider?: CodexProviderKind,
   ): AppServerView {
     const plan = provider === "chatgpt-plan";
-    mkdirSync(home, { mode: 0o700 });
-    mkdirSync(userHome, { mode: 0o700 });
-    mkdirSync(cwd, { mode: 0o700 });
+    mkdirSync(home, { mode: 0o700, recursive: true });
+    mkdirSync(userHome, { mode: 0o700, recursive: true });
+    mkdirSync(cwd, { mode: 0o700, recursive: true });
     writeFileSync(
       join(home, "config.toml"),
       [
@@ -636,7 +692,7 @@ export class CodexExecutor implements LLMExecutor {
         source = candidate;
       }
     }
-    return { root, home, userHome, cwd, authSource: source, initialAuth: initial };
+    return { root, home, userHome, cwd, shared, authSource: source, initialAuth: initial };
   }
 
   /**
@@ -676,7 +732,7 @@ export class CodexExecutor implements LLMExecutor {
     }
   }
 
-  private async runChild(params: InvokeParams, selectedEnv: Record<string, string>, deadlineAt: number | null, provider?: CodexProviderKind): Promise<Attempt> {
+  private async runChild(params: InvokeParams, selectedEnv: Record<string, string>, deadlineAt: number | null, state: InvocationState, provider?: CodexProviderKind): Promise<Attempt> {
     let env = selectedEnv;
     let view: AppServerView | null = null;
     let restoreOrigin: (() => void) | null = null;
@@ -688,6 +744,8 @@ export class CodexExecutor implements LLMExecutor {
       }
     }
 
+    const resumeThreadId = provider === "chatgpt-plan" ? state.resumeThreadId : null;
+    if (resumeThreadId) params = { ...params, prompt: RESUME_PROMPT };
     let schemaDir: string | null = null;
     try {
       let schemaPath: string | null = null;
@@ -697,20 +755,25 @@ export class CodexExecutor implements LLMExecutor {
         writeFileSync(schemaPath, JSON.stringify(params.jsonSchema), { mode: 0o600 });
       }
       if (this.options.protocolDriver) {
-        view = this.createAppServerView(selectedEnv.CODEX_HOME, params.model, validateSelectedOpenAIBaseUrl(selectedEnv.OPENAI_BASE_URL), provider);
+        view = this.createAppServerView(selectedEnv.CODEX_HOME, params.model, validateSelectedOpenAIBaseUrl(selectedEnv.OPENAI_BASE_URL), provider, state);
         env = { ...selectedEnv, CODEX_HOME: view.home, HOME: view.userHome };
+      } else if (provider === "chatgpt-plan") {
+        // The plan token arrives as an env var, so there is no selected home: the executor owns one, and
+        // `exec resume` finds the thread's session files in it for the whole invocation.
+        state.sessionsDir ??= mkdtempSync(join(tmpdir(), "codex-sessions-"));
+        env = { ...selectedEnv, CODEX_HOME: state.sessionsDir };
       }
-      const args = this.options.protocolDriver ? this.buildAppServerArgs(params, provider) : this.buildArgs(params, schemaPath, validateSelectedOpenAIBaseUrl(selectedEnv.OPENAI_BASE_URL), provider);
+      const args = this.options.protocolDriver ? this.buildAppServerArgs(params, provider) : this.buildArgs(params, schemaPath, validateSelectedOpenAIBaseUrl(selectedEnv.OPENAI_BASE_URL), provider, resumeThreadId);
       // Auth acquisition and view setup may have consumed the budget: never spawn with an expired timeout.
       if (deadlineAt !== null && this.now() >= deadlineAt) return expiredAttempt();
-      const attempt = await this.spawnAndWait(params, args, env, view ?? undefined, selectedEnv.CODEX_HOME, deadlineAt, provider);
+      const attempt = await this.spawnAndWait(params, args, env, view ?? undefined, selectedEnv.CODEX_HOME, deadlineAt, provider, resumeThreadId);
       // spawnAndWait throws rather than returning while a child may live; the explicit guard keeps that invariant local.
       if (view && !this.held && provider !== "chatgpt-plan") this.syncAuthBack(view);
       return attempt;
     } finally {
       if (schemaDir) rmSync(schemaDir, { recursive: true, force: true });
       // The view stays in place while a child may live: its auth must not be synced or removed.
-      if (view && !this.held) rmSync(view.root, { recursive: true, force: true });
+      if (view && !this.held && !view.shared) rmSync(view.root, { recursive: true, force: true });
       if (this.held?.reason === "child_not_terminated") {
         // A child that may still be alive must never regain the publication credential.
         console.log("[codex] origin left protected: child not confirmed terminated");
@@ -732,6 +795,7 @@ export class CodexExecutor implements LLMExecutor {
     selectedHome?: string,
     deadlineAt: number | null = null,
     provider?: CodexProviderKind,
+    resumeThreadId?: string | null,
   ): Promise<Attempt> {
     const termWaitMs = this.options.termWaitMs ?? DEFAULT_TERM_WAIT_MS;
     const killWaitMs = this.options.killWaitMs ?? DEFAULT_KILL_WAIT_MS;
@@ -827,6 +891,7 @@ export class CodexExecutor implements LLMExecutor {
           prompt: params.prompt,
           model: params.model,
           ...(provider === "chatgpt-plan" ? { modelProvider: CHATGPT_PLAN_PROVIDER } : {}),
+          ...(resumeThreadId ? { resumeThreadId } : {}),
           workspaceDir: this.workspaceDir,
           ...(view ? { protocolCwd: view.cwd } : {}),
           ...(params.jsonSchema ? { jsonSchema: params.jsonSchema } : {}),
@@ -893,11 +958,15 @@ export class CodexExecutor implements LLMExecutor {
 
     let sawUnsafe: boolean;
     let result: LLMResult;
+    let tokenExpired = false;
+    let threadId: string | null = null;
     if (driver) {
       haltController.abort();
       await driverRun;
       const outcome = transport as CodexTransportResult | null;
       sawUnsafe = outcome?.sawUnsafe ?? true;
+      tokenExpired = outcome?.tokenExpired ?? false;
+      threadId = outcome?.threadId ?? null;
       if (st.spawnError && typeof proc.pid !== "number") {
         throw spawnFailure(st.spawnError, sawUnsafe);
       }
@@ -913,6 +982,8 @@ export class CodexExecutor implements LLMExecutor {
     } else {
       parser.end();
       sawUnsafe = parser.sawUnsafeActivity;
+      tokenExpired = parser.tokenExpired;
+      threadId = parser.threadId;
       if (st.spawnError && typeof proc.pid !== "number") {
         throw spawnFailure(st.spawnError, sawUnsafe);
       }
@@ -932,7 +1003,9 @@ export class CodexExecutor implements LLMExecutor {
     };
     if (clean.stderr?.trim()) console.error("[codex] stderr:", clean.stderr.trim());
     const stop = st.reason === "timeout" || st.reason === "cancel" ? st.reason : null;
-    return { result: clean, sawUnsafe, stop };
+    // Only a ChatGPT plan token can be renewed; with an API key a 401 fails as it always has.
+    const expired = provider === "chatgpt-plan" && tokenExpired;
+    return { result: clean, sawUnsafe, stop, ...(expired ? { tokenExpired: true, threadId } : {}) };
   }
 }
 

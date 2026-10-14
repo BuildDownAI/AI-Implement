@@ -75,6 +75,10 @@ export interface CodexTransportResult {
   sawUnsafe: boolean;
   /** `stdin` when a write to the child failed; timeout and cancel are decided by the executor alone. */
   stopReason: "stdin" | null;
+  /** Thread id acknowledged by `thread/start` or `thread/resume`; lets the executor resume after a token expiry. */
+  threadId?: string | null;
+  /** The turn failed with an HTTP 401 from the provider. */
+  tokenExpired?: boolean;
 }
 
 export interface CodexTransportIo {
@@ -90,6 +94,8 @@ export interface CodexTransportRunInput {
   model: string;
   /** Provider id for `thread/start`; "openai" when absent. */
   modelProvider?: string;
+  /** When set, the session sends `thread/resume` for this thread instead of `thread/start`. */
+  resumeThreadId?: string;
   workspaceDir: string;
   /** Executor-generated trusted empty cwd for the protocol thread; host tools still root at `workspaceDir`. */
   protocolCwd?: string;
@@ -351,6 +357,13 @@ const ITEM_TYPE_LABEL = /^[A-Za-z][A-Za-z0-9_./-]{0,63}$/;
 const BOUND_NOTIFICATIONS = new Set(["item/started", "item/completed", "thread/tokenUsage/updated", "turn/completed"]);
 const MAX_DEFERRED = 256;
 
+/** True when an app-server error object carries `httpStatusCode: 401`, at the top or inside `codexErrorInfo`. */
+function hasHttp401(err: unknown, depth = 0): boolean {
+  if (!isRecord(err) || depth > 3) return false;
+  if (err.httpStatusCode === 401) return true;
+  return Object.values(err).some((v) => hasHttp401(v, depth + 1));
+}
+
 type FailCode =
   | "protocol_error"
   | "malformed_message"
@@ -390,6 +403,8 @@ function runSession(input: CodexTransportRunInput): Promise<CodexTransportResult
     let initialized = false;
     let threadId: string | null = null;
     let turnId: string | null = null;
+    let sawHttp401 = false;
+    let tokenExpired = false;
     // Events for the right thread that outrun the turn/start acknowledgement; replayed once the turn id is known.
     const deferred: Array<() => void> = [];
     let nextId = 1;
@@ -404,6 +419,12 @@ function runSession(input: CodexTransportRunInput): Promise<CodexTransportResult
     const settle = (outcome: CodexTransportResult): void => {
       if (done) return;
       done = true;
+      if (threadId !== null) outcome = { ...outcome, threadId };
+      if (tokenExpired) {
+        outcome = { ...outcome, tokenExpired: true };
+        const t = outcome.result.telemetry;
+        if (t && (tokensIn !== null || tokensOut !== null)) outcome.result = { ...outcome.result, tokensUsed: (tokensIn ?? 0) + (tokensOut ?? 0), telemetry: { ...t, tokensIn, tokensOut } };
+      }
       io.stdout.off("data", onData);
       io.stdout.off("end", onEnd);
       io.stdout.off("close", onEnd);
@@ -451,19 +472,34 @@ function runSession(input: CodexTransportRunInput): Promise<CodexTransportResult
       if (kind === "initialize") {
         initialized = true;
         send({ method: "initialized" });
+        const plan = input.modelProvider === "chatgpt_plan";
+        if (input.resumeThreadId) {
+          // Resume the saved thread under the same pinned settings; the prompt goes out as `turn/start` afterwards.
+          request("thread", "thread/resume", {
+            threadId: input.resumeThreadId,
+            model: input.model,
+            modelProvider: input.modelProvider ?? "openai",
+            cwd: input.protocolCwd ?? ctx.root,
+            approvalPolicy: "never",
+            sandbox: "read-only",
+          });
+          return;
+        }
         request("thread", "thread/start", {
           model: input.model,
           modelProvider: input.modelProvider ?? "openai",
           cwd: input.protocolCwd ?? ctx.root,
           approvalPolicy: "never",
           sandbox: "read-only",
-          ephemeral: true,
+          // A ChatGPT plan thread must persist so it can resume after its access token expires.
+          ...(plan ? {} : { ephemeral: true }),
           // Top-level and experimental: the pinned CLI accepts it here and rejects `config.dynamicTools`.
           dynamicTools: PLANNING_DYNAMIC_TOOLS,
         });
       } else if (kind === "thread") {
         const thread = msg.result.thread;
         if (!isRecord(thread) || typeof thread.id !== "string" || thread.id.length > 200) return fail("protocol_error");
+        if (input.resumeThreadId && thread.id !== input.resumeThreadId) return fail("protocol_error");
         threadId = thread.id;
         startTurn();
       } else {
@@ -537,6 +573,7 @@ function runSession(input: CodexTransportRunInput): Promise<CodexTransportResult
     };
 
     const onNotification = (method: string, params: unknown): void => {
+      if (method === "error" && isRecord(params) && hasHttp401(params.error)) sawHttp401 = true;
       if (!BOUND_NOTIFICATIONS.has(method)) return;
       if (!isRecord(params)) return fail("malformed_message", true);
       const turnIdOf = method === "turn/completed" ? (isRecord(params.turn) ? params.turn.id : undefined) : params.turnId;
@@ -566,6 +603,7 @@ function runSession(input: CodexTransportRunInput): Promise<CodexTransportResult
       if (status === "completed") return settle(success());
       if (status === "failed") {
         const err = isRecord(turn.error) && typeof turn.error.message === "string" ? turn.error.message : undefined;
+        if (sawHttp401 || hasHttp401(turn.error)) tokenExpired = true;
         return fail("turn_failed", false, err);
       }
       return fail(status === "interrupted" ? "turn_interrupted" : "protocol_error");

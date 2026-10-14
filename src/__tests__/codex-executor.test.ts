@@ -1400,6 +1400,15 @@ describe("ChatGPT plan provider", () => {
     expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe(original);
   });
 
+  it("exec: leaves the sessions directory in place while a child may still be alive", async () => {
+    const { executor, log } = build(true, [{ hang: true, dieOn: [] }]);
+    await expect(executor.invoke({ ...base, invocationTimeoutMs: 10 })).rejects.toMatchObject({ reason: "child_not_terminated" });
+    const home = log[0].env.CODEX_HOME;
+    expect(home).not.toBe(selected);
+    expect(existsSync(home)).toBe(true);
+    rmSync(home, { recursive: true, force: true });
+  });
+
   it("passes requiredMs to auth.invoke: the remaining deadline, or the invocation timeout", async () => {
     let t = 1_000;
     const { executor } = build(true, [{ stdout: message("done") }], { nowImpl: () => t });
@@ -1435,5 +1444,232 @@ describe("ChatGPT plan provider", () => {
     const { executor } = build(true, [{ stdout: message("done") }]);
     await executor.invoke(base);
     expect(calls[0].opts).toBeUndefined();
+  });
+});
+
+describe("ChatGPT plan token expiry resume", () => {
+  const CONTINUE = "Continue the task from where you stopped. Your previous turn ended because a credential expired.";
+  const expired = (usage = true): string[] => [
+    ev({ type: "thread.started", thread_id: "t1" }),
+    ev({ type: "turn.started" }),
+    ...(usage ? [ev({ type: "turn.completed", usage: { input_tokens: 10, output_tokens: 5 } })] : []),
+    ev({ type: "error", message: "unexpected status 401 Unauthorized: token expired" }),
+  ];
+  const expiredNoThread = (): string[] => [ev({ type: "turn.started" }), ev({ type: "error", message: "unexpected status 401 Unauthorized" })];
+  let tokenN: number;
+  let calls: Array<{ opts: unknown; token: string }>;
+  let t: number;
+  beforeEach(() => {
+    tokenN = 0;
+    calls = [];
+    t = 1_000;
+  });
+
+  const makePlan = (scripts: Script[], opts: { provider?: boolean; advanceMs?: number } & Partial<CodexExecutorOptions> = {}) => {
+    const { provider = true, advanceMs = 0, ...extra } = opts;
+    const log: Spawned[] = [];
+    const auth: Pick<ModelAuthClient, "invoke"> = {
+      async invoke<T>(_id: string, cb: (i: ModelInvocation) => Promise<T>, o?: unknown): Promise<T> {
+        const token = `plan-token-${++tokenN}-synthetic`;
+        calls.push({ opts: o, token });
+        try {
+          return await cb({ env: { PATH: "/usr/bin", CHATGPT_PLAN_ACCESS_TOKEN: token }, strippedKeys: [], ...(provider ? { codexProvider: "chatgpt-plan" as const } : {}) });
+        } finally {
+          t += advanceMs;
+        }
+      },
+    };
+    const executor = new CodexExecutor(workspace, {
+      auth,
+      profileId: "p1",
+      allowRepositoryWrites: true,
+      spawnImpl: makeSpawn(scripts, log),
+      sleepImpl: async () => {},
+      nowImpl: () => t,
+      termWaitMs: 30,
+      killWaitMs: 30,
+      ...extra,
+    });
+    return { executor, log };
+  };
+
+  it("success: returns without a renewal or resume", async () => {
+    const { executor, log } = makePlan([{ stdout: message("done") }]);
+    const out = await executor.invoke({ ...base, invocationTimeoutMs: 60_000 });
+    expect(out.failure).toBeUndefined();
+    expect(log).toHaveLength(1);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("401 with a thread id: renews with the remaining deadline and resumes the same thread", async () => {
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => void logs.push(a.join(" ")));
+    const { executor, log } = makePlan([{ stdout: expired(), exitCode: 1 }, { stdout: message("finished") }], { advanceMs: 10_000 });
+    const out = await executor.invoke({ ...base, agentStage: "implementation", invocationTimeoutMs: 60_000, jsonSchema: VERDICT_SCHEMA });
+    expect(out.failure).toBeUndefined();
+    expect(out.stdout).toBe("finished");
+    expect(log).toHaveLength(2);
+    expect(calls.map((c) => c.opts)).toEqual([{ requiredMs: 60_000 }, { requiredMs: 50_000 }]);
+    expect(log[1].env.CHATGPT_PLAN_ACCESS_TOKEN).toBe(calls[1].token);
+    // resumed argv
+    const args = log[1].args;
+    expect(args.slice(0, 2)).toEqual(["exec", "resume"]);
+    expect(args.slice(-2)).toEqual(["t1", "-"]);
+    expect(args).not.toContain("--sandbox");
+    expect(args).toContain('sandbox_mode="workspace-write"');
+    expect(args).toContain("--json");
+    expect(args[args.indexOf("--model") + 1]).toBe("gpt-synthetic");
+    expect(args).toContain("--output-schema");
+    expect(args).toContain(`shell_environment_policy.exclude=${JSON.stringify(CODEX_SHELL_ENV_EXCLUDE)}`);
+    expect(args).toContain('model_provider="chatgpt_plan"');
+    expect(args).not.toContain('model_provider="openai"');
+    expect(log[1].stdin).toBe(CONTINUE);
+    expect(log[0].stdin).toBe("do the thing");
+    // usage summed
+    expect(out.telemetry?.tokensIn).toBe(20);
+    expect(out.telemetry?.tokensOut).toBe(10);
+    expect(out.tokensUsed).toBe(30);
+    expect(logs).toContain("[codex] token expired; resumed thread (1/2)");
+    expect(logs.join("\n")).not.toContain("plan-token");
+  });
+
+  it("keeps one sessions CODEX_HOME across attempts and removes it afterwards", async () => {
+    const { executor, log } = makePlan([{ stdout: expired(), exitCode: 1 }, { stdout: expired(), exitCode: 1 }, { stdout: message("ok") }]);
+    let seen: boolean[] = [];
+    const orig = log;
+    await executor.invoke(base);
+    const homes = orig.map((l) => l.env.CODEX_HOME);
+    expect(homes[0]).toBeTruthy();
+    expect(new Set(homes).size).toBe(1);
+    seen = homes.map((h) => existsSync(h));
+    expect(seen).toEqual([false, false, false]);
+  });
+
+  it("removes the sessions directory when the invocation fails", async () => {
+    const { executor, log } = makePlan([{ stdout: ["{}"], exitCode: 1, stderr: "boom" }]);
+    await executor.invoke(base);
+    expect(existsSync(log[0].env.CODEX_HOME)).toBe(false);
+  });
+
+  it("401 after two resumes fails authentication_required without a third resume", async () => {
+    const { executor, log } = makePlan([{ stdout: expired(), exitCode: 1 }]);
+    const out = await executor.invoke({ ...base, invocationTimeoutMs: 60_000 });
+    expect(log).toHaveLength(3);
+    expect(calls).toHaveLength(3);
+    expect(out.failure).toMatchObject({ category: "auth", code: "AUTHENTICATION_REQUIRED", retryable: false });
+    expect(log[2].args.slice(0, 2)).toEqual(["exec", "resume"]);
+    expect(out.telemetry?.tokensIn).toBe(30);
+  });
+
+  it("401 once the deadline is reached fails authentication_required and does not resume", async () => {
+    const { executor, log } = makePlan([{ stdout: expired(), exitCode: 1 }], { advanceMs: 70_000 });
+    const out = await executor.invoke({ ...base, invocationTimeoutMs: 60_000 });
+    expect(log).toHaveLength(1);
+    expect(out.failure).toMatchObject({ category: "auth", code: "AUTHENTICATION_REQUIRED" });
+  });
+
+  it("401 without a thread id renews and starts a fresh attempt under the retry rules", async () => {
+    const { executor, log } = makePlan([{ stdout: expiredNoThread(), exitCode: 1 }, { stdout: message("fresh") }]);
+    const out = await executor.invoke({ ...base, ...retry });
+    expect(out.failure).toBeUndefined();
+    expect(log).toHaveLength(2);
+    expect(calls).toHaveLength(2);
+    expect(log[1].args).not.toContain("resume");
+    expect(log[1].stdin).toBe("do the thing");
+  });
+
+  it("401 without a thread id and no retry policy fails as an authentication failure", async () => {
+    const { executor, log } = makePlan([{ stdout: expiredNoThread(), exitCode: 1 }]);
+    const out = await executor.invoke(base);
+    expect(log).toHaveLength(1);
+    expect(out.failure).toMatchObject({ category: "auth", code: "AUTHENTICATION_REQUIRED" });
+  });
+
+  it("401 with an API key provider fails as today: no renewal, no resume", async () => {
+    const { executor, log } = makePlan([{ stdout: expired(), exitCode: 1 }], { provider: false });
+    const out = await executor.invoke({ ...base, ...retry });
+    expect(log).toHaveLength(1);
+    expect(calls).toHaveLength(1);
+    expect(out.failure?.code).not.toBe("AUTHENTICATION_REQUIRED");
+    expect(log[0].args).not.toContain("resume");
+  });
+
+  it("other failures keep the existing behavior: no resume", async () => {
+    const { executor, log } = makePlan([{ stdout: [ev({ type: "thread.started", thread_id: "t1" }), ev({ type: "turn.started" }), ev({ type: "error", message: "model exploded" })], exitCode: 1 }]);
+    const out = await executor.invoke(base);
+    expect(log).toHaveLength(1);
+    expect(log[0].args).not.toContain("resume");
+    expect(out.failure).toBeDefined();
+  });
+
+  it("derives the resume sandbox from the stage policy", async () => {
+    for (const [agentStage, mode] of [["review", "read-only"], ["implementation", "workspace-write"]] as const) {
+      const { executor, log } = makePlan([{ stdout: expired(), exitCode: 1 }, { stdout: message("ok") }]);
+      await executor.invoke({ ...base, agentStage });
+      expect(log[1].args).toContain(`sandbox_mode="${mode}"`);
+      expect(log[1].args).not.toContain("--sandbox");
+    }
+    const { executor, log } = makePlan([{ stdout: expired(), exitCode: 1 }, { stdout: message("ok") }]);
+    await executor.invoke({ ...base, builtinTools: ["Read"] });
+    expect(log[1].args).toContain('sandbox_mode="read-only"');
+  });
+
+  describe("app-server", () => {
+    const result = (over: Partial<CodexTransportResult> & { tokens?: [number, number] } = {}): CodexTransportResult => {
+      const { tokens: tk, ...rest } = over;
+      return {
+        result: {
+          stdout: "plan",
+          stderr: "",
+          exitCode: 0,
+          tokensUsed: 0,
+          telemetry: { outcome: "success", numTurns: null, durationMs: null, costUsd: null, tokensIn: tk?.[0] ?? null, tokensOut: tk?.[1] ?? null },
+          terminalStatus: { subtype: "success", isError: false },
+          signal: null,
+        },
+        sawUnsafe: false,
+        stopReason: null,
+        ...rest,
+      };
+    };
+    const expiredResult = (): CodexTransportResult => {
+      const r = result({ tokens: [4, 2], tokenExpired: true, threadId: "th-1" });
+      return { ...r, result: { ...r.result, exitCode: 1, terminalStatus: { subtype: "error", isError: true }, stderr: "codex app-server transport: turn_failed" } };
+    };
+
+    it("starts a new app-server with thread/resume input and the continue prompt, sums usage, keeps one home", async () => {
+      const inputs: CodexTransportRunInput[] = [];
+      const homes: string[] = [];
+      const driver: CodexProtocolDriver = {
+        run: async (i) => {
+          inputs.push(i);
+          return inputs.length === 1 ? expiredResult() : result({ tokens: [6, 3] });
+        },
+      };
+      const { executor, log } = makePlan([{ hang: true, dieOn: ["SIGTERM"] }], { protocolDriver: driver });
+      const out = await executor.invoke({ ...base, agentStage: "planning", invocationTimeoutMs: 60_000 });
+      for (const l of log) homes.push(l.env.CODEX_HOME);
+      expect(out.failure).toBeUndefined();
+      expect(log).toHaveLength(2);
+      expect(calls).toHaveLength(2);
+      expect(inputs[0].resumeThreadId).toBeUndefined();
+      expect(inputs[1].resumeThreadId).toBe("th-1");
+      expect(inputs[1].prompt).toBe(CONTINUE);
+      expect(inputs[1].modelProvider).toBe("chatgpt_plan");
+      expect(log[1].args[0]).toBe("app-server");
+      expect(new Set(homes).size).toBe(1);
+      expect(existsSync(homes[0])).toBe(false);
+      expect(out.telemetry?.tokensIn).toBe(10);
+      expect(out.telemetry?.tokensOut).toBe(5);
+    });
+
+    it("does not treat a driver 401 as expiry for the API key provider", async () => {
+      const driver: CodexProtocolDriver = { run: async () => expiredResult() };
+      const { executor, log } = makePlan([{ hang: true, dieOn: ["SIGTERM"] }], { protocolDriver: driver, provider: false });
+      const out = await executor.invoke({ ...base, agentStage: "planning" });
+      expect(log).toHaveLength(1);
+      expect(calls).toHaveLength(1);
+      expect(out.failure).toBeDefined();
+    });
   });
 });

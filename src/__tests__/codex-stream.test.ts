@@ -310,3 +310,19 @@ describe("terminal error message", () => {
     expect(formatLlmResultDetail({ stdout: "", stderr: "spawn failed" })).toBe(": spawn failed");
   });
 });
+
+describe("token expiry detection", () => {
+  const run = (lines: unknown[]): CodexStreamParser => {
+    const p = new CodexStreamParser();
+    for (const l of lines) p.push(`${JSON.stringify(l)}\n`);
+    return p;
+  };
+  it("flags 401 Unauthorized in error and turn.failed events", () => {
+    expect(run([{ type: "error", message: "unexpected status 401 Unauthorized: x" }]).tokenExpired).toBe(true);
+    expect(run([{ type: "turn.failed", error: { message: "401 Unauthorized" } }]).tokenExpired).toBe(true);
+  });
+  it("does not flag other errors or a clean run", () => {
+    expect(run([{ type: "error", message: "429 Too Many Requests" }]).tokenExpired).toBe(false);
+    expect(run([{ type: "turn.started" }]).tokenExpired).toBe(false);
+  });
+});

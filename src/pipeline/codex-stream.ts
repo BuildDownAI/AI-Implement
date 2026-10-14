@@ -131,6 +131,8 @@ export class CodexStreamParser {
   private errorText: string | null = null;
 
   threadId: string | null = null;
+  /** A `turn.failed` / `error` event carried `401 Unauthorized`: the provider rejected the access token. */
+  tokenExpired = false;
   /** Codex event turns (`turn.started`); deliberately distinct from Claude native turns. */
   eventTurns = 0;
   unknownEvents = 0;
@@ -236,6 +238,7 @@ export class CodexStreamParser {
   }
 
   private noteError(message: unknown): void {
+    if (typeof message === "string" && /401 Unauthorized/i.test(message)) this.tokenExpired = true;
     if (this.errorText !== null || typeof message !== "string" || !message.trim()) return;
     this.errorText = truncate(redactSecrets(message.trim()), ERROR_MESSAGE_MAX);
   }
