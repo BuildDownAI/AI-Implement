@@ -50,8 +50,9 @@ export interface FakeFetch {
   fetch: typeof fetch;
   /** Every request, matched or not, in the order received. */
   calls: FetchCall[];
-  /** Replaces the global `fetch` with this fake until the test finishes. */
-  install(): void;
+  /** Replaces the global `fetch` with this fake until the test finishes, and returns the fake,
+   *  so `const fake = fakeFetch(routes).install();` builds and installs in one line. */
+  install(): FakeFetch;
 }
 
 /** Builds a fake fetch from a route table. Call it from a test or a `beforeEach`: it fails the
@@ -99,7 +100,7 @@ export function fakeFetch(routes: Routes): FakeFetch {
       : new Response(resolved.text ?? null, responseInit);
   };
 
-  return {
+  const fake: FakeFetch = {
     fetch: fakeFetchImpl,
     calls,
     install() {
@@ -108,6 +109,8 @@ export function fakeFetch(routes: Routes): FakeFetch {
         globalThis.fetch = original;
       });
       globalThis.fetch = fakeFetchImpl;
+      return fake;
     },
   };
+  return fake;
 }

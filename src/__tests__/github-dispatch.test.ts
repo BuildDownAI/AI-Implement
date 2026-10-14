@@ -755,9 +755,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
   /** The dispatch endpoint of acme/`repo`, answering each request with the next reply in order;
    *  a request past the last reply fails the test. */
   function dispatches(repo: string, ...replies: Reply[]): FakeFetch {
-    const github = fakeFetch({ [`POST /repos/acme/${repo}/actions/workflows/claude-implement.yml/dispatches` as const]: replies });
-    github.install();
-    return github;
+    return fakeFetch({ [`POST /repos/acme/${repo}/actions/workflows/claude-implement.yml/dispatches` as const]: replies }).install();
   }
 
   it("exposes exactly runner_phase, runner_callback_url, and issue_identifier as the optional-input list", () => {

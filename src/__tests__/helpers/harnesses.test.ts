@@ -410,6 +410,14 @@ describe("fakeFetch", () => {
       expect(globalThis.fetch).toBe(original);
     });
 
+    it("returns the fake it installed, so building and installing is one line", async () => {
+      const api = fakeFetch({ "GET /ping": { text: "pong" } });
+
+      expect(api.install()).toBe(api);
+      await fetch(`${API}/ping`);
+      expect(api.calls).toHaveLength(1);
+    });
+
     it("lets a second install in the same test replace the first", async () => {
       const first = fakeFetch({ "GET /ping": { text: "first" } });
       const second = fakeFetch({ "GET /ping": { text: "second" } });

@@ -16,9 +16,7 @@ const THIRTY_DAYS_S = 2591999;
 // The module only ever uses the global fetch for minting, so each reply is a mint response.
 // With no replies, any mint fails the test.
 function mintEndpoint(...replies: Reply[]): FakeFetch {
-  const fake = fakeFetch({ "POST /oauth/token": replies });
-  fake.install();
-  return fake;
+  return fakeFetch({ "POST /oauth/token": replies }).install();
 }
 
 function minted(accessToken: string): Reply {
