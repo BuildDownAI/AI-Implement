@@ -373,12 +373,15 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     let stepTable: KgRefreshStepRecord[] = [];
     const withSteps = (o: RefreshOutcome): RefreshOutcome => (stepTable.length > 0 && !o.steps ? { ...o, steps: stepTable } : o);
 
+    // Set once the run reaches the decision gate; unlike `heldPr` it survives the merge, so every later end is marked held.
+    let heldGate = false;
+
     async function failurePath(
       rawOutcome: RefreshOutcome,
       conclusion: string,
       opts: { timedOut?: boolean; skipOutcome?: boolean } = {},
     ): Promise<RefreshOutcome> {
-      const outcome = withSteps(rawOutcome);
+      const outcome: RefreshOutcome = { ...withSteps(rawOutcome), conclusion, ...(heldGate ? { held: true } : {}) };
       // A dry-run is not a refresh: it never writes the last-refresh record or notifies the operator.
       if (!input.dryRun) await ctx.run("persist", () => deps.persistLastRefresh({ ...outcome, dispatchId }));
       await ctx.run("close-row", () => deps.closeJobLog(jobId, opts.timedOut ? "timed_out" : "failed", conclusion));
@@ -811,6 +814,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           stampBefore: railCtx.stampBefore ?? null, stampAfter: railCtx.stampAfter ?? null,
         };
         if (stepTable.length > 0) successOutcome.steps = stepTable;
+        if (heldGate) successOutcome.held = true;
         await ctx.run("persist", () => deps.persistLastRefresh({ ...successOutcome, dispatchId }));
         ctx.set("step", "close-row");
         await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
@@ -898,6 +902,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         // Decision gate: the runner opened the snapshot PR and finished. Free the machine, keep the lease, wait for a decision.
         const heldPrNumber = report.snapshotPr;
         heldPr = { number: heldPrNumber, branch: report.snapshotBranch };
+        heldGate = true;
         ctx.set("step", "decision");
         const heldAt = await ctx.date.now();
         const decideBy = heldAt + decisionTimeoutMs;

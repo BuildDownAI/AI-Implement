@@ -1959,6 +1959,9 @@ describe("KgRefresh durable workflow", () => {
       const outcome = await runWorkflow(env.baseUrl(), triggerId);
       expect(outcome.ok).toBe(false);
       expect((await closeRowFor(triggerId)).conclusion).toBe("dispatch_rejected");
+      const persisted = persistCalls.find((o) => o.dispatchId === triggerId);
+      expect(persisted?.conclusion).toBe("dispatch_rejected");
+      expect(persisted?.held).toBeUndefined();
       expect(scenarios.get(triggerId)!.findByTitleCalls).toBe(1);
     },
     15_000,
@@ -3445,7 +3448,7 @@ describe("KgRefresh durable workflow", () => {
         const comment = postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!;
         expect(comment).toContain("operator_cancelled");
         expect(await closeRowFor(triggerId)).toMatchObject({ status: "failed", conclusion: "operator_cancelled" });
-        expect(persistCalls.at(-1)).toMatchObject({ ok: false });
+        expect(persistCalls.at(-1)).toMatchObject({ ok: false, conclusion: "operator_cancelled", held: true });
         expect(outcomesFor(triggerId)).toHaveLength(0);
         await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "marker cleared" });
         expect(await countSends(env, "FlyMachineProfile", "kg-refresh", "release")).toBeGreaterThanOrEqual(1);
