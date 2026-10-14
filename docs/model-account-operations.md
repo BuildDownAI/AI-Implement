@@ -50,6 +50,9 @@ fly ssh console -a <orchestrator-app> -C "node dist/model-account-cli.js chatgpt
 
 Revokes the refresh token at OpenAI's `revocation_endpoint`, then stores a record without tokens. The tokens are
 removed whether or not revocation succeeds; the output says `revocation confirmed` or `revocation not confirmed`.
+
+Sign-out and status also work on a disabled or archived profile, so you can revoke the session of a retired account. Import requires an active profile.
+
 If it was not confirmed, disconnect the app in ChatGPT settings.
 
 ### `reauth_required`

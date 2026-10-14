@@ -70,11 +70,12 @@ function operatorStore(): ModelSessionStore {
   });
 }
 
-function requireProfile(profileId: string, deps: CliDeps): void {
+/** Import needs an active profile. Status and logout also accept a disabled or archived one: retiring a profile leaves its stored session, and sign-out must still reach it. */
+function requireProfile(profileId: string, deps: CliDeps, opts: { allowInactive?: boolean } = {}): void {
   const profile = deps.getProfile(profileId);
   if (!profile) throw new CliError("unknown profile");
   if (profile.authMode !== "codex-subscription") throw new CliError("profile is not a codex-subscription profile");
-  if (profile.status !== "active") throw new CliError("profile is not active");
+  if (profile.status !== "active" && !opts.allowInactive) throw new CliError("profile is not active");
 }
 
 function parseJsonObject(text: string): Record<string, unknown> | null {
@@ -126,7 +127,7 @@ async function chatgptImport(profileId: string, deps: CliDeps): Promise<void> {
 }
 
 async function chatgptStatus(profileId: string, deps: CliDeps): Promise<void> {
-  requireProfile(profileId, deps);
+  requireProfile(profileId, deps, { allowInactive: true });
   const { data } = readStored(deps.store(), profileId);
   if (!data) throw new CliError("no record stored for this profile");
   const str = (k: string): string => (typeof data[k] === "string" && data[k] ? (data[k] as string) : "-");
@@ -151,7 +152,7 @@ async function chatgptStatus(profileId: string, deps: CliDeps): Promise<void> {
 }
 
 async function chatgptLogout(profileId: string, deps: CliDeps): Promise<void> {
-  requireProfile(profileId, deps);
+  requireProfile(profileId, deps, { allowInactive: true });
   const store = deps.store();
   const { data, sequence } = readStored(store, profileId);
   if (!data) throw new CliError("no record stored for this profile");
@@ -180,7 +181,7 @@ export async function main(argv: string[], deps: CliDeps = defaultDeps()): Promi
   const [command, ...rest] = argv;
   const run = command ? COMMANDS[command] : undefined;
   // Only `--profile <id>` is accepted, so a record can never ride on argv.
-  if (!run || rest.length !== 2 || rest[0] !== "--profile" || !/^[A-Za-z0-9._:-]{1,128}$/.test(rest[1] ?? "")) {
+  if (!run || rest.length !== 2 || rest[0] !== "--profile" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(rest[1] ?? "")) {
     deps.stderr(USAGE);
     return 2;
   }

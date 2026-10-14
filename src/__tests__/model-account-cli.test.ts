@@ -202,6 +202,34 @@ describe("chatgpt-status", () => {
   });
 });
 
+describe("status and logout on retired or mismatched profiles", () => {
+  it.each(["disabled", "archived"])("signs out and reports status for a %s profile", async (status) => {
+    await run(["chatgpt-import", "--profile", PROFILE]);
+    profile = { authMode: "codex-subscription", status };
+    out = [];
+    expect(await run(["chatgpt-status", "--profile", PROFILE])).toBe(0);
+    expect(await run(["chatgpt-logout", "--profile", PROFILE])).toBe(0);
+    const data = stored()!.data;
+    for (const k of ["accessToken", "refreshToken", "idToken"]) expect(data).not.toHaveProperty(k);
+    noLeak();
+  });
+
+  it.each(["chatgpt-status", "chatgpt-logout"])("%s refuses unknown and wrong-mode profiles", async (cmd) => {
+    await run(["chatgpt-import", "--profile", PROFILE]);
+    for (const p of [null, { authMode: "openai-api-key", status: "active" }]) {
+      profile = p as typeof profile;
+      expect(await run([cmd, "--profile", PROFILE])).toBe(1);
+    }
+    expect(stored()!.data).toHaveProperty("refreshToken");
+    noLeak();
+  });
+
+  it("rejects profile ids the session store would reject", async () => {
+    expect(await run(["chatgpt-status", "--profile", "a:b"])).toBe(2);
+    expect(await run(["chatgpt-status", "--profile", ".a"])).toBe(2);
+  });
+});
+
 describe("chatgpt-logout", () => {
   const discovery = () => new Response(JSON.stringify({ issuer: "https://auth.openai.com", jwks_uri: "https://auth.openai.com/jwks", revocation_endpoint: "https://auth.openai.com/revoke" }), { status: 200 });
 
