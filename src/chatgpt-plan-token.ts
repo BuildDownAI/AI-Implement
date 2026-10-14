@@ -101,6 +101,8 @@ export function shouldRefresh(record: ChatGptPlanRecordV1, now: number, required
   return record.earliestRefreshAt !== null && now >= record.earliestRefreshAt;
 }
 
+const DEFAULT_EXPIRES_IN_MS = 3_600_000;
+
 export type RefreshFailure = "reauth_required" | "invalid_client" | "transient";
 
 export type RefreshResult =
@@ -118,7 +120,7 @@ function safeCode(value: unknown): string | null {
 function classifyError(status: number, code: string | null): RefreshFailure {
   if (code === "invalid_client") return "invalid_client";
   if (status >= 500 || status === 429) return "transient";
-  // 400/401 with a known reauth code and every other 4xx both need a new sign-in.
+  // Every remaining 4xx needs a new sign-in; the error code does not matter here.
   if (status >= 400 && status < 500) return "reauth_required";
   return "transient";
 }
@@ -165,22 +167,27 @@ export async function refreshChatGptPlanRecord(
   }
 
   const { access_token, refresh_token, id_token, expires_in, scope, earliest_refresh_at } = body;
-  if (typeof access_token !== "string" || !access_token || typeof refresh_token !== "string" || !refresh_token) {
-    return fail("transient", status);
-  }
-  if (typeof expires_in !== "number" || !Number.isFinite(expires_in)) return fail("transient", status);
+  // Without a new refresh token nothing rotated, so the old record stays valid.
+  if (typeof refresh_token !== "string" || !refresh_token) return fail("transient", status);
 
+  // OpenAI rotates the refresh token on every 200, so keep it even if the rest of the reply is incomplete.
   const now = deps.now();
+  const hasAccess = typeof access_token === "string" && access_token !== "";
+  const expiresAt = !hasAccess
+    ? now // old access token is kept; refresh again on the next check
+    : typeof expires_in === "number" && Number.isFinite(expires_in)
+      ? now + expires_in * 1000
+      : now + DEFAULT_EXPIRES_IN_MS;
   const scopes =
     typeof scope === "string"
       ? [...new Set(scope.split(/\s+/).filter(Boolean))].sort()
       : record.scopes;
   const candidate: ChatGptPlanRecordV1 = {
     ...record,
-    accessToken: access_token,
+    accessToken: hasAccess ? access_token : record.accessToken,
     refreshToken: refresh_token,
     idToken: typeof id_token === "string" && id_token ? id_token : record.idToken,
-    accessTokenExpiresAt: now + expires_in * 1000,
+    accessTokenExpiresAt: expiresAt,
     scopes,
     earliestRefreshAt:
       typeof earliest_refresh_at === "number" && Number.isFinite(earliest_refresh_at) ? earliest_refresh_at * 1000 : null,

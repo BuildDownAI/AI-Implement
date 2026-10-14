@@ -182,15 +182,58 @@ describe("refreshChatGptPlanRecord", () => {
   });
 
   it.each([
-    [{ refresh_token: "r", expires_in: 10 }],
     [{ access_token: "a", expires_in: 10 }],
-    [{ access_token: "a", refresh_token: "r", expires_in: "soon" }],
-  ])("incomplete or invalid 200 is transient: %j", async (body) => {
+    [{ access_token: "a", refresh_token: "", expires_in: 10 }],
+    [{}],
+  ])("a 200 without a refresh token is transient and changes nothing: %j", async (body) => {
     const input = record();
     const before = JSON.stringify(input);
     const out = await run(input, vi.fn().mockResolvedValue(resp(200, body)));
     expect(out).toEqual({ ok: false, failure: "transient", status: 200, code: null });
     expect(JSON.stringify(input)).toBe(before);
+  });
+
+  it.each([
+    ["missing", { access_token: "a", refresh_token: "r" }],
+    ["not finite", { access_token: "a", refresh_token: "r", expires_in: "soon" }],
+  ])("expires_in %s defaults to one hour and keeps the new refresh token", async (_n, body) => {
+    const out = await run(record(), vi.fn().mockResolvedValue(resp(200, body)));
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    expect(out.record.refreshToken).toBe("r");
+    expect(out.record.accessToken).toBe("a");
+    expect(out.record.accessTokenExpiresAt).toBe(NOW + 3_600_000);
+  });
+
+  it.each([
+    ["missing", { refresh_token: "new-refresh", expires_in: 10 }],
+    ["empty", { access_token: "", refresh_token: "new-refresh", expires_in: 10 }],
+    ["missing with no expires_in", { refresh_token: "new-refresh" }],
+  ])("access_token %s keeps the new refresh token and the old access token", async (_n, body) => {
+    const out = await run(record(), vi.fn().mockResolvedValue(resp(200, body)));
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    expect(out.record.refreshToken).toBe("new-refresh");
+    expect(out.record.accessToken).toBe("old-access");
+    expect(out.record.accessTokenExpiresAt).toBe(NOW);
+    expect(shouldRefresh(out.record, NOW, 60_000)).toBe(true);
+  });
+
+  it("a non-string scope keeps the previous scopes", async () => {
+    const input = record();
+    const body = { access_token: "a", refresh_token: "r", expires_in: 10, scope: 42 };
+    const out = await run(input, vi.fn().mockResolvedValue(resp(200, body)));
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    expect(out.record.scopes).toEqual(input.scopes);
+    expect(out.record.refreshToken).toBe("r");
+  });
+
+  it("a failing 200 never contains the sentinel token", async () => {
+    const body = { access_token: SENTINEL, refresh_token: SENTINEL, expires_in: 10, scope: "openid" };
+    const out = await run(record(), vi.fn().mockResolvedValue(resp(200, body)));
+    expect(out).toMatchObject({ ok: false, failure: "reauth_required" });
+    expect(JSON.stringify(out)).not.toContain(SENTINEL);
   });
 
   it("a 200 whose scope drops the direct scope is reauth_required and leaves the record unchanged", async () => {
