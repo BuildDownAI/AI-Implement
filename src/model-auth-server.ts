@@ -11,7 +11,7 @@
  * bearer -> persisted grant (audience, revocation, expiry, dispatch/snapshot/project/backend) ->
  * bounded body -> the same grant authentication again (the read is asynchronous, so the
  * grant may have expired or been revoked meanwhile) -> shape -> profile in the grant's bindings -> frozen snapshot selection
- * -> current owner (subscription only) -> store or resolver. Revision, provider, auth
+ * -> current owner (reserving modes only) -> store or resolver. Revision, provider, auth
  * mode, and owner generation come from the persisted grant and the frozen snapshot,
  * never from the body.
  *
@@ -40,13 +40,13 @@ import {
   MODEL_AUTH_ROUTES,
   checkCheckoutResponseAgainstBindings,
   checkCheckpointAgainstBindings,
-  isSubscriptionAuthMode,
   parseModelAuthCheckoutRequest,
   parseModelAuthCheckoutResponse,
   parseModelAuthCheckpointRequest,
   parseModelAuthCheckpointResponse,
   parseModelAuthFinishRequest,
   parseModelAuthFinishResponse,
+  reservesModelAccount,
   toSafeModelAuthDiagnostic,
   validateModelAuthGrantBinding,
   MODEL_AUTH_FAILURE_CATEGORIES,
@@ -66,6 +66,8 @@ export const MAX_SMALL_BODY_BYTES = 4 * 1024;
 /** Checkpoint cap: session data up to 64K UTF-16 units, worst case JSON-escaped and UTF-8 encoded. */
 export const MAX_CHECKPOINT_BODY_BYTES = 6 * MAX_SESSION_DATA_LENGTH + 4 * 1024;
 export const DEFAULT_BODY_DEADLINE_MS = 10_000;
+/** A ChatGPT access token with less than this left is refused and a refresh is requested. */
+export const CHATGPT_MIN_TOKEN_LIFETIME_MS = 2 * 60 * 1000;
 
 /** The persisted form of a grant: metadata plus a hash of the bearer, never the bearer. */
 export interface PersistedModelAuthGrant extends SafeGrantMetadata {
@@ -117,6 +119,8 @@ export interface ModelAuthHandlerDeps {
   sessionStore: ModelSessionStore;
   ownership: Pick<ModelSessionOwnership, "snapshot">;
   now(): number;
+  /** Asks the hosted refresher to renew a ChatGPT plan record. Fire-and-forget; failures are ignored. */
+  requestPlanRefresh?(profileId: string): Promise<void>;
   /** Receives safe diagnostics only. Errors thrown by the logger are swallowed. */
   log?(diagnostic: SafeModelAuthDiagnostic): void;
   bodyDeadlineMs?: number;
@@ -359,6 +363,15 @@ export function createModelAuthHandlers(deps: ModelAuthHandlerDeps): ModelAuthHa
     return null;
   }
 
+  function requestRefresh(profileId: string): void {
+    if (!deps.requestPlanRefresh) return;
+    try {
+      void Promise.resolve(deps.requestPlanRefresh(profileId)).catch(() => undefined);
+    } catch {
+      /* fire-and-forget: a failing refresh request must not change the outcome */
+    }
+  }
+
   function checkout(auth: AuthenticatedGrant, raw: unknown): ModelAuthResponse {
     const parsed = parseModelAuthCheckoutRequest(raw);
     if (!parsed.ok) return failure("unauthorized", 400);
@@ -373,8 +386,8 @@ export function createModelAuthHandlers(deps: ModelAuthHandlerDeps): ModelAuthHa
     };
     const selection = selectionFor(auth, binding);
     if (!selection) return fail("unauthorized");
-    const subscription = isSubscriptionAuthMode(binding.authMode);
-    if (subscription) {
+    const reserves = reservesModelAccount(binding.authMode);
+    if (reserves) {
       const ownerFailure = verifyOwner(auth, binding, "checkout");
       if (ownerFailure) return fail(ownerFailure);
     }
@@ -388,7 +401,7 @@ export function createModelAuthHandlers(deps: ModelAuthHandlerDeps): ModelAuthHa
           revision: binding.profileRevision,
           provider: selection.provider,
           authMode: binding.authMode,
-          ...(subscription ? { ownerGeneration: binding.ownerGeneration } : {}),
+          ...(reserves ? { ownerGeneration: binding.ownerGeneration } : {}),
         },
         deps.credentials,
       );
@@ -397,7 +410,7 @@ export function createModelAuthHandlers(deps: ModelAuthHandlerDeps): ModelAuthHa
     }
     if (!resolution.ok) return fail(isSafeCategory(resolution.category) ? resolution.category : "persistence_failed");
 
-    const unusable: ModelAuthFailureCategory = subscription ? "recovery_required" : "authentication_required";
+    const unusable: ModelAuthFailureCategory = reserves ? "recovery_required" : "authentication_required";
     if (
       resolution.profileId !== binding.profileId ||
       resolution.revision !== binding.profileRevision ||
@@ -410,13 +423,19 @@ export function createModelAuthHandlers(deps: ModelAuthHandlerDeps): ModelAuthHa
       ok: true,
       profileId: binding.profileId,
       authMode: binding.authMode,
-      ...(subscription ? { ownerGeneration: binding.ownerGeneration } : {}),
+      ...(reserves ? { ownerGeneration: binding.ownerGeneration } : {}),
       secret: resolution.secret,
     };
     const response = parseModelAuthCheckoutResponse(candidate);
     if (!response.ok) return fail(unusable);
     if (!checkCheckoutResponseAgainstBindings(binding.profileId, response.value, auth.grant.bindings).ok) {
       return fail(unusable);
+    }
+    if (response.value.secret.kind === "chatgpt-access-token") {
+      if (response.value.secret.expiresAt - deps.now() < CHATGPT_MIN_TOKEN_LIFETIME_MS) {
+        requestRefresh(binding.profileId);
+        return fail("authentication_required");
+      }
     }
     log("checkout", binding.profileId, binding);
     return respond(200, response.value);
@@ -426,6 +445,12 @@ export function createModelAuthHandlers(deps: ModelAuthHandlerDeps): ModelAuthHa
     const parsed = parseModelAuthCheckpointRequest(raw);
     if (!parsed.ok) return failure("unauthorized", 400);
     const request = parsed.value;
+    // Hosted ChatGPT plan records take no checkpoint; refuse before any store or status call.
+    const requested = auth.grant.bindings.find((b) => b.profileId === request.profileId);
+    if (requested?.authMode === "codex-subscription") {
+      log("checkpoint", requested.profileId, requested, "unauthorized");
+      return failure("unauthorized", 400);
+    }
     const bound = checkCheckpointAgainstBindings(request, auth.grant.bindings);
     if (!bound.ok) {
       log("checkpoint", request.profileId, undefined, "unauthorized");

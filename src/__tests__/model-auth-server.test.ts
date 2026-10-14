@@ -50,8 +50,16 @@ let readSpy: Mock<(...args: any[]) => any>;
 let checkpointSpy: Mock<(...args: any[]) => any>;
 let lookupSpy: Mock<(...args: any[]) => any>;
 let transportSpy: Mock<(...args: any[]) => any>;
+let planReadSpy: Mock<(...args: any[]) => any>;
+let snapshotSpy: Mock<(...args: any[]) => any>;
+let refreshSpy: Mock<(...args: any[]) => any>;
+let refreshImpl: (profileId: string) => Promise<void>;
 
 const SUB: ModelAuthGrantBinding = { stage: "implementation", profileId: "sub1", profileRevision: 3, authMode: "claude-subscription", ownerGeneration: 1 };
+const CDX: ModelAuthGrantBinding = { stage: "implementation", profileId: "cdx1", profileRevision: 4, authMode: "codex-subscription" };
+const ACCESS_TOKEN = "SYNTH-CHATGPT-ACCESS-TOKEN";
+const REFRESH_TOKEN = "SYNTH-CHATGPT-REFRESH-TOKEN";
+const ID_TOKEN = "SYNTH-CHATGPT-ID-TOKEN";
 const KEYB: ModelAuthGrantBinding = { stage: "review", profileId: "key1", profileRevision: 2, authMode: "openai-api-key" };
 
 function build(): ServerModule.ModelAuthHandlers {
@@ -70,6 +78,8 @@ function depsFrom(): ServerModule.ModelAuthHandlerDeps {
     read: (...a) => { readSpy(...a); return (storeWrap.read ?? realStore.read)(...a); },
     checkpoint: (...a) => { checkpointSpy(...a); return (storeWrap.checkpoint ?? realStore.checkpoint)(...a); },
     importSession: (...a) => realStore.importSession(...a),
+    readPlanRecord: (...a) => { planReadSpy(...a); return (storeWrap.readPlanRecord ?? realStore.readPlanRecord)(...a); },
+    writePlanRecord: (...a) => realStore.writePlanRecord(...a),
   };
   const profile = (id: string, b: ModelAuthGrantBinding) => ({
     profileId: id,
@@ -82,7 +92,7 @@ function depsFrom(): ServerModule.ModelAuthHandlerDeps {
     status: "active" as const,
     ...profileOverrides[id],
   });
-  const all = [SUB, KEYB];
+  const all = [SUB, KEYB, CDX];
   return {
     isTrustedTransport: () => { transportSpy(); return trusted; },
     lookupGrant: (hash) => {
@@ -120,7 +130,8 @@ function depsFrom(): ServerModule.ModelAuthHandlerDeps {
       lookupReference: () => "model-account:key1",
     },
     sessionStore,
-    ownership,
+    ownership: { snapshot: (...a) => { snapshotSpy(...a); return ownership.snapshot(...a); } },
+    requestPlanRefresh: (id) => { refreshSpy(id); return refreshImpl(id); },
     now: () => nowValue,
     log: (d) => logs.push(d),
     bodyDeadlineMs: 50,
@@ -168,7 +179,7 @@ async function boot() {
 beforeEach(async () => {
   dbPath = path.join(os.tmpdir(), `model-auth-server-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
   logs = [];
-  bindings = [SUB, KEYB];
+  bindings = [SUB, KEYB, CDX];
   grantOverrides = {};
   dispatchOverrides = {};
   selections = {};
@@ -184,6 +195,10 @@ beforeEach(async () => {
   checkpointSpy = vi.fn();
   lookupSpy = vi.fn();
   transportSpy = vi.fn();
+  planReadSpy = vi.fn();
+  snapshotSpy = vi.fn();
+  refreshSpy = vi.fn();
+  refreshImpl = async () => undefined;
   await boot();
   handlers = build();
   const r = ownership.reserve({ dispatchId: "d1", profiles: [{ profileId: "sub1", authMode: "subscription" }] });
@@ -192,7 +207,7 @@ beforeEach(async () => {
   expect(generation).toBe(1);
   expect(store.importSession({ profileId: "sub1", ownerGeneration: 1, sessionData: `${SESSION}-0`, operator: OPERATOR }).ok).toBe(true);
   expect(ownership.markRunning({ dispatchId: "d1", profileId: "sub1", generation: 1 }).status).toBe("ok");
-  for (const spy of [resolveSpy, revisionSpy, readSpy, checkpointSpy, lookupSpy, transportSpy]) spy.mockClear();
+  for (const spy of [resolveSpy, revisionSpy, readSpy, checkpointSpy, lookupSpy, transportSpy, planReadSpy, snapshotSpy, refreshSpy]) spy.mockClear();
 });
 
 afterEach(() => {
@@ -530,5 +545,113 @@ describe("revalidation after the asynchronous body read", () => {
     const first = await checkpoint(1);
     expect(first.status).toBe(200);
     expect((await checkpoint(1)).status).toBe(200);
+  });
+});
+
+
+describe("codex-subscription (hosted ChatGPT access token)", () => {
+  const planRecord = (expiresAt: number) => JSON.stringify({
+    version: 1,
+    email: "user@example.com",
+    issuer: "https://auth.openai.com",
+    subject: "sub-1",
+    clientId: "client-1",
+    extAgentHostId: "host-1",
+    idToken: ID_TOKEN,
+    accessToken: ACCESS_TOKEN,
+    refreshToken: REFRESH_TOKEN,
+    tokenType: "Bearer",
+    scopes: ["chatgpt.tokens.use.direct"],
+    accessTokenExpiresAt: expiresAt,
+    earliestRefreshAt: null,
+    savedAt: NOW - 1000,
+  });
+  const seed = (data: string) =>
+    expect(store.writePlanRecord({ profileId: "cdx1", expectedSequence: null, sessionData: data }).ok).toBe(true);
+  const noTokenLeak = (res: ServerModule.ModelAuthResponse, allowAccess = false) => {
+    const text = JSON.stringify(res) + JSON.stringify(logs);
+    expect(text).not.toContain(REFRESH_TOKEN);
+    expect(text).not.toContain(ID_TOKEN);
+    if (!allowAccess) expect(text).not.toContain(ACCESS_TOKEN);
+  };
+
+  it("missing record: authentication_required, no refresh", async () => {
+    const res = await checkout("cdx1");
+    expect(res).toMatchObject({ status: 424, body: { ok: false, category: "authentication_required" } });
+    expect(refreshSpy).not.toHaveBeenCalled();
+    noTokenLeak(res);
+  });
+
+  it.each([
+    ["unreadable store", () => { storeWrap = { readPlanRecord: () => ({ ok: false, category: "persistence_failed", reason: "write_failed" } as never) }; handlers = build(); }],
+    ["throwing store", () => { storeWrap = { readPlanRecord: () => { throw new Error(STORE_ERROR); } }; handlers = build(); }],
+    ["bad JSON", () => seed("not json {")],
+    ["invalid record", () => seed(JSON.stringify({ version: 1, accessToken: ACCESS_TOKEN, refreshToken: REFRESH_TOKEN }))],
+  ])("%s: persistence_failed, no refresh", async (_n, setup) => {
+    setup();
+    const res = await checkout("cdx1");
+    expect(res).toMatchObject({ status: 503, body: { ok: false, category: "persistence_failed" } });
+    expect(refreshSpy).not.toHaveBeenCalled();
+    noTokenLeak(res);
+    expect(JSON.stringify(res) + JSON.stringify(logs)).not.toContain(STORE_ERROR);
+  });
+
+  it("serves a token with 2 minutes or more left, without ownerGeneration or other record fields", async () => {
+    seed(planRecord(NOW + 120_000));
+    const res = await checkout("cdx1");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      version: 1,
+      ok: true,
+      profileId: "cdx1",
+      authMode: "codex-subscription",
+      secret: { kind: "chatgpt-access-token", accessToken: ACCESS_TOKEN, expiresAt: NOW + 120_000 },
+    });
+    expect(refreshSpy).not.toHaveBeenCalled();
+    noTokenLeak(res, true);
+    expect(JSON.stringify(logs)).not.toContain(ACCESS_TOKEN);
+  });
+
+  it("refuses a token with less than 2 minutes left and requests one refresh", async () => {
+    seed(planRecord(NOW + 119_999));
+    const res = await checkout("cdx1");
+    expect(res).toMatchObject({ status: 424, body: { ok: false, category: "authentication_required" } });
+    expect(refreshSpy).toHaveBeenCalledTimes(1);
+    expect(refreshSpy).toHaveBeenCalledWith("cdx1");
+    noTokenLeak(res);
+  });
+
+  it("ignores a refresh that rejects, throws, or never resolves", async () => {
+    seed(planRecord(NOW + 10));
+    for (const impl of [
+      () => Promise.reject(new Error(STORE_ERROR)),
+      () => { throw new Error(STORE_ERROR); },
+      () => new Promise<void>(() => undefined),
+    ]) {
+      refreshImpl = impl as never;
+      const res = await checkout("cdx1");
+      expect(res).toMatchObject({ status: 424, body: { category: "authentication_required" } });
+      noTokenLeak(res);
+    }
+    expect(refreshSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it("makes no owner check on checkout, while claude-subscription still does", async () => {
+    seed(planRecord(NOW + 600_000));
+    expect((await checkout("cdx1")).status).toBe(200);
+    expect(snapshotSpy).not.toHaveBeenCalled();
+    expect((await checkout("sub1")).status).toBe(200);
+    expect(snapshotSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a checkpoint with 400 before any store or ownership call", async () => {
+    seed(planRecord(NOW + 600_000));
+    planReadSpy.mockClear();
+    const res = await handlers.handle(req("checkpoint", { version: 1, profileId: "cdx1", ownerGeneration: 1, stateSequence: 1, sessionData: "x" }));
+    expect(res).toMatchObject({ status: 400, body: { ok: false, category: "unauthorized" } });
+    expect(checkpointSpy).not.toHaveBeenCalled();
+    expect(planReadSpy).not.toHaveBeenCalled();
+    expect(snapshotSpy).not.toHaveBeenCalled();
+    expect(store.readPlanRecord("cdx1")).toMatchObject({ ok: true, stateSequence: 0 });
   });
 });

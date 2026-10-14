@@ -16,21 +16,13 @@ import type * as StoreModule from "../agent-config-store.js";
 import type * as OwnershipModule from "../model-session-ownership.js";
 import type * as SessionModule from "../model-session-store.js";
 
-// The real resolver still treats codex-subscription as session-based (needs an owner
-// generation); the ChatGPT checkout resolver is a separate module. Stand in for it on the
-// `cdx` profile only, so Claude, API-key and Bedrock rows keep the real resolver.
 // `events` records resolver calls and reservations in order, to assert proof timing.
 let events: string[];
-let codexProof: { ok: true } | { ok: false; category: string; code: string };
 const mockCredentials = () => vi.doMock("../model-credentials.js", async () => {
   const actual = await vi.importActual<typeof import("../model-credentials.js")>("../model-credentials.js");
   return {
     ...actual,
     resolveModelCredential: (req: { profileId: string }, d: never) => {
-      if (req.profileId === "cdx") {
-        events.push("proof:cdx");
-        return codexProof.ok ? { ok: true, profileId: req.profileId } : codexProof;
-      }
       const result = actual.resolveModelCredential(req as never, d);
       events.push(`proof:${req.profileId}`);
       return result;
@@ -142,7 +134,6 @@ beforeEach(async () => {
   vi.resetModules();
   process.env.DEDUP_DB_PATH = dbPath;
   events = [];
-  codexProof = { ok: true };
   mockCredentials();
   dedup = await import("../dedup.js");
   prep = await import("../agent-run-preparation.js");
@@ -156,6 +147,14 @@ beforeEach(async () => {
     authorizeOperator: (op) => op === OPERATOR,
   });
   ownership = own.createModelSessionOwnership({ store: sessions, probe: () => "terminated" });
+  // A stored ChatGPT plan record, so the real resolver proves the `cdx` profile.
+  const seeded = sessions.writePlanRecord({ profileId: "cdx", expectedSequence: null, sessionData: JSON.stringify({
+    version: 1, email: "u@example.com", issuer: "https://auth.openai.com", subject: "s", clientId: "c",
+    extAgentHostId: "h", idToken: "synthetic-id", accessToken: "synthetic-access", refreshToken: "synthetic-refresh",
+    tokenType: "Bearer", scopes: ["chatgpt.tokens.use.direct"], accessTokenExpiresAt: Date.now() + 3_600_000,
+    earliestRefreshAt: null, savedAt: Date.now(),
+  }) });
+  if (!seeded.ok) throw new Error("plan record seed failed");
   trust = { [REPO]: PRIVATE, [KG_REPO]: PRIVATE };
   files = {
     ".github/workflows/claude-implement.yml": WORKFLOW,
@@ -757,7 +756,7 @@ describe("codex-subscription is not reserved", () => {
 
   it("fails a codex credential proof as session_unavailable before reserving anything", async () => {
     useStages(API, CODEX);
-    codexProof = { ok: false, category: "authentication_required", code: "session_unavailable" };
+    dedup.getDb().prepare("DELETE FROM model_session_generations WHERE profile_id = 'cdx'").run();
     const before = counts().reservations;
     expect(await prep.prepareAgentRun(request(), deps)).toEqual({
       status: "authentication-required", code: "session_unavailable", stage: "implementation", profileId: "cdx",
@@ -770,7 +769,7 @@ describe("codex-subscription is not reserved", () => {
 
   it("reserves nothing in a mixed snapshot when the codex proof fails", async () => {
     useStages(CODEX, ["sub", "claude", "anthropic"]);
-    codexProof = { ok: false, category: "authentication_required", code: "session_unavailable" };
+    dedup.getDb().prepare("DELETE FROM model_session_generations WHERE profile_id = 'cdx'").run();
     const before = counts().reservations;
     const r = await prep.prepareAgentRun(request(), deps);
     expect(r).toMatchObject({ status: "authentication-required", code: "session_unavailable", profileId: "cdx" });
