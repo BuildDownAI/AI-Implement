@@ -70,6 +70,7 @@ function makeMapping(maxInProgressAiIssues = 3): RepoMapping {
     sensitiveAddPatterns: null,
     sensitiveAllowPatterns: null,
     dependencyTokenScope: null,
+    reviewFixLifecycle: null,
     memoryProviderId: null,
     reviewers: null,
   };
