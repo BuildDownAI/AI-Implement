@@ -61,7 +61,7 @@ beforeEach(async () => {
   vi.resetModules();
   process.env.DEDUP_DB_PATH = dbPath;
   process.env.RUNNER_TOKEN_SECRET = SECRET;
-  vi.doMock("../github-app-auth.js", () => ({ getInstallationToken: async () => TOKEN }));
+  vi.doMock("../github-app-auth.js", () => ({ getScopedInstallationToken: async () => ({ token: TOKEN, expiresAt: "", installationId: 1 }) }));
   dedup = await import("../dedup.js");
   mod = await import("../model-auth-runtime.js");
   store = await import("../agent-config-store.js");

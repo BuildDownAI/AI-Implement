@@ -11,7 +11,8 @@
 import { getProjectOptIn } from "./agent-config-store.js";
 import type { AgentRunPreparationDeps } from "./agent-run-preparation.js";
 import { getDb } from "./dedup.js";
-import { getInstallationToken } from "./github-app-auth.js";
+import { getScopedInstallationToken } from "./github-app-auth.js";
+import { defaultFetchSignal } from "./github.js";
 import type { ModelCredentialDeps } from "./model-credentials.js";
 import { createModelSessionKeyProvider } from "./model-session-keys.js";
 import { createModelSessionOwnership, sessionOwnerVerifier } from "./model-session-ownership.js";
@@ -68,9 +69,13 @@ export function createModelAuthRuntime(input: {
   // Operator decision: no new secrets. An API-key profile prepares as authentication-required.
   const credentials: ModelCredentialDeps = { sessionStore, resolveProtectedSecret: () => null };
 
-  async function token(owner: string): Promise<string> {
+  /** Installation token narrowed to the one repository being checked. */
+  async function token(owner: string, repo: string): Promise<string> {
     try {
-      return await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+      const scoped = await getScopedInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner, {
+        repositories: [repo],
+      });
+      return scoped.token;
     } catch {
       throw new Error("could not obtain a GitHub installation token");
     }
@@ -79,7 +84,7 @@ export function createModelAuthRuntime(input: {
   async function fetchVisibility(repository: string): Promise<RepoVisibility> {
     const m = REPO_REF.exec(repository);
     if (!m) throw new Error("malformed repository reference");
-    const bearer = await token(m[1]!);
+    const bearer = await token(m[1]!, m[2]!);
     let res: Response;
     try {
       res = await fetchImpl(`https://api.github.com/repos/${m[1]}/${m[2]}`, {
@@ -89,7 +94,7 @@ export function createModelAuthRuntime(input: {
           "User-Agent": "linear-dispatch-worker",
           Authorization: `Bearer ${bearer}`,
         },
-        signal: AbortSignal.timeout(Number(process.env.FETCH_TIMEOUT_MS) || 60_000),
+        signal: defaultFetchSignal(),
       });
     } catch {
       throw new Error("repository visibility fetch failed");
@@ -131,7 +136,7 @@ export function createModelAuthRuntime(input: {
           const resolved = await resolveSessionImage({
             owner: target.owner,
             repo: target.repo,
-            token: await token(target.owner),
+            token: await token(target.owner, target.repo),
             defaultImage: config.sessionImage,
             fetchImpl,
           });
