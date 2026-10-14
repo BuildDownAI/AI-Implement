@@ -36,6 +36,29 @@ export const LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS = 5 * 60 * 1000;
 /** Marker of the PR comment the approve step posts; also the once-only check. */
 export const LATE_EXTERNAL_APPROVAL_MARKER = "<!-- ai-implement late-external-approval -->";
 
+/** Marker of the PR comment the `held` step posts; once per workflow key. */
+export function lateExternalHeldMarker(key: string): string {
+  return `<!-- ai-implement late-external-held key=${key} -->`;
+}
+
+/** Why Claude's newest review of the head blocks it. */
+export type HeldReason = "incomplete" | "unreadable" | "changes_requested" | "changes_requested-empty";
+
+const HELD_ACTIONS: Record<HeldReason | "ledger" | "timed-out" | "generic", string> = {
+  incomplete: "Claude's review of this commit did not finish. Re-run the Claude review on this commit (re-run its check, or push a commit); when it approves, post `/ai-implement verify only, make no code change`; or merge by hand.",
+  unreadable: "Claude's review of this commit could not be read. Re-run the Claude review on this commit (re-run its check, or push a commit); when it approves, post `/ai-implement verify only, make no code change`; or merge by hand.",
+  "changes_requested-empty": "Claude requested changes but listed no finding, so no fix run starts. Read the review, then post `/ai-implement <what to change>`; or merge by hand.",
+  changes_requested: "A blocking finding is open. If a review-fix run starts, do nothing; if none starts, post `/ai-implement <what to change>`.",
+  ledger: "A blocking finding is open. If a review-fix run starts, do nothing; if none starts, post `/ai-implement <what to change>`.",
+  "timed-out": "The external review did not finish within 30 minutes. When it approves, post `/ai-implement verify only, make no code change`; or merge by hand.",
+  generic: "The external review has not approved this commit. Read the review; when it approves, post `/ai-implement verify only, make no code change`; if a blocking finding is open and no review-fix run starts, post `/ai-implement <what to change>`; or merge by hand.",
+};
+
+/** The held comment. `reason` is the tick's `heldBy` (absent on a tick journaled before it existed), or `timed-out`. */
+export function heldCommentBody(key: string, sha: string, reason: HeldReason | "ledger" | "timed-out" | undefined): string {
+  return `${lateExternalHeldMarker(key)}\n⚠️ AI-Implement did not write the approval mark for ${sha}, so auto-merge holds this PR.\n\n${HELD_ACTIONS[reason ?? "generic"]}`;
+}
+
 export const lateExternalReviewInputSchema = z.object({
   dispatchId: z.string().min(1),
   owner: z.string().min(1),
@@ -77,6 +100,8 @@ export interface LateReviewTick {
   headCommittedAtMs: number | null;
   /** `last_seen_at` (epoch ms) of every open `blocking` finding in the orchestrator's ledger. */
   blockingLastSeenAtMs: number[];
+  /** Why the tick is blocked: the verdict reason, else `ledger` for a blocking row seen at or after the commit time. Absent on a tick journaled before it existed. */
+  heldBy?: "ledger" | HeldReason;
 }
 
 /** `inFlight`: the row is `dispatched` or `running`, so a run is still writing its outcome. */
@@ -95,7 +120,7 @@ export interface LateExternalReviewDependencies {
   findJob(dispatchId: string): LateReviewJob | null | Promise<LateReviewJob | null>;
   stampApproved(jobId: number, prUrl: string): void | Promise<void>;
   /** `true` when a PR comment with `marker` exists already. */
-  hasComment(input: LateExternalReviewInput, marker: string): Promise<boolean>;
+  hasComment(input: LateExternalReviewInput, marker: string, opts?: { strict?: boolean }): Promise<boolean>;
   postComment(input: LateExternalReviewInput, body: string): Promise<void>;
   /** Test seams; production leaves them unset. */
   intervalMs?: number;
@@ -122,6 +147,24 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
       ctx.set("outcome", outcome);
       ctx.console.log(`[late-external-review] ended dispatch=${input.dispatchId} outcome=${outcome}`);
       return { outcome };
+    }
+
+    // The one step after `end()` on the `findings` / `timed-out` paths. It is last on its path, so a workflow journaled
+    // before it existed replays unchanged. Strict read: an unreadable list throws and retries, never posts twice.
+    async function endHeld(outcome: "findings" | "timed-out", sha: string, heldBy: LateReviewTick["heldBy"]): Promise<LateExternalReviewResult> {
+      const result = end(outcome);
+      try {
+        await ctx.run("held", async () => {
+          const marker = lateExternalHeldMarker(ctx.key);
+          if (!(await deps.hasComment(input, marker, { strict: true }))) {
+            await deps.postComment(input, heldCommentBody(ctx.key, sha, heldBy ?? (outcome === "timed-out" ? "timed-out" : undefined)));
+          }
+        }, { maxRetryAttempts: 5 });
+      } catch (err) {
+        if (!(err instanceof restate.TerminalError)) throw err;
+        ctx.console.log(`[late-external-review] held comment failed dispatch=${input.dispatchId}: ${err.message}`);
+      }
+      return result;
     }
 
     // A gap-fill names no head: the PR's head when the workflow starts is the one it reviews. Journaled, so a replay keeps it.
@@ -153,12 +196,12 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
       const commitMs = tick.headCommittedAtMs;
       const blocked = tick.blockingLastSeenAtMs.some((seen) => commitMs === null || seen >= commitMs);
       // Follow mode keeps waiting on a 🔴: the repository's auto-fix may push again, and the next head is read afresh.
-      if (blocked && !input.followHead) return end("findings");
+      if (blocked && !input.followHead) return endHeld("findings", tick.headSha ?? headSha, tick.heldBy);
       if (tick.checks === "success" && !blocked) {
         if (input.followHead && tick.headSha) approvedHeadSha = tick.headSha;
         break;
       }
-      if ((await ctx.date.now()) - startedAt >= deadlineMs) return end("timed-out");
+      if ((await ctx.date.now()) - startedAt >= deadlineMs) return endHeld("timed-out", tick.headSha ?? headSha, tick.heldBy);
       await ctx.sleep(intervalMs);
     }
 
@@ -214,13 +257,13 @@ function reviewLedgerOptionsFor(owner: string, repo: string): ReviewLedgerOption
 }
 
 /**
- * `true` when Claude's newest review comment on the PR was written for the current head and does not approve it
+ * The reason when Claude's newest review comment on the PR was written for the current head and does not approve it
  * (AII-1303). The ledger stores no verdict, so a `changes_requested` review with only `minor` findings leaves no
  * blocking row. The comment carries no SHA: "of this head" is `updated_at`/`created_at` at or after the head's commit
  * time, the rule the ledger uses for findings. A recognised review with no verdict (the old heading format) does not
  * block unless its findings could not be read; its blocking findings are in the ledger.
  */
-async function newestReviewRejectsHead(token: string, input: { owner: string; repo: string; prNumber: number }, headCommittedAtMs: number): Promise<boolean> {
+async function newestReviewRejectsHead(token: string, input: { owner: string; repo: string; prNumber: number }, headCommittedAtMs: number): Promise<HeldReason | undefined> {
   const options = reviewLedgerOptionsFor(input.owner, input.repo);
   const comments = (await listPrComments(token, input.owner, input.repo, input.prNumber, { strict: true }))
     .map((c, index) => ({ c, index, at: Date.parse(c.updatedAt ?? c.createdAt ?? "") }))
@@ -234,10 +277,13 @@ async function newestReviewRejectsHead(token: string, input: { owner: string; re
     }, options);
     if (classified === null) continue;
     // The newest recognised review decides; an older head's review does not count.
-    if (at < headCommittedAtMs) return false;
-    return classified.findingsUnavailable || (classified.verdict !== undefined && classified.verdict !== "approve");
+    if (at < headCommittedAtMs) return undefined;
+    if (classified.findingsUnavailable) return "unreadable";
+    if (classified.verdict === "incomplete") return "incomplete";
+    if (classified.verdict === "changes_requested") return classified.findings.length === 0 ? "changes_requested-empty" : "changes_requested";
+    return undefined;
   }
-  return false;
+  return undefined;
 }
 
 /** Production deps. A fresh installation token per call; it is never journaled. */
@@ -291,16 +337,21 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
       // A late head (initial run or gap-fill) is never judged in-run, and the ledger has no verdict: read Claude's
       // own (AII-1303). The tick reports it as a blocking finding seen now, which the workflow ends `findings` on.
       // The read throws when the comment list is unreadable, so the step retries rather than reading "no review".
-      if (!input.followHead && await newestReviewRejectsHead(t, input, headCommittedAtMs)) blockingLastSeenAtMs.push(Date.now());
-      return { open, headSha: pr.headSha, checks, headCommittedAtMs, blockingLastSeenAtMs };
+      const rejected = input.followHead ? undefined : await newestReviewRejectsHead(t, input, headCommittedAtMs);
+      if (rejected) blockingLastSeenAtMs.push(Date.now());
+      const heldBy = rejected ?? (blockingLastSeenAtMs.some((seen) => seen >= headCommittedAtMs) ? "ledger" as const : undefined);
+      return { open, headSha: pr.headSha, checks, headCommittedAtMs, blockingLastSeenAtMs, ...(heldBy ? { heldBy } : {}) };
     },
     findJob(dispatchId) {
       const job = getJobByDispatchId(dispatchId);
       return job ? { id: job.id, approved: job.approved, inFlight: job.status === "dispatched" || job.status === "running" } : null;
     },
     stampApproved: (jobId, prUrl) => stampJobApproved(jobId, prUrl),
-    async hasComment(input, marker) {
-      const comments = await listPrComments(await token(input.owner), input.owner, input.repo, input.prNumber);
+    async hasComment(input, marker, opts) {
+      const t = await token(input.owner);
+      const comments = opts?.strict
+        ? await listPrComments(t, input.owner, input.repo, input.prNumber, { strict: true })
+        : await listPrComments(t, input.owner, input.repo, input.prNumber);
       return comments.some((c) => c.body.includes(marker));
     },
     async postComment(input, body) {

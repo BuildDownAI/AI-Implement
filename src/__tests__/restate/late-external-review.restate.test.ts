@@ -47,6 +47,14 @@ const scenarioOf = (id: string): Scenario => {
   return sc;
 };
 
+// The comment names the last tick's head (in follow mode that is the head the review ran against).
+function expectOneHeld(sc: Scenario, text?: string, sha = SHA) {
+  expect(sc.comments).toHaveLength(1);
+  expect(sc.comments[0]).toContain("<!-- ai-implement late-external-held key=");
+  expect(sc.comments[0]).toContain(`for ${sha}, so auto-merge holds this PR.`);
+  if (text) expect(sc.comments[0]).toContain(text);
+}
+
 const COMMIT_MS = 1_000_000;
 const pending: LateReviewTick = { open: true, headSha: SHA, checks: "pending", headCommittedAtMs: COMMIT_MS, blockingLastSeenAtMs: [] };
 const passed: LateReviewTick = { ...pending, checks: "success" };
@@ -88,7 +96,7 @@ function makeDeps(): LateExternalReviewDependencies {
       sc.stamps.push(jobId);
       sc.jobApproved = true;
     },
-    async hasComment(input, marker) {
+    async hasComment(input, marker, _opts) {
       return scenarioOf(input.dispatchId).comments.some((c) => c.includes(marker));
     },
     async postComment(input, body) {
@@ -175,7 +183,7 @@ describe("LateExternalReview workflow", () => {
         const { result, sc } = await runScenario(url(), { ticks: [pending, { ...passed, blockingLastSeenAtMs: [COMMIT_MS + 5] }] });
         expect(result).toEqual({ outcome: "findings" });
         expect(sc.stamps).toEqual([]);
-        expect(sc.comments).toEqual([]);
+        expectOneHeld(sc);
       });
 
       it("ends findings on a blocking finding last seen exactly at the commit time", async () => {
@@ -187,7 +195,7 @@ describe("LateExternalReview workflow", () => {
         const { result, sc } = await runScenario(url(), { ticks: [pending, { ...pending, blockingLastSeenAtMs: [COMMIT_MS + 5] }, passed] });
         expect(result).toEqual({ outcome: "findings" });
         expect(sc.stamps).toEqual([]);
-        expect(sc.comments).toEqual([]);
+        expectOneHeld(sc);
       });
 
       it("ends superseded when the head changes while waiting", async () => {
@@ -214,14 +222,45 @@ describe("LateExternalReview workflow", () => {
         const { result, sc } = await runScenario(url(), { ticks: [{ ...passed, blockingLastSeenAtMs: [COMMIT_MS + 1] }] });
         expect(result).toEqual({ outcome: "findings" });
         expect(sc.stamps).toEqual([]);
-        expect(sc.comments).toEqual([]);
+        expectOneHeld(sc);
       });
 
       it("ends timed-out when the checks stay pending past the deadline", async () => {
         const { result, sc } = await runScenario(url(), { ticks: [pending] });
         expect(result).toEqual({ outcome: "timed-out" });
         expect(sc.stamps).toEqual([]);
-        expect(sc.comments).toEqual([]);
+        expectOneHeld(sc, "did not finish within 30 minutes");
+      });
+
+      it("uses the last blocked tick's heldBy text for a follow-mode timed-out", async () => {
+        const blocked = { ...pending, blockingLastSeenAtMs: [COMMIT_MS + 1], heldBy: "ledger" as const };
+        const { result, sc } = await runScenario(url(), { ticks: [blocked] }, true);
+        expect(result).toEqual({ outcome: "timed-out" });
+        expectOneHeld(sc, "A blocking finding is open");
+      });
+
+      it("names the verdict reason and the tick's head in the held comment", async () => {
+        const { sc } = await runScenario(url(), { ticks: [{ ...passed, blockingLastSeenAtMs: [COMMIT_MS + 1], heldBy: "incomplete" }] });
+        expectOneHeld(sc, "Re-run the Claude review");
+      });
+
+      it("a tick journaled without heldBy posts the generic text", async () => {
+        const { sc } = await runScenario(url(), { ticks: [{ ...passed, blockingLastSeenAtMs: [COMMIT_MS + 1] }] });
+        expectOneHeld(sc, "has not approved this commit");
+      });
+
+      it.each(["findings", "timed-out"] as const)("a crash after the held post on %s posts no second comment", async (kind) => {
+        const ticks = kind === "findings" ? [{ ...passed, blockingLastSeenAtMs: [COMMIT_MS + 1] }] : [pending];
+        const { result, sc } = await runScenario(url(), { ticks, crashAfterComment: true });
+        expect(result.outcome).toBe(kind);
+        expectOneHeld(sc);
+      });
+
+      it("the attempt-keyed workflow posts one held comment under its own key", async () => {
+        const { result, sc } = await runScenario(url(), { ticks: [{ ...passed, blockingLastSeenAtMs: [COMMIT_MS + 1] }] }, false, true, undefined, "att-held");
+        expect(result.outcome).toBe("findings");
+        expectOneHeld(sc);
+        expect(sc.comments[0]).toContain("-att-held -->");
       });
 
       describe("review-fix attempt submit (AII-1307)", () => {
@@ -246,6 +285,7 @@ describe("LateExternalReview workflow", () => {
           expect(result).toEqual({ outcome: "findings" });
           expect(sc.stamps).toEqual([]);
           expect(sc.jobApproved).toBe(false);
+          expectOneHeld(sc);
         });
 
         it("ends superseded with no mark or comment when the newest row is still in flight", async () => {
@@ -275,7 +315,7 @@ describe("LateExternalReview workflow", () => {
           const { result, sc } = await gap({ ticks: [pending, { ...passed, blockingLastSeenAtMs: [COMMIT_MS + 5] }] });
           expect(result).toEqual({ outcome: "findings" });
           expect(sc.stamps).toEqual([]);
-          expect(sc.comments).toEqual([]);
+          expectOneHeld(sc);
           expect(sc.headReads).toBe(1);
         });
 
@@ -284,7 +324,7 @@ describe("LateExternalReview workflow", () => {
           const { result, sc } = await gap({ ticks: [pending, { ...passed, blockingLastSeenAtMs: [COMMIT_MS + 60_000] }] });
           expect(result).toEqual({ outcome: "findings" });
           expect(sc.stamps).toEqual([]);
-          expect(sc.comments).toEqual([]);
+          expectOneHeld(sc);
         });
 
         it("writes the mark once the review check passed with no blocking finding", async () => {
@@ -312,7 +352,7 @@ describe("LateExternalReview workflow", () => {
           const { result, sc } = await gap({ ticks: [pending], reviewerExpected: true });
           expect(result).toEqual({ outcome: "timed-out" });
           expect(sc.stamps).toEqual([]);
-          expect(sc.comments).toEqual([]);
+          expectOneHeld(sc, "did not finish within 30 minutes");
           expect(sc.reviewerReads).toBe(1);
         });
 
@@ -362,7 +402,7 @@ describe("LateExternalReview workflow", () => {
           const { result, sc } = await runScenario(url(), { ticks: [pending] }, true);
           expect(result).toEqual({ outcome: "timed-out" });
           expect(sc.stamps).toEqual([]);
-          expect(sc.comments).toEqual([]);
+          expectOneHeld(sc, "did not finish within 30 minutes");
         });
 
         it("ends timed-out with no mark when the new head's review never reads as done", async () => {
@@ -372,7 +412,7 @@ describe("LateExternalReview workflow", () => {
           const { result, sc } = await runScenario(url(), { ticks: [pending, onB] }, true);
           expect(result).toEqual({ outcome: "timed-out" });
           expect(sc.stamps).toEqual([]);
-          expect(sc.comments).toEqual([]);
+          expectOneHeld(sc, "did not finish within 30 minutes", OTHER_SHA);
         });
 
         it("ends superseded with no mark when the PR closes while waiting", async () => {
