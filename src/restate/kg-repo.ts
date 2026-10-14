@@ -10,6 +10,13 @@
  * and `KgRefresh → KgRepo` are both one-way sends, so no exclusive-handler cycle exists
  * between this object and the workflow it starts.
  *
+ * There is no lease clock (AII-1297): the `KgRefresh.run` invocation holds the lock for its whole
+ * life. `submit` stores that invocation's id in the marker and sends the shared `watch`, which
+ * attaches to the invocation and sends `release` when it ends, however it ends (done, failed,
+ * killed, cancelled). The run's own `release` is the fast path. A paused run holds the lock until
+ * an operator cancels it in the Restate UI. `expire` only clears a legacy marker with no
+ * `invocationId`.
+ *
  * kg-refresh has one owner, unlike the review-fix pilot this pattern is anchored on
  * (`src/restate/review-fix-pr.ts`) — so this object carries none of the pilot's shared
  * admission, owner fences, or selector machinery. Its one queue is the PR-check dry-run
@@ -17,13 +24,11 @@
  * `release` submits the oldest held entry when the in-flight refresh lets go.
  */
 import * as restate from "@restatedev/restate-sdk";
-import type { ObjectContext, ObjectSharedContext } from "@restatedev/restate-sdk";
+import type { InvocationId, ObjectContext, ObjectSharedContext } from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import { MAX_TRACKED_PRS, type KgDryRunReportTarget, type RefreshOutcome } from "../kg-refresh.js";
 import {
-  KG_REFRESH_TOTAL_DEADLINE_MS,
-  KG_REPO_STALE_MARGIN_MS,
   kgDryRunReportSchema,
   kgRefreshOptionsSchema,
   type KgRefreshRunInput,
@@ -33,8 +38,8 @@ import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.j
 interface InFlightMarker {
   triggerId: string;
   startedAt: number;
-  /** Epoch ms when `expire` may clear the marker; `extend` moves it later. Absent on markers written before AII-1254. */
-  leaseUntil?: number;
+  /** The `KgRefresh.run` invocation that holds the lock. Absent on markers written before AII-1297. */
+  invocationId?: string;
 }
 
 /** One held PR-check dry-run request, keyed in state by `<repo>#<prNumber>`. */
@@ -47,12 +52,6 @@ interface PendingDryRun {
 export interface KgRepoDependencies {
   /** The Restate service name of the workflow this object starts — "KgRefresh" in production. */
   workflowName: string;
-  /** Overrides `KG_REPO_STALE_MARGIN_MS` for a deterministic expiry test. Production leaves this unset. */
-  staleMarginMs?: number;
-  /** Overrides `KG_REFRESH_TOTAL_DEADLINE_MS` in the expiry delay for a deterministic test. Production leaves this unset. */
-  totalDeadlineMs?: number;
-  /** Test only: write the marker without `leaseUntil`, the shape written before AII-1254. Production leaves this unset. */
-  omitLeaseUntil?: boolean;
 }
 
 export type KgRepoTriggerResult = { triggerId: string } | { status: "refresh-in-progress"; triggerId: string };
@@ -77,7 +76,7 @@ const recordOutcomeInputSchema = z.object({
 
 const leaseInputSchema = z.object({ triggerId: z.string().min(1) }).strict();
 
-const extendInputSchema = z.object({ triggerId: z.string().min(1), until: z.number() }).strict();
+const watchInputSchema = z.object({ triggerId: z.string().min(1), invocationId: z.string().min(1) }).strict();
 
 export type KgRepoTriggerInput = z.infer<typeof kgRefreshOptionsSchema>;
 export type KgRepoPrInput = z.infer<typeof prInputSchema>;
@@ -106,24 +105,18 @@ export function buildRunParameter(
 }
 
 export function createKgRepo(deps: KgRepoDependencies) {
-  /** The in-flight marker, or null. The marker has no age: the workflow schedules `expire` for its own lease. */
+  /** The in-flight marker, or null. The marker has no age: the run invocation holds it. */
   async function liveInFlight(ctx: ObjectContext): Promise<InFlightMarker | null> {
     return (await ctx.get<InFlightMarker>("inFlight")) ?? null;
   }
 
-  /** Marks a new refresh in flight and hands it to `KgRefresh.run` by one-way send. */
-  function submit(ctx: ObjectContext, now: number, opts: KgRepoTriggerInput & { report?: KgDryRunReportTarget }): string {
+  /** Marks a new refresh in flight, hands it to `KgRefresh.run` by one-way send, and starts the `watch` that frees the lock when the run invocation ends. */
+  async function submit(ctx: ObjectContext, now: number, opts: KgRepoTriggerInput & { report?: KgDryRunReportTarget }): Promise<string> {
     const triggerId = ctx.rand.uuidv4();
-    const leaseMs = (deps.totalDeadlineMs ?? KG_REFRESH_TOTAL_DEADLINE_MS) + (deps.staleMarginMs ?? KG_REPO_STALE_MARGIN_MS);
-    ctx.set<InFlightMarker>("inFlight", deps.omitLeaseUntil ? { triggerId, startedAt: now } : { triggerId, startedAt: now, leaseUntil: now + leaseMs });
-    ctx.workflowSendClient<KgRefreshDefinition>({ name: deps.workflowName as "KgRefresh" }, triggerId).run(buildRunParameter(opts, triggerId));
-    // The object owns the lease's expiry: a run that never reaches the workflow's dispatch step
-    // still clears at the deadline plus margin. A normal `release` clears it first, and the
-    // later `expire` no longer matches the trigger id.
-    ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, ctx.key).expire(
-      { triggerId },
-      restate.rpc.sendOpts({ delay: leaseMs }),
-    );
+    const handle = ctx.workflowSendClient<KgRefreshDefinition>({ name: deps.workflowName as "KgRefresh" }, triggerId).run(buildRunParameter(opts, triggerId));
+    const invocationId = await handle.invocationId;
+    ctx.set<InFlightMarker>("inFlight", { triggerId, startedAt: now, invocationId });
+    ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, ctx.key).watch({ triggerId, invocationId });
     return triggerId;
   }
 
@@ -131,7 +124,7 @@ export function createKgRepo(deps: KgRepoDependencies) {
     const now = await ctx.date.now();
     const live = await liveInFlight(ctx);
     if (live) return { status: "refresh-in-progress", triggerId: live.triggerId };
-    return { triggerId: submit(ctx, now, opts) };
+    return { triggerId: await submit(ctx, now, opts) };
   }
 
   async function enqueueDryRun(ctx: ObjectContext, input: KgRepoEnqueueInput): Promise<KgRepoEnqueueResult> {
@@ -147,7 +140,7 @@ export function createKgRepo(deps: KgRepoDependencies) {
     ctx.set(shaKey, report.sha);
     const now = await ctx.date.now();
     const live = await liveInFlight(ctx);
-    if (!live) return { triggerId: submit(ctx, now, { dryRun: true, kgSourceRef: ref, report }) };
+    if (!live) return { triggerId: await submit(ctx, now, { dryRun: true, kgSourceRef: ref, report }) };
 
     const pending = (await ctx.get<Record<string, PendingDryRun>>("pending")) ?? {};
     // A newer head for the same PR replaces the held one and takes the back of the line.
@@ -177,7 +170,7 @@ export function createKgRepo(deps: KgRepoDependencies) {
     delete pending[headKey];
     if (Object.keys(pending).length === 0) ctx.clear("pending");
     else ctx.set("pending", pending);
-    submit(ctx, await ctx.date.now(), { dryRun: true, kgSourceRef: ref, report });
+    await submit(ctx, await ctx.date.now(), { dryRun: true, kgSourceRef: ref, report });
     return true;
   }
 
@@ -186,31 +179,26 @@ export function createKgRepo(deps: KgRepoDependencies) {
   }
 
   /**
-   * Moves the lease out to `until` (epoch ms) and schedules an `expire` for it. A trigger-id mismatch or an
-   * `until` that is not later than the current lease (or than now) is a no-op. The superseded `expire` stays scheduled; it
-   * finds `now < leaseUntil` and does nothing.
+   * Waits for the run invocation to end and releases its lock. Shared, so it never blocks the object's
+   * exclusive handlers while it is suspended. `explicitCancellation` keeps a cancel of this invocation
+   * from interrupting `attach` and freeing the lock of a live run. A kill or a cancel of the run makes
+   * `attach` throw; every error means the run is over, so all are swallowed and the release still goes out.
    */
-  async function extend(ctx: ObjectContext, input: { triggerId: string; until: number }): Promise<{ extended: boolean }> {
-    const inFlight = await liveInFlight(ctx);
-    if (!inFlight || inFlight.triggerId !== input.triggerId) return { extended: false };
-    if (inFlight.leaseUntil !== undefined && input.until <= inFlight.leaseUntil) return { extended: false };
-    const now = await ctx.date.now();
-    // A legacy marker has no lease to compare with, so a lease that is already over is the only bad `until`.
-    if (input.until <= now) return { extended: false };
-    ctx.set<InFlightMarker>("inFlight", { ...inFlight, leaseUntil: input.until });
-    ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, ctx.key).expire(
-      { triggerId: input.triggerId },
-      restate.rpc.sendOpts({ delay: Math.max(0, input.until - now) }),
-    );
-    return { extended: true };
+  async function watch(ctx: ObjectSharedContext, input: { triggerId: string; invocationId: string }): Promise<void> {
+    try {
+      await ctx.invocation(input.invocationId as InvocationId).attach();
+    } catch {
+      // The run ended by failure, kill or cancel; the release below is the point.
+    }
+    ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, ctx.key).release({ triggerId: input.triggerId });
   }
 
-  /** The deadline-plus-margin backstop for a run that never released. A lease the workflow extended outlives it. */
+  /** Clears a legacy marker (no `invocationId`) that never released. A marker with an `invocationId` is held by its run, never by a clock. */
   async function expire(ctx: ObjectContext, input: { triggerId: string }): Promise<void> {
     const inFlight = await liveInFlight(ctx);
-    if (inFlight?.leaseUntil !== undefined && (await ctx.date.now()) < inFlight.leaseUntil) return;
+    if (inFlight?.invocationId !== undefined) return;
     if (await clearAndDrain(ctx, input.triggerId)) {
-      ctx.console.warn(`[KgRepo] expired in-flight marker for ${ctx.key} (triggerId=${input.triggerId})`);
+      ctx.console.warn(`[KgRepo] expired legacy in-flight marker for ${ctx.key} (triggerId=${input.triggerId})`);
     }
   }
 
@@ -260,7 +248,7 @@ export function createKgRepo(deps: KgRepoDependencies) {
       enqueueDryRun: restate.handlers.object.exclusive({ input: serde.zod(enqueueInputSchema) }, enqueueDryRun),
       release: restate.handlers.object.exclusive({ input: serde.zod(leaseInputSchema), ingressPrivate: true }, release),
       expire: restate.handlers.object.exclusive({ input: serde.zod(leaseInputSchema), ingressPrivate: true }, expire),
-      extend: restate.handlers.object.exclusive({ input: serde.zod(extendInputSchema), ingressPrivate: true }, extend),
+      watch: restate.handlers.object.shared({ input: serde.zod(watchInputSchema), ingressPrivate: true, explicitCancellation: true }, watch),
       recordDryRunOutcome: restate.handlers.object.exclusive({ input: serde.zod(recordOutcomeInputSchema), ingressPrivate: true }, recordDryRunOutcome),
       recordAdminDryRun: restate.handlers.object.exclusive({ ingressPrivate: true }, recordAdminDryRun),
       forgetPr: restate.handlers.object.exclusive({ input: serde.zod(prInputSchema) }, forgetPr),

@@ -51,8 +51,6 @@ import { restateRetentionMs } from "./retention.js";
 
 /** The value of `KG_REFRESH_TTL_MS` of the dispatch watch — how long a dispatch may run before it is treated as lost. */
 export const KG_REFRESH_TOTAL_DEADLINE_MS = 4 * 60 * 60 * 1000;
-/** Grace added on top of the total deadline before `KgRepo` treats an in-flight marker as stale rather than live. */
-export const KG_REPO_STALE_MARGIN_MS = 10 * 60 * 1000;
 /** How long a dispatch may run with no `progress` signal before the workflow treats it as lost. */
 export const KG_REFRESH_BOOTSTRAP_DEADLINE_MS = 10 * 60 * 1000;
 /** How often the GHA backend's watch loop reads the dispatched run's status (ADR 033). A run that ends with no
@@ -946,10 +944,6 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         });
         ctx.console.log(`[KgRefresh] held: dispatch ${dispatchId} snapshot PR #${heldPrNumber} awaits a decision until ${new Date(decideBy).toISOString()}`);
         ctx.objectSendClient(FlyMachineProfile, "kg-refresh").release({ dispatchId });
-        ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).extend({
-          triggerId,
-          until: decideBy + KG_REPO_STALE_MARGIN_MS,
-        });
 
         const decision = await awaitOwnedRun(ctx, {
           signals: ["decide", "cancel"],
