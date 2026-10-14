@@ -1442,6 +1442,18 @@ describe("migrated write handlers (AII-713)", () => {
       expect(cancel).toHaveBeenCalledWith({ reason: "operator_cancelled" });
     });
 
+    it("answers past-merge from decide, and never falls through to cancel", async () => {
+      decide.mockRejectedValue(terminal(409, "past-merge"));
+      expect(answer(await call({ action: "cancel" }))).toEqual({ isError: true, text: "past-merge" });
+      expect(cancel).not.toHaveBeenCalled();
+    });
+
+    it("answers past-merge, not no-refresh-in-flight, when the cancel signal is past the merge", async () => {
+      decide.mockRejectedValue(terminal(409, "no-decision-open"));
+      cancel.mockRejectedValue(terminal(409, "past-merge"));
+      expect(answer(await call({ action: "cancel" }))).toEqual({ isError: true, text: "past-merge" });
+    });
+
     it("answers already-decided for a second decision, and never falls through to cancel", async () => {
       decide.mockRejectedValue(terminal(409, "already-decided"));
       expect(answer(await call({ action: "cancel" }))).toEqual({ isError: true, text: "already-decided" });
