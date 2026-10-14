@@ -6,7 +6,7 @@
 
 Use it to connect your own ChatGPT plan to the `codex-subscription` mode. It follows [OpenAI's sign-in for open-source apps](https://developers.openai.com/siwc/token-sharing-open-source/sign-in).
 
-**Scope limit (ADR 038).** This is for personal and self-hosted use of your own plan. Do not use it to pool, share, or resell plan access. The ADR 038 file is not yet in `docs/adr/` on this branch; link it when it lands.
+**Scope limit ([ADR 041](adr/041-codex-uses-chatgpt-plan-tokens-from-one-refresher.md)).** This is for personal and self-hosted use of your own plan. Do not use it to pool, share, or resell plan access.
 
 ## The 127.0.0.1 rule
 
