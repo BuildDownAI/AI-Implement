@@ -24,7 +24,7 @@ import {
 } from "../fly-machines.js";
 import type { SessionMachineInput } from "../fly-machines.js";
 import { encodeRunConfig, decodeRunConfig, type RunConfigV1 } from "../run-config.js";
-import { fakeFetch, type ReplyInit, type Routes } from "./helpers/fake-fetch.js";
+import { fakeFetch, type ReplyInit } from "./helpers/fake-fetch.js";
 
 const TOKEN = "fly-test-token";
 const APP = "ai-implement-sessions-test";
@@ -35,13 +35,6 @@ const MACHINES = `/v1/apps/${APP}/machines`;
 const MACHINE = `${MACHINES}/machine-123`;
 const MACHINES_URL = `https://api.machines.dev${MACHINES}`;
 const MACHINE_URL = `https://api.machines.dev${MACHINE}`;
-
-/** Installs a fake for the global fetch the Fly client calls, until the test finishes. */
-function flyApi(routes: Routes) {
-  const fake = fakeFetch(routes);
-  fake.install();
-  return fake;
-}
 
 const mockMachine = {
   id: "machine-123",
@@ -61,7 +54,7 @@ const mockMachine = {
 
 describe("createMachine", () => {
   it("sends POST with correct URL and body", async () => {
-    const fly = flyApi({ [`POST ${MACHINES}`]: { json: mockMachine } });
+    const fly = fakeFetch({ [`POST ${MACHINES}`]: { json: mockMachine } }).install();
 
     const opts = { name: "test-machine", region: "iad", config: mockMachine.config };
     const result = await createMachine(TOKEN, APP, opts);
@@ -76,7 +69,7 @@ describe("createMachine", () => {
   });
 
   it("sends correct auth header", async () => {
-    const fly = flyApi({ [`POST ${MACHINES}`]: { json: mockMachine } });
+    const fly = fakeFetch({ [`POST ${MACHINES}`]: { json: mockMachine } }).install();
 
     await createMachine(TOKEN, APP, { config: mockMachine.config });
 
@@ -84,7 +77,7 @@ describe("createMachine", () => {
   });
 
   it("throws on error response", async () => {
-    flyApi({ [`POST ${MACHINES}`]: { status: 422, text: "invalid config" } });
+    fakeFetch({ [`POST ${MACHINES}`]: { status: 422, text: "invalid config" } }).install();
 
     await expect(createMachine(TOKEN, APP, { config: mockMachine.config }))
       .rejects.toThrow("Failed to create machine in ai-implement-sessions-test (422): invalid config");
@@ -93,7 +86,7 @@ describe("createMachine", () => {
 
 describe("getMachine", () => {
   it("fetches machine by ID", async () => {
-    const fly = flyApi({ [`GET ${MACHINE}`]: { json: mockMachine } });
+    const fly = fakeFetch({ [`GET ${MACHINE}`]: { json: mockMachine } }).install();
 
     const result = await getMachine(TOKEN, APP, "machine-123");
     expect(result.id).toBe("machine-123");
@@ -102,7 +95,7 @@ describe("getMachine", () => {
   });
 
   it("throws on 404", async () => {
-    flyApi({ [`GET ${MACHINES}/nonexistent`]: { status: 404, text: "not found" } });
+    fakeFetch({ [`GET ${MACHINES}/nonexistent`]: { status: 404, text: "not found" } }).install();
 
     await expect(getMachine(TOKEN, APP, "nonexistent"))
       .rejects.toThrow("Failed to get machine nonexistent (404)");
@@ -111,7 +104,7 @@ describe("getMachine", () => {
 
 describe("listMachines", () => {
   it("returns array of machines", async () => {
-    const fly = flyApi({ [`GET ${MACHINES}`]: { json: [mockMachine] } });
+    const fly = fakeFetch({ [`GET ${MACHINES}`]: { json: [mockMachine] } }).install();
 
     const result = await listMachines(TOKEN, APP);
     expect(result).toHaveLength(1);
@@ -120,7 +113,7 @@ describe("listMachines", () => {
   });
 
   it("returns empty array when no machines", async () => {
-    flyApi({ [`GET ${MACHINES}`]: { json: [] } });
+    fakeFetch({ [`GET ${MACHINES}`]: { json: [] } }).install();
 
     const result = await listMachines(TOKEN, APP);
     expect(result).toHaveLength(0);
@@ -129,7 +122,7 @@ describe("listMachines", () => {
 
 describe("stopMachine", () => {
   it("sends POST to stop endpoint", async () => {
-    const fly = flyApi({ [`POST ${MACHINE}/stop`]: {} });
+    const fly = fakeFetch({ [`POST ${MACHINE}/stop`]: {} }).install();
 
     await stopMachine(TOKEN, APP, "machine-123");
 
@@ -137,7 +130,7 @@ describe("stopMachine", () => {
   });
 
   it("throws on error", async () => {
-    flyApi({ [`POST ${MACHINE}/stop`]: { status: 409, text: "machine not running" } });
+    fakeFetch({ [`POST ${MACHINE}/stop`]: { status: 409, text: "machine not running" } }).install();
 
     await expect(stopMachine(TOKEN, APP, "machine-123"))
       .rejects.toThrow("Failed to stop machine machine-123 (409)");
@@ -146,7 +139,7 @@ describe("stopMachine", () => {
 
 describe("destroyMachine", () => {
   it("sends DELETE with force=true by default", async () => {
-    const fly = flyApi({ [`DELETE ${MACHINE}`]: {} });
+    const fly = fakeFetch({ [`DELETE ${MACHINE}`]: {} }).install();
 
     await destroyMachine(TOKEN, APP, "machine-123");
 
@@ -154,7 +147,7 @@ describe("destroyMachine", () => {
   });
 
   it("sends DELETE with force=false when specified", async () => {
-    const fly = flyApi({ [`DELETE ${MACHINE}`]: {} });
+    const fly = fakeFetch({ [`DELETE ${MACHINE}`]: {} }).install();
 
     await destroyMachine(TOKEN, APP, "machine-123", false);
 
@@ -162,7 +155,7 @@ describe("destroyMachine", () => {
   });
 
   it("throws on error", async () => {
-    flyApi({ [`DELETE ${MACHINE}`]: { status: 404, text: "not found" } });
+    fakeFetch({ [`DELETE ${MACHINE}`]: { status: 404, text: "not found" } }).install();
 
     await expect(destroyMachine(TOKEN, APP, "machine-123"))
       .rejects.toThrow("Failed to destroy machine machine-123 (404)");
@@ -171,7 +164,7 @@ describe("destroyMachine", () => {
 
 describe("waitForMachine", () => {
   it("sends GET with state and timeout params", async () => {
-    const fly = flyApi({ [`GET ${MACHINE}/wait`]: {} });
+    const fly = fakeFetch({ [`GET ${MACHINE}/wait`]: {} }).install();
 
     await waitForMachine(TOKEN, APP, "machine-123", "started", 30);
 
@@ -179,7 +172,7 @@ describe("waitForMachine", () => {
   });
 
   it("uses default 60s timeout", async () => {
-    const fly = flyApi({ [`GET ${MACHINE}/wait`]: {} });
+    const fly = fakeFetch({ [`GET ${MACHINE}/wait`]: {} }).install();
 
     await waitForMachine(TOKEN, APP, "machine-123", "stopped");
 
@@ -187,7 +180,7 @@ describe("waitForMachine", () => {
   });
 
   it("throws on timeout", async () => {
-    flyApi({ [`GET ${MACHINE}/wait`]: { status: 408, text: "timeout" } });
+    fakeFetch({ [`GET ${MACHINE}/wait`]: { status: 408, text: "timeout" } }).install();
 
     await expect(waitForMachine(TOKEN, APP, "machine-123", "started"))
       .rejects.toThrow('Timeout waiting for machine machine-123 to reach state "started"');
@@ -228,7 +221,7 @@ describe("listAppSecrets", () => {
       { name: "ENG_DATABASE_URL", digest: "abc123", createdAt: "2026-01-01T00:00:00Z" },
       { name: "ENG_STRIPE_KEY", digest: "def456", createdAt: "2026-01-02T00:00:00Z" },
     ];
-    const fly = flyApi({ "POST /graphql": { json: { data: { app: { secrets } } } } });
+    const fly = fakeFetch({ "POST /graphql": { json: { data: { app: { secrets } } } } }).install();
 
     const result = await listAppSecrets(TOKEN, APP);
     expect(result).toHaveLength(2);
@@ -241,21 +234,21 @@ describe("listAppSecrets", () => {
   });
 
   it("returns empty array when app has no secrets", async () => {
-    flyApi({ "POST /graphql": { json: { data: { app: { secrets: [] } } } } });
+    fakeFetch({ "POST /graphql": { json: { data: { app: { secrets: [] } } } } }).install();
 
     const result = await listAppSecrets(TOKEN, APP);
     expect(result).toEqual([]);
   });
 
   it("returns empty array when app is null", async () => {
-    flyApi({ "POST /graphql": { json: { data: { app: null } } } });
+    fakeFetch({ "POST /graphql": { json: { data: { app: null } } } }).install();
 
     const result = await listAppSecrets(TOKEN, APP);
     expect(result).toEqual([]);
   });
 
   it("throws on HTTP error response", async () => {
-    flyApi({ "POST /graphql": { status: 403, text: "forbidden" } });
+    fakeFetch({ "POST /graphql": { status: 403, text: "forbidden" } }).install();
 
     await expect(listAppSecrets(TOKEN, APP))
       .rejects.toThrow("Fly API request failed (403): forbidden");
@@ -264,7 +257,7 @@ describe("listAppSecrets", () => {
 
 describe("setAppSecrets", () => {
   it("sends GraphQL mutation with secrets and returns null version", async () => {
-    const fly = flyApi({ "POST /graphql": { json: { data: { setSecrets: { release: { version: 42 } } } } } });
+    const fly = fakeFetch({ "POST /graphql": { json: { data: { setSecrets: { release: { version: 42 } } } } } }).install();
 
     const version = await setAppSecrets(TOKEN, APP, { ENG_DATABASE_URL: "postgres://localhost/db" });
 
@@ -278,7 +271,7 @@ describe("setAppSecrets", () => {
   });
 
   it("throws on HTTP error response", async () => {
-    flyApi({ "POST /graphql": { status: 422, text: "invalid secret name" } });
+    fakeFetch({ "POST /graphql": { status: 422, text: "invalid secret name" } }).install();
 
     await expect(setAppSecrets(TOKEN, APP, { BAD: "val" }))
       .rejects.toThrow("Fly API request failed (422): invalid secret name");
@@ -287,7 +280,7 @@ describe("setAppSecrets", () => {
 
 describe("unsetAppSecret", () => {
   it("sends GraphQL mutation to unset secret and returns null version", async () => {
-    const fly = flyApi({ "POST /graphql": { json: { data: { unsetSecrets: { release: { version: 43 } } } } } });
+    const fly = fakeFetch({ "POST /graphql": { json: { data: { unsetSecrets: { release: { version: 43 } } } } } }).install();
 
     const version = await unsetAppSecret(TOKEN, APP, "ENG_DATABASE_URL");
 
@@ -300,21 +293,21 @@ describe("unsetAppSecret", () => {
   });
 
   it("throws on HTTP error response", async () => {
-    flyApi({ "POST /graphql": { status: 500, text: "internal server error" } });
+    fakeFetch({ "POST /graphql": { status: 500, text: "internal server error" } }).install();
 
     await expect(unsetAppSecret(TOKEN, APP, "MISSING_SECRET"))
       .rejects.toThrow("Fly API request failed (500): internal server error");
   });
 
   it("throws when GraphQL reports the secret was not found", async () => {
-    flyApi({ "POST /graphql": { json: { errors: [{ message: "Could not find secret MISSING_SECRET" }] } } });
+    fakeFetch({ "POST /graphql": { json: { errors: [{ message: "Could not find secret MISSING_SECRET" }] } } }).install();
 
     await expect(unsetAppSecret(TOKEN, APP, "MISSING_SECRET"))
       .rejects.toThrow("Could not find secret MISSING_SECRET");
   });
 
   it("throws on any GraphQL error", async () => {
-    flyApi({ "POST /graphql": { json: { errors: [{ message: "Unauthorized" }] } } });
+    fakeFetch({ "POST /graphql": { json: { errors: [{ message: "Unauthorized" }] } } }).install();
 
     await expect(unsetAppSecret(TOKEN, APP, "ENG_DATABASE_URL"))
       .rejects.toThrow("Unauthorized");
@@ -839,7 +832,7 @@ describe("buildSessionMachineConfig", () => {
 
 describe("updateMachineMetadata", () => {
   it("sends POST to the metadata key endpoint with JSON value body", async () => {
-    const fly = flyApi({ [`POST ${MACHINE}/metadata/pr_number`]: {} });
+    const fly = fakeFetch({ [`POST ${MACHINE}/metadata/pr_number`]: {} }).install();
 
     await updateMachineMetadata(TOKEN, APP, "machine-123", "pr_number", "42");
 
@@ -850,14 +843,14 @@ describe("updateMachineMetadata", () => {
   });
 
   it("throws on error response", async () => {
-    flyApi({ [`POST ${MACHINES}/machine-xyz/metadata/pr_number`]: { status: 404, text: "machine not found" } });
+    fakeFetch({ [`POST ${MACHINES}/machine-xyz/metadata/pr_number`]: { status: 404, text: "machine not found" } }).install();
 
     await expect(updateMachineMetadata(TOKEN, APP, "machine-xyz", "pr_number", "7"))
       .rejects.toThrow("updateMachineMetadata failed (404)");
   });
 
   it("stamps pr_number extracted from a GitHub PR URL", async () => {
-    const fly = flyApi({ [`POST ${MACHINE}/metadata/pr_number`]: {} });
+    const fly = fakeFetch({ [`POST ${MACHINE}/metadata/pr_number`]: {} }).install();
 
     const prUrl = "https://github.com/org/repo/pull/99";
     const prNumberMatch = prUrl.match(/\/pull\/(\d+)$/);
@@ -873,7 +866,7 @@ describe("fetchMachineLogs", () => {
   const LOGS = `GET ${MACHINE}/logs` as const;
 
   it("appends ?lines=N to the URL to prevent streaming hang", async () => {
-    const fly = flyApi({ [LOGS]: { text: '{"message":"hello"}\n{"message":"world"}\n' } });
+    const fly = fakeFetch({ [LOGS]: { text: '{"message":"hello"}\n{"message":"world"}\n' } }).install();
 
     await fetchMachineLogs(TOKEN, APP, "machine-123");
 
@@ -881,7 +874,7 @@ describe("fetchMachineLogs", () => {
   });
 
   it("uses custom lastN when provided", async () => {
-    const fly = flyApi({ [LOGS]: { text: '{"message":"line"}\n' } });
+    const fly = fakeFetch({ [LOGS]: { text: '{"message":"line"}\n' } }).install();
 
     await fetchMachineLogs(TOKEN, APP, "machine-123", 50);
 
@@ -889,35 +882,35 @@ describe("fetchMachineLogs", () => {
   });
 
   it("parses NDJSON and extracts message fields", async () => {
-    flyApi({ [LOGS]: { text: '{"message":"starting server"}\n{"message":"listening on :3000"}\n' } });
+    fakeFetch({ [LOGS]: { text: '{"message":"starting server"}\n{"message":"listening on :3000"}\n' } }).install();
 
     const result = await fetchMachineLogs(TOKEN, APP, "machine-123");
     expect(result).toBe("starting server\nlistening on :3000");
   });
 
   it("falls back to raw line when JSON parse fails", async () => {
-    flyApi({ [LOGS]: { text: "not-json-at-all\n" } });
+    fakeFetch({ [LOGS]: { text: "not-json-at-all\n" } }).install();
 
     const result = await fetchMachineLogs(TOKEN, APP, "machine-123");
     expect(result).toBe("not-json-at-all");
   });
 
   it("falls back to raw line when parsed JSON has no message field", async () => {
-    flyApi({ [LOGS]: { text: '{"level":"info","ts":1234}\n' } });
+    fakeFetch({ [LOGS]: { text: '{"level":"info","ts":1234}\n' } }).install();
 
     const result = await fetchMachineLogs(TOKEN, APP, "machine-123");
     expect(result).toBe('{"level":"info","ts":1234}');
   });
 
   it("returns empty string for blank body", async () => {
-    flyApi({ [LOGS]: { text: "   \n  " } });
+    fakeFetch({ [LOGS]: { text: "   \n  " } }).install();
 
     const result = await fetchMachineLogs(TOKEN, APP, "machine-123");
     expect(result).toBe("");
   });
 
   it("throws on error response", async () => {
-    flyApi({ [LOGS]: { status: 404, text: "not found" } });
+    fakeFetch({ [LOGS]: { status: 404, text: "not found" } }).install();
 
     await expect(fetchMachineLogs(TOKEN, APP, "machine-123"))
       .rejects.toThrow("Failed to fetch logs for machine machine-123 (404)");
@@ -951,19 +944,19 @@ describe("readMachineExit", () => {
 
 describe("startMachine / updateMachine (AII-1123)", () => {
   it("startMachine posts to /start with no body", async () => {
-    const fly = flyApi({ [`POST ${MACHINE}/start`]: {} });
+    const fly = fakeFetch({ [`POST ${MACHINE}/start`]: {} }).install();
     await startMachine(TOKEN, APP, "machine-123");
     expect(fly.calls[0].url.href).toBe(`${MACHINE_URL}/start`);
     expect(fly.calls[0].body).toBe("");
   });
 
   it("startMachine throws with status and body", async () => {
-    flyApi({ [`POST ${MACHINE}/start`]: { status: 412, text: "bad state" } });
+    fakeFetch({ [`POST ${MACHINE}/start`]: { status: 412, text: "bad state" } }).install();
     await expect(startMachine(TOKEN, APP, "machine-123")).rejects.toThrow("Failed to start machine machine-123 (412): bad state");
   });
 
   it("updateMachine posts { config } and returns the machine", async () => {
-    const fly = flyApi({ [`POST ${MACHINE}`]: { json: mockMachine } });
+    const fly = fakeFetch({ [`POST ${MACHINE}`]: { json: mockMachine } }).install();
     const result = await updateMachine(TOKEN, APP, "machine-123", mockMachine.config as never);
     expect(result.id).toBe("machine-123");
     expect(fly.calls[0].url.href).toBe(MACHINE_URL);
@@ -971,7 +964,7 @@ describe("startMachine / updateMachine (AII-1123)", () => {
   });
 
   it("updateMachine throws with status and body", async () => {
-    flyApi({ [`POST ${MACHINE}`]: { status: 422, text: "invalid config" } });
+    fakeFetch({ [`POST ${MACHINE}`]: { status: 422, text: "invalid config" } }).install();
     await expect(updateMachine(TOKEN, APP, "machine-123", mockMachine.config as never))
       .rejects.toThrow("Failed to update machine machine-123 (422): invalid config");
   });
@@ -990,10 +983,10 @@ describe("clearMachineEnv", () => {
 
   it("settles, posts the same config with env: {}, reads back; never starts it", async () => {
     const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { GITHUB_TOKEN: "x" } } };
-    const fly = flyApi({
+    const fly = fakeFetch({
       [READ]: [ok(withEnv), ok({ ...mockMachine, config: { ...mockMachine.config, env: {} } })],
       [UPDATE]: [ok(mockMachine)],
-    });
+    }).install();
 
     await clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast);
 
@@ -1008,10 +1001,10 @@ describe("clearMachineEnv", () => {
     const replacing = { ...withEnv, state: "replacing" };
     const stopped = { ...withEnv, state: "stopped" };
     const cleared = { ...mockMachine, state: "stopped", config: { ...mockMachine.config, env: {} } };
-    const fly = flyApi({
+    const fly = fakeFetch({
       [READ]: [ok(replacing), ok(replacing), ok(stopped), ok(cleared)],
       [UPDATE]: [ok(cleared)],
-    });
+    }).install();
     await clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast);
     expect(fly.calls.map((c) => c.method)).toEqual(["GET", "GET", "GET", "POST", "GET"]);
   });
@@ -1019,7 +1012,7 @@ describe("clearMachineEnv", () => {
   it("merges metadata into the one update, never calls the metadata endpoint, and verifies it", async () => {
     const m = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" }, metadata: { purpose: "durable-runner", durable_until: "1" } } };
     const done = { ...m, config: { ...m.config, env: {}, metadata: { purpose: "durable-runner", durable_until: "123" } } };
-    const fly = flyApi({ [READ]: [ok(m), ok(done)], [UPDATE]: [ok(m)] });
+    const fly = fakeFetch({ [READ]: [ok(m), ok(done)], [UPDATE]: [ok(m)] }).install();
 
     await clearMachineEnv(TOKEN, APP, "machine-123", { durable_until: "123" }, fast);
 
@@ -1032,7 +1025,7 @@ describe("clearMachineEnv", () => {
   it("adds metadata when the machine has none", async () => {
     const m = { ...mockMachine, config: { ...mockMachine.config, metadata: undefined } };
     const done = { ...m, config: { ...m.config, env: {}, metadata: { durable_until: "5" } } };
-    const fly = flyApi({ [`GET ${MACHINES}/m`]: [ok(m), ok(done)], [`POST ${MACHINES}/m`]: [ok(m)] });
+    const fly = fakeFetch({ [`GET ${MACHINES}/m`]: [ok(m), ok(done)], [`POST ${MACHINES}/m`]: [ok(m)] }).install();
     await clearMachineEnv(TOKEN, APP, "m", { durable_until: "5" }, fast);
     const body = JSON.parse(fly.calls[1].body);
     expect(body.config.metadata).toEqual({ durable_until: "5" });
@@ -1041,10 +1034,10 @@ describe("clearMachineEnv", () => {
   it("treats a 409 concurrent update as a wait and succeeds once the env is clear", async () => {
     const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
     const cleared = { ...mockMachine, config: { ...mockMachine.config, env: {} } };
-    const fly = flyApi({
+    const fly = fakeFetch({
       [READ]: [ok(withEnv), ok(cleared)],
       [UPDATE]: [fail(409, '{"error":"aborted: machine is replacing: concurrent update in progress"}')],
-    });
+    }).install();
     await expect(clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast)).resolves.toBeUndefined();
     expect(fly.calls.filter((c) => c.method === "POST")).toHaveLength(1);
   });
@@ -1053,10 +1046,10 @@ describe("clearMachineEnv", () => {
     vi.useFakeTimers();
     const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
     const cleared = { ...mockMachine, config: { ...mockMachine.config, env: {} } };
-    const fly = flyApi({
+    const fly = fakeFetch({
       [READ]: [ok(withEnv), ok(cleared)],
       [UPDATE]: [fail(429, "resource_exhausted: rate limit exceeded", { "retry-after": "7" })],
-    });
+    }).install();
     const p = clearMachineEnv(TOKEN, APP, "machine-123");
     await vi.advanceTimersByTimeAsync(6_900);
     expect(fly.calls).toHaveLength(2);
@@ -1068,10 +1061,10 @@ describe("clearMachineEnv", () => {
     vi.useFakeTimers();
     const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
     const cleared = { ...mockMachine, config: { ...mockMachine.config, env: {} } };
-    const fly = flyApi({
+    const fly = fakeFetch({
       [READ]: [ok(withEnv), ok(cleared)],
       [UPDATE]: [fail(429, "rate limit", { "retry-after": "3600" })],
-    });
+    }).install();
     const p = clearMachineEnv(TOKEN, APP, "machine-123");
     await vi.advanceTimersByTimeAsync(MAX_RATE_LIMIT_WAIT_MS - 100);
     expect(fly.calls).toHaveLength(2);
@@ -1082,13 +1075,13 @@ describe("clearMachineEnv", () => {
   it("treats a 409 'machine is replacing' without the concurrent-update text as a wait", async () => {
     const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
     const cleared = { ...mockMachine, config: { ...mockMachine.config, env: {} } };
-    flyApi({ [READ]: [ok(withEnv), ok(cleared)], [UPDATE]: [fail(409, '{"error":"machine is replacing"}')] });
+    fakeFetch({ [READ]: [ok(withEnv), ok(cleared)], [UPDATE]: [fail(409, '{"error":"machine is replacing"}')] }).install();
     await expect(clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast)).resolves.toBeUndefined();
   });
 
   it("still throws on an unrelated 409", async () => {
     const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
-    flyApi({ [READ]: [ok(withEnv)], [UPDATE]: [fail(409, '{"error":"something else"}')] });
+    fakeFetch({ [READ]: [ok(withEnv)], [UPDATE]: [fail(409, '{"error":"something else"}')] }).install();
     await expect(clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast)).rejects.toThrow(/409/);
   });
 
@@ -1096,7 +1089,7 @@ describe("clearMachineEnv", () => {
     vi.useFakeTimers();
     const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
     const cleared = { ...mockMachine, config: { ...mockMachine.config, env: {} } };
-    const fly = flyApi({ [READ]: [ok(withEnv), ok(cleared)], [UPDATE]: [fail(429, "rate limit")] });
+    const fly = fakeFetch({ [READ]: [ok(withEnv), ok(cleared)], [UPDATE]: [fail(429, "rate limit")] }).install();
     const p = clearMachineEnv(TOKEN, APP, "machine-123");
     await vi.advanceTimersByTimeAsync(1_900);
     expect(fly.calls).toHaveLength(2);
@@ -1107,10 +1100,10 @@ describe("clearMachineEnv", () => {
   it("with until: stopped, sends the update only after the machine reads stopped", async () => {
     const started = { ...mockMachine, state: "started", config: { ...mockMachine.config, env: { A: "1" } } };
     const stopped = { ...started, state: "stopped" };
-    const fly = flyApi({
+    const fly = fakeFetch({
       [READ]: [ok(started), ok(stopped), ok({ ...stopped, config: { ...stopped.config, env: {} } })],
       [UPDATE]: [ok(stopped)],
-    });
+    }).install();
 
     await clearMachineEnv(TOKEN, APP, "machine-123", undefined, { ...fast, until: ["stopped"] });
 
@@ -1120,7 +1113,7 @@ describe("clearMachineEnv", () => {
   it("with until: stopped, a machine that stays started times out with no update sent", async () => {
     const started = { ...mockMachine, state: "started", config: { ...mockMachine.config, env: { A: "1" } } };
     // No update route: an update would fail the test.
-    const fly = flyApi({ [READ]: ok(started) });
+    const fly = fakeFetch({ [READ]: ok(started) }).install();
     await expect(
       clearMachineEnv(TOKEN, APP, "machine-123", undefined, { intervalMs: 1, timeoutMs: 20, until: ["stopped"] }),
     ).rejects.toThrow(/machine-123.*state=started/);
@@ -1129,25 +1122,25 @@ describe("clearMachineEnv", () => {
 
   it("throws naming the machine and state when the env never clears", async () => {
     const withEnv = { ...mockMachine, state: "stopped", config: { ...mockMachine.config, env: { A: "1" } } };
-    flyApi({ [READ]: ok(withEnv), [UPDATE]: ok(withEnv) });
+    fakeFetch({ [READ]: ok(withEnv), [UPDATE]: ok(withEnv) }).install();
     await expect(clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast)).rejects.toThrow(/machine-123.*state=stopped/);
   });
 
   it("skips the update when the env is already clear and the metadata present", async () => {
     const clean = { ...mockMachine, config: { ...mockMachine.config, env: {}, metadata: { durable_until: "5" } } };
-    const fly = flyApi({ [READ]: [ok(clean)] });
+    const fly = fakeFetch({ [READ]: [ok(clean)] }).install();
     await clearMachineEnv(TOKEN, APP, "machine-123", { durable_until: "5" }, fast);
     expect(fly.calls).toHaveLength(1);
   });
 
   it("throws when the read fails, without posting", async () => {
-    const fly = flyApi({ [`GET ${MACHINES}/m`]: [fail(404, "gone")] });
+    const fly = fakeFetch({ [`GET ${MACHINES}/m`]: [fail(404, "gone")] }).install();
     await expect(clearMachineEnv(TOKEN, APP, "m", undefined, fast)).rejects.toThrow("(404)");
     expect(fly.calls).toHaveLength(1);
   });
 
   it("ends at once, without polling, on a machine Fly reports as destroyed", async () => {
-    const fly = flyApi({ [`GET ${MACHINES}/m`]: [ok({ ...mockMachine, state: "destroyed" })] });
+    const fly = fakeFetch({ [`GET ${MACHINES}/m`]: [ok({ ...mockMachine, state: "destroyed" })] }).install();
     await expect(
       clearMachineEnv(TOKEN, APP, "m", undefined, { ...fast, until: ["stopped", "destroyed"] }),
     ).rejects.toThrow(/gone before the scrub/);
@@ -1155,22 +1148,22 @@ describe("clearMachineEnv", () => {
   });
 
   it("throws when the update fails with a non-wait status", async () => {
-    flyApi({
+    fakeFetch({
       [`GET ${MACHINES}/m`]: [ok({ ...mockMachine, config: { ...mockMachine.config, env: { A: "b" } } })],
       [`POST ${MACHINES}/m`]: [fail(500, "boom")],
-    });
+    }).install();
     await expect(clearMachineEnv(TOKEN, APP, "m", undefined, fast)).rejects.toThrow("(500)");
   });
 });
 
 describe("waitForMachineSettled", () => {
   it("returns null when the machine is gone", async () => {
-    flyApi({ [`GET ${MACHINES}/m`]: { status: 404, text: "nope" } });
+    fakeFetch({ [`GET ${MACHINES}/m`]: { status: 404, text: "nope" } }).install();
     expect(await waitForMachineSettled(TOKEN, APP, "m", { intervalMs: 1 })).toBeNull();
   });
 
   it("throws on timeout naming the machine and the state", async () => {
-    flyApi({ [`GET ${MACHINE}`]: { json: { ...mockMachine, state: "replacing" } } });
+    fakeFetch({ [`GET ${MACHINE}`]: { json: { ...mockMachine, state: "replacing" } } }).install();
     await expect(waitForMachineSettled(TOKEN, APP, "machine-123", { intervalMs: 5, timeoutMs: 20 })).rejects.toThrow(/machine-123.*replacing/);
   });
 });

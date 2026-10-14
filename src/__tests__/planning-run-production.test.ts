@@ -58,11 +58,9 @@ const title = (id: string) => `${PLANNING_RUN_TITLE_PREFIX}${id}`;
 
 // GitHub's run list for the mapping's planning workflow, answering one read.
 function githubRuns(runs: Array<Record<string, unknown>>, status = 200): FakeFetch {
-  const fake = fakeFetch({
+  return fakeFetch({
     "GET /repos/Org/repo/actions/workflows/claude-plan.yml/runs": [{ status, json: { workflow_runs: runs } }],
-  });
-  fake.install();
-  return fake;
+  }).install();
 }
 
 describe("title prefix", () => {
