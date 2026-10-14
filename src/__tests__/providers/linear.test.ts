@@ -6,14 +6,26 @@ import {
   __setLinearTokenForTest,
   __resetLinearAuthForTest,
 } from "../../linear-app-auth.js";
+import { makeIssue } from "../helpers/builders.js";
+import { fakeFetch, type FakeFetch, type Reply } from "../helpers/fake-fetch.js";
 
 // Linear auth lives in the linear-app-auth singleton now (not on ProviderConfig). Configure it
 // and seed a token before every test so the provider's requests carry `Bearer test-token`, and
-// no mint round-trip is injected into the fetch-call counts these assertions rely on.
+// no mint round-trip is injected into the request counts these assertions rely on.
 beforeEach(() => {
   configureLinearAuth("client-id", "client-secret");
   __setLinearTokenForTest("test-token");
 });
+
+// One GraphQL response carrying `data`, as Linear's API returns it.
+const data = (d: unknown): Reply => ({ json: { data: d } });
+
+// Serves the replies in order, one per request; a request past the last fails the test.
+function linear(...replies: Reply[]): FakeFetch {
+  return fakeFetch({ "POST /graphql": replies }).install();
+}
+
+const variables = (fake: FakeFetch, n: number) => JSON.parse(fake.calls[n].body).variables;
 
 describe("LinearProvider", () => {
   it("constructor throws when Linear auth is not configured", () => {
@@ -34,47 +46,26 @@ describe("LinearProvider", () => {
 });
 
 describe("LinearProvider.postComment", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("sends the GraphQL commentCreate mutation with issueId and body", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ data: { commentCreate: { success: true } } }),
-    } as Response);
+    const fake = linear(data({ commentCreate: { success: true } }));
 
     const p = new LinearProvider({});
     await p.postComment("issue-uuid-1", "Hello body");
 
-    expect(fetch).toHaveBeenCalledWith(
-      "https://api.linear.app/graphql",
-      expect.objectContaining({
-        method: "POST",
-        headers: expect.objectContaining({ Authorization: "Bearer test-token" }),
-      }),
-    );
-    const callArgs = vi.mocked(fetch).mock.calls[0];
-    const body = JSON.parse(callArgs[1]?.body as string);
-    expect(body.variables).toEqual({ issueId: "issue-uuid-1", body: "Hello body" });
+    expect(fake.calls[0].url.href).toBe("https://api.linear.app/graphql");
+    expect(fake.calls[0].headers.get("Authorization")).toBe("Bearer test-token");
+    expect(variables(fake, 0)).toEqual({ issueId: "issue-uuid-1", body: "Hello body" });
   });
 
   it("throws on Linear HTTP error", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 500,
-      statusText: "Internal Server Error",
-      text: async () => "boom",
-    } as Response);
+    linear({ status: 500, text: "boom" });
 
     const p = new LinearProvider({});
     await expect(p.postComment("i", "b")).rejects.toThrow(/Linear API error/);
   });
 
   it("throws on Linear GraphQL error", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ errors: [{ message: "Permission denied" }] }),
-    } as Response);
+    linear({ json: { errors: [{ message: "Permission denied" }] } });
 
     const p = new LinearProvider({});
     await expect(p.postComment("i", "b")).rejects.toThrow(/Permission denied/);
@@ -82,42 +73,30 @@ describe("LinearProvider.postComment", () => {
 });
 
 describe("LinearProvider.fetchPlanningContext", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("returns the issue's planning comments, authenticated as the app", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        data: {
-          issue: {
-            comments: {
-              nodes: [
-                { body: "## 🏗️ AI Planning: Architecture Analysis\nUse the widget pattern.", createdAt: "2026-01-01T00:00:00Z" },
-                { body: "just a regular human comment", createdAt: "2026-01-02T00:00:00Z" },
-              ],
-              pageInfo: { hasNextPage: false, endCursor: null },
-            },
-          },
+    const fake = linear(data({
+      issue: {
+        comments: {
+          nodes: [
+            { body: "## 🏗️ AI Planning: Architecture Analysis\nUse the widget pattern.", createdAt: "2026-01-01T00:00:00Z" },
+            { body: "just a regular human comment", createdAt: "2026-01-02T00:00:00Z" },
+          ],
+          pageInfo: { hasNextPage: false, endCursor: null },
         },
-      }),
-    } as Response);
+      },
+    }));
 
     const p = new LinearProvider({});
     const ctx = await p.fetchPlanningContext("issue-uuid-1");
 
     expect(ctx).toContain("Use the widget pattern.");
     expect(ctx).not.toContain("just a regular human comment");
-    expect(fetch).toHaveBeenCalledWith(
-      "https://api.linear.app/graphql",
-      expect.objectContaining({
-        headers: expect.objectContaining({ Authorization: "Bearer test-token" }),
-      }),
-    );
+    expect(fake.calls[0].url.href).toBe("https://api.linear.app/graphql");
+    expect(fake.calls[0].headers.get("Authorization")).toBe("Bearer test-token");
   });
 
   it("returns empty string (never throws) when Linear is unreachable", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 500 } as Response);
+    linear({ status: 500 });
 
     const p = new LinearProvider({});
     await expect(p.fetchPlanningContext("issue-uuid-1")).resolves.toBe("");
@@ -125,25 +104,17 @@ describe("LinearProvider.fetchPlanningContext", () => {
 });
 
 describe("LinearProvider.fetchLifecycleStates", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("maps Linear state.type to IssueLifecycleState", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        data: {
-          issues: {
-            nodes: [
-              { id: "a", state: { type: "completed" } },
-              { id: "b", state: { type: "canceled" } },
-              { id: "c", state: { type: "started" } },
-              { id: "d", state: { type: "unstarted" } },
-            ],
-          },
-        },
-      }),
-    } as Response);
+    linear(data({
+      issues: {
+        nodes: [
+          { id: "a", state: { type: "completed" } },
+          { id: "b", state: { type: "canceled" } },
+          { id: "c", state: { type: "started" } },
+          { id: "d", state: { type: "unstarted" } },
+        ],
+      },
+    }));
 
     const p = new LinearProvider({});
     const states = await p.fetchLifecycleStates(["a", "b", "c", "d", "missing"]);
@@ -156,17 +127,15 @@ describe("LinearProvider.fetchLifecycleStates", () => {
   });
 
   it("returns empty map when called with empty array, makes no fetch", async () => {
+    const fake = linear();
     const p = new LinearProvider({});
     const states = await p.fetchLifecycleStates([]);
     expect(states.size).toBe(0);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(fake.calls).toHaveLength(0);
   });
 });
 
 describe("LinearProvider.fetchAIImplementSnapshot", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   type Ancestor = { identifier: string; description?: string | null; labels?: string[]; parent?: Ancestor | null };
   type Child = { labels?: string[]; stateType?: string };
 
@@ -180,12 +149,13 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     return { identifier: a.identifier, description: a.description ?? null, labels: labelNodes(a.labels), parent: ancestorNode(a.parent) };
   }
 
-  function makeIssue(overrides: {
+  // One issue as the snapshot query returns it. Linear derives an identifier from its team's key,
+  // so the team key is the identifier's prefix and each child is numbered after its parent.
+  function issueNode(overrides: {
     id?: string;
     identifier?: string;
     title?: string;
     description?: string | null;
-    teamKey?: string;
     stateName?: string;
     stateType?: string;
     labels?: string[];
@@ -193,12 +163,14 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     parent?: Ancestor | null;
     children?: Child[];
   } = {}) {
+    const identifier = overrides.identifier ?? "ENG-1";
+    const [teamKey, number] = identifier.split("-");
     return {
       id: overrides.id ?? "uuid-1",
-      identifier: overrides.identifier ?? "ENG-1",
+      identifier,
       title: overrides.title ?? "Title",
       description: overrides.description ?? null,
-      team: { id: "team-id", key: overrides.teamKey ?? "ENG" },
+      team: { id: "team-id", key: teamKey },
       state: {
         id: "state-id",
         name: overrides.stateName ?? "Todo",
@@ -208,7 +180,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
       inverseRelations: { nodes: overrides.inverseRelations ?? [] },
       children: {
         nodes: (overrides.children ?? []).map((c, i) => ({
-          identifier: `${overrides.identifier ?? "ENG-1"}-c${i}`,
+          identifier: `${teamKey}-${Number(number) + 1 + i}`,
           state: { type: c.stateType ?? "unstarted" },
           labels: labelNodes(c.labels),
         })),
@@ -217,24 +189,14 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     };
   }
 
-  function mockSinglePage(nodes: ReturnType<typeof makeIssue>[]) {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        data: {
-          issues: {
-            nodes,
-            pageInfo: { hasNextPage: false, endCursor: null },
-          },
-        },
-      }),
-    } as Response);
+  function singlePage(nodes: ReturnType<typeof issueNode>[]) {
+    return linear(data({ issues: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } }));
   }
 
   it("buckets issues by Plan-Complete label", async () => {
-    mockSinglePage([
-      makeIssue({ id: "a", identifier: "ENG-1", labels: ["AI-Implement", "Plan-Complete"] }),
-      makeIssue({ id: "b", identifier: "ENG-2", labels: ["AI-Implement"] }),
+    singlePage([
+      issueNode({ id: "a", identifier: "ENG-1", labels: ["AI-Implement", "Plan-Complete"] }),
+      issueNode({ id: "b", identifier: "ENG-2", labels: ["AI-Implement"] }),
     ]);
 
     const p = new LinearProvider({});
@@ -248,14 +210,14 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
   });
 
   it("maps parentRef when the issue has a parent; omits it otherwise", async () => {
-    mockSinglePage([
-      makeIssue({
+    singlePage([
+      issueNode({
         id: "child",
         identifier: "ENG-2",
         labels: ["AI-Implement", "Plan-Complete"],
         parent: { identifier: "ENG-1", labels: ["AI-Implement"] },
       }),
-      makeIssue({ id: "orphan", identifier: "ENG-9", labels: ["AI-Implement", "Plan-Complete"] }),
+      issueNode({ id: "orphan", identifier: "ENG-9", labels: ["AI-Implement", "Plan-Complete"] }),
     ]);
 
     const p = new LinearProvider({});
@@ -269,8 +231,8 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
 
   describe("feature-branch grouping", () => {
     it("a leaf under a labeled parent targets the parent's feature-branch chain", async () => {
-      mockSinglePage([
-        makeIssue({
+      singlePage([
+        issueNode({
           id: "leaf",
           identifier: "OOL-96",
           labels: ["AI-Implement", "Plan-Complete"],
@@ -283,8 +245,8 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     });
 
     it("a leaf under an UNlabeled parent gets no chain (PRs to base)", async () => {
-      mockSinglePage([
-        makeIssue({
+      singlePage([
+        issueNode({
           id: "leaf",
           identifier: "OOL-50",
           labels: ["AI-Implement"],
@@ -297,8 +259,8 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     });
 
     it("cascades the chain through labeled grandparents", async () => {
-      mockSinglePage([
-        makeIssue({
+      singlePage([
+        issueNode({
           id: "leaf",
           identifier: "OOL-99",
           labels: ["AI-Implement"],
@@ -316,8 +278,8 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     });
 
     it("skips a feature-node parent while any AI-Implement child is in flight", async () => {
-      mockSinglePage([
-        makeIssue({
+      singlePage([
+        issueNode({
           id: "parent",
           identifier: "OOL-78",
           labels: ["AI-Implement"],
@@ -333,8 +295,8 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     });
 
     it("dispatches a feature-node parent once all AI-Implement children are terminal, onto its own branch", async () => {
-      mockSinglePage([
-        makeIssue({
+      singlePage([
+        issueNode({
           id: "parent",
           identifier: "OOL-78",
           labels: ["AI-Implement"],
@@ -354,8 +316,8 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     it("AII-349 race guard: skips parent when some AI children are Done but unlabeled active children remain", async () => {
       // Operator labeled parent first, then 325/326/327 are Done (by hand) but 328/329
       // are not yet labeled with AI-Implement. The parent must wait — not finalize.
-      mockSinglePage([
-        makeIssue({
+      singlePage([
+        issueNode({
           id: "parent",
           identifier: "AII-324",
           labels: ["AI-Implement"],
@@ -376,8 +338,8 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     });
 
     it("AII-349 race guard: does not finalize blank-spec parent when unlabeled active children remain", async () => {
-      mockSinglePage([
-        makeIssue({
+      singlePage([
+        issueNode({
           id: "parent",
           identifier: "AII-324",
           labels: ["AI-Implement"],
@@ -395,8 +357,8 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     it("AII-349 race guard: non-AI child in terminal state does NOT gate dispatch", async () => {
       // A non-AI child that is Done (e.g. completed by human outside the pipeline) should
       // not block the parent — only active undesignated children trigger the guard.
-      mockSinglePage([
-        makeIssue({
+      singlePage([
+        issueNode({
           id: "parent",
           identifier: "OOL-78",
           labels: ["AI-Implement"],
@@ -415,8 +377,8 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     });
 
     it("skips a labeled parent whose children are not yet AI-Implement (race guard)", async () => {
-      mockSinglePage([
-        makeIssue({
+      singlePage([
+        issueNode({
           id: "parent",
           identifier: "OOL-78",
           labels: ["AI-Implement"],
@@ -429,8 +391,8 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     });
 
     it("targets a multi-issue parent's branch when the parent's ai-implement.yml selects it", async () => {
-      mockSinglePage([
-        makeIssue({
+      singlePage([
+        issueNode({
           id: "leaf",
           identifier: "OOL-87",
           labels: ["AI-Implement"],
@@ -442,8 +404,8 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     });
 
     it("leaves feature-node behaviour unchanged when there is no ai-implement.yml", async () => {
-      mockSinglePage([
-        makeIssue({
+      singlePage([
+        issueNode({
           id: "leaf",
           identifier: "OOL-87",
           labels: ["AI-Implement"],
@@ -455,8 +417,8 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     });
 
     it("resolves each ancestor's mode independently when modes are mixed", async () => {
-      mockSinglePage([
-        makeIssue({
+      singlePage([
+        issueNode({
           id: "leaf",
           identifier: "OOL-87",
           labels: ["AI-Implement"],
@@ -476,8 +438,8 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     });
 
     it("puts a multi-issue parent's own closing work on its multi-issue branch", async () => {
-      mockSinglePage([
-        makeIssue({
+      singlePage([
+        issueNode({
           id: "parent",
           identifier: "OOL-78",
           labels: ["AI-Implement"],
@@ -495,8 +457,8 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
 
     it("strips the config block from the description handed to the runner", async () => {
       const descWithConfig = `Group of unrelated work.\n\n${MULTI_YML}`;
-      mockSinglePage([
-        makeIssue({
+      singlePage([
+        issueNode({
           id: "parent",
           identifier: "OOL-78",
           labels: ["AI-Implement"],
@@ -513,8 +475,8 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     });
 
     it("finalizes an empty-spec grouping parent (null description) instead of dispatching", async () => {
-      mockSinglePage([
-        makeIssue({
+      singlePage([
+        issueNode({
           id: "parent",
           identifier: "OOL-78",
           labels: ["AI-Implement"],
@@ -525,17 +487,17 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
           ],
         }),
       ]);
-      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
       expect(snap.needsPlanning).toEqual([]);
       expect(snap.readyForImplementation).toEqual([]);
       expect(snap.parentsToFinalize).toEqual([
-        { issueId: "parent", identifier: "OOL-78", scopeKey: "ENG" },
+        { issueId: "parent", identifier: "OOL-78", scopeKey: "OOL" },
       ]);
     });
 
     it("finalizes an empty-spec grouping parent (ai-implement.yml-only description) instead of dispatching", async () => {
-      mockSinglePage([
-        makeIssue({
+      singlePage([
+        issueNode({
           id: "parent",
           identifier: "OOL-78",
           labels: ["AI-Implement"],
@@ -545,17 +507,17 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
           ],
         }),
       ]);
-      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
       expect(snap.needsPlanning).toEqual([]);
       expect(snap.readyForImplementation).toEqual([]);
       expect(snap.parentsToFinalize).toEqual([
-        { issueId: "parent", identifier: "OOL-78", scopeKey: "ENG" },
+        { issueId: "parent", identifier: "OOL-78", scopeKey: "OOL" },
       ]);
     });
 
     it("dispatches a non-empty-spec grouping parent normally (no regression)", async () => {
-      mockSinglePage([
-        makeIssue({
+      singlePage([
+        issueNode({
           id: "parent",
           identifier: "OOL-78",
           labels: ["AI-Implement"],
@@ -566,7 +528,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
           ],
         }),
       ]);
-      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
       const parent = snap.needsPlanning.find((i) => i.id === "parent")!;
       expect(parent.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
       expect(snap.parentsToFinalize).toEqual([]);
@@ -574,9 +536,9 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
   });
 
   it("counts AI-Working / AI-Planning issues by scope and excludes them from buckets", async () => {
-    mockSinglePage([
-      makeIssue({ id: "a", teamKey: "T1", labels: ["AI-Implement", "AI-Working"] }),
-      makeIssue({ id: "b", teamKey: "T2", labels: ["AI-Implement", "AI-Planning"] }),
+    singlePage([
+      issueNode({ id: "a", identifier: "T1-1", labels: ["AI-Implement", "AI-Working"] }),
+      issueNode({ id: "b", identifier: "T2-1", labels: ["AI-Implement", "AI-Planning"] }),
     ]);
 
     const p = new LinearProvider({});
@@ -588,9 +550,9 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
   });
 
   it("skips issues with Ready for Review label", async () => {
-    mockSinglePage([
-      makeIssue({ id: "a", identifier: "ENG-1", labels: ["AI-Implement", "Ready for Review"] }),
-      makeIssue({ id: "b", identifier: "ENG-2", labels: ["AI-Implement"] }),
+    singlePage([
+      issueNode({ id: "a", identifier: "ENG-1", labels: ["AI-Implement", "Ready for Review"] }),
+      issueNode({ id: "b", identifier: "ENG-2", labels: ["AI-Implement"] }),
     ]);
 
     const p = new LinearProvider({});
@@ -602,14 +564,14 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
   });
 
   it("skips issues blocked by an open issue, includes ones whose blocker is completed", async () => {
-    mockSinglePage([
-      makeIssue({
+    singlePage([
+      issueNode({
         id: "a",
         identifier: "ENG-1",
         labels: ["AI-Implement"],
         inverseRelations: [{ type: "blocks", issue: { state: { type: "started" } } }],
       }),
-      makeIssue({
+      issueNode({
         id: "b",
         identifier: "ENG-2",
         labels: ["AI-Implement"],
@@ -626,48 +588,43 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
 });
 
 describe("LinearProvider.fetchFeatureNodeRollUps", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
   afterEach(() => { vi.restoreAllMocks(); });
 
-  function mockResponse(nodes: unknown[], pageInfo?: { hasNextPage: boolean; endCursor: string | null }) {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ data: { issues: { nodes, ...(pageInfo ? { pageInfo } : {}) } } }),
-    } as Response);
+  function page(nodes: unknown[], pageInfo = { hasNextPage: false, endCursor: null as string | null }): Reply {
+    return data({ issues: { nodes, pageInfo } });
   }
-  const requestBody = (n: number) => JSON.parse(vi.mocked(fetch).mock.calls[n][1]?.body as string);
   const labels = (...names: string[]) => ({ nodes: names.map((name) => ({ name })) });
   const MULTI_YML = ["```yaml", "# ai-implement.yml", "feature_branch:", '  mode: "multi-issue"', "```"].join("\n");
 
   it("returns feature nodes with parent target; non-feature parent → null (base)", async () => {
-    mockResponse([
-      { identifier: "OOL-107", team: { key: "OOL" },
-        children: { nodes: [{ identifier: "OOL-child1", state: { type: "completed" }, labels: labels("AI-Implement") }] },
-        parent: { identifier: "OOL-106", labels: labels("AI-Implement") } },
-      { identifier: "OOL-106", team: { key: "OOL" },
-        children: { nodes: [{ identifier: "OOL-child2", state: { type: "canceled" }, labels: labels("AI-Implement") }] },
+    linear(page([
+      { id: "ool-107-id", identifier: "OOL-107", description: null, team: { key: "OOL" },
+        children: { nodes: [{ identifier: "OOL-108", state: { type: "completed" }, labels: labels("AI-Implement") }] },
+        parent: { identifier: "OOL-106", description: null, labels: labels("AI-Implement") } },
+      { id: "ool-106-id", identifier: "OOL-106", description: null, team: { key: "OOL" },
+        children: { nodes: [{ identifier: "OOL-109", state: { type: "canceled" }, labels: labels("AI-Implement") }] },
         parent: null },
-    ]);
+    ]));
     const rollUps = await new LinearProvider({}).fetchFeatureNodeRollUps();
     expect(rollUps).toEqual([
-      { identifier: "OOL-107", scopeKey: "OOL", mode: "feature", parent: { identifier: "OOL-106", mode: "feature" }, childIdentifiers: ["OOL-child1"] },
-      { identifier: "OOL-106", scopeKey: "OOL", mode: "feature", parent: null, childIdentifiers: ["OOL-child2"] },
+      { issueId: "ool-107-id", identifier: "OOL-107", scopeKey: "OOL", mode: "feature", parent: { identifier: "OOL-106", mode: "feature" }, childIdentifiers: ["OOL-108"] },
+      { issueId: "ool-106-id", identifier: "OOL-106", scopeKey: "OOL", mode: "feature", parent: null, childIdentifiers: ["OOL-109"] },
     ]);
   });
 
   it("excludes completed issues that are not feature nodes (no AI-Implement child)", async () => {
-    mockResponse([
-      { identifier: "OOL-50", team: { key: "OOL" },
-        children: { nodes: [{ labels: labels("Improvement") }] }, parent: null },
-      { identifier: "OOL-51", team: { key: "OOL" },
+    linear(page([
+      { id: "ool-50-id", identifier: "OOL-50", description: null, team: { key: "OOL" },
+        children: { nodes: [{ identifier: "OOL-52", state: { type: "completed" }, labels: labels("Improvement") }] }, parent: null },
+      { id: "ool-51-id", identifier: "OOL-51", description: null, team: { key: "OOL" },
         children: { nodes: [] }, parent: null },
-    ]);
+    ]));
     const rollUps = await new LinearProvider({}).fetchFeatureNodeRollUps();
     expect(rollUps).toEqual([]);
   });
 
   it("carries each node's and its parent's mode onto the roll-up", async () => {
-    mockResponse([
+    linear(page([
       {
         id: "ool-78-id",
         identifier: "OOL-78",
@@ -676,7 +633,7 @@ describe("LinearProvider.fetchFeatureNodeRollUps", () => {
         children: { nodes: [{ identifier: "OOL-87", state: { type: "completed" }, labels: labels("AI-Implement") }] },
         parent: { identifier: "OOL-70", description: null, labels: labels("AI-Implement") },
       },
-    ]);
+    ]));
     const [rollUp] = await new LinearProvider({}).fetchFeatureNodeRollUps();
     expect(rollUp.mode).toBe("multi-issue");
     expect(rollUp.parent).toEqual({ identifier: "OOL-70", mode: "feature" });
@@ -686,42 +643,43 @@ describe("LinearProvider.fetchFeatureNodeRollUps", () => {
   // AII-609: a node's own tracker state reaching "completed" must not be trusted as a
   // proxy for "all its children are terminal too" — the roll-up gate re-checks live.
   it("defers the roll-up while a designated child is not yet terminal (AII-609)", async () => {
-    mockResponse([
-      { identifier: "AII-604", team: { key: "AII" },
+    linear(page([
+      { id: "aii-604-id", identifier: "AII-604", description: null, team: { key: "AII" },
         children: { nodes: [
           { identifier: "AII-607", state: { type: "completed" }, labels: labels("AI-Implement") },
           { identifier: "AII-608", state: { type: "started" }, labels: labels("AI-Implement") }, // still in flight
         ] },
         parent: null },
-    ]);
+    ]));
     const rollUps = await new LinearProvider({}).fetchFeatureNodeRollUps();
     expect(rollUps).toEqual([]);
   });
 
   it("pages through every match so a feature node on a later page is found", async () => {
     const filler = Array.from({ length: 100 }, (_, i) => ({
-      identifier: `AII-f${i}`, team: { key: "AII" }, children: { nodes: [] }, parent: null,
+      id: `aii-${1000 + i}-id`, identifier: `AII-${1000 + i}`, description: null, team: { key: "AII" }, children: { nodes: [] }, parent: null,
     }));
-    mockResponse(filler, { hasNextPage: true, endCursor: "c1" });
-    mockResponse(
-      [{ id: "aii-682-id", identifier: "AII-682", description: null, team: { key: "AII" },
-        children: { nodes: [{ identifier: "AII-683", state: { type: "completed" }, labels: labels("AI-Implement") }] },
-        parent: null }],
-      { hasNextPage: false, endCursor: null },
+    const fake = linear(
+      page(filler, { hasNextPage: true, endCursor: "c1" }),
+      page(
+        [{ id: "aii-682-id", identifier: "AII-682", description: null, team: { key: "AII" },
+          children: { nodes: [{ identifier: "AII-683", state: { type: "completed" }, labels: labels("AI-Implement") }] },
+          parent: null }],
+      ),
     );
     const rollUps = await new LinearProvider({}).fetchFeatureNodeRollUps();
     expect(rollUps.map((r) => r.identifier)).toEqual(["AII-682"]);
-    expect(fetch).toHaveBeenCalledTimes(2);
-    expect(requestBody(0).variables.after).toBeNull();
-    expect(requestBody(0).variables.first).toBe(100);
-    expect(requestBody(1).variables.after).toBe("c1");
+    expect(fake.calls).toHaveLength(2);
+    expect(variables(fake, 0).after).toBeNull();
+    expect(variables(fake, 0).first).toBe(100);
+    expect(variables(fake, 1).after).toBe("c1");
   });
 
   it("stops after 20 pages and warns once when every page has a next page", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    for (let i = 0; i < 20; i++) mockResponse([], { hasNextPage: true, endCursor: `c${i}` });
+    const fake = linear(...Array.from({ length: 20 }, (_, i) => page([], { hasNextPage: true, endCursor: `c${i}` })));
     await new LinearProvider({}).fetchFeatureNodeRollUps();
-    expect(fetch).toHaveBeenCalledTimes(20);
+    expect(fake.calls).toHaveLength(20);
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0][0]).toContain("fetchFeatureNodeRollUps");
   });
@@ -729,243 +687,224 @@ describe("LinearProvider.fetchFeatureNodeRollUps", () => {
 
 // ----- Lifecycle verb tests -----
 
-function mockJsonOnce(data: unknown) {
-  vi.mocked(fetch).mockResolvedValueOnce({
-    ok: true,
-    json: async () => ({ data }),
-  } as Response);
-}
-
 describe("LinearProvider.markPlanningStarted", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("uses the issue's Linear team when the provided scope key points elsewhere", async () => {
-    // 1. getTeamKeyForIssue
-    mockJsonOnce({ issue: { team: { key: "THR2" } } });
-    // 2. getTeamIdByKey for the issue team, not the caller-provided scope key
-    mockJsonOnce({ teams: { nodes: [{ id: "team-thr2", key: "THR2" }] } });
-    // 3. ensureTeamLabel: same label exists on another team only, so create one for THR2
-    mockJsonOnce({ issueLabels: { nodes: [{ id: "label-other-team", team: { id: "team-other" } }] } });
-    // 4. ensureTeamLabel: create team-scoped label
-    mockJsonOnce({ issueLabelCreate: { issueLabel: { id: "label-thr2-planning" } } });
-    // 5. addLabelToIssue: fetch current labels
-    mockJsonOnce({ issue: { labels: { nodes: [] } } });
-    // 6. addLabelToIssue: issueUpdate
-    mockJsonOnce({ issueUpdate: { success: true } });
-    // 7. transitionToInProgressIfMovable — non-movable, so no state update
-    mockJsonOnce({ issue: { state: { type: "started" } } });
+    const fake = linear(
+      // 1. getTeamKeyForIssue
+      data({ issue: { team: { key: "THR2" } } }),
+      // 2. getTeamIdByKey for the issue team, not the caller-provided scope key
+      data({ teams: { nodes: [{ id: "team-thr2", key: "THR2" }] } }),
+      // 3. ensureTeamLabel: same label exists on another team only, so create one for THR2
+      data({ issueLabels: { nodes: [{ id: "label-other-team", team: { id: "team-other" } }] } }),
+      // 4. ensureTeamLabel: create team-scoped label
+      data({ issueLabelCreate: { issueLabel: { id: "label-thr2-planning" } } }),
+      // 5. addLabelToIssue: fetch current labels
+      data({ issue: { labels: { nodes: [] } } }),
+      // 6. addLabelToIssue: issueUpdate
+      data({ issueUpdate: { success: true } }),
+      // 7. transitionToInProgressIfMovable — non-movable, so no state update
+      data({ issue: { state: { type: "started" } } }),
+    );
 
     const p = new LinearProvider({});
     await p.markPlanningStarted("issue-1", "AII");
 
-    const teamLookupBody = JSON.parse(vi.mocked(fetch).mock.calls[1][1]?.body as string);
-    expect(teamLookupBody.variables).toEqual({ key: "THR2" });
-
-    const createBody = JSON.parse(vi.mocked(fetch).mock.calls[3][1]?.body as string);
-    expect(createBody.variables).toEqual({ teamId: "team-thr2", name: "AI-Planning", color: "#8B5CF6" });
-
-    const addBody = JSON.parse(vi.mocked(fetch).mock.calls[5][1]?.body as string);
-    expect(addBody.variables).toEqual({ issueId: "issue-1", labelIds: ["label-thr2-planning"] });
+    expect(variables(fake, 1)).toEqual({ key: "THR2" });
+    expect(variables(fake, 3)).toEqual({ teamId: "team-thr2", name: "AI-Planning", color: "#8B5CF6" });
+    expect(variables(fake, 5)).toEqual({ issueId: "issue-1", labelIds: ["label-thr2-planning"] });
   });
 
   it("ensures AI-Planning label, adds it to the issue, and transitions to In Progress when movable", async () => {
-    // 1. getTeamKeyForIssue
-    mockJsonOnce({ issue: { team: { key: "ENG" } } });
-    // 2. getTeamIdByKey
-    mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
-    // 3. ensureTeamLabel — find existing AI-Planning label
-    mockJsonOnce({ issueLabels: { nodes: [{ id: "label-planning" }] } });
-    // 4. addLabelToIssue — fetch current labels
-    mockJsonOnce({ issue: { labels: { nodes: [] } } });
-    // 5. addLabelToIssue — issueUpdate
-    mockJsonOnce({ issueUpdate: { success: true } });
-    // 6. transitionToInProgressIfMovable — fetch state.type (movable)
-    mockJsonOnce({ issue: { state: { type: "unstarted" } } });
-    // 7. getInProgressStateId — workflowStates query (team id is cached)
-    mockJsonOnce({
-      workflowStates: { nodes: [{ id: "state-inprog", name: "In Progress", type: "started" }] },
-    });
-    // 8. updateIssueState
-    mockJsonOnce({ issueUpdate: { success: true } });
+    const fake = linear(
+      // 1. getTeamKeyForIssue
+      data({ issue: { team: { key: "ENG" } } }),
+      // 2. getTeamIdByKey
+      data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
+      // 3. ensureTeamLabel — find existing AI-Planning label (workspace-level)
+      data({ issueLabels: { nodes: [{ id: "label-planning", team: null }] } }),
+      // 4. addLabelToIssue — fetch current labels
+      data({ issue: { labels: { nodes: [] } } }),
+      // 5. addLabelToIssue — issueUpdate
+      data({ issueUpdate: { success: true } }),
+      // 6. transitionToInProgressIfMovable — fetch state.type (movable)
+      data({ issue: { state: { type: "unstarted" } } }),
+      // 7. getInProgressStateId — workflowStates query (team id is cached)
+      data({ workflowStates: { nodes: [{ id: "state-inprog", name: "In Progress", type: "started" }] } }),
+      // 8. updateIssueState
+      data({ issueUpdate: { success: true } }),
+    );
 
     const p = new LinearProvider({});
     await p.markPlanningStarted("issue-1", "ENG");
 
-    expect(fetch).toHaveBeenCalledTimes(8);
-    const lastBody = JSON.parse(vi.mocked(fetch).mock.calls[7][1]?.body as string);
-    expect(lastBody.variables).toEqual({ issueId: "issue-1", stateId: "state-inprog" });
+    expect(fake.calls).toHaveLength(8);
+    expect(variables(fake, 7)).toEqual({ issueId: "issue-1", stateId: "state-inprog" });
   });
 
   it("does not transition state when issue is in a non-movable state", async () => {
-    mockJsonOnce({ issue: { team: { key: "ENG" } } });
-    mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
-    mockJsonOnce({ issueLabels: { nodes: [{ id: "label-planning" }] } });
-    mockJsonOnce({ issue: { labels: { nodes: [] } } });
-    mockJsonOnce({ issueUpdate: { success: true } });
-    // state.type fetch returns "started" — not movable
-    mockJsonOnce({ issue: { state: { type: "started" } } });
+    const fake = linear(
+      data({ issue: { team: { key: "ENG" } } }),
+      data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
+      data({ issueLabels: { nodes: [{ id: "label-planning", team: null }] } }),
+      data({ issue: { labels: { nodes: [] } } }),
+      data({ issueUpdate: { success: true } }),
+      // state.type fetch returns "started" — not movable
+      data({ issue: { state: { type: "started" } } }),
+    );
 
     const p = new LinearProvider({});
     await p.markPlanningStarted("issue-1", "ENG");
 
-    expect(fetch).toHaveBeenCalledTimes(6);
+    expect(fake.calls).toHaveLength(6);
   });
 
   it("creates AI-Planning label with #8B5CF6 color when not found", async () => {
-    mockJsonOnce({ issue: { team: { key: "ENG" } } });
-    mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
-    // ensureTeamLabel: search returns empty → create
-    mockJsonOnce({ issueLabels: { nodes: [] } });
-    mockJsonOnce({ issueLabelCreate: { issueLabel: { id: "new-label" } } });
-    mockJsonOnce({ issue: { labels: { nodes: [] } } });
-    mockJsonOnce({ issueUpdate: { success: true } });
-    // state.type fetch (movable)
-    mockJsonOnce({ issue: { state: { type: "backlog" } } });
-    mockJsonOnce({
-      workflowStates: { nodes: [{ id: "state-inprog", name: "In Progress", type: "started" }] },
-    });
-    mockJsonOnce({ issueUpdate: { success: true } });
+    const fake = linear(
+      data({ issue: { team: { key: "ENG" } } }),
+      data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
+      // ensureTeamLabel: search returns empty → create
+      data({ issueLabels: { nodes: [] } }),
+      data({ issueLabelCreate: { issueLabel: { id: "new-label" } } }),
+      data({ issue: { labels: { nodes: [] } } }),
+      data({ issueUpdate: { success: true } }),
+      // state.type fetch (movable)
+      data({ issue: { state: { type: "backlog" } } }),
+      data({ workflowStates: { nodes: [{ id: "state-inprog", name: "In Progress", type: "started" }] } }),
+      data({ issueUpdate: { success: true } }),
+    );
 
     const p = new LinearProvider({});
     await p.markPlanningStarted("issue-1", "ENG");
 
-    const createBody = JSON.parse(vi.mocked(fetch).mock.calls[3][1]?.body as string);
-    expect(createBody.variables).toEqual({ teamId: "team-uuid", name: "AI-Planning", color: "#8B5CF6" });
+    expect(variables(fake, 3)).toEqual({ teamId: "team-uuid", name: "AI-Planning", color: "#8B5CF6" });
   });
 });
 
 describe("LinearProvider.markPlanComplete", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("removes AI-Planning label, then adds Plan-Complete label resolved via issue's team key", async () => {
-    // 1. removeLabelByName: fetch labels
-    mockJsonOnce({ issue: { labels: { nodes: [{ id: "lp", name: "AI-Planning" }, { id: "lo", name: "Other" }] } } });
-    // 2. removeLabelByName: issueUpdate to drop AI-Planning
-    mockJsonOnce({ issueUpdate: { success: true } });
-    // 3. getTeamKeyForIssue
-    mockJsonOnce({ issue: { team: { key: "ENG" } } });
-    // 4. getTeamIdByKey
-    mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
-    // 5. ensureTeamLabel: find existing Plan-Complete
-    mockJsonOnce({ issueLabels: { nodes: [{ id: "label-pc" }] } });
-    // 6. addLabelToIssue: fetch current labels
-    mockJsonOnce({ issue: { labels: { nodes: [{ id: "lo" }] } } });
-    // 7. addLabelToIssue: issueUpdate
-    mockJsonOnce({ issueUpdate: { success: true } });
+    const fake = linear(
+      // 1. removeLabelByName: fetch labels
+      data({ issue: { labels: { nodes: [{ id: "lp", name: "AI-Planning" }, { id: "lo", name: "Other" }] } } }),
+      // 2. removeLabelByName: issueUpdate to drop AI-Planning
+      data({ issueUpdate: { success: true } }),
+      // 3. getTeamKeyForIssue
+      data({ issue: { team: { key: "ENG" } } }),
+      // 4. getTeamIdByKey
+      data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
+      // 5. ensureTeamLabel: find existing Plan-Complete (workspace-level)
+      data({ issueLabels: { nodes: [{ id: "label-pc", team: null }] } }),
+      // 6. addLabelToIssue: fetch current labels
+      data({ issue: { labels: { nodes: [{ id: "lo" }] } } }),
+      // 7. addLabelToIssue: issueUpdate
+      data({ issueUpdate: { success: true } }),
+    );
 
     const p = new LinearProvider({});
     await p.markPlanComplete("issue-1", "team-a");
 
-    expect(fetch).toHaveBeenCalledTimes(7);
-    const removeBody = JSON.parse(vi.mocked(fetch).mock.calls[1][1]?.body as string);
-    expect(removeBody.variables).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
-    const addBody = JSON.parse(vi.mocked(fetch).mock.calls[6][1]?.body as string);
-    expect(addBody.variables.labelIds).toEqual(["lo", "label-pc"]);
+    expect(fake.calls).toHaveLength(7);
+    expect(variables(fake, 1)).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
+    expect(variables(fake, 6).labelIds).toEqual(["lo", "label-pc"]);
   });
 });
 
 describe("LinearProvider.markImplementing", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("ensures AI-Working label and adds it to the issue (no state transition when not movable)", async () => {
-    mockJsonOnce({ issue: { team: { key: "ENG" } } });
-    mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
-    mockJsonOnce({ issueLabels: { nodes: [{ id: "label-aw" }] } });
-    mockJsonOnce({ issue: { labels: { nodes: [] } } });
-    mockJsonOnce({ issueUpdate: { success: true } });
-    // state.type fetch returns "started" — not movable, no transition
-    mockJsonOnce({ issue: { state: { type: "started" } } });
+    const fake = linear(
+      data({ issue: { team: { key: "ENG" } } }),
+      data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
+      data({ issueLabels: { nodes: [{ id: "label-aw", team: null }] } }),
+      data({ issue: { labels: { nodes: [] } } }),
+      data({ issueUpdate: { success: true } }),
+      // state.type fetch returns "started" — not movable, no transition
+      data({ issue: { state: { type: "started" } } }),
+    );
 
     const p = new LinearProvider({});
     await p.markImplementing("issue-1", "ENG");
 
-    expect(fetch).toHaveBeenCalledTimes(6);
-    const addBody = JSON.parse(vi.mocked(fetch).mock.calls[4][1]?.body as string);
-    expect(addBody.variables).toEqual({ issueId: "issue-1", labelIds: ["label-aw"] });
+    expect(fake.calls).toHaveLength(6);
+    expect(variables(fake, 4)).toEqual({ issueId: "issue-1", labelIds: ["label-aw"] });
   });
 
   it("does not transition state when issue is in a non-movable state", async () => {
-    mockJsonOnce({ issue: { team: { key: "ENG" } } });
-    mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
-    mockJsonOnce({ issueLabels: { nodes: [{ id: "label-aw" }] } });
-    mockJsonOnce({ issue: { labels: { nodes: [] } } });
-    mockJsonOnce({ issueUpdate: { success: true } });
-    // state.type "completed" — not movable
-    mockJsonOnce({ issue: { state: { type: "completed" } } });
+    const fake = linear(
+      data({ issue: { team: { key: "ENG" } } }),
+      data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
+      data({ issueLabels: { nodes: [{ id: "label-aw", team: null }] } }),
+      data({ issue: { labels: { nodes: [] } } }),
+      data({ issueUpdate: { success: true } }),
+      // state.type "completed" — not movable
+      data({ issue: { state: { type: "completed" } } }),
+    );
 
     const p = new LinearProvider({});
     await p.markImplementing("issue-1", "ENG");
 
-    // 4 setup/label fetches + 1 state.type query, but no getInProgressStateId/updateIssueState
-    expect(fetch).toHaveBeenCalledTimes(6);
+    // 4 setup/label requests + 1 state.type query, but no getInProgressStateId/updateIssueState
+    expect(fake.calls).toHaveLength(6);
   });
 
   it("transitions state to In Progress when issue is in a movable state", async () => {
-    mockJsonOnce({ issue: { team: { key: "ENG" } } });
-    mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
-    mockJsonOnce({ issueLabels: { nodes: [{ id: "label-aw" }] } });
-    mockJsonOnce({ issue: { labels: { nodes: [] } } });
-    mockJsonOnce({ issueUpdate: { success: true } });
-    // state.type "backlog" — movable
-    mockJsonOnce({ issue: { state: { type: "backlog" } } });
-    // getInProgressStateId
-    mockJsonOnce({
-      workflowStates: { nodes: [{ id: "state-inprog", name: "In Progress", type: "started" }] },
-    });
-    // updateIssueState
-    mockJsonOnce({ issueUpdate: { success: true } });
+    const fake = linear(
+      data({ issue: { team: { key: "ENG" } } }),
+      data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
+      data({ issueLabels: { nodes: [{ id: "label-aw", team: null }] } }),
+      data({ issue: { labels: { nodes: [] } } }),
+      data({ issueUpdate: { success: true } }),
+      // state.type "backlog" — movable
+      data({ issue: { state: { type: "backlog" } } }),
+      // getInProgressStateId
+      data({ workflowStates: { nodes: [{ id: "state-inprog", name: "In Progress", type: "started" }] } }),
+      // updateIssueState
+      data({ issueUpdate: { success: true } }),
+    );
 
     const p = new LinearProvider({});
     await p.markImplementing("issue-1", "ENG");
 
-    expect(fetch).toHaveBeenCalledTimes(8);
-    const lastBody = JSON.parse(vi.mocked(fetch).mock.calls[7][1]?.body as string);
-    expect(lastBody.variables).toEqual({ issueId: "issue-1", stateId: "state-inprog" });
+    expect(fake.calls).toHaveLength(8);
+    expect(variables(fake, 7)).toEqual({ issueId: "issue-1", stateId: "state-inprog" });
   });
 
   it("creates AI-Working label with #F59E0B color when not found", async () => {
-    mockJsonOnce({ issue: { team: { key: "ENG" } } });
-    mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
-    mockJsonOnce({ issueLabels: { nodes: [] } });
-    mockJsonOnce({ issueLabelCreate: { issueLabel: { id: "new-label" } } });
-    mockJsonOnce({ issue: { labels: { nodes: [] } } });
-    mockJsonOnce({ issueUpdate: { success: true } });
-    // state.type fetch — not movable to keep mock count minimal
-    mockJsonOnce({ issue: { state: { type: "started" } } });
+    const fake = linear(
+      data({ issue: { team: { key: "ENG" } } }),
+      data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
+      data({ issueLabels: { nodes: [] } }),
+      data({ issueLabelCreate: { issueLabel: { id: "new-label" } } }),
+      data({ issue: { labels: { nodes: [] } } }),
+      data({ issueUpdate: { success: true } }),
+      // state.type fetch — not movable to keep the request count minimal
+      data({ issue: { state: { type: "started" } } }),
+    );
 
     const p = new LinearProvider({});
     await p.markImplementing("issue-1", "ENG");
 
-    const createBody = JSON.parse(vi.mocked(fetch).mock.calls[3][1]?.body as string);
-    expect(createBody.variables).toEqual({ teamId: "team-uuid", name: "AI-Working", color: "#F59E0B" });
+    expect(variables(fake, 3)).toEqual({ teamId: "team-uuid", name: "AI-Working", color: "#F59E0B" });
   });
 });
 
 describe("LinearProvider.markPrReady", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("swaps AI-Working for Ready for Review atomically and posts a PR comment", async () => {
-    // 1. ensureWorkspaceReadyForReviewLabel: search workspace
-    mockJsonOnce({ issueLabels: { nodes: [{ id: "label-rfr" }] } });
-    // 2. fetch issue labels for swap
-    mockJsonOnce({ issue: { labels: { nodes: [{ id: "lw", name: "AI-Working" }, { id: "lo", name: "Other" }] } } });
-    // 3. issueUpdate label swap
-    mockJsonOnce({ issueUpdate: { success: true } });
-    // 4. postComment
-    mockJsonOnce({ commentCreate: { success: true } });
+    const fake = linear(
+      // 1. ensureWorkspaceReadyForReviewLabel: search workspace
+      data({ issueLabels: { nodes: [{ id: "label-rfr" }] } }),
+      // 2. fetch issue labels for swap
+      data({ issue: { labels: { nodes: [{ id: "lw", name: "AI-Working" }, { id: "lo", name: "Other" }] } } }),
+      // 3. issueUpdate label swap
+      data({ issueUpdate: { success: true } }),
+      // 4. postComment
+      data({ commentCreate: { success: true } }),
+    );
 
     const p = new LinearProvider({});
     await p.markPrReady("issue-1", "team-a", "https://github.com/o/r/pull/7");
 
-    expect(fetch).toHaveBeenCalledTimes(4);
-    const swapBody = JSON.parse(vi.mocked(fetch).mock.calls[2][1]?.body as string);
-    expect(swapBody.variables).toEqual({ issueId: "issue-1", labelIds: ["lo", "label-rfr"] });
-    const commentBody = JSON.parse(vi.mocked(fetch).mock.calls[3][1]?.body as string);
-    expect(commentBody.variables).toEqual({
+    expect(fake.calls).toHaveLength(4);
+    expect(variables(fake, 2)).toEqual({ issueId: "issue-1", labelIds: ["lo", "label-rfr"] });
+    expect(variables(fake, 3)).toEqual({
       issueId: "issue-1",
       body: "AI implementation PR: https://github.com/o/r/pull/7",
     });
@@ -973,249 +912,209 @@ describe("LinearProvider.markPrReady", () => {
 });
 
 describe("LinearProvider.clearWorkingState", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("removes the AI-Working label from the issue", async () => {
-    mockJsonOnce({ issue: { labels: { nodes: [{ id: "lw", name: "AI-Working" }, { id: "lo", name: "Other" }] } } });
-    mockJsonOnce({ issueUpdate: { success: true } });
-    // second removeLabelByName call for AI-Planning — not present, no mutation
-    mockJsonOnce({ issue: { labels: { nodes: [{ id: "lo", name: "Other" }] } } });
+    const fake = linear(
+      data({ issue: { labels: { nodes: [{ id: "lw", name: "AI-Working" }, { id: "lo", name: "Other" }] } } }),
+      data({ issueUpdate: { success: true } }),
+      // second removeLabelByName call for AI-Planning — not present, no mutation
+      data({ issue: { labels: { nodes: [{ id: "lo", name: "Other" }] } } }),
+    );
 
     const p = new LinearProvider({});
     await p.clearWorkingState("issue-1", "team-a");
 
-    expect(fetch).toHaveBeenCalledTimes(3);
-    const updateBody = JSON.parse(vi.mocked(fetch).mock.calls[1][1]?.body as string);
-    expect(updateBody.variables).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
+    expect(fake.calls).toHaveLength(3);
+    expect(variables(fake, 1)).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
   });
 
   it("removes the AI-Planning label from the issue", async () => {
-    mockJsonOnce({ issue: { labels: { nodes: [{ id: "lp", name: "AI-Planning" }, { id: "lo", name: "Other" }] } } });
-    // AI-Working absent — no mutation
-    // second removeLabelByName call for AI-Planning
-    mockJsonOnce({ issue: { labels: { nodes: [{ id: "lp", name: "AI-Planning" }, { id: "lo", name: "Other" }] } } });
-    mockJsonOnce({ issueUpdate: { success: true } });
+    const fake = linear(
+      data({ issue: { labels: { nodes: [{ id: "lp", name: "AI-Planning" }, { id: "lo", name: "Other" }] } } }),
+      // AI-Working absent — no mutation
+      // second removeLabelByName call for AI-Planning
+      data({ issue: { labels: { nodes: [{ id: "lp", name: "AI-Planning" }, { id: "lo", name: "Other" }] } } }),
+      data({ issueUpdate: { success: true } }),
+    );
 
     const p = new LinearProvider({});
     await p.clearWorkingState("issue-1", "team-a");
 
-    expect(fetch).toHaveBeenCalledTimes(3);
-    const updateBody = JSON.parse(vi.mocked(fetch).mock.calls[2][1]?.body as string);
-    expect(updateBody.variables).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
+    expect(fake.calls).toHaveLength(3);
+    expect(variables(fake, 2)).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
   });
 
   it("no-ops (no mutation) when AI-Working label is absent", async () => {
-    mockJsonOnce({ issue: { labels: { nodes: [{ id: "lo", name: "Other" }] } } });
-    // second removeLabelByName call for AI-Planning — also absent
-    mockJsonOnce({ issue: { labels: { nodes: [{ id: "lo", name: "Other" }] } } });
+    const fake = linear(
+      data({ issue: { labels: { nodes: [{ id: "lo", name: "Other" }] } } }),
+      // second removeLabelByName call for AI-Planning — also absent
+      data({ issue: { labels: { nodes: [{ id: "lo", name: "Other" }] } } }),
+    );
 
     const p = new LinearProvider({});
     await p.clearWorkingState("issue-1", "team-a");
 
-    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fake.calls).toHaveLength(2);
   });
 
   it("no-ops when the issue has no labels at all", async () => {
-    mockJsonOnce({ issue: { labels: { nodes: [] } } });
-    // second removeLabelByName call for AI-Planning — also empty
-    mockJsonOnce({ issue: { labels: { nodes: [] } } });
+    const fake = linear(
+      data({ issue: { labels: { nodes: [] } } }),
+      // second removeLabelByName call for AI-Planning — also empty
+      data({ issue: { labels: { nodes: [] } } }),
+    );
 
     const p = new LinearProvider({});
     await p.clearWorkingState("issue-1", "team-a");
 
     // Two labels-fetch queries run; no update mutation when there's nothing to remove
-    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fake.calls).toHaveLength(2);
   });
 });
 
 describe("LinearProvider.markPlanningFailed", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("removes AI-Planning label and posts a failure comment", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ data: { issue: { labels: { nodes: [{ id: "lblP", name: "AI-Planning" }] } } } }),
-    } as Response);
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ data: { issueUpdate: { success: true } } }),
-    } as Response);
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ data: { commentCreate: { success: true } } }),
-    } as Response);
+    const fake = linear(
+      data({ issue: { labels: { nodes: [{ id: "lblP", name: "AI-Planning" }] } } }),
+      data({ issueUpdate: { success: true } }),
+      data({ commentCreate: { success: true } }),
+    );
 
     const p = new LinearProvider({});
     const commented = await p.markPlanningFailed("issue-1", "team-a", "GraphQL exploded");
 
-    const lastCall = vi.mocked(fetch).mock.calls.at(-1)!;
-    const body = JSON.parse(lastCall[1]?.body as string);
-    expect(body.variables.body).toContain("Planning failed: GraphQL exploded");
+    expect(variables(fake, fake.calls.length - 1).body).toContain("Planning failed: GraphQL exploded");
     expect(commented).toBe(true);
   });
 });
 
 describe("LinearProvider.markImplementationFailed", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("removes AI-Working label and posts a failure comment", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ data: { issue: { labels: { nodes: [{ id: "lblW", name: "AI-Working" }] } } } }),
-    } as Response);
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ data: { issueUpdate: { success: true } } }),
-    } as Response);
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ data: { commentCreate: { success: true } } }),
-    } as Response);
+    const fake = linear(
+      data({ issue: { labels: { nodes: [{ id: "lblW", name: "AI-Working" }] } } }),
+      data({ issueUpdate: { success: true } }),
+      data({ commentCreate: { success: true } }),
+    );
 
     const p = new LinearProvider({});
     const commented = await p.markImplementationFailed("issue-1", "team-a", "tests timed out");
 
-    const lastCall = vi.mocked(fetch).mock.calls.at(-1)!;
-    const body = JSON.parse(lastCall[1]?.body as string);
-    expect(body.variables.body).toContain("Implementation failed: tests timed out");
+    expect(variables(fake, fake.calls.length - 1).body).toContain("Implementation failed: tests timed out");
     expect(commented).toBe(true);
   });
 });
 
 describe("LinearProvider.markMerged", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("moves a started issue to Done and drops the Ready for Review label", async () => {
-    // 1. fetch issue state, team key, and labels
-    mockJsonOnce({ issue: { state: { type: "started" }, team: { key: "ENG" }, labels: { nodes: [{ id: "L1", name: "Ready for Review" }, { id: "L2", name: "bug" }] } } });
-    // 2. getTeamIdByKey
-    mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
-    // 3. getCompletedStateId: workflowStates query
-    mockJsonOnce({ workflowStates: { nodes: [{ id: "s-rel", name: "Released", type: "completed" }, { id: "s-done", name: "Done", type: "completed" }] } });
-    // 4. issueUpdate: move state + drop label
-    mockJsonOnce({ issueUpdate: { success: true } });
+    const fake = linear(
+      // 1. fetch issue state, team key, and labels
+      data({ issue: { state: { type: "started" }, team: { key: "ENG" }, labels: { nodes: [{ id: "L1", name: "Ready for Review" }, { id: "L2", name: "bug" }] } } }),
+      // 2. getTeamIdByKey
+      data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
+      // 3. getCompletedStateId: workflowStates query
+      data({ workflowStates: { nodes: [{ id: "s-rel", name: "Released", type: "completed" }, { id: "s-done", name: "Done", type: "completed" }] } }),
+      // 4. issueUpdate: move state + drop label
+      data({ issueUpdate: { success: true } }),
+    );
 
     const p = new LinearProvider({ linearWorkspaceUrl: "https://linear.app/acme" });
     await p.markMerged("issue-1", "team-a");
 
-    expect(fetch).toHaveBeenCalledTimes(4);
-    const updateBody = JSON.parse(vi.mocked(fetch).mock.calls[3][1]?.body as string);
-    expect(updateBody.variables).toMatchObject({ issueId: "issue-1", stateId: "s-done", labelIds: ["L2"] });
+    expect(fake.calls).toHaveLength(4);
+    expect(variables(fake, 3)).toMatchObject({ issueId: "issue-1", stateId: "s-done", labelIds: ["L2"] });
   });
 
   it("no-ops when the issue is already completed", async () => {
-    mockJsonOnce({ issue: { state: { type: "completed" }, team: { key: "ENG" }, labels: { nodes: [] } } });
+    const fake = linear(data({ issue: { state: { type: "completed" }, team: { key: "ENG" }, labels: { nodes: [] } } }));
 
     const p = new LinearProvider({});
     await p.markMerged("issue-1", "team-a");
 
-    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fake.calls).toHaveLength(1);
   });
 
   it("no-ops when the issue is already canceled", async () => {
-    mockJsonOnce({ issue: { state: { type: "canceled" }, team: { key: "ENG" }, labels: { nodes: [] } } });
+    const fake = linear(data({ issue: { state: { type: "canceled" }, team: { key: "ENG" }, labels: { nodes: [] } } }));
 
     const p = new LinearProvider({});
     await p.markMerged("issue-1", "team-a");
 
-    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fake.calls).toHaveLength(1);
   });
 
   it("falls back to the first completed state when none is named Done", async () => {
-    // 1. fetch issue state, team key, labels
-    mockJsonOnce({ issue: { state: { type: "unstarted" }, team: { key: "ENG" }, labels: { nodes: [] } } });
-    // 2. getTeamIdByKey
-    mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
-    // 3. workflowStates — only "Shipped", no "Done"
-    mockJsonOnce({ workflowStates: { nodes: [{ id: "s-shipped", name: "Shipped", type: "completed" }] } });
-    // 4. issueUpdate
-    mockJsonOnce({ issueUpdate: { success: true } });
+    const fake = linear(
+      // 1. fetch issue state, team key, labels
+      data({ issue: { state: { type: "unstarted" }, team: { key: "ENG" }, labels: { nodes: [] } } }),
+      // 2. getTeamIdByKey
+      data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
+      // 3. workflowStates — only "Shipped", no "Done"
+      data({ workflowStates: { nodes: [{ id: "s-shipped", name: "Shipped", type: "completed" }] } }),
+      // 4. issueUpdate
+      data({ issueUpdate: { success: true } }),
+    );
 
     const p = new LinearProvider({});
     await p.markMerged("issue-1", "team-a");
 
-    const updateBody = JSON.parse(vi.mocked(fetch).mock.calls[3][1]?.body as string);
-    expect(updateBody.variables.stateId).toBe("s-shipped");
+    expect(variables(fake, 3).stateId).toBe("s-shipped");
   });
 
   it("keeps all labels except Ready for Review", async () => {
-    mockJsonOnce({ issue: { state: { type: "started" }, team: { key: "ENG" }, labels: { nodes: [{ id: "L1", name: "Ready for Review" }, { id: "L2", name: "bug" }, { id: "L3", name: "AI-Implement" }] } } });
-    mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
-    mockJsonOnce({ workflowStates: { nodes: [{ id: "s-done", name: "Done", type: "completed" }] } });
-    mockJsonOnce({ issueUpdate: { success: true } });
+    const fake = linear(
+      data({ issue: { state: { type: "started" }, team: { key: "ENG" }, labels: { nodes: [{ id: "L1", name: "Ready for Review" }, { id: "L2", name: "bug" }, { id: "L3", name: "AI-Implement" }] } } }),
+      data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
+      data({ workflowStates: { nodes: [{ id: "s-done", name: "Done", type: "completed" }] } }),
+      data({ issueUpdate: { success: true } }),
+    );
 
     const p = new LinearProvider({});
     await p.markMerged("issue-1", "team-a");
 
-    const updateBody = JSON.parse(vi.mocked(fetch).mock.calls[3][1]?.body as string);
-    expect(updateBody.variables.labelIds).toEqual(["L2", "L3"]);
+    expect(variables(fake, 3).labelIds).toEqual(["L2", "L3"]);
   });
 });
 
 describe("LinearProvider.issueUrl", () => {
   it("uses linearWorkspaceUrl when provided", () => {
     const p = new LinearProvider({ linearWorkspaceUrl: "https://linear.app/acme" });
-    expect(p.issueUrl({
-      id: "u", identifier: "ENG-1", title: "t", description: null, scopeKey: "ENG", nativeStatus: "",
-    })).toBe("https://linear.app/acme/issue/ENG-1");
+    expect(p.issueUrl(makeIssue({ identifier: "ENG-1" }))).toBe("https://linear.app/acme/issue/ENG-1");
   });
 
   it("falls back to https://linear.app when workspace URL is unset", () => {
     const p = new LinearProvider({});
-    expect(p.issueUrl({
-      id: "u", identifier: "ENG-1", title: "t", description: null, scopeKey: "ENG", nativeStatus: "",
-    })).toBe("https://linear.app/issue/ENG-1");
+    expect(p.issueUrl(makeIssue({ identifier: "ENG-1" }))).toBe("https://linear.app/issue/ENG-1");
   });
 });
 
 describe("LinearProvider.findByKey", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("returns null for malformed identifiers", async () => {
+    const fake = linear();
     const p = new LinearProvider({});
     expect(await p.findByKey("not a key")).toBeNull();
-    expect(fetch).not.toHaveBeenCalled();
+    expect(fake.calls).toHaveLength(0);
   });
 
   it("returns null when the GraphQL query yields no nodes", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ data: { issues: { nodes: [] } } }),
-    } as Response);
+    linear(data({ issues: { nodes: [] } }));
     const p = new LinearProvider({});
     expect(await p.findByKey("ENG-999")).toBeNull();
   });
 
   it("bubbles non-404 errors from the Linear API", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 500,
-      statusText: "Internal Server Error",
-      text: async () => "boom",
-    } as Response);
+    linear({ status: 500, text: "boom" });
     const p = new LinearProvider({});
     await expect(p.findByKey("ENG-1")).rejects.toThrow(/Linear API error/);
   });
 
   it("returns a TicketIssue when found", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        data: {
-          issues: {
-            nodes: [{
-              id: "issue-uuid", identifier: "ENG-1", title: "Hello", description: "World",
-              team: { key: "ENG" }, state: { name: "Todo", type: "unstarted" },
-            }],
-          },
-        },
-      }),
-    } as Response);
+    linear(data({
+      issues: {
+        nodes: [{
+          id: "issue-uuid", identifier: "ENG-1", title: "Hello", description: "World",
+          team: { key: "ENG" }, state: { name: "Todo", type: "unstarted" },
+        }],
+      },
+    }));
     const p = new LinearProvider({});
     const issue = await p.findByKey("ENG-1");
     expect(issue).toEqual({
