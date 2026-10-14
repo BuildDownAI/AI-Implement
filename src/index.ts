@@ -895,6 +895,18 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     tokenForOwner: (owner) =>
       getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
     getPullRequestState,
+    // AII-1294: a parent's own PR closed unmerged must not block its roll-up.
+    finalizeGroupingParent: async (job) => {
+      const prNumber = job.prUrl ? prNumberFromUrl(job.prUrl) : null;
+      const entry = job.repo && prNumber !== null ? resolvePrMapping(getMappings(), job.repo, prNumber) : undefined;
+      if (!entry) {
+        console.error(`[merge-poll] No mapping resolves for grouping parent ${job.issueIdentifier} (${job.repo} ${job.prUrl}); not finalizing`);
+        return false;
+      }
+      const provider = await registry.forMapping(entry.mapping);
+      await provider.markMerged(job.issueId, entry.scopeKey);
+      return true;
+    },
   });
 
   // Process any pending reconciliation jobs triggered by merged PRs
