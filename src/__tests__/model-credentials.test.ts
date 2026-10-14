@@ -20,6 +20,16 @@ let secrets: Map<string, CredModule.ProtectedSecretValue>;
 let resolverCalls: string[];
 let readCalls: Array<[string, number]>;
 let readResult: SessionReadResult;
+let planResult: SessionReadResult;
+let planReads: string[];
+const ACCESS = "synthetic-access-SENTINEL-0004";
+const REFRESH = "synthetic-refresh-SENTINEL-0005";
+const IDTOK = "synthetic-id-SENTINEL-0006";
+const planJson = (over: Record<string, unknown> = {}) => JSON.stringify({
+  version: 1, email: "u@example.com", issuer: "https://auth.openai.com", subject: "s", clientId: "c",
+  extAgentHostId: "h", idToken: IDTOK, accessToken: ACCESS, refreshToken: REFRESH, tokenType: "Bearer",
+  scopes: ["chatgpt.tokens.use.direct"], accessTokenExpiresAt: 5_000_000, earliestRefreshAt: null, savedAt: 1, ...over,
+});
 
 function deps(extra: Partial<CredModule.ModelCredentialDeps> = {}): CredModule.ModelCredentialDeps {
   const sessionStore: ModelSessionStore = {
@@ -29,6 +39,8 @@ function deps(extra: Partial<CredModule.ModelCredentialDeps> = {}): CredModule.M
     },
     checkpoint: () => { throw new Error("unexpected checkpoint"); },
     importSession: () => { throw new Error("unexpected import"); },
+    readPlanRecord: (profileId) => { planReads.push(profileId); return planResult; },
+    writePlanRecord: () => { throw new Error("unexpected plan write"); },
   };
   return {
     sessionStore,
@@ -73,12 +85,66 @@ beforeEach(async () => {
   secrets = new Map([["model-account:anth", API_SENTINEL]]);
   resolverCalls = [];
   readCalls = [];
+  planReads = [];
+  planResult = { ok: true, profileId: "cdx", ownerGeneration: 1, stateSequence: 2, sessionData: planJson() };
   readResult = { ok: true, profileId: "sub", ownerGeneration: 1, stateSequence: 7, sessionData: SESSION_SENTINEL };
 });
 
 afterEach(() => {
   dedup.closeDb();
   try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+});
+
+describe("codex-subscription (hosted ChatGPT plan record)", () => {
+  const saveCdx = () => save({ profileId: "cdx", agent: "codex", provider: "openai", authMode: "codex-subscription", metadata: {} });
+  const cdxReq = (over: Partial<CredModule.CredentialRequest> = {}) =>
+    req({ profileId: "cdx", provider: "openai", authMode: "codex-subscription", ...over });
+
+  it("returns the access token only, with no ownerGeneration and no owner generation required", () => {
+    saveCdx();
+    const r = cred.resolveModelCredential(cdxReq(), deps());
+    expect(r).toMatchObject({ ok: true, authMode: "codex-subscription", secret: { kind: "chatgpt-access-token", accessToken: ACCESS, expiresAt: 5_000_000 } });
+    if (r.ok) {
+      expect("ownerGeneration" in r).toBe(false);
+      expect(Object.keys(r.secret).sort()).toEqual(["accessToken", "expiresAt", "kind"]);
+    }
+    expect(JSON.stringify(r)).not.toContain(REFRESH);
+    expect(JSON.stringify(r)).not.toContain(IDTOK);
+    expect(planReads).toEqual(["cdx"]);
+    expect(readCalls).toEqual([]);
+  });
+
+  it("maps a missing record to authentication_required and other faults to persistence_failed", () => {
+    saveCdx();
+    planResult = { ok: false, category: "recovery_required", reason: "no_state" };
+    expect(cred.resolveModelCredential(cdxReq(), deps())).toMatchObject({ ok: false, category: "authentication_required", code: "session_unavailable" });
+    planResult = { ok: false, category: "authentication_required", reason: "key_unavailable" };
+    expect(cred.resolveModelCredential(cdxReq(), deps())).toMatchObject({ ok: false, category: "persistence_failed" });
+    for (const sessionData of ["not json", JSON.stringify({ version: 1 }), planJson({ scopes: [] })]) {
+      planResult = { ok: true, profileId: "cdx", ownerGeneration: 1, stateSequence: 2, sessionData };
+      const r = cred.resolveModelCredential(cdxReq(), deps());
+      expect(r).toMatchObject({ ok: false, category: "persistence_failed" });
+      expect(JSON.stringify(r)).not.toContain(ACCESS);
+    }
+  });
+
+  it("reports status without a token", () => {
+    saveCdx();
+    const ok = cred.getCredentialStatus(cdxReq(), deps());
+    expect(ok).toMatchObject({ usable: true, failure: null, referenceConfigured: null });
+    planResult = { ok: false, category: "recovery_required", reason: "no_state" };
+    expect(cred.getCredentialStatus(cdxReq(), deps())).toMatchObject({ usable: false, failure: { category: "authentication_required", code: "session_unavailable" } });
+    planResult = { ok: true, profileId: "cdx", ownerGeneration: 1, stateSequence: 2, sessionData: "bad" };
+    expect(cred.getCredentialStatus(cdxReq(), deps())).toMatchObject({ usable: false, failure: { category: "persistence_failed" } });
+    expect(JSON.stringify(ok)).not.toContain(ACCESS);
+  });
+
+  it("never reads api secrets or owner-bound sessions", () => {
+    saveCdx();
+    cred.resolveModelCredential(cdxReq(), deps());
+    expect(resolverCalls).toEqual([]);
+    expect(readCalls).toEqual([]);
+  });
 });
 
 describe("resolveModelCredential", () => {
@@ -136,7 +202,7 @@ describe("resolveModelCredential", () => {
     }
   });
 
-  it("never lets a codex subscription yield an api key, nor an api profile read sessions", () => {
+  it("never lets a subscription profile yield an api key, nor an api profile read sessions", () => {
     save({ profileId: "sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", metadata: { credentialRef: "model-account:anth" } });
     const r = cred.resolveModelCredential(req({ profileId: "sub", provider: "openai", authMode: "openai-api-key", ownerGeneration: 1 }), deps());
     expect(r).toMatchObject({ ok: false, code: "account_mismatch" });

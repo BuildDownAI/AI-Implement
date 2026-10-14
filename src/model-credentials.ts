@@ -16,13 +16,14 @@
 
 import {
   MODEL_AUTH_FAILURE_CATEGORIES,
-  isSubscriptionAuthMode,
   parseModelAuthCheckoutResponse,
+  reservesModelAccount,
   type ModelAuthFailureCategory,
   type ModelAuthSecret,
 } from "./model-auth-contract.js";
 import type { AccountAuthMode, ModelProvider } from "./agent-config.js";
 import type { ModelSessionStore } from "./model-session-store.js";
+import { parseChatGptPlanRecord, type ChatGptPlanRecordV1 } from "./chatgpt-plan-token.js";
 import {
   getAccountProfileRevision,
   lookupCredentialReference,
@@ -169,13 +170,64 @@ function lookupRef(
   return { ok: true, ref };
 }
 
+type PlanRecordRead = { ok: true; record: ChatGptPlanRecordV1 } | CredentialFailure;
+
+/** Reads, decrypts and validates the hosted ChatGPT plan record. Missing means sign-in is needed; anything else is a fault. */
+function readPlanRecord(profileId: string, deps: ModelCredentialDeps): PlanRecordRead {
+  let read;
+  try {
+    read = deps.sessionStore.readPlanRecord(profileId);
+  } catch {
+    return fail("persistence_failed", "session_unavailable");
+  }
+  if (!read.ok) {
+    return read.reason === "no_state"
+      ? fail("authentication_required", "session_unavailable")
+      : fail("persistence_failed", "session_unavailable");
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(read.sessionData);
+  } catch {
+    return fail("persistence_failed", "secret_invalid");
+  }
+  const parsed = parseChatGptPlanRecord(raw);
+  if (!parsed.ok) return fail("persistence_failed", "secret_invalid");
+  return { ok: true, record: parsed.value };
+}
+
 /** Resolves exactly one credential for the selected profile revision; never substitutes. */
 export function resolveModelCredential(req: CredentialRequest, deps: ModelCredentialDeps): CredentialResolution {
   const auth = authorize(req, deps);
   if (!auth.ok) return fail(auth.category, auth.code);
   const { profile } = auth;
 
-  if (isSubscriptionAuthMode(profile.authMode)) {
+  if (profile.authMode === "codex-subscription") {
+    const plan = readPlanRecord(profile.profileId, deps);
+    if (!plan.ok) return plan;
+    // Copy out the access token only; the ID and refresh tokens never leave the record.
+    const parsed = parseModelAuthCheckoutResponse({
+      version: 1,
+      ok: true,
+      profileId: profile.profileId,
+      authMode: profile.authMode,
+      secret: {
+        kind: "chatgpt-access-token",
+        accessToken: plan.record.accessToken,
+        expiresAt: plan.record.accessTokenExpiresAt,
+      },
+    });
+    if (!parsed.ok) return fail("persistence_failed", "secret_invalid");
+    return {
+      ok: true,
+      profileId: profile.profileId,
+      revision: profile.revision,
+      authMode: profile.authMode,
+      secret: parsed.value.secret,
+    };
+  }
+
+  if (reservesModelAccount(profile.authMode)) {
     if (!isPositiveInt(req.ownerGeneration)) return fail("stale_owner", "invalid_request");
     let read;
     try {
@@ -256,14 +308,18 @@ export function getCredentialStatus(req: CredentialRequest, deps: ModelCredentia
       failure: auth.ok ? null : { category: auth.category, code: auth.code },
     };
   }
-  const subscription = isSubscriptionAuthMode(profile.authMode);
-  const refResult = subscription ? null : lookupRef(profile, deps);
+  const usesRef = !reservesModelAccount(profile.authMode) && profile.authMode !== "codex-subscription";
+  const refResult = usesRef ? lookupRef(profile, deps) : null;
   const referenceConfigured = refResult === null ? null : refResult.ok;
-  const failure = auth.ok
-    ? refResult && !refResult.ok
-      ? { category: refResult.category, code: refResult.code }
-      : null
-    : { category: auth.category, code: auth.code };
+  let failure: CredentialStatus["failure"] = null;
+  if (!auth.ok) {
+    failure = { category: auth.category, code: auth.code };
+  } else if (refResult && !refResult.ok) {
+    failure = { category: refResult.category, code: refResult.code };
+  } else if (profile.authMode === "codex-subscription") {
+    const plan = readPlanRecord(profile.profileId, deps);
+    if (!plan.ok) failure = { category: plan.category, code: plan.code };
+  }
   return {
     profileId: profile.profileId,
     revision: profile.revision,
