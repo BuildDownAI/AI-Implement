@@ -17,7 +17,7 @@ Every cell is a real entry point. The test drives it with fakes at the outermost
 | legacy review-fix queue | `processReviewFixQueue` (`src/index.ts:3500`), runner mode `gha` | none: the queue has no Fly branch | `processReviewFixQueue`, runner mode `local`, through `dispatchLocalGapfill` |
 | kg-refresh | `createKgRefreshSenders(...)["github-actions"]` (`src/restate/kg-refresh-senders.ts:51`) | `["fly-machines"]`, through `launchKeptMachine` (`src/restate/kg-refresh-production.ts:128`) | `["local-docker"]` |
 
-Fly and local implementation and planning launches share `dispatchSession` (`src/index.ts:1616`), which owns admission and mints the result token.
+Fly and local implementation and planning launches share `dispatchSession` (`src/index.ts:1616`), which owns admission and mints the run tokens with `mintLaunchTokens`.
 
 ## What a launch carries
 
@@ -29,14 +29,14 @@ The `RunConfigV1` envelope ([workflow-envelope.md](workflow-envelope.md)) rides 
 
 A run carries up to three tokens: result (`run_token` / `RUN_TOKEN`), progress (`run_progress_token` / `RUN_PROGRESS_TOKEN`) and publication (`run_publication_token` / `RUN_PUBLICATION_TOKEN`). Today's facts:
 
-- Implementation: GitHub Actions gets result, progress and publication. Fly and local get only the result token.
+- Implementation: every backend gets result, progress and publication, minted by `mintLaunchTokens` (`src/runner-tokens.ts`). On GitHub Actions the publication token is sent only when the target workflow supports `run_publication_token`.
 - Gap-fill: GitHub Actions gets all three. Local gets result and progress. Fly gets only the result token, so a Fly gap-fill run has no progress token.
-- Planning gets only the result token on every backend. It never pushes, and the vending route refuses a planning publication token (`src/publication-token-vending.ts:62`).
+- Planning gets result and progress on every backend, minted by `mintLaunchTokens`. It never pushes, and the vending route refuses a planning publication token (`src/publication-token-vending.ts:62`).
 - Review-fix attempt (GitHub Actions) and the legacy queue on GitHub Actions get all three. The legacy queue on local gets result and progress.
 - kg-refresh: GitHub Actions gets all three. Fly and local get result and progress.
-- Fly and local runs get no publication token. They push with the machine nonce: the runner prefers the nonce for its GitHub token (`src/runner-token.ts:81`).
+- On Fly and local runs the runner prefers the machine nonce for its GitHub token (`src/runner-token.ts:81`), so the implementation publication token is carried but unused until AII-1365. The gap-fill, kg-refresh and legacy cells that still lack a publication token push with the nonce.
 
-**The rule this branch makes true: the run kind sets the token set, and the backend never does.** Implementation, gap-fill, review-fix and kg-refresh runs carry result, progress and publication. Planning carries result and progress. Each row in the gap list below that names a `token:` check is a place where today's code breaks this rule.
+**The rule: the run kind sets the token set, and the backend never does.** `LAUNCH_TOKEN_AUDIENCES` in `src/runner-tokens.ts` is the table, and `mintLaunchTokens` mints a launch's tokens from it after it deletes the unconsumed rows of the dispatch id, so a retried launch step can mint again. A consumed row is kept. Implementation, gap-fill, review-fix and kg-refresh runs carry result, progress and publication. Planning carries result and progress. Each row in the gap list below that names a `token:` check is a place where today's code breaks this rule.
 
 ### The runner image
 

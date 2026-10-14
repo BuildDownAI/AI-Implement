@@ -53,6 +53,8 @@ vi.mock("../../notify.js", async (importOriginal) => ({
   notifyText: async () => {},
 }));
 
+vi.mock("../../workflow-probe.js", () => ({ resolveWorkflowContract: async () => "envelope" }));
+vi.mock("../../planning-context.js", () => ({ buildPlanningContextInputs: async () => ({}) }));
 vi.mock("../../github-app-auth.js", () => ({ getInstallationToken: async () => "sim-gh-token" }));
 vi.mock("../../github.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../github.js")>()),
@@ -98,7 +100,8 @@ vi.mock("../../restate/planning-run-workflow.js", async (importOriginal) => {
 
 import { getDb } from "../../dedup.js";
 import { acquireDispatch } from "../../dispatch-gate.js";
-import { dispatchPlanning, reportTerminalJob } from "../../index.js";
+import { dispatchPlanning, dispatchSession, reportTerminalJob } from "../../index.js";
+import { preparePlanningLaunch } from "../../planning-launch.js";
 import { resetRestateStatus, setRestateStatus } from "../../restate/status.js";
 import { initMappingsTable } from "../../config.js";
 import { initDispatchBreakerTable, recordDispatchFailure } from "../../dispatch-breaker.js";
@@ -112,7 +115,7 @@ import { createReviewFixAdminFacade } from "../../review-fix-admin-facade.js";
 import { SqliteReviewFixAttemptStore } from "../../review-fix-attempt-store.js";
 import { listActiveRestateReviewFixPrs, queueReviewFixCancellationForClosedPr } from "../../review-fix-close.js";
 import { mintPreparedReviewFixToken } from "../../runner-tokens.js";
-import { VARIANTS, callWorkflow, cancelInvocation, eventually, queryInvocations, gate, startVariants, stopAll, waitForStep, type Gate } from "./harness.js";
+import { VARIANTS, journalEntries, journalText, callWorkflow, cancelInvocation, eventually, queryInvocations, gate, startVariants, stopAll, waitForStep, type Gate } from "./harness.js";
 
 const OWNER = "TestOrg";
 const REPO = "test-repo";
@@ -887,4 +890,125 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     expect(() => mintPreparedReviewFixToken({ attemptId: dispatchId, audience: "result", secret: "s" })).toThrow(/no current authority/);
     expect(getDb().prepare("SELECT COUNT(*) AS n FROM runner_tokens WHERE dispatch_id = ?").get(dispatchId)).toEqual({ n: 0 });
   });
+
+  describe("the run tokens of a planning launch (AII-1320)", () => {
+    const TOKEN_SECRET = "planning-token-secret-with-enough-entropy";
+    /** What each launch received: the audiences present and the token strings. */
+    let received: Array<{ audiences: string[]; tokens: string[] }> = [];
+    let throwAfterMint = false;
+    let tokenEnvironments: Map<string, RestateEnvironment>;
+
+    const seen = (tokens: Record<string, string | undefined>) => {
+      const named: Record<string, string | undefined> = { result: tokens.result, progress: tokens.progress, publication: tokens.publication };
+      const present = Object.entries(named).filter(([, v]) => v);
+      received.push({ audiences: present.map(([k]) => k), tokens: present.map(([, v]) => v as string) });
+    };
+
+    beforeAll(async () => {
+      const provider = {
+        id: "linear",
+        findByKey: async (key: string) => issues.get(key) ?? null,
+        clearWorkingState: async () => true,
+        issueUrl: (issue: { identifier: string }) => `https://tracker.test/${issue.identifier}`,
+        postComment: async () => {},
+      };
+      const outcomeConfig = { notifyType: "slack", notifyWebhookUrl: "https://hooks.test/notify" } as never;
+      const outcomeRegistry = { forMapping: async () => provider } as never;
+      const config = {
+        githubAppId: "1", githubAppPrivateKey: "k", notifyType: "slack", notifyWebhookUrl: null, flySessionsToken: "fly-token", flySessionsApp: "fly-app",
+        runnerCallbackBaseUrl: "http://callback.test", runnerTokenSecret: TOKEN_SECRET,
+      } as never;
+      sim.timing = SLOW;
+      tokenEnvironments = await startVariants(createProductionPlanningRunServices({
+        config,
+        resolveProvider: async () => provider as never,
+        resolveRunnerImage: async () => undefined,
+        fireBreakerTrip: async () => {},
+        // The real preparation mints the tokens, as production does.
+        preparePlanningLaunch,
+        launchPlanningRun: (async (args: { issue: { id: string; identifier: string; title: string; scopeKey: string }; dispatchId: string; admissionGeneration: number; planningDispatchInputs: Record<string, string> }) => {
+          const inputs = args.planningDispatchInputs;
+          seen({ result: inputs.run_token, progress: inputs.run_progress_token, publication: inputs.run_publication_token });
+          if (throwAfterMint) {
+            throwAfterMint = false;
+            throw new Error("injected: the launch call failed after the mint");
+          }
+          appendLog({
+            issueId: args.issue.id, issueIdentifier: args.issue.identifier, issueTitle: args.issue.title, teamKey: args.issue.scopeKey,
+            repo: `${OWNER}/${REPO}`, dispatchId: args.dispatchId, admissionGeneration: args.admissionGeneration,
+            executionMode: "github-actions", phase: "planning",
+          });
+          const run: SimRun = { id: gh.nextRunId++, title: `${PLANNING_RUN_TITLE_PREFIX}${args.issue.identifier}`, createdAt: new Date().toISOString(), status: "in_progress" };
+          gh.runs.push(run);
+          return { outcome: "accepted", runId: run.id };
+        }) as never,
+        // The real dispatchSession mints for the container backends; only the launch call is simulated.
+        launchPlanningSession: (async (args: { issue: { id: string; identifier: string; title: string; scopeKey: string; nativeStatus: string }; execPath: "fly-machines" | "local-docker"; mapping: never; reservation: { dispatchId: string } }) => {
+          const session = await dispatchSession(config, provider as never, args.issue as never, args.mapping, { count: 0, lastDispatchedAt: null }, "default", {
+            phase: "planning", tokenTtlSeconds: 1800, doMarkDispatched: false, shadow: false, backendKind: args.execPath,
+            onPostDispatch: async () => {},
+            backend: async ({ runToken, runProgressToken, runPublicationToken, markLaunchAttempted }) => {
+              seen({ result: runToken, progress: runProgressToken, publication: runPublicationToken });
+              markLaunchAttempted();
+              const id = `${args.execPath === "fly-machines" ? "m" : "c"}-${++backends.created}`;
+              if (args.execPath === "fly-machines") backends.machines.set(id, "started"); else backends.containers.set(id, true);
+              backends.names.set(planningSessionName(args.reservation.dispatchId), id);
+              return { machineId: id, sessionImage: "img", ghToken: "sim-gh-token", executionMode: args.execPath, statusComment: null };
+            },
+          }, args.reservation as never);
+          return session.admitted
+            ? { outcome: "accepted", machineId: session.machineId, executionMode: args.execPath }
+            : { outcome: "rejected", executionMode: args.execPath };
+        }) as never,
+        reportTerminalJob: async (job) => { await reportTerminalJob(outcomeConfig, outcomeRegistry, job, { ownerCall: true }); },
+        sessionDeps: {} as never,
+      }).services);
+    }, 60_000);
+
+    afterAll(async () => { await stopAll(tokenEnvironments); });
+    beforeEach(() => { received = []; throwAfterMint = false; });
+
+    /** Ends the run the way the backend's own end does, then waits for the release. */
+    async function finish(w: Awaited<ReturnType<typeof dispatch>>, backend: PlanningRunInput["backend"]) {
+      const { jobId } = await eventually(() => w.read(), (st) => st.jobId !== null, { label: "bound" });
+      updateJobStatus(getJobByDispatchId(w.dispatchId)!.id, "completed", "planning_callback");
+      await w.hook(w.dispatchId);
+      if (backend === "github-actions") gh.runs.find((r) => String(r.id) === jobId)!.status = "completed";
+      else if (backend === "fly-machines") backends.machines.set(jobId!, "destroyed");
+      else backends.containers.set(jobId!, false);
+      await untilReleased(w.dispatchId);
+    }
+
+    async function journalOf(label: string, dispatchId: string): Promise<string> {
+      const env = tokenEnvironments.get(label)!;
+      const rows = await eventually(
+        () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'PlanningRun' AND target_service_key = '${dispatchId}'`),
+        (r) => r.length > 0, { label: "PlanningRun invocation" });
+      return journalText(await journalEntries(env.adminAPIBaseUrl(), rows[0].id as string));
+    }
+
+    describe.each(["github-actions", "fly-machines", "local-docker"] as const)("backend %s", (backend) => {
+      it.each(labels)("the launch receives exactly the result and progress tokens, and the journal holds neither (%s)", async (label) => {
+        const w = await dispatch(label, "PLT-60", backend, tokenEnvironments);
+        await waitForStep(w.read, "wait");
+        expect(received).toHaveLength(1);
+        expect(received[0].audiences.sort()).toEqual(["progress", "result"]);
+        await finish(w, backend);
+        const text = await journalOf(label, w.dispatchId);
+        for (const token of received[0].tokens) expect(text).not.toContain(token);
+      }, 60_000);
+    });
+
+    // Depends on a retry (docs/restate-testing.md), so alwaysReplay only. disableRetries fails the invocation at once.
+    it("a launch that throws after the mint is retried, mints again, and the workflow does not end launch_rejected (alwaysReplay)", async () => {
+      throwAfterMint = true;
+      const w = await dispatch("alwaysReplay", "PLT-61", "github-actions", tokenEnvironments);
+      await waitForStep(w.read, "wait");
+      expect(received).toHaveLength(2);
+      expect(received[1].audiences.sort()).toEqual(["progress", "result"]);
+      await finish(w, "github-actions");
+      expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
+    }, 60_000);
+  });
+
 });
