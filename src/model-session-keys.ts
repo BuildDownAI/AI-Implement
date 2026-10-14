@@ -14,6 +14,7 @@ import type { SessionKeyProvider } from "./model-session-store.js";
 export const MODEL_SESSION_KEY_ID = "rts-v1";
 const HKDF_SALT = "ai-implement";
 const HKDF_INFO = "ai-implement/model-session-key/v1";
+const PROTECTION_HKDF_INFO = "ai-implement/model-auth-protection-key/v1";
 const KEY_BYTES = 32;
 
 export function createModelSessionKeyProvider(env: NodeJS.ProcessEnv = process.env): SessionKeyProvider {
@@ -31,4 +32,15 @@ export function createModelSessionKeyProvider(env: NodeJS.ProcessEnv = process.e
       return keyId === MODEL_SESSION_KEY_ID ? derive() : undefined;
     },
   };
+}
+
+/**
+ * Fly protection key (ADR 009): derived from `RUNNER_TOKEN_SECRET` with its own HKDF label, so it differs from the
+ * hosted session key. Returns raw bytes; the consumer base64url-encodes it for the wire. `undefined` when the secret
+ * is unset or empty.
+ */
+export function deriveModelAuthProtectionKey(env: NodeJS.ProcessEnv = process.env): Buffer | undefined {
+  const secret = env.RUNNER_TOKEN_SECRET;
+  if (!secret) return undefined;
+  return Buffer.from(crypto.hkdfSync("sha256", secret, HKDF_SALT, PROTECTION_HKDF_INFO, KEY_BYTES));
 }

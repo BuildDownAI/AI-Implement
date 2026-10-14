@@ -61,6 +61,14 @@ The refresher reports `reauth_required` when OpenAI rejects the refresh token (r
 record is corrupt, or it was sealed under another `RUNNER_TOKEN_SECRET`. Nothing can recover it on the orchestrator:
 sign in again on the laptop (step 1), then import again (step 2).
 
+## Hosted-run dependencies
+
+`src/model-auth-runtime.ts` composes the dependencies a hosted (configured) run needs. Three facts matter to an operator:
+
+- **Protection key.** The Fly protection key is derived, not a new secret: HKDF-SHA256 over `RUNNER_TOKEN_SECRET`, salt `ai-implement`, info `ai-implement/model-auth-protection-key/v1`, 32 bytes (`deriveModelAuthProtectionKey`, `src/model-session-keys.ts`). The info label differs from the hosted session key's (`ai-implement/model-session-key/v1`), as ADR 009 requires, so the two keys are never equal. It travels base64url-encoded. With `RUNNER_TOKEN_SECRET` unset there is no key. Rotating the secret changes both keys.
+- **API-key profiles are not yet supported for hosted runs.** No protected store backs them, so a snapshot with an API-key profile prepares as `authentication-required` and launches nothing. There is never a fallback key. Storage is a separate follow-up.
+- **Scope of this slice.** Only `codex-subscription` and API-key profiles prepare. No `claude-subscription` account is reserved, GitHub Actions does not prepare, and a repo image override (`.ai-implement/image.yml`) is refused on Fly. No new environment variable is involved.
+
 ## Claude subscription accounts
 
 To be filled by [AII-963](https://linear.app/eudoxus/issue/AII-963/provision-accounts-and-recover-held-subscription-sessions).
