@@ -168,12 +168,13 @@ class FakeServer {
   }
 }
 
-function drive(server: FakeServer, redact: (s: string) => string = (s) => s, modelProvider?: string): Promise<CodexTransportResult> {
+function drive(server: FakeServer, redact: (s: string) => string = (s) => s, modelProvider?: string, resumeThreadId?: string): Promise<CodexTransportResult> {
   return createCodexPlanningDriver().run({
     io: { stdin: server.stdin, stdout: server.stdout, halt: server.halt.signal },
     prompt: "plan it",
     model: "gpt-synthetic",
     ...(modelProvider ? { modelProvider } : {}),
+    ...(resumeThreadId ? { resumeThreadId } : {}),
     workspaceDir: ws,
     forbiddenRoots: [],
     redact,
@@ -208,6 +209,79 @@ const completeTurn = (s: FakeServer): void => {
 };
 
 describe("planning protocol driver", () => {
+  it("omits ephemeral for the ChatGPT plan provider so the thread can resume", async () => {
+    const server = new FakeServer((m, s) => {
+      if (handshake(m, s)) return;
+      if (m.method === "turn/start") {
+        ack(m, s);
+        completeTurn(s);
+      }
+    });
+    await drive(server, undefined, "chatgpt_plan");
+    const thread = server.received.find((m) => m.method === "thread/start")!.params as Msg;
+    expect(thread).not.toHaveProperty("ephemeral");
+  });
+
+  it("classifies a failed turn with httpStatusCode 401 as token expired and reports the thread id and usage", async () => {
+    const server = new FakeServer((m, s) => {
+      if (handshake(m, s)) return;
+      if (m.method === "turn/start") {
+        ack(m, s);
+        s.send(tokens(4, 2));
+        s.send(completed({ status: "failed", error: { message: "unauthorized", codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 401 } } } }));
+      }
+    });
+    const out = await drive(server, undefined, "chatgpt_plan");
+    expect(out.tokenExpired).toBe(true);
+    expect(out.threadId).toBe("th1");
+    expect(out.result.telemetry?.tokensIn).toBe(4);
+    expect(out.result.tokensUsed).toBe(6);
+  });
+
+  it("uses a preceding error notification's 401 and does not flag other failures", async () => {
+    const run = async (errParams: Msg | null): Promise<CodexTransportResult> => {
+      const server = new FakeServer((m, s) => {
+        if (handshake(m, s)) return;
+        if (m.method === "turn/start") {
+          ack(m, s);
+          if (errParams) s.send({ method: "error", params: errParams });
+          s.send(completed({ status: "failed", error: { message: "boom" } }));
+        }
+      });
+      return drive(server, undefined, "chatgpt_plan");
+    };
+    expect((await run({ error: { message: "x", codexErrorInfo: { httpStatusCode: 401 } }, willRetry: false })).tokenExpired).toBe(true);
+    expect((await run({ error: { message: "x", httpStatusCode: 500 } })).tokenExpired).toBeUndefined();
+    expect((await run(null)).tokenExpired).toBeUndefined();
+  });
+
+  it("resumes a saved thread: initialize, thread/resume, then turn/start with the prompt", async () => {
+    const server = new FakeServer((m, s) => {
+      if (m.method === "initialize") s.send({ id: m.id, result: { userAgent: "x" } });
+      else if (m.method === "thread/resume") s.send({ id: m.id, result: { thread: { id: "th1" } } });
+      else if (m.method === "turn/start") {
+        ack(m, s);
+        completeTurn(s);
+      }
+    });
+    const out = await drive(server, undefined, "chatgpt_plan", "th1");
+    expect(out.result.exitCode).toBe(0);
+    expect(server.methods().filter((x) => x !== undefined)).toEqual(["initialize", "initialized", "thread/resume", "turn/start"]);
+    const resume = server.received.find((m) => m.method === "thread/resume")!.params as Msg;
+    expect(resume).toMatchObject({ threadId: "th1", modelProvider: "chatgpt_plan", sandbox: "read-only", approvalPolicy: "never" });
+    expect(server.received.some((m) => m.method === "thread/start")).toBe(false);
+  });
+
+  it("fails closed when thread/resume answers with a different thread", async () => {
+    const server = new FakeServer((m, s) => {
+      if (m.method === "initialize") s.send({ id: m.id, result: { userAgent: "x" } });
+      else if (m.method === "thread/resume") s.send({ id: m.id, result: { thread: { id: "other" } } });
+    });
+    const out = await drive(server, undefined, "chatgpt_plan", "th1");
+    expect(out.result.exitCode).toBe(1);
+    expect(server.methods()).not.toContain("turn/start");
+  });
+
   it("sends the supplied model provider in thread/start", async () => {
     const server = new FakeServer((m, s) => {
       if (handshake(m, s)) return;
