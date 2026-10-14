@@ -255,6 +255,18 @@ are still refused, since nothing on them names a tracker issue to report against
 > With the callback disabled, planning stalls at `AI-Planning` and the cascade can't advance
 > on its own.
 
+### A parent's own PR closed without merging (AII-1294)
+
+A feature-node parent never blocks its own roll-up. When the PR from the parent's own run
+(any dispatch row for that PR with `grouping_parent` set, even if a newer gap-fill row says
+otherwise) is closed unmerged, the merge poll (`detectMergedPrs`) calls `markMerged` on the
+parent, then writes the tombstone. It skips this while a run for the issue is in flight
+(nothing is written; the next poll re-checks) and when the closed PR is not the issue's latest
+PR (tombstone only). If `markMerged` throws or no mapping resolves, no tombstone is written
+and the next poll retries. The poll does not check children; the roll-up gates above do that
+live, so a Done parent with a non-terminal designated child still gets no roll-up. A closed
+parent PR does not veto the tree; to stop a tree, cancel the parent issue.
+
 ---
 
 ## 7. End-to-end lifecycle of one tree
