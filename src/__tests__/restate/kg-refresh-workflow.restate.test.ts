@@ -3768,7 +3768,28 @@ describe("KgRefresh durable workflow", () => {
       expect(scenario.cancelCalls).toBe(1);
     }, 60_000);
 
-    it.each(VARIANTS.map(([label]) => label))("a Restate cancel during the merge closes the row and releases once, without closing the snapshot PR (%s)", async (label) => {
+    // ---- AII-1296: the start of the merge is the point of no return ----
+    const expectRunSucceeded = async (env: RestateEnvironment, triggerId: string) => {
+      const row = await eventually(
+        async () => runInvocation(env, triggerId),
+        (inv) => inv.status === "completed" || inv.status === "succeeded",
+        { label: "the run invocation ends" },
+      );
+      expect(row.completion_result).toBe("success");
+    };
+    const expectStoppedBeforeMerge = async (env: RestateEnvironment, triggerId: string, beforeMerge: number, beforeClose: number) => {
+      await expectClosedAndReleasedOnce(env, triggerId);
+      expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
+      expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+    };
+    /** Parks the next `postPrCommentFn` call (the baseline-accept-note step) until released. */
+    const holdAcceptNote = () => {
+      const held = gate("baseline-accept-note held");
+      postPrCommentFn.mockImplementationOnce(async () => { await held.wait(); });
+      return held;
+    };
+
+    it.each(VARIANTS.map(([label]) => label))("a Restate cancel during the merge does not interrupt: the gates run, the row completes and the run succeeds (%s)", async (label) => {
       const env = heldEnvs.get(label)!;
       const beforeClose = closePullRequestFn.mock.calls.length;
       const beforeMerge = mergePullRequestFn.mock.calls.length;
@@ -3777,8 +3798,103 @@ describe("KgRefresh durable workflow", () => {
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
       await eventually(() => mergePullRequestFn.mock.calls.length - beforeMerge, (n) => n >= 1, { label: "the merge call" });
       await restateCancel(env, triggerId);
-      await expectClosedAndReleasedOnce(env, triggerId);
+      await expectRunSucceeded(env, triggerId);
+      expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
+      expect(gateOrder).toEqual(["fetch", "stage", "swap", "verify"]);
+      expect(persistCalls.at(-1)).toMatchObject({ ok: true });
+      expect(servedStamp).toBe(NEW_STAMP);
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "completed" });
+      await eventually(() => runReleases(env, triggerId), (n) => n >= 1, { label: "the release" });
+      await settle(500);
+      expect(await runReleases(env, triggerId)).toBe(1);
       expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(0);
+    }, 60_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a Restate cancel during a held swap restart does not orphan it: one restart, verify runs, the run succeeds (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const swapHeld = gate("AII-1296 swap restart held");
+      let swapAttempts = 0;
+      restartImpl = async () => {
+        swapAttempts++;
+        if (swapAttempts === 1) await swapHeld.wait();
+        servedStamp = NEW_STAMP;
+      };
+      const triggerId = await holdRun(env);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
+      try {
+        await swapHeld.reached();
+        await restateCancel(env, triggerId);
+      } finally {
+        swapHeld.release();
+      }
+      await expectRunSucceeded(env, triggerId);
+      expect(restartCallCount).toBe(1);
+      expect(gateOrder).toEqual(["fetch", "stage", "swap", "verify"]);
+      expect(persistCalls.at(-1)).toMatchObject({ ok: true });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "completed" });
+    }, 60_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a cancel signal between the accept and the commit stops the run: no merge, PR closed, operator_cancelled (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const beforeMerge = mergePullRequestFn.mock.calls.length;
+      const triggerId = await holdRun(env);
+      const held = holdAcceptNote();
+      try {
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
+        await held.reached();
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "stop" });
+      } finally {
+        held.release();
+      }
+      await expectStoppedBeforeMerge(env, triggerId, beforeMerge, beforeClose);
+    }, 60_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a Restate cancel between the accept and the commit stops the run: no merge, PR closed, operator_cancelled (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const beforeMerge = mergePullRequestFn.mock.calls.length;
+      const triggerId = await holdRun(env);
+      const held = holdAcceptNote();
+      try {
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
+        await held.reached();
+        await restateCancel(env, triggerId);
+      } finally {
+        held.release();
+      }
+      await expectStoppedBeforeMerge(env, triggerId, beforeMerge, beforeClose);
+    }, 60_000);
+
+    it.each(VARIANTS.map(([label]) => label))("decide cancel between the accept and the commit succeeds and stops the run (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const beforeMerge = mergePullRequestFn.mock.calls.length;
+      const triggerId = await holdRun(env);
+      const held = holdAcceptNote();
+      try {
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
+        await held.reached();
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ops@example.com" });
+      } finally {
+        held.release();
+      }
+      await expectStoppedBeforeMerge(env, triggerId, beforeMerge, beforeClose);
+    }, 60_000);
+
+    it.each(VARIANTS.map(([label]) => label))("after the merge starts, cancel and decide cancel answer past-merge, a second accept answers already-decided, and the run succeeds (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      mergeDelayMs = 1_500;
+      const beforeMerge = mergePullRequestFn.mock.calls.length;
+      const triggerId = await holdRun(env);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
+      await eventually(() => mergePullRequestFn.mock.calls.length - beforeMerge, (n) => n >= 1, { label: "the merge call" });
+      await expect(callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "stop" })).rejects.toThrow(/409.*past-merge/);
+      await expect(callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ops@example.com" })).rejects.toThrow(/409.*past-merge/);
+      await expect(callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" })).rejects.toThrow(/409.*already-decided/);
+      const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+      expect(outcome.ok).toBe(true);
+      await expectRunSucceeded(env, triggerId);
     }, 60_000);
 
     it.each(VARIANTS.map(([label]) => label))("a Restate cancel at the gate and the cancel signal make the same calls and end operator_cancelled (%s)", async (label) => {

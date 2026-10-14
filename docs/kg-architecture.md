@@ -267,11 +267,12 @@ at a gate (`src/restate/kg-refresh-workflow.ts`):
 | `decide { action: "accept", actor }` | Posts a `### Baseline` comment naming the actor on the PR, then runs the normal merge, delete-branch and fetch/stage/swap/verify gates | as a normal success |
 | `decide { action: "cancel", actor }` | Closes the PR (gate `operator_cancelled`), closes the row, releases | `operator_cancelled` |
 | `cancel` signal (the page's Stop) | Same as `decide` cancel | `operator_cancelled` |
+| `cancel` signal or `decide { action: "cancel" }` after the merge starts | Refused with 409 `past-merge`; the run finishes | as a normal success or gate failure |
 | 24 h elapse (`KG_REFRESH_DECISION_TIMEOUT_MS`, fixed, no setting) | Closes the PR (gate `decision_timeout`), closes the row, releases | `decision_timeout` |
 
 `decide` is a shared handler with a zod-validated body; `actor` is required, and the PR note and the
 `[KgRefresh]` log line name it. It answers 409 `no-decision-open` unless the step is `decision`, and 409
-`already-decided` once a decision is recorded. A cancel that lands at the very moment of the deadline
+`already-decided` once a decision is recorded (except a `cancel` after an `accept`, which acts as the `cancel` signal: it stops the run before the merge starts and answers `past-merge` after). A cancel that lands at the very moment of the deadline
 is recorded as `decision_timeout`. A held dry-run never reaches the gate. Any other report takes the
 unchanged success or failure paths; a `KG_SNAPSHOT_HELD` report with no `snapshotPr` takes the failure path.
 
@@ -279,7 +280,12 @@ The deploy drain counts a suspended invocation, so a held run holds a deploy for
 
 A Stop sent before the gate opens also cancels the held run: the `cancel` promise is durable, so the gate sees it at once.
 
-A Restate cancel of the `run` invocation (from the Restate UI or the admin API) does the full cleanup at every step, through the same function as the `cancel` signal (`cleanupCancelled`): cancel the GitHub run and stop the machine while the runner has not yet reported, close the held snapshot PR (`operator_cancelled`), run the failure path without a notification, and close the row. It logs `[KgRefresh] cancelled by Restate at step <step>`, and each step is best effort. `run` sends the `KgRepo` and `FlyMachineProfile` releases from one `finally` on every exit except a suspension. A cancel at the gate stops no machine (already released) and one during `merge` or the gates adds no revert beyond the rail's own rules.
+**The start of the merge is the point of no return (AII-1296).** The merge cannot be undone (GitHub answers 405 on a merged PR), and a run that stopped after it would leave the repo snapshot and the served graph different. Two rules follow:
+
+1. **Before the merge starts, a cancel stops the run and closes the PR.** A Restate cancel of the `run` invocation (from the Restate UI or the admin API) does the full cleanup at every step, through the same function as the `cancel` signal (`cleanupCancelled`): cancel the GitHub run and stop the machine while the runner has not yet reported, close the held snapshot PR (`operator_cancelled`), run the failure path without a notification, and close the row. It logs `[KgRefresh] cancelled by Restate at step <step>`, and each step is best effort. `run` sends the `KgRepo` and `FlyMachineProfile` releases from one `finally` on every exit except a suspension.
+2. **After the merge starts, the run finishes.** The merge, the gates, `persist`, `close-row` and `outcome` run to the end. A `cancel` signal or `decide { action: "cancel" }` answers 409 `past-merge` (the `decide_kg_refresh` tool answers the error `past-merge`), and a Restate cancel has no effect: the invocation ends `succeeded` and `lastRefresh` shows the result. A Restate-UI cancel cannot answer `past-merge`, because the admin API accepts every cancel.
+
+How it works: `run` is registered with `explicitCancellation: true`, so Restate never throws at a pending await or interrupts a `ctx.run` step. The run sees a Restate cancel only where it races a cancel arm (`ctx.cancellation()`, passed to `awaitOwnedRun` as `cancelArm`, plus a 1 ms check before the dispatch and one at the commit point); the arm throws a 409 that reaches the outer catch and `cleanupCancelled("restate")`. The commit point is the start of `mergeAndRunGates`: after the cancel check, `run` resolves its own `cancel` promise with the reserved value `COMMITTED` (the `cancel` handler refuses it as a reason). The durable promise decides: the first of that write and an operator cancel wins. If the operator won, `run` reads the operator's reason and takes `cleanupCancelled("signal")`; nothing is merged. If `run` won, the `cancel` handler peeks `COMMITTED` and answers `past-merge`. After this point nothing races the cancel arm.
 
 | Cancelled while | Cleanup |
 | -- | -- |
@@ -287,7 +293,10 @@ A Restate cancel of the `run` invocation (from the Restate UI or the admin API) 
 | `await-progress` (GitHub run known) | run cancelled, row closed, released |
 | `await-progress` (Fly) | machine stopped, row closed, released |
 | `decision` (held PR) | PR closed, row closed, released |
-| `merge` / gates | row closed, released |
+| accepted, before the merge starts (the baseline note) | PR closed, row `operator_cancelled`, released; no merge |
+| `merge` / gates and after | no cleanup: the run finishes; the cancel answers `past-merge` |
+
+The journal shape changed in AII-1296 (the cancel arm in the races, the pre-dispatch and commit-point sleeps, the commit resolve), so deploy and revert only with no refresh in flight. The deploy drain already waits for a held run.
 
 
 ### Dry run (AII-632)
