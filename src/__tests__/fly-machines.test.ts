@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   createMachine,
   getMachine,
@@ -24,9 +24,24 @@ import {
 } from "../fly-machines.js";
 import type { SessionMachineInput } from "../fly-machines.js";
 import { encodeRunConfig, decodeRunConfig, type RunConfigV1 } from "../run-config.js";
+import { fakeFetch, type ReplyInit, type Routes } from "./helpers/fake-fetch.js";
 
 const TOKEN = "fly-test-token";
 const APP = "ai-implement-sessions-test";
+
+// Route keys match the path alone; the Machines API (api.machines.dev) and the GraphQL API
+// (api.fly.io) are told apart by each test's url.href assertion.
+const MACHINES = `/v1/apps/${APP}/machines`;
+const MACHINE = `${MACHINES}/machine-123`;
+const MACHINES_URL = `https://api.machines.dev${MACHINES}`;
+const MACHINE_URL = `https://api.machines.dev${MACHINE}`;
+
+/** Installs a fake for the global fetch the Fly client calls, until the test finishes. */
+function flyApi(routes: Routes) {
+  const fake = fakeFetch(routes);
+  fake.install();
+  return fake;
+}
 
 const mockMachine = {
   id: "machine-123",
@@ -45,48 +60,31 @@ const mockMachine = {
 };
 
 describe("createMachine", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("sends POST with correct URL and body", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => mockMachine,
-    } as Response);
+    const fly = flyApi({ [`POST ${MACHINES}`]: { json: mockMachine } });
 
     const opts = { name: "test-machine", region: "iad", config: mockMachine.config };
     const result = await createMachine(TOKEN, APP, opts);
 
     expect(result.id).toBe("machine-123");
+    expect(fly.calls[0].url.href).toBe(MACHINES_URL);
 
-    const [url, reqOpts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines`);
-    expect((reqOpts as RequestInit).method).toBe("POST");
-
-    const body = JSON.parse((reqOpts as RequestInit).body as string);
+    const body = JSON.parse(fly.calls[0].body);
     expect(body.name).toBe("test-machine");
     expect(body.region).toBe("iad");
     expect(body.config.image).toBe("ghcr.io/builddownai/ai-implement-runner:latest");
   });
 
   it("sends correct auth header", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => mockMachine,
-    } as Response);
+    const fly = flyApi({ [`POST ${MACHINES}`]: { json: mockMachine } });
 
     await createMachine(TOKEN, APP, { config: mockMachine.config });
 
-    const opts = vi.mocked(fetch).mock.calls[0][1] as RequestInit;
-    expect((opts.headers as Record<string, string>)["Authorization"]).toBe("Bearer fly-test-token");
+    expect(fly.calls[0].headers.get("Authorization")).toBe("Bearer fly-test-token");
   });
 
   it("throws on error response", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 422,
-      text: async () => "invalid config",
-    } as Response);
+    flyApi({ [`POST ${MACHINES}`]: { status: 422, text: "invalid config" } });
 
     await expect(createMachine(TOKEN, APP, { config: mockMachine.config }))
       .rejects.toThrow("Failed to create machine in ai-implement-sessions-test (422): invalid config");
@@ -94,29 +92,17 @@ describe("createMachine", () => {
 });
 
 describe("getMachine", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("fetches machine by ID", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => mockMachine,
-    } as Response);
+    const fly = flyApi({ [`GET ${MACHINE}`]: { json: mockMachine } });
 
     const result = await getMachine(TOKEN, APP, "machine-123");
     expect(result.id).toBe("machine-123");
     expect(result.state).toBe("started");
-
-    const [url] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123`);
+    expect(fly.calls[0].url.href).toBe(MACHINE_URL);
   });
 
   it("throws on 404", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 404,
-      text: async () => "not found",
-    } as Response);
+    flyApi({ [`GET ${MACHINES}/nonexistent`]: { status: 404, text: "not found" } });
 
     await expect(getMachine(TOKEN, APP, "nonexistent"))
       .rejects.toThrow("Failed to get machine nonexistent (404)");
@@ -124,28 +110,17 @@ describe("getMachine", () => {
 });
 
 describe("listMachines", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("returns array of machines", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => [mockMachine],
-    } as Response);
+    const fly = flyApi({ [`GET ${MACHINES}`]: { json: [mockMachine] } });
 
     const result = await listMachines(TOKEN, APP);
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("machine-123");
-
-    const [url] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines`);
+    expect(fly.calls[0].url.href).toBe(MACHINES_URL);
   });
 
   it("returns empty array when no machines", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => [],
-    } as Response);
+    flyApi({ [`GET ${MACHINES}`]: { json: [] } });
 
     const result = await listMachines(TOKEN, APP);
     expect(result).toHaveLength(0);
@@ -153,25 +128,16 @@ describe("listMachines", () => {
 });
 
 describe("stopMachine", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("sends POST to stop endpoint", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true } as Response);
+    const fly = flyApi({ [`POST ${MACHINE}/stop`]: {} });
 
     await stopMachine(TOKEN, APP, "machine-123");
 
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123/stop`);
-    expect((opts as RequestInit).method).toBe("POST");
+    expect(fly.calls[0].url.href).toBe(`${MACHINE_URL}/stop`);
   });
 
   it("throws on error", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 409,
-      text: async () => "machine not running",
-    } as Response);
+    flyApi({ [`POST ${MACHINE}/stop`]: { status: 409, text: "machine not running" } });
 
     await expect(stopMachine(TOKEN, APP, "machine-123"))
       .rejects.toThrow("Failed to stop machine machine-123 (409)");
@@ -179,34 +145,24 @@ describe("stopMachine", () => {
 });
 
 describe("destroyMachine", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("sends DELETE with force=true by default", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true } as Response);
+    const fly = flyApi({ [`DELETE ${MACHINE}`]: {} });
 
     await destroyMachine(TOKEN, APP, "machine-123");
 
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123?force=true`);
-    expect((opts as RequestInit).method).toBe("DELETE");
+    expect(fly.calls[0].url.href).toBe(`${MACHINE_URL}?force=true`);
   });
 
   it("sends DELETE with force=false when specified", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true } as Response);
+    const fly = flyApi({ [`DELETE ${MACHINE}`]: {} });
 
     await destroyMachine(TOKEN, APP, "machine-123", false);
 
-    const [url] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123?force=false`);
+    expect(fly.calls[0].url.href).toBe(`${MACHINE_URL}?force=false`);
   });
 
   it("throws on error", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 404,
-      text: async () => "not found",
-    } as Response);
+    flyApi({ [`DELETE ${MACHINE}`]: { status: 404, text: "not found" } });
 
     await expect(destroyMachine(TOKEN, APP, "machine-123"))
       .rejects.toThrow("Failed to destroy machine machine-123 (404)");
@@ -214,33 +170,24 @@ describe("destroyMachine", () => {
 });
 
 describe("waitForMachine", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("sends GET with state and timeout params", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true } as Response);
+    const fly = flyApi({ [`GET ${MACHINE}/wait`]: {} });
 
     await waitForMachine(TOKEN, APP, "machine-123", "started", 30);
 
-    const [url] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123/wait?state=started&timeout=30`);
+    expect(fly.calls[0].url.href).toBe(`${MACHINE_URL}/wait?state=started&timeout=30`);
   });
 
   it("uses default 60s timeout", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true } as Response);
+    const fly = flyApi({ [`GET ${MACHINE}/wait`]: {} });
 
     await waitForMachine(TOKEN, APP, "machine-123", "stopped");
 
-    const [url] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toContain("timeout=60");
+    expect(fly.calls[0].url.search).toContain("timeout=60");
   });
 
   it("throws on timeout", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 408,
-      text: async () => "timeout",
-    } as Response);
+    flyApi({ [`GET ${MACHINE}/wait`]: { status: 408, text: "timeout" } });
 
     await expect(waitForMachine(TOKEN, APP, "machine-123", "started"))
       .rejects.toThrow('Timeout waiting for machine machine-123 to reach state "started"');
@@ -276,57 +223,39 @@ describe("generateMachineNonce", () => {
 });
 
 describe("listAppSecrets", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("returns array of secrets with name/digest/created_at via GraphQL", async () => {
     const secrets = [
       { name: "ENG_DATABASE_URL", digest: "abc123", createdAt: "2026-01-01T00:00:00Z" },
       { name: "ENG_STRIPE_KEY", digest: "def456", createdAt: "2026-01-02T00:00:00Z" },
     ];
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ data: { app: { secrets } } }),
-    } as Response);
+    const fly = flyApi({ "POST /graphql": { json: { data: { app: { secrets } } } } });
 
     const result = await listAppSecrets(TOKEN, APP);
     expect(result).toHaveLength(2);
     expect(result[0].name).toBe("ENG_DATABASE_URL");
     expect(result[0].created_at).toBe("2026-01-01T00:00:00Z");
 
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe("https://api.fly.io/graphql");
-    expect((opts as RequestInit).method).toBe("POST");
-    const body = JSON.parse((opts as RequestInit).body as string);
+    expect(fly.calls[0].url.href).toBe("https://api.fly.io/graphql");
+    const body = JSON.parse(fly.calls[0].body);
     expect(body.variables.appName).toBe(APP);
   });
 
   it("returns empty array when app has no secrets", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ data: { app: { secrets: [] } } }),
-    } as Response);
+    flyApi({ "POST /graphql": { json: { data: { app: { secrets: [] } } } } });
 
     const result = await listAppSecrets(TOKEN, APP);
     expect(result).toEqual([]);
   });
 
   it("returns empty array when app is null", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ data: { app: null } }),
-    } as Response);
+    flyApi({ "POST /graphql": { json: { data: { app: null } } } });
 
     const result = await listAppSecrets(TOKEN, APP);
     expect(result).toEqual([]);
   });
 
   it("throws on HTTP error response", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 403,
-      text: async () => "forbidden",
-    } as Response);
+    flyApi({ "POST /graphql": { status: 403, text: "forbidden" } });
 
     await expect(listAppSecrets(TOKEN, APP))
       .rejects.toThrow("Fly API request failed (403): forbidden");
@@ -334,34 +263,22 @@ describe("listAppSecrets", () => {
 });
 
 describe("setAppSecrets", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("sends GraphQL mutation with secrets and returns null version", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ data: { setSecrets: { release: { version: 42 } } } }),
-    } as Response);
+    const fly = flyApi({ "POST /graphql": { json: { data: { setSecrets: { release: { version: 42 } } } } } });
 
     const version = await setAppSecrets(TOKEN, APP, { ENG_DATABASE_URL: "postgres://localhost/db" });
 
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe("https://api.fly.io/graphql");
-    expect((opts as RequestInit).method).toBe("POST");
+    expect(fly.calls[0].url.href).toBe("https://api.fly.io/graphql");
     expect(version).toBeNull();
 
-    const body = JSON.parse((opts as RequestInit).body as string);
+    const body = JSON.parse(fly.calls[0].body);
     expect(body.variables.input.appId).toBe(APP);
     expect(body.variables.input.secrets[0].key).toBe("ENG_DATABASE_URL");
     expect(body.variables.input.secrets[0].value).toBe("postgres://localhost/db");
   });
 
   it("throws on HTTP error response", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 422,
-      text: async () => "invalid secret name",
-    } as Response);
+    flyApi({ "POST /graphql": { status: 422, text: "invalid secret name" } });
 
     await expect(setAppSecrets(TOKEN, APP, { BAD: "val" }))
       .rejects.toThrow("Fly API request failed (422): invalid secret name");
@@ -369,53 +286,35 @@ describe("setAppSecrets", () => {
 });
 
 describe("unsetAppSecret", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("sends GraphQL mutation to unset secret and returns null version", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ data: { unsetSecrets: { release: { version: 43 } } } }),
-    } as Response);
+    const fly = flyApi({ "POST /graphql": { json: { data: { unsetSecrets: { release: { version: 43 } } } } } });
 
     const version = await unsetAppSecret(TOKEN, APP, "ENG_DATABASE_URL");
 
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe("https://api.fly.io/graphql");
-    expect((opts as RequestInit).method).toBe("POST");
+    expect(fly.calls[0].url.href).toBe("https://api.fly.io/graphql");
     expect(version).toBeNull();
 
-    const body = JSON.parse((opts as RequestInit).body as string);
+    const body = JSON.parse(fly.calls[0].body);
     expect(body.variables.input.appId).toBe(APP);
     expect(body.variables.input.keys[0]).toBe("ENG_DATABASE_URL");
   });
 
   it("throws on HTTP error response", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 500,
-      text: async () => "internal server error",
-    } as Response);
+    flyApi({ "POST /graphql": { status: 500, text: "internal server error" } });
 
     await expect(unsetAppSecret(TOKEN, APP, "MISSING_SECRET"))
       .rejects.toThrow("Fly API request failed (500): internal server error");
   });
 
   it("throws when GraphQL reports the secret was not found", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ errors: [{ message: "Could not find secret MISSING_SECRET" }] }),
-    } as Response);
+    flyApi({ "POST /graphql": { json: { errors: [{ message: "Could not find secret MISSING_SECRET" }] } } });
 
     await expect(unsetAppSecret(TOKEN, APP, "MISSING_SECRET"))
       .rejects.toThrow("Could not find secret MISSING_SECRET");
   });
 
   it("throws on any GraphQL error", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ errors: [{ message: "Unauthorized" }] }),
-    } as Response);
+    flyApi({ "POST /graphql": { json: { errors: [{ message: "Unauthorized" }] } } });
 
     await expect(unsetAppSecret(TOKEN, APP, "ENG_DATABASE_URL"))
       .rejects.toThrow("Unauthorized");
@@ -939,35 +838,26 @@ describe("buildSessionMachineConfig", () => {
 });
 
 describe("updateMachineMetadata", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("sends POST to the metadata key endpoint with JSON value body", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true } as Response);
+    const fly = flyApi({ [`POST ${MACHINE}/metadata/pr_number`]: {} });
 
     await updateMachineMetadata(TOKEN, APP, "machine-123", "pr_number", "42");
 
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123/metadata/pr_number`);
-    expect((opts as RequestInit).method).toBe("POST");
-    expect((opts as RequestInit).body).toBe(JSON.stringify({ value: "42" }));
-    expect(((opts as RequestInit).headers as Record<string, string>)["Content-Type"]).toBe("application/json");
-    expect(((opts as RequestInit).headers as Record<string, string>)["Authorization"]).toBe(`Bearer ${TOKEN}`);
+    expect(fly.calls[0].url.href).toBe(`${MACHINE_URL}/metadata/pr_number`);
+    expect(fly.calls[0].body).toBe(JSON.stringify({ value: "42" }));
+    expect(fly.calls[0].headers.get("Content-Type")).toBe("application/json");
+    expect(fly.calls[0].headers.get("Authorization")).toBe(`Bearer ${TOKEN}`);
   });
 
   it("throws on error response", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 404,
-      text: async () => "machine not found",
-    } as Response);
+    flyApi({ [`POST ${MACHINES}/machine-xyz/metadata/pr_number`]: { status: 404, text: "machine not found" } });
 
     await expect(updateMachineMetadata(TOKEN, APP, "machine-xyz", "pr_number", "7"))
       .rejects.toThrow("updateMachineMetadata failed (404)");
   });
 
   it("stamps pr_number extracted from a GitHub PR URL", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true } as Response);
+    const fly = flyApi({ [`POST ${MACHINE}/metadata/pr_number`]: {} });
 
     const prUrl = "https://github.com/org/repo/pull/99";
     const prNumberMatch = prUrl.match(/\/pull\/(\d+)$/);
@@ -975,88 +865,59 @@ describe("updateMachineMetadata", () => {
 
     await updateMachineMetadata(TOKEN, APP, "machine-123", "pr_number", prNumberMatch![1]);
 
-    const [, opts] = vi.mocked(fetch).mock.calls[0];
-    expect((opts as RequestInit).body).toBe(JSON.stringify({ value: "99" }));
+    expect(fly.calls[0].body).toBe(JSON.stringify({ value: "99" }));
   });
 });
 
 describe("fetchMachineLogs", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
+  const LOGS = `GET ${MACHINE}/logs` as const;
 
   it("appends ?lines=N to the URL to prevent streaming hang", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      text: async () => '{"message":"hello"}\n{"message":"world"}\n',
-    } as Response);
+    const fly = flyApi({ [LOGS]: { text: '{"message":"hello"}\n{"message":"world"}\n' } });
 
     await fetchMachineLogs(TOKEN, APP, "machine-123");
 
-    const [url] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(
-      `https://api.machines.dev/v1/apps/${APP}/machines/machine-123/logs?lines=100`,
-    );
+    expect(fly.calls[0].url.href).toBe(`${MACHINE_URL}/logs?lines=100`);
   });
 
   it("uses custom lastN when provided", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      text: async () => '{"message":"line"}\n',
-    } as Response);
+    const fly = flyApi({ [LOGS]: { text: '{"message":"line"}\n' } });
 
     await fetchMachineLogs(TOKEN, APP, "machine-123", 50);
 
-    const [url] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toContain("?lines=50");
+    expect(fly.calls[0].url.search).toBe("?lines=50");
   });
 
   it("parses NDJSON and extracts message fields", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      text: async () =>
-        '{"message":"starting server"}\n{"message":"listening on :3000"}\n',
-    } as Response);
+    flyApi({ [LOGS]: { text: '{"message":"starting server"}\n{"message":"listening on :3000"}\n' } });
 
     const result = await fetchMachineLogs(TOKEN, APP, "machine-123");
     expect(result).toBe("starting server\nlistening on :3000");
   });
 
   it("falls back to raw line when JSON parse fails", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      text: async () => "not-json-at-all\n",
-    } as Response);
+    flyApi({ [LOGS]: { text: "not-json-at-all\n" } });
 
     const result = await fetchMachineLogs(TOKEN, APP, "machine-123");
     expect(result).toBe("not-json-at-all");
   });
 
   it("falls back to raw line when parsed JSON has no message field", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      text: async () => '{"level":"info","ts":1234}\n',
-    } as Response);
+    flyApi({ [LOGS]: { text: '{"level":"info","ts":1234}\n' } });
 
     const result = await fetchMachineLogs(TOKEN, APP, "machine-123");
     expect(result).toBe('{"level":"info","ts":1234}');
   });
 
   it("returns empty string for blank body", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      text: async () => "   \n  ",
-    } as Response);
+    flyApi({ [LOGS]: { text: "   \n  " } });
 
     const result = await fetchMachineLogs(TOKEN, APP, "machine-123");
     expect(result).toBe("");
   });
 
   it("throws on error response", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 404,
-      text: async () => "not found",
-    } as Response);
+    flyApi({ [LOGS]: { status: 404, text: "not found" } });
 
     await expect(fetchMachineLogs(TOKEN, APP, "machine-123"))
       .rejects.toThrow("Failed to fetch logs for machine machine-123 (404)");
@@ -1089,67 +950,57 @@ describe("readMachineExit", () => {
 });
 
 describe("startMachine / updateMachine (AII-1123)", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("startMachine posts to /start with no body", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true } as Response);
+    const fly = flyApi({ [`POST ${MACHINE}/start`]: {} });
     await startMachine(TOKEN, APP, "machine-123");
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123/start`);
-    expect((opts as RequestInit).method).toBe("POST");
-    expect((opts as RequestInit).body).toBeUndefined();
+    expect(fly.calls[0].url.href).toBe(`${MACHINE_URL}/start`);
+    expect(fly.calls[0].body).toBe("");
   });
 
   it("startMachine throws with status and body", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 412, text: async () => "bad state" } as Response);
+    flyApi({ [`POST ${MACHINE}/start`]: { status: 412, text: "bad state" } });
     await expect(startMachine(TOKEN, APP, "machine-123")).rejects.toThrow("Failed to start machine machine-123 (412): bad state");
   });
 
   it("updateMachine posts { config } and returns the machine", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, json: async () => mockMachine } as Response);
+    const fly = flyApi({ [`POST ${MACHINE}`]: { json: mockMachine } });
     const result = await updateMachine(TOKEN, APP, "machine-123", mockMachine.config as never);
     expect(result.id).toBe("machine-123");
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123`);
-    expect((opts as RequestInit).method).toBe("POST");
-    expect(JSON.parse((opts as RequestInit).body as string)).toEqual({ config: mockMachine.config });
+    expect(fly.calls[0].url.href).toBe(MACHINE_URL);
+    expect(JSON.parse(fly.calls[0].body)).toEqual({ config: mockMachine.config });
   });
 
   it("updateMachine throws with status and body", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 422, text: async () => "invalid config" } as Response);
+    flyApi({ [`POST ${MACHINE}`]: { status: 422, text: "invalid config" } });
     await expect(updateMachine(TOKEN, APP, "machine-123", mockMachine.config as never))
       .rejects.toThrow("Failed to update machine machine-123 (422): invalid config");
   });
 });
 
+// clearMachineEnv reads the machine (GET), updates it (POST) and reads it back (GET), all on the machine's path,
+// so each test lists the GET replies in read order and the POST replies in update order.
 describe("clearMachineEnv", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
 
-  const url = `https://api.machines.dev/v1/apps/${APP}/machines/machine-123`;
-  const ok = (body: unknown) => ({ ok: true, status: 200, json: async () => body }) as Response;
-  const fail = (status: number, text: string, headers: Record<string, string> = {}) =>
-    ({ ok: false, status, text: async () => text, headers: new Headers(headers) }) as Response;
-  const posts = () => vi.mocked(fetch).mock.calls.filter(([, o]) => (o as RequestInit | undefined)?.method === "POST");
+  const READ = `GET ${MACHINE}` as const;
+  const UPDATE = `POST ${MACHINE}` as const;
+  const ok = (body: unknown): ReplyInit => ({ json: body });
+  const fail = (status: number, text: string, headers: Record<string, string> = {}): ReplyInit => ({ status, text, headers });
   const fast = { intervalMs: 1, timeoutMs: 1000 };
 
   it("settles, posts the same config with env: {}, reads back; never starts it", async () => {
     const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { GITHUB_TOKEN: "x" } } };
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok(withEnv))
-      .mockResolvedValueOnce(ok(mockMachine))
-      .mockResolvedValueOnce(ok({ ...mockMachine, config: { ...mockMachine.config, env: {} } }));
+    const fly = flyApi({
+      [READ]: [ok(withEnv), ok({ ...mockMachine, config: { ...mockMachine.config, env: {} } })],
+      [UPDATE]: [ok(mockMachine)],
+    });
 
     await clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast);
 
-    const calls = vi.mocked(fetch).mock.calls;
-    expect(calls).toHaveLength(3);
-    expect(calls[0][0]).toBe(url);
-    expect((calls[0][1] as RequestInit | undefined)?.method).toBeUndefined();
-    expect(posts()).toHaveLength(1);
-    expect(JSON.parse((posts()[0][1] as RequestInit).body as string)).toEqual({ config: { ...withEnv.config, env: {} } });
-    expect(calls.some(([u]) => String(u).endsWith("/start"))).toBe(false);
+    // The strict routes also prove nothing called /start.
+    expect(fly.calls.map((c) => c.method)).toEqual(["GET", "POST", "GET"]);
+    expect(fly.calls[0].url.href).toBe(MACHINE_URL);
+    expect(JSON.parse(fly.calls[1].body)).toEqual({ config: { ...withEnv.config, env: {} } });
   });
 
   it("waits out `replacing` reads, then makes exactly one update", async () => {
@@ -1157,28 +1008,23 @@ describe("clearMachineEnv", () => {
     const replacing = { ...withEnv, state: "replacing" };
     const stopped = { ...withEnv, state: "stopped" };
     const cleared = { ...mockMachine, state: "stopped", config: { ...mockMachine.config, env: {} } };
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok(replacing))
-      .mockResolvedValueOnce(ok(replacing))
-      .mockResolvedValueOnce(ok(stopped))
-      .mockResolvedValueOnce(ok(cleared))
-      .mockResolvedValueOnce(ok(cleared));
+    const fly = flyApi({
+      [READ]: [ok(replacing), ok(replacing), ok(stopped), ok(cleared)],
+      [UPDATE]: [ok(cleared)],
+    });
     await clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast);
-    expect(posts()).toHaveLength(1);
+    expect(fly.calls.map((c) => c.method)).toEqual(["GET", "GET", "GET", "POST", "GET"]);
   });
 
   it("merges metadata into the one update, never calls the metadata endpoint, and verifies it", async () => {
     const m = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" }, metadata: { purpose: "durable-runner", durable_until: "1" } } };
     const done = { ...m, config: { ...m.config, env: {}, metadata: { purpose: "durable-runner", durable_until: "123" } } };
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok(m))
-      .mockResolvedValueOnce(ok(m))
-      .mockResolvedValueOnce(ok(done));
+    const fly = flyApi({ [READ]: [ok(m), ok(done)], [UPDATE]: [ok(m)] });
 
     await clearMachineEnv(TOKEN, APP, "machine-123", { durable_until: "123" }, fast);
 
-    expect(vi.mocked(fetch).mock.calls.some(([u]) => String(u).includes("/metadata"))).toBe(false);
-    expect(JSON.parse((posts()[0][1] as RequestInit).body as string)).toEqual({
+    // No /metadata route exists, so a call to it would fail the test.
+    expect(JSON.parse(fly.calls[1].body)).toEqual({
       config: { ...m.config, env: {}, metadata: { purpose: "durable-runner", durable_until: "123" } },
     });
   });
@@ -1186,34 +1032,34 @@ describe("clearMachineEnv", () => {
   it("adds metadata when the machine has none", async () => {
     const m = { ...mockMachine, config: { ...mockMachine.config, metadata: undefined } };
     const done = { ...m, config: { ...m.config, env: {}, metadata: { durable_until: "5" } } };
-    vi.mocked(fetch).mockResolvedValueOnce(ok(m)).mockResolvedValueOnce(ok(m)).mockResolvedValueOnce(ok(done));
+    const fly = flyApi({ [`GET ${MACHINES}/m`]: [ok(m), ok(done)], [`POST ${MACHINES}/m`]: [ok(m)] });
     await clearMachineEnv(TOKEN, APP, "m", { durable_until: "5" }, fast);
-    const body = JSON.parse((posts()[0][1] as RequestInit).body as string);
+    const body = JSON.parse(fly.calls[1].body);
     expect(body.config.metadata).toEqual({ durable_until: "5" });
   });
 
   it("treats a 409 concurrent update as a wait and succeeds once the env is clear", async () => {
     const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
     const cleared = { ...mockMachine, config: { ...mockMachine.config, env: {} } };
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok(withEnv))
-      .mockResolvedValueOnce(fail(409, '{"error":"aborted: machine is replacing: concurrent update in progress"}'))
-      .mockResolvedValueOnce(ok(cleared));
+    const fly = flyApi({
+      [READ]: [ok(withEnv), ok(cleared)],
+      [UPDATE]: [fail(409, '{"error":"aborted: machine is replacing: concurrent update in progress"}')],
+    });
     await expect(clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast)).resolves.toBeUndefined();
-    expect(posts()).toHaveLength(1);
+    expect(fly.calls.filter((c) => c.method === "POST")).toHaveLength(1);
   });
 
   it("waits the retry-after interval on a 429, then re-reads", async () => {
     vi.useFakeTimers();
     const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
     const cleared = { ...mockMachine, config: { ...mockMachine.config, env: {} } };
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok(withEnv))
-      .mockResolvedValueOnce(fail(429, "resource_exhausted: rate limit exceeded", { "retry-after": "7" }))
-      .mockResolvedValueOnce(ok(cleared));
+    const fly = flyApi({
+      [READ]: [ok(withEnv), ok(cleared)],
+      [UPDATE]: [fail(429, "resource_exhausted: rate limit exceeded", { "retry-after": "7" })],
+    });
     const p = clearMachineEnv(TOKEN, APP, "machine-123");
     await vi.advanceTimersByTimeAsync(6_900);
-    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+    expect(fly.calls).toHaveLength(2);
     await vi.advanceTimersByTimeAsync(200);
     await expect(p).resolves.toBeUndefined();
   });
@@ -1222,13 +1068,13 @@ describe("clearMachineEnv", () => {
     vi.useFakeTimers();
     const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
     const cleared = { ...mockMachine, config: { ...mockMachine.config, env: {} } };
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok(withEnv))
-      .mockResolvedValueOnce(fail(429, "rate limit", { "retry-after": "3600" }))
-      .mockResolvedValueOnce(ok(cleared));
+    const fly = flyApi({
+      [READ]: [ok(withEnv), ok(cleared)],
+      [UPDATE]: [fail(429, "rate limit", { "retry-after": "3600" })],
+    });
     const p = clearMachineEnv(TOKEN, APP, "machine-123");
     await vi.advanceTimersByTimeAsync(MAX_RATE_LIMIT_WAIT_MS - 100);
-    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+    expect(fly.calls).toHaveLength(2);
     await vi.advanceTimersByTimeAsync(200);
     await expect(p).resolves.toBeUndefined();
   });
@@ -1236,18 +1082,13 @@ describe("clearMachineEnv", () => {
   it("treats a 409 'machine is replacing' without the concurrent-update text as a wait", async () => {
     const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
     const cleared = { ...mockMachine, config: { ...mockMachine.config, env: {} } };
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok(withEnv))
-      .mockResolvedValueOnce(fail(409, '{"error":"machine is replacing"}'))
-      .mockResolvedValueOnce(ok(cleared));
+    flyApi({ [READ]: [ok(withEnv), ok(cleared)], [UPDATE]: [fail(409, '{"error":"machine is replacing"}')] });
     await expect(clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast)).resolves.toBeUndefined();
   });
 
   it("still throws on an unrelated 409", async () => {
     const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok(withEnv))
-      .mockResolvedValueOnce(fail(409, '{"error":"something else"}'));
+    flyApi({ [READ]: [ok(withEnv)], [UPDATE]: [fail(409, '{"error":"something else"}')] });
     await expect(clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast)).rejects.toThrow(/409/);
   });
 
@@ -1255,13 +1096,10 @@ describe("clearMachineEnv", () => {
     vi.useFakeTimers();
     const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
     const cleared = { ...mockMachine, config: { ...mockMachine.config, env: {} } };
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok(withEnv))
-      .mockResolvedValueOnce(fail(429, "rate limit"))
-      .mockResolvedValueOnce(ok(cleared));
+    const fly = flyApi({ [READ]: [ok(withEnv), ok(cleared)], [UPDATE]: [fail(429, "rate limit")] });
     const p = clearMachineEnv(TOKEN, APP, "machine-123");
     await vi.advanceTimersByTimeAsync(1_900);
-    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+    expect(fly.calls).toHaveLength(2);
     await vi.advanceTimersByTimeAsync(200);
     await expect(p).resolves.toBeUndefined();
   });
@@ -1269,77 +1107,70 @@ describe("clearMachineEnv", () => {
   it("with until: stopped, sends the update only after the machine reads stopped", async () => {
     const started = { ...mockMachine, state: "started", config: { ...mockMachine.config, env: { A: "1" } } };
     const stopped = { ...started, state: "stopped" };
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok(started))
-      .mockResolvedValueOnce(ok(stopped))
-      .mockResolvedValueOnce(ok(stopped))
-      .mockResolvedValueOnce(ok({ ...stopped, config: { ...stopped.config, env: {} } }));
+    const fly = flyApi({
+      [READ]: [ok(started), ok(stopped), ok({ ...stopped, config: { ...stopped.config, env: {} } })],
+      [UPDATE]: [ok(stopped)],
+    });
 
     await clearMachineEnv(TOKEN, APP, "machine-123", undefined, { ...fast, until: ["stopped"] });
 
-    const calls = vi.mocked(fetch).mock.calls;
-    const updateIdx = calls.findIndex(([, o]) => (o as RequestInit | undefined)?.method === "POST");
-    expect(updateIdx).toBe(2);
-    expect(calls).toHaveLength(4);
+    expect(fly.calls.map((c) => c.method)).toEqual(["GET", "GET", "POST", "GET"]);
   });
 
   it("with until: stopped, a machine that stays started times out with no update sent", async () => {
     const started = { ...mockMachine, state: "started", config: { ...mockMachine.config, env: { A: "1" } } };
-    vi.mocked(fetch).mockResolvedValue(ok(started));
+    // No update route: an update would fail the test.
+    const fly = flyApi({ [READ]: ok(started) });
     await expect(
       clearMachineEnv(TOKEN, APP, "machine-123", undefined, { intervalMs: 1, timeoutMs: 20, until: ["stopped"] }),
     ).rejects.toThrow(/machine-123.*state=started/);
-    expect(posts()).toHaveLength(0);
+    expect(fly.calls.every((c) => c.method === "GET")).toBe(true);
   });
 
   it("throws naming the machine and state when the env never clears", async () => {
     const withEnv = { ...mockMachine, state: "stopped", config: { ...mockMachine.config, env: { A: "1" } } };
-    vi.mocked(fetch).mockResolvedValue(ok(withEnv));
+    flyApi({ [READ]: ok(withEnv), [UPDATE]: ok(withEnv) });
     await expect(clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast)).rejects.toThrow(/machine-123.*state=stopped/);
   });
 
   it("skips the update when the env is already clear and the metadata present", async () => {
     const clean = { ...mockMachine, config: { ...mockMachine.config, env: {}, metadata: { durable_until: "5" } } };
-    vi.mocked(fetch).mockResolvedValueOnce(ok(clean));
+    const fly = flyApi({ [READ]: [ok(clean)] });
     await clearMachineEnv(TOKEN, APP, "machine-123", { durable_until: "5" }, fast);
-    expect(posts()).toHaveLength(0);
-    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fly.calls).toHaveLength(1);
   });
 
   it("throws when the read fails, without posting", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(fail(404, "gone"));
+    const fly = flyApi({ [`GET ${MACHINES}/m`]: [fail(404, "gone")] });
     await expect(clearMachineEnv(TOKEN, APP, "m", undefined, fast)).rejects.toThrow("(404)");
-    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fly.calls).toHaveLength(1);
   });
 
   it("ends at once, without polling, on a machine Fly reports as destroyed", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(ok({ ...mockMachine, state: "destroyed" }));
+    const fly = flyApi({ [`GET ${MACHINES}/m`]: [ok({ ...mockMachine, state: "destroyed" })] });
     await expect(
       clearMachineEnv(TOKEN, APP, "m", undefined, { ...fast, until: ["stopped", "destroyed"] }),
     ).rejects.toThrow(/gone before the scrub/);
-    expect(fetch).toHaveBeenCalledTimes(1);
-    expect(posts()).toHaveLength(0);
+    expect(fly.calls).toHaveLength(1);
   });
 
   it("throws when the update fails with a non-wait status", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok({ ...mockMachine, config: { ...mockMachine.config, env: { A: "b" } } }))
-      .mockResolvedValueOnce(fail(500, "boom"));
+    flyApi({
+      [`GET ${MACHINES}/m`]: [ok({ ...mockMachine, config: { ...mockMachine.config, env: { A: "b" } } })],
+      [`POST ${MACHINES}/m`]: [fail(500, "boom")],
+    });
     await expect(clearMachineEnv(TOKEN, APP, "m", undefined, fast)).rejects.toThrow("(500)");
   });
 });
 
 describe("waitForMachineSettled", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("returns null when the machine is gone", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 404, text: async () => "nope", headers: new Headers() } as Response);
+    flyApi({ [`GET ${MACHINES}/m`]: { status: 404, text: "nope" } });
     expect(await waitForMachineSettled(TOKEN, APP, "m", { intervalMs: 1 })).toBeNull();
   });
 
   it("throws on timeout naming the machine and the state", async () => {
-    vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200, json: async () => ({ ...mockMachine, state: "replacing" }) } as Response);
+    flyApi({ [`GET ${MACHINE}`]: { json: { ...mockMachine, state: "replacing" } } });
     await expect(waitForMachineSettled(TOKEN, APP, "machine-123", { intervalMs: 5, timeoutMs: 20 })).rejects.toThrow(/machine-123.*replacing/);
   });
 });
