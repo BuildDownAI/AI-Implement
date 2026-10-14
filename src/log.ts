@@ -95,7 +95,7 @@ export function initLogTable(): void {
       last_attempt_at INTEGER
     )
   `);
-  // AII-1307: a succeeded review-fix attempt's LateExternalReview submit, held until the poll sweep sees it accepted.
+  // Kept so an older image still starts; rows it writes during a rollback move to late_review_pending at the next boot.
   db.exec(`
     CREATE TABLE IF NOT EXISTS attempt_review_pending (
       attempt_id TEXT PRIMARY KEY,
@@ -104,6 +104,25 @@ export function initLogTable(): void {
       created_at INTEGER NOT NULL
     )
   `);
+  // AII-1362: one outbox for every LateExternalReview submit whose state is not in dispatch_log.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS late_review_pending (
+      workflow_key TEXT PRIMARY KEY,
+      dispatch_id TEXT NOT NULL,
+      pr_url TEXT NOT NULL,
+      head_sha TEXT,
+      attempt_id TEXT,
+      created_at INTEGER NOT NULL
+    )
+  `);
+  // Every boot: move attempt_review_pending rows (the key matches lateExternalReviewWorkflowKey).
+  db.transaction(() => {
+    db.exec(`
+      INSERT OR IGNORE INTO late_review_pending (workflow_key, dispatch_id, pr_url, head_sha, attempt_id, created_at)
+      SELECT dispatch_id || '-' || attempt_id, dispatch_id, pr_url, NULL, attempt_id, created_at FROM attempt_review_pending
+    `);
+    db.exec("DELETE FROM attempt_review_pending");
+  })();
   ensureLogColumns();
 }
 
@@ -604,28 +623,42 @@ export function getGapFillRowsAwaitingLateReview(sinceMs: number): Job[] {
   );
 }
 
-export interface PendingAttemptReview { attemptId: string; dispatchId: string; prUrl: string }
+export interface PendingLateReview {
+  workflowKey: string;
+  dispatchId: string;
+  prUrl: string;
+  headSha: string | null;
+  attemptId: string | null;
+}
 
-/** Records that a review-fix attempt's late review still needs submitting (AII-1307). Idempotent per attempt. */
-export function recordPendingAttemptReview(attemptId: string, dispatchId: string, prUrl: string, now = Date.now()): void {
+/**
+ * Records a LateExternalReview submit that still needs to settle (AII-1362). Idempotent per workflow key.
+ * The caller computes `workflowKey` with `lateExternalReviewWorkflowKey` (importing it here would be circular).
+ */
+export function recordPendingLateReview(
+  input: { workflowKey: string; dispatchId: string; prUrl: string; headSha?: string; attemptId?: string },
+  now = Date.now(),
+): void {
   getDb()
-    .prepare("INSERT OR IGNORE INTO attempt_review_pending (attempt_id, dispatch_id, pr_url, created_at) VALUES (?, ?, ?, ?)")
-    .run(attemptId, dispatchId, prUrl, now);
+    .prepare(
+      "INSERT OR IGNORE INTO late_review_pending (workflow_key, dispatch_id, pr_url, head_sha, attempt_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .run(input.workflowKey, input.dispatchId, input.prUrl, input.headSha ?? null, input.attemptId ?? null, now);
 }
 
-/** Pending attempt reviews recorded at or after `sinceMs`, oldest first. */
-export function getPendingAttemptReviews(sinceMs: number): PendingAttemptReview[] {
+/** Pending late reviews recorded at or after `sinceMs`, oldest first. */
+export function getPendingLateReviews(sinceMs: number): PendingLateReview[] {
   // A record older than the window is never retried again; drop it rather than keep dead data.
-  const expired = getDb().prepare("DELETE FROM attempt_review_pending WHERE created_at < ?").run(sinceMs).changes;
-  if (expired > 0) console.log(`[review-fix] Dropped ${expired} expired pending attempt review(s)`);
+  const expired = getDb().prepare("DELETE FROM late_review_pending WHERE created_at < ?").run(sinceMs).changes;
+  if (expired > 0) console.log(`[late-review] Dropped ${expired} expired pending late review(s)`);
   const rows = getDb()
-    .prepare("SELECT attempt_id, dispatch_id, pr_url FROM attempt_review_pending WHERE created_at >= ? ORDER BY created_at ASC")
-    .all(sinceMs) as Array<{ attempt_id: string; dispatch_id: string; pr_url: string }>;
-  return rows.map((r) => ({ attemptId: r.attempt_id, dispatchId: r.dispatch_id, prUrl: r.pr_url }));
+    .prepare("SELECT workflow_key, dispatch_id, pr_url, head_sha, attempt_id FROM late_review_pending WHERE created_at >= ? ORDER BY created_at ASC")
+    .all(sinceMs) as Array<{ workflow_key: string; dispatch_id: string; pr_url: string; head_sha: string | null; attempt_id: string | null }>;
+  return rows.map((r) => ({ workflowKey: r.workflow_key, dispatchId: r.dispatch_id, prUrl: r.pr_url, headSha: r.head_sha, attemptId: r.attempt_id }));
 }
 
-export function clearPendingAttemptReview(attemptId: string): void {
-  getDb().prepare("DELETE FROM attempt_review_pending WHERE attempt_id = ?").run(attemptId);
+export function clearPendingLateReview(workflowKey: string): void {
+  getDb().prepare("DELETE FROM late_review_pending WHERE workflow_key = ?").run(workflowKey);
 }
 
 export function getInFlightIssueIds(): Set<string> {

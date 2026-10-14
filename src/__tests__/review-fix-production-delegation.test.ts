@@ -14,14 +14,14 @@ vi.mock("../runner-mode.js", () => ({
 }));
 const getLatestWorkRowForPr = vi.fn();
 const stampJobApproved = vi.fn();
-const recordPendingAttemptReview = vi.fn();
-const clearPendingAttemptReview = vi.fn();
+const recordPendingLateReview = vi.fn();
+const clearPendingLateReview = vi.fn();
 vi.mock("../log.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../log.js")>()),
   getLatestWorkRowForPr: (...args: unknown[]) => getLatestWorkRowForPr(...args),
   stampJobApproved: (...args: unknown[]) => stampJobApproved(...args),
-  recordPendingAttemptReview: (...args: unknown[]) => recordPendingAttemptReview(...args),
-  clearPendingAttemptReview: (...args: unknown[]) => clearPendingAttemptReview(...args),
+  recordPendingLateReview: (...args: unknown[]) => recordPendingLateReview(...args),
+  clearPendingLateReview: (...args: unknown[]) => clearPendingLateReview(...args),
 }));
 vi.mock("../review-fix-queue.js", () => ({
   acceptReviewFixWebhookEvent: vi.fn(),
@@ -72,16 +72,16 @@ describe("review-fix production delegation", () => {
       expect(submit).toHaveBeenCalledWith({ dispatchId: "d-9", owner: "acme", repo: "app", prNumber: 7,
         prUrl: "https://github.com/acme/app/pull/7", gapFill: true, attemptId: "att-1" });
       expect(stampJobApproved).not.toHaveBeenCalled();
-      expect(recordPendingAttemptReview).toHaveBeenCalledWith("att-1", "d-9", "https://github.com/acme/app/pull/7");
+      expect(recordPendingLateReview).toHaveBeenCalledWith({ workflowKey: "d-9-att-1", dispatchId: "d-9", prUrl: "https://github.com/acme/app/pull/7", attemptId: "att-1" });
     });
 
     it("clears the pending record only when the submit settled, and keeps it when the hook reports false", async () => {
       getLatestWorkRowForPr.mockReturnValue({ id: 9, dispatchId: "d-9" });
-      clearPendingAttemptReview.mockClear();
+      clearPendingLateReview.mockClear();
       await submitLateReviewForAttempt(repoScope, "att-1", vi.fn().mockResolvedValue(false));
-      expect(clearPendingAttemptReview).not.toHaveBeenCalled();
+      expect(clearPendingLateReview).not.toHaveBeenCalled();
       await submitLateReviewForAttempt(repoScope, "att-1", vi.fn().mockResolvedValue(true));
-      expect(clearPendingAttemptReview).toHaveBeenCalledWith("att-1");
+      expect(clearPendingLateReview).toHaveBeenCalledWith("d-9-att-1");
     });
 
     it("submits nothing when the latest run row is still in flight", async () => {
@@ -108,7 +108,7 @@ describe("review-fix production delegation", () => {
       const log = vi.spyOn(console, "log").mockImplementation(() => {});
       await expect(submitLateReviewForAttempt(repoScope, "att-1", vi.fn().mockRejectedValue(new Error("boom")))).resolves.toBeUndefined();
       // The pending marker is written first, so the poll sweep retries the submit.
-      expect(recordPendingAttemptReview).toHaveBeenCalledWith("att-1", "d-9", "https://github.com/acme/app/pull/7");
+      expect(recordPendingLateReview).toHaveBeenCalledWith({ workflowKey: "d-9-att-1", dispatchId: "d-9", prUrl: "https://github.com/acme/app/pull/7", attemptId: "att-1" });
       log.mockRestore();
     });
 
@@ -123,7 +123,7 @@ describe("review-fix production delegation", () => {
         } as never,
         github: { getPrHeadSha: async () => "abc", evaluateMergePolicy: async () => true } as never,
         baseFinalizer: { recordOutcome: vi.fn(), applyApproval: vi.fn().mockResolvedValue(applied) } as never,
-        submitLateExternalReview: submit,
+        submitLateExternalReview: submit as never,
       });
 
       it("submits once after an applied approval", async () => {

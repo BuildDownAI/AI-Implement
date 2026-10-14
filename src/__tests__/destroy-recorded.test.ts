@@ -25,7 +25,7 @@ const machine = (state: string, purpose?: string) => ({
   id: "m1",
   state,
   created_at: new Date().toISOString(),
-  config: { metadata: purpose ? { purpose } : {} },
+  config: { metadata: (purpose ? { purpose } : {}) as Record<string, string> },
 });
 
 describe("destroyMachineRecorded", () => {

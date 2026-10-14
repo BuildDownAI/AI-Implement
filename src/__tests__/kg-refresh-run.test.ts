@@ -42,7 +42,10 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     sensitiveAllowPatterns: null,
     autoMerge: false,
     dependencyTokenScope: null,
+    referenceRepos: null,
     memoryProviderId: null,
+    reviewFixLifecycle: null,
+    reviewers: null,
     ...overrides,
   };
 }
@@ -2690,7 +2693,7 @@ describe("kgIngestStep", () => {
 
   it("ingest failure tail does not contain venv-setup or pip-install output", async () => {
     let callCount = 0;
-    const spawnImpl = (cmd: string, args: string[]) => {
+    const spawnImpl = (_cmd: string, _args: string[]) => {
       callCount++;
       if (callCount <= 2) {
         // setup phases succeed but emit recognisable output
@@ -5625,7 +5628,6 @@ describe("runKgRefresh — dev-harness dep-token-override", () => {
         // NO dependencyAuth override — let the built-in makeDevHarnessDependencyAuthStep run
         kgTrackerData: capturingKgTrackerData,
         kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: makeStepModule({ snapshotPushed: false, commitSha: null }),
       },
       reporter: { report: async () => undefined },
@@ -5697,7 +5699,6 @@ describe("runKgRefresh — dev-harness dep-token-override", () => {
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
         kgTrackerData: makeStepModule({ fetched: false, issueCount: 0 }),
         kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: capturingKgSnapshotPush,
       },
       reporter: { report: async () => undefined },
@@ -5729,7 +5730,6 @@ describe("runKgRefresh — dev-harness dep-token-override", () => {
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
         kgTrackerData: makeStepModule({ fetched: false, issueCount: 0 }),
         kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: capturingKgSnapshotPush,
       },
       reporter: { report: async () => undefined },
@@ -5753,7 +5753,6 @@ describe("runKgRefresh — dev-harness dep-token-override", () => {
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
         kgTrackerData: makeStepModule({ fetched: false, issueCount: 0 }),
         kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: capturingKgSnapshotPush,
       },
       reporter: { report: async () => undefined },

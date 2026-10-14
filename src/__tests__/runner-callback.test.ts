@@ -1279,13 +1279,58 @@ describe("handleRunnerResult — implementation", () => {
       return { res, hook, dispatchId };
     }
 
-    it.each(["implementation", "gap-analysis"] as const)("submits once with the right input (%s)", async (phase) => {
+    it("submits once with the right input (implementation)", async () => {
+      const phase = "implementation";
       const { res, hook, dispatchId } = await run("i-late-" + phase, phase, { externalReviewPending: { headSha: SHA } });
       expect(res.status).toBe(200);
       expect(hook).toHaveBeenCalledTimes(1);
       expect(hook).toHaveBeenCalledWith({
         dispatchId, owner: "o", repo: "r", prNumber: 99, prUrl: "https://github.com/o/r/pull/99", headSha: SHA,
       });
+    });
+
+    function outbox() {
+      return (dedup.getDb().prepare("SELECT * FROM late_review_pending").all()) as Array<Record<string, unknown>>;
+    }
+
+    it("leaves one outbox row with the head sha when the hook reports false (AII-1362)", async () => {
+      const { dispatchId } = await run("i-late-false", "implementation", { externalReviewPending: { headSha: SHA } }, (async () => false) as never);
+      expect(outbox()).toEqual([expect.objectContaining({
+        workflow_key: dispatchId, dispatch_id: dispatchId, head_sha: SHA, attempt_id: null,
+        pr_url: "https://github.com/o/r/pull/99",
+      })]);
+    });
+
+    it("clears the outbox row at once when the first submit settled, and keeps it when the hook throws (AII-1362)", async () => {
+      await run("i-late-true", "implementation", { externalReviewPending: { headSha: SHA } }, (async () => true) as never);
+      await run("i-late-void", "implementation", { externalReviewPending: { headSha: SHA } });
+      expect(outbox()).toEqual([]);
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      await run("i-late-thr", "implementation", { externalReviewPending: { headSha: SHA } }, async () => { throw new Error("boom"); });
+      warn.mockRestore();
+      expect(outbox()).toHaveLength(1);
+    });
+
+    it("writes no outbox row and submits nothing for a gap-analysis result (AII-1362)", async () => {
+      const { hook } = await run("i-late-gap", "gap-analysis", { externalReviewPending: { headSha: SHA } }, (async () => false) as never);
+      expect(hook).not.toHaveBeenCalled();
+      expect(outbox()).toEqual([]);
+    });
+
+    it("sweep submits an initial-run outbox row with its head sha and no gapFill, then clears it (AII-1362)", async () => {
+      const { dispatchId } = await run("i-late-sweep", "implementation", { externalReviewPending: { headSha: SHA } }, (async () => false) as never);
+      const submit = vi.fn(async () => {});
+      expect(await runnerCallback.resubmitPendingGapFillReviews({ ready: () => false, submit })).toBe(0);
+      expect(submit).not.toHaveBeenCalled();
+      const failing = vi.fn(async () => false as const);
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit: failing });
+      expect(outbox()).toHaveLength(1);
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit });
+      expect(submit).toHaveBeenCalledTimes(1);
+      expect(submit).toHaveBeenCalledWith({
+        dispatchId, owner: "o", repo: "r", prNumber: 99, prUrl: "https://github.com/o/r/pull/99", headSha: SHA,
+      });
+      expect(outbox()).toEqual([]);
     });
 
     it("does not submit without the field, without prUrl, or with a malformed field", async () => {
@@ -1346,7 +1391,7 @@ describe("handleRunnerResult — implementation", () => {
     });
 
     it("re-submits a pending review-fix attempt with its attemptId once, then clears it (AII-1307)", async () => {
-      log.recordPendingAttemptReview("att-1", "d-att", "https://github.com/o/r/pull/7", NOW - HOUR);
+      log.recordPendingLateReview({ workflowKey: "d-att-att-1", dispatchId: "d-att", prUrl: "https://github.com/o/r/pull/7", attemptId: "att-1" }, NOW - HOUR);
       const submit = vi.fn(async () => {});
       expect(await runnerCallback.resubmitPendingGapFillReviews({ ready: () => false, submit, now: NOW })).toBe(0);
       expect(submit).not.toHaveBeenCalled();
@@ -1359,7 +1404,7 @@ describe("handleRunnerResult — implementation", () => {
     });
 
     it("keeps a pending review-fix attempt when the hook reports the submit did not settle (AII-1307)", async () => {
-      log.recordPendingAttemptReview("att-2", "d-att2", "https://github.com/o/r/pull/7", NOW - HOUR);
+      log.recordPendingLateReview({ workflowKey: "d-att2-att-2", dispatchId: "d-att2", prUrl: "https://github.com/o/r/pull/7", attemptId: "att-2" }, NOW - HOUR);
       const submit = vi.fn(async () => false);
       expect(await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW })).toBe(0);
       await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
@@ -5157,5 +5202,45 @@ describe("handleRunnerActivity (AII-777/AII-803)", () => {
     expect(second.status).toBe(409);
     expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("conflicting activity payload"));
     errorSpy.mockRestore();
+  });
+
+  it("real store integration: a pipeline_step batch with finalSequence completes the pipeline-steps tail, and a resend is a duplicate", async () => {
+    const attemptId = "attempt-pipeline-steps";
+    const token = preparedProgressToken(attemptId);
+    const onReviewFixActivity = (batch: RunnerCallbackModule.RunnerActivityBody): RunnerCallbackModule.ActivityIntakeOutcome => {
+      const result = reviewFixEvidence.appendReviewFixActivityBatch({
+        attemptId: batch.attemptId, producerId: batch.producerId, events: batch.events, finalSequence: batch.finalSequence,
+      });
+      if (result.conflicts.length > 0) return { status: "conflict", attemptId, reason: "conflict" };
+      if (result.stored === 0 && result.duplicates > 0) return { status: "duplicate", attemptId };
+      return { status: "accepted", attemptId };
+    };
+    const stepEvent = (sequence: number, action: string, status: string) =>
+      activityEvent({
+        attemptId,
+        producerId: "pipeline-steps",
+        sequence,
+        kind: "pipeline_step",
+        action,
+        payload: JSON.stringify({ type: "custom", status, started_at: "2026-10-14T00:00:00.000Z", ended_at: null, parent_step_id: null }),
+      });
+    const body = {
+      version: 1 as const,
+      attemptId,
+      producerId: "pipeline-steps",
+      events: [stepEvent(0, "install", "running"), stepEvent(1, "install", "completed")],
+      finalSequence: 1,
+    };
+
+    const first = await runnerCallback.handleRunnerActivity({ authorization: `Bearer ${token}`, secret: SECRET, body, onReviewFixActivity });
+    expect(first.status).toBe(200);
+    expect(first.body.outcome).toBe("accepted");
+    const gaps = reviewFixEvidence.getReviewFixActivityGaps(attemptId, "pipeline-steps");
+    expect(gaps.tailComplete).toBe(true);
+    expect(gaps.ranges).toEqual([]);
+
+    const second = await runnerCallback.handleRunnerActivity({ authorization: `Bearer ${token}`, secret: SECRET, body, onReviewFixActivity });
+    expect(second.status).toBe(200);
+    expect(second.body.outcome).toBe("duplicate");
   });
 });

@@ -42,7 +42,6 @@ import {
   clearDispatchDedupTool,
   listDispatchReservationsTool,
   releaseDispatchReservationTool,
-  tool,
   type ToolResponse,
 } from "../restate/tools.js";
 import {
@@ -407,45 +406,6 @@ afterEach(() => {
   vi.restoreAllMocks();
   setReviewFixAttemptsFacade(null);
 });
-
-/** Set up a successful proxy response mock. */
-function setupProxyMock(opts: {
-  statusCode?: number;
-  responseHeaders?: Record<string, string>;
-  chunks?: string[];
-}): { mockProxyReq: PassThrough; capturedOpts: { value: http.RequestOptions | null } } {
-  const capturedOpts: { value: http.RequestOptions | null } = { value: null };
-  const mockProxyReq = new PassThrough();
-  const mockProxyRes = new PassThrough();
-  Object.assign(mockProxyRes, {
-    statusCode: opts.statusCode ?? 200,
-    headers: opts.responseHeaders ?? { "content-type": "application/json" },
-  });
-
-  mockHttpRequest.mockImplementationOnce((options: http.RequestOptions, cb: (res: unknown) => void) => {
-    capturedOpts.value = options;
-    process.nextTick(() => {
-      cb(mockProxyRes);
-      for (const chunk of opts.chunks ?? []) mockProxyRes.push(chunk);
-      mockProxyRes.push(null);
-    });
-    return mockProxyReq;
-  });
-
-  return { mockProxyReq, capturedOpts };
-}
-
-/** Set up a proxy socket error mock. */
-function setupProxyError(errorCode: string): void {
-  const mockProxyReq = new PassThrough();
-  mockHttpRequest.mockImplementationOnce((_options: http.RequestOptions, _cb: unknown) => {
-    process.nextTick(() => {
-      const err = Object.assign(new Error(errorCode), { code: errorCode });
-      mockProxyReq.emit("error", err);
-    });
-    return mockProxyReq;
-  });
-}
 
 async function callMcp(
   headers: Record<string, string>,
@@ -2590,6 +2550,10 @@ describe("handleMcpRequest", () => {
         },
         listTools: async () => [],
         callKgTool: async () => ({ ok: true, result: {} }),
+        proxyCall: (_req, res) => {
+          res.writeHead(500);
+          res.end();
+        },
       };
       // AII-711: the capability gate runs inside the kg_* handler, which reads the boot-time
       // singleton; the refusal is a tool result, not a JSON-RPC -32601 envelope.
@@ -2623,6 +2587,10 @@ describe("handleMcpRequest", () => {
         },
         listTools: async () => [],
         callKgTool: async () => ({ ok: true, result: {} }),
+        proxyCall: (_req, res) => {
+          res.writeHead(500);
+          res.end();
+        },
       };
       setKgMemoryProvider(stubProvider);
 
@@ -2656,6 +2624,7 @@ describe("handleMcpRequest", () => {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ jsonrpc: "2.0", id: 9, result: { content: [] } }));
         },
+        callKgTool: async () => ({ ok: true, result: {} }),
       };
 
       const result = await callMcp(
@@ -2793,6 +2762,10 @@ describe("handleMcpRequest", () => {
         capabilities: { hybridSearch: true, neighbors: true, path: true, provenance: true, stalenessStamp: false },
         listTools: async () => [],
         callKgTool,
+        proxyCall: (_req, res) => {
+          res.writeHead(500);
+          res.end();
+        },
       };
       setKgMemoryProvider(stubProvider);
 
