@@ -121,11 +121,33 @@ export interface ImportInput {
   operator: unknown;
 }
 
+export interface PlanRecordWriteInput {
+  profileId: string;
+  /** Sequence of the record this write replaces; null only when no record exists yet. */
+  expectedSequence: number | null;
+  sessionData: string;
+  /** Opaque operator credential. Omit only from the ChatGptPlanAccount refresher object. */
+  operator?: unknown;
+}
+
 export interface ModelSessionStore {
   read(profileId: string, ownerGeneration: number): SessionReadResult;
   checkpoint(input: CheckpointInput): SessionWriteResult;
   importSession(input: ImportInput): SessionWriteResult;
+  /** ChatGPT plan records: one sequence per profile, owner generation fixed at 1, no reservation. */
+  readPlanRecord(profileId: string): SessionReadResult;
+  /**
+   * Compare-and-set on the latest sequence. A write with `operator` set is authorized through
+   * `authorizeOperator`; a write without it is allowed only from the `ChatGptPlanAccount` refresher
+   * object, the one internal caller (src/restate/chatgpt-plan-account.ts). Never calls `verifyOwner`.
+   * Keeps the newest PLAN_RECORD_RETENTION rows per profile.
+   */
+  writePlanRecord(input: PlanRecordWriteInput): SessionWriteResult;
 }
+
+/** Fixed owner generation of ChatGPT plan records (hosted plan accounts take no reservation). */
+export const PLAN_RECORD_OWNER_GENERATION = 1;
+export const PLAN_RECORD_RETENTION = 3;
 
 interface SessionRow {
   profile_id: string;
@@ -212,6 +234,17 @@ export function createModelSessionStore(options: ModelSessionStoreOptions): Mode
       .get(profileId) as SessionRow | undefined;
   }
 
+  function latestPlanRow(db: Database.Database, profileId: string): SessionRow | undefined {
+    return db
+      .prepare(
+        `SELECT profile_id, owner_generation, checkpoint_sequence, encrypted_session_state,
+                encryption_key_id, nonce, auth_tag, valid_until_at, state_status
+         FROM model_session_generations WHERE profile_id = ? AND owner_generation = ?
+         ORDER BY checkpoint_sequence DESC LIMIT 1`,
+      )
+      .get(profileId, PLAN_RECORD_OWNER_GENERATION) as SessionRow | undefined;
+  }
+
   /** Decrypts a row, or throws Abort with the category that keeps the state unusable. */
   function open(row: SessionRow): string {
     if (row.state_status !== "checkpointed") throw new Abort(fail("recovery_required", "state_unusable"));
@@ -294,6 +327,52 @@ export function createModelSessionStore(options: ModelSessionStoreOptions): Mode
   }
 
   return {
+    readPlanRecord(profileId) {
+      if (!ID_PATTERN.test(String(profileId))) return fail("unauthorized", "invalid_input");
+      return run((db): SessionReadResult => {
+        const latest = latestPlanRow(db, profileId);
+        if (!latest) throw new Abort(fail("recovery_required", "no_state"));
+        const sessionData = open(latest);
+        return {
+          ok: true,
+          profileId,
+          ownerGeneration: PLAN_RECORD_OWNER_GENERATION,
+          stateSequence: latest.checkpoint_sequence,
+          sessionData,
+        };
+      });
+    },
+
+    writePlanRecord(input) {
+      const { profileId, expectedSequence, sessionData, operator } = input ?? ({} as PlanRecordWriteInput);
+      if (
+        !ID_PATTERN.test(String(profileId)) || !validSessionData(sessionData) ||
+        !(expectedSequence === null || isNonNegativeInt(expectedSequence))
+      ) {
+        return fail("unauthorized", "invalid_input");
+      }
+      return run((db): SessionWriteResult => {
+        if (operator !== undefined) {
+          let authorized = false;
+          try {
+            authorized = operator !== null && options.authorizeOperator(operator, profileId) === true;
+          } catch {
+            authorized = false;
+          }
+          if (!authorized) throw new Abort(fail("unauthorized", "operator_not_authorized"));
+        }
+        const latest = latestPlanRow(db, profileId);
+        const latestSequence = latest ? latest.checkpoint_sequence : null;
+        if (latestSequence !== expectedSequence) throw new Abort(fail("stale_owner", "stale_sequence"));
+        const sequence = expectedSequence === null ? 0 : expectedSequence + 1;
+        insert(db, profileId, PLAN_RECORD_OWNER_GENERATION, sequence, sessionData);
+        db.prepare(
+          "DELETE FROM model_session_generations WHERE profile_id = ? AND owner_generation = ? AND checkpoint_sequence <= ?",
+        ).run(profileId, PLAN_RECORD_OWNER_GENERATION, sequence - PLAN_RECORD_RETENTION);
+        return { ok: true, profileId, ownerGeneration: PLAN_RECORD_OWNER_GENERATION, stateSequence: sequence, idempotent: false };
+      });
+    },
+
     read(profileId, ownerGeneration) {
       if (!ID_PATTERN.test(String(profileId)) || !isPositiveInt(ownerGeneration)) {
         return fail("unauthorized", "invalid_input");
