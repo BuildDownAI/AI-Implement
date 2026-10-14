@@ -71,7 +71,7 @@ describe("readTick", () => {
     vi.mocked(getCommitTime).mockResolvedValue(25);
     vi.mocked(listPrComments).mockResolvedValue([]);
     const tick = await deps.readTick(input);
-    expect(tick).toEqual({ open: true, headSha: "sha-a", checks: "success", headCommittedAtMs: 25, blockingLastSeenAtMs: [10, 30] });
+    expect(tick).toEqual({ open: true, headSha: "sha-a", checks: "success", headCommittedAtMs: 25, blockingLastSeenAtMs: [10, 30], heldBy: "ledger" });
     expect(getCommitTime).toHaveBeenCalledWith("tok", "owner", "repo", "sha-a");
     expect(getCombinedChecksState).toHaveBeenCalledWith("tok", "owner", "repo", "sha-a");
     expect(listOpenReviewFindings).toHaveBeenCalledWith("owner/repo", 12);
@@ -117,6 +117,12 @@ describe("hasComment", () => {
   it("is false when no comment carries the marker", async () => {
     vi.mocked(listPrComments).mockResolvedValue([{ body: "unrelated" }] as never);
     expect(await deps.hasComment(input, LATE_EXTERNAL_APPROVAL_MARKER)).toBe(false);
+  });
+
+  it("reads strictly only when asked (AII-1361)", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([] as never);
+    await deps.hasComment(input, "m", { strict: true });
+    expect(listPrComments).toHaveBeenLastCalledWith("tok", "owner", "repo", 12, { strict: true });
   });
 });
 

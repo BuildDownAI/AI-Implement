@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn(async () => "tok") }));
@@ -16,7 +17,7 @@ vi.mock("../review-ledger-store.js", () => ({ listOpenReviewFindings: vi.fn(() =
 
 import { getCombinedChecksState, getCommitTime, getDefaultBranchFileText, getPullRequestState, listCheckRuns, listPrComments, listPullRequestCommits } from "../github.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
-import { decodeReadHead, createProductionLateExternalReviewDependencies, LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS } from "../restate/late-external-review.js";
+import { decodeReadHead, heldCommentBody, createProductionLateExternalReviewDependencies, LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS } from "../restate/late-external-review.js";
 import { headReviewedClean } from "../review-head-clean.js";
 
 const run = (status: string, conclusion: string | null) => ({ name: "Claude Code Review", appSlug: "claude", status, conclusion });
@@ -232,5 +233,74 @@ describe("readTick reads Claude's verdict for a gap-fill (AII-1303)", () => {
     vi.mocked(getCommitTime).mockResolvedValue(Date.now() - 1000);
     vi.mocked(listCheckRuns).mockResolvedValue([{ name: "review", appSlug: "github-actions", status: "completed", conclusion: "success" }]);
     expect((await tickOf({ reviewerExpected: true })).checks).toBe("pending");
+  });
+});
+
+describe("readTick heldBy (AII-1361)", () => {
+  const COMMIT_MS = 1_700_000_000_000;
+  const gapInput = { dispatchId: "d", owner: "o", repo: "r", prNumber: 5, prUrl: "u", headSha: "b", gapFill: true };
+  const tickOf = (extra: Record<string, unknown> = {}) =>
+    createProductionLateExternalReviewDependencies({ githubAppId: "1", githubAppPrivateKey: "k" }).readTick({ ...gapInput, ...extra } as never);
+  // Live comments, copied verbatim with `gh api repos/BuildDownAI/AI-Implement/issues/comments/<id>`.
+  const live = (id: number) => {
+    const c = JSON.parse(readFileSync(new URL(`./fixtures/claude-review-comment-${id}.json`, import.meta.url), "utf8"));
+    return { id: c.id, body: c.body as string, user: c.user, htmlUrl: c.html_url, createdAt: new Date(COMMIT_MS + 1000).toISOString() };
+  };
+  const finding = (lastSeenAt: number) => [{ severity: "blocking", lastSeenAt }] as never;
+
+  beforeEach(() => {
+    vi.mocked(getCommitTime).mockResolvedValue(COMMIT_MS);
+    vi.mocked(listCheckRuns).mockResolvedValue([run("completed", "success")]);
+  });
+
+  it("incomplete: PR #1093 comment 6157787770", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([live(6157787770)] as never);
+    expect((await tickOf()).heldBy).toBe("incomplete");
+  });
+  it("changes_requested: AII-1307 PR comment 6156285019", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([live(6156285019)] as never);
+    expect((await tickOf()).heldBy).toBe("changes_requested");
+  });
+  it("changes_requested-empty: a MODIFIED copy of comment 6156285019 with findings: []", async () => {
+    const c = live(6156285019);
+    const re = /(```json review-findings\r?\n)([\s\S]*?)(\r?\n```)/;
+    const m = re.exec(c.body)!;
+    const block = { ...JSON.parse(m[2]), findings: [] };
+    c.body = c.body.replace(re, (_a, o, _b, close) => o + JSON.stringify(block) + close);
+    vi.mocked(listPrComments).mockResolvedValue([c] as never);
+    expect((await tickOf()).heldBy).toBe("changes_requested-empty");
+  });
+  it("unreadable: a malformed review-findings block", async () => {
+    const c = live(6156285019);
+    c.body = c.body.replace(/(```json review-findings\r?\n)[\s\S]*?(\r?\n```)/, "$1{ not json$2");
+    vi.mocked(listPrComments).mockResolvedValue([c] as never);
+    expect((await tickOf()).heldBy).toBe("unreadable");
+  });
+  it("a blocking ledger row and an incomplete verdict give incomplete", async () => {
+    vi.mocked(listOpenReviewFindings).mockReturnValue(finding(COMMIT_MS + 5));
+    vi.mocked(listPrComments).mockResolvedValue([live(6157787770)] as never);
+    expect((await tickOf()).heldBy).toBe("incomplete");
+  });
+  it("a ledger row alone gives ledger; one older than the commit gives none", async () => {
+    vi.mocked(listOpenReviewFindings).mockReturnValue(finding(COMMIT_MS));
+    expect((await tickOf()).heldBy).toBe("ledger");
+    vi.mocked(listOpenReviewFindings).mockReturnValue(finding(COMMIT_MS - 1));
+    expect(await tickOf()).not.toHaveProperty("heldBy");
+  });
+  it("follow mode skips the verdict read: ledger or absent", async () => {
+    vi.mocked(listOpenReviewFindings).mockReturnValue(finding(COMMIT_MS + 1));
+    expect((await tickOf({ followHead: true, headSha: "b" })).heldBy).toBe("ledger");
+  });
+});
+
+describe("heldCommentBody (AII-1361)", () => {
+  const reasons = ["incomplete", "unreadable", "changes_requested", "changes_requested-empty", "ledger", "timed-out", undefined] as const;
+  it.each(reasons)("%s: first line, no leading /ai-implement, no /claude-review", (reason) => {
+    const body = heldCommentBody("k", "abc123", reason);
+    expect(body.split("\n")[1]).toBe("⚠️ AI-Implement did not write the approval mark for abc123, so auto-merge holds this PR.");
+    expect(body.startsWith("/ai-implement")).toBe(false);
+    expect(body.split("\n").every((l) => !l.startsWith("/ai-implement"))).toBe(true);
+    expect(body).not.toContain("/claude-review");
+    expect(body).toContain("<!-- ai-implement late-external-held key=k -->");
   });
 });
