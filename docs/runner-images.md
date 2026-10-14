@@ -40,7 +40,7 @@ The `fly-machines` path validates the image-reference format but applies no allo
 
 ## Private images constrain the execution mode
 
-A private GHCR image is usable **only in GitHub Actions mode**. Fly Machines pull anonymously with no credential mechanism, so a private image fails at machine-create time with `failed to get manifest ... unauthorized`. Local Docker does not pull: it runs the image from the local cache with the host daemon's own credentials. There is no workaround on Fly — choosing a private image is choosing GHA mode.
+Only some backends can pull a private GHCR image. GitHub Actions can pull it. Fly Machines cannot: they pull anonymously with no credential mechanism, so a private image fails at machine-create time with `failed to get manifest ... unauthorized`. Local Docker runs the image from the host cache, private or public. On a cache miss, `docker run` pulls the image with the host daemon's own credentials (`buildDockerRunArgs` passes no `--pull` flag, so the default pull policy `missing` applies). There is no workaround on Fly. To run a private image on a host that has no cached copy and no daemon credentials, use GHA mode.
 
 On the GHA path, `claude-implement.yml` and `claude-plan.yml` authenticate the pull with the job's `GITHUB_TOKEN`: each requests `packages: read` **and** passes the token through the container `credentials:` block. A bare `packages: read` is not sufficient on its own, because GitHub Actions does not auto-authenticate a job-container image pull — the `credentials:` block is what performs the authenticated pull.
 
@@ -103,7 +103,7 @@ There is no order between the orchestrator deploy and the channel move. Either c
 | GitHub Actions | The implement job starts. The Actions runner pulls `container.image`, so the tag can move while the job waits in the queue. | `workflows/claude-implement.yml` (`container.image`) |
 | Fly one-shot | The machine is created. | `src/fly-machines.ts` (`machineConfig.image`) |
 | Kept Fly machine ([ADR 037](adr/037-a-durable-runner-is-a-profile-object-that-owns-one-kept-machine.md)) | Every claim. The orchestrator sends a Fly update with a fresh config and the re-resolved image, then starts the machine. | `src/restate/kg-refresh-production.ts` (`updateMachine`, then `startMachine`) |
-| Local Docker | `docker run`. The image comes from the local cache with no pull. `image.yml` is ignored. | `buildDockerRunArgs` in `src/local-docker.ts` |
+| Local Docker | `docker run`. The image comes from the host cache. On a cache miss, `docker run` pulls it, so a moving tag that is already cached is not refreshed. `image.yml` is ignored. | `buildDockerRunArgs` in `src/local-docker.ts` |
 
 A run that is in flight keeps its image. A new channel image affects only the runs that start after it.
 
