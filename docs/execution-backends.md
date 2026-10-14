@@ -23,7 +23,7 @@ Fly and local implementation and planning launches share `dispatchSession` (`src
 
 ### The envelope
 
-The `RunConfigV1` envelope ([workflow-envelope.md](workflow-envelope.md)) rides in `run_config` on GitHub Actions and in `AI_IMPLEMENT_RUN_CONFIG` on Fly and local. Three builders make it today: `buildEnvelopeDispatchInputs` (`src/github.ts:433`), `buildImplRunConfig` (`src/run-config.ts:147`) and `buildKgRefreshRunConfig` (`src/run-config.ts:190`). Three paths write the literal by hand: the Fly gap-fill branch, the planning session launch, and `buildLaunchInputs` in the review-fix worker. A field that one builder sets and another forgets is a parity gap.
+The `RunConfigV1` envelope ([workflow-envelope.md](workflow-envelope.md)) rides in `run_config` on GitHub Actions and in `AI_IMPLEMENT_RUN_CONFIG` on Fly and local. Every launch path except kg-refresh builds it with `buildRunConfig` (`src/run-config.ts`): `buildEnvelopeDispatchInputs` (`src/github.ts`), `buildImplRunConfig` (a thin wrapper for Fly and local implementation), the Fly gap-fill branch, the planning session launch, and `buildLaunchInputs` in the review-fix worker. kg-refresh uses `buildKgRefreshRunConfig`. The field rules live in `buildRunConfig`, so a field is set the same way on every backend.
 
 ### Run tokens
 
@@ -46,7 +46,7 @@ The local image is the operator's `LOCAL_RUNNER_IMAGE` (`config.localRunnerImage
 
 ## Launch parity test
 
-`src/__tests__/launch-contract-parity.test.ts` runs one cell for each row and column of the table above. Each cell calls the real launch path with fakes at the outermost call and captures the launch payload: the `inputs` given to `postWorkflowDispatch` or `dispatchWorkflow` on GitHub Actions, the machine config given to `createMachine` on Fly, and the input given to `startLocalRunnerContainer` on local Docker. No cell makes a network call: the global `fetch` is a fake that records any call the test did not plan, and the test fails on one.
+`src/__tests__/launch-contract-parity.test.ts` checks that every launch path builds its envelope with `buildRunConfig` (kg-refresh: `buildKgRefreshRunConfig`) and runs one cell for each row and column of the table above. Each cell calls the real launch path with fakes at the outermost call and captures the launch payload: the `inputs` given to `postWorkflowDispatch` or `dispatchWorkflow` on GitHub Actions, the machine config given to `createMachine` on Fly, and the input given to `startLocalRunnerContainer` on local Docker. No cell makes a network call: the global `fetch` is a fake that records any call the test did not plan, and the test fails on one.
 
 Every cell runs three checks:
 

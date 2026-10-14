@@ -129,7 +129,7 @@ export function runConfigFromTaskDocument(params: TaskDocumentParams, issueId: s
 }
 
 export interface ImplRunConfigInput {
-  issue: { id: string; identifier: string; title: string; description?: string | null };
+  issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[]; assigneeName?: string };
   mapping: RepoMapping;
   baseBranch: string;
   runnerCallbackUrl?: string;
@@ -146,29 +146,15 @@ export interface ImplRunConfigInput {
  */
 export function buildImplRunConfig(input: ImplRunConfigInput): RunConfigV1 {
   const { issue, mapping, baseBranch, runnerCallbackUrl, groupingParent, retryPolicy } = input;
-  return {
-    v: 1,
-    issue: {
-      id: issue.id,
-      identifier: issue.identifier,
-      title: issue.title,
-      description: issue.description || issue.title,
-    },
+  return buildRunConfig({
     runnerPhase: "implementation",
-    ...(baseBranch !== mapping.defaultBranch ? { baseBranch } : {}),
-    ...(mapping.branchPrefix ? { branchPrefix: mapping.branchPrefix } : {}),
-    ...(mapping.skillsRepo ? { skillsRepo: mapping.skillsRepo } : {}),
-    ...(mapping.referenceRepos != null ? { referenceRepos: mapping.referenceRepos } : {}),
-    ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
-    ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
-    ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
-    ...(groupingParent ? { groupingParent: true } : {}),
-    ...(mapping.dependencyTokenScope != null ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
-    ...(mapping.reviewers != null ? { reviewers: mapping.reviewers } : {}),
-    ...(mapping.reviewProcess != null ? { reviewProcess: mapping.reviewProcess } : {}),
-    ...(mapping.trustedReviewAuthors != null ? { trustedReviewAuthors: mapping.trustedReviewAuthors } : {}),
+    issue,
+    mapping,
+    baseBranch: baseBranch !== mapping.defaultBranch ? baseBranch : undefined,
+    runnerCallbackUrl,
+    groupingParent,
     retryPolicy,
-  };
+  });
 }
 
 export interface RunConfigBuildInput {

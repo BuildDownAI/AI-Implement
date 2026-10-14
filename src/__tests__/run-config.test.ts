@@ -458,6 +458,24 @@ describe("buildImplRunConfig", () => {
     expect(decoded.groupingParent).toBe(true);
   });
 
+  it("carries sensitiveFiles, profiles and assigneeName, and omits baseBranch when it is the default", () => {
+    const mapping = makeMapping({ sensitiveAddPatterns: ["*.pem"], sensitiveAllowPatterns: [".env"] });
+
+    const runConfig = buildImplRunConfig({
+      issue: { ...implBaseIssue, profiles: ["backend"], assigneeName: "Ada" },
+      mapping,
+      baseBranch: mapping.defaultBranch,
+      retryPolicy: DEFAULT_RETRY_POLICY,
+    });
+
+    const decoded = decodeRunConfig(encodeRunConfig(runConfig));
+    expect(decoded.sensitiveFiles).toEqual({ add: ["*.pem"], allow: [".env"] });
+    expect(decoded.profiles).toEqual(["backend"]);
+    expect(decoded.assigneeName).toBe("Ada");
+    expect(decoded).not.toHaveProperty("baseBranch");
+    expect(decoded.retryPolicy).toEqual(DEFAULT_RETRY_POLICY);
+  });
+
   it("carries the mapping's reviewers when set, including an empty array", () => {
     const reviewers: ReviewerSelection[] = [{ id: "gap-analysis", gates: false }];
     const mapping = makeMapping({ reviewers });

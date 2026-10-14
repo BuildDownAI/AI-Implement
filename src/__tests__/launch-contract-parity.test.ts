@@ -58,20 +58,13 @@ const EXPECTED_TOKENS: Record<Kind, readonly Audience[]> = {
 const KNOWN_GAPS: ReadonlyArray<{ kind: string; backend: string; check: string }> = [
   // implementation
   { kind: "implementation", backend: "github-actions", check: "image" },
-  { kind: "implementation", backend: "fly-machines", check: "envelope:sensitiveFiles" },
-  { kind: "implementation", backend: "fly-machines", check: "envelope:profiles" },
-  { kind: "implementation", backend: "fly-machines", check: "envelope:assigneeName" },
   { kind: "implementation", backend: "fly-machines", check: "token:progress" },
   { kind: "implementation", backend: "fly-machines", check: "token:publication" },
   { kind: "implementation", backend: "fly-machines", check: "image" },
-  { kind: "implementation", backend: "local-docker", check: "envelope:sensitiveFiles" },
-  { kind: "implementation", backend: "local-docker", check: "envelope:profiles" },
-  { kind: "implementation", backend: "local-docker", check: "envelope:assigneeName" },
   { kind: "implementation", backend: "local-docker", check: "token:progress" },
   { kind: "implementation", backend: "local-docker", check: "token:publication" },
   // gap-fill
   { kind: "gap-fill", backend: "github-actions", check: "image" },
-  { kind: "gap-fill", backend: "fly-machines", check: "envelope:dependencyTokenScope" },
   { kind: "gap-fill", backend: "fly-machines", check: "token:progress" },
   { kind: "gap-fill", backend: "fly-machines", check: "token:publication" },
   { kind: "gap-fill", backend: "fly-machines", check: "image" },
@@ -79,16 +72,10 @@ const KNOWN_GAPS: ReadonlyArray<{ kind: string; backend: string; check: string }
   // planning
   { kind: "planning", backend: "github-actions", check: "token:progress" },
   { kind: "planning", backend: "github-actions", check: "image" },
-  ...["baseBranch", "branchPrefix", "skillsRepo", "sensitiveFiles", "reviewers", "reviewProcess", "trustedReviewAuthors", "profiles", "assigneeName"]
-    .flatMap((key) => [
-      { kind: "planning", backend: "fly-machines", check: `envelope:${key}` },
-      { kind: "planning", backend: "local-docker", check: `envelope:${key}` },
-    ]),
   { kind: "planning", backend: "fly-machines", check: "token:progress" },
   { kind: "planning", backend: "fly-machines", check: "image" },
   { kind: "planning", backend: "local-docker", check: "token:progress" },
   // review-fix-attempt
-  { kind: "review-fix-attempt", backend: "github-actions", check: "envelope:retryPolicy" },
   { kind: "review-fix-attempt", backend: "github-actions", check: "image" },
   // legacy review-fix queue
   { kind: "legacy-review-fix", backend: "github-actions", check: "image" },
@@ -503,6 +490,7 @@ const reviewFixAttempt: LaunchPath = async (w) => {
     credentials: { resolve: async () => ({ token: "gh-token", installationId: INSTALLATION_ID }) },
     transport,
     runnerCallbackUrl: CALLBACK_URL,
+    retryPolicy: () => STORED_RETRY_POLICY,
     runnerImage: (target) => w.repoImage.resolveRunnerImageForDispatch({
       ...target, defaultImage: CONFIG.sessionImage, runnerImageExplicit: CONFIG.runnerImageExplicit,
     }),

@@ -21,7 +21,7 @@ import { SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
 import { getFlySecretsMinVersion, getFlyProcessLevelSecrets } from "./runner-mode.js";
 import { resolveSessionImage } from "./repo-image.js";
 import { getMappings } from "./config.js";
-import { encodeRunConfig, type RunConfigV1 } from "./run-config.js";
+import { buildRunConfig, encodeRunConfig } from "./run-config.js";
 
 export interface PreparePlanningLaunchArgs {
   config: AppConfig;
@@ -364,20 +364,15 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
         DEPENDENCIES: planningContextInputs.dependencies,
       };
 
-      const planningRunConfig: RunConfigV1 = {
-        v: 1,
-        issue: {
-          id: issue.id,
-          identifier: issue.identifier,
-          title: issue.title,
-          description: issue.description || issue.title,
-        },
+      const planningRunConfig = buildRunConfig({
         runnerPhase: "planning",
-        ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
-        ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
-        ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
+        issue,
+        mapping,
+        baseBranch: resolvedPlanningBranch !== mapping.defaultBranch ? resolvedPlanningBranch : undefined,
+        runnerCallbackUrl: runnerCallbackUrl || undefined,
         planningContext: planningContextInputs,
-      };
+        retryPolicy: null,
+      });
 
       // both fly-machines and local-docker require a GitHub token now, so it's extracted here for convenience/readability
       const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
