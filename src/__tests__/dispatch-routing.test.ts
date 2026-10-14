@@ -1,19 +1,17 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
 import { resolveExecutionPath, resolvePlanningExecutionPath } from "../runner-mode.js";
 import type * as DedupModule from "../dedup.js";
 import type * as GateModule from "../dispatch-gate.js";
-import type * as BreakerModule from "../dispatch-breaker.js";
-import type { TicketIssue, TicketingProvider } from "../providers/types.js";
+import type { TicketingProvider } from "../providers/types.js";
 import type { RepoMapping } from "../config.js";
-import type { AppConfig } from "../index.js";
 import { shouldReleaseAdmissionOnDispatchError } from "../index.js";
+import { makeAppConfig, makeIssue, makeMapping, makeProvider } from "./helpers/builders.js";
+import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
+import { testDb } from "./helpers/test-db.js";
 
 // Mocked only for the "pre-launch failure releases the reservation" describe block below —
 // dedup.js/log.js/dispatch-breaker.js/dispatch-admission.js/dispatch-gate.js stay real
-// (a temp sqlite db per test) so the admission release actually being exercised is the
+// (a test database per test) so the admission release actually being exercised is the
 // real transactional one, not a stub.
 vi.mock("../github-app-auth.js", () => ({
   getInstallationToken: vi.fn(),
@@ -69,6 +67,27 @@ const planningIngress = vi.hoisted(() => ({ submit: vi.fn(), report: vi.fn() }))
 vi.mock("../restate/planning-run-client.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../restate/planning-run-client.js")>();
   return { ...actual, createPlanningRunIngressClient: () => planningIngress };
+});
+
+/** A Jira project's mapping, its tracker config as validation stores it, for the describes whose provider is Jira. */
+function jiraMapping(project: string, overrides: Partial<RepoMapping> = {}): RepoMapping {
+  return makeMapping({
+    ticketingProvider: "jira",
+    ticketingConfig: {
+      kind: "jira", jql: `project = ${project}`, repoFieldValue: "test-org/test-repo",
+      statusFieldOverride: null, repoFieldOverride: null, profilesFieldOverride: null, baseBranchFieldOverride: null,
+    },
+    ...overrides,
+  });
+}
+
+function jiraProvider(): TicketingProvider {
+  return makeProvider({ id: "jira", issueUrl: (issue) => `https://example.atlassian.net/browse/${issue.identifier}` });
+}
+
+// No request is expected unless a test routes it.
+beforeEach(() => {
+  fakeFetch({}).install();
 });
 
 // AII-783 gap-fill (review finding on PR #681): the exact four cases the blocking review
@@ -204,27 +223,10 @@ describe("resolvePlanningExecutionPath", () => {
 // one shared SQLite connection, concurrent-in-a-tick candidates — to show a single free
 // slot cannot be spent twice regardless of which entry point claims it first.
 describe("acquireDispatch — cross-entry-point admission (poll loop vs. another dispatch path)", () => {
-  let dbPath: string;
-  let dedup: typeof DedupModule;
   let gate: typeof GateModule;
-  let breaker: typeof BreakerModule;
 
   beforeEach(async () => {
-    vi.resetModules();
-    dbPath = path.join(
-      os.tmpdir(),
-      `dispatch-routing-admission-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-    );
-    process.env.DEDUP_DB_PATH = dbPath;
-    dedup = await import("../dedup.js");
-    gate = await import("../dispatch-gate.js");
-    breaker = await import("../dispatch-breaker.js");
-    breaker.initDispatchBreakerTable();
-  });
-
-  afterEach(() => {
-    dedup.closeDb();
-    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+    ({ gate } = (await testDb({ modules: { gate: () => import("../dispatch-gate.js") } })).modules);
   });
 
   it("an implementation (GHA) dispatch and a planning (GHA) dispatch for the same team cannot both claim the last slot", () => {
@@ -339,75 +341,41 @@ describe("acquireDispatch — cross-entry-point admission (poll loop vs. another
 // definitive non-launch and release the reservation, via the real dispatchGitHubActions /
 // dispatchLocalDocker entry points rather than a stub. Only the external launch call
 // (getInstallationToken, startLocalRunnerContainer) is mocked; dedup/log/dispatch-breaker/
-// dispatch-admission/dispatch-gate all run for real against a temp sqlite db, so a
+// dispatch-admission/dispatch-gate all run for real against a test database, so a
 // regression that silently swallowed-without-releasing (or double-released) the
 // reservation would be caught by the capacity assertion below.
 describe("dispatch entry points — pre-launch failure releases the reservation (AII-783 gap-fill)", () => {
-  let dbPath: string;
+  const loaders = {
+    dedup: () => import("../dedup.js"),
+    gate: () => import("../dispatch-gate.js"),
+    admission: () => import("../dispatch-admission.js"),
+    githubAppAuth: () => import("../github-app-auth.js"),
+    localDocker: () => import("../local-docker.js"),
+    planningLaunch: () => import("../planning-launch.js"),
+    indexModule: () => import("../index.js"),
+  };
   let dedup: typeof DedupModule;
   let gate: typeof GateModule;
-  let breaker: typeof BreakerModule;
+  let admission: typeof import("../dispatch-admission.js");
   let indexModule: typeof import("../index.js");
   let githubAppAuth: typeof import("../github-app-auth.js");
   let localDocker: typeof import("../local-docker.js");
+  let planningLaunch: typeof import("../planning-launch.js");
 
-  const issue: TicketIssue = {
-    id: "issue-entrypoint-1",
-    identifier: "AII-900",
-    title: "Test issue",
-    description: "desc",
-    scopeKey: "AII",
-    nativeStatus: "Todo",
-  };
-
-  const mapping = {
-    owner: "eudoxus",
-    repo: "AI-Implement",
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 1,
-    provider: "anthropic",
-    sessionMode: "default",
-    machineCpus: 1,
-    machineMemoryMb: 512,
-    extraEnv: {},
-  } as unknown as RepoMapping;
-
-  const provider = {
-    id: "linear",
-    issueUrl: vi.fn().mockReturnValue("https://linear.app/issue/AII-900"),
-    markImplementationFailed: vi.fn(),
-  } as unknown as TicketingProvider;
-
+  const issue = makeIssue();
+  const mapping = makeMapping();
+  const provider = makeProvider();
   const prior = { count: 0, lastDispatchedAt: null };
 
   beforeEach(async () => {
-    vi.resetModules();
-    dbPath = path.join(
-      os.tmpdir(),
-      `dispatch-entrypoint-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-    );
-    process.env.DEDUP_DB_PATH = dbPath;
-    dedup = await import("../dedup.js");
-    gate = await import("../dispatch-gate.js");
-    breaker = await import("../dispatch-breaker.js");
-    breaker.initDispatchBreakerTable();
-    githubAppAuth = await import("../github-app-auth.js");
-    localDocker = await import("../local-docker.js");
-    indexModule = await import("../index.js");
-  });
-
-  afterEach(() => {
-    dedup.closeDb();
-    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+    ({ dedup, gate, admission, githubAppAuth, localDocker, planningLaunch, indexModule } = (await testDb({ modules: loaders })).modules);
   });
 
   it("dispatchGitHubActions: an installation-token mint failure after acquire releases the reservation", async () => {
     vi.mocked(githubAppAuth.getInstallationToken).mockRejectedValue(new Error("mint failed"));
-    const config = { githubAppId: "id", githubAppPrivateKey: "key" } as unknown as AppConfig;
 
     await expect(
-      indexModule.dispatchGitHubActions(config, provider, issue, mapping, prior, "default", mapping.defaultBranch, null),
+      indexModule.dispatchGitHubActions(makeAppConfig(), provider, issue, mapping, prior, "default", mapping.defaultBranch, null),
     ).rejects.toThrow("mint failed");
 
     // The exact reservation (same issue, same team) is free again, not just the count —
@@ -426,13 +394,7 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
 
   it("dispatchLocalDocker: a throw before markLaunchAttempted (installation-token mint failure) releases the reservation", async () => {
     vi.mocked(githubAppAuth.getInstallationToken).mockRejectedValue(new Error("mint failed"));
-    const config = {
-      githubAppId: "id",
-      githubAppPrivateKey: "key",
-      anthropicApiKey: "sk-test",
-      localRunnerImage: "test-image",
-      localRunnerOrchestratorUrl: "http://localhost:9000",
-    } as unknown as AppConfig;
+    const config = makeAppConfig({ anthropicApiKey: "sk-test" });
 
     await expect(
       indexModule.dispatchLocalDocker(config, provider, issue, mapping, prior, "default", mapping.defaultBranch, null),
@@ -455,13 +417,7 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
   it("dispatchLocalDocker: a throw after markLaunchAttempted (container launch failure) holds the reservation — docker's CLI response can be lost after the container was actually created (AII-783 review, second round, on PR #681)", async () => {
     vi.mocked(githubAppAuth.getInstallationToken).mockResolvedValue("gh-token");
     vi.mocked(localDocker.startLocalRunnerContainer).mockRejectedValue(new Error("docker run failed"));
-    const config = {
-      githubAppId: "id",
-      githubAppPrivateKey: "key",
-      anthropicApiKey: "sk-test",
-      localRunnerImage: "test-image",
-      localRunnerOrchestratorUrl: "http://localhost:9000",
-    } as unknown as AppConfig;
+    const config = makeAppConfig({ anthropicApiKey: "sk-test" });
 
     await expect(
       indexModule.dispatchLocalDocker(config, provider, issue, mapping, prior, "default", mapping.defaultBranch, null),
@@ -485,19 +441,10 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
   });
 
   describe("launchPlanningSession (AII-1053)", () => {
-    const planningConfig = {
-      githubAppId: "id",
-      githubAppPrivateKey: "key",
-      anthropicApiKey: "sk-test",
-      localRunnerImage: "test-image",
-      localRunnerOrchestratorUrl: "http://localhost:9000",
-      runnerCallbackBaseUrl: "http://localhost:9000",
-      runnerTokenSecret: "secret",
-    } as unknown as AppConfig;
+    const planningConfig = makeAppConfig({ anthropicApiKey: "sk-test" });
 
     async function launch(reservation?: import("../index.js").HeldReservation) {
-      const planning = await import("../planning-launch.js");
-      return planning.launchPlanningSession({
+      return planningLaunch.launchPlanningSession({
         config: planningConfig, provider, issue, mapping, execPath: "local-docker", runnerMode: "default",
         resolvedPlanningBranch: "main", planningFieldValue: null, reservation,
         deps: {
@@ -509,15 +456,12 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
       });
     }
 
-    beforeEach(async () => {
-      (await import("../log.js")).initLogTable();
+    beforeEach(() => {
       vi.mocked(githubAppAuth.getInstallationToken).mockResolvedValue("gh-token");
-      vi.mocked(localDocker.startLocalRunnerContainer).mockResolvedValue({ containerId: "c-1", containerName: "n" } as never);
-      (provider as unknown as Record<string, unknown>).markPlanningStarted = vi.fn().mockResolvedValue(undefined);
+      vi.mocked(localDocker.startLocalRunnerContainer).mockResolvedValue({ containerId: "c-1", containerName: "n" });
     });
 
     it("no reservation: acquires exactly one Legacy reservation", async () => {
-      const admission = await import("../dispatch-admission.js");
       const result = await launch();
       expect(result).toEqual({ outcome: "accepted", machineId: "c-1", executionMode: "local-docker" });
       const rows = dedup.getDb().prepare("SELECT dispatch_id FROM dispatch_admissions").all() as { dispatch_id: string }[];
@@ -560,57 +504,36 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
 // itself refused) must free the reservation, while "unknown" (e.g. a 5xx or a lost response)
 // must leave it held, since the run may have actually started. Only postWorkflowDispatch and
 // the image/workflow-contract probes are mocked; dedup/log/dispatch-breaker/dispatch-admission/
-// dispatch-gate all run for real against a temp sqlite db, so the assertions below check the
+// dispatch-gate all run for real against a test database, so the assertions below check the
 // actual reservation state, not a stub's call count.
 describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome admission release/hold (AII-783 review on PR #681)", () => {
-  let dbPath: string;
-  let dedup: typeof DedupModule;
+  const loaders = {
+    gate: () => import("../dispatch-gate.js"),
+    githubAppAuth: () => import("../github-app-auth.js"),
+    repoImage: () => import("../repo-image.js"),
+    workflowProbe: () => import("../workflow-probe.js"),
+    github: () => import("../github.js"),
+    indexModule: () => import("../index.js"),
+  };
   let gate: typeof GateModule;
-  let breaker: typeof BreakerModule;
-  let log: typeof import("../log.js");
   let indexModule: typeof import("../index.js");
   let githubAppAuth: typeof import("../github-app-auth.js");
   let repoImage: typeof import("../repo-image.js");
   let workflowProbe: typeof import("../workflow-probe.js");
   let github: typeof import("../github.js");
 
-  const issue: TicketIssue = {
-    id: "issue-result-outcome-1",
-    identifier: "AII-910",
-    title: "Test issue",
-    description: "desc",
-    scopeKey: "AII",
-    nativeStatus: "Todo",
-  };
-
-  const mapping = {
-    owner: "eudoxus",
-    repo: "AI-Implement",
-    workflowFile: "claude-implement.yml",
-    planningWorkflowFile: "claude-plan.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 1,
-    provider: "anthropic",
-    sessionMode: "default",
-    machineCpus: 1,
-    machineMemoryMb: 512,
-    extraEnv: {},
-  } as unknown as RepoMapping;
+  // A Jira issue is dispatched for implementation once its status reads "Plan Approved", and for planning while it reads "Ready".
+  const issue = makeIssue({ nativeStatus: "Plan Approved" });
+  const planningIssue = { ...issue, nativeStatus: "Ready" };
+  const mapping = jiraMapping("ENG");
 
   // provider.id is deliberately not "linear": buildPlanningContextInputs short-circuits to
   // NONE_CONTEXT without any network call whenever ticketingProviderId !== "linear", which
   // keeps this test independent of whether Linear auth env vars happen to be set.
-  const provider = {
-    id: "jira",
-    issueUrl: vi.fn().mockReturnValue("https://example.atlassian.net/browse/AII-910"),
-    markImplementationFailed: vi.fn(),
-    markPlanningFailed: vi.fn(),
-    markPlanningStarted: vi.fn().mockResolvedValue(undefined),
-    postComment: vi.fn().mockResolvedValue(undefined),
-  } as unknown as TicketingProvider;
+  const provider = jiraProvider();
 
   const prior = { count: 0, lastDispatchedAt: null };
-  const config = { githubAppId: "id", githubAppPrivateKey: "key" } as unknown as AppConfig;
+  const config = makeAppConfig();
 
   const planningCtx = {
     execPath: "github-actions" as const,
@@ -620,23 +543,7 @@ describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome a
   };
 
   beforeEach(async () => {
-    vi.resetModules();
-    dbPath = path.join(
-      os.tmpdir(),
-      `dispatch-outcome-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-    );
-    process.env.DEDUP_DB_PATH = dbPath;
-    dedup = await import("../dedup.js");
-    gate = await import("../dispatch-gate.js");
-    breaker = await import("../dispatch-breaker.js");
-    breaker.initDispatchBreakerTable();
-    log = await import("../log.js");
-    log.initLogTable();
-    githubAppAuth = await import("../github-app-auth.js");
-    repoImage = await import("../repo-image.js");
-    workflowProbe = await import("../workflow-probe.js");
-    github = await import("../github.js");
-    indexModule = await import("../index.js");
+    ({ gate, githubAppAuth, repoImage, workflowProbe, github, indexModule } = (await testDb({ modules: loaders })).modules);
 
     vi.mocked(githubAppAuth.getInstallationToken).mockResolvedValue("gh-token");
     vi.mocked(repoImage.resolveRunnerImageForDispatch).mockResolvedValue(undefined);
@@ -646,11 +553,6 @@ describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome a
       supportsAttemptCorrelation: false,
     });
     vi.mocked(workflowProbe.resolveWorkflowContract).mockResolvedValue("legacy");
-  });
-
-  afterEach(() => {
-    dedup.closeDb();
-    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   });
 
   it("dispatchGitHubActions: outcome 'rejected' releases the reservation", async () => {
@@ -707,7 +609,7 @@ describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome a
       outcome: "rejected",
     });
 
-    await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx);
+    await indexModule.dispatchPlanning(config, provider, planningIssue, mapping, planningCtx);
 
     const retry = gate.acquireDispatch({
       dispatchId: "retry-plan-rejected",
@@ -729,7 +631,7 @@ describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome a
       outcome: "unknown",
     });
 
-    await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx);
+    await indexModule.dispatchPlanning(config, provider, planningIssue, mapping, planningCtx);
 
     const retry = gate.acquireDispatch({
       dispatchId: "retry-plan-unknown",
@@ -755,11 +657,17 @@ describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome a
 // provider.id: "jira" alone makes buildPlanningContextInputs a no-op regardless of when
 // it runs.
 describe("dispatchPlanning defers buildPlanningContextInputs until after admission (AII-783 second review round on PR #681)", () => {
-  let dbPath: string;
-  let dedup: typeof DedupModule;
+  const loaders = {
+    gate: () => import("../dispatch-gate.js"),
+    githubAppAuth: () => import("../github-app-auth.js"),
+    repoImage: () => import("../repo-image.js"),
+    workflowProbe: () => import("../workflow-probe.js"),
+    github: () => import("../github.js"),
+    localDocker: () => import("../local-docker.js"),
+    planningContext: () => import("../planning-context.js"),
+    indexModule: () => import("../index.js"),
+  };
   let gate: typeof GateModule;
-  let breaker: typeof BreakerModule;
-  let log: typeof import("../log.js");
   let indexModule: typeof import("../index.js");
   let githubAppAuth: typeof import("../github-app-auth.js");
   let repoImage: typeof import("../repo-image.js");
@@ -768,41 +676,14 @@ describe("dispatchPlanning defers buildPlanningContextInputs until after admissi
   let localDocker: typeof import("../local-docker.js");
   let planningContext: typeof import("../planning-context.js");
 
-  const issue: TicketIssue = {
-    id: "issue-defer-context-1",
-    identifier: "AII-920",
-    title: "Test issue",
-    description: "desc",
-    scopeKey: "AII",
-    nativeStatus: "Todo",
-  };
-
-  const mapping = {
-    owner: "eudoxus",
-    repo: "AI-Implement",
-    workflowFile: "claude-implement.yml",
-    planningWorkflowFile: "claude-plan.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 1,
-    provider: "anthropic",
-    sessionMode: "default",
-    machineCpus: 1,
-    machineMemoryMb: 512,
-    extraEnv: {},
-  } as unknown as RepoMapping;
+  const issue = makeIssue();
+  const mapping = makeMapping({ maxInProgressAiIssues: 1 });
 
   // Linear-tracked, so buildPlanningContextInputs would take the real network-call
   // branch if it were ever reached — isLinearAuthConfigured() is false in this test env
   // (no Linear env vars set), so a *reached* call still resolves to NONE_CONTEXT rather
   // than throwing, but the mock records that it was invoked at all.
-  const provider = {
-    id: "linear",
-    issueUrl: vi.fn().mockReturnValue("https://linear.app/issue/AII-920"),
-    markImplementationFailed: vi.fn(),
-    markPlanningFailed: vi.fn(),
-    markPlanningStarted: vi.fn().mockResolvedValue(undefined),
-    postComment: vi.fn().mockResolvedValue(undefined),
-  } as unknown as TicketingProvider;
+  const provider = makeProvider();
 
   const planningCtx = {
     execPath: "github-actions" as const,
@@ -819,25 +700,8 @@ describe("dispatchPlanning defers buildPlanningContextInputs until after admissi
   };
 
   beforeEach(async () => {
-    vi.resetModules();
-    dbPath = path.join(
-      os.tmpdir(),
-      `dispatch-defer-context-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-    );
-    process.env.DEDUP_DB_PATH = dbPath;
-    dedup = await import("../dedup.js");
-    gate = await import("../dispatch-gate.js");
-    breaker = await import("../dispatch-breaker.js");
-    breaker.initDispatchBreakerTable();
-    log = await import("../log.js");
-    log.initLogTable();
-    githubAppAuth = await import("../github-app-auth.js");
-    repoImage = await import("../repo-image.js");
-    workflowProbe = await import("../workflow-probe.js");
-    github = await import("../github.js");
-    localDocker = await import("../local-docker.js");
-    planningContext = await import("../planning-context.js");
-    indexModule = await import("../index.js");
+    ({ gate, githubAppAuth, repoImage, workflowProbe, github, localDocker, planningContext, indexModule } =
+      (await testDb({ modules: loaders })).modules);
 
     vi.mocked(githubAppAuth.getInstallationToken).mockResolvedValue("gh-token");
     vi.mocked(repoImage.resolveRunnerImageForDispatch).mockResolvedValue(undefined);
@@ -852,11 +716,6 @@ describe("dispatchPlanning defers buildPlanningContextInputs until after admissi
     vi.mocked(localDocker.startLocalRunnerContainer).mockClear();
   });
 
-  afterEach(() => {
-    dedup.closeDb();
-    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
-  });
-
   it("GHA path: never fetches planning context when the team's capacity is already spent", async () => {
     const occupied = gate.acquireDispatch({
       dispatchId: "occupy-gha",
@@ -869,8 +728,7 @@ describe("dispatchPlanning defers buildPlanningContextInputs until after admissi
     });
     expect(occupied.ok).toBe(true);
 
-    const config = { githubAppId: "id", githubAppPrivateKey: "key" } as unknown as AppConfig;
-    await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx);
+    await indexModule.dispatchPlanning(makeAppConfig(), provider, issue, mapping, planningCtx);
 
     expect(planningContext.buildPlanningContextInputs).not.toHaveBeenCalled();
     expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
@@ -883,8 +741,7 @@ describe("dispatchPlanning defers buildPlanningContextInputs until after admissi
       outcome: "accepted",
     });
 
-    const config = { githubAppId: "id", githubAppPrivateKey: "key" } as unknown as AppConfig;
-    await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx);
+    await indexModule.dispatchPlanning(makeAppConfig(), provider, issue, mapping, planningCtx);
 
     expect(planningContext.buildPlanningContextInputs).toHaveBeenCalledTimes(1);
   });
@@ -901,15 +758,7 @@ describe("dispatchPlanning defers buildPlanningContextInputs until after admissi
     });
     expect(occupied.ok).toBe(true);
 
-    const config = {
-      githubAppId: "id",
-      githubAppPrivateKey: "key",
-      anthropicApiKey: "sk-test",
-      localRunnerImage: "ai-implement-runner:local",
-      healthPort: 8080,
-    } as unknown as AppConfig;
-
-    await indexModule.dispatchPlanning(config, provider, issue, mapping, localPlanningCtx);
+    await indexModule.dispatchPlanning(makeAppConfig(), provider, issue, mapping, localPlanningCtx);
 
     expect(planningContext.buildPlanningContextInputs).not.toHaveBeenCalled();
     expect(vi.mocked(localDocker.startLocalRunnerContainer)).not.toHaveBeenCalled();
@@ -920,77 +769,35 @@ describe("dispatchPlanning defers buildPlanningContextInputs until after admissi
 // implementation base is resolved — a child of a feature node plans against the feature
 // branch its implementation will build on, not unconditionally the repo default.
 describe("preparePlanningDispatch — feature-branch chain resolution (AII-898)", () => {
-  let dbPath: string;
-  let dedup: typeof DedupModule;
-  let log: typeof import("../log.js");
+  const loaders = {
+    githubAppAuth: () => import("../github-app-auth.js"),
+    github: () => import("../github.js"),
+    indexModule: () => import("../index.js"),
+  };
   let indexModule: typeof import("../index.js");
   let githubAppAuth: typeof import("../github-app-auth.js");
   let github: typeof import("../github.js");
 
-  const mapping = {
-    owner: "eudoxus",
-    repo: "AI-Implement",
-    workflowFile: "claude-implement.yml",
-    planningWorkflowFile: "claude-plan.yml",
-    defaultBranch: "testing",
-    maxInProgressAiIssues: 1,
-    executionMode: "github-actions",
-    provider: "anthropic",
-    sessionMode: "default",
-    machineCpus: 1,
-    machineMemoryMb: 512,
-    extraEnv: {},
-  } as unknown as RepoMapping;
-
-  const provider = {
-    id: "jira",
-    issueUrl: vi.fn().mockReturnValue("https://example.atlassian.net/browse/AII-930"),
-    markImplementationFailed: vi.fn(),
-    markPlanningFailed: vi.fn().mockResolvedValue(true),
-    markPlanningStarted: vi.fn().mockResolvedValue(undefined),
-    postComment: vi.fn().mockResolvedValue(undefined),
-  } as unknown as TicketingProvider;
-
-  const config = {
-    githubAppId: "id",
-    githubAppPrivateKey: "key",
-    runnerCallbackBaseUrl: "https://orchestrator.example",
-    runnerTokenSecret: "secret",
-  } as unknown as AppConfig;
+  const mapping = jiraMapping("AII", { defaultBranch: "testing" });
+  const provider = jiraProvider();
+  const config = makeAppConfig({ runnerCallbackBaseUrl: "https://orchestrator.example", runnerTokenSecret: "secret" });
 
   beforeEach(async () => {
-    vi.resetModules();
-    dbPath = path.join(
-      os.tmpdir(),
-      `prepare-planning-dispatch-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-    );
-    process.env.DEDUP_DB_PATH = dbPath;
-    dedup = await import("../dedup.js");
-    log = await import("../log.js");
-    log.initLogTable();
-    githubAppAuth = await import("../github-app-auth.js");
-    github = await import("../github.js");
-    indexModule = await import("../index.js");
+    ({ githubAppAuth, github, indexModule } = (await testDb({ modules: loaders })).modules);
 
     vi.mocked(githubAppAuth.getInstallationToken).mockResolvedValue("gh-token");
     vi.mocked(github.getBranchSha).mockClear();
   });
 
   afterEach(() => {
-    dedup.closeDb();
-    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
     vi.restoreAllMocks();
   });
 
-  const chainIssue: TicketIssue = {
-    id: "issue-chain-1",
+  const chainIssue = makeIssue({
     identifier: "AII-931",
-    title: "Child of a feature node",
-    description: "desc",
-    scopeKey: "AII",
-    nativeStatus: "Todo",
+    nativeStatus: "Ready",
     featureBranchChain: [{ identifier: "AII-682", mode: "feature" }],
-  };
+  });
 
   it("resolves to the feature branch when the chain's target branch already exists", async () => {
     vi.mocked(github.getBranchSha).mockResolvedValue("tip-sha");
@@ -1019,15 +826,11 @@ describe("preparePlanningDispatch — feature-branch chain resolution (AII-898)"
   });
 
   it("a Jira per-issue base field still wins over the chain, with no getBranchSha call", async () => {
-    const fieldIssue: TicketIssue = {
-      id: "issue-field-1",
+    const fieldIssue = makeIssue({
       identifier: "AII-932",
-      title: "Issue with a base branch field",
-      description: "desc",
-      scopeKey: "AII",
-      nativeStatus: "Todo",
+      nativeStatus: "Ready",
       baseBranch: "release/foo",
-    };
+    });
     vi.mocked(github.getBranchSha).mockResolvedValue("field-branch-sha");
 
     const ctx = await indexModule.preparePlanningDispatch(config, provider, fieldIssue, mapping);
@@ -1042,14 +845,7 @@ describe("preparePlanningDispatch — feature-branch chain resolution (AII-898)"
   });
 
   it("no chain and no field: resolves to the default branch, unchanged", async () => {
-    const flatIssue: TicketIssue = {
-      id: "issue-flat-1",
-      identifier: "AII-933",
-      title: "Flat issue",
-      description: "desc",
-      scopeKey: "AII",
-      nativeStatus: "Todo",
-    };
+    const flatIssue = makeIssue({ identifier: "AII-933", nativeStatus: "Ready" });
 
     const ctx = await indexModule.preparePlanningDispatch(config, provider, flatIssue, mapping);
 
@@ -1069,34 +865,22 @@ describe("preparePlanningDispatch — feature-branch chain resolution (AII-898)"
 // stale-admission-sweep floor. Exercised here against the real dispatch_admissions table
 // with a mocked local-docker backend (no network calls needed to observe termination).
 describe("tryFastReleasePlanningAdmission — fast release path for the planning callback (AII-783 review, third round, on PR #681)", () => {
-  let dbPath: string;
-  let dedup: typeof DedupModule;
+  const loaders = {
+    dispatchAdmission: () => import("../dispatch-admission.js"),
+    log: () => import("../log.js"),
+    localDocker: () => import("../local-docker.js"),
+    indexModule: () => import("../index.js"),
+  };
   let dispatchAdmission: typeof import("../dispatch-admission.js");
   let log: typeof import("../log.js");
   let indexModule: typeof import("../index.js");
   let localDocker: typeof import("../local-docker.js");
 
-  const config = { githubAppId: "id", githubAppPrivateKey: "key" } as unknown as AppConfig;
+  const config = makeAppConfig();
 
   beforeEach(async () => {
-    vi.resetModules();
-    dbPath = path.join(
-      os.tmpdir(),
-      `fast-release-admission-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-    );
-    process.env.DEDUP_DB_PATH = dbPath;
-    dedup = await import("../dedup.js");
-    dispatchAdmission = await import("../dispatch-admission.js");
-    log = await import("../log.js");
-    log.initLogTable();
-    localDocker = await import("../local-docker.js");
-    indexModule = await import("../index.js");
+    ({ dispatchAdmission, log, localDocker, indexModule } = (await testDb({ modules: loaders })).modules);
     vi.mocked(localDocker.inspectLocalContainer).mockClear();
-  });
-
-  afterEach(() => {
-    dedup.closeDb();
-    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   });
 
   function acquireAndLog(dispatchId: string): void {
@@ -1198,34 +982,22 @@ describe("tryFastReleasePlanningAdmission — fast release path for the planning
 // confirmAdmissionTerminated oracle against the real dispatch_admissions/dispatch_log
 // tables, the same way the fast-path block above does.
 describe("reconcileTerminalCallbackAdmissions — per-poll reconciliation for terminal callback conclusions (AII-783 gap-fill, third round, on PR #681)", () => {
-  let dbPath: string;
-  let dedup: typeof DedupModule;
+  const loaders = {
+    dispatchAdmission: () => import("../dispatch-admission.js"),
+    log: () => import("../log.js"),
+    localDocker: () => import("../local-docker.js"),
+    indexModule: () => import("../index.js"),
+  };
   let dispatchAdmission: typeof import("../dispatch-admission.js");
   let log: typeof import("../log.js");
   let indexModule: typeof import("../index.js");
   let localDocker: typeof import("../local-docker.js");
 
-  const config = { githubAppId: "id", githubAppPrivateKey: "key" } as unknown as AppConfig;
+  const config = makeAppConfig();
 
   beforeEach(async () => {
-    vi.resetModules();
-    dbPath = path.join(
-      os.tmpdir(),
-      `terminal-callback-admission-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-    );
-    process.env.DEDUP_DB_PATH = dbPath;
-    dedup = await import("../dedup.js");
-    dispatchAdmission = await import("../dispatch-admission.js");
-    log = await import("../log.js");
-    log.initLogTable();
-    localDocker = await import("../local-docker.js");
-    indexModule = await import("../index.js");
+    ({ dispatchAdmission, log, localDocker, indexModule } = (await testDb({ modules: loaders })).modules);
     vi.mocked(localDocker.inspectLocalContainer).mockClear();
-  });
-
-  afterEach(() => {
-    dedup.closeDb();
-    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   });
 
   function acquireLogAndFinalize(
@@ -1246,7 +1018,7 @@ describe("reconcileTerminalCallbackAdmissions — per-poll reconciliation for te
     if (!admitted.ok) throw new Error("test admission unexpectedly deferred");
     const jobId = log.appendLog({
       issueId,
-      issueIdentifier: issueId,
+      issueIdentifier: "AII-1",
       issueTitle: "Issue",
       teamKey: "AII",
       repo: "o/r",
@@ -1333,12 +1105,18 @@ describe("reconcileTerminalCallbackAdmissions — per-poll reconciliation for te
       lifecycleOwner: { kind: "legacy" },
       cap: 5,
     });
-    expect(stillRunning.ok).toBe(true);
+    if (!stillRunning.ok) throw new Error("test admission unexpectedly deferred");
     log.appendLog({
       issueId: "issue-2",
+      issueIdentifier: "AII-2",
+      issueTitle: "Issue",
+      teamKey: "AII",
+      repo: "o/r",
       dispatchId: "dispatch-running",
+      admissionGeneration: stillRunning.record.generation,
       executionMode: "local-docker",
       phase: "implementation",
+      machineId: "container-2",
     });
 
     const third = await dispatchAdmission.reconcileTerminalCallbackAdmissions((candidate) =>
@@ -1350,67 +1128,40 @@ describe("reconcileTerminalCallbackAdmissions — per-poll reconciliation for te
 });
 
 // AII-1023: the run lookup that follows an implementation dispatch must send the issue key,
-// so a run titled for another issue is never linked to this job. Only global fetch (the
-// simulated GitHub run listing) and postWorkflowDispatch are stubbed; findWorkflowRunId,
-// dedup and the job table are real.
+// so a run titled for another issue is never linked to this job. Only the GitHub run listing
+// (a fake fetch) and postWorkflowDispatch are stubbed; findWorkflowRunId, dedup and the job
+// table are real.
 describe("dispatchGitHubActions — run lookup is keyed by issue identifier (AII-1023)", () => {
-  let dbPath: string;
-  let dedup: typeof DedupModule;
+  const loaders = {
+    log: () => import("../log.js"),
+    githubAppAuth: () => import("../github-app-auth.js"),
+    repoImage: () => import("../repo-image.js"),
+    workflowProbe: () => import("../workflow-probe.js"),
+    github: () => import("../github.js"),
+    indexModule: () => import("../index.js"),
+  };
   let log: typeof import("../log.js");
   let indexModule: typeof import("../index.js");
   let githubAppAuth: typeof import("../github-app-auth.js");
   let repoImage: typeof import("../repo-image.js");
   let workflowProbe: typeof import("../workflow-probe.js");
   let github: typeof import("../github.js");
-  const realFetch = globalThis.fetch;
 
-  const issueA = "TOP-1";
-  const issueB: TicketIssue = {
-    id: "issue-lookup-b",
-    identifier: "TOP-2",
-    title: "Issue B",
-    description: "desc",
-    scopeKey: "TOP",
-    nativeStatus: "Todo",
-  };
-
-  const mapping = {
-    owner: "eudoxus",
-    repo: "AI-Implement",
-    workflowFile: "claude-implement.yml",
-    planningWorkflowFile: "claude-plan.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 5,
-    provider: "anthropic",
-    sessionMode: "default",
-    machineCpus: 1,
-    machineMemoryMb: 512,
-    extraEnv: {},
-  } as unknown as RepoMapping;
-
-  const provider = {
-    id: "jira",
-    issueUrl: vi.fn().mockReturnValue("https://example.atlassian.net/browse/TOP-2"),
-    markImplementing: vi.fn().mockResolvedValue(undefined),
-    markImplementationFailed: vi.fn(),
-    postComment: vi.fn().mockResolvedValue(undefined),
-  } as unknown as TicketingProvider;
-
+  const issueA = "ENG-2";
+  const issueB = makeIssue({ nativeStatus: "Plan Approved" });
+  const mapping = jiraMapping("ENG");
+  const provider = jiraProvider();
   const prior = { count: 0, lastDispatchedAt: null };
-  const config = { githubAppId: "id", githubAppPrivateKey: "key" } as unknown as AppConfig;
+  const config = makeAppConfig();
 
-  type ListedRun = { id: number; display_title?: string };
-  function listRuns(runs: ListedRun[]) {
+  type ListedRun = { id: number; display_title: string };
+  function listRuns(runs: ListedRun[]): FakeFetch {
     const created_at = new Date().toISOString();
-    globalThis.fetch = vi.fn(async (input: unknown) => {
-      if (String(input).includes("/actions/workflows/claude-implement.yml/runs")) {
-        return new Response(
-          JSON.stringify({ workflow_runs: runs.map((r) => ({ ...r, created_at })) }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        );
-      }
-      return new Response("{}", { status: 404 });
-    }) as unknown as typeof fetch;
+    return fakeFetch({
+      [`GET /repos/${mapping.owner}/${mapping.repo}/actions/workflows/${mapping.workflowFile}/runs`]: {
+        json: { total_count: runs.length, workflow_runs: runs.map((r) => ({ ...r, created_at })) },
+      },
+    }).install();
   }
 
   async function dispatchB(): Promise<number | null> {
@@ -1421,21 +1172,7 @@ describe("dispatchGitHubActions — run lookup is keyed by issue identifier (AII
   }
 
   beforeEach(async () => {
-    vi.resetModules();
-    dbPath = path.join(
-      os.tmpdir(),
-      `dispatch-lookup-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-    );
-    process.env.DEDUP_DB_PATH = dbPath;
-    dedup = await import("../dedup.js");
-    (await import("../dispatch-breaker.js")).initDispatchBreakerTable();
-    log = await import("../log.js");
-    log.initLogTable();
-    githubAppAuth = await import("../github-app-auth.js");
-    repoImage = await import("../repo-image.js");
-    workflowProbe = await import("../workflow-probe.js");
-    github = await import("../github.js");
-    indexModule = await import("../index.js");
+    ({ log, githubAppAuth, repoImage, workflowProbe, github, indexModule } = (await testDb({ modules: loaders })).modules);
 
     vi.mocked(githubAppAuth.getInstallationToken).mockResolvedValue("gh-token");
     vi.mocked(repoImage.resolveRunnerImageForDispatch).mockResolvedValue(undefined);
@@ -1445,13 +1182,7 @@ describe("dispatchGitHubActions — run lookup is keyed by issue identifier (AII
       supportsAttemptCorrelation: false,
     });
     vi.mocked(workflowProbe.resolveWorkflowContract).mockResolvedValue("legacy");
-    vi.mocked(github.postWorkflowDispatch).mockResolvedValue({ success: true, status: 204, outcome: "accepted" } as never);
-  });
-
-  afterEach(() => {
-    globalThis.fetch = realFetch;
-    dedup.closeDb();
-    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+    vi.mocked(github.postWorkflowDispatch).mockResolvedValue({ success: true, status: 204, outcome: "accepted" });
   });
 
   it("does not link a run titled for another issue", async () => {
@@ -1465,7 +1196,8 @@ describe("dispatchGitHubActions — run lookup is keyed by issue identifier (AII
   });
 
   it("falls back to an untitled run (old template)", async () => {
-    listRuns([{ id: 333 }]);
+    // A template without run-name leaves GitHub to title the run; here, the workflow's own name.
+    listRuns([{ id: 333, display_title: "Claude AI Implementation" }]);
     expect(await dispatchB()).toBe(333);
   });
 
@@ -1481,54 +1213,32 @@ describe("dispatchGitHubActions — run lookup is keyed by issue identifier (AII
 // AII-1021 / AII-1065: a project whose lifecycle switch is `restate` submits `PlanningRun`, which takes the
 // reservation in its first step; `dispatchPlanning` takes none and never launches. A `legacy` project keeps the current owner.
 describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
-  let dbPath: string;
+  const loaders = {
+    dedup: () => import("../dedup.js"),
+    admission: () => import("../dispatch-admission.js"),
+    github: () => import("../github.js"),
+    restateStatus: () => import("../restate/status.js"),
+    indexModule: () => import("../index.js"),
+  };
   let dedup: typeof DedupModule;
   let admission: typeof import("../dispatch-admission.js");
-  let gate: typeof GateModule;
   let indexModule: typeof import("../index.js");
   let github: typeof import("../github.js");
   let restateStatus: typeof import("../restate/status.js");
 
-  const issue: TicketIssue = {
-    id: "issue-pilot-1", identifier: "AII-1100", title: "Pilot", description: "d", scopeKey: "AII", nativeStatus: "Todo",
-  };
-  const baseMapping = {
-    owner: "eudoxus", repo: "AI-Implement", workflowFile: "claude-implement.yml", planningWorkflowFile: "claude-plan.yml",
-    defaultBranch: "main", maxInProgressAiIssues: 1, provider: "anthropic", sessionMode: "default",
-    machineCpus: 1, machineMemoryMb: 512, extraEnv: {},
-  };
-  const pilot = { ...baseMapping, reviewFixLifecycle: "restate" } as unknown as RepoMapping;
-  const legacyMapping = { ...baseMapping, reviewFixLifecycle: "legacy" } as unknown as RepoMapping;
-  const provider = {
-    id: "jira",
-    issueUrl: vi.fn().mockReturnValue("https://example.atlassian.net/browse/AII-1100"),
-    markImplementationFailed: vi.fn(), markPlanningFailed: vi.fn(),
-    markPlanningStarted: vi.fn().mockResolvedValue(undefined), postComment: vi.fn().mockResolvedValue(undefined),
-  } as unknown as TicketingProvider;
-  const config = { githubAppId: "id", githubAppPrivateKey: "key" } as unknown as AppConfig;
+  const issue = makeIssue({ identifier: "AII-1100", scopeKey: "AII", nativeStatus: "Ready" });
+  const pilot = jiraMapping("AII", { reviewFixLifecycle: "restate" });
+  const legacyMapping = jiraMapping("AII", { reviewFixLifecycle: "legacy" });
+  const provider = jiraProvider();
+  const config = makeAppConfig();
   const ctxFor = (execPath: "github-actions" | "fly-machines" | "local-docker") => ({
     execPath, runnerMode: "default", resolvedPlanningBranch: "main", planningFieldValue: "field-1",
   });
   const activeRows = () =>
     (dedup.getDb().prepare("SELECT dispatch_id FROM dispatch_admissions WHERE released_at IS NULL").all() as { dispatch_id: string }[]);
-  const implementationAcquire = (id: string, issueId: string) =>
-    gate.acquireDispatch({
-      dispatchId: id, issueId, issueIdentifier: "X", kind: "implementation", teamKey: "AII",
-      maxInProgressAiIssues: 5, backend: "github-actions",
-    });
 
   beforeEach(async () => {
-    vi.resetModules();
-    dbPath = path.join(os.tmpdir(), `dispatch-pilot-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-    process.env.DEDUP_DB_PATH = dbPath;
-    dedup = await import("../dedup.js");
-    gate = await import("../dispatch-gate.js");
-    admission = await import("../dispatch-admission.js");
-    (await import("../dispatch-breaker.js")).initDispatchBreakerTable();
-    (await import("../log.js")).initLogTable();
-    github = await import("../github.js");
-    restateStatus = await import("../restate/status.js");
-    indexModule = await import("../index.js");
+    ({ dedup, admission, github, restateStatus, indexModule } = (await testDb({ modules: loaders })).modules);
     restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
     planningIngress.submit.mockReset().mockResolvedValue({ status: "accepted" });
     vi.mocked(github.postWorkflowDispatch).mockReset();
@@ -1536,8 +1246,6 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
 
   afterEach(() => {
     restateStatus.resetRestateStatus();
-    dedup.closeDb();
-    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   });
 
   it.each(["github-actions", "fly-machines", "local-docker"] as const)("submits without taking a reservation, and without launching (%s)", async (backend) => {
@@ -1595,7 +1303,7 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
   });
 
   it("an issue the non-binding check refuses is not submitted", async () => {
-    dedup.markDispatched(issue.id, issue.scopeKey);
+    dedup.markDispatched(issue.id, issue.scopeKey, issue.identifier, issue.title);
     await indexModule.dispatchPlanning(config, provider, issue, pilot, ctxFor("github-actions"));
     expect(planningIngress.submit).not.toHaveBeenCalled();
   });
