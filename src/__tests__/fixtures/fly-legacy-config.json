@@ -1,0 +1,93 @@
+{
+  "a": {
+    "name": "session-eng-42",
+    "region": "iad",
+    "config": {
+      "image": "img",
+      "env": {
+        "ISSUE_ID": "id1",
+        "ISSUE_IDENTIFIER": "ENG-42",
+        "ISSUE_TITLE": "T",
+        "ISSUE_DESCRIPTION": "D",
+        "GITHUB_OWNER": "o",
+        "GITHUB_REPO": "r",
+        "GITHUB_DEFAULT_BRANCH": "main",
+        "GITHUB_TOKEN": "gt",
+        "SESSION_TOKEN": "st",
+        "MACHINE_NONCE": "n",
+        "SESSION_MODE": "autonomous",
+        "RUNNER_PHASE": "implementation",
+        "AI_IMPLEMENT_TEAM_SECRET_PREFIX": "ENG_",
+        "AI_IMPLEMENT_FOREIGN_SECRET_NAMES": "OPS_X"
+      },
+      "guest": {
+        "cpu_kind": "shared",
+        "cpus": 1,
+        "memory_mb": 1024
+      },
+      "auto_destroy": false,
+      "restart": {
+        "policy": "no"
+      },
+      "metadata": {
+        "purpose": "session",
+        "issue_id": "id1",
+        "issue_identifier": "ENG-42",
+        "repo": "o/r",
+        "session_mode": "autonomous"
+      }
+    }
+  },
+  "b": {
+    "name": "session-eng-42",
+    "region": "iad",
+    "config": {
+      "image": "img",
+      "env": {
+        "ISSUE_ID": "id1",
+        "ISSUE_IDENTIFIER": "ENG-42",
+        "ISSUE_TITLE": "T",
+        "ISSUE_DESCRIPTION": "D",
+        "GITHUB_OWNER": "o",
+        "GITHUB_REPO": "r",
+        "GITHUB_DEFAULT_BRANCH": "main",
+        "GITHUB_TOKEN": "gt",
+        "SESSION_TOKEN": "st",
+        "MACHINE_NONCE": "n",
+        "SESSION_MODE": "autonomous",
+        "RUNNER_PHASE": "implementation",
+        "AI_IMPLEMENT_FORWARDED_SECRETS": "DB"
+      },
+      "guest": {
+        "cpu_kind": "shared",
+        "cpus": 1,
+        "memory_mb": 1024
+      },
+      "auto_destroy": false,
+      "restart": {
+        "policy": "no"
+      },
+      "metadata": {
+        "purpose": "session",
+        "issue_id": "id1",
+        "issue_identifier": "ENG-42",
+        "repo": "o/r",
+        "session_mode": "autonomous"
+      },
+      "processes": [
+        {
+          "ignore_app_secrets": true,
+          "secrets": [
+            {
+              "env_var": "DB",
+              "name": "ENG_DB"
+            },
+            {
+              "env_var": "GLOBAL"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
