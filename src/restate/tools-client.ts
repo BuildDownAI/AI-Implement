@@ -103,6 +103,14 @@ export async function toolCatalog(deps: DiscoverToolsDeps = {}): Promise<Discove
   return discoverTools(deps);
 }
 
+/**
+ * Tools that still answer during a deploy hold (AII-1401). Both are short invocations that finish in
+ * milliseconds: `get_kg_status` is a read, and `decide_kg_refresh` resolves the durable promise a held
+ * KG refresh waits on, which is what lets the drain finish. Exact names only, compared before
+ * percent-encoding; every other tool answers `deploy-held`.
+ */
+const DEPLOY_HOLD_ALLOWED_TOOLS: ReadonlySet<string> = new Set(["get_kg_status", "decide_kg_refresh"]);
+
 export type CallToolResult =
   | { status: "ok"; content: Array<{ type: string; text: string }>; isError?: boolean }
   | { status: "unavailable" }
@@ -152,8 +160,11 @@ export async function callTool(
   deps: CallToolDeps = {},
 ): Promise<CallToolResult> {
   // Both MCP and POST /api/tools/<name> enter through this seam. Refuse before
-  // contacting the old endpoint once deployment has closed external admission.
-  if (!(deps.permitsExternalCall ?? (() => !isDeployHeld()))()) return { status: "deploy-held" };
+  // contacting the old endpoint once deployment has closed external admission, except for the
+  // two KG decision tools (DEPLOY_HOLD_ALLOWED_TOOLS); the Restate-ready check below still applies.
+  if (!DEPLOY_HOLD_ALLOWED_TOOLS.has(name) && !(deps.permitsExternalCall ?? (() => !isDeployHeld()))()) {
+    return { status: "deploy-held" };
+  }
   const restateReady =
     deps.restateReady ??
     (() => {

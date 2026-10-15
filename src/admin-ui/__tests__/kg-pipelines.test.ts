@@ -526,7 +526,7 @@ describe("kg current run card (AII-1260)", () => {
     partTable: [{ part: "<img src=x onerror=alert(1)>", prev: "100", new: "40" }],
   };
 
-  function mount(opts: { currentRun: Run | null; stage?: string; statusOk?: boolean; decideReply?: unknown; confirm?: boolean; deployPolls?: number; lastRefresh?: unknown }) {
+  function mount(opts: { currentRun: Run | null; stage?: string; statusOk?: boolean; decideReply?: unknown; confirm?: boolean; deployPolls?: number; lastRefresh?: unknown; deployHeld?: boolean }) {
     const dom = new JSDOM(`<!DOCTYPE html><body>${kgPipelinesHtml}</body>`, { runScripts: "dangerously", url: "http://localhost/admin#kg-pipelines" });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const win = dom.window as any;
@@ -543,7 +543,7 @@ describe("kg current run card (AII-1260)", () => {
         if (opts.deployPolls && opts.deployPolls-- > 0) return { ok: false, status: 409, json: async () => ({ error: "deploy-in-progress" }) };
         if (opts.statusOk === false) return { ok: false, status: 500, json: async () => ({}) };
         const stage = opts.stage ?? (opts.currentRun ? "ingest-running" : "serving");
-        return { ok: true, status: 200, json: async () => ({ stage, servedStamp: "abc", lastRefresh: opts.lastRefresh ?? null, currentRun: opts.currentRun }) };
+        return { ok: true, status: 200, json: async () => ({ stage, servedStamp: "abc", lastRefresh: opts.lastRefresh ?? null, currentRun: opts.currentRun, ...(opts.deployHeld !== undefined ? { deployHeld: opts.deployHeld } : {}) }) };
       }
       if (url === "/api/tools/decide_kg_refresh") {
         return { ok: true, status: 200, json: async () => opts.decideReply ?? { content: [{ type: "text", text: "{}" }] } };
@@ -604,6 +604,19 @@ describe("kg current run card (AII-1260)", () => {
     expect(cur.querySelector("a[href^=\"https\"]")?.getAttribute("href")).toBe("https://github.com/o/kg/pull/7");
     expect(m.visibleButtons()).toEqual(["Accept new baseline & refresh", "Cancel"]);
     expect(m.doc.getElementById("kg-refresh-badge")?.textContent).toContain("awaiting decision");
+  });
+
+  it("deployHeld 200 with a held run: Accept and Cancel stay enabled, Refresh disabled, deploy notice shown", async () => {
+    const m = mount({ currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held }, stage: "awaiting-decision", deployHeld: true });
+    await m.win.loadKgStatus();
+    expect((m.doc.getElementById("kg-accept-btn") as HTMLButtonElement).disabled).toBe(false);
+    expect((m.doc.getElementById("kg-cancel-btn") as HTMLButtonElement).disabled).toBe(false);
+    expect((m.doc.getElementById("kg-refresh-btn") as HTMLButtonElement).disabled).toBe(true);
+    expect(m.visibleButtons()).toEqual(["Accept new baseline & refresh", "Cancel"]);
+    expect(m.doc.getElementById("kg-refresh-last")?.textContent).toContain("A deploy is in progress");
+    const n = mount({ currentRun: null, deployHeld: false });
+    await n.win.loadKgStatus();
+    expect(n.doc.getElementById("kg-refresh-last")?.textContent).not.toContain("deploy");
   });
 
   it("re-enables Accept and Cancel after a deploy-in-progress poll", async () => {
