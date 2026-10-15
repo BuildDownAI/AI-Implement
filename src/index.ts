@@ -1161,6 +1161,11 @@ export async function dispatchGitHubActions(
       issue.scopeKey,
       refusalText({ kind: "refuse", category: "configuration-error", code: "gha_not_supported" }),
     );
+    // Count the refusal so a persistently refused issue parks instead of re-commenting every poll.
+    const _brGha = recordDispatchFailure(issue.id, "implementation", "gha_not_supported");
+    if (_brGha.tripped) {
+      await fireBreakerTrip(config, provider, issue.id, issue.identifier, "implementation", _brGha.failures, "gha_not_supported");
+    }
     return;
   }
 
@@ -1773,6 +1778,11 @@ export async function dispatchSession(
           await provider.markImplementationFailed(issue.id, issue.scopeKey, text);
         } else {
           await provider.markPlanningFailed(issue.id, issue.scopeKey, text);
+        }
+        // Count the refusal so a persistently refused issue parks instead of re-commenting every poll.
+        const _brRefuse = recordDispatchFailure(issue.id, opts.phase, decision.code);
+        if (_brRefuse.tripped) {
+          await fireBreakerTrip(config, provider, issue.id, issue.identifier, opts.phase, _brRefuse.failures, decision.code);
         }
       } else {
         console.log(`[poll] ${refusalText(decision)} (${issue.identifier})`);

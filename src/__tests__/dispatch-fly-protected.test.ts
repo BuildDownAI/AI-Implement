@@ -265,6 +265,14 @@ describe("opted-in Fly implementation", () => {
     expect(vi.mocked(provider.markImplementationFailed).mock.calls[0]![2]).toMatch(/Managed dispatch refused/);
   });
 
+  it("repeated refusals trip the breaker and park the issue", async () => {
+    visibility = "public";
+    for (let i = 0; i < 3; i++) await dispatchFly();
+    const row = dedup.getDb().prepare("SELECT consecutive_failures, parked_at FROM dispatch_breaker WHERE issue_id = ?").get(issue.id) as { consecutive_failures: number; parked_at: number | null };
+    expect(row.consecutive_failures).toBe(3);
+    expect(row.parked_at).not.toBeNull();
+  });
+
   it("a missing plan record refuses: no machine, admission released, one tracker failure", async () => {
     dedup.getDb().prepare("DELETE FROM model_session_generations").run();
     await dispatchFly();
@@ -328,6 +336,8 @@ describe("GitHub Actions and both mode", () => {
     expect(probe.resolveWorkflowCapabilities).not.toHaveBeenCalled();
     expect(provider.markImplementationFailed).toHaveBeenCalledOnce();
     expect(vi.mocked(provider.markImplementationFailed).mock.calls[0]![2]).toContain("gha_not_supported");
+    const row = dedup.getDb().prepare("SELECT consecutive_failures FROM dispatch_breaker WHERE issue_id = ?").get(issue.id) as { consecutive_failures: number };
+    expect(row.consecutive_failures).toBe(1);
   });
 });
 
