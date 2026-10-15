@@ -10,7 +10,6 @@ import type { TicketIssue, TicketingProvider } from "../providers/types.js";
 import type { RepoMapping } from "../config.js";
 import type { AppConfig } from "../index.js";
 import { shouldReleaseAdmissionOnDispatchError } from "../index.js";
-import { encodeRunConfig } from "../run-config.js";
 
 // Mocked only for the "pre-launch failure releases the reservation" describe block below —
 // dedup.js/log.js/dispatch-breaker.js/dispatch-admission.js/dispatch-gate.js stay real
@@ -461,6 +460,38 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
 
     const retry = gate.acquireDispatch({
       dispatchId: "retry-local-before",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      kind: "implementation",
+      teamKey: issue.scopeKey,
+      maxInProgressAiIssues: 1,
+      backend: "local-docker",
+    });
+    expect(retry.ok).toBe(true);
+  });
+
+  it("dispatchLocalDocker: a run-token mint failure releases the reservation and never calls the backend", async () => {
+    vi.mocked(githubAppAuth.getInstallationToken).mockResolvedValue("gh-token");
+    const config = {
+      githubAppId: "id",
+      githubAppPrivateKey: "key",
+      anthropicApiKey: "sk-test",
+      localRunnerImage: "test-image",
+      localRunnerOrchestratorUrl: "http://localhost:9000",
+      runnerCallbackBaseUrl: "http://localhost:9000",
+      runnerTokenSecret: "secret",
+    } as unknown as AppConfig;
+    // Make every mint throw without touching the code under test.
+    dedup.getDb().exec("DROP TABLE runner_tokens");
+
+    await expect(
+      indexModule.dispatchLocalDocker(config, provider, issue, mapping, prior, "default", mapping.defaultBranch, null),
+    ).rejects.toThrow(/runner_tokens/);
+
+    expect(localDocker.startLocalRunnerContainer).not.toHaveBeenCalled();
+
+    const retry = gate.acquireDispatch({
+      dispatchId: "retry-local-mint",
       issueId: issue.id,
       issueIdentifier: issue.identifier,
       kind: "implementation",
@@ -1001,7 +1032,7 @@ describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome a
       expect(inputs.run_progress_token).toBeTruthy();
     });
 
-    it("planning: probes the planning workflow; private carries result only, no progress/publication", async () => {
+    it("planning: probes the planning workflow; private carries result and progress, no publication", async () => {
       const { decodeTrustedRunConfig } = await import("../run-config.js");
       vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue(envelopeCaps(true));
       await indexModule.dispatchPlanning(tokenConfig, provider, issue, mapping, planningCtx);
@@ -1011,7 +1042,8 @@ describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome a
       const inputs = sent().inputs;
       const creds = decodeTrustedRunConfig(inputs.run_config!).credentials;
       expect(creds?.resultToken).toBeTruthy();
-      expect(creds?.progressToken).toBeUndefined();
+      // Planning mints a progress token since AII-1320; it rides inside the private credentials.
+      expect(creds?.progressToken).toBeTruthy();
       expect(creds?.publicationToken).toBeUndefined();
       expect(inputs.run_token).toBe("");
       expect("run_progress_token" in inputs).toBe(false);
@@ -1109,7 +1141,7 @@ describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome a
       const inputs = vi.mocked(github.postWorkflowDispatch).mock.calls[0]![0].inputs;
       const creds = decodeTrustedRunConfig(inputs.run_config!).credentials!;
       expect(creds.publicationToken).toBeUndefined();
-      expect(creds.progressToken).toBeUndefined();
+      expect(creds.progressToken).toBeTruthy();
       expect(creds.resultToken).toBeTruthy();
       expect(creds.resultToken).not.toBe("supplied-res");
       expect(creds.attemptToken).toBe("private-attempt-secret");
@@ -1938,7 +1970,6 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
   let dbPath: string;
   let dedup: typeof DedupModule;
   let admission: typeof import("../dispatch-admission.js");
-  let gate: typeof GateModule;
   let indexModule: typeof import("../index.js");
   let github: typeof import("../github.js");
   let restateStatus: typeof import("../restate/status.js");
@@ -1965,18 +1996,12 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
   });
   const activeRows = () =>
     (dedup.getDb().prepare("SELECT dispatch_id FROM dispatch_admissions WHERE released_at IS NULL").all() as { dispatch_id: string }[]);
-  const implementationAcquire = (id: string, issueId: string) =>
-    gate.acquireDispatch({
-      dispatchId: id, issueId, issueIdentifier: "X", kind: "implementation", teamKey: "AII",
-      maxInProgressAiIssues: 5, backend: "github-actions",
-    });
 
   beforeEach(async () => {
     vi.resetModules();
     dbPath = path.join(os.tmpdir(), `dispatch-pilot-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
     process.env.DEDUP_DB_PATH = dbPath;
     dedup = await import("../dedup.js");
-    gate = await import("../dispatch-gate.js");
     admission = await import("../dispatch-admission.js");
     (await import("../dispatch-breaker.js")).initDispatchBreakerTable();
     (await import("../log.js")).initLogTable();

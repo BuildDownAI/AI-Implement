@@ -173,6 +173,28 @@ describe("runAutoMerges — repository-fix review process", () => {
     expect(vi.mocked(mergePullRequest)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(listCheckRuns)).not.toHaveBeenCalled();
   });
+
+  it("holds under the ai-implement process on a blocking finding seen at or after the head's commit (AII-1291)", async () => {
+    await setup();
+    vi.mocked(getCommitTime).mockResolvedValue(Date.now() - 60_000);
+    const ledger = await import("../review-ledger-store.js");
+    ledger.upsertReviewFinding({ repo: "BuildDownAI/AI-Implement", prNumber: 5, source: "github-review", severity: "blocking", body: "bug" });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    await autoMerge.runAutoMerges([mapping({ reviewProcess: "ai-implement" })], deps());
+    expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith("[auto-merge] Holding PR #5 -> ai-implement/feature/aii-200-feat: blocking finding on current head");
+    logSpy.mockRestore();
+  });
+
+  it("merges under the ai-implement process when the finding predates the head, with no review check on the repo (AII-1291)", async () => {
+    await setup();
+    vi.mocked(getCommitTime).mockResolvedValue(Date.now() + 60_000);
+    const ledger = await import("../review-ledger-store.js");
+    ledger.upsertReviewFinding({ repo: "BuildDownAI/AI-Implement", prNumber: 5, source: "github-review", severity: "blocking", body: "bug" });
+    await autoMerge.runAutoMerges([mapping({ reviewProcess: "ai-implement" })], deps());
+    expect(vi.mocked(mergePullRequest)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(listCheckRuns)).not.toHaveBeenCalled();
+  });
 });
 
 describe("runAutoMerges", () => {

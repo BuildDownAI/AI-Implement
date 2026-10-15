@@ -288,7 +288,7 @@ describe("jobs table", () => {
   });
 
   it("getInFlightJobs returns only dispatched and running jobs", () => {
-    const id1 = log.appendLog({ issueId: "issue-1" });
+    log.appendLog({ issueId: "issue-1" });
     const id2 = log.appendLog({ issueId: "issue-2" });
     const id3 = log.appendLog({ issueId: "issue-3" });
 
@@ -314,7 +314,7 @@ describe("jobs table", () => {
   it("getUnnotifiedTerminalJobs returns terminal jobs that haven't been notified", () => {
     const id1 = log.appendLog({ issueId: "issue-1" });
     const id2 = log.appendLog({ issueId: "issue-2" });
-    const id3 = log.appendLog({ issueId: "issue-3" });
+    log.appendLog({ issueId: "issue-3" });
 
     log.updateJobStatus(id1, "completed", "success");
     log.updateJobStatus(id2, "failed", "failure");

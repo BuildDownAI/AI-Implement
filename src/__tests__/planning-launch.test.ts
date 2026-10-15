@@ -131,7 +131,8 @@ describe("preparePlanningLaunch", () => {
     expect(trusted.baseBranch).toBe("feature/base");
     expect(trusted.credentials?.resultToken).toBeTruthy();
     expect(trusted.credentials?.attemptToken).toBe("attempt-private");
-    expect(trusted.credentials?.progressToken).toBeUndefined();
+    // Planning mints a progress token since AII-1320; it rides inside the private credentials.
+    expect(trusted.credentials?.progressToken).toBeTruthy();
     expect(trusted.credentials?.publicationToken).toBeUndefined();
     expect(inputs.run_token).toBe("");
     expect("run_progress_token" in inputs).toBe(false);
@@ -570,7 +571,9 @@ describe("preparePlanningLaunch for an opted-in project", () => {
     vi.mocked(managed.isManagedProject).mockReturnValue(true);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // The mocked module survives vi.resetModules, so restore the opted-out default for later blocks.
+    vi.mocked((await import("../managed-dispatch-auth.js")).isManagedProject).mockReturnValue(false);
     dedup.closeDb();
     try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   });
@@ -598,5 +601,51 @@ describe("preparePlanningLaunch for an opted-in project", () => {
     expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
     expect(fireBreakerTrip).toHaveBeenCalledTimes(1);
     expect(breaker.isParked("i-gha", "planning")).toBe(true);
+  });
+});
+
+describe("preparePlanningLaunch tokens", () => {
+  let dbPath: string;
+  let dedup: typeof import("../dedup.js");
+
+  beforeEach(async () => {
+    vi.resetModules();
+    dbPath = path.join(os.tmpdir(), `planning-prepare-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
+    process.env.DEDUP_DB_PATH = dbPath;
+    dedup = await import("../dedup.js");
+    dedup.getDb();
+    const auth = await import("../github-app-auth.js");
+    vi.mocked(auth.getInstallationToken).mockResolvedValue("gh-token");
+    // This file mocks resolveWorkflowCapabilities (private transport probe); an envelope workflow without the marker.
+    vi.mocked((await import("../workflow-probe.js")).resolveWorkflowCapabilities).mockResolvedValue({
+      contract: "envelope",
+      supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
+      supportsPrivateRunConfig: false,
+    });
+  });
+
+  afterEach(() => {
+    dedup.closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  it("sends run_progress_token in the envelope inputs and mints no publication token", async () => {
+    const mod = await import("../planning-launch.js");
+    const launch = await mod.preparePlanningLaunch({
+      config: { githubAppId: "id", githubAppPrivateKey: "key", runnerCallbackBaseUrl: "http://cb", runnerTokenSecret: "secret" } as unknown as AppConfig,
+      provider: { id: "linear" } as unknown as TicketingProvider,
+      issue: { id: "i-1", identifier: "AII-1", title: "t", description: "d", scopeKey: "AII", nativeStatus: "Todo" } as TicketIssue,
+      mapping: { owner: "eudoxus", repo: "AI-Implement", workflowFile: "w.yml", planningWorkflowFile: "p.yml", defaultBranch: "main" } as unknown as RepoMapping,
+      dispatchId: "d-prep-1",
+      resolvedPlanningBranch: "main",
+      resolveRunnerImage: async () => undefined,
+    });
+    const inputs = launch.planningDispatchInputs as Record<string, string>;
+    expect(inputs.run_token).toBeTruthy();
+    expect(inputs.run_progress_token).toBeTruthy();
+    expect(inputs.run_publication_token).toBeUndefined();
+    const rows = dedup.getDb().prepare("SELECT audience FROM runner_tokens WHERE dispatch_id = 'd-prep-1' ORDER BY audience").all();
+    expect(rows).toEqual([{ audience: "progress" }, { audience: "result" }]);
   });
 });

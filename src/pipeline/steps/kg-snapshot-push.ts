@@ -3,6 +3,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { refreshRunnerGithubCredentials } from "../../runner-token.js";
+import { getPublicationCredential } from "../../publication-credential.js";
 import { openOrFindPullRequest } from "../step-utils.js";
 import { postPrComment } from "../../github.js";
 import { readCodeRepoFromSourcesYml, readSecondaryReposFromSourcesYml } from "./kg-tracker-data.js";
@@ -755,12 +756,17 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     // ── 6. Push to a per-refresh branch and open the refresh PR ──────────────
     // Refresh the dispatch-time token immediately before the push — the same
     // pattern as push.ts. In Fly/local-docker mode the machine nonce re-mints a
-    // fresh token; in GHA mode this returns the current token unchanged.
+    // fresh token; in GHA mode the single-use publication credential does (the
+    // dispatch-time token expires after ~1h, which a long ingest can outlast).
+    // Read after the dry-run exit so a dry run never consumes the credential;
+    // no earlier kg-refresh step exchanges it. Absent when the workflow does not
+    // support it, in which case the current token comes back unchanged.
     const activeGithubToken = await refreshRunnerGithubCredentials({
       currentToken: githubToken,
       orchestratorUrl: inputs.orchestratorUrl,
       machineNonce: inputs.machineNonce,
       callbackUrl: inputs.callbackUrl,
+      publicationToken: getPublicationCredential(),
       owner: repoOwner ?? "",
       repo: repoRepo ?? "",
       workspaceDir,

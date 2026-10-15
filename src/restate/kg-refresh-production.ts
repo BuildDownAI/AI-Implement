@@ -7,7 +7,6 @@
 import { createHmac } from "node:crypto";
 import * as restateClients from "@restatedev/restate-sdk-clients";
 import { getMappings } from "../config.js";
-import { getDb } from "../dedup.js";
 import type { AppConfig } from "../index.js";
 import { getFlySessionsConfig } from "../orchestrator-settings.js";
 import {
@@ -29,7 +28,7 @@ import { resolveWorkflowCapabilities } from "../workflow-probe.js";
 import { buildKgRefreshRunConfig } from "../run-config.js";
 import { readBackendRun, stopBackendRun } from "../backend-run.js";
 import { getRunnerMode, getKgExecutionMode, resolveKgBackend, type KgBackendResolution } from "../runner-mode.js";
-import { mintRunToken } from "../runner-tokens.js";
+import { mintLaunchTokens } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
 import { appendLogIfAbsent, findLogIdByDispatchId, setJobMachineId, setJobMachineNonce, updateJobPrUrl, updateJobRunId } from "../log.js";
 import { clearMachineEnv, createMachine, destroyMachine, getMachine, listMachines, startMachine, updateMachine, waitForMachine, waitForMachineSettled, type CreateMachineOpts, type Machine, type MachineConfig, type SettleOptions } from "../fly-machines.js";
@@ -389,14 +388,15 @@ export function createProductionKgRefreshServices(
       if (!config.runnerTokenSecret) throw new Error("RUNNER_TOKEN_SECRET is not configured");
       const mappingTeamKey = findKgMapping(input.kgSourceRepo)?.[0];
       if (mappingTeamKey === undefined) throw new Error(`no project mapping found for kgSourceRepo=${input.kgSourceRepo}`);
-      // Idempotent across processes: a replay after a crash before the dispatch step journaled re-mints for the same
-      // dispatch id, so clear any unconsumed rows first (the primary key is (dispatch_id, audience)).
-      getDb().prepare("DELETE FROM runner_tokens WHERE dispatch_id = ? AND consumed_at IS NULL").run(dispatchId);
-      const base = { issueId: "kg-refresh", mappingTeamKey, phase: "kg-refresh" as const, dispatchId, ttlSeconds, secret: config.runnerTokenSecret };
+      // mintLaunchTokens clears the dispatch's unconsumed rows first, so a replay re-mints for the same dispatch id.
+      const minted = mintLaunchTokens({
+        issueId: "kg-refresh", mappingTeamKey, phase: "kg-refresh", dispatchId, ttlSeconds,
+        secret: config.runnerTokenSecret, repository: input.kgSourceRepo,
+      });
       return {
-        runToken: mintRunToken({ ...base, audience: "result" }).token,
-        progressToken: mintRunToken({ ...base, audience: "progress" }).token,
-        publicationToken: mintRunToken({ ...base, audience: "publication", repository: input.kgSourceRepo }).token,
+        runToken: minted.runToken,
+        progressToken: minted.runProgressToken,
+        publicationToken: minted.runPublicationToken!,
       };
     },
     dispatch: createKgRefreshDispatch(input),
@@ -580,7 +580,7 @@ export function createKgRefreshIngressClient(
     report: (triggerId, body, opts) =>
       invoke<{ status: "accepted" | "duplicate" }>(() => refresh(triggerId).report(body, callOpts(opts?.idempotencyKey)), { notFound: true, conflict: true }),
     progress: (triggerId, step) => invoke(() => refresh(triggerId).progress(step ? { step } : {}, callOpts()), { notFound: true }),
-    cancel: (triggerId, reason) => invoke(() => refresh(triggerId).cancel({ reason }, callOpts()), { notFound: true }),
+    cancel: (triggerId, reason) => invoke(() => refresh(triggerId).cancel({ reason }, callOpts()), { notFound: true, conflict: true, conflictText: true }),
     decide: (triggerId, input) => invoke(() => refresh(triggerId).decide(input, callOpts()), { notFound: true, conflict: true, conflictText: true }),
     status: (triggerId) => invoke<KgRefreshStatusResult>(() => refresh(triggerId).status(callOpts()), { notFound: true }),
     repoStatus: (slug) => invoke<{ triggerId: string; startedAt: number } | null>(() => repo(slug).status(callOpts())),

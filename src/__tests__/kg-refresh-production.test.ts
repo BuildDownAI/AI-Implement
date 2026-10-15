@@ -95,7 +95,7 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
       localRunnerImage: "local:img", localRunnerOrchestratorUrl: null, healthPort: 8080,
       anthropicApiKey: null, claudeOAuthToken: null,
     },
-    mintToken: vi.fn(async () => ({ token: "gh-token", expiresAt: "" })),
+    mintToken: vi.fn(async () => ({ token: "gh-token", expiresAt: "", installationId: 1 })),
     fetchTarball: noop as never,
     fetchDefaultBranch: vi.fn(async () => "main"),
     fetchSnapshotCommitSha: vi.fn(async () => null),
@@ -632,10 +632,10 @@ describe("createKgRefreshIngressClient", () => {
     expect(result).toEqual({ status: "accepted", value: { status: "duplicate" } });
   });
 
-  it("maps a 409 from report to conflict, and only from report", async () => {
+  it("maps a 409 from report to conflict, and cancel's 409 to conflict with the handler's text", async () => {
     const body = JSON.stringify({ code: 409, message: "report rejected" });
     expect(await clientWith(respond(409, body)).report("t-1", { ok: true })).toEqual({ status: "conflict" });
-    expect(await clientWith(respond(409, body)).cancel("t-1", "stop")).toEqual({ status: "unavailable" });
+    expect(await clientWith(respond(409, body)).cancel("t-1", "stop")).toEqual({ status: "conflict", error: "report rejected" });
     // A 500 carrying the same body is not a conflict.
     expect(await clientWith(respond(500, body)).report("t-1", { ok: true })).toEqual({ status: "unavailable" });
   });

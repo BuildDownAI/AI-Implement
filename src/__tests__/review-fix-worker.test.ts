@@ -6,8 +6,7 @@
  * mocking global `fetch`, since the transport is the seam AII-793's approved
  * amendment asks for explicitly.
  *
- * `npm run typecheck` excludes `src/__tests__`; this file is additionally
- * type-checked via `npx tsc --noEmit -p tsconfig.review-fix-worker-tests.json`.
+ * This file is type-checked by `npm run typecheck` (its `tsconfig.tests.json` pass).
  */
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import os from "node:os";
@@ -633,6 +632,21 @@ describe("GithubReviewFixWorker.launch", () => {
     }
   });
 
+  it("returns rejected, and does not dispatch, when the runner image is refused", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    const { RunnerImageNotAllowedError } = await import("../repo-image.js");
+    const worker = new workerModule.GithubReviewFixWorker({
+      credentials: resolver, transport: t.transport,
+      runnerImage: async () => { throw new RunnerImageNotAllowedError("evil.example/runner:1", "eudoxus", ["ghcr.io/builddownai/"], "ai-implement"); },
+    });
+    const outcome = await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-img5" })));
+    expect(outcome.status).toBe("rejected");
+    expect((outcome as { reason: string }).reason).toContain("evil.example/runner:1");
+    expect(t.dispatchCalls).toHaveLength(0);
+  });
+
   it("omits runnerCallbackUrl from the run config when none is configured", async () => {
     seedMapping();
     const { resolver } = makeCredentials();
@@ -644,6 +658,28 @@ describe("GithubReviewFixWorker.launch", () => {
     const dispatched = t.dispatchCalls[0] as { inputs: Record<string, unknown> };
     const runConfig = JSON.parse(Buffer.from(dispatched.inputs.run_config as string, "base64").toString("utf8"));
     expect(runConfig).not.toHaveProperty("runnerCallbackUrl");
+  });
+
+  it("stamps the stored retry policy, read at launch time, and defaults when no dep is given", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9010 }));
+    const { DEFAULT_RETRY_POLICY } = await import("../pipeline/retry-backoff.js");
+    const decode = (i: number) => JSON.parse(Buffer.from((t.dispatchCalls[i] as { inputs: Record<string, unknown> }).inputs.run_config as string, "base64").toString("utf8"));
+
+    let policy = { ...DEFAULT_RETRY_POLICY, stageRetries: 7 };
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, retryPolicy: () => policy });
+    await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-retry-1" })));
+    expect(decode(0).retryPolicy).toEqual(policy);
+
+    policy = { ...DEFAULT_RETRY_POLICY, stageRetries: 9 };
+    await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-retry-2" })));
+    expect(decode(1).retryPolicy).toEqual(policy);
+
+    const plain = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    await plain.launch(await plain.prepare(makeAttempt({ attemptId: "attempt-retry-3" })));
+    expect(decode(2).retryPolicy).toEqual(DEFAULT_RETRY_POLICY);
   });
 
   it("omits dependencyTokenScope from the run config when the mapping has none set", async () => {

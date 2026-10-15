@@ -23,7 +23,7 @@ function writeShim(binDir: string, name: string, body: string): void {
 describe("session/git-credential-helper.sh", () => {
   it("passes shellcheck cleanly", () => {
     const r = spawnSync("shellcheck", ["session/git-credential-helper.sh"], { stdio: ["ignore", "pipe", "pipe"] });
-    if (r.error?.code === "ENOENT") return; // skip when shellcheck not installed
+    if ((r.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return; // skip when shellcheck not installed
     expect(r.status).toBe(0);
   });
 
@@ -220,7 +220,7 @@ describe("session/entrypoint.sh", () => {
       ["session/entrypoint.sh", "docker-entrypoint.sh"],
       { stdio: ["ignore", "pipe", "pipe"] },
     );
-    if (r.error?.code === "ENOENT") return; // skip when shellcheck not installed
+    if ((r.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return; // skip when shellcheck not installed
     expect(r.status, r.stderr?.toString()).toBe(0);
   });
 
@@ -400,7 +400,7 @@ describe("session/entrypoint.sh", () => {
 describe("session/lib.sh", () => {
   it("passes shellcheck", () => {
     const r = spawnSync("shellcheck", ["session/lib.sh"], { stdio: ["ignore", "pipe", "pipe"] });
-    if (r.error?.code === "ENOENT") return;
+    if ((r.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return;
     expect(r.status, r.stderr?.toString()).toBe(0);
   });
 

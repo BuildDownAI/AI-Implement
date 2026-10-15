@@ -525,7 +525,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
           ],
         }),
       ]);
-      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
       expect(snap.needsPlanning).toEqual([]);
       expect(snap.readyForImplementation).toEqual([]);
       expect(snap.parentsToFinalize).toEqual([
@@ -545,7 +545,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
           ],
         }),
       ]);
-      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
       expect(snap.needsPlanning).toEqual([]);
       expect(snap.readyForImplementation).toEqual([]);
       expect(snap.parentsToFinalize).toEqual([
@@ -566,7 +566,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
           ],
         }),
       ]);
-      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
       const parent = snap.needsPlanning.find((i) => i.id === "parent")!;
       expect(parent.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
       expect(snap.parentsToFinalize).toEqual([]);

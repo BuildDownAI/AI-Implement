@@ -1,5 +1,6 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { resolveSessionImage, resolveDefaultRunnerImage, selectRunnerImageInput, resolveRunnerImageForDispatch, resolveChannelCommit, stripImageTag, __clearRepoImageCacheForTests } from "../repo-image.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resolveSessionImage, resolveDefaultRunnerImage, selectRunnerImageInput, resolveRunnerImageForDispatch, resolveChannelCommit, stripImageTag, isRunnerImageAllowed, RunnerImageNotAllowedError, __clearRepoImageCacheForTests } from "../repo-image.js";
+import * as settings from "../orchestrator-settings.js";
 
 const DEFAULT_IMAGE = "ghcr.io/builddownai/ai-implement-runner:latest";
 
@@ -36,7 +37,7 @@ describe("resolveSessionImage", () => {
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(result).toEqual({ image: "ghcr.io/acme/my-runner:v3", source: "override" });
     expect(fetchImpl).toHaveBeenCalledOnce();
@@ -49,7 +50,7 @@ describe("resolveSessionImage", () => {
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(result).toEqual({ image: DEFAULT_IMAGE, source: "default" });
   });
@@ -61,7 +62,7 @@ describe("resolveSessionImage", () => {
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(result).toEqual({ image: DEFAULT_IMAGE, source: "default" });
   });
@@ -73,7 +74,7 @@ describe("resolveSessionImage", () => {
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(result).toEqual({ image: DEFAULT_IMAGE, source: "default" });
   });
@@ -85,7 +86,7 @@ describe("resolveSessionImage", () => {
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(result).toEqual({ image: DEFAULT_IMAGE, source: "default" });
   });
@@ -99,7 +100,7 @@ describe("resolveSessionImage", () => {
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(result).toEqual({ image: digestRef, source: "override" });
   });
@@ -114,7 +115,7 @@ describe("resolveSessionImage", () => {
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(result).toEqual({ image: "ghcr.io/acme/my-runner:v3", source: "override" });
   });
@@ -126,14 +127,14 @@ describe("resolveSessionImage", () => {
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(fetchImpl).toHaveBeenCalledOnce();
   });
@@ -145,14 +146,14 @@ describe("resolveSessionImage", () => {
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     const b = await resolveSessionImage({
       owner: "acme",
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(a).toEqual({ image: DEFAULT_IMAGE, source: "default" });
     expect(b).toEqual({ image: DEFAULT_IMAGE, source: "default" });
@@ -166,7 +167,7 @@ describe("resolveSessionImage", () => {
       repo: "widgets",
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(result).toEqual({ image: DEFAULT_IMAGE, source: "default" });
   });
@@ -245,7 +246,7 @@ describe("resolveRunnerImageForDispatch", () => {
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
       runnerImageExplicit: false,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(image).toBe("ghcr.io/acme/my-runner:v3");
   });
@@ -258,7 +259,7 @@ describe("resolveRunnerImageForDispatch", () => {
       token: "ghs_xxx",
       defaultImage: "ghcr.io/builddownai/ai-implement-runner:next",
       runnerImageExplicit: true,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(image).toBe("ghcr.io/builddownai/ai-implement-runner:next");
   });
@@ -271,7 +272,7 @@ describe("resolveRunnerImageForDispatch", () => {
       token: "ghs_xxx",
       defaultImage: DEFAULT_IMAGE,
       runnerImageExplicit: false,
-      fetchImpl,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(image).toBeUndefined();
   });
@@ -532,5 +533,84 @@ describe("resolveChannelCommit", () => {
     const result = await resultPromise;
     expect(result).toBeNull();
     vi.useRealTimers();
+  });
+});
+
+describe("isRunnerImageAllowed", () => {
+  it("trusts the built-in prefixes and the lowercased owner", () => {
+    expect(isRunnerImageAllowed("ghcr.io/builddownai/r:1", "acme", [])).toBe(true);
+    expect(isRunnerImageAllowed("ghcr.io/acme/r:1", "Acme", [])).toBe(true);
+  });
+
+  it("refuses a namespace that only shares the owner as a string prefix", () => {
+    expect(isRunnerImageAllowed("ghcr.io/acme-evil/x:1", "acme", [])).toBe(false);
+  });
+
+  it("matches extra prefixes literally", () => {
+    expect(isRunnerImageAllowed("ghcr.io/axb/r:1", "acme", ["ghcr.io/a.b/"])).toBe(false);
+    expect(isRunnerImageAllowed("ghcr.io/a.b/r:1", "acme", ["ghcr.io/a.b/"])).toBe(true);
+    expect(isRunnerImageAllowed("ghcr.io/anything/r:1", "acme", ["ghcr.io/*/"])).toBe(false);
+    expect(isRunnerImageAllowed("ghcr.io/*/r:1", "acme", ["ghcr.io/*/"])).toBe(true);
+  });
+});
+
+describe("resolveSessionImage allowlist", () => {
+  const EVIL = "evil.example/runner:1";
+  let extra: string[];
+  const resolve = (fetchImpl: ReturnType<typeof vi.fn>, defaultImage = DEFAULT_IMAGE) =>
+    resolveSessionImage({ owner: "acme", repo: "widgets", token: "t", defaultImage, fetchImpl: fetchImpl as unknown as typeof fetch });
+
+  beforeEach(() => {
+    __clearRepoImageCacheForTests();
+    extra = [];
+    vi.spyOn(settings, "getRunnerImageAllowedPrefixes").mockImplementation(() => extra);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it("returns an allowed override", async () => {
+    const result = await resolve(mockFetch(200, contentsApiResponse("image: ghcr.io/acme/r:1\n")));
+    expect(result).toEqual({ image: "ghcr.io/acme/r:1", source: "override" });
+  });
+
+  it("returns an allowed default", async () => {
+    expect(await resolve(mockFetch(404, "no"))).toEqual({ image: DEFAULT_IMAGE, source: "default" });
+  });
+
+  it("returns an override under an extra prefix from Settings", async () => {
+    extra = ["evil.example/"];
+    expect((await resolve(mockFetch(200, contentsApiResponse(`image: ${EVIL}\n`)))).image).toBe(EVIL);
+  });
+
+  it("returns a default under an extra prefix from Settings", async () => {
+    extra = ["registry.example/"];
+    const result = await resolve(mockFetch(404, "no"), "registry.example/r:1");
+    expect(result).toEqual({ image: "registry.example/r:1", source: "default" });
+  });
+
+  it("refuses a disallowed override without falling back to the allowed default", async () => {
+    const warn = vi.mocked(console.warn);
+    await expect(resolve(mockFetch(200, contentsApiResponse(`image: ${EVIL}\n`)))).rejects.toBeInstanceOf(RunnerImageNotAllowedError);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes(`[repo-image] runner image ${EVIL} for acme/widgets is not allowed; allowed prefixes: `)
+      && String(c[0]).endsWith("add a prefix at /admin#settings"))).toBe(true);
+  });
+
+  it("refuses a disallowed default", async () => {
+    await expect(resolve(mockFetch(404, "no"), EVIL)).rejects.toBeInstanceOf(RunnerImageNotAllowedError);
+  });
+
+  it("checks the default after an invalid image.yml value falls back", async () => {
+    await expect(resolve(mockFetch(200, contentsApiResponse("image: not a ref\n")), EVIL)).rejects.toBeInstanceOf(RunnerImageNotAllowedError);
+    __clearRepoImageCacheForTests();
+    expect((await resolve(mockFetch(200, contentsApiResponse("image: bare\n")))).source).toBe("default");
+  });
+
+  it("refuses a cached allowed image once the Settings row that allowed it is removed", async () => {
+    extra = ["evil.example/"];
+    const fetchImpl = mockFetch(200, contentsApiResponse(`image: ${EVIL}\n`));
+    await resolve(fetchImpl);
+    extra = [];
+    await expect(resolve(fetchImpl)).rejects.toBeInstanceOf(RunnerImageNotAllowedError);
+    expect(fetchImpl).toHaveBeenCalledOnce();
   });
 });

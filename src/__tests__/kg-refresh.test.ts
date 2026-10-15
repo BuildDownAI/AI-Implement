@@ -503,6 +503,30 @@ describe("kg-refresh production wiring (AII-901)", () => {
   const unavailable = { status: "unavailable" as const, content: [] };
   const held = (v: boolean) => () => v;
 
+  it("makeKgDryRunEnqueue skips the ingress while Restate is not ready (AII-1405)", async () => {
+    const ingress = { enqueueDryRun: vi.fn().mockResolvedValue({ status: "accepted" }) };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const entry = { prNumber: 3 } as never;
+    expect(await idx.makeKgDryRunEnqueue("Org/kg", ingress as never, () => false)("k-1", entry, { idempotencyKey: "d" })).toEqual({ status: "unavailable" });
+    expect(ingress.enqueueDryRun).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain("k-1");
+    warn.mockRestore();
+  });
+
+  it("makeKgDryRunEnqueue calls the ingress when ready and answers unavailable with no slug", async () => {
+    const ingress = { enqueueDryRun: vi.fn().mockResolvedValue({ status: "accepted" }) };
+    const entry = { prNumber: 3 } as never;
+    const opts = { idempotencyKey: "d" };
+    expect(await idx.makeKgDryRunEnqueue("Org/kg", ingress as never, () => true)("k-1", entry, opts)).toEqual({ status: "accepted" });
+    expect(ingress.enqueueDryRun).toHaveBeenCalledWith("Org/kg", { key: "k-1", prNumber: 3 }, opts);
+    ingress.enqueueDryRun.mockClear();
+    for (const r of [true, false]) {
+      expect(await idx.makeKgDryRunEnqueue(undefined, ingress as never, () => r)("k-1", entry, opts)).toEqual({ status: "unavailable" });
+    }
+    expect(ingress.enqueueDryRun).not.toHaveBeenCalled();
+  });
+
   it("cancel cancels the clicked row's dispatchId and reads no marker", async () => {
     const client = { repoStatus: vi.fn(), cancel: vi.fn().mockResolvedValue({ status: "accepted" }) };
     const deps = idx.makeKgRefreshAdminDeps("Org/kg", client as never, vi.fn() as never, held(false));

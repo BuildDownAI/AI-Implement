@@ -37,6 +37,7 @@ import { upsertReviewFinding } from "../../review-ledger-store.js";
 import { acceptReviewFixWebhookEvent, enqueueReviewFix, updateReviewFixStatus } from "../../review-fix-queue.js";
 import { REVIEW_PROCESSES, resolveReviewProcess } from "../../review-process.js";
 import { inspectPendingReviewFixFeedback, loadPendingReviewFixFeedback } from "../../review-fix-pending.js";
+import { createProductionFinalizer } from "../../restate/review-fix-production.js";
 import { createReviewFixFinalizer } from "../../review-fix-finalize.js";
 import type { ReviewFixGitHubAdapter } from "../../review-fix-finalize.js";
 import { createReviewFixGithubAdapter } from "../../review-fix-github-adapter.js";
@@ -160,6 +161,8 @@ let ownerSeq = 0;
 const fixturesByRepo = new Map<string, GithubFixture>();
 const fixtureByAttempt = new Map<string, GithubFixture>();
 const runIndex = new Map<number, GithubFixture>();
+/** The run tokens each attempt's launch received, as the workflow dispatch inputs carry them. */
+const launchTokensByAttempt = new Map<string, string[]>();
 let nextRunId = 9_000;
 
 function repoKey(repository: string): string {
@@ -297,6 +300,8 @@ const transport: ReviewFixWorkerTransport = {
     if (!fixture) throw new Error(`test bug: no fixture registered for attempt ${attemptId}`);
     fixture.attemptId = attemptId;
     fixtureByAttempt.set(attemptId, fixture);
+    launchTokensByAttempt.set(attemptId, [input.inputs.run_token, input.inputs.run_progress_token, input.inputs.run_publication_token]
+      .filter((t): t is string => typeof t === "string" && t.length > 0));
     return fixture.dispatchImpl(input);
   },
   async listRuns(input) {
@@ -345,33 +350,21 @@ const github: ReviewFixGitHubAdapter = {
   },
 };
 
+const LAUNCH_TOKEN_SECRET = "review-fix-launch-token-secret";
 const worker = new GithubReviewFixWorker({
   credentials: fakeCredentials, transport, scopeStore: reviewFixAttemptStoreScopeStore(sqliteStore),
+  // The same shape as `createProductionReviewFixServices`: the launch itself receives the three attempt tokens.
+  callbackInputs: async (attemptId) => ({
+    run_token: mintPreparedReviewFixToken({ attemptId, audience: "result", secret: LAUNCH_TOKEN_SECRET }).token,
+    run_progress_token: mintPreparedReviewFixToken({ attemptId, audience: "progress", secret: LAUNCH_TOKEN_SECRET }).token,
+    run_publication_token: mintPreparedReviewFixToken({ attemptId, audience: "publication", secret: LAUNCH_TOKEN_SECRET }).token,
+    runner_callback_url: "https://orchestrator.test",
+  }),
 });
 
 const baseFinalizer = createReviewFixFinalizer({ attemptStore: sqliteStore, github });
-// Mirrors review-fix-production.ts's own applyApproval wrapper verbatim: re-check evidence,
-// then apply. A crash window after the GitHub write is the journaled step's retry plus the
-// adapter's upsert, not a second ledger.
-const finalizer = {
-  recordOutcome: baseFinalizer.recordOutcome,
-  applyApproval: async (input: Parameters<typeof baseFinalizer.applyApproval>[0]) => {
-    const accepted = await sqliteStore.getAcceptedResult(input.attemptId);
-    const outcome = await sqliteStore.getRecordedOutcome(input.attemptId);
-    if (!accepted?.result || accepted.hasConflict || outcome?.terminal.status !== "succeeded"
-      || JSON.stringify(accepted.result) !== JSON.stringify(input.result)
-      || !await sqliteStore.hasCurrentAuthority(input.attemptId)) {
-      return { status: "withheld" as const, reason: "current attempt authority or accepted result changed" };
-    }
-    const head = await github.getPrHeadSha(input.scope) ?? "";
-    if (head !== input.result.outputCommit || !input.policyAllows
-      || !await github.evaluateMergePolicy(input.scope, input.findingDispositions)) {
-      return { status: "withheld" as const, reason: "current PR head or merge policy changed" };
-    }
-    const current = { ...input, currentAuthority: true, currentPrHeadSha: head };
-    return baseFinalizer.applyApproval(current);
-  },
-};
+// The production wrapper itself (review-fix-production.ts), with no late-review submit wired.
+const finalizer = createProductionFinalizer({ store: sqliteStore, github, baseFinalizer });
 
 const alerts: Array<{ attemptId: string; reason: string }> = [];
 
@@ -1023,9 +1016,27 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;
     const result = resultOf(fixture, prepared);
     const secret = "journal-projection-secret";
-    // Minting needs a live authority, so mint before the attempt finishes.
-    const tokens = (["result", "progress", "publication"] as const)
-      .map((audience) => mintPreparedReviewFixToken({ attemptId, audience, secret }).token);
+    // The launch's own tokens, read from the journal while the attempt waits for its result: Restate trims the
+    // launch entry once the attempt finishes, so a later read would find no token for any reason.
+    const launchTokens = launchTokensByAttempt.get(attemptId) ?? [];
+    expect(launchTokens).toHaveLength(3);
+    const waiting = await queryInvocations(env.adminAPIBaseUrl(),
+      `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${attemptId}' AND target_handler_name = 'run'`);
+    const launchJournal = await eventually(
+      async () => {
+        const journal = await journalEntries(env.adminAPIBaseUrl(), waiting[0].id as string);
+        try {
+          journaledRunResult(journal, "launch-once");
+          return journal;
+        } catch {
+          return undefined;
+        }
+      },
+      (journal) => journal !== undefined,
+      { timeoutMs: 8_000, label: "launch-once journaled result" },
+    );
+    const launchText = journalText(launchJournal!);
+    for (const token of launchTokens) expect(launchText).not.toContain(token);
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "result", result);
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
@@ -1044,9 +1055,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const completedAt = await eventually(readCompletedAt, (v) => v !== null, { timeoutMs: 5_000, label: "review_fix_attempts.completed_at !== null" });
     expect(completedAt).toBe(journaled.completedAt);
 
-    const text = journalText(entries);
-    expect(text).not.toContain(secret);
-    for (const token of tokens) expect(text).not.toContain(token);
+    expect(journalText(entries)).not.toContain(secret);
   }, 25_000);
 
   // -------------------------------------------------------------------------

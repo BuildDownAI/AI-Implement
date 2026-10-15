@@ -728,6 +728,8 @@ export interface SessionMachineInput {
   orchestratorUrl?: string;
   runnerCallbackUrl?: string;
   runToken?: string;
+  runProgressToken?: string;
+  runPublicationToken?: string;
   orchestratorApp?: string; // Fly app name of this orchestrator, stamped into machine metadata
   tenantId?: string; // client slug (e.g. "acme-corp"), stamped as tenant_id in metadata
   expectedTtlSeconds?: number; // expected machine lifetime in seconds, stamped in metadata for reaper
@@ -781,6 +783,12 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
   }
   if (input.runToken) {
     env.RUN_TOKEN = input.runToken;
+  }
+  if (input.runProgressToken) {
+    env.RUN_PROGRESS_TOKEN = input.runProgressToken;
+  }
+  if (input.runPublicationToken) {
+    env.RUN_PUBLICATION_TOKEN = input.runPublicationToken;
   }
   if (input.extraEnv) {
     Object.assign(env, input.extraEnv);

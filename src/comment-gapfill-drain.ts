@@ -10,11 +10,11 @@ import {
   type DispatchAdmissionBackend,
 } from "./dispatch-admission.js";
 import { claimPendingCommentGapfills, markCommentGapfillProcessed } from "./comment-gapfill-queue.js";
-import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, appendLog, countPriorDispatches, updateJobPrUrl, suppressStaleNotifications, type Job } from "./log.js";
+import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getInFlightJobs, appendLog, countPriorDispatches, updateJobPrUrl, suppressStaleNotifications, type Job } from "./log.js";
 import { resolveExecutionPath, getFlySecretsMinVersion, getFlyProcessLevelSecrets, type RunnerMode } from "./runner-mode.js";
-import { mintRunToken, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
+import { mintLaunchTokens, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, capRunnerEnv, branchPrefixRunnerEnv, skillsRepoRunnerEnv, getPullRequestState, type DispatchResult } from "./github.js";
-import { encodeRunConfig, type RunConfigV1, type RunCredentialsV1 } from "./run-config.js";
+import { buildRunConfig, encodeRunConfig, type RunConfigV1, type RunCredentialsV1 } from "./run-config.js";
 import { getRetryPolicy } from "./orchestrator-settings.js";
 import { createMachine, listAppSecrets, generateSessionToken, generateMachineNonce, buildSessionMachineConfig } from "./fly-machines.js";
 import { resolveSessionImage } from "./repo-image.js";
@@ -29,6 +29,7 @@ import {
 } from "./managed-dispatch-auth.js";
 import type { ModelAuthRuntime } from "./model-auth-runtime.js";
 import { buildProtectedFlyBootstrap } from "./fly-protection-key.js";
+import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import type { WorkflowCapabilities, WorkflowContract } from "./workflow-probe.js";
 
 type ContractProbeResult = WorkflowContract | WorkflowCapabilities;
@@ -125,18 +126,16 @@ export function parseGroupingBranchIdentifier(headRef: string | null): string | 
 }
 
 /** Recover tracker identity for a grouping roll-up PR from its feature-node parent's
- *  latest dispatch. Best-effort: any failure resolves to null and the caller refuses
- *  exactly as before. */
-async function resolveRollUpParentDispatch(
-  opts: DrainCommentGapfillsInput,
+ *  latest dispatch, given the PR's head branch. Best-effort: any failure resolves to
+ *  null and the caller refuses exactly as before. */
+function resolveRollUpParentDispatch(
   owner: string,
   repo: string,
   prNumber: number,
-): Promise<Job | null> {
+  headRef: string | null,
+): Job | null {
   try {
-    const ghToken = await opts.getInstallationToken(owner);
-    const pr = await getPullRequestState(ghToken, owner, repo, prNumber);
-    const identifier = parseGroupingBranchIdentifier(pr?.headRef ?? null);
+    const identifier = parseGroupingBranchIdentifier(headRef);
     if (!identifier) return null;
     const parentLog = getLatestDispatchForIssueIdentifier(owner, repo, identifier);
     if (!parentLog) {
@@ -146,13 +145,25 @@ async function resolveRollUpParentDispatch(
       return null;
     }
     console.log(
-      `[comment-gapfill] PR #${prNumber} has no dispatch row; recovered identity from roll-up parent ${parentLog.issueIdentifier} (branch ${pr?.headRef})`,
+      `[comment-gapfill] PR #${prNumber} has no dispatch row; recovered identity from roll-up parent ${parentLog.issueIdentifier} (branch ${headRef})`,
     );
     return parentLog;
   } catch (err) {
     console.warn(`[comment-gapfill] roll-up fallback failed for PR #${prNumber}:`, err);
     return null;
   }
+}
+
+/** The PR's own run while it is still in flight: its row carries the branch identifier
+ *  but no `pr_url` yet, so the PR-url lookup misses it. Newest in-flight row in this repo
+ *  whose issue identifier matches the head branch; ended runs already have `pr_url`. */
+function resolveInFlightDispatch(owner: string, repo: string, headRef: string | null): Job | null {
+  if (!headRef) return null;
+  const fullRepo = `${owner}/${repo}`;
+  const matches = getInFlightJobs().filter(
+    (job) => job.repo === fullRepo && branchMatchesIssueIdentifier(headRef, job.issueIdentifier ?? undefined),
+  );
+  return matches.length > 0 ? matches[matches.length - 1]! : null;
 }
 
 /**
@@ -258,22 +269,45 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
 
       let prLog = getLatestDispatchForPr(item.owner, item.repo, item.prNumber);
       if (!prLog) {
+        // One PR read per item serves both fallbacks.
+        let headRef: string | null = null;
+        let prReadOk = false;
+        const ghToken = await opts.getInstallationToken(item.owner);
+        try {
+          const pr = await getPullRequestState(ghToken, item.owner, item.repo, item.prNumber);
+          if (pr) {
+            prReadOk = true;
+            headRef = pr.headRef;
+          }
+        } catch (err) {
+          console.warn(`[comment-gapfill] could not read PR #${item.prNumber} in ${fullRepo}:`, err);
+        }
+        if (!prReadOk) {
+          await opts.postComment(
+            ghToken, item.owner, item.repo, item.prNumber,
+            "AI-Implement could not read this PR from GitHub just now, so it cannot tell which run it belongs to. Please repost the `/ai-implement` comment.",
+          );
+          markCommentGapfillProcessed(item.id, "failed");
+          continue;
+        }
         // Roll-up fallback: the top-of-tree feature→base PR is opened by merge-up, not
         // by a dispatch, so it has no row of its own — but its head branch encodes the
         // feature-node parent's key (ai-implement/<mode>/<key-slug>), and that parent's
         // own past dispatches carry the tracker identity this rail needs. The gap-fill
         // then runs against the roll-up PR's branch and reports against the parent.
-        prLog = await resolveRollUpParentDispatch(opts, item.owner, item.repo, item.prNumber);
-      }
-      if (!prLog) {
-        console.warn(`[comment-gapfill] No dispatch log for ${fullRepo} PR #${item.prNumber}`);
-        const ghToken = await opts.getInstallationToken(item.owner);
-        await opts.postComment(
-          ghToken, item.owner, item.repo, item.prNumber,
-          "AI-Implement has no record of this PR. Please trigger a new implementation run from the issue tracker first.",
-        );
-        markCommentGapfillProcessed(item.id, "failed");
-        continue;
+        prLog = resolveRollUpParentDispatch(item.owner, item.repo, item.prNumber, headRef);
+        // The PR's own run still in flight: canDispatch's in_flight refusal below leaves
+        // the item pending, and a later drain retries it once the run sets pr_url.
+        if (!prLog) prLog = resolveInFlightDispatch(item.owner, item.repo, headRef);
+        if (!prLog) {
+          console.warn(`[comment-gapfill] No dispatch log for ${fullRepo} PR #${item.prNumber}`);
+          await opts.postComment(
+            ghToken, item.owner, item.repo, item.prNumber,
+            "AI-Implement has no record of this PR. Please trigger a new implementation run from the issue tracker first.",
+          );
+          markCommentGapfillProcessed(item.id, "failed");
+          continue;
+        }
       }
 
       const mappingEntry = repoMappingEntries.find(([key]) => key === prLog.teamKey)
@@ -322,29 +356,23 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
       let runnerCallbackUrl = "";
       let runToken = "";
       let runProgressToken = "";
+      let runPublicationToken: string | undefined;
       let dispatchId: string | undefined;
       if (opts.runnerCallbackBaseUrl && opts.runnerTokenSecret) {
-        const minted = mintRunToken({
+        dispatchId = crypto.randomUUID();
+        const minted = mintLaunchTokens({
           issueId: prLog.issueId,
           mappingTeamKey: scopeKey,
           phase: "gap-analysis",
-          audience: "result",
-          ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-          secret: opts.runnerTokenSecret,
-        });
-        dispatchId = minted.dispatchId;
-        const progressMinted = mintRunToken({
-          issueId: prLog.issueId,
-          mappingTeamKey: scopeKey,
-          phase: "gap-analysis",
-          audience: "progress",
           dispatchId,
           ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
           secret: opts.runnerTokenSecret,
+          repository: `${mapping.owner}/${mapping.repo}`,
         });
         runnerCallbackUrl = opts.runnerCallbackBaseUrl;
-        runToken = minted.token;
-        runProgressToken = progressMinted.token;
+        runToken = minted.runToken;
+        runProgressToken = minted.runProgressToken;
+        runPublicationToken = minted.runPublicationToken;
       }
 
       // Fly and local children boot with a token scoped to the target repository; a
@@ -417,6 +445,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
             runnerCallbackUrl: runnerCallbackUrl || undefined,
             runToken: runToken || undefined,
             runProgressToken: runProgressToken || undefined,
+            runPublicationToken,
             commentInstruction: item.instruction || undefined,
             retryPolicy: getRetryPolicy(),
             onBeforeLaunch: () => { launchStarted = true; },
@@ -534,29 +563,20 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           machineNonce = generateMachineNonce();
 
           const gapFillRunConfig: RunConfigV1 = {
-            v: 1,
-            issue: {
-              id: prLog.issueId,
-              identifier: prLog.issueIdentifier ?? prLog.issueId,
-              title: prLog.issueTitle ?? prLog.issueId,
-              description: prLog.issueTitle ?? prLog.issueId,
-            },
-            runnerPhase: "gap-analysis",
-            prNumber: String(item.prNumber),
-            ...(mapping.branchPrefix ? { branchPrefix: mapping.branchPrefix } : {}),
-            ...(mapping.skillsRepo ? { skillsRepo: mapping.skillsRepo } : {}),
-            ...(mapping.referenceRepos != null ? { referenceRepos: mapping.referenceRepos } : {}),
-            ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
-            ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
-            ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
-            ...(mapping.sensitiveAddPatterns != null || mapping.sensitiveAllowPatterns != null
-              ? { sensitiveFiles: { add: mapping.sensitiveAddPatterns ?? undefined, allow: mapping.sensitiveAllowPatterns ?? undefined } }
-              : {}),
-            ...(mapping.reviewers != null ? { reviewers: mapping.reviewers } : {}),
-            ...(mapping.reviewProcess != null ? { reviewProcess: mapping.reviewProcess } : {}),
-            ...(mapping.trustedReviewAuthors != null ? { trustedReviewAuthors: mapping.trustedReviewAuthors } : {}),
-            ...(item.instruction ? { commentInstruction: item.instruction } : {}),
-            retryPolicy: getRetryPolicy(),
+            ...buildRunConfig({
+              runnerPhase: "gap-analysis",
+              issue: {
+                id: prLog.issueId,
+                identifier: prLog.issueIdentifier ?? prLog.issueId,
+                title: prLog.issueTitle ?? prLog.issueId,
+                description: prLog.issueTitle ?? prLog.issueId,
+              },
+              mapping,
+              runnerCallbackUrl: runnerCallbackUrl || undefined,
+              prNumber: String(item.prNumber),
+              commentInstruction: item.instruction || undefined,
+              retryPolicy: getRetryPolicy(),
+            }),
             ...(protectedLaunch ? { agentConfig: protectedLaunch.snapshot } : {}),
           };
 
@@ -600,6 +620,8 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
             orchestratorUrl: opts.runnerCallbackBaseUrl ?? undefined,
             runnerCallbackUrl: runnerCallbackUrl || undefined,
             runToken: runToken || undefined,
+            runProgressToken: runProgressToken || undefined,
+            runPublicationToken,
             orchestratorApp: opts.flyOrchestratorApp ?? undefined,
             tenantId: opts.tenantId ?? undefined,
             extraEnv: (() => {
@@ -717,17 +739,9 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
             trustedCredentials, capabilities,
             `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
           );
-          const runPublicationToken = dispatchId && opts.runnerCallbackBaseUrl && opts.runnerTokenSecret && capabilities.contract === "envelope" && capabilities.supportsRunPublicationToken
-            ? mintRunToken({
-                issueId: prLog.issueId,
-                mappingTeamKey: scopeKey,
-                phase: "gap-analysis",
-                audience: "publication",
-                dispatchId,
-                repository: `${mapping.owner}/${mapping.repo}`,
-                ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-                secret: opts.runnerTokenSecret,
-              }).token
+          // The mint is unconditional; an old workflow template gets no publication input.
+          const ghaPublicationToken = capabilities.contract === "envelope" && capabilities.supportsRunPublicationToken
+            ? runPublicationToken
             : undefined;
 
           gapFillInputs = (contract === "envelope"
@@ -738,7 +752,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
                 runnerCallbackUrl: runnerCallbackUrl || undefined,
                 runToken,
                 runProgressToken,
-                runPublicationToken,
+                runPublicationToken: ghaPublicationToken,
                 privateTransport: capabilities.supportsPrivateRunConfig === true,
                 credentials: trustedCredentials,
                 runnerImage,

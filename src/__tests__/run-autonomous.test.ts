@@ -18,7 +18,7 @@ import { DEFAULT_PIPELINE } from "../pipeline/default-pipeline.js";
 import { PipelineRunner } from "../pipeline/runner.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import { encodeRunConfig } from "../run-config.js";
-import type { LLMExecutor, PipelineContext, PipelineDefinition, StepModule } from "../pipeline/types.js";
+import type { LLMExecutor, PipelineContext, PipelineDefinition, StepModule, StepReporter } from "../pipeline/types.js";
 import { __resetPublicationCredentialForTests } from "../publication-credential.js";
 import { DISPOSITIONS_FILE, stableReviewFindingKey, type FindingDisposition } from "../pipeline/finding-dispositions.js";
 import { CYCLE_SUMMARY_FILE, type CycleSummary } from "../pipeline/cycle-summary.js";
@@ -1412,10 +1412,116 @@ describe("runAutonomous", () => {
       });
     });
 
+    describe("attempt step reporting through the activity stream", () => {
+      function stubAttemptEnv(): void {
+        vi.stubEnv(
+          "AI_IMPLEMENT_RUN_CONFIG",
+          encodeRunConfig({
+            v: 1,
+            issue: { id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" },
+            reviewFix: REVIEW_FIX_IDENTITY,
+            runnerCallbackUrl: "https://orchestrator.example",
+          }),
+        );
+        vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+        vi.stubEnv("RUN_PROGRESS_TOKEN", "ptok");
+        vi.stubEnv("RUN_TOKEN", "run-token");
+        vi.stubEnv("GITHUB_RUN_ID", "1");
+        vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+      }
+
+      type Post = { path: string; body: { producerId?: string; events?: Array<{ kind: string; action: string; cycle: number; payload: string }>; finalSequence?: number } };
+
+      function makeRecordingFetch(posts: Post[], log?: string[]): typeof fetch {
+        return vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+          const path = new URL(String(url)).pathname;
+          const body = JSON.parse(String(init?.body ?? "{}")) as Post["body"];
+          posts.push({ path, body });
+          log?.push(`post:${path}`);
+          return { ok: true, status: 200, text: async () => "" } as Response;
+        }) as unknown as typeof fetch;
+      }
+
+      const stepPosts = (posts: Post[]) => posts.filter((p) => p.path === "/runner/activity" && p.body.producerId === "pipeline-steps");
+
+      it("posts each step to /runner/activity as a pipeline_step event and nothing to /runner/progress", async () => {
+        stubAttemptEnv();
+        const posts: Post[] = [];
+        const { pipeline, runner } = makeSingleStepPipeline("do-work", { run: vi.fn().mockResolvedValue({}) });
+
+        await runAutonomous({ workspaceDir, pipeline, runner, llmExecutor: makeMockExecutor(0), fetchImpl: makeRecordingFetch(posts) });
+
+        expect(posts.some((p) => p.path === "/runner/progress")).toBe(false);
+        const events = stepPosts(posts).flatMap((p) => p.body.events ?? []);
+        expect(events.length).toBeGreaterThan(0);
+        for (const e of events) {
+          expect(e.kind).toBe("pipeline_step");
+          expect(e.cycle).toBe(1);
+          expect(Object.keys((JSON.parse(e.payload) as { detail: object }).detail).sort()).toEqual(["ended_at", "parent_step_id", "started_at", "status", "type"]);
+        }
+        expect(events.map((e) => (JSON.parse(e.payload) as { action: string }).action)).toContain("do-work");
+      });
+
+      it("delivers a step's event before the next step starts", async () => {
+        stubAttemptEnv();
+        const posts: Post[] = [];
+        const log: string[] = [];
+        const first: StepModule = { run: vi.fn().mockImplementation(async () => { log.push("run:first"); return {}; }) };
+        const second: StepModule = { run: vi.fn().mockImplementation(async () => { log.push("run:second"); return {}; }) };
+        const { pipeline, runner } = makeStepsPipeline([["first", first], ["second", second]]);
+
+        await runAutonomous({ workspaceDir, pipeline, runner, llmExecutor: makeMockExecutor(0), fetchImpl: makeRecordingFetch(posts, log) });
+
+        const secondRun = log.indexOf("run:second");
+        expect(log.slice(0, secondRun)).toContain("post:/runner/activity");
+      });
+
+      it.each([
+        ["success", { run: vi.fn().mockResolvedValue({}) }],
+        ["a thrown pipeline error", { run: vi.fn().mockRejectedValue(new Error("step exploded")) }],
+      ] as Array<[string, StepModule]>)("finalizes the pipeline-steps producer on %s", async (_name, mod) => {
+        stubAttemptEnv();
+        const posts: Post[] = [];
+        const { pipeline, runner } = makeSingleStepPipeline("do-work", mod);
+
+        await runAutonomous({ workspaceDir, pipeline, runner, llmExecutor: makeMockExecutor(0), fetchImpl: makeRecordingFetch(posts) });
+
+        const batches = stepPosts(posts);
+        expect(batches.length).toBeGreaterThan(0);
+        expect(batches[batches.length - 1].body.finalSequence).toBeTypeOf("number");
+      });
+
+      it("lets opts.reporter win over the activity step reporter", async () => {
+        stubAttemptEnv();
+        const posts: Post[] = [];
+        const reported: string[] = [];
+        const reporter: StepReporter = { report: async (s) => { reported.push(s.id); } };
+        const { pipeline, runner } = makeSingleStepPipeline("do-work", { run: vi.fn().mockResolvedValue({}) });
+
+        await runAutonomous({ workspaceDir, pipeline, runner, reporter, llmExecutor: makeMockExecutor(0), fetchImpl: makeRecordingFetch(posts) });
+
+        expect(reported).toContain("do-work");
+        expect(stepPosts(posts)).toHaveLength(0);
+      });
+
+      it("keeps TokenStepReporter (/runner/progress) for a run that is not an attempt", async () => {
+        vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+        vi.stubEnv("RUN_PROGRESS_TOKEN", "ptok");
+        vi.stubEnv("RUN_TOKEN", "run-token");
+        const posts: Post[] = [];
+        const { pipeline, runner } = makeSingleStepPipeline("do-work", { run: vi.fn().mockResolvedValue({}) });
+
+        await runAutonomous({ workspaceDir, pipeline, runner, llmExecutor: makeMockExecutor(0), fetchImpl: makeRecordingFetch(posts) });
+
+        expect(posts.some((p) => p.path === "/runner/progress")).toBe(true);
+        expect(stepPosts(posts)).toHaveLength(0);
+      });
+    });
+
     describe("runAutonomous finally-block wiring", () => {
       it("attempts activity shutdown from the outer finally block on a successful run", async () => {
         const shutdown = vi.fn().mockResolvedValue(undefined);
-        const fakeReporting: RunnerActivityReporting = { attemptId: "attempt-1", sink: makeNoopSink(), shutdown };
+        const fakeReporting: RunnerActivityReporting = { attemptId: "attempt-1", sink: makeNoopSink(), stepReporter: new NoopStepReporter(), shutdown };
         const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
         const { pipeline, runner } = makeSingleStepPipeline("do-work", mod);
 
@@ -1434,7 +1540,7 @@ describe("runAutonomous", () => {
 
       it("attempts activity shutdown from the outer finally block even when the pipeline throws — mirrors the always-runs teardown hook", async () => {
         const shutdown = vi.fn().mockResolvedValue(undefined);
-        const fakeReporting: RunnerActivityReporting = { attemptId: "attempt-1", sink: makeNoopSink(), shutdown };
+        const fakeReporting: RunnerActivityReporting = { attemptId: "attempt-1", sink: makeNoopSink(), stepReporter: new NoopStepReporter(), shutdown };
         const mod: StepModule = { run: vi.fn().mockRejectedValue(new Error("step exploded")) };
         const { pipeline, runner } = makeSingleStepPipeline("bad-step", mod);
 
@@ -1454,7 +1560,7 @@ describe("runAutonomous", () => {
       it("does not let a rejecting shutdown() crash the run — logged, never fatal", async () => {
         const shutdown = vi.fn().mockRejectedValue(new Error("network down"));
         const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-        const fakeReporting: RunnerActivityReporting = { attemptId: "attempt-1", sink: makeNoopSink(), shutdown };
+        const fakeReporting: RunnerActivityReporting = { attemptId: "attempt-1", sink: makeNoopSink(), stepReporter: new NoopStepReporter(), shutdown };
         const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
         const { pipeline, runner } = makeSingleStepPipeline("do-work", mod);
 

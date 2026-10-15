@@ -73,8 +73,10 @@ import {
   type DispatchInputs,
   type DispatchResult,
 } from "./github.js";
-import { encodeRunConfig, encodeTrustedRunConfig, type RunConfigV1, type RunCredentialsV1 } from "./run-config.js";
+import { buildRunConfig, encodeRunConfig, encodeTrustedRunConfig, type RunCredentialsV1 } from "./run-config.js";
 import { resolveWorkflowCapabilities, type ResolveWorkflowContractInput, type WorkflowCapabilities } from "./workflow-probe.js";
+import type { RetryPolicy } from "./pipeline/retry-backoff.js";
+import { RunnerImageNotAllowedError } from "./repo-image.js";
 import { getMappings, type RepoMapping } from "./config.js";
 import type {
   AttemptId,
@@ -297,10 +299,11 @@ function buildLaunchInputs(
   mapping: RepoMapping,
   runnerCallbackUrl?: string,
   privateBearers?: PrivateBearers,
+  retryPolicy: RetryPolicy | null = null,
 ): DispatchInputs {
   const identifier = `review-fix-${plan.scope.prNumber}`;
-  const runConfig: RunConfigV1 = {
-    v: 1,
+  const runConfig = buildRunConfig({
+    runnerPhase: "gap-analysis",
     issue: {
       id: `review-fix:${plan.attemptId}`,
       identifier,
@@ -310,7 +313,10 @@ function buildLaunchInputs(
       // commentInstruction gap-fill dispatches already use for this purpose.
       description: plan.taskText,
     },
-    runnerPhase: "gap-analysis",
+    mapping,
+    // The URL is not a secret; it rides the envelope because the canonical workflow declares no
+    // top-level runner_callback_url input and session/entrypoint.sh reads run_config.runnerCallbackUrl.
+    runnerCallbackUrl,
     prNumber: String(plan.scope.prNumber),
     commentInstruction: plan.taskText,
     reviewFix: {
@@ -321,22 +327,8 @@ function buildLaunchInputs(
       prNumber: plan.scope.prNumber,
       deadlineAt: plan.deadlineAt,
     },
-    // The URL is not a secret; it rides the envelope because the canonical workflow declares no
-    // top-level runner_callback_url input and session/entrypoint.sh reads run_config.runnerCallbackUrl.
-    ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
-    ...(mapping.branchPrefix ? { branchPrefix: mapping.branchPrefix } : {}),
-    ...(mapping.skillsRepo ? { skillsRepo: mapping.skillsRepo } : {}),
-    ...(mapping.referenceRepos != null ? { referenceRepos: mapping.referenceRepos } : {}),
-    ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
-    ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
-    ...(mapping.sensitiveAddPatterns != null || mapping.sensitiveAllowPatterns != null
-      ? { sensitiveFiles: { add: mapping.sensitiveAddPatterns ?? undefined, allow: mapping.sensitiveAllowPatterns ?? undefined } }
-      : {}),
-    ...(mapping.reviewers != null ? { reviewers: mapping.reviewers } : {}),
-    ...(mapping.reviewProcess != null ? { reviewProcess: mapping.reviewProcess } : {}),
-    ...(mapping.trustedReviewAuthors != null ? { trustedReviewAuthors: mapping.trustedReviewAuthors } : {}),
-    ...(mapping.dependencyTokenScope != null ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
-  };
+    retryPolicy,
+  });
 
   // run_attempt_token stays the public correlation marker on both paths (run-name/reconcile need
   // it); it is never promoted to credentials.attemptToken.
@@ -484,6 +476,9 @@ export interface GithubReviewFixWorkerDeps {
   /** Resolves the `runner_image` workflow input for the target repo, as the implementation
    *  dispatch does. `undefined` leaves the workflow's own image resolution in place. */
   runnerImage?: (target: { owner: string; repo: string; token: string }) => Promise<string | undefined>;
+  /** The operator's retry policy, read at each launch so a settings change applies to the next
+   *  one. Absent: the envelope carries DEFAULT_RETRY_POLICY. */
+  retryPolicy?: () => RetryPolicy;
 }
 
 export class GithubReviewFixWorker implements ReviewFixWorkerPort {
@@ -495,6 +490,7 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
   private readonly requiresProtectedTransport?: GithubReviewFixWorkerDeps["requiresProtectedTransport"];
   private readonly runnerCallbackUrl?: string;
   private readonly runnerImage?: GithubReviewFixWorkerDeps["runnerImage"];
+  private readonly retryPolicy?: GithubReviewFixWorkerDeps["retryPolicy"];
 
   constructor(deps: GithubReviewFixWorkerDeps) {
     this.credentials = deps.credentials;
@@ -505,6 +501,7 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
     this.requiresProtectedTransport = deps.requiresProtectedTransport;
     this.runnerCallbackUrl = deps.runnerCallbackUrl;
     this.runnerImage = deps.runnerImage;
+    this.retryPolicy = deps.retryPolicy;
   }
 
   private async remember(attemptId: AttemptId, scope: ScopedPrIdentity, execution?: WorkerExecutionIdentity): Promise<void> {
@@ -538,6 +535,7 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
     if (credential.installationId !== plan.scope.installationId) return { status: "unknown" };
 
     let inputs: DispatchInputs;
+    const retryPolicy = this.retryPolicy?.() ?? null;
     try {
       if (this.callbackInputs) {
         const { run_token, run_progress_token, run_publication_token, runner_callback_url } = await this.callbackInputs(plan.attemptId);
@@ -563,11 +561,11 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
         // Destructured explicitly: only the three credentials join the inputs, and the URL
         // goes into the envelope rather than a top-level input.
         inputs = privateCapable
-          ? buildLaunchInputs(plan, mapping, runner_callback_url, { run_token, run_progress_token, run_publication_token })
-          : { ...buildLaunchInputs(plan, mapping, runner_callback_url), run_token, run_progress_token, run_publication_token };
+          ? buildLaunchInputs(plan, mapping, runner_callback_url, { run_token, run_progress_token, run_publication_token }, retryPolicy)
+          : { ...buildLaunchInputs(plan, mapping, runner_callback_url, undefined, retryPolicy), run_token, run_progress_token, run_publication_token };
       } else {
         if (this.requiresProtectedTransport?.(plan)) return { status: "unknown" };
-        inputs = buildLaunchInputs(plan, mapping, this.runnerCallbackUrl);
+        inputs = buildLaunchInputs(plan, mapping, this.runnerCallbackUrl, undefined, retryPolicy);
       }
     } catch {
       // A missing/expired prepared credential is not proof that an earlier
@@ -579,6 +577,7 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
         const runnerImage = await this.runnerImage({ owner: mapping.owner, repo: mapping.repo, token: credential.token });
         if (runnerImage !== undefined) inputs = { ...inputs, runner_image: runnerImage };
       } catch (err) {
+        if (err instanceof RunnerImageNotAllowedError) return { status: "rejected", reason: err.message };
         console.warn(`[review-fix] Runner image resolution failed for ${mapping.owner}/${mapping.repo}; `
           + `launching without runner_image: ${err instanceof Error ? err.message : String(err)}`);
       }

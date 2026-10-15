@@ -101,6 +101,26 @@ export class TokenStepReporter implements StepReporter {
   }
 }
 
+/** The slice of the runner activity sink that `ActivityStepReporter` needs. */
+export interface StepActivityRecorder {
+  recordStep(step: Step): void;
+  flushSteps(): Promise<void>;
+}
+
+/** Reports each step through the activity stream (`/runner/activity`), flushing as it happens. */
+export class ActivityStepReporter implements StepReporter {
+  constructor(private readonly recorder: StepActivityRecorder) {}
+
+  async report(step: Step): Promise<void> {
+    try {
+      this.recorder.recordStep(step);
+      await this.recorder.flushSteps();
+    } catch (err) {
+      console.error(`[StepReporter] Failed to report step ${step.id}: ${errorSummary(err)}`);
+    }
+  }
+}
+
 export class NoopStepReporter implements StepReporter {
   async report(_step: Step): Promise<void> {}
 }

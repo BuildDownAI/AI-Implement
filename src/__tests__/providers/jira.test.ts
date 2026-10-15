@@ -133,6 +133,19 @@ const baseMapping: Omit<RepoMapping, "ticketingProvider" | "ticketingConfig"> = 
   provider: "anthropic",
   awsRegion: null,
   paused: false,
+  autoMerge: false,
+  maxTurns: null,
+  maxIterations: null,
+  maxJobMinutes: null,
+  branchPrefix: null,
+  skillsRepo: null,
+  referenceRepos: null,
+  sensitiveAddPatterns: null,
+  sensitiveAllowPatterns: null,
+  dependencyTokenScope: null,
+  reviewFixLifecycle: null,
+  memoryProviderId: null,
+  reviewers: null,
 };
 
 const jiraMapping = (

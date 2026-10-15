@@ -380,6 +380,8 @@ const LEGACY_FLY_BODY = {
       "ANTHROPIC_API_KEY": "sk-ant-synthetic",
       "ORCHESTRATOR_URL": "https://orch.example",
       "RUNNER_CALLBACK_URL": "https://orch.example",
+      "RUN_PROGRESS_TOKEN": "<RUN_PROGRESS_TOKEN>",
+      "RUN_PUBLICATION_TOKEN": "<RUN_PUBLICATION_TOKEN>",
       "RUN_TOKEN": "<RUN_TOKEN>",
       "FOO": "bar",
       "AI_IMPLEMENT_RUN_CONFIG": "eyJ2IjoxLCJpc3N1ZSI6eyJpZCI6Imlzc3VlLTEzODkiLCJpZGVudGlmaWVyIjoiQUlJLTEzODkiLCJ0aXRsZSI6IlQiLCJkZXNjcmlwdGlvbiI6ImQifSwicnVubmVyUGhhc2UiOiJpbXBsZW1lbnRhdGlvbiIsInJ1bm5lckNhbGxiYWNrVXJsIjoiaHR0cHM6Ly9vcmNoLmV4YW1wbGUiLCJyZXRyeVBvbGljeSI6eyJyZXF1ZXN0UmV0cmllcyI6Miwic3RhZ2VSZXRyaWVzIjoxLCJwdXNoUmV0cmllcyI6MiwiYmFja29mZkluaXRpYWxNcyI6MzAwMDAsImJhY2tvZmZNYXhNcyI6MzAwMDAwLCJiYWNrb2ZmSml0dGVyIjowLjIsInJldmlld01heFR1cm5zIjozMH19"
@@ -427,7 +429,8 @@ const LEGACY_GHA_CALL = {
   },
   "returnRunDetails": true
 };
-const RANDOM = new Set(["SESSION_TOKEN", "MACHINE_NONCE", "RUN_TOKEN", "run_token", "run_progress_token"]);
+// RUN_PROGRESS_TOKEN / RUN_PUBLICATION_TOKEN: added to Fly launches by the shared token mint (AII-1320).
+const RANDOM = new Set(["SESSION_TOKEN", "MACHINE_NONCE", "RUN_TOKEN", "RUN_PROGRESS_TOKEN", "RUN_PUBLICATION_TOKEN", "run_token", "run_progress_token"]);
 function normalize(v: Record<string, unknown>): Record<string, unknown> {
   return JSON.parse(JSON.stringify(v, (k, x) => (RANDOM.has(k) && typeof x === "string" ? `<${k}>` : x)));
 }
