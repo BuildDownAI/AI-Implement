@@ -139,6 +139,21 @@ export async function runIntrospectionQuery(
   return body.rows as IntrospectionRow[];
 }
 
+/**
+ * Purges one completed invocation (journal and all) through the admin API
+ * (`PATCH /invocations/{id}/purge`, restate-server 1.7.10). A 404/409 means it is already gone
+ * or not purgeable-as-completed; both are treated as done so callers stay idempotent.
+ */
+export async function purgeInvocation(fetchImpl: typeof fetch, adminBaseUrl: string, invocationId: string): Promise<void> {
+  const response = await fetchImpl(`${adminBaseUrl}/invocations/${encodeURIComponent(invocationId)}/purge`, {
+    method: "PATCH",
+    signal: AbortSignal.timeout(REGISTER_TIMEOUT_MS),
+  });
+  if (!response.ok && response.status !== 404 && response.status !== 409) {
+    throw new Error(`admin API purge of ${invocationId} failed: HTTP ${response.status}`);
+  }
+}
+
 export function sqlQuote(value: string): string {
   return value.replace(/'/g, "''");
 }
@@ -164,8 +179,8 @@ export function sqlQuote(value: string): string {
  * comparison rather than an enumerated allowlist. `scheduled` is deliberately excluded: it is
  * a delayed send whose timer has not fired, so it has no journal and no pinned deployment, and
  * when it fires it starts as a new invocation on whichever deployment then serves the service.
- * Counting it would hold a deploy for the whole delay — `KgRepo.expire` is scheduled
- * 4 h 10 min out on every refresh trigger (AII-1031). Persistent Virtual Object state lives in the separate
+ * Counting it would hold a deploy for the whole delay (AII-1031). A suspended `KgRepo.watch`
+ * is not scheduled but non-completed, so it counts: a live or paused refresh holds the drain (AII-1297). Persistent Virtual Object state lives in the separate
  * `state` table and never appears in `sys_invocation`, so it is never counted — durable state
  * alone is not active work (AII-721).
  *

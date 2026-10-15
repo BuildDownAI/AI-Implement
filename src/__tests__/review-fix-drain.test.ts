@@ -902,6 +902,49 @@ describe("processReviewFixQueue — GHA phase fix", () => {
   });
 });
 
+describe("processReviewFixQueue — GHA publication token gate", () => {
+  async function dispatchInputs(supportsRunPublicationToken: boolean): Promise<Record<string, unknown>> {
+    process.env.RUNNER_MODE = "default";
+    configModule.upsertMapping("TEAM", makeMapping({ executionMode: "github-actions" }));
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-gate",
+      issueIdentifier: "AII-11",
+      repo: "acme/billing",
+      prNumber: 43,
+      reason: "late review comment",
+    });
+
+    const githubModule = await import("../github.js");
+    const workflowProbeModule = await import("../workflow-probe.js");
+    const repoImageModule = await import("../repo-image.js");
+    const dispatchWorkflowSpy = vi.spyOn(githubModule, "dispatchWorkflow").mockResolvedValue({ success: true, status: 204 });
+    vi.spyOn(workflowProbeModule, "resolveWorkflowCapabilities").mockResolvedValue({
+      contract: "envelope",
+      supportsRunPublicationToken,
+      supportsAttemptCorrelation: false,
+    });
+    vi.spyOn(repoImageModule, "resolveRunnerImageForDispatch").mockResolvedValue(undefined);
+
+    await indexModule.processReviewFixQueue(
+      { ...mockConfig, runnerCallbackBaseUrl: "https://callback.example", runnerTokenSecret: "test-secret" },
+      mockRegistry,
+    );
+
+    expect(dispatchWorkflowSpy).toHaveBeenCalledTimes(1);
+    return dispatchWorkflowSpy.mock.calls[0]![2] as Record<string, unknown>;
+  }
+
+  it("sends run_publication_token when the contract is envelope and the workflow supports it", async () => {
+    const inputs = await dispatchInputs(true);
+    expect(inputs.run_publication_token).toBeTruthy();
+  });
+
+  it("omits run_publication_token when the workflow does not support it", async () => {
+    const inputs = await dispatchInputs(false);
+    expect("run_publication_token" in inputs).toBe(false);
+  });
+});
+
 describe("processReviewFixQueue — task description wiring", () => {
   it("builds the local-Docker dispatch's issue description with buildReviewFixTaskDescription", async () => {
     const mapping = makeMapping();

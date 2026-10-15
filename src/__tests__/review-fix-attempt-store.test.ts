@@ -1,10 +1,9 @@
 /**
  * Behavioral tests for `src/review-fix-attempt-store.ts` (AII-785) against real
- * SQLite, matching `dispatch-admission.test.ts`'s temp-file harness. `npm run
- * typecheck` excludes `src/__tests__`, and vitest strips types without checking
- * them, so the direct `ReviewFixAttemptStorePort` assignment below (acceptance
- * criterion: "no unsafe adapter casts") is additionally type-checked via
- * `npx tsc --noEmit -p tsconfig.review-fix-attempt-store-tests.json`.
+ * SQLite, matching `dispatch-admission.test.ts`'s temp-file harness. Vitest
+ * strips types without checking them, so the direct `ReviewFixAttemptStorePort`
+ * assignment below (acceptance criterion: "no unsafe adapter casts") is
+ * type-checked by `npm run typecheck` (its `tsconfig.tests.json` pass).
  *
  * `better-sqlite3` is single-connection and synchronous, so "concurrent
  * preparation" here means back-to-back same-content calls within one process —

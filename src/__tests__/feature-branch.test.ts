@@ -23,6 +23,19 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     ticketingConfig: { kind: "linear" },
     awsRegion: null,
     paused: false,
+    autoMerge: false,
+    maxTurns: null,
+    maxIterations: null,
+    maxJobMinutes: null,
+    branchPrefix: null,
+    skillsRepo: null,
+    referenceRepos: null,
+    sensitiveAddPatterns: null,
+    sensitiveAllowPatterns: null,
+    dependencyTokenScope: null,
+    reviewFixLifecycle: null,
+    memoryProviderId: null,
+    reviewers: null,
     ...overrides,
   };
 }
@@ -195,7 +208,7 @@ describe("findOpenRollUpPr (parent no-work churn guard)", () => {
   }) as never;
 
   it("returns the PR when an open roll-up exists for the parent's feature branch", async () => {
-    const finder = vi.fn(async () => ({ number: 42, url: "u", state: "open" as const, merged: false }));
+    const finder = vi.fn(async () => ({ number: 42, url: "u", state: "open" as const, merged: false, headSha: "sha" }));
     const { findOpenRollUpPr } = await import("../feature-branch.js");
     const pr = await findOpenRollUpPr({ ghToken: "tok", issue: parent("P-1"), mapping, finder });
     expect(pr).toEqual({ number: 42, url: "u" });
@@ -204,7 +217,7 @@ describe("findOpenRollUpPr (parent no-work churn guard)", () => {
 
   it("returns null for merged/closed roll-ups and for non-parent (leaf) chains", async () => {
     const { findOpenRollUpPr } = await import("../feature-branch.js");
-    const merged = vi.fn(async () => ({ number: 1, url: "u", state: "closed" as const, merged: true }));
+    const merged = vi.fn(async () => ({ number: 1, url: "u", state: "closed" as const, merged: true, headSha: "sha" }));
     expect(await findOpenRollUpPr({ ghToken: "t", issue: parent("P-2"), mapping, finder: merged })).toBeNull();
     // leaf: chain ends at an ancestor, not itself -> guard does not apply, finder never called
     const leafFinder = vi.fn();

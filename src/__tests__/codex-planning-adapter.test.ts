@@ -404,7 +404,7 @@ describe("planning protocol driver", () => {
       const out = await drive(server);
       expect(out.sawUnsafe).toBe(true);
       expect(out.result.exitCode).toBe(1);
-      expect(out.result.stderr.endsWith(`unexpected_item: ${type}`)).toBe(true);
+      expect(out.result.stderr?.endsWith(`unexpected_item: ${type}`)).toBe(true);
     },
   );
 
@@ -430,7 +430,7 @@ describe("planning protocol driver", () => {
       });
       const out = await drive(server);
       expect(out.sawUnsafe).toBe(true);
-      expect(out.result.stderr.endsWith(`unexpected_item: ${label}`)).toBe(true);
+      expect(out.result.stderr?.endsWith(`unexpected_item: ${label}`)).toBe(true);
       expect(out.result.stderr).not.toContain("SENTINEL");
     }
   });

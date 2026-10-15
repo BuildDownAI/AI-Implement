@@ -44,9 +44,11 @@ export function channelTagForRef(watchedRef: string | null): string | null {
 
 /**
  * Derives the landing cost for a merge to the watched branch.
- * autoDeploy dominates: when it is on every merge triggers a deploy and a runner
- * image build. When off, only the branches that have a corresponding runner build
- * schedule contribute an image build; everything else is a no-op.
+ * autoDeploy dominates: when it is on, every merge triggers a deploy. A runner
+ * image build runs only when the merge changes a path in the `build-runner.yml`
+ * paths filter, so a docs-only merge builds no image. When off, only the branches
+ * that have a corresponding runner build contribute an image build (with the same
+ * path filter); everything else is a no-op.
  */
 export function deriveMergeCost(
   autoDeploy: boolean,

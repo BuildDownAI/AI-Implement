@@ -80,16 +80,16 @@ import { createMachine, getMachine, listMachines, generateSessionToken, generate
 import { isDurableRunnerMachine, safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
 import type { ReaperHelpers } from "./reaper.js";
 import { seedKgMaterializeDirectFromEnv, seedKgExecutionModeFromEnv, getRunnerMode, getFlySecretsMinVersion, getFlyProcessLevelSecrets, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
-import { handleGitHubWebhook } from "./webhook.js";
+import { handleGitHubWebhook, type KgPrCheckConfig } from "./webhook.js";
 import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
-import { getOrchestratorSettings, getRunnerBackendSource, getFlySessionsConfig, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, getRetryPolicy, seedRunnerBackends, refreshRunnerBackendCache } from "./orchestrator-settings.js";
-import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
+import { getOrchestratorSettings, getRunnerBackendSource, getFlySessionsConfig, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, seedRunnerImageAllowedPrefixesFromEnv, getRetryPolicy, seedRunnerBackends, refreshRunnerBackendCache } from "./orchestrator-settings.js";
+import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, resubmitPendingGapFillReviews, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
-import { mintRunToken, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
+import { mintLaunchTokens, IMPLEMENTATION_TTL_SECONDS, type LaunchTokens } from "./runner-tokens.js";
 import { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
 import { createReviewFixAdminFacade } from "./review-fix-admin-facade.js";
 import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "./review-fix-worker.js";
@@ -173,6 +173,7 @@ import { callTool, callToolAsSystem } from "./restate/tools-client.js";
 import { makeKgRefresh, migrateLegacyDryRunOutcomes, runKgRefreshPreflight, defaultFetchDefaultBranch, defaultFetchSnapshotCommitSha, defaultMaterialize, defaultMcpToolCall, defaultPersistLastRefresh, defaultLoadLastRefresh } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
 import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
+import { scrubOperatorLegacyTokens } from "./restate/operator-legacy-scrub.js";
 
 /**
  * The reaper's helper callbacks. The KgRefresh workflow owns kg-refresh rows, so the
@@ -862,6 +863,13 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   // Monitor in-flight jobs and send completion notifications
   await monitorJobs(config, registry);
 
+  // AII-1304: retry LateExternalReview for gap-fill rows submitted while Restate was not ready.
+  try {
+    await resubmitPendingGapFillReviews({ ready: restateReady, submit: lateExternalReviewSubmitHook });
+  } catch (err) {
+    console.error("[poll] late-review sweep failed:", err);
+  }
+
   // Local mode: reap exited containers no in-flight job owns. A planning job
   // finalized by the runner callback goes terminal before the monitor's
   // completion pass, so the monitor never removes its container.
@@ -917,6 +925,18 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     tokenForOwner: (owner) =>
       getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
     getPullRequestState,
+    // AII-1294: a parent's own PR closed unmerged must not block its roll-up.
+    finalizeGroupingParent: async (job) => {
+      const prNumber = job.prUrl ? prNumberFromUrl(job.prUrl) : null;
+      const entry = job.repo && prNumber !== null ? resolvePrMapping(getMappings(), job.repo, prNumber) : undefined;
+      if (!entry) {
+        console.error(`[merge-poll] No mapping resolves for grouping parent ${job.issueIdentifier} (${job.repo} ${job.prUrl}); not finalizing`);
+        return false;
+      }
+      const provider = await registry.forMapping(entry.mapping);
+      await provider.markMerged(job.issueId, entry.scopeKey);
+      return true;
+    },
   });
 
   // Process any pending reconciliation jobs triggered by merged PRs
@@ -1201,28 +1221,21 @@ export async function dispatchGitHubActions(
       let runnerCallbackUrl = "";
       let runToken = "";
       let runProgressToken = "";
+      let mintedPublicationToken: string | undefined;
       if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
-        const minted = mintRunToken({
+        const minted = mintLaunchTokens({
           issueId: issue.id,
           mappingTeamKey: issue.scopeKey,
           phase: "implementation",
-          audience: "result",
           dispatchId,
-          ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-          secret: config.runnerTokenSecret,
-        });
-        const progressMinted = mintRunToken({
-          issueId: issue.id,
-          mappingTeamKey: issue.scopeKey,
-          phase: "implementation",
-          audience: "progress",
-          dispatchId,
+          repository: `${mapping.owner}/${mapping.repo}`,
           ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
           secret: config.runnerTokenSecret,
         });
         runnerCallbackUrl = config.runnerCallbackBaseUrl;
-        runToken = minted.token;
-        runProgressToken = progressMinted.token;
+        runToken = minted.runToken;
+        runProgressToken = minted.runProgressToken;
+        mintedPublicationToken = minted.runPublicationToken;
       }
 
       const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
@@ -1239,21 +1252,8 @@ export async function dispatchGitHubActions(
         trustedCredentials, workflowCapabilities,
         `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
       );
-      const runPublicationToken = contract === "envelope"
-        && workflowCapabilities.supportsRunPublicationToken
-        && dispatchId
-        && config.runnerCallbackBaseUrl
-        && config.runnerTokenSecret
-        ? mintRunToken({
-            issueId: issue.id,
-            mappingTeamKey: issue.scopeKey,
-            phase: "implementation",
-            audience: "publication",
-            dispatchId,
-            repository: `${mapping.owner}/${mapping.repo}`,
-            ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-            secret: config.runnerTokenSecret,
-          }).token
+      const runPublicationToken = contract === "envelope" && workflowCapabilities.supportsRunPublicationToken
+        ? mintedPublicationToken
         : undefined;
 
       const dispatchInputs = contract === "envelope"
@@ -1705,6 +1705,8 @@ export async function dispatchSession(
       machineNonce: string;
       runnerCallbackUrl: string;
       runToken: string;
+      runProgressToken: string;
+      runPublicationToken?: string;
       /** `legacy` for today's path; `launch` carries the snapshot and the one-shot bootstrap. */
       managedAuth: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }>;
       /** Call immediately before the actual launch call (createMachine / the local
@@ -1796,22 +1798,6 @@ export async function dispatchSession(
     }
   }
 
-  let runnerCallbackUrl = "";
-  let runToken = "";
-  if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
-    const minted = mintRunToken({
-      issueId: issue.id,
-      mappingTeamKey: issue.scopeKey,
-      phase: opts.phase,
-      audience: "result",
-      dispatchId,
-      ttlSeconds: opts.tokenTtlSeconds,
-      secret: config.runnerTokenSecret,
-    });
-    runnerCallbackUrl = config.runnerCallbackBaseUrl;
-    runToken = minted.token;
-  }
-
   let launchAttempted = false;
   const markLaunchAttempted = () => {
     launchAttempted = true;
@@ -1819,7 +1805,30 @@ export async function dispatchSession(
 
   let result: SessionBackendResult;
   try {
-    result = await opts.backend({ sessionToken, machineNonce, runnerCallbackUrl, runToken, managedAuth: managedDecision, markLaunchAttempted });
+    let runnerCallbackUrl = "";
+    let tokens: Partial<LaunchTokens> = {};
+    if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
+      tokens = mintLaunchTokens({
+        issueId: issue.id,
+        mappingTeamKey: issue.scopeKey,
+        phase: opts.phase,
+        dispatchId,
+        repository: `${mapping.owner}/${mapping.repo}`,
+        ttlSeconds: opts.tokenTtlSeconds,
+        secret: config.runnerTokenSecret,
+      });
+      runnerCallbackUrl = config.runnerCallbackBaseUrl;
+    }
+    result = await opts.backend({
+      sessionToken,
+      machineNonce,
+      runnerCallbackUrl,
+      runToken: tokens.runToken ?? "",
+      runProgressToken: tokens.runProgressToken ?? "",
+      runPublicationToken: tokens.runPublicationToken,
+      managedAuth: managedDecision,
+      markLaunchAttempted,
+    });
   } catch (err) {
     if (managedDecision.kind === "launch" && opts.managedAuth) {
       settleLaunch(managedDecision, classifyLaunchError(opts.backendKind, launchAttempted, err), opts.managedAuth.runtime);
@@ -1900,6 +1909,8 @@ export async function dispatchSession(
 
 // ---------- Dispatch: Fly Machines ----------
 
+// Exported for direct testing of the launch contract — see the matching comment on
+// dispatchGitHubActions. Not part of the module's public API otherwise.
 export async function dispatchFlyMachine(
   config: AppConfig,
   provider: TicketingProvider,
@@ -1946,7 +1957,7 @@ export async function dispatchFlyMachine(
     managedAuth: { runtime: getModelAuthRuntime(config), workflowFile: mapping.workflowFile },
     isDefinitiveLaunchFailure: isDefinitiveFlyRejectionError,
     branchInfo: shadow ? undefined : { fieldValue: baseBranchFieldValue, defaultBranch: mapping.defaultBranch },
-    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, managedAuth, markLaunchAttempted }) => {
+    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, runProgressToken, runPublicationToken, managedAuth, markLaunchAttempted }) => {
       const minSecretsVersion = getFlySecretsMinVersion();
 
       let allSecretNames: string[] = [];
@@ -2024,6 +2035,8 @@ export async function dispatchFlyMachine(
         orchestratorUrl: config.runnerCallbackBaseUrl ?? undefined,
         runnerCallbackUrl: runnerCallbackUrl || undefined,
         runToken: runToken || undefined,
+        runProgressToken: runProgressToken || undefined,
+        runPublicationToken,
         orchestratorApp: config.flyOrchestratorApp ?? undefined,
         tenantId: config.tenantId ?? undefined,
         expectedTtlSeconds: Math.round(SWEEP_MACHINE_MAX_AGE_MS / 1000),
@@ -2091,7 +2104,7 @@ export async function dispatchLocalDocker(
     managedAuth: { runtime: getModelAuthRuntime(config), workflowFile: mapping.workflowFile },
     isDefinitiveLaunchFailure: isDefinitiveLocalDockerLaunchFailure,
     branchInfo: { fieldValue: baseBranchFieldValue, defaultBranch: mapping.defaultBranch },
-    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, managedAuth, markLaunchAttempted }) => {
+    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, runProgressToken, runPublicationToken, managedAuth, markLaunchAttempted }) => {
       const localOrchestratorUrl =
         config.localRunnerOrchestratorUrl ??
         config.runnerCallbackBaseUrl ??
@@ -2142,6 +2155,8 @@ export async function dispatchLocalDocker(
         orchestratorUrl: localOrchestratorUrl,
         runnerCallbackUrl: runnerCallbackUrl || undefined,
         runToken: runToken || undefined,
+        runProgressToken: runProgressToken || undefined,
+        runPublicationToken,
         extraEnv: (() => {
           const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue), ...assigneeRunnerEnv(issue), ...(protectedLaunch ? {} : { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(localImplRunConfig) }) };
           return Object.keys(merged).length > 0 ? merged : undefined;
@@ -2552,7 +2567,7 @@ export async function tryFastReleasePlanningAdmission(config: AppConfig, dispatc
   }
 }
 
-const TTL_STALE_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved"]);
+const TTL_STALE_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved", "external_review_pending"]);
 
 export async function monitorJobs(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const inFlightJobs = getInFlightJobs();
@@ -3750,6 +3765,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
       let runnerCallbackUrl = "";
       let runToken = "";
       let runProgressToken = "";
+      let mintedPublicationToken: string | undefined;
       let dispatchId: string | undefined;
       // This snapshot defines the findings this specific gap-fill dispatch is
       // allowed to resolve. Findings that arrive after the snapshot remain open
@@ -3822,27 +3838,20 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         // Gap-fill dispatches run the implementation workflow and can take as
         // long as the initial implementation, even though they report back as
         // gap-analysis so Linear status does not regress.
-        const minted = mintRunToken({
+        dispatchId = crypto.randomUUID();
+        const minted = mintLaunchTokens({
           issueId: fix.issueId,
           mappingTeamKey: scopeKey,
           phase: "gap-analysis",
-          audience: "result",
-          ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-          secret: config.runnerTokenSecret,
-        });
-        dispatchId = minted.dispatchId;
-        const progressMinted = mintRunToken({
-          issueId: fix.issueId,
-          mappingTeamKey: scopeKey,
-          phase: "gap-analysis",
-          audience: "progress",
           dispatchId,
           ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
           secret: config.runnerTokenSecret,
+          repository: `${mapping.owner}/${mapping.repo}`,
         });
         runnerCallbackUrl = config.runnerCallbackBaseUrl;
-        runToken = minted.token;
-        runProgressToken = progressMinted.token;
+        runToken = minted.runToken;
+        runProgressToken = minted.runProgressToken;
+        mintedPublicationToken = minted.runPublicationToken;
       }
 
       if (runnerMode === "local") {
@@ -3914,6 +3923,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
             runnerCallbackUrl: runnerCallbackUrl || undefined,
             runToken: runToken || undefined,
             runProgressToken: runProgressToken || undefined,
+            runPublicationToken: mintedPublicationToken,
             anthropicApiKey: reviewFixDecision.kind === "launch" ? undefined : config.anthropicApiKey,
             claudeOAuthToken: reviewFixDecision.kind === "launch" ? undefined : config.claudeOAuthToken,
             retryPolicy: getRetryPolicy(),
@@ -4013,21 +4023,8 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           ref: mapping.defaultBranch,
         });
         reviewFixContract = reviewFixCapabilities.contract;
-        const runPublicationToken = reviewFixContract === "envelope"
-          && reviewFixCapabilities.supportsRunPublicationToken
-          && dispatchId
-          && config.runnerCallbackBaseUrl
-          && config.runnerTokenSecret
-          ? mintRunToken({
-              issueId: fix.issueId,
-              mappingTeamKey: scopeKey,
-              phase: "gap-analysis",
-              audience: "publication",
-              dispatchId,
-              repository: `${mapping.owner}/${mapping.repo}`,
-              ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-              secret: config.runnerTokenSecret,
-            }).token
+        const runPublicationToken = reviewFixContract === "envelope" && reviewFixCapabilities.supportsRunPublicationToken
+          ? mintedPublicationToken
           : undefined;
 
         const fixIssue = {
@@ -4277,12 +4274,13 @@ async function handleKgRefreshOutcome(
 const reviewFixAttemptStore = new SqliteReviewFixAttemptStore();
 const kgRefreshIngressClient = createKgRefreshIngressClient();
 // AII-1227: starts LateExternalReview only while the sidecar is ready and the endpoint registered.
+function restateReady(): boolean {
+  const restate = getRestateStatus();
+  return restate.sidecar.state === "ready" && restate.registration.state === "registered";
+}
 const submitLateExternalReview = createLateExternalReviewSubmitHook({
   ingress: createLateExternalReviewIngressClient(),
-  restateReady: () => {
-    const restate = getRestateStatus();
-    return restate.sidecar.state === "ready" && restate.registration.state === "registered";
-  },
+  restateReady,
 });
 // A repository-fix project's workflow follows the auto-fix to its new head (ADR 038); the mode rides the input.
 const lateExternalReviewSubmitHook: typeof submitLateExternalReview = (input) => {
@@ -4320,6 +4318,27 @@ export function deployHealth(): { held: boolean; startedAt: number | null } {
 }
 
 /**
+ * The KG-repo PR webhook's `enqueueDryRun` dependency (AII-1405). It answers `unavailable` with no
+ * KG source repo, and while Restate is not ready (sidecar not `ready` or registration not
+ * `registered`) it skips the dry run: `submit` sends the new `KgRepo.watch` handler, which a
+ * declined registration cannot serve, so the send would retry forever and block the key.
+ */
+export function makeKgDryRunEnqueue(
+  kgSourceRepo: string | null | undefined,
+  ingress: Pick<KgRefreshIngressClient, "enqueueDryRun">,
+  ready: () => boolean,
+): KgPrCheckConfig["enqueueDryRun"] {
+  return async (key, entry, opts) => {
+    if (!kgSourceRepo) return { status: "unavailable" as const };
+    if (!ready()) {
+      console.warn(`[kg-refresh] skipping dry run for ${key}: Restate registration is not registered`);
+      return { status: "unavailable" as const };
+    }
+    return ingress.enqueueDryRun(parseKgSourceRepo(kgSourceRepo).fullName, { key, ...entry }, opts);
+  };
+}
+
+/**
  * `AdminDeps.kgRefresh` over the Restate services: trigger and status go through the tool
  * handlers as the in-process system caller; cancel calls the `cancel` of the workflow keyed
  * by the clicked row's `dispatchId` (a kg-refresh row's dispatchId is its trigger id) and
@@ -4352,6 +4371,7 @@ export function makeKgRefreshAdminDeps(
       const out = await client.cancel(dispatchId, reason);
       if (out.status === "unavailable") return kgUnavailableAnswer(deployHeld);
       if (out.status === "not-found") return { status: 409, body: { error: "no-refresh-in-flight" } };
+      if (out.status === "conflict") return { status: 409, body: { error: out.error ?? "conflict" } };
       return { status: 200, body: { cancelled: true } };
     },
   };
@@ -4682,10 +4702,7 @@ function startServer(
         kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
-        enqueueDryRun: (key, entry, opts) =>
-          config.kgSourceRepo
-            ? kgRefreshIngressClient.enqueueDryRun(parseKgSourceRepo(config.kgSourceRepo).fullName, { key, ...entry }, opts)
-            : Promise.resolve({ status: "unavailable" as const }),
+        enqueueDryRun: makeKgDryRunEnqueue(config.kgSourceRepo, kgRefreshIngressClient, restateReady),
         forgetKgPr: (repo, prNumber) => kgRefresh.forgetPr(repo, prNumber),
       }, async (repository, prNumber) => { await queueReviewFixCancellationForClosedPr(repository, prNumber, reviewFixIngressClient); }, reviewFixIngressClient).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
@@ -5268,6 +5285,7 @@ async function main(): Promise<void> {
   seedKgMaterializeDirectFromEnv(process.env.KG_MATERIALIZE_DIRECT); // AII-1109: seeds once, inert thereafter
   seedKgExecutionModeFromEnv(process.env.KG_EXECUTION_MODE); // seeds once, inert thereafter
   seedLinearPickupLabelFromEnv(process.env.LINEAR_PICKUP_LABEL); // AII-694: seeds once, inert thereafter
+  seedRunnerImageAllowedPrefixesFromEnv(process.env.RUNNER_IMAGE_ALLOWED_PREFIXES); // AII-1321: seeds once, inert thereafter
   initAccessEntriesTable();
   initReconciliationTable();
   initStepLogTable();
@@ -5341,7 +5359,7 @@ async function main(): Promise<void> {
   console.log(`[restate] retention ${getRestateRetentionDays()} days`);
   // Fire-and-forget: the helper never throws, and boot must not wait on Fly.
   void applyVolumeSnapshotRetentionAtBoot(config.flyDeployToken, process.env.FLY_APP_NAME, getVolumeSnapshotRetentionDays);
-  const reviewFixServices = createProductionReviewFixServices(config, registry, reviewFixAttemptStore);
+  const reviewFixServices = createProductionReviewFixServices(config, registry, reviewFixAttemptStore, submitLateExternalReview);
   // The KgRepo object and KgRefresh workflow (AII-683). Skipped without KG_SOURCE_REPO: the
   // tool handlers then answer 501 from their unset deps.
   const kgSourceRepo = config.kgSourceRepo;
@@ -5415,6 +5433,7 @@ async function main(): Promise<void> {
     registerRestateEndpoint,
     onRegistered: async () => {
       sweepOnRegistered(config);
+      await scrubOperatorLegacyTokens();
       await seedRunnerBackends();
       await refreshRunnerBackendCache();
       await bootReconciliation.onRegistered();

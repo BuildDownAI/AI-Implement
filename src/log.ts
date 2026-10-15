@@ -101,6 +101,34 @@ export function initLogTable(): void {
       last_attempt_at INTEGER
     )
   `);
+  // Kept so an older image still starts; rows it writes during a rollback move to late_review_pending at the next boot.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS attempt_review_pending (
+      attempt_id TEXT PRIMARY KEY,
+      dispatch_id TEXT NOT NULL,
+      pr_url TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    )
+  `);
+  // AII-1362: one outbox for every LateExternalReview submit whose state is not in dispatch_log.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS late_review_pending (
+      workflow_key TEXT PRIMARY KEY,
+      dispatch_id TEXT NOT NULL,
+      pr_url TEXT NOT NULL,
+      head_sha TEXT,
+      attempt_id TEXT,
+      created_at INTEGER NOT NULL
+    )
+  `);
+  // Every boot: move attempt_review_pending rows (the key matches lateExternalReviewWorkflowKey).
+  db.transaction(() => {
+    db.exec(`
+      INSERT OR IGNORE INTO late_review_pending (workflow_key, dispatch_id, pr_url, head_sha, attempt_id, created_at)
+      SELECT dispatch_id || '-' || attempt_id, dispatch_id, pr_url, NULL, attempt_id, created_at FROM attempt_review_pending
+    `);
+    db.exec("DELETE FROM attempt_review_pending");
+  })();
   ensureLogColumns();
 }
 
@@ -335,6 +363,14 @@ export function getRunRecordMergeVerdict(issueIdentifier: string, prUrl: string)
   return "hold";
 }
 
+/** The PR's latest `implementation` / `gap-analysis` row, the one `getRunRecordMergeVerdict` reads. */
+export function getLatestWorkRowForPr(prUrl: string): { id: number; dispatchId: string | null; inFlight: boolean } | null {
+  const row = getDb()
+    .prepare("SELECT id, dispatch_id, status FROM dispatch_log WHERE pr_url = ? AND phase IN ('implementation', 'gap-analysis') ORDER BY id DESC LIMIT 1")
+    .get(prUrl) as { id: number; dispatch_id: string | null; status: string } | undefined;
+  return row ? { id: row.id, dispatchId: row.dispatch_id, inFlight: row.status === "dispatched" || row.status === "running" } : null;
+}
+
 /**
  * Counts prior dispatches for an issue. When `phase` is given, only the
  * matching phase family is counted: planning dispatches number independently
@@ -494,7 +530,7 @@ export function updateJobStatus(
     .prepare(
       `UPDATE dispatch_log
        SET status = ?,
-           conclusion = CASE WHEN conclusion IN ('operator_cancelled', 'runner_approved') THEN conclusion ELSE ? END,
+           conclusion = CASE WHEN conclusion IN ('operator_cancelled', 'runner_approved', 'external_review_pending') THEN conclusion ELSE ? END,
            pr_url = COALESCE(?, pr_url), completed_at = ?,
            machine_nonce = CASE WHEN ? = 1 THEN NULL ELSE machine_nonce END
        WHERE id = ?`,
@@ -577,6 +613,58 @@ export function getInFlightJobs(): Job[] {
       )
       .all() as RawRow[],
   );
+}
+
+/**
+ * Gap-fill rows still waiting on their late external review: completed with the pending
+ * conclusion, no approval mark, a PR, and finished at or after `sinceMs` (AII-1304).
+ */
+export function getGapFillRowsAwaitingLateReview(sinceMs: number): Job[] {
+  return mapRows(
+    getDb()
+      .prepare(
+        "SELECT * FROM dispatch_log WHERE phase = 'gap-analysis' AND status = 'completed' AND conclusion = 'external_review_pending' AND approved = 0 AND pr_url IS NOT NULL AND dispatch_id IS NOT NULL AND completed_at >= ? ORDER BY completed_at ASC",
+      )
+      .all(sinceMs) as RawRow[],
+  );
+}
+
+export interface PendingLateReview {
+  workflowKey: string;
+  dispatchId: string;
+  prUrl: string;
+  headSha: string | null;
+  attemptId: string | null;
+}
+
+/**
+ * Records a LateExternalReview submit that still needs to settle (AII-1362). Idempotent per workflow key.
+ * The caller computes `workflowKey` with `lateExternalReviewWorkflowKey` (importing it here would be circular).
+ */
+export function recordPendingLateReview(
+  input: { workflowKey: string; dispatchId: string; prUrl: string; headSha?: string; attemptId?: string },
+  now = Date.now(),
+): void {
+  getDb()
+    .prepare(
+      "INSERT OR IGNORE INTO late_review_pending (workflow_key, dispatch_id, pr_url, head_sha, attempt_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .run(input.workflowKey, input.dispatchId, input.prUrl, input.headSha ?? null, input.attemptId ?? null, now);
+}
+
+/** Pending late reviews recorded at or after `sinceMs`, oldest first. */
+export function getPendingLateReviews(sinceMs: number): PendingLateReview[] {
+  // A record older than the window is never retried again; drop it rather than keep dead data.
+  const expired = getDb().prepare("DELETE FROM late_review_pending WHERE created_at < ?").run(sinceMs).changes;
+  if (expired > 0) console.log(`[late-review] Dropped ${expired} expired pending late review(s)`);
+  const rows = getDb()
+    .prepare("SELECT workflow_key, dispatch_id, pr_url, head_sha, attempt_id FROM late_review_pending WHERE created_at >= ? ORDER BY created_at ASC")
+    .all(sinceMs) as Array<{ workflow_key: string; dispatch_id: string; pr_url: string; head_sha: string | null; attempt_id: string | null }>;
+  return rows.map((r) => ({ workflowKey: r.workflow_key, dispatchId: r.dispatch_id, prUrl: r.pr_url, headSha: r.head_sha, attemptId: r.attempt_id }));
+}
+
+export function clearPendingLateReview(workflowKey: string): void {
+  getDb().prepare("DELETE FROM late_review_pending WHERE workflow_key = ?").run(workflowKey);
 }
 
 export function getInFlightIssueIds(): Set<string> {

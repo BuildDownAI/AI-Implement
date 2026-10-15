@@ -65,7 +65,7 @@ import { orchestratorTools, setKgRefreshToolDeps } from "../../restate/tools.js"
 import { callToolAsSystem } from "../../restate/tools-client.js";
 import { makeKgRefreshAdminDeps, sweepLegacyKgRefreshRows } from "../../index.js";
 import type { RestateService } from "../../restate/endpoint.js";
-import { VARIANTS, eventually, journalEntries, journaledRunResult, queryInvocations, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, eventually, journalEntries, journalText, journaledRunResult, queryInvocations, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
 
 const KG_SOURCE_REPO = "TestOrg/test-kg-source";
 const NAMESPACE = "https://kg.test.example/";
@@ -129,106 +129,114 @@ let tarball: Buffer;
 let fixtureRepo: string;
 let compose: (over?: Partial<Parameters<typeof createProductionKgRefreshServices>[0]>) => ReturnType<typeof createProductionKgRefreshServices>;
 
+// Shared setup for the blocks that call `compose`; runs once, so a block can run alone (`-t P11`).
+let composeReady = false;
+function ensureCompose(): void {
+  if (composeReady) return;
+  composeReady = true;
+  getDb();
+  initLogTable();
+  initMappingsTable();
+  initSettingsTable();
+  getDb().prepare(`
+    INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, dependency_token_scope)
+    VALUES ('KGT', 'TestOrg', 'test-kg-source', 'claude-implement.yml', 'main', 5, 'installation')
+  `).run();
+
+  fixtureRepo = mkdtempSync(join(tmpdir(), "kgpilotrepo-"));
+  writeFileSync(join(fixtureRepo, "sources.yml"), `namespace: ${NAMESPACE}\n`);
+  mkdirSync(join(fixtureRepo, "snapshot"), { recursive: true });
+  writeFileSync(join(fixtureRepo, "snapshot", "embeddings.npz"), "vectors");
+  writeFileSync(join(fixtureRepo, "snapshot", "embeddings.meta.json"), "{}");
+  tarball = makeTarball(fixtureRepo);
+  sim.dataRoot = mkdtempSync(join(tmpdir(), "kgpilotroot-"));
+
+  sim.postWorkflowDispatch = async (opts) => {
+    gh.dispatches.push({ ...opts.inputs });
+    if (gh.dispatchOutcome === "rejected") return { success: false, status: 422, outcome: "rejected", error: "workflow file not found" };
+    if (gh.dispatchOutcome === "unknown") return { success: false, status: 0, outcome: "unknown", error: "ack lost" };
+    return { success: true, status: 200, outcome: "accepted", runId: gh.dispatchRunId, runUrl: `https://github.test/run/${gh.dispatchRunId}` };
+  };
+
+  process.env.KG_SIDECAR_URL = "http://127.0.0.1:1/mcp";
+  const railFakes = {
+    mintToken: (async () => ({ token: "tok", expiresAt: "" })) as unknown as KgRailDeps["mintToken"],
+    fetchTarball: (async () => {
+      railFetchCalls++;
+      const gate = sim.fetchGate;
+      sim.fetchGate = undefined; // latch only the first call
+      if (gate) await gate;
+      return tarball;
+    }) as unknown as KgRailDeps["fetchTarball"],
+    fetchDefaultBranch: (async () => "main") as unknown as KgRailDeps["fetchDefaultBranch"],
+    fetchSnapshotCommitSha: (async () => SNAPSHOT_SHA) as unknown as KgRailDeps["fetchSnapshotCommitSha"],
+    materialize: (async (_python: string, cwd: string) => {
+      railMaterializeCalls++;
+      mkdirSync(join(cwd, "out"), { recursive: true });
+      writeFileSync(join(cwd, "out", "graph.trig"), "@prefix kg: <x> .");
+      writeFileSync(join(cwd, "out", "embeddings.npz"), "vectors");
+    }) as KgRailDeps["materialize"],
+    mcpToolCall: (async (_url: string, tool: string): Promise<unknown> => {
+      if (tool === "kg_neighbors") return { edges: [{ predicate_iri: "http://purl.org/dc/terms/modified", neighbor: servedStamp }] };
+      if (tool === "kg_hybrid_search") return { count: 3, degraded: false, results: [] };
+      throw new Error(`unexpected tool ${tool}`);
+    }) as KgRailDeps["mcpToolCall"],
+    sidecar: { restart: async () => { servedStamp = NEW_STAMP; } },
+    postPrCommentFn: (async () => {}) as unknown as KgRailDeps["postPrCommentFn"],
+    postOrUpdateStickyCommentFn: (async () => {}) as unknown as KgRailDeps["postOrUpdateStickyCommentFn"],
+    setCommitStatusFn: (async () => {}) as unknown as KgRailDeps["setCommitStatusFn"],
+    mergePullRequestFn: (async () => { mergeCalls++; return "merged"; }) as unknown as KgRailDeps["mergePullRequestFn"],
+    closePullRequestFn: (async () => {}) as unknown as KgRailDeps["closePullRequestFn"],
+    getPullRequestStateFn: (async () => null) as unknown as KgRailDeps["getPullRequestStateFn"],
+    deleteBranchFn: (async () => {}) as unknown as KgRailDeps["deleteBranchFn"],
+  };
+
+  compose = (over = {}) => createProductionKgRefreshServices({
+    kgSourceRepo: KG_SOURCE_REPO,
+    config: {
+      githubAppId: "test-app-id", githubAppPrivateKey: "test-private-key", sessionImage: "runner:test",
+      runnerImageExplicit: false, runnerCallbackBaseUrl: "https://orchestrator.test", runnerTokenSecret: SECRET,
+      flySessionsToken: null, flySessionsApp: null, flySessionsRegion: null,
+      localRunnerImage: "local:img", localRunnerOrchestratorUrl: null, healthPort: 8080,
+      anthropicApiKey: null, claudeOAuthToken: null,
+    },
+    ...railFakes,
+    // Sender deps: the GitHub Actions path uses the faked dispatch POST; the machine backends must not run.
+    getInstallationToken: async () => "tok",
+    getScopedInstallationToken: async () => ({ token: "scoped-tok", expiresAt: "", installationId: 1 }),
+    resolveRunnerImage: async () => undefined,
+    postWorkflowDispatch: ((opts: { inputs: Record<string, string | undefined> }) => sim.postWorkflowDispatch(opts)) as never,
+    keptMachineFly: () => { throw new Error("the Fly sender must not run on the GHA path"); },
+    startLocalRunnerContainer: async () => { throw new Error("the local Docker sender must not run on the GHA path"); },
+    // No runner mode resolves KG to GitHub Actions now (AII-1130); the seam keeps this branch under test until AII-1110.
+    resolveExecutionMode: () => "github-actions",
+    updateJobStatus,
+    getWorkflowRunStatus: async (runId) => { gh.statusCalls.push(runId); return { ...gh.runState }; },
+    findRunByTitle: async () => gh.findResult(++gh.findCalls),
+    cancelWorkflowRun: async (runId) => { gh.cancelCalls.push(runId); return true; },
+    persistLastRefresh: (outcome: RefreshOutcome) => { persistCalls++; defaultPersistLastRefresh(outcome); },
+    handleKgRefreshOutcome: () => {},
+    isDeployHeld: () => false,
+    readStatusRecord: defaultLoadLastRefresh,
+    runPreflight: () => runKgRefreshPreflight({
+      githubAppId: "test-app-id", githubAppPrivateKey: "test-private-key", kgSourceRepo: KG_SOURCE_REPO,
+      mintToken: railFakes.mintToken as never,
+      fetchTarball: (async () => tarball) as never,
+      fetchDefaultBranch: async () => "main",
+      probeRepo: async () => ({ ok: true, status: 200 }),
+      fetchWorkflowFile: async () => ({ status: 200, content: ENVELOPE_WORKFLOW_YAML }),
+      fetchCompare: async () => ({ status: 200, behindBy: 0 }),
+    }),
+    ...over,
+  });
+}
+
 describe("Restate kg-refresh pilot: production-composition proof", () => {
   let environments: Map<string, RestateEnvironment>;
   let services: RestateService[];
 
   beforeAll(async () => {
-    getDb();
-    initLogTable();
-    initMappingsTable();
-    initSettingsTable();
-    getDb().prepare(`
-      INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, dependency_token_scope)
-      VALUES ('KGT', 'TestOrg', 'test-kg-source', 'claude-implement.yml', 'main', 5, 'installation')
-    `).run();
-
-    fixtureRepo = mkdtempSync(join(tmpdir(), "kgpilotrepo-"));
-    writeFileSync(join(fixtureRepo, "sources.yml"), `namespace: ${NAMESPACE}\n`);
-    mkdirSync(join(fixtureRepo, "snapshot"), { recursive: true });
-    writeFileSync(join(fixtureRepo, "snapshot", "embeddings.npz"), "vectors");
-    writeFileSync(join(fixtureRepo, "snapshot", "embeddings.meta.json"), "{}");
-    tarball = makeTarball(fixtureRepo);
-    sim.dataRoot = mkdtempSync(join(tmpdir(), "kgpilotroot-"));
-
-    sim.postWorkflowDispatch = async (opts) => {
-      gh.dispatches.push({ ...opts.inputs });
-      if (gh.dispatchOutcome === "rejected") return { success: false, status: 422, outcome: "rejected", error: "workflow file not found" };
-      if (gh.dispatchOutcome === "unknown") return { success: false, status: 0, outcome: "unknown", error: "ack lost" };
-      return { success: true, status: 200, outcome: "accepted", runId: gh.dispatchRunId, runUrl: `https://github.test/run/${gh.dispatchRunId}` };
-    };
-
-    process.env.KG_SIDECAR_URL = "http://127.0.0.1:1/mcp";
-    const railFakes = {
-      mintToken: (async () => ({ token: "tok", expiresAt: "" })) as unknown as KgRailDeps["mintToken"],
-      fetchTarball: (async () => {
-        railFetchCalls++;
-        const gate = sim.fetchGate;
-        sim.fetchGate = undefined; // latch only the first call
-        if (gate) await gate;
-        return tarball;
-      }) as unknown as KgRailDeps["fetchTarball"],
-      fetchDefaultBranch: (async () => "main") as unknown as KgRailDeps["fetchDefaultBranch"],
-      fetchSnapshotCommitSha: (async () => SNAPSHOT_SHA) as unknown as KgRailDeps["fetchSnapshotCommitSha"],
-      materialize: (async (_python: string, cwd: string) => {
-        railMaterializeCalls++;
-        mkdirSync(join(cwd, "out"), { recursive: true });
-        writeFileSync(join(cwd, "out", "graph.trig"), "@prefix kg: <x> .");
-        writeFileSync(join(cwd, "out", "embeddings.npz"), "vectors");
-      }) as KgRailDeps["materialize"],
-      mcpToolCall: (async (_url: string, tool: string): Promise<unknown> => {
-        if (tool === "kg_neighbors") return { edges: [{ predicate_iri: "http://purl.org/dc/terms/modified", neighbor: servedStamp }] };
-        if (tool === "kg_hybrid_search") return { count: 3, degraded: false, results: [] };
-        throw new Error(`unexpected tool ${tool}`);
-      }) as KgRailDeps["mcpToolCall"],
-      sidecar: { restart: async () => { servedStamp = NEW_STAMP; } },
-      postPrCommentFn: (async () => {}) as unknown as KgRailDeps["postPrCommentFn"],
-      postOrUpdateStickyCommentFn: (async () => {}) as unknown as KgRailDeps["postOrUpdateStickyCommentFn"],
-      setCommitStatusFn: (async () => {}) as unknown as KgRailDeps["setCommitStatusFn"],
-      mergePullRequestFn: (async () => { mergeCalls++; return "merged"; }) as unknown as KgRailDeps["mergePullRequestFn"],
-      closePullRequestFn: (async () => {}) as unknown as KgRailDeps["closePullRequestFn"],
-      getPullRequestStateFn: (async () => null) as unknown as KgRailDeps["getPullRequestStateFn"],
-      deleteBranchFn: (async () => {}) as unknown as KgRailDeps["deleteBranchFn"],
-    };
-
-    compose = (over = {}) => createProductionKgRefreshServices({
-      kgSourceRepo: KG_SOURCE_REPO,
-      config: {
-        githubAppId: "test-app-id", githubAppPrivateKey: "test-private-key", sessionImage: "runner:test",
-        runnerImageExplicit: false, runnerCallbackBaseUrl: "https://orchestrator.test", runnerTokenSecret: SECRET,
-        flySessionsToken: null, flySessionsApp: null, flySessionsRegion: null,
-        localRunnerImage: "local:img", localRunnerOrchestratorUrl: null, healthPort: 8080,
-        anthropicApiKey: null, claudeOAuthToken: null,
-      },
-      ...railFakes,
-      // Sender deps: the GitHub Actions path uses the faked dispatch POST; the machine backends must not run.
-      getInstallationToken: async () => "tok",
-      getScopedInstallationToken: async () => ({ token: "scoped-tok", expiresAt: "", installationId: 1 }),
-      resolveRunnerImage: async () => undefined,
-      postWorkflowDispatch: ((opts: { inputs: Record<string, string | undefined> }) => sim.postWorkflowDispatch(opts)) as never,
-      keptMachineFly: () => { throw new Error("the Fly sender must not run on the GHA path"); },
-      startLocalRunnerContainer: async () => { throw new Error("the local Docker sender must not run on the GHA path"); },
-      // No runner mode resolves KG to GitHub Actions now (AII-1130); the seam keeps this branch under test until AII-1110.
-      resolveExecutionMode: () => "github-actions",
-      updateJobStatus,
-      getWorkflowRunStatus: async (runId) => { gh.statusCalls.push(runId); return { ...gh.runState }; },
-      findRunByTitle: async () => gh.findResult(++gh.findCalls),
-      cancelWorkflowRun: async (runId) => { gh.cancelCalls.push(runId); return true; },
-      persistLastRefresh: (outcome: RefreshOutcome) => { persistCalls++; defaultPersistLastRefresh(outcome); },
-      handleKgRefreshOutcome: () => {},
-      isDeployHeld: () => false,
-      readStatusRecord: defaultLoadLastRefresh,
-      runPreflight: () => runKgRefreshPreflight({
-        githubAppId: "test-app-id", githubAppPrivateKey: "test-private-key", kgSourceRepo: KG_SOURCE_REPO,
-        mintToken: railFakes.mintToken as never,
-        fetchTarball: (async () => tarball) as never,
-        fetchDefaultBranch: async () => "main",
-        probeRepo: async () => ({ ok: true, status: 200 }),
-        fetchWorkflowFile: async () => ({ status: 200, content: ENVELOPE_WORKFLOW_YAML }),
-        fetchCompare: async () => ({ status: 200, behindBy: 0 }),
-      }),
-      ...over,
-    });
+    ensureCompose();
     const composed = compose();
     setKgRefreshToolDeps(composed.toolDeps);
     services = [...composed.services, orchestratorTools];
@@ -267,7 +275,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
   }
 
   const asSystem = (env: RestateEnvironment) => (name: string, args: Record<string, unknown>) =>
-    callToolAsSystem(name, args, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true });
+    callToolAsSystem(name, args, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true, restateReady: () => true });
 
   async function toolAnswer(env: RestateEnvironment, name: string, args: Record<string, unknown> = {}): Promise<{ status: number; body: Record<string, unknown> }> {
     const result = await asSystem(env)(name, args);
@@ -587,7 +595,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
       KG_SOURCE_REPO,
       createKgRefreshIngressClient(UNROUTABLE_INGRESS),
       ((name: string, args: Record<string, unknown>) =>
-        callToolAsSystem(name, args, { ingressBaseUrl: UNROUTABLE_INGRESS, permitsExternalCall: () => true })) as typeof callToolAsSystem,
+        callToolAsSystem(name, args, { ingressBaseUrl: UNROUTABLE_INGRESS, permitsExternalCall: () => true, restateReady: () => true })) as typeof callToolAsSystem,
     );
     expect(await admin.trigger({})).toEqual({ status: 503, body: { error: "restate-unavailable" } });
     expect(kgRows()).toHaveLength(0);
@@ -659,7 +667,7 @@ describe("Restate kg-refresh pilot: Fly sessions settings are live", () => {
   it("P10: a row written after the build resolves fly-machines and the Fly sender uses the new app", async () => {
     const env = environments.get("disableRetries");
     if (!env) throw new Error("missing Restate variant");
-    const answer = await callToolAsSystem("trigger_kg_refresh", {}, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true });
+    const answer = await callToolAsSystem("trigger_kg_refresh", {}, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true, restateReady: () => true });
     if (answer.status !== "ok") throw new Error("trigger_kg_refresh unavailable");
     const triggerId = (JSON.parse(answer.content[0].text) as { body: { triggerId: string } }).body.triggerId;
     await eventually(() => createdApps.length >= 1, (ok) => ok, { label: "fly dispatch", timeoutMs: 20_000 });
@@ -680,5 +688,204 @@ describe("Restate kg-refresh pilot: Fly sessions settings are live", () => {
     );
     expect(journaledRunResult(polled!.journal, "resolve")).toMatchObject({ executionMode: "fly-machines" });
     expect(polled!.dispatchResult).toMatchObject({ outcome: "accepted", executionMode: "fly-machines", runUrl: expect.stringContaining("/apps/late-app/") });
+  }, 40_000);
+});
+
+// P11 ------------------------------------------------------------------------------
+// The machine senders receive all three run tokens in the launch env, and none enters the journal. The journal is read
+// while the workflow waits for the runner, before it finishes: Restate trims the `dispatch-1` entry afterwards, so a
+// later read would find no token for any reason.
+describe("Restate kg-refresh pilot: launch tokens reach the machine senders and stay out of the journal", () => {
+  let environments: Map<string, RestateEnvironment>;
+  let backend: "fly-machines" | "local-docker" = "fly-machines";
+  let launchEnvs: Array<Record<string, string | undefined>> = [];
+
+  beforeAll(async () => {
+    ensureCompose();
+    sim.dataRoot = mkdtempSync(join(tmpdir(), "kgpilotroot-"));
+    const fakeFly = {
+      getMachine: async () => { throw new Error("unexpected getMachine"); },
+      listMachines: async () => [],
+      createMachine: async (opts: { config: { env: Record<string, string> } }) => {
+        launchEnvs.push(opts.config.env);
+        return { id: "m-tokens", state: "started" };
+      },
+      updateMachine: async () => ({}),
+      startMachine: async () => {},
+      waitSettled: async () => null,
+      waitForStopped: async () => {},
+    };
+    const composed = compose({
+      config: {
+        githubAppId: "test-app-id", githubAppPrivateKey: "test-private-key", sessionImage: "runner:test",
+        runnerImageExplicit: false, runnerCallbackBaseUrl: "https://orchestrator.test", runnerTokenSecret: SECRET,
+        flySessionsToken: "fly-test-token", flySessionsApp: "tokens-app", flySessionsRegion: null,
+        localRunnerImage: "local:img", localRunnerOrchestratorUrl: null, healthPort: 8080,
+        anthropicApiKey: null, claudeOAuthToken: null,
+      },
+      keptMachineFly: (() => fakeFly) as never,
+      startLocalRunnerContainer: (async (opts: { runToken?: string; runProgressToken?: string; runPublicationToken?: string; machineNonce: string; orchestratorUrl: string }) => {
+        launchEnvs.push({
+          RUN_TOKEN: opts.runToken, RUN_PROGRESS_TOKEN: opts.runProgressToken, RUN_PUBLICATION_TOKEN: opts.runPublicationToken,
+          MACHINE_NONCE: opts.machineNonce, ORCHESTRATOR_URL: opts.orchestratorUrl,
+        });
+        return { containerId: "c-tokens" };
+      }) as never,
+      resolveExecutionMode: () => backend,
+    });
+    setKgRefreshToolDeps(composed.toolDeps);
+    environments = await startVariants([...composed.services, orchestratorTools]);
+  }, 60_000);
+
+  afterAll(async () => {
+    setKgRefreshToolDeps(null);
+    if (environments) await stopAll(environments);
+    rmSync(sim.dataRoot, { recursive: true, force: true });
+  });
+
+  beforeEach(() => {
+    gh = freshGithub();
+    servedStamp = OLD_STAMP;
+    launchEnvs = [];
+    getDb().prepare("DELETE FROM dispatch_log").run();
+    getDb().prepare("DELETE FROM settings WHERE key LIKE 'kg_%'").run();
+  });
+
+  describe.each(["fly-machines", "local-docker"] as const)("sender %s", (sender) => {
+    it.each(VARIANTS.map(([label]) => label))("P11: the launch env carries the result, progress and publication tokens, and the journal holds none (%s)", async (label) => {
+      backend = sender;
+      const env = environments.get(label);
+      if (!env) throw new Error(`missing Restate variant ${label}`);
+      const answer = await callToolAsSystem("trigger_kg_refresh", {}, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true, restateReady: () => true });
+      if (answer.status !== "ok") throw new Error("trigger_kg_refresh unavailable");
+      const triggerId = (JSON.parse(answer.content[0].text) as { body: { triggerId: string } }).body.triggerId;
+      await eventually(() => launchEnvs.length >= 1, (ok) => ok, { label: `${sender} launch`, timeoutMs: 20_000 });
+      const launched = launchEnvs[0];
+      const tokens = [launched.RUN_TOKEN, launched.RUN_PROGRESS_TOKEN, launched.RUN_PUBLICATION_TOKEN];
+      for (const token of tokens) expect(token).toBeTruthy();
+      expect(new Set(tokens).size).toBe(3);
+      // The nonce and the orchestrator URL keep the publication token inert on a machine backend.
+      expect(launched.MACHINE_NONCE).toBeTruthy();
+      expect(launched.ORCHESTRATOR_URL).toBeTruthy();
+
+      // Read while the workflow waits for the runner. The dispatch-1 result must be journaled before the absence counts.
+      const invocations = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`);
+      const polled = await eventually(
+        async () => {
+          const journal = await journalEntries(env.adminAPIBaseUrl(), invocations[0].id as string);
+          try {
+            return { journal, dispatchResult: journaledRunResult(journal, "dispatch-1") };
+          } catch {
+            return undefined;
+          }
+        },
+        (v) => v !== undefined,
+        { label: "dispatch-1 journaled result", timeoutMs: 20_000 },
+      );
+      expect(polled!.dispatchResult).toMatchObject({ outcome: "accepted", executionMode: sender });
+      const text = journalText(polled!.journal);
+      for (const token of tokens) expect(text).not.toContain(token);
+
+      // End the run, so the next scenario finds the marker clear.
+      const client = createKgRefreshIngressClient(env.baseUrl());
+      await handleRunnerResult({
+        authorization: `Bearer ${launched.RUN_TOKEN}`,
+        body: { phase: "kg-refresh", outcome: "failure", comments: [], ...FAILURE_REPORT } as RunnerResultBody,
+        secret: SECRET,
+        resolveProvider: async () => null,
+        kgRefreshClient: client,
+        kgSourceRepo: KG_SOURCE_REPO,
+      });
+      await eventually(async () => {
+        const marker = await client.repoStatus(KG_SOURCE_REPO);
+        return marker.status === "accepted" ? (marker.value ?? null) : undefined;
+      }, (marker) => marker === null, { label: "KgRepo marker cleared", timeoutMs: 20_000 });
+    }, 40_000);
+  });
+});
+
+describe("Restate kg-refresh pilot: the runner image check (AII-1323)", () => {
+  let environments: Map<string, RestateEnvironment>;
+  let machineCreates = 0;
+  const realFetch = globalThis.fetch;
+
+  beforeAll(async () => {
+    ensureCompose();
+    sim.dataRoot = mkdtempSync(join(tmpdir(), "kgpilotroot-"));
+    // Only the image.yml read is simulated; the harness and the ingress client use the real fetch.
+    vi.stubGlobal("fetch", async (url: string | URL | Request, init?: RequestInit) => {
+      const href = typeof url === "string" ? url : url instanceof URL ? url.href : url.url;
+      if (!href.endsWith("/contents/.ai-implement/image.yml")) return realFetch(url as never, init);
+      const content = Buffer.from("image: evil.example/runner:1\n").toString("base64");
+      return new Response(JSON.stringify({ type: "file", encoding: "base64", content }), { status: 200 });
+    });
+    const { resolveRunnerImageForDispatch } = await vi.importActual<typeof import("../../repo-image.js")>("../../repo-image.js");
+    const fakeFly = {
+      getMachine: async () => { throw new Error("unexpected getMachine"); },
+      listMachines: async () => [],
+      createMachine: async () => { machineCreates++; return { id: "m-image", state: "started" }; },
+      updateMachine: async () => ({}),
+      startMachine: async () => {},
+      waitSettled: async () => null,
+      waitForStopped: async () => {},
+    };
+    const composed = compose({
+      config: {
+        githubAppId: "test-app-id", githubAppPrivateKey: "test-private-key", sessionImage: "ghcr.io/builddownai/ai-implement-runner:latest",
+        runnerImageExplicit: false, runnerCallbackBaseUrl: "https://orchestrator.test", runnerTokenSecret: SECRET,
+        flySessionsToken: "fly-test-token", flySessionsApp: "image-app", flySessionsRegion: null,
+        localRunnerImage: "local:img", localRunnerOrchestratorUrl: null, healthPort: 8080,
+        anthropicApiKey: null, claudeOAuthToken: null,
+      },
+      // The real check, as production wires it.
+      resolveRunnerImage: resolveRunnerImageForDispatch,
+      fetchDefaultBranch: async () => "main",
+      keptMachineFly: (() => fakeFly) as never,
+      resolveExecutionMode: () => "fly-machines",
+    });
+    setKgRefreshToolDeps(composed.toolDeps);
+    environments = await startVariants([...composed.services, orchestratorTools]);
+  }, 60_000);
+
+  afterAll(async () => {
+    vi.unstubAllGlobals();
+    setKgRefreshToolDeps(null);
+    if (environments) await stopAll(environments);
+    rmSync(sim.dataRoot, { recursive: true, force: true });
+  });
+
+  beforeEach(() => {
+    gh = freshGithub();
+    machineCreates = 0;
+    getDb().prepare("DELETE FROM dispatch_log").run();
+    getDb().prepare("DELETE FROM settings WHERE key LIKE 'kg_%'").run();
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("an image.yml naming a disallowed image journals dispatch-1 as rejected and creates no machine or workflow run (%s)", async (label) => {
+    const env = environments.get(label);
+    if (!env) throw new Error(`missing Restate variant ${label}`);
+    const answer = await callToolAsSystem("trigger_kg_refresh", {}, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true, restateReady: () => true });
+    if (answer.status !== "ok") throw new Error("trigger_kg_refresh unavailable");
+    const triggerId = (JSON.parse(answer.content[0].text) as { body: { triggerId: string } }).body.triggerId;
+    const invocations = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`);
+    const result = await eventually(
+      async () => {
+        try {
+          return journaledRunResult(await journalEntries(env.adminAPIBaseUrl(), invocations[0].id as string), "dispatch-1");
+        } catch {
+          return undefined;
+        }
+      },
+      (v) => v !== undefined,
+      { label: "dispatch-1 journaled result", timeoutMs: 20_000 },
+    );
+    expect(result).toMatchObject({ outcome: "rejected", executionMode: "fly-machines" });
+    expect(machineCreates).toBe(0);
+    expect(gh.dispatches).toEqual([]);
+    const client = createKgRefreshIngressClient(env.baseUrl());
+    await eventually(async () => {
+      const marker = await client.repoStatus(KG_SOURCE_REPO);
+      return marker.status === "accepted" ? (marker.value ?? null) : undefined;
+    }, (marker) => marker === null, { label: "KgRepo marker cleared", timeoutMs: 20_000 });
   }, 40_000);
 });

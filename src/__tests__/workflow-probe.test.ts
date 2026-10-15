@@ -17,7 +17,9 @@ const PUBLICATION_TOKEN_YML =
 const ATTEMPT_TOKEN_YML =
   "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n      run_attempt_token:\n        required: false\n";
 
-function mockContents(yamlBody: string): ReturnType<typeof vi.fn> {
+type FetchMock = typeof fetch & ReturnType<typeof vi.fn>;
+
+function mockContents(yamlBody: string): FetchMock {
   return vi.fn().mockResolvedValue({
     ok: true,
     status: 200,
@@ -29,7 +31,7 @@ function mockContents(yamlBody: string): ReturnType<typeof vi.fn> {
   });
 }
 
-function mockFetch(status: number, body: unknown): ReturnType<typeof vi.fn> {
+function mockFetch(status: number, body: unknown): FetchMock {
   return vi.fn().mockResolvedValue({
     ok: status >= 200 && status < 300,
     status,
@@ -156,7 +158,7 @@ describe("resolveWorkflowContract", () => {
   });
 
   it("returns legacy when fetch throws without rethrowing", async () => {
-    const fetchImpl = vi.fn().mockRejectedValue(new Error("net"));
+    const fetchImpl = vi.fn().mockRejectedValue(new Error("net")) as FetchMock;
     const mode = await resolveWorkflowContract({
       owner: "o",
       repo: "r",
@@ -459,5 +461,43 @@ describe("resolveWorkflowCapabilities — supportsPrivateRunConfig", () => {
   it("does not advertise or imply the stage-agent-config capability", async () => {
     const caps = await probe(mockContents(MARKER + ENVELOPE_YML));
     expect(Object.keys(caps).join(",")).not.toMatch(/stage/i);
+  });
+});
+
+describe("transient probe failures (AII-1292)", () => {
+  beforeEach(() => {
+    __clearWorkflowProbeCacheForTests();
+  });
+  const base = { owner: "o", repo: "r", workflowFile: "claude-implement.yml", token: "t", ref: "main" };
+  const transient: Array<[string, () => FetchMock]> = [
+    ["fetch throw", () => vi.fn().mockRejectedValue(new Error("net")) as FetchMock],
+    ["HTTP 500", () => mockFetch(500, {})],
+    ["bad JSON", () => vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => { throw new Error("bad"); } }) as FetchMock],
+    ["non-file body", () => mockFetch(200, { type: "dir" })],
+  ];
+
+  it.each(transient)("%s is not cached and never throws by default", async (_n, make) => {
+    const fetchImpl = make();
+    const first = await resolveWorkflowCapabilities({ ...base, fetchImpl });
+    await resolveWorkflowCapabilities({ ...base, fetchImpl });
+    expect(first.contract).toBe("legacy");
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(transient)("%s throws with failOnTransient", async (_n, make) => {
+    await expect(resolveWorkflowCapabilities({ ...base, fetchImpl: make(), failOnTransient: true })).rejects.toThrow();
+  });
+
+  it("a 404 and a real legacy workflow stay cached and do not throw with failOnTransient", async () => {
+    const notFound = mockFetch(404, {});
+    expect(await resolveWorkflowContract({ ...base, fetchImpl: notFound, failOnTransient: true })).toBe("legacy");
+    await resolveWorkflowContract({ ...base, fetchImpl: notFound, failOnTransient: true });
+    expect(notFound).toHaveBeenCalledOnce();
+
+    __clearWorkflowProbeCacheForTests();
+    const legacy = mockContents(LEGACY_YML);
+    expect(await resolveWorkflowContract({ ...base, fetchImpl: legacy, failOnTransient: true })).toBe("legacy");
+    await resolveWorkflowContract({ ...base, fetchImpl: legacy });
+    expect(legacy).toHaveBeenCalledOnce();
   });
 });

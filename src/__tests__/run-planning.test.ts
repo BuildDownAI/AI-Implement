@@ -80,7 +80,7 @@ describe("runPlanning", () => {
     const result = await runPlanning({
       workspaceDir: ws,
       executor: fakeExecutor,
-      fetchImpl: fakeFetch,
+      fetchImpl: fakeFetch as unknown as typeof fetch,
     });
 
     expect(result.exitCode).toBe(0);
@@ -104,7 +104,7 @@ describe("runPlanning", () => {
     const result = await runPlanning({
       workspaceDir: ws,
       executor: () => ({ status: 1, stdout: "", stderr: "boom" }),
-      fetchImpl: fakeFetch,
+      fetchImpl: fakeFetch as unknown as typeof fetch,
     });
     expect(result.exitCode).toBe(1);
     expect(posted[0]).toMatchObject({ phase: "planning", outcome: "failure" });
@@ -163,7 +163,7 @@ describe("runPlanning", () => {
     const result = await runPlanning({
       workspaceDir: ws,
       executor: () => ({ status: 0, stdout: "", stderr: "" }),
-      fetchImpl: fakeFetch,
+      fetchImpl: fakeFetch as unknown as typeof fetch,
     });
     expect(result.exitCode).toBe(0);
     expect(posted).toHaveLength(1);

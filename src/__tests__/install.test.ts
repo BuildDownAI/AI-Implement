@@ -215,10 +215,10 @@ describe("installStep reviewers output", () => {
       headers: expect.objectContaining({ Authorization: "Bearer ghs_secret" }),
     }));
     expect(reviewerPrompt(outputs.reviewers![0]!)).toBe("malicious PR prompt");
-    expect(outputs.trustedConfigReviewers.map((reviewer) => ({ id: reviewer.id, model: reviewer.model }))).toEqual([
+    expect(outputs.trustedConfigReviewers!.map((reviewer) => ({ id: reviewer.id, model: reviewer.model }))).toEqual([
       { id: "domain-review", model: "claude-sonnet-5-5" },
     ]);
-    expect(reviewerPrompt(outputs.trustedConfigReviewers[0]!)).toBe("trusted default prompt");
+    expect(reviewerPrompt(outputs.trustedConfigReviewers![0]!)).toBe("trusted default prompt");
   });
 
   it("uses the current clone output credential without adding it to install inputs", async () => {
@@ -272,7 +272,7 @@ describe("installStep reviewers output", () => {
 
     expect(fetchImpl).toHaveBeenCalledOnce();
     expect(outputs.reviewers).toBeUndefined();
-    expect(outputs.trustedConfigReviewers.map((reviewer) => reviewer.id)).toEqual(["domain-review"]);
+    expect(outputs.trustedConfigReviewers!.map((reviewer) => reviewer.id)).toEqual(["domain-review"]);
   });
 
   it("does not fetch trusted config for an actual built-in even without a precomputed trusted map", async () => {

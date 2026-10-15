@@ -14,6 +14,7 @@ vi.mock("../log.js", () => ({
   getJobByDispatchId: vi.fn(),
   stampJobApproved: vi.fn(),
 }));
+vi.mock("../config.js", () => ({ getMappings: vi.fn(() => ({})) }));
 vi.mock("../review-ledger-store.js", () => ({
   listOpenReviewFindings: vi.fn(),
 }));
@@ -28,7 +29,7 @@ import {
   type LateExternalReviewInput,
 } from "../restate/late-external-review.js";
 
-const input: LateExternalReviewInput = {
+const input: LateExternalReviewInput & { headSha: string } = {
   dispatchId: "d-1", owner: "owner", repo: "repo", prNumber: 12, prUrl: "https://gh/pr/12", headSha: "sha-a",
 };
 const deps = createProductionLateExternalReviewDependencies({ githubAppId: "1", githubAppPrivateKey: "k" });
@@ -68,8 +69,9 @@ describe("readTick", () => {
       finding("blocking", 10), finding("medium", 20), finding("blocking", 30), finding("minor", 40),
     ]);
     vi.mocked(getCommitTime).mockResolvedValue(25);
+    vi.mocked(listPrComments).mockResolvedValue([]);
     const tick = await deps.readTick(input);
-    expect(tick).toEqual({ open: true, headSha: "sha-a", checks: "success", headCommittedAtMs: 25, blockingLastSeenAtMs: [10, 30] });
+    expect(tick).toEqual({ open: true, headSha: "sha-a", checks: "success", headCommittedAtMs: 25, blockingLastSeenAtMs: [10, 30], heldBy: "ledger" });
     expect(getCommitTime).toHaveBeenCalledWith("tok", "owner", "repo", "sha-a");
     expect(getCombinedChecksState).toHaveBeenCalledWith("tok", "owner", "repo", "sha-a");
     expect(listOpenReviewFindings).toHaveBeenCalledWith("owner/repo", 12);
@@ -91,9 +93,14 @@ describe("findJob", () => {
     expect(getJobByDispatchId).toHaveBeenCalledWith("nope");
   });
 
-  it.each([true, false])("returns only id and approved=%s for a known job", async (approved) => {
-    vi.mocked(getJobByDispatchId).mockReturnValue({ id: 7, approved, extra: "x" } as never);
-    expect(await deps.findJob("d-1")).toStrictEqual({ id: 7, approved });
+  it.each([true, false])("returns only id, approved=%s and inFlight for a known job", async (approved) => {
+    vi.mocked(getJobByDispatchId).mockReturnValue({ id: 7, approved, status: "completed", extra: "x" } as never);
+    expect(await deps.findJob("d-1")).toStrictEqual({ id: 7, approved, inFlight: false });
+  });
+
+  it.each(["dispatched", "running"])("reports a %s row as inFlight", async (status) => {
+    vi.mocked(getJobByDispatchId).mockReturnValue({ id: 7, approved: false, status } as never);
+    expect(await deps.findJob("d-1")).toStrictEqual({ id: 7, approved: false, inFlight: true });
   });
 });
 
@@ -110,6 +117,12 @@ describe("hasComment", () => {
   it("is false when no comment carries the marker", async () => {
     vi.mocked(listPrComments).mockResolvedValue([{ body: "unrelated" }] as never);
     expect(await deps.hasComment(input, LATE_EXTERNAL_APPROVAL_MARKER)).toBe(false);
+  });
+
+  it("reads strictly only when asked (AII-1361)", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([] as never);
+    await deps.hasComment(input, "m", { strict: true });
+    expect(listPrComments).toHaveBeenLastCalledWith("tok", "owner", "repo", 12, { strict: true });
   });
 });
 

@@ -48,6 +48,7 @@ function mapping(overrides: Partial<RepoMapping> & { directory: string; planning
     sensitiveAddPatterns: null,
     sensitiveAllowPatterns: null,
     dependencyTokenScope: null,
+    reviewFixLifecycle: null,
     memoryProviderId: null,
     reviewers: null,
     ...overrides,

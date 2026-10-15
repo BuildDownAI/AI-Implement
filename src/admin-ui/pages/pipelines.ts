@@ -369,8 +369,14 @@ export const pipelinesScript = `
         const cancelBtn = target.closest('[data-cancel-id]');
         if (cancelBtn) {
           const cancelId = cancelBtn.getAttribute('data-cancel-id');
-          if (cancelId && confirm('Stop this KG-refresh run? The machine will be destroyed and the job closed.')) {
+          if (cancelId && confirm('Ask the run to stop? The refresh closes the job itself; a run past the merge cannot be stopped.')) {
             window.api('/api/sessions/' + encodeURIComponent(cancelId), { method: 'DELETE' })
+              .then(function (res) {
+                if (res.ok) return null;
+                return res.json().catch(function () { return {}; }).then(function (body) {
+                  alert((body && body.error) || ('Stop refused (' + res.status + ')'));
+                });
+              })
               .then(function () { load(); })
               .catch(function (err) { console.error('cancel failed:', err); });
           }

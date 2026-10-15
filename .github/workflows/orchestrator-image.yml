@@ -15,11 +15,9 @@
 # Operator step after first merge: mark the "orchestrator-image" check REQUIRED
 # on the testing branch (Settings -> Branches), as for unit-tests.yml.
 #
-# Base image: the Dockerfile FROM lines pin node:24.15.0-slim by digest on Docker
-# Hub, whose anonymous pull limit has failed CI jobs (AII-1195). For this build
-# only, a buildx named context remaps that exact reference to the ECR Public
-# mirror at the same digest. The Dockerfile is untouched; Fly's builder keeps
-# using Docker Hub. Keep NODE_REF in sync with the Dockerfile FROM lines.
+# Base image: the build pulls the pinned base image from Docker Hub, the same
+# source as Fly's builder and build-runner.yml; an ECR Public mirror was removed
+# on 2026-10-14 because it rate-limited anonymous pulls (AII-1279).
 name: orchestrator-image
 
 on:
@@ -33,9 +31,6 @@ jobs:
   orchestrator-image:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      NODE_REF: node:24.15.0-slim@sha256:4e6b70dd6cbfc88c8157ba19aa3d9f9cce6ba4703576d55459e45efcbc9c5f5d
-      NODE_MIRROR: public.ecr.aws/docker/library/node@sha256:4e6b70dd6cbfc88c8157ba19aa3d9f9cce6ba4703576d55459e45efcbc9c5f5d
     steps:
       - uses: actions/checkout@v4
 
@@ -50,8 +45,6 @@ jobs:
           load: true
           push: false
           tags: orchestrator-ci:test
-          build-contexts: |
-            ${{ env.NODE_REF }}=docker-image://${{ env.NODE_MIRROR }}
           build-args: |
             SOURCE_COMMIT=${{ github.event.pull_request.head.sha }}
             SOURCE_REPO=${{ github.repository }}

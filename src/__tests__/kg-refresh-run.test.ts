@@ -11,6 +11,13 @@ import { buildEnvelopeDispatchInputs } from "../github.js";
 import type { RepoMapping } from "../config.js";
 import { resolveRunnerImageForDispatch, __clearRepoImageCacheForTests } from "../repo-image.js";
 
+// Pass-through spy: every test keeps the real refresh unless it overrides the
+// implementation for one call.
+vi.mock("../runner-token.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../runner-token.js")>();
+  return { ...actual, refreshRunnerGithubCredentials: vi.fn(actual.refreshRunnerGithubCredentials) };
+});
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
@@ -42,7 +49,10 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     sensitiveAllowPatterns: null,
     autoMerge: false,
     dependencyTokenScope: null,
+    referenceRepos: null,
     memoryProviderId: null,
+    reviewFixLifecycle: null,
+    reviewers: null,
     ...overrides,
   };
 }
@@ -142,6 +152,8 @@ import {
 } from "../pipeline/steps/kg-tracker-data.js";
 import { kgIngestStep, KgIngestError, isSignalLine } from "../pipeline/steps/kg-ingest.js";
 import { kgScopeReconcileStep } from "../pipeline/steps/kg-scope-reconcile.js";
+import { refreshRunnerGithubCredentials } from "../runner-token.js";
+import { __resetPublicationCredentialForTests } from "../publication-credential.js";
 import { modelProcessEnv } from "../pipeline/process-env.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import type { PipelineContextData } from "../pipeline/types.js";
@@ -1232,6 +1244,93 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
     const [, req] = vi.mocked(fetch).mock.calls[0];
     const body = JSON.parse((req as RequestInit).body as string);
     expect(body.body).toContain("**Guard verdict:** clean");
+  });
+
+  describe("GitHub token refresh before the push (AII-1384)", () => {
+    beforeEach(() => {
+      __resetPublicationCredentialForTests();
+      delete process.env.RUN_PUBLICATION_TOKEN;
+      vi.mocked(refreshRunnerGithubCredentials).mockClear();
+    });
+
+    afterEach(() => {
+      __resetPublicationCredentialForTests();
+      delete process.env.RUN_PUBLICATION_TOKEN;
+    });
+
+    function setupClean(): string {
+      initGitRepo(tmpDir);
+      execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+      execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+      const clonedRef = resolveHead(tmpDir);
+      execSync(
+        `git config url."${bareDir}".insteadOf "https://x-access-token:fresh-tok@github.com/acme/kg-repo.git"`,
+        { cwd: tmpDir, stdio: "ignore" },
+      );
+      writeWorkingTree({ "docs.nt": makeLines(1) });
+      stubPrCreate(30, "https://github.com/acme/kg-repo/pull/30");
+      return clonedRef;
+    }
+
+    it("GHA mode: passes the publication token, pushes and opens the PR with the refreshed token", async () => {
+      process.env.RUN_PUBLICATION_TOKEN = "pub-tok";
+      vi.mocked(refreshRunnerGithubCredentials).mockResolvedValueOnce("fresh-tok");
+      const clonedRef = setupClean();
+
+      const result = await kgSnapshotPushStep.run(
+        makeContext(),
+        makeInputs({ clonedRef, callbackUrl: "http://localhost:8080/cb" }),
+        noopReporter,
+      );
+
+      expect(result.snapshotPushed).toBe(true);
+      expect(refreshRunnerGithubCredentials).toHaveBeenCalledWith(
+        expect.objectContaining({
+          currentToken: "fake-token",
+          callbackUrl: "http://localhost:8080/cb",
+          machineNonce: undefined,
+          publicationToken: "pub-tok",
+        }),
+      );
+      // The push only reaches the bare repo through the insteadOf rewrite keyed on fresh-tok.
+      const refs = execSync("git for-each-ref --format='%(refname)'", { cwd: bareDir }).toString();
+      expect(refs).toContain("refs/heads/kg-refresh/");
+      const [, req] = vi.mocked(fetch).mock.calls[0];
+      expect((req as RequestInit).headers).toMatchObject({ Authorization: expect.stringContaining("fresh-tok") });
+    });
+
+    it("Fly mode: forwards the machine nonce and uses the returned token", async () => {
+      vi.mocked(refreshRunnerGithubCredentials).mockResolvedValueOnce("fresh-tok");
+      const clonedRef = setupClean();
+
+      await kgSnapshotPushStep.run(
+        makeContext(),
+        makeInputs({ clonedRef, orchestratorUrl: "http://orch", machineNonce: "nonce-1" }),
+        noopReporter,
+      );
+
+      expect(refreshRunnerGithubCredentials).toHaveBeenCalledWith(
+        expect.objectContaining({
+          orchestratorUrl: "http://orch",
+          machineNonce: "nonce-1",
+          publicationToken: undefined,
+        }),
+      );
+      const [, req] = vi.mocked(fetch).mock.calls[0];
+      expect((req as RequestInit).headers).toMatchObject({ Authorization: expect.stringContaining("fresh-tok") });
+    });
+
+    it("dry run returns before the refresh and leaves the publication credential unconsumed", async () => {
+      process.env.RUN_PUBLICATION_TOKEN = "pub-tok";
+      initGitRepo(tmpDir);
+      const clonedRef = resolveHead(tmpDir);
+      writeWorkingTree({ "docs.nt": makeLines(1) });
+
+      await kgSnapshotPushStep.run(makeContext(), makeInputs({ clonedRef, dryRun: true }), noopReporter);
+
+      expect(refreshRunnerGithubCredentials).not.toHaveBeenCalled();
+      expect(process.env.RUN_PUBLICATION_TOKEN).toBe("pub-tok");
+    });
   });
 });
 
@@ -2690,7 +2789,7 @@ describe("kgIngestStep", () => {
 
   it("ingest failure tail does not contain venv-setup or pip-install output", async () => {
     let callCount = 0;
-    const spawnImpl = (cmd: string, args: string[]) => {
+    const spawnImpl = (_cmd: string, _args: string[]) => {
       callCount++;
       if (callCount <= 2) {
         // setup phases succeed but emit recognisable output
@@ -3300,7 +3399,7 @@ describe("GHA kg-refresh dispatch — runner_image resolution via resolveRunnerI
   });
 
   it("includes runner_image when KG repo has a per-repo .ai-implement/image.yml override", async () => {
-    const yamlContent = "image: ghcr.io/org/custom-runner:sha-abc\n";
+    const yamlContent = "image: ghcr.io/builddownai/custom-runner:sha-abc\n";
     const b64 = Buffer.from(yamlContent).toString("base64");
     const fetchImpl = vi.fn(async () =>
       new Response(JSON.stringify({ type: "file", encoding: "base64", content: b64 }), {
@@ -3319,7 +3418,7 @@ describe("GHA kg-refresh dispatch — runner_image resolution via resolveRunnerI
     });
 
     // Per-repo override wins regardless of orchestrator flag
-    expect(result).toBe("ghcr.io/org/custom-runner:sha-abc");
+    expect(result).toBe("ghcr.io/builddownai/custom-runner:sha-abc");
   });
 
   it("GHA and Fly resolve the same image ref for the same orchestrator (parity)", async () => {
@@ -3416,7 +3515,7 @@ describe("GHA kg-refresh dispatch — inputs shape contract", () => {
 
   it("runner_image included when image resolved from per-repo override (integration with resolveRunnerImageForDispatch)", async () => {
     __clearRepoImageCacheForTests();
-    const yamlContent = "image: ghcr.io/org/custom-runner:sha-abc\n";
+    const yamlContent = "image: ghcr.io/builddownai/custom-runner:sha-abc\n";
     const b64 = Buffer.from(yamlContent).toString("base64");
     const fetchImpl = vi.fn(async () =>
       new Response(JSON.stringify({ type: "file", encoding: "base64", content: b64 }), {
@@ -3435,7 +3534,7 @@ describe("GHA kg-refresh dispatch — inputs shape contract", () => {
     });
 
     const inputs = buildKgRefreshDispatchInputs({ runConfig: "cfg", runToken: "tok", runProgressToken: "prog", runnerImage, runnerCallbackUrl: undefined });
-    expect(inputs.runner_image).toBe("ghcr.io/org/custom-runner:sha-abc");
+    expect(inputs.runner_image).toBe("ghcr.io/builddownai/custom-runner:sha-abc");
     expect(inputs.run_progress_token).toBe("prog");
   });
 });
@@ -5625,7 +5724,6 @@ describe("runKgRefresh — dev-harness dep-token-override", () => {
         // NO dependencyAuth override — let the built-in makeDevHarnessDependencyAuthStep run
         kgTrackerData: capturingKgTrackerData,
         kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: makeStepModule({ snapshotPushed: false, commitSha: null }),
       },
       reporter: { report: async () => undefined },
@@ -5697,7 +5795,6 @@ describe("runKgRefresh — dev-harness dep-token-override", () => {
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
         kgTrackerData: makeStepModule({ fetched: false, issueCount: 0 }),
         kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: capturingKgSnapshotPush,
       },
       reporter: { report: async () => undefined },
@@ -5729,7 +5826,6 @@ describe("runKgRefresh — dev-harness dep-token-override", () => {
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
         kgTrackerData: makeStepModule({ fetched: false, issueCount: 0 }),
         kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: capturingKgSnapshotPush,
       },
       reporter: { report: async () => undefined },
@@ -5753,7 +5849,6 @@ describe("runKgRefresh — dev-harness dep-token-override", () => {
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
         kgTrackerData: makeStepModule({ fetched: false, issueCount: 0 }),
         kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: capturingKgSnapshotPush,
       },
       reporter: { report: async () => undefined },

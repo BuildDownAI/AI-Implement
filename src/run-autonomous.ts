@@ -14,13 +14,14 @@ import type {
   PipelineContext,
   PipelineDefinition,
   StepReporter,
+  Step,
   ActivitySink,
   ActivityIdentity,
   ActivityToolStart,
   ActivityToolResult,
   CycleActivitySummary,
 } from "./pipeline/types.js";
-import { HttpStepReporter, NoopStepReporter, TokenStepReporter } from "./pipeline/reporter.js";
+import { ActivityStepReporter, HttpStepReporter, NoopStepReporter, TokenStepReporter } from "./pipeline/reporter.js";
 import { TimingCollector, TimingStepReporter, runWithTiming, formatSummary } from "./pipeline/timing.js";
 import { runHookScript } from "./pipeline/steps/hooks.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
@@ -83,8 +84,12 @@ import { DEFAULT_MODEL } from "./pipeline/default-model.js";
 export interface RunnerActivityReporting {
   readonly attemptId: string;
   readonly sink: ActivitySink;
+  /** Reports each pipeline step through the activity stream instead of `/runner/progress`. */
+  readonly stepReporter: StepReporter;
   shutdown(): Promise<void>;
 }
+
+const PIPELINE_STEPS_PRODUCER = "pipeline-steps";
 
 /** JSON-safe copy of an observable tool detail/output value, for `ActivityReporter.record()`'s
  *  `ActivityDetailValue` input. Falls back to a stringified value rather than throwing on a
@@ -154,8 +159,31 @@ export class RunnerActivitySink implements ActivitySink {
     this.reporterFor(identity.producerId).finalize();
   }
 
+  /** Records one pipeline step as a `pipeline_step` event on the `pipeline-steps` producer. */
+  recordStep(step: Step): void {
+    this.reporterFor(PIPELINE_STEPS_PRODUCER).record({
+      cycle: 1,
+      kind: "pipeline_step",
+      action: step.id,
+      detail: {
+        type: step.type,
+        status: step.status,
+        started_at: step.started_at,
+        ended_at: step.ended_at,
+        parent_step_id: step.parent_step_id,
+      },
+    });
+  }
+
+  /** Sends the buffered `pipeline-steps` events now. Never throws. */
+  async flushSteps(): Promise<void> {
+    await this.reporters.get(PIPELINE_STEPS_PRODUCER)?.flush();
+  }
+
   /** Bounded best-effort flush of every producer this run ever touched. Never throws. */
   async shutdown(): Promise<void> {
+    // The final marker must follow the last step, and nothing else finalizes this producer.
+    this.reporters.get(PIPELINE_STEPS_PRODUCER)?.finalize();
     await Promise.all([...this.reporters.values()].map((r) => r.shutdown()));
   }
 }
@@ -176,7 +204,12 @@ export function resolveActivityReporting(
 ): RunnerActivityReporting | undefined {
   if (!reviewFix || !callbackUrl || !progressToken) return undefined;
   const sink = new RunnerActivitySink(callbackUrl, progressToken, reviewFix.attemptId, fetchImpl);
-  return { attemptId: reviewFix.attemptId, sink, shutdown: () => sink.shutdown() };
+  return {
+    attemptId: reviewFix.attemptId,
+    sink,
+    stepReporter: new ActivityStepReporter(sink),
+    shutdown: () => sink.shutdown(),
+  };
 }
 
 type RunAutopsyPasses = Array<{
@@ -1247,6 +1280,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   }
   const baseReporter: StepReporter =
     opts.reporter ??
+    activityReporting?.stepReporter ??
     (callbackUrl && progressToken
       ? new TokenStepReporter(callbackUrl, progressToken, { fetchImpl: opts.fetchImpl })
       : orchestratorUrl && nonce

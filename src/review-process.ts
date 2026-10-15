@@ -70,16 +70,18 @@ export function classifyClaudeInlineMarker(body: string): "blocking" | "minor" |
   return "untagged";
 }
 
-function matchesPair(run: { name: string; appSlug: string }, pair: ReviewCheckPair): boolean {
+function matchesPair(run: { name: string; appSlug: string }, pair: ReviewCheckPair, configured?: readonly string[]): boolean {
   if (run.appSlug.toLowerCase() !== pair.appSlug.toLowerCase()) return false;
-  const names = pair.names === "project-review-check-names" ? DEFAULT_REVIEW_CHECK_NAMES : pair.names;
+  const projectNames = configured && configured.length > 0 ? configured : DEFAULT_REVIEW_CHECK_NAMES;
+  const names = pair.names === "project-review-check-names" ? projectNames : pair.names;
   const name = run.name.trim().toLowerCase();
   return names.some((n) => n.trim().toLowerCase() === name);
 }
 
-/** `true` when `run` is a review check of `process`: its name and posting app match one of the process's check pairs. */
-export function isReviewCheckRun(run: { name: string; appSlug: string }, process: ReviewProcessDefinition): boolean {
-  return process.checkPairs.some((pair) => matchesPair(run, pair));
+/** `true` when `run` is a review check of `process`: its name and posting app match one of the process's check pairs.
+ * `configured` is the project's `reviewCheckNames`; it replaces the defaults for the pairs that use the project's list. */
+export function isReviewCheckRun(run: { name: string; appSlug: string }, process: ReviewProcessDefinition, configured?: readonly string[]): boolean {
+  return process.checkPairs.some((pair) => matchesPair(run, pair, configured));
 }
 
 export function isTrustedReviewAuthor(login: string, process: ReviewProcessDefinition, extra: readonly string[]): boolean {

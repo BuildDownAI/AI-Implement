@@ -9,7 +9,6 @@ import {
   startMachine,
   updateMachine,
   clearMachineEnv,
-  CLEAR_MACHINE_ENV_MAX_MS,
   MAX_RATE_LIMIT_WAIT_MS,
   waitForMachineSettled,
   destroyMachine,
@@ -44,9 +43,9 @@ const mockMachine = {
   config: {
     image: "ghcr.io/builddownai/ai-implement-runner:latest",
     env: {},
-    guest: { cpu_kind: "shared", cpus: 1, memory_mb: 1024 },
+    guest: { cpu_kind: "shared" as const, cpus: 1, memory_mb: 1024 },
     auto_destroy: true,
-    restart: { policy: "no" },
+    restart: { policy: "no" as const },
   },
 };
 
@@ -662,6 +661,33 @@ describe("buildSessionMachineConfig", () => {
     expect(result.config.env!.RUN_TOKEN).toBe("run-token");
   });
 
+  it("sets the progress and publication tokens only when non-empty", () => {
+    const set = buildSessionMachineConfig({
+      ...baseInput,
+      runProgressToken: "progress-token",
+      runPublicationToken: "publication-token",
+    });
+    expect(set.config.env!.RUN_PROGRESS_TOKEN).toBe("progress-token");
+    expect(set.config.env!.RUN_PUBLICATION_TOKEN).toBe("publication-token");
+
+    for (const overrides of [{ runProgressToken: "", runPublicationToken: "" }, {}]) {
+      const env = buildSessionMachineConfig({ ...baseInput, ...overrides }).config.env!;
+      expect(env).not.toHaveProperty("RUN_PROGRESS_TOKEN");
+      expect(env).not.toHaveProperty("RUN_PUBLICATION_TOKEN");
+    }
+  });
+
+  it("extraEnv overrides the progress and publication tokens", () => {
+    const env = buildSessionMachineConfig({
+      ...baseInput,
+      runProgressToken: "progress-token",
+      runPublicationToken: "publication-token",
+      extraEnv: { RUN_PROGRESS_TOKEN: "extra-progress", RUN_PUBLICATION_TOKEN: "extra-publication" },
+    }).config.env!;
+    expect(env.RUN_PROGRESS_TOKEN).toBe("extra-progress");
+    expect(env.RUN_PUBLICATION_TOKEN).toBe("extra-publication");
+  });
+
   it("extraEnv overrides standard env vars when keys collide", () => {
     const result = buildSessionMachineConfig({
       ...baseInput,
@@ -804,7 +830,7 @@ describe("buildSessionMachineConfig", () => {
         extraEnv: { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(runConfig) },
       });
       const env = result.config.env!;
-      const decoded = decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG) as Record<string, unknown>;
+      const decoded = decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG) as unknown as Record<string, unknown>;
       expect(decoded.SESSION_TOKEN).toBeUndefined();
       expect(decoded.GITHUB_TOKEN).toBeUndefined();
       expect(decoded.ANTHROPIC_API_KEY).toBeUndefined();

@@ -67,9 +67,13 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     maxJobMinutes: null,
     branchPrefix: null,
     skillsRepo: null,
+    referenceRepos: null,
     sensitiveAddPatterns: null,
     sensitiveAllowPatterns: null,
     dependencyTokenScope: "installation",
+    reviewFixLifecycle: null,
+    memoryProviderId: null,
+    reviewers: null,
     ...overrides,
   };
 }

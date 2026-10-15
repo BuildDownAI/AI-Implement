@@ -54,7 +54,7 @@ import { getDeployStartedAt, isDeployHeld } from "./deploy-hold.js";
 import { getInFlightWork } from "./in-flight-work.js";
 import { notifyText } from "./notify.js";
 import { getLastSweepAt } from "./reaper.js";
-import { listLog, getInFlightJobs, getInFlightIssueIds, updateJobStatus, getJobById, markJobNotified, getPulls, getIssueEnrichment } from "./log.js";
+import { listLog, getInFlightJobs, getInFlightIssueIds, updateJobStatus, getJobById, markJobNotified, getJobByMachineId, getPulls, getIssueEnrichment } from "./log.js";
 import { getStepsByJobId } from "./step-log.js";
 import { destroyMachineRecorded } from "./backend-run.js";
 import { listMachines, listAppSecrets, setAppSecrets, unsetAppSecret, fetchMachineLogs } from "./fly-machines.js";
@@ -72,6 +72,8 @@ import {
   setRetryPolicy,
   getLinearPickupLabel,
   DEFAULT_LINEAR_PICKUP_LABEL,
+  getRunnerImageAllowedPrefixes,
+  validateRunnerImagePrefixes,
   DEFAULT_RETRY_POLICY,
   type RetryPolicy,
   getFlySessionsConfig,
@@ -1840,69 +1842,59 @@ async function handleDestroySession(
 ): Promise<void> {
   // Find the job. For Fly jobs, match by machineId. For GHA jobs (no machineId),
   // fall back to looking up by numeric dispatch_log id passed as the identifier.
+  const closedKgRefresh = () => {
+    const closed = getJobByMachineId(machineId);
+    return closed?.phase === "kg-refresh" ? closed : null;
+  };
   const job =
     getInFlightJobs().find((j) => j.machineId === machineId) ??
-    (Number.isFinite(Number(machineId)) ? getJobById(Number(machineId)) : null);
+    (Number.isFinite(Number(machineId)) ? getJobById(Number(machineId)) : null) ??
+    closedKgRefresh();
 
-  // Kg-refresh cancel: issue-less run, closed through deps.kgRefresh.cancel (AII-522).
+  // Kg-refresh stop: issue-less run. The KgRefresh workflow owns the row and the machine (AII-901), so the
+  // route sends its `cancel` and returns its answer. It writes the row only when no workflow will close it.
   if (job?.phase === "kg-refresh") {
-    if (job.executionMode === "github-actions") {
-      // The KgRefresh workflow requests the GitHub cancellation and waits for confirmed
-      // termination (AII-901); the Fly branch below destroys through destroyMachineRecorded
-      // (which guards durable-runner machines) because the workflow has no Fly dep.
-      if (!deps.kgRefresh) {
-        json(res, 501, { error: "KG refresh is not configured" });
-        return;
-      }
-      // Cancel first, stamp after: a 409/503 answer leaves the row as it was because the
-      // GitHub run may still be going. The updateJobStatus guard preserves this
-      // conclusion when the workflow's close-row later writes a coarser terminal status.
-      try {
-        const r = await deps.kgRefresh.cancel({ jobId: job.id, dispatchId: job.dispatchId, reason: "operator_cancelled" });
-        if (r.status !== 200) {
-          json(res, r.status, r.body);
-          return;
-        }
-        updateJobStatus(job.id, "failed", "operator_cancelled");
-      } catch (err) {
-        console.error(`[admin] Failed to cancel kg-refresh job ${job.id}:`, err);
-        json(res, 500, { error: err instanceof Error ? err.message : String(err) });
-        return;
-      }
-    } else {
-      if (!config.flySessionsToken || !config.flySessionsApp) {
-        json(res, 503, { error: "Fly sessions config not set" });
-        return;
-      }
-      try {
-        await destroyMachineRecorded(config, machineId, "admin-stop");
-      } catch (err) {
-        // 404 is fine — machine was already gone
-        if (!(err instanceof Error && err.message.includes("404"))) {
-          console.error(`[admin] Failed to destroy kg-refresh machine ${machineId}:`, err);
-          json(res, 500, { error: err instanceof Error ? err.message : String(err) });
-          return;
-        }
-      }
-      // The machine is gone; still tell the workflow so it stops tracking the run.
-      // Best-effort: a 409 (no refresh in flight) or 503 must not undo the destroy.
-      if (deps.kgRefresh) {
-        updateJobStatus(job.id, "failed", "operator_cancelled");
-        try {
-          const r = await deps.kgRefresh.cancel({ jobId: job.id, dispatchId: job.dispatchId, reason: "operator_cancelled" });
-          if (r.status !== 200) {
-            console.warn(`[admin] kg-refresh workflow cancel for Fly job ${job.id} answered ${r.status}`);
-          }
-        } catch (err) {
-          console.error(`[admin] Failed to cancel kg-refresh workflow for Fly job ${job.id}:`, err);
-        }
-      }
+    if (!deps.kgRefresh) {
+      json(res, 501, { error: "KG refresh is not configured" });
+      return;
+    }
+    let r: { status: number; body: unknown };
+    try {
+      r = await deps.kgRefresh.cancel({ jobId: job.id, dispatchId: job.dispatchId, reason: "operator_cancelled" });
+    } catch (err) {
+      console.error(`[admin] Failed to cancel kg-refresh job ${job.id}:`, err);
+      json(res, 500, { error: err instanceof Error ? err.message : String(err) });
+      return;
     }
 
-    // Stamp operator_cancelled (idempotent for the GHA branch, which stamped it on cancel success).
-    updateJobStatus(job.id, "failed", "operator_cancelled");
+    if (r.status === 200) {
+      // A 200 means the stop was requested, not that the run stopped: the workflow closes the row.
+      if (config.notifyWebhookUrl) {
+        notifyText(config.notifyWebhookUrl, `ℹ️ KG-refresh stop requested by operator — the run will stop if it has not passed the merge.`)
+          .catch((err) => console.error("[admin] kg-refresh stop notify failed:", err));
+      }
+      console.log(`[admin] kg-refresh job ${job.id} stop requested by operator`);
+      json(res, 200, { requested: true });
+      return;
+    }
 
-    // One operator-cancel notification; mark notified to prevent the poll loop duplicate.
+    const refusal = (r.body as { error?: unknown } | null)?.error;
+    if (r.status !== 409 || refusal !== "no-refresh-in-flight") {
+      // past-merge, restate-unavailable, ...: the run may still be going, so change nothing.
+      json(res, r.status, r.body);
+      return;
+    }
+
+    // Re-read after the await: the run may have finished meanwhile, and a Stop must not
+    // overwrite a closed row's result. Stamp only a row that is still open.
+    const current = getJobById(job.id);
+    if (!current || (current.status !== "dispatched" && current.status !== "running")) {
+      json(res, 409, r.body);
+      return;
+    }
+
+    // No workflow will close this row (unknown dispatch): stamp it once.
+    updateJobStatus(job.id, "failed", "operator_cancelled");
     if (config.notifyWebhookUrl) {
       notifyText(
         config.notifyWebhookUrl,
@@ -2692,6 +2684,14 @@ function flySettingsView(): Record<string, unknown> {
   };
 }
 
+/** Display text only; `<owner>` is literal. */
+const RUNNER_IMAGE_BUILT_IN_PREFIXES = ["ghcr.io/builddownai/", "ghcr.io/<owner>/"];
+
+/** Validates a runnerImageAllowedPrefixes POST value; returns the stored string (null = delete) or an error. */
+function parseRunnerImagePrefixes(raw: unknown): { value: string | null } | { error: string } {
+  return validateRunnerImagePrefixes(raw);
+}
+
 function handleGetSettings(
   _req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -2712,6 +2712,11 @@ function handleGetSettings(
       effective: getLinearPickupLabel(),
       default: DEFAULT_LINEAR_PICKUP_LABEL,
     },
+    runnerImageAllowedPrefixes: {
+      value: dbSettings.runnerImageAllowedPrefixes,
+      effective: getRunnerImageAllowedPrefixes(),
+      builtIn: RUNNER_IMAGE_BUILT_IN_PREFIXES,
+    },
     retryPolicy: getRetryPolicy(),
     retryPolicyDefaults: DEFAULT_RETRY_POLICY,
   });
@@ -2730,6 +2735,7 @@ async function handlePostSettings(
     kgRefreshReportIssue?: string | null;
     kgBaseRepo?: string | null;
     linearPickupLabel?: string | null;
+    runnerImageAllowedPrefixes?: string | null;
     retryPolicy?: Partial<RetryPolicy> | null;
   };
   try {
@@ -2742,6 +2748,16 @@ async function handlePostSettings(
   } catch {
     json(res, 400, { error: "Invalid request body" });
     return;
+  }
+
+  let runnerImagePrefixes: string | null | undefined;
+  if ("runnerImageAllowedPrefixes" in body) {
+    const parsed = parseRunnerImagePrefixes(body.runnerImageAllowedPrefixes);
+    if ("error" in parsed) {
+      json(res, 400, { error: parsed.error });
+      return;
+    }
+    runnerImagePrefixes = parsed.value;
   }
 
   if ("retryPolicy" in body) {
@@ -2772,6 +2788,9 @@ async function handlePostSettings(
       return;
     }
     setOrchestratorSetting("linearPickupLabel", trimmed ? trimmed : null);
+  }
+  if (runnerImagePrefixes !== undefined) {
+    setOrchestratorSetting("runnerImageAllowedPrefixes", runnerImagePrefixes);
   }
 
   const flyPatch: Record<string, string | null> = {};
@@ -2843,6 +2862,11 @@ async function handlePostSettings(
       value: dbSettings.linearPickupLabel,
       effective: getLinearPickupLabel(),
       default: DEFAULT_LINEAR_PICKUP_LABEL,
+    },
+    runnerImageAllowedPrefixes: {
+      value: dbSettings.runnerImageAllowedPrefixes,
+      effective: getRunnerImageAllowedPrefixes(),
+      builtIn: RUNNER_IMAGE_BUILT_IN_PREFIXES,
     },
     retryPolicy: getRetryPolicy(),
     retryPolicyDefaults: DEFAULT_RETRY_POLICY,

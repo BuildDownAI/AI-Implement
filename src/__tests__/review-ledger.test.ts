@@ -10,6 +10,7 @@ import {
   formatReviewLedgerForPrompt,
   type GhSpawn,
   type ReviewLedgerFinding,
+  reviewContractFindingGates,
 } from "../pipeline/review-ledger.js";
 
 describe("extractClaudeSummaryFindings", () => {
@@ -2184,5 +2185,18 @@ describe("🔴/🟡 headings in a Claude summary", () => {
     expect(sev("🟡 Something")).toBe("minor");
     expect(sev("Minor notes")).toBe("minor");
     expect(sev("Findings")).toBe("medium");
+  });
+});
+
+describe("reviewContractFindingGates", () => {
+  it.each([
+    ["blocking", "approve", true],
+    ["minor", "approve", false],
+    ["minor", "changes_requested", true],
+    ["minor", "incomplete", true],
+    ["minor", undefined, true],
+    ["blocking", "changes_requested", true],
+  ] as const)("%s finding under verdict %s gates=%s", (severity, verdict, expected) => {
+    expect(reviewContractFindingGates({ severity }, verdict)).toBe(expected);
   });
 });

@@ -395,6 +395,82 @@ describe("drainCommentGapfillQueue", () => {
     expect(pending).toHaveLength(0);
   });
 
+  describe("in-flight run of the PR's own branch (AII-1292)", () => {
+    function enqueue42(): void {
+      queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 42, commentId: 7001, commenter: "kim", instruction: "" });
+    }
+    function seedRunning(identifier: string, repo = "acme/billing"): number {
+      return log.appendLog({ issueId: `id-${identifier}`, issueIdentifier: identifier, teamKey: "TEAM", repo, phase: "implementation", status: "running" });
+    }
+
+    it("leaves the item pending, with no reply and no dispatch, then dispatches once pr_url is set", async () => {
+      const mapping = makeMapping();
+      enqueue42();
+      const jobId = seedRunning("AII-120");
+      stubPrLookup("ai-implement/aii-120");
+      const dispatchSpy = vi.fn<DrainInput["dispatch"]>(async () => ({ success: true, status: 204 }));
+      const postCommentSpy = vi.fn<DrainInput["postComment"]>(async () => undefined);
+      const fetchSpy = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+
+      await drain.drainCommentGapfillQueue(makeBaseDrainOpts({ getMappings: () => ({ TEAM: mapping }), dispatch: dispatchSpy, postComment: postCommentSpy }));
+
+      expect(dispatchSpy).not.toHaveBeenCalled();
+      expect(postCommentSpy).not.toHaveBeenCalled();
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+      // Run completes and records its PR.
+      log.updateJobPrUrl(jobId, "https://github.com/acme/billing/pull/42");
+      log.updateJobStatus(jobId, "completed");
+      await drain.drainCommentGapfillQueue(makeBaseDrainOpts({ getMappings: () => ({ TEAM: mapping }), dispatch: dispatchSpy, postComment: postCommentSpy }));
+      expect(dispatchSpy).toHaveBeenCalledTimes(1);
+      expect(postCommentSpy).not.toHaveBeenCalled();
+    });
+
+    it("does not match a longer identifier sharing a prefix, nor another repo's run, nor a finished run", async () => {
+      const mapping = makeMapping();
+      enqueue42();
+      seedRunning("AII-12");
+      seedRunning("AII-123", "acme/other");
+      log.appendLog({ issueId: "done", issueIdentifier: "AII-123", teamKey: "TEAM", repo: "acme/billing", phase: "implementation", status: "completed" });
+      stubPrLookup("ai-implement/aii-123");
+      const postCommentSpy = vi.fn<DrainInput["postComment"]>(async () => undefined);
+
+      await drain.drainCommentGapfillQueue(makeBaseDrainOpts({ getMappings: () => ({ TEAM: mapping }), postComment: postCommentSpy }));
+
+      expect(postCommentSpy).toHaveBeenCalledTimes(1);
+      expect(postCommentSpy.mock.calls[0]![4]).toContain("no record");
+      expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+    });
+
+    it("reads the PR once on the roll-up path", async () => {
+      const mapping = makeMapping();
+      enqueue42();
+      seedDispatchLog("issue-parent", "AII-130", "Parent", "acme", "billing", 5);
+      stubPrLookup("ai-implement/feature/aii-130");
+      const fetchSpy = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+      await drain.drainCommentGapfillQueue(makeBaseDrainOpts({ getMappings: () => ({ TEAM: mapping }) }));
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["null", "throw"])("a PR read failure (%s) gets the GitHub-read reply, not 'no record'", async (mode) => {
+      const mapping = makeMapping();
+      enqueue42();
+      vi.stubGlobal("fetch", vi.fn(async () => {
+        if (mode === "throw") throw new Error("net");
+        return { ok: false, status: 502 } as Response;
+      }));
+      const postCommentSpy = vi.fn<DrainInput["postComment"]>(async () => undefined);
+
+      await drain.drainCommentGapfillQueue(makeBaseDrainOpts({ getMappings: () => ({ TEAM: mapping }), postComment: postCommentSpy }));
+
+      expect(postCommentSpy).toHaveBeenCalledTimes(1);
+      const body = postCommentSpy.mock.calls[0]![4];
+      expect(body).toContain("could not read this PR");
+      expect(body).toContain("repost");
+      expect(body).not.toContain("no record");
+    });
+  });
+
   it("case (c): marks row failed and calls onDispatchFailure when dispatch fails", async () => {
     const mapping = makeMapping({ owner: "acme", repo: "billing" });
 
@@ -1480,6 +1556,8 @@ describe("drainCommentGapfillQueue — admission (AII-787)", () => {
     const getTargetRepoToken = vi.fn<DrainInput["getTargetRepoToken"]>(async () => "scoped-token");
     const postComment = vi.fn<DrainInput["postComment"]>(async () => undefined);
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    // A readable PR with no matching run: the drain reads it before answering "no record".
+    stubPrLookup("some-unrelated-branch");
 
     await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
       getMappings: () => ({ TEAM: mapping }),
@@ -1517,6 +1595,54 @@ describe("drainCommentGapfillQueue — admission (AII-787)", () => {
     expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
     expect(resolveRunnerImage).not.toHaveBeenCalled();
     expect(admission.count("TEAM")).toBe(0);
+  });
+
+  it("Fly gap-fill carries the result, progress and publication tokens, the nonce and orchestrator URL, and none in the encoded run config", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing", executionMode: "fly-machines" });
+    seedDispatchLog("issue-fly-tokens", "AII-306", "Fly tokens", "acme", "billing", 89);
+    queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 89, commentId: 0, commenter: "", instruction: "" });
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }),
+      flySessionsToken: "fly-token",
+      flySessionsApp: "fly-app",
+      anthropicApiKey: "anthropic-key",
+      runnerCallbackBaseUrl: "https://orch.example.com",
+      runnerTokenSecret: "runner-token-secret-with-enough-entropy",
+    }));
+
+    const env = flyMocks.createMachine.mock.calls[0]![2].config.env!;
+    expect(env.RUN_TOKEN).toBeTruthy();
+    expect(env.RUN_PROGRESS_TOKEN).toBeTruthy();
+    expect(env.RUN_PUBLICATION_TOKEN).toBeTruthy();
+    expect(env.MACHINE_NONCE).toBeTruthy();
+    expect(env.ORCHESTRATOR_URL).toBe("https://orch.example.com");
+    // extraEnv reaches the machine env as AI_IMPLEMENT_RUN_CONFIG; no token may travel in it.
+    const { decodeRunConfig } = await import("../run-config.js");
+    expect(env.AI_IMPLEMENT_RUN_CONFIG).toBeTruthy();
+    const encodedConfig = JSON.stringify(decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG!));
+    for (const token of [env.RUN_TOKEN, env.RUN_PROGRESS_TOKEN, env.RUN_PUBLICATION_TOKEN]) {
+      expect(encodedConfig).not.toContain(token!);
+    }
+  });
+
+  it("local gap-fill passes the progress and publication tokens", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing" });
+    seedDispatchLog("issue-local-tokens", "AII-307", "Local tokens", "acme", "billing", 90);
+    queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 90, commentId: 0, commenter: "", instruction: "" });
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }),
+      runnerMode: "local",
+      anthropicApiKey: "anthropic-key",
+      runnerCallbackBaseUrl: "https://orch.example.com",
+      runnerTokenSecret: "runner-token-secret-with-enough-entropy",
+    }));
+
+    const input = localGapfillMocks.dispatchLocalGapfill.mock.calls[0]![0] as { runToken?: string; runProgressToken?: string; runPublicationToken?: string };
+    expect(input.runToken).toBeTruthy();
+    expect(input.runProgressToken).toBeTruthy();
+    expect(input.runPublicationToken).toBeTruthy();
   });
 
   it("holds capacity after an unknown GitHub 5xx outcome", async () => {

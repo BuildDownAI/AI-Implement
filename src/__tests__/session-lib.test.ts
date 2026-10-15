@@ -19,7 +19,7 @@ describe.skipIf(isWindows)("session/lib.sh", () => {
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "pipe"],
     });
-    if (result.error && "code" in result.error && result.error.code === "ENOENT") return;
+    if ((result.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return;
     expect(result.status).toBe(0);
   });
 

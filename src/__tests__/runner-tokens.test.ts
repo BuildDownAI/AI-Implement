@@ -555,3 +555,46 @@ describe("prepared review-fix credentials", () => {
       .toMatchObject({ ok: false, reason: "revoked" });
   });
 });
+
+describe("mintLaunchTokens", () => {
+  const base = { issueId: "issue-1", mappingTeamKey: "ENG", ttlSeconds: 60, secret: SECRET, repository: "acme/app" };
+  const audiences = (dispatchId: string) =>
+    (dedup.getDb().prepare("SELECT audience FROM runner_tokens WHERE dispatch_id = ? ORDER BY audience").all(dispatchId) as { audience: string }[])
+      .map((r) => r.audience);
+
+  it("mints exactly the audiences of LAUNCH_TOKEN_AUDIENCES for each phase", () => {
+    for (const phase of Object.keys(runnerTokens.LAUNCH_TOKEN_AUDIENCES) as (keyof typeof runnerTokens.LAUNCH_TOKEN_AUDIENCES)[]) {
+      const dispatchId = `d-${phase}`;
+      const minted = runnerTokens.mintLaunchTokens({ ...base, phase, dispatchId });
+      expect(audiences(dispatchId)).toEqual([...runnerTokens.LAUNCH_TOKEN_AUDIENCES[phase]].sort());
+      expect(Boolean(minted.runPublicationToken)).toBe(phase !== "planning");
+      expect(minted.runToken).toBeTruthy();
+      expect(minted.runProgressToken).toBeTruthy();
+    }
+  });
+
+  it("a second call for the same dispatch id replaces the unconsumed rows", () => {
+    runnerTokens.mintLaunchTokens({ ...base, phase: "planning", dispatchId: "d-1" });
+    const second = runnerTokens.mintLaunchTokens({ ...base, phase: "planning", dispatchId: "d-1" });
+    expect(audiences("d-1")).toEqual(["progress", "result"]);
+    expect(runnerTokens.verifyRunToken(second.runToken, SECRET, "result", { consume: false }).ok).toBe(true);
+  });
+
+  it("keeps a consumed row, so re-minting that audience still throws", () => {
+    const first = runnerTokens.mintLaunchTokens({ ...base, phase: "planning", dispatchId: "d-2" });
+    expect(runnerTokens.verifyRunToken(first.runToken, SECRET, "result", { consume: true }).ok).toBe(true);
+    expect(() => runnerTokens.mintLaunchTokens({ ...base, phase: "planning", dispatchId: "d-2" })).toThrow(/UNIQUE/);
+    const consumed = dedup.getDb().prepare("SELECT consumed_at FROM runner_tokens WHERE dispatch_id = 'd-2' AND audience = 'result'").get() as { consumed_at: number | null };
+    expect(consumed.consumed_at).not.toBeNull();
+  });
+
+  it("does not touch another dispatch id", () => {
+    runnerTokens.mintLaunchTokens({ ...base, phase: "implementation", dispatchId: "other" });
+    runnerTokens.mintLaunchTokens({ ...base, phase: "implementation", dispatchId: "d-3" });
+    expect(audiences("other")).toEqual(["progress", "publication", "result"]);
+  });
+
+  it("requires an owner/repo binding when the phase mints a publication token", () => {
+    expect(() => runnerTokens.mintLaunchTokens({ ...base, phase: "implementation", dispatchId: "d-4", repository: "bad" })).toThrow(/owner\/repository/);
+  });
+});

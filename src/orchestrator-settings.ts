@@ -13,11 +13,12 @@ const RETRY_POLICY_KEY = "retry_policy";
 const KG_REFRESH_REPORT_ISSUE_KEY = "kg_refresh_report_issue";
 const KG_BASE_REPO_KEY = "kg_base_repo";
 const LINEAR_PICKUP_LABEL_KEY = "linear_pickup_label";
+const RUNNER_IMAGE_ALLOWED_PREFIXES_KEY = "runner_image_allowed_prefixes";
 
 /** Default Linear pickup label when no `linear_pickup_label` row exists (AII-694). */
 export const DEFAULT_LINEAR_PICKUP_LABEL = "AI-Implement";
 
-type SettingKey = "flySessionsApp" | "flySessionsRegion" | "kgRefreshReportIssue" | "kgBaseRepo" | "linearPickupLabel";
+type SettingKey = "flySessionsApp" | "flySessionsRegion" | "kgRefreshReportIssue" | "kgBaseRepo" | "linearPickupLabel" | "runnerImageAllowedPrefixes";
 
 const SETTING_KEYS: Record<SettingKey, string> = {
   flySessionsApp: FLY_SESSIONS_APP_KEY,
@@ -25,6 +26,7 @@ const SETTING_KEYS: Record<SettingKey, string> = {
   kgRefreshReportIssue: KG_REFRESH_REPORT_ISSUE_KEY,
   kgBaseRepo: KG_BASE_REPO_KEY,
   linearPickupLabel: LINEAR_PICKUP_LABEL_KEY,
+  runnerImageAllowedPrefixes: RUNNER_IMAGE_ALLOWED_PREFIXES_KEY,
 };
 
 export interface OrchestratorSettings {
@@ -36,6 +38,8 @@ export interface OrchestratorSettings {
   kgBaseRepo: string | null;
   /** Linear label the provider polls for pickup (AII-694). Seeded once from LINEAR_PICKUP_LABEL. */
   linearPickupLabel: string | null;
+  /** Comma-separated extra trusted runner-image prefixes (AII-1321). Seeded once from RUNNER_IMAGE_ALLOWED_PREFIXES. */
+  runnerImageAllowedPrefixes: string | null;
 }
 
 export function getOrchestratorSettings(): OrchestratorSettings {
@@ -51,6 +55,7 @@ export function getOrchestratorSettings(): OrchestratorSettings {
       kgRefreshReportIssue: get(KG_REFRESH_REPORT_ISSUE_KEY),
       kgBaseRepo: get(KG_BASE_REPO_KEY),
       linearPickupLabel: get(LINEAR_PICKUP_LABEL_KEY),
+      runnerImageAllowedPrefixes: get(RUNNER_IMAGE_ALLOWED_PREFIXES_KEY),
     };
   } catch {
     return {
@@ -59,6 +64,7 @@ export function getOrchestratorSettings(): OrchestratorSettings {
       kgRefreshReportIssue: null,
       kgBaseRepo: null,
       linearPickupLabel: null,
+      runnerImageAllowedPrefixes: null,
     };
   }
 }
@@ -227,6 +233,68 @@ export function seedLinearPickupLabelFromEnv(envValue: string | null | undefined
   if (!envValue?.trim()) return;
   if (getOrchestratorSettings().linearPickupLabel !== null) return;
   setOrchestratorSetting("linearPickupLabel", envValue.trim());
+}
+
+/**
+ * Extra trusted runner-image prefixes (AII-1321): the stored comma-separated value, split,
+ * trimmed, empties dropped. Returns [] with no row and on any DB error, so an unreadable
+ * table never widens the allowlist.
+ */
+export function getRunnerImageAllowedPrefixes(): string[] {
+  try {
+    const db = getDb();
+    const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(RUNNER_IMAGE_ALLOWED_PREFIXES_KEY) as
+      | { value: string }
+      | undefined;
+    return (row?.value ?? "")
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry !== "");
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Validates a runner-image prefix list (AII-1397) for both the settings API and the env seed;
+ * returns the string to store (null = delete) or an error.
+ */
+export function validateRunnerImagePrefixes(raw: unknown): { value: string | null } | { error: string } {
+  if (raw !== null && typeof raw !== "string") {
+    return { error: "runnerImageAllowedPrefixes must be a string or null" };
+  }
+  if (raw === null || raw.trim() === "") return { value: null };
+  if (raw.length > 1000) return { error: "runnerImageAllowedPrefixes must be 1000 characters or fewer" };
+  const entries = raw.split(",").map((e) => e.trim()).filter((e) => e !== "");
+  for (const entry of entries) {
+    if (!/^[A-Za-z0-9._:/@-]+$/.test(entry)) {
+      return { error: "each prefix may contain only letters, digits and . _ : / @ -" };
+    }
+    if (!entry.endsWith("/")) return { error: 'each prefix must end with "/"' };
+    if (!entry.slice(0, -1).includes("/")) {
+      return { error: "each prefix must include a path after the registry host" };
+    }
+    if (entry.startsWith("/") || entry.includes("//")) {
+      return { error: "each prefix must not contain empty path segments" };
+    }
+  }
+  return { value: entries.length > 0 ? entries.join(",") : null };
+}
+
+/**
+ * Seeds `runnerImageAllowedPrefixes` from RUNNER_IMAGE_ALLOWED_PREFIXES on first boot only
+ * (AII-1321) — a no-op once the DB already holds a value. Call once during startup.
+ */
+export function seedRunnerImageAllowedPrefixesFromEnv(envValue: string | null | undefined): void {
+  if (!envValue?.trim()) return;
+  if (getOrchestratorSettings().runnerImageAllowedPrefixes !== null) return;
+  const parsed = validateRunnerImagePrefixes(envValue);
+  if ("error" in parsed) {
+    console.warn(`[settings] RUNNER_IMAGE_ALLOWED_PREFIXES is invalid (${parsed.error}); not seeded`);
+    return;
+  }
+  if (parsed.value === null) return;
+  setOrchestratorSetting("runnerImageAllowedPrefixes", parsed.value);
 }
 
 export function setOrchestratorSetting(key: SettingKey, value: string | null): void {

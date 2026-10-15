@@ -14,7 +14,8 @@ import type * as PrepModule from "../agent-run-preparation.js";
 const SECRET = "SENTINEL-RUNNER-TOKEN-SECRET-xyz";
 const TOKEN = "SENTINEL-INSTALL-TOKEN-1";
 const ACCESS = "SENTINEL-ACCESS-TOKEN-2";
-const DEFAULT_IMAGE = "registry.example/runner:paired";
+// Allowlisted (AII-1323): the built-in prefix ghcr.io/builddownai/ and the owner prefix ghcr.io/acme/.
+const DEFAULT_IMAGE = "ghcr.io/builddownai/runner:paired";
 const CONFIG = { githubAppId: "1", githubAppPrivateKey: "SENTINEL-APP-KEY", sessionImage: DEFAULT_IMAGE };
 
 let dbPath: string;
@@ -86,7 +87,7 @@ afterEach(() => {
 
 describe("checkRunnerCapability", () => {
   it("is true on fly-machines for the default image and false for an override", async () => {
-    const yml = Buffer.from("image: registry.example/custom:1\n").toString("base64");
+    const yml = Buffer.from("image: ghcr.io/acme/custom:1\n").toString("base64");
     imageResponse = { status: 200, body: { type: "file", encoding: "base64", content: yml } };
     const over = runtime().preparationDeps({ owner: "acme", repo: "override-repo", projectKey: "AII" });
     expect(await over.checkRunnerCapability!("fly-machines")).toBe(false);

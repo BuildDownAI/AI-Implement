@@ -18,8 +18,10 @@ import {
   collectExternalReviewFindingsFromGh,
   collectReviewFindingsBlocksFromGh,
   formatReviewLedgerForPrompt,
+  type ReviewFindingsVerdict,
   type ReviewLedgerFinding,
   type ReviewLedgerSource,
+  reviewContractFindingGates,
 } from "../review-ledger.js";
 import {
   buildDispositionInstructions,
@@ -444,8 +446,10 @@ export function isReviewLedgerFindingGating(
   finding: Pick<ReviewLedgerFinding, "source" | "severity" | "reviewerId" | "reviewerProvenance">,
   reviewers?: ReviewerSelection[],
   summaryBlockingGates = false,
+  contractVerdict?: ReviewFindingsVerdict,
 ): boolean {
   if (summaryBlockingGates && finding.source === "claude-review-summary" && finding.severity === "blocking") return true;
+  if (finding.source === "review-contract") return reviewContractFindingGates(finding, contractVerdict);
   return isReviewLedgerSourceGating(finding.source, reviewers, finding.reviewerId, finding.reviewerProvenance);
 }
 
@@ -499,6 +503,7 @@ function buildReviewLedger(
   externalFindings: ReviewLedgerFinding[],
   reviewers?: ReviewerSelection[],
   summaryBlockingGates = false,
+  contractVerdict?: ReviewFindingsVerdict,
 ): PostPushReviewLedgerFinding[] {
   const ledger: PostPushReviewLedgerFinding[] = [];
   const indexByKey = new Map<string, number>();
@@ -510,7 +515,7 @@ function buildReviewLedger(
     const existingIndex = keys.map((key) => indexByKey.get(key)).find((index) => index !== undefined);
     if (existingIndex !== undefined) {
       const existing = ledger[existingIndex];
-      if (!isReviewLedgerFindingGating(existing, reviewers, summaryBlockingGates) && isReviewLedgerFindingGating(finding, reviewers, summaryBlockingGates)) {
+      if (!isReviewLedgerFindingGating(existing, reviewers, summaryBlockingGates, contractVerdict) && isReviewLedgerFindingGating(finding, reviewers, summaryBlockingGates, contractVerdict)) {
         ledger[existingIndex] = finding;
       }
       continue;
@@ -2324,9 +2329,10 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       }
 
       const summaryBlockingGates = reviewProcess.summaryBlockingGates;
-      const reviewLedger = buildReviewLedger(internalIssues, [...selectedInternalFindings, ...externalFindings], effectiveReviewerPolicy, summaryBlockingGates);
-      const gatingReviewFindings = reviewLedger.filter((finding) => isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates));
-      const advisoryReviewFindings = reviewLedger.filter((finding) => !isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates));
+      const contractVerdict = externalFindingsResult.verdictSource === "review-contract" ? externalFindingsResult.verdict : undefined;
+      const reviewLedger = buildReviewLedger(internalIssues, [...selectedInternalFindings, ...externalFindings], effectiveReviewerPolicy, summaryBlockingGates, contractVerdict);
+      const gatingReviewFindings = reviewLedger.filter((finding) => isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates, contractVerdict));
+      const advisoryReviewFindings = reviewLedger.filter((finding) => !isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates, contractVerdict));
       // A finding the fix agent disposed as "follow-up" on an earlier iteration is dropped here,
       // before the merge-readiness decision and before it can reappear in the next fix prompt.
       // An "invalid" disposition is not filtered — it stays gating so the next review decides.
