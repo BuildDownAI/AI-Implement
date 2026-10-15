@@ -117,6 +117,9 @@ import {
   removeLocalContainer,
   startLocalRunnerContainer,
   sweepExitedLocalContainers,
+  validateProtectedLocalInput,
+  type LocalRunnerInput,
+  type StartLocalContainerInput,
 } from "./local-docker.js";
 import { clearPrNotFoundGrace, decideCleanExitOutcome, shouldSkipCompletionNotice, workflowFileForJob } from "./monitor-status.js";
 import type { RunPrCandidate, RunPrMatch } from "./monitor-status.js";
@@ -2072,7 +2075,7 @@ export async function dispatchLocalDocker(
     return;
   }
 
-  if (!config.anthropicApiKey && !config.claudeOAuthToken) {
+  if (!config.anthropicApiKey && !config.claudeOAuthToken && !isManagedProject(issue.scopeKey)) {
     console.error(`[poll] Cannot dispatch ${issue.identifier} via local Docker: neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set`);
     return;
   }
@@ -2083,15 +2086,18 @@ export async function dispatchLocalDocker(
     doMarkDispatched: true,
     shadow: false,
     backendKind: "local-docker",
+    managedAuth: { runtime: getModelAuthRuntime(config), workflowFile: mapping.workflowFile },
     isDefinitiveLaunchFailure: isDefinitiveLocalDockerLaunchFailure,
     branchInfo: { fieldValue: baseBranchFieldValue, defaultBranch: mapping.defaultBranch },
-    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted }) => {
+    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, managedAuth, markLaunchAttempted }) => {
       const localOrchestratorUrl =
         config.localRunnerOrchestratorUrl ??
         config.runnerCallbackBaseUrl ??
         `http://host.docker.internal:${config.healthPort}`;
 
       const ghToken = await getTargetRepoToken(config, mapping.owner, mapping.repo);
+
+      const protectedLaunch = managedAuth.kind === "launch" ? managedAuth : null;
 
       const localImplRunConfig: RunConfigV1 = buildImplRunConfig({
         issue,
@@ -2100,10 +2106,23 @@ export async function dispatchLocalDocker(
         runnerCallbackUrl,
         groupingParent: isGroupingParentDispatch(issue),
         retryPolicy: getRetryPolicy(),
+        ...(protectedLaunch ? { agentConfig: protectedLaunch.snapshot } : {}),
       });
 
-      markLaunchAttempted();
-      const container = await startLocalRunnerContainer({
+      // Every throw here precedes markLaunchAttempted so the grant is settled as rejected.
+      let protectedModelAuth: LocalRunnerInput["protectedModelAuth"];
+      if (protectedLaunch) {
+        const bootstrap = protectedLaunch.takeBootstrap();
+        if (!bootstrap) throw new Error("managed dispatch refused: bootstrap unavailable");
+        protectedModelAuth = {
+          bootstrap,
+          projectKey: issue.scopeKey,
+          runConfig: localImplRunConfig,
+          modelAuthUrl: localOrchestratorUrl,
+        };
+      }
+
+      const localRunnerInput: StartLocalContainerInput = {
         image: config.localRunnerImage,
         issueId: issue.id,
         issueIdentifier: issue.identifier,
@@ -2112,8 +2131,8 @@ export async function dispatchLocalDocker(
         owner: mapping.owner,
         repo: mapping.repo,
         defaultBranch: baseBranch,
-        anthropicApiKey: config.anthropicApiKey ?? undefined,
-        claudeOAuthToken: config.claudeOAuthToken ?? undefined,
+        anthropicApiKey: protectedLaunch ? undefined : (config.anthropicApiKey ?? undefined),
+        claudeOAuthToken: protectedLaunch ? undefined : (config.claudeOAuthToken ?? undefined),
         githubToken: ghToken,
         sessionToken,
         machineNonce,
@@ -2122,10 +2141,16 @@ export async function dispatchLocalDocker(
         runnerCallbackUrl: runnerCallbackUrl || undefined,
         runToken: runToken || undefined,
         extraEnv: (() => {
-          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue), ...assigneeRunnerEnv(issue), AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(localImplRunConfig) };
+          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue), ...assigneeRunnerEnv(issue), ...(protectedLaunch ? {} : { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(localImplRunConfig) }) };
           return Object.keys(merged).length > 0 ? merged : undefined;
         })(),
-      });
+        ...(protectedModelAuth ? { protectedModelAuth } : {}),
+      };
+      // Reserved extraEnv names and legacy credentials fail here, before the grant is marked launched.
+      if (protectedModelAuth) validateProtectedLocalInput(localRunnerInput, protectedModelAuth);
+
+      markLaunchAttempted();
+      const container = await startLocalRunnerContainer(localRunnerInput);
 
       return {
         machineId: container.containerId,

@@ -250,3 +250,22 @@ Use a clean target checkout. If a cancelled or failed run leaves a session lock
 held for the same session file, inspect the artifact directory before trying
 again. A partial artifact set should still show the source proof, image proof,
 selected stages, and the step where execution stopped.
+
+## Hosted Codex job in local Docker
+
+`npm run dev:local` can launch an implementation run of an opted-in project in local Docker with a
+`codex-subscription` profile. The run config and every model-auth value (the plain `local` grant bearer,
+`AI_IMPLEMENT_MODEL_AUTH_*`) travel only in the 0600 env file passed with `--env-file`, never in `docker run`
+arguments; the file is deleted after the launch attempt. `docker inspect` still shows the values, which is
+acceptable for local development. Opted-out projects keep today's arguments and need an Anthropic credential.
+
+1. Opt the project in with direct store writes: save the account profile revision and the orchestrator
+   defaults with `src/agent-config-store.ts` (`saveAccountProfileRevision`, `setOrchestratorDefaults`), then
+   call `setProjectOptIn("<TEAM>", true)`. The target repository must be private.
+2. Import a plan record for the profile with `src/model-account-cli.ts` (see the earlier sections).
+3. Run `npm run dev:local`. The container reaches the model-auth routes at
+   `config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? http://host.docker.internal:<healthPort>`.
+   The local transport gate trusts plain HTTP from the container.
+
+A mapping `extraEnv` entry named `AI_IMPLEMENT_RUN_CONFIG`, `AI_IMPLEMENT_MODEL_AUTH_*` or a model credential
+name (for example `OPENAI_API_KEY`) fails the dispatch before launch and releases the admission.
