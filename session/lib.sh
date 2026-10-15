@@ -6,6 +6,13 @@ log() {
   echo "[session] $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"
 }
 
+# Launch node without ambient preload/module-path controls. Every shell-owned node child
+# (envelope decoders) goes through this: a NODE_OPTIONS=--require preload would otherwise run
+# with the protected envelope in its environment before any classification happened.
+run_node() {
+  env -u NODE_OPTIONS -u NODE_PATH node "$@"
+}
+
 fail() {
   log "FATAL: $*" >&2
   exit 1
@@ -72,6 +79,60 @@ verify_workspace_writable() {
   fail "Cannot write to bind-mounted workspace $workspace_dir (owner $ws_uid:$ws_gid, coder UID $coder_uid GID $coder_gid). Verify AI_IMPLEMENT_HOST_UID/AI_IMPLEMENT_HOST_GID match the host directory owner. On macOS Docker Desktop, confirm file sharing is enabled — the mount may be read-only."
 }
 
+# Copy a standalone local source into the writable container workspace.
+copy_local_workspace() {
+  local workspace_dir="$1"
+  [ -d /source-workspace ] || fail "Local workspace source is unavailable"
+  mkdir -p "$workspace_dir"
+  run_scoped "" cp -a /source-workspace/. "$workspace_dir/"
+  run_scoped "" git config --global --add safe.directory "$workspace_dir"
+}
+
+# Hand the already validated local-auth bootstrap projection to coder without touching
+# broader host mounts or credential directories. Docker Desktop can present the private
+# bind-mounted temp file as root:root during early root-side classification; configured
+# execution then consumes it as coder.
+prepare_local_auth_bootstrap_owner() {
+  [ -n "${AI_IMPLEMENT_LOCAL_AUTH_BOOTSTRAP_FILE:-}" ] || return 0
+  local file="$AI_IMPLEMENT_LOCAL_AUTH_BOOTSTRAP_FILE" parent mode parent_mode group
+  [ "${AI_IMPLEMENT_MODE:-}" = "local" ] || fail "Local auth bootstrap handoff is only supported for local runs"
+  case "$file" in /*) ;; *) fail "Local auth bootstrap path must be absolute" ;; esac
+  [ ! -L "$file" ] || fail "Local auth bootstrap file must not be a symlink"
+  [ -f "$file" ] || fail "Local auth bootstrap file is unavailable"
+  parent="$(dirname -- "$file")"
+  [ ! -L "$parent" ] || fail "Local auth bootstrap directory must not be a symlink"
+  [ -d "$parent" ] || fail "Local auth bootstrap directory is unavailable"
+  [ "$(basename -- "$file")" = "bootstrap.json" ] || fail "Local auth bootstrap file name is invalid"
+  case "$(basename -- "$parent")" in
+    ai-implement-local-auth-*) ;;
+    *) fail "Local auth bootstrap directory is invalid" ;;
+  esac
+  mode="$(stat -c '%a' "$file")"
+  parent_mode="$(stat -c '%a' "$parent")"
+  [ "$mode" = "600" ] || fail "Local auth bootstrap file must be private"
+  [ "$parent_mode" = "700" ] || fail "Local auth bootstrap directory must be private"
+  group="$(id -gn coder)"
+  chown coder:"$group" -- "$parent" "$file"
+  chmod 700 -- "$parent"
+  chmod 600 -- "$file"
+}
+
+# Mounted checkouts retain host ownership; copied/cloned workspaces belong to coder.
+prepare_workspace_owner() {
+  local mode="$1" workspace_dir="$2"
+  if [ "$mode" = "mounted" ]; then
+    prepare_coder_identity "${AI_IMPLEMENT_HOST_UID:-}" "${AI_IMPLEMENT_HOST_GID:-}"
+    prepare_local_auth_bootstrap_owner
+    verify_workspace_writable "$workspace_dir"
+  else
+    if [ -n "${AI_IMPLEMENT_LOCAL_AUTH_BOOTSTRAP_FILE:-}" ]; then
+      prepare_coder_identity "${AI_IMPLEMENT_HOST_UID:-}" "${AI_IMPLEMENT_HOST_GID:-}"
+      prepare_local_auth_bootstrap_owner
+    fi
+    chown -R coder:"$(id -gn coder)" "$workspace_dir"
+  fi
+}
+
 # Resolve VAR from the AI_IMPLEMENT_RUN_CONFIG envelope when the env is empty.
 # Usage: resolve_envelope_field VAR_NAME ENVELOPE_KEY
 #
@@ -92,7 +153,7 @@ resolve_envelope_field() {
   # substitution strips trailing newlines — putting the (possibly empty)
   # value last would make it indistinguishable from a value that never had
   # a separator.
-  out="$(node -e "try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,'base64').toString());const v=c['$key'];process.stdout.write((typeof v==='string'?v:'')+'\nok')}catch(e){process.stdout.write('\nerr')}" 2>/dev/null || echo $'\nerr')"
+  out="$(run_node -e "try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,'base64').toString());const v=c['$key'];process.stdout.write((typeof v==='string'?v:'')+'\nok')}catch(e){process.stdout.write('\nerr')}" 2>/dev/null || echo $'\nerr')"
   status="${out##*$'\n'}"
   val="${out%$'\n'*}"
   if [ "$status" != "ok" ]; then
@@ -102,6 +163,87 @@ resolve_envelope_field() {
   if [ -n "$val" ]; then
     export "${var_name}=${val}"
     log "envelope.${key}=${val}"
+  fi
+}
+
+# Classify AI_IMPLEMENT_RUN_CONFIG for model-auth bootstrap. Prints exactly one fixed word:
+#   legacy      no envelope, or a trusted-decodable envelope with neither a resolved agentConfig
+#               nor a credentials.modelAuthGrant (a callback/publication-only credentials
+#               namespace stays legacy stage selection)
+#   configured  trusted decoder accepts snapshot plus a hosted grant or validated private local bootstrap
+#   invalid     any nonempty envelope the trusted decoder rejects (bad base64/JSON, non-object,
+#               bad version, bad credentials) or configured intent with only one of the two;
+#               callers fail closed, never fall back to legacy
+# Never prints decoded values or decoder error text. AI_IMPLEMENT_DIST_DIR is a test seam.
+classify_run_config() {
+  [ -z "${AI_IMPLEMENT_RUN_CONFIG:-}" ] && { if [ -n "${AI_IMPLEMENT_LOCAL_AUTH_BOOTSTRAP_FILE:-}" ]; then echo invalid; else echo legacy; fi; return 0; }
+  run_node --input-type=module -e '
+    const out = (w) => process.stdout.write(w);
+    try {
+      const dir = process.env.AI_IMPLEMENT_DIST_DIR || "/app/dist";
+      const { decodeTrustedRunConfig } = await import(dir + "/run-config.js");
+      const c = decodeTrustedRunConfig(process.env.AI_IMPLEMENT_RUN_CONFIG);
+      const snapshot = c.agentConfig !== undefined;
+      const grant = c.credentials !== undefined && c.credentials.modelAuthGrant !== undefined;
+      const localFile = process.env.AI_IMPLEMENT_LOCAL_AUTH_BOOTSTRAP_FILE;
+      if (localFile) {
+        if (!snapshot || grant) { out("invalid"); }
+        else {
+          const { validateLocalSessionBootstrap } = await import(dir + "/local/session.js");
+          await validateLocalSessionBootstrap(localFile, c.agentConfig, process.env);
+          out("configured");
+        }
+      } else {
+        out(snapshot && grant ? "configured" : snapshot || grant ? "invalid" : "legacy");
+      }
+    } catch { out("invalid"); }
+  ' 2>/dev/null || echo invalid
+}
+
+# Credential helper that answers only from the GIT_PASSWORD of the git child it serves, so the
+# remote URL and argv stay credential-free and nothing is written to disk. Registered for
+# configured runs only; the TS clone step already supplies GIT_PASSWORD per operation.
+# shellcheck disable=SC2016 # expanded by the helper's own shell, not here
+SCOPED_GIT_HELPER='!f() { [ "$1" = get ] && [ -n "${GIT_PASSWORD:-}" ] || exit 0; echo username=x-access-token; echo "password=$GIT_PASSWORD"; }; f'
+
+configure_scoped_git_auth() {
+  run_scoped "" git config --global credential.helper "$SCOPED_GIT_HELPER" || return $?
+}
+
+# Run one git network operation (clone/fetch) with the GitHub token in that child's environment only.
+git_authed() {
+  GIT_PASSWORD="$GITHUB_TOKEN" GIT_TERMINAL_PROMPT=0 run_scoped "GIT_PASSWORD GIT_TERMINAL_PROMPT" git "$@" || return $?
+}
+
+# Run a command with a minimal, scrubbed environment when the run is configured
+# (CONFIGURED=1): only PATH/HOME/locale/TLS/proxy context plus the explicitly named
+# extra variables (e.g. GH_TOKEN for gh). Model, session, bootstrap and forwarded-secret
+# material never reaches the child. Legacy runs (CONFIGURED unset) run unchanged.
+# Usage: run_scoped "EXTRA_VAR ..." command [args...]
+run_scoped() {
+  local extra="$1" k
+  shift
+  # `|| return` keeps the failure visible to the caller's ERR trap (traps are not inherited by functions).
+  if [ "${CONFIGURED:-0}" != "1" ]; then "$@" || return $?; return 0; fi
+  local -a keep=(PATH HOME USER LOGNAME SHELL TERM TMPDIR TMP TEMP TZ LANG LANGUAGE LC_ALL LC_CTYPE
+    SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE CURL_CA_BUNDLE
+    HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy)
+  local -a pairs=()
+  # shellcheck disable=SC2086 # extra is a space-separated list of names
+  for k in "${keep[@]}" $extra; do
+    [ -n "${!k+x}" ] && pairs+=("$k=${!k}")
+  done
+  env -i "${pairs[@]}" "$@" || return $?
+}
+
+# ERR trap body. Configured runs log a fixed message: the failing command text can carry
+# bootstrap or token material.
+on_err() {
+  local rc="$1" line="$2" cmd="$3"
+  if [ "${CONFIGURED:-0}" = "1" ]; then
+    log "ERROR: line $line failed (exit $rc)"
+  else
+    log "ERROR: line $line failed: $cmd (exit $rc)"
   fi
 }
 
@@ -129,6 +271,14 @@ _remap_is_reserved() {
     ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|SESSION_TOKEN|MACHINE_NONCE) return 0 ;;
     RUN_TOKEN|ORCHESTRATOR_URL|RUNNER_CALLBACK_URL|WORKSPACE_DIR|PATH|HOME) return 0 ;;
   esac
+  # Configured (opted-in) runs also reserve every model credential, session/auth-directory,
+  # provider-routing and node preload/module-path name. Legacy runs keep the narrower list above on purpose.
+  if [ "${CONFIGURED:-0}" = "1" ]; then
+    case "$1" in
+      OPENAI_*|CODEX_*|ANTHROPIC_*|CLAUDE_*|AWS_*|RUN_*|RUNNER_*|NPM_TOKEN|CLOUD_ML_REGION|GOOGLE_APPLICATION_CREDENTIALS) return 0 ;;
+      NODE_OPTIONS|NODE_PATH) return 0 ;;
+    esac
+  fi
   return 1
 }
 

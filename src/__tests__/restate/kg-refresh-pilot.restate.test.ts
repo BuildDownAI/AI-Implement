@@ -203,6 +203,7 @@ function ensureCompose(): void {
     ...railFakes,
     // Sender deps: the GitHub Actions path uses the faked dispatch POST; the machine backends must not run.
     getInstallationToken: async () => "tok",
+    getScopedInstallationToken: async () => ({ token: "scoped-tok", expiresAt: "", installationId: 1 }),
     resolveRunnerImage: async () => undefined,
     postWorkflowDispatch: ((opts: { inputs: Record<string, string | undefined> }) => sim.postWorkflowDispatch(opts)) as never,
     keptMachineFly: () => { throw new Error("the Fly sender must not run on the GHA path"); },

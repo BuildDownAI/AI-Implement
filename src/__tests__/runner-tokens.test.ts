@@ -228,7 +228,7 @@ describe("verifyAndConsumeRunToken", () => {
     expect(runnerTokens.verifyAndConsumeRunToken("nodothere", SECRET).ok).toBe(false);
   });
 
-  it("returns malformed when no row exists for the dispatchId", () => {
+  it("returns missing_row when no row exists for the dispatchId", () => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "issue-1",
       mappingTeamKey: "ENG",
@@ -239,7 +239,7 @@ describe("verifyAndConsumeRunToken", () => {
     dedup.getDb().prepare("DELETE FROM runner_tokens WHERE dispatch_id = ?").run(dispatchId);
     const result = runnerTokens.verifyAndConsumeRunToken(token, SECRET);
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.reason).toBe("malformed");
+    if (!result.ok) expect(result.reason).toBe("missing_row");
   });
 
   it("allows progress tokens to be verified repeatedly without consuming them", () => {
@@ -367,7 +367,7 @@ describe("verifyRunToken — claims on a refusal", () => {
     const result = runnerTokens.verifyRunToken(token, SECRET, "result", { consume: false });
     expect(result.ok).toBe(false);
     if (!result.ok) {
-      expect(result.reason).toBe("malformed");
+      expect(result.reason).toBe("missing_row");
       expect(result.claims?.dispatchId).toBe(dispatchId);
     }
   });

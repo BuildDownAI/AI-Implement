@@ -4,9 +4,29 @@ import type { ReviewLedgerFinding } from "./pipeline/review-ledger.js";
 
 export type ReviewFixStatus = "pending" | "dispatched" | "skipped" | "failed";
 
+/**
+ * Execution budgets for one review-fix task. Review feedback is never clipped:
+ * a set that exceeds any budget is rejected whole (`incomplete`) so no caller can
+ * launch, or acknowledge as handled, a task that omits the end of a finding.
+ *
+ * The rendered task rides `issue.description` and `commentInstruction`, and
+ * run-config silently truncates descriptions at MAX_ENVELOPE_DESCRIPTION_LENGTH.
+ * Budgets: issue context <= 20,000 (+ marker), rendered feedback <= 19,000 and
+ * scaffold ~250, which keeps the worst case under the 40,000 envelope; the
+ * final envelope check still verifies the actual total.
+ */
 export const MAX_TASK_FINDINGS = 30;
-const MAX_FINDING_BODY_LENGTH = 2000;
+/** Per raw finding body. Comfortably above the 4,387-char four-finding regression. */
+export const MAX_FINDING_BODY_LENGTH = 8000;
+/** Rendered "Open review findings" content: headings, metadata, quote prefixes and URLs included. */
+export const MAX_FEEDBACK_AGGREGATE_LENGTH = 19000;
+/** Mirrors run-config.ts MAX_DESCRIPTION_CHARS; run-config's own truncation is unchanged. */
+export const MAX_ENVELOPE_DESCRIPTION_LENGTH = 40000;
 const MAX_ISSUE_DESCRIPTION_LENGTH = 20000;
+/** Bounded length of a log/UI preview; never used to build execution text. */
+const PREVIEW_LENGTH = 200;
+
+export type ReviewFixIncompleteCategory = "count" | "body" | "aggregate" | "envelope";
 
 export interface ReviewFixTaskFinding {
   finding_key: string;
@@ -18,18 +38,44 @@ export interface ReviewFixTaskFinding {
   url: string | null;
 }
 
+export type ReviewFixTaskPreparation =
+  | { status: "complete"; text: string; findings: ReviewFixTaskFinding[] }
+  | { status: "incomplete"; category: ReviewFixIncompleteCategory; reason: string };
+
+/** Thrown before admission when feedback cannot be delivered completely. The message is bounded and carries no finding text. */
+export class ReviewFixFeedbackIncompleteError extends Error {
+  constructor(readonly category: ReviewFixIncompleteCategory, reason: string) {
+    super(`review-fix feedback incomplete (${category}): ${reason}`);
+    this.name = "ReviewFixFeedbackIncompleteError";
+  }
+}
+
 /**
  * Builds a review-fix run's task description: the queue reason, the original
  * issue's requirements, and the open review findings keyed by finding_key so
  * the agent can give each one a disposition instead of re-deriving scope from
- * the raw PR thread.
+ * the raw PR thread. Every supplied finding is rendered in full or the whole
+ * set is reported `incomplete`; `findings` on success equals the rendered set.
  */
-export function buildReviewFixTaskDescription(input: {
+export function prepareReviewFixTask(input: {
   prNumber: number;
   reason: string;
   findings: ReviewFixTaskFinding[];
   issueDescription: string | null;
-}): string {
+}): ReviewFixTaskPreparation {
+  if (input.findings.length > MAX_TASK_FINDINGS) {
+    return incomplete("count", `${input.findings.length} findings exceed the ${MAX_TASK_FINDINGS}-finding limit`);
+  }
+  const oversized = input.findings.find((finding) => finding.body.length > MAX_FINDING_BODY_LENGTH);
+  if (oversized) {
+    return incomplete("body", `finding ${previewOf(oversized.finding_key)} body exceeds ${MAX_FINDING_BODY_LENGTH} characters`);
+  }
+  const rendered = input.findings.map(formatTaskFinding);
+  const feedbackLength = rendered.reduce((sum, part) => sum + part.length, 0) + 2 * Math.max(0, rendered.length - 1);
+  if (feedbackLength > MAX_FEEDBACK_AGGREGATE_LENGTH) {
+    return incomplete("aggregate", `rendered feedback is ${feedbackLength} characters, over the ${MAX_FEEDBACK_AGGREGATE_LENGTH} limit`);
+  }
+
   const sections: string[] = [
     `Address review feedback on PR #${input.prNumber}. Queue reason: ${input.reason}.`,
     "## Issue requirements",
@@ -38,21 +84,37 @@ export function buildReviewFixTaskDescription(input: {
       : "The original issue text was not available. Treat only defects as in scope.",
     "## Open review findings",
   ];
-
-  if (input.findings.length === 0) {
+  if (rendered.length === 0) {
     sections.push("No structured findings are recorded. Read the PR discussion.");
   } else {
-    const included = input.findings.slice(0, MAX_TASK_FINDINGS);
-    const omitted = input.findings.length - included.length;
-    for (const finding of included) {
-      sections.push(formatTaskFinding(finding));
-    }
-    if (omitted > 0) {
-      sections.push(`${omitted} additional finding${omitted === 1 ? " was" : "s were"} left out of this task; consult the PR discussion for the rest.`);
-    }
+    sections.push(...rendered);
   }
+  const text = sections.join("\n\n");
+  if (text.length > MAX_ENVELOPE_DESCRIPTION_LENGTH) {
+    return incomplete("envelope", `rendered task is ${text.length} characters, over the ${MAX_ENVELOPE_DESCRIPTION_LENGTH} envelope limit`);
+  }
+  return { status: "complete", text, findings: [...input.findings] };
+}
 
-  return sections.join("\n\n");
+/** String-returning form for callers that treat an incomplete set as an error. */
+export function buildReviewFixTaskDescription(input: Parameters<typeof prepareReviewFixTask>[0]): string {
+  const prepared = prepareReviewFixTask(input);
+  if (prepared.status === "incomplete") throw new ReviewFixFeedbackIncompleteError(prepared.category, prepared.reason);
+  return prepared.text;
+}
+
+/** Bounded single-line preview for logs/UI. Execution text never derives from it. */
+export function previewReviewFixText(text: string): string {
+  return previewOf(text);
+}
+
+function previewOf(text: string): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > PREVIEW_LENGTH ? `${flat.slice(0, PREVIEW_LENGTH)}…` : flat;
+}
+
+function incomplete(category: ReviewFixIncompleteCategory, reason: string): ReviewFixTaskPreparation {
+  return { status: "incomplete", category, reason };
 }
 
 function formatTaskFinding(finding: ReviewFixTaskFinding): string {
@@ -60,7 +122,7 @@ function formatTaskFinding(finding: ReviewFixTaskFinding): string {
     ? (typeof finding.line === "number" ? `${finding.path}:${finding.line}` : finding.path)
     : undefined;
   const meta = [finding.source, finding.severity, location].filter((part): part is string => Boolean(part)).join(" · ");
-  const body = truncateFindingBody(finding.body)
+  const body = finding.body
     .split("\n")
     .map((line) => `> ${line}`)
     .join("\n");
@@ -68,10 +130,6 @@ function formatTaskFinding(finding: ReviewFixTaskFinding): string {
   const lines = [`### ${finding.finding_key}`, meta, body];
   if (finding.url) lines.push(finding.url);
   return lines.join("\n\n");
-}
-
-function truncateFindingBody(body: string): string {
-  return body.length > MAX_FINDING_BODY_LENGTH ? `${body.slice(0, MAX_FINDING_BODY_LENGTH)}…` : body;
 }
 
 function truncateIssueDescription(text: string): string {

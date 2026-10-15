@@ -181,3 +181,21 @@ A coordinator object is the Restate virtual object that holds the single in-flig
 A rail gate is one journaled step of the kg-refresh rail (fetch, stage, swap, verify) that either passes or fails the refresh. A failed gate triggers the `revert` compensation, and `status` names the gate that did not finish.
 
 **Not to be confused with:** The auto-merge gate, which decides whether a child PR merges; or the review gate, which is the check that holds a PR until review approves.
+
+## ChatGPT plan account
+
+A ChatGPT plan account is an account profile whose `codex-subscription` credential is a ChatGPT plan record from "Sign in with ChatGPT". Its refresh token is held by one refresher.
+
+**Not to be confused with:** A Claude subscription account, which keeps reservations and recovery holds; or an OpenAI API key account.
+
+## Refresher
+
+The refresher is the single holder of a ChatGPT plan account's refresh token: the host-side credential port on a local run, one Restate Virtual Object per account profile on a hosted run. It serializes refreshes and saves each rotated token before it hands out an access token.
+
+**Not to be confused with:** A runner, which never sees the refresh token; or the `Operator` object, which refreshes other credentials.
+
+## Access-token grant
+
+An access-token grant is one checkout of the `chatgpt-access-token` secret kind: an access token and its expiry, valid for about an hour. Renewing is another checkout.
+
+**Not to be confused with:** The refresh token, which stays with the refresher; or a reservation, which hosted ChatGPT plan accounts do not take.

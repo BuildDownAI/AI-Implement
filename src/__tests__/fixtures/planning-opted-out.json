@@ -1,0 +1,74 @@
+{
+  "gha": {
+    "ghToken": "control-token",
+    "runnerImage": "runner:image",
+    "planningSentBaseBranch": true,
+    "planningContract": "legacy",
+    "planningDispatchInputs": {
+      "issue_id": "issue-prepare-1",
+      "issue_identifier": "AII-1052",
+      "issue_title": "Prepare planning",
+      "issue_description": "desc",
+      "parent": "",
+      "siblings": "",
+      "dependencies": "",
+      "base_branch": "feature/base",
+      "runner_callback_url": "",
+      "run_token": "",
+      "runner_image": "runner:image"
+    }
+  },
+  "local": {
+    "image": "img",
+    "issueId": "i-1",
+    "issueIdentifier": "AII-1053",
+    "issueTitle": "t",
+    "issueDescription": "d",
+    "owner": "o",
+    "repo": "r",
+    "defaultBranch": "main",
+    "anthropicApiKey": "sk",
+    "githubToken": "SCOPED-TOKEN-SECRET",
+    "sessionToken": "SESSION",
+    "machineNonce": "NONCE",
+    "phase": "planning",
+    "containerName": "planning-d-1",
+    "orchestratorUrl": "http://host.docker.internal:undefined",
+    "runToken": "RUN",
+    "extraEnv": {
+      "PARENT": "",
+      "SIBLINGS": "",
+      "DEPENDENCIES": "",
+      "AI_IMPLEMENT_RUN_CONFIG": "eyJ2IjoxLCJpc3N1ZSI6eyJpZCI6ImktMSIsImlkZW50aWZpZXIiOiJBSUktMTA1MyIsInRpdGxlIjoidCIsImRlc2NyaXB0aW9uIjoiZCJ9LCJydW5uZXJQaGFzZSI6InBsYW5uaW5nIiwicGxhbm5pbmdDb250ZXh0Ijp7InBhcmVudCI6IiIsInNpYmxpbmdzIjoiIiwiZGVwZW5kZW5jaWVzIjoiIn19"
+    }
+  },
+  "fly": {
+    "image": "default-img",
+    "issueId": "i-1",
+    "issueIdentifier": "AII-1053",
+    "issueTitle": "t",
+    "issueDescription": "d",
+    "owner": "o",
+    "repo": "r",
+    "defaultBranch": "main",
+    "anthropicApiKey": "sk",
+    "githubToken": "SCOPED-TOKEN-SECRET",
+    "sessionToken": "SESSION",
+    "machineNonce": "NONCE",
+    "phase": "planning",
+    "teamKey": "AII",
+    "teamSecretNames": [],
+    "allTeamKeys": [],
+    "machineName": "planning-d-1",
+    "flyProcessLevelSecrets": true,
+    "orchestratorUrl": "https://orch.example.test",
+    "runToken": "RUN",
+    "expectedTtlSeconds": 14400,
+    "extraEnv": {
+      "PARENT": "",
+      "SIBLINGS": "",
+      "DEPENDENCIES": "",
+      "AI_IMPLEMENT_RUN_CONFIG": "eyJ2IjoxLCJpc3N1ZSI6eyJpZCI6ImktMSIsImlkZW50aWZpZXIiOiJBSUktMTA1MyIsInRpdGxlIjoidCIsImRlc2NyaXB0aW9uIjoiZCJ9LCJydW5uZXJQaGFzZSI6InBsYW5uaW5nIiwicGxhbm5pbmdDb250ZXh0Ijp7InBhcmVudCI6IiIsInNpYmxpbmdzIjoiIiwiZGVwZW5kZW5jaWVzIjoiIn19"
+    }
+  }
+}

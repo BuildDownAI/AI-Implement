@@ -71,7 +71,7 @@ import {
   resolveKgExecutionMode,
   type KgRefreshProductionInput,
 } from "../restate/kg-refresh-production.js";
-import { buildKgRefreshRunConfig, decodeRunConfig } from "../run-config.js";
+import { buildKgRefreshRunConfig, decodeRunConfig, decodeTrustedRunConfig } from "../run-config.js";
 import { verifyRunToken } from "../runner-tokens.js";
 
 function makeKeptFly(): KeptMachineFly {
@@ -110,6 +110,7 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
     getPullRequestStateFn: noop as never,
     deleteBranchFn: noop as never,
     getInstallationToken: vi.fn(async () => "gh-token"),
+    getScopedInstallationToken: vi.fn(async () => ({ token: "scoped-gh-token", expiresAt: "", installationId: 1 })),
     resolveRunnerImage: vi.fn(async () => "runner:test"),
     postWorkflowDispatch: ((...args: unknown[]) => postWorkflowDispatch(...args)) as never,
     keptMachineFly: () => makeKeptFly(),
@@ -584,6 +585,19 @@ describe("GHA dispatch wrapper", () => {
     const probe = vi.fn(async () => ({ contract: "envelope", supportsRunPublicationToken: false, supportsAttemptCorrelation: false }));
     await createKgRefreshDispatch(makeInput({ resolveWorkflowCapabilities: probe as never }))(dispatchInput);
     expect(postWorkflowDispatch.mock.calls[0][0].inputs).not.toHaveProperty("run_publication_token");
+  });
+
+  it("moves minted KG bearers into the private envelope on a capable reader", async () => {
+    postWorkflowDispatch.mockResolvedValue({ success: true, status: 200, outcome: "accepted", runId: 1 });
+    const probe = vi.fn(async () => ({ contract: "envelope", supportsRunPublicationToken: true, supportsPrivateRunConfig: true, supportsAttemptCorrelation: false }));
+    await createKgRefreshDispatch(makeInput({ resolveWorkflowCapabilities: probe as never }))(dispatchInput);
+    const inputs = postWorkflowDispatch.mock.calls[0][0].inputs;
+    expect(inputs.run_token).toBe("");
+    expect(inputs).not.toHaveProperty("run_progress_token");
+    expect(inputs).not.toHaveProperty("run_publication_token");
+    expect(decodeTrustedRunConfig(inputs.run_config).credentials).toEqual({
+      version: 1, resultToken: "rt", progressToken: "pt", publicationToken: "pub",
+    });
   });
 
   it("maps a definite rejection to rejected", async () => {

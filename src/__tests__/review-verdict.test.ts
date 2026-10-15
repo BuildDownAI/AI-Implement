@@ -90,6 +90,15 @@ describe("parseReviewVerdict", () => {
     })).toThrow("expected blocking_issues[0].location to be a string when present");
   });
 
+  it("treats a null location as absent, the strict-mode encoding of an optional field", () => {
+    const verdict = parseReviewVerdict({
+      ...validApproved,
+      approved: false,
+      blocking_issues: [{ title: "Bug", location: null, problem: "It fails.", required_fix: "Fix it." }],
+    });
+    expect(verdict.blockingIssues).toEqual([{ title: "Bug", problem: "It fails.", requiredFix: "Fix it." }]);
+  });
+
   it("rejects legacy alias fields instead of ignoring them", () => {
     expect(() => parseReviewVerdict({
       ...validApproved,

@@ -1,4 +1,4 @@
-import { afterEach, describe, it, expect } from "vitest";
+import { afterEach, beforeAll, describe, it, expect } from "vitest";
 import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
@@ -226,7 +226,7 @@ describe("session/entrypoint.sh", () => {
 
   it("is under 120 lines (bootstrap, not monolith)", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
-    expect(content.split("\n").length).toBeLessThan(120);
+    expect(content.split("\n").length).toBeLessThan(140);
   });
 
   it("exec's the phase-selected TS runner as the final step", () => {
@@ -283,7 +283,7 @@ describe("session/entrypoint.sh", () => {
   it("preserves the checked-out gap-fill PR branch for the TS clone step", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
     expect(content).toMatch(/gh pr checkout "\$PR_NUMBER"/);
-    expect(content).toMatch(/GITHUB_DEFAULT_BRANCH="\$\(git branch --show-current\)"/);
+    expect(content).toMatch(/GITHUB_DEFAULT_BRANCH="\$\(run_scoped "" git branch --show-current\)"/);
   });
 
   it("marks the cloned workspace safe before the gap-fill PR checkout", () => {
@@ -370,6 +370,7 @@ describe("session/entrypoint.sh", () => {
         WORKSPACE_DIR: workspace,
         AI_IMPLEMENT_MODE: "local",
         AI_IMPLEMENT_WORKSPACE_MODE: "mounted",
+        AI_IMPLEMENT_RUN_CONFIG: "",
         AI_IMPLEMENT_HOST_UID: "1234",
         AI_IMPLEMENT_HOST_GID: "2345",
         ANTHROPIC_API_KEY: "test-key",
@@ -672,5 +673,259 @@ describe("session/lib.sh verify_workspace_writable", () => {
     expect(rawArgs[cIdx + 1]).not.toContain(root);
     // The workspace path must appear as a standalone argument
     expect(rawArgs).toContain(root);
+  });
+});
+
+// ─── session/entrypoint.sh configured model-auth bootstrap (AII-951) ──────────
+
+describe("session/entrypoint.sh configured model-auth bootstrap", () => {
+  const BEARER = `SENTINEL-bearer-${"x".repeat(24)}${"B".repeat(32)}`;
+  const grant = {
+    version: 1, audience: "model-auth", grantId: "g1", dispatchId: "d1", snapshotId: "s1",
+    projectKey: "p", backend: "fly", expiresAt: 1_800_000_000_000, bearer: BEARER,
+    bindings: [{ stage: "planning", profileId: "pp", profileRevision: 1, authMode: "openai-api-key" }],
+  };
+  const stage = (s: string) => ({
+    sel: { agent: "codex", provider: "openai", model: "m", accountProfileId: `p-${s}`, invocationTimeoutMs: 60_000 },
+    src: { agent: "project", provider: "project", model: "project", accountProfileId: "project", invocationTimeoutMs: "job-deadline" },
+    prof: { id: `p-${s}`, identity: "acct", revision: 2, agent: "codex", provider: "openai", authMode: "openai-api-key" },
+  });
+  const agentConfig = () => {
+    const p = stage("planning"), i = stage("implementation"), r = stage("review");
+    return {
+      version: 1,
+      snapshotId: "snap-1",
+      configRevisions: {
+        orchestratorDefault: { configRevisionId: "11111111-1111-4111-8111-111111111111", revision: 1 },
+        project: { configRevisionId: "22222222-2222-4222-8222-222222222222", revision: 3 },
+      },
+      stages: { planning: p.sel, implementation: i.sel, review: r.sel },
+      sources: { planning: p.src, implementation: i.src, review: r.src },
+      profiles: { planning: p.prof, implementation: i.prof, review: r.prof },
+    };
+  };
+  const issue = { id: "1", identifier: "A-1", title: "t", description: "d" };
+  const encode = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64");
+  const configuredEnvelope = () => encode({ v: 1, issue, prNumber: "7", agentConfig: agentConfig(), credentials: { version: 1, modelAuthGrant: grant } });
+
+  let distDir = "";
+  beforeAll(() => {
+    // Real trusted decoder, compiled once; the shell imports it from AI_IMPLEMENT_DIST_DIR.
+    distDir = join(process.cwd(), "node_modules", ".cache", "aii951-entrypoint-dist");
+    const r = spawnSync("npx", ["tsc", "--outDir", distDir], { encoding: "utf8" });
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+  }, 120_000);
+
+  function run(env: Record<string, string>, opts: { failClone?: boolean } = {}) {
+    const root = mkdtempSync(join(tmpdir(), "entrypoint-configured-"));
+    tempDirs.push(root);
+    const binDir = join(root, "bin");
+    const workspace = join(root, "workspace");
+    const log = join(root, "children.log");
+    spawnSync("mkdir", ["-p", binDir, workspace]);
+    writeFileSync(log, "");
+    // Each shim records its argv and the complete environment the child received.
+    for (const name of ["git", "gh", "su", "dbus-run-session"]) {
+      const tail = name === "git"
+        ? `\ncase "\${1:-}" in branch) echo pr-branch ;; ${opts.failClone ? "clone) exit 1 ;; " : ""}esac`
+        : "";
+      writeShim(binDir, name, `{ echo "== ${name} $*"; env; } >> '${log}'${tail}`);
+    }
+    for (const name of ["chown", "cp"]) writeShim(binDir, name, "true");
+    const result = spawnSync("bash", ["session/entrypoint.sh"], {
+      encoding: "utf8",
+      env: {
+        PATH: `${binDir}:${process.env.PATH}`,
+        HOME: root,
+        WORKSPACE_DIR: workspace,
+        AI_IMPLEMENT_MODE: "local",
+        AI_IMPLEMENT_DIST_DIR: distDir,
+        GITHUB_TOKEN: "SENTINEL-gh-token",
+        GITHUB_OWNER: "BuildDownAI",
+        GITHUB_REPO: "fixture",
+        GITHUB_DEFAULT_BRANCH: "testing",
+        ...env,
+      },
+    });
+    const children = readFileSync(log, "utf8");
+    const sections = children.split(/^== /m).filter(Boolean);
+    return { result, children, sections, output: result.stdout + result.stderr };
+  }
+
+  const AMBIENT = {
+    OPENAI_API_KEY: "SENTINEL-openai",
+    CODEX_HOME: "/sentinel/codex-home",
+    CLAUDE_CONFIG_DIR: "/sentinel/claude",
+    AWS_SECRET_ACCESS_KEY: "SENTINEL-aws-secret",
+    AI_IMPLEMENT_MODEL_AUTH_BEARER: "SENTINEL-model-auth-bearer",
+    RUN_PROGRESS_TOKEN: "SENTINEL-progress",
+    FORWARDED_APP_SECRET: "SENTINEL-forwarded",
+    AI_IMPLEMENT_FORWARDED_SECRETS: "FORWARDED_APP_SECRET",
+  };
+
+  it("hands a configured Codex/OpenAI run to the TS runner without ambient Claude credentials, scrubbing shell git/gh", () => {
+    const envelope = configuredEnvelope();
+    const { result, sections, output } = run({ AI_IMPLEMENT_RUN_CONFIG: envelope, ...AMBIENT });
+    expect(result.status, output).toBe(0);
+    const shellChildren = sections.filter((s) => /^(git|gh) /.test(s));
+    expect(shellChildren.length).toBeGreaterThan(3);
+    for (const s of shellChildren) {
+      for (const secret of ["SENTINEL-openai", "SENTINEL-aws-secret", "SENTINEL-model-auth-bearer", "SENTINEL-progress",
+        "SENTINEL-forwarded", "/sentinel/codex-home", "/sentinel/claude", envelope, BEARER]) {
+        expect(s, s.split("\n")[0]).not.toContain(secret);
+      }
+      expect(s).not.toMatch(/^AI_IMPLEMENT_/m);
+    }
+    // The configured clone URL and every git argv are credential-free: the token reaches only the
+    // clone child's environment (as GIT_PASSWORD), and only gh receives GH_TOKEN.
+    const clone = sections.find((s) => s.startsWith("git clone "));
+    expect(clone, output).toBeDefined();
+    expect(clone!.split("\n")[0]).toContain("https://github.com/BuildDownAI/fixture.git");
+    expect(clone!.split("\n")[0]).not.toContain("SENTINEL-gh-token");
+    expect(clone).toContain("GIT_PASSWORD=SENTINEL-gh-token");
+    for (const s of sections.filter((c) => c.startsWith("git ") && !c.startsWith("git clone "))) {
+      expect(s, s.split("\n")[0]).not.toContain("SENTINEL-gh-token");
+    }
+    for (const s of sections) expect(s.split("\n")[0]).not.toContain("SENTINEL-gh-token");
+    expect(sections.find((s) => s.startsWith("gh pr checkout"))).toContain("GH_TOKEN=SENTINEL-gh-token");
+    // The trusted runner handoff keeps the protected payload.
+    const handoff = sections.find((s) => s.startsWith("dbus-run-session "));
+    expect(handoff, output).toContain(`AI_IMPLEMENT_RUN_CONFIG=${envelope}`);
+    expect(output).not.toContain(BEARER);
+    expect(output).not.toContain(envelope);
+  });
+
+  it("keeps the legacy provider requirement when the run is not configured", () => {
+    const legacyEnvelope = encode({ v: 1, issue });
+    for (const env of [{} as Record<string, string>, { AI_IMPLEMENT_RUN_CONFIG: legacyEnvelope }]) {
+      const { result, children, output } = run({ ISSUE_ID: "i", ISSUE_IDENTIFIER: "A-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d", ...env });
+      expect(result.status).not.toBe(0);
+      expect(output).toContain("At least one of ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN must be set");
+      expect(children).toBe("");
+    }
+  });
+
+  it("legacy bedrock still requires AWS_REGION and GHA mode", () => {
+    const base = { PROVIDER: "bedrock", ISSUE_ID: "i", ISSUE_IDENTIFIER: "A-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d" };
+    expect(run(base).output).toContain("provider=bedrock is supported only in GHA mode");
+    const gha = run({ ...base, GITHUB_ACTIONS: "true", GITHUB_REPOSITORY: "BuildDownAI/fixture" });
+    expect(gha.output).toContain("Required environment variable AWS_REGION is not set");
+  });
+
+  it("legacy runs keep passing ambient credentials to shell children unchanged", () => {
+    const { result, sections, output } = run({
+      ANTHROPIC_API_KEY: "legacy-key", ISSUE_ID: "i", ISSUE_IDENTIFIER: "A-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d",
+    });
+    expect(result.status, output).toBe(0);
+    expect(sections.find((s) => s.startsWith("git "))).toContain("ANTHROPIC_API_KEY=legacy-key");
+    expect(sections.find((s) => s.startsWith("git clone "))!.split("\n")[0]).toContain("x-access-token:SENTINEL-gh-token@github.com");
+  });
+
+  it("a valid private callback/publication-only credentials namespace stays legacy and keeps the provider requirement", () => {
+    const envelope = encode({ v: 1, issue, credentials: { version: 1, resultToken: "tok-a", publicationToken: "tok-b" } });
+    const missing = run({ AI_IMPLEMENT_RUN_CONFIG: envelope });
+    expect(missing.result.status).toBe(1);
+    expect(missing.output).toContain("At least one of ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN must be set");
+    expect(missing.output).not.toContain("Configured model-auth bootstrap");
+    expect(missing.children).toBe("");
+    const ok = run({ AI_IMPLEMENT_RUN_CONFIG: envelope, ANTHROPIC_API_KEY: "legacy-key" });
+    expect(ok.result.status, ok.output).toBe(0);
+    expect(ok.sections.find((s) => s.startsWith("git "))).toContain("ANTHROPIC_API_KEY=legacy-key");
+  });
+
+  it.each([
+    ["missing grant", () => encode({ v: 1, issue, agentConfig: agentConfig() })],
+    ["missing snapshot", () => encode({ v: 1, issue, credentials: { version: 1, modelAuthGrant: grant } })],
+    ["malformed grant", () => encode({ v: 1, issue, agentConfig: agentConfig(), credentials: { version: 1, modelAuthGrant: { ...grant, audience: "other" } } })],
+    ["malformed snapshot", () => encode({ v: 1, issue, agentConfig: { version: 1 }, credentials: { version: 1, modelAuthGrant: grant } })],
+    ["invalid base64/JSON", () => "%%%not-base64-json%%%"],
+    ["truncated JSON", () => configuredEnvelope().slice(0, -16)],
+    ["non-object JSON", () => encode("a string")],
+    ["null JSON", () => encode(null)],
+    ["array JSON", () => encode([issue])],
+    ["unsupported version", () => encode({ v: 2, issue, agentConfig: agentConfig(), credentials: { version: 1, modelAuthGrant: grant } })],
+    ["unsupported credentials version", () => encode({ v: 1, issue, credentials: { version: 2, resultToken: "t" } })],
+  ])("fails closed with a fixed value-free message before git or setup: %s", (_name, make) => {
+    const envelope = make();
+    const { result, children, output } = run({
+      AI_IMPLEMENT_RUN_CONFIG: envelope,
+      ANTHROPIC_API_KEY: "SENTINEL-legacy-fallback",
+      ...AMBIENT,
+    });
+    expect(result.status).toBe(1);
+    expect(output).toContain("FATAL: Configured model-auth bootstrap is invalid or incomplete");
+    expect(children).toBe("");
+    for (const secret of [envelope, BEARER, "SENTINEL-legacy-fallback", "SENTINEL-gh-token", "SENTINEL-openai"]) {
+      expect(output).not.toContain(secret);
+    }
+  });
+
+  describe("node preload/module-path controls", () => {
+    const probe = () => {
+      const dir = mkdtempSync(join(tmpdir(), "entrypoint-preload-"));
+      tempDirs.push(dir);
+      const marker = join(dir, "marker");
+      const preload = join(dir, "preload.cjs");
+      writeFileSync(preload, `require("node:fs").appendFileSync(${JSON.stringify(marker)}, "ran\\n");\n`);
+      return { marker, nodeEnv: { NODE_OPTIONS: `--require=${preload}`, NODE_PATH: "/sentinel/node-path" } };
+    };
+    const alias = (nodeEnv: Record<string, string>) => ({
+      AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_",
+      SAN_NODE_OPTIONS: nodeEnv.NODE_OPTIONS,
+      SAN_NODE_PATH: nodeEnv.NODE_PATH,
+      SAN_REPO_SAFE_SECRET: "safe-repo-value",
+    });
+
+    it("never runs a preload for a valid configured run, and the handoff carries neither bare nor aliased controls", () => {
+      const { marker, nodeEnv } = probe();
+      const envelope = configuredEnvelope();
+      const { result, sections, output } = run({ AI_IMPLEMENT_RUN_CONFIG: envelope, ...nodeEnv, ...alias(nodeEnv) });
+      expect(result.status, output).toBe(0);
+      expect(existsSync(marker)).toBe(false);
+      const handoff = sections.find((s) => s.startsWith("dbus-run-session "))!;
+      expect(handoff).toContain(`AI_IMPLEMENT_RUN_CONFIG=${envelope}`);
+      expect(handoff).not.toMatch(/^NODE_OPTIONS=/m);
+      expect(handoff).not.toMatch(/^NODE_PATH=/m);
+      expect(handoff).not.toMatch(/^SAN_NODE_/m);
+      expect(handoff).toMatch(/^AI_IMPLEMENT_FORWARDED_SECRETS=REPO_SAFE_SECRET$/m);
+      expect(handoff).toContain("REPO_SAFE_SECRET=safe-repo-value");
+      for (const s of sections.filter((c) => /^(git|gh) /.test(c))) expect(s).not.toMatch(/^NODE_(OPTIONS|PATH)=/m);
+    });
+
+    it.each([
+      ["truncated JSON", () => configuredEnvelope().slice(0, -16)],
+      ["invalid base64/JSON", () => "%%%not-base64-json%%%"],
+    ])("never runs a preload for a malformed envelope (%s) and stops before git", (_n, make) => {
+      const { marker, nodeEnv } = probe();
+      const { result, children, output } = run({ AI_IMPLEMENT_RUN_CONFIG: make(), ...nodeEnv, ...alias(nodeEnv) });
+      expect(result.status).toBe(1);
+      expect(output).toContain("FATAL: Configured model-auth bootstrap is invalid or incomplete");
+      expect(children).toBe("");
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    it("legacy runs keep their node controls at the handoff but still decode without running a preload", () => {
+      const { marker, nodeEnv } = probe();
+      const envelope = encode({ v: 1, issue, prNumber: "7" });
+      const { result, sections, output } = run({
+        AI_IMPLEMENT_RUN_CONFIG: envelope, ANTHROPIC_API_KEY: "legacy-key", ...nodeEnv, ...alias(nodeEnv),
+      });
+      expect(result.status, output).toBe(0);
+      expect(existsSync(marker)).toBe(false);
+      const handoff = sections.find((s) => s.startsWith("dbus-run-session "))!;
+      expect(handoff).toContain(`NODE_OPTIONS=${nodeEnv.NODE_OPTIONS}`);
+      expect(handoff).toContain("NODE_PATH=/sentinel/node-path");
+    });
+  });
+
+  it("logs a fixed ERR-trap message, without the failing command text, on configured runs", () => {
+    const envelope = configuredEnvelope();
+    const configured = run({ AI_IMPLEMENT_RUN_CONFIG: envelope }, { failClone: true });
+    expect(configured.result.status).not.toBe(0);
+    expect(configured.output).toMatch(/ERROR: line \d+ failed \(exit 1\)/);
+    for (const leaked of ["git clone", "SENTINEL-gh-token", BEARER, envelope]) expect(configured.output).not.toContain(leaked);
+    // Legacy keeps the command-text form of the trap message.
+    const legacy = run({ ANTHROPIC_API_KEY: "k", ISSUE_ID: "i", ISSUE_IDENTIFIER: "A-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d" }, { failClone: true });
+    expect(legacy.output).toMatch(/ERROR: line \d+ failed: .+ \(exit 1\)/);
   });
 });

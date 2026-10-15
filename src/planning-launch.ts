@@ -5,23 +5,34 @@
 import type { AppConfig, HeldReservation, DispatchSessionResult } from "./index.js";
 import type { RepoMapping } from "./config.js";
 import type { TicketIssue, TicketingProvider } from "./providers/types.js";
-import { postWorkflowDispatch, providerDispatchFields, capRunnerEnv, buildEnvelopeDispatchInputs, type DispatchInputs, type DispatchOutcome } from "./github.js";
-import { resolveWorkflowContract, type WorkflowContract } from "./workflow-probe.js";
+import {
+  postWorkflowDispatch,
+  providerDispatchFields,
+  capRunnerEnv,
+  buildEnvelopeDispatchInputs,
+  assertPrivateTransportForCredentials,
+  type DispatchInputs,
+  type DispatchOutcome,
+} from "./github.js";
+import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { notify } from "./notify.js";
 import { recordDispatchFailure } from "./dispatch-breaker.js";
-import { getInstallationToken } from "./github-app-auth.js";
+import { getInstallationToken, getScopedInstallationToken } from "./github-app-auth.js";
 import { mintLaunchTokens, PLANNING_TTL_SECONDS } from "./runner-tokens.js";
 import { buildPlanningContextInputs } from "./planning-context.js";
 import { postBranchComment } from "./base-branch.js";
 import { appendLog, countPriorDispatches } from "./log.js";
 import { createMachine, buildSessionMachineConfig, listAppSecrets } from "./fly-machines.js";
-import { startLocalRunnerContainer } from "./local-docker.js";
+import { startLocalRunnerContainer, validateProtectedLocalInput, type LocalRunnerInput, type StartLocalContainerInput } from "./local-docker.js";
+import { getModelAuthRuntime } from "./model-auth-runtime.js";
+import { isManagedProject, refusalText } from "./managed-dispatch-auth.js";
+import { buildProtectedFlyBootstrap } from "./fly-protection-key.js";
 import { SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
 import { getFlySecretsMinVersion, getFlyProcessLevelSecrets } from "./runner-mode.js";
 import { resolveSessionImage } from "./repo-image.js";
 import { getMappings } from "./config.js";
-import { buildRunConfig, encodeRunConfig } from "./run-config.js";
+import { buildRunConfig, encodeRunConfig, type RunConfigV1, type RunCredentialsV1 } from "./run-config.js";
 
 export interface PreparePlanningLaunchArgs {
   config: AppConfig;
@@ -30,8 +41,12 @@ export interface PreparePlanningLaunchArgs {
   mapping: RepoMapping;
   dispatchId: string;
   resolvedPlanningBranch: string;
+  /** Typed private credentials for trusted planning transport. Requires private-envelope support. */
+  trustedCredentials?: RunCredentialsV1;
   /** `resolveDispatchRunnerImage` from index.ts, passed in to avoid an import cycle. */
   resolveRunnerImage: (config: AppConfig, mapping: RepoMapping, ghToken: string) => Promise<string | undefined>;
+  /** `fireBreakerTrip` from index.ts; counts the opted-in GitHub Actions refusal. */
+  fireBreakerTrip?: LaunchPlanningRunArgs["fireBreakerTrip"];
 }
 
 export interface PlanningLaunch {
@@ -42,11 +57,37 @@ export interface PlanningLaunch {
   planningDispatchInputs: DispatchInputs;
 }
 
+async function getTargetRepoToken(
+  config: Pick<AppConfig, "githubAppId" | "githubAppPrivateKey">,
+  owner: string,
+  repo: string,
+): Promise<string> {
+  const scoped = await getScopedInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner, {
+    repositories: [repo],
+  });
+  return scoped.token;
+}
+
 /** Everything that runs after the reservation and before the launch call. Pure prep: a throw
  * here is by construction a definitive non-launch. */
 export async function preparePlanningLaunch(args: PreparePlanningLaunchArgs): Promise<PlanningLaunch> {
-  const { config, provider, issue, mapping, dispatchId, resolvedPlanningBranch, resolveRunnerImage } = args;
+  const { config, provider, issue, mapping, dispatchId, resolvedPlanningBranch, trustedCredentials, resolveRunnerImage, fireBreakerTrip } = args;
   const planningMapping = { ...mapping, workflowFile: mapping.planningWorkflowFile };
+
+  // An opted-in project cannot plan on GitHub Actions: refuse before any lookup or token mint.
+  if (isManagedProject(issue.scopeKey)) {
+    await provider.markPlanningFailed(
+      issue.id,
+      issue.scopeKey,
+      refusalText({ kind: "refuse", category: "configuration-error", code: "gha_not_supported" }),
+    );
+    // Neither caller counts a throw from here, so count it or the next poll re-comments every 60 s.
+    const breakerGha = recordDispatchFailure(issue.id, "planning", "gha_not_supported");
+    if (breakerGha.tripped && fireBreakerTrip) {
+      await fireBreakerTrip(config, provider, issue.id, issue.identifier, "planning", breakerGha.failures, "gha_not_supported");
+    }
+    throw new Error("managed dispatch refused: gha_not_supported");
+  }
 
   // Build planning context (PARENT/SIBLINGS/DEPENDENCIES) only once admission is
   // confirmed: this is a real network call (Linear GraphQL lookup) and must not run
@@ -91,13 +132,19 @@ export async function preparePlanningLaunch(args: PreparePlanningLaunchArgs): Pr
   // Legacy contract only; under the envelope the branch rides inside run_config.
   const planningSentBaseBranch = resolvedPlanningBranch !== mapping.defaultBranch;
 
-  const planningContract = await resolveWorkflowContract({
+  const workflowCapabilities = await resolveWorkflowCapabilities({
     owner: mapping.owner,
     repo: mapping.repo,
     workflowFile: mapping.planningWorkflowFile,
     token: ghToken,
     ref: mapping.defaultBranch,
   });
+  const planningContract = workflowCapabilities.contract;
+  assertPrivateTransportForCredentials(
+    trustedCredentials,
+    workflowCapabilities,
+    `${mapping.owner}/${mapping.repo}/${mapping.planningWorkflowFile}@${mapping.defaultBranch}`,
+  );
 
   const planningDispatchInputs = planningContract === "envelope"
     ? buildEnvelopeDispatchInputs(planningMapping, issue, {
@@ -109,6 +156,8 @@ export async function preparePlanningLaunch(args: PreparePlanningLaunchArgs): Pr
         runProgressToken,
         runnerImage,
         planningContext: planningContextInputs,
+        privateTransport: workflowCapabilities.supportsPrivateRunConfig === true,
+        credentials: trustedCredentials,
         // Planning has no retry loop, so nothing is stamped — but retryPolicy is
         // required on EnvelopeDispatchOpts, so every call site must say so explicitly.
         retryPolicy: null,
@@ -313,7 +362,7 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
     return { outcome: "rejected", executionMode: execPath };
   }
 
-  if (!config.anthropicApiKey && !config.claudeOAuthToken) {
+  if (!config.anthropicApiKey && !config.claudeOAuthToken && !isManagedProject(issue.scopeKey)) {
     console.error(
       `[poll] Cannot dispatch planning for ${issue.identifier} via ${execPath}: neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set`,
     );
@@ -344,8 +393,9 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
     doMarkDispatched: false,
     shadow: false,
     backendKind: execPath,
+    managedAuth: { runtime: getModelAuthRuntime(config), workflowFile: mapping.planningWorkflowFile },
     isDefinitiveLaunchFailure,
-    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, runProgressToken, markLaunchAttempted: markAttempted }) => {
+    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, runProgressToken, managedAuth, markLaunchAttempted: markAttempted }) => {
       const markLaunchAttempted = () => {
         launchAttempted = true;
         markAttempted();
@@ -366,18 +416,25 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
         DEPENDENCIES: planningContextInputs.dependencies,
       };
 
-      const planningRunConfig = buildRunConfig({
-        runnerPhase: "planning",
-        issue,
-        mapping,
-        baseBranch: resolvedPlanningBranch !== mapping.defaultBranch ? resolvedPlanningBranch : undefined,
-        runnerCallbackUrl: runnerCallbackUrl || undefined,
-        planningContext: planningContextInputs,
-        retryPolicy: null,
-      });
+      const protectedLaunch = managedAuth.kind === "launch" ? managedAuth : null;
 
-      // both fly-machines and local-docker require a GitHub token now, so it's extracted here for convenience/readability
-      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+      const planningRunConfig: RunConfigV1 = {
+        ...buildRunConfig({
+          runnerPhase: "planning",
+          issue,
+          mapping,
+          baseBranch: resolvedPlanningBranch !== mapping.defaultBranch ? resolvedPlanningBranch : undefined,
+          runnerCallbackUrl: runnerCallbackUrl || undefined,
+          planningContext: planningContextInputs,
+          retryPolicy: null,
+        }),
+        ...(protectedLaunch ? { agentConfig: protectedLaunch.snapshot } : {}),
+      };
+
+      // Control-plane work keeps the installation-wide token; the runner boots with a
+      // token scoped to the target repository alone.
+      const controlGhToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+      const targetGhToken = await getTargetRepoToken(config, mapping.owner, mapping.repo);
       if (execPath === "fly-machines") {
         const minSecretsVersion = getFlySecretsMinVersion();
         let allSecretNames: string[] = [];
@@ -391,9 +448,26 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
         const { image: resolvedImage, source: imageSource } = await resolveSessionImage({
           owner: mapping.owner,
           repo: mapping.repo,
-          token: ghToken,
+          token: targetGhToken,
           defaultImage: config.sessionImage,
         });
+
+        // Every throw here precedes markLaunchAttempted so the grant is settled as rejected.
+        let protectedModelBootstrap: Awaited<ReturnType<typeof buildProtectedFlyBootstrap>> | undefined;
+        if (protectedLaunch) {
+          if (imageSource === "override") throw new Error("managed dispatch refused: repository image override");
+          if (!config.runnerCallbackBaseUrl) throw new Error("managed dispatch refused: no runner callback base URL");
+          const bootstrap = protectedLaunch.takeBootstrap();
+          if (!bootstrap) throw new Error("managed dispatch refused: bootstrap unavailable");
+          protectedModelBootstrap = await buildProtectedFlyBootstrap({
+            token: flyToken!,
+            app: flyApp!,
+            bootstrap,
+            projectKey: issue.scopeKey,
+            runConfig: planningRunConfig,
+            modelAuthUrl: config.runnerCallbackBaseUrl,
+          });
+        }
 
         const machineConfig = buildSessionMachineConfig({
           image: resolvedImage,
@@ -404,9 +478,9 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
           owner: mapping.owner,
           repo: mapping.repo,
           defaultBranch: resolvedPlanningBranch,
-          anthropicApiKey: config.anthropicApiKey ?? undefined,
-          claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-          githubToken: ghToken,
+          anthropicApiKey: protectedLaunch ? undefined : (config.anthropicApiKey ?? undefined),
+          claudeOAuthToken: protectedLaunch ? undefined : (config.claudeOAuthToken ?? undefined),
+          githubToken: targetGhToken,
           sessionToken,
           machineNonce,
           phase: "planning",
@@ -428,9 +502,10 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
           tenantId: config.tenantId ?? undefined,
           expectedTtlSeconds: Math.round(SWEEP_MACHINE_MAX_AGE_MS / 1000),
           extraEnv: (() => {
-            const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...planningEnv, AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(planningRunConfig) };
+            const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...planningEnv, ...(protectedLaunch ? {} : { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(planningRunConfig) }) };
             return Object.keys(merged).length > 0 ? merged : undefined;
           })(),
+          ...(protectedLaunch && protectedModelBootstrap ? { protectedModelBootstrap, dispatchId: protectedLaunch.dispatchId } : {}),
         });
         if (getFlyProcessLevelSecrets().enabled) {
           const secretNames = machineConfig.config.processes?.[0]?.secrets?.map((s) => s.name ?? s.env_var) ?? [];
@@ -444,7 +519,7 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
         return {
           machineId: machine.id,
           sessionImage: resolvedImage,
-          ghToken,
+          ghToken: controlGhToken,
           executionMode: "fly-machines" as const,
           statusComment: { machineName: machine.name, logsUrl: machineLogsUrl },
         };
@@ -455,8 +530,20 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
           config.runnerCallbackBaseUrl ??
           `http://host.docker.internal:${config.healthPort}`;
 
-        markLaunchAttempted();
-        const container = await startLocalRunnerContainer({
+        // Every throw here precedes markLaunchAttempted so the grant is settled as rejected.
+        let protectedModelAuth: LocalRunnerInput["protectedModelAuth"];
+        if (protectedLaunch) {
+          const bootstrap = protectedLaunch.takeBootstrap();
+          if (!bootstrap) throw new Error("managed dispatch refused: bootstrap unavailable");
+          protectedModelAuth = {
+            bootstrap,
+            projectKey: issue.scopeKey,
+            runConfig: planningRunConfig,
+            modelAuthUrl: localOrchestratorUrl,
+          };
+        }
+
+        const localRunnerInput: StartLocalContainerInput = {
           image: config.localRunnerImage,
           issueId: issue.id,
           issueIdentifier: issue.identifier,
@@ -465,9 +552,9 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
           owner: mapping.owner,
           repo: mapping.repo,
           defaultBranch: resolvedPlanningBranch,
-          anthropicApiKey: config.anthropicApiKey ?? undefined,
-          claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-          githubToken: ghToken,
+          anthropicApiKey: protectedLaunch ? undefined : (config.anthropicApiKey ?? undefined),
+          claudeOAuthToken: protectedLaunch ? undefined : (config.claudeOAuthToken ?? undefined),
+          githubToken: targetGhToken,
           sessionToken,
           machineNonce,
           phase: "planning",
@@ -478,15 +565,21 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
           runToken: runToken || undefined,
           runProgressToken: runProgressToken || undefined,
           extraEnv: (() => {
-            const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...planningEnv, AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(planningRunConfig) };
+            const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...planningEnv, ...(protectedLaunch ? {} : { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(planningRunConfig) }) };
             return Object.keys(merged).length > 0 ? merged : undefined;
           })(),
-        });
+          ...(protectedModelAuth ? { protectedModelAuth } : {}),
+        };
+        // Reserved extraEnv names and legacy credentials fail here, before the grant is marked launched.
+        if (protectedModelAuth) validateProtectedLocalInput(localRunnerInput, protectedModelAuth);
+
+        markLaunchAttempted();
+        const container = await startLocalRunnerContainer(localRunnerInput);
 
         return {
           machineId: container.containerId,
           sessionImage: config.localRunnerImage,
-          ghToken: "",
+          ghToken: controlGhToken,
           executionMode: "local-docker" as const,
           statusComment: {
             machineName: container.containerName || container.containerId.slice(0, 12),

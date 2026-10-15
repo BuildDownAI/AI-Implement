@@ -1,7 +1,8 @@
 import type { RepoMapping } from "./config.js";
 import { buildEnvelopeDispatchInputs } from "./github.js";
 import { generateMachineNonce, generateSessionToken } from "./fly-machines.js";
-import { startLocalRunnerContainer } from "./local-docker.js";
+import { startLocalRunnerContainer, validateProtectedLocalInput, type LocalRunnerInput, type StartLocalContainerInput } from "./local-docker.js";
+import type { ManagedDispatchDecision } from "./managed-dispatch-auth.js";
 import { decodeRunConfig, encodeRunConfig, type RunConfigV1 } from "./run-config.js";
 import type { RetryPolicy } from "./pipeline/retry-backoff.js";
 
@@ -29,6 +30,11 @@ export interface DispatchLocalGapfillInput {
   retryPolicy: RetryPolicy | null;
   /** Called after all local preparation, immediately before the potentially ambiguous Docker launch. */
   onBeforeLaunch?: () => void;
+  /** Opted-in project: the run carries the decision's agent snapshot and a protected local grant instead of Anthropic credentials. */
+  managed?: {
+    decision: Extract<ManagedDispatchDecision, { kind: "launch" }>;
+    modelAuthUrl: string;
+  };
 }
 
 export interface DispatchLocalGapfillResult {
@@ -48,7 +54,7 @@ export async function dispatchLocalGapfill(input: DispatchLocalGapfillInput): Pr
   if (input.mapping.provider === "bedrock") {
     throw new Error("Local gap-fill does not support provider=bedrock");
   }
-  if (!input.anthropicApiKey && !input.claudeOAuthToken) {
+  if (!input.managed && !input.anthropicApiKey && !input.claudeOAuthToken) {
     throw new Error("Local gap-fill requires ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN");
   }
 
@@ -66,8 +72,22 @@ export async function dispatchLocalGapfill(input: DispatchLocalGapfillInput): Pr
   if (!envelope.run_config) {
     throw new Error("Local gap-fill envelope did not include run_config");
   }
-  const runConfig = decodeRunConfig(envelope.run_config);
-  const container = await startLocalRunnerContainer({
+  const decoded = decodeRunConfig(envelope.run_config);
+  const runConfig: RunConfigV1 = input.managed ? { ...decoded, agentConfig: input.managed.decision.snapshot } : decoded;
+
+  let protectedModelAuth: LocalRunnerInput["protectedModelAuth"];
+  if (input.managed) {
+    const bootstrap = input.managed.decision.takeBootstrap();
+    if (!bootstrap) throw new Error("managed dispatch refused: bootstrap unavailable");
+    protectedModelAuth = {
+      bootstrap,
+      projectKey: input.managed.decision.projectKey,
+      runConfig,
+      modelAuthUrl: input.managed.modelAuthUrl,
+    };
+  }
+
+  const localInput: StartLocalContainerInput = {
     image: input.image,
     issueId: input.issue.id,
     issueIdentifier: input.issue.identifier,
@@ -76,8 +96,8 @@ export async function dispatchLocalGapfill(input: DispatchLocalGapfillInput): Pr
     owner: input.mapping.owner,
     repo: input.mapping.repo,
     defaultBranch: input.mapping.defaultBranch,
-    anthropicApiKey: input.anthropicApiKey ?? undefined,
-    claudeOAuthToken: input.claudeOAuthToken ?? undefined,
+    anthropicApiKey: protectedModelAuth ? undefined : (input.anthropicApiKey ?? undefined),
+    claudeOAuthToken: protectedModelAuth ? undefined : (input.claudeOAuthToken ?? undefined),
     githubToken: input.githubToken,
     sessionToken,
     machineNonce,
@@ -92,11 +112,15 @@ export async function dispatchLocalGapfill(input: DispatchLocalGapfillInput): Pr
     extraEnv: (() => {
       const merged = {
         ...input.mapping.extraEnv,
-        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(runConfig),
+        ...(protectedModelAuth ? {} : { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(runConfig) }),
       };
       return Object.keys(merged).length > 0 ? merged : undefined;
     })(),
-  });
+    ...(protectedModelAuth ? { protectedModelAuth } : {}),
+  };
+  // Reserved extraEnv names and legacy credentials fail here, before onBeforeLaunch.
+  if (protectedModelAuth) validateProtectedLocalInput(localInput, protectedModelAuth);
+  const container = await startLocalRunnerContainer(localInput);
 
   return {
     containerId: container.containerId,

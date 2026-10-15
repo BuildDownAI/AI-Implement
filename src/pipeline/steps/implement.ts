@@ -80,6 +80,7 @@ export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
       model: model ?? DEFAULT_MODEL,
       maxTurns,
       stage: "implement",
+      agentStage: "implementation",
       expectsStructuredOutput: false,
       retry: retryPolicy ? { policy: retryPolicy, toolUseIsSafe: false } : undefined,
       cycle: iteration,

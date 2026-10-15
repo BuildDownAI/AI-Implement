@@ -224,6 +224,8 @@ vi.mock("../local-docker.js", async (importOriginal) => ({
 vi.mock("../github-app-auth.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../github-app-auth.js")>()),
   getInstallationToken: async () => "gh-token",
+  // Fly and local children boot with a target-repo scoped token on the feature side.
+  getScopedInstallationToken: async () => ({ token: "gh-token", expiresAt: "", installationId: 7 }),
   getInstallationId: async () => 7,
 }));
 
@@ -396,6 +398,7 @@ const gapFill = (runnerMode: "gha" | "fly" | "local"): LaunchPath => async (w) =
     runnerCallbackBaseUrl: CALLBACK_URL,
     runnerTokenSecret: TOKEN_SECRET,
     getInstallationToken: async () => "gh-token",
+    getTargetRepoToken: async () => "gh-token",
     getInstallationId: async () => INSTALLATION_ID,
     resolveRunnerImage: (mapping, token) => w.repoImage.resolveRunnerImageForDispatch({
       owner: mapping.owner, repo: mapping.repo, token,
@@ -514,6 +517,7 @@ function kgDeps(w: World, claim: boolean): KgRefreshSenderDeps {
       anthropicApiKey: "sk-test", claudeOAuthToken: null, kgSourceRepo: "acme/kg",
     },
     getInstallationToken: async () => "gh-token",
+    getScopedInstallationToken: async () => ({ token: "gh-token", expiresAt: "", installationId: 7 }),
     mintToken: async () => ({ token: "gh-token", expiresAt: "" }),
     fetchDefaultBranch: async () => "trunk",
     // The real image resolution, as production injects it.

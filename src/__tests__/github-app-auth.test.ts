@@ -409,6 +409,27 @@ describe("getScopedInstallationToken", () => {
     expect(body.permissions).toBeUndefined();
   });
 
+  it("caches per-repository scoped mints separately from each other and from the broad mint", async () => {
+    let n = 0;
+    vi.mocked(fetch).mockImplementation(async (url) => {
+      const u = String(url);
+      if (u.endsWith("/installation")) return new Response(JSON.stringify({ id: 1 }), { status: 200 });
+      n += 1;
+      return new Response(JSON.stringify({ token: `ghs_${n}`, expires_at: futureExpiresAt() }), { status: 201 });
+    });
+
+    const a = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { repositories: ["repo-a"] });
+    const b = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { repositories: ["repo-b"] });
+    const broad = await getInstallationToken(APP_ID, privateKey, "my-org");
+    expect(new Set([a.token, b.token, broad]).size).toBe(3);
+    expect(n).toBe(3);
+
+    expect((await getScopedInstallationToken(APP_ID, privateKey, "my-org", { repositories: ["repo-a"] })).token).toBe(a.token);
+    expect((await getScopedInstallationToken(APP_ID, privateKey, "my-org", { repositories: ["repo-b"] })).token).toBe(b.token);
+    expect(await getInstallationToken(APP_ID, privateKey, "my-org")).toBe(broad);
+    expect(n).toBe(3);
+  });
+
   it("sends both permissions and repositories in the request body", async () => {
     vi.mocked(fetch).mockImplementation(mockFetch([
       { ok: true, json: { id: 1 } },

@@ -65,6 +65,25 @@ kg-refresh dispatches (both GitHub Actions and Fly Machines) resolve the runner 
 
 The Restate review-fix launch (`GithubReviewFixWorker.launch`) resolves the image the same way, using the target repo, a token from the launch credential, `config.sessionImage`, and `config.runnerImageExplicit`, and sends it as the `runner_image` workflow input (never in the envelope). If resolution fails, the launch omits `runner_image` and logs one warning; the workflow then runs its full ladder: `image.yml`, then the `AI_IMPLEMENT_RUNNER_IMAGE` variable, then `:latest`.
 
+## Baked agent CLIs
+
+The shared session image installs both supported agent CLIs in one image:
+
+| Tool | Package | Pin | Build-time smoke |
+|------|---------|-----|------------------|
+| Claude Code | `@anthropic-ai/claude-code` | `2.1.284` | `claude --version` as `coder` |
+| Codex CLI | `@openai/codex` | `0.159.2` | `codex --version` and `codex exec --help` as `coder` |
+
+The Codex pin was checked against the [official npm package](https://www.npmjs.com/package/@openai/codex) on September 30, 2026. Upgrade it by changing `CODEX_CLI_VERSION` in `Dockerfile.session`, rebuilding the image, and re-running the non-root version/help smoke checks before promoting a channel tag.
+
+**Expected warning: `Codex could not find bubblewrap on PATH`.** `codex app-server` (the planning stage) logs this at ERROR level once per run; the `codex exec` stages (implementation, review) don't print it but resolve `bwrap` the same way. Without a `bwrap` on `PATH`, Codex uses the copy bundled in its npm package (`@openai/codex-linux-*/vendor/*/codex-resources/bwrap`, which reports itself as "bubblewrap built for Codex"). The message is noise; the sandbox works with the bundled copy. **Do not silence it by installing the distribution `bubblewrap` package.** With Debian bookworm's `bubblewrap` 0.8.0 on `PATH`, Codex prefers it, and in the pipeline the implementation stage's file edits then fail (`Failed to delete file /workspace/…`, `Failed to write file …`), so implementation changes nothing. The bundled-only image passes the same live smoke. A plain `codex exec` edit in a bare container works with either copy, so only the live `npm run local:feedback -- --live` smoke ([local-feedback.md](local-feedback.md)) catches this. Run it for any image change that touches the Codex sandbox.
+
+The runner does not add an OpenAI application SDK dependency for Codex execution. The CLI is installed for stage executors that need `codex`; stage selection and runtime credential delivery are implemented in later issues; installing the CLI does not enable them. No authentication state is baked into the image.
+
+The supported local automation surface is `codex exec`. Per the [official OpenAI non-interactive documentation](https://developers.openai.com/codex/noninteractive), `codex exec --json` writes a JSONL stream of structured events to stdout, including `item.started` and `item.completed` events for command executions. The installed CLI help exposes `codex exec --output-schema <FILE>` for constraining the final response to a JSON Schema when a later stage needs a stable machine-checked result.
+
+Codex sends that schema to OpenAI structured outputs in strict mode, which rejects the whole request (HTTP 400 `invalid_json_schema`) unless every object sets `additionalProperties: false` and lists every property in `required`. An optional field is therefore declared required and nullable (`type: ["string", "null"]`), and the parser treats `null` as absent. `src/__tests__/codex-output-schemas.test.ts` holds every built-in output schema to that rule.
+
 **Promotion order.** Commit SHA tags are pushed first, then the build digest is smoke-tested, and only then is any mutable channel tag promoted. Channel-scoped date tags follow `base-<channel>-vYYYYMMDD-<12-char-sha>` (e.g. `base-next-v20260526-abc123def456`) so `latest` and `next` never collide and same-day builds do not overwrite one another.
 
 **Promotion rule.** A channel is promoted for the newest branch head whose image content equals a tested build. If the branch advances between when a build starts and when its smoke tests pass (for example, a docs-only push lands after the triggering code push), the promotion step runs `scripts/image-equiv-check.sh` to diff the tested SHA against the current head. When the diff is empty for the paths that affect the runner image (`Dockerfile.session`, `session/**`, `src/**`, `pipelines/**`, `custom/**`, and the workflow file itself), the build's tested digest is promoted for the current head: the channel tag is updated, the usual date tag for the tested SHA is pushed, and an additional date tag for the head SHA is pushed (`base-<channel>-vYYYYMMDD-<head12>`). The deploy-posture check does not read tags. The extra tag is a manual check only (see [When a change reaches a run](#when-a-change-reaches-a-run)). When the diff is non-empty — the head includes image-relevant changes — promotion is skipped and the build that covers those changes will promote the channel when it completes.

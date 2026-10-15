@@ -11,12 +11,168 @@ vi.mock("../github.js", async (importOriginal) => {
   return { ...actual, postWorkflowDispatch: vi.fn() };
 });
 
-vi.mock("../workflow-probe.js", () => ({ resolveWorkflowContract: vi.fn().mockResolvedValue("envelope") }));
-vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn() }));
-vi.mock("../local-docker.js", () => ({ startLocalRunnerContainer: vi.fn() }));
+vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn(), getScopedInstallationToken: vi.fn() }));
+vi.mock("../local-docker.js", () => ({ startLocalRunnerContainer: vi.fn(), validateProtectedLocalInput: vi.fn() }));
+vi.mock("../managed-dispatch-auth.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../managed-dispatch-auth.js")>();
+  return { ...actual, isManagedProject: vi.fn(() => false) };
+});
+vi.mock("../model-auth-runtime.js", () => ({ getModelAuthRuntime: vi.fn(() => ({ runtime: true })) }));
+vi.mock("../fly-protection-key.js", () => ({ buildProtectedFlyBootstrap: vi.fn(async () => ({ sealed: "SEALED" })) }));
+vi.mock("../fly-machines.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../fly-machines.js")>();
+  return { ...actual, createMachine: vi.fn(), buildSessionMachineConfig: vi.fn((input: unknown) => ({ config: {}, input })), listAppSecrets: vi.fn(async () => []) };
+});
+vi.mock("../config.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../config.js")>();
+  return { ...actual, getMappings: vi.fn(() => ({})) };
+});
+vi.mock("../repo-image.js", () => ({ resolveSessionImage: vi.fn(async () => ({ image: "default-img", source: "default" })) }));
 vi.mock("../planning-context.js", () => ({
   buildPlanningContextInputs: vi.fn().mockResolvedValue({ parent: "", siblings: "", dependencies: "" }),
 }));
+vi.mock("../workflow-probe.js", () => ({ resolveWorkflowCapabilities: vi.fn() }));
+
+/** Opted-out regression fixtures, captured from the code before AII-1391. Set CAPTURE_FIXTURES=1 to regenerate. */
+const FIXTURE_FILE = path.join(import.meta.dirname, "fixtures", "planning-opted-out.json");
+function expectFixture(name: string, value: unknown): void {
+  const actual = JSON.parse(JSON.stringify(value ?? null));
+  if (process.env.CAPTURE_FIXTURES) {
+    const all = fs.existsSync(FIXTURE_FILE) ? JSON.parse(fs.readFileSync(FIXTURE_FILE, "utf8")) : {};
+    all[name] = actual;
+    fs.mkdirSync(path.dirname(FIXTURE_FILE), { recursive: true });
+    fs.writeFileSync(FIXTURE_FILE, JSON.stringify(all, null, 2) + "\n");
+    return;
+  }
+  expect(actual).toEqual(JSON.parse(fs.readFileSync(FIXTURE_FILE, "utf8"))[name]);
+}
+
+describe("preparePlanningLaunch", () => {
+  let dbPath: string;
+  let dedup: typeof import("../dedup.js");
+  let githubAuth: typeof import("../github-app-auth.js");
+  let workflowProbe: typeof import("../workflow-probe.js");
+  let launchModule: typeof import("../planning-launch.js");
+
+  const issue: TicketIssue = {
+    id: "issue-prepare-1",
+    identifier: "AII-1052",
+    title: "Prepare planning",
+    description: "desc",
+    scopeKey: "AII",
+    nativeStatus: "Todo",
+  };
+  const mapping = {
+    owner: "eudoxus",
+    repo: "AI-Implement",
+    workflowFile: "claude-implement.yml",
+    planningWorkflowFile: "claude-plan.yml",
+    defaultBranch: "main",
+  } as unknown as RepoMapping;
+  const config = {
+    githubAppId: "app-id",
+    githubAppPrivateKey: "private-key",
+    runnerCallbackBaseUrl: "https://orch.example.test",
+    runnerTokenSecret: "test-secret-with-enough-entropy-for-hmac",
+  } as unknown as AppConfig;
+  const provider = { id: "jira" } as unknown as TicketingProvider;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+    dbPath = path.join(os.tmpdir(), `planning-prepare-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
+    process.env.DEDUP_DB_PATH = dbPath;
+    dedup = await import("../dedup.js");
+    dedup.getDb();
+    githubAuth = await import("../github-app-auth.js");
+    workflowProbe = await import("../workflow-probe.js");
+    launchModule = await import("../planning-launch.js");
+    vi.mocked(githubAuth.getInstallationToken).mockResolvedValue("control-token");
+  });
+
+  afterEach(() => {
+    dedup.closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  it("envelope planning probes the planning workflow and carries private result credentials only when supported", async () => {
+    const { decodeTrustedRunConfig, decodeRunConfig } = await import("../run-config.js");
+    vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue({
+      contract: "envelope",
+      supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
+      supportsPrivateRunConfig: true,
+    });
+    const resolveRunnerImage = vi.fn().mockResolvedValue("runner:image");
+
+    const result = await launchModule.preparePlanningLaunch({
+      config,
+      provider,
+      issue,
+      mapping,
+      dispatchId: "dispatch-prepare-1",
+      resolvedPlanningBranch: "feature/base",
+      trustedCredentials: { version: 1, attemptToken: "attempt-private" },
+      resolveRunnerImage,
+    });
+
+    expect(workflowProbe.resolveWorkflowCapabilities).toHaveBeenCalledWith(expect.objectContaining({
+      owner: "eudoxus",
+      repo: "AI-Implement",
+      workflowFile: "claude-plan.yml",
+      token: "control-token",
+      ref: "main",
+    }));
+    expect(resolveRunnerImage).toHaveBeenCalledWith(config, mapping, "control-token");
+    expect(result.planningContract).toBe("envelope");
+    const inputs = result.planningDispatchInputs;
+    const trusted = decodeTrustedRunConfig(inputs.run_config!);
+    expect(decodeRunConfig(inputs.run_config!).credentials).toBeUndefined();
+    expect(trusted.baseBranch).toBe("feature/base");
+    expect(trusted.credentials?.resultToken).toBeTruthy();
+    expect(trusted.credentials?.attemptToken).toBe("attempt-private");
+    // Planning mints a progress token since AII-1320; it rides inside the private credentials.
+    expect(trusted.credentials?.progressToken).toBeTruthy();
+    expect(trusted.credentials?.publicationToken).toBeUndefined();
+    expect(inputs.run_token).toBe("");
+    expect("run_progress_token" in inputs).toBe(false);
+    expect("run_publication_token" in inputs).toBe(false);
+  });
+
+  it("supplied private planning credentials fail closed when the planning workflow lacks private-envelope support", async () => {
+    vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue({
+      contract: "envelope",
+      supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
+      supportsPrivateRunConfig: false,
+    });
+
+    await expect(launchModule.preparePlanningLaunch({
+      config,
+      provider,
+      issue,
+      mapping,
+      dispatchId: "dispatch-prepare-2",
+      resolvedPlanningBranch: "main",
+      trustedCredentials: { version: 1, attemptToken: "attempt-private" },
+      resolveRunnerImage: vi.fn().mockResolvedValue(undefined),
+    })).rejects.toThrow(/refusing to drop or downgrade/);
+  });
+
+  it("opted-out GitHub Actions planning: workflow inputs match the pre-change fixture", async () => {
+    vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue({
+      contract: "legacy",
+      supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
+    });
+    const result = await launchModule.preparePlanningLaunch({
+      config: { ...config, runnerTokenSecret: undefined, runnerCallbackBaseUrl: undefined } as unknown as AppConfig,
+      provider, issue, mapping, dispatchId: "dispatch-fixture", resolvedPlanningBranch: "feature/base",
+      resolveRunnerImage: vi.fn().mockResolvedValue("runner:image"),
+    });
+    expectFixture("gha", result);
+  });
+});
 
 describe("launchPlanningRun", () => {
   let dbPath: string;
@@ -212,8 +368,11 @@ describe("launchPlanningSession", () => {
     auth = await import("../github-app-auth.js");
     docker = await import("../local-docker.js");
     mod = await import("../planning-launch.js");
+    vi.mocked((await import("../managed-dispatch-auth.js")).isManagedProject).mockReturnValue(false);
+    vi.mocked(auth.getInstallationToken).mockResolvedValue("CONTROL-TOKEN-SECRET");
+    vi.mocked(auth.getScopedInstallationToken).mockResolvedValue({ token: "SCOPED-TOKEN-SECRET" } as never);
     dispatchSession.mockImplementation(async (_c, _p, _i, _m, _pr, _rm, opts) => {
-      const r = await opts.backend({ sessionToken: "SESSION", machineNonce: "NONCE", runnerCallbackUrl: "", runToken: "RUN", markLaunchAttempted: () => {} });
+      const r = await opts.backend({ sessionToken: "SESSION", machineNonce: "NONCE", runnerCallbackUrl: "", runToken: "RUN", managedAuth: { kind: "legacy" }, markLaunchAttempted: () => {} });
       return { admitted: true, machineId: r.machineId, executionMode: r.executionMode };
     });
   });
@@ -237,8 +396,22 @@ describe("launchPlanningSession", () => {
     const result = await call({ reservation });
     expect(result).toEqual({ outcome: "accepted", machineId: "c-1", executionMode: "local-docker" });
     const json = JSON.stringify(result);
-    for (const secret of ["NONCE", "SESSION", "RUN", "GH-TOKEN-SECRET"]) expect(json).not.toContain(secret);
+    for (const secret of ["NONCE", "SESSION", "RUN", "GH-TOKEN-SECRET", "SCOPED-TOKEN-SECRET"]) expect(json).not.toContain(secret);
     expect(dispatchSession.mock.calls[0][7]).toBe(reservation);
+  });
+
+  it("boots the local planning runner with a target-repo scoped token while keeping the installation token for control-plane work", async () => {
+    vi.mocked(auth.getInstallationToken).mockResolvedValue("CONTROL-TOKEN-SECRET");
+    vi.mocked(auth.getScopedInstallationToken).mockResolvedValue({ token: "SCOPED-TOKEN-SECRET" } as never);
+    vi.mocked(docker.startLocalRunnerContainer).mockResolvedValue({ containerId: "c-1", containerName: "n" } as never);
+
+    await call({ reservation });
+
+    expect(auth.getInstallationToken).toHaveBeenCalledWith("id", "k", "o");
+    expect(auth.getScopedInstallationToken).toHaveBeenCalledWith("id", "k", "o", { repositories: ["r"] });
+    expect(vi.mocked(docker.startLocalRunnerContainer).mock.calls[0][0]).toEqual(
+      expect.objectContaining({ githubToken: "SCOPED-TOKEN-SECRET" }),
+    );
   });
 
   it("an owned launch names the container from the dispatch id; a Legacy launch passes no name", async () => {
@@ -256,7 +429,7 @@ describe("launchPlanningSession", () => {
   it("a throw before markLaunchAttempted is rejected", async () => {
     vi.mocked(auth.getInstallationToken).mockRejectedValue(new Error("mint failed"));
     dispatchSession.mockImplementation(async (_c, _p, _i, _m, _pr, _rm, opts) => {
-      await opts.backend({ sessionToken: "s", machineNonce: "n", runnerCallbackUrl: "", runToken: "", markLaunchAttempted: () => {} });
+      await opts.backend({ sessionToken: "s", machineNonce: "n", runnerCallbackUrl: "", runToken: "", managedAuth: { kind: "legacy" }, markLaunchAttempted: () => {} });
     });
     expect(await call({ reservation })).toEqual({ outcome: "rejected", executionMode: "local-docker" });
   });
@@ -276,6 +449,159 @@ describe("launchPlanningSession", () => {
     dispatchSession.mockResolvedValue({ admitted: false });
     expect(await call()).toEqual({ outcome: "rejected", executionMode: "local-docker" });
   });
+
+  describe("opted-in project", () => {
+    const snapshot = { v: 1, marker: "SNAP" };
+    const takeBootstrap = vi.fn();
+    const launchDecision = () => ({ kind: "launch", snapshot, dispatchId: "d-1", takeBootstrap });
+    let managed: typeof import("../managed-dispatch-auth.js");
+    let flyMachines: typeof import("../fly-machines.js");
+    let attempted: ReturnType<typeof vi.fn>;
+    const optedConfig = { ...baseConfig, anthropicApiKey: null, claudeOAuthToken: null, runnerCallbackBaseUrl: "https://orch.example.test", flySessionsToken: "ft", flySessionsApp: "fa", healthPort: 8080 } as unknown as AppConfig;
+
+    beforeEach(async () => {
+      managed = await import("../managed-dispatch-auth.js");
+      flyMachines = await import("../fly-machines.js");
+      vi.mocked(managed.isManagedProject).mockReturnValue(true);
+      takeBootstrap.mockReset().mockReturnValue({ grant: "PLAIN-GRANT" });
+      attempted = vi.fn();
+      dispatchSession.mockImplementation(async (_c, _p, _i, _m, _pr, _rm, opts) => {
+        expect(opts.managedAuth.workflowFile).toBe(mapping.planningWorkflowFile);
+        const r = await opts.backend({ sessionToken: "S", machineNonce: "N", runnerCallbackUrl: "https://orch.example.test", runToken: "R", managedAuth: launchDecision(), markLaunchAttempted: attempted });
+        return { admitted: true, machineId: r.machineId, executionMode: r.executionMode };
+      });
+      vi.mocked(docker.startLocalRunnerContainer).mockResolvedValue({ containerId: "c-1", containerName: "n" } as never);
+      vi.mocked(flyMachines.createMachine).mockResolvedValue({ id: "m-1", name: "mn" } as never);
+    });
+
+    it("skips the Anthropic precheck", async () => {
+      expect(await call({ config: optedConfig, reservation })).toMatchObject({ outcome: "accepted" });
+    });
+
+    it("local: protectedModelAuth with the snapshot, no legacy credentials or run config env", async () => {
+      await call({ config: optedConfig, reservation });
+      const input = vi.mocked(docker.startLocalRunnerContainer).mock.calls[0][0] as never as Record<string, any>;
+      expect(input.anthropicApiKey).toBeUndefined();
+      expect(input.claudeOAuthToken).toBeUndefined();
+      expect(input.extraEnv?.AI_IMPLEMENT_RUN_CONFIG).toBeUndefined();
+      expect(input.protectedModelAuth.bootstrap).toEqual({ grant: "PLAIN-GRANT" });
+      expect(input.protectedModelAuth.runConfig).toMatchObject({ runnerPhase: "planning", agentConfig: snapshot });
+      expect(input.protectedModelAuth.modelAuthUrl).toBe("https://orch.example.test");
+      expect(docker.validateProtectedLocalInput).toHaveBeenCalled();
+      expect(attempted).toHaveBeenCalled();
+    });
+
+    it("fly: sealed bootstrap, model auth url, no Anthropic credentials", async () => {
+      const result = await call({ config: optedConfig, execPath: "fly-machines", reservation });
+      expect(result).toMatchObject({ outcome: "accepted" });
+      const input = vi.mocked(flyMachines.buildSessionMachineConfig).mock.calls[0][0] as never as Record<string, any>;
+      expect(input.protectedModelBootstrap).toEqual({ sealed: "SEALED" });
+      expect(input.dispatchId).toBe("d-1");
+      expect(input.anthropicApiKey).toBeUndefined();
+      expect(input.claudeOAuthToken).toBeUndefined();
+      expect(input.extraEnv?.AI_IMPLEMENT_RUN_CONFIG).toBeUndefined();
+      expect(flyMachines.createMachine).toHaveBeenCalled();
+      const fly = await import("../fly-protection-key.js");
+      expect(vi.mocked(fly.buildProtectedFlyBootstrap).mock.calls[0][0]).toMatchObject({
+        modelAuthUrl: "https://orch.example.test",
+        runConfig: { runnerPhase: "planning", agentConfig: snapshot },
+      });
+    });
+
+    it("pre-launch failures throw before markLaunchAttempted", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const noUrl = { ...optedConfig, runnerCallbackBaseUrl: undefined } as unknown as AppConfig;
+      expect(await call({ config: noUrl, execPath: "fly-machines", reservation })).toMatchObject({ outcome: "rejected" });
+      const repoImage = await import("../repo-image.js");
+      vi.mocked(repoImage.resolveSessionImage).mockResolvedValueOnce({ image: "x", source: "override" } as never);
+      expect(await call({ config: optedConfig, execPath: "fly-machines", reservation })).toMatchObject({ outcome: "rejected" });
+      takeBootstrap.mockReturnValue(null);
+      expect(await call({ config: optedConfig, reservation })).toMatchObject({ outcome: "rejected" });
+      expect(attempted).not.toHaveBeenCalled();
+      expect(flyMachines.createMachine).not.toHaveBeenCalled();
+      expect(docker.startLocalRunnerContainer).not.toHaveBeenCalled();
+    });
+  });
+
+  it("opted-out launch keeps Anthropic credentials and the run config env", async () => {
+    await call({ reservation });
+    const input = vi.mocked(docker.startLocalRunnerContainer).mock.calls[0][0] as never as Record<string, any>;
+    expect(input.anthropicApiKey).toBe("sk");
+    expect(input.extraEnv.AI_IMPLEMENT_RUN_CONFIG).toBeTypeOf("string");
+    expect(input.protectedModelAuth).toBeUndefined();
+  });
+
+  it("opted-out local launch: the container input matches the pre-change fixture", async () => {
+    vi.mocked(docker.startLocalRunnerContainer).mockResolvedValue({ containerId: "c-1", containerName: "n" } as never);
+    await call({ reservation });
+    expectFixture("local", vi.mocked(docker.startLocalRunnerContainer).mock.calls[0][0]);
+  });
+
+  it("opted-out Fly launch: the machine input matches the pre-change fixture", async () => {
+    const flyMachines = await import("../fly-machines.js");
+    vi.mocked(flyMachines.createMachine).mockResolvedValue({ id: "m-1", name: "mn" } as never);
+    const flyConfig = { ...baseConfig, flySessionsToken: "ft", flySessionsApp: "fa", runnerCallbackBaseUrl: "https://orch.example.test" } as unknown as AppConfig;
+    expect(await call({ config: flyConfig, execPath: "fly-machines", reservation })).toMatchObject({ outcome: "accepted" });
+    expectFixture("fly", vi.mocked(flyMachines.buildSessionMachineConfig).mock.calls[0][0]);
+  });
+
+  it("an opted-out project with no Anthropic credentials is still rejected by the precheck", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const managed = await import("../managed-dispatch-auth.js");
+    expect(managed.isManagedProject("AII")).toBe(false);
+    const noKey = { ...baseConfig, anthropicApiKey: null, claudeOAuthToken: null } as unknown as AppConfig;
+    expect(await call({ config: noKey, reservation })).toEqual({ outcome: "rejected", executionMode: "local-docker" });
+    expect(dispatchSession).not.toHaveBeenCalled();
+  });
+});
+
+describe("preparePlanningLaunch for an opted-in project", () => {
+  let dbPath: string;
+  let dedup: typeof import("../dedup.js");
+
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+    dbPath = path.join(os.tmpdir(), `planning-gha-refuse-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
+    process.env.DEDUP_DB_PATH = dbPath;
+    dedup = await import("../dedup.js");
+    dedup.getDb();
+    (await import("../dispatch-breaker.js")).initDispatchBreakerTable();
+    const managed = await import("../managed-dispatch-auth.js");
+    vi.mocked(managed.isManagedProject).mockReturnValue(true);
+  });
+
+  afterEach(async () => {
+    // The mocked module survives vi.resetModules, so restore the opted-out default for later blocks.
+    vi.mocked((await import("../managed-dispatch-auth.js")).isManagedProject).mockReturnValue(false);
+    dedup.closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  it("refuses before any mint or dispatch and trips the breaker on the third", async () => {
+    const mod = await import("../planning-launch.js");
+    const auth = await import("../github-app-auth.js");
+    const github = await import("../github.js");
+    const breaker = await import("../dispatch-breaker.js");
+    const markPlanningFailed = vi.fn();
+    const provider = { id: "linear", markPlanningFailed } as unknown as TicketingProvider;
+    const issue = { id: "i-gha", identifier: "AII-1", title: "t", scopeKey: "AII" } as unknown as TicketIssue;
+    const fireBreakerTrip = vi.fn();
+    const args = {
+      config: {} as AppConfig, provider, issue,
+      mapping: { owner: "o", repo: "r", planningWorkflowFile: "claude-plan.yml", defaultBranch: "main" } as unknown as RepoMapping,
+      dispatchId: "d", resolvedPlanningBranch: "main",
+      resolveRunnerImage: vi.fn(), fireBreakerTrip,
+    };
+    for (let i = 0; i < 3; i++) {
+      await expect(mod.preparePlanningLaunch(args)).rejects.toThrow("managed dispatch refused: gha_not_supported");
+    }
+    expect(markPlanningFailed).toHaveBeenCalledTimes(3);
+    expect(auth.getInstallationToken).not.toHaveBeenCalled();
+    expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
+    expect(fireBreakerTrip).toHaveBeenCalledTimes(1);
+    expect(breaker.isParked("i-gha", "planning")).toBe(true);
+  });
 });
 
 describe("preparePlanningLaunch tokens", () => {
@@ -290,6 +616,13 @@ describe("preparePlanningLaunch tokens", () => {
     dedup.getDb();
     const auth = await import("../github-app-auth.js");
     vi.mocked(auth.getInstallationToken).mockResolvedValue("gh-token");
+    // This file mocks resolveWorkflowCapabilities (private transport probe); an envelope workflow without the marker.
+    vi.mocked((await import("../workflow-probe.js")).resolveWorkflowCapabilities).mockResolvedValue({
+      contract: "envelope",
+      supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
+      supportsPrivateRunConfig: false,
+    });
   });
 
   afterEach(() => {

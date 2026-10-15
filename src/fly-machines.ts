@@ -1,6 +1,21 @@
 import crypto from "node:crypto";
 
 import {
+  MODEL_AUTH_BACKENDS,
+  MODEL_AUTH_ENV,
+  parseSealedModelAuthBootstrap,
+  type SealedModelAuthBootstrapV1,
+} from "./model-auth-contract.js";
+import { isSafeProtectionKeyRef } from "./model-auth-seal.js";
+import {
+  MODEL_CREDENTIAL_KEYS,
+  MODEL_SESSION_KEYS,
+  PROTECTED_BOOTSTRAP_KEYS,
+  PROTECTED_BOOTSTRAP_PREFIXES,
+} from "./pipeline/process-env.js";
+import { encodeTrustedRunConfig, type RunConfigV1 } from "./run-config.js";
+
+import {
   DURABLE_RUNNER_DISPATCH_ID_KEY,
   DURABLE_RUNNER_PIPELINE_KEY,
   DURABLE_RUNNER_PURPOSE_KEY,
@@ -403,10 +418,10 @@ export async function waitForMachine(
 
 // ── App Secrets CRUD (Fly GraphQL API) ───────────────────────────────────────
 //
-// The Fly Machines REST API secrets endpoint (api.machines.dev) targets the
-// KMS named-secrets feature (not yet GA), not the traditional app env-var
-// secrets that `fly secrets set/list` manages. The GraphQL API is the correct
-// interface for those.
+// Listing and admin writes use the GraphQL API. The REST secrets endpoint
+// (`POST /v1/apps/{app}/secrets`) also writes classic app secrets and, unlike
+// GraphQL here, returns the secrets `version`; `putAppSecretsVersioned` uses it.
+// KMS named-secrets keys are the separate `/secretkeys` endpoints.
 
 const FLY_GRAPHQL_URL = "https://api.fly.io/graphql";
 
@@ -479,6 +494,35 @@ export async function setAppSecrets(
   `, { input: { appId: appName, secrets: secretInputs } });
 
   return null;
+}
+
+/**
+ * Writes app secrets through the Machines REST API and returns the new secrets version, which
+ * `min_secrets_version` pins. Errors are value-free: the response body is never echoed.
+ */
+export async function putAppSecretsVersioned(
+  token: string,
+  appName: string,
+  values: Record<string, string>,
+): Promise<number> {
+  const res = await fetch(`${FLY_API_BASE}/apps/${appName}/secrets`, {
+    method: "POST",
+    headers: flyHeaders(token),
+    body: JSON.stringify({ values }),
+  });
+  if (!res.ok) {
+    throw new Error(`Fly app secrets write failed (${res.status})`);
+  }
+  let version: unknown;
+  try {
+    version = ((await res.json()) as { version?: unknown } | null)?.version;
+  } catch {
+    version = undefined;
+  }
+  if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
+    throw new Error("Fly app secrets write returned no integer version");
+  }
+  return version;
 }
 
 export async function unsetAppSecret(
@@ -559,6 +603,102 @@ export function generateMachineNonce(): string {
 
 // ── Session Machine Builder ──────────────────────────────────────────────────
 
+/**
+ * Verified state of the platform app secret that carries the protection key. The caller
+ * resolves it from the secrets listing; the builder never sees the key bytes.
+ */
+export interface ProtectedBootstrapSecretMetadata {
+  /** Must be the canonical bootstrap-key secret name (`MODEL_AUTH_ENV.protectionKey`). */
+  name?: string;
+  available?: boolean;
+  /** Positive Fly secrets version at which the secret is verified present. */
+  version?: number;
+}
+
+/** Explicit opt-in for sealed model-auth delivery (AII-500). Absent means legacy behaviour. */
+export interface ProtectedModelBootstrapInput {
+  /** Output of `sealModelAuthBootstrap`; re-validated here. */
+  sealed: SealedModelAuthBootstrapV1;
+  projectKey: string;
+  /** Model-auth service base URL, delivered as `AI_IMPLEMENT_MODEL_AUTH_URL`. Must be `https://`. */
+  modelAuthUrl: string;
+  /** Run envelope without a `modelAuthGrant`; the builder embeds the sealed blob and owns `AI_IMPLEMENT_RUN_CONFIG`. */
+  runConfig: RunConfigV1;
+  secret: ProtectedBootstrapSecretMetadata;
+}
+
+export type ProtectedBootstrapErrorCategory =
+  | "protected_input_invalid"
+  | "protected_legacy_credentials_rejected"
+  | "protected_reserved_env_collision"
+  | "protected_secret_unavailable"
+  | "protected_secret_partial"
+  | "protected_secret_reference_unsafe"
+  | "protected_team_prefix_collision";
+
+/** Value-free: carries a category only, never env names, values or key material. */
+export class ProtectedBootstrapError extends Error {
+  readonly category: ProtectedBootstrapErrorCategory;
+  constructor(category: ProtectedBootstrapErrorCategory) {
+    super(`protected model bootstrap rejected: ${category}`);
+    this.name = "ProtectedBootstrapError";
+    this.category = category;
+  }
+}
+
+function isReservedModelEnvName(name: string): boolean {
+  const upper = name.toUpperCase();
+  return (
+    (PROTECTED_BOOTSTRAP_KEYS as readonly string[]).includes(upper) ||
+    (MODEL_CREDENTIAL_KEYS as readonly string[]).includes(upper) ||
+    (MODEL_SESSION_KEYS as readonly string[]).includes(upper) ||
+    PROTECTED_BOOTSTRAP_PREFIXES.some((p) => upper.startsWith(p))
+  );
+}
+
+/** Validates everything before any env is assembled; returns the verified secrets version. */
+function validateProtectedInput(input: SessionMachineInput, p: ProtectedModelBootstrapInput): number {
+  if (input.anthropicApiKey || input.claudeOAuthToken) {
+    throw new ProtectedBootstrapError("protected_legacy_credentials_rejected");
+  }
+  if (input.extraEnv && Object.keys(input.extraEnv).some(isReservedModelEnvName)) {
+    throw new ProtectedBootstrapError("protected_reserved_env_collision");
+  }
+  const sealed = parseSealedModelAuthBootstrap(p?.sealed);
+  if (!sealed.ok || typeof p.projectKey !== "string" || !p.projectKey.trim() || !p.runConfig) {
+    throw new ProtectedBootstrapError("protected_input_invalid");
+  }
+  if (input.dispatchId !== undefined && input.dispatchId !== sealed.value.dispatchId) {
+    throw new ProtectedBootstrapError("protected_input_invalid");
+  }
+  if (p.runConfig.credentials?.modelAuthGrant !== undefined) {
+    throw new ProtectedBootstrapError("protected_input_invalid");
+  }
+  if (typeof p.modelAuthUrl !== "string" || !p.modelAuthUrl.startsWith("https://") || p.modelAuthUrl.length <= "https://".length) {
+    throw new ProtectedBootstrapError("protected_input_invalid");
+  }
+  const keyName = MODEL_AUTH_ENV.protectionKey;
+  const teamKeys = [...(input.allTeamKeys ?? []), ...(input.teamKey ? [input.teamKey] : [])];
+  if (teamKeys.some((k) => keyName.startsWith(`${k.toUpperCase()}_`))) {
+    throw new ProtectedBootstrapError("protected_team_prefix_collision");
+  }
+  const secret = p.secret;
+  if (!secret || (secret.name === undefined && secret.available === undefined && secret.version === undefined)) {
+    throw new ProtectedBootstrapError("protected_secret_unavailable");
+  }
+  if (secret.name === undefined || secret.available === undefined || secret.version === undefined) {
+    throw new ProtectedBootstrapError("protected_secret_partial");
+  }
+  if (!isSafeProtectionKeyRef(secret.name)) {
+    throw new ProtectedBootstrapError("protected_secret_reference_unsafe");
+  }
+  if (secret.available !== true) throw new ProtectedBootstrapError("protected_secret_unavailable");
+  if (!Number.isInteger(secret.version) || secret.version < 1) {
+    throw new ProtectedBootstrapError("protected_secret_partial");
+  }
+  return secret.version;
+}
+
 export interface SessionMachineInput {
   image: string;
   issueId: string;
@@ -601,9 +741,19 @@ export interface SessionMachineInput {
   pipeline?: string;
   /** Stamped as `dispatch_id` metadata when set; a retried dispatch step compares it to find its own run. */
   dispatchId?: string;
+  /**
+   * Opt-in sealed model-auth delivery. When set the builder carries only the sealed envelope and safe
+   * dispatch fields, rejects legacy raw credentials and reserved `extraEnv` names, and throws before a
+   * Machine can be created if the platform-secret protection is not verified. No plaintext fallback.
+   * The protection key reaches the Machine through the app-wide platform secret, never this config.
+   */
+  protectedModelBootstrap?: ProtectedModelBootstrapInput;
 }
 
 export function buildSessionMachineConfig(input: SessionMachineInput): CreateMachineOpts {
+  const protectedBootstrap = input.protectedModelBootstrap;
+  const verifiedSecretsVersion = protectedBootstrap ? validateProtectedInput(input, protectedBootstrap) : undefined;
+
   const env: Record<string, string> = {
     ISSUE_ID: input.issueId,
     ISSUE_IDENTIFIER: input.issueIdentifier,
@@ -642,6 +792,19 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
   }
   if (input.extraEnv) {
     Object.assign(env, input.extraEnv);
+  }
+  if (protectedBootstrap) {
+    env[MODEL_AUTH_ENV.dispatchId] = protectedBootstrap.sealed.dispatchId;
+    env[MODEL_AUTH_ENV.projectKey] = protectedBootstrap.projectKey.trim();
+    env[MODEL_AUTH_ENV.backend] = MODEL_AUTH_BACKENDS.find((b) => b === protectedBootstrap.sealed.backend)!;
+    env[MODEL_AUTH_ENV.baseUrl] = protectedBootstrap.modelAuthUrl;
+    env.AI_IMPLEMENT_RUN_CONFIG = encodeTrustedRunConfig({
+      ...protectedBootstrap.runConfig,
+      credentials: {
+        ...(protectedBootstrap.runConfig.credentials ?? { version: 1 }),
+        modelAuthGrant: protectedBootstrap.sealed,
+      },
+    });
   }
 
   const machineConfig: MachineConfig = {
@@ -692,11 +855,18 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
   // Note: a falsy teamKey (e.g. Jira issues with an empty scopeKey) falls through both branches,
   // so the machine receives all classic app secrets regardless of the flag. This matches flag-off
   // behaviour for the same case and is not a regression, but the flag does not close this gap.
-  if (input.flyProcessLevelSecrets && input.teamKey && input.teamSecretNames !== undefined) {
+  // Protected mode with the flag on also takes the process-level branch (AII-1388): the protection key is
+  // listed explicitly, even when the secrets listing failed, because the fail-closed empty list would
+  // otherwise withhold it. With the flag off, protected mode keeps the entrypoint-filter branch.
+  // Non-protected configs never expose the key: process-level mode omits it, entrypoint-filter mode
+  // lists it among the foreign names.
+  const protectionKeyName = MODEL_AUTH_ENV.protectionKey;
+  if (input.flyProcessLevelSecrets && input.teamKey && (protectedBootstrap || input.teamSecretNames !== undefined)) {
     const ownPrefix = `${input.teamKey.toUpperCase()}_`;
     const allPrefixes = (input.allTeamKeys ?? []).map((k) => `${k.toUpperCase()}_`);
     const processSecrets: MachineSecret[] = [];
-    for (const name of input.teamSecretNames) {
+    for (const name of input.teamSecretNames ?? []) {
+      if (name === protectionKeyName) continue;
       if (name.startsWith(ownPrefix)) {
         // Own-team secret: remap from prefixed stored name to bare env var
         processSecrets.push({ env_var: name.slice(ownPrefix.length), name });
@@ -707,6 +877,7 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
         processSecrets.push({ env_var: name });
       }
     }
+    if (protectedBootstrap) processSecrets.push({ env_var: protectionKeyName });
     machineConfig.processes = [{
       ignore_app_secrets: true,
       secrets: processSecrets,
@@ -719,21 +890,24 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
     const ownPrefix = `${input.teamKey.toUpperCase()}_`;
     env.AI_IMPLEMENT_TEAM_SECRET_PREFIX = ownPrefix;
 
-    if (input.allTeamKeys?.length) {
-      const foreignNames = input.teamSecretNames.filter((name) => {
-        if (name.startsWith(ownPrefix)) return false;
-        return input.allTeamKeys!.some((k) => name.startsWith(`${k.toUpperCase()}_`));
-      });
-      if (foreignNames.length > 0) {
-        env.AI_IMPLEMENT_FOREIGN_SECRET_NAMES = foreignNames.join(",");
-      }
+    const teamKeys = input.allTeamKeys ?? [];
+    const foreignNames = input.teamSecretNames.filter((name) => {
+      if (!protectedBootstrap && name === protectionKeyName) return true;
+      if (name.startsWith(ownPrefix)) return false;
+      return teamKeys.some((k) => name.startsWith(`${k.toUpperCase()}_`));
+    });
+    if (foreignNames.length > 0) {
+      env.AI_IMPLEMENT_FOREIGN_SECRET_NAMES = foreignNames.join(",");
     }
   }
 
   return {
     name: input.machineName ?? `session-${input.issueIdentifier.toLowerCase().replace(/[^a-z0-9-]/g, "-")}`,
     region: input.region ?? "iad",
-    min_secrets_version: input.minSecretsVersion,
+    min_secrets_version:
+      verifiedSecretsVersion !== undefined
+        ? Math.max(verifiedSecretsVersion, input.minSecretsVersion ?? 0)
+        : input.minSecretsVersion,
     config: machineConfig,
   };
 }

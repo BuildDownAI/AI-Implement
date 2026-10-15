@@ -71,6 +71,7 @@ describe("resolveWorkflowContract", () => {
       contract: "envelope",
       supportsRunPublicationToken: true,
       supportsAttemptCorrelation: false,
+      supportsPrivateRunConfig: false,
     });
   });
 
@@ -88,6 +89,7 @@ describe("resolveWorkflowContract", () => {
       contract: "envelope",
       supportsRunPublicationToken: false,
       supportsAttemptCorrelation: false,
+      supportsPrivateRunConfig: false,
     });
   });
 
@@ -107,6 +109,7 @@ describe("resolveWorkflowContract", () => {
       contract: "envelope",
       supportsRunPublicationToken: false,
       supportsAttemptCorrelation: false,
+      supportsPrivateRunConfig: false,
     });
   });
 
@@ -150,6 +153,7 @@ describe("resolveWorkflowContract", () => {
       contract: "legacy",
       supportsRunPublicationToken: false,
       supportsAttemptCorrelation: false,
+      supportsPrivateRunConfig: false,
     });
   });
 
@@ -338,6 +342,7 @@ describe("resolveWorkflowCapabilities — supportsAttemptCorrelation", () => {
       contract: "envelope",
       supportsRunPublicationToken: false,
       supportsAttemptCorrelation: true,
+      supportsPrivateRunConfig: false,
     });
   });
 
@@ -389,6 +394,7 @@ describe("resolveWorkflowCapabilities — supportsAttemptCorrelation", () => {
       contract: "legacy",
       supportsRunPublicationToken: false,
       supportsAttemptCorrelation: false,
+      supportsPrivateRunConfig: false,
     });
   });
 
@@ -415,6 +421,46 @@ describe("resolveWorkflowCapabilities — supportsAttemptCorrelation", () => {
 
     expect(main.supportsAttemptCorrelation).toBe(false);
     expect(dev.supportsAttemptCorrelation).toBe(true);
+  });
+});
+
+// ---------- supportsPrivateRunConfig (AII-982) ----------
+
+describe("resolveWorkflowCapabilities — supportsPrivateRunConfig", () => {
+  const MARKER = "# ai-implement-capability: private-run-config-v1\n";
+  const probe = (fetchImpl: ReturnType<typeof vi.fn>) =>
+    resolveWorkflowCapabilities({
+      owner: "o",
+      repo: "r",
+      workflowFile: "w.yml",
+      token: "t",
+      ref: "main",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+  beforeEach(() => __clearWorkflowProbeCacheForTests());
+
+  it("is true only for an envelope workflow carrying the static marker", async () => {
+    expect((await probe(mockContents(MARKER + ENVELOPE_YML))).supportsPrivateRunConfig).toBe(true);
+  });
+
+  it("is false for an envelope workflow without the marker", async () => {
+    expect((await probe(mockContents(ENVELOPE_YML))).supportsPrivateRunConfig).toBe(false);
+  });
+
+  it("stays false for a legacy workflow that mentions the marker", async () => {
+    expect((await probe(mockContents(MARKER + LEGACY_YML))).supportsPrivateRunConfig).toBe(false);
+  });
+
+  it("is false for 404 and fetch errors", async () => {
+    expect((await probe(mockFetch(404, {}))).supportsPrivateRunConfig).toBe(false);
+    __clearWorkflowProbeCacheForTests();
+    expect((await probe(vi.fn().mockRejectedValue(new Error("boom")))).supportsPrivateRunConfig).toBe(false);
+  });
+
+  it("does not advertise or imply the stage-agent-config capability", async () => {
+    const caps = await probe(mockContents(MARKER + ENVELOPE_YML));
+    expect(Object.keys(caps).join(",")).not.toMatch(/stage/i);
   });
 });
 

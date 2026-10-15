@@ -261,6 +261,7 @@ export interface KgRefreshProductionInput {
   deleteBranchFn: KgRailDeps["deleteBranchFn"];
   /** The sender deps the backends need and `config` cannot supply (AII-1148). */
   getInstallationToken: KgRefreshSenderDeps["getInstallationToken"];
+  getScopedInstallationToken: KgRefreshSenderDeps["getScopedInstallationToken"];
   resolveRunnerImage: KgRefreshSenderDeps["resolveRunnerImage"];
   postWorkflowDispatch: KgRefreshSenderDeps["postWorkflowDispatch"];
   keptMachineFly: KgRefreshSenderDeps["keptMachineFly"];
@@ -328,6 +329,7 @@ export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispa
     // Inherit from the live config: a spread would read every getter once and freeze the Fly values at boot.
     config: Object.create(input.config, { kgSourceRepo: { value: input.kgSourceRepo, enumerable: true } }) as AppConfig,
     getInstallationToken: input.getInstallationToken,
+    getScopedInstallationToken: input.getScopedInstallationToken,
     mintToken: input.mintToken,
     fetchDefaultBranch: input.fetchDefaultBranch,
     resolveRunnerImage: input.resolveRunnerImage,

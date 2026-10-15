@@ -3,6 +3,7 @@
  * boundary where those adapters become Restate services. */
 import { getMappings, resolveReviewFixLifecycle, type RepoMapping } from "../config.js";
 import { getDb } from "../dedup.js";
+import { isManagedProject } from "../managed-dispatch-auth.js";
 import { getInstallationId, getInstallationToken } from "../github-app-auth.js";
 import { getPullRequestState } from "../github.js";
 import { listReviewFixCycleSummaries } from "../review-fix-evidence.js";
@@ -11,11 +12,11 @@ import { createReviewFixGithubAdapter } from "../review-fix-github-adapter.js";
 import { resolveRunnerImageForDispatch } from "../repo-image.js";
 import { resolveReviewProcess, type ReviewFixer } from "../review-process.js";
 import { acceptReviewFixWebhookEvent, updateReviewFixStatus } from "../review-fix-queue.js";
-import { loadPendingReviewFixFeedback } from "../review-fix-pending.js";
+import { inspectPendingReviewFixFeedback } from "../review-fix-pending.js";
 import { SqliteReviewFixAttemptStore } from "../review-fix-attempt-store.js";
 import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "../review-fix-worker.js";
 import { DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES, type ReviewFixFindingDisposition } from "../review-fix-ports.js";
-import type { PreparedReviewFixAttempt } from "../review-fix-ports.js";
+import type { PreparedReviewFixAttempt, ReviewFixAdmissionOutcome, ReviewFixAdmissionRequest } from "../review-fix-ports.js";
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
 import { mintPreparedReviewFixToken } from "../runner-tokens.js";
 import { getRunnerMode, resolveExecutionPath } from "../runner-mode.js";
@@ -37,20 +38,38 @@ export interface ReviewFixProductionConfig {
   runnerImageExplicit: boolean;
 }
 
-function selectedMapping(scope: ScopedPrIdentity): RepoMapping | null {
-  const mapping = Object.values(getMappings()).find((candidate) =>
+/** The selected mapping with its `getMappings()` key, which opt-in lookup is keyed by. */
+function selectedEntry(scope: ScopedPrIdentity): [string, RepoMapping] | null {
+  const entry = Object.entries(getMappings()).find(([, candidate]) =>
     `${candidate.owner}/${candidate.repo}` === scope.repository);
-  return mapping && !mapping.paused && resolveReviewFixLifecycle(mapping) === "restate"
+  if (!entry) return null;
+  const mapping = entry[1];
+  return !mapping.paused && resolveReviewFixLifecycle(mapping) === "restate"
     && resolveExecutionPath(getRunnerMode().mode, mapping.executionMode) === "github-actions"
-    ? mapping : null;
+    ? entry : null;
 }
+
+function selectedMapping(scope: ScopedPrIdentity): RepoMapping | null {
+  return selectedEntry(scope)?.[1] ?? null;
+}
+
+export type ReviewFixAdmission = "admit" | "defer" | "configuration_error";
 
 /** Verify the dispatch-ref contract immediately before a new reservation. A
  * changed workflow, runner mode, missing callback credential, or GitHub outage
- * defers admission with the queue still pending. */
-async function canAdmit(scope: ScopedPrIdentity, config: ReviewFixProductionConfig): Promise<boolean> {
-  const mapping = selectedMapping(scope);
-  if (!mapping || !config.runnerCallbackBaseUrl || !config.runnerTokenSecret) return false;
+ * defers admission with the queue still pending. An opted-in (managed) project is a
+ * configuration error: GitHub Actions cannot carry a model-auth grant yet, so nothing
+ * is checked on GitHub and nothing is reserved. */
+export async function canAdmit(scope: ScopedPrIdentity, config: ReviewFixProductionConfig): Promise<ReviewFixAdmission> {
+  const entry = selectedEntry(scope);
+  if (!entry) return "defer";
+  const [key, mapping] = entry;
+  if (isManagedProject(key)) return "configuration_error";
+  if (!config.runnerCallbackBaseUrl || !config.runnerTokenSecret) return "defer";
+  return await verifyDispatchContract(scope, config, mapping) ? "admit" : "defer";
+}
+
+async function verifyDispatchContract(scope: ScopedPrIdentity, config: ReviewFixProductionConfig, mapping: RepoMapping): Promise<boolean> {
   try {
     const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
     if (await getInstallationId(config.githubAppId, config.githubAppPrivateKey, mapping.owner) !== scope.installationId) return false;
@@ -75,6 +94,24 @@ export function recordDelegatedFix(scope: ScopedPrIdentity, queueCursor: { queue
   updateReviewFixStatus(queueCursor.queueId, "skipped");
   console.log(`[review-fix] Project ${scope.repository} delegates fixes to the repository `
     + `(${resolveReviewProcess(mapping?.reviewProcess).id}), skipping review fix #${queueCursor.queueId}`);
+}
+
+/** Reserve an attempt when the dispatch contract holds. An opted-in project fails its queue row and
+ * reserves nothing; every other non-admit defers with the queue still pending. */
+export async function admitReviewFix(
+  request: ReviewFixAdmissionRequest,
+  config: ReviewFixProductionConfig,
+  store: Pick<SqliteReviewFixAttemptStore, "admit">,
+): Promise<ReviewFixAdmissionOutcome> {
+  const verdict = await canAdmit(request.scope, config);
+  if (verdict === "admit") return store.admit(request);
+  if (verdict === "configuration_error") {
+    const cursor = request.feedback.queueCursor;
+    // A failed row is no longer pending, so the PR object stops rechecking.
+    if (cursor) updateReviewFixStatus(cursor.queueId, "failed");
+    console.error(`[review-fix] ${request.scope.repository}#${request.scope.prNumber} not launched: configuration_error (gha_not_supported)`);
+  }
+  return { status: "deferred", reason: "paused" };
 }
 
 function dispositionsFor(attempt: PreparedReviewFixAttempt, result: ReviewFixResultMetadataV1): ReviewFixFindingDisposition[] {
@@ -191,8 +228,7 @@ export function createProductionReviewFixServices(
   const pr = createReviewFixPR({
     recordFeedback: async (event) => acceptReviewFixWebhookEvent(event),
     attempts: {
-      admit: async (request) => await canAdmit(request.scope, config)
-        ? store.admit(request) : { status: "deferred", reason: "paused" },
+      admit: (request) => admitReviewFix(request, config, store),
     },
     recordDelegated: async (scope, queueCursor) => recordDelegatedFix(scope, queueCursor),
     load: async (scope) => {
@@ -211,7 +247,14 @@ export function createProductionReviewFixServices(
           issueDescription = (await provider.findByKey(row.issue_identifier))?.description ?? null;
         } catch { /* Legacy's fallback text is also valid when the tracker is unavailable. */ }
       }
-      return { closed, pending: loadPendingReviewFixFeedback(scope, issueDescription),
+      // Over-budget feedback is a non-launch outcome: leave every finding pending, admit
+      // nothing, and log only the bounded category. Throwing here would put the journaled
+      // ctx.run into Restate's unbounded retry of a deterministic failure.
+      const inspected = inspectPendingReviewFixFeedback(scope, issueDescription);
+      if (inspected.status === "incomplete") {
+        console.warn(`[review-fix] ${scope.repository}#${scope.prNumber} not launched: ${inspected.reason}`);
+      }
+      return { closed, pending: inspected.status === "ready" ? inspected.feedback : null,
         fixer: fixerFor(mapping),
         jobTimeoutMinutes: mapping.maxJobMinutes ?? DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES };
     },

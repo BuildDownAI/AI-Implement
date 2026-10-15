@@ -1,7 +1,9 @@
+import { sanitizeAttribution, type InvocationAttributionV1 } from "./pipeline/types.js";
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
-import { ClaudeCliExecutor, type ActivityReportingConfig } from "./pipeline/executor.js";
+import { tmpdir } from "node:os";
+import { ClaudeCliExecutor, isPossiblyLiveChild, type ActivityReportingConfig } from "./pipeline/executor.js";
 import { getPublicationCredential } from "./publication-credential.js";
 import { DefaultPipelineContext } from "./pipeline/context.js";
 import { PipelineRunner } from "./pipeline/runner.js";
@@ -28,7 +30,28 @@ import { fetchPlanningContextFromOrchestrator, postRunnerCycleSummary, postRunne
 import { SensitiveFilesError } from "./pipeline/sensitive-files.js";
 import { OperatorCancelledError } from "./pipeline/operator-cancelled.js";
 import { classifyThrown, isFailureRecord } from "./pipeline/failure-classification.js";
-import { decodeRunConfig, type RunConfigV1 } from "./run-config.js";
+import {
+  decodeRunConfig,
+  decodeTrustedRunConfig,
+  validateResolvedAgentSnapshot,
+  type ResolvedAgentSnapshotV1,
+  type RunConfigV1,
+} from "./run-config.js";
+import {
+  acceptModelAuthBootstrap,
+  createModelAuthClient,
+  createModelAuthTransport,
+  openSealedModelAuthBootstrap,
+  type ExpectedBootstrapContext,
+  type LocalCredentialPort,
+  type ModelAuthClient,
+  type ModelAuthTransport,
+} from "./model-auth-client.js";
+import { MODEL_AUTH_BACKENDS, MODEL_AUTH_ENV, isSubscriptionAuthMode, type ModelAuthBackend, type ModelAuthFinishHandling } from "./model-auth-contract.js";
+import { STAGE_NAMES } from "./agent-config.js";
+import { repoTrustRejection, type RepoTrust } from "./repo-trust.js";
+import { AgentRecoveryRequiredError, createStageExecutor, type StageExecutorOptions } from "./pipeline/stage-executor.js";
+import { CodexRecoveryRequiredError } from "./pipeline/codex-executor.js";
 import type { ReviewFixMetadataV1, ReviewFixResultMetadataV1 } from "./review-fix-contract.js";
 import { ActivityReporter, type ActivityDetailValue } from "./pipeline/activity-reporter.js";
 import { DEFAULT_RETRY_POLICY, normalizeRetryPolicy, type RetryPolicy } from "./pipeline/retry-backoff.js";
@@ -203,6 +226,8 @@ export interface RunAutonomousOptions {
   workspaceDir?: string;
   reporter?: StepReporter;
   llmExecutor?: LLMExecutor;
+  /** Seams for an opted-in (snapshot-carrying) run. Ignored for legacy runs. */
+  configured?: ConfiguredRunOptions;
   fetchImpl?: typeof fetch;
   pipeline?: PipelineDefinition;
   runner?: PipelineRunner;
@@ -215,8 +240,31 @@ export interface RunAutonomousOptions {
   activityReporting?: RunnerActivityReporting;
 }
 
+/** Last pass carrying a valid attribution; projected through `sanitizeAttribution` so no consumer sees a raw claim. */
+function passAttribution(passes: unknown): InvocationAttributionV1 | undefined {
+  if (!Array.isArray(passes)) return undefined;
+  for (let i = passes.length - 1; i >= 0; i--) {
+    const clean = sanitizeAttribution((passes[i] as { attribution?: unknown } | null)?.attribution);
+    if (clean) return clean;
+  }
+  return undefined;
+}
+
+/** Attribution an executor attached to a thrown error (`err.attribution`, or its telemetry's). */
+function errorAttribution(err: unknown): InvocationAttributionV1 | undefined {
+  if (typeof err !== "object" || err === null) return undefined;
+  const e = err as { attribution?: unknown; telemetry?: { attribution?: unknown } };
+  return sanitizeAttribution(e.attribution) ?? sanitizeAttribution(e.telemetry?.attribution) ?? undefined;
+}
+
+function attributionField(attribution: InvocationAttributionV1 | undefined): { attribution?: InvocationAttributionV1 } {
+  return attribution ? { attribution } : {};
+}
+
 export interface RunAutonomousResult {
   exitCode: number;
+  /** Optional diagnostic attribution (AII-946/954): the last implementation invocation; absent on legacy runs. */
+  attribution?: InvocationAttributionV1;
 }
 
 function optionalEnv(n: string): string | null {
@@ -436,6 +484,9 @@ export interface ResolvedRunnerInputs {
    *  on Legacy (non-pilot) dispatches and always undefined on the legacy flat-env path — there
    *  is no env-var equivalent. Carriage only: no downstream pipeline seam reads this yet. */
   reviewFix: ReviewFixMetadataV1 | undefined;
+  /** Immutable resolved stage snapshot (run_config.agentConfig). Undefined = legacy run. The
+   *  model-auth grant is deliberately not carried here; it is read separately and never enters context data. */
+  agentConfig: ResolvedAgentSnapshotV1 | undefined;
 }
 
 function parseEnvInt(raw: string | undefined, name: string): number | undefined {
@@ -642,6 +693,7 @@ function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRun
     groupingParent: cfg.groupingParent === true,
     retryPolicy: normalizeRetryPolicy(cfg.retryPolicy),
     reviewFix: cfg.reviewFix,
+    agentConfig: cfg.agentConfig,
   };
 }
 
@@ -726,7 +778,390 @@ export function resolveRunnerInputs(env: NodeJS.ProcessEnv): ResolvedRunnerInput
     groupingParent: env.AI_IMPLEMENT_GROUPING_PARENT === "true",
     retryPolicy: { ...DEFAULT_RETRY_POLICY },
     reviewFix: undefined,
+    agentConfig: undefined,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Configured (opted-in) runs: stage snapshot + selected-credential client
+// ---------------------------------------------------------------------------
+
+export type ConfiguredRunFailure =
+  | "snapshot_incomplete"
+  | "bootstrap_missing"
+  | "bootstrap_invalid"
+  | "bootstrap_context_missing"
+  | "grant_bindings_mismatch"
+  | "transport_unconfigured"
+  | "repository_untrusted";
+
+/** Fixed-message rejection of an opted-in run; never carries input, grant or credential text. */
+export class ConfiguredRunError extends Error {
+  readonly code = "CONFIGURED_RUN_INVALID";
+  readonly reason: ConfiguredRunFailure;
+  constructor(reason: ConfiguredRunFailure) {
+    super(`Configured run rejected before execution: ${reason}`);
+    this.name = "ConfiguredRunError";
+    this.reason = reason;
+  }
+}
+
+export { MODEL_AUTH_ENV };
+
+export interface ConfiguredRunOptions {
+  /** Local runs: the resolved snapshot. Managed runs read it from the envelope. */
+  agentConfig?: ResolvedAgentSnapshotV1;
+  /** Local runs: protected credential source (trusted private testing). */
+  localCredentialPort?: LocalCredentialPort;
+  /** Injected client seam. Never bypasses snapshot, bootstrap or trust validation. */
+  modelAuthClient?: ModelAuthClient;
+  modelAuthTransport?: ModelAuthTransport;
+  /** Trusted dispatch context; defaults to the launcher's AI_IMPLEMENT_MODEL_AUTH_* values. */
+  expectedBootstrap?: ExpectedBootstrapContext;
+  /** Parent directory for private credential directories (defaults to the OS temp dir). */
+  modelAuthRoot?: string;
+  /** Repositories the run executes against, for the trust check (managed runs default to the target repo). */
+  repositories?: readonly string[];
+  /** Actual visibility/trust of one repository, judged by the dispatch-preparation rule. */
+  repoTrust?: (repository: string) => Promise<RepoTrust>;
+  /** Local synthetic OpenAI-compatible provider for real-image manual tests. */
+  syntheticProvider?: ConfiguredSyntheticProviderOptions;
+  now?: () => number;
+  /** Executor construction seams for the selected stage executor (tests). */
+  createCodex?: StageExecutorOptions["createCodex"];
+}
+
+export interface ConfiguredSyntheticProviderOptions {
+  version: 1;
+  kind: "local-feedback-provider";
+  port: number;
+  profileIds: readonly string[];
+}
+
+export interface ConfiguredExecutorArgs {
+  workspaceDir: string;
+  /** Test seam: also used as the Claude executor so an injected double still serves Claude stages. */
+  legacy?: LLMExecutor;
+  logLevel?: LogLevel;
+  activityReporting?: ActivityReportingConfig;
+}
+
+export interface ConfiguredRun {
+  readonly snapshot: ResolvedAgentSnapshotV1;
+  /** Provider label for legacy `PipelineContextData.provider`; the stage executor does the real selection. */
+  readonly provider: "anthropic" | "bedrock";
+  createExecutor(args: ConfiguredExecutorArgs): LLMExecutor;
+  /** Safe finish/dispose. Holds (does nothing) when a child may be live or a checkpoint is uncertain. */
+  finish(handling: ModelAuthFinishHandling): Promise<boolean>;
+}
+
+const REAL_CONFIGURED_RUNS = new WeakSet<ConfiguredRun>();
+
+export function validateBorrowedConfiguredRun(
+  run: ConfiguredRun | undefined,
+  expectedSnapshot?: ResolvedAgentSnapshotV1,
+): ConfiguredRun | undefined {
+  if (!run) return undefined;
+  if (!REAL_CONFIGURED_RUNS.has(run)) throw new ConfiguredRunError("bootstrap_invalid");
+  if (expectedSnapshot && JSON.stringify(run.snapshot) !== JSON.stringify(validateResolvedAgentSnapshot(expectedSnapshot))) {
+    throw new ConfiguredRunError("snapshot_incomplete");
+  }
+  return run;
+}
+
+function isRec(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function syntheticProviderUrl(port: number): string {
+  return `http://local-feedback-provider:${port}/v1`;
+}
+
+function validateSyntheticProvider(
+  raw: ConfiguredSyntheticProviderOptions | undefined,
+  snapshot: ResolvedAgentSnapshotV1,
+  opts: { local: boolean; injected: boolean; hosted: boolean },
+): { url: string; profileIds: Set<string> } | undefined {
+  if (!raw) return undefined;
+  if (!opts.local || opts.injected || opts.hosted) throw new ConfiguredRunError("bootstrap_invalid");
+  if (raw.version !== 1 || raw.kind !== "local-feedback-provider" || !Number.isInteger(raw.port) || raw.port < 1 || raw.port > 65535) {
+    throw new ConfiguredRunError("bootstrap_invalid");
+  }
+  if (!Array.isArray(raw.profileIds) || raw.profileIds.length === 0) throw new ConfiguredRunError("bootstrap_invalid");
+  const selected = new Map(
+    STAGE_NAMES
+      .filter((stage) => snapshot.stages[stage].agent === "codex" && snapshot.stages[stage].provider === "openai")
+      .map((stage) => [snapshot.stages[stage].accountProfileId, snapshot.profiles[stage]] as const),
+  );
+  const ids = new Set<string>();
+  for (const id of raw.profileIds) {
+    if (typeof id !== "string" || id.length === 0 || ids.has(id)) throw new ConfiguredRunError("bootstrap_invalid");
+    const profile = selected.get(id);
+    if (!profile || profile.agent !== "codex" || profile.provider !== "openai") throw new ConfiguredRunError("bootstrap_invalid");
+    ids.add(id);
+  }
+  return { url: syntheticProviderUrl(raw.port), profileIds: ids };
+}
+
+/**
+ * True when the encoded envelope shows configured intent (an `agentConfig` or a model-auth grant) even if
+ * it cannot be decoded, so a malformed configured envelope never degrades to legacy. An envelope that is
+ * not even parseable JSON carries no such signal and stays legacy (the caller keeps its own warning).
+ */
+export function hasConfiguredIntent(encoded: string | undefined): boolean {
+  if (!encoded) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(encoded, "base64").toString("utf-8"));
+  } catch {
+    return false;
+  }
+  if (!isRec(parsed)) return false;
+  return parsed.agentConfig !== undefined || (isRec(parsed.credentials) && parsed.credentials.modelAuthGrant !== undefined);
+}
+
+function readEnvelopeGrant(env: NodeJS.ProcessEnv): unknown {
+  const raw = env.AI_IMPLEMENT_RUN_CONFIG;
+  if (!raw) return undefined;
+  try {
+    return decodeTrustedRunConfig(raw).credentials?.modelAuthGrant;
+  } catch {
+    // Only configured intent is fail-closed; an envelope with no snapshot/grant signal is the caller's
+    // legacy problem (resolveRunnerInputs / the KG warn-and-continue path).
+    if (hasConfiguredIntent(raw)) throw new ConfiguredRunError("bootstrap_invalid");
+    return undefined;
+  }
+}
+
+function expectedFromEnv(env: NodeJS.ProcessEnv, snapshotId: string): ExpectedBootstrapContext {
+  const dispatchId = env[MODEL_AUTH_ENV.dispatchId]?.trim();
+  const projectKey = env[MODEL_AUTH_ENV.projectKey]?.trim();
+  const backend = env[MODEL_AUTH_ENV.backend]?.trim();
+  if (!dispatchId || !projectKey || !backend || !(MODEL_AUTH_BACKENDS as readonly string[]).includes(backend)) {
+    throw new ConfiguredRunError("bootstrap_context_missing");
+  }
+  return { dispatchId, projectKey, snapshotId, backend: backend as ModelAuthBackend };
+}
+
+function openGrant(env: NodeJS.ProcessEnv, raw: unknown, expected: ExpectedBootstrapContext, now: () => number) {
+  try {
+    if (isRec(raw) && raw.ciphertext !== undefined) {
+      const encodedKey = env[MODEL_AUTH_ENV.protectionKey];
+      if (!encodedKey) throw new ConfiguredRunError("bootstrap_missing");
+      return openSealedModelAuthBootstrap({ sealed: raw, protectionKey: Buffer.from(encodedKey, "base64url"), expected, now });
+    }
+    return acceptModelAuthBootstrap(raw, expected, now);
+  } catch (err) {
+    if (err instanceof ConfiguredRunError) throw err;
+    throw new ConfiguredRunError("bootstrap_invalid");
+  }
+}
+
+/**
+ * Validates an opted-in run and builds its one runner-owned client. Returns `undefined` for a legacy run
+ * (no snapshot, no grant, no injected source). Everything that can reject a run happens here, before any
+ * backend call, checkout, clone, hook or model work; a configured run never falls back to legacy.
+ */
+export async function prepareConfiguredRun(input: {
+  env: NodeJS.ProcessEnv;
+  snapshot?: ResolvedAgentSnapshotV1;
+  workspaceDir: string;
+  /** Repositories for the trust check when `options.repositories` is not set. */
+  repositories?: readonly string[];
+  options?: ConfiguredRunOptions;
+}): Promise<ConfiguredRun | undefined> {
+  const { env, options = {} } = input;
+  const grantRaw = readEnvelopeGrant(env);
+  const port = options.localCredentialPort;
+  const injected = options.modelAuthClient;
+  const rawSnapshot = input.snapshot ?? options.agentConfig;
+  if (rawSnapshot === undefined && grantRaw === undefined && !port && !injected) return undefined;
+
+  let snapshot: ResolvedAgentSnapshotV1;
+  try {
+    if (rawSnapshot === undefined) throw new Error("no snapshot");
+    snapshot = validateResolvedAgentSnapshot(rawSnapshot);
+  } catch {
+    throw new ConfiguredRunError("snapshot_incomplete");
+  }
+  if (grantRaw === undefined && !port) throw new ConfiguredRunError("bootstrap_missing");
+  if (grantRaw !== undefined && port) throw new ConfiguredRunError("bootstrap_invalid");
+  const syntheticProvider = validateSyntheticProvider(options.syntheticProvider, snapshot, {
+    local: Boolean(port),
+    injected: Boolean(injected),
+    hosted: grantRaw !== undefined,
+  });
+
+  let grant: ReturnType<typeof openGrant> | undefined;
+  if (grantRaw !== undefined) {
+    const now = options.now ?? Date.now;
+    grant = openGrant(env, grantRaw, options.expectedBootstrap ?? expectedFromEnv(env, snapshot.snapshotId), now);
+    // The grant must cover exactly the profiles this snapshot selects, so one missing the subscription
+    // markers (owner generation) or bound to another profile never starts a run.
+    for (const stage of STAGE_NAMES) {
+      const profile = snapshot.profiles[stage];
+      const binding = grant.bindings.find((b) => b.stage === stage);
+      if (
+        !binding ||
+        binding.profileId !== profile.id ||
+        binding.profileRevision !== profile.revision ||
+        binding.authMode !== profile.authMode
+      ) {
+        throw new ConfiguredRunError("grant_bindings_mismatch");
+      }
+    }
+  }
+
+  // Visibility/trust: the same decision dispatch preparation makes. A local subscription run has no
+  // grant vouching for a prior dispatch check, so it fails closed without an explicit trust source.
+  const subscription = STAGE_NAMES.some((s) => isSubscriptionAuthMode(snapshot.profiles[s].authMode));
+  if (options.repoTrust) {
+    const repositories = [...new Set(options.repositories ?? input.repositories ?? [])];
+    if (repositories.length === 0) throw new ConfiguredRunError("repository_untrusted");
+    for (const repository of repositories) {
+      let trust: RepoTrust | undefined;
+      try {
+        trust = await options.repoTrust(repository);
+      } catch {
+        trust = undefined;
+      }
+      if (repoTrustRejection(trust)) throw new ConfiguredRunError("repository_untrusted");
+    }
+  } else if (port && subscription) {
+    throw new ConfiguredRunError("repository_untrusted");
+  }
+
+  let client: ModelAuthClient;
+  if (injected) {
+    client = injected;
+  } else {
+    let source: Parameters<typeof createModelAuthClient>[0]["source"];
+    if (grant) {
+      const baseUrl = env[MODEL_AUTH_ENV.baseUrl]?.trim();
+      if (!options.modelAuthTransport && !baseUrl) throw new ConfiguredRunError("transport_unconfigured");
+      source = {
+        kind: "hosted",
+        grant,
+        transport: options.modelAuthTransport ?? createModelAuthTransport({ baseUrl: baseUrl as string, bearer: grant.bearer }),
+      };
+    } else {
+      source = { kind: "local", port: port as LocalCredentialPort };
+    }
+    client = createModelAuthClient({
+      source,
+      authRoot: options.modelAuthRoot ?? env[MODEL_AUTH_ENV.authRoot]?.trim() ?? tmpdir(),
+      forbiddenRoots: [input.workspaceDir],
+      protectedEnvKeys: Object.keys(env).filter((k) => k.startsWith("AI_IMPLEMENT_MODEL_AUTH_")),
+      now: options.now,
+      onDiagnostic: (d) => console.log(`[model-auth] ${JSON.stringify(d)}`),
+    });
+  }
+  return buildConfiguredRun(snapshot, client, options, syntheticProvider);
+}
+
+function buildConfiguredRun(
+  snapshot: ResolvedAgentSnapshotV1,
+  client: ModelAuthClient,
+  options: ConfiguredRunOptions,
+  syntheticProvider?: { url: string; profileIds: Set<string> },
+): ConfiguredRun {
+  const modes = new Map(STAGE_NAMES.map((s) => [snapshot.profiles[s].id, snapshot.profiles[s].authMode] as const));
+  const checkouts = new Map<string, Promise<void>>();
+  const checkedOut = new Set<string>();
+  let held = false;
+  let finished = false;
+
+  // One checkout per profile, on first use, so an unused stage's profile is never reserved.
+  const ensureCheckout = (profileId: string): Promise<void> => {
+    let pending = checkouts.get(profileId);
+    if (!pending) {
+      const authMode = modes.get(profileId);
+      pending = authMode
+        ? client.checkout({ profileId, authMode }).then(() => void checkedOut.add(profileId))
+        : Promise.reject(new ConfiguredRunError("snapshot_incomplete"));
+      checkouts.set(profileId, pending);
+    }
+    return pending;
+  };
+  const auth: NonNullable<StageExecutorOptions["auth"]> = {
+    async invoke(profileId, run) {
+      await ensureCheckout(profileId);
+      return client.invoke(profileId, (selected) => {
+        if (!syntheticProvider?.profileIds.has(profileId)) return run(selected);
+        return run({ ...selected, env: { ...selected.env, OPENAI_BASE_URL: syntheticProvider.url } });
+      });
+    },
+  };
+
+  const provider = snapshot.stages.implementation.provider === "bedrock" ? "bedrock" : "anthropic";
+  const run: ConfiguredRun = {
+    snapshot,
+    provider,
+    createExecutor(args) {
+      const selected = createStageExecutor({
+        workspaceDir: args.workspaceDir,
+        legacy: args.legacy ?? {
+          invoke: async () => {
+            throw new ConfiguredRunError("snapshot_incomplete");
+          },
+        },
+        snapshot,
+        auth,
+        logLevel: args.logLevel,
+        activityReporting: args.activityReporting,
+        ...(args.legacy ? { createClaude: () => args.legacy as LLMExecutor } : {}),
+        ...(options.createCodex ? { createCodex: options.createCodex } : {}),
+      });
+      return {
+        async invoke(params) {
+          try {
+            return await selected.invoke(params);
+          } catch (err) {
+            const category = (err as { category?: unknown } | null)?.category;
+            if (
+              err instanceof AgentRecoveryRequiredError ||
+              err instanceof CodexRecoveryRequiredError ||
+              isPossiblyLiveChild(err) ||
+              category === "checkpoint_uncertain" ||
+              category === "checkpoint_rejected"
+            ) {
+              held = true;
+            }
+            throw err;
+          }
+        },
+      };
+    },
+    async finish(handling) {
+      if (finished) return false;
+      finished = true;
+      // A live or unconfirmed child keeps its ownership and credential state; nothing is released here.
+      if (held) return false;
+      let retained = false;
+      for (const profileId of checkedOut) {
+        if (client.status(profileId) !== "ready") {
+          retained = true;
+          continue;
+        }
+        try {
+          await client.finish(profileId, handling);
+        } catch (err) {
+          retained = true;
+          console.error(`[model-auth] finish failed: ${(err as { category?: string } | null)?.category ?? "unknown"}`);
+        }
+      }
+      if (retained) return false;
+      try {
+        await client.dispose();
+        return true;
+      } catch (err) {
+        console.error(`[model-auth] dispose failed: ${(err as { category?: string } | null)?.category ?? "unknown"}`);
+        return false;
+      }
+    },
+  };
+  REAL_CONFIGURED_RUNS.add(run);
+  return run;
 }
 
 export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<RunAutonomousResult> {
@@ -768,7 +1203,17 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     groupingParent,
     retryPolicy,
     reviewFix,
+    agentConfig,
   } = resolveRunnerInputs(process.env);
+  // An opted-in run is validated here, before the branch, planning fetch, hooks, clone or any model work.
+  // Injection (opts.llmExecutor) never bypasses this; absent a snapshot the run is exactly the legacy one.
+  const configured = await prepareConfiguredRun({
+    env: process.env,
+    snapshot: agentConfig,
+    workspaceDir,
+    repositories: [`${githubOwner}/${githubRepo}`],
+    options: opts.configured,
+  });
   const branch = resolveBranch(workspaceDir, baseBranch, prNumber);
   const trustedReviewerDefinitions = await resolveTrustedReviewerDefinitions(reviewers);
 
@@ -819,13 +1264,15 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     appendPipelineOwnedGitInstructions(implementationPrompt, prNumber),
   );
   implementationPrompt = appendOperatorInstruction(implementationPrompt, commentInstruction);
-  const model = claudeModel || workflowModel || DEFAULT_MODEL;
+  // Explicit stage selections beat WORKFLOW.md, CLAUDE_MODEL and PROVIDER; legacy precedence is unchanged.
+  const model = configured ? configured.snapshot.stages.implementation.model : claudeModel || workflowModel || DEFAULT_MODEL;
   const activityReporting = opts.activityReporting ?? resolveActivityReporting(reviewFix, callbackUrl, progressToken, opts.fetchImpl);
   const activityReportingConfig: ActivityReportingConfig | undefined = activityReporting
     ? { attemptId: activityReporting.attemptId, sink: activityReporting.sink }
     : undefined;
-  const llmExecutor =
-    opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, logLevel, false, undefined, undefined, activityReportingConfig);
+  const llmExecutor = configured
+    ? configured.createExecutor({ workspaceDir, legacy: opts.llmExecutor, logLevel, activityReporting: activityReportingConfig })
+    : opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, logLevel, false, undefined, undefined, activityReportingConfig);
   const orchestratorUrl = process.env.ORCHESTRATOR_URL;
   const nonce = process.env.MACHINE_NONCE ?? "";
   if (orchestratorUrl && !nonce) {
@@ -862,7 +1309,8 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       githubToken,
       branch,
       baseBranch,
-      provider,
+      provider: configured ? configured.provider : provider,
+      agentConfig: configured?.snapshot,
       maxTurns,
       maxIterations,
       branchPrefix,
@@ -885,6 +1333,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   );
 
   let disposition: string | undefined;
+  let runCompleted = false;
   let referenceRepoResults: ReferenceRepoResult[] | undefined;
   // Read at each exit rather than once: the pipeline can throw after reference-repos
   // completed, so on the error path the outer value is still unset while the outputs exist.
@@ -899,6 +1348,11 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   const shellMode = devHarnessMode && process.env.AI_IMPLEMENT_SHELL_MODE === "true";
   // Snapshot env before the pipeline runs so we can diff after to find hook exports.
   const envSnap: Record<string, string | undefined> = shellMode ? { ...process.env } : {};
+
+  // The final result stands for the last implementation invocation the feedback loop recorded;
+  // per-pass records stay on the passes. No aggregation here (AII-954 owns it).
+  const finalAttribution = (): InvocationAttributionV1 | undefined =>
+    passAttribution(context.getOutputs("feedback-loop").passes);
 
   try {
     const pipeline = opts.pipeline ?? DEFAULT_PIPELINE;
@@ -954,6 +1408,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       await reportRunnerResult(reviewFix, outputCommit, process.env, {
         workspaceDir,
         phase: runnerPhase,
+        ...attributionField(finalAttribution()),
         outcome: "success",
         noWork: true,
         referenceRepoResults,
@@ -962,7 +1417,8 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         retryPolicy,
         fetchImpl: opts.fetchImpl,
       });
-      return { exitCode: 0 };
+      runCompleted = true;
+      return { exitCode: 0, ...attributionField(finalAttribution()) };
     }
 
     // A gap-fill run updates an existing PR and intentionally does not create a
@@ -1000,6 +1456,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         await reportRunnerResult(reviewFix, outputCommit, process.env, {
           workspaceDir,
           phase: runnerPhase,
+          ...attributionField(finalAttribution()),
           outcome: "failure",
           failureCode: "INSTALL_FAILED",
           failureReason,
@@ -1010,7 +1467,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
           retryPolicy,
           fetchImpl: opts.fetchImpl,
         });
-        return { exitCode: 0 };
+        return { exitCode: 0, ...attributionField(finalAttribution()) };
       }
 
       const statPasses = Array.isArray(fbOutputs.passes) ? (fbOutputs.passes as RunAutopsyPasses) : [];
@@ -1045,6 +1502,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       await reportRunnerResult(reviewFix, outputCommit, process.env, {
         workspaceDir,
         phase: runnerPhase,
+        ...attributionField(finalAttribution()),
         outcome: "success",
         prUrl,
         referenceRepoResults,
@@ -1053,7 +1511,8 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         retryPolicy,
         fetchImpl: opts.fetchImpl,
       });
-      return { exitCode: 0 };
+      runCompleted = true;
+      return { exitCode: 0, ...attributionField(finalAttribution()) };
     }
 
     // The pipeline completed mechanically but either the internal loop or the
@@ -1159,6 +1618,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     await reportRunnerResult(reviewFix, outputCommit, process.env, {
       workspaceDir,
       phase: runnerPhase,
+      ...attributionField(finalAttribution()),
       outcome: "failure",
       failureCode,
       failureReason,
@@ -1171,7 +1631,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       retryPolicy,
       fetchImpl: opts.fetchImpl,
     });
-    return { exitCode: 0 };
+    return { exitCode: 0, ...attributionField(finalAttribution()) };
   } catch (err) {
     console.error(`Pipeline failed: ${err}`);
     disposition = `failed: ${err instanceof Error ? err.message : String(err)}`;
@@ -1194,6 +1654,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     await reportRunnerResult(reviewFix, outputCommitOnError, process.env, {
       workspaceDir,
       phase: runnerPhase,
+      ...attributionField(errorAttribution(err) ?? finalAttribution()),
       outcome: "failure",
       failureReason: err instanceof Error ? err.message : String(err),
       failureCode: err instanceof SensitiveFilesError ? err.code
@@ -1206,7 +1667,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       retryPolicy,
       fetchImpl: opts.fetchImpl,
     });
-    return { exitCode: 1 };
+    return { exitCode: 1, ...attributionField(errorAttribution(err) ?? finalAttribution()) };
   } finally {
     try {
       if (timing.records().length > 0) {
@@ -1225,6 +1686,8 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         console.error(`teardown hook error: ${teardownErr}`);
       }
     }
+    // After teardown no repository child remains. Hold-or-release is decided inside finish().
+    await configured?.finish(runCompleted ? "completed" : "failed");
     if (activityReporting) {
       // Bounded best-effort, attempted on every exit path (success, coded failure,
       // and a caught pipeline exception) — mirrors the teardown hook immediately
@@ -1287,12 +1750,20 @@ export interface RunLocalAutonomousOptions {
   planningContext?: string;
   reporter?: StepReporter;
   llmExecutor?: LLMExecutor;
+  /** Opt-in stage configuration for a local run: the resolved snapshot plus a protected credential port. */
+  configured?: ConfiguredRunOptions;
+  /** Trusted env source for hosted configured grants; local full-loop owns preparation. */
+  configuredEnv?: NodeJS.ProcessEnv;
+  /** @internal Borrowed configured run owned by the local full-loop wrapper. */
+  prebuiltConfiguredRun?: ConfiguredRun;
   pipeline?: PipelineDefinition;
   runner?: PipelineRunner;
 }
 
 export interface RunLocalAutonomousResult {
   exitCode: number;
+  /** Optional diagnostic attribution (AII-946/954): the last implementation invocation; absent on legacy runs. */
+  attribution?: InvocationAttributionV1;
   approved: boolean;
   terminationReason: string;
   iterations: number;
@@ -1340,6 +1811,9 @@ export async function runAutonomousLocally(
   opts: RunLocalAutonomousOptions,
 ): Promise<RunLocalAutonomousResult> {
   const workspaceDir = opts.workspaceDir;
+  // Same validation and resolved settings as the managed entry; local runs read no envelope.
+  const configured = validateBorrowedConfiguredRun(opts.prebuiltConfiguredRun, opts.configured?.agentConfig)
+    ?? await prepareConfiguredRun({ env: opts.configuredEnv ?? {}, workspaceDir, options: opts.configured });
   prepareScratchExclusionIfGit(workspaceDir);
   const planningContext = opts.planningContext ?? "";
   const effectiveMaxTurns = opts.maxTurns ?? 50;
@@ -1376,8 +1850,10 @@ export async function runAutonomousLocally(
   implementationPrompt = appendValidationCommandDiscipline(
     appendPipelineOwnedGitInstructions(implementationPrompt, ""),
   );
-  const model = opts.model ?? workflowModel ?? DEFAULT_MODEL;
-  const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, "summary");
+  const model = configured ? configured.snapshot.stages.implementation.model : opts.model ?? workflowModel ?? DEFAULT_MODEL;
+  const llmExecutor = configured
+    ? configured.createExecutor({ workspaceDir, legacy: opts.llmExecutor, logLevel: "summary" })
+    : opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, "summary");
   const reporter = opts.reporter ?? new NoopStepReporter();
 
   const context = new DefaultPipelineContext(
@@ -1398,7 +1874,8 @@ export async function runAutonomousLocally(
       githubRepo: "",
       githubToken: "",
       branch: "",
-      provider: "anthropic",
+      provider: configured ? configured.provider : "anthropic",
+      agentConfig: configured?.snapshot,
       maxTurns: opts.maxTurns,
       maxIterations: opts.maxIterations,
       profiles: [],
@@ -1413,6 +1890,7 @@ export async function runAutonomousLocally(
   // Teardown runs only when setup ran successfully (or no setup was configured).
   // If setup is configured but fails, setupRan stays false and teardown is skipped.
   let setupRan = !setupHook;
+  let runCompleted = false;
 
   try {
     if (setupHook) {
@@ -1473,6 +1951,7 @@ export async function runAutonomousLocally(
             effectiveMaxTurns,
             effectiveMaxIterations,
             tokenSummary: buildTokenSummary(passes),
+            ...attributionField(passAttribution(passes)),
           };
         }
       } catch (err) {
@@ -1486,10 +1965,12 @@ export async function runAutonomousLocally(
           effectiveMaxTurns,
           effectiveMaxIterations,
           tokenSummary: buildTokenSummary(passes),
+          ...attributionField(passAttribution(passes)),
         };
       }
     }
 
+    runCompleted = approved;
     return {
       exitCode: 0,
       approved,
@@ -1500,6 +1981,7 @@ export async function runAutonomousLocally(
       effectiveMaxTurns,
       effectiveMaxIterations,
       tokenSummary: buildTokenSummary(passes),
+      ...attributionField(passAttribution(passes)),
     };
   } catch (err) {
     return {
@@ -1512,6 +1994,7 @@ export async function runAutonomousLocally(
       effectiveMaxTurns,
       effectiveMaxIterations,
       tokenSummary: null,
+      ...attributionField(errorAttribution(err) ?? passAttribution(context.getOutputs("feedback-loop").passes)),
     };
   } finally {
     if (setupRan && teardownHook) {
@@ -1524,6 +2007,7 @@ export async function runAutonomousLocally(
         console.error(`teardown hook error: ${teardownErr}`);
       }
     }
+    if (!opts.prebuiltConfiguredRun) await configured?.finish(runCompleted ? "completed" : "failed");
   }
 }
 

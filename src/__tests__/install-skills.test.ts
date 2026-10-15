@@ -1,11 +1,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawnSync: vi.fn(actual.spawnSync) };
+});
+
 const isWindows = process.platform === "win32";
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { installSkillsStep } from "../pipeline/steps/install-skills.js";
+import { installSkillsStep, skillAgentsForSnapshot } from "../pipeline/steps/install-skills.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import type { LLMExecutor } from "../pipeline/types.js";
@@ -296,5 +301,134 @@ describe("installSkillsStep", () => {
     expect(existsSync(join(homeDir, ".claude", "skills", "alpha", "SKILL.md"))).toBe(true);
     expect(existsSync(join(homeDir, ".claude", "skills", "beta", "SKILL.md"))).toBe(true);
     expect(existsSync(join(homeDir, ".claude", "skills", "gamma", "SKILL.md"))).toBe(true);
+  });
+});
+
+describe("installSkillsStep git subprocess environment", () => {
+  const SENTINELS: Record<string, string> = {
+    ANTHROPIC_API_KEY: "sentinel-anthropic",
+    CLAUDE_CODE_OAUTH_TOKEN: "sentinel-oauth",
+    RUN_PROGRESS_TOKEN: "sentinel-progress",
+    RUN_PUBLICATION_TOKEN: "sentinel-publication",
+    RUN_TOKEN: "sentinel-run",
+    NPM_TOKEN: "sentinel-npm",
+    GH_TOKEN: "sentinel-gh",
+    GITHUB_TOKEN: "sentinel-github",
+    AI_IMPLEMENT_RUN_CONFIG: "sentinel-run-config",
+    AI_IMPLEMENT_FORWARDED_SECRETS: "SENTINEL_FORWARDED",
+    SENTINEL_FORWARDED: "sentinel-forwarded",
+    GIT_DEPENDENCY_TOKEN_FILE: "/sentinel/dependency-cache.json",
+    GIT_DEPENDENCY_CALLBACK_URL: "https://sentinel.invalid",
+    COMPOSER_AUTH: '{"sentinel":"composer"}',
+  };
+  const saved: Record<string, string | undefined> = {};
+  let dir: string;
+  let home: string;
+
+  beforeEach(() => {
+    dir = "";
+    home = mkdtempSync(join(tmpdir(), "skills-home-env-"));
+    for (const [k, v] of Object.entries(SENTINELS)) {
+      saved[k] = process.env[k];
+      process.env[k] = v;
+    }
+  });
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    try {
+      rmSync(home, { recursive: true, force: true });
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    } catch { /* ignore */ }
+  });
+
+  it("passes a sentinel-free env to the clone and rev-parse spawns", async () => {
+    dir = makeSkillsRepo({ "alpha/SKILL.md": "# Alpha" });
+    vi.mocked(spawnSync).mockClear();
+    await installSkillsStep.run(
+      ctx(),
+      { skillsRepoUrl: dir, githubToken: "x", homeDir: home },
+      new NoopStepReporter(),
+    );
+    const calls = vi.mocked(spawnSync).mock.calls.filter((c) => c[0] === "git");
+    const subcommands = calls.map((c) => (c[1] as string[])[0]);
+    expect(subcommands).toContain("clone");
+    expect(subcommands).toContain("rev-parse");
+    for (const call of calls) {
+      const env = (call[2] as { env?: NodeJS.ProcessEnv }).env;
+      expect(env, `git ${(call[1] as string[])[0]} must pass an explicit env`).toBeDefined();
+      for (const key of Object.keys(SENTINELS)) expect(env![key], key).toBeUndefined();
+    }
+  });
+});
+
+describe("installSkillsStep agent destinations", () => {
+  const snap = (agents: Record<string, string>) =>
+    ({ stages: Object.fromEntries(Object.entries(agents).map(([k, a]) => [k, { agent: a }])) }) as never;
+
+  it("skillAgentsForSnapshot defaults to claude and dedups across stages", () => {
+    expect(skillAgentsForSnapshot(undefined)).toEqual(["claude"]);
+    expect(skillAgentsForSnapshot(snap({ planning: "claude", implement: "claude", review: "claude" }))).toEqual(["claude"]);
+    expect(skillAgentsForSnapshot(snap({ planning: "codex", implement: "codex", review: "codex" }))).toEqual(["codex"]);
+    expect(skillAgentsForSnapshot(snap({ planning: "claude", implement: "codex", review: "claude" })).sort()).toEqual([
+      "claude",
+      "codex",
+    ]);
+  });
+
+  it("default (Claude-only) install does not create the Codex directory", async () => {
+    repoDir = makeSkillsRepo({ "alpha/SKILL.md": "# Alpha" });
+    await installSkillsStep.run(ctx(), { skillsRepoUrl: repoDir, githubToken: "x", homeDir }, new NoopStepReporter());
+    expect(existsSync(join(homeDir, ".claude", "skills", "alpha", "SKILL.md"))).toBe(true);
+    expect(existsSync(join(homeDir, ".agents"))).toBe(false);
+  });
+
+  it("installs identical content for both agents and ignores CODEX_HOME", async () => {
+    repoDir = makeSkillsRepo({ "alpha/SKILL.md": "# Alpha\nbody" });
+    const codexHome = mkdtempSync(join(tmpdir(), "codex-home-"));
+    const prev = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = codexHome;
+    try {
+      const out = await installSkillsStep.run(
+        ctx(),
+        { skillsRepoUrl: repoDir, githubToken: "x", homeDir, agents: ["claude", "codex", "codex"] },
+        new NoopStepReporter(),
+      );
+      expect(out.skillsInstalled).toBe(1);
+      for (const base of [".claude", ".agents"]) {
+        expect(readFileSync(join(homeDir, base, "skills", "alpha", "SKILL.md"), "utf-8")).toBe("# Alpha\nbody");
+      }
+      expect(readdirSync(codexHome)).toEqual([]);
+    } finally {
+      if (prev === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = prev;
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it("excludes synthetic model credentials from the clone child env", async () => {
+    repoDir = makeSkillsRepo({ "alpha/SKILL.md": "# Alpha" });
+    const saved = { ...process.env };
+    process.env.OPENAI_API_KEY = "sk-synthetic-openai";
+    process.env.CODEX_API_KEY = "synthetic-codex";
+    process.env.AI_IMPLEMENT_RUN_CONFIG = "synthetic-run-config";
+    try {
+      const spy = vi.mocked(spawnSync);
+      spy.mockClear();
+      await installSkillsStep.run(
+        ctx(),
+        { skillsRepoUrl: repoDir, githubToken: "x", homeDir, agents: ["codex"] },
+        new NoopStepReporter(),
+      );
+      const clone = spy.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone");
+      const env = (clone?.[2] as { env?: Record<string, string> }).env ?? {};
+      expect(env.OPENAI_API_KEY).toBeUndefined();
+      expect(env.CODEX_API_KEY).toBeUndefined();
+      expect(env.AI_IMPLEMENT_RUN_CONFIG).toBeUndefined();
+    } finally {
+      process.env = saved;
+    }
   });
 });

@@ -2,6 +2,7 @@ import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { FailureRecord } from "./pipeline/failure-classification.js";
 import type { FindingDisposition } from "./pipeline/finding-dispositions.js";
+import { sanitizeAttribution, type InvocationAttributionV1 } from "./pipeline/types.js";
 import type { CycleSummary } from "./pipeline/cycle-summary.js";
 import type { ReferenceRepoResult } from "./reference-repos.js";
 import type { ReviewFixResultMetadataV1 } from "./review-fix-contract.js";
@@ -165,6 +166,8 @@ export async function postRunnerResult(params: {
    * orchestrator to record them against.
    */
   cycleSummaries?: CycleSummary[];
+  /** Optional diagnostic attribution (AII-946). Sanitized before serialization; dropped if malformed. */
+  attribution?: InvocationAttributionV1;
   /** Head SHA the internal review approved when the run ended `external_review_pending`. */
   externalReviewPending?: { headSha: string };
   /** SHA of the snapshot commit pushed by a kg-refresh runner. Only meaningful for phase=kg-refresh. */
@@ -232,6 +235,11 @@ export async function postRunnerResult(params: {
   }
   if (params.cycleSummaries && params.cycleSummaries.length > 0) {
     body.cycleSummaries = params.cycleSummaries;
+  }
+  if (params.attribution !== undefined) {
+    const attribution = sanitizeAttribution(params.attribution);
+    if (attribution) body.attribution = attribution;
+    else console.warn("[runner-callback] dropping invalid attribution before delivery");
   }
   if (params.externalReviewPending) body.externalReviewPending = params.externalReviewPending;
   if (params.snapshotCommit) body.snapshotCommit = params.snapshotCommit;

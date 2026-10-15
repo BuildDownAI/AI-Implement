@@ -162,6 +162,21 @@ const STEP: Step = {
   logs_url: null,
 };
 
+const validAttribution = () => ({
+  version: 1,
+  invocationId: "inv-1",
+  stage: "implementation",
+  snapshotId: "snap-1",
+  agent: "codex",
+  provider: "openai",
+  model: "gpt-synthetic",
+  profileId: null,
+  authMode: "codex-subscription",
+  limit: { kind: "timeout_ms", value: 60000 },
+  outcome: "error",
+  usage: { availability: "unavailable", tokensIn: null, tokensOut: null, costUsd: null, costStatus: "unavailable" },
+});
+
 describe("handleRunnerResult — auth", () => {
   it("returns 401 when Authorization header is missing", async () => {
     const res = await runnerCallback.handleRunnerResult({
@@ -3487,8 +3502,12 @@ describe("handleRunnerResult — call attribution", () => {
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("result refused dispatch=unknown"));
   });
 
-  // These two consume the token and then bail, so without a line the burn is invisible.
-  it("logs a burned token on phase_mismatch", async () => {
+  const consumedAt = (dispatchId: string) =>
+    (dedup.getDb().prepare("SELECT consumed_at FROM runner_tokens WHERE dispatch_id = ?").get(dispatchId) as {
+      consumed_at: number | null;
+    }).consumed_at;
+
+  it("rejects phase_mismatch without consuming the token, and a corrected retry consumes once", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i",
@@ -3497,22 +3516,32 @@ describe("handleRunnerResult — call attribution", () => {
       ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
       secret: SECRET,
     });
+    const provider = new FakeProvider();
+    const post = (body: Record<string, unknown>) =>
+      runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: body as never,
+        secret: SECRET,
+        resolveProvider: makeResolve(provider),
+      });
 
-    const res = await runnerCallback.handleRunnerResult({
-      authorization: `Bearer ${token}`,
-      body: { phase: "implementation", outcome: "success", prUrl: "https://github.com/o/r/pull/1", comments: [] },
-      secret: SECRET,
-      resolveProvider: makeResolve(new FakeProvider()),
-    });
-
+    const res = await post({ phase: "implementation", outcome: "success", prUrl: "https://github.com/o/r/pull/1", comments: [] });
     expect(res.status).toBe(400);
     expect(res.body.error).toBe("phase_mismatch");
+    expect(consumedAt(dispatchId)).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining(`result burned dispatch=${dispatchId} reason=phase_mismatch`),
+      expect.stringContaining(`result rejected dispatch=${dispatchId} reason=phase_mismatch`),
     );
+
+    const ok = await post({ phase: "planning", outcome: "success", comments: [] });
+    expect(ok.status).toBe(200);
+    expect(consumedAt(dispatchId)).not.toBeNull();
+    const replay = await post({ phase: "planning", outcome: "success", comments: [] });
+    expect(replay.status).toBe(409);
+    expect(replay.body.error).toBe("already_consumed");
   });
 
-  it("logs a burned token on missing_prUrl", async () => {
+  it("rejects missing_prUrl without consuming the token, and a corrected retry succeeds", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i",
@@ -3521,19 +3550,66 @@ describe("handleRunnerResult — call attribution", () => {
       ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
       secret: SECRET,
     });
+    const post = (body: Record<string, unknown>) =>
+      runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: body as never,
+        secret: SECRET,
+        resolveProvider: makeResolve(new FakeProvider()),
+      });
+
+    const res = await post({ phase: "implementation", outcome: "success", comments: [] });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("missing_prUrl");
+    expect(consumedAt(dispatchId)).toBeNull();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining(`result rejected dispatch=${dispatchId} reason=missing_prUrl`),
+    );
+
+    const ok = await post({ phase: "implementation", outcome: "success", prUrl: "https://github.com/o/r/pull/1", comments: [] });
+    expect(ok.status).toBe(200);
+    expect(consumedAt(dispatchId)).not.toBeNull();
+  });
+
+  it("returns 401 missing_row for a valid token whose row was deleted", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+    dedup.getDb().prepare("DELETE FROM runner_tokens WHERE dispatch_id = ?").run(dispatchId);
 
     const res = await runnerCallback.handleRunnerResult({
       authorization: `Bearer ${token}`,
-      body: { phase: "implementation", outcome: "success", comments: [] },
+      body: { phase: "planning", outcome: "success", comments: [] },
       secret: SECRET,
       resolveProvider: makeResolve(new FakeProvider()),
     });
+    expect(res.status).toBe(401);
+    expect(res.body.error).toBe("missing_row");
+  });
 
-    expect(res.status).toBe(400);
-    expect(res.body.error).toBe("missing_prUrl");
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining(`result burned dispatch=${dispatchId} reason=missing_prUrl`),
-    );
+  it("lets only one of two concurrent valid posts win", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const post = () =>
+      runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: { phase: "planning", outcome: "success", comments: [] },
+        secret: SECRET,
+        resolveProvider: makeResolve(new FakeProvider()),
+      });
+    const results = await Promise.all([post(), post()]);
+    expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
   });
 });
 
@@ -4808,6 +4884,38 @@ describe("handleRunnerResult — cycle summary durable evidence (AII-801)", () =
     warnSpy.mockRestore();
   });
 
+  it("keeps terminal delivery when attribution is malformed, oversized or of unknown version, warning by count only", async () => {
+    const planted = "sk-SYNTHETICSECRET123456";
+    const bad = [
+      { ...validAttribution(), version: 2 },
+      { ...validAttribution(), apiKey: planted },
+      { ...validAttribution(), model: "x".repeat(5000) },
+      "not-an-object",
+    ];
+    for (const attribution of bad) {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const res = await postResult({ attribution: attribution as never });
+      expect(res.status).toBe(200);
+      const warned = warnSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(warned).toContain("Dropped 1 invalid attribution record(s)");
+      expect(warned).not.toContain(planted);
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("accepts valid attribution without warning", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const res = await postResult({ attribution: validAttribution() as never });
+    expect(res.status).toBe(200);
+    expect(warnSpy.mock.calls.join(" ")).not.toContain("attribution");
+    warnSpy.mockRestore();
+  });
+
+  it("accepts INVOCATION_TIMEOUT as a failure code with the existing error outcome", async () => {
+    const res = await postResult({ outcome: "failure", failureCode: "INVOCATION_TIMEOUT", prUrl: undefined });
+    expect(res.status).toBe(200);
+  });
+
   it("never records a cycle summary for a Legacy result with no reviewFix marker", async () => {
     const summary = baseCycleSummary();
 
@@ -4878,6 +4986,18 @@ describe("handleRunnerCycleSummary — independent pilot evidence", () => {
     expect(post(summary)).toMatchObject({ status: 200, body: { outcome: "duplicate" } });
     expect(post({ ...summary, completedAt: summary.completedAt + 1 }).status).toBe(409);
     expect(reviewFixEvidence.getReviewFixCycleSummary(attemptId, 1)?.completedAt).toBe(summary.completedAt);
+  });
+
+  it("strips malformed attribution and still records the cycle summary", () => {
+    const token = preparedToken();
+    const res = runnerCallback.handleRunnerCycleSummary({
+      authorization: `Bearer ${token}`, secret: SECRET,
+      body: { summary: { ...summary, attribution: { version: 99, model: "sk-SYNTHETICSECRET123456" } } },
+    });
+    expect(res).toMatchObject({ status: 200, body: { outcome: "recorded" } });
+    const stored = reviewFixEvidence.getReviewFixCycleSummary(attemptId, 1);
+    expect(stored?.tests).toEqual(summary.tests);
+    expect((stored as { attribution?: unknown } | null)?.attribution).toBeUndefined();
   });
 
   it("rejects unprepared credentials and oversized evidence", () => {
@@ -5242,5 +5362,154 @@ describe("handleRunnerActivity (AII-777/AII-803)", () => {
     const second = await runnerCallback.handleRunnerActivity({ authorization: `Bearer ${token}`, secret: SECRET, body, onReviewFixActivity });
     expect(second.status).toBe(200);
     expect(second.body.outcome).toBe("duplicate");
+  });
+});
+
+describe("handleRunnerResult — attribution persistence (AII-971)", () => {
+  const PLANTED = "sk-SYNTHETICSECRET123456";
+  const stage = (n: string) => ({
+    sel: { agent: "codex", provider: "openai", model: `m-${n}`, accountProfileId: `p-${n}`, invocationTimeoutMs: 60_000 },
+    src: { agent: "project", provider: "project", model: "project", accountProfileId: "project", invocationTimeoutMs: "job-deadline" },
+    prof: { id: `p-${n}`, identity: "acct", revision: 2, agent: "codex", provider: "openai", authMode: "openai-api-key" },
+  });
+
+  function storeSnapshot(dispatchId: string, snapshotId = "snap-1") {
+    const s = { planning: stage("planning"), implementation: stage("implementation"), review: stage("review") };
+    const pick = (k: "sel" | "src" | "prof") => ({ planning: s.planning[k], implementation: s.implementation[k], review: s.review[k] });
+    dedup.getDb().prepare(
+      `INSERT INTO run_agent_config_snapshots
+         (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+       VALUES (?, ?, 'ENG', ?, ?, ?, 1)`,
+    ).run(
+      snapshotId,
+      dispatchId,
+      JSON.stringify({ stages: pick("sel"), profiles: pick("prof") }),
+      JSON.stringify(pick("src")),
+      JSON.stringify({
+        orchestratorDefault: { configRevisionId: "r1", revision: 1 },
+        project: { configRevisionId: "r2", revision: 1 },
+      }),
+    );
+  }
+
+  const claim = (over: Record<string, unknown> = {}) => ({
+    version: 1,
+    invocationId: "inv-1",
+    stage: "implementation",
+    snapshotId: "snap-1",
+    agent: "codex",
+    provider: "openai",
+    model: "m-implementation",
+    profileId: "p-implementation",
+    authMode: "openai-api-key",
+    limit: null,
+    outcome: "success",
+    usage: { availability: "complete", tokensIn: 100, tokensOut: 10, costUsd: 0.5, costStatus: "reported" },
+    ...over,
+  });
+
+  async function deliver(attribution: unknown, opts: { snapshot?: boolean; extra?: Record<string, unknown>; dispatchId?: string } = {}) {
+    const dispatchId = opts.dispatchId ?? "disp-attr";
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i", mappingTeamKey: "ENG", phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET, dispatchId,
+    });
+    if (!log.findLogIdByDispatchId(dispatchId)) {
+      log.appendLog({ issueId: "i", issueIdentifier: "ENG-1", issueTitle: "t", teamKey: "ENG", repo: "o/r", dispatchId, executionMode: "github-actions", phase: "implementation" });
+    }
+    if (opts.snapshot !== false && !dedup.getDb().prepare("SELECT 1 FROM run_agent_config_snapshots WHERE dispatch_id = ?").get(dispatchId)) {
+      storeSnapshot(dispatchId, `snap-${dispatchId}`);
+    }
+    // The claim names the dispatch's own snapshot unless a test deliberately points it elsewhere.
+    if (attribution && typeof attribution === "object" && (attribution as { snapshotId?: string }).snapshotId === "snap-1") {
+      attribution = { ...(attribution as object), snapshotId: `snap-${dispatchId}` };
+    }
+    return runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1", attribution: attribution as never, ...(opts.extra ?? {}) },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+  }
+
+  const rows = () => dedup.getDb().prepare("SELECT * FROM model_invocation_attribution").all() as Array<Record<string, string | number | null>>;
+
+  it("persists identity from the stored snapshot and reads it back on the job", async () => {
+    const res = await deliver(claim());
+    expect(res.status).toBe(200);
+    const [row] = rows();
+    expect(rows()).toHaveLength(1);
+    expect(row).toMatchObject({ stage: "implementation", profile_id: "p-implementation", profile_revision: 2, agent: "codex", provider: "openai", model: "m-implementation", auth_mode: "openai-api-key", snapshot_id: "snap-disp-attr", status: "succeeded" });
+    const job = log.getJobByDispatchId("disp-attr")!;
+    expect(job.attribution).toMatchObject({ invocationId: "inv-1", usage: { availability: "complete", tokensIn: 100, tokensOut: 10, costUsd: 0.5 } });
+  });
+
+  it("does not store a clean claim from another snapshot", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const res = await deliver(claim({ snapshotId: "other-snap" }));
+    expect(res.status).toBe(200);
+    expect(rows()).toHaveLength(0);
+    const job = log.getJobByDispatchId("disp-attr")!;
+    expect(job.attribution).toBeNull();
+    expect(job.status).toBe("completed");
+    expect(warn.mock.calls.join(" ")).toContain("not matching the dispatch snapshot");
+    expect(warn.mock.calls.join(" ")).not.toContain("invalid attribution");
+  });
+
+  it("does not store a secret-shaped claim from another snapshot", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const res = await deliver(claim({ snapshotId: "other-snap", model: PLANTED }));
+    expect(res.status).toBe(200);
+    expect(rows()).toHaveLength(0);
+    expect(log.getJobByDispatchId("disp-attr")!.attribution).toBeNull();
+    expect(warn.mock.calls.join(" ")).not.toContain(PLANTED);
+  });
+
+  it("stores the snapshot identity, not a disagreeing claim", async () => {
+    await deliver(claim({ model: "claimed-other-model", provider: "anthropic", agent: "claude" }));
+    expect(rows()[0]).toMatchObject({ model: "m-implementation", provider: "openai", agent: "codex" });
+    expect(JSON.parse(rows()[0].usage_json as string).attribution).toBe("mismatch");
+  });
+
+  it("keeps partial and unavailable usage as null, never zero or derived cost", async () => {
+    await deliver(claim({ invocationId: "inv-partial", usage: { availability: "partial", tokensIn: 5, tokensOut: null, costUsd: null, costStatus: "unavailable" } }), { dispatchId: "d-partial" });
+    await deliver(claim({ invocationId: "inv-none", usage: { availability: "unavailable", tokensIn: null, tokensOut: null, costUsd: null, costStatus: "unavailable" } }), { dispatchId: "d-none" });
+    expect(log.getJobByDispatchId("d-partial")!.attribution!.usage).toEqual({ availability: "partial", tokensIn: 5, tokensOut: null, costUsd: null, costStatus: "unavailable" });
+    expect(log.getJobByDispatchId("d-none")!.attribution!.usage).toEqual({ availability: "unavailable", tokensIn: null, tokensOut: null, costUsd: null, costStatus: "unavailable" });
+  });
+
+  it("records a timeout as timed_out with the actual limit, and no invented turns", async () => {
+    await deliver(claim({ outcome: "error", limit: { kind: "timeout_ms", value: 60000 }, usage: null }), { extra: { outcome: "failure", failureCode: "INVOCATION_TIMEOUT", prUrl: undefined } });
+    expect(rows()[0].status).toBe("timed_out");
+    expect(log.getJobByDispatchId("disp-attr")!.attribution).toMatchObject({ outcome: "error", limit: { kind: "timeout_ms", value: 60000 }, usage: { availability: "unavailable", tokensIn: null, tokensOut: null, costUsd: null, costStatus: "unavailable" } });
+    expect(rows()[0].usage_json as string).not.toContain("numTurns");
+  });
+
+  it("does not double-count a repeated invocation id", async () => {
+    await deliver(claim());
+    await deliver(claim(), { dispatchId: "disp-2" });
+    expect(rows()).toHaveLength(1);
+  });
+
+  it("keeps legacy dispatches (no snapshot) readable with no row and no inferred cost", async () => {
+    const res = await deliver(claim(), { snapshot: false });
+    expect(res.status).toBe(200);
+    expect(rows()).toHaveLength(0);
+    expect(log.getJobByDispatchId("disp-attr")!.attribution).toBeNull();
+  });
+
+  it("still completes the terminal callback when persistence throws, without echoing payload", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    dedup.getDb().exec("DROP TABLE model_invocation_attribution");
+    const res = await deliver(claim({ model: "m-implementation" }));
+    expect(res.status).toBe(200);
+    expect(warn.mock.calls.map((c) => c.join(" ")).join("\n")).toContain("Could not persist 1 attribution record");
+  });
+
+  it("never persists sentinel credentials", async () => {
+    await deliver(claim({ invocationId: PLANTED, profileId: PLANTED }));
+    await deliver(claim({ apiKey: PLANTED }), { dispatchId: "d2" });
+    expect(JSON.stringify(rows())).not.toContain(PLANTED);
+    expect(rows()).toHaveLength(0);
   });
 });

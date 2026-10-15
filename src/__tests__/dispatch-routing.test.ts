@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi, onTestFinished } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
@@ -17,6 +17,7 @@ import { shouldReleaseAdmissionOnDispatchError } from "../index.js";
 // real transactional one, not a stub.
 vi.mock("../github-app-auth.js", () => ({
   getInstallationToken: vi.fn(),
+  getScopedInstallationToken: vi.fn(),
   getAppSlug: vi.fn(),
 }));
 
@@ -34,7 +35,17 @@ vi.mock("../local-docker.js", () => ({
 // to reach postWorkflowDispatch. Everything else from these modules stays real.
 vi.mock("../repo-image.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../repo-image.js")>();
-  return { ...actual, resolveRunnerImageForDispatch: vi.fn() };
+  return { ...actual, resolveRunnerImageForDispatch: vi.fn(), resolveSessionImage: vi.fn() };
+});
+
+vi.mock("../fly-machines.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../fly-machines.js")>();
+  return { ...actual, createMachine: vi.fn(), listAppSecrets: vi.fn() };
+});
+
+vi.mock("../managed-dispatch-auth.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../managed-dispatch-auth.js")>();
+  return { ...actual, isManagedProject: vi.fn(actual.isManagedProject) };
 });
 
 vi.mock("../workflow-probe.js", async (importOriginal) => {
@@ -51,7 +62,13 @@ vi.mock("../workflow-probe.js", async (importOriginal) => {
 // already exists, and those tests need to control that answer without hitting GitHub.
 vi.mock("../github.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../github.js")>();
-  return { ...actual, postWorkflowDispatch: vi.fn(), getBranchSha: vi.fn(actual.getBranchSha) };
+  // getRepoDefaultBranch is mocked so no test here reaches GitHub over real HTTP.
+  return {
+    ...actual,
+    postWorkflowDispatch: vi.fn(),
+    getBranchSha: vi.fn(actual.getBranchSha),
+    getRepoDefaultBranch: vi.fn(),
+  };
 });
 
 // Only mocked (as a spy wrapping the real implementation) for the "defers
@@ -425,7 +442,7 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
   });
 
   it("dispatchLocalDocker: a throw before markLaunchAttempted (installation-token mint failure) releases the reservation", async () => {
-    vi.mocked(githubAppAuth.getInstallationToken).mockRejectedValue(new Error("mint failed"));
+    vi.mocked(githubAppAuth.getScopedInstallationToken).mockRejectedValue(new Error("mint failed"));
     const config = {
       githubAppId: "id",
       githubAppPrivateKey: "key",
@@ -439,6 +456,7 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
     ).rejects.toThrow("mint failed");
 
     expect(localDocker.startLocalRunnerContainer).not.toHaveBeenCalled();
+    expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus", { repositories: ["AI-Implement"] });
 
     const retry = gate.acquireDispatch({
       dispatchId: "retry-local-before",
@@ -485,7 +503,7 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
   });
 
   it("dispatchLocalDocker: a throw after markLaunchAttempted (container launch failure) holds the reservation — docker's CLI response can be lost after the container was actually created (AII-783 review, second round, on PR #681)", async () => {
-    vi.mocked(githubAppAuth.getInstallationToken).mockResolvedValue("gh-token");
+    vi.mocked(githubAppAuth.getScopedInstallationToken).mockResolvedValue({ token: "gh-token", expiresAt: "", installationId: 1 } as never);
     vi.mocked(localDocker.startLocalRunnerContainer).mockRejectedValue(new Error("docker run failed"));
     const config = {
       githubAppId: "id",
@@ -500,6 +518,10 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
     ).rejects.toThrow("docker run failed");
 
     expect(localDocker.startLocalRunnerContainer).toHaveBeenCalledOnce();
+    expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus", { repositories: ["AI-Implement"] });
+    expect(vi.mocked(localDocker.startLocalRunnerContainer).mock.calls[0]![0]).toEqual(
+      expect.objectContaining({ githubToken: "gh-token" }),
+    );
 
     // The original reservation is still occupying the issue's slot — a same-issue
     // retry must not be admitted a second time until the matching Legacy monitor
@@ -585,6 +607,213 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
   });
 });
 
+// AII-853: Fly and local children boot with a token scoped to the target repository
+// alone, for implementation, shadow and planning dispatches. A narrow-mint failure
+// launches nothing and never substitutes the installation-wide token.
+describe("Fly and local boot tokens are scoped to the target repository (AII-853)", () => {
+  let dbPath: string;
+  let dedup: typeof DedupModule;
+  let gate: typeof GateModule;
+  let indexModule: typeof import("../index.js");
+  let githubAppAuth: typeof import("../github-app-auth.js");
+  let localDocker: typeof import("../local-docker.js");
+  let flyMachines: typeof import("../fly-machines.js");
+  let repoImage: typeof import("../repo-image.js");
+
+  const issue: TicketIssue = {
+    id: "issue-scoped-boot-1",
+    identifier: "AII-853",
+    title: "Test issue",
+    description: "desc",
+    scopeKey: "AII",
+    nativeStatus: "Todo",
+  };
+
+  const mapping = {
+    owner: "eudoxus",
+    repo: "AI-Implement",
+    workflowFile: "claude-implement.yml",
+    planningWorkflowFile: "claude-plan.yml",
+    defaultBranch: "main",
+    maxInProgressAiIssues: 1,
+    provider: "anthropic",
+    sessionMode: "default",
+    machineCpus: 1,
+    machineMemoryMb: 512,
+    extraEnv: {},
+  } as unknown as RepoMapping;
+
+  const provider = {
+    id: "jira",
+    issueUrl: vi.fn().mockReturnValue("https://example.test/AII-853"),
+    markImplementationFailed: vi.fn(),
+    markPlanningFailed: vi.fn(),
+    markPlanningStarted: vi.fn().mockResolvedValue(undefined),
+    markImplementing: vi.fn().mockResolvedValue(undefined),
+    postComment: vi.fn().mockResolvedValue(undefined),
+  } as unknown as TicketingProvider;
+
+  const prior = { count: 0, lastDispatchedAt: null };
+  const config = {
+    githubAppId: "id",
+    githubAppPrivateKey: "key",
+    anthropicApiKey: "sk-test",
+    flySessionsToken: "fly-token",
+    flySessionsApp: "fly-app",
+    localRunnerImage: "test-image",
+    localRunnerOrchestratorUrl: "http://localhost:9000",
+    healthPort: 8080,
+  } as unknown as AppConfig;
+
+  const planningCtx = (execPath: "fly-machines" | "local-docker") => ({
+    execPath,
+    runnerMode: "default",
+    resolvedPlanningBranch: mapping.defaultBranch,
+    planningFieldValue: null,
+  });
+
+  const SCOPED_REQUEST = { repositories: ["AI-Implement"] };
+
+  beforeEach(async () => {
+    vi.resetModules();
+    dbPath = path.join(
+      os.tmpdir(),
+      `dispatch-scoped-boot-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
+    );
+    process.env.DEDUP_DB_PATH = dbPath;
+    dedup = await import("../dedup.js");
+    gate = await import("../dispatch-gate.js");
+    (await import("../dispatch-breaker.js")).initDispatchBreakerTable();
+    (await import("../log.js")).initLogTable();
+    (await import("../config.js")).initMappingsTable();
+    githubAppAuth = await import("../github-app-auth.js");
+    localDocker = await import("../local-docker.js");
+    flyMachines = await import("../fly-machines.js");
+    repoImage = await import("../repo-image.js");
+    indexModule = await import("../index.js");
+
+    vi.mocked(githubAppAuth.getInstallationToken).mockReset().mockResolvedValue("broad-token");
+    vi.mocked(githubAppAuth.getScopedInstallationToken).mockReset().mockResolvedValue({ token: "scoped-token", expiresAt: "", installationId: 1 } as never);
+    vi.mocked(repoImage.resolveSessionImage).mockReset().mockResolvedValue({ image: "session-image", source: "default" } as never);
+    vi.mocked(flyMachines.listAppSecrets).mockReset().mockResolvedValue([]);
+    vi.mocked(flyMachines.createMachine).mockReset().mockResolvedValue({ id: "m1", name: "machine-1" } as never);
+    vi.mocked(localDocker.startLocalRunnerContainer).mockReset().mockResolvedValue({ containerId: "c1234567890123", containerName: "container-1" } as never);
+  });
+
+  afterEach(() => {
+    dedup.closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  function expectScopedOnly() {
+    expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus", SCOPED_REQUEST);
+    expect(githubAppAuth.getInstallationToken).not.toHaveBeenCalled();
+  }
+
+  function expectPlanningBootTokenSplit() {
+    expect(githubAppAuth.getInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus");
+    expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus", SCOPED_REQUEST);
+  }
+
+  function flyConfigJson(): string {
+    expect(flyMachines.createMachine).toHaveBeenCalledOnce();
+    return JSON.stringify(vi.mocked(flyMachines.createMachine).mock.calls[0]![2]);
+  }
+
+  function expectFreeSlot(backend: "fly-machines" | "local-docker", kind: "implementation" | "planning") {
+    const retry = gate.acquireDispatch({
+      dispatchId: `retry-${backend}-${kind}`,
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      kind,
+      teamKey: issue.scopeKey,
+      maxInProgressAiIssues: 1,
+      backend,
+    });
+    expect(retry.ok).toBe(true);
+  }
+
+  it("Fly implementation boots with the scoped token", async () => {
+    await indexModule.dispatchFlyMachine(config, provider, issue, mapping, prior, "default", mapping.defaultBranch, null);
+
+    expectScopedOnly();
+    const json = flyConfigJson();
+    expect(json).toContain("scoped-token");
+    expect(json).not.toContain("broad-token");
+    expect(repoImage.resolveSessionImage).toHaveBeenCalledWith(expect.objectContaining({ token: "scoped-token" }));
+  });
+
+  it("Fly shadow implementation boots with the scoped token", async () => {
+    await indexModule.dispatchFlyMachine(config, provider, issue, mapping, prior, "default", mapping.defaultBranch, null, true);
+
+    expectScopedOnly();
+    const json = flyConfigJson();
+    expect(json).toContain("scoped-token");
+    expect(json).not.toContain("broad-token");
+  });
+
+  it("Fly planning boots with the scoped token", async () => {
+    await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx("fly-machines"));
+
+    expectPlanningBootTokenSplit();
+    const json = flyConfigJson();
+    expect(json).toContain("scoped-token");
+    expect(json).not.toContain("broad-token");
+  });
+
+  it("local implementation boots with the scoped token", async () => {
+    await indexModule.dispatchLocalDocker(config, provider, issue, mapping, prior, "default", mapping.defaultBranch, null);
+
+    expectScopedOnly();
+    expect(vi.mocked(localDocker.startLocalRunnerContainer).mock.calls[0]![0]).toEqual(
+      expect.objectContaining({ githubToken: "scoped-token" }),
+    );
+  });
+
+  it("local planning boots with the scoped token", async () => {
+    await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx("local-docker"));
+
+    expectPlanningBootTokenSplit();
+    expect(vi.mocked(localDocker.startLocalRunnerContainer).mock.calls[0]![0]).toEqual(
+      expect.objectContaining({ githubToken: "scoped-token", phase: "planning" }),
+    );
+  });
+
+  it("Fly implementation: a narrow-mint failure launches nothing, falls back to nothing and frees the slot", async () => {
+    vi.mocked(githubAppAuth.getScopedInstallationToken).mockRejectedValue(new Error("mint failed"));
+
+    await expect(
+      indexModule.dispatchFlyMachine(config, provider, issue, mapping, prior, "default", mapping.defaultBranch, null),
+    ).rejects.toThrow("mint failed");
+
+    expect(flyMachines.createMachine).not.toHaveBeenCalled();
+    expect(githubAppAuth.getInstallationToken).not.toHaveBeenCalled();
+    expectFreeSlot("fly-machines", "implementation");
+  });
+
+  it("Fly planning: a narrow-mint failure launches nothing and falls back to nothing", async () => {
+    vi.mocked(githubAppAuth.getScopedInstallationToken).mockRejectedValue(new Error("mint failed"));
+
+    await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx("fly-machines")).catch(() => undefined);
+
+    expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus", SCOPED_REQUEST);
+    expect(flyMachines.createMachine).not.toHaveBeenCalled();
+    expect(githubAppAuth.getInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus");
+    expectFreeSlot("fly-machines", "planning");
+  });
+
+  it("local planning: a narrow-mint failure launches nothing and falls back to nothing", async () => {
+    vi.mocked(githubAppAuth.getScopedInstallationToken).mockRejectedValue(new Error("mint failed"));
+
+    await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx("local-docker")).catch(() => undefined);
+
+    expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus", SCOPED_REQUEST);
+    expect(localDocker.startLocalRunnerContainer).not.toHaveBeenCalled();
+    expect(githubAppAuth.getInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus");
+    expectFreeSlot("local-docker", "planning");
+  });
+});
+
 // AII-783 review on PR #681 (finding 2): the non-thrown, result.outcome-based release/hold
 // branch — `if (result.outcome === "rejected") admission.release(...)` — had zero coverage
 // on either side. dispatchGitHubActions and dispatchPlanning's GHA path each have their own
@@ -638,6 +867,7 @@ describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome a
     markImplementationFailed: vi.fn(),
     markPlanningFailed: vi.fn(),
     markPlanningStarted: vi.fn().mockResolvedValue(undefined),
+    markImplementing: vi.fn().mockResolvedValue(undefined),
     postComment: vi.fn().mockResolvedValue(undefined),
   } as unknown as TicketingProvider;
 
@@ -729,6 +959,230 @@ describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome a
       backend: "github-actions",
     });
     expect(retry).toEqual({ ok: false, reason: "occupied", count: 1, cap: 1 });
+  });
+
+  it("dispatchPlanning: an opted-in project on GitHub Actions is refused, the admission released, and the breaker callback counts it (AII-1391)", async () => {
+    const managed = await import("../managed-dispatch-auth.js");
+    vi.mocked(managed.isManagedProject).mockReturnValue(true);
+    onTestFinished(() => { vi.mocked(managed.isManagedProject).mockReset(); });
+    vi.mocked(github.postWorkflowDispatch).mockReset();
+    vi.mocked(provider.markPlanningFailed as never as ReturnType<typeof vi.fn>).mockClear();
+    const optedIssue = { ...issue, id: "issue-opted-gha" };
+
+    for (let i = 0; i < 3; i++) {
+      await expect(indexModule.dispatchPlanning(config, provider, optedIssue, mapping, planningCtx))
+        .rejects.toThrow("managed dispatch refused: gha_not_supported");
+    }
+
+    expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
+    expect(provider.markPlanningFailed).toHaveBeenCalledTimes(3);
+    const grants = dedup.getDb().prepare("SELECT COUNT(*) AS n FROM model_credential_grants").get() as { n: number };
+    expect(grants.n).toBe(0);
+    // The breaker callback reached preparePlanningLaunch: the third refusal parked the issue.
+    expect(breaker.isParked(optedIssue.id, "planning")).toBe(true);
+    // Every admission was released (count 0).
+    const retry = gate.acquireDispatch({
+      dispatchId: "retry-opted-gha",
+      issueId: optedIssue.id,
+      issueIdentifier: optedIssue.identifier,
+      kind: "planning",
+      teamKey: optedIssue.scopeKey,
+      maxInProgressAiIssues: 1,
+      backend: "github-actions",
+    });
+    // Parked by the breaker, not "occupied": no admission is still held.
+    expect(retry).toEqual({ ok: false, reason: "parked", count: 0, cap: 1 });
+  });
+
+  describe("private transport capability (AII-983)", () => {
+    const envelopeCaps = (supportsPrivateRunConfig?: boolean) => ({
+      contract: "envelope" as const,
+      supportsRunPublicationToken: true,
+      supportsAttemptCorrelation: false,
+      ...(supportsPrivateRunConfig !== undefined ? { supportsPrivateRunConfig } : {}),
+    });
+    const tokenConfig = { ...config, runnerTokenSecret: "runner-token-secret-with-enough-entropy", runnerCallbackBaseUrl: "https://orch.example.com" } as unknown as AppConfig;
+    const sent = () => vi.mocked(github.postWorkflowDispatch).mock.calls[0]![0];
+
+    beforeEach(() => {
+      vi.mocked(github.postWorkflowDispatch).mockReset().mockResolvedValue({ success: true, status: 204, outcome: "accepted" } as never);
+    });
+
+    it("implementation: capable reader gets bearers only in credentials", async () => {
+      const { decodeTrustedRunConfig, decodeRunConfig } = await import("../run-config.js");
+      vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue(envelopeCaps(true));
+      await indexModule.dispatchGitHubActions(tokenConfig, provider, issue, mapping, prior, "default", mapping.defaultBranch, null);
+      const inputs = sent().inputs;
+      const creds = decodeTrustedRunConfig(inputs.run_config!).credentials;
+      expect(creds?.resultToken).toBeTruthy();
+      expect(creds?.progressToken).toBeTruthy();
+      expect(decodeRunConfig(inputs.run_config!).credentials).toBeUndefined();
+      expect(inputs.run_token).toBe("");
+      expect("run_progress_token" in inputs).toBe(false);
+      expect("run_publication_token" in inputs).toBe(false);
+    });
+
+    it("implementation: envelope reader without the private marker keeps masked top-level tokens", async () => {
+      const { decodeTrustedRunConfig } = await import("../run-config.js");
+      vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue(envelopeCaps(undefined));
+      await indexModule.dispatchGitHubActions(tokenConfig, provider, issue, mapping, prior, "default", mapping.defaultBranch, null);
+      const inputs = sent().inputs;
+      expect(decodeTrustedRunConfig(inputs.run_config!).credentials).toBeUndefined();
+      expect(inputs.run_token).toBeTruthy();
+      expect(inputs.run_progress_token).toBeTruthy();
+    });
+
+    it("planning: probes the planning workflow; private carries result and progress, no publication", async () => {
+      const { decodeTrustedRunConfig } = await import("../run-config.js");
+      vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue(envelopeCaps(true));
+      await indexModule.dispatchPlanning(tokenConfig, provider, issue, mapping, planningCtx);
+      expect(workflowProbe.resolveWorkflowCapabilities).toHaveBeenCalledWith(
+        expect.objectContaining({ workflowFile: mapping.planningWorkflowFile }),
+      );
+      const inputs = sent().inputs;
+      const creds = decodeTrustedRunConfig(inputs.run_config!).credentials;
+      expect(creds?.resultToken).toBeTruthy();
+      // Planning mints a progress token since AII-1320; it rides inside the private credentials.
+      expect(creds?.progressToken).toBeTruthy();
+      expect(creds?.publicationToken).toBeUndefined();
+      expect(inputs.run_token).toBe("");
+      expect("run_progress_token" in inputs).toBe(false);
+      expect("run_publication_token" in inputs).toBe(false);
+    });
+
+    it("planning: envelope reader without the private marker keeps the masked top-level token", async () => {
+      const { decodeTrustedRunConfig } = await import("../run-config.js");
+      vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue(envelopeCaps(false));
+      await indexModule.dispatchPlanning(tokenConfig, provider, issue, mapping, planningCtx);
+      const inputs = sent().inputs;
+      expect(decodeTrustedRunConfig(inputs.run_config!).credentials).toBeUndefined();
+      expect(inputs.run_token).toBeTruthy();
+    });
+  });
+
+  describe("protected transport fails closed on production paths (AII-983)", () => {
+    const priv = { version: 1 as const, attemptToken: "private-attempt-secret" };
+    const caps = (extra: Record<string, unknown>) => ({
+      contract: "envelope" as const, supportsRunPublicationToken: true, supportsAttemptCorrelation: false, ...extra,
+    });
+    const tokenConfig = { ...config, runnerTokenSecret: "runner-token-secret-with-enough-entropy", runnerCallbackBaseUrl: "https://orch.example.com" } as unknown as AppConfig;
+    let fetchMock: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+      vi.mocked(github.postWorkflowDispatch).mockReset().mockResolvedValue({ success: true, status: 204, outcome: "accepted" } as never);
+    });
+    afterEach(() => { vi.unstubAllGlobals(); });
+
+    const failures: Array<[string, () => Promise<unknown>]> = [
+      ["unsupported reader (false)", () => Promise.resolve(caps({ supportsPrivateRunConfig: false }))],
+      ["envelope without the marker", () => Promise.resolve(caps({}))],
+      ["legacy-contract reader", () => Promise.resolve({ contract: "legacy", supportsRunPublicationToken: false, supportsAttemptCorrelation: false })],
+      ["failed probe", () => Promise.reject(new Error("probe down"))],
+    ];
+
+    it.each(failures)("implementation: supplied credentials on %s throw before launch and release admission", async (_n, impl) => {
+      vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockImplementation(impl as never);
+      await expect(
+        indexModule.dispatchGitHubActions(tokenConfig, provider, issue, mapping, prior, "default", mapping.defaultBranch, null, priv),
+      ).rejects.toThrow();
+      expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
+      const retry = gate.acquireDispatch({
+        dispatchId: "retry-impl-protected", issueId: issue.id, issueIdentifier: issue.identifier,
+        kind: "implementation", teamKey: issue.scopeKey, maxInProgressAiIssues: 1, backend: "github-actions",
+      });
+      expect(retry.ok).toBe(true);
+    });
+
+    it.each(failures)("planning: supplied credentials on %s throw before launch and release admission", async (_n, impl) => {
+      vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockImplementation(impl as never);
+      await expect(
+        indexModule.dispatchPlanning(tokenConfig, provider, issue, mapping, { ...planningCtx, trustedCredentials: priv }),
+      ).rejects.toThrow();
+      expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
+      const retry = gate.acquireDispatch({
+        dispatchId: "retry-plan-protected", issueId: issue.id, issueIdentifier: issue.identifier,
+        kind: "planning", teamKey: issue.scopeKey, maxInProgressAiIssues: 1, backend: "github-actions",
+      });
+      expect(retry.ok).toBe(true);
+    });
+
+    it("implementation: capable reader carries supplied credentials alongside the bearers", async () => {
+      const { decodeTrustedRunConfig } = await import("../run-config.js");
+      vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue(caps({ supportsPrivateRunConfig: true }));
+      await indexModule.dispatchGitHubActions(tokenConfig, provider, issue, mapping, prior, "default", mapping.defaultBranch, null, priv);
+      const inputs = vi.mocked(github.postWorkflowDispatch).mock.calls[0]![0].inputs;
+      const creds = decodeTrustedRunConfig(inputs.run_config!).credentials!;
+      expect(creds.attemptToken).toBe("private-attempt-secret");
+      expect(creds.resultToken).toBeTruthy();
+      expect(inputs.run_token).toBe("");
+    });
+
+    it("planning: capable reader carries supplied credentials but never publication authority", async () => {
+      const { decodeTrustedRunConfig } = await import("../run-config.js");
+      vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue(caps({ supportsPrivateRunConfig: true }));
+      await indexModule.dispatchPlanning(tokenConfig, provider, issue, mapping, { ...planningCtx, trustedCredentials: priv });
+      const inputs = vi.mocked(github.postWorkflowDispatch).mock.calls[0]![0].inputs;
+      const creds = decodeTrustedRunConfig(inputs.run_config!).credentials!;
+      expect(creds.attemptToken).toBe("private-attempt-secret");
+      expect(creds.publicationToken).toBeUndefined();
+    });
+
+    it("planning: a supplied publication/result token is never carried; minted result token and no top-level bearers remain", async () => {
+      const { decodeTrustedRunConfig } = await import("../run-config.js");
+      vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue(caps({ supportsPrivateRunConfig: true }));
+      await indexModule.dispatchPlanning(tokenConfig, provider, issue, mapping, {
+        ...planningCtx,
+        trustedCredentials: { version: 1, publicationToken: "supplied-pub", resultToken: "supplied-res", attemptToken: "private-attempt-secret" },
+      });
+      const inputs = vi.mocked(github.postWorkflowDispatch).mock.calls[0]![0].inputs;
+      const creds = decodeTrustedRunConfig(inputs.run_config!).credentials!;
+      expect(creds.publicationToken).toBeUndefined();
+      expect(creds.progressToken).toBeTruthy();
+      expect(creds.resultToken).toBeTruthy();
+      expect(creds.resultToken).not.toBe("supplied-res");
+      expect(creds.attemptToken).toBe("private-attempt-secret");
+      expect(inputs.run_token).toBe("");
+      expect("run_progress_token" in inputs).toBe(false);
+      expect("run_publication_token" in inputs).toBe(false);
+      expect(JSON.stringify(inputs)).not.toMatch(/supplied-pub|supplied-res/);
+    });
+
+    it.each([
+      ["implementation", () => indexModule.dispatchGitHubActions(tokenConfig, provider, issue, mapping, prior, "default", mapping.defaultBranch, null)],
+      ["planning", () => indexModule.dispatchPlanning(tokenConfig, provider, issue, mapping, planningCtx)],
+    ])("%s: legacy-contract reader with no protected input still dispatches with legacy inputs", async (_k, call) => {
+      vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue(
+        { contract: "legacy", supportsRunPublicationToken: false, supportsAttemptCorrelation: false } as never,
+      );
+      await call();
+      const inputs = vi.mocked(github.postWorkflowDispatch).mock.calls[0]![0].inputs;
+      expect(inputs.run_config).toBeUndefined();
+      expect(inputs.run_token).toBeTruthy();
+    });
+
+    it("implementation: a 422 retry resends the private run_config byte-identical", async () => {
+      const actual = await vi.importActual<typeof import("../github.js")>("../github.js");
+      vi.mocked(github.postWorkflowDispatch).mockImplementation(actual.postWorkflowDispatch);
+      vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue(caps({ supportsPrivateRunConfig: true }));
+      fetchMock
+        .mockResolvedValueOnce({ status: 422, text: async () => 'Unexpected inputs provided: ["issue_identifier"]' })
+        .mockResolvedValueOnce({ status: 204 })
+        // Post-dispatch run-id lookup is not under test; answer it harmlessly.
+        .mockResolvedValue({ ok: false, status: 500, text: async () => "" });
+      await indexModule.dispatchGitHubActions(tokenConfig, provider, issue, mapping, prior, "default", mapping.defaultBranch, null, priv);
+      const dispatchCalls = fetchMock.mock.calls.filter((c) => String(c[0]).endsWith("/dispatches"));
+      expect(dispatchCalls).toHaveLength(2);
+      const bodies = dispatchCalls.map((c) => JSON.parse(c[1].body as string).inputs as Record<string, string>);
+      expect(bodies[1]!.run_config).toBe(bodies[0]!.run_config);
+      expect(bodies[0]!.run_config).toBeTruthy();
+      expect("issue_identifier" in bodies[1]!).toBe(false);
+      expect(bodies[1]!.run_token).toBe("");
+      expect("run_progress_token" in bodies[1]!).toBe(false);
+    });
   });
 
   it("dispatchPlanning GHA path: outcome 'rejected' releases the reservation", async () => {

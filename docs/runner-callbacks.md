@@ -54,6 +54,16 @@ Unmarked Legacy callbacks retain the single-use result token above.
 
 The consequence to remember: only the runner's own Node process holds the run's authority. Code the repository runs under `preflight`, `install` or a hook (a test suite is repository code) cannot read the run tokens, so it cannot post a report or consume the single-use result token. Forwarded secrets stay available to those processes.
 
+## Configured-run model bootstrap (AII-951)
+
+A run is *configured* (opted in) when its envelope carries both a resolved `agentConfig` snapshot and a `credentials.modelAuthGrant`. The shell bootstrap (`session/entrypoint.sh`, `classify_run_config` in `session/lib.sh`) validates **every nonempty envelope** with the compiled trusted decoder (`decodeTrustedRunConfig`) before any git, clone or setup. An envelope the decoder rejects (bad base64/JSON, non-object, unsupported version, invalid credentials) or one with only one of snapshot/grant fails closed with a fixed message and never falls back to legacy credentials. A valid envelope with neither — including a private `credentials` namespace holding only callback/publication tokens — is legacy and keeps the legacy `ANTHROPIC_*`/Bedrock provider requirements unchanged. The TS `isConfiguredModelRun` applies the same rule, treating undecodable input as configured so bad protected input can never select the legacy forwarded-collision exception.
+
+- **Shell children.** On configured runs `run_scoped` starts shell `git`/`gh` with a minimal environment (PATH, HOME, locale, TLS/proxy) plus only `GH_TOKEN` for `gh`. The configured clone uses a credential-free remote URL: `git_authed` places the GitHub token in the clone child's environment only (`GIT_PASSWORD`), answered by a global credential helper that reads that variable, so the token is in no argv, no remote URL and no file; the TS clone step's per-operation `GIT_PASSWORD` fetches use the same helper. Legacy runs keep the token-in-URL clone. Model, session, bootstrap and forwarded-secret variables never reach them, and the ERR trap logs a fixed line instead of the failing command text. The protected envelope stays in the trusted handoff only.
+- **TS children.** `repoProcessEnv` drops the forwarded-secret collision exception and every `OPENAI_`/`CODEX_`/`ANTHROPIC_`/`CLAUDE_CODE_`/`AWS_` name on configured runs (legacy keeps the exception). `modelProcessEnv(allow, selectedAuth)` returns a copy of the environment `ModelAuthClient` built for the selected credential, never merged with `process.env`; `allow` only decides whether GitHub write tokens already in that selected environment survive, and ambient `process.env` GitHub or runner credentials are never restored. The legacy form (no `selectedAuth`) is unchanged.
+- **Node launch controls.** Every shell-owned node decoder runs through `run_node` (`env -u NODE_OPTIONS -u NODE_PATH node`), so an ambient `--require` preload cannot execute with the protected envelope in its environment before classification, in any mode. Configured runs also `unset NODE_OPTIONS NODE_PATH` before the final handoff; legacy handoff keeps them.
+- **Team-secret remap.** Configured runs additionally reserve model, session, provider-routing and `NODE_OPTIONS`/`NODE_PATH` names in `_remap_is_reserved`, so an alias cannot restore them; ordinary secrets still forward. Legacy keeps the narrower list.
+- **Trust limit.** This is credential hygiene, not hostile-code isolation: commands the agent starts can read their parent model process's environment. Hosted session-key delivery to the runner is not part of this change.
+
 ## Blast radius
 
 What one stray use of each credential destroys, and where the symptom appears.
@@ -102,6 +112,47 @@ A Restate review-fix attempt does not post steps to `/runner/progress` (an attem
 
 The planning result callback still marks the planning job complete and still skips the admission release, for both lifecycles. For a project on the `restate` lifecycle, the planning termination hook (`createPlanningAdmissionTerminationHook`) also sends `report` to the `PlanningRun` workflow whose key is the dispatch id (the handler takes no idempotency key; a second `report` is a no-op); a Legacy dispatch keeps the fast release. The planning failure callback calls the same hook, so it also sends `report`; for a Restate-owned dispatch it first writes the row as `failed` with the failure code as its conclusion, and the workflow keeps that conclusion. The `report` only wakes the workflow. The workflow still confirms the run ended with `readStatus` and releases the reservation itself. A lost signal costs at most one tick: 5 seconds in the confirm phase, 30 seconds in the wait (`PLANNING_RUN_CONFIRM_TICK_MS`, `PLANNING_RUN_TICK_MS`). See [restate.md](restate.md#the-planning-run).
 
+## Managed dispatch decisions
+
+`prepareManagedDispatch` (`src/managed-dispatch-auth.ts`, AII-1386) maps one `prepareAgentRun` result to one decision. Every dispatch path calls it so each makes the same choice for the same state. It has no consumer yet. The checks run in this order:
+
+| State, in check order | Decision | Reserve | Mint |
+| -- | -- | -- | -- |
+| `isManagedProject` false (includes an empty `projectKey`) | `legacy`, `prepareAgentRun` not called | no | no |
+| backend `github-actions` | `refuse` configuration-error `gha_not_supported` | no | no |
+| stored or resolved snapshot selects `claude-subscription` | `refuse` configuration-error `claude_subscription_unsupported` | no | no |
+| `prepareAgentRun` throws | `hold` `preparation_failed` | n/a | n/a |
+| `legacy` | `legacy` | no | no |
+| `ready`, `reused: false`, `reservations: []` | `launch` | no | yes |
+| `ready`, `reused: true` (bootstrap already taken) | `hold` `bootstrap_consumed` | n/a | no |
+| `ready` with a non-empty `reservations` | `releaseRejectedLaunch`, then `refuse` configuration-error `claude_subscription_unsupported` | released | revoked |
+| `queued` | `leave-queued` `profile_busy` | n/a | no |
+| `configuration-error` | `refuse` configuration-error, same code | no | no |
+| `authentication-required` | `refuse` authentication-required, same code | no | no |
+| `recovery-required` | `hold`, same code | n/a | n/a |
+
+The empty-`projectKey` row exists because `prepareAgentRun` rejects an empty key as `invalid_request`, and Jira issues can carry an empty scope key.
+
+`settleLaunch` runs after the launch attempt:
+
+| Decision | Outcome | Action |
+| -- | -- | -- |
+| `launch` | `accepted` | nothing; the grant lives until the run ends |
+| `launch` | `rejected` or `unknown` | `releaseRejectedLaunch(dispatchId, [], runtime)`; revokes the grant |
+| any other kind | any | nothing, `{ revoked: false }` |
+
+A grant lives only when the launch is accepted, so `unknown` revokes too. `classifyLaunchError` returns `rejected` when no launch was attempted, for Fly only on a 4xx status in the message (the rule of `isDefinitiveFlyRejectionError`), and `unknown` for local Docker and anything else. A caller releases an owned admission with `launch_rejected` for `leave-queued`, `refuse` and `hold`, and only `refuse` writes a tracker failure, using `refusalText`. The bearer stays inside `takeBootstrap`; `refusalText` is built from `kind`, `category` and `code` only.
+
+## Model-auth routes (AII-1387)
+
+`src/model-auth-routes.ts` serves `POST /runner/model-auth/checkout`, `/checkpoint` and `/finish` from the orchestrator HTTP server, adapting Node requests to `createModelAuthHandlers` (`src/model-auth-server.ts`). The check sits right after the health check in `handleRequest`, before `/api/token`, so no general runner route shadows it. Every method on these paths reaches the handler, which answers 405 for non-POST.
+
+- **Authentication.** The grant bearer. The handler hashes it and looks up `model_credential_grants.bearer_hash`; bindings (with `authMode`) come from `scope_json`. A row whose `scope_json` does not parse is treated as no grant.
+- **Transport rule.** On Fly (`FLY_APP_NAME` set) a request is trusted only when `x-forwarded-proto` contains `https`. Off Fly (local development) it is trusted. A runner must reach the route through the public `RUNNER_CALLBACK_BASE_URL`; one that connects over 6PN carries no `x-forwarded-proto` and gets 403.
+- **Release rule.** The grant's dispatch must still have an unreleased `dispatch_admissions` row. Once the admission is released the grant stops working, whatever its expiry. Revoked and expired grants also fail.
+- **Refresh.** A near-expiry ChatGPT token is refused and `requestChatGptPlanRefresh` is called once.
+- **Logging.** One `[model-auth] <operation> <profile> <status> <category>` line per request, from `SafeModelAuthDiagnostic` only.
+
 ## Rules
 
 1. A test that touches a runner entry point (`runKgRefresh`, `runAutonomous`, `postRunnerResult`) runs disarmed: `RUN_TOKEN`, `RUNNER_CALLBACK_URL`, and `RUN_PROGRESS_TOKEN` are cleared. The file-level hook from PR #467 does this for one file. AII-588 moves it to a vitest setup file so every suite starts disarmed.
@@ -120,6 +171,10 @@ Walk every row and cite the line.
 - Verifiers: every `verifyRunToken` call site, with its audience and its `consume` flag.
 - Strippers: `RUNNER_CREDENTIAL_KEYS` in `src/pipeline/process-env.ts`, and which builder each spawned process uses.
 - Tests: the setup file that disarms, and the tests that assert a stray post is refused.
+
+## Invocation attribution (AII-971)
+
+The terminal result may carry one optional `attribution` (`InvocationAttributionV1`): the last implementation invocation for an autonomous run, the planning invocation for a planning run. The runner sanitizes it before sending; the orchestrator sanitizes it again, then normalizes it against the dispatch's stored `run_agent_config_snapshots` row (`normalizeInvocation`) and inserts one `model_invocation_attribution` row, ignoring a repeated `invocation_id`. Identity comes from the snapshot, never the claim; a claim naming another snapshot stores nothing. A legacy dispatch (no snapshot) stores nothing. Persistence failures log a count-only warning and never stall the terminal callback. `Job.attribution` and the local `summary.json` project the same bounded shape. Per-pass records ride the feedback-loop passes, not the callback.
 
 ## Related
 

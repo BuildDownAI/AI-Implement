@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
 import type { PipelineContext } from "../pipeline/types.js";
 import { readFileSync } from "node:fs";
+import { BUILTIN_REVIEWER_VERDICT_SCHEMA, REVIEWER_VERDICT_SCHEMA } from "../pipeline/reviewers/schema.js";
 
 const checks = [{
   check: "Pulse speed matches the requested behavior",
@@ -14,7 +15,7 @@ const checks = [{
 }];
 const summary = "The requested animation change is implemented in the shared pulse setting.";
 
-async function runReview(verdict: Record<string, unknown>, externalPending = false, maxIterations = 1, options: { strictReport?: boolean; reviewUrl?: string; reviewFailure?: boolean } = {}) {
+async function runReview(verdict: Record<string, unknown>, externalPending = false, maxIterations = 1, options: { strictReport?: boolean; outputSchema?: Record<string, unknown>; reviewUrl?: string; reviewFailure?: boolean } = {}) {
   const ghSpawn = vi.fn((args: string[]) => {
     if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
     if (args.includes("repos/:owner/:repo/pulls/42/reviews") && args.includes("POST")) {
@@ -43,7 +44,7 @@ async function runReview(verdict: Record<string, unknown>, externalPending = fal
     reviewProviders: externalPending ? ["github-claude-code-review"] : [],
     sleep: async () => {}, reviewWaitPollMs: 1, reviewWaitTimeoutMs: 2,
     reviewers: [{ id: "code-review", gates: true }],
-    trustedReviewerDefinitions: new Map([["code-review", { id: "code-review", buildPrompt: () => "Review", outputSchema: { type: "object", ...(options.strictReport ? { required: ["approved", "findings", "summary", "checks"] } : {}) } }]]),
+    trustedReviewerDefinitions: new Map([["code-review", { id: "code-review", buildPrompt: () => "Review", outputSchema: options.outputSchema ?? { type: "object", ...(options.strictReport ? { required: ["approved", "findings", "summary", "checks"] } : {}) } }]]),
   }, { report });
   const nativeBodies = ghSpawn.mock.calls.filter(([args]) => args.includes("event=COMMENT"))
     .map(([args]) => args.find(arg => arg.startsWith("body=")) || "");
@@ -111,6 +112,39 @@ describe("reviewer evidence reports", () => {
     expect(result.approved).toBe(true);
     const child = report.mock.calls.find(([row]) => row.id.includes("reviewer.0"))![0];
     expect(child.outputs.checks).toBeUndefined();
+  });
+
+  it("treats null optional report fields as absent for a config reviewer under the strict-mode schema", async () => {
+    const { result, report } = await runReview(
+      { approved: true, findings: [], summary: null, checks: null },
+      false, 1, { outputSchema: REVIEWER_VERDICT_SCHEMA },
+    );
+    expect(result.approved).toBe(true);
+    const child = report.mock.calls.find(([row]) => row.id.includes("reviewer.0"))![0];
+    expect(child.outputs.summary).toBeUndefined();
+    expect(child.outputs.checks).toBeUndefined();
+  });
+
+  it("treats a null finding path and line as absent", async () => {
+    const { result, report } = await runReview(
+      { approved: false, findings: [{ severity: "blocking", body: "The renderer ignores the new setting.", path: null, line: null }], summary: null, checks: null },
+      false, 1, { outputSchema: REVIEWER_VERDICT_SCHEMA },
+    );
+    expect(result.terminationReason).toBe("iterations_exhausted");
+    const child = report.mock.calls.find(([row]) => row.id.includes("reviewer.0"))![0];
+    expect(child.outputs.findings).toHaveLength(1);
+    expect(child.outputs.findings[0]).toMatchObject({ severity: "blocking", body: "The renderer ignores the new setting." });
+    expect(child.outputs.findings[0]).not.toHaveProperty("path");
+    expect(child.outputs.findings[0]).not.toHaveProperty("line");
+  });
+
+  it("still requires a built-in reviewer to report a summary and checks", async () => {
+    const { result } = await runReview(
+      { approved: true, findings: [], summary: null, checks: null },
+      false, 1, { outputSchema: BUILTIN_REVIEWER_VERDICT_SCHEMA },
+    );
+    expect(result.approved).toBe(false);
+    expect(result.terminationReason).toBe("invalid_review");
   });
 
   it("does not let a positive report override actionable findings", async () => {

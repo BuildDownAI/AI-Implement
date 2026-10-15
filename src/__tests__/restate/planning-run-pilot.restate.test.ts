@@ -53,9 +53,18 @@ vi.mock("../../notify.js", async (importOriginal) => ({
   notifyText: async () => {},
 }));
 
-vi.mock("../../workflow-probe.js", () => ({ resolveWorkflowContract: async () => "envelope" }));
+vi.mock("../../workflow-probe.js", () => ({
+  resolveWorkflowContract: async () => "envelope",
+  // Planning preparation probes the full capabilities (private transport, AII-983); an envelope without the marker.
+  resolveWorkflowCapabilities: async () => ({
+    contract: "envelope", supportsRunPublicationToken: false, supportsAttemptCorrelation: false, supportsPrivateRunConfig: false,
+  }),
+}));
 vi.mock("../../planning-context.js", () => ({ buildPlanningContextInputs: async () => ({}) }));
-vi.mock("../../github-app-auth.js", () => ({ getInstallationToken: async () => "sim-gh-token" }));
+vi.mock("../../github-app-auth.js", () => ({
+  getInstallationToken: async () => "sim-gh-token",
+  getScopedInstallationToken: async () => ({ token: "sim-gh-token", expiresAt: "", installationId: 1 }),
+}));
 vi.mock("../../github.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../github.js")>()),
   getWorkflowRunStatus: (...args: [string, string, string, number]) => gh.status(args[3]),
