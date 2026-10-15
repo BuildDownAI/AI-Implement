@@ -977,6 +977,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       sessionImage: config.sessionImage,
       localRunnerImage: config.localRunnerImage,
       localRunnerOrchestratorUrl: config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? `http://host.docker.internal:${config.healthPort}`,
+      modelAuthRuntime: getModelAuthRuntime(config),
     });
   }
 
@@ -3870,6 +3871,29 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           console.log(`[review-fix] Deferring local review fix #${fix.id} for PR #${fix.prNumber}: ${admission.reason}`);
           continue;
         }
+        let reviewFixDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
+        const reviewFixRuntime = getModelAuthRuntime(config);
+        if (isManagedProject(scopeKey)) {
+          let decision: ManagedDispatchDecision;
+          try {
+            decision = await prepareManagedDispatch(
+              { dispatchId, projectKey: scopeKey, backend: "local-docker", owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile },
+              reviewFixRuntime,
+            );
+          } catch (err) {
+            releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
+            throw err;
+          }
+          console.log(`[review-fix] Managed dispatch for review fix #${fix.id}: ${decision.kind}${"code" in decision ? ` (${decision.code})` : ""}`);
+          if (decision.kind === "legacy" || decision.kind === "launch") {
+            reviewFixDecision = decision;
+          } else {
+            releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
+            console.log(`[review-fix] ${refusalText(decision)} (${fix.issueIdentifier ?? fix.issueId})`);
+            if (decision.kind === "refuse") updateReviewFixStatus(fix.id, "failed");
+            continue;
+          }
+        }
         let launchStarted = false;
         let container: Awaited<ReturnType<typeof dispatchLocalGapfill>>;
         try {
@@ -3890,12 +3914,21 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
             runnerCallbackUrl: runnerCallbackUrl || undefined,
             runToken: runToken || undefined,
             runProgressToken: runProgressToken || undefined,
-            anthropicApiKey: config.anthropicApiKey,
-            claudeOAuthToken: config.claudeOAuthToken,
+            anthropicApiKey: reviewFixDecision.kind === "launch" ? undefined : config.anthropicApiKey,
+            claudeOAuthToken: reviewFixDecision.kind === "launch" ? undefined : config.claudeOAuthToken,
             retryPolicy: getRetryPolicy(),
             onBeforeLaunch: () => { launchStarted = true; },
+            ...(reviewFixDecision.kind === "launch"
+              ? {
+                  managed: {
+                    decision: reviewFixDecision,
+                    modelAuthUrl: config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? `http://host.docker.internal:${config.healthPort}`,
+                  },
+                }
+              : {}),
           });
         } catch (err) {
+          settleLaunch(reviewFixDecision, classifyLaunchError("local-docker", launchStarted, err), reviewFixRuntime);
           if (!launchStarted) releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
           throw err;
         }
@@ -3924,6 +3957,15 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         suppressStaleNotifications(fix.issueId, jobId);
         updateReviewFixStatus(fix.id, "dispatched");
         console.log(`[review-fix] Dispatched local review fix for ${fix.issueIdentifier ?? fix.issueId} (PR #${fix.prNumber}, container: ${container.containerId})`);
+        continue;
+      }
+
+      // Protected model auth has no GitHub Actions transport: refuse before any admission or grant.
+      if (isManagedProject(scopeKey)) {
+        console.warn(
+          `[review-fix] ${refusalText({ kind: "refuse", category: "configuration-error", code: "gha_not_supported" })} (${fix.issueIdentifier ?? fix.issueId})`,
+        );
+        updateReviewFixStatus(fix.id, "failed");
         continue;
       }
 

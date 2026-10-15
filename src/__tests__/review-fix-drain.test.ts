@@ -28,6 +28,27 @@ vi.mock("../local-gapfill.js", async (importOriginal) => {
   };
 });
 
+const managedMocks = vi.hoisted(() => ({
+  isManagedProject: vi.fn<(key: string, dispatchId?: string) => boolean>(() => false),
+  prepareManagedDispatch: vi.fn<(...args: unknown[]) => Promise<unknown>>(),
+  settleLaunch: vi.fn(),
+}));
+
+vi.mock("../managed-dispatch-auth.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../managed-dispatch-auth.js")>();
+  return {
+    ...actual,
+    isManagedProject: managedMocks.isManagedProject,
+    prepareManagedDispatch: managedMocks.prepareManagedDispatch,
+    settleLaunch: managedMocks.settleLaunch,
+  };
+});
+
+vi.mock("../model-auth-runtime.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../model-auth-runtime.js")>();
+  return { ...actual, getModelAuthRuntime: vi.fn(() => ({ runtime: true })) };
+});
+
 const githubAppAuthMocks = vi.hoisted(() => ({
   getInstallationToken: vi.fn<(appId: string, privateKey: string, owner: string) => Promise<string>>(),
   getInstallationId: vi.fn<(appId: string, privateKey: string, owner: string) => Promise<number>>(),
@@ -135,6 +156,10 @@ function stubOpenPrLookup(): void {
 
 beforeEach(async () => {
   vi.resetModules();
+  managedMocks.isManagedProject.mockReset();
+  managedMocks.isManagedProject.mockReturnValue(false);
+  managedMocks.prepareManagedDispatch.mockReset();
+  managedMocks.settleLaunch.mockReset();
   dbPath = path.join(
     os.tmpdir(),
     `review-fix-drain-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
@@ -1386,5 +1411,109 @@ describe("processReviewFixQueue — legacy GHA writer private transport (AII-983
     expect(inputs.run_config).toBeUndefined();
     expect(inputs.run_token).toBeTruthy();
     expect(inputs.run_progress_token).toBeTruthy();
+  });
+});
+
+describe("processReviewFixQueue — protected dispatch (AII-1392)", () => {
+  function queueFix(): number {
+    return reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-m",
+      issueIdentifier: "AII-900",
+      repo: "acme/billing",
+      prNumber: 42,
+      reason: "late review comment",
+    });
+  }
+
+  function launchDecision() {
+    return {
+      kind: "launch",
+      dispatchId: "d-1",
+      projectKey: "TEAM",
+      backend: "local-docker",
+      snapshot: { v: 1 },
+      grant: {},
+      takeBootstrap: vi.fn(() => ({ bootstrap: true })),
+    };
+  }
+
+  it("opted-in local review-fix passes managed input and no Anthropic credentials", async () => {
+    configModule.upsertMapping("TEAM", makeMapping());
+    managedMocks.isManagedProject.mockReturnValue(true);
+    const decision = launchDecision();
+    managedMocks.prepareManagedDispatch.mockResolvedValue(decision);
+    queueFix();
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(managedMocks.prepareManagedDispatch).toHaveBeenCalledWith(
+      expect.objectContaining({ backend: "local-docker", projectKey: "TEAM" }),
+      expect.anything(),
+    );
+    const [call] = localGapfillMocks.dispatchLocalGapfill.mock.calls[0]!;
+    expect(call.managed?.decision).toBe(decision);
+    expect(call.anthropicApiKey).toBeUndefined();
+    expect(call.claudeOAuthToken).toBeUndefined();
+    expect(managedMocks.settleLaunch).not.toHaveBeenCalled();
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+  });
+
+  it("opted-out local review-fix passes no managed input and never prepares", async () => {
+    configModule.upsertMapping("TEAM", makeMapping());
+    queueFix();
+
+    await indexModule.processReviewFixQueue({ ...mockConfig, anthropicApiKey: "key" }, mockRegistry);
+
+    const [call] = localGapfillMocks.dispatchLocalGapfill.mock.calls[0]!;
+    expect(call.managed).toBeUndefined();
+    expect(call.anthropicApiKey).toBe("key");
+    expect(managedMocks.prepareManagedDispatch).not.toHaveBeenCalled();
+  });
+
+  it("a launch that throws before onBeforeLaunch settles rejected and releases the admission", async () => {
+    configModule.upsertMapping("TEAM", makeMapping());
+    managedMocks.isManagedProject.mockReturnValue(true);
+    const decision = launchDecision();
+    managedMocks.prepareManagedDispatch.mockResolvedValue(decision);
+    localGapfillMocks.dispatchLocalGapfill.mockRejectedValue(new Error("managed dispatch refused: bootstrap unavailable"));
+    queueFix();
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "rejected", expect.anything());
+    expect(admission.count("TEAM")).toBe(0);
+  });
+
+  it.each([
+    ["refuse", { kind: "refuse", category: "configuration-error", code: "bad" }, 0],
+    ["leave-queued", { kind: "leave-queued", code: "profile_busy" }, 1],
+    ["hold", { kind: "hold", code: "preparation_failed" }, 1],
+  ])("a %s decision releases the admission and leaves %i pending", async (_name, decision, pending) => {
+    configModule.upsertMapping("TEAM", makeMapping());
+    managedMocks.isManagedProject.mockReturnValue(true);
+    managedMocks.prepareManagedDispatch.mockResolvedValue(decision);
+    queueFix();
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    expect(admission.count("TEAM")).toBe(0);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(pending);
+  });
+
+  it("opted-in GitHub Actions review-fix is failed with no admission, grant or workflow dispatch", async () => {
+    process.env.RUNNER_MODE = "default";
+    configModule.upsertMapping("TEAM", makeMapping({ executionMode: "github-actions" }));
+    managedMocks.isManagedProject.mockReturnValue(true);
+    queueFix();
+    const githubModule = await import("../github.js");
+    const dispatch = vi.spyOn(githubModule, "dispatchWorkflow").mockResolvedValue({ success: true, status: 204 });
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(managedMocks.prepareManagedDispatch).not.toHaveBeenCalled();
+    expect(admission.count("TEAM")).toBe(0);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
   });
 });
