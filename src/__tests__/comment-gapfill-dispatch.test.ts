@@ -1326,6 +1326,45 @@ describe("drainCommentGapfillQueue — admission (AII-787)", () => {
     expect(admission.count("TEAM")).toBe(1);
   });
 
+  it("Fly gap-fill carries the result, progress and publication tokens, and none in extraEnv", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing", executionMode: "fly-machines" });
+    seedDispatchLog("issue-fly-tokens", "AII-306", "Fly tokens", "acme", "billing", 89);
+    queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 89, commentId: 0, commenter: "", instruction: "" });
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }),
+      flySessionsToken: "fly-token",
+      flySessionsApp: "fly-app",
+      anthropicApiKey: "anthropic-key",
+      runnerCallbackBaseUrl: "https://orch.example.com",
+      runnerTokenSecret: "runner-token-secret-with-enough-entropy",
+    }));
+
+    const env = flyMocks.createMachine.mock.calls[0]![2].config.env!;
+    expect(env.RUN_TOKEN).toBeTruthy();
+    expect(env.RUN_PROGRESS_TOKEN).toBeTruthy();
+    expect(env.RUN_PUBLICATION_TOKEN).toBeTruthy();
+  });
+
+  it("local gap-fill passes the progress and publication tokens", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing" });
+    seedDispatchLog("issue-local-tokens", "AII-307", "Local tokens", "acme", "billing", 90);
+    queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 90, commentId: 0, commenter: "", instruction: "" });
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }),
+      runnerMode: "local",
+      anthropicApiKey: "anthropic-key",
+      runnerCallbackBaseUrl: "https://orch.example.com",
+      runnerTokenSecret: "runner-token-secret-with-enough-entropy",
+    }));
+
+    const input = localGapfillMocks.dispatchLocalGapfill.mock.calls[0]![0] as { runToken?: string; runProgressToken?: string; runPublicationToken?: string };
+    expect(input.runToken).toBeTruthy();
+    expect(input.runProgressToken).toBeTruthy();
+    expect(input.runPublicationToken).toBeTruthy();
+  });
+
   it("holds capacity after an unknown GitHub 5xx outcome", async () => {
     const mapping = makeMapping({ owner: "acme", repo: "billing", maxInProgressAiIssues: 1 });
     seedDispatchLog("issue-unknown", "AII-306", "Unknown launch", "acme", "billing", 89);

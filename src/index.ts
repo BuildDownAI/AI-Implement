@@ -77,7 +77,7 @@ import { getOrchestratorSettings, getRunnerBackendSource, getFlySessionsConfig, 
 import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, resubmitPendingGapFillReviews, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
-import { mintRunToken, mintLaunchTokens, IMPLEMENTATION_TTL_SECONDS, type LaunchTokens } from "./runner-tokens.js";
+import { mintLaunchTokens, IMPLEMENTATION_TTL_SECONDS, type LaunchTokens } from "./runner-tokens.js";
 import { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
 import { createReviewFixAdminFacade } from "./review-fix-admin-facade.js";
 import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "./review-fix-worker.js";
@@ -3587,6 +3587,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
       let runnerCallbackUrl = "";
       let runToken = "";
       let runProgressToken = "";
+      let mintedPublicationToken: string | undefined;
       let dispatchId: string | undefined;
       // This snapshot defines the findings this specific gap-fill dispatch is
       // allowed to resolve. Findings that arrive after the snapshot remain open
@@ -3655,27 +3656,20 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         // Gap-fill dispatches run the implementation workflow and can take as
         // long as the initial implementation, even though they report back as
         // gap-analysis so Linear status does not regress.
-        const minted = mintRunToken({
+        dispatchId = crypto.randomUUID();
+        const minted = mintLaunchTokens({
           issueId: fix.issueId,
           mappingTeamKey: scopeKey,
           phase: "gap-analysis",
-          audience: "result",
-          ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-          secret: config.runnerTokenSecret,
-        });
-        dispatchId = minted.dispatchId;
-        const progressMinted = mintRunToken({
-          issueId: fix.issueId,
-          mappingTeamKey: scopeKey,
-          phase: "gap-analysis",
-          audience: "progress",
           dispatchId,
           ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
           secret: config.runnerTokenSecret,
+          repository: `${mapping.owner}/${mapping.repo}`,
         });
         runnerCallbackUrl = config.runnerCallbackBaseUrl;
-        runToken = minted.token;
-        runProgressToken = progressMinted.token;
+        runToken = minted.runToken;
+        runProgressToken = minted.runProgressToken;
+        mintedPublicationToken = minted.runPublicationToken;
       }
 
       if (runnerMode === "local") {
@@ -3722,6 +3716,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
             runnerCallbackUrl: runnerCallbackUrl || undefined,
             runToken: runToken || undefined,
             runProgressToken: runProgressToken || undefined,
+            runPublicationToken: mintedPublicationToken,
             anthropicApiKey: config.anthropicApiKey,
             claudeOAuthToken: config.claudeOAuthToken,
             retryPolicy: getRetryPolicy(),
@@ -3803,21 +3798,8 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           ref: mapping.defaultBranch,
         });
         reviewFixContract = reviewFixCapabilities.contract;
-        const runPublicationToken = reviewFixContract === "envelope"
-          && reviewFixCapabilities.supportsRunPublicationToken
-          && dispatchId
-          && config.runnerCallbackBaseUrl
-          && config.runnerTokenSecret
-          ? mintRunToken({
-              issueId: fix.issueId,
-              mappingTeamKey: scopeKey,
-              phase: "gap-analysis",
-              audience: "publication",
-              dispatchId,
-              repository: `${mapping.owner}/${mapping.repo}`,
-              ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-              secret: config.runnerTokenSecret,
-            }).token
+        const runPublicationToken = reviewFixContract === "envelope" && reviewFixCapabilities.supportsRunPublicationToken
+          ? mintedPublicationToken
           : undefined;
 
         const fixIssue = {

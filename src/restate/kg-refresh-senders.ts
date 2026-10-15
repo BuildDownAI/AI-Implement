@@ -75,7 +75,6 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
     const sessionToken = generateSessionToken();
     const extraEnv: Record<string, string> = {
       AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(input.envelope),
-      RUN_PROGRESS_TOKEN: input.tokens.progressToken,
     };
     const flySessionImage = await deps.resolveRunnerImage({
       owner: repo.owner,
@@ -102,6 +101,8 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
       orchestratorUrl: config.runnerCallbackBaseUrl ?? undefined,
       runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
       runToken: input.tokens.runToken,
+      runProgressToken: input.tokens.progressToken,
+      runPublicationToken: input.tokens.publicationToken,
       orchestratorApp: process.env.FLY_APP_NAME,
       expectedTtlSeconds: 4 * 60 * 60,
       extraEnv,
@@ -147,7 +148,6 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
     const sessionToken = generateSessionToken();
     const extraEnv: Record<string, string> = {
       AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(input.envelope),
-      RUN_PROGRESS_TOKEN: input.tokens.progressToken,
     };
     const localOrchestratorUrl =
       config.localRunnerOrchestratorUrl ??
@@ -171,6 +171,8 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
       orchestratorUrl: localOrchestratorUrl,
       runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
       runToken: input.tokens.runToken,
+      runProgressToken: input.tokens.progressToken,
+      runPublicationToken: input.tokens.publicationToken,
       extraEnv,
     });
     console.log(`[kg-refresh] dispatched via local Docker (dispatchId=${input.dispatchId})`);

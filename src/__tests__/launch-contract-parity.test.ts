@@ -61,10 +61,7 @@ const KNOWN_GAPS: ReadonlyArray<{ kind: string; backend: string; check: string }
   { kind: "implementation", backend: "fly-machines", check: "image" },
   // gap-fill
   { kind: "gap-fill", backend: "github-actions", check: "image" },
-  { kind: "gap-fill", backend: "fly-machines", check: "token:progress" },
-  { kind: "gap-fill", backend: "fly-machines", check: "token:publication" },
   { kind: "gap-fill", backend: "fly-machines", check: "image" },
-  { kind: "gap-fill", backend: "local-docker", check: "token:publication" },
   // planning
   { kind: "planning", backend: "github-actions", check: "image" },
   { kind: "planning", backend: "fly-machines", check: "image" },
@@ -72,12 +69,9 @@ const KNOWN_GAPS: ReadonlyArray<{ kind: string; backend: string; check: string }
   { kind: "review-fix-attempt", backend: "github-actions", check: "image" },
   // legacy review-fix queue
   { kind: "legacy-review-fix", backend: "github-actions", check: "image" },
-  { kind: "legacy-review-fix", backend: "local-docker", check: "token:publication" },
   // kg-refresh
   { kind: "kg-refresh", backend: "github-actions", check: "image" },
-  { kind: "kg-refresh", backend: "fly-machines", check: "token:publication" },
   { kind: "kg-refresh", backend: "fly-machines", check: "image" },
-  { kind: "kg-refresh", backend: "local-docker", check: "token:publication" },
 ];
 
 /** Cells the test does not run, each with its reason. Every kind × backend pair is a cell or listed here. */

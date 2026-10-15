@@ -115,7 +115,7 @@ import { createReviewFixAdminFacade } from "../../review-fix-admin-facade.js";
 import { SqliteReviewFixAttemptStore } from "../../review-fix-attempt-store.js";
 import { listActiveRestateReviewFixPrs, queueReviewFixCancellationForClosedPr } from "../../review-fix-close.js";
 import { mintPreparedReviewFixToken } from "../../runner-tokens.js";
-import { VARIANTS, journalEntries, journalText, callWorkflow, cancelInvocation, eventually, queryInvocations, gate, startVariants, stopAll, waitForStep, type Gate } from "./harness.js";
+import { VARIANTS, journalEntries, journalText, journaledRunResult, callWorkflow, cancelInvocation, eventually, queryInvocations, gate, startVariants, stopAll, waitForStep, type Gate } from "./harness.js";
 
 const OWNER = "TestOrg";
 const REPO = "test-repo";
@@ -979,12 +979,12 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       await untilReleased(w.dispatchId);
     }
 
-    async function journalOf(label: string, dispatchId: string): Promise<string> {
+    async function journalOf(label: string, dispatchId: string): Promise<Array<Record<string, unknown>>> {
       const env = tokenEnvironments.get(label)!;
       const rows = await eventually(
         () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'PlanningRun' AND target_service_key = '${dispatchId}'`),
         (r) => r.length > 0, { label: "PlanningRun invocation" });
-      return journalText(await journalEntries(env.adminAPIBaseUrl(), rows[0].id as string));
+      return journalEntries(env.adminAPIBaseUrl(), rows[0].id as string);
     }
 
     describe.each(["github-actions", "fly-machines", "local-docker"] as const)("backend %s", (backend) => {
@@ -993,9 +993,13 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
         await waitForStep(w.read, "wait");
         expect(received).toHaveLength(1);
         expect(received[0].audiences.sort()).toEqual(["progress", "result"]);
-        await finish(w, backend);
-        const text = await journalOf(label, w.dispatchId);
+        // Read while the workflow waits: Restate trims the `dispatch` entry once the run finishes, so a read
+        // after `finish()` finds no token for any reason. The entry must be present before its absence counts.
+        const journal = await journalOf(label, w.dispatchId);
+        expect(() => journaledRunResult(journal, "dispatch")).not.toThrow();
+        const text = journalText(journal);
         for (const token of received[0].tokens) expect(text).not.toContain(token);
+        await finish(w, backend);
       }, 60_000);
     });
 

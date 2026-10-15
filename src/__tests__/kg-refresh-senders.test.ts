@@ -86,7 +86,11 @@ describe("fly-machines sender", () => {
     const cfg = created[0]!.config as unknown as { env: Record<string, string>; guest: Record<string, unknown>; metadata: Record<string, string> };
     expect(cfg.env.MACHINE_NONCE).toBe(NONCE);
     expect(cfg.env.ISSUE_IDENTIFIER).toBe(IDENTIFIER);
+    expect(cfg.env.RUN_TOKEN).toBe("run-tok");
     expect(cfg.env.RUN_PROGRESS_TOKEN).toBe("progress-tok");
+    expect(cfg.env.RUN_PUBLICATION_TOKEN).toBe("pub-tok");
+    // The runner keeps the nonce route only while both are present, so the publication token stays inert.
+    expect(cfg.env.ORCHESTRATOR_URL).toBe("https://orch.example");
     expect(decodeRunConfig(cfg.env.AI_IMPLEMENT_RUN_CONFIG!)?.issue.identifier).toBe(IDENTIFIER);
     expect(cfg.guest).toMatchObject({ cpu_kind: "performance", cpus: 4, memory_mb: 16384 });
     expect(JSON.stringify(created[0])).toContain("d-1");
@@ -173,6 +177,9 @@ describe("local-docker sender", () => {
     expect(arg.machineNonce).toBe(NONCE);
     expect(arg.issueIdentifier).toBe(IDENTIFIER);
     expect(arg.defaultBranch).toBe("trunk");
+    expect(arg).toMatchObject({ runToken: "run-tok", runProgressToken: "progress-tok", runPublicationToken: "pub-tok", runnerCallbackUrl: "https://orch.example" });
+    expect(arg.orchestratorUrl).toBe("https://orch.example");
+    expect(arg.extraEnv).not.toHaveProperty("RUN_PROGRESS_TOKEN");
     expect(result).toEqual({ outcome: "accepted", jobId: "c-1", executionMode: "local-docker", machineId: null, created: false });
     expect(JSON.stringify(result)).not.toContain(NONCE);
   });
