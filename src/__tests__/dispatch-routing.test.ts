@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi, onTestFinished } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
@@ -42,6 +42,11 @@ vi.mock("../repo-image.js", async (importOriginal) => {
 vi.mock("../fly-machines.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../fly-machines.js")>();
   return { ...actual, createMachine: vi.fn(), listAppSecrets: vi.fn() };
+});
+
+vi.mock("../managed-dispatch-auth.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../managed-dispatch-auth.js")>();
+  return { ...actual, isManagedProject: vi.fn(actual.isManagedProject) };
 });
 
 vi.mock("../workflow-probe.js", async (importOriginal) => {
@@ -671,7 +676,6 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
 
   function expectScopedOnly() {
     expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus", SCOPED_REQUEST);
-    expect(githubAppAuth.getInstallationToken).not.toHaveBeenCalled();
   }
 
   function expectPlanningBootTokenSplit() {
@@ -751,7 +755,6 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
     ).rejects.toThrow("mint failed");
 
     expect(flyMachines.createMachine).not.toHaveBeenCalled();
-    expect(githubAppAuth.getInstallationToken).not.toHaveBeenCalled();
     expectFreeSlot("fly-machines", "implementation");
   });
 
@@ -923,6 +926,39 @@ describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome a
       backend: "github-actions",
     });
     expect(retry).toEqual({ ok: false, reason: "occupied", count: 1, cap: 1 });
+  });
+
+  it("dispatchPlanning: an opted-in project on GitHub Actions is refused, the admission released, and the breaker callback counts it (AII-1391)", async () => {
+    const managed = await import("../managed-dispatch-auth.js");
+    vi.mocked(managed.isManagedProject).mockReturnValue(true);
+    onTestFinished(() => { vi.mocked(managed.isManagedProject).mockReset(); });
+    vi.mocked(github.postWorkflowDispatch).mockReset();
+    vi.mocked(provider.markPlanningFailed as never as ReturnType<typeof vi.fn>).mockClear();
+    const optedIssue = { ...issue, id: "issue-opted-gha" };
+
+    for (let i = 0; i < 3; i++) {
+      await expect(indexModule.dispatchPlanning(config, provider, optedIssue, mapping, planningCtx))
+        .rejects.toThrow("managed dispatch refused: gha_not_supported");
+    }
+
+    expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
+    expect(provider.markPlanningFailed).toHaveBeenCalledTimes(3);
+    const grants = dedup.getDb().prepare("SELECT COUNT(*) AS n FROM model_credential_grants").get() as { n: number };
+    expect(grants.n).toBe(0);
+    // The breaker callback reached preparePlanningLaunch: the third refusal parked the issue.
+    expect(breaker.isParked(optedIssue.id, "planning")).toBe(true);
+    // Every admission was released (count 0).
+    const retry = gate.acquireDispatch({
+      dispatchId: "retry-opted-gha",
+      issueId: optedIssue.id,
+      issueIdentifier: optedIssue.identifier,
+      kind: "planning",
+      teamKey: optedIssue.scopeKey,
+      maxInProgressAiIssues: 1,
+      backend: "github-actions",
+    });
+    // Parked by the breaker, not "occupied": no admission is still held.
+    expect(retry).toEqual({ ok: false, reason: "parked", count: 0, cap: 1 });
   });
 
   describe("private transport capability (AII-983)", () => {

@@ -173,6 +173,7 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
         config, provider, issue, mapping, dispatchId: run.dispatchId,
         resolvedPlanningBranch: run.planningContext[PLANNING_CONTEXT_BRANCH_KEY] || mapping.defaultBranch,
         resolveRunnerImage: input.resolveRunnerImage,
+        fireBreakerTrip: input.fireBreakerTrip,
       });
     } catch (err) {
       console.error(`[planning-run] launch preparation failed dispatch=${run.dispatchId}:`, err);
