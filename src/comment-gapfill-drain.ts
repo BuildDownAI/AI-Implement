@@ -12,7 +12,7 @@ import {
 import { claimPendingCommentGapfills, markCommentGapfillProcessed } from "./comment-gapfill-queue.js";
 import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getInFlightJobs, appendLog, countPriorDispatches, updateJobPrUrl, suppressStaleNotifications, type Job } from "./log.js";
 import { resolveExecutionPath, getFlySecretsMinVersion, getFlyProcessLevelSecrets, type RunnerMode } from "./runner-mode.js";
-import { mintRunToken, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
+import { mintLaunchTokens, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { buildEnvelopeDispatchInputs, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, capRunnerEnv, branchPrefixRunnerEnv, skillsRepoRunnerEnv, getPullRequestState, type DispatchResult } from "./github.js";
 import { buildRunConfig, encodeRunConfig } from "./run-config.js";
 import { getRetryPolicy } from "./orchestrator-settings.js";
@@ -293,29 +293,23 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
       let runnerCallbackUrl = "";
       let runToken = "";
       let runProgressToken = "";
+      let runPublicationToken: string | undefined;
       let dispatchId: string | undefined;
       if (opts.runnerCallbackBaseUrl && opts.runnerTokenSecret) {
-        const minted = mintRunToken({
+        dispatchId = crypto.randomUUID();
+        const minted = mintLaunchTokens({
           issueId: prLog.issueId,
           mappingTeamKey: scopeKey,
           phase: "gap-analysis",
-          audience: "result",
-          ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-          secret: opts.runnerTokenSecret,
-        });
-        dispatchId = minted.dispatchId;
-        const progressMinted = mintRunToken({
-          issueId: prLog.issueId,
-          mappingTeamKey: scopeKey,
-          phase: "gap-analysis",
-          audience: "progress",
           dispatchId,
           ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
           secret: opts.runnerTokenSecret,
+          repository: `${mapping.owner}/${mapping.repo}`,
         });
         runnerCallbackUrl = opts.runnerCallbackBaseUrl;
-        runToken = minted.token;
-        runProgressToken = progressMinted.token;
+        runToken = minted.runToken;
+        runProgressToken = minted.runProgressToken;
+        runPublicationToken = minted.runPublicationToken;
       }
 
       const ghToken = await opts.getInstallationToken(item.owner);
@@ -375,6 +369,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
             runnerCallbackUrl: runnerCallbackUrl || undefined,
             runToken: runToken || undefined,
             runProgressToken: runProgressToken || undefined,
+            runPublicationToken,
             commentInstruction: item.instruction || undefined,
             retryPolicy: getRetryPolicy(),
             onBeforeLaunch: () => { launchStarted = true; },
@@ -516,6 +511,8 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
             orchestratorUrl: opts.runnerCallbackBaseUrl ?? undefined,
             runnerCallbackUrl: runnerCallbackUrl || undefined,
             runToken: runToken || undefined,
+            runProgressToken: runProgressToken || undefined,
+            runPublicationToken,
             orchestratorApp: opts.flyOrchestratorApp ?? undefined,
             tenantId: opts.tenantId ?? undefined,
             extraEnv: (() => {
@@ -608,17 +605,9 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
             ref: mapping.defaultBranch,
           }));
           contract = capabilities.contract;
-          const runPublicationToken = dispatchId && opts.runnerCallbackBaseUrl && opts.runnerTokenSecret && capabilities.contract === "envelope" && capabilities.supportsRunPublicationToken
-            ? mintRunToken({
-                issueId: prLog.issueId,
-                mappingTeamKey: scopeKey,
-                phase: "gap-analysis",
-                audience: "publication",
-                dispatchId,
-                repository: `${mapping.owner}/${mapping.repo}`,
-                ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-                secret: opts.runnerTokenSecret,
-              }).token
+          // The mint is unconditional; an old workflow template gets no publication input.
+          const ghaPublicationToken = capabilities.contract === "envelope" && capabilities.supportsRunPublicationToken
+            ? runPublicationToken
             : undefined;
 
           gapFillInputs = (contract === "envelope"
@@ -629,7 +618,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
                 runnerCallbackUrl: runnerCallbackUrl || undefined,
                 runToken,
                 runProgressToken,
-                runPublicationToken,
+                runPublicationToken: ghaPublicationToken,
                 runnerImage,
                 retryPolicy: getRetryPolicy(),
               })

@@ -65,7 +65,7 @@ import { orchestratorTools, setKgRefreshToolDeps } from "../../restate/tools.js"
 import { callToolAsSystem } from "../../restate/tools-client.js";
 import { makeKgRefreshAdminDeps, sweepLegacyKgRefreshRows } from "../../index.js";
 import type { RestateService } from "../../restate/endpoint.js";
-import { VARIANTS, eventually, journalEntries, journaledRunResult, queryInvocations, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, eventually, journalEntries, journalText, journaledRunResult, queryInvocations, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
 
 const KG_SOURCE_REPO = "TestOrg/test-kg-source";
 const NAMESPACE = "https://kg.test.example/";
@@ -680,4 +680,114 @@ describe("Restate kg-refresh pilot: Fly sessions settings are live", () => {
     expect(journaledRunResult(polled!.journal, "resolve")).toMatchObject({ executionMode: "fly-machines" });
     expect(polled!.dispatchResult).toMatchObject({ outcome: "accepted", executionMode: "fly-machines", runUrl: expect.stringContaining("/apps/late-app/") });
   }, 40_000);
+});
+
+// P11 ------------------------------------------------------------------------------
+// The machine senders receive all three run tokens in the launch env, and none enters the journal. The journal is read
+// while the workflow waits for the runner, before it finishes: Restate trims the `dispatch-1` entry afterwards, so a
+// later read would find no token for any reason.
+describe("Restate kg-refresh pilot: launch tokens reach the machine senders and stay out of the journal", () => {
+  let environments: Map<string, RestateEnvironment>;
+  let backend: "fly-machines" | "local-docker" = "fly-machines";
+  let launchEnvs: Array<Record<string, string | undefined>> = [];
+
+  beforeAll(async () => {
+    sim.dataRoot = mkdtempSync(join(tmpdir(), "kgpilotroot-"));
+    const fakeFly = {
+      getMachine: async () => { throw new Error("unexpected getMachine"); },
+      listMachines: async () => [],
+      createMachine: async (opts: { config: { env: Record<string, string> } }) => {
+        launchEnvs.push(opts.config.env);
+        return { id: "m-tokens", state: "started" };
+      },
+      updateMachine: async () => ({}),
+      startMachine: async () => {},
+      waitSettled: async () => null,
+      waitForStopped: async () => {},
+    };
+    const composed = compose({
+      config: {
+        githubAppId: "test-app-id", githubAppPrivateKey: "test-private-key", sessionImage: "runner:test",
+        runnerImageExplicit: false, runnerCallbackBaseUrl: "https://orchestrator.test", runnerTokenSecret: SECRET,
+        flySessionsToken: "fly-test-token", flySessionsApp: "tokens-app", flySessionsRegion: null,
+        localRunnerImage: "local:img", localRunnerOrchestratorUrl: null, healthPort: 8080,
+        anthropicApiKey: null, claudeOAuthToken: null,
+      },
+      keptMachineFly: (() => fakeFly) as never,
+      startLocalRunnerContainer: (async (opts: { runToken?: string; runProgressToken?: string; runPublicationToken?: string; machineNonce: string; orchestratorUrl: string }) => {
+        launchEnvs.push({
+          RUN_TOKEN: opts.runToken, RUN_PROGRESS_TOKEN: opts.runProgressToken, RUN_PUBLICATION_TOKEN: opts.runPublicationToken,
+          MACHINE_NONCE: opts.machineNonce, ORCHESTRATOR_URL: opts.orchestratorUrl,
+        });
+        return { containerId: "c-tokens" };
+      }) as never,
+      resolveExecutionMode: () => backend,
+    });
+    setKgRefreshToolDeps(composed.toolDeps);
+    environments = await startVariants([...composed.services, orchestratorTools]);
+  }, 60_000);
+
+  afterAll(async () => {
+    setKgRefreshToolDeps(null);
+    if (environments) await stopAll(environments);
+    rmSync(sim.dataRoot, { recursive: true, force: true });
+  });
+
+  beforeEach(() => {
+    launchEnvs = [];
+    getDb().prepare("DELETE FROM dispatch_log").run();
+    getDb().prepare("DELETE FROM settings WHERE key LIKE 'kg_%'").run();
+  });
+
+  describe.each(["fly-machines", "local-docker"] as const)("sender %s", (sender) => {
+    it.each(VARIANTS.map(([label]) => label))("P11: the launch env carries the result, progress and publication tokens, and the journal holds none (%s)", async (label) => {
+      backend = sender;
+      const env = environments.get(label);
+      if (!env) throw new Error(`missing Restate variant ${label}`);
+      const answer = await callToolAsSystem("trigger_kg_refresh", {}, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true, restateReady: () => true });
+      if (answer.status !== "ok") throw new Error("trigger_kg_refresh unavailable");
+      const triggerId = (JSON.parse(answer.content[0].text) as { body: { triggerId: string } }).body.triggerId;
+      await eventually(() => launchEnvs.length >= 1, (ok) => ok, { label: `${sender} launch`, timeoutMs: 20_000 });
+      const launched = launchEnvs[0];
+      const tokens = [launched.RUN_TOKEN, launched.RUN_PROGRESS_TOKEN, launched.RUN_PUBLICATION_TOKEN];
+      for (const token of tokens) expect(token).toBeTruthy();
+      expect(new Set(tokens).size).toBe(3);
+      // The nonce and the orchestrator URL keep the publication token inert on a machine backend.
+      expect(launched.MACHINE_NONCE).toBeTruthy();
+      expect(launched.ORCHESTRATOR_URL).toBeTruthy();
+
+      // Read while the workflow waits for the runner. The dispatch-1 result must be journaled before the absence counts.
+      const invocations = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`);
+      const polled = await eventually(
+        async () => {
+          const journal = await journalEntries(env.adminAPIBaseUrl(), invocations[0].id as string);
+          try {
+            return { journal, dispatchResult: journaledRunResult(journal, "dispatch-1") };
+          } catch {
+            return undefined;
+          }
+        },
+        (v) => v !== undefined,
+        { label: "dispatch-1 journaled result", timeoutMs: 20_000 },
+      );
+      expect(polled!.dispatchResult).toMatchObject({ outcome: "accepted", executionMode: sender });
+      const text = journalText(polled!.journal);
+      for (const token of tokens) expect(text).not.toContain(token);
+
+      // End the run, so the next scenario finds the marker clear.
+      const client = createKgRefreshIngressClient(env.baseUrl());
+      await handleRunnerResult({
+        authorization: `Bearer ${launched.RUN_TOKEN}`,
+        body: { phase: "kg-refresh", outcome: "failure", comments: [], ...FAILURE_REPORT } as RunnerResultBody,
+        secret: SECRET,
+        resolveProvider: async () => null,
+        kgRefreshClient: client,
+        kgSourceRepo: KG_SOURCE_REPO,
+      });
+      await eventually(async () => {
+        const marker = await client.repoStatus(KG_SOURCE_REPO);
+        return marker.status === "accepted" ? (marker.value ?? null) : undefined;
+      }, (marker) => marker === null, { label: "KgRepo marker cleared", timeoutMs: 20_000 });
+    }, 40_000);
+  });
 });

@@ -22,6 +22,7 @@ export interface DispatchLocalGapfillInput {
   runnerCallbackUrl?: string;
   runToken?: string;
   runProgressToken?: string;
+  runPublicationToken?: string;
   anthropicApiKey?: string | null;
   claudeOAuthToken?: string | null;
   commentInstruction?: string;
@@ -85,12 +86,13 @@ export async function dispatchLocalGapfill(input: DispatchLocalGapfillInput): Pr
     orchestratorUrl: input.orchestratorUrl,
     runnerCallbackUrl: input.runnerCallbackUrl || undefined,
     runToken: input.runToken || undefined,
+    runProgressToken: input.runProgressToken || undefined,
+    runPublicationToken: input.runPublicationToken || undefined,
     onBeforeLaunch: input.onBeforeLaunch,
     extraEnv: (() => {
       const merged = {
         ...input.mapping.extraEnv,
         AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(runConfig),
-        ...(envelope.run_progress_token ? { RUN_PROGRESS_TOKEN: envelope.run_progress_token } : {}),
       };
       return Object.keys(merged).length > 0 ? merged : undefined;
     })(),
