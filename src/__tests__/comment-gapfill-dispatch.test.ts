@@ -17,6 +17,25 @@ type CreateMachineFn = typeof FlyMachinesModule.createMachine;
 type ListAppSecretsFn = typeof FlyMachinesModule.listAppSecrets;
 type ResolveSessionImageFn = typeof RepoImageModule.resolveSessionImage;
 
+const managedMocks = vi.hoisted(() => ({
+  isManagedProject: vi.fn<(key: string, dispatchId?: string) => boolean>(() => false),
+  prepareManagedDispatch: vi.fn<(...args: unknown[]) => Promise<unknown>>(),
+  settleLaunch: vi.fn(),
+  buildProtectedFlyBootstrap: vi.fn<(...args: unknown[]) => Promise<unknown>>(),
+}));
+
+vi.mock("../managed-dispatch-auth.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../managed-dispatch-auth.js")>();
+  return {
+    ...actual,
+    isManagedProject: managedMocks.isManagedProject,
+    prepareManagedDispatch: managedMocks.prepareManagedDispatch,
+    settleLaunch: managedMocks.settleLaunch,
+  };
+});
+
+vi.mock("../fly-protection-key.js", () => ({ buildProtectedFlyBootstrap: managedMocks.buildProtectedFlyBootstrap }));
+
 const flyMocks = vi.hoisted(() => ({
   createMachine: vi.fn<CreateMachineFn>(),
   listAppSecrets: vi.fn<ListAppSecretsFn>(),
@@ -64,6 +83,11 @@ let admission: typeof AdmissionModule;
 
 beforeEach(async () => {
   vi.resetModules();
+  managedMocks.isManagedProject.mockReset();
+  managedMocks.isManagedProject.mockReturnValue(false);
+  managedMocks.prepareManagedDispatch.mockReset();
+  managedMocks.settleLaunch.mockReset();
+  managedMocks.buildProtectedFlyBootstrap.mockReset();
   dbPath = path.join(
     os.tmpdir(),
     `comment-gapfill-dispatch-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
@@ -1547,5 +1571,221 @@ describe("drainCommentGapfillQueue — admission (AII-787)", () => {
     await drain.drainCommentGapfillQueue(makeBaseDrainOpts({ getMappings: () => ({ TEAM: mapping }), runnerMode: "local", anthropicApiKey: "anthropic-key" }));
 
     expect(admission.count("TEAM")).toBe(0);
+  });
+});
+
+describe("protected dispatch for gap-fill (AII-1392)", () => {
+  const runtime = { ownership: {} } as never;
+
+  function launchDecision(backend: "fly-machines" | "local-docker") {
+    return {
+      kind: "launch",
+      dispatchId: "d-1",
+      projectKey: "TEAM",
+      backend,
+      snapshot: { v: 1, snapshot: true },
+      grant: {},
+      takeBootstrap: vi.fn(() => ({ bootstrap: true })),
+    };
+  }
+
+  function enqueue(prNumber: number, issueId: string): void {
+    seedDispatchLog(issueId, `AII-${prNumber}`, "Managed", "acme", "billing", prNumber);
+    queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber, commentId: 0, commenter: "", instruction: "" });
+  }
+
+  function flyOpts(extra: Partial<DrainInput> = {}): DrainInput {
+    return makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: makeMapping({ executionMode: "fly-machines" }) }),
+      flySessionsToken: "fly-token",
+      flySessionsApp: "fly-app",
+      runnerCallbackBaseUrl: "https://orch.example",
+      modelAuthRuntime: runtime,
+      ...extra,
+    });
+  }
+
+  function localOpts(extra: Partial<DrainInput> = {}): DrainInput {
+    return makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: makeMapping() }),
+      runnerMode: "local",
+      localRunnerOrchestratorUrl: "http://host.docker.internal:8080",
+      modelAuthRuntime: runtime,
+      ...extra,
+    });
+  }
+
+  it("opted-in Fly item carries a sealed grant, agentConfig and no Anthropic credentials", async () => {
+    managedMocks.isManagedProject.mockReturnValue(true);
+    const decision = launchDecision("fly-machines");
+    managedMocks.prepareManagedDispatch.mockResolvedValue(decision);
+    managedMocks.buildProtectedFlyBootstrap.mockResolvedValue({ sealed: "SEALED" });
+    const fly = await import("../fly-machines.js");
+    const builder = vi.spyOn(fly, "buildSessionMachineConfig").mockReturnValue({ config: { env: {} } } as never);
+    enqueue(50, "issue-m-fly");
+
+    await drain.drainCommentGapfillQueue(flyOpts({ anthropicApiKey: "anthropic-key", claudeOAuthToken: "oauth" }));
+
+    expect(managedMocks.prepareManagedDispatch).toHaveBeenCalledWith(
+      expect.objectContaining({ backend: "fly-machines", projectKey: "TEAM", workflowFile: "claude-implement.yml" }),
+      runtime,
+    );
+    const input = builder.mock.calls[0]![0];
+    expect(input.protectedModelBootstrap).toEqual({ sealed: "SEALED" });
+    expect(input.dispatchId).toBe("d-1");
+    expect(input.anthropicApiKey).toBeUndefined();
+    expect(input.claudeOAuthToken).toBeUndefined();
+    expect(input.extraEnv ?? {}).not.toHaveProperty("AI_IMPLEMENT_RUN_CONFIG");
+    const bootstrapArgs = managedMocks.buildProtectedFlyBootstrap.mock.calls[0]![0] as {
+      runConfig: { runnerPhase: string; agentConfig: unknown }; modelAuthUrl: string;
+    };
+    expect(bootstrapArgs.runConfig.runnerPhase).toBe("gap-analysis");
+    expect(bootstrapArgs.runConfig.agentConfig).toEqual(decision.snapshot);
+    expect(bootstrapArgs.modelAuthUrl).toBe("https://orch.example");
+    expect(flyMocks.createMachine).toHaveBeenCalledTimes(1);
+    expect(managedMocks.settleLaunch).not.toHaveBeenCalled();
+  });
+
+  it("opted-in Fly item refuses a repository image override and releases the admission", async () => {
+    managedMocks.isManagedProject.mockReturnValue(true);
+    const decision = launchDecision("fly-machines");
+    managedMocks.prepareManagedDispatch.mockResolvedValue(decision);
+    flyMocks.resolveSessionImage.mockResolvedValue({ image: "custom", source: "override" });
+    enqueue(51, "issue-m-override");
+
+    await drain.drainCommentGapfillQueue(flyOpts());
+
+    expect(flyMocks.createMachine).not.toHaveBeenCalled();
+    expect(decision.takeBootstrap).not.toHaveBeenCalled();
+    expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "rejected", runtime);
+    expect(admission.count("TEAM")).toBe(0);
+  });
+
+  it("opted-in local item passes managed input without Anthropic credentials", async () => {
+    managedMocks.isManagedProject.mockReturnValue(true);
+    const decision = launchDecision("local-docker");
+    managedMocks.prepareManagedDispatch.mockResolvedValue(decision);
+    enqueue(52, "issue-m-local");
+
+    await drain.drainCommentGapfillQueue(localOpts({ anthropicApiKey: "anthropic-key" }));
+
+    const arg = localGapfillMocks.dispatchLocalGapfill.mock.calls[0]![0] as Record<string, unknown>;
+    expect(arg.managed).toEqual({ decision, modelAuthUrl: "http://host.docker.internal:8080" });
+    expect(arg.anthropicApiKey).toBeUndefined();
+    expect(arg.claudeOAuthToken).toBeUndefined();
+    expect(admission.count("TEAM")).toBe(1);
+  });
+
+  it("opted-in local item without an Anthropic key still dispatches", async () => {
+    managedMocks.isManagedProject.mockReturnValue(true);
+    managedMocks.prepareManagedDispatch.mockResolvedValue(launchDecision("local-docker"));
+    enqueue(53, "issue-m-nokey");
+
+    await drain.drainCommentGapfillQueue(localOpts());
+
+    expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
+  });
+
+  it("opted-in local launch that throws before onBeforeLaunch settles rejected and releases", async () => {
+    managedMocks.isManagedProject.mockReturnValue(true);
+    const decision = launchDecision("local-docker");
+    managedMocks.prepareManagedDispatch.mockResolvedValue(decision);
+    localGapfillMocks.dispatchLocalGapfill.mockRejectedValue(new Error("managed dispatch refused: bootstrap unavailable"));
+    enqueue(54, "issue-m-nobootstrap");
+
+    await drain.drainCommentGapfillQueue(localOpts());
+
+    expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "rejected", runtime);
+    expect(admission.count("TEAM")).toBe(0);
+    expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+  });
+
+  it("opted-in local launch that throws after onBeforeLaunch revokes the grant but keeps the admission", async () => {
+    managedMocks.isManagedProject.mockReturnValue(true);
+    const decision = launchDecision("local-docker");
+    managedMocks.prepareManagedDispatch.mockResolvedValue(decision);
+    localGapfillMocks.dispatchLocalGapfill.mockImplementation(async (...args: unknown[]) => {
+      (args[0] as { onBeforeLaunch: () => void }).onBeforeLaunch();
+      throw new Error("docker exploded");
+    });
+    enqueue(55, "issue-m-after");
+
+    await drain.drainCommentGapfillQueue(localOpts());
+
+    expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "unknown", runtime);
+    expect(admission.count("TEAM")).toBe(1);
+  });
+
+  it("opted-in GitHub Actions item is failed before any admission, grant or dispatch", async () => {
+    managedMocks.isManagedProject.mockReturnValue(true);
+    enqueue(56, "issue-m-gha");
+    const opts = makeBaseDrainOpts({ getMappings: () => ({ TEAM: makeMapping() }), modelAuthRuntime: runtime });
+
+    await drain.drainCommentGapfillQueue(opts);
+
+    expect(opts.dispatch).not.toHaveBeenCalled();
+    expect(managedMocks.prepareManagedDispatch).not.toHaveBeenCalled();
+    expect(admission.count("TEAM")).toBe(0);
+    expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+  });
+
+  it.each([
+    ["refuse", { kind: "refuse", category: "configuration-error", code: "bad" }, true],
+    ["leave-queued", { kind: "leave-queued", code: "profile_busy" }, false],
+    ["hold", { kind: "hold", code: "preparation_failed" }, false],
+  ])("a %s decision releases the admission (failed=%s)", async (_name, decision, failed) => {
+    managedMocks.isManagedProject.mockReturnValue(true);
+    managedMocks.prepareManagedDispatch.mockResolvedValue(decision);
+    enqueue(57, "issue-m-nolaunch");
+
+    await drain.drainCommentGapfillQueue(localOpts());
+
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    expect(admission.count("TEAM")).toBe(0);
+    expect(queue.claimPendingCommentGapfills()).toHaveLength(failed ? 0 : 1);
+  });
+
+  it("an opted-in item with no modelAuthRuntime is refused as phase_not_wired", async () => {
+    managedMocks.isManagedProject.mockReturnValue(true);
+    enqueue(58, "issue-m-nort");
+
+    await drain.drainCommentGapfillQueue(localOpts({ modelAuthRuntime: undefined }));
+
+    expect(managedMocks.prepareManagedDispatch).not.toHaveBeenCalled();
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    expect(admission.count("TEAM")).toBe(0);
+    expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+  });
+
+  describe.each([
+    ["opted out", false],
+    ["opted in", true],
+  ])("Fly createMachine failure, %s", (_label, managed) => {
+    beforeEach(() => {
+      managedMocks.isManagedProject.mockReturnValue(managed);
+      managedMocks.prepareManagedDispatch.mockResolvedValue(launchDecision("fly-machines"));
+      managedMocks.buildProtectedFlyBootstrap.mockResolvedValue({ sealed: "SEALED" });
+    });
+
+    async function run(err: Error) {
+      const fly = await import("../fly-machines.js");
+      if (managed) vi.spyOn(fly, "buildSessionMachineConfig").mockReturnValue({ config: { env: {} } } as never);
+      flyMocks.createMachine.mockRejectedValue(err);
+      enqueue(60, "issue-m-create");
+      await drain.drainCommentGapfillQueue(flyOpts({ anthropicApiKey: "anthropic-key" }));
+    }
+
+    it("a 4xx releases the admission", async () => {
+      await run(new Error("Fly API error (422): bad config"));
+      expect(admission.count("TEAM")).toBe(0);
+      expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+      if (managed) expect(managedMocks.settleLaunch).toHaveBeenCalledWith(expect.anything(), "rejected", runtime);
+    });
+
+    it("a 5xx keeps the admission", async () => {
+      await run(new Error("Fly API error (503): unavailable"));
+      expect(admission.count("TEAM")).toBe(1);
+      if (managed) expect(managedMocks.settleLaunch).toHaveBeenCalledWith(expect.anything(), "unknown", runtime);
+    });
   });
 });
