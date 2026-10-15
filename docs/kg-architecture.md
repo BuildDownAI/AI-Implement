@@ -278,7 +278,7 @@ at a gate (`src/restate/kg-refresh-workflow.ts`):
 is recorded as `decision_timeout`. A held dry-run never reaches the gate. Any other report takes the
 unchanged success or failure paths; a `KG_SNAPSHOT_HELD` report with no `snapshotPr` takes the failure path.
 
-The deploy drain counts a suspended invocation, so a held run holds a deploy for up to 24 h.
+The deploy drain counts a suspended invocation, so a held run holds a deploy for up to 24 h. The operator can still decide it during the hold: `get_kg_status` and `decide_kg_refresh` are the two tools the deploy hold lets through, so Accept/Cancel on the KG page work, the run finishes, and the drain then completes. **Refresh graph now** stays refused.
 
 A Stop sent before the gate opens also cancels the held run: the `cancel` promise is durable, so the gate sees it at once.
 

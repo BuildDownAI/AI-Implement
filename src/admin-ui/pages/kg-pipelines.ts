@@ -19,6 +19,7 @@ export const kgPipelinesHtml = `
       <div class="card-body">
         <div class="kpi-trend" id="kg-refresh-stamp">Served graph stamp: —</div>
         <div class="kpi-trend text-secondary" id="kg-refresh-last"></div>
+        <div class="kpi-trend text-secondary" id="kg-last-steps" hidden></div>
         <div class="kpi-trend text-secondary" id="kg-sidecar-status" hidden></div>
         <div style="margin-top: 12px">
           <button class="btn btn-sm" id="kg-refresh-btn" onclick="window.triggerKgRefresh()">Refresh graph now</button>
@@ -124,7 +125,10 @@ export const kgPipelinesScript = `
       } else if (stage === 'reverted') {
         setBadge(badge, 'warn', 'reverted');
       } else if (stage === 'failed') {
-        setBadge(badge, 'fail', 'failed');
+        const concl = data.lastRefresh && data.lastRefresh.conclusion;
+        if (concl === 'operator_cancelled') setBadge(badge, 'neutral', 'cancelled');
+        else if (concl === 'decision_timeout') setBadge(badge, 'warn', 'timed out');
+        else setBadge(badge, 'fail', 'failed');
       } else if (data.kgDegraded) {
         setBadge(badge, 'warn', 'degraded');
       } else if (data.lastRefresh?.gate === 'ingest-needed') {
@@ -141,12 +145,21 @@ export const kgPipelinesScript = `
       else if (stage === 'snapshot-landed') progressText = 'Snapshot commit confirmed \u2014 starting local staging\u2026';
       else if (stage === 'staging') progressText = 'Staging new graph overlay\u2026';
       const last = data.lastRefresh;
-      const lastText = !last
-        ? 'No refresh has run since boot.'
-        : last.gate === 'ingest-needed'
-        ? 'Last refresh: ' + last.detail
-        : 'Last refresh: ' + (last.ok ? 'ok' : 'failed at gate "' + (last.gate || '?') + '"') + ' \u2014 ' + last.detail;
-      document.getElementById('kg-refresh-last').textContent = progressText || lastText;
+      let lastText;
+      if (!last) lastText = 'No refresh has run since boot.';
+      else if (last.gate === 'ingest-needed') lastText = 'Last refresh: ' + last.detail;
+      else if (last.conclusion === 'operator_cancelled') lastText = 'Last refresh: cancelled by operator';
+      else if (last.conclusion === 'decision_timeout') lastText = 'Last refresh: no decision within 24 h \u2014 the held PR was closed';
+      else lastText = 'Last refresh: ' + (last.ok ? 'ok' : 'failed' + (last.gate ? ' at gate "' + last.gate + '"' : '')) + ' \u2014 ' + last.detail;
+      // A run in flight owns the line: the previous run's result must never show beside it.
+      if (data.currentRun && !progressText) {
+        progressText = stage === 'awaiting-decision'
+          ? 'Held for a decision \u2014 see the current run below'
+          : 'Run in flight' + (data.currentRun.step ? ': ' + data.currentRun.step : '') + ' \u2014 see the current run below';
+      }
+      const deployNotice = 'A deploy is in progress \u2014 you can still decide a held run; Refresh graph now returns after it completes.';
+      document.getElementById('kg-refresh-last').textContent =
+        data.deployHeld ? deployNotice + ' ' + (progressText || lastText) : (progressText || lastText);
       // AII-650: surface the sidecar liveness probe (AII-648) next to the stage-based badge —
       // a sidecar can be "serving" per the stage above while the probe shows it rejecting calls.
       const sidecarEl = document.getElementById('kg-sidecar-status');
@@ -159,6 +172,7 @@ export const kgPipelinesScript = `
       } else {
         sidecarEl.hidden = true;
       }
+      renderKgLastSteps(data.currentRun ? null : last);
       renderKgCurrentRun(data.currentRun, stage);
       const busy = !!data.running || !!data.deployHeld;
       document.getElementById('kg-refresh-btn').disabled = busy;
@@ -166,6 +180,25 @@ export const kgPipelinesScript = `
       document.getElementById('kg-accept-btn').disabled = false;
       document.getElementById('kg-cancel-btn').disabled = false;
     } catch (e) { card.hidden = true; }
+  }
+
+  // A held snapshot is reported as a coded failure, so its push step reads failed; show held.
+  function stepLabel(step, outcome) {
+    if (outcome && outcome.held && step.id === 'kg-snapshot-push' && step.status === 'failed') return 'held';
+    return step.status;
+  }
+  window.kgStepLabel = stepLabel;
+
+  function renderKgLastSteps(last) {
+    const el = document.getElementById('kg-last-steps');
+    el.textContent = '';
+    const steps = last && Array.isArray(last.steps) ? last.steps : [];
+    el.hidden = steps.length === 0;
+    steps.forEach(function (st) {
+      const row = document.createElement('div');
+      row.textContent = st.id + ': ' + stepLabel(st, last);
+      el.appendChild(row);
+    });
   }
 
   // The kg-pipelines page is admin-only, as is the /ui/ proxy, so the link needs no role check.

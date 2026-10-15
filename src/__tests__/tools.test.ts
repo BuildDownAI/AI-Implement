@@ -559,6 +559,32 @@ describe("callTool", () => {
     expect(result).toEqual({ status: "deploy-held" });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
+  describe("deploy hold allowlist (AII-1401)", () => {
+    const okFetch = () => vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ content: [] }) }));
+    const held = { ingressBaseUrl: "http://ingress.example", permitsExternalCall: () => false };
+
+    it.each(["decide_kg_refresh", "get_kg_status"])("%s reaches the ingress during a hold", async (name) => {
+      const fetchImpl = okFetch();
+      const result = await callTool(name, {}, HUMAN_USER, { ...held, fetchImpl: fetchImpl as unknown as typeof fetch });
+      expect(result.status).toBe("ok");
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["trigger_kg_refresh", "get_widget", "decide_kg_refresh_x", "x_get_kg_status"])("%s is refused during a hold", async (name) => {
+      const fetchImpl = okFetch();
+      const result = await callTool(name, {}, HUMAN_USER, { ...held, fetchImpl: fetchImpl as unknown as typeof fetch });
+      expect(result).toEqual({ status: "deploy-held" });
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it.each(["decide_kg_refresh", "get_kg_status"])("%s still answers unavailable when Restate is not ready", async (name) => {
+      const fetchImpl = okFetch();
+      const result = await callTool(name, {}, HUMAN_USER, { ...held, fetchImpl: fetchImpl as unknown as typeof fetch, restateReady: () => false });
+      expect(result).toEqual({ status: "unavailable" });
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+  });
+
   it("maps a 200 ToolResponse body to status: \"ok\"", async () => {
     const fetchImpl = vi.fn(async () => ({
       ok: true,
