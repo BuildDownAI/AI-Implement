@@ -5878,6 +5878,24 @@ describe("admin sessions — kg-refresh destroy", () => {
     updateSpy.mockRestore();
   });
 
+  it.each([
+    ["GHA", async () => ghaKgJob(), (id: number) => String(id)],
+    ["Fly", async () => flyKgJob("m-kg-closed"), () => "m-kg-closed"],
+  ])("%s kg-refresh Stop on a completed row answers 409 and leaves the row untouched", async (_n, mk, ident) => {
+    const token = await login("secret");
+    const jobId = await mk();
+    log.updateJobStatus(jobId, "completed");
+    const before = log.getJobById(jobId);
+    const res = await deleteSession(ident(jobId), token, deps(answers(409, { error: "no-refresh-in-flight" })));
+
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body)).toEqual({ error: "no-refresh-in-flight" });
+    const after = log.getJobById(jobId);
+    expect(after?.status).toBe("completed");
+    expect(after?.conclusion).toBe(before?.conclusion);
+    expect(notifyTextMock).not.toHaveBeenCalled();
+  });
+
   it("stamps a row with no dispatchId through the same path", async () => {
     const token = await login("secret");
     const jobId = await flyKgJob("m-kg-nodispatch", null);

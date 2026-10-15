@@ -54,7 +54,7 @@ import { getDeployStartedAt, isDeployHeld } from "./deploy-hold.js";
 import { getInFlightWork } from "./in-flight-work.js";
 import { notifyText } from "./notify.js";
 import { getLastSweepAt } from "./reaper.js";
-import { listLog, getInFlightJobs, getInFlightIssueIds, updateJobStatus, getJobById, markJobNotified, getPulls, getIssueEnrichment } from "./log.js";
+import { listLog, getInFlightJobs, getInFlightIssueIds, updateJobStatus, getJobById, markJobNotified, getJobByMachineId, getPulls, getIssueEnrichment } from "./log.js";
 import { getStepsByJobId } from "./step-log.js";
 import { destroyMachineRecorded } from "./backend-run.js";
 import { listMachines, listAppSecrets, setAppSecrets, unsetAppSecret, fetchMachineLogs } from "./fly-machines.js";
@@ -1840,9 +1840,14 @@ async function handleDestroySession(
 ): Promise<void> {
   // Find the job. For Fly jobs, match by machineId. For GHA jobs (no machineId),
   // fall back to looking up by numeric dispatch_log id passed as the identifier.
+  const closedKgRefresh = () => {
+    const closed = getJobByMachineId(machineId);
+    return closed?.phase === "kg-refresh" ? closed : null;
+  };
   const job =
     getInFlightJobs().find((j) => j.machineId === machineId) ??
-    (Number.isFinite(Number(machineId)) ? getJobById(Number(machineId)) : null);
+    (Number.isFinite(Number(machineId)) ? getJobById(Number(machineId)) : null) ??
+    closedKgRefresh();
 
   // Kg-refresh stop: issue-less run. The KgRefresh workflow owns the row and the machine (AII-901), so the
   // route sends its `cancel` and returns its answer. It writes the row only when no workflow will close it.
@@ -1878,7 +1883,15 @@ async function handleDestroySession(
       return;
     }
 
-    // No workflow will close this row (unknown dispatch, or the run finished): stamp it once.
+    // Re-read after the await: the run may have finished meanwhile, and a Stop must not
+    // overwrite a closed row's result. Stamp only a row that is still open.
+    const current = getJobById(job.id);
+    if (!current || (current.status !== "dispatched" && current.status !== "running")) {
+      json(res, 409, r.body);
+      return;
+    }
+
+    // No workflow will close this row (unknown dispatch): stamp it once.
     updateJobStatus(job.id, "failed", "operator_cancelled");
     if (config.notifyWebhookUrl) {
       notifyText(
