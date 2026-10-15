@@ -141,6 +141,16 @@ The empty-`projectKey` row exists because `prepareAgentRun` rejects an empty key
 
 A grant lives only when the launch is accepted, so `unknown` revokes too. `classifyLaunchError` returns `rejected` when no launch was attempted, for Fly only on a 4xx status in the message (the rule of `isDefinitiveFlyRejectionError`), and `unknown` for local Docker and anything else. A caller releases an owned admission with `launch_rejected` for `leave-queued`, `refuse` and `hold`, and only `refuse` writes a tracker failure, using `refusalText`. The bearer stays inside `takeBootstrap`; `refusalText` is built from `kind`, `category` and `code` only.
 
+## Model-auth routes (AII-1387)
+
+`src/model-auth-routes.ts` serves `POST /runner/model-auth/checkout`, `/checkpoint` and `/finish` from the orchestrator HTTP server, adapting Node requests to `createModelAuthHandlers` (`src/model-auth-server.ts`). The check sits right after the health check in `handleRequest`, before `/api/token`, so no general runner route shadows it. Every method on these paths reaches the handler, which answers 405 for non-POST.
+
+- **Authentication.** The grant bearer. The handler hashes it and looks up `model_credential_grants.bearer_hash`; bindings (with `authMode`) come from `scope_json`. A row whose `scope_json` does not parse is treated as no grant.
+- **Transport rule.** On Fly (`FLY_APP_NAME` set) a request is trusted only when `x-forwarded-proto` contains `https`. Off Fly (local development) it is trusted. A runner must reach the route through the public `RUNNER_CALLBACK_BASE_URL`; one that connects over 6PN carries no `x-forwarded-proto` and gets 403.
+- **Release rule.** The grant's dispatch must still have an unreleased `dispatch_admissions` row. Once the admission is released the grant stops working, whatever its expiry. Revoked and expired grants also fail.
+- **Refresh.** A near-expiry ChatGPT token is refused and `requestChatGptPlanRefresh` is called once.
+- **Logging.** One `[model-auth] <operation> <profile> <status> <category>` line per request, from `SafeModelAuthDiagnostic` only.
+
 ## Rules
 
 1. A test that touches a runner entry point (`runKgRefresh`, `runAutonomous`, `postRunnerResult`) runs disarmed: `RUN_TOKEN`, `RUNNER_CALLBACK_URL`, and `RUN_PROGRESS_TOKEN` are cleared. The file-level hook from PR #467 does this for one file. AII-588 moves it to a vitest setup file so every suite starts disarmed.

@@ -56,6 +56,9 @@ import { allowlistHasNoAdmin, initAccessEntriesTable } from "./access-entries.js
 import { initAccessAuditTable } from "./access-audit.js";
 import { initAuthEventsTable } from "./mcp-auth-events.js";
 import { initAccessPageGrantsTable } from "./access-page-grants.js";
+import { createModelAuthRoutes } from "./model-auth-routes.js";
+import { getModelAuthRuntime } from "./model-auth-runtime.js";
+import { requestChatGptPlanRefresh } from "./restate/chatgpt-plan-account.js";
 import { handleTokenRequest } from "./token-vending.js";
 import { handleDependencyTokenRequest } from "./dependency-token-vending.js";
 import { handlePublicationAuthorityCheck, handlePublicationTokenRequest } from "./publication-token-vending.js";
@@ -4249,6 +4252,11 @@ function startServer(
     dryRunOutcomes: kgRefreshIngressClient,
   });
   migrateLegacyDryRunOutcomes();
+  const modelAuthRoutes = createModelAuthRoutes({
+    runtime: getModelAuthRuntime(config),
+    onFly: config.flyOrchestratorApp !== null,
+    requestPlanRefresh: (id) => requestChatGptPlanRefresh(id),
+  });
 
   const handleRequest: http.RequestListener = (req, res) => {
     const url = req.url || "/";
@@ -4268,6 +4276,20 @@ function startServer(
         lastPollStartedAt: lastPollStartedAt?.toISOString() ?? null,
         lastPollFinishedAt: lastPollFinishedAt?.toISOString() ?? null,
       }));
+      return;
+    }
+
+    // Model-auth routes — every method is routed so the handler answers 405; before the general runner routes.
+    if (modelAuthRoutes.matches(pathname)) {
+      void modelAuthRoutes.handle(req, res).catch((err) => {
+        console.error("[model-auth] Unhandled error:", err instanceof Error ? err.name : "unknown");
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify({ error: "Internal error" }));
+        } else {
+          res.end();
+        }
+      });
       return;
     }
 
