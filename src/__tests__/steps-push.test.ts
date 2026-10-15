@@ -616,6 +616,42 @@ describe("pushStep", () => {
     expect(body.body).toContain("provider: anthropic");
   });
 
+  it("footer names the implementation stage harness and provider for a configured Codex run", async () => {
+    mockGitSuccess();
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
+    } as Response);
+
+    const stage = (agent: string, provider: string) => ({ agent, provider, model: "m", accountProfileId: "p", invocationTimeoutMs: 1000 });
+    const agentConfig = { version: 1, stages: { implementation: stage("codex", "openai"), review: stage("claude", "bedrock") } };
+    await pushStep.run(makeContext({ model: "gpt-6-luna", provider: "anthropic", agentConfig }), BASE_INPUTS, new NoopStepReporter());
+
+    const fetchCall = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(fetchCall[1]?.body as string) as { body: string };
+    expect(body.body).toContain("Generated with AI-Implement · harness: Codex · model: gpt-6-luna · provider: openai");
+    expect(body.body).not.toContain("harness: Claude Code");
+    expect(body.body).not.toContain("provider: anthropic");
+  });
+
+  it("footer keeps Claude Code and shows the stage provider for a configured Bedrock run", async () => {
+    mockGitSuccess();
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
+    } as Response);
+
+    const stage = (agent: string, provider: string) => ({ agent, provider, model: "m", accountProfileId: "p", invocationTimeoutMs: 1000 });
+    const agentConfig = { version: 1, stages: { implementation: stage("claude", "bedrock"), review: stage("codex", "openai") } };
+    await pushStep.run(makeContext({ model: "m", provider: "bedrock", agentConfig }), BASE_INPUTS, new NoopStepReporter());
+
+    const fetchCall = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(fetchCall[1]?.body as string) as { body: string };
+    expect(body.body).toContain("harness: Claude Code · model: m · provider: bedrock");
+  });
+
   it("footer includes Bedrock ARN-style model ID verbatim", async () => {
     mockGitSuccess();
     vi.mocked(fetch).mockResolvedValueOnce({

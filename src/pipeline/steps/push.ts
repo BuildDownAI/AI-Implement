@@ -641,6 +641,12 @@ function buildPullRequestBody(
     : null;
   const unapprovedSection = buildUnapprovedSection(inputs.reviewSummary as ReviewSummary | undefined, inputs.draft === true);
 
+  // A configured run names the implementation stage's harness and provider; the context `provider`
+  // is a narrowed legacy label (anthropic | bedrock) and would show `openai` as anthropic.
+  const implementationStage = context.data.agentConfig?.stages.implementation;
+  const footerHarness = implementationStage ? (implementationStage.agent === "codex" ? "Codex" : "Claude Code") : "Claude Code";
+  const footerProvider = implementationStage?.provider ?? context.data.provider ?? "anthropic";
+
   return [
     ...(dependencyInstallSection ? [dependencyInstallSection, ""] : []),
     ...(unapprovedSection ? [unapprovedSection, ""] : []),
@@ -664,7 +670,7 @@ function buildPullRequestBody(
     "",
     `Fixes ${issueIdentifier}`,
     "",
-    `Generated with AI-Implement · harness: Claude Code · model: ${context.data.model ?? "unknown"} · provider: ${context.data.provider ?? "anthropic"}`,
+    `Generated with AI-Implement · harness: ${footerHarness} · model: ${context.data.model ?? "unknown"} · provider: ${footerProvider}`,
   ].join("\n");
 }
 
