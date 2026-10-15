@@ -1100,6 +1100,33 @@ describe("pushStep draft PRs", () => {
     expect(body.body).not.toContain("Automated verification was run by the AI-Implement pipeline before opening this PR.");
   });
 
+  it.each([true, false])("heads a max_turns PR (draft=%s) as unfinished work, not a review rejection", async (draft) => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/9", number: 9 }),
+      text: async () => "",
+    } as Response);
+
+    await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, draft, reviewSummary: { ...REVIEW_SUMMARY, terminationReason: "max_turns", finalFeedback: "Implementation hit the turn cap." } },
+      new NoopStepReporter(),
+    );
+
+    const [, init] = vi.mocked(fetch).mock.calls[0];
+    const text = String(JSON.parse(String(init?.body)).body);
+    expect(text).toContain("## ⏱️ The implementation did not finish within its turn budget");
+    expect(text).toContain(`because the implementation used its full turn budget before it finished (after ${REVIEW_SUMMARY.iterations} iteration(s)). The work so far is preserved here. It is incomplete.`);
+    expect(text).toContain(draft ? "opened as a draft because" : "opened for human review because");
+    expect(text).toContain("**Run notes:**");
+    expect(text).toContain("_Preflight and verify hooks were skipped because the implementation did not finish._");
+    expect(text).toContain("- [ ] Automated verification was skipped — the implementation did not finish within its turn budget.");
+    expect(text).not.toContain("did not approve");
+    expect(text).not.toContain("review loop ended without approval");
+    expect(text).not.toContain("Reviewer's final feedback");
+  });
+
   it("titles a provider_unavailable 422 non-draft fallback as an interruption, not an unapproved rejection", async () => {
     mockGitSuccess("abc123");
     vi.mocked(fetch)
