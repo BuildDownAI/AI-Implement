@@ -102,6 +102,7 @@ import { getDb } from "../../dedup.js";
 import { acquireDispatch } from "../../dispatch-gate.js";
 import { dispatchPlanning, dispatchSession, reportTerminalJob } from "../../index.js";
 import { preparePlanningLaunch } from "../../planning-launch.js";
+import { resolveRunnerImageForDispatch } from "../../repo-image.js";
 import { resetRestateStatus, setRestateStatus } from "../../restate/status.js";
 import { initMappingsTable } from "../../config.js";
 import { initDispatchBreakerTable, recordDispatchFailure } from "../../dispatch-breaker.js";
@@ -115,7 +116,7 @@ import { createReviewFixAdminFacade } from "../../review-fix-admin-facade.js";
 import { SqliteReviewFixAttemptStore } from "../../review-fix-attempt-store.js";
 import { listActiveRestateReviewFixPrs, queueReviewFixCancellationForClosedPr } from "../../review-fix-close.js";
 import { mintPreparedReviewFixToken } from "../../runner-tokens.js";
-import { VARIANTS, journalEntries, journalText, journaledRunResult, callWorkflow, cancelInvocation, eventually, queryInvocations, gate, startVariants, stopAll, waitForStep, type Gate } from "./harness.js";
+import { VARIANTS, journalEntries, journalEntryNames, journalText, journaledRunResult, callWorkflow, cancelInvocation, eventually, queryInvocations, gate, startVariants, stopAll, waitForStep, type Gate } from "./harness.js";
 
 const OWNER = "TestOrg";
 const REPO = "test-repo";
@@ -128,6 +129,8 @@ interface SimRun { id: number; title: string; createdAt: string; status: string 
 const gh = {
   runs: [] as SimRun[],
   cancelCalls: [] as number[],
+  /** When set, `.ai-implement/image.yml` names an image outside the allowlist. */
+  evilImage: false,
   statusReads: [] as number[],
   /** Holds the first run-status read of a scenario until the test releases it. */
   statusGate: undefined as Gate | undefined,
@@ -229,6 +232,11 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     vi.stubGlobal("fetch", async (url: string | URL | Request, init?: RequestInit) => {
       const href = typeof url === "string" ? url : url instanceof URL ? url.href : url.url;
       if (!href.startsWith("https://api.github.com/")) return realFetch(url as never, init);
+      if (href.endsWith("/contents/.ai-implement/image.yml")) {
+        if (!gh.evilImage) return new Response("not found", { status: 404 });
+        const content = Buffer.from("image: evil.example/runner:1\n").toString("base64");
+        return new Response(JSON.stringify({ type: "file", encoding: "base64", content }), { status: 200 });
+      }
       if (!href.includes(`/repos/${OWNER}/${REPO}/actions/workflows/claude-plan.yml/runs`)) throw new Error(`unexpected GitHub call ${href}`);
       const listGate = gh.listGate;
       if (listGate && !listGate.isReached()) await listGate.wait();
@@ -854,6 +862,62 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       } finally {
         getDb().prepare("UPDATE mappings SET max_in_progress_ai_issues = 10 WHERE team_key = ?").run(TEAM);
       }
+    }, 60_000);
+  });
+
+  describe("the runner image check (AII-1323)", () => {
+    let imageEnvironments: Map<string, RestateEnvironment>;
+
+    beforeAll(async () => {
+      const provider = {
+        id: "linear",
+        findByKey: async (key: string) => issues.get(key) ?? null,
+        clearWorkingState: async () => true,
+        issueUrl: (issue: { identifier: string }) => `https://tracker.test/${issue.identifier}`,
+        postComment: async () => {},
+      };
+      const config = {
+        githubAppId: "1", githubAppPrivateKey: "k", notifyType: "slack", notifyWebhookUrl: null, flySessionsToken: "fly-token", flySessionsApp: "fly-app",
+        runnerCallbackBaseUrl: "http://callback.test", runnerTokenSecret: "planning-image-secret-with-enough-entropy",
+        sessionImage: "ghcr.io/builddownai/ai-implement-runner:latest", runnerImageExplicit: false,
+      } as never;
+      sim.timing = SLOW;
+      imageEnvironments = await startVariants(createProductionPlanningRunServices({
+        config,
+        resolveProvider: async () => provider as never,
+        // The real check, as production wires it (resolveDispatchRunnerImage in src/index.ts).
+        resolveRunnerImage: (cfg, mapping, ghToken) => resolveRunnerImageForDispatch({
+          owner: mapping.owner, repo: mapping.repo, token: ghToken,
+          defaultImage: cfg.sessionImage, runnerImageExplicit: cfg.runnerImageExplicit,
+        }),
+        fireBreakerTrip: async () => {},
+        preparePlanningLaunch,
+        launchPlanningRun: (async (args: { issue: { identifier: string } }) => {
+          launches.push(args.issue.identifier);
+          return { outcome: "accepted", runId: gh.nextRunId++ };
+        }) as never,
+        launchPlanningSession: (async () => { throw new Error("not used: the scenario runs on github-actions"); }) as never,
+        reportTerminalJob: async () => {},
+        sessionDeps: {} as never,
+      }).services);
+    }, 60_000);
+
+    afterAll(async () => { await stopAll(imageEnvironments); });
+    afterEach(() => { gh.evilImage = false; });
+
+    it.each(labels)("an image.yml naming a disallowed image ends launch_rejected, releases the reservation and starts no run (%s)", async (label) => {
+      gh.evilImage = true;
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const w = await dispatch(label, "PLT-70", "github-actions", imageEnvironments);
+      await waitForStep(w.read, "released");
+      await untilReleased(w.dispatchId);
+      expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "launch_rejected" });
+      expect(launches).toEqual([]);
+      expect(gh.runs).toEqual([]);
+      const env = imageEnvironments.get(label)!;
+      const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'PlanningRun' AND target_service_key = '${w.dispatchId}' AND target_handler_name = 'run'`);
+      const names = await journalEntryNames(env.adminAPIBaseUrl(), rows[0].id as string);
+      expect(names.filter((n) => n === "dispatch")).toHaveLength(1);
     }, 60_000);
   });
 

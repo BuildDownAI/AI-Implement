@@ -364,6 +364,21 @@ describe("GithubReviewFixWorker.launch", () => {
     }
   });
 
+  it("returns rejected, and does not dispatch, when the runner image is refused", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    const { RunnerImageNotAllowedError } = await import("../repo-image.js");
+    const worker = new workerModule.GithubReviewFixWorker({
+      credentials: resolver, transport: t.transport,
+      runnerImage: async () => { throw new RunnerImageNotAllowedError("evil.example/runner:1", "eudoxus", ["ghcr.io/builddownai/"], "ai-implement"); },
+    });
+    const outcome = await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-img5" })));
+    expect(outcome.status).toBe("rejected");
+    expect((outcome as { reason: string }).reason).toContain("evil.example/runner:1");
+    expect(t.dispatchCalls).toHaveLength(0);
+  });
+
   it("omits runnerCallbackUrl from the run config when none is configured", async () => {
     seedMapping();
     const { resolver } = makeCredentials();

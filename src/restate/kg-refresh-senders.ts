@@ -9,7 +9,7 @@ import { buildKgRefreshGhaDispatchBody, postWorkflowDispatch } from "../github.j
 import { buildSessionMachineConfig, generateSessionToken } from "../fly-machines.js";
 import type { startLocalRunnerContainer } from "../local-docker.js";
 import type { getInstallationToken } from "../github-app-auth.js";
-import type { resolveRunnerImageForDispatch } from "../repo-image.js";
+import { RunnerImageNotAllowedError, type resolveRunnerImageForDispatch } from "../repo-image.js";
 import { encodeRunConfig, type RunConfigV1 } from "../run-config.js";
 import type { resolveWorkflowCapabilities } from "../workflow-probe.js";
 import type { KgRailDeps } from "../kg-refresh-rail.js";
@@ -76,13 +76,19 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
     const extraEnv: Record<string, string> = {
       AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(input.envelope),
     };
-    const flySessionImage = await deps.resolveRunnerImage({
-      owner: repo.owner,
-      repo: repo.repo,
-      token: ghToken,
-      defaultImage: config.sessionImage,
-      runnerImageExplicit: config.runnerImageExplicit,
-    }) ?? config.sessionImage;
+    let flySessionImage: string;
+    try {
+      flySessionImage = await deps.resolveRunnerImage({
+        owner: repo.owner,
+        repo: repo.repo,
+        token: ghToken,
+        defaultImage: config.sessionImage,
+        runnerImageExplicit: config.runnerImageExplicit,
+      }) ?? config.sessionImage;
+    } catch (err) {
+      if (err instanceof RunnerImageNotAllowedError) return { outcome: "rejected", jobId: null, executionMode };
+      throw err;
+    }
     const machineConfig = buildSessionMachineConfig({
       image: flySessionImage,
       issueId: "kg-refresh",
@@ -185,10 +191,16 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
     const encoded = encodeRunConfig(input.envelope);
     const { token } = await deps.mintToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
     const defaultBranch = await deps.fetchDefaultBranch(token, repo.owner, repo.repo).catch(() => "main");
-    const runnerImage = await deps.resolveRunnerImage({
-      owner: repo.owner, repo: repo.repo, token,
-      defaultImage: config.sessionImage, runnerImageExplicit: config.runnerImageExplicit,
-    });
+    let runnerImage: string | undefined;
+    try {
+      runnerImage = await deps.resolveRunnerImage({
+        owner: repo.owner, repo: repo.repo, token,
+        defaultImage: config.sessionImage, runnerImageExplicit: config.runnerImageExplicit,
+      });
+    } catch (err) {
+      if (err instanceof RunnerImageNotAllowedError) return { outcome: "rejected", jobId: null, executionMode };
+      throw err;
+    }
     const ref = input.envelope.kgSourceRef ?? defaultBranch ?? "main";
     const { supportsRunPublicationToken } = await deps.resolveWorkflowCapabilities({
       owner: repo.owner, repo: repo.repo, workflowFile: KG_REFRESH_WORKFLOW_FILE, token, ref,
