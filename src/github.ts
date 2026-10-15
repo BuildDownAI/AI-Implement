@@ -1,7 +1,7 @@
 import type { RepoMapping } from "./config.js";
 import { GitHubApiError } from "./github-errors.js";
-import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
-import { DEFAULT_RETRY_POLICY, type RetryPolicy } from "./pipeline/retry-backoff.js";
+import { buildRunConfig, encodeRunConfig } from "./run-config.js";
+import type { RetryPolicy } from "./pipeline/retry-backoff.js";
 import { isChecksPermissionError } from "./checks-permission.js";
 
 export interface DispatchInputs {
@@ -435,39 +435,7 @@ export function buildEnvelopeDispatchInputs(
   issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[]; assigneeName?: string },
   opts: EnvelopeDispatchOpts,
 ): DispatchInputs {
-  const runConfig: RunConfigV1 = {
-    v: 1,
-    issue: {
-      id: issue.id,
-      identifier: issue.identifier,
-      title: issue.title,
-      description: issue.description || issue.title,
-    },
-    runnerPhase: opts.runnerPhase,
-    ...(opts.baseBranch ? { baseBranch: opts.baseBranch } : {}),
-    ...(mapping.branchPrefix ? { branchPrefix: mapping.branchPrefix } : {}),
-    ...(mapping.skillsRepo ? { skillsRepo: mapping.skillsRepo } : {}),
-    ...(opts.runnerCallbackUrl ? { runnerCallbackUrl: opts.runnerCallbackUrl } : {}),
-    ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
-    ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
-    ...(opts.prNumber ? { prNumber: opts.prNumber } : {}),
-    ...(opts.commentInstruction ? { commentInstruction: opts.commentInstruction } : {}),
-    ...(mapping.sensitiveAddPatterns != null || mapping.sensitiveAllowPatterns != null
-      ? { sensitiveFiles: { add: mapping.sensitiveAddPatterns ?? undefined, allow: mapping.sensitiveAllowPatterns ?? undefined } }
-      : {}),
-    ...(mapping.dependencyTokenScope != null && opts.runnerPhase !== "planning" ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
-    ...(mapping.referenceRepos != null && opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh" ? { referenceRepos: mapping.referenceRepos } : {}),
-    ...(mapping.reviewers != null ? { reviewers: mapping.reviewers } : {}),
-    ...(mapping.reviewProcess != null ? { reviewProcess: mapping.reviewProcess } : {}),
-    ...(mapping.trustedReviewAuthors != null ? { trustedReviewAuthors: mapping.trustedReviewAuthors } : {}),
-    ...(issue.profiles && issue.profiles.length > 0 ? { profiles: issue.profiles } : {}),
-    ...(issue.assigneeName ? { assigneeName: issue.assigneeName } : {}),
-    ...(opts.planningContext ? { planningContext: opts.planningContext } : {}),
-    ...(opts.groupingParent ? { groupingParent: true } : {}),
-    ...(opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh"
-      ? { retryPolicy: opts.retryPolicy ?? DEFAULT_RETRY_POLICY }
-      : {}),
-  };
+  const runConfig = buildRunConfig({ ...opts, issue, mapping });
 
   return {
     run_config: encodeRunConfig(runConfig),

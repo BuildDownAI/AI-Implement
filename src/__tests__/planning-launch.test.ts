@@ -11,6 +11,7 @@ vi.mock("../github.js", async (importOriginal) => {
   return { ...actual, postWorkflowDispatch: vi.fn() };
 });
 
+vi.mock("../workflow-probe.js", () => ({ resolveWorkflowContract: vi.fn().mockResolvedValue("envelope") }));
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn() }));
 vi.mock("../local-docker.js", () => ({ startLocalRunnerContainer: vi.fn() }));
 vi.mock("../planning-context.js", () => ({
@@ -274,5 +275,44 @@ describe("launchPlanningSession", () => {
   it("not admitted maps to rejected", async () => {
     dispatchSession.mockResolvedValue({ admitted: false });
     expect(await call()).toEqual({ outcome: "rejected", executionMode: "local-docker" });
+  });
+});
+
+describe("preparePlanningLaunch tokens", () => {
+  let dbPath: string;
+  let dedup: typeof import("../dedup.js");
+
+  beforeEach(async () => {
+    vi.resetModules();
+    dbPath = path.join(os.tmpdir(), `planning-prepare-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
+    process.env.DEDUP_DB_PATH = dbPath;
+    dedup = await import("../dedup.js");
+    dedup.getDb();
+    const auth = await import("../github-app-auth.js");
+    vi.mocked(auth.getInstallationToken).mockResolvedValue("gh-token");
+  });
+
+  afterEach(() => {
+    dedup.closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  it("sends run_progress_token in the envelope inputs and mints no publication token", async () => {
+    const mod = await import("../planning-launch.js");
+    const launch = await mod.preparePlanningLaunch({
+      config: { githubAppId: "id", githubAppPrivateKey: "key", runnerCallbackBaseUrl: "http://cb", runnerTokenSecret: "secret" } as unknown as AppConfig,
+      provider: { id: "linear" } as unknown as TicketingProvider,
+      issue: { id: "i-1", identifier: "AII-1", title: "t", description: "d", scopeKey: "AII", nativeStatus: "Todo" } as TicketIssue,
+      mapping: { owner: "eudoxus", repo: "AI-Implement", workflowFile: "w.yml", planningWorkflowFile: "p.yml", defaultBranch: "main" } as unknown as RepoMapping,
+      dispatchId: "d-prep-1",
+      resolvedPlanningBranch: "main",
+      resolveRunnerImage: async () => undefined,
+    });
+    const inputs = launch.planningDispatchInputs as Record<string, string>;
+    expect(inputs.run_token).toBeTruthy();
+    expect(inputs.run_progress_token).toBeTruthy();
+    expect(inputs.run_publication_token).toBeUndefined();
+    const rows = dedup.getDb().prepare("SELECT audience FROM runner_tokens WHERE dispatch_id = 'd-prep-1' ORDER BY audience").all();
+    expect(rows).toEqual([{ audience: "progress" }, { audience: "result" }]);
   });
 });

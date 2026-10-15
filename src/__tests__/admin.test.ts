@@ -2683,6 +2683,61 @@ describe("admin settings", () => {
     expect(body.flySessionsApp.dbValue).toBeNull();
   });
 
+  describe("runnerImageAllowedPrefixes (AII-1321)", () => {
+    const post = async (token: string, body: unknown) => request("/api/settings", "POST", "secret", body as never, token);
+    const get = async (token: string) => JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
+
+    it("GET returns value, effective and builtIn with no row", async () => {
+      const token = await login("secret");
+      expect((await get(token)).runnerImageAllowedPrefixes).toEqual({
+        value: null,
+        effective: [],
+        builtIn: ["ghcr.io/builddownai/", "ghcr.io/<owner>/"],
+      });
+    });
+
+    it("POST stores a valid list joined with commas, and GET agrees", async () => {
+      const token = await login("secret");
+      const res = await post(token, { runnerImageAllowedPrefixes: " ghcr.io/a/ , ,registry.example.com:5000/team/b/ " });
+      expect(res.statusCode).toBe(200);
+      const expected = { value: "ghcr.io/a/,registry.example.com:5000/team/b/", effective: ["ghcr.io/a/", "registry.example.com:5000/team/b/"] };
+      expect(JSON.parse(res.body).runnerImageAllowedPrefixes).toMatchObject(expected);
+      expect((await get(token)).runnerImageAllowedPrefixes).toMatchObject(expected);
+    });
+
+    it.each([[null], ["   "]])("POST %j deletes the row", async (value) => {
+      const token = await login("secret");
+      await post(token, { runnerImageAllowedPrefixes: "ghcr.io/a/" });
+      const res = await post(token, { runnerImageAllowedPrefixes: value });
+      expect(res.statusCode).toBe(200);
+      expect((await get(token)).runnerImageAllowedPrefixes).toMatchObject({ value: null, effective: [] });
+    });
+
+    it.each([
+      ["a non-string", 5, "runnerImageAllowedPrefixes must be a string or null"],
+      ["over 1000 characters", "ghcr.io/" + "a".repeat(1000) + "/", undefined],
+      ["a space inside an entry", "ghcr.io/a b/", undefined],
+      ["a wildcard", "ghcr.io/a*/", undefined],
+      ["an entry without a trailing slash", "ghcr.io/acme", 'each prefix must end with "/"'],
+      ["a bare registry host", "ghcr.io/", undefined],
+      ["an empty path segment", "ghcr.io//", undefined],
+    ])("POST rejects %s with 400 and writes nothing", async (_label, value, message) => {
+      const token = await login("secret");
+      const res = await post(token, { runnerImageAllowedPrefixes: value, retryPolicy: { reviewMaxTurns: 60 } });
+      expect(res.statusCode).toBe(400);
+      if (message) expect(JSON.parse(res.body).error).toBe(message);
+      const after = await get(token);
+      expect(after.runnerImageAllowedPrefixes.value).toBeNull();
+      expect(after.retryPolicy).toEqual(after.retryPolicyDefaults);
+    });
+
+    it("POST refuses a user-role session with 403", async () => {
+      const token = adminSession.createSession({ email: "reader@eudoxus.ai", sub: "google|reader", provider: "google", name: "Reader" });
+      const res = await request("/api/settings", "POST", "secret", { runnerImageAllowedPrefixes: "ghcr.io/a/" } as never, token);
+      expect(res.statusCode).toBe(403);
+    });
+  });
+
   /** A fake Restate: `set_runner_backend` merges into `state`, and the refresh reads it back through the real cache. */
   function fakeRunnerBackend(opts: { down?: boolean } = {}) {
     const state = { app: null as string | null, region: null as string | null };

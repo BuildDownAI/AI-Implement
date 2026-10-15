@@ -53,6 +53,8 @@ vi.mock("../../notify.js", async (importOriginal) => ({
   notifyText: async () => {},
 }));
 
+vi.mock("../../workflow-probe.js", () => ({ resolveWorkflowContract: async () => "envelope" }));
+vi.mock("../../planning-context.js", () => ({ buildPlanningContextInputs: async () => ({}) }));
 vi.mock("../../github-app-auth.js", () => ({ getInstallationToken: async () => "sim-gh-token" }));
 vi.mock("../../github.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../github.js")>()),
@@ -98,7 +100,9 @@ vi.mock("../../restate/planning-run-workflow.js", async (importOriginal) => {
 
 import { getDb } from "../../dedup.js";
 import { acquireDispatch } from "../../dispatch-gate.js";
-import { dispatchPlanning, reportTerminalJob } from "../../index.js";
+import { dispatchPlanning, dispatchSession, reportTerminalJob } from "../../index.js";
+import { preparePlanningLaunch } from "../../planning-launch.js";
+import { resolveRunnerImageForDispatch } from "../../repo-image.js";
 import { resetRestateStatus, setRestateStatus } from "../../restate/status.js";
 import { initMappingsTable } from "../../config.js";
 import { initDispatchBreakerTable, recordDispatchFailure } from "../../dispatch-breaker.js";
@@ -112,7 +116,7 @@ import { createReviewFixAdminFacade } from "../../review-fix-admin-facade.js";
 import { SqliteReviewFixAttemptStore } from "../../review-fix-attempt-store.js";
 import { listActiveRestateReviewFixPrs, queueReviewFixCancellationForClosedPr } from "../../review-fix-close.js";
 import { mintPreparedReviewFixToken } from "../../runner-tokens.js";
-import { VARIANTS, callWorkflow, cancelInvocation, eventually, queryInvocations, gate, startVariants, stopAll, waitForStep, type Gate } from "./harness.js";
+import { VARIANTS, journalEntries, journalEntryNames, journalText, journaledRunResult, callWorkflow, cancelInvocation, eventually, queryInvocations, gate, startVariants, stopAll, waitForStep, type Gate } from "./harness.js";
 
 const OWNER = "TestOrg";
 const REPO = "test-repo";
@@ -125,6 +129,8 @@ interface SimRun { id: number; title: string; createdAt: string; status: string 
 const gh = {
   runs: [] as SimRun[],
   cancelCalls: [] as number[],
+  /** When set, `.ai-implement/image.yml` names an image outside the allowlist. */
+  evilImage: false,
   statusReads: [] as number[],
   /** Holds the first run-status read of a scenario until the test releases it. */
   statusGate: undefined as Gate | undefined,
@@ -226,6 +232,11 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     vi.stubGlobal("fetch", async (url: string | URL | Request, init?: RequestInit) => {
       const href = typeof url === "string" ? url : url instanceof URL ? url.href : url.url;
       if (!href.startsWith("https://api.github.com/")) return realFetch(url as never, init);
+      if (href.endsWith("/contents/.ai-implement/image.yml")) {
+        if (!gh.evilImage) return new Response("not found", { status: 404 });
+        const content = Buffer.from("image: evil.example/runner:1\n").toString("base64");
+        return new Response(JSON.stringify({ type: "file", encoding: "base64", content }), { status: 200 });
+      }
       if (!href.includes(`/repos/${OWNER}/${REPO}/actions/workflows/claude-plan.yml/runs`)) throw new Error(`unexpected GitHub call ${href}`);
       const listGate = gh.listGate;
       if (listGate && !listGate.isReached()) await listGate.wait();
@@ -854,6 +865,62 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     }, 60_000);
   });
 
+  describe("the runner image check (AII-1323)", () => {
+    let imageEnvironments: Map<string, RestateEnvironment>;
+
+    beforeAll(async () => {
+      const provider = {
+        id: "linear",
+        findByKey: async (key: string) => issues.get(key) ?? null,
+        clearWorkingState: async () => true,
+        issueUrl: (issue: { identifier: string }) => `https://tracker.test/${issue.identifier}`,
+        postComment: async () => {},
+      };
+      const config = {
+        githubAppId: "1", githubAppPrivateKey: "k", notifyType: "slack", notifyWebhookUrl: null, flySessionsToken: "fly-token", flySessionsApp: "fly-app",
+        runnerCallbackBaseUrl: "http://callback.test", runnerTokenSecret: "planning-image-secret-with-enough-entropy",
+        sessionImage: "ghcr.io/builddownai/ai-implement-runner:latest", runnerImageExplicit: false,
+      } as never;
+      sim.timing = SLOW;
+      imageEnvironments = await startVariants(createProductionPlanningRunServices({
+        config,
+        resolveProvider: async () => provider as never,
+        // The real check, as production wires it (resolveDispatchRunnerImage in src/index.ts).
+        resolveRunnerImage: (cfg, mapping, ghToken) => resolveRunnerImageForDispatch({
+          owner: mapping.owner, repo: mapping.repo, token: ghToken,
+          defaultImage: cfg.sessionImage, runnerImageExplicit: cfg.runnerImageExplicit,
+        }),
+        fireBreakerTrip: async () => {},
+        preparePlanningLaunch,
+        launchPlanningRun: (async (args: { issue: { identifier: string } }) => {
+          launches.push(args.issue.identifier);
+          return { outcome: "accepted", runId: gh.nextRunId++ };
+        }) as never,
+        launchPlanningSession: (async () => { throw new Error("not used: the scenario runs on github-actions"); }) as never,
+        reportTerminalJob: async () => {},
+        sessionDeps: {} as never,
+      }).services);
+    }, 60_000);
+
+    afterAll(async () => { await stopAll(imageEnvironments); });
+    afterEach(() => { gh.evilImage = false; });
+
+    it.each(labels)("an image.yml naming a disallowed image ends launch_rejected, releases the reservation and starts no run (%s)", async (label) => {
+      gh.evilImage = true;
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const w = await dispatch(label, "PLT-70", "github-actions", imageEnvironments);
+      await waitForStep(w.read, "released");
+      await untilReleased(w.dispatchId);
+      expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "launch_rejected" });
+      expect(launches).toEqual([]);
+      expect(gh.runs).toEqual([]);
+      const env = imageEnvironments.get(label)!;
+      const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'PlanningRun' AND target_service_key = '${w.dispatchId}' AND target_handler_name = 'run'`);
+      const names = await journalEntryNames(env.adminAPIBaseUrl(), rows[0].id as string);
+      expect(names.filter((n) => n === "dispatch")).toHaveLength(1);
+    }, 60_000);
+  });
+
   it("the stale-admission sweep and the terminal-callback reconcile leave a Restate-owned planning row", async () => {
     const dispatchId = "plan-sweep-1";
     const decision = acquire({
@@ -887,4 +954,129 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     expect(() => mintPreparedReviewFixToken({ attemptId: dispatchId, audience: "result", secret: "s" })).toThrow(/no current authority/);
     expect(getDb().prepare("SELECT COUNT(*) AS n FROM runner_tokens WHERE dispatch_id = ?").get(dispatchId)).toEqual({ n: 0 });
   });
+
+  describe("the run tokens of a planning launch (AII-1320)", () => {
+    const TOKEN_SECRET = "planning-token-secret-with-enough-entropy";
+    /** What each launch received: the audiences present and the token strings. */
+    let received: Array<{ audiences: string[]; tokens: string[] }> = [];
+    let throwAfterMint = false;
+    let tokenEnvironments: Map<string, RestateEnvironment>;
+
+    const seen = (tokens: Record<string, string | undefined>) => {
+      const named: Record<string, string | undefined> = { result: tokens.result, progress: tokens.progress, publication: tokens.publication };
+      const present = Object.entries(named).filter(([, v]) => v);
+      received.push({ audiences: present.map(([k]) => k), tokens: present.map(([, v]) => v as string) });
+    };
+
+    beforeAll(async () => {
+      const provider = {
+        id: "linear",
+        findByKey: async (key: string) => issues.get(key) ?? null,
+        clearWorkingState: async () => true,
+        issueUrl: (issue: { identifier: string }) => `https://tracker.test/${issue.identifier}`,
+        postComment: async () => {},
+      };
+      const outcomeConfig = { notifyType: "slack", notifyWebhookUrl: "https://hooks.test/notify" } as never;
+      const outcomeRegistry = { forMapping: async () => provider } as never;
+      const config = {
+        githubAppId: "1", githubAppPrivateKey: "k", notifyType: "slack", notifyWebhookUrl: null, flySessionsToken: "fly-token", flySessionsApp: "fly-app",
+        runnerCallbackBaseUrl: "http://callback.test", runnerTokenSecret: TOKEN_SECRET,
+      } as never;
+      sim.timing = SLOW;
+      tokenEnvironments = await startVariants(createProductionPlanningRunServices({
+        config,
+        resolveProvider: async () => provider as never,
+        resolveRunnerImage: async () => undefined,
+        fireBreakerTrip: async () => {},
+        // The real preparation mints the tokens, as production does.
+        preparePlanningLaunch,
+        launchPlanningRun: (async (args: { issue: { id: string; identifier: string; title: string; scopeKey: string }; dispatchId: string; admissionGeneration: number; planningDispatchInputs: Record<string, string> }) => {
+          const inputs = args.planningDispatchInputs;
+          seen({ result: inputs.run_token, progress: inputs.run_progress_token, publication: inputs.run_publication_token });
+          if (throwAfterMint) {
+            throwAfterMint = false;
+            throw new Error("injected: the launch call failed after the mint");
+          }
+          appendLog({
+            issueId: args.issue.id, issueIdentifier: args.issue.identifier, issueTitle: args.issue.title, teamKey: args.issue.scopeKey,
+            repo: `${OWNER}/${REPO}`, dispatchId: args.dispatchId, admissionGeneration: args.admissionGeneration,
+            executionMode: "github-actions", phase: "planning",
+          });
+          const run: SimRun = { id: gh.nextRunId++, title: `${PLANNING_RUN_TITLE_PREFIX}${args.issue.identifier}`, createdAt: new Date().toISOString(), status: "in_progress" };
+          gh.runs.push(run);
+          return { outcome: "accepted", runId: run.id };
+        }) as never,
+        // The real dispatchSession mints for the container backends; only the launch call is simulated.
+        launchPlanningSession: (async (args: { issue: { id: string; identifier: string; title: string; scopeKey: string; nativeStatus: string }; execPath: "fly-machines" | "local-docker"; mapping: never; reservation: { dispatchId: string } }) => {
+          const session = await dispatchSession(config, provider as never, args.issue as never, args.mapping, { count: 0, lastDispatchedAt: null }, "default", {
+            phase: "planning", tokenTtlSeconds: 1800, doMarkDispatched: false, shadow: false, backendKind: args.execPath,
+            onPostDispatch: async () => {},
+            backend: async ({ runToken, runProgressToken, runPublicationToken, markLaunchAttempted }) => {
+              seen({ result: runToken, progress: runProgressToken, publication: runPublicationToken });
+              markLaunchAttempted();
+              const id = `${args.execPath === "fly-machines" ? "m" : "c"}-${++backends.created}`;
+              if (args.execPath === "fly-machines") backends.machines.set(id, "started"); else backends.containers.set(id, true);
+              backends.names.set(planningSessionName(args.reservation.dispatchId), id);
+              return { machineId: id, sessionImage: "img", ghToken: "sim-gh-token", executionMode: args.execPath, statusComment: null };
+            },
+          }, args.reservation as never);
+          return session.admitted
+            ? { outcome: "accepted", machineId: session.machineId, executionMode: args.execPath }
+            : { outcome: "rejected", executionMode: args.execPath };
+        }) as never,
+        reportTerminalJob: async (job) => { await reportTerminalJob(outcomeConfig, outcomeRegistry, job, { ownerCall: true }); },
+        sessionDeps: {} as never,
+      }).services);
+    }, 60_000);
+
+    afterAll(async () => { await stopAll(tokenEnvironments); });
+    beforeEach(() => { received = []; throwAfterMint = false; });
+
+    /** Ends the run the way the backend's own end does, then waits for the release. */
+    async function finish(w: Awaited<ReturnType<typeof dispatch>>, backend: PlanningRunInput["backend"]) {
+      const { jobId } = await eventually(() => w.read(), (st) => st.jobId !== null, { label: "bound" });
+      updateJobStatus(getJobByDispatchId(w.dispatchId)!.id, "completed", "planning_callback");
+      await w.hook(w.dispatchId);
+      if (backend === "github-actions") gh.runs.find((r) => String(r.id) === jobId)!.status = "completed";
+      else if (backend === "fly-machines") backends.machines.set(jobId!, "destroyed");
+      else backends.containers.set(jobId!, false);
+      await untilReleased(w.dispatchId);
+    }
+
+    async function journalOf(label: string, dispatchId: string): Promise<Array<Record<string, unknown>>> {
+      const env = tokenEnvironments.get(label)!;
+      const rows = await eventually(
+        () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'PlanningRun' AND target_service_key = '${dispatchId}'`),
+        (r) => r.length > 0, { label: "PlanningRun invocation" });
+      return journalEntries(env.adminAPIBaseUrl(), rows[0].id as string);
+    }
+
+    describe.each(["github-actions", "fly-machines", "local-docker"] as const)("backend %s", (backend) => {
+      it.each(labels)("the launch receives exactly the result and progress tokens, and the journal holds neither (%s)", async (label) => {
+        const w = await dispatch(label, "PLT-60", backend, tokenEnvironments);
+        await waitForStep(w.read, "wait");
+        expect(received).toHaveLength(1);
+        expect(received[0].audiences.sort()).toEqual(["progress", "result"]);
+        // Read while the workflow waits: Restate trims the `dispatch` entry once the run finishes, so a read
+        // after `finish()` finds no token for any reason. The entry must be present before its absence counts.
+        const journal = await journalOf(label, w.dispatchId);
+        expect(() => journaledRunResult(journal, "dispatch")).not.toThrow();
+        const text = journalText(journal);
+        for (const token of received[0].tokens) expect(text).not.toContain(token);
+        await finish(w, backend);
+      }, 60_000);
+    });
+
+    // Depends on a retry (docs/restate-testing.md), so alwaysReplay only. disableRetries fails the invocation at once.
+    it("a launch that throws after the mint is retried, mints again, and the workflow does not end launch_rejected (alwaysReplay)", async () => {
+      throwAfterMint = true;
+      const w = await dispatch("alwaysReplay", "PLT-61", "github-actions", tokenEnvironments);
+      await waitForStep(w.read, "wait");
+      expect(received).toHaveLength(2);
+      expect(received[1].audiences.sort()).toEqual(["progress", "result"]);
+      await finish(w, "github-actions");
+      expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
+    }, 60_000);
+  });
+
 });

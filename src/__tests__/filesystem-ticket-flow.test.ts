@@ -331,7 +331,8 @@ describe("filesystem tickets through the local PR loop", () => {
         { id: "branch-preview", gates: false },
       ],
     });
-    expect(dockerInput.extraEnv!.RUN_PROGRESS_TOKEN).toEqual(expect.any(String));
+    expect(dockerInput.runProgressToken).toEqual(expect.any(String));
+    expect(dockerInput.extraEnv).not.toHaveProperty("RUN_PROGRESS_TOKEN");
 
     const jobs = log.listLog({ limit: 5 });
     const gap = jobs.find((job) => job.phase === "gap-analysis");

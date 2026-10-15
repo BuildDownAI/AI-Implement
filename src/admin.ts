@@ -72,6 +72,8 @@ import {
   setRetryPolicy,
   getLinearPickupLabel,
   DEFAULT_LINEAR_PICKUP_LABEL,
+  getRunnerImageAllowedPrefixes,
+  validateRunnerImagePrefixes,
   DEFAULT_RETRY_POLICY,
   type RetryPolicy,
   getFlySessionsConfig,
@@ -2682,6 +2684,14 @@ function flySettingsView(): Record<string, unknown> {
   };
 }
 
+/** Display text only; `<owner>` is literal. */
+const RUNNER_IMAGE_BUILT_IN_PREFIXES = ["ghcr.io/builddownai/", "ghcr.io/<owner>/"];
+
+/** Validates a runnerImageAllowedPrefixes POST value; returns the stored string (null = delete) or an error. */
+function parseRunnerImagePrefixes(raw: unknown): { value: string | null } | { error: string } {
+  return validateRunnerImagePrefixes(raw);
+}
+
 function handleGetSettings(
   _req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -2702,6 +2712,11 @@ function handleGetSettings(
       effective: getLinearPickupLabel(),
       default: DEFAULT_LINEAR_PICKUP_LABEL,
     },
+    runnerImageAllowedPrefixes: {
+      value: dbSettings.runnerImageAllowedPrefixes,
+      effective: getRunnerImageAllowedPrefixes(),
+      builtIn: RUNNER_IMAGE_BUILT_IN_PREFIXES,
+    },
     retryPolicy: getRetryPolicy(),
     retryPolicyDefaults: DEFAULT_RETRY_POLICY,
   });
@@ -2720,6 +2735,7 @@ async function handlePostSettings(
     kgRefreshReportIssue?: string | null;
     kgBaseRepo?: string | null;
     linearPickupLabel?: string | null;
+    runnerImageAllowedPrefixes?: string | null;
     retryPolicy?: Partial<RetryPolicy> | null;
   };
   try {
@@ -2732,6 +2748,16 @@ async function handlePostSettings(
   } catch {
     json(res, 400, { error: "Invalid request body" });
     return;
+  }
+
+  let runnerImagePrefixes: string | null | undefined;
+  if ("runnerImageAllowedPrefixes" in body) {
+    const parsed = parseRunnerImagePrefixes(body.runnerImageAllowedPrefixes);
+    if ("error" in parsed) {
+      json(res, 400, { error: parsed.error });
+      return;
+    }
+    runnerImagePrefixes = parsed.value;
   }
 
   if ("retryPolicy" in body) {
@@ -2762,6 +2788,9 @@ async function handlePostSettings(
       return;
     }
     setOrchestratorSetting("linearPickupLabel", trimmed ? trimmed : null);
+  }
+  if (runnerImagePrefixes !== undefined) {
+    setOrchestratorSetting("runnerImageAllowedPrefixes", runnerImagePrefixes);
   }
 
   const flyPatch: Record<string, string | null> = {};
@@ -2833,6 +2862,11 @@ async function handlePostSettings(
       value: dbSettings.linearPickupLabel,
       effective: getLinearPickupLabel(),
       default: DEFAULT_LINEAR_PICKUP_LABEL,
+    },
+    runnerImageAllowedPrefixes: {
+      value: dbSettings.runnerImageAllowedPrefixes,
+      effective: getRunnerImageAllowedPrefixes(),
+      builtIn: RUNNER_IMAGE_BUILT_IN_PREFIXES,
     },
     retryPolicy: getRetryPolicy(),
     retryPolicyDefaults: DEFAULT_RETRY_POLICY,

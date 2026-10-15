@@ -24,6 +24,7 @@ import type { ProviderRegistry } from "../providers/registry.js";
 import { createReviewFixAttempt } from "./review-fix-attempt.js";
 import { createReviewFixPR } from "./review-fix-pr.js";
 import type { RestateService } from "./endpoint.js";
+import { getRetryPolicy } from "../orchestrator-settings.js";
 import { lateExternalReviewWorkflowKey, type LateExternalReviewInput } from "./late-external-review.js";
 import { clearPendingLateReview, getLatestWorkRowForPr, recordPendingLateReview } from "../log.js";
 
@@ -172,6 +173,7 @@ export function createProductionReviewFixServices(
   const github = createReviewFixGithubAdapter({ credentials });
   const worker = new GithubReviewFixWorker({ credentials, scopeStore: reviewFixAttemptStoreScopeStore(store),
     runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
+    retryPolicy: getRetryPolicy,
     runnerImage: (target) => resolveRunnerImageForDispatch({ ...target,
       defaultImage: config.sessionImage, runnerImageExplicit: config.runnerImageExplicit }),
     callbackInputs: async (attemptId) => {

@@ -655,6 +655,33 @@ describe("buildSessionMachineConfig", () => {
     expect(result.config.env!.RUN_TOKEN).toBe("run-token");
   });
 
+  it("sets the progress and publication tokens only when non-empty", () => {
+    const set = buildSessionMachineConfig({
+      ...baseInput,
+      runProgressToken: "progress-token",
+      runPublicationToken: "publication-token",
+    });
+    expect(set.config.env!.RUN_PROGRESS_TOKEN).toBe("progress-token");
+    expect(set.config.env!.RUN_PUBLICATION_TOKEN).toBe("publication-token");
+
+    for (const overrides of [{ runProgressToken: "", runPublicationToken: "" }, {}]) {
+      const env = buildSessionMachineConfig({ ...baseInput, ...overrides }).config.env!;
+      expect(env).not.toHaveProperty("RUN_PROGRESS_TOKEN");
+      expect(env).not.toHaveProperty("RUN_PUBLICATION_TOKEN");
+    }
+  });
+
+  it("extraEnv overrides the progress and publication tokens", () => {
+    const env = buildSessionMachineConfig({
+      ...baseInput,
+      runProgressToken: "progress-token",
+      runPublicationToken: "publication-token",
+      extraEnv: { RUN_PROGRESS_TOKEN: "extra-progress", RUN_PUBLICATION_TOKEN: "extra-publication" },
+    }).config.env!;
+    expect(env.RUN_PROGRESS_TOKEN).toBe("extra-progress");
+    expect(env.RUN_PUBLICATION_TOKEN).toBe("extra-publication");
+  });
+
   it("extraEnv overrides standard env vars when keys collide", () => {
     const result = buildSessionMachineConfig({
       ...baseInput,

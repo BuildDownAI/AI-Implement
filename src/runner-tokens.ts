@@ -92,6 +92,38 @@ export function mintRunToken(input: MintInput): MintOutput {
   return { token, dispatchId };
 }
 
+/** The run tokens each run kind gets, on every backend. */
+export const LAUNCH_TOKEN_AUDIENCES: Record<RunTokenClaims["phase"], readonly RunTokenAudience[]> = {
+  implementation: ["result", "progress", "publication"],
+  "gap-analysis": ["result", "progress", "publication"],
+  // Planning never pushes, and the vending route refuses a planning publication token.
+  planning: ["result", "progress"],
+  "kg-refresh": ["result", "progress", "publication"],
+};
+
+export interface LaunchTokens {
+  runToken: string;
+  runProgressToken: string;
+  runPublicationToken?: string;
+}
+
+/** Mints every token LAUNCH_TOKEN_AUDIENCES names for `phase`, after it deletes the unconsumed
+ *  rows of `dispatchId`, so a retried launch step can mint again. */
+export function mintLaunchTokens(input: Omit<MintInput, "audience"> & { repository: string }): LaunchTokens {
+  const dispatchId = input.dispatchId ?? crypto.randomUUID();
+  const audiences = LAUNCH_TOKEN_AUDIENCES[input.phase];
+  const base = { ...input, dispatchId };
+  return getDb().transaction((): LaunchTokens => {
+    getDb().prepare("DELETE FROM runner_tokens WHERE dispatch_id = ? AND consumed_at IS NULL").run(dispatchId);
+    const mint = (audience: RunTokenAudience) => mintRunToken({ ...base, audience }).token;
+    return {
+      runToken: mint("result"),
+      runProgressToken: mint("progress"),
+      ...(audiences.includes("publication") ? { runPublicationToken: mint("publication") } : {}),
+    };
+  })();
+}
+
 // Token verification is intentionally DB-only (runner_tokens table) — no in-memory state
 // is consulted. This means verification survives orchestrator restarts as long as the
 // SQLite volume persists across deploys.

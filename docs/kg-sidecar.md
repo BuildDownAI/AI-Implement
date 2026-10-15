@@ -252,41 +252,7 @@ These tools need no working sidecar. Since AII-711 they are handlers on the `orc
 
 ### `get_deploy_posture`
 
-No inputs. Returns a read-only snapshot of the current deploy and runner-channel state so that skills can price a merge before filing or merging.
-
-```json
-{
-  "autoDeploy": true,
-  "watchedRepo": "BuildDownAI/AI-Implement",
-  "watchedRef": "testing",
-  "runningCommit": "<sha>",
-  "headCommit": "<sha>",
-  "upToDate": false,
-  "deploy": {
-    "held": false,
-    "inFlight": false,
-    "lastOutcome": "deployed-ok"
-  },
-  "runnerChannel": {
-    "image": "ghcr.io/builddownai/ai-implement-runner",
-    "channelTag": "next",
-    "channelCommit": "<sha or null>",
-    "matchesHead": false
-  },
-  "mergeCost": "deploy+image"
-}
-```
-
-Field notes:
-
-- `autoDeploy`, `held`, `runningCommit`, `headCommit`, `lastOutcome`, `watchedRepo`, `watchedRef` — from the same source as `GET /api/deployment-status`.
-- `upToDate` — `true` when `runningCommit === headCommit`, `null` when either is unknown.
-- `deploy.inFlight` — `true` when runner jobs are currently executing (not whether a deploy is in progress).
-- `deploy.lastOutcome` — one of `"deployed-ok"`, `"deployed-not-serving"`, `"build-failed"`, or `null` when no deploy has completed yet.
-- `runnerChannel.channelTag` — `"next"` for `testing`, `"latest"` for `main`, `null` for other branches (no corresponding runner build).
-- `runnerChannel.channelCommit` — the source commit baked into the channel image via its OCI config labels (`org.opencontainers.image.revision` or `AI_IMPLEMENT_SOURCE_COMMIT`). Best-effort: a registry error or missing label yields `null`.
-- `runnerChannel.matchesHead` — `true` when `channelCommit === headCommit`, `null` when `channelCommit` is null.
-- `mergeCost` — `"deploy+image"` when `autoDeploy` is on (every merge triggers a deploy and a runner image build); `"image"` when autoDeploy is off but the watched branch has a runner build (`main` or `testing`); `"none"` otherwise.
+No inputs. Returns a read-only snapshot of deploy and runner-channel state. The fields, and when a merged change reaches a run, are in [When a change reaches a run](runner-images.md#when-a-change-reaches-a-run).
 
 ## Repository layout
 
