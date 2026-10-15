@@ -1016,71 +1016,76 @@ describe("fetchMachineLogs", () => {
   beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
   afterEach(() => { vi.restoreAllMocks(); });
 
-  it("appends ?lines=N to the URL to prevent streaming hang", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      text: async () => '{"message":"hello"}\n{"message":"world"}\n',
-    } as Response);
+  const entry = (message: unknown, timestamp?: string) => ({
+    type: "logs",
+    attributes: { message, ...(timestamp ? { timestamp } : {}) },
+  });
+  const ok = (data: unknown[]) =>
+    ({ ok: true, json: async () => ({ data }) }) as unknown as Response;
 
-    await fetchMachineLogs(TOKEN, APP, "machine-123");
+  it("requests the api.fly.io logs endpoint filtered by instance", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(ok([entry("hello")]));
+
+    await fetchMachineLogs("FlyV1 abc", APP, "m1");
 
     const [url] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(
-      `https://api.machines.dev/v1/apps/${APP}/machines/machine-123/logs?lines=100`,
-    );
+    expect(url).toBe(`https://api.fly.io/api/v1/apps/${APP}/logs?instance=m1`);
   });
 
-  it("uses custom lastN when provided", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      text: async () => '{"message":"line"}\n',
-    } as Response);
-
-    await fetchMachineLogs(TOKEN, APP, "machine-123", 50);
-
-    const [url] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toContain("?lines=50");
+  it("sends a FlyV1 token unchanged, not as Bearer", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(ok([]));
+    await fetchMachineLogs("FlyV1 abc", APP, "m1");
+    const [, opts] = vi.mocked(fetch).mock.calls[0];
+    expect((opts as RequestInit).headers).toMatchObject({ Authorization: "FlyV1 abc" });
   });
 
-  it("parses NDJSON and extracts message fields", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      text: async () =>
-        '{"message":"starting server"}\n{"message":"listening on :3000"}\n',
-    } as Response);
-
-    const result = await fetchMachineLogs(TOKEN, APP, "machine-123");
-    expect(result).toBe("starting server\nlistening on :3000");
+  it("adds the FlyV1 prefix to a bare token", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(ok([]));
+    await fetchMachineLogs("fm2_xyz", APP, "m1");
+    const [, opts] = vi.mocked(fetch).mock.calls[0];
+    expect((opts as RequestInit).headers).toMatchObject({ Authorization: "FlyV1 fm2_xyz" });
   });
 
-  it("falls back to raw line when JSON parse fails", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      text: async () => "not-json-at-all\n",
-    } as Response);
-
-    const result = await fetchMachineLogs(TOKEN, APP, "machine-123");
-    expect(result).toBe("not-json-at-all");
+  it("parses data[].attributes.message", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(ok([entry("a"), entry("b")]));
+    expect(await fetchMachineLogs(TOKEN, APP, "m1")).toBe("a\nb");
   });
 
-  it("falls back to raw line when parsed JSON has no message field", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      text: async () => '{"level":"info","ts":1234}\n',
-    } as Response);
-
-    const result = await fetchMachineLogs(TOKEN, APP, "machine-123");
-    expect(result).toBe('{"level":"info","ts":1234}');
+  it("skips entries without a string message", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(ok([entry("a"), { attributes: {} }, null, entry(5), entry("b")]));
+    expect(await fetchMachineLogs(TOKEN, APP, "m1")).toBe("a\nb");
   });
 
-  it("returns empty string for blank body", async () => {
+  it("returns empty string for empty data", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(ok([]));
+    expect(await fetchMachineLogs(TOKEN, APP, "m1")).toBe("");
+  });
+
+  it("keeps the last lastN messages in chronological order", async () => {
+    const data = Array.from({ length: 150 }, (_, i) =>
+      entry(`l${i}`, `2026-10-15T00:00:00.${String(i).padStart(3, "0")}Z`));
+    vi.mocked(fetch).mockResolvedValueOnce(ok(data));
+    const lines = (await fetchMachineLogs(TOKEN, APP, "m1", 50)).split("\n");
+    expect(lines).toHaveLength(50);
+    expect(lines[0]).toBe("l100");
+    expect(lines[49]).toBe("l149");
+  });
+
+  it("orders newest-first responses by timestamp", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(ok([
+      entry("c", "2026-10-15T00:00:03Z"),
+      entry("b", "2026-10-15T00:00:02Z"),
+      entry("a", "2026-10-15T00:00:01Z"),
+    ]));
+    expect(await fetchMachineLogs(TOKEN, APP, "m1", 2)).toBe("b\nc");
+  });
+
+  it("throws on a non-JSON 200 body", async () => {
     vi.mocked(fetch).mockResolvedValueOnce({
       ok: true,
-      text: async () => "   \n  ",
-    } as Response);
-
-    const result = await fetchMachineLogs(TOKEN, APP, "machine-123");
-    expect(result).toBe("");
+      json: async () => { throw new SyntaxError("bad json"); },
+    } as unknown as Response);
+    await expect(fetchMachineLogs(TOKEN, APP, "m1")).rejects.toThrow("bad json");
   });
 
   it("throws on error response", async () => {

@@ -2262,7 +2262,7 @@ const LOG_MAX_CHARS = 5_000;
  * on successful sessions.
  *
  * Note: when a machine was already auto-destroyed (machineConclusion ===
- * "destroyed") the Fly API returns 404 and no log dump is possible.  Callers
+ * "destroyed") the logs lookup may fail with 404 and no log dump is possible.  Callers
  * must skip this function for that path.
  */
 async function postSessionLogs(
