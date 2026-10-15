@@ -541,15 +541,22 @@ export async function unsetAppSecret(
 
 // ── Machine Logs ─────────────────────────────────────────────────────────────
 
+export const FLY_LOGS_API_BASE = "https://api.fly.io/api/v1";
+
 /**
- * Fetches the last `lastN` log lines from a Fly Machine and returns them as a
+ * Fetches the last `lastN` log lines for a Fly Machine and returns them as a
  * single newline-joined string.
  *
- * The Fly Machines logs endpoint (`/v1/apps/{app}/machines/{id}/logs`) is a
- * streaming NDJSON endpoint that can remain open on a running machine.
- * Passing `?lines=N` caps the response to the last N lines so the stream
- * closes immediately and `res.text()` cannot hang.  An AbortController with a
- * 10 s timeout is added as a second line of defence.
+ * The Machines API has no logs route (it answers 404 for every machine), so
+ * this reads the app-wide logs endpoint on `api.fly.io`, filtered by
+ * `?instance=<machineId>`. That endpoint rejects `Bearer <token>` (401) and
+ * accepts the token as-is (`FlyV1 ...`), so the header is not built with
+ * `flyHeaders`; a token without the prefix gets it added.
+ *
+ * The endpoint returns about 100 entries per page and has no line cap, so
+ * `lastN` is applied client-side and `next_token` pagination is not followed.
+ * Entries are sorted by `attributes.timestamp` when present so "last N" holds
+ * whatever order the API uses. The 10 s abort covers the body read.
  */
 export async function fetchMachineLogs(
   token: string,
@@ -557,38 +564,38 @@ export async function fetchMachineLogs(
   machineId: string,
   lastN = 100,
 ): Promise<string> {
-  const url = `${FLY_API_BASE}/apps/${appName}/machines/${machineId}/logs?lines=${lastN}`;
+  const url = `${FLY_LOGS_API_BASE}/apps/${appName}/logs?instance=${encodeURIComponent(machineId)}`;
+  const trimmed = token.trim();
+  const authorization = trimmed.startsWith("FlyV1 ") ? trimmed : `FlyV1 ${trimmed}`;
 
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), 10_000);
 
-  let res: Response;
   try {
-    res = await fetch(url, { headers: flyHeaders(token), signal: ac.signal });
+    const res = await fetch(url, {
+      headers: { Authorization: authorization, "Content-Type": "application/json" },
+      signal: ac.signal,
+    });
+
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`Failed to fetch logs for machine ${machineId} (${res.status}): ${body}`);
+    }
+
+    const parsed = (await res.json()) as { data?: unknown };
+    const entries = Array.isArray(parsed?.data) ? parsed.data : [];
+    const lines: { message: string; ts: string }[] = [];
+    for (const entry of entries) {
+      const attrs = (entry as { attributes?: { message?: unknown; timestamp?: unknown } } | null)?.attributes;
+      if (typeof attrs?.message !== "string") continue;
+      lines.push({ message: attrs.message, ts: typeof attrs.timestamp === "string" ? attrs.timestamp : "" });
+    }
+    // Stable sort: entries without timestamps keep API order.
+    if (lines.every((l) => l.ts)) lines.sort((x, y) => (x.ts < y.ts ? -1 : x.ts > y.ts ? 1 : 0));
+    return lines.slice(-lastN).map((l) => l.message).join("\n");
   } finally {
     clearTimeout(timer);
   }
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Failed to fetch logs for machine ${machineId} (${res.status}): ${body}`);
-  }
-
-  const raw = await res.text();
-  if (!raw.trim()) return "";
-
-  return raw
-    .split("\n")
-    .filter((line) => line.trim())
-    .map((line) => {
-      try {
-        const parsed = JSON.parse(line) as Record<string, unknown>;
-        return typeof parsed.message === "string" ? parsed.message : line;
-      } catch {
-        return line;
-      }
-    })
-    .join("\n");
 }
 
 // ── Token / Nonce Helpers ────────────────────────────────────────────────────

@@ -3210,6 +3210,16 @@ describe("admin machine logs", () => {
     expect(JSON.parse(res.body).error).toBe("Logs no longer available");
   });
 
+  it.each([401, 403])("returns a distinct 502 permission error when Fly returns %i", async (status) => {
+    fetchMachineLogsMock.mockRejectedValueOnce(new Error(`Failed to fetch logs for machine machine-abc (${status}): denied`));
+    const token = await login("secret");
+    const res = await requestWithFlyConfig("/api/sessions/machine-abc/logs", "GET", token);
+    expect(res.statusCode).toBe(502);
+    const error = JSON.parse(res.body).error as string;
+    expect(error).toMatch(/permission|credential/);
+    expect(error).not.toContain("no longer available");
+  });
+
   it("returns 500 on unexpected Fly API error", async () => {
     fetchMachineLogsMock.mockRejectedValueOnce(new Error("network timeout"));
     const token = await login("secret");

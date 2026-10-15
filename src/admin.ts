@@ -1966,6 +1966,9 @@ async function handleGetMachineLogs(
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes("(404)")) {
       json(res, 404, { error: "Logs no longer available" });
+    } else if (msg.includes("(401)") || msg.includes("(403)")) {
+      // 502, not 401: the SPA logs out on 401.
+      json(res, 502, { error: "Fly rejected the sessions token for log access (permission or credential problem)" });
     } else {
       json(res, 500, { error: msg });
     }
