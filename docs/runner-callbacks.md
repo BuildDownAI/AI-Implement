@@ -110,6 +110,37 @@ A run kind that a Restate workflow owns sends its "I started" signal as a step r
 
 The planning result callback still marks the planning job complete and still skips the admission release, for both lifecycles. For a project on the `restate` lifecycle, the planning termination hook (`createPlanningAdmissionTerminationHook`) also sends `report` to the `PlanningRun` workflow whose key is the dispatch id (the handler takes no idempotency key; a second `report` is a no-op); a Legacy dispatch keeps the fast release. The planning failure callback calls the same hook, so it also sends `report`; for a Restate-owned dispatch it first writes the row as `failed` with the failure code as its conclusion, and the workflow keeps that conclusion. The `report` only wakes the workflow. The workflow still confirms the run ended with `readStatus` and releases the reservation itself. A lost signal costs at most one tick: 5 seconds in the confirm phase, 30 seconds in the wait (`PLANNING_RUN_CONFIRM_TICK_MS`, `PLANNING_RUN_TICK_MS`). See [restate.md](restate.md#the-planning-run).
 
+## Managed dispatch decisions
+
+`prepareManagedDispatch` (`src/managed-dispatch-auth.ts`, AII-1386) maps one `prepareAgentRun` result to one decision. Every dispatch path calls it so each makes the same choice for the same state. It has no consumer yet. The checks run in this order:
+
+| State, in check order | Decision | Reserve | Mint |
+| -- | -- | -- | -- |
+| `isManagedProject` false (includes an empty `projectKey`) | `legacy`, `prepareAgentRun` not called | no | no |
+| backend `github-actions` | `refuse` configuration-error `gha_not_supported` | no | no |
+| stored or resolved snapshot selects `claude-subscription` | `refuse` configuration-error `claude_subscription_unsupported` | no | no |
+| `prepareAgentRun` throws | `hold` `preparation_failed` | n/a | n/a |
+| `legacy` | `legacy` | no | no |
+| `ready`, `reused: false`, `reservations: []` | `launch` | no | yes |
+| `ready`, `reused: true` (bootstrap already taken) | `hold` `bootstrap_consumed` | n/a | no |
+| `ready` with a non-empty `reservations` | `releaseRejectedLaunch`, then `refuse` configuration-error `claude_subscription_unsupported` | released | revoked |
+| `queued` | `leave-queued` `profile_busy` | n/a | no |
+| `configuration-error` | `refuse` configuration-error, same code | no | no |
+| `authentication-required` | `refuse` authentication-required, same code | no | no |
+| `recovery-required` | `hold`, same code | n/a | n/a |
+
+The empty-`projectKey` row exists because `prepareAgentRun` rejects an empty key as `invalid_request`, and Jira issues can carry an empty scope key.
+
+`settleLaunch` runs after the launch attempt:
+
+| Decision | Outcome | Action |
+| -- | -- | -- |
+| `launch` | `accepted` | nothing; the grant lives until the run ends |
+| `launch` | `rejected` or `unknown` | `releaseRejectedLaunch(dispatchId, [], runtime)`; revokes the grant |
+| any other kind | any | nothing, `{ revoked: false }` |
+
+A grant lives only when the launch is accepted, so `unknown` revokes too. `classifyLaunchError` returns `rejected` when no launch was attempted, for Fly only on a 4xx status in the message (the rule of `isDefinitiveFlyRejectionError`), and `unknown` for local Docker and anything else. A caller releases an owned admission with `launch_rejected` for `leave-queued`, `refuse` and `hold`, and only `refuse` writes a tracker failure, using `refusalText`. The bearer stays inside `takeBootstrap`; `refusalText` is built from `kind`, `category` and `code` only.
+
 ## Rules
 
 1. A test that touches a runner entry point (`runKgRefresh`, `runAutonomous`, `postRunnerResult`) runs disarmed: `RUN_TOKEN`, `RUNNER_CALLBACK_URL`, and `RUN_PROGRESS_TOKEN` are cleared. The file-level hook from PR #467 does this for one file. AII-588 moves it to a vitest setup file so every suite starts disarmed.
