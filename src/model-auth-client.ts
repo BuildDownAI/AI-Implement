@@ -507,6 +507,16 @@ interface ProfileEntry {
   state: ProfileState;
 }
 
+/** The diagnostic stage for a profile: only when exactly one grant binding uses it. */
+function soleStage(
+  source: ModelAuthClientOptions["source"],
+  profileId: string,
+): ModelAuthGrantBinding["stage"] | undefined {
+  if (source.kind !== "hosted") return undefined;
+  const matching = source.grant.bindings.filter((b) => b.profileId === profileId);
+  return matching.length === 1 ? matching[0]!.stage : undefined;
+}
+
 function isRetryableStatus(status: number): boolean {
   return status === 429 || status >= 500;
 }
@@ -749,7 +759,7 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
 
   async function obtainSecret(
     request: { profileId: string; authMode: AccountAuthMode },
-    binding: ModelAuthGrantBinding | undefined,
+    stage: ModelAuthGrantBinding["stage"] | undefined,
   ): Promise<{ secret: ModelAuthSecret; ownerGeneration?: number }> {
     const source = options.source;
     if (source.kind === "local") {
@@ -770,7 +780,7 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
     }
     if (res.status < 200 || res.status >= 300) {
       const category = serverCategory(res.body);
-      diagnose("checkout", request.profileId, binding?.stage, category ?? "recovery_required");
+      diagnose("checkout", request.profileId, stage, category ?? "recovery_required");
       return fail("server_rejected", { profileId: request.profileId, ...(category ? { serverCategory: category } : {}) });
     }
     const parsed = parseModelAuthCheckoutResponse(res.body);
@@ -853,7 +863,9 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
         if (binding.authMode !== request.authMode) fail("binding_mismatch", { profileId: request.profileId });
       }
 
-      const { secret, ownerGeneration } = await obtainSecret(request, binding);
+      // One profile may serve several stages and checkout carries no stage: label only when unambiguous.
+      const stage = soleStage(options.source, request.profileId);
+      const { secret, ownerGeneration } = await obtainSecret(request, stage);
       const expectedKinds: readonly string[] =
         request.authMode === "bedrock"
           ? ["aws-bedrock"]
@@ -875,7 +887,7 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
       const entry: ProfileEntry = {
         profileId: request.profileId,
         authMode: request.authMode,
-        ...(binding ? { stage: binding.stage } : {}),
+        ...(stage ? { stage } : {}),
         secret,
         ...(secret.kind === "chatgpt-access-token" ? { expiresAt: secret.expiresAt } : {}),
         ...(ownerGeneration !== undefined ? { ownerGeneration } : {}),
@@ -917,11 +929,7 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
           const requiredMs = opts?.requiredMs ?? 0;
           if (entry.expiresAt === undefined || entry.expiresAt - now() < requiredMs + CHATGPT_RENEWAL_MARGIN_MS) {
             // Once per invocation; the state stays `ready` if this throws, and no run starts.
-            const binding =
-              options.source.kind === "hosted"
-                ? options.source.grant.bindings.find((b) => b.profileId === profileId)
-                : undefined;
-            const renewed = await obtainSecret({ profileId, authMode: entry.authMode }, binding);
+            const renewed = await obtainSecret({ profileId, authMode: entry.authMode }, entry.stage);
             if (renewed.secret.kind !== "chatgpt-access-token") {
               fail("credential_source_mismatch", { profileId });
             }

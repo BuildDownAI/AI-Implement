@@ -21,6 +21,7 @@ import {
   MODEL_AUTH_ROUTES,
   sealedBootstrapAad,
   type ModelAuthGrantBootstrapV1,
+  type SafeModelAuthDiagnostic,
 } from "../model-auth-contract.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 
@@ -862,6 +863,38 @@ describe("client", () => {
       expect(f.calls.length).toBe(before);
       expect(client.status("sub")).toBe("uncertain");
     });
+  });
+
+  it("does not label a multi-stage profile with its first binding's stage", async () => {
+    const seen: Array<SafeModelAuthDiagnostic> = [];
+    const { transport } = fakeTransport((route) => reply(route, ack()));
+    const bindings = (["planning", "implementation", "review"] as const).map((stage) => ({
+      stage,
+      profileId: "sub",
+      profileRevision: 1,
+      authMode: "claude-subscription" as const,
+      ownerGeneration: 3,
+    }));
+    const client = make(transport, { onDiagnostic: (d) => seen.push(d) }, grant({ bindings }));
+    await client.checkout(sub);
+    await client.invoke("sub", async () => undefined);
+    await client.finish("sub", "completed");
+    expect(seen.length).toBeGreaterThanOrEqual(3);
+    for (const d of seen) {
+      expect(d.stage).not.toBe("planning");
+      expect("stage" in d).toBe(false);
+    }
+  });
+
+  it("still labels a single-binding profile with its stage", async () => {
+    const seen: Array<SafeModelAuthDiagnostic> = [];
+    const { transport } = fakeTransport((route) => reply(route, ack()));
+    const client = make(transport, { onDiagnostic: (d) => seen.push(d) });
+    await client.checkout(sub);
+    await client.invoke("sub", async () => undefined);
+    await client.finish("sub", "completed");
+    expect(seen.length).toBeGreaterThanOrEqual(3);
+    for (const d of seen) expect(d.stage).toBe("implementation");
   });
 
   it("diagnostics carry no bearer or secret", async () => {
