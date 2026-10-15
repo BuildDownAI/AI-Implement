@@ -2,17 +2,22 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { getMappings, initMappingsTable, upsertMapping } from "../../config.js";
 import { ProviderRegistry } from "../../providers/registry.js";
 import { validateReviewFixResultMetadata, validateScopedPrIdentity } from "../../review-fix-contract.js";
+import { decodeRunConfig, encodeRunConfig } from "../../run-config.js";
 import { FakeProvider } from "../providers/fake.js";
+import { testDb } from "./test-db.js";
 import {
   makeAppConfig,
+  makeAppendLogEntry,
   makeContext,
   makeExecutor,
+  makeFeedbackLoopOutputs,
   makeIssue,
   makeJob,
   makeMapping,
   makeProvider,
   makeRegistry,
   makeReviewFixResult,
+  makeReviewFixRunConfig,
   makeScopedPrIdentity,
 } from "./builders.js";
 
@@ -59,6 +64,36 @@ describe("makeJob", () => {
     const running = makeJob({ status: "running" });
     expect(running.status).toBe("running");
     expect({ ...running, status: makeJob().status }).toEqual(makeJob());
+  });
+});
+
+describe("makeAppendLogEntry", () => {
+  it("builds an entry the log stores and reads back unchanged, as a first dispatch", async () => {
+    const { log } = (await testDb({ modules: { log: () => import("../../log.js") } })).modules;
+    const entry = makeAppendLogEntry();
+    const job = log.getJobById(log.appendLog(entry));
+    expect(job).toMatchObject({ ...entry, status: "dispatched", dispatchNumber: 1, groupingParent: false });
+  });
+
+  it("names the issue makeIssue builds", () => {
+    const issue = makeIssue();
+    expect(makeAppendLogEntry()).toMatchObject({
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      issueTitle: issue.title,
+      teamKey: issue.scopeKey,
+      issueState: issue.nativeStatus,
+    });
+  });
+
+  it("gives each build its own dispatch id", () => {
+    expect(makeAppendLogEntry().dispatchId).not.toBe(makeAppendLogEntry().dispatchId);
+  });
+
+  it("replaces only the overridden field", () => {
+    const entry = makeAppendLogEntry({ phase: "planning" });
+    expect(entry.phase).toBe("planning");
+    expect({ ...entry, phase: "implementation" }).toEqual({ ...makeAppendLogEntry(), dispatchId: entry.dispatchId });
   });
 });
 
@@ -114,6 +149,48 @@ describe("makeReviewFixResult", () => {
     const retried = makeReviewFixResult({ githubRunAttempt: 2 });
     expect(retried.githubRunAttempt).toBe(2);
     expect({ ...retried, githubRunAttempt: makeReviewFixResult().githubRunAttempt }).toEqual(makeReviewFixResult());
+  });
+});
+
+describe("makeReviewFixRunConfig", () => {
+  it("builds an envelope the runner decodes unchanged, for a pilot attempt on the shared PR identity", () => {
+    const config = makeReviewFixRunConfig();
+    expect(decodeRunConfig(encodeRunConfig(config))).toEqual(config);
+    expect(config.reviewFix).toMatchObject(makeScopedPrIdentity());
+    expect(config.reviewFix!.deadlineAt).toBeGreaterThan(Date.now());
+  });
+
+  it("derives the issue and PR number from the attempt", () => {
+    const config = makeReviewFixRunConfig({ attemptId: "attempt-9", repository: "acme/app", prNumber: 7 });
+    expect(config.issue).toMatchObject({ id: "review-fix:attempt-9", identifier: "review-fix-7", title: "Review-fix for acme/app#7" });
+    expect(config.prNumber).toBe("7");
+  });
+
+  it("replaces only the overridden field", () => {
+    const deadlineAt = Date.now() + 1_000;
+    const withoutCallback = makeReviewFixRunConfig({ deadlineAt }, { runnerCallbackUrl: undefined });
+    expect(withoutCallback.runnerCallbackUrl).toBeUndefined();
+    expect({ ...withoutCallback, runnerCallbackUrl: "https://orchestrator.example" }).toEqual(makeReviewFixRunConfig({ deadlineAt }));
+  });
+});
+
+describe("makeFeedbackLoopOutputs", () => {
+  it("builds a run the reviewer approved on its first pass", () => {
+    const outputs = makeFeedbackLoopOutputs();
+    expect(outputs).toMatchObject({ approved: true, iterations: 1, terminationReason: "approved" });
+    expect(outputs.passes).toEqual([expect.objectContaining({ iteration: 1, reviewApproved: true })]);
+  });
+
+  it("keeps the passes and termination in step with approved and iterations", () => {
+    const outputs = makeFeedbackLoopOutputs({ approved: false, iterations: 3 });
+    expect(outputs.terminationReason).toBe("iterations_exhausted");
+    expect(outputs.passes.map((p) => [p.iteration, p.reviewApproved])).toEqual([[1, false], [2, false], [3, false]]);
+    expect(makeFeedbackLoopOutputs({ iterations: 2 }).passes.map((p) => p.reviewApproved)).toEqual([false, true]);
+  });
+
+  it("lets an override replace a derived field", () => {
+    expect(makeFeedbackLoopOutputs({ approved: false, terminationReason: "max_turns" }).terminationReason).toBe("max_turns");
+    expect(makeFeedbackLoopOutputs({ passes: [] }).passes).toEqual([]);
   });
 });
 

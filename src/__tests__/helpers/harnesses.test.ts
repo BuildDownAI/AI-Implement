@@ -7,6 +7,7 @@ import { testDir, testTempRoot } from "./test-dir.js";
 import { testDb } from "./test-db.js";
 import { fakeFetch, hangUntilAborted } from "./fake-fetch.js";
 import { githubFile } from "./github-replies.js";
+import { linearData, linearGraphql } from "./linear-replies.js";
 
 // Cleanup runs after a test ends, so each "is gone" check lives in the test after the one that
 // created the directory. Tests in a file run in order unless marked concurrent, and none here is.
@@ -442,5 +443,16 @@ describe("githubFile", () => {
 
     expect(file).toMatchObject({ type: "file", encoding: "base64" });
     expect(Buffer.from(file.content, "base64").toString("utf8")).toBe("image: custom\n");
+  });
+});
+
+describe("linearGraphql and linearData", () => {
+  it("answers each GraphQL request in turn with its data", async () => {
+    const linear = linearGraphql(linearData({ viewer: { id: "u-1" } }), linearData({ viewer: { id: "u-2" } }));
+    const ask = () => linear.fetch("https://api.linear.app/graphql", { method: "POST", body: "{}" });
+
+    expect(await (await ask()).json()).toEqual({ data: { viewer: { id: "u-1" } } });
+    expect(await (await ask()).json()).toEqual({ data: { viewer: { id: "u-2" } } });
+    expect(linear.calls.map((c) => `${c.method} ${c.path}`)).toEqual(["POST /graphql", "POST /graphql"]);
   });
 });

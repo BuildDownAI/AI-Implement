@@ -5,7 +5,7 @@ import type * as GateModule from "../dispatch-gate.js";
 import type { TicketingProvider } from "../providers/types.js";
 import type { RepoMapping } from "../config.js";
 import { shouldReleaseAdmissionOnDispatchError } from "../index.js";
-import { makeAppConfig, makeIssue, makeMapping, makeProvider } from "./helpers/builders.js";
+import { makeAppConfig, makeAppendLogEntry, makeIssue, makeMapping, makeProvider } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
 
@@ -895,18 +895,18 @@ describe("tryFastReleasePlanningAdmission — fast release path for the planning
     });
     expect(admitted.ok).toBe(true);
     if (!admitted.ok) throw new Error("test admission unexpectedly deferred");
-    log.appendLog({
-      issueId: "issue-1",
+    log.appendLog(makeAppendLogEntry({
       issueIdentifier: "AII-1",
-      issueTitle: "Plan it",
       teamKey: "AII",
       repo: "o/r",
       dispatchId,
       admissionGeneration: admitted.record.generation,
       executionMode: "local-docker",
+      contract: undefined,
       phase: "planning",
+      machineNonce: "nonce-1",
       machineId: "container-1",
-    });
+    }));
   }
 
   it("releases the reservation once the backend is confirmed stopped", async () => {
@@ -1016,18 +1016,19 @@ describe("reconcileTerminalCallbackAdmissions — per-poll reconciliation for te
     });
     expect(admitted.ok).toBe(true);
     if (!admitted.ok) throw new Error("test admission unexpectedly deferred");
-    const jobId = log.appendLog({
+    const jobId = log.appendLog(makeAppendLogEntry({
       issueId,
       issueIdentifier: "AII-1",
-      issueTitle: "Issue",
       teamKey: "AII",
       repo: "o/r",
       dispatchId,
       admissionGeneration: admitted.record.generation,
       executionMode: "local-docker",
+      contract: undefined,
       phase: conclusion === "planning_callback" ? "planning" : "implementation",
+      machineNonce: "nonce-1",
       machineId: "container-1",
-    });
+    }));
     const status = conclusion === "planning_callback" ? "completed" : "failed";
     // Mirrors runner-callback.ts's own write: terminal status/conclusion, admission
     // reservation deliberately left held for a monitor to confirm the backend is dead.
@@ -1106,18 +1107,18 @@ describe("reconcileTerminalCallbackAdmissions — per-poll reconciliation for te
       cap: 5,
     });
     if (!stillRunning.ok) throw new Error("test admission unexpectedly deferred");
-    log.appendLog({
+    log.appendLog(makeAppendLogEntry({
       issueId: "issue-2",
       issueIdentifier: "AII-2",
-      issueTitle: "Issue",
       teamKey: "AII",
       repo: "o/r",
       dispatchId: "dispatch-running",
       admissionGeneration: stillRunning.record.generation,
       executionMode: "local-docker",
-      phase: "implementation",
+      contract: undefined,
+      machineNonce: "nonce-2",
       machineId: "container-2",
-    });
+    }));
 
     const third = await dispatchAdmission.reconcileTerminalCallbackAdmissions((candidate) =>
       indexModule.confirmAdmissionTerminated(config, candidate),

@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as OrchestratorSettingsModule from "../orchestrator-settings.js";
 import type { LinearProvider as LinearProviderClass } from "../providers/linear.js";
-import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
+import type { FakeFetch } from "./helpers/fake-fetch.js";
+import { linearData, linearGraphql } from "./helpers/linear-replies.js";
 import { testDb } from "./helpers/test-db.js";
 
 // AII-694: the Linear provider reads its pickup label from the settings table
@@ -15,8 +16,7 @@ let fake: FakeFetch;
 
 // Each GraphQL response in order, one per request; a request past the last fails the test.
 function linearAnswers(...data: unknown[]): void {
-  fake = fakeFetch({ "POST /graphql": data.map((d) => ({ json: { data: d } })) });
-  fake.install();
+  fake = linearGraphql(...data.map(linearData)).install();
 }
 
 beforeEach(async () => {

@@ -66,6 +66,7 @@ import { callToolAsSystem } from "../../restate/tools-client.js";
 import { makeKgRefreshAdminDeps, sweepLegacyKgRefreshRows } from "../../index.js";
 import type { RestateService } from "../../restate/endpoint.js";
 import { VARIANTS, eventually, journalEntries, journaledRunResult, queryInvocations, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
+import { makeAppConfig } from "../helpers/builders.js";
 
 const KG_SOURCE_REPO = "TestOrg/test-kg-source";
 const NAMESPACE = "https://kg.test.example/";
@@ -165,7 +166,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
 
     process.env.KG_SIDECAR_URL = "http://127.0.0.1:1/mcp";
     const railFakes = {
-      mintToken: (async () => ({ token: "tok", expiresAt: "" })) as unknown as KgRailDeps["mintToken"],
+      mintToken: (async () => ({ token: "tok", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 1 })) as KgRailDeps["mintToken"],
       fetchTarball: (async () => {
         railFetchCalls++;
         const gate = sim.fetchGate;
@@ -198,13 +199,10 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
 
     compose = (over = {}) => createProductionKgRefreshServices({
       kgSourceRepo: KG_SOURCE_REPO,
-      config: {
-        githubAppId: "test-app-id", githubAppPrivateKey: "test-private-key", sessionImage: "runner:test",
-        runnerImageExplicit: false, runnerCallbackBaseUrl: "https://orchestrator.test", runnerTokenSecret: SECRET,
-        flySessionsToken: null, flySessionsApp: null, flySessionsRegion: null,
-        localRunnerImage: "local:img", localRunnerOrchestratorUrl: null, healthPort: 8080,
-        anthropicApiKey: null, claudeOAuthToken: null,
-      },
+      config: makeAppConfig({
+        githubAppId: "test-app-id", githubAppPrivateKey: "test-private-key",
+        runnerCallbackBaseUrl: "https://orchestrator.test", runnerTokenSecret: SECRET,
+      }),
       ...railFakes,
       // Sender deps: the GitHub Actions path uses the faked dispatch POST; the machine backends must not run.
       getInstallationToken: async () => "tok",

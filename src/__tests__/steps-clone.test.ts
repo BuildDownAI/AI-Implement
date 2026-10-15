@@ -3,7 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { cloneStep } from "../pipeline/steps/clone.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
-import { makeContext } from "./helpers/builders.js";
+import { encodeRunConfig } from "../run-config.js";
+import { makeContext, makeReviewFixRunConfig } from "./helpers/builders.js";
 import { fakeFetch } from "./helpers/fake-fetch.js";
 
 vi.mock("node:child_process", () => ({
@@ -53,7 +54,7 @@ const BASE_INPUTS = {
 
 const PR_INPUTS = {
   ...BASE_INPUTS,
-  branch: "ai-implement/ENG-1-test",
+  branch: "ai-implement/eng-1-test",
   prNumber: "42",
   baseBranch: "main",
 };
@@ -197,7 +198,7 @@ describe("cloneStep", () => {
     vi.mocked(fs.existsSync).mockReturnValue(false);
     vi.stubEnv("GITHUB_TOKEN", "secret-token");
     vi.stubEnv("GH_TOKEN", "secret-token");
-    fakeFetch({ "POST /api/token": [{ json: { token: "fresh-token" } }] }).install();
+    fakeFetch({ "POST /api/token": [{ json: { token: "fresh-token", expires_at: new Date(Date.now() + 3_600_000).toISOString() } }] }).install();
     mockSpawn([
       { status: 0 },
       { status: 0 },
@@ -228,7 +229,7 @@ describe("cloneStep", () => {
 
   it("keeps the boot token when credential vending rejects the refresh", async () => {
     vi.mocked(fs.existsSync).mockReturnValue(false);
-    fakeFetch({ "POST /api/token": [{ status: 403 }] }).install();
+    fakeFetch({ "POST /api/token": [{ status: 403, json: { error: "Invalid or expired nonce" } }] }).install();
     mockSpawn([
       { status: 0 },
       { status: 0 },
@@ -253,33 +254,32 @@ describe("cloneStep", () => {
   });
 
   describe("pilot publication authority", () => {
-    function stubPilot(): void {
-      const config = {
-        v: 1,
-        issue: { id: "issue-1", identifier: "AII-1282", title: "Test", description: "Test" },
-        reviewFix: { version: 1, attemptId: "attempt-1", installationId: 7,
-          repository: "acme/app", prNumber: 42, deadlineAt: Date.now() + 60_000 },
-      };
-      vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", Buffer.from(JSON.stringify(config)).toString("base64"));
+    // A pilot attempt on PR_INPUTS' PR, launched as a GitHub Actions run; returns the callback URL its envelope carries.
+    function stubPilot(): string {
+      const config = makeReviewFixRunConfig({ repository: "acme/app", prNumber: 42 });
+      vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig(config));
       vi.stubEnv("RUN_TOKEN", "result-token");
+      vi.stubEnv("GITHUB_RUN_ID", "555");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+      return config.runnerCallbackUrl!;
     }
 
     it("checks publication authority with the callback URL on a pilot run", async () => {
       vi.mocked(fs.existsSync).mockReturnValue(false);
-      stubPilot();
-      const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 } as Response);
-      vi.stubGlobal("fetch", fetchMock);
+      const callbackUrl = stubPilot();
+      const orchestrator = fakeFetch({ "POST /api/runner/publication-authority": { json: { authorized: true } } }).install();
       mockSpawn([{ status: 0 }, { status: 0 }, { status: 0 }, { status: 0, stdout: "sha1\n" }, { status: 0 }]);
       try {
         await cloneStep.run(makeContext(), {
-          ...PR_INPUTS, callbackUrl: "https://cb.example", baseBranch: undefined,
+          ...PR_INPUTS, callbackUrl, baseBranch: undefined,
         }, new NoopStepReporter());
-        expect(fetchMock).toHaveBeenCalledWith(
-          "https://cb.example/api/runner/publication-authority",
-          expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer result-token" }) }),
-        );
+        expect(orchestrator.calls).toHaveLength(1);
+        expect(orchestrator.calls[0]!.url.href).toBe(`${callbackUrl}/api/runner/publication-authority`);
+        expect(Object.fromEntries(orchestrator.calls[0]!.headers)).toEqual({
+          authorization: "Bearer result-token", "x-run-repository": "acme/app",
+          "x-github-run-id": "555", "x-github-run-attempt": "1",
+        });
       } finally {
-        vi.unstubAllGlobals();
         vi.unstubAllEnvs();
       }
     });
