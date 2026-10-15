@@ -157,7 +157,9 @@ export const kgPipelinesScript = `
           ? 'Held for a decision \u2014 see the current run below'
           : 'Run in flight' + (data.currentRun.step ? ': ' + data.currentRun.step : '') + ' \u2014 see the current run below';
       }
-      document.getElementById('kg-refresh-last').textContent = progressText || lastText;
+      const deployNotice = 'A deploy is in progress \u2014 you can still decide a held run; Refresh graph now returns after it completes.';
+      document.getElementById('kg-refresh-last').textContent =
+        data.deployHeld ? deployNotice + ' ' + (progressText || lastText) : (progressText || lastText);
       // AII-650: surface the sidecar liveness probe (AII-648) next to the stage-based badge —
       // a sidecar can be "serving" per the stage above while the probe shows it rejecting calls.
       const sidecarEl = document.getElementById('kg-sidecar-status');
