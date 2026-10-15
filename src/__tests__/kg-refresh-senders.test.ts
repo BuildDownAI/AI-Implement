@@ -3,7 +3,8 @@ import { describe, expect, it, vi } from "vitest";
 import { createKgRefreshSenders, type KgRefreshSendInput, type KgRefreshSenderDeps } from "../restate/kg-refresh-senders.js";
 import { syncRowToMachineNonce, type KeptMachineFly } from "../restate/kg-refresh-production.js";
 import type { CreateMachineOpts, Machine } from "../fly-machines.js";
-import { decodeRunConfig, type RunConfigV1 } from "../run-config.js";
+import { buildKgRefreshRunConfig, decodeRunConfig } from "../run-config.js";
+import { makeAppConfig } from "./helpers/builders.js";
 
 vi.mock("../restate/kg-refresh-production.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../restate/kg-refresh-production.js")>()),
@@ -14,12 +15,8 @@ const IDENTIFIER = "KG-REFRESH · x9";
 const NONCE = "nonce-secret-123";
 const TOKENS = { runToken: "run-tok", progressToken: "progress-tok", publicationToken: "pub-tok" };
 
-const envelope: RunConfigV1 = {
-  v: 1,
-  issue: { id: "kg-refresh", identifier: IDENTIFIER, title: "KG ingest", description: "" },
-  runnerPhase: "kg-refresh",
-  kgSourceRepo: "acme/kg",
-};
+const CALLBACK_BASE = "https://orch.example";
+const envelope = buildKgRefreshRunConfig({ kgSourceRepo: "acme/kg", issueIdentifier: IDENTIFIER, runnerCallbackUrl: CALLBACK_BASE });
 
 function makeInput(overrides: Partial<KgRefreshSendInput> = {}): KgRefreshSendInput {
   return {
@@ -51,18 +48,17 @@ function makeFly() {
 function makeDeps(overrides: Partial<KgRefreshSenderDeps> = {}, configOverrides: Partial<KgRefreshSenderDeps["config"]> = {}) {
   const { fly, created } = makeFly();
   const deps = {
-    config: {
+    config: makeAppConfig({
       githubAppId: "1", githubAppPrivateKey: "key", flySessionsToken: "fly-token", flySessionsApp: "fly-app",
-      flySessionsRegion: "iad", localRunnerImage: "local:img", localRunnerOrchestratorUrl: null,
-      runnerCallbackBaseUrl: "https://orch.example", healthPort: 8080, sessionImage: "img", runnerImageExplicit: false,
-      anthropicApiKey: null, claudeOAuthToken: null, kgSourceRepo: "acme/kg",
+      flySessionsRegion: "iad", localRunnerImage: "local:img", runnerCallbackBaseUrl: CALLBACK_BASE,
+      sessionImage: "img", kgSourceRepo: "acme/kg",
       ...configOverrides,
-    },
+    }),
     getInstallationToken: vi.fn(async () => "gh-secret-token"),
-    mintToken: vi.fn(async () => ({ token: "gh-secret-token", expiresAt: "" })),
+    mintToken: vi.fn(async () => ({ token: "gh-secret-token", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 1 })),
     fetchDefaultBranch: vi.fn(async () => "trunk"),
     resolveRunnerImage: vi.fn(async () => "runner:test"),
-    resolveWorkflowCapabilities: vi.fn(async () => ({ supportsRunPublicationToken: true })),
+    resolveWorkflowCapabilities: vi.fn(async () => ({ contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: false })),
     postWorkflowDispatch: vi.fn(async () => ({ success: true, outcome: "accepted" as const, runId: 42, runUrl: "https://gh/run/42" })),
     keptMachineFly: vi.fn(() => fly),
     startLocalRunnerContainer: vi.fn(async () => ({ containerId: "c-1" })),

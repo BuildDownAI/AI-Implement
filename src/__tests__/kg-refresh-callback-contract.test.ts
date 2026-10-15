@@ -9,9 +9,6 @@
  *   GET  /runner/planning-context
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { postRunnerResult } from "../runner-result.js";
 import { kgTrackerDataStep } from "../pipeline/steps/kg-tracker-data.js";
 import { fakeFetch } from "./helpers/fake-fetch.js";
@@ -42,7 +39,7 @@ describe("kg-refresh callback-URL contract", () => {
   // ---- Runner-side client contracts ----
 
   it("postRunnerResult resolves to POST /runner/result — a served route", async () => {
-    const orchestrator = fakeFetch({ "POST /runner/result": { json: {} } });
+    const orchestrator = fakeFetch({ "POST /runner/result": { json: { acknowledged: true } } });
 
     const savedToken = process.env.RUN_TOKEN;
     process.env.RUN_TOKEN = "tok-123";
@@ -274,7 +271,7 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
       });
       return new Response(JSON.stringify(out.body), { status: out.status });
     });
-    const workspaceDir = mkdtempSync(join(tmpdir(), "kgreport-held-"));
+    const workspaceDir = testDir("kgreport-held");
     const savedToken = process.env.RUN_TOKEN;
     process.env.RUN_TOKEN = token;
     const partTable = [{ part: "comment.nt", prev: "9995", new: "3793" }];
@@ -296,7 +293,6 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
     } finally {
       if (savedToken === undefined) delete process.env.RUN_TOKEN;
       else process.env.RUN_TOKEN = savedToken;
-      rmSync(workspaceDir, { recursive: true, force: true });
     }
     expect(c.report).toHaveBeenCalledTimes(1);
     expect(c.report).toHaveBeenCalledWith(

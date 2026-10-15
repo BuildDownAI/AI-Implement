@@ -16,7 +16,7 @@ import {
 import { DEFAULT_PIPELINE } from "../pipeline/default-pipeline.js";
 import { PipelineRunner } from "../pipeline/runner.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
-import { encodeRunConfig, type RunConfigV1 } from "../run-config.js";
+import { encodeRunConfig } from "../run-config.js";
 import type { PipelineDefinition, StepModule } from "../pipeline/types.js";
 import { __resetPublicationCredentialForTests } from "../publication-credential.js";
 import { DISPOSITIONS_FILE, stableReviewFindingKey, type FindingDisposition } from "../pipeline/finding-dispositions.js";
@@ -24,11 +24,9 @@ import { CYCLE_SUMMARY_FILE, type CycleSummary } from "../pipeline/cycle-summary
 import type { GhSpawn } from "../pipeline/review-ledger.js";
 import type { ReviewFixMetadataV1 } from "../review-fix-contract.js";
 import { DEFAULT_MODEL } from "../pipeline/default-model.js";
-import { makeExecutor, makeFeedbackLoopOutputs } from "./helpers/builders.js";
+import { makeExecutor, makeFeedbackLoopOutputs, makeReviewFixRunConfig } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 import { testDir } from "./helpers/test-dir.js";
-
-const ORCHESTRATOR = "https://orchestrator.example";
 
 // The orchestrator's runner routes (src/index.ts), each answered as its handler answers success.
 const RESULT = "POST /runner/result";
@@ -79,25 +77,6 @@ const noReviewThreads: GhSpawn = () => ({
     data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } },
   }),
 });
-
-/** The envelope the review-fix worker launches a pilot attempt with (buildLaunchInputs, src/review-fix-worker.ts). */
-function reviewFixRunConfig(identity: ReviewFixMetadataV1): RunConfigV1 {
-  const taskText = "Address the review findings on this PR.";
-  return {
-    v: 1,
-    issue: {
-      id: `review-fix:${identity.attemptId}`,
-      identifier: `review-fix-${identity.prNumber}`,
-      title: `Review-fix for ${identity.repository}#${identity.prNumber}`,
-      description: taskText,
-    },
-    runnerPhase: "gap-analysis",
-    runnerCallbackUrl: ORCHESTRATOR,
-    prNumber: String(identity.prNumber),
-    commentInstruction: taskText,
-    reviewFix: identity,
-  };
-}
 
 const REQUIRED_ENV: Record<string, string> = {
   ISSUE_ID: "issue-abc",
@@ -979,7 +958,7 @@ describe("runAutonomous", () => {
 
     // A pilot attempt is always a gap-fill on its PR, with the callback URL in the envelope only.
     function stubReviewFixEnvelope() {
-      vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig(reviewFixRunConfig(REVIEW_FIX_IDENTITY)));
+      vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig(makeReviewFixRunConfig(REVIEW_FIX_IDENTITY)));
     }
 
     it("attaches the full reviewFix result marker on success, reporting the actual published commit (not GITHUB_SHA)", async () => {
@@ -1487,7 +1466,7 @@ describe("runAutonomous", () => {
       });
 
       it("auto-resolves activity reporting from a pilot reviewFix envelope (no injected override) without throwing", async () => {
-        vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig(reviewFixRunConfig(REVIEW_FIX_IDENTITY)));
+        vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig(makeReviewFixRunConfig(REVIEW_FIX_IDENTITY)));
         vi.stubEnv("RUN_PROGRESS_TOKEN", "ptok");
         vi.stubEnv("RUN_TOKEN", "run-token");
         vi.stubEnv("GITHUB_RUN_ID", "1");

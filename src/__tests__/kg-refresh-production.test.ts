@@ -2,11 +2,13 @@
 // No Docker and no Restate runtime: the services are only constructed, the GHA dispatch
 // is exercised against a mocked postWorkflowDispatch, and the client against a faked fetch.
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { __clearWorkflowProbeCacheForTests } from "../workflow-probe.js";
 import { makeAppConfig } from "./helpers/builders.js";
 import { fakeFetch, hangUntilAborted, type Reply, type Routes } from "./helpers/fake-fetch.js";
+import { githubFile } from "./helpers/github-replies.js";
+import { testDb } from "./helpers/test-db.js";
 
 const postWorkflowDispatch = vi.fn();
 vi.mock("../github.js", async (importOriginal) => ({
@@ -94,7 +96,7 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
       runnerCallbackBaseUrl: "https://orch.example", runnerTokenSecret: "secret",
       flySessionsToken: "fly-token", flySessionsApp: "fly-app",
     }),
-    mintToken: vi.fn(async () => ({ token: "gh-token", expiresAt: "" })),
+    mintToken: vi.fn(async () => ({ token: "gh-token", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 1 })),
     fetchTarball: noop as never,
     fetchDefaultBranch: vi.fn(async () => "main"),
     fetchSnapshotCommitSha: vi.fn(async () => null),
@@ -147,9 +149,15 @@ const dispatchInput = {
   machine: { cpuKind: "performance" as const, cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000 },
 };
 
+/** The KG repo's dispatch workflow as sync writes it, which a GitHub Actions dispatch probes for its inputs. */
+const WORKFLOW_FILE = "GET /repos/acme/kg/contents/.github/workflows/claude-implement.yml" as const;
+const syncedWorkflow = githubFile(fs.readFileSync(path.join(__dirname, "../../workflows/claude-implement.yml"), "utf8"));
+
 beforeEach(() => {
   postWorkflowDispatch.mockReset();
   resolvedPath.current = "github-actions";
+  __clearWorkflowProbeCacheForTests();
+  fakeFetch({ [WORKFLOW_FILE]: syncedWorkflow }).install();
 });
 
 describe("createProductionKgRefreshServices", () => {
@@ -442,23 +450,15 @@ describe("deriveMachineNonce", () => {
 
 describe("row projections (real log.ts, scratch database)", () => {
   async function withScratchDb<T>(fn: (log: typeof import("../log.js"), prod: typeof import("../restate/kg-refresh-production.js"), db: ReturnType<typeof import("../dedup.js")["getDb"]>) => T | Promise<T>): Promise<T> {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kg-record-"));
-    const previous = process.env.DEDUP_DB_PATH;
-    process.env.DEDUP_DB_PATH = path.join(dir, "dedup.sqlite");
-    vi.resetModules();
-    const dedup = await vi.importActual<typeof import("../dedup.js")>("../dedup.js");
-    const log = await vi.importActual<typeof import("../log.js")>("../log.js");
-    try {
-      log.initLogTable();
-      vi.doUnmock("../log.js"); // the fresh module must share the scratch database's log.js instance
-      const prod = await import("../restate/kg-refresh-production.js");
-      return await fn(log, prod, dedup.getDb());
-    } finally {
-      dedup.closeDb();
-      if (previous === undefined) delete process.env.DEDUP_DB_PATH;
-      else process.env.DEDUP_DB_PATH = previous;
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    vi.doUnmock("../log.js"); // the fresh module must share the scratch database's log.js instance
+    const { log, prod, dedup } = (await testDb({
+      modules: {
+        log: () => import("../log.js"),
+        prod: () => import("../restate/kg-refresh-production.js"),
+        dedup: () => import("../dedup.js"),
+      },
+    })).modules;
+    return await fn(log, prod, dedup.getDb());
   }
 
   it("recordKgDispatchRow writes issue_id, phase, repo and execution_mode from the record, once", async () => {
@@ -686,8 +686,9 @@ describe("createKgRefreshIngressClient", () => {
     const started = Date.now();
     expect(await createKgRefreshIngressClient(BASE, { fetchImpl: hung, timeoutMs: 50 }).progress("t-1")).toEqual({ status: "unavailable" });
     expect(Date.now() - started).toBeLessThan(2000);
-    // Nothing listening: a real connection refusal.
-    expect(await createKgRefreshIngressClient("http://127.0.0.1:1", { timeoutMs: 500 }).progress("t-1")).toEqual({ status: "unavailable" });
+    // Nothing listening: fetch rejects at once, as it does on a refused connection.
+    const down = throwing(() => new TypeError("fetch failed"));
+    expect(await createKgRefreshIngressClient(BASE, { fetchImpl: down, timeoutMs: 500 }).progress("t-1")).toEqual({ status: "unavailable" });
   });
 
   it("maps a 404 from report to not-found", async () => {

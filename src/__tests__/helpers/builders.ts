@@ -12,7 +12,8 @@ import type { FeedbackLoopOutputs } from "../../pipeline/steps/feedback-loop.js"
 import type { LLMExecutor, LLMResult, PipelineContextData } from "../../pipeline/types.js";
 import { ProviderRegistry } from "../../providers/registry.js";
 import type { ProviderId, TicketIssue, TicketingProvider } from "../../providers/types.js";
-import type { ReviewFixResultMetadataV1, ScopedPrIdentity } from "../../review-fix-contract.js";
+import type { ReviewFixMetadataV1, ReviewFixResultMetadataV1, ScopedPrIdentity } from "../../review-fix-contract.js";
+import type { RunConfigV1 } from "../../run-config.js";
 
 // Matches what getMappings reads back from a stored mapping: an empty planning workflow file returns as
 // "claude-plan.yml", and prDispatchBudget is always present.
@@ -143,6 +144,37 @@ export function makeReviewFixResult(overrides: Partial<ReviewFixResultMetadataV1
     githubRunId: 555,
     githubRunAttempt: 1,
     outputCommit: "a".repeat(40),
+    ...overrides,
+  };
+}
+
+// The envelope the review-fix worker launches a pilot attempt with (buildLaunchInputs, src/review-fix-worker.ts) for a mapping
+// with no optional settings: a gap-fill on the attempt's PR, whose issue and PR number derive from the attempt.
+export function makeReviewFixRunConfig(
+  reviewFix: Partial<ReviewFixMetadataV1> = {},
+  overrides: Partial<RunConfigV1> = {},
+): RunConfigV1 {
+  const attempt: ReviewFixMetadataV1 = {
+    version: 1,
+    attemptId: "attempt-1",
+    ...makeScopedPrIdentity(),
+    deadlineAt: Date.now() + 60 * 60_000,
+    ...reviewFix,
+  };
+  const taskText = "Address the review findings on this PR.";
+  return {
+    v: 1,
+    issue: {
+      id: `review-fix:${attempt.attemptId}`,
+      identifier: `review-fix-${attempt.prNumber}`,
+      title: `Review-fix for ${attempt.repository}#${attempt.prNumber}`,
+      description: taskText,
+    },
+    runnerPhase: "gap-analysis",
+    runnerCallbackUrl: "https://orchestrator.example",
+    prNumber: String(attempt.prNumber),
+    commentInstruction: taskText,
+    reviewFix: attempt,
     ...overrides,
   };
 }

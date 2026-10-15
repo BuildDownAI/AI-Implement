@@ -7,6 +7,8 @@ vi.mock("node:child_process", () => ({
 import { spawnSync } from "node:child_process";
 import { assertRunnerPublicationAuthority, refreshRunnerGithubCredentials, refreshRunnerGithubToken } from "../runner-token.js";
 import { __resetPublicationCredentialForTests } from "../publication-credential.js";
+import { encodeRunConfig } from "../run-config.js";
+import { makeReviewFixRunConfig } from "./helpers/builders.js";
 import { fakeFetch, type Reply } from "./helpers/fake-fetch.js";
 
 const VEND = "POST /api/token";
@@ -18,17 +20,13 @@ const connectionRefused: Reply = () => {
 
 describe("refreshRunnerGithubToken", () => {
   it("rechecks pilot authority for the exact GitHub execution before publication", async () => {
-    const config = {
-      v: 1,
-      issue: { id: "issue-1", identifier: "AII-799", title: "Test", description: "Test" },
-      reviewFix: { version: 1, attemptId: "attempt-1", installationId: 7,
-        repository: "acme/app", prNumber: 42, deadlineAt: Date.now() + 60_000 },
-    };
-    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", Buffer.from(JSON.stringify(config)).toString("base64"));
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig(makeReviewFixRunConfig({ repository: "acme/app" })));
     vi.stubEnv("RUN_TOKEN", "result-token");
     vi.stubEnv("GITHUB_RUN_ID", "123");
     vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
-    const orchestrator = fakeFetch({ "POST /api/runner/publication-authority": [{ status: 200 }, { status: 403 }] });
+    const orchestrator = fakeFetch({
+      "POST /api/runner/publication-authority": [{ json: { authorized: true } }, { status: 403, json: { error: "Unauthorized" } }],
+    });
     await assertRunnerPublicationAuthority({ callbackUrl: "https://orchestrator.example", owner: "acme", repo: "app", fetchImpl: orchestrator.fetch });
     expect(orchestrator.calls[0].url.href).toBe("https://orchestrator.example/api/runner/publication-authority");
     expect(Object.fromEntries(orchestrator.calls[0].headers)).toEqual({

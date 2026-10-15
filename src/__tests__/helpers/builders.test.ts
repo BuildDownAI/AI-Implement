@@ -2,6 +2,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { getMappings, initMappingsTable, upsertMapping } from "../../config.js";
 import { ProviderRegistry } from "../../providers/registry.js";
 import { validateReviewFixResultMetadata, validateScopedPrIdentity } from "../../review-fix-contract.js";
+import { decodeRunConfig, encodeRunConfig } from "../../run-config.js";
 import { FakeProvider } from "../providers/fake.js";
 import { testDb } from "./test-db.js";
 import {
@@ -16,6 +17,7 @@ import {
   makeProvider,
   makeRegistry,
   makeReviewFixResult,
+  makeReviewFixRunConfig,
   makeScopedPrIdentity,
 } from "./builders.js";
 
@@ -147,6 +149,28 @@ describe("makeReviewFixResult", () => {
     const retried = makeReviewFixResult({ githubRunAttempt: 2 });
     expect(retried.githubRunAttempt).toBe(2);
     expect({ ...retried, githubRunAttempt: makeReviewFixResult().githubRunAttempt }).toEqual(makeReviewFixResult());
+  });
+});
+
+describe("makeReviewFixRunConfig", () => {
+  it("builds an envelope the runner decodes unchanged, for a pilot attempt on the shared PR identity", () => {
+    const config = makeReviewFixRunConfig();
+    expect(decodeRunConfig(encodeRunConfig(config))).toEqual(config);
+    expect(config.reviewFix).toMatchObject(makeScopedPrIdentity());
+    expect(config.reviewFix!.deadlineAt).toBeGreaterThan(Date.now());
+  });
+
+  it("derives the issue and PR number from the attempt", () => {
+    const config = makeReviewFixRunConfig({ attemptId: "attempt-9", repository: "acme/app", prNumber: 7 });
+    expect(config.issue).toMatchObject({ id: "review-fix:attempt-9", identifier: "review-fix-7", title: "Review-fix for acme/app#7" });
+    expect(config.prNumber).toBe("7");
+  });
+
+  it("replaces only the overridden field", () => {
+    const deadlineAt = Date.now() + 1_000;
+    const withoutCallback = makeReviewFixRunConfig({ deadlineAt }, { runnerCallbackUrl: undefined });
+    expect(withoutCallback.runnerCallbackUrl).toBeUndefined();
+    expect({ ...withoutCallback, runnerCallbackUrl: "https://orchestrator.example" }).toEqual(makeReviewFixRunConfig({ deadlineAt }));
   });
 });
 
