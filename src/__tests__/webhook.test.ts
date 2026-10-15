@@ -10,7 +10,7 @@ import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
 import type { RepoMapping } from "../config.js";
 import type { KgPrCheckConfig } from "../webhook.js";
-import { makeMapping } from "./helpers/builders.js";
+import { makeAppendLogEntry, makeMapping } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
 
@@ -100,6 +100,11 @@ function makeRequest(
   };
   if (headers["x-github-delivery"] === "") delete headers["x-github-delivery"];
   return { req: new MockRequest(headers, body), res: new MockResponse(), deliveryId: headers["x-github-delivery"] };
+}
+
+/** Writes the dispatch row an implementation run leaves for one of this file's AII issues. */
+function appendDispatch(entry: Partial<Parameters<typeof LogModule.appendLog>[0]>): number {
+  return log.appendLog(makeAppendLogEntry({ teamKey: "AII", ...entry }));
 }
 
 // ---------- Module isolation ----------
@@ -306,7 +311,7 @@ describe("non-AI PR matching", () => {
 
   it("ignores a merged PR from a different repo", async () => {
     // Add a dispatch log entry for a different repo
-    log.appendLog({ issueId: "issue-1", issueIdentifier: "AII-1", repo: "org/other-repo" });
+    appendDispatch({ issueId: "issue-1", issueIdentifier: "AII-1", repo: "org/other-repo" });
 
     const { req, res } = makeRequest(SECRET, "pull_request", {
       action: "closed",
@@ -592,7 +597,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
     prFiles(80, ["kg_ingest/tracker.py"]);
 
-    const jobId = log.appendLog({ issueId: "issue-kg-1", issueIdentifier: "AII-900", repo: KG_SOURCE_REPO });
+    const jobId = appendDispatch({ issueId: "issue-kg-1", issueIdentifier: "AII-900", repo: KG_SOURCE_REPO });
     log.updateJobStatus(jobId, "running", null, `https://github.com/${KG_SOURCE_REPO}/pull/80`);
 
     const { req, res } = makeRequest(
@@ -767,7 +772,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
 
 describe("reconciliation enqueue", () => {
   it("enqueues a reconciliation job when branch matches issue identifier prefix", async () => {
-    log.appendLog({ issueId: "issue-1", issueIdentifier: "AII-27", repo: "org/repo" });
+    appendDispatch({ issueId: "issue-1", issueIdentifier: "AII-27", repo: "org/repo" });
 
     const { req, res } = makeRequest(SECRET, "pull_request", {
       action: "closed",
@@ -799,7 +804,7 @@ describe("reconciliation enqueue", () => {
   });
 
   it("enqueues when matching by stored PR URL", async () => {
-    const jobId = log.appendLog({ issueId: "issue-2", issueIdentifier: "AII-10", repo: "org/repo" });
+    const jobId = appendDispatch({ issueId: "issue-2", issueIdentifier: "AII-10", repo: "org/repo" });
     // Simulate a stored pr_url on the job
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/7");
 
@@ -826,7 +831,7 @@ describe("reconciliation enqueue", () => {
   });
 
   it("branch prefix match is case-insensitive", async () => {
-    log.appendLog({ issueId: "issue-3", issueIdentifier: "AII-99", repo: "org/repo" });
+    appendDispatch({ issueId: "issue-3", issueIdentifier: "AII-99", repo: "org/repo" });
 
     const { req, res } = makeRequest(SECRET, "pull_request", {
       action: "closed",
@@ -847,7 +852,7 @@ describe("reconciliation enqueue", () => {
   });
 
   it("does not enqueue a second reconciliation row on a redelivered merged-PR webhook", async () => {
-    log.appendLog({ issueId: "issue-4", issueIdentifier: "AII-77", repo: "org/repo" });
+    appendDispatch({ issueId: "issue-4", issueIdentifier: "AII-77", repo: "org/repo" });
 
     const payload = {
       action: "closed",
@@ -927,7 +932,7 @@ describe("reconciliation queue", () => {
 
 describe("review feedback ingestion", () => {
   it("stores CHANGES_REQUESTED reviews and queues a late fix for matching AI PRs", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-1",
       issueIdentifier: "AII-1",
       repo: "org/repo",
@@ -986,7 +991,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("increments the finding's revision when the same review body is reported again", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-revision",
       issueIdentifier: "AII-801",
       repo: "org/repo",
@@ -1033,7 +1038,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("without a delivery header, an exact repeat (same body/timestamp/actor/commit) synthesizes the same identity and is a no-op (AII-792)", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-synth-dup",
       issueIdentifier: "AII-802",
       repo: "org/repo",
@@ -1079,7 +1084,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("a redelivered pull_request_review (same x-github-delivery) is a no-op: no revision bump, no second queue/event row (AII-792)", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-dup-review",
       issueIdentifier: "AII-803",
       repo: "org/repo",
@@ -1124,7 +1129,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("a redelivered pull_request_review_comment (same x-github-delivery) is a no-op (AII-792)", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-dup-comment",
       issueIdentifier: "AII-804",
       repo: "org/repo",
@@ -1167,7 +1172,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("keeps headerless inline comments at different paths distinct even with identical text", async () => {
-    const jobId = log.appendLog({ issueId: "issue-inline-paths", issueIdentifier: "AII-805", repo: "org/repo" });
+    const jobId = appendDispatch({ issueId: "issue-inline-paths", issueIdentifier: "AII-805", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/54");
     const base = {
       action: "created",
@@ -1192,7 +1197,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("a redelivered Claude PR summary comment (same x-github-delivery) is a no-op across multiple findings (AII-792)", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-dup-summary",
       issueIdentifier: "AII-806",
       repo: "org/repo",
@@ -1235,7 +1240,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("propagates a DB failure instead of writing the blanket 200 ack, so GitHub can redeliver (AII-792)", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-db-fail",
       issueIdentifier: "AII-807",
       repo: "org/repo",
@@ -1275,7 +1280,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("ignores AI-Implement native request-changes reviews to avoid self-triggered fix loops", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-self",
       issueIdentifier: "AII-808",
       repo: "org/repo",
@@ -1332,7 +1337,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("stores PR review comments as non-blocking context and queues a late fix for matching AI PRs", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-2",
       issueIdentifier: "AII-2",
       repo: "org/repo",
@@ -1372,7 +1377,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("ignores edited PR review comments so typo fixes do not requeue gap-fill", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-2",
       issueIdentifier: "AII-2",
       repo: "org/repo",
@@ -1429,7 +1434,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("stores Claude PR summary comments and queues a late fix for matching AI PRs", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-4",
       issueIdentifier: "AII-4",
       repo: "org/repo",
@@ -1469,7 +1474,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("ignores edited Claude PR summary comments so progress edits do not requeue gap-fill", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-4",
       issueIdentifier: "AII-4",
       repo: "org/repo",
@@ -1528,7 +1533,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("does not trust generic github-actions bot PR summary comments", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-4",
       issueIdentifier: "AII-4",
       repo: "org/repo",
@@ -1563,7 +1568,7 @@ describe("review feedback ingestion", () => {
   // ---------- AII-817: webhook reads the review-findings block, shared author rule ----------
 
   it("ignores a review-findings block from an author outside the trusted allowlist", async () => {
-    const jobId = log.appendLog({ issueId: "issue-60", issueIdentifier: "AII-60", repo: "org/repo" });
+    const jobId = appendDispatch({ issueId: "issue-60", issueIdentifier: "AII-60", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/60");
 
     const { req, res } = makeRequest(SECRET, "issue_comment", {
@@ -1591,7 +1596,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("ignores a github-actions[bot] issue_comment with no findings block and no Claude review heading", async () => {
-    const jobId = log.appendLog({ issueId: "issue-61", issueIdentifier: "AII-61", repo: "org/repo" });
+    const jobId = appendDispatch({ issueId: "issue-61", issueIdentifier: "AII-61", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/61");
 
     const { req, res } = makeRequest(SECRET, "issue_comment", {
@@ -1620,7 +1625,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("ignores an approve verdict block with no findings as approved, without enqueueing", async () => {
-    const jobId = log.appendLog({ issueId: "issue-62", issueIdentifier: "AII-62", repo: "org/repo" });
+    const jobId = appendDispatch({ issueId: "issue-62", issueIdentifier: "AII-62", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/62");
 
     const { req, res } = makeRequest(SECRET, "issue_comment", {
@@ -1649,7 +1654,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("upserts review-contract findings and enqueues a review-fix (reason=review_contract) from a findings block", async () => {
-    const jobId = log.appendLog({ issueId: "issue-63", issueIdentifier: "AII-63", repo: "org/repo" });
+    const jobId = appendDispatch({ issueId: "issue-63", issueIdentifier: "AII-63", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/63");
 
     const { req, res } = makeRequest(SECRET, "issue_comment", {
@@ -1694,7 +1699,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("ignores an unclosed review-findings block as findings_unavailable and logs it", async () => {
-    const jobId = log.appendLog({ issueId: "issue-64", issueIdentifier: "AII-64", repo: "org/repo" });
+    const jobId = appendDispatch({ issueId: "issue-64", issueIdentifier: "AII-64", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/64");
 
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -1726,7 +1731,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("ignores an explicit incomplete verdict with no findings as findings_unavailable", async () => {
-    const jobId = log.appendLog({ issueId: "issue-65", issueIdentifier: "AII-65", repo: "org/repo" });
+    const jobId = appendDispatch({ issueId: "issue-65", issueIdentifier: "AII-65", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/65");
 
     const { req, res } = makeRequest(SECRET, "issue_comment", {
@@ -1754,7 +1759,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("does not resolve stored findings when a matching PR receives a new synchronize event", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-3",
       issueIdentifier: "AII-3",
       repo: "org/repo",
@@ -1897,7 +1902,7 @@ describe("shouldEnqueueReviewEvent", () => {
 
 describe("bot review gate integration (AII-745)", () => {
   it("enqueues a bot pull_request_review_comment matching the PR's current head with no run dispatched since", async () => {
-    const jobId = log.appendLog({ issueId: "issue-50", issueIdentifier: "AII-50", repo: "org/repo" });
+    const jobId = appendDispatch({ issueId: "issue-50", issueIdentifier: "AII-50", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/50");
 
     const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
@@ -1928,7 +1933,7 @@ describe("bot review gate integration (AII-745)", () => {
   });
 
   it("ignores a bot pull_request_review_comment on a stale head as stale_head, touching no ledger state", async () => {
-    const jobId = log.appendLog({ issueId: "issue-51", issueIdentifier: "AII-51", repo: "org/repo" });
+    const jobId = appendDispatch({ issueId: "issue-51", issueIdentifier: "AII-51", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/51");
 
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -1963,7 +1968,7 @@ describe("bot review gate integration (AII-745)", () => {
   });
 
   it("still enqueues a human's pull_request_review_comment on a stale commit", async () => {
-    const jobId = log.appendLog({ issueId: "issue-52", issueIdentifier: "AII-52", repo: "org/repo" });
+    const jobId = appendDispatch({ issueId: "issue-52", issueIdentifier: "AII-52", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/52");
 
     const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
@@ -1992,12 +1997,12 @@ describe("bot review gate integration (AII-745)", () => {
   });
 
   it("rejects a bot pull_request_review_comment as run_after_review when a run was dispatched after it", async () => {
-    const jobId = log.appendLog({ issueId: "issue-53", issueIdentifier: "AII-53", repo: "org/repo" });
+    const jobId = appendDispatch({ issueId: "issue-53", issueIdentifier: "AII-53", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/54");
 
     const eventAt = new Date(Date.now() - 60_000).toISOString();
 
-    const rerunJobId = log.appendLog({ issueId: "issue-53", issueIdentifier: "AII-53", repo: "org/repo" });
+    const rerunJobId = appendDispatch({ issueId: "issue-53", issueIdentifier: "AII-53", repo: "org/repo" });
     log.updateJobStatus(rerunJobId, "completed", "success", "https://github.com/org/repo/pull/54");
 
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -2031,7 +2036,7 @@ describe("bot review gate integration (AII-745)", () => {
   });
 
   it("never enqueues a pull_request_review whose body carries the self marker, for a bot or human author", async () => {
-    const jobId = log.appendLog({ issueId: "issue-55", issueIdentifier: "AII-55", repo: "org/repo" });
+    const jobId = appendDispatch({ issueId: "issue-55", issueIdentifier: "AII-55", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/55");
 
     for (const author of [{ login: "claude[bot]", type: "Bot" }, { login: "a-human", type: "User" }]) {
@@ -2063,7 +2068,7 @@ describe("bot review gate integration (AII-745)", () => {
   });
 
   it("never enqueues a pull_request_review_comment whose body carries the self marker, for a bot or human author", async () => {
-    const jobId = log.appendLog({ issueId: "issue-56", issueIdentifier: "AII-56", repo: "org/repo" });
+    const jobId = appendDispatch({ issueId: "issue-56", issueIdentifier: "AII-56", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/56");
 
     for (const author of [{ login: "claude[bot]", type: "Bot" }, { login: "a-human", type: "User" }]) {
@@ -2094,7 +2099,7 @@ describe("bot review gate integration (AII-745)", () => {
   });
 
   it("never enqueues a trusted-author issue_comment whose body carries the self marker", async () => {
-    const jobId = log.appendLog({ issueId: "issue-57", issueIdentifier: "AII-57", repo: "org/repo" });
+    const jobId = appendDispatch({ issueId: "issue-57", issueIdentifier: "AII-57", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/57");
 
     const { req, res } = makeRequest(SECRET, "issue_comment", {
@@ -2333,7 +2338,7 @@ describe("/ai-implement comment trigger", () => {
   });
 
   it("existing trusted-review-bot path is unaffected by the new /ai-implement branch", async () => {
-    const jobId = log.appendLog({
+    const jobId = appendDispatch({
       issueId: "issue-4",
       issueIdentifier: "AII-4",
       repo: "org/repo",
@@ -2377,7 +2382,7 @@ describe("review process on inline review comments (AII-1181)", () => {
     body: string,
     mapping?: Partial<RepoMapping>,
   ) {
-    const jobId = log.appendLog({ issueId: `issue-${pr}`, issueIdentifier: `AII-${pr}`, repo: "org/repo" });
+    const jobId = appendDispatch({ issueId: `issue-${pr}`, issueIdentifier: `AII-${pr}`, repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", `https://github.com/org/repo/pull/${pr}`);
     hoisted.getMappings.mockReturnValue(mapping ? orgRepoMapping(mapping) : {});
     const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
@@ -2463,7 +2468,7 @@ describe("review process on inline review comments (AII-1181)", () => {
   it("ignores an unlisted bot's CHANGES_REQUESTED review under every process, and reads it when listed", async () => {
     let pr = 770;
     const postReview = async (user: { login: string; type: string }, mapping: Partial<RepoMapping>) => {
-      const jobId = log.appendLog({ issueId: `issue-${pr}`, issueIdentifier: `AII-${pr}`, repo: "org/repo" });
+      const jobId = appendDispatch({ issueId: `issue-${pr}`, issueIdentifier: `AII-${pr}`, repo: "org/repo" });
       log.updateJobStatus(jobId, "completed", "success", `https://github.com/org/repo/pull/${pr}`);
       hoisted.getMappings.mockReturnValue(orgRepoMapping(mapping));
       const { req, res } = makeRequest(SECRET, "pull_request_review", {
@@ -2506,7 +2511,7 @@ describe("Restate review-fix lifecycle forwards instead of writing (AII-1184)", 
   }
 
   function seedDispatch(pr: number) {
-    const jobId = log.appendLog({ issueId: `issue-${pr}`, issueIdentifier: `AII-${pr}`, repo: "org/repo" });
+    const jobId = appendDispatch({ issueId: `issue-${pr}`, issueIdentifier: `AII-${pr}`, repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", `https://github.com/org/repo/pull/${pr}`);
   }
 

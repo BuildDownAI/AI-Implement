@@ -24,7 +24,7 @@ import { CYCLE_SUMMARY_FILE, type CycleSummary } from "../pipeline/cycle-summary
 import type { GhSpawn } from "../pipeline/review-ledger.js";
 import type { ReviewFixMetadataV1 } from "../review-fix-contract.js";
 import { DEFAULT_MODEL } from "../pipeline/default-model.js";
-import { makeExecutor } from "./helpers/builders.js";
+import { makeExecutor, makeFeedbackLoopOutputs } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 import { testDir } from "./helpers/test-dir.js";
 
@@ -743,7 +743,7 @@ describe("runAutonomous", () => {
         }),
       })
       .register("install", { run: vi.fn().mockResolvedValue({}) })
-      .register("feedback-loop", { run: vi.fn().mockResolvedValue({ approved: false }) })
+      .register("feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })) })
       // Push no longer skips on an unapproved feedback-loop result — it opens a
       // draft PR instead — so the default pipeline needs a push module here too.
       .register("push", { run: vi.fn().mockResolvedValue(openedPr(1, { draft: true })) });
@@ -824,7 +824,7 @@ describe("runAutonomous", () => {
 
     const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
-      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
       ["push", { run: vi.fn().mockResolvedValue(openedPr(1)) }],
     ]);
 
@@ -992,7 +992,7 @@ describe("runAutonomous", () => {
       const publishedCommit = "b".repeat(40);
       const fake = fakeFetch({ [RESULT]: pilotResultStored });
       const { pipeline, runner } = makeStepsPipeline([
-        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha: publishedCommit })) }],
       ]);
 
@@ -1056,7 +1056,7 @@ describe("runAutonomous", () => {
         [RESULT]: pilotResultStored,
       });
       const { pipeline, runner } = makeStepsPipeline([
-        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
       ]);
 
@@ -1112,7 +1112,7 @@ describe("runAutonomous", () => {
 
       const fake = fakeFetch({ [RESULT]: pilotResultStored });
       const { pipeline, runner } = makeStepsPipeline([
-        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
       ]);
 
@@ -1155,13 +1155,7 @@ describe("runAutonomous", () => {
       };
       const runner = new PipelineRunner()
         .register("feedback-loop", {
-          run: vi.fn().mockResolvedValue({
-            approved: false,
-            iterations: 3,
-            finalFeedback: "still failing",
-            terminationReason: "iterations_exhausted",
-            passes: [],
-          }),
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })),
         })
         .register("push", { run: pushRun });
 
@@ -1192,7 +1186,7 @@ describe("runAutonomous", () => {
 
       const fake = fakeFetch({});
       const { pipeline, runner } = makeStepsPipeline([
-        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
       ]);
 
@@ -1250,7 +1244,7 @@ describe("runAutonomous", () => {
       const fake = fakeFetch({ [RESULT]: pilotResultStored });
       // verify runs after push on an approved run; post-push review never runs on a gap-fill.
       const { pipeline, runner } = makeStepsPipeline([
-        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha: publishedCommit })) }],
         ["verify", { run: vi.fn().mockRejectedValue(new Error("verify hook exploded")) }],
       ]);
@@ -1284,7 +1278,7 @@ describe("runAutonomous", () => {
       const fake = fakeFetch({ [RESULT]: pilotResultStored });
       const { pipeline, runner } = makeStepsPipeline([
         ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci" }) }],
-        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["install-retry", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "dependency conflict" }) }],
         ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha: publishedCommit })) }],
       ]);
@@ -1320,7 +1314,7 @@ describe("runAutonomous", () => {
 
       const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
       const { pipeline, runner } = makeStepsPipeline([
-        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockResolvedValue(openedPr(1)) }],
       ]);
 
@@ -1501,7 +1495,7 @@ describe("runAutonomous", () => {
 
         const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: pilotResultStored });
         const { pipeline, runner } = makeStepsPipeline([
-          ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+          ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
           ["push", { run: vi.fn().mockResolvedValue(updatedPr(7)) }],
         ]);
 
@@ -1551,7 +1545,7 @@ describe("runAutonomous", () => {
 
     const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
-      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
       ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
     ]);
 
@@ -1584,7 +1578,7 @@ describe("runAutonomous", () => {
 
     const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
-      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
       ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
     ]);
 
@@ -1657,13 +1651,7 @@ describe("runAutonomous", () => {
       [
         "feedback-loop",
         {
-          run: vi.fn().mockResolvedValue({
-            approved: false,
-            iterations: 3,
-            finalFeedback: "nope",
-            terminationReason: "iterations_exhausted",
-            passes: [],
-          }),
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })),
         },
       ],
       ["push", { run: vi.fn().mockResolvedValue(openedPr(9, { draft: true })) }],
@@ -1699,7 +1687,7 @@ describe("runAutonomous", () => {
     const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
       ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed: dependency conflict" }) }],
-      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true, iterations: 2, terminationReason: "approved", passes: [] }) }],
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
       ["install-retry", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed again: dependency conflict".repeat(30) }) }],
       ["push", { run: vi.fn().mockResolvedValue(openedPr(9, { draft: true })) }],
     ]);
@@ -1751,7 +1739,7 @@ describe("runAutonomous", () => {
     const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
       ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed: dependency conflict" }) }],
-      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true, iterations: 2, terminationReason: "approved", passes: [] }) }],
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
       ["install-retry", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed again: dependency conflict" }) }],
       ["push", { run: vi.fn().mockResolvedValue(openedPr(9, { draft: true })) }],
       // Registered so pipeline.steps.some(id === "post-push-review") is true, mirroring a
@@ -1794,7 +1782,7 @@ describe("runAutonomous", () => {
     const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
       ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed: dependency conflict" }) }],
-      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true, iterations: 2, terminationReason: "approved", passes: [] }) }],
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
       ["install-retry", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed again: dependency conflict" }) }],
       ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
     ]);
@@ -1840,13 +1828,7 @@ describe("runAutonomous", () => {
       [
         "feedback-loop",
         {
-          run: vi.fn().mockResolvedValue({
-            approved: false,
-            iterations: 3,
-            finalFeedback: "nope",
-            terminationReason: "iterations_exhausted",
-            passes: [],
-          }),
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })),
         },
       ],
       ["install-retry", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "still conflict" }) }],
@@ -1878,13 +1860,7 @@ describe("runAutonomous", () => {
       [
         "feedback-loop",
         {
-          run: vi.fn().mockResolvedValue({
-            approved: false,
-            iterations: 1,
-            finalFeedback: "not approved",
-            terminationReason: "iterations_exhausted",
-            passes: [],
-          }),
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })),
         },
       ],
       ["push", { run: vi.fn().mockResolvedValue(openedPr(9)) }],
@@ -1930,13 +1906,7 @@ describe("runAutonomous", () => {
       })
       .register("install", { run: vi.fn().mockResolvedValue({}) })
       .register("feedback-loop", {
-        run: vi.fn().mockResolvedValue({
-          approved: false,
-          iterations: 2,
-          finalFeedback: "missing regression coverage",
-          terminationReason: "iterations_exhausted",
-          passes: [],
-        }),
+        run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })),
       })
       .register("push", {
         run: pushRun,
@@ -1990,13 +1960,7 @@ describe("runAutonomous", () => {
     };
     const runner = new PipelineRunner()
       .register("feedback-loop", {
-        run: vi.fn().mockResolvedValue({
-          approved: false,
-          iterations: 2,
-          finalFeedback: "still missing tests",
-          terminationReason: "iterations_exhausted",
-          passes: [],
-        }),
+        run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })),
       })
       .register("push", { run: pushRun });
 
@@ -2045,7 +2009,7 @@ describe("runAutonomous", () => {
     };
     const runner = new PipelineRunner()
       .register("feedback-loop", {
-        run: vi.fn().mockResolvedValue({ approved: true, iterations: 2, terminationReason: "approved", passes: [] }),
+        run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()),
       })
       .register("push", { run: pushRun });
 
@@ -2083,13 +2047,11 @@ describe("runAutonomous", () => {
       [
         "feedback-loop",
         {
-          run: vi.fn().mockResolvedValue({
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({
             approved: false,
-            iterations: 1,
             finalFeedback: "ran out of turns",
             terminationReason: "max_turns",
-            passes: [],
-          }),
+          })),
         },
       ],
       ["push", { run: vi.fn().mockResolvedValue(openedPr(10, { draft: true })) }],
@@ -2135,14 +2097,11 @@ describe("runAutonomous", () => {
       [
         "feedback-loop",
         {
-          run: vi.fn().mockResolvedValue({
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({
             approved: false,
-            iterations: 1,
-            finalFeedback: "Model provider was unavailable during review after 2 attempt(s).",
             terminationReason: "provider_unavailable",
-            passes: [],
             failure: providerFailure,
-          }),
+          })),
         },
       ],
       ["push", { run: vi.fn().mockResolvedValue(openedPr(12, { draft: true })) }],
@@ -2188,7 +2147,7 @@ describe("runAutonomous", () => {
     const { pipeline, runner } = makeStepsPipeline([
       [
         "feedback-loop",
-        { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", passes: [] }) },
+        { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) },
       ],
       ["push", { run: vi.fn().mockResolvedValue(openedPr(11)) }],
       [
@@ -2235,7 +2194,7 @@ describe("runAutonomous", () => {
     const { pipeline, runner } = makeStepsPipeline([
       [
         "feedback-loop",
-        { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", passes: [] }) },
+        { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) },
       ],
       ["push", { run: vi.fn().mockResolvedValue(openedPr(11)) }],
       [
@@ -2276,7 +2235,7 @@ describe("runAutonomous", () => {
     const { pipeline, runner } = makeStepsPipeline([
       [
         "feedback-loop",
-        { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", passes: [] }) },
+        { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) },
       ],
       ["push", { run: vi.fn().mockResolvedValue(openedPr(11)) }],
       [
@@ -2326,7 +2285,7 @@ describe("runAutonomous", () => {
     const { pipeline, runner } = makeStepsPipeline([
       [
         "feedback-loop",
-        { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", passes: [] }) },
+        { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) },
       ],
       ["push", { run: vi.fn().mockResolvedValue(openedPr(13)) }],
       [
@@ -2383,7 +2342,7 @@ describe("runAutonomous", () => {
     const { pipeline, runner } = makeStepsPipeline([
       [
         "feedback-loop",
-        { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", passes: [] }) },
+        { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) },
       ],
       ["push", { run: vi.fn().mockResolvedValue(openedPr(12)) }],
       [
@@ -2451,7 +2410,7 @@ describe("runAutonomous", () => {
     const { pipeline, runner } = makeStepsPipeline([
       [
         "feedback-loop",
-        { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", passes: [] }) },
+        { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) },
       ],
       ["push", { run: vi.fn().mockResolvedValue(openedPr(13)) }],
       [
@@ -2507,7 +2466,7 @@ describe("runAutonomous", () => {
     const { pipeline, runner } = makeStepsPipeline([
       [
         "feedback-loop",
-        { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", passes: [] }) },
+        { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) },
       ],
       ["push", { run: vi.fn().mockResolvedValue(openedPr(14)) }],
       [
@@ -2556,13 +2515,7 @@ describe("runAutonomous", () => {
       [
         "feedback-loop",
         {
-          run: vi.fn().mockResolvedValue({
-            approved: false,
-            iterations: 2,
-            finalFeedback: "nope",
-            terminationReason: "iterations_exhausted",
-            passes: [],
-          }),
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false, finalFeedback: "nope" })),
         },
       ],
       ["push", { run: vi.fn().mockResolvedValue(openedPr(1, { draft: true })) }],
@@ -2588,7 +2541,7 @@ describe("runAutonomous", () => {
 
     const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
-      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved" }) }],
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
       ["push", { run: vi.fn().mockResolvedValue(openedPr(11)) }],
     ]);
 
@@ -2657,7 +2610,7 @@ describe("runAutonomous", () => {
 
     const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
-      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved" }) }],
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
       ["push", { run: vi.fn().mockResolvedValue(openedPr(12)) }],
       ["post-push-review", { run: vi.fn().mockResolvedValue({
         approved: false,
@@ -2700,12 +2653,7 @@ describe("runAutonomous", () => {
       [
         "feedback-loop",
         {
-          run: vi.fn().mockResolvedValue({
-            approved: true,
-            iterations: 1,
-            terminationReason: "approved",
-            passes: [],
-          }),
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()),
         },
       ],
     ]);
@@ -2743,13 +2691,7 @@ describe("runAutonomous", () => {
       [
         "feedback-loop",
         {
-          run: vi.fn().mockResolvedValue({
-            approved: false,
-            iterations: 2,
-            terminationReason: "iterations_exhausted",
-            finalFeedback: "implementation incomplete",
-            passes: [],
-          }),
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })),
         },
       ],
     ]);
@@ -2963,7 +2905,7 @@ describe("runAutonomous", () => {
       vi.stubEnv("AI_IMPLEMENT_UNTIL_STEP", "setup");
 
       const setupMod: StepModule = { run: vi.fn().mockResolvedValue({}) };
-      const feedbackMod: StepModule = { run: vi.fn().mockResolvedValue({ approved: true }) };
+      const feedbackMod: StepModule = { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) };
 
       const { pipeline, runner } = makeStepsPipeline([
         ["setup", setupMod],
@@ -2990,7 +2932,7 @@ describe("runAutonomous", () => {
       const setupMod: StepModule = {
         run: vi.fn().mockRejectedValue(new Error("hook exploded")),
       };
-      const feedbackMod: StepModule = { run: vi.fn().mockResolvedValue({}) };
+      const feedbackMod: StepModule = { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) };
 
       const { pipeline, runner } = makeStepsPipeline([
         ["setup", setupMod],
@@ -3016,7 +2958,7 @@ describe("runAutonomous", () => {
 
       const { pipeline, runner } = makeStepsPipeline([
         ["setup", { run: vi.fn().mockResolvedValue({}) }],
-        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
       ]);
 
       const result = await runAutonomous({
@@ -3036,7 +2978,7 @@ describe("runAutonomous", () => {
       vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "cloned");
       vi.stubEnv("AI_IMPLEMENT_UNTIL_STEP", "setup");
       vi.stubEnv("AI_IMPLEMENT_SHELL_MODE", "true");
-      const feedbackMod: StepModule = { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1 }) };
+      const feedbackMod: StepModule = { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) };
       const pushMod: StepModule = { run: vi.fn().mockResolvedValue(openedPr(1)) };
       const { pipeline, runner } = makeStepsPipeline([
         ["setup", { run: vi.fn().mockResolvedValue({}) }],
@@ -3140,7 +3082,7 @@ describe("runAutonomous", () => {
       const { ghSpawn, calls } = makeGhSpawn(threadBody, threadPath, threadLine);
       const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
       const { pipeline, runner } = makeStepsPipeline([
-        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
       ]);
 
@@ -3191,7 +3133,7 @@ describe("runAutonomous", () => {
       // No git change: push reports a no-op (existing-PR shape), mirroring push.ts's
       // branchPushed=false with no prUrl for an already-up-to-date PR branch.
       const { pipeline, runner } = makeStepsPipeline([
-        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockResolvedValue({ prUrl: null, prNumber: 42, branchPushed: false, commitSha: "c".repeat(40), draft: false }) }],
       ]);
 
@@ -3240,7 +3182,7 @@ describe("runAutonomous", () => {
       const { ghSpawn, calls } = makeGhSpawn(threadBody, threadPath, threadLine);
       const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
       const { pipeline, runner } = makeStepsPipeline([
-        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockRejectedValue(new Error("push failed")) }],
       ]);
 
@@ -3267,7 +3209,7 @@ describe("runAutonomous", () => {
       ];
       const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
       const { pipeline, runner } = makeStepsPipeline([
-        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockResolvedValue(openedPr(1)) }],
         [
           "post-push-review",
@@ -3297,7 +3239,7 @@ describe("runAutonomous", () => {
 
       const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
       const { pipeline, runner } = makeStepsPipeline([
-        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockResolvedValue(openedPr(1)) }],
       ]);
 
@@ -3377,13 +3319,7 @@ describe("runAutonomousLocally", () => {
 
   it("returns exitCode 0 and approved=true when feedback-loop approves", async () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({
-        approved: true,
-        iterations: 2,
-        terminationReason: "approved",
-        passes: [],
-        finalFeedback: "",
-      }),
+      run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ iterations: 2 })),
     });
 
     const result = await runAutonomousLocally({
@@ -3425,13 +3361,7 @@ describe("runAutonomousLocally", () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
       run: vi.fn().mockImplementation(async (ctx) => {
         capturedPlanningContext = ctx.data.planningContext;
-        return {
-          approved: true,
-          iterations: 1,
-          terminationReason: "approved",
-          passes: [],
-          finalFeedback: "",
-        };
+        return makeFeedbackLoopOutputs();
       }),
     });
 
@@ -3453,7 +3383,7 @@ describe("runAutonomousLocally", () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
       run: vi.fn().mockImplementation(async (ctx) => {
         capturedPlanningContext = ctx.data.planningContext;
-        return { approved: true, iterations: 1, terminationReason: "approved", passes: [], finalFeedback: "" };
+        return makeFeedbackLoopOutputs();
       }),
     });
 
@@ -3474,7 +3404,7 @@ describe("runAutonomousLocally", () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
       run: vi.fn().mockImplementation(async (_ctx, inputs: Record<string, unknown>) => {
         capturedInputs = inputs;
-        return { approved: true, iterations: 1, terminationReason: "approved", passes: [], finalFeedback: "" };
+        return makeFeedbackLoopOutputs();
       }),
     });
 
@@ -3503,7 +3433,7 @@ describe("runAutonomousLocally", () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
       run: vi.fn().mockImplementation(async (ctx) => {
         capturedModel = ctx.data.model;
-        return { approved: true, iterations: 1, terminationReason: "approved", passes: [], finalFeedback: "" };
+        return makeFeedbackLoopOutputs();
       }),
     });
 
@@ -3529,7 +3459,7 @@ describe("runAutonomousLocally", () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
       run: vi.fn().mockImplementation(async (ctx) => {
         capturedModel = ctx.data.model;
-        return { approved: true, iterations: 1, terminationReason: "approved", passes: [], finalFeedback: "" };
+        return makeFeedbackLoopOutputs();
       }),
     });
 
@@ -3599,13 +3529,7 @@ describe("runAutonomousLocally", () => {
 
   it("returns effectiveMaxTurns and effectiveMaxIterations in result", async () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({
-        approved: true,
-        iterations: 1,
-        terminationReason: "approved",
-        passes: [],
-        finalFeedback: "",
-      }),
+      run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()),
     });
 
     const result = await runAutonomousLocally({
@@ -3625,13 +3549,7 @@ describe("runAutonomousLocally", () => {
 
   it("uses default effectiveMaxTurns=50 and effectiveMaxIterations=3 when not specified", async () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({
-        approved: true,
-        iterations: 1,
-        terminationReason: "approved",
-        passes: [],
-        finalFeedback: "",
-      }),
+      run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()),
     });
 
     const result = await runAutonomousLocally({
@@ -3851,13 +3769,7 @@ describe("runAutonomousLocally", () => {
     writeFileSync(join(workspaceDir, "teardown.sh"), 'printf "" > teardown-ran.marker\n');
 
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({
-        approved: true,
-        iterations: 1,
-        terminationReason: "approved",
-        passes: [],
-        finalFeedback: "",
-      }),
+      run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()),
     });
 
     await runAutonomousLocally({
@@ -3877,13 +3789,7 @@ describe("runAutonomousLocally", () => {
     writeFileSync(join(workspaceDir, "verify.sh"), "exit 1\n");
 
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({
-        approved: true,
-        iterations: 1,
-        terminationReason: "approved",
-        passes: [],
-        finalFeedback: "",
-      }),
+      run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()),
     });
 
     const result = await runAutonomousLocally({
@@ -3905,13 +3811,7 @@ describe("runAutonomousLocally", () => {
     writeFileSync(join(workspaceDir, "verify.sh"), 'printf "" > verify-ran.marker\n');
 
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({
-        approved: false,
-        iterations: 2,
-        terminationReason: "iterations_exhausted",
-        passes: [],
-        finalFeedback: "",
-      }),
+      run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })),
     });
 
     await runAutonomousLocally({

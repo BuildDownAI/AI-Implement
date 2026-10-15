@@ -5,7 +5,7 @@ import { NoopStepReporter } from "../pipeline/reporter.js";
 import { __resetPublicationCredentialForTests } from "../publication-credential.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import type { FailureRecord } from "../pipeline/failure-classification.js";
-import { makeContext as makeBaseContext } from "./helpers/builders.js";
+import { makeContext as makeBaseContext, makeFeedbackLoopOutputs } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type ReplyInit, type Routes } from "./helpers/fake-fetch.js";
 
 vi.mock("node:child_process", () => ({
@@ -476,7 +476,7 @@ describe("pushStep", () => {
   it("creates a concise PR body with summary, approach, and test plan sections", async () => {
     mockGitSuccess();
     const ctx = makeContext();
-    ctx.setOutputs("feedback-loop", { approved: true });
+    ctx.setOutputs("feedback-loop", makeFeedbackLoopOutputs());
     ctx.setOutputs("preflight", { summary: "typecheck: passed, tests: passed (12 assertions)" });
     const fake = fakeFetch({ [CREATE_PR]: created(1) }).install();
 

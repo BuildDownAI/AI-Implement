@@ -6,8 +6,9 @@
 import { vi } from "vitest";
 import type { RepoMapping } from "../../config.js";
 import type { AppConfig } from "../../index.js";
-import type { Job } from "../../log.js";
+import type { Job, appendLog } from "../../log.js";
 import { DefaultPipelineContext } from "../../pipeline/context.js";
+import type { FeedbackLoopOutputs } from "../../pipeline/steps/feedback-loop.js";
 import type { LLMExecutor, LLMResult, PipelineContextData } from "../../pipeline/types.js";
 import { ProviderRegistry } from "../../providers/registry.js";
 import type { ProviderId, TicketIssue, TicketingProvider } from "../../providers/types.js";
@@ -89,6 +90,28 @@ export function makeJob(overrides: Partial<Job> = {}): Job {
   };
 }
 
+type AppendLogEntry = Parameters<typeof appendLog>[0];
+
+// The row a GitHub Actions implementation dispatch writes for makeIssue's issue, under its first admission.
+// Each build gets its own dispatch id, as each dispatch does; dispatchNumber is left for appendLog to count.
+export function makeAppendLogEntry(overrides: Partial<AppendLogEntry> = {}): AppendLogEntry {
+  return {
+    issueId: "issue-1",
+    issueIdentifier: "ENG-1",
+    issueTitle: "Test",
+    teamKey: "ENG",
+    repo: "test-org/test-repo",
+    issueState: "Todo (unstarted)",
+    dispatchId: crypto.randomUUID(),
+    admissionGeneration: 0,
+    executionMode: "github-actions",
+    runnerMode: "default",
+    phase: "implementation",
+    contract: "envelope",
+    ...overrides,
+  };
+}
+
 export function makeIssue(overrides: Partial<TicketIssue> = {}): TicketIssue {
   return {
     id: "issue-1",
@@ -120,6 +143,29 @@ export function makeReviewFixResult(overrides: Partial<ReviewFixResultMetadataV1
     githubRunId: 555,
     githubRunAttempt: 1,
     outputCommit: "a".repeat(40),
+    ...overrides,
+  };
+}
+
+// A feedback-loop run whose passes and termination agree with `approved` and `iterations`, as the step's own outputs
+// do: one pass per iteration, the last reviewed as approved or not. Override them too to describe another run.
+export function makeFeedbackLoopOutputs(overrides: Partial<FeedbackLoopOutputs> = {}): FeedbackLoopOutputs {
+  const approved = overrides.approved ?? true;
+  const iterations = overrides.iterations ?? 1;
+  return {
+    approved,
+    iterations,
+    finalFeedback: approved ? "" : "Changes requested.",
+    terminationReason: approved ? "approved" : "iterations_exhausted",
+    passes: Array.from({ length: iterations }, (_, i) => ({
+      iteration: i + 1,
+      implementTurns: 1,
+      implementOutcome: "success",
+      costUsd: null,
+      reviewCostUsd: null,
+      reviewApproved: i === iterations - 1 ? approved : false,
+    })),
+    extraCostUsd: null,
     ...overrides,
   };
 }

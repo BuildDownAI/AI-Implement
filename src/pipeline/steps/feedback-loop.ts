@@ -118,7 +118,7 @@ export interface PassStat extends Record<string, unknown> {
   reviewAttempts?: number;
 }
 
-interface FeedbackLoopOutputs extends Record<string, unknown> {
+export interface FeedbackLoopOutputs extends Record<string, unknown> {
   approved: boolean;
   iterations: number;
   finalFeedback: string;

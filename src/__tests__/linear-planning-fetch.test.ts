@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { fetchPlanningContext } from "../linear-planning-fetch.js";
 import { configureLinearAuth, __setLinearTokenForTest } from "../linear-app-auth.js";
-import { fakeFetch, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
+import type { Reply } from "./helpers/fake-fetch.js";
+import { linearData, linearGraphql as linear } from "./helpers/linear-replies.js";
 
 beforeEach(() => {
   configureLinearAuth("client-id", "client-secret");
@@ -12,20 +13,7 @@ type Comment = { body: string; createdAt: string };
 
 // One page of the issue's comments, as Linear's GraphQL API returns it.
 function commentsPage(nodes: Comment[], endCursor: string | null = null): Reply {
-  return {
-    json: {
-      data: {
-        issue: {
-          comments: { nodes, pageInfo: { hasNextPage: endCursor !== null, endCursor } },
-        },
-      },
-    },
-  };
-}
-
-// Serves the replies in order, one per request; a request past the last fails the test.
-function linear(...replies: Reply[]): FakeFetch {
-  return fakeFetch({ "POST /graphql": replies });
+  return linearData({ issue: { comments: { nodes, pageInfo: { hasNextPage: endCursor !== null, endCursor } } } });
 }
 
 describe("fetchPlanningContext", () => {

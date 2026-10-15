@@ -7,7 +7,8 @@ import {
   __resetLinearAuthForTest,
 } from "../../linear-app-auth.js";
 import { makeIssue } from "../helpers/builders.js";
-import { fakeFetch, type FakeFetch, type Reply } from "../helpers/fake-fetch.js";
+import type { FakeFetch, Reply } from "../helpers/fake-fetch.js";
+import { linearData as data, linearGraphql } from "../helpers/linear-replies.js";
 
 // Linear auth lives in the linear-app-auth singleton now (not on ProviderConfig). Configure it
 // and seed a token before every test so the provider's requests carry `Bearer test-token`, and
@@ -17,13 +18,7 @@ beforeEach(() => {
   __setLinearTokenForTest("test-token");
 });
 
-// One GraphQL response carrying `data`, as Linear's API returns it.
-const data = (d: unknown): Reply => ({ json: { data: d } });
-
-// Serves the replies in order, one per request; a request past the last fails the test.
-function linear(...replies: Reply[]): FakeFetch {
-  return fakeFetch({ "POST /graphql": replies }).install();
-}
+const linear = (...replies: Reply[]): FakeFetch => linearGraphql(...replies).install();
 
 const variables = (fake: FakeFetch, n: number) => JSON.parse(fake.calls[n].body).variables;
 

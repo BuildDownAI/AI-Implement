@@ -10,7 +10,7 @@ import type * as AdmissionModule from "../dispatch-admission.js";
 import type * as RestateStatusModule from "../restate/status.js";
 import type { RepoMapping } from "../config.js";
 import type { TicketingProvider } from "../providers/types.js";
-import { makeAppConfig, makeIssue, makeMapping, makeProvider, makeRegistry } from "./helpers/builders.js";
+import { makeAppConfig, makeAppendLogEntry, makeIssue, makeMapping, makeProvider, makeRegistry } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type Reply, type Routes } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
 
@@ -279,13 +279,7 @@ describe("processReviewFixQueue — dispatch gate", () => {
 
     // An in-flight dispatch for the same issue (e.g. the initial implementation run,
     // or a concurrent review-fix, still running).
-    log.appendLog({
-      issueId: "issue-1",
-      teamKey: "AII",
-      repo: "acme/billing",
-      phase: "implementation",
-      status: "running",
-    });
+    log.appendLog(makeAppendLogEntry({ issueIdentifier: "AII-1", teamKey: "AII", repo: "acme/billing" }));
 
     const queueId = reviewFixQueue.enqueueReviewFix({
       issueId: "issue-1",
@@ -350,13 +344,7 @@ describe("processReviewFixQueue — dispatch gate", () => {
     configModule.upsertMapping("AII", mapping);
 
     // A different issue's in-flight run already occupies the team's one slot.
-    log.appendLog({
-      issueId: "issue-other",
-      teamKey: "AII",
-      repo: "acme/billing",
-      phase: "implementation",
-      status: "running",
-    });
+    log.appendLog(makeAppendLogEntry({ issueIdentifier: "AII-7", teamKey: "AII", repo: "acme/billing" }));
 
     const queueId = reviewFixQueue.enqueueReviewFix({
       issueId: "issue-3",
@@ -452,14 +440,16 @@ describe("processReviewFixQueue — PR dispatch budget", () => {
   /** Seeds a completed gap-analysis dispatch counted toward a PR's 24h budget.
    *  Terminal status keeps it out of the in_flight gate, which would otherwise
    *  mask the pr_budget reason this suite exercises. */
-  function seedGapAnalysisDispatch(issueId: string, repo: string, prNumber: number): void {
-    const jobId = log.appendLog({
+  function seedGapAnalysisDispatch(issueId: string, issueIdentifier: string, repo: string, prNumber: number): void {
+    const jobId = log.appendLog(makeAppendLogEntry({
       issueId,
+      issueIdentifier,
+      issueTitle: `Review feedback fix for PR #${prNumber}`,
       teamKey: "AII",
       repo,
       phase: "gap-analysis",
       status: "completed",
-    });
+    }));
     log.updateJobPrUrl(jobId, `https://github.com/${repo}/pull/${prNumber}`);
   }
 
@@ -467,8 +457,8 @@ describe("processReviewFixQueue — PR dispatch budget", () => {
     const mapping = acmeBilling({ prDispatchBudget: 2 });
     configModule.upsertMapping("AII", mapping);
 
-    seedGapAnalysisDispatch("issue-1", "acme/billing", 42);
-    seedGapAnalysisDispatch("issue-1", "acme/billing", 42);
+    seedGapAnalysisDispatch("issue-1", "AII-1", "acme/billing", 42);
+    seedGapAnalysisDispatch("issue-1", "AII-1", "acme/billing", 42);
 
     const queueId = reviewFixQueue.enqueueReviewFix({
       issueId: "issue-1",
@@ -518,8 +508,8 @@ describe("processReviewFixQueue — PR dispatch budget", () => {
     const mapping = acmeBilling({ prDispatchBudget: 2 });
     configModule.upsertMapping("AII", mapping);
 
-    seedGapAnalysisDispatch("issue-1", "acme/billing", 42);
-    seedGapAnalysisDispatch("issue-1", "acme/billing", 42);
+    seedGapAnalysisDispatch("issue-1", "AII-1", "acme/billing", 42);
+    seedGapAnalysisDispatch("issue-1", "AII-1", "acme/billing", 42);
 
     reviewFixQueue.enqueueReviewFix({
       issueId: "issue-1",
@@ -547,8 +537,8 @@ describe("processReviewFixQueue — PR dispatch budget", () => {
     const mapping = acmeBilling({ prDispatchBudget: 2 });
     configModule.upsertMapping("AII", mapping);
 
-    seedGapAnalysisDispatch("issue-1", "acme/billing", 42);
-    seedGapAnalysisDispatch("issue-1", "acme/billing", 42);
+    seedGapAnalysisDispatch("issue-1", "AII-1", "acme/billing", 42);
+    seedGapAnalysisDispatch("issue-1", "AII-1", "acme/billing", 42);
 
     reviewFixQueue.enqueueReviewFix({
       issueId: "issue-1",
@@ -582,8 +572,8 @@ describe("processReviewFixQueue — PR dispatch budget", () => {
     const mapping = acmeBilling({ prDispatchBudget: 2 });
     configModule.upsertMapping("AII", mapping);
 
-    seedGapAnalysisDispatch("issue-1", "acme/billing", 42);
-    seedGapAnalysisDispatch("issue-1", "acme/billing", 42);
+    seedGapAnalysisDispatch("issue-1", "AII-1", "acme/billing", 42);
+    seedGapAnalysisDispatch("issue-1", "AII-1", "acme/billing", 42);
 
     const queueId = reviewFixQueue.enqueueReviewFix({
       issueId: "issue-1",
@@ -629,7 +619,7 @@ describe("guardOpenPrBeforeImplementationDispatch", () => {
 
   it("routes an open PR to a review-fix run and marks the issue dispatched", async () => {
     const issue = makeIssue({ identifier: "ENG-901" });
-    const id = log.appendLog({ issueId: issue.id, executionMode: "github-actions" });
+    const id = log.appendLog(makeAppendLogEntry({ issueId: issue.id, issueIdentifier: issue.identifier, repo: "acme/billing" }));
     log.updateJobStatus(id, "completed", "success", "https://github.com/acme/billing/pull/77");
 
     pulls({ 77: pullRequest("open") });
@@ -657,7 +647,7 @@ describe("guardOpenPrBeforeImplementationDispatch", () => {
 
   it("does not enqueue a second review-fix row when called again for the same open PR", async () => {
     const issue = makeIssue();
-    const id = log.appendLog({ issueId: issue.id, executionMode: "github-actions" });
+    const id = log.appendLog(makeAppendLogEntry({ issueId: issue.id, issueIdentifier: issue.identifier, repo: "acme/billing" }));
     log.updateJobStatus(id, "completed", "success", "https://github.com/acme/billing/pull/81");
 
     pulls({ 81: pullRequest("open") });
@@ -673,7 +663,7 @@ describe("guardOpenPrBeforeImplementationDispatch", () => {
 
   it("dispatches (returns false) when the PR is closed and not merged", async () => {
     const issue = makeIssue();
-    const id = log.appendLog({ issueId: issue.id, executionMode: "github-actions" });
+    const id = log.appendLog(makeAppendLogEntry({ issueId: issue.id, issueIdentifier: issue.identifier, repo: "acme/billing" }));
     log.updateJobStatus(id, "completed", "success", "https://github.com/acme/billing/pull/78");
 
     pulls({ 78: pullRequest("closed") });
@@ -687,7 +677,7 @@ describe("guardOpenPrBeforeImplementationDispatch", () => {
 
   it("skips dispatch (returns true) with no review-fix row when the PR is merged", async () => {
     const issue = makeIssue();
-    const id = log.appendLog({ issueId: issue.id, executionMode: "github-actions" });
+    const id = log.appendLog(makeAppendLogEntry({ issueId: issue.id, issueIdentifier: issue.identifier, repo: "acme/billing" }));
     log.updateJobStatus(id, "completed", "success", "https://github.com/acme/billing/pull/79");
 
     pulls({ 79: pullRequest("closed", true) });
@@ -701,7 +691,7 @@ describe("guardOpenPrBeforeImplementationDispatch", () => {
 
   it("skips dispatch (returns true) and logs when the PR state lookup fails", async () => {
     const issue = makeIssue({ identifier: "ENG-905" });
-    const id = log.appendLog({ issueId: issue.id, executionMode: "github-actions" });
+    const id = log.appendLog(makeAppendLogEntry({ issueId: issue.id, issueIdentifier: issue.identifier, repo: "acme/billing" }));
     log.updateJobStatus(id, "completed", "success", "https://github.com/acme/billing/pull/80");
 
     pulls({ 80: { status: 502 } });
