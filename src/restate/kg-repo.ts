@@ -187,7 +187,8 @@ export function createKgRepo(deps: KgRepoDependencies) {
   async function watch(ctx: ObjectSharedContext, input: { triggerId: string; invocationId: string }): Promise<void> {
     try {
       await ctx.invocation(input.invocationId as InvocationId).attach();
-    } catch {
+    } catch (err) {
+      if (restate.internal.isSuspendedError(err)) throw err;
       // The run ended by failure, kill or cancel; the release below is the point.
     }
     ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, ctx.key).release({ triggerId: input.triggerId });
