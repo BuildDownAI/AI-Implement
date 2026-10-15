@@ -73,7 +73,7 @@ export const settingsHtml = `
     <div class="card">
       <div class="card-header"><h2 class="card-title">Runner Image Prefixes</h2></div>
       <div class="card-body">
-        <p class="text-secondary" style="margin-bottom:12px">The orchestrator checks the runner image before each launch. It always trusts ghcr.io/builddownai/ and ghcr.io/&lt;repo owner&gt;/. Add more prefixes here, comma-separated. Each prefix must end with /. On GitHub Actions the workflow checks the image against the separate repository variable AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES.</p>
+        <p class="text-secondary" style="margin-bottom:12px">The orchestrator checks the runner image before each GitHub Actions and Fly launch. Local Docker launches are not checked. It always trusts ghcr.io/builddownai/ and ghcr.io/&lt;repo owner&gt;/. Add more prefixes here, comma-separated. Each prefix must end with /. On GitHub Actions the workflow checks the image against the separate repository variable AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES.</p>
         <div class="field">
           <label>Extra Prefixes</label>
           <div style="display:flex;gap:6px">

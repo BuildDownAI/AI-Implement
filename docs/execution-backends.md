@@ -42,7 +42,7 @@ A run carries up to three tokens: result (`run_token` / `RUN_TOKEN`), progress (
 
 When the image is fixed: every path uses a moving tag, and in-flight runs keep their image. For the time on each backend and how to confirm it, see [runner-images.md § When a change reaches a run](runner-images.md#when-a-change-reaches-a-run).
 
-The local image is the operator's `LOCAL_RUNNER_IMAGE` (`config.localRunnerImage`, `src/index.ts:329`). No repository input reaches it, so local Docker has no image check. GitHub Actions and Fly launches are checked against the built-in prefixes plus the Settings row before the launch call ([runner-images.md § Allowlisting](runner-images.md#allowlisting)). The kept Fly machine re-resolves its image at every claim (`launchKeptMachine`, `src/restate/kg-refresh-production.ts:183-201`), so a check on the kg-refresh Fly path must cover the claim, not only the create.
+The local image is the operator's `LOCAL_RUNNER_IMAGE` (`config.localRunnerImage`, `src/index.ts:329`). No repository input reaches it, so local Docker has no image check. GitHub Actions and Fly launches are checked against the built-in prefixes plus the Settings row before the launch call ([runner-images.md § Allowlisting](runner-images.md#allowlisting)). The kept Fly machine re-resolves its image at every claim (`launchKeptMachine`, `src/restate/kg-refresh-production.ts:183-201`), and the kg-refresh Fly sender (`src/restate/kg-refresh-senders.ts`) resolves and checks the image on every dispatch, before `launchKeptMachine`, so the check covers both the create and the claim.
 
 ## Launch parity test
 
