@@ -1326,7 +1326,7 @@ describe("drainCommentGapfillQueue — admission (AII-787)", () => {
     expect(admission.count("TEAM")).toBe(1);
   });
 
-  it("Fly gap-fill carries the result, progress and publication tokens, and none in extraEnv", async () => {
+  it("Fly gap-fill carries the result, progress and publication tokens, the nonce and orchestrator URL, and none in the encoded run config", async () => {
     const mapping = makeMapping({ owner: "acme", repo: "billing", executionMode: "fly-machines" });
     seedDispatchLog("issue-fly-tokens", "AII-306", "Fly tokens", "acme", "billing", 89);
     queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 89, commentId: 0, commenter: "", instruction: "" });
@@ -1344,6 +1344,15 @@ describe("drainCommentGapfillQueue — admission (AII-787)", () => {
     expect(env.RUN_TOKEN).toBeTruthy();
     expect(env.RUN_PROGRESS_TOKEN).toBeTruthy();
     expect(env.RUN_PUBLICATION_TOKEN).toBeTruthy();
+    expect(env.MACHINE_NONCE).toBeTruthy();
+    expect(env.ORCHESTRATOR_URL).toBe("https://orch.example.com");
+    // extraEnv reaches the machine env as AI_IMPLEMENT_RUN_CONFIG; no token may travel in it.
+    const { decodeRunConfig } = await import("../run-config.js");
+    expect(env.AI_IMPLEMENT_RUN_CONFIG).toBeTruthy();
+    const encodedConfig = JSON.stringify(decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG!));
+    for (const token of [env.RUN_TOKEN, env.RUN_PROGRESS_TOKEN, env.RUN_PUBLICATION_TOKEN]) {
+      expect(encodedConfig).not.toContain(token!);
+    }
   });
 
   it("local gap-fill passes the progress and publication tokens", async () => {
