@@ -57,7 +57,16 @@ import { initAccessAuditTable } from "./access-audit.js";
 import { initAuthEventsTable } from "./mcp-auth-events.js";
 import { initAccessPageGrantsTable } from "./access-page-grants.js";
 import { createModelAuthRoutes } from "./model-auth-routes.js";
-import { getModelAuthRuntime } from "./model-auth-runtime.js";
+import { getModelAuthRuntime, type ModelAuthRuntime } from "./model-auth-runtime.js";
+import {
+  classifyLaunchError,
+  isManagedProject,
+  prepareManagedDispatch,
+  refusalText,
+  settleLaunch,
+  type ManagedDispatchDecision,
+} from "./managed-dispatch-auth.js";
+import { buildProtectedFlyBootstrap } from "./fly-protection-key.js";
 import { requestChatGptPlanRefresh } from "./restate/chatgpt-plan-account.js";
 import { handleTokenRequest } from "./token-vending.js";
 import { handleDependencyTokenRequest } from "./dependency-token-vending.js";
@@ -829,8 +838,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
           if (execPath === "both") {
             // Shadow: GHA is primary (controls ticket state and dedup); Fly is secondary
-            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
-            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue, true);
+            await dispatchBothMode(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
           } else if (execPath === "local-docker") {
             await dispatchLocalDocker(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
           } else if (execPath === "fly-machines") {
@@ -1109,6 +1117,24 @@ async function resolveDispatchRunnerImage(
 // Exported for direct testing of the pre-launch-failure release path — see
 // "real entry-point/monitor regressions" in dispatch-routing.test.ts. Not part of the
 // module's public API otherwise; every production call site is within this file.
+/** "both" mode: GHA is primary, Fly the shadow. Decision 6: an opted-in project gets no Fly shadow
+ *  (the GHA primary refused it), so the shadow is skipped rather than promoted. */
+export async function dispatchBothMode(
+  config: AppConfig,
+  provider: TicketingProvider,
+  issue: DispatchableIssue,
+  mapping: RepoMapping,
+  prior: { count: number; lastDispatchedAt: number | null },
+  runnerMode: string,
+  baseBranch: string,
+  baseBranchFieldValue: string | null,
+): Promise<void> {
+  await dispatchGitHubActions(config, provider, issue, mapping, prior, runnerMode, baseBranch, baseBranchFieldValue);
+  if (!isManagedProject(issue.scopeKey)) {
+    await dispatchFlyMachine(config, provider, issue, mapping, prior, runnerMode, baseBranch, baseBranchFieldValue, true);
+  }
+}
+
 export async function dispatchGitHubActions(
   config: AppConfig,
   provider: TicketingProvider,
@@ -1128,6 +1154,21 @@ export async function dispatchGitHubActions(
   // Final admission authority: one transaction reserves team capacity and per-issue
   // occupancy before any credential mint or launch call. canDispatch (checked earlier,
   // in poll()) is only the preview.
+  // An opted-in project cannot run on GitHub Actions yet (AII-970): refuse before anything is reserved.
+  if (isManagedProject(issue.scopeKey)) {
+    await provider.markImplementationFailed(
+      issue.id,
+      issue.scopeKey,
+      refusalText({ kind: "refuse", category: "configuration-error", code: "gha_not_supported" }),
+    );
+    // Count the refusal so a persistently refused issue parks instead of re-commenting every poll.
+    const breakerGha = recordDispatchFailure(issue.id, "implementation", "gha_not_supported");
+    if (breakerGha.tripped) {
+      await fireBreakerTrip(config, provider, issue.id, issue.identifier, "implementation", breakerGha.failures, "gha_not_supported");
+    }
+    return;
+  }
+
   const dispatchId = crypto.randomUUID();
   const admission = acquireDispatch({
     dispatchId,
@@ -1624,7 +1665,7 @@ export interface HeldReservation {
 /** What `dispatchSession` reports to a caller that cares (the shadow and implementation
  * callers ignore it). `admitted: false` means `acquireDispatch` refused and nothing ran. */
 export type DispatchSessionResult =
-  | { admitted: false }
+  | { admitted: false; refusal?: string }
   | { admitted: true; machineId: string; executionMode: "fly-machines" | "local-docker" };
 
 export async function dispatchSession(
@@ -1643,6 +1684,9 @@ export async function dispatchSession(
      *  the shadow Fly dispatch mirrors an already-admitted GHA primary and must not
      *  compete for (or be blocked by) the same issue's reservation. */
     backendKind: "fly-machines" | "local-docker";
+    /** Managed model authentication (AII-958). Absent means the caller is not wired: an
+     *  opted-in project then refuses with `phase_not_wired` instead of launching legacy. */
+    managedAuth?: { runtime: ModelAuthRuntime; workflowFile: string };
     /** Classifies a thrown backend() error, once the backend has called
      *  `markLaunchAttempted`, as a proven non-launch (safe to release the reservation)
      *  versus an ambiguous failure (must stay held for the matching Legacy monitor to
@@ -1656,6 +1700,8 @@ export async function dispatchSession(
       machineNonce: string;
       runnerCallbackUrl: string;
       runToken: string;
+      /** `legacy` for today's path; `launch` carries the snapshot and the one-shot bootstrap. */
+      managedAuth: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }>;
       /** Call immediately before the actual launch call (createMachine / the local
        *  Docker spawn) — everything the backend does before this point (minting a
        *  credential, resolving an image) is provably side-effect-free for the
@@ -1703,6 +1749,48 @@ export async function dispatchSession(
     admission = decision;
   }
 
+  // Managed model authentication: decided before any run token is minted. Only an
+  // admission acquired here is released; a caller-held reservation is never ours to free.
+  let managedDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
+  if (!opts.managedAuth) {
+    if (isManagedProject(issue.scopeKey, dispatchId)) {
+      admission?.release("launch_rejected");
+      console.warn(`[poll] Managed dispatch for ${issue.identifier}: phase_not_wired (${opts.phase}); nothing launched`);
+      return { admitted: false, refusal: "phase_not_wired" };
+    }
+  } else if (opts.shadow && isManagedProject(issue.scopeKey, dispatchId)) {
+    return { admitted: false };
+  } else {
+    const decision = await prepareManagedDispatch(
+      { dispatchId, projectKey: issue.scopeKey, backend: opts.backendKind, owner: mapping.owner, repo: mapping.repo, workflowFile: opts.managedAuth.workflowFile },
+      opts.managedAuth.runtime,
+    );
+    console.log(
+      `[poll] Managed dispatch for ${issue.identifier}: ${decision.kind}${"code" in decision ? ` (${decision.code})` : ""}`,
+    );
+    if (decision.kind === "legacy" || decision.kind === "launch") {
+      managedDecision = decision;
+    } else {
+      admission?.release("launch_rejected");
+      if (decision.kind === "refuse") {
+        const text = refusalText(decision);
+        if (opts.phase === "implementation") {
+          await provider.markImplementationFailed(issue.id, issue.scopeKey, text);
+        } else {
+          await provider.markPlanningFailed(issue.id, issue.scopeKey, text);
+        }
+        // Count the refusal so a persistently refused issue parks instead of re-commenting every poll.
+        const breakerRefuse = recordDispatchFailure(issue.id, opts.phase, decision.code);
+        if (breakerRefuse.tripped) {
+          await fireBreakerTrip(config, provider, issue.id, issue.identifier, opts.phase, breakerRefuse.failures, decision.code);
+        }
+      } else {
+        console.log(`[poll] ${refusalText(decision)} (${issue.identifier})`);
+      }
+      return { admitted: false, refusal: decision.code };
+    }
+  }
+
   let runnerCallbackUrl = "";
   let runToken = "";
   if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
@@ -1726,8 +1814,11 @@ export async function dispatchSession(
 
   let result: SessionBackendResult;
   try {
-    result = await opts.backend({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted });
+    result = await opts.backend({ sessionToken, machineNonce, runnerCallbackUrl, runToken, managedAuth: managedDecision, markLaunchAttempted });
   } catch (err) {
+    if (managedDecision.kind === "launch" && opts.managedAuth) {
+      settleLaunch(managedDecision, classifyLaunchError(opts.backendKind, launchAttempted, err), opts.managedAuth.runtime);
+    }
     if (admission && shouldReleaseAdmissionOnDispatchError(launchAttempted, err, opts.isDefinitiveLaunchFailure)) {
       admission.release("launch_rejected");
     }
@@ -1830,7 +1921,7 @@ export async function dispatchFlyMachine(
     return;
   }
 
-  if (!config.anthropicApiKey && !config.claudeOAuthToken) {
+  if (!config.anthropicApiKey && !config.claudeOAuthToken && !isManagedProject(issue.scopeKey)) {
     const level = shadow ? "warn" : "error";
     console[level](`[poll] ${shadow ? "Shadow Fly dispatch skipped" : "Cannot dispatch"} ${issue.identifier} via Fly Machines: neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set`);
     return;
@@ -1847,9 +1938,10 @@ export async function dispatchFlyMachine(
     doMarkDispatched: !shadow,
     shadow,
     backendKind: "fly-machines",
+    managedAuth: { runtime: getModelAuthRuntime(config), workflowFile: mapping.workflowFile },
     isDefinitiveLaunchFailure: isDefinitiveFlyRejectionError,
     branchInfo: shadow ? undefined : { fieldValue: baseBranchFieldValue, defaultBranch: mapping.defaultBranch },
-    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted }) => {
+    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, managedAuth, markLaunchAttempted }) => {
       const minSecretsVersion = getFlySecretsMinVersion();
 
       let allSecretNames: string[] = [];
@@ -1869,6 +1961,14 @@ export async function dispatchFlyMachine(
         defaultImage: config.sessionImage,
       });
 
+      // Protected launch: the capability check and the launch must agree on the paired image,
+      // and every throw here precedes markLaunchAttempted so the grant is settled as rejected.
+      const protectedLaunch = managedAuth.kind === "launch" ? managedAuth : null;
+      if (protectedLaunch) {
+        if (imageSource === "override") throw new Error("managed dispatch refused: repository image override");
+        if (!config.runnerCallbackBaseUrl) throw new Error("managed dispatch refused: no runner callback base URL");
+      }
+
       const implRunConfig: RunConfigV1 = buildImplRunConfig({
         issue,
         mapping,
@@ -1876,7 +1976,22 @@ export async function dispatchFlyMachine(
         runnerCallbackUrl,
         groupingParent: isGroupingParentDispatch(issue),
         retryPolicy: getRetryPolicy(),
+        ...(protectedLaunch ? { agentConfig: protectedLaunch.snapshot } : {}),
       });
+
+      let protectedModelBootstrap: Awaited<ReturnType<typeof buildProtectedFlyBootstrap>> | undefined;
+      if (protectedLaunch) {
+        const bootstrap = protectedLaunch.takeBootstrap();
+        if (!bootstrap) throw new Error("managed dispatch refused: bootstrap unavailable");
+        protectedModelBootstrap = await buildProtectedFlyBootstrap({
+          token: flyToken,
+          app: flyApp,
+          bootstrap,
+          projectKey: issue.scopeKey,
+          runConfig: implRunConfig,
+          modelAuthUrl: config.runnerCallbackBaseUrl!,
+        });
+      }
 
       const machineConfig = buildSessionMachineConfig({
         image: resolvedImage,
@@ -1887,8 +2002,8 @@ export async function dispatchFlyMachine(
         owner: mapping.owner,
         repo: mapping.repo,
         defaultBranch: baseBranch,
-        anthropicApiKey: config.anthropicApiKey ?? undefined,
-        claudeOAuthToken: config.claudeOAuthToken ?? undefined,
+        anthropicApiKey: protectedLaunch ? undefined : (config.anthropicApiKey ?? undefined),
+        claudeOAuthToken: protectedLaunch ? undefined : (config.claudeOAuthToken ?? undefined),
         githubToken: ghToken,
         sessionToken,
         machineNonce,
@@ -1908,9 +2023,10 @@ export async function dispatchFlyMachine(
         tenantId: config.tenantId ?? undefined,
         expectedTtlSeconds: Math.round(SWEEP_MACHINE_MAX_AGE_MS / 1000),
         extraEnv: (() => {
-          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue), ...assigneeRunnerEnv(issue), AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(implRunConfig) };
+          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue), ...assigneeRunnerEnv(issue), ...(protectedLaunch ? {} : { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(implRunConfig) }) };
           return Object.keys(merged).length > 0 ? merged : undefined;
         })(),
+        ...(protectedLaunch && protectedModelBootstrap ? { protectedModelBootstrap, dispatchId: protectedLaunch.dispatchId } : {}),
       });
       if (getFlyProcessLevelSecrets().enabled) {
         const secretNames = machineConfig.config.processes?.[0]?.secrets?.map((s) => s.name ?? s.env_var) ?? [];
