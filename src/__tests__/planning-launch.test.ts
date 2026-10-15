@@ -12,11 +12,40 @@ vi.mock("../github.js", async (importOriginal) => {
 });
 
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn(), getScopedInstallationToken: vi.fn() }));
-vi.mock("../local-docker.js", () => ({ startLocalRunnerContainer: vi.fn() }));
+vi.mock("../local-docker.js", () => ({ startLocalRunnerContainer: vi.fn(), validateProtectedLocalInput: vi.fn() }));
+vi.mock("../managed-dispatch-auth.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../managed-dispatch-auth.js")>();
+  return { ...actual, isManagedProject: vi.fn(() => false) };
+});
+vi.mock("../model-auth-runtime.js", () => ({ getModelAuthRuntime: vi.fn(() => ({ runtime: true })) }));
+vi.mock("../fly-protection-key.js", () => ({ buildProtectedFlyBootstrap: vi.fn(async () => ({ sealed: "SEALED" })) }));
+vi.mock("../fly-machines.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../fly-machines.js")>();
+  return { ...actual, createMachine: vi.fn(), buildSessionMachineConfig: vi.fn((input: unknown) => ({ config: {}, input })), listAppSecrets: vi.fn(async () => []) };
+});
+vi.mock("../config.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../config.js")>();
+  return { ...actual, getMappings: vi.fn(() => ({})) };
+});
+vi.mock("../repo-image.js", () => ({ resolveSessionImage: vi.fn(async () => ({ image: "default-img", source: "default" })) }));
 vi.mock("../planning-context.js", () => ({
   buildPlanningContextInputs: vi.fn().mockResolvedValue({ parent: "", siblings: "", dependencies: "" }),
 }));
 vi.mock("../workflow-probe.js", () => ({ resolveWorkflowCapabilities: vi.fn() }));
+
+/** Opted-out regression fixtures, captured from the code before AII-1391. Set CAPTURE_FIXTURES=1 to regenerate. */
+const FIXTURE_FILE = path.join(import.meta.dirname, "fixtures", "planning-opted-out.json");
+function expectFixture(name: string, value: unknown): void {
+  const actual = JSON.parse(JSON.stringify(value ?? null));
+  if (process.env.CAPTURE_FIXTURES) {
+    const all = fs.existsSync(FIXTURE_FILE) ? JSON.parse(fs.readFileSync(FIXTURE_FILE, "utf8")) : {};
+    all[name] = actual;
+    fs.mkdirSync(path.dirname(FIXTURE_FILE), { recursive: true });
+    fs.writeFileSync(FIXTURE_FILE, JSON.stringify(all, null, 2) + "\n");
+    return;
+  }
+  expect(actual).toEqual(JSON.parse(fs.readFileSync(FIXTURE_FILE, "utf8"))[name]);
+}
 
 describe("preparePlanningLaunch", () => {
   let dbPath: string;
@@ -127,6 +156,20 @@ describe("preparePlanningLaunch", () => {
       trustedCredentials: { version: 1, attemptToken: "attempt-private" },
       resolveRunnerImage: vi.fn().mockResolvedValue(undefined),
     })).rejects.toThrow(/refusing to drop or downgrade/);
+  });
+
+  it("opted-out GitHub Actions planning: workflow inputs match the pre-change fixture", async () => {
+    vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue({
+      contract: "legacy",
+      supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
+    });
+    const result = await launchModule.preparePlanningLaunch({
+      config: { ...config, runnerTokenSecret: undefined, runnerCallbackBaseUrl: undefined } as unknown as AppConfig,
+      provider, issue, mapping, dispatchId: "dispatch-fixture", resolvedPlanningBranch: "feature/base",
+      resolveRunnerImage: vi.fn().mockResolvedValue("runner:image"),
+    });
+    expectFixture("gha", result);
   });
 });
 
@@ -324,10 +367,11 @@ describe("launchPlanningSession", () => {
     auth = await import("../github-app-auth.js");
     docker = await import("../local-docker.js");
     mod = await import("../planning-launch.js");
+    vi.mocked((await import("../managed-dispatch-auth.js")).isManagedProject).mockReturnValue(false);
     vi.mocked(auth.getInstallationToken).mockResolvedValue("CONTROL-TOKEN-SECRET");
     vi.mocked(auth.getScopedInstallationToken).mockResolvedValue({ token: "SCOPED-TOKEN-SECRET" } as never);
     dispatchSession.mockImplementation(async (_c, _p, _i, _m, _pr, _rm, opts) => {
-      const r = await opts.backend({ sessionToken: "SESSION", machineNonce: "NONCE", runnerCallbackUrl: "", runToken: "RUN", markLaunchAttempted: () => {} });
+      const r = await opts.backend({ sessionToken: "SESSION", machineNonce: "NONCE", runnerCallbackUrl: "", runToken: "RUN", managedAuth: { kind: "legacy" }, markLaunchAttempted: () => {} });
       return { admitted: true, machineId: r.machineId, executionMode: r.executionMode };
     });
   });
@@ -384,7 +428,7 @@ describe("launchPlanningSession", () => {
   it("a throw before markLaunchAttempted is rejected", async () => {
     vi.mocked(auth.getInstallationToken).mockRejectedValue(new Error("mint failed"));
     dispatchSession.mockImplementation(async (_c, _p, _i, _m, _pr, _rm, opts) => {
-      await opts.backend({ sessionToken: "s", machineNonce: "n", runnerCallbackUrl: "", runToken: "", markLaunchAttempted: () => {} });
+      await opts.backend({ sessionToken: "s", machineNonce: "n", runnerCallbackUrl: "", runToken: "", managedAuth: { kind: "legacy" }, markLaunchAttempted: () => {} });
     });
     expect(await call({ reservation })).toEqual({ outcome: "rejected", executionMode: "local-docker" });
   });
@@ -403,5 +447,156 @@ describe("launchPlanningSession", () => {
   it("not admitted maps to rejected", async () => {
     dispatchSession.mockResolvedValue({ admitted: false });
     expect(await call()).toEqual({ outcome: "rejected", executionMode: "local-docker" });
+  });
+
+  describe("opted-in project", () => {
+    const snapshot = { v: 1, marker: "SNAP" };
+    const takeBootstrap = vi.fn();
+    const launchDecision = () => ({ kind: "launch", snapshot, dispatchId: "d-1", takeBootstrap });
+    let managed: typeof import("../managed-dispatch-auth.js");
+    let flyMachines: typeof import("../fly-machines.js");
+    let attempted: ReturnType<typeof vi.fn>;
+    const optedConfig = { ...baseConfig, anthropicApiKey: null, claudeOAuthToken: null, runnerCallbackBaseUrl: "https://orch.example.test", flySessionsToken: "ft", flySessionsApp: "fa", healthPort: 8080 } as unknown as AppConfig;
+
+    beforeEach(async () => {
+      managed = await import("../managed-dispatch-auth.js");
+      flyMachines = await import("../fly-machines.js");
+      vi.mocked(managed.isManagedProject).mockReturnValue(true);
+      takeBootstrap.mockReset().mockReturnValue({ grant: "PLAIN-GRANT" });
+      attempted = vi.fn();
+      dispatchSession.mockImplementation(async (_c, _p, _i, _m, _pr, _rm, opts) => {
+        expect(opts.managedAuth.workflowFile).toBe(mapping.planningWorkflowFile);
+        const r = await opts.backend({ sessionToken: "S", machineNonce: "N", runnerCallbackUrl: "https://orch.example.test", runToken: "R", managedAuth: launchDecision(), markLaunchAttempted: attempted });
+        return { admitted: true, machineId: r.machineId, executionMode: r.executionMode };
+      });
+      vi.mocked(docker.startLocalRunnerContainer).mockResolvedValue({ containerId: "c-1", containerName: "n" } as never);
+      vi.mocked(flyMachines.createMachine).mockResolvedValue({ id: "m-1", name: "mn" } as never);
+    });
+
+    it("skips the Anthropic precheck", async () => {
+      expect(await call({ config: optedConfig, reservation })).toMatchObject({ outcome: "accepted" });
+    });
+
+    it("local: protectedModelAuth with the snapshot, no legacy credentials or run config env", async () => {
+      await call({ config: optedConfig, reservation });
+      const input = vi.mocked(docker.startLocalRunnerContainer).mock.calls[0][0] as never as Record<string, any>;
+      expect(input.anthropicApiKey).toBeUndefined();
+      expect(input.claudeOAuthToken).toBeUndefined();
+      expect(input.extraEnv?.AI_IMPLEMENT_RUN_CONFIG).toBeUndefined();
+      expect(input.protectedModelAuth.bootstrap).toEqual({ grant: "PLAIN-GRANT" });
+      expect(input.protectedModelAuth.runConfig).toMatchObject({ runnerPhase: "planning", agentConfig: snapshot });
+      expect(input.protectedModelAuth.modelAuthUrl).toBe("https://orch.example.test");
+      expect(docker.validateProtectedLocalInput).toHaveBeenCalled();
+      expect(attempted).toHaveBeenCalled();
+    });
+
+    it("fly: sealed bootstrap, model auth url, no Anthropic credentials", async () => {
+      const result = await call({ config: optedConfig, execPath: "fly-machines", reservation });
+      expect(result).toMatchObject({ outcome: "accepted" });
+      const input = vi.mocked(flyMachines.buildSessionMachineConfig).mock.calls[0][0] as never as Record<string, any>;
+      expect(input.protectedModelBootstrap).toEqual({ sealed: "SEALED" });
+      expect(input.dispatchId).toBe("d-1");
+      expect(input.anthropicApiKey).toBeUndefined();
+      expect(input.claudeOAuthToken).toBeUndefined();
+      expect(input.extraEnv?.AI_IMPLEMENT_RUN_CONFIG).toBeUndefined();
+      expect(flyMachines.createMachine).toHaveBeenCalled();
+      const fly = await import("../fly-protection-key.js");
+      expect(vi.mocked(fly.buildProtectedFlyBootstrap).mock.calls[0][0]).toMatchObject({
+        modelAuthUrl: "https://orch.example.test",
+        runConfig: { runnerPhase: "planning", agentConfig: snapshot },
+      });
+    });
+
+    it("pre-launch failures throw before markLaunchAttempted", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const noUrl = { ...optedConfig, runnerCallbackBaseUrl: undefined } as unknown as AppConfig;
+      expect(await call({ config: noUrl, execPath: "fly-machines", reservation })).toMatchObject({ outcome: "rejected" });
+      const repoImage = await import("../repo-image.js");
+      vi.mocked(repoImage.resolveSessionImage).mockResolvedValueOnce({ image: "x", source: "override" } as never);
+      expect(await call({ config: optedConfig, execPath: "fly-machines", reservation })).toMatchObject({ outcome: "rejected" });
+      takeBootstrap.mockReturnValue(null);
+      expect(await call({ config: optedConfig, reservation })).toMatchObject({ outcome: "rejected" });
+      expect(attempted).not.toHaveBeenCalled();
+      expect(flyMachines.createMachine).not.toHaveBeenCalled();
+      expect(docker.startLocalRunnerContainer).not.toHaveBeenCalled();
+    });
+  });
+
+  it("opted-out launch keeps Anthropic credentials and the run config env", async () => {
+    await call({ reservation });
+    const input = vi.mocked(docker.startLocalRunnerContainer).mock.calls[0][0] as never as Record<string, any>;
+    expect(input.anthropicApiKey).toBe("sk");
+    expect(input.extraEnv.AI_IMPLEMENT_RUN_CONFIG).toBeTypeOf("string");
+    expect(input.protectedModelAuth).toBeUndefined();
+  });
+
+  it("opted-out local launch: the container input matches the pre-change fixture", async () => {
+    vi.mocked(docker.startLocalRunnerContainer).mockResolvedValue({ containerId: "c-1", containerName: "n" } as never);
+    await call({ reservation });
+    expectFixture("local", vi.mocked(docker.startLocalRunnerContainer).mock.calls[0][0]);
+  });
+
+  it("opted-out Fly launch: the machine input matches the pre-change fixture", async () => {
+    const flyMachines = await import("../fly-machines.js");
+    vi.mocked(flyMachines.createMachine).mockResolvedValue({ id: "m-1", name: "mn" } as never);
+    const flyConfig = { ...baseConfig, flySessionsToken: "ft", flySessionsApp: "fa", runnerCallbackBaseUrl: "https://orch.example.test" } as unknown as AppConfig;
+    expect(await call({ config: flyConfig, execPath: "fly-machines", reservation })).toMatchObject({ outcome: "accepted" });
+    expectFixture("fly", vi.mocked(flyMachines.buildSessionMachineConfig).mock.calls[0][0]);
+  });
+
+  it("an opted-out project with no Anthropic credentials is still rejected by the precheck", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const managed = await import("../managed-dispatch-auth.js");
+    expect(managed.isManagedProject("AII")).toBe(false);
+    const noKey = { ...baseConfig, anthropicApiKey: null, claudeOAuthToken: null } as unknown as AppConfig;
+    expect(await call({ config: noKey, reservation })).toEqual({ outcome: "rejected", executionMode: "local-docker" });
+    expect(dispatchSession).not.toHaveBeenCalled();
+  });
+});
+
+describe("preparePlanningLaunch for an opted-in project", () => {
+  let dbPath: string;
+  let dedup: typeof import("../dedup.js");
+
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+    dbPath = path.join(os.tmpdir(), `planning-gha-refuse-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
+    process.env.DEDUP_DB_PATH = dbPath;
+    dedup = await import("../dedup.js");
+    dedup.getDb();
+    (await import("../dispatch-breaker.js")).initDispatchBreakerTable();
+    const managed = await import("../managed-dispatch-auth.js");
+    vi.mocked(managed.isManagedProject).mockReturnValue(true);
+  });
+
+  afterEach(() => {
+    dedup.closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  it("refuses before any mint or dispatch and trips the breaker on the third", async () => {
+    const mod = await import("../planning-launch.js");
+    const auth = await import("../github-app-auth.js");
+    const github = await import("../github.js");
+    const breaker = await import("../dispatch-breaker.js");
+    const markPlanningFailed = vi.fn();
+    const provider = { id: "linear", markPlanningFailed } as unknown as TicketingProvider;
+    const issue = { id: "i-gha", identifier: "AII-1", title: "t", scopeKey: "AII" } as unknown as TicketIssue;
+    const fireBreakerTrip = vi.fn();
+    const args = {
+      config: {} as AppConfig, provider, issue,
+      mapping: { owner: "o", repo: "r", planningWorkflowFile: "claude-plan.yml", defaultBranch: "main" } as unknown as RepoMapping,
+      dispatchId: "d", resolvedPlanningBranch: "main",
+      resolveRunnerImage: vi.fn(), fireBreakerTrip,
+    };
+    for (let i = 0; i < 3; i++) {
+      await expect(mod.preparePlanningLaunch(args)).rejects.toThrow("managed dispatch refused: gha_not_supported");
+    }
+    expect(markPlanningFailed).toHaveBeenCalledTimes(3);
+    expect(auth.getInstallationToken).not.toHaveBeenCalled();
+    expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
+    expect(fireBreakerTrip).toHaveBeenCalledTimes(1);
+    expect(breaker.isParked("i-gha", "planning")).toBe(true);
   });
 });

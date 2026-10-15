@@ -1587,6 +1587,7 @@ export async function dispatchPlanning(
     config, provider, issue, mapping, dispatchId, resolvedPlanningBranch,
     trustedCredentials: ctx.trustedCredentials,
     resolveRunnerImage: resolveDispatchRunnerImage,
+    fireBreakerTrip,
   }).catch((err) => {
     planningAdmission.release("launch_rejected");
     throw err;
