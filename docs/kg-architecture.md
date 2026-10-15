@@ -269,6 +269,7 @@ at a gate (`src/restate/kg-refresh-workflow.ts`):
 | `decide { action: "accept", actor }` | Posts a `### Baseline` comment naming the actor on the PR, then runs the normal merge, delete-branch and fetch/stage/swap/verify gates | as a normal success |
 | `decide { action: "cancel", actor }` | Closes the PR (gate `operator_cancelled`), closes the row, releases | `operator_cancelled` |
 | `cancel` signal (the page's Stop) | Same as `decide` cancel | `operator_cancelled` |
+| `cancel` signal on a finished run, or on a dispatch no workflow knows | Refused with 409 `no-refresh-in-flight` (checked before `past-merge`, since a finished run's `cancel` promise also holds `COMMITTED`) | the route stamps the row |
 | `cancel` signal or `decide { action: "cancel" }` after the merge starts | Refused with 409 `past-merge`; the run finishes | as a normal success or gate failure |
 | 24 h elapse (`KG_REFRESH_DECISION_TIMEOUT_MS`, fixed, no setting) | Closes the PR (gate `decision_timeout`), closes the row, releases | `decision_timeout` |
 
@@ -279,6 +280,8 @@ is recorded as `decision_timeout`. A held dry-run never reaches the gate. Any ot
 unchanged success or failure paths; a `KG_SNAPSHOT_HELD` report with no `snapshotPr` takes the failure path.
 
 The deploy drain counts a suspended invocation, so a held run holds a deploy for up to 24 h. The operator can still decide it during the hold: `get_kg_status` and `decide_kg_refresh` are the two tools the deploy hold lets through, so Accept/Cancel on the KG page work, the run finishes, and the drain then completes. **Refresh graph now** stays refused.
+
+The page's Stop route sends the workflow's `cancel` and returns its answer. On 200 it writes nothing and destroys nothing (the workflow stops the machine and closes the row; the notice says "stop requested"). On 409 `no-refresh-in-flight` it stamps `failed` / `operator_cancelled` once, because no workflow will. Any other answer (`past-merge`, 503) is returned unchanged and the row is left alone. The route writes a refresh row only when no workflow will; the other writers are the workflow (`closeJobLog`, `cleanupCancelled`) and the reaper's max-age sweep (`src/reaper.ts`), which also writes `timed_out`.
 
 A Stop sent before the gate opens also cancels the held run: the `cancel` promise is durable, so the gate sees it at once.
 

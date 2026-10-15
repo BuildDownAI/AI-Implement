@@ -58,7 +58,8 @@ describe("pipelines page — kg-refresh row actions (AII-521)", () => {
 
   it("prompts for confirmation before cancelling a kg-refresh run", () => {
     expect(pipelinesScript).toContain("confirm(");
-    expect(pipelinesScript).toContain("Stop this KG-refresh run");
+    expect(pipelinesScript).toContain("Ask the run to stop");
+    expect(pipelinesScript).toContain("body.error");
   });
 
   it("fetches machine logs via GET /api/sessions/:machineId/logs", () => {

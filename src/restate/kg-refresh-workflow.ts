@@ -291,6 +291,8 @@ export const KG_REFRESH_COMMITTED = "__kg-refresh-committed__";
 
 /** Message of the 409 a cancel gets once the merge has started. */
 export const KG_REFRESH_PAST_MERGE_MESSAGE = "past-merge";
+/** The `cancel` answer (409) when no refresh is in flight: the run finished, or no workflow knows the dispatch. */
+export const KG_REFRESH_NO_REFRESH_MESSAGE = "no-refresh-in-flight";
 
 export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
   const { owner, repo: repoName } = parseKgSourceRepo(deps.kgSourceRepo);
@@ -460,7 +462,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         await ctx.run("close-snapshot-pr", () => closeSnapshotPr(deps.rail, owner, repoName, number, gate, branch), { maxRetryAttempts: 3 });
       } catch (err) {
         if (restate.internal.isSuspendedError(err)) throw err;
-        if (err instanceof restate.TerminalError && err.code === 409) throw err; // a Restate cancel, not a close failure
+        // `run` is registered with `explicitCancellation`, so no step is interrupted by a Restate cancel: a failure here is a close failure.
         ctx.console.error(`[KgRefresh] closing snapshot PR #${number} failed for ${triggerId}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
@@ -1110,6 +1112,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
 
   async function cancel(ctx: WorkflowSharedContext, raw: { reason?: string }): Promise<void> {
     await requireStarted(ctx);
+    // First: a finished run's `cancel` promise also holds COMMITTED, so the peek in requestCancel would answer past-merge.
+    if (await ctx.get<boolean>("completed")) throw new restate.TerminalError(KG_REFRESH_NO_REFRESH_MESSAGE, { errorCode: 409 });
     const reason = raw?.reason ?? "cancelled";
     if (reason === KG_REFRESH_COMMITTED) {
       throw new restate.TerminalError("cancel reason is reserved", { errorCode: 400 });

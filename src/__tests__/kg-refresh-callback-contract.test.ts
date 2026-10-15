@@ -343,4 +343,14 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
     });
     expect(ingress.cancel).not.toHaveBeenCalled();
   });
+
+  it("contract: KgRefresh.cancel — a handler 409 reaches the route as 409 with its text, not 503", async () => {
+    const idx = await import("../index.js");
+    const ingress = { repoStatus: vi.fn(), cancel: vi.fn().mockResolvedValue({ status: "conflict", error: "past-merge" }) };
+    const deps = idx.makeKgRefreshAdminDeps(SLUG, ingress as never, vi.fn() as never, () => false);
+    expect(await deps.cancel({ jobId: 1, dispatchId: "t-merge", reason: "operator_cancelled" })).toEqual({
+      status: 409,
+      body: { error: "past-merge" },
+    });
+  });
 });
