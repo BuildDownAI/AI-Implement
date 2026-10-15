@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import crypto from "node:crypto";
+import { readFileSync } from "node:fs";
 import {
   createMachine,
   getMachine,
@@ -18,6 +19,7 @@ import {
   buildSessionMachineConfig,
   listAppSecrets,
   setAppSecrets,
+  putAppSecretsVersioned,
   unsetAppSecret,
   fetchMachineLogs,
   updateMachineMetadata,
@@ -1388,10 +1390,11 @@ describe("buildSessionMachineConfig — protected model bootstrap (AII-500)", ()
     v: 1,
     issue: { id: "uuid-123", identifier: "ENG-42", title: "t", description: "d" },
   };
+  const MODEL_AUTH_URL = "https://orchestrator.example/model-auth";
   const goodSecret = { name: MODEL_AUTH_ENV.protectionKey, available: true, version: 7 };
   const protectedInput = (over: Partial<SessionMachineInput> = {}): SessionMachineInput => ({
     ...baseInput,
-    protectedModelBootstrap: { sealed, projectKey: "proj", runConfig, secret: goodSecret },
+    protectedModelBootstrap: { sealed, projectKey: "proj", modelAuthUrl: MODEL_AUTH_URL, runConfig, secret: goodSecret },
     ...over,
   });
   const category = (input: SessionMachineInput) => {
@@ -1451,13 +1454,50 @@ describe("buildSessionMachineConfig — protected model bootstrap (AII-500)", ()
     }
   });
 
-  it("does not use process-level secrets for protection, keeping the team-secret filter", () => {
+  it("keeps the entrypoint filter for protected mode when the process-level flag is off", () => {
     const result = buildSessionMachineConfig(
-      protectedInput({ teamKey: "eng", teamSecretNames: ["ENG_DB", "OPS_X"], allTeamKeys: ["eng", "ops"], flyProcessLevelSecrets: true }),
+      protectedInput({ teamKey: "eng", teamSecretNames: ["ENG_DB", "OPS_X"], allTeamKeys: ["eng", "ops"], flyProcessLevelSecrets: false }),
     );
     expect(result.config.processes).toBeUndefined();
     expect(result.config.env!.AI_IMPLEMENT_TEAM_SECRET_PREFIX).toBe("ENG_");
     expect(result.config.env!.AI_IMPLEMENT_FOREIGN_SECRET_NAMES).toBe("OPS_X");
+  });
+
+  it("uses process-level secrets in protected mode: foreign names out, key listed, model-auth URL set", () => {
+    const result = buildSessionMachineConfig(
+      protectedInput({
+        teamKey: "eng",
+        teamSecretNames: ["ENG_DB", "OPS_X", "GLOBAL"],
+        allTeamKeys: ["eng", "ops"],
+        flyProcessLevelSecrets: true,
+      }),
+    );
+    const proc = result.config.processes![0];
+    expect(proc.ignore_app_secrets).toBe(true);
+    expect(proc.secrets!.map((s) => s.env_var)).toEqual(["DB", "GLOBAL", MODEL_AUTH_ENV.protectionKey]);
+    expect(JSON.stringify(proc.secrets)).not.toContain("OPS_X");
+    expect(result.config.env![MODEL_AUTH_ENV.baseUrl]).toBe(MODEL_AUTH_URL);
+  });
+
+  it("still lists the protection key when the secrets listing failed", () => {
+    const result = buildSessionMachineConfig(
+      protectedInput({ teamKey: "eng", teamSecretNames: [], allTeamKeys: ["eng"], flyProcessLevelSecrets: true }),
+    );
+    expect(result.config.processes![0].ignore_app_secrets).toBe(true);
+    expect(result.config.processes![0].secrets).toEqual([{ env_var: MODEL_AUTH_ENV.protectionKey }]);
+  });
+
+  it("throws protected_team_prefix_collision for a team key that captures the protection key", () => {
+    expect(category(protectedInput({ teamKey: "AI" }))).toBe("protected_team_prefix_collision");
+    expect(category(protectedInput({ teamKey: "eng", allTeamKeys: ["eng", "ai"] }))).toBe("protected_team_prefix_collision");
+    expect(category(protectedInput({ teamKey: "AII", allTeamKeys: ["AII"] }))).toBeUndefined();
+  });
+
+  it("requires an https model-auth URL", () => {
+    const pb = { sealed, projectKey: "proj", runConfig, secret: goodSecret };
+    for (const modelAuthUrl of ["http://orchestrator.example", "", "https://", undefined as never]) {
+      expect(category(protectedInput({ protectedModelBootstrap: { ...pb, modelAuthUrl } }))).toBe("protected_input_invalid");
+    }
   });
 
   it("rejects simultaneous legacy raw credentials", () => {
@@ -1491,7 +1531,7 @@ describe("buildSessionMachineConfig — protected model bootstrap (AII-500)", ()
 
   it("fails before launch for missing, unavailable, partial, version-less or unsafe secret metadata", () => {
     const withSecret = (secret: ProtectedBootstrapSecretMetadata | undefined) =>
-      protectedInput({ protectedModelBootstrap: { sealed, projectKey: "proj", runConfig, secret: secret as never } });
+      protectedInput({ protectedModelBootstrap: { sealed, projectKey: "proj", modelAuthUrl: MODEL_AUTH_URL, runConfig, secret: secret as never } });
     const cases: [ProtectedBootstrapSecretMetadata | undefined, string][] = [
       [undefined, "protected_secret_unavailable"],
       [{}, "protected_secret_unavailable"],
@@ -1518,7 +1558,7 @@ describe("buildSessionMachineConfig — protected model bootstrap (AII-500)", ()
   });
 
   it("rejects a malformed sealed envelope, mismatched dispatch, or an envelope that already holds a grant", () => {
-    const pb = { sealed, projectKey: "proj", runConfig, secret: goodSecret };
+    const pb = { sealed, projectKey: "proj", modelAuthUrl: MODEL_AUTH_URL, runConfig, secret: goodSecret };
     expect(category(protectedInput({ protectedModelBootstrap: { ...pb, sealed: { ...sealed, tag: "x" } } }))).toBe("protected_input_invalid");
     expect(category(protectedInput({ dispatchId: "disp-other" }))).toBe("protected_input_invalid");
     expect(category(protectedInput({ protectedModelBootstrap: { ...pb, projectKey: " " } }))).toBe("protected_input_invalid");
@@ -1553,5 +1593,57 @@ describe("buildSessionMachineConfig — protected model bootstrap (AII-500)", ()
       expect(proc.config.processes?.[0].ignore_app_secrets).toBe(true);
       expect(proc.min_secrets_version).toBeUndefined();
     });
+  });
+});
+
+describe("buildSessionMachineConfig — legacy config and protection key hiding (AII-1388)", () => {
+  const base: SessionMachineInput = {
+    image: "img", issueId: "id1", issueIdentifier: "ENG-42", issueTitle: "T", issueDescription: "D",
+    owner: "o", repo: "r", defaultBranch: "main", githubToken: "gt", sessionToken: "st", machineNonce: "n",
+  };
+  const names = ["ENG_DB", "OPS_X", "GLOBAL"];
+  const fixture = JSON.parse(
+    readFileSync(new URL("./fixtures/fly-legacy-config.json", import.meta.url), "utf8"),
+  ) as { a: unknown; b: unknown };
+
+  it("is byte-identical to the pre-change config for a listing without the key", () => {
+    const common = { ...base, teamKey: "eng", teamSecretNames: names, allTeamKeys: ["eng", "ops"] };
+    expect(JSON.parse(JSON.stringify(buildSessionMachineConfig({ ...common, flyProcessLevelSecrets: false })))).toEqual(fixture.a);
+    expect(JSON.parse(JSON.stringify(buildSessionMachineConfig({ ...common, flyProcessLevelSecrets: true })))).toEqual(fixture.b);
+  });
+
+  it("process-level mode omits the key from global passthrough", () => {
+    const r = buildSessionMachineConfig({
+      ...base, teamKey: "eng", teamSecretNames: [...names, MODEL_AUTH_ENV.protectionKey], allTeamKeys: ["eng", "ops"], flyProcessLevelSecrets: true,
+    });
+    expect(r.config.processes![0].secrets!.map((s) => s.env_var)).toEqual(["DB", "GLOBAL"]);
+  });
+
+  it("entrypoint-filter mode lists the key as foreign", () => {
+    const r = buildSessionMachineConfig({
+      ...base, teamKey: "eng", teamSecretNames: [...names, MODEL_AUTH_ENV.protectionKey], allTeamKeys: ["eng", "ops"],
+    });
+    expect(r.config.env!.AI_IMPLEMENT_FOREIGN_SECRET_NAMES).toBe(`OPS_X,${MODEL_AUTH_ENV.protectionKey}`);
+  });
+});
+
+describe("putAppSecretsVersioned", () => {
+  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
+
+  it("POSTs values to the REST secrets endpoint and returns the version", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, json: async () => ({ version: 12 }) } as Response);
+    await expect(putAppSecretsVersioned("tok", "app", { A: "b" })).resolves.toBe(12);
+    const [url, opts] = vi.mocked(fetch).mock.calls[0];
+    expect(url).toBe("https://api.machines.dev/v1/apps/app/secrets");
+    expect(JSON.parse((opts as RequestInit).body as string)).toEqual({ values: { A: "b" } });
+  });
+
+  it("throws value-free errors on non-2xx or a missing version", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 403, text: async () => "echo SECRETVALUE" } as Response);
+    await expect(putAppSecretsVersioned("tok", "app", { A: "SECRETVALUE" })).rejects.toThrow(/403/);
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, json: async () => ({ version: "x" }) } as Response);
+    const err = await putAppSecretsVersioned("tok", "app", { A: "SECRETVALUE" }).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).not.toContain("SECRETVALUE");
   });
 });

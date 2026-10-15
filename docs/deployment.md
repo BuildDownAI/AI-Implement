@@ -221,7 +221,7 @@ fly ssh console --app <app_name>             # shell into the machine
 
 Secrets set through the admin UI Secrets panel are stored as classic Fly app secrets on the **shared sessions app**, prefixed with the team key — for example, a secret named `QA_PROBE` on the `SAN` mapping is stored as `SAN_QA_PROBE`.
 
-Classic Fly app secrets are **app-wide**: Fly injects every classic secret into every machine on the sessions app under its stored name, regardless of which team that machine belongs to. The Fly Machines API `processes[].secrets` field with `env_var` remap only applies to the non-GA named-secrets feature and has no effect on classic secrets.
+Classic Fly app secrets are **app-wide** by default: with the process-level flag off, Fly injects every classic secret into every machine on the sessions app under its stored name, regardless of which team that machine belongs to. With the flag on (the default, see [Process-level secrets](#process-level-secrets)), `processes[0].ignore_app_secrets` plus an explicit `processes[0].secrets` list keeps other teams' secrets out at the Fly boundary. An earlier note here that the `processes[].secrets` remap has no effect on classic secrets was superseded by the AII-491 spike and the AII-1388 live probe (2026-10-15), which confirmed the key is present and a foreign-team secret absent on a protected probe machine.
 
 The runner entrypoint (`session/entrypoint.sh`, via `remap_team_secrets` in `session/lib.sh`) is the isolation boundary. When `AI_IMPLEMENT_TEAM_SECRET_PREFIX` is set, the entrypoint runs before the `su -p coder` handoff and:
 
@@ -247,6 +247,9 @@ Process-level mode switches `buildSessionMachineConfig` to a stricter isolation 
 - Own-team secrets (`<TEAM>_<NAME>`) → `{ env_var: "<NAME>", name: "<TEAM>_<NAME>" }` (remapped to bare form)
 - Foreign-team secrets → excluded entirely
 - Global secrets (no team prefix) → `{ env_var: "<NAME>" }` (passed through unchanged)
+- `AI_IMPLEMENT_MODEL_AUTH_PROTECTION_KEY` → omitted from global passthrough for ordinary runs; for a **protected** run (ADR 009) it is always listed as `{ env_var: "AI_IMPLEMENT_MODEL_AUTH_PROTECTION_KEY" }`, even when the secrets listing failed and the list is otherwise empty, so the fail-closed empty list does not withhold it. With the flag off, a non-protected config appends the key to `AI_IMPLEMENT_FOREIGN_SECRET_NAMES` when it appears in the listing.
+
+**Protection key delivery.** `ensureProtectionKeySecret` (`src/fly-protection-key.ts`) derives the key from `RUNNER_TOKEN_SECRET`, writes it to the sessions app once with `FLY_SESSIONS_TOKEN` through the REST `POST /v1/apps/{app}/secrets` endpoint (`putAppSecretsVersioned`), and stores `{fingerprint, version}` in the `settings` table. The returned secrets version becomes the machine's `min_secrets_version`. Rotating `RUNNER_TOKEN_SECRET` writes a new key and version on the next protected dispatch. A team key whose prefix captures the key name (team `AI`, prefix `AI_`) makes the builder throw `protected_team_prefix_collision`. Rollback: `fly secrets unset AI_IMPLEMENT_MODEL_AUTH_PROTECTION_KEY -a <sessions app>`.
 
 The entrypoint remap/filter logic remains active in both modes but is a no-op when process-level mode is on, since the machine already receives bare names with foreign names absent. The orchestrator also sets `AI_IMPLEMENT_FORWARDED_SECRETS` to the comma-joined bare names of the own-team secrets in `processes[0].secrets`, so `modelProcessEnv()` strips them from the agent's environment before Claude Code starts.
 
