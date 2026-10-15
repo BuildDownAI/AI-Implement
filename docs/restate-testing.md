@@ -340,9 +340,9 @@ did not test). Scenarios follow four rules, and
 
    ```ts
    const rows = await eventually(
-     () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRepo' AND target_handler_name = 'expire'`),
+     () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRepo' AND target_handler_name = 'watch'`),
      (found) => found.length === 1,
-     { label: "one scheduled KgRepo.expire" },
+     { label: "one suspended KgRepo.watch while the run lives" },
    );
    ```
 

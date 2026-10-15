@@ -10,7 +10,7 @@ import type { WorkflowContext, WorkflowSharedContext } from "@restatedev/restate
 import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { awaitOwnedRun, type OwnedRunEvent, type OwnedRunStatus } from "../../restate/owned-run-wait.js";
-import { VARIANTS, callWorkflow, eventually, gate, startVariants, stopAll, waitForStep, type Gate } from "./harness.js";
+import { VARIANTS, callWorkflow, cancelInvocation, eventually, gate, queryInvocations, startVariants, stopAll, waitForStep, type Gate } from "./harness.js";
 
 type Shape = "kg-refresh" | "planning" | "review-fix";
 
@@ -137,12 +137,56 @@ const fixture = restate.workflow({
   },
 });
 
+// Passes of the cancel fixture's race, keyed by workflow key: one cancelArm call per race. A replay
+// can re-run the handler, so a test asserts a lower bound.
+const cancelArmCalls = new Map<string, number>();
+
+interface CancelFixtureInput {
+  tickMs: number;
+  totalMs: number;
+}
+
+// A run registered with `explicitCancellation`, as KgRefresh is: a Restate cancel is seen only
+// through the cancelArm raced inside awaitOwnedRun (same shape as `cancelArm` in kg-refresh-workflow.ts).
+const cancelFixture = restate.workflow({
+  name: "OwnedRunCancelFixture",
+  handlers: {
+    run: restate.handlers.workflow.workflow(
+      { explicitCancellation: true },
+      async (ctx: WorkflowContext, input: CancelFixtureInput): Promise<OwnedRunEvent> => {
+        const startedAt = await ctx.date.now();
+        ctx.set("step", "waiting");
+        const key = ctx.key;
+        const cancelArm = (): restate.RestatePromise<never> => {
+          cancelArmCalls.set(key, (cancelArmCalls.get(key) ?? 0) + 1);
+          return (ctx as unknown as restate.internal.ContextInternal).cancellation().map((): never => {
+            throw new restate.TerminalError("Cancelled", { errorCode: 409 });
+          });
+        };
+        return awaitOwnedRun(ctx, {
+          signals: ["report"],
+          resultSignal: "report",
+          totalDeadlineAt: startedAt + input.totalMs,
+          tickMs: input.tickMs,
+          cancelArm,
+        });
+      },
+    ),
+    report: restate.handlers.workflow.shared(async (ctx: WorkflowSharedContext, body: unknown) => {
+      ctx.promise("report").resolve(body ?? { ok: true });
+    }),
+    status: restate.handlers.workflow.shared(async (ctx: WorkflowSharedContext): Promise<{ step: string | null }> => ({
+      step: (await ctx.get<string>("step")) ?? null,
+    })),
+  },
+});
+
 describe("awaitOwnedRun (Restate)", () => {
   let environments: Map<string, RestateEnvironment>;
   let counter = 0;
 
   beforeAll(async () => {
-    environments = await startVariants([fixture]);
+    environments = await startVariants([fixture, cancelFixture]);
   }, 60_000);
 
   afterAll(async () => {
@@ -388,5 +432,55 @@ describe("awaitOwnedRun (Restate)", () => {
       const result = await run.done;
       expect(result.events).toEqual([{ kind: "total_timeout" }]);
     });
+  });
+
+  describe("cancelArm option", () => {
+    const LONG_TICK = { tickMs: 600_000, totalMs: 1_200_000 };
+    const SHORT_TICK = { tickMs: 30, totalMs: 1_200_000 };
+
+    function beginCancel(label: string, input: CancelFixtureInput) {
+      const env = envFor(label);
+      const baseUrl = env.baseUrl();
+      const key = `cancel-${label}-${counter++}`;
+      const done = callWorkflow<OwnedRunEvent>(baseUrl, "OwnedRunCancelFixture", key, "run", input);
+      // A rejection that nobody has awaited yet must not surface as unhandled.
+      done.catch(() => undefined);
+      const read = () => callWorkflow<{ step: string | null }>(baseUrl, "OwnedRunCancelFixture", key, "status");
+      const send = (body: unknown) => callWorkflow(baseUrl, "OwnedRunCancelFixture", key, "report", body);
+      const cancel = async () => {
+        const rows = await eventually(
+          () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'OwnedRunCancelFixture' AND target_service_key = '${key}' AND target_handler_name = 'run'`),
+          (found) => found.length === 1,
+          { label: "the run invocation" },
+        );
+        await cancelInvocation(env.adminAPIBaseUrl(), String(rows[0].id));
+      };
+      return { key, done, read, send, cancel };
+    }
+
+    it.each(labels)("a cancel while the wait is pending rejects with 409 at once, not at the next tick (%s)", async (label) => {
+      const run = beginCancel(label, LONG_TICK);
+      await waitForStep(run.read, "waiting");
+      await run.cancel();
+      // The tick is ten minutes away: only the cancel arm can settle this.
+      await expect(run.done).rejects.toThrow(/409/);
+    }, 30_000);
+
+    it.each(labels)("the arm is called fresh for each race: a cancel after several passes is seen (%s)", async (label) => {
+      const run = beginCancel(label, SHORT_TICK);
+      await waitForStep(run.read, "waiting");
+      await eventually(() => cancelArmCalls.get(run.key) ?? 0, (calls) => calls >= 2, { label: "two loop passes" });
+      await run.cancel();
+      await expect(run.done).rejects.toThrow(/409/);
+      expect(cancelArmCalls.get(run.key)).toBeGreaterThan(1);
+    }, 30_000);
+
+    it.each(labels)("with no cancel, a signal still wins and the tick still loops (%s)", async (label) => {
+      const run = beginCancel(label, SHORT_TICK);
+      await waitForStep(run.read, "waiting");
+      await eventually(() => cancelArmCalls.get(run.key) ?? 0, (calls) => calls >= 3, { label: "three loop passes" });
+      await run.send({ ok: true });
+      expect(await run.done).toEqual({ kind: "signal", name: "report", value: { ok: true } });
+    }, 30_000);
   });
 });

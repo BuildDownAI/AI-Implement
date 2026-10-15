@@ -297,7 +297,8 @@ describe("heldCommentBody (AII-1361)", () => {
   const reasons = ["incomplete", "unreadable", "changes_requested", "changes_requested-empty", "ledger", "timed-out", undefined] as const;
   it.each(reasons)("%s: first line, no leading /ai-implement, no /claude-review", (reason) => {
     const body = heldCommentBody("k", "abc123", reason);
-    expect(body.split("\n")[1]).toBe("⚠️ AI-Implement did not write the approval mark for abc123, so auto-merge holds this PR.");
+    expect(body.split("\n")[1]).toBe("⚠️ AI-Implement did not write the approval mark for abc123, so AI-Implement does not merge this PR.");
+    expect(body.toLowerCase()).not.toContain("auto-merge");
     expect(body.startsWith("/ai-implement")).toBe(false);
     expect(body.split("\n").every((l) => !l.startsWith("/ai-implement"))).toBe(true);
     expect(body).not.toContain("/claude-review");

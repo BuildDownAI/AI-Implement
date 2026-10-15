@@ -618,10 +618,10 @@ describe("createKgRefreshIngressClient", () => {
     expect(result).toEqual({ status: "accepted", value: { status: "duplicate" } });
   });
 
-  it("maps a 409 from report to conflict, and only from report", async () => {
+  it("maps a 409 from report to conflict, and cancel's 409 to conflict with the handler's text", async () => {
     const body = JSON.stringify({ code: 409, message: "report rejected" });
     expect(await clientWith(respond(409, body)).report("t-1", { ok: true })).toEqual({ status: "conflict" });
-    expect(await clientWith(respond(409, body)).cancel("t-1", "stop")).toEqual({ status: "unavailable" });
+    expect(await clientWith(respond(409, body)).cancel("t-1", "stop")).toEqual({ status: "conflict", error: "report rejected" });
     // A 500 carrying the same body is not a conflict.
     expect(await clientWith(respond(500, body)).report("t-1", { ok: true })).toEqual({ status: "unavailable" });
   });

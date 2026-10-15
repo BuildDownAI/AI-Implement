@@ -146,7 +146,7 @@ describe("queryNonCompletedInvocations against a real 1.7.10 admin API (AII-721)
 });
 
 // A delayed one-way send has not started: status `scheduled`, no journal, no pinned
-// deployment. It must not hold a deploy (KgRepo.expire is delayed 4 h 10 min). Own
+// deployment. It must not hold a deploy (a delayed send can wait for hours). Own
 // environment: the describe above leaves a suspended invocation behind on purpose.
 describe("queryNonCompletedInvocations ignores a scheduled call that has not started", () => {
   let environments: Map<string, RestateEnvironment>;

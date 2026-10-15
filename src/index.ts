@@ -68,7 +68,7 @@ import { createMachine, getMachine, listMachines, generateSessionToken, generate
 import { isDurableRunnerMachine, safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
 import type { ReaperHelpers } from "./reaper.js";
 import { seedKgMaterializeDirectFromEnv, seedKgExecutionModeFromEnv, getRunnerMode, getFlySecretsMinVersion, getFlyProcessLevelSecrets, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
-import { handleGitHubWebhook } from "./webhook.js";
+import { handleGitHubWebhook, type KgPrCheckConfig } from "./webhook.js";
 import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
@@ -4116,6 +4116,27 @@ export function deployHealth(): { held: boolean; startedAt: number | null } {
 }
 
 /**
+ * The KG-repo PR webhook's `enqueueDryRun` dependency (AII-1405). It answers `unavailable` with no
+ * KG source repo, and while Restate is not ready (sidecar not `ready` or registration not
+ * `registered`) it skips the dry run: `submit` sends the new `KgRepo.watch` handler, which a
+ * declined registration cannot serve, so the send would retry forever and block the key.
+ */
+export function makeKgDryRunEnqueue(
+  kgSourceRepo: string | null | undefined,
+  ingress: Pick<KgRefreshIngressClient, "enqueueDryRun">,
+  ready: () => boolean,
+): KgPrCheckConfig["enqueueDryRun"] {
+  return async (key, entry, opts) => {
+    if (!kgSourceRepo) return { status: "unavailable" as const };
+    if (!ready()) {
+      console.warn(`[kg-refresh] skipping dry run for ${key}: Restate registration is not registered`);
+      return { status: "unavailable" as const };
+    }
+    return ingress.enqueueDryRun(parseKgSourceRepo(kgSourceRepo).fullName, { key, ...entry }, opts);
+  };
+}
+
+/**
  * `AdminDeps.kgRefresh` over the Restate services: trigger and status go through the tool
  * handlers as the in-process system caller; cancel calls the `cancel` of the workflow keyed
  * by the clicked row's `dispatchId` (a kg-refresh row's dispatchId is its trigger id) and
@@ -4148,6 +4169,7 @@ export function makeKgRefreshAdminDeps(
       const out = await client.cancel(dispatchId, reason);
       if (out.status === "unavailable") return kgUnavailableAnswer(deployHeld);
       if (out.status === "not-found") return { status: 409, body: { error: "no-refresh-in-flight" } };
+      if (out.status === "conflict") return { status: 409, body: { error: out.error ?? "conflict" } };
       return { status: 200, body: { cancelled: true } };
     },
   };
@@ -4459,10 +4481,7 @@ function startServer(
         kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
-        enqueueDryRun: (key, entry, opts) =>
-          config.kgSourceRepo
-            ? kgRefreshIngressClient.enqueueDryRun(parseKgSourceRepo(config.kgSourceRepo).fullName, { key, ...entry }, opts)
-            : Promise.resolve({ status: "unavailable" as const }),
+        enqueueDryRun: makeKgDryRunEnqueue(config.kgSourceRepo, kgRefreshIngressClient, restateReady),
         forgetKgPr: (repo, prNumber) => kgRefresh.forgetPr(repo, prNumber),
       }, async (repository, prNumber) => { await queueReviewFixCancellationForClosedPr(repository, prNumber, reviewFixIngressClient); }, reviewFixIngressClient).catch((err) => {
         console.error("[webhook] Unhandled error:", err);

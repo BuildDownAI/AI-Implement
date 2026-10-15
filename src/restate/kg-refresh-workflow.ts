@@ -51,8 +51,6 @@ import { restateRetentionMs } from "./retention.js";
 
 /** The value of `KG_REFRESH_TTL_MS` of the dispatch watch — how long a dispatch may run before it is treated as lost. */
 export const KG_REFRESH_TOTAL_DEADLINE_MS = 4 * 60 * 60 * 1000;
-/** Grace added on top of the total deadline before `KgRepo` treats an in-flight marker as stale rather than live. */
-export const KG_REPO_STALE_MARGIN_MS = 10 * 60 * 1000;
 /** How long a dispatch may run with no `progress` signal before the workflow treats it as lost. */
 export const KG_REFRESH_BOOTSTRAP_DEADLINE_MS = 10 * 60 * 1000;
 /** How often the GHA backend's watch loop reads the dispatched run's status (ADR 033). A run that ends with no
@@ -285,6 +283,17 @@ type GateResult = { ok: true; railCtx: RailContext } | { ok: false; gate: Refres
 /** Message of the 404 `TerminalError` `report`/`progress` throw for a key no `run` has started under. */
 export const KG_REFRESH_NOT_FOUND_MESSAGE = "kg-refresh workflow not found";
 
+/**
+ * The reserved value `run` writes to its own `cancel` promise when the merge starts (AII-1296). The
+ * first of this write and an operator cancel wins; the `cancel` handler refuses it as a reason.
+ */
+export const KG_REFRESH_COMMITTED = "__kg-refresh-committed__";
+
+/** Message of the 409 a cancel gets once the merge has started. */
+export const KG_REFRESH_PAST_MERGE_MESSAGE = "past-merge";
+/** The `cancel` answer (409) when no refresh is in flight: the run finished, or no workflow knows the dispatch. */
+export const KG_REFRESH_NO_REFRESH_MESSAGE = "no-refresh-in-flight";
+
 export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
   const { owner, repo: repoName } = parseKgSourceRepo(deps.kgSourceRepo);
   const retentionMs = deps.retentionMs ?? restateRetentionMs();
@@ -397,6 +406,18 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       return outcome;
     }
 
+    // The run is registered with `explicitCancellation`: Restate never throws at a pending await, so a
+    // cancel is seen only where this arm is raced. Called fresh for each race, because the SDK hands out a
+    // new promise after one resolves. After the commit point nothing races it.
+    const cancelArm = (): restate.RestatePromise<never> =>
+      (ctx as unknown as restate.internal.ContextInternal).cancellation().map((): never => {
+        throw new restate.TerminalError("Cancelled", { errorCode: 409 });
+      });
+    // Throws the 409 when a Restate cancel has already arrived; otherwise continues after a 1 ms timer.
+    const checkCancelled = async (): Promise<void> => {
+      await restate.RestatePromise.race([cancelArm(), ctx.sleep(1)]);
+    };
+
     // State the cancel cleanup reads; set as the run advances, so a cancel before dispatch makes no stop call.
     let dispatched: KgDispatchResult | undefined;
     let runId: number | undefined;
@@ -441,7 +462,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         await ctx.run("close-snapshot-pr", () => closeSnapshotPr(deps.rail, owner, repoName, number, gate, branch), { maxRetryAttempts: 3 });
       } catch (err) {
         if (restate.internal.isSuspendedError(err)) throw err;
-        if (err instanceof restate.TerminalError && err.code === 409) throw err; // a Restate cancel, not a close failure
+        // `run` is registered with `explicitCancellation`, so no step is interrupted by a Restate cancel: a failure here is a close failure.
         ctx.console.error(`[KgRefresh] closing snapshot PR #${number} failed for ${triggerId}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
@@ -555,6 +576,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       }
       // Armed before the dispatch creates the machine, so `/api/token` never sees a row with no nonce.
       if (executionMode !== GHA_EXECUTION_MODE) await ctx.run(`nonce-${attempt}`, () => deps.armMachineNonce(dispatchId, attempt));
+      // A cancel during `reserve` and the steps before it still makes no dispatch.
+      await checkCancelled();
       const dispatchResult = await ctx.run(
         `dispatch-${attempt}`,
         async (): Promise<KgDispatchResult> => {
@@ -678,6 +701,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             totalDeadlineAt,
             tickMs: watchIntervalMs,
             startedSeen,
+            cancelArm,
             ...(isGha ? { readStatus } : machineJobId ? { readStatus: readMachineStatus } : {}),
           });
 
@@ -707,8 +731,20 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         // already-closed PR must fail the run, not be treated as a silent success, and must not
         // retry forever. Neither step has staged or swapped anything yet, so `revertRail` does
         // not apply to either failure.
+        // The commit point (AII-1296): the start of the merge is the one point of no return. A Restate
+        // cancel that arrived earlier (during the accept note, say) stops the run here.
+        await checkCancelled();
+        heldPr = report.snapshotPr !== undefined ? { number: report.snapshotPr, branch: report.snapshotBranch } : undefined;
+        // The first of this write and an operator cancel wins; the loser sees the other's value.
+        try {
+          await ctx.promise<string>("cancel").resolve(KG_REFRESH_COMMITTED);
+        } catch (err) {
+          if (restate.internal.isSuspendedError(err)) throw err;
+          if (!(err instanceof restate.TerminalError && err.code === 409)) throw err; // "promise was already completed"
+        }
+        if ((await ctx.promise<string>("cancel").get()) !== KG_REFRESH_COMMITTED) return cleanupCancelled("signal");
+        heldPr = undefined; // merging: a cancel past here must not close the PR
         ctx.set("step", "merge");
-        heldPr = undefined; // merged (or merging): a cancel past here must not close the PR
         try {
           const mergeResult = await ctx.run(
             "merge",
@@ -726,7 +762,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           );
         } catch (err) {
           if (restate.internal.isSuspendedError(err)) throw err;
-          if (err instanceof restate.TerminalError && err.code === 409) throw err; // a cancel is not a merge failure: the outer catch cleans up
+          // `run` is registered with `explicitCancellation`, and nothing races a cancel after the commit point: a failure here is a merge failure.
           ctx.set("step", "failed");
           const at = await ctx.date.now();
           const detail = err instanceof Error ? err.message : String(err);
@@ -915,15 +951,12 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         });
         ctx.console.log(`[KgRefresh] held: dispatch ${dispatchId} snapshot PR #${heldPrNumber} awaits a decision until ${new Date(decideBy).toISOString()}`);
         ctx.objectSendClient(FlyMachineProfile, "kg-refresh").release({ dispatchId });
-        ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).extend({
-          triggerId,
-          until: decideBy + KG_REPO_STALE_MARGIN_MS,
-        });
 
         const decision = await awaitOwnedRun(ctx, {
           signals: ["decide", "cancel"],
           resultSignal: "decide",
           totalDeadlineAt: decideBy,
+          cancelArm,
           // One sleep to the deadline: a signal still wins the race at once.
           tickMs: Math.max(1, decideBy - heldAt),
         });
@@ -932,12 +965,12 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           const decided = decision.value as KgRefreshDecideInput;
           if (decided.action === "accept") {
             ctx.console.log(`[KgRefresh] decided accept by ${decided.actor}: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
-            // The note is best effort: the merge is what matters.
+            // The note is best effort: the merge is what matters. The step is never interrupted by a Restate
+            // cancel; the commit point sees a cancel that arrives during it.
             try {
               await ctx.run("baseline-accept-note", () => postBaselineAcceptNote(deps.rail, owner, repoName, heldPrNumber, decided.actor), { maxRetryAttempts: 3 });
             } catch (err) {
               if (restate.internal.isSuspendedError(err)) throw err;
-              if (err instanceof restate.TerminalError && err.code === 409) throw err; // a Restate cancel, not a note failure
               ctx.console.error(`[KgRefresh] baseline accept note failed for PR #${heldPrNumber}: ${err instanceof Error ? err.message : String(err)}`);
             }
             return await mergeAndRunGates(report);
@@ -1058,12 +1091,34 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     if (await stepPromise.peek() === undefined) await stepPromise.resolve(step);
   }
 
+  const pastMerge = () => new restate.TerminalError(KG_REFRESH_PAST_MERGE_MESSAGE, { errorCode: 409 });
+
+  /** The one cancel write, shared by `cancel` and `decide`: an operator cancel, or `past-merge` once `run` has committed. */
+  async function requestCancel(ctx: WorkflowSharedContext, reason: string): Promise<void> {
+    // Producer: the callers of the `cancel` handler (operator stop and newer-trigger paths).
+    const promise = ctx.promise<string>("cancel");
+    const existing = await promise.peek();
+    if (existing === KG_REFRESH_COMMITTED) throw pastMerge();
+    if (existing !== undefined) return;
+    try {
+      await promise.resolve(reason);
+    } catch (err) {
+      if (restate.internal.isSuspendedError(err)) throw err;
+      if (!(err instanceof restate.TerminalError && err.code === 409)) throw err;
+      // `run` committed in between (or another cancel won): look again.
+      if ((await promise.peek()) === KG_REFRESH_COMMITTED) throw pastMerge();
+    }
+  }
+
   async function cancel(ctx: WorkflowSharedContext, raw: { reason?: string }): Promise<void> {
     await requireStarted(ctx);
+    // First: a finished run's `cancel` promise also holds COMMITTED, so the peek in requestCancel would answer past-merge.
+    if (await ctx.get<boolean>("completed")) throw new restate.TerminalError(KG_REFRESH_NO_REFRESH_MESSAGE, { errorCode: 409 });
     const reason = raw?.reason ?? "cancelled";
-    // Producer: the callers of this `cancel` handler (operator stop and newer-trigger paths).
-    const promise = ctx.promise<string>("cancel");
-    if (await promise.peek() === undefined) await promise.resolve(reason);
+    if (reason === KG_REFRESH_COMMITTED) {
+      throw new restate.TerminalError("cancel reason is reserved", { errorCode: 400 });
+    }
+    await requestCancel(ctx, reason);
   }
 
 function toStepRecord(step: Step): KgRefreshStepRecord {
@@ -1082,7 +1137,13 @@ function toStepRecord(step: Step): KgRefreshStepRecord {
     // Peek first: once decided the workflow may leave the decision step, and a second call must still answer already-decided.
     // Producers: AII-1257. The value is the input object, never undefined, so the deadline peek sees it.
     const promise = ctx.promise<KgRefreshDecideInput>("decide");
-    if ((await promise.peek()) !== undefined) {
+    const recorded = await promise.peek();
+    if (recorded !== undefined) {
+      // A cancel after an accept still stops the run until the commit point, then answers past-merge.
+      if (recorded.action === "accept" && input.action === "cancel") {
+        await requestCancel(ctx, "cancelled");
+        return;
+      }
       throw new restate.TerminalError("already-decided", { errorCode: 409 });
     }
     if ((await ctx.get<string>("step")) !== "decision") {
@@ -1126,6 +1187,8 @@ function toStepRecord(step: Step): KgRefreshStepRecord {
         input: serde.zod(kgRefreshRunInputSchema),
         journalRetention: retentionMs,
         ingressPrivate: true,
+        // A cancel is seen only through `cancelArm`, so it never orphans a step and never reaches the merge (AII-1296).
+        explicitCancellation: true,
       }, run),
       report: restate.handlers.workflow.shared({
         journalRetention: retentionMs,
