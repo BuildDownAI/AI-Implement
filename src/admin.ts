@@ -1872,7 +1872,7 @@ async function handleDestroySession(
           .catch((err) => console.error("[admin] kg-refresh stop notify failed:", err));
       }
       console.log(`[admin] kg-refresh job ${job.id} stop requested by operator`);
-      json(res, 200, { destroyed: true, requested: true });
+      json(res, 200, { requested: true });
       return;
     }
 

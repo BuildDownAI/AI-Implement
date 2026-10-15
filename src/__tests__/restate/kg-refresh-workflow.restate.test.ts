@@ -2242,7 +2242,7 @@ describe("KgRefresh durable workflow", () => {
 
   // ---- AII-973: reconcile-first dispatch, workflow-owned expiry, tokens out of the journal ----
   it.each(VARIANTS.map(([label]) => label))(
-    "the workflow sends no KgRepo.expire (KgRepo owns the lease expiry), and no journal entry holds a token (%s)",
+    "the workflow sends no KgRepo.expire (nothing schedules a lease expiry), and no journal entry holds a token (%s)",
     async (label) => {
       const env = envFor(label);
       const triggerId = newTriggerId();
@@ -2275,7 +2275,7 @@ describe("KgRefresh durable workflow", () => {
         expect(journal).not.toContain(Buffer.from(token).toString("base64"));
       }
 
-      // the workflow never schedules the lease expiry; `KgRepo.submit` does
+      // nothing schedules the lease expiry: since AII-1297 `KgRepo.watch` releases the lock
       const expires = await queryInvocations(
         env.adminAPIBaseUrl(),
         `target_service_name = 'KgRepo' AND target_service_key = '${KG_SOURCE_REPO}' AND target_handler_name = 'expire' AND invoked_by_target LIKE 'KgRefresh/${triggerId}/%'`,

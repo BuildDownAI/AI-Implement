@@ -5848,6 +5848,7 @@ describe("admin sessions — kg-refresh destroy", () => {
     const res = await deleteSession(mode === "fly" ? "m-kg-200" : String(jobId), token, deps(answers(200, { cancelled: true })));
 
     expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ requested: true });
     expect(destroyMachineMock).not.toHaveBeenCalled();
     expect(cancelWorkflowRunMock).not.toHaveBeenCalled();
     const after = log.getJobById(jobId);

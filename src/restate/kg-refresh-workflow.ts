@@ -762,7 +762,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           );
         } catch (err) {
           if (restate.internal.isSuspendedError(err)) throw err;
-          if (err instanceof restate.TerminalError && err.code === 409) throw err; // a cancel is not a merge failure: the outer catch cleans up
+          // `run` is registered with `explicitCancellation`, and nothing races a cancel after the commit point: a failure here is a merge failure.
           ctx.set("step", "failed");
           const at = await ctx.date.now();
           const detail = err instanceof Error ? err.message : String(err);
