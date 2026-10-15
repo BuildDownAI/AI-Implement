@@ -676,6 +676,7 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
 
   function expectScopedOnly() {
     expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus", SCOPED_REQUEST);
+    expect(githubAppAuth.getInstallationToken).not.toHaveBeenCalled();
   }
 
   function expectPlanningBootTokenSplit() {
@@ -755,6 +756,7 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
     ).rejects.toThrow("mint failed");
 
     expect(flyMachines.createMachine).not.toHaveBeenCalled();
+    expect(githubAppAuth.getInstallationToken).not.toHaveBeenCalled();
     expectFreeSlot("fly-machines", "implementation");
   });
 
