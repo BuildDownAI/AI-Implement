@@ -72,6 +72,10 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
 
   const flyMachines: KgRefreshSender = async (input) => {
     const executionMode = "fly-machines";
+    if (input.envelope.agentConfig !== undefined || input.envelope.credentials?.modelAuthGrant !== undefined) {
+      console.error("[kg-refresh] refused: a KG refresh envelope carries model authentication");
+      return { outcome: "rejected", jobId: null, executionMode: executionMode };
+    }
     if (!config.flySessionsToken || !config.flySessionsApp) {
       // A definitive rejection: retrying cannot configure the app, and the workflow ends the run dispatch_rejected.
       console.error("[kg-refresh] fly-machines execution path selected but FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured");
@@ -146,6 +150,11 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
   };
 
   const localDocker: KgRefreshSender = async (input) => {
+    const executionMode = "local-docker";
+    if (input.envelope.agentConfig !== undefined || input.envelope.credentials?.modelAuthGrant !== undefined) {
+      console.error("[kg-refresh] refused: a KG refresh envelope carries model authentication");
+      return { outcome: "rejected", jobId: null, executionMode: executionMode };
+    }
     if (!config.localRunnerImage) {
       throw new Error(
         "[kg-refresh] local-docker execution path selected but LOCAL_RUNNER_IMAGE is not configured",
@@ -186,11 +195,15 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
       extraEnv,
     });
     console.log(`[kg-refresh] dispatched via local Docker (dispatchId=${input.dispatchId})`);
-    return { outcome: "accepted", jobId: containerId, executionMode: "local-docker", machineId: null, created: false };
+    return { outcome: "accepted", jobId: containerId, executionMode, machineId: null, created: false };
   };
 
   const githubActions: KgRefreshSender = async (input) => {
     const executionMode = "github-actions";
+    if (input.envelope.agentConfig !== undefined || input.envelope.credentials?.modelAuthGrant !== undefined) {
+      console.error("[kg-refresh] refused: a KG refresh envelope carries model authentication");
+      return { outcome: "rejected", jobId: null, executionMode: executionMode };
+    }
     const repo = sourceRepo();
     const encoded = encodeRunConfig(input.envelope);
     const { token } = await deps.mintToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);

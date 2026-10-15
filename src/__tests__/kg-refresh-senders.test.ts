@@ -279,3 +279,35 @@ describe("github-actions sender", () => {
     expect(result.outcome).toBe("accepted");
   });
 });
+
+describe("model-auth refusal", () => {
+  const modes = [["fly-machines", "fly-machines"], ["local-docker", "local-docker"], ["github-actions", "github-actions"]] as const;
+  const variants: Array<[string, Partial<RunConfigV1>]> = [
+    ["agentConfig", { agentConfig: { v: 1 } as never }],
+    ["modelAuthGrant", { credentials: { version: 1, modelAuthGrant: { v: 1 } as never } as never }],
+  ];
+  for (const [mode] of modes) {
+    for (const [label, extra] of variants) {
+      it(`${mode} rejects an envelope with ${label} before any call`, async () => {
+        const { deps, fly } = makeDeps({}, mode === "local-docker" ? { localRunnerImage: undefined as never } : {});
+        const err = vi.spyOn(console, "error").mockImplementation(() => {});
+        const result = await createKgRefreshSenders(deps)[mode](makeInput({ envelope: { ...envelope, ...extra }, machineNonce: null }));
+        expect(result).toEqual({ outcome: "rejected", jobId: null, executionMode: mode });
+        expect(err).toHaveBeenCalledWith("[kg-refresh] refused: a KG refresh envelope carries model authentication");
+        for (const spy of [deps.getScopedInstallationToken, deps.getInstallationToken, deps.mintToken, deps.fetchDefaultBranch,
+          deps.resolveRunnerImage, deps.postWorkflowDispatch, deps.keptMachineFly, deps.startLocalRunnerContainer]) {
+          expect(spy).not.toHaveBeenCalled();
+        }
+        expect(fly.createMachine).not.toHaveBeenCalled();
+        err.mockRestore();
+      });
+    }
+  }
+
+  it("does not refuse an envelope whose credentials carry no modelAuthGrant", async () => {
+    const { deps } = makeDeps();
+    const result = await createKgRefreshSenders(deps)["github-actions"](makeInput({
+      machineNonce: null, envelope: { ...envelope, credentials: { version: 1 } as never } }));
+    expect(result.outcome).toBe("accepted");
+  });
+});
