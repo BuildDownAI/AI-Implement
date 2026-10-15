@@ -3895,6 +3895,8 @@ describe("KgRefresh durable workflow", () => {
       const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
       expect(outcome.ok).toBe(true);
       await expectRunSucceeded(env, triggerId);
+      // A finished run answers no-refresh-in-flight, not past-merge, so the Stop route can stamp a stuck row.
+      await expect(callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "stop" })).rejects.toThrow(/409.*no-refresh-in-flight/);
     }, 60_000);
 
     it.each(VARIANTS.map(([label]) => label))("a Restate cancel at the gate and the cancel signal make the same calls and end operator_cancelled (%s)", async (label) => {

@@ -4148,6 +4148,7 @@ export function makeKgRefreshAdminDeps(
       const out = await client.cancel(dispatchId, reason);
       if (out.status === "unavailable") return kgUnavailableAnswer(deployHeld);
       if (out.status === "not-found") return { status: 409, body: { error: "no-refresh-in-flight" } };
+      if (out.status === "conflict") return { status: 409, body: { error: out.error ?? "conflict" } };
       return { status: 200, body: { cancelled: true } };
     },
   };

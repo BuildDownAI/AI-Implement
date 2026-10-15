@@ -5790,7 +5790,7 @@ describe("admin sessions — kg-refresh destroy", () => {
     );
     const res = new MockResponse();
     admin.handleAdminRequest(req as never, res as never, sessionsConfig(), makeFakeRegistry(provider), {
-      kgRefresh: kgRefresh ?? { trigger: vi.fn(), status: vi.fn(), cancel: vi.fn() },
+      kgRefresh: kgRefresh ?? { trigger: vi.fn(), status: vi.fn(), cancel: vi.fn(async () => ({ status: 409, body: { error: "no-refresh-in-flight" } })) },
     });
     await res.done;
     return { statusCode: res.statusCode, body: res.body };
@@ -5806,61 +5806,17 @@ describe("admin sessions — kg-refresh destroy", () => {
     notifyTextMock.mockReset();
   });
 
-  it("destroys the machine and returns 200 for an in-flight kg-refresh job", async () => {
-    const token = await login("secret");
-    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
+  type KgCancel = NonNullable<NonNullable<Parameters<typeof admin.handleAdminRequest>[4]>["kgRefresh"]>["cancel"];
+  const answers = (status: number, body: unknown) => vi.fn(async () => ({ status, body })) as unknown as KgCancel & ReturnType<typeof vi.fn>;
+  const deps = (cancel: KgCancel) => ({ trigger: vi.fn(), status: vi.fn(), cancel });
+
+  async function flyKgJob(machineId: string, dispatchId: string | null = "t-fly"): Promise<number> {
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines", ...(dispatchId ? { dispatchId } : {}) });
     log.setJobMachineNonce(jobId, "nonce-kg");
-    log.setJobMachineId(jobId, "m-kg-cancel");
-    log.updateJobMachineId(jobId, "m-kg-cancel");
-
-    const res = await deleteSession("m-kg-cancel", token);
-
-    expect(res.statusCode).toBe(200);
-    expect(destroyMachineMock).toHaveBeenCalledWith(FLY_TOKEN, FLY_APP, "m-kg-cancel");
-  });
-
-  it("stamps the job row operator_cancelled", async () => {
-    const token = await login("secret");
-    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
-    log.setJobMachineNonce(jobId, "nonce-kg");
-    log.setJobMachineId(jobId, "m-kg-cancel3");
-    log.updateJobMachineId(jobId, "m-kg-cancel3");
-
-    await deleteSession("m-kg-cancel3", token);
-
-    const row = log.getJobById(jobId);
-    expect(row?.status).toBe("failed");
-    expect(row?.conclusion).toBe("operator_cancelled");
-  });
-
-  it("sends exactly one notification and does not call provider.clearWorkingState (regression pin)", async () => {
-    const token = await login("secret");
-    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
-    log.setJobMachineNonce(jobId, "nonce-kg");
-    log.setJobMachineId(jobId, "m-kg-cancel4");
-    log.updateJobMachineId(jobId, "m-kg-cancel4");
-
-    const clearWorkingState = vi.spyOn(provider, "clearWorkingState");
-    await deleteSession("m-kg-cancel4", token);
-
-    expect(notifyTextMock).toHaveBeenCalledOnce();
-    expect(clearWorkingState).not.toHaveBeenCalled();
-  });
-
-  it("Fly-mode kg-refresh cancel destroys the machine and also calls the workflow cancel, tolerating a non-200", async () => {
-    const token = await login("secret");
-    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines", dispatchId: "t-fly" });
-    log.setJobMachineNonce(jobId, "nonce-kg");
-    log.setJobMachineId(jobId, "m-kg-cancel5");
-    log.updateJobMachineId(jobId, "m-kg-cancel5");
-    const cancel = vi.fn(async () => ({ status: 409, body: { error: "no-refresh-in-flight" } }));
-    const res = await deleteSession("m-kg-cancel5", token, { trigger: vi.fn(), status: vi.fn(), cancel });
-
-    expect(res.statusCode).toBe(200);
-    expect(destroyMachineMock).toHaveBeenCalledWith(FLY_TOKEN, FLY_APP, "m-kg-cancel5");
-    expect(cancel).toHaveBeenCalledWith({ jobId, dispatchId: "t-fly", reason: "operator_cancelled" });
-    expect(log.getJobById(jobId)?.conclusion).toBe("operator_cancelled");
-  });
+    log.setJobMachineId(jobId, machineId);
+    log.updateJobMachineId(jobId, machineId);
+    return jobId;
+  }
 
   async function ghaKgJob(): Promise<number> {
     const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "github-actions", repo: "TestOrg/test-kg", dispatchId: "t-gha" });
@@ -5868,43 +5824,88 @@ describe("admin sessions — kg-refresh destroy", () => {
     return jobId;
   }
 
-  it("GHA-mode kg-refresh cancel calls the workflow cancel, then stamps the row, and never cancels the run itself", async () => {
+  it("Fly kg-refresh Stop whose cancel answers 409 past-merge returns it, leaves the row unchanged and destroys no machine", async () => {
     const token = await login("secret");
-    const jobId = await ghaKgJob();
-    const cancel = vi.fn(async () => ({ status: 200, body: { cancelled: true } }));
-    const res = await deleteSession(String(jobId), token, { trigger: vi.fn(), status: vi.fn(), cancel });
+    const jobId = await flyKgJob("m-kg-merge");
+    const before = log.getJobById(jobId);
+    const cancel = answers(409, { error: "past-merge" });
+    const res = await deleteSession("m-kg-merge", token, deps(cancel));
+
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body)).toEqual({ error: "past-merge" });
+    expect(cancel).toHaveBeenCalledWith({ jobId, dispatchId: "t-fly", reason: "operator_cancelled" });
+    expect(destroyMachineMock).not.toHaveBeenCalled();
+    const after = log.getJobById(jobId);
+    expect(after?.status).toBe(before?.status);
+    expect(after?.conclusion).toBe(before?.conclusion);
+    expect(notifyTextMock).not.toHaveBeenCalled();
+  });
+
+  it.each([["fly", "fly"], ["gha", "gha"]])("%s kg-refresh Stop answering 200 writes nothing, destroys nothing and sends one 'stop requested' notice", async (mode) => {
+    const token = await login("secret");
+    const jobId = mode === "fly" ? await flyKgJob("m-kg-200") : await ghaKgJob();
+    const before = log.getJobById(jobId);
+    const res = await deleteSession(mode === "fly" ? "m-kg-200" : String(jobId), token, deps(answers(200, { cancelled: true })));
 
     expect(res.statusCode).toBe(200);
-    expect(cancel).toHaveBeenCalledWith({ jobId, dispatchId: "t-gha", reason: "operator_cancelled" });
-    expect(cancelWorkflowRunMock).not.toHaveBeenCalled();
     expect(destroyMachineMock).not.toHaveBeenCalled();
+    expect(cancelWorkflowRunMock).not.toHaveBeenCalled();
+    const after = log.getJobById(jobId);
+    expect(after?.status).toBe(before?.status);
+    expect(after?.conclusion).toBe(before?.conclusion);
+    expect(notifyTextMock).toHaveBeenCalledTimes(1);
+    const text = (notifyTextMock.mock.calls[0] as unknown as [string, string])[1];
+    expect(text).toContain("stop requested");
+    expect(text).not.toContain("cancelled");
+  });
+
+  it("stamps operator_cancelled once and sends the operator-cancel notice when no workflow knows the run", async () => {
+    const token = await login("secret");
+    const jobId = await flyKgJob("m-kg-stamp");
+    const updateSpy = vi.spyOn(log, "updateJobStatus");
+    const clearWorkingState = vi.spyOn(provider, "clearWorkingState");
+    const res = await deleteSession("m-kg-stamp", token, deps(answers(409, { error: "no-refresh-in-flight" })));
+
+    expect(res.statusCode).toBe(200);
+    expect(updateSpy.mock.calls.filter((c) => c[0] === jobId)).toHaveLength(1);
+    const row = log.getJobById(jobId);
+    expect(row?.status).toBe("failed");
+    expect(row?.conclusion).toBe("operator_cancelled");
+    expect(destroyMachineMock).not.toHaveBeenCalled();
+    expect(notifyTextMock).toHaveBeenCalledTimes(1);
+    expect((notifyTextMock.mock.calls[0] as unknown as [string, string])[1]).toContain("cancelled by operator");
+    expect(clearWorkingState).not.toHaveBeenCalled();
+    updateSpy.mockRestore();
+  });
+
+  it("stamps a row with no dispatchId through the same path", async () => {
+    const token = await login("secret");
+    const jobId = await flyKgJob("m-kg-nodispatch", null);
+    const res = await deleteSession("m-kg-nodispatch", token, deps(answers(409, { error: "no-refresh-in-flight" })));
+    expect(res.statusCode).toBe(200);
     expect(log.getJobById(jobId)?.conclusion).toBe("operator_cancelled");
   });
 
-  it("GHA-mode kg-refresh cancel answers 503 when the workflow is unavailable, without notifying", async () => {
+  it("GHA kg-refresh Stop during the merge returns 409 past-merge, not 503, and stamps nothing", async () => {
     const token = await login("secret");
     const jobId = await ghaKgJob();
-    const cancel = vi.fn(async () => ({ status: 503, body: { error: "restate-unavailable" } }));
-    const res = await deleteSession(String(jobId), token, { trigger: vi.fn(), status: vi.fn(), cancel });
+    const res = await deleteSession(String(jobId), token, deps(answers(409, { error: "past-merge" })));
+
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body)).toEqual({ error: "past-merge" });
+    expect(log.getJobById(jobId)?.conclusion).not.toBe("operator_cancelled");
+    expect(notifyTextMock).not.toHaveBeenCalled();
+  });
+
+  it("kg-refresh Stop answers 503 when the workflow is unavailable, changing nothing and not notifying", async () => {
+    const token = await login("secret");
+    const jobId = await ghaKgJob();
+    const res = await deleteSession(String(jobId), token, deps(answers(503, { error: "restate-unavailable" })));
 
     expect(res.statusCode).toBe(503);
     expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
     expect(notifyTextMock).not.toHaveBeenCalled();
     expect(log.getJobById(jobId)?.conclusion).not.toBe("operator_cancelled");
-  });
-
-  it("GHA-mode kg-refresh cancel passes a 409 no-refresh-in-flight through and leaves the row untouched", async () => {
-    const token = await login("secret");
-    const jobId = await ghaKgJob();
-    const before = log.getJobById(jobId);
-    const cancel = vi.fn(async () => ({ status: 409, body: { error: "no-refresh-in-flight" } }));
-    const res = await deleteSession(String(jobId), token, { trigger: vi.fn(), status: vi.fn(), cancel });
-
-    expect(res.statusCode).toBe(409);
-    const after = log.getJobById(jobId);
-    expect(after?.status).toBe(before?.status);
-    expect(after?.conclusion).toBe(before?.conclusion);
-    expect(notifyTextMock).not.toHaveBeenCalled();
   });
 
   it("issue-keyed session destroy still calls provider.clearWorkingState (regression pin)", async () => {
