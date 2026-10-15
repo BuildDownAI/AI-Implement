@@ -802,3 +802,89 @@ describe("Restate kg-refresh pilot: launch tokens reach the machine senders and 
     }, 40_000);
   });
 });
+
+describe("Restate kg-refresh pilot: the runner image check (AII-1323)", () => {
+  let environments: Map<string, RestateEnvironment>;
+  let machineCreates = 0;
+  const realFetch = globalThis.fetch;
+
+  beforeAll(async () => {
+    ensureCompose();
+    sim.dataRoot = mkdtempSync(join(tmpdir(), "kgpilotroot-"));
+    // Only the image.yml read is simulated; the harness and the ingress client use the real fetch.
+    vi.stubGlobal("fetch", async (url: string | URL | Request, init?: RequestInit) => {
+      const href = typeof url === "string" ? url : url instanceof URL ? url.href : url.url;
+      if (!href.endsWith("/contents/.ai-implement/image.yml")) return realFetch(url as never, init);
+      const content = Buffer.from("image: evil.example/runner:1\n").toString("base64");
+      return new Response(JSON.stringify({ type: "file", encoding: "base64", content }), { status: 200 });
+    });
+    const { resolveRunnerImageForDispatch } = await vi.importActual<typeof import("../../repo-image.js")>("../../repo-image.js");
+    const fakeFly = {
+      getMachine: async () => { throw new Error("unexpected getMachine"); },
+      listMachines: async () => [],
+      createMachine: async () => { machineCreates++; return { id: "m-image", state: "started" }; },
+      updateMachine: async () => ({}),
+      startMachine: async () => {},
+      waitSettled: async () => null,
+      waitForStopped: async () => {},
+    };
+    const composed = compose({
+      config: {
+        githubAppId: "test-app-id", githubAppPrivateKey: "test-private-key", sessionImage: "ghcr.io/builddownai/ai-implement-runner:latest",
+        runnerImageExplicit: false, runnerCallbackBaseUrl: "https://orchestrator.test", runnerTokenSecret: SECRET,
+        flySessionsToken: "fly-test-token", flySessionsApp: "image-app", flySessionsRegion: null,
+        localRunnerImage: "local:img", localRunnerOrchestratorUrl: null, healthPort: 8080,
+        anthropicApiKey: null, claudeOAuthToken: null,
+      },
+      // The real check, as production wires it.
+      resolveRunnerImage: resolveRunnerImageForDispatch,
+      fetchDefaultBranch: async () => "main",
+      keptMachineFly: (() => fakeFly) as never,
+      resolveExecutionMode: () => "fly-machines",
+    });
+    setKgRefreshToolDeps(composed.toolDeps);
+    environments = await startVariants([...composed.services, orchestratorTools]);
+  }, 60_000);
+
+  afterAll(async () => {
+    vi.unstubAllGlobals();
+    setKgRefreshToolDeps(null);
+    if (environments) await stopAll(environments);
+    rmSync(sim.dataRoot, { recursive: true, force: true });
+  });
+
+  beforeEach(() => {
+    gh = freshGithub();
+    machineCreates = 0;
+    getDb().prepare("DELETE FROM dispatch_log").run();
+    getDb().prepare("DELETE FROM settings WHERE key LIKE 'kg_%'").run();
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("an image.yml naming a disallowed image journals dispatch-1 as rejected and creates no machine or workflow run (%s)", async (label) => {
+    const env = environments.get(label);
+    if (!env) throw new Error(`missing Restate variant ${label}`);
+    const answer = await callToolAsSystem("trigger_kg_refresh", {}, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true, restateReady: () => true });
+    if (answer.status !== "ok") throw new Error("trigger_kg_refresh unavailable");
+    const triggerId = (JSON.parse(answer.content[0].text) as { body: { triggerId: string } }).body.triggerId;
+    const invocations = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`);
+    const result = await eventually(
+      async () => {
+        try {
+          return journaledRunResult(await journalEntries(env.adminAPIBaseUrl(), invocations[0].id as string), "dispatch-1");
+        } catch {
+          return undefined;
+        }
+      },
+      (v) => v !== undefined,
+      { label: "dispatch-1 journaled result", timeoutMs: 20_000 },
+    );
+    expect(result).toMatchObject({ outcome: "rejected", executionMode: "fly-machines" });
+    expect(machineCreates).toBe(0);
+    expect(gh.dispatches).toEqual([]);
+    const client = createKgRefreshIngressClient(env.baseUrl());
+    await eventually(async () => {
+      const marker = await client.repoStatus(KG_SOURCE_REPO);
+      return marker.status === "accepted" ? (marker.value ?? null) : undefined;
+    }, (marker) => marker === null, { label: "KgRepo marker cleared", timeoutMs: 20_000 });
+  }, 40_000);
+});

@@ -75,6 +75,7 @@ import {
 } from "./github.js";
 import { buildRunConfig, encodeRunConfig } from "./run-config.js";
 import type { RetryPolicy } from "./pipeline/retry-backoff.js";
+import { RunnerImageNotAllowedError } from "./repo-image.js";
 import { getMappings, type RepoMapping } from "./config.js";
 import type {
   AttemptId,
@@ -497,6 +498,7 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
         const runnerImage = await this.runnerImage({ owner: mapping.owner, repo: mapping.repo, token: credential.token });
         if (runnerImage !== undefined) inputs = { ...inputs, runner_image: runnerImage };
       } catch (err) {
+        if (err instanceof RunnerImageNotAllowedError) return { status: "rejected", reason: err.message };
         console.warn(`[review-fix] Runner image resolution failed for ${mapping.owner}/${mapping.repo}; `
           + `launching without runner_image: ${err instanceof Error ? err.message : String(err)}`);
       }

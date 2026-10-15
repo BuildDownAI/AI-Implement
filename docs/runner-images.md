@@ -22,7 +22,7 @@ In `fly-machines` mode the orchestrator reads it through the GitHub contents API
 
 In `github-actions` mode a manual `runner_image` dispatch input overrides everything for that one run.
 
-If `image.yml` is absent, malformed, or names an unreachable reference, resolution falls through to the next rung rather than failing.
+If `image.yml` is absent or malformed, resolution falls through to the next rung rather than failing. An `image.yml` that names an image outside the allowlist is refused, not skipped: the launch does not happen and the default image is not substituted (see Allowlisting).
 
 ## Forwarding, and why it is conditional
 
@@ -34,9 +34,11 @@ Planning runs honor the identical rule, so a testing orchestrator pinned to `:ne
 
 ## Allowlisting
 
-The `github-actions` path auto-trusts `ghcr.io/builddownai/` and the repo owner's own `ghcr.io/<owner>/` namespace, so a fork publishing its own image needs no extra configuration. `AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES` exists only for third-party registries.
+The orchestrator checks the resolved runner image before every GitHub Actions and Fly launch (`resolveSessionImage`, `src/repo-image.ts`). It trusts `ghcr.io/builddownai/`, the repo owner's own `ghcr.io/<owner lowercased>/` namespace, and the extra prefixes stored in the Settings row (see "Extra trusted image prefixes"). Each prefix is matched literally with `startsWith`; no prefix is compiled into a pattern. The check runs on every call, including a hit on the 60 s cache, so removing a prefix at `/admin#settings` takes effect at the next launch.
 
-The `fly-machines` path validates the image-reference format but applies no allowlist.
+A refused image throws `RunnerImageNotAllowedError` and logs `[repo-image] runner image <image> for <owner>/<repo> is not allowed; ...`. A disallowed `image.yml` is never replaced by the default image, and the orchestrator's own default (`AI_IMPLEMENT_RUNNER_IMAGE`, `SESSION_IMAGE`, or the built-in) is checked the same way. The Restate review-fix launch and the kg-refresh senders turn the refusal into a `rejected` outcome; the other launch paths treat the throw as a non-launch and release their reservation, so an implementation issue retries at each poll until the image or the allowlist is fixed.
+
+On GitHub Actions the workflows keep their own check (`validate-runner-image`), which trusts the same built-in prefixes plus the repository variable `AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES`. A GitHub Actions image must pass both. When the orchestrator sends no `runner_image`, the workflow resolves the image itself and only its own check applies. Local Docker is not checked: `LOCAL_RUNNER_IMAGE` is operator configuration and no repository input reaches it.
 
 ## Private images constrain the execution mode
 
@@ -166,4 +168,4 @@ The typical reason is a language runtime or tool the base image lacks (terraform
 
 ## Extra trusted image prefixes (AII-1321)
 
-The orchestrator stores extra trusted runner-image prefixes in the `runner_image_allowed_prefixes` settings row (comma-separated, each ending in `/`). It seeds the row once from `RUNNER_IMAGE_ALLOWED_PREFIXES` and serves it on `GET`/`POST /api/settings` as `runnerImageAllowedPrefixes` (`value`, `effective`, `builtIn`). Only an admin can write it. `getRunnerImageAllowedPrefixes()` returns `[]` when the row is missing or unreadable, so a database fault never widens the allowlist. The built-in prefixes always apply. Nothing reads the setting yet (AII-1323); the repository Actions variable `AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES` is a separate store.
+The orchestrator stores extra trusted runner-image prefixes in the `runner_image_allowed_prefixes` settings row (comma-separated, each ending in `/`). It seeds the row once from `RUNNER_IMAGE_ALLOWED_PREFIXES` and serves it on `GET`/`POST /api/settings` as `runnerImageAllowedPrefixes` (`value`, `effective`, `builtIn`). Only an admin can write it. `getRunnerImageAllowedPrefixes()` returns `[]` when the row is missing or unreadable, so a database fault never widens the allowlist. The built-in prefixes always apply. The orchestrator's launch check reads it (see Allowlisting); the repository Actions variable `AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES` is a separate store.

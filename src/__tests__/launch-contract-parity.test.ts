@@ -55,24 +55,7 @@ const EXPECTED_TOKENS: Record<Kind, readonly Audience[]> = {
 
 /** Each row is a check that fails today. A later issue removes its rows when it closes the gap.
  *  A row whose check passes fails this test, so the list cannot go stale. */
-const KNOWN_GAPS: ReadonlyArray<{ kind: string; backend: string; check: string }> = [
-  // implementation
-  { kind: "implementation", backend: "github-actions", check: "image" },
-  { kind: "implementation", backend: "fly-machines", check: "image" },
-  // gap-fill
-  { kind: "gap-fill", backend: "github-actions", check: "image" },
-  { kind: "gap-fill", backend: "fly-machines", check: "image" },
-  // planning
-  { kind: "planning", backend: "github-actions", check: "image" },
-  { kind: "planning", backend: "fly-machines", check: "image" },
-  // review-fix-attempt
-  { kind: "review-fix-attempt", backend: "github-actions", check: "image" },
-  // legacy review-fix queue
-  { kind: "legacy-review-fix", backend: "github-actions", check: "image" },
-  // kg-refresh
-  { kind: "kg-refresh", backend: "github-actions", check: "image" },
-  { kind: "kg-refresh", backend: "fly-machines", check: "image" },
-];
+const KNOWN_GAPS: ReadonlyArray<{ kind: string; backend: string; check: string }> = [];
 
 /** Cells the test does not run, each with its reason. Every kind × backend pair is a cell or listed here. */
 const OUT_OF_SCOPE_CELLS: ReadonlyArray<{ kind: Kind; backend: Backend; reason: string }> = [
@@ -617,18 +600,28 @@ async function launchOnce(cell: Cell, options: RunOptions = {}): Promise<Capture
   }
 }
 
-/** Whether a launch call was made with `.ai-implement/image.yml` naming an image that is not allowed. */
+/**
+ * Whether the path failed to refuse an image that is not allowed. It refuses when it makes no launch call, any
+ * throw is a `RunnerImageNotAllowedError`, and the resolver logged the refusal naming the image. A different error
+ * or a silent non-launch is a failure.
+ */
 async function launchesWithEvilImage(cell: Cell, options: RunOptions): Promise<boolean> {
   let world: World | null = null;
   try {
     world = await boot({ evilImage: true, runnerMode: cell.runnerMode });
+    vi.mocked(console.warn).mockClear();
+    let refused = false;
     try {
       await cell.run(world, options);
-    } catch {
-      // A path that refuses by throwing before the launch call has also made no launch call.
+    } catch (err) {
+      if (!(err instanceof world.repoImage.RunnerImageNotAllowedError)) return true;
+      refused = true;
     }
     expect(world.rec.unplannedFetch, `${cell.kind} · ${cell.backend} made an unplanned fetch`).toEqual([]);
-    return world.rec.launches.length > 0;
+    const logged = vi.mocked(console.warn).mock.calls.some(
+      (call) => typeof call[0] === "string" && call[0].includes(`runner image ${EVIL_IMAGE} for`) && call[0].includes("is not allowed"),
+    );
+    return world.rec.launches.length > 0 || !(refused || logged);
   } finally {
     teardown(world);
   }
@@ -695,6 +688,10 @@ describe("launch contract parity", () => {
     expect(listed).toEqual(all);
     for (const cell of OUT_OF_SCOPE_CELLS) expect(cell.reason).not.toBe("");
     for (const entry of IMAGE_OUT_OF_SCOPE) expect(entry.reason).not.toBe("");
+  });
+
+  it("KNOWN_GAPS is empty", () => {
+    expect(KNOWN_GAPS).toEqual([]);
   });
 
   it("KNOWN_GAPS names only cells that run and checks that exist", () => {

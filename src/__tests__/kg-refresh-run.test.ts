@@ -3399,7 +3399,7 @@ describe("GHA kg-refresh dispatch — runner_image resolution via resolveRunnerI
   });
 
   it("includes runner_image when KG repo has a per-repo .ai-implement/image.yml override", async () => {
-    const yamlContent = "image: ghcr.io/org/custom-runner:sha-abc\n";
+    const yamlContent = "image: ghcr.io/builddownai/custom-runner:sha-abc\n";
     const b64 = Buffer.from(yamlContent).toString("base64");
     const fetchImpl = vi.fn(async () =>
       new Response(JSON.stringify({ type: "file", encoding: "base64", content: b64 }), {
@@ -3418,7 +3418,7 @@ describe("GHA kg-refresh dispatch — runner_image resolution via resolveRunnerI
     });
 
     // Per-repo override wins regardless of orchestrator flag
-    expect(result).toBe("ghcr.io/org/custom-runner:sha-abc");
+    expect(result).toBe("ghcr.io/builddownai/custom-runner:sha-abc");
   });
 
   it("GHA and Fly resolve the same image ref for the same orchestrator (parity)", async () => {
@@ -3515,7 +3515,7 @@ describe("GHA kg-refresh dispatch — inputs shape contract", () => {
 
   it("runner_image included when image resolved from per-repo override (integration with resolveRunnerImageForDispatch)", async () => {
     __clearRepoImageCacheForTests();
-    const yamlContent = "image: ghcr.io/org/custom-runner:sha-abc\n";
+    const yamlContent = "image: ghcr.io/builddownai/custom-runner:sha-abc\n";
     const b64 = Buffer.from(yamlContent).toString("base64");
     const fetchImpl = vi.fn(async () =>
       new Response(JSON.stringify({ type: "file", encoding: "base64", content: b64 }), {
@@ -3534,7 +3534,7 @@ describe("GHA kg-refresh dispatch — inputs shape contract", () => {
     });
 
     const inputs = buildKgRefreshDispatchInputs({ runConfig: "cfg", runToken: "tok", runProgressToken: "prog", runnerImage, runnerCallbackUrl: undefined });
-    expect(inputs.runner_image).toBe("ghcr.io/org/custom-runner:sha-abc");
+    expect(inputs.runner_image).toBe("ghcr.io/builddownai/custom-runner:sha-abc");
     expect(inputs.run_progress_token).toBe("prog");
   });
 });
