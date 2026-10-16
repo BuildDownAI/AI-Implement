@@ -404,6 +404,13 @@ describe("GHA workflow shims", () => {
       expect(yaml).toMatch(/GITHUB_REPOSITORY_OWNER is empty/);
     });
 
+    it(`${f} runs the container job with Docker's init and no added privileges`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const containerJob = (Object.values(doc.jobs) as any[]).find((j: any) => j.container);
+      expect(String(containerJob.container.options).split(/\s+/)).toContain("--init");
+      expect(String(containerJob.container.options)).not.toMatch(/--privileged|--cap-add|--security-opt|--group-add|--user/);
+    });
+
     it(`${f} masks runner progress tokens from the event file before consumers use them`, () => {
       const yaml = readFileSync(f, "utf-8");
       const doc = parse(yaml) as any;

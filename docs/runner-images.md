@@ -191,4 +191,6 @@ The orchestrator stores extra trusted runner-image prefixes in the `runner_image
 
 ## Host Docker socket and full-access implementation (AII-1437)
 
+The synced implementation job also sets `container.options: --init` so Docker reaps orphaned processes; Codex full-access runs need it (see execution-backends.md).
+
 GitHub mounts `/var/run/docker.sock` into GHA `container:` jobs. The image's `coder` user is non-root; the admission check for the ephemeral full-access Codex policy refuses to start the model when the user is root or can read or write that socket, and reports only booleans. The synced workflow adds no privilege to change this. See [execution-backends.md](execution-backends.md#ephemeral-full-access-for-codex-implementation-aii-1437) for the policy and its residual risk.

@@ -218,6 +218,10 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+      # Docker's built-in init reaps orphaned grandchildren; without it a native
+      # Codex run leaves a zombie and the process-group stop check correctly
+      # demands recovery (AII-1437). Adds no privilege or capability.
+      options: --init
     steps:
       # Read the event file without exposing token-valued env/script metadata: GitHub
       # prints those headers before executing the first add-mask command (AII-676).
