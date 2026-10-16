@@ -64,6 +64,12 @@ let probe: typeof WorkflowProbeModule;
 let visibility: "public" | "private";
 let planRecord = true;
 let logs: string[];
+let workflows: Record<string, string | null> = {};
+const CAPABLE_WORKFLOWS = {
+  ".github/workflows/claude-implement.yml": "# ai-implement-capability: stage-agent-config-v1\n",
+  ".github/workflows/comment-trigger.yml": null,
+  ".github/workflows/claude-kg-refresh.yml": null,
+};
 
 const issue = { id: "issue-1389", identifier: "AII-1389", title: "T", description: "d", scopeKey: "AII", nativeStatus: "Todo" } as unknown as TicketIssue;
 const mapping = {
@@ -112,6 +118,7 @@ beforeEach(async () => {
   process.env.RUNNER_TOKEN_SECRET = RUNNER_SECRET;
   visibility = "private";
   planRecord = true;
+  workflows = {};
   logs = [];
   for (const m of ["log", "warn", "error"] as const) {
     vi.spyOn(console, m).mockImplementation((...a: unknown[]) => { logs.push(a.map(String).join(" ")); });
@@ -155,7 +162,7 @@ beforeEach(async () => {
       ownership,
       credentials,
       getRepoTrust: async () => ({ visibility, trustedForSubscription: true }),
-      readDefaultBranchWorkflows: async () => ({}),
+      readDefaultBranchWorkflows: async () => workflows,
       checkRunnerCapability: async () => true,
     }),
   } as unknown as ModelAuthRuntime;
@@ -328,16 +335,119 @@ describe("dispatchSession managed guards", () => {
 });
 
 describe("GitHub Actions and both mode", () => {
-  it("refuses an opted-in project before reserving anything", async () => {
+  it("fails closed with a fixed code when the workflow cannot be read, leaving no admission or grant", async () => {
     await index.dispatchGitHubActions(config, provider, issue, mapping, prior, "default", "main", null);
     expect(admissions()).toBe(0);
     expect(count("model_credential_grants")).toBe(0);
     expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
     expect(probe.resolveWorkflowCapabilities).not.toHaveBeenCalled();
     expect(provider.markImplementationFailed).toHaveBeenCalledOnce();
-    expect(vi.mocked(provider.markImplementationFailed).mock.calls[0]![2]).toContain("gha_not_supported");
+    expect(vi.mocked(provider.markImplementationFailed).mock.calls[0]![2]).toContain("delivery_unreadable");
     const row = dedup.getDb().prepare("SELECT consecutive_failures FROM dispatch_breaker WHERE issue_id = ?").get(issue.id) as { consecutive_failures: number };
     expect(row.consecutive_failures).toBe(1);
+  });
+});
+
+describe("opted-in GitHub Actions implementation (AII-1420)", () => {
+  const capabilities = { contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: false, supportsPrivateRunConfig: true } as const;
+  const dispatchGha = () => index.dispatchGitHubActions(config, provider, issue, mapping, prior, "default", "main", null);
+  const sent = () => {
+    expect(github.postWorkflowDispatch).toHaveBeenCalledOnce();
+    return vi.mocked(github.postWorkflowDispatch).mock.calls[0]![0].inputs as Record<string, string>;
+  };
+
+  beforeEach(() => {
+    workflows = CAPABLE_WORKFLOWS;
+    vi.mocked(probe.resolveWorkflowCapabilities).mockResolvedValue(capabilities as never);
+    vi.mocked(github.postWorkflowDispatch).mockResolvedValue({ success: true, status: 204 } as never);
+  });
+
+  it("dispatches the frozen snapshot and protected bootstrap inside the private run_config, with no downgrade", async () => {
+    await dispatchGha();
+    const inputs = sent();
+    const rc = decodeTrustedRunConfig(inputs.run_config!);
+    expect(rc.agentConfig?.profiles.implementation.authMode).toBe("codex-subscription");
+    const grant = rc.credentials?.modelAuthGrant as { bearer: string; backend: string; dispatchId: string };
+    expect(grant.backend).toBe("gha");
+    expect(grant.bearer).toBeTruthy();
+    expect(rc.credentials?.resultToken).toBeTruthy();
+    expect(inputs.run_token).toBe("");
+    expect(inputs).not.toHaveProperty("run_progress_token");
+    expect(inputs).not.toHaveProperty("run_publication_token");
+    for (const [k, v] of Object.entries(inputs)) {
+      if (k !== "run_config") expect(v).not.toContain(grant.bearer);
+    }
+    const all = logs.join("\n") + JSON.stringify(vi.mocked(provider.markImplementationFailed).mock.calls);
+    expect(all).not.toContain(grant.bearer);
+    expect(all).not.toContain(inputs.run_config!);
+    expect(all).toContain("Managed dispatch for AII-1389: launch");
+    expect(grantRevoked()).toBe(false);
+    expect(admissions()).toBe(1);
+  });
+
+  it.each([
+    ["an old template", { ...CAPABLE_WORKFLOWS, ".github/workflows/claude-implement.yml": "name: old\n" }, "runner_incompatible"],
+    ["a retired trigger", { ...CAPABLE_WORKFLOWS, ".github/workflows/comment-trigger.yml": "name: x" }, "retired_workflow_present"],
+    ["an unreadable workflow", {}, "delivery_unreadable"],
+  ])("refuses %s with a fixed code: no probe, no dispatch, no grant, admission released", async (_n, files, code) => {
+    workflows = files;
+    await dispatchGha();
+    expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
+    expect(probe.resolveWorkflowCapabilities).not.toHaveBeenCalled();
+    expect(count("model_credential_grants")).toBe(0);
+    expect(admissions()).toBe(0);
+    expect(vi.mocked(provider.markImplementationFailed).mock.calls[0]![2]).toContain(code);
+    const row = dedup.getDb().prepare("SELECT consecutive_failures FROM dispatch_breaker WHERE issue_id = ?").get(issue.id) as { consecutive_failures: number };
+    expect(row.consecutive_failures).toBe(1);
+  });
+
+  it("refuses a public repository before any credential is resolved", async () => {
+    visibility = "public";
+    await dispatchGha();
+    expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
+    expect(count("model_credential_grants")).toBe(0);
+    expect(count("model_profile_reservations")).toBe(0);
+    expect(vi.mocked(provider.markImplementationFailed).mock.calls[0]![2]).toContain("repository_public");
+  });
+
+  it("refuses when the target workflow lacks the private transport and revokes the grant", async () => {
+    vi.mocked(probe.resolveWorkflowCapabilities).mockResolvedValue({ ...capabilities, supportsPrivateRunConfig: false } as never);
+    await expect(dispatchGha()).rejects.toThrow(/supportsPrivateRunConfig/);
+    expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
+    expect(grantRevoked()).toBe(true);
+    expect(admissions()).toBe(0);
+  });
+
+  it("revokes the grant and releases the admission when GitHub rejects the launch", async () => {
+    vi.mocked(github.postWorkflowDispatch).mockResolvedValue({ success: false, status: 404, error: "Not Found", outcome: "rejected" } as never);
+    await dispatchGha();
+    expect(grantRevoked()).toBe(true);
+    expect(admissions()).toBe(0);
+  });
+
+  it("revokes the grant but holds the admission when the launch outcome is uncertain", async () => {
+    vi.mocked(github.postWorkflowDispatch).mockResolvedValue({ success: false, status: 503, error: "upstream", outcome: "unknown" } as never);
+    await dispatchGha();
+    expect(grantRevoked()).toBe(true);
+    expect(admissions()).toBe(1);
+  });
+
+  it("revokes the grant when the dispatch call throws", async () => {
+    vi.mocked(github.postWorkflowDispatch).mockRejectedValue(new Error("socket hang up"));
+    await expect(dispatchGha()).rejects.toThrow("socket hang up");
+    expect(grantRevoked()).toBe(true);
+    expect(admissions()).toBe(1);
+  });
+
+  it("an opted-out project keeps today's inputs: no agentConfig, no credentials", async () => {
+    store.setProjectOptIn("AII", false);
+    workflows = {};
+    vi.mocked(probe.resolveWorkflowCapabilities).mockResolvedValue({ ...capabilities, supportsPrivateRunConfig: false } as never);
+    await dispatchGha();
+    const rc = decodeTrustedRunConfig(sent().run_config!);
+    expect(rc.agentConfig).toBeUndefined();
+    expect(rc.credentials).toBeUndefined();
+    expect(count("model_credential_grants")).toBe(0);
   });
 });
 

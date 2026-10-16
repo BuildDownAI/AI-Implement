@@ -147,8 +147,57 @@ describe("getRepoTrust", () => {
     await expect(deps().getRepoTrust("not-a-repo")).rejects.toThrow(/malformed/);
   });
 
-  it("rejects readDefaultBranchWorkflows", async () => {
-    await expect(deps().readDefaultBranchWorkflows("acme/app", [".github/workflows/x.yml"])).rejects.toThrow();
+  describe("readDefaultBranchWorkflows (AII-1420)", () => {
+    const WF = ".github/workflows/claude-implement.yml";
+    const RETIRED = ".github/workflows/comment-trigger.yml";
+    let seen: string[];
+    let files: Record<string, { status: number; text?: string } | "throw">;
+
+    beforeEach(() => {
+      seen = [];
+      files = {};
+      vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        const u = String(url);
+        seen.push(`${u} ${JSON.stringify(init?.headers ?? {})}`);
+        const key = decodeURIComponent(u.split("/contents/")[1]!);
+        const f = files[key] ?? { status: 404 };
+        if (f === "throw") throw new Error(`network down ${TOKEN}`);
+        if (f.status !== 200) return new Response("{}", { status: f.status });
+        return new Response(JSON.stringify({ type: "file", encoding: "base64", content: Buffer.from(f.text ?? "").toString("base64") }), { status: 200 });
+      }));
+    });
+    afterEach(() => { vi.unstubAllGlobals(); });
+
+    it("returns text for present paths and null for 404 paths, reading the default branch with a repo-scoped token", async () => {
+      files[WF] = { status: 200, text: "# ai-implement-capability: stage-agent-config-v1\n" };
+      const out = await deps().readDefaultBranchWorkflows("acme/app", [WF, RETIRED]);
+      expect(out).toEqual({ [WF]: "# ai-implement-capability: stage-agent-config-v1\n", [RETIRED]: null });
+      expect(seen).toHaveLength(2);
+      for (const call of seen) {
+        expect(call).toContain("https://api.github.com/repos/acme/app/contents/.github/workflows/");
+        expect(call).not.toContain("ref=");
+        expect(call).toContain(TOKEN);
+      }
+    });
+
+    it("surfaces a non-404 error as delivery_unreadable, never as absent", async () => {
+      files[WF] = { status: 500 };
+      await expect(deps().readDefaultBranchWorkflows("acme/app", [WF])).rejects.toThrow(/HTTP 500/);
+      files[WF] = "throw";
+      await expect(deps().readDefaultBranchWorkflows("acme/app", [WF])).rejects.toThrow();
+      files[WF] = { status: 403 };
+      const result = await prep.prepareAgentRun(
+        { dispatchId: "d-unreadable", projectKey: "AII", backend: "github-actions", workflowRepository: "acme/app", workflowFile: "claude-implement.yml", repositories: ["acme/app"] },
+        runtime().preparationDeps({ owner: "acme", repo: "app", projectKey: "AII" }),
+      ).catch((e: Error) => ({ status: "threw", message: e.message }));
+      expect(JSON.stringify(result)).not.toContain(TOKEN);
+      expect(JSON.stringify(result)).not.toContain("absent");
+    });
+
+    it("rejects a malformed repository without any request", async () => {
+      await expect(deps().readDefaultBranchWorkflows("not-a-repo", [WF])).rejects.toThrow(/malformed/);
+      expect(seen).toHaveLength(0);
+    });
   });
 });
 

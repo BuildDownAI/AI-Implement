@@ -1,6 +1,6 @@
 import type { RepoMapping } from "./config.js";
 import { GitHubApiError } from "./github-errors.js";
-import { type RunConfigV1, type RunCredentialsV1, buildRunConfig, encodeRunConfig, encodeTrustedRunConfig } from "./run-config.js";
+import { type ResolvedAgentSnapshotV1, type RunConfigV1, type RunCredentialsV1, buildRunConfig, encodeRunConfig, encodeTrustedRunConfig } from "./run-config.js";
 import type { RetryPolicy } from "./pipeline/retry-backoff.js";
 import { isChecksPermissionError } from "./checks-permission.js";
 
@@ -415,6 +415,8 @@ export interface EnvelopeDispatchOpts {
    *  Requires `privateTransport: true`; supplying it without capability throws rather than
    *  dropping or downgrading it. */
   credentials?: RunCredentialsV1;
+  /** Frozen stage snapshot from a managed `launch` decision; rides in `run_config.agentConfig`. */
+  agentConfig?: ResolvedAgentSnapshotV1;
   runnerImage?: string | null;
   prNumber?: string;
   /** Operator instruction forwarded from an /ai-implement PR comment. Rides inside run_config. */

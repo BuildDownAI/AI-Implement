@@ -13,6 +13,7 @@ import type * as AdmissionModule from "../dispatch-admission.js";
 import type * as RestateStatusModule from "../restate/status.js";
 import type { RepoMapping } from "../config.js";
 import type { TicketIssue } from "../providers/types.js";
+import { makeGrant, makeSnapshot } from "./configured-run-fixture.js";
 
 type DispatchLocalGapfillFn = typeof LocalGapfillModule.dispatchLocalGapfill;
 
@@ -1544,10 +1545,11 @@ describe("processReviewFixQueue — protected dispatch (AII-1392)", () => {
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(pending);
   });
 
-  it("opted-in GitHub Actions review-fix is failed with no admission, grant or workflow dispatch", async () => {
+  it("opted-in GitHub Actions review-fix with a refused preparation is failed, releases its admission and dispatches nothing", async () => {
     process.env.RUNNER_MODE = "default";
     configModule.upsertMapping("TEAM", makeMapping({ executionMode: "github-actions" }));
     managedMocks.isManagedProject.mockReturnValue(true);
+    managedMocks.prepareManagedDispatch.mockResolvedValue({ kind: "refuse", category: "configuration-error", code: "runner_incompatible" });
     queueFix();
     const githubModule = await import("../github.js");
     const dispatch = vi.spyOn(githubModule, "dispatchWorkflow").mockResolvedValue({ success: true, status: 204 });
@@ -1555,8 +1557,111 @@ describe("processReviewFixQueue — protected dispatch (AII-1392)", () => {
     await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
 
     expect(dispatch).not.toHaveBeenCalled();
-    expect(managedMocks.prepareManagedDispatch).not.toHaveBeenCalled();
+    expect(managedMocks.prepareManagedDispatch).toHaveBeenCalledWith(expect.objectContaining({ backend: "github-actions" }), expect.anything());
     expect(admission.count("TEAM")).toBe(0);
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+  });
+  describe("opted-in GitHub Actions review-fix with a capable workflow (AII-1420)", () => {
+    const snapshot = makeSnapshot("codex-subscription");
+    const bootstrap = makeGrant(snapshot, { backend: "gha", dispatchId: "d-1", projectKey: "TEAM" });
+    const tokenConfig = {
+      ...mockConfig,
+      runnerCallbackBaseUrl: "https://callback.example",
+      runnerTokenSecret: "runner-token-secret-with-enough-entropy",
+    } as unknown as IndexModule.AppConfig;
+    const caps = (supportsPrivateRunConfig: boolean) => ({
+      contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: false, supportsPrivateRunConfig,
+    });
+    let decision: ReturnType<typeof ghaDecision>;
+
+    function ghaDecision() {
+      return {
+        kind: "launch",
+        dispatchId: "d-1",
+        projectKey: "TEAM",
+        backend: "github-actions",
+        snapshot,
+        grant: {},
+        takeBootstrap: vi.fn(() => bootstrap),
+      };
+    }
+
+    async function setup(supportsPrivateRunConfig = true) {
+      process.env.RUNNER_MODE = "default";
+      configModule.upsertMapping("TEAM", makeMapping({ executionMode: "github-actions" }));
+      managedMocks.isManagedProject.mockReturnValue(true);
+      decision = ghaDecision();
+      managedMocks.prepareManagedDispatch.mockResolvedValue(decision);
+      queueFix();
+      const githubModule = await import("../github.js");
+      const workflowProbeModule = await import("../workflow-probe.js");
+      const repoImageModule = await import("../repo-image.js");
+      vi.spyOn(workflowProbeModule, "resolveWorkflowCapabilities").mockResolvedValue(caps(supportsPrivateRunConfig) as never);
+      vi.spyOn(repoImageModule, "resolveRunnerImageForDispatch").mockResolvedValue(undefined);
+      return vi.spyOn(githubModule, "dispatchWorkflow");
+    }
+
+    it("accepted launch carries the frozen snapshot and protected bootstrap privately and keeps the grant", async () => {
+      const { decodeTrustedRunConfig, decodeRunConfig } = await import("../run-config.js");
+      const dispatch = await setup();
+      dispatch.mockResolvedValue({ success: true, status: 204 });
+
+      await indexModule.processReviewFixQueue(tokenConfig, mockRegistry);
+
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      const inputs = dispatch.mock.calls[0]![2] as Record<string, string>;
+      const trusted = decodeTrustedRunConfig(inputs.run_config!);
+      expect(trusted.agentConfig).toEqual(snapshot);
+      expect(trusted.credentials?.modelAuthGrant).toEqual(bootstrap);
+      expect(trusted.credentials?.resultToken).toBeTruthy();
+      expect(decodeRunConfig(inputs.run_config!).credentials).toBeUndefined();
+      expect(inputs.run_token).toBe("");
+      for (const [k, v] of Object.entries(inputs)) {
+        if (k !== "run_config") expect(String(v)).not.toContain(bootstrap.bearer);
+      }
+      expect(decision.takeBootstrap).toHaveBeenCalledTimes(1);
+      expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "accepted", expect.anything());
+      expect(admission.count("TEAM")).toBe(1);
+    });
+
+    it("rejected dispatch revokes the grant and releases the admission", async () => {
+      const dispatch = await setup();
+      dispatch.mockResolvedValue({ success: false, status: 404, error: "Not Found", outcome: "rejected" });
+
+      await indexModule.processReviewFixQueue(tokenConfig, mockRegistry);
+
+      expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "rejected", expect.anything());
+      expect(admission.count("TEAM")).toBe(0);
+    });
+
+    it("uncertain dispatch revokes the grant but keeps the admission", async () => {
+      const dispatch = await setup();
+      dispatch.mockResolvedValue({ success: false, status: 503, error: "upstream", outcome: "unknown" });
+
+      await indexModule.processReviewFixQueue(tokenConfig, mockRegistry);
+
+      expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "unknown", expect.anything());
+      expect(admission.count("TEAM")).toBe(1);
+    });
+
+    it("a throwing dispatch revokes the grant and keeps the admission", async () => {
+      const dispatch = await setup();
+      dispatch.mockRejectedValue(new Error("socket hang up"));
+
+      await indexModule.processReviewFixQueue(tokenConfig, mockRegistry);
+
+      expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "unknown", expect.anything());
+      expect(admission.count("TEAM")).toBe(1);
+    });
+
+    it("a workflow without the private transport revokes the grant before any dispatch and releases the admission", async () => {
+      const dispatch = await setup(false);
+
+      await indexModule.processReviewFixQueue(tokenConfig, mockRegistry);
+
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "rejected", expect.anything());
+      expect(admission.count("TEAM")).toBe(0);
+    });
   });
 });

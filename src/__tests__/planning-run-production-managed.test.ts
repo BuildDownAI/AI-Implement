@@ -52,6 +52,7 @@ vi.mock("../dispatch-breaker.js", async (importOriginal) => ({
 vi.mock("../managed-dispatch-auth.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../managed-dispatch-auth.js")>()),
   isManagedProject: vi.fn(() => true),
+  prepareManagedDispatch: vi.fn(async () => ({ kind: "refuse", category: "configuration-error", code: "runner_incompatible" })),
 }));
 vi.mock("../model-auth-runtime.js", () => ({ getModelAuthRuntime: vi.fn(() => ({ runtime: true })) }));
 vi.mock("../fly-protection-key.js", () => ({ buildProtectedFlyBootstrap: vi.fn(async () => ({ sealed: "SEALED" })) }));
@@ -137,7 +138,7 @@ describe("PlanningRun launch for an opted-in project (AII-1391)", () => {
     expect(getInstallationToken).not.toHaveBeenCalled();
     expect(postWorkflowDispatch).not.toHaveBeenCalled();
     // The refusal was counted and the trip went through `input.fireBreakerTrip`.
-    expect(recordDispatchFailure).toHaveBeenCalledWith("i-1", "planning", "gha_not_supported");
+    expect(recordDispatchFailure).toHaveBeenCalledWith("i-1", "planning", "runner_incompatible");
     expect(fireBreakerTrip).toHaveBeenCalledTimes(1);
     expect(releaseByDispatchId).not.toHaveBeenCalled();
   });

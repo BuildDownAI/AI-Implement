@@ -11,6 +11,7 @@ import type * as FlyMachinesModule from "../fly-machines.js";
 import type * as RepoImageModule from "../repo-image.js";
 import type * as AdmissionModule from "../dispatch-admission.js";
 import type { RepoMapping } from "../config.js";
+import { makeGrant, makeSnapshot } from "./configured-run-fixture.js";
 
 type DrainInput = DrainModule.DrainCommentGapfillsInput;
 type CreateMachineFn = typeof FlyMachinesModule.createMachine;
@@ -1842,17 +1843,120 @@ describe("protected dispatch for gap-fill (AII-1392)", () => {
     expect(admission.count("TEAM")).toBe(1);
   });
 
-  it("opted-in GitHub Actions item is failed before any admission, grant or dispatch", async () => {
+  it("opted-in GitHub Actions item with a refused preparation is failed and releases its admission without dispatching", async () => {
     managedMocks.isManagedProject.mockReturnValue(true);
+    managedMocks.prepareManagedDispatch.mockResolvedValue({ kind: "refuse", category: "configuration-error", code: "runner_incompatible" });
     enqueue(56, "issue-m-gha");
     const opts = makeBaseDrainOpts({ getMappings: () => ({ TEAM: makeMapping() }), modelAuthRuntime: runtime });
 
     await drain.drainCommentGapfillQueue(opts);
 
     expect(opts.dispatch).not.toHaveBeenCalled();
-    expect(managedMocks.prepareManagedDispatch).not.toHaveBeenCalled();
+    expect(managedMocks.prepareManagedDispatch).toHaveBeenCalledWith(expect.objectContaining({ backend: "github-actions" }), runtime);
     expect(admission.count("TEAM")).toBe(0);
     expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+  });
+
+  describe("opted-in GitHub Actions item with a capable workflow (AII-1420)", () => {
+    const snapshot = makeSnapshot("codex-subscription");
+    const bootstrap = makeGrant(snapshot, { backend: "gha", dispatchId: "d-1", projectKey: "TEAM" });
+    const SECRET_BEARER = bootstrap.bearer;
+    const caps = (supportsPrivateRunConfig: boolean) => ({
+      contract: "envelope" as const, supportsRunPublicationToken: true, supportsAttemptCorrelation: false, supportsPrivateRunConfig,
+    });
+    function ghaDecision() {
+      return {
+        kind: "launch",
+        dispatchId: "d-1",
+        projectKey: "TEAM",
+        backend: "github-actions",
+        snapshot,
+        grant: {},
+        takeBootstrap: vi.fn(() => bootstrap),
+      };
+    }
+    async function runGha(
+      decision: ReturnType<typeof ghaDecision>,
+      result: Awaited<ReturnType<DrainInput["dispatch"]>> | Error,
+      supportsPrivateRunConfig = true,
+    ) {
+      managedMocks.isManagedProject.mockReturnValue(true);
+      managedMocks.prepareManagedDispatch.mockResolvedValue(decision);
+      enqueue(58, "issue-m-gha-cap");
+      const dispatch = vi.fn<DrainInput["dispatch"]>(async () => {
+        if (result instanceof Error) throw result;
+        return result;
+      });
+      const opts = makeBaseDrainOpts({
+        getMappings: () => ({ TEAM: makeMapping() }),
+        runnerCallbackBaseUrl: "https://orch.example.com",
+        runnerTokenSecret: "runner-token-secret-with-enough-entropy",
+        modelAuthRuntime: runtime,
+        dispatch,
+        checkContract: vi.fn<DrainInput["checkContract"]>(async () => caps(supportsPrivateRunConfig)),
+      });
+      const drained = drain.drainCommentGapfillQueue(opts);
+      return { dispatch, drained };
+    }
+
+    it("accepted launch carries the frozen snapshot and the protected bootstrap privately, and keeps the grant", async () => {
+      const { decodeTrustedRunConfig, decodeRunConfig } = await import("../run-config.js");
+      const decision = ghaDecision();
+      const { dispatch, drained } = await runGha(decision, { success: true, status: 204 });
+      await drained;
+
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      const inputs = dispatch.mock.calls[0]![2];
+      const trusted = decodeTrustedRunConfig(inputs.run_config!);
+      expect(trusted.agentConfig).toEqual(decision.snapshot);
+      expect(trusted.credentials?.modelAuthGrant).toEqual(bootstrap);
+      expect(trusted.credentials?.resultToken).toBeTruthy();
+      expect(decodeRunConfig(inputs.run_config!).credentials).toBeUndefined();
+      expect(inputs.run_token).toBe("");
+      for (const [k, v] of Object.entries(inputs)) {
+        if (k !== "run_config") expect(String(v)).not.toContain(SECRET_BEARER);
+      }
+      expect(decision.takeBootstrap).toHaveBeenCalledTimes(1);
+      expect(managedMocks.settleLaunch).not.toHaveBeenCalled();
+      expect(admission.count("TEAM")).toBe(1);
+    });
+
+    it("rejected dispatch revokes the grant and releases the admission", async () => {
+      const decision = ghaDecision();
+      const { drained } = await runGha(decision, { success: false, status: 404, error: "Not Found", outcome: "rejected" } as never);
+      await drained;
+
+      expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "rejected", runtime);
+      expect(admission.count("TEAM")).toBe(0);
+    });
+
+    it("uncertain dispatch revokes the grant but keeps the admission for reconciliation", async () => {
+      const decision = ghaDecision();
+      const { drained } = await runGha(decision, { success: false, status: 503, error: "upstream", outcome: "unknown" } as never);
+      await drained;
+
+      expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "unknown", runtime);
+      expect(admission.count("TEAM")).toBe(1);
+    });
+
+    it("a throwing dispatch revokes the grant and keeps the admission", async () => {
+      const decision = ghaDecision();
+      const { drained } = await runGha(decision, new Error("socket hang up"));
+      await drained;
+
+      expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "unknown", runtime);
+      expect(admission.count("TEAM")).toBe(1);
+    });
+
+    it("a workflow without the private transport revokes the grant before any dispatch and releases the admission", async () => {
+      const decision = ghaDecision();
+      const { dispatch, drained } = await runGha(decision, { success: true, status: 204 }, false);
+      await drained;
+
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "rejected", runtime);
+      expect(admission.count("TEAM")).toBe(0);
+    });
   });
 
   it.each([

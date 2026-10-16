@@ -25,8 +25,16 @@ import { postBranchComment } from "./base-branch.js";
 import { appendLog, countPriorDispatches } from "./log.js";
 import { createMachine, buildSessionMachineConfig, listAppSecrets } from "./fly-machines.js";
 import { startLocalRunnerContainer, validateProtectedLocalInput, type LocalRunnerInput, type StartLocalContainerInput } from "./local-docker.js";
-import { getModelAuthRuntime } from "./model-auth-runtime.js";
-import { isManagedProject, refusalText } from "./managed-dispatch-auth.js";
+import { getModelAuthRuntime, type ModelAuthRuntime } from "./model-auth-runtime.js";
+import {
+  ghaLaunchOutcome,
+  ghaManagedCredentials,
+  isManagedProject,
+  prepareManagedDispatch,
+  refusalText,
+  settleLaunch,
+  type ManagedDispatchDecision,
+} from "./managed-dispatch-auth.js";
 import { buildProtectedFlyBootstrap } from "./fly-protection-key.js";
 import { SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
 import { getFlySecretsMinVersion, getFlyProcessLevelSecrets } from "./runner-mode.js";
@@ -55,6 +63,9 @@ export interface PlanningLaunch {
   planningSentBaseBranch: boolean;
   planningContract: WorkflowContract;
   planningDispatchInputs: DispatchInputs;
+  /** The managed decision for this launch; `launchPlanningRun` settles it against the launch outcome. */
+  managedDecision?: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }>;
+  managedRuntime?: ModelAuthRuntime;
 }
 
 async function getTargetRepoToken(
@@ -71,23 +82,51 @@ async function getTargetRepoToken(
 /** Everything that runs after the reservation and before the launch call. Pure prep: a throw
  * here is by construction a definitive non-launch. */
 export async function preparePlanningLaunch(args: PreparePlanningLaunchArgs): Promise<PlanningLaunch> {
-  const { config, provider, issue, mapping, dispatchId, resolvedPlanningBranch, trustedCredentials, resolveRunnerImage, fireBreakerTrip } = args;
+  const { config, provider, issue, mapping, dispatchId, fireBreakerTrip } = args;
   const planningMapping = { ...mapping, workflowFile: mapping.planningWorkflowFile };
 
-  // An opted-in project cannot plan on GitHub Actions: refuse before any lookup or token mint.
-  if (isManagedProject(issue.scopeKey)) {
-    await provider.markPlanningFailed(
-      issue.id,
-      issue.scopeKey,
-      refusalText({ kind: "refuse", category: "configuration-error", code: "gha_not_supported" }),
+  // Managed model authentication (AII-1420): decided before any run token is minted. A non-launch decision
+  // throws, and the caller releases the reservation it holds.
+  const managedRuntime = getModelAuthRuntime(config);
+  let managedDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
+  if (isManagedProject(issue.scopeKey, dispatchId)) {
+    const decision = await prepareManagedDispatch(
+      { dispatchId, projectKey: issue.scopeKey, backend: "github-actions", owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.planningWorkflowFile },
+      managedRuntime,
     );
-    // Neither caller counts a throw from here, so count it or the next poll re-comments every 60 s.
-    const breakerGha = recordDispatchFailure(issue.id, "planning", "gha_not_supported");
-    if (breakerGha.tripped && fireBreakerTrip) {
-      await fireBreakerTrip(config, provider, issue.id, issue.identifier, "planning", breakerGha.failures, "gha_not_supported");
+    console.log(`[poll] Managed planning dispatch for ${issue.identifier}: ${decision.kind}${"code" in decision ? ` (${decision.code})` : ""}`);
+    if (decision.kind === "legacy" || decision.kind === "launch") {
+      managedDecision = decision;
+    } else {
+      if (decision.kind === "refuse") {
+        await provider.markPlanningFailed(issue.id, issue.scopeKey, refusalText(decision));
+        // Neither caller counts a throw from here, so count it or the next poll re-comments every 60 s.
+        const breakerRefuse = recordDispatchFailure(issue.id, "planning", decision.code);
+        if (breakerRefuse.tripped && fireBreakerTrip) {
+          await fireBreakerTrip(config, provider, issue.id, issue.identifier, "planning", breakerRefuse.failures, decision.code);
+        }
+      }
+      throw new Error(`managed dispatch ${decision.kind === "refuse" ? "refused" : "not launched"}: ${decision.code}`);
     }
-    throw new Error("managed dispatch refused: gha_not_supported");
   }
+  try {
+    const launch = await buildPlanningLaunch(args, planningMapping, managedDecision);
+    return managedDecision.kind === "launch" ? { ...launch, managedDecision, managedRuntime } : launch;
+  } catch (err) {
+    // Nothing launched: revoke the grant. The caller releases the reservation.
+    settleLaunch(managedDecision, "rejected", managedRuntime);
+    throw err;
+  }
+}
+
+async function buildPlanningLaunch(
+  args: PreparePlanningLaunchArgs,
+  planningMapping: RepoMapping,
+  managedDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }>,
+): Promise<Omit<PlanningLaunch, "managedDecision" | "managedRuntime">> {
+  const { config, provider, issue, mapping, dispatchId, resolvedPlanningBranch, resolveRunnerImage } = args;
+  const managedCredentials = ghaManagedCredentials(managedDecision);
+  const trustedCredentials = managedCredentials ? { ...args.trustedCredentials, ...managedCredentials } : args.trustedCredentials;
 
   // Build planning context (PARENT/SIBLINGS/DEPENDENCIES) only once admission is
   // confirmed: this is a real network call (Linear GraphQL lookup) and must not run
@@ -158,6 +197,7 @@ export async function preparePlanningLaunch(args: PreparePlanningLaunchArgs): Pr
         planningContext: planningContextInputs,
         privateTransport: workflowCapabilities.supportsPrivateRunConfig === true,
         credentials: trustedCredentials,
+        ...(managedDecision.kind === "launch" ? { agentConfig: managedDecision.snapshot } : {}),
         // Planning has no retry loop, so nothing is stamped — but retryPolicy is
         // required on EnvelopeDispatchOpts, so every call site must say so explicitly.
         retryPolicy: null,
@@ -215,21 +255,28 @@ export async function launchPlanningRun(args: LaunchPlanningRunArgs): Promise<Pl
   const {
     config, provider, issue, mapping, dispatchId, admissionGeneration, planningFieldValue,
     ghToken, runnerImage, planningSentBaseBranch, planningContract, planningDispatchInputs,
-    fireBreakerTrip, onRejected,
+    fireBreakerTrip, onRejected, managedDecision, managedRuntime,
   } = args;
   const planningMapping = { ...mapping, workflowFile: mapping.planningWorkflowFile };
 
   // returnRunDetails (AII-778): outcome "rejected" is the only signal precise enough to
   // treat as a definitive non-launch — see the matching comment in dispatchGitHubActions.
-  const result = await postWorkflowDispatch({
-    token: ghToken,
-    owner: planningMapping.owner,
-    repo: planningMapping.repo,
-    workflowFile: planningMapping.workflowFile,
-    ref: planningMapping.defaultBranch,
-    inputs: planningDispatchInputs,
-    returnRunDetails: true,
-  });
+  let result: Awaited<ReturnType<typeof postWorkflowDispatch>>;
+  try {
+    result = await postWorkflowDispatch({
+      token: ghToken,
+      owner: planningMapping.owner,
+      repo: planningMapping.repo,
+      workflowFile: planningMapping.workflowFile,
+      ref: planningMapping.defaultBranch,
+      inputs: planningDispatchInputs,
+      returnRunDetails: true,
+    });
+  } catch (err) {
+    if (managedDecision && managedRuntime) settleLaunch(managedDecision, "unknown", managedRuntime);
+    throw err;
+  }
+  if (managedDecision && managedRuntime) settleLaunch(managedDecision, ghaLaunchOutcome(result), managedRuntime);
 
   if (!result.success) {
     await surfaceDispatchFailure(
