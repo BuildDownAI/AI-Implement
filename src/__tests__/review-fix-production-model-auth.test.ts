@@ -7,7 +7,9 @@ const isManagedProject = vi.fn();
 const getInstallationToken = vi.fn(async () => "tok");
 const getInstallationId = vi.fn(async () => 1);
 const resolveWorkflowCapabilities = vi.fn(async () => ({
-  contract: "envelope", supportsAttemptCorrelation: true, supportsRunPublicationToken: true }));
+  contract: "envelope", supportsAttemptCorrelation: true, supportsRunPublicationToken: true,
+  supportsPrivateRunConfig: true, supportsStageAgentConfig: true }));
+const inspectAgentReadiness = vi.fn();
 const getPullRequestState = vi.fn(async () => ({ state: "open", merged: false }));
 
 vi.mock("../config.js", () => ({
@@ -23,6 +25,7 @@ vi.mock("../review-fix-queue.js", () => ({
   updateReviewFixStatus: (...args: unknown[]) => updateReviewFixStatus(...args),
 }));
 vi.mock("../managed-dispatch-auth.js", () => ({ isManagedProject: (...a: unknown[]) => isManagedProject(...a) }));
+vi.mock("../agent-run-preparation.js", () => ({ inspectAgentReadiness: (...a: unknown[]) => inspectAgentReadiness(...a) }));
 vi.mock("../github-app-auth.js", () => ({
   getInstallationToken: (...a: unknown[]) => getInstallationToken(...(a as [])),
   getInstallationId: (...a: unknown[]) => getInstallationId(...(a as [])),
@@ -35,44 +38,83 @@ import { admitReviewFix, canAdmit } from "../restate/review-fix-production.js";
 const scope = { repository: "acme/app", prNumber: 7, installationId: 1 } as never;
 const config = { githubAppId: "1", githubAppPrivateKey: "k", runnerCallbackBaseUrl: "https://o", runnerTokenSecret: "s",
   sessionImage: "img", runnerImageExplicit: false };
+const runtime = { preparationDeps: vi.fn(() => ({})) } as never;
 const request = { scope, feedback: { taskText: "t", findings: [], queueCursor: { queueId: 42, eventId: 1 } },
   jobTimeoutMinutes: 30 } as never;
 
 afterEach(() => vi.clearAllMocks());
 
 describe("review-fix admission and model authentication", () => {
-  it("refuses an opted-in project before any GitHub call, keyed by the mapping key", async () => {
+  it("defers a managed project when no model-auth runtime is supplied, touching nothing", async () => {
     getMappings.mockReturnValue({ "proj-key": mapping });
     isManagedProject.mockReturnValue(true);
-    expect(await canAdmit(scope, config)).toBe("configuration_error");
+    expect(await canAdmit(scope, config)).toBe("defer");
     expect(isManagedProject).toHaveBeenCalledWith("proj-key");
     expect(getInstallationToken).not.toHaveBeenCalled();
-    expect(getInstallationId).not.toHaveBeenCalled();
-    expect(resolveWorkflowCapabilities).not.toHaveBeenCalled();
-    expect(getPullRequestState).not.toHaveBeenCalled();
+    expect(inspectAgentReadiness).not.toHaveBeenCalled();
   });
 
-  it("admit reserves nothing, fails the queue row and logs the exact line", async () => {
+  it("admits a managed project only when readiness is ready", async () => {
     getMappings.mockReturnValue({ k: mapping });
     isManagedProject.mockReturnValue(true);
+    inspectAgentReadiness.mockResolvedValue({ status: "ready", profiles: [{ authMode: "codex-subscription" }] });
+    expect(await canAdmit(scope, config, runtime)).toBe("admit");
+    expect(inspectAgentReadiness).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["credential_unauthorized", "configuration_error"], ["unsupported_combination", "configuration_error"],
+    ["resolution_failed", "configuration_error"], ["runner_incompatible", "configuration_error"],
+    ["delivery_unreadable", "defer"], ["repository_visibility_unknown", "defer"], ["credential_unavailable", "defer"],
+  ])("maps readiness code %s to %s", async (code, verdict) => {
+    getMappings.mockReturnValue({ k: mapping });
+    isManagedProject.mockReturnValue(true);
+    inspectAgentReadiness.mockResolvedValue({ status: "not-ready", code });
+    expect(await canAdmit(scope, config, runtime)).toBe(verdict);
+  });
+
+  it("defers when readiness throws and refuses legacy-resolving or Claude subscription selections", async () => {
+    getMappings.mockReturnValue({ k: mapping });
+    isManagedProject.mockReturnValue(true);
+    inspectAgentReadiness.mockRejectedValueOnce(new Error("boom"));
+    expect(await canAdmit(scope, config, runtime)).toBe("defer");
+    inspectAgentReadiness.mockResolvedValueOnce({ status: "legacy" });
+    expect(await canAdmit(scope, config, runtime)).toBe("configuration_error");
+    inspectAgentReadiness.mockResolvedValueOnce({ status: "ready", profiles: [{ authMode: "claude-subscription" }] });
+    expect(await canAdmit(scope, config, runtime)).toBe("configuration_error");
+  });
+
+  it("fails an incapable managed workflow before any readiness read", async () => {
+    getMappings.mockReturnValue({ k: mapping });
+    isManagedProject.mockReturnValue(true);
+    resolveWorkflowCapabilities.mockResolvedValueOnce({ contract: "envelope", supportsAttemptCorrelation: true,
+      supportsRunPublicationToken: true, supportsPrivateRunConfig: true, supportsStageAgentConfig: false } as never);
+    expect(await canAdmit(scope, config, runtime)).toBe("configuration_error");
+    expect(inspectAgentReadiness).not.toHaveBeenCalled();
+  });
+
+  it("admit reserves nothing, fails the queue row and logs only a code", async () => {
+    getMappings.mockReturnValue({ k: mapping });
+    isManagedProject.mockReturnValue(true);
+    inspectAgentReadiness.mockResolvedValue({ status: "not-ready", code: "credential_unauthorized" });
     const store = { admit: vi.fn() };
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
-    const outcome = await admitReviewFix(request, config, store);
+    const outcome = await admitReviewFix(request, config, store, runtime);
     expect(outcome).toEqual({ status: "deferred", reason: "paused" });
     expect(store.admit).not.toHaveBeenCalled();
     expect(updateReviewFixStatus).toHaveBeenCalledWith(42, "failed");
-    expect(err).toHaveBeenCalledWith("[review-fix] acme/app#7 not launched: configuration_error (gha_not_supported)");
+    expect(err).toHaveBeenCalledWith("[review-fix] acme/app#7 not launched: configuration_error (credential_unauthorized)");
     err.mockRestore();
   });
 
-  it("still defers without touching the queue when the opted-in request has no cursor", async () => {
+  it("defers without touching the queue on uncertain readiness", async () => {
     getMappings.mockReturnValue({ k: mapping });
     isManagedProject.mockReturnValue(true);
-    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    inspectAgentReadiness.mockResolvedValue({ status: "not-ready", code: "delivery_unreadable" });
     const noCursor = { ...(request as object), feedback: { taskText: "t", findings: [] } } as never;
-    expect(await admitReviewFix(noCursor, config, { admit: vi.fn() })).toEqual({ status: "deferred", reason: "paused" });
+    expect(await admitReviewFix(request, config, { admit: vi.fn() }, runtime)).toEqual({ status: "deferred", reason: "paused" });
+    expect(await admitReviewFix(noCursor, config, { admit: vi.fn() }, runtime)).toEqual({ status: "deferred", reason: "paused" });
     expect(updateReviewFixStatus).not.toHaveBeenCalled();
-    err.mockRestore();
   });
 
   it("keeps the opted-out path: same GitHub calls, admit", async () => {

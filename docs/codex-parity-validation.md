@@ -208,7 +208,7 @@ until those are present.
 | Codex on Restate: expired-token resume | Pending | Live run ID, snapshot ID, head SHA |
 | Codex on Restate review-fix, live | Pending | Live run ID, snapshot ID, head SHA |
 
-Managed Restate review-fix admission still refuses until AII-1335/1336. AII-1338 is generic Fly proof, not Codex-specific.
+Managed Restate review-fix admission is open on GitHub Actions only (AII-1444): Codex API/ChatGPT and supported mixed selections admit when the workflow capabilities and read-only readiness hold. Fly and local Docker still refuse until AII-1336, managed Claude subscription stays refused, and no live proof exists yet. AII-1338 is generic Fly proof, not Codex-specific.
 AII-1289 owns the final Codex-specific evidence.
 
 ## Release order
