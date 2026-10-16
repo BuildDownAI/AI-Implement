@@ -7,6 +7,7 @@ import {
   type SealedModelAuthBootstrapV1,
   isEphemeralPolicyEnvName,
 } from "./model-auth-contract.js";
+import { isRunCredentialEnvName } from "./runner-tokens.js";
 import { isSafeProtectionKeyRef } from "./model-auth-seal.js";
 import {
   MODEL_CREDENTIAL_KEYS,
@@ -801,6 +802,10 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
   if (input.extraEnv && Object.keys(input.extraEnv).some(isEphemeralPolicyEnvName)) {
     // The ephemeral full-access opt-in is GHA-only (AII-1437): refuse before any machine is created.
     throw new Error("ephemeral full-access opt-in is not supported on Fly machines");
+  }
+  const reservedCredentialKey = input.extraEnv ? Object.keys(input.extraEnv).find(isRunCredentialEnvName) : undefined;
+  if (reservedCredentialKey !== undefined) {
+    throw new Error(`extraEnv name ${reservedCredentialKey} is reserved`);
   }
   if (input.extraEnv) {
     Object.assign(env, input.extraEnv);
