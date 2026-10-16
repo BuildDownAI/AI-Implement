@@ -65,9 +65,11 @@ function selectedMapping(scope: ScopedPrIdentity): RepoMapping | null {
 export type ReviewFixAdmission = "admit" | "defer" | "configuration_error";
 
 /** Readiness codes that are uncertain rather than wrong: the queue stays pending and a later check can admit.
- * `resolution_failed` is deliberately not here: an unauthorized, disabled or missing profile surfaces as that code. */
+ * `resolution_failed` is deliberately not here: an unauthorized, disabled or missing profile surfaces as that code,
+ * whereas `resolution_unavailable` is an operational fault (such as a locked database) reading the inputs. */
 const DEFERRED_READINESS_CODES: ReadonlySet<string> = new Set([
   "delivery_unreadable", "repository_visibility_unknown", "credential_unavailable", "session_unavailable",
+  "resolution_unavailable",
 ]);
 
 interface AdmissionDecision { verdict: ReviewFixAdmission; reason: string }
@@ -103,7 +105,8 @@ async function decideAdmission(
   if (!runtime) return { verdict: "defer", reason: "model_auth_unavailable" };
   const capabilities = await verifyDispatchContract(scope, config, mapping, true);
   if (!capabilities) return { verdict: "defer", reason: "contract_unverified" };
-  if (capabilities.supportsStageAgentConfig !== true || capabilities.supportsPrivateRunConfig !== true) {
+  if (capabilities.contract !== "envelope" || capabilities.supportsAttemptCorrelation !== true
+    || capabilities.supportsRunPublicationToken !== true || capabilities.supportsStageAgentConfig !== true || capabilities.supportsPrivateRunConfig !== true) {
     return { verdict: "configuration_error", reason: "workflow_capability_missing" };
   }
   if (hasEphemeralFullAccessOptIn(mapping.extraEnv) && capabilities.supportsExecutionPolicy !== true) {
@@ -140,8 +143,11 @@ async function verifyDispatchContract(
     const capabilities = await resolveWorkflowCapabilities({ owner: mapping.owner, repo: mapping.repo,
       workflowFile: mapping.workflowFile, token, ref: mapping.defaultBranch, ...(managed ? { failOnTransient: true } : {}) });
     const prState = await getPullRequestState(token, mapping.owner, mapping.repo, scope.prNumber);
+    if (prState?.state !== "open" || prState.merged) return null;
+    // A managed verdict reports a known-incapable template as a configuration error, so the capabilities are returned for it to judge.
+    if (managed) return capabilities;
     return capabilities.contract === "envelope" && capabilities.supportsAttemptCorrelation
-      && capabilities.supportsRunPublicationToken && prState?.state === "open" && !prState.merged ? capabilities : null;
+      && capabilities.supportsRunPublicationToken ? capabilities : null;
   } catch { return null; }
 }
 

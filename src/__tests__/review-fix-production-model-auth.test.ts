@@ -65,7 +65,7 @@ describe("review-fix admission and model authentication", () => {
   it.each([
     ["credential_unauthorized", "configuration_error"], ["unsupported_combination", "configuration_error"],
     ["resolution_failed", "configuration_error"], ["runner_incompatible", "configuration_error"],
-    ["delivery_unreadable", "defer"], ["repository_visibility_unknown", "defer"], ["credential_unavailable", "defer"],
+    ["resolution_unavailable", "defer"], ["delivery_unreadable", "defer"], ["repository_visibility_unknown", "defer"], ["credential_unavailable", "defer"],
   ])("maps readiness code %s to %s", async (code, verdict) => {
     getMappings.mockReturnValue({ k: mapping });
     isManagedProject.mockReturnValue(true);
@@ -91,6 +91,30 @@ describe("review-fix admission and model authentication", () => {
       supportsRunPublicationToken: true, supportsPrivateRunConfig: true, supportsStageAgentConfig: false } as never);
     expect(await canAdmit(scope, config, runtime)).toBe("configuration_error");
     expect(inspectAgentReadiness).not.toHaveBeenCalled();
+  });
+
+  it.each(["supportsAttemptCorrelation", "supportsRunPublicationToken"])(
+    "fails a managed workflow missing %s, but defers when the PR is not readable as open", async (missing) => {
+      getMappings.mockReturnValue({ k: mapping });
+      isManagedProject.mockReturnValue(true);
+      resolveWorkflowCapabilities.mockResolvedValueOnce({ contract: "envelope", supportsAttemptCorrelation: true,
+        supportsRunPublicationToken: true, supportsPrivateRunConfig: true, supportsStageAgentConfig: true,
+        [missing]: false } as never);
+      expect(await canAdmit(scope, config, runtime)).toBe("configuration_error");
+      expect(inspectAgentReadiness).not.toHaveBeenCalled();
+      resolveWorkflowCapabilities.mockResolvedValueOnce({ contract: "envelope", supportsAttemptCorrelation: true,
+        supportsRunPublicationToken: true, supportsPrivateRunConfig: true, supportsStageAgentConfig: true,
+        [missing]: false } as never);
+      getPullRequestState.mockResolvedValueOnce({ state: "closed", merged: false } as never);
+      expect(await canAdmit(scope, config, runtime)).toBe("defer");
+    });
+
+  it("keeps a legacy workflow missing attempt correlation deferred", async () => {
+    getMappings.mockReturnValue({ k: mapping });
+    isManagedProject.mockReturnValue(false);
+    resolveWorkflowCapabilities.mockResolvedValueOnce({ contract: "envelope", supportsAttemptCorrelation: false,
+      supportsRunPublicationToken: true } as never);
+    expect(await canAdmit(scope, config)).toBe("defer");
   });
 
   it("admit reserves nothing, fails the queue row and logs only a code", async () => {

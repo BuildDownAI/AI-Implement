@@ -136,6 +136,7 @@ export interface AgentRunRequest {
 export type ConfigurationErrorCode =
   | "invalid_request"
   | "resolution_failed"
+  | "resolution_unavailable"
   | "snapshot_invalid"
   | "project_mismatch"
   | "unsupported_combination"
@@ -246,14 +247,24 @@ type Resolved =
   | { readonly kind: "snapshot"; readonly snapshot: ResolvedAgentSnapshotV1; readonly stored: boolean }
   | { readonly kind: "error"; readonly code: ConfigurationErrorCode };
 
+/** A database fault (locked, busy, I/O) is operational uncertainty, not a verdict on the stored selection. */
+function isOperationalFault(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === "string" && code.startsWith("SQLITE_");
+}
+
+function resolutionFailure(err: unknown): ConfigurationErrorCode {
+  return isOperationalFault(err) ? "resolution_unavailable" : "resolution_failed";
+}
+
 function resolveCurrent(request: AgentRunRequest, candidate?: StageAgentConfigurationV1): Resolved {
   let projection;
   try {
     projection = candidate
       ? resolveCandidateProjectStageConfig(request.projectKey, candidate, request.remainingJobMs)
       : resolveProjectStageConfig(request.projectKey, request.remainingJobMs);
-  } catch {
-    return { kind: "error", code: "resolution_failed" };
+  } catch (err) {
+    return { kind: "error", code: resolutionFailure(err) };
   }
   if (projection.resolution.mode !== "configured") return { kind: "legacy" };
   const refs = projection.configReferences;
@@ -427,8 +438,8 @@ export async function inspectAgentReadiness(
   try {
     // A candidate is an uncommitted project config: it is resolved in place of the stored head and nothing is stored.
     resolved = candidate ? resolveCurrent(request, candidate) : resolveForRequest(request);
-  } catch {
-    return { status: "not-ready", code: "resolution_failed" };
+  } catch (err) {
+    return { status: "not-ready", code: resolutionFailure(err) };
   }
   if (resolved.kind === "legacy") return { status: "legacy" };
   if (resolved.kind === "error") return { status: "not-ready", code: resolved.code };
@@ -591,8 +602,8 @@ export async function prepareAgentRun(request: AgentRunRequest, deps: AgentRunPr
   try {
     resolved = resolveForRequest(request);
     if (resolved.kind === "snapshot" && !resolved.stored) resolved = persistSnapshot(request, resolved.snapshot);
-  } catch {
-    return { status: "configuration-error", code: "resolution_failed" };
+  } catch (err) {
+    return { status: "configuration-error", code: resolutionFailure(err) };
   }
   if (resolved.kind === "legacy") return { status: "legacy" };
   if (resolved.kind === "error") return { status: "configuration-error", code: resolved.code };

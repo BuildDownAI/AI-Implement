@@ -129,6 +129,9 @@ export async function prepareManagedDispatch(
     case "queued":
       return { kind: "leave-queued", code: "profile_busy" };
     case "configuration-error":
+      // An operational fault reading the selection (a locked database) is not a verdict on it: hold, never refuse,
+      // so callers that fail the queue row on a refusal keep the feedback pending.
+      if (result.code === "resolution_unavailable") return { kind: "hold", code: result.code };
       return { kind: "refuse", category: "configuration-error", code: result.code };
     case "authentication-required":
       return { kind: "refuse", category: "authentication-required", code: result.code };

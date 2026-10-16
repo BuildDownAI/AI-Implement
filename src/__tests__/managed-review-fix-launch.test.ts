@@ -543,6 +543,75 @@ describe("production managed GHA review-fix launch", () => {
       expect([...sideEffects(), count("model_profile_reservations"), count("review_fix_attempts")]).toEqual(before);
     });
 
+    it("defers on a real locked database, keeps the queue row pending, then admits after the lock clears", async () => {
+      const { enqueueReviewFix, getPendingReviewFixes } = await import("../review-fix-queue.js");
+      const queueId = enqueueReviewFix({ issueId: "i1", issueIdentifier: "AII-1", repo: SCOPE.repository, prNumber: SCOPE.prNumber, reason: "review" });
+      const request = { scope: SCOPE, feedback: { taskText: "t", findings: [{ findingKey: "f1", version: 1 }], queueCursor: { queueId, eventId: 1 } },
+        jobTimeoutMinutes: 30 };
+      const before = [...sideEffects(), count("model_profile_reservations")];
+      const db = dedup.getDb();
+      db.pragma("journal_mode = DELETE");
+      db.pragma("busy_timeout = 1");
+      const { default: Database } = await import("better-sqlite3");
+      const other = new Database(dbPath);
+      const locking: ModelAuthRuntime = { ...runtime, preparationDeps: (...args) => {
+        other.exec("BEGIN EXCLUSIVE");
+        return runtime.preparationDeps(...args);
+      } };
+      try {
+        expect(await production.canAdmit(SCOPE, CONFIG, locking)).toBe("defer");
+        other.exec("ROLLBACK");
+        expect(await production.admitReviewFix(request, CONFIG, attempts, locking)).toMatchObject({ status: "deferred" });
+      } finally {
+        try { other.exec("ROLLBACK"); } catch { /* released */ }
+        other.close();
+      }
+      expect(getPendingReviewFixes().map((row) => row.id)).toContain(queueId);
+      expect([...sideEffects(), count("model_profile_reservations")]).toEqual(before);
+      expect(sent).toHaveLength(0);
+      expect(await admit()).toBe("admit");
+    });
+
+    it.each(["run_attempt_token", "run_publication_token"])(
+      "fails a readable workflow whose declared %s input is renamed, dispatching nothing", async (input) => {
+        workflow = workflow.replace(new RegExp(`^(\\s{2,})${input}:\\s*$`, "m"), "$1renamed_input:");
+        expect(workflow).not.toMatch(new RegExp(`^\\s{2,}${input}:\\s*$`, "m"));
+        const { enqueueReviewFix, getPendingReviewFixes } = await import("../review-fix-queue.js");
+        const queueId = enqueueReviewFix({ issueId: "i1", issueIdentifier: "AII-1", repo: SCOPE.repository, prNumber: SCOPE.prNumber, reason: "review" });
+        expect(await admit()).toBe("configuration_error");
+        const request = { scope: SCOPE, feedback: { taskText: "t", findings: [], queueCursor: { queueId, eventId: 1 } }, jobTimeoutMinutes: 30 };
+        const attemptsBefore = count("review_fix_attempts");
+        expect((await production.admitReviewFix(request, CONFIG, attempts, runtime)).status).toBe("deferred");
+        expect(getPendingReviewFixes().map((row) => row.id)).not.toContain(queueId);
+        expect(count("review_fix_attempts")).toBe(attemptsBefore);
+        expect(sent).toHaveLength(0);
+        expect(count("model_credential_grants")).toBe(0);
+        // A transient PR read still defers rather than failing.
+        prState = null;
+        expect(await admit()).toBe("defer");
+      });
+
+    it("holds, rather than refuses, a launch whose selection cannot be read because the database is locked", async () => {
+      const { prepareManagedDispatch } = await import("../managed-dispatch-auth.js");
+      const db = dedup.getDb();
+      db.pragma("journal_mode = DELETE");
+      db.pragma("busy_timeout = 1");
+      const { default: Database } = await import("better-sqlite3");
+      const other = new Database(dbPath);
+      const locking: ModelAuthRuntime = { ...runtime, preparationDeps: (...args) => {
+        other.exec("BEGIN EXCLUSIVE");
+        return runtime.preparationDeps(...args);
+      } };
+      try {
+        const decision = await prepareManagedDispatch({ dispatchId: prepared.attemptId, projectKey: "AII", backend: "github-actions",
+          owner: "acme", repo: "app", workflowFile: "claude-implement.yml" }, locking);
+        expect(decision).toEqual({ kind: "hold", code: "resolution_unavailable" });
+      } finally { other.exec("ROLLBACK"); other.close(); }
+      expect(count("model_credential_grants")).toBe(0);
+      const { worker, plan } = await launch();
+      expect((await worker.launch(plan)).status).toBe("accepted");
+    });
+
     it("fails the queue row with a code-only log and reserves nothing on a bad configuration", async () => {
       const { enqueueReviewFix, getPendingReviewFixes } = await import("../review-fix-queue.js");
       const queueId = enqueueReviewFix({ issueId: "i1", issueIdentifier: "AII-1", repo: SCOPE.repository, prNumber: SCOPE.prNumber, reason: "review" });

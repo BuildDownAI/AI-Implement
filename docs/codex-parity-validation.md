@@ -136,7 +136,7 @@ The TEST mapping was restored to fly-machines/Legacy via the supported admin UI 
 ephemeral opt-in is absent, autoMerge false and capacity 2 CPU / 4096 MB retained, other mappings untouched. The smokes used
 temporary GHA, so this restoration is cleanup and not live Fly acceptance.
 
-AII-1289 remains open (Backlog) with the AII-1336/1338 blockers. The managed review-fix guard stays intact, and the
+AII-1289 remains open (Backlog) with the AII-1336/1338 blockers. Managed review-fix admission is open on GitHub Actions only (AII-1444); the Fly and local guards stay intact, and the
 sequence AII-1368 -> AII-1312 -> AII-1374 -> AII-1313 and D10 are not waived. No restart, cancel, retry or
 uncertain-launch proof is inferred from these normal successes.
 

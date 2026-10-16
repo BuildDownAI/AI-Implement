@@ -669,6 +669,22 @@ describe("cleanup ownership completeness", () => {
 });
 
 describe("inspectAgentReadiness", () => {
+  it("reports a locked database as resolution_unavailable and recovers without a configuration edit", async () => {
+    const db = dedup.getDb();
+    db.pragma("journal_mode = DELETE");
+    db.pragma("busy_timeout = 1");
+    const { default: Database } = await import("better-sqlite3");
+    const other = new Database(dbPath);
+    other.exec("BEGIN EXCLUSIVE");
+    try {
+      expect(await prep.inspectAgentReadiness(request(), deps)).toEqual({ status: "not-ready", code: "resolution_unavailable" });
+    } finally {
+      other.exec("ROLLBACK");
+      other.close();
+    }
+    expect(await prep.inspectAgentReadiness(request(), deps)).toMatchObject({ status: "ready" });
+  });
+
   it("is read-only and reports ready with deferred subscription credentials", async () => {
     const before = counts();
     const r = await prep.inspectAgentReadiness(request(), deps);
