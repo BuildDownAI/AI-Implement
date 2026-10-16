@@ -1600,6 +1600,7 @@ describe("drainCommentGapfillQueue — admission (AII-787)", () => {
 
   it("Fly gap-fill carries the result, progress and publication tokens, the nonce and orchestrator URL, and none in the encoded run config", async () => {
     const mapping = makeMapping({ owner: "acme", repo: "billing", executionMode: "fly-machines" });
+    const runnerTokenSecret = "runner-token-secret-with-enough-entropy";
     seedDispatchLog("issue-fly-tokens", "AII-306", "Fly tokens", "acme", "billing", 89);
     queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 89, commentId: 0, commenter: "", instruction: "" });
 
@@ -1609,13 +1610,24 @@ describe("drainCommentGapfillQueue — admission (AII-787)", () => {
       flySessionsApp: "fly-app",
       anthropicApiKey: "anthropic-key",
       runnerCallbackBaseUrl: "https://orch.example.com",
-      runnerTokenSecret: "runner-token-secret-with-enough-entropy",
+      runnerTokenSecret,
     }));
 
     const env = flyMocks.createMachine.mock.calls[0]![2].config.env!;
-    expect(env.RUN_TOKEN).toBeTruthy();
-    expect(env.RUN_PROGRESS_TOKEN).toBeTruthy();
-    expect(env.RUN_PUBLICATION_TOKEN).toBeTruthy();
+    // Each env value must be a real minted token for its audience, all from one dispatch.
+    // Imported lazily so it shares the post-resetModules DB handle with the drain.
+    const { verifyRunToken } = await import("../runner-tokens.js");
+    const dispatchIds = new Set<string>();
+    for (const [key, audience] of [
+      ["RUN_TOKEN", "result"],
+      ["RUN_PROGRESS_TOKEN", "progress"],
+      ["RUN_PUBLICATION_TOKEN", "publication"],
+    ] as const) {
+      const verified = verifyRunToken(env[key]!, runnerTokenSecret, audience, { consume: false });
+      expect(verified.ok, `${key} verifies as ${audience}`).toBe(true);
+      if (verified.ok) dispatchIds.add(verified.claims.dispatchId);
+    }
+    expect(dispatchIds.size).toBe(1);
     expect(env.MACHINE_NONCE).toBeTruthy();
     expect(env.ORCHESTRATOR_URL).toBe("https://orch.example.com");
     // extraEnv reaches the machine env as AI_IMPLEMENT_RUN_CONFIG; no token may travel in it.
