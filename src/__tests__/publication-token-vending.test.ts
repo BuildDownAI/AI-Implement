@@ -128,6 +128,19 @@ describe("handlePublicationTokenRequest", () => {
     );
   });
 
+  it("still returns a token when the minting layer drops checks for the installation", async () => {
+    const token = mintPublicationToken("implementation", "acme/app");
+    // The intersection lives in getScopedInstallationToken (mocked here); the route must not add its own gate.
+    mockGetScopedToken.mockResolvedValueOnce({ token: "ghs_no_checks", expiresAt: "2030-01-01T00:00:00Z" });
+
+    const result = await callHandler(token);
+
+    expect(result.status).toBe(200);
+    expect(mockGetScopedToken.mock.calls[0][3].permissions).toEqual(
+      { contents: "write", pull_requests: "write", workflows: "write", checks: "read" },
+    );
+  });
+
   it("logs one line per mint without the token value (AII-922)", async () => {
     const token = mintPublicationToken("implementation", "acme/app");
     mockGetScopedToken.mockResolvedValueOnce({

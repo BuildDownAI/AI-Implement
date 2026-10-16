@@ -373,6 +373,114 @@ describe("installationIncludesRepo", () => {
   });
 });
 
+describe("getScopedInstallationToken permission intersection", () => {
+  const futureExpiresAt = () => new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  const PUBLICATION = { contents: "write", pull_requests: "write", workflows: "write", checks: "read" };
+  const mintBody = (call: number) => JSON.parse((vi.mocked(fetch).mock.calls[call][1] as RequestInit).body as string);
+  let warn: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    warn.mockRestore();
+  });
+
+  const mint = (perms: Record<string, string> = PUBLICATION, extra: Record<string, unknown> = {}) =>
+    getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: perms, ...extra });
+
+  it("leaves the body unchanged and does not warn when everything is granted", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1, permissions: { ...PUBLICATION, metadata: "read" } } },
+      { ok: true, json: { token: "t", expires_at: futureExpiresAt() } },
+    ]));
+    await mint();
+    expect(mintBody(1)).toEqual({ permissions: PUBLICATION });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("drops a permission the installation lacks and warns once", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1, permissions: { contents: "write", pull_requests: "write", workflows: "write" } } },
+      { ok: true, json: { token: "t", expires_at: futureExpiresAt() } },
+    ]));
+    await mint();
+    expect(mintBody(1).permissions).toEqual({ contents: "write", pull_requests: "write", workflows: "write" });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain("checks");
+    expect(warn.mock.calls[0][0]).toContain("my-org");
+  });
+
+  it("lowers write to read where only read is granted", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1, permissions: { ...PUBLICATION, workflows: "read" } } },
+      { ok: true, json: { token: "t", expires_at: futureExpiresAt() } },
+    ]));
+    await mint();
+    expect(mintBody(1).permissions).toEqual({ ...PUBLICATION, workflows: "read" });
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes through a level the rank does not know", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1, permissions: { contents: "write" } } },
+      { ok: true, json: { token: "t", expires_at: futureExpiresAt() } },
+    ]));
+    await mint({ contents: "superuser" });
+    expect(mintBody(1).permissions).toEqual({ contents: "superuser" });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("warns once for the same owner and permission across mints", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1, permissions: { contents: "write" } } },
+      { ok: true, json: { token: "t1", expires_at: futureExpiresAt() } },
+      { ok: true, json: { id: 1, permissions: { contents: "write" } } },
+      { ok: true, json: { token: "t2", expires_at: futureExpiresAt() } },
+    ]));
+    await mint({ contents: "write", checks: "read" });
+    await mint({ contents: "write", checks: "read" }, { forceRefresh: true });
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws the same GitHubApiError when the installation lookup fails", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: false, status: 404, text: "Not Found" },
+      { ok: false, status: 404, text: "Not Found" },
+    ]));
+    await expect(mint()).rejects.toMatchObject({ status: 404, path: "/users/my-org/installation" });
+  });
+
+  it("passes the request through when the installation response has no permissions", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "t", expires_at: futureExpiresAt() } },
+    ]));
+    await mint();
+    expect(mintBody(1)).toEqual({ permissions: PUBLICATION });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("makes no installation request on a cache hit", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1, permissions: { contents: "write" } } },
+      { ok: true, json: { token: "t", expires_at: futureExpiresAt() } },
+    ]));
+    await mint({ contents: "write", checks: "read" });
+    expect(fetch).toHaveBeenCalledTimes(2);
+    await mint({ contents: "write", checks: "read" });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("throws without a mint request when nothing requested is granted", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1, permissions: { metadata: "read" } } },
+    ]));
+    await expect(mint({ checks: "read" })).rejects.toThrow(/my-org.*checks/);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("getScopedInstallationToken", () => {
   const futureExpiresAt = () => new Date(Date.now() + 60 * 60 * 1000).toISOString();
 
