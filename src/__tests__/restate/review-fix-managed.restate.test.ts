@@ -42,6 +42,8 @@ const state = vi.hoisted(() => ({
   dispatched: [] as Array<Record<string, unknown>>,
   nextRunId: 9_500,
   workflow: "",
+  omitRunId: false,
+  listed: [] as Array<{ id: number; run_attempt: number; display_title: string; head_branch: string }>,
 }));
 
 vi.mock("../../github-app-auth.js", () => ({
@@ -57,7 +59,8 @@ vi.mock("../../github.js", async (importOriginal) => ({
   getPullRequestState: async () => ({ state: "open", merged: false }),
   postWorkflowDispatch: async ({ inputs }: { inputs: DispatchInputs }) => {
     state.dispatched.push(inputs as unknown as Record<string, unknown>);
-    return { success: true, status: 204, outcome: "accepted" as const, runId: state.nextRunId++ };
+    const runId = state.nextRunId++;
+    return state.omitRunId ? { success: true, status: 204, outcome: "accepted" as const } : { success: true, status: 204, outcome: "accepted" as const, runId };
   },
 }));
 
@@ -101,7 +104,7 @@ const githubFetch: typeof fetch = async (input, init) => {
     const run = runs.get(Number(m[1])) ?? { status: "in_progress", conclusion: null };
     return json({ ...run, run_attempt: 1 });
   }
-  if (/\/actions\/workflows\//.test(path)) return json({ workflow_runs: [] });
+  if (/\/actions\/workflows\//.test(path)) return json({ workflow_runs: state.listed });
   if (path.includes("/contents/.github/workflows/")) {
     return json({ type: "file", encoding: "base64", content: Buffer.from(state.workflow).toString("base64") });
   }
@@ -273,6 +276,48 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
     const finalText = await journalsOf(attemptId, 42);
     for (const secret of [launch.bearer, ...launch.tokens, ACCESS, SECRET]) expect(finalText).not.toContain(secret);
   }, 90_000);
+
+  it("keeps the model-auth grant for an accepted 204 with no run id, reconciles the exact run, and finalizes", async () => {
+    const before = state.dispatched.length;
+    state.omitRunId = true;
+    let attemptId: string; let prepared: Awaited<ReturnType<typeof admit>>["prepared"];
+    try { ({ attemptId, prepared } = await admit(46)); await eventually(() => state.dispatched.length, (n) => n >= before + 1, { timeoutMs: 20_000, label: "managed dispatch" }); }
+    finally { state.omitRunId = false; }
+    const runId = state.nextRunId - 1;
+    const launch = await launched(before + 1);
+    // GitHub accepted the launch but returned no identity: the grant survives, nothing was dispatched twice.
+    expect(grants(attemptId)).toBe(1);
+    expect(getDb().prepare("SELECT count(*) AS n FROM model_credential_grants WHERE dispatch_id = ? AND revoked_at IS NOT NULL").get(attemptId)).toEqual({ n: 0 });
+    expect(occupancy(attemptId)).toBeNull();
+    state.listed = [{ id: runId, run_attempt: 1, display_title: `Review fix · attempt ${attemptId}`, head_branch: "main" }];
+
+    const { createModelAuthRoutes } = await import("../../model-auth-routes.js");
+    const routes = createModelAuthRoutes({ runtime, onFly: false, requestPlanRefresh: async () => {} });
+    const http = await import("node:http");
+    const server = http.createServer((req, res) => { void routes.handle(req, res); });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const port = (server.address() as { port: number }).port;
+      const response = await realFetch(`http://127.0.0.1:${port}/runner/model-auth/checkout`, {
+        method: "POST", headers: { authorization: `Bearer ${launch.bearer}`, "content-type": "application/json" },
+        body: JSON.stringify({ version: 1, profileId: "cdx" }),
+      });
+      expect(response.status).toBe(200);
+    } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
+
+    const commit = heads.get(46)!;
+    recordCycle(prepared, commit);
+    await eventually(async () => (await deliver(launch.config.credentials!.resultToken!, resultFor(prepared, runId, commit))).body,
+      (body) => (body as { outcome?: string }).outcome === "stored", { timeoutMs: 30_000, label: "result stored after reconcile" });
+    runs.set(runId, { status: "completed", conclusion: "success" });
+    const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
+    expect(done).toMatchObject({ status: "finalized", approval: "applied" });
+    expect(occupancy(attemptId)).not.toBeNull();
+    expect(state.dispatched).toHaveLength(before + 1);
+    state.listed = [];
+    const text = await journalsOf(attemptId, 46);
+    for (const secret of [launch.bearer, ...launch.tokens, ACCESS, SECRET]) expect(text).not.toContain(secret);
+  }, 120_000);
 
   it("withholds approval when the PR head moved after the accepted result", async () => {
     const before = state.dispatched.length;
