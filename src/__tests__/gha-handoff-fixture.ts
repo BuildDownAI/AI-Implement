@@ -47,7 +47,7 @@ export interface GhaHandoff {
   runEnv: Record<string, string>;
 }
 
-type HandoffInput = { snapshot?: ResolvedAgentSnapshotV1; grant?: ModelAuthGrantBootstrapV1; context?: unknown; callback?: boolean; policy?: unknown };
+type HandoffInput = { runConfig?: string; snapshot?: ResolvedAgentSnapshotV1; grant?: ModelAuthGrantBootstrapV1; context?: unknown; callback?: boolean; policy?: unknown };
 
 /** Wire form of the dispatch envelope, built directly so a deliberately invalid or missing context reaches the bootstrap, not the encoder. */
 export function ghaRunConfig(file: string, input: HandoffInput): string {
@@ -82,7 +82,7 @@ export function ghaRunStepEnv(
   const job = workflow.jobs.implement ?? workflow.jobs.plan;
   const mask = job.steps.find((s: { name: string }) => s.name === "Mask runner callback tokens");
   const run = job.steps.find((s: { name: string }) => s.name === "Run pipeline" || s.name === "Run planning");
-  const runConfig = ghaRunConfig(file, input);
+  const runConfig = input.runConfig ?? ghaRunConfig(file, input);
 
   const dir = mkdtempSync(join(tmpdir(), "gha-handoff-"));
   try {

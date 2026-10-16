@@ -3,7 +3,9 @@
  * boundary where those adapters become Restate services. */
 import { getMappings, resolveReviewFixLifecycle, type RepoMapping } from "../config.js";
 import { getDb } from "../dedup.js";
-import { isManagedProject } from "../managed-dispatch-auth.js";
+import { hasEphemeralFullAccessOptIn } from "../model-auth-contract.js";
+import type { ModelAuthRuntime } from "../model-auth-runtime.js";
+import { isManagedProject, prepareManagedDispatch, ghaManagedCredentials, settleLaunch } from "../managed-dispatch-auth.js";
 import { getInstallationId, getInstallationToken } from "../github-app-auth.js";
 import { getPullRequestState } from "../github.js";
 import { listReviewFixCycleSummaries } from "../review-fix-evidence.js";
@@ -38,10 +40,15 @@ export interface ReviewFixProductionConfig {
   runnerImageExplicit: boolean;
 }
 
+/** Mapping identity stays available to already-admitted legacy GHA attempts across runner-mode changes. */
+function mappedEntry(scope: ScopedPrIdentity): [string, RepoMapping] | null {
+  return Object.entries(getMappings()).find(([, candidate]) =>
+    `${candidate.owner}/${candidate.repo}` === scope.repository) ?? null;
+}
+
 /** The selected mapping with its `getMappings()` key, which opt-in lookup is keyed by. */
 function selectedEntry(scope: ScopedPrIdentity): [string, RepoMapping] | null {
-  const entry = Object.entries(getMappings()).find(([, candidate]) =>
-    `${candidate.owner}/${candidate.repo}` === scope.repository);
+  const entry = mappedEntry(scope);
   if (!entry) return null;
   const mapping = entry[1];
   return !mapping.paused && resolveReviewFixLifecycle(mapping) === "restate"
@@ -200,17 +207,44 @@ export function createProductionFinalizer(deps: {
   };
 }
 
-export function createProductionReviewFixServices(
+/** The real launch adapter, also used by composition tests without constructing SDK services. */
+export function createProductionReviewFixWorker(
   config: ReviewFixProductionConfig,
-  registry: ProviderRegistry,
-  store = new SqliteReviewFixAttemptStore(),
-  submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<boolean | void>,
-): RestateService[] {
+  store: SqliteReviewFixAttemptStore,
+  runtime?: ModelAuthRuntime,
+): GithubReviewFixWorker {
   const credentials = createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey);
-  const github = createReviewFixGithubAdapter({ credentials });
-  const worker = new GithubReviewFixWorker({ credentials, scopeStore: reviewFixAttemptStoreScopeStore(store),
+  return new GithubReviewFixWorker({ credentials, scopeStore: reviewFixAttemptStoreScopeStore(store),
     runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
     retryPolicy: getRetryPolicy,
+    requiresProtectedTransport: (plan) => {
+      const entry = mappedEntry(plan.scope);
+      return entry === null || isManagedProject(entry[0], plan.attemptId);
+    },
+    prepareManagedLaunch: async (plan, capabilities) => {
+      const entry = mappedEntry(plan.scope);
+      if (!entry) throw new Error("review-fix mapping unavailable");
+      const [projectKey, mapping] = entry;
+      if (!isManagedProject(projectKey, plan.attemptId)) return null;
+      if (!selectedEntry(plan.scope)) throw new Error("review-fix managed mapping unavailable");
+      if (capabilities.supportsStageAgentConfig !== true) throw new Error("review-fix managed workflow unavailable");
+      if (!runtime) throw new Error("review-fix model authentication unavailable");
+      if (hasEphemeralFullAccessOptIn(mapping.extraEnv) && capabilities.supportsExecutionPolicy !== true) {
+        throw new Error("review-fix execution policy transport unavailable");
+      }
+      const decision = await prepareManagedDispatch({ dispatchId: plan.attemptId, projectKey,
+        backend: "github-actions", owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile }, runtime);
+      if (decision.kind !== "launch") throw new Error("review-fix managed preparation unavailable");
+      try {
+        const managedCredentials = ghaManagedCredentials(decision, config.runnerCallbackBaseUrl, { extraEnv: mapping.extraEnv });
+        if (!managedCredentials) throw new Error("review-fix managed credentials unavailable");
+        return { snapshot: decision.snapshot, credentials: managedCredentials,
+          settle: (outcome) => { settleLaunch(decision, outcome, runtime); } };
+      } catch {
+        settleLaunch(decision, "rejected", runtime);
+        throw new Error("review-fix managed credentials unavailable");
+      }
+    },
     runnerImage: (target) => resolveRunnerImageForDispatch({ ...target,
       defaultImage: config.sessionImage, runnerImageExplicit: config.runnerImageExplicit }),
     callbackInputs: async (attemptId) => {
@@ -223,6 +257,18 @@ export function createProductionReviewFixServices(
       };
     },
   });
+}
+
+export function createProductionReviewFixServices(
+  config: ReviewFixProductionConfig,
+  registry: ProviderRegistry,
+  store = new SqliteReviewFixAttemptStore(),
+  submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<boolean | void>,
+  runtime?: ModelAuthRuntime,
+): RestateService[] {
+  const credentials = createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey);
+  const github = createReviewFixGithubAdapter({ credentials });
+  const worker = createProductionReviewFixWorker(config, store, runtime);
   const baseFinalizer = createReviewFixFinalizer({ attemptStore: store, github });
   const finalizer = createProductionFinalizer({ store, github, baseFinalizer, submitLateExternalReview });
   const pr = createReviewFixPR({
