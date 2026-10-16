@@ -402,6 +402,36 @@ describe("production managed GHA review-fix launch", () => {
     expect(count("model_credential_grants")).toBe(0);
   });
 
+  it("keeps the grant for an accepted 204 with no run id while the worker outcome stays unknown", async () => {
+    dispatchResult = { success: true, status: 204, outcome: "accepted" };
+    const { worker, plan } = await launch();
+    const result = await worker.launch(plan);
+    expect(result).toEqual({ status: "unknown" });
+    expect(sent).toHaveLength(1);
+    expect(revoked()).toBeNull();
+    const grant = (await decode()).credentials?.modelAuthGrant;
+    if (!grant || !("bearer" in grant)) throw new Error("expected plain GHA bootstrap");
+    const { createModelAuthRoutes } = await import("../model-auth-routes.js");
+    const routes = createModelAuthRoutes({ runtime, onFly: false, requestPlanRefresh: async () => {} });
+    server = http.createServer((req, res) => { void routes.handle(req, res); });
+    await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
+    const response = await nativeFetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/runner/model-auth/checkout`, {
+      method: "POST", headers: { authorization: `Bearer ${grant.bearer}`, "content-type": "application/json" },
+      body: JSON.stringify({ version: 1, profileId: "cdx" }),
+    });
+    expect(response.status).toBe(200);
+    for (const data of [plan, result, await attempts.getPreparedAttempt(prepared.attemptId)]) {
+      expect(JSON.stringify(data)).not.toContain(grant.bearer);
+    }
+  });
+
+  it("still revokes the grant when the dispatch outcome is genuinely ambiguous", async () => {
+    dispatchResult = { success: false, status: 500, outcome: "unknown" } as typeof dispatchResult;
+    const { worker, plan } = await launch();
+    expect(await worker.launch(plan)).toEqual({ status: "unknown" });
+    expect(revoked()).not.toBeNull();
+  });
+
   it("never journals a GitHub rejection body that echoes the protected envelope", async () => {
     dispatchResult = { success: false, status: 422, outcome: "rejected", error: "SYNTHETIC-echoed-private-request" };
     const { worker, plan } = await launch();

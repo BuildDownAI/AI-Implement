@@ -551,8 +551,8 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
 
     let inputs: DispatchInputs;
     let managed: ManagedReviewFixLaunch | null = null;
-    const finish = (outcome: WorkerLaunchOutcome): WorkerLaunchOutcome => {
-      managed?.settle(outcome.status);
+    const finish = (outcome: WorkerLaunchOutcome, settlement: "accepted" | "rejected" | "unknown" = outcome.status): WorkerLaunchOutcome => {
+      managed?.settle(settlement);
       return outcome;
     };
     const retryPolicy = this.retryPolicy?.() ?? null;
@@ -638,8 +638,10 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
       return finish({ status: "accepted", execution });
     }
     // A 204/"accepted" response with no resolvable run id cannot be bound to an execution
-    // yet — the caller must reconcile rather than trust an unverified identity.
-    return finish({ status: "unknown" });
+    // yet — the caller must reconcile rather than trust an unverified identity. GitHub did
+    // positively accept the launch, so the managed grant is kept for the run that is starting;
+    // only the public outcome stays unknown.
+    return finish({ status: "unknown" }, result.outcome === "accepted" ? "accepted" : "unknown");
   }
 
   async reconcile(attemptId: AttemptId, scope: ScopedPrIdentity): Promise<WorkerLookupOutcome> {
