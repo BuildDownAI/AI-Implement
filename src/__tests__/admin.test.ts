@@ -883,6 +883,14 @@ describe("admin mappings", () => {
       expect(res.statusCode).toBe(400);
       expect(JSON.parse(res.body).error).toContain("github-actions");
     });
+
+    it("rejects a mode change to Fly that omits extraEnv while the opt-in is stored", async () => {
+      expect((await create({ [OPT_IN]: "ephemeral-runner-asserted-v1" })).statusCode).toBe(202);
+      const token = await login("secret");
+      const res = await request("/api/mappings", "POST", "secret", { teamKey: "EPH", owner: "org", repo: "eph", executionMode: "fly-machines" }, token);
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toContain("github-actions");
+    });
   });
 
   it("defaults provider to anthropic and awsRegion to null when omitted", async () => {

@@ -11,7 +11,8 @@ import {
 } from "./dispatch-admission.js";
 import { claimPendingCommentGapfills, markCommentGapfillProcessed } from "./comment-gapfill-queue.js";
 import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getInFlightJobs, appendLog, countPriorDispatches, updateJobPrUrl, suppressStaleNotifications, type Job } from "./log.js";
-import { resolveExecutionPath, getFlySecretsMinVersion, getFlyProcessLevelSecrets, type RunnerMode } from "./runner-mode.js";
+import { hasEphemeralFullAccessOptIn } from "./model-auth-contract.js";
+import { checkForcedPathEligibility, resolveExecutionPath, getFlySecretsMinVersion, getFlyProcessLevelSecrets, type RunnerMode } from "./runner-mode.js";
 import { mintLaunchTokens, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, capRunnerEnv, branchPrefixRunnerEnv, skillsRepoRunnerEnv, getPullRequestState, type DispatchResult } from "./github.js";
 import { buildRunConfig, encodeRunConfig, type RunConfigV1, type RunCredentialsV1 } from "./run-config.js";
@@ -354,6 +355,13 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
       }
 
       const execPath = resolveExecutionPath(opts.runnerMode, mapping.executionMode);
+
+      // AII-1437: an ephemeral full-access opt-in cannot run off GHA; defer rather than throw at launch.
+      const pathEligibility = checkForcedPathEligibility(opts.runnerMode, mapping, true);
+      if (!pathEligibility.eligible && hasEphemeralFullAccessOptIn(mapping.extraEnv)) {
+        console.log(`[comment-gapfill] Deferring item #${item.id} for PR #${item.prNumber}: ${pathEligibility.reason}`);
+        continue;
+      }
 
       let runnerCallbackUrl = "";
       let runToken = "";

@@ -458,6 +458,18 @@ describe("runner-mode", () => {
       expect(r.reason).toMatch(/FLY_SESSIONS_APP/);
     });
 
+    it("ephemeral full-access opt-in is ineligible on fly, local, shadow and fly-machines mappings, eligible on gha", () => {
+      const optIn = { ...ghaMapping, extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "ephemeral-runner-asserted-v1" } };
+      for (const mode of ["fly", "local", "shadow"] as const) {
+        const r = runnerMode.checkForcedPathEligibility(mode, optIn, true);
+        expect(r.eligible).toBe(false);
+        expect(r.reason).toMatch(/GitHub Actions/);
+      }
+      expect(runnerMode.checkForcedPathEligibility("default", { ...optIn, executionMode: "fly-machines" }, true).eligible).toBe(false);
+      expect(runnerMode.checkForcedPathEligibility("default", optIn, true).eligible).toBe(true);
+      expect(runnerMode.checkForcedPathEligibility("gha", optIn, true).eligible).toBe(true);
+    });
+
     it("forced fly + fly-capable mapping → eligible", () => {
       const r = runnerMode.checkForcedPathEligibility("fly", ghaMapping, true);
       expect(r).toEqual({ eligible: true, reason: null });
