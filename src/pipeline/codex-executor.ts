@@ -114,8 +114,8 @@ function validateSelectedOpenAIBaseUrl(raw: string | undefined): string | undefi
  */
 export class CodexPlanningPolicyUnprovenError extends Error {
   readonly code = "CODEX_PLANNING_POLICY_UNPROVEN";
-  constructor() {
-    super("Codex planning is refused: its restricted-write, no-command policy is not enforceable on the pinned CLI");
+  constructor(stage: "planning" | "review" = "planning") {
+    super(`Codex ${stage} is refused: its restricted, no-command policy is not enforceable on the pinned CLI`);
     this.name = "CodexPlanningPolicyUnprovenError";
   }
 }
@@ -144,7 +144,7 @@ export interface CodexExecutorOptions {
    */
   protocolDriver?: CodexProtocolDriver;
   /**
-   * Absolute path of the installed, operator-selected project skills (planning only). When set and present,
+   * Absolute path of the installed, operator-selected project skills (planning and review). When set and present,
    * a read-only copy lands in the app-server view's HOME. Must not resolve inside the workspace, the selected
    * CODEX_HOME or a forbidden root.
    */
@@ -381,7 +381,15 @@ export class CodexExecutor implements LLMExecutor {
 
   async invoke(params: InvokeParams): Promise<LLMResult> {
     if (this.held) throw new CodexRecoveryRequiredError("held");
-    if (params.agentStage === "planning" && !this.options.protocolDriver) throw new CodexPlanningPolicyUnprovenError();
+    // Planning and review each require the app-server driver of their own policy; neither may fall back to exec.
+    // A policy-less driver is accepted for planning only (pre-existing injected drivers); review demands its own.
+    const driverPolicy = this.options.protocolDriver?.policy;
+    if (
+      (params.agentStage === "planning" && (!this.options.protocolDriver || (driverPolicy !== undefined && driverPolicy !== "planning"))) ||
+      (params.agentStage === "review" && driverPolicy !== "review")
+    ) {
+      throw new CodexPlanningPolicyUnprovenError(params.agentStage);
+    }
     if (this.usesFullAccess(params)) {
       // Before any auth checkout or spawn: a root user or a reachable host Docker socket voids the outer boundary.
       const report = (this.options.fullAccessAdmission ?? checkFullAccessAdmission)();

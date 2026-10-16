@@ -326,9 +326,12 @@ describe("pinned configuration and sandbox", () => {
     };
     const impl = await argsFor({ agentStage: "implementation", ...READ_ONLY_TOOL_PARAMS });
     expect(impl[impl.indexOf("--sandbox") + 1]).toBe("workspace-write");
-    const review = await argsFor({ agentStage: "review" });
-    expect(review[review.indexOf("--sandbox") + 1]).toBe("read-only");
-    expect(new Set([impl.join(), review.join()]).size).toBe(2);
+    const none = await argsFor({});
+    expect(none[none.indexOf("--sandbox") + 1]).toBe("workspace-write");
+    // Review never falls back to `exec`: it needs its own restricted driver (AII-1438).
+    const { executor, log } = make([{ stdout: message("ok") }]);
+    await expect(executor.invoke({ ...base, agentStage: "review" })).rejects.toMatchObject({ code: "CODEX_PLANNING_POLICY_UNPROVEN" });
+    expect(log).toHaveLength(0);
   });
 
   it("refuses planning before any auth checkout or spawn rather than shipping an unproven policy", async () => {
@@ -1527,7 +1530,7 @@ describe("ChatGPT plan token expiry resume", () => {
   });
 
   it("derives the resume sandbox from the stage policy", async () => {
-    for (const [agentStage, mode] of [["review", "read-only"], ["implementation", "workspace-write"]] as const) {
+    for (const [agentStage, mode] of [["implementation", "workspace-write"]] as const) {
       const { executor, log } = makePlan([{ stdout: expired(), exitCode: 1 }, { stdout: message("ok") }]);
       await executor.invoke({ ...base, agentStage });
       expect(log[1].args).toContain(`sandbox_mode="${mode}"`);
@@ -1635,10 +1638,16 @@ describe("ephemeral full access (AII-1437)", () => {
     fullAccessAdmission: () => admitted,
     ...extra,
   });
+  const okDriver = (): CodexTransportResult => ({
+    result: { stdout: "review", stderr: "", exitCode: 0, tokensUsed: 0, terminalStatus: { subtype: "success", isError: false }, signal: null },
+    sawUnsafe: false,
+    stopReason: null,
+  });
+  const reviewDriver = (): CodexProtocolDriver => ({ policy: "review", run: async () => okDriver() });
   const hasBypass = (args: string[]): boolean => args.some((a) => a === FLAG || /danger|bypass|full-access|approval/i.test(a) && a !== 'approval_policy="never"');
 
   it("default: no policy keeps the existing sandbox argv for every stage", async () => {
-    for (const [agentStage, mode] of [["review", "read-only"], ["implementation", "workspace-write"], [undefined, "workspace-write"]] as const) {
+    for (const [agentStage, mode] of [["implementation", "workspace-write"], [undefined, "workspace-write"]] as const) {
       const { executor, log } = make([{ stdout: message("ok") }]);
       await executor.invoke({ ...base, ...(agentStage ? { agentStage } : {}) });
       expect(log[0].args).toEqual(expect.arrayContaining(["--sandbox", mode]));
@@ -1652,9 +1661,10 @@ describe("ephemeral full access (AII-1437)", () => {
     expect(impl.log[0].args).toContain(FLAG);
     expect(impl.log[0].args).not.toContain("--sandbox");
 
-    const review = make([{ stdout: message("ok") }], full());
+    const review = make([{ stdout: message("ok") }], full({ protocolDriver: reviewDriver() }));
     await review.executor.invoke({ ...base, agentStage: "review" });
-    expect(review.log[0].args).toEqual(expect.arrayContaining(["--sandbox", "read-only"]));
+    expect(review.log[0].args[0]).toBe("app-server");
+    expect(review.log[0].args).toContain('sandbox_mode="read-only"');
     expect(hasBypass(review.log[0].args)).toBe(false);
 
     const none = make([{ stdout: message("ok") }], full());
@@ -1701,9 +1711,22 @@ describe("ephemeral full access (AII-1437)", () => {
     }
   });
 
+  it("review requires its own restricted driver: none, or a planning driver, is refused before auth or spawn", async () => {
+    for (const protocolDriver of [undefined, { ...reviewDriver(), policy: "planning" as const }]) {
+      const { executor, log, auth } = make([{ stdout: message("ok") }], full(protocolDriver ? { protocolDriver } : {}));
+      await expect(executor.invoke({ ...base, agentStage: "review" })).rejects.toMatchObject({ code: "CODEX_PLANNING_POLICY_UNPROVEN" });
+      expect(log).toHaveLength(0);
+      expect(auth.events).toEqual([]);
+    }
+    // A review driver is not valid for planning either.
+    const { executor, log } = make([{ stdout: message("ok") }], full({ protocolDriver: reviewDriver() }));
+    await expect(executor.invoke({ ...base, agentStage: "planning" })).rejects.toMatchObject({ code: "CODEX_PLANNING_POLICY_UNPROVEN" });
+    expect(log).toHaveLength(0);
+  });
+
   it("admission is not consulted for review, so review is unaffected by a failing probe", async () => {
     const probe = vi.fn(() => ({ nonRoot: false, socketPresent: false, socketReadable: false, socketWritable: false, admitted: false }));
-    const { executor, log } = make([{ stdout: message("ok") }], full({ fullAccessAdmission: probe }));
+    const { executor, log } = make([{ stdout: message("ok") }], full({ fullAccessAdmission: probe, protocolDriver: reviewDriver() }));
     await executor.invoke({ ...base, agentStage: "review" });
     expect(probe).not.toHaveBeenCalled();
     expect(log).toHaveLength(1);
@@ -1738,12 +1761,26 @@ describe("ephemeral full access (AII-1437)", () => {
       expect(log[1].args.some((a) => a.startsWith("sandbox_mode="))).toBe(false);
     });
 
-    it("a review resume stays read-only even with the policy present", async () => {
-      const { executor, log } = plan([{ stdout: expired, exitCode: 1 }, { stdout: message("ok") }], full());
-      await executor.invoke({ ...base, agentStage: "review" });
-      expect(log[1].args.slice(0, 2)).toEqual(["exec", "resume"]);
-      expect(log[1].args).toContain('sandbox_mode="read-only"');
-      expect(hasBypass(log[1].args)).toBe(false);
+    it("a review resume stays on the restricted app-server even with the policy present", async () => {
+      const inputs: CodexTransportRunInput[] = [];
+      const protocolDriver: CodexProtocolDriver = {
+        policy: "review",
+        async run(input) {
+          inputs.push(input);
+          const first = inputs.length === 1;
+          const t = okDriver();
+          return first ? { ...t, threadId: "t-rev", tokenExpired: true, result: { ...t.result, exitCode: 1, terminalStatus: { subtype: "error", isError: true }, stderr: "codex app-server transport: turn_failed" } } : t;
+        },
+      };
+      const { executor, log } = plan([{ hang: true, dieOn: ["SIGTERM"] }, { hang: true, dieOn: ["SIGTERM"] }], full({ protocolDriver }));
+      await executor.invoke({ ...base, agentStage: "review", invocationTimeoutMs: 60_000 });
+      expect(log).toHaveLength(2);
+      for (const spawned of log) {
+        expect(spawned.args[0]).toBe("app-server");
+        expect(spawned.args).toContain('sandbox_mode="read-only"');
+        expect(hasBypass(spawned.args)).toBe(false);
+      }
+      expect(inputs[1].resumeThreadId).toBe("t-rev");
     });
 
     it("a transient retry repeats the identical argv: no widening, no narrowing", async () => {

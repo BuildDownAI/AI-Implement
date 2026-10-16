@@ -293,6 +293,8 @@ describe("Codex-selected planning and review with the policy present", () => {
     const { transport, checkouts } = codexLoopback(profiles);
     const log: Child[] = [];
     const driverInputs: unknown[] = [];
+    const currentPolicy: { value: "planning" | "review" } = { value: "planning" };
+    let expireReviewOnce = false;
     const run = await prepareConfiguredRun({
       env: { ...process.env, ...handoff.runEnv },
       workspaceDir: workspace,
@@ -308,10 +310,24 @@ describe("Codex-selected planning and review with the policy present", () => {
           fullAccessAdmission: admitted,
           trustedSkillsDir: join(workspace, "skills"),
           protocolDriver: {
+            // The driver's policy follows the stage under test; the real selector only honours a matching policy.
+            get policy() {
+              return currentPolicy.value;
+            },
             async run(input: { workspaceDir: string }) {
               driverInputs.push(input);
+              if (currentPolicy.value === "review" && expireReviewOnce) {
+                expireReviewOnce = false;
+                return {
+                  result: { stdout: "", stderr: "codex app-server transport: turn_failed", exitCode: 1, tokensUsed: 0, terminalStatus: { subtype: "error", isError: true }, signal: null },
+                  sawUnsafe: false,
+                  stopReason: null,
+                  threadId: "t-review",
+                  tokenExpired: true,
+                };
+              }
               return {
-                result: { stdout: "done", stderr: "", exitCode: 0, tokensUsed: 1, terminalStatus: { subtype: "success", isError: false }, signal: null },
+                result: { stdout: "done", stderr: "", exitCode: 0, tokensUsed: 1, ...(currentPolicy.value === "review" ? { structuredOutput: { approved: true, issues: [] } } : {}), terminalStatus: { subtype: "success", isError: false }, signal: null },
                 sawUnsafe: false,
                 stopReason: null,
                 threadId: "t1",
@@ -322,9 +338,11 @@ describe("Codex-selected planning and review with the policy present", () => {
       },
     });
     const executor = run!.createExecutor({ workspaceDir: workspace, logLevel: "summary" });
-    const invoke = (agentStage: InvokeParams["agentStage"], extra: Partial<InvokeParams> = {}) =>
-      executor.invoke({ prompt: "p", model: "ignored", stage: String(agentStage), agentStage, ...extra });
-    return { invoke, log, checkouts, driverInputs };
+    const invoke = (agentStage: InvokeParams["agentStage"], extra: Partial<InvokeParams> = {}) => {
+      if (agentStage === "planning" || agentStage === "review") currentPolicy.value = agentStage;
+      return executor.invoke({ prompt: "p", model: "ignored", stage: String(agentStage), agentStage, ...extra });
+    };
+    return { invoke, log, checkouts, driverInputs, expireReviewOnce: () => (expireReviewOnce = true) };
   }
 
   const BYPASS_TOKENS = [FLAG, "danger-full-access", "--dangerously"];
@@ -332,9 +350,12 @@ describe("Codex-selected planning and review with the policy present", () => {
 
   for (const shared of [false, true]) {
     it(`planning uses the read-only app-server argv and review stays read-only (${shared ? "shared" : "separate"} profile)`, async () => {
-      const { invoke, log, checkouts } = await composeCodex(shared, [planningSpawn, { stdout: ok, exitCode: 0 }, { stdout: ok, exitCode: 0 }, { stdout: ok, exitCode: 0 }]);
+      const { invoke, log, checkouts } = await composeCodex(shared, [planningSpawn, planningSpawn, { stdout: ok, exitCode: 0 }]);
       await invoke("planning");
-      await invoke("review");
+      const reviewed = await invoke("review");
+      // The exact structured verdict the review steps consume survives the real composition.
+      expect(reviewed.structuredOutput).toEqual({ approved: true, issues: [] });
+      expect(reviewed.attribution).toMatchObject({ agent: "codex", model: "gpt-review" });
       await invoke("implementation");
       expect(log).toHaveLength(3);
       const [plan, review, impl] = log;
@@ -342,8 +363,10 @@ describe("Codex-selected planning and review with the policy present", () => {
       expect(plan.args).toEqual(expect.arrayContaining(['sandbox_mode="read-only"', 'approval_policy="never"', "features.shell_tool=false", "features.unified_exec=false"]));
       expect(plan.args).toContain('model="gpt-planning"');
       for (const t of BYPASS_TOKENS) expect(plan.args.join(" ")).not.toContain(t);
-      expect(review.args.slice(0, 1)).toEqual(["exec"]);
-      expect(review.args).toEqual(expect.arrayContaining(["--sandbox", "read-only", "gpt-review"]));
+      // Review is on the restricted native transport too (AII-1438): never `exec`, never a bypass.
+      expect(review.args[0]).toBe("app-server");
+      expect(review.args).toEqual(expect.arrayContaining(['sandbox_mode="read-only"', 'approval_policy="never"', "features.shell_tool=false", "features.unified_exec=false", 'model="gpt-review"']));
+      expect(review.args).not.toContain("--sandbox");
       for (const t of BYPASS_TOKENS) expect(review.args.join(" ")).not.toContain(t);
       expect(impl.args).toContain(FLAG);
       expect(impl.args).not.toContain("--sandbox");
@@ -354,17 +377,22 @@ describe("Codex-selected planning and review with the policy present", () => {
     });
   }
 
-  it("a review resume after token expiry keeps read-only, no bypass, while implementation resume keeps the bypass", async () => {
-    const { invoke, log } = await composeCodex(false, [
-      { stdout: expired, exitCode: 1 }, { stdout: ok, exitCode: 0 },
+  it("a review resume after token expiry stays on the restricted app-server, no bypass, while implementation resume keeps the bypass", async () => {
+    const { invoke, log, driverInputs, expireReviewOnce } = await composeCodex(false, [
+      planningSpawn, planningSpawn,
       { stdout: expired, exitCode: 1 }, { stdout: ok, exitCode: 0 },
     ], "codex-subscription");
+    expireReviewOnce();
     await invoke("review");
     await invoke("implementation");
     expect(log).toHaveLength(4);
-    expect(log[1].args.slice(0, 2)).toEqual(["exec", "resume"]);
-    expect(log[1].args).toContain('sandbox_mode="read-only"');
-    for (const t of BYPASS_TOKENS) expect(log[0].args.join(" ") + log[1].args.join(" ")).not.toContain(t);
+    for (const c of [log[0], log[1]]) {
+      expect(c.args[0]).toBe("app-server");
+      expect(c.args).toContain('sandbox_mode="read-only"');
+      for (const t of BYPASS_TOKENS) expect(c.args.join(" ")).not.toContain(t);
+    }
+    // The second review attempt resumes the saved thread through the same driver, not through `exec resume`.
+    expect((driverInputs[1] as { resumeThreadId?: string }).resumeThreadId).toBe("t-review");
     expect(log[2].args).toContain(FLAG);
     expect(log[3].args.slice(0, 2)).toEqual(["exec", "resume"]);
     expect(log[3].args).toContain(FLAG);
