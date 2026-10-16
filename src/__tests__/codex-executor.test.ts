@@ -1626,3 +1626,138 @@ describe("ChatGPT plan token expiry resume", () => {
     });
   });
 });
+
+describe("ephemeral full access (AII-1437)", () => {
+  const FLAG = "--dangerously-bypass-approvals-and-sandbox";
+  const admitted = { nonRoot: true, socketPresent: true, socketReadable: false, socketWritable: false, admitted: true };
+  const full = (extra: Partial<CodexExecutorOptions> = {}): Partial<CodexExecutorOptions> => ({
+    implementationFullAccess: true,
+    fullAccessAdmission: () => admitted,
+    ...extra,
+  });
+  const hasBypass = (args: string[]): boolean => args.some((a) => a === FLAG || /danger|bypass|full-access|approval/i.test(a) && a !== 'approval_policy="never"');
+
+  it("default: no policy keeps the existing sandbox argv for every stage", async () => {
+    for (const [agentStage, mode] of [["review", "read-only"], ["implementation", "workspace-write"], [undefined, "workspace-write"]] as const) {
+      const { executor, log } = make([{ stdout: message("ok") }]);
+      await executor.invoke({ ...base, ...(agentStage ? { agentStage } : {}) });
+      expect(log[0].args).toEqual(expect.arrayContaining(["--sandbox", mode]));
+      expect(hasBypass(log[0].args)).toBe(false);
+    }
+  });
+
+  it("with the policy only implementation changes; review and an absent stage keep their sandbox", async () => {
+    const impl = make([{ stdout: message("ok") }], full());
+    await impl.executor.invoke({ ...base, agentStage: "implementation" });
+    expect(impl.log[0].args).toContain(FLAG);
+    expect(impl.log[0].args).not.toContain("--sandbox");
+
+    const review = make([{ stdout: message("ok") }], full());
+    await review.executor.invoke({ ...base, agentStage: "review" });
+    expect(review.log[0].args).toEqual(expect.arrayContaining(["--sandbox", "read-only"]));
+    expect(hasBypass(review.log[0].args)).toBe(false);
+
+    const none = make([{ stdout: message("ok") }], full());
+    await none.executor.invoke({ ...base });
+    expect(none.log[0].args).toEqual(expect.arrayContaining(["--sandbox", "workspace-write"]));
+    expect(hasBypass(none.log[0].args)).toBe(false);
+  });
+
+  it("planning never receives the policy: the app-server argv has no bypass flag and stays read-only", async () => {
+    const calls: CodexTransportRunInput[] = [];
+    const driver: CodexProtocolDriver = {
+      async run(input) {
+        calls.push(input);
+        return {
+          result: { stdout: "plan", stderr: "", exitCode: 0, tokensUsed: 0, terminalStatus: { subtype: "success", isError: false }, signal: null },
+          sawUnsafe: false,
+          stopReason: null,
+          threadId: "t1",
+        };
+      },
+    };
+    const { executor, log } = make([{ stdout: message("ok") }], full({ protocolDriver: driver }));
+    await executor.invoke({ ...base, agentStage: "planning" });
+    // The planning argv is built for the app-server child and must never carry the exec bypass flag.
+    expect(log).toHaveLength(1);
+    for (const spawned of log) {
+      expect(spawned.args[0]).toBe("app-server");
+      expect(hasBypass(spawned.args)).toBe(false);
+      expect(spawned.args).toContain('sandbox_mode="read-only"');
+    }
+  });
+
+  it("refuses root or a reachable Docker socket before any auth checkout or spawn", async () => {
+    const reports = [
+      { nonRoot: false, socketPresent: false, socketReadable: false, socketWritable: false, admitted: false },
+      { nonRoot: true, socketPresent: true, socketReadable: true, socketWritable: false, admitted: false },
+      { nonRoot: true, socketPresent: true, socketReadable: false, socketWritable: true, admitted: false },
+    ];
+    for (const report of reports) {
+      const { executor, log, auth } = make([{ stdout: message("ok") }], full({ fullAccessAdmission: () => report }));
+      await expect(executor.invoke({ ...base, agentStage: "implementation" })).rejects.toMatchObject({ code: "CODEX_FULL_ACCESS_REFUSED" });
+      expect(log).toHaveLength(0);
+      expect(auth.events).toEqual([]);
+    }
+  });
+
+  it("admission is not consulted for review, so review is unaffected by a failing probe", async () => {
+    const probe = vi.fn(() => ({ nonRoot: false, socketPresent: false, socketReadable: false, socketWritable: false, admitted: false }));
+    const { executor, log } = make([{ stdout: message("ok") }], full({ fullAccessAdmission: probe }));
+    await executor.invoke({ ...base, agentStage: "review" });
+    expect(probe).not.toHaveBeenCalled();
+    expect(log).toHaveLength(1);
+  });
+
+  describe("resume and retry", () => {
+    const expired = [
+      ev({ type: "thread.started", thread_id: "t1" }),
+      ev({ type: "turn.started" }),
+      ev({ type: "error", message: "unexpected status 401 Unauthorized: token expired" }),
+    ];
+    const plan = (scripts: Script[], extra: Partial<CodexExecutorOptions>) => {
+      const log: Spawned[] = [];
+      let n = 0;
+      const auth: Pick<ModelAuthClient, "invoke"> = {
+        invoke: async (_id, cb) =>
+          cb({ env: { PATH: "/usr/bin", CHATGPT_PLAN_ACCESS_TOKEN: `plan-token-${++n}-synthetic` }, strippedKeys: [], codexProvider: "chatgpt-plan" as const }),
+      };
+      const executor = new CodexExecutor(workspace, {
+        auth, profileId: "p1", allowRepositoryWrites: true, spawnImpl: makeSpawn(scripts, log), sleepImpl: async () => {}, termWaitMs: 30, killWaitMs: 30, ...extra,
+      });
+      return { executor, log };
+    };
+
+    it("a token-expiry resume carries the same authority as the fresh exec", async () => {
+      const { executor, log } = plan([{ stdout: expired, exitCode: 1 }, { stdout: message("ok") }], full());
+      await executor.invoke({ ...base, agentStage: "implementation" });
+      expect(log).toHaveLength(2);
+      expect(log[0].args).toContain(FLAG);
+      expect(log[1].args.slice(0, 2)).toEqual(["exec", "resume"]);
+      expect(log[1].args).toContain(FLAG);
+      expect(log[1].args.some((a) => a.startsWith("sandbox_mode="))).toBe(false);
+    });
+
+    it("a review resume stays read-only even with the policy present", async () => {
+      const { executor, log } = plan([{ stdout: expired, exitCode: 1 }, { stdout: message("ok") }], full());
+      await executor.invoke({ ...base, agentStage: "review" });
+      expect(log[1].args.slice(0, 2)).toEqual(["exec", "resume"]);
+      expect(log[1].args).toContain('sandbox_mode="read-only"');
+      expect(hasBypass(log[1].args)).toBe(false);
+    });
+
+    it("a transient retry repeats the identical argv: no widening, no narrowing", async () => {
+      const { executor, log } = make([{ exitCode: 1, stderr: "503 service unavailable" }, { stdout: message("ok") }], full());
+      await executor.invoke({ ...base, agentStage: "implementation", ...retry });
+      expect(log).toHaveLength(2);
+      expect(log[1].args).toEqual(log[0].args);
+    });
+
+    it("a rejected full-access flag surfaces CODEX_CONFIG_REJECTED and is not retried or widened", async () => {
+      const { executor, log } = make([{ exitCode: 2, stderr: "error: unexpected argument '--dangerously-bypass-approvals-and-sandbox' found" }, { stdout: message("ok") }], full());
+      const out = await executor.invoke({ ...base, agentStage: "implementation", ...retry });
+      expect(out.failure?.code).toBe("CODEX_CONFIG_REJECTED");
+      expect(log).toHaveLength(1);
+    });
+  });
+});

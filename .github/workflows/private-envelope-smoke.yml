@@ -48,6 +48,7 @@ jobs:
           AI_IMPLEMENT_MODEL_AUTH_PROJECT_KEY: ${{ steps.bootstrap.outputs.run_model_auth_project_key }}
           AI_IMPLEMENT_MODEL_AUTH_BACKEND: ${{ steps.bootstrap.outputs.run_model_auth_backend }}
           AI_IMPLEMENT_MODEL_AUTH_URL: ${{ steps.bootstrap.outputs.run_model_auth_url }}
+          AI_IMPLEMENT_EXECUTION_POLICY: ${{ steps.bootstrap.outputs.run_execution_policy }}
           RUN_PUBLICATION_TOKEN: ${{ steps.bootstrap.outputs.run_publication_token }}
         run: node scripts/check-private-envelope-gha-logs.mjs consume implement
       - name: Untrusted intermediate step
@@ -121,6 +122,7 @@ jobs:
           AI_IMPLEMENT_MODEL_AUTH_PROJECT_KEY: ${{ steps.bootstrap.outputs.run_model_auth_project_key }}
           AI_IMPLEMENT_MODEL_AUTH_BACKEND: ${{ steps.bootstrap.outputs.run_model_auth_backend }}
           AI_IMPLEMENT_MODEL_AUTH_URL: ${{ steps.bootstrap.outputs.run_model_auth_url }}
+          AI_IMPLEMENT_EXECUTION_POLICY: ${{ steps.bootstrap.outputs.run_execution_policy }}
           RUN_PUBLICATION_TOKEN: ${{ steps.bootstrap.outputs.run_publication_token }}
         run: node scripts/check-private-envelope-gha-logs.mjs consume failure
       - name: Untrusted intermediate step
@@ -136,6 +138,7 @@ jobs:
           AI_IMPLEMENT_MODEL_AUTH_PROJECT_KEY: ${{ steps.bootstrap.outputs.run_model_auth_project_key }}
           AI_IMPLEMENT_MODEL_AUTH_BACKEND: ${{ steps.bootstrap.outputs.run_model_auth_backend }}
           AI_IMPLEMENT_MODEL_AUTH_URL: ${{ steps.bootstrap.outputs.run_model_auth_url }}
+          AI_IMPLEMENT_EXECUTION_POLICY: ${{ steps.bootstrap.outputs.run_execution_policy }}
           RUN_PUBLICATION_TOKEN: ${{ steps.bootstrap.outputs.run_publication_token }}
         run: node scripts/check-private-envelope-gha-logs.mjs fail failure
       - name: Boundary marker

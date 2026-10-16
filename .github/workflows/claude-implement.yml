@@ -2,6 +2,7 @@
 # ai-implement-capability: private-run-config-v1
 # ai-implement-capability: stage-agent-config-v1
 # ai-implement-capability: stage-agent-launch-context-v1
+# ai-implement-capability: ephemeral-execution-policy-v1
 # All pipeline logic lives in the runner image (ghcr.io/builddownai/ai-implement-runner).
 # Do not edit in target repos.
 #
@@ -217,6 +218,10 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+      # Docker's built-in init reaps orphaned grandchildren; without it a native
+      # Codex run leaves a zombie and the process-group stop check correctly
+      # demands recovery (AII-1437). Adds no privilege or capability.
+      options: --init
     steps:
       # Read the event file without exposing token-valued env/script metadata: GitHub
       # prints those headers before executing the first add-mask command (AII-676).
@@ -289,13 +294,23 @@ jobs:
                           and ($m.host | if test("\\A[0-9.]+\\z")
                                          then (split(".") | length == 4 and all(.[]; test("\\A[0-9]{1,3}\\z") and tonumber <= 255))
                                          else true end)));
+            def policy:
+              isobj and only(["version", "implementationSandbox", "dispatchId", "projectKey", "backend", "ephemeralRunnerAsserted"])
+              and .version == 1 and .implementationSandbox == "ephemeral-full-access"
+              and (.dispatchId | idstr) and (.projectKey | idstr) and .backend == "gha"
+              and .ephemeralRunnerAsserted == true;
             def creds:
-              isobj and only(["version", "resultToken", "progressToken", "publicationToken", "attemptToken", "modelAuthGrant", "modelAuthContext"])
+              isobj and only(["version", "resultToken", "progressToken", "publicationToken", "attemptToken", "modelAuthGrant", "modelAuthContext", "executionPolicy"])
               and .version == 1
               and (. as $c | all("resultToken", "progressToken", "publicationToken", "attemptToken";
                      . as $f | ($c | has($f) | not) or ($c[$f] | token)))
               and (if has("modelAuthGrant") then (.modelAuthGrant | grant) and has("modelAuthContext") else true end)
-              and (if has("modelAuthContext") then (.modelAuthContext | ctx) else true end);
+              and (if has("modelAuthContext") then (.modelAuthContext | ctx) else true end)
+              and (if has("executionPolicy")
+                   then (.executionPolicy | policy) and has("modelAuthContext")
+                        and .executionPolicy.dispatchId == .modelAuthContext.dispatchId
+                        and .executionPolicy.projectKey == .modelAuthContext.projectKey
+                   else true end);
             def snapstr: type == "string" and test("\\S") and length <= 256;
             def revref: isobj and only(["configRevisionId", "revision"]) and (.configRevisionId | snapstr) and (.revision | posint);
             def sel:
@@ -348,7 +363,10 @@ jobs:
               ("RUN_MODEL_AUTH_DISPATCH_ID=" + ($c.modelAuthContext.dispatchId // "")),
               ("RUN_MODEL_AUTH_PROJECT_KEY=" + ($c.modelAuthContext.projectKey // "")),
               ("RUN_MODEL_AUTH_BACKEND=" + ($c.modelAuthContext.backend // "")),
-              ("RUN_MODEL_AUTH_URL=" + ($c.modelAuthContext.modelAuthUrl // ""))
+              ("RUN_MODEL_AUTH_URL=" + ($c.modelAuthContext.modelAuthUrl // "")),
+              ("RUN_EXECUTION_POLICY=" + (if $c.executionPolicy
+                 then "v1:ephemeral-full-access:gha:" + $c.executionPolicy.dispatchId + ":" + $c.executionPolicy.projectKey
+                 else "" end))
           ' "$GITHUB_EVENT_PATH" 2>/dev/null)" || {
             echo "::error::Private run_config bootstrap failed" >&2
             exit 1
@@ -571,6 +589,9 @@ jobs:
           AI_IMPLEMENT_MODEL_AUTH_PROJECT_KEY: ${{ steps.bootstrap.outputs.run_model_auth_project_key }}
           AI_IMPLEMENT_MODEL_AUTH_BACKEND: ${{ steps.bootstrap.outputs.run_model_auth_backend }}
           AI_IMPLEMENT_MODEL_AUTH_URL: ${{ steps.bootstrap.outputs.run_model_auth_url }}
+          # Operator-approved ephemeral full-access policy (AII-1437): validated bootstrap output only, empty unless the
+          # dispatcher projected it. The runner re-checks it against the model-auth dispatch id and project key.
+          AI_IMPLEMENT_EXECUTION_POLICY: ${{ steps.bootstrap.outputs.run_execution_policy }}
           RUN_PUBLICATION_TOKEN: ${{ steps.bootstrap.outputs.run_publication_token }}
           AI_IMPLEMENT_NPM_REGISTRY: ${{ vars.AI_IMPLEMENT_NPM_REGISTRY }}
           AI_IMPLEMENT_NPM_SCOPE: ${{ vars.AI_IMPLEMENT_NPM_SCOPE }}

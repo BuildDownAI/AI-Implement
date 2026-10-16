@@ -91,15 +91,11 @@ export function buildFixture(ctx) {
         projectKey: "proj-smoke", backend: "gha", expiresAt: 1_800_000_000_000, bearer: `synth-bearer-${v("bearer")}`,
         bindings: [{ stage: ctx.kind === "plan" ? "planning" : "implementation", profileId: "prof-api", profileRevision: 1, authMode: "openai-api-key" }],
       };
-  const context = { version: 1, dispatchId: "dispatch-smoke", projectKey: "proj-smoke", backend: "gha", modelAuthUrl: "https://orchestrator.example.com/api/model-auth" };
+  const modelAuthContext = { version: 1, dispatchId: "dispatch-smoke", projectKey: "proj-smoke", backend: "gha", modelAuthUrl: "https://orchestrator.example/model-auth" };
   const runConfig = Buffer.from(JSON.stringify({
     v: 1,
     issue: { id: "issue-smoke", identifier: "AII-984", title: "synthetic", description: "synthetic" },
-    credentials: {
-      version: 1, ...tokens, modelAuthGrant: grant,
-      // The bootstrap requires a context alongside any grant.
-      modelAuthContext: context,
-    },
+    credentials: { version: 1, ...tokens, modelAuthGrant: grant, modelAuthContext },
   })).toString("base64");
   // Hostile public inputs: the private namespace is the single authority, these must be ignored.
   const hostile = {
@@ -114,6 +110,9 @@ export function buildFixture(ctx) {
     ["progress", tokens.progressToken],
     ["publication", tokens.publicationToken],
     ["attempt", tokens.attemptToken],
+    ["context-dispatch-id", modelAuthContext.dispatchId],
+    ["context-project-key", modelAuthContext.projectKey],
+    ["context-url", modelAuthContext.modelAuthUrl],
     ...(plan
       ? [["grant-nonce", grant.nonce], ["grant-ciphertext", grant.ciphertext], ["grant-tag", grant.tag]]
       : [["grant-bearer", grant.bearer]]),
@@ -126,16 +125,15 @@ export function buildFixture(ctx) {
     event: { inputs: { run_config: runConfig, ...hostile } },
     secrets,
     // Output name -> exact value the trusted consumer must receive.
+    // The fixture carries no executionPolicy, so that output is delivered empty.
     delivered: {
       run_token: tokens.resultToken, run_progress_token: tokens.progressToken, run_publication_token: tokens.publicationToken,
-      // Non-secret model-auth routing context: delivered to the trusted consumer alongside the tokens.
-      run_model_auth_dispatch_id: context.dispatchId, run_model_auth_project_key: context.projectKey,
-      run_model_auth_backend: context.backend, run_model_auth_url: context.modelAuthUrl,
+      run_model_auth_dispatch_id: modelAuthContext.dispatchId, run_model_auth_project_key: modelAuthContext.projectKey,
+      run_model_auth_backend: modelAuthContext.backend, run_model_auth_url: modelAuthContext.modelAuthUrl,
+      run_execution_policy: "",
     },
-    // Delivered outputs the bootstrap does not mask (backend is a fixed enum, not a credential).
-    unmasked: ["run_model_auth_backend"],
     // Values that must never reach any process env at all.
-    neverDelivered: secrets.filter((s) => !["result", "progress", "publication"].includes(s.label)).map((s) => s.value),
+    neverDelivered: secrets.filter((s) => !["result", "progress", "publication", "context-dispatch-id", "context-project-key", "context-url"].includes(s.label)).map((s) => s.value),
   };
 }
 
@@ -191,7 +189,10 @@ export const hasLogEnd = (log) => logLines(log).some((l) => l.includes(END_MARKE
 /** The ordered proof markers a complete job log must contain. */
 export function expectedMarkers(fx, mapping) {
   const k = fx.kind;
-  const headers = Object.entries(mapping).filter(([, output]) => !fx.unmasked.includes(output)).map(([key]) => `${key}: ***`);
+  // Backend is the one unmasked non-empty value; an empty value prints no stable header, so it is not required.
+  const headers = Object.entries(mapping)
+    .filter(([, output]) => fx.delivered[output] !== "")
+    .map(([key, output]) => `${key}: ${output === "run_model_auth_backend" ? fx.delivered[output] : "***"}`);
   const consume = (name) =>
     `PROOF ${name} kind=${k} result=exact progress=exact publication=${"RUN_PUBLICATION_TOKEN" in mapping ? "exact" : "absent"} grant=not-promoted`;
   return [
@@ -411,7 +412,7 @@ function syntheticLog(fx, mapping, { mask = true, drop = () => false, tail = tru
     if (m.startsWith("PROOF normal-output")) {
       const label = m.split(" ")[3].split("=")[0];
       lines.push(hide(`PROOF normal-output kind=${fx.kind} ${label}=${fx.secrets.find((s) => s.label === label).value}`));
-    } else if (m.endsWith(": ***")) {
+    } else if (/^[A-Z][A-Z_]*: /.test(m)) {
       lines.push(`  ${m}`);
     } else lines.push(m);
   }

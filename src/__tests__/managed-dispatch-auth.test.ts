@@ -325,6 +325,26 @@ describe("prepareManagedDispatch on github-actions (AII-1420)", () => {
     expect(adapter.ghaManagedCredentials({ kind: "legacy" }, "https://orch.example.com")).toBeUndefined();
   });
 
+  it("projects the ephemeral full-access policy only for an implementation writer with the exact mapping opt-in", async () => {
+    gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED });
+    const d = launchOf(await adapter.prepareManagedDispatch(ghaReq(), runtime));
+    const creds = adapter.ghaManagedCredentials(d, "https://orch.example.com", { extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "ephemeral-runner-asserted-v1" } });
+    expect(creds?.executionPolicy).toEqual({
+      version: 1, implementationSandbox: "ephemeral-full-access", dispatchId: d.dispatchId, projectKey: d.projectKey,
+      backend: "gha", ephemeralRunnerAsserted: true,
+    });
+    // The policy is bound to the same identity as the model-auth context.
+    expect(creds?.executionPolicy?.dispatchId).toBe(creds?.modelAuthContext?.dispatchId);
+    expect(creds?.executionPolicy?.projectKey).toBe(creds?.modelAuthContext?.projectKey);
+
+    // Planning and every writer that passes nothing never carry it; neither do absent, malformed or mismatched opt-ins.
+    const stub = { kind: "launch", dispatchId: d.dispatchId, projectKey: d.projectKey, takeBootstrap: () => creds?.modelAuthGrant } as never;
+    for (const impl of [undefined, {}, { extraEnv: null }, { extraEnv: {} }, { extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "true" } },
+      { extraEnv: { ai_implement_ephemeral_full_access: "ephemeral-runner-asserted-v1" } }]) {
+      expect(adapter.ghaManagedCredentials(stub, "https://orch.example.com", impl as never)).not.toHaveProperty("executionPolicy");
+    }
+  });
+
   it.each([
     ["an old template without the capability marker", { [WORKFLOW]: "name: old\n", ...ABSENT_RETIRED }, "runner_incompatible"],
     ["a custom template", { [WORKFLOW]: "name: custom\non: workflow_dispatch\n", ...ABSENT_RETIRED }, "runner_incompatible"],

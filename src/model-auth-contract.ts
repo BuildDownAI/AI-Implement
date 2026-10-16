@@ -987,6 +987,72 @@ export function parseModelAuthContext(raw: unknown): ValidationResult<ModelAuthC
   return ok({ version: 1, dispatchId: dispatchId.value, projectKey: projectKey.value, backend: "gha", modelAuthUrl: url });
 }
 
+/**
+ * Operator-approved execution policy (AII-1437). The only authority source for Codex implementation full access:
+ * a versioned, dispatcher-authored value that travels in the protected credential namespace beside the model-auth
+ * context and must match it. Never part of `agentConfig`, repository config, the generic run_config or diagnostics.
+ * The operator's per-project opt-in is `EPHEMERAL_FULL_ACCESS_EXTRA_ENV` in the mapping `extraEnv`; setting it
+ * asserts that the project's GHA runner is an ephemeral, disposable job. Nothing in code can prove that.
+ */
+export const EXECUTION_POLICY_FIELD = "executionPolicy";
+export const EPHEMERAL_FULL_ACCESS_POLICY = "ephemeral-full-access";
+/** Reserved mapping `extraEnv` name; the value must equal `EPHEMERAL_FULL_ACCESS_ASSERTION`. Rejected on Fly and local. */
+export const EPHEMERAL_FULL_ACCESS_EXTRA_ENV = "AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS";
+export const EPHEMERAL_FULL_ACCESS_ASSERTION = "ephemeral-runner-asserted-v1";
+/** Workflow capability marker a GHA template must carry to project the policy. */
+export const EXECUTION_POLICY_TEMPLATE_CAPABILITY = "ai-implement-capability: ephemeral-execution-policy-v1";
+/** Protected launch variable the workflow Run step sets from the validated credentials; compared again by the runner. */
+export const EXECUTION_POLICY_ENV = "AI_IMPLEMENT_EXECUTION_POLICY";
+
+export interface ExecutionPolicyV1 {
+  readonly version: 1;
+  readonly implementationSandbox: typeof EPHEMERAL_FULL_ACCESS_POLICY;
+  readonly dispatchId: string;
+  readonly projectKey: string;
+  readonly backend: "gha";
+  readonly ephemeralRunnerAsserted: true;
+}
+
+const EXECUTION_POLICY_FIELDS = [
+  "version", "implementationSandbox", "dispatchId", "projectKey", "backend", "ephemeralRunnerAsserted",
+] as const;
+
+export function parseExecutionPolicy(raw: unknown): ValidationResult<ExecutionPolicyV1> {
+  const obj = objectOf(raw, "execution policy");
+  if (!obj.ok) return obj;
+  if (Object.keys(obj.value).some((k) => !(EXECUTION_POLICY_FIELDS as readonly string[]).includes(k))) {
+    return err("execution policy contains unknown field(s)");
+  }
+  const version = validateVersion(obj.value, "execution policy");
+  if (!version.ok) return version;
+  if (obj.value.implementationSandbox !== EPHEMERAL_FULL_ACCESS_POLICY) return err("execution policy sandbox is unsupported");
+  const dispatchId = validateIdString(obj.value.dispatchId, "execution policy dispatchId");
+  if (!dispatchId.ok) return dispatchId;
+  const projectKey = validateIdString(obj.value.projectKey, "execution policy projectKey");
+  if (!projectKey.ok) return projectKey;
+  if (obj.value.backend !== "gha") return err("execution policy backend must be gha");
+  if (obj.value.ephemeralRunnerAsserted !== true) return err("execution policy requires an ephemeral runner assertion");
+  return ok({
+    version: 1,
+    implementationSandbox: EPHEMERAL_FULL_ACCESS_POLICY,
+    dispatchId: dispatchId.value,
+    projectKey: projectKey.value,
+    backend: "gha",
+    ephemeralRunnerAsserted: true,
+  });
+}
+
+/** Names that must never reach a Fly or local runner env: the opt-in is GHA-only and the launch variable is protected. */
+export function isEphemeralPolicyEnvName(name: string): boolean {
+  const upper = name.toUpperCase();
+  return upper === EPHEMERAL_FULL_ACCESS_EXTRA_ENV || upper === EXECUTION_POLICY_ENV;
+}
+
+/** True only for the exact operator assertion value in a mapping's extraEnv. */
+export function hasEphemeralFullAccessOptIn(extraEnv: Readonly<Record<string, string>> | null | undefined): boolean {
+  return extraEnv?.[EPHEMERAL_FULL_ACCESS_EXTRA_ENV] === EPHEMERAL_FULL_ACCESS_ASSERTION;
+}
+
 /** Trusted launcher values the bootstrap must match; the grant never supplies its own. */
 export const MODEL_AUTH_ENV = {
   dispatchId: "AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID",

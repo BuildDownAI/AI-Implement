@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { archiveLocalContainerLogsBestEffort } from "./local-job-logs.js";
-import { MODEL_AUTH_ENV, type ModelAuthGrantBootstrapV1 } from "./model-auth-contract.js";
+import { isEphemeralPolicyEnvName, MODEL_AUTH_ENV, type ModelAuthGrantBootstrapV1 } from "./model-auth-contract.js";
 import {
   MODEL_CREDENTIAL_KEYS,
   MODEL_SESSION_KEYS,
@@ -106,6 +106,10 @@ export function validateProtectedLocalInput(input: LocalRunnerInput, p: NonNulla
 
 export function buildLocalRunnerEnv(input: LocalRunnerInput): Record<string, string> {
   const protectedAuth = input.protectedModelAuth;
+  if (input.extraEnv && Object.keys(input.extraEnv).some(isEphemeralPolicyEnvName)) {
+    // The ephemeral full-access opt-in is GHA-only (AII-1437).
+    throw new Error("ephemeral full-access opt-in is not supported in local Docker");
+  }
   if (protectedAuth) validateProtectedLocalInput(input, protectedAuth);
   const env: Record<string, string> = {
     AI_IMPLEMENT_MODE: "local",

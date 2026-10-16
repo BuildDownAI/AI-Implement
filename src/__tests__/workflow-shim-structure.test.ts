@@ -129,6 +129,14 @@ describe("GHA workflow shims", () => {
       }
     });
 
+    it(`${f} ${IMPLEMENT_WORKFLOWS.includes(f) ? "advertises" : "does not advertise"} the ephemeral execution policy capability`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      const marker = /^# ai-implement-capability: ephemeral-execution-policy-v1$/m;
+      // Only the implementation workflow projects the policy; planning rejects it as an unknown credential key.
+      expect(marker.test(yaml)).toBe(IMPLEMENT_WORKFLOWS.includes(f));
+      expect(yaml.includes("AI_IMPLEMENT_EXECUTION_POLICY")).toBe(IMPLEMENT_WORKFLOWS.includes(f));
+    });
+
     it(`${f} never decodes or dumps run_config outside the projection`, () => {
       const yaml = readFileSync(f, "utf-8");
       expect(yaml).not.toMatch(/base64 -d \| jq \.\s/);
@@ -394,6 +402,13 @@ describe("GHA workflow shims", () => {
       // Allowlist match must be literal — quoted "$prefix" so glob chars in an operator prefix can't widen it.
       expect(yaml).toMatch(/\[\[ "\$runner_image" == "\$prefix"\* \]\]/);
       expect(yaml).toMatch(/GITHUB_REPOSITORY_OWNER is empty/);
+    });
+
+    it(`${f} runs the container job with Docker's init and no added privileges`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const containerJob = (Object.values(doc.jobs) as any[]).find((j: any) => j.container);
+      expect(String(containerJob.container.options).split(/\s+/)).toContain("--init");
+      expect(String(containerJob.container.options)).not.toMatch(/--privileged|--cap-add|--security-opt|--group-add|--user/);
     });
 
     it(`${f} masks runner progress tokens from the event file before consumers use them`, () => {

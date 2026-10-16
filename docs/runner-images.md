@@ -188,3 +188,9 @@ The typical reason is a language runtime or tool the base image lacks (terraform
 ## Extra trusted image prefixes (AII-1321)
 
 The orchestrator stores extra trusted runner-image prefixes in the `runner_image_allowed_prefixes` settings row (comma-separated, each ending in `/`). It seeds the row once from `RUNNER_IMAGE_ALLOWED_PREFIXES` and serves it on `GET`/`POST /api/settings` as `runnerImageAllowedPrefixes` (`value`, `effective`, `builtIn`). Only an admin can write it. `getRunnerImageAllowedPrefixes()` returns `[]` when the row is missing or unreadable, so a database fault never widens the allowlist. The built-in prefixes always apply. The orchestrator's launch check reads it (see Allowlisting); the repository Actions variable `AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES` is a separate store.
+
+## Host Docker socket and full-access implementation (AII-1437)
+
+The synced implementation job also sets `container.options: --init` so Docker reaps orphaned processes; Codex full-access runs need it (see execution-backends.md).
+
+GitHub mounts `/var/run/docker.sock` into GHA `container:` jobs. The image's `coder` user is non-root; the admission check for the ephemeral full-access Codex policy refuses to start the model when the user is root or can read or write that socket, and reports only booleans. The synced workflow adds no privilege to change this. See [execution-backends.md](execution-backends.md#ephemeral-full-access-for-codex-implementation-aii-1437) for the policy and its residual risk.

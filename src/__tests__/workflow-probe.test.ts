@@ -72,6 +72,7 @@ describe("resolveWorkflowContract", () => {
       supportsRunPublicationToken: true,
       supportsAttemptCorrelation: false,
       supportsPrivateRunConfig: false,
+      supportsExecutionPolicy: false,
     });
   });
 
@@ -90,6 +91,7 @@ describe("resolveWorkflowContract", () => {
       supportsRunPublicationToken: false,
       supportsAttemptCorrelation: false,
       supportsPrivateRunConfig: false,
+      supportsExecutionPolicy: false,
     });
   });
 
@@ -110,6 +112,7 @@ describe("resolveWorkflowContract", () => {
       supportsRunPublicationToken: false,
       supportsAttemptCorrelation: false,
       supportsPrivateRunConfig: false,
+      supportsExecutionPolicy: false,
     });
   });
 
@@ -154,6 +157,7 @@ describe("resolveWorkflowContract", () => {
       supportsRunPublicationToken: false,
       supportsAttemptCorrelation: false,
       supportsPrivateRunConfig: false,
+      supportsExecutionPolicy: false,
     });
   });
 
@@ -343,6 +347,7 @@ describe("resolveWorkflowCapabilities — supportsAttemptCorrelation", () => {
       supportsRunPublicationToken: false,
       supportsAttemptCorrelation: true,
       supportsPrivateRunConfig: false,
+      supportsExecutionPolicy: false,
     });
   });
 
@@ -395,6 +400,7 @@ describe("resolveWorkflowCapabilities — supportsAttemptCorrelation", () => {
       supportsRunPublicationToken: false,
       supportsAttemptCorrelation: false,
       supportsPrivateRunConfig: false,
+      supportsExecutionPolicy: false,
     });
   });
 
