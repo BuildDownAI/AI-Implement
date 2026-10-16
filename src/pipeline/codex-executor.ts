@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import type { InvokeParams, LLMExecutor, LLMResult, RunTelemetry } from "./types.js";
@@ -66,19 +66,15 @@ const CONFIG_REJECTION_RE =
  */
 export class CodexRecoveryRequiredError extends Error {
   readonly code = "CODEX_RECOVERY_REQUIRED";
-  readonly reason: "child_not_terminated" | "checkpoint_uncertain" | "auth_sync_failed" | "held";
-  /** For `auth_sync_failed`: the preserved trusted view that still holds the refreshed session. */
-  readonly viewRoot?: string;
-  constructor(reason: CodexRecoveryRequiredError["reason"], viewRoot?: string) {
+  readonly reason: "child_not_terminated" | "checkpoint_uncertain" | "held";
+  constructor(reason: CodexRecoveryRequiredError["reason"]) {
     super(`Codex invocation requires recovery: ${reason}`);
     this.name = "CodexRecoveryRequiredError";
     this.reason = reason;
-    if (viewRoot) this.viewRoot = viewRoot;
   }
 }
 
-/** Fixed-message rejection of a refreshed session; never carries file content. */
-class AuthSyncRejected extends Error {}
+const OPENAI_BASE_URL_REJECTED = "Selected OPENAI_BASE_URL is not an allowed local provider endpoint";
 
 function validateSelectedOpenAIBaseUrl(raw: string | undefined): string | undefined {
   if (!raw) return undefined;
@@ -86,7 +82,7 @@ function validateSelectedOpenAIBaseUrl(raw: string | undefined): string | undefi
   try {
     url = new URL(raw);
   } catch {
-    throw new CodexRecoveryRequiredError("auth_sync_failed");
+    throw new Error(OPENAI_BASE_URL_REJECTED);
   }
   if (
     url.protocol !== "http:" ||
@@ -98,43 +94,11 @@ function validateSelectedOpenAIBaseUrl(raw: string | undefined): string | undefi
     url.password ||
     !url.port
   ) {
-    throw new CodexRecoveryRequiredError("auth_sync_failed");
+    throw new Error(OPENAI_BASE_URL_REJECTED);
   }
   const port = Number(url.port);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new CodexRecoveryRequiredError("auth_sync_failed");
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(OPENAI_BASE_URL_REJECTED);
   return raw;
-}
-
-function parseAuth(text: string): Record<string, unknown> | null {
-  try {
-    const parsed: unknown = JSON.parse(text);
-    return isObject(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Account-identifying fields of an auth.json: API key, token account id and id_token subject. Null when
- * none yields a nonempty stable identity, so two unknown identities can never compare equal.
- */
-function authIdentity(auth: Record<string, unknown>): string | null {
-  const tokens = isObject(auth.tokens) ? auth.tokens : {};
-  const nonEmpty = (v: unknown): string | null => (typeof v === "string" && v.length > 0 ? v : null);
-  let subject: string | null = null;
-  if (typeof tokens.id_token === "string") {
-    const payload = tokens.id_token.split(".")[1];
-    if (payload) {
-      try {
-        const claims: unknown = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
-        if (isObject(claims)) subject = nonEmpty(claims.sub);
-      } catch {
-        // an undecodable id_token carries no identity to compare
-      }
-    }
-  }
-  const parts = [nonEmpty(auth.OPENAI_API_KEY), nonEmpty(tokens.account_id), subject];
-  return parts.every((p) => p === null) ? null : JSON.stringify(parts);
 }
 
 /**
@@ -241,8 +205,6 @@ interface AppServerView {
   cwd: string;
   /** True when the root belongs to the invocation (kept across resumes) rather than to one attempt. */
   shared: boolean;
-  authSource: string | null;
-  initialAuth: string | null;
 }
 
 type StopReason = "timeout" | "cancel" | "stdin";
@@ -568,9 +530,8 @@ export class CodexExecutor implements LLMExecutor {
     const recovery = new Promise<never>((_, reject) => (signalRecovery = reject));
     const requiredMs = deadlineAt !== null ? Math.max(0, deadlineAt - this.now()) : params.invocationTimeoutMs;
     try {
-      // If the child cannot be proven dead, or its refreshed session could not be safely persisted, the
-      // callback must never settle: the client checkpoints on both return and throw, so settling would
-      // persist stale or foreign session state and mark the profile ready. The pending invoke keeps the
+      // If the child cannot be proven dead, the callback must never settle: the client
+      // checkpoints on both return and throw, so settling would mark the profile ready. The pending invoke keeps the
       // profile "invoking" (no second invocation, no dispose), while the race below surfaces the
       // recovery-required error to the caller.
       const invocation = this.options.auth.invoke(this.options.profileId, async (selected) => {
@@ -578,7 +539,7 @@ export class CodexExecutor implements LLMExecutor {
           return await this.runChild(params, selected.env, deadlineAt, state, selected.codexProvider);
         } catch (err) {
           const held = this.held;
-          if (held && (held.reason === "child_not_terminated" || held.reason === "auth_sync_failed")) {
+          if (held && held.reason === "child_not_terminated") {
             signalRecovery(held);
             return new Promise<Attempt>(() => {});
           }
@@ -673,8 +634,8 @@ export class CodexExecutor implements LLMExecutor {
   }
 
   /**
-   * Trusted per-invoke view for the app-server: a CODEX_HOME holding only our config.toml plus a copy of
-   * the SELECTED profile's auth.json, an empty HOME, and an empty protocol cwd. Nothing else from the selected home,
+   * Trusted per-invoke view for the app-server: a CODEX_HOME holding only our config.toml (no auth.json: the
+   * credential arrives as an env var), an empty HOME, and an empty protocol cwd. Nothing else from the selected home,
    * the user home or the repository is visible to the child's config/rules/MCP loaders.
    */
   private createAppServerView(selectedHome: string | undefined, model: string, baseUrl?: string, provider?: CodexProviderKind, state?: InvocationState): AppServerView {
@@ -731,26 +692,8 @@ export class CodexExecutor implements LLMExecutor {
       ].join("\n"),
       { mode: 0o600 },
     );
-    let source: string | null = null;
-    let initial: string | null = null;
-    if (selectedHome && !plan) {
-      const candidate = join(selectedHome, "auth.json");
-      if (existsSync(candidate)) {
-        // Read once and write that exact text, so the baseline and the view cannot diverge. A malformed
-        // selected auth fails before any child exists: nothing could be refreshed or compared safely. The
-        // hold keeps the auth callback pending so the client cannot checkpoint over the selected profile.
-        initial = readFileSync(candidate, "utf8");
-        if (!parseAuth(initial)) {
-          this.held = new CodexRecoveryRequiredError("auth_sync_failed");
-          console.warn("[codex] selected auth.json is malformed; no child spawned; executor held for recovery");
-          throw this.held;
-        }
-        writeFileSync(join(home, "auth.json"), initial, { mode: 0o600 });
-        source = candidate;
-      }
-    }
     this.copyTrustedSkills(userHome, selectedHome, root);
-    return { root, home, userHome, cwd, shared, authSource: source, initialAuth: initial };
+    return { root, home, userHome, cwd, shared };
   }
 
   /** Copies the trusted skills into the view HOME, read-only. Nothing else enters HOME; errors carry no path. */
@@ -772,43 +715,6 @@ export class CodexExecutor implements LLMExecutor {
     lockTree(dest);
     const count = readdirSync(dest).filter((n) => lstatSync(join(dest, n)).isDirectory()).length;
     console.log(`[codex] planning skills copied=${count}`);
-  }
-
-  /**
-   * Called only after the group is proven terminated. Persists a refreshed auth.json into the selected
-   * profile's home, never overwriting a file that changed underneath us and never for another account.
-   * Fail-closed: a missing, malformed, foreign-account or uncommittable refresh holds the executor and
-   * throws, leaving the view (the only copy of the refreshed session) in place for recovery. The caller
-   * must then keep the auth callback pending, because the client would checkpoint a stale session.
-   */
-  private syncAuthBack(view: AppServerView): void {
-    if (!view.authSource || view.initialAuth === null) return;
-    const tmp = `${view.authSource}.sync-${process.pid}`;
-    try {
-      const refreshed = readFileSync(join(view.home, "auth.json"), "utf8");
-      if (refreshed === view.initialAuth) return;
-      const next = parseAuth(refreshed);
-      const prev = parseAuth(view.initialAuth);
-      const nextId = next ? authIdentity(next) : null;
-      const prevId = prev ? authIdentity(prev) : null;
-      if (nextId === null || prevId === null || nextId !== prevId) throw new AuthSyncRejected("invalid_or_foreign_auth");
-      if (readFileSync(view.authSource, "utf8") !== view.initialAuth) throw new AuthSyncRejected("source_changed");
-      // "wx": a pre-existing file at the temp path is a collision, never silently overwritten.
-      writeFileSync(tmp, refreshed, { mode: 0o600, flag: "wx" });
-      renameSync(tmp, view.authSource);
-    } catch (err) {
-      try {
-        // On a collision the file at `tmp` is not ours to delete.
-        if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") rmSync(tmp, { force: true });
-      } catch {
-        // best-effort: the temp file holds the same content as the preserved view
-      }
-      this.held = new CodexRecoveryRequiredError("auth_sync_failed", view.root);
-      // Class or errno code only: messages may carry paths or credential content.
-      const why = err instanceof AuthSyncRejected ? err.message : ((err as NodeJS.ErrnoException)?.code ?? "io_error");
-      console.warn(`[codex] auth sync-back failed (${why}); refreshed session preserved at ${view.root}; executor held for recovery`);
-      throw this.held;
-    }
   }
 
   private async runChild(params: InvokeParams, selectedEnv: Record<string, string>, deadlineAt: number | null, state: InvocationState, provider?: CodexProviderKind): Promise<Attempt> {
@@ -847,11 +753,10 @@ export class CodexExecutor implements LLMExecutor {
       if (deadlineAt !== null && this.now() >= deadlineAt) return expiredAttempt();
       const attempt = await this.spawnAndWait(params, args, env, view ?? undefined, selectedEnv.CODEX_HOME, deadlineAt, provider, resumeThreadId);
       // spawnAndWait throws rather than returning while a child may live; the explicit guard keeps that invariant local.
-      if (view && !this.held && provider !== "chatgpt-plan") this.syncAuthBack(view);
       return attempt;
     } finally {
       if (schemaDir) rmSync(schemaDir, { recursive: true, force: true });
-      // The view stays in place while a child may live: its auth must not be synced or removed.
+      // The view stays in place while a child may live: it must not be removed.
       if (view && !this.held && !view.shared) removeView(view.root);
       if (this.held?.reason === "child_not_terminated") {
         // A child that may still be alive must never regain the publication credential.

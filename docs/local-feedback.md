@@ -156,10 +156,10 @@ container receives only `CHATGPT_PLAN_ACCESS_TOKEN`; the refresh token and ID
 token stay on the host, and no `auth.json` is created. If the sign-in expires,
 the run fails with `authentication_required`; run `login` again.
 
-Profiles that use `codex login` and Codex's own `auth.json` (`"sessionSource":
-"local-login"`) still work until the Codex `auth.json` path is removed. Prefer
-`chatgpt-sign-in`. Either way the harness refuses a record that is Codex's active
-`auth.json`.
+A `codex-subscription` profile must use `"sessionSource": "chatgpt-sign-in"`;
+any other source fails config load with `config_invalid`. Sign in again with
+`node dist/chatgpt-plan-login.js login`. The harness refuses a record that is
+Codex's active `auth.json`.
 
 Create an external stage-agent config. This example writes only file references;
 it does not embed credential material.

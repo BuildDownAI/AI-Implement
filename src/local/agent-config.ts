@@ -46,8 +46,9 @@ import {
  *       "sessionPath"               // subscription modes: separately protected local file
  *       "sessionSource": "local-login" | "chatgpt-sign-in"
  *                                           // subscription only; "hosted-copy" is rejected.
- *                                           // "chatgpt-sign-in" is codex-subscription only: sessionPath is a
- *                                           // ChatGPT plan record that the host refreshes
+ *                                           // codex-subscription requires "chatgpt-sign-in": sessionPath is a
+ *                                           // ChatGPT plan record that the host refreshes.
+ *                                           // claude-subscription requires "local-login".
  *       "trustedPrivateTesting": true       // subscription only; explicit authorization
  *     }]
  *   }
@@ -307,12 +308,9 @@ function parseProfile(raw: unknown, index: number, projectKey: string): ParsedPr
     if (raw.sessionSource === "hosted-copy") {
       fail("hosted_session_copy", `${ctx} copied hosted session state is not an independent local login`);
     }
-    if (raw.sessionSource === "chatgpt-sign-in") {
-      if (authMode !== "codex-subscription") {
-        fail("config_invalid", `${ctx}.sessionSource chatgpt-sign-in is valid only for codex-subscription`);
-      }
-    } else if (raw.sessionSource !== "local-login") {
-      fail("config_invalid", `${ctx}.sessionSource must be local-login or chatgpt-sign-in`);
+    const requiredSource = authMode === "codex-subscription" ? "chatgpt-sign-in" : "local-login";
+    if (raw.sessionSource !== requiredSource) {
+      fail("config_invalid", `${ctx}.sessionSource must be ${requiredSource} for ${authMode}`);
     }
     if (raw.trustedPrivateTesting !== true) {
       fail("subscription_unauthorized", `${ctx} subscription use requires explicit trusted private testing authorization`);
