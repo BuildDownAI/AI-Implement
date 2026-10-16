@@ -8,6 +8,8 @@ import type * as FlyMachinesModule from "../fly-machines.js";
 import type * as RepoImageModule from "../repo-image.js";
 import type * as AdmissionModule from "../dispatch-admission.js";
 import type * as OrchestratorSettingsModule from "../orchestrator-settings.js";
+import type * as LocalGapfillModule from "../local-gapfill.js";
+import type * as LocalDockerModule from "../local-docker.js";
 import type { RepoMapping } from "../config.js";
 import { makeMapping } from "./helpers/builders.js";
 import { fakeFetch, type Reply } from "./helpers/fake-fetch.js";
@@ -41,14 +43,31 @@ vi.mock("../repo-image.js", async (importOriginal) => {
   };
 });
 
-type DispatchLocalGapfillFn = (...args: unknown[]) => Promise<unknown>;
+type DispatchLocalGapfillFn = typeof LocalGapfillModule.dispatchLocalGapfill;
+type StartLocalRunnerContainerFn = typeof LocalDockerModule.startLocalRunnerContainer;
 
-const localGapfillMocks = vi.hoisted(() => ({
-  dispatchLocalGapfill: vi.fn<DispatchLocalGapfillFn>(),
+// The Docker launch is the seam. dispatchLocalGapfill runs for real behind a spy that records its input,
+// so its guards and its onBeforeLaunch call stay on the path the drain takes.
+const localGapfillMocks = vi.hoisted(() => {
+  const real: { dispatchLocalGapfill?: DispatchLocalGapfillFn } = {};
+  return {
+    real,
+    dispatchLocalGapfill: vi.fn<DispatchLocalGapfillFn>((input) => real.dispatchLocalGapfill!(input)),
+    startLocalRunnerContainer: vi.fn<StartLocalRunnerContainerFn>(async (input) => {
+      input.onBeforeLaunch?.();
+      return { containerId: "c".repeat(64), containerName: "ai-implement-aii-305-container" };
+    }),
+  };
+});
+
+vi.mock("../local-docker.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../local-docker.js")>()),
+  startLocalRunnerContainer: localGapfillMocks.startLocalRunnerContainer,
 }));
 
 vi.mock("../local-gapfill.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../local-gapfill.js")>();
+  localGapfillMocks.real.dispatchLocalGapfill = actual.dispatchLocalGapfill;
   return {
     ...actual,
     dispatchLocalGapfill: localGapfillMocks.dispatchLocalGapfill,
@@ -88,13 +107,6 @@ beforeEach(async () => {
   });
   flyMocks.listAppSecrets.mockResolvedValue([]);
   flyMocks.resolveSessionImage.mockResolvedValue({ image: "ghcr.io/builddownai/ai-implement-runner:latest", source: "default" });
-  localGapfillMocks.dispatchLocalGapfill.mockResolvedValue({
-    containerId: "container-1",
-    containerName: "container-1",
-    machineNonce: "nonce-1",
-    sessionToken: "session-token-1",
-    runConfig: {} as never,
-  });
 });
 
 afterEach(() => {
@@ -103,6 +115,7 @@ afterEach(() => {
   flyMocks.listAppSecrets.mockReset();
   flyMocks.resolveSessionImage.mockReset();
   localGapfillMocks.dispatchLocalGapfill.mockReset();
+  localGapfillMocks.startLocalRunnerContainer.mockReset();
 });
 
 /** Fake the GitHub PR lookup the roll-up fallback performs (drain calls
@@ -141,6 +154,17 @@ function makeBaseDrainOpts(overrides: Partial<DrainInput> = {}): DrainInput {
     sessionImage: "ghcr.io/builddownai/ai-implement-runner:latest",
     ...overrides,
   };
+}
+
+/** A local-docker orchestrator: local dispatch refuses to launch without a callback and a model credential. */
+function localDrainOpts(overrides: Partial<DrainInput> = {}): DrainInput {
+  return makeBaseDrainOpts({
+    runnerMode: "local",
+    runnerCallbackBaseUrl: "http://host.docker.internal:8080",
+    runnerTokenSecret: "runner-token-secret-with-enough-entropy",
+    anthropicApiKey: "anthropic-key",
+    ...overrides,
+  });
 }
 
 function seedDispatchLog(
@@ -1184,13 +1208,9 @@ describe("drainCommentGapfillQueue — admission (AII-787)", () => {
     seedDispatchLog("issue-local-admission", "AII-305", "Local test", "acme", "billing", 88);
     queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 88, commentId: 0, commenter: "", instruction: "" });
 
-    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
-      getMappings: () => ({ TEAM: mapping }),
-      runnerMode: "local",
-      anthropicApiKey: "anthropic-key",
-    }));
+    await drain.drainCommentGapfillQueue(localDrainOpts({ getMappings: () => ({ TEAM: mapping }) }));
 
-    expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
+    expect(localGapfillMocks.startLocalRunnerContainer).toHaveBeenCalledTimes(1);
     expect(admission.count("TEAM")).toBe(1);
   });
 
@@ -1241,10 +1261,26 @@ describe("drainCommentGapfillQueue — admission (AII-787)", () => {
     const mapping = makeMapping({ owner: "acme", repo: "billing" });
     seedDispatchLog("issue-local-prep", "AII-309", "Local preparation", "acme", "billing", 92);
     queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 92, commentId: 0, commenter: "", instruction: "" });
-    localGapfillMocks.dispatchLocalGapfill.mockRejectedValueOnce(new Error("missing image"));
+    // Writing the secret env file fails before startLocalRunnerContainer calls onBeforeLaunch.
+    localGapfillMocks.startLocalRunnerContainer.mockRejectedValueOnce(new Error("ENOSPC: no space left on device"));
 
-    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({ getMappings: () => ({ TEAM: mapping }), runnerMode: "local", anthropicApiKey: "anthropic-key" }));
+    await drain.drainCommentGapfillQueue(localDrainOpts({ getMappings: () => ({ TEAM: mapping }) }));
 
+    expect(localGapfillMocks.startLocalRunnerContainer).toHaveBeenCalledTimes(1);
     expect(admission.count("TEAM")).toBe(0);
+  });
+
+  it("holds local admission when Docker was invoked and the launch then failed", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing" });
+    seedDispatchLog("issue-local-launch", "AII-310", "Local launch", "acme", "billing", 93);
+    queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 93, commentId: 0, commenter: "", instruction: "" });
+    localGapfillMocks.startLocalRunnerContainer.mockImplementationOnce(async (input) => {
+      input.onBeforeLaunch?.();
+      throw new Error("Failed to start local Docker runner: exit 125");
+    });
+
+    await drain.drainCommentGapfillQueue(localDrainOpts({ getMappings: () => ({ TEAM: mapping }) }));
+
+    expect(admission.count("TEAM")).toBe(1);
   });
 });

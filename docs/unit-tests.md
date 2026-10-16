@@ -104,7 +104,7 @@ The same holds for a fake's replies: each must be one the real API or module can
 
 **Builders that are not plain data.** `makeProvider` returns a `TicketingProvider` whose every method is a spy typed by its own signature, and `makeExecutor` an `LLMExecutor` whose `invoke` is one, each with a safe default passed as the spy's implementation, so the default survives `mockReset`. `makeRegistry` returns a subclass of the real `ProviderRegistry` that overrides only `forMapping`: the class has private members, so no object literal satisfies its type without a cast, and the registry's other lookups still run their own code against the given providers. It takes either one `provider`, which every mapping resolves to, or `providers` keyed by tracker id, never both. A tracker missing from `providers` throws, as an unconstructable provider does in production, so the real `forAllMappings` skips it with a warning.
 
-**Per-file copies.** Many test files still define their own builders for the same types, under `make*` names and others such as `mapping`, and the copies do not all share a signature. They move onto the shared builders file by file. Many are typed with `as unknown as <Type>`, and such a fixture compiles whatever the type becomes, so it cannot show drift.
+**Per-file helpers.** A test file keeps a builder of its own only for what no other file shares. A wrapper fixes the values every test in one file uses and passes the rest to a shared builder, as `acmeBilling` in `review-fix-drain.test.ts` does over `makeMapping`; its fields still come from the shared builder, so a change to the type is still made in one place. A builder for a type only one file builds stays in that file, such as `makeKgPrCheck` in `webhook.test.ts`, and moves into `builders.ts` once a third file needs it. Type neither with `as unknown as <Type>`, which compiles whatever the type becomes.
 
 ### Fakes
 
@@ -162,7 +162,7 @@ Pass `fake.fetch` where a module takes `fetchImpl`, or call `fake.install()` whe
 
 **When a test needs more.** Use what the harness offers first; a function reply covers most needs. Write the rest in the test file. A harness grows once three test files share the same new need, as a type gets a builder once three files build it. Two things override the count. A harness that breaks a promise it makes is fixed however few files hit it: `testDb` creates tables through the real modules because a test file's mock of a table's module left that table missing from the test's database. And many per-file workarounds around one harness are a sign it is missing something, so raise them rather than adding another. Growth keeps a harness general: what belongs to one service goes beside it, as `github-replies.ts` does.
 
-**Per-file copies.** Many test files still build their own databases, fakes and directories, and some leave files in the OS temp directory. They move onto the harnesses file by file.
+**Per-file helpers.** A test file keeps a helper over a harness for what only it needs, most often a function that installs `fakeFetch` with the routes one service answers in that file, each with the reply production's handler sends, such as `commentTriggerApi` in `webhook.test.ts`. `MockRequest` and `MockResponse`, a request and response pair for calling an HTTP handler directly, are still copied across the files that do so; they are not a harness yet.
 
 ## CI
 

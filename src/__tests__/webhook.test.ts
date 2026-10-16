@@ -343,7 +343,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
       kgBaseRepo: KG_BASE_REPO,
       githubAppId: "app-id",
       githubAppPrivateKey: "app-key",
-      enqueueDryRun: vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } }),
+      enqueueDryRun: vi.fn<KgPrCheckConfig["enqueueDryRun"]>(async () => ({ status: "accepted", value: { triggerId: "t-1" } })),
       ...overrides,
     };
   }

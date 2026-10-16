@@ -6,6 +6,7 @@ import type * as ConfigModule from "../config.js";
 import type * as IndexModule from "../index.js";
 import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as LocalGapfillModule from "../local-gapfill.js";
+import type * as LocalDockerModule from "../local-docker.js";
 import type * as AdmissionModule from "../dispatch-admission.js";
 import type * as RestateStatusModule from "../restate/status.js";
 import type { RepoMapping } from "../config.js";
@@ -15,13 +16,30 @@ import { fakeFetch, type FakeFetch, type Reply, type Routes } from "./helpers/fa
 import { testDb } from "./helpers/test-db.js";
 
 type DispatchLocalGapfillFn = typeof LocalGapfillModule.dispatchLocalGapfill;
+type StartLocalRunnerContainerFn = typeof LocalDockerModule.startLocalRunnerContainer;
 
-const localGapfillMocks = vi.hoisted(() => ({
-  dispatchLocalGapfill: vi.fn<DispatchLocalGapfillFn>(),
+// The Docker launch is the seam. dispatchLocalGapfill runs for real behind a spy that records its input,
+// so its guards and its onBeforeLaunch call stay on the path the drain takes.
+const localGapfillMocks = vi.hoisted(() => {
+  const real: { dispatchLocalGapfill?: DispatchLocalGapfillFn } = {};
+  return {
+    real,
+    dispatchLocalGapfill: vi.fn<DispatchLocalGapfillFn>((input) => real.dispatchLocalGapfill!(input)),
+    startLocalRunnerContainer: vi.fn<StartLocalRunnerContainerFn>(async (input) => {
+      input.onBeforeLaunch?.();
+      return { containerId: "c".repeat(64), containerName: "ai-implement-aii-42-container" };
+    }),
+  };
+});
+
+vi.mock("../local-docker.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../local-docker.js")>()),
+  startLocalRunnerContainer: localGapfillMocks.startLocalRunnerContainer,
 }));
 
 vi.mock("../local-gapfill.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../local-gapfill.js")>();
+  localGapfillMocks.real.dispatchLocalGapfill = actual.dispatchLocalGapfill;
   return {
     ...actual,
     dispatchLocalGapfill: localGapfillMocks.dispatchLocalGapfill,
@@ -82,7 +100,10 @@ let github: typeof import("../github.js");
 let workflowProbe: typeof import("../workflow-probe.js");
 let repoImage: typeof import("../repo-image.js");
 
-const config = makeAppConfig();
+// A local-docker orchestrator always has these: local dispatch refuses to launch without a callback and a model credential.
+const config = makeAppConfig({
+  runnerCallbackBaseUrl: "http://host.docker.internal:8080", runnerTokenSecret: "runner-secret", anthropicApiKey: "sk-ant-test",
+});
 
 const trackerPostCommentMock = vi.fn<TicketingProvider["postComment"]>(async () => undefined);
 const findByKeyMock = vi.fn<TicketingProvider["findByKey"]>(async () => null);
@@ -116,13 +137,6 @@ beforeEach(async () => {
   githubAppAuthMocks.getInstallationId.mockResolvedValue(778899);
   ingressMocks.feedback.mockResolvedValue({ status: "accepted" });
   findByKeyMock.mockReset();
-  localGapfillMocks.dispatchLocalGapfill.mockResolvedValue({
-    containerId: "container-1",
-    containerName: "container-1",
-    machineNonce: "nonce-1",
-    sessionToken: "session-token-1",
-    runConfig: {} as never,
-  });
 
   // No request is expected unless a test routes it.
   fakeFetch({}).install();
@@ -133,6 +147,7 @@ afterEach(() => {
   restateStatus.resetRestateStatus();
   vi.restoreAllMocks();
   localGapfillMocks.dispatchLocalGapfill.mockReset();
+  localGapfillMocks.startLocalRunnerContainer.mockReset();
   githubAppAuthMocks.getInstallationToken.mockReset();
   githubAppAuthMocks.getInstallationId.mockReset();
   ingressMocks.feedback.mockReset();
@@ -151,10 +166,8 @@ describe("processReviewFixQueue — owner selection", () => {
     restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
     pulls({ 42: pullRequest("open") });
     const queueId = queueOne();
-    const pilotConfig = { ...config, runnerCallbackBaseUrl: "https://callback.example",
-      runnerTokenSecret: "test-secret" };
 
-    await indexModule.processReviewFixQueue(pilotConfig, registry);
+    await indexModule.processReviewFixQueue(config, registry);
 
     expect(reviewFixQueue.getPendingReviewFixes().map((item) => item.id)).toContain(queueId);
     expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
@@ -175,19 +188,17 @@ describe("processReviewFixQueue — owner selection", () => {
     restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
     pulls({ 42: pullRequest("open") });
     const queueId = queueOne();
-    const pilotConfig = { ...config, runnerCallbackBaseUrl: "https://callback.example",
-      runnerTokenSecret: "test-secret" };
     const base = 1_700_000_010_000 - (1_700_000_010_000 % 30_000);
     const now = vi.spyOn(Date, "now");
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
     ingressMocks.feedback.mockResolvedValue({ status: "unavailable" });
 
     now.mockReturnValue(base + 1_000);
-    await indexModule.processReviewFixQueue(pilotConfig, registry);
+    await indexModule.processReviewFixQueue(config, registry);
     now.mockReturnValue(base + 29_000);
-    await indexModule.processReviewFixQueue(pilotConfig, registry);
+    await indexModule.processReviewFixQueue(config, registry);
     now.mockReturnValue(base + 31_000);
-    await indexModule.processReviewFixQueue(pilotConfig, registry);
+    await indexModule.processReviewFixQueue(config, registry);
 
     const keys = ingressMocks.feedback.mock.calls.map((c) => c[2].idempotencyKey);
     const eventId = reviewFixQueue.listReviewFixEvents(queueId).at(-1)!.id;
@@ -201,15 +212,13 @@ describe("processReviewFixQueue — owner selection", () => {
     process.env.RUNNER_MODE = "gha";
     configModule.upsertMapping("AII", acmeBilling({ reviewFixLifecycle: "restate" }));
     queueOne();
-    const pilotConfig = { ...config, runnerCallbackBaseUrl: "https://callback.example",
-      runnerTokenSecret: "test-secret" };
-    await indexModule.processReviewFixQueue(pilotConfig, registry);
+    await indexModule.processReviewFixQueue(config, registry);
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
     expect(ingressMocks.feedback).not.toHaveBeenCalled();
 
     restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
     process.env.RUNNER_MODE = "fly";
-    await indexModule.processReviewFixQueue(pilotConfig, registry);
+    await indexModule.processReviewFixQueue(config, registry);
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
     expect(ingressMocks.feedback).not.toHaveBeenCalled();
   });
@@ -233,10 +242,8 @@ describe("processReviewFixQueue — owner selection", () => {
     restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
     queueOne();
     pulls({ 42: pullRequest("closed") });
-    const pilotConfig = { ...config, runnerCallbackBaseUrl: "https://callback.example",
-      runnerTokenSecret: "test-secret" };
 
-    await indexModule.processReviewFixQueue(pilotConfig, registry);
+    await indexModule.processReviewFixQueue(config, registry);
 
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
     expect(ingressMocks.feedback).not.toHaveBeenCalled();
@@ -1162,7 +1169,34 @@ describe("processReviewFixQueue — admission (AII-787)", () => {
 
     await indexModule.processReviewFixQueue(config, registry);
 
-    expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
+    expect(localGapfillMocks.startLocalRunnerContainer).toHaveBeenCalledTimes(1);
+    expect(admission.count("AII")).toBe(1);
+  });
+
+  it("releases local capacity when the launch fails before Docker is invoked", async () => {
+    configModule.upsertMapping("AII", acmeBilling());
+    pulls({ 79: pullRequest("open") });
+    reviewFixQueue.enqueueReviewFix({ issueId: "issue-local-prep", issueIdentifier: "AII-37", repo: "acme/billing", prNumber: 79, reason: "late review" });
+    // Writing the secret env file fails before startLocalRunnerContainer calls onBeforeLaunch.
+    localGapfillMocks.startLocalRunnerContainer.mockRejectedValueOnce(new Error("ENOSPC: no space left on device"));
+
+    await indexModule.processReviewFixQueue(config, registry);
+
+    expect(localGapfillMocks.startLocalRunnerContainer).toHaveBeenCalledTimes(1);
+    expect(admission.count("AII")).toBe(0);
+  });
+
+  it("holds local capacity when Docker was invoked and the launch then failed", async () => {
+    configModule.upsertMapping("AII", acmeBilling());
+    pulls({ 80: pullRequest("open") });
+    reviewFixQueue.enqueueReviewFix({ issueId: "issue-local-launch", issueIdentifier: "AII-38", repo: "acme/billing", prNumber: 80, reason: "late review" });
+    localGapfillMocks.startLocalRunnerContainer.mockImplementationOnce(async (input) => {
+      input.onBeforeLaunch?.();
+      throw new Error("Failed to start local Docker runner: exit 125");
+    });
+
+    await indexModule.processReviewFixQueue(config, registry);
+
     expect(admission.count("AII")).toBe(1);
   });
 
