@@ -1,5 +1,6 @@
 # Synced to target repos by sync-workflow.yml.
 # ai-implement-capability: private-run-config-v1
+# ai-implement-capability: stage-agent-config-v1
 # All pipeline logic lives in the runner image (ghcr.io/builddownai/ai-implement-runner).
 # Do not edit in target repos.
 #

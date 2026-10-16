@@ -508,6 +508,21 @@ export function buildEnvelopeDispatchInputs(
 }
 
 /**
+ * True when the encoded envelope carries a managed stage snapshot or model-auth grant. Raw
+ * parse only (no validation, nothing logged): an unparseable value is treated as legacy.
+ */
+function isManagedRunConfig(encoded: string): boolean {
+  try {
+    const parsed = JSON.parse(Buffer.from(encoded, "base64").toString("utf-8")) as Record<string, unknown> | null;
+    if (parsed === null || typeof parsed !== "object") return false;
+    const creds = parsed.credentials as Record<string, unknown> | null | undefined;
+    return parsed.agentConfig !== undefined || (creds !== null && typeof creds === "object" && creds.modelAuthGrant !== undefined);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Posts a `workflow_dispatch`, with a bounded strip-and-retry for older templates: **at most
  * two requests, ever.** On a 422 whose body matches `/unexpected inputs/i` and names — by exact
  * match, never substring — at least one `ENVELOPE_OPTIONAL_INPUTS` member that is present in
@@ -543,6 +558,8 @@ export async function postWorkflowDispatch(opts: {
   if (first.success) return first;
   if (first.status !== 422 || !/unexpected inputs/i.test(first.error ?? "")) return first;
   if (!opts.inputs.run_config) return first;
+  // A managed run never degrades to a legacy shape: a rejected input is a hard failure.
+  if (isManagedRunConfig(opts.inputs.run_config)) return first;
 
   const rejectedNames = extractUnexpectedInputNames(first.error ?? "");
   const namesToStrip = ENVELOPE_OPTIONAL_INPUTS.filter(

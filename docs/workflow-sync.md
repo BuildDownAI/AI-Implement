@@ -46,3 +46,7 @@ A mapping's `workflowFile` and `planningWorkflowFile` must each be a bare file n
 ## Bulk fallback
 
 `.github/workflows/sync-workflow.yml` in this repo is a manual GitHub Actions fallback that syncs templates to a named `target_repo`. Normal distribution is the orchestrator path above.
+
+## Template capability markers
+
+Both `claude-implement.yml` and `claude-plan.yml` carry two static header lines: `# ai-implement-capability: private-run-config-v1` (private envelope transport, read by `workflow-probe.ts`) and `# ai-implement-capability: stage-agent-config-v1` (managed stage authentication, checked by the dispatch gate in `agent-run-preparation.ts`). Neither implies the other, and neither is a dispatch input. A managed run (envelope carries `agentConfig` or `credentials.modelAuthGrant`) is refused before execution on a template without the stage marker, and `postWorkflowDispatch` never strips inputs and retries for it: a 422 on a managed dispatch is returned as a failure. Opted-out runs keep the legacy strip-and-retry. The retired `comment-trigger.yml` and `claude-kg-refresh.yml` stay in the sync removal list.

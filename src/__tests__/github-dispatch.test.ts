@@ -807,6 +807,28 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     expect(ENVELOPE_OPTIONAL_INPUTS).toEqual(["runner_phase", "runner_callback_url", "issue_identifier"]);
   });
 
+  it.each([
+    ["agentConfig", { agentConfig: { v: 1 } }],
+    ["credentials.modelAuthGrant", { credentials: { version: 1, modelAuthGrant: {} } }],
+  ])("does not downgrade a managed run (%s) on a rejected input", async (_name, extra) => {
+    const fetchMock = vi.fn().mockResolvedValue(textResponse(422, 'Unexpected inputs provided: ["runner_phase"]'));
+    vi.stubGlobal("fetch", fetchMock);
+    const runConfig = Buffer.from(JSON.stringify({ v: 1, ...extra }), "utf-8").toString("base64");
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "r",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: { run_config: runConfig, run_token: "", runner_phase: "implementation" },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(422);
+  });
+
   it("strips a single optional input named in the 422 body and retries once", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_phase"]'))
@@ -1361,19 +1383,14 @@ describe("managed credentials on the GitHub Actions envelope (AII-1420)", () => 
     expect(JSON.stringify(result)).not.toContain(BEARER);
   });
 
-  it("retries a 422 naming an optional input at most once and keeps run_config with the grant byte-identical", async () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_phase"]'))
-      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["issue_identifier"]'));
+  it("never strips and retries a managed 422 naming an optional input, and the failure carries no bearer", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(textResponse(422, 'Unexpected inputs provided: ["runner_phase"]'));
     vi.stubGlobal("fetch", fetchMock);
     const inputs = { ...managedInputs(), runner_phase: "implementation" as const };
     const result = await postWorkflowDispatch({ token: "tok", owner: "o", repo: "r", workflowFile: "claude-implement.yml", ref: "main", inputs });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    const second = JSON.parse(String((fetchMock.mock.calls[1]![1] as RequestInit).body)).inputs as Record<string, string>;
-    expect(second).not.toHaveProperty("runner_phase");
-    expect(second.run_config).toBe(inputs.run_config);
-    expect(decodeTrustedRunConfig(second.run_config).credentials?.modelAuthGrant).toMatchObject({ bearer: BEARER });
-    expect(second.run_token).toBe("");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(422);
     expect(JSON.stringify(result)).not.toContain(BEARER);
   });
 });
