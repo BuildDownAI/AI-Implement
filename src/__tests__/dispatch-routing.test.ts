@@ -45,7 +45,7 @@ vi.mock("../fly-machines.js", async (importOriginal) => {
 
 vi.mock("../managed-dispatch-auth.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../managed-dispatch-auth.js")>();
-  return { ...actual, isManagedProject: vi.fn(actual.isManagedProject) };
+  return { ...actual, isManagedProject: vi.fn(actual.isManagedProject), prepareManagedDispatch: vi.fn(actual.prepareManagedDispatch) };
 });
 
 vi.mock("../workflow-probe.js", async (importOriginal) => {
@@ -964,14 +964,18 @@ describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome a
   it("dispatchPlanning: an opted-in project on GitHub Actions is refused, the admission released, and the breaker callback counts it (AII-1391)", async () => {
     const managed = await import("../managed-dispatch-auth.js");
     vi.mocked(managed.isManagedProject).mockReturnValue(true);
-    onTestFinished(() => { vi.mocked(managed.isManagedProject).mockReset(); });
+    vi.mocked(managed.prepareManagedDispatch).mockResolvedValue({ kind: "refuse", category: "configuration-error", code: "runner_incompatible" });
+    onTestFinished(async () => {
+      vi.mocked(managed.isManagedProject).mockReset();
+      vi.mocked(managed.prepareManagedDispatch).mockImplementation((await vi.importActual<typeof import("../managed-dispatch-auth.js")>("../managed-dispatch-auth.js")).prepareManagedDispatch);
+    });
     vi.mocked(github.postWorkflowDispatch).mockReset();
     vi.mocked(provider.markPlanningFailed as never as ReturnType<typeof vi.fn>).mockClear();
     const optedIssue = { ...issue, id: "issue-opted-gha" };
 
     for (let i = 0; i < 3; i++) {
       await expect(indexModule.dispatchPlanning(config, provider, optedIssue, mapping, planningCtx))
-        .rejects.toThrow("managed dispatch refused: gha_not_supported");
+        .rejects.toThrow("managed dispatch refused: runner_incompatible");
     }
 
     expect(github.postWorkflowDispatch).not.toHaveBeenCalled();

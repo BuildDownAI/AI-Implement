@@ -2,8 +2,9 @@
  * Managed dispatch decision adapter (AII-1386).
  *
  * Turns one `prepareAgentRun` result into one dispatch decision (legacy, launch, leave-queued, refuse, hold),
- * settles a launch, and revokes a grant that did not start a run. No consumer exists yet; every dispatch path
- * in later leaves of AII-958 calls it so each path makes the same choice for the same state.
+ * settles a launch, and revokes a grant that did not start a run. Every dispatch path calls it so each path
+ * makes the same choice for the same state. A GitHub Actions launch is decided by the verified default-branch
+ * workflow capability (`prepareAgentRun`), never by backend alone (AII-1420).
  *
  * The raw bearer stays inside the function-valued `takeBootstrap` on a `launch` decision, which
  * `JSON.stringify` and structured logging never see. Refusal text is fixed and built from `kind`, `category`
@@ -19,7 +20,7 @@ import {
 import type { DispatchAdmissionBackend } from "./dispatch-admission.js";
 import type { ModelAuthGrantBootstrapV1, SafeGrantMetadata } from "./model-auth-contract.js";
 import type { ModelAuthRuntime } from "./model-auth-runtime.js";
-import type { ResolvedAgentSnapshotV1 } from "./run-config.js";
+import type { ResolvedAgentSnapshotV1, RunCredentialsV1 } from "./run-config.js";
 
 export interface ManagedDispatchRequest {
   dispatchId: string;
@@ -86,9 +87,6 @@ export async function prepareManagedDispatch(
   runtime: ModelAuthRuntime,
 ): Promise<ManagedDispatchDecision> {
   if (!isManagedProject(req.projectKey, req.dispatchId)) return { kind: "legacy" };
-  if (req.backend === "github-actions") {
-    return { kind: "refuse", category: "configuration-error", code: "gha_not_supported" };
-  }
   if (selectsClaudeSubscription(req.projectKey, req.dispatchId)) return SUBSCRIPTION_REFUSAL;
 
   const repository = `${req.owner}/${req.repo}`;
@@ -176,4 +174,23 @@ export function refusalText(
     case "leave-queued":
       return `Managed dispatch left queued: ${decision.code}. No run was started.`;
   }
+}
+
+/**
+ * Private credentials for a GitHub Actions `launch` decision, or undefined for a legacy one. The bearer is taken
+ * once; a missing bootstrap (already consumed) throws a fixed message so nothing launches without it.
+ */
+export function ghaManagedCredentials(
+  decision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }>,
+): RunCredentialsV1 | undefined {
+  if (decision.kind !== "launch") return undefined;
+  const bootstrap = decision.takeBootstrap();
+  if (!bootstrap) throw new Error("managed dispatch bootstrap unavailable");
+  return { version: 1, modelAuthGrant: bootstrap };
+}
+
+/** Maps a `postWorkflowDispatch` result to a settle outcome: only an API-level rejection is definitive. */
+export function ghaLaunchOutcome(result: { success: boolean; outcome?: string }): "accepted" | "rejected" | "unknown" {
+  if (result.success) return "accepted";
+  return result.outcome === "rejected" ? "rejected" : "unknown";
 }

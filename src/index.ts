@@ -60,6 +60,8 @@ import { createModelAuthRoutes } from "./model-auth-routes.js";
 import { createAgentConfigAdminDeps, getModelAuthRuntime, type ModelAuthRuntime } from "./model-auth-runtime.js";
 import {
   classifyLaunchError,
+  ghaLaunchOutcome,
+  ghaManagedCredentials,
   isManagedProject,
   prepareManagedDispatch,
   refusalText,
@@ -1178,21 +1180,6 @@ export async function dispatchGitHubActions(
   // Final admission authority: one transaction reserves team capacity and per-issue
   // occupancy before any credential mint or launch call. canDispatch (checked earlier,
   // in poll()) is only the preview.
-  // An opted-in project cannot run on GitHub Actions yet (AII-970): refuse before anything is reserved.
-  if (isManagedProject(issue.scopeKey)) {
-    await provider.markImplementationFailed(
-      issue.id,
-      issue.scopeKey,
-      refusalText({ kind: "refuse", category: "configuration-error", code: "gha_not_supported" }),
-    );
-    // Count the refusal so a persistently refused issue parks instead of re-commenting every poll.
-    const breakerGha = recordDispatchFailure(issue.id, "implementation", "gha_not_supported");
-    if (breakerGha.tripped) {
-      await fireBreakerTrip(config, provider, issue.id, issue.identifier, "implementation", breakerGha.failures, "gha_not_supported");
-    }
-    return;
-  }
-
   const dispatchId = crypto.randomUUID();
   const admission = acquireDispatch({
     dispatchId,
@@ -1204,6 +1191,40 @@ export async function dispatchGitHubActions(
     backend: "github-actions",
   });
   if (!admission.ok) return;
+
+  // Managed model authentication (AII-1420): decided after admission and before any run token is minted.
+  // The decision carries the frozen snapshot and the one-shot bootstrap; a refusal launches nothing.
+  const managedRuntime = getModelAuthRuntime(config);
+  let managedDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
+  if (isManagedProject(issue.scopeKey, dispatchId)) {
+    let decision: ManagedDispatchDecision;
+    try {
+      decision = await prepareManagedDispatch(
+        { dispatchId, projectKey: issue.scopeKey, backend: "github-actions", owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile },
+        managedRuntime,
+      );
+    } catch (err) {
+      admission.release("launch_rejected");
+      throw err;
+    }
+    console.log(`[poll] Managed dispatch for ${issue.identifier}: ${decision.kind}${"code" in decision ? ` (${decision.code})` : ""}`);
+    if (decision.kind === "legacy" || decision.kind === "launch") {
+      managedDecision = decision;
+    } else {
+      admission.release("launch_rejected");
+      if (decision.kind === "refuse") {
+        await provider.markImplementationFailed(issue.id, issue.scopeKey, refusalText(decision));
+        // Count the refusal so a persistently refused issue parks instead of re-commenting every poll.
+        const breakerRefuse = recordDispatchFailure(issue.id, "implementation", decision.code);
+        if (breakerRefuse.tripped) {
+          await fireBreakerTrip(config, provider, issue.id, issue.identifier, "implementation", breakerRefuse.failures, decision.code);
+        }
+      } else {
+        console.log(`[poll] ${refusalText(decision)} (${issue.identifier})`);
+      }
+      return;
+    }
+  }
 
   // True whenever base_branch is forwarded as a legacy workflow input — set by the
   // field OR by feature-branch grouping. Used only to attribute a 422 below.
@@ -1217,6 +1238,8 @@ export async function dispatchGitHubActions(
   const { ghToken, runnerImage, contract, dispatchInputs } =
     await (async () => {
       const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+      const managedCredentials = ghaManagedCredentials(managedDecision);
+      const credentials = managedCredentials ? { ...trustedCredentials, ...managedCredentials } : trustedCredentials;
 
       let runnerCallbackUrl = "";
       let runToken = "";
@@ -1249,7 +1272,7 @@ export async function dispatchGitHubActions(
       });
       const { contract } = workflowCapabilities;
       assertPrivateTransportForCredentials(
-        trustedCredentials, workflowCapabilities,
+        credentials, workflowCapabilities,
         `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
       );
       const runPublicationToken = contract === "envelope" && workflowCapabilities.supportsRunPublicationToken
@@ -1265,7 +1288,8 @@ export async function dispatchGitHubActions(
             runProgressToken,
             runPublicationToken,
             privateTransport: workflowCapabilities.supportsPrivateRunConfig === true,
-            credentials: trustedCredentials,
+            credentials,
+            ...(managedDecision.kind === "launch" ? { agentConfig: managedDecision.snapshot } : {}),
             runnerImage,
             groupingParent: isGroupingParentDispatch(issue) || undefined,
             retryPolicy: getRetryPolicy(),
@@ -1293,6 +1317,8 @@ export async function dispatchGitHubActions(
 
       return { ghToken, runnerCallbackUrl, runToken, runProgressToken, runnerImage, contract, dispatchInputs };
     })().catch((err) => {
+      // Nothing launched: revoke the grant and free the reservation.
+      settleLaunch(managedDecision, "rejected", managedRuntime);
       admission.release("launch_rejected");
       throw err;
     });
@@ -1301,15 +1327,23 @@ export async function dispatchGitHubActions(
   // itself refused the request (a 4xx before any run started) — the one signal precise
   // enough to treat as a definitive non-launch. Anything else (a thrown network error,
   // a 5xx, "unknown") stays uncertain and must not release the reservation below.
-  const result = await postWorkflowDispatch({
-    token: ghToken,
-    owner: mapping.owner,
-    repo: mapping.repo,
-    workflowFile: mapping.workflowFile,
-    ref: mapping.defaultBranch,
-    inputs: dispatchInputs,
-    returnRunDetails: true,
-  });
+  let result: Awaited<ReturnType<typeof postWorkflowDispatch>>;
+  try {
+    result = await postWorkflowDispatch({
+      token: ghToken,
+      owner: mapping.owner,
+      repo: mapping.repo,
+      workflowFile: mapping.workflowFile,
+      ref: mapping.defaultBranch,
+      inputs: dispatchInputs,
+      returnRunDetails: true,
+    });
+  } catch (err) {
+    // Uncertain: the request may have reached GitHub. Revoke the grant; the admission stays held.
+    settleLaunch(managedDecision, "unknown", managedRuntime);
+    throw err;
+  }
+  settleLaunch(managedDecision, ghaLaunchOutcome(result), managedRuntime);
 
   if (!result.success) {
     await surfaceDispatchFailure(
@@ -3970,15 +4004,6 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         continue;
       }
 
-      // Protected model auth has no GitHub Actions transport: refuse before any admission or grant.
-      if (isManagedProject(scopeKey)) {
-        console.warn(
-          `[review-fix] ${refusalText({ kind: "refuse", category: "configuration-error", code: "gha_not_supported" })} (${fix.issueIdentifier ?? fix.issueId})`,
-        );
-        updateReviewFixStatus(fix.id, "failed");
-        continue;
-      }
-
       // Final admission authority: one transaction reserves team capacity and PR-scoped
       // occupancy before any credential mint or launch call. gateDecision (checked above)
       // is only the preview. Reuse a dispatchId already minted above (callback configured);
@@ -4004,6 +4029,31 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         continue;
       }
 
+      // Managed model authentication (AII-1420): decided after admission and before any launch call.
+      let ghaFixDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
+      const ghaFixRuntime = getModelAuthRuntime(config);
+      if (isManagedProject(scopeKey, dispatchId)) {
+        let decision: ManagedDispatchDecision;
+        try {
+          decision = await prepareManagedDispatch(
+            { dispatchId, projectKey: scopeKey, backend: "github-actions", owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile },
+            ghaFixRuntime,
+          );
+        } catch (err) {
+          releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
+          throw err;
+        }
+        console.log(`[review-fix] Managed dispatch for review fix #${fix.id}: ${decision.kind}${"code" in decision ? ` (${decision.code})` : ""}`);
+        if (decision.kind === "legacy" || decision.kind === "launch") {
+          ghaFixDecision = decision;
+        } else {
+          releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
+          console.log(`[review-fix] ${refusalText(decision)} (${fix.issueIdentifier ?? fix.issueId})`);
+          if (decision.kind === "refuse") updateReviewFixStatus(fix.id, "failed");
+          continue;
+        }
+      }
+
       // Everything below is pure prep — no launch call has fired yet. A throw anywhere in
       // here (e.g. a workflow-capabilities probe failure) is by construction a definitive
       // non-launch, so it releases the reservation and rethrows for the outer per-item catch
@@ -4023,6 +4073,11 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           ref: mapping.defaultBranch,
         });
         reviewFixContract = reviewFixCapabilities.contract;
+        const ghaFixCredentials = ghaManagedCredentials(ghaFixDecision);
+        assertPrivateTransportForCredentials(
+          ghaFixCredentials, reviewFixCapabilities,
+          `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
+        );
         const runPublicationToken = reviewFixContract === "envelope" && reviewFixCapabilities.supportsRunPublicationToken
           ? mintedPublicationToken
           : undefined;
@@ -4043,6 +4098,8 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
               runProgressToken,
               runPublicationToken,
               privateTransport: reviewFixCapabilities.supportsPrivateRunConfig === true,
+              credentials: ghaFixCredentials,
+              ...(ghaFixDecision.kind === "launch" ? { agentConfig: ghaFixDecision.snapshot } : {}),
               runnerImage,
               retryPolicy: getRetryPolicy(),
             })
@@ -4066,11 +4123,19 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
               ...(runnerImage ? { runner_image: runnerImage } : {}),
             };
       } catch (err) {
+        settleLaunch(ghaFixDecision, "rejected", ghaFixRuntime);
         releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
         throw err;
       }
 
-      const result = await dispatchWorkflow(ghToken, mapping, reviewFixInputs, { returnRunDetails: true });
+      let result: Awaited<ReturnType<typeof dispatchWorkflow>>;
+      try {
+        result = await dispatchWorkflow(ghToken, mapping, reviewFixInputs, { returnRunDetails: true });
+      } catch (err) {
+        settleLaunch(ghaFixDecision, "unknown", ghaFixRuntime);
+        throw err;
+      }
+      settleLaunch(ghaFixDecision, ghaLaunchOutcome(result), ghaFixRuntime);
 
       if (!result.success) {
         if (result.outcome !== "rejected") {

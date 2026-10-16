@@ -5,6 +5,7 @@ import path from "node:path";
 import type { RepoMapping } from "../config.js";
 import type { TicketIssue, TicketingProvider } from "../providers/types.js";
 import type { AppConfig } from "../index.js";
+import { makeGrant, makeSnapshot } from "./configured-run-fixture.js";
 
 vi.mock("../github.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../github.js")>();
@@ -15,7 +16,7 @@ vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn(), getScop
 vi.mock("../local-docker.js", () => ({ startLocalRunnerContainer: vi.fn(), validateProtectedLocalInput: vi.fn() }));
 vi.mock("../managed-dispatch-auth.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../managed-dispatch-auth.js")>();
-  return { ...actual, isManagedProject: vi.fn(() => false) };
+  return { ...actual, isManagedProject: vi.fn(() => false), prepareManagedDispatch: vi.fn(), settleLaunch: vi.fn() };
 });
 vi.mock("../model-auth-runtime.js", () => ({ getModelAuthRuntime: vi.fn(() => ({ runtime: true })) }));
 vi.mock("../fly-protection-key.js", () => ({ buildProtectedFlyBootstrap: vi.fn(async () => ({ sealed: "SEALED" })) }));
@@ -580,6 +581,8 @@ describe("preparePlanningLaunch for an opted-in project", () => {
 
   it("refuses before any mint or dispatch and trips the breaker on the third", async () => {
     const mod = await import("../planning-launch.js");
+    const managed = await import("../managed-dispatch-auth.js");
+    vi.mocked(managed.prepareManagedDispatch).mockResolvedValue({ kind: "refuse", category: "configuration-error", code: "runner_incompatible" });
     const auth = await import("../github-app-auth.js");
     const github = await import("../github.js");
     const breaker = await import("../dispatch-breaker.js");
@@ -594,7 +597,7 @@ describe("preparePlanningLaunch for an opted-in project", () => {
       resolveRunnerImage: vi.fn(), fireBreakerTrip,
     };
     for (let i = 0; i < 3; i++) {
-      await expect(mod.preparePlanningLaunch(args)).rejects.toThrow("managed dispatch refused: gha_not_supported");
+      await expect(mod.preparePlanningLaunch(args)).rejects.toThrow("managed dispatch refused: runner_incompatible");
     }
     expect(markPlanningFailed).toHaveBeenCalledTimes(3);
     expect(auth.getInstallationToken).not.toHaveBeenCalled();
@@ -647,5 +650,159 @@ describe("preparePlanningLaunch tokens", () => {
     expect(inputs.run_publication_token).toBeUndefined();
     const rows = dedup.getDb().prepare("SELECT audience FROM runner_tokens WHERE dispatch_id = 'd-prep-1' ORDER BY audience").all();
     expect(rows).toEqual([{ audience: "progress" }, { audience: "result" }]);
+  });
+});
+
+describe("managed planning on GitHub Actions (AII-1420)", () => {
+  let dbPath: string;
+  let dedup: typeof import("../dedup.js");
+  let managed: typeof import("../managed-dispatch-auth.js");
+  let github: typeof import("../github.js");
+  let probe: typeof import("../workflow-probe.js");
+  let mod: typeof import("../planning-launch.js");
+
+  const snapshot = makeSnapshot("codex-subscription");
+  const bootstrap = makeGrant(snapshot, { backend: "gha", dispatchId: "d-gha", projectKey: "AII" });
+  const issue = { id: "i-gha", identifier: "AII-1420", title: "t", description: "d", scopeKey: "AII", nativeStatus: "Todo" } as TicketIssue;
+  const mapping = { owner: "o", repo: "r", workflowFile: "w.yml", planningWorkflowFile: "p.yml", defaultBranch: "main" } as unknown as RepoMapping;
+  const config = {
+    githubAppId: "id", githubAppPrivateKey: "key", runnerCallbackBaseUrl: "http://cb", runnerTokenSecret: "secret-with-enough-entropy-for-hmac",
+  } as unknown as AppConfig;
+  const provider = {
+    id: "linear",
+    issueUrl: vi.fn(() => "https://example.test/AII-1420"),
+    markPlanningFailed: vi.fn(),
+    markPlanningStarted: vi.fn(),
+    postComment: vi.fn(),
+  } as unknown as TicketingProvider;
+  const fireBreakerTrip = vi.fn();
+  let decision: { kind: "launch"; dispatchId: string; projectKey: string; backend: "github-actions"; snapshot: typeof snapshot; grant: object; takeBootstrap: ReturnType<typeof vi.fn> };
+
+  const prepare = () => mod.preparePlanningLaunch({
+    config, provider, issue, mapping, dispatchId: "d-gha", resolvedPlanningBranch: "main",
+    resolveRunnerImage: async () => undefined, fireBreakerTrip,
+  });
+  const launch = async (onRejected = vi.fn()) => {
+    const prepared = await prepare();
+    return { prepared, onRejected, run: () => mod.launchPlanningRun({
+      ...prepared, config, provider, issue, mapping, dispatchId: "d-gha", admissionGeneration: 1,
+      planningFieldValue: null, fireBreakerTrip, onRejected,
+    }) };
+  };
+
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+    dbPath = path.join(os.tmpdir(), `planning-managed-gha-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
+    process.env.DEDUP_DB_PATH = dbPath;
+    dedup = await import("../dedup.js");
+    dedup.getDb();
+    (await import("../dispatch-breaker.js")).initDispatchBreakerTable();
+    (await import("../log.js")).initLogTable();
+    managed = await import("../managed-dispatch-auth.js");
+    github = await import("../github.js");
+    probe = await import("../workflow-probe.js");
+    mod = await import("../planning-launch.js");
+    vi.mocked(managed.isManagedProject).mockReturnValue(true);
+    vi.mocked((await import("../github-app-auth.js")).getInstallationToken).mockResolvedValue("control-token");
+    vi.mocked(probe.resolveWorkflowCapabilities).mockResolvedValue({
+      contract: "envelope", supportsRunPublicationToken: false, supportsAttemptCorrelation: false, supportsPrivateRunConfig: true,
+    });
+    decision = {
+      kind: "launch", dispatchId: "d-gha", projectKey: "AII", backend: "github-actions",
+      snapshot, grant: {}, takeBootstrap: vi.fn(() => bootstrap),
+    };
+    vi.mocked(managed.prepareManagedDispatch).mockResolvedValue(decision as never);
+  });
+
+  afterEach(async () => {
+    vi.mocked((await import("../managed-dispatch-auth.js")).isManagedProject).mockReturnValue(false);
+    dedup.closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  it("a capable launch carries the frozen snapshot and protected bootstrap privately, with no downgrade", async () => {
+    const { decodeTrustedRunConfig, decodeRunConfig } = await import("../run-config.js");
+    const prepared = await prepare();
+
+    expect(managed.prepareManagedDispatch).toHaveBeenCalledWith(
+      expect.objectContaining({ backend: "github-actions", projectKey: "AII", dispatchId: "d-gha", workflowFile: "p.yml" }),
+      expect.anything(),
+    );
+    const inputs = prepared.planningDispatchInputs as Record<string, string>;
+    const trusted = decodeTrustedRunConfig(inputs.run_config!);
+    expect(trusted.agentConfig).toEqual(snapshot);
+    expect(trusted.credentials?.modelAuthGrant).toEqual(bootstrap);
+    expect(decodeRunConfig(inputs.run_config!).credentials).toBeUndefined();
+    expect(inputs.run_token).toBe("");
+    for (const [k, v] of Object.entries(inputs)) {
+      if (k !== "run_config") expect(String(v)).not.toContain(bootstrap.bearer);
+    }
+    expect(decision.takeBootstrap).toHaveBeenCalledTimes(1);
+    expect(managed.settleLaunch).not.toHaveBeenCalled();
+  });
+
+  it("a workflow without the private transport revokes the grant and throws before any dispatch", async () => {
+    vi.mocked(probe.resolveWorkflowCapabilities).mockResolvedValue({
+      contract: "envelope", supportsRunPublicationToken: false, supportsAttemptCorrelation: false, supportsPrivateRunConfig: false,
+    });
+
+    await expect(prepare()).rejects.toThrow(/supportsPrivateRunConfig|refusing to drop or downgrade/);
+
+    expect(managed.settleLaunch).toHaveBeenCalledWith(decision, "rejected", expect.anything());
+    expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["refuse", { kind: "refuse", category: "configuration-error", code: "runner_incompatible" }],
+    ["authentication-required", { kind: "refuse", category: "authentication-required", code: "profile_disabled" }],
+  ])("a %s decision marks planning failed, mints nothing and launches nothing", async (_n, refusal) => {
+    vi.mocked(managed.prepareManagedDispatch).mockResolvedValue(refusal as never);
+
+    await expect(prepare()).rejects.toThrow(`managed dispatch refused: ${(refusal as { code: string }).code}`);
+
+    expect(provider.markPlanningFailed).toHaveBeenCalledTimes(1);
+    expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
+    expect(managed.settleLaunch).not.toHaveBeenCalled();
+  });
+
+  it("accepted dispatch keeps the grant", async () => {
+    vi.mocked(github.postWorkflowDispatch).mockResolvedValue({ success: true, status: 204, outcome: "accepted" });
+    const { run, onRejected } = await launch();
+
+    expect(await run()).toMatchObject({ outcome: "accepted" });
+
+    expect(managed.settleLaunch).toHaveBeenCalledWith(decision, "accepted", expect.anything());
+    expect(onRejected).not.toHaveBeenCalled();
+  });
+
+  it("rejected dispatch revokes the grant and releases the admission", async () => {
+    vi.mocked(github.postWorkflowDispatch).mockResolvedValue({ success: false, status: 404, error: "Not Found", outcome: "rejected" });
+    const { run, onRejected } = await launch();
+
+    expect(await run()).toEqual({ outcome: "rejected" });
+
+    expect(managed.settleLaunch).toHaveBeenCalledWith(decision, "rejected", expect.anything());
+    expect(onRejected).toHaveBeenCalledTimes(1);
+  });
+
+  it("uncertain dispatch revokes the grant and keeps the admission", async () => {
+    vi.mocked(github.postWorkflowDispatch).mockResolvedValue({ success: false, status: 503, error: "upstream", outcome: "unknown" });
+    const { run, onRejected } = await launch();
+
+    expect(await run()).toEqual({ outcome: "unknown" });
+
+    expect(managed.settleLaunch).toHaveBeenCalledWith(decision, "unknown", expect.anything());
+    expect(onRejected).not.toHaveBeenCalled();
+  });
+
+  it("a throwing dispatch revokes the grant, keeps the admission and rethrows", async () => {
+    vi.mocked(github.postWorkflowDispatch).mockRejectedValue(new Error("socket hang up"));
+    const { run, onRejected } = await launch();
+
+    await expect(run()).rejects.toThrow("socket hang up");
+
+    expect(managed.settleLaunch).toHaveBeenCalledWith(decision, "unknown", expect.anything());
+    expect(onRejected).not.toHaveBeenCalled();
   });
 });
