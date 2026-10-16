@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { checkFullAccessAdmission, CodexFullAccessRefusedError, type FullAccessAdmissionReport } from "./full-access-admission.js";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -45,6 +46,9 @@ export const CODEX_SHELL_ENV_EXCLUDE = [
   "OPENAI_API_KEY",
   "OPENAI_BASE_URL",
 ] as const;
+
+/** Pinned Codex 0.159.2 flag accepted by both `exec` and `exec resume`; intended for externally sandboxed environments. */
+const FULL_ACCESS_FLAG = "--dangerously-bypass-approvals-and-sandbox";
 
 const shellEnvPolicyArgs = (): string[] => ["-c", `shell_environment_policy.exclude=${JSON.stringify(CODEX_SHELL_ENV_EXCLUDE)}`];
 
@@ -145,6 +149,14 @@ export interface CodexExecutorOptions {
    * CODEX_HOME or a forbidden root.
    */
   trustedSkillsDir?: string;
+  /**
+   * Operator-approved ephemeral full access (AII-1437), validated by the runner against the trusted launch context.
+   * Constructor-held and never recomputed: only `agentStage === "implementation"` can use it, planning and review
+   * keep their restrictions, and no retry or resume path widens or narrows it. Default (absent) = existing sandbox.
+   */
+  implementationFullAccess?: true;
+  /** Admission seam (tests). Defaults to the real root and host Docker socket access check. */
+  fullAccessAdmission?: () => FullAccessAdmissionReport;
 }
 
 const SKILLS_REJECTED = "The trusted skills directory is not allowed in the planning view";
@@ -370,6 +382,12 @@ export class CodexExecutor implements LLMExecutor {
   async invoke(params: InvokeParams): Promise<LLMResult> {
     if (this.held) throw new CodexRecoveryRequiredError("held");
     if (params.agentStage === "planning" && !this.options.protocolDriver) throw new CodexPlanningPolicyUnprovenError();
+    if (this.usesFullAccess(params)) {
+      // Before any auth checkout or spawn: a root user or a reachable host Docker socket voids the outer boundary.
+      const report = (this.options.fullAccessAdmission ?? checkFullAccessAdmission)();
+      if (!report.admitted) throw new CodexFullAccessRefusedError(report);
+      console.log("[codex] implementation runs with operator-approved ephemeral full access (outer runner isolation)");
+    }
     const startedAt = this.now();
     // `invocationTimeoutMs` bounds the whole invocation (every attempt and backoff), not each spawn.
     const deadlineAt = params.invocationTimeoutMs != null ? startedAt + params.invocationTimeoutMs : null;
@@ -562,7 +580,12 @@ export class CodexExecutor implements LLMExecutor {
    * config or caller-supplied flags. An absent stage keeps the legacy `builtinTools` mapping.
    * Planning never reaches here: it runs on the app-server path with its own argv.
    */
+  private usesFullAccess(params: InvokeParams): boolean {
+    return this.options.implementationFullAccess === true && params.agentStage === "implementation";
+  }
+
   private sandboxArgs(params: InvokeParams): string[] {
+    if (this.usesFullAccess(params)) return [FULL_ACCESS_FLAG];
     switch (params.agentStage) {
       case "review":
         return ["--sandbox", "read-only"];
@@ -575,13 +598,15 @@ export class CodexExecutor implements LLMExecutor {
 
   /** `codex exec resume` has no `--sandbox`; the same policy is passed as the `sandbox_mode` config override. */
   private resumeSandboxArgs(params: InvokeParams): string[] {
+    // The pinned `exec resume` accepts the same bypass flag, so a resumed thread keeps exactly the fresh authority.
+    if (this.usesFullAccess(params)) return [FULL_ACCESS_FLAG];
     const [, mode] = this.sandboxArgs(params);
     return ["-c", `sandbox_mode=${JSON.stringify(mode)}`];
   }
 
   private buildArgs(params: InvokeParams, schemaPath: string | null, baseUrl?: string, provider?: CodexProviderKind, resumeThreadId?: string | null): string[] {
     // Pinned selection is placed on argv, after the ignore flags, so user or project config
-    // cannot change it. No Claude-only flag and no bypass or approve-all flag is ever passed.
+    // cannot change it. No Claude-only flag is ever passed, and the bypass flag appears only for an approved implementation stage.
     const args = [
       "exec",
       ...(resumeThreadId ? ["resume"] : []),

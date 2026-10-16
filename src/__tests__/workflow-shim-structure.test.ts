@@ -129,6 +129,14 @@ describe("GHA workflow shims", () => {
       }
     });
 
+    it(`${f} ${IMPLEMENT_WORKFLOWS.includes(f) ? "advertises" : "does not advertise"} the ephemeral execution policy capability`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      const marker = /^# ai-implement-capability: ephemeral-execution-policy-v1$/m;
+      // Only the implementation workflow projects the policy; planning rejects it as an unknown credential key.
+      expect(marker.test(yaml)).toBe(IMPLEMENT_WORKFLOWS.includes(f));
+      expect(yaml.includes("AI_IMPLEMENT_EXECUTION_POLICY")).toBe(IMPLEMENT_WORKFLOWS.includes(f));
+    });
+
     it(`${f} never decodes or dumps run_config outside the projection`, () => {
       const yaml = readFileSync(f, "utf-8");
       expect(yaml).not.toMatch(/base64 -d \| jq \.\s/);

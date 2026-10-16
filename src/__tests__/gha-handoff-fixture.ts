@@ -25,6 +25,16 @@ export const GHA_CONTEXT: ModelAuthContextV1 = {
   modelAuthUrl: "https://orchestrator.invalid/model-auth",
 };
 
+/** Trusted execution policy a dispatcher would author for `GHA_CONTEXT` when the mapping carries the opt-in. */
+export const GHA_POLICY = {
+  version: 1,
+  implementationSandbox: "ephemeral-full-access",
+  dispatchId: "disp-1",
+  projectKey: "proj",
+  backend: "gha",
+  ephemeralRunnerAsserted: true,
+} as const;
+
 export function ghaGrant(snapshot: ResolvedAgentSnapshotV1, over: Partial<ModelAuthGrantBootstrapV1> = {}): ModelAuthGrantBootstrapV1 {
   return makeGrant(snapshot, { backend: "gha", ...over });
 }
@@ -37,7 +47,7 @@ export interface GhaHandoff {
   runEnv: Record<string, string>;
 }
 
-type HandoffInput = { snapshot?: ResolvedAgentSnapshotV1; grant?: ModelAuthGrantBootstrapV1; context?: unknown; callback?: boolean };
+type HandoffInput = { snapshot?: ResolvedAgentSnapshotV1; grant?: ModelAuthGrantBootstrapV1; context?: unknown; callback?: boolean; policy?: unknown };
 
 /** Wire form of the dispatch envelope, built directly so a deliberately invalid or missing context reaches the bootstrap, not the encoder. */
 export function ghaRunConfig(file: string, input: HandoffInput): string {
@@ -53,6 +63,7 @@ export function ghaRunConfig(file: string, input: HandoffInput): string {
       ...(file.includes("implement") ? { publicationToken: "pub-synthetic" } : {}),
       ...(input.grant ? { modelAuthGrant: input.grant } : {}),
       ...(input.context !== undefined ? { modelAuthContext: input.context } : {}),
+      ...(input.policy !== undefined ? { executionPolicy: input.policy } : {}),
     },
   } as unknown as RunConfigV1;
   return Buffer.from(JSON.stringify(envelope)).toString("base64");

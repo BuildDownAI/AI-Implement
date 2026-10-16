@@ -5,6 +5,7 @@ import {
   MODEL_AUTH_ENV,
   parseSealedModelAuthBootstrap,
   type SealedModelAuthBootstrapV1,
+  isEphemeralPolicyEnvName,
 } from "./model-auth-contract.js";
 import { isSafeProtectionKeyRef } from "./model-auth-seal.js";
 import {
@@ -796,6 +797,10 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
   }
   if (input.runPublicationToken) {
     env.RUN_PUBLICATION_TOKEN = input.runPublicationToken;
+  }
+  if (input.extraEnv && Object.keys(input.extraEnv).some(isEphemeralPolicyEnvName)) {
+    // The ephemeral full-access opt-in is GHA-only (AII-1437): refuse before any machine is created.
+    throw new Error("ephemeral full-access opt-in is not supported on Fly machines");
   }
   if (input.extraEnv) {
     Object.assign(env, input.extraEnv);

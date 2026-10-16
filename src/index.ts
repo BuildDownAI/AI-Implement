@@ -25,7 +25,7 @@ import {
   type StaleAdmissionCandidate,
 } from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
-import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, postPrComment, defaultFetchSignal, fetchRepoTarball, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, type DispatchInputs } from "./github.js";
+import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, postPrComment, defaultFetchSignal, fetchRepoTarball, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, type DispatchInputs } from "./github.js";
 import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -1238,7 +1238,7 @@ export async function dispatchGitHubActions(
   const { ghToken, runnerImage, contract, dispatchInputs } =
     await (async () => {
       const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
-      const managedCredentials = ghaManagedCredentials(managedDecision, config.runnerCallbackBaseUrl);
+      const managedCredentials = ghaManagedCredentials(managedDecision, config.runnerCallbackBaseUrl, { extraEnv: mapping.extraEnv });
       const credentials = managedCredentials ? { ...trustedCredentials, ...managedCredentials } : trustedCredentials;
 
       let runnerCallbackUrl = "";
@@ -1272,6 +1272,10 @@ export async function dispatchGitHubActions(
       });
       const { contract } = workflowCapabilities;
       assertPrivateTransportForCredentials(
+        credentials, workflowCapabilities,
+        `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
+      );
+      assertExecutionPolicyCapability(
         credentials, workflowCapabilities,
         `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
       );
@@ -4073,8 +4077,12 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           ref: mapping.defaultBranch,
         });
         reviewFixContract = reviewFixCapabilities.contract;
-        const ghaFixCredentials = ghaManagedCredentials(ghaFixDecision, config.runnerCallbackBaseUrl);
+        const ghaFixCredentials = ghaManagedCredentials(ghaFixDecision, config.runnerCallbackBaseUrl, { extraEnv: mapping.extraEnv });
         assertPrivateTransportForCredentials(
+          ghaFixCredentials, reviewFixCapabilities,
+          `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
+        );
+        assertExecutionPolicyCapability(
           ghaFixCredentials, reviewFixCapabilities,
           `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
         );

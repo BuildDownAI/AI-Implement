@@ -17,6 +17,9 @@ const RUN_ATTEMPT_TOKEN_RE = /^\s{2,}run_attempt_token:\s*$/m;
  */
 const PRIVATE_RUN_CONFIG_RE = /^#\s*ai-implement-capability:\s*private-run-config-v1\s*$/m;
 
+/** Static marker for the ephemeral full-access execution policy projection (AII-1437). */
+const EXECUTION_POLICY_RE = /^#\s*ai-implement-capability:\s*ephemeral-execution-policy-v1\s*$/m;
+
 export type WorkflowContract = "envelope" | "legacy";
 export interface WorkflowCapabilities {
   contract: WorkflowContract;
@@ -25,6 +28,8 @@ export interface WorkflowCapabilities {
   supportsAttemptCorrelation: boolean;
   /** True when an envelope workflow carries the private-envelope marker. Absent (older fixtures) = false. */
   supportsPrivateRunConfig?: boolean;
+  /** True when an envelope workflow carries the ephemeral-execution-policy-v1 marker. Absent = false. */
+  supportsExecutionPolicy?: boolean;
 }
 
 type CacheEntry = { expiresAt: number; capabilities: WorkflowCapabilities };
@@ -106,6 +111,7 @@ async function probeCapabilities(
       supportsRunPublicationToken: false,
       supportsAttemptCorrelation: false,
       supportsPrivateRunConfig: false,
+      supportsExecutionPolicy: false,
     },
     transient,
   });
@@ -153,6 +159,7 @@ async function probeCapabilities(
       supportsRunPublicationToken: contract === "envelope" && RUN_PUBLICATION_TOKEN_RE.test(yamlText),
       supportsAttemptCorrelation: contract === "envelope" && RUN_ATTEMPT_TOKEN_RE.test(yamlText),
       supportsPrivateRunConfig: contract === "envelope" && PRIVATE_RUN_CONFIG_RE.test(yamlText),
+      supportsExecutionPolicy: contract === "envelope" && EXECUTION_POLICY_RE.test(yamlText),
     },
     transient: false,
   };

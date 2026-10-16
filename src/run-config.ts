@@ -16,9 +16,11 @@ import {
 import {
   parseModelAuthGrantBootstrap,
   parseModelAuthContext,
+  parseExecutionPolicy,
   parseSealedModelAuthBootstrap,
   type ModelAuthGrantBootstrapV1,
   type ModelAuthContextV1,
+  type ExecutionPolicyV1,
   type SealedModelAuthBootstrapV1,
 } from "./model-auth-contract.js";
 
@@ -114,7 +116,7 @@ export interface RunConfigV1 {
 export const RUN_CREDENTIALS_VERSION = 1;
 const MAX_CREDENTIAL_TOKEN_CHARS = 4096;
 const CREDENTIAL_TOKEN_FIELDS = ["resultToken", "progressToken", "publicationToken", "attemptToken"] as const;
-const CREDENTIAL_FIELDS = ["version", ...CREDENTIAL_TOKEN_FIELDS, "modelAuthGrant", "modelAuthContext"] as const;
+const CREDENTIAL_FIELDS = ["version", ...CREDENTIAL_TOKEN_FIELDS, "modelAuthGrant", "modelAuthContext", "executionPolicy"] as const;
 
 /**
  * Versioned typed credentials for trusted transport. Token fields mirror the synthetic audiences
@@ -131,6 +133,8 @@ export interface RunCredentialsV1 {
   modelAuthGrant?: ModelAuthGrantBootstrapV1 | SealedModelAuthBootstrapV1;
   /** Dispatcher-authored GHA launch context (AII-1427), independent of the grant. Protected-only. */
   modelAuthContext?: ModelAuthContextV1;
+  /** Operator-approved ephemeral full-access policy (AII-1437). Protected-only; must match `modelAuthContext`. */
+  executionPolicy?: ExecutionPolicyV1;
 }
 
 const MAX_DESCRIPTION_CHARS = 40_000;
@@ -302,6 +306,17 @@ export function validateRunCredentials(value: unknown): RunCredentialsV1 {
     if (!parsed.ok) credentialsFail(".modelAuthContext", "is invalid");
     out.modelAuthContext = parsed.value;
   }
+  if (value.executionPolicy !== undefined) {
+    const parsed = parseExecutionPolicy(value.executionPolicy);
+    if (!parsed.ok) credentialsFail(".executionPolicy", "is invalid");
+    const ctx = out.modelAuthContext;
+    // The policy is bound to the trusted launch context: no context, or a different dispatch/project, is refused.
+    if (!ctx || ctx.dispatchId !== parsed.value.dispatchId || ctx.projectKey !== parsed.value.projectKey
+        || ctx.backend !== parsed.value.backend) {
+      credentialsFail(".executionPolicy", "does not match the launch context");
+    }
+    out.executionPolicy = parsed.value;
+  }
   return out;
 }
 
@@ -342,6 +357,7 @@ export function diagnosticProjection(config: RunConfigV1): RunConfigV1 & { crede
     const present = CREDENTIAL_TOKEN_FIELDS.filter((f) => creds[f] !== undefined) as string[];
     if (creds.modelAuthGrant !== undefined) present.push("modelAuthGrant");
     if (creds.modelAuthContext !== undefined) present.push("modelAuthContext");
+    if (creds.executionPolicy !== undefined) present.push("executionPolicy");
     projected.credentialFields = present;
   }
   return projected;

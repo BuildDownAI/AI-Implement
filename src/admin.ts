@@ -1,3 +1,4 @@
+import { EPHEMERAL_FULL_ACCESS_ASSERTION, EPHEMERAL_FULL_ACCESS_EXTRA_ENV, EXECUTION_POLICY_ENV, isEphemeralPolicyEnvName } from "./model-auth-contract.js";
 import http from "node:http";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -3289,6 +3290,21 @@ export async function upsertMappingAction(
       return { status: 400, body: { error: "extraEnv values must all be strings" } };
     }
     extraEnv = body.extraEnv as Record<string, string>;
+    if (Object.keys(extraEnv).some((k) => k.toUpperCase() === EXECUTION_POLICY_ENV)) {
+      return { status: 400, body: { error: `extraEnv name ${EXECUTION_POLICY_ENV} is reserved` } };
+    }
+    if (Object.keys(extraEnv).some((k) => isEphemeralPolicyEnvName(k) && k !== EPHEMERAL_FULL_ACCESS_EXTRA_ENV)) {
+      return { status: 400, body: { error: `extraEnv name ${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} must be spelled exactly` } };
+    }
+    if (EPHEMERAL_FULL_ACCESS_EXTRA_ENV in extraEnv) {
+      if (extraEnv[EPHEMERAL_FULL_ACCESS_EXTRA_ENV] !== EPHEMERAL_FULL_ACCESS_ASSERTION) {
+        return { status: 400, body: { error: `${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} must equal ${EPHEMERAL_FULL_ACCESS_ASSERTION}` } };
+      }
+      const modeForOptIn = body.executionMode ?? existingMapping?.executionMode ?? DEFAULT_EXECUTION_MODE;
+      if (modeForOptIn !== "github-actions") {
+        return { status: 400, body: { error: `${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} is supported only with executionMode "github-actions"` } };
+      }
+    }
   }
 
   const validProviders: ClaudeProvider[] = ["anthropic", "bedrock"];

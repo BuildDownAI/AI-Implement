@@ -47,7 +47,7 @@ import {
   type ModelAuthClient,
   type ModelAuthTransport,
 } from "./model-auth-client.js";
-import { MODEL_AUTH_BACKENDS, MODEL_AUTH_ENV, isSubscriptionAuthMode, type ModelAuthBackend, type ModelAuthFinishHandling } from "./model-auth-contract.js";
+import { EXECUTION_POLICY_ENV, MODEL_AUTH_BACKENDS, MODEL_AUTH_ENV, isSubscriptionAuthMode, type ModelAuthBackend, type ModelAuthFinishHandling } from "./model-auth-contract.js";
 import { STAGE_NAMES } from "./agent-config.js";
 import { repoTrustRejection, type RepoTrust } from "./repo-trust.js";
 import { AgentRecoveryRequiredError, createStageExecutor, type StageExecutorOptions } from "./pipeline/stage-executor.js";
@@ -785,7 +785,8 @@ export type ConfiguredRunFailure =
   | "bootstrap_context_missing"
   | "grant_bindings_mismatch"
   | "transport_unconfigured"
-  | "repository_untrusted";
+  | "repository_untrusted"
+  | "execution_policy_invalid";
 
 /** Fixed-message rejection of an opted-in run; never carries input, grant or credential text. */
 export class ConfiguredRunError extends Error {
@@ -821,6 +822,8 @@ export interface ConfiguredRunOptions {
   now?: () => number;
   /** Executor construction seams for the selected stage executor (tests). */
   createCodex?: StageExecutorOptions["createCodex"];
+  /** Codex executor seams (spawn, sleep, admission) for composition tests. Never carries the full-access policy. */
+  codexOptions?: StageExecutorOptions["codexOptions"];
 }
 
 export interface ConfiguredSyntheticProviderOptions {
@@ -935,6 +938,41 @@ function expectedFromEnv(env: NodeJS.ProcessEnv, snapshotId: string): ExpectedBo
   return { dispatchId, projectKey, snapshotId, backend: backend as ModelAuthBackend };
 }
 
+function readEnvelopeExecutionPolicy(env: NodeJS.ProcessEnv): unknown {
+  const raw = env.AI_IMPLEMENT_RUN_CONFIG;
+  if (!raw) return undefined;
+  try {
+    return decodeTrustedRunConfig(raw).credentials?.executionPolicy;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Operator-approved ephemeral full access (AII-1437). Enabled only when the workflow-projected launch variable, the
+ * validated envelope policy and the trusted model-auth context all agree on a GHA dispatch. An absent variable keeps
+ * the default sandbox; a present one that fails any check rejects the run before execution, never degrades silently.
+ * `GITHUB_ACTIONS`, repository config, a diagnostic stage string and unrelated ambient flags are never consulted.
+ */
+function resolveImplementationFullAccess(
+  env: NodeJS.ProcessEnv,
+  expected: ExpectedBootstrapContext | undefined,
+): boolean {
+  const projected = env[EXECUTION_POLICY_ENV]?.trim();
+  if (!projected) return false;
+  const policy = readEnvelopeExecutionPolicy(env);
+  if (
+    !expected || expected.backend !== "gha" || !isRec(policy) ||
+    policy.version !== 1 || policy.implementationSandbox !== "ephemeral-full-access" ||
+    policy.backend !== "gha" || policy.ephemeralRunnerAsserted !== true ||
+    policy.dispatchId !== expected.dispatchId || policy.projectKey !== expected.projectKey ||
+    projected !== `v1:ephemeral-full-access:gha:${expected.dispatchId}:${expected.projectKey}`
+  ) {
+    throw new ConfiguredRunError("execution_policy_invalid");
+  }
+  return true;
+}
+
 function openGrant(env: NodeJS.ProcessEnv, raw: unknown, expected: ExpectedBootstrapContext, now: () => number) {
   try {
     if (isRec(raw) && raw.ciphertext !== undefined) {
@@ -985,9 +1023,11 @@ export async function prepareConfiguredRun(input: {
   });
 
   let grant: ReturnType<typeof openGrant> | undefined;
+  let expectedContext: ExpectedBootstrapContext | undefined;
   if (grantRaw !== undefined) {
     const now = options.now ?? Date.now;
-    grant = openGrant(env, grantRaw, options.expectedBootstrap ?? expectedFromEnv(env, snapshot.snapshotId), now);
+    expectedContext = options.expectedBootstrap ?? expectedFromEnv(env, snapshot.snapshotId);
+    grant = openGrant(env, grantRaw, expectedContext, now);
     // The grant must cover exactly the profiles this snapshot selects, so one missing the subscription
     // markers (owner generation) or bound to another profile never starts a run.
     for (const stage of STAGE_NAMES) {
@@ -1003,6 +1043,8 @@ export async function prepareConfiguredRun(input: {
       }
     }
   }
+
+  const implementationFullAccess = resolveImplementationFullAccess(env, grant ? expectedContext : undefined);
 
   // Visibility/trust: the same decision dispatch preparation makes. A local subscription run has no
   // grant vouching for a prior dispatch check, so it fails closed without an explicit trust source.
@@ -1043,12 +1085,12 @@ export async function prepareConfiguredRun(input: {
       source,
       authRoot: options.modelAuthRoot ?? env[MODEL_AUTH_ENV.authRoot]?.trim() ?? tmpdir(),
       forbiddenRoots: [input.workspaceDir],
-      protectedEnvKeys: Object.keys(env).filter((k) => k.startsWith("AI_IMPLEMENT_MODEL_AUTH_")),
+      protectedEnvKeys: Object.keys(env).filter((k) => k.startsWith("AI_IMPLEMENT_MODEL_AUTH_") || k === EXECUTION_POLICY_ENV),
       now: options.now,
       onDiagnostic: (d) => console.log(`[model-auth] ${JSON.stringify(d)}`),
     });
   }
-  return buildConfiguredRun(snapshot, client, options, syntheticProvider);
+  return buildConfiguredRun(snapshot, client, options, syntheticProvider, implementationFullAccess);
 }
 
 function buildConfiguredRun(
@@ -1056,6 +1098,7 @@ function buildConfiguredRun(
   client: ModelAuthClient,
   options: ConfiguredRunOptions,
   syntheticProvider?: { url: string; profileIds: Set<string> },
+  implementationFullAccess = false,
 ): ConfiguredRun {
   const modes = new Map(STAGE_NAMES.map((s) => [snapshot.profiles[s].id, snapshot.profiles[s].authMode] as const));
   const checkouts = new Map<string, Promise<void>>();
@@ -1103,6 +1146,8 @@ function buildConfiguredRun(
         activityReporting: args.activityReporting,
         ...(args.legacy ? { createClaude: () => args.legacy as LLMExecutor } : {}),
         ...(options.createCodex ? { createCodex: options.createCodex } : {}),
+        ...(options.codexOptions ? { codexOptions: options.codexOptions } : {}),
+        ...(implementationFullAccess ? { implementationFullAccess: true as const } : {}),
       });
       return {
         async invoke(params) {

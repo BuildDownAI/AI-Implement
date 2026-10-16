@@ -18,7 +18,7 @@ import {
   releaseRejectedLaunch,
 } from "./agent-run-preparation.js";
 import type { DispatchAdmissionBackend } from "./dispatch-admission.js";
-import { parseModelAuthContext, type ModelAuthGrantBootstrapV1, type SafeGrantMetadata } from "./model-auth-contract.js";
+import { hasEphemeralFullAccessOptIn, parseExecutionPolicy, parseModelAuthContext, type ModelAuthGrantBootstrapV1, type SafeGrantMetadata } from "./model-auth-contract.js";
 import type { ModelAuthRuntime } from "./model-auth-runtime.js";
 import type { ResolvedAgentSnapshotV1, RunCredentialsV1 } from "./run-config.js";
 
@@ -183,6 +183,9 @@ export function refusalText(
 export function ghaManagedCredentials(
   decision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }>,
   callbackBaseUrl: string | null | undefined,
+  /** Implementation-phase writers only: the mapping's `extraEnv`, read for the ephemeral full-access opt-in. Planning
+   *  and every other writer omit it, so they can never carry the policy. */
+  implementation?: { extraEnv?: Readonly<Record<string, string>> | null },
 ): RunCredentialsV1 | undefined {
   if (decision.kind !== "launch") return undefined;
   // Context comes from the trusted request and configured callback base, never from the grant.
@@ -196,7 +199,26 @@ export function ghaManagedCredentials(
   if (!context.ok) throw new Error("managed dispatch refused: model auth context unavailable");
   const bootstrap = decision.takeBootstrap();
   if (!bootstrap) throw new Error("managed dispatch bootstrap unavailable");
-  return { version: 1, modelAuthGrant: bootstrap, modelAuthContext: context.value };
+  // The policy is derived from the trusted decision identity plus the administrator's mapping opt-in, never from the grant.
+  let executionPolicy: RunCredentialsV1["executionPolicy"];
+  if (implementation && hasEphemeralFullAccessOptIn(implementation.extraEnv)) {
+    const policy = parseExecutionPolicy({
+      version: 1,
+      implementationSandbox: "ephemeral-full-access",
+      dispatchId: decision.dispatchId,
+      projectKey: decision.projectKey,
+      backend: "gha",
+      ephemeralRunnerAsserted: true,
+    });
+    if (!policy.ok) throw new Error("managed dispatch refused: execution policy unavailable");
+    executionPolicy = policy.value;
+  }
+  return {
+    version: 1,
+    modelAuthGrant: bootstrap,
+    modelAuthContext: context.value,
+    ...(executionPolicy ? { executionPolicy } : {}),
+  };
 }
 
 /** Maps a `postWorkflowDispatch` result to a settle outcome: only an API-level rejection is definitive. */

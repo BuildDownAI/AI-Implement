@@ -410,7 +410,7 @@ export interface EnvelopeDispatchOpts {
    *  encoder) and are NOT duplicated as top-level inputs; `run_token` is sent as "". Absent/false
    *  keeps the generic envelope plus masked top-level token inputs. */
   privateTransport?: boolean;
-  /** Extra typed private credentials. Only `modelAuthGrant`, `modelAuthContext` and `attemptToken` are carried; supplied
+  /** Extra typed private credentials. Only `modelAuthGrant`, `modelAuthContext`, `executionPolicy` and `attemptToken` are carried; supplied
    *  result/progress/publication bearers are ignored in favour of the minted token options.
    *  Requires `privateTransport: true`; supplying it without capability throws rather than
    *  dropping or downgrading it. */
@@ -456,6 +456,20 @@ export function assertPrivateTransportForCredentials(
   }
 }
 
+/** Fail-closed guard for the ephemeral full-access policy (AII-1437): an old workflow's credentials validator would
+ *  drop or reject the unknown field, so a workflow without the capability marker aborts the dispatch before launch. */
+export function assertExecutionPolicyCapability(
+  credentials: RunCredentialsV1 | undefined,
+  capabilities: { supportsExecutionPolicy?: boolean },
+  target: string,
+): void {
+  if (credentials?.executionPolicy !== undefined && capabilities.supportsExecutionPolicy !== true) {
+    throw new Error(
+      `ephemeral execution policy requires the ephemeral-execution-policy-v1 capability on ${target}; refusing to launch without it — re-sync workflows`,
+    );
+  }
+}
+
 /** Only the non-callback private fields a caller may supply. Result/progress/publication bearers are
  *  orchestrator-minted and phase-scoped, so a supplied copy is never carried over. */
 function suppliedNonBearerCredentials(credentials: RunCredentialsV1 | undefined): Partial<RunCredentialsV1> {
@@ -463,6 +477,7 @@ function suppliedNonBearerCredentials(credentials: RunCredentialsV1 | undefined)
     ...(credentials?.attemptToken !== undefined ? { attemptToken: credentials.attemptToken } : {}),
     ...(credentials?.modelAuthGrant !== undefined ? { modelAuthGrant: credentials.modelAuthGrant } : {}),
     ...(credentials?.modelAuthContext !== undefined ? { modelAuthContext: credentials.modelAuthContext } : {}),
+    ...(credentials?.executionPolicy !== undefined ? { executionPolicy: credentials.executionPolicy } : {}),
   };
 }
 

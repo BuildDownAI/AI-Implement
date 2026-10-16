@@ -13,7 +13,7 @@ import { claimPendingCommentGapfills, markCommentGapfillProcessed } from "./comm
 import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getInFlightJobs, appendLog, countPriorDispatches, updateJobPrUrl, suppressStaleNotifications, type Job } from "./log.js";
 import { resolveExecutionPath, getFlySecretsMinVersion, getFlyProcessLevelSecrets, type RunnerMode } from "./runner-mode.js";
 import { mintLaunchTokens, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
-import { buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, capRunnerEnv, branchPrefixRunnerEnv, skillsRepoRunnerEnv, getPullRequestState, type DispatchResult } from "./github.js";
+import { buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, capRunnerEnv, branchPrefixRunnerEnv, skillsRepoRunnerEnv, getPullRequestState, type DispatchResult } from "./github.js";
 import { buildRunConfig, encodeRunConfig, type RunConfigV1, type RunCredentialsV1 } from "./run-config.js";
 import { getRetryPolicy } from "./orchestrator-settings.js";
 import { createMachine, listAppSecrets, generateSessionToken, generateMachineNonce, buildSessionMachineConfig } from "./fly-machines.js";
@@ -737,9 +737,13 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           }));
           contract = capabilities.contract;
           const suppliedCredentials = opts.getTrustedCredentials?.({ owner: item.owner, repo: item.repo, prNumber: item.prNumber });
-          const managedCredentials = ghaManagedCredentials(ghaDecision, opts.runnerCallbackBaseUrl);
+          const managedCredentials = ghaManagedCredentials(ghaDecision, opts.runnerCallbackBaseUrl, { extraEnv: mapping.extraEnv });
           const trustedCredentials = managedCredentials ? { ...suppliedCredentials, ...managedCredentials } : suppliedCredentials;
           assertPrivateTransportForCredentials(
+            trustedCredentials, capabilities,
+            `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
+          );
+          assertExecutionPolicyCapability(
             trustedCredentials, capabilities,
             `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
           );
