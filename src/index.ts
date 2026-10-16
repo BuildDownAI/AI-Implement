@@ -1238,7 +1238,7 @@ export async function dispatchGitHubActions(
   const { ghToken, runnerImage, contract, dispatchInputs } =
     await (async () => {
       const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
-      const managedCredentials = ghaManagedCredentials(managedDecision);
+      const managedCredentials = ghaManagedCredentials(managedDecision, config.runnerCallbackBaseUrl);
       const credentials = managedCredentials ? { ...trustedCredentials, ...managedCredentials } : trustedCredentials;
 
       let runnerCallbackUrl = "";
@@ -4073,7 +4073,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           ref: mapping.defaultBranch,
         });
         reviewFixContract = reviewFixCapabilities.contract;
-        const ghaFixCredentials = ghaManagedCredentials(ghaFixDecision);
+        const ghaFixCredentials = ghaManagedCredentials(ghaFixDecision, config.runnerCallbackBaseUrl);
         assertPrivateTransportForCredentials(
           ghaFixCredentials, reviewFixCapabilities,
           `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,

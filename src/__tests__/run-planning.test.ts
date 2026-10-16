@@ -9,6 +9,9 @@ import { encodeRunConfig, encodeTrustedRunConfig, type ResolvedAgentSnapshotV1 }
 import { AgentRecoveryRequiredError } from "../pipeline/stage-executor.js";
 import { MODEL_AUTH_ROUTES } from "../model-auth-contract.js";
 import { EXPECTED, NOW, SENTINEL_BEARER, fakeClient, makeGrant } from "./configured-run-fixture.js";
+import { GHA_CONTEXT, GHA_PLAN_WORKFLOWS, ghaGrant, ghaRunStepEnv, stubRunEnv } from "./gha-handoff-fixture.js";
+import { prepareConfiguredRun } from "../run-autonomous.js";
+import type { ModelAuthTransport } from "../model-auth-client.js";
 import type { InvokeParams, LLMResult } from "../pipeline/types.js";
 import { vi } from "vitest";
 import { EventEmitter } from "node:events";
@@ -649,6 +652,168 @@ describe("configured planning (shared prepareConfiguredRun + selected stage exec
     expect(JSON.stringify(posted)).not.toContain(SENTINEL_BEARER);
     expect(JSON.stringify(posted)).not.toContain(S_API);
   });
+
+  // ---- AII-1427: the trusted launch context arrives from the real GHA bootstrap, never from the test ----
+
+  /** Loopback model-auth service: answers checkout/finish locally; records every route hit. */
+  function loopbackTransport() {
+    const hits: string[] = [];
+    const transport: ModelAuthTransport = {
+      post: vi.fn(async (route: string) => {
+        hits.push(route);
+        const body = route === MODEL_AUTH_ROUTES.checkout
+          ? { version: 1, ok: true, profileId: "p-plan", authMode: "anthropic-api-key", secret: { kind: "api-key", apiKey: S_API } }
+          : { version: 1, ok: true, acknowledged: true };
+        return { status: 200, body };
+      }),
+    };
+    return { transport, hits };
+  }
+
+  const planSnapshot = (agent: "claude" | "codex", authMode: "anthropic-api-key" | "openai-api-key" | "codex-subscription") => {
+    const snapshot = snapshotFor(agent);
+    snapshot.profiles.planning = { ...snapshot.profiles.planning, authMode } as never;
+    return snapshot;
+  };
+
+  for (const file of GHA_PLAN_WORKFLOWS) {
+    describe(`GHA bootstrap handoff via ${file}`, () => {
+      it("baseline: an old-shaped Run env (envelope present, no AI_IMPLEMENT_MODEL_AUTH_*) is rejected with bootstrap_context_missing", async () => {
+        const snapshot = planSnapshot("codex", "codex-subscription");
+        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot) });
+        expect(handoff.bootStatus).toBe(0);
+        // Old template: only the envelope reaches the Run step.
+        const oldEnv = { AI_IMPLEMENT_RUN_CONFIG: handoff.runEnv.AI_IMPLEMENT_RUN_CONFIG };
+        await expect(
+          prepareConfiguredRun({ env: oldEnv, snapshot, workspaceDir: ws, options: { now: () => NOW } }),
+        ).rejects.toMatchObject({ code: "CONFIGURED_RUN_INVALID", reason: "bootstrap_context_missing" });
+        stubRunEnv(oldEnv);
+        const codex = fakeCodex(true);
+        const { impl, argv } = fakeSpawn({ plan: true });
+        const r = await runPlanning({ workspaceDir: ws, executor: legacy, spawnImpl: impl, configured: { createCodex: codex.createCodex }, fetchImpl: fakeFetch as never });
+        expect(r.exitCode).toBe(1);
+        expect(posted[0].failureReason).toBe("Configured planning failed (bootstrap_context_missing)");
+        expect(codex.created).toEqual([]);
+        expect(argv).toEqual([]);
+        expect(legacy).not.toHaveBeenCalled();
+      });
+
+      it("a context-less envelope from the real bootstrap yields no context env, so the runner still refuses", async () => {
+        const snapshot = planSnapshot("codex", "codex-subscription");
+        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot) });
+        expect(handoff.runEnv.AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID).toBe("");
+        stubRunEnv(handoff.runEnv);
+        const codex = fakeCodex(true);
+        const r = await runPlanning({ workspaceDir: ws, executor: legacy, configured: { createCodex: codex.createCodex }, fetchImpl: fakeFetch as never });
+        expect(r.exitCode).toBe(1);
+        expect(posted[0].failureReason).toBe("Configured planning failed (bootstrap_context_missing)");
+        expect(codex.created).toEqual([]);
+      });
+
+      for (const authMode of ["codex-subscription", "openai-api-key"] as const) {
+        it(`planning entrypoint, Codex ${authMode}: bootstrap-derived env reaches the selected Codex executor`, async () => {
+          const snapshot = planSnapshot("codex", authMode);
+          const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: GHA_CONTEXT });
+          expect(handoff.bootStatus).toBe(0);
+          expect(handoff.githubEnv).toBe("");
+          stubRunEnv(handoff.runEnv);
+          const { transport } = loopbackTransport();
+          const codex = fakeCodex(true);
+          const r = await runPlanning({
+            workspaceDir: ws, executor: legacy, fetchImpl: fakeFetch as never,
+            configured: { createCodex: codex.createCodex, modelAuthTransport: transport },
+          });
+          expect(r.exitCode).toBe(0);
+          expect(posted[0].outcome).toBe("success");
+          expect(codex.created).toEqual(["p-plan"]);
+          expect(codex.calls[0]).toMatchObject({ agentStage: "planning", model: "gpt-plan" });
+          expect(legacy).not.toHaveBeenCalled();
+        });
+      }
+
+      it("planning entrypoint, Claude API key: bootstrap-derived env drives checkout/finish through the loopback transport", async () => {
+        const snapshot = planSnapshot("claude", "anthropic-api-key");
+        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: GHA_CONTEXT });
+        expect(handoff.bootStatus).toBe(0);
+        stubRunEnv(handoff.runEnv);
+        const { transport, hits } = loopbackTransport();
+        const { impl, argv } = fakeSpawn({ plan: true });
+        const r = await runPlanning({
+          workspaceDir: ws, executor: legacy, spawnImpl: impl, fetchImpl: fakeFetch as never,
+          configured: { modelAuthTransport: transport },
+        });
+        expect(r.exitCode).toBe(0);
+        expect(hits).toEqual([MODEL_AUTH_ROUTES.checkout, MODEL_AUTH_ROUTES.finish]);
+        expect(argv).toHaveLength(1);
+        expect(legacy).not.toHaveBeenCalled();
+        expect(JSON.stringify(posted)).not.toContain(SENTINEL_BEARER);
+      });
+
+      const forgeries: Array<[string, Parameters<typeof ghaGrant>[1]]> = [
+        ["dispatch", { dispatchId: "other-dispatch" }],
+        ["project", { projectKey: "other-project" }],
+        ["backend", { backend: "fly" }],
+        ["snapshot", { snapshotId: "other-snapshot" }],
+      ];
+      for (const [field, over] of forgeries) {
+        it(`a grant with an altered ${field} is rejected against the independent context with no side effects`, async () => {
+          const snapshot = planSnapshot("codex", "codex-subscription");
+          const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot, over), context: GHA_CONTEXT });
+          // Whether the workflow or the runner refuses, no checkout, child or model work may start.
+          if (handoff.bootStatus !== 0) {
+            expect(handoff.runEnv).toEqual({});
+            return;
+          }
+          stubRunEnv(handoff.runEnv);
+          const { transport, hits } = loopbackTransport();
+          const codex = fakeCodex(true);
+          const { impl, argv } = fakeSpawn({ plan: true });
+          const r = await runPlanning({
+            workspaceDir: ws, executor: legacy, spawnImpl: impl, fetchImpl: fakeFetch as never,
+            configured: { createCodex: codex.createCodex, modelAuthTransport: transport },
+          });
+          expect(r.exitCode).toBe(1);
+          expect(posted[0].failureReason).toMatch(/^Configured planning failed \(/);
+          expect(hits).toEqual([]);
+          expect(codex.created).toEqual([]);
+          expect(argv).toEqual([]);
+          expect(legacy).not.toHaveBeenCalled();
+        });
+      }
+
+      it("an altered launch context (grant unchanged) is rejected by the runner with no side effects", async () => {
+        const snapshot = planSnapshot("codex", "codex-subscription");
+        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: { ...GHA_CONTEXT, dispatchId: "tampered-dispatch" } });
+        expect(handoff.bootStatus).toBe(0);
+        stubRunEnv(handoff.runEnv);
+        const { transport, hits } = loopbackTransport();
+        const codex = fakeCodex(true);
+        const { impl, argv } = fakeSpawn({ plan: true });
+        const r = await runPlanning({
+          workspaceDir: ws, executor: legacy, spawnImpl: impl, fetchImpl: fakeFetch as never,
+          configured: { createCodex: codex.createCodex, modelAuthTransport: transport },
+        });
+        expect(r.exitCode).toBe(1);
+        expect(posted[0].failureReason).toBe("Configured planning failed (bootstrap_invalid)");
+        expect(hits).toEqual([]);
+        expect(codex.created).toEqual([]);
+        expect(argv).toEqual([]);
+      });
+
+      it.each([
+        ["http", "http://orchestrator.invalid/model-auth"],
+        ["userinfo", "https://user:pw@orchestrator.invalid/model-auth"],
+        ["query", "https://orchestrator.invalid/model-auth?x=1"],
+        ["fragment", "https://orchestrator.invalid/model-auth#x"],
+      ])("an unsafe context URL (%s) is refused by the bootstrap, so the Run step never starts", (_n, modelAuthUrl) => {
+        const snapshot = planSnapshot("codex", "codex-subscription");
+        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: { ...GHA_CONTEXT, modelAuthUrl } });
+        expect(handoff.bootStatus).not.toBe(0);
+        expect(handoff.runEnv).toEqual({});
+        expect(handoff.githubEnv).toBe("");
+      });
+    });
+  }
 
   it("default managed entrypoint: an envelope snapshot without a protected grant fails closed (bootstrap_missing)", async () => {
     configure("claude", { grant: false });

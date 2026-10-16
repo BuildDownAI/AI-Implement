@@ -464,3 +464,23 @@ describe("safe projections", () => {
     expect(failed.category).toBe("stale_owner");
   });
 });
+
+describe("parseModelAuthContext (AII-1427)", () => {
+  const good = { version: 1, dispatchId: "d1", projectKey: "AII", backend: "gha", modelAuthUrl: "https://orch.example.com/base" };
+
+  it("accepts a strict gha context", async () => {
+    const { parseModelAuthContext } = await import("../model-auth-contract.js");
+    expect(parseModelAuthContext(good)).toEqual({ ok: true, value: good });
+  });
+
+  it.each([
+    [{ extra: "x" }], [{ version: 2 }], [{ backend: "fly" }], [{ backend: "local" }], [{ dispatchId: "" }],
+    [{ projectKey: "-bad" }], [{ modelAuthUrl: "http://orch.example.com" }], [{ modelAuthUrl: "https://a@orch.example.com" }],
+    [{ modelAuthUrl: "https://orch.example.com/#f" }], [{ modelAuthUrl: `https://orch.example.com/${"a".repeat(2048)}` }],
+  ])("rejects %j without echoing values", async (patch) => {
+    const { parseModelAuthContext } = await import("../model-auth-contract.js");
+    const r = parseModelAuthContext({ ...good, ...patch });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).not.toContain("orch.example.com");
+  });
+});

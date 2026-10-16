@@ -18,7 +18,7 @@ import {
   releaseRejectedLaunch,
 } from "./agent-run-preparation.js";
 import type { DispatchAdmissionBackend } from "./dispatch-admission.js";
-import type { ModelAuthGrantBootstrapV1, SafeGrantMetadata } from "./model-auth-contract.js";
+import { parseModelAuthContext, type ModelAuthGrantBootstrapV1, type SafeGrantMetadata } from "./model-auth-contract.js";
 import type { ModelAuthRuntime } from "./model-auth-runtime.js";
 import type { ResolvedAgentSnapshotV1, RunCredentialsV1 } from "./run-config.js";
 
@@ -182,11 +182,21 @@ export function refusalText(
  */
 export function ghaManagedCredentials(
   decision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }>,
+  callbackBaseUrl: string | null | undefined,
 ): RunCredentialsV1 | undefined {
   if (decision.kind !== "launch") return undefined;
+  // Context comes from the trusted request and configured callback base, never from the grant.
+  const context = parseModelAuthContext({
+    version: 1,
+    dispatchId: decision.dispatchId,
+    projectKey: decision.projectKey,
+    backend: "gha",
+    modelAuthUrl: callbackBaseUrl,
+  });
+  if (!context.ok) throw new Error("managed dispatch refused: model auth context unavailable");
   const bootstrap = decision.takeBootstrap();
   if (!bootstrap) throw new Error("managed dispatch bootstrap unavailable");
-  return { version: 1, modelAuthGrant: bootstrap };
+  return { version: 1, modelAuthGrant: bootstrap, modelAuthContext: context.value };
 }
 
 /** Maps a `postWorkflowDispatch` result to a settle outcome: only an API-level rejection is definitive. */

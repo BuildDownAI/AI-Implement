@@ -36,7 +36,7 @@ const KEY = crypto.createHash("sha256").update("synthetic-prep-key").digest();
 const OPERATOR = { synthetic: "operator" };
 const REPO = "acme/app";
 const KG_REPO = "acme/knowledge";
-const WORKFLOW = `# ${"ai-implement-capability: stage-agent-config-v1"}\nname: implement\n`;
+const WORKFLOW = `# ${"ai-implement-capability: stage-agent-config-v1"}\n# ${"ai-implement-capability: stage-agent-launch-context-v1"}\nname: implement\n`;
 
 let dbPath: string;
 let dedup: typeof DedupModule;
@@ -456,6 +456,12 @@ describe("delivery and runner capability", () => {
     const before = counts();
     expect(await prep.prepareAgentRun(request(), deps)).toEqual({ status: "configuration-error", code });
     expect(counts().reservations).toBe(before.reservations);
+    expect(counts().grants).toBe(0);
+  });
+
+  it("requires the launch-context marker as well as the stage-agent marker on GitHub Actions", async () => {
+    files = { ...(files as Record<string, string | null>), ".github/workflows/claude-implement.yml": "# ai-implement-capability: stage-agent-config-v1\n" };
+    expect(await prep.prepareAgentRun(request(), deps)).toEqual({ status: "configuration-error", code: "runner_incompatible" });
     expect(counts().grants).toBe(0);
   });
 

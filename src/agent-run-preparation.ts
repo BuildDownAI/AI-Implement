@@ -78,6 +78,8 @@ import { validateResolvedAgentSnapshot, type ResolvedAgentSnapshotV1 } from "./r
 
 /** Marker a synced `claude-implement.yml` must carry to execute an opted-in snapshot. Older templates ignore the snapshot. */
 export const AGENT_CONFIG_TEMPLATE_CAPABILITY = "ai-implement-capability: stage-agent-config-v1";
+/** GHA templates that deliver the independent trusted model-auth context (AII-1427) to the Run step. */
+export const AGENT_LAUNCH_CONTEXT_TEMPLATE_CAPABILITY = "ai-implement-capability: stage-agent-launch-context-v1";
 
 /** Retired workflow files; mirrors `REMOVE_FILES` in `workflow-sync.ts`. Either one present blocks dispatch. */
 export const RETIRED_WORKFLOW_PATHS = [
@@ -372,7 +374,11 @@ async function checkCapability(request: AgentRunRequest, deps: AgentReadinessDep
   if ([workflowPath, ...RETIRED_WORKFLOW_PATHS].some((p) => files[p] === undefined)) return "delivery_unreadable";
   if (RETIRED_WORKFLOW_PATHS.some((p) => files[p] !== null)) return "retired_workflow_present";
   const template = files[workflowPath];
-  return typeof template === "string" && template.includes(AGENT_CONFIG_TEMPLATE_CAPABILITY) ? null : "runner_incompatible";
+  return typeof template === "string"
+    && template.includes(AGENT_CONFIG_TEMPLATE_CAPABILITY)
+    && template.includes(AGENT_LAUNCH_CONTEXT_TEMPLATE_CAPABILITY)
+    ? null
+    : "runner_incompatible";
 }
 
 /** Matrix, trust and capability: everything decidable without credentials or reservations. */

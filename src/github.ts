@@ -410,7 +410,7 @@ export interface EnvelopeDispatchOpts {
    *  encoder) and are NOT duplicated as top-level inputs; `run_token` is sent as "". Absent/false
    *  keeps the generic envelope plus masked top-level token inputs. */
   privateTransport?: boolean;
-  /** Extra typed private credentials. Only `modelAuthGrant` and `attemptToken` are carried; supplied
+  /** Extra typed private credentials. Only `modelAuthGrant`, `modelAuthContext` and `attemptToken` are carried; supplied
    *  result/progress/publication bearers are ignored in favour of the minted token options.
    *  Requires `privateTransport: true`; supplying it without capability throws rather than
    *  dropping or downgrading it. */
@@ -462,6 +462,7 @@ function suppliedNonBearerCredentials(credentials: RunCredentialsV1 | undefined)
   return {
     ...(credentials?.attemptToken !== undefined ? { attemptToken: credentials.attemptToken } : {}),
     ...(credentials?.modelAuthGrant !== undefined ? { modelAuthGrant: credentials.modelAuthGrant } : {}),
+    ...(credentials?.modelAuthContext !== undefined ? { modelAuthContext: credentials.modelAuthContext } : {}),
   };
 }
 

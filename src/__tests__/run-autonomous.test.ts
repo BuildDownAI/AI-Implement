@@ -27,6 +27,9 @@ import type { ReviewFixMetadataV1 } from "../review-fix-contract.js";
 import { DEFAULT_MODEL } from "../pipeline/default-model.js";
 import { ClaudeCliExecutor } from "../pipeline/executor.js";
 import { NOW, SENTINEL_BEARER, envelopeEnv, fakeClient, makeGrant, makeSnapshot } from "./configured-run-fixture.js";
+import { GHA_CONTEXT, GHA_IMPLEMENT_WORKFLOWS, ghaGrant, ghaRunStepEnv, stubRunEnv } from "./gha-handoff-fixture.js";
+import { MODEL_AUTH_ROUTES } from "../model-auth-contract.js";
+import type { ModelAuthTransport } from "../model-auth-client.js";
 
 const REQUIRED_ENV: Record<string, string> = {
   ISSUE_ID: "issue-abc",
@@ -4388,6 +4391,160 @@ describe("configured (opted-in) autonomous runs", () => {
     expect(client.checkout).not.toHaveBeenCalled();
     expect(existsSync(hook)).toBe(false);
   });
+
+  // ---- AII-1427: the trusted launch context arrives from the real GHA bootstrap, never from the test ----
+
+  function loopbackTransport() {
+    const hits: string[] = [];
+    const transport: ModelAuthTransport = {
+      post: vi.fn(async (route: string) => {
+        hits.push(route);
+        const body = route === MODEL_AUTH_ROUTES.checkout
+          ? { version: 1, ok: true, profileId: "p-rev", authMode: "anthropic-api-key", secret: { kind: "api-key", apiKey: "sk-synthetic-review-key-000000" } }
+          : { version: 1, ok: true, acknowledged: true };
+        return { status: 200, body };
+      }),
+    };
+    return { transport, hits };
+  }
+  const fakeCodexFactory = () => {
+    const created: string[] = [];
+    const calls: unknown[] = [];
+    const createCodex = (id: string) => {
+      created.push(id);
+      return { invoke: async (p: unknown) => (calls.push(p), { stdout: "done", exitCode: 0, tokensUsed: 1 }) };
+    };
+    return { createCodex, created, calls };
+  };
+
+  for (const file of GHA_IMPLEMENT_WORKFLOWS) {
+    describe(`GHA bootstrap handoff via ${file}`, () => {
+      let hook: string;
+      beforeEach(() => {
+        hook = join(workspaceDir, "setup-ran");
+        writeFileSync(join(workspaceDir, "WORKFLOW.md"), `---\nsetup: touch ${hook}\n---\nDo it.\n`);
+        for (const k of ["GITHUB_OWNER", "GITHUB_REPO", "GITHUB_TOKEN"]) vi.stubEnv(k, REQUIRED_ENV[k]);
+      });
+
+      it("baseline: an old-shaped Run env (envelope present, no AI_IMPLEMENT_MODEL_AUTH_*) is rejected with bootstrap_context_missing and no work", async () => {
+        const snapshot = makeSnapshot("codex-subscription");
+        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), callback: false });
+        expect(handoff.bootStatus).toBe(0);
+        stubRunEnv({ AI_IMPLEMENT_RUN_CONFIG: handoff.runEnv.AI_IMPLEMENT_RUN_CONFIG });
+        const { transport, hits } = loopbackTransport();
+        const codex = fakeCodexFactory();
+        const injected = makeMockExecutor(0);
+        const c = capture("implementation");
+        await expect(
+          runAutonomous({ workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected, configured: { createCodex: codex.createCodex, modelAuthTransport: transport, now: () => NOW } }),
+        ).rejects.toMatchObject({ code: "CONFIGURED_RUN_INVALID", reason: "bootstrap_context_missing" });
+        expect(c.seen.ctx).toBeUndefined();
+        expect(hits).toEqual([]);
+        expect(codex.created).toEqual([]);
+        expect(injected.invoke).not.toHaveBeenCalled();
+        expect(existsSync(hook)).toBe(false);
+      });
+
+      for (const authMode of ["codex-subscription", "openai-api-key"] as const) {
+        it(`implementation entrypoint, Codex ${authMode}: bootstrap-derived env reaches the selected Codex executor`, async () => {
+          const snapshot = makeSnapshot(authMode);
+          const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: GHA_CONTEXT, callback: false });
+          expect(handoff.bootStatus).toBe(0);
+          expect(handoff.githubEnv).toBe("");
+          stubRunEnv(handoff.runEnv);
+          const { transport } = loopbackTransport();
+          const codex = fakeCodexFactory();
+          const c = capture("implementation");
+          await runAutonomous({
+            workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: makeMockExecutor(0),
+            configured: { createCodex: codex.createCodex, modelAuthTransport: transport, now: () => NOW },
+          });
+          expect(c.seen.ctx).toBeDefined();
+          expect(c.seen.ctx!.data.agentConfig).toEqual(snapshot);
+          expect(codex.created).toEqual(["p-impl"]);
+          expect(codex.calls).toHaveLength(1);
+        });
+      }
+
+      it("implementation entrypoint, Claude API key stage: bootstrap-derived env drives checkout through the loopback transport", async () => {
+        const snapshot = makeSnapshot("openai-api-key");
+        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: GHA_CONTEXT, callback: false });
+        expect(handoff.bootStatus).toBe(0);
+        stubRunEnv(handoff.runEnv);
+        const { transport, hits } = loopbackTransport();
+        const injected = makeMockExecutor(0);
+        const c = capture("review");
+        await runAutonomous({
+          workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected,
+          configured: { modelAuthTransport: transport, now: () => NOW },
+        });
+        expect(hits[0]).toBe(MODEL_AUTH_ROUTES.checkout);
+        expect(injected.invoke).toHaveBeenCalledTimes(1);
+      });
+
+      const forgeries: Array<[string, Parameters<typeof ghaGrant>[1]]> = [
+        ["dispatch", { dispatchId: "other-dispatch" }],
+        ["project", { projectKey: "other-project" }],
+        ["backend", { backend: "fly" }],
+        ["snapshot", { snapshotId: "other-snapshot" }],
+      ];
+      for (const [field, over] of forgeries) {
+        it(`a grant with an altered ${field} is rejected against the independent context before any clone, hook or model work`, async () => {
+          const snapshot = makeSnapshot("codex-subscription");
+          const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot, over), context: GHA_CONTEXT, callback: false });
+          if (handoff.bootStatus !== 0) {
+            expect(handoff.runEnv).toEqual({});
+            return;
+          }
+          stubRunEnv(handoff.runEnv);
+          const { transport, hits } = loopbackTransport();
+          const codex = fakeCodexFactory();
+          const injected = makeMockExecutor(0);
+          const c = capture("implementation");
+          await expect(
+            runAutonomous({ workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected, configured: { createCodex: codex.createCodex, modelAuthTransport: transport, now: () => NOW } }),
+          ).rejects.toThrow(/Configured run rejected before execution/);
+          expect(c.seen.ctx).toBeUndefined();
+          expect(hits).toEqual([]);
+          expect(codex.created).toEqual([]);
+          expect(injected.invoke).not.toHaveBeenCalled();
+          expect(existsSync(hook)).toBe(false);
+        });
+      }
+
+      it("an altered launch context (grant unchanged) is rejected by the runner before any clone, hook or model work", async () => {
+        const snapshot = makeSnapshot("codex-subscription");
+        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: { ...GHA_CONTEXT, projectKey: "tampered" }, callback: false });
+        expect(handoff.bootStatus).toBe(0);
+        stubRunEnv(handoff.runEnv);
+        const { transport, hits } = loopbackTransport();
+        const codex = fakeCodexFactory();
+        const injected = makeMockExecutor(0);
+        const c = capture("implementation");
+        await expect(
+          runAutonomous({ workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected, configured: { createCodex: codex.createCodex, modelAuthTransport: transport, now: () => NOW } }),
+        ).rejects.toMatchObject({ reason: "bootstrap_invalid" });
+        expect(c.seen.ctx).toBeUndefined();
+        expect(hits).toEqual([]);
+        expect(codex.created).toEqual([]);
+        expect(injected.invoke).not.toHaveBeenCalled();
+        expect(existsSync(hook)).toBe(false);
+      });
+
+      it.each([
+        ["http", "http://orchestrator.invalid/model-auth"],
+        ["userinfo", "https://user:pw@orchestrator.invalid/model-auth"],
+        ["query", "https://orchestrator.invalid/model-auth?x=1"],
+      ])("an unsafe context URL (%s) is refused by the bootstrap, so the Run step never starts", (_n, modelAuthUrl) => {
+        const snapshot = makeSnapshot("codex-subscription");
+        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: { ...GHA_CONTEXT, modelAuthUrl }, callback: false });
+        expect(handoff.bootStatus).not.toBe(0);
+        expect(handoff.runEnv).toEqual({});
+        expect(handoff.githubEnv).toBe("");
+        expect(existsSync(hook)).toBe(false);
+      });
+    });
+  }
 
   it("local: rejects a public repository or an untrusted subscription workspace before work", async () => {
     const client = fakeClient();

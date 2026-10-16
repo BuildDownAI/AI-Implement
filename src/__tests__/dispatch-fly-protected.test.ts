@@ -66,7 +66,7 @@ let planRecord = true;
 let logs: string[];
 let workflows: Record<string, string | null> = {};
 const CAPABLE_WORKFLOWS = {
-  ".github/workflows/claude-implement.yml": "# ai-implement-capability: stage-agent-config-v1\n",
+  ".github/workflows/claude-implement.yml": "# ai-implement-capability: stage-agent-config-v1\n# ai-implement-capability: stage-agent-launch-context-v1\n",
   ".github/workflows/comment-trigger.yml": null,
   ".github/workflows/claude-kg-refresh.yml": null,
 };
@@ -383,6 +383,35 @@ describe("opted-in GitHub Actions implementation (AII-1420)", () => {
     expect(all).toContain("Managed dispatch for AII-1389: launch");
     expect(grantRevoked()).toBe(false);
     expect(admissions()).toBe(1);
+  });
+
+  it("carries a launch context equal to the request's own values, never read from a grant whose dispatch, project and backend differ", async () => {
+    const managed = await import("../managed-dispatch-auth.js");
+    const real = managed.prepareManagedDispatch;
+    let launched: { dispatchId: string; projectKey: string } | undefined;
+    vi.spyOn(managed, "prepareManagedDispatch").mockImplementation(async (...args) => {
+      const decision = await real(...args);
+      if (decision.kind !== "launch") return decision;
+      launched = { dispatchId: decision.dispatchId, projectKey: decision.projectKey };
+      const take = decision.takeBootstrap;
+      return {
+        ...decision,
+        takeBootstrap: () => {
+          const bootstrap = take();
+          return bootstrap && { ...bootstrap, dispatchId: "grant-dispatch", projectKey: "grant-project", backend: "fly" } as never;
+        },
+      };
+    });
+    await dispatchGha();
+    const rc = decodeTrustedRunConfig(sent().run_config!);
+    expect(launched).toBeDefined();
+    const grant = rc.credentials?.modelAuthGrant as { dispatchId: string; projectKey: string; backend: string };
+    expect([grant.dispatchId, grant.projectKey, grant.backend]).toEqual(["grant-dispatch", "grant-project", "fly"]);
+    expect(rc.credentials?.modelAuthContext).toEqual({
+      version: 1, dispatchId: launched!.dispatchId, projectKey: launched!.projectKey, backend: "gha", modelAuthUrl: config.runnerCallbackBaseUrl,
+    });
+    expect(launched!.dispatchId).not.toBe("grant-dispatch");
+    expect(launched!.projectKey).not.toBe("grant-project");
   });
 
   it.each([

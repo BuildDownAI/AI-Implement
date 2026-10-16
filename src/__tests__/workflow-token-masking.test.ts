@@ -505,6 +505,57 @@ for (const file of files) {
       expect("ownerGeneration" in delivered.credentials.modelAuthGrant.bindings[0]).toBe(false);
     });
 
+    const ctx = {
+      version: 1, dispatchId: "ctx-dispatch-sentinel", projectKey: "ctx-project-sentinel", backend: "gha",
+      modelAuthUrl: "https://orchestrator.example.com/base",
+    };
+
+    it("exports the independent model-auth context as masked outputs to the Run step only", () => {
+      const credentials = { version: 1, ...tokens, modelAuthGrant: codexGrant, modelAuthContext: ctx };
+      const run_config = enc({ ...base, agentConfig: codexSnapshot, credentials });
+      const r = handoff({ run_config, run_token: "", run_progress_token: "", run_attempt_token: "" });
+      expect(r.boot.status).toBe(0);
+      expect(r.githubEnv).toBe("");
+      expect(r.env.AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID).toBe(ctx.dispatchId);
+      expect(r.env.AI_IMPLEMENT_MODEL_AUTH_PROJECT_KEY).toBe(ctx.projectKey);
+      expect(r.env.AI_IMPLEMENT_MODEL_AUTH_BACKEND).toBe("gha");
+      expect(r.env.AI_IMPLEMENT_MODEL_AUTH_URL).toBe(ctx.modelAuthUrl);
+      const masks = r.boot.stdout.split("\n").filter((l: string) => l.startsWith("::add-mask::"));
+      for (const v of [ctx.dispatchId, ctx.projectKey, ctx.modelAuthUrl]) expect(masks).toContain(`::add-mask::${v}`);
+      const unmasked = r.boot.stdout.split("\n").filter((l: string) => !l.startsWith("::add-mask::")).join("\n");
+      for (const v of [ctx.dispatchId, ctx.projectKey, ctx.modelAuthUrl]) expect(unmasked).not.toContain(v);
+      for (const step of job.steps) {
+        if (step === run || step === mask) continue;
+        expect(JSON.stringify(step)).not.toMatch(/run_model_auth|AI_IMPLEMENT_MODEL_AUTH_/);
+      }
+    });
+
+    it("leaves the context env empty for envelopes without one", () => {
+      const r = handoff({ run_config: enc({ ...base, credentials: { version: 1, ...tokens } }) });
+      expect(r.env.AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID).toBe("");
+      expect(r.env.AI_IMPLEMENT_MODEL_AUTH_URL).toBe("");
+    });
+
+    it.each([
+      ["unknown field", { extra: "x" }],
+      ["wrong version", { version: 2 }],
+      ["non-gha backend", { backend: "fly" }],
+      ["http url", { modelAuthUrl: "http://orchestrator.example.com" }],
+      ["userinfo url", { modelAuthUrl: "https://u:p@orchestrator.example.com" }],
+      ["query url", { modelAuthUrl: "https://orchestrator.example.com/?a=b" }],
+      ["whitespace url", { modelAuthUrl: "https://orchestrator.example.com/a b" }],
+      ["empty dispatch", { dispatchId: "" }],
+      ["bad project", { projectKey: "bad key" }],
+    ])("rejects an invalid context (%s) before the Run step", (_name, patch) => {
+      const credentials = { version: 1, ...tokens, modelAuthGrant: codexGrant, modelAuthContext: { ...ctx, ...patch } };
+      const r = handoff({ run_config: enc({ ...base, agentConfig: codexSnapshot, credentials }) });
+      expect(r.boot.status).toBe(1);
+      expect(r.boot.stderr).toBe("::error::Private run_config bootstrap failed\n");
+      expect(r.done).toBeUndefined();
+      expect(r.githubEnv).toBe("");
+      expect(r.outputs).toBe("");
+    });
+
     it("rejects a Codex grant carrying ownerGeneration before the Run step executes", () => {
       const grant = structuredClone(codexGrant) as any;
       grant.bindings[0].ownerGeneration = 1;

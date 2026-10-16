@@ -906,6 +906,32 @@ describe("private credentials namespace (AII-981)", () => {
   const creds = (extra: Record<string, unknown> = {}) => ({ version: 1, ...extra }) as never;
   const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64");
 
+  describe("modelAuthContext (AII-1427)", () => {
+    const context = { version: 1, dispatchId: "d1", projectKey: "p", backend: "gha", modelAuthUrl: "https://orch.example.com" };
+
+    it("round-trips through the trusted encoder only and is omitted from generic and diagnostic projections", () => {
+      const config = { ...base, credentials: { version: 1, modelAuthContext: context } } as never as RunConfigV1;
+      expect(decodeTrustedRunConfig(encodeTrustedRunConfig(config)).credentials?.modelAuthContext).toEqual(context);
+      expect(encodeRunConfig(config)).not.toContain(Buffer.from("orch.example.com").toString("base64").slice(0, 8));
+      expect(JSON.stringify(decodeRunConfig(encodeRunConfig(config)))).not.toContain("orch.example.com");
+      expect(JSON.stringify(diagnosticProjection(config))).not.toContain("orch.example.com");
+    });
+
+    it.each([
+      ["unknown field", { extra: 1 }],
+      ["wrong version", { version: 2 }],
+      ["non-gha backend", { backend: "fly" }],
+      ["empty dispatch", { dispatchId: "" }],
+      ["overlong project", { projectKey: "p".repeat(129) }],
+      ["http url", { modelAuthUrl: "http://orch.example.com" }],
+      ["credentialed url", { modelAuthUrl: "https://u:p@orch.example.com" }],
+      ["query url", { modelAuthUrl: "https://orch.example.com?x=1" }],
+      ["malformed url", { modelAuthUrl: "not a url" }],
+    ])("rejects %s", (_n, patch) => {
+      expect(() => validateRunCredentials({ version: 1, modelAuthContext: { ...context, ...patch } })).toThrow("modelAuthContext");
+    });
+  });
+
   it("legacy envelopes without credentials decode unchanged", () => {
     const decoded = decodeRunConfig(encodeRunConfig(base));
     expect(decoded).toEqual(base);
