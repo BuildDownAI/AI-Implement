@@ -1029,10 +1029,11 @@ describe("app-server trusted view (AII-1002)", () => {
         root = dirname(log[0].env.HOME);
         return new Promise((resolve) => i.io.halt.addEventListener("abort", () => resolve({ ...okResult(), stopReason: null })));
       };
-      const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, halting, { trustedSkillsDir: skills });
+      const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, halting, { trustedSkillsDir: skills, nowImpl: () => 0 });
       try {
         const result = await executor.invoke({ ...base, invocationTimeoutMs: 20 });
         expect(result.failure?.code).toBe("INVOCATION_TIMEOUT");
+        expect(log.length).toBe(1);
         expect(root).not.toBe("");
         expect(existsSync(root)).toBe(false);
       } finally {
