@@ -221,7 +221,7 @@ jobs:
               isobj and only(["stage", "profileId", "profileRevision", "authMode", "ownerGeneration"])
               and (.stage | IN(stage_names[])) and (.profileId | idstr) and (.profileRevision | posint)
               and (.authMode | IN(modes[]))
-              and (if (.authMode | IN("claude-subscription", "codex-subscription"))
+              and (if .authMode == "claude-subscription"
                    then (.ownerGeneration | posint) else (has("ownerGeneration") | not) end);
             def plain_grant:
               isobj and only(["version", "audience", "grantId", "dispatchId", "snapshotId", "projectKey", "backend", "expiresAt", "bearer", "bindings"])

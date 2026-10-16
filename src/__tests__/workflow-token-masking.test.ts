@@ -100,6 +100,16 @@ for (const file of files) {
         { stage: "implementation", profileId: "prof-sub", profileRevision: 1, authMode: "claude-subscription", ownerGeneration: 3 },
       ],
     };
+    const codexGrant = {
+      version: 1, audience: "model-auth", grantId: "grant-2", dispatchId: "dispatch-1", snapshotId: "snap-1",
+      projectKey: "proj", backend: "gha", expiresAt: 1_800_000_000_000,
+      bearer: "AII982-codex-bearer-" + "B".repeat(32),
+      bindings: [
+        { stage: "planning", profileId: "prof-codex", profileRevision: 1, authMode: "codex-subscription" },
+        { stage: "implementation", profileId: "prof-codex", profileRevision: 1, authMode: "codex-subscription" },
+        { stage: "review", profileId: "prof-codex", profileRevision: 1, authMode: "codex-subscription" },
+      ],
+    };
     const sealedGrant = {
       version: 1, algorithm: "aes-256-gcm", dispatchId: "dispatch-1", backend: "fly",
       nonce: "N".repeat(16), ciphertext: "AII982sealedcipher", tag: "T".repeat(22),
@@ -123,6 +133,7 @@ for (const file of files) {
 
     it("fixtures satisfy the authoritative TypeScript contract", () => {
       expect(() => validateRunCredentials({ version: 1, ...sentinels, modelAuthGrant: plainGrant })).not.toThrow();
+      expect(() => validateRunCredentials({ version: 1, ...sentinels, modelAuthGrant: codexGrant })).not.toThrow();
       expect(() => validateRunCredentials({ version: 1, modelAuthGrant: sealedGrant })).not.toThrow();
       expect(() => validateResolvedAgentSnapshot(snapshot)).not.toThrow();
     });
@@ -136,6 +147,14 @@ for (const file of files) {
       expect(lines[0]).toBe(`::add-mask::${run_config}`);
       for (const v of [...Object.values(sentinels), plainGrant.bearer]) expect(lines).toContain(`::add-mask::${v}`);
       expect(result.stdout).not.toContain(plainGrant.projectKey + "\n");
+      expect(result.stderr).toBe("");
+    });
+
+    it("accepts an all-Codex ChatGPT-plan grant without ownerGeneration and masks its bearer", () => {
+      const run_config = enc({ ...base, credentials: { version: 1, ...sentinels, modelAuthGrant: codexGrant } });
+      const result = execute(JSON.stringify({ inputs: { run_config } }));
+      expect(result.status).toBe(0);
+      expect(maskLines(result.stdout)).toContain(`::add-mask::${codexGrant.bearer}`);
       expect(result.stderr).toBe("");
     });
 
@@ -201,6 +220,12 @@ for (const file of files) {
         mut(plainGrant, (g) => { g.bindings[0].authMode = "oauth"; }),
         mut(plainGrant, (g) => { g.bindings[0].ownerGeneration = 1; }),
         mut(plainGrant, (g) => { delete g.bindings[1].ownerGeneration; }),
+        mut(plainGrant, (g) => { g.bindings[1].ownerGeneration = 0; }),
+        mut(plainGrant, (g) => { g.bindings[1].ownerGeneration = -1; }),
+        mut(plainGrant, (g) => { g.bindings[1].ownerGeneration = 1.5; }),
+        mut(plainGrant, (g) => { g.bindings[0].authMode = "codex-subscription"; g.bindings[0].ownerGeneration = 1; }),
+        mut(codexGrant, (g) => { g.bindings[0].ownerGeneration = 1; }),
+        mut(codexGrant, (g) => { g.bindings[2].authMode = "unsupported-mode"; }),
         mut(plainGrant, (g) => { g.bindings[0].profileRevision = 0; }),
         mut(plainGrant, (g) => { g.bindings[0].key = "AII982-binding-key"; }),
         mut(plainGrant, (g) => { g.bindings.push(clone(g.bindings[0])); }),
@@ -435,6 +460,21 @@ for (const file of files) {
       expect(JSON.stringify(r.env)).not.toContain("att-1");
       expect(r.boot.stderr).toBe("");
       // Credentials never enter $GITHUB_ENV, which every later step (incl. third-party actions) inherits.
+      expect(r.githubEnv).toBe("");
+    });
+
+    it("delivers an all-Codex grant without ownerGeneration to the Run step", () => {
+      const codexGrant = {
+        version: 1, audience: "model-auth", grantId: "grant-2", dispatchId: "dispatch-1", snapshotId: "snap-1",
+        projectKey: "proj", backend: "gha", expiresAt: 1_800_000_000_000,
+        bearer: "AII1000-codex-bearer-" + "B".repeat(32),
+        bindings: ["planning", "implementation", "review"].map((stage) =>
+          ({ stage, profileId: "prof-codex", profileRevision: 1, authMode: "codex-subscription" })),
+      };
+      const run_config = enc({ ...base, credentials: { version: 1, ...tokens, modelAuthGrant: codexGrant } });
+      const r = handoff({ run_config, run_token: "", run_progress_token: "", run_attempt_token: "" });
+      expect(r.boot.status).toBe(0);
+      expect(r.boot.stderr).toBe("");
       expect(r.githubEnv).toBe("");
     });
 
