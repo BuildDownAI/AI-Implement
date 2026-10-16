@@ -6256,6 +6256,24 @@ describe("model accounts and stage configuration (AII-962)", () => {
       }
     });
 
+    it("serialises concurrent PUTs so a refusal's rollback cannot clobber a later valid write", async () => {
+      const t = await seed();
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      const first = optIn(t, async () => {
+        await gate;
+        return { status: "not-ready", code: "runner_incompatible" };
+      });
+      const second = call("/api/mappings/APP/agent-config", "PUT", t, { enabled: false, stages: { review: { model: "m-2" } } });
+      release();
+      const [a, b] = await Promise.all([first, second]);
+      expect(a.status).toBe(409);
+      expect(b.status).toBe(200);
+      const head = (await call("/api/mappings/APP/agent-config", "GET", t)).json;
+      expect(head.enabled).toBe(false);
+      expect(head.stages.review.model).toBe("m-2");
+    });
+
     it("refuses GitHub Actions opt-in as unsupported while workflows are unreadable", async () => {
       const t = await seed();
       const r = await optIn(t, async () => ({ status: "not-ready", code: "delivery_unreadable" }));

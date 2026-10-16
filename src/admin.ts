@@ -4070,6 +4070,21 @@ async function optInRefusal(projectKey: string, deps: AdminDeps): Promise<OptInR
   return null;
 }
 
+const projectConfigLocks = new Map<string, Promise<unknown>>();
+
+/** Serialises read-inspect-write sequences per project so one PUT's rollback cannot overwrite another's write. */
+async function withProjectConfigLock<T>(projectKey: string, fn: () => Promise<T>): Promise<T> {
+  const prior = projectConfigLocks.get(projectKey) ?? Promise.resolve();
+  const run = prior.then(fn, fn);
+  const tail = run.catch(() => undefined);
+  projectConfigLocks.set(projectKey, tail);
+  try {
+    return await run;
+  } finally {
+    if (projectConfigLocks.get(projectKey) === tail) projectConfigLocks.delete(projectKey);
+  }
+}
+
 async function handlePutProjectAgentConfig(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -4079,6 +4094,16 @@ async function handlePutProjectAgentConfig(
 ): Promise<void> {
   const body = await readJsonObject(req, res);
   if (!body) return;
+  await withProjectConfigLock(projectKey, () => putProjectAgentConfigLocked(res, projectKey, deps, actor, body));
+}
+
+async function putProjectAgentConfigLocked(
+  res: http.ServerResponse,
+  projectKey: string,
+  deps: AdminDeps,
+  actor: string | null,
+  body: Record<string, unknown>,
+): Promise<void> {
   if (!getMappings()[projectKey]) {
     json(res, 404, { error: "mapping not found" });
     return;
@@ -4121,12 +4146,16 @@ async function handlePutProjectAgentConfig(
   if (enabled) {
     const refusal = await optInRefusal(projectKey, deps);
     if (refusal) {
-      // Readiness is async and so cannot run inside the store's transaction; restore the prior state
-      // as a new revision so history stays append-only. Dispatch re-checks readiness regardless.
-      try {
-        setProjectStageConfig(projectKey, previous?.config ?? { version: STAGE_AGENT_CONFIG_VERSION, mode: "legacy" }, actor);
-      } catch {
-        setProjectStageConfig(projectKey, { version: STAGE_AGENT_CONFIG_VERSION, mode: "legacy" }, actor);
+      // Readiness inspects the stored head, so it cannot run before the commit. Restore the prior state
+      // as a new revision (history stays append-only), but only while the head is still our candidate;
+      // dispatch re-checks readiness regardless.
+      if (getProjectStageConfig(projectKey)?.revision === stored.revision) {
+        const legacy = { version: STAGE_AGENT_CONFIG_VERSION, mode: "legacy" } as const;
+        try {
+          setProjectStageConfig(projectKey, previous?.config ?? legacy, actor);
+        } catch {
+          setProjectStageConfig(projectKey, legacy, actor);
+        }
       }
       json(res, refusal.status, refusal.body);
       return;
