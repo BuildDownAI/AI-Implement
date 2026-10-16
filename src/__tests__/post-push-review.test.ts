@@ -1,4 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import fs from "node:fs";
 import path from "node:path";
@@ -12,11 +13,16 @@ import { REVIEWER_VERDICT_SCHEMA } from "../pipeline/reviewers/schema.js";
 import { DISPOSITIONS_FILE, buildDispositionInstructions, stableReviewFindingKey } from "../pipeline/finding-dispositions.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "../pipeline/cycle-summary.js";
 import { makeContext } from "./helpers/builders.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
 import { testDir } from "./helpers/test-dir.js";
+
+// A GitHub Actions run, the default mode: no machine nonce or orchestrator URL, and the push step has already spent
+// the one-use publication credential, so a fix pass's credential refresh keeps the dispatch token.
+const GITHUB_ACTIONS_RUN = { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_dispatch_token", nonce: "", orchestratorUrl: "" };
 
 function makeCtx(invoke: LLMExecutor["invoke"], overrides: Partial<PipelineContextData> = {}) {
   return makeContext(
-    { issueIdentifier: "AII-200", issueTitle: "X", model: "claude-sonnet-4-6", ...overrides },
+    { issueIdentifier: "AII-200", issueTitle: "X", model: "claude-sonnet-4-6", ...GITHUB_ACTIONS_RUN, ...overrides },
     { invoke },
   );
 }
@@ -216,12 +222,8 @@ describe("postPushReviewStep", () => {
     const notApproved = { approved: false, blocking_issues: [{ title: "bug", problem: "bug", required_fix: "bug" }], feedback: "fix the bug", score: 4, progress_delta: 0 };
     const ghComments: string[] = [];
     const gitPushCalls: string[][] = [];
-    const pushOrder: string[] = [];
     const gitSpawn = vi.fn((args: string[]) => {
-      if (args[0] === "push") {
-        gitPushCalls.push(args);
-        pushOrder.push("push");
-      }
+      if (args[0] === "push") gitPushCalls.push(args);
       if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
       if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
       if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
@@ -238,12 +240,9 @@ describe("postPushReviewStep", () => {
       return { stdout: "", exitCode: 0 };
     });
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(notApproved))));
-    const refreshCredentials = vi.fn(async () => {
-      pushOrder.push("refresh");
-    });
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn, refreshCredentials },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
     expect(out.approved).toBe(false);
@@ -256,8 +255,6 @@ describe("postPushReviewStep", () => {
       "HEAD:refs/heads/ai-implement/aii-200-x",
       "--force-with-lease=refs/heads/ai-implement/aii-200-x:beadfeed",
     ]);
-    expect(refreshCredentials).toHaveBeenCalledTimes(1);
-    expect(pushOrder).toEqual(["refresh", "push"]);
     expect(ghComments.some((c) => c.includes("fix-complete") && c.includes("abc1234"))).toBe(true);
     expect(ghComments.some((c) => c.includes("Changes pushed:") && c.includes("Modified: `app/api/parse/route.ts`"))).toBe(true);
     expect(ghComments.some((c) => c.includes("Added: `app/api/parse/route.test.ts`"))).toBe(true);
@@ -6827,5 +6824,76 @@ describe("postPushReviewStep review process gate", () => {
     expect(blocked.out.approved).toBe(false);
     expect(blocked.out.terminationReason).toBe("invalid_review");
     expect(f.posted.join("\n")).toContain("Project reviewer selection is empty");
+  });
+});
+
+// The fix pass refreshes the GitHub token before pushing, and how depends on the execution mode: only a run with a
+// machine nonce can re-vend. Each mode must still end in the same push. The workspace is a real repository, because the
+// refresh rewrites origin with git itself rather than through the step's gitSpawn.
+describe("credential refresh before a fix-pass push, by execution mode", () => {
+  const notApproved = { approved: false, blocking_issues: [{ title: "bug", problem: "bug", required_fix: "bug" }], feedback: "fix the bug", score: 4, progress_delta: 0 };
+  const originWith = (token: string) => `https://x-access-token:${token}@github.com/acme/app.git`;
+
+  function realGit(args: string[]): string {
+    const result = spawnSync("git", args, { cwd: workspaceDir, encoding: "utf8" });
+    if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+    return result.stdout.trim();
+  }
+
+  beforeEach(() => {
+    // The runner's environment carries the dispatch token, and the clone step left it in origin's URL.
+    vi.stubEnv("GITHUB_TOKEN", GITHUB_ACTIONS_RUN.githubToken);
+    vi.stubEnv("GH_TOKEN", GITHUB_ACTIONS_RUN.githubToken);
+    realGit(["init", "-q"]);
+    realGit(["remote", "add", "origin", originWith(GITHUB_ACTIONS_RUN.githubToken)]);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  /** Runs one fix pass and records each push with the origin URL it would go out with. */
+  async function runOneFixPass(overrides: Partial<PipelineContextData>, events: string[]): Promise<void> {
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "push") events.push(`push ${args[2]} to ${realGit(["remote", "get-url", "origin"])}`);
+      if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
+      if (args[0] === "ls-remote") return { stdout: "beadfeed\trefs/heads/ai-implement/aii-200-x\n", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => ({ stdout: args[0] === "pr" && args[1] === "diff" ? "diff" : "", exitCode: 0 }));
+    await postPushReviewStep.run(
+      makeCtx(vi.fn(async () => structuredReviewResult(notApproved)), overrides),
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+  }
+
+  it("on GitHub Actions, pushes with the dispatch token and asks the orchestrator for nothing", async () => {
+    const orchestrator = fakeFetch({}).install();
+    const events: string[] = [];
+
+    await runOneFixPass({}, events);
+
+    expect(orchestrator.calls).toEqual([]);
+    expect(events).toEqual([`push HEAD:refs/heads/ai-implement/aii-200-x to ${originWith(GITHUB_ACTIONS_RUN.githubToken)}`]);
+  });
+
+  it("on Fly or local Docker, vends a token with the machine nonce and points origin at it before the push", async () => {
+    const events: string[] = [];
+    const orchestrator = fakeFetch({
+      "POST /api/token": () => {
+        events.push("vend");
+        return { json: { token: "ghs_fresh_token", expires_at: new Date(Date.now() + 3_600_000).toISOString() } };
+      },
+    }).install();
+
+    await runOneFixPass({ nonce: "machine-nonce", orchestratorUrl: "http://orchestrator.internal:8080" }, events);
+
+    expect(orchestrator.calls).toHaveLength(1);
+    expect(JSON.parse(orchestrator.calls[0]!.body)).toEqual({ nonce: "machine-nonce", owner: "acme" });
+    expect(events).toEqual(["vend", `push HEAD:refs/heads/ai-implement/aii-200-x to ${originWith("ghs_fresh_token")}`]);
+    expect(process.env.GH_TOKEN).toBe("ghs_fresh_token");
   });
 });
