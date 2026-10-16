@@ -724,3 +724,101 @@ describe("kg current run card (AII-1260)", () => {
     }
   });
 });
+
+describe("kg schedule control (AII-1434)", () => {
+  const browserZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const wrap = (v: unknown) => ({ content: [{ type: "text", text: JSON.stringify(v) }] });
+
+  function mount(get: { status: number; body: unknown }, set?: { status: number; body: unknown }) {
+    const dom = new JSDOM(`<!DOCTYPE html><body>${kgPipelinesHtml}</body>`, { runScripts: "dangerously", url: "http://localhost/admin#kg-pipelines" });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const win = dom.window as any;
+    win.registerPage = () => {};
+    const calls: { url: string; body: unknown }[] = [];
+    win.api = async (url: string, init?: { body?: string }) => {
+      calls.push({ url, body: init?.body ? JSON.parse(init.body) : undefined });
+      const r = url === "/api/tools/get_pipeline_schedule" ? get : url === "/api/tools/set_pipeline_schedule" && set ? set : null;
+      if (!r) return { ok: false, status: 404, json: async () => ({}) };
+      return { ok: r.status >= 200 && r.status < 300, status: r.status, json: async () => r.body };
+    };
+    const script = dom.window.document.createElement("script");
+    script.textContent = kgPipelinesScript;
+    dom.window.document.head.appendChild(script);
+    const el = (id: string) => dom.window.document.getElementById(id) as HTMLInputElement;
+    return { win, el, calls };
+  }
+
+  it("shows off, the browser zone and 'Off' when nothing is stored", async () => {
+    const { win, el, calls } = mount({ status: 200, body: wrap({ pipeline: "kg-refresh", schedule: null, nextOccurrence: null }) });
+    await win.loadKgSchedule();
+    expect(calls[0]).toEqual({ url: "/api/tools/get_pipeline_schedule", body: { args: { pipeline: "kg-refresh" } } });
+    expect(el("kg-schedule-enabled").checked).toBe(false);
+    expect(el("kg-schedule-zone").value).toBe(browserZone);
+    expect(el("kg-schedule-next").textContent).toBe("Next run: Off");
+  });
+
+  it("shows a stored schedule and renders a refused detail as text", async () => {
+    const next = "2026-10-17T06:30:00.000Z";
+    const schedule = {
+      enabled: true, time: "06:30", zone: "Europe/Paris", lastFiredOccurrence: "x", lastStartedRunId: null,
+      lastResult: { at: "2026-10-16T06:30:00.000Z", occurrence: "x", outcome: "refused", detail: "<b>busy</b>" },
+    };
+    const { win, el } = mount({ status: 200, body: wrap({ pipeline: "kg-refresh", schedule, nextOccurrence: next }) });
+    await win.loadKgSchedule();
+    expect(el("kg-schedule-enabled").checked).toBe(true);
+    expect(el("kg-schedule-time").value).toBe("06:30");
+    expect(el("kg-schedule-zone").value).toBe("Europe/Paris");
+    expect(el("kg-schedule-next").textContent).toBe("Next run: " + new Date(next).toLocaleString());
+    const last = el("kg-schedule-last");
+    expect(last.querySelector("b")).toBeNull();
+    expect(last.textContent).toContain("refused");
+    expect(last.textContent).toContain(new Date(schedule.lastResult.at).toLocaleString());
+    expect(last.textContent).toContain("<b>busy</b>");
+  });
+
+  it("shows the run id for a started result", async () => {
+    const schedule = { enabled: true, time: "06:30", zone: "UTC", lastResult: { at: "2026-10-16T06:30:00.000Z", occurrence: "x", outcome: "started", runId: "run-42" } };
+    const { win, el } = mount({ status: 200, body: wrap({ schedule, nextOccurrence: "2026-10-17T06:30:00.000Z" }) });
+    await win.loadKgSchedule();
+    expect(el("kg-schedule-last").textContent).toContain("started");
+    expect(el("kg-schedule-last").textContent).toContain("run-42");
+  });
+
+  it("saves the patch; a 400 shows its message and keeps the typed inputs through a poll", async () => {
+    const { win, el, calls } = mount(
+      { status: 200, body: wrap({ schedule: null, nextOccurrence: null }) },
+      { status: 200, body: wrap({ status: 400, body: { error: "unknown time zone" } }) },
+    );
+    await win.loadKgSchedule();
+    el("kg-schedule-enabled").checked = true;
+    el("kg-schedule-time").value = "07:15";
+    el("kg-schedule-zone").value = "Mars/Base";
+    await win.saveKgSchedule();
+    const save = calls.find((c) => c.url === "/api/tools/set_pipeline_schedule");
+    expect(save?.body).toEqual({ args: { pipeline: "kg-refresh", patch: { enabled: true, time: "07:15", zone: "Mars/Base" } } });
+    expect(el("kg-schedule-error").textContent).toContain("unknown time zone");
+    expect(el("kg-schedule-error").hidden).toBe(false);
+    await win.loadKgSchedule();
+    expect(el("kg-schedule-enabled").checked).toBe(true);
+    expect(el("kg-schedule-time").value).toBe("07:15");
+    expect(el("kg-schedule-zone").value).toBe("Mars/Base");
+  });
+
+  it("disables Save on a 409 deploy-in-progress", async () => {
+    const { win, el } = mount(
+      { status: 200, body: wrap({ schedule: null, nextOccurrence: null }) },
+      { status: 409, body: { error: "deploy-in-progress" } },
+    );
+    await win.loadKgSchedule();
+    expect(el("btn-kg-schedule-save").disabled).toBe(false);
+    await win.saveKgSchedule();
+    expect(el("btn-kg-schedule-save").disabled).toBe(true);
+    expect(el("kg-schedule-error").textContent).toContain("A deploy is in progress");
+  });
+
+  it("disables Save when the load answers 409 deploy-in-progress", async () => {
+    const { win, el } = mount({ status: 409, body: { error: "deploy-in-progress" } });
+    await win.loadKgSchedule();
+    expect(el("btn-kg-schedule-save").disabled).toBe(true);
+  });
+});

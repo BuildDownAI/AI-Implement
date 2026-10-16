@@ -8,7 +8,7 @@ export const kgPipelinesHtml = `
       <div class="page-subtitle">Refresh the knowledge graph and watch its runs</div>
     </div>
     <div class="page-header-actions">
-      <button class="btn btn-sm" onclick="loadKgStatus(); loadKgExecutionMode(); loadKgMaterializeMode(); loadKgRunProfile()">&#8635; Refresh</button>
+      <button class="btn btn-sm" onclick="loadKgStatus(); loadKgExecutionMode(); loadKgMaterializeMode(); loadKgRunProfile(); loadKgSchedule()">&#8635; Refresh</button>
     </div>
   </header>
   <div class="page-body">
@@ -64,6 +64,16 @@ export const kgPipelinesHtml = `
           <button class="btn btn-sm" id="btn-kg-gha-save" disabled onclick="window.saveKgGhaProfile()">Save</button>
         </div>
         <div class="kpi-trend text-secondary" id="kg-gha-note" hidden>Runner size comes from the KG repo's \`AI_IMPLEMENT_RUNNER_LABEL\` Actions variable. GitHub owns the machines, so there is no kept machine or idle time.</div>
+        <div style="margin-top: 12px; display:flex; align-items:center; gap:12px; flex-wrap:wrap" id="kg-schedule-controls">
+          <span class="kpi-trend text-secondary">Schedule:</span>
+          <label class="kpi-trend text-secondary"><input type="checkbox" id="kg-schedule-enabled" onchange="window.refreshKgScheduleDirty()"> On</label>
+          <label class="kpi-trend text-secondary">Daily at <input type="time" id="kg-schedule-time" style="width: 110px" oninput="window.refreshKgScheduleDirty()"></label>
+          <label class="kpi-trend text-secondary">Zone <input type="text" id="kg-schedule-zone" style="width: 200px" oninput="window.refreshKgScheduleDirty()"></label>
+          <button class="btn btn-sm" id="btn-kg-schedule-save" onclick="window.saveKgSchedule()">Save</button>
+          <span class="kpi-trend text-secondary" id="kg-schedule-error" hidden></span>
+        </div>
+        <div class="kpi-trend text-secondary" id="kg-schedule-next">Next run: —</div>
+        <div class="kpi-trend text-secondary" id="kg-schedule-last"></div>
       </div>
     </div>
     ${dispatchLogHtml("kglog", { title: "Runs", emptyText: "No knowledge-graph refresh runs in the selected time range" })}
@@ -552,6 +562,111 @@ export const kgPipelinesScript = `
     return saveKgRunProfile('github-actions', changes);
   };
 
+  // AII-1434: the daily refresh schedule, read and written through the PipelineSchedule tools.
+  // A poll repaints only while the inputs match what was last painted, so a typed or
+  // just-rejected edit survives.
+  let savedKgSchedule = null;
+  let kgScheduleHeld = false;
+
+  function kgScheduleInputs() {
+    return {
+      enabled: document.getElementById('kg-schedule-enabled').checked,
+      time: document.getElementById('kg-schedule-time').value,
+      zone: document.getElementById('kg-schedule-zone').value.trim(),
+    };
+  }
+
+  function kgScheduleDirty() {
+    if (!savedKgSchedule) return false;
+    const now = kgScheduleInputs();
+    return now.enabled !== savedKgSchedule.enabled || now.time !== savedKgSchedule.time || now.zone !== savedKgSchedule.zone;
+  }
+
+  function refreshKgScheduleDirty() {
+    document.getElementById('btn-kg-schedule-save').disabled = kgScheduleHeld;
+  }
+  window.refreshKgScheduleDirty = refreshKgScheduleDirty;
+
+  function showKgScheduleError(text) {
+    const el = document.getElementById('kg-schedule-error');
+    el.textContent = text || '';
+    el.hidden = !text;
+  }
+
+  var KG_DEPLOY_HELD_TEXT = 'A deploy is in progress — try again after it completes.';
+
+  function renderKgScheduleResult(schedule, nextOccurrence) {
+    document.getElementById('kg-schedule-next').textContent =
+      'Next run: ' + (nextOccurrence ? new Date(nextOccurrence).toLocaleString() : 'Off');
+    const lastEl = document.getElementById('kg-schedule-last');
+    const lr = schedule && schedule.lastResult;
+    if (!lr) { lastEl.textContent = 'Last result: none yet'; return; }
+    let text = 'Last result: ' + lr.outcome + ' at ' + new Date(lr.at).toLocaleString();
+    if (lr.outcome === 'refused') text += ' — ' + (lr.detail || '');
+    else if (lr.runId) text += ' — run ' + lr.runId;
+    else if (lr.detail) text += ' — ' + lr.detail;
+    lastEl.textContent = text;
+  }
+
+  async function loadKgSchedule() {
+    try {
+      const res = await window.api('/api/tools/get_pipeline_schedule', { method: 'POST', body: JSON.stringify({ args: { pipeline: 'kg-refresh' } }) });
+      const out = unwrapToolAnswer(res, await res.json().catch(function () { return {}; }));
+      if (out.status === 409 && out.body.error === 'deploy-in-progress') {
+        kgScheduleHeld = true;
+        refreshKgScheduleDirty();
+        showKgScheduleError(KG_DEPLOY_HELD_TEXT);
+        return;
+      }
+      if (!out.ok) {
+        showKgScheduleError('schedule unavailable (' + (out.status === 403 ? 'admin only' : out.status) + ')');
+        return;
+      }
+      kgScheduleHeld = false;
+      refreshKgScheduleDirty();
+      if (document.getElementById('kg-schedule-error').textContent === KG_DEPLOY_HELD_TEXT) showKgScheduleError('');
+      const schedule = out.body.schedule || null;
+      renderKgScheduleResult(schedule, out.body.nextOccurrence);
+      if (kgScheduleDirty()) return;
+      const browserZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      savedKgSchedule = {
+        enabled: !!(schedule && schedule.enabled),
+        time: (schedule && schedule.time) || '',
+        zone: (schedule && schedule.zone) || browserZone || '',
+      };
+      document.getElementById('kg-schedule-enabled').checked = savedKgSchedule.enabled;
+      document.getElementById('kg-schedule-time').value = savedKgSchedule.time;
+      document.getElementById('kg-schedule-zone').value = savedKgSchedule.zone;
+    } catch (e) { /* transient — next poll retries */ }
+  }
+
+  window.saveKgSchedule = async function () {
+    if (kgScheduleHeld) return;
+    const patch = kgScheduleInputs();
+    try {
+      const args = { pipeline: 'kg-refresh', patch: patch };
+      const res = await window.api('/api/tools/set_pipeline_schedule', { method: 'POST', body: JSON.stringify({ args: args }) });
+      const out = unwrapToolAnswer(res, await res.json().catch(function () { return {}; }));
+      if (out.status === 409 && out.body.error === 'deploy-in-progress') {
+        kgScheduleHeld = true;
+        refreshKgScheduleDirty();
+        showKgScheduleError(KG_DEPLOY_HELD_TEXT);
+        return;
+      }
+      if (out.status === 403) { showKgScheduleError('admin only'); return; }
+      if (!out.ok) {
+        showKgScheduleError(String(out.body.error || out.status));
+        return;
+      }
+      showKgScheduleError('');
+      savedKgSchedule = null;
+      await loadKgSchedule();
+    } catch (err) {
+      showKgScheduleError('Could not save the schedule — ' + String(err));
+    }
+  };
+
+  window.loadKgSchedule = loadKgSchedule;
   window.loadKgStatus = loadKgStatus;
   window.loadKgExecutionMode = loadKgExecutionMode;
   window.loadKgMaterializeMode = loadKgMaterializeMode;
@@ -562,6 +677,8 @@ export const kgPipelinesScript = `
     loadKgExecutionMode();
     loadKgMaterializeMode();
     loadKgRunProfile();
+    loadKgSchedule();
+    setInterval(loadKgSchedule, 15000);
     setInterval(loadKgStatus, 15000);
     setInterval(loadKgExecutionMode, 15000);
     setInterval(loadKgMaterializeMode, 15000);
