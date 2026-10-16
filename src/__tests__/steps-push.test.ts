@@ -1127,7 +1127,7 @@ describe("pushStep draft PRs", () => {
     expect(body.body).toContain("Run notes");
     expect(body.body).toContain("partial changes were preserved");
     // The column is specifically the implement call's spawn attempts (not review's).
-    expect(body.body).toContain("| Pass | Implement outcome | Turns | Implement attempts | Cost | Review |");
+    expect(body.body).toContain("| Pass | Implement outcome | Turns / limit | Implement attempts | Cost | Tokens | Review |");
     // The test-plan line must not read as a review rejection on a provider outage — the
     // reviewer may never have run at all (BAC-27201).
     expect(body.body).toContain("- [ ] Automated verification was skipped — the model provider was unavailable and the run was interrupted.");
@@ -1163,6 +1163,41 @@ describe("pushStep draft PRs", () => {
     expect(body.body).toContain("| 1 | success | 3 |");
     expect(body.body).toContain("| 2 | error (LLM_TERMINAL_ERROR) | 4 |");
     expect(body.body).toMatch(/\| 2 \| error \(LLM_TERMINAL_ERROR\).*\| approved \|/);
+  });
+
+  it("renders Codex turns as unavailable and missing cost as unavailable in the unapproved table (AII-113)", async () => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/9", number: 9 }),
+      text: async () => "",
+    } as Response);
+
+    await pushStep.run(
+      makeContext(),
+      {
+        ...BASE_INPUTS, draft: true,
+        reviewSummary: {
+          ...REVIEW_SUMMARY,
+          passes: [
+            {
+              iteration: 1, implementTurns: 7, implementOutcome: "success", costUsd: null, reviewCostUsd: null, reviewApproved: false,
+              tokensIn: 10, tokensOut: 20,
+              attribution: {
+                version: 1, invocationId: "inv-1", stage: "implementation", snapshotId: "snap-1", agent: "codex", provider: "openai",
+                model: "m", profileId: null, authMode: "codex-subscription",
+                limit: { kind: "timeout_ms", value: 600000 }, outcome: "success", usage: null,
+              },
+            },
+          ],
+        },
+      },
+      new NoopStepReporter(),
+    );
+
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0][1]?.body));
+    expect(body.body).toContain("| 1 | success | n/a (native turn count unavailable); limit 600s timeout | 1 | unavailable | in 10 / out 20 | rejected |");
+    expect(body.body).not.toContain("$0.00");
   });
 
   it("titles a provider_unavailable 422 non-draft fallback as an interruption, not an unapproved rejection", async () => {

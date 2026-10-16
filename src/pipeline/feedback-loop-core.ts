@@ -104,6 +104,8 @@ export interface FeedbackLoopOutputs extends Record<string, unknown> {
    *  report-card.ts's extraCostUsd `.retry` rows so the ticket-facing total (run-autonomous.ts)
    *  can agree with the report card (BAC-27201). */
   extraCostUsd: number | null;
+  /** Superseded retry attempts that produced no reported cost, so `extraCostUsd` is a lower bound. */
+  extraCostUnreported?: number;
 }
 
 function addExtraCost(a: number | null, b: number | null | undefined): number | null {
@@ -219,6 +221,7 @@ export async function runFeedbackLoop(
   // that ultimately settled the stage. Mirrors report-card.ts's extraCostUsd `.retry` rows
   // so the ticket-facing total can agree with the report card (BAC-27201).
   let extraCostUsd: number | null = null;
+  let extraCostUnreported = 0;
 
   const rawPlanningContext = params.planningContext;
   const { acceptanceBar, mapSection } = splitPlanningContext(rawPlanningContext ?? "");
@@ -317,6 +320,7 @@ export async function runFeedbackLoop(
         if (willRetryImplement) {
           implementSubStep.id = `implement.${iteration}.retry${implementStageAttempt}`;
           extraCostUsd = addExtraCost(extraCostUsd, implementErrTelemetry?.costUsd);
+          if (implementErrTelemetry?.costUsd == null) extraCostUnreported++;
         }
         implementSubStep.outputs = {
           error: String(err),
@@ -565,6 +569,7 @@ export async function runFeedbackLoop(
         if (willRetryReview) {
           reviewSubStep.id = `review.${iteration}.retry${reviewStageAttempt}`;
           extraCostUsd = addExtraCost(extraCostUsd, reviewErrTelemetry?.costUsd);
+          if (reviewErrTelemetry?.costUsd == null) extraCostUnreported++;
         }
         reviewSubStep.outputs = {
           error: String(err),
@@ -632,6 +637,7 @@ export async function runFeedbackLoop(
     terminationReason,
     passes,
     extraCostUsd,
+    extraCostUnreported,
     ...(postMortem ? { postMortem } : {}),
     ...(failureForOutputs ? { failure: failureForOutputs } : {}),
   };
