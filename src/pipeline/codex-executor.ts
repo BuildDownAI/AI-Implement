@@ -1,12 +1,13 @@
 import { spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import type { InvokeParams, LLMExecutor, LLMResult, RunTelemetry } from "./types.js";
 import { CodexStreamParser, redactSecrets } from "./codex-stream.js";
 import type { CodexProtocolDriver, CodexTransportResult } from "./codex-planning-adapter.js";
 import { classifyLlmResult, classifySpawnError, isLlmResultFailure, type FailureRecord } from "./failure-classification.js";
+import { CODEX_SKILLS_SUBDIR } from "./steps/install-skills.js";
 import { computeBackoffMs } from "./retry-backoff.js";
 import { suspendOriginWriteCredential } from "./executor.js";
 import { CHATGPT_PLAN_ACCESS_TOKEN_ENV, type ModelAuthClient, type ModelInvocation } from "../model-auth-client.js";
@@ -174,6 +175,62 @@ export interface CodexExecutorOptions {
    * recovery; the driver only speaks JSON-RPC over the child's stdio and returns a bounded result.
    */
   protocolDriver?: CodexProtocolDriver;
+  /**
+   * Absolute path of the installed, operator-selected project skills (planning only). When set and present,
+   * a read-only copy lands in the app-server view's HOME. Must not resolve inside the workspace, the selected
+   * CODEX_HOME or a forbidden root.
+   */
+  trustedSkillsDir?: string;
+}
+
+const SKILLS_REJECTED = "The trusted skills directory is not allowed in the planning view";
+
+function realOrNull(p: string): string | null {
+  try {
+    return realpathSync(p);
+  } catch {
+    return null;
+  }
+}
+
+function isInside(child: string, parent: string): boolean {
+  return child === parent || child.startsWith(parent.endsWith(sep) ? parent : parent + sep);
+}
+
+/** Restores write bits under a view's HOME so a read-only skills copy can be removed by a non-root user. */
+function removeView(root: string): void {
+  const walk = (dir: string): void => {
+    let entries: string[];
+    try {
+      chmodSync(dir, 0o700);
+      entries = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const name of entries) {
+      const full = join(dir, name);
+      try {
+        if (lstatSync(full).isDirectory()) walk(full);
+      } catch {
+        // best effort
+      }
+    }
+  };
+  const userHome = join(root, "user-home");
+  if (existsSync(userHome)) walk(userHome);
+  rmSync(root, { recursive: true, force: true });
+}
+
+/** Marks a copied tree read-only without following links. */
+function lockTree(dir: string): void {
+  for (const name of readdirSync(dir)) {
+    const full = join(dir, name);
+    const st = lstatSync(full);
+    if (st.isSymbolicLink()) continue;
+    if (st.isDirectory()) lockTree(full);
+    else chmodSync(full, 0o444);
+  }
+  chmodSync(dir, 0o555);
 }
 
 interface AppServerView {
@@ -433,7 +490,7 @@ export class CodexExecutor implements LLMExecutor {
     } finally {
       // The sessions directory lives exactly as long as the invocation, success or failure —
       // except while a child may still be alive: its CODEX_HOME must not be removed under it.
-      if (state.sessionsDir && !this.held) rmSync(state.sessionsDir, { recursive: true, force: true });
+      if (state.sessionsDir && !this.held) removeView(state.sessionsDir);
     }
   }
 
@@ -632,7 +689,7 @@ export class CodexExecutor implements LLMExecutor {
       return this.populateAppServerView({ root, home, cwd, userHome, shared }, selectedHome, model, baseUrl, provider);
     } catch (err) {
       // No child exists yet, so removing a half-built view cannot race a live process. A shared root is the invocation's to remove.
-      if (!shared) rmSync(root, { recursive: true, force: true });
+      if (!shared) removeView(root);
       throw err;
     }
   }
@@ -692,7 +749,29 @@ export class CodexExecutor implements LLMExecutor {
         source = candidate;
       }
     }
+    this.copyTrustedSkills(userHome, selectedHome, root);
     return { root, home, userHome, cwd, shared, authSource: source, initialAuth: initial };
+  }
+
+  /** Copies the trusted skills into the view HOME, read-only. Nothing else enters HOME; errors carry no path. */
+  private copyTrustedSkills(userHome: string, selectedHome: string | undefined, root: string): void {
+    const dir = this.options.trustedSkillsDir;
+    if (!dir) return;
+    const real = realOrNull(dir);
+    if (!real) return;
+    const forbidden = [this.workspaceDir, selectedHome, root]
+      .filter((p): p is string => !!p)
+      .map((p) => realOrNull(p) ?? p);
+    if (forbidden.some((f) => isInside(real, f))) throw new Error(SKILLS_REJECTED);
+    const dest = join(userHome, CODEX_SKILLS_SUBDIR);
+    // A shared view is populated again on each attempt; the first copy stays.
+    if (existsSync(dest)) return;
+    mkdirSync(join(dest, ".."), { mode: 0o700, recursive: true });
+    // Symbolic links are dropped, not followed or recreated: no outside content stays reachable through the copy.
+    cpSync(real, dest, { recursive: true, dereference: false, filter: (src) => !lstatSync(src).isSymbolicLink() });
+    lockTree(dest);
+    const count = readdirSync(dest).filter((n) => lstatSync(join(dest, n)).isDirectory()).length;
+    console.log(`[codex] planning skills copied=${count}`);
   }
 
   /**
@@ -773,7 +852,7 @@ export class CodexExecutor implements LLMExecutor {
     } finally {
       if (schemaDir) rmSync(schemaDir, { recursive: true, force: true });
       // The view stays in place while a child may live: its auth must not be synced or removed.
-      if (view && !this.held && !view.shared) rmSync(view.root, { recursive: true, force: true });
+      if (view && !this.held && !view.shared) removeView(view.root);
       if (this.held?.reason === "child_not_terminated") {
         // A child that may still be alive must never regain the publication credential.
         console.log("[codex] origin left protected: child not confirmed terminated");

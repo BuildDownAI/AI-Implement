@@ -9,6 +9,9 @@ import {
   type ClaudeInvokeOptions,
 } from "./executor.js";
 import { CodexExecutor, CodexRecoveryRequiredError, type CodexExecutorOptions } from "./codex-executor.js";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { CODEX_SKILLS_SUBDIR } from "./steps/install-skills.js";
 import { createCodexPlanningDriver } from "./codex-planning-adapter.js";
 import {
   sanitizeAttribution,
@@ -113,7 +116,12 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
         options.createCodex?.(profileId) ??
         new CodexExecutor(options.workspaceDir, {
           ...options.codexOptions,
-          ...(stage === "planning" ? { protocolDriver: options.codexOptions?.protocolDriver ?? createCodexPlanningDriver() } : { protocolDriver: undefined }),
+          ...(stage === "planning"
+            ? {
+                protocolDriver: options.codexOptions?.protocolDriver ?? createCodexPlanningDriver(),
+                trustedSkillsDir: options.codexOptions?.trustedSkillsDir ?? join(homedir(), CODEX_SKILLS_SUBDIR),
+              }
+            : { protocolDriver: undefined, trustedSkillsDir: undefined }),
           auth,
           profileId,
           allowRepositoryWrites: options.allowRepositoryWrites,

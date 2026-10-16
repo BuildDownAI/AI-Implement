@@ -2,6 +2,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import type { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { CODEX_SKILLS_SUBDIR } from "../pipeline/steps/install-skills.js";
 import { AgentRecoveryRequiredError, AgentStageError, createStageExecutor, safeLimitLabel, safeModelLabel } from "../pipeline/stage-executor.js";
 import { ClaudeCliExecutor } from "../pipeline/executor.js";
 import { CodexRecoveryRequiredError } from "../pipeline/codex-executor.js";
@@ -9,6 +12,18 @@ import { normalizeInvocation } from "../agent-usage.js";
 import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
 import type { ModelAuthClient, ModelInvocation } from "../model-auth-client.js";
 import type { InvokeParams, LLMExecutor, LLMResult } from "../pipeline/types.js";
+
+const codexCtorOptions = vi.hoisted(() => [] as Array<Record<string, unknown>>);
+vi.mock("../pipeline/codex-executor.js", async (orig) => {
+  const actual = await orig<typeof import("../pipeline/codex-executor.js")>();
+  class CapturingCodex extends actual.CodexExecutor {
+    constructor(ws: string, options: ConstructorParameters<typeof actual.CodexExecutor>[1]) {
+      super(ws, options);
+      codexCtorOptions.push(options as unknown as Record<string, unknown>);
+    }
+  }
+  return { ...actual, CodexExecutor: CapturingCodex };
+});
 
 const rev = { configRevisionId: "rev-1", revision: 1 };
 const snapshot: ResolvedAgentSnapshotV1 = {
@@ -470,5 +485,18 @@ describe("held profiles across stages", () => {
     const again = await ex.invoke({ ...base, agentStage: "implementation" }).catch((e) => e);
     expect(again).toBeInstanceOf(AgentRecoveryRequiredError);
     expect(auth.invoke).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("trustedSkillsDir wiring", () => {
+  it("is passed to the planning Codex executor only", async () => {
+    codexCtorOptions.length = 0;
+    const ex = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot, auth: fakeAuth() });
+    for (const agentStage of ["planning", "review"] as const) {
+      await ex.invoke({ ...base, agentStage }).catch(() => undefined);
+    }
+    expect(codexCtorOptions).toHaveLength(2);
+    expect(codexCtorOptions[0].trustedSkillsDir).toBe(join(homedir(), CODEX_SKILLS_SUBDIR));
+    expect(codexCtorOptions[1].trustedSkillsDir).toBeUndefined();
   });
 });
