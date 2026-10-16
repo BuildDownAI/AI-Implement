@@ -3,17 +3,21 @@
  * routes need. No consumer exists yet; later leaves of AII-958 wire it into dispatch.
  *
  * Every store here is a stateless wrapper over `getDb()`, so one process-wide instance is safe. Rules fixed in
- * this slice: no `claude-subscription` account is reserved, no GitHub Actions path prepares, API-key profiles
- * resolve no secret (they prepare as `authentication-required`), and a repo image override is refused.
+ * this slice: no `claude-subscription` account is reserved, API-key profiles
+ * resolve only from encrypted `model_protected_secrets` (no ambient fallback; a missing row prepares as
+ * `authentication-required`), and a repo image override is refused.
  *
  * No secret reaches a log or a thrown message: failures use fixed text.
  */
+import { randomUUID } from "node:crypto";
 import { getProjectOptIn } from "./agent-config-store.js";
-import type { AgentRunPreparationDeps } from "./agent-run-preparation.js";
+import type { AgentConfigAdminDeps } from "./admin.js";
+import { inspectAgentReadiness, type AgentRunPreparationDeps } from "./agent-run-preparation.js";
 import { getDb } from "./dedup.js";
 import { getScopedInstallationToken } from "./github-app-auth.js";
-import { defaultFetchSignal } from "./github.js";
+import { defaultFetchSignal, getDefaultBranchFileText } from "./github.js";
 import type { ModelCredentialDeps } from "./model-credentials.js";
+import { createModelProtectedSecrets } from "./model-protected-secrets.js";
 import { createModelSessionKeyProvider } from "./model-session-keys.js";
 import { createModelSessionOwnership, sessionOwnerVerifier } from "./model-session-ownership.js";
 import type { ModelSessionOwnership } from "./model-session-ownership.js";
@@ -66,8 +70,11 @@ export function createModelAuthRuntime(input: {
     },
   };
 
-  // Operator decision: no new secrets. An API-key profile prepares as authentication-required.
-  const credentials: ModelCredentialDeps = { sessionStore, resolveProtectedSecret: () => null };
+  // API-key and Bedrock secrets come only from encrypted storage keyed off RUNNER_TOKEN_SECRET.
+  const credentials: ModelCredentialDeps = {
+    sessionStore,
+    resolveProtectedSecret: createModelProtectedSecrets({ env: input.env }).resolve,
+  };
 
   /** Installation token narrowed to the one repository being checked. */
   async function token(owner: string, repo: string): Promise<string> {
@@ -125,9 +132,15 @@ export function createModelAuthRuntime(input: {
           const visibility = await fetchVisibility(repository);
           return { visibility, trustedForSubscription: visibility === "private" && getProjectOptIn(target.projectKey) };
         },
-        // No GitHub Actions path prepares in this slice; a resolving stub would be a silent pass.
-        readDefaultBranchWorkflows() {
-          return Promise.reject(new Error("GitHub Actions workflows are not readable in this slice"));
+        // Default-branch text, repo-scoped token. `null` is an absent file; any other failure throws, which
+        // preparation reports as `delivery_unreadable` (never as "absent").
+        async readDefaultBranchWorkflows(repository, paths) {
+          const m = REPO_REF.exec(repository);
+          if (!m) throw new Error("malformed repository reference");
+          const bearer = await token(m[1]!, m[2]!);
+          const files: Record<string, string | null> = {};
+          for (const path of paths) files[path] = await getDefaultBranchFileText(bearer, m[1]!, m[2]!, path);
+          return files;
         },
         async checkRunnerCapability(backend) {
           if (backend === "local-docker") return true;
@@ -143,6 +156,23 @@ export function createModelAuthRuntime(input: {
           return resolved.source === "default";
         },
       };
+    },
+  };
+}
+
+/** Binds the admin API's readiness seam (AII-962) to the shared runtime. Read-only: it inspects, reserves and mints nothing. */
+export function createAgentConfigAdminDeps(config: RuntimeConfig): AgentConfigAdminDeps {
+  const runtime = getModelAuthRuntime(config);
+  return {
+    credentials: runtime.credentials,
+    sessionSnapshot: (profileId) => runtime.ownership.snapshot(profileId),
+    inspectReadiness(request, candidate) {
+      const [owner, repo] = request.workflowRepository.split("/");
+      return inspectAgentReadiness(
+        { ...request, dispatchId: `admin-readiness-${randomUUID()}` },
+        runtime.preparationDeps({ owner: owner!, repo: repo!, projectKey: request.projectKey }),
+        candidate,
+      );
     },
   };
 }

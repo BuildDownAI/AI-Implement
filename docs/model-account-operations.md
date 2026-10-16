@@ -66,8 +66,24 @@ sign in again on the laptop (step 1), then import again (step 2).
 `src/model-auth-runtime.ts` composes the dependencies a hosted (configured) run needs. Three facts matter to an operator:
 
 - **Protection key.** The Fly protection key is derived, not a new secret: HKDF-SHA256 over `RUNNER_TOKEN_SECRET`, salt `ai-implement`, info `ai-implement/model-auth-protection-key/v1`, 32 bytes (`deriveModelAuthProtectionKey`, `src/model-session-keys.ts`). The info label differs from the hosted session key's (`ai-implement/model-session-key/v1`), as ADR 009 requires, so the two keys are never equal. It travels base64url-encoded. With `RUNNER_TOKEN_SECRET` unset there is no key. Rotating the secret changes both keys.
-- **API-key profiles are not yet supported for hosted runs.** No protected store backs them, so a snapshot with an API-key profile prepares as `authentication-required` and launches nothing. There is never a fallback key. Storage is a separate follow-up.
+- **API-key and Bedrock profiles resolve from encrypted storage.** `src/model-protected-secrets.ts` stores each credential in `model_protected_secrets`, sealed with AES-256-GCM under a key derived by HKDF from `RUNNER_TOKEN_SECRET` (info `ai-implement/model-protected-secret-key/v1`, distinct from the session and protection labels) and bound to the exact `model-account:` reference as authenticated data. A permitted profile whose reference has a stored row prepares as `ready`. A missing key, row or reference, a malformed value, a bad tag, a changed `RUNNER_TOKEN_SECRET` or a swapped reference is unavailable: the profile prepares as `authentication-required`, with a fixed failure code and no value in errors. There is never an ambient fallback key. Rotating `RUNNER_TOKEN_SECRET` requires re-importing the credentials. Import and delete are described in [API credentials](#api-credentials).
 - **Scope of this slice.** Only `codex-subscription` and API-key profiles prepare. No `claude-subscription` account is reserved, GitHub Actions does not prepare, and a repo image override (`.ai-implement/image.yml`) is refused on Fly. No new environment variable is involved.
+
+## API credentials
+
+Import and remove API-key and Bedrock credentials with `secret-import` and `secret-delete` (AII-1422). The value enters only through stdin, never argv. Output is the reference and a fixed result (`ref=model-account:<name> secret-import ok`); failures print fixed text and never a value. Browser entry does not exist.
+
+- **Import.** Over Fly SSH, pipe the value in. An API key is the whole of stdin; one trailing newline is dropped and nothing else is trimmed:
+
+  ```bash
+  printf '%s' "$KEY" | fly ssh console -a <orchestrator-app> -C "node dist/model-account-cli.js secret-import --ref model-account:team-key"
+  ```
+
+  A Bedrock credential is a JSON object on stdin with `region`, `accessKeyId`, `secretAccessKey` and optional `sessionToken`. Stdin that parses as a JSON object is always read as a bundle, so an API key that is itself JSON object text cannot be imported. The reference must match `model-account:` followed by lowercase letters, digits, `.`, `_` or `-`. A bad reference or value, or an unset `RUNNER_TOKEN_SECRET`, fails before anything is written.
+- **Replace.** Importing again to the same reference overwrites the stored value.
+- **Delete.** `node dist/model-account-cli.js secret-delete --ref model-account:team-key` removes the row and succeeds when none exists. Afterwards the profile prepares as `authentication-required`.
+- **Backup and restore.** Rows are sealed under a key derived from the current `RUNNER_TOKEN_SECRET` and bound to their reference. A restored database works only under the same secret, and a row copied to another reference fails authentication.
+- **Rotation.** Rotating `RUNNER_TOKEN_SECRET` orphans every stored credential. Re-import each one after the rotation.
 
 ## Claude subscription accounts
 

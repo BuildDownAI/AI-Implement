@@ -114,12 +114,11 @@ The planning result callback still marks the planning job complete and still ski
 
 ## Managed dispatch decisions
 
-`prepareManagedDispatch` (`src/managed-dispatch-auth.ts`, AII-1386) maps one `prepareAgentRun` result to one decision. Every dispatch path calls it so each makes the same choice for the same state. It has no consumer yet. The checks run in this order:
+`prepareManagedDispatch` (`src/managed-dispatch-auth.ts`, AII-1386) maps one `prepareAgentRun` result to one decision. Every dispatch path calls it so each makes the same choice for the same state. The checks run in this order. A `github-actions` backend has no special row (AII-1420): `prepareAgentRun` reads the default-branch workflow and the retired triggers, and only a template carrying `ai-implement-capability: stage-agent-config-v1` with no retired trigger reaches reservation and minting. An old, custom, unreadable or retired-trigger state refuses with a fixed code (`runner_incompatible`, `delivery_unreadable`, `retired_workflow_present`) and launches nothing.
 
 | State, in check order | Decision | Reserve | Mint |
 | -- | -- | -- | -- |
 | `isManagedProject` false (includes an empty `projectKey`) | `legacy`, `prepareAgentRun` not called | no | no |
-| backend `github-actions` | `refuse` configuration-error `gha_not_supported` | no | no |
 | stored or resolved snapshot selects `claude-subscription` | `refuse` configuration-error `claude_subscription_unsupported` | no | no |
 | `prepareAgentRun` throws | `hold` `preparation_failed` | n/a | n/a |
 | `legacy` | `legacy` | no | no |

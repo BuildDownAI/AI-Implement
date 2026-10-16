@@ -81,6 +81,10 @@ export interface PassStat extends Record<string, unknown> {
   attempts?: number;
   /** Spawn attempts the review call made for this pass, when review ran (>1 only under a retried transient failure). */
   reviewAttempts?: number;
+  /** Failure code when the implement invocation failed yet the pass went on to review; the review verdict never clears it. */
+  implementFailureCode?: string;
+  /** Redacted one-line cause for `implementFailureCode` (the failure record's message). */
+  implementFailureMessage?: string;
   /** Optional implement-invocation attribution (AII-946/954), carried from telemetry; absent on legacy executors. */
   attribution?: InvocationAttributionV1;
 }
@@ -100,6 +104,8 @@ export interface FeedbackLoopOutputs extends Record<string, unknown> {
    *  report-card.ts's extraCostUsd `.retry` rows so the ticket-facing total (run-autonomous.ts)
    *  can agree with the report card (BAC-27201). */
   extraCostUsd: number | null;
+  /** Superseded retry attempts that produced no reported cost, so `extraCostUsd` is a lower bound. */
+  extraCostUnreported?: number;
 }
 
 function addExtraCost(a: number | null, b: number | null | undefined): number | null {
@@ -215,6 +221,7 @@ export async function runFeedbackLoop(
   // that ultimately settled the stage. Mirrors report-card.ts's extraCostUsd `.retry` rows
   // so the ticket-facing total can agree with the report card (BAC-27201).
   let extraCostUsd: number | null = null;
+  let extraCostUnreported = 0;
 
   const rawPlanningContext = params.planningContext;
   const { acceptanceBar, mapSection } = splitPlanningContext(rawPlanningContext ?? "");
@@ -313,6 +320,7 @@ export async function runFeedbackLoop(
         if (willRetryImplement) {
           implementSubStep.id = `implement.${iteration}.retry${implementStageAttempt}`;
           extraCostUsd = addExtraCost(extraCostUsd, implementErrTelemetry?.costUsd);
+          if (implementErrTelemetry?.costUsd == null) extraCostUnreported++;
         }
         implementSubStep.outputs = {
           error: String(err),
@@ -411,6 +419,7 @@ export async function runFeedbackLoop(
     }
 
     const implementTelemetry = implementOutputs.telemetry as RunTelemetry | undefined;
+    const implementInvocationFailure = implementOutputs.invocationFailure as FailureRecord | undefined;
     const pass: PassStat = {
       iteration,
       implementTurns: implementTelemetry?.numTurns ?? null,
@@ -423,6 +432,9 @@ export async function runFeedbackLoop(
       cacheReadTokens: implementTelemetry?.cacheReadTokens ?? null,
       cacheCreationTokens: implementTelemetry?.cacheCreationTokens ?? null,
       attempts: implementAttemptsTotal,
+      ...(implementInvocationFailure
+        ? { implementFailureCode: implementInvocationFailure.code, implementFailureMessage: implementInvocationFailure.message }
+        : {}),
       ...(implementTelemetry?.attribution ? { attribution: implementTelemetry.attribution } : {}),
     };
     passes.push(pass);
@@ -526,7 +538,10 @@ export async function runFeedbackLoop(
           verdict: {
             approved: reviewOutputs.approved,
             reason: reviewOutputs.approved ? "approved" : "changes_requested",
-            summary: reviewOutputs.feedback,
+            // An approving review never clears the implement invocation's own failure.
+            summary: implementInvocationFailure
+              ? `Implement invocation failed (${implementInvocationFailure.code}): ${implementInvocationFailure.message}\n\n${reviewOutputs.feedback}`
+              : reviewOutputs.feedback,
           },
           usage: sumUsage(implementTelemetry, reviewOutputs.telemetry),
         });
@@ -554,6 +569,7 @@ export async function runFeedbackLoop(
         if (willRetryReview) {
           reviewSubStep.id = `review.${iteration}.retry${reviewStageAttempt}`;
           extraCostUsd = addExtraCost(extraCostUsd, reviewErrTelemetry?.costUsd);
+          if (reviewErrTelemetry?.costUsd == null) extraCostUnreported++;
         }
         reviewSubStep.outputs = {
           error: String(err),
@@ -621,6 +637,7 @@ export async function runFeedbackLoop(
     terminationReason,
     passes,
     extraCostUsd,
+    extraCostUnreported,
     ...(postMortem ? { postMortem } : {}),
     ...(failureForOutputs ? { failure: failureForOutputs } : {}),
   };

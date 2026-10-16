@@ -131,3 +131,12 @@ describe("runner image prefixes card", () => {
     expect(body).not.toContain("innerHTML");
   });
 });
+
+describe("orchestrator agent defaults card", () => {
+  it("is declared with its own error element and no raw credential field", () => {
+    expect(settingsHtml).toContain('id="settings-agent-defaults-mode"');
+    expect(settingsHtml).toContain('id="settings-agent-defaults-error" class="error hidden"');
+    expect(settingsHtml).toContain("each project opts in separately");
+    expect(settingsHtml).toContain("Changes apply to the next run");
+  });
+});

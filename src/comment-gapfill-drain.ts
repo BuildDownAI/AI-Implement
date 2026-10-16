@@ -21,6 +21,8 @@ import { resolveSessionImage } from "./repo-image.js";
 import { dispatchLocalGapfill } from "./local-gapfill.js";
 import {
   classifyLaunchError,
+  ghaLaunchOutcome,
+  ghaManagedCredentials,
   isManagedProject,
   prepareManagedDispatch,
   refusalText,
@@ -83,7 +85,7 @@ function releaseGapfillAdmission(admission: GapfillAdmission): void {
 async function resolveManagedDecision(
   opts: DrainCommentGapfillsInput,
   item: { id: number },
-  req: { dispatchId: string; projectKey: string; backend: "local-docker" | "fly-machines"; owner: string; repo: string; workflowFile: string },
+  req: { dispatchId: string; projectKey: string; backend: "local-docker" | "fly-machines" | "github-actions"; owner: string; repo: string; workflowFile: string },
   admission: GapfillAdmission,
   identifier: string,
 ): Promise<Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> | null> {
@@ -683,14 +685,6 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
 
       } else {
         // GitHub Actions path (includes "both" shadow mode — GHA is primary)
-        // Protected model auth has no GitHub Actions transport: refuse before any admission or grant.
-        if (isManagedProject(scopeKey)) {
-          console.warn(
-            `[comment-gapfill] ${refusalText({ kind: "refuse", category: "configuration-error", code: "gha_not_supported" })} (${gapFillIssue.identifier})`,
-          );
-          markCommentGapfillProcessed(item.id, "failed");
-          continue;
-        }
         // Final admission authority: one transaction reserves team capacity and PR-scoped
         // occupancy before any credential mint or launch call. gateDecision (checked above)
         // is only the preview. Reuse a dispatchId already minted above (callback configured);
@@ -716,6 +710,14 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           continue;
         }
 
+        // Managed model authentication (AII-1420): decided after admission and before any launch call.
+        const ghaDecision = await resolveManagedDecision(
+          opts, item,
+          { dispatchId, projectKey: scopeKey, backend: "github-actions", owner: item.owner, repo: item.repo, workflowFile: mapping.workflowFile },
+          admission, gapFillIssue.identifier,
+        );
+        if (!ghaDecision) continue;
+
         // Everything below is pure prep — no launch call has fired yet. A throw anywhere in
         // here (e.g. a workflow-capabilities probe failure) is by construction a definitive
         // non-launch, so it releases the reservation and rethrows for the outer per-item catch
@@ -734,7 +736,9 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
             ref: mapping.defaultBranch,
           }));
           contract = capabilities.contract;
-          const trustedCredentials = opts.getTrustedCredentials?.({ owner: item.owner, repo: item.repo, prNumber: item.prNumber });
+          const suppliedCredentials = opts.getTrustedCredentials?.({ owner: item.owner, repo: item.repo, prNumber: item.prNumber });
+          const managedCredentials = ghaManagedCredentials(ghaDecision);
+          const trustedCredentials = managedCredentials ? { ...suppliedCredentials, ...managedCredentials } : suppliedCredentials;
           assertPrivateTransportForCredentials(
             trustedCredentials, capabilities,
             `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
@@ -755,6 +759,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
                 runPublicationToken: ghaPublicationToken,
                 privateTransport: capabilities.supportsPrivateRunConfig === true,
                 credentials: trustedCredentials,
+                ...(ghaDecision.kind === "launch" ? { agentConfig: ghaDecision.snapshot } : {}),
                 runnerImage,
                 retryPolicy: getRetryPolicy(),
               })
@@ -775,11 +780,19 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
                 ...(runnerImage ? { runner_image: runnerImage } : {}),
               }) as Record<string, string | undefined>;
         } catch (err) {
+          settleManaged(opts, ghaDecision, "rejected");
           releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
           throw err;
         }
 
-        const result = await opts.dispatch(ghToken, mapping, gapFillInputs, { returnRunDetails: true });
+        let result: Awaited<ReturnType<typeof opts.dispatch>>;
+        try {
+          result = await opts.dispatch(ghToken, mapping, gapFillInputs, { returnRunDetails: true });
+        } catch (err) {
+          settleManaged(opts, ghaDecision, "unknown");
+          throw err;
+        }
+        if (!result.success) settleManaged(opts, ghaDecision, ghaLaunchOutcome(result) === "rejected" ? "rejected" : "unknown");
 
         if (!result.success) {
           if (result.outcome !== "rejected") {

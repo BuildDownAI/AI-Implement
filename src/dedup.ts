@@ -241,6 +241,17 @@ function createAgentConfigurationTables(): void {
       CHECK (state_status IN ('checkpointed', 'held', 'expired', 'revoked'))
     )
   `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS model_protected_secrets (
+      secret_ref TEXT PRIMARY KEY,
+      ciphertext BLOB NOT NULL,
+      nonce BLOB NOT NULL,
+      auth_tag BLOB NOT NULL,
+      encryption_key_id TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    )
+  `);
   db.exec(`
     CREATE TABLE IF NOT EXISTS model_credential_grants (
       grant_id TEXT PRIMARY KEY,

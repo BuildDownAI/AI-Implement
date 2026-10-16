@@ -31,6 +31,25 @@ export const settingsHtml = `
     </div>
 
     <div class="card">
+      <div class="card-header"><h2 class="card-title">Orchestrator Agent Defaults</h2></div>
+      <div class="card-body">
+        <p class="text-secondary" style="margin-bottom:12px">Stage defaults for planning, implementation and review live in the orchestrator, not in a target repository. Turning them on here does not enrol any project: each project opts in separately, and a legacy project keeps its current behavior. Changes apply to the next run. Edit the per-stage agent, provider, model, account profile and elapsed time limit on the <a href="#models">Models &amp; providers</a> page.</p>
+        <div class="field">
+          <label>Defaults mode</label>
+          <div style="display:flex;gap:6px">
+            <select class="input" id="settings-agent-defaults-mode" style="flex:1">
+              <option value="legacy">legacy (stage defaults off)</option>
+              <option value="configured">configured (stage defaults on for opted-in projects)</option>
+            </select>
+            <button class="btn btn-primary btn-sm" id="settings-agent-defaults-save" onclick="saveAgentDefaultsMode()">Save</button>
+          </div>
+          <div id="settings-agent-defaults-summary" class="text-tertiary" style="font-size:11px;margin-top:3px"></div>
+        </div>
+        <div id="settings-agent-defaults-error" class="error hidden"></div>
+      </div>
+    </div>
+
+    <div class="card">
       <div class="card-header"><h2 class="card-title">Linear Pickup Label</h2></div>
       <div class="card-body">
         <div class="warning">Changing this label changes which Linear issues this orchestrator dispatches. Change it only for a planned migration. Issues that carry the old label stop dispatching at the next poll. The lifecycle labels (AI-Planning, AI-Working, Plan-Complete, Ready for Review) do not change.</div>
@@ -167,6 +186,69 @@ export const settingsScript = `
       input.value = policy && policy[field] !== defaults[field] ? policy[field] : '';
     });
   }
+
+  var adDirty = false;
+
+  function adCanEdit() {
+    return typeof window.isAdmin === 'function' && window.isAdmin();
+  }
+
+  function adShowError(msg) {
+    var el = document.getElementById('settings-agent-defaults-error');
+    el.textContent = msg || '';
+    el.classList.toggle('hidden', !msg);
+  }
+
+  async function adErrorText(res, fallback) {
+    try {
+      var data = await res.json();
+      if (data && data.error) return fallback + ': ' + data.error;
+    } catch (_) {}
+    return fallback + ' (HTTP ' + res.status + ')';
+  }
+
+  async function loadAgentDefaults() {
+    if (adDirty) return;
+    var modeEl = document.getElementById('settings-agent-defaults-mode');
+    var saveBtn = document.getElementById('settings-agent-defaults-save');
+    var canEdit = adCanEdit();
+    modeEl.disabled = !canEdit;
+    saveBtn.classList.toggle('hidden', !canEdit);
+    modeEl.onchange = function () { adDirty = true; };
+    try {
+      var res = await window.api('/api/agent-defaults');
+      if (!res.ok) { adShowError(await adErrorText(res, 'Failed to load agent defaults')); return; }
+      var data = await res.json();
+      modeEl.value = data.mode === 'configured' ? 'configured' : 'legacy';
+      var stages = data.stages || {};
+      var n = Object.keys(stages).length;
+      document.getElementById('settings-agent-defaults-summary').textContent =
+        (data.configured ? 'Saved' : 'Nothing saved yet') + '; ' + n + ' of 3 stages have settings.';
+      adShowError('');
+    } catch (err) {
+      adShowError('Failed to load agent defaults: ' + String(err));
+    }
+  }
+
+  async function saveAgentDefaultsMode() {
+    if (!adCanEdit()) return;
+    adShowError('');
+    var modeEl = document.getElementById('settings-agent-defaults-mode');
+    var mode = modeEl.value === 'configured' ? 'configured' : 'legacy';
+    try {
+      // PUT replaces stages wholesale, so read the current stages immediately before writing.
+      var cur = await window.api('/api/agent-defaults');
+      if (!cur.ok) { adShowError(await adErrorText(cur, 'Failed to read current stage defaults')); return; }
+      var current = await cur.json();
+      var res = await window.api('/api/agent-defaults', { method: 'PUT', body: JSON.stringify({ mode: mode, stages: current.stages || {} }) });
+      if (!res.ok) { adShowError(await adErrorText(res, 'Failed to save agent defaults')); return; }
+      adDirty = false;
+      await loadAgentDefaults();
+    } catch (err) {
+      adShowError('Failed to save agent defaults: ' + String(err));
+    }
+  }
+  window.saveAgentDefaultsMode = saveAgentDefaultsMode;
 
   async function loadSettings() {
     try {
@@ -422,6 +504,6 @@ export const settingsScript = `
   }
   window.deleteGlobalSecret = deleteGlobalSecret;
 
-  window.registerPage('settings', function () { loadSettings(); loadGlobalSecrets(); });
+  window.registerPage('settings', function () { loadSettings(); loadGlobalSecrets(); loadAgentDefaults(); });
 })();
 `;

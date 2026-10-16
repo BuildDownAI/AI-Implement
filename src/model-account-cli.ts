@@ -1,8 +1,9 @@
 /**
  * Operator command for hosted model accounts: `node dist/model-account-cli.js <command> ...`, run on the
  * orchestrator machine (for example through `fly ssh console`). ChatGPT plan commands: `chatgpt-import`,
- * `chatgpt-status`, `chatgpt-logout`, each with `--profile <id>`. Claude subscription commands arrive with AII-963;
- * add them to `COMMANDS`.
+ * `chatgpt-status`, `chatgpt-logout`, each with `--profile <id>`. API credential commands: `secret-import` and
+ * `secret-delete`, each with `--ref model-account:<name>`, over the encrypted store in model-protected-secrets.ts.
+ * Claude subscription commands arrive with AII-963; add them to `COMMANDS`.
  *
  * Trust boundary: the operator shell on this machine to the protected session store. The record enters only through
  * stdin (never argv). No token reaches stdout, stderr, or an error message; failures print fixed text.
@@ -15,6 +16,9 @@ import type { AccountProfileProjection } from "./agent-config-store.js";
 import { revoke } from "./chatgpt-plan-login.js";
 import { parseChatGptPlanRecord, serializeChatGptPlanRecord } from "./chatgpt-plan-token.js";
 import { getDb } from "./dedup.js";
+import { createModelProtectedSecrets } from "./model-protected-secrets.js";
+import type { ModelProtectedSecrets, ProtectedSecretFailure } from "./model-protected-secrets.js";
+import { MODEL_ACCOUNT_REF_PATTERN } from "./model-credentials.js";
 import { createModelSessionKeyProvider } from "./model-session-keys.js";
 import { PLAN_RECORD_OWNER_GENERATION, createModelSessionStore } from "./model-session-store.js";
 import type { ModelSessionStore } from "./model-session-store.js";
@@ -22,7 +26,9 @@ import { readChatGptPlanState, requestChatGptPlanRefresh } from "./restate/chatg
 
 export const HOST_ID_KEY = "chatgpt_plan_host_id";
 const OPERATOR = "model-account-cli";
-const USAGE = "usage: model-account-cli <chatgpt-import|chatgpt-status|chatgpt-logout> --profile <id>   (import reads the record JSON from stdin)";
+const USAGE =
+  "usage: model-account-cli <chatgpt-import|chatgpt-status|chatgpt-logout> --profile <id>   (import reads the record JSON from stdin)\n" +
+  "       model-account-cli <secret-import|secret-delete> --ref model-account:<name>   (import reads the API key or Bedrock JSON from stdin)";
 
 export interface CliDeps {
   store: () => ModelSessionStore;
@@ -33,6 +39,8 @@ export interface CliDeps {
   getProfile: (profileId: string) => AccountProfileProjection | null;
   requestRefresh: (profileId: string) => Promise<void>;
   readState: (profileId: string) => Promise<{ lastOutcome: string } | null>;
+  /** Encrypted API-key and Bedrock credential store (AII-1411). */
+  secrets: () => ModelProtectedSecrets;
   fetch: typeof fetch;
   readStdin: () => Promise<string>;
   now: () => number;
@@ -171,6 +179,39 @@ async function chatgptLogout(profileId: string, deps: CliDeps): Promise<void> {
   if (!confirmed) deps.stdout("Revocation was not confirmed. You can disconnect the app in ChatGPT settings.");
 }
 
+const SECRET_FAILURES: Record<ProtectedSecretFailure, string> = {
+  invalid_ref: "the reference is not a valid model-account reference",
+  invalid_value: "stdin is not a valid API key or Bedrock credential bundle",
+  key_unavailable: "RUNNER_TOKEN_SECRET is not set; the encryption key derives from it",
+  row_missing: "could not write the credential",
+  decrypt_failed: "could not write the credential",
+  write_failed: "could not write the credential",
+};
+
+/** A key is one line; a trailing newline from `echo` or a heredoc is dropped, nothing else is trimmed. */
+function parseSecretInput(raw: string): string | Record<string, unknown> {
+  const text = raw.replace(/\r?\n$/, "");
+  return parseJsonObject(text) ?? text;
+}
+
+async function secretImport(ref: string, deps: CliDeps): Promise<void> {
+  if (!deps.env.RUNNER_TOKEN_SECRET) throw new CliError(SECRET_FAILURES.key_unavailable);
+  const result = deps.secrets().write(ref, parseSecretInput(await deps.readStdin()) as never);
+  if (!result.ok) throw new CliError(SECRET_FAILURES[result.code]);
+  deps.stdout(`ref=${ref} secret-import ok`);
+}
+
+async function secretDelete(ref: string, deps: CliDeps): Promise<void> {
+  const result = deps.secrets().delete(ref);
+  if (!result.ok) throw new CliError("could not delete the credential");
+  deps.stdout(`ref=${ref} secret-delete ok`);
+}
+
+const SECRET_COMMANDS: Record<string, (ref: string, deps: CliDeps) => Promise<void>> = {
+  "secret-import": secretImport,
+  "secret-delete": secretDelete,
+};
+
 const COMMANDS: Record<string, (profileId: string, deps: CliDeps) => Promise<void>> = {
   "chatgpt-import": chatgptImport,
   "chatgpt-status": chatgptStatus,
@@ -179,6 +220,22 @@ const COMMANDS: Record<string, (profileId: string, deps: CliDeps) => Promise<voi
 
 export async function main(argv: string[], deps: CliDeps = defaultDeps()): Promise<number> {
   const [command, ...rest] = argv;
+  const secretRun = command ? SECRET_COMMANDS[command] : undefined;
+  if (secretRun) {
+    // Only `--ref <ref>` is accepted, so a value can never ride on argv; an invalid ref is never echoed.
+    const ref = rest[1];
+    if (rest.length !== 2 || rest[0] !== "--ref" || ref === undefined || !MODEL_ACCOUNT_REF_PATTERN.test(ref)) {
+      deps.stderr(rest.length === 2 && rest[0] === "--ref" ? `${command} failed: ${SECRET_FAILURES.invalid_ref}` : USAGE);
+      return rest.length === 2 && rest[0] === "--ref" ? 1 : 2;
+    }
+    try {
+      await secretRun(ref, deps);
+      return 0;
+    } catch (err) {
+      deps.stderr(`ref=${ref} ${command} failed: ${err instanceof CliError ? err.message : "unexpected failure"}`);
+      return 1;
+    }
+  }
   const run = command ? COMMANDS[command] : undefined;
   // Only `--profile <id>` is accepted, so a record can never ride on argv.
   if (!run || rest.length !== 2 || rest[0] !== "--profile" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(rest[1] ?? "")) {
@@ -209,6 +266,7 @@ export function defaultDeps(): CliDeps {
     getProfile: getAccountProfile,
     requestRefresh: (id) => requestChatGptPlanRefresh(id),
     readState: (id) => readChatGptPlanState(id),
+    secrets: () => createModelProtectedSecrets({ env: process.env }),
     fetch: (input, init) => fetch(input, init),
     readStdin: readProcessStdin,
     now: () => Date.now(),

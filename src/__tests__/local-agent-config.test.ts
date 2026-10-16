@@ -39,14 +39,14 @@ function baseConfig(overrides: Record<string, unknown> = {}) {
     projectKey: PROJECT,
     stages: {
       planning: stageBlock("api-a"),
-      implementation: stageBlock("sub-a"),
+      implementation: stageBlock("sub-a", "claude", "anthropic"),
       review: stageBlock("api-b"),
     },
     profiles: [
       { id: "api-a", identity: "a", revision: 1, agent: "codex", provider: "openai", authMode: "openai-api-key", credentialPath: join(outside, "a.key") },
       { id: "api-b", identity: "b", revision: 1, agent: "codex", provider: "openai", authMode: "openai-api-key", credentialPath: join(outside, "b.key") },
       {
-        id: "sub-a", identity: "s", revision: 2, agent: "codex", provider: "openai", authMode: "codex-subscription",
+        id: "sub-a", identity: "s", revision: 2, agent: "claude", provider: "anthropic", authMode: "claude-subscription",
         sessionPath: join(outside, "session.json"), sessionSource: "local-login", trustedPrivateTesting: true,
       },
     ],
@@ -112,7 +112,7 @@ describe("loadLocalAgentConfig", () => {
     expect(resolution.mode).toBe("configured");
     if (resolution.mode !== "configured") return;
     expect(Object.keys(resolution.stages)).toEqual(["planning", "implementation", "review"]);
-    expect(resolution.profiles.implementation.authMode).toBe("codex-subscription");
+    expect(resolution.profiles.implementation.authMode).toBe("claude-subscription");
     expect([...references.keys()].sort()).toEqual(["api-a", "api-b", "sub-a"]);
   });
 
@@ -223,7 +223,7 @@ describe("ownership and port", () => {
     expect(await port.load({ profileId: "api-a", authMode: "openai-api-key" })).toEqual({ kind: "api-key", apiKey: API_SECRET });
     expect(await port.load({ profileId: "api-b", authMode: "openai-api-key" })).toEqual({ kind: "api-key", apiKey: "sk-synthetic-b" });
     expect(port.persistSession).toBeDefined();
-    await expectCategory(port.load({ profileId: "api-a", authMode: "codex-subscription" }), "credential_unreadable");
+    await expectCategory(port.load({ profileId: "api-a", authMode: "claude-subscription" }), "credential_unreadable");
   });
 
   it("omits persistSession for API-only configurations", async () => {
@@ -234,7 +234,7 @@ describe("ownership and port", () => {
 
   it("requires ownership before loading a subscription session", async () => {
     const { port } = await setup();
-    await expectCategory(port.load({ profileId: "sub-a", authMode: "codex-subscription" }), "session_not_owned");
+    await expectCategory(port.load({ profileId: "sub-a", authMode: "claude-subscription" }), "session_not_owned");
   });
 
   it("releases an unused lease without persisting or reading the session", async () => {
@@ -272,7 +272,7 @@ describe("ownership and port", () => {
     const sub = loaded.references.get("sub-a")!;
     const lease = await ownership.acquire(sub);
 
-    const load = port.load({ profileId: "sub-a", authMode: "codex-subscription" });
+    const load = port.load({ profileId: "sub-a", authMode: "claude-subscription" });
     await entered.promise;
 
     const proofRequested = deferred();
@@ -287,7 +287,7 @@ describe("ownership and port", () => {
 
     expect(lease.status).toBe("owned");
     expect(lease.used).toBe(false);
-    await expectCategory(port.load({ profileId: "sub-a", authMode: "codex-subscription" }), "session_not_owned");
+    await expectCategory(port.load({ profileId: "sub-a", authMode: "claude-subscription" }), "session_not_owned");
 
     continueLoad.resolve();
     await expectCategory(load, "session_not_owned");
@@ -302,7 +302,7 @@ describe("ownership and port", () => {
   it("does not release unused ownership after session use, unknown proof, held state, or stale fencing", async () => {
     const { ownership, port, sub } = await setup();
     const used = await ownership.acquire(sub);
-    await port.load({ profileId: "sub-a", authMode: "codex-subscription" });
+    await port.load({ profileId: "sub-a", authMode: "claude-subscription" });
     expect(used.used).toBe(true);
     await expectCategory(ownership.releaseUnused(used, { confirmTermination: async () => "confirmed" }), "persistence_missing");
     expect(used.status).toBe("owned");
@@ -340,7 +340,7 @@ describe("ownership and port", () => {
   it("durably persists the exact refreshed payload with private mode and survives container removal", async () => {
     const { ownership, port, sub } = await setup();
     const lease = await ownership.acquire(sub);
-    expect(await port.load({ profileId: "sub-a", authMode: "codex-subscription" })).toEqual({
+    expect(await port.load({ profileId: "sub-a", authMode: "claude-subscription" })).toEqual({
       kind: "session", sessionData: SESSION_SECRET, stateSequence: 0,
     });
     const refreshed = '{"synthetic":"refreshed-1"}\n  ';
@@ -355,7 +355,7 @@ describe("ownership and port", () => {
     expect(lease.status).toBe("released");
     // Next owner sees refreshed state.
     const next = await ownership.acquire(sub);
-    expect((await port.load({ profileId: "sub-a", authMode: "codex-subscription" }))).toMatchObject({ sessionData: refreshed });
+    expect((await port.load({ profileId: "sub-a", authMode: "claude-subscription" }))).toMatchObject({ sessionData: refreshed });
     expect(next.status).toBe("owned");
   });
 
@@ -518,11 +518,20 @@ describe("chatgpt-sign-in references", () => {
     return new Response(JSON.stringify(error ? { error } : {}), { status });
   }
 
+  /** The base config with its subscription profile switched to a codex-subscription ChatGPT sign-in record. */
+  function chatGptConfig() {
+    const cfg = baseConfig({
+      stages: { planning: stageBlock("api-a"), implementation: stageBlock("sub-a"), review: stageBlock("api-b") },
+    });
+    Object.assign(cfg.profiles[2] as Record<string, unknown>, {
+      agent: "codex", provider: "openai", authMode: "codex-subscription", sessionPath: recordPath(), sessionSource: "chatgpt-sign-in",
+    });
+    return cfg;
+  }
+
   async function setup(rec: unknown, io: Record<string, unknown> = {}) {
     await privateFile(recordPath(), typeof rec === "string" ? rec : JSON.stringify(rec));
-    const cfg = baseConfig();
-    (cfg.profiles[2] as Record<string, unknown>).sessionPath = recordPath();
-    (cfg.profiles[2] as Record<string, unknown>).sessionSource = "chatgpt-sign-in";
+    const cfg = chatGptConfig();
     const loaded = await loadLocalAgentConfig(opts(await writeConfig(cfg)));
     const ownership = new LocalSessionOwnership({ forbiddenRoots: [repo], onDiagnostic: (d) => diagnostics.push(d) });
     const port = createLocalCredentialPort({
@@ -547,10 +556,16 @@ describe("chatgpt-sign-in references", () => {
     const api = baseConfig();
     (api.profiles[0] as Record<string, unknown>).sessionSource = "chatgpt-sign-in";
     await expect(loadLocalAgentConfig(opts(await writeConfig(api)))).rejects.toMatchObject({ category: "config_invalid" });
-    const untrusted = baseConfig();
-    (untrusted.profiles[2] as Record<string, unknown>).sessionSource = "chatgpt-sign-in";
+    const untrusted = chatGptConfig();
     delete (untrusted.profiles[2] as Record<string, unknown>).trustedPrivateTesting;
     await expect(loadLocalAgentConfig(opts(await writeConfig(untrusted)))).rejects.toMatchObject({ category: "subscription_unauthorized" });
+  });
+
+  it("rejects local-login for codex-subscription, and chatgpt-sign-in is the only codex source", async () => {
+    const codexLogin = chatGptConfig();
+    (codexLogin.profiles[2] as Record<string, unknown>).sessionSource = "local-login";
+    await expect(loadLocalAgentConfig(opts(await writeConfig(codexLogin)))).rejects.toMatchObject({ category: "config_invalid" });
+    await expect(loadLocalAgentConfig(opts(await writeConfig(baseConfig())))).resolves.toBeDefined();
   });
 
   it("returns the current token without a refresh call when it has enough life", async () => {

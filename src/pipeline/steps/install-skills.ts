@@ -48,6 +48,8 @@ interface InstallSkillsInputs extends Record<string, unknown> {
 interface InstallSkillsOutputs extends Record<string, unknown> {
   skillsInstalled: number;
   skillsRepoRef: string | null;
+  /** Distinct skill directory names installed this call (absent on failure paths). */
+  skillNames?: string[];
 }
 
 export const installSkillsStep: StepModule<InstallSkillsInputs, InstallSkillsOutputs> = {
@@ -200,7 +202,7 @@ export function installSkills(inputs: InstallSkillsInputs): InstallSkillsOutputs
     console.log(
       `[skills] cloned ref=${skillsRepoRef ?? "unknown"} installed=${skillsInstalled} skill(s)`,
     );
-    return { skillsInstalled, skillsRepoRef };
+    return { skillsInstalled, skillsRepoRef, skillNames: skillDirs.map((d) => d.name) };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`[skills] install failed: ${redactToken(msg)}`);

@@ -3,9 +3,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { execFileSync, type spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { CHATGPT_PLAN_PROVIDER, CODEX_SHELL_ENV_EXCLUDE, CodexExecutor, chatgptPlanProviderArgs, CodexPlanningPolicyUnprovenError, CodexRecoveryRequiredError, matchesSchema, type CodexExecutorOptions } from "../pipeline/codex-executor.js";
 import { ModelAuthClientError, type ModelAuthClient, type ModelInvocation } from "../model-auth-client.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
@@ -211,7 +211,10 @@ describe("CodexExecutor result contract", () => {
         spawnImpl: makeSpawn([{ stdout: message("done") }], log),
         sleepImpl: async () => {},
       });
-      await expect(executor.invoke(base), url).rejects.toMatchObject({ reason: "auth_sync_failed" });
+      const error = await executor.invoke(base).catch((e: unknown) => e);
+      expect(error, url).toBeInstanceOf(Error);
+      expect(error, url).not.toBeInstanceOf(CodexRecoveryRequiredError);
+      expect((error as Error).message, url).toMatch(/OPENAI_BASE_URL/);
       expect(log, url).toEqual([]);
     }
   });
@@ -808,8 +811,6 @@ describe("protocol driver seam (AII-1001)", () => {
 
 describe("app-server trusted view (AII-1002)", () => {
   const AUTH_ORIGINAL = '{"tokens":{"account_id":"acct-S","refresh_token":"original"}}';
-  const AUTH_REFRESHED = '{"tokens":{"account_id":"acct-S","refresh_token":"refreshed"}}';
-  const AUTH_OTHER = '{"tokens":{"account_id":"acct-X","refresh_token":"other"}}';
   const viewDirs = (): string[] => readdirSync(tmpdir()).filter((n) => n.startsWith("codex-view-"));
   let selected: string;
   beforeEach(() => {
@@ -834,32 +835,6 @@ describe("app-server trusted view (AII-1002)", () => {
     stopReason: null,
   });
 
-  /** Mirrors ModelAuthClient: checkpoints (reads the selected source) after the callback returns OR throws, then settles. */
-  function checkpointingAuth() {
-    const checkpoints: string[] = [];
-    let started = 0;
-    let settled = 0;
-    const client: Pick<ModelAuthClient, "invoke"> = {
-      async invoke<T>(_id: string, cb: (i: ModelInvocation) => Promise<T>): Promise<T> {
-        started++;
-        let out: T | undefined;
-        let failure: unknown;
-        let failed = false;
-        try {
-          out = await cb({ env: { PATH: "/usr/bin", CODEX_HOME: selected }, strippedKeys: [] });
-        } catch (e) {
-          failed = true;
-          failure = e;
-        }
-        checkpoints.push(readFileSync(join(selected, "auth.json"), "utf8"));
-        settled++;
-        if (failed) throw failure;
-        return out as T;
-      },
-    };
-    return { client, checkpoints, invocations: () => ({ started, settled }) };
-  }
-
   function run(scripts: Script[], log: Spawned[], driverRun: CodexProtocolDriver["run"], extra: Partial<CodexExecutorOptions> = {}) {
     const events: string[] = [];
     const auth: Pick<ModelAuthClient, "invoke"> = {
@@ -883,8 +858,8 @@ describe("app-server trusted view (AII-1002)", () => {
     return { executor, log, events };
   }
 
-  it("spawns in a trusted empty cwd with a trusted CODEX_HOME holding only config and the selected auth", async () => {
-    let seen: { cwdFiles: string[]; cwd: string; home: string; files: string[]; config: string; auth: string; input: CodexTransportRunInput } | undefined;
+  it("spawns in a trusted empty cwd with a trusted CODEX_HOME holding only config, never the selected auth", async () => {
+    let seen: { cwdFiles: string[]; cwd: string; home: string; files: string[]; config: string; input: CodexTransportRunInput } | undefined;
     const log: Spawned[] = [];
     const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async (input) => {
       const home = log[0].env.CODEX_HOME;
@@ -894,7 +869,6 @@ describe("app-server trusted view (AII-1002)", () => {
         home,
         files: readdirSync(home).sort(),
         config: readFileSync(join(home, "config.toml"), "utf8"),
-        auth: readFileSync(join(home, "auth.json"), "utf8"),
         input,
       };
       return okResult();
@@ -902,10 +876,9 @@ describe("app-server trusted view (AII-1002)", () => {
     // route the spawn log through the same array the driver reads
     await executor.invoke(base);
     expect(seen!.home).not.toBe(selected);
-    expect(seen!.files).toEqual(["auth.json", "config.toml"]);
+    expect(seen!.files).toEqual(["config.toml"]);
     expect(seen!.config).not.toContain("evil");
     expect(seen!.config).not.toContain("mcp_servers");
-    expect(seen!.auth).toBe(AUTH_ORIGINAL);
     expect(seen!.cwdFiles).toEqual([]);
     // HOME is a trusted empty dir inside the view, never the selected HOME
     expect(log[0].env.HOME).toBe(join(dirname(seen!.home), "user-home"));
@@ -917,228 +890,181 @@ describe("app-server trusted view (AII-1002)", () => {
     expect(existsSync(seen!.home)).toBe(false);
   });
 
-  it("syncs a refreshed auth.json back to the selected home only after termination", async () => {
-    const log: Spawned[] = [];
-    const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
-      writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), AUTH_REFRESHED);
-      expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe(AUTH_ORIGINAL);
-      return okResult();
-    });
-    await executor.invoke(base);
-    expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe(AUTH_REFRESHED);
-    // hostile selected config is untouched, never copied
-    expect(readFileSync(join(selected, "config.toml"), "utf8")).toContain("evil");
-  });
-
-  it("syncs a refreshed session for the same account and checkpoints only afterwards", async () => {
-    writeFileSync(join(selected, "auth.json"), '{"tokens":{"account_id":"acct-A","refresh_token":"r1"}}');
-    const log: Spawned[] = [];
-    const { client, checkpoints } = checkpointingAuth();
-    const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
-      writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), '{"tokens":{"account_id":"acct-A","refresh_token":"r2"}}');
-      return okResult();
-    }, { auth: client });
-    await executor.invoke(base);
-    expect(checkpoints).toEqual(['{"tokens":{"account_id":"acct-A","refresh_token":"r2"}}']);
-  });
-
-  describe("fail-closed auth sync-back", () => {
-    const cleanupViews = (before: Set<string>): void => {
-      for (const n of viewDirs().filter((d) => !before.has(d))) rmSync(join(tmpdir(), n), { recursive: true, force: true });
+  describe("trusted skills in the view HOME", () => {
+    const mkSkills = (): string => {
+      const dir = mkdtempSync(join(tmpdir(), "synthetic-skills-"));
+      mkdirSync(join(dir, "a", "refs"), { recursive: true });
+      writeFileSync(join(dir, "a", "SKILL.md"), "synthetic skill a");
+      writeFileSync(join(dir, "a", "refs", "r.md"), "ref");
+      return dir;
+    };
+    const cleanup = (d: string) => {
+      const walk = (p: string) => {
+        try {
+          chmodSync(p, 0o700);
+          for (const n of readdirSync(p)) walk(join(p, n));
+        } catch {
+          // file or gone
+        }
+      };
+      walk(d);
+      rmSync(d, { recursive: true, force: true });
     };
 
-    // Each case: what the child leaves in the view, what happens to the selected source meanwhile.
-    const cases: Array<[string, (home: string) => void, string?]> = [
-      ["malformed JSON", (home) => writeFileSync(join(home, "auth.json"), "{not json sk-secret-canary")],
-      ["a non-object JSON value", (home) => writeFileSync(join(home, "auth.json"), "[1,2]")],
-      ["a deleted view auth.json", (home) => rmSync(join(home, "auth.json"))],
-      [
-        "a different account identity",
-        (home) => writeFileSync(join(home, "auth.json"), '{"tokens":{"account_id":"acct-B"}}'),
-        '{"tokens":{"account_id":"acct-A"}}',
-      ],
-      [
-        "a lost account identity",
-        (home) => writeFileSync(join(home, "auth.json"), '{"tokens":{}}'),
-        '{"tokens":{"account_id":"acct-A"}}',
-      ],
-      [
-        "a selected source changed underneath the view",
-        (home) => {
-          writeFileSync(join(home, "auth.json"), AUTH_REFRESHED);
-          writeFileSync(join(selected, "auth.json"), AUTH_OTHER);
-        },
-      ],
-      [
-        "a selected source removed underneath the view",
-        (home) => {
-          writeFileSync(join(home, "auth.json"), AUTH_REFRESHED);
-          rmSync(join(selected, "auth.json"));
-        },
-      ],
-      [
-        "a sync write failure",
-        (home) => {
-          writeFileSync(join(home, "auth.json"), AUTH_REFRESHED);
-          mkdirSync(join(selected, `auth.json.sync-${process.pid}`));
-        },
-      ],
-    ];
-
-    it.each(cases)("holds, preserves the view and never checkpoints on %s", async (_name, mutate, initial) => {
-      if (initial) writeFileSync(join(selected, "auth.json"), initial);
-      const before = new Set(viewDirs());
-      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    it("copies the skills read-only, logs a count, and removes the view afterward", async () => {
+      const skills = mkSkills();
+      const outside = mkdtempSync(join(tmpdir(), "synthetic-outside-"));
+      writeFileSync(join(outside, "secret.txt"), "outside-content");
+      symlinkSync(join(outside, "secret.txt"), join(skills, "a", "link-file"));
+      symlinkSync(outside, join(skills, "a", "link-dir"));
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      let seen: { content: string; fileMode: number; dirMode: number; nestedMode: number; names: string[]; leaked: boolean; root: string } | undefined;
       const log: Spawned[] = [];
-      const { client, checkpoints, invocations } = checkpointingAuth();
       const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
-        mutate(log[0].env.CODEX_HOME);
+        const dest = join(log[0].env.HOME, ".agents", "skills");
+        let leaked = false;
+        for (const l of ["link-file", "link-dir"]) {
+          try {
+            readFileSync(join(dest, "a", l, l === "link-dir" ? "secret.txt" : ""), "utf8");
+            leaked = true;
+          } catch {
+            // not readable through the copy
+          }
+        }
+        seen = {
+          content: readFileSync(join(dest, "a", "SKILL.md"), "utf8"),
+          fileMode: statSync(join(dest, "a", "SKILL.md")).mode & 0o777,
+          dirMode: statSync(dest).mode & 0o777,
+          nestedMode: statSync(join(dest, "a", "refs")).mode & 0o777,
+          names: readdirSync(log[0].env.HOME),
+          leaked,
+          root: dirname(log[0].env.HOME),
+        };
         return okResult();
-      }, { auth: client });
-      const sourceAfterRun = (): string | null => (existsSync(join(selected, "auth.json")) ? readFileSync(join(selected, "auth.json"), "utf8") : null);
-
-      await expect(executor.invoke(base)).rejects.toMatchObject({ code: "CODEX_RECOVERY_REQUIRED", reason: "auth_sync_failed" });
-
-      // the callback never settled: no success, no checkpoint (stale or otherwise), profile still "invoking"
-      expect(checkpoints).toEqual([]);
-      expect(invocations()).toEqual({ started: 1, settled: 0 });
-      // the selected source was never replaced by anything this run produced
-      const unchangedOrExternal = sourceAfterRun();
-      expect([initial ?? AUTH_ORIGINAL, AUTH_OTHER, null]).toContain(unchangedOrExternal);
-
-      // the view survives as the only copy of the refreshed session
-      const left = viewDirs().filter((n) => !before.has(n));
-      expect(left).toHaveLength(1);
-      const err = await executor.invoke(base).catch((e: unknown) => e);
-      expect(err).toMatchObject({ reason: "held" });
-      expect(log).toHaveLength(1);
-      expect(invocations().started).toBe(1);
-      expect(viewDirs().filter((n) => !before.has(n))).toEqual(left);
-
-      const logged = warn.mock.calls.map((c) => c.join(" ")).join("\n");
-      expect(logged).toContain("auth sync-back failed");
-      expect(logged).not.toContain("sk-secret-canary");
-      warn.mockRestore();
-      cleanupViews(before);
+      }, { trustedSkillsDir: skills });
+      try {
+        await executor.invoke(base);
+        expect(seen!.content).toBe("synthetic skill a");
+        expect(seen!.fileMode).toBe(0o444);
+        expect(seen!.dirMode).toBe(0o555);
+        expect(seen!.nestedMode).toBe(0o555);
+        expect(seen!.names).toEqual([".agents"]);
+        expect(seen!.leaked).toBe(false);
+        expect(logSpy.mock.calls.filter((c) => String(c[0]).includes("planning skills copied="))).toEqual([["[codex] planning skills copied=1"]]);
+        expect(existsSync(seen!.root)).toBe(false);
+      } finally {
+        logSpy.mockRestore();
+        cleanup(skills);
+        cleanup(outside);
+      }
     });
 
-    it("carries the preserved view location on the recovery error and still restores the origin credential", async () => {
-      const before = new Set(viewDirs());
+    it("leaves HOME empty when unset, and when the directory is missing", async () => {
+      for (const extra of [{}, { trustedSkillsDir: join(tmpdir(), "synthetic-missing-skills") }]) {
+        let names: string[] | undefined;
+        const log: Spawned[] = [];
+        const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
+          names = readdirSync(log[0].env.HOME);
+          return okResult();
+        }, extra);
+        await executor.invoke(base);
+        expect(names).toEqual([]);
+      }
+    });
+
+    it("fails before spawn, value-free, for a directory in the workspace, selected home or view", async () => {
+      const inWorkspace = join(workspace, ".agents", "skills");
+      mkdirSync(inWorkspace, { recursive: true });
+      writeFileSync(join(inWorkspace, "SKILL.md"), "synthetic-secret-content");
+      const inSelected = join(selected, "skills");
+      mkdirSync(inSelected, { recursive: true });
+      const viaDots = join(workspace, "..", basename(workspace), ".agents", "skills");
+      for (const dir of [inWorkspace, inSelected, viaDots]) {
+        const log: Spawned[] = [];
+        const driver = vi.fn(async () => okResult());
+        const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, driver, { trustedSkillsDir: dir });
+        const err = await executor.invoke(base).then(() => null, (e: Error) => e);
+        expect(err).toBeInstanceOf(Error);
+        expect(log.length).toBe(0);
+        expect(driver).not.toHaveBeenCalled();
+        expect(String(err!.message)).not.toContain(dir);
+        expect(String(err!.message)).not.toContain("synthetic-secret-content");
+      }
+    });
+
+    it("fails before spawn for a symlink that resolves into the workspace or selected home", async () => {
+      const inWorkspace = join(workspace, ".agents", "skills");
+      mkdirSync(inWorkspace, { recursive: true });
+      writeFileSync(join(inWorkspace, "SKILL.md"), "synthetic-secret-content");
+      const inSelected = join(selected, "skills");
+      mkdirSync(inSelected, { recursive: true });
+      const holder = mkdtempSync(join(tmpdir(), "synthetic-links-"));
+      try {
+        for (const [i, target] of [inWorkspace, inSelected].entries()) {
+          const link = join(holder, `link-${i}`);
+          symlinkSync(target, link);
+          const log: Spawned[] = [];
+          const driver = vi.fn(async () => okResult());
+          const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, driver, { trustedSkillsDir: link });
+          const err = await executor.invoke(base).then(() => null, (e: Error) => e);
+          expect(err).toBeInstanceOf(Error);
+          expect(log.length).toBe(0);
+          expect(driver).not.toHaveBeenCalled();
+          for (const leak of [link, target, "synthetic-secret-content"]) expect(String(err!.message)).not.toContain(leak);
+        }
+      } finally {
+        cleanup(holder);
+      }
+    });
+
+    it("removes the view on timeout with skills present", async () => {
+      const skills = mkSkills();
       const log: Spawned[] = [];
-      const { client } = checkpointingAuth();
+      let root = "";
+      const halting: CodexProtocolDriver["run"] = (i) => {
+        root = dirname(log[0].env.HOME);
+        return new Promise((resolve) => i.io.halt.addEventListener("abort", () => resolve({ ...okResult(), stopReason: null })));
+      };
+      const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, halting, { trustedSkillsDir: skills });
+      try {
+        const result = await executor.invoke({ ...base, invocationTimeoutMs: 20 });
+        expect(result.failure?.code).toBe("INVOCATION_TIMEOUT");
+        expect(root).not.toBe("");
+        expect(existsSync(root)).toBe(false);
+      } finally {
+        cleanup(skills);
+      }
+    });
+
+    it("removes the view when the spawn fails with skills present", async () => {
+      const skills = mkSkills();
+      const before = new Set(viewDirs());
+      const { executor } = run([{ error: Object.assign(new Error("spawn codex ENOENT"), { code: "ENOENT" }) }], [], async () => okResult(), { trustedSkillsDir: skills });
+      try {
+        await executor.invoke(base).catch(() => undefined);
+        expect(viewDirs().filter((n) => !before.has(n))).toEqual([]);
+      } finally {
+        cleanup(skills);
+      }
+    });
+
+    it("removes the view on a cancel path with skills present", async () => {
+      const skills = mkSkills();
+      const ctl = new AbortController();
+      const log: Spawned[] = [];
+      let root = "";
       const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
-        writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), "garbage");
+        root = dirname(log[0].env.HOME);
+        ctl.abort();
         return okResult();
-      }, { auth: client });
-      const err = (await executor.invoke(base).catch((e: unknown) => e)) as CodexRecoveryRequiredError;
-      expect(err).toBeInstanceOf(CodexRecoveryRequiredError);
-      expect(readFileSync(join(err.viewRoot!, "home", "auth.json"), "utf8")).toBe("garbage");
-      cleanupViews(before);
-    });
-  });
-
-  describe("selected auth validation before spawn", () => {
-    it.each([
-      ["malformed JSON", "{not json sk-secret-canary"],
-      ["a non-object JSON value", "[1,2]"],
-    ])("holds with the callback pending, no spawn and no checkpoint on %s", async (_name, text) => {
-      writeFileSync(join(selected, "auth.json"), text);
-      const before = new Set(viewDirs());
-      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-      const log: Spawned[] = [];
-      const { client, checkpoints, invocations } = checkpointingAuth();
-      const driver = vi.fn(async () => okResult());
-      const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, driver, { auth: client });
-
-      await expect(executor.invoke(base)).rejects.toMatchObject({ code: "CODEX_RECOVERY_REQUIRED", reason: "auth_sync_failed" });
-
-      expect(log).toHaveLength(0);
-      expect(driver).not.toHaveBeenCalled();
-      expect(checkpoints).toEqual([]);
-      expect(invocations()).toEqual({ started: 1, settled: 0 });
-      // the selected profile is untouched and the half-built view (config only, no auth) is gone
-      expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe(text);
-      expect(viewDirs().filter((n) => !before.has(n))).toEqual([]);
-
-      await expect(executor.invoke(base)).rejects.toMatchObject({ reason: "held" });
-      expect(log).toHaveLength(0);
-      expect(invocations().started).toBe(1);
-
-      const logged = warn.mock.calls.map((c) => c.join(" ")).join("\n");
-      expect(logged).not.toContain("sk-secret-canary");
-      warn.mockRestore();
-    });
-  });
-
-  describe("auth identity comparison", () => {
-    const idToken = (claims: Record<string, unknown>): string =>
-      `h.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.s`;
-
-    async function refresh(initial: string, refreshed: string) {
-      writeFileSync(join(selected, "auth.json"), initial);
-      const before = new Set(viewDirs());
-      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-      const log: Spawned[] = [];
-      const { client, checkpoints, invocations } = checkpointingAuth();
-      const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
-        writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), refreshed);
-        return okResult();
-      }, { auth: client });
-      const outcome = await executor.invoke(base).then(
-        () => "ok",
-        (e: unknown) => (e as { reason?: string }).reason ?? "error",
-      );
-      warn.mockRestore();
-      const left = viewDirs().filter((n) => !before.has(n));
-      for (const n of left) rmSync(join(tmpdir(), n), { recursive: true, force: true });
-      return { outcome, checkpoints, invocations: invocations(), source: readFileSync(join(selected, "auth.json"), "utf8") };
-    }
-
-    it.each([
-      ["a valid object with no identity fields", '{"tokens":{"refresh_token":"r1"}}', '{"tokens":{"refresh_token":"r2"}}'],
-      ["empty identity strings", '{"OPENAI_API_KEY":"","tokens":{"account_id":""}}', '{"OPENAI_API_KEY":"","tokens":{"account_id":"","refresh_token":"r2"}}'],
-      [
-        "an undecodable id_token",
-        '{"tokens":{"id_token":"not-a-jwt","refresh_token":"r1"}}',
-        '{"tokens":{"id_token":"not-a-jwt","refresh_token":"r2"}}',
-      ],
-      ["an id_token subject that is not a string", `{"tokens":{"id_token":"${idToken({ sub: 7 })}"}}`, `{"tokens":{"id_token":"${idToken({ sub: 7 })}","x":1}}`],
-    ])("rejects a refresh when selected and refreshed identity are unknown: %s", async (_n, initial, refreshed) => {
-      const r = await refresh(initial, refreshed);
-      expect(r.outcome).toBe("auth_sync_failed");
-      expect(r.checkpoints).toEqual([]);
-      expect(r.invocations).toEqual({ started: 1, settled: 0 });
-      expect(r.source).toBe(initial);
-    });
-
-    it("rejects a refresh that drops a known selected identity", async () => {
-      const r = await refresh('{"tokens":{"account_id":"acct-A"}}', '{"tokens":{"refresh_token":"r2"}}');
-      expect(r.outcome).toBe("auth_sync_failed");
-      expect(r.checkpoints).toEqual([]);
-    });
-
-    it("accepts a refreshed API-key account", async () => {
-      const refreshed = '{"OPENAI_API_KEY":"sk-synthetic-1","last_refresh":"later"}';
-      const r = await refresh('{"OPENAI_API_KEY":"sk-synthetic-1"}', refreshed);
-      expect(r.outcome).toBe("ok");
-      expect(r.source).toBe(refreshed);
-      expect(r.checkpoints).toEqual([refreshed]);
-    });
-
-    it("accepts a refreshed session whose identity is the id_token subject", async () => {
-      const initial = `{"tokens":{"id_token":"${idToken({ sub: "user-1" })}","refresh_token":"r1"}}`;
-      const refreshed = `{"tokens":{"id_token":"${idToken({ sub: "user-1" })}","refresh_token":"r2"}}`;
-      const r = await refresh(initial, refreshed);
-      expect(r.outcome).toBe("ok");
-      expect(r.source).toBe(refreshed);
-    });
-
-    it("rejects a refresh for a different id_token subject", async () => {
-      const r = await refresh(
-        `{"tokens":{"id_token":"${idToken({ sub: "user-1" })}"}}`,
-        `{"tokens":{"id_token":"${idToken({ sub: "user-2" })}"}}`,
-      );
-      expect(r.outcome).toBe("auth_sync_failed");
+      }, { trustedSkillsDir: skills, cancelSignal: ctl.signal });
+      try {
+        await executor.invoke(base).catch(() => undefined);
+        expect(root).not.toBe("");
+        expect(existsSync(root)).toBe(false);
+      } finally {
+        cleanup(skills);
+      }
     });
   });
 
@@ -1157,17 +1083,15 @@ describe("app-server trusted view (AII-1002)", () => {
     expect(config).not.toContain("evil");
   });
 
-  it("keeps the view and skips sync while the child may live, and still blocks a second invoke", async () => {
+  it("keeps the view while the child may live, and still blocks a second invoke", async () => {
     const before = new Set(viewDirs());
     const log: Spawned[] = [];
     const { executor } = run([{ hang: true, dieOn: [] }], log, async () => {
-      writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), AUTH_REFRESHED);
       return okResult();
     });
     await expect(executor.invoke(base)).rejects.toBeInstanceOf(CodexRecoveryRequiredError);
     const left = viewDirs().filter((n) => !before.has(n));
     expect(left).toHaveLength(1);
-    expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe(AUTH_ORIGINAL);
     await expect(executor.invoke(base)).rejects.toMatchObject({ reason: "held" });
     expect(viewDirs().filter((n) => !before.has(n))).toEqual(left);
     rmSync(join(tmpdir(), left[0]), { recursive: true, force: true });
@@ -1661,6 +1585,35 @@ describe("ChatGPT plan token expiry resume", () => {
       expect(existsSync(homes[0])).toBe(false);
       expect(out.telemetry?.tokensIn).toBe(10);
       expect(out.telemetry?.tokensOut).toBe(5);
+    });
+
+    it("populates a shared ChatGPT plan view with skills once: the second attempt keeps the copy and the view is removed", async () => {
+      const skills = mkdtempSync(join(tmpdir(), "synthetic-skills-"));
+      mkdirSync(join(skills, "a"), { recursive: true });
+      writeFileSync(join(skills, "a", "SKILL.md"), "synthetic skill a");
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const seen: string[] = [];
+      const homes: string[] = [];
+      const driver: CodexProtocolDriver = {
+        run: async () => {
+          const l = planned.log[planned.log.length - 1];
+          homes.push(l.env.CODEX_HOME);
+          seen.push(readFileSync(join(l.env.HOME, ".agents", "skills", "a", "SKILL.md"), "utf8"));
+          return seen.length === 1 ? expiredResult() : result({ tokens: [6, 3] });
+        },
+      };
+      const planned = makePlan([{ hang: true, dieOn: ["SIGTERM"] }], { protocolDriver: driver, trustedSkillsDir: skills });
+      try {
+        const out = await planned.executor.invoke({ ...base, agentStage: "planning", invocationTimeoutMs: 60_000 });
+        expect(out.failure).toBeUndefined();
+        expect(seen).toEqual(["synthetic skill a", "synthetic skill a"]);
+        expect(new Set(homes).size).toBe(1);
+        expect(existsSync(dirname(homes[0]))).toBe(false);
+        expect(logSpy.mock.calls.filter((c) => String(c[0]).includes("planning skills copied="))).toHaveLength(1);
+      } finally {
+        logSpy.mockRestore();
+        rmSync(skills, { recursive: true, force: true });
+      }
     });
 
     it("does not treat a driver 401 as expiry for the API key provider", async () => {

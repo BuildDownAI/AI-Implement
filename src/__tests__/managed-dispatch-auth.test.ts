@@ -152,13 +152,6 @@ describe("prepareManagedDispatch", () => {
     expect(calls.preparationDeps).toBe(0);
   });
 
-  it("refuses github-actions with no reservation or grant", async () => {
-    const d = await adapter.prepareManagedDispatch(req({ backend: "github-actions" }), runtime);
-    expect(d).toEqual({ kind: "refuse", category: "configuration-error", code: "gha_not_supported" });
-    expect(count("model_profile_reservations")).toBe(0);
-    expect(count("model_credential_grants")).toBe(0);
-  });
-
   it("refuses a resolved claude-subscription profile with no reservation or grant", async () => {
     useStages("sub");
     const d = await adapter.prepareManagedDispatch(req(), runtime);
@@ -269,6 +262,152 @@ describe("prepareManagedDispatch", () => {
     expect(d).toEqual({ kind: "refuse", category: "configuration-error", code: "claude_subscription_unsupported" });
     expect(revokedAt()).not.toBeNull();
     expect(JSON.stringify(d)).not.toContain("bearer");
+  });
+});
+
+const CAPABLE = "name: Implement\n# ai-implement-capability: stage-agent-config-v1\n";
+const WORKFLOW = ".github/workflows/claude-implement.yml";
+
+function gha(files: Record<string, string | null> | (() => Promise<Record<string, string | null>>), trust?: { visibility: "public" | "private"; trustedForSubscription: boolean }) {
+  const spies = { reads: 0, secrets: 0, trust: 0 };
+  prepDepsOverride = (d) => ({
+    ...d,
+    credentials: { ...d.credentials, resolveProtectedSecret: (...a: Parameters<typeof d.credentials.resolveProtectedSecret>) => { spies.secrets++; return d.credentials.resolveProtectedSecret(...a); } },
+    getRepoTrust: async (...a) => { spies.trust++; return trust ?? (await d.getRepoTrust(...a)); },
+    readDefaultBranchWorkflows: async () => {
+      spies.reads++;
+      return typeof files === "function" ? files() : files;
+    },
+  });
+  return spies;
+}
+
+const ABSENT_RETIRED = { ".github/workflows/comment-trigger.yml": null, ".github/workflows/claude-kg-refresh.yml": null };
+const ghaReq = (over: Partial<AdapterModule.ManagedDispatchRequest> = {}) => req({ backend: "github-actions", ...over });
+
+describe("prepareManagedDispatch on github-actions (AII-1420)", () => {
+  const noRunner = () => {
+    expect(count("model_profile_reservations")).toBe(0);
+    expect(count("model_credential_grants")).toBe(0);
+  };
+
+  it("opted out: legacy, no workflow read", async () => {
+    store.setProjectOptIn("AII", false);
+    const spies = gha({});
+    expect(await adapter.prepareManagedDispatch(ghaReq(), runtime)).toEqual({ kind: "legacy" });
+    expect(spies.reads).toBe(0);
+    noRunner();
+  });
+
+  it("opted in with a capable template: launches with the frozen snapshot and a protected bootstrap", async () => {
+    const spies = gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED });
+    const d = launchOf(await adapter.prepareManagedDispatch(ghaReq(), runtime));
+    expect(spies.reads).toBe(1);
+    expect(d.backend).toBe("github-actions");
+    expect(d.snapshot.profiles.implementation.authMode).toBe("codex-subscription");
+    expect(JSON.stringify(d)).not.toContain("bearer");
+    const creds = adapter.ghaManagedCredentials(d);
+    expect(creds?.version).toBe(1);
+    expect(creds?.modelAuthGrant).toMatchObject({ dispatchId: "d1", backend: "gha" });
+    expect(() => adapter.ghaManagedCredentials(d)).toThrow("managed dispatch bootstrap unavailable");
+    expect(adapter.ghaManagedCredentials({ kind: "legacy" })).toBeUndefined();
+  });
+
+  it.each([
+    ["an old template without the capability marker", { [WORKFLOW]: "name: old\n", ...ABSENT_RETIRED }, "runner_incompatible"],
+    ["a custom template", { [WORKFLOW]: "name: custom\non: workflow_dispatch\n", ...ABSENT_RETIRED }, "runner_incompatible"],
+    ["a missing workflow file", { [WORKFLOW]: null, ...ABSENT_RETIRED }, "runner_incompatible"],
+    ["a retired comment trigger", { [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED, ".github/workflows/comment-trigger.yml": "name: x" }, "retired_workflow_present"],
+    ["a retired kg-refresh workflow", { [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED, ".github/workflows/claude-kg-refresh.yml": "name: x" }, "retired_workflow_present"],
+    ["an unlisted path in the read", { [WORKFLOW]: CAPABLE }, "delivery_unreadable"],
+  ])("refuses %s with a fixed code and launches nothing", async (_n, files, code) => {
+    gha(files);
+    const d = await adapter.prepareManagedDispatch(ghaReq(), runtime);
+    expect(d).toEqual({ kind: "refuse", category: "configuration-error", code });
+    noRunner();
+  });
+
+  it("refuses an unreadable workflow without leaking the thrown message", async () => {
+    gha(async () => { throw new Error("SENTINEL-TOKEN HTTP 500"); });
+    const d = await adapter.prepareManagedDispatch(ghaReq(), runtime);
+    expect(d).toEqual({ kind: "refuse", category: "configuration-error", code: "delivery_unreadable" });
+    expect(JSON.stringify(d)).not.toContain("SENTINEL");
+    noRunner();
+  });
+
+  it("refuses an unauthorized account with no fallback to legacy", async () => {
+    store.saveAccountProfileRevision({
+      profileId: "cdx", identity: "Cdx", revision: 2, agent: "codex", provider: "openai",
+      authMode: "codex-subscription", allowedProjectKeys: ["OTHER"],
+    });
+    gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED });
+    const d = await adapter.prepareManagedDispatch(ghaReq(), runtime);
+    expect(d).toEqual({ kind: "refuse", category: "configuration-error", code: "resolution_failed" });
+    expect(d).not.toEqual({ kind: "legacy" });
+    noRunner();
+  });
+
+  it("refuses a disabled account with no fallback to legacy", async () => {
+    store.saveAccountProfileRevision({
+      profileId: "cdx", identity: "Cdx", revision: 2, agent: "codex", provider: "openai",
+      authMode: "codex-subscription", allowedProjectKeys: ["AII"], status: "disabled",
+    });
+    gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED });
+    const d = await adapter.prepareManagedDispatch(ghaReq(), runtime);
+    expect(d).toEqual({ kind: "refuse", category: "configuration-error", code: "resolution_failed" });
+    expect(d).not.toEqual({ kind: "legacy" });
+    noRunner();
+  });
+
+  it("refuses a subscription profile on a public repository before any credential is resolved or reserved", async () => {
+    const spies = gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED }, { visibility: "public", trustedForSubscription: false });
+    const reserve = vi.spyOn(ownership, "reserve");
+    const d = await adapter.prepareManagedDispatch(ghaReq(), runtime);
+    expect(d).toEqual({ kind: "refuse", category: "configuration-error", code: "repository_public" });
+    expect(spies.secrets).toBe(0);
+    expect(spies.reads).toBe(0);
+    expect(reserve).not.toHaveBeenCalled();
+    noRunner();
+  });
+
+  it("still refuses claude-subscription even with a capable template", async () => {
+    useStages("sub");
+    const spies = gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED });
+    expect(await adapter.prepareManagedDispatch(ghaReq(), runtime))
+      .toEqual({ kind: "refuse", category: "configuration-error", code: "claude_subscription_unsupported" });
+    expect(spies.reads).toBe(0);
+    noRunner();
+  });
+
+  it("keeps the snapshot across a config change and mints no second bootstrap", async () => {
+    gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED });
+    const first = launchOf(await adapter.prepareManagedDispatch(ghaReq(), runtime));
+    store.setProjectOptIn("AII", false);
+    const second = await adapter.prepareManagedDispatch(ghaReq(), runtime);
+    expect(second).toEqual({ kind: "hold", code: "bootstrap_consumed" });
+    expect(count("model_credential_grants")).toBe(1);
+    const prepMod = await import("../agent-run-preparation.js");
+    expect(prepMod.loadStoredSnapshot("d1")).toEqual(first.snapshot);
+  });
+
+  it("settles a rejected or uncertain GitHub Actions launch by revoking the grant", async () => {
+    gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED });
+    for (const outcome of ["rejected", "unknown"] as const) {
+      const id = `gha-${outcome}`;
+      const d = launchOf(await adapter.prepareManagedDispatch(ghaReq({ dispatchId: id }), runtime));
+      expect(adapter.settleLaunch(d, outcome, runtime)).toEqual({ revoked: true });
+      expect(revokedAt(id)).not.toBeNull();
+    }
+    const kept = launchOf(await adapter.prepareManagedDispatch(ghaReq({ dispatchId: "gha-ok" }), runtime));
+    expect(adapter.settleLaunch(kept, "accepted", runtime)).toEqual({ revoked: false });
+    expect(revokedAt("gha-ok")).toBeNull();
+  });
+
+  it("maps a dispatch result to a settle outcome", () => {
+    expect(adapter.ghaLaunchOutcome({ success: true })).toBe("accepted");
+    expect(adapter.ghaLaunchOutcome({ success: false, outcome: "rejected" })).toBe("rejected");
+    expect(adapter.ghaLaunchOutcome({ success: false, outcome: "unknown" })).toBe("unknown");
+    expect(adapter.ghaLaunchOutcome({ success: false })).toBe("unknown");
   });
 });
 

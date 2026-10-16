@@ -9,6 +9,7 @@ import { classifyGitFailure, envSecrets, oneLinerMessage, type FailureRecord } f
 import { computeBackoffMs, normalizeRetryPolicy, sleepAsync } from "../retry-backoff.js";
 import { dependenciesMissing } from "../pipeline-loader.js";
 import { neutralizeFences } from "../../completion-classification.js";
+import { formatPassRow, STATS_TABLE_DIVIDER, STATS_TABLE_HEADER, type StatsPass } from "../../run-autopsy.js";
 
 // Waits between ls-remote attempts (attempts = delays + 1). A freshly minted installation
 // token is not accepted by git over HTTPS for a few seconds (AII-936), so a refreshed
@@ -22,16 +23,7 @@ export interface ReviewSummary extends Record<string, unknown> {
   terminationReason: string;
   iterations: number;
   finalFeedback: string;
-  passes: Array<{
-    iteration: number;
-    implementTurns: number | null;
-    implementOutcome: string;
-    costUsd: number | null;
-    reviewApproved: boolean | null;
-    attempts?: number;
-    reviewAttempts?: number;
-    reviewCostUsd?: number | null;
-  }>;
+  passes: Array<StatsPass & { reviewAttempts?: number }>;
   postMortem?: string;
 }
 
@@ -698,16 +690,7 @@ function buildDependencyInstallSection(installMethod: string, installError: stri
 
 function buildUnapprovedSection(summary: ReviewSummary | undefined, draft: boolean): string | null {
   if (!summary) return null;
-  const passRows = summary.passes
-    .map((p) => {
-      // Pattern anchor: statsFromFeedbackLoop (src/report-card.ts) — a pass's cost is
-      // implement + in-loop review, not implement alone (BAC-27201).
-      const passCost = p.costUsd != null || p.reviewCostUsd != null ? (p.costUsd ?? 0) + (p.reviewCostUsd ?? 0) : null;
-      const cost = passCost != null ? `$${passCost.toFixed(2)}` : "—";
-      const review = p.reviewApproved == null ? "not run" : p.reviewApproved ? "approved" : "rejected";
-      return `| ${p.iteration} | ${p.implementOutcome} | ${p.implementTurns ?? "?"} | ${p.attempts ?? 1} | ${cost} | ${review} |`;
-    })
-    .join("\n");
+  const passRows = summary.passes.map(formatPassRow).join("\n");
   // A provider outage is not a review verdict: the reviewer may never have run, so the
   // heading, the sentence and the feedback label must not claim it rejected anything.
   const providerUnavailable = summary.terminationReason === "provider_unavailable";
@@ -724,8 +707,8 @@ function buildUnapprovedSection(summary: ReviewSummary | undefined, draft: boole
     "",
     "**Run stats:**",
     "",
-    "| Pass | Implement outcome | Turns | Implement attempts | Cost | Review |",
-    "|---|---|---|---|---|---|",
+    STATS_TABLE_HEADER,
+    STATS_TABLE_DIVIDER,
     passRows,
     ...(summary.postMortem ? ["", "<details><summary><strong>Post-mortem</strong></summary>", "", summary.postMortem, "", "</details>"] : []),
     "",

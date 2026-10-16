@@ -37,8 +37,34 @@ import {
   setKgExecutionMode,
   parseKgExecutionModeEnv,
   setKgMaterializeDirect,
+  resolveExecutionPath,
   type RunnerMode,
 } from "./runner-mode.js";
+import {
+  STAGE_AGENT_CONFIG_VERSION,
+  STAGE_NAMES,
+  STAGE_SELECTION_FIELDS,
+  type StageAgentConfigurationV1,
+  type StageName,
+} from "./agent-config.js";
+import {
+  getAccountProfile,
+  getOrchestratorDefaults,
+  getProjectStageConfig,
+  listAccountProfiles,
+  lookupCredentialReference,
+  readStageInputsFingerprint,
+  resolveCandidateProjectStageConfig,
+  resolveProjectStageConfig,
+  saveAccountProfileRevision,
+  setOrchestratorDefaults,
+  setProjectStageConfig,
+  StaleStageInputsError,
+  type AccountProfileProjection,
+} from "./agent-config-store.js";
+import type { AgentReadiness, AgentRunRequest } from "./agent-run-preparation.js";
+import { getCredentialStatus, type ModelCredentialDeps } from "./model-credentials.js";
+import type { OwnershipSnapshot } from "./model-session-ownership.js";
 import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { listParked, unpark } from "./dispatch-breaker.js";
 import { createSession, accessCodeMatches, authenticateAdminRequest, type AdminGate, type SessionIdentity } from "./admin-session.js";
@@ -545,6 +571,22 @@ export interface AdminDeps {
    * don't exercise the five `/api/review-fix/attempts/*` routes, which then answer 501.
    */
   reviewFixAttempts?: ReviewFixAttemptsFacade;
+  /**
+   * Model-account and stage-configuration seam (AII-962). Injected for the same reason as
+   * `getRestateStatus`: the concrete readiness inspection composes `model-auth-runtime`
+   * (GitHub App tokens, session store), bound in src/index.ts. Absent means readiness is
+   * unknown: profile statuses read `unknown` and opting a project in is refused with 501.
+   */
+  agentConfig?: AgentConfigAdminDeps;
+}
+
+export interface AgentConfigAdminDeps {
+  /** Read-only readiness (`inspectAgentReadiness`) for one project on one backend. Never writes, reserves or mints. */
+  inspectReadiness(request: Omit<AgentRunRequest, "dispatchId">, candidate?: StageAgentConfigurationV1): Promise<AgentReadiness>;
+  /** Safe credential status inputs; no secret is read through them. */
+  credentials: ModelCredentialDeps;
+  /** Ownership snapshot of a `claude-subscription` profile; absent when never reserved. */
+  sessionSnapshot?(profileId: string): OwnershipSnapshot | undefined;
 }
 
 /** Caller identity passed into every `reviewFixAttempts` facade call, so scope and
@@ -1011,6 +1053,47 @@ export function handleAdminRequest(
       if (!job || job.teamKey !== teamKey) { json(res, 404, { error: "sync job not found" }); return true; }
       json(res, 200, { id: job.id, status: job.status, result: job.result, error: job.error });
       return true;
+    }
+
+    // Model accounts and stage configuration (AII-962). Admin-only: none of these paths is in PAGE_ROUTES,
+    // and a granted page never reaches a non-GET. Matched exactly, and before the generic mapping handlers.
+    if (url === "/api/model-accounts" && method === "GET") {
+      handleListModelAccounts(res, deps);
+      return true;
+    }
+    if (url === "/api/model-accounts" && method === "POST") {
+      runAsync(res, handleCreateModelAccount(req, res, deps));
+      return true;
+    }
+    const modelAccountMatch = url.match(/^\/api\/model-accounts\/([^/]+)$/);
+    if (modelAccountMatch && method === "PATCH") {
+      runAsync(res, handlePatchModelAccount(req, res, decodeURIComponent(modelAccountMatch[1]), deps));
+      return true;
+    }
+    if (url === "/api/agent-defaults" && method === "GET") {
+      const stored = getOrchestratorDefaults();
+      json(res, 200, stored ? { configured: true, ...storedConfigView(stored) } : { configured: false, mode: "legacy", stages: {} });
+      return true;
+    }
+    if (url === "/api/agent-defaults" && method === "PUT") {
+      runAsync(res, handlePutAgentDefaults(req, res, gate.identity?.email ?? null));
+      return true;
+    }
+    const agentConfigMatch = url.match(/^\/api\/mappings\/([^/]+)\/agent-config(\/resolved)?$/);
+    if (agentConfigMatch) {
+      const projectKey = decodeURIComponent(agentConfigMatch[1]);
+      if (agentConfigMatch[2] && method === "GET") {
+        handleGetResolvedAgentConfig(res, projectKey, deps);
+        return true;
+      }
+      if (!agentConfigMatch[2] && method === "GET") {
+        handleGetProjectAgentConfig(res, projectKey);
+        return true;
+      }
+      if (!agentConfigMatch[2] && method === "PUT") {
+        runAsync(res, handlePutProjectAgentConfig(req, res, projectKey, deps, gate.identity?.email ?? null));
+        return true;
+      }
     }
 
     // Secrets management: /api/mappings/:teamKey/secrets or /api/mappings/:teamKey/secrets/:name
@@ -3662,4 +3745,468 @@ async function handleTemplateStatus(
     }),
   );
   json(res, 200, results);
+}
+
+
+// --- Model accounts and stage configuration (AII-962) ---
+
+function runAsync(res: http.ServerResponse, task: Promise<void>): void {
+  task.catch(() => {
+    if (!res.headersSent) json(res, 500, { error: "internal error" });
+  });
+}
+
+async function readJsonObject(req: http.IncomingMessage, res: http.ServerResponse): Promise<Record<string, unknown> | null> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readBody(req));
+  } catch {
+    json(res, 400, { error: "body must be valid JSON" });
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    json(res, 400, { error: "body must be a JSON object" });
+    return null;
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function unsupportedKeys(body: Record<string, unknown>, allowed: readonly string[]): string[] {
+  return Object.keys(body).filter((k) => !allowed.includes(k));
+}
+
+/** The readiness vocabulary shown on profile and resolved reads (AII-1203/1200). No token, client id or host id. */
+type AccountReadiness = "ready" | "sign-in required" | "refresh failed (transient)" | "missing" | "unknown";
+
+interface AccountStatusView {
+  readiness: AccountReadiness;
+  /** Fixed failure code from the credential status projection; never a reference or value. */
+  failureCode: string | null;
+  /** `claude-subscription` only. */
+  sessionRecovery?: { state: string; recoveryRequired: boolean } | null;
+}
+
+function accountStatus(profile: AccountProfileProjection, deps: AdminDeps, projectKey?: string): AccountStatusView {
+  const view: AccountStatusView = { readiness: "unknown", failureCode: null };
+  if (profile.authMode === "claude-subscription") {
+    const snap = deps.agentConfig?.sessionSnapshot?.(profile.profileId);
+    view.sessionRecovery = snap ? { state: snap.state, recoveryRequired: snap.state === "recovery_required" } : null;
+    return view;
+  }
+  if (!deps.agentConfig) return view;
+  const probe = projectKey ?? profile.allowedProjectKeys[0];
+  if (!probe) return view; // credential status is project-scoped; an unpermitted profile has nothing to probe
+  let status;
+  try {
+    status = getCredentialStatus(
+      { projectKey: probe, profileId: profile.profileId, revision: profile.revision, provider: profile.provider, authMode: profile.authMode },
+      deps.agentConfig.credentials,
+    );
+  } catch {
+    return view;
+  }
+  view.failureCode = status.failure?.code ?? null;
+  if (status.usable) {
+    view.readiness = "ready";
+  } else if (status.failure?.code === "session_unavailable") {
+    view.readiness = status.failure.category === "authentication_required" ? "sign-in required" : "refresh failed (transient)";
+  } else if (status.failure?.code === "reference_missing" || status.referenceConfigured === false) {
+    view.readiness = "missing";
+  }
+  return view;
+}
+
+function handleListModelAccounts(res: http.ServerResponse, deps: AdminDeps): void {
+  const accounts = listAccountProfiles().map((p) => ({
+    profileId: p.profileId,
+    identity: p.identity,
+    revision: p.revision,
+    agent: p.agent,
+    provider: p.provider,
+    authMode: p.authMode,
+    allowedProjectKeys: p.allowedProjectKeys,
+    profileStatus: p.status,
+    account: accountStatus(p, deps),
+  }));
+  json(res, 200, { accounts });
+}
+
+const ACCOUNT_WRITE_FIELDS = ["profileId", "identity", "agent", "provider", "authMode", "allowedProjectKeys", "credentialRef", "status"] as const;
+
+function accountWriteView(p: AccountProfileProjection, deps: AdminDeps): Record<string, unknown> {
+  const { status, ...rest } = p;
+  return { ...rest, profileStatus: status, account: accountStatus(p, deps) };
+}
+
+async function handleCreateModelAccount(req: http.IncomingMessage, res: http.ServerResponse, deps: AdminDeps): Promise<void> {
+  const body = await readJsonObject(req, res);
+  if (!body) return;
+  const extra = unsupportedKeys(body, ACCOUNT_WRITE_FIELDS);
+  if (extra.length > 0) {
+    json(res, 400, { error: `unsupported field(s): ${extra.join(", ")}. Account writes carry metadata and a protected credentialRef, never credential values` });
+    return;
+  }
+  const profileId = body.profileId;
+  if (typeof profileId !== "string") {
+    json(res, 400, { error: "profileId is required" });
+    return;
+  }
+  if (getAccountProfile(profileId)) {
+    json(res, 409, { error: "account profile already exists; PATCH it to append a revision" });
+    return;
+  }
+  if (body.allowedProjectKeys === undefined) body.allowedProjectKeys = [];
+  if (body.status !== undefined && body.status !== "active") {
+    json(res, 400, { error: "a new account profile must be created active" });
+    return;
+  }
+  saveAccountWrite(res, deps, profileId, 1, body, 201);
+}
+
+async function handlePatchModelAccount(req: http.IncomingMessage, res: http.ServerResponse, profileId: string, deps: AdminDeps): Promise<void> {
+  const body = await readJsonObject(req, res);
+  if (!body) return;
+  const extra = unsupportedKeys(body, ACCOUNT_WRITE_FIELDS.filter((f) => f !== "profileId"));
+  if (extra.length > 0) {
+    json(res, 400, { error: `unsupported field(s): ${extra.join(", ")}. Account writes carry metadata and a protected credentialRef, never credential values` });
+    return;
+  }
+  const head = getAccountProfile(profileId);
+  if (!head) {
+    json(res, 404, { error: "account profile not found" });
+    return;
+  }
+  const merged: Record<string, unknown> = {
+    identity: head.identity,
+    agent: head.agent,
+    provider: head.provider,
+    authMode: head.authMode,
+    allowedProjectKeys: head.allowedProjectKeys,
+    status: head.status,
+  };
+  const currentRef = lookupCredentialReference(profileId, head.revision);
+  if (currentRef !== null) merged.credentialRef = currentRef;
+  for (const [k, v] of Object.entries(body)) {
+    if (k === "credentialRef" && v === null) delete merged.credentialRef;
+    else merged[k] = v;
+  }
+  // A disabled or archived profile never gains a project grant: grants are only ever removed or kept.
+  const nextStatus = merged.status;
+  if (nextStatus !== "active" && Array.isArray(merged.allowedProjectKeys)) {
+    const added = (merged.allowedProjectKeys as unknown[]).filter((k) => typeof k === "string" && !head.allowedProjectKeys.includes(k));
+    if (added.length > 0) {
+      json(res, 409, { error: "a disabled or archived account profile cannot receive new project grants", code: "profile_not_active" });
+      return;
+    }
+  }
+  saveAccountWrite(res, deps, profileId, head.revision + 1, merged, 200);
+}
+
+function saveAccountWrite(
+  res: http.ServerResponse,
+  deps: AdminDeps,
+  profileId: string,
+  revision: number,
+  fields: Record<string, unknown>,
+  okStatus: number,
+): void {
+  try {
+    const saved = saveAccountProfileRevision({
+      profileId,
+      identity: fields.identity as string,
+      revision,
+      agent: fields.agent as never,
+      provider: fields.provider as never,
+      authMode: fields.authMode as never,
+      allowedProjectKeys: fields.allowedProjectKeys as string[],
+      status: fields.status as never,
+      metadata: fields.credentialRef === undefined ? {} : { credentialRef: fields.credentialRef as string },
+    });
+    json(res, okStatus, accountWriteView(saved, deps));
+  } catch (err) {
+    // The store throws fixed messages and writes everything in one transaction, so a failure leaves no revision behind.
+    json(res, 400, { error: err instanceof Error ? err.message : "invalid account profile" });
+  }
+}
+
+function storedConfigView(stored: { configRevisionId: string; revision: number; config: StageAgentConfigurationV1; createdAt: number }): Record<string, unknown> {
+  return {
+    enabled: stored.config.mode === "configured",
+    mode: stored.config.mode,
+    stages: stored.config.stages ?? {},
+    revision: stored.revision,
+    configRevisionId: stored.configRevisionId,
+    updatedAt: stored.createdAt,
+  };
+}
+
+/** Validates the value types the store leaves to the resolver, so a legacy-mode write cannot park a malformed stage. */
+function validateStagesBody(stages: unknown): string | null {
+  if (typeof stages !== "object" || stages === null || Array.isArray(stages)) return "stages must be an object";
+  for (const [stage, patch] of Object.entries(stages)) {
+    if (!(STAGE_NAMES as readonly string[]).includes(stage)) return "stages contains unknown key(s)";
+    if (typeof patch !== "object" || patch === null || Array.isArray(patch)) return `stages.${stage} must be an object`;
+    for (const [field, value] of Object.entries(patch)) {
+      if (!(STAGE_SELECTION_FIELDS as readonly string[]).includes(field)) return `stages.${stage} contains unknown key(s)`;
+      if (value === null) continue;
+      if (field === "invocationTimeoutMs" ? !Number.isSafeInteger(value) || (value as number) <= 0 : typeof value !== "string" || value.trim() === "") {
+        return `stages.${stage}.${field} is malformed`;
+      }
+    }
+  }
+  return null;
+}
+
+async function handlePutAgentDefaults(req: http.IncomingMessage, res: http.ServerResponse, actor: string | null): Promise<void> {
+  const body = await readJsonObject(req, res);
+  if (!body) return;
+  const extra = unsupportedKeys(body, ["mode", "stages"]);
+  if (extra.length > 0) {
+    json(res, 400, { error: `unsupported field(s): ${extra.join(", ")}` });
+    return;
+  }
+  if (body.mode !== "legacy" && body.mode !== "configured") {
+    json(res, 400, { error: "mode must be legacy or configured" });
+    return;
+  }
+  if (body.stages !== undefined) {
+    const bad = validateStagesBody(body.stages);
+    if (bad) {
+      json(res, 400, { error: bad });
+      return;
+    }
+  }
+  try {
+    const stored = setOrchestratorDefaults(
+      { version: STAGE_AGENT_CONFIG_VERSION, mode: body.mode, ...(body.stages !== undefined ? { stages: body.stages as StageAgentConfigurationV1["stages"] } : {}) },
+      actor,
+    );
+    json(res, 200, { configured: true, ...storedConfigView(stored) });
+  } catch (err) {
+    json(res, 400, { error: err instanceof Error ? err.message : "invalid defaults" });
+  }
+}
+
+function handleGetProjectAgentConfig(res: http.ServerResponse, projectKey: string): void {
+  if (!getMappings()[projectKey]) {
+    json(res, 404, { error: "mapping not found" });
+    return;
+  }
+  const stored = getProjectStageConfig(projectKey);
+  json(res, 200, { projectKey, ...(stored ? storedConfigView(stored) : { enabled: false, mode: "legacy", stages: {} }) });
+}
+
+/** Per-field overlay: a supplied field replaces the stored one (null clears it back to inheritance); the rest stay. */
+function overlayStages(
+  current: StageAgentConfigurationV1["stages"],
+  incoming: Record<string, Record<string, unknown>>,
+): StageAgentConfigurationV1["stages"] {
+  const next: Record<string, Record<string, unknown>> = {};
+  for (const [stage, patch] of Object.entries(current ?? {})) next[stage] = { ...(patch as Record<string, unknown>) };
+  for (const [stage, patch] of Object.entries(incoming)) next[stage] = { ...next[stage], ...patch };
+  return next as StageAgentConfigurationV1["stages"];
+}
+
+function backendsFor(mapping: { executionMode: "github-actions" | "fly-machines" }): AgentRunRequest["backend"][] {
+  const path = resolveExecutionPath(getRunnerMode().mode, mapping.executionMode);
+  return path === "both" ? ["github-actions", "fly-machines"] : [path];
+}
+
+const WORKFLOW_SYNC_ACTION =
+  "Run the existing workflow sync for this project (/admin#projects) and merge its PR in the target repo; this API does not enable or rewrite workflows.";
+
+interface OptInRefusal {
+  status: number;
+  body: Record<string, unknown>;
+}
+
+/** Read-only readiness of an uncommitted candidate for the backend(s) dispatch would use. Nothing is stored to inspect it. */
+async function optInRefusal(projectKey: string, candidate: StageAgentConfigurationV1, deps: AdminDeps): Promise<OptInRefusal | null> {
+  const mapping = getMappings()[projectKey]!;
+  try {
+    const { resolution } = resolveCandidateProjectStageConfig(projectKey, candidate);
+    if (resolution.mode === "configured" && STAGE_NAMES.some((s) => resolution.profiles[s].authMode === "claude-subscription")) {
+      return {
+        status: 422,
+        body: { error: "Claude subscription execution cannot be enabled from this API", code: "claude_subscription_unsupported" },
+      };
+    }
+  } catch {
+    return { status: 422, body: { error: "stage configuration does not resolve", code: "resolution_failed" } };
+  }
+  for (const backend of backendsFor(mapping)) {
+    let readiness: AgentReadiness;
+    try {
+      readiness = await deps.agentConfig!.inspectReadiness(
+        {
+          projectKey,
+          backend,
+          workflowRepository: `${mapping.owner}/${mapping.repo}`,
+          workflowFile: mapping.workflowFile,
+          repositories: [`${mapping.owner}/${mapping.repo}`],
+        },
+        candidate,
+      );
+    } catch {
+      return { status: 503, body: { error: "readiness inspection failed", code: "readiness_unavailable", backend } };
+    }
+    if (readiness.status === "ready") continue;
+    const code = readiness.status === "not-ready" ? readiness.code : "resolution_failed";
+    const templateCodes = ["runner_incompatible", "retired_workflow_present", "delivery_unreadable"];
+    if (backend === "github-actions" && code === "delivery_unreadable") {
+      return {
+        status: 409,
+        body: {
+          error: "GitHub Actions opt-in is not supported yet: managed credentials and workflow readiness for GitHub Actions dispatch are not available",
+          code: "unsupported_backend",
+          backend,
+        },
+      };
+    }
+    return {
+      status: 409,
+      body: {
+        error: "project is not ready to run configured agents",
+        code,
+        backend,
+        ...(backend === "github-actions" && templateCodes.includes(code) ? { action: WORKFLOW_SYNC_ACTION } : {}),
+      },
+    };
+  }
+  return null;
+}
+
+const projectConfigLocks = new Map<string, Promise<unknown>>();
+
+/** Serialises read-inspect-write sequences per project so one PUT's rollback cannot overwrite another's write. */
+async function withProjectConfigLock<T>(projectKey: string, fn: () => Promise<T>): Promise<T> {
+  const prior = projectConfigLocks.get(projectKey) ?? Promise.resolve();
+  const run = prior.then(fn, fn);
+  const tail = run.catch(() => undefined);
+  projectConfigLocks.set(projectKey, tail);
+  try {
+    return await run;
+  } finally {
+    if (projectConfigLocks.get(projectKey) === tail) projectConfigLocks.delete(projectKey);
+  }
+}
+
+async function handlePutProjectAgentConfig(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  projectKey: string,
+  deps: AdminDeps,
+  actor: string | null,
+): Promise<void> {
+  const body = await readJsonObject(req, res);
+  if (!body) return;
+  await withProjectConfigLock(projectKey, () => putProjectAgentConfigLocked(res, projectKey, deps, actor, body));
+}
+
+async function putProjectAgentConfigLocked(
+  res: http.ServerResponse,
+  projectKey: string,
+  deps: AdminDeps,
+  actor: string | null,
+  body: Record<string, unknown>,
+): Promise<void> {
+  if (!getMappings()[projectKey]) {
+    json(res, 404, { error: "mapping not found" });
+    return;
+  }
+  const extra = unsupportedKeys(body, ["enabled", "stages"]);
+  if (extra.length > 0) {
+    json(res, 400, { error: `unsupported field(s): ${extra.join(", ")}` });
+    return;
+  }
+  const previous = getProjectStageConfig(projectKey);
+  if (body.enabled !== undefined && typeof body.enabled !== "boolean") {
+    json(res, 400, { error: "enabled must be a boolean" });
+    return;
+  }
+  if (body.stages !== undefined) {
+    const bad = validateStagesBody(body.stages);
+    if (bad) {
+      json(res, 400, { error: bad });
+      return;
+    }
+  }
+  const enabled = body.enabled ?? previous?.config.mode === "configured";
+  if (enabled && !deps.agentConfig) {
+    json(res, 501, { error: "agent configuration readiness inspection is not configured", code: "readiness_unavailable" });
+    return;
+  }
+  const stages = body.stages === undefined ? previous?.config.stages : overlayStages(previous?.config.stages, body.stages as Record<string, Record<string, unknown>>);
+  const candidate: StageAgentConfigurationV1 = {
+    version: STAGE_AGENT_CONFIG_VERSION,
+    mode: enabled ? "configured" : "legacy",
+    ...(stages !== undefined ? { stages } : {}),
+  };
+  // Taken before any await: if a default, profile, permission or project head moves while readiness is
+  // inspected, the commit below refuses rather than publishing a verdict about inputs that no longer exist.
+  const inputs = readStageInputsFingerprint(projectKey);
+  if (enabled) {
+    try {
+      resolveCandidateProjectStageConfig(projectKey, candidate);
+    } catch (err) {
+      json(res, 400, { error: err instanceof Error ? err.message : "invalid stage configuration" });
+      return;
+    }
+    const refusal = await optInRefusal(projectKey, candidate, deps);
+    if (refusal) {
+      json(res, refusal.status, refusal.body);
+      return;
+    }
+  }
+  let stored;
+  try {
+    stored = setProjectStageConfig(projectKey, candidate, actor, inputs); // re-validates resolution inside its own transaction
+  } catch (err) {
+    if (err instanceof StaleStageInputsError) {
+      json(res, 409, { error: "stage configuration inputs changed while readiness was inspected; retry", code: "stale_inputs" });
+      return;
+    }
+    json(res, 400, { error: err instanceof Error ? err.message : "invalid stage configuration" });
+    return;
+  }
+  json(res, 200, { projectKey, ...storedConfigView(stored) });
+}
+
+function handleGetResolvedAgentConfig(res: http.ServerResponse, projectKey: string, deps: AdminDeps): void {
+  if (!getMappings()[projectKey]) {
+    json(res, 404, { error: "mapping not found" });
+    return;
+  }
+  const stored = getProjectStageConfig(projectKey);
+  const base = { projectKey, enabled: stored?.config.mode === "configured" };
+  let projection;
+  try {
+    projection = resolveProjectStageConfig(projectKey);
+  } catch (err) {
+    // Resolver messages are fixed text (disabled, unpermitted or incompatible profile); none carries a credential.
+    json(res, 200, {
+      ...base,
+      mode: "configured",
+      resolved: false,
+      error: { code: "resolution_failed", message: err instanceof Error ? err.message : "stage configuration does not resolve" },
+    });
+    return;
+  }
+  const { resolution } = projection;
+  if (resolution.mode !== "configured") {
+    json(res, 200, { ...base, mode: "legacy", resolved: true });
+    return;
+  }
+  const stages = {} as Record<StageName, unknown>;
+  for (const stage of STAGE_NAMES) {
+    const profile = resolution.profiles[stage];
+    const projectionProfile = getAccountProfile(profile.id);
+    stages[stage] = {
+      values: resolution.stages[stage],
+      sources: resolution.sources[stage],
+      profile: { id: profile.id, identity: profile.identity, revision: profile.revision, agent: profile.agent, provider: profile.provider, authMode: profile.authMode },
+      account: projectionProfile ? accountStatus({ ...projectionProfile, revision: profile.revision }, deps, projectKey) : { readiness: "unknown", failureCode: "profile_not_found" },
+    };
+  }
+  json(res, 200, { ...base, mode: "configured", resolved: true, stages, configRevisions: projection.configReferences });
 }

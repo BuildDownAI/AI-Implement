@@ -4,6 +4,7 @@ import {
   MAX_SESSION_DATA_LENGTH,
   MODEL_AUTH_FAILURE_CATEGORIES,
   RESERVED_AUTH_MODES,
+  expectedSecretKind,
   SUBSCRIPTION_AUTH_MODES,
   isSubscriptionAuthMode,
   reservesModelAccount,
@@ -143,6 +144,13 @@ describe("grant bootstrap", () => {
       expect(reservesModelAccount("codex-subscription")).toBe(false);
       expect(isSubscriptionAuthMode("codex-subscription")).toBe(true);
       expect([...SUBSCRIPTION_AUTH_MODES]).toEqual(["claude-subscription", "codex-subscription"]);
+    });
+    it("names the one secret kind each mode accepts", () => {
+      expect(expectedSecretKind("anthropic-api-key")).toBe("api-key");
+      expect(expectedSecretKind("openai-api-key")).toBe("api-key");
+      expect(expectedSecretKind("bedrock")).toBe("aws-bedrock");
+      expect(expectedSecretKind("claude-subscription")).toBe("session");
+      expect(expectedSecretKind("codex-subscription")).toBe("chatgpt-access-token");
     });
     it("rejects unsupported modes, stages, and revisions", () => {
       expect(parseModelAuthGrantBootstrap(grant({ bindings: [{ ...apiBinding, authMode: "oauth" }] })).ok).toBe(false);
