@@ -666,7 +666,7 @@ describe("managed planning on GitHub Actions (AII-1420)", () => {
   const issue = { id: "i-gha", identifier: "AII-1420", title: "t", description: "d", scopeKey: "AII", nativeStatus: "Todo" } as TicketIssue;
   const mapping = { owner: "o", repo: "r", workflowFile: "w.yml", planningWorkflowFile: "p.yml", defaultBranch: "main" } as unknown as RepoMapping;
   const config = {
-    githubAppId: "id", githubAppPrivateKey: "key", runnerCallbackBaseUrl: "http://cb", runnerTokenSecret: "secret-with-enough-entropy-for-hmac",
+    githubAppId: "id", githubAppPrivateKey: "key", runnerCallbackBaseUrl: "https://cb.example.test", runnerTokenSecret: "secret-with-enough-entropy-for-hmac",
   } as unknown as AppConfig;
   const provider = {
     id: "linear",
@@ -721,6 +721,20 @@ describe("managed planning on GitHub Actions (AII-1420)", () => {
     try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   });
 
+  it("the launch context is the request's own values, never read from a grant whose dispatch, project and backend differ", async () => {
+    const { decodeTrustedRunConfig } = await import("../run-config.js");
+    const divergent = { ...bootstrap, dispatchId: "grant-dispatch", projectKey: "grant-project", backend: "fly" } as unknown as typeof bootstrap;
+    decision.takeBootstrap = vi.fn(() => divergent);
+    const prepared = await prepare();
+
+    const trusted = decodeTrustedRunConfig((prepared.planningDispatchInputs as Record<string, string>).run_config!);
+    expect(trusted.credentials?.modelAuthGrant).toEqual(divergent);
+    expect(trusted.credentials?.modelAuthContext).toEqual({
+      version: 1, dispatchId: "d-gha", projectKey: "AII", backend: "gha", modelAuthUrl: "https://cb.example.test",
+    });
+    expect(JSON.stringify(trusted.credentials?.modelAuthContext)).not.toMatch(/grant-dispatch|grant-project/);
+  });
+
   it("a capable launch carries the frozen snapshot and protected bootstrap privately, with no downgrade", async () => {
     const { decodeTrustedRunConfig, decodeRunConfig } = await import("../run-config.js");
     const prepared = await prepare();
@@ -733,6 +747,9 @@ describe("managed planning on GitHub Actions (AII-1420)", () => {
     const trusted = decodeTrustedRunConfig(inputs.run_config!);
     expect(trusted.agentConfig).toEqual(snapshot);
     expect(trusted.credentials?.modelAuthGrant).toEqual(bootstrap);
+    expect(trusted.credentials?.modelAuthContext).toEqual({
+      version: 1, dispatchId: "d-gha", projectKey: "AII", backend: "gha", modelAuthUrl: "https://cb.example.test",
+    });
     expect(decodeRunConfig(inputs.run_config!).credentials).toBeUndefined();
     expect(inputs.run_token).toBe("");
     for (const [k, v] of Object.entries(inputs)) {

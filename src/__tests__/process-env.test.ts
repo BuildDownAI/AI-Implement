@@ -342,6 +342,40 @@ describe("private envelope and model-auth bootstrap stripping (AII-981)", () => 
     expect(env).not.toHaveProperty("AI_IMPLEMENT_MODEL_AUTH_GRANT");
     expect(env).not.toHaveProperty("AI_IMPLEMENT_RUN_CONFIG");
   });
+
+  // AII-1427: the independent trusted launch context reaches the Run step's process env only.
+  describe("independent model-auth launch context", () => {
+    const CONTEXT: Record<string, string> = {
+      AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID: "SENTINEL-ctx-dispatch",
+      AI_IMPLEMENT_MODEL_AUTH_PROJECT_KEY: "SENTINEL-ctx-project",
+      AI_IMPLEMENT_MODEL_AUTH_BACKEND: "gha",
+      AI_IMPLEMENT_MODEL_AUTH_URL: "https://sentinel-ctx.example.com/base",
+    };
+    beforeEach(() => {
+      for (const [k, v] of Object.entries(CONTEXT)) saveAndSet(k, v);
+    });
+
+    it("is absent from hook (repo), configured hook, model, git and dependency-git children", () => {
+      const children: Record<string, NodeJS.ProcessEnv> = {
+        repo: repoProcessEnv(),
+        repoConfigured: repoProcessEnv({ configured: true }),
+        modelNoWrite: modelProcessEnv(false),
+        modelWrite: modelProcessEnv(true),
+        git: gitProcessEnv(),
+        gitDependency: gitDependencyProcessEnv(),
+      };
+      for (const [name, env] of Object.entries(children)) {
+        for (const k of Object.keys(CONTEXT)) expect(env, `${name} leaked ${k}`).not.toHaveProperty(k);
+        expect(JSON.stringify(env), name).not.toContain("SENTINEL-ctx");
+      }
+    });
+
+    it("does not mutate process.env", () => {
+      repoProcessEnv();
+      modelProcessEnv(true);
+      for (const [k, v] of Object.entries(CONTEXT)) expect(process.env[k]).toBe(v);
+    });
+  });
 });
 
 describe("configured runs and selected authentication (AII-951)", () => {

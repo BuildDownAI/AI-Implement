@@ -125,7 +125,7 @@ async function buildPlanningLaunch(
   managedDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }>,
 ): Promise<Omit<PlanningLaunch, "managedDecision" | "managedRuntime">> {
   const { config, provider, issue, mapping, dispatchId, resolvedPlanningBranch, resolveRunnerImage } = args;
-  const managedCredentials = ghaManagedCredentials(managedDecision);
+  const managedCredentials = ghaManagedCredentials(managedDecision, config.runnerCallbackBaseUrl);
   const trustedCredentials = managedCredentials ? { ...args.trustedCredentials, ...managedCredentials } : args.trustedCredentials;
 
   // Build planning context (PARENT/SIBLINGS/DEPENDENCIES) only once admission is

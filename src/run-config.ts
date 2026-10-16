@@ -15,8 +15,10 @@ import {
 } from "./agent-config.js";
 import {
   parseModelAuthGrantBootstrap,
+  parseModelAuthContext,
   parseSealedModelAuthBootstrap,
   type ModelAuthGrantBootstrapV1,
+  type ModelAuthContextV1,
   type SealedModelAuthBootstrapV1,
 } from "./model-auth-contract.js";
 
@@ -112,7 +114,7 @@ export interface RunConfigV1 {
 export const RUN_CREDENTIALS_VERSION = 1;
 const MAX_CREDENTIAL_TOKEN_CHARS = 4096;
 const CREDENTIAL_TOKEN_FIELDS = ["resultToken", "progressToken", "publicationToken", "attemptToken"] as const;
-const CREDENTIAL_FIELDS = ["version", ...CREDENTIAL_TOKEN_FIELDS, "modelAuthGrant"] as const;
+const CREDENTIAL_FIELDS = ["version", ...CREDENTIAL_TOKEN_FIELDS, "modelAuthGrant", "modelAuthContext"] as const;
 
 /**
  * Versioned typed credentials for trusted transport. Token fields mirror the synthetic audiences
@@ -127,6 +129,8 @@ export interface RunCredentialsV1 {
   publicationToken?: string;
   attemptToken?: string;
   modelAuthGrant?: ModelAuthGrantBootstrapV1 | SealedModelAuthBootstrapV1;
+  /** Dispatcher-authored GHA launch context (AII-1427), independent of the grant. Protected-only. */
+  modelAuthContext?: ModelAuthContextV1;
 }
 
 const MAX_DESCRIPTION_CHARS = 40_000;
@@ -293,6 +297,11 @@ export function validateRunCredentials(value: unknown): RunCredentialsV1 {
     if (!parsed.ok) credentialsFail(".modelAuthGrant", "is invalid");
     out.modelAuthGrant = parsed.value;
   }
+  if (value.modelAuthContext !== undefined) {
+    const parsed = parseModelAuthContext(value.modelAuthContext);
+    if (!parsed.ok) credentialsFail(".modelAuthContext", "is invalid");
+    out.modelAuthContext = parsed.value;
+  }
   return out;
 }
 
@@ -332,6 +341,7 @@ export function diagnosticProjection(config: RunConfigV1): RunConfigV1 & { crede
   if (isRec(creds)) {
     const present = CREDENTIAL_TOKEN_FIELDS.filter((f) => creds[f] !== undefined) as string[];
     if (creds.modelAuthGrant !== undefined) present.push("modelAuthGrant");
+    if (creds.modelAuthContext !== undefined) present.push("modelAuthContext");
     projected.credentialFields = present;
   }
   return projected;

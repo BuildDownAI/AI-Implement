@@ -1,6 +1,7 @@
 # Synced to target repos by sync-workflow.yml.
 # ai-implement-capability: private-run-config-v1
 # ai-implement-capability: stage-agent-config-v1
+# ai-implement-capability: stage-agent-launch-context-v1
 # All pipeline logic lives in the runner image (ghcr.io/builddownai/ai-implement-runner).
 # Do not edit in target repos.
 #
@@ -277,12 +278,24 @@ jobs:
               and .version == 1 and .algorithm == "aes-256-gcm" and (.dispatchId | idstr) and .backend == "fly"
               and (.nonce | b64u(16; 16)) and (.ciphertext | b64u(1; 65536)) and (.tag | b64u(22; 22));
             def grant: if isobj and has("algorithm") then sealed_grant else plain_grant end;
+            def ctx:
+              isobj and only(["version", "dispatchId", "projectKey", "backend", "modelAuthUrl"])
+              and .version == 1 and (.dispatchId | idstr) and (.projectKey | idstr) and .backend == "gha"
+              and (.modelAuthUrl | type == "string" and length <= 2048
+                   and test("\\Ahttps://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?\\z")
+                   and (capture("\\Ahttps://(?<host>[^:/]+)(:(?<port>[0-9]{1,5}))?") as $m
+                        | (($m.port // "1") | tonumber) as $p
+                        | $p >= 1 and $p <= 65535
+                          and ($m.host | if test("\\A[0-9.]+\\z")
+                                         then (split(".") | length == 4 and all(.[]; test("\\A[0-9]{1,3}\\z") and tonumber <= 255))
+                                         else true end)));
             def creds:
-              isobj and only(["version", "resultToken", "progressToken", "publicationToken", "attemptToken", "modelAuthGrant"])
+              isobj and only(["version", "resultToken", "progressToken", "publicationToken", "attemptToken", "modelAuthGrant", "modelAuthContext"])
               and .version == 1
               and (. as $c | all("resultToken", "progressToken", "publicationToken", "attemptToken";
                      . as $f | ($c | has($f) | not) or ($c[$f] | token)))
-              and (if has("modelAuthGrant") then (.modelAuthGrant | grant) else true end);
+              and (if has("modelAuthGrant") then (.modelAuthGrant | grant) and has("modelAuthContext") else true end)
+              and (if has("modelAuthContext") then (.modelAuthContext | ctx) else true end);
             def snapstr: type == "string" and test("\\S") and length <= 256;
             def revref: isobj and only(["configRevisionId", "revision"]) and (.configRevisionId | snapstr) and (.revision | posint);
             def sel:
@@ -326,11 +339,16 @@ jobs:
             | . as $c
             | ([ (.resultToken, .progressToken, .publicationToken, .attemptToken | select(. != null)),
                 (.modelAuthGrant // empty
-                  | if has("algorithm") then (.nonce, .ciphertext, .tag | select(length >= 8)) else .bearer end) ]
+                  | if has("algorithm") then (.nonce, .ciphertext, .tag | select(length >= 8)) else .bearer end),
+                (.modelAuthContext // empty | .dispatchId, .projectKey, .modelAuthUrl) ]
             | unique | .[] | mask),
               ("RUN_TOKEN=" + ($c.resultToken // "")),
               ("RUN_PROGRESS_TOKEN=" + ($c.progressToken // "")),
-              ("RUN_PUBLICATION_TOKEN=" + ($c.publicationToken // ""))
+              ("RUN_PUBLICATION_TOKEN=" + ($c.publicationToken // "")),
+              ("RUN_MODEL_AUTH_DISPATCH_ID=" + ($c.modelAuthContext.dispatchId // "")),
+              ("RUN_MODEL_AUTH_PROJECT_KEY=" + ($c.modelAuthContext.projectKey // "")),
+              ("RUN_MODEL_AUTH_BACKEND=" + ($c.modelAuthContext.backend // "")),
+              ("RUN_MODEL_AUTH_URL=" + ($c.modelAuthContext.modelAuthUrl // ""))
           ' "$GITHUB_EVENT_PATH" 2>/dev/null)" || {
             echo "::error::Private run_config bootstrap failed" >&2
             exit 1
@@ -548,6 +566,11 @@ jobs:
           # Private credentials arrive as masked outputs of the bootstrap step.
           RUN_TOKEN: ${{ steps.bootstrap.outputs.run_token }}
           RUN_PROGRESS_TOKEN: ${{ steps.bootstrap.outputs.run_progress_token }}
+          # Independent trusted model-auth context (AII-1427): masked bootstrap outputs, Run step only.
+          AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID: ${{ steps.bootstrap.outputs.run_model_auth_dispatch_id }}
+          AI_IMPLEMENT_MODEL_AUTH_PROJECT_KEY: ${{ steps.bootstrap.outputs.run_model_auth_project_key }}
+          AI_IMPLEMENT_MODEL_AUTH_BACKEND: ${{ steps.bootstrap.outputs.run_model_auth_backend }}
+          AI_IMPLEMENT_MODEL_AUTH_URL: ${{ steps.bootstrap.outputs.run_model_auth_url }}
           RUN_PUBLICATION_TOKEN: ${{ steps.bootstrap.outputs.run_publication_token }}
           AI_IMPLEMENT_NPM_REGISTRY: ${{ vars.AI_IMPLEMENT_NPM_REGISTRY }}
           AI_IMPLEMENT_NPM_SCOPE: ${{ vars.AI_IMPLEMENT_NPM_SCOPE }}

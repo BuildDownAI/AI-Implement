@@ -1899,6 +1899,21 @@ describe("protected dispatch for gap-fill (AII-1392)", () => {
       return { dispatch, drained };
     }
 
+    it("the launch context is the request's own values, never read from a grant whose dispatch, project and backend differ", async () => {
+      const { decodeTrustedRunConfig } = await import("../run-config.js");
+      const divergent = makeGrant(snapshot, { backend: "fly", dispatchId: "grant-dispatch", projectKey: "grant-project" });
+      const decision = { ...ghaDecision(), takeBootstrap: vi.fn(() => divergent) };
+      const { dispatch, drained } = await runGha(decision, { success: true, status: 204 });
+      await drained;
+
+      const trusted = decodeTrustedRunConfig(dispatch.mock.calls[0]![2].run_config!);
+      expect(trusted.credentials?.modelAuthGrant).toEqual(divergent);
+      expect(trusted.credentials?.modelAuthContext).toEqual({
+        version: 1, dispatchId: decision.dispatchId, projectKey: decision.projectKey, backend: "gha", modelAuthUrl: "https://orch.example.com",
+      });
+      expect(JSON.stringify(trusted.credentials?.modelAuthContext)).not.toMatch(/grant-dispatch|grant-project/);
+    });
+
     it("accepted launch carries the frozen snapshot and the protected bootstrap privately, and keeps the grant", async () => {
       const { decodeTrustedRunConfig, decodeRunConfig } = await import("../run-config.js");
       const decision = ghaDecision();
@@ -1911,6 +1926,9 @@ describe("protected dispatch for gap-fill (AII-1392)", () => {
       expect(trusted.agentConfig).toEqual(decision.snapshot);
       expect(trusted.credentials?.modelAuthGrant).toEqual(bootstrap);
       expect(trusted.credentials?.resultToken).toBeTruthy();
+      expect(trusted.credentials?.modelAuthContext).toEqual({
+        version: 1, dispatchId: decision.dispatchId, projectKey: decision.projectKey, backend: "gha", modelAuthUrl: "https://orch.example.com",
+      });
       expect(decodeRunConfig(inputs.run_config!).credentials).toBeUndefined();
       expect(inputs.run_token).toBe("");
       for (const [k, v] of Object.entries(inputs)) {

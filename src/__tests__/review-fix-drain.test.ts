@@ -1601,6 +1601,24 @@ describe("processReviewFixQueue — protected dispatch (AII-1392)", () => {
       return vi.spyOn(githubModule, "dispatchWorkflow");
     }
 
+    it("the launch context is the request's own values, never read from a grant whose dispatch, project and backend differ", async () => {
+      const { decodeTrustedRunConfig } = await import("../run-config.js");
+      const dispatch = await setup();
+      dispatch.mockResolvedValue({ success: true, status: 204 });
+      const divergent = makeGrant(snapshot, { backend: "fly", dispatchId: "grant-dispatch", projectKey: "grant-project" });
+      decision.takeBootstrap = vi.fn(() => divergent);
+
+      await indexModule.processReviewFixQueue(tokenConfig, mockRegistry);
+
+      const inputs = dispatch.mock.calls[0]![2] as Record<string, string>;
+      const trusted = decodeTrustedRunConfig(inputs.run_config!);
+      expect(trusted.credentials?.modelAuthGrant).toEqual(divergent);
+      expect(trusted.credentials?.modelAuthContext).toEqual({
+        version: 1, dispatchId: decision.dispatchId, projectKey: decision.projectKey, backend: "gha", modelAuthUrl: "https://callback.example",
+      });
+      expect(JSON.stringify(trusted.credentials?.modelAuthContext)).not.toMatch(/grant-dispatch|grant-project/);
+    });
+
     it("accepted launch carries the frozen snapshot and protected bootstrap privately and keeps the grant", async () => {
       const { decodeTrustedRunConfig, decodeRunConfig } = await import("../run-config.js");
       const dispatch = await setup();
@@ -1614,6 +1632,9 @@ describe("processReviewFixQueue — protected dispatch (AII-1392)", () => {
       expect(trusted.agentConfig).toEqual(snapshot);
       expect(trusted.credentials?.modelAuthGrant).toEqual(bootstrap);
       expect(trusted.credentials?.resultToken).toBeTruthy();
+      expect(trusted.credentials?.modelAuthContext).toEqual({
+        version: 1, dispatchId: decision.dispatchId, projectKey: decision.projectKey, backend: "gha", modelAuthUrl: "https://callback.example",
+      });
       expect(decodeRunConfig(inputs.run_config!).credentials).toBeUndefined();
       expect(inputs.run_token).toBe("");
       for (const [k, v] of Object.entries(inputs)) {

@@ -198,6 +198,15 @@ describe("prepareManagedDispatch", () => {
     expect(await adapter.prepareManagedDispatch(req(), runtime)).toEqual({ kind: "hold", code: "bootstrap_consumed" });
   });
 
+  it("refuses to build credentials without a safe callback base URL, leaving the bootstrap untaken", async () => {
+    gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED });
+    const d = launchOf(await adapter.prepareManagedDispatch(ghaReq(), runtime));
+    for (const url of [null, undefined, "", "http://orch.example.com", "https://u:p@orch.example.com", "https://orch.example.com/?q=1"]) {
+      expect(() => adapter.ghaManagedCredentials(d, url)).toThrow("model auth context unavailable");
+    }
+    expect(adapter.ghaManagedCredentials(d, "https://orch.example.com")?.modelAuthGrant).toBeDefined();
+  });
+
   it.each([
     [{ status: "legacy" }, { kind: "legacy" }],
     [{ status: "queued", dispatchId: "d1", busyProfiles: ["sub"] }, { kind: "leave-queued", code: "profile_busy" }],
@@ -265,7 +274,7 @@ describe("prepareManagedDispatch", () => {
   });
 });
 
-const CAPABLE = "name: Implement\n# ai-implement-capability: stage-agent-config-v1\n";
+const CAPABLE = "name: Implement\n# ai-implement-capability: stage-agent-config-v1\n# ai-implement-capability: stage-agent-launch-context-v1\n";
 const WORKFLOW = ".github/workflows/claude-implement.yml";
 
 function gha(files: Record<string, string | null> | (() => Promise<Record<string, string | null>>), trust?: { visibility: "public" | "private"; trustedForSubscription: boolean }) {
@@ -306,11 +315,14 @@ describe("prepareManagedDispatch on github-actions (AII-1420)", () => {
     expect(d.backend).toBe("github-actions");
     expect(d.snapshot.profiles.implementation.authMode).toBe("codex-subscription");
     expect(JSON.stringify(d)).not.toContain("bearer");
-    const creds = adapter.ghaManagedCredentials(d);
+    const creds = adapter.ghaManagedCredentials(d, "https://orch.example.com");
     expect(creds?.version).toBe(1);
     expect(creds?.modelAuthGrant).toMatchObject({ dispatchId: "d1", backend: "gha" });
-    expect(() => adapter.ghaManagedCredentials(d)).toThrow("managed dispatch bootstrap unavailable");
-    expect(adapter.ghaManagedCredentials({ kind: "legacy" })).toBeUndefined();
+    expect(creds?.modelAuthContext).toEqual({
+      version: 1, dispatchId: d.dispatchId, projectKey: d.projectKey, backend: "gha", modelAuthUrl: "https://orch.example.com",
+    });
+    expect(() => adapter.ghaManagedCredentials(d, "https://orch.example.com")).toThrow("managed dispatch bootstrap unavailable");
+    expect(adapter.ghaManagedCredentials({ kind: "legacy" }, "https://orch.example.com")).toBeUndefined();
   });
 
   it.each([

@@ -929,6 +929,64 @@ export function toSafeModelAuthDiagnostic(input: {
   };
 }
 
+export const MODEL_AUTH_CONTEXT_FIELD = "modelAuthContext";
+export const MAX_MODEL_AUTH_URL_LENGTH = 2048;
+/** https only; host is letters/digits/dots/hyphens, optional port and plain path. No userinfo, query or fragment. */
+export const MODEL_AUTH_URL_PATTERN = /^https:\/\/[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?(\/[A-Za-z0-9._~\/-]*)?$/;
+
+/** Pattern match plus a real authority check: the port is 1-65535 and the URL constructor accepts it (mirrored in the workflow jq). */
+export function isValidModelAuthUrl(url: string): boolean {
+  if (url.length > MAX_MODEL_AUTH_URL_LENGTH || !MODEL_AUTH_URL_PATTERN.test(url)) return false;
+  const port = /^https:\/\/[^:/]+:([0-9]{1,5})/.exec(url)?.[1];
+  if (port !== undefined && (Number(port) < 1 || Number(port) > 65535)) return false;
+  const host = /^https:\/\/([^:/]+)/.exec(url)?.[1] ?? "";
+  if (/^[0-9.]+$/.test(host)) {
+    const octets = host.split(".");
+    if (octets.length !== 4 || !octets.every((o) => /^[0-9]{1,3}$/.test(o) && Number(o) <= 255)) return false;
+  }
+  try {
+    new URL(url);
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Dispatcher-authored launch metadata that travels beside, never inside, the opaque grant (AII-1427).
+ * Every value comes from the trusted dispatch request and the configured callback base URL; the runner
+ * compares the grant against it, so deriving it from the grant would defeat the comparison.
+ * Carried only in the protected credential namespace (GHA transport).
+ */
+export interface ModelAuthContextV1 {
+  readonly version: 1;
+  readonly dispatchId: string;
+  readonly projectKey: string;
+  readonly backend: "gha";
+  readonly modelAuthUrl: string;
+}
+
+const CONTEXT_FIELDS = ["version", "dispatchId", "projectKey", "backend", "modelAuthUrl"] as const;
+
+export function parseModelAuthContext(raw: unknown): ValidationResult<ModelAuthContextV1> {
+  const obj = objectOf(raw, "model auth context");
+  if (!obj.ok) return obj;
+  const unknown = Object.keys(obj.value).some((k) => !(CONTEXT_FIELDS as readonly string[]).includes(k));
+  if (unknown) return err("model auth context contains unknown field(s)");
+  const version = validateVersion(obj.value, "model auth context");
+  if (!version.ok) return version;
+  const dispatchId = validateIdString(obj.value.dispatchId, "model auth context dispatchId");
+  if (!dispatchId.ok) return dispatchId;
+  const projectKey = validateIdString(obj.value.projectKey, "model auth context projectKey");
+  if (!projectKey.ok) return projectKey;
+  if (obj.value.backend !== "gha") return err("model auth context backend must be gha");
+  const url = obj.value.modelAuthUrl;
+  if (typeof url !== "string" || !isValidModelAuthUrl(url)) {
+    return err("model auth context modelAuthUrl must be a plain https URL");
+  }
+  return ok({ version: 1, dispatchId: dispatchId.value, projectKey: projectKey.value, backend: "gha", modelAuthUrl: url });
+}
+
 /** Trusted launcher values the bootstrap must match; the grant never supplies its own. */
 export const MODEL_AUTH_ENV = {
   dispatchId: "AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID",

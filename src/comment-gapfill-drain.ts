@@ -737,7 +737,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           }));
           contract = capabilities.contract;
           const suppliedCredentials = opts.getTrustedCredentials?.({ owner: item.owner, repo: item.repo, prNumber: item.prNumber });
-          const managedCredentials = ghaManagedCredentials(ghaDecision);
+          const managedCredentials = ghaManagedCredentials(ghaDecision, opts.runnerCallbackBaseUrl);
           const trustedCredentials = managedCredentials ? { ...suppliedCredentials, ...managedCredentials } : suppliedCredentials;
           assertPrivateTransportForCredentials(
             trustedCredentials, capabilities,
