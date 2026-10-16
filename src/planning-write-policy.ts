@@ -16,6 +16,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os, { tmpdir } from "node:os";
+import { isMap, isScalar, parseDocument } from "yaml";
 import { CLAUDE_SKILLS_SUBDIR } from "./pipeline/steps/install-skills.js";
 import { READ_ONLY_BUILTIN_TOOLS, RESTRICTED_DISALLOWED_TOOLS } from "./pipeline/steps/read-only-tools.js";
 
@@ -149,27 +150,57 @@ export function buildPlanningToolArgs(withSkills = false): string[] {
 }
 
 /**
- * True when a SKILL.md front-matter block declares `hooks:`. The CLI runs skill front-matter hooks as commands
- * outside the tool whitelist (verified on 2.1.284), so such a skill is excluded rather than loaded.
+ * True when SKILL.md front matter declares a top-level `hooks` key, or cannot be shown not to. The CLI runs
+ * skill front-matter hooks as commands outside the tool whitelist (verified on 2.1.284), so such a skill is
+ * excluded rather than loaded. The block is parsed as YAML, so quoting, indentation and CRLF cannot hide the
+ * key; malformed, ambiguous (duplicate keys, merge keys, non-mapping) or unterminated front matter fails closed.
  */
-function declaresFrontmatterHooks(skillMd: string): boolean {
-  const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(skillMd);
-  return m ? /^hooks\s*:/m.test(m[1]) : false;
+export function declaresFrontmatterHooks(skillMd: string): boolean {
+  const text = skillMd.replace(/^\uFEFF/, "");
+  if (!/^\s*---/.test(text)) return false;
+  const m = /^---[ \t]*\r?\n([\s\S]*?)(?:\r?\n)?^---[ \t]*(?:\r?\n|$)/m.exec(text);
+  if (!m || m.index !== 0) return true;
+  try {
+    const doc = parseDocument(m[1], { uniqueKeys: true });
+    if (doc.errors.length > 0 || doc.warnings.length > 0) return true;
+    if (doc.contents === null) return false;
+    if (!isMap(doc.contents)) return true;
+    return doc.contents.items.some((pair) => {
+      const key = isScalar(pair.key) ? pair.key.value : undefined;
+      if (typeof key !== "string") return true;
+      const k = key.trim().toLowerCase();
+      return k === "hooks" || k === "<<";
+    });
+  } catch {
+    return true;
+  }
+}
+
+/** True when `a` and `b` (real paths) are equal or one contains the other. */
+function pathsOverlap(a: string, b: string): boolean {
+  const rel = (from: string, to: string) => {
+    const r = path.relative(from, to);
+    return r === "" || (!r.startsWith("..") && !path.isAbsolute(r));
+  };
+  return rel(a, b) || rel(b, a);
 }
 
 /**
  * Copies one selected skill into the generated plugin. The source must be a real directory directly under the
- * home skills directory with a regular `SKILL.md`; symlinks (anywhere in the tree) are excluded, not followed.
+ * home skills directory with a regular `SKILL.md`; symlinks (anywhere in the tree) are excluded, not followed,
+ * and a source overlapping the real workspace is rejected so repository content is never loaded as a skill.
  */
-function copySkill(homeDir: string, name: string, destRoot: string): boolean {
+function copySkill(homeDir: string, name: string, destRoot: string, wsReal: string): boolean {
   if (!SKILL_NAME.test(name)) return false;
   const base = path.join(homeDir, CLAUDE_SKILLS_SUBDIR);
   const src = path.join(base, name);
   try {
     if (!fs.lstatSync(src).isDirectory()) return false;
     if (!fs.lstatSync(path.join(src, "SKILL.md")).isFile()) return false;
+    const srcReal = fs.realpathSync(src);
+    if (path.dirname(srcReal) !== fs.realpathSync(base)) return false;
+    if (pathsOverlap(srcReal, wsReal) || pathsOverlap(fs.realpathSync(base), wsReal)) return false;
     if (declaresFrontmatterHooks(fs.readFileSync(path.join(src, "SKILL.md"), "utf8"))) return false;
-    if (path.dirname(fs.realpathSync(src)) !== fs.realpathSync(base)) return false;
     fs.cpSync(src, path.join(destRoot, name), {
       recursive: true,
       filter: (entry) => {
@@ -225,7 +256,7 @@ export function setupPlanningWritePolicy(workspaceDir: string, skills?: Planning
       const skillsRoot = path.join(pluginDir, "skills");
       fs.mkdirSync(skillsRoot, { recursive: true });
       const homeDir = skills.homeDir ?? os.homedir();
-      const copied = [...new Set(skills.skillNames)].filter((n) => copySkill(homeDir, n, skillsRoot));
+      const copied = [...new Set(skills.skillNames)].filter((n) => copySkill(homeDir, n, skillsRoot, wsReal));
       if (copied.length > 0) {
         fs.mkdirSync(path.join(pluginDir, ".claude-plugin"));
         fs.writeFileSync(

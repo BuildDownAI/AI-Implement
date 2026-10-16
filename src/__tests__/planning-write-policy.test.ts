@@ -8,6 +8,7 @@ import {
   decidePlanningWritePayload,
   setupPlanningWritePolicy,
   buildPlanningToolArgs,
+  declaresFrontmatterHooks,
 } from "../planning-write-policy.js";
 import { buildRestrictedToolArgs, READ_ONLY_BUILTIN_TOOLS, RESTRICTED_DISALLOWED_TOOLS } from "../pipeline/steps/read-only-tools.js";
 
@@ -158,6 +159,64 @@ describe("planning write policy", () => {
       } finally {
         policy.cleanup();
       }
+    });
+
+    it.each([
+      ["unquoted", "---\nname: x\nhooks:\n  PreToolUse: []\n---\nb"],
+      ["double-quoted", '---\nname: x\n"hooks":\n  PreToolUse: []\n---\nb'],
+      ["single-quoted", "---\nname: x\n'hooks':\n  PreToolUse: []\n---\nb"],
+      ["CRLF quoted", '---\r\nname: x\r\n"hooks":\r\n  PreToolUse: []\r\n---\r\nb'],
+      ["flow style", "---\n{name: x, hooks: {}}\n---\nb"],
+      ["merge key", "---\nbase: &b {hooks: {}}\n<<: *b\n---\nb"],
+      ["malformed YAML", "---\nname: [unclosed\n---\nb"],
+      ["duplicate keys", "---\nname: a\nname: b\n---\nb"],
+      ["unterminated", "---\nname: x\nb"],
+      ["non-mapping", "---\n- a\n---\nb"],
+    ])("excludes hook-bearing or unparseable front matter (%s)", (_l, md) => {
+      expect(declaresFrontmatterHooks(md)).toBe(true);
+    });
+
+    it.each([
+      ["allowed-tools", "---\nname: x\nallowed-tools: Bash, Edit\n---\nhooks: in body"],
+      ["nested hooks key", "---\nname: x\nmetadata:\n  hooks: y\n---\nb"],
+      ["no front matter", "just text"],
+      ["empty front matter", "---\n---\nb"],
+    ])("keeps benign front matter (%s)", (_l, md) => {
+      expect(declaresFrontmatterHooks(md)).toBe(false);
+    });
+
+    it("never copies a quoted-hooks skill", () => {
+      const skills = join(home, ".claude", "skills");
+      mkdirSync(join(skills, "qhooked"));
+      writeFileSync(join(skills, "qhooked", "SKILL.md"), '---\nname: qhooked\n"hooks":\n  PreToolUse: []\n---\nb');
+      const policy = setupPlanningWritePolicy(ws, { homeDir: home, skillNames: ["qhooked"] });
+      expect(policy.args).not.toContain("--plugin-dir");
+      policy.cleanup();
+    });
+
+    it("rejects skill sources overlapping the workspace in either direction, including symlink aliases", () => {
+      const repoSkill = join(ws, ".claude", "skills", "repo-skill");
+      mkdirSync(repoSkill, { recursive: true });
+      writeFileSync(join(repoSkill, "SKILL.md"), "---\nname: repo-skill\n---\nb");
+      const a = setupPlanningWritePolicy(ws, { homeDir: ws, skillNames: ["repo-skill"] });
+      expect(a.args).not.toContain("--plugin-dir");
+      a.cleanup();
+
+      const alias = mkdtempSync(join(tmpdir(), "pwp-alias-"));
+      symlinkSync(ws, join(alias, "ws"));
+      const b = setupPlanningWritePolicy(ws, { homeDir: join(alias, "ws"), skillNames: ["repo-skill"] });
+      expect(b.args).not.toContain("--plugin-dir");
+      b.cleanup();
+      rmSync(alias, { recursive: true, force: true });
+
+      // workspace nested inside the skill source (ancestor direction)
+      const skills = join(home, ".claude", "skills");
+      mkdirSync(join(skills, "wide", "nested-ws"), { recursive: true });
+      writeFileSync(join(skills, "wide", "SKILL.md"), "---\nname: wide\n---\nb");
+      const nested = join(skills, "wide", "nested-ws");
+      const c = setupPlanningWritePolicy(nested, { homeDir: home, skillNames: ["wide"] });
+      expect(c.args).not.toContain("--plugin-dir");
+      c.cleanup();
     });
 
     it("adds no plugin and keeps Skill denied when nothing valid is selected, and cleans up", () => {
