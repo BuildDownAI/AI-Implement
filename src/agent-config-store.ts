@@ -493,12 +493,81 @@ export function getOrchestratorDefaults(): StoredStageConfig | null {
   return row ? toStored(row) : null;
 }
 
-export function setProjectStageConfig(projectKey: string, config: StageAgentConfigurationV1, createdBy: string | null = null): StoredStageConfig {
+/** Thrown by a compare-and-set write when the inputs readiness was inspected against have since changed. */
+export class StaleStageInputsError extends Error {
+  constructor() {
+    super("stage configuration inputs changed while readiness was inspected");
+    this.name = "StaleStageInputsError";
+  }
+}
+
+function inputsFingerprint(db: Database.Database, projectKey: string): string {
+  return JSON.stringify({
+    defaults: currentDefaults(db)?.config_revision_id ?? null,
+    project: latestConfigRow(db, "project", projectKey)?.config_revision_id ?? null,
+    profiles: loadProfiles(db).map((p) => [p.id, p.revision, p.disabled, [...(p.allowedProjectKeys ?? [])].sort()]),
+  });
+}
+
+/**
+ * Identity of everything a project's resolution reads: the defaults head, the project head, and every profile's head
+ * revision, status and permissions. Read-only. Take it before inspecting a candidate and pass it back as
+ * `expectedInputs` to `setProjectStageConfig`, which refuses the write if any of it moved.
+ */
+export function readStageInputsFingerprint(projectKey: string): string {
+  assertNonEmptyProjectKey(projectKey);
+  const db = getDb();
+  return db.transaction(() => inputsFingerprint(db, projectKey))();
+}
+
+/**
+ * Resolves an uncommitted project config against the current defaults, profiles and permissions without writing
+ * anything. The project reference is a placeholder for the revision the candidate would become. Throws when it does not resolve.
+ */
+export function resolveCandidateProjectStageConfig(
+  projectKey: string,
+  candidate: StageAgentConfigurationV1,
+  remainingJobMs?: number,
+): ProjectStageResolution {
+  assertNonEmptyProjectKey(projectKey);
+  assertConfigShape(candidate, "projectConfig");
+  const db = getDb();
+  return db.transaction(() => {
+    const projectRow = latestConfigRow(db, "project", projectKey);
+    const defaultsRow = currentDefaults(db);
+    const resolution = resolveStageAgentConfig({
+      projectKey,
+      orchestratorDefaults: parseConfig(defaultsRow) ?? LEGACY_CONFIG,
+      projectConfig: candidate,
+      accountProfiles: loadProfiles(db),
+      remainingJobMs,
+    });
+    if (resolution.mode !== "configured") return { resolution, configRevisionIds: [] };
+    if (!defaultsRow) throw new Error("configured resolution requires orchestrator config row");
+    const configReferences: ConfigReferences = {
+      orchestratorDefault: { configRevisionId: defaultsRow.config_revision_id, revision: defaultsRow.revision },
+      project: { configRevisionId: "candidate", revision: (projectRow?.revision ?? 0) + 1 },
+    };
+    return {
+      resolution,
+      configReferences,
+      configRevisionIds: [configReferences.orchestratorDefault.configRevisionId, configReferences.project.configRevisionId],
+    };
+  })();
+}
+
+export function setProjectStageConfig(
+  projectKey: string,
+  config: StageAgentConfigurationV1,
+  createdBy: string | null = null,
+  expectedInputs?: string,
+): StoredStageConfig {
   assertNonEmptyProjectKey(projectKey);
   assertConfigShape(config, "projectConfig");
   const db = getDb();
   return db
     .transaction(() => {
+      if (expectedInputs !== undefined && inputsFingerprint(db, projectKey) !== expectedInputs) throw new StaleStageInputsError();
       if (config.mode === "configured") assertProjectResolves(db, projectKey, config);
       return appendConfig(db, "project", projectKey, config, createdBy);
     })

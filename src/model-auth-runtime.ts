@@ -155,11 +155,12 @@ export function createAgentConfigAdminDeps(config: RuntimeConfig): AgentConfigAd
   return {
     credentials: runtime.credentials,
     sessionSnapshot: (profileId) => runtime.ownership.snapshot(profileId),
-    inspectReadiness(request) {
+    inspectReadiness(request, candidate) {
       const [owner, repo] = request.workflowRepository.split("/");
       return inspectAgentReadiness(
         { ...request, dispatchId: `admin-readiness-${randomUUID()}` },
         runtime.preparationDeps({ owner: owner!, repo: repo!, projectKey: request.projectKey }),
+        candidate,
       );
     },
   };

@@ -6274,6 +6274,72 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect(head.stages.review.model).toBe("m-2");
     });
 
+    it("inspects the candidate without publishing it: nothing is stored while inspection is pending or after a refusal", async () => {
+      const t = await seed();
+      const store = await import("../agent-config-store.js");
+      const revs = count("stage_agent_config_revisions");
+      let release!: () => void;
+      let entered!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      const inside = new Promise<void>((r) => (entered = r));
+      const seen: unknown[] = [];
+      const pending = optIn(t, async (req: any) => {
+        seen.push(req);
+        entered();
+        await gate;
+        return { status: "not-ready", code: "runner_incompatible" };
+      });
+      await inside;
+      expect(store.getProjectOptIn("APP")).toBe(false);
+      expect(store.getProjectStageConfig("APP")).toBeNull();
+      expect(count("stage_agent_config_revisions")).toBe(revs);
+      release();
+      expect((await pending).status).toBe(409);
+      expect(store.getProjectStageConfig("APP")).toBeNull();
+      expect(count("stage_agent_config_revisions")).toBe(revs);
+      expect(seen).toHaveLength(1);
+    });
+
+    it("refuses to commit readiness when the defaults, a profile or the project head moved during inspection", async () => {
+      const t = await seed();
+      const store = await import("../agent-config-store.js");
+      const moves: Array<[string, () => void]> = [
+        ["defaults", () => store.setOrchestratorDefaults({ version: 1, ...defaults, stages: { ...defaults.stages, review: { ...defaults.stages.review, model: "gpt-y" } } } as never)],
+        ["profile", () => void store.saveAccountProfileRevision({ profileId: "oai-1", revision: store.getAccountProfile("oai-1")!.revision + 1, identity: "renamed", agent: "codex", provider: "openai", authMode: "openai-api-key", allowedProjectKeys: ["APP"], metadata: { credentialRef: SENTINEL } } as never)],
+        ["project", () => void store.setProjectStageConfig("APP", { version: 1, mode: "legacy", stages: { review: { model: "newer" } } } as never)],
+      ];
+      for (const [, move] of moves) {
+        const before = store.getProjectStageConfig("APP")?.revision ?? 0;
+        const r = await optIn(t, async () => {
+          move();
+          return { status: "ready", profiles: [] };
+        });
+        expect(r.status).toBe(409);
+        expect(r.json.code).toBe("stale_inputs");
+        expect(store.getProjectOptIn("APP")).toBe(false);
+        // Only the concurrent writer's own revision (project move) may exist; the stale candidate never lands.
+        expect(store.getProjectStageConfig("APP")?.revision ?? 0).toBeLessThanOrEqual(before + 1);
+      }
+      expect(store.getProjectStageConfig("APP")?.config.stages?.review?.model).toBe("newer");
+    });
+
+    it("keeps legacy, disabled and Claude-subscription candidates fail-closed without storing them", async () => {
+      const t = await seed();
+      const store = await import("../agent-config-store.js");
+      const inspect = vi.fn(async () => ({ status: "ready", profiles: [] }));
+      const r = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true, stages: { review: { accountProfileId: "missing" } } }, readyDeps(inspect));
+      expect(r.status).toBe(400);
+      expect(inspect).not.toHaveBeenCalled();
+      const off = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: false }, readyDeps(inspect));
+      expect(off.status).toBe(200);
+      expect(inspect).not.toHaveBeenCalled();
+      const backendFail = await optIn(t, async () => {
+        throw new Error("boom");
+      });
+      expect(backendFail.status).toBe(503);
+      expect(store.getProjectOptIn("APP")).toBe(false);
+    });
+
     it("refuses GitHub Actions opt-in as unsupported while workflows are unreadable", async () => {
       const t = await seed();
       const r = await optIn(t, async () => ({ status: "not-ready", code: "delivery_unreadable" }));

@@ -53,10 +53,13 @@ import {
   getProjectStageConfig,
   listAccountProfiles,
   lookupCredentialReference,
+  readStageInputsFingerprint,
+  resolveCandidateProjectStageConfig,
   resolveProjectStageConfig,
   saveAccountProfileRevision,
   setOrchestratorDefaults,
   setProjectStageConfig,
+  StaleStageInputsError,
   type AccountProfileProjection,
 } from "./agent-config-store.js";
 import type { AgentReadiness, AgentRunRequest } from "./agent-run-preparation.js";
@@ -579,7 +582,7 @@ export interface AdminDeps {
 
 export interface AgentConfigAdminDeps {
   /** Read-only readiness (`inspectAgentReadiness`) for one project on one backend. Never writes, reserves or mints. */
-  inspectReadiness(request: Omit<AgentRunRequest, "dispatchId">): Promise<AgentReadiness>;
+  inspectReadiness(request: Omit<AgentRunRequest, "dispatchId">, candidate?: StageAgentConfigurationV1): Promise<AgentReadiness>;
   /** Safe credential status inputs; no secret is read through them. */
   credentials: ModelCredentialDeps;
   /** Ownership snapshot of a `claude-subscription` profile; absent when never reserved. */
@@ -4017,11 +4020,11 @@ interface OptInRefusal {
   body: Record<string, unknown>;
 }
 
-/** Read-only readiness for the backend(s) dispatch would use. Runs after the candidate is stored, because inspection resolves the stored head. */
-async function optInRefusal(projectKey: string, deps: AdminDeps): Promise<OptInRefusal | null> {
+/** Read-only readiness of an uncommitted candidate for the backend(s) dispatch would use. Nothing is stored to inspect it. */
+async function optInRefusal(projectKey: string, candidate: StageAgentConfigurationV1, deps: AdminDeps): Promise<OptInRefusal | null> {
   const mapping = getMappings()[projectKey]!;
   try {
-    const { resolution } = resolveProjectStageConfig(projectKey);
+    const { resolution } = resolveCandidateProjectStageConfig(projectKey, candidate);
     if (resolution.mode === "configured" && STAGE_NAMES.some((s) => resolution.profiles[s].authMode === "claude-subscription")) {
       return {
         status: 422,
@@ -4034,13 +4037,16 @@ async function optInRefusal(projectKey: string, deps: AdminDeps): Promise<OptInR
   for (const backend of backendsFor(mapping)) {
     let readiness: AgentReadiness;
     try {
-      readiness = await deps.agentConfig!.inspectReadiness({
-        projectKey,
-        backend,
-        workflowRepository: `${mapping.owner}/${mapping.repo}`,
-        workflowFile: mapping.workflowFile,
-        repositories: [`${mapping.owner}/${mapping.repo}`],
-      });
+      readiness = await deps.agentConfig!.inspectReadiness(
+        {
+          projectKey,
+          backend,
+          workflowRepository: `${mapping.owner}/${mapping.repo}`,
+          workflowFile: mapping.workflowFile,
+          repositories: [`${mapping.owner}/${mapping.repo}`],
+        },
+        candidate,
+      );
     } catch {
       return { status: 503, body: { error: "readiness inspection failed", code: "readiness_unavailable", backend } };
     }
@@ -4136,30 +4142,32 @@ async function putProjectAgentConfigLocked(
     mode: enabled ? "configured" : "legacy",
     ...(stages !== undefined ? { stages } : {}),
   };
-  let stored;
-  try {
-    stored = setProjectStageConfig(projectKey, candidate, actor); // validates resolution inside its own transaction
-  } catch (err) {
-    json(res, 400, { error: err instanceof Error ? err.message : "invalid stage configuration" });
-    return;
-  }
+  // Taken before any await: if a default, profile, permission or project head moves while readiness is
+  // inspected, the commit below refuses rather than publishing a verdict about inputs that no longer exist.
+  const inputs = readStageInputsFingerprint(projectKey);
   if (enabled) {
-    const refusal = await optInRefusal(projectKey, deps);
+    try {
+      resolveCandidateProjectStageConfig(projectKey, candidate);
+    } catch (err) {
+      json(res, 400, { error: err instanceof Error ? err.message : "invalid stage configuration" });
+      return;
+    }
+    const refusal = await optInRefusal(projectKey, candidate, deps);
     if (refusal) {
-      // Readiness inspects the stored head, so it cannot run before the commit. Restore the prior state
-      // as a new revision (history stays append-only), but only while the head is still our candidate;
-      // dispatch re-checks readiness regardless.
-      if (getProjectStageConfig(projectKey)?.revision === stored.revision) {
-        const legacy = { version: STAGE_AGENT_CONFIG_VERSION, mode: "legacy" } as const;
-        try {
-          setProjectStageConfig(projectKey, previous?.config ?? legacy, actor);
-        } catch {
-          setProjectStageConfig(projectKey, legacy, actor);
-        }
-      }
       json(res, refusal.status, refusal.body);
       return;
     }
+  }
+  let stored;
+  try {
+    stored = setProjectStageConfig(projectKey, candidate, actor, inputs); // re-validates resolution inside its own transaction
+  } catch (err) {
+    if (err instanceof StaleStageInputsError) {
+      json(res, 409, { error: "stage configuration inputs changed while readiness was inspected; retry", code: "stale_inputs" });
+      return;
+    }
+    json(res, 400, { error: err instanceof Error ? err.message : "invalid stage configuration" });
+    return;
   }
   json(res, 200, { projectKey, ...storedConfigView(stored) });
 }
