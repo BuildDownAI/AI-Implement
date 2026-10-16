@@ -66,9 +66,9 @@ export const kgPipelinesHtml = `
         <div class="kpi-trend text-secondary" id="kg-gha-note" hidden>Runner size comes from the KG repo's \`AI_IMPLEMENT_RUNNER_LABEL\` Actions variable. GitHub owns the machines, so there is no kept machine or idle time.</div>
         <div style="margin-top: 12px; display:flex; align-items:center; gap:12px; flex-wrap:wrap" id="kg-schedule-controls">
           <span class="kpi-trend text-secondary">Schedule:</span>
-          <label class="kpi-trend text-secondary"><input type="checkbox" id="kg-schedule-enabled" onchange="window.refreshKgScheduleDirty()"> On</label>
-          <label class="kpi-trend text-secondary">Daily at <input type="time" id="kg-schedule-time" style="width: 110px" oninput="window.refreshKgScheduleDirty()"></label>
-          <label class="kpi-trend text-secondary">Zone <input type="text" id="kg-schedule-zone" style="width: 200px" oninput="window.refreshKgScheduleDirty()"></label>
+          <label class="kpi-trend text-secondary"><input type="checkbox" id="kg-schedule-enabled" onchange="window.refreshKgScheduleSave()"> On</label>
+          <label class="kpi-trend text-secondary">Daily at <input type="time" id="kg-schedule-time" style="width: 110px" oninput="window.refreshKgScheduleSave()"></label>
+          <label class="kpi-trend text-secondary">Zone <input type="text" id="kg-schedule-zone" style="width: 200px" oninput="window.refreshKgScheduleSave()"></label>
           <button class="btn btn-sm" id="btn-kg-schedule-save" onclick="window.saveKgSchedule()">Save</button>
           <span class="kpi-trend text-secondary" id="kg-schedule-error" hidden></span>
         </div>
@@ -582,10 +582,10 @@ export const kgPipelinesScript = `
     return now.enabled !== savedKgSchedule.enabled || now.time !== savedKgSchedule.time || now.zone !== savedKgSchedule.zone;
   }
 
-  function refreshKgScheduleDirty() {
+  function refreshKgScheduleSave() {
     document.getElementById('btn-kg-schedule-save').disabled = kgScheduleHeld;
   }
-  window.refreshKgScheduleDirty = refreshKgScheduleDirty;
+  window.refreshKgScheduleSave = refreshKgScheduleSave;
 
   function showKgScheduleError(text) {
     const el = document.getElementById('kg-schedule-error');
@@ -614,7 +614,7 @@ export const kgPipelinesScript = `
       const out = unwrapToolAnswer(res, await res.json().catch(function () { return {}; }));
       if (out.status === 409 && out.body.error === 'deploy-in-progress') {
         kgScheduleHeld = true;
-        refreshKgScheduleDirty();
+        refreshKgScheduleSave();
         showKgScheduleError(KG_DEPLOY_HELD_TEXT);
         return;
       }
@@ -623,8 +623,8 @@ export const kgPipelinesScript = `
         return;
       }
       kgScheduleHeld = false;
-      refreshKgScheduleDirty();
-      if (document.getElementById('kg-schedule-error').textContent === KG_DEPLOY_HELD_TEXT) showKgScheduleError('');
+      refreshKgScheduleSave();
+      if (!kgScheduleDirty()) showKgScheduleError('');
       const schedule = out.body.schedule || null;
       renderKgScheduleResult(schedule, out.body.nextOccurrence);
       if (kgScheduleDirty()) return;
@@ -649,7 +649,7 @@ export const kgPipelinesScript = `
       const out = unwrapToolAnswer(res, await res.json().catch(function () { return {}; }));
       if (out.status === 409 && out.body.error === 'deploy-in-progress') {
         kgScheduleHeld = true;
-        refreshKgScheduleDirty();
+        refreshKgScheduleSave();
         showKgScheduleError(KG_DEPLOY_HELD_TEXT);
         return;
       }

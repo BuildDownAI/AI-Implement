@@ -821,4 +821,25 @@ describe("kg schedule control (AII-1434)", () => {
     await win.loadKgSchedule();
     expect(el("btn-kg-schedule-save").disabled).toBe(true);
   });
+
+  it("shows 'admin only' when the save answers 403 and keeps the inputs", async () => {
+    const { win, el } = mount(
+      { status: 200, body: wrap({ schedule: null, nextOccurrence: null }) },
+      { status: 403, body: { error: "forbidden" } },
+    );
+    await win.loadKgSchedule();
+    el("kg-schedule-time").value = "07:15";
+    await win.saveKgSchedule();
+    expect(el("kg-schedule-error").textContent).toBe("admin only");
+    expect(el("kg-schedule-time").value).toBe("07:15");
+  });
+
+  it("clears a stale load error once a later poll succeeds", async () => {
+    const { win, el } = mount({ status: 500, body: {} });
+    await win.loadKgSchedule();
+    expect(el("kg-schedule-error").textContent).toContain("schedule unavailable");
+    win.api = async () => ({ ok: true, status: 200, json: async () => wrap({ schedule: null, nextOccurrence: null }) });
+    await win.loadKgSchedule();
+    expect(el("kg-schedule-error").textContent).toBe("");
+  });
 });
