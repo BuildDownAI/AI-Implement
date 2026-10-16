@@ -3867,6 +3867,42 @@ describe("KgRefresh durable workflow", () => {
       await expectStoppedBeforeMerge(env, triggerId, beforeMerge, beforeClose);
     }, 60_000);
 
+    it.each(VARIANTS.map(([label]) => label))("a schedule's superseded cancel after an accept does not stop the run: the person's accept wins and the merge runs (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const beforeMerge = mergePullRequestFn.mock.calls.length;
+      const triggerId = await holdRun(env);
+      const held = holdAcceptNote();
+      try {
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
+        await held.reached();
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "superseded_by_schedule" });
+      } finally {
+        held.release();
+      }
+      await expectRunSucceeded(env, triggerId);
+      expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
+      expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(0);
+      expect(gateOrder).toEqual(["fetch", "stage", "swap", "verify"]);
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "completed" });
+    }, 60_000);
+
+    it.each(VARIANTS.map(([label]) => label))("an operator cancel with another reason after an accept still wins at the commit point (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const beforeMerge = mergePullRequestFn.mock.calls.length;
+      const triggerId = await holdRun(env);
+      const held = holdAcceptNote();
+      try {
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
+        await held.reached();
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "operator requested" });
+      } finally {
+        held.release();
+      }
+      await expectStoppedBeforeMerge(env, triggerId, beforeMerge, beforeClose);
+    }, 60_000);
+
     it.each(VARIANTS.map(([label]) => label))("a Restate cancel between the accept and the commit stops the run: no merge, PR closed, operator_cancelled (%s)", async (label) => {
       const env = heldEnvs.get(label)!;
       const beforeClose = closePullRequestFn.mock.calls.length;
