@@ -628,6 +628,8 @@ describe("Restate kg-refresh pilot: Fly sessions settings are live", () => {
   const createdApps: Array<string | null> = [];
 
   beforeAll(async () => {
+    ensureCompose();
+    gh = freshGithub();
     for (const k of envKeys) { saved[k] = process.env[k]; delete process.env[k]; }
     process.env.FLY_SESSIONS_TOKEN = "fly-test-token";
     getDb().prepare("DELETE FROM settings WHERE key = 'fly_sessions_app'").run();
