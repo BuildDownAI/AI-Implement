@@ -708,6 +708,7 @@ describe("protocol driver seam (AII-1001)", () => {
       "-c", "features.shell_tool=false",
       "-c", "features.view_image=false",
       "-c", "features.multi_agent=false",
+      "-c", "agents.enabled=false",
       "-c", "features.goals=false",
       "-c", "features.unified_exec=false",
       "-c", 'web_search="disabled"',
@@ -953,7 +954,7 @@ describe("app-server trusted view (AII-1002)", () => {
         expect(seen!.nestedMode).toBe(0o555);
         expect(seen!.names).toEqual([".agents"]);
         expect(seen!.leaked).toBe(false);
-        expect(logSpy.mock.calls.filter((c) => String(c[0]).includes("planning skills copied="))).toEqual([["[codex] planning skills copied=1"]]);
+        expect(logSpy.mock.calls.filter((c) => String(c[0]).includes("app-server skills copied="))).toEqual([["[codex] app-server skills copied=1"]]);
         expect(existsSync(seen!.root)).toBe(false);
       } finally {
         logSpy.mockRestore();
@@ -1612,7 +1613,7 @@ describe("ChatGPT plan token expiry resume", () => {
         expect(seen).toEqual(["synthetic skill a", "synthetic skill a"]);
         expect(new Set(homes).size).toBe(1);
         expect(existsSync(dirname(homes[0]))).toBe(false);
-        expect(logSpy.mock.calls.filter((c) => String(c[0]).includes("planning skills copied="))).toHaveLength(1);
+        expect(logSpy.mock.calls.filter((c) => String(c[0]).includes("app-server skills copied="))).toHaveLength(1);
       } finally {
         logSpy.mockRestore();
         rmSync(skills, { recursive: true, force: true });

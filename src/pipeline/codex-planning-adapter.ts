@@ -597,6 +597,10 @@ function runSession(input: CodexTransportRunInput, policy: CodexProtocolPolicy):
         const item = params.item;
         if (!isRecord(item) || typeof item.type !== "string") return fail("malformed_message", true);
         if (!SAFE_ITEM_TYPES.has(item.type)) return fail("unexpected_item", true, ITEM_TYPE_LABEL.test(item.type) ? item.type : "?");
+        // Structured question metadata (the async request_user_input path) is a user-input channel, not a message.
+        if (item.type === "agentMessage" && item.questions !== undefined && item.questions !== null && !(Array.isArray(item.questions) && item.questions.length === 0)) {
+          return fail("denied_request", true);
+        }
         if (method === "item/completed" && item.type === "agentMessage") {
           if (typeof item.text !== "string") return fail("malformed_message", true);
           if (item.text.length > PLANNING_LIMITS.messageChars) return fail("output_too_large");

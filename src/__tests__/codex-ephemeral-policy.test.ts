@@ -6,7 +6,7 @@
  */
 import { execFileSync, type spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConfiguredRunError, prepareConfiguredRun } from "../run-autonomous.js";
 import { NOW, SENTINEL_BEARER, makeSnapshot } from "./configured-run-fixture.js";
 import { S_AMBIENT, S_CHATGPT, S_OPENAI, codexLoopback } from "./codex-composition-fixture.js";
+import { MODEL_AUTH_ROUTES } from "../model-auth-contract.js";
 import { GHA_CONTEXT, GHA_IMPLEMENT_WORKFLOWS, GHA_POLICY, ghaGrant, ghaRunStepEnv } from "./gha-handoff-fixture.js";
 import type { InvokeParams } from "../pipeline/types.js";
 
@@ -271,7 +272,7 @@ describe("planning workflow", () => {
   });
 });
 
-/** All three stages Codex-selected: planning (app-server), implementation and review (exec) through the real chain. */
+/** All three stages Codex-selected: planning and review (app-server), implementation (exec) through the real chain. */
 describe("Codex-selected planning and review with the policy present", () => {
   const file = GHA_IMPLEMENT_WORKFLOWS[0];
   const codexSnapshot = (shared: boolean, authMode: "openai-api-key" | "codex-subscription") => {
@@ -284,13 +285,13 @@ describe("Codex-selected planning and review with the policy present", () => {
     return snapshot;
   };
 
-  async function composeCodex(shared: boolean, scripts: Array<{ stdout: string[]; exitCode: number; hang?: boolean }>, authMode: "openai-api-key" | "codex-subscription" = "openai-api-key", policy: unknown = GHA_POLICY) {
+  async function composeCodex(shared: boolean, scripts: Array<{ stdout: string[]; exitCode: number; hang?: boolean }>, authMode: "openai-api-key" | "codex-subscription" = "openai-api-key", policy: unknown = GHA_POLICY, appServerChild?: (log: Child[]) => typeof spawn) {
     const snapshot = codexSnapshot(shared, authMode);
     const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: GHA_CONTEXT, policy, callback: false });
     expect(handoff.bootStatus).toBe(0);
     for (const [k, v] of Object.entries(handoff.runEnv)) vi.stubEnv(k, v);
     const profiles = Object.fromEntries(Object.values(snapshot.profiles).map((p) => [p.id, authMode]));
-    const { transport, checkouts } = codexLoopback(profiles);
+    const { transport, checkouts, routes } = codexLoopback(profiles);
     const log: Child[] = [];
     const driverInputs: unknown[] = [];
     const currentPolicy: { value: "planning" | "review" } = { value: "planning" };
@@ -303,13 +304,14 @@ describe("Codex-selected planning and review with the policy present", () => {
         modelAuthTransport: transport,
         now: () => NOW,
         codexOptions: {
-          spawnImpl: scriptedSpawn(scripts, log, workspace),
+          spawnImpl: appServerChild ? appServerChild(log) : scriptedSpawn(scripts, log, workspace),
           sleepImpl: async () => {},
           termWaitMs: 20,
           killWaitMs: 20,
           fullAccessAdmission: admitted,
           trustedSkillsDir: join(workspace, "skills"),
-          protocolDriver: {
+          // With an app-server child double, the real default drivers are used: only the child's stdio is faked.
+          protocolDriver: appServerChild ? undefined : {
             // The driver's policy follows the stage under test; the real selector only honours a matching policy.
             get policy() {
               return currentPolicy.value;
@@ -342,7 +344,7 @@ describe("Codex-selected planning and review with the policy present", () => {
       if (agentStage === "planning" || agentStage === "review") currentPolicy.value = agentStage;
       return executor.invoke({ prompt: "p", model: "ignored", stage: String(agentStage), agentStage, ...extra });
     };
-    return { invoke, log, checkouts, driverInputs, expireReviewOnce: () => (expireReviewOnce = true) };
+    return { invoke, log, checkouts, routes, finish: () => run!.finish("completed"), driverInputs, expireReviewOnce: () => (expireReviewOnce = true) };
   }
 
   const BYPASS_TOKENS = [FLAG, "danger-full-access", "--dangerously"];
@@ -396,5 +398,114 @@ describe("Codex-selected planning and review with the policy present", () => {
     expect(log[2].args).toContain(FLAG);
     expect(log[3].args.slice(0, 2)).toEqual(["exec", "resume"]);
     expect(log[3].args).toContain(FLAG);
+  });
+
+  // The default real createCodexReviewDriver is used; only the child's stdio (the protocol and provider side) is scripted.
+  describe("real review driver through the real chain (child stdio faked)", () => {
+    type Frame = Record<string, unknown>;
+    const verdict = JSON.stringify({ approved: true, issues: [] });
+
+    /** Scripts a `codex app-server` child. `onFrame` answers each client frame; a bare `kill` closes the child. */
+    function appServer(onFrame: (spawnIndex: number, m: Frame, send: (f: Frame) => void) => void) {
+      return (log: Child[]): typeof spawn =>
+        ((_cmd: string, args: string[], opts: { env: Record<string, string> }) => {
+          const index = log.length;
+          const rec: Child & { frames: Frame[] } = { args, env: opts.env, stdin: "", remote: "", frames: [] };
+          log.push(rec);
+          const proc = new EventEmitter() as unknown as ChildProcessWithoutNullStreams;
+          const stdin = new PassThrough();
+          const stdout = new PassThrough();
+          const stderr = new PassThrough();
+          const send = (f: Frame): void => void stdout.write(`${JSON.stringify(f)}\n`);
+          let buf = "";
+          stdin.on("data", (d: Buffer) => {
+            rec.stdin += d.toString();
+            buf += d.toString();
+            let nl: number;
+            while ((nl = buf.indexOf("\n")) !== -1) {
+              const m = JSON.parse(buf.slice(0, nl)) as Frame;
+              buf = buf.slice(nl + 1);
+              rec.frames.push(m);
+              setImmediate(() => onFrame(index, m, send));
+            }
+          });
+          Object.assign(proc, {
+            stdin, stdout, stderr, pid: undefined, unref: () => {},
+            kill: (sig: NodeJS.Signals) => {
+              setImmediate(() => {
+                stdout.end();
+                stderr.end();
+                proc.emit("close", null, sig);
+              });
+              return true;
+            },
+          });
+          return proc;
+        }) as unknown as typeof spawn;
+    }
+
+    const bound = (p: Frame = {}): Frame => ({ threadId: "th-review", turnId: "tu1", ...p });
+    // Handshake + a read/search/verdict turn; `expire` ends the turn with an HTTP 401 instead.
+    const reviewTurn = (expire: boolean) => (_i: number, m: Frame, send: (f: Frame) => void): void => {
+      if (m.method === "initialize") send({ id: m.id, result: { userAgent: "x" } });
+      else if (m.method === "thread/start" || m.method === "thread/resume") send({ id: m.id, result: { thread: { id: "th-review" } } });
+      else if (m.method === "turn/start") {
+        send({ id: m.id, result: { turn: { id: "tu1" } } });
+        if (expire) send({ method: "turn/completed", params: { threadId: "th-review", turn: { id: "tu1", status: "failed", error: { message: "unauthorized", httpStatusCode: 401 } } } });
+        else send({ id: 100, method: "item/tool/call", params: bound({ callId: "c100", tool: "repo_read", arguments: { path: "sample.txt" } }) });
+      } else if (m.id === 100) {
+        send({ id: 101, method: "item/tool/call", params: bound({ callId: "c101", tool: "repo_search", arguments: { pattern: "needle" } }) });
+      } else if (m.id === 101) {
+        send({ method: "item/completed", params: bound({ item: { type: "agentMessage", id: "m", text: verdict } }) });
+        send({ method: "turn/completed", params: { threadId: "th-review", turn: { id: "tu1", status: "completed" } } });
+      }
+    };
+
+    for (const shared of [false, true]) {
+      it(`reaches the real review policy: two tools, read-only thread, exact verdict, no bypass (${shared ? "shared" : "separate"} profile)`, async () => {
+        writeFileSync(join(workspace, "sample.txt"), "alpha\nneedle here\n");
+        const { invoke, log, checkouts, routes } = await composeCodex(shared, [], "openai-api-key", GHA_POLICY, appServer(reviewTurn(false)));
+        const reviewed = await invoke("review");
+        expect(reviewed.failure).toBeUndefined();
+        expect(reviewed.structuredOutput).toEqual({ approved: true, issues: [] });
+        expect(reviewed.attribution).toMatchObject({ agent: "codex", model: "gpt-review" });
+        const child = log[0] as Child & { frames: Array<Record<string, unknown>> };
+        expect(child.args[0]).toBe("app-server");
+        expect(child.args).toContain("agents.enabled=false");
+        expect(child.args).toContain('model="gpt-review"');
+        for (const t of BYPASS_TOKENS) expect(child.args.join(" ")).not.toContain(t);
+        const thread = child.frames.find((f) => f.method === "thread/start")!.params as { dynamicTools: Array<{ name: string }>; sandbox: string };
+        expect(thread.dynamicTools.map((t) => t.name)).toEqual(["repo_read", "repo_search"]);
+        expect(thread.sandbox).toBe("read-only");
+        // Both host tools were answered by the real handlers: the search result is the search call's own output.
+        const answers = child.frames.filter((f) => f.id === 100 || f.id === 101).map((f) => JSON.stringify(f.result));
+        expect(answers[0]).toContain("needle here");
+        expect(answers[1]).toContain("sample.txt:2: needle here");
+        expect(child.env.CODEX_API_KEY).toBe(S_OPENAI);
+        expect(checkouts.map((c) => c.profileId)).toEqual([shared ? "p-impl" : "p-rev"]);
+        expect(routes()).toEqual([MODEL_AUTH_ROUTES.checkout]);
+      });
+    }
+
+    it("a token expiry resumes the saved review thread through the real driver, still read-only with no bypass", async () => {
+      writeFileSync(join(workspace, "sample.txt"), "alpha\nneedle here\n");
+      const turns = [reviewTurn(true), reviewTurn(false)];
+      const { invoke, log, routes, finish } = await composeCodex(false, [], "codex-subscription", GHA_POLICY, appServer((i, m, send) => turns[Math.min(i, 1)](i, m, send)));
+      const reviewed = await invoke("review");
+      expect(reviewed.failure).toBeUndefined();
+      expect(reviewed.structuredOutput).toEqual({ approved: true, issues: [] });
+      expect(log).toHaveLength(2);
+      await finish();
+      // The selected profile is checked out once for the expired and resumed attempts, then finished by the run.
+      // No checkpoint is recorded because the synthetic child never refreshes the credential.
+      expect(routes()).toEqual([MODEL_AUTH_ROUTES.checkout, MODEL_AUTH_ROUTES.finish]);
+      const resumed = (log[1] as Child & { frames: Array<Record<string, unknown>> }).frames.find((f) => f.method === "thread/resume")!.params as { threadId: string; sandbox: string };
+      expect(resumed.threadId).toBe("th-review");
+      expect(resumed.sandbox).toBe("read-only");
+      for (const c of log) {
+        expect(c.args[0]).toBe("app-server");
+        for (const t of BYPASS_TOKENS) expect(c.args.join(" ")).not.toContain(t);
+      }
+    });
   });
 });
