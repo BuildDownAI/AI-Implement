@@ -2886,6 +2886,38 @@ describe("runAutonomous", () => {
     expect(stats).toContain("**Total cost:** $0.80");
   });
 
+  it("labels the ticket-facing total partial when post-push review or a retry reports no cost (AII-113)", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue({
+        approved: true,
+        iterations: 1,
+        terminationReason: "approved",
+        passes: [{ iteration: 1, implementTurns: 5, implementOutcome: "success", costUsd: 0.20, reviewCostUsd: 0.05, reviewApproved: true }],
+        extraCostUsd: null,
+        extraCostUnreported: 0,
+      }) }],
+      ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/o/r/pull/20", prNumber: 20, branchPushed: true, draft: false }) }],
+      ["post-push-review", { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", costUsd: null }) }],
+    ]);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const stats = readFileSync(join(workspaceDir, "ai-output", "comments", "95-run-stats.md"), "utf-8");
+    expect(stats).toContain("**Total cost:** ≥ $0.25 (partial)");
+  });
+
   it("does not report success when the post-push review rejects an internally approved PR", async () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");

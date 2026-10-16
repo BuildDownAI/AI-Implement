@@ -55,7 +55,7 @@ import { CodexRecoveryRequiredError } from "./pipeline/codex-executor.js";
 import type { ReviewFixMetadataV1, ReviewFixResultMetadataV1 } from "./review-fix-contract.js";
 import { ActivityReporter, type ActivityDetailValue } from "./pipeline/activity-reporter.js";
 import { DEFAULT_RETRY_POLICY, normalizeRetryPolicy, type RetryPolicy } from "./pipeline/retry-backoff.js";
-import { writeRunAutopsy, writeRunStats } from "./run-autopsy.js";
+import { writeRunAutopsy, writeRunStats, type StatsPass } from "./run-autopsy.js";
 import { dependenciesMissing, shouldSkipPostPushReview } from "./pipeline/pipeline-loader.js";
 import { parsePlanningBlock } from "./planning-block.js";
 import type { LocalRunTokenSummary } from "./local/run-result.js";
@@ -212,16 +212,7 @@ export function resolveActivityReporting(
   };
 }
 
-type RunAutopsyPasses = Array<{
-  iteration: number;
-  implementTurns: number | null;
-  implementOutcome: string;
-  implementFailureCode?: string;
-  costUsd: number | null;
-  reviewApproved: boolean | null;
-  attempts?: number;
-  reviewCostUsd?: number | null;
-}>;
+type RunAutopsyPasses = StatsPass[];
 
 export interface RunAutonomousOptions {
   workspaceDir?: string;
@@ -1484,6 +1475,10 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       const postPushReviewCostUsd = postPushReviewRequired && typeof postPushReviewOutputs.costUsd === "number"
         ? postPushReviewOutputs.costUsd
         : null;
+      // Components that ran but reported no cost: a superseded retry attempt without telemetry
+      // (feedback-loop) or a post-push review that ran without a numeric cost.
+      const fbUnreported = typeof fbOutputs.extraCostUnreported === "number" ? fbOutputs.extraCostUnreported : 0;
+      const extraCostUnreported = fbUnreported + (postPushReviewRequired && postPushReviewCostUsd == null ? 1 : 0);
       const extraCostUsd = fbExtraCostUsd == null && postPushReviewCostUsd == null
         ? null
         : (fbExtraCostUsd ?? 0) + (postPushReviewCostUsd ?? 0);
@@ -1493,6 +1488,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         plannedFiles: prUrl ? (planningBlock?.files ?? []) : [],
         filesChanged,
         extraCostUsd,
+        extraCostUnreported,
       });
       const iterations = typeof fbOutputs.iterations === "number" ? fbOutputs.iterations : "?";
       disposition = prUrl

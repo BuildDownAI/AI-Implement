@@ -1,24 +1,113 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_RETRY_POLICY } from "./pipeline/retry-backoff.js";
+import type { InvocationAttributionV1 } from "./pipeline/types.js";
 import { providerUnavailablePhrase, type FailureRecord } from "./pipeline/failure-classification.js";
+
+/** One pass as the stats/autopsy tables see it. `attribution` is the sanitized implement-invocation attribution. */
+export interface StatsPass {
+  iteration: number;
+  implementTurns: number | null;
+  implementOutcome: string;
+  /** Set when the implement invocation itself failed, even if a later review approved. */
+  implementFailureCode?: string;
+  costUsd: number | null;
+  reviewApproved: boolean | null;
+  attempts?: number;
+  reviewCostUsd?: number | null;
+  tokensIn?: number | null;
+  tokensOut?: number | null;
+  attribution?: InvocationAttributionV1;
+}
+
+export const STATS_TABLE_HEADER = "| Pass | Implement outcome | Turns / limit | Implement attempts | Cost | Tokens | Review |";
+export const STATS_TABLE_DIVIDER = "|---|---|---|---|---|---|---|";
+
+interface CostCell {
+  /** Sum of the components that were reported. */
+  known: number;
+  anyKnown: boolean;
+  anyMissing: boolean;
+}
+
+function passCostParts(p: StatsPass): CostCell {
+  const usage = p.attribution?.usage;
+  const implement =
+    p.costUsd ?? (usage?.costStatus === "reported" ? usage.costUsd : null);
+  // A null review cost only counts as a missing component when a review actually ran.
+  const reviewRan = p.reviewApproved != null;
+  const review = p.reviewCostUsd ?? null;
+  return {
+    known: (implement ?? 0) + (review ?? 0),
+    anyKnown: implement != null || review != null,
+    anyMissing: implement == null || (reviewRan && review == null),
+  };
+}
+
+function formatCostCell(c: CostCell): string {
+  if (!c.anyKnown) return "unavailable";
+  return c.anyMissing ? `≥ $${c.known.toFixed(2)} (partial)` : `$${c.known.toFixed(2)}`;
+}
+
+/** Per-pass cost: implement + in-loop review (BAC-27201), never a missing cost rendered as $0.00. */
+export function formatPassCost(p: StatsPass): string {
+  return formatCostCell(passCostParts(p));
+}
+
+/**
+ * Run total across passes plus the out-of-table extra (retry attempts, post-push review).
+ * `extraCostUnreported` counts extra components that ran without a reported cost.
+ */
+export function formatTotalCost(passes: StatsPass[], extraCostUsd?: number | null, extraCostUnreported = 0): string {
+  const total: CostCell = { known: 0, anyKnown: false, anyMissing: extraCostUnreported > 0 };
+  for (const p of passes) {
+    const c = passCostParts(p);
+    total.known += c.known;
+    total.anyKnown ||= c.anyKnown;
+    total.anyMissing ||= c.anyMissing;
+  }
+  if (extraCostUsd != null) {
+    total.known += extraCostUsd;
+    total.anyKnown = true;
+  }
+  return formatCostCell(total);
+}
+
+function formatLimit(limit: NonNullable<InvocationAttributionV1["limit"]>): string {
+  return limit.kind === "timeout_ms" ? `${limit.value / 1000}s timeout` : `${limit.value} max turns`;
+}
+
+/** Turns cell: a Codex pass has no native turn count, so never present one; show the recorded limit instead. */
+export function formatTurnsCell(p: StatsPass): string {
+  const limit = p.attribution?.limit ? `limit ${formatLimit(p.attribution.limit)}` : null;
+  if (p.attribution?.agent === "codex") {
+    return `n/a (native turn count unavailable)${limit ? `; ${limit}` : ""}`;
+  }
+  const turns = p.implementTurns != null ? String(p.implementTurns) : "unknown";
+  return limit ? `${turns} (${limit})` : turns;
+}
+
+/** Input/output token counts; an unavailable count is labelled, never shown as 0. */
+export function formatTokensCell(p: StatsPass): string {
+  const usage = p.attribution?.usage;
+  const tin = p.tokensIn ?? usage?.tokensIn ?? null;
+  const tout = p.tokensOut ?? usage?.tokensOut ?? null;
+  if (tin == null && tout == null) return "unavailable";
+  return `in ${tin ?? "unavailable"} / out ${tout ?? "unavailable"}`;
+}
+
+export function formatPassRow(p: StatsPass): string {
+  const review = p.reviewApproved == null ? "not run" : p.reviewApproved ? "approved" : "rejected";
+  const outcome = p.implementFailureCode ? `${p.implementOutcome} (${p.implementFailureCode})` : p.implementOutcome;
+  return `| ${p.iteration} | ${outcome} | ${formatTurnsCell(p)} | ${p.attempts ?? 1} | ${formatPassCost(p)} | ${formatTokensCell(p)} | ${review} |`;
+}
 
 export interface RunAutopsy {
   issueIdentifier: string;
   terminationReason: string;
   iterations: number;
   finalFeedback: string;
-  passes: Array<{
-    iteration: number;
-    implementTurns: number | null;
-    implementOutcome: string;
-    /** Set when the implement invocation itself failed, even if a later review approved. */
-    implementFailureCode?: string;
-    costUsd: number | null;
-    reviewApproved: boolean | null;
-    attempts?: number;
-    reviewCostUsd?: number | null;
-  }>;
+  passes: StatsPass[];
   postMortem?: string;
   prUrl?: string;
   /** Set only when terminationReason is "reviewer_turns_exhausted" — the configured cap the reviewer hit. */
@@ -31,17 +120,7 @@ export interface RunAutopsy {
 export function formatRunAutopsy(a: RunAutopsy): string {
   const reviewerTurnsExhausted = a.terminationReason === "reviewer_turns_exhausted";
   const providerUnavailable = a.terminationReason === "provider_unavailable";
-  const passRows = a.passes
-    .map((p) => {
-      // Pattern anchor: statsFromFeedbackLoop (src/report-card.ts) — a pass's cost is
-      // implement + in-loop review, not implement alone (BAC-27201).
-      const passCost = p.costUsd != null || p.reviewCostUsd != null ? (p.costUsd ?? 0) + (p.reviewCostUsd ?? 0) : null;
-      const cost = passCost != null ? `$${passCost.toFixed(2)}` : "—";
-      const review = p.reviewApproved == null ? "not run" : p.reviewApproved ? "approved" : "rejected";
-      const outcome = p.implementFailureCode ? `${p.implementOutcome} (${p.implementFailureCode})` : p.implementOutcome;
-      return `| ${p.iteration} | ${outcome} | ${p.implementTurns ?? "?"} | ${p.attempts ?? 1} | ${cost} | ${review} |`;
-    })
-    .join("\n");
+  const passRows = a.passes.map(formatPassRow).join("\n");
   const { stageLabel, codeState } = providerUnavailablePhrase(a.failure?.stage, Boolean(a.prUrl));
   return [
     `## 🔎 Run autopsy — ${a.issueIdentifier}`,
@@ -66,8 +145,8 @@ export function formatRunAutopsy(a: RunAutopsy): string {
     "",
     ...a.finalFeedback.split("\n").map((l) => `> ${l}`),
     "",
-    "| Pass | Implement outcome | Turns | Implement attempts | Cost | Review |",
-    "|---|---|---|---|---|---|",
+    STATS_TABLE_HEADER,
+    STATS_TABLE_DIVIDER,
     passRows,
     ...(a.postMortem ? ["", a.postMortem] : []),
   ].join("\n");
@@ -89,51 +168,32 @@ export function writeRunAutopsy(workspaceDir: string, a: RunAutopsy): void {
 
 export interface RunStats {
   issueIdentifier: string;
-  passes: Array<{
-    iteration: number;
-    implementTurns: number | null;
-    implementOutcome: string;
-    /** Set when the implement invocation itself failed, even if a later review approved. */
-    implementFailureCode?: string;
-    costUsd: number | null;
-    reviewApproved: boolean | null;
-    attempts?: number;
-    reviewCostUsd?: number | null;
-  }>;
+  passes: StatsPass[];
   plannedFiles: string[];
   filesChanged: string[] | null;
   /** Cost outside the per-pass table — superseded implement/review retry attempts plus, when
    *  it ran, the post-push reviewer's own review/fix invocations. Mirrors report-card.ts's
    *  extraCostUsd so this total agrees with the report card for the same run (BAC-27201). */
   extraCostUsd?: number | null;
+  /** Count of out-of-table components (retry attempts, post-push review) that ran without a reported cost. */
+  extraCostUnreported?: number;
 }
 
 /** Markdown stats posted to the ticket for approved runs via the ai-output/comments plumbing. */
 export function formatRunStats(s: RunStats): string {
-  const passRows = s.passes
-    .map((p) => {
-      // Pattern anchor: statsFromFeedbackLoop (src/report-card.ts) — a pass's cost is
-      // implement + in-loop review, not implement alone (BAC-27201).
-      const passCost = p.costUsd != null || p.reviewCostUsd != null ? (p.costUsd ?? 0) + (p.reviewCostUsd ?? 0) : null;
-      const cost = passCost != null ? `$${passCost.toFixed(2)}` : "—";
-      const review = p.reviewApproved == null ? "not run" : p.reviewApproved ? "approved" : "rejected";
-      const outcome = p.implementFailureCode ? `${p.implementOutcome} (${p.implementFailureCode})` : p.implementOutcome;
-      return `| ${p.iteration} | ${outcome} | ${p.implementTurns ?? "?"} | ${p.attempts ?? 1} | ${cost} | ${review} |`;
-    })
-    .join("\n");
-  // Pattern anchor: report-card.ts's derivedStatsForJob — the per-pass sum here is the same
-  // "base" that function derives from feedback-loop's own outputs, and extraCostUsd is the
-  // same addition it makes on top via extraCostUsd(db, jobId) (BAC-27201).
-  const totalCost = s.passes.reduce((sum, p) => sum + (p.costUsd ?? 0) + (p.reviewCostUsd ?? 0), 0) + (s.extraCostUsd ?? 0);
+  const passRows = s.passes.map(formatPassRow).join("\n");
+  // Pattern anchor: report-card.ts's derivedStatsForJob — extraCostUsd is the same addition it makes
+  // on top of the per-pass sum (BAC-27201). A missing component yields a partial/unavailable label.
+  const totalCost = formatTotalCost(s.passes, s.extraCostUsd, s.extraCostUnreported);
 
   const lines: string[] = [
     `## Run stats — ${s.issueIdentifier}`,
     "",
-    "| Pass | Implement outcome | Turns | Implement attempts | Cost | Review |",
-    "|---|---|---|---|---|---|",
+    STATS_TABLE_HEADER,
+    STATS_TABLE_DIVIDER,
     passRows,
     "",
-    `**Total cost:** $${totalCost.toFixed(2)}`,
+    `**Total cost:** ${totalCost}`,
   ];
 
   if (s.plannedFiles.length > 0 && s.filesChanged !== null) {
