@@ -155,7 +155,37 @@ describe("agent configuration and account ownership schema", () => {
         PRIMARY KEY (dispatch_id, audience)
       );
       CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE model_account_profiles (
+        profile_id TEXT PRIMARY KEY,
+        current_profile_revision INTEGER NOT NULL CHECK (current_profile_revision > 0),
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        CHECK (status IN ('active', 'disabled', 'archived'))
+      );
+      CREATE TABLE model_session_generations (
+        profile_id TEXT NOT NULL,
+        owner_generation INTEGER NOT NULL CHECK (owner_generation > 0),
+        checkpoint_sequence INTEGER NOT NULL CHECK (checkpoint_sequence >= 0),
+        encrypted_session_state BLOB NOT NULL,
+        encryption_key_id TEXT NOT NULL,
+        nonce BLOB NOT NULL,
+        auth_tag BLOB NOT NULL,
+        checkpointed_at INTEGER NOT NULL,
+        valid_until_at INTEGER,
+        state_status TEXT NOT NULL DEFAULT 'checkpointed',
+        PRIMARY KEY (profile_id, owner_generation, checkpoint_sequence),
+        CHECK (state_status IN ('checkpointed', 'held', 'expired', 'revoked'))
+      );
     `);
+    old.prepare(`INSERT INTO model_account_profiles
+      (profile_id, current_profile_revision, status, created_at, updated_at)
+      VALUES ('legacy-profile', 3, 'active', 10, 20)`).run();
+    old.prepare(`INSERT INTO model_session_generations
+      (profile_id, owner_generation, checkpoint_sequence, encrypted_session_state, encryption_key_id,
+       nonce, auth_tag, checkpointed_at, valid_until_at, state_status)
+      VALUES ('legacy-profile', 2, 5, ?, 'legacy-key', ?, ?, 30, NULL, 'held')`)
+      .run(Buffer.from([9, 8, 7]), Buffer.from([1, 2]), Buffer.from([3]));
     old.prepare("INSERT INTO dispatched (issue_id, dispatched_at) VALUES (?, ?)").run("legacy-issue", 123);
     old.prepare(`INSERT INTO runner_tokens
       (dispatch_id, audience, issue_id, phase, expires_at, consumed_at, mapping_team_key)
@@ -174,6 +204,7 @@ describe("agent configuration and account ownership schema", () => {
     expect(tableNames).toContain("run_agent_config_snapshots");
     expect(tableNames).toContain("model_profile_reservations");
     expect(tableNames).toContain("model_session_generations");
+    expect(tableNames).toContain("model_protected_secrets");
     expect(tableNames).toContain("model_credential_grants");
     expect(tableNames).toContain("model_credential_grant_profiles");
     expect(tableNames).toContain("model_invocation_attribution");
@@ -183,6 +214,16 @@ describe("agent configuration and account ownership schema", () => {
       .toEqual([{ dispatch_id: "dispatch-1", mapping_team_key: "AII" }]);
     expect(db.prepare("SELECT key, value FROM settings").all())
       .toEqual([{ key: "linear_pickup_label", value: "AI-Implement" }]);
+    expect(db.prepare("SELECT * FROM model_account_profiles").all()).toEqual([
+      { profile_id: "legacy-profile", current_profile_revision: 3, status: "active", created_at: 10, updated_at: 20 },
+    ]);
+    expect(db.prepare("SELECT * FROM model_session_generations").all()).toEqual([{
+      profile_id: "legacy-profile", owner_generation: 2, checkpoint_sequence: 5,
+      encrypted_session_state: Buffer.from([9, 8, 7]), encryption_key_id: "legacy-key",
+      nonce: Buffer.from([1, 2]), auth_tag: Buffer.from([3]), checkpointed_at: 30,
+      valid_until_at: null, state_status: "held",
+    }]);
+    expect((db.prepare("SELECT COUNT(*) AS n FROM model_protected_secrets").get() as { n: number }).n).toBe(0);
     expect((db.prepare("SELECT COUNT(*) AS n FROM stage_agent_config_revisions").get() as { n: number }).n).toBe(0);
   });
 
@@ -308,6 +349,34 @@ describe("agent configuration and account ownership schema", () => {
 });
 
 describe("review-fix attempt schema", () => {
+  it("creates model_protected_secrets with ciphertext-only columns and keeps rows across startups", () => {
+    const db = dedup.getDb();
+    const columns = db.prepare("SELECT name, type, \"notnull\" AS nn, pk FROM pragma_table_info('model_protected_secrets') ORDER BY cid").all();
+    expect(columns).toEqual([
+      { name: "secret_ref", type: "TEXT", nn: 0, pk: 1 },
+      { name: "ciphertext", type: "BLOB", nn: 1, pk: 0 },
+      { name: "nonce", type: "BLOB", nn: 1, pk: 0 },
+      { name: "auth_tag", type: "BLOB", nn: 1, pk: 0 },
+      { name: "encryption_key_id", type: "TEXT", nn: 1, pk: 0 },
+      { name: "updated_at", type: "INTEGER", nn: 1, pk: 0 },
+    ]);
+    db.prepare(`INSERT INTO model_protected_secrets
+      (secret_ref, ciphertext, nonce, auth_tag, encryption_key_id, updated_at)
+      VALUES ('model-account:acct-1', ?, ?, ?, 'key-1', 42)`)
+      .run(Buffer.from([1, 2, 3]), Buffer.from([4, 5]), Buffer.from([6]));
+    expect(() => db.prepare(`INSERT INTO model_protected_secrets
+      (secret_ref, ciphertext, nonce, auth_tag, encryption_key_id, updated_at)
+      VALUES ('model-account:acct-2', NULL, x'00', x'00', 'key-1', 1)`).run()).toThrow();
+
+    dedup.closeDb();
+    const reopened = dedup.getDb();
+    expect(reopened.prepare(`SELECT secret_ref, typeof(ciphertext) AS c, typeof(nonce) AS n,
+      typeof(auth_tag) AS a, encryption_key_id, typeof(updated_at) AS u, updated_at, hex(ciphertext) AS ch
+      FROM model_protected_secrets`).all()).toEqual([
+      { secret_ref: "model-account:acct-1", c: "blob", n: "blob", a: "blob", encryption_key_id: "key-1", u: "integer", updated_at: 42, ch: "010203" },
+    ]);
+  });
+
   it("leaves an existing review_fix_inbox table and its rows in place without altering it", () => {
     const old = new Database(dbPath);
     old.exec(`CREATE TABLE review_fix_inbox (
