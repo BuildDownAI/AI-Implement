@@ -4,6 +4,7 @@ import path from "node:path";
 import fs from "node:fs";
 import type * as DedupModule from "../dedup.js";
 import type * as CliModule from "../model-account-cli.js";
+import { createModelProtectedSecrets } from "../model-protected-secrets.js";
 import { createModelSessionKeyProvider } from "../model-session-keys.js";
 import { createModelSessionStore } from "../model-session-store.js";
 import type { ModelSessionStore } from "../model-session-store.js";
@@ -39,6 +40,7 @@ function deps(stdin: string, env: NodeJS.ProcessEnv = { RUNNER_TOKEN_SECRET: SEC
     hostId: () => cli.orchestratorHostId(),
     planSequence: (id) => cli.latestPlanSequence(id, () => dedup.getDb()),
     getProfile: (id) => (profile && id === PROFILE ? ({ profileId: id, ...profile } as never) : null),
+    secrets: () => createModelProtectedSecrets({ env, db: () => dedup.getDb() }),
     requestRefresh: requestRefresh as never,
     readState: async () => ({ lastOutcome: "refreshed" }),
     fetch: fetchMock as never,
@@ -259,5 +261,80 @@ describe("chatgpt-logout", () => {
     await logoutWith(cases[0]![1]);
     const call = fetchMock.mock.calls.find((c) => String(c[0]).endsWith("/revoke"))!;
     expect(String(call[1].body)).toContain(REFRESH);
+  });
+});
+
+describe("secret-import / secret-delete", () => {
+  const REF = "model-account:k1";
+  const KEY = "SENTINEL-API-KEY-4";
+  const B = { region: "us-east-1", accessKeyId: "SENTINEL-AKID-5", secretAccessKey: "SENTINEL-SAK-6", sessionToken: "SENTINEL-ST-7" };
+  const secrets = () => createModelProtectedSecrets({ env: { RUNNER_TOKEN_SECRET: SECRET }, db: () => dedup.getDb() });
+  const rows = () => (dedup.getDb().prepare("SELECT COUNT(*) AS n FROM model_protected_secrets").get() as { n: number }).n;
+  const leaks = () => {
+    const text = [...out, ...err].join("\n");
+    for (const s of [KEY, ...Object.values(B)]) expect(text).not.toContain(s);
+  };
+
+  it("round-trips an API key, replaces it, and deletes it", async () => {
+    expect(await run(["secret-import", "--ref", REF], `${KEY}\n`)).toBe(0);
+    expect(out).toEqual([`ref=${REF} secret-import ok`]);
+    expect(secrets().resolve(REF)).toBe(KEY);
+    expect(await run(["secret-import", "--ref", REF], "SENTINEL-API-KEY-NEW")).toBe(0);
+    expect(secrets().resolve(REF)).toBe("SENTINEL-API-KEY-NEW");
+    expect(await run(["secret-delete", "--ref", REF])).toBe(0);
+    expect(secrets().resolve(REF)).toBeNull();
+    expect(secrets().open(REF)).toEqual({ ok: false, code: "row_missing" });
+    expect(await run(["secret-delete", "--ref", REF])).toBe(0);
+    leaks();
+  });
+
+  it("imports a Bedrock bundle", async () => {
+    expect(await run(["secret-import", "--ref", REF], JSON.stringify(B))).toBe(0);
+    expect(secrets().resolve(REF)).toEqual(B);
+    leaks();
+  });
+
+  it("refuses bad input without mutating stored values", async () => {
+    await run(["secret-import", "--ref", REF], KEY);
+    out = [];
+    const cases: Array<[string[], string, NodeJS.ProcessEnv?]> = [
+      [["secret-import", "--ref", "FOO"], KEY],
+      [["secret-import", "--ref", "model-account:"], KEY],
+      [["secret-import", "--ref", "model-account:UP"], KEY],
+      [["secret-import", "--ref", `model-account:${"a".repeat(200)}`], KEY],
+      [["secret-import", "--ref", "model-account:a/b"], KEY],
+      [["secret-import", "--ref", REF], ""],
+      [["secret-import", "--ref", REF], JSON.stringify({ region: B.region, accessKeyId: B.accessKeyId })],
+      [["secret-import", "--ref", REF], JSON.stringify({ ...B, extra: "SENTINEL-EXTRA" })],
+      [["secret-import", "--ref", REF], KEY, {}],
+      [["secret-import", "--ref", REF], KEY, { RUNNER_TOKEN_SECRET: "" }],
+    ];
+    for (const [argv, stdin, env] of cases) {
+      expect(await run(argv, stdin, env)).not.toBe(0);
+    }
+    expect(rows()).toBe(1);
+    expect(secrets().resolve(REF)).toBe(KEY);
+    leaks();
+  });
+
+  it("rejects values on argv with usage that echoes nothing", async () => {
+    for (const argv of [["secret-import", "--ref", REF, KEY], ["secret-import", "--ref", REF, "--value", KEY], ["secret-import"], ["secret-delete", REF]]) {
+      err = [];
+      expect(await run(argv, KEY)).toBe(2);
+      expect(err.join("\n")).toContain("usage:");
+      expect(err.join("\n")).not.toContain(KEY);
+    }
+    expect(rows()).toBe(0);
+  });
+
+  it("prints only fixed text when the store throws", async () => {
+    const d = deps(KEY);
+    d.secrets = () => ({ ...secrets(), write: () => ({ ok: false, code: "write_failed" }), delete: () => ({ ok: false, code: "write_failed" }) });
+    expect(await cli.main(["secret-import", "--ref", REF], d)).toBe(1);
+    expect(await cli.main(["secret-delete", "--ref", REF], d)).toBe(1);
+    leaks();
+    d.secrets = () => { throw new Error(`boom ${KEY}`); };
+    expect(await cli.main(["secret-import", "--ref", REF], d)).toBe(1);
+    leaks();
   });
 });
