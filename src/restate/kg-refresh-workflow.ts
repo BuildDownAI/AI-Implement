@@ -727,7 +727,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       }
 
       /** The merge, branch delete and four rail gates for a snapshot PR the run may land: the success path and the accepted decision both end here. */
-      async function mergeAndRunGates(report: KgRefreshReportBody): Promise<RefreshOutcome> {
+      async function mergeAndRunGates(report: KgRefreshReportBody, afterAccept = false): Promise<RefreshOutcome> {
         // Success: a fresh snapshot landed. Merge it, then run the four rail gates one at a time.
         // mergeSnapshotPr resolves "blocked"/"conflict" rather than throwing (the same contract
         // src/kg-refresh.ts's pre-migration caller checks explicitly) — a merge conflict or an
@@ -735,7 +735,9 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         // retry forever. Neither step has staged or swapped anything yet, so `revertRail` does
         // not apply to either failure.
         // The commit point (AII-1296): the start of the merge is the one point of no return. A Restate
-        // cancel that arrived earlier (during the accept note, say) stops the run here.
+        // cancel that arrived earlier (during the accept note, say) stops the run here. The exception is
+        // a schedule's replace (superseded_by_schedule) after a person's accept: the accept came first
+        // and a person's decision wins, so the run merges.
         await checkCancelled();
         heldPr = report.snapshotPr !== undefined ? { number: report.snapshotPr, branch: report.snapshotBranch } : undefined;
         // The first of this write and an operator cancel wins; the loser sees the other's value.
@@ -745,7 +747,11 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           if (restate.internal.isSuspendedError(err)) throw err;
           if (!(err instanceof restate.TerminalError && err.code === 409)) throw err; // "promise was already completed"
         }
-        if ((await ctx.promise<string>("cancel").get()) !== KG_REFRESH_COMMITTED) return cleanupCancelled("signal");
+        const cancelValue = await ctx.promise<string>("cancel").get();
+        const supersededByScheduleAfterAccept = afterAccept && cancelValue === KG_REFRESH_SUPERSEDED_REASON;
+        if (cancelValue !== KG_REFRESH_COMMITTED && !supersededByScheduleAfterAccept) {
+          return cleanupCancelled("signal", cancelValue === KG_REFRESH_SUPERSEDED_REASON ? KG_REFRESH_SUPERSEDED_REASON : undefined);
+        }
         heldPr = undefined; // merging: a cancel past here must not close the PR
         ctx.set("step", "merge");
         try {
@@ -976,7 +982,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
               if (restate.internal.isSuspendedError(err)) throw err;
               ctx.console.error(`[KgRefresh] baseline accept note failed for PR #${heldPrNumber}: ${err instanceof Error ? err.message : String(err)}`);
             }
-            return await mergeAndRunGates(report);
+            return await mergeAndRunGates(report, true);
           }
           ctx.console.log(`[KgRefresh] decided cancel by ${decided.actor}: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
           return cleanupCancelled("signal");
