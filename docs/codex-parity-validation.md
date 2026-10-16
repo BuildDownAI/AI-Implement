@@ -98,7 +98,7 @@ Codex / openai / gpt-6-luna / chatgpt-plan-test / codex-subscription, outcome su
 
 - Snapshot IDs were observed directly from sanitized authenticated run records, not inferred.
 - Implementation used native implementation and native restricted Codex review, one iteration; current-head native review
-  5552376399. PR [BuildDownAI/codex-sandbox-repo#6](https://linear.app/eudoxus/review/test-3-add-a-version-option-to-the-word-count-cli-gha-codex-smoke-f37de3483039)
+  5552376399. PR [BuildDownAI/codex-sandbox-repo#6](https://github.com/BuildDownAI/codex-sandbox-repo/pull/6)
   merged as `3c6e25a7ea1260b090a0249da924c9362970dd9f` at 18:57:12Z; TEST-3 is Done.
 - Tokens are per record, not a whole-pipeline aggregate: planning 49881 in / 1069 out; implementation 101322 in / 1687 out.
   Cost is null/unavailable, not zero.
