@@ -15,6 +15,13 @@ import { redactSecrets } from "./codex-stream.js";
  */
 
 export const PLANNING_TOOL_NAMES = ["repo_read", "repo_search", "comments_write"] as const;
+/** Review is read-only: no comments_write and no other write, command, delegate, MCP or network tool. */
+export const REVIEW_TOOL_NAMES = ["repo_read", "repo_search"] as const;
+export type CodexProtocolPolicy = "planning" | "review";
+const POLICY_TOOLS: Record<CodexProtocolPolicy, readonly string[]> = {
+  planning: PLANNING_TOOL_NAMES,
+  review: REVIEW_TOOL_NAMES,
+};
 type PlanningToolName = (typeof PLANNING_TOOL_NAMES)[number];
 
 export const PLANNING_LIMITS = {
@@ -108,6 +115,8 @@ export interface CodexTransportRunInput {
 
 /** Typed seam consumed only inside `CodexExecutor.runChild`. */
 export interface CodexProtocolDriver {
+  /** Which restricted tool policy this driver enforces; the executor refuses a driver whose policy does not match the stage. */
+  readonly policy?: CodexProtocolPolicy;
   run(input: CodexTransportRunInput): Promise<CodexTransportResult>;
 }
 
@@ -329,8 +338,9 @@ export function runPlanningTool(
   ctx: HostContext,
   tool: string,
   args: unknown,
+  policy: CodexProtocolPolicy = "planning",
 ): { ok: boolean; text: string } {
-  if (!Object.prototype.hasOwnProperty.call(HANDLERS, tool) || !isRecord(args)) return { ok: false, text: "tool call rejected" };
+  if (!POLICY_TOOLS[policy].includes(tool) || !Object.prototype.hasOwnProperty.call(HANDLERS, tool) || !isRecord(args)) return { ok: false, text: "tool call rejected" };
   try {
     return { ok: true, text: HANDLERS[tool as PlanningToolName](ctx, args) };
   } catch (err) {
@@ -384,10 +394,15 @@ function count(v: unknown): number | null {
 
 /** Creates the planning driver. Stateless: each `run` owns its own session. */
 export function createCodexPlanningDriver(): CodexProtocolDriver {
-  return { run: runSession };
+  return { policy: "planning", run: (input) => runSession(input, "planning") };
 }
 
-function runSession(input: CodexTransportRunInput): Promise<CodexTransportResult> {
+/** Creates the restricted review driver: same lifecycle and handlers, but only repo_read and repo_search. */
+export function createCodexReviewDriver(): CodexProtocolDriver {
+  return { policy: "review", run: (input) => runSession(input, "review") };
+}
+
+function runSession(input: CodexTransportRunInput, policy: CodexProtocolPolicy): Promise<CodexTransportResult> {
   return new Promise<CodexTransportResult>((resolveRun) => {
     const { io } = input;
     let ctx: HostContext;
@@ -494,7 +509,7 @@ function runSession(input: CodexTransportRunInput): Promise<CodexTransportResult
           // A ChatGPT plan thread must persist so it can resume after its access token expires.
           ...(plan ? {} : { ephemeral: true }),
           // Top-level and experimental: the pinned CLI accepts it here and rejects `config.dynamicTools`.
-          dynamicTools: PLANNING_DYNAMIC_TOOLS,
+          dynamicTools: PLANNING_DYNAMIC_TOOLS.filter((t) => POLICY_TOOLS[policy].includes(t.name)),
         });
       } else if (kind === "thread") {
         const thread = msg.result.thread;
@@ -540,7 +555,7 @@ function runSession(input: CodexTransportRunInput): Promise<CodexTransportResult
     };
 
     const onServerRequest = (id: unknown, method: string, params: unknown): void => {
-      if (method === "item/tool/call" && isRecord(params) && typeof params.tool === "string" && Object.prototype.hasOwnProperty.call(HANDLERS, params.tool)) {
+      if (method === "item/tool/call" && isRecord(params) && typeof params.tool === "string" && POLICY_TOOLS[policy].includes(params.tool)) {
         if (!initialized || threadId === null || params.threadId !== threadId || typeof params.callId !== "string") {
           deny(id);
           return fail("denied_request", true);
@@ -561,7 +576,7 @@ function runSession(input: CodexTransportRunInput): Promise<CodexTransportResult
           deny(id);
           return fail("tool_limit", true);
         }
-        const out = runPlanningTool(ctx, params.tool, params.arguments);
+        const out = runPlanningTool(ctx, params.tool, params.arguments, policy);
         if (trace.length < 200) trace.push(`${params.tool}${out.ok ? "" : " (denied)"}`);
         send({ id, result: { success: out.ok, contentItems: [{ type: "inputText", text: input.redact(out.text) }] } });
         return;
@@ -582,6 +597,10 @@ function runSession(input: CodexTransportRunInput): Promise<CodexTransportResult
         const item = params.item;
         if (!isRecord(item) || typeof item.type !== "string") return fail("malformed_message", true);
         if (!SAFE_ITEM_TYPES.has(item.type)) return fail("unexpected_item", true, ITEM_TYPE_LABEL.test(item.type) ? item.type : "?");
+        // Structured question metadata (the async request_user_input path) is a user-input channel, not a message.
+        if (item.type === "agentMessage" && item.questions !== undefined && item.questions !== null && !(Array.isArray(item.questions) && item.questions.length === 0)) {
+          return fail("denied_request", true);
+        }
         if (method === "item/completed" && item.type === "agentMessage") {
           if (typeof item.text !== "string") return fail("malformed_message", true);
           if (item.text.length > PLANNING_LIMITS.messageChars) return fail("output_too_large");

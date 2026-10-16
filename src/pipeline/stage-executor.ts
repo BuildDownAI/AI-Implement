@@ -12,7 +12,7 @@ import { CodexExecutor, CodexRecoveryRequiredError, type CodexExecutorOptions } 
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { CODEX_SKILLS_SUBDIR } from "./steps/install-skills.js";
-import { createCodexPlanningDriver } from "./codex-planning-adapter.js";
+import { createCodexPlanningDriver, createCodexReviewDriver } from "./codex-planning-adapter.js";
 import {
   sanitizeAttribution,
   type InvocationAttributionV1,
@@ -108,20 +108,30 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
         undefined,
         options.activityReporting,
       ));
-  // Planning has its own Codex executor and argv: the native app-server path (read-only sandbox, shell and
-  // unified exec disabled, repo_read/repo_search/comments_write host tools confined to ai-output/comments).
-  // Implementation and review keep the `codex exec` path with their own sandbox. Cached per profile and kind.
+  // Planning and review have their own Codex executors and argv: the native app-server path (read-only sandbox,
+  // shell and unified exec disabled). Planning's host tools are repo_read/repo_search/comments_write (confined to
+  // ai-output/comments); review's are repo_read/repo_search only. Implementation keeps the `codex exec` path with
+  // its own sandbox. Cached per profile and kind, so no stage reuses another's transport or policy.
   const getCodex = (profileId: string, stage: StageName): LLMExecutor => {
-    const key = `${stage === "planning" ? "planning" : "exec"}:${profileId}`;
+    const kind = stage === "planning" || stage === "review" ? stage : "exec";
+    const key = `${kind}:${profileId}`;
     let ex = codexByProfile.get(key);
     if (!ex) {
       ex =
         options.createCodex?.(profileId) ??
         new CodexExecutor(options.workspaceDir, {
           ...options.codexOptions,
-          ...(stage === "planning"
+          ...(kind !== "exec"
             ? {
-                protocolDriver: options.codexOptions?.protocolDriver ?? createCodexPlanningDriver(),
+                // A supplied driver is honoured only when its policy matches the stage.
+                protocolDriver:
+                  options.codexOptions?.protocolDriver &&
+                  (options.codexOptions.protocolDriver.policy === kind ||
+                    (kind === "planning" && options.codexOptions.protocolDriver.policy === undefined))
+                    ? options.codexOptions.protocolDriver
+                    : kind === "planning"
+                      ? createCodexPlanningDriver()
+                      : createCodexReviewDriver(),
                 trustedSkillsDir: options.codexOptions?.trustedSkillsDir ?? join(homedir(), CODEX_SKILLS_SUBDIR),
                 implementationFullAccess: undefined,
               }

@@ -277,13 +277,27 @@ describe("real CodexExecutor behind the selector", () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     const log: Spawned[] = [];
     const auth = checkpointAuth();
-    const ex = make(auth, codexSpawn({}, log));
+    const inputs: Array<{ prompt: string; model: string }> = [];
+    const run = vi.fn(async (input: { io: { stdin: { end(): void } }; prompt: string; model: string }) => {
+      inputs.push({ prompt: input.prompt, model: input.model });
+      input.io.stdin.end();
+      return { result: { ...ok, stdout: "review" }, sawUnsafe: false, stopReason: null as null };
+    });
+    const ex = createStageExecutor({
+      workspaceDir: "/tmp",
+      legacy: fakeExec(),
+      snapshot: execSnapshot,
+      auth,
+      allowRepositoryWrites: true,
+      codexOptions: { spawnImpl: codexSpawn({}, log), sleepImpl: async () => {}, termWaitMs: 20, killWaitMs: 20, protocolDriver: { policy: "review", run } as never },
+    });
     const res = await ex.invoke({ ...base, prompt: "review this", agentStage: "review", stage: "implement", maxTurns: 7, model: "repo-config-model" });
     expect(log).toHaveLength(1);
-    expect(log[0].args[log[0].args.indexOf("--model") + 1]).toBe("gpt-rev");
-    expect(log[0].args.join(" ")).not.toMatch(/repo-config-model|caller-model|max-turns/);
-    expect(log[0].stdin).toBe("review this");
-    expect(log[0].stdin).not.toMatch(/turn/i);
+    // Review runs on the restricted app-server transport (AII-1438), never `exec`.
+    expect(log[0].args[0]).toBe("app-server");
+    expect(log[0].args).toContain('model="gpt-rev"');
+    expect(log[0].args.join(" ")).not.toMatch(/repo-config-model|caller-model|max-turns|bypass|dangerously/);
+    expect(inputs).toEqual([{ prompt: "review this", model: "gpt-rev" }]);
     expect(auth.invoke).toHaveBeenCalledTimes(1);
     expect(auth.events).toEqual(["invoke:p-rev", "checkpoint"]);
     expect(res.attribution).toMatchObject({ agent: "codex", model: "gpt-rev", limit: { kind: "timeout_ms", value: 3000 } });
@@ -357,14 +371,24 @@ describe("real CodexExecutor behind the selector", () => {
       codexOptions: { spawnImpl: execSpawn, sleepImpl: async () => {}, termWaitMs: 20, killWaitMs: 20 },
     });
     await exec.invoke({ ...base, agentStage: "implementation" });
-    await exec.invoke({ ...base, agentStage: "review" });
+    const reviewEx = createStageExecutor({
+      workspaceDir: "/tmp",
+      legacy: fakeExec(),
+      snapshot: driverSnapshot,
+      auth: checkpointAuth(),
+      allowRepositoryWrites: true,
+      codexOptions: { spawnImpl: execSpawn, sleepImpl: async () => {}, termWaitMs: 20, killWaitMs: 20 },
+    });
+    // The review executor builds its own review driver (no injected driver): feed it an immediately-closed child.
+    await reviewEx.invoke({ ...base, agentStage: "review" }).catch(() => undefined);
     const implArgs = log[1].args;
     const reviewArgs = log[2].args;
     expect(planArgs[0]).toBe("app-server");
     expect(planArgs).toContain('sandbox_mode="read-only"');
     expect(planArgs).toContain("features.shell_tool=false");
     expect(implArgs).toContain("workspace-write");
-    expect(reviewArgs).toContain("read-only");
+    expect(reviewArgs[0]).toBe("app-server");
+    expect(reviewArgs).toContain('sandbox_mode="read-only"');
     for (const args of [planArgs, implArgs, reviewArgs]) {
       expect(args.join(" ")).not.toMatch(/bypass|dangerously|--yolo|full-access|--max-turns|--allowedTools/);
     }
@@ -489,14 +513,36 @@ describe("held profiles across stages", () => {
 });
 
 describe("trustedSkillsDir wiring", () => {
-  it("is passed to the planning Codex executor only", async () => {
+  it("is passed to the planning and review Codex executors, not implementation", async () => {
     codexCtorOptions.length = 0;
-    const ex = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot, auth: fakeAuth() });
-    for (const agentStage of ["planning", "review"] as const) {
+    const allCodex: ResolvedAgentSnapshotV1 = {
+      ...snapshot,
+      stages: { ...snapshot.stages, planning: { ...snapshot.stages.review }, implementation: { ...snapshot.stages.review } },
+      profiles: { ...snapshot.profiles, planning: { ...snapshot.profiles.review }, implementation: { ...snapshot.profiles.review } },
+    };
+    const ex = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot: allCodex, auth: fakeAuth() });
+    for (const agentStage of ["planning", "review", "implementation"] as const) {
       await ex.invoke({ ...base, agentStage }).catch(() => undefined);
     }
-    expect(codexCtorOptions).toHaveLength(2);
+    expect(codexCtorOptions).toHaveLength(3);
     expect(codexCtorOptions[0].trustedSkillsDir).toBe(join(homedir(), CODEX_SKILLS_SUBDIR));
-    expect(codexCtorOptions[1].trustedSkillsDir).toBeUndefined();
+    expect(codexCtorOptions[1].trustedSkillsDir).toBe(join(homedir(), CODEX_SKILLS_SUBDIR));
+    expect(codexCtorOptions[2].trustedSkillsDir).toBeUndefined();
+  });
+
+  it("partitions executors per stage: each gets only its own driver policy, implementation none", async () => {
+    codexCtorOptions.length = 0;
+    const sameProfile: ResolvedAgentSnapshotV1 = {
+      ...snapshot,
+      stages: { ...snapshot.stages, planning: { ...snapshot.stages.review }, implementation: { ...snapshot.stages.review } },
+      profiles: { ...snapshot.profiles, planning: { ...snapshot.profiles.review }, implementation: { ...snapshot.profiles.review } },
+    };
+    const ex = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot: sameProfile, auth: fakeAuth(), implementationFullAccess: true });
+    for (const agentStage of ["planning", "review", "implementation", "review"] as const) {
+      await ex.invoke({ ...base, agentStage }).catch(() => undefined);
+    }
+    expect(codexCtorOptions).toHaveLength(3);
+    expect(codexCtorOptions.map((o) => (o as { protocolDriver?: { policy?: string } }).protocolDriver?.policy)).toEqual(["planning", "review", undefined]);
+    expect(codexCtorOptions.map((o) => o.implementationFullAccess)).toEqual([undefined, undefined, true]);
   });
 });

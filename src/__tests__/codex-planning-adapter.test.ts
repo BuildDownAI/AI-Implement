@@ -12,6 +12,8 @@ import {
   PLANNING_DYNAMIC_TOOLS,
   PLANNING_LIMITS,
   createCodexPlanningDriver,
+  createCodexReviewDriver,
+  REVIEW_TOOL_NAMES,
   createHostContext,
   runPlanningTool,
   type CodexTransportResult,
@@ -168,8 +170,8 @@ class FakeServer {
   }
 }
 
-function drive(server: FakeServer, redact: (s: string) => string = (s) => s, modelProvider?: string, resumeThreadId?: string): Promise<CodexTransportResult> {
-  return createCodexPlanningDriver().run({
+function drive(server: FakeServer, redact: (s: string) => string = (s) => s, modelProvider?: string, resumeThreadId?: string, driver = createCodexPlanningDriver()): Promise<CodexTransportResult> {
+  return driver.run({
     io: { stdin: server.stdin, stdout: server.stdout, halt: server.halt.signal },
     prompt: "plan it",
     model: "gpt-synthetic",
@@ -750,6 +752,185 @@ describe("planning protocol driver", () => {
   });
 });
 
+describe("review protocol driver (AII-1438)", () => {
+  const driveReview = (server: FakeServer, modelProvider?: string, resumeThreadId?: string) =>
+    drive(server, undefined, modelProvider, resumeThreadId, createCodexReviewDriver());
+  const verdict = JSON.stringify({ approved: true, issues: [] });
+
+  it("declares a review policy and only repo_read and repo_search on the actual thread/start", async () => {
+    expect(createCodexReviewDriver().policy).toBe("review");
+    expect(createCodexPlanningDriver().policy).toBe("planning");
+    expect(REVIEW_TOOL_NAMES).toEqual(["repo_read", "repo_search"]);
+    const server = new FakeServer((m, s) => {
+      if (handshake(m, s)) return;
+      if (m.method === "turn/start") {
+        ack(m, s);
+        s.send(agentMessage(verdict));
+        s.send(completed());
+      }
+    });
+    const out = await driveReview(server);
+    const thread = server.received.find((m) => m.method === "thread/start")!.params as Msg;
+    expect((thread.dynamicTools as Array<{ name: string }>).map((t) => t.name)).toEqual(["repo_read", "repo_search"]);
+    expect(thread.sandbox).toBe("read-only");
+    expect(thread.approvalPolicy).toBe("never");
+    // Exact verdict JSON is returned as structured output; prose or malformed output is never converted into one.
+    expect(out.result.structuredOutput).toEqual({ approved: true, issues: [] });
+    expect(out.result.exitCode).toBe(0);
+  });
+
+  it("serves repo_read and repo_search, and rejects comments_write with no effect", async () => {
+    writeFileSync(join(ws, "a.txt"), "needle line");
+    const calls = [
+      { tool: "repo_read", arguments: { path: "a.txt" } },
+      { tool: "repo_search", arguments: { pattern: "needle" } },
+      { tool: "comments_write", arguments: { name: "plan.md", content: "pwn" } },
+    ];
+    let step = 0;
+    const server = new FakeServer((m, s) => {
+      if (handshake(m, s)) return;
+      if (m.method === "turn/start") {
+        ack(m, s);
+        s.send(toolCall(100, calls[0]));
+      } else if (m.id !== undefined && !m.method && (m.id as number) >= 100) {
+        step++;
+        if (step < calls.length) s.send(toolCall(100 + step, calls[step]));
+        else completeTurn(s);
+      }
+    });
+    const out = await driveReview(server);
+    expect(out.sawUnsafe).toBe(true);
+    expect(out.result.exitCode).toBe(1);
+    expect(out.result.stderr).toContain("denied_request");
+    expect(out.result.telemetry?.toolTrace ?? []).toEqual([]);
+    await new Promise((r) => setImmediate(r));
+    const replies = server.received.filter((m) => typeof m.id === "number" && (m.id as number) >= 100);
+    expect(replies.map((r) => (r.result as Msg | undefined)?.success ?? (r.error ? "error" : undefined))).toEqual([true, true, "error"]);
+    expect(existsSync(join(ws, "ai-output"))).toBe(false);
+  });
+
+  it.each([
+    ["comments_write", "item/tool/call", bound({ callId: "c", tool: "comments_write", arguments: { name: "x.md", content: "pwn" } })],
+    ["shell tool", "item/tool/call", bound({ callId: "c", tool: "shell", arguments: { command: "touch pwned" } })],
+    ["edit tool", "item/tool/call", bound({ callId: "c", tool: "apply_patch", arguments: {} })],
+    ["delegate tool", "item/tool/call", bound({ callId: "c", tool: "spawn_agent", arguments: {} })],
+    ["network tool", "item/tool/call", bound({ callId: "c", tool: "web_search", arguments: { query: "x" } })],
+    ["command approval", "item/commandExecution/requestApproval", { command: "touch pwned" }],
+    ["file change approval", "item/fileChange/requestApproval", { itemId: "i" }],
+    ["user input", "item/tool/requestUserInput", { questions: [] }],
+    ["MCP elicitation", "mcpServer/elicitation/request", { serverName: "s", message: "m" }],
+    ["permissions approval", "item/permissions/requestApproval", { permissions: {} }],
+    ["unknown method", "future/request", {}],
+  ])("rejects %s with an error, no effect, and fails unsafe", async (_n, method, params) => {
+    const server = new FakeServer((m, s) => {
+      if (handshake(m, s)) return;
+      if (m.method === "turn/start") {
+        ack(m, s);
+        s.send({ id: 77, method, params });
+      }
+    });
+    const out = await driveReview(server);
+    expect(out.sawUnsafe).toBe(true);
+    expect(out.result.exitCode).toBe(1);
+    expect(out.result.terminalStatus?.isError).toBe(true);
+    expect(out.result.structuredOutput).toBeUndefined();
+    await new Promise((r) => setImmediate(r));
+    const reply = server.received.find((m) => m.id === 77);
+    expect(reply?.error).toBeDefined();
+    expect(reply?.result).toBeUndefined();
+    expect(existsSync(join(ws, "pwned"))).toBe(false);
+    expect(existsSync(join(ws, "ai-output"))).toBe(false);
+  });
+
+  it.each(["commandExecution", "fileChange", "mcpToolCall", "webSearch", "collabAgentToolCall"])("fails closed on an unexpected %s item", async (type) => {
+    const server = new FakeServer((m, s) => {
+      if (handshake(m, s)) return;
+      if (m.method === "turn/start") {
+        ack(m, s);
+        s.send({ method: "item/started", params: bound({ item: { type, id: "i" } }) });
+      }
+    });
+    const out = await driveReview(server);
+    expect(out.sawUnsafe).toBe(true);
+    expect(out.result.stderr?.endsWith(`unexpected_item: ${type}`)).toBe(true);
+  });
+
+  describe("structured asynchronous question messages (request_user_input_async)", () => {
+    const questions = [{ title: "Must remain unavailable", options: ["One", "Two"] }];
+    for (const method of ["item/started", "item/completed"]) {
+      for (const bad of [questions, "free text", { title: "x" }, 0]) {
+        it(`${method} with questions=${JSON.stringify(bad)} fails closed and never yields a verdict`, async () => {
+          const server = new FakeServer((m, s) => {
+            if (handshake(m, s)) return;
+            if (m.method === "turn/start") {
+              ack(m, s);
+              s.send({ method, params: bound({ item: { type: "agentMessage", id: "m", text: verdict, phase: "final_answer", questions: bad } }) });
+              s.send(agentMessage(verdict));
+              s.send(completed());
+            }
+          });
+          const out = await driveReview(server);
+          expect(out.sawUnsafe).toBe(true);
+          expect(out.result.exitCode).not.toBe(0);
+          expect(out.result.stderr).toContain("denied_request");
+          expect(out.result.structuredOutput).toBeUndefined();
+        });
+      }
+    }
+
+    for (const empty of [undefined, null, []]) {
+      it(`keeps a normal message with questions=${JSON.stringify(empty)}`, async () => {
+        const server = new FakeServer((m, s) => {
+          if (handshake(m, s)) return;
+          if (m.method === "turn/start") {
+            ack(m, s);
+            s.send(agentMessage(verdict, { item: { type: "agentMessage", id: "m", text: verdict, phase: "final_answer", questions: empty } }));
+            s.send(completed());
+          }
+        });
+        const out = await driveReview(server);
+        expect(out.result.structuredOutput).toEqual({ approved: true, issues: [] });
+      });
+    }
+  });
+
+  it("does not turn prose into a verdict", async () => {
+    const server = new FakeServer((m, s) => {
+      if (handshake(m, s)) return;
+      if (m.method === "turn/start") {
+        ack(m, s);
+        s.send(agentMessage("looks good to me, approved"));
+        s.send(completed());
+      }
+    });
+    const out = await driveReview(server);
+    expect(out.result.structuredOutput).toBeUndefined();
+  });
+
+  it("keeps a resumed review thread restricted: thread/resume stays read-only and the tool gate is unchanged", async () => {
+    const server = new FakeServer((m, s) => {
+      if (m.method === "initialize") s.send({ id: m.id, result: { userAgent: "x" } });
+      else if (m.method === "thread/resume") s.send({ id: m.id, result: { thread: { id: "th1" } } });
+      else if (m.method === "turn/start") {
+        ack(m, s);
+        s.send(toolCall(88, { tool: "comments_write", arguments: { name: "x.md", content: "pwn" } }));
+      }
+    });
+    const out = await driveReview(server, "chatgpt_plan", "th1");
+    const resume = server.received.find((m) => m.method === "thread/resume")!.params as Msg;
+    expect(resume).toMatchObject({ threadId: "th1", sandbox: "read-only", approvalPolicy: "never" });
+    expect(out.sawUnsafe).toBe(true);
+    expect(existsSync(join(ws, "ai-output"))).toBe(false);
+  });
+
+  it("runPlanningTool gates by policy: review refuses comments_write, planning keeps it", () => {
+    const ctx = createHostContext(ws, []);
+    expect(runPlanningTool(ctx, "comments_write", { name: "a.md", content: "x" }, "review").ok).toBe(false);
+    expect(existsSync(join(ws, "ai-output"))).toBe(false);
+    expect(runPlanningTool(ctx, "comments_write", { name: "a.md", content: "x" }, "planning").ok).toBe(true);
+  });
+});
+
 // ---------------------------------------------------------------------------------------------
 // Pinned-binary proof (AII-1001): the real codex app-server against a synthetic loopback Responses
 // provider, driven through CodexExecutor. Skipped unless the pinned CLI is on PATH; no network, fake auth only.
@@ -774,19 +955,43 @@ const GENERIC_TOOL_RE = /shell|exec|apply_patch|patch|web_search|image|mcp|brows
 interface PlannedCall {
   name: string;
   args: Record<string, unknown>;
+  /**
+   * Emit this exact call whether or not the inventory advertises it, the way a misbehaving model would:
+   * `exec` is the configured model's `functions.exec` custom tool (`input` is its JavaScript); `function` is a
+   * namespaced function_call. Without it the call resolves against the top-level tool names, and an
+   * unadvertised name is answered with prose (the older, weaker behaviour).
+   */
+  wire?: { kind: "exec"; input: string } | { kind: "function"; namespace?: string };
 }
 interface Provider {
   url: string;
   bodies: string[];
   toolNames: string[];
+  /** Every tool of the first request: top-level names plus `input[type=additional_tools]` as `namespace.name`. */
+  inventory: string[];
   outputs: string[];
   close(): Promise<void>;
 }
 
 const sse = (events: Array<Record<string, unknown>>): string => events.map((e) => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join("");
 
-async function startProvider(plan: PlannedCall[]): Promise<Provider> {
-  const state = { bodies: [] as string[], toolNames: [] as string[], outputs: [] as string[] };
+/** Flattens the provider-request inventory: top-level tools and the configured model's additional_tools namespaces. */
+function inventoryOf(body: { tools?: Array<Record<string, unknown>>; input?: unknown }): string[] {
+  const out: string[] = [];
+  const walk = (tools: unknown, prefix: string): void => {
+    for (const t of Array.isArray(tools) ? (tools as Array<Record<string, unknown>>) : []) {
+      const name = String(t.name ?? "");
+      if (t.type === "namespace") walk(t.tools, `${prefix}${name}.`);
+      else out.push(`${prefix}${name}`);
+    }
+  };
+  walk(body.tools, "");
+  for (const i of Array.isArray(body.input) ? (body.input as Array<Record<string, unknown>>) : []) if (i.type === "additional_tools") walk(i.tools, "");
+  return out;
+}
+
+async function startProvider(plan: PlannedCall[], finalText = "plan complete", opts: { unauthorizedUntilResume?: boolean } = {}): Promise<Provider> {
+  const state = { bodies: [] as string[], toolNames: [] as string[], inventory: [] as string[], outputs: [] as string[], };
   const server: Server = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
@@ -797,6 +1002,10 @@ async function startProvider(plan: PlannedCall[]): Promise<Provider> {
         return;
       }
       state.bodies.push(raw);
+      if (opts.unauthorizedUntilResume && !raw.includes("a credential expired")) {
+        res.writeHead(401, { "content-type": "application/json" }).end(JSON.stringify({ error: { message: "token expired", type: "invalid_request_error" } }));
+        return;
+      }
       let body: { tools?: Array<{ name?: string }>; input?: unknown };
       try {
         body = JSON.parse(raw);
@@ -806,15 +1015,28 @@ async function startProvider(plan: PlannedCall[]): Promise<Provider> {
       }
       const names = (body.tools ?? []).map((t) => String(t.name ?? ""));
       if (state.toolNames.length === 0) state.toolNames = names;
+      if (state.inventory.length === 0) state.inventory = inventoryOf(body as { tools?: Array<Record<string, unknown>>; input?: unknown });
       const items = Array.isArray(body.input) ? (body.input as Array<Record<string, unknown>>) : [];
-      const outs = items.filter((i) => i.type === "function_call_output");
+      const outs = items.filter((i) => i.type === "function_call_output" || i.type === "custom_tool_call_output");
       state.outputs = outs.map((o) => (typeof o.output === "string" ? o.output : JSON.stringify(o.output)));
       const step = outs.length;
       const respId = `resp_${state.bodies.length}`;
       const events: Array<Record<string, unknown>> = [{ type: "response.created", response: { id: respId } }];
       const next = plan[step];
       const resolved = next ? names.find((n) => n === next.name || n.endsWith(next.name)) : undefined;
-      if (next && resolved) {
+      if (next?.wire?.kind === "exec") {
+        events.push({
+          type: "response.output_item.done",
+          output_index: 0,
+          item: { type: "custom_tool_call", call_id: `call_${step}`, namespace: "functions", name: "exec", input: next.wire.input },
+        });
+      } else if (next?.wire?.kind === "function") {
+        events.push({
+          type: "response.output_item.done",
+          output_index: 0,
+          item: { type: "function_call", call_id: `call_${step}`, ...(next.wire.namespace ? { namespace: next.wire.namespace } : {}), name: next.name, arguments: JSON.stringify(next.args) },
+        });
+      } else if (next && resolved) {
         events.push({
           type: "response.output_item.done",
           output_index: 0,
@@ -824,7 +1046,7 @@ async function startProvider(plan: PlannedCall[]): Promise<Provider> {
         events.push({
           type: "response.output_item.done",
           output_index: 0,
-          item: { type: "message", role: "assistant", id: `msg_${step}`, content: [{ type: "output_text", text: next ? `missing tool ${next.name}` : "plan complete" }] },
+          item: { type: "message", role: "assistant", id: `msg_${step}`, content: [{ type: "output_text", text: next ? `missing tool ${next.name}` : finalText }] },
         });
       }
       events.push({
@@ -844,6 +1066,9 @@ async function startProvider(plan: PlannedCall[]): Promise<Provider> {
     },
     get toolNames() {
       return state.toolNames;
+    },
+    get inventory() {
+      return state.inventory;
     },
     get outputs() {
       return state.outputs;
@@ -877,8 +1102,9 @@ describe.skipIf(!pinnedCodex && !pinnedRequired)("pinned codex app-server (synth
     rmSync(userHome, { recursive: true, force: true });
   });
 
-  async function runPinned(plan: PlannedCall[]) {
-    const provider = await startProvider(plan);
+  async function runPinned(plan: PlannedCall[], opts: { model?: string; review?: boolean; finalText?: string; jsonSchema?: Record<string, unknown>; resumeAfter401?: boolean } = {}) {
+    const provider = await startProvider(plan, opts.finalText, { unauthorizedUntilResume: opts.resumeAfter401 });
+    const argvLog: string[][] = [];
     const auth: Pick<ModelAuthClient, "invoke"> = {
       async invoke<T>(_id: string, run: (i: ModelInvocation) => Promise<T>): Promise<T> {
         const env: Record<string, string> = {
@@ -890,13 +1116,28 @@ describe.skipIf(!pinnedCodex && !pinnedRequired)("pinned codex app-server (synth
           OPENAI_BASE_URL: provider.url,
           SYNTHETIC_ENV_CANARY: FAKE_ENV,
         };
-        return run({ env, strippedKeys: [] });
+        // A ChatGPT plan token: every request before the resume prompt answers 401, so the executor resumes the saved thread.
+        return opts.resumeAfter401 ? run({ env: { ...env, CHATGPT_PLAN_ACCESS_TOKEN: FAKE_KEY }, strippedKeys: [], codexProvider: "chatgpt-plan" }) : run({ env, strippedKeys: [] });
       },
     };
-    const executor = new CodexExecutor(ws, { auth, profileId: "p1", allowRepositoryWrites: true, protocolDriver: createCodexPlanningDriver() });
+    // The plan provider's base URL is fixed to api.openai.com; only that endpoint is redirected to the loopback.
+    const redirect = (args: string[]): string[] => args.map((a) => (a.includes(".base_url=") ? `model_providers.chatgpt_plan.base_url=${JSON.stringify(provider.url)}` : a));
+    const spawnImpl = ((cmd: string, args: string[], o: Parameters<typeof spawn>[2]) => {
+      const real = opts.resumeAfter401 ? redirect(args) : args;
+      argvLog.push(real);
+      return spawn(cmd, real, o);
+    }) as typeof spawn;
+    const executor = new CodexExecutor(ws, { auth, profileId: "p1", allowRepositoryWrites: true, spawnImpl, protocolDriver: opts.review ? createCodexReviewDriver() : createCodexPlanningDriver() });
     try {
-      const result = await executor.invoke({ prompt: "Write a plan.", model: "gpt-synthetic", stage: "plan", invocationTimeoutMs: 90_000 });
-      return { result, provider, bodies: [...provider.bodies], toolNames: [...provider.toolNames], outputs: [...provider.outputs] };
+      const result = await executor.invoke({
+        prompt: "Write a plan.",
+        model: opts.model ?? "gpt-synthetic",
+        stage: "plan",
+        invocationTimeoutMs: 90_000,
+        ...(opts.review ? { agentStage: "review" as const } : {}),
+        ...(opts.jsonSchema ? { jsonSchema: opts.jsonSchema } : {}),
+      });
+      return { result, provider, argvLog, bodies: [...provider.bodies], toolNames: [...provider.toolNames], inventory: [...provider.inventory], outputs: [...provider.outputs] };
     } finally {
       await provider.close();
     }
@@ -942,6 +1183,163 @@ describe.skipIf(!pinnedCodex && !pinnedRequired)("pinned codex app-server (synth
     const all = bodies.join("\n");
     for (const canary of [FAKE_KEY, FAKE_AUTH, FAKE_ENV, AWS_CANARY, "git-private-canary"]) expect(all).not.toContain(canary);
   }, 120_000);
+
+  // SYNTHETIC native evidence (pinned CLI + no-account loopback Responses provider), not a live TEST review.
+  it("review: reads, searches and returns a schema verdict through the restricted transport with no command startup (synthetic)", async () => {
+    seedWorkspace();
+    const verdict = JSON.stringify({ approved: true, issues: [] });
+    const schema = { type: "object", properties: { approved: { type: "boolean" }, issues: { type: "array", items: { type: "string" } } }, required: ["approved", "issues"], additionalProperties: false };
+    const { result, bodies, toolNames, outputs } = await runPinned(
+      [
+        { name: "repo_read", args: { path: "a.txt" } },
+        { name: "repo_search", args: { pattern: "needle" } },
+        // These tools are not advertised: the synthetic model's attempt resolves to no callable tool.
+        { name: "comments_write", args: { name: "plan.md", content: "pwn" } },
+      ],
+      { review: true, finalText: verdict, jsonSchema: schema },
+    );
+    // The provider answers the unadvertised comments_write attempt with prose, which ends the exchange; the
+    // verdict path is covered by the second run below. Here: the inventory and the two allowed calls.
+    expect(outputs[0]).toContain("needle here");
+    // The search call's own output (path:line: text), not a substring of the earlier read.
+    expect(outputs[1]).toBe("a.txt:2: needle here");
+    const advertised = toolNames.filter((n) => /repo_(read|search)$/.test(n));
+    expect(advertised.length).toBe(2);
+    expect(toolNames.some((n) => n.endsWith("comments_write"))).toBe(false);
+    expect(toolNames.filter((n) => GENERIC_TOOL_RE.test(n))).toEqual([]);
+    // Observed provider-request inventory on the pinned CLI (synthetic): the two host tools plus the built-in
+    // request_user_input descriptor, which the CLI cannot omit (see the denial test below). Nothing else.
+    expect([...toolNames].sort()).toEqual(["repo_read", "repo_search", "request_user_input"]);
+    expect(existsSync(join(ws, "ai-output"))).toBe(false);
+    expect(result.stdout).toBe("missing tool comments_write");
+    expect(bodies.join("\n")).not.toContain(FAKE_AUTH);
+  }, 120_000);
+
+  it("review: the schema verdict comes back as structured output (synthetic)", async () => {
+    seedWorkspace();
+    const verdict = JSON.stringify({ approved: false, issues: ["needs a test"] });
+    const schema = { type: "object", properties: { approved: { type: "boolean" }, issues: { type: "array", items: { type: "string" } } }, required: ["approved", "issues"], additionalProperties: false };
+    const { result, bodies } = await runPinned([{ name: "repo_read", args: { path: "a.txt" } }], { review: true, finalText: verdict, jsonSchema: schema });
+    expect(result.failure).toBeUndefined();
+    expect(result.structuredOutput).toEqual({ approved: false, issues: ["needs a test"] });
+    expect(bodies.some((b) => b.includes('"additionalProperties":false') && b.includes("approved"))).toBe(true);
+  }, 120_000);
+
+  it("review: the fallback model's request_user_input is refused by the CLI in Default mode; command/write denial is proven by the gpt-6-luna tests (synthetic)", async () => {
+    seedWorkspace();
+    const sentinel = join(outside, "pwned");
+    const { result, toolNames, outputs } = await runPinned(
+      [
+        // request_user_input is a CLI built-in that cannot be omitted from the inventory; Default mode refuses it.
+        { name: "request_user_input", args: { questions: [{ id: "q1", header: "Q", question: "Proceed?", options: [{ label: "yes", description: "yes" }] }] } },
+      ],
+      { review: true },
+    );
+    // The CLI itself answers the call as unavailable in Default mode: no server request reaches the driver.
+    expect(outputs[0]).toContain("request_user_input is unavailable in Default mode");
+    expect(result.stderr).not.toContain("denied_request");
+    expect(existsSync(sentinel)).toBe(false);
+    expect(existsSync(join(ws, "ai-output"))).toBe(false);
+    expect(toolNames.filter((n) => GENERIC_TOOL_RE.test(n))).toEqual([]);
+    expect(outputs.every((o) => !o.includes("pwned"))).toBe(true);
+  }, 120_000);
+
+  // SYNTHETIC native evidence for the configured review model (`gpt-6-luna`): its tools arrive in
+  // `input[type=additional_tools]` as a `functions.exec` JavaScript wrapper (custom_tool_call) over nested tools.
+  // The no-account loopback provider emits each attempted call whether or not it is advertised, so every refusal
+  // below is the CLI's or the driver's, not the provider substituting prose. Not a live review.
+  describe("configured review model gpt-6-luna (synthetic)", () => {
+    const LUNA = "gpt-6-luna";
+    const schema = { type: "object", properties: { approved: { type: "boolean" }, issues: { type: "array", items: { type: "string" } } }, required: ["approved", "issues"], additionalProperties: false };
+    const approval = JSON.stringify({ approved: true, issues: [] });
+    const exec = (input: string, name = "exec"): PlannedCall => ({ name, args: {}, wire: { kind: "exec", input } });
+    const luna = (plan: PlannedCall[], extra: { finalText?: string; resumeAfter401?: boolean } = {}) => runPinned(plan, { review: true, model: LUNA, jsonSchema: schema, finalText: approval, ...extra });
+
+    it("inventory: two repo tools behind functions.exec plus inert descriptors; read, search and the exact schema verdict work", async () => {
+      seedWorkspace();
+      const { result, inventory, outputs } = await luna([
+        exec('text(await tools.repo_read({path:"a.txt"}));'),
+        exec('text(await tools.repo_search({pattern:"needle"}));'),
+      ]);
+      expect(result.failure).toBeUndefined();
+      expect(result.structuredOutput).toEqual({ approved: true, issues: [] });
+      expect(outputs[0]).toContain("needle here");
+      expect(outputs[1]).toContain("a.txt:2: needle here");
+      // Accurate inventory: the configured model sees a wrapper (functions.exec), the clock, wait, the two
+      // user-input functions and a native apply_patch next to the repo tools. Documented, not claimed absent.
+      expect(inventory).toEqual(expect.arrayContaining(["functions.exec", "functions.wait", "functions.request_user_input", "functions.request_user_input_async", "clock.sleep"]));
+      expect(inventory.some((n) => /repo_read|repo_search/.test(n))).toBe(false); // nested behind exec, not top-level
+      expect(inventory.filter((n) => /comments_write|spawn|collaboration|shell|exec_command|unified/.test(n))).toEqual([]);
+      expect(existsSync(join(ws, "ai-output"))).toBe(false);
+    }, 120_000);
+
+    // Each attempted call is emitted by the provider although it is not (or only partly) advertised.
+    const refusals: Array<[string, PlannedCall, RegExp]> = [
+      ["command execution", exec('text(await tools.exec_command({cmd:"touch pwned"}));'), /exec_command|not a function|undefined/i],
+      ["network", exec('text(await fetch("http://127.0.0.1:9/"));'), /fetch|not defined|not a function|undefined/i],
+      ["an MCP tool", exec("text(await tools.mcp__ologs__get_profile({}));"), /mcp__ologs|not a function|undefined/i],
+      ["comments_write under review", exec('text(await tools.comments_write({name:"x.md",content:"pwn"}));'), /comments_write|not a function|undefined/i],
+      ["a native patch", exec('text(await tools.apply_patch("*** Begin Patch\\n*** Add File: pwned.txt\\n+pwned\\n*** End Patch"));'), /patch rejected: writing is blocked by read-only sandbox/],
+    ];
+    for (const [label, call, expected] of refusals) {
+      it(`refuses ${label} with no effect`, async () => {
+        seedWorkspace();
+        const { result, outputs } = await luna([call]);
+        expect(outputs.join("\n")).toMatch(expected);
+        expect(outputs.join("\n")).not.toContain("approved");
+        expect(existsSync(join(ws, "pwned"))).toBe(false);
+        expect(existsSync(join(ws, "pwned.txt"))).toBe(false);
+        expect(existsSync(join(ws, "x.md"))).toBe(false);
+        expect(existsSync(join(ws, "ai-output"))).toBe(false);
+        expect(result.stderr ?? "").not.toMatch(/sandbox.*(start|exec)/i);
+      }, 120_000);
+    }
+
+    it("a forced collaboration.spawn_agent is unsupported (agents.enabled=false) and delegates nothing", async () => {
+      seedWorkspace();
+      const { result, argvLog, outputs, inventory } = await luna([{ name: "spawn_agent", args: { message: "delegate" }, wire: { kind: "function", namespace: "collaboration" } }]);
+      expect(argvLog[0]).toEqual(expect.arrayContaining(["agents.enabled=false", "features.multi_agent=false"]));
+      expect(inventory.some((n) => /collaboration/.test(n))).toBe(false);
+      expect(outputs[0]).toContain("unsupported call: collaborationspawn_agent");
+      expect(result.stderr ?? "").not.toContain("unexpected_item");
+    }, 120_000);
+
+    it("a forced request_user_input_async cannot reach an approval: the question message fails closed", async () => {
+      seedWorkspace();
+      const { result } = await luna(
+        [{ name: "request_user_input_async", args: { questions: [{ title: "Must remain unavailable", options: ["One", "Two"] }] }, wire: { kind: "function", namespace: "functions" } }],
+        { finalText: approval },
+      );
+      expect(result.structuredOutput).toBeUndefined();
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("denied_request");
+    }, 120_000);
+
+    it("a persistent thread resumed after a 401 stays read-only with the same inventory and refusals (restricted resume)", async () => {
+      seedWorkspace();
+      const { result, argvLog, inventory, outputs } = await luna(
+        [
+          exec('text(await tools.repo_read({path:"a.txt"}));'),
+          exec('text(await tools.apply_patch("*** Begin Patch\\n*** Add File: pwned.txt\\n+pwned\\n*** End Patch"));'),
+          { name: "spawn_agent", args: { message: "delegate" }, wire: { kind: "function", namespace: "collaboration" } },
+        ],
+        { resumeAfter401: true },
+      );
+      // Two app-server children: the first kept hitting 401, the second resumed the saved thread. Same restricted argv, no bypass.
+      expect(argvLog.length).toBe(2);
+      for (const a of argvLog) {
+        expect(a[0]).toBe("app-server");
+        expect(a).toEqual(expect.arrayContaining(['sandbox_mode="read-only"', "agents.enabled=false", "features.unified_exec=false"]));
+        expect(a.join(" ")).not.toContain("dangerously");
+      }
+      expect(inventory).toContain("functions.exec");
+      expect(outputs[0]).toContain("needle here");
+      expect(outputs[1]).toContain("patch rejected: writing is blocked by read-only sandbox");
+      expect(outputs[2]).toContain("unsupported call: collaborationspawn_agent");
+      expect(existsSync(join(ws, "pwned.txt"))).toBe(false);
+      expect(result.structuredOutput).toEqual({ approved: true, issues: [] });
+    }, 180_000);
+  });
 
   it("ignores hostile repo and user config and rules: same model, provider and tool inventory, nothing executed", async () => {
     seedWorkspace();
