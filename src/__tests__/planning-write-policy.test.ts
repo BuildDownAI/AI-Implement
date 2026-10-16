@@ -9,6 +9,7 @@ import {
   setupPlanningWritePolicy,
   buildPlanningToolArgs,
 } from "../planning-write-policy.js";
+import { buildRestrictedToolArgs, READ_ONLY_BUILTIN_TOOLS } from "../pipeline/steps/read-only-tools.js";
 
 describe("planning write policy", () => {
   let ws: string;
@@ -99,15 +100,33 @@ describe("planning write policy", () => {
     expect(decidePlanningWrite({ file_path: "ai-output/comments/a.md" }, join(ws, "missing-workspace")).allow).toBe(false);
   });
 
-  it("builds tool args that keep Write but deny shell, MCP and delegates", () => {
+  it("builds tool args that keep Write and allow skills but deny shell, MCP and delegates", () => {
     const args = buildPlanningToolArgs();
     expect(args[args.indexOf("--tools") + 1]).toBe("Read,Glob,Grep,Write");
     expect(args).toContain("--strict-mcp-config");
-    expect(args).toContain("--disable-slash-commands");
+    expect(args).not.toContain("--disable-slash-commands");
     const denied = args[args.indexOf("--disallowed-tools") + 1].split(",");
-    expect(denied).toEqual(expect.arrayContaining(["Bash", "Edit", "NotebookEdit", "Task", "Agent", "Skill", "mcp__*"]));
+    expect(denied).toEqual(expect.arrayContaining(["Bash", "Edit", "NotebookEdit", "Task", "Agent", "mcp__*"]));
+    expect(denied).not.toContain("Skill");
     expect(denied).not.toContain("Write");
     expect(args).not.toContain("--allowedTools");
+  });
+
+  it("keeps the trusted settings and empty setting sources on the planning policy", () => {
+    const policy = setupPlanningWritePolicy(ws);
+    try {
+      expect(policy.args[policy.args.indexOf("--setting-sources") + 1]).toBe("");
+      expect(policy.args).toContain("--settings");
+      expect(policy.args).not.toContain("--disable-slash-commands");
+    } finally {
+      policy.cleanup();
+    }
+  });
+
+  it("leaves review and post-mortem restricted args denying Skill", () => {
+    const args = buildRestrictedToolArgs(READ_ONLY_BUILTIN_TOOLS);
+    expect(args).toContain("--disable-slash-commands");
+    expect(args[args.indexOf("--disallowed-tools") + 1].split(",")).toContain("Skill");
   });
 
   describe("generated guard script", () => {

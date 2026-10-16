@@ -36,13 +36,13 @@ Each setting below is documented in the same shape — what it gives a run, the 
 
 | Setting | `implementation` | `gap-analysis` | `planning` | `kg-refresh` |
 |---------|------------------|----------------|------------|--------------|
-| Skills repository | applied | applied | installed (not yet usable) | ignored |
+| Skills repository | applied | applied | installed and usable | ignored |
 | Dependency token scope | applied | applied | not sent | applied |
 | Reference repositories | applied | applied | not sent | not sent |
 
 Gap-analysis shares the implementation entry module — it is an implementation run with `prNumber` set — so the two columns will agree for any setting added here.
 
-**Planning installs skills but applies nothing else on this page.** `run-planning.js` invokes the agent directly and runs no pipeline, so dependency token scope and reference repositories are guarded out of the planning envelope at dispatch. Both planning entry points do install the selected skills before the planning executor starts. They cannot be used yet: Claude planning denies the `Skill` tool and passes `--disable-slash-commands` (AII-1169 changes that policy), and the Codex app-server runs with an empty view `HOME` (AII-1163 changes that). Treat neither as a bug to fix in passing.
+**Planning installs skills but applies nothing else on this page.** `run-planning.js` invokes the agent directly and runs no pipeline, so dependency token scope and reference repositories are guarded out of the planning envelope at dispatch. Both planning entry points do install the selected skills before the planning executor starts. Planning may load these trusted project skills: Claude planning allows the `Skill` tool and omits `--disable-slash-commands` (AII-1169), and the Codex planning view receives the skill files (AII-1163). Everything else stays denied for Claude planning: `Bash`, `Edit`, `NotebookEdit`, `Task`, `Agent` and `mcp__*`, and `Write` is limited to `ai-output/comments/` by the write guard. A skill's `allowed-tools` front matter cannot widen that set. Review and post-mortem sessions still deny `Skill`.
 
 **kg-refresh runs its own pipeline** (`pipelines/kg-refresh.yml`), which includes `dependency-auth` but neither `install-skills` nor `reference-repos`. Reference repositories are additionally guarded out of its envelope, so that phase never receives the field at all. Its dependency token is not optional in the way the table suggests: a later step depends on it, and `docs/issueless-runs.md` §5 covers that rail.
 
@@ -160,7 +160,7 @@ A missing repository never fails the run or changes its classification. That is 
 
 - **Dependency token scope is silently inert on a legacy-contract repository.** The setting saves, displays, and does nothing. The admin interface does not distinguish, so the only way to know is the target repository's workflow contract.
 - **Reference repositories are also inert on legacy-contract repositories.** The field is envelope-only; no dispatch input and no environment variable carry it, so the step never receives entries on a legacy workflow.
-- **An installed skill is not necessarily a usable one.** Planning installs skills, but Claude planning denies the `Skill` tool and Codex planning sees an empty `HOME`; the phase table above says what a phase can use.
+- **An installed skill is not necessarily a usable one.** Planning may load the trusted project skills, but read-only review and post-mortem sessions still deny the `Skill` tool; the phase table above says what a phase can use.
 - **Both steps report success while doing nothing.** `install-skills` returns zero installed on every failure path, and `dependency-auth` returns `acquired: false`. Neither fails its step, so the `[skills]` and `[dependency-auth]` log lines are the only evidence a setting took effect.
 - **A skills repository can overwrite a skill the image ships.** The copy is forced and keyed on directory name, with no warning on collision.
 - **A missing reference repository does not fail the run.** The step records a cause and continues. The agent receives a prompt telling it the repository is unavailable; whether that makes the output wrong is the issue author's problem to anticipate, not the pipeline's to prevent.

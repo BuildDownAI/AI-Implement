@@ -15,7 +15,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
-import { buildRestrictedToolArgs, READ_ONLY_BUILTIN_TOOLS } from "./pipeline/steps/read-only-tools.js";
+import { READ_ONLY_BUILTIN_TOOLS, RESTRICTED_DISALLOWED_TOOLS } from "./pipeline/steps/read-only-tools.js";
 
 export interface PlanningWriteDecision {
   allow: boolean;
@@ -123,9 +123,16 @@ export interface PlanningWritePolicy {
   cleanup: () => void;
 }
 
-/** Tool args only (no trusted settings): Read/Glob/Grep plus Write. */
+/**
+ * Tool args only (no trusted settings): Read/Glob/Grep plus Write, and the trusted
+ * project skills. Unlike `buildRestrictedToolArgs`, `Skill` is not denied and
+ * `--disable-slash-commands` is omitted so planning can load skills. The deny list is
+ * derived from `RESTRICTED_DISALLOWED_TOOLS`, so a tool added there stays denied.
+ */
 export function buildPlanningToolArgs(): string[] {
-  return buildRestrictedToolArgs([...READ_ONLY_BUILTIN_TOOLS, "Write"]);
+  const builtinTools = [...READ_ONLY_BUILTIN_TOOLS, "Write"];
+  const denied = RESTRICTED_DISALLOWED_TOOLS.filter((t) => t !== "Write" && t !== "Skill");
+  return ["--tools", builtinTools.join(","), "--strict-mcp-config", "--disallowed-tools", denied.join(",")];
 }
 
 /**
