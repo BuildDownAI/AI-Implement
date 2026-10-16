@@ -245,7 +245,7 @@ The first container-job step of `claude-implement.yml` and `claude-plan.yml` (id
 
 "Print dispatch inputs" no longer dumps the decoded envelope. It prints the diagnostic projection: known envelope keys only, `credentials` replaced by `credentialFields` (names only), and `agentConfig` replaced by the fixed marker `"<omitted>"` — the nested snapshot is validated by the bootstrap but never copied raw into logs.
 
-A workflow advertises private-envelope support with the static comment `# ai-implement-capability: private-run-config-v1` — not a `workflow_dispatch` input. `resolveWorkflowCapabilities` sets `supportsPrivateRunConfig` only for an envelope workflow carrying it; missing or unprobed means `false`. It is unrelated to the `stage-agent-config-v1` capability, which a later slice installs.
+A workflow advertises private-envelope support with the static comment `# ai-implement-capability: private-run-config-v1` — not a `workflow_dispatch` input. `resolveWorkflowCapabilities` sets `supportsPrivateRunConfig` only for an envelope workflow carrying it; missing or unprobed means `false`. It is independent of the `stage-agent-config-v1` capability. The canonical implementation and planning templates (`workflows/claude-implement.yml`, `workflows/claude-plan.yml`) now carry both markers. Carrying them does not activate a target: that still requires an authorized template sync to the target repo and a capable trusted image. No sync has occurred.
 
 `buildEnvelopeDispatchInputs` takes `privateTransport` (AII-983) and an optional extra `credentials`; see below. The two-request optional-input retry never strips `run_config` or the tokens, and resends `run_config` byte-identical.
 

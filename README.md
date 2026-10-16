@@ -143,6 +143,17 @@ Use a dedicated independently signed-in testing profile. A failed or cancelled
 run retains ownership when refreshed state or container termination cannot be
 confirmed; do not delete its lock to start a competing run.
 
+### Codex and hosted model accounts
+
+On a running orchestrator, configure model accounts under **Models & providers** in the admin UI
+(`/admin`), and opt a project in or let it inherit the defaults from its **Agents** settings in the
+Projects drawer. Operator procedures, including the protected CLI steps, are in
+[docs/model-account-operations.md](docs/model-account-operations.md). Never paste raw browser
+credentials anywhere. Existing Codex local-login users re-sign in through `chatgpt-plan-login`; the
+orchestrator does not read or copy an `auth.json`. Support is provisional: see
+[docs/codex-parity-validation.md](docs/codex-parity-validation.md) for what is verified and what is
+still pending.
+
 ### Exercise planning and implementation separately
 
 Use `--phase` to choose the test surface:
