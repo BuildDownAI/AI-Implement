@@ -121,7 +121,7 @@ describe("GHA workflow shims", () => {
     it(`${f} advertises the static private-envelope marker without a dispatch input`, () => {
       const yaml = readFileSync(f, "utf-8");
       expect(yaml).toMatch(/^# ai-implement-capability: private-run-config-v1$/m);
-      expect(yaml).not.toMatch(/stage-agent-config/);
+      expect(yaml).toMatch(/^# ai-implement-capability: stage-agent-config-v1$/m);
       const doc = parse(yaml) as any;
       for (const name of Object.keys(doc.on.workflow_dispatch.inputs)) {
         expect(name).not.toMatch(/private|capab|marker/i);

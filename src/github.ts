@@ -528,6 +528,21 @@ export function buildEnvelopeDispatchInputs(
  * `runner_phase_extra` or `extra_runner_callback_url` must not be mistaken for a match on
  * `runner_phase` or `runner_callback_url`.
  */
+/**
+ * True when the encoded envelope carries a managed stage snapshot or model-auth grant. Raw
+ * parse only (no validation, nothing logged): an unparseable value is treated as legacy.
+ */
+function isManagedRunConfig(encoded: string): boolean {
+  try {
+    const parsed = JSON.parse(Buffer.from(encoded, "base64").toString("utf-8")) as Record<string, unknown> | null;
+    if (parsed === null || typeof parsed !== "object") return false;
+    const creds = parsed.credentials as Record<string, unknown> | null | undefined;
+    return parsed.agentConfig !== undefined || (creds !== null && typeof creds === "object" && creds.modelAuthGrant !== undefined);
+  } catch {
+    return false;
+  }
+}
+
 export async function postWorkflowDispatch(opts: {
   token: string;
   owner: string;
@@ -543,6 +558,8 @@ export async function postWorkflowDispatch(opts: {
   if (first.success) return first;
   if (first.status !== 422 || !/unexpected inputs/i.test(first.error ?? "")) return first;
   if (!opts.inputs.run_config) return first;
+  // A managed run never degrades to a legacy shape: a rejected input is a hard failure.
+  if (isManagedRunConfig(opts.inputs.run_config)) return first;
 
   const rejectedNames = extractUnexpectedInputNames(first.error ?? "");
   const namesToStrip = ENVELOPE_OPTIONAL_INPUTS.filter(
