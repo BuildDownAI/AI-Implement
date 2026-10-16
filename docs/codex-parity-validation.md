@@ -45,9 +45,11 @@ the other feature children is recorded on their own PRs; only claims verified th
 | [#1180](https://github.com/BuildDownAI/AI-Implement/pull/1180) | AII-967 |
 | [#1181](https://github.com/BuildDownAI/AI-Implement/pull/1181) | AII-970 |
 
-Integrated baseline `b66a202333152272dcda4dc15c387e1ed20d001d`: `env -u RUNNER_TOKEN_SECRET npm test` passed 319 suites,
-10192 tests (4 skipped); typecheck, build and 985 targeted tests passed; the local Restate suite passed 900 tests in 22
-suites, and three CI passes passed 900 each. This is source and synthetic evidence, not paid or live acceptance.
+Integrated baseline: the feature lane after #1175 merged as commit `db554e08752d99954d0024ae522397826f4bb492`
+(its tree is `b66a202333152272dcda4dc15c387e1ed20d001d`). The build-down operator reported 319 suites / 10192 unit tests
+(4 skipped), 985 targeted tests, typecheck/build, and 900 local Restate tests in 22 suites (900 on each of three CI runs
+of the PR head `bdc8d26a`). These figures are operator-reported; this pipeline did not re-run them at that commit. They
+are source and synthetic evidence, not paid or live acceptance.
 
 Deployment and target workflow sync have not occurred.
 
@@ -70,15 +72,22 @@ docker run --rm --network none --user "$(id -u):$(id -g)" --cap-drop ALL \
   -v "$PWD/package.json:/app/package.json:ro" \
   -v "$PWD/scripts/planning-skills-proof.mjs:/proof.mjs:ro" \
   -e PLANNING_PROOF_DIST=/app/dist \
-  sha256:d8a31b74e210140540300c5a5141b215c2aebe6bcbe55a9b77548be9cc3cf323 node /proof.mjs
+  --entrypoint node \
+  sha256:d8a31b74e210140540300c5a5141b215c2aebe6bcbe55a9b77548be9cc3cf323 /proof.mjs
 ```
 
 The mounted `dist` must be built from the same commit as the script. If the image keeps its own dependencies, drop the
 `node_modules` and `package.json` mounts. If the image needs a writable `HOME`, none is required: the script sets its own.
 
-**Status: pending native validation in the pinned image.** The pipeline did not run Docker. The script ran once against
-a local Claude 2.1.284 on the host (all assertions passed); that is not the pinned-image run. Build-down must execute the
-command above before merge and record the output.
+The image's default entrypoint is a session bootstrap that fails on missing runner credentials, so `--entrypoint node`
+is required and only `/proof.mjs` follows the image.
+
+**Status: independently validated by build-down on `aa9fe17302fbe010c6dc6cae897ae18954054230`** (PR #1182 comment
+6210317200) in the recorded image, after `npm run build`: Claude 2.1.284, exit 0, not timed out, eight synthetic loopback
+requests; trusted Skill load, denied Bash/Edit/outside Write, allowed comments Write, repository skill/command
+discovery/call/hook exclusion, and all five source-validation cases passed. Network none, unprivileged UID/GID,
+capabilities dropped, no-new-privileges, read-only root, owned tmpfs; no live credentials or paid calls. The pipeline
+itself did not run Docker. Paid/live and Codex-on-Restate acceptance remain pending.
 
 ## Limited historical evidence
 

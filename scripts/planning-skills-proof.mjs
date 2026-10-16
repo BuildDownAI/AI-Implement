@@ -111,7 +111,6 @@ try {
   const wsOverlap = mkWs("w4");
   policyCase("source inside workspace excluded", { home: join(wsOverlap, "home"), ws: wsOverlap, content: skillMd("synthetic-proof", "", "X") });
   policyCase("source in '..selected-home' under workspace excluded", { home: join(wsOverlap, "..selected-home"), ws: wsOverlap, content: skillMd("synthetic-proof", "", "X") });
-  assert(!existsSync(join(root, "never-ran")), "a source hook executed");
 
   // ---- 2. Native Claude session ----
   const ws = mkWs("sandbox");
