@@ -1221,6 +1221,8 @@ export const setPipelineScheduleTool = tool(
   async (ctx, input): Promise<ToolResponse> => {
     const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
     const { pipeline, patch } = input.args;
+    // PipelineSchedule is bound only with the KG composition; without it there is no service to call.
+    if (kgRefreshToolDeps === null) return reply({ status: 501, body: { error: "kg-source-repo-not-configured" } });
     try {
       return reply(await ctx.objectClient(PipelineSchedule, pipeline).set(patch));
     } catch (err) {
@@ -1231,7 +1233,7 @@ export const setPipelineScheduleTool = tool(
 );
 
 export const GET_PIPELINE_SCHEDULE_DESCRIPTION =
-  "Returns a pipeline's schedule as { pipeline, schedule, nextOccurrence }. schedule is null when none was set, which means off; nextOccurrence is the next fire time (ISO), or null when the schedule is off.";
+  "Returns a pipeline's schedule as { pipeline, schedule, nextOccurrence }. schedule is null when none was set, which means off; nextOccurrence is the next fire time (ISO), or null when the schedule is off. When no KG source repo is configured the answer carries available: false and a null schedule.";
 
 export const getPipelineScheduleTool = tool(
   {
@@ -1241,6 +1243,10 @@ export const getPipelineScheduleTool = tool(
   },
   async (ctx, input): Promise<ToolResponse> => {
     const { pipeline } = input.args;
+    if (kgRefreshToolDeps === null) {
+      const unbound = { pipeline, schedule: null, nextOccurrence: null, available: false };
+      return { content: [{ type: "text", text: JSON.stringify(unbound, null, 2) }] };
+    }
     const state = await ctx.objectClient(PipelineSchedule, pipeline).get();
     const { nextOccurrence, ...schedule } = state ?? {};
     const result = { pipeline, schedule: state ? schedule : null, nextOccurrence: nextOccurrence ?? null };

@@ -8,8 +8,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { BusyRead, FireAnswer, ScheduledPipeline } from "../../restate/pipeline-schedule.js";
 import { createPipelineSchedule } from "../../restate/pipeline-schedule.js";
 import type { RestateEnvironment } from "./harness.js";
-import { VARIANTS, callObject, callService, crashAfterFirstCall, startVariants, stopAll } from "./harness.js";
-import { orchestratorTools } from "../../restate/tools.js";
+import { VARIANTS, callObject, eventually, queryInvocations, callService, crashAfterFirstCall, startVariants, stopAll } from "./harness.js";
+import { orchestratorTools, setKgRefreshToolDeps } from "../../restate/tools.js";
 import type { PipelineScheduleAdapter, ScheduleWorld } from "./pipeline-schedule-contract.js";
 import { pipelineScheduleContractKeys, registerPipelineScheduleContract } from "./pipeline-schedule-contract.js";
 
@@ -137,6 +137,9 @@ const ADMIN = { kind: "human", email: "admin@example.com", role: "admin" };
 const USER = { kind: "human", email: "user@example.com", role: "user" };
 
 describe("schedule tools", () => {
+  // The tools only check for a bound KG composition; a stub stands in for it.
+  beforeAll(() => setKgRefreshToolDeps({} as Parameters<typeof setKgRefreshToolDeps>[0]));
+  afterAll(() => setKgRefreshToolDeps(null));
   const labels = VARIANTS.map(([label]) => label);
   const url = (label: string): string => envs.get(label)!.baseUrl();
   const tool = (label: string, name: string, caller: unknown, args: unknown) =>
@@ -190,5 +193,48 @@ describe("schedule tools", () => {
     const key = `tool-${label}-c`;
     newWorld(key);
     expect(await read(label, key)).toEqual({ pipeline: key, schedule: null, nextOccurrence: null });
+  });
+});
+
+describe("schedule tools without the KG composition", () => {
+  let bare: Map<string, RestateEnvironment>;
+  beforeAll(async () => {
+    setKgRefreshToolDeps(null);
+    bare = await startVariants([orchestratorTools]);
+  }, 60_000);
+  afterAll(async () => {
+    await stopAll(bare);
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("answer without calling PipelineSchedule and strand nothing (%s)", async (label) => {
+    const env = bare.get(label)!;
+    const call = (name: string, caller: unknown, args: unknown) =>
+      callService<ToolResult>(env.baseUrl(), "orchestratorTools", name, { caller, args });
+    const text = (r: ToolResult) => JSON.parse(r.content![0].text) as unknown;
+
+    expect(text(await call("get_pipeline_schedule", USER, { pipeline: "kg-refresh" }))).toEqual({
+      pipeline: "kg-refresh",
+      schedule: null,
+      nextOccurrence: null,
+      available: false,
+    });
+    const set = await call("set_pipeline_schedule", ADMIN, { pipeline: "kg-refresh", patch: { enabled: false } });
+    expect(set.isError).toBeFalsy();
+    expect(text(set)).toEqual({ status: 501, body: { error: "kg-source-repo-not-configured" } });
+
+    const refused = await call("set_pipeline_schedule", USER, { pipeline: "kg-refresh", patch: { enabled: false } });
+    expect(refused.isError).toBe(true);
+    expect(refused.content?.[0]?.text).toBe("forbidden: set_pipeline_schedule requires the admin role");
+
+    const admin = env.adminAPIBaseUrl();
+    // The query must cover the tool calls: they show as completed, and nothing else is left running.
+    await eventually(
+      () => queryInvocations(admin, "target_service_name = 'orchestratorTools' AND status = 'completed'"),
+      (rows) => rows.length >= 3,
+    );
+    await eventually(
+      () => queryInvocations(admin, "status != 'completed'"),
+      (rows) => rows.length === 0,
+    );
   });
 });
