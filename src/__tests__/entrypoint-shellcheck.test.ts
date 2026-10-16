@@ -716,7 +716,7 @@ describe("session/entrypoint.sh configured model-auth bootstrap", () => {
     expect(r.status, r.stdout + r.stderr).toBe(0);
   }, 120_000);
 
-  function run(env: Record<string, string>, opts: { failClone?: boolean } = {}) {
+  function run(env: Record<string, string>, opts: { failClone?: boolean; handoff?: boolean; launcherHome?: string | "fake-root" } = {}) {
     const root = mkdtempSync(join(tmpdir(), "entrypoint-configured-"));
     tempDirs.push(root);
     const binDir = join(root, "bin");
@@ -732,11 +732,33 @@ describe("session/entrypoint.sh configured model-auth bootstrap", () => {
       writeShim(binDir, name, `{ echo "== ${name} $*"; env; } >> '${log}'${tail}`);
     }
     for (const name of ["chown", "cp"]) writeShim(binDir, name, "true");
+    const fakeRoot = join(root, "fake-root");
+    const fakeCoder = join(root, "fake-coder");
+    const fillOut = join(root, "fill.log");
+    if (opts.handoff) {
+      spawnSync("mkdir", ["-p", fakeRoot, fakeCoder]);
+      const realGit = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
+      // Real git for `config --global` (writes the launcher HOME); every other subcommand is logged only.
+      writeShim(binDir, "git", `{ echo "== git $*"; } >> '${log}'
+case "\${1:-} \${2:-}" in "config --global") exec '${realGit}' "$@" ;; branch*) echo pr-branch ;; esac`);
+      // Real copy, with only the fixed coder/root paths mapped to owned fixtures.
+      writeShim(binDir, "cp", `args=()
+for a in "$@"; do
+  case "$a" in /root/*) a='${fakeRoot}'/"\${a#/root/}" ;; /home/coder/*) a='${fakeCoder}'/"\${a#/home/coder/}" ;; esac
+  args+=("$a")
+done
+exec /bin/cp "\${args[@]}"`);
+      // The coder-side child: real credential fill, once with and once without operation-scoped GIT_PASSWORD.
+      const fill = (pw: string) => `echo "-- ${pw ? "with" : "without"}" >> '${fillOut}'
+printf 'protocol=https\\nhost=github.com\\n\\n' | env -i PATH="$PATH" HOME='${fakeCoder}' GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=echo ${pw ? `GIT_PASSWORD='${pw}' ` : ""}'${realGit}' credential fill >> '${fillOut}' 2>&1 || true`;
+      writeShim(binDir, "dbus-run-session", `{ echo "== dbus-run-session $*"; } >> '${log}'\n${fill("SYNTH-operation-password")}\n${fill("")}`);
+    }
     const result = spawnSync("bash", ["session/entrypoint.sh"], {
       encoding: "utf8",
       env: {
         PATH: `${binDir}:${process.env.PATH}`,
-        HOME: root,
+        HOME: opts.launcherHome === "fake-root" ? fakeRoot : opts.launcherHome ?? root,
+        GIT_CONFIG_NOSYSTEM: "1",
         WORKSPACE_DIR: workspace,
         AI_IMPLEMENT_MODE: "local",
         AI_IMPLEMENT_DIST_DIR: distDir,
@@ -749,8 +771,40 @@ describe("session/entrypoint.sh configured model-auth bootstrap", () => {
     });
     const children = readFileSync(log, "utf8");
     const sections = children.split(/^== /m).filter(Boolean);
-    return { result, children, sections, output: result.stdout + result.stderr };
+    const fill = existsSync(fillOut) ? readFileSync(fillOut, "utf8") : "";
+    return { result, children, sections, output: result.stdout + result.stderr, root, fakeRoot, fakeCoder, fill };
   }
+
+  describe("git config handoff to coder", () => {
+    const check = (r: ReturnType<typeof run>) => {
+      expect(r.result.status, r.output).toBe(0);
+      const config = readFileSync(join(r.fakeCoder, ".gitconfig"), "utf8");
+      expect(config).toContain("helper");
+      expect(config).toContain("x-access-token");
+      const [withPw, withoutPw] = r.fill.split("-- without");
+      expect(withPw).toContain("username=x-access-token");
+      expect(withPw).toContain("password=SYNTH-operation-password");
+      // GIT_ASKPASS=echo only echoes its prompt back; without GIT_PASSWORD the helper supplies nothing.
+      expect(withoutPw).not.toContain("x-access-token");
+      expect(withoutPw).not.toContain("SYNTH-operation-password");
+      expect(withoutPw).not.toMatch(/^password=(?!Password for)/m);
+      for (const secret of ["SENTINEL-gh-token", "SYNTH-operation-password"]) {
+        expect(config).not.toContain(secret);
+        for (const s of r.sections) expect(s.split("\n")[0]).not.toContain(secret);
+      }
+    };
+
+    it("copies the launcher HOME's gitconfig, not /root's, so the coder child gets the scoped helper", () => {
+      const home = mkdtempSync(join(tmpdir(), "entrypoint-launcher-home-"));
+      tempDirs.push(home);
+      check(run({ AI_IMPLEMENT_RUN_CONFIG: configuredEnvelope() }, { handoff: true, launcherHome: home }));
+    });
+
+    it("keeps the normal root-HOME case working", () => {
+      // HOME is the directory the cp shim maps /root to.
+      check(run({ AI_IMPLEMENT_RUN_CONFIG: configuredEnvelope() }, { handoff: true, launcherHome: "fake-root" }));
+    });
+  });
 
   const AMBIENT = {
     OPENAI_API_KEY: "SENTINEL-openai",

@@ -112,7 +112,7 @@ fi
 
 # ── 5. Workspace ownership for non-root Claude ───────────────────────────────
 prepare_workspace_owner "$WORKSPACE_MODE" "$WORKSPACE_DIR"
-cp /root/.gitconfig /home/coder/.gitconfig 2>/dev/null || true
+cp "${HOME:-/root}/.gitconfig" /home/coder/.gitconfig 2>/dev/null || true
 chown coder:coder /home/coder/.gitconfig 2>/dev/null || true
 
 # ── 5.5. Remap per-team Fly secrets ─────────────────────────────────────────
