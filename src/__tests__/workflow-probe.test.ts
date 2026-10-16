@@ -73,6 +73,7 @@ describe("resolveWorkflowContract", () => {
       supportsAttemptCorrelation: false,
       supportsPrivateRunConfig: false,
       supportsExecutionPolicy: false,
+      supportsStageAgentConfig: false,
     });
   });
 
@@ -92,6 +93,7 @@ describe("resolveWorkflowContract", () => {
       supportsAttemptCorrelation: false,
       supportsPrivateRunConfig: false,
       supportsExecutionPolicy: false,
+      supportsStageAgentConfig: false,
     });
   });
 
@@ -113,6 +115,7 @@ describe("resolveWorkflowContract", () => {
       supportsAttemptCorrelation: false,
       supportsPrivateRunConfig: false,
       supportsExecutionPolicy: false,
+      supportsStageAgentConfig: false,
     });
   });
 
@@ -158,6 +161,7 @@ describe("resolveWorkflowContract", () => {
       supportsAttemptCorrelation: false,
       supportsPrivateRunConfig: false,
       supportsExecutionPolicy: false,
+      supportsStageAgentConfig: false,
     });
   });
 
@@ -348,6 +352,7 @@ describe("resolveWorkflowCapabilities — supportsAttemptCorrelation", () => {
       supportsAttemptCorrelation: true,
       supportsPrivateRunConfig: false,
       supportsExecutionPolicy: false,
+      supportsStageAgentConfig: false,
     });
   });
 
@@ -401,6 +406,7 @@ describe("resolveWorkflowCapabilities — supportsAttemptCorrelation", () => {
       supportsAttemptCorrelation: false,
       supportsPrivateRunConfig: false,
       supportsExecutionPolicy: false,
+      supportsStageAgentConfig: false,
     });
   });
 
@@ -464,9 +470,9 @@ describe("resolveWorkflowCapabilities — supportsPrivateRunConfig", () => {
     expect((await probe(vi.fn().mockRejectedValue(new Error("boom")))).supportsPrivateRunConfig).toBe(false);
   });
 
-  it("does not advertise or imply the stage-agent-config capability", async () => {
+  it("does not imply stage-agent support from the private-envelope marker", async () => {
     const caps = await probe(mockContents(MARKER + ENVELOPE_YML));
-    expect(Object.keys(caps).join(",")).not.toMatch(/stage/i);
+    expect(caps.supportsStageAgentConfig).toBe(false);
   });
 });
 

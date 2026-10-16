@@ -20,6 +20,10 @@ const PRIVATE_RUN_CONFIG_RE = /^#\s*ai-implement-capability:\s*private-run-confi
 /** Static marker for the ephemeral full-access execution policy projection (AII-1437). */
 const EXECUTION_POLICY_RE = /^#\s*ai-implement-capability:\s*ephemeral-execution-policy-v1\s*$/m;
 
+/** Both markers are required on the exact dispatch ref, independently of private transport. */
+const STAGE_AGENT_CONFIG_RE = /^#\s*ai-implement-capability:\s*stage-agent-config-v1\s*$/m;
+const STAGE_AGENT_CONTEXT_RE = /^#\s*ai-implement-capability:\s*stage-agent-launch-context-v1\s*$/m;
+
 export type WorkflowContract = "envelope" | "legacy";
 export interface WorkflowCapabilities {
   contract: WorkflowContract;
@@ -30,6 +34,8 @@ export interface WorkflowCapabilities {
   supportsPrivateRunConfig?: boolean;
   /** True when an envelope workflow carries the ephemeral-execution-policy-v1 marker. Absent = false. */
   supportsExecutionPolicy?: boolean;
+  /** Configured stages and independent trusted launch context on this exact ref. Absent = false. */
+  supportsStageAgentConfig?: boolean;
 }
 
 type CacheEntry = { expiresAt: number; capabilities: WorkflowCapabilities };
@@ -112,6 +118,7 @@ async function probeCapabilities(
       supportsAttemptCorrelation: false,
       supportsPrivateRunConfig: false,
       supportsExecutionPolicy: false,
+      supportsStageAgentConfig: false,
     },
     transient,
   });
@@ -160,6 +167,7 @@ async function probeCapabilities(
       supportsAttemptCorrelation: contract === "envelope" && RUN_ATTEMPT_TOKEN_RE.test(yamlText),
       supportsPrivateRunConfig: contract === "envelope" && PRIVATE_RUN_CONFIG_RE.test(yamlText),
       supportsExecutionPolicy: contract === "envelope" && EXECUTION_POLICY_RE.test(yamlText),
+      supportsStageAgentConfig: contract === "envelope" && STAGE_AGENT_CONFIG_RE.test(yamlText) && STAGE_AGENT_CONTEXT_RE.test(yamlText),
     },
     transient: false,
   };

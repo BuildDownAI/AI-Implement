@@ -327,6 +327,14 @@ describe("GithubReviewFixWorker.launch private envelope capability", () => {
     expect(t.dispatchCalls).toHaveLength(1);
   });
 
+  it("never prepares managed credentials on an unprotected workflow", async () => {
+    const prepareManagedLaunch = vi.fn();
+    const { outcome, t } = await run(legacyProbe, { requiresProtectedTransport: () => true, prepareManagedLaunch });
+    expect(outcome).toEqual({ status: "unknown" });
+    expect(prepareManagedLaunch).not.toHaveBeenCalled();
+    expect(t.dispatchCalls).toHaveLength(0);
+  });
+
   it("does not probe or dispatch on installation mismatch", async () => {
     seedMapping();
     const { resolver } = makeCredentials({ installationId: 99 });

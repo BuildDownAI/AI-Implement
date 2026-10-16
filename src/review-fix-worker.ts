@@ -73,7 +73,7 @@ import {
   type DispatchInputs,
   type DispatchResult,
 } from "./github.js";
-import { buildRunConfig, encodeRunConfig, encodeTrustedRunConfig, type RunCredentialsV1 } from "./run-config.js";
+import { buildRunConfig, encodeRunConfig, encodeTrustedRunConfig, type RunCredentialsV1, type ResolvedAgentSnapshotV1 } from "./run-config.js";
 import { resolveWorkflowCapabilities, type ResolveWorkflowContractInput, type WorkflowCapabilities } from "./workflow-probe.js";
 import type { RetryPolicy } from "./pipeline/retry-backoff.js";
 import { RunnerImageNotAllowedError } from "./repo-image.js";
@@ -300,6 +300,7 @@ function buildLaunchInputs(
   runnerCallbackUrl?: string,
   privateBearers?: PrivateBearers,
   retryPolicy: RetryPolicy | null = null,
+  managed?: ManagedReviewFixLaunch,
 ): DispatchInputs {
   const identifier = `review-fix-${plan.scope.prNumber}`;
   const runConfig = buildRunConfig({
@@ -328,6 +329,7 @@ function buildLaunchInputs(
       deadlineAt: plan.deadlineAt,
     },
     retryPolicy,
+    agentConfig: managed?.snapshot,
   });
 
   // run_attempt_token stays the public correlation marker on both paths (run-name/reconcile need
@@ -340,6 +342,7 @@ function buildLaunchInputs(
   };
   if (privateBearers) {
     const credentials: RunCredentialsV1 = {
+      ...managed?.credentials,
       version: 1,
       ...(privateBearers.run_token ? { resultToken: privateBearers.run_token } : {}),
       ...(privateBearers.run_progress_token ? { progressToken: privateBearers.run_progress_token } : {}),
@@ -453,6 +456,13 @@ export function reviewFixAttemptStoreScopeStore(source: ReviewFixWorkerAttemptSc
 // The adapter
 // ---------------------------------------------------------------------------
 
+/** Kept inside launch(), never returned through a journaled worker port. */
+export interface ManagedReviewFixLaunch {
+  snapshot: ResolvedAgentSnapshotV1;
+  credentials: RunCredentialsV1;
+  settle(outcome: "accepted" | "rejected" | "unknown"): void;
+}
+
 export interface GithubReviewFixWorkerDeps {
   credentials: ReviewFixWorkerCredentialResolver;
   /** Mint callback bearers inside the launch adapter, after preparation. The
@@ -469,8 +479,11 @@ export interface GithubReviewFixWorkerDeps {
   /** Defaults to `resolveWorkflowCapabilities`. Injected by tests to observe the exact probe target. */
   resolveCapabilities?: (input: ResolveWorkflowContractInput) => Promise<WorkflowCapabilities>;
   /** True when this work must travel over protected (private-envelope) transport and may never
-   *  fall back to legacy top-level credentials. No review-fix work requires it today. */
+   *  fall back to legacy top-level credentials. */
   requiresProtectedTransport?: (plan: WorkerLaunchPlan) => boolean;
+  /** Production managed preparation, after protected transport is verified. A refusal throws
+   * fixed text; null is legacy. Neither secrets nor settlement callbacks enter the launch plan. */
+  prepareManagedLaunch?: (plan: WorkerLaunchPlan, capabilities: WorkflowCapabilities) => Promise<ManagedReviewFixLaunch | null>;
   /** Orchestrator callback base URL, carried in the run envelope (not a secret). */
   runnerCallbackUrl?: string;
   /** Resolves the `runner_image` workflow input for the target repo, as the implementation
@@ -488,6 +501,7 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
   private readonly callbackInputs?: GithubReviewFixWorkerDeps["callbackInputs"];
   private readonly resolveCapabilities: NonNullable<GithubReviewFixWorkerDeps["resolveCapabilities"]>;
   private readonly requiresProtectedTransport?: GithubReviewFixWorkerDeps["requiresProtectedTransport"];
+  private readonly prepareManagedLaunch?: GithubReviewFixWorkerDeps["prepareManagedLaunch"];
   private readonly runnerCallbackUrl?: string;
   private readonly runnerImage?: GithubReviewFixWorkerDeps["runnerImage"];
   private readonly retryPolicy?: GithubReviewFixWorkerDeps["retryPolicy"];
@@ -499,6 +513,7 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
     this.callbackInputs = deps.callbackInputs;
     this.resolveCapabilities = deps.resolveCapabilities ?? resolveWorkflowCapabilities;
     this.requiresProtectedTransport = deps.requiresProtectedTransport;
+    this.prepareManagedLaunch = deps.prepareManagedLaunch;
     this.runnerCallbackUrl = deps.runnerCallbackUrl;
     this.runnerImage = deps.runnerImage;
     this.retryPolicy = deps.retryPolicy;
@@ -535,6 +550,11 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
     if (credential.installationId !== plan.scope.installationId) return { status: "unknown" };
 
     let inputs: DispatchInputs;
+    let managed: ManagedReviewFixLaunch | null = null;
+    const finish = (outcome: WorkerLaunchOutcome): WorkerLaunchOutcome => {
+      managed?.settle(outcome.status);
+      return outcome;
+    };
     const retryPolicy = this.retryPolicy?.() ?? null;
     try {
       if (this.callbackInputs) {
@@ -544,8 +564,9 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
         // Probe the exact target transport.dispatch will receive, with the same installation
         // token. Only a strict `true` selects private transport; a throw is "not private".
         let privateCapable = false;
+        let capabilities: WorkflowCapabilities | undefined;
         try {
-          const capabilities = await this.resolveCapabilities({
+          capabilities = await this.resolveCapabilities({
             owner: mapping.owner,
             repo: mapping.repo,
             workflowFile: mapping.workflowFile,
@@ -557,11 +578,13 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
           privateCapable = false;
         }
         // Protected work never downgrades to top-level bearers.
-        if (!privateCapable && this.requiresProtectedTransport?.(plan)) return { status: "unknown" };
+        if (this.requiresProtectedTransport?.(plan) && (!privateCapable || capabilities?.contract !== "envelope"
+          || !capabilities.supportsAttemptCorrelation || !capabilities.supportsRunPublicationToken)) return { status: "unknown" };
+        if (privateCapable && capabilities) managed = await this.prepareManagedLaunch?.(plan, capabilities) ?? null;
         // Destructured explicitly: only the three credentials join the inputs, and the URL
         // goes into the envelope rather than a top-level input.
         inputs = privateCapable
-          ? buildLaunchInputs(plan, mapping, runner_callback_url, { run_token, run_progress_token, run_publication_token }, retryPolicy)
+          ? buildLaunchInputs(plan, mapping, runner_callback_url, { run_token, run_progress_token, run_publication_token }, retryPolicy, managed ?? undefined)
           : { ...buildLaunchInputs(plan, mapping, runner_callback_url, undefined, retryPolicy), run_token, run_progress_token, run_publication_token };
       } else {
         if (this.requiresProtectedTransport?.(plan)) return { status: "unknown" };
@@ -570,14 +593,14 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
     } catch {
       // A missing/expired prepared credential is not proof that an earlier
       // dispatch did not happen. The workflow reconciles under its launch intent.
-      return { status: "unknown" };
+      return finish({ status: "unknown" });
     }
     if (this.runnerImage) {
       try {
         const runnerImage = await this.runnerImage({ owner: mapping.owner, repo: mapping.repo, token: credential.token });
         if (runnerImage !== undefined) inputs = { ...inputs, runner_image: runnerImage };
       } catch (err) {
-        if (err instanceof RunnerImageNotAllowedError) return { status: "rejected", reason: err.message };
+        if (err instanceof RunnerImageNotAllowedError) return finish({ status: "rejected", reason: err.message });
         console.warn(`[review-fix] Runner image resolution failed for ${mapping.owner}/${mapping.repo}; `
           + `launching without runner_image: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -585,7 +608,7 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
     // Backstop: the outer envelope silently truncates oversized descriptions, so prove the
     // encoded payload still carries the admitted task text in both fields before any dispatch.
     if (!envelopeCarriesTaskText(inputs.run_config, plan.taskText)) {
-      return { status: "rejected", reason: "rendered review-fix task does not fit the run envelope intact" };
+      return finish({ status: "rejected", reason: "rendered review-fix task does not fit the run envelope intact" });
     }
     let result: DispatchResult;
     try {
@@ -598,22 +621,25 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
         inputs,
       });
     } catch {
-      return { status: "unknown" };
+      return finish({ status: "unknown" });
     }
 
     if (result.outcome === "rejected") {
-      return { status: "rejected", reason: result.error ?? `GitHub rejected the dispatch (HTTP ${result.status})` };
+      // The API response may echo the private request. Never journal it for a managed launch.
+      return finish({ status: "rejected", reason: managed
+        ? `GitHub rejected the managed dispatch (HTTP ${result.status})`
+        : result.error ?? `GitHub rejected the dispatch (HTTP ${result.status})` });
     }
     if (result.outcome === "accepted" && result.runId !== undefined) {
       // A freshly dispatched run always starts at its first attempt; GitHub's dispatch
       // response carries no run_attempt field of its own to read this from.
       const execution: WorkerExecutionIdentity = { githubRunId: result.runId, githubRunAttempt: 1 };
       await this.remember(plan.attemptId, plan.scope, execution);
-      return { status: "accepted", execution };
+      return finish({ status: "accepted", execution });
     }
     // A 204/"accepted" response with no resolvable run id cannot be bound to an execution
     // yet — the caller must reconcile rather than trust an unverified identity.
-    return { status: "unknown" };
+    return finish({ status: "unknown" });
   }
 
   async reconcile(attemptId: AttemptId, scope: ScopedPrIdentity): Promise<WorkerLookupOutcome> {
