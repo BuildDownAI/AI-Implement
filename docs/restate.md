@@ -229,6 +229,36 @@ Each internal call never throws: a connection failure, a non-2xx response, or an
 
 After each run the object sends itself a delayed `refresh` carrying `scheduledFor: nextAt`; a scheduled run whose `scheduledFor` no longer matches state is a superseded timer and does nothing, so a `requested` refresh (`requestChatGptPlanRefresh`) does not multiply timers. `transient` retries in 2 minutes; `reauth_required`, `invalid_client`, and `missing` schedule nothing. A corrupt record maps to `reauth_required`, an unavailable key to `transient`. A crash between OpenAI's rotation and the store write loses the session; the profile then needs a new sign-in. The bound object uses a fail-closed store until a session key provider is provisioned.
 
+## Pipeline schedules
+
+`PipelineSchedule` (`src/restate/pipeline-schedule.ts`, AII-1431, [ADR 042](adr/042-a-pipeline-schedule-is-a-due-or-fired-state-checked-by-the-poll-loop.md)) is a Virtual Object, one per scheduled pipeline, that fires the pipeline once a day at a local time. Restate 1.7.10 has no native cron, and a delayed self-send brings back cancel-and-re-arm, so a schedule is a state: each day has one occurrence, and `lastFiredOccurrence` records whether it fired. The poll loop is the tick. Nothing consumes the object yet (AII-1403 step 2 connects KG refresh).
+
+State (one key, `state`): `enabled`, `time` (`HH:MM`), `zone` (IANA), `lastFiredOccurrence`, `lastStartedRunId`, `lastResult` (`started`, `refused`, or `replaced`). Empty state is "off": `get` answers `null`. There is no `seed` handler.
+
+| Handler | Kind | Does |
+|---|---|---|
+| `get` | shared | The state, or `null`; plus `nextOccurrence` when the schedule is on |
+| `set` | exclusive, `ingressPrivate` | Merges `{ enabled?, time?, zone? }`; a bad value or a key outside `deps.pipelines` is a 400 with state unchanged. Turning on, or changing `time` or `zone`, marks the latest past occurrence as fired, so a 03:00 schedule turned on at 14:00 does not fire at once |
+| `check` | exclusive | The only handler that calls the pipeline's `busy`, `replace`, or `fire`, and it records the answer in the same handler |
+
+`check`, when the schedule is on and the latest occurrence differs from `lastFiredOccurrence` (due):
+
+| `busy` read | Holder is `lastStartedRunId` and awaits a decision | `fire` answer | Result |
+|---|---|---|---|
+| busy | no, or the pipeline has no `replace`, or that run was already replaced | | nothing; still due |
+| busy | yes, not yet replaced | | `replace(holder)` once; `lastResult = replaced`; still due |
+| free | | `started` | fired; `lastStartedRunId` set |
+| free | | `busy` | nothing; still due (the worker became busy between the read and the start) |
+| free | | `refused` | fired; not retried until the next occurrence |
+
+Off, empty, or not-due states call nothing, `busy` included.
+
+`latestOccurrence(nowMs, time, zone)` is pure and uses `Intl.DateTimeFormat` only. A local time inside a spring-forward gap maps to the first instant after the gap; a time that occurs twice at fall-back maps to the first; several missed days give one occurrence, the latest.
+
+`checkPipelineSchedules(keys)` is the poll-loop caller: one POST per key to `PipelineSchedule/<key>/check`. It makes no call during a deploy hold (AII-1281) or unless the sidecar is `ready` and registration is `registered`, and a failed call logs one line and never throws.
+
+A pipeline joins by registering its `ScheduledPipeline` (`busy`, optional `replace`, `fire`) and calling `registerPipelineScheduleContract` (`src/__tests__/restate/pipeline-schedule-contract.ts`) from its `*.restate.test.ts`: 11 scenarios on both variants, no sleeping.
+
 ## The tools service
 
 `src/restate/tools.ts` (AII-710) hosts `orchestratorTools`, the Restate service `/mcp`'s diagnostic and write tools migrate onto one handler at a time. `tool()` wraps `restate.handlers.handler` with a `serde.zod` input/output schema and a fixed wire shape, `{ caller, args }` — `caller` (the already-verified identity and role) travels with every call instead of a bearer token, because the ingress journals request bodies durably and a credential has no business sitting in that journal; `args` is the tool's own arguments. The wrapper also carries the discovery metadata, `mcp.type: "tool"` and `mcp.role: "<user|admin>"`, which Restate's admin API attaches to the handler's deployment record after its first invocation.
