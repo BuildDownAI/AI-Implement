@@ -386,7 +386,11 @@ export class CodexExecutor implements LLMExecutor {
       // Before any auth checkout or spawn: a root user or a reachable host Docker socket voids the outer boundary.
       const report = (this.options.fullAccessAdmission ?? checkFullAccessAdmission)();
       if (!report.admitted) throw new CodexFullAccessRefusedError(report);
-      console.log("[codex] implementation runs with operator-approved ephemeral full access (outer runner isolation)");
+      // Fixed safe projection only: never the raw report, UID/group inventory, paths or credentials.
+      const { nonRoot, socketPresent, socketReadable, socketWritable, admitted } = report;
+      console.log(
+        `[codex] implementation runs with operator-approved ephemeral full access (outer runner isolation): ${JSON.stringify({ nonRoot, socketPresent, socketReadable, socketWritable, admitted })}`,
+      );
     }
     const startedAt = this.now();
     // `invocationTimeoutMs` bounds the whole invocation (every attempt and backoff), not each spawn.

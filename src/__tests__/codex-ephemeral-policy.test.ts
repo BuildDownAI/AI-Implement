@@ -44,7 +44,7 @@ const expired = [
 ];
 
 interface Child { args: string[]; env: Record<string, string>; stdin: string; remote: string }
-function scriptedSpawn(scripts: Array<{ stdout: string[]; exitCode: number }>, log: Child[], workspace: string): typeof spawn {
+function scriptedSpawn(scripts: Array<{ stdout: string[]; exitCode: number; hang?: boolean }>, log: Child[], workspace: string): typeof spawn {
   return ((_cmd: string, args: string[], opts: { env: Record<string, string> }) => {
     const script = scripts[Math.min(log.length, scripts.length - 1)];
     const rec: Child = { args, env: opts.env, stdin: "", remote: execFileSync("git", ["remote", "get-url", "origin"], { cwd: workspace }).toString().trim() };
@@ -54,7 +54,19 @@ function scriptedSpawn(scripts: Array<{ stdout: string[]; exitCode: number }>, l
     stdin.on("data", (d: Buffer) => (rec.stdin += d.toString()));
     const stdout = new PassThrough();
     const stderr = new PassThrough();
-    Object.assign(proc, { stdin, stdout, stderr, pid: undefined, kill: () => true, unref: () => {} });
+    const closeWith = (code: number | null, sig: NodeJS.Signals | null): void => {
+      stdout.end();
+      stderr.end();
+      proc.emit("close", code, sig);
+    };
+    Object.assign(proc, {
+      stdin, stdout, stderr, pid: undefined, unref: () => {},
+      kill: (sig: NodeJS.Signals) => {
+        if (script.hang) setImmediate(() => closeWith(null, sig));
+        return true;
+      },
+    });
+    if (script.hang) return proc;
     setImmediate(() => {
       for (const line of script.stdout) stdout.write(`${line}\n`);
       setImmediate(() => {
@@ -201,6 +213,21 @@ for (const file of GHA_IMPLEMENT_WORKFLOWS) {
       expect(execFileSync("git", ["remote", "get-url", "origin"], { cwd: workspace }).toString()).toContain(REMOTE_CANARY);
     });
 
+    it("logs only the five safe admission booleans on success", async () => {
+      const canary = "canary-report-extra-IIII9999";
+      const logSpy = vi.mocked(console.log);
+      const { invoke } = await compose(file, {
+        policy: GHA_POLICY,
+        admission: () => ({ ...admitted(), uid: 4242, groups: [canary], socketPath: `/${canary}` }) as ReturnType<typeof admitted>,
+      });
+      await invoke("implementation");
+      const lines = logSpy.mock.calls.map((c) => c.join(" ")).filter((l) => l.includes("full access"));
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain(JSON.stringify(admitted()));
+      expect(lines[0]).not.toContain(canary);
+      expect(lines[0]).not.toContain("4242");
+    });
+
     it("refuses before any checkout or spawn when admission fails", async () => {
       const { invoke, log, checkouts } = await compose(file, {
         policy: GHA_POLICY,
@@ -215,11 +242,9 @@ for (const file of GHA_IMPLEMENT_WORKFLOWS) {
       it("an ambient launch flag without the envelope policy is rejected", async () => {
         await expect(compose(file, { env: { AI_IMPLEMENT_EXECUTION_POLICY: "v1:ephemeral-full-access:gha:disp-1:proj" } })).rejects.toMatchObject({ reason: "execution_policy_invalid" });
       });
-      it("an envelope policy without the launch variable stays default", async () => {
-        const { invoke, log } = await compose(file, { policy: GHA_POLICY, env: { AI_IMPLEMENT_EXECUTION_POLICY: "" } });
-        await invoke("implementation");
-        expect(log[0].args).not.toContain(FLAG);
-        expect(log[0].args).toEqual(expect.arrayContaining(["--sandbox", "workspace-write"]));
+      it("an envelope policy with a blank launch variable is rejected, never downgraded to the sandbox", async () => {
+        await expect(compose(file, { policy: GHA_POLICY, env: { AI_IMPLEMENT_EXECUTION_POLICY: "" } })).rejects.toMatchObject({ reason: "execution_policy_invalid" });
+        await expect(compose(file, { policy: GHA_POLICY, env: { AI_IMPLEMENT_EXECUTION_POLICY: "   " } })).rejects.toMatchObject({ reason: "execution_policy_invalid" });
       });
       it("a launch variable for another dispatch or project is rejected", async () => {
         for (const value of ["v1:ephemeral-full-access:gha:other:proj", "v1:ephemeral-full-access:gha:disp-1:other", "v1:ephemeral-full-access:fly:disp-1:proj", "true", "1"]) {
@@ -243,5 +268,105 @@ describe("planning workflow", () => {
       const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: GHA_CONTEXT, policy: GHA_POLICY, callback: false });
       expect(handoff.bootStatus).not.toBe(0);
     }
+  });
+});
+
+/** All three stages Codex-selected: planning (app-server), implementation and review (exec) through the real chain. */
+describe("Codex-selected planning and review with the policy present", () => {
+  const file = GHA_IMPLEMENT_WORKFLOWS[0];
+  const codexSnapshot = (shared: boolean, authMode: "openai-api-key" | "codex-subscription") => {
+    const snapshot = makeSnapshot(authMode);
+    for (const stage of ["planning", "review"] as const) {
+      const id = shared ? "p-impl" : stage === "planning" ? "p-plan" : "p-rev";
+      snapshot.stages[stage] = { ...snapshot.stages[stage], agent: "codex", provider: "openai", model: `gpt-${stage}`, accountProfileId: id };
+      snapshot.profiles[stage] = { ...snapshot.profiles[stage], id, agent: "codex", provider: "openai", authMode };
+    }
+    return snapshot;
+  };
+
+  async function composeCodex(shared: boolean, scripts: Array<{ stdout: string[]; exitCode: number; hang?: boolean }>, authMode: "openai-api-key" | "codex-subscription" = "openai-api-key", policy: unknown = GHA_POLICY) {
+    const snapshot = codexSnapshot(shared, authMode);
+    const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: GHA_CONTEXT, policy, callback: false });
+    expect(handoff.bootStatus).toBe(0);
+    for (const [k, v] of Object.entries(handoff.runEnv)) vi.stubEnv(k, v);
+    const profiles = Object.fromEntries(Object.values(snapshot.profiles).map((p) => [p.id, authMode]));
+    const { transport, checkouts } = codexLoopback(profiles);
+    const log: Child[] = [];
+    const driverInputs: unknown[] = [];
+    const run = await prepareConfiguredRun({
+      env: { ...process.env, ...handoff.runEnv },
+      workspaceDir: workspace,
+      snapshot,
+      options: {
+        modelAuthTransport: transport,
+        now: () => NOW,
+        codexOptions: {
+          spawnImpl: scriptedSpawn(scripts, log, workspace),
+          sleepImpl: async () => {},
+          termWaitMs: 20,
+          killWaitMs: 20,
+          fullAccessAdmission: admitted,
+          trustedSkillsDir: join(workspace, "skills"),
+          protocolDriver: {
+            async run(input: { workspaceDir: string }) {
+              driverInputs.push(input);
+              return {
+                result: { stdout: "done", stderr: "", exitCode: 0, tokensUsed: 1, terminalStatus: { subtype: "success", isError: false }, signal: null },
+                sawUnsafe: false,
+                stopReason: null,
+                threadId: "t1",
+              };
+            },
+          } as never,
+        },
+      },
+    });
+    const executor = run!.createExecutor({ workspaceDir: workspace, logLevel: "summary" });
+    const invoke = (agentStage: InvokeParams["agentStage"], extra: Partial<InvokeParams> = {}) =>
+      executor.invoke({ prompt: "p", model: "ignored", stage: String(agentStage), agentStage, ...extra });
+    return { invoke, log, checkouts, driverInputs };
+  }
+
+  const BYPASS_TOKENS = [FLAG, "danger-full-access", "--dangerously"];
+  const planningSpawn = { stdout: [], exitCode: 0, hang: true };
+
+  for (const shared of [false, true]) {
+    it(`planning uses the read-only app-server argv and review stays read-only (${shared ? "shared" : "separate"} profile)`, async () => {
+      const { invoke, log, checkouts } = await composeCodex(shared, [planningSpawn, { stdout: ok, exitCode: 0 }, { stdout: ok, exitCode: 0 }, { stdout: ok, exitCode: 0 }]);
+      await invoke("planning");
+      await invoke("review");
+      await invoke("implementation");
+      expect(log).toHaveLength(3);
+      const [plan, review, impl] = log;
+      expect(plan.args[0]).toBe("app-server");
+      expect(plan.args).toEqual(expect.arrayContaining(['sandbox_mode="read-only"', 'approval_policy="never"', "features.shell_tool=false", "features.unified_exec=false"]));
+      expect(plan.args).toContain('model="gpt-planning"');
+      for (const t of BYPASS_TOKENS) expect(plan.args.join(" ")).not.toContain(t);
+      expect(review.args.slice(0, 1)).toEqual(["exec"]);
+      expect(review.args).toEqual(expect.arrayContaining(["--sandbox", "read-only", "gpt-review"]));
+      for (const t of BYPASS_TOKENS) expect(review.args.join(" ")).not.toContain(t);
+      expect(impl.args).toContain(FLAG);
+      expect(impl.args).not.toContain("--sandbox");
+      expect(impl.args).toContain("gpt-implementation".replace("implementation", "impl"));
+      // Selected profile per stage, with only that profile's key in each child env.
+      for (const c of log) expect(c.env.CODEX_API_KEY).toBe(S_OPENAI);
+      expect(new Set(checkouts.map((c) => c.profileId)).size).toBe(shared ? 1 : 3);
+    });
+  }
+
+  it("a review resume after token expiry keeps read-only, no bypass, while implementation resume keeps the bypass", async () => {
+    const { invoke, log } = await composeCodex(false, [
+      { stdout: expired, exitCode: 1 }, { stdout: ok, exitCode: 0 },
+      { stdout: expired, exitCode: 1 }, { stdout: ok, exitCode: 0 },
+    ], "codex-subscription");
+    await invoke("review");
+    await invoke("implementation");
+    expect(log).toHaveLength(4);
+    expect(log[1].args.slice(0, 2)).toEqual(["exec", "resume"]);
+    expect(log[1].args).toContain('sandbox_mode="read-only"');
+    for (const t of BYPASS_TOKENS) expect(log[0].args.join(" ") + log[1].args.join(" ")).not.toContain(t);
+    expect(log[2].args).toContain(FLAG);
+    expect(log[3].args.slice(0, 2)).toEqual(["exec", "resume"]);
+    expect(log[3].args).toContain(FLAG);
   });
 });

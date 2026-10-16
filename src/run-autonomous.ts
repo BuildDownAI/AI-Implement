@@ -950,8 +950,9 @@ function readEnvelopeExecutionPolicy(env: NodeJS.ProcessEnv): unknown {
 
 /**
  * Operator-approved ephemeral full access (AII-1437). Enabled only when the workflow-projected launch variable, the
- * validated envelope policy and the trusted model-auth context all agree on a GHA dispatch. An absent variable keeps
- * the default sandbox; a present one that fails any check rejects the run before execution, never degrades silently.
+ * validated envelope policy and the trusted model-auth context all agree on a GHA dispatch. Only the absence of both the
+ * variable and the envelope policy keeps the default sandbox; any other combination that fails a check (including a
+ * blank variable beside an envelope policy) rejects the run before execution, never degrades silently.
  * `GITHUB_ACTIONS`, repository config, a diagnostic stage string and unrelated ambient flags are never consulted.
  */
 function resolveImplementationFullAccess(
@@ -959,8 +960,10 @@ function resolveImplementationFullAccess(
   expected: ExpectedBootstrapContext | undefined,
 ): boolean {
   const projected = env[EXECUTION_POLICY_ENV]?.trim();
-  if (!projected) return false;
   const policy = readEnvelopeExecutionPolicy(env);
+  // Only the absence of BOTH the envelope policy and the launch projection keeps the default sandbox. A policy the
+  // operator explicitly requested with a blank projection is a broken handoff and must not run under the old sandbox.
+  if (!projected && policy === undefined) return false;
   if (
     !expected || expected.backend !== "gha" || !isRec(policy) ||
     policy.version !== 1 || policy.implementationSandbox !== "ephemeral-full-access" ||
