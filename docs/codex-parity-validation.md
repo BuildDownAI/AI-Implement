@@ -51,7 +51,94 @@ Integrated baseline: the feature lane after #1175 merged as commit `db554e08752d
 of the PR head `bdc8d26a`). These figures are operator-reported; this pipeline did not re-run them at that commit. They
 are source and synthetic evidence, not paid or live acceptance.
 
-Deployment and target workflow sync have not occurred.
+The deployment and live evidence that followed is recorded in the dated section below.
+
+## Rollout and live evidence (2026-10-16)
+
+This section is separate from the synthetic evidence above. Rollout facts, synthetic proofs of the published image and live
+runs are kept apart below. Nothing here closes AII-1289.
+
+### Rollout
+
+| Item | Value |
+|---|---|
+| Integration PR #1183 merge | `3ab76f2d03df8d020fe9e6ae30fef603c8686bf5` |
+| Merged follow-ups (PR / issue) | #1185 / AII-1425 truthful ownership; #1186 / AII-1426 bootstrap grammar; #1189 / AII-1427 trusted GHA context; #1190 / AII-1435 scoped Git HOME; #1191 / AII-1437 explicit ephemeral implementation policy and `--init`; #1194 / AII-1438 native restricted review |
+| Dispatcher | `44325258dcbe8f8d3306e37d39ade2026af1139f`, confirmed deployed by MCP |
+| Final runner build | [Actions run 38950064968](https://github.com/BuildDownAI/AI-Implement/actions/runs/38950064968), succeeded |
+| Immutable build index digest | `sha256:4791cf0149ea5fb93f3f19ae1b16093e83a340892ae6f975d30ce6dc18cb94c4` |
+| Promoted `next` platform manifest digest | `sha256:b15f54b26abebb11809e97b8e4c2eb62e707f034aeb97e2b82c073c0bee8e352` |
+| Private workflow PR #5 merge | `03c35f24b346f19ec7e68a2905d090c628aad5c2` |
+
+The two digests are different digest types (build index versus promoted platform manifest); do not substitute one for the
+other. Both private workflow files byte-match the final canonical and mirrored templates; the implementation workflow has 4
+capabilities and `--init`, planning has 3. The target repository has no PR CI checks configured, so no target CI result
+exists for it.
+
+### Synthetic proof of the published image (no live account or model)
+
+The orchestrator's own compiled published image passed the following against a loopback synthetic provider and account.
+No live account or model was used for these proofs.
+
+- 13 configured-model native review cases (9 fresh/persistent and 4 actual thread-resume).
+- Fresh and expiry/resume implementation, requiring no terminal failure.
+- 22 actual workflow handoff checks and 4 real Linux admission checks.
+- Candidate #1194: CI 10534 unit tests / 322 suites / 16 native skips, plus 3 x 900 Restate tests; independent run of 483
+  targeted tests, typecheck, build and DB-isolation.
+
+### Live: TEST-3 (ordinary GHA, ChatGPT plan)
+
+[TEST-3](https://linear.app/eudoxus/issue/TEST-3/add-a-version-option-to-the-word-count-cli-gha-codex-smoke), attribution
+Codex / openai / gpt-6-luna / chatgpt-plan-test / codex-subscription, outcome success for both stages.
+
+| Stage | Dispatch | GHA run | Head | Snapshot | Invocation |
+|---|---|---|---|---|---|
+| Planning | 2398 | [38924501371](https://github.com/BuildDownAI/codex-sandbox-repo/actions/runs/38924501371) | workflow head `afa4e5091004c7e1f469ef1586ec49d5b544bf6c` | `59d26d41-1a62-48ee-8db4-faad7ad5f4ca` | `planning-090f7f72-5976-4ae8-af38-a1c207b19336` |
+| Implementation | 2421 (UUID `0a70d2ff-9b23-4770-af0f-1b5a6e373e3c`) | [38950834723](https://github.com/BuildDownAI/codex-sandbox-repo/actions/runs/38950834723) | PR head `0104954083479023ca74b519ee939a9c5654b3ea` | `b417bdf2-0852-4c8d-b32c-9e60db8240f2` | `implementation-0d8f9a88-8dc0-4ce7-884d-2de1703fdf32` |
+
+- Snapshot IDs were observed directly from sanitized authenticated run records, not inferred.
+- Implementation used native implementation and native restricted Codex review, one iteration; current-head native review
+  5552376399. PR [BuildDownAI/codex-sandbox-repo#6](https://linear.app/eudoxus/review/test-3-add-a-version-option-to-the-word-count-cli-gha-codex-smoke-f37de3483039)
+  merged as `3c6e25a7ea1260b090a0249da924c9362970dd9f` at 18:57:12Z; TEST-3 is Done.
+- Tokens are per record, not a whole-pipeline aggregate: planning 49881 in / 1069 out; implementation 101322 in / 1687 out.
+  Cost is null/unavailable, not zero.
+- An independent reviewer ran 5 Python unit tests and 10 real CLI checks as non-root; all passed and only the 3 specified
+  files changed (evidence: PR #6 comment 6222589526). The run used the promoted `b15f54b2...` manifest; checkout and finish
+  succeeded; the actual non-root admission socket was unreadable and unwritable. The legacy Restate reference is correctly
+  null. No target CI exists, so none passed.
+
+Historical failed attempts (kept as history; neither is the final outcome, and neither is TEST-2's unknown stream cause):
+
+| Dispatch | GHA run | Failure |
+|---|---|---|
+| 2399 | 38924910356 | Failed before model work at Git HOME |
+| 2402 | 38929014021 | Failed in the Linux implementation/review sandbox |
+
+### Live: TEST-4 (Codex planning through Restate on GHA, planning only)
+
+[TEST-4](https://linear.app/eudoxus/issue/TEST-4/prove-existing-codex-planning-through-restate-on-gha-planning-only), dispatch
+2423, PlanningRun `21e54423-afaf-466a-9001-a2ef0a40562a` (from the MCP report card).
+
+- Real GHA run [38951467322](https://github.com/BuildDownAI/codex-sandbox-repo/actions/runs/38951467322) succeeded on head
+  `3c6e25a7ea1260b090a0249da924c9362970dd9f`; snapshot `37e0e5ed-2861-4ad8-ab78-c629024d8263`, invocation
+  `planning-3bb10515-b7ab-4421-b2c5-d783fdf3f322`. Same configured model, account and auth; success, 41940 in / 1117 out,
+  cost null/unavailable.
+- All 3 native planning artifacts posted; checkout and finish succeeded; runner callback POST ok, phase=planning,
+  outcome=success. MCP shows terminal `planning_callback`, with no TEST reservation or job left.
+- The pickup label was removed after the actual GHA job started; completion did not dispatch implementation. No repository
+  edits or PR.
+- Caveat: the Restate-owned row's legacy runId is null. The GHA identity above was observed directly from its unique
+  workflow run, not inferred from that field. No ReviewFixAttempt ID exists and none is claimed.
+
+### Cleanup and authority
+
+The TEST mapping was restored to fly-machines/Legacy via the supported admin UI and verified after reload; the exact
+ephemeral opt-in is absent, autoMerge false and capacity 2 CPU / 4096 MB retained, other mappings untouched. The smokes used
+temporary GHA, so this restoration is cleanup and not live Fly acceptance.
+
+AII-1289 remains open (Backlog) with the AII-1336/1338 blockers. The managed review-fix guard stays intact, and the
+sequence AII-1368 -> AII-1312 -> AII-1374 -> AII-1313 and D10 are not waived. No restart, cancel, retry or
+uncertain-launch proof is inferred from these normal successes.
 
 ## Opt-in native planning-skills proof
 
@@ -95,7 +182,7 @@ TEST-2 supplies limited Fly/ChatGPT proof: exit 0 with error telemetry, then app
 unknown. It is not the final matrix. A successful automatic Restate review-fix in this campaign ran on Claude/GHA; that does
 **not** prove Codex.
 
-## Pending: paid/live acceptance
+## Pending and partial: paid/live acceptance
 
 Each pending row needs an exact run ID, frozen snapshot ID and head SHA recorded when it is accepted. Nothing is accepted
 until those are present.
@@ -107,8 +194,8 @@ until those are present.
 | Fly x OpenAI API key | Pending | Run ID, snapshot ID, head SHA |
 | Fly x ChatGPT plan | Pending | Run ID, snapshot ID, head SHA |
 | GHA x OpenAI API key | Pending | Run ID, snapshot ID, head SHA |
-| GHA x ChatGPT plan | Pending | Run ID, snapshot ID, head SHA |
-| Real Codex PlanningRun and a later ReviewFixAttempt | Pending | Both identifiers, snapshot ID, head SHA |
+| GHA x ChatGPT plan | Verified for the TEST-3 ordinary-run smoke only (planning 2398, implementation 2421; see the 2026-10-16 section). Not extended to API-key, Fly, Docker, mixed or recovery cases | Run IDs, snapshot IDs and heads recorded above |
+| Real Codex PlanningRun and a later ReviewFixAttempt | Partial: PlanningRun `21e54423-afaf-466a-9001-a2ef0a40562a` supplied (TEST-4); managed ReviewFixAttempt not yet admitted or proven | ReviewFixAttempt identifier, snapshot ID, head SHA |
 | Mixed-stage runs (Claude and Codex across planning/implementation/review) | Pending | Run ID, snapshot ID, head SHA per stage |
 | Codex on Restate: restart recovery | Pending | Live run ID, snapshot ID, head SHA |
 | Codex on Restate: cancel | Pending | Live run ID, snapshot ID, head SHA |
