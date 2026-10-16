@@ -35,6 +35,7 @@ import { feedbackLoopStep, projectStageReport } from "../pipeline/steps/feedback
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import { DEFAULT_RETRY_POLICY, computeBackoffMs } from "../pipeline/retry-backoff.js";
+import type { FailureRecord } from "../pipeline/failure-classification.js";
 import type { LLMExecutor, Step, StepReporter } from "../pipeline/types.js";
 import { makeSnapshot } from "./configured-run-fixture.js";
 
@@ -130,6 +131,28 @@ describe("feedbackLoopStep", () => {
     expect(outputs.finalFeedback).toBe("Looks good");
     expect(implementStep.run).toHaveBeenCalledTimes(1);
     expect(reviewStep.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an implement invocation failure on the pass when review approves", async () => {
+    const failure: FailureRecord = {
+      category: "crash", code: "UNKNOWN", stage: "implement", attempt: 1, retryable: false,
+      message: "stream disconnected", evidence: { truncated: false },
+    };
+    vi.mocked(implementStep.run).mockResolvedValue({
+      ...IMPLEMENT_OUTPUTS,
+      telemetry: { outcome: "error", numTurns: 1, durationMs: 5, costUsd: null, tokensIn: null, tokensOut: null },
+      invocationFailure: failure,
+    });
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    const outputs = await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(outputs.approved).toBe(true);
+    const pass = (outputs.passes as Array<Record<string, unknown>>)[0];
+    expect(pass.implementOutcome).toBe("error");
+    expect(pass.reviewApproved).toBe(true);
+    expect(pass.implementFailureCode).toBe("UNKNOWN");
+    expect(pass.implementFailureMessage).toBe("stream disconnected");
   });
 
   it("uses implementationPrompt for the implement step", async () => {

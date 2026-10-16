@@ -81,6 +81,10 @@ export interface PassStat extends Record<string, unknown> {
   attempts?: number;
   /** Spawn attempts the review call made for this pass, when review ran (>1 only under a retried transient failure). */
   reviewAttempts?: number;
+  /** Failure code when the implement invocation failed yet the pass went on to review; the review verdict never clears it. */
+  implementFailureCode?: string;
+  /** Redacted one-line cause for `implementFailureCode` (the failure record's message). */
+  implementFailureMessage?: string;
   /** Optional implement-invocation attribution (AII-946/954), carried from telemetry; absent on legacy executors. */
   attribution?: InvocationAttributionV1;
 }
@@ -411,6 +415,7 @@ export async function runFeedbackLoop(
     }
 
     const implementTelemetry = implementOutputs.telemetry as RunTelemetry | undefined;
+    const implementInvocationFailure = implementOutputs.invocationFailure as FailureRecord | undefined;
     const pass: PassStat = {
       iteration,
       implementTurns: implementTelemetry?.numTurns ?? null,
@@ -423,6 +428,9 @@ export async function runFeedbackLoop(
       cacheReadTokens: implementTelemetry?.cacheReadTokens ?? null,
       cacheCreationTokens: implementTelemetry?.cacheCreationTokens ?? null,
       attempts: implementAttemptsTotal,
+      ...(implementInvocationFailure
+        ? { implementFailureCode: implementInvocationFailure.code, implementFailureMessage: implementInvocationFailure.message }
+        : {}),
       ...(implementTelemetry?.attribution ? { attribution: implementTelemetry.attribution } : {}),
     };
     passes.push(pass);
@@ -526,7 +534,10 @@ export async function runFeedbackLoop(
           verdict: {
             approved: reviewOutputs.approved,
             reason: reviewOutputs.approved ? "approved" : "changes_requested",
-            summary: reviewOutputs.feedback,
+            // An approving review never clears the implement invocation's own failure.
+            summary: implementInvocationFailure
+              ? `Implement invocation failed (${implementInvocationFailure.code}): ${implementInvocationFailure.message}\n\n${reviewOutputs.feedback}`
+              : reviewOutputs.feedback,
           },
           usage: sumUsage(implementTelemetry, reviewOutputs.telemetry),
         });

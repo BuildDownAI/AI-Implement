@@ -132,6 +132,48 @@ describe("usage and terminal semantics", () => {
   });
 });
 
+// TEST-2 reported pass 1 success/rejected and pass 2 error/approved. The retained invocation
+// output for that run is not available to this repo, so the cause is NOT proven from it; this
+// fixture reproduces the one parser sequence that yields exit 0 + outcome=error + a later clean
+// turn: a non-reconnect `error` event (sticky fatal) followed by a successful `turn.completed`.
+describe("error then clean completion (TEST-2 shape)", () => {
+  const fatalThenClean = () => j(
+    started,
+    { type: "error", message: `stream disconnected before completion ${SK}` },
+    msg("done"),
+    done({ input_tokens: 5, output_tokens: 2 }),
+  );
+
+  it("pass 1 (clean) is success and pass 2 (error, then clean turn) stays error with exit 0", () => {
+    const pass1 = parseCodexStream(j(started, msg("done"), done())).toResult({ exitCode: 0 });
+    expect(pass1.telemetry?.outcome).toBe("success");
+    expect(pass1.terminalStatus).toEqual({ subtype: "success", isError: false });
+
+    const pass2 = parseCodexStream(fatalThenClean()).toResult({ exitCode: 0 });
+    expect(pass2.exitCode).toBe(0);
+    expect(pass2.telemetry?.outcome).toBe("error");
+    expect(pass2.terminalStatus).toEqual({ subtype: "error", isError: true });
+  });
+
+  it("carries the redacted terminal error into the failure record so the cause is reportable", () => {
+    const result = parseCodexStream(fatalThenClean()).toResult({ exitCode: 0 });
+    const failure = classifyLlmResult(result, { stage: "implement", attempt: 1, expectsStructuredOutput: false });
+    expect(failure.code).toBe("LLM_TERMINAL_ERROR");
+    expect(failure.message).toContain("stream disconnected before completion");
+    expect(failure.evidence.llmErrorMessage).toContain("stream disconnected before completion");
+    expect(JSON.stringify(failure)).not.toContain(SK);
+  });
+
+  it("a corrupt line before a clean completion stays an error and records no invented message", () => {
+    const result = parseCodexStream("not json\n" + j(started, done())).toResult({ exitCode: 0 });
+    expect(result.terminalStatus?.isError).toBe(true);
+    expect(result.errorMessage).toBeUndefined();
+    const failure = classifyLlmResult(result, { stage: "implement", attempt: 1, expectsStructuredOutput: false });
+    expect(failure.code).toBe("LLM_TERMINAL_ERROR");
+    expect(failure.evidence.llmErrorMessage).toBeUndefined();
+  });
+});
+
 const started = { type: "turn.started" };
 const approved = msg('{"approved":true}');
 const wsRetry = (attempt: number, url = "ws://local-feedback-provider:8080/v1/responses") => ({

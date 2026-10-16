@@ -28,6 +28,7 @@ export interface ReviewSummary extends Record<string, unknown> {
     implementOutcome: string;
     costUsd: number | null;
     reviewApproved: boolean | null;
+    implementFailureCode?: string;
     attempts?: number;
     reviewAttempts?: number;
     reviewCostUsd?: number | null;
@@ -705,7 +706,8 @@ function buildUnapprovedSection(summary: ReviewSummary | undefined, draft: boole
       const passCost = p.costUsd != null || p.reviewCostUsd != null ? (p.costUsd ?? 0) + (p.reviewCostUsd ?? 0) : null;
       const cost = passCost != null ? `$${passCost.toFixed(2)}` : "—";
       const review = p.reviewApproved == null ? "not run" : p.reviewApproved ? "approved" : "rejected";
-      return `| ${p.iteration} | ${p.implementOutcome} | ${p.implementTurns ?? "?"} | ${p.attempts ?? 1} | ${cost} | ${review} |`;
+      const outcome = p.implementFailureCode ? `${p.implementOutcome} (${p.implementFailureCode})` : p.implementOutcome;
+      return `| ${p.iteration} | ${outcome} | ${p.implementTurns ?? "?"} | ${p.attempts ?? 1} | ${cost} | ${review} |`;
     })
     .join("\n");
   // A provider outage is not a review verdict: the reviewer may never have run, so the
