@@ -1004,6 +1004,23 @@ export const projectsScript = `
     return body;
   }
 
+  function agOverrideProblem() {
+    for (var i = 0; i < AG_STAGES.length; i++) {
+      for (var j = 0; j < AG_FIELDS.length; j++) {
+        var d = agDraft(AG_STAGES[i], AG_FIELDS[j]);
+        if (d.mode !== 'override') continue;
+        var raw = String(d.value == null ? '' : d.value).trim();
+        if (AG_FIELDS[j] === 'invocationTimeoutMs') {
+          var n = Number(raw);
+          if (!raw || !Number.isInteger(n) || n <= 0) return AG_STAGES[i] + ': ' + AG_LABELS[AG_FIELDS[j]] + ' must be a positive whole number, or switch it to Inherit.';
+        } else if (!raw) {
+          return AG_STAGES[i] + ': ' + AG_LABELS[AG_FIELDS[j]] + ' is blank. Enter a value or switch it to Inherit.';
+        }
+      }
+    }
+    return '';
+  }
+
   function agShowError(message) {
     var err = document.getElementById('md-agents-error');
     err.textContent = message;
@@ -1018,6 +1035,8 @@ export const projectsScript = `
     if (saveBtn.disabled) return;
     document.getElementById('md-agents-error').classList.add('hidden');
     document.getElementById('md-agents-ok').classList.add('hidden');
+    var overrideProblem = agOverrideProblem();
+    if (overrideProblem) { agShowError(overrideProblem); return; }
     var body = agDiff();
     if (!Object.keys(body).length) { agShowError('Nothing to save: no agent setting changed.'); return; }
     if (agentState.draftEnabled) {

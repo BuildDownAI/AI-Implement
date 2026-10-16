@@ -572,6 +572,33 @@ describe("projects page agents tab", () => {
     expect(puts(m)[0].body).toEqual({ stages: { review: { model: null } } });
   });
 
+  it("blocks the PUT when an override is left blank or the timeout is not a positive integer", async () => {
+    const m = mountAgents();
+    await open(m);
+    const mode = field(m.doc, "mode", "review", "model");
+    mode.value = "override";
+    fire(m.doc, mode);
+    const blank = field(m.doc, "value", "review", "model");
+    blank.value = "   ";
+    blank.dispatchEvent(new m.doc.defaultView!.Event("input", { bubbles: true }));
+    await m.win.saveAgentConfig();
+    expect(puts(m)).toHaveLength(0);
+    expect(m.doc.getElementById("md-agents-error")!.textContent).toContain("Model is blank");
+
+    const mode2 = field(m.doc, "mode", "review", "model");
+    mode2.value = "inherit";
+    fire(m.doc, mode2);
+    const tmode = field(m.doc, "mode", "review", "invocationTimeoutMs");
+    tmode.value = "override";
+    fire(m.doc, tmode);
+    const tin = field(m.doc, "value", "review", "invocationTimeoutMs");
+    tin.value = "";
+    tin.dispatchEvent(new m.doc.defaultView!.Event("input", { bubbles: true }));
+    await m.win.saveAgentConfig();
+    expect(puts(m)).toHaveLength(0);
+    expect(m.doc.getElementById("md-agents-error")!.textContent).toContain("positive whole number");
+  });
+
   it("lists only active, permitted, compatible profiles and shows readiness and recovery", async () => {
     const m = mountAgents({
       accounts: [
