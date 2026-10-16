@@ -34,6 +34,7 @@ let dispatchThrows: boolean;
 let workflow: string;
 let server: http.Server | undefined;
 let installationId: number;
+let prState: { state: string; merged: boolean } | null;
 let candidateRuns: Array<{ id: number; run_attempt: number; display_title: string; head_branch: string }>;
 
 function stage(profile = "cdx") {
@@ -67,6 +68,7 @@ beforeEach(async () => {
   vi.stubEnv("RUNNER_TOKEN_SECRET", SECRET);
   vi.stubEnv("RUNNER_MODE", "gha");
   installationId = 7;
+  prState = { state: "open", merged: false };
   candidateRuns = [];
   workflow = fs.readFileSync("workflows/claude-implement.yml", "utf8");
   sent = [];
@@ -83,6 +85,7 @@ beforeEach(async () => {
     return { ...actual,
       getDefaultBranchFileText: async (_token: string, _owner: string, _repo: string, file: string) =>
         file === ".github/workflows/claude-implement.yml" ? workflow : null,
+      getPullRequestState: async () => prState,
       postWorkflowDispatch: async ({ inputs }: { inputs: DispatchInputs }) => {
         sent.push(inputs);
         if (dispatchThrows) throw new Error("SYNTHETIC-network-loss");
@@ -426,7 +429,211 @@ describe("production managed GHA review-fix launch", () => {
     expect(count("model_credential_grants")).toBe(0);
   });
 
-  it("keeps admission closed until the separately reviewed admission issue", async () => {
-    expect(await production.canAdmit(SCOPE, CONFIG)).toBe("configuration_error");
+  describe("managed admission", () => {
+    const sideEffects = () => ["run_agent_config_snapshots", "model_credential_grants"].map(count);
+    const admit = (rt: ModelAuthRuntime | undefined = runtime) => production.canAdmit(SCOPE, CONFIG, rt);
+
+    it("admits a configured Codex selection read-only, then launches exactly once on the real worker", async () => {
+      const before = sideEffects();
+      expect(await admit()).toBe("admit");
+      expect(sideEffects()).toEqual(before);
+      const { worker, plan } = await launch();
+      expect((await worker.launch(plan)).status).toBe("accepted");
+      expect(sent).toHaveLength(1);
+      expect((await decode()).agentConfig?.stages.implementation.accountProfileId).toBe("cdx");
+    });
+
+    async function writeKey(profileId: string, agent: "claude" | "codex", provider: "anthropic" | "openai", authMode: string) {
+      profiles.saveAccountProfileRevision({ profileId, identity: profileId, revision: 1, agent, provider,
+        authMode: authMode as "anthropic-api-key", allowedProjectKeys: ["AII"], metadata: { credentialRef: `model-account:${profileId}` } });
+      const { createModelProtectedSecrets } = await import("../model-protected-secrets.js");
+      expect(createModelProtectedSecrets().write(`model-account:${profileId}`, `SYNTHETIC-${profileId}-key`).ok).toBe(true);
+    }
+
+    it("admits a supported mixed Claude-API plus Codex selection and launches with both stages frozen", async () => {
+      await writeKey("api", "claude", "anthropic", "anthropic-api-key");
+      const claude = { agent: "claude" as const, provider: "anthropic" as const, model: "claude-sonnet-5-5",
+        accountProfileId: "api", invocationTimeoutMs: 60_000 };
+      profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: claude, implementation: stage(), review: claude } });
+      const before = sideEffects();
+      expect(await admit()).toBe("admit");
+      expect(sideEffects()).toEqual(before);
+      const { worker, plan } = await launch();
+      expect((await worker.launch(plan)).status).toBe("accepted");
+      expect(sent).toHaveLength(1);
+      const snapshot = (await decode()).agentConfig!;
+      expect(snapshot.stages.planning.agent).toBe("claude");
+      expect(snapshot.stages.implementation.agent).toBe("codex");
+      expect(snapshot.profiles.review.authMode).toBe("anthropic-api-key");
+      expect(snapshot.profiles.implementation.authMode).toBe("codex-subscription");
+    });
+
+    it("admits a Codex API-key selection and launches exactly once", async () => {
+      await writeKey("capi", "codex", "openai", "openai-api-key");
+      defaults("capi");
+      expect(await admit()).toBe("admit");
+      const { worker, plan } = await launch();
+      expect((await worker.launch(plan)).status).toBe("accepted");
+      expect(sent).toHaveLength(1);
+      const snapshot = (await decode()).agentConfig!;
+      expect(snapshot.profiles.implementation.authMode).toBe("openai-api-key");
+      expect(snapshot.stages.implementation.accountProfileId).toBe("capi");
+    });
+
+    it("fails an unauthorized project key without launching or granting", async () => {
+      profiles.saveAccountProfileRevision({ profileId: "cdx", identity: "cdx", revision: 2, agent: "codex", provider: "openai",
+        authMode: "codex-subscription", allowedProjectKeys: ["OTHER"] });
+      expect(await admit()).toBe("configuration_error");
+      expect(sent).toHaveLength(0);
+      expect(count("model_credential_grants")).toBe(0);
+    });
+
+    it("refuses a managed Claude subscription stage", async () => {
+      profiles.saveAccountProfileRevision({ profileId: "sub", identity: "sub", revision: 1, agent: "claude", provider: "anthropic",
+        authMode: "claude-subscription", allowedProjectKeys: ["AII"] });
+      profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: {
+        planning: { agent: "claude", provider: "anthropic", model: "claude-sonnet-5-5", accountProfileId: "sub", invocationTimeoutMs: 60_000 },
+        implementation: stage(), review: stage(),
+      } });
+      expect(await admit()).toBe("configuration_error");
+      expect(count("model_credential_grants")).toBe(0);
+    });
+
+    it.each(["private-run-config-v1", "stage-agent-config-v1", "stage-agent-launch-context-v1"])(
+      "fails an incapable template missing %s", async (marker) => {
+        workflow = workflow.replaceAll(marker, "unsupported-marker");
+        expect(await admit()).toBe("configuration_error");
+        expect(sent).toHaveLength(0);
+      });
+
+    it("requires the execution-policy marker only under the full-access opt-in", async () => {
+      workflow = workflow.replaceAll("ephemeral-execution-policy-v1", "unsupported-policy");
+      expect(await admit()).toBe("admit");
+      const mapping = config.getMappings()["AII"]!;
+      config.upsertMapping("AII", { ...mapping, extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "ephemeral-runner-asserted-v1" } });
+      expect(await admit()).toBe("configuration_error");
+    });
+
+    it("defers on uncertainty and retained gates instead of failing", async () => {
+      expect(await production.canAdmit(SCOPE, CONFIG)).toBe("defer");
+      installationId = 99;
+      expect(await admit()).toBe("defer");
+      installationId = 7;
+      prState = { state: "closed", merged: false };
+      expect(await admit()).toBe("defer");
+      prState = { state: "open", merged: false };
+      vi.stubEnv("RUNNER_MODE", "fly");
+      expect(await admit()).toBe("defer");
+      vi.stubEnv("RUNNER_MODE", "gha");
+      expect(await production.canAdmit(SCOPE, { ...CONFIG, runnerCallbackBaseUrl: null }, runtime)).toBe("defer");
+      expect(await admit()).toBe("admit");
+    });
+
+    it("defers rather than fails when the repository visibility is unknown", async () => {
+      expect(await admit()).toBe("admit");
+      const { enqueueReviewFix, getPendingReviewFixes } = await import("../review-fix-queue.js");
+      const queueId = enqueueReviewFix({ issueId: "i1", issueIdentifier: "AII-1", repo: SCOPE.repository, prNumber: SCOPE.prNumber, reason: "review" });
+      const unknownVisibility: typeof fetch = async (input) => String(input).includes("/actions/") || String(input).includes("/contents/")
+        ? Response.json({ workflow_runs: [] }) : new Response("boom", { status: 500 });
+      const { createModelAuthRuntime } = await import("../model-auth-runtime.js");
+      const uncertain = createModelAuthRuntime({ config: CONFIG, env: { RUNNER_TOKEN_SECRET: SECRET }, fetchImpl: unknownVisibility });
+      const before = [...sideEffects(), count("model_profile_reservations"), count("review_fix_attempts")];
+      expect(await admit(uncertain)).toBe("defer");
+      expect(getPendingReviewFixes().map((row) => row.id)).toContain(queueId);
+      expect([...sideEffects(), count("model_profile_reservations"), count("review_fix_attempts")]).toEqual(before);
+    });
+
+    it("defers on a real locked database, keeps the queue row pending, then admits after the lock clears", async () => {
+      const { enqueueReviewFix, getPendingReviewFixes } = await import("../review-fix-queue.js");
+      const queueId = enqueueReviewFix({ issueId: "i1", issueIdentifier: "AII-1", repo: SCOPE.repository, prNumber: SCOPE.prNumber, reason: "review" });
+      const request = { scope: SCOPE, feedback: { taskText: "t", findings: [{ findingKey: "f1", version: 1 }], queueCursor: { queueId, eventId: 1 } },
+        jobTimeoutMinutes: 30 };
+      const before = [...sideEffects(), count("model_profile_reservations")];
+      const db = dedup.getDb();
+      db.pragma("journal_mode = DELETE");
+      db.pragma("busy_timeout = 1");
+      const { default: Database } = await import("better-sqlite3");
+      const other = new Database(dbPath);
+      const locking: ModelAuthRuntime = { ...runtime, preparationDeps: (...args) => {
+        other.exec("BEGIN EXCLUSIVE");
+        return runtime.preparationDeps(...args);
+      } };
+      try {
+        expect(await production.canAdmit(SCOPE, CONFIG, locking)).toBe("defer");
+        other.exec("ROLLBACK");
+        expect(await production.admitReviewFix(request, CONFIG, attempts, locking)).toMatchObject({ status: "deferred" });
+      } finally {
+        try { other.exec("ROLLBACK"); } catch { /* released */ }
+        other.close();
+      }
+      expect(getPendingReviewFixes().map((row) => row.id)).toContain(queueId);
+      expect([...sideEffects(), count("model_profile_reservations")]).toEqual(before);
+      expect(sent).toHaveLength(0);
+      expect(await admit()).toBe("admit");
+    });
+
+    it.each(["run_attempt_token", "run_publication_token"])(
+      "fails a readable workflow whose declared %s input is renamed, dispatching nothing", async (input) => {
+        workflow = workflow.replace(new RegExp(`^(\\s{2,})${input}:\\s*$`, "m"), "$1renamed_input:");
+        expect(workflow).not.toMatch(new RegExp(`^\\s{2,}${input}:\\s*$`, "m"));
+        const { enqueueReviewFix, getPendingReviewFixes } = await import("../review-fix-queue.js");
+        const queueId = enqueueReviewFix({ issueId: "i1", issueIdentifier: "AII-1", repo: SCOPE.repository, prNumber: SCOPE.prNumber, reason: "review" });
+        expect(await admit()).toBe("configuration_error");
+        const request = { scope: SCOPE, feedback: { taskText: "t", findings: [], queueCursor: { queueId, eventId: 1 } }, jobTimeoutMinutes: 30 };
+        const attemptsBefore = count("review_fix_attempts");
+        expect((await production.admitReviewFix(request, CONFIG, attempts, runtime)).status).toBe("deferred");
+        expect(getPendingReviewFixes().map((row) => row.id)).not.toContain(queueId);
+        expect(count("review_fix_attempts")).toBe(attemptsBefore);
+        expect(sent).toHaveLength(0);
+        expect(count("model_credential_grants")).toBe(0);
+        // A transient PR read still defers rather than failing.
+        prState = null;
+        expect(await admit()).toBe("defer");
+      });
+
+    it("holds, rather than refuses, a launch whose selection cannot be read because the database is locked", async () => {
+      const { prepareManagedDispatch } = await import("../managed-dispatch-auth.js");
+      const db = dedup.getDb();
+      db.pragma("journal_mode = DELETE");
+      db.pragma("busy_timeout = 1");
+      const { default: Database } = await import("better-sqlite3");
+      const other = new Database(dbPath);
+      const locking: ModelAuthRuntime = { ...runtime, preparationDeps: (...args) => {
+        other.exec("BEGIN EXCLUSIVE");
+        return runtime.preparationDeps(...args);
+      } };
+      try {
+        const decision = await prepareManagedDispatch({ dispatchId: prepared.attemptId, projectKey: "AII", backend: "github-actions",
+          owner: "acme", repo: "app", workflowFile: "claude-implement.yml" }, locking);
+        expect(decision).toEqual({ kind: "hold", code: "resolution_unavailable" });
+      } finally { other.exec("ROLLBACK"); other.close(); }
+      expect(count("model_credential_grants")).toBe(0);
+      const { worker, plan } = await launch();
+      expect((await worker.launch(plan)).status).toBe("accepted");
+    });
+
+    it("fails the queue row with a code-only log and reserves nothing on a bad configuration", async () => {
+      const { enqueueReviewFix, getPendingReviewFixes } = await import("../review-fix-queue.js");
+      const queueId = enqueueReviewFix({ issueId: "i1", issueIdentifier: "AII-1", repo: SCOPE.repository, prNumber: SCOPE.prNumber, reason: "review" });
+      profiles.saveAccountProfileRevision({ profileId: "cdx", identity: "cdx", revision: 2, agent: "codex", provider: "openai",
+        authMode: "codex-subscription", allowedProjectKeys: ["OTHER"] });
+      const logged: string[] = [];
+      for (const method of ["error", "log", "warn"] as const) {
+        vi.spyOn(console, method).mockImplementation((...args: unknown[]) => { logged.push(args.map(String).join(" ")); });
+      }
+      const reservations = () => [count("model_profile_reservations"), count("review_fix_attempts"), ...sideEffects()];
+      const before = reservations();
+      const request = { scope: SCOPE, feedback: { taskText: "t", findings: [], queueCursor: { queueId, eventId: 1 } },
+        jobTimeoutMinutes: 30 };
+      const outcome = await production.admitReviewFix(request, CONFIG, attempts, runtime);
+      expect(outcome.status).toBe("deferred");
+      const row = dedup.getDb().prepare("SELECT status FROM review_fix_queue WHERE id = ?").get(queueId) as { status: string };
+      expect(row.status).toBe("failed");
+      expect(getPendingReviewFixes().map((r) => r.id)).not.toContain(queueId);
+      expect(reservations()).toEqual(before);
+      expect(sent).toHaveLength(0);
+      expect(logged.some((line) => line.includes("configuration_error"))).toBe(true);
+      for (const line of logged) { expect(line).not.toContain("SYNTHETIC"); expect(line).not.toContain(ACCESS); }
+    });
   });
 });

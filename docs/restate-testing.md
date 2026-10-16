@@ -232,6 +232,10 @@ which AII-800's suite already covers precisely against a faster-to-assert fake.
 
 CI runs `npm run test:restate` against server 1.7.10 (the `restate-tests-binary` job); its pass/fail there — not this document — is the authoritative evidence for AII-813's "both variants and SDK boundary suite pass" acceptance criterion. This is binary-server evidence, not a live pilot rollout. `npm run typecheck` (which covers the Restate tests) passes as of the commit that added this section.
 
+### `review-fix-managed.restate.test.ts`: managed Codex on GHA (AII-1444)
+
+Composes `createProductionReviewFixServices` with a real model-auth runtime on the `restate-server` binary. Only GitHub's HTTP surface and workflow dispatch are synthetic. It proves ReviewFixPR admission, the protected managed worker, the authenticated result callback, the current-head check and the finalizer; that a moved head, a cancelled attempt and a late result never approve; that occupancy is released only once the run is terminal; that an incapable template fails the queue row with nothing dispatched; and that no bearer, run token or credential reaches a journal value. Engine evidence, not live proof.
+
 ## `kg-refresh-pilot.restate.test.ts`: the switched kg-refresh path against production services (AII-896)
 
 `kg-refresh-workflow.restate.test.ts` (AII-894) runs `KgRefresh` and `KgRepo` against fakes for every

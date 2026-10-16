@@ -212,6 +212,7 @@ describe("prepareManagedDispatch", () => {
     [{ status: "queued", dispatchId: "d1", busyProfiles: ["sub"] }, { kind: "leave-queued", code: "profile_busy" }],
     [{ status: "configuration-error", code: "repository_public" }, { kind: "refuse", category: "configuration-error", code: "repository_public" }],
     [{ status: "authentication-required", code: "credential_unavailable", stage: "implementation", profileId: "p" }, { kind: "refuse", category: "authentication-required", code: "credential_unavailable" }],
+    [{ status: "configuration-error", code: "resolution_unavailable" }, { kind: "hold", code: "resolution_unavailable" }],
     [{ status: "recovery-required", code: "grant_expired" }, { kind: "hold", code: "grant_expired" }],
   ])("maps %j", async (result, expected) => {
     vi.resetModules();

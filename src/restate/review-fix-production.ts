@@ -2,6 +2,7 @@
  * external calls live in SQLite/GitHub adapters; this file is the allowed SDK
  * boundary where those adapters become Restate services. */
 import { getMappings, resolveReviewFixLifecycle, type RepoMapping } from "../config.js";
+import { randomUUID } from "node:crypto";
 import { getDb } from "../dedup.js";
 import { hasEphemeralFullAccessOptIn } from "../model-auth-contract.js";
 import type { ModelAuthRuntime } from "../model-auth-runtime.js";
@@ -22,7 +23,8 @@ import type { PreparedReviewFixAttempt, ReviewFixAdmissionOutcome, ReviewFixAdmi
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
 import { mintPreparedReviewFixToken } from "../runner-tokens.js";
 import { getRunnerMode, resolveExecutionPath } from "../runner-mode.js";
-import { resolveWorkflowCapabilities } from "../workflow-probe.js";
+import { inspectAgentReadiness } from "../agent-run-preparation.js";
+import { resolveWorkflowCapabilities, type WorkflowCapabilities } from "../workflow-probe.js";
 import type { ProviderRegistry } from "../providers/registry.js";
 import { createReviewFixAttempt } from "./review-fix-attempt.js";
 import { createReviewFixPR } from "./review-fix-pr.js";
@@ -62,30 +64,91 @@ function selectedMapping(scope: ScopedPrIdentity): RepoMapping | null {
 
 export type ReviewFixAdmission = "admit" | "defer" | "configuration_error";
 
+/** Readiness codes that are uncertain rather than wrong: the queue stays pending and a later check can admit.
+ * `resolution_failed` is deliberately not here: an unauthorized, disabled or missing profile surfaces as that code,
+ * whereas `resolution_unavailable` is an operational fault (such as a locked database) reading the inputs. */
+const DEFERRED_READINESS_CODES: ReadonlySet<string> = new Set([
+  "delivery_unreadable", "repository_visibility_unknown", "credential_unavailable", "session_unavailable",
+  "resolution_unavailable",
+]);
+
+interface AdmissionDecision { verdict: ReviewFixAdmission; reason: string }
+
 /** Verify the dispatch-ref contract immediately before a new reservation. A
  * changed workflow, runner mode, missing callback credential, or GitHub outage
- * defers admission with the queue still pending. An opted-in (managed) project is a
- * configuration error: GitHub Actions cannot carry a model-auth grant yet, so nothing
- * is checked on GitHub and nothing is reserved. */
-export async function canAdmit(scope: ScopedPrIdentity, config: ReviewFixProductionConfig): Promise<ReviewFixAdmission> {
-  const entry = selectedEntry(scope);
-  if (!entry) return "defer";
-  const [key, mapping] = entry;
-  if (isManagedProject(key)) return "configuration_error";
-  if (!config.runnerCallbackBaseUrl || !config.runnerTokenSecret) return "defer";
-  return await verifyDispatchContract(scope, config, mapping) ? "admit" : "defer";
+ * defers admission with the queue still pending. A managed (opted-in) project is
+ * additionally admitted only when its workflow carries the managed capabilities and
+ * the read-only agent readiness check passes; that check reserves, snapshots and mints
+ * nothing, because launch preparation is the only place that freezes and grants. */
+export async function canAdmit(
+  scope: ScopedPrIdentity,
+  config: ReviewFixProductionConfig,
+  runtime?: ModelAuthRuntime,
+): Promise<ReviewFixAdmission> {
+  return (await decideAdmission(scope, config, runtime)).verdict;
 }
 
-async function verifyDispatchContract(scope: ScopedPrIdentity, config: ReviewFixProductionConfig, mapping: RepoMapping): Promise<boolean> {
+async function decideAdmission(
+  scope: ScopedPrIdentity,
+  config: ReviewFixProductionConfig,
+  runtime?: ModelAuthRuntime,
+): Promise<AdmissionDecision> {
+  const entry = selectedEntry(scope);
+  if (!entry) return { verdict: "defer", reason: "not_selected" };
+  const [key, mapping] = entry;
+  const managed = isManagedProject(key);
+  if (!config.runnerCallbackBaseUrl || !config.runnerTokenSecret) return { verdict: "defer", reason: "callback_unavailable" };
+  if (!managed) {
+    return await verifyDispatchContract(scope, config, mapping) ? { verdict: "admit", reason: "legacy" }
+      : { verdict: "defer", reason: "contract_unverified" };
+  }
+  if (!runtime) return { verdict: "defer", reason: "model_auth_unavailable" };
+  const capabilities = await verifyDispatchContract(scope, config, mapping, true);
+  if (!capabilities) return { verdict: "defer", reason: "contract_unverified" };
+  if (capabilities.contract !== "envelope" || capabilities.supportsAttemptCorrelation !== true
+    || capabilities.supportsRunPublicationToken !== true || capabilities.supportsStageAgentConfig !== true || capabilities.supportsPrivateRunConfig !== true) {
+    return { verdict: "configuration_error", reason: "workflow_capability_missing" };
+  }
+  if (hasEphemeralFullAccessOptIn(mapping.extraEnv) && capabilities.supportsExecutionPolicy !== true) {
+    return { verdict: "configuration_error", reason: "execution_policy_missing" };
+  }
+  const repository = `${mapping.owner}/${mapping.repo}`;
+  let readiness;
+  try {
+    readiness = await inspectAgentReadiness({ dispatchId: `admission-readiness-${randomUUID()}`, projectKey: key,
+      backend: "github-actions", workflowRepository: repository, workflowFile: mapping.workflowFile,
+      repositories: [repository] }, runtime.preparationDeps({ owner: mapping.owner, repo: mapping.repo, projectKey: key }));
+  } catch { return { verdict: "defer", reason: "readiness_unavailable" }; }
+  if (readiness.status === "legacy") return { verdict: "configuration_error", reason: "no_stage_configuration" };
+  if (readiness.status === "not-ready") {
+    return { verdict: DEFERRED_READINESS_CODES.has(readiness.code) ? "defer" : "configuration_error", reason: readiness.code };
+  }
+  // Launch preparation refuses a Claude subscription stage on managed projects; fail the row now rather than at launch.
+  if (readiness.profiles.some((profile) => profile.authMode === "claude-subscription")) {
+    return { verdict: "configuration_error", reason: "claude_subscription_unsupported" };
+  }
+  return { verdict: "admit", reason: "managed" };
+}
+
+async function verifyDispatchContract(
+  scope: ScopedPrIdentity,
+  config: ReviewFixProductionConfig,
+  mapping: RepoMapping,
+  managed = false,
+): Promise<WorkflowCapabilities | null> {
   try {
     const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
-    if (await getInstallationId(config.githubAppId, config.githubAppPrivateKey, mapping.owner) !== scope.installationId) return false;
+    if (await getInstallationId(config.githubAppId, config.githubAppPrivateKey, mapping.owner) !== scope.installationId) return null;
+    // A managed verdict can fail the queue row, so an unreadable workflow must throw (defer) instead of reading as incapable.
     const capabilities = await resolveWorkflowCapabilities({ owner: mapping.owner, repo: mapping.repo,
-      workflowFile: mapping.workflowFile, token, ref: mapping.defaultBranch });
+      workflowFile: mapping.workflowFile, token, ref: mapping.defaultBranch, ...(managed ? { failOnTransient: true } : {}) });
     const prState = await getPullRequestState(token, mapping.owner, mapping.repo, scope.prNumber);
+    if (prState?.state !== "open" || prState.merged) return null;
+    // A managed verdict reports a known-incapable template as a configuration error, so the capabilities are returned for it to judge.
+    if (managed) return capabilities;
     return capabilities.contract === "envelope" && capabilities.supportsAttemptCorrelation
-      && capabilities.supportsRunPublicationToken && prState?.state === "open" && !prState.merged;
-  } catch { return false; }
+      && capabilities.supportsRunPublicationToken ? capabilities : null;
+  } catch { return null; }
 }
 
 /** Who fixes review findings for this mapping; an unmapped PR keeps ai-implement. */
@@ -103,20 +166,21 @@ export function recordDelegatedFix(scope: ScopedPrIdentity, queueCursor: { queue
     + `(${resolveReviewProcess(mapping?.reviewProcess).id}), skipping review fix #${queueCursor.queueId}`);
 }
 
-/** Reserve an attempt when the dispatch contract holds. An opted-in project fails its queue row and
+/** Reserve an attempt when the dispatch contract holds. A configuration error fails its queue row and
  * reserves nothing; every other non-admit defers with the queue still pending. */
 export async function admitReviewFix(
   request: ReviewFixAdmissionRequest,
   config: ReviewFixProductionConfig,
   store: Pick<SqliteReviewFixAttemptStore, "admit">,
+  runtime?: ModelAuthRuntime,
 ): Promise<ReviewFixAdmissionOutcome> {
-  const verdict = await canAdmit(request.scope, config);
+  const { verdict, reason } = await decideAdmission(request.scope, config, runtime);
   if (verdict === "admit") return store.admit(request);
   if (verdict === "configuration_error") {
     const cursor = request.feedback.queueCursor;
     // A failed row is no longer pending, so the PR object stops rechecking.
     if (cursor) updateReviewFixStatus(cursor.queueId, "failed");
-    console.error(`[review-fix] ${request.scope.repository}#${request.scope.prNumber} not launched: configuration_error (gha_not_supported)`);
+    console.error(`[review-fix] ${request.scope.repository}#${request.scope.prNumber} not launched: configuration_error (${reason})`);
   }
   return { status: "deferred", reason: "paused" };
 }
@@ -274,7 +338,7 @@ export function createProductionReviewFixServices(
   const pr = createReviewFixPR({
     recordFeedback: async (event) => acceptReviewFixWebhookEvent(event),
     attempts: {
-      admit: (request) => admitReviewFix(request, config, store),
+      admit: (request) => admitReviewFix(request, config, store, runtime),
     },
     recordDelegated: async (scope, queueCursor) => recordDelegatedFix(scope, queueCursor),
     load: async (scope) => {
