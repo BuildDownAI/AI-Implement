@@ -72,6 +72,7 @@ export const projectsHtml = `
         <button type="button" class="btn btn-sm" data-md-tab="capacity" onclick="switchMappingTab('capacity')">Capacity</button>
         <button type="button" class="btn btn-sm" data-md-tab="guardrails" onclick="switchMappingTab('guardrails')">Guardrails</button>
         <button type="button" class="btn btn-sm" data-md-tab="provider" onclick="switchMappingTab('provider')">Provider</button>
+        <button type="button" class="btn btn-sm" data-md-tab="agents" id="md-tab-agents" onclick="switchMappingTab('agents')">Agents</button>
       </span>
     </div>
     <div class="md-body">
@@ -397,6 +398,20 @@ export const projectsHtml = `
               <input class="input mono" id="md-planning-wf" value="claude-plan.yml">
             </div>
           </div>
+        </div>
+      </div>
+      <div data-md-panel="agents" hidden>
+        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Agents</h3>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 12px">Opt this project in to per-stage agent settings. Each field inherits the orchestrator default or overrides it for this project only. Legacy projects keep the Provider tab behavior.</p>
+        <div id="md-agents-new" class="field-hint hidden">Save the mapping first. Agent settings attach to an existing project key.</div>
+        <div id="md-agents-body">
+          <label class="checkbox-row"><input id="md-agents-enabled" type="checkbox"> Opt in to stage agent configuration</label>
+          <div id="md-agents-profiles" style="margin:12px 0"></div>
+          <div id="md-agents-stages"></div>
+          <div class="field-hint" style="margin-top:12px">Changes apply to the next run only; runs already in flight keep their settings. Prompts and review rules stay in the repository, and there is no per-issue override. Agent settings are saved with their own button, separately from the mapping.</div>
+          <div id="md-agents-error" class="error hidden" role="alert" style="margin-top:10px"></div>
+          <div id="md-agents-ok" class="field-hint hidden" style="margin-top:10px"></div>
+          <div style="margin-top:12px"><button type="button" id="md-agents-save" class="btn btn-accent" onclick="saveAgentConfig()">Save agent settings</button></div>
         </div>
       </div>
     </div>
@@ -765,6 +780,324 @@ export const projectsScript = `
     return refRepoDraft.length ? refRepoDraft : null;
   }
 
+
+  // ---- Agents tab: opt-in and inherited stage settings (AII-968) ----
+  var AG_STAGES = ['planning', 'implementation', 'review'];
+  var AG_FIELDS = ['agent', 'provider', 'model', 'accountProfileId', 'invocationTimeoutMs'];
+  var AG_LABELS = { agent: 'Agent', provider: 'Provider', model: 'Model', accountProfileId: 'Account profile', invocationTimeoutMs: 'Invocation timeout (ms)' };
+  var AG_ERRORS = {
+    resolution_failed: 'These settings do not resolve to a usable configuration. Check that every stage has an agent, provider, model, profile and timeout.',
+    claude_subscription_unsupported: 'Claude subscription profiles cannot be enabled from here. Pick a different profile.',
+    unsupported_backend: 'This project runs on GitHub Actions, which cannot opt in yet. Nothing was changed.',
+    readiness_unavailable: 'Readiness could not be checked right now. Nothing was changed; try again later.',
+    stale_inputs: 'Defaults, a profile or this project changed while saving. The view was refreshed; review it and save again.',
+    runner_incompatible: 'The project runner is not compatible with configured agents yet.',
+    retired_workflow_present: 'The project still carries a retired workflow file.',
+    delivery_unreadable: 'Managed credentials or workflow readiness could not be confirmed for this project.'
+  };
+  var agentState = null;
+  var agentLoadPromise = Promise.resolve();
+
+  function agText(v) { return v === undefined || v === null ? '' : String(v); }
+
+  function agStoredValue(stage, field) {
+    var st = agentState.stored[stage];
+    var v = st ? st[field] : undefined;
+    return v === undefined || v === null ? undefined : v;
+  }
+
+  function agDefaultValue(stage, field) {
+    var st = agentState.defaults[stage];
+    var v = st ? st[field] : undefined;
+    return v === undefined || v === null ? undefined : v;
+  }
+
+  function agDraft(stage, field) { return agentState.draft[stage][field]; }
+
+  function agEffective(stage, field) {
+    var d = agDraft(stage, field);
+    if (d.mode === 'override' && agText(d.value) !== '') return { value: d.value, source: 'project' };
+    var dv = agDefaultValue(stage, field);
+    return dv === undefined ? { value: undefined, source: 'unset' } : { value: dv, source: 'orchestrator default' };
+  }
+
+  function agEligibleProfiles(stage) {
+    var agent = agEffective(stage, 'agent').value;
+    var provider = agEffective(stage, 'provider').value;
+    return agentState.accounts.filter(function (a) {
+      return a.profileStatus === 'active'
+        && Array.isArray(a.allowedProjectKeys) && a.allowedProjectKeys.indexOf(agentState.key) !== -1
+        && a.authMode !== 'claude-subscription'
+        && a.agent === agent && a.provider === provider;
+    });
+  }
+
+  function agStageProblem(stage) {
+    var profile = agEffective(stage, 'accountProfileId').value;
+    if (profile === undefined) return 'No account profile is selected for ' + stage + '.';
+    var ok = agEligibleProfiles(stage).some(function (a) { return a.profileId === profile; });
+    return ok ? '' : 'The profile for ' + stage + ' is not active, not permitted for this project, or does not match the agent and provider.';
+  }
+
+  function agEnableProblem() {
+    for (var i = 0; i < AG_STAGES.length; i++) {
+      var p = agStageProblem(AG_STAGES[i]);
+      if (p) return p;
+      var t = agDraft(AG_STAGES[i], 'invocationTimeoutMs');
+      if (t.mode === 'override' && !(Number.isInteger(Number(t.value)) && Number(t.value) > 0)) return 'Timeout for ' + AG_STAGES[i] + ' must be a positive whole number.';
+      for (var j = 0; j < AG_FIELDS.length; j++) {
+        if (agEffective(AG_STAGES[i], AG_FIELDS[j]).value === undefined) return AG_LABELS[AG_FIELDS[j]] + ' for ' + AG_STAGES[i] + ' has no value.';
+      }
+    }
+    return '';
+  }
+
+  function agPreviewText(stage, field) {
+    var e = agEffective(stage, field);
+    return 'Effective: ' + (e.value === undefined ? 'not set' : String(e.value)) + ' (source: ' + e.source + ')';
+  }
+
+  function agValueControl(stage, field) {
+    var d = agDraft(stage, field);
+    var dis = d.mode === 'inherit' ? ' disabled' : '';
+    var attrs = ' data-ag-value data-stage="' + window.escAttr(stage) + '" data-field="' + window.escAttr(field) + '" aria-label="' + window.escAttr(AG_LABELS[field] + ' for ' + stage) + '"' + dis;
+    if (field === 'agent' || field === 'provider') {
+      var opts = field === 'agent' ? ['claude', 'codex'] : ['anthropic', 'bedrock', 'openai'];
+      return '<select class="select"' + attrs + '>' + opts.map(function (o) {
+        return '<option value="' + window.escAttr(o) + '"' + (String(d.value) === o ? ' selected' : '') + '>' + window.esc(o) + '</option>';
+      }).join('') + '</select>';
+    }
+    if (field === 'accountProfileId') {
+      var eligible = agEligibleProfiles(stage);
+      var html = '<select class="select"' + attrs + '><option value=""></option>';
+      html += eligible.map(function (a) {
+        return '<option value="' + window.escAttr(a.profileId) + '"' + (String(d.value) === a.profileId ? ' selected' : '') + '>' + window.esc(a.identity + ' (' + a.profileId + ')') + '</option>';
+      }).join('');
+      return html + '</select>';
+    }
+    return '<input class="input mono"' + (field === 'invocationTimeoutMs' ? ' inputmode="numeric"' : '') + attrs + ' value="' + window.escAttr(agText(d.value)) + '">';
+  }
+
+  function agRenderProfiles() {
+    var el = document.getElementById('md-agents-profiles');
+    var rows = agentState.accounts.filter(function (a) {
+      return a.profileStatus === 'active' && Array.isArray(a.allowedProjectKeys) && a.allowedProjectKeys.indexOf(agentState.key) !== -1;
+    });
+    if (!rows.length) {
+      el.innerHTML = '<div class="field-hint">No active account profile is permitted for this project. Permit one under model accounts first.</div>';
+      return;
+    }
+    el.innerHTML = '<div style="font-size:12px;font-weight:500;color:var(--fg-secondary);margin-bottom:6px">Profiles permitted for this project</div>' + rows.map(function (a) {
+      var acct = a.account || {};
+      var line = a.identity + ' (' + a.profileId + ') · ' + a.agent + '/' + a.provider + ' · ' + a.authMode + ' · readiness: ' + agText(acct.readiness || 'unknown');
+      if (acct.failureCode) line += ' (' + acct.failureCode + ')';
+      if (a.authMode === 'claude-subscription') {
+        var rec = acct.sessionRecovery;
+        line += ' · session recovery: ' + (rec ? rec.state + (rec.recoveryRequired ? ', recovery required' : '') : 'none') + ' · cannot be enabled from here';
+      }
+      return '<div class="field-hint" data-ag-profile="' + window.escAttr(a.profileId) + '">' + window.esc(line) + '</div>';
+    }).join('');
+  }
+
+  function agRender() {
+    if (!agentState) return;
+    document.getElementById('md-agents-enabled').checked = agentState.draftEnabled;
+    agRenderProfiles();
+    document.getElementById('md-agents-stages').innerHTML = AG_STAGES.map(function (stage) {
+      var rows = AG_FIELDS.map(function (field) {
+        var d = agDraft(stage, field);
+        var sel = '<select class="select" data-ag-mode data-stage="' + window.escAttr(stage) + '" data-field="' + window.escAttr(field) + '" aria-label="' + window.escAttr(AG_LABELS[field] + ' mode for ' + stage) + '">'
+          + '<option value="inherit"' + (d.mode === 'inherit' ? ' selected' : '') + '>Inherit</option>'
+          + '<option value="override"' + (d.mode === 'override' ? ' selected' : '') + '>Override</option></select>';
+        return '<div style="display:grid;grid-template-columns:150px 110px 1fr;gap:8px;align-items:center;margin-bottom:6px">'
+          + '<label class="field-label" style="margin:0">' + window.esc(AG_LABELS[field]) + '</label>' + sel
+          + '<div>' + agValueControl(stage, field) + '<div class="field-hint" data-ag-preview="' + window.escAttr(stage + '.' + field) + '">' + window.esc(agPreviewText(stage, field)) + '</div></div></div>';
+      }).join('');
+      var problem = agStageProblem(stage);
+      return '<div style="margin-bottom:14px"><div style="font-size:12px;font-weight:500;color:var(--fg-secondary);margin-bottom:8px">' + window.esc(stage) + '</div>' + rows
+        + (problem ? '<div class="field-hint" data-ag-problem="' + window.escAttr(stage) + '">' + window.esc(problem) + '</div>' : '') + '</div>';
+    }).join('');
+  }
+
+  function agUpdatePreviews() {
+    for (var i = 0; i < AG_STAGES.length; i++) {
+      for (var j = 0; j < AG_FIELDS.length; j++) {
+        var el = document.querySelector('[data-ag-preview="' + AG_STAGES[i] + '.' + AG_FIELDS[j] + '"]');
+        if (el) el.textContent = agPreviewText(AG_STAGES[i], AG_FIELDS[j]);
+      }
+    }
+  }
+
+  function agBuildState(key, cfg, defaults, accounts) {
+    var stored = (cfg && cfg.stages && typeof cfg.stages === 'object') ? cfg.stages : {};
+    var defs = (defaults && defaults.stages && typeof defaults.stages === 'object') ? defaults.stages : {};
+    agentState = { key: key, enabled: !!(cfg && cfg.enabled), draftEnabled: !!(cfg && cfg.enabled), stored: stored, defaults: defs, accounts: Array.isArray(accounts) ? accounts : [], draft: {} };
+    AG_STAGES.forEach(function (stage) {
+      agentState.draft[stage] = {};
+      AG_FIELDS.forEach(function (field) {
+        var v = agStoredValue(stage, field);
+        agentState.draft[stage][field] = v === undefined ? { mode: 'inherit', value: '' } : { mode: 'override', value: v };
+      });
+    });
+  }
+
+  async function agFetchJson(url) {
+    var res = await window.api(url);
+    if (!res.ok) throw new Error('http ' + res.status);
+    return res.json();
+  }
+
+  function agShowLoadError() {
+    agentState = null;
+    var err = document.getElementById('md-agents-error');
+    err.textContent = 'Agent settings could not be loaded. Close and reopen the project to retry.';
+    err.classList.remove('hidden');
+    document.getElementById('md-agents-save').disabled = true;
+  }
+
+  async function loadAgentConfig(key) {
+    agentState = null;
+    document.getElementById('md-agents-stages').innerHTML = '';
+    document.getElementById('md-agents-profiles').innerHTML = '';
+    var err = document.getElementById('md-agents-error');
+    err.classList.add('hidden');
+    document.getElementById('md-agents-ok').classList.add('hidden');
+    document.getElementById('md-agents-save').disabled = true;
+    try {
+      var results = await Promise.all([
+        agFetchJson('/api/mappings/' + encodeURIComponent(key) + '/agent-config'),
+        agFetchJson('/api/agent-defaults'),
+        agFetchJson('/api/model-accounts')
+      ]);
+      if (document.getElementById('md-team-key-orig').value !== key) return;
+      agBuildState(key, results[0], results[1], results[2].accounts);
+      document.getElementById('md-agents-save').disabled = false;
+      agRender();
+    } catch (_) {
+      if (document.getElementById('md-team-key-orig').value === key) agShowLoadError();
+    }
+  }
+  window.loadAgentConfig = loadAgentConfig;
+  window.agentConfigLoaded = function () { return agentLoadPromise; };
+
+  function agDiff() {
+    var body = {};
+    if (agentState.draftEnabled !== agentState.enabled) body.enabled = agentState.draftEnabled;
+    var stages = {};
+    AG_STAGES.forEach(function (stage) {
+      AG_FIELDS.forEach(function (field) {
+        var d = agDraft(stage, field);
+        var stored = agStoredValue(stage, field);
+        var next;
+        if (d.mode === 'inherit') {
+          if (stored === undefined) return;
+          next = null;
+        } else {
+          next = field === 'invocationTimeoutMs' ? Number(d.value) : String(d.value).trim();
+          if (stored === next) return;
+        }
+        stages[stage] = stages[stage] || {};
+        stages[stage][field] = next;
+      });
+    });
+    if (Object.keys(stages).length) body.stages = stages;
+    return body;
+  }
+
+  function agShowError(message) {
+    var err = document.getElementById('md-agents-error');
+    err.textContent = message;
+    err.classList.remove('hidden');
+    document.getElementById('md-agents-ok').classList.add('hidden');
+  }
+
+  async function saveAgentConfig() {
+    if (!agentState) return;
+    var key = agentState.key;
+    var saveBtn = document.getElementById('md-agents-save');
+    if (saveBtn.disabled) return;
+    document.getElementById('md-agents-error').classList.add('hidden');
+    document.getElementById('md-agents-ok').classList.add('hidden');
+    var body = agDiff();
+    if (!Object.keys(body).length) { agShowError('Nothing to save: no agent setting changed.'); return; }
+    if (agentState.draftEnabled) {
+      var problem = agEnableProblem();
+      if (problem) {
+        agentState.draftEnabled = agentState.enabled;
+        agRender();
+        agShowError('Cannot enable: ' + problem);
+        return;
+      }
+    }
+    saveBtn.disabled = true;
+    var res, data = {};
+    try {
+      res = await window.api('/api/mappings/' + encodeURIComponent(key) + '/agent-config', { method: 'PUT', body: JSON.stringify(body) });
+      try { data = await res.json(); } catch (_) {}
+    } catch (_) {
+      saveBtn.disabled = false;
+      agentState.draftEnabled = agentState.enabled;
+      agRender();
+      agShowError('Could not confirm the save. Reload and check the project before retrying.');
+      return;
+    }
+    saveBtn.disabled = false;
+    if (!res.ok) {
+      var code = data && typeof data.code === 'string' ? data.code : '';
+      var msg = AG_ERRORS[code]
+        || (res.status === 400 ? AG_ERRORS.resolution_failed : 'Could not save agent settings (HTTP ' + res.status + ').');
+      if (code === 'stale_inputs') await loadAgentConfig(key);
+      else { agentState.draftEnabled = agentState.enabled; agRender(); }
+      agShowError(msg + (data && typeof data.action === 'string' ? ' ' + data.action : ''));
+      return;
+    }
+    await loadAgentConfig(key);
+    var ok = document.getElementById('md-agents-ok');
+    ok.textContent = 'Agent settings saved. They apply to the next run.';
+    ok.classList.remove('hidden');
+  }
+  window.saveAgentConfig = saveAgentConfig;
+
+  function agPrepareTab(isNew, key) {
+    var tab = document.getElementById('md-tab-agents');
+    tab.disabled = isNew;
+    document.getElementById('md-agents-new').classList.toggle('hidden', !isNew);
+    document.getElementById('md-agents-body').classList.toggle('hidden', isNew);
+    agentState = null;
+    agentLoadPromise = isNew ? Promise.resolve() : loadAgentConfig(key);
+  }
+
+  (function wireAgentPanel() {
+    var panel = document.getElementById('md-agents-body');
+    if (!panel) return;
+    panel.addEventListener('change', function (ev) {
+      if (!agentState) return;
+      var t = ev.target;
+      if (t.id === 'md-agents-enabled') { agentState.draftEnabled = t.checked; return; }
+      var stage = t.dataset.stage, field = t.dataset.field;
+      if (!stage || !field) return;
+      var d = agDraft(stage, field);
+      if (t.hasAttribute('data-ag-mode')) {
+        if (t.value === 'inherit') { d.mode = 'inherit'; d.value = ''; }
+        else {
+          d.mode = 'override';
+          var seed = agStoredValue(stage, field);
+          d.value = seed !== undefined ? seed : agText(agDefaultValue(stage, field));
+        }
+      } else if (t.hasAttribute('data-ag-value')) {
+        d.value = t.value;
+      }
+      agRender();
+    });
+    panel.addEventListener('input', function (ev) {
+      if (!agentState) return;
+      var t = ev.target;
+      if (!t.hasAttribute || !t.hasAttribute('data-ag-value') || t.tagName !== 'INPUT') return;
+      agDraft(t.dataset.stage, t.dataset.field).value = t.value;
+      agUpdatePreviews();
+    });
+  })();
+
   function openMappingDialog(key) {
     const isNew = !key;
     document.getElementById('md-title').textContent = isNew ? 'Add Mapping' : 'Edit Mapping: ' + key;
@@ -855,6 +1188,7 @@ export const projectsScript = `
     onProviderChange();
     onPlanningChange();
     onTicketingProviderChange();
+    agPrepareTab(isNew, key);
     switchMappingTab('ticketing');
 
     document.getElementById('mapping-dialog').showModal();
