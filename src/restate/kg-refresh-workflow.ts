@@ -752,6 +752,9 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         if (cancelValue !== KG_REFRESH_COMMITTED && !supersededByScheduleAfterAccept) {
           return cleanupCancelled("signal", cancelValue === KG_REFRESH_SUPERSEDED_REASON ? KG_REFRESH_SUPERSEDED_REASON : undefined);
         }
+        // Durable commit point on both paths: on the accept-wins path the promise still holds the schedule's
+        // reason, so requestCancel reads this key to answer past-merge.
+        ctx.set("committed", true);
         heldPr = undefined; // merging: a cancel past here must not close the PR
         ctx.set("step", "merge");
         try {
@@ -1106,6 +1109,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
   /** The one cancel write, shared by `cancel` and `decide`: an operator cancel, or `past-merge` once `run` has committed. */
   async function requestCancel(ctx: WorkflowSharedContext, reason: string): Promise<void> {
     // Producer: the callers of the `cancel` handler (operator stop and newer-trigger paths).
+    if (await ctx.get<boolean>("committed")) throw pastMerge();
     const promise = ctx.promise<string>("cancel");
     const existing = await promise.peek();
     if (existing === KG_REFRESH_COMMITTED) throw pastMerge();
