@@ -216,6 +216,7 @@ type RunAutopsyPasses = Array<{
   iteration: number;
   implementTurns: number | null;
   implementOutcome: string;
+  implementFailureCode?: string;
   costUsd: number | null;
   reviewApproved: boolean | null;
   attempts?: number;

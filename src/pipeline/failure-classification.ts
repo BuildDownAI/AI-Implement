@@ -431,6 +431,7 @@ export function projectFailureRecord(value: FailureRecord): FailureRecord {
       ...(evidence.llmSubtype !== undefined ? { llmSubtype: evidence.llmSubtype } : {}),
       ...(evidence.llmIsError !== undefined ? { llmIsError: evidence.llmIsError } : {}),
       ...(evidence.llmOutcome !== undefined ? { llmOutcome: evidence.llmOutcome } : {}),
+      ...(evidence.llmErrorMessage !== undefined ? { llmErrorMessage: evidence.llmErrorMessage } : {}),
       ...(evidence.captureError !== undefined ? { captureError: evidence.captureError } : {}),
     },
   };
