@@ -863,8 +863,9 @@ export const projectsScript = `
     var attrs = ' data-ag-value data-stage="' + window.escAttr(stage) + '" data-field="' + window.escAttr(field) + '" aria-label="' + window.escAttr(AG_LABELS[field] + ' for ' + stage) + '"' + dis;
     if (field === 'agent' || field === 'provider') {
       var opts = field === 'agent' ? ['claude', 'codex'] : ['anthropic', 'bedrock', 'openai'];
-      return '<select class="select"' + attrs + '>' + opts.map(function (o) {
-        return '<option value="' + window.escAttr(o) + '"' + (String(d.value) === o ? ' selected' : '') + '>' + window.esc(o) + '</option>';
+      var shown = d.mode === 'inherit' ? agText(agDefaultValue(stage, field)) : agText(d.value);
+      return '<select class="select"' + attrs + '><option value=""' + (opts.indexOf(shown) === -1 ? ' selected' : '') + ' disabled>Inherited</option>' + opts.map(function (o) {
+        return '<option value="' + window.escAttr(o) + '"' + (shown === o ? ' selected' : '') + '>' + window.esc(o) + '</option>';
       }).join('') + '</select>';
     }
     if (field === 'accountProfileId') {

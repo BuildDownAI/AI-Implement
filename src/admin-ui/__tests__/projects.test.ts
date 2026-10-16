@@ -560,6 +560,27 @@ describe("projects page agents tab", () => {
     expect(m.calls.some((c) => c.url === "/api/agent-defaults" && c.method !== "GET")).toBe(false);
   });
 
+  it("does not show claude/anthropic in disabled inherited agent and provider controls", async () => {
+    const m = mountAgents();
+    await open(m);
+    const agent = field(m.doc, "value", "review", "agent");
+    const provider = field(m.doc, "value", "review", "provider");
+    expect(agent.disabled).toBe(true);
+    expect(agent.value).toBe("codex");
+    expect(provider.value).toBe("openai");
+
+    const mode = field(m.doc, "mode", "review", "agent");
+    mode.value = "override";
+    fire(m.doc, mode);
+    const seeded = field(m.doc, "value", "review", "agent");
+    expect(seeded.disabled).toBe(false);
+    expect(seeded.value).toBe("codex");
+    await m.win.saveAgentConfig();
+    const body = puts(m)[0]?.body as { stages?: Record<string, Record<string, unknown>> } | undefined;
+    expect(body?.stages?.review?.provider).toBeUndefined();
+    expect(body?.stages?.review?.agent ?? "codex").toBe("codex");
+  });
+
   it("sends null when an override is cleared and shows the inherited value", async () => {
     const m = mountAgents({ stored: { enabled: true, mode: "configured", stages: { review: { model: "gpt-custom" } } } });
     await open(m);
