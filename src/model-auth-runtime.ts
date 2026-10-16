@@ -4,7 +4,8 @@
  *
  * Every store here is a stateless wrapper over `getDb()`, so one process-wide instance is safe. Rules fixed in
  * this slice: no `claude-subscription` account is reserved, no GitHub Actions path prepares, API-key profiles
- * resolve no secret (they prepare as `authentication-required`), and a repo image override is refused.
+ * resolve only from encrypted `model_protected_secrets` (no ambient fallback; a missing row prepares as
+ * `authentication-required`), and a repo image override is refused.
  *
  * No secret reaches a log or a thrown message: failures use fixed text.
  */
@@ -14,6 +15,7 @@ import { getDb } from "./dedup.js";
 import { getScopedInstallationToken } from "./github-app-auth.js";
 import { defaultFetchSignal } from "./github.js";
 import type { ModelCredentialDeps } from "./model-credentials.js";
+import { createModelProtectedSecrets } from "./model-protected-secrets.js";
 import { createModelSessionKeyProvider } from "./model-session-keys.js";
 import { createModelSessionOwnership, sessionOwnerVerifier } from "./model-session-ownership.js";
 import type { ModelSessionOwnership } from "./model-session-ownership.js";
@@ -66,8 +68,11 @@ export function createModelAuthRuntime(input: {
     },
   };
 
-  // Operator decision: no new secrets. An API-key profile prepares as authentication-required.
-  const credentials: ModelCredentialDeps = { sessionStore, resolveProtectedSecret: () => null };
+  // API-key and Bedrock secrets come only from encrypted storage keyed off RUNNER_TOKEN_SECRET.
+  const credentials: ModelCredentialDeps = {
+    sessionStore,
+    resolveProtectedSecret: createModelProtectedSecrets({ env: input.env }).resolve,
+  };
 
   /** Installation token narrowed to the one repository being checked. */
   async function token(owner: string, repo: string): Promise<string> {

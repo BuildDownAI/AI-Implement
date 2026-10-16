@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
-import { createModelSessionKeyProvider, deriveModelAuthProtectionKey, MODEL_SESSION_KEY_ID } from "../model-session-keys.js";
+import { createModelSessionKeyProvider, deriveModelAuthProtectionKey, deriveModelProtectedSecretKey, MODEL_SESSION_KEY_ID } from "../model-session-keys.js";
 
 const SECRET = "SENTINEL-RUNNER-TOKEN-SECRET-abc123";
 
@@ -121,5 +121,21 @@ describe("deriveModelAuthProtectionKey", () => {
   it("is undefined without a secret", () => {
     expect(deriveModelAuthProtectionKey({})).toBeUndefined();
     expect(deriveModelAuthProtectionKey({ RUNNER_TOKEN_SECRET: "" })).toBeUndefined();
+  });
+});
+
+describe("deriveModelProtectedSecretKey", () => {
+  it("derives a deterministic 32-byte key under its own label", () => {
+    const key = deriveModelProtectedSecretKey({ RUNNER_TOKEN_SECRET: SECRET })!;
+    expect(key).toHaveLength(32);
+    expect(key.equals(deriveModelProtectedSecretKey({ RUNNER_TOKEN_SECRET: SECRET })!)).toBe(true);
+    expect(key.equals(derive(SECRET, "ai-implement/model-protected-secret-key/v1"))).toBe(true);
+    expect(key.equals(createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: SECRET }).current()!.key)).toBe(false);
+    expect(key.equals(deriveModelAuthProtectionKey({ RUNNER_TOKEN_SECRET: SECRET })!)).toBe(false);
+  });
+
+  it("is undefined without the secret", () => {
+    expect(deriveModelProtectedSecretKey({})).toBeUndefined();
+    expect(deriveModelProtectedSecretKey({ RUNNER_TOKEN_SECRET: "" })).toBeUndefined();
   });
 });

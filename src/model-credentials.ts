@@ -32,7 +32,7 @@ import {
 
 /** Protected references must live in this namespace; env-var style names never match. */
 export const MODEL_ACCOUNT_REF_PREFIX = "model-account:";
-const MODEL_ACCOUNT_REF_PATTERN = /^model-account:[a-z0-9][a-z0-9._-]{0,127}$/;
+export const MODEL_ACCOUNT_REF_PATTERN = /^model-account:[a-z0-9][a-z0-9._-]{0,127}$/;
 
 export type CredentialFailureCode =
   | "invalid_request"

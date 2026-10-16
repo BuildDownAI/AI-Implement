@@ -169,10 +169,15 @@ describe("ownership", () => {
 });
 
 describe("credentials and session store", () => {
-  it("resolves no protected secret", () => {
-    const { credentials } = runtime();
-    expect(credentials.resolveProtectedSecret("model-account:api")).toBeNull();
-    expect(credentials.resolveProtectedSecret("anything")).toBeNull();
+  it("resolves no protected secret without a stored row, and ignores ambient keys", () => {
+    process.env.ANTHROPIC_API_KEY = "AMBIENT";
+    try {
+      const { credentials } = runtime();
+      expect(credentials.resolveProtectedSecret("model-account:api")).toBeNull();
+      expect(credentials.resolveProtectedSecret("anything")).toBeNull();
+    } finally {
+      delete process.env.ANTHROPIC_API_KEY;
+    }
   });
 
   it("reads a record written under the CLI key scheme", async () => {
@@ -223,7 +228,37 @@ describe("prepareAgentRun with the runtime deps", () => {
     expect(JSON.stringify(r)).not.toContain(ACCESS);
   });
 
-  it("is authentication-required for an API-key profile and mints no grant", async () => {
+  it("is ready for an API-key profile with an encrypted stored key", async () => {
+    store.saveAccountProfileRevision({
+      profileId: "api", identity: "Api", revision: 1, agent: "claude", provider: "anthropic",
+      authMode: "anthropic-api-key", allowedProjectKeys: ["AII"], metadata: { credentialRef: "model-account:api" },
+    });
+    useStages("api", "claude", "anthropic");
+    const { createModelProtectedSecrets } = await import("../model-protected-secrets.js");
+    const KEY = "sk-ant-SENTINEL-STORED-KEY";
+    expect(createModelProtectedSecrets({ env: { RUNNER_TOKEN_SECRET: SECRET } }).write("model-account:api", KEY).ok).toBe(true);
+    const r = await prep.prepareAgentRun(request(), runtime().preparationDeps({ owner: "acme", repo: "ready-repo", projectKey: "AII" }));
+    expect(r.status).toBe("ready");
+    expect(JSON.stringify(r)).not.toContain(KEY);
+  });
+
+  it("denies a disabled-project profile without consulting storage", async () => {
+    const spy = vi.fn(() => "sk-never");
+    const { resolveModelCredential } = await import("../model-credentials.js");
+    store.saveAccountProfileRevision({
+      profileId: "api", identity: "Api", revision: 1, agent: "claude", provider: "anthropic",
+      authMode: "anthropic-api-key", allowedProjectKeys: ["OTHER"], metadata: { credentialRef: "model-account:api" },
+    });
+    const rt = runtime();
+    const res = resolveModelCredential(
+      { projectKey: "AII", profileId: "api", revision: 1, provider: "anthropic", authMode: "anthropic-api-key" },
+      { ...rt.credentials, resolveProtectedSecret: spy },
+    );
+    expect(res.ok).toBe(false);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("is authentication-required for an API-key profile with no stored row and mints no grant", async () => {
     store.saveAccountProfileRevision({
       profileId: "api", identity: "Api", revision: 1, agent: "claude", provider: "anthropic",
       authMode: "anthropic-api-key", allowedProjectKeys: ["AII"], metadata: { credentialRef: "model-account:api" },
