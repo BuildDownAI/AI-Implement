@@ -861,6 +861,18 @@ describe("admin mappings", () => {
       return request("/api/mappings", "POST", "secret", { teamKey: "EPH", owner: "org", repo: "eph", extraEnv, ...extra }, token);
     };
 
+    it.each(["RUN_TOKEN","RUN_PROGRESS_TOKEN","RUN_PUBLICATION_TOKEN","SESSION_TOKEN","MACHINE_NONCE","run_token","Machine_Nonce"])("refuses the run credential name %s on save", async (name) => {
+      const res = await create({ [name]: "s3cret-val" });
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toBe(`extraEnv name ${name} is reserved`);
+      expect(res.body).not.toContain("s3cret-val");
+    });
+
+    it("still saves names that merely contain a credential name", async () => {
+      const res = await create({ MY_RUN_TOKEN: "v", FOO: "bar" });
+      expect(res.statusCode).toBe(202);
+    });
+
     it("accepts the exact assertion on a GitHub Actions mapping", async () => {
       const res = await create({ [OPT_IN]: "ephemeral-runner-asserted-v1" });
       expect(res.statusCode).toBe(202);

@@ -443,6 +443,17 @@ describe("buildSessionMachineConfig", () => {
     anthropicApiKey: "sk-ant-test",
   };
 
+  it.each(["RUN_TOKEN","RUN_PROGRESS_TOKEN","RUN_PUBLICATION_TOKEN","SESSION_TOKEN","MACHINE_NONCE","run_token","Machine_Nonce"])("refuses extraEnv name %s without echoing the value", (name) => {
+    let message = "";
+    try {
+      buildSessionMachineConfig({ ...baseInput, extraEnv: { [name]: "s3cret-val" } });
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    expect(message).toBe(`extraEnv name ${name} is reserved`);
+    expect(message).not.toContain("s3cret-val");
+  });
+
   it("maps issue metadata to env vars", () => {
     const result = buildSessionMachineConfig(baseInput);
     const env = result.config.env!;
@@ -675,17 +686,6 @@ describe("buildSessionMachineConfig", () => {
       expect(env).not.toHaveProperty("RUN_PROGRESS_TOKEN");
       expect(env).not.toHaveProperty("RUN_PUBLICATION_TOKEN");
     }
-  });
-
-  it("extraEnv overrides the progress and publication tokens", () => {
-    const env = buildSessionMachineConfig({
-      ...baseInput,
-      runProgressToken: "progress-token",
-      runPublicationToken: "publication-token",
-      extraEnv: { RUN_PROGRESS_TOKEN: "extra-progress", RUN_PUBLICATION_TOKEN: "extra-publication" },
-    }).config.env!;
-    expect(env.RUN_PROGRESS_TOKEN).toBe("extra-progress");
-    expect(env.RUN_PUBLICATION_TOKEN).toBe("extra-publication");
   });
 
   it("extraEnv overrides standard env vars when keys collide", () => {

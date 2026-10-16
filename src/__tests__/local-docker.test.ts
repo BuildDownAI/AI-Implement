@@ -27,6 +27,16 @@ const baseInput: LocalRunnerInput = {
 };
 
 describe("buildLocalRunnerEnv", () => {
+  it.each(["RUN_TOKEN","RUN_PROGRESS_TOKEN","RUN_PUBLICATION_TOKEN","SESSION_TOKEN","MACHINE_NONCE","run_token","Machine_Nonce"])("refuses extraEnv name %s without echoing the value", (name) => {
+    let message = "";
+    try {
+      buildLocalRunnerEnv({ ...baseInput, extraEnv: { [name]: "s3cret-val" } });
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    expect(message).toBe(`extraEnv name ${name} is reserved`);
+    expect(message).not.toContain("s3cret-val");
+  });
   it("maps issue, repo, auth, and local mode env vars", () => {
     const env = buildLocalRunnerEnv(baseInput);
 
@@ -259,7 +269,7 @@ describe("splitLocalRunnerEnv", () => {
   it("keeps RUN_PROGRESS_TOKEN out of docker argv env", () => {
     const { publicEnv, secretEnv } = splitLocalRunnerEnv(buildLocalRunnerEnv({
       ...baseInput,
-      extraEnv: { RUN_PROGRESS_TOKEN: "progress-token" },
+      runProgressToken: "progress-token",
     }));
 
     expect(publicEnv.RUN_PROGRESS_TOKEN).toBeUndefined();
@@ -292,16 +302,6 @@ describe("splitLocalRunnerEnv", () => {
     }
   });
 
-  it("extraEnv overrides the progress and publication tokens", () => {
-    const env = buildLocalRunnerEnv({
-      ...baseInput,
-      runProgressToken: "progress-token",
-      runPublicationToken: "publication-token",
-      extraEnv: { RUN_PROGRESS_TOKEN: "extra-progress", RUN_PUBLICATION_TOKEN: "extra-publication" },
-    });
-    expect(env.RUN_PROGRESS_TOKEN).toBe("extra-progress");
-    expect(env.RUN_PUBLICATION_TOKEN).toBe("extra-publication");
-  });
 });
 
 describe("buildDockerEnvFileContent", () => {
