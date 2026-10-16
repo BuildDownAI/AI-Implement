@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter, RunTelemetry } from "../types.js";
 import { formatLlmResultDetail } from "../step-utils.js";
-import { classifyLlmResult, type FailureRecord } from "../failure-classification.js";
+import { classifyLlmResult, isLlmResultFailure, type FailureRecord } from "../failure-classification.js";
 import { describeReferenceRepoCause, type ReferenceRepoResult } from "../../reference-repos.js";
 import { DEFAULT_MODEL } from "../default-model.js";
 
@@ -23,6 +23,13 @@ interface ImplementOutputs extends Record<string, unknown> {
   subagentCount: number;
   telemetry?: RunTelemetry;
   attempts: number;
+  /**
+   * Set when the invocation exited 0 but its own terminal status or executor
+   * verdict says it failed (e.g. a fatal/corrupt Codex stream). The step still
+   * returns so the workspace can be reviewed, but the real invocation outcome
+   * stays on the outputs and must not be overwritten by a later review verdict.
+   */
+  invocationFailure?: FailureRecord;
 }
 
 function buildReferenceReposSection(results: ReferenceRepoResult[]): string {
@@ -114,7 +121,22 @@ export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
       throw err;
     }
 
+    // Exit 0 does not prove success: a fatal or corrupt stream settles with
+    // terminalStatus.isError. Keep that failure visible next to the outputs
+    // instead of letting a later review approval stand in for the invocation.
+    const invocationFailure =
+      result.exitCode === 0 && result.telemetry?.outcome !== "max_turns" && isLlmResultFailure(result, false)
+        ? (result.failure ??
+          classifyLlmResult(result, {
+            stage: "implement",
+            attempt: result.attempts ?? 1,
+            expectsStructuredOutput: false,
+            elapsedMs: result.telemetry?.durationMs ?? undefined,
+          }))
+        : undefined;
+
     return {
+      ...(invocationFailure ? { invocationFailure } : {}),
       filesChanged: getChangedFiles(workspaceDir),
       tokensUsed: result.tokensUsed,
       exitCode: result.exitCode,

@@ -1136,6 +1136,35 @@ describe("pushStep draft PRs", () => {
     expect(body.body).not.toContain("Automated verification was run by the AI-Implement pipeline before opening this PR.");
   });
 
+  it("shows an implement invocation failure code next to the review verdict in the pass table", async () => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/9", number: 9 }),
+      text: async () => "",
+    } as Response);
+
+    await pushStep.run(
+      makeContext(),
+      {
+        ...BASE_INPUTS, draft: true,
+        reviewSummary: {
+          ...REVIEW_SUMMARY,
+          passes: [
+            { iteration: 1, implementTurns: 3, implementOutcome: "success", costUsd: 1, reviewApproved: false },
+            { iteration: 2, implementTurns: 4, implementOutcome: "error", implementFailureCode: "LLM_TERMINAL_ERROR", costUsd: 1, reviewApproved: true },
+          ],
+        },
+      },
+      new NoopStepReporter(),
+    );
+
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0][1]?.body));
+    expect(body.body).toContain("| 1 | success | 3 |");
+    expect(body.body).toContain("| 2 | error (LLM_TERMINAL_ERROR) | 4 |");
+    expect(body.body).toMatch(/\| 2 \| error \(LLM_TERMINAL_ERROR\).*\| approved \|/);
+  });
+
   it("titles a provider_unavailable 422 non-draft fallback as an interruption, not an unapproved rejection", async () => {
     mockGitSuccess("abc123");
     vi.mocked(fetch)

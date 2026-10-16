@@ -12,6 +12,8 @@ export interface RunAutopsy {
     iteration: number;
     implementTurns: number | null;
     implementOutcome: string;
+    /** Set when the implement invocation itself failed, even if a later review approved. */
+    implementFailureCode?: string;
     costUsd: number | null;
     reviewApproved: boolean | null;
     attempts?: number;
@@ -36,7 +38,8 @@ export function formatRunAutopsy(a: RunAutopsy): string {
       const passCost = p.costUsd != null || p.reviewCostUsd != null ? (p.costUsd ?? 0) + (p.reviewCostUsd ?? 0) : null;
       const cost = passCost != null ? `$${passCost.toFixed(2)}` : "—";
       const review = p.reviewApproved == null ? "not run" : p.reviewApproved ? "approved" : "rejected";
-      return `| ${p.iteration} | ${p.implementOutcome} | ${p.implementTurns ?? "?"} | ${p.attempts ?? 1} | ${cost} | ${review} |`;
+      const outcome = p.implementFailureCode ? `${p.implementOutcome} (${p.implementFailureCode})` : p.implementOutcome;
+      return `| ${p.iteration} | ${outcome} | ${p.implementTurns ?? "?"} | ${p.attempts ?? 1} | ${cost} | ${review} |`;
     })
     .join("\n");
   const { stageLabel, codeState } = providerUnavailablePhrase(a.failure?.stage, Boolean(a.prUrl));
@@ -90,6 +93,8 @@ export interface RunStats {
     iteration: number;
     implementTurns: number | null;
     implementOutcome: string;
+    /** Set when the implement invocation itself failed, even if a later review approved. */
+    implementFailureCode?: string;
     costUsd: number | null;
     reviewApproved: boolean | null;
     attempts?: number;
@@ -112,7 +117,8 @@ export function formatRunStats(s: RunStats): string {
       const passCost = p.costUsd != null || p.reviewCostUsd != null ? (p.costUsd ?? 0) + (p.reviewCostUsd ?? 0) : null;
       const cost = passCost != null ? `$${passCost.toFixed(2)}` : "—";
       const review = p.reviewApproved == null ? "not run" : p.reviewApproved ? "approved" : "rejected";
-      return `| ${p.iteration} | ${p.implementOutcome} | ${p.implementTurns ?? "?"} | ${p.attempts ?? 1} | ${cost} | ${review} |`;
+      const outcome = p.implementFailureCode ? `${p.implementOutcome} (${p.implementFailureCode})` : p.implementOutcome;
+      return `| ${p.iteration} | ${outcome} | ${p.implementTurns ?? "?"} | ${p.attempts ?? 1} | ${cost} | ${review} |`;
     })
     .join("\n");
   // Pattern anchor: report-card.ts's derivedStatsForJob — the per-pass sum here is the same

@@ -173,6 +173,24 @@ const STAT_PASSES = [
 ];
 
 describe("formatRunStats", () => {
+  it("surfaces a failed implement invocation on an approved pass (TEST-2 shape)", () => {
+    const md = formatRunStats({
+      issueIdentifier: "TEST-2",
+      passes: [{ iteration: 2, implementTurns: 4, implementOutcome: "error", implementFailureCode: "LLM_TERMINAL_ERROR", costUsd: 1, reviewApproved: true }],
+      plannedFiles: [],
+      filesChanged: null,
+    });
+    expect(md).toContain("| 2 | error (LLM_TERMINAL_ERROR) | 4 | 1 | $1.00 | approved |");
+  });
+
+  it("autopsy table also surfaces the implement failure code", () => {
+    const md = formatRunAutopsy({
+      ...AUTOPSY,
+      passes: [{ iteration: 1, implementTurns: 4, implementOutcome: "error", implementFailureCode: "LLM_TERMINAL_ERROR", costUsd: 1, reviewApproved: false }],
+    });
+    expect(md).toContain("| 1 | error (LLM_TERMINAL_ERROR) | 4 | 1 | $1.00 | rejected |");
+  });
+
   it("renders the six-column pass row", () => {
     const md = formatRunStats({
       issueIdentifier: "AII-1",

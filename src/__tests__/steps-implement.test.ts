@@ -5,6 +5,8 @@ import { NoopStepReporter } from "../pipeline/reporter.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import type { LLMExecutor, LLMResult } from "../pipeline/types.js";
 import { DEFAULT_MODEL } from "../pipeline/default-model.js";
+import { parseCodexStream } from "../pipeline/codex-stream.js";
+import type { FailureRecord } from "../pipeline/failure-classification.js";
 import type { ReferenceRepoResult } from "../reference-repos.js";
 
 function makeExecutor(overrides: Partial<LLMResult> = {}): LLMExecutor {
@@ -166,6 +168,62 @@ describe("implementStep", () => {
     const failure = (err as Error & { failure?: { category?: string; code?: string } }).failure;
     expect(failure?.category).toBe("crash");
     expect(failure?.code).toBe("PROCESS_EXIT_NONZERO");
+  });
+
+  it("classifies an exit-0 Codex stream that errored mid-turn and keeps the real outcome", async () => {
+    const lines = [
+      { type: "turn.started" },
+      { type: "error", message: "stream disconnected before completion" },
+      { type: "item.completed", item: { id: "m1", type: "agent_message", text: "done" } },
+      { type: "turn.completed", usage: { input_tokens: 5, output_tokens: 2 } },
+    ].map((e) => JSON.stringify(e)).join("\n");
+    const parsed = parseCodexStream(lines).toResult({ exitCode: 0 });
+    parsed.telemetry = { ...parsed.telemetry!, durationMs: 1234 };
+    parsed.attempts = 2;
+    const out = await implementStep.run(makeContext(makeExecutor(parsed)), { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter());
+    expect(out.exitCode).toBe(0);
+    expect(out.telemetry?.outcome).toBe("error");
+    expect(out.invocationFailure).toMatchObject({
+      stage: "implement",
+      code: "LLM_TERMINAL_ERROR",
+      category: "invalid_output",
+      attempt: 2,
+      elapsedMs: 1234,
+      retryable: false,
+    });
+    expect(out.invocationFailure?.message).toContain("stream disconnected before completion");
+  });
+
+  it("preserves an executor-supplied failure on an exit-0 fatal result", async () => {
+    const failure: FailureRecord = {
+      category: "invalid_output", code: "EXECUTOR_SUPPLIED", stage: "implement", attempt: 3, retryable: false,
+      elapsedMs: 77, message: "from executor", evidence: { truncated: false },
+    };
+    const executor = makeExecutor({
+      exitCode: 0,
+      terminalStatus: { subtype: "error", isError: true },
+      telemetry: { outcome: "error", numTurns: 1, durationMs: 10, costUsd: null, tokensIn: null, tokensOut: null },
+      failure,
+      attempts: 3,
+    });
+    const out = await implementStep.run(makeContext(executor), { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter());
+    expect(out.invocationFailure).toEqual(failure);
+  });
+
+  it("does not flag a clean exit-0 Codex result", async () => {
+    const parsed = parseCodexStream(
+      [{ type: "turn.started" }, { type: "turn.completed" }].map((e) => JSON.stringify(e)).join("\n"),
+    ).toResult({ exitCode: 0 });
+    const out = await implementStep.run(makeContext(makeExecutor(parsed)), { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter());
+    expect(out.telemetry?.outcome).toBe("success");
+    expect(out.invocationFailure).toBeUndefined();
+  });
+
+  it("still throws for a non-zero exit even when the stream is fatal", async () => {
+    const executor = makeExecutor({ exitCode: 1, terminalStatus: { subtype: "error", isError: true } });
+    await expect(
+      implementStep.run(makeContext(executor), { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter()),
+    ).rejects.toThrow(/exit code 1/);
   });
 
   it("surfaces the executor's failure.elapsedMs on the thrown error", async () => {

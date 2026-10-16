@@ -50,6 +50,8 @@ export interface FailureRecord {
     llmIsError?: boolean | null;
     /** From RunTelemetry.outcome — makes e.g. a `subtype: success` / `outcome: max_turns` mismatch explainable from the record alone. */
     llmOutcome?: RunTelemetry["outcome"] | null;
+    /** Redacted, capped terminal error text the stream parser captured (e.g. a Codex `error` event) — present even when the process exited 0. */
+    llmErrorMessage?: string;
     /** Set only when evidence capture itself failed (best-effort — see classify* catch blocks). */
     captureError?: string;
   };
@@ -429,6 +431,7 @@ export function projectFailureRecord(value: FailureRecord): FailureRecord {
       ...(evidence.llmSubtype !== undefined ? { llmSubtype: evidence.llmSubtype } : {}),
       ...(evidence.llmIsError !== undefined ? { llmIsError: evidence.llmIsError } : {}),
       ...(evidence.llmOutcome !== undefined ? { llmOutcome: evidence.llmOutcome } : {}),
+      ...(evidence.llmErrorMessage !== undefined ? { llmErrorMessage: evidence.llmErrorMessage } : {}),
       ...(evidence.captureError !== undefined ? { captureError: evidence.captureError } : {}),
     },
   };
@@ -479,7 +482,10 @@ export function classifyLlmResult(
     const secrets = envSecrets();
     const stdout = result.stdout ?? "";
     const stderr = result.stderr ?? "";
-    const text = [stderr, stdout].filter(Boolean).join("\n");
+    const errorMessage = result.errorMessage?.trim() ?? "";
+    // The parser's terminal error text leads the message for an exit-0 failure: stdout
+    // carries only the model's final prose, which says nothing about why the stream was fatal.
+    const text = [result.exitCode === 0 ? errorMessage : "", stderr, stdout].filter(Boolean).join("\n");
 
     let category: FailureCategory;
     let code: string;
@@ -562,6 +568,7 @@ export function classifyLlmResult(
         llmOutcome: result.telemetry?.outcome ?? null,
         llmSubtype: result.terminalStatus?.subtype ?? null,
         llmIsError: result.terminalStatus?.isError ?? null,
+        ...(errorMessage ? { llmErrorMessage: redactAndCap(errorMessage, 500, secrets) } : {}),
       },
     };
   } catch (captureErr) {
