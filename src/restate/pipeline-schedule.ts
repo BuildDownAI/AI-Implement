@@ -276,6 +276,8 @@ export function createPipelineSchedule(deps: PipelineScheduleDeps) {
 }
 
 export type PipelineScheduleDefinition = ReturnType<typeof createPipelineSchedule>;
+/** A name-only client handle for callers outside this module (the tools), so they do not bind the object. */
+export const PipelineSchedule: PipelineScheduleDefinition = { name: "PipelineSchedule" } as PipelineScheduleDefinition;
 
 // --- the poll-loop caller -------------------------------------------------------------------------
 

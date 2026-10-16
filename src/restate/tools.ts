@@ -40,6 +40,7 @@ import type { StepStatus } from "../pipeline/types.js";
 import { FlyMachineProfile } from "./fly-machine-profile.js";
 import { RUN_PROFILE_OBJECTS, isRunProfileBackend, type RunProfileBackend } from "./run-profile.js";
 import { RunnerBackend } from "./runner-backend.js";
+import { PipelineSchedule } from "./pipeline-schedule.js";
 import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { getOrchestratorSettings, getFlySessionsConfig, getLinearPickupLabel } from "../orchestrator-settings.js";
@@ -1204,6 +1205,49 @@ export const getRunnerBackendTool = tool(
   },
 );
 
+export const SET_PIPELINE_SCHEDULE_DESCRIPTION =
+  "Set a pipeline's daily schedule (admin role): pipeline (kg-refresh) and patch { enabled, time, zone }. time is HH:MM, zone an IANA zone name such as America/Denver. Given fields merge into the stored schedule; enabling needs both time and zone. A bad time, bad zone, unknown pipeline or unknown field is refused with 400 naming the field. Returns the stored schedule.";
+
+export const setPipelineScheduleTool = tool(
+  {
+    description: SET_PIPELINE_SCHEDULE_DESCRIPTION,
+    input: z.object({
+      pipeline: z.string().describe("The scheduled pipeline, e.g. kg-refresh"),
+      patch: z.record(z.string(), z.unknown()).describe("Fields to merge: { enabled?: boolean, time?: \"HH:MM\", zone?: IANA zone }"),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
+    const { pipeline, patch } = input.args;
+    try {
+      return reply(await ctx.objectClient(PipelineSchedule, pipeline).set(patch));
+    } catch (err) {
+      if (err instanceof restate.TerminalError && err.code === 400) return reply({ status: 400, body: { error: err.message } });
+      throw err;
+    }
+  },
+);
+
+export const GET_PIPELINE_SCHEDULE_DESCRIPTION =
+  "Returns a pipeline's schedule as { pipeline, schedule, nextOccurrence }. schedule is null when none was set, which means off; nextOccurrence is the next fire time (ISO), or null when the schedule is off.";
+
+export const getPipelineScheduleTool = tool(
+  {
+    description: GET_PIPELINE_SCHEDULE_DESCRIPTION,
+    input: z.object({ pipeline: z.string().describe("The scheduled pipeline, e.g. kg-refresh") }),
+    role: "user",
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const { pipeline } = input.args;
+    const state = await ctx.objectClient(PipelineSchedule, pipeline).get();
+    const { nextOccurrence, ...schedule } = state ?? {};
+    const result = { pipeline, schedule: state ? schedule : null, nextOccurrence: nextOccurrence ?? null };
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
 export const PAUSE_PROJECT_DESCRIPTION =
   "Pause or resume a project mapping (admin role). Same as the paused update of PATCH /api/mappings/<teamKey>.";
 
@@ -1442,6 +1486,8 @@ export const orchestratorTools = restate.service({
     set_run_profile: setRunProfileTool,
     set_runner_backend: setRunnerBackendTool,
     get_runner_backend: getRunnerBackendTool,
+    set_pipeline_schedule: setPipelineScheduleTool,
+    get_pipeline_schedule: getPipelineScheduleTool,
     pause_project: pauseProjectTool,
     add_project: addProjectTool,
     trigger_workflow_sync: triggerWorkflowSyncTool,
