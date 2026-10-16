@@ -10,14 +10,14 @@ Every cell is a real entry point. The test drives it with fakes at the outermost
 
 | Run kind | github-actions | fly-machines | local-docker |
 |---|---|---|---|
-| implementation | `dispatchGitHubActions` (`src/index.ts:1112`) | `dispatchFlyMachine` (`src/index.ts:1795`) | `dispatchLocalDocker` (`src/index.ts:1930`) |
-| gap-fill (`/ai-implement` comment) | `drainCommentGapfillQueue` (`src/comment-gapfill-drain.ts:185`), GitHub Actions branch | same function, Fly branch | same function, local branch, through `dispatchLocalGapfill` (`src/local-gapfill.ts:41`) |
-| planning | `dispatchPlanning` (`src/index.ts:1456`) then `preparePlanningLaunch` (`src/planning-launch.ts:47`) and `launchPlanningRun` | `dispatchPlanning` then `launchPlanningSession` (`src/planning-launch.ts:303`) | same as Fly |
-| review-fix attempt (Restate pilot) | `GithubReviewFixWorker.launch` (`src/review-fix-worker.ts:485`); callback tokens from `callbackInputs` (`src/restate/review-fix-production.ts:177`) | none yet | none yet |
-| legacy review-fix queue | `processReviewFixQueue` (`src/index.ts:3500`), runner mode `gha` | none: the queue has no Fly branch | `processReviewFixQueue`, runner mode `local`, through `dispatchLocalGapfill` |
-| kg-refresh | `createKgRefreshSenders(...)["github-actions"]` (`src/restate/kg-refresh-senders.ts:51`) | `["fly-machines"]`, through `launchKeptMachine` (`src/restate/kg-refresh-production.ts:128`) | `["local-docker"]` |
+| implementation | `dispatchGitHubActions` (`src/index.ts`) | `dispatchFlyMachine` (`src/index.ts`) | `dispatchLocalDocker` (`src/index.ts`) |
+| gap-fill (`/ai-implement` comment) | `drainCommentGapfillQueue` (`src/comment-gapfill-drain.ts`), GitHub Actions branch | same function, Fly branch | same function, local branch, through `dispatchLocalGapfill` (`src/local-gapfill.ts`) |
+| planning | `dispatchPlanning` (`src/index.ts`) then `preparePlanningLaunch` (`src/planning-launch.ts`) and `launchPlanningRun` | `dispatchPlanning` then `launchPlanningSession` (`src/planning-launch.ts`) | same as Fly |
+| review-fix attempt (Restate pilot) | `GithubReviewFixWorker.launch` (`src/review-fix-worker.ts`); callback tokens from `callbackInputs` (`src/restate/review-fix-production.ts`) | none yet | none yet |
+| legacy review-fix queue | `processReviewFixQueue` (`src/index.ts`), runner mode `gha` | none: the queue has no Fly branch | `processReviewFixQueue`, runner mode `local`, through `dispatchLocalGapfill` |
+| kg-refresh | `createKgRefreshSenders(...)["github-actions"]` (`src/restate/kg-refresh-senders.ts`) | `["fly-machines"]`, through `launchKeptMachine` (`src/restate/kg-refresh-production.ts`) | `["local-docker"]` |
 
-Fly and local implementation and planning launches share `dispatchSession` (`src/index.ts:1616`), which owns admission and mints the run tokens with `mintLaunchTokens`.
+Fly and local implementation and planning launches share `dispatchSession` (`src/index.ts`), which owns admission and mints the run tokens with `mintLaunchTokens`.
 
 ## What a launch carries
 
@@ -31,10 +31,10 @@ A run carries up to three tokens: result (`run_token` / `RUN_TOKEN`), progress (
 
 - Implementation: every backend gets result, progress and publication, minted by `mintLaunchTokens` (`src/runner-tokens.ts`). On GitHub Actions the publication token is sent only when the target workflow supports `run_publication_token`.
 - Gap-fill: every backend gets all three, minted once by `mintLaunchTokens` (phase `gap-analysis`). Fly and local send them through the carriers; GitHub Actions sends the publication token only when the target workflow supports `run_publication_token`.
-- Planning gets result and progress on every backend, minted by `mintLaunchTokens`. It never pushes, and the vending route refuses a planning publication token (`src/publication-token-vending.ts:62`).
+- Planning gets result and progress on every backend, minted by `mintLaunchTokens`. It never pushes, and the vending route refuses a planning publication token (`src/publication-token-vending.ts`).
 - Review-fix attempt (GitHub Actions) gets all three from its own attempt-scoped mint (`mintPreparedReviewFixToken`, claims carry an `attemptId`). The legacy queue mints with `mintLaunchTokens` and gets all three on GitHub Actions and local.
 - kg-refresh: every backend gets all three from `mintLaunchTokens`, minted inside the `dispatch-N` step and kept in a closure, so no token enters the journal.
-- On Fly and local runs the runner prefers the machine nonce for its GitHub token (`src/runner-token.ts:81`), so the publication token on a Fly or local run is carried but unused until AII-1365. Fly and local runs push with the nonce.
+- On Fly and local runs the runner prefers the machine nonce for its GitHub token (`src/runner-token.ts`), so the publication token on a Fly or local run is carried but unused until AII-1365. Fly and local runs push with the nonce.
 
 **The rule: the run kind sets the token set, and the backend never does.** `LAUNCH_TOKEN_AUDIENCES` in `src/runner-tokens.ts` is the table, and `mintLaunchTokens` mints a launch's tokens from it after it deletes the unconsumed rows of the dispatch id, so a retried launch step can mint again. A consumed row is kept. Implementation, gap-fill, review-fix and kg-refresh runs carry result, progress and publication. Planning carries result and progress. Every dispatch-scoped mint goes through `mintLaunchTokens`; `mintRunToken` is called only inside `src/runner-tokens.ts`. Each Restate workflow that launches a runner (PlanningRun, KgRefresh, ReviewFixAttempt) has a test that reads the journal while the launch entry still exists and finds no token string in it.
 
@@ -42,7 +42,7 @@ A run carries up to three tokens: result (`run_token` / `RUN_TOKEN`), progress (
 
 When the image is fixed: every path uses a moving tag, and in-flight runs keep their image. For the time on each backend and how to confirm it, see [runner-images.md § When a change reaches a run](runner-images.md#when-a-change-reaches-a-run).
 
-The local image is the operator's `LOCAL_RUNNER_IMAGE` (`config.localRunnerImage`, `src/index.ts:329`). No repository input reaches it, so local Docker has no image check. GitHub Actions and Fly launches are checked against the built-in prefixes plus the Settings row before the launch call ([runner-images.md § Allowlisting](runner-images.md#allowlisting)). The kept Fly machine re-resolves its image at every claim (`launchKeptMachine`, `src/restate/kg-refresh-production.ts:183-201`), and the kg-refresh Fly sender (`src/restate/kg-refresh-senders.ts`) resolves and checks the image on every dispatch, before `launchKeptMachine`, so the check covers both the create and the claim.
+The local image is the operator's `LOCAL_RUNNER_IMAGE` (`config.localRunnerImage`, `src/index.ts`). No repository input reaches it, so local Docker has no image check. GitHub Actions and Fly launches are checked against the built-in prefixes plus the Settings row before the launch call ([runner-images.md § Allowlisting](runner-images.md#allowlisting)). The kept Fly machine re-resolves its image at every claim and sends it with the claim's Fly update, except where the update is skipped (already `started` for the same dispatch, or adopting a machine an earlier step attempt created; the image was checked at that earlier attempt) (`launchKeptMachine`, `src/restate/kg-refresh-production.ts`: `updateMachine`, then `startMachine`), and the kg-refresh Fly sender (`src/restate/kg-refresh-senders.ts`) resolves and checks the image on every dispatch, before `launchKeptMachine`, so the check covers both the create and the claim.
 
 ## Launch parity test
 

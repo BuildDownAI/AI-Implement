@@ -123,7 +123,7 @@ There is no order between the orchestrator deploy and the channel move. Either c
 |---------|---------------------|--------|
 | GitHub Actions | The implement job starts. The Actions runner pulls `container.image`, so the tag can move while the job waits in the queue. | `workflows/claude-implement.yml` (`container.image`) |
 | Fly one-shot | The machine is created. | `src/fly-machines.ts` (`machineConfig.image`) |
-| Kept Fly machine ([ADR 037](adr/037-a-durable-runner-is-a-profile-object-that-owns-one-kept-machine.md)) | Every claim. The orchestrator sends a Fly update with a fresh config and the re-resolved image, then starts the machine. | `src/restate/kg-refresh-production.ts` (`updateMachine`, then `startMachine`) |
+| Kept Fly machine ([ADR 037](adr/037-a-durable-runner-is-a-profile-object-that-owns-one-kept-machine.md)) | Every claim, except two cases. The orchestrator sends a Fly update with a fresh config and the re-resolved image, then starts the machine. It sends no update when the kept machine is already `started` for the same dispatch, or when it adopts a machine that an earlier step attempt created for that dispatch. In both cases the image was set and checked at the earlier attempt. | `src/restate/kg-refresh-production.ts` (`updateMachine`, then `startMachine`) |
 | Local Docker | `docker run`. The image comes from the host cache. On a cache miss, `docker run` pulls it, so a moving tag that is already cached is not refreshed. `image.yml` is ignored. | `buildDockerRunArgs` in `src/local-docker.ts` |
 
 A run that is in flight keeps its image. A new channel image affects only the runs that start after it.
@@ -174,7 +174,7 @@ The posture never reads the date tags.
 
 ### Planned
 
-AII-1308 plans a runner commit report (D12) and a `RunnerChannel` object. They do not exist yet. The image check in AII-1323 will change the behavior that this section describes.
+AII-1308 plans a runner commit report (D12) and a `RunnerChannel` object. They do not exist yet.
 
 ### Open questions
 
