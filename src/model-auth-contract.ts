@@ -193,6 +193,20 @@ export function isSubscriptionAuthMode(mode: AccountAuthMode): boolean {
   return SUBSCRIPTION_AUTH_MODES.includes(mode);
 }
 
+/** The one secret kind a checkout may carry for the mode. A codex-subscription secret is always an access token. */
+export function expectedSecretKind(authMode: AccountAuthMode): ModelAuthSecret["kind"] {
+  switch (authMode) {
+    case "bedrock":
+      return "aws-bedrock";
+    case "codex-subscription":
+      return "chatgpt-access-token";
+    case "claude-subscription":
+      return "session";
+    default:
+      return "api-key";
+  }
+}
+
 /** True when the mode reserves an account: owner generation, session secret, checkpoints. */
 export function reservesModelAccount(mode: AccountAuthMode): boolean {
   return RESERVED_AUTH_MODES.includes(mode);

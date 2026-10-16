@@ -206,15 +206,17 @@ describe("buildModelInvocationEnv", () => {
     ).toBe("unsupported_auth_mode");
   });
 
-  it("points subscription modes at the private directory and drops inherited homes", () => {
-    const { env } = buildModelInvocationEnv({
-      authMode: "codex-subscription",
-      secret: { kind: "session", sessionData: S_SESSION, stateSequence: 0 },
-      authDir: "/private",
-      inheritedEnv,
-    });
-    expect(env.CODEX_HOME).toBe("/private");
-    expect(env).not.toHaveProperty("OPENAI_API_KEY");
+  it("rejects a session secret for codex-subscription", () => {
+    expect(
+      category(() =>
+        buildModelInvocationEnv({
+          authMode: "codex-subscription",
+          secret: { kind: "session", sessionData: S_SESSION, stateSequence: 0 },
+          authDir: "/private",
+          inheritedEnv,
+        }),
+      ),
+    ).toBe("credential_source_mismatch");
   });
 
   it("drops unlisted inherited names, records names only, keeps safe context", () => {
@@ -811,14 +813,13 @@ describe("client", () => {
       }
     });
 
-    it("codex subscription ignores inherited API keys and points at the private dir", () => {
+    it("codex subscription ignores inherited API keys and homes and sets only the access token", () => {
       const { env } = buildModelInvocationEnv({
         authMode: "codex-subscription",
-        secret: { kind: "session", sessionData: S_SESSION, stateSequence: 0 },
-        authDir: "/private",
+        secret: { kind: "chatgpt-access-token", accessToken: S_API, expiresAt: NOW },
         inheritedEnv: { OPENAI_API_KEY: S_INHERITED, CODEX_API_KEY: S_INHERITED, CODEX_HOME: "/x" },
       });
-      expect(env).toEqual({ CODEX_HOME: "/private" });
+      expect(env).toEqual({ [CHATGPT_PLAN_ACCESS_TOKEN_ENV]: S_API });
     });
 
     it("dispose fails without deleting while an invocation is active, then succeeds", async () => {
@@ -1094,17 +1095,13 @@ describe("ChatGPT plan access token (codex-subscription)", () => {
     expect(await categoryAsync(c.checkout({ profileId: "sub", authMode: "claude-subscription" }))).toBe("credential_source_failed");
   });
 
-  it("session secret on codex still uses CODEX_HOME, checkpoints, and does no expiry check", async () => {
+  it("rejects a session secret for codex-subscription at checkout and writes no session file", async () => {
     const load = vi.fn(async () => ({ kind: "session" as const, sessionData: S_SESSION, stateSequence: 0 }));
     const persistSession = vi.fn(async () => undefined);
     const c = createModelAuthClient({ source: { kind: "local", port: { load, persistSession } }, authRoot, forbiddenRoots: [], inheritedEnv: {} });
-    await c.checkout(cg);
-    await c.invoke("cx", async (inv) => {
-      expect(inv.env.CODEX_HOME).toBeTruthy();
-      expect(inv.codexProvider).toBeUndefined();
-    }, { requiredMs: 10 ** 12 });
-    expect(load).toHaveBeenCalledTimes(1);
-    expect(persistSession).toHaveBeenCalledTimes(1);
+    expect(await categoryAsync(c.checkout(cg))).toBe("credential_source_mismatch");
+    expect(readdirSync(authRoot)).toEqual([]);
+    expect(persistSession).not.toHaveBeenCalled();
     await c.dispose();
   });
 

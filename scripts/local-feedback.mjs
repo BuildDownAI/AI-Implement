@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { chmod, cp, copyFile, mkdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
@@ -495,7 +495,8 @@ async function writePrivateFile(path, content) {
   await chmod(path, 0o600).catch(() => undefined);
 }
 
-async function makeSubscriptionFixture(privateRoot, name) {
+// `claude` builds the local-login lease fixture; the default builds the codex chatgpt-sign-in one.
+async function makeSubscriptionFixture(privateRoot, name, { claude = false } = {}) {
   const root = mkdtempSync(join(privateRoot, `${name}-`));
   const repo = join(root, "repo");
   const outside = join(root, "outside");
@@ -503,19 +504,23 @@ async function makeSubscriptionFixture(privateRoot, name) {
   await mkdirPrivate(repo);
   await mkdirPrivate(outside);
   await mkdirPrivate(authRoot);
-  const authPath = join(outside, "auth.json");
+  const authPath = join(outside, claude ? ".credentials.json" : "chatgpt-plan.json");
   const configPath = join(outside, "agent-config.json");
-  await writePrivateFile(authPath, '{"tokens":{"account_id":"acct-local","refresh_token":"r1"}}\n');
-  const stage = { agent: "codex", provider: "openai", model: "gpt-local-subscription", accountProfileId: "sub", invocationTimeoutMs: 60000 };
+  await writePrivateFile(authPath, claude ? '{"claudeAiOauth":{"accessToken":"a1","refreshToken":"r1"}}\n' : "{}\n");
+  const stage = claude
+    ? { agent: "claude", provider: "anthropic", model: "claude-local-subscription", accountProfileId: "sub", invocationTimeoutMs: 60000 }
+    : { agent: "codex", provider: "openai", model: "gpt-local-subscription", accountProfileId: "sub", invocationTimeoutMs: 60000 };
   await writePrivateFile(configPath, JSON.stringify({
     version: 1,
     mode: "configured",
     projectKey: "local-demo",
     stages: { planning: stage, implementation: stage, review: stage },
-    profiles: [{ id: "sub", identity: "local synthetic subscription", revision: 1, agent: "codex", provider: "openai", authMode: "codex-subscription", sessionPath: authPath, sessionSource: "local-login", trustedPrivateTesting: true }],
+    profiles: [{ id: "sub", identity: "local synthetic subscription", revision: 1, agent: stage.agent, provider: stage.provider, authMode: claude ? "claude-subscription" : "codex-subscription", sessionPath: authPath, sessionSource: claude ? "local-login" : "chatgpt-sign-in", trustedPrivateTesting: true }],
   }));
-  return { root, repo, outside, authRoot, authPath, configPath, lockPath: join(outside, ".auth.json.ai-lock") };
+  return { root, repo, outside, authRoot, authPath, configPath, lockPath: join(outside, `.${basename(authPath)}.ai-lock`) };
 }
+
+const REFRESHED_CLAUDE_SESSION = '{"claudeAiOauth":{"accessToken":"a2","refreshToken":"r2"}}\n';
 
 async function makeSubscriptionLifecycle(classes, fixture) {
   const loaded = await classes.loadLocalAgentConfig({ configPath: fixture.configPath, projectKey: "local-demo", forbiddenRoots: [fixture.repo] });
@@ -527,19 +532,19 @@ async function makeSubscriptionLifecycle(classes, fixture) {
     source: { kind: "local", port },
     authRoot: fixture.authRoot,
     forbiddenRoots: [fixture.repo],
-    inheritedEnv: { PATH: process.env.PATH ?? "/usr/bin", OPENAI_API_KEY: "synthetic-ambient-openai-key", CODEX_HOME: "/synthetic/ambient-codex-home" },
+    inheritedEnv: { PATH: process.env.PATH ?? "/usr/bin", ANTHROPIC_API_KEY: "synthetic-ambient-anthropic-key", CLAUDE_CONFIG_DIR: "/synthetic/ambient-claude-config" },
   });
   return { sub, ownership, port, client };
 }
 
 async function checkoutInvokeFinishSubscription(lifecycle, capture = {}) {
-  await lifecycle.client.checkout({ profileId: "sub", authMode: "codex-subscription" });
+  await lifecycle.client.checkout({ profileId: "sub", authMode: "claude-subscription" });
   await lifecycle.client.invoke("sub", async ({ env }) => {
-    capture.codexHome = env.CODEX_HOME;
-    capture.selectedEnvHadCodexHome = typeof env.CODEX_HOME === "string" && env.CODEX_HOME.length > 0;
-    capture.ambientOpenAiKeyStripped = !Object.prototype.hasOwnProperty.call(env, "OPENAI_API_KEY");
-    capture.ambientCodexHomeStripped = env.CODEX_HOME !== "/synthetic/ambient-codex-home";
-    await writePrivateFile(join(env.CODEX_HOME, "auth.json"), '{"tokens":{"account_id":"acct-local","refresh_token":"r2"}}\n');
+    capture.configDir = env.CLAUDE_CONFIG_DIR;
+    capture.selectedEnvHadConfigDir = typeof env.CLAUDE_CONFIG_DIR === "string" && env.CLAUDE_CONFIG_DIR.length > 0;
+    capture.ambientApiKeyStripped = !Object.prototype.hasOwnProperty.call(env, "ANTHROPIC_API_KEY");
+    capture.ambientConfigDirStripped = env.CLAUDE_CONFIG_DIR !== "/synthetic/ambient-claude-config";
+    await writePrivateFile(join(env.CLAUDE_CONFIG_DIR, ".credentials.json"), REFRESHED_CLAUDE_SESSION);
   });
   await lifecycle.client.finish("sub", "completed");
   await lifecycle.client.dispose();
@@ -561,25 +566,25 @@ async function runSubscriptionLifecycleSimulation(root) {
   ]);
   const classes = { loadLocalAgentConfig, LocalSessionOwnership, createLocalCredentialPort, createModelAuthClient };
   const runRoot = mkdtempSync(join(root, "subscription-lifecycle-"));
-  const refreshed = '{"tokens":{"account_id":"acct-local","refresh_token":"r2"}}\n';
+  const refreshed = REFRESHED_CLAUDE_SESSION;
   try {
-    const happyFixture = await makeSubscriptionFixture(runRoot, "happy");
+    const happyFixture = await makeSubscriptionFixture(runRoot, "happy", { claude: true });
     const happyLifecycle = await makeSubscriptionLifecycle(classes, happyFixture);
     const happyLease = await happyLifecycle.ownership.acquire(happyLifecycle.sub);
     const happyCapture = {};
     await checkoutInvokeFinishSubscription(happyLifecycle, happyCapture);
     const happyExternalLoginRefreshed = (await readFile(happyFixture.authPath, "utf8")) === refreshed;
     let happyTempRemoved = false;
-    try { await stat(happyCapture.codexHome); } catch { happyTempRemoved = true; }
+    try { await stat(happyCapture.configDir); } catch { happyTempRemoved = true; }
     await happyLifecycle.ownership.release(happyLease, { confirmTermination: async () => "confirmed" });
     let happyLockGone = false;
     try { await stat(happyFixture.lockPath); } catch { happyLockGone = true; }
     const reacquire = await happyLifecycle.ownership.acquire(happyLifecycle.sub);
-    const reloaded = await happyLifecycle.port.load({ profileId: "sub", authMode: "codex-subscription" });
+    const reloaded = await happyLifecycle.port.load({ profileId: "sub", authMode: "claude-subscription" });
     await happyLifecycle.port.persistSession({ profileId: "sub", sessionData: reloaded.sessionData });
     await happyLifecycle.ownership.release(reacquire, { confirmTermination: async () => "confirmed" });
 
-    const unknownFixture = await makeSubscriptionFixture(runRoot, "unknown");
+    const unknownFixture = await makeSubscriptionFixture(runRoot, "unknown", { claude: true });
     const unknownLifecycle = await makeSubscriptionLifecycle(classes, unknownFixture);
     const unknownLease = await unknownLifecycle.ownership.acquire(unknownLifecycle.sub);
     await checkoutInvokeFinishSubscription(unknownLifecycle);
@@ -594,20 +599,20 @@ async function runSubscriptionLifecycleSimulation(root) {
     await unknownLifecycle.ownership.release(unknownLease, { confirmTermination: async () => "confirmed" });
     const unknownReleasedAfterRetry = unknownLease.status === "released";
 
-    const stalePersistFixture = await makeSubscriptionFixture(runRoot, "stale-persist");
+    const stalePersistFixture = await makeSubscriptionFixture(runRoot, "stale-persist", { claude: true });
     const stalePersistLifecycle = await makeSubscriptionLifecycle(classes, stalePersistFixture);
     await stalePersistLifecycle.ownership.acquire(stalePersistLifecycle.sub);
-    await stalePersistLifecycle.client.checkout({ profileId: "sub", authMode: "codex-subscription" });
+    await stalePersistLifecycle.client.checkout({ profileId: "sub", authMode: "claude-subscription" });
     await unlink(stalePersistFixture.lockPath);
     let stalePersistCategory = "none";
     try {
       await stalePersistLifecycle.client.invoke("sub", async ({ env }) => {
-        await writePrivateFile(join(env.CODEX_HOME, "auth.json"), refreshed);
+        await writePrivateFile(join(env.CLAUDE_CONFIG_DIR, ".credentials.json"), refreshed);
       });
     } catch (error) { stalePersistCategory = category(error); }
     await stalePersistLifecycle.client.dispose().catch(() => undefined);
 
-    const staleReleaseFixture = await makeSubscriptionFixture(runRoot, "stale-release");
+    const staleReleaseFixture = await makeSubscriptionFixture(runRoot, "stale-release", { claude: true });
     const staleReleaseLifecycle = await makeSubscriptionLifecycle(classes, staleReleaseFixture);
     const staleReleaseLease = await staleReleaseLifecycle.ownership.acquire(staleReleaseLifecycle.sub);
     await checkoutInvokeFinishSubscription(staleReleaseLifecycle);
@@ -617,9 +622,9 @@ async function runSubscriptionLifecycleSimulation(root) {
     catch (error) { staleReleaseCategory = category(error); }
 
     const happy = {
-      selectedEnvHadCodexHome: happyCapture.selectedEnvHadCodexHome === true,
-      ambientOpenAiKeyStripped: happyCapture.ambientOpenAiKeyStripped === true,
-      ambientCodexHomeStripped: happyCapture.ambientCodexHomeStripped === true,
+      selectedEnvHadConfigDir: happyCapture.selectedEnvHadConfigDir === true,
+      ambientApiKeyStripped: happyCapture.ambientApiKeyStripped === true,
+      ambientConfigDirStripped: happyCapture.ambientConfigDirStripped === true,
       externalLoginRefreshed: happyExternalLoginRefreshed,
       finishRemovedTempAuthDir: happyTempRemoved,
       confirmedReleaseFreedLock: happyLease.status === "released" && happyLockGone,
@@ -673,9 +678,6 @@ export async function runChatGptSignInScenario(root) {
       accessTokenExpiresAt: now + 60_000, earliestRefreshAt: null, savedAt: now - 3_000_000,
     };
     await writePrivateFile(fixture.authPath, JSON.stringify(oldRecord));
-    const config = JSON.parse(await readFile(fixture.configPath, "utf8"));
-    config.profiles[0].sessionSource = "chatgpt-sign-in";
-    await writePrivateFile(fixture.configPath, JSON.stringify(config));
     const loaded = await loadLocalAgentConfig({ configPath: fixture.configPath, projectKey: "local-demo", forbiddenRoots: [fixture.repo] });
     const ownership = new LocalSessionOwnership({ forbiddenRoots: [fixture.repo] });
     // The fake token endpoint is injected in-process, so no network call is made.

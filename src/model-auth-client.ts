@@ -50,6 +50,7 @@ import {
   type ModelAuthGrantBootstrapV1,
   type ModelAuthSecret,
   type SafeModelAuthDiagnostic,
+  expectedSecretKind,
 } from "./model-auth-contract.js";
 import {
   GITHUB_WRITE_CREDENTIAL_KEYS,
@@ -363,12 +364,8 @@ export function buildModelInvocationEnv(input: {
       env.CLAUDE_CONFIG_DIR = input.authDir;
       break;
     case "codex-subscription":
-      if (secret.kind === "chatgpt-access-token") {
-        env[CHATGPT_PLAN_ACCESS_TOKEN_ENV] = secret.accessToken;
-        break;
-      }
-      if (secret.kind !== "session" || !input.authDir) fail("credential_source_mismatch");
-      env.CODEX_HOME = input.authDir;
+      if (secret.kind !== "chatgpt-access-token") fail("credential_source_mismatch");
+      env[CHATGPT_PLAN_ACCESS_TOKEN_ENV] = secret.accessToken;
       break;
     default:
       fail("unsupported_auth_mode");
@@ -381,10 +378,6 @@ export const CHATGPT_PLAN_ACCESS_TOKEN_ENV = "CHATGPT_PLAN_ACCESS_TOKEN";
 
 /** Renew when the token would expire within this margin after the invocation's expected duration. */
 const CHATGPT_RENEWAL_MARGIN_MS = 60_000;
-
-function sessionFileName(mode: AccountAuthMode): string {
-  return mode === "codex-subscription" ? "auth.json" : ".credentials.json";
-}
 
 // ---------------------------------------------------------------------------
 // Ports
@@ -866,15 +859,7 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
       // One profile may serve several stages and checkout carries no stage: label only when unambiguous.
       const stage = soleStage(options.source, request.profileId);
       const { secret, ownerGeneration } = await obtainSecret(request, stage);
-      const expectedKinds: readonly string[] =
-        request.authMode === "bedrock"
-          ? ["aws-bedrock"]
-          : request.authMode === "codex-subscription"
-            ? ["chatgpt-access-token", "session"]
-            : request.authMode === "claude-subscription"
-              ? ["session"]
-              : ["api-key"];
-      if (!expectedKinds.includes(secret.kind)) fail("credential_source_mismatch", { profileId: request.profileId });
+      if (secret.kind !== expectedSecretKind(request.authMode)) fail("credential_source_mismatch", { profileId: request.profileId });
       // A refreshed session with nowhere to go would be silently lost.
       if (
         options.source.kind === "local" &&
@@ -898,7 +883,7 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
         // Files are written only after every authorization check above has passed.
         const dir = await makePrivateDir();
         entry.dir = dir;
-        entry.sessionFile = join(dir, sessionFileName(request.authMode));
+        entry.sessionFile = join(dir, ".credentials.json");
         try {
           await writeSessionFile(entry.sessionFile, secret.sessionData);
         } catch (e) {
