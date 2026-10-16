@@ -165,6 +165,7 @@ import { createKgFindRunByTitle, createProductionKgRefreshServices, bindKeptMach
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
+import { checkPipelineSchedules } from "./restate/pipeline-schedule.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { resolveReviewProcess } from "./review-process.js";
 import { createLateExternalReviewIngressClient, createLateExternalReviewSubmitHook, createProductionLateExternalReviewServices } from "./restate/late-external-review.js";
@@ -445,6 +446,9 @@ async function getTargetRepoToken(
   return scoped.token;
 }
 
+/** True once the KG composition (and so the `PipelineSchedule` service) is bound at boot. */
+let kgScheduleBound = false;
+
 async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const cycle = beginCycle();
   if (!cycle) {
@@ -457,6 +461,8 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   const timeoutMs = config.pollCycleTimeoutMs;
 
   await refreshRunnerBackendCache();
+  // Outside the cycle deadline: the check has its own timeout and never throws. Only bound when the KG composition exists.
+  if (kgScheduleBound) await checkPipelineSchedules(["kg-refresh"]);
   await runWithDeadline(
     cycleId,
     started,
@@ -5476,6 +5482,7 @@ async function main(): Promise<void> {
     })
     : null;
   setKgRefreshToolDeps(kgComposition?.toolDeps ?? null);
+  kgScheduleBound = kgComposition !== null;
   const kgServices = kgComposition?.services ?? [];
   // The PlanningRun workflow (AII-1020, AII-1054): registered; `dispatchPlanning` submits it for a project on the Restate lifecycle.
   const planningRunServices = createProductionPlanningRunServices({

@@ -12,7 +12,7 @@ export interface ScheduleWorld {
   /** The clock `deps.now` reads, in ms. */
   setClock(ms: number): void;
   /** What `busy` answers from now on. Default `{ busy: false }`. */
-  setBusy(read: BusyRead): void;
+  setBusy(read: BusyRead): void | Promise<void>;
   /** Queues answers for the next `fire` calls; once empty, `fire` answers `started` with a fresh run id. */
   queueFire(...answers: FireAnswer[]): void;
   /** The next `fire` commits its effect, then throws once, as if the caller crashed before seeing the answer. */
@@ -104,11 +104,11 @@ export function registerPipelineScheduleContract(
     it.each(labels)("3. due and busy: no fire and still due; free on the next check: one fire (%s)", async (label) => {
       const s = begin(label, 3);
       await s.turnOnAndDue();
-      s.world.setBusy({ busy: true, holder: null, awaitingDecision: false });
+      await s.world.setBusy({ busy: true, holder: null, awaitingDecision: false });
       await s.check();
       expect(s.world.calls()).toEqual(["busy"]);
       expect((await s.get())?.lastFiredOccurrence).toBe(PREVIOUS);
-      s.world.setBusy({ busy: false });
+      await s.world.setBusy({ busy: false });
       await s.check();
       expect(s.world.calls()).toEqual(["busy", "busy", "fire"]);
       expect((await s.get())?.lastFiredOccurrence).toBe(OCCURRENCE);
@@ -160,14 +160,14 @@ export function registerPipelineScheduleContract(
       const runId = (await s.get())?.lastStartedRunId;
       expect(runId).toBeTruthy();
       s.world.setClock(DUE + DAY);
-      s.world.setBusy({ busy: true, holder: runId!, awaitingDecision: true });
+      await s.world.setBusy({ busy: true, holder: runId!, awaitingDecision: true });
       await s.check();
       expect(s.world.calls().filter((c) => c.startsWith("replace"))).toEqual([`replace:${runId}`]);
       expect((await s.get())?.lastResult).toMatchObject({ outcome: "replaced", runId });
       await s.check();
       expect(s.world.calls().filter((c) => c.startsWith("replace"))).toHaveLength(1);
       expect(count(s.world.calls(), "fire")).toBe(1);
-      s.world.setBusy({ busy: false });
+      await s.world.setBusy({ busy: false });
       await s.check();
       expect(count(s.world.calls(), "fire")).toBe(2);
       expect((await s.get())?.lastFiredOccurrence).toBe(NEXT_OCCURRENCE);
@@ -176,7 +176,7 @@ export function registerPipelineScheduleContract(
     it.each(labels)("8. a holder that is not the last started run (a manual run) is not replaced; still due (%s)", async (label) => {
       const s = begin(label, 8);
       await s.turnOnAndDue();
-      s.world.setBusy({ busy: true, holder: "manual-run", awaitingDecision: true });
+      await s.world.setBusy({ busy: true, holder: "manual-run", awaitingDecision: true });
       await s.check();
       expect(s.world.calls()).toEqual(["busy"]);
       expect((await s.get())?.lastFiredOccurrence).toBe(PREVIOUS);

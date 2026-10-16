@@ -147,6 +147,9 @@ export interface KgRefreshHeldView {
   decideBy: number;
 }
 
+/** The cancel reason a pipeline schedule sends to replace its own run held at the decision gate (AII-1432). */
+export const KG_REFRESH_SUPERSEDED_REASON = "superseded_by_schedule";
+
 export interface KgRefreshStatusResult {
   step: string | null;
   startedAt: number | null;
@@ -473,7 +476,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
      * when `bestEffort` is set (a Restate cancel must still reach the release), and a signal cancel
      * additionally waits for the GitHub run to terminate.
      */
-    async function cleanupCancelled(mode: "signal" | "restate"): Promise<RefreshOutcome> {
+    async function cleanupCancelled(mode: "signal" | "restate", gate = "operator_cancelled"): Promise<RefreshOutcome> {
       const bestEffort = mode === "restate";
       const attempt = async (name: string, fn: () => Promise<unknown>): Promise<void> => {
         if (!bestEffort) {
@@ -523,7 +526,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           }
         }
       }
-      await closeHeldPr("operator_cancelled");
+      await closeHeldPr(gate);
       ctx.set("step", "failed");
       const at = await ctx.date.now();
       let cancelled = buildFailureOutcome(at, "cancelled by operator");
@@ -980,7 +983,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         }
         if (decision.kind === "signal") {
           ctx.console.log(`[KgRefresh] cancel signal while held: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
-          return cleanupCancelled("signal");
+          // Only the gate close names the schedule; the run's failure classification stays operator_cancelled.
+          return cleanupCancelled("signal", decision.value === KG_REFRESH_SUPERSEDED_REASON ? KG_REFRESH_SUPERSEDED_REASON : undefined);
         }
 
         ctx.console.log(`[KgRefresh] decision timeout: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
