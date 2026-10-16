@@ -9,7 +9,7 @@ import { ClaudeCliExecutor } from "./pipeline/executor.js";
 import type { InvocationAttributionV1, InvokeParams, LLMResult } from "./pipeline/types.js";
 import { DEFAULT_MODEL } from "./pipeline/default-model.js";
 import { installSkills, skillAgentsForSnapshot } from "./pipeline/steps/install-skills.js";
-import { setupPlanningWritePolicy, type PlanningWritePolicy } from "./planning-write-policy.js";
+import { setupPlanningWritePolicy, type PlanningSkillInput, type PlanningWritePolicy } from "./planning-write-policy.js";
 
 export type PlanningExecutor = (
   prompt: string,
@@ -101,16 +101,21 @@ function describeConfiguredFailure(err: unknown): string {
  * Installs the selected project skills before any planning executor starts. The runner's `GITHUB_TOKEN` reaches only
  * the clone child (through `gitProcessEnv`), never a model process. Bounded and non-fatal: failures only warn.
  */
-function installPlanningSkills(skillsRepo: string | undefined, snapshot: ResolvedAgentSnapshotV1 | undefined): void {
-  if (!skillsRepo) return;
+function installPlanningSkills(
+  skillsRepo: string | undefined,
+  snapshot: ResolvedAgentSnapshotV1 | undefined,
+): PlanningSkillInput | undefined {
+  if (!skillsRepo) return undefined;
   try {
-    installSkills({
+    const out = installSkills({
       skillsRepoUrl: skillsRepo,
       githubToken: process.env.GITHUB_TOKEN?.trim() ?? "",
       agents: skillAgentsForSnapshot(snapshot),
     });
+    return out?.skillNames?.length ? { skillNames: out.skillNames } : undefined;
   } catch {
     // installSkills does not throw; planning must proceed regardless.
+    return undefined;
   }
 }
 
@@ -120,6 +125,7 @@ interface ConfiguredPlanningInput {
   workspaceDir: string;
   prompt: string;
   configured: ConfiguredRun;
+  skills?: PlanningSkillInput;
   spawnImpl?: typeof spawn;
   /** True when this call owns the auth lifecycle and must finish it; a caller-owned client is left to the caller. */
   ownsLifecycle: boolean;
@@ -135,7 +141,7 @@ type ConfiguredPlanningOutcome =
  * the legacy executor, and never retries on another account. Success requires a readable Markdown plan.
  */
 async function invokeConfiguredPlanning(input: ConfiguredPlanningInput): Promise<ConfiguredPlanningOutcome> {
-  const { workspaceDir, prompt, configured } = input;
+  const { workspaceDir, prompt, configured, skills } = input;
   const selection = configured.snapshot.stages.planning;
   let completed = false;
 
@@ -145,7 +151,7 @@ async function invokeConfiguredPlanning(input: ConfiguredPlanningInput): Promise
   try {
     if (selection.agent === "claude") {
       try {
-        policy = setupPlanningWritePolicy(workspaceDir);
+        policy = setupPlanningWritePolicy(workspaceDir, skills);
       } catch {
         return { ok: false, reason: "Planning write policy could not be set up; planning was not started" };
       }
@@ -279,12 +285,13 @@ export async function runPlanningLocally(
     if (parsed.frontMatter.model) model = opts.model ?? parsed.frontMatter.model;
     if (parsed.body.trim()) prompt = parsed.body;
   }
-  installPlanningSkills(opts.skillsRepo, opts.agentConfig);
+  const skills = installPlanningSkills(opts.skillsRepo, opts.agentConfig);
   if (configured) {
     const outcome = await invokeConfiguredPlanning({
       workspaceDir: opts.workspaceDir,
       prompt,
       configured,
+      skills,
       spawnImpl: opts.spawnImpl,
       ownsLifecycle: !opts.prebuiltConfiguredRun && !opts.configured?.modelAuthClient,
     });
@@ -296,7 +303,7 @@ export async function runPlanningLocally(
   }
   let policy: PlanningWritePolicy;
   try {
-    policy = setupPlanningWritePolicy(opts.workspaceDir);
+    policy = setupPlanningWritePolicy(opts.workspaceDir, skills);
   } catch {
     return {
       exitCode: 1,
@@ -439,9 +446,9 @@ export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exit
     if (parsed.frontMatter.model) model = process.env.CLAUDE_MODEL || parsed.frontMatter.model;
     if (parsed.body.trim()) prompt = parsed.body;
   }
-  installPlanningSkills(skillsRepo, agentConfig);
+  const skills = installPlanningSkills(skillsRepo, agentConfig);
   if (configured) {
-    const outcome = await invokeConfiguredPlanning({ workspaceDir, prompt, configured, spawnImpl: opts.spawnImpl, ownsLifecycle: true });
+    const outcome = await invokeConfiguredPlanning({ workspaceDir, prompt, configured, skills, spawnImpl: opts.spawnImpl, ownsLifecycle: true });
     if (!outcome.ok) return failConfigured(outcome.reason, outcome.attribution);
     await postRunnerResult({
       phase: "planning",
@@ -455,7 +462,7 @@ export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exit
   }
   let policy: PlanningWritePolicy;
   try {
-    policy = setupPlanningWritePolicy(workspaceDir);
+    policy = setupPlanningWritePolicy(workspaceDir, skills);
   } catch {
     await postRunnerResult({
       phase: "planning",
