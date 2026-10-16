@@ -180,7 +180,7 @@ export function declaresFrontmatterHooks(skillMd: string): boolean {
 function pathsOverlap(a: string, b: string): boolean {
   const rel = (from: string, to: string) => {
     const r = path.relative(from, to);
-    return r === "" || (!r.startsWith("..") && !path.isAbsolute(r));
+    return r === "" || (r !== ".." && !r.startsWith(".." + path.sep) && !path.isAbsolute(r));
   };
   return rel(a, b) || rel(b, a);
 }

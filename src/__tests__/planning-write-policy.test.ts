@@ -219,6 +219,16 @@ describe("planning write policy", () => {
       c.cleanup();
     });
 
+    it("treats a '..'-prefixed child directory name as inside the workspace", () => {
+      const homeDir = join(ws, "..selected-home");
+      const skill = join(homeDir, ".claude", "skills", "repo-skill");
+      mkdirSync(skill, { recursive: true });
+      writeFileSync(join(skill, "SKILL.md"), "---\nname: repo-skill\n---\nb");
+      const policy = setupPlanningWritePolicy(ws, { homeDir, skillNames: ["repo-skill"] });
+      expect(policy.args).not.toContain("--plugin-dir");
+      policy.cleanup();
+    });
+
     it("adds no plugin and keeps Skill denied when nothing valid is selected, and cleans up", () => {
       const none = setupPlanningWritePolicy(ws, { homeDir: home, skillNames: ["nomd", "linked"] });
       expect(none.args).not.toContain("--plugin-dir");
