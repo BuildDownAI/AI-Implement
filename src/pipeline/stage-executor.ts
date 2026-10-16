@@ -69,7 +69,10 @@ export interface StageExecutorOptions {
   activityReporting?: ActivityReportingConfig;
   cancelSignal?: AbortSignal;
   /** Extra Codex executor options (spawn/sleep seams); `auth`/`profileId` are always the selected ones. */
-  codexOptions?: Omit<CodexExecutorOptions, "auth" | "profileId" | "allowRepositoryWrites" | "cancelSignal">;
+  codexOptions?: Omit<CodexExecutorOptions, "auth" | "profileId" | "allowRepositoryWrites" | "cancelSignal" | "implementationFullAccess">;
+  /** Validated operator-approved ephemeral full-access policy (AII-1437). Reaches only the `exec` Codex executor, which
+   *  applies it to `agentStage === "implementation"`; the planning app-server executor never receives it. */
+  implementationFullAccess?: true;
   /** Construction seams, mainly for tests. Each is called at most once per executor (Codex: per profile). */
   createClaude?: () => ClaudeLike;
   createCodex?: (profileId: string) => LLMExecutor;
@@ -120,8 +123,13 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
             ? {
                 protocolDriver: options.codexOptions?.protocolDriver ?? createCodexPlanningDriver(),
                 trustedSkillsDir: options.codexOptions?.trustedSkillsDir ?? join(homedir(), CODEX_SKILLS_SUBDIR),
+                implementationFullAccess: undefined,
               }
-            : { protocolDriver: undefined, trustedSkillsDir: undefined }),
+            : {
+                protocolDriver: undefined,
+                trustedSkillsDir: undefined,
+                ...(options.implementationFullAccess === true ? { implementationFullAccess: true as const } : {}),
+              }),
           auth,
           profileId,
           allowRepositoryWrites: options.allowRepositoryWrites,

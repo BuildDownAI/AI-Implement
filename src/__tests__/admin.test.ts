@@ -854,6 +854,45 @@ describe("admin mappings", () => {
     expect(JSON.parse(res.body).error).toMatch(/extraEnv must be a plain object/);
   });
 
+  describe("ephemeral full-access opt-in (AII-1437)", () => {
+    const OPT_IN = "AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS";
+    const create = async (extraEnv: Record<string, string>, extra: Record<string, unknown> = {}) => {
+      const token = await login("secret");
+      return request("/api/mappings", "POST", "secret", { teamKey: "EPH", owner: "org", repo: "eph", extraEnv, ...extra }, token);
+    };
+
+    it("accepts the exact assertion on a GitHub Actions mapping", async () => {
+      const res = await create({ [OPT_IN]: "ephemeral-runner-asserted-v1" });
+      expect(res.statusCode).toBe(202);
+      expect(JSON.parse(res.body).extraEnv).toEqual({ [OPT_IN]: "ephemeral-runner-asserted-v1" });
+    });
+
+    it.each([["true"], ["1"], [""], ["ephemeral-runner-asserted-v2"]])("rejects the value %j", async (value) => {
+      const res = await create({ [OPT_IN]: value });
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toContain(OPT_IN);
+    });
+
+    it("rejects a case variant and the reserved launch variable", async () => {
+      expect((await create({ [OPT_IN.toLowerCase()]: "ephemeral-runner-asserted-v1" })).statusCode).toBe(400);
+      expect((await create({ AI_IMPLEMENT_EXECUTION_POLICY: "v1:ephemeral-full-access:gha:a:b" })).statusCode).toBe(400);
+    });
+
+    it("rejects the opt-in on a Fly mapping", async () => {
+      const res = await create({ [OPT_IN]: "ephemeral-runner-asserted-v1" }, { executionMode: "fly-machines" });
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toContain("github-actions");
+    });
+
+    it("rejects a mode change to Fly that omits extraEnv while the opt-in is stored", async () => {
+      expect((await create({ [OPT_IN]: "ephemeral-runner-asserted-v1" })).statusCode).toBe(202);
+      const token = await login("secret");
+      const res = await request("/api/mappings", "POST", "secret", { teamKey: "EPH", owner: "org", repo: "eph", executionMode: "fly-machines" }, token);
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toContain("github-actions");
+    });
+  });
+
   it("defaults provider to anthropic and awsRegion to null when omitted", async () => {
     const token = await login("secret");
     const create = await request("/api/mappings", "POST", "secret", {

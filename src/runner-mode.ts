@@ -1,4 +1,5 @@
 import { getDb } from "./dedup.js";
+import { hasEphemeralFullAccessOptIn } from "./model-auth-contract.js";
 
 declare global {
   namespace NodeJS {
@@ -97,9 +98,13 @@ export interface ForcedPathEligibility {
  */
 export function checkForcedPathEligibility(
   runnerMode: RunnerMode,
-  mapping: { executionMode: "github-actions" | "fly-machines"; provider?: string },
+  mapping: { executionMode: "github-actions" | "fly-machines"; provider?: string; extraEnv?: Readonly<Record<string, string>> | null },
   hasFlySessionsApp: boolean,
 ): ForcedPathEligibility {
+  // AII-1437: the ephemeral full-access opt-in is GHA-only; any other resolved path would throw at launch.
+  if (hasEphemeralFullAccessOptIn(mapping.extraEnv) && resolveExecutionPath(runnerMode, mapping.executionMode) !== "github-actions") {
+    return { eligible: false, reason: "ephemeral full-access opt-in requires GitHub Actions execution" };
+  }
   if (runnerMode !== "fly") return { eligible: true, reason: null };
   if (mapping.provider === "bedrock") {
     return { eligible: false, reason: "provider=bedrock is GHA-only (no role-assumption on Fly)" };

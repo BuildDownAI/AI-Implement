@@ -28,7 +28,7 @@ export const INSTALL_CREDENTIAL_KEYS = ["NPM_TOKEN"] as const;
  * a model or repository child. The selected model credential is delivered separately by
  * ModelAuthClient's invocation environment, which this module does not touch.
  */
-export const PROTECTED_BOOTSTRAP_KEYS = ["AI_IMPLEMENT_RUN_CONFIG"] as const;
+export const PROTECTED_BOOTSTRAP_KEYS = ["AI_IMPLEMENT_RUN_CONFIG", "AI_IMPLEMENT_EXECUTION_POLICY"] as const;
 export const PROTECTED_BOOTSTRAP_PREFIXES = ["AI_IMPLEMENT_MODEL_AUTH_"] as const;
 
 /** Model credential and session-handle names beyond MODEL_CREDENTIAL_KEYS that repository code must not inherit. */
