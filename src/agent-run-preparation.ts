@@ -43,9 +43,10 @@ import {
   STAGE_NAMES,
   type AccountAuthMode,
   type ConfiguredStageResolution,
+  type StageAgentConfigurationV1,
   type StageName,
 } from "./agent-config.js";
-import { getProjectOptIn, resolveProjectStageConfig } from "./agent-config-store.js";
+import { getProjectOptIn, resolveCandidateProjectStageConfig, resolveProjectStageConfig } from "./agent-config-store.js";
 import type { DispatchAdmissionBackend } from "./dispatch-admission.js";
 import {
   MODEL_AUTH_AUDIENCE,
@@ -243,10 +244,12 @@ type Resolved =
   | { readonly kind: "snapshot"; readonly snapshot: ResolvedAgentSnapshotV1; readonly stored: boolean }
   | { readonly kind: "error"; readonly code: ConfigurationErrorCode };
 
-function resolveCurrent(request: AgentRunRequest): Resolved {
+function resolveCurrent(request: AgentRunRequest, candidate?: StageAgentConfigurationV1): Resolved {
   let projection;
   try {
-    projection = resolveProjectStageConfig(request.projectKey, request.remainingJobMs);
+    projection = candidate
+      ? resolveCandidateProjectStageConfig(request.projectKey, candidate, request.remainingJobMs)
+      : resolveProjectStageConfig(request.projectKey, request.remainingJobMs);
   } catch {
     return { kind: "error", code: "resolution_failed" };
   }
@@ -408,11 +411,16 @@ function credentialRequest(projectKey: string, snapshot: ResolvedAgentSnapshotV1
  * `prepareAgentRun`. `codex-subscription` is not reserved, so it takes the unreserved path.
  * An unknown or unreadable input is `not-ready`.
  */
-export async function inspectAgentReadiness(request: AgentRunRequest, deps: AgentReadinessDeps): Promise<AgentReadiness> {
+export async function inspectAgentReadiness(
+  request: AgentRunRequest,
+  deps: AgentReadinessDeps,
+  candidate?: StageAgentConfigurationV1,
+): Promise<AgentReadiness> {
   if (!validRequest(request)) return { status: "not-ready", code: "invalid_request" };
   let resolved: Resolved;
   try {
-    resolved = resolveForRequest(request);
+    // A candidate is an uncommitted project config: it is resolved in place of the stored head and nothing is stored.
+    resolved = candidate ? resolveCurrent(request, candidate) : resolveForRequest(request);
   } catch {
     return { status: "not-ready", code: "resolution_failed" };
   }

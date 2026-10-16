@@ -57,7 +57,7 @@ import { initAccessAuditTable } from "./access-audit.js";
 import { initAuthEventsTable } from "./mcp-auth-events.js";
 import { initAccessPageGrantsTable } from "./access-page-grants.js";
 import { createModelAuthRoutes } from "./model-auth-routes.js";
-import { getModelAuthRuntime, type ModelAuthRuntime } from "./model-auth-runtime.js";
+import { createAgentConfigAdminDeps, getModelAuthRuntime, type ModelAuthRuntime } from "./model-auth-runtime.js";
 import {
   classifyLaunchError,
   isManagedProject,
@@ -5104,7 +5104,8 @@ function startServer(
           min: RESTATE_RETENTION_DAYS_MIN,
           max: RESTATE_RETENTION_DAYS_MAX,
         },
-        reviewFixAttempts })) return;
+        reviewFixAttempts,
+        agentConfig: createAgentConfigAdminDeps(config) })) return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
