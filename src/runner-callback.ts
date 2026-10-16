@@ -812,8 +812,8 @@ export async function handleRunnerResult(
 
   // Note: token is consumed atomically here BEFORE any provider call. If
   // postComment or a status verb fails downstream, the comments may be lost
-  // (orchestrator surfaces the error in warnings[] but the runner has no
-  // retry path — its token is gone). This is intentional, best-effort
+  // (orchestrator surfaces the error in warnings[] but a runner retry
+  // answers 409 already_consumed, which the runner treats as delivered). This is intentional, best-effort
   // design: returning a 5xx would make the GHA step go red and trigger
   // user-side retries, which we don't want to encourage. Operators monitor
   // the orchestrator logs for warnings[] entries and re-dispatch manually
@@ -836,7 +836,7 @@ export async function handleRunnerResult(
   const { claims, mappingTeamKey } = verified;
 
   // Shape-validated, but a malformed record is dropped rather than rejected: the
-  // token above is already consumed, and postRunnerResult never retries, so
+  // token above is already consumed, and a postRunnerResult retry would only get 409, so
   // failing the whole callback here would discard the comments, the tracker
   // transition, and remediation over a field the orchestrator only ever displays.
   // A newer runner reporting a FailureCategory this orchestrator doesn't yet know

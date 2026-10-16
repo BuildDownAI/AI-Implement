@@ -22,6 +22,22 @@ const MAX_PILOT_RESULT_ATTEMPTS = 8;
 /** Bounds a single delivery attempt; overridable per-call via `transportTimeoutMs` for tests. */
 const PILOT_TRANSPORT_TIMEOUT_MS = 10_000;
 
+/**
+ * Time a Legacy result post keeps retrying (AII-859). Covers an orchestrator replacement or
+ * restart (minutes) with margin; it delays runner exit by at most this long when the
+ * orchestrator stays down. Still bounded by MAX_PILOT_RESULT_ATTEMPTS.
+ */
+const LEGACY_RESULT_DELIVERY_BUDGET_MS = 15 * 60_000;
+
+function isAlreadyConsumed(body: string): boolean {
+  try {
+    const parsed = JSON.parse(body) as { error?: unknown };
+    return parsed?.error === "already_consumed";
+  } catch {
+    return false;
+  }
+}
+
 function isRetryableStatus(status: number): boolean {
   return status === 429 || status >= 500;
 }
@@ -195,8 +211,7 @@ export async function postRunnerResult(params: {
   callbackUrl?: string | null;
   fetchImpl?: typeof fetch;
   /**
-   * Backoff policy for the pilot's bounded result-delivery retry loop (AII-794). Ignored for
-   * a Legacy call (no `reviewFix`), which always delivers in one attempt exactly as before.
+   * Backoff policy for the bounded result-delivery retry loop (AII-794, AII-859).
    * Defaults to DEFAULT_RETRY_POLICY.
    */
   retryPolicy?: RetryPolicy;
@@ -255,39 +270,28 @@ export async function postRunnerResult(params: {
   const payload = JSON.stringify(body);
   const fetchFn = params.fetchImpl ?? fetch;
 
-  if (!params.reviewFix) {
-    // Legacy (no pilot marker): unchanged single-attempt behavior.
-    try {
-      const res = await fetchFn(url, { method: "POST", headers, body: payload });
-      if (!res.ok) {
-        console.error(`[runner-callback] POST failed HTTP ${res.status}: ${await res.text().catch(() => "")}`);
-      } else {
-        console.log(`[runner-callback] POST ok phase=${params.phase} outcome=${params.outcome}`);
-      }
-    } catch (err) {
-      console.error("[runner-callback] POST failed:", err);
-    }
-    return;
-  }
-
-  // Pilot (reviewFix present): bounded retry/backoff on transient transport/429/5xx failures,
-  // respecting the attempt's stored deadline plus delivery grace. A terminal 4xx/conflict (incl.
+  // Bounded retry/backoff on transient transport/429/5xx failures. A pilot call (reviewFix present)
+  // respects the attempt's stored deadline plus delivery grace; a Legacy call has no deadline and
+  // gets LEGACY_RESULT_DELIVERY_BUDGET_MS from now (AII-859). A terminal 4xx/conflict (incl.
   // the pilot's own 409 conflict / 410 stale classifications) stops retrying immediately and
   // remains visible via console.error — never retried, never silently swallowed. Exhausting the
   // deadline or the attempt cap without a response is its own explicit "no-result" log outcome;
   // it must never rerun agent work or mint a new attempt, only report that delivery failed.
-  const attemptId = params.reviewFix.attemptId;
+  const attemptId = params.reviewFix?.attemptId;
+  const attemptTag = attemptId ? ` attemptId=${attemptId}` : "";
   const nowFn = params.now ?? Date.now;
   const sleepFn = params.sleepImpl ?? sleep;
   const policy = params.retryPolicy ?? DEFAULT_RETRY_POLICY;
   const transportTimeoutMs = params.transportTimeoutMs ?? PILOT_TRANSPORT_TIMEOUT_MS;
-  const deadline = params.reviewFix.deadlineAt + PILOT_RESULT_DELIVERY_GRACE_MS;
+  const deadline = params.reviewFix
+    ? params.reviewFix.deadlineAt + PILOT_RESULT_DELIVERY_GRACE_MS
+    : nowFn() + LEGACY_RESULT_DELIVERY_BUDGET_MS;
   let lastReason = "unknown";
 
   for (let attempt = 1; attempt <= MAX_PILOT_RESULT_ATTEMPTS; attempt++) {
     if (nowFn() >= deadline) {
       console.error(
-        `[runner-callback] POST no-result phase=${params.phase} outcome=${params.outcome} attemptId=${attemptId}: ` +
+        `[runner-callback] POST no-result phase=${params.phase} outcome=${params.outcome}${attemptTag}: ` +
           `delivery deadline exceeded before attempt ${attempt} (last reason=${lastReason})`,
       );
       return;
@@ -295,16 +299,25 @@ export async function postRunnerResult(params: {
     try {
       const res = await fetchWithAbortTimeout(fetchFn, url, { method: "POST", headers, body: payload }, transportTimeoutMs);
       if (res.ok) {
-        console.log(`[runner-callback] POST ok phase=${params.phase} outcome=${params.outcome} attemptId=${attemptId}`);
+        console.log(`[runner-callback] POST ok phase=${params.phase} outcome=${params.outcome}${attemptTag}`);
         return;
       }
       // Drain the body to free the connection without ever logging its contents — an untrusted
       // server/transport string here could carry an echoed bearer or other request data.
-      await res.text().catch(() => "");
+      const text = await res.text().catch(() => "");
+      // The result token is single-use: a 409 already_consumed on a RETRY means an earlier attempt
+      // reached the server and only its response was lost. On attempt 1 it is a stray token use
+      // (AII-567) and stays a failure. Parsed for this one comparison only; never logged.
+      if (attempt > 1 && res.status === 409 && isAlreadyConsumed(text)) {
+        console.log(
+          `[runner-callback] POST delivered (token already consumed on retry) phase=${params.phase} outcome=${params.outcome}${attemptTag}`,
+        );
+        return;
+      }
       lastReason = classifyFailureReason(res.status, null);
       if (!isRetryableStatus(res.status)) {
         console.error(
-          `[runner-callback] POST failed HTTP ${res.status} attemptId=${attemptId} (terminal, not retrying) reason=${lastReason}`,
+          `[runner-callback] POST failed HTTP ${res.status}${attemptTag} (terminal, not retrying) reason=${lastReason}`,
         );
         return;
       }
@@ -314,7 +327,7 @@ export async function postRunnerResult(params: {
 
     if (attempt === MAX_PILOT_RESULT_ATTEMPTS) {
       console.error(
-        `[runner-callback] POST no-result phase=${params.phase} outcome=${params.outcome} attemptId=${attemptId}: ` +
+        `[runner-callback] POST no-result phase=${params.phase} outcome=${params.outcome}${attemptTag}: ` +
           `retry attempts exhausted (${MAX_PILOT_RESULT_ATTEMPTS}) (last reason=${lastReason})`,
       );
       return;
@@ -323,7 +336,7 @@ export async function postRunnerResult(params: {
     const remaining = deadline - nowFn();
     if (remaining <= 0) {
       console.error(
-        `[runner-callback] POST no-result phase=${params.phase} outcome=${params.outcome} attemptId=${attemptId}: ` +
+        `[runner-callback] POST no-result phase=${params.phase} outcome=${params.outcome}${attemptTag}: ` +
           `delivery deadline exceeded after attempt ${attempt} (last reason=${lastReason})`,
       );
       return;

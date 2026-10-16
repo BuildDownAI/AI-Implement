@@ -1651,6 +1651,7 @@ describe("runAutonomous", () => {
           runner,
           reporter: new NoopStepReporter(),
           llmExecutor: makeMockExecutor(0),
+          fetchImpl: vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" }),
         });
 
         expect(result.exitCode).toBe(0);
