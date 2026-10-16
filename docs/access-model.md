@@ -202,3 +202,16 @@ It holds no architectural responsibility, which is what keeps the deprecated pat
 **Per-person grants.** The grant set is global: every `user` on an orchestrator sees the same pages. The table is keyed on the page alone, so distinguishing two users means a schema change, not a setting.
 
 **Re-pointing a bound entry in one step.** Today it takes a remove-then-add pair of saves, and binding state is never shown on the page. Surfacing which entries are bound, and letting a save clear a binding explicitly, are both open.
+
+## Model-account and stage-configuration admin API (AII-962)
+
+Admin-only: none of these paths is in `PAGE_ROUTES`, so a granted non-admin gets 403 on every one of them (a grant never reaches a non-GET anyway).
+
+| Route | Purpose |
+|---|---|
+| `GET` / `POST /api/model-accounts`, `PATCH /api/model-accounts/:id` | Profile list (safe projection plus readiness) and revision writes. Bodies carry metadata and a protected `credentialRef` only; any other key (`apiKey`, `session`, `token`, ...) is a 400. Reads never return `credentialRef`. |
+| `GET` / `PUT /api/agent-defaults` | Orchestrator stage defaults. Validated against profiles in one transaction. |
+| `GET` / `PUT /api/mappings/:key/agent-config` | Project opt-in (`enabled`) and partial stage overrides. A supplied field replaces the stored one, `null` returns it to inheritance, omitted fields stay. |
+| `GET /api/mappings/:key/agent-config/resolved` | Actual values, per-field sources, resolution failure code, account readiness (`ready`, `sign-in required`, `refresh failed (transient)`, `missing`, `unknown`), and session recovery state for `claude-subscription` only. |
+
+Ordinary mapping CRUD never reads `enabled` or `agentConfig`. Opt-in calls `inspectAgentReadiness` for the backend dispatch would use (`deps.agentConfig`, bound in `src/index.ts`) and refuses with 409/422 and a fixed code. GitHub Actions opt-in answers `unsupported_backend` until managed GHA credentials land (AII-1420/AII-970); template codes name the existing workflow sync. Claude subscription profiles cannot be opted in. Readiness is async, so the candidate is stored first and a refusal restores the prior state as a new revision; dispatch checks readiness again.

@@ -6063,3 +6063,245 @@ describe("admin poll-now", () => {
     expect(res.statusCode).toBe(503);
   });
 });
+
+describe("model accounts and stage configuration (AII-962)", () => {
+  function sso(email: string, sub: string): string {
+    return adminSession.createSession({ email, sub, provider: "google", name: email });
+  }
+  const adminTok = () => sso("ada@eudoxus.ai", "google|ada");
+  const userTok = () => sso("reader@eudoxus.ai", "google|reader");
+
+  type Deps = NonNullable<Parameters<typeof admin.handleAdminRequest>[4]>;
+  const readyDeps = (inspect: (r: unknown) => Promise<unknown> = async () => ({ status: "ready", profiles: [] })): Deps => ({
+    agentConfig: {
+      inspectReadiness: inspect as never,
+      credentials: { sessionStore: {} as never, resolveProtectedSecret: () => null },
+    },
+  });
+
+  async function call(url: string, method: string, token: string, body?: unknown, deps: Deps = {}) {
+    const res = await requestWithDeps(url, method, token, deps, body);
+    return { status: res.statusCode, json: res.body ? JSON.parse(res.body) : null, raw: res.body };
+  }
+
+  const SENTINEL = "ref/sentinel-credential-ref";
+  const profileBody = (over: Record<string, unknown> = {}) => ({
+    profileId: "oai-1",
+    identity: "OpenAI team key",
+    agent: "codex",
+    provider: "openai",
+    authMode: "openai-api-key",
+    allowedProjectKeys: ["APP"],
+    credentialRef: SENTINEL,
+    ...over,
+  });
+  const defaults = {
+    mode: "configured",
+    stages: Object.fromEntries(
+      ["planning", "implementation", "review"].map((s) => [
+        s,
+        { agent: "codex", provider: "openai", model: "gpt-x", accountProfileId: "oai-1", invocationTimeoutMs: 600000 },
+      ]),
+    ),
+  };
+
+  async function seed(deps: Deps = {}) {
+    const t = adminTok();
+    await request("/api/mappings", "POST", "secret", { teamKey: "APP", owner: "org", repo: "app" }, t);
+    expect((await call("/api/model-accounts", "POST", t, profileBody(), deps)).status).toBe(201);
+    expect((await call("/api/agent-defaults", "PUT", t, defaults, deps)).status).toBe(200);
+    return t;
+  }
+
+  const count = (table: string) => (dedup.getDb().prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
+
+  it("refuses every write to a non-admin, even with every page granted, and changes nothing", async () => {
+    await seed();
+    accessGrants.savePageGrants(Object.keys(accessGrants.PAGE_ROUTES), "ada@eudoxus.ai");
+    const before = [count("model_account_profile_revisions"), count("stage_agent_config_revisions"), count("model_account_profile_project_permissions")];
+    const u = userTok();
+    for (const [url, method, body] of [
+      ["/api/model-accounts", "POST", profileBody({ profileId: "x1" })],
+      ["/api/model-accounts/oai-1", "PATCH", { status: "disabled" }],
+      ["/api/agent-defaults", "PUT", defaults],
+      ["/api/mappings/APP/agent-config", "PUT", { enabled: false }],
+    ] as const) {
+      expect((await call(url, method, u, body, readyDeps())).status).toBe(403);
+    }
+    expect([count("model_account_profile_revisions"), count("stage_agent_config_revisions"), count("model_account_profile_project_permissions")]).toEqual(before);
+  });
+
+  it("rejects credential values and unknown keys without echoing them, and appends nothing", async () => {
+    const t = await seed();
+    const revs = count("model_account_profile_revisions");
+    for (const bad of [{ apiKey: "sk-live-abc" }, { session: "s" }, { token: "t" }, { credentialRef: "sk-live-abc123" }]) {
+      const r = await call("/api/model-accounts", "POST", t, profileBody({ profileId: "bad", ...bad }));
+      expect(r.status).toBe(400);
+      expect(r.raw).not.toContain("sk-live-abc");
+    }
+    expect((await call("/api/model-accounts/oai-1", "PATCH", t, { apiKey: "x" })).status).toBe(400);
+    expect((await call("/api/model-accounts", "POST", t, profileBody({ profileId: "bad", authMode: "bedrock" }))).status).toBe(400);
+    expect(count("model_account_profile_revisions")).toBe(revs);
+  });
+
+  it("reads only safe profile metadata and maps codex-subscription readiness", async () => {
+    const t = await seed();
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "plan-1", authMode: "codex-subscription", credentialRef: undefined, allowedProjectKeys: ["APP"] }));
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "cl-sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", credentialRef: undefined }));
+    const mk = (readPlanRecord: () => unknown): Deps => ({
+      agentConfig: {
+        inspectReadiness: async () => ({ status: "ready", profiles: [] }),
+        credentials: { sessionStore: { readPlanRecord } as never, resolveProtectedSecret: () => null },
+        sessionSnapshot: (id) => (id === "cl-sub" ? { profileId: id, dispatchId: "d", generation: 1, state: "recovery_required", heartbeatAt: null } : undefined),
+      },
+    });
+    const list = async (readPlanRecord: () => unknown) => (await call("/api/model-accounts", "GET", t, undefined, mk(readPlanRecord))).json.accounts;
+    const find = (accts: Array<Record<string, any>>, id: string) => accts.find((a) => a.profileId === id)!;
+
+    let accts = await list(() => ({ ok: false, reason: "no_state" }));
+    expect(find(accts, "plan-1").account.readiness).toBe("sign-in required");
+    accts = await list(() => ({ ok: false, reason: "decrypt_failed" }));
+    expect(find(accts, "plan-1").account.readiness).toBe("refresh failed (transient)");
+    expect(find(accts, "cl-sub").account.sessionRecovery).toEqual({ state: "recovery_required", recoveryRequired: true });
+    expect(find(accts, "oai-1").account.sessionRecovery).toBeUndefined();
+    expect(find(accts, "oai-1").account.readiness).toBe("missing"); // reference is outside the protected namespace
+
+    const raw = (await call("/api/model-accounts", "GET", t, undefined, mk(() => ({ ok: false, reason: "no_state" })))).raw;
+    expect(raw).not.toContain(SENTINEL);
+    expect(raw).not.toContain("credentialRef");
+    expect(raw).not.toContain("metadata");
+  });
+
+  it("keeps old revisions on PATCH and refuses new grants for a disabled profile", async () => {
+    const t = await seed();
+    const store = await import("../agent-config-store.js");
+    const patched = await call("/api/model-accounts/oai-1", "PATCH", t, { identity: "Renamed" });
+    expect(patched.json).toMatchObject({ revision: 2, identity: "Renamed", profileStatus: "active" });
+    expect(store.getAccountProfileRevision("oai-1", 1)?.identity).toBe("OpenAI team key");
+    expect(store.lookupCredentialReference("oai-1", 2)).toBe(SENTINEL); // reference carried forward
+    expect((await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" })).status).toBe(200);
+    const grant = await call("/api/model-accounts/oai-1", "PATCH", t, { allowedProjectKeys: ["APP", "OTHER"] });
+    expect(grant.status).toBe(409);
+    expect(store.getAccountProfile("oai-1")?.revision).toBe(3);
+    // A disabled profile is refused by a new project config.
+    const put = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, readyDeps());
+    expect(put.status).toBe(400);
+    expect((await call("/api/model-accounts/nope", "PATCH", t, { status: "disabled" })).status).toBe(404);
+  });
+
+  it("validates defaults atomically", async () => {
+    const t = await seed();
+    const revs = count("stage_agent_config_revisions");
+    const bad = { mode: "configured", stages: { planning: { agent: "codex", provider: "openai", model: "m", accountProfileId: "missing", invocationTimeoutMs: 1000 } } };
+    expect((await call("/api/agent-defaults", "PUT", t, bad)).status).toBe(400);
+    expect((await call("/api/agent-defaults", "PUT", t, { ...defaults, extra: 1 })).status).toBe(400);
+    expect((await call("/api/agent-defaults", "PUT", t, { mode: "legacy", stages: { planning: { model: 5 } } })).status).toBe(400);
+    expect(count("stage_agent_config_revisions")).toBe(revs);
+    expect((await call("/api/agent-defaults", "GET", t)).json).toMatchObject({ configured: true, enabled: true });
+  });
+
+  it("round-trips opt-in and individual inheritance fields", async () => {
+    const t = await seed();
+    const deps = readyDeps();
+    const put = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true, stages: { review: { model: "gpt-review", invocationTimeoutMs: 900000 } } }, deps);
+    expect(put.status).toBe(200);
+    let got = (await call("/api/mappings/APP/agent-config", "GET", t)).json;
+    expect(got).toMatchObject({ enabled: true, stages: { review: { model: "gpt-review", invocationTimeoutMs: 900000 } } });
+
+    let resolved = (await call("/api/mappings/APP/agent-config/resolved", "GET", t, undefined, deps)).json;
+    expect(resolved.stages.review.values.model).toBe("gpt-review");
+    expect(resolved.stages.review.sources.model).toBe("project");
+    expect(resolved.stages.planning.sources.model).toBe("orchestrator-default");
+    expect(resolved.stages.review.account.readiness).toBe("missing");
+    expect(JSON.stringify(resolved)).not.toContain(SENTINEL);
+
+    // null restores inheritance for that field only.
+    await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { model: null } } }, deps);
+    got = (await call("/api/mappings/APP/agent-config", "GET", t)).json;
+    expect(got.enabled).toBe(true);
+    expect(got.stages.review.invocationTimeoutMs).toBe(900000);
+    resolved = (await call("/api/mappings/APP/agent-config/resolved", "GET", t, undefined, deps)).json;
+    expect(resolved.stages.review.values.model).toBe("gpt-x");
+    expect(resolved.stages.review.sources.model).toBe("orchestrator-default");
+    expect(resolved.stages.review.sources.invocationTimeoutMs).toBe("project");
+
+    // Disabling needs no readiness and keeps the overrides.
+    const off = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: false });
+    expect(off.status).toBe(200);
+    expect((await call("/api/mappings/APP/agent-config", "GET", t)).json).toMatchObject({ enabled: false, stages: { review: { invocationTimeoutMs: 900000 } } });
+    expect((await call("/api/mappings/NOPE/agent-config", "GET", t)).status).toBe(404);
+  });
+
+  it("returns actionable resolution errors instead of a 500", async () => {
+    const t = await seed();
+    await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, readyDeps());
+    await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" });
+    const r = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
+    expect(r.status).toBe(200);
+    expect(r.json).toMatchObject({ resolved: false, error: { code: "resolution_failed" } });
+  });
+
+  describe("readiness gate on opt-in", () => {
+    const optIn = (t: string, inspect: (r: any) => Promise<unknown>) =>
+      call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, readyDeps(inspect));
+
+    it("refuses an unready GitHub Actions project, names the workflow-sync action and restores legacy", async () => {
+      const t = await seed();
+      for (const code of ["runner_incompatible", "retired_workflow_present"]) {
+        const r = await optIn(t, async () => ({ status: "not-ready", code }));
+        expect(r.status).toBe(409);
+        expect(r.json).toMatchObject({ code, backend: "github-actions" });
+        expect(r.json.action).toMatch(/workflow sync/);
+        expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(false);
+      }
+    });
+
+    it("refuses GitHub Actions opt-in as unsupported while workflows are unreadable", async () => {
+      const t = await seed();
+      const r = await optIn(t, async () => ({ status: "not-ready", code: "delivery_unreadable" }));
+      expect(r.status).toBe(409);
+      expect(r.json.code).toBe("unsupported_backend");
+    });
+
+    it("inspects the Fly backend without GHA template checks", async () => {
+      const t = await seed();
+      await request("/api/mappings", "POST", "secret", { teamKey: "FLY", owner: "org", repo: "fly", executionMode: "fly-machines" }, t);
+      await call("/api/model-accounts/oai-1", "PATCH", t, { allowedProjectKeys: ["APP", "FLY"] });
+      const seen: string[] = [];
+      const r = await call("/api/mappings/FLY/agent-config", "PUT", t, { enabled: true }, readyDeps(async (req: any) => {
+        seen.push(req.backend);
+        return { status: "ready", profiles: [] };
+      }));
+      expect(r.status).toBe(200);
+      expect(seen).toEqual(["fly-machines"]);
+    });
+
+    it("fails closed when no readiness inspection is configured", async () => {
+      const t = await seed();
+      const r = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true });
+      expect(r.status).toBe(501);
+      expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(false);
+    });
+
+    it("never enables Claude subscription execution", async () => {
+      const t = await seed();
+      await call("/api/model-accounts", "POST", t, profileBody({ profileId: "cl-sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", credentialRef: undefined }));
+      const r = await call("/api/mappings/APP/agent-config", "PUT", t, {
+        enabled: true,
+        stages: { review: { agent: "claude", provider: "anthropic", accountProfileId: "cl-sub", model: "m" } },
+      }, readyDeps());
+      expect(r.status).toBe(422);
+      expect(r.json.code).toBe("claude_subscription_unsupported");
+    });
+  });
+
+  it("keeps ordinary mapping CRUD from touching agent configuration", async () => {
+    const t = await seed();
+    const store = await import("../agent-config-store.js");
+    const body = { enabled: true, agentConfig: { mode: "configured" } };
+    await request("/api/mappings", "POST", "secret", { teamKey: "APP", owner: "org", repo: "app", ...body }, t);
+    await request("/api/mappings/APP", "PATCH", "secret", body, t);
+    expect(store.getProjectOptIn("APP")).toBe(false);
+    expect(store.getProjectStageConfig("APP")).toBeNull();
+  });
+});

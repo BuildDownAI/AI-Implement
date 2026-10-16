@@ -8,8 +8,10 @@
  *
  * No secret reaches a log or a thrown message: failures use fixed text.
  */
+import { randomUUID } from "node:crypto";
 import { getProjectOptIn } from "./agent-config-store.js";
-import type { AgentRunPreparationDeps } from "./agent-run-preparation.js";
+import type { AgentConfigAdminDeps } from "./admin.js";
+import { inspectAgentReadiness, type AgentRunPreparationDeps } from "./agent-run-preparation.js";
 import { getDb } from "./dedup.js";
 import { getScopedInstallationToken } from "./github-app-auth.js";
 import { defaultFetchSignal } from "./github.js";
@@ -143,6 +145,22 @@ export function createModelAuthRuntime(input: {
           return resolved.source === "default";
         },
       };
+    },
+  };
+}
+
+/** Binds the admin API's readiness seam (AII-962) to the shared runtime. Read-only: it inspects, reserves and mints nothing. */
+export function createAgentConfigAdminDeps(config: RuntimeConfig): AgentConfigAdminDeps {
+  const runtime = getModelAuthRuntime(config);
+  return {
+    credentials: runtime.credentials,
+    sessionSnapshot: (profileId) => runtime.ownership.snapshot(profileId),
+    inspectReadiness(request) {
+      const [owner, repo] = request.workflowRepository.split("/");
+      return inspectAgentReadiness(
+        { ...request, dispatchId: `admin-readiness-${randomUUID()}` },
+        runtime.preparationDeps({ owner: owner!, repo: repo!, projectKey: request.projectKey }),
+      );
     },
   };
 }
