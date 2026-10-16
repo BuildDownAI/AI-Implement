@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, existsSync, readFileSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, existsSync, readFileSync, realpathSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -9,7 +9,7 @@ import {
   setupPlanningWritePolicy,
   buildPlanningToolArgs,
 } from "../planning-write-policy.js";
-import { buildRestrictedToolArgs, READ_ONLY_BUILTIN_TOOLS } from "../pipeline/steps/read-only-tools.js";
+import { buildRestrictedToolArgs, READ_ONLY_BUILTIN_TOOLS, RESTRICTED_DISALLOWED_TOOLS } from "../pipeline/steps/read-only-tools.js";
 
 describe("planning write policy", () => {
   let ws: string;
@@ -100,16 +100,78 @@ describe("planning write policy", () => {
     expect(decidePlanningWrite({ file_path: "ai-output/comments/a.md" }, join(ws, "missing-workspace")).allow).toBe(false);
   });
 
-  it("builds tool args that keep Write and allow skills but deny shell, MCP and delegates", () => {
-    const args = buildPlanningToolArgs();
-    expect(args[args.indexOf("--tools") + 1]).toBe("Read,Glob,Grep,Write");
+  it("builds tool args that keep Write, deny Skill without skills, and allow it with them", () => {
+    const none = buildPlanningToolArgs();
+    expect(none[none.indexOf("--tools") + 1]).toBe("Read,Glob,Grep,Write");
+    expect(none[none.indexOf("--disallowed-tools") + 1].split(",")).toContain("Skill");
+
+    const args = buildPlanningToolArgs(true);
+    expect(args[args.indexOf("--tools") + 1]).toBe("Read,Glob,Grep,Write,Skill");
     expect(args).toContain("--strict-mcp-config");
     expect(args).not.toContain("--disable-slash-commands");
     const denied = args[args.indexOf("--disallowed-tools") + 1].split(",");
+    expect(denied).toEqual(RESTRICTED_DISALLOWED_TOOLS.filter((t) => t !== "Write" && t !== "Skill"));
     expect(denied).toEqual(expect.arrayContaining(["Bash", "Edit", "NotebookEdit", "Task", "Agent", "mcp__*"]));
-    expect(denied).not.toContain("Skill");
-    expect(denied).not.toContain("Write");
     expect(args).not.toContain("--allowedTools");
+  });
+
+  describe("selected skills plugin", () => {
+    let home: string;
+    beforeEach(() => {
+      home = mkdtempSync(join(tmpdir(), "pwp-home-"));
+      const skills = join(home, ".claude", "skills");
+      mkdirSync(join(skills, "good", "refs"), { recursive: true });
+      writeFileSync(join(skills, "good", "SKILL.md"), "---\nname: good\ndescription: d\nallowed-tools: Bash, Edit\n---\nbody");
+      writeFileSync(join(skills, "good", "refs", "a.md"), "a");
+      writeFileSync(join(outside, "secret.txt"), "s");
+      symlinkSync(join(outside, "secret.txt"), join(skills, "good", "link.txt"));
+      mkdirSync(join(skills, "nomd"));
+      mkdirSync(join(skills, "linked-skill-target"));
+      writeFileSync(join(skills, "linked-skill-target", "SKILL.md"), "x");
+      symlinkSync(join(skills, "linked-skill-target"), join(skills, "linked"));
+      mkdirSync(join(skills, "hooked"));
+      writeFileSync(join(skills, "hooked", "SKILL.md"), "---\nname: hooked\nhooks:\n  PreToolUse: []\n---\nbody");
+      mkdirSync(join(skills, "other"));
+      writeFileSync(join(skills, "other", "SKILL.md"), "x");
+      mkdirSync(join(skills, "good", "hooks"));
+      writeFileSync(join(skills, "good", "hooks", "hooks.json"), "{}");
+    });
+    afterEach(() => rmSync(home, { recursive: true, force: true }));
+
+    it("wraps only valid selected skills in a plugin outside the workspace and wires the flags", () => {
+      const policy = setupPlanningWritePolicy(ws, {
+        homeDir: home,
+        skillNames: ["good", "nomd", "linked", "hooked", "../escape", "missing", "good"],
+      });
+      try {
+        const dir = policy.args[policy.args.indexOf("--plugin-dir") + 1];
+        expect(dir.startsWith(realpathSync(tmpdir()))).toBe(true);
+        expect(policy.args[policy.args.indexOf("--tools") + 1]).toBe("Read,Glob,Grep,Write,Skill");
+        expect(policy.args[policy.args.indexOf("--setting-sources") + 1]).toBe("");
+        expect(policy.args).not.toContain("--disable-slash-commands");
+        expect(JSON.parse(readFileSync(join(dir, ".claude-plugin", "plugin.json"), "utf-8")).name).toBeTruthy();
+        expect(readdirSync(join(dir, "skills"))).toEqual(["good"]);
+        expect(existsSync(join(dir, "skills", "good", "SKILL.md"))).toBe(true);
+        expect(existsSync(join(dir, "skills", "good", "refs", "a.md"))).toBe(true);
+        expect(existsSync(join(dir, "skills", "good", "link.txt"))).toBe(false);
+        expect(readdirSync(dir).sort()).toEqual([".claude-plugin", "skills"]);
+      } finally {
+        policy.cleanup();
+      }
+    });
+
+    it("adds no plugin and keeps Skill denied when nothing valid is selected, and cleans up", () => {
+      const none = setupPlanningWritePolicy(ws, { homeDir: home, skillNames: ["nomd", "linked"] });
+      expect(none.args).not.toContain("--plugin-dir");
+      expect(none.args[none.args.indexOf("--tools") + 1]).toBe("Read,Glob,Grep,Write");
+      none.cleanup();
+
+      const policy = setupPlanningWritePolicy(ws, { homeDir: home, skillNames: ["good"] });
+      const dir = policy.args[policy.args.indexOf("--plugin-dir") + 1];
+      policy.cleanup();
+      policy.cleanup();
+      expect(existsSync(dir)).toBe(false);
+    });
   });
 
   it("keeps the trusted settings and empty setting sources on the planning policy", () => {
@@ -118,6 +180,7 @@ describe("planning write policy", () => {
       expect(policy.args[policy.args.indexOf("--setting-sources") + 1]).toBe("");
       expect(policy.args).toContain("--settings");
       expect(policy.args).not.toContain("--disable-slash-commands");
+      expect(policy.args).not.toContain("--plugin-dir");
     } finally {
       policy.cleanup();
     }
