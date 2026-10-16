@@ -940,6 +940,40 @@ describe("getFleetReport", () => {
 });
 
 describe("getIssueReportCard restate (AII-1129)", () => {
+  async function admitPlanning(dispatchId: string, lifecycleOwner: { kind: "legacy" } | { kind: "restate"; attemptId: string }) {
+    const admission = await import("../dispatch-admission.js");
+    const res = admission.acquire({
+      dispatchId,
+      mappingKey: "m",
+      scope: { kind: "issue", issueScope: "s", issueId: `issue-${dispatchId}` },
+      kind: "planning",
+      backend: "fly-machines",
+      lifecycleOwner,
+      cap: 5,
+    });
+    expect(res.ok).toBe(true);
+    return admission;
+  }
+
+  it("returns null for a planning row with a real Legacy admission (AII-1425)", async () => {
+    await admitPlanning("plan-legacy", { kind: "legacy" });
+    insertDispatch({ issueIdentifier: "AII-PL", phase: "planning", dispatchId: "plan-legacy" });
+    expect(rc.getIssueReportCard("AII-PL")!.runs[0].restate).toBeNull();
+  });
+
+  it("returns PlanningRun for a Restate-owned planning row, even after release (AII-1425)", async () => {
+    const admission = await admitPlanning("plan-rs", { kind: "restate", attemptId: "att-1" });
+    admission.releaseByDispatchId("plan-rs", "finalized");
+    insertDispatch({ issueIdentifier: "AII-PR", phase: "planning", dispatchId: "plan-rs", status: "completed", conclusion: "success" });
+    expect(rc.getIssueReportCard("AII-PR")!.runs[0].restate).toEqual({ service: "PlanningRun", key: "plan-rs" });
+  });
+
+  it("does not fabricate or throw when the admissions table is absent (AII-1425)", () => {
+    dedup.getDb().exec("DROP TABLE IF EXISTS dispatch_admissions");
+    insertDispatch({ issueIdentifier: "AII-NT", phase: "planning", dispatchId: "plan-x" });
+    expect(rc.getIssueReportCard("AII-NT")!.runs[0].restate).toBeNull();
+  });
+
   it("maps kg-refresh, planning and implementation rows; null dispatch_id and non-restate rows are null", () => {
     const issueIdentifier = "AII-RS";
     insertDispatch({ issueIdentifier, phase: "kg-refresh", dispatchId: "kg-1", dispatchedAt: 1 });
@@ -950,7 +984,7 @@ describe("getIssueReportCard restate (AII-1129)", () => {
     const card = rc.getIssueReportCard(issueIdentifier)!;
     expect(card.runs.map((r) => r.restate)).toEqual([
       { service: "KgRefresh", key: "kg-1" },
-      { service: "PlanningRun", key: "plan-1" },
+      null,
       null,
       null,
       null,
@@ -965,7 +999,7 @@ describe("getIssueReportCard restate (AII-1129)", () => {
       scope: { kind: "issue", issueScope: "s", issueId: "issue-default" },
       kind: "gap-fill",
       backend: "fly-machines",
-      lifecycleOwner: { kind: "restate" } as never,
+      lifecycleOwner: { kind: "restate", attemptId: "att-rf" },
       cap: 5,
     });
     insertDispatch({ issueIdentifier: "AII-RF", phase: "gap-fill", dispatchId: "rf-1" });
