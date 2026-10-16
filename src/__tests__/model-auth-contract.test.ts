@@ -474,9 +474,19 @@ describe("parseModelAuthContext (AII-1427)", () => {
   });
 
   it.each([
+    ["https://orch.example.com:1"], ["https://orch.example.com:443/base"], ["https://orch.example.com:65535"],
+    ["https://10.0.0.255:8443"], [`https://orch.example.com/${"a".repeat(2048 - "https://orch.example.com/".length)}`],
+  ])("accepts boundary-valid url %s", async (modelAuthUrl) => {
+    const { parseModelAuthContext } = await import("../model-auth-contract.js");
+    expect(parseModelAuthContext({ ...good, modelAuthUrl }).ok).toBe(true);
+  });
+
+  it.each([
     [{ extra: "x" }], [{ version: 2 }], [{ backend: "fly" }], [{ backend: "local" }], [{ dispatchId: "" }],
     [{ projectKey: "-bad" }], [{ modelAuthUrl: "http://orch.example.com" }], [{ modelAuthUrl: "https://a@orch.example.com" }],
-    [{ modelAuthUrl: "https://orch.example.com/#f" }], [{ modelAuthUrl: `https://orch.example.com/${"a".repeat(2048)}` }],
+    [{ modelAuthUrl: "https://orch.example.com/#f" }],
+    [{ modelAuthUrl: "https://orch.example.com:99999" }], [{ modelAuthUrl: "https://orch.example.com:65536" }], [{ modelAuthUrl: "https://orch.example.com:0" }],
+    [{ modelAuthUrl: "https://999.1.1.1" }], [{ modelAuthUrl: "https://1.2.3" }], [{ modelAuthUrl: "https://orch.example.com\\evil" }], [{ modelAuthUrl: `https://orch.example.com/${"a".repeat(2048)}` }],
   ])("rejects %j without echoing values", async (patch) => {
     const { parseModelAuthContext } = await import("../model-auth-contract.js");
     const r = parseModelAuthContext({ ...good, ...patch });

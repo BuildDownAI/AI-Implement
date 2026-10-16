@@ -129,6 +129,9 @@ for (const file of files) {
       profiles: Object.fromEntries(["planning", "implementation", "review"].map((st) =>
         [st, profile("claude", "anthropic", "anthropic-api-key")])),
     };
+    const managedCtx = {
+      version: 1, dispatchId: "ctx-dispatch-1", projectKey: "ctx-project-key", backend: "gha", modelAuthUrl: "https://orchestrator.example.com",
+    };
     const maskLines = (stdout: string) => stdout.trim().split("\n");
 
     it("fixtures satisfy the authoritative TypeScript contract", () => {
@@ -139,7 +142,7 @@ for (const file of files) {
     });
 
     it("masks the encoded envelope first, then every token and the plain grant bearer", () => {
-      const run_config = enc({ ...base, agentConfig: snapshot, credentials: { version: 1, ...sentinels, modelAuthGrant: plainGrant } });
+      const run_config = enc({ ...base, agentConfig: snapshot, credentials: { version: 1, ...sentinels, modelAuthGrant: plainGrant, modelAuthContext: managedCtx } });
       const result = execute(JSON.stringify({ inputs: { run_config } }));
       expect(result.status).toBe(0);
       const lines = maskLines(result.stdout);
@@ -151,7 +154,7 @@ for (const file of files) {
     });
 
     it("accepts an all-Codex ChatGPT-plan grant without ownerGeneration and masks its bearer", () => {
-      const run_config = enc({ ...base, credentials: { version: 1, ...sentinels, modelAuthGrant: codexGrant } });
+      const run_config = enc({ ...base, credentials: { version: 1, ...sentinels, modelAuthGrant: codexGrant, modelAuthContext: managedCtx } });
       const result = execute(JSON.stringify({ inputs: { run_config } }));
       expect(result.status).toBe(0);
       expect(maskLines(result.stdout)).toContain(`::add-mask::${codexGrant.bearer}`);
@@ -159,7 +162,7 @@ for (const file of files) {
     });
 
     it("masks the sealed grant ciphertext, nonce and tag", () => {
-      const run_config = enc({ ...base, credentials: { version: 1, modelAuthGrant: sealedGrant } });
+      const run_config = enc({ ...base, credentials: { version: 1, modelAuthGrant: sealedGrant, modelAuthContext: managedCtx } });
       const result = execute(JSON.stringify({ inputs: { run_config } }));
       expect(result.status).toBe(0);
       const lines = maskLines(result.stdout);
@@ -471,6 +474,9 @@ for (const file of files) {
       bindings: ["planning", "implementation", "review"].map((stage) =>
         ({ stage, profileId: "prof-codex", profileRevision: 1, authMode: "codex-subscription" })),
     };
+    const managedCtx = {
+      version: 1, dispatchId: "dispatch-1", projectKey: "proj", backend: "gha", modelAuthUrl: "https://orchestrator.example.com",
+    };
     const stages = ["planning", "implementation", "review"];
     const codexSnapshot = {
       version: 1, snapshotId: "snap-1",
@@ -488,7 +494,7 @@ for (const file of files) {
 
     it("delivers an all-Codex grant without ownerGeneration to the Run step", () => {
       expect(() => validateResolvedAgentSnapshot(codexSnapshot)).not.toThrow();
-      const credentials = { version: 1, ...tokens, modelAuthGrant: codexGrant };
+      const credentials = { version: 1, ...tokens, modelAuthGrant: codexGrant, modelAuthContext: managedCtx };
       expect(() => validateRunCredentials(credentials)).not.toThrow();
       const run_config = enc({ ...base, agentConfig: codexSnapshot, credentials });
       const r = handoff({ run_config, run_token: "", run_progress_token: "", run_attempt_token: "" });
@@ -544,6 +550,9 @@ for (const file of files) {
       ["userinfo url", { modelAuthUrl: "https://u:p@orchestrator.example.com" }],
       ["query url", { modelAuthUrl: "https://orchestrator.example.com/?a=b" }],
       ["whitespace url", { modelAuthUrl: "https://orchestrator.example.com/a b" }],
+      ["port above range", { modelAuthUrl: "https://orch.invalid:99999" }],
+      ["port zero", { modelAuthUrl: "https://orch.invalid:0" }],
+      ["out-of-range ipv4", { modelAuthUrl: "https://999.1.1.1" }],
       ["empty dispatch", { dispatchId: "" }],
       ["bad project", { projectKey: "bad key" }],
     ])("rejects an invalid context (%s) before the Run step", (_name, patch) => {
@@ -552,6 +561,34 @@ for (const file of files) {
       expect(r.boot.status).toBe(1);
       expect(r.boot.stderr).toBe("::error::Private run_config bootstrap failed\n");
       expect(r.done).toBeUndefined();
+      expect(r.githubEnv).toBe("");
+      expect(r.outputs).toBe("");
+    });
+
+    it.each([
+      ["https://orch.invalid:1"],
+      ["https://orch.invalid:443/base"],
+      ["https://orch.invalid:65535"],
+      ["https://10.0.0.255:8443"],
+    ])("accepts boundary-valid context url %s", (modelAuthUrl) => {
+      const credentials = { version: 1, ...tokens, modelAuthGrant: codexGrant, modelAuthContext: { ...ctx, modelAuthUrl } };
+      expect(() => validateRunCredentials(credentials)).not.toThrow();
+      const r = handoff({ run_config: enc({ ...base, agentConfig: codexSnapshot, credentials }) });
+      expect(r.boot.status).toBe(0);
+      expect(r.env.AI_IMPLEMENT_MODEL_AUTH_URL).toBe(modelAuthUrl);
+    });
+
+    it.each([
+      ["missing", undefined],
+      ["null", null],
+    ])("rejects a private grant whose modelAuthContext is %s before the Run step", (_name, value) => {
+      const credentials: Record<string, unknown> = { version: 1, ...tokens, modelAuthGrant: codexGrant };
+      if (value !== undefined) credentials.modelAuthContext = value;
+      const r = handoff({ run_config: enc({ ...base, agentConfig: codexSnapshot, credentials }) });
+      expect(r.boot.status).toBe(1);
+      expect(r.boot.stderr).toBe("::error::Private run_config bootstrap failed\n");
+      expect(r.done).toBeUndefined();
+      expect(r.env).toBeUndefined();
       expect(r.githubEnv).toBe("");
       expect(r.outputs).toBe("");
     });

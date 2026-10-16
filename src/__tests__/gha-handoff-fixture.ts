@@ -37,14 +37,10 @@ export interface GhaHandoff {
   runEnv: Record<string, string>;
 }
 
-export function ghaRunStepEnv(
-  file: string,
-  input: { snapshot?: ResolvedAgentSnapshotV1; grant?: ModelAuthGrantBootstrapV1; context?: unknown; callback?: boolean },
-): GhaHandoff {
-  const workflow = parse(readFileSync(file, "utf8"));
-  const job = workflow.jobs.implement ?? workflow.jobs.plan;
-  const mask = job.steps.find((s: { name: string }) => s.name === "Mask runner callback tokens");
-  const run = job.steps.find((s: { name: string }) => s.name === "Run pipeline" || s.name === "Run planning");
+type HandoffInput = { snapshot?: ResolvedAgentSnapshotV1; grant?: ModelAuthGrantBootstrapV1; context?: unknown; callback?: boolean };
+
+/** Wire form of the dispatch envelope, built directly so a deliberately invalid or missing context reaches the bootstrap, not the encoder. */
+export function ghaRunConfig(file: string, input: HandoffInput): string {
   const envelope = {
     v: 1,
     issue: { id: "i1", identifier: "ENG-9", title: "T", description: "D" },
@@ -59,8 +55,23 @@ export function ghaRunStepEnv(
       ...(input.context !== undefined ? { modelAuthContext: input.context } : {}),
     },
   } as unknown as RunConfigV1;
-  // Build the wire form directly: a deliberately invalid context must reach the bootstrap, not the encoder.
-  const runConfig = Buffer.from(JSON.stringify(envelope)).toString("base64");
+  return Buffer.from(JSON.stringify(envelope)).toString("base64");
+}
+
+/** The OLD Run-step environment: the envelope alone, as a pre-AII-1427 template delivered it. Built directly, never through the repaired bootstrap. */
+export function oldShapedRunEnv(file: string, input: HandoffInput): Record<string, string> {
+  return { AI_IMPLEMENT_RUN_CONFIG: ghaRunConfig(file, input) };
+}
+
+export function ghaRunStepEnv(
+  file: string,
+  input: HandoffInput,
+): GhaHandoff {
+  const workflow = parse(readFileSync(file, "utf8"));
+  const job = workflow.jobs.implement ?? workflow.jobs.plan;
+  const mask = job.steps.find((s: { name: string }) => s.name === "Mask runner callback tokens");
+  const run = job.steps.find((s: { name: string }) => s.name === "Run pipeline" || s.name === "Run planning");
+  const runConfig = ghaRunConfig(file, input);
 
   const dir = mkdtempSync(join(tmpdir(), "gha-handoff-"));
   try {

@@ -934,6 +934,24 @@ export const MAX_MODEL_AUTH_URL_LENGTH = 2048;
 /** https only; host is letters/digits/dots/hyphens, optional port and plain path. No userinfo, query or fragment. */
 export const MODEL_AUTH_URL_PATTERN = /^https:\/\/[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?(\/[A-Za-z0-9._~\/-]*)?$/;
 
+/** Pattern match plus a real authority check: the port is 1-65535 and the URL constructor accepts it (mirrored in the workflow jq). */
+export function isValidModelAuthUrl(url: string): boolean {
+  if (url.length > MAX_MODEL_AUTH_URL_LENGTH || !MODEL_AUTH_URL_PATTERN.test(url)) return false;
+  const port = /^https:\/\/[^:/]+:([0-9]{1,5})/.exec(url)?.[1];
+  if (port !== undefined && (Number(port) < 1 || Number(port) > 65535)) return false;
+  const host = /^https:\/\/([^:/]+)/.exec(url)?.[1] ?? "";
+  if (/^[0-9.]+$/.test(host)) {
+    const octets = host.split(".");
+    if (octets.length !== 4 || !octets.every((o) => /^[0-9]{1,3}$/.test(o) && Number(o) <= 255)) return false;
+  }
+  try {
+    new URL(url);
+  } catch {
+    return false;
+  }
+  return true;
+}
+
 /**
  * Dispatcher-authored launch metadata that travels beside, never inside, the opaque grant (AII-1427).
  * Every value comes from the trusted dispatch request and the configured callback base URL; the runner
@@ -963,7 +981,7 @@ export function parseModelAuthContext(raw: unknown): ValidationResult<ModelAuthC
   if (!projectKey.ok) return projectKey;
   if (obj.value.backend !== "gha") return err("model auth context backend must be gha");
   const url = obj.value.modelAuthUrl;
-  if (typeof url !== "string" || url.length > MAX_MODEL_AUTH_URL_LENGTH || !MODEL_AUTH_URL_PATTERN.test(url)) {
+  if (typeof url !== "string" || !isValidModelAuthUrl(url)) {
     return err("model auth context modelAuthUrl must be a plain https URL");
   }
   return ok({ version: 1, dispatchId: dispatchId.value, projectKey: projectKey.value, backend: "gha", modelAuthUrl: url });

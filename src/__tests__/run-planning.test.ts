@@ -9,7 +9,8 @@ import { encodeRunConfig, encodeTrustedRunConfig, type ResolvedAgentSnapshotV1 }
 import { AgentRecoveryRequiredError } from "../pipeline/stage-executor.js";
 import { MODEL_AUTH_ROUTES } from "../model-auth-contract.js";
 import { EXPECTED, NOW, SENTINEL_BEARER, fakeClient, makeGrant } from "./configured-run-fixture.js";
-import { GHA_CONTEXT, GHA_PLAN_WORKFLOWS, ghaGrant, ghaRunStepEnv, stubRunEnv } from "./gha-handoff-fixture.js";
+import { GHA_CONTEXT, GHA_PLAN_WORKFLOWS, ghaGrant, ghaRunStepEnv, oldShapedRunEnv, stubRunEnv } from "./gha-handoff-fixture.js";
+import { CODEX_CHILD_GLOBAL, S_AMBIENT, S_CHATGPT, S_OPENAI, codexLoopback, installCodexChild, installPlanningDriver, resetCodexChild } from "./codex-composition-fixture.js";
 import { prepareConfiguredRun } from "../run-autonomous.js";
 import type { ModelAuthTransport } from "../model-auth-client.js";
 import type { InvokeParams, LLMResult } from "../pipeline/types.js";
@@ -22,6 +23,20 @@ vi.mock("../pipeline/steps/install-skills.js", async (importOriginal) => {
   return { ...actual, installSkills: vi.fn(() => ({ skillsInstalled: 0, skillsRepoRef: null })) };
 });
 import { installSkills } from "../pipeline/steps/install-skills.js";
+
+// Passthrough except while a test installs the fake `codex` child / planning protocol driver (codex-composition-fixture.ts).
+type CodexSlots = { spawn?: (...args: unknown[]) => unknown; driver?: unknown };
+const codexSlots = (): CodexSlots | undefined => (globalThis as unknown as Record<string, CodexSlots | undefined>)[CODEX_CHILD_GLOBAL];
+vi.mock("node:child_process", async (importOriginal) => {
+  const real = await importOriginal<typeof import("node:child_process")>();
+  const spawn = ((...a: Parameters<typeof real.spawn>) =>
+    a[0] === "codex" && codexSlots()?.spawn ? codexSlots()!.spawn!(...a) : real.spawn(...a)) as typeof real.spawn;
+  return { ...real, spawn };
+});
+vi.mock("../pipeline/codex-planning-adapter.js", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../pipeline/codex-planning-adapter.js")>();
+  return { ...real, createCodexPlanningDriver: () => (codexSlots()?.driver as ReturnType<typeof real.createCodexPlanningDriver> | undefined) ?? real.createCodexPlanningDriver() };
+});
 
 type RunnerResultPayload = {
   phase: "planning";
@@ -680,10 +695,11 @@ describe("configured planning (shared prepareConfiguredRun + selected stage exec
     describe(`GHA bootstrap handoff via ${file}`, () => {
       it("baseline: an old-shaped Run env (envelope present, no AI_IMPLEMENT_MODEL_AUTH_*) is rejected with bootstrap_context_missing", async () => {
         const snapshot = planSnapshot("codex", "codex-subscription");
-        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot) });
-        expect(handoff.bootStatus).toBe(0);
+        const input = { snapshot, grant: ghaGrant(snapshot) };
+        // The repaired bootstrap refuses a grant without context, so the OLD environment is constructed directly.
+        expect(ghaRunStepEnv(file, input).bootStatus).toBe(1);
         // Old template: only the envelope reaches the Run step.
-        const oldEnv = { AI_IMPLEMENT_RUN_CONFIG: handoff.runEnv.AI_IMPLEMENT_RUN_CONFIG };
+        const oldEnv = oldShapedRunEnv(file, input);
         await expect(
           prepareConfiguredRun({ env: oldEnv, snapshot, workspaceDir: ws, options: { now: () => NOW } }),
         ).rejects.toMatchObject({ code: "CONFIGURED_RUN_INVALID", reason: "bootstrap_context_missing" });
@@ -698,36 +714,62 @@ describe("configured planning (shared prepareConfiguredRun + selected stage exec
         expect(legacy).not.toHaveBeenCalled();
       });
 
-      it("a context-less envelope from the real bootstrap yields no context env, so the runner still refuses", async () => {
+      it.each([["missing", undefined], ["null", null]])("a managed grant with %s context fails in the real bootstrap, so the Run step never starts", (_n, context) => {
         const snapshot = planSnapshot("codex", "codex-subscription");
-        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot) });
-        expect(handoff.runEnv.AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID).toBe("");
-        stubRunEnv(handoff.runEnv);
-        const codex = fakeCodex(true);
-        const r = await runPlanning({ workspaceDir: ws, executor: legacy, configured: { createCodex: codex.createCodex }, fetchImpl: fakeFetch as never });
-        expect(r.exitCode).toBe(1);
-        expect(posted[0].failureReason).toBe("Configured planning failed (bootstrap_context_missing)");
-        expect(codex.created).toEqual([]);
+        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context });
+        expect(handoff.bootStatus).toBe(1);
+        expect(handoff.bootStderr).toBe("::error::Private run_config bootstrap failed\n");
+        expect(handoff.githubEnv).toBe("");
+        expect(handoff.runEnv).toEqual({});
       });
 
       for (const authMode of ["codex-subscription", "openai-api-key"] as const) {
-        it(`planning entrypoint, Codex ${authMode}: bootstrap-derived env reaches the selected Codex executor`, async () => {
+        it(`planning entrypoint, Codex ${authMode}: the real CodexExecutor checks out the selected profile and its child receives only that credential`, async () => {
           const snapshot = planSnapshot("codex", authMode);
           const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: GHA_CONTEXT });
           expect(handoff.bootStatus).toBe(0);
           expect(handoff.githubEnv).toBe("");
           stubRunEnv(handoff.runEnv);
-          const { transport } = loopbackTransport();
-          const codex = fakeCodex(true);
-          const r = await runPlanning({
-            workspaceDir: ws, executor: legacy, fetchImpl: fakeFetch as never,
-            configured: { createCodex: codex.createCodex, modelAuthTransport: transport },
-          });
+          for (const k of ["OPENAI_API_KEY", "CODEX_API_KEY", "CHATGPT_PLAN_ACCESS_TOKEN"]) process.env[k] = S_AMBIENT;
+          const { transport, checkouts, routes } = codexLoopback({ "p-plan": authMode, "p-impl": authMode, "p-rev": "anthropic-api-key" });
+          const child = installCodexChild("hang");
+          const driverInputs = installPlanningDriver();
+          let r;
+          try {
+            r = await runPlanning({ workspaceDir: ws, executor: legacy, fetchImpl: fakeFetch as never, configured: { modelAuthTransport: transport } });
+          } finally {
+            resetCodexChild();
+            for (const k of ["OPENAI_API_KEY", "CODEX_API_KEY", "CHATGPT_PLAN_ACCESS_TOKEN"]) delete process.env[k];
+          }
           expect(r.exitCode).toBe(0);
           expect(posted[0].outcome).toBe("success");
-          expect(codex.created).toEqual(["p-plan"]);
-          expect(codex.calls[0]).toMatchObject({ agentStage: "planning", model: "gpt-plan" });
           expect(legacy).not.toHaveBeenCalled();
+          // Exactly one checkout, for the selected planning profile and auth mode, then finish/release.
+          expect(checkouts).toEqual([{ profileId: "p-plan", authMode }]);
+          expect(routes()[0]).toBe(MODEL_AUTH_ROUTES.checkout);
+          expect(routes().at(-1)).toBe(MODEL_AUTH_ROUTES.finish);
+          // The native planning driver ran against the real executor's child with the selected model.
+          expect(driverInputs).toHaveLength(1);
+          expect(driverInputs[0].model).toBe("gpt-plan");
+          expect(child).toHaveLength(1);
+          expect(child[0].cmd).toBe("codex");
+          const env = child[0].env;
+          const dump = JSON.stringify(env);
+          if (authMode === "codex-subscription") {
+            expect(env.CHATGPT_PLAN_ACCESS_TOKEN).toBe(S_CHATGPT);
+            expect(env.CODEX_API_KEY).toBeUndefined();
+            expect(dump).not.toContain(S_OPENAI);
+            expect(driverInputs[0].modelProvider).toBe("chatgpt_plan");
+          } else {
+            expect(env.CODEX_API_KEY).toBe(S_OPENAI);
+            expect(env.CHATGPT_PLAN_ACCESS_TOKEN).toBeUndefined();
+            expect(dump).not.toContain(S_CHATGPT);
+            expect(driverInputs[0].modelProvider).toBeUndefined();
+          }
+          expect(env.OPENAI_API_KEY).toBeUndefined();
+          expect(dump).not.toContain(S_AMBIENT);
+          expect(dump).not.toContain(SENTINEL_BEARER);
+          expect(Object.keys(env).filter((k) => k.startsWith("AI_IMPLEMENT_") || k.startsWith("RUN_"))).toEqual([]);
         });
       }
 

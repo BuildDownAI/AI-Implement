@@ -927,6 +927,7 @@ describe("private credentials namespace (AII-981)", () => {
       ["credentialed url", { modelAuthUrl: "https://u:p@orch.example.com" }],
       ["query url", { modelAuthUrl: "https://orch.example.com?x=1" }],
       ["malformed url", { modelAuthUrl: "not a url" }],
+      ["port above range", { modelAuthUrl: "https://orch.invalid:99999" }],
     ])("rejects %s", (_n, patch) => {
       expect(() => validateRunCredentials({ version: 1, modelAuthContext: { ...context, ...patch } })).toThrow("modelAuthContext");
     });

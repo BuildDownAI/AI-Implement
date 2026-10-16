@@ -282,13 +282,19 @@ jobs:
               isobj and only(["version", "dispatchId", "projectKey", "backend", "modelAuthUrl"])
               and .version == 1 and (.dispatchId | idstr) and (.projectKey | idstr) and .backend == "gha"
               and (.modelAuthUrl | type == "string" and length <= 2048
-                   and test("\\Ahttps://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?\\z"));
+                   and test("\\Ahttps://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?\\z")
+                   and (capture("\\Ahttps://(?<host>[^:/]+)(:(?<port>[0-9]{1,5}))?") as $m
+                        | (($m.port // "1") | tonumber) as $p
+                        | $p >= 1 and $p <= 65535
+                          and ($m.host | if test("\\A[0-9.]+\\z")
+                                         then (split(".") | length == 4 and all(.[]; test("\\A[0-9]{1,3}\\z") and tonumber <= 255))
+                                         else true end)));
             def creds:
               isobj and only(["version", "resultToken", "progressToken", "publicationToken", "attemptToken", "modelAuthGrant", "modelAuthContext"])
               and .version == 1
               and (. as $c | all("resultToken", "progressToken", "publicationToken", "attemptToken";
                      . as $f | ($c | has($f) | not) or ($c[$f] | token)))
-              and (if has("modelAuthGrant") then (.modelAuthGrant | grant) else true end)
+              and (if has("modelAuthGrant") then (.modelAuthGrant | grant) and has("modelAuthContext") else true end)
               and (if has("modelAuthContext") then (.modelAuthContext | ctx) else true end);
             def snapstr: type == "string" and test("\\S") and length <= 256;
             def revref: isobj and only(["configRevisionId", "revision"]) and (.configRevisionId | snapstr) and (.revision | posint);
