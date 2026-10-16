@@ -40,4 +40,4 @@ The orchestrator already has the right shape for "do this once per condition": t
 
 ## Consequences
 
-A due occurrence is retried on every poll tick until the worker is free, so `busy` must be cheap and side-effect free. Nothing calls `PipelineSchedule` yet: AII-1403 step 2 connects KG refresh and the poll loop, and step 3 adds the writer tool. Until then the module has no consumer.
+A due occurrence is retried on every poll tick until the worker is free, so `busy` must be cheap and side-effect free. The poll loop (`checkPipelineSchedules`) calls `check` each cycle, and the `get_pipeline_schedule` and `set_pipeline_schedule` tools read and write the state; KG refresh is the first registered pipeline. The replace action is a one-way send and `check` records `replaced` before the cancel lands, so a lost cancel is not repeated and the schedule waits for the decision-gate timeout.
