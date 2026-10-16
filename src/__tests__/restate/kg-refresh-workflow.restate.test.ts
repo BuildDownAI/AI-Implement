@@ -3458,6 +3458,23 @@ describe("KgRefresh durable workflow", () => {
       60_000,
     );
 
+    it.each(VARIANTS.flatMap(([label]) => [[label, "superseded_by_schedule", "superseded_by_schedule"], [label, "cancelled", "operator_cancelled"], [label, "operator requested", "operator_cancelled"]] as const))(
+      "%s: a gate cancel with reason %s closes the PR with gate %s and the run stays operator_cancelled (AII-1432)",
+      async (label, reason, gate) => {
+        const env = heldEnvs.get(label)!;
+        const triggerId = await holdRun(env);
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason });
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+
+        const comment = postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!;
+        expect(comment).toContain(gate);
+        if (gate === "superseded_by_schedule") expect(comment).not.toContain("operator_cancelled");
+        expect(await closeRowFor(triggerId)).toMatchObject({ status: "failed", conclusion: "operator_cancelled" });
+        expect(persistCalls.at(-1)).toMatchObject({ ok: false, conclusion: "operator_cancelled", held: true });
+      },
+      60_000,
+    );
+
     it.each(VARIANTS.map(([label]) => label))(
       "a Stop sent before the held report cancels the held run without a decide (%s)",
       async (label) => {

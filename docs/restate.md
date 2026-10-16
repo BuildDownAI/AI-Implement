@@ -231,7 +231,7 @@ After each run the object sends itself a delayed `refresh` carrying `scheduledFo
 
 ## Pipeline schedules
 
-`PipelineSchedule` (`src/restate/pipeline-schedule.ts`, AII-1431, [ADR 042](adr/042-a-pipeline-schedule-is-a-due-or-fired-state-checked-by-the-poll-loop.md)) is a Virtual Object, one per scheduled pipeline, that fires the pipeline once a day at a local time. Restate 1.7.10 has no native cron, and a delayed self-send brings back cancel-and-re-arm, so a schedule is a state: each day has one occurrence, and `lastFiredOccurrence` records whether it fired. The poll loop is the tick. Nothing consumes the object yet (AII-1403 step 2 connects KG refresh).
+`PipelineSchedule` (`src/restate/pipeline-schedule.ts`, AII-1431, [ADR 042](adr/042-a-pipeline-schedule-is-a-due-or-fired-state-checked-by-the-poll-loop.md)) is a Virtual Object, one per scheduled pipeline, that fires the pipeline once a day at a local time. Restate 1.7.10 has no native cron, and a delayed self-send brings back cancel-and-re-arm, so a schedule is a state: each day has one occurrence, and `lastFiredOccurrence` records whether it fired. The poll loop is the tick. KG refresh is the first consumer (AII-1432; `docs/issueless-runs.md` § Reserve and dispatch).
 
 State (one key, `state`): `enabled`, `time` (`HH:MM`), `zone` (IANA), `lastFiredOccurrence`, `lastStartedRunId`, `lastResult` (`started`, `refused`, or `replaced`). Empty state is "off": `get` answers `null`. There is no `seed` handler.
 

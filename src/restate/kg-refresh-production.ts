@@ -8,6 +8,8 @@ import { createHmac } from "node:crypto";
 import * as restateClients from "@restatedev/restate-sdk-clients";
 import { getMappings } from "../config.js";
 import type { AppConfig } from "../index.js";
+import { createPipelineSchedule } from "./pipeline-schedule.js";
+import { createKgRefreshSchedulePipeline } from "./kg-refresh-schedule.js";
 import { getFlySessionsConfig } from "../orchestrator-settings.js";
 import {
   CANARY_DEADLINE_MS,
@@ -470,7 +472,7 @@ export function createProductionKgRefreshServices(
   };
 
   return {
-    services: [createKgRepo({ workflowName: "KgRefresh" }), createFlyMachineProfile(buildFlyMachineProfileDeps()), createGhaRunProfile(), createKgRefreshWorkflow(deps)],
+    services: [createKgRepo({ workflowName: "KgRefresh" }), createFlyMachineProfile(buildFlyMachineProfileDeps()), createGhaRunProfile(), createKgRefreshWorkflow(deps), createPipelineSchedule({ pipelines: { "kg-refresh": createKgRefreshSchedulePipeline(input.kgSourceRepo) } })],
     toolDeps,
   };
 }
