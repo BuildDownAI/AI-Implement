@@ -3458,6 +3458,23 @@ describe("KgRefresh durable workflow", () => {
       60_000,
     );
 
+    it.each(VARIANTS.flatMap(([label]) => [[label, "superseded_by_schedule", "superseded_by_schedule"], [label, "cancelled", "operator_cancelled"], [label, "operator requested", "operator_cancelled"]] as const))(
+      "%s: a gate cancel with reason %s closes the PR with gate %s and the run stays operator_cancelled (AII-1432)",
+      async (label, reason, gate) => {
+        const env = heldEnvs.get(label)!;
+        const triggerId = await holdRun(env);
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason });
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+
+        const comment = postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!;
+        expect(comment).toContain(gate);
+        if (gate === "superseded_by_schedule") expect(comment).not.toContain("operator_cancelled");
+        expect(await closeRowFor(triggerId)).toMatchObject({ status: "failed", conclusion: "operator_cancelled" });
+        expect(persistCalls.at(-1)).toMatchObject({ ok: false, conclusion: "operator_cancelled", held: true });
+      },
+      60_000,
+    );
+
     it.each(VARIANTS.map(([label]) => label))(
       "a Stop sent before the held report cancels the held run without a decide (%s)",
       async (label) => {
@@ -3844,6 +3861,61 @@ describe("KgRefresh durable workflow", () => {
         await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
         await held.reached();
         await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "stop" });
+      } finally {
+        held.release();
+      }
+      await expectStoppedBeforeMerge(env, triggerId, beforeMerge, beforeClose);
+    }, 60_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a schedule's superseded cancel after an accept does not stop the run: the person's accept wins and the merge runs (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const beforeMerge = mergePullRequestFn.mock.calls.length;
+      const triggerId = await holdRun(env);
+      const held = holdAcceptNote();
+      try {
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
+        await held.reached();
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "superseded_by_schedule" });
+      } finally {
+        held.release();
+      }
+      await expectRunSucceeded(env, triggerId);
+      expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
+      expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(0);
+      expect(gateOrder).toEqual(["fetch", "stage", "swap", "verify"]);
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "completed" });
+    }, 60_000);
+
+    it.each(VARIANTS.map(([label]) => label))("after the accept wins over a schedule's cancel, a later cancel and decide cancel answer past-merge and the run succeeds (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      mergeDelayMs = 1_500;
+      const beforeMerge = mergePullRequestFn.mock.calls.length;
+      const triggerId = await holdRun(env);
+      const held = holdAcceptNote();
+      try {
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
+        await held.reached();
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "superseded_by_schedule" });
+      } finally {
+        held.release();
+      }
+      await eventually(() => mergePullRequestFn.mock.calls.length - beforeMerge, (n) => n >= 1, { label: "the merge call" });
+      await expect(callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "stop" })).rejects.toThrow(/409.*past-merge/);
+      await expect(callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ops@example.com" })).rejects.toThrow(/409.*past-merge/);
+      await expectRunSucceeded(env, triggerId);
+    }, 60_000);
+
+    it.each(VARIANTS.map(([label]) => label))("an operator cancel with another reason after an accept still wins at the commit point (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const beforeMerge = mergePullRequestFn.mock.calls.length;
+      const triggerId = await holdRun(env);
+      const held = holdAcceptNote();
+      try {
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
+        await held.reached();
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "operator requested" });
       } finally {
         held.release();
       }

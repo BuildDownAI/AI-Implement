@@ -147,6 +147,9 @@ export interface KgRefreshHeldView {
   decideBy: number;
 }
 
+/** The cancel reason a pipeline schedule sends to replace its own run held at the decision gate (AII-1432). */
+export const KG_REFRESH_SUPERSEDED_REASON = "superseded_by_schedule";
+
 export interface KgRefreshStatusResult {
   step: string | null;
   startedAt: number | null;
@@ -473,7 +476,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
      * when `bestEffort` is set (a Restate cancel must still reach the release), and a signal cancel
      * additionally waits for the GitHub run to terminate.
      */
-    async function cleanupCancelled(mode: "signal" | "restate"): Promise<RefreshOutcome> {
+    async function cleanupCancelled(mode: "signal" | "restate", gate = "operator_cancelled"): Promise<RefreshOutcome> {
       const bestEffort = mode === "restate";
       const attempt = async (name: string, fn: () => Promise<unknown>): Promise<void> => {
         if (!bestEffort) {
@@ -523,7 +526,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           }
         }
       }
-      await closeHeldPr("operator_cancelled");
+      await closeHeldPr(gate);
       ctx.set("step", "failed");
       const at = await ctx.date.now();
       let cancelled = buildFailureOutcome(at, "cancelled by operator");
@@ -724,7 +727,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       }
 
       /** The merge, branch delete and four rail gates for a snapshot PR the run may land: the success path and the accepted decision both end here. */
-      async function mergeAndRunGates(report: KgRefreshReportBody): Promise<RefreshOutcome> {
+      async function mergeAndRunGates(report: KgRefreshReportBody, afterAccept = false): Promise<RefreshOutcome> {
         // Success: a fresh snapshot landed. Merge it, then run the four rail gates one at a time.
         // mergeSnapshotPr resolves "blocked"/"conflict" rather than throwing (the same contract
         // src/kg-refresh.ts's pre-migration caller checks explicitly) — a merge conflict or an
@@ -732,7 +735,9 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         // retry forever. Neither step has staged or swapped anything yet, so `revertRail` does
         // not apply to either failure.
         // The commit point (AII-1296): the start of the merge is the one point of no return. A Restate
-        // cancel that arrived earlier (during the accept note, say) stops the run here.
+        // cancel that arrived earlier (during the accept note, say) stops the run here. The exception is
+        // a schedule's replace (superseded_by_schedule) after a person's accept: the accept came first
+        // and a person's decision wins, so the run merges.
         await checkCancelled();
         heldPr = report.snapshotPr !== undefined ? { number: report.snapshotPr, branch: report.snapshotBranch } : undefined;
         // The first of this write and an operator cancel wins; the loser sees the other's value.
@@ -742,7 +747,14 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           if (restate.internal.isSuspendedError(err)) throw err;
           if (!(err instanceof restate.TerminalError && err.code === 409)) throw err; // "promise was already completed"
         }
-        if ((await ctx.promise<string>("cancel").get()) !== KG_REFRESH_COMMITTED) return cleanupCancelled("signal");
+        const cancelValue = await ctx.promise<string>("cancel").get();
+        const supersededByScheduleAfterAccept = afterAccept && cancelValue === KG_REFRESH_SUPERSEDED_REASON;
+        if (cancelValue !== KG_REFRESH_COMMITTED && !supersededByScheduleAfterAccept) {
+          return cleanupCancelled("signal", cancelValue === KG_REFRESH_SUPERSEDED_REASON ? KG_REFRESH_SUPERSEDED_REASON : undefined);
+        }
+        // Durable commit point on both paths: on the accept-wins path the promise still holds the schedule's
+        // reason, so requestCancel reads this key to answer past-merge.
+        ctx.set("committed", true);
         heldPr = undefined; // merging: a cancel past here must not close the PR
         ctx.set("step", "merge");
         try {
@@ -973,14 +985,15 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
               if (restate.internal.isSuspendedError(err)) throw err;
               ctx.console.error(`[KgRefresh] baseline accept note failed for PR #${heldPrNumber}: ${err instanceof Error ? err.message : String(err)}`);
             }
-            return await mergeAndRunGates(report);
+            return await mergeAndRunGates(report, true);
           }
           ctx.console.log(`[KgRefresh] decided cancel by ${decided.actor}: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
           return cleanupCancelled("signal");
         }
         if (decision.kind === "signal") {
           ctx.console.log(`[KgRefresh] cancel signal while held: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
-          return cleanupCancelled("signal");
+          // Only the gate close names the schedule; the run's failure classification stays operator_cancelled.
+          return cleanupCancelled("signal", decision.value === KG_REFRESH_SUPERSEDED_REASON ? KG_REFRESH_SUPERSEDED_REASON : undefined);
         }
 
         ctx.console.log(`[KgRefresh] decision timeout: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
@@ -1096,6 +1109,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
   /** The one cancel write, shared by `cancel` and `decide`: an operator cancel, or `past-merge` once `run` has committed. */
   async function requestCancel(ctx: WorkflowSharedContext, reason: string): Promise<void> {
     // Producer: the callers of the `cancel` handler (operator stop and newer-trigger paths).
+    if (await ctx.get<boolean>("committed")) throw pastMerge();
     const promise = ctx.promise<string>("cancel");
     const existing = await promise.peek();
     if (existing === KG_REFRESH_COMMITTED) throw pastMerge();
