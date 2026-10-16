@@ -406,6 +406,26 @@ describe("production managed GHA review-fix launch", () => {
     expect(revoked()).not.toBeNull();
   });
 
+  it.each([true, false])("preserves admitted legacy GHA attempts across a global Fly switch (private=%s)", async (privateCapable) => {
+    profiles.setProjectOptIn("AII", false);
+    vi.stubEnv("RUNNER_MODE", "fly");
+    if (!privateCapable) workflow = workflow.replaceAll("private-run-config-v1", "unsupported-private");
+    expect(await production.canAdmit(SCOPE, CONFIG)).toBe("defer");
+    const { worker, plan } = await launch();
+    expect((await worker.launch(plan)).status).toBe("accepted");
+    expect(sent).toHaveLength(1);
+    expect((await decode()).agentConfig).toBeUndefined();
+    expect(count("model_credential_grants")).toBe(0);
+  });
+
+  it("still holds a managed launch after global GHA eligibility is removed", async () => {
+    vi.stubEnv("RUNNER_MODE", "fly");
+    const { worker, plan } = await launch();
+    expect(await worker.launch(plan)).toEqual({ status: "unknown" });
+    expect(sent).toHaveLength(0);
+    expect(count("model_credential_grants")).toBe(0);
+  });
+
   it("keeps admission closed until the separately reviewed admission issue", async () => {
     expect(await production.canAdmit(SCOPE, CONFIG)).toBe("configuration_error");
   });

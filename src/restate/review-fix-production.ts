@@ -40,10 +40,15 @@ export interface ReviewFixProductionConfig {
   runnerImageExplicit: boolean;
 }
 
+/** Mapping identity stays available to already-admitted legacy GHA attempts across runner-mode changes. */
+function mappedEntry(scope: ScopedPrIdentity): [string, RepoMapping] | null {
+  return Object.entries(getMappings()).find(([, candidate]) =>
+    `${candidate.owner}/${candidate.repo}` === scope.repository) ?? null;
+}
+
 /** The selected mapping with its `getMappings()` key, which opt-in lookup is keyed by. */
 function selectedEntry(scope: ScopedPrIdentity): [string, RepoMapping] | null {
-  const entry = Object.entries(getMappings()).find(([, candidate]) =>
-    `${candidate.owner}/${candidate.repo}` === scope.repository);
+  const entry = mappedEntry(scope);
   if (!entry) return null;
   const mapping = entry[1];
   return !mapping.paused && resolveReviewFixLifecycle(mapping) === "restate"
@@ -213,14 +218,15 @@ export function createProductionReviewFixWorker(
     runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
     retryPolicy: getRetryPolicy,
     requiresProtectedTransport: (plan) => {
-      const entry = selectedEntry(plan.scope);
+      const entry = mappedEntry(plan.scope);
       return entry === null || isManagedProject(entry[0], plan.attemptId);
     },
     prepareManagedLaunch: async (plan, capabilities) => {
-      const entry = selectedEntry(plan.scope);
+      const entry = mappedEntry(plan.scope);
       if (!entry) throw new Error("review-fix mapping unavailable");
       const [projectKey, mapping] = entry;
       if (!isManagedProject(projectKey, plan.attemptId)) return null;
+      if (!selectedEntry(plan.scope)) throw new Error("review-fix managed mapping unavailable");
       if (capabilities.supportsStageAgentConfig !== true) throw new Error("review-fix managed workflow unavailable");
       if (!runtime) throw new Error("review-fix model authentication unavailable");
       if (hasEphemeralFullAccessOptIn(mapping.extraEnv) && capabilities.supportsExecutionPolicy !== true) {
