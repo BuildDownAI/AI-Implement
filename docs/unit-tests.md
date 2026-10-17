@@ -90,7 +90,20 @@ The credential `beforeEach` in `clear-runner-credentials.ts` predates the scrub 
 
 **Reading a builder's failure.** A new required field fails the builder's object with TS2322, or with TS2345 where the object is passed to a constructor or a spy (`makeContext`, `makeExecutor`). The error's first line prints the whole object type; the indented lines beneath name the field, as `Types of property '…' are incompatible` rather than missing, because the overrides could supply it. Give the field a default in the builder. A changed `ProviderRegistry` constructor fails at the `super(...)` call in `makeRegistry`'s subclass (TS2554), and a renamed `forMapping` at that subclass's `override` (TS4113).
 
-**Where the defaults come from.** The defaults are literals, not the production `DEFAULT_*` constants: a test of what an unconfigured mapping gets calls the code that applies the default, not a builder. `builders.test.ts` passes each default through the code that consumes it where one exists, such as storing a mapping and reading it back, so a default cannot describe a state production never produces. Three defaults read the clock when the object is built, `makeJob`'s `dispatchedAt` (now) and the `deadlineAt` of `makeReviewFixResult` and of `makeReviewFixRunConfig`'s attempt (an hour from now), so two builds can differ; a test that compares builds freezes the clock with `vi.setSystemTime` or overrides the field. `makeAppendLogEntry` likewise gives each build a fresh `dispatchId`, as each real dispatch gets one. `makeFeedbackLoopOutputs` derives `passes` and `terminationReason` from `approved` and `iterations`, so overriding those two still yields outputs that agree with each other, as the step's own do. `makeReviewFixRunConfig` derives the envelope's issue and PR number from the attempt it carries, as the review-fix worker does.
+**Where the defaults come from.** The defaults are literals, not the production `DEFAULT_*` constants: a test of what an unconfigured mapping gets calls the code that applies the default, not a builder. `builders.test.ts` passes each default through the code that consumes it where one exists, such as storing a mapping and reading it back, so a default cannot describe a state production never produces.
+
+Some defaults are not fixed literals. They change with each build, or they follow from other fields, as the real values do:
+
+| Builder | Field | Its value |
+|---|---|---|
+| `makeJob` | `dispatchedAt` | The clock when the object is built |
+| `makeReviewFixResult` | `deadlineAt` | An hour after the object is built |
+| `makeReviewFixRunConfig` | The attempt's `deadlineAt` | An hour after the object is built |
+| `makeReviewFixRunConfig` | The envelope's issue and PR number | The attempt it carries, as the review-fix worker derives them |
+| `makeAppendLogEntry` | `dispatchId` | Fresh for each build, as each real dispatch gets one |
+| `makeFeedbackLoopOutputs` | `passes`, `finalFeedback`, `terminationReason`, `failure` | `approved`, `iterations` and `terminationReason`: one pass per iteration, the last ending the way the step ends that kind of run (a `max_turns` pass is never reviewed, and a `provider_unavailable` run carries its `failure`) |
+
+Two builds of a clock or fresh-id field can differ, so a test that compares builds freezes the clock with `vi.setSystemTime` or overrides the field. A derived field agrees with the fields it follows from, so overriding those still yields a consistent object; a test that overrides the derived field itself describes a different object and owns its consistency.
 
 **Overriding a default.** Override a field only when the test depends on it: removing the override fails one of its tests, or leaves the fixture contradicting other data in the same test, such as a mapping whose repository differs from the job looked up under it.
 

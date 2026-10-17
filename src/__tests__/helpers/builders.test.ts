@@ -188,6 +188,18 @@ describe("makeFeedbackLoopOutputs", () => {
     expect(makeFeedbackLoopOutputs({ iterations: 2 }).passes.map((p) => p.reviewApproved)).toEqual([false, true]);
   });
 
+  it("ends the last pass the way its termination reason says, with every pass carrying its attempts", () => {
+    const maxTurns = makeFeedbackLoopOutputs({ iterations: 2, terminationReason: "max_turns" });
+    expect(maxTurns.approved).toBe(false);
+    expect(maxTurns.passes.map((p) => [p.implementOutcome, p.reviewApproved, p.attempts])).toEqual([["success", false, 1], ["max_turns", null, 1]]);
+    expect(maxTurns.finalFeedback).toContain("turn cap");
+    const outage = makeFeedbackLoopOutputs({ terminationReason: "provider_unavailable" });
+    expect(outage.passes).toEqual([expect.objectContaining({ implementOutcome: "error", reviewApproved: null })]);
+    expect(outage.failure).toMatchObject({ code: "PROVIDER_UNAVAILABLE", retryable: false });
+    expect(makeFeedbackLoopOutputs({ terminationReason: "review_error" }).passes[0].reviewApproved).toBeNull();
+    expect(makeFeedbackLoopOutputs().failure).toBeUndefined();
+  });
+
   it("lets an override replace a derived field", () => {
     expect(makeFeedbackLoopOutputs({ approved: false, terminationReason: "max_turns" }).terminationReason).toBe("max_turns");
     expect(makeFeedbackLoopOutputs({ passes: [] }).passes).toEqual([]);

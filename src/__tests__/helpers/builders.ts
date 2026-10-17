@@ -8,6 +8,7 @@ import type { RepoMapping } from "../../config.js";
 import type { AppConfig } from "../../index.js";
 import type { Job, appendLog } from "../../log.js";
 import { DefaultPipelineContext } from "../../pipeline/context.js";
+import type { FailureRecord } from "../../pipeline/failure-classification.js";
 import type { FeedbackLoopOutputs } from "../../pipeline/steps/feedback-loop.js";
 import type { LLMExecutor, LLMResult, PipelineContextData } from "../../pipeline/types.js";
 import { ProviderRegistry } from "../../providers/registry.js";
@@ -179,25 +180,45 @@ export function makeReviewFixRunConfig(
   };
 }
 
-// A feedback-loop run whose passes and termination agree with `approved` and `iterations`, as the step's own outputs
-// do: one pass per iteration, the last reviewed as approved or not. Override them too to describe another run.
+// A feedback-loop run whose passes, feedback and termination agree with `approved`, `iterations` and
+// `terminationReason`, as the step's own outputs do: one pass per iteration, every earlier pass reviewed and
+// rejected, and the last one ending the way its termination says (feedback-loop.ts). A `provider_unavailable` run is
+// the implement-stage outage. Override `passes` or `finalFeedback` too to describe a run they do not cover.
 export function makeFeedbackLoopOutputs(overrides: Partial<FeedbackLoopOutputs> = {}): FeedbackLoopOutputs {
-  const approved = overrides.approved ?? true;
+  const terminationReason = overrides.terminationReason ?? (overrides.approved === false ? "iterations_exhausted" : "approved");
+  const approved = overrides.approved ?? terminationReason === "approved";
   const iterations = overrides.iterations ?? 1;
+  const reviewed = (approvedPass: boolean) => ({
+    implementTurns: 1, implementOutcome: "success", costUsd: null, reviewCostUsd: null,
+    reviewApproved: approvedPass, attempts: 1, reviewAttempts: 1,
+  });
+  const lastPass = {
+    approved: reviewed(true),
+    iterations_exhausted: reviewed(false),
+    max_turns: { implementTurns: 50, implementOutcome: "max_turns", costUsd: null, reviewCostUsd: null, reviewApproved: null, attempts: 1 },
+    review_error: { ...reviewed(false), reviewApproved: null },
+    provider_unavailable: { implementTurns: null, implementOutcome: "error", costUsd: null, reviewCostUsd: null, reviewApproved: null, attempts: 2 },
+  }[terminationReason];
+  // The default retry policy gives the implement stage two attempts; the terminal record is restamped for the stage.
+  const outage: FailureRecord = {
+    category: "transient", code: "PROVIDER_UNAVAILABLE", stage: "implement", attempt: 1,
+    retryable: false, message: "Provider overloaded (529)", evidence: { truncated: false },
+  };
+  const finalFeedback = {
+    approved: "",
+    iterations_exhausted: "Changes requested.",
+    max_turns: "Implementation hit the 50-turn cap before completing (50 turns used).",
+    review_error: "Review step failed and was skipped: Error: review failed",
+    provider_unavailable: `Model provider was unavailable during implementation after 2 attempt(s); partial changes were preserved. ${outage.message}`,
+  }[terminationReason];
   return {
     approved,
     iterations,
-    finalFeedback: approved ? "" : "Changes requested.",
-    terminationReason: approved ? "approved" : "iterations_exhausted",
-    passes: Array.from({ length: iterations }, (_, i) => ({
-      iteration: i + 1,
-      implementTurns: 1,
-      implementOutcome: "success",
-      costUsd: null,
-      reviewCostUsd: null,
-      reviewApproved: i === iterations - 1 ? approved : false,
-    })),
+    finalFeedback,
+    terminationReason,
+    passes: Array.from({ length: iterations }, (_, i) => ({ iteration: i + 1, ...(i === iterations - 1 ? lastPass : reviewed(false)) })),
     extraCostUsd: null,
+    ...(terminationReason === "provider_unavailable" ? { failure: outage } : {}),
     ...overrides,
   };
 }
