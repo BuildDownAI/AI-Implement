@@ -446,10 +446,18 @@ async function resolveKgScopeTeams(
   githubAppPrivateKey: string,
 ): Promise<string[]> {
   const manifestTeams = await resolveKgManifestTeams(kgSourceRepo, githubAppId, githubAppPrivateKey);
-  const trackerMappedTeams = Object.entries(getMappings())
+  const mappings = getMappings();
+  const mappedManifestTeams = manifestTeams.filter((t) => Object.hasOwn(mappings, t));
+  const skippedTeams = manifestTeams.filter((t) => !Object.hasOwn(mappings, t));
+  if (skippedTeams.length > 0) {
+    console.warn(
+      `[admin] KG scope: skipping manifest teams with no orchestrator mapping (no tracker to read): ${skippedTeams.join(", ")}`,
+    );
+  }
+  const trackerMappedTeams = Object.entries(mappings)
     .filter(([, m]) => m.ticketingProvider === "linear" || m.ticketingProvider === "jira")
     .map(([key]) => key);
-  return [...new Set([...manifestTeams, ...trackerMappedTeams])];
+  return [...new Set([...mappedManifestTeams, ...trackerMappedTeams])];
 }
 
 function shapeIssue(i: TicketIssue, bucket: "ready" | "needs-planning") {

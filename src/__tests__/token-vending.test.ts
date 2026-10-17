@@ -282,7 +282,7 @@ describe("handleKgTrackerDataRequest", () => {
     expect(result.body.issues).toEqual(MOCK_ISSUES);
   });
 
-  it("returns 403 for a teamKey not present in getMappings", async () => {
+  it("returns 404 unmapped-team for a teamKey not present in getMappings", async () => {
     const token = mintKgProgressToken();
 
     const result = await callTrackerData({
@@ -291,8 +291,8 @@ describe("handleKgTrackerDataRequest", () => {
       getMappings: () => ({ AII: {}, BDS: {} }),
     });
 
-    expect(result.status).toBe(403);
-    expect(result.body).toEqual({ error: "Unauthorized" });
+    expect(result.status).toBe(404);
+    expect(result.body).toEqual({ error: "unmapped-team" });
   });
 
   it("returns 403 when teamKey is empty", async () => {
