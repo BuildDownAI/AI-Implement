@@ -246,6 +246,14 @@ When the run finishes, `summary.md` reports `mode: live` and the outcome from th
 harness exit code, matching `result.json`. A summary that still says
 `mode: live-preflight` means the command stopped before the run finished.
 
+The CLI's startup diagnostics (for example a task file missing its YAML front
+matter) are captured and written to `runner.stderr.log`, then echoed to the
+terminal after the run ends. If they match a sensitive-output pattern
+(`Authorization`, `Bearer …`, session or token markers), both the terminal echo
+and `runner.stderr.log` are replaced by a "withheld" notice; the whole text is
+scanned, so a marker split across writes is still caught. When no runner started,
+`summary.md` says so rather than pointing at `runner.log` or `run/`.
+
 Use a clean target checkout. If a cancelled or failed run leaves a session lock
 held for the same session file, inspect the artifact directory before trying
 again. A partial artifact set should still show the source proof, image proof,
