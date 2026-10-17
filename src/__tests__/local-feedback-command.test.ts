@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import * as devHarnessIndex from "../dev-harness/index.js";
 import { runDevHarnessCli } from "../dev-harness/cli.js";
 
@@ -308,6 +308,39 @@ describe("local feedback command helpers", () => {
       };
       await expect(runLiveHarness({ ...input, cliModule, echoStderr: () => undefined })).rejects.toThrow("harness exploded");
       expect(readFileSync(join(artifactsDir, "runner.stderr.log"), "utf8")).toContain("partial diagnostics");
+    });
+
+    it("keeps the harness error when the echo writer also fails", async () => {
+      const { artifactsDir, input } = liveInput("unused");
+      const cliModule = {
+        runDevHarnessCli: async (_args: string[], deps: { writeStderr: (t: string) => void }) => {
+          deps.writeStderr("partial diagnostics\n");
+          throw new Error("PRIMARY_HARNESS_FAILURE");
+        },
+      };
+      const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        await expect(
+          runLiveHarness({ ...input, cliModule, echoStderr: () => { throw new Error("SECONDARY_DIAGNOSTIC_FAILURE"); } }),
+        ).rejects.toThrow("PRIMARY_HARNESS_FAILURE");
+      } finally {
+        logged.mockRestore();
+      }
+      expect(readFileSync(join(artifactsDir, "runner.stderr.log"), "utf8")).toContain("partial diagnostics");
+      expect(JSON.parse(readFileSync(join(artifactsDir, "result.json"), "utf8"))).toEqual({ exitCode: 1, live: true });
+    });
+
+    it("surfaces an echo writer failure when the run itself succeeded", async () => {
+      const { input } = liveInput("unused");
+      const cliModule = {
+        runDevHarnessCli: async (_args: string[], deps: { writeStderr: (t: string) => void }) => {
+          deps.writeStderr("note\n");
+          return 0;
+        },
+      };
+      await expect(
+        runLiveHarness({ ...input, cliModule, echoStderr: () => { throw new Error("SECONDARY_DIAGNOSTIC_FAILURE"); } }),
+      ).rejects.toThrow("SECONDARY_DIAGNOSTIC_FAILURE");
     });
 
     it("withholds a sensitive diagnostic from both the echo and the artifact, even when split across calls", async () => {

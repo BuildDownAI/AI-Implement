@@ -1065,8 +1065,9 @@ export async function runLiveHarness({ cliModule, artifactsDir, workspace, task,
     const text = err.join("");
     if (text) echoStderr(assertNoSensitiveProofLeak([{ name: "runner.stderr.log", text }]).ok ? text : WITHHELD_NOTICE);
   };
+  let exitCode;
   try {
-    return await finishLiveRun({
+    exitCode = await finishLiveRun({
       runHarness: () => cliModule.runDevHarnessCli(buildDevHarnessArgs({ workspace, task, imageId, agentConfig }), deps),
       dispose,
       // A harness that throws still leaves a failure summary rather than the preflight one.
@@ -1079,9 +1080,17 @@ export async function runLiveHarness({ cliModule, artifactsDir, workspace, task,
         }
       },
     });
-  } finally {
-    echoCaptured();
+  } catch (error) {
+    // The run's own error outranks a broken diagnostic writer.
+    try {
+      echoCaptured();
+    } catch (echoError) {
+      console.error(`[local:feedback] could not echo the live diagnostics: ${echoError instanceof Error ? echoError.message : String(echoError)}`);
+    }
+    throw error;
   }
+  echoCaptured();
+  return exitCode;
 }
 
 async function runLive(options) {
