@@ -748,11 +748,10 @@ describe("buildSessionMachineConfig", () => {
     it("secrets are not present in the decoded envelope", () => {
       const result = buildSessionMachineConfig(implInput);
       const env = result.config.env!;
-      const decoded = decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG) as unknown as Record<string, unknown>;
-      expect(decoded.SESSION_TOKEN).toBeUndefined();
-      expect(decoded.GITHUB_TOKEN).toBeUndefined();
-      expect(decoded.ANTHROPIC_API_KEY).toBeUndefined();
-      expect(decoded.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+      const decoded = decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG);
+      for (const secret of ["SESSION_TOKEN", "GITHUB_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]) {
+        expect(decoded).not.toHaveProperty(secret);
+      }
     });
   });
 

@@ -1,8 +1,7 @@
 /**
  * Behavioral tests for `src/model-auth-server.ts` (AII-955) against a temp SQLite file
  * with the real session store and ownership module. Synthetic credentials only; no
- * network and no model calls. `npm run typecheck` excludes `src/__tests__`, so
- * type-check this file explicitly with a throwaway tsconfig.
+ * network and no model calls.
  */
 import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from "vitest";
 import os from "node:os";

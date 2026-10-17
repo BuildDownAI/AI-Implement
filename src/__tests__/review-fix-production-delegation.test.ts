@@ -114,7 +114,8 @@ describe("review-fix production delegation", () => {
     describe("production finalizer wiring", () => {
       const result = { outputCommit: "abc" } as never;
       const input = { attemptId: "att-1", scope, result, findingDispositions: [], policyAllows: true } as never;
-      const build = (applied: { status: string }, submit: ReturnType<typeof vi.fn>) => createProductionFinalizer({
+      type SubmitLateExternalReview = NonNullable<Parameters<typeof createProductionFinalizer>[0]["submitLateExternalReview"]>;
+      const build = (applied: { status: string }, submit: SubmitLateExternalReview) => createProductionFinalizer({
         store: {
           getAcceptedResult: async () => ({ result, hasConflict: false }),
           getRecordedOutcome: async () => ({ terminal: { status: "succeeded" } }),
@@ -122,7 +123,7 @@ describe("review-fix production delegation", () => {
         } as never,
         github: { getPrHeadSha: async () => "abc", evaluateMergePolicy: async () => true } as never,
         baseFinalizer: { recordOutcome: vi.fn(), applyApproval: vi.fn().mockResolvedValue(applied) } as never,
-        submitLateExternalReview: submit as never,
+        submitLateExternalReview: submit,
       });
 
       it("submits once after an applied approval", async () => {

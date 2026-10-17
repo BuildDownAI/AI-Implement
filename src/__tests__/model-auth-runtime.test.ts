@@ -1,6 +1,6 @@
 /**
  * Tests for `src/model-auth-runtime.ts` (AII-1385) against a temp SQLite file, a stub `fetchImpl` and a mocked
- * installation token. `npm run typecheck` excludes `src/__tests__`, so type-check this file with a throwaway tsconfig.
+ * installation token.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import os from "node:os";

@@ -1,8 +1,7 @@
 /**
  * Protected Fly dispatch for implementation runs (AII-1389). Real preparation, ownership and gate against a
  * temp SQLite file; the Fly API, the image probe and the GitHub token mint are stubbed. Synthetic
- * `codex-subscription` profile, no network. `npm run typecheck` excludes `src/__tests__`, so type-check this
- * file explicitly with a throwaway tsconfig.
+ * `codex-subscription` profile, no network.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import os from "node:os";

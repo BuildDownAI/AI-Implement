@@ -1,8 +1,6 @@
 /**
  * Behavioral tests for `src/model-session-ownership.ts` (AII-949) against a temp SQLite
  * file with the real session store. Synthetic keys and session data only; no network.
- * `npm run typecheck` excludes `src/__tests__`, so type-check this file explicitly with
- * a throwaway tsconfig.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import os from "node:os";

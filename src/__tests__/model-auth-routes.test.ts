@@ -1,7 +1,6 @@
 /**
  * Behavioral tests for `src/model-auth-routes.ts` (AII-1387) on a real `http.Server` and a temp SQLite
- * file. Synthetic credentials only. `npm run typecheck` excludes `src/__tests__`, so type-check this file
- * explicitly with a throwaway tsconfig.
+ * file. Synthetic credentials only.
  */
 import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from "vitest";
 import os from "node:os";

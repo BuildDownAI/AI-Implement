@@ -2,8 +2,6 @@
  * Behavioral tests for `src/agent-run-preparation.ts` (AII-956) against a temp SQLite
  * file with the real config store, ownership layer and session store. Synthetic
  * credentials and injected fakes only: no network, no paid model calls.
- * `npm run typecheck` excludes `src/__tests__`, so type-check this file explicitly with
- * a throwaway tsconfig.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import os from "node:os";
