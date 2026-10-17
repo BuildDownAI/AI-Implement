@@ -437,9 +437,8 @@ async function resolveKgManifestTeams(
 
 /**
  * Union of every team currently in scope for the KG: the KG repo's sources.yml
- * trackers: manifest, plus every mapped team with a Linear ticketing provider (the
- * only provider fetchAllTrackerIssuesForTeam supports). Jira-mapped teams are
- * silently excluded rather than attempted and failed.
+ * trackers: manifest, plus every mapped team whose tracker `TrackerExport` can read
+ * (Linear and Jira; a filesystem mapping has no tracker).
  */
 async function resolveKgScopeTeams(
   kgSourceRepo: string | null | undefined,
@@ -447,10 +446,10 @@ async function resolveKgScopeTeams(
   githubAppPrivateKey: string,
 ): Promise<string[]> {
   const manifestTeams = await resolveKgManifestTeams(kgSourceRepo, githubAppId, githubAppPrivateKey);
-  const linearMappedTeams = Object.entries(getMappings())
-    .filter(([, m]) => m.ticketingProvider === "linear")
+  const trackerMappedTeams = Object.entries(getMappings())
+    .filter(([, m]) => m.ticketingProvider === "linear" || m.ticketingProvider === "jira")
     .map(([key]) => key);
-  return [...new Set([...manifestTeams, ...linearMappedTeams])];
+  return [...new Set([...manifestTeams, ...trackerMappedTeams])];
 }
 
 function shapeIssue(i: TicketIssue, bucket: "ready" | "needs-planning") {
@@ -917,10 +916,11 @@ export function handleAdminRequest(
     }
 
     // Admin-authenticated export of tracker data for the kg-refresh dev harness's
-    // --tracker-data flag — same underlying Linear read as the runner-only
-    // POST /api/runner/kg-tracker-data, aggregated across pages for one team.
+    // --tracker-data flag — both this route and the runner-only
+    // POST /api/runner/kg-tracker-data call TrackerExport through one ingress client;
+    // this one aggregates the pages for a team.
     // With no ?team=, exports the union of every team in scope (the KG repo's
-    // sources.yml manifest plus every Linear-mapped team), deduplicated by issue id —
+    // sources.yml manifest plus every Linear- or Jira-mapped team), deduplicated by issue id —
     // the harness's default fetch when no --tracker-data file is given (AII-608).
     if (url.startsWith("/api/kg/tracker-data") && method === "GET") {
       const qs = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";

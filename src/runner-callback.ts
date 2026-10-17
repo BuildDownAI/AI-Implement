@@ -1517,12 +1517,11 @@ export interface HandleKgTrackerDataInput {
 }
 
 /**
- * Returns a paginated page of Linear issues (with their comments) for the team
- * associated with the run's mapping.
+ * Returns one page of issues (with their comments) from `TrackerExport.page` for
+ * the tracker of the run's mapping.
  *
- * Callable only by kg-refresh runs — any other phase gets 403. The orchestrator
- * performs the Linear read with its own credential; the runner receives data
- * only and never a credential.
+ * Callable only by kg-refresh runs — any other phase gets 403. This function never
+ * reads a tracker and holds no credential; the runner receives data only.
  */
 export async function handleKgTrackerDataRequest(
   input: HandleKgTrackerDataInput,

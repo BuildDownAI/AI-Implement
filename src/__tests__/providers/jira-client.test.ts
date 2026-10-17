@@ -62,6 +62,29 @@ describe("JiraClient", () => {
     expect(JSON.parse(fetchMock.mock.calls[1][1].body).nextPageToken).toBe("p2");
   });
 
+  it("searchJqlPage sends nextPageToken only when given and returns the next one", async () => {
+    fetchMock
+      .mockResolvedValueOnce({
+        ok: true, status: 200,
+        json: async () => ({ issues: [{ id: "1", key: "X-1", fields: {} }], nextPageToken: "p2" }),
+      })
+      .mockResolvedValueOnce({
+        ok: true, status: 200,
+        json: async () => ({ issues: [{ id: "2", key: "X-2", fields: {} }] }),
+      });
+    const client = new JiraClient(config);
+    const first = await client.searchJqlPage("project = X", ["summary"]);
+    expect(first.nextPageToken).toBe("p2");
+    expect(first.issues.map((i) => i.key)).toEqual(["X-1"]);
+    const second = await client.searchJqlPage("project = X", ["summary"], "p2");
+    expect(second.nextPageToken).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const firstBody = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(firstBody).not.toHaveProperty("nextPageToken");
+    expect(firstBody.maxResults).toBe(100);
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body).nextPageToken).toBe("p2");
+  });
+
   it("validateJql returns valid:true on success", async () => {
     fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({}) });
     const client = new JiraClient(config);

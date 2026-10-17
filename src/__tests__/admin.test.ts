@@ -76,14 +76,6 @@ vi.mock("../github.js", async (importOriginal) => ({
   cancelWorkflowRun: cancelWorkflowRunMock,
 }));
 
-const isLinearAuthConfiguredMock = vi.hoisted(() => vi.fn(() => false));
-const withLinearTokenMock = vi.hoisted(() => vi.fn());
-vi.mock("../linear-app-auth.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../linear-app-auth.js")>()),
-  isLinearAuthConfigured: isLinearAuthConfiguredMock,
-  withLinearToken: withLinearTokenMock,
-}));
-
 const readLocalJobLogsMock = vi.hoisted(() => vi.fn());
 vi.mock("../local-job-logs.js", () => ({
   readLocalJobLogs: readLocalJobLogsMock,
@@ -5792,7 +5784,7 @@ describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () =>
     expect(JSON.parse(res.body)).toEqual([shared]);
   });
 
-  it("excludes a Jira-mapped team from the union without failing the whole request", async () => {
+  it("includes a Jira-mapped team in the union", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
     await request("/api/mappings", "POST", "secret", {
@@ -5801,13 +5793,15 @@ describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () =>
       ticketingConfig: { kind: "jira", jql: "project = ACME", repoFieldValue: "org/jira-app" },
     }, token);
     const aiiIssues = [{ id: "1", identifier: "AII-1" }];
-    page.mockResolvedValueOnce(trackerOk(aiiIssues));
+    const jiraIssues = [{ id: "10001", identifier: "ACME-1" }];
+    page.mockResolvedValueOnce(trackerOk(aiiIssues)).mockResolvedValueOnce(trackerOk(jiraIssues));
 
     const res = await trackerDataRequest("", token);
 
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual(aiiIssues);
-    expect(page).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(res.body)).toEqual(expect.arrayContaining([...aiiIssues, ...jiraIssues]));
+    expect(page).toHaveBeenCalledTimes(2);
+    expect(page.mock.calls.map((c) => c[0].team).sort()).toEqual(["AII", "JIRA1"]);
   });
 
   it("short-circuits with 503 and the code when one team's page is not OK, rather than a partial 200", async () => {
