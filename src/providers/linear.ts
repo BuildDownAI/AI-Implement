@@ -6,8 +6,10 @@ import type {
   TicketIssue,
   TicketingProvider,
   ProviderConfig,
+  TrackerIssuePage,
 } from "./types.js";
-import { MissingProviderConfigError } from "./types.js";
+import type { RepoMapping } from "../config.js";
+import { MissingProviderConfigError, TrackerUnavailableError } from "./types.js";
 import { fetchPlanningContext as fetchLinearPlanningContext } from "../linear-planning-fetch.js";
 import { isLinearAuthConfigured, withLinearToken } from "../linear-app-auth.js";
 import { defaultFetchSignal } from "../github.js";
@@ -133,6 +135,32 @@ export class LinearProvider implements TicketingProvider {
 
   async fetchPlanningContext(issueId: string): Promise<string> {
     return fetchLinearPlanningContext({ issueId });
+  }
+
+  async listIssuesPage(mapping: RepoMapping, cursor: string | null): Promise<TrackerIssuePage> {
+    if (!isLinearAuthConfigured()) throw new TrackerUnavailableError("Linear credential not configured");
+    if (!mapping.teamKey) throw new TrackerUnavailableError("mapping carries no team key");
+    const data = await this.linearMutation<{ issues?: { nodes: TrackerIssuePage["issues"]; pageInfo: TrackerIssuePage["pageInfo"] } }>(
+      `query($teamKey: String!, $first: Int!, $after: String) {
+        issues(filter: { team: { key: { eq: $teamKey } } }, first: $first, after: $after, orderBy: updatedAt) {
+          nodes {
+            id identifier title description branchName
+            state { name type }
+            labels { nodes { name } }
+            project { name }
+            parent { identifier }
+            comments(first: 100) { nodes { body user { name } createdAt } }
+            relations { nodes { type relatedIssue { identifier } } }
+          }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`,
+      { teamKey: mapping.teamKey, first: 50, after: cursor },
+    );
+    return {
+      issues: data.issues?.nodes ?? [],
+      pageInfo: data.issues?.pageInfo ?? { hasNextPage: false, endCursor: null },
+    };
   }
 
   private async linearMutation<T>(

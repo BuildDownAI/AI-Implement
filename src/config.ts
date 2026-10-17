@@ -26,6 +26,8 @@ export const DEFAULT_PROVIDER: ClaudeProvider = "anthropic";
 const DEFAULT_TICKETING_PROVIDER: ProviderId = "linear";
 
 export interface RepoMapping {
+  /** The mapping's key in `getMappings()`. Not stored or populated by `getMappings()`; `TrackerExport` stamps it so a provider's `listIssuesPage` can name the team without a second lookup. */
+  teamKey?: string;
   owner: string;
   repo: string;
   workflowFile: string;
