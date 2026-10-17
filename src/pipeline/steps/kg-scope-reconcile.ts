@@ -142,7 +142,11 @@ function planSeqAddition(
   // so only a flow-empty `[]` is replaced; the bare form is spliced in right after the colon.
   const end = isSeq(value) ? Math.max(start, (value as { range: readonly [number, number, number] }).range[1]) : start;
   const block = renderSeqEntries(entries, DEFAULT_DASH_INDENT).replace(/\n$/, "");
-  return { splice: { start, end, text: `\n${block}` } };
+  // Same-line content after the value (e.g. `[]  # note`) would otherwise glue onto the last
+  // rendered entry, so push it onto its own line.
+  const lineRest = raw.slice(end).split("\n", 1)[0] ?? "";
+  const trailer = lineRest.trim() === "" ? "" : "\n";
+  return { splice: { start, end, text: `\n${block}${trailer}` } };
 }
 
 /**
@@ -197,8 +201,9 @@ function verifyScope(
   if (!isMap(contents)) return "generated sources.yml is not a mapping";
   const additions = new Set([...(repoAdditions.length > 0 ? ["secondary_repos"] : []), ...(teamAdditions.length > 0 ? ["trackers"] : [])]);
   const present = (key: string, field: string): Set<string> | string => {
+    // Only keys this run adds to must validate; an untouched key may be bare or empty.
+    if (!additions.has(key)) return new Set<string>();
     const seq = contents.get(key, true);
-    if (seq === undefined && !additions.has(key)) return new Set<string>();
     if (!isSeq(seq)) return `"${key}" is not a sequence`;
     const values = new Set<string>();
     for (const item of seq.items) {

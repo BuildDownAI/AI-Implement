@@ -1911,6 +1911,35 @@ describe("kgScopeReconcileStep", () => {
     }
   });
 
+  it("adds only repos and leaves a bare `trackers:` alone when no team needs adding", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      writeSources(templateManifest("", " []"));
+      await runScope(SCOPE_MAPPINGS.map((m) => ({ ...m, teamKey: "" })));
+      const out = readSources();
+      const doc = parseDocument(out);
+      expect(doc.errors).toHaveLength(0);
+      const json = doc.toJS() as { secondary_repos: Array<{ slug: string }> };
+      expect(json.secondary_repos.map((r) => r.slug)).toEqual(["org/r0", "org/r1", "org/r2"]);
+      expect(out).toContain("trackers:\n#  - kind: linear\n");
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("moves a same-line comment after `[]` onto its own line instead of the last entry", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      writeSources(templateManifest(" []  # pending", " []"));
+      await runScope(SCOPE_MAPPINGS);
+      const out = readSources();
+      expect(parseDocument(out).errors).toHaveLength(0);
+      expect(out).toContain("    team: T2\n    tier: secondary\n  # pending\n");
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
   it("is idempotent: a second run on its own output logs 'scope in sync' and writes nothing", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
     try {
