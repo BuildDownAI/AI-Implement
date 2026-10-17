@@ -1935,6 +1935,22 @@ describe("JiraProvider.listIssuesPage", () => {
     expect(rec.comments.nodes[0]).toEqual({ body: "n0", user: null, createdAt: "2026-01-01T00:00:00.000Z" });
   });
 
+  it("keeps the newest 100 of 101 embedded comments, newest first, without listComments", async () => {
+    const embedded = Array.from({ length: 101 }, (_, i) => ({
+      id: `c${i}`, body: adf(`n${i}`), created: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(), author: null,
+    }));
+    const full = {
+      id: "10", key: "P-14",
+      fields: { summary: "t", customfield_10101: "acme/x", comment: { total: 101, comments: embedded } },
+    };
+    vi.mocked(fetch).mockResolvedValueOnce(FIELDS_WITH_EPIC).mockResolvedValueOnce(page([full]));
+    const rec = (await provider("lip-101").listIssuesPage(mapping(), null)).issues[0];
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+    expect(rec.comments.nodes).toHaveLength(100);
+    expect(rec.comments.nodes[0].body).toBe("n100");
+    expect(rec.comments.nodes.map((c) => c.body)).not.toContain("n0");
+  });
+
   it("throws TrackerUnavailableError for a mapping without Jira config or team key", async () => {
     const p = provider("lip-unavail");
     await expect(p.listIssuesPage({ ...jiraMapping(), teamKey: undefined }, null)).rejects.toBeInstanceOf(TrackerUnavailableError);

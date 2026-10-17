@@ -316,7 +316,7 @@ export class JiraProvider implements TicketingProvider {
    *
    * Comments: the search response embeds a capped comment list with its `total`. Only an
    * issue whose embedded list is shorter than `total` costs an extra `listComments` call
-   * (newest first, so the 100 kept are the newest).
+   * (newest first, so the 100 kept are the newest). The embedded list is sorted newest first too.
    */
   async listIssuesPage(mapping: RepoMapping, cursor: string | null): Promise<TrackerIssuePage> {
     const cfg = mapping.ticketingConfig;
@@ -381,6 +381,18 @@ export class JiraProvider implements TicketingProvider {
     if ((embedded?.total ?? 0) > comments.length) {
       comments = await this.client.listComments(raw.key);
     }
+
+    // Newest first on both paths, so the cap keeps the newest. Stable; a missing or
+    // unparsable `created` sorts last (NaN would break the comparator).
+    const createdMs = (c: JiraComment): number => {
+      const t = Date.parse(c.created ?? "");
+      return Number.isNaN(t) ? Number.NEGATIVE_INFINITY : t;
+    };
+    comments = [...comments].sort((a, b) => {
+      const ta = createdMs(a);
+      const tb = createdMs(b);
+      return ta === tb ? 0 : tb > ta ? 1 : -1;
+    });
 
     return {
       id: raw.id,
