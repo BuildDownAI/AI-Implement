@@ -478,7 +478,12 @@ export function reviewFixResultIntakeResponse(outcome: ResultIntakeOutcome): Han
  */
 const POST_PUSH_REVIEW_FIX_CYCLE_BAND = 100_000;
 
+/** The post-push publication record sorts after every feedback-loop cycle and before any
+ *  post-push-review-fix cycle, whose later commit must stay the final one. */
+const PUBLICATION_CYCLE_BAND = 50_000;
+
 function reviewFixCycleRecordNumber(summary: CycleSummary): number {
+  if (summary.stage === "publication") return PUBLICATION_CYCLE_BAND + summary.cycle;
   return summary.stage === "post-push-review-fix" ? POST_PUSH_REVIEW_FIX_CYCLE_BAND + summary.cycle : summary.cycle;
 }
 
