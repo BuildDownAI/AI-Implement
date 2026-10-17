@@ -140,6 +140,94 @@ AII-1289 remains open (Backlog) with the AII-1336/1338 blockers. Managed review-
 sequence AII-1368 -> AII-1312 -> AII-1374 -> AII-1313 and D10 are not waived. No restart, cancel, retry or
 uncertain-launch proof is inferred from these normal successes.
 
+## Live managed review-fix acceptance (2026-10-17)
+
+The normal managed **GHA + configured Codex + Restate review-fix/finalizer** path passed the controlled
+[TEST-5](https://linear.app/eudoxus/issue/TEST-5/prove-managed-codex-automatic-restate-review-fix-on-gha) acceptance.
+Scope is the ChatGPT-plan profile on GHA. AII-1289's remaining backend, auth, mixed-stage and recovery matrix stays open.
+
+### Deployed code and published runner
+
+Managed launch/admission and live corrections landed in [#1203](https://github.com/BuildDownAI/AI-Implement/pull/1203),
+[#1206](https://github.com/BuildDownAI/AI-Implement/pull/1206), [#1208](https://github.com/BuildDownAI/AI-Implement/pull/1208),
+[#1210](https://github.com/BuildDownAI/AI-Implement/pull/1210), [#1218](https://github.com/BuildDownAI/AI-Implement/pull/1218)
+and [#1221](https://github.com/BuildDownAI/AI-Implement/pull/1221).
+
+| Item | Observed value |
+|---|---|
+| Dispatcher, running = watched head | `e2134848be1269b757b4722265c343733503288f`, MCP `deployed-ok`, Restate ready/registered |
+| Successful runner build | [39045156714](https://github.com/BuildDownAI/AI-Implement/actions/runs/39045156714), same source |
+| Immutable build index | `sha256:eb8d5344f4ffa4c23a039774ddc0b18e67850c479b60f7cb8ca69dc3c94a76cd` |
+| Build's amd64 manifest | `sha256:ba51de3949045ffedd910c3035b657b2ba59a90366d2abf9f54beaf74244dfc8` |
+| Promoted `next` manifest, also observed in the live GHA pull | `sha256:dd30682cbe09629d1b32e9d44b47aacd0d5f3056ef4bb2c9b4c8a93d7a83902b` |
+
+The index, build platform manifest and promoted manifest are different digest types/representations. The published build and
+`next` config/layer digests matched. Five relevant compiled evidence/attribution modules in the published image byte-matched
+the tested local build. A non-root, network-disabled probe of that image passed successful publication, rejected/null-verdict
+and failed-result refusal, null publication usage, unchanged source evidence and nullable attribution checks; its native CLI
+reported Codex 0.159.2. This probe used no live account or model. #1221's current-head CI passed 10,649 unit tests and three
+runs of 993 real Restate tests, with external review approval.
+
+### Accepted live attempt
+
+The fixture was already correctly `fixed` after the preceding attempt. The leader's genuine
+[inline operator review comment](https://github.com/BuildDownAI/codex-sandbox-repo/pull/7#discussion_r4303263585),
+inside [COMMENTED review 5558515577](https://github.com/BuildDownAI/codex-sandbox-repo/pull/7#pullrequestreview-5558515577),
+requested a permanent exact-object unittest. Normal `review_comment` admission started the attempt automatically.
+It was an operator finding, with no invented bot/LLM verdict, hand-written webhook or manual workflow dispatch.
+
+| Evidence | Observed value |
+|---|---|
+| Restate owner / attempt | `reviewfix-fa04fa31c7359e782c5a15041871d7ad12b8a6e136e0b3892852aeea27d86613` |
+| GHA execution | [39045579755](https://github.com/BuildDownAI/codex-sandbox-repo/actions/runs/39045579755), attempt 1, completed/success |
+| Input / published head | `58bcb3d04b4da7b03f3694efc65977b6e2222b55` / `4f10b595b7bdb44cc949082c33adcad57bea9060` |
+| Frozen agent snapshot | `0456eef4-4717-4fcd-8b62-a866d9825130` |
+| Retained invocation | `implementation-da7d6032-cb7a-4510-b02e-a763d44bff6d` |
+| Agent / provider / model | `codex` / `openai` / `gpt-6-luna` |
+| Profile / auth mode / outcome | `chatgpt-plan-test` / `codex-subscription` / `success` |
+| Invocation usage | 105942 tokens in / 1441 out; cost null/unavailable |
+| Combined source-cycle usage | 114513 tokens in / 1543 out; cost null; publication usage all null |
+| Finding | `adf4e206e3938ee5c0b9ff9a1a522f1daf3029b7606093043bae2cb2be98e9ed`, version 1, addressed |
+
+MCP supplied the snapshot and invocation IDs directly from retained, snapshot-validated attribution. These are per-invocation
+figures, separate from the combined implementation/review cycle; publication is not another model call and adds no spend.
+
+Native Codex implementation and restricted native review passed in one iteration. The real GHA log records selected-profile
+checkout/finish success, non-root ephemeral implementation admission (Docker socket unreadable/unwritable), and authenticated
+result POST success. The immutable source cycle remains pending-push with no output commit; distinct publication cycle 50001
+records the actual head, complete finding disposition and `approved:true`. Both retain truthful `tests:missing` telemetry.
+The independent operator check ran all six Python tests and rejected four mutated fixtures (state, version, smoke identity,
+extra key), then restored the fixture. Only `tests/test_restate_smoke.py` changed in this follow-up. The target repo has no
+CI configured; these independent checks are not a target CI claim.
+
+The actual `ai-implement-orchestrator-bot[bot]`
+[finalizer effect](https://github.com/BuildDownAI/codex-sandbox-repo/pull/7#issuecomment-6235865381) names the exact head
+and addressed finding. MCP showed `evidenceComplete:true`, `terminationConfirmed:true` and no held reservation. A genuine
+[current-head operator approval](https://github.com/BuildDownAI/codex-sandbox-repo/pull/7#pullrequestreview-5558535065)
+followed independent verification. Private [PR #7](https://github.com/BuildDownAI/codex-sandbox-repo/pull/7) merged as
+`73ebde8ee18dcacc9d788742c9d5a8ac95f5021e` at 2026-10-17 15:37:58Z.
+
+TEST-5 also has the earlier PlanningRun `03a7af9b-b6e1-4f24-9b0b-80b20b8a7627` (MCP report card); no planning snapshot is
+invented for it here. TEST-4's separate accepted planning run and exact snapshot remain recorded in the preceding section.
+
+### Failures retained and cleanup
+
+| Earlier GHA run | Actual outcome / correction |
+|---|---|
+| 38969033642 | Checkout unauthorized before model work/push. An accepted-204 settlement reproduction led to #1208. |
+| 38972181483 | Checkout unauthorized before repair/push. A documented `workflow_run_id` parser reproduction led to #1210. |
+| 39004451748 | Real Codex fix pushed `58bcb3d`, but pre-push cycle evidence lacked the published SHA/dispositions and final approval was withheld. #1218 repaired publication evidence; #1221 retained attribution. |
+
+These are distinct review-triggered attempts. Same-attempt restart, cancellation, timeout, uncertain-launch and expiry/resume
+acceptance remain pending below. No force-release, forced deployment or fabricated recovery evidence was used.
+
+After the successful run and private merge, no TEST job/reservation remained. Browser control became unavailable
+(`cgWindowNotFound`), so TEST was temporarily paused with the supported partial MCP operation; readback confirmed paused=true,
+GHA mode and autoMerge=false. Restoring its prior fly-machines/Legacy/empty-extraEnv/active configuration is still pending
+browser access. Stage settings and other mapping fields are preserved. TEST-5 remains open for that cleanup. This dated state
+supersedes the earlier TEST-3/4 cleanup state; restoration will not count as live Fly proof. John's D10 and the remaining
+AII-1334/1335/1336/1338 backend work remain separate.
+
 ## Opt-in native planning-skills proof
 
 `scripts/planning-skills-proof.mjs` is not part of `npm test` and adds no dependency. It drives the compiled production
@@ -174,13 +262,12 @@ is required and only `/proof.mjs` follows the image.
 requests; trusted Skill load, denied Bash/Edit/outside Write, allowed comments Write, repository skill/command
 discovery/call/hook exclusion, and all five source-validation cases passed. Network none, unprivileged UID/GID,
 capabilities dropped, no-new-privileges, read-only root, owned tmpfs; no live credentials or paid calls. The pipeline
-itself did not run Docker. Paid/live and Codex-on-Restate acceptance remain pending.
+itself did not run Docker. Paid/live acceptance is recorded in the dated sections above; this synthetic skill probe adds no live evidence.
 
 ## Limited historical evidence
 
 TEST-2 supplies limited Fly/ChatGPT proof: exit 0 with error telemetry, then approval, with the original stream cause
-unknown. It is not the final matrix. A successful automatic Restate review-fix in this campaign ran on Claude/GHA; that does
-**not** prove Codex.
+unknown. It is not the final matrix. Earlier automatic Restate review-fix success on Claude/GHA did not prove Codex. TEST-5's accepted Codex run is recorded above.
 
 ## Pending and partial: paid/live acceptance
 
@@ -194,8 +281,8 @@ until those are present.
 | Fly x OpenAI API key | Pending | Run ID, snapshot ID, head SHA |
 | Fly x ChatGPT plan | Pending | Run ID, snapshot ID, head SHA |
 | GHA x OpenAI API key | Pending | Run ID, snapshot ID, head SHA |
-| GHA x ChatGPT plan | Verified for the TEST-3 ordinary-run smoke only (planning 2398, implementation 2421; see the 2026-10-16 section). Not extended to API-key, Fly, Docker, mixed or recovery cases | Run IDs, snapshot IDs and heads recorded above |
-| Real Codex PlanningRun and a later ReviewFixAttempt | Partial: PlanningRun `21e54423-afaf-466a-9001-a2ef0a40562a` supplied (TEST-4); managed ReviewFixAttempt not yet admitted or proven | ReviewFixAttempt identifier, snapshot ID, head SHA |
+| GHA x ChatGPT plan | Verified for TEST-3 ordinary runs and TEST-5 managed Restate review-fix; see the dated sections. API-key, Fly, Docker, mixed and recovery cases remain pending | Run IDs, snapshot IDs and heads recorded above |
+| Real Codex PlanningRun and a later ReviewFixAttempt | Verified for the recorded GHA/ChatGPT PlanningRun (TEST-4) and later managed ReviewFixAttempt (TEST-5); other matrix cases remain pending | ReviewFixAttempt identifier, snapshot ID, head SHA |
 | Mixed-stage runs (Claude and Codex across planning/implementation/review) | Pending | Run ID, snapshot ID, head SHA per stage |
 | Codex on Restate: restart recovery | Pending | Live run ID, snapshot ID, head SHA |
 | Codex on Restate: cancel | Pending | Live run ID, snapshot ID, head SHA |
@@ -206,7 +293,7 @@ until those are present.
 | Codex on Restate: timeout | Pending | Live run ID, snapshot ID, head SHA |
 | Codex on Restate: unavailable auth | Pending | Live run ID, snapshot ID, head SHA |
 | Codex on Restate: expired-token resume | Pending | Live run ID, snapshot ID, head SHA |
-| Codex on Restate review-fix, live | Pending | Live run ID, snapshot ID, head SHA |
+| Codex on Restate review-fix, live | Verified for TEST-5 GHA/ChatGPT normal completion | Exact attempt/run/snapshot/head and finalizer above |
 
 Managed Restate review-fix admission is open on GitHub Actions only (AII-1444): Codex API/ChatGPT and supported mixed selections admit when the workflow capabilities and read-only readiness hold. Fly and local Docker still refuse until AII-1336, managed Claude subscription stays refused, and no live proof exists yet. AII-1338 is generic Fly proof, not Codex-specific.
 AII-1289 owns the final Codex-specific evidence.
