@@ -252,7 +252,9 @@ A snapshot shrink, or a refresh that could not read tracker data, is one decisio
 not a failed run and a second ingest. The `held` state carries a `cause`: `shrink` (a content-shrink
 rule fired) or `tracker-missing` (`kg-tracker-data` reported `fetched: false` while the cloned snapshot
 has `issue.nt` or `comment.nt`). A `tracker-missing` PR body starts with a warning line naming the
-failed teams, and `held.failedTeams` lists them. When the runner's `report` is `failureCode: "KG_SNAPSHOT_HELD"` with a `snapshotPr`, `KgRefresh` stops
+failed teams, and `held.failedTeams` lists them.
+
+When the runner's `report` is `failureCode: "KG_SNAPSHOT_HELD"` with a `snapshotPr`, `KgRefresh` stops
 at a gate (`src/restate/kg-refresh-workflow.ts`):
 
 1. Sets step `decision` and stores `held` in workflow state: `snapshotPr`, `snapshotCommit`,
@@ -565,7 +567,8 @@ to the workflow. A held error also carries `cause` and `failedTeams`, which trav
 | Dry run (PR check), soft only or tracker data missing | no | `refused` with the table, never `held` |
 
 A held run commits, pushes `kg-refresh/<stamp>` and opens the PR (body: `Guard verdict: held — a shrink
-waits for an operator decision`; for `tracker-missing`, the body starts with a `⚠️` line naming the failed teams), then throws `KgSnapshotHeldError`. It is never reported as `success`;
+waits for an operator decision`; for `tracker-missing`, the body starts with a `⚠️` line naming the
+failed teams), then throws `KgSnapshotHeldError`. It is never reported as `success`;
 `KgRefresh` stops at the [decision gate](#decision-gate-aii-1248) on it.
 
 A PR-check dry run takes the workflow's dry-run branch: it never writes `lastRefresh`, never reaches the
@@ -666,8 +669,11 @@ missing tracker part when `fetched=true`, stays a hard refusal, since a part tha
 another reason is an ingest defect and holding it would invite an operator to accept a broken graph.
 A dry run pushes nothing and has no PR to hold, so it still refuses with
 `KG_SNAPSHOT_TRACKER_REGRESSION`. See
-[Held-verdict plumbing](#held-verdict-plumbing-aii-1253-aii-1264). For a shrink, an intentional change in what the ingest emits (a base-repo classification change, for example) also
-shrinks these files, and the guard cannot tell that from data loss on its own, so an operator decides.
+[Held-verdict plumbing](#held-verdict-plumbing-aii-1253-aii-1264).
+
+For a shrink, an intentional change in what the ingest emits (a base-repo classification change, for
+example) also shrinks these files, and the guard cannot tell that from data loss on its own, so an
+operator decides.
 
 One log line listing all parts with `prev=` and `new=` counts is emitted on every push attempt,
 pass or fail. The `fetched=false` flag check (which guards against a docs-only push replacing a
