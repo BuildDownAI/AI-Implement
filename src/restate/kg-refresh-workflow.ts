@@ -104,6 +104,9 @@ export interface KgRefreshReportBody {
   snapshotCommit?: string;
   snapshotBranch?: string;
   partTable?: Array<{ part: string; prev: string; new: string }>;
+  /** Absent on a report from a runner that predates the field; reads as "shrink". */
+  cause?: "shrink" | "tracker-missing";
+  failedTeams?: string[];
 }
 
 export interface KgDispatchInput {
@@ -144,6 +147,10 @@ export interface KgDispatchRowDetails {
 export interface KgRefreshHeldView {
   snapshotPr: number;
   partTable: Array<{ part: string; prev: string; new: string }>;
+  /** Why the run waits. */
+  cause: "shrink" | "tracker-missing";
+  /** Teams whose tracker fetch failed; empty for a shrink. */
+  failedTeams: string[];
   decideBy: number;
 }
 
@@ -959,6 +966,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           snapshotCommit: report.snapshotCommit,
           snapshotBranch: report.snapshotBranch,
           partTable: report.partTable,
+          cause: report.cause ?? "shrink",
+          failedTeams: report.failedTeams ?? [],
           decideBy,
         });
         ctx.console.log(`[KgRefresh] held: dispatch ${dispatchId} snapshot PR #${heldPrNumber} awaits a decision until ${new Date(decideBy).toISOString()}`);
@@ -1187,8 +1196,8 @@ function toStepRecord(step: Step): KgRefreshStepRecord {
     let decisions: KgRefreshStatusResult["decisions"] = [];
     let held: KgRefreshStatusResult["held"] = null;
     if (step === "decision") {
-      const stored = await ctx.get<{ snapshotPr: number; partTable?: KgRefreshHeldView["partTable"]; decideBy: number }>("held");
-      if (stored) held = { snapshotPr: stored.snapshotPr, partTable: stored.partTable ?? [], decideBy: stored.decideBy };
+      const stored = await ctx.get<{ snapshotPr: number; partTable?: KgRefreshHeldView["partTable"]; cause?: KgRefreshHeldView["cause"]; failedTeams?: string[]; decideBy: number }>("held");
+      if (stored) held = { snapshotPr: stored.snapshotPr, partTable: stored.partTable ?? [], cause: stored.cause ?? "shrink", failedTeams: stored.failedTeams ?? [], decideBy: stored.decideBy };
       if ((await ctx.promise<KgRefreshDecideInput>("decide").peek()) === undefined) decisions = ["accept", "cancel"];
     }
     return { step: step ?? null, startedAt: startedAt ?? null, triggerId: triggerId ?? null, runId: runId ?? null, dryRun: dryRun === true, runnerStep, decisions, held };

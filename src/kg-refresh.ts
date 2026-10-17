@@ -76,6 +76,8 @@ export interface RefreshOutcome {
   dispatchId?: string;
   /** Per-part {part, prev, new} rows from the push guard. Present on a dry-run outcome or a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638) when the runner reported one. */
   partTable?: Array<{ part: string; prev: string; new: string }>;
+  cause?: "shrink" | "tracker-missing";
+  failedTeams?: string[];
   /** Every runner step the workflow saw, in pipeline order (AII-1134); absent when the runner reported none. */
   steps?: KgRefreshStepRecord[];
   /** Why the run ended (`operator_cancelled`, `decision_timeout`, `merge_failed`, …); absent on success and on older records. */
@@ -195,7 +197,7 @@ export interface KgRefreshStatus {
     triggerId: string;
     step: string | null;
     decisions: Array<"accept" | "cancel">;
-    held: { snapshotPr: number; snapshotPrUrl?: string; partTable: Array<{ part: string; prev: string; new: string }>; decideBy: number } | null;
+    held: { snapshotPr: number; snapshotPrUrl?: string; partTable: Array<{ part: string; prev: string; new: string }>; cause: "shrink" | "tracker-missing"; failedTeams: string[]; decideBy: number } | null;
   } | null;
   /** The runner step in flight, when the workflow has one (AII-1134). */
   runnerStep?: { id: string; status: StepStatus };
