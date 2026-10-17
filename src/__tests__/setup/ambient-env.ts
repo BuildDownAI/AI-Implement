@@ -20,6 +20,14 @@ export const BASE_ENV_ALLOWLIST: EnvAllowlist = {
     DEDUP_DB_PATH:
       "Both vitest configs set it to :memory: through test.env. " +
       "Without it, dedup.ts opens /data/dedup.sqlite or /tmp/ai-implement.sqlite, a real database every test file shares.",
+    CODEX_PINNED_PROOF:
+      "An operator switch, not machine state. " +
+      "`required` turns codex-planning-adapter.test.ts's pinned-CLI tests from a skip into a failure when codex 0.159.2 is missing " +
+      "(docs/pipeline-architecture.md). Deleted, the gated run skips silently.",
+    CAPTURE_FIXTURES:
+      "An operator switch, not machine state. " +
+      "Set, planning-launch.test.ts rewrites fixtures/planning-opted-out.json instead of comparing against it. " +
+      "Deleted, a regeneration run only compares.",
   },
   prefixes: {},
   pinned: {

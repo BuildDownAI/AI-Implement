@@ -1,7 +1,6 @@
 /**
  * Tests for `src/managed-dispatch-auth.ts` (AII-1386) against a temp SQLite file with the real config store,
- * ownership layer and session store. Synthetic runtime, no network. `npm run typecheck` excludes
- * `src/__tests__`, so type-check this file explicitly with a throwaway tsconfig.
+ * ownership layer and session store. Synthetic runtime, no network.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import os from "node:os";
