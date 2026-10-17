@@ -6,9 +6,11 @@ import type {
   ProviderConfig,
   TicketIssue,
   TicketingProvider,
+  TrackerIssuePage,
+  TrackerIssueRecord,
 } from "./types.js";
-import { MissingProviderConfigError } from "./types.js";
-import { JiraApiError, JiraClient } from "./jira-client.js";
+import { MissingProviderConfigError, TrackerUnavailableError } from "./types.js";
+import { JiraApiError, JiraClient, type JiraComment, type JiraIssue } from "./jira-client.js";
 import {
   getCachedFieldIds,
   STATUS_VALUES,
@@ -209,6 +211,16 @@ function incompleteBlockerKeys(issuelinks: unknown): string[] {
     .map((l) => (l.inwardIssue as { key: string }).key);
 }
 
+/** Comments the knowledge-graph export carries per issue (Linear's `comments(first: 100)`). */
+const TRACKER_EXPORT_MAX_COMMENTS = 100;
+
+/** Jira link type name → the export's relation type. Every other name is `related`. */
+function exportRelationType(typeName: string | undefined): string {
+  if (typeName === "Blocks") return "blocks";
+  if (typeName === "Duplicate") return "duplicate";
+  return "related";
+}
+
 export interface JiraProviderConstructor {
   client: JiraClient;
   /** Per-instance cache scope label; typically the cloud ID. */
@@ -294,6 +306,100 @@ export class JiraProvider implements TicketingProvider {
     }
     await this.client.setField(issueId, ids.statusFieldId, { value });
     return true;
+  }
+
+  /**
+   * One page of a mapping's issues for the knowledge-graph export. The cursor is Jira's
+   * `nextPageToken` (null → first page). The repo-field filter runs after the search, so a
+   * page can hold fewer issues, or none, while `hasNextPage` is still true; callers follow
+   * `hasNextPage`, not the issue count. `sourceSystem` and `team` are stamped by `TrackerExport`.
+   *
+   * Comments: the search response embeds a capped comment list with its `total`. Only an
+   * issue whose embedded list is shorter than `total` costs an extra `listComments` call
+   * (newest first, so the 100 kept are the newest).
+   */
+  async listIssuesPage(mapping: RepoMapping, cursor: string | null): Promise<TrackerIssuePage> {
+    const cfg = mapping.ticketingConfig;
+    if (cfg?.kind !== "jira") throw new TrackerUnavailableError("mapping has no Jira ticketing config");
+    const scopeKey = mapping.teamKey;
+    if (!scopeKey) throw new TrackerUnavailableError("mapping carries no team key");
+
+    const fieldIds = await this.fields(scopeKey);
+    const res = await this.client.searchJqlPage(
+      `(${cfg.jql})`,
+      [
+        "summary", "description", "status", "labels", "project", "parent", "issuelinks", "comment",
+        fieldIds.repoFieldId,
+        ...(fieldIds.epicLinkFieldId ? [fieldIds.epicLinkFieldId] : []),
+      ],
+      cursor ?? undefined,
+    );
+
+    const inScope = res.issues.filter((raw) => {
+      const actual = readRepoFieldValue(raw.fields[fieldIds.repoFieldId]);
+      if (actual === cfg.repoFieldValue) return true;
+      const mismatchKey = `${scopeKey}::${raw.key}`;
+      if (!this.notifiedMismatches.has(mismatchKey)) {
+        this.notifiedMismatches.add(mismatchKey);
+        this.onRepoFieldMismatch(scopeKey, raw.key, actual);
+      }
+      return false;
+    });
+
+    const issues: TrackerIssueRecord[] = [];
+    for (const raw of inScope) issues.push(await this.toTrackerRecord(raw, fieldIds));
+    return {
+      issues,
+      pageInfo: { hasNextPage: !!res.nextPageToken, endCursor: res.nextPageToken ?? null },
+    };
+  }
+
+  private async toTrackerRecord(raw: JiraIssue, fieldIds: ResolvedFieldIds): Promise<TrackerIssueRecord> {
+    const f = raw.fields;
+    const status = f.status as { name?: string; statusCategory?: { key?: string } } | null;
+    const labels = Array.isArray(f.labels) ? (f.labels as unknown[]).filter((l): l is string => typeof l === "string") : [];
+    const projectName = (f.project as { name?: string } | null)?.name;
+    const parentKey = effectiveParentKey(f, fieldIds);
+
+    const relations: TrackerIssueRecord["relations"]["nodes"] = [];
+    if (Array.isArray(f.issuelinks)) {
+      for (const l of f.issuelinks as JiraIssueLink[]) {
+        // An outward link reads "this issue <blocks|duplicates|…> the other". An inward one
+        // reads the other way round, and the export's `blocks`/`duplicate` are directed from
+        // the record's own issue, so an inward link is always `related`; the other issue's
+        // own record carries the directed edge.
+        if (l.outwardIssue?.key) {
+          relations.push({ type: exportRelationType(l.type?.name), relatedIssue: { identifier: l.outwardIssue.key } });
+        } else if (l.inwardIssue?.key) {
+          relations.push({ type: "related", relatedIssue: { identifier: l.inwardIssue.key } });
+        }
+      }
+    }
+
+    const embedded = f.comment as { comments?: JiraComment[]; total?: number } | null;
+    let comments = embedded?.comments ?? [];
+    if ((embedded?.total ?? 0) > comments.length) {
+      comments = await this.client.listComments(raw.key);
+    }
+
+    return {
+      id: raw.id,
+      identifier: raw.key,
+      title: typeof f.summary === "string" ? f.summary : "",
+      description: descriptionText(f),
+      state: status?.name ? { name: status.name, type: status.statusCategory?.key ?? "" } : null,
+      labels: { nodes: labels.map((name) => ({ name })) },
+      project: projectName ? { name: projectName } : null,
+      parent: parentKey ? { identifier: parentKey } : null,
+      comments: {
+        nodes: comments.slice(0, TRACKER_EXPORT_MAX_COMMENTS).map((c) => ({
+          body: typeof c.body === "string" ? c.body : adfToPlainText(c.body),
+          user: c.author?.displayName ? { name: c.author.displayName } : null,
+          createdAt: c.created ?? "",
+        })),
+      },
+      relations: { nodes: relations },
+    };
   }
 
   async fetchAIImplementSnapshot(): Promise<AIImplementSnapshot> {

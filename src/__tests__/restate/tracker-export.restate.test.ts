@@ -1,6 +1,6 @@
 // Real Restate coverage for the TrackerExport service (AII-1462). The provider is an in-process fake;
-// the exported case table runs once per fake in FAKE_PROVIDERS, so a new provider (Jira, AII-605 step 3)
-// is one more entry. Happy paths run on `alwaysReplay`, error paths on `disableRetries`, and the
+// the exported case table runs once per fake in FAKE_PROVIDERS (Linear and Jira, AII-605), so a new
+// provider is one more entry. Happy paths run on `alwaysReplay`, error paths on `disableRetries`, and the
 // transient-error case on the retry-enabled environment.
 //
 // Run with `npm run test:restate`; excluded from `npm test`.
@@ -26,8 +26,8 @@ export interface FakeProviderEntry {
   id: string;
 }
 
-/** One entry per provider under test. The Jira issue adds its fake here. */
-export const FAKE_PROVIDERS: FakeProviderEntry[] = [{ id: "fake-linear" }];
+/** One entry per provider under test; one table runs for all of them. */
+export const FAKE_PROVIDERS: FakeProviderEntry[] = [{ id: "fake-linear" }, { id: "fake-jira" }];
 
 const record = (n: number): TrackerIssueRecord => ({
   id: `id-${n}`, identifier: `T-${n}`, title: `Issue ${n}`, description: null,
