@@ -283,7 +283,7 @@ export function buildPublicationCycleSummary(
   const feedback = summaries.filter((s) => s.stage === "feedback-loop");
   const source = feedback.reduce<CycleSummary | null>((best, s) => (!best || s.cycle > best.cycle ? s : best), null);
   if (!source) return null;
-  const record: CycleSummary = {
+  const full: CycleSummary = {
     id: PUBLICATION_CYCLE_ID,
     stage: "publication",
     cycle: 1,
@@ -300,7 +300,30 @@ export function buildPublicationCycleSummary(
     limitReached: source.limitReached,
     completedAt: source.completedAt,
   };
-  return isCycleSummary(record) ? record : null;
+  const fits = (r: CycleSummary): boolean => isCycleSummary(r as unknown);
+  if (fits(full)) return full;
+  const record: CycleSummary = full;
+  // Over the byte cap: shed non-coverage evidence first (tests, then verdict detail), keeping the
+  // dispositions the approval gate needs; flag the loss via truncated/limitReached.
+  const shrunk: CycleSummary[] = [
+    { ...record, tests: record.tests.slice(0, OVERFLOW_ENTRY_CAP) },
+    { ...record, tests: [SIZE_LIMIT_TEST_PLACEHOLDER], verdict: { approved: record.verdict.approved, reason: record.verdict.reason } },
+  ].map((r) => ({ ...r, truncated: true, limitReached: true }));
+  for (const candidate of shrunk) if (fits(candidate)) return candidate;
+  // Dispositions alone overflow: keep as many as fit rather than publishing nothing.
+  let fallback: CycleSummary = shrunk[1];
+  while (fallback.dispositions.length > 0 && !fits(fallback)) {
+    fallback = { ...fallback, dispositions: fallback.dispositions.slice(0, Math.floor(fallback.dispositions.length * 0.9)) };
+  }
+  if (fits(fallback)) {
+    console.warn(
+      `[cycle-summary] publication record exceeded the ${CYCLE_SUMMARY_MAX_BYTES}-byte cap; ` +
+        `kept ${fallback.dispositions.length}/${record.dispositions.length} dispositions`,
+    );
+    return fallback;
+  }
+  console.warn(`[cycle-summary] publication record could not be bounded to ${CYCLE_SUMMARY_MAX_BYTES} bytes; omitting it`);
+  return null;
 }
 
 /** Redacts, then caps `value` to `maxChars`; `truncated` is explicit rather than inferred from

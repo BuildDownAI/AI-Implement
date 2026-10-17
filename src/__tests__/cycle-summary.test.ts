@@ -371,6 +371,19 @@ describe("buildPublicationCycleSummary", () => {
       expect(readCycleSummaries(d).every((s) => s.outputCommit === null)).toBe(true);
     } finally { rmSync(d, { recursive: true, force: true }); }
   });
+  it("sheds test evidence before dispositions when the record overflows the byte cap", () => {
+    const d = dir();
+    try {
+      const tests = Array.from({ length: 50 }, (_, i) => ({ name: `t${i}-${"x".repeat(190)}`, status: "passed" as const }));
+      writeCycleSummary(d, baseInput({ tests }));
+      const dispositions = Array.from({ length: 60 }, (_, i) => ({ key: `${i}`.padStart(64, "a"), disposition: "fixed" }));
+      const pub = buildPublicationCycleSummary(readCycleSummaries(d), "e".repeat(40), dispositions);
+      expect(pub).not.toBeNull();
+      expect(pub!.dispositions).toHaveLength(60);
+      expect(pub!.limitReached).toBe(true);
+      expect(isCycleSummary(pub)).toBe(true);
+    } finally { rmSync(d, { recursive: true, force: true }); }
+  });
   it("returns null without a pushed commit or a feedback-loop source", () => {
     const d = dir();
     try {
