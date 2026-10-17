@@ -76,6 +76,9 @@ export async function runLocalFullLoopFromEnv(
   deps: Partial<LocalFullLoopRunnerDependencies> = DEFAULT_DEPENDENCIES,
 ): Promise<number> {
   const resolvedDeps = { ...DEFAULT_DEPENDENCIES, ...deps };
+  const workspaceDir = env.WORKSPACE_DIR ?? "/workspace";
+  // Reset first so no early failure can leave an earlier run's attribution to be reported.
+  resetLatestAttributionFile(workspaceDir);
   const encoded = env.AI_IMPLEMENT_RUN_CONFIG;
   if (!encoded) throw new Error("Missing required env var: AI_IMPLEMENT_RUN_CONFIG");
 
@@ -84,12 +87,10 @@ export async function runLocalFullLoopFromEnv(
   if (configuredIntent && !decodeTrustedRunConfig(encoded).agentConfig) {
     throw CONFIGURED_BOOTSTRAP_ERROR;
   }
-  const workspaceDir = env.WORKSPACE_DIR ?? "/workspace";
   const bootstrap = config.agentConfig && env[LOCAL_AUTH_BOOTSTRAP_ENV]
     ? await resolvedDeps.loadLocalSessionBootstrap({ env, snapshot: config.agentConfig, workspaceDir })
     : undefined;
 
-  resetLatestAttributionFile(workspaceDir);
   resolvedDeps.writeStdout("[dev:run] full loop: planning -> implementation -> review\n");
   const result = await resolvedDeps.runFullLoop({
     workspaceDir,

@@ -175,4 +175,14 @@ describe("latest attribution round trip", () => {
     await collectRunArtifacts(handle, 3);
     expect(tel(art).latestInvocationAttribution).toBeNull();
   });
+
+  it("does not report a stale result when the next run fails before the loop starts", async () => {
+    const { ws, art, handle } = setup();
+    await runLoop(ws, { attribution });
+    await expect(
+      runLocalFullLoopFromEnv({ AI_IMPLEMENT_RUN_CONFIG: "not-a-config", WORKSPACE_DIR: ws }, { writeStdout: () => undefined }),
+    ).rejects.toThrow();
+    await collectRunArtifacts(handle, 1);
+    expect(tel(art).latestInvocationAttribution).toBeNull();
+  });
 });

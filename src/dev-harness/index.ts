@@ -747,7 +747,7 @@ const MAX_UNTRACKED_FILES = 200;
 const MAX_UNTRACKED_BYTES = 256 * 1024;
 const UNTRACKED_DENY = [
   /(^|\/)(ai-output|\.dev-runs|\.git|node_modules|\.cache|\.ai-implement-local|\.codex|\.claude)\//,
-  /(^|\/)\.env(\..*)?$/,
+  /(^|\/)\.env(\..*)?$/i,
   /(^|\/)(\.npmrc|\.netrc|auth\.json|bootstrap\.json|credentials(\..*)?)$/i,
   /\.(pem|key|p12|pfx)$/i,
 ];
@@ -759,12 +759,18 @@ function collectUntrackedEvidence(cwd: string): { patch: string; stat: string } 
     stdio: ["ignore", "pipe", "pipe"],
   });
   if (listed.status !== 0) return { patch: "", stat: "" };
-  const files = (listed.stdout?.toString() ?? "")
+  const eligible = (listed.stdout?.toString() ?? "")
     .split("\0")
-    .filter((f) => f && !UNTRACKED_DENY.some((re) => re.test(f)))
-    .slice(0, MAX_UNTRACKED_FILES);
+    .filter((f) => f && !UNTRACKED_DENY.some((re) => re.test(f)));
+  const files = eligible.slice(0, MAX_UNTRACKED_FILES);
   let patch = "";
   let stat = "";
+  if (eligible.length > files.length) {
+    const note = `# untracked evidence truncated: ${eligible.length - files.length} of ${eligible.length} new files omitted (limit ${MAX_UNTRACKED_FILES})\n`;
+    console.warn(`[dev-harness] ${note.slice(2).trim()}`);
+    patch += note;
+    stat += note;
+  }
   for (const file of files) {
     try {
       const st = lstatSync(join(cwd, file));
