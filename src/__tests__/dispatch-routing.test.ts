@@ -81,6 +81,9 @@ function jiraMapping(project: string, overrides: Partial<RepoMapping> = {}): Rep
   });
 }
 
+// Planning dispatches only with the runner callback configured (planningDispatchBlockReason, src/runner-callback.ts).
+const CALLBACK_CONFIG = { runnerCallbackBaseUrl: "https://orchestrator.example", runnerTokenSecret: "secret" };
+
 function jiraProvider(): TicketingProvider {
   return makeProvider({ id: "jira", issueUrl: (issue) => `https://example.atlassian.net/browse/${issue.identifier}` });
 }
@@ -363,7 +366,8 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
   let planningLaunch: typeof import("../planning-launch.js");
 
   const issue = makeIssue();
-  const mapping = makeMapping();
+  // The poll loop dispatches planning only for a mapping with planning on.
+  const mapping = makeMapping({ planningEnabled: true });
   const provider = makeProvider();
   const prior = { count: 0, lastDispatchedAt: null };
 
@@ -441,7 +445,7 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
   });
 
   describe("launchPlanningSession (AII-1053)", () => {
-    const planningConfig = makeAppConfig({ anthropicApiKey: "sk-test" });
+    const planningConfig = makeAppConfig({ anthropicApiKey: "sk-test", ...CALLBACK_CONFIG });
 
     async function launch(reservation?: import("../index.js").HeldReservation) {
       return planningLaunch.launchPlanningSession({
@@ -525,7 +529,7 @@ describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome a
   // A Jira issue is dispatched for implementation once its status reads "Plan Approved", and for planning while it reads "Ready".
   const issue = makeIssue({ nativeStatus: "Plan Approved" });
   const planningIssue = { ...issue, nativeStatus: "Ready" };
-  const mapping = jiraMapping("ENG");
+  const mapping = jiraMapping("ENG", { planningEnabled: true });
 
   // provider.id is deliberately not "linear": buildPlanningContextInputs short-circuits to
   // NONE_CONTEXT without any network call whenever ticketingProviderId !== "linear", which
@@ -533,7 +537,7 @@ describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome a
   const provider = jiraProvider();
 
   const prior = { count: 0, lastDispatchedAt: null };
-  const config = makeAppConfig();
+  const config = makeAppConfig(CALLBACK_CONFIG);
 
   const planningCtx = {
     execPath: "github-actions" as const,
@@ -677,7 +681,8 @@ describe("dispatchPlanning defers buildPlanningContextInputs until after admissi
   let planningContext: typeof import("../planning-context.js");
 
   const issue = makeIssue();
-  const mapping = makeMapping({ maxInProgressAiIssues: 1 });
+  const mapping = makeMapping({ maxInProgressAiIssues: 1, planningEnabled: true });
+  const config = makeAppConfig(CALLBACK_CONFIG);
 
   // Linear-tracked, so buildPlanningContextInputs would take the real network-call
   // branch if it were ever reached — isLinearAuthConfigured() is false in this test env
@@ -719,8 +724,8 @@ describe("dispatchPlanning defers buildPlanningContextInputs until after admissi
   it("GHA path: never fetches planning context when the team's capacity is already spent", async () => {
     const occupied = gate.acquireDispatch({
       dispatchId: "occupy-gha",
-      issueId: "AII-other-1",
-      issueIdentifier: "AII-other-1",
+      issueId: "issue-other-1",
+      issueIdentifier: "ENG-91",
       kind: "implementation",
       teamKey: issue.scopeKey,
       maxInProgressAiIssues: 1,
@@ -728,7 +733,7 @@ describe("dispatchPlanning defers buildPlanningContextInputs until after admissi
     });
     expect(occupied.ok).toBe(true);
 
-    await indexModule.dispatchPlanning(makeAppConfig(), provider, issue, mapping, planningCtx);
+    await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx);
 
     expect(planningContext.buildPlanningContextInputs).not.toHaveBeenCalled();
     expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
@@ -741,7 +746,7 @@ describe("dispatchPlanning defers buildPlanningContextInputs until after admissi
       outcome: "accepted",
     });
 
-    await indexModule.dispatchPlanning(makeAppConfig(), provider, issue, mapping, planningCtx);
+    await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx);
 
     expect(planningContext.buildPlanningContextInputs).toHaveBeenCalledTimes(1);
   });
@@ -749,8 +754,8 @@ describe("dispatchPlanning defers buildPlanningContextInputs until after admissi
   it("local-docker path: never fetches planning context when the team's capacity is already spent", async () => {
     const occupied = gate.acquireDispatch({
       dispatchId: "occupy-local",
-      issueId: "AII-other-2",
-      issueIdentifier: "AII-other-2",
+      issueId: "issue-other-2",
+      issueIdentifier: "ENG-92",
       kind: "planning",
       teamKey: issue.scopeKey,
       maxInProgressAiIssues: 1,
@@ -758,7 +763,7 @@ describe("dispatchPlanning defers buildPlanningContextInputs until after admissi
     });
     expect(occupied.ok).toBe(true);
 
-    await indexModule.dispatchPlanning(makeAppConfig(), provider, issue, mapping, localPlanningCtx);
+    await indexModule.dispatchPlanning(config, provider, issue, mapping, localPlanningCtx);
 
     expect(planningContext.buildPlanningContextInputs).not.toHaveBeenCalled();
     expect(vi.mocked(localDocker.startLocalRunnerContainer)).not.toHaveBeenCalled();
@@ -778,9 +783,9 @@ describe("preparePlanningDispatch — feature-branch chain resolution (AII-898)"
   let githubAppAuth: typeof import("../github-app-auth.js");
   let github: typeof import("../github.js");
 
-  const mapping = jiraMapping("AII", { defaultBranch: "testing" });
+  const mapping = jiraMapping("AII", { defaultBranch: "testing", planningEnabled: true });
   const provider = jiraProvider();
-  const config = makeAppConfig({ runnerCallbackBaseUrl: "https://orchestrator.example", runnerTokenSecret: "secret" });
+  const config = makeAppConfig(CALLBACK_CONFIG);
 
   beforeEach(async () => {
     ({ githubAppAuth, github, indexModule } = (await testDb({ modules: loaders })).modules);
@@ -793,8 +798,10 @@ describe("preparePlanningDispatch — feature-branch chain resolution (AII-898)"
     vi.restoreAllMocks();
   });
 
+  // A Jira issue's scope key is its mapping's key (JiraProvider).
   const chainIssue = makeIssue({
     identifier: "AII-931",
+    scopeKey: "AII",
     nativeStatus: "Ready",
     featureBranchChain: [{ identifier: "AII-682", mode: "feature" }],
   });
@@ -828,6 +835,7 @@ describe("preparePlanningDispatch — feature-branch chain resolution (AII-898)"
   it("a Jira per-issue base field still wins over the chain, with no getBranchSha call", async () => {
     const fieldIssue = makeIssue({
       identifier: "AII-932",
+      scopeKey: "AII",
       nativeStatus: "Ready",
       baseBranch: "release/foo",
     });
@@ -845,7 +853,7 @@ describe("preparePlanningDispatch — feature-branch chain resolution (AII-898)"
   });
 
   it("no chain and no field: resolves to the default branch, unchanged", async () => {
-    const flatIssue = makeIssue({ identifier: "AII-933", nativeStatus: "Ready" });
+    const flatIssue = makeIssue({ identifier: "AII-933", scopeKey: "AII", nativeStatus: "Ready" });
 
     const ctx = await indexModule.preparePlanningDispatch(config, provider, flatIssue, mapping);
 
@@ -1177,12 +1185,13 @@ describe("dispatchGitHubActions — run lookup is keyed by issue identifier (AII
 
     vi.mocked(githubAppAuth.getInstallationToken).mockResolvedValue("gh-token");
     vi.mocked(repoImage.resolveRunnerImageForDispatch).mockResolvedValue(undefined);
+    // Runs titled with the issue key come from the envelope template (its run-name names the issue).
     vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue({
-      contract: "legacy",
+      contract: "envelope",
       supportsRunPublicationToken: false,
       supportsAttemptCorrelation: false,
     });
-    vi.mocked(workflowProbe.resolveWorkflowContract).mockResolvedValue("legacy");
+    vi.mocked(workflowProbe.resolveWorkflowContract).mockResolvedValue("envelope");
     vi.mocked(github.postWorkflowDispatch).mockResolvedValue({ success: true, status: 204, outcome: "accepted" });
   });
 
@@ -1227,13 +1236,14 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
   let github: typeof import("../github.js");
   let restateStatus: typeof import("../restate/status.js");
 
-  const issue = makeIssue({ identifier: "AII-1100", scopeKey: "AII", nativeStatus: "Ready" });
-  const pilot = jiraMapping("AII", { reviewFixLifecycle: "restate" });
-  const legacyMapping = jiraMapping("AII", { reviewFixLifecycle: "legacy" });
+  // The issue names its base branch, so the validated field value is the branch planning resolves to (index.ts).
+  const issue = makeIssue({ identifier: "AII-1100", scopeKey: "AII", nativeStatus: "Ready", baseBranch: "release/1.0" });
+  const pilot = jiraMapping("AII", { reviewFixLifecycle: "restate", planningEnabled: true });
+  const legacyMapping = jiraMapping("AII", { reviewFixLifecycle: "legacy", planningEnabled: true });
   const provider = jiraProvider();
-  const config = makeAppConfig();
+  const config = makeAppConfig(CALLBACK_CONFIG);
   const ctxFor = (execPath: "github-actions" | "fly-machines" | "local-docker") => ({
-    execPath, runnerMode: "default", resolvedPlanningBranch: "main", planningFieldValue: "field-1",
+    execPath, runnerMode: "default", resolvedPlanningBranch: "release/1.0", planningFieldValue: "release/1.0",
   });
   const activeRows = () =>
     (dedup.getDb().prepare("SELECT dispatch_id FROM dispatch_admissions WHERE released_at IS NULL").all() as { dispatch_id: string }[]);
@@ -1256,7 +1266,7 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
     const [dispatchId, input] = planningIngress.submit.mock.calls[0];
     expect(input).toEqual({
       dispatchId, teamKey: "AII", issueId: issue.id, issueIdentifier: issue.identifier, backend,
-      planningContext: { resolvedPlanningBranch: "main", planningFieldValue: "field-1" },
+      planningContext: { resolvedPlanningBranch: "release/1.0", planningFieldValue: "release/1.0" },
     });
     // The workflow reserves in its first step; the poll loop holds nothing.
     expect(admission.read(dispatchId)).toBeNull();

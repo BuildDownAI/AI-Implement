@@ -16,7 +16,8 @@ import {
 import { DEFAULT_PIPELINE } from "../pipeline/default-pipeline.js";
 import { PipelineRunner } from "../pipeline/runner.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
-import { encodeRunConfig } from "../run-config.js";
+import { buildImplRunConfig, encodeRunConfig } from "../run-config.js";
+import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import type { PipelineDefinition, StepModule } from "../pipeline/types.js";
 import { __resetPublicationCredentialForTests } from "../publication-credential.js";
 import { DISPOSITIONS_FILE, stableReviewFindingKey, type FindingDisposition } from "../pipeline/finding-dispositions.js";
@@ -24,7 +25,7 @@ import { CYCLE_SUMMARY_FILE, type CycleSummary } from "../pipeline/cycle-summary
 import type { GhSpawn } from "../pipeline/review-ledger.js";
 import type { ReviewFixMetadataV1 } from "../review-fix-contract.js";
 import { DEFAULT_MODEL } from "../pipeline/default-model.js";
-import { makeExecutor, makeFeedbackLoopOutputs, makeReviewFixRunConfig } from "./helpers/builders.js";
+import { makeExecutor, makeFeedbackLoopOutputs, makeIssue, makeMapping, makeReviewFixRunConfig } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 import { testDir } from "./helpers/test-dir.js";
 
@@ -36,6 +37,8 @@ const CYCLE_SUMMARY = "POST /runner/cycle-summary";
 const ACTIVITY = "POST /runner/activity";
 
 const legacyResultAccepted = { json: { acknowledged: true, warnings: [] } };
+// The result handler's answer to an implementation success that names no PR (handleRunnerResult, src/runner-callback.ts).
+const missingPrUrlRejected = { status: 400, json: { error: "missing_prUrl" } };
 const pilotResultStored = { json: { acknowledged: true, outcome: "stored", retryable: false } };
 const cycleSummaryRecorded = { json: { acknowledged: true, outcome: "recorded" } };
 const progressAccepted = { json: { acknowledged: true } };
@@ -68,6 +71,18 @@ function openedPr(prNumber: number, overrides: Record<string, unknown> = {}): Re
 /** The push step's outputs when a gap-fill run pushed to its existing PR, which returns no PR URL. */
 function updatedPr(prNumber: number, overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return { prUrl: null, prNumber, branchPushed: true, commitSha: "c".repeat(40), draft: false, pushAttempts: 1, ...overrides };
+}
+
+/** The envelope the orchestrator dispatches an implementation run of AII-1 with (buildImplRunConfig). */
+function implEnvelope(opts: { baseBranch?: string; runnerCallbackUrl?: string } = {}): string {
+  const mapping = makeMapping();
+  return encodeRunConfig(buildImplRunConfig({
+    issue: makeIssue({ id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" }),
+    mapping,
+    baseBranch: opts.baseBranch ?? mapping.defaultBranch,
+    runnerCallbackUrl: opts.runnerCallbackUrl,
+    retryPolicy: DEFAULT_RETRY_POLICY,
+  }));
 }
 
 /** `gh` for a gap-fill run's PR with no unresolved review threads; every gap-fill run lists them. */
@@ -279,14 +294,7 @@ describe("runAutonomous", () => {
 
   it("uses run_config.baseBranch as branch for non-gap-fill runs, overriding GITHUB_DEFAULT_BRANCH", async () => {
     vi.stubEnv("GITHUB_DEFAULT_BRANCH", "main");
-    vi.stubEnv(
-      "AI_IMPLEMENT_RUN_CONFIG",
-      encodeRunConfig({
-        v: 1,
-        issue: { id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" },
-        baseBranch: "ai-implement/feature/ool-126",
-      }),
-    );
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", implEnvelope({ baseBranch: "ai-implement/feature/ool-126" }));
 
     let capturedBranch: string | undefined;
     const mod: StepModule = {
@@ -304,13 +312,8 @@ describe("runAutonomous", () => {
 
   it("falls back to GITHUB_DEFAULT_BRANCH when run_config.baseBranch is absent", async () => {
     vi.stubEnv("GITHUB_DEFAULT_BRANCH", "main");
-    vi.stubEnv(
-      "AI_IMPLEMENT_RUN_CONFIG",
-      encodeRunConfig({
-        v: 1,
-        issue: { id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" },
-      }),
-    );
+    // The envelope leaves baseBranch out when the run targets the mapping's default branch.
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", implEnvelope());
 
     let capturedBranch: string | undefined;
     const mod: StepModule = {
@@ -327,7 +330,8 @@ describe("runAutonomous", () => {
   });
 
   it("does not use run_config.baseBranch for gap-fill runs — uses GITHUB_DEFAULT_BRANCH (PR checkout branch)", async () => {
-    vi.stubEnv("GITHUB_DEFAULT_BRANCH", "ai-implement/ai-implement-aii-1-fix-something");
+    // The PR's own branch, named from the issue when the initial run opened it (buildIssueBranchName).
+    vi.stubEnv("GITHUB_DEFAULT_BRANCH", "ai-implement/aii-1-test-issue");
     vi.stubEnv(
       "AI_IMPLEMENT_RUN_CONFIG",
       encodeRunConfig({
@@ -358,7 +362,7 @@ describe("runAutonomous", () => {
     });
 
     // Gap-fill: uses the PR checkout branch (GITHUB_DEFAULT_BRANCH), not envelope baseBranch
-    expect(capturedBranch).toBe("ai-implement/ai-implement-aii-1-fix-something");
+    expect(capturedBranch).toBe("ai-implement/aii-1-test-issue");
   });
 
   it("reads model from WORKFLOW.md front matter and passes it through context", async () => {
@@ -841,14 +845,7 @@ describe("runAutonomous", () => {
     // callback URL inside the envelope. Regression test for the bug where postRunnerResult
     // silently no-op'd because it only ever read the legacy env var. The envelope takes
     // precedence over the flat ISSUE_ID/etc env vars stubbed by stubRequiredEnv() above.
-    vi.stubEnv(
-      "AI_IMPLEMENT_RUN_CONFIG",
-      encodeRunConfig({
-        v: 1,
-        issue: { id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" },
-        runnerCallbackUrl: "https://orchestrator.example",
-      }),
-    );
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", implEnvelope({ runnerCallbackUrl: "https://orchestrator.example" }));
     vi.stubEnv("RUN_TOKEN", "run-token");
 
     const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
@@ -956,9 +953,11 @@ describe("runAutonomous", () => {
       deadlineAt: Date.now() + 60 * 60_000,
     };
 
-    // A pilot attempt is always a gap-fill on its PR, with the callback URL in the envelope only.
+    // A pilot attempt is always a gap-fill on its PR, with the callback URL in the envelope only, and is always
+    // launched with a progress token (review-fix-production.ts mints one; the workflow passes it as RUN_PROGRESS_TOKEN).
     function stubReviewFixEnvelope() {
       vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig(makeReviewFixRunConfig(REVIEW_FIX_IDENTITY)));
+      vi.stubEnv("RUN_PROGRESS_TOKEN", "pilot-progress");
     }
 
     it("attaches the full reviewFix result marker on success, reporting the actual published commit (not GITHUB_SHA)", async () => {
@@ -969,7 +968,7 @@ describe("runAutonomous", () => {
       vi.stubEnv("GITHUB_SHA", "0".repeat(40));
 
       const publishedCommit = "b".repeat(40);
-      const fake = fakeFetch({ [RESULT]: pilotResultStored });
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: pilotResultStored });
       const { pipeline, runner } = makeStepsPipeline([
         ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha: publishedCommit })) }],
@@ -987,6 +986,7 @@ describe("runAutonomous", () => {
 
       expect(result.exitCode).toBe(0);
       expect(fake.calls.map((call) => `${call.method} ${call.url.href}`)).toEqual([
+        "GET https://orchestrator.example/runner/planning-context",
         "POST https://orchestrator.example/runner/result",
       ]);
       const body = resultBody(fake) as { outcome: string; reviewFix?: Record<string, unknown> };
@@ -1007,7 +1007,6 @@ describe("runAutonomous", () => {
     it("forwards this run's declared cycle summaries alongside an attached reviewFix marker (AII-801)", async () => {
       stubReviewFixEnvelope();
       vi.stubEnv("RUN_TOKEN", "run-token");
-      vi.stubEnv("RUN_PROGRESS_TOKEN", "pilot-progress");
       vi.stubEnv("GITHUB_RUN_ID", "999888");
       vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
 
@@ -1059,14 +1058,15 @@ describe("runAutonomous", () => {
     it("delivers a failed cycle before no-output pilot result is skipped", async () => {
       stubReviewFixEnvelope();
       vi.stubEnv("RUN_TOKEN", "run-token");
-      vi.stubEnv("RUN_PROGRESS_TOKEN", "pilot-progress");
       vi.stubEnv("GITHUB_RUN_ID", "42");
       vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+      // The cycle feedback-loop writes when the provider stays unavailable through review (feedback-loop.ts);
+      // the push then fails before it publishes anything.
       const summary: CycleSummary = {
         id: "feedback-loop.1", stage: "feedback-loop", cycle: 1,
-        inputCommit: "a".repeat(40), outputCommit: null, outputCommitStatus: "not_applicable",
+        inputCommit: "a".repeat(40), outputCommit: null, outputCommitStatus: "pending_push",
         dispositions: [], tests: [{ name: "npm test", status: "failed" }],
-        verdict: { approved: null, reason: "fix_failed" },
+        verdict: { approved: null, reason: "provider_unavailable", summary: "Model provider was unavailable during review after 2 attempt(s)." },
         usage: { tokensIn: 1, tokensOut: 1, costUsd: null },
         truncated: false, limitReached: false, completedAt: 1_700_000_000_000,
       };
@@ -1074,7 +1074,8 @@ describe("runAutonomous", () => {
       writeFileSync(join(workspaceDir, CYCLE_SUMMARY_FILE), `${JSON.stringify(summary)}\n`);
       const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [CYCLE_SUMMARY]: cycleSummaryRecorded });
       const { pipeline, runner } = makeStepsPipeline([
-        ["setup", { run: vi.fn().mockRejectedValue(new Error("setup exploded before push ran")) }],
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ terminationReason: "provider_unavailable" })) }],
+        ["push", { run: vi.fn().mockRejectedValue(new Error("push failed before publishing")) }],
       ]);
       await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(),
         llmExecutor: makeExecutor(), fetchImpl: fake.fetch, ghSpawn: noReviewThreads });
@@ -1089,7 +1090,7 @@ describe("runAutonomous", () => {
       vi.stubEnv("GITHUB_RUN_ID", "999888");
       vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
 
-      const fake = fakeFetch({ [RESULT]: pilotResultStored });
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: pilotResultStored });
       const { pipeline, runner } = makeStepsPipeline([
         ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
@@ -1117,7 +1118,7 @@ describe("runAutonomous", () => {
       vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
       const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
-      const fake = fakeFetch({});
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext });
       const pushRun = vi.fn().mockResolvedValue(updatedPr(42));
       // The default pipeline's push skip (pipeline-loader.ts): an unapproved gap-fill pushes nothing.
       const pipeline: PipelineDefinition = {
@@ -1150,7 +1151,7 @@ describe("runAutonomous", () => {
 
       expect(result.exitCode).toBe(0);
       expect(pushRun).not.toHaveBeenCalled();
-      expect(fake.calls).toEqual([]);
+      expect(routesRequested(fake)).toEqual([PLANNING_CONTEXT]);
       expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("pilot result delivery skipped"));
       expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("attempt-1"));
       errSpy.mockRestore();
@@ -1163,7 +1164,7 @@ describe("runAutonomous", () => {
       vi.stubEnv("GITHUB_RUN_ATTEMPT", "");
       const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
-      const fake = fakeFetch({});
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext });
       const { pipeline, runner } = makeStepsPipeline([
         ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
@@ -1180,7 +1181,7 @@ describe("runAutonomous", () => {
       });
 
       expect(result.exitCode).toBe(0);
-      expect(fake.calls).toEqual([]);
+      expect(routesRequested(fake)).toEqual([PLANNING_CONTEXT]);
       expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("pilot result delivery skipped"));
       errSpy.mockRestore();
     });
@@ -1192,7 +1193,7 @@ describe("runAutonomous", () => {
       vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
       const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
-      const fake = fakeFetch({});
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext });
       const { pipeline, runner } = makeStepsPipeline([
         ["setup", { run: vi.fn().mockRejectedValue(new Error("setup exploded before push ran")) }],
       ]);
@@ -1208,7 +1209,7 @@ describe("runAutonomous", () => {
       });
 
       expect(result.exitCode).toBe(1);
-      expect(fake.calls).toEqual([]);
+      expect(routesRequested(fake)).toEqual([PLANNING_CONTEXT]);
       expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("pilot result delivery skipped"));
       errSpy.mockRestore();
     });
@@ -1220,7 +1221,7 @@ describe("runAutonomous", () => {
       vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
 
       const publishedCommit = "d".repeat(40);
-      const fake = fakeFetch({ [RESULT]: pilotResultStored });
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: pilotResultStored });
       // verify runs after push on an approved run; post-push review never runs on a gap-fill.
       const { pipeline, runner } = makeStepsPipeline([
         ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
@@ -1254,7 +1255,7 @@ describe("runAutonomous", () => {
       vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
 
       const publishedCommit = "f".repeat(40);
-      const fake = fakeFetch({ [RESULT]: pilotResultStored });
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: pilotResultStored });
       const { pipeline, runner } = makeStepsPipeline([
         ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci" }) }],
         ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
@@ -1273,7 +1274,7 @@ describe("runAutonomous", () => {
       });
 
       expect(result.exitCode).toBe(0);
-      expect(routesRequested(fake)).toEqual([RESULT]);
+      expect(routesRequested(fake)).toEqual([PLANNING_CONTEXT, RESULT]);
       const body = resultBody(fake);
       expect(body).toMatchObject({
         outcome: "failure",
@@ -1555,7 +1556,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: missingPrUrlRejected });
     const { pipeline, runner } = makeStepsPipeline([
       ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
       ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
@@ -1867,6 +1868,8 @@ describe("runAutonomous", () => {
 
   it("the default dirty gap-fill existing-PR pipeline reports REVIEW_UNAPPROVED instead of success", async () => {
     vi.stubEnv("PR_NUMBER", "42");
+    // A gap-fill run checks out its PR's branch, which the clone reports back unchanged.
+    vi.stubEnv("GITHUB_DEFAULT_BRANCH", "ai-implement/aii-1-test-issue");
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
@@ -1879,7 +1882,7 @@ describe("runAutonomous", () => {
           repoOwner: "acme",
           repoRepo: "app",
           githubToken: "ghs_test",
-          branch: "ai-implement/pr-42",
+          branch: "ai-implement/aii-1-test-issue",
           clonedRef: "base-sha",
         }),
       })
@@ -2431,15 +2434,8 @@ describe("runAutonomous", () => {
   });
 
   it("uses the reviewer-specific exhausted turn cap in the ticket comment and autopsy", async () => {
-    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
-    vi.stubEnv(
-      "AI_IMPLEMENT_RUN_CONFIG",
-      encodeRunConfig({
-        v: 1,
-        issue: { id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" },
-      }),
-    );
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", implEnvelope({ runnerCallbackUrl: "https://orchestrator.example" }));
 
     const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
@@ -2627,7 +2623,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: missingPrUrlRejected });
     const { pipeline, runner } = makeStepsPipeline([
       [
         "feedback-loop",
