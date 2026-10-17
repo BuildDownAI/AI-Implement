@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { LinearProvider } from "../../providers/linear.js";
-import { MissingProviderConfigError, type TicketingProvider } from "../../providers/types.js";
+import { MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
+import type { RepoMapping } from "../../config.js";
+import { fetchTrackerIssuesPage } from "../../runner-callback.js";
 import {
   configureLinearAuth,
   __setLinearTokenForTest,
@@ -1222,5 +1224,66 @@ describe("LinearProvider.findByKey", () => {
       id: "issue-uuid", identifier: "ENG-1", title: "Hello", description: "World",
       scopeKey: "ENG", nativeStatus: "Todo (unstarted)",
     });
+  });
+});
+
+describe("LinearProvider.listIssuesPage", () => {
+  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  const mapping = { teamKey: "ENG", owner: "o", repo: "r" } as unknown as RepoMapping;
+  const recorded = {
+    data: {
+      issues: {
+        nodes: [{
+          id: "u1", identifier: "ENG-1", title: "T", description: "D", branchName: "eng-1",
+          state: { name: "Todo", type: "unstarted" }, labels: { nodes: [{ name: "AI-Implement" }] },
+          project: { name: "P" }, parent: { identifier: "ENG-0" },
+          comments: { nodes: [{ body: "hi", user: { name: "A" }, createdAt: "2026-01-01T00:00:00Z" }] },
+          relations: { nodes: [{ type: "blocks", relatedIssue: { identifier: "ENG-2" } }] },
+        }],
+        pageInfo: { hasNextPage: true, endCursor: "cur" },
+      },
+    },
+  };
+  const ok = (json: unknown) => ({ ok: true, json: async () => json }) as Response;
+
+  it("returns the records fetchTrackerIssuesPage returns for the same response", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(ok(recorded)).mockResolvedValueOnce(ok(recorded));
+    const result = await new LinearProvider({}).listIssuesPage(mapping, null);
+    const legacy = await fetchTrackerIssuesPage("ENG", null);
+    expect(legacy.status).toBe(200);
+    expect(result).toEqual(legacy.body);
+    expect(result.issues[0]).not.toHaveProperty("sourceSystem");
+    expect(result.issues[0]).not.toHaveProperty("team");
+  });
+
+  it("sends first 50 and the cursor", async () => {
+    vi.mocked(fetch).mockResolvedValue(ok(recorded));
+    const p = new LinearProvider({});
+    await p.listIssuesPage(mapping, null);
+    await p.listIssuesPage(mapping, "cur");
+    const vars = vi.mocked(fetch).mock.calls.map((c) => JSON.parse((c[1] as RequestInit).body as string).variables);
+    expect(vars).toEqual([
+      { teamKey: "ENG", first: 50, after: null },
+      { teamKey: "ENG", first: 50, after: "cur" },
+    ]);
+  });
+
+  it("throws on a non-OK response", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 500, statusText: "x", text: async () => "" } as Response);
+    await expect(new LinearProvider({}).listIssuesPage(mapping, null)).rejects.toThrow(/Linear API error/);
+  });
+
+  it("throws on GraphQL errors instead of returning an empty page", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(ok({ errors: [{ message: "bad" }] }));
+    await expect(new LinearProvider({}).listIssuesPage(mapping, null)).rejects.toThrow(/GraphQL error/);
+  });
+
+  it("throws TrackerUnavailableError without calling fetch when auth is unconfigured", async () => {
+    const p = new LinearProvider({});
+    __resetLinearAuthForTest();
+    await expect(p.listIssuesPage(mapping, null)).rejects.toBeInstanceOf(TrackerUnavailableError);
+    expect(fetch).not.toHaveBeenCalled();
   });
 });

@@ -1,4 +1,5 @@
 import type { FeatureBranchMode } from "../pipeline/branch-name.js";
+import type { RepoMapping } from "../config.js";
 
 /** One rung of a feature-branch grouping chain → branch `ai-implement/<mode>/<identifier>`. */
 export interface FeatureBranchChainEntry {
@@ -91,6 +92,38 @@ export interface FeatureNodeRollUp {
   childIdentifiers: string[];
 }
 
+/** One issue as the knowledge-graph tracker export carries it: Linear field names, plus the two fields `TrackerExport` stamps. */
+export interface TrackerIssueRecord {
+  id: string;
+  identifier: string;
+  title: string;
+  description: string | null;
+  branchName?: string | null;
+  state: { name: string; type: string } | null;
+  labels: { nodes: Array<{ name: string }> };
+  project: { name: string } | null;
+  parent: { identifier: string } | null;
+  comments: { nodes: Array<{ body: string; user: { name: string } | null; createdAt: string }> };
+  relations: { nodes: Array<{ type: string; relatedIssue: { identifier: string } }> };
+  /** The provider's `id`. Set by the `TrackerExport` handler, never by a provider. */
+  sourceSystem?: string;
+  /** The mapping key. Set by the `TrackerExport` handler, never by a provider. */
+  team?: string;
+}
+
+export interface TrackerIssuePage {
+  issues: TrackerIssueRecord[];
+  pageInfo: { hasNextPage: boolean; endCursor: string | null };
+}
+
+/** The tracker cannot be read and a retry will not help (a missing credential). `TrackerExport` answers it as terminal `tracker-unavailable`. */
+export class TrackerUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TrackerUnavailableError";
+  }
+}
+
 export type IssueLifecycleState = "active" | "completed" | "cancelled";
 
 export type ProviderId = "linear" | "jira" | (string & {});
@@ -147,6 +180,9 @@ export interface TicketingProvider {
   /** Look up an issue by its human-readable identifier (e.g. "ENG-123", "PROJ-456").
    *  Returns null if not found. */
   findByKey(key: string): Promise<TicketIssue | null>;
+
+  /** One page of the mapping's issues for the knowledge-graph export. Optional so a fork's custom provider factory still compiles. Throws `TrackerUnavailableError` when the credential is missing; any other throw is retried. Does not set `sourceSystem` or `team`. */
+  listIssuesPage?(mapping: RepoMapping, cursor: string | null): Promise<TrackerIssuePage>;
 }
 
 /** Configuration handed to provider factories. */
