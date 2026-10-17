@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { createTrackerExportIngressClient } from "../restate/tracker-export.js";
+import { createProductionTrackerExportServices, createTrackerExportIngressClient } from "../restate/tracker-export.js";
 
 const INPUT = { team: "ENG", cursor: null };
 const PAGE = { issues: [], pageInfo: { hasNextPage: false, endCursor: null } };
@@ -31,5 +31,12 @@ describe("createTrackerExportIngressClient", () => {
   it("maps an unrelated HTTP error to unavailable", async () => {
     const client = createTrackerExportIngressClient("http://restate.test", { fetchImpl: respond(500, { message: "boom" }) });
     expect(await client.page(INPUT)).toEqual({ ok: false, code: "unavailable" });
+  });
+});
+
+describe("createProductionTrackerExportServices", () => {
+  it("returns the TrackerExport service the boot list registers", () => {
+    const { services } = createProductionTrackerExportServices();
+    expect(services.map((service) => service.name)).toEqual(["TrackerExport"]);
   });
 });

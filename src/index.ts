@@ -168,6 +168,7 @@ import { setKgRefreshToolDeps } from "./restate/tools.js";
 import { checkPipelineSchedules } from "./restate/pipeline-schedule.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { resolveReviewProcess } from "./review-process.js";
+import { createProductionTrackerExportServices, createTrackerExportIngressClient } from "./restate/tracker-export.js";
 import { createLateExternalReviewIngressClient, createLateExternalReviewSubmitHook, createProductionLateExternalReviewServices } from "./restate/late-external-review.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
 import type { RestateRegistrationStatus } from "./restate/status.js";
@@ -4352,6 +4353,7 @@ async function handleKgRefreshOutcome(
 
 const reviewFixAttemptStore = new SqliteReviewFixAttemptStore();
 const kgRefreshIngressClient = createKgRefreshIngressClient();
+const trackerExportClient = createTrackerExportIngressClient();
 // AII-1227: starts LateExternalReview only while the sidecar is ready and the endpoint registered.
 function restateReady(): boolean {
   const restate = getRestateStatus();
@@ -4706,6 +4708,7 @@ function startServer(
           cursor,
           teamKey,
           getMappings,
+          trackerExport: trackerExportClient,
         });
         res.writeHead(result.status, { "Content-Type": "application/json" });
         res.end(JSON.stringify(result.body));
@@ -5167,7 +5170,7 @@ function startServer(
           return { started: getPollStats().pollCount > before };
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, getRestateStatus,
+      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, getRestateStatus,
         retention: {
           getRestateDays: getRestateRetentionDays,
           setRestateDays: setRestateRetentionDays,
@@ -5505,12 +5508,13 @@ async function main(): Promise<void> {
     sessionDeps: { dispatchSession, isDefinitiveFlyRejectionError, isDefinitiveLocalDockerLaunchFailure, shouldReleaseAdmissionOnDispatchError },
   }).services;
   const lateExternalReviewServices = createProductionLateExternalReviewServices(config).services;
+  const trackerExportServices = createProductionTrackerExportServices().services;
   const bootReconciliation = createBootReconciliation(
     () => startupReconciliation(config, registry),
     () => getRunnerBackendSource(),
   );
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
-    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...lateExternalReviewServices], restateSidecar.identityKey),
+    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...lateExternalReviewServices, ...trackerExportServices], restateSidecar.identityKey),
     registerRestateEndpoint,
     onRegistered: async () => {
       sweepOnRegistered(config);

@@ -2,7 +2,6 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { LinearProvider } from "../../providers/linear.js";
 import { MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
 import type { RepoMapping } from "../../config.js";
-import { fetchTrackerIssuesPage } from "../../runner-callback.js";
 import {
   configureLinearAuth,
   __setLinearTokenForTest,
@@ -1248,12 +1247,9 @@ describe("LinearProvider.listIssuesPage", () => {
   };
   const ok = (json: unknown) => ({ ok: true, json: async () => json }) as Response;
 
-  it("returns the records fetchTrackerIssuesPage returns for the same response", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(ok(recorded)).mockResolvedValueOnce(ok(recorded));
+  it("does not stamp sourceSystem or team on the records", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(ok(recorded));
     const result = await new LinearProvider({}).listIssuesPage(mapping, null);
-    const legacy = await fetchTrackerIssuesPage("ENG", null);
-    expect(legacy.status).toBe(200);
-    expect(result).toEqual(legacy.body);
     expect(result.issues[0]).not.toHaveProperty("sourceSystem");
     expect(result.issues[0]).not.toHaveProperty("team");
   });

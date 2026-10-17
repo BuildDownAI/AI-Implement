@@ -35,7 +35,7 @@ A zero-issue page is a normal answer.
 ## Consequences
 
 - Journal size: one page is up to 50 issues with up to 100 comments each, journaled whole by `ctx.run`. The page size is fixed at 50; this ADR does not record a measured size.
-- Nothing calls the service yet and it is not registered at boot; the wiring issue does both with its first caller. `fetchTrackerIssuesPage` stays until then.
+- The service is registered at boot and both KG tracker-data routes call it (AII-1463); `fetchTrackerIssuesPage` is deleted, so there is no second Linear read path.
 
 ## Alternatives considered
 
