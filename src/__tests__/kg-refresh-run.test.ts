@@ -6,6 +6,7 @@ import { EventEmitter } from "node:events";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
+import { parseDocument } from "yaml";
 import { encodeRunConfig, decodeRunConfig } from "../run-config.js";
 import { buildEnvelopeDispatchInputs } from "../github.js";
 import type { RepoMapping } from "../config.js";
@@ -1800,9 +1801,181 @@ describe("kgScopeReconcileStep", () => {
     }
     expect(result!.addedRepoSlugs).toEqual(["Acme/docs"]);
     expect(readSources()).not.toContain("knowledge-graph-app");
+    expect(parseDocument(readSources()).errors).toHaveLength(0);
     expect(printed).toContain("skipping acme/knowledge-graph-app: it is this KG repo");
     // The self repo's team is still a valid tracker to add.
     expect(result!.addedTeamNames).toEqual(["KGA", "DOC"]);
+  });
+
+  const SCOPE_MAPPINGS: ScopeMapping[] = [
+    { teamKey: "T0", repo: "org/r0", defaultBranch: "main", ticketingProvider: "linear" },
+    { teamKey: "T1", repo: "org/r1", defaultBranch: "dev", ticketingProvider: "linear" },
+    { teamKey: "T2", repo: "org/r2", defaultBranch: "main", ticketingProvider: "linear" },
+  ];
+
+  function templateManifest(trackersEmpty: string, reposEmpty: string): string {
+    return [
+      "# Knowledge graph sources",
+      "# Edit with care.",
+      "namespace: https://example.org/kg/",
+      "code_repo:",
+      "  slug: org/code",
+      "  path: .",
+      `trackers:${trackersEmpty}`,
+      "#  - kind: linear",
+      "#    team: ABC",
+      "self_ingest: false",
+      `secondary_repos:${reposEmpty}`,
+      "#  - slug: owner/repo",
+      "#    branch: main",
+      "",
+    ].join("\n");
+  }
+
+  async function runScope(
+    mappings: ScopeMapping[],
+    writeFileSyncImpl?: (path: string, data: string) => void,
+  ): Promise<Record<string, unknown>> {
+    return (await kgScopeReconcileStep.run(
+      makeContext(),
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl: makeMappingFetch(mappings), writeFileSyncImpl },
+      noopReporter,
+    )) as unknown as Record<string, unknown>;
+  }
+
+  function expectScopeWritten(out: string, before: string): void {
+    const doc = parseDocument(out);
+    expect(doc.errors).toHaveLength(0);
+    const json = doc.toJS() as { trackers: Array<{ team: string }>; secondary_repos: Array<{ slug: string }> };
+    expect(json.trackers.map((t) => t.team)).toEqual(["T0", "T1", "T2"]);
+    expect(json.secondary_repos.map((r) => r.slug)).toEqual(["org/r0", "org/r1", "org/r2"]);
+    const comments = (s: string) => s.split("\n").filter((l) => l.startsWith("#"));
+    expect(comments(out)).toEqual(comments(before));
+  }
+
+  for (const [label, empty] of [["flow-empty `[]`", " []"], ["block-empty", ""]] as const) {
+    it(`fills template ${label} trackers and secondary_repos so the file parses`, async () => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      try {
+        const before = templateManifest(empty, empty);
+        writeSources(before);
+        await runScope(SCOPE_MAPPINGS);
+        const out = readSources();
+        expectScopeWritten(out, before);
+        expect(out).toContain(
+          "trackers:\n  - kind: linear\n    team: T0\n    tier: secondary\n  - kind: linear\n    team: T1\n" +
+            "    tier: secondary\n  - kind: linear\n    team: T2\n    tier: secondary\n#  - kind: linear\n",
+        );
+        expect(out).toContain("self_ingest: false\nsecondary_repos:\n  - slug: org/r0\n");
+      } finally {
+        vi.restoreAllMocks();
+      }
+    });
+  }
+
+  it("keeps unchanged lines byte-for-byte when both keys have entries and other values are empty", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const before = [
+        "# header",
+        "code_repo:",
+        "  slug: org/code",
+        "extra: []",
+        "empty_block:",
+        "trackers:",
+        "    - kind: linear   # keep alignment",
+        "      team: T0",
+        "self_ingest: false",
+        "secondary_repos:",
+        "    - slug: org/r0    # trailing",
+        "      branch: main",
+        "# footer",
+        "",
+      ].join("\n");
+      writeSources(before);
+      await runScope(SCOPE_MAPPINGS);
+      const out = readSources();
+      const doc = parseDocument(out);
+      expect(doc.errors).toHaveLength(0);
+      const json = doc.toJS() as { trackers: Array<{ team: string }>; secondary_repos: Array<{ slug: string }> };
+      expect(json.trackers.map((t) => t.team)).toEqual(["T0", "T1", "T2"]);
+      expect(json.secondary_repos.map((r) => r.slug)).toEqual(["org/r0", "org/r1", "org/r2"]);
+      const beforeLines = before.split("\n");
+      const outLines = out.split("\n");
+      // Every original line survives in order; only new entries are interleaved.
+      let i = 0;
+      for (const line of outLines) if (line === beforeLines[i]) i++;
+      expect(i).toBe(beforeLines.length);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("adds only repos and leaves a bare `trackers:` alone when no team needs adding", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      writeSources(templateManifest("", " []"));
+      await runScope(SCOPE_MAPPINGS.map((m) => ({ ...m, teamKey: "" })));
+      const out = readSources();
+      const doc = parseDocument(out);
+      expect(doc.errors).toHaveLength(0);
+      const json = doc.toJS() as { secondary_repos: Array<{ slug: string }> };
+      expect(json.secondary_repos.map((r) => r.slug)).toEqual(["org/r0", "org/r1", "org/r2"]);
+      expect(out).toContain("trackers:\n#  - kind: linear\n");
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("moves a same-line comment after `[]` onto its own line instead of the last entry", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      writeSources(templateManifest(" []  # pending", " []"));
+      await runScope(SCOPE_MAPPINGS);
+      const out = readSources();
+      expect(parseDocument(out).errors).toHaveLength(0);
+      expect(out).toContain("    team: T2\n    tier: secondary\n  # pending\n");
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("is idempotent: a second run on its own output logs 'scope in sync' and writes nothing", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      writeSources(templateManifest(" []", " []"));
+      await runScope(SCOPE_MAPPINGS);
+      const first = readSources();
+      logSpy.mockClear();
+      const writeSpy = vi.fn();
+      await runScope(SCOPE_MAPPINGS, writeSpy);
+      expect(logSpy).toHaveBeenCalledWith("[kg-scope-reconcile] scope in sync");
+      expect(writeSpy).not.toHaveBeenCalled();
+      expect(readSources()).toBe(first);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("throws, logs the generated text, and does not write when the output fails the parse check", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      // A scalar `trackers` is skipped by the splice, so the team additions never land.
+      const before = "code_repo:\n  slug: org/code\ntrackers: nope\n";
+      writeSources(before);
+      const writeSpy = vi.fn();
+      await expect(runScope(SCOPE_MAPPINGS, writeSpy)).rejects.toThrow(/kg-scope-reconcile/);
+      expect(writeSpy).not.toHaveBeenCalled();
+      const logged = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(logged).toContain("[kg-scope-reconcile]");
+      expect(logged).toContain("trackers: nope");
+      expect(warnSpy).toHaveBeenCalled();
+      expect(readSources()).toBe(before);
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 
   it("returns zero outputs and skips the fetch when RUN_PROGRESS_TOKEN is absent", async () => {
