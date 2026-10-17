@@ -371,20 +371,104 @@ describe("postRunnerResult", () => {
     expect(body).not.toHaveProperty("reviewFix");
   });
 
-  it("does not retry a legacy (no reviewFix) call on a transient 503 — single-attempt behavior is unchanged (AII-794)", async () => {
-    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const fetchImpl = vi.fn().mockResolvedValue({ ok: false, status: 503, text: async () => "unavailable" });
+  describe("legacy bounded retry (AII-859)", () => {
+    const base = { workspaceDir: "/tmp", phase: "implementation" as const, outcome: "failure" as const, callbackUrl: "https://cb" };
+    const resp = (status: number, text = "") => ({ ok: status < 400, status, text: async () => text });
 
-    await postRunnerResult({
-      workspaceDir: "/tmp",
-      phase: "implementation",
-      outcome: "failure",
-      callbackUrl: "https://cb",
-      fetchImpl,
+    it.each([
+      ["transport error", () => Promise.reject(new Error("ECONNREFUSED"))],
+      ["429", () => Promise.resolve(resp(429))],
+      ["503", () => Promise.resolve(resp(503))],
+    ])("retries after %s with backoff and resends an identical body", async (_n, first) => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const fetchImpl = vi.fn().mockImplementationOnce(first).mockResolvedValue(resp(200));
+      const sleepImpl = vi.fn().mockResolvedValue(undefined);
+
+      await postRunnerResult({ ...base, fetchImpl, sleepImpl, now: () => 0 });
+
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+      expect(sleepImpl).toHaveBeenCalledOnce();
+      expect(fetchImpl.mock.calls[0][1].body).toBe(fetchImpl.mock.calls[1][1].body);
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("POST ok"));
     });
 
-    expect(fetchImpl).toHaveBeenCalledOnce();
-    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("POST failed HTTP 503"));
+    it("treats 409 already_consumed on a retry as delivered", async () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const fetchImpl = vi
+        .fn()
+        .mockResolvedValueOnce(resp(503))
+        .mockResolvedValueOnce(resp(409, '{"error":"already_consumed"}'));
+      await postRunnerResult({ ...base, fetchImpl, sleepImpl: async () => {}, now: () => 0 });
+
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("POST delivered"));
+      expect(errSpy).not.toHaveBeenCalled();
+    });
+
+    it("keeps a first-attempt 409 already_consumed a failure", async () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const fetchImpl = vi.fn().mockResolvedValue(resp(409, '{"error":"already_consumed"}'));
+      await postRunnerResult({ ...base, fetchImpl, sleepImpl: async () => {}, now: () => 0 });
+
+      expect(fetchImpl).toHaveBeenCalledOnce();
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("POST failed HTTP 409"));
+      expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("delivered"));
+    });
+
+    it.each([
+      [400, ""],
+      [401, ""],
+      [403, ""],
+      [404, ""],
+      [409, '{"error":"conflicting_report"}'],
+    ])("does not retry HTTP %i", async (status, text) => {
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const fetchImpl = vi.fn().mockResolvedValue(resp(status, text));
+      const sleepImpl = vi.fn();
+      await postRunnerResult({ ...base, fetchImpl, sleepImpl, now: () => 0 });
+
+      expect(fetchImpl).toHaveBeenCalledOnce();
+      expect(sleepImpl).not.toHaveBeenCalled();
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining(`POST failed HTTP ${status}`));
+    });
+
+    it("does not count a non-already_consumed 409 on a retry as delivered", async () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const fetchImpl = vi
+        .fn()
+        .mockResolvedValueOnce(resp(503))
+        .mockResolvedValueOnce(resp(409, '{"error":"conflicting_report"}'));
+      await postRunnerResult({ ...base, fetchImpl, sleepImpl: async () => {}, now: () => 0 });
+
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+      expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("delivered"));
+    });
+
+    it("gives up with a no-result line after the attempt cap", async () => {
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const fetchImpl = vi.fn().mockResolvedValue(resp(503));
+      await postRunnerResult({ ...base, fetchImpl, sleepImpl: async () => {}, now: () => 0 });
+
+      expect(fetchImpl).toHaveBeenCalledTimes(8);
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("POST no-result"));
+    });
+
+    it("gives up when the time budget is exhausted", async () => {
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      let t = 0;
+      const fetchImpl = vi.fn().mockResolvedValue(resp(503));
+      const sleepImpl = vi.fn(async (ms: number) => {
+        t += ms + 10 * 60_000;
+      });
+      await postRunnerResult({ ...base, fetchImpl, sleepImpl, now: () => t });
+
+      expect(fetchImpl.mock.calls.length).toBeLessThan(8);
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("POST no-result"));
+    });
   });
 
   describe("pilot bounded retry/backoff (AII-794)", () => {
