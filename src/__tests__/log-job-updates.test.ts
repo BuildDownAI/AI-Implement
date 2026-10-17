@@ -52,6 +52,14 @@ describe("updateJobStatus CASE guard — runner_approved conclusion survives mon
     expect(job?.conclusion).toBe("operator_cancelled");
   });
 
+  it("preserves external_review_pending against monitor writes (AII-1304)", () => {
+    const id = log.appendLog({ issueId: "i-pend", executionMode: "github-actions" });
+    log.updateJobStatus(id, "completed", "external_review_pending", "https://github.com/o/r/pull/11");
+    log.updateJobStatus(id, "failed", "failure", null);
+    log.updateJobStatus(id, "completed", "success", null);
+    expect(log.getJobById(id)?.conclusion).toBe("external_review_pending");
+  });
+
   it("updates conclusion when not in the protected set", () => {
     const id = log.appendLog({ issueId: "i-plain", executionMode: "github-actions" });
     log.updateJobStatus(id, "completed", "success", null);
@@ -390,5 +398,32 @@ describe("listLog strips evidence tails", () => {
     // The single-job read keeps the full record, untouched.
     expect(log.getJobById(id)?.failure?.evidence.truncated).toBe(false);
     expect(log.getJobById(id)?.failure?.evidence.stdoutTail).toBe("full tail, not actually truncated");
+  });
+});
+
+describe("late_review_pending outbox (AII-1362)", () => {
+  const rows = () => dedup.getDb().prepare("SELECT * FROM late_review_pending").all() as Array<Record<string, unknown>>;
+
+  it("moves attempt_review_pending rows at every boot without overwriting", () => {
+    const db = dedup.getDb();
+    const ins = db.prepare("INSERT INTO attempt_review_pending (attempt_id, dispatch_id, pr_url, created_at) VALUES (?, ?, ?, ?)");
+    ins.run("a", "d", "https://github.com/o/r/pull/1", 1234);
+    log.initLogTable();
+    expect(rows()).toEqual([{ workflow_key: "d-a", dispatch_id: "d", pr_url: "https://github.com/o/r/pull/1", head_sha: null, attempt_id: "a", created_at: 1234 }]);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM attempt_review_pending").get()).toEqual({ n: 0 });
+    ins.run("a", "d", "https://github.com/o/r/pull/1", 9999);
+    log.initLogTable();
+    expect(rows()).toHaveLength(1);
+    expect(rows()[0]!.created_at).toBe(1234);
+  });
+
+  it("is idempotent per key, drops rows older than the window and clears by key", () => {
+    log.recordPendingLateReview({ workflowKey: "k", dispatchId: "k", prUrl: "u", headSha: "s" }, 100);
+    log.recordPendingLateReview({ workflowKey: "k", dispatchId: "k", prUrl: "u", headSha: "s" }, 500);
+    log.recordPendingLateReview({ workflowKey: "old", dispatchId: "old", prUrl: "u" }, 10);
+    expect(log.getPendingLateReviews(50)).toEqual([{ workflowKey: "k", dispatchId: "k", prUrl: "u", headSha: "s", attemptId: null }]);
+    expect(rows()).toHaveLength(1);
+    log.clearPendingLateReview("k");
+    expect(rows()).toEqual([]);
   });
 });

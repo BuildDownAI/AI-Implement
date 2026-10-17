@@ -37,7 +37,7 @@ export interface MintOutput {
 export type VerifyResult =
   | { ok: true; claims: RunTokenClaims; mappingTeamKey: string; consumedAt: number | null }
   // Claims on a refusal so it can be attributed to a dispatch; absent when the payload was never trustworthy.
-  | { ok: false; reason: "malformed" | "bad_signature" | "expired" | "already_consumed" | "wrong_audience" | "wrong_scope" | "revoked"; claims?: RunTokenClaims };
+  | { ok: false; reason: "malformed" | "missing_row" | "bad_signature" | "expired" | "already_consumed" | "wrong_audience" | "wrong_scope" | "revoked"; claims?: RunTokenClaims };
 
 export const PLANNING_TTL_SECONDS = 30 * 60;
 export const IMPLEMENTATION_TTL_SECONDS = 2 * 60 * 60;
@@ -92,6 +92,38 @@ export function mintRunToken(input: MintInput): MintOutput {
   return { token, dispatchId };
 }
 
+/** The run tokens each run kind gets, on every backend. */
+export const LAUNCH_TOKEN_AUDIENCES: Record<RunTokenClaims["phase"], readonly RunTokenAudience[]> = {
+  implementation: ["result", "progress", "publication"],
+  "gap-analysis": ["result", "progress", "publication"],
+  // Planning never pushes, and the vending route refuses a planning publication token.
+  planning: ["result", "progress"],
+  "kg-refresh": ["result", "progress", "publication"],
+};
+
+export interface LaunchTokens {
+  runToken: string;
+  runProgressToken: string;
+  runPublicationToken?: string;
+}
+
+/** Mints every token LAUNCH_TOKEN_AUDIENCES names for `phase`, after it deletes the unconsumed
+ *  rows of `dispatchId`, so a retried launch step can mint again. */
+export function mintLaunchTokens(input: Omit<MintInput, "audience"> & { repository: string }): LaunchTokens {
+  const dispatchId = input.dispatchId ?? crypto.randomUUID();
+  const audiences = LAUNCH_TOKEN_AUDIENCES[input.phase];
+  const base = { ...input, dispatchId };
+  return getDb().transaction((): LaunchTokens => {
+    getDb().prepare("DELETE FROM runner_tokens WHERE dispatch_id = ? AND consumed_at IS NULL").run(dispatchId);
+    const mint = (audience: RunTokenAudience) => mintRunToken({ ...base, audience }).token;
+    return {
+      runToken: mint("result"),
+      runProgressToken: mint("progress"),
+      ...(audiences.includes("publication") ? { runPublicationToken: mint("publication") } : {}),
+    };
+  })();
+}
+
 // Token verification is intentionally DB-only (runner_tokens table) — no in-memory state
 // is consulted. This means verification survives orchestrator restarts as long as the
 // SQLite volume persists across deploys.
@@ -119,8 +151,8 @@ function verifyTokenSignatureAndLoadClaims(token: string, secret: string): Verif
   const row = db
     .prepare("SELECT consumed_at, mapping_team_key FROM runner_tokens WHERE dispatch_id = ? AND audience = ?")
     .get(claims.dispatchId, claims.audience) as { consumed_at: number | null; mapping_team_key: string } | undefined;
-  // Reason stays "malformed" though the payload verified: callers map it to a status.
-  if (!row) return { ok: false, reason: "malformed", claims };
+  // Payload verified but the row is gone (e.g. retry deleted the issue's rows).
+  if (!row) return { ok: false, reason: "missing_row", claims };
 
   return { ok: true, claims, mappingTeamKey: row.mapping_team_key, consumedAt: row.consumed_at };
 }

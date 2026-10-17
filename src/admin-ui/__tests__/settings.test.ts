@@ -79,3 +79,64 @@ describe("linear pickup label card", () => {
     expect(body).not.toContain("getElementById('settings-error')");
   });
 });
+
+describe("runner image prefixes card", () => {
+  const fnBody = (name: string) => {
+    const from = settingsScript.slice(settingsScript.indexOf(`async function ${name}`));
+    return from.slice(0, from.indexOf("\n  }"));
+  };
+
+  it("declares the ids, placeholder and handlers, after the KG Refresh card", () => {
+    for (const id of [
+      "settings-runner-image-prefixes",
+      "settings-runner-image-prefixes-source",
+    ]) {
+      expect(settingsHtml).toContain(`id="${id}"`);
+    }
+    expect(settingsHtml).toContain('id="settings-runner-image-prefixes-error" class="error hidden"');
+    expect(settingsHtml).toContain('placeholder="ghcr.io/acme/"');
+    expect(settingsHtml).toContain('onclick="saveRunnerImagePrefixes()"');
+    expect(settingsHtml).toContain('onclick="clearRunnerImagePrefixes()"');
+    expect(settingsHtml.indexOf("Runner Image Prefixes")).toBeGreaterThan(settingsHtml.indexOf("KG Refresh"));
+  });
+
+  it("exposes both handlers on window", () => {
+    expect(settingsScript).toContain("window.saveRunnerImagePrefixes = saveRunnerImagePrefixes");
+    expect(settingsScript).toContain("window.clearRunnerImagePrefixes = clearRunnerImagePrefixes");
+  });
+
+  it("fills the input and source line from data.runnerImageAllowedPrefixes using textContent", () => {
+    expect(settingsScript).toContain("const prefixes = data.runnerImageAllowedPrefixes");
+    expect(settingsScript).toContain("getElementById('settings-runner-image-prefixes').value = prefixes.value || ''");
+    expect(settingsScript).toContain("getElementById('settings-runner-image-prefixes-source').textContent");
+    expect(settingsScript).toContain("'Built-in: ' + (prefixes.builtIn || []).join(', ')");
+    expect(settingsScript).toContain("|| 'none'");
+  });
+
+  it("saves the trimmed input or null, and clear posts null", () => {
+    expect(fnBody("saveRunnerImagePrefixes")).toContain(
+      "getElementById('settings-runner-image-prefixes').value.trim() || null",
+    );
+    expect(fnBody("clearRunnerImagePrefixes")).toContain("postRunnerImagePrefixes(null)");
+    expect(fnBody("postRunnerImagePrefixes")).toContain(
+      "JSON.stringify({ runnerImageAllowedPrefixes: val })",
+    );
+  });
+
+  it("shows a 400 error in its own error element and never uses innerHTML", () => {
+    const body = fnBody("postRunnerImagePrefixes");
+    expect(body).toContain("getElementById('settings-runner-image-prefixes-error')");
+    expect(body).toContain("errEl.textContent = data.error");
+    expect(body).not.toContain("getElementById('settings-error')");
+    expect(body).not.toContain("innerHTML");
+  });
+});
+
+describe("orchestrator agent defaults card", () => {
+  it("is declared with its own error element and no raw credential field", () => {
+    expect(settingsHtml).toContain('id="settings-agent-defaults-mode"');
+    expect(settingsHtml).toContain('id="settings-agent-defaults-error" class="error hidden"');
+    expect(settingsHtml).toContain("each project opts in separately");
+    expect(settingsHtml).toContain("Changes apply to the next run");
+  });
+});

@@ -2,8 +2,13 @@ import { describe, expect, it, vi } from "vitest";
 import {
   encodeRunConfig,
   decodeRunConfig,
+  decodeTrustedRunConfig,
+  encodeTrustedRunConfig,
+  diagnosticProjection,
+  validateRunCredentials,
   runConfigFromTaskDocument,
   buildImplRunConfig,
+  buildRunConfig,
   buildKgRefreshRunConfig,
   type RunConfigV1,
   type TaskDocumentParams,
@@ -62,6 +67,12 @@ describe("run-config envelope", () => {
     const decoded = decodeRunConfig(encodeRunConfig(big));
     expect(decoded.issue.description.length).toBeLessThanOrEqual(40_000 + 100);
     expect(decoded.issue.description).toContain("[truncated by ai-implement");
+  });
+
+  it("round-trips a description exactly at the envelope limit without truncation", () => {
+    const exact = "x".repeat(40_000);
+    const decoded = decodeRunConfig(encodeRunConfig({ ...full, issue: { ...full.issue, description: exact } }));
+    expect(decoded.issue.description).toBe(exact);
   });
 
   it("round-trips profiles", () => {
@@ -269,6 +280,90 @@ const implBaseIssue = {
   description: "Implement the feature",
 };
 
+describe("buildRunConfig", () => {
+  const fullMapping = makeMapping({
+    branchPrefix: "pr",
+    skillsRepo: "org/skills",
+    maxTurns: 50,
+    maxIterations: 3,
+    sensitiveAddPatterns: ["*.secrets.toml"],
+    sensitiveAllowPatterns: [".env"],
+    dependencyTokenScope: "installation",
+    referenceRepos: [{ repo: "org/ref", ref: "main" }] as RepoMapping["referenceRepos"],
+    reviewers: [{ id: "gap-analysis", gates: true }],
+    reviewProcess: "claude-code-review",
+    trustedReviewAuthors: ["octocat"],
+  });
+  const issue = { ...implBaseIssue, profiles: ["backend"], assigneeName: "Ada" };
+  const retryPolicy = { ...DEFAULT_RETRY_POLICY, stageRetries: 0 };
+  const reviewFix = {
+    version: 1 as const,
+    attemptId: "attempt-1",
+    installationId: 123,
+    repository: "acme/widgets",
+    prNumber: 42,
+    deadlineAt: Date.parse("2026-01-01T00:00:00.000Z"),
+  };
+  const build = (runnerPhase: RunConfigV1["runnerPhase"] & string, extra: Partial<Parameters<typeof buildRunConfig>[0]> = {}) =>
+    buildRunConfig({
+      runnerPhase,
+      issue,
+      mapping: fullMapping,
+      baseBranch: "develop",
+      runnerCallbackUrl: "https://orch.example/runner",
+      prNumber: "42",
+      commentInstruction: "do it",
+      planningContext: { parent: "p" },
+      groupingParent: true,
+      retryPolicy,
+      ...extra,
+    });
+  const common = [
+    "v", "issue", "runnerPhase", "baseBranch", "branchPrefix", "skillsRepo", "runnerCallbackUrl",
+    "maxTurns", "maxIterations", "prNumber", "commentInstruction", "sensitiveFiles", "reviewers",
+    "reviewProcess", "trustedReviewAuthors", "profiles", "assigneeName", "planningContext", "groupingParent",
+  ];
+
+  it.each([
+    ["implementation", [...common, "dependencyTokenScope", "referenceRepos", "retryPolicy"]],
+    ["gap-analysis", [...common, "dependencyTokenScope", "referenceRepos", "retryPolicy"]],
+    ["planning", common],
+  ] as const)("emits each conditional key once for %s", (phase, expected) => {
+    const cfg = build(phase);
+    const keys = Object.keys(cfg);
+    expect(new Set(keys).size).toBe(keys.length);
+    expect([...keys].sort()).toEqual([...expected].sort());
+    expect(cfg.retryPolicy).toEqual(phase === "planning" ? undefined : retryPolicy);
+  });
+
+  it("omits referenceRepos and retryPolicy for kg-refresh", () => {
+    const cfg = build("kg-refresh");
+    expect("referenceRepos" in cfg).toBe(false);
+    expect("retryPolicy" in cfg).toBe(false);
+  });
+
+  it("falls back to DEFAULT_RETRY_POLICY on a null policy", () => {
+    expect(build("implementation", { retryPolicy: null }).retryPolicy).toEqual(DEFAULT_RETRY_POLICY);
+  });
+
+  it("includes reviewFix only when set", () => {
+    expect("reviewFix" in build("gap-analysis")).toBe(false);
+    const cfg = build("gap-analysis", { reviewFix });
+    expect(cfg.reviewFix).toEqual(reviewFix);
+    expect(decodeRunConfig(encodeRunConfig(cfg)).reviewFix).toEqual(reviewFix);
+  });
+
+  it("keeps the edge cases: empty description, empty profiles, falsy baseBranch", () => {
+    const cfg = build("implementation", {
+      issue: { ...implBaseIssue, description: "", profiles: [] },
+      baseBranch: "",
+    });
+    expect(cfg.issue.description).toBe(implBaseIssue.title);
+    expect("profiles" in cfg).toBe(false);
+    expect("baseBranch" in cfg).toBe(false);
+  });
+});
+
 // buildImplRunConfig backs both the Fly Machines and local Docker implementation
 // dispatch paths (BAC-27113) — a single shared builder, tested once here.
 describe("buildImplRunConfig", () => {
@@ -330,6 +425,24 @@ describe("buildImplRunConfig", () => {
     expect(decoded.baseBranch).toBe("release");
     expect(decoded.runnerCallbackUrl).toBe("https://orch.example/api/runner");
     expect(decoded.groupingParent).toBe(true);
+  });
+
+  it("carries sensitiveFiles, profiles and assigneeName, and omits baseBranch when it is the default", () => {
+    const mapping = makeMapping({ sensitiveAddPatterns: ["*.pem"], sensitiveAllowPatterns: [".env"] });
+
+    const runConfig = buildImplRunConfig({
+      issue: { ...implBaseIssue, profiles: ["backend"], assigneeName: "Ada" },
+      mapping,
+      baseBranch: mapping.defaultBranch,
+      retryPolicy: DEFAULT_RETRY_POLICY,
+    });
+
+    const decoded = decodeRunConfig(encodeRunConfig(runConfig));
+    expect(decoded.sensitiveFiles).toEqual({ add: ["*.pem"], allow: [".env"] });
+    expect(decoded.profiles).toEqual(["backend"]);
+    expect(decoded.assigneeName).toBe("Ada");
+    expect(decoded).not.toHaveProperty("baseBranch");
+    expect(decoded.retryPolicy).toEqual(DEFAULT_RETRY_POLICY);
   });
 
   it("carries the mapping's reviewers when set, including an empty array", () => {
@@ -609,5 +722,255 @@ describe("runConfigFromTaskDocument", () => {
     expect(decoded.profiles).toEqual(["backend"]);
     expect(decoded.maxTurns).toBe(10);
     expect(decoded.maxIterations).toBe(2);
+  });
+});
+
+describe("agentConfig resolved snapshot", () => {
+  const mk = (stage: "planning" | "implementation" | "review", agent: "claude" | "codex", provider: "anthropic" | "bedrock" | "openai", authMode: string, src = "project") => ({
+    sel: { agent, provider, model: "m", accountProfileId: `p-${stage}`, invocationTimeoutMs: 60_000 },
+    src: { agent: src, provider: src, model: src, accountProfileId: src, invocationTimeoutMs: "job-deadline" },
+    prof: { id: `p-${stage}`, identity: "acct", revision: 2, agent, provider, authMode },
+  });
+  const build = (): any => {
+    const p = mk("planning", "claude", "anthropic", "claude-subscription");
+    const i = mk("implementation", "codex", "openai", "codex-subscription", "orchestrator-default");
+    const r = mk("review", "codex", "openai", "openai-api-key");
+    return {
+      version: 1,
+      snapshotId: "snap-1",
+      configRevisions: {
+        orchestratorDefault: { configRevisionId: "11111111-1111-4111-8111-111111111111", revision: 1 },
+        project: { configRevisionId: "22222222-2222-4222-8222-222222222222", revision: 3 },
+      },
+      stages: { planning: p.sel, implementation: i.sel, review: r.sel },
+      sources: { planning: p.src, implementation: i.src, review: r.src },
+      profiles: { planning: p.prof, implementation: i.prof, review: r.prof },
+    };
+  };
+  const base = { v: 1, issue: { id: "1", identifier: "A-1", title: "t", description: "d" } };
+  const decodeWith = (agentConfig: unknown) =>
+    decodeRunConfig(Buffer.from(JSON.stringify({ ...base, agentConfig }), "utf-8").toString("base64"));
+
+  it("legacy envelope has no agentConfig key", () => {
+    expect("agentConfig" in decodeRunConfig(encodeRunConfig(base as RunConfigV1))).toBe(false);
+  });
+
+  it("round-trips a valid snapshot", () => {
+    const cfg = { ...base, agentConfig: build() } as RunConfigV1;
+    expect(decodeRunConfig(encodeRunConfig(cfg)).agentConfig).toEqual(build());
+  });
+
+  it("accepts every auth mode", () => {
+    const combos: Array<["claude" | "codex", "anthropic" | "bedrock" | "openai", string]> = [
+      ["claude", "anthropic", "anthropic-api-key"], ["claude", "bedrock", "bedrock"],
+      ["claude", "anthropic", "claude-subscription"], ["codex", "openai", "openai-api-key"],
+      ["codex", "openai", "codex-subscription"],
+    ];
+    for (const [a, p, m] of combos) {
+      const s = build();
+      const x = mk("review", a, p, m);
+      s.stages.review = x.sel; s.profiles.review = x.prof;
+      expect(() => decodeWith(s)).not.toThrow();
+    }
+  });
+
+  const mutations: Array<[string, (s: any) => void]> = [
+    ["bad version", (s) => { s.version = 2; }],
+    ["missing stage", (s) => { delete s.stages.review; }],
+    ["extra stage", (s) => { s.stages.extra = s.stages.review; }],
+    ["zero revision", (s) => { s.profiles.review.revision = 0; }],
+    ["numeric-only config revisions", (s) => { s.configRevisions = { orchestratorDefault: 1, project: 3 }; }],
+    ["string config revision", (s) => { s.configRevisions.project.revision = "3"; }],
+    ["zero config revision", (s) => { s.configRevisions.project.revision = 0; }],
+    ["negative config revision", (s) => { s.configRevisions.project.revision = -1; }],
+    ["fractional config revision", (s) => { s.configRevisions.orchestratorDefault.revision = 1.5; }],
+    ["empty config revision id", (s) => { s.configRevisions.project.configRevisionId = ""; }],
+    ["non-string config revision id", (s) => { s.configRevisions.project.configRevisionId = 7; }],
+    ["oversized config revision id", (s) => { s.configRevisions.project.configRevisionId = "x".repeat(10_000); }],
+    ["missing config layer", (s) => { delete s.configRevisions.project; }],
+    ["negative timeout", (s) => { s.stages.review.invocationTimeoutMs = -1; }],
+    ["fractional timeout", (s) => { s.stages.review.invocationTimeoutMs = 1.5; }],
+    ["string timeout", (s) => { s.stages.review.invocationTimeoutMs = "5"; }],
+    ["bad source", (s) => { s.sources.review.model = "user"; }],
+    ["profile id mismatch", (s) => { s.profiles.review.id = "other"; }],
+    ["profile agent mismatch", (s) => { s.profiles.review.agent = "claude"; }],
+    ["profile provider mismatch", (s) => { s.profiles.review.provider = "anthropic"; }],
+    ["codex with anthropic-api-key", (s) => { s.profiles.review.authMode = "anthropic-api-key"; }],
+  ];
+  for (const [name, mutate] of mutations) {
+    it(`rejects ${name}`, () => {
+      const s = build();
+      mutate(s);
+      expect(() => decodeWith(s)).toThrow(/agentConfig/);
+      expect(() => encodeRunConfig({ ...base, agentConfig: s } as RunConfigV1)).toThrow(/agentConfig/);
+    });
+  }
+
+  it.each([null, [], "x", 5])("rejects non-object agentConfig %#", (v) => {
+    expect(() => decodeWith(v)).toThrow(/agentConfig/);
+  });
+
+  it("rejects credential-shaped fields without echoing values", () => {
+    const secret = "sk-SYNTHETIC-SECRET-VALUE";
+    const inject: Array<(s: any) => void> = [
+      (s) => { s.apiKey = secret; },
+      (s) => { s.stages.review.token = secret; },
+      (s) => { s.profiles.review.credential = secret; },
+      (s) => { s.profiles.planning.accessToken = secret; },
+      (s) => { s.sources.review.apiKey = secret; },
+      (s) => { s.configRevisions.token = secret; },
+      (s) => { s.configRevisions.project.token = secret; },
+    ];
+    for (const fn of inject) {
+      const s = build();
+      fn(s);
+      let msg = "";
+      try { decodeWith(s); } catch (e) { msg = (e as Error).message; }
+      expect(msg).toMatch(/unknown field/);
+      expect(msg).not.toContain(secret);
+      expect(msg).not.toContain("apiKey");
+      expect(msg.length).toBeLessThan(200);
+    }
+  });
+
+  it("whitelist drops unknown top-level keys and keeps the snapshot", () => {
+    const out = decodeRunConfig(Buffer.from(JSON.stringify({ ...base, extra: 1, agentConfig: build() })).toString("base64"));
+    expect("extra" in out).toBe(false);
+    expect(out.agentConfig).toEqual(build());
+  });
+
+  it("builder defaults omit agentConfig, and accept then validate an explicit snapshot", () => {
+    const mapping = makeMapping();
+    const input = { issue: implBaseIssue, mapping, baseBranch: mapping.defaultBranch, retryPolicy: DEFAULT_RETRY_POLICY };
+    expect("agentConfig" in buildImplRunConfig(input)).toBe(false);
+    expect(buildImplRunConfig({ ...input, agentConfig: build() }).agentConfig).toEqual(build());
+    const bad = build();
+    bad.stages.review.invocationTimeoutMs = 0;
+    expect(() => buildImplRunConfig({ ...input, agentConfig: bad })).toThrow(/agentConfig/);
+  });
+});
+
+describe("private credentials namespace (AII-981)", () => {
+  const base: RunConfigV1 = { v: 1, issue: { id: "i", identifier: "AII-1", title: "T", description: "D" } };
+  const S = (n: string) => `SENTINEL-${n}-` + "x".repeat(24);
+  const grant = {
+    version: 1, audience: "model-auth", grantId: "g1", dispatchId: "d1", snapshotId: "s1",
+    projectKey: "p", backend: "fly", expiresAt: 1_800_000_000_000, bearer: S("bearer") + "B".repeat(32),
+    bindings: [{ stage: "planning", profileId: "pp", profileRevision: 1, authMode: "openai-api-key" }],
+  };
+  const sealed = {
+    version: 1, algorithm: "aes-256-gcm", dispatchId: "d1", backend: "fly",
+    nonce: "A".repeat(16), ciphertext: "Zm9vYmFy", tag: "B".repeat(22),
+  };
+  const creds = (extra: Record<string, unknown> = {}) => ({ version: 1, ...extra }) as never;
+  const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64");
+
+  describe("modelAuthContext (AII-1427)", () => {
+    const context = { version: 1, dispatchId: "d1", projectKey: "p", backend: "gha", modelAuthUrl: "https://orch.example.com" };
+
+    it("round-trips through the trusted encoder only and is omitted from generic and diagnostic projections", () => {
+      const config = { ...base, credentials: { version: 1, modelAuthContext: context } } as never as RunConfigV1;
+      expect(decodeTrustedRunConfig(encodeTrustedRunConfig(config)).credentials?.modelAuthContext).toEqual(context);
+      expect(encodeRunConfig(config)).not.toContain(Buffer.from("orch.example.com").toString("base64").slice(0, 8));
+      expect(JSON.stringify(decodeRunConfig(encodeRunConfig(config)))).not.toContain("orch.example.com");
+      expect(JSON.stringify(diagnosticProjection(config))).not.toContain("orch.example.com");
+    });
+
+    it.each([
+      ["unknown field", { extra: 1 }],
+      ["wrong version", { version: 2 }],
+      ["non-gha backend", { backend: "fly" }],
+      ["empty dispatch", { dispatchId: "" }],
+      ["overlong project", { projectKey: "p".repeat(129) }],
+      ["http url", { modelAuthUrl: "http://orch.example.com" }],
+      ["credentialed url", { modelAuthUrl: "https://u:p@orch.example.com" }],
+      ["query url", { modelAuthUrl: "https://orch.example.com?x=1" }],
+      ["malformed url", { modelAuthUrl: "not a url" }],
+      ["port above range", { modelAuthUrl: "https://orch.invalid:99999" }],
+    ])("rejects %s", (_n, patch) => {
+      expect(() => validateRunCredentials({ version: 1, modelAuthContext: { ...context, ...patch } })).toThrow("modelAuthContext");
+    });
+  });
+
+  it("legacy envelopes without credentials decode unchanged", () => {
+    const decoded = decodeRunConfig(encodeRunConfig(base));
+    expect(decoded).toEqual(base);
+    expect(decodeTrustedRunConfig(encodeRunConfig(base))).toEqual(base);
+    expect(decoded).not.toHaveProperty("credentials");
+  });
+
+  it.each([
+    ["resultToken"], ["progressToken"], ["publicationToken"], ["attemptToken"],
+  ])("round-trips %s through trusted transport only", (field) => {
+    const config = { ...base, credentials: creds({ [field]: S(field) }) };
+    const trusted = decodeTrustedRunConfig(encodeTrustedRunConfig(config));
+    expect(trusted.credentials).toEqual({ version: 1, [field]: S(field) });
+    expect(decodeRunConfig(encodeTrustedRunConfig(config))).not.toHaveProperty("credentials");
+    expect(Buffer.from(encodeRunConfig(config), "base64").toString()).not.toContain(S(field));
+  });
+
+  it("accepts plain and sealed modelAuthGrant", () => {
+    for (const g of [grant, sealed]) {
+      const out = decodeTrustedRunConfig(encodeTrustedRunConfig({ ...base, credentials: creds({ modelAuthGrant: g }) }));
+      expect(out.credentials?.modelAuthGrant).toEqual(g);
+    }
+  });
+
+  it("rejects malformed credentials with value-free, key-free errors", () => {
+    const unknownKey = "ATTACKER_KEY_" + S("k");
+    const cases: unknown[] = [
+      { version: 2, resultToken: S("a") },
+      { version: 1, resultToken: 42 },
+      { version: 1, resultToken: "" },
+      { version: 1, progressToken: S("a") + " space" },
+      { version: 1, publicationToken: "y".repeat(5000) },
+      { version: 1, resultToken: S("a"), [unknownKey]: S("u") },
+      { version: 1, modelAuthGrant: { ...grant, extra: S("g") } },
+      { version: 1, modelAuthGrant: { ...sealed, bearer: S("s") } },
+      { version: 1, modelAuthGrant: "string" },
+      "nope",
+      [],
+    ];
+    for (const c of cases) {
+      let message = "";
+      try { validateRunCredentials(c); } catch (e) { message = (e as Error).message; }
+      expect(message).not.toBe("");
+      expect(message.length).toBeLessThan(120);
+      expect(message).not.toContain("SENTINEL");
+      expect(message).not.toContain("ATTACKER");
+    }
+    expect(() => decodeRunConfig(b64({ ...base, credentials: { version: 1, [unknownKey]: 1 } }))).toThrow(/credentials/);
+  });
+
+  it("keeps modelAuthGrant out of agentConfig", () => {
+    expect(() => decodeRunConfig(b64({ ...base, agentConfig: { version: 1, modelAuthGrant: grant } }))).toThrow(/agentConfig/);
+  });
+
+  it("diagnostic projection and generic encode never contain credentials or encoded envelopes", () => {
+    const private_ = encodeTrustedRunConfig({
+      ...base, credentials: creds({ resultToken: S("r"), modelAuthGrant: grant }),
+    });
+    const spread = { ...base, credentials: creds({ resultToken: S("r"), modelAuthGrant: grant }),
+      encodedPrivate: private_, AI_IMPLEMENT_RUN_CONFIG: private_ } as RunConfigV1;
+    const text = JSON.stringify(diagnosticProjection(spread));
+    expect(text).not.toContain("SENTINEL");
+    expect(text).not.toContain(private_);
+    expect(text).not.toContain("encodedPrivate");
+    expect(JSON.parse(text).credentialFields).toEqual(["resultToken", "modelAuthGrant"]);
+    const generic = encodeRunConfig(spread);
+    const genericText = Buffer.from(generic, "base64").toString();
+    expect(genericText).not.toContain("SENTINEL");
+    expect(genericText).not.toContain(private_);
+    expect(genericText).not.toContain("encodedPrivate");
+    expect(genericText).not.toContain("AI_IMPLEMENT_RUN_CONFIG");
+    expect(generic).not.toContain(private_);
+    expect(Object.keys(JSON.parse(genericText)).sort()).toEqual(Object.keys(base).sort());
+  });
+
+  it("generic encode keeps description truncation and agentConfig while dropping unknown keys", () => {
+    const long = { ...base, issue: { ...base.issue, description: "x".repeat(200_000) }, extra: "nope" } as RunConfigV1;
+    const decoded = JSON.parse(Buffer.from(encodeRunConfig(long), "base64").toString());
+    expect(decoded.issue.description.length).toBeLessThan(200_000);
+    expect(decoded).not.toHaveProperty("extra");
   });
 });

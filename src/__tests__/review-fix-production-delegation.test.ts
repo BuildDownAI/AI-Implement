@@ -12,12 +12,23 @@ vi.mock("../runner-mode.js", () => ({
   getRunnerMode: () => ({ mode: "default" }),
   resolveExecutionPath: () => "github-actions",
 }));
+const getLatestWorkRowForPr = vi.fn();
+const stampJobApproved = vi.fn();
+const recordPendingLateReview = vi.fn();
+const clearPendingLateReview = vi.fn();
+vi.mock("../log.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../log.js")>()),
+  getLatestWorkRowForPr: (...args: unknown[]) => getLatestWorkRowForPr(...args),
+  stampJobApproved: (...args: unknown[]) => stampJobApproved(...args),
+  recordPendingLateReview: (...args: unknown[]) => recordPendingLateReview(...args),
+  clearPendingLateReview: (...args: unknown[]) => clearPendingLateReview(...args),
+}));
 vi.mock("../review-fix-queue.js", () => ({
   acceptReviewFixWebhookEvent: vi.fn(),
   updateReviewFixStatus: (...args: unknown[]) => updateReviewFixStatus(...args),
 }));
 
-import { fixerFor, recordDelegatedFix } from "../restate/review-fix-production.js";
+import { fixerFor, createProductionFinalizer, recordDelegatedFix, submitLateReviewForAttempt } from "../restate/review-fix-production.js";
 
 // A project on the review process whose fixer is the repository's own auto-fix: the only one that delegates.
 const mapping = makeMapping({ owner: "acme", repo: "app", reviewProcess: "claude-code-review-repository-fix" });
@@ -46,5 +57,88 @@ describe("review-fix production delegation", () => {
     expect(fixerFor(null)).toBe("ai-implement");
     expect(fixerFor(makeMapping({ reviewProcess: "claude-code-review" }))).toBe("ai-implement");
     expect(fixerFor(mapping)).toBe("repository");
+  });
+
+  describe("late external review after an applied approval (AII-1307)", () => {
+    const repoScope = { repository: "acme/app", prNumber: 7, installationId: 1 } as never;
+
+    it("submits once with gapFill, the latest run row and the attempt id, and stamps nothing", async () => {
+      getLatestWorkRowForPr.mockReturnValue({ id: 9, dispatchId: "d-9" });
+      const submit = vi.fn().mockResolvedValue(undefined);
+      await submitLateReviewForAttempt(repoScope, "att-1", submit);
+      expect(getLatestWorkRowForPr).toHaveBeenCalledWith("https://github.com/acme/app/pull/7");
+      expect(submit).toHaveBeenCalledTimes(1);
+      expect(submit).toHaveBeenCalledWith({ dispatchId: "d-9", owner: "acme", repo: "app", prNumber: 7,
+        prUrl: "https://github.com/acme/app/pull/7", gapFill: true, attemptId: "att-1" });
+      expect(stampJobApproved).not.toHaveBeenCalled();
+      expect(recordPendingLateReview).toHaveBeenCalledWith({ workflowKey: "d-9-att-1", dispatchId: "d-9", prUrl: "https://github.com/acme/app/pull/7", attemptId: "att-1" });
+    });
+
+    it("clears the pending record only when the submit settled, and keeps it when the hook reports false", async () => {
+      getLatestWorkRowForPr.mockReturnValue({ id: 9, dispatchId: "d-9" });
+      clearPendingLateReview.mockClear();
+      await submitLateReviewForAttempt(repoScope, "att-1", vi.fn().mockResolvedValue(false));
+      expect(clearPendingLateReview).not.toHaveBeenCalled();
+      await submitLateReviewForAttempt(repoScope, "att-1", vi.fn().mockResolvedValue(true));
+      expect(clearPendingLateReview).toHaveBeenCalledWith("d-9-att-1");
+    });
+
+    it("submits nothing when the latest run row is still in flight", async () => {
+      getLatestWorkRowForPr.mockReturnValue({ id: 9, dispatchId: "d-9", inFlight: true });
+      const submit = vi.fn();
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      await submitLateReviewForAttempt(repoScope, "att-1", submit);
+      expect(submit).not.toHaveBeenCalled();
+      log.mockRestore();
+    });
+
+    it("submits nothing and logs when the PR has no run row", async () => {
+      getLatestWorkRowForPr.mockReturnValue(null);
+      const submit = vi.fn();
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      await submitLateReviewForAttempt(repoScope, "att-1", submit);
+      expect(submit).not.toHaveBeenCalled();
+      expect(log).toHaveBeenCalledWith(expect.stringContaining("not submitting late external review"));
+      log.mockRestore();
+    });
+
+    it("never throws when the submit fails", async () => {
+      getLatestWorkRowForPr.mockReturnValue({ id: 9, dispatchId: "d-9" });
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      await expect(submitLateReviewForAttempt(repoScope, "att-1", vi.fn().mockRejectedValue(new Error("boom")))).resolves.toBeUndefined();
+      // The pending marker is written first, so the poll sweep retries the submit.
+      expect(recordPendingLateReview).toHaveBeenCalledWith({ workflowKey: "d-9-att-1", dispatchId: "d-9", prUrl: "https://github.com/acme/app/pull/7", attemptId: "att-1" });
+      log.mockRestore();
+    });
+
+    describe("production finalizer wiring", () => {
+      const result = { outputCommit: "abc" } as never;
+      const input = { attemptId: "att-1", scope, result, findingDispositions: [], policyAllows: true } as never;
+      const build = (applied: { status: string }, submit: ReturnType<typeof vi.fn>) => createProductionFinalizer({
+        store: {
+          getAcceptedResult: async () => ({ result, hasConflict: false }),
+          getRecordedOutcome: async () => ({ terminal: { status: "succeeded" } }),
+          hasCurrentAuthority: async () => true,
+        } as never,
+        github: { getPrHeadSha: async () => "abc", evaluateMergePolicy: async () => true } as never,
+        baseFinalizer: { recordOutcome: vi.fn(), applyApproval: vi.fn().mockResolvedValue(applied) } as never,
+        submitLateExternalReview: submit as never,
+      });
+
+      it("submits once after an applied approval", async () => {
+        getLatestWorkRowForPr.mockReturnValue({ id: 9, dispatchId: "d-9" });
+        const submit = vi.fn().mockResolvedValue(true);
+        expect(await build({ status: "applied" }, submit).applyApproval(input)).toEqual({ status: "applied" });
+        expect(submit).toHaveBeenCalledTimes(1);
+        expect(stampJobApproved).not.toHaveBeenCalled();
+      });
+
+      it("submits nothing when the approval is withheld", async () => {
+        getLatestWorkRowForPr.mockReturnValue({ id: 9, dispatchId: "d-9" });
+        const submit = vi.fn();
+        await build({ status: "withheld" }, submit).applyApproval(input);
+        expect(submit).not.toHaveBeenCalled();
+      });
+    });
   });
 });

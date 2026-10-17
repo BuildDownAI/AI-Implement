@@ -26,6 +26,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ARG YQ_VERSION=v4.53.2
 ARG AST_GREP_VERSION=0.42.1
 ARG CLAUDE_CODE_VERSION=2.1.284
+ARG CODEX_CLI_VERSION=0.159.2
 
 # System dependencies — base tools + power tools for the agent.
 # dbus + libsecret-1-0 are required so Claude Code's startup keychain read
@@ -86,14 +87,22 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get update && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Claude Code CLI and ast-grep (structural search/rewrite)
-RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "@ast-grep/cli@${AST_GREP_VERSION}" \
+# Claude Code CLI, Codex CLI, and ast-grep (structural search/rewrite)
+RUN npm install -g \
+      "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+      "@openai/codex@${CODEX_CLI_VERSION}" \
+      "@ast-grep/cli@${AST_GREP_VERSION}" \
     && corepack enable
 
-# Create non-root user for Claude Code (refuses --dangerously-skip-permissions as root)
+# Create non-root user for agent CLIs (Claude Code refuses --dangerously-skip-permissions as root)
 RUN useradd -m -s /bin/bash coder \
     && mkdir -p /workspace \
     && chown coder:coder /workspace
+
+# Smoke-test agent CLIs without credentials or model calls.
+RUN su coder -c 'claude --version' \
+    && su coder -c 'codex --version' \
+    && su coder -c 'codex exec --help >/dev/null'
 
 # Ship the compiled TS pipeline + prod-only deps + pipelines dir
 WORKDIR /app

@@ -1,7 +1,7 @@
 import type { RepoMapping } from "./config.js";
 import { GitHubApiError } from "./github-errors.js";
-import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
-import { DEFAULT_RETRY_POLICY, type RetryPolicy } from "./pipeline/retry-backoff.js";
+import { type ResolvedAgentSnapshotV1, type RunConfigV1, type RunCredentialsV1, buildRunConfig, encodeRunConfig, encodeTrustedRunConfig } from "./run-config.js";
+import type { RetryPolicy } from "./pipeline/retry-backoff.js";
 import { isChecksPermissionError } from "./checks-permission.js";
 
 export interface DispatchInputs {
@@ -405,6 +405,18 @@ export interface EnvelopeDispatchOpts {
   runProgressToken?: string;
   /** Include only when the target workflow advertises publication-token support. */
   runPublicationToken?: string;
+  /** True only when the exact workflow/ref reported `supportsPrivateRunConfig === true` (AII-983).
+   *  The result/progress/publication bearers then ride inside `run_config.credentials` (trusted
+   *  encoder) and are NOT duplicated as top-level inputs; `run_token` is sent as "". Absent/false
+   *  keeps the generic envelope plus masked top-level token inputs. */
+  privateTransport?: boolean;
+  /** Extra typed private credentials. Only `modelAuthGrant`, `modelAuthContext`, `executionPolicy` and `attemptToken` are carried; supplied
+   *  result/progress/publication bearers are ignored in favour of the minted token options.
+   *  Requires `privateTransport: true`; supplying it without capability throws rather than
+   *  dropping or downgrading it. */
+  credentials?: RunCredentialsV1;
+  /** Frozen stage snapshot from a managed `launch` decision; rides in `run_config.agentConfig`. */
+  agentConfig?: ResolvedAgentSnapshotV1;
   runnerImage?: string | null;
   prNumber?: string;
   /** Operator instruction forwarded from an /ai-implement PR comment. Rides inside run_config. */
@@ -430,60 +442,100 @@ export interface EnvelopeDispatchOpts {
  * pass-through inputs (tokens, provider, image, timeout) stay top-level so
  * the GHA workflow can ::add-mask:: the tokens before unpacking the envelope.
  */
+/** Fail-closed guard for supplied private credentials (AII-983): protected transport must never be
+ *  dropped or downgraded, so an unsupported/unprobeable reader aborts the dispatch before launch. */
+export function assertPrivateTransportForCredentials(
+  credentials: RunCredentialsV1 | undefined,
+  capabilities: { supportsPrivateRunConfig?: boolean },
+  target: string,
+): void {
+  if (credentials !== undefined && capabilities.supportsPrivateRunConfig !== true) {
+    throw new Error(
+      `protected run transport requires supportsPrivateRunConfig on ${target}; refusing to drop or downgrade private credentials — re-sync workflows`,
+    );
+  }
+}
+
+/** Fail-closed guard for the ephemeral full-access policy (AII-1437): an old workflow's credentials validator would
+ *  drop or reject the unknown field, so a workflow without the capability marker aborts the dispatch before launch. */
+export function assertExecutionPolicyCapability(
+  credentials: RunCredentialsV1 | undefined,
+  capabilities: { supportsExecutionPolicy?: boolean },
+  target: string,
+): void {
+  if (credentials?.executionPolicy !== undefined && capabilities.supportsExecutionPolicy !== true) {
+    throw new Error(
+      `ephemeral execution policy requires the ephemeral-execution-policy-v1 capability on ${target}; refusing to launch without it — re-sync workflows`,
+    );
+  }
+}
+
+/** Only the non-callback private fields a caller may supply. Result/progress/publication bearers are
+ *  orchestrator-minted and phase-scoped, so a supplied copy is never carried over. */
+function suppliedNonBearerCredentials(credentials: RunCredentialsV1 | undefined): Partial<RunCredentialsV1> {
+  return {
+    ...(credentials?.attemptToken !== undefined ? { attemptToken: credentials.attemptToken } : {}),
+    ...(credentials?.modelAuthGrant !== undefined ? { modelAuthGrant: credentials.modelAuthGrant } : {}),
+    ...(credentials?.modelAuthContext !== undefined ? { modelAuthContext: credentials.modelAuthContext } : {}),
+    ...(credentials?.executionPolicy !== undefined ? { executionPolicy: credentials.executionPolicy } : {}),
+  };
+}
+
 export function buildEnvelopeDispatchInputs(
   mapping: RepoMapping,
   issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[]; assigneeName?: string },
   opts: EnvelopeDispatchOpts,
 ): DispatchInputs {
-  const runConfig: RunConfigV1 = {
-    v: 1,
-    issue: {
-      id: issue.id,
-      identifier: issue.identifier,
-      title: issue.title,
-      description: issue.description || issue.title,
-    },
-    runnerPhase: opts.runnerPhase,
-    ...(opts.baseBranch ? { baseBranch: opts.baseBranch } : {}),
-    ...(mapping.branchPrefix ? { branchPrefix: mapping.branchPrefix } : {}),
-    ...(mapping.skillsRepo ? { skillsRepo: mapping.skillsRepo } : {}),
-    ...(opts.runnerCallbackUrl ? { runnerCallbackUrl: opts.runnerCallbackUrl } : {}),
-    ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
-    ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
-    ...(opts.prNumber ? { prNumber: opts.prNumber } : {}),
-    ...(opts.commentInstruction ? { commentInstruction: opts.commentInstruction } : {}),
-    ...(mapping.sensitiveAddPatterns != null || mapping.sensitiveAllowPatterns != null
-      ? { sensitiveFiles: { add: mapping.sensitiveAddPatterns ?? undefined, allow: mapping.sensitiveAllowPatterns ?? undefined } }
-      : {}),
-    ...(mapping.dependencyTokenScope != null && opts.runnerPhase !== "planning" ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
-    ...(mapping.referenceRepos != null && opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh" ? { referenceRepos: mapping.referenceRepos } : {}),
-    ...(mapping.reviewers != null ? { reviewers: mapping.reviewers } : {}),
-    ...(mapping.reviewProcess != null ? { reviewProcess: mapping.reviewProcess } : {}),
-    ...(mapping.trustedReviewAuthors != null ? { trustedReviewAuthors: mapping.trustedReviewAuthors } : {}),
-    ...(issue.profiles && issue.profiles.length > 0 ? { profiles: issue.profiles } : {}),
-    ...(issue.assigneeName ? { assigneeName: issue.assigneeName } : {}),
-    ...(opts.planningContext ? { planningContext: opts.planningContext } : {}),
-    ...(opts.groupingParent ? { groupingParent: true } : {}),
-    ...(opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh"
-      ? { retryPolicy: opts.retryPolicy ?? DEFAULT_RETRY_POLICY }
-      : {}),
-  };
+  const isPrivate = opts.privateTransport === true;
+  if (opts.credentials !== undefined && !isPrivate) {
+    throw new Error(
+      "protected run transport requires supportsPrivateRunConfig on the target workflow; refusing to drop or downgrade private credentials",
+    );
+  }
+  const issuesPublication = opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh";
+  const credentials: RunCredentialsV1 | undefined = isPrivate
+    ? {
+        version: 1,
+        ...(opts.runToken ? { resultToken: opts.runToken } : {}),
+        ...(opts.runProgressToken ? { progressToken: opts.runProgressToken } : {}),
+        ...(issuesPublication && opts.runPublicationToken ? { publicationToken: opts.runPublicationToken } : {}),
+        ...suppliedNonBearerCredentials(opts.credentials),
+      }
+    : undefined;
+  const runConfig = buildRunConfig({ ...opts, issue, mapping, credentials });
 
   return {
-    run_config: encodeRunConfig(runConfig),
+    run_config: credentials !== undefined ? encodeTrustedRunConfig(runConfig) : encodeRunConfig(runConfig),
     // Display-only duplicate: run-name: is evaluated before any step runs, so it cannot
     // decode run_config. The shared 422 retry (ENVELOPE_OPTIONAL_INPUTS) strips this on a
     // template that predates the declaration.
     issue_identifier: issue.identifier,
-    run_token: opts.runToken ?? "",
-    ...(opts.runProgressToken !== undefined ? { run_progress_token: opts.runProgressToken } : {}),
-    ...(opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh" && opts.runPublicationToken !== undefined
+    // Private transport: bearers live only in run_config.credentials; "" keeps the (required)
+    // top-level input present for readers that predate the private namespace.
+    run_token: isPrivate ? "" : opts.runToken ?? "",
+    ...(!isPrivate && opts.runProgressToken !== undefined ? { run_progress_token: opts.runProgressToken } : {}),
+    ...(!isPrivate && issuesPublication && opts.runPublicationToken !== undefined
       ? { run_publication_token: opts.runPublicationToken }
       : {}),
     ...providerDispatchFields(mapping),
     ...(mapping.maxJobMinutes != null ? { job_timeout_minutes: String(mapping.maxJobMinutes) } : {}),
     ...(opts.runnerImage ? { runner_image: opts.runnerImage } : {}),
   };
+}
+
+/**
+ * True when the encoded envelope carries a managed stage snapshot or model-auth grant. Raw
+ * parse only (no validation, nothing logged): an unparseable value is treated as legacy.
+ */
+function isManagedRunConfig(encoded: string): boolean {
+  try {
+    const parsed = JSON.parse(Buffer.from(encoded, "base64").toString("utf-8")) as Record<string, unknown> | null;
+    if (parsed === null || typeof parsed !== "object") return false;
+    const creds = parsed.credentials as Record<string, unknown> | null | undefined;
+    return parsed.agentConfig !== undefined || (creds !== null && typeof creds === "object" && creds.modelAuthGrant !== undefined);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -522,6 +574,8 @@ export async function postWorkflowDispatch(opts: {
   if (first.success) return first;
   if (first.status !== 422 || !/unexpected inputs/i.test(first.error ?? "")) return first;
   if (!opts.inputs.run_config) return first;
+  // A managed run never degrades to a legacy shape: a rejected input is a hard failure.
+  if (isManagedRunConfig(opts.inputs.run_config)) return first;
 
   const rejectedNames = extractUnexpectedInputNames(first.error ?? "");
   const namesToStrip = ENVELOPE_OPTIONAL_INPUTS.filter(
@@ -578,26 +632,50 @@ export async function postPrComment(
   }
 }
 
+/** A PR/issue comment. Author and timestamps are optional: callers that only need `id`/`body` ignore them. */
+export interface PrComment {
+  id: number;
+  body: string;
+  user?: { login: string; type?: string };
+  htmlUrl?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 /**
  * Lists all comments on a PR/issue (unified GitHub comment API), paginated to
  * completion via the response's `Link: rel="next"` header — a PR with more than
  * 100 comments before the sticky one must still be found, or `postOrUpdateStickyComment`
  * duplicates it instead of updating it in place. Used to find a previously-posted
- * sticky comment to update in place.
+ * sticky comment to update in place. By default a non-OK page ends the walk and returns
+ * what was read so far; pass `{ strict: true }` when the caller must not mistake an
+ * unreadable page for an empty list (the call then throws so the step can retry).
  */
 export async function listPrComments(
   token: string,
   owner: string,
   repo: string,
   prNumber: number,
-): Promise<Array<{ id: number; body: string }>> {
-  const comments: Array<{ id: number; body: string }> = [];
+  options: { strict?: boolean } = {},
+): Promise<PrComment[]> {
+  const comments: PrComment[] = [];
   let url: string | null = `https://api.github.com/repos/${owner}/${repo}/issues/${prNumber}/comments?per_page=100`;
   while (url) {
     const res: Response = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
-    if (!res.ok) break;
-    const data = (await res.json()) as Array<{ id: number; body?: string }>;
-    comments.push(...data.map((c) => ({ id: c.id, body: c.body ?? "" })));
+    // Strict readers must not mistake an unreadable list for an empty one: throw so the caller retries.
+    if (!res.ok) {
+      if (options.strict) throw new Error(`listPrComments: ${owner}/${repo}#${prNumber} comments unreadable (HTTP ${res.status})`);
+      break;
+    }
+    const data = (await res.json()) as Array<{ id: number; body?: string; user?: { login?: string; type?: string } | null; html_url?: string; created_at?: string; updated_at?: string }>;
+    comments.push(...data.map((c) => ({
+      id: c.id,
+      body: c.body ?? "",
+      ...(c.user?.login ? { user: { login: c.user.login, ...(c.user.type ? { type: c.user.type } : {}) } } : {}),
+      ...(c.html_url ? { htmlUrl: c.html_url } : {}),
+      ...(c.created_at ? { createdAt: c.created_at } : {}),
+      ...(c.updated_at ? { updatedAt: c.updated_at } : {}),
+    })));
     url = parseLinkNext(res.headers.get("link"));
   }
   return comments;
@@ -704,6 +782,32 @@ export async function listPullRequestFiles(
     url = parseLinkNext(res.headers.get("link"));
   }
   return files;
+}
+
+/**
+ * SHAs of the commits on a PR, oldest first (the head is last). Follows `Link: rel="next"`;
+ * GitHub caps the list at 250 commits. Throws on a non-OK response so a caller never reads
+ * a failed call as "no commits".
+ */
+export async function listPullRequestCommits(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+): Promise<string[]> {
+  const shas: string[] = [];
+  let url: string | null = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/commits?per_page=100`;
+  while (url) {
+    const res: Response = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`listPullRequestCommits failed: HTTP ${res.status}: ${text}`);
+    }
+    const data = (await res.json()) as Array<{ sha?: string }>;
+    shas.push(...data.map((c) => c.sha).filter((c): c is string => typeof c === "string"));
+    url = parseLinkNext(res.headers.get("link"));
+  }
+  return shas;
 }
 
 /**
@@ -880,6 +984,33 @@ export function buildKgRefreshGhaDispatchBody(opts: {
     ...(opts.runnerCallbackUrl ? { runner_callback_url: opts.runnerCallbackUrl } : {}),
     ...(opts.issueIdentifier ? { issue_identifier: opts.issueIdentifier } : {}),
   };
+}
+
+/**
+ * Private-transport KG body (AII-983): re-encodes the decoded trusted config with the result and
+ * progress bearers inside `credentials` and omits them as top-level inputs. Publication
+ * authority comes only from the caller's minted token. Supplied bearers are discarded;
+ * only the model-auth grant and attempt token already on the config are kept.
+ */
+export function buildPrivateKgRefreshGhaDispatchBody(
+  opts: Parameters<typeof buildKgRefreshGhaDispatchBody>[0] & { trustedConfig: RunConfigV1 },
+): DispatchInputs {
+  const { trustedConfig, ...rest } = opts;
+  const credentials: RunCredentialsV1 = {
+    ...suppliedNonBearerCredentials(trustedConfig.credentials),
+    version: 1,
+    resultToken: opts.runToken,
+    progressToken: opts.runProgressToken,
+    ...(opts.runPublicationToken ? { publicationToken: opts.runPublicationToken } : {}),
+  };
+  const body = buildKgRefreshGhaDispatchBody({
+    ...rest,
+    runConfig: encodeTrustedRunConfig({ ...trustedConfig, credentials }),
+    runToken: "",
+  });
+  delete body.run_progress_token;
+  delete body.run_publication_token;
+  return body;
 }
 
 export interface WorkflowRunStatus {
@@ -1490,4 +1621,17 @@ export async function compareCommits(
   if (!res.ok) return null;
   const data = (await res.json()) as { behind_by?: unknown };
   return { behindBy: typeof data.behind_by === "number" ? data.behind_by : 0 };
+}
+
+/**
+ * A file's text from the repository's default branch (no `ref`), or `null` when it does not exist.
+ * Any other failure throws, so a caller inside a retried step never reads "no file" from an outage.
+ */
+export async function getDefaultBranchFileText(token: string, owner: string, repo: string, path: string): Promise<string | null> {
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}`, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`getDefaultBranchFileText ${path} failed: HTTP ${res.status}`);
+  const body = (await res.json()) as { content?: string; encoding?: string; type?: string };
+  if (body.type !== "file" || body.encoding !== "base64" || typeof body.content !== "string") return null;
+  return Buffer.from(body.content, "base64").toString("utf8");
 }

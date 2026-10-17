@@ -12,7 +12,7 @@ A reference for the two test tiers that cover the Restate code under `src/restat
 | Engine present | No. The handler is called as a plain function | Yes. A real `restate-server` journals the call and delivers it over HTTP/2 to the in-process SDK endpoint |
 | What it proves | The branch logic, the error mapping, the wire shapes, the time boundaries | What the engine does with the handler: serialisation, retry, idempotency, suspension, discovery metadata, ingress serde |
 | Cost | Milliseconds per test | About a second per scenario, plus one server boot per variant per file (seconds) |
-| Type-check | `npm run typecheck` excludes `src/__tests__` | `npx tsc --noEmit --project tsconfig.restate-tests.json` (the `restate-tests-binary` CI job runs it, on pass 1) |
+| Type-check | `npm run typecheck` | `npm run typecheck` (covers `src/__tests__/restate/` through `tsconfig.tests.json`; the `unit-tests` CI job runs it) |
 | CI job | `unit-tests` in `.github/workflows/unit-tests.yml` | `restate-tests-binary` (the binary runtime, the one production runs; three passes as a three-job matrix since AII-1158, kept from AII-993 so a scenario that fails one run in three fails the PR that adds it) in the same workflow, in parallel with `unit-tests`, on every PR to `testing`, `main`, and the grouping branches |
 
 The default suite excludes `src/__tests__/restate/**` in `vitest.config.ts`, so a dispatched runner never starts a Restate server for them.
@@ -102,10 +102,11 @@ The last two scenarios are the ones the issue AII-713 was about. They cannot exi
 
 `operator-object.restate.test.ts` follows the same shape against the `Operator` Virtual Object and adds the properties a Virtual Object is for:
 
-- Two concurrent `refresh` calls presenting the same current hash both succeed with the identical new pair. Only an `exclusive` handler queue can prove this.
-- A presentation of the previous hash inside the grace window returns the same pair the rotation produced.
+- Two concurrent `refresh` calls presenting the same current hash both succeed with the same `ok` answer (the orchestrator derives the one new token outside Restate). Only an `exclusive` handler queue can prove this.
+- A presentation of the previous hash inside the grace window answers `ok` when its `nextHash` equals the rotated-in `currentHash`, and `unavailable` (nothing cleared) when it differs.
 - Unknown hash, expired family, `revoke`, sign-in after revoke, and `describe` each assert the state through a shared read, never a journal read.
-- One scenario runs the same sequence against both variants and asserts the two results are equal, which is the replay-determinism check for handlers that use `ctx.rand.uuidv4()` and `ctx.date.now()`.
+- One scenario runs the same sequence against both variants and asserts the two results are equal, which is the replay-determinism check for handlers that use `ctx.date.now()` (the `Operator` object no longer uses `ctx.rand`; the same scenario asserts the concurrent answer equals the rotation and carries no token).
+- One scenario seeds a legacy-shape family and legacy `refresh` invocations through a stand-in `Operator` registered with the pre-AII-1287 handlers, runs `scrubOperatorLegacyTokens` against the test server's admin API, and asserts `state`, `sys_invocation` and `sys_journal` hold no raw token and no completed legacy invocation, that the settings row is written (injected store), and that a second run is a no-op.
 
 The exact grace-window boundary is not here. A real server can only reach it with a 30 s wait, so `decideRefresh` was factored out as a pure function of state and time and is unit-tested in `src/__tests__/operator-object.test.ts` on both sides of the boundary.
 
@@ -158,7 +159,7 @@ An issue that adds or changes Restate behaviour writes the unit tests first, the
 
 ```bash
 npm run test:restate
-npx tsc --noEmit --project tsconfig.restate-tests.json
+npm run typecheck
 ```
 
 The scenario runs set the Restate SDK log level to `WARN` (`vitest.restate.config.ts`, AII-1161), so the SDK's one-line-per-step `INFO` output stays out of the log. To see those lines for a local repro, run `RESTATE_LOGGING=INFO npm run test:restate`; the config accepts the SDK's five names (`TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`) in any case, keeps `WARN` for an empty value, and warns once and keeps `WARN` for an unknown name (`src/restate/log-level.ts`).
@@ -229,8 +230,11 @@ which AII-800's suite already covers precisely against a faster-to-assert fake.
 | Deployment drain (`register()`'s conflict/force-registration path) and the workflow/journal/idempotency retention configuration | Already proven elsewhere, not duplicated here | `endpoint.restate.test.ts` / `endpoint-registration.restate.test.ts` (drain); retention metadata assertion in `review-fix-attempt.restate.test.ts` (retention) |
 | Real Fly Machines/GitHub Actions runner container behavior under the pilot | **Not proven anywhere in this repo's test tree** | needs live evidence — this is the same class of gap the "real `restate-server` binary" row above already names for the engine itself |
 
-CI runs `npm run test:restate` against server 1.7.10 (the `restate-tests-binary` job); its pass/fail there — not this document — is the authoritative evidence for AII-813's "both variants and SDK boundary suite pass" acceptance criterion. This is binary-server evidence, not a live pilot rollout. `npx tsc --noEmit --project
-tsconfig.restate-tests.json` passes as of the commit that added this section.
+CI runs `npm run test:restate` against server 1.7.10 (the `restate-tests-binary` job); its pass/fail there — not this document — is the authoritative evidence for AII-813's "both variants and SDK boundary suite pass" acceptance criterion. This is binary-server evidence, not a live pilot rollout. `npm run typecheck` (which covers the Restate tests) passes as of the commit that added this section.
+
+### `review-fix-managed.restate.test.ts`: managed Codex on GHA (AII-1444)
+
+Composes `createProductionReviewFixServices` with a real model-auth runtime on the `restate-server` binary. Only GitHub's HTTP surface and workflow dispatch are synthetic. It proves ReviewFixPR admission, the protected managed worker, the authenticated result callback, the current-head check and the finalizer; that a moved head, a cancelled attempt and a late result never approve; that occupancy is released only once the run is terminal; that an incapable template fails the queue row with nothing dispatched; and that no bearer, run token or credential reaches a journal value. Engine evidence, not live proof.
 
 ## `kg-refresh-pilot.restate.test.ts`: the switched kg-refresh path against production services (AII-896)
 
@@ -340,9 +344,9 @@ did not test). Scenarios follow four rules, and
 
    ```ts
    const rows = await eventually(
-     () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRepo' AND target_handler_name = 'expire'`),
+     () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRepo' AND target_handler_name = 'watch'`),
      (found) => found.length === 1,
-     { label: "one scheduled KgRepo.expire" },
+     { label: "one suspended KgRepo.watch while the run lives" },
    );
    ```
 
@@ -387,3 +391,17 @@ This is the gated race test pattern. A scenario of an owned-run wait sets the or
 ## FlyMachineProfile kept-machine scenarios
 
 `fly-machine-profile.restate.test.ts` drives `claim` / `attach` / `release` / `expire` (ADR 037) through a forwarding service (the handlers are ingress-private) with a fake Fly. The scheduled `expire` is asserted with `queryInvocations` inside `eventually`; a stale-timer scenario calls `expire` with the earlier `releasedAt` itself rather than racing a clock, and one scenario uses `idleTimeoutMsOverride` to see the engine deliver the timer.
+
+## `feedback-loop-workflow.restate.test.ts`: the implement/review loop replayed (AII-626, AII-629)
+
+The loop's control flow lives in `src/pipeline/feedback-loop-core.ts` (`runFeedbackLoop`), with every
+effect — model calls, git reads, cycle-summary write, reporting, sleeping, clocks — injected as
+`LoopEffects`. The test defines a `FeedbackLoopTest` workflow **in the test file only** and journals
+each effect, then runs the production control flow against fake effects on both harness variants. No
+model, callback or credential is involved.
+
+Boundaries: the workflow is never registered in `src/restate/endpoint.ts`; nothing under
+`src/pipeline/` imports `src/restate/*` or `@restatedev/*` (guarded by
+`src/__tests__/restate-boundary.test.ts` in the default suite); the `*.restate.test.ts` file is excluded
+from `npm test` and runs under `npm run test:restate` (container variant needs Docker; set
+`RESTATE_TEST_RUNTIME=binary` for the binary variant).

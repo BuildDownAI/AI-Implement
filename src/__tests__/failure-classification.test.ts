@@ -1094,6 +1094,19 @@ describe("projectFailureRecord", () => {
     expect((projected.evidence as Record<string, unknown>)).not.toHaveProperty("sneaky");
   });
 
+  it("preserves evidence.llmErrorMessage", () => {
+    const record: FailureRecord = {
+      category: "transient",
+      code: "X",
+      stage: "s",
+      attempt: 1,
+      retryable: true,
+      message: "m",
+      evidence: { truncated: false, llmErrorMessage: "stream disconnected" },
+    };
+    expect(projectFailureRecord(record).evidence.llmErrorMessage).toBe("stream disconnected");
+  });
+
   it("preserves optional fields (exitCode, signal, elapsedMs) when present", () => {
     const record: FailureRecord = {
       category: "cancelled",

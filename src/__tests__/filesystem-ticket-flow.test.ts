@@ -254,6 +254,7 @@ describe("filesystem tickets through the local PR loop", () => {
       runnerCallbackBaseUrl: "http://host.docker.internal:8080",
       runnerTokenSecret: SECRET,
       getInstallationToken: vi.fn(async () => "gh-token"),
+      getTargetRepoToken: vi.fn(async () => "gh-token"),
       getInstallationId: vi.fn(async () => 778899),
       resolveRunnerImage: vi.fn(async () => undefined),
       checkContract,
@@ -298,7 +299,8 @@ describe("filesystem tickets through the local PR loop", () => {
         { id: "branch-preview", gates: false },
       ],
     });
-    expect(dockerInput.extraEnv!.RUN_PROGRESS_TOKEN).toEqual(expect.any(String));
+    expect(dockerInput.runProgressToken).toEqual(expect.any(String));
+    expect(dockerInput.extraEnv).not.toHaveProperty("RUN_PROGRESS_TOKEN");
 
     const jobs = log.listLog({ limit: 5 });
     const gap = jobs.find((job) => job.phase === "gap-analysis");
@@ -341,6 +343,7 @@ describe("filesystem tickets through the local PR loop", () => {
       runnerCallbackBaseUrl: "http://host.docker.internal:8080",
       runnerTokenSecret: SECRET,
       getInstallationToken: vi.fn(async () => "gh-token"),
+      getTargetRepoToken: vi.fn(async () => "gh-token"),
       getInstallationId: vi.fn(async () => 778899),
       resolveRunnerImage: vi.fn(async () => undefined),
       checkContract: vi.fn<DrainModule.DrainCommentGapfillsInput["checkContract"]>(async () => "envelope"),

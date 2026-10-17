@@ -4,9 +4,14 @@ import {
   markJobFailureCommented,
   stampJobApproved,
   updateJobFailure,
+  recordInvocationAttribution,
   updateJobPrUrl,
   updateJobStatus,
   type Job,
+  getGapFillRowsAwaitingLateReview,
+  getPendingLateReviews,
+  clearPendingLateReview,
+  recordPendingLateReview,
 } from "./log.js";
 import { redactStepCredentials } from "./pipeline/step-redaction.js";
 import type { Step } from "./pipeline/types.js";
@@ -40,8 +45,11 @@ import {
 import { isLinearAuthConfigured, withLinearToken } from "./linear-app-auth.js";
 import { isFailureRecord, projectFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
 import { sanitizeFindingDispositions, type FindingDisposition } from "./pipeline/finding-dispositions.js";
-import { isCycleSummary, sanitizeCycleSummaries, type CycleSummary, type CycleDisposition } from "./pipeline/cycle-summary.js";
-import type { LateExternalReviewInput } from "./restate/late-external-review.js";
+import { loadStoredSnapshot } from "./agent-run-preparation.js";
+import { normalizeInvocation } from "./agent-usage.js";
+import { sanitizeAttribution, type InvocationAttributionV1 } from "./pipeline/types.js";
+import { isCycleSummary, stripCycleAttribution, sanitizeCycleSummaries, type CycleSummary, type CycleDisposition } from "./pipeline/cycle-summary.js";
+import { lateExternalReviewWorkflowKey, type LateExternalReviewInput } from "./restate/late-external-review.js";
 import { recordReviewFixCycleSummary, type ReviewFixCycleSummaryOutcome } from "./review-fix-evidence.js";
 import type { ReviewFixFindingDisposition } from "./review-fix-ports.js";
 import {
@@ -148,6 +156,14 @@ export interface RunnerResultBody {
    */
   cycleSummaries?: CycleSummary[];
   /**
+   * Optional diagnostic attribution (AII-946). Sanitized and stripped-on-invalid in
+   * handleRunnerResult; never fails the callback. Older orchestrators ignore the unknown key.
+   * Census (AII-971 wires emission/persistence): API job/report readers, reviewer result
+   * handling and failure validators do not read this field yet. `INVOCATION_TIMEOUT` is an
+   * ordinary open-ended `failure.code` reported with the existing error outcome.
+   */
+  attribution?: InvocationAttributionV1;
+  /**
    * Optional pilot marker (AII-769 Restate review-fix pilot; shape defined by
    * AII-770's review-fix-contract.ts). Present only on a result reported by a
    * Restate-owned review-fix attempt — absent means Legacy. A present-but-
@@ -208,7 +224,7 @@ export interface HandleRunnerResultInput {
    * result that ended `external_review_pending`. The hook itself decides whether Restate is ready;
    * an error it throws is logged and does not change the response.
    */
-  submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<void>;
+  submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<boolean | void>;
 }
 
 export interface HandleRunnerResultOutput {
@@ -535,7 +551,8 @@ export function handleRunnerCycleSummary(input: {
   const verified = verifyPreparedReviewFixToken(bearer, input.secret, "progress");
   if (!verified.ok || !verified.claims.attemptId) return bad(401, verified.ok ? "wrong_scope" : verified.reason);
   if (!input.body || typeof input.body !== "object" || Array.isArray(input.body)) return bad(400, "invalid_cycle_body");
-  const summary = (input.body as { summary?: unknown }).summary;
+  const { value: summary, stripped } = stripCycleAttribution((input.body as { summary?: unknown }).summary);
+  if (stripped) console.warn("[runner-callback] dropped malformed cycle summary attribution (count=1)");
   if (!isCycleSummary(summary)) return bad(400, "invalid_cycle_summary");
 
   const outcome = recordOneCycleSummary(verified.claims.attemptId, summary);
@@ -643,6 +660,7 @@ export async function handleRunnerResult(
     failure?: unknown;
     findingDispositions?: unknown;
     cycleSummaries?: unknown;
+    attribution?: unknown;
     reviewFix?: unknown;
     externalReviewPending?: unknown;
   } | null | undefined;
@@ -762,6 +780,36 @@ export async function handleRunnerResult(
     return { status: 200, body: { acknowledged: true } };
   }
 
+  // Authenticate without consuming, then run every check that needs only the
+  // claims and body, so a rejected request leaves the single-use token usable
+  // for a corrected retry. The consume below stays atomic and decides races.
+  const preflight = verifyRunToken(bearerToken, input.secret, "result", { consume: false });
+  if (!preflight.ok) {
+    console.warn(
+      `[runner-callback] result refused dispatch=${preflight.claims?.dispatchId ?? "unknown"} ` +
+        `phase=${input.body.phase} outcome=${input.body.outcome} reason=${preflight.reason}`,
+    );
+    return preflight.reason === "already_consumed"
+      ? bad(409, "already_consumed")
+      : bad(401, preflight.reason);
+  }
+  if (preflight.claims.phase !== input.body.phase) {
+    console.warn(
+      `[runner-callback] result rejected dispatch=${preflight.claims.dispatchId} reason=phase_mismatch ` +
+        `token=${preflight.claims.phase} body=${input.body.phase}`,
+    );
+    return bad(400, "phase_mismatch");
+  }
+  if (
+    input.body.outcome === "success" &&
+    input.body.phase === "implementation" &&
+    !input.body.prUrl &&
+    !input.body.noWork
+  ) {
+    console.warn(`[runner-callback] result rejected dispatch=${preflight.claims.dispatchId} reason=missing_prUrl`);
+    return bad(400, "missing_prUrl");
+  }
+
   // Note: token is consumed atomically here BEFORE any provider call. If
   // postComment or a status verb fails downstream, the comments may be lost
   // (orchestrator surfaces the error in warnings[] but the runner has no
@@ -786,13 +834,6 @@ export async function handleRunnerResult(
   );
 
   const { claims, mappingTeamKey } = verified;
-  if (claims.phase !== input.body.phase) {
-    console.warn(
-      `[runner-callback] result burned dispatch=${claims.dispatchId} reason=phase_mismatch ` +
-        `token=${claims.phase} body=${input.body.phase}`,
-    );
-    return bad(400, "phase_mismatch");
-  }
 
   // Shape-validated, but a malformed record is dropped rather than rejected: the
   // token above is already consumed, and postRunnerResult never retries, so
@@ -814,6 +855,35 @@ export async function handleRunnerResult(
   input.body.findingDispositions = sanitizedFindingDispositions;
   if (droppedFindingDispositions > 0) {
     console.warn(`[runner-callback] Dropped ${droppedFindingDispositions} invalid finding disposition(s)`);
+  }
+
+  // Optional diagnostic attribution: an invalid value is stripped (count-only warn, no payload)
+  // and the terminal outcome is still delivered. Unlike invalid agentConfig, this never fails closed.
+  if (body.attribution !== undefined) {
+    const attribution = sanitizeAttribution(body.attribution);
+    if (attribution) input.body.attribution = attribution;
+    else {
+      delete input.body.attribution;
+      console.warn("[runner-callback] Dropped 1 invalid attribution record(s)");
+    }
+  }
+  // Persist against the dispatch's frozen snapshot, never the claim: identity comes from the
+  // snapshot and a claim naming another snapshot yields no row. Best-effort — a failure here
+  // must not stall the terminal callback (token already consumed, no retry).
+  if (input.body.attribution) {
+    try {
+      const snapshot = loadStoredSnapshot(claims.dispatchId);
+      const row = snapshot ? normalizeInvocation(snapshot, { attribution: input.body.attribution }) : null;
+      if (row && row.attribution !== "rejected") {
+        recordInvocationAttribution(claims.dispatchId, row, {
+          timedOut: input.body.failureCode === "INVOCATION_TIMEOUT" || failure?.code === "INVOCATION_TIMEOUT",
+        });
+      } else if (snapshot) {
+        console.warn("[runner-callback] Dropped 1 attribution record(s) not matching the dispatch snapshot");
+      }
+    } catch {
+      console.warn("[runner-callback] Could not persist 1 attribution record (count only)");
+    }
   }
 
   // Same sanitize-and-drop treatment again: a Legacy run (no reviewFix marker —
@@ -840,15 +910,6 @@ export async function handleRunnerResult(
     }
   }
 
-  if (
-    input.body.outcome === "success" &&
-    input.body.phase === "implementation" &&
-    !input.body.prUrl &&
-    !input.body.noWork
-  ) {
-    console.warn(`[runner-callback] result burned dispatch=${claims.dispatchId} reason=missing_prUrl`);
-    return bad(400, "missing_prUrl");
-  }
 
   const provider = await input.resolveProvider(mappingTeamKey);
   if (!provider) {
@@ -939,17 +1000,26 @@ export async function handleRunnerResult(
       input.submitLateExternalReview &&
       pendingHeadSha &&
       input.body.prUrl &&
-      (input.body.phase === "implementation" || input.body.phase === "gap-analysis")
+      input.body.phase === "implementation"
     ) {
       const target = parsePrUrlTarget(input.body.prUrl);
       if (target) {
+        // AII-1362: record before the submit; a settled submit clears it, otherwise the poll sweep retries.
+        const workflowKey = lateExternalReviewWorkflowKey({ dispatchId: claims.dispatchId });
         try {
-          await input.submitLateExternalReview({
+          recordPendingLateReview({
+            workflowKey,
+            dispatchId: claims.dispatchId,
+            prUrl: input.body.prUrl,
+            headSha: pendingHeadSha,
+          });
+          const settled = await input.submitLateExternalReview({
             dispatchId: claims.dispatchId,
             ...target,
             prUrl: input.body.prUrl,
             headSha: pendingHeadSha,
           });
+          if (settled !== false) clearPendingLateReview(workflowKey);
         } catch (err) {
           warn("submitLateExternalReview", err);
         }
@@ -1120,9 +1190,23 @@ export async function handleRunnerResult(
       }
       // updateJobStatus first: triggers markCommentGapfillRunTerminal for trigger='comment'
       // jobs (AII-277 livelock) and resets machine_nonce on terminal transition.
-      // stampJobApproved then sets approved=1 durably (updateJobStatus never touches that column).
-      updateJobStatus(job.id, "completed", "runner_approved", job.prUrl!);
-      stampJobApproved(job.id, job.prUrl!);
+      // AII-1291: no approval mark here. The gap-fill pushed a head the external review has not
+      // judged yet; LateExternalReview writes the mark once that review passes on the head.
+      // Without Restate no mark is written and the PR is held until the poll sweep resubmits (an initial-run success stamps the mark in the callback).
+      updateJobStatus(job.id, "completed", "external_review_pending", job.prUrl!);
+      const target = parsePrUrlTarget(job.prUrl!);
+      if (input.submitLateExternalReview && target) {
+        try {
+          await input.submitLateExternalReview({
+            dispatchId: claims.dispatchId,
+            ...target,
+            prUrl: job.prUrl!,
+            gapFill: true,
+          });
+        } catch (err) {
+          warn("submitLateExternalReview", err);
+        }
+      }
     } else if (!job) {
       console.warn(`[runner-callback] no job row for dispatch=${claims.dispatchId} — gap-analysis approval mark not written`);
     }
@@ -1572,4 +1656,53 @@ export async function handleRunnerPlanningContext(
     );
     return { status: 200, body: { planningContext: "" } };
   }
+}
+
+const LATE_REVIEW_RESUBMIT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * AII-1304: a gap-fill success submits LateExternalReview once; when Restate was not ready the
+ * row stays `external_review_pending`. Each poll tick with Restate ready re-submits those rows
+ * (completed within 24 h). The workflow key is the dispatch id, so a repeat submit is a no-op.
+ */
+export async function resubmitPendingGapFillReviews(opts: {
+  ready: () => boolean;
+  submit: (input: { dispatchId: string; owner: string; repo: string; prNumber: number; prUrl: string; gapFill?: true; attemptId?: string; headSha?: string }) => Promise<boolean | void> | boolean | void;
+  now?: number;
+}): Promise<number> {
+  if (!opts.ready()) return 0;
+  let submitted = 0;
+  for (const job of getGapFillRowsAwaitingLateReview((opts.now ?? Date.now()) - LATE_REVIEW_RESUBMIT_WINDOW_MS)) {
+    const target = parsePrUrlTarget(job.prUrl!);
+    if (!target) continue;
+    console.log(`[late-review-sweep] re-submitting LateExternalReview dispatch=${job.dispatchId} pr=${job.prUrl}`);
+    try {
+      await opts.submit({ dispatchId: job.dispatchId!, ...target, prUrl: job.prUrl!, gapFill: true });
+      submitted++;
+    } catch (err) {
+      console.warn(`[late-review-sweep] submit failed dispatch=${job.dispatchId}:`, err);
+    }
+  }
+  // AII-1362: the outbox, for submits whose state is not in dispatch_log (initial runs, review-fix attempts).
+  for (const pending of getPendingLateReviews((opts.now ?? Date.now()) - LATE_REVIEW_RESUBMIT_WINDOW_MS)) {
+    const target = parsePrUrlTarget(pending.prUrl);
+    if (!target) continue;
+    console.log(`[late-review-sweep] re-submitting LateExternalReview key=${pending.workflowKey} dispatch=${pending.dispatchId} pr=${pending.prUrl}`);
+    try {
+      const settled = await opts.submit({
+        dispatchId: pending.dispatchId,
+        ...target,
+        prUrl: pending.prUrl,
+        ...(pending.headSha ? { headSha: pending.headSha } : {}),
+        ...(pending.attemptId ? { gapFill: true as const, attemptId: pending.attemptId } : {}),
+      });
+      // `false` = the hook could not reach Restate; keep the record for the next tick.
+      if (settled === false) continue;
+      clearPendingLateReview(pending.workflowKey);
+      submitted++;
+    } catch (err) {
+      console.warn(`[late-review-sweep] submit failed key=${pending.workflowKey}:`, err);
+    }
+  }
+  return submitted;
 }

@@ -539,3 +539,57 @@ describe("postRunnerResult", () => {
     expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("POST ok"));
   });
 });
+
+describe("postRunnerResult attribution", () => {
+  beforeEach(() => { vi.stubEnv("RUN_TOKEN", "run-token"); });
+  afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+
+  const attr = {
+    version: 1 as const, invocationId: "inv-1", stage: "review" as const, snapshotId: "snap-1",
+    agent: "claude" as const, provider: "anthropic" as const, model: "claude-synthetic", profileId: "p1",
+    authMode: "anthropic-api-key" as const, limit: null, outcome: "success" as const, usage: null,
+  };
+  const send = async (attribution: unknown) => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    await postRunnerResult({
+      workspaceDir: "/tmp", phase: "implementation", outcome: "success", callbackUrl: "https://cb",
+      fetchImpl, attribution: attribution as never,
+    });
+    return JSON.parse(fetchImpl.mock.calls[0][1].body as string) as Record<string, unknown>;
+  };
+
+  it("omits attribution for legacy bodies", async () => {
+    expect(await send(undefined)).not.toHaveProperty("attribution");
+  });
+
+  it("preserves valid attribution with null usage", async () => {
+    const body = await send(attr);
+    expect((body.attribution as { usage: unknown }).usage).toBeNull();
+    expect((body.attribution as { stage: string }).stage).toBe("review");
+  });
+
+  it("carries attribution on capped and failed outcomes, with the actual limit", async () => {
+    for (const [outcome, failureCode, limit] of [
+      ["failure", "MAX_TURNS_EXHAUSTED", { kind: "max_turns", value: 50 }],
+      ["failure", "INVOCATION_TIMEOUT", { kind: "timeout_ms", value: 60000 }],
+    ] as const) {
+      const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      await postRunnerResult({
+        workspaceDir: "/tmp", phase: "implementation", outcome, failureCode, failureReason: "x", callbackUrl: "https://cb",
+        fetchImpl, attribution: { ...attr, outcome: "error", limit } as never,
+      });
+      const body = JSON.parse(fetchImpl.mock.calls[0][1].body as string) as { attribution: { limit: unknown; outcome: string } };
+      expect(body.attribution.limit).toEqual(limit);
+      expect(body.attribution.outcome).toBe("error");
+      expect(JSON.stringify(body)).not.toContain("numTurns");
+    }
+  });
+
+  it("drops credential-bearing attribution before it is serialized but still delivers the result", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const body = await send({ ...attr, authorization: "Bearer sk-SYNTHETICSECRET123456" });
+    expect(body).not.toHaveProperty("attribution");
+    expect(JSON.stringify(body)).not.toContain("SYNTHETICSECRET");
+    expect(body.outcome).toBe("success");
+  });
+});

@@ -72,11 +72,11 @@ The credential `beforeEach` in `clear-runner-credentials.ts` predates the scrub 
 
 ## Type checking
 
-- `npm run typecheck` runs `tsc --noEmit` against `tsconfig.json`, which excludes `src/__tests__`. `src/admin-ui/__tests__` is not excluded, so those tests are type-checked.
-- vitest removes types without checking them. `npm test` passes test code that is not type-valid.
-- **Per-file test configs.** Each root-level `tsconfig.*-tests.json` extends `tsconfig.json`, lists the files it checks in `include` (mostly named test files; some add the source files under test, and `tsconfig.restate-tests.json` uses globs), and sets `"exclude": []`. The empty `exclude` is required, because the base config's `exclude` still filters a derived config's `include`. Without it, a config that lists only test files fails with `TS18003: No inputs were found`, and a config that also lists a source file passes with exit code 0 while it silently drops the test files. Confirm the checked set with `tsc --listFiles` when you write a new config.
-- CI runs six of these configs: `tsconfig.review-fix-ports-tests.json`, `tsconfig.dispatch-admission-tests.json`, `tsconfig.review-fix-attempt-store-tests.json`, `tsconfig.review-fix-finalize-tests.json` and `tsconfig.aii-806-tests.json` in the `unit-tests` job, and `tsconfig.restate-tests.json` in the `restate-tests` job. The others are not run anywhere.
-- The current convention, stated in `CLAUDE.md` § Running tests and [bug-fix-tests.md](bug-fix-tests.md) § Which tier: type-check a new test file with a throwaway config.
+- vitest removes types without checking them, so `npm test` passes test code that is not type-valid. The type check is what catches a test that no longer matches the code it tests.
+- `npm run typecheck` runs two passes. The first is `tsc --noEmit` against `tsconfig.json`, which excludes `src/__tests__`. The second is `tsc --noEmit -p tsconfig.tests.json`, which extends it, includes every `.ts` file under `src/` and sets `"exclude": []`, so every test file is checked, the Restate tier's included.
+- The empty `exclude` is required, because the base config's `exclude` still filters a derived config's `include`. Without it, a config that lists only test files fails with `TS18003: No inputs were found`, and a config that also lists a source file passes with exit code 0 while it silently drops the test files.
+- Test files are held to the base config's options, `noUnusedLocals` and `noUnusedParameters` among them, so an unused import or variable in a test fails the check.
+- A new test file needs no config of its own: the second pass's `include` already covers it. `tsc --noEmit --listFiles -p tsconfig.tests.json` shows the checked set.
 
 ## Fakes and fixtures
 
@@ -183,7 +183,7 @@ Pass `fake.fetch` where a module takes `fetchImpl`, or call `fake.install()` whe
 
 | Job | Runs |
 |---|---|
-| `unit-tests` | `npm ci`; `npm test`; `npm run typecheck`; five per-file test configs |
+| `unit-tests` | `npm ci`; `npm test`; `npm run typecheck` (both passes, so every test file is type-checked) |
 | `restate-tests-binary` | `npm run test:restate`, once in each of three parallel passes |
 
 No job unsets anything before running tests: the scrub gives CI the same environment as every other machine.

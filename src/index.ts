@@ -25,7 +25,7 @@ import {
   type StaleAdmissionCandidate,
 } from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
-import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, fetchRepoTarball, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, type DispatchInputs } from "./github.js";
+import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, postPrComment, defaultFetchSignal, fetchRepoTarball, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, type DispatchInputs } from "./github.js";
 import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -56,6 +56,20 @@ import { allowlistHasNoAdmin, initAccessEntriesTable } from "./access-entries.js
 import { initAccessAuditTable } from "./access-audit.js";
 import { initAuthEventsTable } from "./mcp-auth-events.js";
 import { initAccessPageGrantsTable } from "./access-page-grants.js";
+import { createModelAuthRoutes } from "./model-auth-routes.js";
+import { createAgentConfigAdminDeps, getModelAuthRuntime, type ModelAuthRuntime } from "./model-auth-runtime.js";
+import {
+  classifyLaunchError,
+  ghaLaunchOutcome,
+  ghaManagedCredentials,
+  isManagedProject,
+  prepareManagedDispatch,
+  refusalText,
+  settleLaunch,
+  type ManagedDispatchDecision,
+} from "./managed-dispatch-auth.js";
+import { buildProtectedFlyBootstrap } from "./fly-protection-key.js";
+import { requestChatGptPlanRefresh } from "./restate/chatgpt-plan-account.js";
 import { handleTokenRequest } from "./token-vending.js";
 import { handleDependencyTokenRequest } from "./dependency-token-vending.js";
 import { handlePublicationAuthorityCheck, handlePublicationTokenRequest } from "./publication-token-vending.js";
@@ -68,16 +82,16 @@ import { createMachine, getMachine, listMachines, generateSessionToken, generate
 import { isDurableRunnerMachine, safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
 import type { ReaperHelpers } from "./reaper.js";
 import { seedKgMaterializeDirectFromEnv, seedKgExecutionModeFromEnv, getRunnerMode, getFlySecretsMinVersion, getFlyProcessLevelSecrets, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
-import { handleGitHubWebhook } from "./webhook.js";
+import { handleGitHubWebhook, type KgPrCheckConfig } from "./webhook.js";
 import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
-import { getOrchestratorSettings, getRunnerBackendSource, getFlySessionsConfig, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, getRetryPolicy, seedRunnerBackends, refreshRunnerBackendCache } from "./orchestrator-settings.js";
-import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
+import { getOrchestratorSettings, getRunnerBackendSource, getFlySessionsConfig, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, seedRunnerImageAllowedPrefixesFromEnv, getRetryPolicy, seedRunnerBackends, refreshRunnerBackendCache } from "./orchestrator-settings.js";
+import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, resubmitPendingGapFillReviews, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
-import { mintRunToken, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
+import { mintLaunchTokens, IMPLEMENTATION_TTL_SECONDS, type LaunchTokens } from "./runner-tokens.js";
 import { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
 import { createReviewFixAdminFacade } from "./review-fix-admin-facade.js";
 import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "./review-fix-worker.js";
@@ -105,16 +119,19 @@ import {
   removeLocalContainer,
   startLocalRunnerContainer,
   sweepExitedLocalContainers,
+  validateProtectedLocalInput,
+  type LocalRunnerInput,
+  type StartLocalContainerInput,
 } from "./local-docker.js";
 import { clearPrNotFoundGrace, decideCleanExitOutcome, shouldSkipCompletionNotice, workflowFileForJob } from "./monitor-status.js";
 import type { RunPrCandidate, RunPrMatch } from "./monitor-status.js";
 import { pickPrForRun } from "./monitor-status.js";
-import { type RunConfigV1, encodeRunConfig, buildImplRunConfig } from "./run-config.js";
+import { type RunConfigV1, type RunCredentialsV1, encodeRunConfig, buildImplRunConfig } from "./run-config.js";
 import { resolveBaseBranch, findOpenRollUpPr, resolvePlanningBranch } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
 import { runAutoMerges } from "./auto-merge.js";
-import { getPendingReviewFixes, listReviewFixEvents, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, acceptReviewFixWebhookEvent, buildReviewFixTaskDescription, MAX_TASK_FINDINGS } from "./review-fix-queue.js";
+import { getPendingReviewFixes, listReviewFixEvents, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, acceptReviewFixWebhookEvent, prepareReviewFixTask, previewReviewFixText } from "./review-fix-queue.js";
 import { initReviewFixEvidenceTable, sweepExpiredReviewFixEvidence } from "./review-fix-evidence.js";
 import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
 import { sweepOrphanedGapfillRows } from "./comment-gapfill-queue.js";
@@ -148,6 +165,7 @@ import { createKgFindRunByTitle, createProductionKgRefreshServices, bindKeptMach
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
+import { checkPipelineSchedules } from "./restate/pipeline-schedule.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { resolveReviewProcess } from "./review-process.js";
 import { createLateExternalReviewIngressClient, createLateExternalReviewSubmitHook, createProductionLateExternalReviewServices } from "./restate/late-external-review.js";
@@ -158,6 +176,7 @@ import { callTool, callToolAsSystem } from "./restate/tools-client.js";
 import { makeKgRefresh, migrateLegacyDryRunOutcomes, runKgRefreshPreflight, defaultFetchDefaultBranch, defaultFetchSnapshotCommitSha, defaultMaterialize, defaultMcpToolCall, defaultPersistLastRefresh, defaultLoadLastRefresh } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
 import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
+import { scrubOperatorLegacyTokens } from "./restate/operator-legacy-scrub.js";
 
 /**
  * The reaper's helper callbacks. The KgRefresh workflow owns kg-refresh rows, so the
@@ -411,6 +430,25 @@ export async function guardOpenPrBeforeImplementationDispatch(
   return false;
 }
 
+/**
+ * Mint the GitHub token a Fly or local-Docker child runner boots with, scoped to the
+ * mapping's target repository alone. Throws on failure so the launch aborts; there is
+ * deliberately no fallback to the installation-wide token.
+ */
+async function getTargetRepoToken(
+  config: Pick<AppConfig, "githubAppId" | "githubAppPrivateKey">,
+  owner: string,
+  repo: string,
+): Promise<string> {
+  const scoped = await getScopedInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner, {
+    repositories: [repo],
+  });
+  return scoped.token;
+}
+
+/** True once the KG composition (and so the `PipelineSchedule` service) is bound at boot. */
+let kgScheduleBound = false;
+
 async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const cycle = beginCycle();
   if (!cycle) {
@@ -423,6 +461,8 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   const timeoutMs = config.pollCycleTimeoutMs;
 
   await refreshRunnerBackendCache();
+  // Outside the cycle deadline: the check has its own timeout and never throws. Only bound when the KG composition exists.
+  if (kgScheduleBound) await checkPipelineSchedules(["kg-refresh"]);
   await runWithDeadline(
     cycleId,
     started,
@@ -810,8 +850,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
           if (execPath === "both") {
             // Shadow: GHA is primary (controls ticket state and dedup); Fly is secondary
-            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
-            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue, true);
+            await dispatchBothMode(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
           } else if (execPath === "local-docker") {
             await dispatchLocalDocker(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
           } else if (execPath === "fly-machines") {
@@ -831,6 +870,13 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   // Monitor in-flight jobs and send completion notifications
   await monitorJobs(config, registry);
+
+  // AII-1304: retry LateExternalReview for gap-fill rows submitted while Restate was not ready.
+  try {
+    await resubmitPendingGapFillReviews({ ready: restateReady, submit: lateExternalReviewSubmitHook });
+  } catch (err) {
+    console.error("[poll] late-review sweep failed:", err);
+  }
 
   // Local mode: reap exited containers no in-flight job owns. A planning job
   // finalized by the runner callback goes terminal before the monitor's
@@ -887,6 +933,18 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     tokenForOwner: (owner) =>
       getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
     getPullRequestState,
+    // AII-1294: a parent's own PR closed unmerged must not block its roll-up.
+    finalizeGroupingParent: async (job) => {
+      const prNumber = job.prUrl ? prNumberFromUrl(job.prUrl) : null;
+      const entry = job.repo && prNumber !== null ? resolvePrMapping(getMappings(), job.repo, prNumber) : undefined;
+      if (!entry) {
+        console.error(`[merge-poll] No mapping resolves for grouping parent ${job.issueIdentifier} (${job.repo} ${job.prUrl}); not finalizing`);
+        return false;
+      }
+      const provider = await registry.forMapping(entry.mapping);
+      await provider.markMerged(job.issueId, entry.scopeKey);
+      return true;
+    },
   });
 
   // Process any pending reconciliation jobs triggered by merged PRs
@@ -926,6 +984,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
       runnerTokenSecret: config.runnerTokenSecret,
       getInstallationToken: (owner) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
+      getTargetRepoToken: (owner, repo) => getTargetRepoToken(config, owner, repo),
       getInstallationId: (owner) => getInstallationId(config.githubAppId, config.githubAppPrivateKey, owner),
       resolveRunnerImage: (mapping, ghToken) => resolveDispatchRunnerImage(config, mapping, ghToken),
       checkContract: (params) => resolveWorkflowCapabilities(params),
@@ -946,6 +1005,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       sessionImage: config.sessionImage,
       localRunnerImage: config.localRunnerImage,
       localRunnerOrchestratorUrl: config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? `http://host.docker.internal:${config.healthPort}`,
+      modelAuthRuntime: getModelAuthRuntime(config),
     });
   }
 
@@ -1089,6 +1149,24 @@ async function resolveDispatchRunnerImage(
 // Exported for direct testing of the pre-launch-failure release path — see
 // "real entry-point/monitor regressions" in dispatch-routing.test.ts. Not part of the
 // module's public API otherwise; every production call site is within this file.
+/** "both" mode: GHA is primary, Fly the shadow. Decision 6: an opted-in project gets no Fly shadow
+ *  (the GHA primary refused it), so the shadow is skipped rather than promoted. */
+export async function dispatchBothMode(
+  config: AppConfig,
+  provider: TicketingProvider,
+  issue: DispatchableIssue,
+  mapping: RepoMapping,
+  prior: { count: number; lastDispatchedAt: number | null },
+  runnerMode: string,
+  baseBranch: string,
+  baseBranchFieldValue: string | null,
+): Promise<void> {
+  await dispatchGitHubActions(config, provider, issue, mapping, prior, runnerMode, baseBranch, baseBranchFieldValue);
+  if (!isManagedProject(issue.scopeKey)) {
+    await dispatchFlyMachine(config, provider, issue, mapping, prior, runnerMode, baseBranch, baseBranchFieldValue, true);
+  }
+}
+
 export async function dispatchGitHubActions(
   config: AppConfig,
   provider: TicketingProvider,
@@ -1100,6 +1178,10 @@ export async function dispatchGitHubActions(
   /** The validated "AI-Implement Base Branch" field value, or null when unset. Distinct
    *  from baseBranch, which also covers the feature-branch-grouping fallback. */
   baseBranchFieldValue: string | null,
+  /** Typed trusted-preparation seam (AII-958 composes it): private credentials such as a
+   *  model-auth grant. Requires supportsPrivateRunConfig at the exact workflow/ref; an
+   *  unsupported reader fails before launch rather than dropping them. */
+  trustedCredentials?: RunCredentialsV1,
 ): Promise<void> {
   // Final admission authority: one transaction reserves team capacity and per-issue
   // occupancy before any credential mint or launch call. canDispatch (checked earlier,
@@ -1116,6 +1198,40 @@ export async function dispatchGitHubActions(
   });
   if (!admission.ok) return;
 
+  // Managed model authentication (AII-1420): decided after admission and before any run token is minted.
+  // The decision carries the frozen snapshot and the one-shot bootstrap; a refusal launches nothing.
+  const managedRuntime = getModelAuthRuntime(config);
+  let managedDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
+  if (isManagedProject(issue.scopeKey, dispatchId)) {
+    let decision: ManagedDispatchDecision;
+    try {
+      decision = await prepareManagedDispatch(
+        { dispatchId, projectKey: issue.scopeKey, backend: "github-actions", owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile },
+        managedRuntime,
+      );
+    } catch (err) {
+      admission.release("launch_rejected");
+      throw err;
+    }
+    console.log(`[poll] Managed dispatch for ${issue.identifier}: ${decision.kind}${"code" in decision ? ` (${decision.code})` : ""}`);
+    if (decision.kind === "legacy" || decision.kind === "launch") {
+      managedDecision = decision;
+    } else {
+      admission.release("launch_rejected");
+      if (decision.kind === "refuse") {
+        await provider.markImplementationFailed(issue.id, issue.scopeKey, refusalText(decision));
+        // Count the refusal so a persistently refused issue parks instead of re-commenting every poll.
+        const breakerRefuse = recordDispatchFailure(issue.id, "implementation", decision.code);
+        if (breakerRefuse.tripped) {
+          await fireBreakerTrip(config, provider, issue.id, issue.identifier, "implementation", breakerRefuse.failures, decision.code);
+        }
+      } else {
+        console.log(`[poll] ${refusalText(decision)} (${issue.identifier})`);
+      }
+      return;
+    }
+  }
+
   // True whenever base_branch is forwarded as a legacy workflow input — set by the
   // field OR by feature-branch grouping. Used only to attribute a 422 below.
   const implSentBaseBranch = baseBranch !== mapping.defaultBranch;
@@ -1128,32 +1244,27 @@ export async function dispatchGitHubActions(
   const { ghToken, runnerImage, contract, dispatchInputs } =
     await (async () => {
       const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+      const managedCredentials = ghaManagedCredentials(managedDecision, config.runnerCallbackBaseUrl, { extraEnv: mapping.extraEnv });
+      const credentials = managedCredentials ? { ...trustedCredentials, ...managedCredentials } : trustedCredentials;
 
       let runnerCallbackUrl = "";
       let runToken = "";
       let runProgressToken = "";
+      let mintedPublicationToken: string | undefined;
       if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
-        const minted = mintRunToken({
+        const minted = mintLaunchTokens({
           issueId: issue.id,
           mappingTeamKey: issue.scopeKey,
           phase: "implementation",
-          audience: "result",
           dispatchId,
-          ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-          secret: config.runnerTokenSecret,
-        });
-        const progressMinted = mintRunToken({
-          issueId: issue.id,
-          mappingTeamKey: issue.scopeKey,
-          phase: "implementation",
-          audience: "progress",
-          dispatchId,
+          repository: `${mapping.owner}/${mapping.repo}`,
           ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
           secret: config.runnerTokenSecret,
         });
         runnerCallbackUrl = config.runnerCallbackBaseUrl;
-        runToken = minted.token;
-        runProgressToken = progressMinted.token;
+        runToken = minted.runToken;
+        runProgressToken = minted.runProgressToken;
+        mintedPublicationToken = minted.runPublicationToken;
       }
 
       const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
@@ -1166,21 +1277,16 @@ export async function dispatchGitHubActions(
         ref: mapping.defaultBranch,
       });
       const { contract } = workflowCapabilities;
-      const runPublicationToken = contract === "envelope"
-        && workflowCapabilities.supportsRunPublicationToken
-        && dispatchId
-        && config.runnerCallbackBaseUrl
-        && config.runnerTokenSecret
-        ? mintRunToken({
-            issueId: issue.id,
-            mappingTeamKey: issue.scopeKey,
-            phase: "implementation",
-            audience: "publication",
-            dispatchId,
-            repository: `${mapping.owner}/${mapping.repo}`,
-            ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-            secret: config.runnerTokenSecret,
-          }).token
+      assertPrivateTransportForCredentials(
+        credentials, workflowCapabilities,
+        `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
+      );
+      assertExecutionPolicyCapability(
+        credentials, workflowCapabilities,
+        `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
+      );
+      const runPublicationToken = contract === "envelope" && workflowCapabilities.supportsRunPublicationToken
+        ? mintedPublicationToken
         : undefined;
 
       const dispatchInputs = contract === "envelope"
@@ -1191,6 +1297,9 @@ export async function dispatchGitHubActions(
             runToken,
             runProgressToken,
             runPublicationToken,
+            privateTransport: workflowCapabilities.supportsPrivateRunConfig === true,
+            credentials,
+            ...(managedDecision.kind === "launch" ? { agentConfig: managedDecision.snapshot } : {}),
             runnerImage,
             groupingParent: isGroupingParentDispatch(issue) || undefined,
             retryPolicy: getRetryPolicy(),
@@ -1218,6 +1327,8 @@ export async function dispatchGitHubActions(
 
       return { ghToken, runnerCallbackUrl, runToken, runProgressToken, runnerImage, contract, dispatchInputs };
     })().catch((err) => {
+      // Nothing launched: revoke the grant and free the reservation.
+      settleLaunch(managedDecision, "rejected", managedRuntime);
       admission.release("launch_rejected");
       throw err;
     });
@@ -1226,15 +1337,23 @@ export async function dispatchGitHubActions(
   // itself refused the request (a 4xx before any run started) — the one signal precise
   // enough to treat as a definitive non-launch. Anything else (a thrown network error,
   // a 5xx, "unknown") stays uncertain and must not release the reservation below.
-  const result = await postWorkflowDispatch({
-    token: ghToken,
-    owner: mapping.owner,
-    repo: mapping.repo,
-    workflowFile: mapping.workflowFile,
-    ref: mapping.defaultBranch,
-    inputs: dispatchInputs,
-    returnRunDetails: true,
-  });
+  let result: Awaited<ReturnType<typeof postWorkflowDispatch>>;
+  try {
+    result = await postWorkflowDispatch({
+      token: ghToken,
+      owner: mapping.owner,
+      repo: mapping.repo,
+      workflowFile: mapping.workflowFile,
+      ref: mapping.defaultBranch,
+      inputs: dispatchInputs,
+      returnRunDetails: true,
+    });
+  } catch (err) {
+    // Uncertain: the request may have reached GitHub. Revoke the grant; the admission stays held.
+    settleLaunch(managedDecision, "unknown", managedRuntime);
+    throw err;
+  }
+  settleLaunch(managedDecision, ghaLaunchOutcome(result), managedRuntime);
 
   if (!result.success) {
     await surfaceDispatchFailure(
@@ -1332,6 +1451,9 @@ export type PlanningDispatchContext = {
    *  resolvedPlanningBranch, which may instead resolve to the feature-branch chain
    *  target or fall back to the mapping default. */
   planningFieldValue: string | null;
+  /** Typed trusted-preparation seam (AII-958): private credentials for the planning run. Planning
+   *  never receives publication authority; requires supportsPrivateRunConfig or fails pre-launch. */
+  trustedCredentials?: RunCredentialsV1;
 };
 
 /**
@@ -1508,7 +1630,9 @@ export async function dispatchPlanning(
   // dispatchGitHubActions.
   const launch = await preparePlanningLaunch({
     config, provider, issue, mapping, dispatchId, resolvedPlanningBranch,
+    trustedCredentials: ctx.trustedCredentials,
     resolveRunnerImage: resolveDispatchRunnerImage,
+    fireBreakerTrip,
   }).catch((err) => {
     planningAdmission.release("launch_rejected");
     throw err;
@@ -1590,7 +1714,7 @@ export interface HeldReservation {
 /** What `dispatchSession` reports to a caller that cares (the shadow and implementation
  * callers ignore it). `admitted: false` means `acquireDispatch` refused and nothing ran. */
 export type DispatchSessionResult =
-  | { admitted: false }
+  | { admitted: false; refusal?: string }
   | { admitted: true; machineId: string; executionMode: "fly-machines" | "local-docker" };
 
 export async function dispatchSession(
@@ -1609,6 +1733,9 @@ export async function dispatchSession(
      *  the shadow Fly dispatch mirrors an already-admitted GHA primary and must not
      *  compete for (or be blocked by) the same issue's reservation. */
     backendKind: "fly-machines" | "local-docker";
+    /** Managed model authentication (AII-958). Absent means the caller is not wired: an
+     *  opted-in project then refuses with `phase_not_wired` instead of launching legacy. */
+    managedAuth?: { runtime: ModelAuthRuntime; workflowFile: string };
     /** Classifies a thrown backend() error, once the backend has called
      *  `markLaunchAttempted`, as a proven non-launch (safe to release the reservation)
      *  versus an ambiguous failure (must stay held for the matching Legacy monitor to
@@ -1622,6 +1749,10 @@ export async function dispatchSession(
       machineNonce: string;
       runnerCallbackUrl: string;
       runToken: string;
+      runProgressToken: string;
+      runPublicationToken?: string;
+      /** `legacy` for today's path; `launch` carries the snapshot and the one-shot bootstrap. */
+      managedAuth: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }>;
       /** Call immediately before the actual launch call (createMachine / the local
        *  Docker spawn) — everything the backend does before this point (minting a
        *  credential, resolving an image) is provably side-effect-free for the
@@ -1669,20 +1800,46 @@ export async function dispatchSession(
     admission = decision;
   }
 
-  let runnerCallbackUrl = "";
-  let runToken = "";
-  if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
-    const minted = mintRunToken({
-      issueId: issue.id,
-      mappingTeamKey: issue.scopeKey,
-      phase: opts.phase,
-      audience: "result",
-      dispatchId,
-      ttlSeconds: opts.tokenTtlSeconds,
-      secret: config.runnerTokenSecret,
-    });
-    runnerCallbackUrl = config.runnerCallbackBaseUrl;
-    runToken = minted.token;
+  // Managed model authentication: decided before any run token is minted. Only an
+  // admission acquired here is released; a caller-held reservation is never ours to free.
+  let managedDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
+  if (!opts.managedAuth) {
+    if (isManagedProject(issue.scopeKey, dispatchId)) {
+      admission?.release("launch_rejected");
+      console.warn(`[poll] Managed dispatch for ${issue.identifier}: phase_not_wired (${opts.phase}); nothing launched`);
+      return { admitted: false, refusal: "phase_not_wired" };
+    }
+  } else if (opts.shadow && isManagedProject(issue.scopeKey, dispatchId)) {
+    return { admitted: false };
+  } else {
+    const decision = await prepareManagedDispatch(
+      { dispatchId, projectKey: issue.scopeKey, backend: opts.backendKind, owner: mapping.owner, repo: mapping.repo, workflowFile: opts.managedAuth.workflowFile },
+      opts.managedAuth.runtime,
+    );
+    console.log(
+      `[poll] Managed dispatch for ${issue.identifier}: ${decision.kind}${"code" in decision ? ` (${decision.code})` : ""}`,
+    );
+    if (decision.kind === "legacy" || decision.kind === "launch") {
+      managedDecision = decision;
+    } else {
+      admission?.release("launch_rejected");
+      if (decision.kind === "refuse") {
+        const text = refusalText(decision);
+        if (opts.phase === "implementation") {
+          await provider.markImplementationFailed(issue.id, issue.scopeKey, text);
+        } else {
+          await provider.markPlanningFailed(issue.id, issue.scopeKey, text);
+        }
+        // Count the refusal so a persistently refused issue parks instead of re-commenting every poll.
+        const breakerRefuse = recordDispatchFailure(issue.id, opts.phase, decision.code);
+        if (breakerRefuse.tripped) {
+          await fireBreakerTrip(config, provider, issue.id, issue.identifier, opts.phase, breakerRefuse.failures, decision.code);
+        }
+      } else {
+        console.log(`[poll] ${refusalText(decision)} (${issue.identifier})`);
+      }
+      return { admitted: false, refusal: decision.code };
+    }
   }
 
   let launchAttempted = false;
@@ -1692,8 +1849,34 @@ export async function dispatchSession(
 
   let result: SessionBackendResult;
   try {
-    result = await opts.backend({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted });
+    let runnerCallbackUrl = "";
+    let tokens: Partial<LaunchTokens> = {};
+    if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
+      tokens = mintLaunchTokens({
+        issueId: issue.id,
+        mappingTeamKey: issue.scopeKey,
+        phase: opts.phase,
+        dispatchId,
+        repository: `${mapping.owner}/${mapping.repo}`,
+        ttlSeconds: opts.tokenTtlSeconds,
+        secret: config.runnerTokenSecret,
+      });
+      runnerCallbackUrl = config.runnerCallbackBaseUrl;
+    }
+    result = await opts.backend({
+      sessionToken,
+      machineNonce,
+      runnerCallbackUrl,
+      runToken: tokens.runToken ?? "",
+      runProgressToken: tokens.runProgressToken ?? "",
+      runPublicationToken: tokens.runPublicationToken,
+      managedAuth: managedDecision,
+      markLaunchAttempted,
+    });
   } catch (err) {
+    if (managedDecision.kind === "launch" && opts.managedAuth) {
+      settleLaunch(managedDecision, classifyLaunchError(opts.backendKind, launchAttempted, err), opts.managedAuth.runtime);
+    }
     if (admission && shouldReleaseAdmissionOnDispatchError(launchAttempted, err, opts.isDefinitiveLaunchFailure)) {
       admission.release("launch_rejected");
     }
@@ -1770,7 +1953,9 @@ export async function dispatchSession(
 
 // ---------- Dispatch: Fly Machines ----------
 
-async function dispatchFlyMachine(
+// Exported for direct testing of the launch contract — see the matching comment on
+// dispatchGitHubActions. Not part of the module's public API otherwise.
+export async function dispatchFlyMachine(
   config: AppConfig,
   provider: TicketingProvider,
   issue: DispatchableIssue,
@@ -1796,7 +1981,7 @@ async function dispatchFlyMachine(
     return;
   }
 
-  if (!config.anthropicApiKey && !config.claudeOAuthToken) {
+  if (!config.anthropicApiKey && !config.claudeOAuthToken && !isManagedProject(issue.scopeKey)) {
     const level = shadow ? "warn" : "error";
     console[level](`[poll] ${shadow ? "Shadow Fly dispatch skipped" : "Cannot dispatch"} ${issue.identifier} via Fly Machines: neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set`);
     return;
@@ -1813,9 +1998,10 @@ async function dispatchFlyMachine(
     doMarkDispatched: !shadow,
     shadow,
     backendKind: "fly-machines",
+    managedAuth: { runtime: getModelAuthRuntime(config), workflowFile: mapping.workflowFile },
     isDefinitiveLaunchFailure: isDefinitiveFlyRejectionError,
     branchInfo: shadow ? undefined : { fieldValue: baseBranchFieldValue, defaultBranch: mapping.defaultBranch },
-    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted }) => {
+    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, runProgressToken, runPublicationToken, managedAuth, markLaunchAttempted }) => {
       const minSecretsVersion = getFlySecretsMinVersion();
 
       let allSecretNames: string[] = [];
@@ -1826,7 +2012,7 @@ async function dispatchFlyMachine(
         console.warn(`[poll] Failed to fetch app secrets for ${issue.identifier}, proceeding without team secrets:`, err);
       }
 
-      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+      const ghToken = await getTargetRepoToken(config, mapping.owner, mapping.repo);
 
       const { image: resolvedImage, source: imageSource } = await resolveSessionImage({
         owner: mapping.owner,
@@ -1835,6 +2021,14 @@ async function dispatchFlyMachine(
         defaultImage: config.sessionImage,
       });
 
+      // Protected launch: the capability check and the launch must agree on the paired image,
+      // and every throw here precedes markLaunchAttempted so the grant is settled as rejected.
+      const protectedLaunch = managedAuth.kind === "launch" ? managedAuth : null;
+      if (protectedLaunch) {
+        if (imageSource === "override") throw new Error("managed dispatch refused: repository image override");
+        if (!config.runnerCallbackBaseUrl) throw new Error("managed dispatch refused: no runner callback base URL");
+      }
+
       const implRunConfig: RunConfigV1 = buildImplRunConfig({
         issue,
         mapping,
@@ -1842,7 +2036,22 @@ async function dispatchFlyMachine(
         runnerCallbackUrl,
         groupingParent: isGroupingParentDispatch(issue),
         retryPolicy: getRetryPolicy(),
+        ...(protectedLaunch ? { agentConfig: protectedLaunch.snapshot } : {}),
       });
+
+      let protectedModelBootstrap: Awaited<ReturnType<typeof buildProtectedFlyBootstrap>> | undefined;
+      if (protectedLaunch) {
+        const bootstrap = protectedLaunch.takeBootstrap();
+        if (!bootstrap) throw new Error("managed dispatch refused: bootstrap unavailable");
+        protectedModelBootstrap = await buildProtectedFlyBootstrap({
+          token: flyToken,
+          app: flyApp,
+          bootstrap,
+          projectKey: issue.scopeKey,
+          runConfig: implRunConfig,
+          modelAuthUrl: config.runnerCallbackBaseUrl!,
+        });
+      }
 
       const machineConfig = buildSessionMachineConfig({
         image: resolvedImage,
@@ -1853,8 +2062,8 @@ async function dispatchFlyMachine(
         owner: mapping.owner,
         repo: mapping.repo,
         defaultBranch: baseBranch,
-        anthropicApiKey: config.anthropicApiKey ?? undefined,
-        claudeOAuthToken: config.claudeOAuthToken ?? undefined,
+        anthropicApiKey: protectedLaunch ? undefined : (config.anthropicApiKey ?? undefined),
+        claudeOAuthToken: protectedLaunch ? undefined : (config.claudeOAuthToken ?? undefined),
         githubToken: ghToken,
         sessionToken,
         machineNonce,
@@ -1870,13 +2079,16 @@ async function dispatchFlyMachine(
         orchestratorUrl: config.runnerCallbackBaseUrl ?? undefined,
         runnerCallbackUrl: runnerCallbackUrl || undefined,
         runToken: runToken || undefined,
+        runProgressToken: runProgressToken || undefined,
+        runPublicationToken,
         orchestratorApp: config.flyOrchestratorApp ?? undefined,
         tenantId: config.tenantId ?? undefined,
         expectedTtlSeconds: Math.round(SWEEP_MACHINE_MAX_AGE_MS / 1000),
         extraEnv: (() => {
-          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue), ...assigneeRunnerEnv(issue), AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(implRunConfig) };
+          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue), ...assigneeRunnerEnv(issue), ...(protectedLaunch ? {} : { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(implRunConfig) }) };
           return Object.keys(merged).length > 0 ? merged : undefined;
         })(),
+        ...(protectedLaunch && protectedModelBootstrap ? { protectedModelBootstrap, dispatchId: protectedLaunch.dispatchId } : {}),
       });
       if (getFlyProcessLevelSecrets().enabled) {
         const secretNames = machineConfig.config.processes?.[0]?.secrets?.map((s) => s.name ?? s.env_var) ?? [];
@@ -1922,7 +2134,7 @@ export async function dispatchLocalDocker(
     return;
   }
 
-  if (!config.anthropicApiKey && !config.claudeOAuthToken) {
+  if (!config.anthropicApiKey && !config.claudeOAuthToken && !isManagedProject(issue.scopeKey)) {
     console.error(`[poll] Cannot dispatch ${issue.identifier} via local Docker: neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set`);
     return;
   }
@@ -1933,15 +2145,18 @@ export async function dispatchLocalDocker(
     doMarkDispatched: true,
     shadow: false,
     backendKind: "local-docker",
+    managedAuth: { runtime: getModelAuthRuntime(config), workflowFile: mapping.workflowFile },
     isDefinitiveLaunchFailure: isDefinitiveLocalDockerLaunchFailure,
     branchInfo: { fieldValue: baseBranchFieldValue, defaultBranch: mapping.defaultBranch },
-    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted }) => {
+    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, runProgressToken, runPublicationToken, managedAuth, markLaunchAttempted }) => {
       const localOrchestratorUrl =
         config.localRunnerOrchestratorUrl ??
         config.runnerCallbackBaseUrl ??
         `http://host.docker.internal:${config.healthPort}`;
 
-      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+      const ghToken = await getTargetRepoToken(config, mapping.owner, mapping.repo);
+
+      const protectedLaunch = managedAuth.kind === "launch" ? managedAuth : null;
 
       const localImplRunConfig: RunConfigV1 = buildImplRunConfig({
         issue,
@@ -1950,10 +2165,23 @@ export async function dispatchLocalDocker(
         runnerCallbackUrl,
         groupingParent: isGroupingParentDispatch(issue),
         retryPolicy: getRetryPolicy(),
+        ...(protectedLaunch ? { agentConfig: protectedLaunch.snapshot } : {}),
       });
 
-      markLaunchAttempted();
-      const container = await startLocalRunnerContainer({
+      // Every throw here precedes markLaunchAttempted so the grant is settled as rejected.
+      let protectedModelAuth: LocalRunnerInput["protectedModelAuth"];
+      if (protectedLaunch) {
+        const bootstrap = protectedLaunch.takeBootstrap();
+        if (!bootstrap) throw new Error("managed dispatch refused: bootstrap unavailable");
+        protectedModelAuth = {
+          bootstrap,
+          projectKey: issue.scopeKey,
+          runConfig: localImplRunConfig,
+          modelAuthUrl: localOrchestratorUrl,
+        };
+      }
+
+      const localRunnerInput: StartLocalContainerInput = {
         image: config.localRunnerImage,
         issueId: issue.id,
         issueIdentifier: issue.identifier,
@@ -1962,8 +2190,8 @@ export async function dispatchLocalDocker(
         owner: mapping.owner,
         repo: mapping.repo,
         defaultBranch: baseBranch,
-        anthropicApiKey: config.anthropicApiKey ?? undefined,
-        claudeOAuthToken: config.claudeOAuthToken ?? undefined,
+        anthropicApiKey: protectedLaunch ? undefined : (config.anthropicApiKey ?? undefined),
+        claudeOAuthToken: protectedLaunch ? undefined : (config.claudeOAuthToken ?? undefined),
         githubToken: ghToken,
         sessionToken,
         machineNonce,
@@ -1971,11 +2199,19 @@ export async function dispatchLocalDocker(
         orchestratorUrl: localOrchestratorUrl,
         runnerCallbackUrl: runnerCallbackUrl || undefined,
         runToken: runToken || undefined,
+        runProgressToken: runProgressToken || undefined,
+        runPublicationToken,
         extraEnv: (() => {
-          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue), ...assigneeRunnerEnv(issue), AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(localImplRunConfig) };
+          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue), ...assigneeRunnerEnv(issue), ...(protectedLaunch ? {} : { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(localImplRunConfig) }) };
           return Object.keys(merged).length > 0 ? merged : undefined;
         })(),
-      });
+        ...(protectedModelAuth ? { protectedModelAuth } : {}),
+      };
+      // Reserved extraEnv names and legacy credentials fail here, before the grant is marked launched.
+      if (protectedModelAuth) validateProtectedLocalInput(localRunnerInput, protectedModelAuth);
+
+      markLaunchAttempted();
+      const container = await startLocalRunnerContainer(localRunnerInput);
 
       return {
         machineId: container.containerId,
@@ -2070,7 +2306,7 @@ const LOG_MAX_CHARS = 5_000;
  * on successful sessions.
  *
  * Note: when a machine was already auto-destroyed (machineConclusion ===
- * "destroyed") the Fly API returns 404 and no log dump is possible.  Callers
+ * "destroyed") the logs lookup may fail with 404 and no log dump is possible.  Callers
  * must skip this function for that path.
  */
 async function postSessionLogs(
@@ -2375,7 +2611,7 @@ export async function tryFastReleasePlanningAdmission(config: AppConfig, dispatc
   }
 }
 
-const TTL_STALE_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved"]);
+const TTL_STALE_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved", "external_review_pending"]);
 
 export async function monitorJobs(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const inFlightJobs = getInFlightJobs();
@@ -3573,17 +3809,12 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
       let runnerCallbackUrl = "";
       let runToken = "";
       let runProgressToken = "";
+      let mintedPublicationToken: string | undefined;
       let dispatchId: string | undefined;
       // This snapshot defines the findings this specific gap-fill dispatch is
       // allowed to resolve. Findings that arrive after the snapshot remain open
       // for a later queue event rather than being cleared by an older run.
       const openFindings = listOpenReviewFindings(fix.repo, fix.prNumber);
-      // Must match the slice buildReviewFixTaskDescription renders into the task text
-      // below: a finding beyond MAX_TASK_FINDINGS is never shown to the agent, so it
-      // has to stay "open" rather than being resolved by this dispatch's callback.
-      const taskFindings = openFindings.slice(0, MAX_TASK_FINDINGS);
-      const dispatchFindingIds = taskFindings.map((finding) => finding.id);
-
       const [owner] = fix.repo.split("/");
       const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
       const installationId = String(await getInstallationId(config.githubAppId, config.githubAppPrivateKey, owner));
@@ -3622,7 +3853,11 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         }
       }
 
-      const taskDescription = buildReviewFixTaskDescription({
+      // One admission contract shared with the durable path: every open finding is rendered
+      // in full or the item stays pending. The installation token above is for repository
+      // reads only; preparation precedes admission and runner launch-token minting, so an
+      // overflow leaks neither, and dispatchFindingIds is exactly the rendered set.
+      const prepared = prepareReviewFixTask({
         prNumber: fix.prNumber,
         reason: fix.reason,
         findings: openFindings.map((finding) => ({
@@ -3636,32 +3871,31 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         })),
         issueDescription,
       });
+      if (prepared.status === "incomplete") {
+        console.warn(`[review-fix] Incomplete feedback (${prepared.category}) for PR #${fix.prNumber}; keeping review fix #${fix.id} pending: ${previewReviewFixText(prepared.reason)}`);
+        continue;
+      }
+      const taskDescription = prepared.text;
+      const dispatchFindingIds = openFindings.map((finding) => finding.id);
 
       if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
         // Gap-fill dispatches run the implementation workflow and can take as
         // long as the initial implementation, even though they report back as
         // gap-analysis so Linear status does not regress.
-        const minted = mintRunToken({
+        dispatchId = crypto.randomUUID();
+        const minted = mintLaunchTokens({
           issueId: fix.issueId,
           mappingTeamKey: scopeKey,
           phase: "gap-analysis",
-          audience: "result",
-          ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-          secret: config.runnerTokenSecret,
-        });
-        dispatchId = minted.dispatchId;
-        const progressMinted = mintRunToken({
-          issueId: fix.issueId,
-          mappingTeamKey: scopeKey,
-          phase: "gap-analysis",
-          audience: "progress",
           dispatchId,
           ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
           secret: config.runnerTokenSecret,
+          repository: `${mapping.owner}/${mapping.repo}`,
         });
         runnerCallbackUrl = config.runnerCallbackBaseUrl;
-        runToken = minted.token;
-        runProgressToken = progressMinted.token;
+        runToken = minted.runToken;
+        runProgressToken = minted.runProgressToken;
+        mintedPublicationToken = minted.runPublicationToken;
       }
 
       if (runnerMode === "local") {
@@ -3690,9 +3924,34 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           console.log(`[review-fix] Deferring local review fix #${fix.id} for PR #${fix.prNumber}: ${admission.reason}`);
           continue;
         }
+        let reviewFixDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
+        const reviewFixRuntime = getModelAuthRuntime(config);
+        if (isManagedProject(scopeKey)) {
+          let decision: ManagedDispatchDecision;
+          try {
+            decision = await prepareManagedDispatch(
+              { dispatchId, projectKey: scopeKey, backend: "local-docker", owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile },
+              reviewFixRuntime,
+            );
+          } catch (err) {
+            releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
+            throw err;
+          }
+          console.log(`[review-fix] Managed dispatch for review fix #${fix.id}: ${decision.kind}${"code" in decision ? ` (${decision.code})` : ""}`);
+          if (decision.kind === "legacy" || decision.kind === "launch") {
+            reviewFixDecision = decision;
+          } else {
+            releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
+            console.log(`[review-fix] ${refusalText(decision)} (${fix.issueIdentifier ?? fix.issueId})`);
+            if (decision.kind === "refuse") updateReviewFixStatus(fix.id, "failed");
+            continue;
+          }
+        }
         let launchStarted = false;
         let container: Awaited<ReturnType<typeof dispatchLocalGapfill>>;
         try {
+          // The child boots repo-scoped; a mint failure aborts the launch (no broad fallback).
+          const childToken = await getTargetRepoToken(config, mapping.owner, mapping.repo);
           container = await dispatchLocalGapfill({
             mapping,
             issue: {
@@ -3702,18 +3961,28 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
               description: taskDescription,
             },
             prNumber: fix.prNumber,
-            githubToken: ghToken,
+            githubToken: childToken,
             image: config.localRunnerImage,
             orchestratorUrl: config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? `http://host.docker.internal:${config.healthPort}`,
             runnerCallbackUrl: runnerCallbackUrl || undefined,
             runToken: runToken || undefined,
             runProgressToken: runProgressToken || undefined,
-            anthropicApiKey: config.anthropicApiKey,
-            claudeOAuthToken: config.claudeOAuthToken,
+            runPublicationToken: mintedPublicationToken,
+            anthropicApiKey: reviewFixDecision.kind === "launch" ? undefined : config.anthropicApiKey,
+            claudeOAuthToken: reviewFixDecision.kind === "launch" ? undefined : config.claudeOAuthToken,
             retryPolicy: getRetryPolicy(),
             onBeforeLaunch: () => { launchStarted = true; },
+            ...(reviewFixDecision.kind === "launch"
+              ? {
+                  managed: {
+                    decision: reviewFixDecision,
+                    modelAuthUrl: config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? `http://host.docker.internal:${config.healthPort}`,
+                  },
+                }
+              : {}),
           });
         } catch (err) {
+          settleLaunch(reviewFixDecision, classifyLaunchError("local-docker", launchStarted, err), reviewFixRuntime);
           if (!launchStarted) releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
           throw err;
         }
@@ -3770,6 +4039,31 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         continue;
       }
 
+      // Managed model authentication (AII-1420): decided after admission and before any launch call.
+      let ghaFixDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
+      const ghaFixRuntime = getModelAuthRuntime(config);
+      if (isManagedProject(scopeKey, dispatchId)) {
+        let decision: ManagedDispatchDecision;
+        try {
+          decision = await prepareManagedDispatch(
+            { dispatchId, projectKey: scopeKey, backend: "github-actions", owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile },
+            ghaFixRuntime,
+          );
+        } catch (err) {
+          releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
+          throw err;
+        }
+        console.log(`[review-fix] Managed dispatch for review fix #${fix.id}: ${decision.kind}${"code" in decision ? ` (${decision.code})` : ""}`);
+        if (decision.kind === "legacy" || decision.kind === "launch") {
+          ghaFixDecision = decision;
+        } else {
+          releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
+          console.log(`[review-fix] ${refusalText(decision)} (${fix.issueIdentifier ?? fix.issueId})`);
+          if (decision.kind === "refuse") updateReviewFixStatus(fix.id, "failed");
+          continue;
+        }
+      }
+
       // Everything below is pure prep — no launch call has fired yet. A throw anywhere in
       // here (e.g. a workflow-capabilities probe failure) is by construction a definitive
       // non-launch, so it releases the reservation and rethrows for the outer per-item catch
@@ -3789,21 +4083,17 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           ref: mapping.defaultBranch,
         });
         reviewFixContract = reviewFixCapabilities.contract;
-        const runPublicationToken = reviewFixContract === "envelope"
-          && reviewFixCapabilities.supportsRunPublicationToken
-          && dispatchId
-          && config.runnerCallbackBaseUrl
-          && config.runnerTokenSecret
-          ? mintRunToken({
-              issueId: fix.issueId,
-              mappingTeamKey: scopeKey,
-              phase: "gap-analysis",
-              audience: "publication",
-              dispatchId,
-              repository: `${mapping.owner}/${mapping.repo}`,
-              ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-              secret: config.runnerTokenSecret,
-            }).token
+        const ghaFixCredentials = ghaManagedCredentials(ghaFixDecision, config.runnerCallbackBaseUrl, { extraEnv: mapping.extraEnv });
+        assertPrivateTransportForCredentials(
+          ghaFixCredentials, reviewFixCapabilities,
+          `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
+        );
+        assertExecutionPolicyCapability(
+          ghaFixCredentials, reviewFixCapabilities,
+          `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
+        );
+        const runPublicationToken = reviewFixContract === "envelope" && reviewFixCapabilities.supportsRunPublicationToken
+          ? mintedPublicationToken
           : undefined;
 
         const fixIssue = {
@@ -3821,6 +4111,9 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
               runToken,
               runProgressToken,
               runPublicationToken,
+              privateTransport: reviewFixCapabilities.supportsPrivateRunConfig === true,
+              credentials: ghaFixCredentials,
+              ...(ghaFixDecision.kind === "launch" ? { agentConfig: ghaFixDecision.snapshot } : {}),
               runnerImage,
               retryPolicy: getRetryPolicy(),
             })
@@ -3844,11 +4137,19 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
               ...(runnerImage ? { runner_image: runnerImage } : {}),
             };
       } catch (err) {
+        settleLaunch(ghaFixDecision, "rejected", ghaFixRuntime);
         releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
         throw err;
       }
 
-      const result = await dispatchWorkflow(ghToken, mapping, reviewFixInputs, { returnRunDetails: true });
+      let result: Awaited<ReturnType<typeof dispatchWorkflow>>;
+      try {
+        result = await dispatchWorkflow(ghToken, mapping, reviewFixInputs, { returnRunDetails: true });
+      } catch (err) {
+        settleLaunch(ghaFixDecision, "unknown", ghaFixRuntime);
+        throw err;
+      }
+      settleLaunch(ghaFixDecision, ghaLaunchOutcome(result), ghaFixRuntime);
 
       if (!result.success) {
         if (result.outcome !== "rejected") {
@@ -4052,12 +4353,13 @@ async function handleKgRefreshOutcome(
 const reviewFixAttemptStore = new SqliteReviewFixAttemptStore();
 const kgRefreshIngressClient = createKgRefreshIngressClient();
 // AII-1227: starts LateExternalReview only while the sidecar is ready and the endpoint registered.
+function restateReady(): boolean {
+  const restate = getRestateStatus();
+  return restate.sidecar.state === "ready" && restate.registration.state === "registered";
+}
 const submitLateExternalReview = createLateExternalReviewSubmitHook({
   ingress: createLateExternalReviewIngressClient(),
-  restateReady: () => {
-    const restate = getRestateStatus();
-    return restate.sidecar.state === "ready" && restate.registration.state === "registered";
-  },
+  restateReady,
 });
 // A repository-fix project's workflow follows the auto-fix to its new head (ADR 038); the mode rides the input.
 const lateExternalReviewSubmitHook: typeof submitLateExternalReview = (input) => {
@@ -4095,6 +4397,27 @@ export function deployHealth(): { held: boolean; startedAt: number | null } {
 }
 
 /**
+ * The KG-repo PR webhook's `enqueueDryRun` dependency (AII-1405). It answers `unavailable` with no
+ * KG source repo, and while Restate is not ready (sidecar not `ready` or registration not
+ * `registered`) it skips the dry run: `submit` sends the new `KgRepo.watch` handler, which a
+ * declined registration cannot serve, so the send would retry forever and block the key.
+ */
+export function makeKgDryRunEnqueue(
+  kgSourceRepo: string | null | undefined,
+  ingress: Pick<KgRefreshIngressClient, "enqueueDryRun">,
+  ready: () => boolean,
+): KgPrCheckConfig["enqueueDryRun"] {
+  return async (key, entry, opts) => {
+    if (!kgSourceRepo) return { status: "unavailable" as const };
+    if (!ready()) {
+      console.warn(`[kg-refresh] skipping dry run for ${key}: Restate registration is not registered`);
+      return { status: "unavailable" as const };
+    }
+    return ingress.enqueueDryRun(parseKgSourceRepo(kgSourceRepo).fullName, { key, ...entry }, opts);
+  };
+}
+
+/**
  * `AdminDeps.kgRefresh` over the Restate services: trigger and status go through the tool
  * handlers as the in-process system caller; cancel calls the `cancel` of the workflow keyed
  * by the clicked row's `dispatchId` (a kg-refresh row's dispatchId is its trigger id) and
@@ -4127,6 +4450,7 @@ export function makeKgRefreshAdminDeps(
       const out = await client.cancel(dispatchId, reason);
       if (out.status === "unavailable") return kgUnavailableAnswer(deployHeld);
       if (out.status === "not-found") return { status: 409, body: { error: "no-refresh-in-flight" } };
+      if (out.status === "conflict") return { status: 409, body: { error: out.error ?? "conflict" } };
       return { status: 200, body: { cancelled: true } };
     },
   };
@@ -4211,6 +4535,11 @@ function startServer(
     dryRunOutcomes: kgRefreshIngressClient,
   });
   migrateLegacyDryRunOutcomes();
+  const modelAuthRoutes = createModelAuthRoutes({
+    runtime: getModelAuthRuntime(config),
+    onFly: config.flyOrchestratorApp !== null,
+    requestPlanRefresh: (id) => requestChatGptPlanRefresh(id),
+  });
 
   const handleRequest: http.RequestListener = (req, res) => {
     const url = req.url || "/";
@@ -4230,6 +4559,20 @@ function startServer(
         lastPollStartedAt: lastPollStartedAt?.toISOString() ?? null,
         lastPollFinishedAt: lastPollFinishedAt?.toISOString() ?? null,
       }));
+      return;
+    }
+
+    // Model-auth routes — every method is routed so the handler answers 405; before the general runner routes.
+    if (modelAuthRoutes.matches(pathname)) {
+      void modelAuthRoutes.handle(req, res).catch((err) => {
+        console.error("[model-auth] Unhandled error:", err instanceof Error ? err.name : "unknown");
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify({ error: "Internal error" }));
+        } else {
+          res.end();
+        }
+      });
       return;
     }
 
@@ -4438,10 +4781,7 @@ function startServer(
         kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
-        enqueueDryRun: (key, entry, opts) =>
-          config.kgSourceRepo
-            ? kgRefreshIngressClient.enqueueDryRun(parseKgSourceRepo(config.kgSourceRepo).fullName, { key, ...entry }, opts)
-            : Promise.resolve({ status: "unavailable" as const }),
+        enqueueDryRun: makeKgDryRunEnqueue(config.kgSourceRepo, kgRefreshIngressClient, restateReady),
         forgetKgPr: (repo, prNumber) => kgRefresh.forgetPr(repo, prNumber),
       }, async (repository, prNumber) => { await queueReviewFixCancellationForClosedPr(repository, prNumber, reviewFixIngressClient); }, reviewFixIngressClient).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
@@ -4843,7 +5183,8 @@ function startServer(
           min: RESTATE_RETENTION_DAYS_MIN,
           max: RESTATE_RETENTION_DAYS_MAX,
         },
-        reviewFixAttempts })) return;
+        reviewFixAttempts,
+        agentConfig: createAgentConfigAdminDeps(config) })) return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
@@ -5024,6 +5365,7 @@ async function main(): Promise<void> {
   seedKgMaterializeDirectFromEnv(process.env.KG_MATERIALIZE_DIRECT); // AII-1109: seeds once, inert thereafter
   seedKgExecutionModeFromEnv(process.env.KG_EXECUTION_MODE); // seeds once, inert thereafter
   seedLinearPickupLabelFromEnv(process.env.LINEAR_PICKUP_LABEL); // AII-694: seeds once, inert thereafter
+  seedRunnerImageAllowedPrefixesFromEnv(process.env.RUNNER_IMAGE_ALLOWED_PREFIXES); // AII-1321: seeds once, inert thereafter
   initAccessEntriesTable();
   initReconciliationTable();
   initStepLogTable();
@@ -5097,7 +5439,7 @@ async function main(): Promise<void> {
   console.log(`[restate] retention ${getRestateRetentionDays()} days`);
   // Fire-and-forget: the helper never throws, and boot must not wait on Fly.
   void applyVolumeSnapshotRetentionAtBoot(config.flyDeployToken, process.env.FLY_APP_NAME, getVolumeSnapshotRetentionDays);
-  const reviewFixServices = createProductionReviewFixServices(config, registry, reviewFixAttemptStore);
+  const reviewFixServices = createProductionReviewFixServices(config, registry, reviewFixAttemptStore, submitLateExternalReview, getModelAuthRuntime(config));
   // The KgRepo object and KgRefresh workflow (AII-683). Skipped without KG_SOURCE_REPO: the
   // tool handlers then answer 501 from their unset deps.
   const kgSourceRepo = config.kgSourceRepo;
@@ -5122,6 +5464,7 @@ async function main(): Promise<void> {
       getPullRequestStateFn: getPullRequestState,
       deleteBranchFn: deleteBranch,
       getInstallationToken,
+      getScopedInstallationToken,
       resolveRunnerImage: resolveRunnerImageForDispatch,
       postWorkflowDispatch,
       keptMachineFly: () => bindKeptMachineFly(config.flySessionsToken!, config.flySessionsApp!),
@@ -5147,6 +5490,7 @@ async function main(): Promise<void> {
     })
     : null;
   setKgRefreshToolDeps(kgComposition?.toolDeps ?? null);
+  kgScheduleBound = kgComposition !== null;
   const kgServices = kgComposition?.services ?? [];
   // The PlanningRun workflow (AII-1020, AII-1054): registered; `dispatchPlanning` submits it for a project on the Restate lifecycle.
   const planningRunServices = createProductionPlanningRunServices({
@@ -5170,6 +5514,7 @@ async function main(): Promise<void> {
     registerRestateEndpoint,
     onRegistered: async () => {
       sweepOnRegistered(config);
+      await scrubOperatorLegacyTokens();
       await seedRunnerBackends();
       await refreshRunnerBackendCache();
       await bootReconciliation.onRegistered();

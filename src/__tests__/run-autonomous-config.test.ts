@@ -1,6 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 import { encodeRunConfig } from "../run-config.js";
-import { resolveRunnerInputs } from "../run-autonomous.js";
+import {
+  resolveRunnerInputs,
+  prepareConfiguredRun,
+  runAutonomousLocally,
+  ConfiguredRunError,
+  hasConfiguredIntent,
+  type ConfiguredRunOptions,
+} from "../run-autonomous.js";
+import { AgentStageError } from "../pipeline/stage-executor.js";
+import type { LLMExecutor } from "../pipeline/types.js";
+import { EXPECTED, NOW, SENTINEL_BEARER, envelopeEnv, fakeClient, makeGrant, makeSnapshot } from "./configured-run-fixture.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { DEFAULT_REVIEWER_SELECTION } from "../config.js";
 
@@ -653,5 +663,203 @@ describe("resolveRunnerInputs", () => {
       };
       expect(() => resolveRunnerInputs(env as NodeJS.ProcessEnv)).toThrow(/reviewFix/);
     });
+  });
+});
+
+
+describe("resolveRunnerInputs agentConfig", () => {
+  it("carries the snapshot and never the grant", () => {
+    const snap = makeSnapshot();
+    const env = { ...BASE_ENV, ...envelopeEnv(snap, makeGrant(snap)) };
+    const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+    expect(inputs.agentConfig).toEqual(snap);
+    expect(JSON.stringify(inputs)).not.toContain(SENTINEL_BEARER);
+  });
+
+  it("is undefined for envelope and flat-env legacy runs", () => {
+    const legacy = { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({ v: 1, issue: { id: "i", identifier: "A-1", title: "t", description: "d" } }), ...BASE_ENV };
+    expect(resolveRunnerInputs(legacy as NodeJS.ProcessEnv).agentConfig).toBeUndefined();
+    const flat = { ISSUE_ID: "1", ISSUE_IDENTIFIER: "A-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d", ...BASE_ENV };
+    expect(resolveRunnerInputs(flat as NodeJS.ProcessEnv).agentConfig).toBeUndefined();
+  });
+});
+
+describe("hasConfiguredIntent", () => {
+  const enc = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64");
+  it("detects a snapshot or grant even when the envelope is otherwise malformed", () => {
+    expect(hasConfiguredIntent(enc({ v: 1, agentConfig: { junk: true } }))).toBe(true);
+    expect(hasConfiguredIntent(enc({ credentials: { modelAuthGrant: 1 } }))).toBe(true);
+  });
+  it("treats absent, unparseable and signal-free envelopes as legacy", () => {
+    expect(hasConfiguredIntent(undefined)).toBe(false);
+    expect(hasConfiguredIntent("%%%not-json")).toBe(false);
+    expect(hasConfiguredIntent(enc({ v: 1, credentials: { version: 1, progressToken: "x" } }))).toBe(false);
+  });
+});
+
+describe("prepareConfiguredRun", () => {
+  const snap = makeSnapshot();
+  const trusted = async () => ({ visibility: "private" as const, trustedForSubscription: true });
+  const prepare = (env: Record<string, string>, options: ConfiguredRunOptions = {}, snapshot = snap) =>
+    prepareConfiguredRun({ env: env as NodeJS.ProcessEnv, snapshot, workspaceDir: "/tmp/ws-x", repositories: ["o/r"], options: { now: () => NOW, ...options } });
+  const reason = async (p: Promise<unknown>) => {
+    try {
+      await p;
+    } catch (e) {
+      expect(e).toBeInstanceOf(ConfiguredRunError);
+      expect((e as Error).message).not.toContain(SENTINEL_BEARER);
+      return (e as ConfiguredRunError).reason;
+    }
+    return "no-error";
+  };
+
+  it("is legacy without a snapshot, grant or injected source", async () => {
+    await expect(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x" })).resolves.toBeUndefined();
+  });
+
+  it("rejects incomplete or invalid bootstrap before any client call", async () => {
+    const client = fakeClient();
+    const good = envelopeEnv(snap, makeGrant(snap));
+    expect(await reason(prepare(envelopeEnv(snap, undefined), { modelAuthClient: client }))).toBe("bootstrap_missing");
+    expect(await reason(prepareConfiguredRun({ env: envelopeEnv(undefined, makeGrant(snap)) as NodeJS.ProcessEnv, workspaceDir: "/tmp/ws-x", options: { modelAuthClient: client } }))).toBe("snapshot_incomplete");
+    expect(await reason(prepare({ ...good, AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID: "" }, { modelAuthClient: client }))).toBe("bootstrap_context_missing");
+    expect(await reason(prepare({ ...good, AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID: "other" }, { modelAuthClient: client }))).toBe("bootstrap_invalid");
+    expect(await reason(prepare(envelopeEnv(snap, makeGrant(snap, { expiresAt: NOW })), { modelAuthClient: client }))).toBe("bootstrap_invalid");
+    expect(await reason(prepare({ ...good, AI_IMPLEMENT_MODEL_AUTH_URL: "" }))).toBe("transport_unconfigured");
+    expect(await reason(prepare(good, { localCredentialPort: { load: vi.fn() }, modelAuthClient: client }))).toBe("bootstrap_invalid");
+    expect(client.checkout).not.toHaveBeenCalled();
+    expect(client.invoke).not.toHaveBeenCalled();
+  });
+
+  it("rejects a grant that does not cover the snapshot's profiles", async () => {
+    const bad = makeGrant(snap, { bindings: makeGrant(snap).bindings.map((b) => (b.stage === "review" ? { ...b, profileRevision: 9 } : b)) });
+    expect(await reason(prepare(envelopeEnv(snap, bad), { modelAuthClient: fakeClient() }))).toBe("grant_bindings_mismatch");
+    const missing = makeGrant(snap, { bindings: makeGrant(snap).bindings.filter((b) => b.stage !== "planning") });
+    expect(await reason(prepare(envelopeEnv(snap, missing), { modelAuthClient: fakeClient() }))).toBe("grant_bindings_mismatch");
+  });
+
+  it("rejects a malformed snapshot", async () => {
+    expect(await reason(prepare(envelopeEnv(snap, makeGrant(snap)), { modelAuthClient: fakeClient() }, { ...snap, version: 2 } as never))).toBe("snapshot_incomplete");
+  });
+
+  it("applies the dispatch-preparation visibility and trust decision", async () => {
+    const env = envelopeEnv(snap, makeGrant(snap));
+    const withTrust = (t: unknown) => prepare(env, { modelAuthClient: fakeClient(), repoTrust: async () => t as never });
+    expect(await reason(withTrust({ visibility: "public", trustedForSubscription: true }))).toBe("repository_untrusted");
+    expect(await reason(withTrust({ visibility: "private", trustedForSubscription: false }))).toBe("repository_untrusted");
+    expect(await reason(withTrust({ visibility: "mystery", trustedForSubscription: true }))).toBe("repository_untrusted");
+    expect(await reason(prepare(env, { modelAuthClient: fakeClient(), repoTrust: async () => { throw new Error("boom"); } }))).toBe("repository_untrusted");
+    expect(await reason(withTrust({ visibility: "internal", trustedForSubscription: true }))).toBe("no-error");
+  });
+
+  it("fails a local subscription run closed without a trust source", async () => {
+    const sub = makeSnapshot("codex-subscription");
+    const local = { localCredentialPort: { load: vi.fn() } };
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { agentConfig: sub, ...local, modelAuthClient: fakeClient() } }))).toBe("repository_untrusted");
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { agentConfig: sub, ...local, modelAuthClient: fakeClient(), repositories: ["o/r"], repoTrust: trusted } }))).toBe("no-error");
+    expect(local.localCredentialPort.load).not.toHaveBeenCalled();
+  });
+
+  it("accepts a local synthetic provider only for selected Codex/OpenAI profiles", async () => {
+    const local = { localCredentialPort: { load: vi.fn() } };
+    await expect(prepareConfiguredRun({
+      env: {},
+      workspaceDir: "/tmp/ws-x",
+      options: {
+        agentConfig: snap,
+        ...local,
+        syntheticProvider: { version: 1, kind: "local-feedback-provider", port: 8080, profileIds: ["p-impl"] },
+      },
+    })).resolves.toBeTruthy();
+  });
+
+  it("rejects synthetic providers outside the local protected-port path", async () => {
+    const synth = { version: 1 as const, kind: "local-feedback-provider" as const, port: 8080, profileIds: ["p-impl"] };
+    const local = { localCredentialPort: { load: vi.fn() } };
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { agentConfig: snap, syntheticProvider: synth } }))).toBe("bootstrap_missing");
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { agentConfig: snap, ...local, modelAuthClient: fakeClient(), syntheticProvider: synth } }))).toBe("bootstrap_invalid");
+    expect(await reason(prepare(envelopeEnv(snap, makeGrant(snap)), { syntheticProvider: synth }))).toBe("bootstrap_invalid");
+  });
+
+  it("rejects invalid synthetic provider ports and profile selections", async () => {
+    const local = { localCredentialPort: { load: vi.fn() } };
+    const base = { agentConfig: snap, ...local };
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { ...base, syntheticProvider: { version: 1, kind: "local-feedback-provider", port: 0, profileIds: ["p-impl"] } } }))).toBe("bootstrap_invalid");
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { ...base, syntheticProvider: { version: 1, kind: "local-feedback-provider", port: 65536, profileIds: ["p-impl"] } } }))).toBe("bootstrap_invalid");
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { ...base, syntheticProvider: { version: 1, kind: "local-feedback-provider", port: 8080, profileIds: [] } } }))).toBe("bootstrap_invalid");
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { ...base, syntheticProvider: { version: 1, kind: "local-feedback-provider", port: 8080, profileIds: ["p-rev"] } } }))).toBe("bootstrap_invalid");
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { ...base, syntheticProvider: { version: 1, kind: "local-feedback-provider", port: 8080, profileIds: ["p-impl", "p-impl"] } } }))).toBe("bootstrap_invalid");
+  });
+
+  it("checks out each profile once, on first use, and finishes then disposes it", async () => {
+    const client = fakeClient();
+    const run = (await prepare(envelopeEnv(snap, makeGrant(snap)), { modelAuthClient: client }))!;
+    const legacy: LLMExecutor = { invoke: vi.fn().mockResolvedValue({ stdout: "", exitCode: 0, tokensUsed: 0 }) };
+    const ex = run.createExecutor({ workspaceDir: "/tmp/ws-x", legacy });
+    expect(client.checkout).not.toHaveBeenCalled();
+    await ex.invoke({ prompt: "p", model: "caller", agentStage: "review" });
+    await ex.invoke({ prompt: "p", model: "caller", agentStage: "review" });
+    expect(client.checkout).toHaveBeenCalledTimes(1);
+    expect(client.checkout).toHaveBeenCalledWith({ profileId: "p-rev", authMode: "anthropic-api-key" });
+    expect(client.invoke).toHaveBeenCalledTimes(2);
+    expect((legacy.invoke as ReturnType<typeof vi.fn>).mock.calls[0][0].model).toBe("claude-review");
+    await expect(run.finish("completed")).resolves.toBe(true);
+    await expect(run.finish("completed")).resolves.toBe(false);
+    expect(client.finish).toHaveBeenCalledTimes(1);
+    expect(client.finish).toHaveBeenCalledWith("p-rev", "completed");
+    expect(client.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("requires an explicit agentStage and never infers one", async () => {
+    const run = (await prepare(envelopeEnv(snap, makeGrant(snap)), { modelAuthClient: fakeClient() }))!;
+    const ex = run.createExecutor({ workspaceDir: "/tmp/ws-x", legacy: { invoke: vi.fn() } });
+    await expect(ex.invoke({ prompt: "p", model: "m", stage: "review" } as never)).rejects.toBeInstanceOf(AgentStageError);
+  });
+
+  it("retains state instead of finishing when a child may be live or a checkpoint is uncertain", async () => {
+    for (const mark of [{ possiblyLive: true }, { category: "checkpoint_uncertain" }]) {
+      const client = fakeClient();
+      const run = (await prepare(envelopeEnv(snap, makeGrant(snap)), { modelAuthClient: client }))!;
+      const legacy: LLMExecutor = { invoke: vi.fn().mockRejectedValue(Object.assign(new Error("x"), mark)) };
+      const ex = run.createExecutor({ workspaceDir: "/tmp/ws-x", legacy });
+      await expect(ex.invoke({ prompt: "p", model: "m", agentStage: "review" })).rejects.toBeTruthy();
+      await expect(run.finish("failed")).resolves.toBe(false);
+      expect(client.finish).not.toHaveBeenCalled();
+      expect(client.dispose).not.toHaveBeenCalled();
+    }
+  });
+
+  it("does not dispose while a profile is still invoking or uncertain", async () => {
+    const client = fakeClient();
+    const run = (await prepare(envelopeEnv(snap, makeGrant(snap)), { modelAuthClient: client }))!;
+    const ex = run.createExecutor({ workspaceDir: "/tmp/ws-x", legacy: { invoke: vi.fn().mockResolvedValue({ stdout: "", exitCode: 0, tokensUsed: 0 }) } });
+    await ex.invoke({ prompt: "p", model: "m", agentStage: "review" });
+    client.states.set("p-rev", "uncertain");
+    await expect(run.finish("failed")).resolves.toBe(false);
+    expect(client.finish).not.toHaveBeenCalled();
+    expect(client.dispose).not.toHaveBeenCalled();
+  });
+
+  it("does not leak the bearer through the snapshot, provider label or executor", async () => {
+    const run = (await prepare(envelopeEnv(snap, makeGrant(snap)), { modelAuthClient: fakeClient() }))!;
+    expect(JSON.stringify({ s: run.snapshot, p: run.provider })).not.toContain(SENTINEL_BEARER);
+    expect(run.provider).toBe("anthropic");
+    expect(EXPECTED.dispatchId).toBe("disp-1");
+  });
+
+  it("rejects a structurally forged borrowed configured run before local work", async () => {
+    const forged = {
+      snapshot: snap,
+      provider: "anthropic",
+      createExecutor: vi.fn(),
+      finish: vi.fn(),
+    };
+    await expect(runAutonomousLocally({
+      workspaceDir: "/tmp/ws-x",
+      issueIdentifier: "AII-1",
+      issueTitle: "t",
+      issueDescription: "d",
+      prebuiltConfiguredRun: forged as never,
+    })).rejects.toMatchObject({ reason: "bootstrap_invalid" });
   });
 });

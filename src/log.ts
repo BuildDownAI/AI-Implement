@@ -1,3 +1,5 @@
+import { sanitizeAttribution, type InvocationAttributionV1 } from "./pipeline/types.js";
+import type { InvocationUsageRow } from "./agent-usage.js";
 import { getDb } from "./dedup.js";
 import { getMappings } from "./config.js";
 import { markCommentGapfillRunTerminal, requeueGapfillAfterPushFailure } from "./comment-gapfill-queue.js";
@@ -68,6 +70,10 @@ export interface Job {
    *  🟡 one. Distinct from `failure`, which is persisted for every phase (including
    *  gap-analysis, which the callback never comments for and so never stamps this field). */
   failureCommentedAt: number | null;
+  /** Bounded safe projection of the latest persisted invocation record for this dispatch
+   *  (`model_invocation_attribution`, AII-971); legacy dispatches read `null` with no inferred cost.
+   *  Optional so undeclared `Job` literals keep compiling. */
+  attribution?: InvocationAttributionV1 | null;
 }
 
 // Keep old name exported for backwards compat with admin.ts
@@ -95,6 +101,34 @@ export function initLogTable(): void {
       last_attempt_at INTEGER
     )
   `);
+  // Kept so an older image still starts; rows it writes during a rollback move to late_review_pending at the next boot.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS attempt_review_pending (
+      attempt_id TEXT PRIMARY KEY,
+      dispatch_id TEXT NOT NULL,
+      pr_url TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    )
+  `);
+  // AII-1362: one outbox for every LateExternalReview submit whose state is not in dispatch_log.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS late_review_pending (
+      workflow_key TEXT PRIMARY KEY,
+      dispatch_id TEXT NOT NULL,
+      pr_url TEXT NOT NULL,
+      head_sha TEXT,
+      attempt_id TEXT,
+      created_at INTEGER NOT NULL
+    )
+  `);
+  // Every boot: move attempt_review_pending rows (the key matches lateExternalReviewWorkflowKey).
+  db.transaction(() => {
+    db.exec(`
+      INSERT OR IGNORE INTO late_review_pending (workflow_key, dispatch_id, pr_url, head_sha, attempt_id, created_at)
+      SELECT dispatch_id || '-' || attempt_id, dispatch_id, pr_url, NULL, attempt_id, created_at FROM attempt_review_pending
+    `);
+    db.exec("DELETE FROM attempt_review_pending");
+  })();
   ensureLogColumns();
 }
 
@@ -329,6 +363,14 @@ export function getRunRecordMergeVerdict(issueIdentifier: string, prUrl: string)
   return "hold";
 }
 
+/** The PR's latest `implementation` / `gap-analysis` row, the one `getRunRecordMergeVerdict` reads. */
+export function getLatestWorkRowForPr(prUrl: string): { id: number; dispatchId: string | null; inFlight: boolean } | null {
+  const row = getDb()
+    .prepare("SELECT id, dispatch_id, status FROM dispatch_log WHERE pr_url = ? AND phase IN ('implementation', 'gap-analysis') ORDER BY id DESC LIMIT 1")
+    .get(prUrl) as { id: number; dispatch_id: string | null; status: string } | undefined;
+  return row ? { id: row.id, dispatchId: row.dispatch_id, inFlight: row.status === "dispatched" || row.status === "running" } : null;
+}
+
 /**
  * Counts prior dispatches for an issue. When `phase` is given, only the
  * matching phase family is counted: planning dispatches number independently
@@ -488,7 +530,7 @@ export function updateJobStatus(
     .prepare(
       `UPDATE dispatch_log
        SET status = ?,
-           conclusion = CASE WHEN conclusion IN ('operator_cancelled', 'runner_approved') THEN conclusion ELSE ? END,
+           conclusion = CASE WHEN conclusion IN ('operator_cancelled', 'runner_approved', 'external_review_pending') THEN conclusion ELSE ? END,
            pr_url = COALESCE(?, pr_url), completed_at = ?,
            machine_nonce = CASE WHEN ? = 1 THEN NULL ELSE machine_nonce END
        WHERE id = ?`,
@@ -571,6 +613,58 @@ export function getInFlightJobs(): Job[] {
       )
       .all() as RawRow[],
   );
+}
+
+/**
+ * Gap-fill rows still waiting on their late external review: completed with the pending
+ * conclusion, no approval mark, a PR, and finished at or after `sinceMs` (AII-1304).
+ */
+export function getGapFillRowsAwaitingLateReview(sinceMs: number): Job[] {
+  return mapRows(
+    getDb()
+      .prepare(
+        "SELECT * FROM dispatch_log WHERE phase = 'gap-analysis' AND status = 'completed' AND conclusion = 'external_review_pending' AND approved = 0 AND pr_url IS NOT NULL AND dispatch_id IS NOT NULL AND completed_at >= ? ORDER BY completed_at ASC",
+      )
+      .all(sinceMs) as RawRow[],
+  );
+}
+
+export interface PendingLateReview {
+  workflowKey: string;
+  dispatchId: string;
+  prUrl: string;
+  headSha: string | null;
+  attemptId: string | null;
+}
+
+/**
+ * Records a LateExternalReview submit that still needs to settle (AII-1362). Idempotent per workflow key.
+ * The caller computes `workflowKey` with `lateExternalReviewWorkflowKey` (importing it here would be circular).
+ */
+export function recordPendingLateReview(
+  input: { workflowKey: string; dispatchId: string; prUrl: string; headSha?: string; attemptId?: string },
+  now = Date.now(),
+): void {
+  getDb()
+    .prepare(
+      "INSERT OR IGNORE INTO late_review_pending (workflow_key, dispatch_id, pr_url, head_sha, attempt_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .run(input.workflowKey, input.dispatchId, input.prUrl, input.headSha ?? null, input.attemptId ?? null, now);
+}
+
+/** Pending late reviews recorded at or after `sinceMs`, oldest first. */
+export function getPendingLateReviews(sinceMs: number): PendingLateReview[] {
+  // A record older than the window is never retried again; drop it rather than keep dead data.
+  const expired = getDb().prepare("DELETE FROM late_review_pending WHERE created_at < ?").run(sinceMs).changes;
+  if (expired > 0) console.log(`[late-review] Dropped ${expired} expired pending late review(s)`);
+  const rows = getDb()
+    .prepare("SELECT workflow_key, dispatch_id, pr_url, head_sha, attempt_id FROM late_review_pending WHERE created_at >= ? ORDER BY created_at ASC")
+    .all(sinceMs) as Array<{ workflow_key: string; dispatch_id: string; pr_url: string; head_sha: string | null; attempt_id: string | null }>;
+  return rows.map((r) => ({ workflowKey: r.workflow_key, dispatchId: r.dispatch_id, prUrl: r.pr_url, headSha: r.head_sha, attemptId: r.attempt_id }));
+}
+
+export function clearPendingLateReview(workflowKey: string): void {
+  getDb().prepare("DELETE FROM late_review_pending WHERE workflow_key = ?").run(workflowKey);
 }
 
 export function getInFlightIssueIds(): Set<string> {
@@ -798,6 +892,7 @@ interface RawRow {
 }
 
 function mapRows(rows: RawRow[]): Job[] {
+  const attributions = readAttributionsByDispatch(rows.map((r) => r.dispatch_id));
   return rows.map((row) => ({
     id: row.id,
     issueId: row.issue_id,
@@ -827,7 +922,129 @@ function mapRows(rows: RawRow[]): Job[] {
     approved: row.approved === 1,
     failure: parseFailureJson(row.failure_json),
     failureCommentedAt: row.failure_commented_at ?? null,
+    attribution: (row.dispatch_id && attributions.get(row.dispatch_id)) || null,
   }));
+}
+
+interface AttributionRow {
+  invocation_id: string;
+  dispatch_id: string;
+  stage: string;
+  profile_id: string;
+  agent: string;
+  provider: string;
+  model: string;
+  auth_mode: string;
+  snapshot_id: string | null;
+  usage_json: string;
+}
+
+const attributionReadWarned = new Set<string>();
+
+/** A failed attribution read degrades to "no attribution". Warns once per process per error class, by
+ *  class name only (never message or values). A missing table (pre-migration database) stays silent. */
+function warnAttributionReadFailure(err: unknown): void {
+  const message = err instanceof Error ? err.message : "";
+  if (/no such table/i.test(message)) return;
+  const cls = err instanceof Error ? err.constructor.name || err.name : typeof err;
+  if (attributionReadWarned.has(cls)) return;
+  attributionReadWarned.add(cls);
+  console.warn(`[log] attribution read failed (${cls}); jobs will show no attribution`);
+}
+
+/** Projects stored invocation rows through `sanitizeAttribution`, so Job reads, callbacks and local
+ *  summaries share one bounded shape. The latest row per dispatch wins; a malformed row reads as absent. */
+function readAttributionsByDispatch(dispatchIds: Array<string | null>): Map<string, InvocationAttributionV1> {
+  const out = new Map<string, InvocationAttributionV1>();
+  const ids = [...new Set(dispatchIds.filter((d): d is string => typeof d === "string"))];
+  if (ids.length === 0) return out;
+  let rows: AttributionRow[];
+  try {
+    rows = getDb()
+      .prepare(
+        `SELECT invocation_id, dispatch_id, stage, profile_id, agent, provider, model, auth_mode, snapshot_id, usage_json
+         FROM model_invocation_attribution WHERE dispatch_id IN (${ids.map(() => "?").join(",")}) ORDER BY rowid`,
+      )
+      .all(...ids) as AttributionRow[];
+  } catch (err) {
+    warnAttributionReadFailure(err);
+    return out;
+  }
+  for (const row of rows) {
+    try {
+      const u = JSON.parse(row.usage_json) as Record<string, unknown>;
+      const hasUsage = typeof u.availability === "string";
+      const projected = sanitizeAttribution({
+        version: 1,
+        invocationId: row.invocation_id,
+        stage: row.stage,
+        snapshotId: row.snapshot_id,
+        agent: row.agent,
+        provider: row.provider,
+        model: row.model,
+        profileId: row.profile_id,
+        authMode: row.auth_mode,
+        limit: u.limit ?? null,
+        outcome: u.outcome,
+        usage: hasUsage
+          ? { availability: u.availability, tokensIn: u.tokensIn, tokensOut: u.tokensOut, costUsd: u.costUsd ?? null, costStatus: u.costStatus }
+          : null,
+      });
+      if (projected) out.set(row.dispatch_id, projected);
+    } catch {
+      // unreadable usage_json reads as absent
+    }
+  }
+  return out;
+}
+
+const INVOCATION_STATUS: Record<InvocationUsageRow["outcome"], string> = {
+  success: "succeeded",
+  max_turns: "failed",
+  error: "failed",
+  unknown: "failed",
+};
+
+/**
+ * Persists one normalized invocation record (AII-954 `normalizeInvocation` output) for a dispatch.
+ * Insert-or-ignore on `invocation_id`, so a repeated delivery never double-counts. Rows without an
+ * invocation id cannot be deduplicated and are not stored. Returns whether a row was inserted.
+ */
+export function recordInvocationAttribution(
+  dispatchId: string,
+  row: InvocationUsageRow,
+  opts: { timedOut?: boolean; now?: number } = {},
+): boolean {
+  if (row.invocationId === null) return false;
+  const now = opts.now ?? Date.now();
+  const status = opts.timedOut ? "timed_out" : INVOCATION_STATUS[row.outcome];
+  const usage = {
+    availability: row.usage.availability,
+    tokensIn: row.usage.tokensIn,
+    tokensOut: row.usage.tokensOut,
+    cacheReadTokens: row.usage.cacheReadTokens,
+    cacheCreationTokens: row.usage.cacheCreationTokens,
+    costUsd: row.usage.costUsd,
+    costStatus: row.usage.costStatus,
+    limit: row.limit,
+    outcome: row.outcome,
+    attempts: row.attempts,
+    attribution: row.attribution,
+    mismatches: row.mismatches,
+  };
+  const info = getDb()
+    .prepare(
+      `INSERT OR IGNORE INTO model_invocation_attribution
+         (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode,
+          config_revision_id, snapshot_id, status, started_at, completed_at, usage_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      row.invocationId, dispatchId, row.stage, row.profileId, row.profileRevision, row.agent, row.provider,
+      row.model, row.authMode, row.configRevisions.project.configRevisionId, row.snapshotId, status, now, now,
+      JSON.stringify(usage),
+    );
+  return info.changes > 0;
 }
 
 /** Best-effort parse: a malformed or pre-migration row reads as "no failure" rather than throwing. */

@@ -11,12 +11,31 @@ const RUN_PUBLICATION_TOKEN_RE = /^\s{2,}run_publication_token:\s*$/m;
  */
 const RUN_ATTEMPT_TOKEN_RE = /^\s{2,}run_attempt_token:\s*$/m;
 
+/**
+ * Static private-envelope marker (AII-982): a YAML comment, not a workflow_dispatch input.
+ * Distinct from the stage-agent-config-v1 capability, which this must never imply.
+ */
+const PRIVATE_RUN_CONFIG_RE = /^#\s*ai-implement-capability:\s*private-run-config-v1\s*$/m;
+
+/** Static marker for the ephemeral full-access execution policy projection (AII-1437). */
+const EXECUTION_POLICY_RE = /^#\s*ai-implement-capability:\s*ephemeral-execution-policy-v1\s*$/m;
+
+/** Both markers are required on the exact dispatch ref, independently of private transport. */
+const STAGE_AGENT_CONFIG_RE = /^#\s*ai-implement-capability:\s*stage-agent-config-v1\s*$/m;
+const STAGE_AGENT_CONTEXT_RE = /^#\s*ai-implement-capability:\s*stage-agent-launch-context-v1\s*$/m;
+
 export type WorkflowContract = "envelope" | "legacy";
 export interface WorkflowCapabilities {
   contract: WorkflowContract;
   supportsRunPublicationToken: boolean;
   /** True when the workflow declares `run_attempt_token`, gating attempt-correlation / versioned-callback support. */
   supportsAttemptCorrelation: boolean;
+  /** True when an envelope workflow carries the private-envelope marker. Absent (older fixtures) = false. */
+  supportsPrivateRunConfig?: boolean;
+  /** True when an envelope workflow carries the ephemeral-execution-policy-v1 marker. Absent = false. */
+  supportsExecutionPolicy?: boolean;
+  /** Configured stages and independent trusted launch context on this exact ref. Absent = false. */
+  supportsStageAgentConfig?: boolean;
 }
 
 type CacheEntry = { expiresAt: number; capabilities: WorkflowCapabilities };
@@ -38,6 +57,18 @@ export interface ResolveWorkflowContractInput {
   fetchImpl?: typeof fetch;
   /** Injected for tests. Defaults to `Date.now`. */
   nowMs?: () => number;
+  /** Throw on a transient probe failure (fetch throw, non-404 error status, bad JSON, non-file body)
+   *  instead of answering `legacy`. Default false: callers keep the never-throw behaviour. */
+  failOnTransient?: boolean;
+}
+
+/** Thrown only when `failOnTransient` is set and the probe could not read the workflow. */
+export class WorkflowProbeTransientError extends Error {}
+
+interface ProbeResult {
+  capabilities: WorkflowCapabilities;
+  /** True when `legacy` is a guess from a failed read, not an answer. Never cached. */
+  transient: boolean;
 }
 
 export async function resolveWorkflowContract(
@@ -60,7 +91,13 @@ export async function resolveWorkflowCapabilities(
     return cached.capabilities;
   }
 
-  const capabilities = await probeCapabilities(owner, repo, workflowFile, ref, token, fetchImpl);
+  const { capabilities, transient } = await probeCapabilities(owner, repo, workflowFile, ref, token, fetchImpl);
+  if (transient) {
+    if (input.failOnTransient) {
+      throw new WorkflowProbeTransientError(`could not read ${owner}/${repo}/${workflowFile}@${ref}`);
+    }
+    return capabilities;
+  }
   cache.set(cacheKey, { expiresAt: now + CACHE_TTL_MS, capabilities });
   return capabilities;
 }
@@ -72,12 +109,18 @@ async function probeCapabilities(
   ref: string,
   token: string,
   fetchImpl: typeof fetch,
-): Promise<WorkflowCapabilities> {
+): Promise<ProbeResult> {
   const url = `https://api.github.com/repos/${owner}/${repo}/contents/.github/workflows/${workflowFile}?ref=${encodeURIComponent(ref)}`;
-  const legacy = (): WorkflowCapabilities => ({
-    contract: "legacy",
-    supportsRunPublicationToken: false,
-    supportsAttemptCorrelation: false,
+  const legacy = (transient = false): ProbeResult => ({
+    capabilities: {
+      contract: "legacy",
+      supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
+      supportsPrivateRunConfig: false,
+      supportsExecutionPolicy: false,
+      supportsStageAgentConfig: false,
+    },
+    transient,
   });
   let res: Response;
   try {
@@ -91,7 +134,7 @@ async function probeCapabilities(
     });
   } catch (err) {
     console.warn(`[workflow-probe] ${owner}/${repo}/${workflowFile}: fetch failed (${err instanceof Error ? err.message : String(err)}); assuming legacy contract`);
-    return legacy();
+    return legacy(true);
   }
 
   if (res.status === 404) {
@@ -99,7 +142,7 @@ async function probeCapabilities(
   }
   if (!res.ok) {
     console.warn(`[workflow-probe] ${owner}/${repo}/${workflowFile}: contents lookup returned HTTP ${res.status}; assuming legacy contract`);
-    return legacy();
+    return legacy(true);
   }
 
   let body: { content?: string; encoding?: string; type?: string };
@@ -107,19 +150,25 @@ async function probeCapabilities(
     body = (await res.json()) as typeof body;
   } catch (err) {
     console.warn(`[workflow-probe] ${owner}/${repo}/${workflowFile}: response was not JSON; assuming legacy contract`);
-    return legacy();
+    return legacy(true);
   }
 
   if (body.type !== "file" || body.encoding !== "base64" || !body.content) {
     console.warn(`[workflow-probe] ${owner}/${repo}/${workflowFile}: response was not a file blob; assuming legacy contract`);
-    return legacy();
+    return legacy(true);
   }
 
   const yamlText = Buffer.from(body.content, "base64").toString("utf8");
   const contract = RUN_CONFIG_RE.test(yamlText) ? "envelope" : "legacy";
   return {
-    contract,
-    supportsRunPublicationToken: contract === "envelope" && RUN_PUBLICATION_TOKEN_RE.test(yamlText),
-    supportsAttemptCorrelation: contract === "envelope" && RUN_ATTEMPT_TOKEN_RE.test(yamlText),
+    capabilities: {
+      contract,
+      supportsRunPublicationToken: contract === "envelope" && RUN_PUBLICATION_TOKEN_RE.test(yamlText),
+      supportsAttemptCorrelation: contract === "envelope" && RUN_ATTEMPT_TOKEN_RE.test(yamlText),
+      supportsPrivateRunConfig: contract === "envelope" && PRIVATE_RUN_CONFIG_RE.test(yamlText),
+      supportsExecutionPolicy: contract === "envelope" && EXECUTION_POLICY_RE.test(yamlText),
+      supportsStageAgentConfig: contract === "envelope" && STAGE_AGENT_CONFIG_RE.test(yamlText) && STAGE_AGENT_CONTEXT_RE.test(yamlText),
+    },
+    transient: false,
   };
 }

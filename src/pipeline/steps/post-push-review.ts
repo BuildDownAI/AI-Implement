@@ -18,8 +18,10 @@ import {
   collectExternalReviewFindingsFromGh,
   collectReviewFindingsBlocksFromGh,
   formatReviewLedgerForPrompt,
+  type ReviewFindingsVerdict,
   type ReviewLedgerFinding,
   type ReviewLedgerSource,
+  reviewContractFindingGates,
 } from "../review-ledger.js";
 import {
   buildDispositionInstructions,
@@ -29,12 +31,13 @@ import {
   stableReviewFindingKey,
   type FindingDisposition,
 } from "../finding-dispositions.js";
-import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
+import { READ_ONLY_TOOL_PARAMS } from "./read-only-tools.js";
 import { resolveReviewProcess, type ReviewProcessDefinition, type ReviewProcessId, type ReviewVerdictResult } from "../../review-process.js";
 import { REVIEWER_VERDICT_SCHEMA, resolveTrustedReviewer, type ReviewerDefinition, type ReviewerFinding, type ReviewerVerdict } from "../reviewers/registry.js";
 import { isChecksPermissionError } from "../../checks-permission.js";
 import { inferTestResults, sumUsage, toolTraceLines, writeCycleSummary, type CycleDisposition } from "../cycle-summary.js";
 import { DEFAULT_MODEL } from "../default-model.js";
+import { safeLimitLabel } from "../stage-executor.js";
 
 interface PostPushReviewInputs extends Record<string, unknown> {
   prNumber: string;
@@ -443,8 +446,10 @@ export function isReviewLedgerFindingGating(
   finding: Pick<ReviewLedgerFinding, "source" | "severity" | "reviewerId" | "reviewerProvenance">,
   reviewers?: ReviewerSelection[],
   summaryBlockingGates = false,
+  contractVerdict?: ReviewFindingsVerdict,
 ): boolean {
   if (summaryBlockingGates && finding.source === "claude-review-summary" && finding.severity === "blocking") return true;
+  if (finding.source === "review-contract") return reviewContractFindingGates(finding, contractVerdict);
   return isReviewLedgerSourceGating(finding.source, reviewers, finding.reviewerId, finding.reviewerProvenance);
 }
 
@@ -498,6 +503,7 @@ function buildReviewLedger(
   externalFindings: ReviewLedgerFinding[],
   reviewers?: ReviewerSelection[],
   summaryBlockingGates = false,
+  contractVerdict?: ReviewFindingsVerdict,
 ): PostPushReviewLedgerFinding[] {
   const ledger: PostPushReviewLedgerFinding[] = [];
   const indexByKey = new Map<string, number>();
@@ -509,7 +515,7 @@ function buildReviewLedger(
     const existingIndex = keys.map((key) => indexByKey.get(key)).find((index) => index !== undefined);
     if (existingIndex !== undefined) {
       const existing = ledger[existingIndex];
-      if (!isReviewLedgerFindingGating(existing, reviewers, summaryBlockingGates) && isReviewLedgerFindingGating(finding, reviewers, summaryBlockingGates)) {
+      if (!isReviewLedgerFindingGating(existing, reviewers, summaryBlockingGates, contractVerdict) && isReviewLedgerFindingGating(finding, reviewers, summaryBlockingGates, contractVerdict)) {
         ledger[existingIndex] = finding;
       }
       continue;
@@ -1414,13 +1420,27 @@ function configAdvisoryReviewers(
   });
 }
 
+/** A report field the reviewer must fill: required and not nullable (strict mode requires every field; null marks it optional). */
+function isMandatoryReportField(schema: ReviewerDefinition["outputSchema"], field: string): boolean {
+  if (!Array.isArray(schema.required) || !schema.required.includes(field)) return false;
+  const properties = schema.properties as Record<string, { type?: unknown } | undefined> | undefined;
+  const type = properties?.[field]?.type;
+  return !(Array.isArray(type) && type.includes("null"));
+}
+
 function parseReviewerDefinitionVerdict(value: unknown, schema: ReviewerDefinition["outputSchema"]): ReviewerVerdict {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("expected structured reviewer output to be an object");
   }
-  const raw = value as { approved?: unknown; findings?: unknown; summary?: unknown; checks?: unknown };
+  const reported = value as { approved?: unknown; findings?: unknown; summary?: unknown; checks?: unknown };
+  // Null is the strict-mode encoding of an absent optional field.
+  const raw = {
+    ...reported,
+    summary: reported.summary === null ? undefined : reported.summary,
+    checks: reported.checks === null ? undefined : reported.checks,
+  };
   for (const field of ["summary", "checks"] as const) {
-    if (Array.isArray(schema.required) && schema.required.includes(field) && raw[field] === undefined) {
+    if (isMandatoryReportField(schema, field) && raw[field] === undefined) {
       throw new Error(`expected required report field ${field}`);
     }
   }
@@ -1437,10 +1457,10 @@ function parseReviewerDefinitionVerdict(value: unknown, schema: ReviewerDefiniti
     if (typeof item.body !== "string" || !item.body.trim()) {
       throw new Error(`expected findings[${index}].body to be a non-empty string`);
     }
-    if (item.path !== undefined && typeof item.path !== "string") {
+    if (item.path !== undefined && item.path !== null && typeof item.path !== "string") {
       throw new Error(`expected findings[${index}].path to be a string when present`);
     }
-    if (item.line !== undefined && typeof item.line !== "number") {
+    if (item.line !== undefined && item.line !== null && typeof item.line !== "number") {
       throw new Error(`expected findings[${index}].line to be a number when present`);
     }
     return {
@@ -1640,6 +1660,8 @@ async function runSelectedInternalReviewers(params: {
   let firstTerminationReason: PostPushReviewTerminationReason | undefined;
   let priorLlmFailure = false;
 
+  const reviewSelection = params.context.data.agentConfig?.stages.review;
+  const isTimeBudget = reviewSelection?.agent === "codex";
   for (const [reviewerIndex, reviewer] of params.reviewers.entries()) {
     const { selection, definition, legacy, provenance } = reviewer;
     const reviewerId = selection.id;
@@ -1647,6 +1669,9 @@ async function runSelectedInternalReviewers(params: {
     const reportId = reviewerReportId(params.iteration, reviewerIndex, reviewer);
     const stage = reviewerStage(params.iteration, reviewerIndex, reviewer);
     const maxTurns = selectionMaxTurns(selection) ?? definition.maxTurns ?? params.retryPolicy.reviewMaxTurns;
+    const reviewBudgetLabel = reviewSelection?.agent === "codex"
+      ? safeLimitLabel({ kind: "timeout_ms", value: reviewSelection.invocationTimeoutMs })
+      : `${maxTurns} turns`;
     const reportInputs = legacy
       ? { iteration: params.iteration, prNumber: params.prNumber, maxTurns }
       : { iteration: params.iteration, prNumber: params.prNumber, reviewerId, reviewerProvenance: provenance ?? "trusted", gates: reviewerGates(selection, provenance), maxTurns };
@@ -1695,7 +1720,9 @@ async function runSelectedInternalReviewers(params: {
         diff: params.diff,
         previousFindings: params.previousFindings,
       });
-      prompt += `\n\nYou have a maximum of ${maxTurns} turns for this review. Reserve your final turn for the structured report. Prioritize the required checks, and identify any unverified areas honestly in checks[].`;
+      prompt += isTimeBudget
+        ? `\n\nYou have a time budget of ${reviewBudgetLabel.replace(/^timeout /, "")} for this review. Finish within the time budget and reserve time for the structured report. Prioritize the required checks, and identify any unverified areas honestly in checks[].`
+        : `\n\nYou have a maximum of ${reviewBudgetLabel} for this review. Reserve your final turn for the structured report. Prioritize the required checks, and identify any unverified areas honestly in checks[].`;
     } catch (err) {
       if (err instanceof OperatorCancelledError || err instanceof PrMergedError) throw err;
       const feedback = compactErrorMessage(`Reviewer ${label} could not build its prompt: ${err instanceof Error ? err.message : String(err)}`);
@@ -1709,9 +1736,10 @@ async function runSelectedInternalReviewers(params: {
       prompt,
       model: definition.model ?? params.model,
       maxTurns,
-      tools: READ_ONLY_ALLOWED_TOOLS,
+      ...READ_ONLY_TOOL_PARAMS,
       jsonSchema: definition.outputSchema,
       stage,
+      agentStage: "review",
       expectsStructuredOutput: true,
     });
     let reviewResult: LLMResult;
@@ -1793,7 +1821,8 @@ async function runSelectedInternalReviewers(params: {
       const partialReport = partialVerdict
         ? `\n\n${reviewerEvidenceReport(label, partialVerdict, true)}`
         : "\n\nNo usable partial structured review evidence was returned before the cap.";
-      const feedback = `${label} ran out of turns at the configured cap (${maxTurns}). ${summaryLine(reviewResult.telemetry)}${partialReport}`;
+      const capMessage = `ran out of turns at the configured cap (${maxTurns})`;
+      const feedback = `${label} ${capMessage}. ${summaryLine(reviewResult.telemetry)}${partialReport}`;
       if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "reviewer_turns_exhausted";
       await reportIncompleteFailure(
         feedback,
@@ -1809,7 +1838,10 @@ async function runSelectedInternalReviewers(params: {
     if (reviewFailure) {
       const failure = classifyLlmResult(reviewResult, { stage, attempt: reviewResult.attempts ?? 1, expectsStructuredOutput: true, elapsedMs: reviewResult.telemetry?.durationMs ?? undefined });
       const telemetryPart = reviewResult.telemetry ? summaryLine(reviewResult.telemetry) : "no telemetry reported";
-      const feedback = compactErrorMessage(`Reviewer ${label} failed: ${reviewFailure} (${telemetryPart}; ${failure.category}/${failure.code})`);
+      const timedOut = isTimeBudget && reviewResult.failure?.code === "INVOCATION_TIMEOUT";
+      const feedback = compactErrorMessage(timedOut
+        ? `Reviewer ${label} ran out of its time budget (${reviewBudgetLabel}): ${reviewFailure} (${telemetryPart}; ${failure.category}/${failure.code})`
+        : `Reviewer ${label} failed: ${reviewFailure} (${telemetryPart}; ${failure.category}/${failure.code})`);
       if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "review_failed";
       priorLlmFailure ||= reviewerGates(selection, provenance);
       await reportIncompleteFailure(feedback, reviewResult.telemetry, { failure }, reviewStartedAt, reviewEndedAt);
@@ -2297,9 +2329,10 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       }
 
       const summaryBlockingGates = reviewProcess.summaryBlockingGates;
-      const reviewLedger = buildReviewLedger(internalIssues, [...selectedInternalFindings, ...externalFindings], effectiveReviewerPolicy, summaryBlockingGates);
-      const gatingReviewFindings = reviewLedger.filter((finding) => isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates));
-      const advisoryReviewFindings = reviewLedger.filter((finding) => !isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates));
+      const contractVerdict = externalFindingsResult.verdictSource === "review-contract" ? externalFindingsResult.verdict : undefined;
+      const reviewLedger = buildReviewLedger(internalIssues, [...selectedInternalFindings, ...externalFindings], effectiveReviewerPolicy, summaryBlockingGates, contractVerdict);
+      const gatingReviewFindings = reviewLedger.filter((finding) => isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates, contractVerdict));
+      const advisoryReviewFindings = reviewLedger.filter((finding) => !isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates, contractVerdict));
       // A finding the fix agent disposed as "follow-up" on an earlier iteration is dropped here,
       // before the merge-readiness decision and before it can reappear in the next fix prompt.
       // An "invalid" disposition is not filtered — it stays gating so the next review decides.
@@ -2628,6 +2661,7 @@ ${externalFindingsFixBlock}
         model,
         maxTurns: FIX_MAX_TURNS,
         stage: `post-push-review/fix-${iteration}`,
+        agentStage: "implementation",
         expectsStructuredOutput: false,
       });
       costUsd = addExtraCost(costUsd, fixResult.telemetry?.costUsd);

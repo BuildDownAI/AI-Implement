@@ -2,6 +2,10 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { resetClosedVetoLogGuard, resetRollUpHandledMarkers, isRollUpHandled, markRollUpHandled, clearRollUpHandledMarkersByIdentifier, runMergeUps } from "../merge-up.js";
 import type { RepoMapping } from "../config.js";
 import type { FeatureNodeRollUp } from "../providers/types.js";
+import { LinearProvider } from "../providers/linear.js";
+import { JiraProvider } from "../providers/jira.js";
+import type { JiraClient } from "../providers/jira-client.js";
+import { configureLinearAuth, __setLinearTokenForTest } from "../linear-app-auth.js";
 import { makeMapping } from "./helpers/builders.js";
 
 vi.mock("../dedup.js", async () => {
@@ -20,11 +24,13 @@ vi.mock("../github.js", () => ({
   createPullRequest: vi.fn(async () => ({ number: 7, url: "https://gh/pr/7" })),
   mergeBranch: vi.fn(async () => "merged"),
   deleteBranch: vi.fn(async () => true),
+  defaultFetchSignal: () => new AbortController().signal,
 }));
 
 import { compareBranches, createPullRequest, mergeBranch, findOpenPullRequest, findPullRequestByBranches, getBranchSha, deleteBranch } from "../github.js";
 
-const mapping = () => makeMapping({ owner: "jodwyer", repo: "alpacaWheel", defaultBranch: "testing" });
+const mapping = (overrides: Partial<RepoMapping> = {}) =>
+  makeMapping({ owner: "jodwyer", repo: "alpacaWheel", defaultBranch: "testing", ...overrides });
 
 const deps = (resolve: (k: string) => RepoMapping | null, finalizeMerged = vi.fn(async () => {})) => ({
   githubAppId: "1", githubAppPrivateKey: "k", resolveMapping: resolve, finalizeMerged,
@@ -387,5 +393,61 @@ describe("clearRollUpHandledMarkersByIdentifier (AII-349 reopen re-arm)", () => 
 
     expect(isRollUpHandled("owner", "repo", "ai-implement/feature/ool-78")).toBe(false);
     expect(isRollUpHandled("owner", "repo", "ai-implement/feature/ool-79")).toBe(true);
+  });
+});
+
+// AII-1294: the merge poll marks a grouping parent Done without checking its children, so
+// the roll-up gates must keep re-checking designated children live.
+describe("fetchFeatureNodeRollUps — Done parent with a non-terminal designated child", () => {
+  it("Linear returns no roll-up", async () => {
+    configureLinearAuth("client-id", "client-secret");
+    __setLinearTokenForTest("test-token");
+    const labels = { nodes: [{ name: "AI-Implement" }] };
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ data: { issues: { nodes: [
+        { identifier: "AII-1", team: { key: "AII" }, parent: null, children: { nodes: [
+          { identifier: "AII-2", state: { type: "completed" }, labels },
+          { identifier: "AII-3", state: { type: "started" }, labels },
+        ] } },
+      ] } } }),
+    } as Response)));
+    try {
+      expect(await new LinearProvider({}).fetchFeatureNodeRollUps()).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("Jira returns no roll-up", async () => {
+    const issue = (key: string, status: string, parentKey: string | null) => ({
+      id: `id-${key}`, key,
+      fields: {
+        parent: parentKey ? { key: parentKey } : null,
+        customfield_10100: { value: status },
+        customfield_10101: { value: "acme/x" },
+      },
+    });
+    const routes: Array<{ when: RegExp; issues: unknown[] }> = [
+      { when: /statusCategory = Done/, issues: [issue("OOL-1", "Merged", null)] },
+      { when: /parent in/, issues: [issue("OOL-2", "Merged", "OOL-1"), issue("OOL-3", "Implementing", "OOL-1")] },
+    ];
+    const client = {
+      async searchJql(jql: string) { return routes.find((r) => r.when.test(jql))?.issues ?? []; },
+    } as unknown as JiraClient;
+    const provider = new JiraProvider({
+      client, cacheScope: "c", siteUrl: "https://x",
+      getMappings: () => ({
+        m1: mapping({
+          ticketingProvider: "jira",
+          ticketingConfig: {
+            kind: "jira", jql: "project = OOL", repoFieldValue: "acme/x",
+            statusFieldOverride: "customfield_10100", repoFieldOverride: "customfield_10101",
+            profilesFieldOverride: "customfield_10200", baseBranchFieldOverride: "customfield_10300",
+          },
+        } as Partial<RepoMapping>),
+      }),
+    });
+    expect(await provider.fetchFeatureNodeRollUps()).toEqual([]);
   });
 });

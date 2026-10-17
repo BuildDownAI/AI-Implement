@@ -265,9 +265,9 @@ function isRestateOwned(dispatchId: string): boolean {
 function restateRefForRow(d: DispatchRow): RunEntry["restate"] {
   if (!d.dispatch_id) return null;
   if (d.phase === "kg-refresh") return { service: "KgRefresh", key: d.dispatch_id };
-  if (d.phase === "planning") return { service: "PlanningRun", key: d.dispatch_id };
   if (d.phase === "implementation") return null;
-  return isRestateOwned(d.dispatch_id) ? { service: "ReviewFixAttempt", key: d.dispatch_id } : null;
+  if (!isRestateOwned(d.dispatch_id)) return null;
+  return { service: d.phase === "planning" ? "PlanningRun" : "ReviewFixAttempt", key: d.dispatch_id };
 }
 
 // ---- getIssueReportCard ----

@@ -8,7 +8,7 @@ import {
 } from "./comment-gapfill-queue.js";
 import { getRunRecordMergeVerdict } from "./log.js";
 import { resolveReviewProcess } from "./review-process.js";
-import { headReviewedClean } from "./review-head-clean.js";
+import { headHasBlockingFinding, headReviewedClean } from "./review-head-clean.js";
 
 export interface AutoMergeDeps {
   githubAppId: string;
@@ -101,6 +101,11 @@ async function autoMergeRepo(mapping: RepoMapping, deps: AutoMergeDeps): Promise
       if (resolveReviewProcess(mapping.reviewProcess).fixer === "repository"
         && !(await headReviewedClean(token, owner, repo, pr.number, pr.headSha))) {
         console.log(`[auto-merge] Holding PR #${pr.number} -> ${pr.base}: current head not reviewed clean`);
+        continue;
+      }
+      // The mark records no head SHA: a verdict posted after it (AII-1291) must still hold the PR.
+      if (await headHasBlockingFinding(token, owner, repo, pr.number, pr.headSha)) {
+        console.log(`[auto-merge] Holding PR #${pr.number} -> ${pr.base}: blocking finding on current head`);
         continue;
       }
       const result = await mergePullRequest(token, owner, repo, pr.number, pr.headSha, "merge");

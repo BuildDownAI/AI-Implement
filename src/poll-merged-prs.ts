@@ -1,6 +1,6 @@
 import type { RepoMapping } from "./config.js";
-import { listLog } from "./log.js";
-import type { JobStatus } from "./log.js";
+import { getInFlightIssueIds, getLatestPrUrlForIssue, listLog } from "./log.js";
+import type { Job, JobStatus } from "./log.js";
 import {
   enqueueReconciliation,
   hasReconciliationForPr,
@@ -22,6 +22,10 @@ export interface DetectDeps {
     repo: string,
     prNumber: number,
   ) => Promise<{ merged: boolean; state: "open" | "closed" } | null>;
+  /** Marks a grouping parent whose own PR closed unmerged as Done. Resolves true once the
+   *  parent is finalized; false (nothing resolvable) leaves the PR untombstoned for a retry.
+   *  A provider error throws, with the same effect. */
+  finalizeGroupingParent: (job: Job) => Promise<boolean>;
 }
 
 /** Parse the PR number from a stored html PR URL ending in /pull/<n>. */
@@ -37,12 +41,22 @@ export function prNumberFromUrl(url: string): number | null {
  * re-checked next tick.
  */
 export async function detectMergedPrs(deps: DetectDeps): Promise<void> {
-  for (const job of listLog({ limit: 500 })) {
+  const jobs = listLog({ limit: 500 });
+  // AII-1294: a PR belongs to a grouping parent's own run if ANY of its rows says so — a newer
+  // gap-fill row on the same PR carries groupingParent=false.
+  const groupingParentPrs = new Set<string>();
+  for (const job of jobs) {
+    if (job.groupingParent && job.prUrl) groupingParentPrs.add(job.prUrl);
+  }
+  const handled = new Set<string>();
+  for (const job of jobs) {
     if (!job.repo || !job.prUrl) continue;
     if (!CANDIDATE_STATUSES.has(job.status)) continue;
     const prNumber = prNumberFromUrl(job.prUrl);
     if (prNumber === null) continue;
     if (hasReconciliationForPr(job.repo, prNumber)) continue;
+    const prKey = `${job.repo}#${prNumber}`;
+    if (handled.has(prKey)) continue;
     const mapping = deps.mappingForRepo(job.repo);
     if (!mapping) continue;
     const [owner] = job.repo.split("/");
@@ -65,6 +79,18 @@ export async function detectMergedPrs(deps: DetectDeps): Promise<void> {
       });
       console.log(`[merge-poll] Detected merge of PR #${prNumber} in ${job.repo}; queued reconciliation`);
     } else if (state.state === "closed") {
+      handled.add(prKey);
+      if (groupingParentPrs.has(job.prUrl) && getLatestPrUrlForIssue(job.issueId) === job.prUrl) {
+        // A run in flight may still change the picture; the next poll re-checks.
+        if (getInFlightIssueIds().has(job.issueId)) continue;
+        try {
+          if (!(await deps.finalizeGroupingParent(job))) continue;
+        } catch (err) {
+          console.error(`[merge-poll] failed to finalize grouping parent ${job.issueIdentifier} for closed PR #${prNumber} in ${job.repo}:`, err);
+          continue;
+        }
+        console.log(`[merge-poll] Grouping parent ${job.issueIdentifier} finalized: own PR #${prNumber} in ${job.repo} closed unmerged`);
+      }
       recordReconciliationTombstone({
         issueId: job.issueId,
         issueIdentifier: job.issueIdentifier,

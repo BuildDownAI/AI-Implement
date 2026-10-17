@@ -1,15 +1,17 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 const isWindows = process.platform === "win32";
-import { writeFileSync, chmodSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { PassThrough } from "node:stream";
 import { EventEmitter } from "node:events";
-import { ClaudeCliExecutor, readTelemetryFlag, type ActivityReportingConfig } from "../pipeline/executor.js";
+import { ClaudeCliExecutor, groupHasLiveMembers, isPossiblyLiveChild, readTelemetryFlag, suspendOriginWriteCredential, type ActivityReportingConfig } from "../pipeline/executor.js";
 import { computeBackoffMs, DEFAULT_RETRY_POLICY, type RetryPolicy } from "../pipeline/retry-backoff.js";
 import type { ActivitySink, ActivityIdentity, ActivityToolResult } from "../pipeline/types.js";
+import { READ_ONLY_TOOL_PARAMS } from "../pipeline/steps/read-only-tools.js";
 import { testDir } from "./helpers/test-dir.js";
 
 interface FakeAttempt {
@@ -233,6 +235,30 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
     expect(result.telemetry?.outcome).toBe("success");
     expect(result.telemetry?.numTurns).toBe(4);
     expect(result.tokensUsed).toBe(120);
+  });
+
+  it("legacy invoke uses a stripped process.env; a selected env replaces it for that call only", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.stubEnv("ANTHROPIC_API_KEY", "ambient-synthetic-key-0000");
+    vi.stubEnv("RUN_TOKEN", "runner-token-0000");
+    // Controlled auth state: a host-level OAuth token would make OAuth-wins drop the API key under test.
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", undefined);
+    const before = { ...process.env };
+    const envs: Array<Record<string, string | undefined>> = [];
+    const fakeSpawn = (_c: string, _a: string[], o: { env: Record<string, string | undefined> }) => {
+      envs.push(o.env);
+      return makeTestProcess(SUCCESS_LINES.join("\n") + "\n", 0);
+    };
+    const exec = new ClaudeCliExecutor("/tmp", "summary", true, fakeSpawn as unknown as typeof spawn);
+    await exec.invoke({ prompt: "p", model: "m" });
+    await exec.invoke(
+      { prompt: "p", model: "m" },
+      { env: { PATH: "/bin", ANTHROPIC_API_KEY: "selected-synthetic-key", RUN_TOKEN: "still-stripped-0000" } },
+    );
+    expect(envs[0].ANTHROPIC_API_KEY).toBe("ambient-synthetic-key-0000");
+    expect(envs[0].RUN_TOKEN).toBeUndefined();
+    expect(envs[1]).toEqual({ PATH: "/bin", ANTHROPIC_API_KEY: "selected-synthetic-key" });
+    expect(process.env).toEqual(before);
   });
 
   it("does NOT print per-event lines at summary level, but prints the summary", async () => {
@@ -857,6 +883,93 @@ describe.skipIf(isWindows)("ClaudeCliExecutor request-level retry (BAC-27114)", 
     expect(result.attempts).toBe(1);
     expect(result.failure?.category).toBe("transient");
     expect(result.failure?.code).toBe("PROVIDER_OVERLOADED");
+  });
+
+  it.each([
+    ["Edit", "Edit"],
+    ["Write", "Write"],
+    ["an MCP tool", "mcp__srv__do"],
+    ["an unknown tool", "Mystery"],
+  ])("does not retry a toolUseIsSafe failure after %s tool_use", async (_label, name) => {
+    const line = JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name, input: {} }] } });
+    const { spawnImpl, callCount } = makeFakeSpawn([{ stdoutLines: [line], stderr: OVERLOAD_STDERR, exitCode: 1 }]);
+    const exec = new ClaudeCliExecutor("/tmp", "summary", false, spawnImpl, makeFakeSleep().sleepImpl);
+    const result = await exec.invoke({
+      prompt: "p", model: "m", stage: "review", expectsStructuredOutput: true,
+      retry: { policy: basePolicy, toolUseIsSafe: true },
+    });
+    expect(callCount()).toBe(1);
+    expect(result.attempts).toBe(1);
+  });
+
+  it("does not retry a toolUseIsSafe failure when a tool_use is hidden in a nameless nested block", async () => {
+    const line = JSON.stringify({ type: "assistant", message: { content: [{ type: "x", content: [{ type: "tool_use" }] }] } });
+    const { spawnImpl, callCount } = makeFakeSpawn([{ stdoutLines: [line], stderr: OVERLOAD_STDERR, exitCode: 1 }]);
+    const exec = new ClaudeCliExecutor("/tmp", "summary", false, spawnImpl, makeFakeSleep().sleepImpl);
+    await exec.invoke({
+      prompt: "p", model: "m", stage: "review", expectsStructuredOutput: true,
+      retry: { policy: basePolicy, toolUseIsSafe: true },
+    });
+    expect(callCount()).toBe(1);
+  });
+
+  it("still retries a toolUseIsSafe failure when content is a malformed string", async () => {
+    const line = JSON.stringify({ type: "assistant", message: { content: "oops" } });
+    const { spawnImpl, callCount } = makeFakeSpawn([{ stdoutLines: [line], stderr: OVERLOAD_STDERR, exitCode: 1 }, { exitCode: 0 }]);
+    const exec = new ClaudeCliExecutor("/tmp", "summary", false, spawnImpl, makeFakeSleep().sleepImpl);
+    await exec.invoke({
+      prompt: "p", model: "m", stage: "review", expectsStructuredOutput: true,
+      retry: { policy: basePolicy, toolUseIsSafe: true },
+    });
+    expect(callCount()).toBe(2);
+  });
+
+  describe("restricted tool spawn args", () => {
+    function capture(): { spawnImpl: typeof spawn; argv: () => string[] } {
+      let captured: string[] = [];
+      const inner = makeFakeSpawn([{ exitCode: 0 }]).spawnImpl;
+      const spawnImpl = ((cmd: string, args: readonly string[], opts: unknown) => {
+        captured = [...args];
+        return (inner as unknown as (...a: unknown[]) => unknown)(cmd, args, opts);
+      }) as unknown as typeof spawn;
+      return { spawnImpl, argv: () => captured };
+    }
+    const flagValue = (argv: string[], flag: string): string | undefined => argv[argv.indexOf(flag) + 1];
+
+    it("limits a builtinTools session to Read/Glob/Grep and denies shell, writes, MCP, skills and delegates", async () => {
+      const { spawnImpl, argv } = capture();
+      const exec = new ClaudeCliExecutor("/tmp", "summary", false, spawnImpl, makeFakeSleep().sleepImpl);
+      await exec.invoke({ prompt: "p", model: "m", ...READ_ONLY_TOOL_PARAMS });
+      const args = argv();
+      expect(flagValue(args, "--tools")).toBe("Read,Glob,Grep");
+      expect(args).toContain("--strict-mcp-config");
+      expect(args).not.toContain("--mcp-config");
+      expect(args).toContain("--disable-slash-commands");
+      const denied = flagValue(args, "--disallowed-tools")!.split(",");
+      for (const t of ["Bash", "Edit", "Write", "NotebookEdit", "Task", "Agent", "Skill", "mcp__*"]) {
+        expect(denied).toContain(t);
+      }
+      expect(flagValue(args, "--allowed-tools")).toBe("Read,Glob,Grep");
+      expect(args.join(" ")).not.toContain("curl");
+    });
+
+    it("leaves an implementation-style invocation unrestricted", async () => {
+      const { spawnImpl, argv } = capture();
+      const exec = new ClaudeCliExecutor("/tmp", "summary", false, spawnImpl, makeFakeSleep().sleepImpl);
+      await exec.invoke({ prompt: "p", model: "m", maxTurns: 5 });
+      const args = argv();
+      for (const f of ["--tools", "--disallowed-tools", "--strict-mcp-config", "--disable-slash-commands", "--allowed-tools"]) {
+        expect(args).not.toContain(f);
+      }
+    });
+
+    it("emits --allowed-tools alone for an implementation invocation with configured tools", async () => {
+      const { spawnImpl, argv } = capture();
+      const exec = new ClaudeCliExecutor("/tmp", "summary", false, spawnImpl, makeFakeSleep().sleepImpl);
+      await exec.invoke({ prompt: "p", model: "m", tools: ["Bash(npm test)"] });
+      expect(flagValue(argv(), "--allowed-tools")).toBe("Bash(npm test)");
+      expect(argv()).not.toContain("--tools");
+    });
   });
 
   it("classifies (but does not retry) a structural exit-0 review failure — missing structured output is not transient", async () => {
@@ -2555,5 +2668,159 @@ describe.skipIf(isWindows)("ClaudeCliExecutor runner-activity reporting (AII-798
     const output = (toolResultCall!.payload as ActivityToolResult).output;
     expect(output.truncated).toBe(true);
     expect(Buffer.byteLength(output.text, "utf8")).toBeLessThanOrEqual(16 * 1024);
+  });
+});
+
+describe("suspendOriginWriteCredential (shared publication-credential guard)", () => {
+  let repo: string;
+  const originOf = (): string => execFileSync("git", ["remote", "get-url", "origin"], { cwd: repo, encoding: "utf-8" }).trim();
+
+  beforeEach(() => {
+    repo = mkdtempSync(join(tmpdir(), "guard-"));
+    execFileSync("git", ["init", "-q"], { cwd: repo });
+  });
+  afterEach(() => rmSync(repo, { recursive: true, force: true }));
+
+  it("strips http(s) origin credentials and restores them exactly", () => {
+    const tokenized = "https://x-access-token:secret-token@github.com/acme/app.git";
+    execFileSync("git", ["remote", "add", "origin", tokenized], { cwd: repo });
+    const restore = suspendOriginWriteCredential(repo);
+    expect(restore).toBeTypeOf("function");
+    expect(originOf()).toBe("https://github.com/acme/app.git");
+    restore?.();
+    expect(originOf()).toBe(tokenized);
+  });
+
+  it("is a no-op for SSH origins, credential-free http origins and a missing origin", () => {
+    expect(suspendOriginWriteCredential(repo)).toBeNull();
+    execFileSync("git", ["remote", "add", "origin", "git@github.com:acme/app.git"], { cwd: repo });
+    expect(suspendOriginWriteCredential(repo)).toBeNull();
+    expect(originOf()).toBe("git@github.com:acme/app.git");
+    execFileSync("git", ["remote", "set-url", "origin", "https://github.com/acme/app.git"], { cwd: repo });
+    expect(suspendOriginWriteCredential(repo)).toBeNull();
+  });
+
+  it("throws when the credential cannot be removed", () => {
+    execFileSync("git", ["remote", "add", "origin", "https://u:p@github.com/acme/app.git"], { cwd: repo });
+    const lock = join(repo, ".git", "config.lock");
+    writeFileSync(lock, "");
+    expect(() => suspendOriginWriteCredential(repo)).toThrow(/Failed to remove the repository write credential/);
+  });
+});
+
+describe.skipIf(isWindows)("ClaudeCliExecutor invocation deadline", () => {
+  const retry = { policy: { ...DEFAULT_RETRY_POLICY, requestRetries: 3, backoffInitialMs: 10_000, backoffMaxMs: 60_000 }, toolUseIsSafe: false };
+  const fastStop = { termWaitMs: 150, killWaitMs: 150 };
+
+  /** Real child process stand-in for `claude`: runs `script` under node, consuming stdin. */
+  function realChild(script: string, pids: number[] = []): typeof spawn {
+    return ((_cmd: string, _args: readonly string[], opts: Parameters<typeof spawn>[2]) => {
+      const child = spawn(process.execPath, ["-e", `process.stdin.resume();${script}`], opts);
+      if (child.pid) pids.push(child.pid);
+      return child;
+    }) as unknown as typeof spawn;
+  }
+
+  const groupAlive = (pid: number): boolean => groupHasLiveMembers(pid);
+
+  it("stops a real child at the deadline, returns a classified timeout and confirms the group is gone", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const pids: number[] = [];
+    const exec = new ClaudeCliExecutor("/tmp", "summary", true, realChild("setInterval(() => {}, 1000);", pids), undefined, undefined, undefined, fastStop);
+    const t0 = Date.now();
+    const result = await exec.invoke({ prompt: "p", model: "m", invocationTimeoutMs: 400 });
+    expect(Date.now() - t0).toBeLessThan(4000);
+    expect(result.failure).toMatchObject({ category: "crash", code: "INVOCATION_TIMEOUT", retryable: false });
+    expect(result.telemetry).toBeDefined();
+    expect(groupAlive(pids[0])).toBe(false);
+  });
+
+  it("escalates to SIGKILL for a child that ignores SIGTERM, including its forked descendants", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const pids: number[] = [];
+    const script = `process.on("SIGTERM", () => {}); require("node:child_process").spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], { stdio: "ignore" }); setInterval(() => {}, 1000);`;
+    const exec = new ClaudeCliExecutor("/tmp", "summary", true, realChild(script, pids), undefined, undefined, undefined, fastStop);
+    const result = await exec.invoke({ prompt: "p", model: "m", invocationTimeoutMs: 500 });
+    expect(result.failure).toMatchObject({ code: "INVOCATION_TIMEOUT" });
+    expect(groupAlive(pids[0])).toBe(false);
+  });
+
+  it("does not report success for a child that outlives its deadline", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const line = JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "late", usage: { input_tokens: 1, output_tokens: 1 } });
+    const script = `setTimeout(() => { console.log(${JSON.stringify(line)}); process.exit(0); }, 1500);`;
+    const exec = new ClaudeCliExecutor("/tmp", "summary", true, realChild(script), undefined, undefined, undefined, fastStop);
+    const result = await exec.invoke({ prompt: "p", model: "m", invocationTimeoutMs: 30 });
+    expect(result.failure).toMatchObject({ code: "INVOCATION_TIMEOUT" });
+  });
+
+  it("holds a possibly-live child: rejects with a timeout failure and possiblyLive when death is unproven", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const spawnImpl = (() => {
+      const stdin = new PassThrough();
+      const proc = Object.assign(new EventEmitter(), { stdin, stdout: makeDestroyableEmitter(), stderr: makeDestroyableEmitter(), kill: () => true, unref: () => {} });
+      return proc as unknown as ChildProcessWithoutNullStreams;
+    }) as unknown as typeof spawn;
+    const exec = new ClaudeCliExecutor("/tmp", "summary", true, spawnImpl, undefined, undefined, undefined, { termWaitMs: 20, killWaitMs: 20 });
+    const err = await exec.invoke({ prompt: "p", model: "m", invocationTimeoutMs: 20 }).catch((e) => e);
+    expect(isPossiblyLiveChild(err)).toBe(true);
+    expect(err.failure).toMatchObject({ code: "INVOCATION_TIMEOUT" });
+    expect(err.telemetry).toBeDefined();
+  });
+
+  function transientSpawn(calls: { n: number }) {
+    return (() => {
+      calls.n++;
+      const proc = new EventEmitter() as unknown as ChildProcessWithoutNullStreams;
+      Object.assign(proc, { stdin: Object.assign(new EventEmitter(), { end: () => {} }), stdout: new EventEmitter(), stderr: new EventEmitter() });
+      setImmediate(() => proc.emit("error", Object.assign(new Error("spawn claude EAGAIN"), { code: "EAGAIN" })));
+      return proc;
+    }) as unknown as typeof spawn;
+  }
+
+  it("bounds the retry backoff by the remaining budget and spawns nothing after expiry", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    let t = 1_000;
+    const slept: number[] = [];
+    const calls = { n: 0 };
+    const exec = new ClaudeCliExecutor("/tmp", "summary", true, transientSpawn(calls), async (ms) => void (slept.push(ms), (t += ms)), undefined, () => t);
+    const result = await exec.invoke({ prompt: "p", model: "m", invocationTimeoutMs: 100, retry });
+    expect(result.failure).toMatchObject({ code: "INVOCATION_TIMEOUT", retryable: false });
+    expect(calls.n).toBe(1);
+    expect(slept).toHaveLength(1);
+    expect(slept[0]).toBeLessThanOrEqual(100);
+    expect(t - 1_000).toBeLessThanOrEqual(100);
+    expect(result.telemetry).toBeDefined();
+  });
+
+  it("rechecks the deadline after a scheduling delay and never spawns with an expired or zero timeout", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    let t = 1_000;
+    const calls = { n: 0 };
+    // The sleep itself overshoots the budget (scheduler delay): the following attempt must not spawn.
+    const delayed = new ClaudeCliExecutor("/tmp", "summary", true, transientSpawn(calls), async (ms) => void (t += ms + 5_000), undefined, () => t);
+    const r1 = await delayed.invoke({ prompt: "p", model: "m", invocationTimeoutMs: 100, retry });
+    expect(r1.failure).toMatchObject({ code: "INVOCATION_TIMEOUT" });
+    expect(calls.n).toBe(1);
+
+    const zero = { n: 0 };
+    const exec0 = new ClaudeCliExecutor("/tmp", "summary", true, transientSpawn(zero));
+    const r0 = await exec0.invoke({ prompt: "p", model: "m", invocationTimeoutMs: 0 });
+    expect(r0.failure).toMatchObject({ code: "INVOCATION_TIMEOUT" });
+    expect(zero.n).toBe(0);
+  });
+
+  it("accumulates telemetry from a failed attempt into the timeout result", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    let t = 1_000;
+    const lines = [
+      JSON.stringify({ type: "result", subtype: "error_during_execution", is_error: true, result: "overloaded", num_turns: 2, total_cost_usd: 0.5, usage: { input_tokens: 9, output_tokens: 4 } }),
+    ];
+    const { spawnImpl } = makeFakeSpawn([{ stdoutLines: lines, stderr: 'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}', exitCode: 1 }]);
+    const exec = new ClaudeCliExecutor("/tmp", "summary", true, spawnImpl, async (ms) => void (t += ms), undefined, () => t);
+    const result = await exec.invoke({ prompt: "p", model: "m", invocationTimeoutMs: 100, retry });
+    expect(result.failure).toMatchObject({ code: "INVOCATION_TIMEOUT" });
+    expect(result.telemetry?.tokensIn).toBe(9);
+    expect(result.telemetry?.tokensOut).toBe(4);
   });
 });

@@ -122,12 +122,12 @@ describe("decideAvailabilityAction", () => {
     available: true as boolean | null,
     headCommit: "def5678" as string | null,
     held: false,
-    policy: { autoDeploy: false, notifyAvailable: true },
+    policy: { autoDeploy: false, notifyAvailable: true, watchedRepo: null, watchedRef: null },
     lastActedCommit: null as string | null,
   });
 
   it("deploys when automatic deploying is on and the commit is new", () => {
-    const input = { ...base(), policy: { autoDeploy: true, notifyAvailable: true } };
+    const input = { ...base(), policy: { autoDeploy: true, notifyAvailable: true, watchedRepo: null, watchedRef: null } };
     expect(policy.decideAvailabilityAction(input)).toBe("deploy");
   });
 
@@ -138,12 +138,12 @@ describe("decideAvailabilityAction", () => {
   it("prefers deploying over announcing when both are enabled", () => {
     // The shutdown notice already announces the pause, so a second notice would
     // double-ping one event.
-    const input = { ...base(), policy: { autoDeploy: true, notifyAvailable: true } };
+    const input = { ...base(), policy: { autoDeploy: true, notifyAvailable: true, watchedRepo: null, watchedRef: null } };
     expect(policy.decideAvailabilityAction(input)).toBe("deploy");
   });
 
   it("does nothing when both are off", () => {
-    const input = { ...base(), policy: { autoDeploy: false, notifyAvailable: false } };
+    const input = { ...base(), policy: { autoDeploy: false, notifyAvailable: false, watchedRepo: null, watchedRef: null } };
     expect(policy.decideAvailabilityAction(input)).toBe("none");
   });
 
@@ -157,7 +157,7 @@ describe("decideAvailabilityAction", () => {
   ])("does nothing when %s", (_label, patch) => {
     // Each of these is checked with automatic deploying ON, so a regression that drops
     // the guard shows up as an unattended deploy rather than a silent no-op.
-    const input = { ...base(), policy: { autoDeploy: true, notifyAvailable: true }, ...patch };
+    const input = { ...base(), policy: { autoDeploy: true, notifyAvailable: true, watchedRepo: null, watchedRef: null }, ...patch };
     expect(policy.decideAvailabilityAction(input)).toBe("none");
   });
 

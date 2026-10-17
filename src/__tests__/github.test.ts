@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, getCommitTime } from "../github.js";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime, getDefaultBranchFileText, listPrComments } from "../github.js";
 import { decodeRunConfig } from "../run-config.js";
 import { buildIssueBranchName } from "../pipeline/branch-name.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
@@ -956,6 +956,34 @@ describe("listPullRequestFiles (AII-639)", () => {
   });
 });
 
+describe("listPullRequestCommits (AII-1302)", () => {
+  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it("follows Link rel=\"next\" and returns SHAs oldest first across pages", async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => ({ sha: `sha-${i}` }));
+    const page2 = [{ sha: "head" }];
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(JSON.stringify(page1), {
+        status: 200,
+        headers: { link: '<https://api.github.com/repos/o/r/pulls/7/commits?per_page=100&page=2>; rel="next"' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(page2), { status: 200 }));
+    const shas = await listPullRequestCommits("tok", "o", "r", 7);
+    expect(shas).toHaveLength(101);
+    expect(shas[0]).toBe("sha-0");
+    expect(shas[100]).toBe("head");
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+    expect(String(vi.mocked(fetch).mock.calls[0][0])).toContain("/pulls/7/commits?per_page=100");
+    expect(String(vi.mocked(fetch).mock.calls[1][0])).toContain("page=2");
+  });
+
+  it("throws on a non-OK page rather than reading it as no commits", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response("nope", { status: 502 }));
+    await expect(listPullRequestCommits("tok", "o", "r", 7)).rejects.toThrow(/listPullRequestCommits failed: HTTP 502/);
+  });
+});
+
 describe("parseLinkNext", () => {
   it("returns null for a null header", () => {
     expect(parseLinkNext(null)).toBeNull();
@@ -1043,5 +1071,56 @@ describe("getCommitTime", () => {
   it("throws on a fetch error", async () => {
     fakeFetch({ [COMMIT]: () => { throw new Error("net"); } }).install();
     await expect(getCommitTime("t", "o", "r", "abc")).rejects.toThrow(/net/);
+  });
+});
+
+describe("getDefaultBranchFileText", () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+  const stub = (res: unknown) => vi.stubGlobal("fetch", vi.fn(async () => res));
+
+  it("decodes a base64 file and encodes each path segment", async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ type: "file", encoding: "base64", content: Buffer.from("a: 1\n").toString("base64") }) }));
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await getDefaultBranchFileText("t", "o", "r", ".ai-implement/my file#1.yml")).toBe("a: 1\n");
+    expect((fetchMock.mock.calls[0] as unknown as [string])[0]).toBe("https://api.github.com/repos/o/r/contents/.ai-implement/my%20file%231.yml");
+  });
+
+  it("returns null on 404", async () => {
+    stub({ ok: false, status: 404, json: async () => ({}) });
+    expect(await getDefaultBranchFileText("t", "o", "r", "x")).toBeNull();
+  });
+
+  it("throws on other non-ok responses", async () => {
+    stub({ ok: false, status: 500, json: async () => ({}) });
+    await expect(getDefaultBranchFileText("t", "o", "r", "x")).rejects.toThrow(/500/);
+  });
+
+  it("returns null when the path is not a file", async () => {
+    stub({ ok: true, status: 200, json: async () => ({ type: "dir" }) });
+    expect(await getDefaultBranchFileText("t", "o", "r", "x")).toBeNull();
+  });
+});
+
+describe("listPrComments strict option (AII-1309)", () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+  const page = (status: number, body: unknown, link?: string) =>
+    new Response(JSON.stringify(body), { status, ...(link ? { headers: { link } } : {}) });
+
+  it("stops quietly on a non-ok response by default", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => page(502, {})));
+    expect(await listPrComments("t", "o", "r", 5)).toEqual([]);
+  });
+
+  it.each([502, 403])("throws on a %s when strict", async (status) => {
+    vi.stubGlobal("fetch", vi.fn(async () => page(status, {})));
+    await expect(listPrComments("t", "o", "r", 5, { strict: true })).rejects.toThrow(new RegExp(String(status)));
+  });
+
+  it("throws when strict and a later page fails", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(page(200, [{ id: 1, body: "a" }], '<https://api.github.com/next>; rel="next"'))
+      .mockResolvedValueOnce(page(502, {}));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(listPrComments("t", "o", "r", 5, { strict: true })).rejects.toThrow(/502/);
   });
 });

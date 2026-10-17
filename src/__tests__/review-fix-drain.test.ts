@@ -11,6 +11,7 @@ import type * as AdmissionModule from "../dispatch-admission.js";
 import type * as RestateStatusModule from "../restate/status.js";
 import type { RepoMapping } from "../config.js";
 import type { TicketingProvider } from "../providers/types.js";
+import { makeGrant, makeSnapshot } from "./configured-run-fixture.js";
 import { makeAppConfig, makeAppendLogEntry, makeIssue, makeMapping, makeProvider, makeRegistry } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type Reply, type Routes } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
@@ -46,9 +47,34 @@ vi.mock("../local-gapfill.js", async (importOriginal) => {
   };
 });
 
+const managedMocks = vi.hoisted(() => ({
+  isManagedProject: vi.fn<(key: string, dispatchId?: string) => boolean>(() => false),
+  prepareManagedDispatch: vi.fn<(...args: unknown[]) => Promise<unknown>>(),
+  settleLaunch: vi.fn(),
+}));
+
+vi.mock("../managed-dispatch-auth.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../managed-dispatch-auth.js")>();
+  return {
+    ...actual,
+    isManagedProject: managedMocks.isManagedProject,
+    prepareManagedDispatch: managedMocks.prepareManagedDispatch,
+    settleLaunch: managedMocks.settleLaunch,
+  };
+});
+
+vi.mock("../model-auth-runtime.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../model-auth-runtime.js")>();
+  return { ...actual, getModelAuthRuntime: vi.fn(() => ({ runtime: true })) };
+});
+
 const githubAppAuthMocks = vi.hoisted(() => ({
   getInstallationToken: vi.fn<(appId: string, privateKey: string, owner: string) => Promise<string>>(async () => "gh-token"),
   getInstallationId: vi.fn<(appId: string, privateKey: string, owner: string) => Promise<number>>(async () => 778899),
+  // GitHub's answer to a repository-scoped mint: the token, its expiry an hour out, and the installation.
+  getScopedInstallationToken: vi.fn<typeof import("../github-app-auth.js").getScopedInstallationToken>(async () => ({
+    token: "scoped-token", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 778899,
+  })),
 }));
 
 vi.mock("../github-app-auth.js", async (importOriginal) => {
@@ -57,6 +83,7 @@ vi.mock("../github-app-auth.js", async (importOriginal) => {
     ...actual,
     getInstallationToken: githubAppAuthMocks.getInstallationToken,
     getInstallationId: githubAppAuthMocks.getInstallationId,
+    getScopedInstallationToken: githubAppAuthMocks.getScopedInstallationToken,
   };
 });
 
@@ -129,6 +156,9 @@ function pulls(replies: Record<number, Reply | Reply[]>): FakeFetch {
 }
 
 beforeEach(async () => {
+  managedMocks.isManagedProject.mockReset();
+  managedMocks.prepareManagedDispatch.mockReset();
+  managedMocks.settleLaunch.mockReset();
   process.env.RUNNER_MODE = "local";
   ({
     dedup, log, breaker, configModule, reviewFixQueue, admission, restateStatus,
@@ -149,6 +179,7 @@ afterEach(() => {
   localGapfillMocks.startLocalRunnerContainer.mockReset();
   githubAppAuthMocks.getInstallationToken.mockReset();
   githubAppAuthMocks.getInstallationId.mockReset();
+  githubAppAuthMocks.getScopedInstallationToken.mockReset();
   ingressMocks.feedback.mockReset();
   trackerPostCommentMock.mockClear();
 });
@@ -397,6 +428,48 @@ describe("processReviewFixQueue — dispatch gate", () => {
     expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
     const pending = reviewFixQueue.getPendingReviewFixes();
     expect(pending).toHaveLength(0);
+  });
+
+  it("boots the local review-fix child with a repo-scoped token", async () => {
+    const mapping = acmeBilling();
+    configModule.upsertMapping("TEAM", mapping);
+    pulls({ 42: pullRequest("open") });
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-scoped",
+      issueIdentifier: "AII-90",
+      repo: "acme/billing",
+      prNumber: 42,
+      reason: "late review comment",
+    });
+
+    await indexModule.processReviewFixQueue(config, registry);
+
+    expect(githubAppAuthMocks.getScopedInstallationToken).toHaveBeenCalledWith(
+      config.githubAppId,
+      config.githubAppPrivateKey,
+      mapping.owner,
+      { repositories: [mapping.repo] },
+    );
+    const [call] = localGapfillMocks.dispatchLocalGapfill.mock.calls[0]!;
+    expect(call.githubToken).toBe("scoped-token");
+  });
+
+  it("aborts the local review-fix launch when the scoped mint fails, with no broad fallback", async () => {
+    const mapping = acmeBilling();
+    configModule.upsertMapping("TEAM", mapping);
+    githubAppAuthMocks.getScopedInstallationToken.mockRejectedValue(new Error("mint failed"));
+    pulls({ 42: pullRequest("open") });
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-mintfail",
+      issueIdentifier: "AII-91",
+      repo: "acme/billing",
+      prNumber: 42,
+      reason: "late review comment",
+    });
+
+    await indexModule.processReviewFixQueue(config, registry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
   });
 
   it("keeps a review fix pending when GitHub cannot confirm the PR is open", async () => {
@@ -777,6 +850,50 @@ describe("processReviewFixQueue — GHA phase fix", () => {
   });
 });
 
+describe("processReviewFixQueue — GHA publication token gate", () => {
+  async function dispatchInputs(supportsRunPublicationToken: boolean): Promise<Record<string, unknown>> {
+    process.env.RUNNER_MODE = "default";
+    configModule.upsertMapping("TEAM", acmeBilling({ executionMode: "github-actions" }));
+    pulls({ 43: pullRequest("open") });
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-gate",
+      issueIdentifier: "AII-11",
+      repo: "acme/billing",
+      prNumber: 43,
+      reason: "late review comment",
+    });
+
+    const githubModule = await import("../github.js");
+    const workflowProbeModule = await import("../workflow-probe.js");
+    const repoImageModule = await import("../repo-image.js");
+    const dispatchWorkflowSpy = vi.spyOn(githubModule, "dispatchWorkflow").mockResolvedValue({ success: true, status: 204 });
+    vi.spyOn(workflowProbeModule, "resolveWorkflowCapabilities").mockResolvedValue({
+      contract: "envelope",
+      supportsRunPublicationToken,
+      supportsAttemptCorrelation: false,
+    });
+    vi.spyOn(repoImageModule, "resolveRunnerImageForDispatch").mockResolvedValue(undefined);
+
+    await indexModule.processReviewFixQueue(
+      { ...config, runnerCallbackBaseUrl: "https://callback.example", runnerTokenSecret: "test-secret" },
+      registry,
+    );
+
+    expect(dispatchWorkflowSpy).toHaveBeenCalledTimes(1);
+    return dispatchWorkflowSpy.mock.calls[0]![2] as Record<string, unknown>;
+  }
+
+  it("sends run_publication_token when the contract is envelope and the workflow supports it", async () => {
+    const inputs = await dispatchInputs(true);
+    expect(inputs.run_publication_token).toBeTruthy();
+  });
+
+  it("omits run_publication_token when the workflow does not support it", async () => {
+    const inputs = await dispatchInputs(false);
+    expect("run_publication_token" in inputs).toBe(false);
+  });
+});
+
 describe("processReviewFixQueue — task description wiring", () => {
   it("builds the local-Docker dispatch's issue description with buildReviewFixTaskDescription", async () => {
     const mapping = acmeBilling();
@@ -832,6 +949,61 @@ describe("processReviewFixQueue — task description wiring", () => {
     expect(call.issue.description).toBe(expected);
     expect(expected).toContain(`### ${openFindings[0]!.findingKey}`);
     expect(expected).toContain("Implement the widget.");
+  });
+
+  it("keeps an over-budget review pending: no dispatch, no dispatch record, no status change", async () => {
+    configModule.upsertMapping("TEAM", acmeBilling());
+    pulls({ 62: pullRequest("open") });
+    const queueId = reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-over", issueIdentifier: "AII-12", repo: "acme/billing", prNumber: 62, reason: "late review comment",
+    });
+    const reviewLedgerStore = await import("../review-ledger-store.js");
+    for (let i = 0; i < 31; i++) {
+      reviewLedgerStore.upsertReviewFinding({
+        repo: "acme/billing", prNumber: 62, source: "github-review", severity: "blocking",
+        body: `Finding ${i}`, path: `src/f${i}.ts`, line: i + 1,
+      });
+    }
+    findByKeyMock.mockResolvedValue({
+      id: "issue-over", identifier: "AII-12", title: "T", description: "d", scopeKey: "TEAM", nativeStatus: "In Progress",
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    await indexModule.processReviewFixQueue(config, registry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    expect(reviewFixQueue.getPendingReviewFixes().map((item) => item.id)).toEqual([queueId]);
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_dispatches").get() as { n: number }).n).toBe(0);
+    expect(reviewLedgerStore.listOpenReviewFindings("acme/billing", 62)).toHaveLength(31);
+    expect(warn.mock.calls.some((call) => String(call[0]).includes("Incomplete feedback (count)"))).toBe(true);
+  });
+
+  it("dispatches a full admitted set and records exactly the rendered finding ids", async () => {
+    configModule.upsertMapping("TEAM", acmeBilling());
+    pulls({ 63: pullRequest("open") });
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-full", issueIdentifier: "AII-13", repo: "acme/billing", prNumber: 63, reason: "late review comment",
+    });
+    const reviewLedgerStore = await import("../review-ledger-store.js");
+    for (let i = 0; i < 4; i++) {
+      reviewLedgerStore.upsertReviewFinding({
+        repo: "acme/billing", prNumber: 63, source: "github-review", severity: "blocking",
+        body: `Finding ${i}\n\n${"detail ".repeat(150)}\nEND-${i}`, path: `src/f${i}.ts`, line: i + 1,
+      });
+    }
+    findByKeyMock.mockResolvedValue({
+      id: "issue-full", identifier: "AII-13", title: "T", description: "d", scopeKey: "TEAM", nativeStatus: "In Progress",
+    });
+    localGapfillMocks.dispatchLocalGapfill.mockResolvedValue({ containerId: "c", machineNonce: "n" } as never);
+
+    await indexModule.processReviewFixQueue(config, registry);
+
+    const [call] = localGapfillMocks.dispatchLocalGapfill.mock.calls[0]!;
+    for (let i = 0; i < 4; i++) expect(call.issue.description).toContain(`END-${i}`);
+    const open = reviewLedgerStore.listOpenReviewFindings("acme/billing", 63).map((f) => f.id).sort();
+    const row = dedup.getDb().prepare("SELECT finding_ids_json FROM review_fix_dispatches").get() as { finding_ids_json: string };
+    expect((JSON.parse(row.finding_ids_json) as number[]).sort()).toEqual(open);
+    expect(open).toHaveLength(4);
   });
 
   it("uses buildReviewFixTaskDescription for the legacy issue_description dispatch field on the GHA path", async () => {
@@ -926,60 +1098,6 @@ describe("processReviewFixQueue — task description wiring", () => {
     expect(pending).toHaveLength(0);
 
     consoleErrorSpy.mockRestore();
-  });
-
-  it("caps the dispatch snapshot at the first 30 findings shown in the task text, leaving finding 31 open after resolution", async () => {
-    const mapping = acmeBilling();
-    configModule.upsertMapping("AII", mapping);
-    pulls({ 62: pullRequest("open") });
-
-    reviewFixQueue.enqueueReviewFix({
-      issueId: "issue-cap",
-      issueIdentifier: "AII-12",
-      repo: "acme/billing",
-      prNumber: 62,
-      reason: "review_comment",
-    });
-
-    for (let i = 0; i < 31; i++) {
-      reviewLedgerStore.upsertReviewFinding({
-        repo: "acme/billing",
-        prNumber: 62,
-        source: "github-review",
-        severity: "blocking",
-        body: `Finding number ${i}`,
-        path: "src/foo.ts",
-        line: i,
-      });
-    }
-
-    await indexModule.processReviewFixQueue(config, registry);
-
-    expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
-    const [call] = localGapfillMocks.dispatchLocalGapfill.mock.calls[0]!;
-    const description = call.issue.description ?? "";
-    const headingCount = (description.match(/^### /gm) ?? []).length;
-    expect(headingCount).toBe(30);
-    expect(description).toContain("1 additional finding was left out of this task");
-
-    const openFindings = reviewLedgerStore.listOpenReviewFindings("acme/billing", 62);
-    expect(openFindings).toHaveLength(31);
-    const expectedIds = openFindings.slice(0, 30).map((f) => f.id);
-    const omittedId = openFindings[30]!.id;
-
-    const job = log.getInFlightJobs().find((j) => j.issueId === "issue-cap");
-    expect(job?.dispatchId).toBeTruthy();
-    const snapshot = reviewFixQueue.getReviewFixDispatchSnapshot(job!.dispatchId!);
-    expect(snapshot).not.toBeNull();
-    expect(snapshot!.findingIds).toEqual(expectedIds);
-    expect(snapshot!.findingIds).not.toContain(omittedId);
-
-    // Simulate the runner-callback success path, which resolves exactly the snapshot's ids.
-    reviewLedgerStore.markReviewFindingsResolvedByIds("acme/billing", 62, snapshot!.findingIds);
-
-    const stillOpen = reviewLedgerStore.listOpenReviewFindings("acme/billing", 62);
-    expect(stillOpen).toHaveLength(1);
-    expect(stillOpen[0]!.id).toBe(omittedId);
   });
 });
 
@@ -1250,5 +1368,297 @@ describe("processReviewFixQueue — admission (AII-787)", () => {
 
     expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+  });
+});
+
+describe("processReviewFixQueue — legacy GHA writer private transport (AII-983)", () => {
+  const tokenConfig = {
+    ...config,
+    runnerCallbackBaseUrl: "https://callback.example",
+    runnerTokenSecret: "runner-token-secret-with-enough-entropy",
+  } as unknown as IndexModule.AppConfig;
+
+  async function run(caps: Record<string, unknown>, issueId: string) {
+    process.env.RUNNER_MODE = "default";
+    configModule.upsertMapping("TEAM", acmeBilling({ executionMode: "github-actions" }));
+    pulls({ 77: pullRequest("open") });
+    reviewFixQueue.enqueueReviewFix({
+      issueId, issueIdentifier: `AII-${issueId}`, repo: "acme/billing", prNumber: 77, reason: "late review comment",
+    });
+    const githubModule = await import("../github.js");
+    const workflowProbeModule = await import("../workflow-probe.js");
+    const repoImageModule = await import("../repo-image.js");
+    const dispatchWorkflowSpy = vi.spyOn(githubModule, "dispatchWorkflow").mockResolvedValue({ success: true, status: 204 });
+    vi.spyOn(workflowProbeModule, "resolveWorkflowCapabilities").mockResolvedValue(caps as never);
+    vi.spyOn(repoImageModule, "resolveRunnerImageForDispatch").mockResolvedValue(undefined);
+    await indexModule.processReviewFixQueue(tokenConfig, registry);
+    expect(dispatchWorkflowSpy).toHaveBeenCalledTimes(1);
+    return dispatchWorkflowSpy.mock.calls[0]![2] as Record<string, string | undefined>;
+  }
+
+  const envelope = (extra: Record<string, unknown> = {}) => ({
+    contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: false, ...extra,
+  });
+
+  it("capable reader: bearers only in credentials, none top-level", async () => {
+    const { decodeTrustedRunConfig, decodeRunConfig } = await import("../run-config.js");
+    const inputs = await run(envelope({ supportsPrivateRunConfig: true }), "rf-private");
+    const creds = decodeTrustedRunConfig(inputs.run_config!).credentials!;
+    expect(creds.resultToken).toBeTruthy();
+    expect(creds.progressToken).toBeTruthy();
+    expect(creds.publicationToken).toBeTruthy();
+    expect(decodeRunConfig(inputs.run_config!).credentials).toBeUndefined();
+    expect(inputs.run_token).toBe("");
+    expect("run_progress_token" in inputs).toBe(false);
+    expect("run_publication_token" in inputs).toBe(false);
+  });
+
+  it.each([
+    ["envelope without the marker", envelope(), "rf-nomark"],
+    ["explicit false", envelope({ supportsPrivateRunConfig: false }), "rf-false"],
+  ])("%s keeps masked top-level tokens (new writer / old reader)", async (_n, caps, id) => {
+    const { decodeTrustedRunConfig } = await import("../run-config.js");
+    const inputs = await run(caps, id);
+    expect(decodeTrustedRunConfig(inputs.run_config!).credentials).toBeUndefined();
+    expect(inputs.run_token).toBeTruthy();
+    expect(inputs.run_progress_token).toBeTruthy();
+    expect(inputs.run_publication_token).toBeTruthy();
+  });
+
+  it("legacy-contract reader keeps the top-level legacy inputs and never gets run_config", async () => {
+    const inputs = await run({ contract: "legacy", supportsRunPublicationToken: false, supportsAttemptCorrelation: false }, "rf-legacy");
+    expect(inputs.run_config).toBeUndefined();
+    expect(inputs.run_token).toBeTruthy();
+    expect(inputs.run_progress_token).toBeTruthy();
+  });
+});
+
+describe("processReviewFixQueue — protected dispatch (AII-1392)", () => {
+  function queueFix(): number {
+    pulls({ 42: pullRequest("open") });
+    return reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-m",
+      issueIdentifier: "AII-900",
+      repo: "acme/billing",
+      prNumber: 42,
+      reason: "late review comment",
+    });
+  }
+
+  function launchDecision() {
+    return {
+      kind: "launch",
+      dispatchId: "d-1",
+      projectKey: "TEAM",
+      backend: "local-docker",
+      snapshot: { v: 1 },
+      grant: {},
+      takeBootstrap: vi.fn(() => ({ bootstrap: true })),
+    };
+  }
+
+  it("opted-in local review-fix passes managed input and no Anthropic credentials", async () => {
+    configModule.upsertMapping("TEAM", acmeBilling());
+    managedMocks.isManagedProject.mockReturnValue(true);
+    const decision = launchDecision();
+    managedMocks.prepareManagedDispatch.mockResolvedValue(decision);
+    queueFix();
+
+    await indexModule.processReviewFixQueue(config, registry);
+
+    expect(managedMocks.prepareManagedDispatch).toHaveBeenCalledWith(
+      expect.objectContaining({ backend: "local-docker", projectKey: "TEAM" }),
+      expect.anything(),
+    );
+    const [call] = localGapfillMocks.dispatchLocalGapfill.mock.calls[0]!;
+    expect(call.managed?.decision).toBe(decision);
+    expect(call.anthropicApiKey).toBeUndefined();
+    expect(call.claudeOAuthToken).toBeUndefined();
+    expect(managedMocks.settleLaunch).not.toHaveBeenCalled();
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+  });
+
+  it("opted-out local review-fix passes no managed input and never prepares", async () => {
+    configModule.upsertMapping("TEAM", acmeBilling());
+    queueFix();
+
+    await indexModule.processReviewFixQueue({ ...config, anthropicApiKey: "key" }, registry);
+
+    const [call] = localGapfillMocks.dispatchLocalGapfill.mock.calls[0]!;
+    expect(call.managed).toBeUndefined();
+    expect(call.anthropicApiKey).toBe("key");
+    expect(managedMocks.prepareManagedDispatch).not.toHaveBeenCalled();
+  });
+
+  it("a launch that throws before onBeforeLaunch settles rejected and releases the admission", async () => {
+    configModule.upsertMapping("TEAM", acmeBilling());
+    managedMocks.isManagedProject.mockReturnValue(true);
+    const decision = launchDecision();
+    managedMocks.prepareManagedDispatch.mockResolvedValue(decision);
+    localGapfillMocks.dispatchLocalGapfill.mockRejectedValue(new Error("managed dispatch refused: bootstrap unavailable"));
+    queueFix();
+
+    await indexModule.processReviewFixQueue(config, registry);
+
+    expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "rejected", expect.anything());
+    expect(admission.count("TEAM")).toBe(0);
+  });
+
+  it.each([
+    ["refuse", { kind: "refuse", category: "configuration-error", code: "bad" }, 0],
+    ["leave-queued", { kind: "leave-queued", code: "profile_busy" }, 1],
+    ["hold", { kind: "hold", code: "preparation_failed" }, 1],
+  ])("a %s decision releases the admission and leaves %i pending", async (_name, decision, pending) => {
+    configModule.upsertMapping("TEAM", acmeBilling());
+    managedMocks.isManagedProject.mockReturnValue(true);
+    managedMocks.prepareManagedDispatch.mockResolvedValue(decision);
+    queueFix();
+
+    await indexModule.processReviewFixQueue(config, registry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    expect(admission.count("TEAM")).toBe(0);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(pending);
+  });
+
+  it("opted-in GitHub Actions review-fix with a refused preparation is failed, releases its admission and dispatches nothing", async () => {
+    process.env.RUNNER_MODE = "default";
+    configModule.upsertMapping("TEAM", acmeBilling({ executionMode: "github-actions" }));
+    managedMocks.isManagedProject.mockReturnValue(true);
+    managedMocks.prepareManagedDispatch.mockResolvedValue({ kind: "refuse", category: "configuration-error", code: "runner_incompatible" });
+    queueFix();
+    const githubModule = await import("../github.js");
+    const dispatch = vi.spyOn(githubModule, "dispatchWorkflow").mockResolvedValue({ success: true, status: 204 });
+
+    await indexModule.processReviewFixQueue(config, registry);
+
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(managedMocks.prepareManagedDispatch).toHaveBeenCalledWith(expect.objectContaining({ backend: "github-actions" }), expect.anything());
+    expect(admission.count("TEAM")).toBe(0);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+  });
+  describe("opted-in GitHub Actions review-fix with a capable workflow (AII-1420)", () => {
+    const snapshot = makeSnapshot("codex-subscription");
+    const bootstrap = makeGrant(snapshot, { backend: "gha", dispatchId: "d-1", projectKey: "TEAM" });
+    const tokenConfig = {
+      ...config,
+      runnerCallbackBaseUrl: "https://callback.example",
+      runnerTokenSecret: "runner-token-secret-with-enough-entropy",
+    } as unknown as IndexModule.AppConfig;
+    const caps = (supportsPrivateRunConfig: boolean) => ({
+      contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: false, supportsPrivateRunConfig,
+    });
+    let decision: ReturnType<typeof ghaDecision>;
+
+    function ghaDecision() {
+      return {
+        kind: "launch",
+        dispatchId: "d-1",
+        projectKey: "TEAM",
+        backend: "github-actions",
+        snapshot,
+        grant: {},
+        takeBootstrap: vi.fn(() => bootstrap),
+      };
+    }
+
+    async function setup(supportsPrivateRunConfig = true) {
+      process.env.RUNNER_MODE = "default";
+      configModule.upsertMapping("TEAM", acmeBilling({ executionMode: "github-actions" }));
+      managedMocks.isManagedProject.mockReturnValue(true);
+      decision = ghaDecision();
+      managedMocks.prepareManagedDispatch.mockResolvedValue(decision);
+      queueFix();
+      const githubModule = await import("../github.js");
+      const workflowProbeModule = await import("../workflow-probe.js");
+      const repoImageModule = await import("../repo-image.js");
+      vi.spyOn(workflowProbeModule, "resolveWorkflowCapabilities").mockResolvedValue(caps(supportsPrivateRunConfig) as never);
+      vi.spyOn(repoImageModule, "resolveRunnerImageForDispatch").mockResolvedValue(undefined);
+      return vi.spyOn(githubModule, "dispatchWorkflow");
+    }
+
+    it("the launch context is the request's own values, never read from a grant whose dispatch, project and backend differ", async () => {
+      const { decodeTrustedRunConfig } = await import("../run-config.js");
+      const dispatch = await setup();
+      dispatch.mockResolvedValue({ success: true, status: 204 });
+      const divergent = makeGrant(snapshot, { backend: "fly", dispatchId: "grant-dispatch", projectKey: "grant-project" });
+      decision.takeBootstrap = vi.fn(() => divergent);
+
+      await indexModule.processReviewFixQueue(tokenConfig, registry);
+
+      const inputs = dispatch.mock.calls[0]![2] as Record<string, string>;
+      const trusted = decodeTrustedRunConfig(inputs.run_config!);
+      expect(trusted.credentials?.modelAuthGrant).toEqual(divergent);
+      expect(trusted.credentials?.modelAuthContext).toEqual({
+        version: 1, dispatchId: decision.dispatchId, projectKey: decision.projectKey, backend: "gha", modelAuthUrl: "https://callback.example",
+      });
+      expect(JSON.stringify(trusted.credentials?.modelAuthContext)).not.toMatch(/grant-dispatch|grant-project/);
+    });
+
+    it("accepted launch carries the frozen snapshot and protected bootstrap privately and keeps the grant", async () => {
+      const { decodeTrustedRunConfig, decodeRunConfig } = await import("../run-config.js");
+      const dispatch = await setup();
+      dispatch.mockResolvedValue({ success: true, status: 204 });
+
+      await indexModule.processReviewFixQueue(tokenConfig, registry);
+
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      const inputs = dispatch.mock.calls[0]![2] as Record<string, string>;
+      const trusted = decodeTrustedRunConfig(inputs.run_config!);
+      expect(trusted.agentConfig).toEqual(snapshot);
+      expect(trusted.credentials?.modelAuthGrant).toEqual(bootstrap);
+      expect(trusted.credentials?.resultToken).toBeTruthy();
+      expect(trusted.credentials?.modelAuthContext).toEqual({
+        version: 1, dispatchId: decision.dispatchId, projectKey: decision.projectKey, backend: "gha", modelAuthUrl: "https://callback.example",
+      });
+      expect(decodeRunConfig(inputs.run_config!).credentials).toBeUndefined();
+      expect(inputs.run_token).toBe("");
+      for (const [k, v] of Object.entries(inputs)) {
+        if (k !== "run_config") expect(String(v)).not.toContain(bootstrap.bearer);
+      }
+      expect(decision.takeBootstrap).toHaveBeenCalledTimes(1);
+      expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "accepted", expect.anything());
+      expect(admission.count("TEAM")).toBe(1);
+    });
+
+    it("rejected dispatch revokes the grant and releases the admission", async () => {
+      const dispatch = await setup();
+      dispatch.mockResolvedValue({ success: false, status: 404, error: "Not Found", outcome: "rejected" });
+
+      await indexModule.processReviewFixQueue(tokenConfig, registry);
+
+      expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "rejected", expect.anything());
+      expect(admission.count("TEAM")).toBe(0);
+    });
+
+    it("uncertain dispatch revokes the grant but keeps the admission", async () => {
+      const dispatch = await setup();
+      dispatch.mockResolvedValue({ success: false, status: 503, error: "upstream", outcome: "unknown" });
+
+      await indexModule.processReviewFixQueue(tokenConfig, registry);
+
+      expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "unknown", expect.anything());
+      expect(admission.count("TEAM")).toBe(1);
+    });
+
+    it("a throwing dispatch revokes the grant and keeps the admission", async () => {
+      const dispatch = await setup();
+      dispatch.mockRejectedValue(new Error("socket hang up"));
+
+      await indexModule.processReviewFixQueue(tokenConfig, registry);
+
+      expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "unknown", expect.anything());
+      expect(admission.count("TEAM")).toBe(1);
+    });
+
+    it("a workflow without the private transport revokes the grant before any dispatch and releases the admission", async () => {
+      const dispatch = await setup(false);
+
+      await indexModule.processReviewFixQueue(tokenConfig, registry);
+
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "rejected", expect.anything());
+      expect(admission.count("TEAM")).toBe(0);
+    });
   });
 });

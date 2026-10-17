@@ -36,7 +36,8 @@ import { SqliteReviewFixAttemptStore } from "../../review-fix-attempt-store.js";
 import { upsertReviewFinding } from "../../review-ledger-store.js";
 import { acceptReviewFixWebhookEvent, enqueueReviewFix, updateReviewFixStatus } from "../../review-fix-queue.js";
 import { REVIEW_PROCESSES, resolveReviewProcess } from "../../review-process.js";
-import { loadPendingReviewFixFeedback } from "../../review-fix-pending.js";
+import { inspectPendingReviewFixFeedback, loadPendingReviewFixFeedback } from "../../review-fix-pending.js";
+import { createProductionFinalizer } from "../../restate/review-fix-production.js";
 import { createReviewFixFinalizer } from "../../review-fix-finalize.js";
 import type { ReviewFixGitHubAdapter } from "../../review-fix-finalize.js";
 import { createReviewFixGithubAdapter } from "../../review-fix-github-adapter.js";
@@ -137,6 +138,8 @@ interface GithubFixture {
    *  `review_fix_queue`/`review_findings` tables via `loadPendingReviewFixFeedback`
    *  (including its `queueCursor`), instead of the hand-supplied fixture value. */
   useProductionPending: boolean;
+  /** Incomplete-feedback outcomes the production-shaped `load()` resolved as pending:null. */
+  incompleteLoads: Array<{ category: string; reason: string }>;
   windowMs: number;
   jobTimeoutMinutes: number;
   reviewProcess: string | null;
@@ -158,6 +161,8 @@ let ownerSeq = 0;
 const fixturesByRepo = new Map<string, GithubFixture>();
 const fixtureByAttempt = new Map<string, GithubFixture>();
 const runIndex = new Map<number, GithubFixture>();
+/** The run tokens each attempt's launch received, as the workflow dispatch inputs carry them. */
+const launchTokensByAttempt = new Map<string, string[]>();
 let nextRunId = 9_000;
 
 function repoKey(repository: string): string {
@@ -178,7 +183,7 @@ function freshScenario(prefix: string, opts: { cap?: number; budget?: number; pa
     open: true, draft: false, merged: false, mergeable: true, mergeableState: "clean",
     headSha: sha(`${owner}-initial`),
     checks: [], statusState: "success", statusCount: 0, reviews: [], comments: [], commentPosts: 0,
-    pending: null, useProductionPending: false, windowMs: 200, jobTimeoutMinutes: LONG_DEADLINE_JOB_TIMEOUT_MINUTES,
+    pending: null, useProductionPending: false, incompleteLoads: [], windowMs: 200, jobTimeoutMinutes: LONG_DEADLINE_JOB_TIMEOUT_MINUTES,
     reviewProcess: null, blockAdmission: null, admitOverride: null, recordResultOverride: null, applyApprovalEffectOverride: null,
     dispatchImpl: () => { throw new Error("unset"); },
     dispatchCalls: 0, listRunsVisible: true, runId: null, runAttempt: 1, runDetail: null,
@@ -295,6 +300,8 @@ const transport: ReviewFixWorkerTransport = {
     if (!fixture) throw new Error(`test bug: no fixture registered for attempt ${attemptId}`);
     fixture.attemptId = attemptId;
     fixtureByAttempt.set(attemptId, fixture);
+    launchTokensByAttempt.set(attemptId, [input.inputs.run_token, input.inputs.run_progress_token, input.inputs.run_publication_token]
+      .filter((t): t is string => typeof t === "string" && t.length > 0));
     return fixture.dispatchImpl(input);
   },
   async listRuns(input) {
@@ -343,33 +350,21 @@ const github: ReviewFixGitHubAdapter = {
   },
 };
 
+const LAUNCH_TOKEN_SECRET = "review-fix-launch-token-secret";
 const worker = new GithubReviewFixWorker({
   credentials: fakeCredentials, transport, scopeStore: reviewFixAttemptStoreScopeStore(sqliteStore),
+  // The same shape as `createProductionReviewFixServices`: the launch itself receives the three attempt tokens.
+  callbackInputs: async (attemptId) => ({
+    run_token: mintPreparedReviewFixToken({ attemptId, audience: "result", secret: LAUNCH_TOKEN_SECRET }).token,
+    run_progress_token: mintPreparedReviewFixToken({ attemptId, audience: "progress", secret: LAUNCH_TOKEN_SECRET }).token,
+    run_publication_token: mintPreparedReviewFixToken({ attemptId, audience: "publication", secret: LAUNCH_TOKEN_SECRET }).token,
+    runner_callback_url: "https://orchestrator.test",
+  }),
 });
 
 const baseFinalizer = createReviewFixFinalizer({ attemptStore: sqliteStore, github });
-// Mirrors review-fix-production.ts's own applyApproval wrapper verbatim: re-check evidence,
-// then apply. A crash window after the GitHub write is the journaled step's retry plus the
-// adapter's upsert, not a second ledger.
-const finalizer = {
-  recordOutcome: baseFinalizer.recordOutcome,
-  applyApproval: async (input: Parameters<typeof baseFinalizer.applyApproval>[0]) => {
-    const accepted = await sqliteStore.getAcceptedResult(input.attemptId);
-    const outcome = await sqliteStore.getRecordedOutcome(input.attemptId);
-    if (!accepted?.result || accepted.hasConflict || outcome?.terminal.status !== "succeeded"
-      || JSON.stringify(accepted.result) !== JSON.stringify(input.result)
-      || !await sqliteStore.hasCurrentAuthority(input.attemptId)) {
-      return { status: "withheld" as const, reason: "current attempt authority or accepted result changed" };
-    }
-    const head = await github.getPrHeadSha(input.scope) ?? "";
-    if (head !== input.result.outputCommit || !input.policyAllows
-      || !await github.evaluateMergePolicy(input.scope, input.findingDispositions)) {
-      return { status: "withheld" as const, reason: "current PR head or merge policy changed" };
-    }
-    const current = { ...input, currentAuthority: true, currentPrHeadSha: head };
-    return baseFinalizer.applyApproval(current);
-  },
-};
+// The production wrapper itself (review-fix-production.ts), with no late-review submit wired.
+const finalizer = createProductionFinalizer({ store: sqliteStore, github, baseFinalizer });
 
 const alerts: Array<{ attemptId: string; reason: string }> = [];
 
@@ -400,7 +395,14 @@ const pr = createReviewFixPR({
   },
   load: async (scope) => {
     const fixture = findFixture(scope.repository);
-    const pending = fixture.useProductionPending ? loadPendingReviewFixFeedback(scope, null) : fixture.pending;
+    // Mirrors review-fix-production.ts load(): over-budget feedback resolves as pending:null
+    // (a non-launch outcome) instead of throwing into Restate's unbounded journaled retry.
+    let pending = fixture.pending;
+    if (fixture.useProductionPending) {
+      const inspected = inspectPendingReviewFixFeedback(scope, null);
+      if (inspected.status === "incomplete") fixture.incompleteLoads.push({ category: inspected.category, reason: inspected.reason });
+      pending = inspected.status === "ready" ? inspected.feedback : null;
+    }
     return { closed: fixture.merged || !fixture.open, jobTimeoutMinutes: fixture.jobTimeoutMinutes, pending,
       fixer: resolveReviewProcess(fixture.reviewProcess).fixer };
   },
@@ -567,34 +569,46 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     } finally { REVIEW_PROCESSES["claude-code-review"].fixer = original; }
   }, 20_000);
 
-  it.each(VARIANTS.map(([label]) => label))("more than 30 finding versions admits the oldest 30 and preserves the rest pending, per the production pending-feedback projection (%s)", async (label) => {
+  it.each(VARIANTS.map(([label]) => label))("more than 30 finding versions is rejected whole and every version stays pending, per the production non-launch adapter (%s)", async (label) => {
     const env = envFor(label);
     const fixture = freshScenario("overflow");
     fixture.useProductionPending = true;
     // Real review_findings rows (distinct body per finding, so each gets its own
     // content-addressed finding_key) plus one real review_fix_queue/events row —
-    // the exact tables loadPendingReviewFixFeedback (and admit()'s cursor
-    // re-validation) read, not a hand-built ReviewFixPendingFeedback.
+    // the exact tables the production pending-feedback projection reads.
     const findingIds = Array.from({ length: 35 }, (_, i) => seedOpenFinding(fixture, `Overflow finding number ${i}`));
     seedQueueEvent(fixture, "automatic review-fix findings", findingIds);
-    const beforeAdmission = loadPendingReviewFixFeedback(fixture.scope, null);
-    expect(beforeAdmission?.findings).toHaveLength(30);
-    expect(beforeAdmission?.queueCursor).toMatchObject({ queueId: expect.any(Number), eventId: expect.any(Number) });
+    expect(() => loadPendingReviewFixFeedback(fixture.scope, null)).toThrow(/count|30/);
+    const inspected = inspectPendingReviewFixFeedback(fixture.scope, null);
+    expect(inspected).toMatchObject({ status: "incomplete", category: "count" });
+    fixture.incompleteLoads.length = 0;
 
     await triggerFeedback(env, fixture.scope);
-    await eventually(() => latestAttemptRow(fixture.scope) !== undefined, Boolean, { timeoutMs: 8_000, label: "latestAttemptRow(fixture.scope) !== undefined" });
-    const attemptId = latestAttemptRow(fixture.scope)!.attemptId;
-    fixture.attemptId = attemptId;
-    fixtureByAttempt.set(attemptId, fixture);
+    await eventually(() => fixture.incompleteLoads.length > 0, Boolean, { timeoutMs: 8_000, label: "incomplete feedback detected" });
+    await settle(fixture.windowMs + 300);
 
-    const prepared = await sqliteStore.getPreparedAttempt(attemptId);
-    expect(prepared?.findings).toHaveLength(30);
+    // The coordinator resolved the journaled load as pending:null (no throw), so Restate
+    // does not retry the deterministic failure: a bounded number of loads, one category.
+    expect(fixture.incompleteLoads.length).toBeLessThanOrEqual(3);
+    expect(new Set(fixture.incompleteLoads.map((load) => load.category))).toEqual(new Set(["count"]));
+    expect(fixture.incompleteLoads[0].reason).toContain("35 findings exceed the 30-finding limit");
+    expect(fixture.incompleteLoads[0].reason).not.toContain("Overflow finding number");
 
-    // The 31st-35th finding versions were never offered to admission and remain
-    // open and unprocessed in the real ledger/queue projection after the first
-    // admission committed — not merely "not yet admitted" but re-derivable on demand.
-    const stillPending = loadPendingReviewFixFeedback(fixture.scope, null);
-    expect(stillPending?.findings).toHaveLength(5);
+    // Nothing admitted, no budget consumed, no worker dispatch.
+    const teamKey = fixture.scope.repository.split("/")[0];
+    expect(latestAttemptRow(fixture.scope)).toBeUndefined();
+    expect(activeAdmissionCount(teamKey)).toBe(0);
+    expect(budgetEntryCount(fixture.scope.repository, fixture.scope.prNumber)).toBe(0);
+    expect(fixture.dispatchCalls).toBe(0);
+
+    // All 35 finding versions remain open, unattempted, and in the pending queue row.
+    const open = getDb().prepare(`SELECT COUNT(*) AS n FROM review_findings WHERE repo = ? AND pr_number = ? AND status = 'open'`)
+      .get(fixture.scope.repository, fixture.scope.prNumber) as { n: number };
+    expect(open.n).toBe(35);
+    const queued = getDb().prepare(`SELECT status FROM review_fix_queue WHERE repo = ? AND pr_number = ?`)
+      .get(fixture.scope.repository, fixture.scope.prNumber) as { status: string };
+    expect(queued.status).toBe("pending");
+    expect(inspectPendingReviewFixFeedback(fixture.scope, null)).toMatchObject({ status: "incomplete", category: "count" });
   }, 20_000);
 
   it.each(VARIANTS.map(([label]) => label))("a new/re-reported finding after a snapshot stays open for the next attempt, per the production pending-feedback projection (%s)", async (label) => {
@@ -1002,9 +1016,27 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;
     const result = resultOf(fixture, prepared);
     const secret = "journal-projection-secret";
-    // Minting needs a live authority, so mint before the attempt finishes.
-    const tokens = (["result", "progress", "publication"] as const)
-      .map((audience) => mintPreparedReviewFixToken({ attemptId, audience, secret }).token);
+    // The launch's own tokens, read from the journal while the attempt waits for its result: Restate trims the
+    // launch entry once the attempt finishes, so a later read would find no token for any reason.
+    const launchTokens = launchTokensByAttempt.get(attemptId) ?? [];
+    expect(launchTokens).toHaveLength(3);
+    const waiting = await queryInvocations(env.adminAPIBaseUrl(),
+      `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${attemptId}' AND target_handler_name = 'run'`);
+    const launchJournal = await eventually(
+      async () => {
+        const journal = await journalEntries(env.adminAPIBaseUrl(), waiting[0].id as string);
+        try {
+          journaledRunResult(journal, "launch-once");
+          return journal;
+        } catch {
+          return undefined;
+        }
+      },
+      (journal) => journal !== undefined,
+      { timeoutMs: 8_000, label: "launch-once journaled result" },
+    );
+    const launchText = journalText(launchJournal!);
+    for (const token of launchTokens) expect(launchText).not.toContain(token);
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "result", result);
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
@@ -1023,9 +1055,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const completedAt = await eventually(readCompletedAt, (v) => v !== null, { timeoutMs: 5_000, label: "review_fix_attempts.completed_at !== null" });
     expect(completedAt).toBe(journaled.completedAt);
 
-    const text = journalText(entries);
-    expect(text).not.toContain(secret);
-    for (const token of tokens) expect(text).not.toContain(token);
+    expect(journalText(entries)).not.toContain(secret);
   }, 25_000);
 
   // -------------------------------------------------------------------------

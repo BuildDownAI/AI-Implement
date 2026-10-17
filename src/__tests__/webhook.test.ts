@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as WebhookModule from "../webhook.js";
 import type * as LogModule from "../log.js";
 import type * as ReconciliationModule from "../reconciliation.js";
@@ -1653,6 +1653,117 @@ describe("review feedback ingestion", () => {
     expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
   });
 
+  it("ignores an approve verdict with only minor findings as approved, without enqueueing", async () => {
+    const jobId = log.appendLog({ issueId: "issue-71", issueIdentifier: "AII-71", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/71");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "## Review\n\nNotes.\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"approve\",\"findings\":[{\"severity\":\"minor\",\"path\":\"src/x.ts\",\"line\":1,\"body\":\"Nit one.\"},{\"severity\":\"minor\",\"path\":\"src/y.ts\",\"line\":2,\"body\":\"Nit two.\"}]}\n```",
+        html_url: "https://github.com/org/repo/issues/71#issuecomment-71",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 71,
+        html_url: "https://github.com/org/repo/pull/71",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/71" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "approved" });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 71)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("still enqueues a prose Claude summary whose medium findings sit beside a ready-to-merge line", async () => {
+    const jobId = log.appendLog({ issueId: "issue-73", issueIdentifier: "AII-73", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/73");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "**Claude finished the review**\n\n### Review\n\n### Issues\n- Real concern in src/x.ts that needs a change.\n\n**Merge readiness:** Ready to merge",
+        html_url: "https://github.com/org/repo/issues/73#issuecomment-73",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 73,
+        html_url: "https://github.com/org/repo/pull/73",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/73" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(JSON.parse(res.body)).toMatchObject({ queued: true });
+  });
+
+  it("still enqueues an approve verdict that carries a blocking finding", async () => {
+    const jobId = log.appendLog({ issueId: "issue-72", issueIdentifier: "AII-72", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/72");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "## Review\n\nNotes.\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"approve\",\"findings\":[{\"severity\":\"blocking\",\"path\":\"src/x.ts\",\"line\":1,\"body\":\"Bug.\"}]}\n```",
+        html_url: "https://github.com/org/repo/issues/72#issuecomment-72",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 72,
+        html_url: "https://github.com/org/repo/pull/72",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/72" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ queued: true });
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+  });
+
+  it("still enqueues a changes_requested verdict with only a minor finding", async () => {
+    const jobId = log.appendLog({ issueId: "issue-73", issueIdentifier: "AII-73", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/73");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "## Review\n\nNotes.\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[{\"severity\":\"minor\",\"path\":\"src/x.ts\",\"line\":1,\"body\":\"Nit one.\"},{\"severity\":\"minor\",\"path\":\"src/y.ts\",\"line\":2,\"body\":\"Nit two.\"}]}\n```",
+        html_url: "https://github.com/org/repo/issues/73#issuecomment-73",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 73,
+        html_url: "https://github.com/org/repo/pull/73",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/73" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ queued: true });
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+  });
+
   it("upserts review-contract findings and enqueues a review-fix (reason=review_contract) from a findings block", async () => {
     const jobId = appendDispatch({ issueId: "issue-63", issueIdentifier: "AII-63", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/63");
@@ -2272,6 +2383,106 @@ describe("/ai-implement comment trigger", () => {
     expect(commentGapfillQueue.claimPendingCommentGapfills(10)).toHaveLength(0);
   });
 
+  describe("transient GitHub failures (AII-1292)", () => {
+    const mockFetch = vi.fn<typeof fetch>();
+    beforeEach(() => {
+      mockFetch.mockReset();
+      mockFetch.mockImplementation((url: string | URL | Request) => {
+        const urlStr = String(url);
+        if (urlStr.includes("/collaborators/")) {
+          return Promise.resolve(new Response(JSON.stringify({ permission: "write" }), { status: 200 }));
+        }
+        if (urlStr.includes("/reactions")) {
+          return Promise.resolve(new Response("", { status: 201 }));
+        }
+        return Promise.resolve(new Response("", { status: 404 }));
+      });
+      vi.stubGlobal("fetch", mockFetch);
+    });
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    const reasonComments = () => mockFetch.mock.calls.filter(([url, init]) =>
+      String(url).includes("/issues/1/comments") && (init as RequestInit | undefined)?.method === "POST");
+    const reactions = () => mockFetch.mock.calls.filter(([url]) => String(url).includes("/reactions"));
+    const permOk = () => new Response(JSON.stringify({ permission: "write" }), { status: 200 });
+
+    async function post(): Promise<{ statusCode: number; body: Record<string, unknown> }> {
+      const { req, res } = makeRequest(SECRET, "issue_comment", makeAiImplComment("/ai-implement fix it"));
+      webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app-id", "private-key");
+      await res.done;
+      return { statusCode: res.statusCode, body: JSON.parse(res.body) };
+    }
+
+    it("probe failing twice posts one reason comment, no 👀, nothing queued, contract_probe_failed", async () => {
+      hoisted.getMappings.mockReturnValue(orgRepoMapping());
+      hoisted.resolveWorkflowContract.mockClear();
+      hoisted.resolveWorkflowContract.mockRejectedValue(new Error("probe"));
+      mockFetch.mockImplementation(() => Promise.resolve(new Response("{}", { status: 201 })));
+
+      const out = await post();
+
+      expect(out.body).toMatchObject({ ignored: true, reason: "contract_probe_failed" });
+      expect(hoisted.resolveWorkflowContract).toHaveBeenCalledTimes(2);
+      expect((hoisted.resolveWorkflowContract.mock.calls[0] as unknown[])[0]).toMatchObject({ failOnTransient: true });
+      expect(reasonComments()).toHaveLength(1);
+      expect(reactions()).toHaveLength(0);
+      expect(commentGapfillQueue.claimPendingCommentGapfills(10)).toHaveLength(0);
+    });
+
+    it("probe failing once then succeeding queues the comment with 👀", async () => {
+      hoisted.getMappings.mockReturnValue(orgRepoMapping());
+      hoisted.resolveWorkflowContract.mockRejectedValueOnce(new Error("probe")).mockResolvedValue("envelope");
+
+      const out = await post();
+
+      expect(out.body).toMatchObject({ queued: true });
+      expect(reasonComments()).toHaveLength(0);
+      expect(reactions()).toHaveLength(1);
+    });
+
+    it("permission API errors twice give permission_check_failed with one comment", async () => {
+      hoisted.getMappings.mockReturnValue(orgRepoMapping());
+      mockFetch.mockImplementation((url: string | URL | Request) =>
+        Promise.resolve(String(url).includes("/collaborators/") ? new Response("", { status: 503 }) : new Response("{}", { status: 201 })));
+
+      const out = await post();
+
+      expect(out.body).toMatchObject({ ignored: true, reason: "permission_check_failed" });
+      expect(reasonComments()).toHaveLength(1);
+      expect(reactions()).toHaveLength(0);
+      expect(commentGapfillQueue.claimPendingCommentGapfills(10)).toHaveLength(0);
+    });
+
+    it("a permission error then a 200 queues the comment", async () => {
+      hoisted.getMappings.mockReturnValue(orgRepoMapping());
+      let permCalls = 0;
+      mockFetch.mockImplementation((url: string | URL | Request) => {
+        if (String(url).includes("/collaborators/")) {
+          return Promise.resolve(++permCalls === 1 ? new Response("", { status: 500 }) : permOk());
+        }
+        return Promise.resolve(new Response("{}", { status: 201 }));
+      });
+
+      const out = await post();
+
+      expect(out.body).toMatchObject({ queued: true });
+      expect(reasonComments()).toHaveLength(0);
+    });
+
+    it("a 404 from the permission API is a non-writer, not an error", async () => {
+      hoisted.getMappings.mockReturnValue(orgRepoMapping());
+      mockFetch.mockImplementation((url: string | URL | Request) =>
+        Promise.resolve(String(url).includes("/collaborators/") ? new Response("", { status: 404 }) : new Response("{}", { status: 201 })));
+
+      const out = await post();
+
+      expect(out.body).toMatchObject({ ignored: true, reason: "insufficient_permission" });
+      expect(reasonComments()).toHaveLength(0);
+    });
+  });
+
   it("(f-i) non-PR issue comment is ignored", async () => {
     hoisted.getMappings.mockReturnValue(orgRepoMapping());
 
@@ -2580,6 +2791,17 @@ describe("Restate review-fix lifecycle forwards instead of writing (AII-1184)", 
     expect(opts.idempotencyKey).toBe("d-abc");
     expect(reviewStore.listOpenReviewFindings("org/repo", 10)).toEqual([]);
     expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("issueComment: an approve verdict with only minor findings is not forwarded", async () => {
+    mapRepo("restate");
+    seedDispatch(12);
+    const ingress = fakeIngress();
+    const body = "## Review\n\nNits.\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"approve\",\"findings\":[{\"severity\":\"minor\",\"path\":\"src/x.ts\",\"line\":1,\"body\":\"Nit.\"}]}\n```";
+    const out = await post("issueComment", 12, { ingress, body });
+    expect(out.status).toBe(200);
+    expect(out.body).toEqual({ ignored: true, reason: "approved" });
+    expect(ingress.feedback).not.toHaveBeenCalled();
   });
 
   it("never calls acceptReviewFixWebhookEvent on the Restate path", async () => {

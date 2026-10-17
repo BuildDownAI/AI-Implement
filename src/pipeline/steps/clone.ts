@@ -4,6 +4,7 @@ import path from "node:path";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { prepareScratchExclusion } from "../scratch-exclude.js";
 import { refreshRunnerGithubCredentials } from "../../runner-token.js";
+import { gitProcessEnv, gitDependencyProcessEnv } from "../process-env.js";
 import { classifyGitFailure, type FailureRecord } from "../failure-classification.js";
 
 interface CloneInputs extends Record<string, unknown> {
@@ -87,13 +88,13 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
             const isShallowResult = spawnSync(
               "git",
               ["rev-parse", "--is-shallow-repository"],
-              { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
+              { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitProcessEnv() },
             );
             if (isShallowResult.stdout?.toString().trim() === "true") {
               const unshallowResult = spawnSync(
                 "git",
                 ["fetch", "--unshallow", "origin"],
-                { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
+                { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitDependencyProcessEnv() },
               );
               if (unshallowResult.status !== 0) {
                 const stderr = (unshallowResult.stderr?.toString() ?? "").trim();
@@ -109,7 +110,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
             const fetchResult = spawnSync(
               "git",
               ["fetch", "origin", ...branchArgs],
-              { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
+              { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitDependencyProcessEnv() },
             );
             if (fetchResult.status !== 0) {
               const stderr = (fetchResult.stderr?.toString() ?? "").trim();
@@ -123,7 +124,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
             const fetchResult = spawnSync(
               "git",
               ["fetch", "--depth", String(depth ?? 1), "origin", ...branchArgs],
-              { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
+              { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitDependencyProcessEnv() },
             );
             if (fetchResult.status !== 0) {
               const stderr = (fetchResult.stderr?.toString() ?? "").trim();
@@ -139,7 +140,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
           const resetResult = spawnSync(
             "git",
             ["reset", "--hard", resetTarget],
-            { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
+            { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitProcessEnv() },
           );
           if (resetResult.status !== 0) {
             const stderr = (resetResult.stderr?.toString() ?? "").trim();
@@ -154,7 +155,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
           const cloneResult = spawnSync(
             "git",
             ["clone", ...depthArgs, ...branchArgs, bareRemote, effectiveDir],
-            { stdio: ["ignore", "pipe", "pipe"] },
+            { stdio: ["ignore", "pipe", "pipe"], env: gitDependencyProcessEnv() },
           );
           if (cloneResult.status !== 0) {
             const stderr = (cloneResult.stderr?.toString() ?? "").trim();
@@ -194,13 +195,13 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
           const isShallowResult = spawnSync(
             "git",
             ["rev-parse", "--is-shallow-repository"],
-            { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
+            { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitProcessEnv() },
           );
           if (isShallowResult.stdout?.toString().trim() === "true") {
             const unshallowResult = spawnSync(
               "git",
               ["fetch", "--unshallow", "origin"],
-              { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
+              { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitDependencyProcessEnv() },
             );
             if (unshallowResult.status !== 0) {
               const stderr = unshallowResult.stderr?.toString() ?? "";
@@ -214,7 +215,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
           const fetchResult = spawnSync(
             "git",
             ["fetch", "origin", ...branchArgs],
-            { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
+            { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitDependencyProcessEnv() },
           );
           if (fetchResult.status !== 0) {
             const stderr = fetchResult.stderr?.toString() ?? "";
@@ -229,7 +230,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
           const fetchResult = spawnSync(
             "git",
             ["fetch", "--depth", depthVal, "origin", ...branchArgs],
-            { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
+            { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitDependencyProcessEnv() },
           );
           if (fetchResult.status !== 0) {
             const stderr = fetchResult.stderr?.toString() ?? "";
@@ -246,7 +247,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
         const resetResult = spawnSync(
           "git",
           ["reset", "--hard", "FETCH_HEAD"],
-          { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
+          { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitProcessEnv() },
         );
         if (resetResult.status !== 0) {
           const stderr = resetResult.stderr?.toString() ?? "";
@@ -263,7 +264,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
         const cloneResult = spawnSync(
           "git",
           ["clone", ...depthArgs, ...branchArgs, bareRemote, effectiveDir],
-          { stdio: ["ignore", "pipe", "pipe"] },
+          { stdio: ["ignore", "pipe", "pipe"], env: gitDependencyProcessEnv() },
         );
         if (cloneResult.status !== 0) {
           const stderr = cloneResult.stderr?.toString() ?? "";
@@ -279,6 +280,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
       const revResult = spawnSync("git", ["rev-parse", "HEAD"], {
         cwd: effectiveDir,
         stdio: ["ignore", "pipe", "pipe"],
+        env: gitProcessEnv(),
       });
       if (revResult.status !== 0) {
         const stderr = revResult.stderr?.toString() ?? "";
@@ -301,6 +303,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
       const headResult = spawnSync("git", ["rev-parse", "HEAD"], {
         cwd: workspaceDir,
         stdio: ["ignore", "pipe", "pipe"],
+        env: gitProcessEnv(),
       });
       const clonedRef = headResult.status === 0 ? headResult.stdout.toString().trim() : "unknown";
       return { workspaceDir, clonedRef, cloneMethod: "mounted", repoOwner, repoRepo, branch, githubToken };
@@ -312,12 +315,12 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
 
     if (fs.existsSync(path.join(workspaceDir, ".git"))) {
       // Incremental: fetch the branch and reset to it
-      const gitAuthEnv = { ...process.env, GIT_ASKPASS: "echo", GIT_USERNAME: "x-access-token", GIT_PASSWORD: githubToken };
+      const gitAuthEnv = gitProcessEnv({ GIT_ASKPASS: "echo", GIT_USERNAME: "x-access-token", GIT_PASSWORD: githubToken });
       if (depth === "full") {
         const isShallowResult = spawnSync(
           "git",
           ["rev-parse", "--is-shallow-repository"],
-          { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
+          { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], env: gitProcessEnv() },
         );
         if (isShallowResult.stdout?.toString().trim() === "true") {
           const unshallowResult = spawnSync(
@@ -366,7 +369,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
       const resetResult = spawnSync(
         "git",
         ["reset", "--hard", `origin/${branch}`],
-        { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
+        { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], env: gitProcessEnv() },
       );
       if (resetResult.status !== 0) {
         const stderr = resetResult.stderr?.toString() ?? "";
@@ -384,7 +387,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
       const cloneResult = spawnSync(
         "git",
         ["clone", ...depthArgs, "--branch", branch, remote, workspaceDir],
-        { stdio: ["ignore", "pipe", "pipe"] },
+        { stdio: ["ignore", "pipe", "pipe"], env: gitProcessEnv() },
       );
       if (cloneResult.status !== 0) {
         const stderr = (cloneResult.stderr?.toString() ?? "").replace(githubToken, "***");
@@ -402,12 +405,11 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
     // create true merge commits. Fail soft — if the fetch fails the run degrades
     // to single-branch behavior rather than aborting.
     if (inputs.prNumber && inputs.baseBranch) {
-      const gitAuthEnv = {
-        ...process.env,
+      const gitAuthEnv = gitProcessEnv({
         GIT_ASKPASS: "echo",
         GIT_USERNAME: "x-access-token",
         GIT_PASSWORD: githubToken,
-      };
+      });
       const baseBranchRefspec = `+refs/heads/${inputs.baseBranch}:refs/remotes/origin/${inputs.baseBranch}`;
       const fetchBase = spawnSync(
         "git",
@@ -422,7 +424,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
         const mergeBase = spawnSync(
           "git",
           ["merge-base", `origin/${inputs.baseBranch}`, "HEAD"],
-          { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
+          { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], env: gitProcessEnv() },
         );
         if (mergeBase.status !== 0) {
           const unshallow = spawnSync(
@@ -450,15 +452,18 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
     spawnSync("git", ["config", "user.name", "ai-implement[bot]"], {
       cwd: workspaceDir,
       stdio: ["ignore", "pipe", "pipe"],
+      env: gitProcessEnv(),
     });
     spawnSync("git", ["config", "user.email", "ai-implement[bot]@users.noreply.github.com"], {
       cwd: workspaceDir,
       stdio: ["ignore", "pipe", "pipe"],
+      env: gitProcessEnv(),
     });
 
     const revResult = spawnSync("git", ["rev-parse", "HEAD"], {
       cwd: workspaceDir,
       stdio: ["ignore", "pipe", "pipe"],
+      env: gitProcessEnv(),
     });
     if (revResult.status !== 0) {
       const stderr = revResult.stderr?.toString() ?? "";
