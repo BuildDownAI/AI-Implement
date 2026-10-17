@@ -236,12 +236,14 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
    *  dispositions file, the publication builder, then the authenticated `/runner/cycle-summary` intake.
    *  Returns the status of every delivery in order. */
   function streamRunnerEvidence(prepared: { findings: ReadonlyArray<{ findingKey: string }> }, progressToken: string, commit: string,
-    opts: { dispositions: "all" | "partial" | "invalid" | "none"; publish?: boolean; deliveries?: number; conflictingPublication?: boolean }): number[] {
+    opts: { dispositions: "all" | "partial" | "invalid" | "none"; publish?: boolean; deliveries?: number; conflictingPublication?: boolean;
+      sourceApproved?: boolean | null; resultOutcome?: "success" | "failure" }): number[] {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rf-evidence-"));
     try {
       writeCycleSummary(dir, { id: "feedback-loop.1", stage: "feedback-loop", cycle: 1, inputCommit: sha("input"), outputCommit: null,
         outputCommitStatus: "pending_push", dispositions: [], tests: [{ name: "test execution", status: "missing" }],
-        verdict: { approved: true, reason: "approved" }, usage: { tokensIn: null, tokensOut: null, costUsd: null } });
+        verdict: { approved: opts.sourceApproved === undefined ? true : opts.sourceApproved, reason: "approved" },
+        usage: { tokensIn: 120, tokensOut: 30, costUsd: 0.05 } });
       const keys = prepared.findings.map((f) => f.findingKey);
       const entries = opts.dispositions === "all" ? keys.map((k) => ({ findingKey: k, disposition: "fixed", reason: "done" }))
         : opts.dispositions === "partial" ? keys.slice(0, 1).map((k) => ({ findingKey: k, disposition: "fixed", reason: "done" }))
@@ -253,13 +255,13 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
       }
       const pending = readCycleSummaries(dir);
       const publication = opts.publish === false ? null : buildPublicationCycleSummary(pending, commit,
-        readFindingDispositions(dir).valid.map((d) => ({ key: d.findingKey, disposition: d.disposition })));
+        readFindingDispositions(dir).valid.map((d) => ({ key: d.findingKey, disposition: d.disposition })), opts.resultOutcome ?? "success");
       const batch = [...pending, ...(publication ? [publication] : [])];
       const post = (summary: unknown) => handleRunnerCycleSummary({ authorization: `Bearer ${progressToken}`, secret: SECRET, body: { summary } }).status;
       const statuses = Array.from({ length: opts.deliveries ?? 1 }, () => batch).flat().map(post);
       if (opts.conflictingPublication) {
         // Same immutable identity, different (complete) payload: must be rejected, never merged over the first.
-        statuses.push(post(buildPublicationCycleSummary(pending, commit, keys.map((k) => ({ key: k, disposition: "fixed" })))));
+        statuses.push(post(buildPublicationCycleSummary(pending, commit, keys.map((k) => ({ key: k, disposition: "fixed" })), "success")));
       }
       return statuses;
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
@@ -398,7 +400,7 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
     const before = state.dispatched.length;
     const { attemptId, prepared } = await admit(56);
     const launch = await launched(before + 1);
-    expect(buildPublicationCycleSummary([], null, [])).toBeNull();
+    expect(buildPublicationCycleSummary([], null, [], "success")).toBeNull();
     streamRunnerEvidence(prepared, launch.config.credentials!.progressToken!, heads.get(56)!, { dispositions: "all", publish: false });
     runs.set(launch.runId, { status: "completed", conclusion: "failure" });
     const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
@@ -406,6 +408,16 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
     expect(getDb().prepare("SELECT cycle, output_commit FROM review_fix_cycles WHERE attempt_id = ?").all(attemptId))
       .toEqual([{ cycle: 1, output_commit: null }]);
     expect(comments.get(56) ?? []).toHaveLength(0);
+  }, 90_000);
+
+  it("withholds approval when the native review rejected the change, even with fixed dispositions and a pushed commit", async () => {
+    const c = await runCase(70, { dispositions: "all", sourceApproved: false });
+    const done = await finish(c.attemptId, c.prepared, c.launch, c.commit);
+    expect(done).toMatchObject({ status: "finalized" });
+    expect(done).not.toMatchObject({ approval: "applied" });
+    expect(comments.get(70) ?? []).toHaveLength(0);
+    expect(getDb().prepare("SELECT count(*) AS n FROM review_fix_cycles WHERE attempt_id = ? AND output_commit IS NOT NULL").get(c.attemptId))
+      .toEqual({ n: 0 });
   }, 90_000);
 
   it("withholds approval when the PR head moved after the evidence was published", async () => {

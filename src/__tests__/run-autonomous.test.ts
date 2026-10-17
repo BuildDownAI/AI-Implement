@@ -1069,9 +1069,42 @@ describe("runAutonomous", () => {
       expect(mockFetch.mock.calls[1][0]).toBe("https://orchestrator.example/runner/cycle-summary");
       expect(publication).toMatchObject({ id: "publication.1", stage: "publication", outputCommit: publishedCommit,
         outputCommitStatus: "committed", dispositions: [{ key: findingKey, disposition: "fixed" }],
-        tests: cycleSummary.tests, verdict: cycleSummary.verdict, usage: cycleSummary.usage });
+        tests: cycleSummary.tests, verdict: cycleSummary.verdict,
+        usage: { tokensIn: null, tokensOut: null, costUsd: null } });
+      // Measured usage stays on the source cycle; the publication record never duplicates it.
+      expect((JSON.parse(mockFetch.mock.calls[0][1].body as string) as { summary: CycleSummary }).summary.usage).toEqual(cycleSummary.usage);
       const body = JSON.parse(mockFetch.mock.calls[2][1].body as string) as { cycleSummaries?: CycleSummary[] };
       expect(body.cycleSummaries).toEqual([cycleSummary, publication]);
+    });
+
+    it("emits no approval-bearing publication when the native review rejected a pushed change", async () => {
+      stubReviewFixEnvelope({}, { prNumber: "42" });
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("RUN_PROGRESS_TOKEN", "pilot-progress");
+      vi.stubEnv("GITHUB_RUN_ID", "999888");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
+      const rejected: CycleSummary = {
+        id: "feedback-loop.1", stage: "feedback-loop", cycle: 1, inputCommit: "a".repeat(40), outputCommit: null,
+        outputCommitStatus: "pending_push", dispositions: [], tests: [{ name: "test execution", status: "missing" }],
+        verdict: { approved: false, reason: "rejected" }, usage: { tokensIn: 5, tokensOut: 6, costUsd: 0.02 },
+        truncated: false, limitReached: false, completedAt: 1_700_000_000_000,
+      };
+      mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
+      writeFileSync(join(workspaceDir, CYCLE_SUMMARY_FILE), `${JSON.stringify(rejected)}\n`);
+      writeFileSync(join(workspaceDir, "ai-output", "finding-dispositions.json"),
+        JSON.stringify([{ findingKey: "f".repeat(64), disposition: "fixed", reason: "done" }]));
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: false }) }],
+        ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/acme/app/pull/42", prNumber: 42,
+          branchPushed: true, commitSha: "b".repeat(40), draft: false }) }],
+      ]);
+      await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeMockExecutor(0), fetchImpl: mockFetch });
+      const bodies = mockFetch.mock.calls.map((c) => JSON.parse(c[1].body as string) as { summary?: CycleSummary; outcome?: string; cycleSummaries?: CycleSummary[] });
+      expect(bodies.filter((b) => b.summary).map((b) => b.summary!.id)).toEqual(["feedback-loop.1"]);
+      expect(bodies.find((b) => b.outcome)?.outcome).toBe("failure");
+      expect(bodies.find((b) => b.outcome)?.cycleSummaries?.map((c) => c.id)).toEqual(["feedback-loop.1"]);
     });
 
     it("publishes only validated dispositions: invalid entries are dropped and an unpushed run emits no publication record", async () => {

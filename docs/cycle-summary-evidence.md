@@ -199,8 +199,13 @@ After a successful push, `reportRunnerResult` (`src/run-autonomous.ts`) builds o
 `buildPublicationCycleSummary` (`stage: "publication"`, id `publication.1`) and streams it after the
 pre-push records and before the result. It carries the actual pushed `commitSha`
 (`outputCommitStatus: "committed"`) and the dispositions validated from
-`ai-output/finding-dispositions.json`. Tests, verdict and usage are copied from the last feedback-loop
-cycle, so missing tests stay `missing` and null usage stays null. `completedAt` is taken from that source
+`ai-output/finding-dispositions.json`. Tests and verdict are copied from the last feedback-loop
+cycle, so missing tests stay `missing`. Usage is **null** on the publication record: it is not a model
+invocation, so measured spend stays on the original cycle and is never counted twice.
+The record is approval-bearing, so it is built **only** when the overall runner result is `success` **and**
+the source cycle's native verdict is explicitly `approved: true`. A `false`/`null` verdict, a failure
+result (install failure, caught post-push failure, review-unapproved) or a missing verdict leaves only
+the truthful pre-push records; the job's green exit (handled failures exit 0) never stands in for approval. `completedAt` is taken from that source
 cycle, so every redelivery is byte-identical and idempotent. No record is built when the push produced
 no commit or the run wrote no feedback-loop cycle, and a `fixed` disposition is never inferred.
 

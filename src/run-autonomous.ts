@@ -590,6 +590,7 @@ async function reportRunnerResult(
         recorded,
         outputCommit,
         (params.findingDispositions ?? []).map((d) => ({ key: d.findingKey, disposition: d.disposition })),
+        params.outcome,
       )
     : null;
   const cycleSummaries = publication ? [...recorded, publication] : recorded;

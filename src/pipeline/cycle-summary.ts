@@ -270,7 +270,8 @@ export const PUBLICATION_CYCLE_ID = "publication.1";
  * Builds the one distinct publication record emitted after the pipeline-owned push succeeds. The
  * immutable pre-push `feedback-loop.N` records stay `pending_push`/`outputCommit:null`; this record
  * carries the actual pushed commit and the agent's validated dispositions, and reuses the final
- * feedback-loop cycle's tests, verdict and usage verbatim (missing stays missing, null stays null).
+ * feedback-loop cycle's tests and verdict verbatim (missing stays missing) and carries null usage.
+ * Only a successful runner result with an explicitly approving source verdict yields a record.
  * Returns null without a feedback-loop source cycle or a pushed commit. `completedAt` is derived from
  * the source cycle, so every delivery of the same run is byte-identical (idempotent, never a 409).
  */
@@ -278,11 +279,15 @@ export function buildPublicationCycleSummary(
   summaries: readonly CycleSummary[],
   outputCommit: string | null,
   dispositions: readonly CycleDisposition[],
+  resultOutcome: "success" | "failure",
 ): CycleSummary | null {
+  if (resultOutcome !== "success") return null;
   if (!outputCommit || outputCommit.length > 40) return null;
   const feedback = summaries.filter((s) => s.stage === "feedback-loop");
   const source = feedback.reduce<CycleSummary | null>((best, s) => (!best || s.cycle > best.cycle ? s : best), null);
-  if (!source) return null;
+  // Approval-bearing coverage needs an explicit approving native verdict; a false/null verdict keeps
+  // only the truthful pre-push records (the job's green exit never stands in for review success).
+  if (!source || source.verdict.approved !== true) return null;
   const full: CycleSummary = {
     id: PUBLICATION_CYCLE_ID,
     stage: "publication",
@@ -295,7 +300,8 @@ export function buildPublicationCycleSummary(
     })),
     tests: source.tests,
     verdict: source.verdict,
-    usage: source.usage,
+    // Publication is not a model invocation: measured usage stays on the source cycle, never duplicated.
+    usage: { tokensIn: null, tokensOut: null, costUsd: null },
     truncated: source.truncated,
     limitReached: source.limitReached,
     completedAt: source.completedAt,
