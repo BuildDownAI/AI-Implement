@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { chmod, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -26,6 +26,7 @@ import {
   streamSessionLogsUntilShellReady,
   type LocalAuthBridge,
 } from "../local/session.js";
+import { LOCAL_FULL_LOOP_RESULT_FILE, readSummaryAttribution } from "../local/run-result.js";
 import { parseTaskFileFromPath } from "./task-file.js";
 import type { ParsedTaskFile } from "./task-file.js";
 import { collectPlanningArtifact } from "./planning-artifacts.js";
@@ -742,12 +743,69 @@ export async function stopDevRun(handle: DevRunHandle): Promise<void> {
   return stopLocalSession(handle);
 }
 
+const MAX_UNTRACKED_FILES = 200;
+const MAX_UNTRACKED_BYTES = 256 * 1024;
+const UNTRACKED_DENY = [
+  /(^|\/)(ai-output|\.dev-runs|\.git|node_modules|\.cache|\.ai-implement-local|\.codex|\.claude)\//,
+  /(^|\/)\.env(\..*)?$/i,
+  /(^|\/)(\.npmrc|\.netrc|auth\.json|bootstrap\.json|credentials(\..*)?)$/i,
+  /\.(pem|key|p12|pfx)$/i,
+];
+
+/** Newly added, nonignored, regular files as read-only git diffs; never mutates the checkout. */
+function collectUntrackedEvidence(cwd: string): { patch: string; stat: string } {
+  const listed = spawnSync("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
+    cwd,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (listed.status !== 0) return { patch: "", stat: "" };
+  const eligible = (listed.stdout?.toString() ?? "")
+    .split("\0")
+    .filter((f) => f && !UNTRACKED_DENY.some((re) => re.test(f)));
+  const files = eligible.slice(0, MAX_UNTRACKED_FILES);
+  let patch = "";
+  let stat = "";
+  if (eligible.length > files.length) {
+    const note = `# untracked evidence truncated: ${eligible.length - files.length} of ${eligible.length} new files omitted (limit ${MAX_UNTRACKED_FILES})\n`;
+    console.warn(`[dev-harness] ${note.slice(2).trim()}`);
+    patch += note;
+    stat += note;
+  }
+  for (const file of files) {
+    try {
+      const st = lstatSync(join(cwd, file));
+      if (!st.isFile() || st.size > MAX_UNTRACKED_BYTES) continue;
+    } catch {
+      continue;
+    }
+    // Exit status 1 means "differs", which is the expected result here.
+    const run = (extra: string[]) =>
+      spawnSync("git", ["diff", "--no-index", "--no-color", ...extra, "--", "/dev/null", file], {
+        cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+      }).stdout?.toString() ?? "";
+    patch += run([]);
+    stat += run(["--stat"]);
+  }
+  return { patch, stat };
+}
+
+/** Latest-invocation attribution recorded by the local full loop; null when absent or invalid. */
+function readLatestAttribution(workspace: string) {
+  try {
+    const parsed = JSON.parse(readFileSync(join(workspace, LOCAL_FULL_LOOP_RESULT_FILE), "utf8")) as { latestAttribution?: unknown };
+    return readSummaryAttribution({ attribution: parsed?.latestAttribution });
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Write run artifacts into handle.artifactsDir:
  * - run.log (full container log)
- * - changes.diff (git diff of working tree)
+ * - changes.diff (git diff of working tree plus new nonignored files)
  * - diffstat.txt (git diff --stat)
- * - telemetry.json (exit code, timing, issue metadata)
+ * - telemetry.json (exit code, timing, issue metadata, latest invocation attribution)
  */
 export async function collectRunArtifacts(
   handle: DevRunHandle,
@@ -787,13 +845,14 @@ export async function collectRunArtifacts(
     cwd: artifactWorkspace,
     stdio: ["ignore", "pipe", "pipe"],
   });
-  await writeFile(join(artifactsDir, "diffstat.txt"), diffstatResult.stdout?.toString() ?? "");
+  const untracked = collectUntrackedEvidence(artifactWorkspace);
+  await writeFile(join(artifactsDir, "diffstat.txt"), (diffstatResult.stdout?.toString() ?? "") + untracked.stat);
 
   const fullDiffResult = spawnSync("git", ["diff"], {
     cwd: artifactWorkspace,
     stdio: ["ignore", "pipe", "pipe"],
   });
-  await writeFile(join(artifactsDir, "changes.diff"), fullDiffResult.stdout?.toString() ?? "");
+  await writeFile(join(artifactsDir, "changes.diff"), (fullDiffResult.stdout?.toString() ?? "") + untracked.patch);
 
   // Sampled here, not at call time: cancellation can arrive while artifacts are being collected.
   const wasCancelled = typeof cancelled === "function" ? cancelled() : cancelled;
@@ -806,6 +865,8 @@ export async function collectRunArtifacts(
     // Observed Docker exit; null when unknown. Never a statement about operator cancellation.
     exitCode,
     ...(wasCancelled ? { cancelled: true, cancellation: { logicalExit: 130 } } : {}),
+    // Latest invocation only: not whole-run spend, not per-stage. Null when absent or invalid.
+    latestInvocationAttribution: readLatestAttribution(artifactWorkspace),
     startedAt: startedAt.toISOString(),
     endedAt: new Date().toISOString(),
     durationMs: Date.now() - startedAt.getTime(),
