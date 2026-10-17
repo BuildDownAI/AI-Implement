@@ -47,6 +47,7 @@ import { isFailureRecord, projectFailureRecord, type FailureRecord } from "./pip
 import { sanitizeFindingDispositions, type FindingDisposition } from "./pipeline/finding-dispositions.js";
 import { loadStoredSnapshot } from "./agent-run-preparation.js";
 import { normalizeInvocation } from "./agent-usage.js";
+import { acceptedReviewFixDispatchId } from "./review-fix-attempt-store.js";
 import { sanitizeAttribution, type InvocationAttributionV1 } from "./pipeline/types.js";
 import { isCycleSummary, stripCycleAttribution, sanitizeCycleSummaries, type CycleSummary, type CycleDisposition } from "./pipeline/cycle-summary.js";
 import { lateExternalReviewWorkflowKey, type LateExternalReviewInput } from "./restate/late-external-review.js";
@@ -533,6 +534,34 @@ function recordOneCycleSummary(attemptId: string, summary: CycleSummary): Review
     });
 }
 
+/** Best-effort diagnostics only: accepted result identity and frozen configuration remain authoritative. */
+function recordManagedResultAttribution(
+  result: ReviewFixResultMetadataV1,
+  body: { attribution?: unknown; failure?: unknown; failureCode?: unknown },
+): void {
+  if (body.attribution == null) return;
+  try {
+    const attribution = sanitizeAttribution(body.attribution);
+    if (!attribution) {
+      console.warn("[runner-callback] Dropped 1 invalid managed attribution record(s)");
+      return;
+    }
+    const dispatchId = acceptedReviewFixDispatchId(result);
+    const snapshot = dispatchId ? loadStoredSnapshot(dispatchId) : null;
+    const row = snapshot ? normalizeInvocation(snapshot, { attribution }) : null;
+    if (dispatchId && row?.attribution === "verified") {
+      recordInvocationAttribution(dispatchId, row, {
+        timedOut: body.failureCode === "INVOCATION_TIMEOUT"
+          || (isFailureRecord(body.failure) && body.failure.code === "INVOCATION_TIMEOUT"),
+      });
+    } else {
+      console.warn("[runner-callback] Dropped 1 managed attribution record(s) not matching accepted snapshot");
+    }
+  } catch {
+    console.warn("[runner-callback] Could not persist 1 managed attribution record (count only)");
+  }
+}
+
 function recordCycleSummaries(attemptId: string, summaries: readonly CycleSummary[]): void {
   for (const summary of summaries) {
     const outcome = recordOneCycleSummary(attemptId, summary);
@@ -734,6 +763,7 @@ export async function handleRunnerResult(
     // its attached cycles unwritten. A byte-identical duplicate may repair only
     // that evidence; nothing else here is ever replayed.
     if (outcome.status === "duplicate" && outcome.attemptId === validated.value.attemptId) {
+      recordManagedResultAttribution(validated.value, body);
       const { valid, dropped } = sanitizeCycleSummaries(body.cycleSummaries);
       if (dropped > 0) console.warn(`[runner-callback] Dropped ${dropped} invalid cycle summary record(s)`);
       recordCycleSummaries(outcome.attemptId, valid);
@@ -742,6 +772,8 @@ export async function handleRunnerResult(
     if (outcome.status !== "stored") {
       return reviewFixResultIntakeResponse(outcome);
     }
+
+    recordManagedResultAttribution(validated.value, body);
 
     const { valid, dropped } = sanitizeCycleSummaries(body.cycleSummaries);
     if (dropped > 0) console.warn(`[runner-callback] Dropped ${dropped} invalid cycle summary record(s)`);

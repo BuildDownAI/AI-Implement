@@ -1,5 +1,6 @@
 import { hasEphemeralFullAccessOptIn, EPHEMERAL_FULL_ACCESS_ASSERTION, EPHEMERAL_FULL_ACCESS_EXTRA_ENV, EXECUTION_POLICY_ENV, isEphemeralPolicyEnvName } from "./model-auth-contract.js";
 import http from "node:http";
+import type { InvocationAttributionV1 } from "./pipeline/types.js";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -630,6 +631,8 @@ export interface ReviewFixAttemptDetail {
   /** False whenever a requested cancellation or deadline has not yet been confirmed
    *  stopped on GitHub's side — explicit, never inferred from an absent field. */
   terminationConfirmed: boolean;
+  /** Latest snapshot-validated invocation for this attempt's own dispatch; absent on older servers. */
+  attribution?: InvocationAttributionV1 | null;
   cycles: ReviewFixAttemptCycleSummary[];
 }
 

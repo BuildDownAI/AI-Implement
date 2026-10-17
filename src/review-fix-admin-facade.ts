@@ -4,6 +4,7 @@
  * never free capacity without the workflow's backend-terminal confirmation. */
 import type { ReviewFixAttemptsFacade, ReviewFixAttemptCaller, ReviewFixAttemptCycleSummary } from "./admin.js";
 import { getDb } from "./dedup.js";
+import { getInvocationAttribution } from "./log.js";
 import { getReviewFixActivityGaps, isReviewFixEvidenceTombstoned,
   listReviewFixActivity, listReviewFixCycleSummaries } from "./review-fix-evidence.js";
 import type { ReviewFixCancelForwarder } from "./review-fix-close.js";
@@ -116,6 +117,7 @@ export function createReviewFixAdminFacade(
         state: terminal ? terminal.terminal.status : row.result_conflict_at !== null ? "conflict" : row.state,
         evidenceComplete: evidenceComplete(attemptId, cycles),
         terminationConfirmed: row.released_at !== null,
+        attribution: getInvocationAttribution(row.dispatch_id),
         cycles,
       } };
     },
