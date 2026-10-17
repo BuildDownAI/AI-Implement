@@ -32,7 +32,7 @@ Post the red lines as a PR comment or in the issue's `# ai-implement-build-down-
 
 ## Which tier
 
-Use a unit test (`src/__tests__/<module>.test.ts`) unless the assertion is about the Restate engine itself. The rule is in `docs/restate-testing.md` § "When to write a Restate test, and when a unit test". Remember that `npm run typecheck` does not check `src/__tests__`; type-check a new test file with a throwaway tsconfig.
+Use a unit test (`src/__tests__/<module>.test.ts`) unless the assertion is about the Restate engine itself. The rule is in `docs/restate-testing.md` § "When to write a Restate test, and when a unit test". Remember that `npm run typecheck` also type-checks `src/__tests__` (through `tsconfig.tests.json`), so run it on a new test file; never add a file to that config's `exclude` list.
 
 ## Worked example: AII-738
 

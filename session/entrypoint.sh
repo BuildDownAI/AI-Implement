@@ -7,7 +7,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib.sh"
-trap 'log "ERROR: line $LINENO failed: $BASH_COMMAND (exit $?)"' ERR
+CONFIGURED=0
+# on_err logs a fixed message once CONFIGURED=1 (the failing command text can carry secrets).
+trap 'on_err "$?" "$LINENO" "$BASH_COMMAND"' ERR
 WORKSPACE_DIR="${WORKSPACE_DIR:-/workspace}"
 WORKSPACE_MODE="${AI_IMPLEMENT_WORKSPACE_MODE:-cloned}"
 
@@ -21,12 +23,25 @@ log "Execution mode: $AI_IMPLEMENT_MODE"
 export AI_IMPLEMENT_MODE
 
 # ── 2. Env validation ────────────────────────────────────────────────────────
-PROVIDER="${PROVIDER:-anthropic}"
-case "$PROVIDER" in
-  bedrock) [ "$AI_IMPLEMENT_MODE" = "gha" ] || fail "provider=bedrock is supported only in GHA mode"; require_env AWS_REGION; export CLAUDE_CODE_USE_BEDROCK=1; export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 ;;
-  anthropic) require_one_of ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ;;
-  *) fail "Unsupported provider: $PROVIDER" ;;
+# A configured run carries a resolved snapshot plus a hosted grant or protected local bootstrap.
+# The trusted decoder and local metadata validator run before the legacy provider check is skipped.
+# Incomplete or malformed configured input fails closed here, before any git/clone/setup, with
+# a fixed message and no legacy-credential fallback.
+case "$(classify_run_config)" in
+  legacy) ;;
+  configured) CONFIGURED=1 ;;
+  *) fail "Configured model-auth bootstrap is invalid or incomplete" ;;
 esac
+PROVIDER="${PROVIDER:-anthropic}"
+if [ "$CONFIGURED" = "1" ]; then
+  log "Configured run: model credentials come from the selected-stage authentication path"
+else
+  case "$PROVIDER" in
+    bedrock) [ "$AI_IMPLEMENT_MODE" = "gha" ] || fail "provider=bedrock is supported only in GHA mode"; require_env AWS_REGION; export CLAUDE_CODE_USE_BEDROCK=1; export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 ;;
+    anthropic) require_one_of ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ;;
+    *) fail "Unsupported provider: $PROVIDER" ;;
+  esac
+fi
 export PROVIDER
 # AI_IMPLEMENT_RUN_CONFIG (the envelope) carries the issue fields when set; the
 # TS runner decodes them itself. Only the legacy per-field contract needs them
@@ -46,9 +61,9 @@ else
   require_env GITHUB_TOKEN GITHUB_OWNER GITHUB_REPO
 fi
 export GITHUB_OWNER GITHUB_REPO
-[ -z "${PR_NUMBER:-}" ] && [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ] && PR_NUMBER="$(node -e "try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,'base64').toString());process.stdout.write(String(c.prNumber||''))}catch{}" 2>/dev/null||true)"
+[ -z "${PR_NUMBER:-}" ] && [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ] && PR_NUMBER="$(run_node -e "try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,'base64').toString());process.stdout.write(String(c.prNumber||''))}catch{}" 2>/dev/null||true)"
 export PR_NUMBER="${PR_NUMBER:-}"
-_kg_r="$(if [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ]; then node -e "try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,'base64').toString());process.stdout.write(c.kgSourceRepo||'')}catch{}" 2>/dev/null; fi)"
+_kg_r="$(if [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ]; then run_node -e "try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,'base64').toString());process.stdout.write(c.kgSourceRepo||'')}catch{}" 2>/dev/null; fi)"
 [ -n "${_kg_r:-}" ] && { GITHUB_OWNER="${_kg_r%%/*}"; GITHUB_REPO="${_kg_r#*/}"; }
 # ── 3. Token acquisition ─────────────────────────────────────────────────────
 export GH_TOKEN="$GITHUB_TOKEN"
@@ -58,43 +73,46 @@ if [ -z "${GITHUB_DEFAULT_BRANCH:-}" ]; then
   if [ -z "${_kg_r:-}" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
     GITHUB_DEFAULT_BRANCH="${GITHUB_REF_NAME}"
   else
-    GITHUB_DEFAULT_BRANCH="$(gh api "repos/${GITHUB_OWNER}/${GITHUB_REPO}" --jq ".default_branch")"
+    GITHUB_DEFAULT_BRANCH="$(run_scoped "GH_TOKEN" gh api "repos/${GITHUB_OWNER}/${GITHUB_REPO}" --jq ".default_branch")"
   fi
 fi
 export GITHUB_DEFAULT_BRANCH
-[ -n "${_kg_r:-}" ] && _kg_ref="$(node -e 'try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,"base64").toString());process.stdout.write(c.kgSourceRef||"")}catch(e){}' 2>/dev/null||true)" && [ -n "$_kg_ref" ] && { log "run_config.kgSourceRef=${_kg_ref}"; GITHUB_DEFAULT_BRANCH="$_kg_ref"; export GITHUB_DEFAULT_BRANCH; }
-[ -z "${PR_NUMBER:-}" ] && [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ] && _rb="$(node -e 'try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,"base64").toString());process.stdout.write(c.baseBranch||"")}catch(e){}' 2>/dev/null||true)" && [ -n "$_rb" ] && { log "run_config.baseBranch=${_rb}"; GITHUB_DEFAULT_BRANCH="$_rb"; }
-git config --global user.name "ai-implement-bot"
-git config --global user.email "ai-implement-bot@users.noreply.github.com"
-git config --global init.defaultBranch "$GITHUB_DEFAULT_BRANCH"
+[ -n "${_kg_r:-}" ] && _kg_ref="$(run_node -e 'try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,"base64").toString());process.stdout.write(c.kgSourceRef||"")}catch(e){}' 2>/dev/null||true)" && [ -n "$_kg_ref" ] && { log "run_config.kgSourceRef=${_kg_ref}"; GITHUB_DEFAULT_BRANCH="$_kg_ref"; export GITHUB_DEFAULT_BRANCH; }
+[ -z "${PR_NUMBER:-}" ] && [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ] && _rb="$(run_node -e 'try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,"base64").toString());process.stdout.write(c.baseBranch||"")}catch(e){}' 2>/dev/null||true)" && [ -n "$_rb" ] && { log "run_config.baseBranch=${_rb}"; GITHUB_DEFAULT_BRANCH="$_rb"; }
+run_scoped "" git config --global user.name "ai-implement-bot"
+run_scoped "" git config --global user.email "ai-implement-bot@users.noreply.github.com"
+run_scoped "" git config --global init.defaultBranch "$GITHUB_DEFAULT_BRANCH"
 
-if [ "$WORKSPACE_MODE" = "mounted" ]; then
+if [ "$WORKSPACE_MODE" = "copy" ]; then
+  copy_local_workspace "$WORKSPACE_DIR"
+  cd "$WORKSPACE_DIR"
+elif [ "$WORKSPACE_MODE" = "mounted" ]; then
   log "Using bind-mounted workspace at $WORKSPACE_DIR"
-  git config --global --add safe.directory "$WORKSPACE_DIR"
+  run_scoped "" git config --global --add safe.directory "$WORKSPACE_DIR"
   cd "$WORKSPACE_DIR"
 else
-  REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git"
   log "Cloning ${GITHUB_OWNER}/${GITHUB_REPO}..."
-  git clone --depth=1 --branch "$GITHUB_DEFAULT_BRANCH" "$REPO_URL" "$WORKSPACE_DIR"
-  git config --global --add safe.directory "$WORKSPACE_DIR"
+  if [ "$CONFIGURED" = "1" ]; then
+    configure_scoped_git_auth
+    git_authed clone --depth=1 --branch "$GITHUB_DEFAULT_BRANCH" "https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git" "$WORKSPACE_DIR"
+  else
+    REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git"
+    git clone --depth=1 --branch "$GITHUB_DEFAULT_BRANCH" "$REPO_URL" "$WORKSPACE_DIR"
+  fi
+  run_scoped "" git config --global --add safe.directory "$WORKSPACE_DIR"
   cd "$WORKSPACE_DIR"
   if [ -n "$PR_NUMBER" ]; then
     log "Gap-fill: checking out PR #$PR_NUMBER"
-    git config --replace-all remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
-    gh pr checkout "$PR_NUMBER"
-    GITHUB_DEFAULT_BRANCH="$(git branch --show-current)"
+    run_scoped "" git config --replace-all remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+    run_scoped "GH_TOKEN" gh pr checkout "$PR_NUMBER"
+    GITHUB_DEFAULT_BRANCH="$(run_scoped "" git branch --show-current)"
     export GITHUB_DEFAULT_BRANCH
   fi
 fi
 
 # ── 5. Workspace ownership for non-root Claude ───────────────────────────────
-if [ "$WORKSPACE_MODE" = "mounted" ]; then
-  prepare_coder_identity "${AI_IMPLEMENT_HOST_UID:-}" "${AI_IMPLEMENT_HOST_GID:-}"
-  verify_workspace_writable "$WORKSPACE_DIR"
-else
-  chown -R coder:coder "$WORKSPACE_DIR"
-fi
-cp /root/.gitconfig /home/coder/.gitconfig 2>/dev/null || true
+prepare_workspace_owner "$WORKSPACE_MODE" "$WORKSPACE_DIR"
+cp "${HOME:-/root}/.gitconfig" /home/coder/.gitconfig 2>/dev/null || true
 chown coder:coder /home/coder/.gitconfig 2>/dev/null || true
 
 # ── 5.5. Remap per-team Fly secrets ─────────────────────────────────────────
@@ -113,4 +131,6 @@ export RUNNER_PHASE
 RUNNER_ENTRY="$(select_runner_entry "$RUNNER_PHASE")"
 [ "$RUNNER_PHASE" = "kg-refresh" ] && export RUNNER_CALLBACK_URL RUN_PROGRESS_TOKEN
 log "Invoking TS pipeline (node /app/dist/$RUNNER_ENTRY, phase=$RUNNER_PHASE, source=$RUNNER_PHASE_SOURCE)..."
+# Configured: no ambient node preload/module path (bare or alias-restored) may meet the protected envelope.
+[ "$CONFIGURED" != "1" ] || unset NODE_OPTIONS NODE_PATH
 exec dbus-run-session -- su -p coder -c "HOME=/home/coder exec node /app/dist/$RUNNER_ENTRY"

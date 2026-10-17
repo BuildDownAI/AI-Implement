@@ -82,8 +82,9 @@ export async function openOrFindPullRequest(
   throw new Error(`PR creation failed with HTTP ${prRes.status}: ${body}`);
 }
 
-export function formatLlmResultDetail(result: { stdout?: string; stderr?: string }): string {
-  const detail = (result.stderr || result.stdout || "").trim();
+/** The stream's own error text outranks stderr, which can carry only CLI warnings (Codex's PATH-alias notice). */
+export function formatLlmResultDetail(result: { stdout?: string; stderr?: string; errorMessage?: string }): string {
+  const detail = (result.errorMessage || result.stderr || result.stdout || "").trim();
   return detail ? `: ${detail}` : "";
 }
 

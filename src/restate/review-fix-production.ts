@@ -2,7 +2,11 @@
  * external calls live in SQLite/GitHub adapters; this file is the allowed SDK
  * boundary where those adapters become Restate services. */
 import { getMappings, resolveReviewFixLifecycle, type RepoMapping } from "../config.js";
+import { randomUUID } from "node:crypto";
 import { getDb } from "../dedup.js";
+import { hasEphemeralFullAccessOptIn } from "../model-auth-contract.js";
+import type { ModelAuthRuntime } from "../model-auth-runtime.js";
+import { isManagedProject, prepareManagedDispatch, ghaManagedCredentials, settleLaunch } from "../managed-dispatch-auth.js";
 import { getInstallationId, getInstallationToken } from "../github-app-auth.js";
 import { getPullRequestState } from "../github.js";
 import { listReviewFixCycleSummaries } from "../review-fix-evidence.js";
@@ -11,19 +15,23 @@ import { createReviewFixGithubAdapter } from "../review-fix-github-adapter.js";
 import { resolveRunnerImageForDispatch } from "../repo-image.js";
 import { resolveReviewProcess, type ReviewFixer } from "../review-process.js";
 import { acceptReviewFixWebhookEvent, updateReviewFixStatus } from "../review-fix-queue.js";
-import { loadPendingReviewFixFeedback } from "../review-fix-pending.js";
+import { inspectPendingReviewFixFeedback } from "../review-fix-pending.js";
 import { SqliteReviewFixAttemptStore } from "../review-fix-attempt-store.js";
 import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "../review-fix-worker.js";
 import { DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES, type ReviewFixFindingDisposition } from "../review-fix-ports.js";
-import type { PreparedReviewFixAttempt } from "../review-fix-ports.js";
+import type { PreparedReviewFixAttempt, ReviewFixAdmissionOutcome, ReviewFixAdmissionRequest } from "../review-fix-ports.js";
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
 import { mintPreparedReviewFixToken } from "../runner-tokens.js";
 import { getRunnerMode, resolveExecutionPath } from "../runner-mode.js";
-import { resolveWorkflowCapabilities } from "../workflow-probe.js";
+import { inspectAgentReadiness } from "../agent-run-preparation.js";
+import { resolveWorkflowCapabilities, type WorkflowCapabilities } from "../workflow-probe.js";
 import type { ProviderRegistry } from "../providers/registry.js";
 import { createReviewFixAttempt } from "./review-fix-attempt.js";
 import { createReviewFixPR } from "./review-fix-pr.js";
 import type { RestateService } from "./endpoint.js";
+import { getRetryPolicy } from "../orchestrator-settings.js";
+import { lateExternalReviewWorkflowKey, type LateExternalReviewInput } from "./late-external-review.js";
+import { clearPendingLateReview, getLatestWorkRowForPr, recordPendingLateReview } from "../log.js";
 
 export interface ReviewFixProductionConfig {
   githubAppId: string;
@@ -34,29 +42,113 @@ export interface ReviewFixProductionConfig {
   runnerImageExplicit: boolean;
 }
 
-function selectedMapping(scope: ScopedPrIdentity): RepoMapping | null {
-  const mapping = Object.values(getMappings()).find((candidate) =>
-    `${candidate.owner}/${candidate.repo}` === scope.repository);
-  return mapping && !mapping.paused && resolveReviewFixLifecycle(mapping) === "restate"
-    && resolveExecutionPath(getRunnerMode().mode, mapping.executionMode) === "github-actions"
-    ? mapping : null;
+/** Mapping identity stays available to already-admitted legacy GHA attempts across runner-mode changes. */
+function mappedEntry(scope: ScopedPrIdentity): [string, RepoMapping] | null {
+  return Object.entries(getMappings()).find(([, candidate]) =>
+    `${candidate.owner}/${candidate.repo}` === scope.repository) ?? null;
 }
+
+/** The selected mapping with its `getMappings()` key, which opt-in lookup is keyed by. */
+function selectedEntry(scope: ScopedPrIdentity): [string, RepoMapping] | null {
+  const entry = mappedEntry(scope);
+  if (!entry) return null;
+  const mapping = entry[1];
+  return !mapping.paused && resolveReviewFixLifecycle(mapping) === "restate"
+    && resolveExecutionPath(getRunnerMode().mode, mapping.executionMode) === "github-actions"
+    ? entry : null;
+}
+
+function selectedMapping(scope: ScopedPrIdentity): RepoMapping | null {
+  return selectedEntry(scope)?.[1] ?? null;
+}
+
+export type ReviewFixAdmission = "admit" | "defer" | "configuration_error";
+
+/** Readiness codes that are uncertain rather than wrong: the queue stays pending and a later check can admit.
+ * `resolution_failed` is deliberately not here: an unauthorized, disabled or missing profile surfaces as that code,
+ * whereas `resolution_unavailable` is an operational fault (such as a locked database) reading the inputs. */
+const DEFERRED_READINESS_CODES: ReadonlySet<string> = new Set([
+  "delivery_unreadable", "repository_visibility_unknown", "credential_unavailable", "session_unavailable",
+  "resolution_unavailable",
+]);
+
+interface AdmissionDecision { verdict: ReviewFixAdmission; reason: string }
 
 /** Verify the dispatch-ref contract immediately before a new reservation. A
  * changed workflow, runner mode, missing callback credential, or GitHub outage
- * defers admission with the queue still pending. */
-async function canAdmit(scope: ScopedPrIdentity, config: ReviewFixProductionConfig): Promise<boolean> {
-  const mapping = selectedMapping(scope);
-  if (!mapping || !config.runnerCallbackBaseUrl || !config.runnerTokenSecret) return false;
+ * defers admission with the queue still pending. A managed (opted-in) project is
+ * additionally admitted only when its workflow carries the managed capabilities and
+ * the read-only agent readiness check passes; that check reserves, snapshots and mints
+ * nothing, because launch preparation is the only place that freezes and grants. */
+export async function canAdmit(
+  scope: ScopedPrIdentity,
+  config: ReviewFixProductionConfig,
+  runtime?: ModelAuthRuntime,
+): Promise<ReviewFixAdmission> {
+  return (await decideAdmission(scope, config, runtime)).verdict;
+}
+
+async function decideAdmission(
+  scope: ScopedPrIdentity,
+  config: ReviewFixProductionConfig,
+  runtime?: ModelAuthRuntime,
+): Promise<AdmissionDecision> {
+  const entry = selectedEntry(scope);
+  if (!entry) return { verdict: "defer", reason: "not_selected" };
+  const [key, mapping] = entry;
+  const managed = isManagedProject(key);
+  if (!config.runnerCallbackBaseUrl || !config.runnerTokenSecret) return { verdict: "defer", reason: "callback_unavailable" };
+  if (!managed) {
+    return await verifyDispatchContract(scope, config, mapping) ? { verdict: "admit", reason: "legacy" }
+      : { verdict: "defer", reason: "contract_unverified" };
+  }
+  if (!runtime) return { verdict: "defer", reason: "model_auth_unavailable" };
+  const capabilities = await verifyDispatchContract(scope, config, mapping, true);
+  if (!capabilities) return { verdict: "defer", reason: "contract_unverified" };
+  if (capabilities.contract !== "envelope" || capabilities.supportsAttemptCorrelation !== true
+    || capabilities.supportsRunPublicationToken !== true || capabilities.supportsStageAgentConfig !== true || capabilities.supportsPrivateRunConfig !== true) {
+    return { verdict: "configuration_error", reason: "workflow_capability_missing" };
+  }
+  if (hasEphemeralFullAccessOptIn(mapping.extraEnv) && capabilities.supportsExecutionPolicy !== true) {
+    return { verdict: "configuration_error", reason: "execution_policy_missing" };
+  }
+  const repository = `${mapping.owner}/${mapping.repo}`;
+  let readiness;
+  try {
+    readiness = await inspectAgentReadiness({ dispatchId: `admission-readiness-${randomUUID()}`, projectKey: key,
+      backend: "github-actions", workflowRepository: repository, workflowFile: mapping.workflowFile,
+      repositories: [repository] }, runtime.preparationDeps({ owner: mapping.owner, repo: mapping.repo, projectKey: key }));
+  } catch { return { verdict: "defer", reason: "readiness_unavailable" }; }
+  if (readiness.status === "legacy") return { verdict: "configuration_error", reason: "no_stage_configuration" };
+  if (readiness.status === "not-ready") {
+    return { verdict: DEFERRED_READINESS_CODES.has(readiness.code) ? "defer" : "configuration_error", reason: readiness.code };
+  }
+  // Launch preparation refuses a Claude subscription stage on managed projects; fail the row now rather than at launch.
+  if (readiness.profiles.some((profile) => profile.authMode === "claude-subscription")) {
+    return { verdict: "configuration_error", reason: "claude_subscription_unsupported" };
+  }
+  return { verdict: "admit", reason: "managed" };
+}
+
+async function verifyDispatchContract(
+  scope: ScopedPrIdentity,
+  config: ReviewFixProductionConfig,
+  mapping: RepoMapping,
+  managed = false,
+): Promise<WorkflowCapabilities | null> {
   try {
     const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
-    if (await getInstallationId(config.githubAppId, config.githubAppPrivateKey, mapping.owner) !== scope.installationId) return false;
+    if (await getInstallationId(config.githubAppId, config.githubAppPrivateKey, mapping.owner) !== scope.installationId) return null;
+    // A managed verdict can fail the queue row, so an unreadable workflow must throw (defer) instead of reading as incapable.
     const capabilities = await resolveWorkflowCapabilities({ owner: mapping.owner, repo: mapping.repo,
-      workflowFile: mapping.workflowFile, token, ref: mapping.defaultBranch });
+      workflowFile: mapping.workflowFile, token, ref: mapping.defaultBranch, ...(managed ? { failOnTransient: true } : {}) });
     const prState = await getPullRequestState(token, mapping.owner, mapping.repo, scope.prNumber);
+    if (prState?.state !== "open" || prState.merged) return null;
+    // A managed verdict reports a known-incapable template as a configuration error, so the capabilities are returned for it to judge.
+    if (managed) return capabilities;
     return capabilities.contract === "envelope" && capabilities.supportsAttemptCorrelation
-      && capabilities.supportsRunPublicationToken && prState?.state === "open" && !prState.merged;
-  } catch { return false; }
+      && capabilities.supportsRunPublicationToken ? capabilities : null;
+  } catch { return null; }
 }
 
 /** Who fixes review findings for this mapping; an unmapped PR keeps ai-implement. */
@@ -74,6 +166,25 @@ export function recordDelegatedFix(scope: ScopedPrIdentity, queueCursor: { queue
     + `(${resolveReviewProcess(mapping?.reviewProcess).id}), skipping review fix #${queueCursor.queueId}`);
 }
 
+/** Reserve an attempt when the dispatch contract holds. A configuration error fails its queue row and
+ * reserves nothing; every other non-admit defers with the queue still pending. */
+export async function admitReviewFix(
+  request: ReviewFixAdmissionRequest,
+  config: ReviewFixProductionConfig,
+  store: Pick<SqliteReviewFixAttemptStore, "admit">,
+  runtime?: ModelAuthRuntime,
+): Promise<ReviewFixAdmissionOutcome> {
+  const { verdict, reason } = await decideAdmission(request.scope, config, runtime);
+  if (verdict === "admit") return store.admit(request);
+  if (verdict === "configuration_error") {
+    const cursor = request.feedback.queueCursor;
+    // A failed row is no longer pending, so the PR object stops rechecking.
+    if (cursor) updateReviewFixStatus(cursor.queueId, "failed");
+    console.error(`[review-fix] ${request.scope.repository}#${request.scope.prNumber} not launched: configuration_error (${reason})`);
+  }
+  return { status: "deferred", reason: "paused" };
+}
+
 function dispositionsFor(attempt: PreparedReviewFixAttempt, result: ReviewFixResultMetadataV1): ReviewFixFindingDisposition[] {
   const summaries = listReviewFixCycleSummaries(attempt.attemptId);
   // A finding may have been addressed in an earlier cycle. Require the final
@@ -87,29 +198,54 @@ function dispositionsFor(attempt: PreparedReviewFixAttempt, result: ReviewFixRes
   return [...latest.values()];
 }
 
-export function createProductionReviewFixServices(
-  config: ReviewFixProductionConfig,
-  registry: ProviderRegistry,
-  store = new SqliteReviewFixAttemptStore(),
-): RestateService[] {
-  const credentials = createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey);
-  const github = createReviewFixGithubAdapter({ credentials });
-  const worker = new GithubReviewFixWorker({ credentials, scopeStore: reviewFixAttemptStoreScopeStore(store),
-    runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
-    runnerImage: (target) => resolveRunnerImageForDispatch({ ...target,
-      defaultImage: config.sessionImage, runnerImageExplicit: config.runnerImageExplicit }),
-    callbackInputs: async (attemptId) => {
-      if (!config.runnerTokenSecret || !config.runnerCallbackBaseUrl) throw new Error("pilot callbacks unavailable");
-      return {
-        run_token: mintPreparedReviewFixToken({ attemptId, audience: "result", secret: config.runnerTokenSecret }).token,
-        run_progress_token: mintPreparedReviewFixToken({ attemptId, audience: "progress", secret: config.runnerTokenSecret }).token,
-        run_publication_token: mintPreparedReviewFixToken({ attemptId, audience: "publication", secret: config.runnerTokenSecret }).token,
-        runner_callback_url: config.runnerCallbackBaseUrl,
-      };
-    },
-  });
-  const baseFinalizer = createReviewFixFinalizer({ attemptStore: store, github });
-  const finalizer: typeof baseFinalizer = {
+/**
+ * After a review-fix attempt's approval effect applied (AII-1307), asks `LateExternalReview` to review the
+ * pushed head and write the PR's mark. The mark is never stamped here. Never throws: this runs inside the
+ * journaled `apply-approval-once` step, and a retry would re-run the approval effect.
+ */
+export async function submitLateReviewForAttempt(
+  scope: ScopedPrIdentity,
+  attemptId: string,
+  submit: ((input: LateExternalReviewInput) => Promise<boolean | void>) | undefined,
+): Promise<void> {
+  if (!submit) return;
+  try {
+    const [owner, repo] = scope.repository.split("/");
+    const prUrl = `https://github.com/${scope.repository}/pull/${scope.prNumber}`;
+    const row = getLatestWorkRowForPr(prUrl);
+    if (!row?.dispatchId) {
+      console.log(`[review-fix] No run row with a dispatch id for ${prUrl}, not submitting late external review (attempt ${attemptId})`);
+      return;
+    }
+    // A row still dispatched/running belongs to a run that writes its own outcome; stamping it from here could mark an
+    // unreviewed run (its status can turn terminal-unapproved while the workflow waits). A settled row cannot change.
+    if (row.inFlight) {
+      console.log(`[review-fix] Run ${row.dispatchId} for ${prUrl} is still in flight, not submitting late external review (attempt ${attemptId})`);
+      return;
+    }
+    // Held for the poll sweep (resubmitPendingGapFillReviews) in case Restate is not ready and the hook only logs.
+    const workflowKey = lateExternalReviewWorkflowKey({ dispatchId: row.dispatchId, attemptId });
+    recordPendingLateReview({ workflowKey, dispatchId: row.dispatchId, prUrl, attemptId });
+    const settled = await submit({ dispatchId: row.dispatchId, owner, repo, prNumber: scope.prNumber, prUrl, gapFill: true, attemptId });
+    // Accepted or already running: the workflow key is the idempotency, so the retry record is spent.
+    if (settled !== false) clearPendingLateReview(workflowKey);
+  } catch (err) {
+    console.log(`[review-fix] Late external review submit failed for attempt ${attemptId}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+type ReviewFixFinalizer = ReturnType<typeof createReviewFixFinalizer>;
+
+/** The finalizer the attempt workflow runs: re-checks authority, head and policy, applies the approval,
+ * then (AII-1307) asks `LateExternalReview` to write the mark once the effect applied. */
+export function createProductionFinalizer(deps: {
+  store: Pick<SqliteReviewFixAttemptStore, "getAcceptedResult" | "getRecordedOutcome" | "hasCurrentAuthority">;
+  github: Pick<ReturnType<typeof createReviewFixGithubAdapter>, "getPrHeadSha" | "evaluateMergePolicy">;
+  baseFinalizer: ReviewFixFinalizer;
+  submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<boolean | void>;
+}): ReviewFixFinalizer {
+  const { store, github, baseFinalizer, submitLateExternalReview } = deps;
+  return {
     recordOutcome: baseFinalizer.recordOutcome,
     applyApproval: async (input) => {
       // The result handler may record a conflict after the workflow's earlier
@@ -128,14 +264,81 @@ export function createProductionReviewFixServices(
         return { status: "withheld", reason: "current PR head or merge policy changed" };
       }
       const current = { ...input, currentAuthority: true, currentPrHeadSha: head };
-      return baseFinalizer.applyApproval(current);
+      const applied = await baseFinalizer.applyApproval(current);
+      if (applied.status === "applied") await submitLateReviewForAttempt(input.scope, input.attemptId, submitLateExternalReview);
+      return applied;
     },
   };
+}
+
+/** The real launch adapter, also used by composition tests without constructing SDK services. */
+export function createProductionReviewFixWorker(
+  config: ReviewFixProductionConfig,
+  store: SqliteReviewFixAttemptStore,
+  runtime?: ModelAuthRuntime,
+): GithubReviewFixWorker {
+  const credentials = createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey);
+  return new GithubReviewFixWorker({ credentials, scopeStore: reviewFixAttemptStoreScopeStore(store),
+    runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
+    retryPolicy: getRetryPolicy,
+    requiresProtectedTransport: (plan) => {
+      const entry = mappedEntry(plan.scope);
+      return entry === null || isManagedProject(entry[0], plan.attemptId);
+    },
+    prepareManagedLaunch: async (plan, capabilities) => {
+      const entry = mappedEntry(plan.scope);
+      if (!entry) throw new Error("review-fix mapping unavailable");
+      const [projectKey, mapping] = entry;
+      if (!isManagedProject(projectKey, plan.attemptId)) return null;
+      if (!selectedEntry(plan.scope)) throw new Error("review-fix managed mapping unavailable");
+      if (capabilities.supportsStageAgentConfig !== true) throw new Error("review-fix managed workflow unavailable");
+      if (!runtime) throw new Error("review-fix model authentication unavailable");
+      if (hasEphemeralFullAccessOptIn(mapping.extraEnv) && capabilities.supportsExecutionPolicy !== true) {
+        throw new Error("review-fix execution policy transport unavailable");
+      }
+      const decision = await prepareManagedDispatch({ dispatchId: plan.attemptId, projectKey,
+        backend: "github-actions", owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile }, runtime);
+      if (decision.kind !== "launch") throw new Error("review-fix managed preparation unavailable");
+      try {
+        const managedCredentials = ghaManagedCredentials(decision, config.runnerCallbackBaseUrl, { extraEnv: mapping.extraEnv });
+        if (!managedCredentials) throw new Error("review-fix managed credentials unavailable");
+        return { snapshot: decision.snapshot, credentials: managedCredentials,
+          settle: (outcome) => { settleLaunch(decision, outcome, runtime); } };
+      } catch {
+        settleLaunch(decision, "rejected", runtime);
+        throw new Error("review-fix managed credentials unavailable");
+      }
+    },
+    runnerImage: (target) => resolveRunnerImageForDispatch({ ...target,
+      defaultImage: config.sessionImage, runnerImageExplicit: config.runnerImageExplicit }),
+    callbackInputs: async (attemptId) => {
+      if (!config.runnerTokenSecret || !config.runnerCallbackBaseUrl) throw new Error("pilot callbacks unavailable");
+      return {
+        run_token: mintPreparedReviewFixToken({ attemptId, audience: "result", secret: config.runnerTokenSecret }).token,
+        run_progress_token: mintPreparedReviewFixToken({ attemptId, audience: "progress", secret: config.runnerTokenSecret }).token,
+        run_publication_token: mintPreparedReviewFixToken({ attemptId, audience: "publication", secret: config.runnerTokenSecret }).token,
+        runner_callback_url: config.runnerCallbackBaseUrl,
+      };
+    },
+  });
+}
+
+export function createProductionReviewFixServices(
+  config: ReviewFixProductionConfig,
+  registry: ProviderRegistry,
+  store = new SqliteReviewFixAttemptStore(),
+  submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<boolean | void>,
+  runtime?: ModelAuthRuntime,
+): RestateService[] {
+  const credentials = createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey);
+  const github = createReviewFixGithubAdapter({ credentials });
+  const worker = createProductionReviewFixWorker(config, store, runtime);
+  const baseFinalizer = createReviewFixFinalizer({ attemptStore: store, github });
+  const finalizer = createProductionFinalizer({ store, github, baseFinalizer, submitLateExternalReview });
   const pr = createReviewFixPR({
     recordFeedback: async (event) => acceptReviewFixWebhookEvent(event),
     attempts: {
-      admit: async (request) => await canAdmit(request.scope, config)
-        ? store.admit(request) : { status: "deferred", reason: "paused" },
+      admit: (request) => admitReviewFix(request, config, store, runtime),
     },
     recordDelegated: async (scope, queueCursor) => recordDelegatedFix(scope, queueCursor),
     load: async (scope) => {
@@ -154,7 +357,14 @@ export function createProductionReviewFixServices(
           issueDescription = (await provider.findByKey(row.issue_identifier))?.description ?? null;
         } catch { /* Legacy's fallback text is also valid when the tracker is unavailable. */ }
       }
-      return { closed, pending: loadPendingReviewFixFeedback(scope, issueDescription),
+      // Over-budget feedback is a non-launch outcome: leave every finding pending, admit
+      // nothing, and log only the bounded category. Throwing here would put the journaled
+      // ctx.run into Restate's unbounded retry of a deterministic failure.
+      const inspected = inspectPendingReviewFixFeedback(scope, issueDescription);
+      if (inspected.status === "incomplete") {
+        console.warn(`[review-fix] ${scope.repository}#${scope.prNumber} not launched: ${inspected.reason}`);
+      }
+      return { closed, pending: inspected.status === "ready" ? inspected.feedback : null,
         fixer: fixerFor(mapping),
         jobTimeoutMinutes: mapping.maxJobMinutes ?? DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES };
     },

@@ -226,6 +226,22 @@ export async function cancelInvocation(adminBaseUrl: string, id: string): Promis
   if (!response.ok) throw new Error(`cancel of invocation ${id} failed: HTTP ${response.status}`);
 }
 
+/** Kills one invocation through the admin API (`PATCH /invocations/<id>/kill`): no `finally` runs and callers attached to it see a 409. */
+export async function killInvocation(adminBaseUrl: string, id: string): Promise<void> {
+  const response = await fetch(`${adminBaseUrl}/invocations/${encodeURIComponent(id)}/kill`, { method: "PATCH" });
+  if (!response.ok) throw new Error(`kill of invocation ${id} failed: HTTP ${response.status}`);
+}
+
+/** Overwrites one Virtual Object state entry through the admin API, to plant a marker shape an older release wrote. */
+export async function setObjectState(adminBaseUrl: string, service: string, key: string, stateKey: string, value: unknown): Promise<void> {
+  const response = await fetch(`${adminBaseUrl}/services/${encodeURIComponent(service)}/state`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ object_key: key, new_state: { [stateKey]: [...Buffer.from(JSON.stringify(value))] } }),
+  });
+  if (!response.ok) throw new Error(`state write for ${service}/${key} failed: HTTP ${response.status} ${await response.text()}`);
+}
+
 /** The one permitted wait: use it only before a NEGATIVE assertion ("nothing more
  *  happens"). Waiting for something to become true is `eventually`, never a sleep. */
 export async function settle(ms: number): Promise<void> {

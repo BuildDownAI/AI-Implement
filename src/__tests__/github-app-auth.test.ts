@@ -381,6 +381,25 @@ describe("getScopedInstallationToken", () => {
     expect(body.permissions).toBeUndefined();
   });
 
+  it("caches per-repository scoped mints separately from each other and from the broad mint", async () => {
+    const api = fakeFetch({
+      [orgInstallation("my-org")]: installation(1),
+      [mint(1)]: [token("ghs_1"), token("ghs_2"), token("ghs_3")],
+    }).install();
+    const mints = () => api.calls.filter((call) => `${call.method} ${call.path}` === mint(1)).length;
+
+    const a = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { repositories: ["repo-a"] });
+    const b = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { repositories: ["repo-b"] });
+    const broad = await getInstallationToken(APP_ID, privateKey, "my-org");
+    expect(new Set([a.token, b.token, broad]).size).toBe(3);
+    expect(mints()).toBe(3);
+
+    expect((await getScopedInstallationToken(APP_ID, privateKey, "my-org", { repositories: ["repo-a"] })).token).toBe(a.token);
+    expect((await getScopedInstallationToken(APP_ID, privateKey, "my-org", { repositories: ["repo-b"] })).token).toBe(b.token);
+    expect(await getInstallationToken(APP_ID, privateKey, "my-org")).toBe(broad);
+    expect(mints()).toBe(3);
+  });
+
   it("sends both permissions and repositories in the request body", async () => {
     const api = myOrg(token("ghs_both"));
 

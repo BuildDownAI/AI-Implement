@@ -526,7 +526,7 @@ describe("kg current run card (AII-1260)", () => {
     partTable: [{ part: "<img src=x onerror=alert(1)>", prev: "100", new: "40" }],
   };
 
-  function mount(opts: { currentRun: Run | null; stage?: string; statusOk?: boolean; decideReply?: unknown; confirm?: boolean; deployPolls?: number }) {
+  function mount(opts: { currentRun: Run | null; stage?: string; statusOk?: boolean; decideReply?: unknown; confirm?: boolean; deployPolls?: number; lastRefresh?: unknown; deployHeld?: boolean }) {
     const dom = new JSDOM(`<!DOCTYPE html><body>${kgPipelinesHtml}</body>`, { runScripts: "dangerously", url: "http://localhost/admin#kg-pipelines" });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const win = dom.window as any;
@@ -543,7 +543,7 @@ describe("kg current run card (AII-1260)", () => {
         if (opts.deployPolls && opts.deployPolls-- > 0) return { ok: false, status: 409, json: async () => ({ error: "deploy-in-progress" }) };
         if (opts.statusOk === false) return { ok: false, status: 500, json: async () => ({}) };
         const stage = opts.stage ?? (opts.currentRun ? "ingest-running" : "serving");
-        return { ok: true, status: 200, json: async () => ({ stage, servedStamp: "abc", lastRefresh: null, currentRun: opts.currentRun }) };
+        return { ok: true, status: 200, json: async () => ({ stage, servedStamp: "abc", lastRefresh: opts.lastRefresh ?? null, currentRun: opts.currentRun, ...(opts.deployHeld !== undefined ? { deployHeld: opts.deployHeld } : {}) }) };
       }
       if (url === "/api/tools/decide_kg_refresh") {
         return { ok: true, status: 200, json: async () => opts.decideReply ?? { content: [{ type: "text", text: "{}" }] } };
@@ -606,6 +606,19 @@ describe("kg current run card (AII-1260)", () => {
     expect(m.doc.getElementById("kg-refresh-badge")?.textContent).toContain("awaiting decision");
   });
 
+  it("deployHeld 200 with a held run: Accept and Cancel stay enabled, Refresh disabled, deploy notice shown", async () => {
+    const m = mount({ currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held }, stage: "awaiting-decision", deployHeld: true });
+    await m.win.loadKgStatus();
+    expect((m.doc.getElementById("kg-accept-btn") as HTMLButtonElement).disabled).toBe(false);
+    expect((m.doc.getElementById("kg-cancel-btn") as HTMLButtonElement).disabled).toBe(false);
+    expect((m.doc.getElementById("kg-refresh-btn") as HTMLButtonElement).disabled).toBe(true);
+    expect(m.visibleButtons()).toEqual(["Accept new baseline & refresh", "Cancel"]);
+    expect(m.doc.getElementById("kg-refresh-last")?.textContent).toContain("A deploy is in progress");
+    const n = mount({ currentRun: null, deployHeld: false });
+    await n.win.loadKgStatus();
+    expect(n.doc.getElementById("kg-refresh-last")?.textContent).not.toContain("deploy");
+  });
+
   it("re-enables Accept and Cancel after a deploy-in-progress poll", async () => {
     const m = mount({ currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held }, stage: "awaiting-decision", deployPolls: 1 });
     await m.win.loadKgStatus();
@@ -614,6 +627,62 @@ describe("kg current run card (AII-1260)", () => {
     await m.win.loadKgStatus();
     expect((m.doc.getElementById("kg-accept-btn") as HTMLButtonElement).disabled).toBe(false);
     expect((m.doc.getElementById("kg-cancel-btn") as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  describe("AII-1398: last-refresh text", () => {
+    const failed = { ok: false, at: 1, gate: "staging", detail: "git push failed (exit 128)", stampBefore: null, stampAfter: null };
+    const text = (m: ReturnType<typeof mount>) => m.doc.getElementById("kg-refresh-last")?.textContent ?? "";
+    const badge = (m: ReturnType<typeof mount>) => m.doc.getElementById("kg-refresh-badge") as HTMLElement;
+
+    it("a held run shows no text from the older run", async () => {
+      const m = mount({ currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held }, stage: "awaiting-decision", lastRefresh: failed });
+      await m.win.loadKgStatus();
+      expect(text(m)).toBe("Held for a decision \u2014 see the current run below");
+      expect(text(m)).not.toContain("git push failed");
+    });
+
+    it("any run in flight hides the older result", async () => {
+      const m = mount({ currentRun: { triggerId: "t", step: "ingest", decisions: [], held: null }, lastRefresh: failed });
+      await m.win.loadKgStatus();
+      expect(text(m)).not.toContain("git push failed");
+      expect(text(m)).toContain("waiting for snapshot commit");
+    });
+
+    it("operator_cancelled reads cancelled, not a gate failure", async () => {
+      const m = mount({ currentRun: null, stage: "failed", lastRefresh: { ...failed, gate: undefined, conclusion: "operator_cancelled", detail: "cancelled by operator" } });
+      await m.win.loadKgStatus();
+      expect(badge(m).textContent).toContain("cancelled");
+      expect(badge(m).className).not.toContain("fail");
+      expect(text(m)).toBe("Last refresh: cancelled by operator");
+      expect(text(m)).not.toContain('gate "?"');
+    });
+
+    it("decision_timeout reads timed out", async () => {
+      const m = mount({ currentRun: null, stage: "failed", lastRefresh: { ...failed, gate: undefined, conclusion: "decision_timeout" } });
+      await m.win.loadKgStatus();
+      expect(badge(m).textContent).toContain("timed out");
+      expect(text(m)).toBe("Last refresh: no decision within 24 h \u2014 the held PR was closed");
+    });
+
+    it("an old record without conclusion renders, omitting an empty gate", async () => {
+      const m = mount({ currentRun: null, stage: "failed", lastRefresh: { ...failed, gate: undefined } });
+      await m.win.loadKgStatus();
+      expect(badge(m).className).toContain("fail");
+      expect(text(m)).toBe("Last refresh: failed \u2014 git push failed (exit 128)");
+      const g = mount({ currentRun: null, stage: "failed", lastRefresh: failed });
+      await g.win.loadKgStatus();
+      expect(text(g)).toBe('Last refresh: failed at gate "staging" \u2014 git push failed (exit 128)');
+    });
+
+    it("a held outcome's kg-snapshot-push step renders held; otherwise failed", async () => {
+      const steps = [{ id: "kg-snapshot-push", status: "failed", startedAt: "x", endedAt: null, durationMs: null }];
+      const h = mount({ currentRun: null, stage: "failed", lastRefresh: { ...failed, held: true, steps } });
+      await h.win.loadKgStatus();
+      expect(h.doc.getElementById("kg-last-steps")?.textContent).toBe("kg-snapshot-push: held");
+      const n = mount({ currentRun: null, stage: "failed", lastRefresh: { ...failed, steps } });
+      await n.win.loadKgStatus();
+      expect(n.doc.getElementById("kg-last-steps")?.textContent).toBe("kg-snapshot-push: failed");
+    });
   });
 
   it("status failure hides the card", async () => {
@@ -653,5 +722,124 @@ describe("kg current run card (AII-1260)", () => {
     for (const gone of ["kg-dry-run-btn", "kg-accept-baseline-btn", "kg-dry-run-last", "renderKgDryRun", "last" + "DryRun", "triggerKgAcceptBaseline"]) {
       expect(src).not.toContain(gone);
     }
+  });
+});
+
+describe("kg schedule control (AII-1434)", () => {
+  const browserZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const wrap = (v: unknown) => ({ content: [{ type: "text", text: JSON.stringify(v) }] });
+
+  function mount(get: { status: number; body: unknown }, set?: { status: number; body: unknown }) {
+    const dom = new JSDOM(`<!DOCTYPE html><body>${kgPipelinesHtml}</body>`, { runScripts: "dangerously", url: "http://localhost/admin#kg-pipelines" });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const win = dom.window as any;
+    win.registerPage = () => {};
+    const calls: { url: string; body: unknown }[] = [];
+    win.api = async (url: string, init?: { body?: string }) => {
+      calls.push({ url, body: init?.body ? JSON.parse(init.body) : undefined });
+      const r = url === "/api/tools/get_pipeline_schedule" ? get : url === "/api/tools/set_pipeline_schedule" && set ? set : null;
+      if (!r) return { ok: false, status: 404, json: async () => ({}) };
+      return { ok: r.status >= 200 && r.status < 300, status: r.status, json: async () => r.body };
+    };
+    const script = dom.window.document.createElement("script");
+    script.textContent = kgPipelinesScript;
+    dom.window.document.head.appendChild(script);
+    const el = (id: string) => dom.window.document.getElementById(id) as HTMLInputElement;
+    return { win, el, calls };
+  }
+
+  it("shows off, the browser zone and 'Off' when nothing is stored", async () => {
+    const { win, el, calls } = mount({ status: 200, body: wrap({ pipeline: "kg-refresh", schedule: null, nextOccurrence: null }) });
+    await win.loadKgSchedule();
+    expect(calls[0]).toEqual({ url: "/api/tools/get_pipeline_schedule", body: { args: { pipeline: "kg-refresh" } } });
+    expect(el("kg-schedule-enabled").checked).toBe(false);
+    expect(el("kg-schedule-zone").value).toBe(browserZone);
+    expect(el("kg-schedule-next").textContent).toBe("Next run: Off");
+  });
+
+  it("shows a stored schedule and renders a refused detail as text", async () => {
+    const next = "2026-10-17T06:30:00.000Z";
+    const schedule = {
+      enabled: true, time: "06:30", zone: "Europe/Paris", lastFiredOccurrence: "x", lastStartedRunId: null,
+      lastResult: { at: "2026-10-16T06:30:00.000Z", occurrence: "x", outcome: "refused", detail: "<b>busy</b>" },
+    };
+    const { win, el } = mount({ status: 200, body: wrap({ pipeline: "kg-refresh", schedule, nextOccurrence: next }) });
+    await win.loadKgSchedule();
+    expect(el("kg-schedule-enabled").checked).toBe(true);
+    expect(el("kg-schedule-time").value).toBe("06:30");
+    expect(el("kg-schedule-zone").value).toBe("Europe/Paris");
+    expect(el("kg-schedule-next").textContent).toBe("Next run: " + new Date(next).toLocaleString());
+    const last = el("kg-schedule-last");
+    expect(last.querySelector("b")).toBeNull();
+    expect(last.textContent).toContain("refused");
+    expect(last.textContent).toContain(new Date(schedule.lastResult.at).toLocaleString());
+    expect(last.textContent).toContain("<b>busy</b>");
+  });
+
+  it("shows the run id for a started result", async () => {
+    const schedule = { enabled: true, time: "06:30", zone: "UTC", lastResult: { at: "2026-10-16T06:30:00.000Z", occurrence: "x", outcome: "started", runId: "run-42" } };
+    const { win, el } = mount({ status: 200, body: wrap({ schedule, nextOccurrence: "2026-10-17T06:30:00.000Z" }) });
+    await win.loadKgSchedule();
+    expect(el("kg-schedule-last").textContent).toContain("started");
+    expect(el("kg-schedule-last").textContent).toContain("run-42");
+  });
+
+  it("saves the patch; a 400 shows its message and keeps the typed inputs through a poll", async () => {
+    const { win, el, calls } = mount(
+      { status: 200, body: wrap({ schedule: null, nextOccurrence: null }) },
+      { status: 200, body: wrap({ status: 400, body: { error: "unknown time zone" } }) },
+    );
+    await win.loadKgSchedule();
+    el("kg-schedule-enabled").checked = true;
+    el("kg-schedule-time").value = "07:15";
+    el("kg-schedule-zone").value = "Mars/Base";
+    await win.saveKgSchedule();
+    const save = calls.find((c) => c.url === "/api/tools/set_pipeline_schedule");
+    expect(save?.body).toEqual({ args: { pipeline: "kg-refresh", patch: { enabled: true, time: "07:15", zone: "Mars/Base" } } });
+    expect(el("kg-schedule-error").textContent).toContain("unknown time zone");
+    expect(el("kg-schedule-error").hidden).toBe(false);
+    await win.loadKgSchedule();
+    expect(el("kg-schedule-enabled").checked).toBe(true);
+    expect(el("kg-schedule-time").value).toBe("07:15");
+    expect(el("kg-schedule-zone").value).toBe("Mars/Base");
+  });
+
+  it("disables Save on a 409 deploy-in-progress", async () => {
+    const { win, el } = mount(
+      { status: 200, body: wrap({ schedule: null, nextOccurrence: null }) },
+      { status: 409, body: { error: "deploy-in-progress" } },
+    );
+    await win.loadKgSchedule();
+    expect(el("btn-kg-schedule-save").disabled).toBe(false);
+    await win.saveKgSchedule();
+    expect(el("btn-kg-schedule-save").disabled).toBe(true);
+    expect(el("kg-schedule-error").textContent).toContain("A deploy is in progress");
+  });
+
+  it("disables Save when the load answers 409 deploy-in-progress", async () => {
+    const { win, el } = mount({ status: 409, body: { error: "deploy-in-progress" } });
+    await win.loadKgSchedule();
+    expect(el("btn-kg-schedule-save").disabled).toBe(true);
+  });
+
+  it("shows 'admin only' when the save answers 403 and keeps the inputs", async () => {
+    const { win, el } = mount(
+      { status: 200, body: wrap({ schedule: null, nextOccurrence: null }) },
+      { status: 403, body: { error: "forbidden" } },
+    );
+    await win.loadKgSchedule();
+    el("kg-schedule-time").value = "07:15";
+    await win.saveKgSchedule();
+    expect(el("kg-schedule-error").textContent).toBe("admin only");
+    expect(el("kg-schedule-time").value).toBe("07:15");
+  });
+
+  it("clears a stale load error once a later poll succeeds", async () => {
+    const { win, el } = mount({ status: 500, body: {} });
+    await win.loadKgSchedule();
+    expect(el("kg-schedule-error").textContent).toContain("schedule unavailable");
+    win.api = async () => ({ ok: true, status: 200, json: async () => wrap({ schedule: null, nextOccurrence: null }) });
+    await win.loadKgSchedule();
+    expect(el("kg-schedule-error").textContent).toBe("");
   });
 });

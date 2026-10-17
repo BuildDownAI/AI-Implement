@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DedupModule from "../dedup.js";
 import type * as OrchestratorSettingsModule from "../orchestrator-settings.js";
@@ -26,6 +29,7 @@ describe("getOrchestratorSettings", () => {
       kgRefreshReportIssue: null,
       kgBaseRepo: null,
       linearPickupLabel: null,
+      runnerImageAllowedPrefixes: null,
     });
   });
 
@@ -37,6 +41,7 @@ describe("getOrchestratorSettings", () => {
       kgRefreshReportIssue: null,
       kgBaseRepo: null,
       linearPickupLabel: null,
+      runnerImageAllowedPrefixes: null,
     });
   });
 });
@@ -350,5 +355,70 @@ describe("RunnerBackend cache (AII-1243)", () => {
     expect(sendSeed.mock.calls.map((c) => c[0])).toEqual(["github-actions"]);
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     await expect(settings.seedRunnerBackends({ sendSeed: async () => { throw new Error("down"); } })).resolves.toBeUndefined();
+  });
+});
+
+describe("getRunnerImageAllowedPrefixes", () => {
+  it("returns [] when no row exists", () => {
+    expect(settings.getRunnerImageAllowedPrefixes()).toEqual([]);
+  });
+
+  it("splits, trims and drops empty entries", () => {
+    settings.setOrchestratorSetting("runnerImageAllowedPrefixes", " ghcr.io/a/, ,ghcr.io/b/ ");
+    expect(settings.getRunnerImageAllowedPrefixes()).toEqual(["ghcr.io/a/", "ghcr.io/b/"]);
+  });
+
+  it("returns [] when the database read throws", async () => {
+    vi.resetModules();
+    const dbPath2 = path.join(os.tmpdir(), `orch-settings-notable-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
+    process.env.DEDUP_DB_PATH = dbPath2;
+    const dedup2 = await import("../dedup.js");
+    const settings2 = await import("../orchestrator-settings.js");
+    // initSettingsTable() deliberately skipped so the query throws.
+    expect(settings2.getRunnerImageAllowedPrefixes()).toEqual([]);
+    dedup2.closeDb();
+    try { fs.unlinkSync(dbPath2); } catch { /* ignore */ }
+  });
+});
+
+describe("seedRunnerImageAllowedPrefixesFromEnv", () => {
+  it("seeds the DB value from the env value when unset", () => {
+    settings.seedRunnerImageAllowedPrefixesFromEnv("ghcr.io/acme/");
+    expect(settings.getOrchestratorSettings().runnerImageAllowedPrefixes).toBe("ghcr.io/acme/");
+  });
+
+  it("does nothing when the env value is absent or blank", () => {
+    settings.seedRunnerImageAllowedPrefixesFromEnv(undefined);
+    settings.seedRunnerImageAllowedPrefixesFromEnv("   ");
+    expect(settings.getOrchestratorSettings().runnerImageAllowedPrefixes).toBeNull();
+  });
+
+  it("never overwrites an existing DB value", () => {
+    settings.setOrchestratorSetting("runnerImageAllowedPrefixes", "ghcr.io/set/");
+    settings.seedRunnerImageAllowedPrefixesFromEnv("ghcr.io/env/");
+    expect(settings.getOrchestratorSettings().runnerImageAllowedPrefixes).toBe("ghcr.io/set/");
+  });
+
+  it.each([
+    ["ghcr.io", "each prefix must end with \"/\""],
+    ["ghcr.io/acme", "each prefix must end with \"/\""],
+    ["ghcr.io/a*/", "each prefix may contain only letters, digits and . _ : / @ -"],
+  ])("stores nothing and logs for the invalid env value %s", (value, error) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    settings.seedRunnerImageAllowedPrefixesFromEnv(value);
+    expect(settings.getOrchestratorSettings().runnerImageAllowedPrefixes).toBeNull();
+    expect(settings.getRunnerImageAllowedPrefixes()).toEqual([]);
+    expect(warn).toHaveBeenCalledWith(`[settings] RUNNER_IMAGE_ALLOWED_PREFIXES is invalid (${error}); not seeded`);
+    warn.mockRestore();
+  });
+
+  it("stores the normalized form of a valid list", () => {
+    settings.seedRunnerImageAllowedPrefixesFromEnv(" ghcr.io/acme/ , ghcr.io/b/ ");
+    expect(settings.getOrchestratorSettings().runnerImageAllowedPrefixes).toBe("ghcr.io/acme/,ghcr.io/b/");
+  });
+
+  it("stores nothing for a comma-only env value", () => {
+    settings.seedRunnerImageAllowedPrefixesFromEnv(",,");
+    expect(settings.getOrchestratorSettings().runnerImageAllowedPrefixes).toBeNull();
   });
 });

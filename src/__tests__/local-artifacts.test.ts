@@ -1,6 +1,7 @@
-import { describe, it, expect } from "vitest";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { afterEach, describe, it, expect } from "vitest";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import {
   validateRunId,
@@ -8,7 +9,7 @@ import {
   writeRunArtifacts,
   removeRunArtifacts,
 } from "../local/artifacts.js";
-import type { LocalArtifactInput } from "../local/run-result.js";
+import { readSummaryAttribution, type LocalArtifactInput } from "../local/run-result.js";
 import { testDir } from "./helpers/test-dir.js";
 
 const VALID_ID = "550e8400-e29b-41d4-a716-446655440000";
@@ -309,5 +310,38 @@ describe("removeRunArtifacts", () => {
   it("rejects a run ID with path traversal sequences", async () => {
     const root = testDir("aii-art");
     await expect(removeRunArtifacts("abc/../def", root)).rejects.toThrow(/Invalid run ID/);
+  });
+});
+
+describe("writeRunArtifacts attribution (AII-971)", () => {
+  const attribution = {
+    version: 1 as const, invocationId: "inv-1", stage: "implementation" as const, snapshotId: "snap-1",
+    agent: "codex" as const, provider: "openai" as const, model: "gpt-synthetic", profileId: "p1",
+    authMode: "openai-api-key" as const, limit: { kind: "timeout_ms" as const, value: 60000 }, outcome: "error" as const,
+    usage: { availability: "partial" as const, tokensIn: 5, tokensOut: null, costUsd: null, costStatus: "unavailable" as const },
+  };
+  const read = async (input: LocalArtifactInput) => {
+    const root = mkdtempSync(join(tmpdir(), "attr-art-"));
+    dirs.push(root);
+    const dir = await writeRunArtifacts({ ...input, outputRoot: root });
+    return JSON.parse(readFileSync(join(dir, "summary.json"), "utf-8")) as Record<string, unknown>;
+  };
+  const dirs: string[] = [];
+  afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
+
+  it("omits the key for legacy runs", async () => {
+    expect(await read(baseInput())).not.toHaveProperty("attribution");
+  });
+
+  it("writes the sanitized attribution with null usage preserved", async () => {
+    const summary = await read(baseInput({ attribution }));
+    expect(summary.attribution).toEqual(attribution);
+    expect(readSummaryAttribution(summary)).toEqual(attribution);
+  });
+
+  it("drops invalid or credential-bearing attribution and never writes sentinels", async () => {
+    const summary = await read(baseInput({ attribution: { ...attribution, model: "sk-SYNTHETICSECRET123456" } }));
+    expect(summary).not.toHaveProperty("attribution");
+    expect(JSON.stringify(summary)).not.toContain("SYNTHETICSECRET");
   });
 });

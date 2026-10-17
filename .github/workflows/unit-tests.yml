@@ -36,13 +36,6 @@ jobs:
       # Its allowlist, with the reason for each entry, is src/__tests__/setup/ambient-env.ts.
       - run: npm test
       - run: npm run typecheck
-      - run: npx tsc --noEmit --project tsconfig.review-fix-ports-tests.json
-      - run: npx tsc --noEmit --project tsconfig.dispatch-admission-tests.json
-      - run: npx tsc --noEmit --project tsconfig.review-fix-attempt-store-tests.json
-      - run: npx tsc --noEmit --project tsconfig.review-fix-finalize-tests.json
-      - run: npx tsc --noEmit --project tsconfig.aii-806-tests.json
-      - run: npx tsc --noEmit --project tsconfig.github-tests.json
-      - run: npx tsc --noEmit --project tsconfig.auto-merge-tests.json
 
   # Restate harness (AII-612): src/__tests__/restate/**/*.restate.test.ts on the
   # `restate-server` binary from node_modules — the runtime the orchestrator sidecar
@@ -70,5 +63,3 @@ jobs:
       - run: npm ci
       - name: npm run test:restate pass ${{ matrix.pass }} of 3
         run: npm run test:restate
-      - run: npx tsc --noEmit --project tsconfig.restate-tests.json
-        if: matrix.pass == 1

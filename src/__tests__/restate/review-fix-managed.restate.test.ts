@@ -1,0 +1,384 @@
+// Managed Codex review-fix on GHA (AII-1444), against the real `restate-server` binary and the *production*
+// composition: `createProductionReviewFixServices` (PR coordinator, attempt workflow, SQLite store, finalizer, GitHub
+// adapter, `GithubReviewFixWorker` with the protected managed preparation) and a real model-auth runtime. Only the
+// external boundaries are synthetic: GitHub's HTTP surface and workflow dispatch. It proves the runtime wiring
+// ReviewFixPR admission -> protected worker -> authenticated result -> current-head check -> finalizer, that a stale
+// head, a cancelled attempt and a late result never approve, that occupancy is held until the run is confirmed
+// terminal, and that no grant, bearer, run token or credential reaches a journal value.
+//
+// Engine evidence, not live-pilot evidence: the live TEST rollout is a separate step after merge.
+import fs from "node:fs";
+import { createHash } from "node:crypto";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import type { DispatchInputs } from "../../github.js";
+import { __clearWorkflowProbeCacheForTests } from "../../workflow-probe.js";
+import { getDb } from "../../dedup.js";
+import { getMappings, initMappingsTable, upsertMapping } from "../../config.js";
+import { initDispatchBreakerTable } from "../../dispatch-breaker.js";
+import { initSettingsTable } from "../../runner-mode.js";
+import { initLogTable } from "../../log.js";
+import * as profiles from "../../agent-config-store.js";
+import { createModelAuthRuntime, type ModelAuthRuntime } from "../../model-auth-runtime.js";
+import { createProductionReviewFixServices } from "../../restate/review-fix-production.js";
+import { SqliteReviewFixAttemptStore } from "../../review-fix-attempt-store.js";
+import { decodeTrustedRunConfig } from "../../run-config.js";
+import { upsertReviewFinding } from "../../review-ledger-store.js";
+import { enqueueReviewFix } from "../../review-fix-queue.js";
+import { recordReviewFixCycleSummary } from "../../review-fix-evidence.js";
+import { handleRunnerResult, ReviewFixIntakeUnavailableError } from "../../runner-callback.js";
+import type { ResultIntakeOutcome, ReviewFixResultMetadataV1, ScopedPrIdentity } from "../../review-fix-contract.js";
+import { createReviewFixIngressClient, reviewFixResultForwardKey, reviewFixResultIntakeFromForward } from "../../restate/review-fix-client.js";
+import type { ReviewFixAttemptCompletion } from "../../restate/review-fix-attempt.js";
+import type { ProviderRegistry } from "../../providers/registry.js";
+import type { RestateEnvironment } from "./harness.js";
+import { attachWorkflow, callWorkflow, eventually, journalEntries, journalText, queryInvocations, startRetryEnabled } from "./harness.js";
+
+const SECRET = "SYNTHETIC-managed-token-secret";
+const ACCESS = "SYNTHETIC-managed-model-access";
+const CONFIG = { githubAppId: "1", githubAppPrivateKey: "synthetic-key", runnerTokenSecret: SECRET,
+  runnerCallbackBaseUrl: "https://orchestrator.example", sessionImage: "ghcr.io/builddownai/runner:next", runnerImageExplicit: false };
+
+const state = vi.hoisted(() => ({
+  dispatched: [] as Array<Record<string, unknown>>,
+  nextRunId: 9_500,
+  workflow: "",
+  omitRunId: false,
+  listed: [] as Array<{ id: number; run_attempt: number; display_title: string; head_branch: string }>,
+}));
+
+vi.mock("../../github-app-auth.js", () => ({
+  getInstallation: async () => ({ token: "SYNTHETIC-github-token", installationId: 7 }),
+  getInstallationToken: async () => "SYNTHETIC-github-token",
+  getInstallationId: async () => 7,
+  getScopedInstallationToken: async () => ({ token: "SYNTHETIC-github-token", installationId: 7, expiresAt: "" }),
+}));
+vi.mock("../../github.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../github.js")>()),
+  getDefaultBranchFileText: async (_t: string, _o: string, _r: string, file: string) =>
+    file === ".github/workflows/claude-implement.yml" ? state.workflow : null,
+  getPullRequestState: async () => ({ state: "open", merged: false }),
+  postWorkflowDispatch: async ({ inputs }: { inputs: DispatchInputs }) => {
+    state.dispatched.push(inputs as unknown as Record<string, unknown>);
+    const runId = state.nextRunId++;
+    return state.omitRunId ? { success: true, status: 204, outcome: "accepted" as const } : { success: true, status: 204, outcome: "accepted" as const, runId };
+  },
+}));
+
+const realFetch = globalThis.fetch;
+const heads = new Map<number, string>();
+const comments = new Map<number, string[]>();
+const runs = new Map<number, { status: string; conclusion: string | null }>();
+const cancelled: number[] = [];
+
+function sha(seed: string): string {
+  return createHash("sha256").update(seed).digest("hex").slice(0, 40);
+}
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
+
+/** GitHub's HTTP surface for acme/app; everything else (Restate ingress and admin) uses the real fetch. */
+const githubFetch: typeof fetch = async (input, init) => {
+  const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+  if (url.hostname === "127.0.0.1" || url.hostname === "localhost") return realFetch(input as never, init);
+  const method = (init?.method ?? "GET").toUpperCase();
+  const path = url.pathname;
+  let m: RegExpExecArray | null;
+  if ((m = /\/pulls\/(\d+)$/.exec(path))) {
+    const pr = Number(m[1]);
+    return json({ state: "open", draft: false, merged: false, mergeable: true, mergeable_state: "clean", head: { sha: heads.get(pr) } });
+  }
+  if ((m = /\/issues\/(\d+)\/comments$/.exec(path))) {
+    const pr = Number(m[1]);
+    if (method === "POST") {
+      comments.set(pr, [...(comments.get(pr) ?? []), (JSON.parse(String(init?.body ?? "{}")) as { body: string }).body]);
+      return json({}, 201);
+    }
+    return json((comments.get(pr) ?? []).map((body) => ({ body })));
+  }
+  if (/\/pulls\/\d+\/reviews$/.test(path)) return json([]);
+  if (/\/check-runs$/.test(path)) return json({ total_count: 0, check_runs: [] });
+  if (/\/commits\/[0-9a-f]{40}\/status$/.test(path)) return json({ state: "success", total_count: 0 });
+  if ((m = /\/actions\/runs\/(\d+)\/cancel$/.exec(path))) { cancelled.push(Number(m[1])); return json({}, 202); }
+  if ((m = /\/actions\/runs\/(\d+)$/.exec(path))) {
+    const run = runs.get(Number(m[1])) ?? { status: "in_progress", conclusion: null };
+    return json({ ...run, run_attempt: 1 });
+  }
+  if (/\/actions\/workflows\//.test(path)) return json({ workflow_runs: state.listed });
+  if (path.includes("/contents/.github/workflows/")) {
+    return json({ type: "file", encoding: "base64", content: Buffer.from(state.workflow).toString("base64") });
+  }
+  if (path.includes("/contents/.ai-implement/image.yml")) return new Response(null, { status: 404 });
+  return json({ visibility: "private" });
+};
+
+function scope(prNumber: number): ScopedPrIdentity {
+  return { installationId: 7, repository: "acme/app", prNumber };
+}
+
+describe("Restate managed Codex review-fix on GHA: production composition", () => {
+  let env: RestateEnvironment;
+  let runtime: ModelAuthRuntime;
+  let store: SqliteReviewFixAttemptStore;
+
+  beforeAll(async () => {
+    vi.stubEnv("RUNNER_TOKEN_SECRET", SECRET);
+    vi.stubEnv("RUNNER_MODE", "gha");
+    vi.stubGlobal("fetch", githubFetch);
+    state.workflow = fs.readFileSync("workflows/claude-implement.yml", "utf8");
+    getDb();
+    initMappingsTable();
+    initDispatchBreakerTable();
+    initLogTable();
+    initSettingsTable();
+    runtime = createModelAuthRuntime({ config: CONFIG, env: { RUNNER_TOKEN_SECRET: SECRET }, fetchImpl: githubFetch });
+    profiles.saveAccountProfileRevision({ profileId: "cdx", identity: "cdx", revision: 1, agent: "codex", provider: "openai",
+      authMode: "codex-subscription", allowedProjectKeys: ["AII"] });
+    expect(runtime.sessionStore.writePlanRecord({ profileId: "cdx", expectedSequence: null, sessionData: JSON.stringify({
+      version: 1, email: "synthetic@example.com", issuer: "https://auth.openai.com", subject: "cdx", clientId: "synthetic",
+      extAgentHostId: "synthetic", idToken: "synthetic-id", accessToken: ACCESS, refreshToken: "synthetic-refresh",
+      tokenType: "Bearer", scopes: ["chatgpt.tokens.use.direct"], accessTokenExpiresAt: Date.now() + 3_600_000,
+      earliestRefreshAt: null, savedAt: Date.now(),
+    }) }).ok).toBe(true);
+    const stage = { agent: "codex" as const, provider: "openai" as const, model: "gpt-6-luna", accountProfileId: "cdx", invocationTimeoutMs: 60_000 };
+    profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } });
+    profiles.setProjectOptIn("AII", true);
+    upsertMapping("AII", {
+      workflowFile: "claude-implement.yml", defaultBranch: "main", maxInProgressAiIssues: 3, executionMode: "github-actions",
+      sessionMode: "autonomous", machineCpus: 2, machineMemoryMb: 4096, planningEnabled: false, planningWorkflowFile: "",
+      autoApprovePlans: true, autoMerge: false, extraEnv: {}, provider: "anthropic", ticketingProvider: "linear",
+      ticketingConfig: { kind: "linear" }, awsRegion: null, paused: false, maxTurns: null, maxIterations: null,
+      maxJobMinutes: null, branchPrefix: null, skillsRepo: null, sensitiveAddPatterns: null, sensitiveAllowPatterns: null,
+      dependencyTokenScope: null, memoryProviderId: null, referenceRepos: null, reviewers: null,
+      owner: "acme", repo: "app", reviewFixLifecycle: "restate",
+    });
+    expect(getMappings().AII?.reviewFixLifecycle).toBe("restate");
+    store = new SqliteReviewFixAttemptStore();
+    const services = createProductionReviewFixServices(CONFIG, {} as ProviderRegistry, store, undefined, runtime);
+    env = await startRetryEnabled(services);
+  }, 60_000);
+
+  afterAll(async () => {
+    await env?.stop();
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  /** Seeds one real open finding plus its queue event, then delivers feedback through the real ingress client. */
+  async function admit(prNumber: number): Promise<{ attemptId: string; prepared: NonNullable<Awaited<ReturnType<typeof store.getPreparedAttempt>>> }> {
+    heads.set(prNumber, sha(`head-${prNumber}`));
+    const findingId = upsertReviewFinding({ repo: "acme/app", prNumber, source: "review-contract", severity: "medium", body: `finding for ${prNumber}` });
+    enqueueReviewFix({ issueId: `acme/app#${prNumber}`, issueIdentifier: null, repo: "acme/app", prNumber, reason: "changes_requested",
+      findingIds: [findingId], sourceEventId: `managed-${prNumber}` });
+    const out = await createReviewFixIngressClient(env.baseUrl()).feedback(scope(prNumber), undefined, { idempotencyKey: `managed-feedback-${prNumber}` });
+    expect(out.status).toBe("accepted");
+    const attemptId = await eventually(
+      () => (getDb().prepare("SELECT attempt_id AS id FROM review_fix_attempts WHERE repository = ? AND pr_number = ?")
+        .get("acme/app", prNumber) as { id: string } | undefined)?.id,
+      (id) => id !== undefined, { timeoutMs: 20_000, label: "managed attempt admitted" }) as string;
+    const prepared = (await store.getPreparedAttempt(attemptId))!;
+    return { attemptId, prepared };
+  }
+
+  async function launched(count: number): Promise<{ bearer: string; tokens: string[]; runId: number; config: ReturnType<typeof decodeTrustedRunConfig> }> {
+    await eventually(() => state.dispatched.length, (n) => n >= count, { timeoutMs: 20_000, label: "managed dispatch" });
+    const inputs = state.dispatched[count - 1];
+    const config = decodeTrustedRunConfig(String(inputs.run_config));
+    const grant = config.credentials?.modelAuthGrant;
+    if (!grant || !("bearer" in grant)) throw new Error("expected a plain GHA model-auth bootstrap");
+    const tokens = [config.credentials?.resultToken, config.credentials?.progressToken, config.credentials?.publicationToken]
+      .filter((t): t is string => typeof t === "string" && t.length > 0);
+    return { bearer: grant.bearer, tokens, runId: state.nextRunId - 1, config };
+  }
+
+  function resultFor(prepared: { attemptId: string; scope: ScopedPrIdentity; deadlineAt: number }, runId: number, outputCommit: string): ReviewFixResultMetadataV1 {
+    return { version: 1, attemptId: prepared.attemptId as ReviewFixResultMetadataV1["attemptId"], ...prepared.scope, deadlineAt: prepared.deadlineAt,
+      githubRunId: runId, githubRunAttempt: 1, outputCommit };
+  }
+
+  /** The authenticated runner result callback, forwarded over the ingress exactly as `onReviewFixResult` does. */
+  async function deliver(resultToken: string, result: ReviewFixResultMetadataV1) {
+    const ingress = createReviewFixIngressClient(env.baseUrl());
+    return handleRunnerResult({
+      authorization: `Bearer ${resultToken}`, secret: SECRET,
+      body: { phase: "gap-analysis", outcome: "success", comments: [], reviewFix: result },
+      resolveProvider: async () => null,
+      onReviewFixResult: async (validated): Promise<ResultIntakeOutcome> => {
+        const out = await ingress.result(validated.attemptId, validated, { idempotencyKey: reviewFixResultForwardKey(validated) });
+        const outcome = reviewFixResultIntakeFromForward(validated.attemptId, out);
+        if (!outcome) throw new ReviewFixIntakeUnavailableError();
+        return outcome;
+      },
+    });
+  }
+
+  function recordCycle(prepared: { attemptId: string; findings: ReadonlyArray<{ findingKey: string }> }, commit: string): void {
+    expect(recordReviewFixCycleSummary({
+      attemptId: prepared.attemptId, cycle: 1, inputCommit: sha("input"), outputCommit: commit,
+      dispositions: prepared.findings.map((f) => ({ findingKey: f.findingKey, disposition: "addressed" as const })),
+      tests: { passed: 1 }, verdict: "passed", usage: { tokens: 10 }, completedAt: Date.now(),
+    }).status).toBe("recorded");
+  }
+
+  async function journalsOf(attemptId: string, prNumber: number): Promise<string> {
+    const admin = env.adminAPIBaseUrl();
+    const rows = [
+      ...await queryInvocations(admin, `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${attemptId}'`),
+      ...await queryInvocations(admin, `target_service_name = 'ReviewFixPR' AND target_service_key LIKE '%${prNumber}%'`),
+    ];
+    const text: string[] = [];
+    for (const row of rows) text.push(journalText(await journalEntries(admin, row.id as string)));
+    return text.join("\n");
+  }
+
+  const occupancy = (attemptId: string) => (getDb().prepare("SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?")
+    .get(attemptId) as { released_at: number | null } | undefined)?.released_at ?? null;
+  const grants = (attemptId: string) => (getDb().prepare("SELECT count(*) AS n FROM model_credential_grants WHERE dispatch_id = ?")
+    .get(attemptId) as { n: number }).n;
+
+  it("admits through the PR coordinator, launches the protected worker once, approves only the exact current head, and journals no credential", async () => {
+    const before = state.dispatched.length;
+    const { attemptId, prepared } = await admit(42);
+    const launch = await launched(before + 1);
+    expect(state.dispatched).toHaveLength(before + 1);
+    // The frozen snapshot is the selected Codex account; the attempt, not a top-level input, carries the run identity.
+    expect(launch.config.agentConfig?.stages.implementation.accountProfileId).toBe("cdx");
+    expect(launch.config.credentials?.modelAuthContext).toMatchObject({ dispatchId: attemptId, projectKey: "AII", backend: "gha" });
+    expect(launch.tokens).toHaveLength(3);
+    for (const key of ["run_token", "run_progress_token", "run_publication_token"]) expect(state.dispatched[before][key] ?? "").toBe("");
+    expect(grants(attemptId)).toBe(1);
+    expect(occupancy(attemptId)).toBeNull();
+
+    // Journals are read while the attempt waits for its result: the launch step is the one that held the bearer.
+    const waiting = await journalsOf(attemptId, 42);
+    for (const secret of [launch.bearer, ...launch.tokens, ACCESS, SECRET]) expect(waiting).not.toContain(secret);
+
+    const commit = heads.get(42)!;
+    recordCycle(prepared, commit);
+    expect(await deliver(launch.config.credentials!.resultToken!, resultFor(prepared, launch.runId, commit)))
+      .toMatchObject({ status: 200, body: { outcome: "stored" } });
+    // The result alone neither approves nor frees the slot: the run must be confirmed terminal first.
+    expect(comments.get(42) ?? []).toHaveLength(0);
+    expect(occupancy(attemptId)).toBeNull();
+    runs.set(launch.runId, { status: "completed", conclusion: "success" });
+    const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
+    expect(done).toMatchObject({ status: "finalized", approval: "applied" });
+    expect(comments.get(42) ?? []).toHaveLength(1);
+    expect(occupancy(attemptId)).not.toBeNull();
+    expect(state.dispatched).toHaveLength(before + 1);
+
+    // A result arriving after the final outcome is stale and approves nothing further.
+    const late = await callWorkflow<ResultIntakeOutcome>(env.baseUrl(), "ReviewFixAttempt", attemptId, "result",
+      resultFor(prepared, launch.runId, sha("late-commit")));
+    expect(late.status).toBe("stale");
+    expect(comments.get(42) ?? []).toHaveLength(1);
+
+    const finalText = await journalsOf(attemptId, 42);
+    for (const secret of [launch.bearer, ...launch.tokens, ACCESS, SECRET]) expect(finalText).not.toContain(secret);
+  }, 90_000);
+
+  it("keeps the model-auth grant for an accepted 204 with no run id, reconciles the exact run, and finalizes", async () => {
+    const before = state.dispatched.length;
+    state.omitRunId = true;
+    let attemptId: string; let prepared: Awaited<ReturnType<typeof admit>>["prepared"];
+    try { ({ attemptId, prepared } = await admit(46)); await eventually(() => state.dispatched.length, (n) => n >= before + 1, { timeoutMs: 20_000, label: "managed dispatch" }); }
+    finally { state.omitRunId = false; }
+    const runId = state.nextRunId - 1;
+    const launch = await launched(before + 1);
+    // GitHub accepted the launch but returned no identity: the grant survives, nothing was dispatched twice.
+    expect(grants(attemptId)).toBe(1);
+    expect(getDb().prepare("SELECT count(*) AS n FROM model_credential_grants WHERE dispatch_id = ? AND revoked_at IS NOT NULL").get(attemptId)).toEqual({ n: 0 });
+    expect(occupancy(attemptId)).toBeNull();
+    state.listed = [{ id: runId, run_attempt: 1, display_title: `Review fix · attempt ${attemptId}`, head_branch: "main" }];
+
+    const { createModelAuthRoutes } = await import("../../model-auth-routes.js");
+    const routes = createModelAuthRoutes({ runtime, onFly: false, requestPlanRefresh: async () => {} });
+    const http = await import("node:http");
+    const server = http.createServer((req, res) => { void routes.handle(req, res); });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const port = (server.address() as { port: number }).port;
+      const response = await realFetch(`http://127.0.0.1:${port}/runner/model-auth/checkout`, {
+        method: "POST", headers: { authorization: `Bearer ${launch.bearer}`, "content-type": "application/json" },
+        body: JSON.stringify({ version: 1, profileId: "cdx" }),
+      });
+      expect(response.status).toBe(200);
+    } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
+
+    const commit = heads.get(46)!;
+    recordCycle(prepared, commit);
+    await eventually(async () => (await deliver(launch.config.credentials!.resultToken!, resultFor(prepared, runId, commit))).body,
+      (body) => (body as { outcome?: string }).outcome === "stored", { timeoutMs: 30_000, label: "result stored after reconcile" });
+    runs.set(runId, { status: "completed", conclusion: "success" });
+    const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
+    expect(done).toMatchObject({ status: "finalized", approval: "applied" });
+    expect(occupancy(attemptId)).not.toBeNull();
+    expect(state.dispatched).toHaveLength(before + 1);
+    state.listed = [];
+    const text = await journalsOf(attemptId, 46);
+    for (const secret of [launch.bearer, ...launch.tokens, ACCESS, SECRET]) expect(text).not.toContain(secret);
+  }, 120_000);
+
+  it("withholds approval when the PR head moved after the accepted result", async () => {
+    const before = state.dispatched.length;
+    const { attemptId, prepared } = await admit(43);
+    const launch = await launched(before + 1);
+    const commit = heads.get(43)!;
+    recordCycle(prepared, commit);
+    expect(await deliver(launch.config.credentials!.resultToken!, resultFor(prepared, launch.runId, commit)))
+      .toMatchObject({ status: 200, body: { outcome: "stored" } });
+    heads.set(43, sha("moved-head"));
+    runs.set(launch.runId, { status: "completed", conclusion: "success" });
+    const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
+    expect(done.status).toBe("finalized");
+    expect(done).not.toMatchObject({ approval: "applied" });
+    expect(comments.get(43) ?? []).toHaveLength(0);
+    expect(occupancy(attemptId)).not.toBeNull();
+  }, 90_000);
+
+  it("a cancelled attempt revokes authority, holds occupancy until the run is terminal, and a late result never approves", async () => {
+    const before = state.dispatched.length;
+    const { attemptId, prepared } = await admit(44);
+    const launch = await launched(before + 1);
+    await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "cancel", { attemptId });
+    await eventually(() => cancelled.includes(launch.runId), Boolean, { timeoutMs: 10_000, label: "run cancel requested" });
+    const revoked = getDb().prepare("SELECT authority_revoked_at FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as { authority_revoked_at: number | null };
+    expect(revoked.authority_revoked_at).not.toBeNull();
+    expect(occupancy(attemptId)).toBeNull(); // the backend has not confirmed the stop yet
+
+    const commit = heads.get(44)!;
+    recordCycle(prepared, commit);
+    const late = await deliver(launch.config.credentials!.resultToken!, resultFor(prepared, launch.runId, commit));
+    expect(late.body).not.toMatchObject({ outcome: "stored" });
+    expect(occupancy(attemptId)).toBeNull();
+
+    runs.set(launch.runId, { status: "completed", conclusion: "cancelled" });
+    const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
+    expect(done).toMatchObject({ status: "finalized", approval: "not_applicable" });
+    expect(comments.get(44) ?? []).toHaveLength(0);
+    expect(occupancy(attemptId)).not.toBeNull();
+    expect(state.dispatched).toHaveLength(before + 1);
+    const text = await journalsOf(attemptId, 44);
+    for (const secret of [launch.bearer, ...launch.tokens, ACCESS]) expect(text).not.toContain(secret);
+  }, 90_000);
+
+  it("fails the queue row and dispatches nothing when the managed template lacks attempt transport", async () => {
+    const dispatchedBefore = state.dispatched.length;
+    const good = state.workflow;
+    state.workflow = good.replace(/^(\s{2,})run_attempt_token:\s*$/m, "$1renamed_input:");
+    expect(state.workflow).not.toBe(good);
+    __clearWorkflowProbeCacheForTests(); // the probe caches a capable template for minutes
+    try {
+      heads.set(45, sha("head-45"));
+      const findingId = upsertReviewFinding({ repo: "acme/app", prNumber: 45, source: "review-contract", severity: "medium", body: "finding for 45" });
+      const queueId = enqueueReviewFix({ issueId: "acme/app#45", issueIdentifier: null, repo: "acme/app", prNumber: 45,
+        reason: "changes_requested", findingIds: [findingId], sourceEventId: "managed-45" });
+      expect((await createReviewFixIngressClient(env.baseUrl()).feedback(scope(45), undefined, { idempotencyKey: "managed-feedback-45" })).status).toBe("accepted");
+      await eventually(
+        () => (getDb().prepare("SELECT status FROM review_fix_queue WHERE id = ?").get(queueId) as { status: string }).status,
+        (status) => status === "failed", { timeoutMs: 20_000, label: "queue row failed" });
+      expect(getDb().prepare("SELECT count(*) AS n FROM review_fix_attempts WHERE pr_number = 45").get()).toEqual({ n: 0 });
+      expect(state.dispatched).toHaveLength(dispatchedBefore);
+    } finally { state.workflow = good; __clearWorkflowProbeCacheForTests(); }
+  }, 60_000);
+});

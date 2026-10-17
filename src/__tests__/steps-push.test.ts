@@ -8,6 +8,7 @@ import type { FailureRecord } from "../pipeline/failure-classification.js";
 import { makeContext as makeBaseContext, makeFeedbackLoopOutputs } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type ReplyInit, type Routes } from "./helpers/fake-fetch.js";
 import { githubError } from "./helpers/github-replies.js";
+import { makeSnapshot } from "./configured-run-fixture.js";
 
 vi.mock("node:child_process", () => ({
   spawnSync: vi.fn(),
@@ -534,6 +535,32 @@ describe("pushStep", () => {
     expect(prRequest(fake).body).toContain("provider: anthropic");
   });
 
+  it("footer names the implementation stage harness and provider for a configured Codex run", async () => {
+    mockGitSuccess();
+    const fake = fakeFetch({ [CREATE_PR]: created(1) }).install();
+
+    // The fixture's implementation stage is Codex on OpenAI.
+    const agentConfig = makeSnapshot();
+    await pushStep.run(makeContext({ model: "gpt-6-luna", provider: "anthropic", agentConfig }), BASE_INPUTS, new NoopStepReporter());
+
+    const body = prRequest(fake);
+    expect(body.body).toContain("Generated with AI-Implement · harness: Codex · model: gpt-6-luna · provider: openai");
+    expect(body.body).not.toContain("harness: Claude Code");
+    expect(body.body).not.toContain("provider: anthropic");
+  });
+
+  it("footer keeps Claude Code and shows the stage provider for a configured Bedrock run", async () => {
+    mockGitSuccess();
+    const fake = fakeFetch({ [CREATE_PR]: created(1) }).install();
+
+    const snapshot = makeSnapshot();
+    const agentConfig = { ...snapshot, stages: { ...snapshot.stages, implementation: { ...snapshot.stages.implementation, agent: "claude", provider: "bedrock" } } } as const;
+    await pushStep.run(makeContext({ model: "m", provider: "bedrock", agentConfig }), BASE_INPUTS, new NoopStepReporter());
+
+    const body = prRequest(fake);
+    expect(body.body).toContain("harness: Claude Code · model: m · provider: bedrock");
+  });
+
   it("footer includes Bedrock ARN-style model ID verbatim", async () => {
     mockGitSuccess();
     const fake = fakeFetch({ [CREATE_PR]: created(1) }).install();
@@ -961,13 +988,69 @@ describe("pushStep draft PRs", () => {
     expect(body.body).toContain("Run notes");
     expect(body.body).toContain("partial changes were preserved");
     // The column is specifically the implement call's spawn attempts (not review's).
-    expect(body.body).toContain("| Pass | Implement outcome | Turns | Implement attempts | Cost | Review |");
+    expect(body.body).toContain("| Pass | Implement outcome | Turns / limit | Implement attempts | Cost | Tokens | Review |");
     // The test-plan line must not read as a review rejection on a provider outage — the
     // reviewer may never have run at all (BAC-27201).
     expect(body.body).toContain("- [ ] Automated verification was skipped — the model provider was unavailable and the run was interrupted.");
     expect(body.body).toContain(`${"- [ ] Automated verification was skipped — the model provider was unavailable and the run was interrupted."}\n\n${TEST_VERDICT_SENTENCE}\n`);
     expect(body.body).not.toContain("the review loop did not approve this change");
     expect(body.body).not.toContain("Automated verification was run by the AI-Implement pipeline before opening this PR.");
+  });
+
+  it("shows an implement invocation failure code next to the review verdict in the pass table", async () => {
+    mockGitSuccess("abc123");
+    const fake = fakeFetch({ [CREATE_PR]: created(9) }).install();
+
+    await pushStep.run(
+      makeContext(),
+      {
+        ...BASE_INPUTS, draft: true,
+        reviewSummary: {
+          ...REVIEW_SUMMARY,
+          passes: [
+            { iteration: 1, implementTurns: 3, implementOutcome: "success", costUsd: 1, reviewApproved: false },
+            { iteration: 2, implementTurns: 4, implementOutcome: "error", implementFailureCode: "LLM_TERMINAL_ERROR", costUsd: 1, reviewApproved: true },
+          ],
+        },
+      },
+      new NoopStepReporter(),
+    );
+
+    const body = prRequest(fake);
+    expect(body.body).toContain("| 1 | success | 3 |");
+    expect(body.body).toContain("| 2 | error (LLM_TERMINAL_ERROR) | 4 |");
+    expect(body.body).toMatch(/\| 2 \| error \(LLM_TERMINAL_ERROR\).*\| approved \|/);
+  });
+
+  it("renders Codex turns as unavailable and missing cost as unavailable in the unapproved table (AII-113)", async () => {
+    mockGitSuccess("abc123");
+    const fake = fakeFetch({ [CREATE_PR]: created(9) }).install();
+
+    await pushStep.run(
+      makeContext(),
+      {
+        ...BASE_INPUTS, draft: true,
+        reviewSummary: {
+          ...REVIEW_SUMMARY,
+          passes: [
+            {
+              iteration: 1, implementTurns: 7, implementOutcome: "success", costUsd: null, reviewCostUsd: null, reviewApproved: false,
+              tokensIn: 10, tokensOut: 20,
+              attribution: {
+                version: 1, invocationId: "inv-1", stage: "implementation", snapshotId: "snap-1", agent: "codex", provider: "openai",
+                model: "m", profileId: null, authMode: "codex-subscription",
+                limit: { kind: "timeout_ms", value: 600000 }, outcome: "success", usage: null,
+              },
+            },
+          ],
+        },
+      },
+      new NoopStepReporter(),
+    );
+
+    const body = prRequest(fake);
+    expect(body.body).toContain("| 1 | success | n/a (native turn count unavailable); limit 600s timeout | 1 | unavailable | in 10 / out 20 | rejected |");
+    expect(body.body).not.toContain("$0.00");
   });
 
   it("titles a provider_unavailable 422 non-draft fallback as an interruption, not an unapproved rejection", async () => {

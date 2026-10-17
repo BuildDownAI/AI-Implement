@@ -83,6 +83,8 @@ Currently grantable: Issues, Pipelines, Pull requests, Blockers, Reports, Pipeli
 
 **A grant admits exact paths by `GET`, and nothing else.** Prefix matching is deliberately unsupported, because a prefix would also grant sub-paths added under it later — the opposite of failing closed. The useful consequence is that every mutating route stays Admin-only for free: `DELETE /api/dedup/{id}` is refused for a user holding the Audit grant, without anyone having to enumerate it.
 
+**A page grant can include a read path that another page also uses, and granting that page then exposes that data too.** The current case: the Reports grant includes `/api/log`, the read behind the Pipelines page's Jobs card, so the Reports page can show the Agent attribution card. A user granted only Reports can therefore read the whole job log. The operator accepted this on 2026-10-09 ([AII-972](https://linear.app/eudoxus/issue/AII-972/show-agent-attribution-and-usage-availability-in-reports), PR #963); it is a decision, not an accident. Before adding a shared path to a grant, check what else that path returns.
+
 ### What grants do not restrict
 
 **Page grants govern the admin UI. They do not govern what a user can read.** User-role `/mcp` reads are open to every allowlisted identity — a `user` granted nothing still reaches the project inventory, fleet report, tenant health, runner mode, and in-flight jobs. "Granted nothing" therefore means "no admin pages", never "sees nothing", and an operator deciding what to grant should treat user-role MCP reads as the floor rather than the ceiling. Privileged read tools, such as review-fix attempt/activity inspection, may still require `admin`. What a `user` cannot do over `/mcp` is write: the few write tools that exist there are on a declared list in `src/mcp.ts`, each with a required role resolved on every call, and everything else that mutates stays on the admin API (see [mcp-server.md](mcp-server.md), ADR 015).
@@ -200,3 +202,16 @@ It holds no architectural responsibility, which is what keeps the deprecated pat
 **Per-person grants.** The grant set is global: every `user` on an orchestrator sees the same pages. The table is keyed on the page alone, so distinguishing two users means a schema change, not a setting.
 
 **Re-pointing a bound entry in one step.** Today it takes a remove-then-add pair of saves, and binding state is never shown on the page. Surfacing which entries are bound, and letting a save clear a binding explicitly, are both open.
+
+## Model-account and stage-configuration admin API (AII-962)
+
+Admin-only: none of these paths is in `PAGE_ROUTES`, so a granted non-admin gets 403 on every one of them (a grant never reaches a non-GET anyway).
+
+| Route | Purpose |
+|---|---|
+| `GET` / `POST /api/model-accounts`, `PATCH /api/model-accounts/:id` | Profile list (safe projection plus readiness) and revision writes. Bodies carry metadata and a protected `credentialRef` only; any other key (`apiKey`, `session`, `token`, ...) is a 400. Reads never return `credentialRef`. |
+| `GET` / `PUT /api/agent-defaults` | Orchestrator stage defaults. Validated against profiles in one transaction. |
+| `GET` / `PUT /api/mappings/:key/agent-config` | Project opt-in (`enabled`) and partial stage overrides. A supplied field replaces the stored one, `null` returns it to inheritance, omitted fields stay. |
+| `GET /api/mappings/:key/agent-config/resolved` | Actual values, per-field sources, resolution failure code, account readiness (`ready`, `sign-in required`, `refresh failed (transient)`, `missing`, `unknown`), and session recovery state for `claude-subscription` only. |
+
+Ordinary mapping CRUD never reads `enabled` or `agentConfig`. Opt-in calls `inspectAgentReadiness` for the backend dispatch would use (`deps.agentConfig`, bound in `src/index.ts`) and refuses with 409/422 and a fixed code. GitHub Actions opt-in answers `unsupported_backend` until managed GHA credentials land (AII-1420/AII-970); template codes name the existing workflow sync. Claude subscription profiles cannot be opted in. Readiness is validated **before** anything is committed: the candidate project config is resolved read-only (`resolveCandidateProjectStageConfig`) and passed to `inspectAgentReadiness(request, deps, candidate)`, so a pending or refused inspection leaves the opt-in, config head and revision untouched. SQLite is synchronous, so no transaction spans the await; instead `readStageInputsFingerprint` (defaults head, project head, every profile's head revision, status and permissions) is taken before inspecting and re-checked inside the committing transaction (`setProjectStageConfig(..., expectedInputs)`). If any input moved, the PUT answers 409 `stale_inputs` and writes nothing, so stale readiness never overwrites a newer accepted write. PUTs for one project are also serialised. Dispatch checks readiness again.

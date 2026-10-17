@@ -4,6 +4,8 @@ import { projectsHtml, projectsScript } from "../pages/projects.js";
 import type { RepoMapping } from "../../config.js";
 import { makeMapping } from "../../__tests__/helpers/builders.js";
 
+type Mapping = Record<string, unknown>;
+
 function escapeText(value: unknown): string {
   return String(value == null ? "" : value)
     .replace(/&/g, "&amp;")
@@ -459,5 +461,239 @@ describe("projects page review process and trusted review authors", () => {
     win.api = async () => ({ ok: false, status: 400, json: async () => ({ error }) });
     await save(win);
     expect(doc.getElementById("md-error")?.textContent).toContain(error);
+  });
+});
+
+describe("projects page agents tab", () => {
+  const defaults = {
+    configured: true,
+    mode: "configured",
+    stages: Object.fromEntries(
+      ["planning", "implementation", "review"].map((stage) => [
+        stage,
+        { agent: "codex", provider: "openai", model: "gpt-default", accountProfileId: "acct-1", invocationTimeoutMs: 600000 },
+      ]),
+    ),
+  };
+  const account = (overrides: Mapping = {}): Mapping => ({
+    profileId: "acct-1",
+    identity: "Team key",
+    revision: 1,
+    agent: "codex",
+    provider: "openai",
+    authMode: "openai-api-key",
+    allowedProjectKeys: ["AII"],
+    profileStatus: "active",
+    account: { readiness: "ready", failureCode: null },
+    ...overrides,
+  });
+
+  function mountAgents(opts: { stored?: Mapping; accounts?: Mapping[]; put?: { status: number; body: Mapping } } = {}) {
+    const m = mountProjects(makeMapping({ executionMode: "fly-machines" }));
+    const calls: { url: string; method: string; body: unknown }[] = [];
+    const base = m.win.api;
+    m.win.api = async (url: string, init?: { method?: string; body?: string }) => {
+      const method = init?.method ?? "GET";
+      calls.push({ url, method, body: init?.body ? JSON.parse(init.body) : undefined });
+      if (url === "/api/mappings/AII/agent-config" && method === "GET") {
+        return { ok: true, status: 200, json: async () => ({ projectKey: "AII", enabled: false, mode: "legacy", stages: {}, ...opts.stored }) };
+      }
+      if (url === "/api/agent-defaults") return { ok: true, status: 200, json: async () => defaults };
+      if (url === "/api/model-accounts") return { ok: true, status: 200, json: async () => ({ accounts: opts.accounts ?? [account()] }) };
+      if (url === "/api/mappings/AII/agent-config" && method === "PUT") {
+        const r = opts.put ?? { status: 200, body: { enabled: true, stages: {} } };
+        return { ok: r.status < 400, status: r.status, json: async () => r.body };
+      }
+      return base(url, init);
+    };
+    return { ...m, calls };
+  }
+
+  async function open(m: ReturnType<typeof mountAgents>) {
+    await m.win.loadMappings();
+    m.win.openMappingDialog("AII");
+    await m.win.agentConfigLoaded();
+  }
+
+  function fire(doc: Document, el: Element) {
+    el.dispatchEvent(new doc.defaultView!.Event("change", { bubbles: true }));
+  }
+  const field = (doc: Document, kind: "mode" | "value", stage: string, f: string) =>
+    doc.querySelector<HTMLInputElement & HTMLSelectElement>(`[data-ag-${kind}][data-stage="${stage}"][data-field="${f}"]`)!;
+  const preview = (doc: Document, stage: string, f: string) => doc.querySelector(`[data-ag-preview="${stage}.${f}"]`)!.textContent;
+  const puts = (m: ReturnType<typeof mountAgents>) => m.calls.filter((c) => c.method === "PUT");
+
+  it("previews the override and restores the inherited value on clear, sending only changed fields", async () => {
+    const m = mountAgents();
+    await open(m);
+    expect(preview(m.doc, "review", "model")).toContain("gpt-default (source: orchestrator default)");
+
+    const mode = field(m.doc, "mode", "review", "model");
+    mode.value = "override";
+    fire(m.doc, mode);
+    const input = field(m.doc, "value", "review", "model");
+    input.value = "gpt-custom";
+    input.dispatchEvent(new m.doc.defaultView!.Event("input", { bubbles: true }));
+    expect(preview(m.doc, "review", "model")).toContain("gpt-custom (source: project)");
+    expect(puts(m)).toHaveLength(0);
+
+    await m.win.saveAgentConfig();
+    expect(puts(m)).toHaveLength(1);
+    expect(puts(m)[0]).toMatchObject({ url: "/api/mappings/AII/agent-config", body: { stages: { review: { model: "gpt-custom" } } } });
+    expect(m.calls.some((c) => c.url === "/api/agent-defaults" && c.method !== "GET")).toBe(false);
+  });
+
+  it("does not show claude/anthropic in disabled inherited agent and provider controls", async () => {
+    const m = mountAgents();
+    await open(m);
+    const agent = field(m.doc, "value", "review", "agent");
+    const provider = field(m.doc, "value", "review", "provider");
+    expect(agent.disabled).toBe(true);
+    expect(agent.value).toBe("codex");
+    expect(provider.value).toBe("openai");
+
+    const mode = field(m.doc, "mode", "review", "agent");
+    mode.value = "override";
+    fire(m.doc, mode);
+    const seeded = field(m.doc, "value", "review", "agent");
+    expect(seeded.disabled).toBe(false);
+    expect(seeded.value).toBe("codex");
+    await m.win.saveAgentConfig();
+    const body = puts(m)[0]?.body as { stages?: Record<string, Record<string, unknown>> } | undefined;
+    expect(body?.stages?.review?.provider).toBeUndefined();
+    expect(body?.stages?.review?.agent ?? "codex").toBe("codex");
+  });
+
+  it("sends null when an override is cleared and shows the inherited value", async () => {
+    const m = mountAgents({ stored: { enabled: true, mode: "configured", stages: { review: { model: "gpt-custom" } } } });
+    await open(m);
+    expect(preview(m.doc, "review", "model")).toContain("(source: project)");
+    const mode = field(m.doc, "mode", "review", "model");
+    mode.value = "inherit";
+    fire(m.doc, mode);
+    expect(preview(m.doc, "review", "model")).toContain("gpt-default (source: orchestrator default)");
+    await m.win.saveAgentConfig();
+    expect(puts(m)[0].body).toEqual({ stages: { review: { model: null } } });
+  });
+
+  it("blocks the PUT when an override is left blank or the timeout is not a positive integer", async () => {
+    const m = mountAgents();
+    await open(m);
+    const mode = field(m.doc, "mode", "review", "model");
+    mode.value = "override";
+    fire(m.doc, mode);
+    const blank = field(m.doc, "value", "review", "model");
+    blank.value = "   ";
+    blank.dispatchEvent(new m.doc.defaultView!.Event("input", { bubbles: true }));
+    await m.win.saveAgentConfig();
+    expect(puts(m)).toHaveLength(0);
+    expect(m.doc.getElementById("md-agents-error")!.textContent).toContain("Model is blank");
+
+    const mode2 = field(m.doc, "mode", "review", "model");
+    mode2.value = "inherit";
+    fire(m.doc, mode2);
+    const tmode = field(m.doc, "mode", "review", "invocationTimeoutMs");
+    tmode.value = "override";
+    fire(m.doc, tmode);
+    const tin = field(m.doc, "value", "review", "invocationTimeoutMs");
+    tin.value = "";
+    tin.dispatchEvent(new m.doc.defaultView!.Event("input", { bubbles: true }));
+    await m.win.saveAgentConfig();
+    expect(puts(m)).toHaveLength(0);
+    expect(m.doc.getElementById("md-agents-error")!.textContent).toContain("positive whole number");
+  });
+
+  it("lists only active, permitted, compatible profiles and shows readiness and recovery", async () => {
+    const m = mountAgents({
+      accounts: [
+        account(),
+        account({ profileId: "acct-off", profileStatus: "disabled" }),
+        account({ profileId: "acct-other", allowedProjectKeys: ["OTHER"] }),
+        account({ profileId: "acct-claude", agent: "claude", provider: "anthropic", authMode: "claude-subscription", account: { readiness: "sign-in required", failureCode: "authentication_required", sessionRecovery: { state: "recovery_required", recoveryRequired: true } } }),
+        account({ profileId: "acct-bad", identity: "<img src=x onerror=alert(1)>", account: { readiness: "missing", failureCode: "x" } }),
+      ],
+    });
+    await open(m);
+    const mode = field(m.doc, "mode", "planning", "accountProfileId");
+    mode.value = "override";
+    fire(m.doc, mode);
+    const options = Array.from(field(m.doc, "value", "planning", "accountProfileId").querySelectorAll("option")).map((o) => o.value);
+    expect(options).toEqual(["", "acct-1", "acct-bad"]);
+    const panel = m.doc.querySelector('[data-md-panel="agents"]')!;
+    expect(panel.querySelector("img")).toBeNull();
+    const text = panel.textContent!;
+    expect(text).toContain("readiness: sign-in required (authentication_required)");
+    expect(text).toContain("session recovery: recovery_required, recovery required");
+    expect(text).toContain("readiness: missing (x)");
+  });
+
+  it("blocks opt-in when a stage profile is not eligible", async () => {
+    const m = mountAgents({ accounts: [account({ allowedProjectKeys: ["OTHER"] })] });
+    await open(m);
+    const box = m.doc.getElementById("md-agents-enabled") as HTMLInputElement;
+    box.checked = true;
+    fire(m.doc, box);
+    await m.win.saveAgentConfig();
+    expect(puts(m)).toHaveLength(0);
+    expect(box.checked).toBe(false);
+    expect(m.doc.getElementById("md-agents-error")!.textContent).toContain("Cannot enable");
+  });
+
+  it.each([
+    [422, "claude_subscription_unsupported", "Claude subscription"],
+    [409, "unsupported_backend", "GitHub Actions"],
+    [409, "readiness_unavailable", "Readiness could not be checked"],
+    [503, "readiness_unavailable", "Readiness could not be checked"],
+    [409, "stale_inputs", "refreshed"],
+    [422, "resolution_failed", "do not resolve"],
+  ])("leaves the opt-in unchecked and shows fixed copy for %i %s", async (status, code, copy) => {
+    const m = mountAgents({ put: { status, body: { error: "<b>raw</b> secret-ish", code } } });
+    await open(m);
+    const box = m.doc.getElementById("md-agents-enabled") as HTMLInputElement;
+    box.checked = true;
+    fire(m.doc, box);
+    await m.win.saveAgentConfig();
+    expect(puts(m)[0].body).toEqual({ enabled: true });
+    expect(box.checked).toBe(false);
+    const err = m.doc.getElementById("md-agents-error")!;
+    expect(err.textContent).toContain(copy);
+    expect(err.textContent).not.toContain("raw");
+  });
+
+  it("shows the action string for GitHub Actions template codes", async () => {
+    const m = mountAgents({ put: { status: 409, body: { code: "runner_incompatible", action: "Run the existing workflow sync." } } });
+    await open(m);
+    const box = m.doc.getElementById("md-agents-enabled") as HTMLInputElement;
+    box.checked = true;
+    fire(m.doc, box);
+    await m.win.saveAgentConfig();
+    expect(m.doc.getElementById("md-agents-error")!.textContent).toContain("Run the existing workflow sync.");
+  });
+
+  it("has no credential input, issue override, and states scope copy", async () => {
+    const m = mountAgents();
+    await open(m);
+    const panel = m.doc.querySelector('[data-md-panel="agents"]')!;
+    expect(panel.querySelector('input[type="password"]')).toBeNull();
+    expect(panel.textContent).not.toMatch(/token|api key|secret/i);
+    expect(panel.textContent).toContain("apply to the next run");
+    expect(panel.textContent).toContain("Prompts and review rules stay in the repository");
+    expect(panel.textContent).toContain("no per-issue override");
+  });
+
+  it("disables the Agents tab for a new mapping and issues no agent requests", async () => {
+    const m = mountAgents();
+    await m.win.loadMappings();
+    m.win.openMappingDialog();
+    expect((m.doc.getElementById("md-tab-agents") as HTMLButtonElement).disabled).toBe(true);
+    expect(m.calls.some((c) => c.url.includes("agent-config"))).toBe(false);
+  });
+
+  it("leaves the mapping save payload free of agent fields", async () => {
+    const m = mountAgents();
+    await open(m);
+    await save(m.win);
+    expect(JSON.stringify(m.posts[0])).not.toMatch(/agent|stages/i);
+    expect(puts(m)).toHaveLength(0);
   });
 });

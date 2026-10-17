@@ -1,9 +1,8 @@
 /**
  * Behavioral tests for `src/dispatch-admission.ts` (AII-775). Exercises the module
  * directly against a temp SQLite file from the shared `testDb` harness.
- * `npm run typecheck` excludes `src/__tests__` and vitest strips types without
- * checking them, so the `prepare` synchronous-only contract is additionally
- * type-checked explicitly via `npx tsc --noEmit -p tsconfig.dispatch-admission-tests.json`.
+ * Vitest strips types without checking them, so the `prepare` synchronous-only
+ * contract is type-checked by `npm run typecheck` (its `tsconfig.tests.json` pass).
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import type * as AdmissionModule from "../dispatch-admission.js";
@@ -349,7 +348,7 @@ describe("acquire — synchronous prepare", () => {
 });
 
 describe("acquire — prepare type contract", () => {
-  it("rejects an async prepare callback at compile time (checked via tsconfig.dispatch-admission-tests.json)", () => {
+  it("rejects an async prepare callback at compile time (checked via npm run typecheck)", () => {
     const callWithAsyncPrepare = () =>
       admission.acquire(
         issueRequest({ dispatchId: "type-check-only" }),

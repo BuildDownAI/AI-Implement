@@ -155,6 +155,21 @@ const STEP: Step = {
   logs_url: null,
 };
 
+const validAttribution = () => ({
+  version: 1,
+  invocationId: "inv-1",
+  stage: "implementation",
+  snapshotId: "snap-1",
+  agent: "codex",
+  provider: "openai",
+  model: "gpt-synthetic",
+  profileId: null,
+  authMode: "codex-subscription",
+  limit: { kind: "timeout_ms", value: 60000 },
+  outcome: "error",
+  usage: { availability: "unavailable", tokensIn: null, tokensOut: null, costUsd: null, costStatus: "unavailable" },
+});
+
 describe("handleRunnerResult — auth", () => {
   it("returns 401 when Authorization header is missing", async () => {
     const res = await runnerCallback.handleRunnerResult({
@@ -1265,13 +1280,58 @@ describe("handleRunnerResult — implementation", () => {
       return { res, hook, dispatchId };
     }
 
-    it.each(["implementation", "gap-analysis"] as const)("submits once with the right input (%s)", async (phase) => {
+    it("submits once with the right input (implementation)", async () => {
+      const phase = "implementation";
       const { res, hook, dispatchId } = await run("i-late-" + phase, phase, { externalReviewPending: { headSha: SHA } });
       expect(res.status).toBe(200);
       expect(hook).toHaveBeenCalledTimes(1);
       expect(hook).toHaveBeenCalledWith({
         dispatchId, owner: "o", repo: "r", prNumber: 99, prUrl: "https://github.com/o/r/pull/99", headSha: SHA,
       });
+    });
+
+    function outbox() {
+      return (dedup.getDb().prepare("SELECT * FROM late_review_pending").all()) as Array<Record<string, unknown>>;
+    }
+
+    it("leaves one outbox row with the head sha when the hook reports false (AII-1362)", async () => {
+      const { dispatchId } = await run("i-late-false", "implementation", { externalReviewPending: { headSha: SHA } }, (async () => false) as never);
+      expect(outbox()).toEqual([expect.objectContaining({
+        workflow_key: dispatchId, dispatch_id: dispatchId, head_sha: SHA, attempt_id: null,
+        pr_url: "https://github.com/o/r/pull/99",
+      })]);
+    });
+
+    it("clears the outbox row at once when the first submit settled, and keeps it when the hook throws (AII-1362)", async () => {
+      await run("i-late-true", "implementation", { externalReviewPending: { headSha: SHA } }, (async () => true) as never);
+      await run("i-late-void", "implementation", { externalReviewPending: { headSha: SHA } });
+      expect(outbox()).toEqual([]);
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      await run("i-late-thr", "implementation", { externalReviewPending: { headSha: SHA } }, async () => { throw new Error("boom"); });
+      warn.mockRestore();
+      expect(outbox()).toHaveLength(1);
+    });
+
+    it("writes no outbox row and submits nothing for a gap-analysis result (AII-1362)", async () => {
+      const { hook } = await run("i-late-gap", "gap-analysis", { externalReviewPending: { headSha: SHA } }, (async () => false) as never);
+      expect(hook).not.toHaveBeenCalled();
+      expect(outbox()).toEqual([]);
+    });
+
+    it("sweep submits an initial-run outbox row with its head sha and no gapFill, then clears it (AII-1362)", async () => {
+      const { dispatchId } = await run("i-late-sweep", "implementation", { externalReviewPending: { headSha: SHA } }, (async () => false) as never);
+      const submit = vi.fn(async () => {});
+      expect(await runnerCallback.resubmitPendingGapFillReviews({ ready: () => false, submit })).toBe(0);
+      expect(submit).not.toHaveBeenCalled();
+      const failing = vi.fn(async () => false as const);
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit: failing });
+      expect(outbox()).toHaveLength(1);
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit });
+      expect(submit).toHaveBeenCalledTimes(1);
+      expect(submit).toHaveBeenCalledWith({
+        dispatchId, owner: "o", repo: "r", prNumber: 99, prUrl: "https://github.com/o/r/pull/99", headSha: SHA,
+      });
+      expect(outbox()).toEqual([]);
     });
 
     it("does not submit without the field, without prUrl, or with a malformed field", async () => {
@@ -1296,6 +1356,82 @@ describe("handleRunnerResult — implementation", () => {
       expect(thrown.res.status).toBe(absent.res.status);
       // Like every other best-effort step here, the error surfaces as a warning only.
       expect(thrown.res.body).toEqual({ ...absent.res.body, warnings: ["submitLateExternalReview: boom"] });
+    });
+  });
+
+  describe("resubmitPendingGapFillReviews (AII-1304)", () => {
+    const NOW = Date.UTC(2026, 0, 10, 12);
+    const HOUR = 3600_000;
+    function pendingRow(id: string, over: { phase?: string; prUrl?: string | null; agoMs?: number } = {}) {
+      const dispatchId = `d-${id}`;
+      const rowId = log.appendLog({
+        issueId: id, issueIdentifier: "ENG-9", teamKey: "ENG", repo: "o/r", dispatchId,
+        executionMode: "github-actions", phase: over.phase ?? "gap-analysis",
+      });
+      log.updateJobStatus(rowId, "completed", "external_review_pending", over.prUrl === undefined ? "https://github.com/o/r/pull/7" : over.prUrl);
+      return { rowId, dispatchId };
+    }
+    async function setCompleted(rowId: number, at: number) {
+      const { getDb } = await import("../dedup.js");
+      getDb().prepare("UPDATE dispatch_log SET completed_at = ? WHERE id = ?").run(at, rowId);
+    }
+
+    it("a not-ready callback leaves the row pending; the next ready tick submits once, a second submits nothing", async () => {
+      const { rowId, dispatchId } = pendingRow("i-sweep");
+      await setCompleted(rowId, NOW - HOUR);
+      const submit = vi.fn(async () => {});
+      expect(await runnerCallback.resubmitPendingGapFillReviews({ ready: () => false, submit, now: NOW })).toBe(0);
+      expect(submit).not.toHaveBeenCalled();
+      expect(log.getJobById(rowId)?.conclusion).toBe("external_review_pending");
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
+      expect(submit).toHaveBeenCalledTimes(1);
+      expect(submit).toHaveBeenCalledWith({
+        dispatchId, owner: "o", repo: "r", prNumber: 7, prUrl: "https://github.com/o/r/pull/7", gapFill: true,
+      });
+      // Idempotent through the workflow key: the real hook answers `conflict` and the row is unchanged.
+    });
+
+    it("re-submits a pending review-fix attempt with its attemptId once, then clears it (AII-1307)", async () => {
+      log.recordPendingLateReview({ workflowKey: "d-att-att-1", dispatchId: "d-att", prUrl: "https://github.com/o/r/pull/7", attemptId: "att-1" }, NOW - HOUR);
+      const submit = vi.fn(async () => {});
+      expect(await runnerCallback.resubmitPendingGapFillReviews({ ready: () => false, submit, now: NOW })).toBe(0);
+      expect(submit).not.toHaveBeenCalled();
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
+      expect(submit).toHaveBeenCalledWith({
+        dispatchId: "d-att", owner: "o", repo: "r", prNumber: 7, prUrl: "https://github.com/o/r/pull/7", gapFill: true, attemptId: "att-1",
+      });
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
+      expect(submit).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps a pending review-fix attempt when the hook reports the submit did not settle (AII-1307)", async () => {
+      log.recordPendingLateReview({ workflowKey: "d-att2-att-2", dispatchId: "d-att2", prUrl: "https://github.com/o/r/pull/7", attemptId: "att-2" }, NOW - HOUR);
+      const submit = vi.fn(async () => false);
+      expect(await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW })).toBe(0);
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
+      expect(submit).toHaveBeenCalledTimes(2);
+    });
+
+    it("respects the 24 h window", async () => {
+      const old = pendingRow("i-old");
+      const fresh = pendingRow("i-fresh");
+      await setCompleted(old.rowId, NOW - 25 * HOUR);
+      await setCompleted(fresh.rowId, NOW - 23 * HOUR);
+      const submit = vi.fn(async () => {});
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
+      expect(submit).toHaveBeenCalledTimes(1);
+      expect(submit).toHaveBeenCalledWith(expect.objectContaining({ dispatchId: fresh.dispatchId }));
+    });
+
+    it("skips approved, non-gap-fill, and PR-less rows", async () => {
+      const approved = pendingRow("i-appr");
+      log.stampJobApproved(approved.rowId, "https://github.com/o/r/pull/7");
+      const impl = pendingRow("i-impl", { phase: "implementation" });
+      const noPr = pendingRow("i-nopr", { prUrl: null });
+      for (const r of [approved, impl, noPr]) await setCompleted(r.rowId, NOW - HOUR);
+      const submit = vi.fn(async () => {});
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
+      expect(submit).not.toHaveBeenCalled();
     });
   });
 
@@ -2302,7 +2438,57 @@ describe("handleRunnerResult — gap-analysis", () => {
     ]);
   });
 
-  it("stamps runner_approved conclusion when conflict-resolution gap-analysis succeeds (no snapshot)", async () => {
+  it("writes no approval mark on gap-analysis success and submits LateExternalReview with the row's PR (AII-1291)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i", mappingTeamKey: "ENG", phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", issueIdentifier: "ENG-7", repo: "org/repo", dispatchId });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+    const hook = vi.fn(async () => {});
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "gap-analysis", outcome: "success", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+      submitLateExternalReview: hook as never,
+    });
+
+    expect(res.status).toBe(200);
+    const job = log.getJobByDispatchId(dispatchId);
+    expect(job?.status).toBe("completed");
+    expect(job?.conclusion).toBe("external_review_pending");
+    expect(job?.approved).toBe(false);
+    expect(log.getRunRecordMergeVerdict("ENG-7", "https://github.com/org/repo/pull/12")).toBe("hold");
+    expect(hook).toHaveBeenCalledTimes(1);
+    expect(hook).toHaveBeenCalledWith({
+      dispatchId, owner: "org", repo: "repo", prNumber: 12, prUrl: "https://github.com/org/repo/pull/12", gapFill: true,
+    });
+  });
+
+  it("still returns 200 and writes no mark when the LateExternalReview submit throws or is absent (AII-1291)", async () => {
+    for (const hook of [vi.fn(async () => { throw new Error("boom"); }), undefined]) {
+      const id = `i-gap-nohook-${hook ? "throw" : "absent"}`;
+      const { token, dispatchId } = runnerTokens.mintRunToken({
+        issueId: id, mappingTeamKey: "ENG", phase: "gap-analysis",
+        ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+      });
+      const jobId = log.appendLog({ issueId: id, repo: "org/repo", dispatchId });
+      log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+      const res = await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: { phase: "gap-analysis", outcome: "success", comments: [] },
+        secret: SECRET,
+        resolveProvider: makeResolve(new FakeProvider()),
+        ...(hook ? { submitLateExternalReview: hook as never } : {}),
+      });
+      expect(res.status).toBe(200);
+      expect(log.getJobByDispatchId(dispatchId)?.approved).toBe(false);
+    }
+  });
+
+  it("leaves conflict-resolution gap-analysis awaiting the external review (no snapshot)", async () => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i",
       mappingTeamKey: "ENG",
@@ -2323,8 +2509,8 @@ describe("handleRunnerResult — gap-analysis", () => {
     expect(res.status).toBe(200);
     const job = log.getJobByDispatchId(dispatchId);
     expect(job?.status).toBe("completed");
-    expect(job?.conclusion).toBe("runner_approved");
-    expect(job?.approved).toBe(true);
+    expect(job?.conclusion).toBe("external_review_pending");
+    expect(job?.approved).toBe(false);
   });
 
   it("warns when no job row exists for an approved gap-analysis result (AII-572)", async () => {
@@ -2346,7 +2532,7 @@ describe("handleRunnerResult — gap-analysis", () => {
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("no job row"));
   });
 
-  it("stamps runner_approved when review-fix gap-analysis succeeds (snapshot branch)", async () => {
+  it("resolves findings and leaves the mark to LateExternalReview when review-fix gap-analysis succeeds (snapshot branch)", async () => {
     reviewStore.upsertReviewFinding({
       repo: "org/repo",
       prNumber: 12,
@@ -2383,9 +2569,10 @@ describe("handleRunnerResult — gap-analysis", () => {
     });
 
     expect(res.status).toBe(200);
-    // Gap-fill's own post-push review approved the PR, so the approval mark is re-stamped (AII-460).
+    // AII-1291: the mark waits for the external review of the pushed head.
     const job = log.getJobByDispatchId(dispatchId);
-    expect(job?.conclusion).toBe("runner_approved");
+    expect(job?.conclusion).toBe("external_review_pending");
+    expect(job?.approved).toBe(false);
     // Findings scoped to the snapshot must still be resolved.
     expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toEqual([]);
   });
@@ -2453,10 +2640,10 @@ describe("handleRunnerResult — gap-analysis", () => {
     // Queue row must be terminalized so hasPendingConflictResolution returns false
     // and auto-merge can proceed (regression: stampJobApproved alone skipped this side effect).
     expect(commentGapfillQueue.hasPendingConflictResolution("org", "repo", 12)).toBe(false);
-    // Approval mark must still be stamped.
+    // AII-1291: the mark waits for LateExternalReview.
     const job = log.getJobByDispatchId(dispatchId);
-    expect(job?.conclusion).toBe("runner_approved");
-    expect(job?.approved).toBe(true);
+    expect(job?.conclusion).toBe("external_review_pending");
+    expect(job?.approved).toBe(false);
   });
 
   it("persists a failure record but never stamps failureCommentedAt — the callback doesn't comment for gap-analysis, so the monitor backstop must still fire (BAC-27112 follow-up)", async () => {
@@ -3294,8 +3481,12 @@ describe("handleRunnerResult — call attribution", () => {
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("result refused dispatch=unknown"));
   });
 
-  // These two consume the token and then bail, so without a line the burn is invisible.
-  it("logs a burned token on phase_mismatch", async () => {
+  const consumedAt = (dispatchId: string) =>
+    (dedup.getDb().prepare("SELECT consumed_at FROM runner_tokens WHERE dispatch_id = ?").get(dispatchId) as {
+      consumed_at: number | null;
+    }).consumed_at;
+
+  it("rejects phase_mismatch without consuming the token, and a corrected retry consumes once", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i",
@@ -3304,22 +3495,32 @@ describe("handleRunnerResult — call attribution", () => {
       ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
       secret: SECRET,
     });
+    const provider = new FakeProvider();
+    const post = (body: Record<string, unknown>) =>
+      runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: body as never,
+        secret: SECRET,
+        resolveProvider: makeResolve(provider),
+      });
 
-    const res = await runnerCallback.handleRunnerResult({
-      authorization: `Bearer ${token}`,
-      body: { phase: "implementation", outcome: "success", prUrl: "https://github.com/o/r/pull/1", comments: [] },
-      secret: SECRET,
-      resolveProvider: makeResolve(new FakeProvider()),
-    });
-
+    const res = await post({ phase: "implementation", outcome: "success", prUrl: "https://github.com/o/r/pull/1", comments: [] });
     expect(res.status).toBe(400);
     expect(res.body.error).toBe("phase_mismatch");
+    expect(consumedAt(dispatchId)).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining(`result burned dispatch=${dispatchId} reason=phase_mismatch`),
+      expect.stringContaining(`result rejected dispatch=${dispatchId} reason=phase_mismatch`),
     );
+
+    const ok = await post({ phase: "planning", outcome: "success", comments: [] });
+    expect(ok.status).toBe(200);
+    expect(consumedAt(dispatchId)).not.toBeNull();
+    const replay = await post({ phase: "planning", outcome: "success", comments: [] });
+    expect(replay.status).toBe(409);
+    expect(replay.body.error).toBe("already_consumed");
   });
 
-  it("logs a burned token on missing_prUrl", async () => {
+  it("rejects missing_prUrl without consuming the token, and a corrected retry succeeds", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i",
@@ -3328,19 +3529,66 @@ describe("handleRunnerResult — call attribution", () => {
       ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
       secret: SECRET,
     });
+    const post = (body: Record<string, unknown>) =>
+      runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: body as never,
+        secret: SECRET,
+        resolveProvider: makeResolve(new FakeProvider()),
+      });
+
+    const res = await post({ phase: "implementation", outcome: "success", comments: [] });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("missing_prUrl");
+    expect(consumedAt(dispatchId)).toBeNull();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining(`result rejected dispatch=${dispatchId} reason=missing_prUrl`),
+    );
+
+    const ok = await post({ phase: "implementation", outcome: "success", prUrl: "https://github.com/o/r/pull/1", comments: [] });
+    expect(ok.status).toBe(200);
+    expect(consumedAt(dispatchId)).not.toBeNull();
+  });
+
+  it("returns 401 missing_row for a valid token whose row was deleted", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+    dedup.getDb().prepare("DELETE FROM runner_tokens WHERE dispatch_id = ?").run(dispatchId);
 
     const res = await runnerCallback.handleRunnerResult({
       authorization: `Bearer ${token}`,
-      body: { phase: "implementation", outcome: "success", comments: [] },
+      body: { phase: "planning", outcome: "success", comments: [] },
       secret: SECRET,
       resolveProvider: makeResolve(new FakeProvider()),
     });
+    expect(res.status).toBe(401);
+    expect(res.body.error).toBe("missing_row");
+  });
 
-    expect(res.status).toBe(400);
-    expect(res.body.error).toBe("missing_prUrl");
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining(`result burned dispatch=${dispatchId} reason=missing_prUrl`),
-    );
+  it("lets only one of two concurrent valid posts win", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const post = () =>
+      runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: { phase: "planning", outcome: "success", comments: [] },
+        secret: SECRET,
+        resolveProvider: makeResolve(new FakeProvider()),
+      });
+    const results = await Promise.all([post(), post()]);
+    expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
   });
 });
 
@@ -4595,6 +4843,38 @@ describe("handleRunnerResult — cycle summary durable evidence (AII-801)", () =
     warnSpy.mockRestore();
   });
 
+  it("keeps terminal delivery when attribution is malformed, oversized or of unknown version, warning by count only", async () => {
+    const planted = "sk-SYNTHETICSECRET123456";
+    const bad = [
+      { ...validAttribution(), version: 2 },
+      { ...validAttribution(), apiKey: planted },
+      { ...validAttribution(), model: "x".repeat(5000) },
+      "not-an-object",
+    ];
+    for (const attribution of bad) {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const res = await postResult({ attribution: attribution as never });
+      expect(res.status).toBe(200);
+      const warned = warnSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(warned).toContain("Dropped 1 invalid attribution record(s)");
+      expect(warned).not.toContain(planted);
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("accepts valid attribution without warning", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const res = await postResult({ attribution: validAttribution() as never });
+    expect(res.status).toBe(200);
+    expect(warnSpy.mock.calls.join(" ")).not.toContain("attribution");
+    warnSpy.mockRestore();
+  });
+
+  it("accepts INVOCATION_TIMEOUT as a failure code with the existing error outcome", async () => {
+    const res = await postResult({ outcome: "failure", failureCode: "INVOCATION_TIMEOUT", prUrl: undefined });
+    expect(res.status).toBe(200);
+  });
+
   it("never records a cycle summary for a Legacy result with no reviewFix marker", async () => {
     const summary = baseCycleSummary();
 
@@ -4665,6 +4945,18 @@ describe("handleRunnerCycleSummary — independent pilot evidence", () => {
     expect(post(summary)).toMatchObject({ status: 200, body: { outcome: "duplicate" } });
     expect(post({ ...summary, completedAt: summary.completedAt + 1 }).status).toBe(409);
     expect(reviewFixEvidence.getReviewFixCycleSummary(attemptId, 1)?.completedAt).toBe(summary.completedAt);
+  });
+
+  it("strips malformed attribution and still records the cycle summary", () => {
+    const token = preparedToken();
+    const res = runnerCallback.handleRunnerCycleSummary({
+      authorization: `Bearer ${token}`, secret: SECRET,
+      body: { summary: { ...summary, attribution: { version: 99, model: "sk-SYNTHETICSECRET123456" } } },
+    });
+    expect(res).toMatchObject({ status: 200, body: { outcome: "recorded" } });
+    const stored = reviewFixEvidence.getReviewFixCycleSummary(attemptId, 1);
+    expect(stored?.tests).toEqual(summary.tests);
+    expect((stored as { attribution?: unknown } | null)?.attribution).toBeUndefined();
   });
 
   it("rejects unprepared credentials and oversized evidence", () => {
@@ -4979,5 +5271,194 @@ describe("handleRunnerActivity (AII-777/AII-803)", () => {
     expect(second.status).toBe(409);
     expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("conflicting activity payload"));
     errorSpy.mockRestore();
+  });
+
+  it("real store integration: a pipeline_step batch with finalSequence completes the pipeline-steps tail, and a resend is a duplicate", async () => {
+    const attemptId = "attempt-pipeline-steps";
+    const token = preparedProgressToken(attemptId);
+    const onReviewFixActivity = (batch: RunnerCallbackModule.RunnerActivityBody): RunnerCallbackModule.ActivityIntakeOutcome => {
+      const result = reviewFixEvidence.appendReviewFixActivityBatch({
+        attemptId: batch.attemptId, producerId: batch.producerId, events: batch.events, finalSequence: batch.finalSequence,
+      });
+      if (result.conflicts.length > 0) return { status: "conflict", attemptId, reason: "conflict" };
+      if (result.stored === 0 && result.duplicates > 0) return { status: "duplicate", attemptId };
+      return { status: "accepted", attemptId };
+    };
+    const stepEvent = (sequence: number, action: string, status: string) =>
+      activityEvent({
+        attemptId,
+        producerId: "pipeline-steps",
+        sequence,
+        kind: "pipeline_step",
+        action,
+        payload: JSON.stringify({ type: "custom", status, started_at: "2026-10-14T00:00:00.000Z", ended_at: null, parent_step_id: null }),
+      });
+    const body = {
+      version: 1 as const,
+      attemptId,
+      producerId: "pipeline-steps",
+      events: [stepEvent(0, "install", "running"), stepEvent(1, "install", "completed")],
+      finalSequence: 1,
+    };
+
+    const first = await runnerCallback.handleRunnerActivity({ authorization: `Bearer ${token}`, secret: SECRET, body, onReviewFixActivity });
+    expect(first.status).toBe(200);
+    expect(first.body.outcome).toBe("accepted");
+    const gaps = reviewFixEvidence.getReviewFixActivityGaps(attemptId, "pipeline-steps");
+    expect(gaps.tailComplete).toBe(true);
+    expect(gaps.ranges).toEqual([]);
+
+    const second = await runnerCallback.handleRunnerActivity({ authorization: `Bearer ${token}`, secret: SECRET, body, onReviewFixActivity });
+    expect(second.status).toBe(200);
+    expect(second.body.outcome).toBe("duplicate");
+  });
+});
+
+describe("handleRunnerResult — attribution persistence (AII-971)", () => {
+  const PLANTED = "sk-SYNTHETICSECRET123456";
+  const stage = (n: string) => ({
+    sel: { agent: "codex", provider: "openai", model: `m-${n}`, accountProfileId: `p-${n}`, invocationTimeoutMs: 60_000 },
+    src: { agent: "project", provider: "project", model: "project", accountProfileId: "project", invocationTimeoutMs: "job-deadline" },
+    prof: { id: `p-${n}`, identity: "acct", revision: 2, agent: "codex", provider: "openai", authMode: "openai-api-key" },
+  });
+
+  function storeSnapshot(dispatchId: string, snapshotId = "snap-1") {
+    const s = { planning: stage("planning"), implementation: stage("implementation"), review: stage("review") };
+    const pick = (k: "sel" | "src" | "prof") => ({ planning: s.planning[k], implementation: s.implementation[k], review: s.review[k] });
+    dedup.getDb().prepare(
+      `INSERT INTO run_agent_config_snapshots
+         (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+       VALUES (?, ?, 'ENG', ?, ?, ?, 1)`,
+    ).run(
+      snapshotId,
+      dispatchId,
+      JSON.stringify({ stages: pick("sel"), profiles: pick("prof") }),
+      JSON.stringify(pick("src")),
+      JSON.stringify({
+        orchestratorDefault: { configRevisionId: "r1", revision: 1 },
+        project: { configRevisionId: "r2", revision: 1 },
+      }),
+    );
+  }
+
+  const claim = (over: Record<string, unknown> = {}) => ({
+    version: 1,
+    invocationId: "inv-1",
+    stage: "implementation",
+    snapshotId: "snap-1",
+    agent: "codex",
+    provider: "openai",
+    model: "m-implementation",
+    profileId: "p-implementation",
+    authMode: "openai-api-key",
+    limit: null,
+    outcome: "success",
+    usage: { availability: "complete", tokensIn: 100, tokensOut: 10, costUsd: 0.5, costStatus: "reported" },
+    ...over,
+  });
+
+  async function deliver(attribution: unknown, opts: { snapshot?: boolean; extra?: Record<string, unknown>; dispatchId?: string } = {}) {
+    const dispatchId = opts.dispatchId ?? "disp-attr";
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i", mappingTeamKey: "ENG", phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET, dispatchId,
+    });
+    if (!log.findLogIdByDispatchId(dispatchId)) {
+      log.appendLog({ issueId: "i", issueIdentifier: "ENG-1", issueTitle: "t", teamKey: "ENG", repo: "o/r", dispatchId, executionMode: "github-actions", phase: "implementation" });
+    }
+    if (opts.snapshot !== false && !dedup.getDb().prepare("SELECT 1 FROM run_agent_config_snapshots WHERE dispatch_id = ?").get(dispatchId)) {
+      storeSnapshot(dispatchId, `snap-${dispatchId}`);
+    }
+    // The claim names the dispatch's own snapshot unless a test deliberately points it elsewhere.
+    if (attribution && typeof attribution === "object" && (attribution as { snapshotId?: string }).snapshotId === "snap-1") {
+      attribution = { ...(attribution as object), snapshotId: `snap-${dispatchId}` };
+    }
+    return runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1", attribution: attribution as never, ...(opts.extra ?? {}) },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+  }
+
+  const rows = () => dedup.getDb().prepare("SELECT * FROM model_invocation_attribution").all() as Array<Record<string, string | number | null>>;
+
+  it("persists identity from the stored snapshot and reads it back on the job", async () => {
+    const res = await deliver(claim());
+    expect(res.status).toBe(200);
+    const [row] = rows();
+    expect(rows()).toHaveLength(1);
+    expect(row).toMatchObject({ stage: "implementation", profile_id: "p-implementation", profile_revision: 2, agent: "codex", provider: "openai", model: "m-implementation", auth_mode: "openai-api-key", snapshot_id: "snap-disp-attr", status: "succeeded" });
+    const job = log.getJobByDispatchId("disp-attr")!;
+    expect(job.attribution).toMatchObject({ invocationId: "inv-1", usage: { availability: "complete", tokensIn: 100, tokensOut: 10, costUsd: 0.5 } });
+  });
+
+  it("does not store a clean claim from another snapshot", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const res = await deliver(claim({ snapshotId: "other-snap" }));
+    expect(res.status).toBe(200);
+    expect(rows()).toHaveLength(0);
+    const job = log.getJobByDispatchId("disp-attr")!;
+    expect(job.attribution).toBeNull();
+    expect(job.status).toBe("completed");
+    expect(warn.mock.calls.join(" ")).toContain("not matching the dispatch snapshot");
+    expect(warn.mock.calls.join(" ")).not.toContain("invalid attribution");
+  });
+
+  it("does not store a secret-shaped claim from another snapshot", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const res = await deliver(claim({ snapshotId: "other-snap", model: PLANTED }));
+    expect(res.status).toBe(200);
+    expect(rows()).toHaveLength(0);
+    expect(log.getJobByDispatchId("disp-attr")!.attribution).toBeNull();
+    expect(warn.mock.calls.join(" ")).not.toContain(PLANTED);
+  });
+
+  it("stores the snapshot identity, not a disagreeing claim", async () => {
+    await deliver(claim({ model: "claimed-other-model", provider: "anthropic", agent: "claude" }));
+    expect(rows()[0]).toMatchObject({ model: "m-implementation", provider: "openai", agent: "codex" });
+    expect(JSON.parse(rows()[0].usage_json as string).attribution).toBe("mismatch");
+  });
+
+  it("keeps partial and unavailable usage as null, never zero or derived cost", async () => {
+    await deliver(claim({ invocationId: "inv-partial", usage: { availability: "partial", tokensIn: 5, tokensOut: null, costUsd: null, costStatus: "unavailable" } }), { dispatchId: "d-partial" });
+    await deliver(claim({ invocationId: "inv-none", usage: { availability: "unavailable", tokensIn: null, tokensOut: null, costUsd: null, costStatus: "unavailable" } }), { dispatchId: "d-none" });
+    expect(log.getJobByDispatchId("d-partial")!.attribution!.usage).toEqual({ availability: "partial", tokensIn: 5, tokensOut: null, costUsd: null, costStatus: "unavailable" });
+    expect(log.getJobByDispatchId("d-none")!.attribution!.usage).toEqual({ availability: "unavailable", tokensIn: null, tokensOut: null, costUsd: null, costStatus: "unavailable" });
+  });
+
+  it("records a timeout as timed_out with the actual limit, and no invented turns", async () => {
+    await deliver(claim({ outcome: "error", limit: { kind: "timeout_ms", value: 60000 }, usage: null }), { extra: { outcome: "failure", failureCode: "INVOCATION_TIMEOUT", prUrl: undefined } });
+    expect(rows()[0].status).toBe("timed_out");
+    expect(log.getJobByDispatchId("disp-attr")!.attribution).toMatchObject({ outcome: "error", limit: { kind: "timeout_ms", value: 60000 }, usage: { availability: "unavailable", tokensIn: null, tokensOut: null, costUsd: null, costStatus: "unavailable" } });
+    expect(rows()[0].usage_json as string).not.toContain("numTurns");
+  });
+
+  it("does not double-count a repeated invocation id", async () => {
+    await deliver(claim());
+    await deliver(claim(), { dispatchId: "disp-2" });
+    expect(rows()).toHaveLength(1);
+  });
+
+  it("keeps legacy dispatches (no snapshot) readable with no row and no inferred cost", async () => {
+    const res = await deliver(claim(), { snapshot: false });
+    expect(res.status).toBe(200);
+    expect(rows()).toHaveLength(0);
+    expect(log.getJobByDispatchId("disp-attr")!.attribution).toBeNull();
+  });
+
+  it("still completes the terminal callback when persistence throws, without echoing payload", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    dedup.getDb().exec("DROP TABLE model_invocation_attribution");
+    const res = await deliver(claim({ model: "m-implementation" }));
+    expect(res.status).toBe(200);
+    expect(warn.mock.calls.map((c) => c.join(" ")).join("\n")).toContain("Could not persist 1 attribution record");
+  });
+
+  it("never persists sentinel credentials", async () => {
+    await deliver(claim({ invocationId: PLANTED, profileId: PLANTED }));
+    await deliver(claim({ apiKey: PLANTED }), { dispatchId: "d2" });
+    expect(JSON.stringify(rows())).not.toContain(PLANTED);
+    expect(rows()).toHaveLength(0);
   });
 });

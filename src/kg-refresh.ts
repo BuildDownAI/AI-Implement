@@ -78,6 +78,10 @@ export interface RefreshOutcome {
   partTable?: Array<{ part: string; prev: string; new: string }>;
   /** Every runner step the workflow saw, in pipeline order (AII-1134); absent when the runner reported none. */
   steps?: KgRefreshStepRecord[];
+  /** Why the run ended (`operator_cancelled`, `decision_timeout`, `merge_failed`, …); absent on success and on older records. */
+  conclusion?: string;
+  /** True when the run reached the decision gate (a held snapshot PR), whatever its end; absent on older records. */
+  held?: boolean;
 }
 
 export interface KgRefreshStepRecord {

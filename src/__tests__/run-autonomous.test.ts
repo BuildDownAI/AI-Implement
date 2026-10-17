@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const isWindows = process.platform === "win32";
-import { chmodSync, mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import {
@@ -18,16 +19,32 @@ import { PipelineRunner } from "../pipeline/runner.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import { buildImplRunConfig, encodeRunConfig } from "../run-config.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
-import type { PipelineDefinition, StepModule } from "../pipeline/types.js";
+import type { PipelineContext, PipelineDefinition, StepModule, StepReporter } from "../pipeline/types.js";
 import { __resetPublicationCredentialForTests } from "../publication-credential.js";
 import { DISPOSITIONS_FILE, stableReviewFindingKey, type FindingDisposition } from "../pipeline/finding-dispositions.js";
 import { CYCLE_SUMMARY_FILE, type CycleSummary } from "../pipeline/cycle-summary.js";
 import type { GhSpawn } from "../pipeline/review-ledger.js";
 import type { ReviewFixMetadataV1 } from "../review-fix-contract.js";
 import { DEFAULT_MODEL } from "../pipeline/default-model.js";
+import { ClaudeCliExecutor } from "../pipeline/executor.js";
+import { NOW, SENTINEL_BEARER, envelopeEnv, fakeClient, makeGrant, makeSnapshot } from "./configured-run-fixture.js";
+import { GHA_CONTEXT, GHA_IMPLEMENT_WORKFLOWS, ghaGrant, ghaRunStepEnv, oldShapedRunEnv, stubRunEnv } from "./gha-handoff-fixture.js";
+import { CODEX_CHILD_GLOBAL, S_AMBIENT, S_CHATGPT, S_OPENAI, codexLoopback, installCodexChild, resetCodexChild } from "./codex-composition-fixture.js";
+import { MODEL_AUTH_ROUTES } from "../model-auth-contract.js";
+import type { ModelAuthTransport } from "../model-auth-client.js";
 import { makeExecutor, makeFeedbackLoopOutputs, makeIssue, makeMapping, makeReviewFixRunConfig } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 import { testDir } from "./helpers/test-dir.js";
+
+// Passthrough except for the `codex` command while a test installs a fake child (see codex-composition-fixture.ts).
+vi.mock("node:child_process", async (importOriginal) => {
+  const real = await importOriginal<typeof import("node:child_process")>();
+  const spawn = ((...a: Parameters<typeof real.spawn>) => {
+    const slots = (globalThis as unknown as Record<string, { spawn?: (...args: unknown[]) => unknown } | undefined>)[CODEX_CHILD_GLOBAL];
+    return a[0] === "codex" && slots?.spawn ? slots.spawn(...a) : real.spawn(...a);
+  }) as typeof real.spawn;
+  return { ...real, spawn };
+});
 
 // The orchestrator's runner routes (src/index.ts), each answered as its handler answers success.
 const RESULT = "POST /runner/result";
@@ -1405,10 +1422,116 @@ describe("runAutonomous", () => {
       });
     });
 
+    describe("attempt step reporting through the activity stream", () => {
+      function stubAttemptEnv(): void {
+        vi.stubEnv(
+          "AI_IMPLEMENT_RUN_CONFIG",
+          encodeRunConfig({
+            v: 1,
+            issue: { id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" },
+            reviewFix: REVIEW_FIX_IDENTITY,
+            runnerCallbackUrl: "https://orchestrator.example",
+          }),
+        );
+        vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+        vi.stubEnv("RUN_PROGRESS_TOKEN", "ptok");
+        vi.stubEnv("RUN_TOKEN", "run-token");
+        vi.stubEnv("GITHUB_RUN_ID", "1");
+        vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+      }
+
+      type Post = { path: string; body: { producerId?: string; events?: Array<{ kind: string; action: string; cycle: number; payload: string }>; finalSequence?: number } };
+
+      function makeRecordingFetch(posts: Post[], log?: string[]): typeof fetch {
+        return vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+          const path = new URL(String(url)).pathname;
+          const body = JSON.parse(String(init?.body ?? "{}")) as Post["body"];
+          posts.push({ path, body });
+          log?.push(`post:${path}`);
+          return { ok: true, status: 200, text: async () => "" } as Response;
+        }) as unknown as typeof fetch;
+      }
+
+      const stepPosts = (posts: Post[]) => posts.filter((p) => p.path === "/runner/activity" && p.body.producerId === "pipeline-steps");
+
+      it("posts each step to /runner/activity as a pipeline_step event and nothing to /runner/progress", async () => {
+        stubAttemptEnv();
+        const posts: Post[] = [];
+        const { pipeline, runner } = makeSingleStepPipeline("do-work", { run: vi.fn().mockResolvedValue({}) });
+
+        await runAutonomous({ workspaceDir, pipeline, runner, llmExecutor: makeExecutor(), fetchImpl: makeRecordingFetch(posts) });
+
+        expect(posts.some((p) => p.path === "/runner/progress")).toBe(false);
+        const events = stepPosts(posts).flatMap((p) => p.body.events ?? []);
+        expect(events.length).toBeGreaterThan(0);
+        for (const e of events) {
+          expect(e.kind).toBe("pipeline_step");
+          expect(e.cycle).toBe(1);
+          expect(Object.keys((JSON.parse(e.payload) as { detail: object }).detail).sort()).toEqual(["ended_at", "parent_step_id", "started_at", "status", "type"]);
+        }
+        expect(events.map((e) => (JSON.parse(e.payload) as { action: string }).action)).toContain("do-work");
+      });
+
+      it("delivers a step's event before the next step starts", async () => {
+        stubAttemptEnv();
+        const posts: Post[] = [];
+        const log: string[] = [];
+        const first: StepModule = { run: vi.fn().mockImplementation(async () => { log.push("run:first"); return {}; }) };
+        const second: StepModule = { run: vi.fn().mockImplementation(async () => { log.push("run:second"); return {}; }) };
+        const { pipeline, runner } = makeStepsPipeline([["first", first], ["second", second]]);
+
+        await runAutonomous({ workspaceDir, pipeline, runner, llmExecutor: makeExecutor(), fetchImpl: makeRecordingFetch(posts, log) });
+
+        const secondRun = log.indexOf("run:second");
+        expect(log.slice(0, secondRun)).toContain("post:/runner/activity");
+      });
+
+      it.each([
+        ["success", { run: vi.fn().mockResolvedValue({}) }],
+        ["a thrown pipeline error", { run: vi.fn().mockRejectedValue(new Error("step exploded")) }],
+      ] as Array<[string, StepModule]>)("finalizes the pipeline-steps producer on %s", async (_name, mod) => {
+        stubAttemptEnv();
+        const posts: Post[] = [];
+        const { pipeline, runner } = makeSingleStepPipeline("do-work", mod);
+
+        await runAutonomous({ workspaceDir, pipeline, runner, llmExecutor: makeExecutor(), fetchImpl: makeRecordingFetch(posts) });
+
+        const batches = stepPosts(posts);
+        expect(batches.length).toBeGreaterThan(0);
+        expect(batches[batches.length - 1].body.finalSequence).toBeTypeOf("number");
+      });
+
+      it("lets opts.reporter win over the activity step reporter", async () => {
+        stubAttemptEnv();
+        const posts: Post[] = [];
+        const reported: string[] = [];
+        const reporter: StepReporter = { report: async (s) => { reported.push(s.id); } };
+        const { pipeline, runner } = makeSingleStepPipeline("do-work", { run: vi.fn().mockResolvedValue({}) });
+
+        await runAutonomous({ workspaceDir, pipeline, runner, reporter, llmExecutor: makeExecutor(), fetchImpl: makeRecordingFetch(posts) });
+
+        expect(reported).toContain("do-work");
+        expect(stepPosts(posts)).toHaveLength(0);
+      });
+
+      it("keeps TokenStepReporter (/runner/progress) for a run that is not an attempt", async () => {
+        vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+        vi.stubEnv("RUN_PROGRESS_TOKEN", "ptok");
+        vi.stubEnv("RUN_TOKEN", "run-token");
+        const posts: Post[] = [];
+        const { pipeline, runner } = makeSingleStepPipeline("do-work", { run: vi.fn().mockResolvedValue({}) });
+
+        await runAutonomous({ workspaceDir, pipeline, runner, llmExecutor: makeExecutor(), fetchImpl: makeRecordingFetch(posts) });
+
+        expect(posts.some((p) => p.path === "/runner/progress")).toBe(true);
+        expect(stepPosts(posts)).toHaveLength(0);
+      });
+    });
+
     describe("runAutonomous finally-block wiring", () => {
       it("attempts activity shutdown from the outer finally block on a successful run", async () => {
         const shutdown = vi.fn().mockResolvedValue(undefined);
-        const fakeReporting: RunnerActivityReporting = { attemptId: "attempt-1", sink: makeNoopSink(), shutdown };
+        const fakeReporting: RunnerActivityReporting = { attemptId: "attempt-1", sink: makeNoopSink(), stepReporter: new NoopStepReporter(), shutdown };
         const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
         const { pipeline, runner } = makeSingleStepPipeline("do-work", mod);
 
@@ -1427,7 +1550,7 @@ describe("runAutonomous", () => {
 
       it("attempts activity shutdown from the outer finally block even when the pipeline throws — mirrors the always-runs teardown hook", async () => {
         const shutdown = vi.fn().mockResolvedValue(undefined);
-        const fakeReporting: RunnerActivityReporting = { attemptId: "attempt-1", sink: makeNoopSink(), shutdown };
+        const fakeReporting: RunnerActivityReporting = { attemptId: "attempt-1", sink: makeNoopSink(), stepReporter: new NoopStepReporter(), shutdown };
         const mod: StepModule = { run: vi.fn().mockRejectedValue(new Error("step exploded")) };
         const { pipeline, runner } = makeSingleStepPipeline("bad-step", mod);
 
@@ -1447,7 +1570,7 @@ describe("runAutonomous", () => {
       it("does not let a rejecting shutdown() crash the run — logged, never fatal", async () => {
         const shutdown = vi.fn().mockRejectedValue(new Error("network down"));
         const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-        const fakeReporting: RunnerActivityReporting = { attemptId: "attempt-1", sink: makeNoopSink(), shutdown };
+        const fakeReporting: RunnerActivityReporting = { attemptId: "attempt-1", sink: makeNoopSink(), stepReporter: new NoopStepReporter(), shutdown };
         const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
         const { pipeline, runner } = makeSingleStepPipeline("do-work", mod);
 
@@ -2577,6 +2700,38 @@ describe("runAutonomous", () => {
     const stats = readFileSync(join(workspaceDir, "ai-output", "comments", "95-run-stats.md"), "utf-8");
     // 0.20 + 0.05 (pass) + 0.10 (feedback-loop retries) + 0.45 (post-push review + fix)
     expect(stats).toContain("**Total cost:** $0.80");
+  });
+
+  it("labels the ticket-facing total partial when post-push review or a retry reports no cost (AII-113)", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue({
+        approved: true,
+        iterations: 1,
+        terminationReason: "approved",
+        passes: [{ iteration: 1, implementTurns: 5, implementOutcome: "success", costUsd: 0.20, reviewCostUsd: 0.05, reviewApproved: true }],
+        extraCostUsd: null,
+        extraCostUnreported: 0,
+      }) }],
+      ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/o/r/pull/20", prNumber: 20, branchPushed: true, draft: false }) }],
+      ["post-push-review", { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", costUsd: null }) }],
+    ]);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const stats = readFileSync(join(workspaceDir, "ai-output", "comments", "95-run-stats.md"), "utf-8");
+    expect(stats).toContain("**Total cost:** ≥ $0.25 (partial)");
   });
 
   it("does not report success when the post-push review rejects an internally approved PR", async () => {
@@ -3824,5 +3979,404 @@ describe("runAutonomousLocally", () => {
 
     expect(result.exitCode).toBe(1);
     expect(existsSync(join(workspaceDir, "teardown-ran.marker"))).toBe(true);
+  });
+});
+
+
+describe("configured (opted-in) autonomous runs", () => {
+  let workspaceDir: string;
+  const snap = makeSnapshot();
+
+  beforeEach(() => {
+    __resetPublicationCredentialForTests();
+    workspaceDir = mkdtempSync(join(tmpdir(), "run-autonomous-configured-"));
+    stubRequiredEnv();
+    for (const k of [
+      "ORCHESTRATOR_URL", "MACHINE_NONCE", "RUNNER_CALLBACK_URL", "RUN_TOKEN", "RUN_PROGRESS_TOKEN", "RUNNER_PHASE",
+      "PR_NUMBER", "AI_IMPLEMENT_UNTIL_STEP", "AI_IMPLEMENT_SHELL_MODE", "GITHUB_REF_NAME",
+    ]) vi.stubEnv(k, "");
+    vi.stubEnv("GITHUB_DEFAULT_BRANCH", "main");
+    vi.stubEnv("CLAUDE_MODEL", "env-claude-model");
+    vi.stubEnv("PROVIDER", "bedrock");
+  });
+
+  afterEach(() => {
+    __resetPublicationCredentialForTests();
+    vi.unstubAllEnvs();
+    rmSync(workspaceDir, { recursive: true, force: true });
+  });
+
+  function stubConfiguredEnv(): void {
+    for (const [k, v] of Object.entries(envelopeEnv(snap, makeGrant(snap)))) vi.stubEnv(k, v);
+  }
+
+  /** Captures the context the runner builds; optionally invokes the executor from inside a step. */
+  function capture(invokeStage?: "implementation" | "review") {
+    const seen: { ctx?: PipelineContext; result?: unknown } = {};
+    const { pipeline, runner } = makeSingleStepPipeline("capture", {
+      run: vi.fn(async (ctx: PipelineContext) => {
+        seen.ctx = ctx;
+        if (invokeStage) seen.result = await ctx.llmExecutor.invoke({ prompt: "p", model: "caller-model", agentStage: invokeStage });
+        return {};
+      }),
+    });
+    return { seen, pipeline, runner };
+  }
+
+  it("managed and local runs receive the same resolved stage settings, overriding every legacy model source", async () => {
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nmodel: workflow-model\n---\nDo it.\n");
+    stubConfiguredEnv();
+    const managedClient = fakeClient();
+    const m = capture();
+    const managed = await runAutonomous({
+      workspaceDir, ...m, reporter: new NoopStepReporter(),
+      configured: { modelAuthClient: managedClient, now: () => NOW },
+    });
+    const localClient = fakeClient();
+    const l = capture();
+    const local = await runAutonomousLocally({
+      workspaceDir, issueIdentifier: "AII-1", issueTitle: "t", issueDescription: "d", model: "opts-model",
+      pipeline: l.pipeline, runner: l.runner,
+      configured: {
+        agentConfig: snap, modelAuthClient: localClient, localCredentialPort: { load: vi.fn() },
+        repositories: ["acme/app"], repoTrust: async () => ({ visibility: "private", trustedForSubscription: true }),
+      },
+    });
+    expect(managed.exitCode).toBe(0);
+    expect(local.exitCode).toBe(0);
+    expect(m.seen.ctx!.data.agentConfig).toEqual(snap);
+    expect(l.seen.ctx!.data.agentConfig).toEqual(m.seen.ctx!.data.agentConfig);
+    for (const c of [m.seen.ctx!, l.seen.ctx!]) {
+      expect(c.data.model).toBe("gpt-impl");
+      expect(c.data.provider).toBe("anthropic");
+    }
+    for (const c of [m.seen.ctx!, l.seen.ctx!]) {
+      expect(JSON.stringify(c.data)).not.toContain(SENTINEL_BEARER);
+    }
+  });
+
+  it("selects the executor from the snapshot per call and passes the injected executor only as Claude", async () => {
+    stubConfiguredEnv();
+    const client = fakeClient();
+    const injected = makeExecutor();
+    const c = capture("review");
+    await runAutonomous({
+      workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected,
+      configured: { modelAuthClient: client, now: () => NOW },
+    });
+    expect(c.seen.ctx!.llmExecutor).not.toBe(injected);
+    expect(injected.invoke).toHaveBeenCalledTimes(1);
+    expect((injected.invoke as ReturnType<typeof vi.fn>).mock.calls[0][0].model).toBe("claude-review");
+    expect(client.checkout).toHaveBeenCalledTimes(1);
+    expect(client.checkout).toHaveBeenCalledWith({ profileId: "p-rev", authMode: "anthropic-api-key" });
+    expect(client.invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("finishes and disposes once on success and as failed on a thrown step", async () => {
+    stubConfiguredEnv();
+    const ok = fakeClient();
+    const c = capture("review");
+    await runAutonomous({ workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(), configured: { modelAuthClient: ok, now: () => NOW } });
+    // The capture pipeline has no approval, so the run is a coded failure, not a completion.
+    expect(ok.finish).toHaveBeenCalledTimes(1);
+    expect(ok.finish).toHaveBeenCalledWith("p-rev", "failed");
+    expect(ok.dispose).toHaveBeenCalledTimes(1);
+
+    const bad = fakeClient();
+    const { pipeline, runner } = makeSingleStepPipeline("boom", {
+      run: vi.fn(async (ctx: PipelineContext) => {
+        await ctx.llmExecutor.invoke({ prompt: "p", model: "m", agentStage: "review" });
+        throw new Error("step exploded");
+      }),
+    });
+    const r = await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(), configured: { modelAuthClient: bad, now: () => NOW } });
+    expect(r.exitCode).toBe(1);
+    expect(bad.finish).toHaveBeenCalledWith("p-rev", "failed");
+    expect(bad.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("holds instead of releasing when a child may still be live", async () => {
+    stubConfiguredEnv();
+    const client = fakeClient();
+    const live = { invoke: vi.fn().mockRejectedValue(Object.assign(new Error("still running"), { possiblyLive: true })) };
+    const { pipeline, runner } = makeSingleStepPipeline("live", {
+      run: vi.fn(async (ctx: PipelineContext) => {
+        await ctx.llmExecutor.invoke({ prompt: "p", model: "m", agentStage: "review" });
+        return {};
+      }),
+    });
+    const r = await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: live, configured: { modelAuthClient: client, now: () => NOW } });
+    expect(r.exitCode).toBe(1);
+    expect(client.finish).not.toHaveBeenCalled();
+    expect(client.dispose).not.toHaveBeenCalled();
+  });
+
+  it("rejects an invalid bootstrap before any runner, hook or executor work, even with injection", async () => {
+    const hook = join(workspaceDir, "setup-ran");
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), `---\nsetup: touch ${hook}\n---\nDo it.\n`);
+    const injected = makeExecutor();
+    const client = fakeClient();
+    const cases: Array<[string, Record<string, string>]> = [
+      ["missing grant", envelopeEnv(snap, undefined)],
+      ["expired grant", envelopeEnv(snap, makeGrant(snap, { expiresAt: NOW }))],
+      ["context mismatch", { ...envelopeEnv(snap, makeGrant(snap)), AI_IMPLEMENT_MODEL_AUTH_PROJECT_KEY: "other" }],
+    ];
+    for (const [, env] of cases) {
+      for (const [k, v] of Object.entries(env)) vi.stubEnv(k, v);
+      const c = capture();
+      await expect(
+        runAutonomous({ workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected, configured: { modelAuthClient: client, now: () => NOW } }),
+      ).rejects.toThrow(/Configured run rejected before execution/);
+      expect(c.seen.ctx).toBeUndefined();
+      vi.unstubAllEnvs();
+      stubRequiredEnv();
+    }
+    expect(injected.invoke).not.toHaveBeenCalled();
+    expect(client.checkout).not.toHaveBeenCalled();
+    expect(existsSync(hook)).toBe(false);
+  });
+
+  // ---- AII-1427: the trusted launch context arrives from the real GHA bootstrap, never from the test ----
+
+  function loopbackTransport() {
+    const hits: string[] = [];
+    const transport: ModelAuthTransport = {
+      post: vi.fn(async (route: string) => {
+        hits.push(route);
+        const body = route === MODEL_AUTH_ROUTES.checkout
+          ? { version: 1, ok: true, profileId: "p-rev", authMode: "anthropic-api-key", secret: { kind: "api-key", apiKey: "sk-synthetic-review-key-000000" } }
+          : { version: 1, ok: true, acknowledged: true };
+        return { status: 200, body };
+      }),
+    };
+    return { transport, hits };
+  }
+  const fakeCodexFactory = () => {
+    const created: string[] = [];
+    const calls: unknown[] = [];
+    const createCodex = (id: string) => {
+      created.push(id);
+      return { invoke: async (p: unknown) => (calls.push(p), { stdout: "done", exitCode: 0, tokensUsed: 1 }) };
+    };
+    return { createCodex, created, calls };
+  };
+
+  for (const file of GHA_IMPLEMENT_WORKFLOWS) {
+    describe(`GHA bootstrap handoff via ${file}`, () => {
+      let hook: string;
+      beforeEach(() => {
+        hook = join(workspaceDir, "setup-ran");
+        writeFileSync(join(workspaceDir, "WORKFLOW.md"), `---\nsetup: touch ${hook}\n---\nDo it.\n`);
+        for (const k of ["GITHUB_OWNER", "GITHUB_REPO", "GITHUB_TOKEN"]) vi.stubEnv(k, REQUIRED_ENV[k]);
+      });
+
+      it("baseline: an old-shaped Run env (envelope present, no AI_IMPLEMENT_MODEL_AUTH_*) is rejected with bootstrap_context_missing and no work", async () => {
+        const snapshot = makeSnapshot("codex-subscription");
+        const input = { snapshot, grant: ghaGrant(snapshot), callback: false };
+        // The repaired bootstrap refuses a grant without context, so the OLD environment is constructed directly.
+        expect(ghaRunStepEnv(file, input).bootStatus).toBe(1);
+        stubRunEnv(oldShapedRunEnv(file, input));
+        const { transport, hits } = loopbackTransport();
+        const codex = fakeCodexFactory();
+        const injected = makeExecutor();
+        const c = capture("implementation");
+        await expect(
+          runAutonomous({ workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected, configured: { createCodex: codex.createCodex, modelAuthTransport: transport, now: () => NOW } }),
+        ).rejects.toMatchObject({ code: "CONFIGURED_RUN_INVALID", reason: "bootstrap_context_missing" });
+        expect(c.seen.ctx).toBeUndefined();
+        expect(hits).toEqual([]);
+        expect(codex.created).toEqual([]);
+        expect(injected.invoke).not.toHaveBeenCalled();
+        expect(existsSync(hook)).toBe(false);
+      });
+
+      for (const authMode of ["codex-subscription", "openai-api-key"] as const) {
+        it(`implementation entrypoint, Codex ${authMode}: the real CodexExecutor checks out the selected profile and its child receives only that credential`, async () => {
+          const snapshot = makeSnapshot(authMode);
+          const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: GHA_CONTEXT, callback: false });
+          expect(handoff.bootStatus).toBe(0);
+          expect(handoff.githubEnv).toBe("");
+          stubRunEnv(handoff.runEnv);
+          for (const k of ["OPENAI_API_KEY", "CODEX_API_KEY", "CHATGPT_PLAN_ACCESS_TOKEN"]) vi.stubEnv(k, S_AMBIENT);
+          const { transport, checkouts, routes } = codexLoopback({ "p-plan": "anthropic-api-key", "p-impl": authMode, "p-rev": "anthropic-api-key" });
+          const child = installCodexChild("exec");
+          const injected = makeExecutor();
+          const c = capture("implementation");
+          try {
+            const result = await runAutonomous({
+              workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected,
+              configured: { modelAuthTransport: transport, now: () => NOW },
+            });
+            expect(result.exitCode).toBe(0);
+          } finally {
+            resetCodexChild();
+          }
+          // Successful stage outcome from the real executor, not the legacy Claude one.
+          expect(c.seen.result).toMatchObject({ exitCode: 0, stdout: "done" });
+          expect(injected.invoke).not.toHaveBeenCalled();
+          // Exactly one checkout, for the selected Codex profile and auth mode, then finish/release.
+          expect(checkouts).toEqual([{ profileId: "p-impl", authMode }]);
+          expect(routes()[0]).toBe(MODEL_AUTH_ROUTES.checkout);
+          expect(routes().at(-1)).toBe(MODEL_AUTH_ROUTES.finish);
+          // One `codex` child with the selected credential and nothing ambient, opposite or bootstrap-derived.
+          expect(child).toHaveLength(1);
+          expect(child[0].cmd).toBe("codex");
+          expect(child[0].args).toContain("gpt-impl");
+          const env = child[0].env;
+          const dump = JSON.stringify(env);
+          if (authMode === "codex-subscription") {
+            expect(env.CHATGPT_PLAN_ACCESS_TOKEN).toBe(S_CHATGPT);
+            expect(env.CODEX_API_KEY).toBeUndefined();
+            expect(dump).not.toContain(S_OPENAI);
+            expect(child[0].args.some((a) => a.includes("chatgpt_plan"))).toBe(true);
+          } else {
+            expect(env.CODEX_API_KEY).toBe(S_OPENAI);
+            expect(env.CHATGPT_PLAN_ACCESS_TOKEN).toBeUndefined();
+            expect(dump).not.toContain(S_CHATGPT);
+            expect(child[0].args.some((a) => a.includes("chatgpt_plan"))).toBe(false);
+          }
+          expect(env.OPENAI_API_KEY).toBeUndefined();
+          expect(dump).not.toContain(S_AMBIENT);
+          expect(dump).not.toContain(SENTINEL_BEARER);
+          expect(Object.keys(env).filter((k) => k.startsWith("AI_IMPLEMENT_") || k.startsWith("RUN_"))).toEqual([]);
+        });
+      }
+
+      it("implementation entrypoint, Claude API key stage: bootstrap-derived env drives checkout through the loopback transport", async () => {
+        const snapshot = makeSnapshot("openai-api-key");
+        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: GHA_CONTEXT, callback: false });
+        expect(handoff.bootStatus).toBe(0);
+        stubRunEnv(handoff.runEnv);
+        const { transport, hits } = loopbackTransport();
+        const injected = makeExecutor();
+        const c = capture("review");
+        await runAutonomous({
+          workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected,
+          configured: { modelAuthTransport: transport, now: () => NOW },
+        });
+        expect(hits[0]).toBe(MODEL_AUTH_ROUTES.checkout);
+        expect(injected.invoke).toHaveBeenCalledTimes(1);
+      });
+
+      const forgeries: Array<[string, Parameters<typeof ghaGrant>[1]]> = [
+        ["dispatch", { dispatchId: "other-dispatch" }],
+        ["project", { projectKey: "other-project" }],
+        ["backend", { backend: "fly" }],
+        ["snapshot", { snapshotId: "other-snapshot" }],
+      ];
+      for (const [field, over] of forgeries) {
+        it(`a grant with an altered ${field} is rejected against the independent context before any clone, hook or model work`, async () => {
+          const snapshot = makeSnapshot("codex-subscription");
+          const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot, over), context: GHA_CONTEXT, callback: false });
+          if (handoff.bootStatus !== 0) {
+            expect(handoff.runEnv).toEqual({});
+            return;
+          }
+          stubRunEnv(handoff.runEnv);
+          const { transport, hits } = loopbackTransport();
+          const codex = fakeCodexFactory();
+          const injected = makeExecutor();
+          const c = capture("implementation");
+          await expect(
+            runAutonomous({ workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected, configured: { createCodex: codex.createCodex, modelAuthTransport: transport, now: () => NOW } }),
+          ).rejects.toThrow(/Configured run rejected before execution/);
+          expect(c.seen.ctx).toBeUndefined();
+          expect(hits).toEqual([]);
+          expect(codex.created).toEqual([]);
+          expect(injected.invoke).not.toHaveBeenCalled();
+          expect(existsSync(hook)).toBe(false);
+        });
+      }
+
+      it("an altered launch context (grant unchanged) is rejected by the runner before any clone, hook or model work", async () => {
+        const snapshot = makeSnapshot("codex-subscription");
+        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: { ...GHA_CONTEXT, projectKey: "tampered" }, callback: false });
+        expect(handoff.bootStatus).toBe(0);
+        stubRunEnv(handoff.runEnv);
+        const { transport, hits } = loopbackTransport();
+        const codex = fakeCodexFactory();
+        const injected = makeExecutor();
+        const c = capture("implementation");
+        await expect(
+          runAutonomous({ workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected, configured: { createCodex: codex.createCodex, modelAuthTransport: transport, now: () => NOW } }),
+        ).rejects.toMatchObject({ reason: "bootstrap_invalid" });
+        expect(c.seen.ctx).toBeUndefined();
+        expect(hits).toEqual([]);
+        expect(codex.created).toEqual([]);
+        expect(injected.invoke).not.toHaveBeenCalled();
+        expect(existsSync(hook)).toBe(false);
+      });
+
+      it.each([
+        ["http", "http://orchestrator.invalid/model-auth"],
+        ["userinfo", "https://user:pw@orchestrator.invalid/model-auth"],
+        ["query", "https://orchestrator.invalid/model-auth?x=1"],
+      ])("an unsafe context URL (%s) is refused by the bootstrap, so the Run step never starts", (_n, modelAuthUrl) => {
+        const snapshot = makeSnapshot("codex-subscription");
+        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: { ...GHA_CONTEXT, modelAuthUrl }, callback: false });
+        expect(handoff.bootStatus).not.toBe(0);
+        expect(handoff.runEnv).toEqual({});
+        expect(handoff.githubEnv).toBe("");
+        expect(existsSync(hook)).toBe(false);
+      });
+    });
+  }
+
+  it("local: rejects a public repository or an untrusted subscription workspace before work", async () => {
+    const client = fakeClient();
+    const injected = makeExecutor();
+    for (const trust of [
+      { visibility: "public", trustedForSubscription: true },
+      { visibility: "private", trustedForSubscription: false },
+    ] as const) {
+      const l = capture();
+      await expect(
+        runAutonomousLocally({
+          workspaceDir, issueIdentifier: "AII-1", issueTitle: "t", issueDescription: "d", llmExecutor: injected,
+          pipeline: l.pipeline, runner: l.runner,
+          configured: {
+            agentConfig: makeSnapshot("codex-subscription"), modelAuthClient: client, localCredentialPort: { load: vi.fn() },
+            repositories: ["acme/app"], repoTrust: async () => trust,
+          },
+        }),
+      ).rejects.toThrow(/repository_untrusted/);
+      expect(l.seen.ctx).toBeUndefined();
+    }
+    expect(injected.invoke).not.toHaveBeenCalled();
+    expect(client.checkout).not.toHaveBeenCalled();
+  });
+
+  it("local: cleans up on setup-hook failure and on a thrown pipeline", async () => {
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nsetup: exit 3\n---\nDo it.\n");
+    const client = fakeClient();
+    const l = capture();
+    const configured = {
+      agentConfig: snap, modelAuthClient: client, localCredentialPort: { load: vi.fn() },
+      repositories: ["acme/app"], repoTrust: async () => ({ visibility: "private" as const, trustedForSubscription: true }),
+    };
+    const r = await runAutonomousLocally({ workspaceDir, issueIdentifier: "AII-1", issueTitle: "t", issueDescription: "d", pipeline: l.pipeline, runner: l.runner, configured });
+    expect(r.terminationReason).toBe("setup_failed");
+    expect(l.seen.ctx).toBeUndefined();
+    expect(client.checkout).not.toHaveBeenCalled();
+    expect(client.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("an absent snapshot preserves legacy construction and injection byte-for-byte", async () => {
+    const injected = makeExecutor();
+    const c = capture();
+    await runAutonomous({ workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected });
+    expect(c.seen.ctx!.llmExecutor).toBe(injected);
+    expect(c.seen.ctx!.data.agentConfig).toBeUndefined();
+    expect(c.seen.ctx!.data.model).toBe("env-claude-model");
+    expect(c.seen.ctx!.data.provider).toBe("bedrock");
+
+    const built = capture();
+    await runAutonomous({ workspaceDir, ...built, reporter: new NoopStepReporter() });
+    expect(built.seen.ctx!.llmExecutor).toBeInstanceOf(ClaudeCliExecutor);
+
+    const l = capture();
+    await runAutonomousLocally({ workspaceDir, issueIdentifier: "AII-1", issueTitle: "t", issueDescription: "d", llmExecutor: injected, pipeline: l.pipeline, runner: l.runner });
+    expect(l.seen.ctx!.llmExecutor).toBe(injected);
+    expect(l.seen.ctx!.data.agentConfig).toBeUndefined();
   });
 });

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   closeSync,
   mkdirSync,
@@ -334,7 +334,7 @@ describe("runtime data directory overlay", () => {
     touch(join(runtimeDir, COMPLETION_MARKER));
 
     let capturedEnv: NodeJS.ProcessEnv | undefined;
-    const spawnCapture = (cmd: string, args: string[], opts: object) => {
+    const spawnCapture = (_cmd: string, _args: string[], opts: object) => {
       capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
       return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
     };
@@ -360,7 +360,7 @@ describe("runtime data directory overlay", () => {
     const runtimeDir = join(testDir("kg-sidecar"), "nonexistent-subdir");
 
     let capturedEnv: NodeJS.ProcessEnv | undefined;
-    const spawnCapture = (cmd: string, args: string[], opts: object) => {
+    const spawnCapture = (_cmd: string, _args: string[], opts: object) => {
       capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
       return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
     };
@@ -386,7 +386,7 @@ describe("runtime data directory overlay", () => {
     const runtimeDir = testDir("kg-sidecar"); // exists but no COMPLETION_MARKER
 
     let capturedEnv: NodeJS.ProcessEnv | undefined;
-    const spawnCapture = (cmd: string, args: string[], opts: object) => {
+    const spawnCapture = (_cmd: string, _args: string[], opts: object) => {
       capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
       return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
     };
@@ -430,7 +430,7 @@ describe("nt_parts backend selection", () => {
     touch(join(runtimeDir, "parts", "issue.nt"));
 
     let capturedEnv: NodeJS.ProcessEnv | undefined;
-    const spawnCapture = (cmd: string, args: string[], opts: object) => {
+    const spawnCapture = (_cmd: string, _args: string[], opts: object) => {
       capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
       return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
     };
@@ -461,7 +461,7 @@ describe("nt_parts backend selection", () => {
     touch(join(runtimeDir, "graph.trig"));
 
     let capturedEnv: NodeJS.ProcessEnv | undefined;
-    const spawnCapture = (cmd: string, args: string[], opts: object) => {
+    const spawnCapture = (_cmd: string, _args: string[], opts: object) => {
       capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
       return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
     };
@@ -492,7 +492,7 @@ describe("nt_parts backend selection", () => {
     mkdirSync(join(runtimeDir, "parts"));
 
     const capturedEnvs: Array<NodeJS.ProcessEnv | undefined> = [];
-    const spawnCapture = (cmd: string, args: string[], opts: object) => {
+    const spawnCapture = (_cmd: string, _args: string[], opts: object) => {
       capturedEnvs.push((opts as { env?: NodeJS.ProcessEnv }).env);
       return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
     };

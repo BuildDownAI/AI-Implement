@@ -43,48 +43,48 @@ export function finalStructuredOutput(events: StreamEvent[]): unknown {
   return lastResult(events)?.structured_output;
 }
 
+const MAX_TOOL_USE_SCAN_DEPTH = 8;
+
+/** Built-in tools proven read-only; the only tool_use a retry may replay past. */
+const PROVEN_READ_ONLY_TOOLS: ReadonlySet<string> = new Set(["Read", "Glob", "Grep"]);
+
+/**
+ * Visits every `tool_use` block reachable from an `assistant` event's message,
+ * at any nesting depth, so malformed or unexpected CLI telemetry cannot hide one
+ * behind a non-array `content` or a wrapper object. A structure deeper than the
+ * scan limit is reported as an anonymous tool_use rather than trusted.
+ */
+function someToolUse(events: StreamEvent[], predicate: (block: Record<string, unknown>) => boolean): boolean {
+  const visit = (node: unknown, depth: number): boolean => {
+    if (node == null || typeof node !== "object") return false;
+    if (depth > MAX_TOOL_USE_SCAN_DEPTH) return predicate({ type: "tool_use" });
+    if (Array.isArray(node)) return node.some((child) => visit(child, depth + 1));
+    const obj = node as Record<string, unknown>;
+    if (obj.type === "tool_use" && predicate(obj)) return true;
+    return Object.values(obj).some((child) => visit(child, depth + 1));
+  };
+  return events.some((e) => e.type === "assistant" && visit(e.message, 0));
+}
+
 /**
  * Whether any `assistant` event in this attempt carried a `tool_use` block.
  * A re-spawn is a fresh session with no memory of the first attempt, so once
  * a tool has run the agent may have already edited the workspace — retrying
  * from scratch on a dirty tree could duplicate or undo that work. This is the
- * sole gate that makes a request-level retry safe.
+ * gate that makes a request-level retry safe for implementation sessions.
  */
 export function sawToolUse(events: StreamEvent[]): boolean {
-  for (const e of events) {
-    if (e.type !== "assistant") continue;
-    const msg = e.message as { content?: unknown } | undefined;
-    const content = msg?.content;
-    if (!Array.isArray(content)) continue;
-    if (content.some((block) => (block as { type?: string } | null)?.type === "tool_use")) return true;
-  }
-  return false;
+  return someToolUse(events, () => true);
 }
 
 /**
- * Whether any `assistant` event in this attempt carried a `tool_use` block
- * whose tool name starts with "Bash" — including review's allowed
- * `Bash(curl *)`, which despite being nominally read-only can still write
- * files or POST data. Used to gate a request-level retry even for a
- * `toolUseIsSafe` (review) session, where an ordinary Read/Glob/Grep tool use
- * is safe to retry past but a Bash invocation is not.
+ * Whether any `assistant` event in this attempt carried a `tool_use` block that
+ * is not a proven read-only built-in (Read, Glob, Grep). An allowlist: Edit,
+ * Write, Bash, MCP, unknown, nameless or nested tool use all count as unsafe,
+ * so a `toolUseIsSafe` (review) session only replays past known read-only use.
  */
 export function sawUnsafeToolUse(events: StreamEvent[]): boolean {
-  for (const e of events) {
-    if (e.type !== "assistant") continue;
-    const msg = e.message as { content?: unknown } | undefined;
-    const content = msg?.content;
-    if (!Array.isArray(content)) continue;
-    if (
-      content.some((block) => {
-        const b = block as { type?: string; name?: string } | null;
-        return b?.type === "tool_use" && typeof b.name === "string" && b.name.startsWith("Bash");
-      })
-    ) {
-      return true;
-    }
-  }
-  return false;
+  return someToolUse(events, (b) => typeof b.name !== "string" || !PROVEN_READ_ONLY_TOOLS.has(b.name));
 }
 
 export interface DerivedToolStart {

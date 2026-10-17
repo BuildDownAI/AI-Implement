@@ -18,25 +18,19 @@ vi.mock("../notify.js", async (importOriginal) => ({
 
 const fetchMachineLogsMock = vi.hoisted(() => vi.fn<() => Promise<string>>());
 const destroyMachineMock = vi.hoisted(() => vi.fn(async () => {}));
-const stopMachineMock = vi.hoisted(() => vi.fn(async () => {}));
 const listMachinesMock = vi.hoisted(() => vi.fn<() => Promise<import("../fly-machines.js").Machine[]>>(async () => []));
-// A session machine as Fly's API returns it, created a minute ago; its age is what a destroy records. An issue run's
-// machine by default; a kept kg-refresh runner carries the durable-runner purpose in its metadata.
-const { flyMachine, getMachineMock } = vi.hoisted(() => {
-  const flyMachine = (id: string, state = "stopped", metadata: Record<string, string> = {}): import("../fly-machines.js").Machine => {
-    const createdAt = new Date(Date.now() - 60_000).toISOString();
-    return {
-      id, name: `session-${id}`, state, region: "iad", created_at: createdAt, updated_at: createdAt,
-      config: { image: "registry.fly.io/ai-implement-sessions:latest", metadata },
-    };
+// An issue run's session machine as Fly's API returns it, created a minute ago; its age is what a destroy records.
+const getMachineMock = vi.hoisted(() => vi.fn(async (_t: string, _a: string, id: string): Promise<import("../fly-machines.js").Machine> => {
+  const createdAt = new Date(Date.now() - 60_000).toISOString();
+  return {
+    id, name: `session-${id}`, state: "stopped", region: "iad", created_at: createdAt, updated_at: createdAt,
+    config: { image: "registry.fly.io/ai-implement-sessions:latest", metadata: {} },
   };
-  return { flyMachine, getMachineMock: vi.fn(async (_t: string, _a: string, id: string) => flyMachine(id)) };
-});
+}));
 vi.mock("../fly-machines.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../fly-machines.js")>()),
   fetchMachineLogs: fetchMachineLogsMock,
   destroyMachine: destroyMachineMock,
-  stopMachine: stopMachineMock,
   getMachine: getMachineMock,
   listMachines: listMachinesMock,
 }));
@@ -853,6 +847,45 @@ describe("admin mappings", () => {
     }, token);
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toMatch(/extraEnv must be a plain object/);
+  });
+
+  describe("ephemeral full-access opt-in (AII-1437)", () => {
+    const OPT_IN = "AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS";
+    const create = async (extraEnv: Record<string, string>, extra: Record<string, unknown> = {}) => {
+      const token = await login("secret");
+      return request("/api/mappings", "POST", "secret", { teamKey: "EPH", owner: "org", repo: "eph", extraEnv, ...extra }, token);
+    };
+
+    it("accepts the exact assertion on a GitHub Actions mapping", async () => {
+      const res = await create({ [OPT_IN]: "ephemeral-runner-asserted-v1" });
+      expect(res.statusCode).toBe(202);
+      expect(JSON.parse(res.body).extraEnv).toEqual({ [OPT_IN]: "ephemeral-runner-asserted-v1" });
+    });
+
+    it.each([["true"], ["1"], [""], ["ephemeral-runner-asserted-v2"]])("rejects the value %j", async (value) => {
+      const res = await create({ [OPT_IN]: value });
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toContain(OPT_IN);
+    });
+
+    it("rejects a case variant and the reserved launch variable", async () => {
+      expect((await create({ [OPT_IN.toLowerCase()]: "ephemeral-runner-asserted-v1" })).statusCode).toBe(400);
+      expect((await create({ AI_IMPLEMENT_EXECUTION_POLICY: "v1:ephemeral-full-access:gha:a:b" })).statusCode).toBe(400);
+    });
+
+    it("rejects the opt-in on a Fly mapping", async () => {
+      const res = await create({ [OPT_IN]: "ephemeral-runner-asserted-v1" }, { executionMode: "fly-machines" });
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toContain("github-actions");
+    });
+
+    it("rejects a mode change to Fly that omits extraEnv while the opt-in is stored", async () => {
+      expect((await create({ [OPT_IN]: "ephemeral-runner-asserted-v1" })).statusCode).toBe(202);
+      const token = await login("secret");
+      const res = await request("/api/mappings", "POST", "secret", { teamKey: "EPH", owner: "org", repo: "eph", executionMode: "fly-machines" }, token);
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toContain("github-actions");
+    });
   });
 
   it("defaults provider to anthropic and awsRegion to null when omitted", async () => {
@@ -2661,6 +2694,61 @@ describe("admin settings", () => {
     expect(body.flySessionsApp.dbValue).toBeNull();
   });
 
+  describe("runnerImageAllowedPrefixes (AII-1321)", () => {
+    const post = async (token: string, body: unknown) => request("/api/settings", "POST", "secret", body as never, token);
+    const get = async (token: string) => JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
+
+    it("GET returns value, effective and builtIn with no row", async () => {
+      const token = await login("secret");
+      expect((await get(token)).runnerImageAllowedPrefixes).toEqual({
+        value: null,
+        effective: [],
+        builtIn: ["ghcr.io/builddownai/", "ghcr.io/<owner>/"],
+      });
+    });
+
+    it("POST stores a valid list joined with commas, and GET agrees", async () => {
+      const token = await login("secret");
+      const res = await post(token, { runnerImageAllowedPrefixes: " ghcr.io/a/ , ,registry.example.com:5000/team/b/ " });
+      expect(res.statusCode).toBe(200);
+      const expected = { value: "ghcr.io/a/,registry.example.com:5000/team/b/", effective: ["ghcr.io/a/", "registry.example.com:5000/team/b/"] };
+      expect(JSON.parse(res.body).runnerImageAllowedPrefixes).toMatchObject(expected);
+      expect((await get(token)).runnerImageAllowedPrefixes).toMatchObject(expected);
+    });
+
+    it.each([[null], ["   "]])("POST %j deletes the row", async (value) => {
+      const token = await login("secret");
+      await post(token, { runnerImageAllowedPrefixes: "ghcr.io/a/" });
+      const res = await post(token, { runnerImageAllowedPrefixes: value });
+      expect(res.statusCode).toBe(200);
+      expect((await get(token)).runnerImageAllowedPrefixes).toMatchObject({ value: null, effective: [] });
+    });
+
+    it.each([
+      ["a non-string", 5, "runnerImageAllowedPrefixes must be a string or null"],
+      ["over 1000 characters", "ghcr.io/" + "a".repeat(1000) + "/", undefined],
+      ["a space inside an entry", "ghcr.io/a b/", undefined],
+      ["a wildcard", "ghcr.io/a*/", undefined],
+      ["an entry without a trailing slash", "ghcr.io/acme", 'each prefix must end with "/"'],
+      ["a bare registry host", "ghcr.io/", undefined],
+      ["an empty path segment", "ghcr.io//", undefined],
+    ])("POST rejects %s with 400 and writes nothing", async (_label, value, message) => {
+      const token = await login("secret");
+      const res = await post(token, { runnerImageAllowedPrefixes: value, retryPolicy: { reviewMaxTurns: 60 } });
+      expect(res.statusCode).toBe(400);
+      if (message) expect(JSON.parse(res.body).error).toBe(message);
+      const after = await get(token);
+      expect(after.runnerImageAllowedPrefixes.value).toBeNull();
+      expect(after.retryPolicy).toEqual(after.retryPolicyDefaults);
+    });
+
+    it("POST refuses a user-role session with 403", async () => {
+      const token = adminSession.createSession({ email: "reader@eudoxus.ai", sub: "google|reader", provider: "google", name: "Reader" });
+      const res = await request("/api/settings", "POST", "secret", { runnerImageAllowedPrefixes: "ghcr.io/a/" } as never, token);
+      expect(res.statusCode).toBe(403);
+    });
+  });
+
   /** A fake Restate: `set_runner_backend` merges into `state`, and the refresh reads it back through the real cache. */
   function fakeRunnerBackend(opts: { down?: boolean } = {}) {
     const state = { app: null as string | null, region: null as string | null };
@@ -3118,6 +3206,16 @@ describe("admin machine logs", () => {
     const res = await requestWithFlyConfig("/api/sessions/machine-abc/logs", "GET", token);
     expect(res.statusCode).toBe(404);
     expect(JSON.parse(res.body).error).toBe("Logs no longer available");
+  });
+
+  it.each([401, 403])("returns a distinct 502 permission error when Fly returns %i", async (status) => {
+    fetchMachineLogsMock.mockRejectedValueOnce(new Error(`Failed to fetch logs for machine machine-abc (${status}): denied`));
+    const token = await login("secret");
+    const res = await requestWithFlyConfig("/api/sessions/machine-abc/logs", "GET", token);
+    expect(res.statusCode).toBe(502);
+    const error = JSON.parse(res.body).error as string;
+    expect(error).toMatch(/permission|credential/);
+    expect(error).not.toContain("no longer available");
   });
 
   it("returns 500 on unexpected Fly API error", async () => {
@@ -4151,7 +4249,7 @@ describe("POST /api/tools/<name>", () => {
     const fake = fakeFetch({ "POST /orchestratorTools/get_tenant_health": reply });
     const token = await login("secret");
     const res = await toolRequest(token, { args: {} }, {
-      callTool: (name, args, caller) => callTool(name, args, caller, { fetchImpl: fake.fetch, permitsExternalCall: () => true }),
+      callTool: (name, args, caller) => callTool(name, args, caller, { fetchImpl: fake.fetch, permitsExternalCall: () => true, restateReady: () => true }),
     });
     expect(fake.calls.map((call) => `${call.method} ${call.path}`)).toEqual(["POST /orchestratorTools/get_tenant_health"]);
     expect(res.statusCode).toBe(503);
@@ -5246,6 +5344,12 @@ describe("per-page grants", () => {
       expect(res.statusCode).toBe(200);
     });
 
+    it("lets a reports-granted user read /api/log for the attribution card", async () => {
+      accessGrants.savePageGrants(["reports"], "ada@eudoxus.ai");
+      const res = await request("/api/log?since=1", "GET", "secret", undefined, userSession());
+      expect(res.statusCode).toBe(200);
+    });
+
     it("leaves an admin unaffected by what is granted", async () => {
       accessGrants.savePageGrants([], "ada@eudoxus.ai");
       const res = await request("/api/mappings", "GET", "secret", undefined, adminSsoSession());
@@ -5702,78 +5806,31 @@ describe("admin sessions — kg-refresh destroy", () => {
     );
     const res = new MockResponse();
     admin.handleAdminRequest(req as never, res as never, sessionsConfig(), makeFakeRegistry(provider), {
-      // The workflow's answer to a cancel of a run it tracks (makeKgRefreshAdminDeps, src/index.ts).
-      kgRefresh: kgRefresh ?? { trigger: vi.fn(), status: vi.fn(), cancel: vi.fn(async () => ({ status: 200, body: { cancelled: true } })) },
+      kgRefresh: kgRefresh ?? { trigger: vi.fn(), status: vi.fn(), cancel: vi.fn(async () => ({ status: 409, body: { error: "no-refresh-in-flight" } })) },
     });
     await res.done;
     return { statusCode: res.statusCode, body: res.body };
   }
 
-  // A Fly kg-refresh run as the workflow records it: the row carries the trigger id and the KG repository, and its
-  // machine is the kept durable runner (kg-refresh-senders.ts), which a destroy only stops.
-  function flyKgJob(machineId: string): number {
-    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines", repo: "TestOrg/test-kg", dispatchId: `t-${machineId}` });
-    log.setJobMachineNonce(jobId, "nonce-kg");
-    log.setJobMachineId(jobId, machineId);
-    log.updateJobMachineId(jobId, machineId);
-    getMachineMock.mockImplementation(async (_t, _a, id) => flyMachine(id, "started", { purpose: "durable-runner", pipeline: "kg-refresh" }));
-    return jobId;
-  }
-
   beforeEach(() => {
     destroyMachineMock.mockReset();
-    stopMachineMock.mockReset();
     getMachineMock.mockReset();
     cancelWorkflowRunMock.mockReset();
     getInstallationTokenMock.mockReset();
     notifyTextMock.mockReset();
   });
 
-  it("stops the kept machine instead of destroying it and returns 200 for an in-flight kg-refresh job", async () => {
-    const token = await login("secret");
-    flyKgJob("m-kg-cancel");
+  type KgCancel = NonNullable<NonNullable<Parameters<typeof admin.handleAdminRequest>[4]>["kgRefresh"]>["cancel"];
+  const answers = (status: number, body: unknown) => vi.fn(async () => ({ status, body })) as unknown as KgCancel & ReturnType<typeof vi.fn>;
+  const deps = (cancel: KgCancel) => ({ trigger: vi.fn(), status: vi.fn(), cancel });
 
-    const res = await deleteSession("m-kg-cancel", token);
-
-    expect(res.statusCode).toBe(200);
-    expect(stopMachineMock).toHaveBeenCalledWith(FLY_TOKEN, FLY_APP, "m-kg-cancel");
-    expect(destroyMachineMock).not.toHaveBeenCalled();
-  });
-
-  it("stamps the job row operator_cancelled", async () => {
-    const token = await login("secret");
-    const jobId = flyKgJob("m-kg-cancel3");
-
-    await deleteSession("m-kg-cancel3", token);
-
-    const row = log.getJobById(jobId);
-    expect(row?.status).toBe("failed");
-    expect(row?.conclusion).toBe("operator_cancelled");
-  });
-
-  it("sends exactly one notification and does not call provider.clearWorkingState (regression pin)", async () => {
-    const token = await login("secret");
-    flyKgJob("m-kg-cancel4");
-
-    const clearWorkingState = vi.spyOn(provider, "clearWorkingState");
-    await deleteSession("m-kg-cancel4", token);
-
-    expect(notifyTextMock).toHaveBeenCalledOnce();
-    expect(clearWorkingState).not.toHaveBeenCalled();
-  });
-
-  it("Fly-mode kg-refresh cancel stops the kept machine and also calls the workflow cancel, tolerating a non-200", async () => {
-    const token = await login("secret");
-    const jobId = flyKgJob("m-kg-cancel5");
-    const cancel = vi.fn(async () => ({ status: 409, body: { error: "no-refresh-in-flight" } }));
-    const res = await deleteSession("m-kg-cancel5", token, { trigger: vi.fn(), status: vi.fn(), cancel });
-
-    expect(res.statusCode).toBe(200);
-    expect(stopMachineMock).toHaveBeenCalledWith(FLY_TOKEN, FLY_APP, "m-kg-cancel5");
-    expect(destroyMachineMock).not.toHaveBeenCalled();
-    expect(cancel).toHaveBeenCalledWith({ jobId, dispatchId: "t-m-kg-cancel5", reason: "operator_cancelled" });
-    expect(log.getJobById(jobId)?.conclusion).toBe("operator_cancelled");
-  });
+  async function flyKgJob(machineId: string, dispatchId: string | null = "t-fly"): Promise<number> {
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines", repo: "TestOrg/test-kg", ...(dispatchId ? { dispatchId } : {}) });
+    log.setJobMachineNonce(jobId, "nonce-kg");
+    log.setJobMachineId(jobId, machineId);
+    log.updateJobMachineId(jobId, machineId);
+    return jobId;
+  }
 
   async function ghaKgJob(): Promise<number> {
     const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "github-actions", repo: "TestOrg/test-kg", dispatchId: "t-gha" });
@@ -5781,43 +5838,107 @@ describe("admin sessions — kg-refresh destroy", () => {
     return jobId;
   }
 
-  it("GHA-mode kg-refresh cancel calls the workflow cancel, then stamps the row, and never cancels the run itself", async () => {
+  it("Fly kg-refresh Stop whose cancel answers 409 past-merge returns it, leaves the row unchanged and destroys no machine", async () => {
     const token = await login("secret");
-    const jobId = await ghaKgJob();
-    const cancel = vi.fn(async () => ({ status: 200, body: { cancelled: true } }));
-    const res = await deleteSession(String(jobId), token, { trigger: vi.fn(), status: vi.fn(), cancel });
+    const jobId = await flyKgJob("m-kg-merge");
+    const before = log.getJobById(jobId);
+    const cancel = answers(409, { error: "past-merge" });
+    const res = await deleteSession("m-kg-merge", token, deps(cancel));
+
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body)).toEqual({ error: "past-merge" });
+    expect(cancel).toHaveBeenCalledWith({ jobId, dispatchId: "t-fly", reason: "operator_cancelled" });
+    expect(destroyMachineMock).not.toHaveBeenCalled();
+    const after = log.getJobById(jobId);
+    expect(after?.status).toBe(before?.status);
+    expect(after?.conclusion).toBe(before?.conclusion);
+    expect(notifyTextMock).not.toHaveBeenCalled();
+  });
+
+  it.each([["fly", "fly"], ["gha", "gha"]])("%s kg-refresh Stop answering 200 writes nothing, destroys nothing and sends one 'stop requested' notice", async (mode) => {
+    const token = await login("secret");
+    const jobId = mode === "fly" ? await flyKgJob("m-kg-200") : await ghaKgJob();
+    const before = log.getJobById(jobId);
+    const res = await deleteSession(mode === "fly" ? "m-kg-200" : String(jobId), token, deps(answers(200, { cancelled: true })));
 
     expect(res.statusCode).toBe(200);
-    expect(cancel).toHaveBeenCalledWith({ jobId, dispatchId: "t-gha", reason: "operator_cancelled" });
-    expect(cancelWorkflowRunMock).not.toHaveBeenCalled();
+    expect(JSON.parse(res.body)).toEqual({ requested: true });
     expect(destroyMachineMock).not.toHaveBeenCalled();
+    expect(cancelWorkflowRunMock).not.toHaveBeenCalled();
+    const after = log.getJobById(jobId);
+    expect(after?.status).toBe(before?.status);
+    expect(after?.conclusion).toBe(before?.conclusion);
+    expect(notifyTextMock).toHaveBeenCalledTimes(1);
+    const text = (notifyTextMock.mock.calls[0] as unknown as [string, string])[1];
+    expect(text).toContain("stop requested");
+    expect(text).not.toContain("cancelled");
+  });
+
+  it("stamps operator_cancelled once and sends the operator-cancel notice when no workflow knows the run", async () => {
+    const token = await login("secret");
+    const jobId = await flyKgJob("m-kg-stamp");
+    const updateSpy = vi.spyOn(log, "updateJobStatus");
+    const clearWorkingState = vi.spyOn(provider, "clearWorkingState");
+    const res = await deleteSession("m-kg-stamp", token, deps(answers(409, { error: "no-refresh-in-flight" })));
+
+    expect(res.statusCode).toBe(200);
+    expect(updateSpy.mock.calls.filter((c) => c[0] === jobId)).toHaveLength(1);
+    const row = log.getJobById(jobId);
+    expect(row?.status).toBe("failed");
+    expect(row?.conclusion).toBe("operator_cancelled");
+    expect(destroyMachineMock).not.toHaveBeenCalled();
+    expect(notifyTextMock).toHaveBeenCalledTimes(1);
+    expect((notifyTextMock.mock.calls[0] as unknown as [string, string])[1]).toContain("cancelled by operator");
+    expect(clearWorkingState).not.toHaveBeenCalled();
+    updateSpy.mockRestore();
+  });
+
+  it.each([
+    ["GHA", async () => ghaKgJob(), (id: number) => String(id)],
+    ["Fly", async () => flyKgJob("m-kg-closed"), () => "m-kg-closed"],
+  ])("%s kg-refresh Stop on a completed row answers 409 and leaves the row untouched", async (_n, mk, ident) => {
+    const token = await login("secret");
+    const jobId = await mk();
+    log.updateJobStatus(jobId, "completed");
+    const before = log.getJobById(jobId);
+    const res = await deleteSession(ident(jobId), token, deps(answers(409, { error: "no-refresh-in-flight" })));
+
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body)).toEqual({ error: "no-refresh-in-flight" });
+    const after = log.getJobById(jobId);
+    expect(after?.status).toBe("completed");
+    expect(after?.conclusion).toBe(before?.conclusion);
+    expect(notifyTextMock).not.toHaveBeenCalled();
+  });
+
+  it("stamps a row with no dispatchId through the same path", async () => {
+    const token = await login("secret");
+    const jobId = await flyKgJob("m-kg-nodispatch", null);
+    const res = await deleteSession("m-kg-nodispatch", token, deps(answers(409, { error: "no-refresh-in-flight" })));
+    expect(res.statusCode).toBe(200);
     expect(log.getJobById(jobId)?.conclusion).toBe("operator_cancelled");
   });
 
-  it("GHA-mode kg-refresh cancel answers 503 when the workflow is unavailable, without notifying", async () => {
+  it("GHA kg-refresh Stop during the merge returns 409 past-merge, not 503, and stamps nothing", async () => {
     const token = await login("secret");
     const jobId = await ghaKgJob();
-    const cancel = vi.fn(async () => ({ status: 503, body: { error: "restate-unavailable" } }));
-    const res = await deleteSession(String(jobId), token, { trigger: vi.fn(), status: vi.fn(), cancel });
+    const res = await deleteSession(String(jobId), token, deps(answers(409, { error: "past-merge" })));
+
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body)).toEqual({ error: "past-merge" });
+    expect(log.getJobById(jobId)?.conclusion).not.toBe("operator_cancelled");
+    expect(notifyTextMock).not.toHaveBeenCalled();
+  });
+
+  it("kg-refresh Stop answers 503 when the workflow is unavailable, changing nothing and not notifying", async () => {
+    const token = await login("secret");
+    const jobId = await ghaKgJob();
+    const res = await deleteSession(String(jobId), token, deps(answers(503, { error: "restate-unavailable" })));
 
     expect(res.statusCode).toBe(503);
     expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
     expect(notifyTextMock).not.toHaveBeenCalled();
     expect(log.getJobById(jobId)?.conclusion).not.toBe("operator_cancelled");
-  });
-
-  it("GHA-mode kg-refresh cancel passes a 409 no-refresh-in-flight through and leaves the row untouched", async () => {
-    const token = await login("secret");
-    const jobId = await ghaKgJob();
-    const before = log.getJobById(jobId);
-    const cancel = vi.fn(async () => ({ status: 409, body: { error: "no-refresh-in-flight" } }));
-    const res = await deleteSession(String(jobId), token, { trigger: vi.fn(), status: vi.fn(), cancel });
-
-    expect(res.statusCode).toBe(409);
-    const after = log.getJobById(jobId);
-    expect(after?.status).toBe(before?.status);
-    expect(after?.conclusion).toBe(before?.conclusion);
-    expect(notifyTextMock).not.toHaveBeenCalled();
   });
 
   it("issue-keyed session destroy still calls provider.clearWorkingState (regression pin)", async () => {
@@ -5882,5 +6003,331 @@ describe("admin poll-now", () => {
     const token = await login("secret");
     const res = await pollNowRequest(undefined, token);
     expect(res.statusCode).toBe(503);
+  });
+});
+
+describe("model accounts and stage configuration (AII-962)", () => {
+  function sso(email: string, sub: string): string {
+    return adminSession.createSession({ email, sub, provider: "google", name: email });
+  }
+  const adminTok = () => sso("ada@eudoxus.ai", "google|ada");
+  const userTok = () => sso("reader@eudoxus.ai", "google|reader");
+
+  type Deps = NonNullable<Parameters<typeof admin.handleAdminRequest>[4]>;
+  const readyDeps = (inspect: (r: unknown) => Promise<unknown> = async () => ({ status: "ready", profiles: [] })): Deps => ({
+    agentConfig: {
+      inspectReadiness: inspect as never,
+      credentials: { sessionStore: {} as never, resolveProtectedSecret: () => null },
+    },
+  });
+
+  async function call(url: string, method: string, token: string, body?: unknown, deps: Deps = {}) {
+    const res = await requestWithDeps(url, method, token, deps, body);
+    return { status: res.statusCode, json: res.body ? JSON.parse(res.body) : null, raw: res.body };
+  }
+
+  const SENTINEL = "ref/sentinel-credential-ref";
+  const profileBody = (over: Record<string, unknown> = {}) => ({
+    profileId: "oai-1",
+    identity: "OpenAI team key",
+    agent: "codex",
+    provider: "openai",
+    authMode: "openai-api-key",
+    allowedProjectKeys: ["APP"],
+    credentialRef: SENTINEL,
+    ...over,
+  });
+  const defaults = {
+    mode: "configured",
+    stages: Object.fromEntries(
+      ["planning", "implementation", "review"].map((s) => [
+        s,
+        { agent: "codex", provider: "openai", model: "gpt-x", accountProfileId: "oai-1", invocationTimeoutMs: 600000 },
+      ]),
+    ),
+  };
+
+  async function seed(deps: Deps = {}) {
+    const t = adminTok();
+    await request("/api/mappings", "POST", "secret", { teamKey: "APP", owner: "org", repo: "app" }, t);
+    expect((await call("/api/model-accounts", "POST", t, profileBody(), deps)).status).toBe(201);
+    expect((await call("/api/agent-defaults", "PUT", t, defaults, deps)).status).toBe(200);
+    return t;
+  }
+
+  const count = (table: string) => (dedup.getDb().prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
+
+  it("refuses every write to a non-admin, even with every page granted, and changes nothing", async () => {
+    await seed();
+    accessGrants.savePageGrants(Object.keys(accessGrants.PAGE_ROUTES), "ada@eudoxus.ai");
+    const before = [count("model_account_profile_revisions"), count("stage_agent_config_revisions"), count("model_account_profile_project_permissions")];
+    const u = userTok();
+    for (const [url, method, body] of [
+      ["/api/model-accounts", "POST", profileBody({ profileId: "x1" })],
+      ["/api/model-accounts/oai-1", "PATCH", { status: "disabled" }],
+      ["/api/agent-defaults", "PUT", defaults],
+      ["/api/mappings/APP/agent-config", "PUT", { enabled: false }],
+    ] as const) {
+      expect((await call(url, method, u, body, readyDeps())).status).toBe(403);
+    }
+    expect([count("model_account_profile_revisions"), count("stage_agent_config_revisions"), count("model_account_profile_project_permissions")]).toEqual(before);
+  });
+
+  it("rejects credential values and unknown keys without echoing them, and appends nothing", async () => {
+    const t = await seed();
+    const revs = count("model_account_profile_revisions");
+    for (const bad of [{ apiKey: "sk-live-abc" }, { session: "s" }, { token: "t" }, { credentialRef: "sk-live-abc123" }]) {
+      const r = await call("/api/model-accounts", "POST", t, profileBody({ profileId: "bad", ...bad }));
+      expect(r.status).toBe(400);
+      expect(r.raw).not.toContain("sk-live-abc");
+    }
+    expect((await call("/api/model-accounts/oai-1", "PATCH", t, { apiKey: "x" })).status).toBe(400);
+    expect((await call("/api/model-accounts", "POST", t, profileBody({ profileId: "bad", authMode: "bedrock" }))).status).toBe(400);
+    expect(count("model_account_profile_revisions")).toBe(revs);
+  });
+
+  it("reads only safe profile metadata and maps codex-subscription readiness", async () => {
+    const t = await seed();
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "plan-1", authMode: "codex-subscription", credentialRef: undefined, allowedProjectKeys: ["APP"] }));
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "cl-sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", credentialRef: undefined }));
+    const mk = (readPlanRecord: () => unknown): Deps => ({
+      agentConfig: {
+        inspectReadiness: async () => ({ status: "ready", profiles: [] }),
+        credentials: { sessionStore: { readPlanRecord } as never, resolveProtectedSecret: () => null },
+        sessionSnapshot: (id) => (id === "cl-sub" ? { profileId: id, dispatchId: "d", generation: 1, state: "recovery_required", heartbeatAt: null } : undefined),
+      },
+    });
+    const list = async (readPlanRecord: () => unknown) => (await call("/api/model-accounts", "GET", t, undefined, mk(readPlanRecord))).json.accounts;
+    const find = (accts: Array<Record<string, any>>, id: string) => accts.find((a) => a.profileId === id)!;
+
+    let accts = await list(() => ({ ok: false, reason: "no_state" }));
+    expect(find(accts, "plan-1").account.readiness).toBe("sign-in required");
+    accts = await list(() => ({ ok: false, reason: "decrypt_failed" }));
+    expect(find(accts, "plan-1").account.readiness).toBe("refresh failed (transient)");
+    expect(find(accts, "cl-sub").account.sessionRecovery).toEqual({ state: "recovery_required", recoveryRequired: true });
+    expect(find(accts, "oai-1").account.sessionRecovery).toBeUndefined();
+    expect(find(accts, "oai-1").account.readiness).toBe("missing"); // reference is outside the protected namespace
+
+    const raw = (await call("/api/model-accounts", "GET", t, undefined, mk(() => ({ ok: false, reason: "no_state" })))).raw;
+    expect(raw).not.toContain(SENTINEL);
+    expect(raw).not.toContain("credentialRef");
+    expect(raw).not.toContain("metadata");
+  });
+
+  it("keeps old revisions on PATCH and refuses new grants for a disabled profile", async () => {
+    const t = await seed();
+    const store = await import("../agent-config-store.js");
+    const patched = await call("/api/model-accounts/oai-1", "PATCH", t, { identity: "Renamed" });
+    expect(patched.json).toMatchObject({ revision: 2, identity: "Renamed", profileStatus: "active" });
+    expect(store.getAccountProfileRevision("oai-1", 1)?.identity).toBe("OpenAI team key");
+    expect(store.lookupCredentialReference("oai-1", 2)).toBe(SENTINEL); // reference carried forward
+    expect((await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" })).status).toBe(200);
+    const grant = await call("/api/model-accounts/oai-1", "PATCH", t, { allowedProjectKeys: ["APP", "OTHER"] });
+    expect(grant.status).toBe(409);
+    expect(store.getAccountProfile("oai-1")?.revision).toBe(3);
+    // A disabled profile is refused by a new project config.
+    const put = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, readyDeps());
+    expect(put.status).toBe(400);
+    expect((await call("/api/model-accounts/nope", "PATCH", t, { status: "disabled" })).status).toBe(404);
+  });
+
+  it("validates defaults atomically", async () => {
+    const t = await seed();
+    const revs = count("stage_agent_config_revisions");
+    const bad = { mode: "configured", stages: { planning: { agent: "codex", provider: "openai", model: "m", accountProfileId: "missing", invocationTimeoutMs: 1000 } } };
+    expect((await call("/api/agent-defaults", "PUT", t, bad)).status).toBe(400);
+    expect((await call("/api/agent-defaults", "PUT", t, { ...defaults, extra: 1 })).status).toBe(400);
+    expect((await call("/api/agent-defaults", "PUT", t, { mode: "legacy", stages: { planning: { model: 5 } } })).status).toBe(400);
+    expect(count("stage_agent_config_revisions")).toBe(revs);
+    expect((await call("/api/agent-defaults", "GET", t)).json).toMatchObject({ configured: true, enabled: true });
+  });
+
+  it("round-trips opt-in and individual inheritance fields", async () => {
+    const t = await seed();
+    const deps = readyDeps();
+    const put = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true, stages: { review: { model: "gpt-review", invocationTimeoutMs: 900000 } } }, deps);
+    expect(put.status).toBe(200);
+    let got = (await call("/api/mappings/APP/agent-config", "GET", t)).json;
+    expect(got).toMatchObject({ enabled: true, stages: { review: { model: "gpt-review", invocationTimeoutMs: 900000 } } });
+
+    let resolved = (await call("/api/mappings/APP/agent-config/resolved", "GET", t, undefined, deps)).json;
+    expect(resolved.stages.review.values.model).toBe("gpt-review");
+    expect(resolved.stages.review.sources.model).toBe("project");
+    expect(resolved.stages.planning.sources.model).toBe("orchestrator-default");
+    expect(resolved.stages.review.account.readiness).toBe("missing");
+    expect(JSON.stringify(resolved)).not.toContain(SENTINEL);
+
+    // null restores inheritance for that field only.
+    await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { model: null } } }, deps);
+    got = (await call("/api/mappings/APP/agent-config", "GET", t)).json;
+    expect(got.enabled).toBe(true);
+    expect(got.stages.review.invocationTimeoutMs).toBe(900000);
+    resolved = (await call("/api/mappings/APP/agent-config/resolved", "GET", t, undefined, deps)).json;
+    expect(resolved.stages.review.values.model).toBe("gpt-x");
+    expect(resolved.stages.review.sources.model).toBe("orchestrator-default");
+    expect(resolved.stages.review.sources.invocationTimeoutMs).toBe("project");
+
+    // Disabling needs no readiness and keeps the overrides.
+    const off = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: false });
+    expect(off.status).toBe(200);
+    expect((await call("/api/mappings/APP/agent-config", "GET", t)).json).toMatchObject({ enabled: false, stages: { review: { invocationTimeoutMs: 900000 } } });
+    expect((await call("/api/mappings/NOPE/agent-config", "GET", t)).status).toBe(404);
+  });
+
+  it("returns actionable resolution errors instead of a 500", async () => {
+    const t = await seed();
+    await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, readyDeps());
+    await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" });
+    const r = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
+    expect(r.status).toBe(200);
+    expect(r.json).toMatchObject({ resolved: false, error: { code: "resolution_failed" } });
+  });
+
+  describe("readiness gate on opt-in", () => {
+    const optIn = (t: string, inspect: (r: any) => Promise<unknown>) =>
+      call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, readyDeps(inspect));
+
+    it("refuses an unready GitHub Actions project, names the workflow-sync action and restores legacy", async () => {
+      const t = await seed();
+      for (const code of ["runner_incompatible", "retired_workflow_present"]) {
+        const r = await optIn(t, async () => ({ status: "not-ready", code }));
+        expect(r.status).toBe(409);
+        expect(r.json).toMatchObject({ code, backend: "github-actions" });
+        expect(r.json.action).toMatch(/workflow sync/);
+        expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(false);
+      }
+    });
+
+    it("serialises concurrent PUTs so a refusal's rollback cannot clobber a later valid write", async () => {
+      const t = await seed();
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      const first = optIn(t, async () => {
+        await gate;
+        return { status: "not-ready", code: "runner_incompatible" };
+      });
+      const second = call("/api/mappings/APP/agent-config", "PUT", t, { enabled: false, stages: { review: { model: "m-2" } } });
+      release();
+      const [a, b] = await Promise.all([first, second]);
+      expect(a.status).toBe(409);
+      expect(b.status).toBe(200);
+      const head = (await call("/api/mappings/APP/agent-config", "GET", t)).json;
+      expect(head.enabled).toBe(false);
+      expect(head.stages.review.model).toBe("m-2");
+    });
+
+    it("inspects the candidate without publishing it: nothing is stored while inspection is pending or after a refusal", async () => {
+      const t = await seed();
+      const store = await import("../agent-config-store.js");
+      const revs = count("stage_agent_config_revisions");
+      let release!: () => void;
+      let entered!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      const inside = new Promise<void>((r) => (entered = r));
+      const seen: unknown[] = [];
+      const pending = optIn(t, async (req: any) => {
+        seen.push(req);
+        entered();
+        await gate;
+        return { status: "not-ready", code: "runner_incompatible" };
+      });
+      await inside;
+      expect(store.getProjectOptIn("APP")).toBe(false);
+      expect(store.getProjectStageConfig("APP")).toBeNull();
+      expect(count("stage_agent_config_revisions")).toBe(revs);
+      release();
+      expect((await pending).status).toBe(409);
+      expect(store.getProjectStageConfig("APP")).toBeNull();
+      expect(count("stage_agent_config_revisions")).toBe(revs);
+      expect(seen).toHaveLength(1);
+    });
+
+    it("refuses to commit readiness when the defaults, a profile or the project head moved during inspection", async () => {
+      const t = await seed();
+      const store = await import("../agent-config-store.js");
+      const moves: Array<[string, () => void]> = [
+        ["defaults", () => store.setOrchestratorDefaults({ version: 1, ...defaults, stages: { ...defaults.stages, review: { ...defaults.stages.review, model: "gpt-y" } } } as never)],
+        ["profile", () => void store.saveAccountProfileRevision({ profileId: "oai-1", revision: store.getAccountProfile("oai-1")!.revision + 1, identity: "renamed", agent: "codex", provider: "openai", authMode: "openai-api-key", allowedProjectKeys: ["APP"], metadata: { credentialRef: SENTINEL } } as never)],
+        ["project", () => void store.setProjectStageConfig("APP", { version: 1, mode: "legacy", stages: { review: { model: "newer" } } } as never)],
+      ];
+      for (const [, move] of moves) {
+        const before = store.getProjectStageConfig("APP")?.revision ?? 0;
+        const r = await optIn(t, async () => {
+          move();
+          return { status: "ready", profiles: [] };
+        });
+        expect(r.status).toBe(409);
+        expect(r.json.code).toBe("stale_inputs");
+        expect(store.getProjectOptIn("APP")).toBe(false);
+        // Only the concurrent writer's own revision (project move) may exist; the stale candidate never lands.
+        expect(store.getProjectStageConfig("APP")?.revision ?? 0).toBeLessThanOrEqual(before + 1);
+      }
+      expect(store.getProjectStageConfig("APP")?.config.stages?.review?.model).toBe("newer");
+    });
+
+    it("keeps legacy, disabled and Claude-subscription candidates fail-closed without storing them", async () => {
+      const t = await seed();
+      const store = await import("../agent-config-store.js");
+      const inspect = vi.fn(async () => ({ status: "ready", profiles: [] }));
+      const r = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true, stages: { review: { accountProfileId: "missing" } } }, readyDeps(inspect));
+      expect(r.status).toBe(400);
+      expect(inspect).not.toHaveBeenCalled();
+      const off = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: false }, readyDeps(inspect));
+      expect(off.status).toBe(200);
+      expect(inspect).not.toHaveBeenCalled();
+      const backendFail = await optIn(t, async () => {
+        throw new Error("boom");
+      });
+      expect(backendFail.status).toBe(503);
+      expect(store.getProjectOptIn("APP")).toBe(false);
+    });
+
+    it("refuses GitHub Actions opt-in as unsupported while workflows are unreadable", async () => {
+      const t = await seed();
+      const r = await optIn(t, async () => ({ status: "not-ready", code: "delivery_unreadable" }));
+      expect(r.status).toBe(409);
+      expect(r.json.code).toBe("unsupported_backend");
+    });
+
+    it("inspects the Fly backend without GHA template checks", async () => {
+      const t = await seed();
+      await request("/api/mappings", "POST", "secret", { teamKey: "FLY", owner: "org", repo: "fly", executionMode: "fly-machines" }, t);
+      await call("/api/model-accounts/oai-1", "PATCH", t, { allowedProjectKeys: ["APP", "FLY"] });
+      const seen: string[] = [];
+      const r = await call("/api/mappings/FLY/agent-config", "PUT", t, { enabled: true }, readyDeps(async (req: any) => {
+        seen.push(req.backend);
+        return { status: "ready", profiles: [] };
+      }));
+      expect(r.status).toBe(200);
+      expect(seen).toEqual(["fly-machines"]);
+    });
+
+    it("fails closed when no readiness inspection is configured", async () => {
+      const t = await seed();
+      const r = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true });
+      expect(r.status).toBe(501);
+      expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(false);
+    });
+
+    it("never enables Claude subscription execution", async () => {
+      const t = await seed();
+      await call("/api/model-accounts", "POST", t, profileBody({ profileId: "cl-sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", credentialRef: undefined }));
+      const r = await call("/api/mappings/APP/agent-config", "PUT", t, {
+        enabled: true,
+        stages: { review: { agent: "claude", provider: "anthropic", accountProfileId: "cl-sub", model: "m" } },
+      }, readyDeps());
+      expect(r.status).toBe(422);
+      expect(r.json.code).toBe("claude_subscription_unsupported");
+    });
+  });
+
+  it("keeps ordinary mapping CRUD from touching agent configuration", async () => {
+    const t = await seed();
+    const store = await import("../agent-config-store.js");
+    const body = { enabled: true, agentConfig: { mode: "configured" } };
+    await request("/api/mappings", "POST", "secret", { teamKey: "APP", owner: "org", repo: "app", ...body }, t);
+    await request("/api/mappings/APP", "PATCH", "secret", body, t);
+    expect(store.getProjectOptIn("APP")).toBe(false);
+    expect(store.getProjectStageConfig("APP")).toBeNull();
   });
 });

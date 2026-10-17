@@ -1,10 +1,8 @@
 /**
  * Type-shape and behavioral-contract tests for the AII-829 review-fix ports.
- * `npm run typecheck` excludes `src/__tests__`, and vitest strips types without
- * checking them, so the `@ts-expect-error` cases below only fail a build under
- * the throwaway `tsconfig.review-fix-ports-tests.json` — run explicitly via
- * `npx tsc --noEmit -p tsconfig.review-fix-ports-tests.json`, and wired into
- * `.github/workflows/unit-tests.yml` (`unit-tests` job) so a regression is
+ * Vitest strips types without checking them, so the `@ts-expect-error` cases
+ * below only fail a build under `npm run typecheck`, whose second pass
+ * (`tsconfig.tests.json`) covers this file and runs in CI, so a regression is
  * caught automatically rather than only by a human remembering to run it.
  * The `it()` blocks exercise representative, entirely in-memory test doubles
  * for all three ports; nothing here does real I/O.
@@ -394,7 +392,7 @@ describe("review-fix ports: representative doubles exercise the full lifecycle",
 // ---------------------------------------------------------------------------
 
 describe("review-fix ports: negative type cases", () => {
-  it("would fail tsc under tsconfig.review-fix-ports-tests.json if any guard below were removed", () => {
+  it("would fail `npm run typecheck` (tsconfig.tests.json) if any guard below were removed", () => {
     // @ts-expect-error an immutable outcome is missing its attemptId identity
     const missingIdentity: ReviewFixImmutableOutcome = {
       scope: SCOPE,

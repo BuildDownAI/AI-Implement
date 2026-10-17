@@ -611,4 +611,20 @@ describe("monitorJobs TTL check (AII-743)", () => {
     expect(updateJobStatus).not.toHaveBeenCalled();
     expect(incrementStuckAttempts).not.toHaveBeenCalled();
   });
+
+  it("skips the TTL branch entirely for a job whose fresh conclusion is external_review_pending", async () => {
+    const job = makeJob({
+      teamKey: "AII",
+      repo: "org/repo",
+      runId: null,
+      dispatchedAt: Date.now() - 106 * 60 * 1000,
+    });
+    vi.mocked(getInFlightJobs).mockReturnValue([job]);
+    vi.mocked(getJobById).mockReturnValue({ conclusion: "external_review_pending" } as unknown as Job);
+
+    await monitorJobs(mockAppConfig, makeRegistry());
+
+    expect(updateJobStatus).not.toHaveBeenCalled();
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+  });
 });

@@ -21,7 +21,7 @@ vi.mock("../mcp-auth-events.js", () => ({
 
 import crypto from "node:crypto";
 import type { ObjectContext } from "@restatedev/restate-sdk";
-import { decideRefresh, GRACE_MS, operatorObject, type FamilyState } from "../restate/operator-object.js";
+import { decideRefresh, deriveNextRefreshToken, GRACE_MS, operatorObject, type FamilyState } from "../restate/operator-object.js";
 import type * as OperatorObjectModule from "../restate/operator-object.js";
 import type * as AccessEntriesModule from "../access-entries.js";
 import type * as AuthEventsModule from "../mcp-auth-events.js";
@@ -33,6 +33,7 @@ import { testDb } from "./helpers/test-db.js";
 // An arbitrary high loopback port nothing listens on: connections fail fast with
 // ECONNREFUSED rather than hanging, which is what "unroutable ingress" needs to test.
 const UNROUTABLE_INGRESS = "http://127.0.0.1:59999";
+const TEST_SECRET = "test-app-private-key";
 
 const ADMITTING_ENTRY: AccessEntriesModule.AccessEntry = {
   kind: "address",
@@ -77,7 +78,7 @@ beforeEach(async () => {
 });
 
 function authorityWithFetch(fetchImpl: typeof fetch, accessTokenTtlMs = 60 * 60 * 1000): InstanceType<typeof RestateRefreshAuthority> {
-  return new RestateRefreshAuthority({ ingressBaseUrl: UNROUTABLE_INGRESS, fetchImpl, accessTokenTtlMs });
+  return new RestateRefreshAuthority({ ingressBaseUrl: UNROUTABLE_INGRESS, fetchImpl, accessTokenTtlMs, refreshKeySecret: TEST_SECRET });
 }
 
 /** The Operator object's ingress for client `c1`, keyed by handler name. */
@@ -103,6 +104,16 @@ function stubAbortTimeout(expectedMs: number): ReturnType<typeof vi.spyOn> {
   });
 }
 
+describe("deriveNextRefreshToken", () => {
+  it("is deterministic, 64 hex chars, and differs per token and per key", () => {
+    const a = deriveNextRefreshToken("t1", "k1");
+    expect(a).toMatch(/^[0-9a-f]{64}$/);
+    expect(deriveNextRefreshToken("t1", "k1")).toBe(a);
+    expect(deriveNextRefreshToken("t2", "k1")).not.toBe(a);
+    expect(deriveNextRefreshToken("t1", "k2")).not.toBe(a);
+  });
+});
+
 describe("GRACE_MS", () => {
   it("is 30 seconds, exported for tests", () => {
     expect(GRACE_MS).toBe(30_000);
@@ -113,7 +124,6 @@ describe("decideRefresh — the state-table branch, as a pure function", () => {
   function family(overrides: Partial<FamilyState> = {}): FamilyState {
     return {
       currentHash: "current-hash",
-      currentToken: "current-token",
       previousHash: "previous-hash",
       rotatedAt: 1_000_000,
       expiresAt: 1_000_000 + 30 * 24 * 60 * 60 * 1000,
@@ -171,7 +181,9 @@ describe("decideRefresh — the state-table branch, as a pure function", () => {
 // this file reaches the real `refresh` handler — the one AII-727 asks for, so a deleted
 // `ctx.clearAll()` fails this suite — rather than duplicating its logic or only exercising
 // decideRefresh, which doesn't call clearAll at all.
-type RefreshHandler = (ctx: ObjectContext, request: { presentedHash: string }) => Promise<unknown>;
+type RefreshHandler = (ctx: ObjectContext, request: { presentedHash: string; nextHash: string }) => Promise<unknown>;
+type DropHandler = (ctx: ObjectContext) => Promise<boolean>;
+const realDrop: DropHandler = (operatorObject as unknown as { object: { dropLegacyToken: DropHandler } }).object.dropLegacyToken;
 const realRefresh: RefreshHandler = (operatorObject as unknown as { object: { refresh: RefreshHandler } }).object.refresh;
 
 /**
@@ -183,7 +195,7 @@ const realRefresh: RefreshHandler = (operatorObject as unknown as { object: { re
 function fakeObjectContext(
   state: { email?: string; sub?: string; provider?: string; family?: FamilyState | null },
   now: number,
-): { ctx: ObjectContext; clearAllCalls: () => number } {
+): { ctx: ObjectContext; clearAllCalls: () => number; store: Map<string, unknown> } {
   const store = new Map<string, unknown>(
     Object.entries(state).filter(([, value]) => value !== undefined) as Array<[string, unknown]>,
   );
@@ -198,16 +210,14 @@ function fakeObjectContext(
       store.clear();
     },
     date: { now: async (): Promise<number> => now },
-    rand: { uuidv4: (): string => "00000000-0000-0000-0000-000000000000" },
   } as unknown as ObjectContext;
-  return { ctx, clearAllCalls: () => clearAllCalls };
+  return { ctx, clearAllCalls: () => clearAllCalls, store };
 }
 
 describe("refresh (real handler, via a fake ObjectContext) — stale-hash clearAll (AII-727)", () => {
   function staleFamily(rotatedAt: number): FamilyState {
     return {
       currentHash: "current-hash",
-      currentToken: "current-token",
       previousHash: "previous-hash",
       rotatedAt,
       expiresAt: rotatedAt + 30 * 24 * 60 * 60 * 1000,
@@ -218,7 +228,7 @@ describe("refresh (real handler, via a fake ObjectContext) — stale-hash clearA
     const rotatedAt = 1_000_000;
     const { ctx, clearAllCalls } = fakeObjectContext({ family: staleFamily(rotatedAt) }, rotatedAt + GRACE_MS + 1);
 
-    const result = await realRefresh(ctx, { presentedHash: "previous-hash" });
+    const result = await realRefresh(ctx, { presentedHash: "previous-hash", nextHash: "current-hash" });
 
     expect(result).toEqual({ status: "replay" });
     expect(clearAllCalls()).toBe(1);
@@ -231,10 +241,49 @@ describe("refresh (real handler, via a fake ObjectContext) — stale-hash clearA
       rotatedAt + GRACE_MS,
     );
 
-    const result = await realRefresh(ctx, { presentedHash: "previous-hash" });
+    const result = await realRefresh(ctx, { presentedHash: "previous-hash", nextHash: "current-hash" });
 
-    expect(result).toMatchObject({ status: "ok", token: "current-token" });
+    expect(result).toMatchObject({ status: "ok" });
+    expect(result).not.toHaveProperty("token");
     expect(clearAllCalls()).toBe(0);
+  });
+
+  it("a concurrent call whose nextHash differs from currentHash answers unavailable and changes nothing", async () => {
+    const rotatedAt = 1_000_000;
+    const { ctx, clearAllCalls, store } = fakeObjectContext({ family: staleFamily(rotatedAt) }, rotatedAt + 1);
+    const before = structuredClone(store.get("family"));
+
+    const result = await realRefresh(ctx, { presentedHash: "previous-hash", nextHash: "other-hash" });
+
+    expect(result).toEqual({ status: "unavailable" });
+    expect(clearAllCalls()).toBe(0);
+    expect(store.get("family")).toEqual(before);
+  });
+
+  it("rotate stores nextHash as current and the presented hash as previous; a legacy family is rewritten without currentToken", async () => {
+    const legacy = { ...staleFamily(1_000_000), currentToken: "legacy-raw" } as FamilyState;
+    const { ctx, store } = fakeObjectContext({ family: legacy }, 1_000_500);
+
+    const result = await realRefresh(ctx, { presentedHash: "current-hash", nextHash: "next-hash" });
+
+    expect(result).toMatchObject({ status: "ok" });
+    const written = store.get("family") as Record<string, unknown>;
+    expect(written).toMatchObject({ currentHash: "next-hash", previousHash: "current-hash", rotatedAt: 1_000_500 });
+    expect(written).not.toHaveProperty("currentToken");
+  });
+
+  it("dropLegacyToken removes only a non-empty currentToken", async () => {
+    const legacy = { ...staleFamily(1_000_000), currentToken: "legacy-raw" };
+    const a = fakeObjectContext({ family: legacy as FamilyState }, 1);
+    await expect(realDrop(a.ctx)).resolves.toBe(true);
+    expect(a.store.get("family")).toEqual(staleFamily(1_000_000));
+
+    const b = fakeObjectContext({ family: staleFamily(1_000_000) }, 1);
+    await expect(realDrop(b.ctx)).resolves.toBe(false);
+    expect(b.store.get("family")).toEqual(staleFamily(1_000_000));
+
+    const c = fakeObjectContext({ family: { ...staleFamily(1_000_000), currentToken: "" } as FamilyState }, 1);
+    await expect(realDrop(c.ctx)).resolves.toBe(false);
   });
 });
 
@@ -324,6 +373,26 @@ describe("RestateRefreshAuthority — invoke() bounded at 10s (AII-728)", () => 
 });
 
 describe("RestateRefreshAuthority — outcome mapping", () => {
+  it("answers unavailable (cause restate) without calling refresh when no secret is available", async () => {
+    const saved = process.env.GITHUB_APP_PRIVATE_KEY;
+    delete process.env.GITHUB_APP_PRIVATE_KEY;
+    try {
+      const sidecar = ingress({ identity: identityOk, refresh: { json: {} } });
+      const authority = new RestateRefreshAuthority({
+        ingressBaseUrl: UNROUTABLE_INGRESS,
+        fetchImpl: sidecar.fetch,
+        accessTokenTtlMs: 3600_000,
+      });
+      await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({
+        status: "unavailable",
+        cause: "restate",
+      });
+      expect(sidecar.calls.some((call) => call.url.href.endsWith("/refresh"))).toBe(false);
+    } finally {
+      if (saved !== undefined) process.env.GITHUB_APP_PRIVATE_KEY = saved;
+    }
+  });
+
   it("maps a 5xx ingress response on the identity read to unavailable (cause restate), never reaching refresh", async () => {
     const sidecar = ingress({ identity: { status: 503 } });
     const authority = authorityWithFetch(sidecar.fetch);
@@ -369,11 +438,11 @@ describe("RestateRefreshAuthority — outcome mapping", () => {
       refresh: (call) => {
         expect(JSON.parse(call.body)).toEqual({
           presentedHash: crypto.createHash("sha256").update("old-raw-token").digest("hex"),
+          nextHash: crypto.createHash("sha256").update(deriveNextRefreshToken("old-raw-token", TEST_SECRET)).digest("hex"),
         });
         return {
           json: {
             status: "ok",
-            token: "new-raw-token",
             expiresAt: Date.now() + 1000,
             email: "ada@eudoxus.ai",
             sub: "sub-1",
@@ -387,7 +456,7 @@ describe("RestateRefreshAuthority — outcome mapping", () => {
     expect(outcome).toEqual({
       status: "ok",
       accessToken: expect.any(String),
-      refreshToken: "new-raw-token",
+      refreshToken: deriveNextRefreshToken("old-raw-token", TEST_SECRET),
       expiresInSeconds: 3600,
     });
     expect(sidecar.calls.map((call) => call.url.href)).toEqual([
@@ -496,7 +565,7 @@ describe("RestateRefreshAuthority.rotate — allowlist re-check (AII-687 parity)
 describe("RestateRefreshAuthority.rotate — auth events (AII-708 parity)", () => {
   it("emits exactly one 'ok' event on a successful rotation", async () => {
     const rotated: Reply = () => ({
-      json: { status: "ok", token: "new-raw-token", expiresAt: Date.now() + 1000, email: "ada@eudoxus.ai", sub: "sub-1", provider: "google" },
+      json: { status: "ok", expiresAt: Date.now() + 1000, email: "ada@eudoxus.ai", sub: "sub-1", provider: "google" },
     });
     const authority = authorityWithFetch(ingress({ identity: rotated, refresh: rotated }).fetch);
     await authority.rotate({ refreshToken: "old-raw-token", clientId: "c1" });

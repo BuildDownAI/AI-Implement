@@ -31,6 +31,25 @@ export const settingsHtml = `
     </div>
 
     <div class="card">
+      <div class="card-header"><h2 class="card-title">Orchestrator Agent Defaults</h2></div>
+      <div class="card-body">
+        <p class="text-secondary" style="margin-bottom:12px">Stage defaults for planning, implementation and review live in the orchestrator, not in a target repository. Turning them on here does not enrol any project: each project opts in separately, and a legacy project keeps its current behavior. Changes apply to the next run. Edit the per-stage agent, provider, model, account profile and elapsed time limit on the <a href="#models">Models &amp; providers</a> page.</p>
+        <div class="field">
+          <label>Defaults mode</label>
+          <div style="display:flex;gap:6px">
+            <select class="input" id="settings-agent-defaults-mode" style="flex:1">
+              <option value="legacy">legacy (stage defaults off)</option>
+              <option value="configured">configured (stage defaults on for opted-in projects)</option>
+            </select>
+            <button class="btn btn-primary btn-sm" id="settings-agent-defaults-save" onclick="saveAgentDefaultsMode()">Save</button>
+          </div>
+          <div id="settings-agent-defaults-summary" class="text-tertiary" style="font-size:11px;margin-top:3px"></div>
+        </div>
+        <div id="settings-agent-defaults-error" class="error hidden"></div>
+      </div>
+    </div>
+
+    <div class="card">
       <div class="card-header"><h2 class="card-title">Linear Pickup Label</h2></div>
       <div class="card-body">
         <div class="warning">Changing this label changes which Linear issues this orchestrator dispatches. Change it only for a planned migration. Issues that carry the old label stop dispatching at the next poll. The lifecycle labels (AI-Planning, AI-Working, Plan-Complete, Ready for Review) do not change.</div>
@@ -67,6 +86,23 @@ export const settingsHtml = `
           <div class="text-tertiary" style="font-size:11px;margin-top:3px">owner/repo watched by the PR-triggered kg-refresh dry-run check, alongside the bound KG source repo. Leave blank to check only the KG source repo.</div>
         </div>
         <div id="settings-kg-error" class="error hidden"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><h2 class="card-title">Runner Image Prefixes</h2></div>
+      <div class="card-body">
+        <p class="text-secondary" style="margin-bottom:12px">The orchestrator checks the runner image before each GitHub Actions and Fly launch. Local Docker launches are not checked. It always trusts ghcr.io/builddownai/ and ghcr.io/&lt;repo owner&gt;/. Add more prefixes here, comma-separated. Each prefix must end with /. On GitHub Actions the workflow checks the image against the separate repository variable AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES.</p>
+        <div class="field">
+          <label>Extra Prefixes</label>
+          <div style="display:flex;gap:6px">
+            <input class="input" id="settings-runner-image-prefixes" placeholder="ghcr.io/acme/" style="flex:1">
+            <button class="btn btn-primary btn-sm" onclick="saveRunnerImagePrefixes()">Save</button>
+            <button class="btn btn-sm" onclick="clearRunnerImagePrefixes()">Clear</button>
+          </div>
+          <div id="settings-runner-image-prefixes-source" class="text-tertiary" style="font-size:11px;margin-top:3px"></div>
+        </div>
+        <div id="settings-runner-image-prefixes-error" class="error hidden"></div>
       </div>
     </div>
 
@@ -151,6 +187,69 @@ export const settingsScript = `
     });
   }
 
+  var adDirty = false;
+
+  function adCanEdit() {
+    return typeof window.isAdmin === 'function' && window.isAdmin();
+  }
+
+  function adShowError(msg) {
+    var el = document.getElementById('settings-agent-defaults-error');
+    el.textContent = msg || '';
+    el.classList.toggle('hidden', !msg);
+  }
+
+  async function adErrorText(res, fallback) {
+    try {
+      var data = await res.json();
+      if (data && data.error) return fallback + ': ' + data.error;
+    } catch (_) {}
+    return fallback + ' (HTTP ' + res.status + ')';
+  }
+
+  async function loadAgentDefaults() {
+    if (adDirty) return;
+    var modeEl = document.getElementById('settings-agent-defaults-mode');
+    var saveBtn = document.getElementById('settings-agent-defaults-save');
+    var canEdit = adCanEdit();
+    modeEl.disabled = !canEdit;
+    saveBtn.classList.toggle('hidden', !canEdit);
+    modeEl.onchange = function () { adDirty = true; };
+    try {
+      var res = await window.api('/api/agent-defaults');
+      if (!res.ok) { adShowError(await adErrorText(res, 'Failed to load agent defaults')); return; }
+      var data = await res.json();
+      modeEl.value = data.mode === 'configured' ? 'configured' : 'legacy';
+      var stages = data.stages || {};
+      var n = Object.keys(stages).length;
+      document.getElementById('settings-agent-defaults-summary').textContent =
+        (data.configured ? 'Saved' : 'Nothing saved yet') + '; ' + n + ' of 3 stages have settings.';
+      adShowError('');
+    } catch (err) {
+      adShowError('Failed to load agent defaults: ' + String(err));
+    }
+  }
+
+  async function saveAgentDefaultsMode() {
+    if (!adCanEdit()) return;
+    adShowError('');
+    var modeEl = document.getElementById('settings-agent-defaults-mode');
+    var mode = modeEl.value === 'configured' ? 'configured' : 'legacy';
+    try {
+      // PUT replaces stages wholesale, so read the current stages immediately before writing.
+      var cur = await window.api('/api/agent-defaults');
+      if (!cur.ok) { adShowError(await adErrorText(cur, 'Failed to read current stage defaults')); return; }
+      var current = await cur.json();
+      var res = await window.api('/api/agent-defaults', { method: 'PUT', body: JSON.stringify({ mode: mode, stages: current.stages || {} }) });
+      if (!res.ok) { adShowError(await adErrorText(res, 'Failed to save agent defaults')); return; }
+      adDirty = false;
+      await loadAgentDefaults();
+    } catch (err) {
+      adShowError('Failed to save agent defaults: ' + String(err));
+    }
+  }
+  window.saveAgentDefaultsMode = saveAgentDefaultsMode;
+
   async function loadSettings() {
     try {
       const res = await window.api('/api/settings');
@@ -171,6 +270,13 @@ export const settingsScript = `
       pickupLabelInput.value = data.linearPickupLabel.value || '';
       pickupLabelSource.textContent = 'Active: ' + data.linearPickupLabel.effective
         + (data.linearPickupLabel.value === null ? ' (default)' : ' (from settings)');
+      const prefixes = data.runnerImageAllowedPrefixes;
+      if (prefixes) {
+        document.getElementById('settings-runner-image-prefixes').value = prefixes.value || '';
+        document.getElementById('settings-runner-image-prefixes-source').textContent =
+          'Built-in: ' + (prefixes.builtIn || []).join(', ')
+          + '  Extra: ' + ((prefixes.effective || []).join(', ') || 'none');
+      }
       const srcText = appInfo.runtimeValue
         ? ('Active: ' + window.esc(appInfo.runtimeValue) + (data.runnerBackendSource === 'restate' ? ' (source: restate)' : ' (source: fallback \u2014 Restate not read yet; env var or DB row)'))
         : 'Not configured — add a sessions app name to enable Fly dispatch';
@@ -278,6 +384,30 @@ export const settingsScript = `
   }
   window.resetPickupLabel = resetPickupLabel;
 
+  async function postRunnerImagePrefixes(val) {
+    const errEl = document.getElementById('settings-runner-image-prefixes-error');
+    errEl.classList.add('hidden');
+    try {
+      const res = await window.api('/api/settings', { method: 'POST', body: JSON.stringify({ runnerImageAllowedPrefixes: val }) });
+      const data = await res.json();
+      if (!res.ok) { errEl.textContent = data.error || 'Failed to save setting.'; errEl.classList.remove('hidden'); return; }
+      await loadSettings();
+    } catch (err) {
+      errEl.textContent = String(err);
+      errEl.classList.remove('hidden');
+    }
+  }
+
+  async function saveRunnerImagePrefixes() {
+    await postRunnerImagePrefixes(document.getElementById('settings-runner-image-prefixes').value.trim() || null);
+  }
+  window.saveRunnerImagePrefixes = saveRunnerImagePrefixes;
+
+  async function clearRunnerImagePrefixes() {
+    await postRunnerImagePrefixes(null);
+  }
+  window.clearRunnerImagePrefixes = clearRunnerImagePrefixes;
+
   async function saveSettings(payload, errEl) {
     errEl = errEl || document.getElementById('settings-error');
     errEl.classList.add('hidden');
@@ -374,6 +504,6 @@ export const settingsScript = `
   }
   window.deleteGlobalSecret = deleteGlobalSecret;
 
-  window.registerPage('settings', function () { loadSettings(); loadGlobalSecrets(); });
+  window.registerPage('settings', function () { loadSettings(); loadGlobalSecrets(); loadAgentDefaults(); });
 })();
 `;

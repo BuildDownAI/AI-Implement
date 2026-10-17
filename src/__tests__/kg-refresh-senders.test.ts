@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createKgRefreshSenders, type KgRefreshSendInput, type KgRefreshSenderDeps } from "../restate/kg-refresh-senders.js";
 import { syncRowToMachineNonce, type KeptMachineFly } from "../restate/kg-refresh-production.js";
 import type { CreateMachineOpts, Machine } from "../fly-machines.js";
-import { buildKgRefreshRunConfig, decodeRunConfig } from "../run-config.js";
+import { buildKgRefreshRunConfig, decodeRunConfig, type RunConfigV1 } from "../run-config.js";
 import { makeAppConfig } from "./helpers/builders.js";
 
 vi.mock("../restate/kg-refresh-production.js", async (importOriginal) => ({
@@ -55,6 +55,7 @@ function makeDeps(overrides: Partial<KgRefreshSenderDeps> = {}, configOverrides:
       ...configOverrides,
     }),
     getInstallationToken: vi.fn(async () => "gh-secret-token"),
+    getScopedInstallationToken: vi.fn(async () => ({ token: "scoped-boot-token", expiresAt: "", installationId: 1 })),
     mintToken: vi.fn(async () => ({ token: "gh-secret-token", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 1 })),
     fetchDefaultBranch: vi.fn(async () => "trunk"),
     resolveRunnerImage: vi.fn(async () => "runner:test"),
@@ -82,7 +83,11 @@ describe("fly-machines sender", () => {
     const cfg = created[0]!.config as unknown as { env: Record<string, string>; guest: Record<string, unknown>; metadata: Record<string, string> };
     expect(cfg.env.MACHINE_NONCE).toBe(NONCE);
     expect(cfg.env.ISSUE_IDENTIFIER).toBe(IDENTIFIER);
+    expect(cfg.env.RUN_TOKEN).toBe("run-tok");
     expect(cfg.env.RUN_PROGRESS_TOKEN).toBe("progress-tok");
+    expect(cfg.env.RUN_PUBLICATION_TOKEN).toBe("pub-tok");
+    // The runner keeps the nonce route only while both are present, so the publication token stays inert.
+    expect(cfg.env.ORCHESTRATOR_URL).toBe("https://orch.example");
     expect(decodeRunConfig(cfg.env.AI_IMPLEMENT_RUN_CONFIG!)?.issue.identifier).toBe(IDENTIFIER);
     expect(cfg.guest).toMatchObject({ cpu_kind: "performance", cpus: 4, memory_mb: 16384 });
     expect(JSON.stringify(created[0])).toContain("d-1");
@@ -169,6 +174,9 @@ describe("local-docker sender", () => {
     expect(arg.machineNonce).toBe(NONCE);
     expect(arg.issueIdentifier).toBe(IDENTIFIER);
     expect(arg.defaultBranch).toBe("trunk");
+    expect(arg).toMatchObject({ runToken: "run-tok", runProgressToken: "progress-tok", runPublicationToken: "pub-tok", runnerCallbackUrl: "https://orch.example" });
+    expect(arg.orchestratorUrl).toBe("https://orch.example");
+    expect(arg.extraEnv).not.toHaveProperty("RUN_PROGRESS_TOKEN");
     expect(result).toEqual({ outcome: "accepted", jobId: "c-1", executionMode: "local-docker", machineId: null, created: false });
     expect(JSON.stringify(result)).not.toContain(NONCE);
   });
@@ -176,6 +184,46 @@ describe("local-docker sender", () => {
   it("throws with no local runner image", async () => {
     const { deps } = makeDeps({}, { localRunnerImage: undefined });
     await expect(createKgRefreshSenders(deps)["local-docker"](makeInput())).rejects.toThrow(/LOCAL_RUNNER_IMAGE/);
+  });
+});
+
+// AII-990: a Fly or local runner boots with a token scoped to the KG repository alone; the
+// installation-wide token stays on control-plane reads.
+describe("KG runner boot token (AII-990)", () => {
+  it("Fly boot uses the scoped token and keeps the broad token for control-plane work", async () => {
+    const { deps, created } = makeDeps();
+    await createKgRefreshSenders(deps)["fly-machines"](makeInput());
+    expect(deps.getScopedInstallationToken).toHaveBeenCalledWith("1", "key", "acme", { repositories: ["kg"] });
+    expect(deps.fetchDefaultBranch).toHaveBeenCalledWith("gh-secret-token", "acme", "kg");
+    expect(deps.resolveRunnerImage).toHaveBeenCalledWith(expect.objectContaining({ token: "scoped-boot-token" }));
+    const json = JSON.stringify(created[0]!.config);
+    expect(json).toContain("scoped-boot-token");
+    expect(json).not.toContain("gh-secret-token");
+  });
+
+  it("local boot uses the scoped token", async () => {
+    const { deps } = makeDeps();
+    await createKgRefreshSenders(deps)["local-docker"](makeInput());
+    expect(deps.getScopedInstallationToken).toHaveBeenCalledWith("1", "key", "acme", { repositories: ["kg"] });
+    const arg = (deps.startLocalRunnerContainer as ReturnType<typeof vi.fn>).mock.calls[0]![0] as Record<string, unknown>;
+    expect(arg.githubToken).toBe("scoped-boot-token");
+  });
+
+  it("Fly: a narrow-mint failure launches nothing and never uses the broad token", async () => {
+    const { deps, created } = makeDeps({
+      getScopedInstallationToken: vi.fn(async () => { throw new Error("mint failed"); }) as never,
+    });
+    await expect(createKgRefreshSenders(deps)["fly-machines"](makeInput())).rejects.toThrow("mint failed");
+    expect(created).toHaveLength(0);
+    expect(deps.resolveRunnerImage).not.toHaveBeenCalled();
+  });
+
+  it("local: a narrow-mint failure launches nothing", async () => {
+    const { deps } = makeDeps({
+      getScopedInstallationToken: vi.fn(async () => { throw new Error("mint failed"); }) as never,
+    });
+    await expect(createKgRefreshSenders(deps)["local-docker"](makeInput())).rejects.toThrow("mint failed");
+    expect(deps.startLocalRunnerContainer).not.toHaveBeenCalled();
   });
 });
 
@@ -231,6 +279,38 @@ describe("github-actions sender", () => {
     const { deps } = makeDeps({ postWorkflowDispatch: vi.fn(async () => ({ success: true })) as never });
     const result = await createKgRefreshSenders(deps)["github-actions"](makeInput({ machineNonce: null }));
     expect(result.jobId).toBeNull();
+    expect(result.outcome).toBe("accepted");
+  });
+});
+
+describe("model-auth refusal", () => {
+  const modes = [["fly-machines", "fly-machines"], ["local-docker", "local-docker"], ["github-actions", "github-actions"]] as const;
+  const variants: Array<[string, Partial<RunConfigV1>]> = [
+    ["agentConfig", { agentConfig: { v: 1 } as never }],
+    ["modelAuthGrant", { credentials: { version: 1, modelAuthGrant: { v: 1 } as never } as never }],
+  ];
+  for (const [mode] of modes) {
+    for (const [label, extra] of variants) {
+      it(`${mode} rejects an envelope with ${label} before any call`, async () => {
+        const { deps, fly } = makeDeps({}, mode === "local-docker" ? { localRunnerImage: undefined as never } : {});
+        const err = vi.spyOn(console, "error").mockImplementation(() => {});
+        const result = await createKgRefreshSenders(deps)[mode](makeInput({ envelope: { ...envelope, ...extra }, machineNonce: null }));
+        expect(result).toEqual({ outcome: "rejected", jobId: null, executionMode: mode });
+        expect(err).toHaveBeenCalledWith("[kg-refresh] refused: a KG refresh envelope carries model authentication");
+        for (const spy of [deps.getScopedInstallationToken, deps.getInstallationToken, deps.mintToken, deps.fetchDefaultBranch,
+          deps.resolveRunnerImage, deps.postWorkflowDispatch, deps.keptMachineFly, deps.startLocalRunnerContainer]) {
+          expect(spy).not.toHaveBeenCalled();
+        }
+        expect(fly.createMachine).not.toHaveBeenCalled();
+        err.mockRestore();
+      });
+    }
+  }
+
+  it("does not refuse an envelope whose credentials carry no modelAuthGrant", async () => {
+    const { deps } = makeDeps();
+    const result = await createKgRefreshSenders(deps)["github-actions"](makeInput({
+      machineNonce: null, envelope: { ...envelope, credentials: { version: 1 } as never } }));
     expect(result.outcome).toBe("accepted");
   });
 });

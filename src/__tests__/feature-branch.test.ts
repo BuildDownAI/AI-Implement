@@ -163,14 +163,14 @@ describe("findOpenRollUpPr (parent no-work churn guard)", () => {
     makeIssue({ identifier, scopeKey: "P", featureBranchChain: [{ identifier, mode: "feature" }] });
 
   it("returns the PR when an open roll-up exists for the parent's feature branch", async () => {
-    const finder = vi.fn(async () => ({ number: 42, url: "u", state: "open" as const, merged: false }));
+    const finder = vi.fn(async () => ({ number: 42, url: "u", state: "open" as const, merged: false, headSha: "sha" }));
     const pr = await findOpenRollUpPr({ ghToken: "tok", issue: parent("P-1"), mapping, finder });
     expect(pr).toEqual({ number: 42, url: "u" });
     expect(finder).toHaveBeenCalledWith("tok", "test-org", "test-repo", "ai-implement/feature/p-1", "testing");
   });
 
   it("returns null for merged/closed roll-ups and for non-parent (leaf) chains", async () => {
-    const merged = vi.fn(async () => ({ number: 1, url: "u", state: "closed" as const, merged: true }));
+    const merged = vi.fn(async () => ({ number: 1, url: "u", state: "closed" as const, merged: true, headSha: "sha" }));
     expect(await findOpenRollUpPr({ ghToken: "t", issue: parent("P-2"), mapping, finder: merged })).toBeNull();
     // leaf: chain ends at an ancestor, not itself -> guard does not apply, finder never called
     const leafFinder = vi.fn();

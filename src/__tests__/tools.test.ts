@@ -478,6 +478,57 @@ describe("discoverTools", () => {
 });
 
 describe("callTool", () => {
+  beforeEach(() => setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } }));
+  afterEach(() => resetRestateStatus());
+
+  it("returns deploy-held without an ingress request even when Restate is not ready", async () => {
+    resetRestateStatus();
+    const fetchImpl = vi.fn() as unknown as typeof fetch;
+    const result = await callTool("get_widget", {}, HUMAN_USER, {
+      ingressBaseUrl: "http://ingress.example", fetchImpl,
+      permitsExternalCall: () => false,
+    });
+    expect(result).toEqual({ status: "deploy-held" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["sidecar starting", { sidecar: { state: "starting" } }],
+    ["sidecar timeout", { sidecar: { state: "timeout" } }],
+    ["sidecar exited", { sidecar: { state: "exited", code: 1, signal: null } }],
+    ["sidecar missing-binary", { sidecar: { state: "missing-binary" } }],
+    ["registration declined-conflict", { registration: { state: "declined-conflict" } }],
+    ["registration unreachable", { registration: { state: "unreachable" } }],
+    ["registration not-attempted", { registration: { state: "not-attempted" } }],
+  ] as const)("answers unavailable without an ingress request when %s (AII-1281)", async (_label, patch) => {
+    setRestateStatus(patch as Parameters<typeof setRestateStatus>[0]);
+    const fetchImpl = vi.fn() as unknown as typeof fetch;
+    const result = await callTool("get_widget", {}, HUMAN_USER, {
+      ingressBaseUrl: "http://ingress.example", fetchImpl,
+      permitsExternalCall: () => true,
+    });
+    expect(result).toEqual({ status: "unavailable" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("answers unavailable for callToolAsSystem when registration is declined", async () => {
+    setRestateStatus({ registration: { state: "declined-conflict" } });
+    const fetchImpl = vi.fn() as unknown as typeof fetch;
+    const result = await callToolAsSystem("get_widget", {}, { fetchImpl, permitsExternalCall: () => true });
+    expect(result).toEqual({ status: "unavailable" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("lets an injected restateReady override the status default", async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ content: [] }) })) as unknown as typeof fetch;
+    resetRestateStatus();
+    const result = await callTool("get_widget", {}, HUMAN_USER, {
+      ingressBaseUrl: "http://ingress.example", fetchImpl, restateReady: () => true,
+    });
+    expect(result.status).toBe("ok");
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
   it("returns deploy-held without an ingress request when drain admission closes", async () => {
     const fake = fakeFetch({});
     const result = await callTool("get_widget", {}, HUMAN_USER, {
@@ -487,6 +538,32 @@ describe("callTool", () => {
     expect(result).toEqual({ status: "deploy-held" });
     expect(fake.calls).toHaveLength(0);
   });
+  describe("deploy hold allowlist (AII-1401)", () => {
+    const okFetch = () => vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ content: [] }) }));
+    const held = { ingressBaseUrl: "http://ingress.example", permitsExternalCall: () => false };
+
+    it.each(["decide_kg_refresh", "get_kg_status"])("%s reaches the ingress during a hold", async (name) => {
+      const fetchImpl = okFetch();
+      const result = await callTool(name, {}, HUMAN_USER, { ...held, fetchImpl: fetchImpl as unknown as typeof fetch });
+      expect(result.status).toBe("ok");
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["trigger_kg_refresh", "get_widget", "decide_kg_refresh_x", "x_get_kg_status"])("%s is refused during a hold", async (name) => {
+      const fetchImpl = okFetch();
+      const result = await callTool(name, {}, HUMAN_USER, { ...held, fetchImpl: fetchImpl as unknown as typeof fetch });
+      expect(result).toEqual({ status: "deploy-held" });
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it.each(["decide_kg_refresh", "get_kg_status"])("%s still answers unavailable when Restate is not ready", async (name) => {
+      const fetchImpl = okFetch();
+      const result = await callTool(name, {}, HUMAN_USER, { ...held, fetchImpl: fetchImpl as unknown as typeof fetch, restateReady: () => false });
+      expect(result).toEqual({ status: "unavailable" });
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+  });
+
   it("maps a 200 ToolResponse body to status: \"ok\"", async () => {
     const fake = fakeFetch({ [GET_WIDGET]: [{ json: { content: [{ type: "text", text: "hello" }] } }] });
 
@@ -569,6 +646,9 @@ describe("callTool", () => {
 });
 
 describe("callToolAsSystem", () => {
+  beforeEach(() => setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } }));
+  afterEach(() => resetRestateStatus());
+
   it("uses the same drain admission barrier", async () => {
     const fake = fakeFetch({});
     expect(await callToolAsSystem("get_tenant_health", {}, {
@@ -1352,6 +1432,18 @@ describe("migrated write handlers (AII-713)", () => {
       decide.mockRejectedValue(terminal(409, "no-decision-open"));
       expect(JSON.parse(answer(await call({ action: "cancel" })).text)).toEqual({ cancelled: true });
       expect(cancel).toHaveBeenCalledWith({ reason: "operator_cancelled" });
+    });
+
+    it("answers past-merge from decide, and never falls through to cancel", async () => {
+      decide.mockRejectedValue(terminal(409, "past-merge"));
+      expect(answer(await call({ action: "cancel" }))).toEqual({ isError: true, text: "past-merge" });
+      expect(cancel).not.toHaveBeenCalled();
+    });
+
+    it("answers past-merge, not no-refresh-in-flight, when the cancel signal is past the merge", async () => {
+      decide.mockRejectedValue(terminal(409, "no-decision-open"));
+      cancel.mockRejectedValue(terminal(409, "past-merge"));
+      expect(answer(await call({ action: "cancel" }))).toEqual({ isError: true, text: "past-merge" });
     });
 
     it("answers already-decided for a second decision, and never falls through to cancel", async () => {

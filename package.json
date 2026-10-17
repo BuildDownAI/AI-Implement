@@ -19,11 +19,12 @@
     "build:runner:local": "DOCKER_BUILDKIT=1 docker build -f Dockerfile.session -t ai-implement-runner:local .",
     "dev:local": "npm run check:node && npm run build:runner:local && RUNNER_MODE=local LOCAL_RUNNER_IMAGE=ai-implement-runner:local tsx --env-file-if-exists=.env src/index.ts",
     "dev:run": "npm run check:node && tsx --env-file-if-exists=.env src/dev-harness/cli.ts",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.tests.json",
     "test": "npm run test:db-isolation && vitest run",
     "test:db-isolation": "node scripts/check-test-db-isolation.mjs",
     "test:watch": "vitest",
-    "test:restate": "vitest run --config vitest.restate.config.ts"
+    "test:restate": "vitest run --config vitest.restate.config.ts",
+    "local:feedback": "npm run check:node && npm run build && node scripts/local-feedback.mjs"
   },
   "dependencies": {
     "@restatedev/restate-sdk": "^1.17.1",
@@ -42,6 +43,7 @@
     "@types/node": "^24.13.3",
     "@types/picomatch": "^4.0.3",
     "jsdom": "^30.0.1",
+    "smol-toml": "^1.9.1",
     "tsx": "^4.23.12",
     "typescript": "^5.9.3",
     "vitest": "^4.1.11"

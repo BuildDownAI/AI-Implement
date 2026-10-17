@@ -5,6 +5,8 @@ import type { ReviewerSelection } from "../config.js";
 import type { RetryPolicy } from "./retry-backoff.js";
 import type { ReviewerDefinition } from "./reviewers/registry.js";
 import type { FailureRecord } from "./failure-classification.js";
+import { STAGE_NAMES, type AccountAuthMode, type StageName } from "../agent-config.js";
+import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
 
 export type StepStatus = "running" | "passed" | "failed" | "skipped" | "cancelled";
 
@@ -72,6 +74,9 @@ export interface PipelineContextData {
    *  Always set by run-autonomous ([] when the env var is absent). No built-in step reads
    *  it — it is the contract surface for image-baked custom/ steps. */
   profiles?: string[];
+  /** Resolved per-stage agent snapshot from the envelope (AII-944). Absent = legacy behavior.
+   *  Not to be confused with `profiles`, which are workflow profiles, not model account profiles. */
+  agentConfig?: ResolvedAgentSnapshotV1;
   /** Autonomous runner: issue assignee display name (Jira), from the run_config envelope or
    *  AI_IMPLEMENT_ASSIGNEE_NAME env. Used by push.ts to attribute the opened PR's title. */
   assigneeName?: string;
@@ -259,6 +264,141 @@ export interface StepModule<
 
 export type LogLevel = "summary" | "stream";
 
+/** Current version of {@link InvocationAttributionV1}. */
+export const INVOCATION_ATTRIBUTION_VERSION = 1;
+/** Hard cap on the serialized size of one attribution object. */
+export const ATTRIBUTION_MAX_BYTES = 2048;
+
+export type UsageAvailability = "complete" | "partial" | "unavailable";
+export type AttributionCostStatus = "reported" | "unavailable";
+export type AttributionLimitKind = "timeout_ms" | "max_turns";
+
+export interface AttributionUsage {
+  availability: UsageAvailability;
+  tokensIn: number | null;
+  tokensOut: number | null;
+  /** Provider-reported cost only. Never derived from token counts; null when unavailable. */
+  costUsd: number | null;
+  costStatus: AttributionCostStatus;
+}
+
+/**
+ * Optional, versioned diagnostic attribution for one model invocation (AII-946).
+ * Diagnostic only: an invalid value is stripped (see {@link sanitizeAttribution}) and never
+ * blocks terminal reporting — unlike an invalid authoritative `agentConfig`, which fails closed.
+ * `outcome` reuses the closed telemetry enum; a timeout is `outcome: "error"` with failure code
+ * `INVOCATION_TIMEOUT` (failure-classification's open UPPER_SNAKE code contract).
+ * Nothing emits or persists this yet — AII-971 owns emission.
+ */
+export interface InvocationAttributionV1 {
+  version: 1;
+  invocationId: string;
+  stage: StageName;
+  snapshotId: string;
+  agent: "claude" | "codex";
+  provider: "anthropic" | "bedrock" | "openai";
+  model: string;
+  profileId: string | null;
+  authMode: AccountAuthMode;
+  limit: { kind: AttributionLimitKind; value: number } | null;
+  outcome: "success" | "max_turns" | "error" | "unknown";
+  usage: AttributionUsage | null;
+}
+
+const ATTRIBUTION_KEYS = ["version", "invocationId", "stage", "snapshotId", "agent", "provider", "model", "profileId", "authMode", "limit", "outcome", "usage"];
+const ATTRIBUTION_USAGE_KEYS = ["availability", "tokensIn", "tokensOut", "costUsd", "costStatus"];
+const ATTRIBUTION_AUTH_MODES = ["anthropic-api-key", "bedrock", "claude-subscription", "openai-api-key", "codex-subscription"];
+const ATTRIBUTION_ID_RE = /^[\w.:/@-]{1,128}$/;
+/** Model ids may carry suffixes such as `[1m]` or `+`: printable non-whitespace ASCII, bounded. */
+const ATTRIBUTION_MODEL_RE = /^[\x21-\x7e]{1,128}$/;
+const ATTRIBUTION_SECRET_RE = /(sk-[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{10,}|ghp_|gho_|ghs_|xox[bp]-)/i;
+
+function attrRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function onlyKeys(v: Record<string, unknown>, allowed: string[]): boolean {
+  return Object.keys(v).every((k) => allowed.includes(k));
+}
+
+function attrId(v: unknown): v is string {
+  return typeof v === "string" && ATTRIBUTION_ID_RE.test(v) && !ATTRIBUTION_SECRET_RE.test(v);
+}
+
+function attrModel(v: unknown): v is string {
+  return typeof v === "string" && ATTRIBUTION_MODEL_RE.test(v) && !ATTRIBUTION_SECRET_RE.test(v);
+}
+
+function nullableCount(v: unknown): v is number | null {
+  return v === null || (typeof v === "number" && Number.isFinite(v) && v >= 0);
+}
+
+/**
+ * Validates `value` as an allowlisted, bounded {@link InvocationAttributionV1} and returns a fresh
+ * projection containing only known fields, or `null` when it is absent, malformed, oversized,
+ * of an unknown version, or credential-shaped. Null usage/cost stay null (never zero or estimated).
+ * Callers drop-and-warn with a count only; never echo the rejected payload.
+ */
+export function sanitizeAttribution(value: unknown): InvocationAttributionV1 | null {
+  if (!attrRecord(value) || !onlyKeys(value, ATTRIBUTION_KEYS)) return null;
+  try {
+    if (Buffer.byteLength(JSON.stringify(value), "utf-8") > ATTRIBUTION_MAX_BYTES) return null;
+  } catch {
+    return null;
+  }
+  if (value.version !== INVOCATION_ATTRIBUTION_VERSION) return null;
+  if (!attrId(value.invocationId) || !attrId(value.snapshotId) || !attrModel(value.model)) return null;
+  if (!(STAGE_NAMES as readonly unknown[]).includes(value.stage)) return null;
+  if (value.agent !== "claude" && value.agent !== "codex") return null;
+  if (value.provider !== "anthropic" && value.provider !== "bedrock" && value.provider !== "openai") return null;
+  if (value.profileId !== null && !attrId(value.profileId)) return null;
+  if (!ATTRIBUTION_AUTH_MODES.includes(value.authMode as string)) return null;
+  if (!["success", "max_turns", "error", "unknown"].includes(value.outcome as string)) return null;
+
+  let limit: InvocationAttributionV1["limit"] = null;
+  if (value.limit !== null && value.limit !== undefined) {
+    const l = value.limit;
+    if (!attrRecord(l) || !onlyKeys(l, ["kind", "value"])) return null;
+    if (l.kind !== "timeout_ms" && l.kind !== "max_turns") return null;
+    if (typeof l.value !== "number" || !Number.isSafeInteger(l.value) || l.value <= 0) return null;
+    limit = { kind: l.kind, value: l.value };
+  }
+
+  let usage: AttributionUsage | null = null;
+  if (value.usage !== null && value.usage !== undefined) {
+    const u = value.usage;
+    if (!attrRecord(u) || !onlyKeys(u, ATTRIBUTION_USAGE_KEYS)) return null;
+    const { availability, tokensIn, tokensOut, costStatus } = u;
+    const costUsd = u.costUsd === undefined ? null : u.costUsd;
+    if (availability !== "complete" && availability !== "partial" && availability !== "unavailable") return null;
+    if (costStatus !== "reported" && costStatus !== "unavailable") return null;
+    if (!nullableCount(tokensIn) || !nullableCount(tokensOut) || !nullableCount(costUsd)) return null;
+    const present = (tokensIn !== null ? 1 : 0) + (tokensOut !== null ? 1 : 0);
+    if (availability === "complete" && present !== 2) return null;
+    if (availability === "partial" && present !== 1) return null;
+    if (availability === "unavailable" && present !== 0) return null;
+    // Cost is reported by the provider or unavailable; it is never a zero/estimated placeholder.
+    if (costStatus === "reported" && costUsd === null) return null;
+    if (costStatus === "unavailable" && costUsd !== null) return null;
+    usage = { availability, tokensIn, tokensOut, costUsd, costStatus };
+  }
+
+  return {
+    version: 1,
+    invocationId: value.invocationId,
+    stage: value.stage as StageName,
+    snapshotId: value.snapshotId,
+    agent: value.agent,
+    provider: value.provider,
+    model: value.model,
+    profileId: value.profileId as string | null,
+    authMode: value.authMode as AccountAuthMode,
+    limit,
+    outcome: value.outcome as InvocationAttributionV1["outcome"],
+    usage,
+  };
+}
+
 export interface RunTelemetry {
   outcome: "success" | "max_turns" | "error" | "unknown";
   numTurns: number | null;
@@ -273,6 +413,8 @@ export interface RunTelemetry {
   toolTrace?: string[];
   /** Bash commands with a matching structured tool result; never inferred from model text. */
   executedCommands?: Array<{ command: string; failed: boolean }>;
+  /** Optional diagnostic attribution (AII-946); absent on legacy/unemitting runs. */
+  attribution?: InvocationAttributionV1;
 }
 
 export interface LLMTerminalStatus {
@@ -290,17 +432,33 @@ export interface LLMResult {
   terminalStatus?: LLMTerminalStatus;
   /** Termination signal from the CLI process's close event (e.g. SIGTERM), null when it exited normally. */
   signal?: string | null;
+  /** The agent's own terminal error text (redacted), when its event stream reported one. Classification places it ahead of stderr/stdout in the message for an exit-0 failure and records it as `evidence.llmErrorMessage`. */
+  errorMessage?: string;
   /** Number of spawn attempts made for this invocation; 1 unless `retry` was supplied and a transient pre-tool-use failure was re-spawned. Optional so a custom LLMExecutor may omit it — consumers fall back to `?? 1`. */
   attempts?: number;
   /** Set on any classified failure of the final attempt (retryable or not) — the last attempt's classified record. */
   failure?: FailureRecord;
+  /** Optional diagnostic attribution (AII-946); mirrors `telemetry.attribution` for results without telemetry. */
+  attribution?: InvocationAttributionV1;
 }
 
 export interface InvokeParams {
   prompt: string;
   model: string;
   maxTurns?: number;
+  /**
+   * Permission patterns passed as `--allowed-tools`. This PREAPPROVES tools; it
+   * does not restrict availability, and a pattern (e.g. `Bash(curl *)`) is not a
+   * built-in tool name. Use `builtinTools` to restrict what a session can use.
+   */
   tools?: string[];
+  /**
+   * Built-in tool NAMES (e.g. `Read`) that are the only tools available to the
+   * session. When set, the executor passes `--tools` plus flags that deny MCP
+   * tools, skills and delegates, and denies Bash/Edit/Write. Absent = the
+   * ordinary unrestricted tool set (implementation).
+   */
+  builtinTools?: string[];
   jsonSchema?: Record<string, unknown>;
   /**
    * Stage identifier used to tag a classified failure (e.g. "implement" or
@@ -309,6 +467,16 @@ export interface InvokeParams {
    * failure record even with no retry policy configured.
    */
   stage?: string;
+  /**
+   * Configured agent stage this call belongs to (AII-944). Independent of the diagnostic
+   * `stage` label above. No built-in executor reads it yet; absent = legacy behavior.
+   */
+  agentStage?: StageName;
+  /**
+   * Elapsed-time limit for this one invocation, from the resolved snapshot (AII-944).
+   * Separate from native Claude `maxTurns`; turns are never translated into time.
+   */
+  invocationTimeoutMs?: number;
   /**
    * Whether this call site requires `structuredOutput` (review does; implement
    * never requests it). Read independently of `retry` for the same reason as
@@ -326,10 +494,10 @@ export interface InvokeParams {
     policy: RetryPolicy;
     /**
      * True when a tool call made during a failed attempt cannot have mutated the
-     * workspace (review runs read-only tools) — EXCEPT a Bash-prefixed tool use
-     * (e.g. review's allowed `Bash(curl *)`), which can still write files or POST
-     * despite the read-only allowlist and so still blocks a retry regardless of
-     * this flag. See `effectiveSawToolUse`/`sawUnsafeToolUse`.
+     * workspace (review runs read-only tools) — but only a proven read-only
+     * built-in (Read/Glob/Grep) counts as safe; any other, unknown or malformed
+     * tool use still blocks a retry regardless of this flag. See
+     * `effectiveSawToolUse`/`sawUnsafeToolUse`.
      */
     toolUseIsSafe: boolean;
   };

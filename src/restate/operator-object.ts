@@ -7,14 +7,15 @@
  * bounded grace window instead of treating every re-presentation of a just-rotated
  * token as theft.
  *
- * Trust boundary: this object is reachable only through the localhost ingress
- * (127.0.0.1:8081, AII-627). Only a token *hash* ever crosses that ingress inbound —
- * the ingress journals request bodies, and a journaled raw token would outlive its
- * rotation. `refresh` itself mints the next raw token (via `ctx.rand.uuidv4()`, so
- * concurrent callers converge on the identical value once the exclusive handler has
- * serialized them) and returns it — that is unavoidable, since a caller cannot hand
- * back a bearer secret it never received without the object producing it — but no raw
- * token is ever accepted as *input*.
+ * Trust boundary: this object holds refresh-token *hashes only*. Restate state, journals and
+ * handler inputs/outputs never contain a raw refresh token (AII-1287): the admin-only Restate
+ * UI proxy (ADR 040) can read state and journals, so a raw token there would be readable.
+ * The orchestrator derives the next token outside Restate (`deriveNextRefreshToken`: an HMAC of
+ * the presented token under a key from HKDF over `GITHUB_APP_PRIVATE_KEY`, which never reaches
+ * the sidecar) and sends only `{ presentedHash, nextHash }`. Two concurrent callers presenting
+ * the same token therefore compute the same next token independently; the exclusive handler
+ * only has to agree on its hash. `ctx.rand` is not used — it is seeded from the invocation id,
+ * which is not secret.
  *
  * Access tokens stay verified in SQLite (`mcp_tokens`, `verifyMcpToken`) — this object
  * only tracks refresh-token family state.
@@ -44,11 +45,22 @@ function sha256(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex");
 }
 
+/** Fixed domain-separation labels: changing either changes every derived token. */
+const REFRESH_KEY_SALT = "ai-implement:mcp-refresh-token:salt:v1";
+const REFRESH_KEY_INFO = "ai-implement:mcp-refresh-token:hmac-key:v1";
+
+/**
+ * The next refresh token for a family: hex HMAC-SHA256 of the presented token under a key
+ * HKDF-derived from the GitHub App private key. Deterministic, so concurrent refreshes of the
+ * same presented token converge without any raw token crossing Restate. Orchestrator process only.
+ */
+export function deriveNextRefreshToken(presented: string, secret: string): string {
+  const key = Buffer.from(crypto.hkdfSync("sha256", secret, REFRESH_KEY_SALT, REFRESH_KEY_INFO, 32));
+  return crypto.createHmac("sha256", key).update(presented).digest("hex");
+}
+
 export interface FamilyState {
   currentHash: string;
-  /** The raw value hashing to `currentHash`, kept only so a concurrent refresh presenting
-   *  the previous hash within GRACE_MS can be handed back the same pair (see module doc). */
-  currentToken: string;
   previousHash: string | null;
   rotatedAt: number;
   expiresAt: number;
@@ -64,6 +76,8 @@ interface IssueRequest {
 
 interface RefreshRequest {
   presentedHash: string;
+  /** Hash of the token the orchestrator derived from the presented one (`deriveNextRefreshToken`). */
+  nextHash: string;
   /**
    * Test-only seam (AII-727): when set, the handler durably sleeps this many ms — still
    * holding the exclusive lock — before deciding. Proves a concurrent `describe` (shared)
@@ -76,9 +90,10 @@ interface RefreshRequest {
 }
 
 type RefreshHandlerResult =
-  | { status: "ok"; token: string; expiresAt: number; email: string; sub: string; provider: string }
+  | { status: "ok"; expiresAt: number; email: string; sub: string; provider: string }
   | { status: "replay" }
-  | { status: "expired" };
+  | { status: "expired" }
+  | { status: "unavailable" };
 
 interface DescribeResult {
   email: string | null;
@@ -139,9 +154,6 @@ async function issue(ctx: ObjectContext, request: IssueRequest): Promise<void> {
   ctx.set<string>("provider", request.provider);
   ctx.set<FamilyState>("family", {
     currentHash: request.hash,
-    // Nothing to answer a concurrent-replay with yet — a fresh sign-in has no previous
-    // hash for a second caller to present, so this is never read before the first rotation.
-    currentToken: "",
     previousHash: null,
     rotatedAt,
     expiresAt: request.expiresAt,
@@ -169,12 +181,18 @@ async function refresh(ctx: ObjectContext, request: RefreshRequest): Promise<Ref
       // family is non-null here: decideRefresh only returns "concurrent" when a
       // previous-hash match was found, which requires a family to compare against.
       const f = family as FamilyState;
+      // The caller converges only when it derived the very token already rotated in. A
+      // mismatch (a legacy family whose current token the old code minted, or a key change
+      // inside the grace window) is not theft: answer unavailable and change nothing.
+      if (request.nextHash !== f.currentHash) {
+        return { status: "unavailable" };
+      }
       const [email, sub, provider] = await Promise.all([
         ctx.get<string>("email"),
         ctx.get<string>("sub"),
         ctx.get<string>("provider"),
       ]);
-      return { status: "ok", token: f.currentToken, expiresAt: f.expiresAt, email: email ?? "", sub: sub ?? "", provider: provider ?? "" };
+      return { status: "ok", expiresAt: f.expiresAt, email: email ?? "", sub: sub ?? "", provider: provider ?? "" };
     }
     case "rotate": {
       const f = family as FamilyState;
@@ -183,18 +201,31 @@ async function refresh(ctx: ObjectContext, request: RefreshRequest): Promise<Ref
         ctx.get<string>("sub"),
         ctx.get<string>("provider"),
       ]);
-      const token = `${ctx.rand.uuidv4()}${ctx.rand.uuidv4()}`.replace(/-/g, "");
       const expiresAt = now + REFRESH_TOKEN_TTL_MS;
       ctx.set<FamilyState>("family", {
-        currentHash: sha256(token),
-        currentToken: token,
+        currentHash: request.nextHash,
         previousHash: f.currentHash,
         rotatedAt: now,
         expiresAt,
       });
-      return { status: "ok", token, expiresAt, email: email ?? "", sub: sub ?? "", provider: provider ?? "" };
+      return { status: "ok", expiresAt, email: email ?? "", sub: sub ?? "", provider: provider ?? "" };
     }
   }
+}
+
+/**
+ * One-time scrub of the raw `currentToken` the pre-AII-1287 code kept in family state. Removes
+ * only a non-empty `currentToken`; every other field is left as it was. Exclusive, so it cannot
+ * interleave with a `refresh` on the same key. Returns whether it removed anything.
+ */
+async function dropLegacyToken(ctx: ObjectContext): Promise<boolean> {
+  const family = await ctx.get<FamilyState & { currentToken?: string }>("family");
+  if (!family || !family.currentToken) {
+    return false;
+  }
+  const { currentToken: _dropped, ...rest } = family;
+  ctx.set<FamilyState>("family", rest);
+  return true;
 }
 
 async function revoke(ctx: ObjectContext): Promise<void> {
@@ -231,6 +262,7 @@ export const operatorObject = restate.object({
   handlers: {
     issue,
     refresh,
+    dropLegacyToken,
     revoke,
     describe: restate.handlers.object.shared(describe),
     identity: restate.handlers.object.shared(identity),
@@ -245,6 +277,8 @@ export interface RestateRefreshAuthorityOptions {
   fetchImpl?: typeof fetch;
   /** Shared deploy drain admission check; injectable for deterministic tests. */
   permitsExternalCall?: () => boolean;
+  /** Secret the next-refresh-token key derives from. Defaults to `GITHUB_APP_PRIVATE_KEY`; overridable for tests. */
+  refreshKeySecret?: string;
   /** The access token's TTL, minted here in SQLite alongside a successful rotation. */
   accessTokenTtlMs: number;
 }
@@ -259,11 +293,13 @@ export class RestateRefreshAuthority implements RefreshAuthority {
   private readonly fetchImpl: typeof fetch;
   private readonly accessTokenTtlMs: number;
   private readonly permitsExternalCall: () => boolean;
+  private readonly refreshKeySecret: string | undefined;
 
   constructor(options: RestateRefreshAuthorityOptions) {
     this.baseUrl = options.ingressBaseUrl ?? `http://${RESTATE_INGRESS_BIND_ADDRESS}`;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.accessTokenTtlMs = options.accessTokenTtlMs;
+    this.refreshKeySecret = options.refreshKeySecret;
     this.permitsExternalCall = options.permitsExternalCall ?? (() => !isDeployHeld());
   }
 
@@ -389,9 +425,19 @@ export class RestateRefreshAuthority implements RefreshAuthority {
     // fallible step after it, and a SQLITE_BUSY there is covered by the GRACE_MS window (a
     // client retry inside it presents the pre-rotation hash and gets the same pair back,
     // via decideRefresh's "concurrent" branch, rather than being treated as replay).
+    const secret = this.refreshKeySecret ?? process.env.GITHUB_APP_PRIVATE_KEY;
+    if (!secret) {
+      console.error("[mcp-oauth] refresh unavailable: no secret to derive the next refresh token from");
+      emit("unavailable");
+      return { status: "unavailable", cause: "restate" };
+    }
     const presentedHash = sha256(input.refreshToken);
-    const result = await this.invoke<RefreshHandlerResult>(clientId, "refresh", { presentedHash });
-    if (result === "unavailable") {
+    const nextRefreshToken = deriveNextRefreshToken(input.refreshToken, secret);
+    const result = await this.invoke<RefreshHandlerResult>(clientId, "refresh", {
+      presentedHash,
+      nextHash: sha256(nextRefreshToken),
+    });
+    if (result === "unavailable" || result.status === "unavailable") {
       emit("unavailable");
       return { status: "unavailable", cause: "restate" };
     }
@@ -416,7 +462,7 @@ export class RestateRefreshAuthority implements RefreshAuthority {
     return {
       status: "ok",
       accessToken,
-      refreshToken: result.token,
+      refreshToken: nextRefreshToken,
       expiresInSeconds: Math.floor(this.accessTokenTtlMs / 1000),
     };
   }

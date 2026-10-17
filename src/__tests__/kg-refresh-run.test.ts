@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { execSync, spawnSync } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -12,6 +13,13 @@ import { makeContext as makeBaseContext, makeMapping } from "./helpers/builders.
 import { fakeFetch, type FakeFetch, type Reply, type Routes } from "./helpers/fake-fetch.js";
 import { githubFile } from "./helpers/github-replies.js";
 import { testDir } from "./helpers/test-dir.js";
+
+// Pass-through spy: every test keeps the real refresh unless it overrides the
+// implementation for one call.
+vi.mock("../runner-token.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../runner-token.js")>();
+  return { ...actual, refreshRunnerGithubCredentials: vi.fn(actual.refreshRunnerGithubCredentials) };
+});
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -110,6 +118,8 @@ import {
 } from "../pipeline/steps/kg-tracker-data.js";
 import { kgIngestStep, KgIngestError, isSignalLine } from "../pipeline/steps/kg-ingest.js";
 import { kgScopeReconcileStep } from "../pipeline/steps/kg-scope-reconcile.js";
+import { refreshRunnerGithubCredentials } from "../runner-token.js";
+import { __resetPublicationCredentialForTests } from "../publication-credential.js";
 import { modelProcessEnv } from "../pipeline/process-env.js";
 import type { PipelineContextData } from "../pipeline/types.js";
 
@@ -1184,6 +1194,93 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
     expect(result.snapshotPushed).toBe(true);
     const body = JSON.parse(github.calls[0].body);
     expect(body.body).toContain("**Guard verdict:** clean");
+  });
+
+  describe("GitHub token refresh before the push (AII-1384)", () => {
+    let github: FakeFetch;
+
+    beforeEach(() => {
+      __resetPublicationCredentialForTests();
+      delete process.env.RUN_PUBLICATION_TOKEN;
+      vi.mocked(refreshRunnerGithubCredentials).mockClear();
+    });
+
+    afterEach(() => {
+      __resetPublicationCredentialForTests();
+      delete process.env.RUN_PUBLICATION_TOKEN;
+    });
+
+    function setupClean(): string {
+      initGitRepo(tmpDir);
+      execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+      execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+      const clonedRef = resolveHead(tmpDir);
+      execSync(
+        `git config url."${bareDir}".insteadOf "https://x-access-token:fresh-tok@github.com/acme/kg-repo.git"`,
+        { cwd: tmpDir, stdio: "ignore" },
+      );
+      writeWorkingTree({ "docs.nt": makeLines(1) });
+      github = refreshPrApi(30);
+      return clonedRef;
+    }
+
+    it("GHA mode: passes the publication token, pushes and opens the PR with the refreshed token", async () => {
+      process.env.RUN_PUBLICATION_TOKEN = "pub-tok";
+      vi.mocked(refreshRunnerGithubCredentials).mockResolvedValueOnce("fresh-tok");
+      const clonedRef = setupClean();
+
+      const result = await kgSnapshotPushStep.run(
+        makeContext(),
+        makeInputs({ clonedRef, callbackUrl: "http://localhost:8080/cb" }),
+        noopReporter,
+      );
+
+      expect(result.snapshotPushed).toBe(true);
+      expect(refreshRunnerGithubCredentials).toHaveBeenCalledWith(
+        expect.objectContaining({
+          currentToken: "fake-token",
+          callbackUrl: "http://localhost:8080/cb",
+          machineNonce: undefined,
+          publicationToken: "pub-tok",
+        }),
+      );
+      // The push only reaches the bare repo through the insteadOf rewrite keyed on fresh-tok.
+      const refs = execSync("git for-each-ref --format='%(refname)'", { cwd: bareDir }).toString();
+      expect(refs).toContain("refs/heads/kg-refresh/");
+      expect(github.calls[0].headers.get("Authorization")).toEqual(expect.stringContaining("fresh-tok"));
+    });
+
+    it("Fly mode: forwards the machine nonce and uses the returned token", async () => {
+      vi.mocked(refreshRunnerGithubCredentials).mockResolvedValueOnce("fresh-tok");
+      const clonedRef = setupClean();
+
+      await kgSnapshotPushStep.run(
+        makeContext(),
+        makeInputs({ clonedRef, orchestratorUrl: "http://orch", machineNonce: "nonce-1" }),
+        noopReporter,
+      );
+
+      expect(refreshRunnerGithubCredentials).toHaveBeenCalledWith(
+        expect.objectContaining({
+          orchestratorUrl: "http://orch",
+          machineNonce: "nonce-1",
+          publicationToken: undefined,
+        }),
+      );
+      expect(github.calls[0].headers.get("Authorization")).toEqual(expect.stringContaining("fresh-tok"));
+    });
+
+    it("dry run returns before the refresh and leaves the publication credential unconsumed", async () => {
+      process.env.RUN_PUBLICATION_TOKEN = "pub-tok";
+      initGitRepo(tmpDir);
+      const clonedRef = resolveHead(tmpDir);
+      writeWorkingTree({ "docs.nt": makeLines(1) });
+
+      await kgSnapshotPushStep.run(makeContext(), makeInputs({ clonedRef, dryRun: true }), noopReporter);
+
+      expect(refreshRunnerGithubCredentials).not.toHaveBeenCalled();
+      expect(process.env.RUN_PUBLICATION_TOKEN).toBe("pub-tok");
+    });
   });
 });
 
@@ -3228,7 +3325,7 @@ describe("GHA kg-refresh dispatch — runner_image resolution via resolveRunnerI
   });
 
   it("includes runner_image when KG repo has a per-repo .ai-implement/image.yml override", async () => {
-    const fetchImpl = kgRepoImageYml(githubFile("image: ghcr.io/org/custom-runner:sha-abc\n")).fetch;
+    const fetchImpl = kgRepoImageYml(githubFile("image: ghcr.io/builddownai/custom-runner:sha-abc\n")).fetch;
 
     const result = await resolveRunnerImageForDispatch({
       owner: "BuildDownAI",
@@ -3240,7 +3337,7 @@ describe("GHA kg-refresh dispatch — runner_image resolution via resolveRunnerI
     });
 
     // Per-repo override wins regardless of orchestrator flag
-    expect(result).toBe("ghcr.io/org/custom-runner:sha-abc");
+    expect(result).toBe("ghcr.io/builddownai/custom-runner:sha-abc");
   });
 
   it("GHA and Fly resolve the same image ref for the same orchestrator (parity)", async () => {
@@ -3337,7 +3434,7 @@ describe("GHA kg-refresh dispatch — inputs shape contract", () => {
 
   it("runner_image included when image resolved from per-repo override (integration with resolveRunnerImageForDispatch)", async () => {
     __clearRepoImageCacheForTests();
-    const fetchImpl = kgRepoImageYml(githubFile("image: ghcr.io/org/custom-runner:sha-abc\n")).fetch;
+    const fetchImpl = kgRepoImageYml(githubFile("image: ghcr.io/builddownai/custom-runner:sha-abc\n")).fetch;
 
     const runnerImage = await resolveRunnerImageForDispatch({
       owner: "BuildDownAI",
@@ -3349,7 +3446,7 @@ describe("GHA kg-refresh dispatch — inputs shape contract", () => {
     });
 
     const inputs = buildKgRefreshDispatchInputs({ runConfig: "cfg", runToken: "tok", runProgressToken: "prog", runnerImage, runnerCallbackUrl: undefined });
-    expect(inputs.runner_image).toBe("ghcr.io/org/custom-runner:sha-abc");
+    expect(inputs.runner_image).toBe("ghcr.io/builddownai/custom-runner:sha-abc");
     expect(inputs.run_progress_token).toBe("prog");
   });
 });
@@ -5730,5 +5827,145 @@ describe("makeDevHarnessDependencyAuthStep", () => {
       "credential.https://github.com.helper",
       "/opt/ai-implement/git-credential-helper.sh",
     ]);
+  });
+});
+
+// ── runKgRefresh() with stage configuration (AII-960) ─────────────────────────
+
+import { NOW, SENTINEL_BEARER, envelopeEnv, fakeClient, makeGrant, makeSnapshot } from "./configured-run-fixture.js";
+import type { LLMExecutor, PipelineContext } from "../pipeline/types.js";
+
+describe("runKgRefresh stage configuration", () => {
+  let tmpDir: string;
+  const snap = makeSnapshot();
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgrun-cfg-"));
+    vi.stubEnv("GITHUB_OWNER", "org");
+    vi.stubEnv("GITHUB_REPO", "kg-repo");
+    vi.stubEnv("GITHUB_TOKEN", "tok");
+    vi.stubEnv("GITHUB_DEFAULT_BRANCH", "main");
+    vi.stubEnv("WORKSPACE_DIR", tmpDir);
+    for (const k of ["RUNNER_CALLBACK_URL", "RUN_PROGRESS_TOKEN", "RUN_TOKEN", "AI_IMPLEMENT_RUN_CONFIG", "AI_IMPLEMENT_DEP_TOKEN_OVERRIDE"]) vi.stubEnv(k, "");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  const throwingExecutor = (): LLMExecutor => ({ invoke: vi.fn().mockRejectedValue(new Error("a model was invoked")) });
+
+  function steps(seen: { ctx?: PipelineContext; clone: number }, pushError?: Error) {
+    return {
+      clone: { run: async () => { seen.clone++; return { workspaceDir: tmpDir, repoOwner: "org", repoRepo: "kg-repo", githubToken: "tok", clonedRef: "abc" }; } } as StepModule,
+      kgIngest: { run: async (ctx: PipelineContext) => { seen.ctx = ctx; return { statsFile: null }; } } as StepModule,
+      kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha" }, pushError),
+    };
+  }
+
+  const stub = (env: Record<string, string>) => {
+    for (const [k, v] of Object.entries(env)) vi.stubEnv(k, v);
+  };
+
+  it("fails before clone and ingest on a malformed configured envelope, with fixed text and no env fallback", async () => {
+    const bad = Buffer.from(JSON.stringify({ v: 1, issue: { id: "i", identifier: "K-1", title: "t", description: "d" }, agentConfig: { snapshotId: SENTINEL_BEARER } })).toString("base64");
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", bad);
+    const seen = { clone: 0 } as { ctx?: PipelineContext; clone: number };
+    const exec = throwingExecutor();
+    const err = await runKgRefresh({ workspaceDir: tmpDir, stepsOverride: steps(seen), llmExecutor: exec, reporter: { report: async () => undefined } }).catch((e) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toBe("Configured run rejected before execution: snapshot_incomplete");
+    expect(seen.clone).toBe(0);
+    expect(seen.ctx).toBeUndefined();
+    expect(exec.invoke).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a snapshot without a grant", () => envelopeEnv(snap, undefined)],
+    ["a grant without a snapshot", () => envelopeEnv(undefined, makeGrant(snap))],
+    ["an expired grant", () => envelopeEnv(snap, makeGrant(snap, { expiresAt: NOW }))],
+  ])("rejects %s before clone, with an injected executor never called", async (_label, env) => {
+    stub(env());
+    const seen = { clone: 0 } as { ctx?: PipelineContext; clone: number };
+    const exec = throwingExecutor();
+    const client = fakeClient();
+    await expect(
+      runKgRefresh({ workspaceDir: tmpDir, stepsOverride: steps(seen), llmExecutor: exec, reporter: { report: async () => undefined }, configured: { modelAuthClient: client, now: () => NOW } }),
+    ).rejects.toThrow(/Configured run rejected before execution/);
+    expect(seen.clone).toBe(0);
+    expect(exec.invoke).not.toHaveBeenCalled();
+    expect(client.checkout).not.toHaveBeenCalled();
+  });
+
+  it("carries the snapshot into the context, invokes zero models on the deterministic rail, and disposes", async () => {
+    stub(envelopeEnv(snap, makeGrant(snap)));
+    const seen = { clone: 0 } as { ctx?: PipelineContext; clone: number };
+    const exec = throwingExecutor();
+    const client = fakeClient();
+    const result = await runKgRefresh({
+      workspaceDir: tmpDir, stepsOverride: steps(seen), llmExecutor: exec, reporter: { report: async () => undefined },
+      configured: { modelAuthClient: client, now: () => NOW },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(seen.clone).toBe(1);
+    expect(seen.ctx!.data.agentConfig).toEqual(snap);
+    expect(seen.ctx!.llmExecutor).not.toBe(exec);
+    expect(JSON.stringify(seen.ctx!.data)).not.toContain(SENTINEL_BEARER);
+    expect(exec.invoke).not.toHaveBeenCalled();
+    expect(client.checkout).not.toHaveBeenCalled();
+    expect(client.invoke).not.toHaveBeenCalled();
+    expect(client.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("applies the selected stage settings to a model-driven repair call through the context executor", async () => {
+    stub(envelopeEnv(snap, makeGrant(snap)));
+    const client = fakeClient();
+    const claude: LLMExecutor = { invoke: vi.fn().mockResolvedValue({ stdout: "", exitCode: 0, tokensUsed: 0 }) };
+    const result = await runKgRefresh({
+      workspaceDir: tmpDir, llmExecutor: claude, reporter: { report: async () => undefined },
+      configured: { modelAuthClient: client, now: () => NOW },
+      stepsOverride: {
+        clone: makeStepModule({ workspaceDir: tmpDir }),
+        kgIngest: { run: async (ctx: PipelineContext) => { await ctx.llmExecutor.invoke({ prompt: "repair", model: "caller", agentStage: "review" }); return {}; } },
+        kgSnapshotPush: makeStepModule({ snapshotPushed: true }),
+      },
+    });
+    expect(result.exitCode).toBe(0);
+    expect((claude.invoke as ReturnType<typeof vi.fn>).mock.calls[0][0].model).toBe("claude-review");
+    expect(client.checkout).toHaveBeenCalledTimes(1);
+    expect(client.finish).toHaveBeenCalledWith("p-rev", "completed");
+    expect(client.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("finishes as failed when a step fails", async () => {
+    stub(envelopeEnv(snap, makeGrant(snap)));
+    const client = fakeClient();
+    const seen = { clone: 0 } as { ctx?: PipelineContext; clone: number };
+    const result = await runKgRefresh({
+      workspaceDir: tmpDir, stepsOverride: steps(seen, new Error("push failed")), reporter: { report: async () => undefined },
+      configured: { modelAuthClient: client, now: () => NOW },
+    });
+    expect(result.exitCode).toBe(1);
+    expect(client.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the warn-and-continue behavior for a legacy malformed envelope and for no envelope", async () => {
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", "%%%not-an-envelope");
+    const seen = { clone: 0 } as { ctx?: PipelineContext; clone: number };
+    const exec = throwingExecutor();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const r1 = await runKgRefresh({ workspaceDir: tmpDir, stepsOverride: steps(seen), llmExecutor: exec, reporter: { report: async () => undefined } });
+    expect(r1.exitCode).toBe(0);
+    expect(warn).toHaveBeenCalled();
+    expect(seen.ctx!.llmExecutor).toBe(exec);
+    expect(seen.ctx!.data.agentConfig).toBeUndefined();
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", "");
+    const seen2 = { clone: 0 } as { ctx?: PipelineContext; clone: number };
+    const r2 = await runKgRefresh({ workspaceDir: tmpDir, stepsOverride: steps(seen2), llmExecutor: exec, reporter: { report: async () => undefined } });
+    expect(r2.exitCode).toBe(0);
+    expect(seen2.ctx!.llmExecutor).toBe(exec);
+    expect(exec.invoke).not.toHaveBeenCalled();
+    warn.mockRestore();
   });
 });

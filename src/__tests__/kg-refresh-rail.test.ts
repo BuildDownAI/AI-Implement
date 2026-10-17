@@ -494,7 +494,7 @@ describe("kg-refresh-rail", () => {
         { permissions: { contents: "write", pull_requests: "write" }, repositories: ["test-kg"] },
       );
       expect(postPrCommentFn).toHaveBeenCalledWith("tok", "TestOrg", "test-kg", 9, expect.stringContaining("alice@example.com"));
-      expect(postPrCommentFn.mock.calls[0]![4]).toContain("### Baseline");
+      expect((postPrCommentFn.mock.calls[0] as unknown[])[4]).toContain("### Baseline");
     });
 
     it("postDryRunReport posts the sticky comment and sets the commit status on success", async () => {

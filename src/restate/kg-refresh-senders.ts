@@ -5,11 +5,11 @@
  * The kg-refresh form of the backend-selected deps in `planning-run-production.ts`. */
 import type { AppConfig } from "../index.js";
 import { parseKgSourceRepo } from "../deploy.js";
-import { buildKgRefreshGhaDispatchBody, postWorkflowDispatch } from "../github.js";
+import { buildKgRefreshGhaDispatchBody, buildPrivateKgRefreshGhaDispatchBody, postWorkflowDispatch } from "../github.js";
 import { buildSessionMachineConfig, generateSessionToken } from "../fly-machines.js";
 import type { startLocalRunnerContainer } from "../local-docker.js";
-import type { getInstallationToken } from "../github-app-auth.js";
-import type { resolveRunnerImageForDispatch } from "../repo-image.js";
+import type { getInstallationToken, getScopedInstallationToken } from "../github-app-auth.js";
+import { RunnerImageNotAllowedError, type resolveRunnerImageForDispatch } from "../repo-image.js";
 import { encodeRunConfig, type RunConfigV1 } from "../run-config.js";
 import type { resolveWorkflowCapabilities } from "../workflow-probe.js";
 import type { KgRailDeps } from "../kg-refresh-rail.js";
@@ -46,6 +46,8 @@ export interface KgRefreshSenderDeps {
   postWorkflowDispatch: typeof postWorkflowDispatch;
   keptMachineFly: () => KeptMachineFly;
   startLocalRunnerContainer: typeof startLocalRunnerContainer;
+  /** Mints the boot token scoped to the KG source repository alone (AII-990). */
+  getScopedInstallationToken: typeof getScopedInstallationToken;
 }
 
 export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExecutionMode, KgRefreshSender> {
@@ -56,6 +58,13 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
     return parseKgSourceRepo(config.kgSourceRepo);
   };
 
+  /** The token a Fly or local runner boots with, scoped to the KG repository alone (AII-990). A failure aborts
+   *  the launch; there is deliberately no fallback to the installation-wide control-plane token. */
+  const repoBootToken = async (repo: { owner: string; repo: string }): Promise<string> => {
+    const scoped = await deps.getScopedInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner, { repositories: [repo.repo] });
+    return scoped.token;
+  };
+
   const requireNonce = (input: KgRefreshSendInput): string => {
     if (input.machineNonce === null) throw new Error("[kg-refresh] machineNonce is required for a machine backend");
     return input.machineNonce;
@@ -63,6 +72,10 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
 
   const flyMachines: KgRefreshSender = async (input) => {
     const executionMode = "fly-machines";
+    if (input.envelope.agentConfig !== undefined || input.envelope.credentials?.modelAuthGrant !== undefined) {
+      console.error("[kg-refresh] refused: a KG refresh envelope carries model authentication");
+      return { outcome: "rejected", jobId: null, executionMode: executionMode };
+    }
     if (!config.flySessionsToken || !config.flySessionsApp) {
       // A definitive rejection: retrying cannot configure the app, and the workflow ends the run dispatch_rejected.
       console.error("[kg-refresh] fly-machines execution path selected but FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured");
@@ -70,20 +83,27 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
     }
     const machineNonce = requireNonce(input);
     const repo = sourceRepo();
+    // Narrow mint first: a failure aborts the launch with no fallback to the broad token.
+    const bootToken = await repoBootToken(repo);
     const ghToken = await deps.getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
     const defaultBranch = (await deps.fetchDefaultBranch(ghToken, repo.owner, repo.repo)) ?? "main";
     const sessionToken = generateSessionToken();
     const extraEnv: Record<string, string> = {
       AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(input.envelope),
-      RUN_PROGRESS_TOKEN: input.tokens.progressToken,
     };
-    const flySessionImage = await deps.resolveRunnerImage({
-      owner: repo.owner,
-      repo: repo.repo,
-      token: ghToken,
-      defaultImage: config.sessionImage,
-      runnerImageExplicit: config.runnerImageExplicit,
-    }) ?? config.sessionImage;
+    let flySessionImage: string;
+    try {
+      flySessionImage = await deps.resolveRunnerImage({
+        owner: repo.owner,
+        repo: repo.repo,
+        token: bootToken,
+        defaultImage: config.sessionImage,
+        runnerImageExplicit: config.runnerImageExplicit,
+      }) ?? config.sessionImage;
+    } catch (err) {
+      if (err instanceof RunnerImageNotAllowedError) return { outcome: "rejected", jobId: null, executionMode };
+      throw err;
+    }
     const machineConfig = buildSessionMachineConfig({
       image: flySessionImage,
       issueId: "kg-refresh",
@@ -95,13 +115,15 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
       defaultBranch,
       anthropicApiKey: config.anthropicApiKey ?? undefined,
       claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-      githubToken: ghToken,
+      githubToken: bootToken,
       sessionToken,
       machineNonce,
       phase: "kg-refresh",
       orchestratorUrl: config.runnerCallbackBaseUrl ?? undefined,
       runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
       runToken: input.tokens.runToken,
+      runProgressToken: input.tokens.progressToken,
+      runPublicationToken: input.tokens.publicationToken,
       orchestratorApp: process.env.FLY_APP_NAME,
       expectedTtlSeconds: 4 * 60 * 60,
       extraEnv,
@@ -135,6 +157,11 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
   };
 
   const localDocker: KgRefreshSender = async (input) => {
+    const executionMode = "local-docker";
+    if (input.envelope.agentConfig !== undefined || input.envelope.credentials?.modelAuthGrant !== undefined) {
+      console.error("[kg-refresh] refused: a KG refresh envelope carries model authentication");
+      return { outcome: "rejected", jobId: null, executionMode: executionMode };
+    }
     if (!config.localRunnerImage) {
       throw new Error(
         "[kg-refresh] local-docker execution path selected but LOCAL_RUNNER_IMAGE is not configured",
@@ -142,12 +169,12 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
     }
     const machineNonce = requireNonce(input);
     const repo = sourceRepo();
+    const bootToken = await repoBootToken(repo);
     const ghToken = await deps.getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
     const defaultBranch = (await deps.fetchDefaultBranch(ghToken, repo.owner, repo.repo)) ?? "main";
     const sessionToken = generateSessionToken();
     const extraEnv: Record<string, string> = {
       AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(input.envelope),
-      RUN_PROGRESS_TOKEN: input.tokens.progressToken,
     };
     const localOrchestratorUrl =
       config.localRunnerOrchestratorUrl ??
@@ -164,40 +191,56 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
       defaultBranch,
       anthropicApiKey: config.anthropicApiKey ?? undefined,
       claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-      githubToken: ghToken,
+      githubToken: bootToken,
       sessionToken,
       machineNonce,
       phase: "kg-refresh",
       orchestratorUrl: localOrchestratorUrl,
       runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
       runToken: input.tokens.runToken,
+      runProgressToken: input.tokens.progressToken,
+      runPublicationToken: input.tokens.publicationToken,
       extraEnv,
     });
     console.log(`[kg-refresh] dispatched via local Docker (dispatchId=${input.dispatchId})`);
-    return { outcome: "accepted", jobId: containerId, executionMode: "local-docker", machineId: null, created: false };
+    return { outcome: "accepted", jobId: containerId, executionMode, machineId: null, created: false };
   };
 
   const githubActions: KgRefreshSender = async (input) => {
     const executionMode = "github-actions";
+    if (input.envelope.agentConfig !== undefined || input.envelope.credentials?.modelAuthGrant !== undefined) {
+      console.error("[kg-refresh] refused: a KG refresh envelope carries model authentication");
+      return { outcome: "rejected", jobId: null, executionMode: executionMode };
+    }
     const repo = sourceRepo();
     const encoded = encodeRunConfig(input.envelope);
     const { token } = await deps.mintToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
     const defaultBranch = await deps.fetchDefaultBranch(token, repo.owner, repo.repo).catch(() => "main");
-    const runnerImage = await deps.resolveRunnerImage({
-      owner: repo.owner, repo: repo.repo, token,
-      defaultImage: config.sessionImage, runnerImageExplicit: config.runnerImageExplicit,
-    });
+    let runnerImage: string | undefined;
+    try {
+      runnerImage = await deps.resolveRunnerImage({
+        owner: repo.owner, repo: repo.repo, token,
+        defaultImage: config.sessionImage, runnerImageExplicit: config.runnerImageExplicit,
+      });
+    } catch (err) {
+      if (err instanceof RunnerImageNotAllowedError) return { outcome: "rejected", jobId: null, executionMode };
+      throw err;
+    }
     const ref = input.envelope.kgSourceRef ?? defaultBranch ?? "main";
-    const { supportsRunPublicationToken } = await deps.resolveWorkflowCapabilities({
+    const { supportsRunPublicationToken, supportsPrivateRunConfig } = await deps.resolveWorkflowCapabilities({
       owner: repo.owner, repo: repo.repo, workflowFile: KG_REFRESH_WORKFLOW_FILE, token, ref,
     });
     if (input.jobTimeoutMinutes === null) throw new Error("GitHub Actions dispatch needs jobTimeoutMinutes from GhaRunProfile");
-    const inputs = buildKgRefreshGhaDispatchBody({
+    const kgBodyOpts = {
       runConfig: encoded, runToken: input.tokens.runToken, runProgressToken: input.tokens.progressToken,
       ...(supportsRunPublicationToken ? { runPublicationToken: input.tokens.publicationToken } : {}),
       runnerImage, runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
-      runnerPhase: "kg-refresh", jobTimeoutMinutes: String(input.jobTimeoutMinutes), issueIdentifier: input.envelope.issue.identifier,
-    });
+      runnerPhase: "kg-refresh" as const, jobTimeoutMinutes: String(input.jobTimeoutMinutes), issueIdentifier: input.envelope.issue.identifier,
+    };
+    // A strictly capable reader takes the bearers in the private run config; anything else keeps the masked inputs.
+    const inputs = supportsPrivateRunConfig === true
+      ? buildPrivateKgRefreshGhaDispatchBody({ ...kgBodyOpts, trustedConfig: input.envelope })
+      : buildKgRefreshGhaDispatchBody(kgBodyOpts);
     const result = await deps.postWorkflowDispatch({
       token, owner: repo.owner, repo: repo.repo, workflowFile: KG_REFRESH_WORKFLOW_FILE,
       ref, inputs, returnRunDetails: true,
