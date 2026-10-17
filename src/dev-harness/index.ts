@@ -752,6 +752,7 @@ export async function stopDevRun(handle: DevRunHandle): Promise<void> {
 export async function collectRunArtifacts(
   handle: DevRunHandle,
   exitCode: number | null,
+  cancelled = false,
 ): Promise<void> {
   const { artifactsDir, workspace, containerId, runId, task, startedAt } = handle;
 
@@ -800,7 +801,9 @@ export async function collectRunArtifacts(
     identifier: task.identifier,
     title: task.title,
     phase: handle.phase,
+    // Observed Docker exit; null when unknown. Never a statement about operator cancellation.
     exitCode,
+    ...(cancelled ? { cancelled: true, cancellation: { logicalExit: 130 } } : {}),
     startedAt: startedAt.toISOString(),
     endedAt: new Date().toISOString(),
     durationMs: Date.now() - startedAt.getTime(),

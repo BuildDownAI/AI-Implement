@@ -251,6 +251,25 @@ held for the same session file, inspect the artifact directory before trying
 again. A partial artifact set should still show the source proof, image proof,
 selected stages, and the step where execution stopped.
 
+### Cancelled runs and the session lock
+
+On SIGINT/SIGTERM the harness stops the container, closes the credential bridge (draining in-flight
+checkouts), probes Docker, and then settles the lease. It prints one line, `[dev:run] local session lease:
+released` or `held (<category>)`; the line never carries a lock token, a path, or session values.
+
+- **released** — no disposition arrived, but the lease was provably unused (no checkout, no refresh) and
+  Docker confirmed the container is gone. Ownership's `releaseUnused` made that call and removed the lock.
+- **held** — the lease was used or refreshed, the owner is stale, or termination was not confirmed. The
+  lock stays as it is; a held run is never reported as success. `telemetry.json` keeps `exitCode` as the
+  Docker exit (`null` when unknown) and adds `cancelled: true` with `cancellation.logicalExit: 130`, so exit
+  `0` plus a cancellation is not a successful run.
+
+A used lock from a killed runner stays `state: owned` with no hold reason. Do not clear it from the filename
+or age alone. Before removing it, confirm all of: the container is gone (`docker ps -a` shows no container for
+the run), no runner process for that session is alive, and the session record is intact and was persisted
+(a refreshed session may exist only in the container's lost state — if in doubt, re-login rather than
+reuse). Only then remove that one `.ai-lock` file by hand. The harness never does this automatically.
+
 ## Hosted Codex job in local Docker
 
 `npm run dev:local` can launch an implementation run of an opted-in project in local Docker with a

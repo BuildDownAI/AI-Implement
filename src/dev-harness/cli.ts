@@ -10,6 +10,7 @@ import {
   streamLogsUntilShellReady,
 } from "./index.js";
 import type { DevRunHandle } from "./index.js";
+import { LocalAgentConfigError } from "../local/agent-config.js";
 
 export interface DevHarnessCliDependencies {
   startDevRun: typeof startDevRun;
@@ -86,7 +87,22 @@ function monitorCancellation(handle: DevRunHandle, deps: DevHarnessCliDependenci
   };
 }
 
-async function finalizeLocalAuth(handle: DevRunHandle, deps: DevHarnessCliDependencies): Promise<void> {
+function leaseFailureCategories(error: unknown): string {
+  const errors = error instanceof AggregateError ? error.errors : [error];
+  const categories = errors.map((e) => (e instanceof LocalAgentConfigError ? e.category : "ownership_failed"));
+  return [...new Set(categories)].join(",");
+}
+
+/**
+ * Stops short of any release the ownership layer would not itself allow: a cancelled run with no
+ * terminal disposition goes through `releaseUnused`, which refuses used/refreshed/stale leases.
+ * The reported line carries only the lease state and a safe error category.
+ */
+async function finalizeLocalAuth(
+  handle: DevRunHandle,
+  deps: DevHarnessCliDependencies,
+  cancelled: boolean,
+): Promise<void> {
   if (!handle.localAuth) return;
   let state: Awaited<ReturnType<DevHarnessCliDependencies["getRunStatus"]>> | undefined;
   try {
@@ -96,12 +112,20 @@ async function finalizeLocalAuth(handle: DevRunHandle, deps: DevHarnessCliDepend
   }
   await handle.localAuth.close().catch(() => undefined);
   const proof = state?.running === false && state.exitCode !== null ? "confirmed" : "unknown";
-  await handle.localAuth.releaseAfterTermination(async () => proof).catch(() => undefined);
+  const noDisposition = handle.localAuth.safeDisposition !== true;
+  if (noDisposition && !cancelled) return;
+  try {
+    if (noDisposition) await handle.localAuth.releaseUnused(async () => proof);
+    else await handle.localAuth.releaseAfterTermination(async () => proof);
+    deps.writeStderr("[dev:run] local session lease: released\n");
+  } catch (error) {
+    deps.writeStderr(`[dev:run] local session lease: held (${leaseFailureCategories(error)}); see docs/local-feedback.md\n`);
+  }
 }
 
-async function cleanupDevRun(handle: DevRunHandle, deps: DevHarnessCliDependencies): Promise<void> {
+async function cleanupDevRun(handle: DevRunHandle, deps: DevHarnessCliDependencies, cancelled: boolean): Promise<void> {
   try {
-    await finalizeLocalAuth(handle, deps);
+    await finalizeLocalAuth(handle, deps, cancelled);
   } finally {
     await handle.sourceWorkspaceCleanup?.().catch(() => undefined);
   }
@@ -230,14 +254,14 @@ export async function runDevHarnessCli(
         );
         if (shellExitCode !== 0) finalExitCode = shellExitCode;
 
-        await deps.collectRunArtifacts(handle, finalExitCode);
+        await deps.collectRunArtifacts(handle, finalExitCode, cancel.wasCancelled());
         artifactsCollected = true;
       } else {
         const state = await deps.getRunStatus(handle);
         finalExitCode = state.exitCode;
       }
 
-      if (!artifactsCollected) await deps.collectRunArtifacts(handle, finalExitCode);
+      if (!artifactsCollected) await deps.collectRunArtifacts(handle, finalExitCode, cancel.wasCancelled());
       const durationSec = ((deps.now() - handle.startedAt.getTime()) / 1000).toFixed(1);
       deps.writeStderr(
         `[dev:run] done: exit=${finalExitCode ?? "unknown"} duration=${durationSec}s\n` +
@@ -248,7 +272,7 @@ export async function runDevHarnessCli(
     } finally {
       cancel.dispose();
       await cancel.waitForStop();
-      await cleanupDevRun(handle, deps);
+      await cleanupDevRun(handle, deps, cancel.wasCancelled());
       deps.writeStderr("[dev:run] removing container...\n");
       await deps.stopSession(handle).catch(() => undefined);
     }
@@ -261,7 +285,7 @@ export async function runDevHarnessCli(
     const state = await deps.getRunStatus(handle);
     const exitCode = state.exitCode;
     const durationSec = ((deps.now() - handle.startedAt.getTime()) / 1000).toFixed(1);
-    await deps.collectRunArtifacts(handle, exitCode);
+    await deps.collectRunArtifacts(handle, exitCode, cancel.wasCancelled());
     deps.writeStderr(
       `[dev:run] done: exit=${exitCode ?? "unknown"} duration=${durationSec}s\n` +
       `[dev:run] artifacts saved to ${handle.artifactsDir}/\n` +
@@ -271,7 +295,7 @@ export async function runDevHarnessCli(
   } finally {
     cancel.dispose();
     await cancel.waitForStop();
-    await cleanupDevRun(handle, deps);
+    await cleanupDevRun(handle, deps, cancel.wasCancelled());
     if (cancel.wasCancelled()) await deps.stopSession(handle).catch(() => undefined);
   }
 }
