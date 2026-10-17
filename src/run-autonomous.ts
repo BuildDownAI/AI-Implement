@@ -70,7 +70,7 @@ import {
   replyToDispositionThreads,
   type FindingDisposition,
 } from "./pipeline/finding-dispositions.js";
-import { readCycleSummaries } from "./pipeline/cycle-summary.js";
+import { buildPublicationCycleSummary, readCycleSummaries } from "./pipeline/cycle-summary.js";
 import type { GhSpawn } from "./pipeline/review-ledger.js";
 import { DEFAULT_MODEL } from "./pipeline/default-model.js";
 
@@ -582,7 +582,17 @@ async function reportRunnerResult(
   env: NodeJS.ProcessEnv,
   params: Omit<Parameters<typeof postRunnerResult>[0], "reviewFix" | "cycleSummaries">,
 ): Promise<void> {
-  const cycleSummaries = identity ? readCycleSummaries(params.workspaceDir) : [];
+  const recorded = identity ? readCycleSummaries(params.workspaceDir) : [];
+  // After a successful push, one distinct publication record carries the real pushed commit and the
+  // agent's validated dispositions; the immutable pre-push records are forwarded unchanged before it.
+  const publication = identity
+    ? buildPublicationCycleSummary(
+        recorded,
+        outputCommit,
+        (params.findingDispositions ?? []).map((d) => ({ key: d.findingKey, disposition: d.disposition })),
+      )
+    : null;
+  const cycleSummaries = publication ? [...recorded, publication] : recorded;
   const progressToken = env.RUN_PROGRESS_TOKEN?.trim();
   const callbackUrl = params.callbackUrl ?? env.RUNNER_CALLBACK_URL;
   if (identity && cycleSummaries.length > 0) {

@@ -4988,6 +4988,28 @@ describe("handleRunnerCycleSummary — independent pilot evidence", () => {
     expect(reviewFixEvidence.getReviewFixCycleSummary(attemptId, 1)?.completedAt).toBe(summary.completedAt);
   });
 
+  it("records the publication cycle after pre-push cycles, idempotently, without touching them", () => {
+    const token = preparedToken();
+    const post = (entry: CycleSummary) => runnerCallback.handleRunnerCycleSummary({
+      authorization: `Bearer ${token}`, secret: SECRET, body: { summary: entry },
+    });
+    const head = "b".repeat(40);
+    const key = "c".repeat(64);
+    const pending: CycleSummary = { ...summary, outputCommitStatus: "pending_push", tests: [{ name: "test execution", status: "missing" }] };
+    const publication: CycleSummary = {
+      ...pending, id: "publication.1", stage: "publication", cycle: 1, outputCommit: head, outputCommitStatus: "committed",
+      dispositions: [{ key, disposition: "fixed" }],
+    };
+    expect(post(pending)).toMatchObject({ status: 200, body: { outcome: "recorded" } });
+    expect(post(publication)).toMatchObject({ status: 200, body: { outcome: "recorded" } });
+    expect(post(publication)).toMatchObject({ status: 200, body: { outcome: "duplicate" } });
+    expect(post({ ...publication, outputCommit: "d".repeat(40) }).status).toBe(409);
+    const rows = reviewFixEvidence.listReviewFixCycleSummaries(attemptId);
+    expect(rows.map((r) => r.outputCommit)).toEqual([null, head]);
+    expect(rows.at(-1)?.dispositions).toEqual([{ findingKey: key, disposition: "addressed" }]);
+    expect(rows[0]?.tests).toEqual([{ name: "test execution", status: "missing" }]);
+  });
+
   it("strips malformed attribution and still records the cycle summary", () => {
     const token = preparedToken();
     const res = runnerCallback.handleRunnerCycleSummary({

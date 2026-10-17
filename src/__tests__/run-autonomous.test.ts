@@ -1005,7 +1005,7 @@ describe("runAutonomous", () => {
     });
 
     it("forwards this run's declared cycle summaries alongside an attached reviewFix marker (AII-801)", async () => {
-      stubReviewFixEnvelope();
+      stubReviewFixEnvelope({}, { prNumber: "42" });
       vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
       vi.stubEnv("RUN_TOKEN", "run-token");
       vi.stubEnv("RUN_PROGRESS_TOKEN", "pilot-progress");
@@ -1029,6 +1029,8 @@ describe("runAutonomous", () => {
       };
       mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
       writeFileSync(join(workspaceDir, CYCLE_SUMMARY_FILE), `${JSON.stringify(cycleSummary)}\n`);
+      writeFileSync(join(workspaceDir, "ai-output", "finding-dispositions.json"),
+        JSON.stringify([{ findingKey: "f".repeat(64), disposition: "fixed", reason: "done" }]));
 
       const publishedCommit = "b".repeat(40);
       const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
@@ -1060,8 +1062,57 @@ describe("runAutonomous", () => {
       expect(result.exitCode).toBe(0);
       expect(mockFetch.mock.calls[0][0]).toBe("https://orchestrator.example/runner/cycle-summary");
       expect(JSON.parse(mockFetch.mock.calls[0][1].body as string)).toEqual({ summary: cycleSummary });
-      const body = JSON.parse(mockFetch.mock.calls[1][1].body as string) as { cycleSummaries?: CycleSummary[] };
-      expect(body.cycleSummaries).toEqual([cycleSummary]);
+      // The pre-push record is forwarded unchanged; a distinct publication record follows with the
+      // real pushed commit and the validated dispositions file, then the result.
+      const findingKey = "f".repeat(64);
+      const publication = JSON.parse(mockFetch.mock.calls[1][1].body as string).summary as CycleSummary;
+      expect(mockFetch.mock.calls[1][0]).toBe("https://orchestrator.example/runner/cycle-summary");
+      expect(publication).toMatchObject({ id: "publication.1", stage: "publication", outputCommit: publishedCommit,
+        outputCommitStatus: "committed", dispositions: [{ key: findingKey, disposition: "fixed" }],
+        tests: cycleSummary.tests, verdict: cycleSummary.verdict, usage: cycleSummary.usage });
+      const body = JSON.parse(mockFetch.mock.calls[2][1].body as string) as { cycleSummaries?: CycleSummary[] };
+      expect(body.cycleSummaries).toEqual([cycleSummary, publication]);
+    });
+
+    it("publishes only validated dispositions: invalid entries are dropped and an unpushed run emits no publication record", async () => {
+      stubReviewFixEnvelope({}, { prNumber: "42" });
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("RUN_PROGRESS_TOKEN", "pilot-progress");
+      vi.stubEnv("GITHUB_RUN_ID", "999888");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
+      const pending: CycleSummary = {
+        id: "feedback-loop.1", stage: "feedback-loop", cycle: 1, inputCommit: "a".repeat(40), outputCommit: null,
+        outputCommitStatus: "pending_push", dispositions: [], tests: [{ name: "test execution", status: "missing" }],
+        verdict: { approved: true, reason: "approved" }, usage: { tokensIn: null, tokensOut: null, costUsd: null },
+        truncated: false, limitReached: false, completedAt: 1_700_000_000_000,
+      };
+      mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
+      writeFileSync(join(workspaceDir, CYCLE_SUMMARY_FILE), `${JSON.stringify(pending)}\n`);
+      writeFileSync(join(workspaceDir, "ai-output", "finding-dispositions.json"), JSON.stringify([
+        { findingKey: "f".repeat(64), disposition: "bogus", reason: "done" },
+        { findingKey: "", disposition: "fixed", reason: "done" },
+      ]));
+      const pushed = { prUrl: "https://github.com/acme/app/pull/42", prNumber: 42, branchPushed: true, commitSha: "b".repeat(40), draft: false };
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["push", { run: vi.fn().mockResolvedValue(pushed) }],
+      ]);
+      await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeMockExecutor(0), fetchImpl: mockFetch });
+      const publication = JSON.parse(mockFetch.mock.calls[1][1].body as string).summary as CycleSummary;
+      expect(publication).toMatchObject({ id: "publication.1", outputCommit: "b".repeat(40), dispositions: [] });
+
+      // Nothing was pushed (no commit): the pending record alone is forwarded and no publication is built.
+      mockFetch.mockClear();
+      const none = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["push", { run: vi.fn().mockResolvedValue({ ...pushed, commitSha: undefined }) }],
+      ]);
+      await runAutonomous({ workspaceDir, pipeline: none.pipeline, runner: none.runner, reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0), fetchImpl: mockFetch });
+      const ids = mockFetch.mock.calls.map((c) => (JSON.parse(c[1].body as string) as { summary?: CycleSummary }).summary?.id).filter(Boolean);
+      expect(ids).toEqual(["feedback-loop.1"]);
     });
 
     it("delivers a failed cycle before no-output pilot result is skipped", async () => {

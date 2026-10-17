@@ -53,7 +53,7 @@ export interface CycleSummary {
    *  different content is rejected (the first-recorded summary wins) rather than silently
    *  replacing it — see `appendCycleSummary`. */
   id: string;
-  stage: "feedback-loop" | "post-push-review-fix";
+  stage: "feedback-loop" | "post-push-review-fix" | "publication";
   cycle: number;
   inputCommit: string | null;
   outputCommit: string | null;
@@ -158,7 +158,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export function isCycleSummary(value: unknown): value is CycleSummary {
   if (!isRecord(value)) return false;
   if (typeof value.id !== "string" || value.id.length === 0 || value.id.length > 128) return false;
-  if (value.stage !== "feedback-loop" && value.stage !== "post-push-review-fix") return false;
+  if (value.stage !== "feedback-loop" && value.stage !== "post-push-review-fix" && value.stage !== "publication") return false;
   if (!Number.isSafeInteger(value.cycle) || (value.cycle as number) <= 0) return false;
   if ((value.inputCommit !== null && (typeof value.inputCommit !== "string" || value.inputCommit.length > 40))
     || (value.outputCommit !== null && (typeof value.outputCommit !== "string" || value.outputCommit.length > 40))) return false;
@@ -262,6 +262,45 @@ function appendCycleSummary(workspaceDir: string, record: CycleSummary): void {
   }
   const all = [...existing, record];
   fs.writeFileSync(filePath, `${all.map((s) => JSON.stringify(s)).join("\n")}\n`, "utf-8");
+}
+
+export const PUBLICATION_CYCLE_ID = "publication.1";
+
+/**
+ * Builds the one distinct publication record emitted after the pipeline-owned push succeeds. The
+ * immutable pre-push `feedback-loop.N` records stay `pending_push`/`outputCommit:null`; this record
+ * carries the actual pushed commit and the agent's validated dispositions, and reuses the final
+ * feedback-loop cycle's tests, verdict and usage verbatim (missing stays missing, null stays null).
+ * Returns null without a feedback-loop source cycle or a pushed commit. `completedAt` is derived from
+ * the source cycle, so every delivery of the same run is byte-identical (idempotent, never a 409).
+ */
+export function buildPublicationCycleSummary(
+  summaries: readonly CycleSummary[],
+  outputCommit: string | null,
+  dispositions: readonly CycleDisposition[],
+): CycleSummary | null {
+  if (!outputCommit || outputCommit.length > 40) return null;
+  const feedback = summaries.filter((s) => s.stage === "feedback-loop");
+  const source = feedback.reduce<CycleSummary | null>((best, s) => (!best || s.cycle > best.cycle ? s : best), null);
+  if (!source) return null;
+  const record: CycleSummary = {
+    id: PUBLICATION_CYCLE_ID,
+    stage: "publication",
+    cycle: 1,
+    inputCommit: source.inputCommit,
+    outputCommit,
+    outputCommitStatus: "committed",
+    dispositions: dispositions.slice(0, MAX_DISPOSITION_ENTRIES).map((d) => ({
+      key: d.key.slice(0, MAX_DISPOSITION_FIELD_CHARS), disposition: d.disposition.slice(0, MAX_DISPOSITION_FIELD_CHARS),
+    })),
+    tests: source.tests,
+    verdict: source.verdict,
+    usage: source.usage,
+    truncated: source.truncated,
+    limitReached: source.limitReached,
+    completedAt: source.completedAt,
+  };
+  return isCycleSummary(record) ? record : null;
 }
 
 /** Redacts, then caps `value` to `maxChars`; `truncated` is explicit rather than inferred from

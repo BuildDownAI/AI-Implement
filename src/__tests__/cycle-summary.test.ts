@@ -10,6 +10,7 @@ import {
   toolTraceLines,
   CYCLE_SUMMARY_FILE,
   CYCLE_SUMMARY_MAX_BYTES,
+  buildPublicationCycleSummary,
   type CycleSummaryInput,
 } from "../pipeline/cycle-summary.js";
 import type { RunTelemetry } from "../pipeline/types.js";
@@ -352,5 +353,30 @@ describe("attribution contract (AII-946)", () => {
     expect(legacy).toEqual({ value: base, stripped: false });
     const withExtra = stripCycleAttribution({ ...base, attribution: { ...attr(), usage: null } });
     expect((withExtra.value as { attribution: unknown }).attribution).toEqual(sanitizeAttribution({ ...attr(), usage: null }));
+  });
+});
+
+describe("buildPublicationCycleSummary", () => {
+  const dir = () => mkdtempSync(join(tmpdir(), "pub-cycle-"));
+  it("copies tests/verdict/usage from the last feedback-loop cycle and carries the pushed commit", () => {
+    const d = dir();
+    try {
+      writeCycleSummary(d, baseInput({ tests: [{ name: "test execution", status: "missing" }], usage: { tokensIn: null, tokensOut: null, costUsd: null } }));
+      const second = writeCycleSummary(d, baseInput({ id: "feedback-loop.2", cycle: 2, tests: [{ name: "test execution", status: "missing" }],
+        verdict: { approved: false, reason: "rejected" }, usage: { tokensIn: null, tokensOut: null, costUsd: null } }));
+      const pub = buildPublicationCycleSummary(readCycleSummaries(d), "e".repeat(40), [{ key: "k", disposition: "fixed" }]);
+      expect(pub).toMatchObject({ id: "publication.1", stage: "publication", outputCommit: "e".repeat(40), outputCommitStatus: "committed",
+        tests: [{ name: "test execution", status: "missing" }], verdict: { approved: false, reason: "rejected" },
+        usage: { tokensIn: null, tokensOut: null, costUsd: null }, completedAt: second.completedAt, dispositions: [{ key: "k", disposition: "fixed" }] });
+      expect(readCycleSummaries(d).every((s) => s.outputCommit === null)).toBe(true);
+    } finally { rmSync(d, { recursive: true, force: true }); }
+  });
+  it("returns null without a pushed commit or a feedback-loop source", () => {
+    const d = dir();
+    try {
+      expect(buildPublicationCycleSummary([], "e".repeat(40), [])).toBeNull();
+      writeCycleSummary(d, baseInput());
+      expect(buildPublicationCycleSummary(readCycleSummaries(d), null, [])).toBeNull();
+    } finally { rmSync(d, { recursive: true, force: true }); }
   });
 });
