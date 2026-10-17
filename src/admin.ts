@@ -124,10 +124,9 @@ import { enqueueWorkflowSync, runWorkflowSync, getWorkflowSyncById } from "./wor
 import { isBareWorkflowFileName, workflowFileNamesCollide } from "./workflow-sync.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import { normalizeGitHubRepo, normalizeReferenceRepos, type ReferenceRepo } from "./reference-repos.js";
-import { fetchTrackerIssuesPage } from "./runner-callback.js";
-import { isLinearAuthConfigured } from "./linear-app-auth.js";
 import { resolveWorkflowCapabilities } from "./workflow-probe.js";
 import type { callTool } from "./restate/tools-client.js";
+import type { TrackerExportIngressClient } from "./restate/tracker-export.js";
 import type { RestateStatus } from "./restate/status.js";
 import type { Caller } from "./mcp-identity.js";
 import picomatch from "picomatch";
@@ -337,28 +336,22 @@ export function clearDedupEntryAction(issueId: string): { status: number; body: 
 }
 
 /**
- * Loops fetchTrackerIssuesPage across every page for a team, returning the flat
+ * Loops `TrackerExport.page` across every page for a team, returning the flat
  * issue array the kg-refresh dev harness's `--tracker-data` file expects
  * (`Array.isArray(parsed) ? parsed.length : 0` in kg-tracker-data.ts). A
- * non-200 page short-circuits and its status/error propagate to the caller.
+ * non-OK page short-circuits and its code propagates to the caller.
  */
 async function fetchAllTrackerIssuesForTeam(
+  trackerExport: TrackerExportIngressClient,
   teamKey: string,
-): Promise<{ ok: true; issues: unknown[] } | { ok: false; status: number; error: string }> {
+): Promise<{ ok: true; issues: unknown[] } | { ok: false; code: string }> {
   const issues: unknown[] = [];
   let cursor: string | null = null;
   do {
-    const page = await fetchTrackerIssuesPage(teamKey, cursor);
-    if (page.status !== 200) {
-      const error = (page.body as { error?: string }).error ?? "Upstream tracker error";
-      return { ok: false, status: page.status, error };
-    }
-    const body = page.body as {
-      issues: unknown[];
-      pageInfo: { hasNextPage: boolean; endCursor: string | null };
-    };
-    issues.push(...body.issues);
-    cursor = body.pageInfo.hasNextPage ? body.pageInfo.endCursor : null;
+    const result = await trackerExport.page({ team: teamKey, cursor });
+    if (!result.ok) return { ok: false, code: result.code };
+    issues.push(...result.page.issues);
+    cursor = result.page.pageInfo.hasNextPage ? result.page.pageInfo.endCursor : null;
   } while (cursor !== null);
   return { ok: true, issues };
 }
@@ -552,6 +545,8 @@ export interface AdminDeps {
   };
   /** The tools-service ingress caller (src/restate/tools-client.ts, AII-710). Absent only in tests that don't exercise POST /api/tools/<name>. */
   callTool?: typeof callTool;
+  /** The `TrackerExport` ingress client (AII-1463), bound in src/index.ts. Absent only in tests that don't exercise GET /api/kg/tracker-data; the route answers 503 `unavailable` then. */
+  trackerExport?: TrackerExportIngressClient;
   /** Re-reads `RunnerBackend/fly-machines` into the cache after a Settings write. Defaults to `refreshRunnerBackendCache`; a test seam. */
   refreshRunnerBackendCache?: () => Promise<void>;
   /**
@@ -937,14 +932,14 @@ export function handleAdminRequest(
           json(res, 403, { error: "Unauthorized" });
           return true;
         }
-        if (!isLinearAuthConfigured()) {
-          json(res, 503, { error: "Tracker not configured" });
+        if (!deps.trackerExport) {
+          json(res, 503, { error: "unavailable" });
           return true;
         }
-        fetchAllTrackerIssuesForTeam(team).then(
+        fetchAllTrackerIssuesForTeam(deps.trackerExport, team).then(
           (result) => {
             if (!result.ok) {
-              json(res, result.status, { error: result.error });
+              json(res, 503, { error: result.code });
             } else {
               json(res, 200, result.issues);
             }
@@ -954,8 +949,9 @@ export function handleAdminRequest(
         return true;
       }
 
-      if (!isLinearAuthConfigured()) {
-        json(res, 503, { error: "Tracker not configured" });
+      const trackerExport = deps.trackerExport;
+      if (!trackerExport) {
+        json(res, 503, { error: "unavailable" });
         return true;
       }
       (async () => {
@@ -963,9 +959,9 @@ export function handleAdminRequest(
           const scopeTeams = await resolveKgScopeTeams(config.kgSourceRepo, config.githubAppId, config.githubAppPrivateKey);
           const byId = new Map<string, unknown>();
           for (const scopeTeam of scopeTeams) {
-            const result = await fetchAllTrackerIssuesForTeam(scopeTeam);
+            const result = await fetchAllTrackerIssuesForTeam(trackerExport, scopeTeam);
             if (!result.ok) {
-              json(res, result.status, { error: result.error });
+              json(res, 503, { error: result.code });
               return;
             }
             for (const issue of result.issues) {

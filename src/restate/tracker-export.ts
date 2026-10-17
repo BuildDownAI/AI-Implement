@@ -4,8 +4,7 @@
  * `sourceSystem` and `team` on every record, so a provider cannot forget them.
  *
  * Shape follows `LateExternalReview` (`late-external-review.ts`): injected dependencies, a production
- * factory, and a typed ingress client that never throws. Not an MCP tool, and nothing registers or
- * calls it yet.
+ * factory, and a typed ingress client that never throws. Not an MCP tool; registered at boot and called by the two KG tracker-data routes.
  */
 import * as restate from "@restatedev/restate-sdk";
 import * as restateClients from "@restatedev/restate-sdk-clients";
@@ -99,7 +98,7 @@ export function createTrackerExport(deps: TrackerExportDependencies) {
 export type TrackerExportDefinition = ReturnType<typeof createTrackerExport>;
 
 /** Production deps: the real mappings and `ProviderRegistry`. Credentials are read by the provider at call time, never journaled. */
-export function createProductionTrackerExportServices(_config?: unknown): { services: RestateService[] } {
+export function createProductionTrackerExportServices(): { services: RestateService[] } {
   const registry = new ProviderRegistry(providerConfigFromEnv(), () => getMappings());
   return {
     services: [createTrackerExport({
