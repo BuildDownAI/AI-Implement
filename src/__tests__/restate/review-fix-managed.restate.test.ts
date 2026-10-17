@@ -1,7 +1,7 @@
 // Managed Codex review-fix on GHA (AII-1444), against the real `restate-server` binary and the *production*
 // composition: `createProductionReviewFixServices` (PR coordinator, attempt workflow, SQLite store, finalizer, GitHub
 // adapter, `GithubReviewFixWorker` with the protected managed preparation) and a real model-auth runtime. Only the
-// external boundaries are synthetic: GitHub's HTTP surface and workflow dispatch. It proves the runtime wiring
+// external boundaries are synthetic: GitHub's HTTP surface. The dispatch helper is real. It proves the runtime wiring
 // ReviewFixPR admission -> protected worker -> authenticated result -> current-head check -> finalizer, that a stale
 // head, a cancelled attempt and a late result never approve, that occupancy is held until the run is confirmed
 // terminal, and that no grant, bearer, run token or credential reaches a journal value.
@@ -57,11 +57,6 @@ vi.mock("../../github.js", async (importOriginal) => ({
   getDefaultBranchFileText: async (_t: string, _o: string, _r: string, file: string) =>
     file === ".github/workflows/claude-implement.yml" ? state.workflow : null,
   getPullRequestState: async () => ({ state: "open", merged: false }),
-  postWorkflowDispatch: async ({ inputs }: { inputs: DispatchInputs }) => {
-    state.dispatched.push(inputs as unknown as Record<string, unknown>);
-    const runId = state.nextRunId++;
-    return state.omitRunId ? { success: true, status: 204, outcome: "accepted" as const } : { success: true, status: 204, outcome: "accepted" as const, runId };
-  },
 }));
 
 const realFetch = globalThis.fetch;
@@ -104,7 +99,19 @@ const githubFetch: typeof fetch = async (input, init) => {
     const run = runs.get(Number(m[1])) ?? { status: "in_progress", conclusion: null };
     return json({ ...run, run_attempt: 1 });
   }
-  if (/\/actions\/workflows\//.test(path)) return json({ workflow_runs: state.listed });
+  if (/\/actions\/workflows\//.test(path)) {
+    if (method === "POST") {
+      const body = JSON.parse(String(init?.body)) as { inputs: DispatchInputs };
+      state.dispatched.push(body.inputs as unknown as Record<string, unknown>);
+      const runId = state.nextRunId++;
+      return state.omitRunId ? new Response(null, { status: 204 }) : json({
+        workflow_run_id: runId,
+        run_url: `https://api.github.com/repos/acme/app/actions/runs/${runId}`,
+        html_url: `https://github.com/acme/app/actions/runs/${runId}`,
+      });
+    }
+    return json({ workflow_runs: state.listed });
+  }
   if (path.includes("/contents/.github/workflows/")) {
     return json({ type: "file", encoding: "base64", content: Buffer.from(state.workflow).toString("base64") });
   }

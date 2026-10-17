@@ -149,10 +149,9 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
  * per the issue's "validate response IDs/URLs against requested repo" requirement. `html_url`
  * must always match `https://github.com/{owner}/{repo}/actions/runs/{id}`; if the body also
  * carries a `repository` field (string `"owner/repo"` or an object with `full_name`), that
- * must agree too. Either signal disagreeing is treated as an unresolved identity rather than
- * a trusted one — GitHub's `return_run_details` response shape isn't documented today, so this
- * stays deliberately tolerant of fields it doesn't recognise and strict only about the ones it
- * uses to prove repo ownership.
+ * must agree too. GitHub documents `workflow_run_id` and `run_url` for dispatch responses;
+ * retain historical `id`/`run` payload support, but reject conflicting identity fields or URLs.
+ * https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event
  */
 function extractDispatchRunIdentity(
   body: unknown,
@@ -162,13 +161,15 @@ function extractDispatchRunIdentity(
   if (!isPlainRecord(body)) return null;
   const run = isPlainRecord(body.run) ? body.run : body;
 
-  const id = run.id;
+  const id = run.workflow_run_id !== undefined ? run.workflow_run_id : run.id;
   const htmlUrl = run.html_url;
   if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0) return null;
+  if (run.id !== undefined && run.id !== id) return null;
   if (typeof htmlUrl !== "string") return null;
 
   const expectedRepo = `${owner}/${repo}`;
-  if (!htmlUrl.startsWith(`https://github.com/${expectedRepo}/actions/runs/`)) return null;
+  if (htmlUrl !== `https://github.com/${expectedRepo}/actions/runs/${id}`) return null;
+  if (run.run_url !== undefined && run.run_url !== `https://api.github.com/repos/${expectedRepo}/actions/runs/${id}`) return null;
 
   const repository = run.repository;
   if (repository !== undefined) {

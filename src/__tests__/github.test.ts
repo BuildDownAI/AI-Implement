@@ -219,6 +219,44 @@ describe("postWorkflowDispatch — returnRunDetails opt-in", () => {
     });
   });
 
+  it.each([
+    { workflow_run_id: 555 },
+    { workflow_run_id: 555, id: 555 },
+    { run: { id: 555 } },
+  ])("accepts documented dispatch IDs and compatible historical IDs: %j", async (fields) => {
+    const urls = {
+      run_url: "https://api.github.com/repos/acme/widgets/actions/runs/555",
+      html_url: "https://github.com/acme/widgets/actions/runs/555",
+    };
+    const body = "run" in fields ? { run: { ...fields.run, ...urls } } : { ...fields, ...urls };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(jsonResponse(200, body)));
+
+    expect(await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true })).toEqual({
+      success: true, status: 200, outcome: "accepted", runId: 555, runUrl: urls.html_url,
+    });
+  });
+
+  it.each([
+    { name: "conflicting identity fields", fields: { id: 556 } },
+    { name: "a string run ID", fields: { workflow_run_id: "555" } },
+    { name: "a nonpositive run ID", fields: { workflow_run_id: 0 } },
+    { name: "an unsafe run ID", fields: { workflow_run_id: Number.MAX_SAFE_INTEGER + 1 } },
+    { name: "a different HTML run ID", fields: { html_url: "https://github.com/acme/widgets/actions/runs/556" } },
+    { name: "a different HTML repository", fields: { html_url: "https://github.com/other/widgets/actions/runs/555" } },
+    { name: "a different API run ID", fields: { run_url: "https://api.github.com/repos/acme/widgets/actions/runs/556" } },
+    { name: "a different API repository", fields: { run_url: "https://api.github.com/repos/other/widgets/actions/runs/555" } },
+  ])("does not bind $name in a documented response", async ({ fields }) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(jsonResponse(200, {
+      workflow_run_id: 555,
+      run_url: "https://api.github.com/repos/acme/widgets/actions/runs/555",
+      html_url: "https://github.com/acme/widgets/actions/runs/555",
+      ...fields,
+    })));
+
+    expect(await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true }))
+      .toEqual({ success: true, status: 200, outcome: "unknown" });
+  });
+
   it("204 → accepted with unresolved identity, distinct from rejected", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(textResponse(204, null));
     vi.stubGlobal("fetch", fetchMock);

@@ -58,7 +58,7 @@ The retry is **capped at exactly two requests, by construction, not just by the 
 
 ## Dispatch outcomes and `returnRunDetails`
 
-`postDispatchOnce`, the function inside `postWorkflowDispatch`/`dispatchWorkflow` that actually posts one `workflow_dispatch` request, accepts an opt-in `returnRunDetails?: boolean` option (AII-778, default off). Every existing call site — `dispatchWorkflow`'s implementation, gap-analysis, and planning dispatches; the review-fix re-dispatch; the kg-refresh GHA dispatch — leaves it unset today, so nothing in this repo yet requests or reads the fields below. The option exists as wire-contract plumbing for a consumer (the Restate review-fix pilot) that has not landed.
+`postDispatchOnce`, the function inside `postWorkflowDispatch`/`dispatchWorkflow` that actually posts one `workflow_dispatch` request, accepts an opt-in `returnRunDetails?: boolean` option (AII-778, default off). The Restate review-fix worker opts in; ordinary `dispatchWorkflow` callers retain the existing response contract.
 
 Setting `returnRunDetails: true`:
 
@@ -83,7 +83,7 @@ export interface DispatchResult {
 | Response | `outcome` | `runId`/`runUrl` | Why |
 |---|---|---|---|
 | `204` | `accepted` | absent | GitHub queued the dispatch. `workflow_dispatch` never returns a run id on a plain 204 — there is no exact identity to report, only "this plausibly started." |
-| `200`, body validates against the requested repo | `accepted` | present | `extractDispatchRunIdentity` requires `html_url` to match `https://github.com/{owner}/{repo}/actions/runs/{id}` and, if the body also carries a `repository` field (string or `{full_name}`), that it names the same `owner/repo`. Either signal disagreeing — or missing/malformed entirely — is treated as unresolved, not trusted; GitHub's `return_run_details` response shape isn't documented, so parsing stays tolerant of fields it doesn't recognise and strict only about the ones that prove repo ownership. |
+| `200`, body validates against the requested repo | `accepted` | present | GitHub's [documented response](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event) contains `workflow_run_id`, `run_url` and `html_url`. `extractDispatchRunIdentity` accepts that positive safe-integer ID and retains historical `id`/`run` payload support. Supplied ID fields must agree; `html_url` and any supplied `run_url` must name that exact repository and run. An optional `repository` field must agree too. Missing, malformed or conflicting identity stays unresolved. |
 | `200`, unparseable or repo-mismatched body | `unknown` | absent | Same reasoning as above, on the failing side. |
 | `4xx` | `rejected` | absent | A definite application-level refusal — safe to treat as "did not happen." |
 | `5xx`, or any other unrecognised status | `unknown` | absent | GitHub may have started the run before failing to report it cleanly; not safe to assume either accepted or rejected. |
