@@ -1556,6 +1556,71 @@ describe("kgTrackerDataStep", () => {
     expect(JSON.parse(written[0][1])).toEqual([{ id: "a" }, { id: "b" }]);
   });
 
+  it("skips a 404 team without counting it as failed, and keeps fetched true", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    const fetchImpl: typeof fetch = async (_, init) => {
+      const body = JSON.parse(init?.body as string) as { teamKey?: string };
+      if (body.teamKey === "GHOST") return { ok: false, status: 404, json: async () => ({ error: "unmapped-team" }) } as Response;
+      return { ok: true, status: 200, json: async () => makeTrackerPage([{ id: "a" }], false) } as Response;
+    };
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const written: Array<[string, string]> = [];
+    try {
+      const result = await kgTrackerDataStep.run(
+        makeContext(),
+        {
+          callbackUrl: "http://orch",
+          workspaceDir: tmpDir,
+          fetchImpl,
+          writeFileSyncImpl: (p, d) => written.push([p, d]),
+          sourcesYmlReaderImpl: () => ["GHOST", "AII"],
+        },
+        noopReporter,
+      );
+      expect(result).toEqual({ fetched: true, failedTeams: [], issueCount: 1, teamCounts: [{ team: "AII", count: 1 }] });
+      expect(JSON.parse(written[0][1])).toEqual([{ id: "a" }]);
+      expect(logSpy).toHaveBeenCalledWith("[kg-tracker-data] team GHOST: skipped (no orchestrator mapping)");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it.each([401, 403])("throws KgTrackerDataFetchError on a %i answer and writes nothing", async (status) => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    const written: Array<[string, string]> = [];
+    await expect(
+      kgTrackerDataStep.run(
+        makeContext(),
+        {
+          callbackUrl: "http://orch",
+          workspaceDir: tmpDir,
+          fetchImpl: makeFetch([{ ok: false, status }]),
+          writeFileSyncImpl: (p, d) => written.push([p, d]),
+          sourcesYmlReaderImpl: () => ["AII"],
+        },
+        noopReporter,
+      ),
+    ).rejects.toMatchObject({ code: "KG_TRACKER_DATA_FETCH_FAILED" });
+    expect(written).toEqual([]);
+  });
+
+  it("records a 500 team as failed", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      {
+        callbackUrl: "http://orch",
+        workspaceDir: tmpDir,
+        fetchImpl: makeFetch([{ ok: false, status: 500 }]),
+        writeFileSyncImpl: () => {},
+        sourcesYmlReaderImpl: () => ["AII"],
+      },
+      noopReporter,
+    );
+    expect(result.fetched).toBe(false);
+    expect(result.failedTeams).toEqual(["AII"]);
+  });
+
   it("throws KgTrackerDataFetchError when an OK response has a malformed body", async () => {
     process.env.RUN_PROGRESS_TOKEN = "test-token";
     await expect(

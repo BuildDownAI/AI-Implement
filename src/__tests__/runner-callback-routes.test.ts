@@ -160,12 +160,19 @@ describe("/runner/kg-tracker-data route wrapper", () => {
     secret: "secret",
   }).token;
 
-  it("returns 403 for a wrong phase or an unmapped team without calling the client", async () => {
+  it("returns 403 for a wrong phase (even for an unmapped team) and 404 unmapped-team for a valid token, without calling the client", async () => {
     const page = vi.fn();
     const wrongPhase = await callKgTrackerDataRoute({
       runnerTokenSecret: "secret",
       authorization: `Bearer ${kgToken("implementation")}`,
-      rawBody: JSON.stringify({ teamKey: "AII" }),
+      rawBody: JSON.stringify({ teamKey: "EVIL" }),
+      getMappings: () => ({ AII: {} }),
+      trackerExport: { page },
+    });
+    const badToken = await callKgTrackerDataRoute({
+      runnerTokenSecret: "secret",
+      authorization: "Bearer not-a-token",
+      rawBody: JSON.stringify({ teamKey: "EVIL" }),
       getMappings: () => ({ AII: {} }),
       trackerExport: { page },
     });
@@ -177,7 +184,9 @@ describe("/runner/kg-tracker-data route wrapper", () => {
       trackerExport: { page },
     });
     expect(wrongPhase.status).toBe(403);
-    expect(unmapped.status).toBe(403);
+    expect(badToken.status).toBe(403);
+    expect(unmapped.status).toBe(404);
+    expect(unmapped.body).toEqual({ error: "unmapped-team" });
     expect(page).not.toHaveBeenCalled();
   });
 

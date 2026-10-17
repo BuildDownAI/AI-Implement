@@ -59,11 +59,22 @@ vi.mock("../deploy-availability.js", async (importOriginal) => ({
 }));
 
 const mintSourceTokenOrJwtMock = vi.hoisted(() => vi.fn());
+const getScopedInstallationTokenMock = vi.hoisted(() => vi.fn());
+const fetchRepoTarballMock = vi.hoisted(() => vi.fn());
+const extractSourceMock = vi.hoisted(() => vi.fn());
+vi.mock("../deploy.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../deploy.js")>();
+  return {
+    ...actual,
+    extractSource: extractSourceMock,
+  };
+});
 const getInstallationTokenMock = vi.hoisted(() => vi.fn().mockResolvedValue("gh-token-mock"));
 vi.mock("../github-app-auth.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../github-app-auth.js")>()),
   mintSourceTokenOrJwt: mintSourceTokenOrJwtMock,
   getInstallationToken: getInstallationTokenMock,
+  getScopedInstallationToken: getScopedInstallationTokenMock,
 }));
 
 const listRepoBranchesAndTagsMock = vi.hoisted(() => vi.fn());
@@ -73,6 +84,7 @@ vi.mock("../github.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../github.js")>()),
   listRepoBranchesAndTags: listRepoBranchesAndTagsMock,
   getRepoDefaultBranch: getRepoDefaultBranchMock,
+  fetchRepoTarball: fetchRepoTarballMock,
   cancelWorkflowRun: cancelWorkflowRunMock,
 }));
 
@@ -5815,6 +5827,55 @@ describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () =>
     expect(res.statusCode).toBe(503);
     expect(JSON.parse(res.body)).toEqual({ error: "tracker-failed" });
     expect(page).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips a manifest team with no mapping, logs it, and still answers 200 with the mapped team's issues", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kg-manifest-test-"));
+    fs.writeFileSync(path.join(dir, "sources.yml"), "trackers:\n  - team: GHOST\n  - team: AII\n");
+    getScopedInstallationTokenMock.mockResolvedValue({ token: "t" });
+    getRepoDefaultBranchMock.mockResolvedValue("main");
+    fetchRepoTarballMock.mockResolvedValue(Buffer.from(""));
+    extractSourceMock.mockResolvedValue(dir);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const aiiIssues = [{ id: "1", identifier: "AII-1" }];
+    page.mockResolvedValue(trackerOk(aiiIssues));
+    try {
+      const res = await trackerDataRequest("", token, { kgSourceRepo: "org/kg" });
+
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual(aiiIssues);
+      expect(page.mock.calls.map((c) => c[0].team)).toEqual(["AII"]);
+      const skipLines = warn.mock.calls.map((c) => String(c[0])).filter((l) => l.includes("no orchestrator mapping"));
+      expect(skipLines).toHaveLength(1);
+      expect(skipLines[0]).toContain("GHOST");
+      expect(skipLines[0]).not.toContain("AII,");
+    } finally {
+      warn.mockRestore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("emits no skip line when every manifest team is mapped", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kg-manifest-test-"));
+    fs.writeFileSync(path.join(dir, "sources.yml"), "trackers:\n  - team: AII\n");
+    getScopedInstallationTokenMock.mockResolvedValue({ token: "t" });
+    getRepoDefaultBranchMock.mockResolvedValue("main");
+    fetchRepoTarballMock.mockResolvedValue(Buffer.from(""));
+    extractSourceMock.mockResolvedValue(dir);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    page.mockResolvedValue(trackerOk([]));
+    try {
+      const res = await trackerDataRequest("", token, { kgSourceRepo: "org/kg" });
+      expect(res.statusCode).toBe(200);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("no orchestrator mapping"))).toBe(false);
+    } finally {
+      warn.mockRestore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("degrades to mapped-teams-only when the KG manifest fetch fails (e.g. a malformed kgSourceRepo)", async () => {

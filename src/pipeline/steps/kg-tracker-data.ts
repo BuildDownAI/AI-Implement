@@ -430,6 +430,7 @@ export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOut
       const teamIssues: TrackerIssue[] = [];
 
       let failure: string | null = null;
+      let skipped = false;
       try {
         do {
           const body: Record<string, string> = { teamKey: team };
@@ -443,6 +444,13 @@ export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOut
             body: JSON.stringify(body),
           });
           if (!res.ok) {
+            if (res.status === 404) {
+              skipped = true;
+              break;
+            }
+            if (res.status === 401 || res.status === 403) {
+              throw new KgTrackerDataFetchError(`team ${team}: unauthorized (${res.status})`);
+            }
             failure = String(res.status);
             break;
           }
@@ -463,6 +471,11 @@ export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOut
       } catch (err) {
         if (err instanceof KgTrackerDataFetchError) throw err;
         failure = `error: ${err instanceof Error ? err.message : String(err)}`;
+      }
+
+      if (skipped) {
+        console.log(`[kg-tracker-data] team ${team}: skipped (no orchestrator mapping)`);
+        continue;
       }
 
       if (failure !== null) {

@@ -1520,7 +1520,8 @@ export interface HandleKgTrackerDataInput {
  * Returns one page of issues (with their comments) from `TrackerExport.page` for
  * the tracker of the run's mapping.
  *
- * Callable only by kg-refresh runs — any other phase gets 403. This function never
+ * Callable only by kg-refresh runs — a missing or bad token or any other phase gets 403.
+ * A valid kg-refresh token with a team that has no mapping gets 404 `unmapped-team`. This function never
  * reads a tracker and holds no credential; the runner receives data only.
  */
 export async function handleKgTrackerDataRequest(
@@ -1541,9 +1542,11 @@ export async function handleKgTrackerDataRequest(
   if (verified.claims.phase !== "kg-refresh") return bad(403, "Unauthorized");
 
   const mappedKeys = Object.keys(input.getMappings());
-  if (!input.teamKey || !mappedKeys.includes(input.teamKey)) {
+  if (!input.teamKey) return bad(403, "Unauthorized");
+  if (!mappedKeys.includes(input.teamKey)) {
+    // After the token and phase checks: only a valid kg-refresh caller learns whether a team is mapped.
     console.warn(`[kg-tracker-data] teamKey '${input.teamKey}' is not a mapped team`);
-    return bad(403, "Unauthorized");
+    return bad(404, "unmapped-team");
   }
 
   const result = await input.trackerExport.page({ team: input.teamKey, cursor: input.cursor ?? null });
