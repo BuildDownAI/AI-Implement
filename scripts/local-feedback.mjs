@@ -1017,13 +1017,15 @@ export function writeLiveResult({ artifactsDir, exitCode, source, image, stages,
   writeFileSync(join(artifactsDir, "summary.md"), summarizeResult({ ok: exitCode === 0, mode: "live", source, image, artifactsDir, stages, note }), { mode: 0o600 });
 }
 
+const WITHHELD_NOTICE = "[local:feedback] CLI diagnostics withheld: they matched a sensitive-output pattern.\n";
+
 /** Persists the CLI's stderr diagnostics, withholding them when they match a sensitive-proof pattern. Returns the artifact name, or undefined when there was nothing to write. */
 export function writeLiveStderrArtifact({ artifactsDir, err }) {
   const text = err.join("");
   if (!text) return undefined;
   const name = "runner.stderr.log";
   const scan = assertNoSensitiveProofLeak([{ name, text }]);
-  const body = scan.ok ? text : "[local:feedback] CLI diagnostics withheld: they matched a sensitive-output pattern.\n";
+  const body = scan.ok ? text : WITHHELD_NOTICE;
   writeFileSync(join(artifactsDir, name), body, { mode: 0o600 });
   return name;
 }
@@ -1057,20 +1059,29 @@ export async function finishLiveRun({ runHarness, dispose, writeResult }) {
 
 /** The post-gate live orchestration: runs the production CLI with captured, echoed stderr and records the result. */
 export async function runLiveHarness({ cliModule, artifactsDir, workspace, task, imageId, agentConfig, source, stages, signalProcess, echoStderr = (text) => process.stderr.write(text) }) {
-  const { deps, err, dispose, getHandle } = makeCliDeps({ cliModule, artifactsDir: join(artifactsDir, "run"), logsPath: join(artifactsDir, "runner.log"), signalProcess, echoStderr });
-  return finishLiveRun({
-    runHarness: () => cliModule.runDevHarnessCli(buildDevHarnessArgs({ workspace, task, imageId, agentConfig }), deps),
-    dispose,
-    // A harness that throws still leaves a failure summary rather than the preflight one.
-    writeResult: (code) => {
-      let stderrArtifact;
-      try {
-        stderrArtifact = writeLiveStderrArtifact({ artifactsDir, err });
-      } finally {
-        writeLiveResult({ artifactsDir, exitCode: code, source, image: imageId, stages, runnerStarted: getHandle() !== undefined, stderrArtifact });
-      }
-    },
-  });
+  // Nothing is echoed while the CLI runs: the sensitive-proof scan needs the whole text, so a marker split across writeStderr calls is still caught.
+  const { deps, err, dispose, getHandle } = makeCliDeps({ cliModule, artifactsDir: join(artifactsDir, "run"), logsPath: join(artifactsDir, "runner.log"), signalProcess });
+  const echoCaptured = () => {
+    const text = err.join("");
+    if (text) echoStderr(assertNoSensitiveProofLeak([{ name: "runner.stderr.log", text }]).ok ? text : WITHHELD_NOTICE);
+  };
+  try {
+    return await finishLiveRun({
+      runHarness: () => cliModule.runDevHarnessCli(buildDevHarnessArgs({ workspace, task, imageId, agentConfig }), deps),
+      dispose,
+      // A harness that throws still leaves a failure summary rather than the preflight one.
+      writeResult: (code) => {
+        let stderrArtifact;
+        try {
+          stderrArtifact = writeLiveStderrArtifact({ artifactsDir, err });
+        } finally {
+          writeLiveResult({ artifactsDir, exitCode: code, source, image: imageId, stages, runnerStarted: getHandle() !== undefined, stderrArtifact });
+        }
+      },
+    });
+  } finally {
+    echoCaptured();
+  }
 }
 
 async function runLive(options) {

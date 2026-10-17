@@ -310,6 +310,27 @@ describe("local feedback command helpers", () => {
       expect(readFileSync(join(artifactsDir, "runner.stderr.log"), "utf8")).toContain("partial diagnostics");
     });
 
+    it("withholds a sensitive diagnostic from both the echo and the artifact, even when split across calls", async () => {
+      const { artifactsDir, input } = liveInput("unused");
+      const cliModule = {
+        runDevHarnessCli: async (_args: string[], deps: { writeStderr: (t: string) => void }) => {
+          deps.writeStderr("Task file must begin with a YAML front matter block delimited by ---\n");
+          deps.writeStderr("Author");
+          deps.writeStderr("ization: Bearer planted-secret\n");
+          return 1;
+        },
+      };
+      const echoed: string[] = [];
+      const exitCode = await runLiveHarness({ ...input, cliModule, echoStderr: (text: string) => echoed.push(text) });
+      expect(exitCode).toBe(1);
+      const artifact = readFileSync(join(artifactsDir, "runner.stderr.log"), "utf8");
+      for (const text of [echoed.join(""), artifact]) {
+        expect(text).toContain("withheld");
+        expect(text).not.toContain("planted-secret");
+        expect(text).not.toContain("Authorization");
+      }
+    });
+
     it("withholds stderr that matches a sensitive pattern", () => {
       const artifactsDir = tempDir("live-diag-sensitive");
       const name = writeLiveStderrArtifact({ artifactsDir, err: ["Authorization: Bearer abc\n"] });
