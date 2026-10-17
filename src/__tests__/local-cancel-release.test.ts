@@ -114,7 +114,8 @@ describe("cancellation release without a terminal disposition (real bridge + own
 
     expect(await runDevHarnessCli(ARGS, deps)).toBe(130);
 
-    expect(collect).toHaveBeenCalledWith(expect.anything(), 0, true);
+    expect(collect).toHaveBeenCalledWith(expect.anything(), 0, expect.any(Function));
+    expect((collect.mock.calls[0] as unknown as [unknown, unknown, () => boolean])[2]()).toBe(true);
     expect(await lockFiles()).toEqual([]);
     expect(stderr.join("")).toContain("local session lease: released");
     await expect(ownership.acquire(reference())).resolves.toBeDefined();
@@ -143,7 +144,7 @@ describe("cancellation release without a terminal disposition (real bridge + own
       const { bridge } = await setup();
       const { deps, stderr, collect } = cancelledDeps(bridge, status);
       expect(await runDevHarnessCli(ARGS, deps)).toBe(130);
-      expect(collect).toHaveBeenCalledWith(expect.anything(), status.exitCode, true);
+      expect(collect).toHaveBeenCalledWith(expect.anything(), status.exitCode, expect.any(Function));
       expect(stderr.join("")).toContain("held (termination_unconfirmed)");
       expect(await lockFiles()).toHaveLength(1);
       await rm(join(outside, (await lockFiles())[0]!));

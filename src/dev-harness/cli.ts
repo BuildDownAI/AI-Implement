@@ -254,14 +254,14 @@ export async function runDevHarnessCli(
         );
         if (shellExitCode !== 0) finalExitCode = shellExitCode;
 
-        await deps.collectRunArtifacts(handle, finalExitCode, cancel.wasCancelled());
+        await deps.collectRunArtifacts(handle, finalExitCode, cancel.wasCancelled);
         artifactsCollected = true;
       } else {
         const state = await deps.getRunStatus(handle);
         finalExitCode = state.exitCode;
       }
 
-      if (!artifactsCollected) await deps.collectRunArtifacts(handle, finalExitCode, cancel.wasCancelled());
+      if (!artifactsCollected) await deps.collectRunArtifacts(handle, finalExitCode, cancel.wasCancelled);
       const durationSec = ((deps.now() - handle.startedAt.getTime()) / 1000).toFixed(1);
       deps.writeStderr(
         `[dev:run] done: exit=${finalExitCode ?? "unknown"} duration=${durationSec}s\n` +
@@ -285,7 +285,7 @@ export async function runDevHarnessCli(
     const state = await deps.getRunStatus(handle);
     const exitCode = state.exitCode;
     const durationSec = ((deps.now() - handle.startedAt.getTime()) / 1000).toFixed(1);
-    await deps.collectRunArtifacts(handle, exitCode, cancel.wasCancelled());
+    await deps.collectRunArtifacts(handle, exitCode, cancel.wasCancelled);
     deps.writeStderr(
       `[dev:run] done: exit=${exitCode ?? "unknown"} duration=${durationSec}s\n` +
       `[dev:run] artifacts saved to ${handle.artifactsDir}/\n` +
