@@ -243,6 +243,12 @@ describe("orchestratorTools (Restate)", () => {
         execution: { githubRunId: "123", githubRunAttempt: 2 }, deadlineAt: 42,
         pendingFeedback: true, snapshot: null, state: "running", evidenceComplete: false,
         terminationConfirmed: false, cycles: [],
+        attribution: {
+          version: 1, invocationId: "implementation-managed", stage: "implementation", snapshotId: "snapshot-managed",
+          agent: "codex", provider: "openai", model: "gpt-managed", profileId: "selected-plan", authMode: "codex-subscription",
+          limit: null, outcome: "success",
+          usage: { availability: "complete", tokensIn: 100, tokensOut: 10, costUsd: null, costStatus: "unavailable" },
+        },
       };
       const calls: unknown[] = [];
       const facade: Pick<ReviewFixAttemptsFacade, "getAttempt" | "getActivity"> = {

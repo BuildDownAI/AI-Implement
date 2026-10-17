@@ -942,10 +942,10 @@ describe("review-fix admin facade: cycle evidence projection", () => {
     expect(observed.verdict).toEqual({ approved: null, reason: "{broken" });
   });
 
-  it("exposes no invocation attribution on the attempt summary: that read model is keyed by dispatch id, outside this facade", async () => {
+  it("reports missing invocation attribution explicitly without inventing a job or usage", async () => {
     const { attemptId, facade } = await attemptWithFacade();
     const detail = await facade.getAttempt(attemptId as never, admin);
     if (detail.status !== "ok") throw new Error("expected ok");
-    expect(Object.keys(detail.attempt)).not.toContain("attribution");
+    expect(detail.attempt.attribution).toBeNull();
   });
 });

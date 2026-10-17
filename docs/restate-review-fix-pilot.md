@@ -89,7 +89,20 @@ To confirm that a finished run's callbacks arrived, read the attempt with the ad
 
 For a review webhook, distinguish acceptance failure from delivery to Restate. Under the Restate lifecycle a valid event is forwarded over the Restate ingress with the GitHub delivery id as the idempotency key, and the webhook writes nothing to SQLite; if Restate is unavailable the webhook answers non-2xx and the redelivery sweep (AII-1178) or a manual redelivery repeats the forward under the same key. Do not create a second event or a new attempt. If GitHub received a non-2xx because validation failed, locate the failed delivery in the repository's webhook delivery history and **manually redeliver that delivery** after correcting the cause. GitHub does not automatically retry a failed webhook; redelivery preserves its GUID for deduplication. See [review-fix rail](./review-fix-rail.md#webhook-intake-atomic-acceptance-and-redelivery-aii-792).
 
-The `/runner/result` callback verifies the run token (never consuming it) and forwards the validated result over the loopback ingress to `ReviewFixAttempt.result`, keyed `<attemptId>.result.<sha256 of the body>`. The body hash keeps an identical retry on Restate's cached acknowledgement while a different result reaches the handler, which records the conflict (a bare `<attemptId>.result` key would replay the first response and hide it). The workflow's `store-result` step is the only writer of the accepted result; the callback writes no SQLite row. A 503 means Restate was unreachable: nothing was written, and the runner retries the same serialized result, bounded by the attempt deadline plus delivery grace. A 409 conflict or 410 stale result is terminal for that callback retry. Inspect the attempt and GitHub execution if delivery exhausts. Never rerun agent work to repair a callback transport failure. See [runner callback contract](./runner-callbacks.md).
+The `/runner/result` callback verifies the run token (never consuming it) and forwards the validated result over the loopback ingress to `ReviewFixAttempt.result`, keyed `<attemptId>.result.<sha256 of the body>`. The body hash keeps an identical retry on Restate's cached acknowledgement while a different result reaches the handler, which records the conflict (a bare `<attemptId>.result` key would replay the first response and hide it). The workflow's `store-result` step is the only writer of the accepted result; the callback does not write accepted-result business state. A 503 means Restate was unreachable: nothing was written, and the runner retries the same serialized result, bounded by the attempt deadline plus delivery grace. A 409 conflict or 410 stale result is terminal for that callback retry. Inspect the attempt and GitHub execution if delivery exhausts. Never rerun agent work to repair a callback transport failure. See [runner callback contract](./runner-callbacks.md).
+
+## Invocation attribution
+
+Managed review-fix result attribution (AII-1451) is retained separately from cycle evidence. After a result is accepted,
+the callback binds its diagnostic attribution to the stored accepted result's dispatch and frozen agent snapshot.
+An identical result retry may repair missing attribution without repeating terminal effects or counting an invocation
+twice. Conflicting, stale or unauthenticated results cannot add it; malformed or mismatching diagnostics are dropped
+without rejecting terminal delivery. Diagnostic storage failures log counts only.
+
+The existing admin attempt detail and `get_review_fix_attempt` include nullable `attribution`, even when the attempt has
+no legacy job row. It is the latest validated invocation for that dispatch, not a sum of implementation and review spend.
+Unavailable cost stays null. Older attempts without retained attribution return null; this does not backfill historical
+calls or authorize rerunning work. Attribution is diagnostic and does not establish approval or backend termination.
 
 ## Incompatible endpoint deployment and rollback
 
