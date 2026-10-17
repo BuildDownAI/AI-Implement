@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { generateKeyPairSync } from "node:crypto";
 import { getInstallationToken, getInstallationId, refreshInstallationToken, getInstallation, getAppSlug, installationIncludesRepo, clearTokenCache, createAppJwt, getScopedInstallationToken, mintSourceTokenOrJwt } from "../github-app-auth.js";
-import { fakeFetch, type ReplyInit } from "./helpers/fake-fetch.js";
+import { fakeFetch, type Reply, type ReplyInit } from "./helpers/fake-fetch.js";
+import { githubError } from "./helpers/github-replies.js";
 
 // Generate a real RSA key pair for tests so JWT signing works correctly
 const { privateKey } = generateKeyPairSync("rsa", {
@@ -24,9 +25,12 @@ const APP_ID = "123456";
 const orgInstallation = (owner: string) => `GET /orgs/${owner}/installation`;
 const userInstallation = (owner: string) => `GET /users/${owner}/installation`;
 const mint = (installationId: number) => `POST /app/installations/${installationId}/access_tokens`;
-const installation = (id: number, extra: Record<string, unknown> = {}): ReplyInit => ({ json: { id, ...extra } });
-const token = (value: string, expiresAt = ""): ReplyInit => ({ json: { token: value, expires_at: expiresAt } });
-const notFound: ReplyInit = { status: 404, text: "Not Found" };
+const installation = (id: number, extra: Record<string, unknown> = {}): ReplyInit =>
+  ({ json: { id, repository_selection: "selected", ...extra } });
+// GitHub answers a mint with 201 and a token that expires an hour later; the default expiry is read when the routes are built.
+const token = (value: string, expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString()): ReplyInit =>
+  ({ status: 201, json: { token: value, expires_at: expiresAt } });
+const notFound = githubError(404, "Not Found");
 
 // Decodes a JWT's payload segment (header.PAYLOAD.signature) so tests can assert its claims.
 function decodePayload(jwt: string): { iat: number; exp: number; iss: string } {
@@ -111,15 +115,15 @@ describe("getInstallationToken", () => {
   it("maintains separate caches per owner", async () => {
     fakeFetch({
       [orgInstallation("org1")]: installation(1),
-      [mint(1)]: token("token-org1"),
+      [mint(1)]: token("ghs_org1"),
       [orgInstallation("org2")]: installation(2),
-      [mint(2)]: token("token-org2"),
+      [mint(2)]: token("ghs_org2"),
     }).install();
 
     const t1 = await getInstallationToken(APP_ID, privateKey, "org1");
     const t2 = await getInstallationToken(APP_ID, privateKey, "org2");
-    expect(t1).toBe("token-org1");
-    expect(t2).toBe("token-org2");
+    expect(t1).toBe("ghs_org1");
+    expect(t2).toBe("ghs_org2");
   });
 
   it("throws if the app is not installed for either owner endpoint", async () => {
@@ -135,7 +139,7 @@ describe("getInstallationToken", () => {
   it("throws if the installation token request fails", async () => {
     fakeFetch({
       [orgInstallation("my-org")]: installation(99),
-      [mint(99)]: { status: 500, text: "Internal Server Error" },
+      [mint(99)]: githubError(500, "Internal Server Error"),
     }).install();
 
     await expect(getInstallationToken(APP_ID, privateKey, "my-org"))
@@ -190,25 +194,26 @@ describe("getInstallationToken", () => {
     const T0 = 1_700_000_000_000;
     vi.spyOn(Date, "now").mockReturnValue(T0);
 
-    const expiresAt = new Date(T0 + 30 * 60 * 1000).toISOString(); // 30 min from T0
+    const minutes = (n: number) => T0 + n * 60 * 1000;
     const api = fakeFetch({
       [orgInstallation("org")]: [installation(1), installation(1)],
-      [mint(1)]: [token("tok1", expiresAt), token("tok2", expiresAt)],
+      // Each token expires an hour after its mint; the first is minted at T0, the second at T0 + 56min.
+      [mint(1)]: [token("ghs_tok1", new Date(minutes(60)).toISOString()), token("ghs_tok2", new Date(minutes(116)).toISOString())],
     }).install();
 
     await getInstallationToken(APP_ID, privateKey, "org");
     expect(api.calls).toHaveLength(2);
 
-    // At T0 + 24min: cache expires at T0 + 25min (30 - 5 margin) → still valid
-    vi.spyOn(Date, "now").mockReturnValue(T0 + 24 * 60 * 1000);
+    // At T0 + 54min: cache expires at T0 + 55min (60 - 5 margin) → still valid
+    vi.spyOn(Date, "now").mockReturnValue(minutes(54));
     const t2 = await getInstallationToken(APP_ID, privateKey, "org");
-    expect(t2).toBe("tok1");
+    expect(t2).toBe("ghs_tok1");
     expect(api.calls).toHaveLength(2); // cache hit
 
-    // At T0 + 26min: past the 25-min cache window → re-fetch
-    vi.spyOn(Date, "now").mockReturnValue(T0 + 26 * 60 * 1000);
+    // At T0 + 56min: past the 55-min cache window → re-fetch
+    vi.spyOn(Date, "now").mockReturnValue(minutes(56));
     const t3 = await getInstallationToken(APP_ID, privateKey, "org");
-    expect(t3).toBe("tok2");
+    expect(t3).toBe("ghs_tok2");
     expect(api.calls).toHaveLength(4); // re-fetched after derived expiry
   });
 
@@ -218,7 +223,7 @@ describe("getInstallationToken", () => {
 
     const api = fakeFetch({
       [orgInstallation("org")]: [installation(1)],
-      [mint(1)]: [token("tok")], // empty expires_at → fallback to 50 min
+      [mint(1)]: [{ status: 201, json: { token: "ghs_tok" } }], // no expires_at → fallback to 50 min
     }).install();
 
     await getInstallationToken(APP_ID, privateKey, "org");
@@ -226,23 +231,24 @@ describe("getInstallationToken", () => {
     // At T0 + 49min: within the 50-min fallback window → cache still valid
     vi.spyOn(Date, "now").mockReturnValue(T0 + 49 * 60 * 1000);
     const t2 = await getInstallationToken(APP_ID, privateKey, "org");
-    expect(t2).toBe("tok");
+    expect(t2).toBe("ghs_tok");
     expect(api.calls).toHaveLength(2); // still cached
   });
 });
 
 describe("getInstallation", () => {
   it("returns the token plus the install's repository selection", async () => {
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
     fakeFetch({
       [orgInstallation("my-org")]: installation(55, { repository_selection: "selected" }),
-      [mint(55)]: token("ghs_inst"),
+      [mint(55)]: token("ghs_inst", expiresAt),
     }).install();
 
     const result = await getInstallation(APP_ID, privateKey, "my-org");
 
     expect(result).toEqual({
       token: "ghs_inst",
-      expiresAt: 0, // expires_at was "" in the reply → fallback to 0
+      expiresAt: Date.parse(expiresAt),
       installationId: 55,
       repositorySelection: "selected",
     });
@@ -262,7 +268,7 @@ describe("getInstallation", () => {
 
   it("defaults repositorySelection to 'selected' when GitHub omits it", async () => {
     fakeFetch({
-      [orgInstallation("my-org")]: installation(57), // no repository_selection
+      [orgInstallation("my-org")]: { json: { id: 57 } }, // no repository_selection
       [mint(57)]: token("ghs_x"),
     }).install();
 
@@ -272,10 +278,9 @@ describe("getInstallation", () => {
   });
 
   it("is uncached — every call re-resolves and re-mints", async () => {
-    const all = installation(1, { repository_selection: "all", account: { type: "Organization" } });
     const api = fakeFetch({
-      [orgInstallation("my-org")]: [all, all],
-      [mint(1)]: [token("t1"), token("t2")],
+      [orgInstallation("my-org")]: [installation(1), installation(1)],
+      [mint(1)]: [token("ghs_t1"), token("ghs_t2")],
     }).install();
 
     await getInstallation(APP_ID, privateKey, "my-org");
@@ -340,7 +345,7 @@ describe("installationIncludesRepo", () => {
   });
 
   it("throws a GitHubApiError on a non-ok response", async () => {
-    fakeFetch({ [REPOS]: { status: 403, text: "Forbidden" } }).install();
+    fakeFetch({ [REPOS]: githubError(403, "Resource not accessible by integration") }).install();
 
     await expect(installationIncludesRepo("ghs_x", "backend"))
       .rejects.toThrow("Failed to list installation repositories");
@@ -348,12 +353,11 @@ describe("installationIncludesRepo", () => {
 });
 
 describe("getScopedInstallationToken", () => {
-  const futureExpiresAt = () => new Date(Date.now() + 60 * 60 * 1000).toISOString();
   // One installation lookup and one mint for my-org's installation 1, each answering the same reply every time.
-  const myOrg = (minted: ReplyInit) => fakeFetch({ [orgInstallation("my-org")]: installation(1), [mint(1)]: minted }).install();
+  const myOrg = (minted: Reply) => fakeFetch({ [orgInstallation("my-org")]: installation(1), [mint(1)]: minted }).install();
 
   it("sends permissions only in the request body", async () => {
-    const api = myOrg(token("ghs_perms", futureExpiresAt()));
+    const api = myOrg(token("ghs_perms"));
 
     const result = await getScopedInstallationToken(APP_ID, privateKey, "my-org", {
       permissions: { contents: "read" },
@@ -366,7 +370,7 @@ describe("getScopedInstallationToken", () => {
   });
 
   it("sends repositories only in the request body", async () => {
-    const api = myOrg(token("ghs_repos", futureExpiresAt()));
+    const api = myOrg(token("ghs_repos"));
 
     await getScopedInstallationToken(APP_ID, privateKey, "my-org", {
       repositories: ["my-repo"],
@@ -378,7 +382,7 @@ describe("getScopedInstallationToken", () => {
   });
 
   it("sends both permissions and repositories in the request body", async () => {
-    const api = myOrg(token("ghs_both", futureExpiresAt()));
+    const api = myOrg(token("ghs_both"));
 
     await getScopedInstallationToken(APP_ID, privateKey, "my-org", {
       permissions: { contents: "read", issues: "write" },
@@ -393,7 +397,7 @@ describe("getScopedInstallationToken", () => {
   });
 
   it("sends no body when neither option is supplied", async () => {
-    const api = myOrg(token("ghs_bare", futureExpiresAt()));
+    const api = myOrg(token("ghs_bare"));
 
     await getScopedInstallationToken(APP_ID, privateKey, "my-org");
 
@@ -401,7 +405,7 @@ describe("getScopedInstallationToken", () => {
   });
 
   it("treats an empty permissions object as absent (no body sent)", async () => {
-    const api = myOrg(token("ghs_empty_perms", futureExpiresAt()));
+    const api = myOrg(token("ghs_empty_perms"));
 
     await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: {} });
 
@@ -409,7 +413,7 @@ describe("getScopedInstallationToken", () => {
   });
 
   it("treats an empty repositories array as absent (no body sent)", async () => {
-    const api = myOrg(token("ghs_empty_repos", futureExpiresAt()));
+    const api = myOrg(token("ghs_empty_repos"));
 
     await getScopedInstallationToken(APP_ID, privateKey, "my-org", { repositories: [] });
 
@@ -417,7 +421,7 @@ describe("getScopedInstallationToken", () => {
   });
 
   it("treats both empty permissions and empty repositories as absent (no body sent)", async () => {
-    const api = myOrg(token("ghs_empty_both", futureExpiresAt()));
+    const api = myOrg(token("ghs_empty_both"));
 
     await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: {}, repositories: [] });
 
@@ -427,7 +431,7 @@ describe("getScopedInstallationToken", () => {
   it("returns a cached token on identical options (cache hit)", async () => {
     const api = fakeFetch({
       [orgInstallation("my-org")]: [installation(1)],
-      [mint(1)]: [token("ghs_hit", futureExpiresAt())],
+      [mint(1)]: [token("ghs_hit")],
     }).install();
 
     const t1 = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } });
@@ -443,7 +447,7 @@ describe("getScopedInstallationToken", () => {
   it("forceRefresh skips the cache read but still updates the cache", async () => {
     const api = fakeFetch({
       [orgInstallation("my-org")]: [installation(1), installation(1)],
-      [mint(1)]: [token("ghs_first", futureExpiresAt()), token("ghs_fresh", futureExpiresAt())],
+      [mint(1)]: [token("ghs_first"), token("ghs_fresh")],
     }).install();
 
     const t1 = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { repositories: ["repo-a"] });
@@ -458,7 +462,7 @@ describe("getScopedInstallationToken", () => {
   it("re-fetches on differing options for the same owner (cache miss)", async () => {
     const api = fakeFetch({
       [orgInstallation("my-org")]: [installation(1), installation(1)],
-      [mint(1)]: [token("ghs_read", futureExpiresAt()), token("ghs_write", futureExpiresAt())],
+      [mint(1)]: [token("ghs_read"), token("ghs_write")],
     }).install();
 
     const t1 = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } });
@@ -478,7 +482,8 @@ describe("getScopedInstallationToken", () => {
 
     const api = fakeFetch({
       [orgInstallation("my-org")]: [installation(1), installation(1)],
-      [mint(1)]: [token("ghs_ttl", realExpiry), token("ghs_ttl2", new Date(baseMs + 2 * oneHourMs).toISOString())],
+      // The second mint happens just past the boundary below, and its token expires an hour after that.
+      [mint(1)]: [token("ghs_ttl", realExpiry), token("ghs_ttl2", new Date(baseMs + oneHourMs - fiveMinMs + 1 + oneHourMs).toISOString())],
     }).install();
 
     const minted = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } });
@@ -502,7 +507,7 @@ describe("getScopedInstallationToken", () => {
   it("clearTokenCache() clears the scoped cache", async () => {
     const api = fakeFetch({
       [orgInstallation("my-org")]: [installation(1), installation(1)],
-      [mint(1)]: [token("ghs_before", futureExpiresAt()), token("ghs_after", futureExpiresAt())],
+      [mint(1)]: [token("ghs_before"), token("ghs_after")],
     }).install();
 
     await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } });
@@ -516,7 +521,7 @@ describe("getScopedInstallationToken", () => {
   });
 
   it("throws GitHubApiError with status and path on token-mint failure", async () => {
-    myOrg({ status: 422, text: "Unprocessable Entity" });
+    myOrg(githubError(422, "Validation Failed"));
 
     await expect(
       getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } }),
@@ -541,7 +546,7 @@ describe("getScopedInstallationToken", () => {
     const api = fakeFetch({
       [orgInstallation("my-user")]: notFound,
       [userInstallation("my-user")]: installation(5),
-      [mint(5)]: token("ghs_user_scoped", futureExpiresAt()),
+      [mint(5)]: token("ghs_user_scoped"),
     }).install();
 
     const result = await getScopedInstallationToken(APP_ID, privateKey, "my-user", {
@@ -553,12 +558,10 @@ describe("getScopedInstallationToken", () => {
 });
 
 describe("mintSourceTokenOrJwt", () => {
-  const futureExpiresAt = () => new Date(Date.now() + 60 * 60 * 1000).toISOString();
-
   it("returns an installation token when the App is installed (auth=installation)", async () => {
     fakeFetch({
       [orgInstallation("my-org")]: installation(1),
-      [mint(1)]: token("ghs_installed", futureExpiresAt()),
+      [mint(1)]: token("ghs_installed"),
     }).install();
 
     const result = await mintSourceTokenOrJwt(APP_ID, privateKey, "my-org", {
@@ -590,7 +593,7 @@ describe("mintSourceTokenOrJwt", () => {
   it("rethrows non-404 mint errors without falling back", async () => {
     fakeFetch({
       [orgInstallation("my-org")]: installation(1),
-      [mint(1)]: { status: 422, text: "Unprocessable Entity" },
+      [mint(1)]: githubError(422, "Validation Failed"),
     }).install();
 
     await expect(
@@ -600,7 +603,7 @@ describe("mintSourceTokenOrJwt", () => {
 
   it("rethrows a 500 from the installation endpoint without falling back", async () => {
     // No user-installation route: a fallback request would fail the test.
-    fakeFetch({ [orgInstallation("my-org")]: { status: 500, text: "Internal Server Error" } }).install();
+    fakeFetch({ [orgInstallation("my-org")]: githubError(500, "Internal Server Error") }).install();
 
     await expect(
       mintSourceTokenOrJwt(APP_ID, privateKey, "my-org"),
@@ -646,7 +649,7 @@ describe("createAppJwt clock-skew tolerance", () => {
   it("emits the widened claims on the real mint path (through getInstallation)", async () => {
     vi.spyOn(Date, "now").mockReturnValue(REF * 1000);
     const api = fakeFetch({
-      [orgInstallation("my-org")]: installation(7, { repository_selection: "all" }),
+      [orgInstallation("my-org")]: installation(7),
       [mint(7)]: token("ghs_x"),
     }).install();
 

@@ -60,7 +60,7 @@ describe("LinearProvider.postComment", () => {
   });
 
   it("throws on Linear GraphQL error", async () => {
-    linear({ json: { errors: [{ message: "Permission denied" }] } });
+    linear({ json: { data: null, errors: [{ message: "Permission denied", path: ["commentCreate"] }] } });
 
     const p = new LinearProvider({});
     await expect(p.postComment("i", "b")).rejects.toThrow(/Permission denied/);
@@ -165,13 +165,13 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
       identifier,
       title: overrides.title ?? "Title",
       description: overrides.description ?? null,
-      team: { id: "team-id", key: teamKey },
+      team: { id: `team-${teamKey}`, key: teamKey },
       state: {
         id: "state-id",
         name: overrides.stateName ?? "Todo",
         type: overrides.stateType ?? "unstarted",
       },
-      labels: { nodes: (overrides.labels ?? []).map((name, i) => ({ id: `l${i}`, name })) },
+      labels: { nodes: (overrides.labels ?? []).map((name) => ({ id: `label-${name}`, name })) },
       inverseRelations: { nodes: overrides.inverseRelations ?? [] },
       children: {
         nodes: (overrides.children ?? []).map((c, i) => ({
@@ -596,14 +596,18 @@ describe("LinearProvider.fetchFeatureNodeRollUps", () => {
       { id: "ool-107-id", identifier: "OOL-107", description: null, team: { key: "OOL" },
         children: { nodes: [{ identifier: "OOL-108", state: { type: "completed" }, labels: labels("AI-Implement") }] },
         parent: { identifier: "OOL-106", description: null, labels: labels("AI-Implement") } },
+      // OOL-107 is completed and labeled (it is in this page), so Linear lists it among its parent's children.
       { id: "ool-106-id", identifier: "OOL-106", description: null, team: { key: "OOL" },
-        children: { nodes: [{ identifier: "OOL-109", state: { type: "canceled" }, labels: labels("AI-Implement") }] },
+        children: { nodes: [
+          { identifier: "OOL-107", state: { type: "completed" }, labels: labels("AI-Implement") },
+          { identifier: "OOL-109", state: { type: "canceled" }, labels: labels("AI-Implement") },
+        ] },
         parent: null },
     ]));
     const rollUps = await new LinearProvider({}).fetchFeatureNodeRollUps();
     expect(rollUps).toEqual([
       { issueId: "ool-107-id", identifier: "OOL-107", scopeKey: "OOL", mode: "feature", parent: { identifier: "OOL-106", mode: "feature" }, childIdentifiers: ["OOL-108"] },
-      { issueId: "ool-106-id", identifier: "OOL-106", scopeKey: "OOL", mode: "feature", parent: null, childIdentifiers: ["OOL-109"] },
+      { issueId: "ool-106-id", identifier: "OOL-106", scopeKey: "OOL", mode: "feature", parent: null, childIdentifiers: ["OOL-107", "OOL-109"] },
     ]);
   });
 
@@ -672,7 +676,11 @@ describe("LinearProvider.fetchFeatureNodeRollUps", () => {
 
   it("stops after 20 pages and warns once when every page has a next page", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const fake = linear(...Array.from({ length: 20 }, (_, i) => page([], { hasNextPage: true, endCursor: `c${i}` })));
+    // Each page carries one completed issue that is not a feature node, as a real page past the cursor does.
+    const fake = linear(...Array.from({ length: 20 }, (_, i) => page(
+      [{ id: `aii-${2000 + i}-id`, identifier: `AII-${2000 + i}`, description: null, team: { key: "AII" }, children: { nodes: [] }, parent: null }],
+      { hasNextPage: true, endCursor: `c${i}` },
+    )));
     await new LinearProvider({}).fetchFeatureNodeRollUps();
     expect(fake.calls).toHaveLength(20);
     expect(warn).toHaveBeenCalledTimes(1);
@@ -795,7 +803,7 @@ describe("LinearProvider.markPlanComplete", () => {
     );
 
     const p = new LinearProvider({});
-    await p.markPlanComplete("issue-1", "team-a");
+    await p.markPlanComplete("issue-1", "ENG");
 
     expect(fake.calls).toHaveLength(7);
     expect(variables(fake, 1)).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
@@ -895,7 +903,7 @@ describe("LinearProvider.markPrReady", () => {
     );
 
     const p = new LinearProvider({});
-    await p.markPrReady("issue-1", "team-a", "https://github.com/o/r/pull/7");
+    await p.markPrReady("issue-1", "ENG", "https://github.com/o/r/pull/7");
 
     expect(fake.calls).toHaveLength(4);
     expect(variables(fake, 2)).toEqual({ issueId: "issue-1", labelIds: ["lo", "label-rfr"] });
@@ -916,7 +924,7 @@ describe("LinearProvider.clearWorkingState", () => {
     );
 
     const p = new LinearProvider({});
-    await p.clearWorkingState("issue-1", "team-a");
+    await p.clearWorkingState("issue-1", "ENG");
 
     expect(fake.calls).toHaveLength(3);
     expect(variables(fake, 1)).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
@@ -932,7 +940,7 @@ describe("LinearProvider.clearWorkingState", () => {
     );
 
     const p = new LinearProvider({});
-    await p.clearWorkingState("issue-1", "team-a");
+    await p.clearWorkingState("issue-1", "ENG");
 
     expect(fake.calls).toHaveLength(3);
     expect(variables(fake, 2)).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
@@ -946,7 +954,7 @@ describe("LinearProvider.clearWorkingState", () => {
     );
 
     const p = new LinearProvider({});
-    await p.clearWorkingState("issue-1", "team-a");
+    await p.clearWorkingState("issue-1", "ENG");
 
     expect(fake.calls).toHaveLength(2);
   });
@@ -959,7 +967,7 @@ describe("LinearProvider.clearWorkingState", () => {
     );
 
     const p = new LinearProvider({});
-    await p.clearWorkingState("issue-1", "team-a");
+    await p.clearWorkingState("issue-1", "ENG");
 
     // Two labels-fetch queries run; no update mutation when there's nothing to remove
     expect(fake.calls).toHaveLength(2);
@@ -975,7 +983,7 @@ describe("LinearProvider.markPlanningFailed", () => {
     );
 
     const p = new LinearProvider({});
-    const commented = await p.markPlanningFailed("issue-1", "team-a", "GraphQL exploded");
+    const commented = await p.markPlanningFailed("issue-1", "ENG", "GraphQL exploded");
 
     expect(variables(fake, fake.calls.length - 1).body).toContain("Planning failed: GraphQL exploded");
     expect(commented).toBe(true);
@@ -991,7 +999,7 @@ describe("LinearProvider.markImplementationFailed", () => {
     );
 
     const p = new LinearProvider({});
-    const commented = await p.markImplementationFailed("issue-1", "team-a", "tests timed out");
+    const commented = await p.markImplementationFailed("issue-1", "ENG", "tests timed out");
 
     expect(variables(fake, fake.calls.length - 1).body).toContain("Implementation failed: tests timed out");
     expect(commented).toBe(true);
@@ -1011,8 +1019,8 @@ describe("LinearProvider.markMerged", () => {
       data({ issueUpdate: { success: true } }),
     );
 
-    const p = new LinearProvider({ linearWorkspaceUrl: "https://linear.app/acme" });
-    await p.markMerged("issue-1", "team-a");
+    const p = new LinearProvider({});
+    await p.markMerged("issue-1", "ENG");
 
     expect(fake.calls).toHaveLength(4);
     expect(variables(fake, 3)).toMatchObject({ issueId: "issue-1", stateId: "s-done", labelIds: ["L2"] });
@@ -1022,7 +1030,7 @@ describe("LinearProvider.markMerged", () => {
     const fake = linear(data({ issue: { state: { type: "completed" }, team: { key: "ENG" }, labels: { nodes: [] } } }));
 
     const p = new LinearProvider({});
-    await p.markMerged("issue-1", "team-a");
+    await p.markMerged("issue-1", "ENG");
 
     expect(fake.calls).toHaveLength(1);
   });
@@ -1031,7 +1039,7 @@ describe("LinearProvider.markMerged", () => {
     const fake = linear(data({ issue: { state: { type: "canceled" }, team: { key: "ENG" }, labels: { nodes: [] } } }));
 
     const p = new LinearProvider({});
-    await p.markMerged("issue-1", "team-a");
+    await p.markMerged("issue-1", "ENG");
 
     expect(fake.calls).toHaveLength(1);
   });
@@ -1049,7 +1057,7 @@ describe("LinearProvider.markMerged", () => {
     );
 
     const p = new LinearProvider({});
-    await p.markMerged("issue-1", "team-a");
+    await p.markMerged("issue-1", "ENG");
 
     expect(variables(fake, 3).stateId).toBe("s-shipped");
   });
@@ -1063,7 +1071,7 @@ describe("LinearProvider.markMerged", () => {
     );
 
     const p = new LinearProvider({});
-    await p.markMerged("issue-1", "team-a");
+    await p.markMerged("issue-1", "ENG");
 
     expect(variables(fake, 3).labelIds).toEqual(["L2", "L3"]);
   });

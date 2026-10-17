@@ -91,7 +91,8 @@ describe("createJiraProviderFromConfig", () => {
   });
 });
 
-// A Jira mapping as the store reads one back: validation stores every field override as a string or null.
+// A Jira mapping as the store reads one back: validation stores every field override as a string or null,
+// and the repo field value names the mapping's own repository.
 const jiraMapping = (
   overrides: Partial<{
     jql: string;
@@ -101,21 +102,24 @@ const jiraMapping = (
     profilesFieldOverride: string | null;
     baseBranchFieldOverride: string | null;
   }> = {},
-): RepoMapping =>
-  makeMapping({
-    owner: "acme",
-    repo: "x",
+): RepoMapping => {
+  const repoFieldValue = overrides.repoFieldValue ?? "acme/x";
+  const [owner, repo] = repoFieldValue.split("/");
+  return makeMapping({
+    owner,
+    repo,
     ticketingProvider: "jira",
     ticketingConfig: {
       kind: "jira",
       jql: overrides.jql ?? "project = P",
-      repoFieldValue: overrides.repoFieldValue ?? "acme/x",
+      repoFieldValue,
       statusFieldOverride: overrides.statusFieldOverride ?? null,
       repoFieldOverride: overrides.repoFieldOverride ?? null,
       profilesFieldOverride: overrides.profilesFieldOverride ?? null,
       baseBranchFieldOverride: overrides.baseBranchFieldOverride ?? null,
     },
   });
+};
 
 // All four field ids set by override, so the provider never lists the instance's fields.
 const ALL_OVERRIDES = {
@@ -125,12 +129,25 @@ const ALL_OVERRIDES = {
   baseBranchFieldOverride: "customfield_10300",
 };
 
+// The field list's entries for the two single-select fields, with the schema Jira gives a custom select.
+const selectField = (id: string, name: string) => ({
+  id, name, custom: true,
+  schema: { type: "option", custom: "com.atlassian.jira.plugin.system.customfieldtypes:select", customId: Number(id.replace("customfield_", "")) },
+});
+
 const FIELDS_REPLY: ReplyInit = {
-  json: [
-    { id: "customfield_10100", name: "AI-Implement Status", custom: true, schema: {} },
-    { id: "customfield_10101", name: "AI-Implement Repo", custom: true, schema: {} },
-  ],
+  json: [selectField("customfield_10100", "AI-Implement Status"), selectField("customfield_10101", "AI-Implement Repo")],
 };
+
+// A description as REST API v3 sends it: an Atlassian Document Format document, one paragraph per argument.
+const adfDoc = (...paragraphs: string[]) => ({
+  type: "doc",
+  version: 1,
+  content: paragraphs.map((text) => ({ type: "paragraph", content: [{ type: "text", text }] })),
+});
+
+// Jira's error body for a failed request.
+const jiraError = (status: number, message: string): ReplyInit => ({ status, json: { errorMessages: [message], errors: {} } });
 
 function makeProvider(opts: {
   cacheScope: string;
@@ -163,12 +180,12 @@ function jqlSearch(...routes: SearchRoute[]): Reply {
       unmatched.push(jql);
       throw new Error(`jqlSearch: no route for ${jql}`);
     }
-    if (route.status) return { status: route.status, text: "boom" };
+    if (route.status) return jiraError(route.status, "Error in the JQL Query");
     const issues = (route.issues ?? []).map((issue) => ({
       ...issue,
       fields: Object.fromEntries(Object.entries(issue.fields).filter(([name]) => fields.includes(name))),
     }));
-    return { json: { issues } };
+    return { json: { issues, isLast: true } };
   };
 }
 
@@ -184,7 +201,7 @@ const searchBodies = (fake: FakeFetch): Array<{ jql: string; fields: string[] }>
 
 describe("JiraProvider.postComment", () => {
   it("posts a comment with ADF-formatted body", async () => {
-    const fake = fakeFetch({ [COMMENT]: { status: 201, json: { id: "comment-1" } } }).install();
+    const fake = fakeFetch({ [COMMENT]: { status: 201, json: { id: "10000" } } }).install();
 
     const p = makeProvider({ cacheScope: "c", mappings: {} });
     await p.postComment("10001", "Hello world");
@@ -209,7 +226,7 @@ describe("JiraProvider lifecycle status setters", () => {
     json: { id: "10001", key: "P-1", fields: { customfield_10100: { value } } },
   });
   const written: ReplyInit = { status: 204 };
-  const commented: ReplyInit = { status: 201, json: { id: "c1" } };
+  const commented: ReplyInit = { status: 201, json: { id: "10000" } };
 
   const methods = (fake: FakeFetch) => fake.calls.map((c) => c.method);
   const commentText = (fake: FakeFetch) =>
@@ -342,7 +359,7 @@ describe("JiraProvider lifecycle status setters", () => {
   it("markImplementationFailed proceeds to mark failed when the status pre-read errors", async () => {
     const fake = fakeFetch({
       [FIELDS]: FIELDS_REPLY,
-      [STATUS_READ]: { status: 500, text: "boom" }, // pre-read fails
+      [STATUS_READ]: jiraError(500, "Internal server error"), // pre-read fails
       [STATUS_WRITE]: written,
       [COMMENT]: commented,
     }).install();
@@ -419,6 +436,7 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
   });
   afterEach(() => { vi.restoreAllMocks(); });
 
+  // An issue as the bucket search returns it: every field it requests, links and assignee included.
   const issue = (
     id: string, key: string, status: string, repo: string,
     desc: unknown = null, summary = `summary-${key}`,
@@ -428,6 +446,8 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
       summary, description: desc,
       customfield_10100: { value: status },
       customfield_10101: { value: repo },
+      issuelinks: [],
+      assignee: null,
     },
   });
 
@@ -456,7 +476,7 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
       [SEARCH]: jqlSearch(
         ready(
           issue("10001", "P-1", "Ready", "acme/x"),
-          issue("10002", "P-2", "Plan Approved", "acme/x", "desc"),
+          issue("10002", "P-2", "Plan Approved", "acme/x", adfDoc("desc")),
         ),
         children(),
         inFlight(),
@@ -558,7 +578,15 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
       },
     });
     fakeFetch({
-      [FIELDS]: FIELDS_REPLY,
+      [FIELDS]: {
+        json: [
+          selectField("customfield_10100", "AI-Implement Status"),
+          {
+            id: "customfield_10101", name: "AI-Implement Repo", custom: true,
+            schema: { type: "string", custom: "com.atlassian.jira.plugin.system.customfieldtypes:textfield", customId: 10101 },
+          },
+        ],
+      },
       [SEARCH]: jqlSearch(ready(textIssue("50001", "P-40", "Ready", "acme/x")), children(), inFlight()),
     }).install();
 
@@ -589,9 +617,9 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
 
   // A Jira "Blocks" issue link, as it appears in the blocked issue's `issuelinks`:
   // `inwardIssue` present ⇒ this issue "is blocked by" that issue.
-  const blockedByLink = (statusCategoryKey: string) => ({
+  const blockedByLink = (statusCategoryKey: string, key = "BLK-1") => ({
     type: { name: "Blocks", inward: "is blocked by", outward: "blocks" },
-    inwardIssue: { key: "BLK-1", fields: { status: { statusCategory: { key: statusCategoryKey } } } },
+    inwardIssue: { key, fields: { status: { statusCategory: { key: statusCategoryKey } } } },
   });
 
   // The other direction: this issue blocks something else (it is not itself blocked).
@@ -668,9 +696,10 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
   });
 
   it("includes an issue with no issuelinks field", async () => {
+    const { issuelinks: _omitted, ...fields } = issue("50005", "P-44", "Ready", "acme/x").fields;
     fakeFetch({
       [FIELDS]: FIELDS_REPLY,
-      [SEARCH]: jqlSearch(ready(issue("50005", "P-44", "Ready", "acme/x")), children(), inFlight()),
+      [SEARCH]: jqlSearch(ready({ id: "50005", key: "P-44", fields }), children(), inFlight()),
     }).install();
 
     const p = makeProvider({ cacheScope: "c-no-links", mappings: { "acme/x": jiraMapping() } });
@@ -683,8 +712,8 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
     fakeFetch({
       [FIELDS]: FIELDS_REPLY,
       [SEARCH]: jqlSearch(
-        ready(withLinks(issue("50006", "P-45", "Ready", "acme/x"), [blockedByLink("done"), blockedByLink("indeterminate")])),
-        keyIn(), // merged-blocker lookup (BLK-1 not found → not merged)
+        ready(withLinks(issue("50006", "P-45", "Ready", "acme/x"), [blockedByLink("done", "BLK-1"), blockedByLink("indeterminate", "BLK-2")])),
+        keyIn(issue("60003", "BLK-2", "Implementing", "acme/x")), // merged-blocker lookup: BLK-2 is not Merged
         inFlight(),
       ),
     }).install();
@@ -722,7 +751,7 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
       [FIELDS]: FIELDS_REPLY,
       [SEARCH]: jqlSearch(
         ready(withLinks(issue("50008", "P-47", "Ready", "acme/x"), [blockedByLink("new")])),
-        { when: /^key in/, status: 500 }, // lookup fails
+        { when: /^key in/, status: 400 }, // lookup fails: Jira refuses JQL naming a deleted or unbrowsable key
         inFlight(), // no candidates → no children query
       ),
     }).install();
@@ -874,7 +903,7 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
   });
 
   it("dispatches a feature-node parent once all designated children are terminal, onto its own branch", async () => {
-    const parentWithSpec = { ...issue("OOL-78", "Ready", "acme/x"), fields: { ...issue("OOL-78", "Ready", "acme/x").fields, description: "Closing work spec." } };
+    const parentWithSpec = { ...issue("OOL-78", "Ready", "acme/x"), fields: { ...issue("OOL-78", "Ready", "acme/x").fields, description: adfDoc("Closing work spec.") } };
     fakeFetch({
       [SEARCH]: jqlSearch(
         ready(parentWithSpec),
@@ -895,7 +924,7 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
     // markMerged only sets the AI-Implement Status custom field — native status
     // stays untouched. The gating check must accept that as terminal or the
     // feature-node parent would stay blocked forever after a normal merge.
-    const parentWithSpec = { ...issue("OOL-78", "Ready", "acme/x"), fields: { ...issue("OOL-78", "Ready", "acme/x").fields, description: "Closing work spec." } };
+    const parentWithSpec = { ...issue("OOL-78", "Ready", "acme/x"), fields: { ...issue("OOL-78", "Ready", "acme/x").fields, description: adfDoc("Closing work spec.") } };
     fakeFetch({
       [SEARCH]: jqlSearch(
         ready(parentWithSpec),
@@ -970,7 +999,15 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
   });
 
   it("dispatches a non-empty-spec feature-node-ready parent normally (no regression)", async () => {
-    const parentWithSpec = { ...issue("OOL-78", "Ready", "acme/x"), fields: { ...issue("OOL-78", "Ready", "acme/x").fields, description: "## Do the work\n\nActual spec here." } };
+    const spec = {
+      type: "doc",
+      version: 1,
+      content: [
+        { type: "heading", attrs: { level: 2 }, content: [{ type: "text", text: "Do the work" }] },
+        { type: "paragraph", content: [{ type: "text", text: "Actual spec here." }] },
+      ],
+    };
+    const parentWithSpec = { ...issue("OOL-78", "Ready", "acme/x"), fields: { ...issue("OOL-78", "Ready", "acme/x").fields, description: spec } };
     fakeFetch({
       [SEARCH]: jqlSearch(
         ready(parentWithSpec),
@@ -1348,7 +1385,7 @@ describe("JiraProvider.findByKey", () => {
   });
 
   it("returns null on 404", async () => {
-    fakeFetch({ [`GET ${API}/issue/MISS-1` as const]: { status: 404, text: "missing" } }).install();
+    fakeFetch({ [`GET ${API}/issue/MISS-1` as const]: jiraError(404, "Issue does not exist or you do not have permission to see it.") }).install();
     const p = makeProvider({ cacheScope: "c-fbk2", mappings: {} });
     expect(await p.findByKey("MISS-1")).toBeNull();
   });
@@ -1362,9 +1399,12 @@ describe("JiraProvider.fetchAIImplementSnapshot — profiles field", () => {
 
   const FIELDS_WITH_PROFILES: ReplyInit = {
     json: [
-      { id: "customfield_10100", name: "AI-Implement Status", custom: true, schema: {} },
-      { id: "customfield_10101", name: "AI-Implement Repo", custom: true, schema: {} },
-      { id: "customfield_10200", name: "AI-Implement Profiles", custom: true, schema: {} },
+      selectField("customfield_10100", "AI-Implement Status"),
+      selectField("customfield_10101", "AI-Implement Repo"),
+      {
+        id: "customfield_10200", name: "AI-Implement Profiles", custom: true,
+        schema: { type: "array", items: "option", custom: "com.atlassian.jira.plugin.system.customfieldtypes:multiselect", customId: 10200 },
+      },
     ],
   };
 
@@ -1376,6 +1416,8 @@ describe("JiraProvider.fetchAIImplementSnapshot — profiles field", () => {
       customfield_10100: { value: "Ready" },
       customfield_10101: { value: "acme/x" },
       customfield_10200: profiles,
+      issuelinks: [],
+      assignee: null,
     },
   });
 
@@ -1424,6 +1466,8 @@ describe("JiraProvider.fetchAIImplementSnapshot — profiles field", () => {
             description: null,
             customfield_10100: { value: "Ready" },
             customfield_10101: { value: "acme/x" },
+            issuelinks: [],
+            assignee: null,
           },
         }),
         children(),
@@ -1448,6 +1492,8 @@ describe("JiraProvider.fetchAIImplementSnapshot — profiles field", () => {
             customfield_10100: { value: "Ready" },
             customfield_10101: { value: "acme/x" },
             customfield_10200: [{ value: "mobile" }],
+            issuelinks: [],
+            assignee: null,
           },
         }),
         children(),
@@ -1475,6 +1521,7 @@ describe("JiraProvider.fetchAIImplementSnapshot — assignee field", () => {
       description: null,
       customfield_10100: { value: "Ready" },
       customfield_10101: { value: "acme/x" },
+      issuelinks: [],
       assignee,
     },
   });

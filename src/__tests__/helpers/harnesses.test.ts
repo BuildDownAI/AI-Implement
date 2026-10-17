@@ -6,7 +6,7 @@ import type Database from "better-sqlite3";
 import { testDir, testTempRoot } from "./test-dir.js";
 import { testDb } from "./test-db.js";
 import { fakeFetch, hangUntilAborted } from "./fake-fetch.js";
-import { githubFile } from "./github-replies.js";
+import { githubError, githubFile } from "./github-replies.js";
 import { linearData, linearGraphql } from "./linear-replies.js";
 
 // Cleanup runs after a test ends, so each "is gone" check lives in the test after the one that
@@ -443,6 +443,17 @@ describe("githubFile", () => {
 
     expect(file).toMatchObject({ type: "file", encoding: "base64" });
     expect(Buffer.from(file.content, "base64").toString("utf8")).toBe("image: custom\n");
+  });
+});
+
+describe("githubError", () => {
+  it("answers with the status and GitHub's error body", async () => {
+    const github = fakeFetch({ "GET /orgs/acme/installation": githubError(404, "Not Found") });
+
+    const res = await github.fetch("https://api.github.com/orgs/acme/installation");
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ message: "Not Found", documentation_url: "https://docs.github.com/rest", status: "404" });
   });
 });
 
