@@ -1,4 +1,8 @@
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { runLocalFullLoop } from "./local/full-loop.js";
+import { LOCAL_FULL_LOOP_RESULT_FILE } from "./local/run-result.js";
+import { sanitizeAttribution } from "./pipeline/types.js";
 import { decodeRunConfig, decodeTrustedRunConfig, type ResolvedAgentSnapshotV1 } from "./run-config.js";
 import { hasConfiguredIntent, type ConfiguredRunOptions } from "./run-autonomous.js";
 
@@ -42,6 +46,25 @@ const DEFAULT_DEPENDENCIES: LocalFullLoopRunnerDependencies = {
   writeStdout: (text) => process.stdout.write(text),
 };
 
+/** Best-effort: evidence loss must never change the loop's exit code or classification. */
+function resetLatestAttributionFile(workspaceDir: string): void {
+  try {
+    rmSync(join(workspaceDir, LOCAL_FULL_LOOP_RESULT_FILE), { force: true });
+  } catch {
+    // ignore
+  }
+}
+
+function writeLatestAttributionFile(workspaceDir: string, attribution: unknown): void {
+  try {
+    const file = join(workspaceDir, LOCAL_FULL_LOOP_RESULT_FILE);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify({ latestAttribution: sanitizeAttribution(attribution) }));
+  } catch {
+    // ignore
+  }
+}
+
 export function formatLocalFullLoopEntrypointError(env: NodeJS.ProcessEnv, err: unknown): string {
   return hasConfiguredIntent(env.AI_IMPLEMENT_RUN_CONFIG) || hasLocalBootstrapPointer(env)
     ? SAFE_CONFIGURED_ERROR
@@ -66,6 +89,7 @@ export async function runLocalFullLoopFromEnv(
     ? await resolvedDeps.loadLocalSessionBootstrap({ env, snapshot: config.agentConfig, workspaceDir })
     : undefined;
 
+  resetLatestAttributionFile(workspaceDir);
   resolvedDeps.writeStdout("[dev:run] full loop: planning -> implementation -> review\n");
   const result = await resolvedDeps.runFullLoop({
     workspaceDir,
@@ -81,6 +105,7 @@ export async function runLocalFullLoopFromEnv(
     configuredEnv: bootstrap ? undefined : env,
     onConfiguredFinish: bootstrap?.onConfiguredFinish,
   });
+  writeLatestAttributionFile(workspaceDir, result.attribution);
   resolvedDeps.writeStdout(
     `[dev:run] full loop complete: classification=${result.classification} ` +
       `planning=${result.planningExitCode} implementation=${result.implementationExitCode} ` +
