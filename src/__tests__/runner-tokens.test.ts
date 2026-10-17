@@ -31,6 +31,16 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe("isRunCredentialEnvName", () => {
+  it.each(["RUN_TOKEN", "RUN_PROGRESS_TOKEN", "RUN_PUBLICATION_TOKEN", "SESSION_TOKEN", "MACHINE_NONCE"])("matches %s in any case", (name) => {
+    expect(runnerTokens.isRunCredentialEnvName(name)).toBe(true);
+    expect(runnerTokens.isRunCredentialEnvName(name.toLowerCase())).toBe(true);
+  });
+  it.each(["GITHUB_TOKEN", "MY_RUN_TOKEN", "RUN_TOKEN_X", ""])("does not match %j", (name) => {
+    expect(runnerTokens.isRunCredentialEnvName(name)).toBe(false);
+  });
+});
+
 describe("mintRunToken", () => {
   it("a stale publication release cannot clear a newer claim, even within one millisecond", () => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
