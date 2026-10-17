@@ -63,8 +63,6 @@ let runnerTokens: typeof RunnerTokensModule;
 let runnerCallback: typeof RunnerCallbackModule;
 
 let mockGetScopedInstallationToken: ReturnType<typeof vi.fn>;
-let mockIsLinearAuthConfigured: ReturnType<typeof vi.fn>;
-let mockWithLinearToken: ReturnType<typeof vi.fn>;
 
 const SECRET = "test-secret-with-enough-entropy-for-hmac";
 
@@ -79,9 +77,6 @@ beforeEach(async () => {
   runnerCallback = await import("../runner-callback.js");
   const ghAuth = await import("../github-app-auth.js");
   mockGetScopedInstallationToken = vi.mocked(ghAuth.getScopedInstallationToken);
-  const linearAuth = await import("../linear-app-auth.js");
-  mockIsLinearAuthConfigured = vi.mocked(linearAuth.isLinearAuthConfigured);
-  mockWithLinearToken = vi.mocked(linearAuth.withLinearToken);
   log.initLogTable();
 });
 
@@ -220,6 +215,10 @@ function mintKgProgressToken(): string {
 }
 
 describe("handleKgTrackerDataRequest", () => {
+  const page = vi.fn();
+  beforeEach(() => {
+    page.mockReset();
+  });
   const DEFAULT_MAPPINGS: Record<string, unknown> = { AII: {}, BDS: {} };
 
   async function callTrackerData(opts: {
@@ -229,6 +228,7 @@ describe("handleKgTrackerDataRequest", () => {
     getMappings?: () => Record<string, unknown>;
   }): Promise<{ status: number; body: Record<string, unknown> }> {
     return runnerCallback.handleKgTrackerDataRequest({
+      trackerExport: { page },
       authorization: opts.authorization,
       secret: SECRET,
       cursor: opts.cursor,
@@ -239,19 +239,6 @@ describe("handleKgTrackerDataRequest", () => {
 
   const MOCK_ISSUES = [{ id: "issue-1", identifier: "AII-1", title: "Test issue" }];
   const MOCK_PAGE_INFO = { hasNextPage: false, endCursor: null };
-
-  function makeLinearOkResponse(
-    issues = MOCK_ISSUES,
-    pageInfo = MOCK_PAGE_INFO,
-  ): Response {
-    return {
-      ok: true,
-      status: 200,
-      json: async () => ({
-        data: { issues: { nodes: issues, pageInfo } },
-      }),
-    } as unknown as Response;
-  }
 
   it("returns 403 when Authorization header is missing", async () => {
     const result = await callTrackerData({ authorization: undefined });
@@ -281,20 +268,9 @@ describe("handleKgTrackerDataRequest", () => {
     expect(result.body).toEqual({ error: "Unauthorized" });
   });
 
-  it("returns 503 when Linear is not configured", async () => {
-    const token = mintKgProgressToken();
-    mockIsLinearAuthConfigured.mockReturnValueOnce(false);
-
-    const result = await callTrackerData({ authorization: `Bearer ${token}` });
-
-    expect(result.status).toBe(503);
-    expect(result.body).toEqual({ error: "Tracker not configured" });
-  });
-
   it("returns 200 for a teamKey present in getMappings", async () => {
     const token = mintKgProgressToken();
-    mockIsLinearAuthConfigured.mockReturnValueOnce(true);
-    mockWithLinearToken.mockResolvedValueOnce(makeLinearOkResponse());
+    page.mockResolvedValueOnce({ ok: true, page: { issues: MOCK_ISSUES, pageInfo: MOCK_PAGE_INFO } });
 
     const result = await callTrackerData({
       authorization: `Bearer ${token}`,
@@ -306,7 +282,7 @@ describe("handleKgTrackerDataRequest", () => {
     expect(result.body.issues).toEqual(MOCK_ISSUES);
   });
 
-  it("returns 403 for a teamKey not present in getMappings", async () => {
+  it("returns 404 unmapped-team for a teamKey not present in getMappings", async () => {
     const token = mintKgProgressToken();
 
     const result = await callTrackerData({
@@ -315,8 +291,8 @@ describe("handleKgTrackerDataRequest", () => {
       getMappings: () => ({ AII: {}, BDS: {} }),
     });
 
-    expect(result.status).toBe(403);
-    expect(result.body).toEqual({ error: "Unauthorized" });
+    expect(result.status).toBe(404);
+    expect(result.body).toEqual({ error: "unmapped-team" });
   });
 
   it("returns 403 when teamKey is empty", async () => {
@@ -332,22 +308,29 @@ describe("handleKgTrackerDataRequest", () => {
     expect(result.body).toEqual({ error: "Unauthorized" });
   });
 
-  it("returns 200 with issues and pageInfo on the happy path", async () => {
+  it("returns 200 with issues and pageInfo and passes team and cursor to the client", async () => {
     const token = mintKgProgressToken();
-    mockIsLinearAuthConfigured.mockReturnValueOnce(true);
-    mockWithLinearToken.mockResolvedValueOnce(makeLinearOkResponse());
+    page.mockResolvedValueOnce({ ok: true, page: { issues: MOCK_ISSUES, pageInfo: MOCK_PAGE_INFO } });
 
-    const result = await callTrackerData({ authorization: `Bearer ${token}` });
+    const result = await callTrackerData({ authorization: `Bearer ${token}`, cursor: "cursor-xyz" });
 
     expect(result.status).toBe(200);
-    expect(result.body.issues).toEqual(MOCK_ISSUES);
-    expect(result.body.pageInfo).toEqual(MOCK_PAGE_INFO);
+    expect(result.body).toEqual({ issues: MOCK_ISSUES, pageInfo: MOCK_PAGE_INFO });
+    expect(page).toHaveBeenCalledWith({ team: "AII", cursor: "cursor-xyz" });
+  });
+
+  it("passes a missing cursor as null", async () => {
+    const token = mintKgProgressToken();
+    page.mockResolvedValueOnce({ ok: true, page: { issues: [], pageInfo: MOCK_PAGE_INFO } });
+
+    await callTrackerData({ authorization: `Bearer ${token}` });
+
+    expect(page).toHaveBeenCalledWith({ team: "AII", cursor: null });
   });
 
   it("is multi-use — the same progress token can fetch multiple pages", async () => {
     const token = mintKgProgressToken();
-    mockIsLinearAuthConfigured.mockReturnValue(true);
-    mockWithLinearToken.mockResolvedValue(makeLinearOkResponse());
+    page.mockResolvedValue({ ok: true, page: { issues: MOCK_ISSUES, pageInfo: MOCK_PAGE_INFO } });
 
     const first = await callTrackerData({ authorization: `Bearer ${token}` });
     const second = await callTrackerData({ authorization: `Bearer ${token}` });
@@ -356,93 +339,23 @@ describe("handleKgTrackerDataRequest", () => {
     expect(second.status).toBe(200);
   });
 
-  it("selection string contains every ISSUE_FIELDS field", async () => {
-    const token = mintKgProgressToken();
-    mockIsLinearAuthConfigured.mockReturnValueOnce(true);
+  it.each(["tracker-unavailable", "tracker-failed", "unavailable"] as const)(
+    "returns 503 with the %s code when the client answers ok:false",
+    async (code) => {
+      const token = mintKgProgressToken();
+      page.mockResolvedValueOnce({ ok: false, code });
 
-    let capturedQuery: string | null = null;
-    mockWithLinearToken.mockImplementationOnce(
-      async (cb: (token: string) => Promise<Response>) => {
-        const fetchSpy = vi.spyOn(global, "fetch").mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({
-            data: {
-              issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
-            },
-          }),
-        } as unknown as Response);
-        const resp = await cb("fake-linear-token");
-        const rawBody = fetchSpy.mock.calls[0]?.[1]?.body;
-        capturedQuery = (JSON.parse(rawBody as string) as Record<string, unknown>)
-          .query as string;
-        fetchSpy.mockRestore();
-        return resp;
-      },
-    );
+      const result = await callTrackerData({ authorization: `Bearer ${token}` });
 
-    await callTrackerData({ authorization: `Bearer ${token}` });
+      expect(result.status).toBe(503);
+      expect(result.body).toEqual({ error: code });
+    },
+  );
 
-    expect(capturedQuery).toContain("branchName");
-    expect(capturedQuery).toContain("labels");
-    expect(capturedQuery).toContain("project");
-    expect(capturedQuery).toContain("parent");
-    expect(capturedQuery).toContain("relations");
-    expect(capturedQuery).toContain("relatedIssue");
-    expect(capturedQuery).toContain("user");
-    expect(capturedQuery).toContain("comments(first: 100)");
-  });
-
-  it("passes the cursor to the upstream Linear query", async () => {
-    const token = mintKgProgressToken();
-    mockIsLinearAuthConfigured.mockReturnValueOnce(true);
-
-    let capturedVariables: Record<string, unknown> | null = null;
-    mockWithLinearToken.mockImplementationOnce(
-      async (cb: (token: string) => Promise<Response>) => {
-        const fetchSpy = vi.spyOn(global, "fetch").mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({
-            data: {
-              issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
-            },
-          }),
-        } as unknown as Response);
-        const resp = await cb("fake-linear-token");
-        const rawBody = fetchSpy.mock.calls[0]?.[1]?.body;
-        capturedVariables = (JSON.parse(rawBody as string) as Record<string, unknown>)
-          .variables as Record<string, unknown>;
-        fetchSpy.mockRestore();
-        return resp;
-      },
-    );
-
-    await callTrackerData({ authorization: `Bearer ${token}`, cursor: "cursor-xyz" });
-
-    expect(capturedVariables!["after"]).toBe("cursor-xyz");
-    expect(capturedVariables!["teamKey"]).toBe("AII");
-  });
-
-  it("returns 502 when the Linear API returns a non-OK HTTP status", async () => {
-    const token = mintKgProgressToken();
-    mockIsLinearAuthConfigured.mockReturnValueOnce(true);
-    mockWithLinearToken.mockResolvedValueOnce({
-      ok: false,
-      status: 500,
-      json: async () => ({}),
-    } as unknown as Response);
-
-    const result = await callTrackerData({ authorization: `Bearer ${token}` });
-
-    expect(result.status).toBe(502);
-  });
-
-  it("returns 500 when the upstream fetch throws", async () => {
-    const token = mintKgProgressToken();
-    mockIsLinearAuthConfigured.mockReturnValueOnce(true);
-    mockWithLinearToken.mockRejectedValueOnce(new Error("Network error"));
-
-    const result = await callTrackerData({ authorization: `Bearer ${token}` });
-
-    expect(result.status).toBe(500);
+  it("never calls the client for a rejected request", async () => {
+    await callTrackerData({ authorization: undefined });
+    await callTrackerData({ authorization: "Bearer not.a.valid.token" });
+    await callTrackerData({ authorization: `Bearer ${mintKgProgressToken()}`, teamKey: "EVIL" });
+    expect(page).not.toHaveBeenCalled();
   });
 });

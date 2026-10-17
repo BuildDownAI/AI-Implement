@@ -42,7 +42,7 @@ import {
   TROUBLESHOOTING_URL,
   type Classification,
 } from "./completion-classification.js";
-import { isLinearAuthConfigured, withLinearToken } from "./linear-app-auth.js";
+import type { TrackerExportIngressClient } from "./restate/tracker-export.js";
 import { isFailureRecord, projectFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
 import { sanitizeFindingDispositions, type FindingDisposition } from "./pipeline/finding-dispositions.js";
 import { loadStoredSnapshot } from "./agent-run-preparation.js";
@@ -143,6 +143,10 @@ export interface RunnerResultBody {
   guardVerdict?: "clean" | "refused" | "held";
   /** Per-part {part, prev, new} table from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
   partTable?: Array<{ part: string; prev: string; new: string }>;
+  /** Why a `KG_SNAPSHOT_HELD` run waits; absent from runners that predate the field. */
+  cause?: "shrink" | "tracker-missing";
+  /** Teams whose tracker fetch failed, for a `tracker-missing` hold. */
+  failedTeams?: string[];
   /** Reference repository clone outcomes, present only when the run declared entries. */
   referenceRepoResults?: ReferenceRepoResult[];
   /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid). Shape-validated below. */
@@ -808,6 +812,8 @@ export async function handleRunnerResult(
         snapshotCommit: input.body.snapshotCommit,
         snapshotBranch: input.body.snapshotBranch,
         partTable: input.body.partTable,
+        cause: input.body.cause,
+        failedTeams: input.body.failedTeams,
       },
       { idempotencyKey: dispatchId },
     );
@@ -1506,76 +1512,17 @@ export interface HandleKgTrackerDataInput {
   teamKey: string;
   /** Returns the set of configured mapping team keys; teamKey is validated against this set. */
   getMappings: () => Record<string, unknown>;
+  /** The `TrackerExport` Restate service client (AII-1463); the route never reads a tracker itself. */
+  trackerExport: TrackerExportIngressClient;
 }
 
 /**
- * Fetches one paginated page of Linear issues (with their comments) for a team.
- * Shared by the runner-authenticated route (one page per call) and the
- * admin-authenticated export route (loops this across pages). Performs the
- * Linear read with the orchestrator's own credential — callers never see it.
- */
-export async function fetchTrackerIssuesPage(
-  teamKey: string,
-  cursor: string | null | undefined,
-): Promise<HandleRunnerResultOutput> {
-  const FIRST = 50;
-
-  try {
-    const response = await withLinearToken((token) =>
-      fetch("https://api.linear.app/graphql", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({
-          query: `query($teamKey: String!, $first: Int!, $after: String) {
-            issues(filter: { team: { key: { eq: $teamKey } } }, first: $first, after: $after, orderBy: updatedAt) {
-              nodes {
-                id identifier title description branchName
-                state { name type }
-                labels { nodes { name } }
-                project { name }
-                parent { identifier }
-                comments(first: 100) { nodes { body user { name } createdAt } }
-                relations { nodes { type relatedIssue { identifier } } }
-              }
-              pageInfo { hasNextPage endCursor }
-            }
-          }`,
-          variables: { teamKey, first: FIRST, after: cursor ?? null },
-        }),
-      })
-    );
-
-    if (!response.ok) {
-      console.error(`[kg-tracker-data] Linear API returned ${response.status}`);
-      return { status: 502, body: { error: "Upstream tracker error" } };
-    }
-
-    const data = (await response.json()) as {
-      data?: { issues?: { nodes: unknown[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } } };
-      errors?: Array<{ message: string }>;
-    };
-
-    if (data.errors?.length) {
-      console.error("[kg-tracker-data] Linear GraphQL errors:", data.errors);
-      return { status: 502, body: { error: "Upstream tracker error" } };
-    }
-
-    const issues = data.data?.issues?.nodes ?? [];
-    const pageInfo = data.data?.issues?.pageInfo ?? { hasNextPage: false, endCursor: null };
-    return { status: 200, body: { issues, pageInfo } };
-  } catch (err) {
-    console.error("[kg-tracker-data] Failed to fetch tracker data:", err);
-    return { status: 500, body: { error: "Failed to fetch tracker data" } };
-  }
-}
-
-/**
- * Returns a paginated page of Linear issues (with their comments) for the team
- * associated with the run's mapping.
+ * Returns one page of issues (with their comments) from `TrackerExport.page` for
+ * the tracker of the run's mapping.
  *
- * Callable only by kg-refresh runs — any other phase gets 403. The orchestrator
- * performs the Linear read with its own credential; the runner receives data
- * only and never a credential.
+ * Callable only by kg-refresh runs — a missing or bad token or any other phase gets 403.
+ * A valid kg-refresh token with a team that has no mapping gets 404 `unmapped-team`. This function never
+ * reads a tracker and holds no credential; the runner receives data only.
  */
 export async function handleKgTrackerDataRequest(
   input: HandleKgTrackerDataInput,
@@ -1595,16 +1542,19 @@ export async function handleKgTrackerDataRequest(
   if (verified.claims.phase !== "kg-refresh") return bad(403, "Unauthorized");
 
   const mappedKeys = Object.keys(input.getMappings());
-  if (!input.teamKey || !mappedKeys.includes(input.teamKey)) {
+  if (!input.teamKey) return bad(403, "Unauthorized");
+  if (!mappedKeys.includes(input.teamKey)) {
+    // After the token and phase checks: only a valid kg-refresh caller learns whether a team is mapped.
     console.warn(`[kg-tracker-data] teamKey '${input.teamKey}' is not a mapped team`);
-    return bad(403, "Unauthorized");
+    return bad(404, "unmapped-team");
   }
 
-  if (!isLinearAuthConfigured()) {
-    return { status: 503, body: { error: "Tracker not configured" } };
+  const result = await input.trackerExport.page({ team: input.teamKey, cursor: input.cursor ?? null });
+  if (!result.ok) {
+    console.warn(`[kg-tracker-data] TrackerExport answered ${result.code} for team ${input.teamKey}`);
+    return { status: 503, body: { error: result.code } };
   }
-
-  return fetchTrackerIssuesPage(input.teamKey, input.cursor);
+  return { status: 200, body: { issues: result.page.issues, pageInfo: result.page.pageInfo } };
 }
 
 export interface KgScopeEntry {

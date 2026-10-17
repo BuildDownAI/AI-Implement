@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { JiraProvider, createJiraProviderFromConfig } from "../../providers/jira.js";
-import { JiraClient } from "../../providers/jira-client.js";
-import { MissingProviderConfigError, type TicketingProvider } from "../../providers/types.js";
+import { JiraApiError, JiraClient } from "../../providers/jira-client.js";
+import { MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
 import { clearFieldCache } from "../../providers/jira-fields.js";
 import { validateTicketingConfig } from "../../providers/ticketing-config.js";
 import { validateIssueBaseBranch } from "../../base-branch.js";
@@ -1790,5 +1790,179 @@ describe("validateTicketingConfig — profilesFieldOverride passthrough", () => 
     });
     if (result.kind !== "jira") throw new Error("expected jira");
     expect(result.profilesFieldOverride).toBeNull();
+  });
+});
+
+describe("JiraProvider.listIssuesPage", () => {
+  beforeEach(() => {
+    clearFieldCache();
+    vi.stubGlobal("fetch", vi.fn());
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const FIELDS_WITH_EPIC = {
+    ok: true,
+    json: async () => [
+      { id: "customfield_10100", name: "AI-Implement Status", custom: true, schema: {} },
+      { id: "customfield_10101", name: "AI-Implement Repo", custom: true, schema: {} },
+      { id: "customfield_10014", name: "Epic Link", custom: true, schema: {} },
+    ],
+  } as Response;
+
+  const adf = (text: string) => ({
+    type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text }] }],
+  });
+  const page = (issues: unknown[], nextPageToken?: string) =>
+    ({ ok: true, status: 200, json: async () => ({ issues, nextPageToken }) }) as Response;
+  const mapping = (): RepoMapping => ({ ...jiraMapping(), teamKey: "acme/x" });
+  const provider = (scope: string) =>
+    makeProvider({ cacheScope: scope, mappings: { "acme/x": jiraMapping() } });
+
+  const full = {
+    id: "10001",
+    key: "P-1",
+    fields: {
+      summary: "Full issue",
+      description: adf("Body text"),
+      status: { name: "In Progress", statusCategory: { key: "indeterminate" } },
+      labels: ["a", "b"],
+      project: { name: "Proj" },
+      parent: { key: "P-0" },
+      customfield_10101: { value: "acme/x" },
+      issuelinks: [
+        { type: { name: "Blocks" }, outwardIssue: { key: "P-2" } },
+        { type: { name: "Duplicate" }, outwardIssue: { key: "P-3" } },
+        { type: { name: "Relates" }, outwardIssue: { key: "P-4" } },
+        { type: { name: "Blocks" }, inwardIssue: { key: "P-5" } },
+      ],
+      comment: {
+        total: 1,
+        comments: [{ id: "c1", body: adf("A comment"), created: "2026-01-02T00:00:00.000Z", author: { displayName: "Ada" } }],
+      },
+    },
+  };
+
+  it("maps an issue to the tracker record shape and omits branchName, sourceSystem and team", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(FIELDS_WITH_EPIC).mockResolvedValueOnce(page([full]));
+    const res = await provider("lip-map").listIssuesPage(mapping(), null);
+
+    expect(res.pageInfo).toEqual({ hasNextPage: false, endCursor: null });
+    const rec = res.issues[0];
+    expect(rec).toEqual({
+      id: "10001",
+      identifier: "P-1",
+      title: "Full issue",
+      description: "Body text",
+      state: { name: "In Progress", type: "indeterminate" },
+      labels: { nodes: [{ name: "a" }, { name: "b" }] },
+      project: { name: "Proj" },
+      parent: { identifier: "P-0" },
+      comments: { nodes: [{ body: "A comment", user: { name: "Ada" }, createdAt: "2026-01-02T00:00:00.000Z" }] },
+      relations: {
+        nodes: [
+          { type: "blocks", relatedIssue: { identifier: "P-2" } },
+          { type: "duplicate", relatedIssue: { identifier: "P-3" } },
+          { type: "related", relatedIssue: { identifier: "P-4" } },
+          { type: "related", relatedIssue: { identifier: "P-5" } },
+        ],
+      },
+    });
+    const body = JSON.parse(vi.mocked(fetch).mock.calls[1][1]?.body as string);
+    expect(body.jql).toBe("(project = TEST)");
+    expect(body.fields).toEqual(expect.arrayContaining(["comment", "issuelinks", "customfield_10101", "customfield_10014"]));
+  });
+
+  it("takes the parent from Epic Link when there is no native parent", async () => {
+    const epicChild = { id: "2", key: "P-6", fields: { summary: "c", customfield_10101: "acme/x", customfield_10014: "P-EPIC" } };
+    vi.mocked(fetch).mockResolvedValueOnce(FIELDS_WITH_EPIC).mockResolvedValueOnce(page([epicChild]));
+    const res = await provider("lip-epic").listIssuesPage(mapping(), null);
+    expect(res.issues[0].parent).toEqual({ identifier: "P-EPIC" });
+  });
+
+  it("yields nulls and empty arrays for a sparse issue", async () => {
+    const sparse = { id: "3", key: "P-7", fields: { summary: "s", customfield_10101: { value: "acme/x" }, comment: null } };
+    vi.mocked(fetch).mockResolvedValueOnce(FIELDS_WITH_EPIC).mockResolvedValueOnce(page([sparse]));
+    const rec = (await provider("lip-sparse").listIssuesPage(mapping(), null)).issues[0];
+    expect(rec).toMatchObject({
+      description: null, state: null, project: null, parent: null,
+      labels: { nodes: [] }, comments: { nodes: [] }, relations: { nodes: [] },
+    });
+  });
+
+  it("drops an issue whose repo field is another repo, for option and plain-string fields", async () => {
+    const other = { id: "4", key: "P-8", fields: { summary: "o", customfield_10101: { value: "acme/other" } } };
+    const otherText = { id: "5", key: "P-9", fields: { summary: "o", customfield_10101: "acme/other" } };
+    const textMatch = { id: "6", key: "P-10", fields: { summary: "t", customfield_10101: "acme/x" } };
+    vi.mocked(fetch).mockResolvedValueOnce(FIELDS_WITH_EPIC).mockResolvedValueOnce(page([other, otherText, textMatch]));
+    const res = await provider("lip-drop").listIssuesPage(mapping(), null);
+    expect(res.issues.map((i) => i.identifier)).toEqual(["P-10"]);
+  });
+
+  it("chains two pages through the cursor", async () => {
+    const a = { id: "7", key: "P-11", fields: { summary: "a", customfield_10101: "acme/x" } };
+    const b = { id: "8", key: "P-12", fields: { summary: "b", customfield_10101: "acme/x" } };
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_WITH_EPIC)
+      .mockResolvedValueOnce(page([a], "tok-2"))
+      .mockResolvedValueOnce(page([b]));
+    const p = provider("lip-chain");
+    const first = await p.listIssuesPage(mapping(), null);
+    expect(first.pageInfo).toEqual({ hasNextPage: true, endCursor: "tok-2" });
+    const second = await p.listIssuesPage(mapping(), first.pageInfo.endCursor);
+    expect(second.pageInfo).toEqual({ hasNextPage: false, endCursor: null });
+    expect(second.issues.map((i) => i.identifier)).toEqual(["P-12"]);
+    expect(JSON.parse(vi.mocked(fetch).mock.calls[1][1]?.body as string)).not.toHaveProperty("nextPageToken");
+    expect(JSON.parse(vi.mocked(fetch).mock.calls[2][1]?.body as string).nextPageToken).toBe("tok-2");
+  });
+
+  it("completes a truncated embedded comment list with listComments, capped at 100", async () => {
+    const many = Array.from({ length: 150 }, (_, i) => ({
+      id: `c${i}`, body: adf(`n${i}`), created: "2026-01-01T00:00:00.000Z", author: null,
+    }));
+    const trunc = {
+      id: "9", key: "P-13",
+      fields: { summary: "t", customfield_10101: "acme/x", comment: { total: 150, comments: many.slice(0, 20) } },
+    };
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_WITH_EPIC)
+      .mockResolvedValueOnce(page([trunc]))
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ comments: many.slice(0, 100), total: 150 }) } as Response)
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ comments: many.slice(100), total: 150 }) } as Response);
+    const rec = (await provider("lip-trunc").listIssuesPage(mapping(), null)).issues[0];
+    expect(rec.comments.nodes).toHaveLength(100);
+    expect(rec.comments.nodes[0]).toEqual({ body: "n0", user: null, createdAt: "2026-01-01T00:00:00.000Z" });
+  });
+
+  it("keeps the newest 100 of 101 embedded comments, newest first, without listComments", async () => {
+    const embedded = Array.from({ length: 101 }, (_, i) => ({
+      id: `c${i}`, body: adf(`n${i}`), created: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(), author: null,
+    }));
+    const full = {
+      id: "10", key: "P-14",
+      fields: { summary: "t", customfield_10101: "acme/x", comment: { total: 101, comments: embedded } },
+    };
+    vi.mocked(fetch).mockResolvedValueOnce(FIELDS_WITH_EPIC).mockResolvedValueOnce(page([full]));
+    const rec = (await provider("lip-101").listIssuesPage(mapping(), null)).issues[0];
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+    expect(rec.comments.nodes).toHaveLength(100);
+    expect(rec.comments.nodes[0].body).toBe("n100");
+    expect(rec.comments.nodes.map((c) => c.body)).not.toContain("n0");
+  });
+
+  it("throws TrackerUnavailableError for a mapping without Jira config or team key", async () => {
+    const p = provider("lip-unavail");
+    await expect(p.listIssuesPage({ ...jiraMapping(), teamKey: undefined }, null)).rejects.toBeInstanceOf(TrackerUnavailableError);
+    await expect(
+      p.listIssuesPage({ ...baseMapping, ticketingProvider: "linear", ticketingConfig: { kind: "linear" }, teamKey: "X" } as RepoMapping, null),
+    ).rejects.toBeInstanceOf(TrackerUnavailableError);
+  });
+
+  it("propagates a Jira API error so Restate retries it", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_WITH_EPIC)
+      .mockResolvedValueOnce({ ok: false, status: 500, text: async () => "boom" } as Response);
+    await expect(provider("lip-err").listIssuesPage(mapping(), null)).rejects.toBeInstanceOf(JiraApiError);
   });
 });
