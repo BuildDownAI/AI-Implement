@@ -5,6 +5,8 @@ import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import * as devHarnessIndex from "../dev-harness/index.js";
+import { runDevHarnessCli } from "../dev-harness/cli.js";
 
 // The local feedback command is a Node ESM script with pure helper exports.
 // @ts-ignore no declaration file for the repo-local .mjs command module
@@ -26,7 +28,9 @@ const {
   runScenarioFinally,
   subscriptionUnknownProof,
   summarizeResult,
+  runLiveHarness,
   writeLiveResult,
+  writeLiveStderrArtifact,
 } = localFeedbackCommand;
 
 const tempRoots: string[] = [];
@@ -252,6 +256,74 @@ describe("local feedback command helpers", () => {
     expect(summary).toContain("gpt-local-review");
     expect(summary).toContain(`exit code ${exitCode}`);
     expect(JSON.parse(readFileSync(join(artifactsDir, "result.json"), "utf8"))).toEqual({ exitCode, live: true });
+  });
+
+  describe("live startup diagnostics", () => {
+    const FRONT_MATTER_ERROR = "Task file must begin with a YAML front matter block delimited by ---";
+
+    function liveInput(task: string) {
+      const artifactsDir = tempDir("live-diag-artifacts");
+      const workspace = tempDir("live-diag-workspace");
+      return {
+        artifactsDir,
+        input: {
+          cliModule: { ...devHarnessIndex, runDevHarnessCli },
+          artifactsDir,
+          workspace,
+          task,
+          imageId: "sha256:123",
+          agentConfig: join(workspace, "agent.yml"),
+          source: { head: "abc", trackedDiffSha256: "def" },
+          stages: {},
+          signalProcess: new EventEmitter(),
+        },
+      };
+    }
+
+    it("reports a real pre-run validation failure, keeps exit 1, and does not promise runner artifacts", async () => {
+      const task = join(tempDir("live-diag-task"), "task.md");
+      writeFileSync(task, "no front matter here\n");
+      const { artifactsDir, input } = liveInput(task);
+      const echoed: string[] = [];
+
+      const exitCode = await runLiveHarness({ ...input, echoStderr: (text: string) => echoed.push(text) });
+
+      expect(exitCode).toBe(1);
+      expect(echoed.join("")).toContain(FRONT_MATTER_ERROR);
+      expect(readFileSync(join(artifactsDir, "runner.stderr.log"), "utf8")).toContain(FRONT_MATTER_ERROR);
+      const summary = readFileSync(join(artifactsDir, "summary.md"), "utf8");
+      expect(summary).not.toContain("runner.log and run/ hold the stage outcomes");
+      expect(summary).toContain("no runner was started");
+      expect(summary).toContain("runner.stderr.log");
+      expect(JSON.parse(readFileSync(join(artifactsDir, "result.json"), "utf8"))).toEqual({ exitCode: 1, live: true });
+    });
+
+    it("keeps the harness error and still records stderr when the harness throws", async () => {
+      const { artifactsDir, input } = liveInput("unused");
+      const cliModule = {
+        runDevHarnessCli: async (_args: string[], deps: { writeStderr: (t: string) => void }) => {
+          deps.writeStderr("partial diagnostics\n");
+          throw new Error("harness exploded");
+        },
+      };
+      await expect(runLiveHarness({ ...input, cliModule, echoStderr: () => undefined })).rejects.toThrow("harness exploded");
+      expect(readFileSync(join(artifactsDir, "runner.stderr.log"), "utf8")).toContain("partial diagnostics");
+    });
+
+    it("withholds stderr that matches a sensitive pattern", () => {
+      const artifactsDir = tempDir("live-diag-sensitive");
+      const name = writeLiveStderrArtifact({ artifactsDir, err: ["Authorization: Bearer abc\n"] });
+      const text = readFileSync(join(artifactsDir, name), "utf8");
+      expect(text).toContain("withheld");
+      expect(text).not.toContain("Bearer abc");
+    });
+
+    it("writes no artifact when stderr is empty and keeps the runner wording when a runner started", () => {
+      const artifactsDir = tempDir("live-diag-empty");
+      expect(writeLiveStderrArtifact({ artifactsDir, err: [] })).toBeUndefined();
+      writeLiveResult({ artifactsDir, exitCode: 0, source: { head: "a", trackedDiffSha256: "b" }, image: "i", stages: {} });
+      expect(readFileSync(join(artifactsDir, "summary.md"), "utf8")).toContain("runner.log and run/ hold the stage outcomes");
+    });
   });
 
   describe("finishLiveRun", () => {
