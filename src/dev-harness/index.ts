@@ -752,6 +752,7 @@ export async function stopDevRun(handle: DevRunHandle): Promise<void> {
 export async function collectRunArtifacts(
   handle: DevRunHandle,
   exitCode: number | null,
+  cancelled: boolean | (() => boolean) = false,
 ): Promise<void> {
   const { artifactsDir, workspace, containerId, runId, task, startedAt } = handle;
 
@@ -794,13 +795,17 @@ export async function collectRunArtifacts(
   });
   await writeFile(join(artifactsDir, "changes.diff"), fullDiffResult.stdout?.toString() ?? "");
 
+  // Sampled here, not at call time: cancellation can arrive while artifacts are being collected.
+  const wasCancelled = typeof cancelled === "function" ? cancelled() : cancelled;
   const telemetry = {
     runId,
     containerId: containerId.slice(0, 12),
     identifier: task.identifier,
     title: task.title,
     phase: handle.phase,
+    // Observed Docker exit; null when unknown. Never a statement about operator cancellation.
     exitCode,
+    ...(wasCancelled ? { cancelled: true, cancellation: { logicalExit: 130 } } : {}),
     startedAt: startedAt.toISOString(),
     endedAt: new Date().toISOString(),
     durationMs: Date.now() - startedAt.getTime(),
