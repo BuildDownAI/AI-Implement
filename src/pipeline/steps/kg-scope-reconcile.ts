@@ -133,9 +133,16 @@ function planSeqAddition(
 
   // Block-empty (`key:`) or flow-empty (`key: []`) — nothing to preserve, so replace the
   // value span with a freshly rendered block at the default indent.
-  const start = (pair.key as { range: readonly [number, number, number] }).range[1];
-  const end = (value as { range: readonly [number, number, number] }).range[2];
-  return { splice: { start, end, text: `\n${renderSeqEntries(entries, DEFAULT_DASH_INDENT)}` } };
+  // The splice starts just past the key's `:` (the key scalar's range ends before it), so the
+  // colon survives. The block's own trailing newline is dropped: the original text after the
+  // value already begins with the line break, and keeping both would leave a blank line.
+  const keyEnd = (pair.key as { range: readonly [number, number, number] }).range[1];
+  const start = raw.indexOf(":", keyEnd) + 1;
+  // A bare `key:` parses as a null scalar whose range runs over the comment lines that follow,
+  // so only a flow-empty `[]` is replaced; the bare form is spliced in right after the colon.
+  const end = isSeq(value) ? Math.max(start, (value as { range: readonly [number, number, number] }).range[1]) : start;
+  const block = renderSeqEntries(entries, DEFAULT_DASH_INDENT).replace(/\n$/, "");
+  return { splice: { start, end, text: `\n${block}` } };
 }
 
 /**
@@ -173,6 +180,42 @@ function applySeqAdditions(
   }
 
   return out;
+}
+
+/**
+ * Re-parses the generated text and returns a description of the first problem, or null when
+ * the file parses, both scope keys are sequences, and every added slug/team is present.
+ */
+function verifyScope(
+  output: string,
+  repoAdditions: Array<{ slug: string }>,
+  teamAdditions: Array<{ team: string }>,
+): string | null {
+  const doc = parseDocument(output);
+  if (doc.errors.length > 0) return `generated sources.yml has parse error(s): ${doc.errors[0]?.message}`;
+  const contents = doc.contents;
+  if (!isMap(contents)) return "generated sources.yml is not a mapping";
+  const additions = new Set([...(repoAdditions.length > 0 ? ["secondary_repos"] : []), ...(teamAdditions.length > 0 ? ["trackers"] : [])]);
+  const present = (key: string, field: string): Set<string> | string => {
+    const seq = contents.get(key, true);
+    if (seq === undefined && !additions.has(key)) return new Set<string>();
+    if (!isSeq(seq)) return `"${key}" is not a sequence`;
+    const values = new Set<string>();
+    for (const item of seq.items) {
+      const v = isMap(item) ? item.get(field) : undefined;
+      if (typeof v === "string") values.add(v);
+    }
+    return values;
+  };
+  const slugs = present("secondary_repos", "slug");
+  if (typeof slugs === "string") return slugs;
+  const teams = present("trackers", "team");
+  if (typeof teams === "string") return teams;
+  const missingSlug = repoAdditions.find((r) => !slugs.has(r.slug));
+  if (missingSlug) return `added repo ${missingSlug.slug} is missing from secondary_repos`;
+  const missingTeam = teamAdditions.find((t) => !teams.has(t.team));
+  if (missingTeam) return `added team ${missingTeam.team} is missing from trackers`;
+  return null;
 }
 
 function readSourcesYmlRaw(workspaceDir: string): string {
@@ -301,6 +344,12 @@ export const kgScopeReconcileStep: StepModule<KgScopeReconcileInputs, KgScopeRec
       { key: "secondary_repos", entries: repoAdditions },
       { key: "trackers", entries: teamAdditions },
     ]);
+
+    const problem = verifyScope(output, repoAdditions, teamAdditions);
+    if (problem !== null) {
+      console.error(`[kg-scope-reconcile] ${problem}; generated sources.yml:\n${output}`);
+      throw new Error(`[kg-scope-reconcile] refusing to write sources.yml: ${problem}`);
+    }
 
     writeFn(join(workspaceDir, "sources.yml"), output);
     console.log(`[kg-scope-reconcile] added repos=${repoAdditions.length} teams=${teamAdditions.length}`);
