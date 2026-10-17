@@ -252,7 +252,8 @@ A snapshot shrink, or a refresh that could not read tracker data, is one decisio
 not a failed run and a second ingest. The `held` state carries a `cause`: `shrink` (a content-shrink
 rule fired) or `tracker-missing` (`kg-tracker-data` reported `fetched: false` while the cloned snapshot
 has `issue.nt` or `comment.nt`). A `tracker-missing` PR body starts with a warning line naming the
-failed teams, and `held.failedTeams` lists them.
+failed teams, and `held.failedTeams` lists them. The KG Pipelines page shows `held.cause` and
+`held.failedTeams` in the current-run card, and the Accept prompt names the cause.
 
 When the runner's `report` is `failureCode: "KG_SNAPSHOT_HELD"` with a `snapshotPr`, `KgRefresh` stops
 at a gate (`src/restate/kg-refresh-workflow.ts`):

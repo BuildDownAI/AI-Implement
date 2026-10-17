@@ -562,6 +562,51 @@ describe("kg current run card (AII-1260)", () => {
     return { win, doc, calls, visibleButtons };
   }
 
+  async function heldMount(extra: Record<string, unknown>) {
+    const m = mount({ currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held: { ...held, ...extra } }, stage: "awaiting-decision" });
+    const prompts: string[] = [];
+    m.win.confirm = (t: string) => { prompts.push(t); return true; };
+    await m.win.loadKgStatus();
+    return { ...m, prompts };
+  }
+  const SHRINK_PROMPT = "Accept the new baseline? This lands the held snapshot even though a tracked part shrank, overriding the zero-shrink/50% guard for this run. Review the part table first.";
+
+  it("held tracker-missing: names the failed teams as text, creating no element", async () => {
+    const m = await heldMount({ cause: "tracker-missing", failedTeams: ["ACME", "<img src=x onerror=alert(1)>"] });
+    const why = m.doc.getElementById("kg-current-run")?.children[1] as HTMLElement;
+    expect(why.textContent).toBe("Why: tracker data could not be read for ACME, <img src=x onerror=alert(1)>. The tracker parts of this snapshot are missing or reduced.");
+    expect(why.querySelector("img")).toBeNull();
+    expect(why.children.length).toBe(0);
+  });
+
+  it("held tracker-missing with no failed teams: not fetched line", async () => {
+    const m = await heldMount({ cause: "tracker-missing", failedTeams: [] });
+    expect(m.doc.getElementById("kg-current-run")?.children[1]?.textContent).toBe("Why: tracker data was not fetched this run.");
+  });
+
+  it("held shrink and held with no cause: shrink line", async () => {
+    const a = await heldMount({ cause: "shrink", failedTeams: [] });
+    expect(a.doc.getElementById("kg-current-run")?.children[1]?.textContent).toBe("Why: a snapshot part shrank past the guard.");
+    const b = await heldMount({});
+    expect(b.doc.getElementById("kg-current-run")?.children[1]?.textContent).toBe("Why: a snapshot part shrank past the guard.");
+  });
+
+  it("Accept prompt names failed teams for tracker-missing, unchanged for shrink, with no extra status request", async () => {
+    const t = await heldMount({ cause: "tracker-missing", failedTeams: ["ACME", "BETA"] });
+    const before = t.calls.length;
+    const p = t.win.decideKgRefresh("accept");
+    expect(t.calls.slice(before).map((c) => c.url)).toEqual(["/api/tools/decide_kg_refresh"]);
+    await p;
+    expect(t.prompts[0]).toContain("ACME, BETA");
+    expect(t.prompts[0]).toContain("missing or reduced");
+    const s = await heldMount({ cause: "shrink" });
+    await s.win.decideKgRefresh("accept");
+    expect(s.prompts[0]).toBe(SHRINK_PROMPT);
+    const n = await heldMount({});
+    await n.win.decideKgRefresh("accept");
+    expect(n.prompts[0]).toBe(SHRINK_PROMPT);
+  });
+
   it("no current run: stamp, last outcome and Refresh graph now only", async () => {
     const { win, doc, visibleButtons } = mount({ currentRun: null });
     await win.loadKgStatus();
