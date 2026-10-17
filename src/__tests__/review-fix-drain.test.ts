@@ -47,8 +47,8 @@ vi.mock("../local-gapfill.js", async (importOriginal) => {
 });
 
 const githubAppAuthMocks = vi.hoisted(() => ({
-  getInstallationToken: vi.fn<(appId: string, privateKey: string, owner: string) => Promise<string>>(),
-  getInstallationId: vi.fn<(appId: string, privateKey: string, owner: string) => Promise<number>>(),
+  getInstallationToken: vi.fn<(appId: string, privateKey: string, owner: string) => Promise<string>>(async () => "gh-token"),
+  getInstallationId: vi.fn<(appId: string, privateKey: string, owner: string) => Promise<number>>(async () => 778899),
 }));
 
 vi.mock("../github-app-auth.js", async (importOriginal) => {
@@ -61,7 +61,9 @@ vi.mock("../github-app-auth.js", async (importOriginal) => {
 });
 
 const ingressMocks = vi.hoisted(() => ({
-  feedback: vi.fn<(scope: unknown, event: unknown, opts: { idempotencyKey: string }) => Promise<{ status: "accepted" | "unavailable" }>>(),
+  feedback: vi.fn<(scope: unknown, event: unknown, opts: { idempotencyKey: string }) => Promise<{ status: "accepted" | "unavailable" }>>(
+    async () => ({ status: "accepted" }),
+  ),
 }));
 
 vi.mock("../restate/review-fix-client.js", async (importOriginal) => {
@@ -133,9 +135,6 @@ beforeEach(async () => {
     reviewLedgerStore, github, workflowProbe, repoImage, indexModule,
   } = (await testDb({ modules: loaders })).modules);
 
-  githubAppAuthMocks.getInstallationToken.mockResolvedValue("gh-token");
-  githubAppAuthMocks.getInstallationId.mockResolvedValue(778899);
-  ingressMocks.feedback.mockResolvedValue({ status: "accepted" });
   findByKeyMock.mockReset();
 
   // No request is expected unless a test routes it.
@@ -157,7 +156,7 @@ afterEach(() => {
 describe("processReviewFixQueue — owner selection", () => {
   function queueOne(): number {
     return reviewFixQueue.enqueueReviewFix({ issueId: "issue-pilot", issueIdentifier: "AII-42",
-      repo: "acme/billing", prNumber: 42, reason: "review_feedback", sourceEventId: "event-pilot" });
+      repo: "acme/billing", prNumber: 42, reason: "changes_requested", sourceEventId: "event-pilot" });
   }
 
   it("nudges Restate ingress once per 30 s bucket for selected automatic GHA work and leaves Legacy dispatch inert", async () => {
@@ -253,7 +252,7 @@ describe("processReviewFixQueue — owner selection", () => {
 describe("processReviewFixQueue — repository fixer", () => {
   function queueOne(): number {
     return reviewFixQueue.enqueueReviewFix({ issueId: "issue-repo-fix", issueIdentifier: "AII-43",
-      repo: "acme/billing", prNumber: 43, reason: "review_feedback", sourceEventId: "event-repo-fix" });
+      repo: "acme/billing", prNumber: 43, reason: "changes_requested", sourceEventId: "event-repo-fix" });
   }
 
   it("skips the row and dispatches nothing when the process hands fixes to the repository", async () => {
@@ -293,7 +292,7 @@ describe("processReviewFixQueue — dispatch gate", () => {
       issueIdentifier: "AII-1",
       repo: "acme/billing",
       prNumber: 42,
-      reason: "late review comment",
+      reason: "review_comment",
     });
 
     const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
@@ -325,14 +324,14 @@ describe("processReviewFixQueue — dispatch gate", () => {
       issueIdentifier: "AII-2",
       repo: "acme/billing",
       prNumber: 10,
-      reason: "late review comment",
+      reason: "review_comment",
     });
     reviewFixQueue.enqueueReviewFix({
       issueId: "issue-2",
       issueIdentifier: "AII-2",
       repo: "acme/billing",
       prNumber: 20,
-      reason: "late review comment",
+      reason: "review_comment",
     });
 
     await indexModule.processReviewFixQueue(config, registry);
@@ -358,7 +357,7 @@ describe("processReviewFixQueue — dispatch gate", () => {
       issueIdentifier: "AII-3",
       repo: "acme/billing",
       prNumber: 42,
-      reason: "late review comment",
+      reason: "review_comment",
     });
 
     const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
@@ -390,7 +389,7 @@ describe("processReviewFixQueue — dispatch gate", () => {
       issueIdentifier: "AII-4",
       repo: "acme/billing",
       prNumber: 42,
-      reason: "late review comment",
+      reason: "review_comment",
     });
 
     await indexModule.processReviewFixQueue(config, registry);
@@ -407,7 +406,7 @@ describe("processReviewFixQueue — dispatch gate", () => {
       issueIdentifier: "AII-999",
       repo: "acme/billing",
       prNumber: 42,
-      reason: "late review comment",
+      reason: "review_comment",
     });
     pulls({ 42: [{ status: 503 }, pullRequest("open")] });
 
@@ -428,7 +427,7 @@ describe("processReviewFixQueue — dispatch gate", () => {
       issueIdentifier: "AII-998",
       repo: "acme/billing",
       prNumber: 42,
-      reason: "late review comment",
+      reason: "review_comment",
     });
     pulls({ 42: [() => { throw new Error("connection reset"); }, pullRequest("closed", true)] });
 
@@ -447,8 +446,11 @@ describe("processReviewFixQueue — PR dispatch budget", () => {
   /** Seeds a completed gap-analysis dispatch counted toward a PR's 24h budget.
    *  Terminal status keeps it out of the in_flight gate, which would otherwise
    *  mask the pr_budget reason this suite exercises. */
+  // A finished gap-fill dispatch as production leaves it: its admission, taken and released the way the drain takes
+  // one (acquireGapfillAdmission, src/index.ts), leaves the PR's budget entry behind, and its log row is the completed
+  // gap-analysis run launched under that admission.
   function seedGapAnalysisDispatch(issueId: string, issueIdentifier: string, repo: string, prNumber: number): void {
-    const jobId = log.appendLog(makeAppendLogEntry({
+    const entry = makeAppendLogEntry({
       issueId,
       issueIdentifier,
       issueTitle: `Review feedback fix for PR #${prNumber}`,
@@ -456,8 +458,26 @@ describe("processReviewFixQueue — PR dispatch budget", () => {
       repo,
       phase: "gap-analysis",
       status: "completed",
-    }));
+    });
+    const taken = admission.acquire({
+      dispatchId: entry.dispatchId!,
+      mappingKey: "AII",
+      scope: { kind: "pr", issueId, installationId: "778899", repository: repo, prNumber },
+      kind: "gap-fill",
+      backend: "local-docker",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 3,
+    });
+    if (!taken.ok) throw new Error(`seed admission refused: ${taken.reason}`);
+    admission.release(entry.dispatchId!, { kind: "legacy" }, taken.record.generation, "finalized");
+    const jobId = log.appendLog({ ...entry, admissionGeneration: taken.record.generation });
     log.updateJobPrUrl(jobId, `https://github.com/${repo}/pull/${prNumber}`);
+  }
+
+  // The seeded dispatches age out of the 24h window: both their log rows and their budget entries fall outside it.
+  function ageOutGapAnalysisDispatches(): void {
+    dedup.getDb().prepare("DELETE FROM dispatch_log WHERE phase = 'gap-analysis'").run();
+    dedup.getDb().prepare("DELETE FROM dispatch_budget_entries").run();
   }
 
   it("parks the PR and posts exactly one PR comment and one tracker comment when the budget is reached", async () => {
@@ -472,7 +492,7 @@ describe("processReviewFixQueue — PR dispatch budget", () => {
       issueIdentifier: "AII-1",
       repo: "acme/billing",
       prNumber: 42,
-      reason: "late review comment",
+      reason: "review_comment",
     });
 
     const postPrCommentSpy = vi.spyOn(github, "postPrComment").mockResolvedValue(undefined);
@@ -523,7 +543,7 @@ describe("processReviewFixQueue — PR dispatch budget", () => {
       issueIdentifier: "AII-1",
       repo: "acme/billing",
       prNumber: 42,
-      reason: "late review comment",
+      reason: "review_comment",
     });
 
     const postPrCommentSpy = vi.spyOn(github, "postPrComment").mockResolvedValue(undefined);
@@ -552,7 +572,7 @@ describe("processReviewFixQueue — PR dispatch budget", () => {
       issueIdentifier: "AII-1",
       repo: "acme/billing",
       prNumber: 42,
-      reason: "late review comment",
+      reason: "review_comment",
     });
 
     vi.spyOn(github, "postPrComment").mockResolvedValue(undefined);
@@ -563,7 +583,7 @@ describe("processReviewFixQueue — PR dispatch budget", () => {
 
     // The count drops below budget (e.g. the older dispatches age out of the 24h
     // window) while the park persists (unpark is human-only).
-    dedup.getDb().prepare("DELETE FROM dispatch_log WHERE phase = 'gap-analysis'").run();
+    ageOutGapAnalysisDispatches();
 
     breaker.unpark("issue-1", "gap-analysis");
     pulls({ 42: pullRequest("open") });
@@ -587,7 +607,7 @@ describe("processReviewFixQueue — PR dispatch budget", () => {
       issueIdentifier: "AII-1",
       repo: "acme/billing",
       prNumber: 42,
-      reason: "late review comment",
+      reason: "review_comment",
     });
 
     const postPrCommentSpy = vi.spyOn(github, "postPrComment").mockResolvedValue(undefined);
@@ -598,7 +618,7 @@ describe("processReviewFixQueue — PR dispatch budget", () => {
     expect(postPrCommentSpy).toHaveBeenCalledTimes(1);
 
     // The count drops below budget, but the park persists (no unpark call).
-    dedup.getDb().prepare("DELETE FROM dispatch_log WHERE phase = 'gap-analysis'").run();
+    ageOutGapAnalysisDispatches();
 
     await indexModule.processReviewFixQueue(config, registry);
 
@@ -730,7 +750,7 @@ describe("processReviewFixQueue — GHA phase fix", () => {
       issueIdentifier: "AII-5",
       repo: "acme/billing",
       prNumber: 42,
-      reason: "late review comment",
+      reason: "review_comment",
     });
 
     vi.spyOn(github, "dispatchWorkflow").mockResolvedValue({ success: true, status: 204, outcome: "accepted" });
@@ -768,7 +788,7 @@ describe("processReviewFixQueue — task description wiring", () => {
       issueIdentifier: "AII-10",
       repo: "acme/billing",
       prNumber: 60,
-      reason: "late review comment",
+      reason: "review_comment",
     });
 
     reviewLedgerStore.upsertReviewFinding({
@@ -796,7 +816,7 @@ describe("processReviewFixQueue — task description wiring", () => {
     const openFindings = reviewLedgerStore.listOpenReviewFindings("acme/billing", 60);
     const expected = reviewFixQueue.buildReviewFixTaskDescription({
       prNumber: 60,
-      reason: "late review comment",
+      reason: "review_comment",
       findings: openFindings.map((f) => ({
         finding_key: f.findingKey,
         source: f.source,
@@ -825,7 +845,7 @@ describe("processReviewFixQueue — task description wiring", () => {
       issueIdentifier: "AII-6",
       repo: "acme/billing",
       prNumber: 55,
-      reason: "late review comment",
+      reason: "review_comment",
     });
 
     reviewLedgerStore.upsertReviewFinding({
@@ -861,7 +881,7 @@ describe("processReviewFixQueue — task description wiring", () => {
     const openFindings = reviewLedgerStore.listOpenReviewFindings("acme/billing", 55);
     const expected = reviewFixQueue.buildReviewFixTaskDescription({
       prNumber: 55,
-      reason: "late review comment",
+      reason: "review_comment",
       findings: openFindings.map((f) => ({
         finding_key: f.findingKey,
         source: f.source,
@@ -889,7 +909,7 @@ describe("processReviewFixQueue — task description wiring", () => {
       issueIdentifier: "AII-11",
       repo: "acme/billing",
       prNumber: 61,
-      reason: "late review comment",
+      reason: "review_comment",
     });
 
     findByKeyMock.mockRejectedValue(new Error("provider unavailable"));
@@ -918,7 +938,7 @@ describe("processReviewFixQueue — task description wiring", () => {
       issueIdentifier: "AII-12",
       repo: "acme/billing",
       prNumber: 62,
-      reason: "late review comment",
+      reason: "review_comment",
     });
 
     for (let i = 0; i < 31; i++) {
@@ -1000,7 +1020,7 @@ describe("processReviewFixQueue — admission (AII-787)", () => {
       issueIdentifier: "AII-30",
       repo: "acme/billing",
       prNumber: 70,
-      reason: "late review comment",
+      reason: "review_comment",
     });
 
     // Simulates a competing dispatch (e.g. a human /ai-implement comment gap-fill) that
@@ -1041,7 +1061,7 @@ describe("processReviewFixQueue — admission (AII-787)", () => {
       issueIdentifier: "AII-31",
       repo: "acme/billing",
       prNumber: 71,
-      reason: "late review comment",
+      reason: "review_comment",
     });
 
     // A different PR under the same team already holds the (only) slot — no dispatch_log
@@ -1081,7 +1101,7 @@ describe("processReviewFixQueue — admission (AII-787)", () => {
       issueIdentifier: "AII-32",
       repo: "acme/billing",
       prNumber: 73,
-      reason: "late review comment",
+      reason: "review_comment",
     });
 
     await indexModule.processReviewFixQueue(config, registry);
@@ -1135,7 +1155,7 @@ describe("processReviewFixQueue — admission (AII-787)", () => {
       issueIdentifier: "AII-33",
       repo: "acme/billing",
       prNumber: 74,
-      reason: "late review comment",
+      reason: "review_comment",
     });
 
     await indexModule.processReviewFixQueue(config, registry);
@@ -1164,7 +1184,7 @@ describe("processReviewFixQueue — admission (AII-787)", () => {
       issueIdentifier: "AII-34",
       repo: "acme/billing",
       prNumber: 76,
-      reason: "late review comment",
+      reason: "review_comment",
     });
 
     await indexModule.processReviewFixQueue(config, registry);
@@ -1176,7 +1196,7 @@ describe("processReviewFixQueue — admission (AII-787)", () => {
   it("releases local capacity when the launch fails before Docker is invoked", async () => {
     configModule.upsertMapping("AII", acmeBilling());
     pulls({ 79: pullRequest("open") });
-    reviewFixQueue.enqueueReviewFix({ issueId: "issue-local-prep", issueIdentifier: "AII-37", repo: "acme/billing", prNumber: 79, reason: "late review" });
+    reviewFixQueue.enqueueReviewFix({ issueId: "issue-local-prep", issueIdentifier: "AII-37", repo: "acme/billing", prNumber: 79, reason: "review_comment" });
     // Writing the secret env file fails before startLocalRunnerContainer calls onBeforeLaunch.
     localGapfillMocks.startLocalRunnerContainer.mockRejectedValueOnce(new Error("ENOSPC: no space left on device"));
 
@@ -1189,7 +1209,7 @@ describe("processReviewFixQueue — admission (AII-787)", () => {
   it("holds local capacity when Docker was invoked and the launch then failed", async () => {
     configModule.upsertMapping("AII", acmeBilling());
     pulls({ 80: pullRequest("open") });
-    reviewFixQueue.enqueueReviewFix({ issueId: "issue-local-launch", issueIdentifier: "AII-38", repo: "acme/billing", prNumber: 80, reason: "late review" });
+    reviewFixQueue.enqueueReviewFix({ issueId: "issue-local-launch", issueIdentifier: "AII-38", repo: "acme/billing", prNumber: 80, reason: "review_comment" });
     localGapfillMocks.startLocalRunnerContainer.mockImplementationOnce(async (input) => {
       input.onBeforeLaunch?.();
       throw new Error("Failed to start local Docker runner: exit 125");
@@ -1204,7 +1224,7 @@ describe("processReviewFixQueue — admission (AII-787)", () => {
     const { dispatchWorkflowSpy } = setupGha({ maxInProgressAiIssues: 1 });
     dispatchWorkflowSpy.mockResolvedValue({ success: false, status: 500, error: "", outcome: "unknown" });
     pulls({ 77: pullRequest("open") });
-    reviewFixQueue.enqueueReviewFix({ issueId: "issue-unknown", issueIdentifier: "AII-35", repo: "acme/billing", prNumber: 77, reason: "late review" });
+    reviewFixQueue.enqueueReviewFix({ issueId: "issue-unknown", issueIdentifier: "AII-35", repo: "acme/billing", prNumber: 77, reason: "review_comment" });
 
     await indexModule.processReviewFixQueue(config, registry);
 
@@ -1219,7 +1239,7 @@ describe("processReviewFixQueue — admission (AII-787)", () => {
   it("defers a local launch when another owner already reserved the same PR", async () => {
     configModule.upsertMapping("AII", acmeBilling());
     pulls({ 78: pullRequest("open") });
-    reviewFixQueue.enqueueReviewFix({ issueId: "issue-local-race", issueIdentifier: "AII-36", repo: "acme/billing", prNumber: 78, reason: "late review" });
+    reviewFixQueue.enqueueReviewFix({ issueId: "issue-local-race", issueIdentifier: "AII-36", repo: "acme/billing", prNumber: 78, reason: "review_comment" });
     expect(admission.acquire({
       dispatchId: "other-owner", mappingKey: "AII",
       scope: { kind: "pr", issueId: "issue-local-race", installationId: "778899", repository: "acme/billing", prNumber: 78 },

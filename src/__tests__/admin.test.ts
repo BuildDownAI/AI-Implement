@@ -18,12 +18,26 @@ vi.mock("../notify.js", async (importOriginal) => ({
 
 const fetchMachineLogsMock = vi.hoisted(() => vi.fn<() => Promise<string>>());
 const destroyMachineMock = vi.hoisted(() => vi.fn(async () => {}));
+const stopMachineMock = vi.hoisted(() => vi.fn(async () => {}));
 const listMachinesMock = vi.hoisted(() => vi.fn<() => Promise<import("../fly-machines.js").Machine[]>>(async () => []));
+// A session machine as Fly's API returns it, created a minute ago; its age is what a destroy records. An issue run's
+// machine by default; a kept kg-refresh runner carries the durable-runner purpose in its metadata.
+const { flyMachine, getMachineMock } = vi.hoisted(() => {
+  const flyMachine = (id: string, state = "stopped", metadata: Record<string, string> = {}): import("../fly-machines.js").Machine => {
+    const createdAt = new Date(Date.now() - 60_000).toISOString();
+    return {
+      id, name: `session-${id}`, state, region: "iad", created_at: createdAt, updated_at: createdAt,
+      config: { image: "registry.fly.io/ai-implement-sessions:latest", metadata },
+    };
+  };
+  return { flyMachine, getMachineMock: vi.fn(async (_t: string, _a: string, id: string) => flyMachine(id)) };
+});
 vi.mock("../fly-machines.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../fly-machines.js")>()),
   fetchMachineLogs: fetchMachineLogsMock,
   destroyMachine: destroyMachineMock,
-  getMachine: vi.fn(async (_t: string, _a: string, id: string) => ({ id, state: "stopped", config: { metadata: {} } })),
+  stopMachine: stopMachineMock,
+  getMachine: getMachineMock,
   listMachines: listMachinesMock,
 }));
 
@@ -52,7 +66,9 @@ vi.mock("../deploy-availability.js", async (importOriginal) => ({
 }));
 
 const mintSourceTokenOrJwtMock = vi.hoisted(() => vi.fn());
-const getInstallationTokenMock = vi.hoisted(() => vi.fn().mockResolvedValue("gh-token-mock"));
+const getInstallationTokenMock = vi.hoisted(() =>
+  vi.fn<typeof import("../github-app-auth.js").getInstallationToken>(async () => "gh-token-mock"),
+);
 vi.mock("../github-app-auth.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../github-app-auth.js")>()),
   mintSourceTokenOrJwt: mintSourceTokenOrJwtMock,
@@ -61,7 +77,7 @@ vi.mock("../github-app-auth.js", async (importOriginal) => ({
 
 const listRepoBranchesAndTagsMock = vi.hoisted(() => vi.fn());
 const getRepoDefaultBranchMock = vi.hoisted(() => vi.fn());
-const cancelWorkflowRunMock = vi.hoisted(() => vi.fn().mockResolvedValue(true));
+const cancelWorkflowRunMock = vi.hoisted(() => vi.fn(async () => true));
 vi.mock("../github.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../github.js")>()),
   listRepoBranchesAndTags: listRepoBranchesAndTagsMock,
@@ -2313,8 +2329,9 @@ describe("admin kg materialize-mode", () => {
 });
 
 describe("admin kg refresh options removed (AII-1263)", () => {
+  // trigger_kg_refresh's answer to an accepted refresh (src/restate/tools.ts).
   const kgRefreshDeps = {
-    trigger: vi.fn(async (_opts?: { ref?: string; actorEmail?: string }) => ({ status: 202, body: { accepted: true } })),
+    trigger: vi.fn(async (_opts?: { ref?: string; actorEmail?: string }) => ({ status: 202, body: { refreshing: true, triggerId: "t-0" } })),
     status: vi.fn(),
     cancel: vi.fn(),
   };
@@ -2359,7 +2376,7 @@ describe("admin kg refresh options removed (AII-1263)", () => {
     expect(res.statusCode).toBe(202);
     expect(kgRefreshDeps.trigger).toHaveBeenCalledTimes(1);
     expect(kgRefreshDeps.trigger.mock.calls[0]).toHaveLength(0);
-    expect(JSON.parse(res.body)).toMatchObject({ accepted: true });
+    expect(JSON.parse(res.body)).toMatchObject({ refreshing: true });
   });
 
   it("POST /api/kg/refresh with { dryRun: false } is the real refresh", async () => {
@@ -2367,7 +2384,7 @@ describe("admin kg refresh options removed (AII-1263)", () => {
     const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: false });
     expect(res.statusCode).toBe(202);
     expect(kgRefreshDeps.trigger.mock.calls[0]).toHaveLength(0);
-    expect(JSON.parse(res.body)).toEqual({ accepted: true });
+    expect(JSON.parse(res.body)).toEqual({ refreshing: true, triggerId: "t-0" });
   });
 
   it("POST /api/kg/refresh with an invalid JSON body returns 400 and does not trigger", async () => {
@@ -2380,9 +2397,9 @@ describe("admin kg refresh options removed (AII-1263)", () => {
 
   it.each([
     [409, { error: "refresh-in-progress" }],
-    [501, { error: "kg-source-not-configured" }],
-    [422, { error: "preflight-failed", detail: "x" }],
-    [507, { error: "insufficient-storage" }],
+    [501, { error: "kg-source-repo-not-configured" }],
+    [422, { error: "preflight-failed", precondition: "preflight-failed", detail: "acme/kg — contents: read — HTTP 404" }],
+    [507, { error: "insufficient-storage", detail: "less than 209715200 bytes free on the volume" }],
   ])("POST /api/kg/refresh passes a %i tool answer through with its body (AII-901)", async (status, body) => {
     kgRefreshDeps.trigger.mockResolvedValueOnce({ status, body } as never);
     const token = await login("secret");
@@ -3137,7 +3154,7 @@ describe("admin job-detail endpoint", () => {
       issueId: "issue-detail",
       issueIdentifier: "ENG-99",
       issueTitle: "Detail test",
-      teamKey: "eng",
+      teamKey: "ENG",
       repo: "org/repo",
     });
     const res = await request(`/api/jobs/${id}/steps`, "GET", "secret", undefined, token);
@@ -3618,11 +3635,15 @@ describe("admin blockers endpoint", () => {
   it("lists a parked issue as parked for the phase it would run next, and no other phase", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", planningWorkflowFile: "claude-plan.yml" }, token);
-    const { parkIssue } = modules.dispatchBreaker;
+    // Planning and implementation park only through the breaker: the third failed run in a row parks the phase.
+    const { recordDispatchFailure } = modules.dispatchBreaker;
+    const park = (issueId: string, phase: string) => {
+      for (let run = 0; run < 3; run++) recordDispatchFailure(issueId, phase, "failure");
+    };
     const mk = (id: string, identifier: string) => makeIssue({ id, identifier, scopeKey: "CORE" });
-    parkIssue("impl-1", "implementation", "x");
-    parkIssue("plan-1", "planning", "x");
-    parkIssue("plan-2", "implementation", "x"); // wrong phase for a needsPlanning issue
+    park("impl-1", "implementation");
+    park("plan-1", "planning");
+    park("plan-2", "implementation"); // wrong phase for a needsPlanning issue
     dedup.markDispatched("impl-1", "CORE", "CORE-1", "CORE-1"); // parked wins over dedup
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
       readyForImplementation: [mk("impl-1", "CORE-1")],
@@ -3637,6 +3658,7 @@ describe("admin blockers endpoint", () => {
       ["CORE-1", "parked"],
       ["CORE-2", "parked"],
     ]);
+    expect(body.blockers[0].detail).toContain("Parked after 3 failed runs");
     expect(body.totals.byReason.parked).toBe(2);
   });
 
@@ -4454,13 +4476,17 @@ describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
 
   describe("GET /api/review-fix/attempts/:attemptId", () => {
     it("is reachable by a non-admin user session (reads are open, scope is enforced inside the facade)", async () => {
+      // The production facade answers not_found to any caller who is not an admin (createReviewFixAdminFacade).
+      const getAttempt = vi.fn(async (_attemptId: string, caller: { role: string }) =>
+        caller.role === "admin" ? { status: "ok" as const, attempt: ATTEMPT_DETAIL } : { status: "not_found" as const });
       const res = await requestWithDeps(
         "/api/review-fix/attempts/attempt-1",
         "GET",
         userSession(),
-        { reviewFixAttempts: fakeFacade({ getAttempt: async () => ({ status: "ok", attempt: ATTEMPT_DETAIL }) }) },
+        { reviewFixAttempts: fakeFacade({ getAttempt }) },
       );
-      expect(res.statusCode).toBe(200);
+      expect(getAttempt).toHaveBeenCalledWith("attempt-1", expect.objectContaining({ role: "user" }));
+      expect(res.statusCode).toBe(404);
     });
 
     it("returns the attempt detail with explicit evidenceComplete/terminationConfirmed fields, never omitted", async () => {
@@ -5676,41 +5702,47 @@ describe("admin sessions — kg-refresh destroy", () => {
     );
     const res = new MockResponse();
     admin.handleAdminRequest(req as never, res as never, sessionsConfig(), makeFakeRegistry(provider), {
-      kgRefresh: kgRefresh ?? { trigger: vi.fn(), status: vi.fn(), cancel: vi.fn() },
+      // The workflow's answer to a cancel of a run it tracks (makeKgRefreshAdminDeps, src/index.ts).
+      kgRefresh: kgRefresh ?? { trigger: vi.fn(), status: vi.fn(), cancel: vi.fn(async () => ({ status: 200, body: { cancelled: true } })) },
     });
     await res.done;
     return { statusCode: res.statusCode, body: res.body };
   }
 
+  // A Fly kg-refresh run as the workflow records it: the row carries the trigger id and the KG repository, and its
+  // machine is the kept durable runner (kg-refresh-senders.ts), which a destroy only stops.
+  function flyKgJob(machineId: string): number {
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines", repo: "TestOrg/test-kg", dispatchId: `t-${machineId}` });
+    log.setJobMachineNonce(jobId, "nonce-kg");
+    log.setJobMachineId(jobId, machineId);
+    log.updateJobMachineId(jobId, machineId);
+    getMachineMock.mockImplementation(async (_t, _a, id) => flyMachine(id, "started", { purpose: "durable-runner", pipeline: "kg-refresh" }));
+    return jobId;
+  }
+
   beforeEach(() => {
     destroyMachineMock.mockReset();
-    destroyMachineMock.mockResolvedValue(undefined);
+    stopMachineMock.mockReset();
+    getMachineMock.mockReset();
     cancelWorkflowRunMock.mockReset();
-    cancelWorkflowRunMock.mockResolvedValue(true);
     getInstallationTokenMock.mockReset();
-    getInstallationTokenMock.mockResolvedValue("gh-token-mock");
     notifyTextMock.mockReset();
   });
 
-  it("destroys the machine and returns 200 for an in-flight kg-refresh job", async () => {
+  it("stops the kept machine instead of destroying it and returns 200 for an in-flight kg-refresh job", async () => {
     const token = await login("secret");
-    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
-    log.setJobMachineNonce(jobId, "nonce-kg");
-    log.setJobMachineId(jobId, "m-kg-cancel");
-    log.updateJobMachineId(jobId, "m-kg-cancel");
+    flyKgJob("m-kg-cancel");
 
     const res = await deleteSession("m-kg-cancel", token);
 
     expect(res.statusCode).toBe(200);
-    expect(destroyMachineMock).toHaveBeenCalledWith(FLY_TOKEN, FLY_APP, "m-kg-cancel");
+    expect(stopMachineMock).toHaveBeenCalledWith(FLY_TOKEN, FLY_APP, "m-kg-cancel");
+    expect(destroyMachineMock).not.toHaveBeenCalled();
   });
 
   it("stamps the job row operator_cancelled", async () => {
     const token = await login("secret");
-    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
-    log.setJobMachineNonce(jobId, "nonce-kg");
-    log.setJobMachineId(jobId, "m-kg-cancel3");
-    log.updateJobMachineId(jobId, "m-kg-cancel3");
+    const jobId = flyKgJob("m-kg-cancel3");
 
     await deleteSession("m-kg-cancel3", token);
 
@@ -5721,10 +5753,7 @@ describe("admin sessions — kg-refresh destroy", () => {
 
   it("sends exactly one notification and does not call provider.clearWorkingState (regression pin)", async () => {
     const token = await login("secret");
-    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
-    log.setJobMachineNonce(jobId, "nonce-kg");
-    log.setJobMachineId(jobId, "m-kg-cancel4");
-    log.updateJobMachineId(jobId, "m-kg-cancel4");
+    flyKgJob("m-kg-cancel4");
 
     const clearWorkingState = vi.spyOn(provider, "clearWorkingState");
     await deleteSession("m-kg-cancel4", token);
@@ -5733,18 +5762,16 @@ describe("admin sessions — kg-refresh destroy", () => {
     expect(clearWorkingState).not.toHaveBeenCalled();
   });
 
-  it("Fly-mode kg-refresh cancel destroys the machine and also calls the workflow cancel, tolerating a non-200", async () => {
+  it("Fly-mode kg-refresh cancel stops the kept machine and also calls the workflow cancel, tolerating a non-200", async () => {
     const token = await login("secret");
-    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines", dispatchId: "t-fly" });
-    log.setJobMachineNonce(jobId, "nonce-kg");
-    log.setJobMachineId(jobId, "m-kg-cancel5");
-    log.updateJobMachineId(jobId, "m-kg-cancel5");
+    const jobId = flyKgJob("m-kg-cancel5");
     const cancel = vi.fn(async () => ({ status: 409, body: { error: "no-refresh-in-flight" } }));
     const res = await deleteSession("m-kg-cancel5", token, { trigger: vi.fn(), status: vi.fn(), cancel });
 
     expect(res.statusCode).toBe(200);
-    expect(destroyMachineMock).toHaveBeenCalledWith(FLY_TOKEN, FLY_APP, "m-kg-cancel5");
-    expect(cancel).toHaveBeenCalledWith({ jobId, dispatchId: "t-fly", reason: "operator_cancelled" });
+    expect(stopMachineMock).toHaveBeenCalledWith(FLY_TOKEN, FLY_APP, "m-kg-cancel5");
+    expect(destroyMachineMock).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledWith({ jobId, dispatchId: "t-m-kg-cancel5", reason: "operator_cancelled" });
     expect(log.getJobById(jobId)?.conclusion).toBe("operator_cancelled");
   });
 
