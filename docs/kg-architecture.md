@@ -248,14 +248,20 @@ dispatched a runner and received no callback within the TTL self-heals at the ne
 
 ### Decision gate (AII-1248)
 
-A snapshot shrink is one decision inside the same run, not a failed run and a second ingest. When
-the runner's `report` is `failureCode: "KG_SNAPSHOT_HELD"` with a `snapshotPr`, `KgRefresh` stops
+A snapshot shrink, or a refresh that could not read tracker data, is one decision inside the same run,
+not a failed run and a second ingest. The `held` state carries a `cause`: `shrink` (a content-shrink
+rule fired) or `tracker-missing` (`kg-tracker-data` reported `fetched: false` while the cloned snapshot
+has `issue.nt` or `comment.nt`). A `tracker-missing` PR body starts with a warning line naming the
+failed teams, and `held.failedTeams` lists them.
+
+When the runner's `report` is `failureCode: "KG_SNAPSHOT_HELD"` with a `snapshotPr`, `KgRefresh` stops
 at a gate (`src/restate/kg-refresh-workflow.ts`):
 
 1. Sets step `decision` and stores `held` in workflow state: `snapshotPr`, `snapshotCommit`,
-   `snapshotBranch`, `partTable`, and `decideBy` (now + 24 h). `status` exposes `snapshotPr`,
-   `partTable`, and `decideBy` (not the commit or branch) as `held`, which `get_kg_status` surfaces
-   as `currentRun.held`.
+   `snapshotBranch`, `partTable`, `cause`, `failedTeams`, and `decideBy` (now + 24 h). `status`
+   exposes `snapshotPr`, `partTable`, `cause`, `failedTeams`, and `decideBy` (not the commit or
+   branch) as `held`, which `get_kg_status` surfaces as `currentRun.held`. A report or stored state
+   with no `cause` (a run in flight at deploy) reads as `shrink` with no failed teams.
 2. Sends `FlyMachineProfile("kg-refresh").release({ dispatchId })`: the runner has finished, so the
    machine returns to the profile now rather than after the wait.
 3. Keeps `KgRepo` held: no call is needed, because the `run` invocation holds the lock for its whole life
@@ -549,18 +555,20 @@ An accept now travels in the `decide` signal, whose `actor` the PR note and log 
 `kg-snapshot-push.ts` returns `guardVerdict` and `partTable` in its step output on the success path and,
 via `KgSnapshotTrackerRegressionError.partTable`, on a hard guard refusal. The runner's callback body
 carries both back (`RunnerResultBody.guardVerdict` / `.partTable`), and `handleRunnerResult` forwards them
-to the workflow. Guard 0b's regressions split into two classes:
+to the workflow. A held error also carries `cause` and `failedTeams`, which travel the same way into the
+`held` state. Guard 0b's regressions split into two classes:
 
 | Case | Push and PR | Report |
 |---|---|---|
 | No regression | yes | success |
 | Hard regression (a part missing), with or without soft | no | failure `KG_SNAPSHOT_TRACKER_REGRESSION`, `guardVerdict: "refused"`, part table, no `snapshot*` fields |
 | Soft only (zero-shrink or 50% rule) | yes | failure `KG_SNAPSHOT_HELD`, `guardVerdict: "held"`, part table, `snapshotPr`/`snapshotCommit`/`snapshotBranch` |
-| Guard 0 (tracker fetch failed) | no | `KG_SNAPSHOT_TRACKER_REGRESSION` |
-| Dry run (PR check), soft only | no | `refused` with the table, never `held` |
+| Guard 0 (tracker fetch failed, tracker part in the clone), real run | yes | failure `KG_SNAPSHOT_HELD`, `cause: "tracker-missing"`, `failedTeams`, part table; a missing or smaller `issue.nt` / `comment.nt` is held, any other missing part is hard |
+| Dry run (PR check), soft only or tracker data missing | no | `refused` with the table, never `held` |
 
 A held run commits, pushes `kg-refresh/<stamp>` and opens the PR (body: `Guard verdict: held — a shrink
-waits for an operator decision`), then throws `KgSnapshotHeldError`. It is never reported as `success`;
+waits for an operator decision`; for `tracker-missing`, the body starts with a `⚠️` line naming the
+failed teams), then throws `KgSnapshotHeldError`. It is never reported as `success`;
 `KgRefresh` stops at the [decision gate](#decision-gate-aii-1248) on it.
 
 A PR-check dry run takes the workflow's dry-run branch: it never writes `lastRefresh`, never reaches the
@@ -650,19 +658,27 @@ following hold:
 
 | Rule | Condition |
 |---|---|
-| Missing part | A part file present in the previous snapshot is absent from the working tree |
+| Missing part | A part file present in the previous snapshot is absent from the working tree. Hard, except `issue.nt` / `comment.nt` when tracker data is missing (`fetched=false`), which hold |
 | General shrink | Any part file's line count is below `PART_SHRINK_THRESHOLD` (50 %) of its previous count |
 | `issue.nt` / `comment.nt` zero-shrink | `issue.nt` or `comment.nt` shrinks by any amount when the `kg-tracker-data` step reported a non-zero `issueCount` |
 
-The general-shrink and zero-shrink rules — but never the missing-part rule, nor the separate
-`fetched=false` tracker guard above them — hold the run at the
-decision gate rather than failing it ([Held-verdict plumbing](#held-verdict-plumbing-aii-1253-aii-1264)):
-an intentional change in what the ingest emits (a base-repo classification change, for example) also
-shrinks these files, and the guard cannot tell that from data loss on its own, so an operator decides.
+The general-shrink and zero-shrink rules hold the run at the decision gate rather than failing it.
+So does `fetched=false` with tracker parts in the cloned snapshot (cause `tracker-missing`): there a
+missing or smaller `issue.nt` / `comment.nt` counts as held too. Any other missing part, and a
+missing tracker part when `fetched=true`, stays a hard refusal, since a part that vanishes for
+another reason is an ingest defect and holding it would invite an operator to accept a broken graph.
+A dry run pushes nothing and has no PR to hold, so it still refuses with
+`KG_SNAPSHOT_TRACKER_REGRESSION`. See
+[Held-verdict plumbing](#held-verdict-plumbing-aii-1253-aii-1264).
+
+For a shrink, an intentional change in what the ingest emits (a base-repo classification change, for
+example) also shrinks these files, and the guard cannot tell that from data loss on its own, so an
+operator decides.
 
 One log line listing all parts with `prev=` and `new=` counts is emitted on every push attempt,
 pass or fail. The `fetched=false` flag check (which guards against a docs-only push replacing a
-tracker-enriched graph) is a separate, prior guard; both must pass before a commit is made.
+tracker-enriched graph) runs first; it marks the run held rather than throwing, and the part
+comparison then computes the table.
 
 **Fly session image pinning (AII-534, updated AII-555).** The Fly sender (`src/restate/kg-refresh-senders.ts`) resolves the
 session machine image via `resolveRunnerImageForDispatch` (`src/repo-image.ts`), the same

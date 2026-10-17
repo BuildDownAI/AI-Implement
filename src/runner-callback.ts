@@ -143,6 +143,10 @@ export interface RunnerResultBody {
   guardVerdict?: "clean" | "refused" | "held";
   /** Per-part {part, prev, new} table from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
   partTable?: Array<{ part: string; prev: string; new: string }>;
+  /** Why a `KG_SNAPSHOT_HELD` run waits; absent from runners that predate the field. */
+  cause?: "shrink" | "tracker-missing";
+  /** Teams whose tracker fetch failed, for a `tracker-missing` hold. */
+  failedTeams?: string[];
   /** Reference repository clone outcomes, present only when the run declared entries. */
   referenceRepoResults?: ReferenceRepoResult[];
   /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid). Shape-validated below. */
@@ -808,6 +812,8 @@ export async function handleRunnerResult(
         snapshotCommit: input.body.snapshotCommit,
         snapshotBranch: input.body.snapshotBranch,
         partTable: input.body.partTable,
+        cause: input.body.cause,
+        failedTeams: input.body.failedTeams,
       },
       { idempotencyKey: dispatchId },
     );
