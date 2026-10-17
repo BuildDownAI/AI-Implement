@@ -7,6 +7,7 @@ import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import type { FailureRecord } from "../pipeline/failure-classification.js";
 import { makeContext as makeBaseContext, makeFeedbackLoopOutputs } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type ReplyInit, type Routes } from "./helpers/fake-fetch.js";
+import { githubError } from "./helpers/github-replies.js";
 
 vi.mock("node:child_process", () => ({
   spawnSync: vi.fn(),
@@ -25,10 +26,14 @@ import { computeBackoffMs, sleepAsync } from "../pipeline/retry-backoff.js";
 
 // The issue the implementation branch below is named for; the PR title, body and commit assertions name it.
 // No orchestrator URL or nonce: a GitHub Actions run, like BASE_INPUTS. The pipeline copies these into the
-// step's inputs, so a test that vends a token passes the same values to both.
+// step's inputs, so a test that vends a token passes the same values to both. The checked-out branch is the
+// inputs' base branch: the clone reports it back and the pipeline passes it on as `baseBranch`.
 function makeContext(overrides: Partial<PipelineContextData> = {}) {
-  return makeBaseContext({ issueIdentifier: "ENG-42", orchestratorUrl: "", nonce: "", ...overrides });
+  return makeBaseContext({ issueIdentifier: "ENG-42", orchestratorUrl: "", nonce: "", branch: "main", ...overrides });
 }
+
+// A gap-fill run checks out the PR's own branch, which the inputs name as both base and branch.
+const GAP_FILL_CONTEXT = { prNumber: "42", branch: "feature/existing-pr" };
 
 const CREATE_PR = "POST /repos/acme/app/pulls";
 const LIST_PRS = "GET /repos/acme/app/pulls";
@@ -42,7 +47,7 @@ const created = (number: number): ReplyInit => ({
 });
 /** The orchestrator's answer to a token vend; `/api/token` and `/api/runner/publication-token` share it. */
 const minted = (token: string): ReplyInit => ({ json: { token, expires_at: "2030-01-01T00:00:00Z" } });
-const unprocessable: ReplyInit = { status: 422, json: { message: "Validation Failed" } };
+const unprocessable = githubError(422, "Validation Failed");
 
 interface PullRequestCreate { title: string; head: string; base: string; body: string; draft?: boolean }
 
@@ -221,7 +226,7 @@ describe("pushStep", () => {
     const fake = fakeFetch({ [PUBLICATION_TOKEN]: minted("fresh-token") }).install();
 
     const outputs = await pushStep.run(
-      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      makeContext({ callbackUrl: "https://orchestrator.example", ...GAP_FILL_CONTEXT }),
       {
         ...BASE_INPUTS,
         branchName: "feature/existing-pr",
@@ -260,7 +265,7 @@ describe("pushStep", () => {
     const fake = fakeFetch({ [PUBLICATION_TOKEN]: minted("fresh-token") }).install();
 
     const outputs = await pushStep.run(
-      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      makeContext({ callbackUrl: "https://orchestrator.example", ...GAP_FILL_CONTEXT }),
       {
         ...BASE_INPUTS,
         branchName: "feature/existing-pr",
@@ -291,7 +296,7 @@ describe("pushStep", () => {
     mockGitSuccess("abc123");
 
     await expect(pushStep.run(
-      makeContext({ prNumber: "42" }),
+      makeContext(GAP_FILL_CONTEXT),
       {
         ...BASE_INPUTS,
         branchName: "feature/existing-pr",
@@ -313,7 +318,7 @@ describe("pushStep", () => {
     mockGitSuccess("abc123", false);
 
     const outputs = await pushStep.run(
-      makeContext({ prNumber: "42" }),
+      makeContext(GAP_FILL_CONTEXT),
       {
         ...BASE_INPUTS,
         branchName: "feature/existing-pr",
@@ -751,7 +756,7 @@ describe("pushStep", () => {
     fakeFetch({ [CREATE_PR]: created(9) }).install();
 
     const outputs = await pushStep.run(
-      makeContext(),
+      makeContext({ sensitiveFiles: { allow: [".env"] } }),
       { ...BASE_INPUTS, sensitiveFiles: { allow: [".env"] } },
       new NoopStepReporter(),
     );
@@ -768,7 +773,7 @@ describe("pushStep", () => {
 
     await expect(
       pushStep.run(
-        makeContext(),
+        makeContext({ sensitiveFiles: { allow: [".env"] } }),
         { ...BASE_INPUTS, sensitiveFiles: { allow: [".env"] } },
         new NoopStepReporter(),
       ),
@@ -800,7 +805,7 @@ describe("pushStep", () => {
 
     await expect(
       pushStep.run(
-        makeContext(),
+        makeContext({ sensitiveFiles: { add: ["*.secret"] } }),
         { ...BASE_INPUTS, sensitiveFiles: { add: ["*.secret"] } },
         new NoopStepReporter(),
       ),
@@ -823,7 +828,7 @@ describe("pushStep", () => {
     fakeFetch({ [CREATE_PR]: created(9) }).install();
 
     const outputs = await pushStep.run(
-      makeContext(),
+      makeContext({ sensitiveFiles: { allow: [".env.*"] } }),
       { ...BASE_INPUTS, sensitiveFiles: { allow: [".env.*"] } },
       new NoopStepReporter(),
     );
@@ -895,15 +900,16 @@ describe("pushStep", () => {
   });
 });
 
-const REVIEW_SUMMARY = {
-  terminationReason: "iterations_exhausted",
-  iterations: 3,
-  finalFeedback: "Missing tests for the retry path.",
-  passes: [
-    { iteration: 1, implementTurns: 98, implementOutcome: "success", costUsd: 3.21, reviewApproved: false },
-  ],
-  postMortem: "## Post-mortem\nScope too broad.",
-};
+/** The review summary the pipeline hands push for an unapproved feedback-loop run (pipeline-loader.ts). */
+function reviewSummary(run: ReturnType<typeof makeFeedbackLoopOutputs>) {
+  const { terminationReason, iterations, finalFeedback, passes, postMortem } = run;
+  return { terminationReason, iterations, finalFeedback, passes, ...(postMortem ? { postMortem } : {}) };
+}
+
+const REVIEW_SUMMARY = reviewSummary(makeFeedbackLoopOutputs({ approved: false, iterations: 3, finalFeedback: "Missing tests for the retry path." }));
+// Only a run that hit the turn cap carries a post-mortem.
+const MAX_TURNS_SUMMARY = reviewSummary(makeFeedbackLoopOutputs({ terminationReason: "max_turns", postMortem: "## Post-mortem\nScope too broad." }));
+const OUTAGE_SUMMARY = reviewSummary(makeFeedbackLoopOutputs({ terminationReason: "provider_unavailable" }));
 
 describe("pushStep draft PRs", () => {
   beforeEach(() => {
@@ -916,7 +922,7 @@ describe("pushStep draft PRs", () => {
 
     const outputs = await pushStep.run(
       makeContext(),
-      { ...BASE_INPUTS, draft: true, reviewSummary: REVIEW_SUMMARY },
+      { ...BASE_INPUTS, draft: true, reviewSummary: MAX_TURNS_SUMMARY },
       new NoopStepReporter(),
     );
 
@@ -924,8 +930,8 @@ describe("pushStep draft PRs", () => {
     const body = prRequest(fake);
     expect(body.draft).toBe(true);
     expect(body.body).toContain("Automated review did not approve");
-    expect(body.body).toContain("Missing tests for the retry path.");
-    expect(body.body).toContain("iterations_exhausted");
+    expect(body.body).toContain("Implementation hit the 50-turn cap");
+    expect(body.body).toContain("max_turns");
     expect(body.body).toContain("Post-mortem");
     // The test-plan line must not contradict the unapproved section above it: no
     // testsSummary/preflight summary was supplied, so the fallback must say
@@ -941,7 +947,7 @@ describe("pushStep draft PRs", () => {
 
     const outputs = await pushStep.run(
       makeContext(),
-      { ...BASE_INPUTS, draft: true, reviewSummary: { ...REVIEW_SUMMARY, terminationReason: "provider_unavailable", finalFeedback: "Model provider was unavailable during implementation after 2 attempt(s); partial changes were preserved.", postMortem: undefined } },
+      { ...BASE_INPUTS, draft: true, reviewSummary: OUTAGE_SUMMARY },
       new NoopStepReporter(),
     );
 
@@ -978,7 +984,7 @@ describe("pushStep draft PRs", () => {
         ...BASE_INPUTS,
         prTitle: "ENG-42: Test",
         draft: true,
-        reviewSummary: { ...REVIEW_SUMMARY, terminationReason: "provider_unavailable" },
+        reviewSummary: OUTAGE_SUMMARY,
       },
       new NoopStepReporter(),
     );
@@ -1071,9 +1077,11 @@ describe("pushStep — dependency install status in the PR body", () => {
     ctx.setOutputs("install-retry", { installFailed: true, installMethod: "npm ci", installError: "ERESOLVE unable to resolve dependency tree" });
     const fake = fakeFetch({ [CREATE_PR]: created(11) }).install();
 
-    await pushStep.run(ctx, BASE_INPUTS, new NoopStepReporter());
+    // The pipeline opens a run whose dependencies never installed as a draft, approved or not.
+    await pushStep.run(ctx, { ...BASE_INPUTS, draft: true }, new NoopStepReporter());
 
     const body = prRequest(fake);
+    expect(body.draft).toBe(true);
     expect(body.body.startsWith("## ⚠️ Dependencies did not install")).toBe(true);
     expect(body.body).toContain("`npm ci`");
     expect(body.body).toContain("ERESOLVE unable to resolve dependency tree");
@@ -1092,7 +1100,7 @@ describe("pushStep — dependency install status in the PR body", () => {
     });
     const fake = fakeFetch({ [CREATE_PR]: created(11) }).install();
 
-    await pushStep.run(ctx, BASE_INPUTS, new NoopStepReporter());
+    await pushStep.run(ctx, { ...BASE_INPUTS, draft: true }, new NoopStepReporter());
 
     const body = prRequest(fake);
     const fenceCount = (body.body.match(/^```$/gm) ?? []).length;
@@ -1151,7 +1159,7 @@ describe("pushStep — dependency install status in the PR body", () => {
 
   it("never renders install status for a gap-fill push (no PR body is built)", async () => {
     mockGitSuccess("abc123");
-    const ctx = makeContext({ prNumber: "42" });
+    const ctx = makeContext(GAP_FILL_CONTEXT);
     ctx.setOutputs("install", { installFailed: true, installMethod: "npm ci" });
     ctx.setOutputs("install-retry", { installFailed: true, installMethod: "npm ci", installError: "boom" });
 
@@ -1236,7 +1244,7 @@ describe("pushStep — Case A (agent-committed changes)", () => {
     const fake = fakeFetch({ [CREATE_PR]: created(21) }).install();
 
     await pushStep.run(
-      makeContext(),
+      makeContext({ branch: "ai-implement/feature/eng-40" }),
       {
         ...BASE_INPUTS,
         branchName: "ai-implement/eng-42-test",
@@ -1315,7 +1323,7 @@ describe("pushStep — Case B (grouping parent no-op)", () => {
     mockNoChanges();
 
     const outputs = await pushStep.run(
-      makeContext(),
+      makeContext({ groupingParent: true }),
       { ...BASE_INPUTS, groupingParent: true },
       new NoopStepReporter(),
     );
@@ -1331,7 +1339,7 @@ describe("pushStep — Case B (grouping parent no-op)", () => {
     mockNoChanges();
 
     await pushStep.run(
-      makeContext(),
+      makeContext({ groupingParent: true }),
       { ...BASE_INPUTS, groupingParent: true },
       new NoopStepReporter(),
     );
@@ -1358,7 +1366,7 @@ describe("pushStep — Case B (grouping parent no-op)", () => {
 
     await expect(
       pushStep.run(
-        makeContext(),
+        makeContext({ groupingParent: false }),
         { ...BASE_INPUTS, groupingParent: false },
         new NoopStepReporter(),
       ),
@@ -1372,7 +1380,7 @@ describe("pushStep — Case B (grouping parent no-op)", () => {
     fakeFetch({ [CREATE_PR]: created(13) }).install();
 
     const outputs = await pushStep.run(
-      makeContext(),
+      makeContext({ groupingParent: true }),
       { ...BASE_INPUTS, groupingParent: true },
       new NoopStepReporter(),
     );
@@ -1400,7 +1408,7 @@ describe("pushStep — hardening (review findings)", () => {
     });
 
     await expect(
-      pushStep.run(makeContext(), { ...BASE_INPUTS, groupingParent: true }, new NoopStepReporter()),
+      pushStep.run(makeContext({ groupingParent: true }), { ...BASE_INPUTS, groupingParent: true }, new NoopStepReporter()),
     ).rejects.toThrow(/git rev-list .*failed/);
     expect(unrouted.calls).toEqual([]);
   });
@@ -1852,7 +1860,7 @@ describe("pushStep — push failure classification and retry (BAC-27116)", () =>
     const fake = fakeFetch({ [PUBLICATION_TOKEN]: minted("fresh-token") }).install();
 
     const outputs = await pushStep.run(
-      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      makeContext({ callbackUrl: "https://orchestrator.example", ...GAP_FILL_CONTEXT }),
       {
         ...BASE_INPUTS,
         branchName: "feature/existing-pr",
@@ -3054,7 +3062,7 @@ describe("pushStep — push guard: adopt agent push vs refuse foreign work", () 
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     const outputs = await pushStep.run(
-      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      makeContext({ callbackUrl: "https://orchestrator.example", ...GAP_FILL_CONTEXT }),
       { ...GAP_FILL_INPUTS, callbackUrl: "https://orchestrator.example" },
       new NoopStepReporter(),
     );
@@ -3073,7 +3081,7 @@ describe("pushStep — push guard: adopt agent push vs refuse foreign work", () 
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     await pushStep.run(
-      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      makeContext({ callbackUrl: "https://orchestrator.example", ...GAP_FILL_CONTEXT }),
       { ...GAP_FILL_INPUTS, callbackUrl: "https://orchestrator.example" },
       new NoopStepReporter(),
     );
@@ -3103,7 +3111,7 @@ describe("pushStep — push guard: adopt agent push vs refuse foreign work", () 
 
     let caught: (Error & { failure?: FailureRecord }) | undefined;
     try {
-      await pushStep.run(makeContext({ prNumber: "42" }), GAP_FILL_INPUTS, new NoopStepReporter());
+      await pushStep.run(makeContext(GAP_FILL_CONTEXT), GAP_FILL_INPUTS, new NoopStepReporter());
     } catch (err) {
       caught = err as typeof caught;
     }
@@ -3142,7 +3150,7 @@ describe("pushStep — push guard: adopt agent push vs refuse foreign work", () 
     vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
 
     const result = await pushStep.run(
-      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      makeContext({ callbackUrl: "https://orchestrator.example", ...GAP_FILL_CONTEXT }),
       { ...GAP_FILL_INPUTS, callbackUrl: "https://orchestrator.example" },
       new NoopStepReporter(),
     );
@@ -3162,7 +3170,7 @@ describe("pushStep — push guard: adopt agent push vs refuse foreign work", () 
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     await pushStep.run(
-      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      makeContext({ callbackUrl: "https://orchestrator.example", ...GAP_FILL_CONTEXT }),
       { ...GAP_FILL_INPUTS, callbackUrl: "https://orchestrator.example" },
       new NoopStepReporter(),
     );

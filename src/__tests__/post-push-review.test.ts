@@ -44,6 +44,77 @@ function structuredReviewResult(structuredOutput: unknown, stdout = "ignored fin
   };
 }
 
+// The PR's head as GitHub reports it: `GET /pulls/{n}` always carries `head.sha`.
+const PR_HEAD_SHA = "4a8f2c1e9b7d3a5f6c0e2b4d8a1f3c5e7b9d0a2c";
+
+/**
+ * GitHub's answer, through `gh api`, to a request a test's fake answers with an empty success, which `gh api` never
+ * prints for these routes: the PR with its head, no check runs on that head, and the review a POST creates.
+ */
+function githubReply(args: string[]): string | undefined {
+  if (args[0] !== "api") return undefined;
+  const path = args.find((arg) => arg.startsWith("repos/")) ?? "";
+  const pull = /^repos\/:owner\/:repo\/pulls\/(\d+)(\/reviews)?$/.exec(path);
+  if (pull && !pull[2]) return JSON.stringify({ number: Number(pull[1]), state: "open", head: { ref: "ai-implement/aii-200-x", sha: PR_HEAD_SHA } });
+  if (pull && args.includes("POST")) {
+    return JSON.stringify({ id: 80, state: "COMMENTED", html_url: `https://github.com/acme/app/pull/${pull[1]}#pullrequestreview-80` });
+  }
+  if (/\/commits\/[^/]+\/check-runs/.test(path)) {
+    const page = { total_count: 0, check_runs: [] };
+    return JSON.stringify(args.includes("--slurp") ? [page] : page);
+  }
+  return undefined;
+}
+
+/**
+ * Runs the step as the pipeline does: with the push step's commit, the PR's head, as `pushedSha`; with no real waiting
+ * between review-check probes; and with GitHub's replies where the test's own fake leaves them empty. A test of the
+ * ls-remote lease fallback passes `pushedSha: undefined`.
+ */
+function runReview(...[ctx, inputs, reporter]: Parameters<typeof postPushReviewStep.run>) {
+  const ghSpawn = inputs.ghSpawn;
+  return postPushReviewStep.run(
+    ctx,
+    {
+      pushedSha: PR_HEAD_SHA,
+      sleep: async () => undefined,
+      ...inputs,
+      ...(ghSpawn && {
+        ghSpawn: (args: string[]) => {
+          const result = ghSpawn(args);
+          const reply = result.exitCode === 0 && result.stdout.trim() === "" ? githubReply(args) : undefined;
+          return reply === undefined ? result : { ...result, stdout: reply };
+        },
+      }),
+    },
+    reporter,
+  );
+}
+
+// The comment links to the review GitHub created for the report (githubReply's POST answer).
+const REVIEW_LINK = "[Full reviewer report](https://github.com/acme/app/pull/42#pullrequestreview-80)";
+
+/** The body of the last review the step submitted, which carries the full reviewer report the comment links to. */
+function submittedReview(ghSpawn: ReturnType<typeof vi.fn>): string {
+  const post = (ghSpawn.mock.calls as string[][][])
+    .map(([args]) => args)
+    .filter((args) => args.includes("POST") && args.some((arg) => /\/pulls\/\d+\/reviews$/.test(arg)))
+    .at(-1);
+  return post?.find((arg) => arg.startsWith("body="))?.slice("body=".length) ?? "";
+}
+
+// The telemetry the executor reports when the CLI ended before writing its result event, as on a provider failure.
+const NO_RESULT_TELEMETRY = {
+  outcome: "unknown" as const, numTurns: null, durationMs: null, costUsd: null, tokensIn: null, tokensOut: null,
+  cacheReadTokens: null, cacheCreationTokens: null, toolTrace: [],
+};
+
+/** A review that hit its turn cap: the CLI's `error_max_turns` result, which telemetry reads as `max_turns`. */
+function turnCapResult(structuredOutput: unknown, numTurns: number) {
+  const result = structuredReviewResult(structuredOutput);
+  return { ...result, terminalStatus: { subtype: "error_max_turns", isError: true }, telemetry: { ...result.telemetry, outcome: "max_turns" as const, numTurns } };
+}
+
 function countOccurrences(text: string, needle: string): number {
   return text.split(needle).length - 1;
 }
@@ -93,7 +164,7 @@ describe("postPushReviewStep", () => {
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -117,7 +188,7 @@ describe("postPushReviewStep", () => {
     });
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(reviewerOutput))));
 
-    await postPushReviewStep.run(
+    await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
       { report: vi.fn(async () => undefined) },
@@ -170,7 +241,7 @@ describe("postPushReviewStep", () => {
     let warnings = "";
 
     try {
-      await postPushReviewStep.run(
+      await runReview(
         ctx,
         { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
         { report: vi.fn(async () => undefined) },
@@ -208,7 +279,7 @@ describe("postPushReviewStep", () => {
     });
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(reviewerOutput))));
 
-    await postPushReviewStep.run(
+    await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
       { report: vi.fn(async () => undefined) },
@@ -240,7 +311,7 @@ describe("postPushReviewStep", () => {
       return { stdout: "", exitCode: 0 };
     });
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(notApproved))));
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -253,7 +324,8 @@ describe("postPushReviewStep", () => {
       "push",
       "origin",
       "HEAD:refs/heads/ai-implement/aii-200-x",
-      "--force-with-lease=refs/heads/ai-implement/aii-200-x:beadfeed",
+      // The lease is the commit the push step pushed.
+      `--force-with-lease=refs/heads/ai-implement/aii-200-x:${PR_HEAD_SHA}`,
     ]);
     expect(ghComments.some((c) => c.includes("fix-complete") && c.includes("abc1234"))).toBe(true);
     expect(ghComments.some((c) => c.includes("Changes pushed:") && c.includes("Modified: `app/api/parse/route.ts`"))).toBe(true);
@@ -282,7 +354,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => structuredReviewResult(reviewerOutput));
     const ctx = makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 45 } });
 
-    await postPushReviewStep.run(
+    await runReview(
       ctx,
       {
         prNumber: "42",
@@ -318,7 +390,7 @@ describe("postPushReviewStep", () => {
     });
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(notApproved))));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -351,7 +423,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(approvedWithIssues)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -376,7 +448,7 @@ describe("postPushReviewStep", () => {
       feedback: "Ready.",
     }));
 
-    await postPushReviewStep.run(
+    await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, reviewProviders: [] },
       { report: vi.fn(async () => undefined) },
@@ -403,7 +475,7 @@ describe("postPushReviewStep", () => {
       selectedReviewerDefinition("unselected-review"),
     ]);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 45 } }),
       {
         prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
@@ -453,7 +525,7 @@ describe("postPushReviewStep", () => {
     });
 
     try {
-      await postPushReviewStep.run(
+      await runReview(
         makeCtx(invoke),
         {
           prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
@@ -478,7 +550,7 @@ describe("postPushReviewStep", () => {
     });
     const invoke = vi.fn(async () => structuredReviewResult({ approved: true, findings: [], summary: "Checked the change.", checks: [{ check: "Scope", result: "passed", evidence: "The diff matches the requested scope." }] }));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 45 } }),
       {
         prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
@@ -519,7 +591,7 @@ describe("postPushReviewStep", () => {
       return { stdout: '{"fixed":[],"testing":[],"notes":""}', exitCode: 0, tokensUsed: 1 };
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       {
         prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn, reviewProviders: [],
@@ -580,7 +652,7 @@ describe("postPushReviewStep", () => {
       return { stdout: '{"fixed":[],"testing":[],"notes":""}', exitCode: 0, tokensUsed: 1 };
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       {
         prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn,
@@ -613,7 +685,7 @@ describe("postPushReviewStep", () => {
     });
     const invoke = vi.fn(async () => structuredReviewResult({ approved: false, findings: [{ severity: "blocking", body: "Advisory custom concern" }] }));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       {
         prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
@@ -641,7 +713,7 @@ describe("postPushReviewStep", () => {
     });
     const invoke = vi.fn(async () => structuredReviewResult({ approved: false, findings: [{ severity: "blocking", body: "Same defect" }] }));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       {
         prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn, reviewProviders: [],
@@ -669,7 +741,7 @@ describe("postPushReviewStep", () => {
       telemetry: { outcome: "max_turns" as const, numTurns: 7, durationMs: 60_000, costUsd: null, tokensIn: 10, tokensOut: 20 },
     }));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       {
         prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
@@ -681,7 +753,8 @@ describe("postPushReviewStep", () => {
 
     expect(out.terminationReason).toBe("reviewer_turns_exhausted");
     expect(out.failure).toEqual(expect.objectContaining({ reviewMaxTurns: 7 }));
-    expect(ghComments.some((comment) => comment.includes("(7)"))).toBe(true);
+    expect(ghComments.some((comment) => comment.includes(REVIEW_LINK))).toBe(true);
+    expect(submittedReview(ghSpawn)).toContain("(7)");
   });
 
   it("fails closed and names unresolved selected reviewers before running review", async () => {
@@ -693,7 +766,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      const out = await postPushReviewStep.run(
+      const out = await runReview(
         makeCtx(invoke),
         { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewers: [{ id: "missing-review", gates: true }], trustedReviewerDefinitions: new Map() },
         { report: vi.fn(async () => undefined) },
@@ -716,7 +789,7 @@ describe("postPushReviewStep", () => {
         if (args[0] === "pr" && args[1] === "comment") ghComments.push(args[args.indexOf("--body") + 1]);
         return { stdout: "", exitCode: 0 };
       });
-      const out = await postPushReviewStep.run(
+      const out = await runReview(
         makeCtx(vi.fn()),
         { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewers, trustedReviewerDefinitions: new Map() },
         { report: vi.fn(async () => undefined) },
@@ -732,7 +805,7 @@ describe("postPushReviewStep", () => {
       const invoke = vi.fn(async () => structuredReviewResult({ approved: true, findings: [], summary: "Checked the change.", checks: [{ check: "Scope", result: "passed", evidence: "The diff matches the requested scope." }] }));
       const trustedDefinitions = reviewerMap([selectedReviewerDefinition("image-review", { buildPrompt: () => "trusted image prompt" })]);
 
-      const out = await postPushReviewStep.run(
+      const out = await runReview(
         makeCtx(invoke),
         {
           prNumber: "42",
@@ -796,7 +869,7 @@ describe("postPushReviewStep", () => {
       throw new Error(`unexpected stage ${params.stage}`);
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke, { model: "run-review-model" }),
       {
         prNumber: "42",
@@ -840,7 +913,7 @@ describe("postPushReviewStep", () => {
       throw new Error(`unexpected stage ${params.stage}`);
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       {
         prNumber: "42",
@@ -888,7 +961,7 @@ describe("postPushReviewStep", () => {
       throw new Error(`unexpected stage ${params.stage}`);
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       {
         prNumber: "42",
@@ -925,7 +998,7 @@ describe("postPushReviewStep", () => {
       throw new Error(`unexpected stage ${params.stage}`);
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       {
         prNumber: "42",
@@ -968,7 +1041,7 @@ describe("postPushReviewStep", () => {
       throw new Error(`unexpected stage ${params.stage}`);
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       {
         prNumber: "42",
@@ -1002,17 +1075,18 @@ describe("postPushReviewStep", () => {
       telemetry: { outcome: "success" as const, numTurns: 1, durationMs: 10, costUsd: null, tokensIn: 1, tokensOut: 1 },
     }));
 
-    const out = await postPushReviewStep.run(
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") ghComments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const out = await runReview(
       makeCtx(invoke),
       {
         prNumber: "42",
         workspaceDir,
         maxIterations: 1,
-        ghSpawn: vi.fn((args: string[]) => {
-          if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
-          if (args[0] === "pr" && args[1] === "comment") ghComments.push(args[args.indexOf("--body") + 1]);
-          return { stdout: "", exitCode: 0 };
-        }),
+        ghSpawn,
         gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
         reviewProviders: [],
         reviewers: [{ id: "domain-review", gates: false }],
@@ -1026,12 +1100,13 @@ describe("postPushReviewStep", () => {
     expect(out.terminationReason).toBe("approved");
     expect(invoke).toHaveBeenCalledTimes(1);
     expect(invokeArg(invoke, 0).stage).toBe("post-push-review/branch-advisory-0-domain-review-review-1");
-    expect(ghComments.find((comment) => comment.includes("Ready to merge"))).toContain("Reviewer domain-review (branch advisory) returned no structured_output");
+    expect(ghComments.find((comment) => comment.includes("Ready to merge"))).toContain(REVIEW_LINK);
+    expect(submittedReview(ghSpawn)).toContain("Reviewer domain-review (branch advisory) returned no structured_output");
   });
 
   it("does not rerun a branch config preview when prompt and model match the trusted selected config", async () => {
     const invoke = vi.fn(async () => structuredReviewResult({ approved: true, findings: [] }));
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       {
         prNumber: "42",
@@ -1099,17 +1174,18 @@ describe("postPushReviewStep", () => {
       throw new Error(`unexpected stage ${params.stage}`);
     });
 
-    const out = await postPushReviewStep.run(
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") ghComments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const out = await runReview(
       makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }),
       {
         prNumber: "42",
         workspaceDir,
         maxIterations: 1,
-        ghSpawn: vi.fn((args: string[]) => {
-          if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
-          if (args[0] === "pr" && args[1] === "comment") ghComments.push(args[args.indexOf("--body") + 1]);
-          return { stdout: "", exitCode: 0 };
-        }),
+        ghSpawn,
         gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
         reviewProviders: [],
         reviewers: [{ id: "domain-review", gates: true }],
@@ -1122,7 +1198,8 @@ describe("postPushReviewStep", () => {
     expect(out.approved).toBe(true);
     expect(out.terminationReason).toBe("approved");
     expect(invoke.mock.calls.map((call) => call[0].stage)).not.toContain("post-push-review/fix-1");
-    expect(ghComments.find((comment) => comment.includes("Ready to merge"))).toContain(feedbackText);
+    expect(ghComments.find((comment) => comment.includes("Ready to merge"))).toContain(REVIEW_LINK);
+    expect(submittedReview(ghSpawn)).toContain(feedbackText);
   });
 
   it("preserves trusted gating when trusted and branch config findings have the same text", async () => {
@@ -1138,7 +1215,7 @@ describe("postPushReviewStep", () => {
       throw new Error(`unexpected stage ${params.stage}`);
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       {
         prNumber: "42",
@@ -1169,7 +1246,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      const out = await postPushReviewStep.run(
+      const out = await runReview(
         makeCtx(invoke),
         {
           prNumber: "42",
@@ -1200,7 +1277,7 @@ describe("postPushReviewStep", () => {
     const ghComments: string[] = [];
     const invoke = vi.fn();
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       {
         prNumber: "42",
@@ -1248,7 +1325,7 @@ describe("postPushReviewStep", () => {
       throw new Error(`unexpected stage ${params.stage}`);
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       {
         prNumber: "42",
@@ -1307,7 +1384,7 @@ describe("postPushReviewStep", () => {
       throw new Error(`unexpected stage ${params.stage}`);
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewerDefinitions: [configReviewerDefinition("domain-review", "Domain prompt")] },
       { report: vi.fn(async (record) => { reports.push(record); }) },
@@ -1322,7 +1399,8 @@ describe("postPushReviewStep", () => {
     ]);
     expect(reports.find((report) => report.id === "post-push-review.1.reviewer.1.branch.domain-review")?.status).toBe("failed");
     expect(reports.find((report) => report.id === "post-push-review.1")?.outputs.telemetry.costUsd).toBe(0.4);
-    expect(ghComments.find((comment) => comment.includes("Ready to merge"))).toContain("Reviewer domain-review (branch advisory) returned no structured_output");
+    expect(ghComments.find((comment) => comment.includes("Ready to merge"))).toContain(REVIEW_LINK);
+    expect(submittedReview(ghSpawn)).toContain("Reviewer domain-review (branch advisory) returned no structured_output");
   });
 
   it("keeps unselected config turn exhaustion advisory without running a fix pass", async () => {
@@ -1346,7 +1424,7 @@ describe("postPushReviewStep", () => {
       throw new Error(`unexpected stage ${params.stage}`);
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewerDefinitions: [configReviewerDefinition("domain-review", "Domain prompt")] },
       { report: vi.fn(async () => undefined) },
@@ -1357,7 +1435,8 @@ describe("postPushReviewStep", () => {
       "post-push-review/review-1",
       "post-push-review/branch-advisory-1-domain-review-review-1",
     ]);
-    expect(ghComments.find((comment) => comment.includes("Ready to merge"))).toContain("domain-review (branch advisory) ran out of turns");
+    expect(ghComments.find((comment) => comment.includes("Ready to merge"))).toContain(REVIEW_LINK);
+    expect(submittedReview(ghSpawn)).toContain("domain-review (branch advisory) ran out of turns");
   });
 
   it("fails closed when a selected config reviewer returns invalid output", async () => {
@@ -1376,7 +1455,7 @@ describe("postPushReviewStep", () => {
       telemetry: { outcome: "success" as const, numTurns: 1, durationMs: 10, costUsd: null, tokensIn: 1, tokensOut: 1 },
     }));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewers: [{ id: "domain-review", gates: true }], trustedConfigReviewerDefinitions: [configReviewerDefinition("domain-review", "Domain prompt")] },
       { report: vi.fn(async () => undefined) },
@@ -1385,7 +1464,8 @@ describe("postPushReviewStep", () => {
     expect(out.approved).toBe(false);
     expect(out.terminationReason).toBe("invalid_review");
     expect(invoke).toHaveBeenCalledTimes(1);
-    expect(ghComments.find((comment) => comment.includes("automated review is incomplete"))).toContain("Reviewer domain-review returned no structured_output");
+    expect(ghComments.find((comment) => comment.includes("automated review is incomplete"))).toContain(REVIEW_LINK);
+    expect(submittedReview(ghSpawn)).toContain("Reviewer domain-review returned no structured_output");
   });
 
   it("fails closed when a selected reviewer returns invalid structured output", async () => {
@@ -1397,7 +1477,7 @@ describe("postPushReviewStep", () => {
     });
     const invoke = vi.fn(async () => structuredReviewResult({ approved: false, findings: [] }));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewers: [{ id: "code-review", gates: true }], trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("code-review")]) },
       { report: vi.fn(async () => undefined) },
@@ -1405,7 +1485,8 @@ describe("postPushReviewStep", () => {
 
     expect(out.approved).toBe(false);
     expect(out.terminationReason).toBe("invalid_review");
-    expect(ghComments.some((comment) => comment.includes("approved=false without findings"))).toBe(true);
+    expect(ghComments.some((comment) => comment.includes(REVIEW_LINK))).toBe(true);
+    expect(submittedReview(ghSpawn)).toContain("approved=false without findings");
   });
 
   it("fails closed when the reviewer returns text but no structured_output", async () => {
@@ -1423,7 +1504,7 @@ describe("postPushReviewStep", () => {
       terminalStatus: { subtype: "success", isError: false },
     }));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [] },
       { report: vi.fn(async () => undefined) },
@@ -1432,7 +1513,8 @@ describe("postPushReviewStep", () => {
     expect(out.approved).toBe(false);
     expect(out.terminationReason).toBe("invalid_review");
     expect(invoke).toHaveBeenCalledTimes(1);
-    expect(comments.some((comment) => comment.includes("returned no structured_output"))).toBe(true);
+    expect(comments.some((comment) => comment.includes(REVIEW_LINK))).toBe(true);
+    expect(submittedReview(ghSpawn)).toContain("returned no structured_output");
   });
 
   it("fails closed when the terminal result is an error even with exit 0", async () => {
@@ -1448,7 +1530,7 @@ describe("postPushReviewStep", () => {
       terminalStatus: { subtype: "error_during_execution", isError: true },
     }));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [] },
       { report: vi.fn(async () => undefined) },
@@ -1461,13 +1543,17 @@ describe("postPushReviewStep", () => {
 
   it.each([
     ["missing terminal", { terminalStatus: undefined }, "terminal result event"],
-    ["non-success subtype", { terminalStatus: { subtype: "error_max_turns", isError: false } }, "error_max_turns"],
+    // Telemetry reads the same result event, so a non-success subtype comes with an error outcome.
+    ["non-success subtype", {
+      terminalStatus: { subtype: "error_during_execution", isError: false },
+      telemetry: { outcome: "error" as const, numTurns: 1, durationMs: 1, costUsd: null, tokensIn: 1, tokensOut: 1 },
+    }, "error_during_execution"],
   ])("rejects structured approval with %s", async (_name, overrides, message) => {
     const invoke = vi.fn(async () => ({
       ...structuredReviewResult({ approved: true, blocking_issues: [], score: 90, progress_delta: 100, feedback: "ok" }),
       ...overrides,
     }));
-    const out = await postPushReviewStep.run(makeCtx(invoke), {
+    const out = await runReview(makeCtx(invoke), {
       prNumber: "42", workspaceDir, maxIterations: 2, reviewProviders: [],
       ghSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
       gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
@@ -1486,7 +1572,7 @@ describe("postPushReviewStep", () => {
       terminalStatus: { subtype: "error_during_execution", isError: true },
       telemetry: { outcome: "error" as const, numTurns: 6, durationMs: 12_000, costUsd: null, tokensIn: 10, tokensOut: 20 },
     }));
-    const out = await postPushReviewStep.run(makeCtx(invoke), {
+    const out = await runReview(makeCtx(invoke), {
       prNumber: "42", workspaceDir, maxIterations: 2, reviewProviders: [],
       ghSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
       gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
@@ -1514,7 +1600,7 @@ describe("postPushReviewStep", () => {
       telemetry: { outcome: "max_turns" as const, numTurns: 30, durationMs: 60_000, costUsd: null, tokensIn: 10, tokensOut: 20 },
     }));
 
-    const out = await postPushReviewStep.run(makeCtx(invoke), {
+    const out = await runReview(makeCtx(invoke), {
       prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [],
       ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
     }, { report });
@@ -1537,7 +1623,9 @@ describe("postPushReviewStep", () => {
         failure: expect.objectContaining({ code: "REVIEWER_TURNS_EXHAUSTED" }),
       }),
     }));
-    expect(ghComments.some((c) => c.includes("reviewer-turns-exhausted") && c.includes("ran out of turns") && c.includes("(30)"))).toBe(true);
+    expect(ghComments.some((c) => c.includes("reviewer-turns-exhausted") && c.includes(REVIEW_LINK))).toBe(true);
+    expect(submittedReview(ghSpawn)).toContain("ran out of turns");
+    expect(submittedReview(ghSpawn)).toContain("(30)");
   });
 
   it("stamps a non-default reviewMaxTurns onto the REVIEWER_TURNS_EXHAUSTED record (AII-647)", async () => {
@@ -1548,7 +1636,7 @@ describe("postPushReviewStep", () => {
     }));
     const ctx = makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 45 } });
 
-    const out = await postPushReviewStep.run(ctx, {
+    const out = await runReview(ctx, {
       prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [],
       ghSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
     }, { report: vi.fn(async () => undefined) });
@@ -1563,7 +1651,7 @@ describe("postPushReviewStep", () => {
       telemetry: { outcome: "max_turns" as const, numTurns: 30, durationMs: 60_000, costUsd: null, tokensIn: 10, tokensOut: 20 },
     }));
 
-    const out = await postPushReviewStep.run(makeCtx(invoke), {
+    const out = await runReview(makeCtx(invoke), {
       prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [],
       ghSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
     }, { report });
@@ -1583,9 +1671,9 @@ describe("postPushReviewStep", () => {
       return { stdout: "", exitCode: 0 };
     });
     const gitSpawn = vi.fn((args: string[]) => {
-      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "feature-branch", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x", exitCode: 0 };
       if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234", exitCode: 0 };
-      if (args[0] === "ls-remote") return { stdout: "deadbeef refs/heads/feature-branch", exitCode: 0 };
+      if (args[0] === "ls-remote") return { stdout: "deadbeef refs/heads/ai-implement/aii-200-x", exitCode: 0 };
       if (args[0] === "status") return { stdout: "M file.ts", exitCode: 0 };
       return { stdout: "", exitCode: 0 };
     });
@@ -1618,7 +1706,7 @@ describe("postPushReviewStep", () => {
       throw new Error(`unexpected stage ${params.stage}`);
     });
 
-    const out = await postPushReviewStep.run(makeCtx(invoke), {
+    const out = await runReview(makeCtx(invoke), {
       prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [],
       ghSpawn, gitSpawn,
     }, { report });
@@ -1640,13 +1728,15 @@ describe("postPushReviewStep", () => {
 
     const exhaustedComment = ghComments.find((c) => c.includes("reviewer-turns-exhausted"));
     expect(exhaustedComment).toContain("automated review is incomplete");
-    expect(exhaustedComment).toContain("Blocking issues from the previous review:");
-    expect(exhaustedComment).toContain("Missing null check");
-    expect(exhaustedComment).toContain("Unhandled promise rejection");
-    expect(exhaustedComment).toContain("Off-by-one in loop");
-    expect(exhaustedComment).toContain("1 automated fix revision(s) were pushed and not fully re-reviewed.");
-    expect(exhaustedComment!.indexOf("1 automated fix revision(s)")).toBeLessThan(
-      exhaustedComment!.indexOf("Missing null check"),
+    expect(exhaustedComment).toContain(REVIEW_LINK);
+    const exhaustedReview = submittedReview(ghSpawn);
+    expect(exhaustedReview).toContain("Blocking issues from the previous review:");
+    expect(exhaustedReview).toContain("Missing null check");
+    expect(exhaustedReview).toContain("Unhandled promise rejection");
+    expect(exhaustedReview).toContain("Off-by-one in loop");
+    expect(exhaustedReview).toContain("1 automated fix revision(s) were pushed and not fully re-reviewed.");
+    expect(exhaustedReview.indexOf("1 automated fix revision(s)")).toBeLessThan(
+      exhaustedReview.indexOf("Missing null check"),
     );
 
     // The sub-step report for the exhausted iteration carries the explanatory text in
@@ -1673,7 +1763,7 @@ describe("postPushReviewStep", () => {
         structuredReviewResult({ approved: true, blocking_issues: [], score: 95, progress_delta: 100, feedback: "ok" }),
       );
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       {
         prNumber: "42",
@@ -1710,7 +1800,7 @@ describe("postPushReviewStep", () => {
       tokensUsed: 0,
     }));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 1 } }),
       {
         prNumber: "42",
@@ -1729,7 +1819,8 @@ describe("postPushReviewStep", () => {
     expect(out.failure).toEqual(expect.objectContaining({ code: "PROVIDER_UNAVAILABLE", stage: "post-push-review" }));
     // 1 initial + 1 retry (stageRetries=1), then exhausted.
     expect(invoke).toHaveBeenCalledTimes(2);
-    expect(ghComments.some((c) => c.includes("provider was unavailable") && c.includes("review is incomplete"))).toBe(true);
+    expect(ghComments.some((c) => c.includes(REVIEW_LINK) && c.includes("review is incomplete"))).toBe(true);
+    expect(submittedReview(ghSpawn)).toContain("provider was unavailable");
     expect(ghComments.every((c) => !c.includes("did not approve"))).toBe(true);
   });
   it("carries the prior iteration's blockers and fix-revision count forward when the provider is unavailable on iteration >= 2 (BAC-27134)", async () => {
@@ -1743,9 +1834,9 @@ describe("postPushReviewStep", () => {
       return { stdout: "", exitCode: 0 };
     });
     const gitSpawn = vi.fn((args: string[]) => {
-      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "feature-branch", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x", exitCode: 0 };
       if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234", exitCode: 0 };
-      if (args[0] === "ls-remote") return { stdout: "deadbeef refs/heads/feature-branch", exitCode: 0 };
+      if (args[0] === "ls-remote") return { stdout: "deadbeef refs/heads/ai-implement/aii-200-x", exitCode: 0 };
       if (args[0] === "status") return { stdout: "M file.ts", exitCode: 0 };
       return { stdout: "", exitCode: 0 };
     });
@@ -1765,12 +1856,12 @@ describe("postPushReviewStep", () => {
         return { stdout: JSON.stringify({ fixed: ["Added null guard"], testing: ["ran tests"], notes: "" }), exitCode: 0, tokensUsed: 100 };
       }
       if (params.stage === "post-push-review/review-2") {
-        return { stdout: "", stderr: "upstream returned 529 overloaded_error", exitCode: 1, tokensUsed: 0 };
+        return { stdout: "", stderr: "upstream returned 529 overloaded_error", exitCode: 1, tokensUsed: 0, telemetry: NO_RESULT_TELEMETRY };
       }
       throw new Error(`unexpected stage ${params.stage}`);
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }),
       {
         prNumber: "42",
@@ -1793,9 +1884,11 @@ describe("postPushReviewStep", () => {
 
     const providerComment = ghComments.find((c) => c.includes("provider-unavailable"));
     expect(providerComment).toContain("automated review is incomplete");
-    expect(providerComment).toContain("1 automated fix revision(s) were pushed and not fully re-reviewed.");
-    expect(providerComment).toContain("Blocking issues from the previous review:");
-    expect(providerComment).toContain("Missing null check");
+    expect(providerComment).toContain(REVIEW_LINK);
+    const providerReview = submittedReview(ghSpawn);
+    expect(providerReview).toContain("1 automated fix revision(s) were pushed and not fully re-reviewed.");
+    expect(providerReview).toContain("Blocking issues from the previous review:");
+    expect(providerReview).toContain("Missing null check");
   });
   it("carries telemetry on every post-push-review and fix-pass sub-step report so report-card can price the run (BAC-27201)", async () => {
     const notApproved = { approved: false, blocking_issues: [{ title: "bug", problem: "bug", required_fix: "bug" }], feedback: "fix the bug", score: 4, progress_delta: 0 };
@@ -1824,7 +1917,7 @@ describe("postPushReviewStep", () => {
     });
 
     const report = vi.fn(async () => undefined);
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report },
@@ -1869,7 +1962,7 @@ describe("postPushReviewStep", () => {
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
 
     const report = vi.fn(async () => undefined);
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn, sleep: async () => {} },
       { report },
@@ -1903,7 +1996,7 @@ describe("postPushReviewStep", () => {
       feedback: "Ready.",
     }));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [] },
       { report: vi.fn(async () => undefined) },
@@ -1931,7 +2024,7 @@ describe("postPushReviewStep", () => {
       feedback: "One blocker remains.",
     }));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn, reviewProviders: [] },
       { report: vi.fn(async () => undefined) },
@@ -1961,7 +2054,7 @@ describe("postPushReviewStep", () => {
     });
     const invoke = vi.fn(async () => (structuredReviewResult(approvedWithFindings)));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -2003,7 +2096,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -2057,7 +2150,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -2152,7 +2245,7 @@ describe("postPushReviewStep", () => {
     });
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -2208,7 +2301,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       {
         prNumber: "42",
@@ -2282,7 +2375,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -2339,7 +2432,7 @@ describe("postPushReviewStep", () => {
     });
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       {
         prNumber: "42",
@@ -2390,7 +2483,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -2429,7 +2522,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn, reviewProviders: [] },
       { report: vi.fn(async () => undefined) },
@@ -2471,7 +2564,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       {
         prNumber: "42",
@@ -2528,7 +2621,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    await postPushReviewStep.run(
+    await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -2573,7 +2666,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    await postPushReviewStep.run(
+    await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -2618,7 +2711,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    await postPushReviewStep.run(
+    await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -2651,7 +2744,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(approvedWithFeedback)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -2678,7 +2771,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(approvedWithDeferredConcern)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -2705,7 +2798,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(approvedWithCosmeticNote)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -2736,7 +2829,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(notReadyWithoutBlocker)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -2765,7 +2858,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(approvedWithShouldPass)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -2792,7 +2885,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(approvedWithResolvedBlockers)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -2821,7 +2914,7 @@ describe("postPushReviewStep", () => {
       tokensUsed: 0,
     })));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn() },
       { report },
@@ -2858,7 +2951,7 @@ describe("postPushReviewStep", () => {
       ...structuredReviewResult(undefined, "this is not json"),
     })));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn() },
       { report },
@@ -2898,7 +2991,7 @@ describe("postPushReviewStep", () => {
       });
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -2925,7 +3018,7 @@ describe("postPushReviewStep", () => {
     const ghSpawn = vi.fn(() => ({ stdout: "diff", exitCode: 0 }));
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(notApproved))));
     await expect(
-      postPushReviewStep.run(
+      runReview(
         ctx,
         { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
         { report: vi.fn(async () => undefined) },
@@ -2940,15 +3033,15 @@ describe("postPushReviewStep", () => {
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
       if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
-      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-744-x\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
       if (args[0] === "ls-remote") {
         lsRemoteCalls.push(args);
         // Simulates a concurrent writer: the remote moved to "deadb0b0", not "aaaaaaa" (pushedSha).
-        return { stdout: "deadb0b0\trefs/heads/ai-implement/aii-744-x\n", exitCode: 0 };
+        return { stdout: "deadb0b0\trefs/heads/ai-implement/aii-200-x\n", exitCode: 0 };
       }
       if (args[0] === "push") {
         pushCalls.push(args);
-        return { stdout: "", stderr: "! [rejected] ai-implement/aii-744-x -> ai-implement/aii-744-x (stale info)", exitCode: 1 };
+        return { stdout: "", stderr: "! [rejected] ai-implement/aii-200-x -> ai-implement/aii-200-x (stale info)", exitCode: 1 };
       }
       return { stdout: "", exitCode: 0 };
     });
@@ -2957,7 +3050,7 @@ describe("postPushReviewStep", () => {
 
     let caught: (Error & { failure?: unknown }) | undefined;
     try {
-      await postPushReviewStep.run(
+      await runReview(
         ctx,
         { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn, pushedSha: "aaaaaaa" },
         { report: vi.fn(async () => undefined) },
@@ -2968,7 +3061,7 @@ describe("postPushReviewStep", () => {
 
     expect(caught).toBeDefined();
     expect(pushCalls).toHaveLength(1);
-    expect(pushCalls[0]).toContain("--force-with-lease=refs/heads/ai-implement/aii-744-x:aaaaaaa");
+    expect(pushCalls[0]).toContain("--force-with-lease=refs/heads/ai-implement/aii-200-x:aaaaaaa");
     expect(lsRemoteCalls).toHaveLength(1); // only the post-rejection lookup for the error message, never for the lease itself
     expect(caught!.message).toContain("stale info");
     expect(caught!.message).toContain("aaaaaaa");
@@ -2984,7 +3077,7 @@ describe("postPushReviewStep", () => {
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
       if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
-      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-744-x\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
       if (args[0] === "ls-remote") {
         return { stdout: "", stderr: "fatal: unable to access: Could not resolve host", exitCode: 128 };
       }
@@ -2999,7 +3092,7 @@ describe("postPushReviewStep", () => {
 
     let caught: (Error & { failure?: unknown }) | undefined;
     try {
-      await postPushReviewStep.run(
+      await runReview(
         ctx,
         { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn, pushedSha: "aaaaaaa" },
         { report: vi.fn(async () => undefined) },
@@ -3023,10 +3116,10 @@ describe("postPushReviewStep", () => {
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
       if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
-      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-744-x\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
       if (args[0] === "ls-remote") {
         // The remote never moved: this was an auth failure, not a lease conflict.
-        return { stdout: "aaaaaaa\trefs/heads/ai-implement/aii-744-x\n", exitCode: 0 };
+        return { stdout: "aaaaaaa\trefs/heads/ai-implement/aii-200-x\n", exitCode: 0 };
       }
       if (args[0] === "push") {
         pushCalls.push(args);
@@ -3039,7 +3132,7 @@ describe("postPushReviewStep", () => {
 
     let caught: (Error & { failure?: unknown }) | undefined;
     try {
-      await postPushReviewStep.run(
+      await runReview(
         ctx,
         { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn, pushedSha: "aaaaaaa" },
         { report: vi.fn(async () => undefined) },
@@ -3066,7 +3159,7 @@ describe("postPushReviewStep", () => {
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
       if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
-      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-744-x\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
       if (args[0] === "rev-parse" && args[1] === "HEAD") {
         headCallCount++;
         return { stdout: `fixcommit${headCallCount}\n`, exitCode: 0 };
@@ -3081,15 +3174,15 @@ describe("postPushReviewStep", () => {
     const ghSpawn = vi.fn(() => ({ stdout: "diff", exitCode: 0 }));
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(notApproved))));
 
-    await postPushReviewStep.run(
+    await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn, pushedSha: "aaaaaaa" },
       { report: vi.fn(async () => undefined) },
     );
 
     expect(pushCalls).toHaveLength(2);
-    expect(pushCalls[0]).toContain("--force-with-lease=refs/heads/ai-implement/aii-744-x:aaaaaaa");
-    expect(pushCalls[1]).toContain("--force-with-lease=refs/heads/ai-implement/aii-744-x:fixcommit1");
+    expect(pushCalls[0]).toContain("--force-with-lease=refs/heads/ai-implement/aii-200-x:aaaaaaa");
+    expect(pushCalls[1]).toContain("--force-with-lease=refs/heads/ai-implement/aii-200-x:fixcommit1");
   });
 
   it("falls back to ls-remote and logs once when pushedSha is absent", async () => {
@@ -3099,10 +3192,10 @@ describe("postPushReviewStep", () => {
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
       if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
-      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-744-x\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
       if (args[0] === "ls-remote") {
         lsRemoteCalls.push(args);
-        return { stdout: "beadfeed\trefs/heads/ai-implement/aii-744-x\n", exitCode: 0 };
+        return { stdout: "beadfeed\trefs/heads/ai-implement/aii-200-x\n", exitCode: 0 };
       }
       if (args[0] === "push") {
         pushCalls.push(args);
@@ -3114,16 +3207,16 @@ describe("postPushReviewStep", () => {
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(notApproved))));
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
-    await postPushReviewStep.run(
+    await runReview(
       ctx,
-      { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn, pushedSha: undefined },
       { report: vi.fn(async () => undefined) },
     );
 
     expect(pushCalls).toHaveLength(2);
     expect(lsRemoteCalls).toHaveLength(2);
-    expect(pushCalls[0]).toContain("--force-with-lease=refs/heads/ai-implement/aii-744-x:beadfeed");
-    expect(pushCalls[1]).toContain("--force-with-lease=refs/heads/ai-implement/aii-744-x:beadfeed");
+    expect(pushCalls[0]).toContain("--force-with-lease=refs/heads/ai-implement/aii-200-x:beadfeed");
+    expect(pushCalls[1]).toContain("--force-with-lease=refs/heads/ai-implement/aii-200-x:beadfeed");
     const fallbackLogs = warnSpy.mock.calls.filter((call) =>
       call.some((arg) => typeof arg === "string" && arg.includes("No pushedSha input; lease falls back to ls-remote")),
     );
@@ -3146,7 +3239,7 @@ describe("postPushReviewStep", () => {
       return { stdout: "", exitCode: 0 };
     });
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(notApproved))));
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -3193,7 +3286,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -3215,7 +3308,7 @@ describe("postPushReviewStep", () => {
     });
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(undefined, reviewerOutput))));
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -3246,7 +3339,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    await postPushReviewStep.run(
+    await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -3285,7 +3378,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(notApproved)));
     const ctx = makeCtx(invoke);
 
-    await postPushReviewStep.run(
+    await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -3347,7 +3440,7 @@ describe("postPushReviewStep", () => {
       .mockResolvedValueOnce(structuredReviewResult(secondReview));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -3389,8 +3482,8 @@ describe("postPushReviewStep", () => {
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: "M src/app/page.tsx\n", exitCode: 0 };
       if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
-      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "codex/structured-review-feedback\n", exitCode: 0 };
-      if (args[0] === "ls-remote") return { stdout: "beadfeed\trefs/heads/codex/structured-review-feedback\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
+      if (args[0] === "ls-remote") return { stdout: "beadfeed\trefs/heads/ai-implement/aii-200-x\n", exitCode: 0 };
       if (args[0] === "show") return { stdout: "M\tsrc/app/page.tsx\n", exitCode: 0 };
       return { stdout: "", exitCode: 0 };
     });
@@ -3404,7 +3497,7 @@ describe("postPushReviewStep", () => {
       .mockResolvedValueOnce(structuredReviewResult(secondReview));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -3448,7 +3541,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    await postPushReviewStep.run(
+    await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -3490,14 +3583,15 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    await postPushReviewStep.run(
+    await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 
     expect(invoke).toHaveBeenCalledTimes(1);
-    expect(ghComments.some((comment) => comment.includes("unexpected field blocking_issues[0].text"))).toBe(true);
+    expect(ghComments.some((comment) => comment.includes(REVIEW_LINK))).toBe(true);
+    expect(submittedReview(ghSpawn)).toContain("unexpected field blocking_issues[0].text");
   });
 
   it("escapes markdown control characters in structured issue fields", async () => {
@@ -3528,7 +3622,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    await postPushReviewStep.run(
+    await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -3577,7 +3671,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    await postPushReviewStep.run(
+    await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -3613,7 +3707,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(notApproved)));
     const ctx = makeCtx(invoke);
 
-    await postPushReviewStep.run(
+    await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -3664,7 +3758,7 @@ describe("postPushReviewStep", () => {
       });
     const ctx = makeCtx(invoke);
 
-    await postPushReviewStep.run(
+    await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -3713,7 +3807,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -3766,7 +3860,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -3809,7 +3903,7 @@ describe("postPushReviewStep", () => {
     });
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -3836,7 +3930,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
       { report: vi.fn(async () => undefined) },
@@ -3886,7 +3980,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn, sleep },
       { report: vi.fn(async () => undefined) },
@@ -3916,7 +4010,7 @@ describe("postPushReviewStep", () => {
       }
       if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews")) {
         reviewCalls.push(args);
-        return { stdout: "[]", exitCode: 0 };
+        return { stdout: githubReply(args)!, exitCode: 0 };
       }
       if (args[0] === "pr" && args[1] === "comment") {
         ghComments.push(args[args.indexOf("--body") + 1]);
@@ -3926,7 +4020,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       {
         prNumber: "42",
@@ -3958,8 +4052,7 @@ describe("postPushReviewStep", () => {
     expect(submittedReviewBody).toContain("code-review: approved");
     expect(ghComments.some((c) => c.includes("did not complete") && c.includes("Manual review required"))).toBe(true);
     const statusComment = ghComments.find((c) => c.includes("did not complete") && c.includes("Manual review required"));
-    expect(statusComment).toContain("gap-analysis: approved");
-    expect(statusComment).toContain("code-review: approved");
+    expect(statusComment).toContain(REVIEW_LINK);
   });
 
   it("recognizes 'review' and 'code-review-plugin' check names as the external review gate by default", async () => {
@@ -3989,7 +4082,7 @@ describe("postPushReviewStep", () => {
     });
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(reviewerOutput))));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep },
       { report: vi.fn(async () => undefined) },
@@ -4027,7 +4120,7 @@ describe("postPushReviewStep", () => {
     let warnings = "";
 
     try {
-      await postPushReviewStep.run(
+      await runReview(
         ctx,
         { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn },
         { report: vi.fn(async () => undefined) },
@@ -4063,7 +4156,7 @@ describe("postPushReviewStep", () => {
       }
       if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews")) {
         reviewCalls.push(args);
-        return { stdout: "[]", exitCode: 0 };
+        return { stdout: githubReply(args)!, exitCode: 0 };
       }
       return { stdout: "", exitCode: 0 };
     });
@@ -4071,7 +4164,7 @@ describe("postPushReviewStep", () => {
   };
   const runGate = async (f: ReturnType<typeof gateFixture>, maxIterations = 1) => {
     const invoke = vi.fn(async () => (structuredReviewResult(f.reviewerOutput)));
-    return postPushReviewStep.run(
+    return runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations, ghSpawn: f.ghSpawn,
         gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: vi.fn(async () => undefined),
@@ -4135,7 +4228,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 300000 },
       { report: vi.fn(async () => undefined) },
@@ -4174,7 +4267,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 300000 },
       { report: vi.fn(async () => undefined) },
@@ -4208,7 +4301,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000 },
       { report: vi.fn(async () => undefined) },
@@ -4246,7 +4339,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep: vi.fn(async () => undefined), reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000 },
       { report: vi.fn(async () => undefined) },
@@ -4386,7 +4479,7 @@ describe("postPushReviewStep", () => {
       return { stdout: "", exitCode: 0 };
     });
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn,
         gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: vi.fn(async () => undefined),
@@ -4479,7 +4572,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn, sleep },
       { report: vi.fn(async () => undefined) },
@@ -4516,7 +4609,7 @@ describe("postPushReviewStep", () => {
     });
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(reviewerOutput))));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitTimeoutMs: 1000, reviewWaitPollMs: 100 },
       { report: vi.fn(async () => undefined) },
@@ -4556,7 +4649,7 @@ describe("postPushReviewStep", () => {
     });
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(reviewerOutput))));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep },
       { report: vi.fn(async () => undefined) },
@@ -4586,7 +4679,7 @@ describe("postPushReviewStep", () => {
     let warnings = "";
 
     try {
-      await postPushReviewStep.run(
+      await runReview(
         ctx,
         { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn },
         { report: vi.fn(async () => undefined) },
@@ -4620,7 +4713,7 @@ describe("postPushReviewStep", () => {
     });
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(reviewerOutput))));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitTimeoutMs: 1000, reviewWaitPollMs: 100 },
       { report: vi.fn(async () => undefined) },
@@ -4658,7 +4751,7 @@ describe("postPushReviewStep", () => {
       });
       const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(reviewerOutput))));
 
-      const out = await postPushReviewStep.run(
+      const out = await runReview(
         ctx,
         { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitTimeoutMs: 1000, reviewWaitPollMs: 100 },
         { report: vi.fn(async () => undefined) },
@@ -4694,7 +4787,7 @@ describe("postPushReviewStep", () => {
     });
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(reviewerOutput))));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitTimeoutMs: 1000, reviewWaitPollMs: 100 },
       { report: vi.fn(async () => undefined) },
@@ -4733,7 +4826,7 @@ describe("postPushReviewStep", () => {
     });
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(reviewerOutput))));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep },
       { report: vi.fn(async () => undefined) },
@@ -4787,7 +4880,7 @@ describe("postPushReviewStep", () => {
         }
         return { stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } }), exitCode: 0 };
       });
-      const out = await postPushReviewStep.run(
+      const out = await runReview(
         makeCtx(vi.fn(async () => structuredReviewResult(reviewerOutput))),
         { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
         { report: vi.fn(async () => undefined) },
@@ -4876,7 +4969,7 @@ describe("postPushReviewStep", () => {
     });
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(reviewerOutput))));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep },
       { report: vi.fn(async () => undefined) },
@@ -4916,7 +5009,7 @@ describe("postPushReviewStep", () => {
     });
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(reviewerOutput))));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewCheckNames: ["my-custom-review"] },
       { report: vi.fn(async () => undefined) },
@@ -4971,7 +5064,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
       { report: vi.fn(async () => undefined) },
@@ -5022,7 +5115,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
       { report: vi.fn(async () => undefined) },
@@ -5078,7 +5171,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
       { report: vi.fn(async () => undefined) },
@@ -5138,7 +5231,7 @@ describe("postPushReviewStep", () => {
     });
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(reviewerOutput))));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
       { report: vi.fn(async () => undefined) },
@@ -5183,7 +5276,7 @@ describe("postPushReviewStep", () => {
     });
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(reviewerOutput))));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
       { report: vi.fn(async () => undefined) },
@@ -5234,7 +5327,7 @@ describe("postPushReviewStep", () => {
     });
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(reviewerOutput))));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
       { report: vi.fn(async () => undefined) },
@@ -5263,7 +5356,7 @@ describe("postPushReviewStep", () => {
     });
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(reviewerOutput))));
     await expect(
-      postPushReviewStep.run(
+      runReview(
         ctx,
         { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
         { report: vi.fn(async () => undefined) },
@@ -5282,7 +5375,7 @@ describe("postPushReviewStep", () => {
       return { stdout: "", exitCode: 0 };
     });
     const ctx = makeCtx(vi.fn(async () => ({ stdout: "", exitCode: 0, tokensUsed: 0 })));
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
       { report: vi.fn(async () => undefined) },
@@ -5318,8 +5411,8 @@ describe("postPushReviewStep", () => {
       return { stdout: "", exitCode: 0 };
     });
     // LLM reviewer fails (non-zero exit).
-    const ctx = makeCtx(vi.fn(async () => ({ stdout: "", exitCode: 1, tokensUsed: 0 })));
-    const out = await postPushReviewStep.run(
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: "", exitCode: 1, tokensUsed: 0, telemetry: NO_RESULT_TELEMETRY })));
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
       { report: vi.fn(async () => undefined) },
@@ -5345,7 +5438,7 @@ describe("postPushReviewStep", () => {
     });
     const ctx = makeCtx(vi.fn(async () => ({ stdout: "", exitCode: 0, tokensUsed: 0 })));
     await expect(
-      postPushReviewStep.run(
+      runReview(
         ctx,
         { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
         { report: vi.fn(async () => undefined) },
@@ -5399,7 +5492,7 @@ describe("postPushReviewStep", () => {
       }),
     );
     await expect(
-      postPushReviewStep.run(
+      runReview(
         ctx,
         { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
         { report: vi.fn(async () => undefined) },
@@ -5422,7 +5515,7 @@ describe("postPushReviewStep", () => {
     const ctx = makeCtx(invoke);
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -5450,7 +5543,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
       { report: vi.fn(async () => undefined) },
@@ -5477,7 +5570,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
       { report: vi.fn(async () => undefined) },
@@ -5500,7 +5593,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
       { report: vi.fn(async () => undefined) },
@@ -5529,7 +5622,7 @@ describe("postPushReviewStep", () => {
     });
     const invoke = vi.fn(async () => ({ stdout: "", exitCode: 0, tokensUsed: 0 }));
     const ctx = makeCtx(invoke);
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
       { report: vi.fn(async () => undefined) },
@@ -5554,9 +5647,9 @@ describe("postPushReviewStep", () => {
     let invokeCount = 0;
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: " M src/example.ts\n", exitCode: 0 };
-      if (args[0] === "rev-parse" && args.includes("--abbrev-ref")) return { stdout: "feature-branch\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args.includes("--abbrev-ref")) return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
       if (args[0] === "rev-parse") return { stdout: "abc1234\n", exitCode: 0 };
-      if (args[0] === "ls-remote") return { stdout: "abc1234\trefs/heads/feature-branch\n", exitCode: 0 };
+      if (args[0] === "ls-remote") return { stdout: "abc1234\trefs/heads/ai-implement/aii-200-x\n", exitCode: 0 };
       if (args[0] === "show") return { stdout: "M\tsrc/example.ts\n", exitCode: 0 };
       return { stdout: "", exitCode: 0 };
     });
@@ -5579,7 +5672,7 @@ describe("postPushReviewStep", () => {
       return { stdout: JSON.stringify({ fixed: ["Guarded null ref"] }), exitCode: 0, tokensUsed: 100 };
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -5598,9 +5691,9 @@ describe("postPushReviewStep", () => {
     let invokeCount = 0;
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: " M src/example.ts\n", exitCode: 0 };
-      if (args[0] === "rev-parse" && args.includes("--abbrev-ref")) return { stdout: "feature-branch\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args.includes("--abbrev-ref")) return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
       if (args[0] === "rev-parse") return { stdout: "abc1234\n", exitCode: 0 };
-      if (args[0] === "ls-remote") return { stdout: "abc1234\trefs/heads/feature-branch\n", exitCode: 0 };
+      if (args[0] === "ls-remote") return { stdout: "abc1234\trefs/heads/ai-implement/aii-200-x\n", exitCode: 0 };
       if (args[0] === "show") return { stdout: "M\tsrc/example.ts\n", exitCode: 0 };
       return { stdout: "", exitCode: 0 };
     });
@@ -5638,7 +5731,7 @@ describe("postPushReviewStep", () => {
       return { ...structuredReviewResult({ approved: true, blocking_issues: [], score: 95, progress_delta: 100, feedback: "lgtm" }), exitCode: 0, tokensUsed: 100 };
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [], ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -5657,9 +5750,9 @@ describe("postPushReviewStep", () => {
     let invokeCount = 0;
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: " M src/example.ts\n", exitCode: 0 };
-      if (args[0] === "rev-parse" && args.includes("--abbrev-ref")) return { stdout: "feature-branch\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args.includes("--abbrev-ref")) return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
       if (args[0] === "rev-parse") return { stdout: "abc1234\n", exitCode: 0 };
-      if (args[0] === "ls-remote") return { stdout: "abc1234\trefs/heads/feature-branch\n", exitCode: 0 };
+      if (args[0] === "ls-remote") return { stdout: "abc1234\trefs/heads/ai-implement/aii-200-x\n", exitCode: 0 };
       if (args[0] === "show") return { stdout: "M\tsrc/example.ts\n", exitCode: 0 };
       return { stdout: "", exitCode: 0 };
     });
@@ -5692,10 +5785,10 @@ describe("postPushReviewStep", () => {
         return { stdout: "", exitCode: 0, tokensUsed: 100 };
       }
       // Reviewer #2: LLM fails — sets priorLlmFailure=true.
-      return { stdout: "", exitCode: 1, tokensUsed: 0 };
+      return { stdout: "", exitCode: 1, tokensUsed: 0, telemetry: NO_RESULT_TELEMETRY };
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [], ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -5728,7 +5821,7 @@ describe("postPushReviewStep", () => {
     });
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(reviewerOutput))));
     await expect(
-      postPushReviewStep.run(
+      runReview(
         ctx,
         { prNumber: "42", workspaceDir, maxIterations: 1, reviewProviders: [], ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
         { report: vi.fn(async () => undefined) },
@@ -5780,7 +5873,7 @@ describe("independent incomplete reviewer results", () => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
       if (args[0] === "api" && args[1].endsWith("/reviews")) {
         reviews.push(args.find(arg => arg.startsWith("body="))!.slice(5));
-        return { stdout: JSON.stringify({ html_url: "https://github.com/o/r/pull/9#review-1" }), exitCode: 0 };
+        return { stdout: githubReply(args)!, exitCode: 0 };
       }
       if (args[0] === "pr" && args[1] === "comment") comments.push(args[args.indexOf("--body") + 1]);
       return { stdout: "", exitCode: 0 };
@@ -5792,13 +5885,13 @@ describe("independent incomplete reviewer results", () => {
     const invoke = vi.fn(async (params: any) => {
       if (params.stage.includes("gap-analysis")) {
         if (kind === "throws") throw new Error("review transport disconnected");
-        if (kind === "provider") return { stdout: "", stderr: "upstream returned 529 overloaded_error", exitCode: 1, tokensUsed: 0 };
+        if (kind === "provider") return { stdout: "", stderr: "upstream returned 529 overloaded_error", exitCode: 1, tokensUsed: 0, telemetry: NO_RESULT_TELEMETRY };
         if (kind === "invalid") return structuredReviewResult({ approved: "maybe" });
-        return { ...structuredReviewResult(partial), telemetry: { ...structuredReviewResult(partial).telemetry, outcome: "max_turns" as const, numTurns: 12 } };
+        return turnCapResult(partial, 12);
       }
       return structuredReviewResult({ approved: true, findings: [], summary: "Checked error handling in src/api.ts.", checks: [{ check: "Error handling", result: "passed", evidence: "src/api.ts handles a missing response." }] });
     });
-    const out = await postPushReviewStep.run(makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }), {
+    const out = await runReview(makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }), {
       prNumber: "9", workspaceDir, maxIterations: 3, reviewProviders: [], ghSpawn,
       gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
       reviewers: [{ id: "gap-analysis", gates, maxTurns: 12 }, { id: "code-review", gates: true }],
@@ -5830,14 +5923,14 @@ describe("independent incomplete reviewer results", () => {
   it("publishes actual code findings when another required reviewer is incomplete without starting a fix pass", async () => {
     const reviews: string[] = [];
     const invoke = vi.fn(async (params: any) => params.stage.includes("gap-analysis")
-      ? { ...structuredReviewResult(undefined), telemetry: { ...structuredReviewResult(undefined).telemetry, outcome: "max_turns" as const } }
+      ? turnCapResult(undefined, 1)
       : structuredReviewResult({ approved: false, findings: [{ severity: "blocking", body: "Null response crashes src/api.ts." }], summary: "Found missing null handling." }));
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
       if (args[0] === "api" && args[1].endsWith("/reviews")) reviews.push(args.find(arg => arg.startsWith("body="))!.slice(5));
       return { stdout: "", exitCode: 0 };
     });
-    const out = await postPushReviewStep.run(makeCtx(invoke), {
+    const out = await runReview(makeCtx(invoke), {
       prNumber: "9", workspaceDir, maxIterations: 3, reviewProviders: [], ghSpawn,
       gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
       reviewers: [{ id: "gap-analysis", gates: true }, { id: "code-review", gates: true }],
@@ -5927,7 +6020,7 @@ describe("finding dispositions in the fix pass (AII-751)", () => {
   function makeGitSpawn(opts: { pushFails?: boolean } = {}) {
     return vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
-      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "fix-branch\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
       if (args[0] === "push" && opts.pushFails) {
         return { stdout: "", stderr: "remote: 403 Forbidden", exitCode: 1 };
       }
@@ -5941,7 +6034,7 @@ describe("finding dispositions in the fix pass (AII-751)", () => {
     const invoke = vi.fn(async () => structuredReviewResult(cleanInternalReview));
     const ctx = makeCtx(invoke, { issueDescription: "Implement the widget exporter per AII-751's acceptance criteria." });
 
-    await postPushReviewStep.run(
+    await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn() },
       { report: vi.fn(async () => undefined) },
@@ -5973,7 +6066,7 @@ describe("finding dispositions in the fix pass (AII-751)", () => {
     const invoke = vi.fn(async () => structuredReviewResult(approvedWithIssue));
     const ctx = makeCtx(invoke);
 
-    await postPushReviewStep.run(
+    await runReview(
       ctx,
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -6029,7 +6122,7 @@ Minor issue worth addressing.
     const cleanInternalReview = { approved: true, blocking_issues: [], feedback: "", score: 9, progress_delta: 0 };
     const invoke = vi.fn(async () => structuredReviewResult(cleanInternalReview));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn() },
       { report: vi.fn(async () => undefined) },
@@ -6063,11 +6156,11 @@ Minor issue worth addressing.
     // dispositions file and made no other tracked change — the feature's core no-op-fix case.
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: "", exitCode: 0 };
-      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "fix-branch\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
       return { stdout: "", exitCode: 0 };
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -6094,7 +6187,7 @@ Minor issue worth addressing.
     const cleanInternalReview = { approved: true, blocking_issues: [], feedback: "", score: 9, progress_delta: 0 };
     const invoke = vi.fn(async () => structuredReviewResult(cleanInternalReview));
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn() },
       { report: vi.fn(async () => undefined) },
@@ -6120,11 +6213,11 @@ Minor issue worth addressing.
     const invoke = vi.fn(async () => structuredReviewResult(cleanInternalReview));
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: "", exitCode: 0 };
-      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "fix-branch\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
       return { stdout: "", exitCode: 0 };
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -6147,7 +6240,7 @@ Minor issue worth addressing.
 
     let caught: unknown;
     try {
-      await postPushReviewStep.run(
+      await runReview(
         makeCtx(invoke),
         { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn({ pushFails: true }) },
         { report: vi.fn(async () => undefined) },
@@ -6168,7 +6261,7 @@ Minor issue worth addressing.
     let fixPassCount = 0;
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
-      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "fix-branch\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
       return { stdout: "", exitCode: 0 };
     });
     const cleanInternalReview = { approved: true, blocking_issues: [], feedback: "", score: 9, progress_delta: 0 };
@@ -6183,7 +6276,7 @@ Minor issue worth addressing.
       return structuredReviewResult(cleanInternalReview);
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -6240,9 +6333,10 @@ describe("postPushReviewStep — cycle summaries (AII-801)", () => {
       return { stdout: "", exitCode: 0 };
     });
     const gitSpawn = vi.fn((args: string[]) => {
-      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "fix-branch\n", exitCode: 0 };
-      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234", exitCode: 0 };
-      if (args[0] === "rev-parse" && args[1] === "HEAD") return { stdout: "abc1234567890abc1234567890abc1234567890", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
+      // The fix pass's commit: HEAD once it has committed, after the push step's commit (PR_HEAD_SHA).
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "9c3e5a7", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "HEAD") return { stdout: "9c3e5a7b1d2f4a6c8e0b2d4f6a8c0e2b4d6f8a1c", exitCode: 0 };
       if (args[0] === "status") return { stdout: "M file.ts", exitCode: 0 };
       return { stdout: "", exitCode: 0 };
     });
@@ -6270,7 +6364,7 @@ describe("postPushReviewStep — cycle summaries (AII-801)", () => {
       throw new Error(`unexpected stage ${params.stage}`);
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [], ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -6282,9 +6376,9 @@ describe("postPushReviewStep — cycle summaries (AII-801)", () => {
     const [summary] = summaries;
     expect(summary!.id).toBe("post-push-review.fix-1");
     expect(summary!.stage).toBe("post-push-review-fix");
-    expect(summary!.inputCommit).toBe("abc1234567890abc1234567890abc1234567890");
+    expect(summary!.inputCommit).toBe(PR_HEAD_SHA);
     expect(summary!.outputCommitStatus).toBe("committed");
-    expect(summary!.outputCommit).toBe("abc1234567890abc1234567890abc1234567890");
+    expect(summary!.outputCommit).toBe("9c3e5a7b1d2f4a6c8e0b2d4f6a8c0e2b4d6f8a1c");
     expect(summary!.verdict).toMatchObject({ approved: null, reason: "fixed" });
     // The fix agent's testing[] note ("npm test -- all passed") is self-reported, not an
     // observed tool result — it must never be read as an inferred "passed" (AII-801 review).
@@ -6310,12 +6404,12 @@ describe("postPushReviewStep — cycle summaries (AII-801)", () => {
         });
       }
       if (params.stage === "post-push-review/fix-1") {
-        return { stdout: "", stderr: "socket hang up", exitCode: 1, tokensUsed: 0 };
+        return { stdout: "", stderr: "socket hang up", exitCode: 1, tokensUsed: 0, telemetry: NO_RESULT_TELEMETRY };
       }
       throw new Error(`unexpected stage ${params.stage}`);
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [], ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -6355,7 +6449,7 @@ describe("postPushReviewStep — cycle summaries (AII-801)", () => {
       throw new Error(`unexpected stage ${params.stage}`);
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 2, reviewProviders: [], ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -6375,9 +6469,9 @@ describe("postPushReviewStep — cycle summaries (AII-801)", () => {
       return { stdout: "", exitCode: 0 };
     });
     const gitSpawn = vi.fn((args: string[]) => {
-      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "fix-branch\n", exitCode: 0 };
-      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234", exitCode: 0 };
-      if (args[0] === "rev-parse" && args[1] === "HEAD") return { stdout: "abc1234567890abc1234567890abc1234567890", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "9c3e5a7", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "HEAD") return { stdout: "9c3e5a7b1d2f4a6c8e0b2d4f6a8c0e2b4d6f8a1c", exitCode: 0 };
       if (args[0] === "status") return { stdout: "M file.ts", exitCode: 0 };
       return { stdout: "", exitCode: 0 };
     });
@@ -6409,7 +6503,7 @@ describe("postPushReviewStep — cycle summaries (AII-801)", () => {
       throw new Error(`unexpected stage ${params.stage}`);
     });
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       makeCtx(invoke),
       { prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [], ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
@@ -6482,7 +6576,7 @@ describe("postPushReviewStep review process gate", () => {
     const warns: string[] = [];
     const warn = vi.spyOn(console, "warn").mockImplementation((...a) => { warns.push(a.join(" ")); });
     try {
-      const out = await postPushReviewStep.run(
+      const out = await runReview(
         makeCtx(invoke),
         { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: f.ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
           sleep: vi.fn(async () => undefined), reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000,
@@ -6863,7 +6957,7 @@ describe("credential refresh before a fix-pass push, by execution mode", () => {
       return { stdout: "", exitCode: 0 };
     });
     const ghSpawn = vi.fn((args: string[]) => ({ stdout: args[0] === "pr" && args[1] === "diff" ? "diff" : "", exitCode: 0 }));
-    await postPushReviewStep.run(
+    await runReview(
       makeCtx(vi.fn(async () => structuredReviewResult(notApproved)), overrides),
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
