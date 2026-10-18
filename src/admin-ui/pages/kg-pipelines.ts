@@ -160,7 +160,7 @@ export const kgPipelinesScript = `
       else if (last.gate === 'ingest-needed') lastText = 'Last refresh: ' + last.detail;
       else if (last.conclusion === 'operator_cancelled') lastText = 'Last refresh: cancelled by operator';
       else if (last.conclusion === 'decision_timeout') lastText = 'Last refresh: no decision within 24 h \u2014 the held PR was closed';
-      else lastText = 'Last refresh: ' + (last.ok ? 'ok' : 'failed' + (last.gate ? ' at gate "' + last.gate + '"' : '')) + ' \u2014 ' + last.detail;
+      else lastText = 'Last refresh: ' + (last.ok ? (last.warnings && last.warnings.length > 0 ? 'completed with warnings' : 'passed') : 'failed' + (last.gate ? ' at gate "' + last.gate + '"' : '')) + ' \u2014 ' + last.detail;
       // A run in flight owns the line: the previous run's result must never show beside it.
       if (data.currentRun && !progressText) {
         progressText = stage === 'awaiting-decision'

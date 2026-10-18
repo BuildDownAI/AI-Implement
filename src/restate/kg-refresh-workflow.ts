@@ -113,6 +113,8 @@ export interface KgRefreshReportBody {
   lostTeams?: Array<{ team: string; servedIssues: number }>;
   /** Warnings on a completed run; copied onto the success outcome. */
   warnings?: string[];
+  /** The snapshot guard's verdict; `warnings` marks an ok run with skipped or failed sources. Absent from a runner that predates the field. */
+  guardVerdict?: "clean" | "warnings" | "refused" | "held";
   /** Per-source results; absent from a runner that predates the field. */
   sources?: SourceResult[];
 }
@@ -408,6 +410,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     let stepTable: KgRefreshStepRecord[] = [];
     let reportedSources: SourceResult[] = [];
     let reportedWarnings: string[] = [];
+    let reportedGuardVerdict: KgRefreshReportBody["guardVerdict"];
     const withSteps = (o: RefreshOutcome): RefreshOutcome => {
       const withTable = stepTable.length > 0 && !o.steps ? { ...o, steps: stepTable } : o;
       return reportedSources.length > 0 && !withTable.sources ? { ...withTable, sources: reportedSources } : withTable;
@@ -843,7 +846,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
               detail: railCtx.detail ?? "Graph is current — a new ingest is required to refresh",
               stampBefore: railCtx.stampBefore ?? null, stampAfter: railCtx.stampBefore ?? null,
             };
-            await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
+            await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed", "passed"));
             await notifyOutcome("no-new-data", outcome, { failureCode: "ingest-needed" });
             return finish(outcome);
           }
@@ -895,7 +898,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         if (heldGate) successOutcome.held = true;
         await ctx.run("persist", () => deps.persistLastRefresh({ ...successOutcome, dispatchId }));
         ctx.set("step", "close-row");
-        await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
+        const successConclusion = reportedWarnings.length > 0 || reportedGuardVerdict === "warnings" ? "warnings" : "passed";
+        await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed", successConclusion));
         ctx.set("step", "outcome");
         await notifyOutcome("success", successOutcome);
         return finish(successOutcome);
@@ -941,6 +945,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       reportedSources = report.sources ?? [];
       ctx.set("sources", reportedSources);
       reportedWarnings = report.warnings ?? [];
+      reportedGuardVerdict = report.guardVerdict;
       // Journaled peeks, so a replay rebuilds the same table.
       stepTable = [];
       for (const id of KG_REFRESH_RUNNER_STEPS) {
@@ -964,7 +969,11 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           await ctx.run("dry-run-report", () => postDryRunReport(deps.rail, input.report!, outcome));
         }
         ctx.set("step", "closed");
-        await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
+        // A refused dry run is a failure, never "completed".
+        const dryConclusion = reportedWarnings.length > 0 || reportedGuardVerdict === "warnings" ? "warnings" : "passed";
+        await ctx.run("close-row", () => report.ok
+          ? deps.closeJobLog(jobId, "completed", dryConclusion)
+          : deps.closeJobLog(jobId, "failed", report.failureCode ?? "dry_run_refused"));
         return finish(outcome);
       }
 
@@ -975,7 +984,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           ok: true, at, detail: report.failureReason ?? "Graph is current — a new ingest is required to refresh",
           stampBefore: null, stampAfter: null,
         };
-        await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
+        await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed", "passed"));
         await notifyOutcome("no-new-data", outcome, { failureCode: report.failureCode });
         return finish(outcome);
       }

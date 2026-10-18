@@ -755,6 +755,21 @@ Each of these shipped a degraded or blocked deploy, and each is now covered by a
 | 2026-09-08 | The kg-refresh report step (feedback-loop) re-ran the ingest by hand without a GitHub token and rewrote `snapshot/parts/` without `pr.nt`; the guard refused three runs | The report step is removed from `pipelines/kg-refresh.yml`; the ingest step's counters and `ai-output/kg-ingest.log` (AII-581) plus the snapshot-push guard are the report |
 | 2026-09-08 | Refresh rail's materialize OOM-killed at ~31.6k quads (271 MB RSS beside the serving sidecar on a 512 MB machine); the rail refused the swap and kept serving the old graph | `fly.toml` memory raised to 1 GB — the documented headroom figure, not a code change |
 
+### Row conclusions and dashboard outcomes (AII-1472)
+
+`KgRefresh` is the only writer of a kg-refresh job row, and every close carries a conclusion:
+
+| Close | Status | Conclusion |
+|---|---|---|
+| Success, no-new-data, clean dry run | `completed` | `passed` |
+| Ok with warnings (`guardVerdict: "warnings"` or a non-empty `warnings` list), live or dry run | `completed` | `warnings` |
+| Not ok, including a refused dry run | `failed` / `timed_out` | the failure code (`dry_run_refused` when the report carries none) |
+
+The Pipelines badge for a `kg-refresh` row reads **passed**, **completed with warnings**, or **failed** from
+status and conclusion; other run kinds keep their status label. A legacy row (`completed`, no conclusion)
+keeps the plain `completed` label. The KG page's last-refresh line shows the same three outcomes for live
+refreshes (`ok`, plus `warnings`, or `failed`); dry runs appear only as Pipelines rows.
+
 ## KG-refresh outcome visibility (AII-496)
 
 Every terminal outcome (success, no-new-data, failure) calls `handleKgRefreshOutcome` in

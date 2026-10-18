@@ -718,6 +718,19 @@ describe("kg current run card (AII-1260)", () => {
       expect(text(m)).toBe("Last refresh: no decision within 24 h \u2014 the held PR was closed");
     });
 
+    it("shows passed, completed with warnings, and failed", async () => {
+      const ok = { ok: true, at: 1, detail: "refreshed", stampBefore: null, stampAfter: "x" };
+      const p = mount({ currentRun: null, stage: "serving", lastRefresh: ok });
+      await p.win.loadKgStatus();
+      expect(text(p)).toBe("Last refresh: passed \u2014 refreshed");
+      const w = mount({ currentRun: null, stage: "serving", lastRefresh: { ...ok, warnings: ["source x skipped"] } });
+      await w.win.loadKgStatus();
+      expect(text(w)).toBe("Last refresh: completed with warnings \u2014 refreshed");
+      const f = mount({ currentRun: null, stage: "failed", lastRefresh: { ...failed, gate: undefined } });
+      await f.win.loadKgStatus();
+      expect(text(f)).toBe("Last refresh: failed \u2014 git push failed (exit 128)");
+    });
+
     it("an old record without conclusion renders, omitting an empty gate", async () => {
       const m = mount({ currentRun: null, stage: "failed", lastRefresh: { ...failed, gate: undefined } });
       await m.win.loadKgStatus();
