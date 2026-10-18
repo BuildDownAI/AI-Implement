@@ -671,9 +671,17 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
           const prevShowResult = spawnSync(
             "git",
             ["show", `${clonedRef}:${partPath}`],
-            { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 },
+            { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 1024 * 1024 * 1024 },
           );
-          if (prevShowResult.status !== 0) {
+          if (prevShowResult.status !== 0 || prevShowResult.error != null) {
+            if (trackerMissing && TRACKER_NT_FILES.has(partName)) {
+              // Unreadable served tracker part: the hold built from section 0 already counts it as lost, so
+              // record it as a soft regression rather than crashing before the hold is raised.
+              partLogLines.push(`${partName} prev=unreadable`);
+              partRows.push({ part: partName, prev: "unreadable", next: "—", delta: "—" });
+              softRegressions.push(`${partName}: previous copy unreadable (tracker data missing)`);
+              continue;
+            }
             throw new Error(
               `git show failed reading previous ${partPath} (exit ${prevShowResult.status ?? "null"}): ${prevShowResult.stderr?.toString().trim() ?? ""}`,
             );

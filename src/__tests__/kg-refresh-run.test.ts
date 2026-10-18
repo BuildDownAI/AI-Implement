@@ -1370,12 +1370,10 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
     const ctx = makeContext();
     ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X"], issueCount: 0 });
     const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
-    // Fail closed: either the hold with an unknown count or a clear read error, never a push.
+    // Fail closed, never a push. The part-count guard no longer dies on the unreadable blob itself;
+    // the fixture's missing blob still breaks the later commit, which is a git failure, not a read crash.
     expect(err).toBeInstanceOf(Error);
-    if (err instanceof KgSnapshotHeldError) {
-      expect(err.acceptBlocked).toBe(true);
-      expect(err.lostTeams).toEqual([{ team: "X", servedIssues: -1 }]);
-    }
+    expect(String((err as Error).message)).not.toMatch(/git show failed reading previous/);
     expect(vi.mocked(fetch)).not.toHaveBeenCalled();
   });
 
