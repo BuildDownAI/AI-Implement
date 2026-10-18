@@ -203,10 +203,15 @@ export const pipelinesScript = `
             || code === 'review_invalid'
             || (code === 'PROVIDER_UNAVAILABLE' && (!stage || stage.includes('review')));
         }
-        function statusBadge(status, conclusion, failure) {
+        function statusBadge(status, conclusion, failure, phase) {
           const reason = (failure && typeof failure.code === 'string' && failure.code) || conclusion || '';
           if (status === 'timed_out' && conclusion === 'stuck_giveup') {
             return makeBadge('fail', 'Needs human', reason);
+          }
+          if (phase === 'kg-refresh') {
+            if (status === 'completed' && conclusion === 'warnings') return makeBadge('warn', 'completed with warnings', reason);
+            if (status === 'completed' && conclusion === 'passed') return makeBadge('success', 'passed', reason);
+            if (status === 'failed') return makeBadge('fail', 'failed', reason);
           }
           const label = isReviewIncomplete(status, conclusion, failure)
             ? 'review incomplete'
@@ -286,7 +291,7 @@ export const pipelinesScript = `
             // status (e.g. 'unknown' after an orchestrator restart) is known-completed.
             const planStatus = (plan.status === 'unknown' || plan.status === 'dispatched' || plan.status === 'running')
               ? 'completed' : plan.status;
-            const combinedStatus = statusBadge(planStatus, plan.conclusion, plan.failure) + ' <span style="color:#aaa;font-size:0.8em">→</span> ' + statusBadge(impl.status, impl.conclusion, impl.failure);
+            const combinedStatus = statusBadge(planStatus, plan.conclusion, plan.failure) + ' <span style="color:#aaa;font-size:0.8em">→</span> ' + statusBadge(impl.status, impl.conclusion, impl.failure, impl.phase);
             const prLink = impl.prUrl ? '<a href="' + window.safeUrl(impl.prUrl) + '" target="_blank">View</a>' : '—';
             const logs = logsButton(impl);
             tr.innerHTML = '<td style="white-space:nowrap">' + dt + '</td>'
@@ -335,7 +340,7 @@ export const pipelinesScript = `
               + '<td class="mono">' + window.esc(entry.repo || '—') + '</td>'
               + '<td>' + runnerCell + '</td>'
               + imageCell
-              + '<td>' + statusBadge(entry.status, entry.conclusion, entry.failure) + '</td>'
+              + '<td>' + statusBadge(entry.status, entry.conclusion, entry.failure, entry.phase) + '</td>'
               + '<td>' + logCell + cancelCell + '</td>';
           }
           tbody.appendChild(tr);

@@ -804,7 +804,7 @@ describe("KgRefresh durable workflow", () => {
       expect(outcome.detail).toContain("Graph is current");
       // the snapshot PR still merges — only the local rail short-circuits after fetch.
       expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
-      expect(await closeRowFor(triggerId)).toMatchObject({ status: "completed" });
+      expect(await closeRowFor(triggerId)).toMatchObject({ status: "completed", conclusion: "passed" });
       expect(outcomesFor(triggerId).length).toBe(1);
       expect(outcomesFor(triggerId).at(-1)!).toMatchObject({ kind: "no-new-data", meta: { failureCode: "ingest-needed" } });
       // no stage/swap/verify/revert: the sidecar never restarts, nothing is persisted again,
@@ -838,6 +838,24 @@ describe("KgRefresh durable workflow", () => {
     },
     15_000,
   );
+
+  it.each([
+    ["a clean report", {}, "passed"],
+    ["a report carrying warnings", { warnings: ["source skipped"] }, "warnings"],
+    ["a warnings guard verdict", { guardVerdict: "warnings" }, "warnings"],
+  ] as const)("AII-1472: a live success with %s closes completed/%s (alwaysReplay)", async (_name, extra, conclusion) => {
+    const env = envFor("alwaysReplay");
+    const triggerId = newTriggerId();
+    makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+
+    const done = runWorkflow(env.baseUrl(), triggerId);
+    await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+    await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ...SUCCESS_REPORT, ...extra });
+    const outcome = await done;
+
+    expect(outcome.ok).toBe(true);
+    expect(await closeRowFor(triggerId)).toMatchObject({ status: "completed", conclusion });
+  }, 15_000);
 
   it.each(VARIANTS.map(([label]) => label))(
     "a snapshot with no committed embeddings ends as a graceful no-op without materialize, swap, or revert (%s)",
@@ -2136,6 +2154,40 @@ describe("KgRefresh durable workflow", () => {
     },
     15_000,
   );
+
+  describe("AII-1472: the row conclusion is the real outcome", () => {
+    const runWith = async (label: string, dryRun: boolean, body: Record<string, unknown>) => {
+      const env = deadlineEnvFor(label);
+      const triggerId = newTriggerId();
+      const held = gate("report for row conclusion");
+      makeScenario(triggerId, {
+        dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions",
+        runStatusSequence: [{ status: "queued", conclusion: null }], tickGate: held,
+      });
+      const done = runWorkflow(env.baseUrl(), triggerId, dryRun ? { dryRun: true } : {});
+      await held.reached();
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", body);
+      held.release();
+      await done;
+      return closeRowFor(triggerId);
+    };
+    it("a refused dry run closes failed with the failure code (disableRetries)", async () => {
+      const row = await runWith("disableRetries", true, { ok: false, failureCode: "KG_SNAPSHOT_REFUSED" });
+      expect(row).toMatchObject({ status: "failed", conclusion: "KG_SNAPSHOT_REFUSED" });
+    }, 15_000);
+    it("a refused dry run without a code still carries a conclusion (disableRetries)", async () => {
+      const row = await runWith("disableRetries", true, { ok: false });
+      expect(row).toMatchObject({ status: "failed", conclusion: "dry_run_refused" });
+    }, 15_000);
+    it("a dry run with warnings closes completed/warnings (alwaysReplay)", async () => {
+      const row = await runWith("alwaysReplay", true, { ok: true, guardVerdict: "warnings" });
+      expect(row).toMatchObject({ status: "completed", conclusion: "warnings" });
+    }, 15_000);
+    it("a clean dry run closes completed/passed (alwaysReplay)", async () => {
+      const row = await runWith("alwaysReplay", true, { ok: true, guardVerdict: "clean" });
+      expect(row).toMatchObject({ status: "completed", conclusion: "passed" });
+    }, 15_000);
+  });
 
   it.each(VARIANTS.map(([label]) => label))(
     "AII-1010: a report resolved while the bootstrap deadline passes wins over bootstrap_timeout (%s)",
