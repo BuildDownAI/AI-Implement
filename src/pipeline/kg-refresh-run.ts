@@ -1,3 +1,4 @@
+import { parseSourceResults } from "../kg-source-results.js";
 import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -383,6 +384,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
             snapshotBranch: held.branchName,
             cause: held.cause,
             failedTeams: held.failedTeams,
+            ...(held.sources.length > 0 ? { sources: held.sources } : {}),
           }
         : {}),
       callbackUrl,
@@ -393,6 +395,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
 
   await configured?.finish("completed");
   const snapshotPushOutputs = context.getOutputs("kg-snapshot-push");
+  const sources = parseSourceResults(snapshotPushOutputs.sources);
   await postRunnerResult({
     phase: "kg-refresh",
     workspaceDir,
@@ -403,6 +406,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     ...(kgDryRun && snapshotPushOutputs.guardVerdict === "clean"
       ? { guardVerdict: "clean" as const, partTable: snapshotPushOutputs.partTable as Array<{ part: string; prev: string; new: string }> | undefined }
       : {}),
+    ...(sources.length > 0 ? { sources } : {}),
     callbackUrl,
     fetchImpl: opts.fetchImpl,
   });

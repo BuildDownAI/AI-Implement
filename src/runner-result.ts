@@ -1,3 +1,4 @@
+import type { SourceResult } from "./kg-source-results.js";
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { FailureRecord } from "./pipeline/failure-classification.js";
@@ -184,6 +185,8 @@ export async function postRunnerResult(params: {
   cause?: "shrink" | "tracker-missing";
   /** Teams whose tracker fetch failed, for a held kg-refresh. */
   failedTeams?: string[];
+  /** Per-source results of a kg-refresh (tracker teams, repos, docs sites). */
+  sources?: SourceResult[];
   /**
    * Optional pilot marker (AII-769 Restate review-fix pilot; AII-770 contract).
    * Present only when this result comes from a Restate-owned review-fix
@@ -253,6 +256,7 @@ export async function postRunnerResult(params: {
   if (params.partTable) body.partTable = params.partTable;
   if (params.cause) body.cause = params.cause;
   if (params.failedTeams) body.failedTeams = params.failedTeams;
+  if (params.sources) body.sources = params.sources;
   if (params.reviewFix) body.reviewFix = params.reviewFix;
   const url = `${callbackUrl.replace(/\/$/, "")}/runner/result`;
   const headers = { "Content-Type": "application/json", Authorization: `Bearer ${runToken}` };

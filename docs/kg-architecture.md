@@ -539,6 +539,25 @@ runtime control. The toggle only affects the *next*
 refresh, not whatever the sidecar is currently serving — `GET /api/kg/status` and the `get_kg_status`
 MCP tool both report the resolved setting as `materialize: "rdflib" | "direct"` for observability.
 
+### Per-source results (AII-1470)
+
+A refresh reports one result per source: `source`, `kind`, `status` (`success` / `skipped` /
+`failed`), `reason`, and `counts`. The type and the defensive parser are in `src/kg-source-results.ts`.
+Two steps supply the rows and `kg-snapshot-push` merges them:
+
+| Part | Produced by | Rows |
+|---|---|---|
+| Tracker | `kg-tracker-data` output `teamResults` | one `tracker:<team>` row per team in `sources.yml`: `success` with `counts.issues`, `skipped` (reason `no mapping`, a 404), or `failed` (reason the HTTP status or `error: …`). With no teams at all, one `skipped` row, reason `no trackers in sources.yml`. A 401/403 aborts the step, so those teams have no row |
+| Ingest | `kg-ingest` output `sourceResults`, read from `ai-output/source-results.json` | code repo, secondary repos, self-ingest, docs sites. The file is written by the KG repo's ingest and is optional: when it is absent or unparseable the output is `[]` (one log line) and malformed entries are dropped |
+
+For the same `source`, the tracker row wins, because the tracker step is the only place that saw the
+fetch. The merged list is `sources` in the `kg-snapshot-push` output and in `KgSnapshotHeldError`. It is
+rendered as the "Sources" table in the refresh report (the PR body, or the dry-run log), and travels
+the way `failedTeams` does: `kg-refresh-run.ts` → `postRunnerResult` → `runner-callback.ts` →
+`KgRefresh.report`. The workflow stores it on the outcome and returns it on `status` (`sources`), and on
+`status.held.sources` while the run waits at the decision gate. Only success, dry-run, and held reports
+carry it; other failures send none. A runner that predates the field sends none and reads as `[]`.
+
 ### Held-verdict plumbing (AII-1253, AII-1264)
 
 The run envelope carries one guard-related flag, `kgDryRun`, and it is set only by the KG-repo PR

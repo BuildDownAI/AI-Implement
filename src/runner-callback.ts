@@ -1,3 +1,4 @@
+import type { SourceResult } from "./kg-source-results.js";
 import {
   claimJobRunId,
   getJobByDispatchId,
@@ -147,6 +148,8 @@ export interface RunnerResultBody {
   cause?: "shrink" | "tracker-missing";
   /** Teams whose tracker fetch failed, for a `tracker-missing` hold. */
   failedTeams?: string[];
+  /** Per-source results of the refresh; absent from runners that predate the field. */
+  sources?: SourceResult[];
   /** Reference repository clone outcomes, present only when the run declared entries. */
   referenceRepoResults?: ReferenceRepoResult[];
   /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid). Shape-validated below. */
@@ -814,6 +817,7 @@ export async function handleRunnerResult(
         partTable: input.body.partTable,
         cause: input.body.cause,
         failedTeams: input.body.failedTeams,
+        sources: input.body.sources,
       },
       { idempotencyKey: dispatchId },
     );

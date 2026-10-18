@@ -3435,10 +3435,15 @@ describe("KgRefresh durable workflow", () => {
       async (label) => {
         const env = heldEnvs.get(label)!;
         const beforeMerge = mergePullRequestFn.mock.calls.length;
-        const triggerId = await holdRun(env, { report: { ...HELD_REPORT, cause: "tracker-missing", failedTeams: ["X", "Y"] } });
-        const open = await callWorkflow<{ decisions: string[]; held: { cause: string; failedTeams: string[] } }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
+        const sources = [
+          { source: "tracker:X", kind: "tracker", status: "failed", reason: "503", counts: {} },
+          { source: "tracker:Z", kind: "tracker", status: "success", reason: "", counts: { issues: 12 } },
+        ];
+        const triggerId = await holdRun(env, { report: { ...HELD_REPORT, cause: "tracker-missing", failedTeams: ["X", "Y"], sources } as KgRefreshReportBody });
+        const open = await callWorkflow<{ decisions: string[]; held: { cause: string; failedTeams: string[]; sources: unknown[] }; sources: unknown[] }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
         expect(open.decisions).toEqual(["accept", "cancel"]);
-        expect(open.held).toMatchObject({ snapshotPr: 77, cause: "tracker-missing", failedTeams: ["X", "Y"] });
+        expect(open.held).toMatchObject({ snapshotPr: 77, cause: "tracker-missing", failedTeams: ["X", "Y"], sources });
+        expect(open.sources).toEqual(sources);
 
         await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ada@example.com" });
         const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
@@ -3720,7 +3725,7 @@ describe("KgRefresh durable workflow", () => {
         await waitForStep(() => readStatus(env.baseUrl(), triggerId), "decision");
         const open = await callWorkflow<{ decisions: string[]; held: unknown }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
         expect(open.decisions).toEqual(["accept", "cancel"]);
-        expect(open.held).toEqual({ snapshotPr: 77, partTable: [{ part: "graph", prev: "100", new: "40" }], cause: "shrink", failedTeams: [], decideBy: expect.any(Number) });
+        expect(open.held).toEqual({ snapshotPr: 77, partTable: [{ part: "graph", prev: "100", new: "40" }], cause: "shrink", failedTeams: [], sources: [], decideBy: expect.any(Number) });
 
         await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ada@example.com" });
         const after = await callWorkflow<{ decisions: string[] }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
