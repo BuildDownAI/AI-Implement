@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { execSync, spawnSync } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -10,7 +9,7 @@ import { parseDocument } from "yaml";
 import { encodeRunConfig, decodeRunConfig, buildKgRefreshRunConfig, type KgRefreshRunConfigInput, type RunConfigV1 } from "../run-config.js";
 import { buildEnvelopeDispatchInputs } from "../github.js";
 import { resolveRunnerImageForDispatch, __clearRepoImageCacheForTests } from "../repo-image.js";
-import { makeContext as makeBaseContext, makeMapping } from "./helpers/builders.js";
+import { makeContext as makeBaseContext, makeExecutor, makeMapping } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type Reply, type Routes } from "./helpers/fake-fetch.js";
 import { githubFile } from "./helpers/github-replies.js";
 import { testDir } from "./helpers/test-dir.js";
@@ -6173,7 +6172,7 @@ describe("runKgRefresh stage configuration", () => {
   const snap = makeSnapshot();
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "kgrun-cfg-"));
+    tmpDir = testDir("kgrun-cfg");
     vi.stubEnv("GITHUB_OWNER", "org");
     vi.stubEnv("GITHUB_REPO", "kg-repo");
     vi.stubEnv("GITHUB_TOKEN", "tok");
@@ -6184,10 +6183,11 @@ describe("runKgRefresh stage configuration", () => {
 
   afterEach(() => {
     vi.unstubAllEnvs();
-    rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  const throwingExecutor = (): LLMExecutor => ({ invoke: vi.fn().mockRejectedValue(new Error("a model was invoked")) });
+  const throwingExecutor = (): LLMExecutor => ({
+    invoke: vi.fn<LLMExecutor["invoke"]>(async () => { throw new Error("a model was invoked"); }),
+  });
 
   function steps(seen: { ctx?: PipelineContext; clone: number }, pushError?: Error) {
     return {
@@ -6254,7 +6254,7 @@ describe("runKgRefresh stage configuration", () => {
   it("applies the selected stage settings to a model-driven repair call through the context executor", async () => {
     stub(envelopeEnv(snap, makeGrant(snap)));
     const client = fakeClient();
-    const claude: LLMExecutor = { invoke: vi.fn().mockResolvedValue({ stdout: "", exitCode: 0, tokensUsed: 0 }) };
+    const claude = makeExecutor();
     const result = await runKgRefresh({
       workspaceDir: tmpDir, llmExecutor: claude, reporter: { report: async () => undefined },
       configured: { modelAuthClient: client, now: () => NOW },
@@ -6265,7 +6265,7 @@ describe("runKgRefresh stage configuration", () => {
       },
     });
     expect(result.exitCode).toBe(0);
-    expect((claude.invoke as ReturnType<typeof vi.fn>).mock.calls[0][0].model).toBe("claude-review");
+    expect(vi.mocked(claude.invoke).mock.calls[0][0].model).toBe("claude-review");
     expect(client.checkout).toHaveBeenCalledTimes(1);
     expect(client.finish).toHaveBeenCalledWith("p-rev", "completed");
     expect(client.dispose).toHaveBeenCalledTimes(1);

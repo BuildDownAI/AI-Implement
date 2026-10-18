@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { mkdtempSync, rmSync, appendFileSync, existsSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   writeCycleSummary,
@@ -354,53 +353,43 @@ describe("attribution contract (AII-946)", () => {
 });
 
 describe("buildPublicationCycleSummary", () => {
-  const dir = () => mkdtempSync(join(tmpdir(), "pub-cycle-"));
+  const dir = () => testDir("pub-cycle");
   it("copies tests/verdict from the last approving feedback-loop cycle, carries null usage and the pushed commit", () => {
     const d = dir();
-    try {
-      writeCycleSummary(d, baseInput({ tests: [{ name: "test execution", status: "missing" }], usage: { tokensIn: null, tokensOut: null, costUsd: null } }));
-      const second = writeCycleSummary(d, baseInput({ id: "feedback-loop.2", cycle: 2, tests: [{ name: "test execution", status: "missing" }],
-        verdict: { approved: true, reason: "approved" }, usage: { tokensIn: 100, tokensOut: 50, costUsd: 0.25 } }));
-      const pub = buildPublicationCycleSummary(readCycleSummaries(d), "e".repeat(40), [{ key: "k", disposition: "fixed" }], "success");
-      expect(pub).toMatchObject({ id: "publication.1", stage: "publication", outputCommit: "e".repeat(40), outputCommitStatus: "committed",
-        tests: [{ name: "test execution", status: "missing" }], verdict: { approved: true, reason: "approved" },
-        usage: { tokensIn: null, tokensOut: null, costUsd: null }, completedAt: second.completedAt, dispositions: [{ key: "k", disposition: "fixed" }] });
-      expect(readCycleSummaries(d).every((s) => s.outputCommit === null)).toBe(true);
-    } finally { rmSync(d, { recursive: true, force: true }); }
+    writeCycleSummary(d, baseInput({ tests: [{ name: "test execution", status: "missing" }], usage: { tokensIn: null, tokensOut: null, costUsd: null } }));
+    const second = writeCycleSummary(d, baseInput({ id: "feedback-loop.2", cycle: 2, tests: [{ name: "test execution", status: "missing" }],
+      verdict: { approved: true, reason: "approved" }, usage: { tokensIn: 100, tokensOut: 50, costUsd: 0.25 } }));
+    const pub = buildPublicationCycleSummary(readCycleSummaries(d), "e".repeat(40), [{ key: "k", disposition: "fixed" }], "success");
+    expect(pub).toMatchObject({ id: "publication.1", stage: "publication", outputCommit: "e".repeat(40), outputCommitStatus: "committed",
+      tests: [{ name: "test execution", status: "missing" }], verdict: { approved: true, reason: "approved" },
+      usage: { tokensIn: null, tokensOut: null, costUsd: null }, completedAt: second.completedAt, dispositions: [{ key: "k", disposition: "fixed" }] });
+    expect(readCycleSummaries(d).every((s) => s.outputCommit === null)).toBe(true);
   });
   it("sheds test evidence before dispositions when the record overflows the byte cap", () => {
     const d = dir();
-    try {
-      const tests = Array.from({ length: 50 }, (_, i) => ({ name: `t${i}-${"x".repeat(190)}`, status: "passed" as const }));
-      writeCycleSummary(d, baseInput({ tests }));
-      const dispositions = Array.from({ length: 60 }, (_, i) => ({ key: `${i}`.padStart(64, "a"), disposition: "fixed" }));
-      const pub = buildPublicationCycleSummary(readCycleSummaries(d), "e".repeat(40), dispositions, "success");
-      expect(pub).not.toBeNull();
-      expect(pub!.dispositions).toHaveLength(60);
-      expect(pub!.limitReached).toBe(true);
-      expect(isCycleSummary(pub)).toBe(true);
-    } finally { rmSync(d, { recursive: true, force: true }); }
+    const tests = Array.from({ length: 50 }, (_, i) => ({ name: `t${i}-${"x".repeat(190)}`, status: "passed" as const }));
+    writeCycleSummary(d, baseInput({ tests }));
+    const dispositions = Array.from({ length: 60 }, (_, i) => ({ key: `${i}`.padStart(64, "a"), disposition: "fixed" }));
+    const pub = buildPublicationCycleSummary(readCycleSummaries(d), "e".repeat(40), dispositions, "success");
+    expect(pub).not.toBeNull();
+    expect(pub!.dispositions).toHaveLength(60);
+    expect(pub!.limitReached).toBe(true);
+    expect(isCycleSummary(pub)).toBe(true);
   });
   it("returns null without a pushed commit or a feedback-loop source", () => {
     const d = dir();
-    try {
-      expect(buildPublicationCycleSummary([], "e".repeat(40), [], "success")).toBeNull();
-      writeCycleSummary(d, baseInput());
-      expect(buildPublicationCycleSummary(readCycleSummaries(d), null, [], "success")).toBeNull();
-    } finally { rmSync(d, { recursive: true, force: true }); }
+    expect(buildPublicationCycleSummary([], "e".repeat(40), [], "success")).toBeNull();
+    writeCycleSummary(d, baseInput());
+    expect(buildPublicationCycleSummary(readCycleSummaries(d), null, [], "success")).toBeNull();
   });
   it("withholds approval coverage for a failed result or a non-approving verdict", () => {
     const d = dir();
-    try {
-      writeCycleSummary(d, baseInput({ verdict: { approved: true, reason: "approved" } }));
-      expect(buildPublicationCycleSummary(readCycleSummaries(d), "e".repeat(40), [{ key: "k", disposition: "fixed" }], "failure")).toBeNull();
-      for (const approved of [false, null]) {
-        const d2 = dir();
-        try {
-          writeCycleSummary(d2, baseInput({ verdict: { approved, reason: "rejected" } }));
-          expect(buildPublicationCycleSummary(readCycleSummaries(d2), "e".repeat(40), [{ key: "k", disposition: "fixed" }], "success")).toBeNull();
-        } finally { rmSync(d2, { recursive: true, force: true }); }
-      }
-    } finally { rmSync(d, { recursive: true, force: true }); }
+    writeCycleSummary(d, baseInput({ verdict: { approved: true, reason: "approved" } }));
+    expect(buildPublicationCycleSummary(readCycleSummaries(d), "e".repeat(40), [{ key: "k", disposition: "fixed" }], "failure")).toBeNull();
+    for (const approved of [false, null]) {
+      const d2 = dir();
+      writeCycleSummary(d2, baseInput({ verdict: { approved, reason: "rejected" } }));
+      expect(buildPublicationCycleSummary(readCycleSummaries(d2), "e".repeat(40), [{ key: "k", disposition: "fixed" }], "success")).toBeNull();
+    }
   });
 });

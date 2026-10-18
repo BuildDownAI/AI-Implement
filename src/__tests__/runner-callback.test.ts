@@ -9,6 +9,8 @@ import type * as ReviewLedgerStoreModule from "../review-ledger-store.js";
 import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
 import type * as ReviewFixEvidenceModule from "../review-fix-evidence.js";
+import type * as ReviewFixAttemptStoreModule from "../review-fix-attempt-store.js";
+import type * as ReviewFixAdminFacadeModule from "../review-fix-admin-facade.js";
 import type { CycleSummary } from "../pipeline/cycle-summary.js";
 import { formatFailureComment, boundStatusText } from "../runner-callback.js";
 import { FakeProvider } from "./providers/fake.js";
@@ -22,7 +24,7 @@ import type {
   ReviewFixResultMetadataV1,
   ResultIntakeOutcome,
 } from "../review-fix-contract.js";
-import { makeIssue, makeReviewFixResult } from "./helpers/builders.js";
+import { makeAppendLogEntry, makeIssue, makeReviewFixResult } from "./helpers/builders.js";
 import { testDb } from "./helpers/test-db.js";
 
 // ---------- Hoisted mocks for AII-749 lease-rejected handling ----------
@@ -71,11 +73,14 @@ let reviewStore: typeof ReviewLedgerStoreModule;
 let reviewFixQueue: typeof ReviewFixQueueModule;
 let commentGapfillQueue: typeof CommentGapfillQueueModule;
 let reviewFixEvidence: typeof ReviewFixEvidenceModule;
+let reviewFixAttemptStore: typeof ReviewFixAttemptStoreModule;
+let reviewFixAdminFacade: typeof ReviewFixAdminFacadeModule;
 
 beforeEach(async () => {
   ({
     dedup, log, dispatchAdmission, runnerTokens, runnerCallback, stepLog,
     reviewStore, reviewFixQueue, commentGapfillQueue, reviewFixEvidence,
+    reviewFixAttemptStore, reviewFixAdminFacade,
   } = (await testDb({
     modules: {
       dedup: () => import("../dedup.js"),
@@ -88,6 +93,8 @@ beforeEach(async () => {
       reviewFixQueue: () => import("../review-fix-queue.js"),
       commentGapfillQueue: () => import("../comment-gapfill-queue.js"),
       reviewFixEvidence: () => import("../review-fix-evidence.js"),
+      reviewFixAttemptStore: () => import("../review-fix-attempt-store.js"),
+      reviewFixAdminFacade: () => import("../review-fix-admin-facade.js"),
     },
   })).modules);
 });
@@ -1364,16 +1371,14 @@ describe("handleRunnerResult — implementation", () => {
     const HOUR = 3600_000;
     function pendingRow(id: string, over: { phase?: string; prUrl?: string | null; agoMs?: number } = {}) {
       const dispatchId = `d-${id}`;
-      const rowId = log.appendLog({
-        issueId: id, issueIdentifier: "ENG-9", teamKey: "ENG", repo: "o/r", dispatchId,
-        executionMode: "github-actions", phase: over.phase ?? "gap-analysis",
-      });
+      const rowId = log.appendLog(makeAppendLogEntry({
+        issueId: id, repo: "o/r", dispatchId, phase: over.phase ?? "gap-analysis",
+      }));
       log.updateJobStatus(rowId, "completed", "external_review_pending", over.prUrl === undefined ? "https://github.com/o/r/pull/7" : over.prUrl);
       return { rowId, dispatchId };
     }
     async function setCompleted(rowId: number, at: number) {
-      const { getDb } = await import("../dedup.js");
-      getDb().prepare("UPDATE dispatch_log SET completed_at = ? WHERE id = ?").run(at, rowId);
+      dedup.getDb().prepare("UPDATE dispatch_log SET completed_at = ? WHERE id = ?").run(at, rowId);
     }
 
     it("a not-ready callback leaves the row pending; the next ready tick submits once, a second submits nothing", async () => {
@@ -2443,7 +2448,7 @@ describe("handleRunnerResult — gap-analysis", () => {
       issueId: "i", mappingTeamKey: "ENG", phase: "gap-analysis",
       ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
     });
-    const jobId = log.appendLog({ issueId: "i", issueIdentifier: "ENG-7", repo: "org/repo", dispatchId });
+    const jobId = log.appendLog(makeAppendLogEntry({ issueId: "i", issueIdentifier: "ENG-7", repo: "org/repo", dispatchId, phase: "gap-analysis" }));
     log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
     const hook = vi.fn(async () => {});
 
@@ -2474,7 +2479,7 @@ describe("handleRunnerResult — gap-analysis", () => {
         issueId: id, mappingTeamKey: "ENG", phase: "gap-analysis",
         ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
       });
-      const jobId = log.appendLog({ issueId: id, repo: "org/repo", dispatchId });
+      const jobId = log.appendLog(makeAppendLogEntry({ issueId: id, repo: "org/repo", dispatchId, phase: "gap-analysis" }));
       log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
       const res = await runnerCallback.handleRunnerResult({
         authorization: `Bearer ${token}`,
@@ -5386,7 +5391,7 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
       ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET, dispatchId,
     });
     if (!log.findLogIdByDispatchId(dispatchId)) {
-      log.appendLog({ issueId: "i", issueIdentifier: "ENG-1", issueTitle: "t", teamKey: "ENG", repo: "o/r", dispatchId, executionMode: "github-actions", phase: "implementation" });
+      log.appendLog(makeAppendLogEntry({ issueId: "i", repo: "o/r", dispatchId }));
     }
     if (opts.snapshot !== false && !dedup.getDb().prepare("SELECT 1 FROM run_agent_config_snapshots WHERE dispatch_id = ?").get(dispatchId)) {
       storeSnapshot(dispatchId, `snap-${dispatchId}`);
@@ -5407,13 +5412,9 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
     const attemptId = "attempt-managed-attr";
     const token = preparedResultToken(attemptId);
     storeSnapshot(attemptId, "snap-managed-attr");
-    const { SqliteReviewFixAttemptStore } = await import("../review-fix-attempt-store.js");
-    const store = new SqliteReviewFixAttemptStore();
+    const store = new reviewFixAttemptStore.SqliteReviewFixAttemptStore();
     await store.bindExecution(attemptId, { githubRunId: 555, githubRunAttempt: 1 }, Date.now());
-    const marker: ReviewFixResultMetadataV1 = {
-      version: 1, attemptId, installationId: 1, repository: "acme/widgets", prNumber: 42,
-      deadlineAt: DEADLINE_AT, githubRunId: 555, githubRunAttempt: 1, outputCommit: "a".repeat(40),
-    };
+    const marker = makeReviewFixResult({ attemptId, repository: "acme/widgets", deadlineAt: DEADLINE_AT });
     const fake = new FakeProvider({ recordCalls: true });
     const deliver = (attribution: unknown = claim({ snapshotId: "snap-managed-attr", usage: {
       availability: "complete", tokensIn: 100, tokensOut: 10, costUsd: null, costStatus: "unavailable",
@@ -5432,8 +5433,7 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
     expect(log.getJobByDispatchId(c.attemptId)).toBeNull();
     expect(rows()).toHaveLength(1);
     expect(rows()[0]).toMatchObject({dispatch_id: c.attemptId, snapshot_id: "snap-managed-attr", model: "m-implementation", profile_id: "p-implementation"});
-    const { createReviewFixAdminFacade } = await import("../review-fix-admin-facade.js");
-    const facade = createReviewFixAdminFacade(c.store, {reconcile: async () => ({status: "unknown"})}, {cancel: async () => ({status: "accepted"})});
+    const facade = reviewFixAdminFacade.createReviewFixAdminFacade(c.store, {reconcile: async () => ({status: "unknown"})}, {cancel: async () => ({status: "accepted"})});
     expect(await facade.getAttempt(c.attemptId, {role: "admin", email: "operator@example.com"})).toMatchObject({status: "ok", attempt: {
       attribution: {snapshotId: "snap-managed-attr", invocationId: "inv-1", agent: "codex", model: "m-implementation", profileId: "p-implementation",
         usage: {tokensIn: 100, tokensOut: 10, costUsd: null, costStatus: "unavailable"}},
