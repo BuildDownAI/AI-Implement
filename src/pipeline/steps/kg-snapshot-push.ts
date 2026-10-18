@@ -57,7 +57,7 @@ export class KgSnapshotHeldError extends Error {
   readonly commitSha: string | null;
   readonly branchName: string;
   /** Why the run waits: a content shrink, or tracker data that could not be read. */
-  readonly cause: "shrink" | "tracker-missing";
+  readonly cause: "shrink" | "tracker-missing" | "source-failed";
   /** Teams whose tracker fetch failed; empty for a shrink. */
   readonly failedTeams: string[];
   /** Per-source results (tracker + ingest) for the operator's decision. */
@@ -72,7 +72,7 @@ export class KgSnapshotHeldError extends Error {
     prNumber: number | null,
     commitSha: string | null,
     branchName: string,
-    cause: "shrink" | "tracker-missing" = "shrink",
+    cause: "shrink" | "tracker-missing" | "source-failed" = "shrink",
     failedTeams: string[] = [],
     sources: SourceResult[] = [],
     acceptBlocked = false,
@@ -568,7 +568,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     /** Set by guard 0b on a soft-only shrink in a real run: push and open the PR, then throw KgSnapshotHeldError. */
     let held = false;
     let heldDetail = "";
-    let heldCause: "shrink" | "tracker-missing" = "shrink";
+    let heldCause: "shrink" | "tracker-missing" | "source-failed" = "shrink";
     /** Teams whose tracker fetch failed; set with heldCause "tracker-missing". */
     let failedTeams: string[] = [];
     /** True when fetched=false and the cloned snapshot has a tracker part: tracker parts may be missing or smaller. */
@@ -853,15 +853,33 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       parseSourceResults(context.getOutputs("kg-ingest").sourceResults),
     );
     const scope = inputs.scope ?? { addedRepos: [], addedTeams: [], mappedProjectCount: 0 };
-    const acceptBlocked = held && heldCause === "tracker-missing" && lostTeams.length > 0;
+    // A failed non-tracker source may have left half-written triples (the ingest does not roll back
+    // a source that raised), so a run with one never publishes: live holds with Accept blocked,
+    // a dry run completes with warnings. Skipped sources and tracker rows (guard 0b) are unaffected.
+    const failedSources = sources.filter((s) => s.status === "failed" && s.kind !== "tracker");
+    const failedSourceText = `Source(s) failed: ${failedSources.map((s) => `${s.source}${s.reason ? ` (${s.reason})` : ""}`).join(", ")}; the graph may be partial`;
+    if (failedSources.length > 0 && !dryRun) {
+      if (held) {
+        heldDetail = [heldDetail, failedSourceText].join("; ");
+      } else {
+        held = true;
+        heldCause = "source-failed";
+        heldDetail = failedSourceText;
+      }
+    }
+    const acceptBlocked =
+      held && ((heldCause === "tracker-missing" && lostTeams.length > 0) || failedSources.length > 0);
     const warnings: string[] = [];
+    if (failedSources.length > 0 && dryRun) warnings.push(failedSourceText);
     if (trackerWarning && !held) {
       const names = [...lostTeams.map((t) => t.team), ...emptyTeams];
       if (names.length > 0) warnings.push(`Tracker data was skipped or failed for team(s): ${names.join(", ")}`);
       else warnings.push("Tracker data was not fetched this run");
     }
     const guardVerdictText = held
-      ? heldCause === "tracker-missing"
+      ? heldCause === "source-failed"
+        ? "held — " + failedSourceText
+        : heldCause === "tracker-missing"
         ? acceptBlocked
           ? "held — accepting would drop served issues of: " + lostTeams.map((t) => `${t.team} (${t.servedIssues < 0 ? "unknown" : t.servedIssues})`).join(", ")
           : "held — tracker data is missing and the run waits for an operator decision"
@@ -883,7 +901,9 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       ingestWarnings,
       guardVerdict: guardVerdictText,
       scope,
-      warning: held && heldCause === "tracker-missing"
+      warning: held && heldCause === "source-failed"
+        ? `> ⚠️ ${failedSourceText}.`
+        : held && heldCause === "tracker-missing"
         ? failedTeams.length > 0
           ? `> ⚠️ Tracker data could not be read for team(s): ${failedTeams.join(", ")}. The tracker parts of this snapshot are missing or reduced.`
           : "> ⚠️ Tracker data was not fetched this run. The tracker parts of this snapshot are missing or reduced."

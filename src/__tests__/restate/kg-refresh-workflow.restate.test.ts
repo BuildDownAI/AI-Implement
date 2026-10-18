@@ -3481,6 +3481,28 @@ describe("KgRefresh durable workflow", () => {
     );
 
     it.each(VARIANTS.map(([label]) => label))(
+      "a source-failed hold offers only cancel, and cancel closes the held PR (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const sources = [{ source: "secondary_repo:x", kind: "secondary_repo", status: "failed", reason: "boom", counts: {} }];
+        const triggerId = await holdRun(env, { report: { ...HELD_REPORT, cause: "source-failed", acceptBlocked: true, lostTeams: [], sources } as KgRefreshReportBody });
+        const open = await callWorkflow<{ decisions: string[]; held: { cause: string; acceptBlocked: boolean } }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
+        expect(open.decisions).toEqual(["cancel"]);
+        expect(open.held).toMatchObject({ cause: "source-failed", acceptBlocked: true, sources });
+
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ada@example.com" });
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
+        await closeRowFor(triggerId);
+      },
+      60_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
       "accept on an acceptBlocked run answers accept-blocked and the run stays at the gate (%s)",
       async (label) => {
         const env = heldEnvs.get(label)!;

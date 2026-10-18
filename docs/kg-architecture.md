@@ -266,6 +266,15 @@ whenever the tracker is the only problem. A live run has two outcomes:
 | yes | The PR opens and the run holds (`KG_SNAPSHOT_HELD`, cause `tracker-missing`) with `acceptBlocked: true` and `lostTeams: [{ team, servedIssues }]`: accepting would publish a graph without those issues. `status.decisions` is `["cancel"]`, and `decide({ action: "accept" })` answers a 409 `accept-blocked` and leaves the run at the gate. |
 | no | The snapshot publishes through the normal gates with a warning in the PR body and `warnings` (the team names) on the outcome. |
 
+A third cause, `source-failed` (AII-1474), covers any `failed` entry in `sources` whose `kind` is not
+`tracker` (`code_repo`, `secondary_repo`, `self`, `docs_site`, `ingest`). Since KGB-36 the ingest finishes
+every source it can and exits 0, and it does not roll back a source that raised, so a failed source can
+leave half-written triples in the graph. A live run opens the PR and holds with `acceptBlocked: true`
+(`decisions: ["cancel"]`, Accept answers `accept-blocked`); the failed rows are in `held.sources` and the PR
+body's warning names them. A dry run completes with `guardVerdict: "warnings"` and pushes nothing. A
+`skipped` non-tracker source stays a warning. When a tracker-missing or shrink hold is already set, that
+cause stays but Accept is blocked all the same.
+
 A fetch that failed with no team named, and a shrink, still hold with both decisions offered. A `held`
 state stored before `acceptBlocked` existed reads as unblocked.
 

@@ -1360,6 +1360,10 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
       { "issue.nt": teamIssues("OTHER", 5), "doc.nt": makeLines(10) },
     );
     // Make `git show <clonedRef>:snapshot/parts/issue.nt` fail by dropping its blob from the clone.
+    // HEAD moves past the clone so its tree no longer references the dropped blob: the later commit and push still work.
+    execSync("git add -A && git commit -q -m interim", { cwd: tmpDir, stdio: "ignore" });
+    writeWorkingTree({ "issue.nt": teamIssues("OTHER", 6), "doc.nt": makeLines(10) });
+    stubPrCreate(54, "https://github.com/acme/kg-repo/pull/54");
     const blob = execSync(`git rev-parse ${clonedRef}:snapshot/parts/issue.nt`, { cwd: tmpDir }).toString().trim();
     execSync("git repack -a -d -q", { cwd: tmpDir, stdio: "ignore" });
     const packDir = join(tmpDir, ".git", "objects", "pack");
@@ -1370,11 +1374,12 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
     const ctx = makeContext();
     ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X"], issueCount: 0 });
     const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
-    // Fail closed, never a push. The part-count guard no longer dies on the unreadable blob itself;
-    // the fixture's missing blob still breaks the later commit, which is a git failure, not a read crash.
-    expect(err).toBeInstanceOf(Error);
-    expect(String((err as Error).message)).not.toMatch(/git show failed reading previous/);
-    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+    expect(err).toBeInstanceOf(KgSnapshotHeldError);
+    expect(err.cause).toBe("tracker-missing");
+    expect(err.acceptBlocked).toBe(true);
+    expect(err.lostTeams).toEqual([{ team: "X", servedIssues: -1 }]);
+    // Held, not published: the PR opened and waits for the gate.
+    expect(err.prNumber).toBe(54);
   });
 
   it("a failed team with no served issues plus an unrelated issue.nt shrink still holds in a live run", async () => {
@@ -1404,6 +1409,71 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
     expect(err).toBeInstanceOf(KgSnapshotHeldError);
     expect(err.lostTeams).toEqual([{ team: "A", servedIssues: 3 }]);
     expect(err.acceptBlocked).toBe(true);
+  });
+
+  describe("a failed non-tracker source", () => {
+    const steadyParts = { "issue.nt": teamIssues("A", 3), "doc.nt": makeLines(10) };
+    const sourceRow = (source: string, kind: string, status: string) => ({ source, kind, status, reason: status === "failed" ? "boom" : "", counts: {} });
+    const ingestWith = (rows: unknown[]) => {
+      const ctx = makeContext();
+      ctx.setOutputs("kg-tracker-data", { fetched: true, failedTeams: [], issueCount: 3 });
+      ctx.setOutputs("kg-ingest", { sourceResults: rows });
+      return ctx;
+    };
+
+    it.each([
+      ["secondary_repo:x", "secondary_repo"],
+      ["code_repo:main", "code_repo"],
+      ["self", "self"],
+      ["docs_site:d", "docs_site"],
+    ])("a live run with %s failed holds with Accept blocked after the PR opens", async (source, kind) => {
+      const clonedRef = setupShrink(steadyParts, steadyParts);
+      stubPrCreate(51, "https://github.com/acme/kg-repo/pull/51");
+      const ctx = ingestWith([sourceRow(source, kind, "failed")]);
+      const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+      expect(err).toBeInstanceOf(KgSnapshotHeldError);
+      expect(err.cause).toBe("source-failed");
+      expect(err.acceptBlocked).toBe(true);
+      expect(err.prNumber).toBe(51);
+      expect(err.sources.filter((r: { status: string }) => r.status === "failed").map((r: { source: string }) => r.source)).toEqual([source]);
+      const init = vi.mocked(fetch).mock.calls[0][1] as RequestInit;
+      expect((JSON.parse(init.body as string) as { body: string }).body).toContain(`⚠️ Source(s) failed: ${source}`);
+    });
+
+    it("a dry run completes with warnings naming the source and pushes nothing", async () => {
+      const clonedRef = setupShrink(steadyParts, steadyParts);
+      const ctx = ingestWith([sourceRow("secondary_repo:x", "secondary_repo", "failed")]);
+      const result = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef, dryRun: true }), noopReporter);
+      expect(result.guardVerdict).toBe("warnings");
+      expect(result.snapshotPushed).toBe(false);
+      expect(result.prNumber).toBeNull();
+      expect(result.warnings?.[0]).toContain("secondary_repo:x");
+      expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+    });
+
+    it("a skipped secondary repo does not hold", async () => {
+      const clonedRef = setupShrink(steadyParts, steadyParts);
+      stubPrCreate(52, "https://github.com/acme/kg-repo/pull/52");
+      const ctx = ingestWith([sourceRow("secondary_repo:x", "secondary_repo", "skipped")]);
+      const result = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter);
+      expect(result.snapshotPushed).toBe(true);
+      expect(result.prNumber).toBe(52);
+    });
+
+    it("a failed source on top of a tracker-missing hold keeps that cause but stays Accept-blocked", async () => {
+      const clonedRef = setupShrink(
+        { "issue.nt": teamIssues("X", 4) + teamIssues("OTHER", 50), "doc.nt": makeLines(10) },
+        { "issue.nt": teamIssues("OTHER", 50), "doc.nt": makeLines(10) },
+      );
+      stubPrCreate(53, "https://github.com/acme/kg-repo/pull/53");
+      const ctx = makeContext();
+      ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X"], issueCount: 0 });
+      ctx.setOutputs("kg-ingest", { sourceResults: [sourceRow("self", "self", "failed")] });
+      const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+      expect(err).toBeInstanceOf(KgSnapshotHeldError);
+      expect(err.cause).toBe("tracker-missing");
+      expect(err.acceptBlocked).toBe(true);
+    });
   });
 
   it("a dry run with a soft-only shrink refuses with the table and never holds", async () => {
