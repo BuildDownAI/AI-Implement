@@ -291,7 +291,7 @@ Only these four fields cross the boundary — no `ticketingConfig`, token, or ot
 
 ### Tracker-data endpoint
 
-The runner calls `POST /api/runner/kg-tracker-data` once per configured team. The `kg-tracker-data` pipeline step (`src/pipeline/steps/kg-tracker-data.ts`) reads the team list from `sources.yml` in the cloned KG source repo:
+The runner calls `POST /api/runner/kg-tracker-data` once per configured team. The `kg-tracker-data` pipeline step (`src/pipeline/steps/kg-tracker-data.ts`) reads the team list from `sources.yml` in the cloned KG source repo. `kg-scope-reconcile` runs first and writes the mapped teams into that scratch clone, in a dry run as well; a dry run commits and pushes nothing, so the write never leaves the run:
 
 ```yaml
 trackers:
@@ -371,7 +371,7 @@ The runner's result callback reaches `KgRefresh.report` (§5, Callback). The fir
 
 | Report | Result |
 |---|---|
-| dry run (PR check only; the admin doors refuse `dryRun`) | `dry-run-report`, then `closed`; nothing is merged and the served graph is untouched. A dry run that fails before a report (rejected dispatch, timeout, lost run, cancel, workflow error) still records and posts a failure verdict for its PR, and writes neither the last-refresh record nor the operator notification |
+| dry run (PR check only; the admin doors refuse `dryRun`) | `dry-run-report`, then `closed` (row `passed`, `warnings` for a dry run with skipped or failed sources, or `failed`); nothing is merged and the served graph is untouched. A dry run that fails before a report (rejected dispatch, timeout, lost run, cancel, workflow error) still records and posts a failure verdict for its PR, and writes neither the last-refresh record nor the operator notification |
 | `KG_SNAPSHOT_STALE` | `no-new-data`, a success outcome |
 | failure, or no `snapshotPr` / `snapshotCommit` | `failed`; a reported `snapshotPr` is closed unmerged and its branch deleted |
 | success with a snapshot | `merge` (merge commit, never squash), `delete-branch`, then the four rail gates |

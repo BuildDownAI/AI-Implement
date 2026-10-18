@@ -607,7 +607,8 @@ to the workflow. A held error also carries `cause` and `failedTeams`, which trav
 | Hard regression (a part missing), with or without soft | no | failure `KG_SNAPSHOT_TRACKER_REGRESSION`, `guardVerdict: "refused"`, part table, no `snapshot*` fields |
 | Soft only (zero-shrink or 50% rule) | yes | failure `KG_SNAPSHOT_HELD`, `guardVerdict: "held"`, part table, `snapshotPr`/`snapshotCommit`/`snapshotBranch` |
 | Guard 0 (tracker fetch failed, tracker part in the clone), real run | yes | failure `KG_SNAPSHOT_HELD`, `cause: "tracker-missing"`, `failedTeams`, part table; a missing or smaller `issue.nt` / `comment.nt` is held, any other missing part is hard |
-| Dry run (PR check), soft only or tracker data missing | no | `refused` with the table, never `held` |
+| Dry run (PR check), tracker data only: skipped or failed teams, missing tracker parts | no | completes with warnings (`guardVerdict: "warnings"`), never `held`; the report carries the guard table, the Sources table and the warnings |
+| Dry run (PR check), hard regression, or a soft shrink that tracker data does not explain (non-tracker zero-shrink or 50% rule, a tracker-file shrink no lost team explains) | no | failure `KG_SNAPSHOT_TRACKER_REGRESSION`, `guardVerdict: "refused"`, part table |
 
 A held run commits, pushes `kg-refresh/<stamp>` and opens the PR (body: `Guard verdict: held — a shrink
 waits for an operator decision`; for `tracker-missing`, the body starts with a `⚠️` line naming the
@@ -710,8 +711,10 @@ So does `fetched=false` with tracker parts in the cloned snapshot (cause `tracke
 missing or smaller `issue.nt` / `comment.nt` counts as held too. Any other missing part, and a
 missing tracker part when `fetched=true`, stays a hard refusal, since a part that vanishes for
 another reason is an ingest defect and holding it would invite an operator to accept a broken graph.
-A dry run pushes nothing and has no PR to hold, so it still refuses with
-`KG_SNAPSHOT_TRACKER_REGRESSION`. See
+A dry run pushes nothing and has no PR to hold, so a tracker-data problem alone (skipped or failed
+teams, missing tracker parts) completes it with warnings. A hard regression, or a soft shrink that
+tracker data does not explain (a non-tracker zero-shrink or 50% rule, a tracker-file shrink no lost
+team explains), still refuses it with `KG_SNAPSHOT_TRACKER_REGRESSION`. See
 [Held-verdict plumbing](#held-verdict-plumbing-aii-1253-aii-1264).
 
 For a shrink, an intentional change in what the ingest emits (a base-repo classification change, for
