@@ -2363,37 +2363,51 @@ describe("kgScopeReconcileStep", () => {
     expect(after).toContain("  - slug: org/only-one   # trailing comment\n  - slug: org/new-repo\n");
   });
 
-  it("dry run: computes and logs the diff but never writes sources.yml", async () => {
-    writeSources("trackers:\n  - kind: linear\n    team: AII\n");
-    const before = readSources();
-    const fetchImpl = makeMappingFetch([
-      { teamKey: "AII", repo: "org/new-repo", defaultBranch: "main", ticketingProvider: "linear" },
-      { teamKey: "BDS", repo: "org/other-repo", defaultBranch: "main", ticketingProvider: "linear" },
-    ]);
-    let writeCalled = false;
+  it("dry run: writes the reconciled manifest into the scratch clone and logs it as not pushed", async () => {
+    writeSources(templateManifest(" []", " []"));
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
-    let result;
+    let result: Record<string, unknown>;
     try {
-      result = await kgScopeReconcileStep.run(
+      result = (await kgScopeReconcileStep.run(
         makeContext(),
-        {
-          callbackUrl: "http://orch",
-          workspaceDir: tmpDir,
-          dryRun: true,
-          fetchImpl,
-          writeFileSyncImpl: () => { writeCalled = true; },
-        },
+        { callbackUrl: "http://orch", workspaceDir: tmpDir, dryRun: true, fetchImpl: makeMappingFetch(SCOPE_MAPPINGS) },
         noopReporter,
-      );
-      expect(logSpy).toHaveBeenCalledWith("[kg-scope-reconcile] dry-run: would add repos=2 teams=1");
+      )) as unknown as Record<string, unknown>;
+      expect(logSpy).toHaveBeenCalledWith("[kg-scope-reconcile] dry-run: added repos=3 teams=3 to the scratch clone (not pushed)");
     } finally {
       logSpy.mockRestore();
     }
 
-    expect(writeCalled).toBe(false);
-    expect(readSources()).toBe(before);
-    expect(result.addedRepos).toBe(2);
-    expect(result.addedTeams).toBe(1);
+    expectScopeWritten(readSources(), templateManifest(" []", " []"));
+    expect(result).toEqual({
+      addedRepos: 3,
+      addedTeams: 3,
+      addedRepoSlugs: ["org/r0", "org/r1", "org/r2"],
+      addedTeamNames: ["T0", "T1", "T2"],
+      mappedProjectCount: 3,
+    });
+  });
+
+  it("dry run: the tracker step then fetches every reconciled team", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "tok";
+    writeSources("trackers: []\n");
+    await kgScopeReconcileStep.run(
+      makeContext(),
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, dryRun: true, fetchImpl: makeMappingFetch(SCOPE_MAPPINGS.slice(0, 2)) },
+      noopReporter,
+    );
+    let calls = 0;
+    const fetchImpl: typeof fetch = (async () => {
+      calls++;
+      return { ok: true, status: 200, json: async () => ({ issues: [], pageInfo: { hasNextPage: false, endCursor: null } }) } as Response;
+    }) as typeof fetch;
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl },
+      noopReporter,
+    );
+    expect(calls).toBe(2);
+    expect(result.teamCounts.map((t: { team: string }) => t.team)).toEqual(["T0", "T1"]);
   });
 
   it("malformed sources.yml does not throw and reconciles from an empty manifest", async () => {
