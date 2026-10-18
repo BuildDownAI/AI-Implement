@@ -4,13 +4,9 @@
  * `codex-subscription` profile, no network.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
-import crypto from "node:crypto";
+import { serializeChatGptPlanRecord } from "../chatgpt-plan-token.js";
 import type * as DedupModule from "../dedup.js";
 import type * as StoreModule from "../agent-config-store.js";
-import type * as OwnershipModule from "../model-session-ownership.js";
 import type * as IndexModule from "../index.js";
 import type * as FlyModule from "../fly-machines.js";
 import type * as RepoImageModule from "../repo-image.js";
@@ -18,12 +14,18 @@ import type * as GithubModule from "../github.js";
 import type * as WorkflowProbeModule from "../workflow-probe.js";
 import type { ModelAuthRuntime } from "../model-auth-runtime.js";
 import type { RepoMapping } from "../config.js";
-import type { AppConfig } from "../index.js";
-import type { TicketIssue, TicketingProvider } from "../providers/types.js";
+import type { TicketIssue } from "../providers/types.js";
 import { decodeTrustedRunConfig } from "../run-config.js";
+import { createModelSessionKeyProvider } from "../model-session-keys.js";
+import { makeAppConfig, makeChatGptPlanRecord, makeIssue, makeMapping, makeProvider } from "./helpers/builders.js";
+import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
+import { flySecretsUpdated } from "./helpers/replies/fly.js";
+import { testDb } from "./helpers/test-db.js";
 
-const KEY = crypto.createHash("sha256").update("synthetic-dispatch-key").digest();
 const RUNNER_SECRET = "runner-token-secret-synthetic-0123456789";
+// The session store's key: production's provider, derived from a synthetic secret.
+const KEYS = createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: "synthetic-dispatch-secret" });
+const KEY = KEYS.current()!.key;
 const holder = vi.hoisted(() => ({ runtime: undefined as unknown }));
 
 vi.mock("../model-auth-runtime.js", async (importOriginal) => {
@@ -52,8 +54,9 @@ vi.mock("../github.js", async (importOriginal) => {
   return { ...actual, postWorkflowDispatch: vi.fn(), getRepoDefaultBranch: vi.fn() };
 });
 
-let dbPath: string;
 let dedup: typeof DedupModule;
+let managed: typeof import("../managed-dispatch-auth.js");
+let api: FakeFetch;
 let store: typeof StoreModule;
 let index: typeof IndexModule;
 let fly: typeof FlyModule;
@@ -70,26 +73,22 @@ const CAPABLE_WORKFLOWS = {
   ".github/workflows/claude-kg-refresh.yml": null,
 };
 
-const issue = { id: "issue-1389", identifier: "AII-1389", title: "T", description: "d", scopeKey: "AII", nativeStatus: "Todo" } as unknown as TicketIssue;
-const mapping = {
-  owner: "acme", repo: "app", workflowFile: "claude-implement.yml", planningWorkflowFile: "claude-plan.yml",
-  defaultBranch: "main", maxInProgressAiIssues: 1, provider: "anthropic", sessionMode: "default",
-  machineCpus: 1, machineMemoryMb: 512, extraEnv: {},
-} as unknown as RepoMapping;
+// A Jira project AII mapped to acme/app; the issue is one its provider returns.
+const issue = makeIssue({ id: "issue-1389", identifier: "AII-1389", title: "T", description: "d", scopeKey: "AII", nativeStatus: "Plan Approved" });
+const mapping = makeMapping({
+  owner: "acme", repo: "app", machineCpus: 1, machineMemoryMb: 512,
+  ticketingProvider: "jira",
+  ticketingConfig: {
+    kind: "jira", jql: "project = AII", repoFieldValue: "acme/app",
+    statusFieldOverride: null, repoFieldOverride: null, profilesFieldOverride: null, baseBranchFieldOverride: null,
+  },
+});
 const prior = { count: 0, lastDispatchedAt: null };
-const config = {
-  githubAppId: "id", githubAppPrivateKey: "key", anthropicApiKey: "sk-ant-synthetic", claudeOAuthToken: null,
-  flySessionsToken: "fly-token", flySessionsApp: "fly-app", runnerCallbackBaseUrl: "https://orch.example",
-  runnerTokenSecret: RUNNER_SECRET, healthPort: 8080,
-} as unknown as AppConfig;
-const provider = {
-  id: "jira",
-  issueUrl: vi.fn().mockReturnValue("https://example.test/AII-1389"),
-  markImplementationFailed: vi.fn().mockResolvedValue(true),
-  markPlanningFailed: vi.fn().mockResolvedValue(true),
-  markImplementing: vi.fn().mockResolvedValue(undefined),
-  postComment: vi.fn().mockResolvedValue(undefined),
-} as unknown as TicketingProvider;
+const config = makeAppConfig({
+  anthropicApiKey: "sk-ant-synthetic", flySessionsToken: "fly-token", flySessionsApp: "fly-app",
+  runnerCallbackBaseUrl: "https://orch.example", runnerTokenSecret: RUNNER_SECRET,
+});
+const provider = makeProvider({ id: "jira" });
 
 function count(table: string): number {
   return (dedup.getDb().prepare(`SELECT count(*) AS n FROM ${table}`).get() as { n: number }).n;
@@ -111,10 +110,7 @@ function machineBody() {
 }
 
 beforeEach(async () => {
-  dbPath = path.join(os.tmpdir(), `dispatch-fly-protected-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  vi.resetModules();
-  process.env.DEDUP_DB_PATH = dbPath;
-  process.env.RUNNER_TOKEN_SECRET = RUNNER_SECRET;
+  vi.stubEnv("RUNNER_TOKEN_SECRET", RUNNER_SECRET);
   visibility = "private";
   planRecord = true;
   workflows = {};
@@ -122,27 +118,31 @@ beforeEach(async () => {
   for (const m of ["log", "warn", "error"] as const) {
     vi.spyOn(console, m).mockImplementation((...a: unknown[]) => { logs.push(a.map(String).join(" ")); });
   }
-  dedup = await import("../dedup.js");
-  store = await import("../agent-config-store.js");
-  const own: typeof OwnershipModule = await import("../model-session-ownership.js");
-  const sessionMod = await import("../model-session-store.js");
-  dedup.getDb();
-  (await import("../dispatch-breaker.js")).initDispatchBreakerTable();
-  (await import("../log.js")).initLogTable();
-  (await import("../config.js")).initMappingsTable();
+  const modules = (await testDb({
+    modules: {
+      dedup: () => import("../dedup.js"),
+      store: () => import("../agent-config-store.js"),
+      own: () => import("../model-session-ownership.js"),
+      sessionMod: () => import("../model-session-store.js"),
+      index: () => import("../index.js"),
+      fly: () => import("../fly-machines.js"),
+      repoImage: () => import("../repo-image.js"),
+      github: () => import("../github.js"),
+      probe: () => import("../workflow-probe.js"),
+      auth: () => import("../github-app-auth.js"),
+      managed: () => import("../managed-dispatch-auth.js"),
+    },
+  })).modules;
+  ({ dedup, store, index, fly, repoImage, github, probe, managed } = modules);
+  const { own, sessionMod, auth } = modules;
   const sessions = sessionMod.createModelSessionStore({
-    keys: { current: () => ({ keyId: "k1", key: KEY }), get: (id) => (id === "k1" ? KEY : undefined) },
+    keys: KEYS,
     verifyOwner: own.sessionOwnerVerifier,
     authorizeOperator: () => false,
   });
   const ownership = own.createModelSessionOwnership({ store: sessions, probe: () => "terminated" });
   if (planRecord) {
-    sessions.writePlanRecord({ profileId: "cdx", expectedSequence: null, sessionData: JSON.stringify({
-      version: 1, email: "u@example.com", issuer: "https://auth.openai.com", subject: "s", clientId: "c",
-      extAgentHostId: "h", idToken: "synthetic-id", accessToken: "synthetic-access", refreshToken: "synthetic-refresh",
-      tokenType: "Bearer", scopes: ["chatgpt.tokens.use.direct"], accessTokenExpiresAt: Date.now() + 3_600_000,
-      earliestRefreshAt: null, savedAt: Date.now(),
-    }) });
+    sessions.writePlanRecord({ profileId: "cdx", expectedSequence: null, sessionData: serializeChatGptPlanRecord(makeChatGptPlanRecord()) });
   }
   store.saveAccountProfileRevision({
     profileId: "cdx", identity: "Cdx", revision: 1, agent: "codex", provider: "openai",
@@ -166,16 +166,15 @@ beforeEach(async () => {
     }),
   } as unknown as ModelAuthRuntime;
 
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({ version: 7 }) } as Response));
+  // The two requests the mocks above leave on the real fetch: the protection key's write to the sessions app, and
+  // a GitHub Actions dispatch's best-effort run lookup, answered as GitHub does before the new run is listed.
+  api = fakeFetch({
+    "POST /v1/apps/fly-app/secrets": flySecretsUpdated(7),
+    "GET /repos/acme/app/actions/workflows/claude-implement.yml/runs": { json: { total_count: 0, workflow_runs: [] } },
+  }).install();
 
-  index = await import("../index.js");
-  fly = await import("../fly-machines.js");
-  repoImage = await import("../repo-image.js");
-  github = await import("../github.js");
-  probe = await import("../workflow-probe.js");
-  const auth = await import("../github-app-auth.js");
   vi.mocked(auth.getInstallationToken).mockResolvedValue("broad-token");
-  vi.mocked(auth.getScopedInstallationToken).mockResolvedValue({ token: "scoped-token", expiresAt: "", installationId: 1 } as never);
+  vi.mocked(auth.getScopedInstallationToken).mockResolvedValue({ token: "scoped-token", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 1 });
   vi.mocked(repoImage.resolveSessionImage).mockReset().mockResolvedValue({ image: "session-image", source: "default" } as never);
   vi.mocked(fly.listAppSecrets).mockReset().mockResolvedValue([]);
   vi.mocked(fly.createMachine).mockReset().mockResolvedValue({ id: "m1", name: "machine-1" } as never);
@@ -186,13 +185,8 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  vi.unstubAllGlobals();
   vi.restoreAllMocks();
-  delete process.env.RUNNER_TOKEN_SECRET;
-  for (const suffix of ["", "-wal", "-shm"]) {
-    try { fs.unlinkSync(dbPath + suffix); } catch { /* ignore */ }
-  }
+  vi.unstubAllEnvs();
 });
 
 describe("opted-in Fly implementation", () => {
@@ -226,7 +220,7 @@ describe("opted-in Fly implementation", () => {
   });
 
   it("skips the Anthropic-key precheck only for an opted-in project", async () => {
-    const noKey = { ...config, anthropicApiKey: null } as unknown as AppConfig;
+    const noKey = { ...config, anthropicApiKey: null };
     await index.dispatchFlyMachine(noKey, provider, issue, mapping, prior, "default", "main", null);
     expect(fly.createMachine).toHaveBeenCalledOnce();
 
@@ -255,7 +249,7 @@ describe("opted-in Fly implementation", () => {
   });
 
   it("a missing runnerCallbackBaseUrl creates no machine and revokes the grant", async () => {
-    const noUrl = { ...config, runnerCallbackBaseUrl: null } as unknown as AppConfig;
+    const noUrl = { ...config, runnerCallbackBaseUrl: null };
     await expect(index.dispatchFlyMachine(noUrl, provider, issue, mapping, prior, "default", "main", null)).rejects.toThrow(/callback/);
     expect(fly.createMachine).not.toHaveBeenCalled();
     expect(admissions()).toBe(0);
@@ -385,7 +379,6 @@ describe("opted-in GitHub Actions implementation (AII-1420)", () => {
   });
 
   it("carries a launch context equal to the request's own values, never read from a grant whose dispatch, project and backend differ", async () => {
-    const managed = await import("../managed-dispatch-auth.js");
     const real = managed.prepareManagedDispatch;
     let launched: { dispatchId: string; projectKey: string } | undefined;
     vi.spyOn(managed, "prepareManagedDispatch").mockImplementation(async (...args) => {
@@ -490,13 +483,14 @@ describe("opted-out Fly implementation", () => {
     const rc = decodeTrustedRunConfig(env.AI_IMPLEMENT_RUN_CONFIG!);
     expect(rc.credentials).toBeUndefined();
     expect(rc.agentConfig).toBeUndefined();
-    expect(JSON.stringify(vi.mocked(fetch).mock.calls)).not.toContain("secrets");
+    expect(api.calls.map((c) => c.path)).not.toContain("/v1/apps/fly-app/secrets");
     expect(count("model_credential_grants")).toBe(0);
   });
 });
 
 // Fixtures captured by running these dispatches against the pre-AII-1389 `src/index.ts`; the per-run random
-// values (session token, nonce, run tokens) are replaced by placeholders before comparing.
+// values (session token, nonce, run tokens) are replaced by placeholders before comparing. SESSION_MODE and
+// session_mode carry the mapping's session mode through unchanged.
 const LEGACY_FLY_BODY = {
   "name": "session-aii-1389",
   "region": "iad",
@@ -513,7 +507,7 @@ const LEGACY_FLY_BODY = {
       "GITHUB_TOKEN": "scoped-token",
       "SESSION_TOKEN": "<SESSION_TOKEN>",
       "MACHINE_NONCE": "<MACHINE_NONCE>",
-      "SESSION_MODE": "default",
+      "SESSION_MODE": "autonomous",
       "RUNNER_PHASE": "implementation",
       "ANTHROPIC_API_KEY": "sk-ant-synthetic",
       "ORCHESTRATOR_URL": "https://orch.example",
@@ -538,7 +532,7 @@ const LEGACY_FLY_BODY = {
       "issue_id": "issue-1389",
       "issue_identifier": "AII-1389",
       "repo": "acme/app",
-      "session_mode": "default",
+      "session_mode": "autonomous",
       "expected_ttl_seconds": "14400"
     },
     "processes": [

@@ -1,15 +1,13 @@
 import { describe, expect, it, beforeEach, afterEach, vi, onTestFinished } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
 import { resolveExecutionPath, resolvePlanningExecutionPath } from "../runner-mode.js";
 import type * as DedupModule from "../dedup.js";
 import type * as GateModule from "../dispatch-gate.js";
-import type { TicketIssue, TicketingProvider } from "../providers/types.js";
+import type { TicketingProvider } from "../providers/types.js";
 import type { RepoMapping } from "../config.js";
-import { shouldReleaseAdmissionOnDispatchError, type AppConfig } from "../index.js";
+import { shouldReleaseAdmissionOnDispatchError } from "../index.js";
 import { makeAppConfig, makeAppendLogEntry, makeIssue, makeMapping, makeProvider } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
+import { githubError } from "./helpers/replies/github.js";
 import { testDb } from "./helpers/test-db.js";
 
 // Mocked only for the "pre-launch failure releases the reservation" describe block below —
@@ -103,6 +101,11 @@ function jiraMapping(project: string, overrides: Partial<RepoMapping> = {}): Rep
 
 // Planning dispatches only with the runner callback configured (planningDispatchBlockReason, src/runner-callback.ts).
 const CALLBACK_CONFIG = { runnerCallbackBaseUrl: "https://orchestrator.example", runnerTokenSecret: "secret" };
+
+/** A repository-scoped installation token as the mint returns it, valid for an hour. */
+function scopedToken(token: string) {
+  return { token, expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 1 };
+}
 
 function jiraProvider(): TicketingProvider {
   return makeProvider({ id: "jira", issueUrl: (issue) => `https://example.atlassian.net/browse/${issue.identifier}` });
@@ -441,15 +444,11 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
 
   it("dispatchLocalDocker: a run-token mint failure releases the reservation and never calls the backend", async () => {
     vi.mocked(githubAppAuth.getInstallationToken).mockResolvedValue("gh-token");
-    const config = {
-      githubAppId: "id",
-      githubAppPrivateKey: "key",
+    const config = makeAppConfig({
       anthropicApiKey: "sk-test",
-      localRunnerImage: "test-image",
-      localRunnerOrchestratorUrl: "http://localhost:9000",
       runnerCallbackBaseUrl: "http://localhost:9000",
       runnerTokenSecret: "secret",
-    } as unknown as AppConfig;
+    });
     // Make every mint throw without touching the code under test.
     dedup.getDb().exec("DROP TABLE runner_tokens");
 
@@ -472,7 +471,7 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
   });
 
   it("dispatchLocalDocker: a throw after markLaunchAttempted (container launch failure) holds the reservation — docker's CLI response can be lost after the container was actually created (AII-783 review, second round, on PR #681)", async () => {
-    vi.mocked(githubAppAuth.getScopedInstallationToken).mockResolvedValue({ token: "gh-token", expiresAt: "", installationId: 1 } as never);
+    vi.mocked(githubAppAuth.getScopedInstallationToken).mockResolvedValue(scopedToken("gh-token"));
     vi.mocked(localDocker.startLocalRunnerContainer).mockRejectedValue(new Error("docker run failed"));
     const config = makeAppConfig({ anthropicApiKey: "sk-test" });
 
@@ -562,8 +561,6 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
 // alone, for implementation, shadow and planning dispatches. A narrow-mint failure
 // launches nothing and never substitutes the installation-wide token.
 describe("Fly and local boot tokens are scoped to the target repository (AII-853)", () => {
-  let dbPath: string;
-  let dedup: typeof DedupModule;
   let gate: typeof GateModule;
   let indexModule: typeof import("../index.js");
   let githubAppAuth: typeof import("../github-app-auth.js");
@@ -571,50 +568,27 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
   let flyMachines: typeof import("../fly-machines.js");
   let repoImage: typeof import("../repo-image.js");
 
-  const issue: TicketIssue = {
-    id: "issue-scoped-boot-1",
-    identifier: "AII-853",
-    title: "Test issue",
-    description: "desc",
-    scopeKey: "AII",
-    nativeStatus: "Todo",
-  };
+  // A Jira issue in the AII project, in the snapshot's Ready bucket.
+  const issue = makeIssue({ identifier: "AII-853", scopeKey: "AII", nativeStatus: "Ready" });
 
-  const mapping = {
+  const mapping = makeMapping({
     owner: "eudoxus",
     repo: "AI-Implement",
-    workflowFile: "claude-implement.yml",
-    planningWorkflowFile: "claude-plan.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 1,
-    provider: "anthropic",
-    sessionMode: "default",
-    machineCpus: 1,
-    machineMemoryMb: 512,
-    extraEnv: {},
-  } as unknown as RepoMapping;
+    ticketingProvider: "jira",
+    ticketingConfig: {
+      kind: "jira", jql: "project = AII", repoFieldValue: "eudoxus/AI-Implement",
+      statusFieldOverride: null, repoFieldOverride: null, profilesFieldOverride: null, baseBranchFieldOverride: null,
+    },
+  });
 
-  const provider = {
-    id: "jira",
-    issueUrl: vi.fn().mockReturnValue("https://example.test/AII-853"),
-    markImplementationFailed: vi.fn(),
-    markPlanningFailed: vi.fn(),
-    markPlanningStarted: vi.fn().mockResolvedValue(undefined),
-    markImplementing: vi.fn().mockResolvedValue(undefined),
-    postComment: vi.fn().mockResolvedValue(undefined),
-  } as unknown as TicketingProvider;
+  const provider = jiraProvider();
 
   const prior = { count: 0, lastDispatchedAt: null };
-  const config = {
-    githubAppId: "id",
-    githubAppPrivateKey: "key",
+  const config = makeAppConfig({
     anthropicApiKey: "sk-test",
     flySessionsToken: "fly-token",
     flySessionsApp: "fly-app",
-    localRunnerImage: "test-image",
-    localRunnerOrchestratorUrl: "http://localhost:9000",
-    healthPort: 8080,
-  } as unknown as AppConfig;
+  });
 
   const planningCtx = (execPath: "fly-machines" | "local-docker") => ({
     execPath,
@@ -626,34 +600,23 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
   const SCOPED_REQUEST = { repositories: ["AI-Implement"] };
 
   beforeEach(async () => {
-    vi.resetModules();
-    dbPath = path.join(
-      os.tmpdir(),
-      `dispatch-scoped-boot-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-    );
-    process.env.DEDUP_DB_PATH = dbPath;
-    dedup = await import("../dedup.js");
-    gate = await import("../dispatch-gate.js");
-    (await import("../dispatch-breaker.js")).initDispatchBreakerTable();
-    (await import("../log.js")).initLogTable();
-    (await import("../config.js")).initMappingsTable();
-    githubAppAuth = await import("../github-app-auth.js");
-    localDocker = await import("../local-docker.js");
-    flyMachines = await import("../fly-machines.js");
-    repoImage = await import("../repo-image.js");
-    indexModule = await import("../index.js");
+    ({ gate, githubAppAuth, localDocker, flyMachines, repoImage, indexModule } = (await testDb({
+      modules: {
+        gate: () => import("../dispatch-gate.js"),
+        githubAppAuth: () => import("../github-app-auth.js"),
+        localDocker: () => import("../local-docker.js"),
+        flyMachines: () => import("../fly-machines.js"),
+        repoImage: () => import("../repo-image.js"),
+        indexModule: () => import("../index.js"),
+      },
+    })).modules);
 
     vi.mocked(githubAppAuth.getInstallationToken).mockReset().mockResolvedValue("broad-token");
-    vi.mocked(githubAppAuth.getScopedInstallationToken).mockReset().mockResolvedValue({ token: "scoped-token", expiresAt: "", installationId: 1 } as never);
+    vi.mocked(githubAppAuth.getScopedInstallationToken).mockReset().mockResolvedValue(scopedToken("scoped-token"));
     vi.mocked(repoImage.resolveSessionImage).mockReset().mockResolvedValue({ image: "session-image", source: "default" } as never);
     vi.mocked(flyMachines.listAppSecrets).mockReset().mockResolvedValue([]);
     vi.mocked(flyMachines.createMachine).mockReset().mockResolvedValue({ id: "m1", name: "machine-1" } as never);
     vi.mocked(localDocker.startLocalRunnerContainer).mockReset().mockResolvedValue({ containerId: "c1234567890123", containerName: "container-1" } as never);
-  });
-
-  afterEach(() => {
-    dedup.closeDb();
-    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   });
 
   function expectScopedOnly() {
@@ -917,7 +880,7 @@ describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome a
       supportsAttemptCorrelation: false,
       ...(supportsPrivateRunConfig !== undefined ? { supportsPrivateRunConfig } : {}),
     });
-    const tokenConfig = { ...config, runnerTokenSecret: "runner-token-secret-with-enough-entropy", runnerCallbackBaseUrl: "https://orch.example.com" } as unknown as AppConfig;
+    const tokenConfig = makeAppConfig({ runnerTokenSecret: "runner-token-secret-with-enough-entropy", runnerCallbackBaseUrl: "https://orch.example.com" });
     const sent = () => vi.mocked(github.postWorkflowDispatch).mock.calls[0]![0];
 
     beforeEach(() => {
@@ -985,15 +948,17 @@ describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome a
     const caps = (extra: Record<string, unknown>) => ({
       contract: "envelope" as const, supportsRunPublicationToken: true, supportsAttemptCorrelation: false, ...extra,
     });
-    const tokenConfig = { ...config, runnerTokenSecret: "runner-token-secret-with-enough-entropy", runnerCallbackBaseUrl: "https://orch.example.com" } as unknown as AppConfig;
-    let fetchMock: ReturnType<typeof vi.fn>;
+    const tokenConfig = makeAppConfig({ runnerTokenSecret: "runner-token-secret-with-enough-entropy", runnerCallbackBaseUrl: "https://orch.example.com" });
+    /** The workflow-dispatch POST, and the run lookup an accepted implementation dispatch makes once. */
+    const DISPATCHES = `POST /repos/${mapping.owner}/${mapping.repo}/actions/workflows/${mapping.workflowFile}/dispatches` as const;
+    const RUNS = `GET /repos/${mapping.owner}/${mapping.repo}/actions/workflows/${mapping.workflowFile}/runs` as const;
+    let api: FakeFetch;
 
     beforeEach(() => {
-      fetchMock = vi.fn();
-      vi.stubGlobal("fetch", fetchMock);
+      // postWorkflowDispatch is mocked, so a dispatch here sends nothing unless a test routes it.
+      api = fakeFetch({ [RUNS]: { json: { total_count: 0, workflow_runs: [] } } }).install();
       vi.mocked(github.postWorkflowDispatch).mockReset().mockResolvedValue({ success: true, status: 204, outcome: "accepted" } as never);
     });
-    afterEach(() => { vi.unstubAllGlobals(); });
 
     const failures: Array<[string, () => Promise<unknown>]> = [
       ["unsupported reader (false)", () => Promise.resolve(caps({ supportsPrivateRunConfig: false }))],
@@ -1008,7 +973,7 @@ describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome a
         indexModule.dispatchGitHubActions(tokenConfig, provider, issue, mapping, prior, "default", mapping.defaultBranch, null, priv),
       ).rejects.toThrow();
       expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
-      expect(fetchMock).not.toHaveBeenCalled();
+      expect(api.calls).toEqual([]);
       const retry = gate.acquireDispatch({
         dispatchId: "retry-impl-protected", issueId: issue.id, issueIdentifier: issue.identifier,
         kind: "implementation", teamKey: issue.scopeKey, maxInProgressAiIssues: 1, backend: "github-actions",
@@ -1022,7 +987,7 @@ describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome a
         indexModule.dispatchPlanning(tokenConfig, provider, issue, mapping, { ...planningCtx, trustedCredentials: priv }),
       ).rejects.toThrow();
       expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
-      expect(fetchMock).not.toHaveBeenCalled();
+      expect(api.calls).toEqual([]);
       const retry = gate.acquireDispatch({
         dispatchId: "retry-plan-protected", issueId: issue.id, issueIdentifier: issue.identifier,
         kind: "planning", teamKey: issue.scopeKey, maxInProgressAiIssues: 1, backend: "github-actions",
@@ -1088,15 +1053,15 @@ describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome a
       const actual = await vi.importActual<typeof import("../github.js")>("../github.js");
       vi.mocked(github.postWorkflowDispatch).mockImplementation(actual.postWorkflowDispatch);
       vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue(caps({ supportsPrivateRunConfig: true }));
-      fetchMock
-        .mockResolvedValueOnce({ status: 422, text: async () => 'Unexpected inputs provided: ["issue_identifier"]' })
-        .mockResolvedValueOnce({ status: 204 })
-        // Post-dispatch run-id lookup is not under test; answer it harmlessly.
-        .mockResolvedValue({ ok: false, status: 500, text: async () => "" });
+      const github422 = fakeFetch({
+        // GitHub refuses an input the target workflow does not declare, then accepts the retry without it.
+        [DISPATCHES]: [githubError(422, 'Unexpected inputs provided: ["issue_identifier"]'), { status: 204 }],
+        [RUNS]: { json: { total_count: 0, workflow_runs: [] } },
+      }).install();
       await indexModule.dispatchGitHubActions(tokenConfig, provider, issue, mapping, prior, "default", mapping.defaultBranch, null, priv);
-      const dispatchCalls = fetchMock.mock.calls.filter((c) => String(c[0]).endsWith("/dispatches"));
+      const dispatchCalls = github422.calls.filter((c) => c.path.endsWith("/dispatches"));
       expect(dispatchCalls).toHaveLength(2);
-      const bodies = dispatchCalls.map((c) => JSON.parse(c[1].body as string).inputs as Record<string, string>);
+      const bodies = dispatchCalls.map((c) => JSON.parse(c.body).inputs as Record<string, string>);
       expect(bodies[1]!.run_config).toBe(bodies[0]!.run_config);
       expect(bodies[0]!.run_config).toBeTruthy();
       expect("issue_identifier" in bodies[1]!).toBe(false);

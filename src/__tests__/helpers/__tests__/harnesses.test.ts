@@ -6,6 +6,7 @@ import type Database from "better-sqlite3";
 import { testDir, testTempRoot } from "../test-dir.js";
 import { testDb } from "../test-db.js";
 import { fakeFetch, hangUntilAborted } from "../fake-fetch.js";
+import { flySecretsUpdated } from "../replies/fly.js";
 import { githubError, githubFile } from "../replies/github.js";
 import { linearData, linearGraphql } from "../replies/linear.js";
 
@@ -454,6 +455,17 @@ describe("githubError", () => {
 
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ message: "Not Found", documentation_url: "https://docs.github.com/rest", status: "404" });
+  });
+});
+
+describe("flySecretsUpdated", () => {
+  it("answers as the secrets endpoint does: the new version, under both of its names", async () => {
+    const fly = fakeFetch({ "POST /v1/apps/sessions/secrets": flySecretsUpdated(7) });
+
+    const res = await fly.fetch("https://api.machines.dev/v1/apps/sessions/secrets", { method: "POST", body: "{}" });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ Version: 7, version: 7 });
   });
 });
 
