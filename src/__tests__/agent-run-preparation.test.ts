@@ -3,16 +3,17 @@
  * file with the real config store, ownership layer and session store. Synthetic
  * credentials and injected fakes only: no network, no paid model calls.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import crypto from "node:crypto";
+import { serializeChatGptPlanRecord } from "../chatgpt-plan-token.js";
 import type * as DedupModule from "../dedup.js";
 import type * as PrepModule from "../agent-run-preparation.js";
 import type * as StoreModule from "../agent-config-store.js";
 import type * as OwnershipModule from "../model-session-ownership.js";
 import type * as SessionModule from "../model-session-store.js";
+import { createModelSessionKeyProvider } from "../model-session-keys.js";
+import { makeChatGptPlanRecord } from "./helpers/builders.js";
+import { testDb, type TestDb } from "./helpers/test-db.js";
 
 // `events` records resolver calls and reservations in order, to assert proof timing.
 let events: string[];
@@ -30,13 +31,21 @@ const mockCredentials = () => vi.doMock("../model-credentials.js", async () => {
 
 const API_SENTINEL = "sk-synthetic-api-SENTINEL-0001";
 const SESSION_SENTINEL = "synthetic-session-SENTINEL-0002";
-const KEY = crypto.createHash("sha256").update("synthetic-prep-key").digest();
 const OPERATOR = { synthetic: "operator" };
 const REPO = "acme/app";
 const KG_REPO = "acme/knowledge";
 const WORKFLOW = `# ${"ai-implement-capability: stage-agent-config-v1"}\n# ${"ai-implement-capability: stage-agent-launch-context-v1"}\nname: implement\n`;
 
-let dbPath: string;
+const MODULES = {
+  dedup: () => import("../dedup.js"),
+  prep: () => import("../agent-run-preparation.js"),
+  store: () => import("../agent-config-store.js"),
+  own: () => import("../model-session-ownership.js"),
+  sessionMod: () => import("../model-session-store.js"),
+  credentials: () => import("../model-credentials.js"),
+};
+
+let testDatabase: TestDb<typeof MODULES>;
 let dedup: typeof DedupModule;
 let prep: typeof PrepModule;
 let store: typeof StoreModule;
@@ -128,30 +137,18 @@ function ready(r: PrepModule.AgentRunPreparation) {
 }
 
 beforeEach(async () => {
-  dbPath = path.join(os.tmpdir(), `agent-run-prep-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  vi.resetModules();
-  process.env.DEDUP_DB_PATH = dbPath;
   events = [];
   mockCredentials();
-  dedup = await import("../dedup.js");
-  prep = await import("../agent-run-preparation.js");
-  store = await import("../agent-config-store.js");
-  own = await import("../model-session-ownership.js");
-  const sessionMod = await import("../model-session-store.js");
-  dedup.getDb();
-  sessions = sessionMod.createModelSessionStore({
-    keys: { current: () => ({ keyId: "k1", key: KEY }), get: (id) => (id === "k1" ? KEY : undefined) },
+  testDatabase = await testDb({ modules: MODULES });
+  ({ dedup, prep, store, own } = testDatabase.modules);
+  sessions = testDatabase.modules.sessionMod.createModelSessionStore({
+    keys: createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: "synthetic-prep-secret" }),
     verifyOwner: own.sessionOwnerVerifier,
     authorizeOperator: (op) => op === OPERATOR,
   });
   ownership = own.createModelSessionOwnership({ store: sessions, probe: () => "terminated" });
   // A stored ChatGPT plan record, so the real resolver proves the `cdx` profile.
-  const seeded = sessions.writePlanRecord({ profileId: "cdx", expectedSequence: null, sessionData: JSON.stringify({
-    version: 1, email: "u@example.com", issuer: "https://auth.openai.com", subject: "s", clientId: "c",
-    extAgentHostId: "h", idToken: "synthetic-id", accessToken: "synthetic-access", refreshToken: "synthetic-refresh",
-    tokenType: "Bearer", scopes: ["chatgpt.tokens.use.direct"], accessTokenExpiresAt: Date.now() + 3_600_000,
-    earliestRefreshAt: null, savedAt: Date.now(),
-  }) });
+  const seeded = sessions.writePlanRecord({ profileId: "cdx", expectedSequence: null, sessionData: serializeChatGptPlanRecord(makeChatGptPlanRecord()) });
   if (!seeded.ok) throw new Error("plan record seed failed");
   trust = { [REPO]: PRIVATE, [KG_REPO]: PRIVATE };
   files = {
@@ -190,13 +187,6 @@ beforeEach(async () => {
   optIn();
   seedSession("sub");
   seedSession("sub2");
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  for (const suffix of ["", "-wal", "-shm"]) {
-    try { fs.unlinkSync(dbPath + suffix); } catch { /* ignore */ }
-  }
 });
 
 describe("legacy", () => {
@@ -523,7 +513,7 @@ describe("credential readiness", () => {
   });
 
   it("does not accept usable status alone: a subscription needs readable session state", async () => {
-    const status = (await import("../model-credentials.js")).getCredentialStatus(
+    const status = testDatabase.modules.credentials.getCredentialStatus(
       { projectKey: "AII", profileId: "sub", revision: 1, provider: "anthropic", authMode: "claude-subscription" },
       deps.credentials,
     );
@@ -672,7 +662,7 @@ describe("inspectAgentReadiness", () => {
     db.pragma("journal_mode = DELETE");
     db.pragma("busy_timeout = 1");
     const { default: Database } = await import("better-sqlite3");
-    const other = new Database(dbPath);
+    const other = new Database(testDatabase.path);
     other.exec("BEGIN EXCLUSIVE");
     try {
       expect(await prep.inspectAgentReadiness(request(), deps)).toEqual({ status: "not-ready", code: "resolution_unavailable" });

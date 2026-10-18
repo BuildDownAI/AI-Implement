@@ -1,7 +1,7 @@
-import { open as fsOpen, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile, chmod } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { open as fsOpen, mkdir, readFile, readdir, rm, stat, symlink, writeFile, chmod } from "node:fs/promises";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { ChatGptPlanRecordV1 } from "../chatgpt-plan-token.js";
 import {
   LocalAgentConfigError,
   LocalSessionOwnership,
@@ -11,6 +11,9 @@ import {
   type LocalAgentConfigFailure,
   type TerminationProof,
 } from "../local/agent-config.js";
+import { makeChatGptPlanRecord } from "./helpers/builders.js";
+import { fakeFetch, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
+import { testDir } from "./helpers/test-dir.js";
 
 const API_SECRET = "sk-synthetic-api-key-0000";
 const SESSION_SECRET = '{"synthetic":"session-0000"}';
@@ -89,7 +92,7 @@ function deferred<T = void>() {
 }
 
 beforeEach(async () => {
-  root = await mkdtemp(join(tmpdir(), "agent-config-"));
+  root = testDir("agent-config");
   await chmod(root, 0o700);
   repo = join(root, "repo");
   outside = join(root, "outside");
@@ -100,10 +103,6 @@ beforeEach(async () => {
   await privateFile(join(outside, "b.key"), "sk-synthetic-b");
   await privateFile(join(outside, "session.json"), SESSION_SECRET);
   diagnostics = [];
-});
-
-afterEach(async () => {
-  await rm(root, { recursive: true, force: true });
 });
 
 describe("loadLocalAgentConfig", () => {
@@ -502,21 +501,17 @@ describe("chatgpt-sign-in references", () => {
   const NEW_REFRESH = "rt-synthetic-rotated-0000";
   const recordPath = () => join(outside, "plan.json");
 
-  function record(overrides: Record<string, unknown> = {}) {
-    return {
-      version: 1, email: "a@example.com", issuer: "https://auth.openai.com", subject: "sub-1", clientId: "client-1",
-      extAgentHostId: "host-1", idToken: ID_TOKEN, accessToken: OLD_ACCESS, refreshToken: REFRESH_TOKEN, tokenType: "Bearer",
-      scopes: ["chatgpt.tokens.use.direct"], accessTokenExpiresAt: NOW + 10 * MIN, earliestRefreshAt: null, savedAt: NOW - MIN,
+  function record(overrides: Partial<ChatGptPlanRecordV1> = {}) {
+    return makeChatGptPlanRecord({
+      idToken: ID_TOKEN, accessToken: OLD_ACCESS, refreshToken: REFRESH_TOKEN, accessTokenExpiresAt: NOW + 10 * MIN, savedAt: NOW - MIN,
       ...overrides,
-    };
+    });
   }
 
-  function okResponse() {
-    return new Response(JSON.stringify({ access_token: NEW_ACCESS, refresh_token: NEW_REFRESH, id_token: ID_TOKEN, expires_in: 3600 }), { status: 200 });
-  }
-  function errResponse(status: number, error?: string) {
-    return new Response(JSON.stringify(error ? { error } : {}), { status });
-  }
+  /** OpenAI's token endpoint answering every refresh with `reply`. */
+  const tokenEndpoint = (reply: Reply): FakeFetch => fakeFetch({ "POST /api/accounts/oauth/token": reply });
+  const rotated: Reply = { json: { access_token: NEW_ACCESS, refresh_token: NEW_REFRESH, id_token: ID_TOKEN, expires_in: 3600 } };
+  const failed = (status: number, error?: string): Reply => ({ status, json: error ? { error } : {} });
 
   /** The base config with its subscription profile switched to a codex-subscription ChatGPT sign-in record. */
   function chatGptConfig() {
@@ -534,9 +529,10 @@ describe("chatgpt-sign-in references", () => {
     const cfg = chatGptConfig();
     const loaded = await loadLocalAgentConfig(opts(await writeConfig(cfg)));
     const ownership = new LocalSessionOwnership({ forbiddenRoots: [repo], onDiagnostic: (d) => diagnostics.push(d) });
+    // A test that passes no fetch makes no refresh call: an empty fake refuses one.
     const port = createLocalCredentialPort({
       references: loaded.references, forbiddenRoots: [repo], ownership, onDiagnostic: (d) => diagnostics.push(d),
-      io: { now: () => NOW, ...io },
+      io: { now: () => NOW, fetch: fakeFetch({}).fetch, ...io },
     });
     const sub = loaded.references.get("sub-a")!;
     return { loaded, ownership, port, sub };
@@ -569,24 +565,24 @@ describe("chatgpt-sign-in references", () => {
   });
 
   it("returns the current token without a refresh call when it has enough life", async () => {
-    const fetchMock = vi.fn();
-    const { ownership, port, sub } = await setup(record({ accessTokenExpiresAt: NOW + 56 * MIN }), { fetch: fetchMock });
+    const openai = fakeFetch({});
+    const { ownership, port, sub } = await setup(record({ accessTokenExpiresAt: NOW + 56 * MIN }), { fetch: openai.fetch });
     await ownership.acquire(sub);
     const secret = await load(port);
     expect(secret).toEqual({ kind: "chatgpt-access-token", accessToken: OLD_ACCESS, expiresAt: NOW + 56 * MIN });
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(openai.calls).toHaveLength(0);
   });
 
   it("refreshes when earliestRefreshAt has passed even if the token is fresh", async () => {
-    const fetchMock = vi.fn(async () => okResponse());
-    const { ownership, port, sub } = await setup(record({ accessTokenExpiresAt: NOW + 59 * MIN, earliestRefreshAt: NOW - 1 }), { fetch: fetchMock });
+    const openai = tokenEndpoint(rotated);
+    const { ownership, port, sub } = await setup(record({ accessTokenExpiresAt: NOW + 59 * MIN, earliestRefreshAt: NOW - 1 }), { fetch: openai.fetch });
     await ownership.acquire(sub);
     expect(await load(port)).toMatchObject({ accessToken: NEW_ACCESS });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(openai.calls).toHaveLength(1);
   });
 
   it("ok: writes the new record atomically and returns only the access token", async () => {
-    const { ownership, port, sub } = await setup(record(), { fetch: vi.fn(async () => okResponse()) });
+    const { ownership, port, sub } = await setup(record(), { fetch: tokenEndpoint(rotated).fetch });
     const lease = await ownership.acquire(sub);
     const secret = await load(port);
     expect(secret).toEqual({ kind: "chatgpt-access-token", accessToken: NEW_ACCESS, expiresAt: NOW + 3600_000 });
@@ -603,7 +599,7 @@ describe("chatgpt-sign-in references", () => {
 
   it("transient with more than 2 minutes left returns the old token and leaves the file unchanged", async () => {
     const original = JSON.stringify(record({ accessTokenExpiresAt: NOW + 2 * MIN + 1 }));
-    const { ownership, port, sub } = await setup(original, { fetch: vi.fn(async () => errResponse(503)) });
+    const { ownership, port, sub } = await setup(original, { fetch: tokenEndpoint(failed(503)).fetch });
     await ownership.acquire(sub);
     expect(await load(port)).toEqual({ kind: "chatgpt-access-token", accessToken: OLD_ACCESS, expiresAt: NOW + 2 * MIN + 1 });
     expect(await readFile(recordPath(), "utf8")).toBe(original);
@@ -611,7 +607,7 @@ describe("chatgpt-sign-in references", () => {
 
   it("transient with 2 minutes or less left fails credential_unreadable", async () => {
     const original = JSON.stringify(record({ accessTokenExpiresAt: NOW + 2 * MIN }));
-    const { ownership, port, sub } = await setup(original, { fetch: vi.fn(async () => errResponse(503)) });
+    const { ownership, port, sub } = await setup(original, { fetch: tokenEndpoint(failed(503)).fetch });
     await ownership.acquire(sub);
     await expectCategory(load(port), "credential_unreadable", secrets);
     expect(await readFile(recordPath(), "utf8")).toBe(original);
@@ -619,7 +615,7 @@ describe("chatgpt-sign-in references", () => {
 
   it("reauth_required fails authentication_required and names the login command", async () => {
     const original = JSON.stringify(record());
-    const { ownership, port, sub } = await setup(original, { fetch: vi.fn(async () => errResponse(400, "invalid_grant")) });
+    const { ownership, port, sub } = await setup(original, { fetch: tokenEndpoint(failed(400, "invalid_grant")).fetch });
     await ownership.acquire(sub);
     const error = await load(port).catch((e: unknown) => e);
     expect(error).toMatchObject({ category: "authentication_required" });
@@ -629,7 +625,7 @@ describe("chatgpt-sign-in references", () => {
 
   it("invalid_client fails config_invalid and leaves the file unchanged", async () => {
     const original = JSON.stringify(record());
-    const { ownership, port, sub } = await setup(original, { fetch: vi.fn(async () => errResponse(401, "invalid_client")) });
+    const { ownership, port, sub } = await setup(original, { fetch: tokenEndpoint(failed(401, "invalid_client")).fetch });
     await ownership.acquire(sub);
     await expectCategory(load(port), "config_invalid", secrets);
     expect(await readFile(recordPath(), "utf8")).toBe(original);
@@ -638,7 +634,7 @@ describe("chatgpt-sign-in references", () => {
   it("returns no token when the rename fails, and keeps the original record", async () => {
     const original = JSON.stringify(record());
     const { ownership, port, sub } = await setup(original, {
-      fetch: vi.fn(async () => okResponse()),
+      fetch: tokenEndpoint(rotated).fetch,
       rename: vi.fn(async () => { throw new Error(`boom ${NEW_REFRESH}`); }),
     });
     await ownership.acquire(sub);
@@ -649,7 +645,7 @@ describe("chatgpt-sign-in references", () => {
 
   it("returns no token when the directory sync fails", async () => {
     const { ownership, port, sub } = await setup(record(), {
-      fetch: vi.fn(async () => okResponse()),
+      fetch: tokenEndpoint(rotated).fetch,
       syncDir: vi.fn(async () => { throw new Error("sync"); }),
     });
     await ownership.acquire(sub);
@@ -667,13 +663,13 @@ describe("chatgpt-sign-in references", () => {
   });
 
   it("serializes concurrent loads so only one refresh runs", async () => {
-    const fetchMock = vi.fn(async () => okResponse());
-    const { ownership, port, sub } = await setup(record(), { fetch: fetchMock });
+    const openai = tokenEndpoint(rotated);
+    const { ownership, port, sub } = await setup(record(), { fetch: openai.fetch });
     await ownership.acquire(sub);
     const [a, b] = await Promise.all([load(port), load(port)]);
     expect(a).toMatchObject({ accessToken: NEW_ACCESS });
     expect(b).toMatchObject({ accessToken: NEW_ACCESS });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(openai.calls).toHaveLength(1);
   });
 
   it("rejects container persistence into a ChatGPT record", async () => {
