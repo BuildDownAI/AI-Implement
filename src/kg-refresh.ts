@@ -77,7 +77,7 @@ export interface RefreshOutcome {
   dispatchId?: string;
   /** Per-part {part, prev, new} rows from the push guard. Present on a dry-run outcome or a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638) when the runner reported one. */
   partTable?: Array<{ part: string; prev: string; new: string }>;
-  cause?: "shrink" | "tracker-missing";
+  cause?: "shrink" | "tracker-missing" | "source-failed";
   failedTeams?: string[];
   /** Skipped or failed teams that had served issues, when the run was held with Accept blocked. */
   lostTeams?: Array<{ team: string; servedIssues: number }>;
@@ -204,7 +204,7 @@ export interface KgRefreshStatus {
     triggerId: string;
     step: string | null;
     decisions: Array<"accept" | "cancel">;
-    held: { snapshotPr: number; snapshotPrUrl?: string; partTable: Array<{ part: string; prev: string; new: string }>; cause: "shrink" | "tracker-missing"; failedTeams: string[]; acceptBlocked: boolean; lostTeams: Array<{ team: string; servedIssues: number }>; sources: SourceResult[]; decideBy: number } | null;
+    held: { snapshotPr: number; snapshotPrUrl?: string; partTable: Array<{ part: string; prev: string; new: string }>; cause: "shrink" | "tracker-missing" | "source-failed"; failedTeams: string[]; acceptBlocked: boolean; lostTeams: Array<{ team: string; servedIssues: number }>; sources: SourceResult[]; decideBy: number } | null;
   } | null;
   /** The runner step in flight, when the workflow has one (AII-1134). */
   runnerStep?: { id: string; status: StepStatus };

@@ -233,6 +233,10 @@ export const kgPipelinesScript = `
   }
 
   function heldWhy(held) {
+    if (held.cause === 'source-failed') {
+      const failed = (Array.isArray(held.sources) ? held.sources : []).filter(function (s) { return s.status === 'failed' && s.kind !== 'tracker'; }).map(function (s) { return String(s.source); });
+      return 'Why: ' + (failed.length ? failed.join(', ') : 'a source') + ' failed, so the graph may be partial. Accept is blocked.';
+    }
     if (held.cause !== 'tracker-missing') return 'Why: a snapshot part shrank past the guard.';
     const teams = heldTeams(held);
     return teams.length

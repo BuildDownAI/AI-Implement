@@ -106,7 +106,7 @@ export interface KgRefreshReportBody {
   snapshotBranch?: string;
   partTable?: Array<{ part: string; prev: string; new: string }>;
   /** Absent on a report from a runner that predates the field; reads as "shrink". */
-  cause?: "shrink" | "tracker-missing";
+  cause?: "shrink" | "tracker-missing" | "source-failed";
   failedTeams?: string[];
   /** Absent from a runner that predates the field; reads as unblocked. */
   acceptBlocked?: boolean;
@@ -156,7 +156,7 @@ export interface KgRefreshHeldView {
   snapshotPr: number;
   partTable: Array<{ part: string; prev: string; new: string }>;
   /** Why the run waits. */
-  cause: "shrink" | "tracker-missing";
+  cause: "shrink" | "tracker-missing" | "source-failed";
   /** Teams whose tracker fetch failed; empty for a shrink. */
   failedTeams: string[];
   /** True when accepting would publish a graph without `lostTeams`' issues; the gate then offers cancel only. */

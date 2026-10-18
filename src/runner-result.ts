@@ -182,7 +182,7 @@ export async function postRunnerResult(params: {
   /** Per-part {part, prev, new} table from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
   partTable?: Array<{ part: string; prev: string; new: string }>;
   /** Why a held kg-refresh waits: a content shrink or missing tracker data. */
-  cause?: "shrink" | "tracker-missing";
+  cause?: "shrink" | "tracker-missing" | "source-failed";
   /** Teams whose tracker fetch failed, for a held kg-refresh. */
   failedTeams?: string[];
   /** True when accepting the held kg-refresh would drop a skipped or failed team's served issues. */
