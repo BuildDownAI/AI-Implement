@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { __clearWorkflowProbeCacheForTests } from "../workflow-probe.js";
 import { makeAppConfig } from "./helpers/builders.js";
 import { fakeFetch, hangUntilAborted, type Reply, type Routes } from "./helpers/fake-fetch.js";
-import { githubFile } from "./helpers/github-replies.js";
+import { githubFile } from "./helpers/replies/github.js";
 import { testDb } from "./helpers/test-db.js";
 
 const postWorkflowDispatch = vi.fn();

@@ -26,16 +26,16 @@ import type { GhSpawn } from "../pipeline/review-ledger.js";
 import type { ReviewFixMetadataV1 } from "../review-fix-contract.js";
 import { DEFAULT_MODEL } from "../pipeline/default-model.js";
 import { ClaudeCliExecutor } from "../pipeline/executor.js";
-import { NOW, SENTINEL_BEARER, envelopeEnv, fakeClient, makeGrant, makeSnapshot } from "./configured-run-fixture.js";
-import { GHA_CONTEXT, GHA_IMPLEMENT_WORKFLOWS, ghaGrant, ghaRunStepEnv, oldShapedRunEnv, stubRunEnv } from "./gha-handoff-fixture.js";
-import { CODEX_CHILD_GLOBAL, S_AMBIENT, S_CHATGPT, S_OPENAI, codexLoopback, installCodexChild, resetCodexChild } from "./codex-composition-fixture.js";
+import { NOW, SENTINEL_BEARER, envelopeEnv, fakeClient, makeGrant, makeSnapshot } from "./helpers/fixtures/configured-run.js";
+import { GHA_CONTEXT, GHA_IMPLEMENT_WORKFLOWS, ghaGrant, ghaRunStepEnv, oldShapedRunEnv, stubRunEnv } from "./helpers/fixtures/gha-handoff.js";
+import { CODEX_CHILD_GLOBAL, S_AMBIENT, S_CHATGPT, S_OPENAI, codexLoopback, installCodexChild, resetCodexChild } from "./helpers/fixtures/codex-composition.js";
 import { MODEL_AUTH_ROUTES } from "../model-auth-contract.js";
 import type { ModelAuthTransport } from "../model-auth-client.js";
 import { makeExecutor, makeFeedbackLoopOutputs, makeIssue, makeMapping, makeReviewFixRunConfig } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type Reply, type ReplyInit } from "./helpers/fake-fetch.js";
 import { testDir } from "./helpers/test-dir.js";
 
-// Passthrough except for the `codex` command while a test installs a fake child (see codex-composition-fixture.ts).
+// Passthrough except for the `codex` command while a test installs a fake child (see helpers/fixtures/codex-composition.ts).
 vi.mock("node:child_process", async (importOriginal) => {
   const real = await importOriginal<typeof import("node:child_process")>();
   const spawn = ((...a: Parameters<typeof real.spawn>) => {

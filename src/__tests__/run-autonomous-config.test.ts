@@ -10,7 +10,7 @@ import {
 } from "../run-autonomous.js";
 import { AgentStageError } from "../pipeline/stage-executor.js";
 import type { LLMExecutor } from "../pipeline/types.js";
-import { EXPECTED, NOW, SENTINEL_BEARER, envelopeEnv, fakeClient, makeGrant, makeSnapshot } from "./configured-run-fixture.js";
+import { EXPECTED, NOW, SENTINEL_BEARER, envelopeEnv, fakeClient, makeGrant, makeSnapshot } from "./helpers/fixtures/configured-run.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { DEFAULT_REVIEWER_SELECTION } from "../config.js";
 

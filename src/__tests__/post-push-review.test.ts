@@ -12,7 +12,7 @@ import type { ReviewerDefinition } from "../pipeline/reviewers/registry.js";
 import { REVIEWER_VERDICT_SCHEMA } from "../pipeline/reviewers/schema.js";
 import { DISPOSITIONS_FILE, buildDispositionInstructions, stableReviewFindingKey } from "../pipeline/finding-dispositions.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "../pipeline/cycle-summary.js";
-import { makeSnapshot } from "./configured-run-fixture.js";
+import { makeSnapshot } from "./helpers/fixtures/configured-run.js";
 import { createStageExecutor } from "../pipeline/stage-executor.js";
 import { makeContext } from "./helpers/builders.js";
 import { fakeFetch } from "./helpers/fake-fetch.js";

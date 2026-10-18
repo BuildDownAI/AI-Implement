@@ -1,6 +1,6 @@
 // fakeFetch routes and replies shaped like Linear's GraphQL API (AII-1076), for the responses several test files
-// fake the same way. See docs/unit-tests.md § Harnesses.
-import { fakeFetch, type FakeFetch, type Reply } from "./fake-fetch.js";
+// fake the same way. See ../README.md.
+import { fakeFetch, type FakeFetch, type Reply } from "../fake-fetch.js";
 
 /** One GraphQL response carrying `data`, as Linear's API answers a request that succeeds. */
 export function linearData(data: unknown): Reply {

@@ -12,7 +12,7 @@ import type { LLMExecutor, PipelineDefinition, StepModule } from "../pipeline/ty
 import { getDiff } from "../pipeline/steps/feedback-loop.js";
 import { makeExecutor } from "./helpers/builders.js";
 import { testDir } from "./helpers/test-dir.js";
-import { fakeClient, makeGrant, makeSnapshot } from "./configured-run-fixture.js";
+import { fakeClient, makeGrant, makeSnapshot } from "./helpers/fixtures/configured-run.js";
 import { encodeTrustedRunConfig, type ResolvedAgentSnapshotV1 } from "../run-config.js";
 
 function planningExecutorWithPlan() {

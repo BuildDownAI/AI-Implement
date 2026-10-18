@@ -7,7 +7,7 @@ import { REVIEWER_VERDICT_SCHEMA } from "../pipeline/reviewers/schema.js";
 import type { PipelineContextData } from "../pipeline/types.js";
 import { makeContext } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
-import { githubFile } from "./helpers/github-replies.js";
+import { githubFile } from "./helpers/replies/github.js";
 import { testDir } from "./helpers/test-dir.js";
 
 /** A pipeline context with `data`, and the clone step's outputs when given. */

@@ -12,10 +12,10 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConfiguredRunError, prepareConfiguredRun } from "../run-autonomous.js";
-import { NOW, SENTINEL_BEARER, makeSnapshot } from "./configured-run-fixture.js";
-import { S_AMBIENT, S_CHATGPT, S_OPENAI, codexLoopback } from "./codex-composition-fixture.js";
+import { NOW, SENTINEL_BEARER, makeSnapshot } from "./helpers/fixtures/configured-run.js";
+import { S_AMBIENT, S_CHATGPT, S_OPENAI, codexLoopback } from "./helpers/fixtures/codex-composition.js";
 import { MODEL_AUTH_ROUTES } from "../model-auth-contract.js";
-import { GHA_CONTEXT, GHA_IMPLEMENT_WORKFLOWS, GHA_POLICY, ghaGrant, ghaRunStepEnv } from "./gha-handoff-fixture.js";
+import { GHA_CONTEXT, GHA_IMPLEMENT_WORKFLOWS, GHA_POLICY, ghaGrant, ghaRunStepEnv } from "./helpers/fixtures/gha-handoff.js";
 import type { InvokeParams } from "../pipeline/types.js";
 
 const FLAG = "--dangerously-bypass-approvals-and-sandbox";
@@ -263,7 +263,7 @@ for (const file of GHA_IMPLEMENT_WORKFLOWS) {
 
 describe("planning workflow", () => {
   it("rejects a credentials namespace carrying the policy: planning can never be granted it", async () => {
-    const { GHA_PLAN_WORKFLOWS } = await import("./gha-handoff-fixture.js");
+    const { GHA_PLAN_WORKFLOWS } = await import("./helpers/fixtures/gha-handoff.js");
     for (const file of GHA_PLAN_WORKFLOWS) {
       const snapshot = makeSnapshot();
       const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: GHA_CONTEXT, policy: GHA_POLICY, callback: false });

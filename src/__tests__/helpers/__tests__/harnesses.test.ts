@@ -3,11 +3,11 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type Database from "better-sqlite3";
-import { testDir, testTempRoot } from "./test-dir.js";
-import { testDb } from "./test-db.js";
-import { fakeFetch, hangUntilAborted } from "./fake-fetch.js";
-import { githubError, githubFile } from "./github-replies.js";
-import { linearData, linearGraphql } from "./linear-replies.js";
+import { testDir, testTempRoot } from "../test-dir.js";
+import { testDb } from "../test-db.js";
+import { fakeFetch, hangUntilAborted } from "../fake-fetch.js";
+import { githubError, githubFile } from "../replies/github.js";
+import { linearData, linearGraphql } from "../replies/linear.js";
 
 // Cleanup runs after a test ends, so each "is gone" check lives in the test after the one that
 // created the directory. Tests in a file run in order unless marked concurrent, and none here is.
@@ -127,21 +127,21 @@ describe("testDb", () => {
     (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((r) => r.name);
 
   it("imports the requested modules after the reset, so they read the new database", async () => {
-    const { path, modules } = await testDb({ modules: { dedup: () => import("../../dedup.js") } });
+    const { path, modules } = await testDb({ modules: { dedup: () => import("../../../dedup.js") } });
 
     expect(modules.dedup.getDb().name).toBe(path);
     expect(process.env.DEDUP_DB_PATH).toBe(path);
   });
 
   it("creates the tables boot creates", async () => {
-    const { modules } = await testDb({ modules: { dedup: () => import("../../dedup.js") } });
+    const { modules } = await testDb({ modules: { dedup: () => import("../../../dedup.js") } });
 
     // One table from each end of initDbTables, plus one getDb() creates on open.
     expect(tableNames(modules.dedup.getDb())).toEqual(expect.arrayContaining(["mappings", "settings", "review_fix_evidence_tombstones", "dispatched"]));
   });
 
   it("with tables: \"none\", leaves the file unopened, and opening it creates only getDb()'s own tables", async () => {
-    const { path, modules } = await testDb({ tables: "none", modules: { dedup: () => import("../../dedup.js") } });
+    const { path, modules } = await testDb({ tables: "none", modules: { dedup: () => import("../../../dedup.js") } });
 
     expect(existsSync(path)).toBe(false);
     const tables = tableNames(modules.dedup.getDb());
@@ -155,14 +155,14 @@ describe("testDb", () => {
     let first: { path: string; handle: Database.Database };
 
     it("writes a row in the first test", async () => {
-      const { path, modules } = await testDb({ modules: { log: () => import("../../log.js"), dedup: () => import("../../dedup.js") } });
+      const { path, modules } = await testDb({ modules: { log: () => import("../../../log.js"), dedup: () => import("../../../dedup.js") } });
       modules.log.appendLog({ issueId: "issue-1" });
       first = { path, handle: modules.dedup.getDb() };
       expect(modules.log.listLog()).toHaveLength(1);
     });
 
     it("finds an empty database at a new path, and the first one closed and gone", async () => {
-      const { path, modules } = await testDb({ modules: { log: () => import("../../log.js") } });
+      const { path, modules } = await testDb({ modules: { log: () => import("../../../log.js") } });
 
       expect(path).not.toBe(first.path);
       expect(modules.log.listLog()).toEqual([]);
@@ -179,7 +179,7 @@ describe("testDb", () => {
     let created: string;
 
     it.fails("opens a database, then fails", async () => {
-      const { path, modules } = await testDb({ modules: { dedup: () => import("../../dedup.js") } });
+      const { path, modules } = await testDb({ modules: { dedup: () => import("../../../dedup.js") } });
       created = path;
       modules.dedup.getDb();
       throw new Error("the test fails after opening its database");
@@ -194,7 +194,7 @@ describe("testDb", () => {
     let reopenedHandle: Database.Database;
 
     it("restarts against the same file: the old handle closes and fresh modules see the earlier rows", async () => {
-      const db = await testDb({ modules: { log: () => import("../../log.js"), dedup: () => import("../../dedup.js") } });
+      const db = await testDb({ modules: { log: () => import("../../../log.js"), dedup: () => import("../../../dedup.js") } });
       db.modules.log.appendLog({ issueId: "before-restart" });
       const firstHandle = db.modules.dedup.getDb();
 
@@ -215,8 +215,8 @@ describe("testDb", () => {
   it("creates tables with the same init functions, in the same order, as main() at boot", () => {
     const source = (file: string) => readFileSync(join(import.meta.dirname, file), "utf8");
     // main() calls each as a bare statement; BOOT_TABLE_INITS calls each on its freshly imported module.
-    const boot = [...source("../../index.ts").matchAll(/^\s*(init\w+Tables?)\(\);/gm)].map((m) => m[1]);
-    const harness = [...source("test-db.ts").matchAll(/\.(init\w+Tables?)\(\)/g)].map((m) => m[1]);
+    const boot = [...source("../../../index.ts").matchAll(/^\s*(init\w+Tables?)\(\);/gm)].map((m) => m[1]);
+    const harness = [...source("../test-db.ts").matchAll(/\.(init\w+Tables?)\(\)/g)].map((m) => m[1]);
 
     expect(boot, "The pattern found no init calls in src/index.ts; update it to match main()'s").not.toEqual([]);
     expect(

@@ -185,7 +185,7 @@ npm run test:restate # src/__tests__/restate/**/*.restate.test.ts — one runtim
 
 **Vitest strips types without checking them, so `npm run typecheck` is what catches a type error in a test file.** Its second pass, `tsconfig.tests.json`, checks every `src/**/*.ts` file, test files included. A new test file is checked from the day it is added; never add a file to its `exclude` list, and keep the empty `exclude` key, since without it `extends` inherits `src/__tests__` from `tsconfig.json`.
 
-Build test fixtures with the shared builders in `src/__tests__/helpers/builders.ts`, and a test's database, fake `fetch` and temporary directories with the harnesses beside them (`testDb`, `fakeFetch`, `testDir`), not a new per-file copy; a type built as a fixture, or a harness need, that recurs in a third test file goes there ([docs/unit-tests.md](docs/unit-tests.md) § Fakes and fixtures).
+Build test fixtures with the shared builders in `src/__tests__/helpers/builders.ts`, and a test's database, fake `fetch` and temporary directories with the harnesses beside them (`testDb`, `fakeFetch`, `testDir`), not a new per-file copy; a type built as a fixture, or a harness need, that recurs in a third test file goes there ([src/__tests__/helpers/README.md](src/__tests__/helpers/README.md)).
 
 Fixing a bug: write the failing test first, then the fix, in one pull request — see [docs/bug-fix-tests.md](docs/bug-fix-tests.md).
 

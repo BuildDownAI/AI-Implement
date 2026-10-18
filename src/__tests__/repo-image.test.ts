@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveSessionImage, resolveDefaultRunnerImage, selectRunnerImageInput, resolveRunnerImageForDispatch, resolveChannelCommit, stripImageTag, isRunnerImageAllowed, RunnerImageNotAllowedError, __clearRepoImageCacheForTests } from "../repo-image.js";
 import * as settings from "../orchestrator-settings.js";
 import { fakeFetch, hangUntilAborted, type FakeFetch, type Reply, type Routes } from "./helpers/fake-fetch.js";
-import { githubFile } from "./helpers/github-replies.js";
+import { githubFile } from "./helpers/replies/github.js";
 
 const DEFAULT_IMAGE = "ghcr.io/builddownai/ai-implement-runner:latest";
 

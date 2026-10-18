@@ -5,7 +5,7 @@ import { buildIssueBranchName } from "../pipeline/branch-name.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { makeMapping } from "./helpers/builders.js";
 import { fakeFetch, type ReplyInit } from "./helpers/fake-fetch.js";
-import { githubError, githubFile } from "./helpers/github-replies.js";
+import { githubError, githubFile } from "./helpers/replies/github.js";
 
 const mockMapping = makeMapping();
 

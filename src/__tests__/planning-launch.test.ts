@@ -5,7 +5,7 @@ import path from "node:path";
 import type { RepoMapping } from "../config.js";
 import type { TicketIssue, TicketingProvider } from "../providers/types.js";
 import type { AppConfig } from "../index.js";
-import { makeGrant, makeSnapshot } from "./configured-run-fixture.js";
+import { makeGrant, makeSnapshot } from "./helpers/fixtures/configured-run.js";
 import { makeAppConfig, makeIssue, makeMapping, makeProvider } from "./helpers/builders.js";
 import { testDb } from "./helpers/test-db.js";
 

@@ -1,7 +1,7 @@
 // A fresh database for each test (AII-925). dedup.ts reads DEDUP_DB_PATH once, when it is first
 // imported, so a test gets its own database only by pointing the path elsewhere and then importing
 // every database module again after a registry reset. testDb() does both, in that order, and
-// cleans up when the test finishes. See docs/unit-tests.md § Harnesses.
+// cleans up when the test finishes. See README.md in this directory.
 import { join } from "node:path";
 import { onTestFinished, vi } from "vitest";
 import type * as DedupModule from "../../dedup.js";

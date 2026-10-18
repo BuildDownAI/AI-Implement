@@ -7,7 +7,7 @@ import {
   checkDiagnostics,
   checkCopyDrift,
   type WorkflowKey,
-} from "./helpers/workflow-input-contract.js";
+} from "./helpers/fixtures/workflow-input-contract.js";
 
 describe("workflow input allowlist (ADR 032)", () => {
   for (const key of Object.keys(INPUT_CONTRACT) as WorkflowKey[]) {

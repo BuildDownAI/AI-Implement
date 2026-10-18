@@ -38,7 +38,7 @@ import {
   streamSessionLogsUntilShellReady,
   validateLocalSessionBootstrap,
 } from "../local/session.js";
-import { makeSnapshot } from "./configured-run-fixture.js";
+import { makeSnapshot } from "./helpers/fixtures/configured-run.js";
 
 function makeExecFileMock(containerId = "abc123def456") {
   vi.mocked(rawExecFile).mockImplementation(

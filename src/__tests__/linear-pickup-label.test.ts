@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as OrchestratorSettingsModule from "../orchestrator-settings.js";
 import type { LinearProvider as LinearProviderClass } from "../providers/linear.js";
 import type { FakeFetch } from "./helpers/fake-fetch.js";
-import { linearData, linearGraphql } from "./helpers/linear-replies.js";
+import { linearData, linearGraphql } from "./helpers/replies/linear.js";
 import { testDb } from "./helpers/test-db.js";
 
 // AII-694: the Linear provider reads its pickup label from the settings table

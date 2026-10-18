@@ -1,10 +1,10 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { getMappings, initMappingsTable, upsertMapping } from "../../config.js";
-import { ProviderRegistry } from "../../providers/registry.js";
-import { validateReviewFixResultMetadata, validateScopedPrIdentity } from "../../review-fix-contract.js";
-import { decodeRunConfig, encodeRunConfig } from "../../run-config.js";
-import { FakeProvider } from "../providers/fake.js";
-import { testDb } from "./test-db.js";
+import { getMappings, initMappingsTable, upsertMapping } from "../../../config.js";
+import { ProviderRegistry } from "../../../providers/registry.js";
+import { validateReviewFixResultMetadata, validateScopedPrIdentity } from "../../../review-fix-contract.js";
+import { decodeRunConfig, encodeRunConfig } from "../../../run-config.js";
+import { FakeProvider } from "../../providers/fake.js";
+import { testDb } from "../test-db.js";
 import {
   makeAppConfig,
   makeAppendLogEntry,
@@ -19,7 +19,7 @@ import {
   makeReviewFixResult,
   makeReviewFixRunConfig,
   makeScopedPrIdentity,
-} from "./builders.js";
+} from "../builders.js";
 
 describe("makeMapping", () => {
   beforeAll(() => {
@@ -69,7 +69,7 @@ describe("makeJob", () => {
 
 describe("makeAppendLogEntry", () => {
   it("builds an entry the log stores and reads back unchanged, as a first dispatch", async () => {
-    const { log } = (await testDb({ modules: { log: () => import("../../log.js") } })).modules;
+    const { log } = (await testDb({ modules: { log: () => import("../../../log.js") } })).modules;
     const entry = makeAppendLogEntry();
     const job = log.getJobById(log.appendLog(entry));
     expect(job).toMatchObject({ ...entry, status: "dispatched", dispatchNumber: 1, groupingParent: false });

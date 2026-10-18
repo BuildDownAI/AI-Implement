@@ -10,9 +10,9 @@ import { fakeFetch } from "./helpers/fake-fetch.js";
 import { testDir } from "./helpers/test-dir.js";
 import { AgentRecoveryRequiredError } from "../pipeline/stage-executor.js";
 import { MODEL_AUTH_ROUTES } from "../model-auth-contract.js";
-import { EXPECTED, NOW, SENTINEL_BEARER, fakeClient, makeGrant } from "./configured-run-fixture.js";
-import { GHA_CONTEXT, GHA_PLAN_WORKFLOWS, ghaGrant, ghaRunStepEnv, oldShapedRunEnv, stubRunEnv } from "./gha-handoff-fixture.js";
-import { CODEX_CHILD_GLOBAL, S_AMBIENT, S_CHATGPT, S_OPENAI, codexLoopback, installCodexChild, installPlanningDriver, resetCodexChild } from "./codex-composition-fixture.js";
+import { EXPECTED, NOW, SENTINEL_BEARER, fakeClient, makeGrant } from "./helpers/fixtures/configured-run.js";
+import { GHA_CONTEXT, GHA_PLAN_WORKFLOWS, ghaGrant, ghaRunStepEnv, oldShapedRunEnv, stubRunEnv } from "./helpers/fixtures/gha-handoff.js";
+import { CODEX_CHILD_GLOBAL, S_AMBIENT, S_CHATGPT, S_OPENAI, codexLoopback, installCodexChild, installPlanningDriver, resetCodexChild } from "./helpers/fixtures/codex-composition.js";
 import { prepareConfiguredRun } from "../run-autonomous.js";
 import type { ModelAuthTransport } from "../model-auth-client.js";
 import type { InvokeParams, LLMResult } from "../pipeline/types.js";
@@ -26,7 +26,7 @@ vi.mock("../pipeline/steps/install-skills.js", async (importOriginal) => {
 });
 import { installSkills } from "../pipeline/steps/install-skills.js";
 
-// Passthrough except while a test installs the fake `codex` child / planning protocol driver (codex-composition-fixture.ts).
+// Passthrough except while a test installs the fake `codex` child / planning protocol driver (helpers/fixtures/codex-composition.ts).
 type CodexSlots = { spawn?: (...args: unknown[]) => unknown; driver?: unknown };
 const codexSlots = (): CodexSlots | undefined => (globalThis as unknown as Record<string, CodexSlots | undefined>)[CODEX_CHILD_GLOBAL];
 vi.mock("node:child_process", async (importOriginal) => {

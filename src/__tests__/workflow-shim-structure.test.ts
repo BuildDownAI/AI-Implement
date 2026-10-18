@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { parse } from "yaml";
-import { INPUT_CONTRACT } from "./helpers/workflow-input-contract.js";
+import { INPUT_CONTRACT } from "./helpers/fixtures/workflow-input-contract.js";
 import { GITHUB_WRITE_CREDENTIAL_KEYS } from "../pipeline/process-env.js";
 
 const IMPLEMENT_WORKFLOWS = [

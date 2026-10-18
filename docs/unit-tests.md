@@ -9,8 +9,8 @@ How the default test suite runs, what isolates it from the machine it runs on, w
 | `src/__tests__/` | Orchestrator and runner tests, mostly one file per module, with `admin/` and `providers/` subdirectories | `npm test` |
 | `src/__tests__/restate/` | Restate engine scenarios (`*.restate.test.ts`) | `npm run test:restate` only |
 | `src/__tests__/setup/` | The setup files both vitest configs load, the environment allowlist, and their tests | — |
-| `src/__tests__/helpers/` | Shared fixture builders, the test harnesses, and their tests | — |
-| `src/__tests__/fixtures/` | Static fixture data | — |
+| `src/__tests__/helpers/` | Shared fixture builders and the test harnesses at the top; one service's reply shapes in `replies/`; one subsystem's shared fixtures in `fixtures/`; their tests in `__tests__/` ([README](../src/__tests__/helpers/README.md)) | `npm test` (`__tests__/`) |
+| `src/__tests__/fixtures/` | Static fixture data: files a test reads or compares against | — |
 | `src/admin-ui/__tests__/` | The admin SPA's modules: its pages, auth, router and drawer | `npm test` |
 
 ## What `npm test` runs
@@ -80,30 +80,15 @@ The credential `beforeEach` in `clear-runner-credentials.ts` predates the scrub 
 
 ## Fakes and fixtures
 
+The shared builders, harnesses, service replies and subsystem fixtures live in `src/__tests__/helpers/`. [Its README](../src/__tests__/helpers/README.md) owns what each one does, how to use it, and where a new helper goes. This section holds the rules every fixture and fake follows, whatever builds it.
+
 ### Fixture builders
 
 `src/__tests__/helpers/builders.ts` holds one builder for each commonly built fixture type. Build a test's fixtures with them rather than a new per-file copy.
 
 **When a type gets a builder.** Once it is hand-built as a fixture, an input whose values do not matter to the test, in three or more test files. A value under test, such as a step a pipeline test runs or a failure record a classifier classifies, stays inline however often it repeats.
 
-**What a builder guarantees.** A builder returns a complete object of its type with neutral defaults, takes overrides for the fields a test cares about, and returns its type without a cast, so a field added to the type fails the type check at the builder wherever test files are type-checked (§ Type checking).
-
-**Reading a builder's failure.** A new required field fails the builder's object with TS2322, or with TS2345 where the object is passed to a constructor or a spy (`makeContext`, `makeExecutor`). The error's first line prints the whole object type; the indented lines beneath name the field, as `Types of property '…' are incompatible` rather than missing, because the overrides could supply it. Give the field a default in the builder. A changed `ProviderRegistry` constructor fails at the `super(...)` call in `makeRegistry`'s subclass (TS2554), and a renamed `forMapping` at that subclass's `override` (TS4113).
-
-**Where the defaults come from.** The defaults are literals, not the production `DEFAULT_*` constants: a test of what an unconfigured mapping gets calls the code that applies the default, not a builder. `builders.test.ts` passes each default through the code that consumes it where one exists, such as storing a mapping and reading it back, so a default cannot describe a state production never produces.
-
-Some defaults are not fixed literals. They change with each build, or they follow from other fields, as the real values do:
-
-| Builder | Field | Its value |
-|---|---|---|
-| `makeJob` | `dispatchedAt` | The clock when the object is built |
-| `makeReviewFixResult` | `deadlineAt` | An hour after the object is built |
-| `makeReviewFixRunConfig` | The attempt's `deadlineAt` | An hour after the object is built |
-| `makeReviewFixRunConfig` | The envelope's issue and PR number | The attempt it carries, as the review-fix worker derives them |
-| `makeAppendLogEntry` | `dispatchId` | Fresh for each build, as each real dispatch gets one |
-| `makeFeedbackLoopOutputs` | `passes`, `finalFeedback`, `terminationReason`, `failure` | `approved`, `iterations` and `terminationReason`: one pass per iteration, the last ending the way the step ends that kind of run (a `max_turns` pass is never reviewed, and a `provider_unavailable` run carries its `failure`) |
-
-Two builds of a clock or fresh-id field can differ, so a test that compares builds freezes the clock with `vi.setSystemTime` or overrides the field. A derived field agrees with the fields it follows from, so overriding those still yields a consistent object; a test that overrides the derived field itself describes a different object and owns its consistency.
+**What a builder guarantees.** A builder returns a complete object of its type with neutral defaults, takes overrides for the fields a test cares about, and returns its type without a cast, so a field added to the type fails the type check at the builder wherever test files are type-checked ([§ Type checking](#type-checking)).
 
 **Overriding a default.** Override a field only when the test depends on it: removing the override fails one of its tests, or leaves the fixture contradicting other data in the same test, such as a mapping whose repository differs from the job looked up under it.
 
@@ -115,65 +100,17 @@ Two builds of a clock or fresh-id field can differ, so a test that compares buil
 
 The same holds for a fake's replies: each must be one the real API or module can return, such as a vended token with the `expires_at` its route always sends.
 
-**Builders that are not plain data.** `makeProvider` returns a `TicketingProvider` whose every method is a spy typed by its own signature, and `makeExecutor` an `LLMExecutor` whose `invoke` is one, each with a safe default passed as the spy's implementation, so the default survives `mockReset`. `makeRegistry` returns a subclass of the real `ProviderRegistry` that overrides only `forMapping`: the class has private members, so no object literal satisfies its type without a cast, and the registry's other lookups still run their own code against the given providers. It takes either one `provider`, which every mapping resolves to, or `providers` keyed by tracker id, never both. A tracker missing from `providers` throws, as an unconstructable provider does in production, so the real `forAllMappings` skips it with a warning.
-
 **Per-file helpers.** A test file keeps a builder of its own only for what no other file shares. A wrapper fixes the values every test in one file uses and passes the rest to a shared builder, as `acmeBilling` in `review-fix-drain.test.ts` does over `makeMapping`; its fields still come from the shared builder, so a change to the type is still made in one place. A builder for a type only one file builds stays in that file, such as `makeKgPrCheck` in `webhook.test.ts`, and moves into `builders.ts` once a third file needs it. Type neither with `as unknown as <Type>`, which compiles whatever the type becomes.
 
 ### Fakes
 
-- **Injected seams.** Many modules that call a network or a client take an implementation parameter, such as `fetchImpl` or `getInstallationTokenImpl`, and tests pass a fake. For `fetchImpl`, pass a `fakeFetch` (§ Harnesses). For the others, reuse the fake in the module's existing test file before you write a new one ([bug-fix-tests.md](bug-fix-tests.md), step 1). Several functions that read the environment take it the same way, as an `env` parameter defaulting to `process.env`.
+- **Injected seams.** Many modules that call a network or a client take an implementation parameter, such as `fetchImpl` or `getInstallationTokenImpl`, and tests pass a fake. For `fetchImpl`, pass a `fakeFetch` ([§ Harnesses](#harnesses)). For the others, reuse the fake in the module's existing test file before you write a new one ([bug-fix-tests.md](bug-fix-tests.md), step 1). Several functions that read the environment take it the same way, as an `env` parameter defaulting to `process.env`.
 - **The stateful fake provider.** `FakeProvider` in `src/__tests__/providers/fake.ts` implements `TicketingProvider` in memory: it holds issues, moves them through the lifecycle verbs, and records comments and, when asked, calls. `src/__tests__/providers/contract.ts` is the contract suite it passes. Use it when a test needs a tracker that remembers; use `makeProvider` when a test controls or asserts individual calls.
 - **Module mocks.** `vi.mock` replaces a whole module. The test then exercises the mock, not the real module.
 
 ### Harnesses
 
-A builder makes a value a test passes in. A harness makes something the code under test reaches for by itself, and removes it when the test finishes. `src/__tests__/helpers/` holds these:
-
-| Harness | Gives a test | Replaces |
-|---|---|---|
-| `testDir(prefix?)`, `test-dir.ts` | An empty directory under the OS temp directory | `mkdtempSync` plus a removal list in `afterEach` |
-| `testTempRoot(prefix?)`, `test-dir.ts` | A `testDir` that the OS temp directory points at | Stubbing `TMPDIR`, `TEMP` and `TMP`, then restoring them by hand |
-| `testDb(options?)`, `test-db.ts` | Its own database file with every table boot creates, and the modules it asked for, imported against that file | Setting `DEDUP_DB_PATH`, `vi.resetModules()`, dynamic imports and table creation in `beforeEach`, then `closeDb()` and a file delete in `afterEach` |
-| `fakeFetch(routes)`, `fake-fetch.ts` | A `fetch` that answers from a route table and records every request | A per-file fake, or `vi.stubGlobal("fetch", vi.fn())` with queued replies |
-
-**How a harness cleans up.** Each one registers its cleanup with vitest's `onTestFinished`, which runs after the test and its `afterEach` hooks whether the test passed or failed, so the caller writes no `afterEach`. Call a harness from a test or a `beforeEach`. vitest throws "can only be called inside a test" from a `beforeAll` or a `describe` body, because the cleanup must belong to one test.
-
-**Naming.** A harness is named for what a test gets (`testDir`, `testDb`, `fakeFetch`), and the name says it belongs to a test, since it works only inside one. The `make*` prefix stays with the builders: plain data, buildable anywhere.
-
-**`testDir`.** It returns an empty directory, removed with everything in it when the test finishes. `prefix` goes into the directory's name (`ai-implement-<prefix>-…`), which identifies a leaked one.
-
-**`testTempRoot`.** For code that writes under `os.tmpdir()` itself rather than taking a directory, such as a background deploy's scratch directory or a container's secret env file. It creates a `testDir`, then points `TMPDIR`, `TEMP` and `TMP` at it, the variables `os.tmpdir()` reads first on POSIX and on Windows, so whatever the code creates there is removed with it. When the test finishes, each variable goes back to its earlier value, or is unset again, before the directory is removed. A `testDir` called after it lands inside it.
-
-**`testDb`.** `dedup.ts` resolves its database path once, when it is first imported. A test therefore gets its own database only by setting `DEDUP_DB_PATH`, resetting the module registry, and importing every database module again; `testDb` does these in that order, with the file inside a `testDir`. A test passes the modules it needs as loaders and gets them back, typed:
-
-```ts
-const MODULES = { log: () => import("../log.js"), hold: () => import("../deploy-hold.js") };
-let db: TestDb<typeof MODULES>;
-
-beforeEach(async () => {
-  db = await testDb({ modules: MODULES });
-});
-```
-
-Import these modules only through loaders. A static import at the top of the test file binds once, to the database `dedup.ts` opened first, and a registry reset cannot rebind it. By default `testDb` creates every table `main()` in `src/index.ts` creates at boot, through `BOOT_TABLE_INITS`; `harnesses.test.ts` fails when that list and `main()`'s calls differ, so a new table goes into both. It calls each table's init function on the real module, through `vi.importActual`, so a test file's `vi.mock` of one of those modules leaves table creation alone. A mock's factory runs once, and `vi.resetModules()` does not rebuild it. A mock that replaces the module has no init function for `testDb` to call. One that spreads the real module (`...(await importOriginal())`) hands out the functions of the copy its factory loaded, and that copy still uses the database `dedup.ts` had open at that moment, the same trap as a static import. Code under test that reaches any of those copied functions reads that database, not the test's. Two options cover the other cases:
-
-- `tables: "none"` leaves the file unopened, for a test of code that meets a missing table, or of an upgrade from an older schema the test writes first. A test can call `testDb` again for this beside the database its `beforeEach` made.
-- `db.reopen()` simulates a restart: it closes the database, resets the registry, creates the tables again, and returns freshly imported modules against the same file.
-
-When the test finishes, the database is closed, the previous `DEDUP_DB_PATH` is restored, and the directory is removed along with any `-wal` and `-shm` files beside the database.
-
-**`fakeFetch`.** A route key is `"<METHOD> <path>"`, matched against the request path without its query string. A reply is one of:
-
-- `{ status?, json?, text?, headers? }`, built into a fresh `Response` for each request, with status 200 by default;
-- a function of the recorded request that returns such an object or a `Response` it builds, for state kept between requests or a reply that depends on headers or the query. A function that throws makes `fetch` reject with what it threw, the way a network failure rejects; the request is still recorded, and the throw alone does not fail the test;
-- `hangUntilAborted`, exported beside `fakeFetch`: a reply that never answers, and rejects with the abort's reason once the caller's signal fires, as `fetch` does. It proves a request is bounded by its timeout;
-- a list of any of these, served one per request, in order.
-
-A reply shaped like one service's API that several test files need lives beside the harness, not in it: `githubFile(text)` in `github-replies.ts` answers as GitHub's contents API does for a file, with the text base64-encoded, `githubError(status, message)` beside it answers with the status and GitHub's error body (`message`, `documentation_url`, and the status as a string), and `linearGraphql(...replies)` in `linear-replies.ts` serves Linear's GraphQL endpoint one reply per request, each built with `linearData(data)`.
-
-Pass `fake.fetch` where a module takes `fetchImpl`, or call `fake.install()` when the code calls the global `fetch`; the original global comes back when the test finishes. `install()` returns the fake, so `const fake = fakeFetch(routes).install();` builds and installs it in one line, with no per-file helper. Each `install()` restores the global it replaced, and cleanups run last-registered first, so a test that installs a second fake over its `beforeEach`'s still ends on the original. Prefer `install()` to `vi.stubGlobal`, which stays in place until `vi.unstubAllGlobals()` because the vitest configs leave `unstubGlobals` off. `fake.calls` holds every request as received: method, URL, path, headers, body text, and the `AbortSignal` the caller passed, if any. A request no route matches, or one past the end of its route's list, throws to the caller and also fails the test when it finishes, naming the method and path. Production code often catches a failed `fetch`, and the test must not pass because it did.
-
-**When a test needs more.** Use what the harness offers first; a function reply covers most needs. Write the rest in the test file. A harness grows once three test files share the same new need, as a type gets a builder once three files build it. Two things override the count. A harness that breaks a promise it makes is fixed however few files hit it: `testDb` creates tables through the real modules because a test file's mock of a table's module left that table missing from the test's database. And many per-file workarounds around one harness are a sign it is missing something, so raise them rather than adding another. Growth keeps a harness general: what belongs to one service goes beside it, as `github-replies.ts` does.
+A builder makes a value a test passes in. A harness makes something the code under test reaches for by itself, a temporary directory (`testDir`), a database (`testDb`) or an HTTP API (`fakeFetch`), and removes it when the test finishes. Use one rather than setting that up and tearing it down by hand; the [helpers README](../src/__tests__/helpers/README.md#harnesses) covers how each one is used and what it guarantees.
 
 **Per-file helpers.** A test file keeps a helper over a harness for what only it needs, most often a function that installs `fakeFetch` with the routes one service answers in that file, each with the reply production's handler sends, such as `commentTriggerApi` in `webhook.test.ts`. `MockRequest` and `MockResponse`, a request and response pair for calling an HTTP handler directly, are still copied across the files that do so; they are not a harness yet.
 

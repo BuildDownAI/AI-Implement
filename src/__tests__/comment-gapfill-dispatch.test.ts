@@ -14,7 +14,7 @@ import type { RepoMapping } from "../config.js";
 import { makeMapping } from "./helpers/builders.js";
 import { fakeFetch, type Reply } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
-import { makeGrant, makeSnapshot } from "./configured-run-fixture.js";
+import { makeGrant, makeSnapshot } from "./helpers/fixtures/configured-run.js";
 
 type DrainInput = DrainModule.DrainCommentGapfillsInput;
 type CreateMachineFn = typeof FlyMachinesModule.createMachine;

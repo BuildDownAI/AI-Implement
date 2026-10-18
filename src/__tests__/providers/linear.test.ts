@@ -9,7 +9,7 @@ import {
 } from "../../linear-app-auth.js";
 import { makeIssue } from "../helpers/builders.js";
 import type { FakeFetch, Reply } from "../helpers/fake-fetch.js";
-import { linearData as data, linearGraphql } from "../helpers/linear-replies.js";
+import { linearData as data, linearGraphql } from "../helpers/replies/linear.js";
 
 // Linear auth lives in the linear-app-auth singleton now (not on ProviderConfig). Configure it
 // and seed a token before every test so the provider's requests carry `Bearer test-token`, and

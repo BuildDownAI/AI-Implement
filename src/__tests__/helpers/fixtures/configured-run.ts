@@ -1,9 +1,9 @@
 /** Synthetic fixtures for opted-in runner tests. No real credential, network or paid model call. */
 import { vi } from "vitest";
-import type { ModelAuthClient, ModelInvocation } from "../model-auth-client.js";
-import type { ModelAuthGrantBootstrapV1 } from "../model-auth-contract.js";
-import { encodeTrustedRunConfig, type ResolvedAgentSnapshotV1 } from "../run-config.js";
-import type { AccountAuthMode } from "../agent-config.js";
+import type { ModelAuthClient, ModelInvocation } from "../../../model-auth-client.js";
+import type { ModelAuthGrantBootstrapV1 } from "../../../model-auth-contract.js";
+import { encodeTrustedRunConfig, type ResolvedAgentSnapshotV1 } from "../../../run-config.js";
+import type { AccountAuthMode } from "../../../agent-config.js";
 
 export const SENTINEL_BEARER = "SENTINELbearer0123456789abcdefghijklmnop";
 export const NOW = 1_700_000_000_000;

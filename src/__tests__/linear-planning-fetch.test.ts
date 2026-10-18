@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { fetchPlanningContext } from "../linear-planning-fetch.js";
 import { configureLinearAuth, __setLinearTokenForTest } from "../linear-app-auth.js";
 import type { Reply } from "./helpers/fake-fetch.js";
-import { linearData, linearGraphql as linear } from "./helpers/linear-replies.js";
+import { linearData, linearGraphql as linear } from "./helpers/replies/linear.js";
 
 beforeEach(() => {
   configureLinearAuth("client-id", "client-secret");
