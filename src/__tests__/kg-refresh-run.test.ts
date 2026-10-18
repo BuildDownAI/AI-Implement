@@ -1354,6 +1354,31 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
     expect(err.prNumber).toBe(42);
   });
 
+  it("an unreadable served issue.nt counts the failed team as lost: the live run never publishes", async () => {
+    const clonedRef = setupShrink(
+      { "issue.nt": teamIssues("X", 100), "doc.nt": makeLines(10) },
+      { "issue.nt": teamIssues("OTHER", 5), "doc.nt": makeLines(10) },
+    );
+    // Make `git show <clonedRef>:snapshot/parts/issue.nt` fail by dropping its blob from the clone.
+    const blob = execSync(`git rev-parse ${clonedRef}:snapshot/parts/issue.nt`, { cwd: tmpDir }).toString().trim();
+    execSync("git repack -a -d -q", { cwd: tmpDir, stdio: "ignore" });
+    const packDir = join(tmpDir, ".git", "objects", "pack");
+    const stash = mkdtempSync(join(tmpdir(), "kg-pack-"));
+    execSync(`mv "${packDir}"/* "${stash}"/ && for p in "${stash}"/*.pack; do git unpack-objects -q < "$p"; done`, { cwd: tmpDir, stdio: "ignore" });
+    rmSync(stash, { recursive: true, force: true });
+    rmSync(join(tmpDir, ".git", "objects", blob.slice(0, 2), blob.slice(2)), { force: true });
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X"], issueCount: 0 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    // Fail closed: either the hold with an unknown count or a clear read error, never a push.
+    expect(err).toBeInstanceOf(Error);
+    if (err instanceof KgSnapshotHeldError) {
+      expect(err.acceptBlocked).toBe(true);
+      expect(err.lostTeams).toEqual([{ team: "X", servedIssues: -1 }]);
+    }
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
   it("a failed team with no served issues plus an unrelated issue.nt shrink still holds in a live run", async () => {
     const clonedRef = setupShrink(
       { "issue.nt": teamIssues("OTHER", 50), "doc.nt": makeLines(10) },

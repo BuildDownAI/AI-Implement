@@ -94,6 +94,7 @@ export class KgSnapshotHeldError extends Error {
 /** A skipped or failed tracker team whose issues the served snapshot carries. */
 export interface LostTeam {
   team: string;
+  /** Issue count in the served snapshot; -1 when the served issue.nt could not be read, which counts as lost. */
   servedIssues: number;
 }
 
@@ -618,12 +619,15 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
         const issueShow = spawnSync(
           "git",
           ["show", `${clonedRef}:snapshot/parts/issue.nt`],
-          { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 },
+          { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 1024 * 1024 * 1024 },
         );
-        const servedIssueNt = issueShow.status === 0 ? issueShow.stdout.toString() : "";
+        // Only a clone that carries issue.nt can serve issues; a failed read of one that does is unknown, and unknown counts as lost.
+        const hasServedIssueNt = previousTrackerFiles.some((f) => f.trim().endsWith("/issue.nt"));
+        const readFailed = hasServedIssueNt && (issueShow.status !== 0 || issueShow.error != null);
+        const servedIssueNt = hasServedIssueNt && !readFailed ? issueShow.stdout.toString() : "";
         for (const team of affectedTeams) {
-          const servedIssues = countTeamIssues(servedIssueNt, team);
-          if (servedIssues > 0) lostTeams.push({ team, servedIssues });
+          const servedIssues = readFailed ? -1 : countTeamIssues(servedIssueNt, team);
+          if (servedIssues !== 0) lostTeams.push({ team, servedIssues });
           else emptyTeams.push(team);
         }
       }
@@ -851,7 +855,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     const guardVerdictText = held
       ? heldCause === "tracker-missing"
         ? acceptBlocked
-          ? "held — accepting would drop served issues of: " + lostTeams.map((t) => `${t.team} (${t.servedIssues})`).join(", ")
+          ? "held — accepting would drop served issues of: " + lostTeams.map((t) => `${t.team} (${t.servedIssues < 0 ? "unknown" : t.servedIssues})`).join(", ")
           : "held — tracker data is missing and the run waits for an operator decision"
         : "held — a shrink waits for an operator decision"
       : warnings.length > 0
