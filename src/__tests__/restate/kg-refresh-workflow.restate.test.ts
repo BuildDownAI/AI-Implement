@@ -3454,6 +3454,67 @@ describe("KgRefresh durable workflow", () => {
       60_000,
     );
 
+    const BLOCKED_REPORT = {
+      ...HELD_REPORT, cause: "tracker-missing", failedTeams: ["X"], acceptBlocked: true,
+      lostTeams: [{ team: "X", servedIssues: 40 }],
+    } as KgRefreshReportBody;
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "an acceptBlocked held run offers only cancel, and cancel closes the held PR (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env, { report: BLOCKED_REPORT });
+        const open = await callWorkflow<{ decisions: string[]; held: { acceptBlocked: boolean; lostTeams: unknown[] } }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
+        expect(open.decisions).toEqual(["cancel"]);
+        expect(open.held).toMatchObject({ acceptBlocked: true, lostTeams: [{ team: "X", servedIssues: 40 }] });
+
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ada@example.com" });
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
+        await closeRowFor(triggerId);
+      },
+      60_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "accept on an acceptBlocked run answers accept-blocked and the run stays at the gate (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env, { report: BLOCKED_REPORT });
+        await expect(
+          callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ada@example.com" }),
+        ).rejects.toThrow(/409.*accept-blocked/);
+        const after = await callWorkflow<{ step: string; decisions: string[] }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
+        expect(after).toMatchObject({ step: "decision", decisions: ["cancel"] });
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
+
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ada@example.com" });
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        await closeRowFor(triggerId);
+      },
+      60_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "a held shrink without acceptBlocked still offers both decisions (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const triggerId = await holdRun(env);
+        const open = await callWorkflow<{ decisions: string[]; held: { acceptBlocked: boolean; lostTeams: unknown[] } }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
+        expect(open.decisions).toEqual(["accept", "cancel"]);
+        expect(open.held).toMatchObject({ acceptBlocked: false, lostTeams: [] });
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ada@example.com" });
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        await closeRowFor(triggerId);
+      },
+      60_000,
+    );
+
     it.each(VARIANTS.flatMap(([label]) => [[label, "decide"], [label, "cancel"]] as const))(
       "%s: a %s cancel closes the PR as operator_cancelled and records it once",
       async (label, via) => {
@@ -3725,7 +3786,7 @@ describe("KgRefresh durable workflow", () => {
         await waitForStep(() => readStatus(env.baseUrl(), triggerId), "decision");
         const open = await callWorkflow<{ decisions: string[]; held: unknown }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
         expect(open.decisions).toEqual(["accept", "cancel"]);
-        expect(open.held).toEqual({ snapshotPr: 77, partTable: [{ part: "graph", prev: "100", new: "40" }], cause: "shrink", failedTeams: [], sources: [], decideBy: expect.any(Number) });
+        expect(open.held).toEqual({ snapshotPr: 77, partTable: [{ part: "graph", prev: "100", new: "40" }], cause: "shrink", failedTeams: [], acceptBlocked: false, lostTeams: [], sources: [], decideBy: expect.any(Number) });
 
         await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ada@example.com" });
         const after = await callWorkflow<{ decisions: string[] }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});

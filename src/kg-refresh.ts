@@ -79,6 +79,10 @@ export interface RefreshOutcome {
   partTable?: Array<{ part: string; prev: string; new: string }>;
   cause?: "shrink" | "tracker-missing";
   failedTeams?: string[];
+  /** Skipped or failed teams that had served issues, when the run was held with Accept blocked. */
+  lostTeams?: Array<{ team: string; servedIssues: number }>;
+  /** Warnings on a run that completed or was held (skipped or failed tracker teams). */
+  warnings?: string[];
   /** Per-source results (tracker teams, repos, docs sites); absent on older records. */
   sources?: SourceResult[];
   /** Every runner step the workflow saw, in pipeline order (AII-1134); absent when the runner reported none. */
@@ -200,7 +204,7 @@ export interface KgRefreshStatus {
     triggerId: string;
     step: string | null;
     decisions: Array<"accept" | "cancel">;
-    held: { snapshotPr: number; snapshotPrUrl?: string; partTable: Array<{ part: string; prev: string; new: string }>; cause: "shrink" | "tracker-missing"; failedTeams: string[]; sources: SourceResult[]; decideBy: number } | null;
+    held: { snapshotPr: number; snapshotPrUrl?: string; partTable: Array<{ part: string; prev: string; new: string }>; cause: "shrink" | "tracker-missing"; failedTeams: string[]; acceptBlocked: boolean; lostTeams: Array<{ team: string; servedIssues: number }>; sources: SourceResult[]; decideBy: number } | null;
   } | null;
   /** The runner step in flight, when the workflow has one (AII-1134). */
   runnerStep?: { id: string; status: StepStatus };

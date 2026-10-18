@@ -663,11 +663,14 @@ describe("kgSnapshotPushStep — tracker regression guard", () => {
     mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
     writeFileSync(join(tmpDir, "snapshot", "parts", "issue.nt"), "<s> <p> <o> .\n");
     writeFileSync(join(tmpDir, "snapshot", "parts", "comment.nt"), "<s> <p> <o> .\n");
+    // A non-tracker part that vanishes is a hard regression, so the dry run still refuses.
+    writeFileSync(join(tmpDir, "snapshot", "parts", "doc.nt"), "<s> <p> <o> .\n");
     writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
     writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-01-01T00:00:00Z");
     execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
     execSync("git commit -m 'snapshot with tracker parts'", { cwd: tmpDir, stdio: "ignore" });
     const clonedRef = resolveHead(tmpDir);
+    rmSync(join(tmpDir, "snapshot", "parts", "doc.nt"));
 
     const ctx = makeContext();
     ctx.setOutputs("kg-tracker-data", { fetched: false, issueCount: 0 });
@@ -747,9 +750,11 @@ describe("kgSnapshotPushStep — tracker regression guard", () => {
     initGitRepo(tmpDir);
     mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
     writeFileSync(join(tmpDir, "snapshot", "parts", "issue.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "parts", "doc.nt"), "<s> <p> <o> .\n");
     execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
     execSync("git commit -m 'snapshot with tracker parts'", { cwd: tmpDir, stdio: "ignore" });
     const clonedRef = resolveHead(tmpDir);
+    rmSync(join(tmpDir, "snapshot", "parts", "doc.nt"));
 
     const ctx = makeContext();
     // Intentionally do NOT set kg-tracker-data outputs → getOutputs returns {}
@@ -1105,6 +1110,11 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
     };
   }
 
+  /** One issue per line, each carrying the `trackerTeam` literal the step counts. */
+  function teamIssues(team: string, n: number): string {
+    return Array.from({ length: n }, (_, i) => `<urn:issue:${team}-${i}> <https://example.com/onto#trackerTeam> "${team}" .\n`).join("");
+  }
+
   function setupShrink(parts: Record<string, string>, shrunk: Record<string, string>): string {
     initGitRepo(tmpDir);
     commitPreviousSnapshot(parts);
@@ -1209,8 +1219,8 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
 
   it("tracker data missing (fetched=false) pushes, opens the PR with a warning naming the failed teams, and holds", async () => {
     const clonedRef = setupShrink(
-      { "issue.nt": makeLines(100), "comment.nt": makeLines(50) },
-      { "issue.nt": makeLines(100), "comment.nt": makeLines(50) },
+      { "issue.nt": teamIssues("X", 100), "comment.nt": makeLines(50) },
+      { "issue.nt": teamIssues("X", 100), "comment.nt": makeLines(50) },
     );
     stubPrCreate(31, "https://github.com/acme/kg-repo/pull/31");
     const ctx = makeContext();
@@ -1219,6 +1229,8 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
     expect(err).toBeInstanceOf(KgSnapshotHeldError);
     expect(err.cause).toBe("tracker-missing");
     expect(err.failedTeams).toEqual(["X"]);
+    expect(err.acceptBlocked).toBe(true);
+    expect(err.lostTeams).toEqual([{ team: "X", servedIssues: 100 }]);
     expect(err.prNumber).toBe(31);
     expect(err.partTable).toEqual(expect.arrayContaining([
       { part: "comment.nt", prev: "50", new: "50" },
@@ -1233,7 +1245,7 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
 
   it("a tracker part missing from the new tree counts as held when tracker data is missing", async () => {
     const clonedRef = setupShrink(
-      { "issue.nt": makeLines(100), "docs.nt": makeLines(10) },
+      { "issue.nt": teamIssues("X", 100), "docs.nt": makeLines(10) },
       { "docs.nt": makeLines(10) },
     );
     rmSync(join(tmpDir, "snapshot", "parts", "issue.nt"));
@@ -1271,17 +1283,127 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
     expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
   });
 
-  it("tracker data missing in a dry run refuses with the part table and pushes nothing", async () => {
+  it("tracker data missing in a dry run completes with warnings, the part table and sources, and pushes nothing", async () => {
     initGitRepo(tmpDir);
-    commitPreviousSnapshot({ "issue.nt": makeLines(100) });
+    commitPreviousSnapshot({ "issue.nt": teamIssues("X", 100) });
     const clonedRef = resolveHead(tmpDir);
-    writeWorkingTree({ "issue.nt": makeLines(100) });
+    writeWorkingTree({ "issue.nt": teamIssues("X", 100) });
+    const ctx = makeContext();
+    const teamResults = [{ source: "tracker:X", kind: "tracker", status: "failed", reason: "boom", counts: {} }];
+    ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X"], issueCount: 0, teamResults });
+    const result = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef, dryRun: true }), noopReporter);
+    expect(result.guardVerdict).toBe("warnings");
+    expect(result.snapshotPushed).toBe(false);
+    expect(result.partTable).toEqual([{ part: "issue.nt", prev: "100", new: "100" }]);
+    expect(result.warnings?.[0]).toContain("X");
+    expect(result.sources).toEqual(teamResults);
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
+  it("a dry run with a failed team and a missing non-tracker part still refuses", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "issue.nt": teamIssues("X", 10), "doc.nt": makeLines(10) });
+    const clonedRef = resolveHead(tmpDir);
+    writeWorkingTree({ "issue.nt": teamIssues("X", 10) });
+    rmSync(join(tmpDir, "snapshot", "parts", "doc.nt"), { force: true });
     const ctx = makeContext();
     ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X"], issueCount: 0 });
     const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef, dryRun: true }), noopReporter).catch((e) => e);
     expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
-    expect(err.partTable).toEqual([{ part: "issue.nt", prev: "100", new: "100" }]);
+  });
+
+  it("a live run whose failed team has no served issues publishes with a warning naming the team", async () => {
+    const clonedRef = setupShrink(
+      { "issue.nt": teamIssues("OTHER", 5), "doc.nt": makeLines(10) },
+      { "issue.nt": teamIssues("OTHER", 5), "doc.nt": makeLines(10) },
+    );
+    stubPrCreate(41, "https://github.com/acme/kg-repo/pull/41");
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X"], issueCount: 0 });
+    const result = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter);
+    expect(result.snapshotPushed).toBe(true);
+    expect(result.prNumber).toBe(41);
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings?.[0]).toContain("X");
+    const init = vi.mocked(fetch).mock.calls[0][1] as RequestInit;
+    expect((JSON.parse(init.body as string) as { body: string }).body).toContain("X");
+  });
+
+  it("a skipped team (in teamResults only) with served issues holds with Accept blocked; the count reads the clone, not the working tree", async () => {
+    const clonedRef = setupShrink(
+      { "issue.nt": teamIssues("AB", 40) + teamIssues("ABC", 7), "doc.nt": makeLines(10) },
+      // The working tree already lost the team's issues; the count must not read it.
+      { "issue.nt": teamIssues("ABC", 7), "doc.nt": makeLines(10) },
+    );
+    stubPrCreate(42, "https://github.com/acme/kg-repo/pull/42");
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", {
+      fetched: true,
+      failedTeams: [],
+      issueCount: 7,
+      teamResults: [
+        { source: "tracker:AB", kind: "tracker", status: "skipped", reason: "no mapping", counts: {} },
+        { source: "tracker:ABC", kind: "tracker", status: "success", reason: "", counts: { issues: 7 } },
+      ],
+    });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotHeldError);
+    expect(err.cause).toBe("tracker-missing");
+    expect(err.acceptBlocked).toBe(true);
+    expect(err.lostTeams).toEqual([{ team: "AB", servedIssues: 40 }]);
+    expect(err.prNumber).toBe(42);
+  });
+
+  it("an unreadable served issue.nt counts the failed team as lost: the live run never publishes", async () => {
+    const clonedRef = setupShrink(
+      { "issue.nt": teamIssues("X", 100), "doc.nt": makeLines(10) },
+      { "issue.nt": teamIssues("OTHER", 5), "doc.nt": makeLines(10) },
+    );
+    // Make `git show <clonedRef>:snapshot/parts/issue.nt` fail by dropping its blob from the clone.
+    const blob = execSync(`git rev-parse ${clonedRef}:snapshot/parts/issue.nt`, { cwd: tmpDir }).toString().trim();
+    execSync("git repack -a -d -q", { cwd: tmpDir, stdio: "ignore" });
+    const packDir = join(tmpDir, ".git", "objects", "pack");
+    const stash = mkdtempSync(join(tmpdir(), "kg-pack-"));
+    execSync(`mv "${packDir}"/* "${stash}"/ && for p in "${stash}"/*.pack; do git unpack-objects -q < "$p"; done`, { cwd: tmpDir, stdio: "ignore" });
+    rmSync(stash, { recursive: true, force: true });
+    rmSync(join(tmpDir, ".git", "objects", blob.slice(0, 2), blob.slice(2)), { force: true });
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X"], issueCount: 0 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    // Fail closed, never a push. The part-count guard no longer dies on the unreadable blob itself;
+    // the fixture's missing blob still breaks the later commit, which is a git failure, not a read crash.
+    expect(err).toBeInstanceOf(Error);
+    expect(String((err as Error).message)).not.toMatch(/git show failed reading previous/);
     expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
+  it("a failed team with no served issues plus an unrelated issue.nt shrink still holds in a live run", async () => {
+    const clonedRef = setupShrink(
+      { "issue.nt": teamIssues("OTHER", 50), "doc.nt": makeLines(10) },
+      { "issue.nt": teamIssues("OTHER", 30), "doc.nt": makeLines(10) },
+    );
+    stubPrCreate(44, "https://github.com/acme/kg-repo/pull/44");
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X"], issueCount: 0 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotHeldError);
+    expect(err.cause).toBe("tracker-missing");
+    expect(err.acceptBlocked).toBe(false);
+    expect(err.lostTeams).toEqual([]);
+  });
+
+  it("mixed teams: lostTeams lists only the team with served issues", async () => {
+    const clonedRef = setupShrink(
+      { "issue.nt": teamIssues("A", 3), "doc.nt": makeLines(10) },
+      { "issue.nt": teamIssues("A", 3), "doc.nt": makeLines(10) },
+    );
+    stubPrCreate(43, "https://github.com/acme/kg-repo/pull/43");
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["A", "B"], issueCount: 0 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotHeldError);
+    expect(err.lostTeams).toEqual([{ team: "A", servedIssues: 3 }]);
+    expect(err.acceptBlocked).toBe(true);
   });
 
   it("a dry run with a soft-only shrink refuses with the table and never holds", async () => {
@@ -5495,11 +5617,14 @@ describe("kgSnapshotPushStep — dryRun flag", () => {
     mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
     writeFileSync(join(tmpDir, "snapshot", "parts", "issue.nt"), "<s> <p> <o> .\n");
     writeFileSync(join(tmpDir, "snapshot", "parts", "comment.nt"), "<s> <p> <o> .\n");
+    // A non-tracker part that vanishes is a hard regression, so the dry run still refuses.
+    writeFileSync(join(tmpDir, "snapshot", "parts", "doc.nt"), "<s> <p> <o> .\n");
     writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
     writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-01-01T00:00:00Z");
     execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
     execSync("git commit -m 'snapshot with tracker parts'", { cwd: tmpDir, stdio: "ignore" });
     const clonedRef = resolveHead(tmpDir);
+    rmSync(join(tmpDir, "snapshot", "parts", "doc.nt"));
 
     const ctx = makeContext();
     ctx.setOutputs("kg-tracker-data", { fetched: false, issueCount: 0 });

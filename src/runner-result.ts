@@ -178,13 +178,19 @@ export async function postRunnerResult(params: {
   /** The `kg-refresh/<stamp>` branch the snapshot was pushed to; the orchestrator deletes it after merge or close. */
   snapshotBranch?: string | null;
   /** Guard verdict from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
-  guardVerdict?: "clean" | "refused" | "held";
+  guardVerdict?: "clean" | "warnings" | "refused" | "held";
   /** Per-part {part, prev, new} table from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
   partTable?: Array<{ part: string; prev: string; new: string }>;
   /** Why a held kg-refresh waits: a content shrink or missing tracker data. */
   cause?: "shrink" | "tracker-missing";
   /** Teams whose tracker fetch failed, for a held kg-refresh. */
   failedTeams?: string[];
+  /** True when accepting the held kg-refresh would drop a skipped or failed team's served issues. */
+  acceptBlocked?: boolean;
+  /** Skipped or failed teams with issues in the served snapshot, for a blocked kg-refresh hold. */
+  lostTeams?: Array<{ team: string; servedIssues: number }>;
+  /** Warnings on a kg-refresh that completed: skipped or failed tracker teams with no served issues. */
+  warnings?: string[];
   /** Per-source results of a kg-refresh (tracker teams, repos, docs sites). */
   sources?: SourceResult[];
   /**
@@ -257,6 +263,9 @@ export async function postRunnerResult(params: {
   if (params.cause) body.cause = params.cause;
   if (params.failedTeams) body.failedTeams = params.failedTeams;
   if (params.sources) body.sources = params.sources;
+  if (params.acceptBlocked) body.acceptBlocked = params.acceptBlocked;
+  if (params.lostTeams) body.lostTeams = params.lostTeams;
+  if (params.warnings) body.warnings = params.warnings;
   if (params.reviewFix) body.reviewFix = params.reviewFix;
   const url = `${callbackUrl.replace(/\/$/, "")}/runner/result`;
   const headers = { "Content-Type": "application/json", Authorization: `Bearer ${runToken}` };

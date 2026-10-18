@@ -651,6 +651,15 @@ describe("kg current run card (AII-1260)", () => {
     expect(m.doc.getElementById("kg-refresh-badge")?.textContent).toContain("awaiting decision");
   });
 
+  it("acceptBlocked held run (decisions: cancel only): held card renders, Accept hidden", async () => {
+    const m = mount({ currentRun: { triggerId: "t", step: "decision", decisions: ["cancel"], held }, stage: "awaiting-decision" });
+    await m.win.loadKgStatus();
+    const cur = m.doc.getElementById("kg-current-run") as HTMLElement;
+    expect(cur.textContent).toContain("Held for a decision until ");
+    expect(cur.querySelector("a[href^=\"https\"]")?.getAttribute("href")).toBe("https://github.com/o/kg/pull/7");
+    expect(m.visibleButtons()).toEqual(["Cancel"]);
+  });
+
   it("deployHeld 200 with a held run: Accept and Cancel stay enabled, Refresh disabled, deploy notice shown", async () => {
     const m = mount({ currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held }, stage: "awaiting-decision", deployHeld: true });
     await m.win.loadKgStatus();

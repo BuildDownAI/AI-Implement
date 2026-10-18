@@ -251,7 +251,7 @@ export const kgPipelinesScript = `
     el.textContent = '';
     if (!run) { el.hidden = true; return; }
     el.hidden = false;
-    const held = stage === 'awaiting-decision' && decisions.indexOf('accept') >= 0 && run.held ? run.held : null;
+    const held = stage === 'awaiting-decision' && run.held ? run.held : null;
     const head = document.createElement('div');
     if (!held) {
       head.textContent = 'Run in flight' + (run.step ? ': ' + run.step : '');
