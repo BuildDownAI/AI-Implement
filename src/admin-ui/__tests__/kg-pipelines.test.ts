@@ -651,6 +651,15 @@ describe("kg current run card (AII-1260)", () => {
     expect(m.doc.getElementById("kg-refresh-badge")?.textContent).toContain("awaiting decision");
   });
 
+  it("acceptBlocked held run (decisions: cancel only): held card renders, Accept hidden", async () => {
+    const m = mount({ currentRun: { triggerId: "t", step: "decision", decisions: ["cancel"], held }, stage: "awaiting-decision" });
+    await m.win.loadKgStatus();
+    const cur = m.doc.getElementById("kg-current-run") as HTMLElement;
+    expect(cur.textContent).toContain("Held for a decision until ");
+    expect(cur.querySelector("a[href^=\"https\"]")?.getAttribute("href")).toBe("https://github.com/o/kg/pull/7");
+    expect(m.visibleButtons()).toEqual(["Cancel"]);
+  });
+
   it("deployHeld 200 with a held run: Accept and Cancel stay enabled, Refresh disabled, deploy notice shown", async () => {
     const m = mount({ currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held }, stage: "awaiting-decision", deployHeld: true });
     await m.win.loadKgStatus();
@@ -707,6 +716,19 @@ describe("kg current run card (AII-1260)", () => {
       await m.win.loadKgStatus();
       expect(badge(m).textContent).toContain("timed out");
       expect(text(m)).toBe("Last refresh: no decision within 24 h \u2014 the held PR was closed");
+    });
+
+    it("shows passed, completed with warnings, and failed", async () => {
+      const ok = { ok: true, at: 1, detail: "refreshed", stampBefore: null, stampAfter: "x" };
+      const p = mount({ currentRun: null, stage: "serving", lastRefresh: ok });
+      await p.win.loadKgStatus();
+      expect(text(p)).toBe("Last refresh: passed \u2014 refreshed");
+      const w = mount({ currentRun: null, stage: "serving", lastRefresh: { ...ok, warnings: ["source x skipped"] } });
+      await w.win.loadKgStatus();
+      expect(text(w)).toBe("Last refresh: completed with warnings \u2014 refreshed");
+      const f = mount({ currentRun: null, stage: "failed", lastRefresh: { ...failed, gate: undefined } });
+      await f.win.loadKgStatus();
+      expect(text(f)).toBe("Last refresh: failed \u2014 git push failed (exit 128)");
     });
 
     it("an old record without conclusion renders, omitting an empty gate", async () => {

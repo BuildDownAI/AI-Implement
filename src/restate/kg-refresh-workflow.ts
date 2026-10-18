@@ -16,6 +16,7 @@
  * asynchronously. kg-refresh has one owner, so none of the pilot's admission/selector
  * machinery is needed here — see `docs/adr/032-a-fully-migrated-run-kind-coordinates-through-a-virtual-object.md`.
  */
+import type { SourceResult } from "../kg-source-results.js";
 import * as restate from "@restatedev/restate-sdk";
 import type { WorkflowContext, WorkflowSharedContext } from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
@@ -105,8 +106,17 @@ export interface KgRefreshReportBody {
   snapshotBranch?: string;
   partTable?: Array<{ part: string; prev: string; new: string }>;
   /** Absent on a report from a runner that predates the field; reads as "shrink". */
-  cause?: "shrink" | "tracker-missing";
+  cause?: "shrink" | "tracker-missing" | "source-failed";
   failedTeams?: string[];
+  /** Absent from a runner that predates the field; reads as unblocked. */
+  acceptBlocked?: boolean;
+  lostTeams?: Array<{ team: string; servedIssues: number }>;
+  /** Warnings on a completed run; copied onto the success outcome. */
+  warnings?: string[];
+  /** The snapshot guard's verdict; `warnings` marks an ok run with skipped or failed sources. Absent from a runner that predates the field. */
+  guardVerdict?: "clean" | "warnings" | "refused" | "held";
+  /** Per-source results; absent from a runner that predates the field. */
+  sources?: SourceResult[];
 }
 
 export interface KgDispatchInput {
@@ -148,9 +158,15 @@ export interface KgRefreshHeldView {
   snapshotPr: number;
   partTable: Array<{ part: string; prev: string; new: string }>;
   /** Why the run waits. */
-  cause: "shrink" | "tracker-missing";
+  cause: "shrink" | "tracker-missing" | "source-failed";
   /** Teams whose tracker fetch failed; empty for a shrink. */
   failedTeams: string[];
+  /** True when accepting would publish a graph without `lostTeams`' issues; the gate then offers cancel only. */
+  acceptBlocked: boolean;
+  /** Skipped or failed teams that have issues in the served snapshot. */
+  lostTeams: Array<{ team: string; servedIssues: number }>;
+  /** Per-source results of the run, so the operator decides from them. */
+  sources: SourceResult[];
   decideBy: number;
 }
 
@@ -165,10 +181,12 @@ export interface KgRefreshStatusResult {
   dryRun: boolean;
   /** The last runner step with a resolved step promise, in pipeline order; `null` before the first report. */
   runnerStep: { id: string; status: string } | null;
-  /** `["accept", "cancel"]` while the decision gate is open and undecided; `[]` otherwise. */
+  /** `["accept", "cancel"]` while the decision gate is open and undecided (`["cancel"]` when the held run is `acceptBlocked`); `[]` otherwise. */
   decisions: Array<"accept" | "cancel">;
   /** The held snapshot PR and its part table while step is `decision`; `null` otherwise. */
   held: KgRefreshHeldView | null;
+  /** Per-source results the runner reported; `[]` before the report and for runners that send none. */
+  sources: SourceResult[];
 }
 
 export interface KgDispatchResult {
@@ -390,7 +408,13 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
 
     // Built once, after `report`; pre-report failures (timeout, lost) carry no table.
     let stepTable: KgRefreshStepRecord[] = [];
-    const withSteps = (o: RefreshOutcome): RefreshOutcome => (stepTable.length > 0 && !o.steps ? { ...o, steps: stepTable } : o);
+    let reportedSources: SourceResult[] = [];
+    let reportedWarnings: string[] = [];
+    let reportedGuardVerdict: KgRefreshReportBody["guardVerdict"];
+    const withSteps = (o: RefreshOutcome): RefreshOutcome => {
+      const withTable = stepTable.length > 0 && !o.steps ? { ...o, steps: stepTable } : o;
+      return reportedSources.length > 0 && !withTable.sources ? { ...withTable, sources: reportedSources } : withTable;
+    };
 
     // Set once the run reaches the decision gate; unlike `heldPr` it survives the merge, so every later end is marked held.
     let heldGate = false;
@@ -822,7 +846,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
               detail: railCtx.detail ?? "Graph is current — a new ingest is required to refresh",
               stampBefore: railCtx.stampBefore ?? null, stampAfter: railCtx.stampBefore ?? null,
             };
-            await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
+            await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed", "passed"));
             await notifyOutcome("no-new-data", outcome, { failureCode: "ingest-needed" });
             return finish(outcome);
           }
@@ -869,10 +893,13 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           stampBefore: railCtx.stampBefore ?? null, stampAfter: railCtx.stampAfter ?? null,
         };
         if (stepTable.length > 0) successOutcome.steps = stepTable;
+        if (reportedSources.length > 0) successOutcome.sources = reportedSources;
+        if (reportedWarnings.length > 0) successOutcome.warnings = reportedWarnings;
         if (heldGate) successOutcome.held = true;
         await ctx.run("persist", () => deps.persistLastRefresh({ ...successOutcome, dispatchId }));
         ctx.set("step", "close-row");
-        await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
+        const successConclusion = reportedWarnings.length > 0 || reportedGuardVerdict === "warnings" ? "warnings" : "passed";
+        await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed", successConclusion));
         ctx.set("step", "outcome");
         await notifyOutcome("success", successOutcome);
         return finish(successOutcome);
@@ -915,6 +942,10 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       // waitResult.kind === "report"
       const report = waitResult.value;
       reported = true;
+      reportedSources = report.sources ?? [];
+      ctx.set("sources", reportedSources);
+      reportedWarnings = report.warnings ?? [];
+      reportedGuardVerdict = report.guardVerdict;
       // Journaled peeks, so a replay rebuilds the same table.
       stepTable = [];
       for (const id of KG_REFRESH_RUNNER_STEPS) {
@@ -930,13 +961,19 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           stampBefore: null, stampAfter: null, dryRun: true, partTable: report.partTable,
         };
         if (stepTable.length > 0) outcome.steps = stepTable;
+        if (reportedSources.length > 0) outcome.sources = reportedSources;
+        if (reportedWarnings.length > 0) outcome.warnings = reportedWarnings;
         if (input.report) {
           // Stored on `KgRepo` so the outcome can be re-reported; journaled, so a replay sends once.
           ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).recordDryRunOutcome({ report: input.report, outcome });
           await ctx.run("dry-run-report", () => postDryRunReport(deps.rail, input.report!, outcome));
         }
         ctx.set("step", "closed");
-        await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
+        // A refused dry run is a failure, never "completed".
+        const dryConclusion = reportedWarnings.length > 0 || reportedGuardVerdict === "warnings" ? "warnings" : "passed";
+        await ctx.run("close-row", () => report.ok
+          ? deps.closeJobLog(jobId, "completed", dryConclusion)
+          : deps.closeJobLog(jobId, "failed", report.failureCode ?? "dry_run_refused"));
         return finish(outcome);
       }
 
@@ -947,7 +984,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           ok: true, at, detail: report.failureReason ?? "Graph is current — a new ingest is required to refresh",
           stampBefore: null, stampAfter: null,
         };
-        await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
+        await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed", "passed"));
         await notifyOutcome("no-new-data", outcome, { failureCode: report.failureCode });
         return finish(outcome);
       }
@@ -958,7 +995,6 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         const heldPrNumber = report.snapshotPr;
         heldPr = { number: heldPrNumber, branch: report.snapshotBranch };
         heldGate = true;
-        ctx.set("step", "decision");
         const heldAt = await ctx.date.now();
         const decideBy = heldAt + decisionTimeoutMs;
         ctx.set("held", {
@@ -968,8 +1004,13 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           partTable: report.partTable,
           cause: report.cause ?? "shrink",
           failedTeams: report.failedTeams ?? [],
+          acceptBlocked: report.acceptBlocked === true,
+          lostTeams: report.lostTeams ?? [],
+          sources: reportedSources,
           decideBy,
         });
+        // After `held`: `decide` must never see step "decision" without the acceptBlocked flag.
+        ctx.set("step", "decision");
         ctx.console.log(`[KgRefresh] held: dispatch ${dispatchId} snapshot PR #${heldPrNumber} awaits a decision until ${new Date(decideBy).toISOString()}`);
         ctx.objectSendClient(FlyMachineProfile, "kg-refresh").release({ dispatchId });
 
@@ -984,6 +1025,11 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
 
         if (decision.kind === "signal" && decision.name === "decide") {
           const decided = decision.value as KgRefreshDecideInput;
+          if (decided.action === "accept" && report.acceptBlocked === true) {
+            // Defence in depth: `decide` already refuses this. Treat it as a cancel.
+            ctx.console.error(`[KgRefresh] accept refused, snapshot is accept-blocked: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
+            return cleanupCancelled("signal");
+          }
           if (decided.action === "accept") {
             ctx.console.log(`[KgRefresh] decided accept by ${decided.actor}: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
             // The note is best effort: the merge is what matters. The step is never interrupted by a Restate
@@ -1172,16 +1218,21 @@ function toStepRecord(step: Step): KgRefreshStepRecord {
     if ((await ctx.get<string>("step")) !== "decision") {
       throw new restate.TerminalError("no-decision-open", { errorCode: 409 });
     }
+    // The gate, not the page, enforces the rule: a blocked hold answers accept with 409 and stays open.
+    if (input.action === "accept" && (await ctx.get<{ acceptBlocked?: boolean }>("held"))?.acceptBlocked === true) {
+      throw new restate.TerminalError("accept-blocked", { errorCode: 409 });
+    }
     await promise.resolve(input);
   }
 
   async function status(ctx: WorkflowSharedContext): Promise<KgRefreshStatusResult> {
-    const [step, startedAt, triggerId, runId, dryRun] = await Promise.all([
+    const [step, startedAt, triggerId, runId, dryRun, sources] = await Promise.all([
       ctx.get<string>("step"),
       ctx.get<number>("startedAt"),
       ctx.get<string>("triggerId"),
       ctx.get<number>("runId"),
       ctx.get<boolean>("dryRun"),
+      ctx.get<SourceResult[]>("sources"),
     ]);
     let runnerStep: KgRefreshStatusResult["runnerStep"] = null;
     for (const id of KG_REFRESH_RUNNER_STEPS) {
@@ -1196,11 +1247,11 @@ function toStepRecord(step: Step): KgRefreshStepRecord {
     let decisions: KgRefreshStatusResult["decisions"] = [];
     let held: KgRefreshStatusResult["held"] = null;
     if (step === "decision") {
-      const stored = await ctx.get<{ snapshotPr: number; partTable?: KgRefreshHeldView["partTable"]; cause?: KgRefreshHeldView["cause"]; failedTeams?: string[]; decideBy: number }>("held");
-      if (stored) held = { snapshotPr: stored.snapshotPr, partTable: stored.partTable ?? [], cause: stored.cause ?? "shrink", failedTeams: stored.failedTeams ?? [], decideBy: stored.decideBy };
-      if ((await ctx.promise<KgRefreshDecideInput>("decide").peek()) === undefined) decisions = ["accept", "cancel"];
+      const stored = await ctx.get<{ snapshotPr: number; partTable?: KgRefreshHeldView["partTable"]; cause?: KgRefreshHeldView["cause"]; failedTeams?: string[]; acceptBlocked?: boolean; lostTeams?: KgRefreshHeldView["lostTeams"]; sources?: SourceResult[]; decideBy: number }>("held");
+      if (stored) held = { snapshotPr: stored.snapshotPr, partTable: stored.partTable ?? [], cause: stored.cause ?? "shrink", failedTeams: stored.failedTeams ?? [], acceptBlocked: stored.acceptBlocked === true, lostTeams: stored.lostTeams ?? [], sources: stored.sources ?? [], decideBy: stored.decideBy };
+      if ((await ctx.promise<KgRefreshDecideInput>("decide").peek()) === undefined) decisions = held?.acceptBlocked ? ["cancel"] : ["accept", "cancel"];
     }
-    return { step: step ?? null, startedAt: startedAt ?? null, triggerId: triggerId ?? null, runId: runId ?? null, dryRun: dryRun === true, runnerStep, decisions, held };
+    return { step: step ?? null, startedAt: startedAt ?? null, triggerId: triggerId ?? null, runId: runId ?? null, dryRun: dryRun === true, runnerStep, decisions, held, sources: sources ?? [] };
   }
 
   return restate.workflow({

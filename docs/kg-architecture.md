@@ -235,7 +235,7 @@ or these steps by hand.
 | `checking` | Refresh triggered; comparing snapshot SHA against last recorded |
 | `ingest-running` | Runner job dispatched; waiting for callback |
 | `snapshot-landed` | Callback received; snapshot commit verified |
-| `awaiting-decision` | A run is held at the decision gate with its snapshot PR open; `currentRun.decisions` is `["accept", "cancel"]` |
+| `awaiting-decision` | A run is held at the decision gate with its snapshot PR open; `currentRun.decisions` is `["accept", "cancel"]`, or `["cancel"]` when the hold is `acceptBlocked` |
 | `staging` | Local rail running (fetch → materialize → swap) |
 | `serving` | Rail succeeded; sidecar serving new graph |
 | `reverted` | Gate failed; rolled back to previous overlay |
@@ -255,12 +255,40 @@ has `issue.nt` or `comment.nt`). A `tracker-missing` PR body starts with a warni
 failed teams, and `held.failedTeams` lists them. The KG Pipelines page shows `held.cause` and
 `held.failedTeams` in the current-run card, and the Accept prompt names the cause.
 
+A skipped (404, no mapping) or failed tracker team is judged by what the served snapshot already holds
+(AII-1471). `kg-snapshot-push` counts that team's issues in the **cloned** `snapshot/parts/issue.nt`
+(`git show <clonedRef>:…`, one `onto#trackerTeam "<team>"` literal per issue; the working tree's file is
+already the reduced one). A dry run ends **completed with warnings** (`guardVerdict: "warnings"`, no push)
+whenever the tracker is the only problem. A live run has two outcomes:
+
+| A skipped or failed team has served issues | Outcome |
+|---|---|
+| yes | The PR opens and the run holds (`KG_SNAPSHOT_HELD`, cause `tracker-missing`) with `acceptBlocked: true` and `lostTeams: [{ team, servedIssues }]`: accepting would publish a graph without those issues. `status.decisions` is `["cancel"]`, and `decide({ action: "accept" })` answers a 409 `accept-blocked` and leaves the run at the gate. |
+| no | The snapshot publishes through the normal gates with a warning in the PR body and `warnings` (the team names) on the outcome. |
+
+A zero count is trusted only when every `trackerTeam` literal in the served `issue.nt` is a `sources.yml`
+tracker key. A snapshot written before KGB-33 holds the identifier prefix (`"TOP"`) rather than the key
+(`topia-mobile`), so with any other literal present a zero-count team is unknown (`servedIssues: -1`) and
+counts as lost. A new team, where every literal matches a key, stays in the publish-with-warning row.
+
+A third cause, `source-failed` (AII-1474), covers any `failed` entry in `sources` whose `kind` is not
+`tracker` (`code_repo`, `secondary_repo`, `self`, `docs_site`, `ingest`). Since KGB-36 the ingest finishes
+every source it can and exits 0, and it does not roll back a source that raised, so a failed source can
+leave half-written triples in the graph. A live run opens the PR and holds with `acceptBlocked: true`
+(`decisions: ["cancel"]`, Accept answers `accept-blocked`); the failed rows are in `held.sources` and the PR
+body's warning names them. A dry run completes with `guardVerdict: "warnings"` and pushes nothing. A
+`skipped` non-tracker source stays a warning. When a tracker-missing or shrink hold is already set, that
+cause stays but Accept is blocked all the same.
+
+A fetch that failed with no team named, and a shrink, still hold with both decisions offered. A `held`
+state stored before `acceptBlocked` existed reads as unblocked.
+
 When the runner's `report` is `failureCode: "KG_SNAPSHOT_HELD"` with a `snapshotPr`, `KgRefresh` stops
 at a gate (`src/restate/kg-refresh-workflow.ts`):
 
 1. Sets step `decision` and stores `held` in workflow state: `snapshotPr`, `snapshotCommit`,
-   `snapshotBranch`, `partTable`, `cause`, `failedTeams`, and `decideBy` (now + 24 h). `status`
-   exposes `snapshotPr`, `partTable`, `cause`, `failedTeams`, and `decideBy` (not the commit or
+   `snapshotBranch`, `partTable`, `cause`, `failedTeams`, `acceptBlocked`, `lostTeams`, and `decideBy`
+   (now + 24 h). `status` exposes `snapshotPr`, `partTable`, `cause`, `failedTeams`, `acceptBlocked`, `lostTeams`, and `decideBy` (not the commit or
    branch) as `held`, which `get_kg_status` surfaces as `currentRun.held`. A report or stored state
    with no `cause` (a run in flight at deploy) reads as `shrink` with no failed teams.
 2. Sends `FlyMachineProfile("kg-refresh").release({ dispatchId })`: the runner has finished, so the
@@ -539,6 +567,25 @@ runtime control. The toggle only affects the *next*
 refresh, not whatever the sidecar is currently serving — `GET /api/kg/status` and the `get_kg_status`
 MCP tool both report the resolved setting as `materialize: "rdflib" | "direct"` for observability.
 
+### Per-source results (AII-1470)
+
+A refresh reports one result per source: `source`, `kind`, `status` (`success` / `skipped` /
+`failed`), `reason`, and `counts`. The type and the defensive parser are in `src/kg-source-results.ts`.
+Two steps supply the rows and `kg-snapshot-push` merges them:
+
+| Part | Produced by | Rows |
+|---|---|---|
+| Tracker | `kg-tracker-data` output `teamResults` | one `tracker:<team>` row per team in `sources.yml`: `success` with `counts.issues`, `skipped` (reason `no mapping`, a 404), or `failed` (reason the HTTP status or `error: …`). With no teams at all, one `skipped` row, reason `no trackers in sources.yml`. A 401/403 aborts the step, so those teams have no row |
+| Ingest | `kg-ingest` output `sourceResults`, read from `ai-output/source-results.json` | code repo, secondary repos, self-ingest, docs sites. The file is written by the KG repo's ingest and is optional: when it is absent or unparseable the output is `[]` (one log line) and malformed entries are dropped |
+
+For the same `source`, the tracker row wins, because the tracker step is the only place that saw the
+fetch. The merged list is `sources` in the `kg-snapshot-push` output and in `KgSnapshotHeldError`. It is
+rendered as the "Sources" table in the refresh report (the PR body, or the dry-run log), and travels
+the way `failedTeams` does: `kg-refresh-run.ts` → `postRunnerResult` → `runner-callback.ts` →
+`KgRefresh.report`. The workflow stores it on the outcome and returns it on `status` (`sources`), and on
+`status.held.sources` while the run waits at the decision gate. Only success, dry-run, and held reports
+carry it; other failures send none. A runner that predates the field sends none and reads as `[]`.
+
 ### Held-verdict plumbing (AII-1253, AII-1264)
 
 The run envelope carries one guard-related flag, `kgDryRun`, and it is set only by the KG-repo PR
@@ -565,7 +612,8 @@ to the workflow. A held error also carries `cause` and `failedTeams`, which trav
 | Hard regression (a part missing), with or without soft | no | failure `KG_SNAPSHOT_TRACKER_REGRESSION`, `guardVerdict: "refused"`, part table, no `snapshot*` fields |
 | Soft only (zero-shrink or 50% rule) | yes | failure `KG_SNAPSHOT_HELD`, `guardVerdict: "held"`, part table, `snapshotPr`/`snapshotCommit`/`snapshotBranch` |
 | Guard 0 (tracker fetch failed, tracker part in the clone), real run | yes | failure `KG_SNAPSHOT_HELD`, `cause: "tracker-missing"`, `failedTeams`, part table; a missing or smaller `issue.nt` / `comment.nt` is held, any other missing part is hard |
-| Dry run (PR check), soft only or tracker data missing | no | `refused` with the table, never `held` |
+| Dry run (PR check), tracker data only: skipped or failed teams, missing tracker parts | no | completes with warnings (`guardVerdict: "warnings"`), never `held`; the report carries the guard table, the Sources table and the warnings |
+| Dry run (PR check), hard regression, or a soft shrink that tracker data does not explain (non-tracker zero-shrink or 50% rule, a tracker-file shrink no lost team explains) | no | failure `KG_SNAPSHOT_TRACKER_REGRESSION`, `guardVerdict: "refused"`, part table |
 
 A held run commits, pushes `kg-refresh/<stamp>` and opens the PR (body: `Guard verdict: held — a shrink
 waits for an operator decision`; for `tracker-missing`, the body starts with a `⚠️` line naming the
@@ -668,8 +716,10 @@ So does `fetched=false` with tracker parts in the cloned snapshot (cause `tracke
 missing or smaller `issue.nt` / `comment.nt` counts as held too. Any other missing part, and a
 missing tracker part when `fetched=true`, stays a hard refusal, since a part that vanishes for
 another reason is an ingest defect and holding it would invite an operator to accept a broken graph.
-A dry run pushes nothing and has no PR to hold, so it still refuses with
-`KG_SNAPSHOT_TRACKER_REGRESSION`. See
+A dry run pushes nothing and has no PR to hold, so a tracker-data problem alone (skipped or failed
+teams, missing tracker parts) completes it with warnings. A hard regression, or a soft shrink that
+tracker data does not explain (a non-tracker zero-shrink or 50% rule, a tracker-file shrink no lost
+team explains), still refuses it with `KG_SNAPSHOT_TRACKER_REGRESSION`. See
 [Held-verdict plumbing](#held-verdict-plumbing-aii-1253-aii-1264).
 
 For a shrink, an intentional change in what the ingest emits (a base-repo classification change, for
@@ -712,6 +762,21 @@ Each of these shipped a degraded or blocked deploy, and each is now covered by a
 | 2026-09-08 | With the report step gone, the stale-stamp gate read `snapshot/embeddings.stamp`, a file only hand edits and that agent ever wrote; the first guard-clean run (34270413381) failed `KG_SNAPSHOT_STALE` on it | The gate reads `age_stamp` from `snapshot/embeddings.meta.json` — the ingest's own stamp and the one the rail's materialize checks — with the legacy file as fallback |
 | 2026-09-08 | The kg-refresh report step (feedback-loop) re-ran the ingest by hand without a GitHub token and rewrote `snapshot/parts/` without `pr.nt`; the guard refused three runs | The report step is removed from `pipelines/kg-refresh.yml`; the ingest step's counters and `ai-output/kg-ingest.log` (AII-581) plus the snapshot-push guard are the report |
 | 2026-09-08 | Refresh rail's materialize OOM-killed at ~31.6k quads (271 MB RSS beside the serving sidecar on a 512 MB machine); the rail refused the swap and kept serving the old graph | `fly.toml` memory raised to 1 GB — the documented headroom figure, not a code change |
+
+### Row conclusions and dashboard outcomes (AII-1472)
+
+`KgRefresh` is the only writer of a kg-refresh job row, and every close carries a conclusion:
+
+| Close | Status | Conclusion |
+|---|---|---|
+| Success, no-new-data, clean dry run | `completed` | `passed` |
+| Ok with warnings (`guardVerdict: "warnings"` or a non-empty `warnings` list), live or dry run | `completed` | `warnings` |
+| Not ok, including a refused dry run | `failed` / `timed_out` | the failure code (`dry_run_refused` when the report carries none) |
+
+The Pipelines badge for a `kg-refresh` row reads **passed**, **completed with warnings**, or **failed** from
+status and conclusion; other run kinds keep their status label. A legacy row (`completed`, no conclusion)
+keeps the plain `completed` label. The KG page's last-refresh line shows the same three outcomes for live
+refreshes (**passed**, **completed with warnings**, or **failed**, as above); dry runs appear only as Pipelines rows.
 
 ## KG-refresh outcome visibility (AII-496)
 

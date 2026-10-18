@@ -160,7 +160,7 @@ export const kgPipelinesScript = `
       else if (last.gate === 'ingest-needed') lastText = 'Last refresh: ' + last.detail;
       else if (last.conclusion === 'operator_cancelled') lastText = 'Last refresh: cancelled by operator';
       else if (last.conclusion === 'decision_timeout') lastText = 'Last refresh: no decision within 24 h \u2014 the held PR was closed';
-      else lastText = 'Last refresh: ' + (last.ok ? 'ok' : 'failed' + (last.gate ? ' at gate "' + last.gate + '"' : '')) + ' \u2014 ' + last.detail;
+      else lastText = 'Last refresh: ' + (last.ok ? (last.warnings && last.warnings.length > 0 ? 'completed with warnings' : 'passed') : 'failed' + (last.gate ? ' at gate "' + last.gate + '"' : '')) + ' \u2014 ' + last.detail;
       // A run in flight owns the line: the previous run's result must never show beside it.
       if (data.currentRun && !progressText) {
         progressText = stage === 'awaiting-decision'
@@ -233,6 +233,10 @@ export const kgPipelinesScript = `
   }
 
   function heldWhy(held) {
+    if (held.cause === 'source-failed') {
+      const failed = (Array.isArray(held.sources) ? held.sources : []).filter(function (s) { return s.status === 'failed' && s.kind !== 'tracker'; }).map(function (s) { return String(s.source); });
+      return 'Why: ' + (failed.length ? failed.join(', ') : 'a source') + ' failed, so the graph may be partial. Accept is blocked.';
+    }
     if (held.cause !== 'tracker-missing') return 'Why: a snapshot part shrank past the guard.';
     const teams = heldTeams(held);
     return teams.length
@@ -251,7 +255,7 @@ export const kgPipelinesScript = `
     el.textContent = '';
     if (!run) { el.hidden = true; return; }
     el.hidden = false;
-    const held = stage === 'awaiting-decision' && decisions.indexOf('accept') >= 0 && run.held ? run.held : null;
+    const held = stage === 'awaiting-decision' && run.held ? run.held : null;
     const head = document.createElement('div');
     if (!held) {
       head.textContent = 'Run in flight' + (run.step ? ': ' + run.step : '');

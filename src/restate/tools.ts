@@ -624,7 +624,7 @@ export const getDeployPostureTool = tool(
 );
 
 export const GET_KG_STATUS_DESCRIPTION =
-  "Returns the KG refresh rail state: stage (idle | checking | ingest-running | snapshot-landed | awaiting-decision | staging | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), the last refresh outcome with its gate. The served stamp falls back to a live read when the last-refresh record carries none. currentRun is the in-flight run only (triggerId, step, decisions, held), or null with no run in flight; decisions is [\"accept\", \"cancel\"] only while the run waits at the decision gate (stage awaiting-decision), and held carries the snapshot PR, its part table, and the decide-by time. Poll it after `POST /api/kg/refresh`.";
+  "Returns the KG refresh rail state: stage (idle | checking | ingest-running | snapshot-landed | awaiting-decision | staging | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), the last refresh outcome with its gate. The served stamp falls back to a live read when the last-refresh record carries none. currentRun is the in-flight run only (triggerId, step, decisions, held), or null with no run in flight; decisions is [\"accept\", \"cancel\"] only while the run waits at the decision gate (stage awaiting-decision), or [\"cancel\"] for a blocked hold (held.acceptBlocked), and held carries the snapshot PR, its part table, and the decide-by time. Poll it after `POST /api/kg/refresh`.";
 
 // Type-only client handles: the real definitions are built with dependencies at boot
 // (createProductionKgRefreshServices); a client needs only the service name and handler types.
@@ -682,7 +682,7 @@ export function kgStageForRunnerStep(id: string, status: StepStatus): KgRefreshS
 const REVERT_GATES = new Set(["answers", "vectors", "canary", "stamp"]);
 
 export const DECIDE_KG_REFRESH_DESCRIPTION =
-  "Decide the current in-flight KG refresh (admin role). Acts only on the run KgRepo reports in flight; there is no trigger id argument, so a past run cannot be decided. `accept` lands the held snapshot, `cancel` drops it. When the run is not at the decision gate, `accept` answers no-decision-open and `cancel` stops the run through the cancel signal. A second decision answers already-decided, except that a `cancel` after an accept stops the run until the merge starts and answers past-merge from then on (the merge is the point of no return; the run finishes). With no run in flight the answer is no-refresh-in-flight.";
+  "Decide the current in-flight KG refresh (admin role). Acts only on the run KgRepo reports in flight; there is no trigger id argument, so a past run cannot be decided. `accept` lands the held snapshot, `cancel` drops it. When the run is not at the decision gate, `accept` answers no-decision-open and `cancel` stops the run through the cancel signal. `accept` on a blocked hold answers accept-blocked. A second decision answers already-decided, except that a `cancel` after an accept stops the run until the merge starts and answers past-merge from then on (the merge is the point of no return; the run finishes). With no run in flight the answer is no-refresh-in-flight.";
 
 export const decideKgRefreshTool = tool(
   {
@@ -708,6 +708,7 @@ export const decideKgRefreshTool = tool(
     } catch (err) {
       if (!(err instanceof restate.TerminalError) || err.code !== 409) throw err;
       if (err.message === "past-merge") return toolError("past-merge");
+      if (err.message === "accept-blocked") return toolError("accept-blocked");
       if (err.message === "already-decided") return toolError("already-decided");
       if (err.message !== "no-decision-open") throw err;
     }
