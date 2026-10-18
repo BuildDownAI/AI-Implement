@@ -1468,6 +1468,12 @@ describe("migrated write handlers (AII-713)", () => {
       expect(cancel).toHaveBeenCalledWith({ reason: "operator_cancelled" });
     });
 
+    it("answers accept-blocked from decide for a blocked hold, and never falls through to cancel", async () => {
+      decide.mockRejectedValue(terminal(409, "accept-blocked"));
+      expect(answer(await call({ action: "accept" }))).toEqual({ isError: true, text: "accept-blocked" });
+      expect(cancel).not.toHaveBeenCalled();
+    });
+
     it("answers past-merge from decide, and never falls through to cancel", async () => {
       decide.mockRejectedValue(terminal(409, "past-merge"));
       expect(answer(await call({ action: "cancel" }))).toEqual({ isError: true, text: "past-merge" });

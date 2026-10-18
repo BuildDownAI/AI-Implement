@@ -995,7 +995,6 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         const heldPrNumber = report.snapshotPr;
         heldPr = { number: heldPrNumber, branch: report.snapshotBranch };
         heldGate = true;
-        ctx.set("step", "decision");
         const heldAt = await ctx.date.now();
         const decideBy = heldAt + decisionTimeoutMs;
         ctx.set("held", {
@@ -1010,6 +1009,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           sources: reportedSources,
           decideBy,
         });
+        // After `held`: `decide` must never see step "decision" without the acceptBlocked flag.
+        ctx.set("step", "decision");
         ctx.console.log(`[KgRefresh] held: dispatch ${dispatchId} snapshot PR #${heldPrNumber} awaits a decision until ${new Date(decideBy).toISOString()}`);
         ctx.objectSendClient(FlyMachineProfile, "kg-refresh").release({ dispatchId });
 
@@ -1024,6 +1025,11 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
 
         if (decision.kind === "signal" && decision.name === "decide") {
           const decided = decision.value as KgRefreshDecideInput;
+          if (decided.action === "accept" && report.acceptBlocked === true) {
+            // Defence in depth: `decide` already refuses this. Treat it as a cancel.
+            ctx.console.error(`[KgRefresh] accept refused, snapshot is accept-blocked: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
+            return cleanupCancelled("signal");
+          }
           if (decided.action === "accept") {
             ctx.console.log(`[KgRefresh] decided accept by ${decided.actor}: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
             // The note is best effort: the merge is what matters. The step is never interrupted by a Restate

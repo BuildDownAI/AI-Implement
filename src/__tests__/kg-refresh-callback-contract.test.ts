@@ -333,6 +333,7 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
         lostTeams: [{ team: "X", servedIssues: 40 }],
         warnings: ["Tracker data was skipped or failed for team(s): X"],
         sources,
+        guardVerdict: "held",
       }),
       { idempotencyKey: dispatchId },
     );

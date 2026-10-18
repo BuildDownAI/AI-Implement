@@ -827,6 +827,7 @@ export async function handleRunnerResult(
         acceptBlocked: input.body.acceptBlocked,
         lostTeams: input.body.lostTeams,
         warnings: input.body.warnings,
+        guardVerdict: input.body.guardVerdict,
       },
       { idempotencyKey: dispatchId },
     );

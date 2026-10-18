@@ -266,6 +266,11 @@ whenever the tracker is the only problem. A live run has two outcomes:
 | yes | The PR opens and the run holds (`KG_SNAPSHOT_HELD`, cause `tracker-missing`) with `acceptBlocked: true` and `lostTeams: [{ team, servedIssues }]`: accepting would publish a graph without those issues. `status.decisions` is `["cancel"]`, and `decide({ action: "accept" })` answers a 409 `accept-blocked` and leaves the run at the gate. |
 | no | The snapshot publishes through the normal gates with a warning in the PR body and `warnings` (the team names) on the outcome. |
 
+A zero count is trusted only when every `trackerTeam` literal in the served `issue.nt` is a `sources.yml`
+tracker key. A snapshot written before KGB-33 holds the identifier prefix (`"TOP"`) rather than the key
+(`topia-mobile`), so with any other literal present a zero-count team is unknown (`servedIssues: -1`) and
+counts as lost. A new team, where every literal matches a key, stays in the publish-with-warning row.
+
 A third cause, `source-failed` (AII-1474), covers any `failed` entry in `sources` whose `kind` is not
 `tracker` (`code_repo`, `secondary_repo`, `self`, `docs_site`, `ingest`). Since KGB-36 the ingest finishes
 every source it can and exits 0, and it does not roll back a source that raised, so a failed source can
@@ -771,7 +776,7 @@ Each of these shipped a degraded or blocked deploy, and each is now covered by a
 The Pipelines badge for a `kg-refresh` row reads **passed**, **completed with warnings**, or **failed** from
 status and conclusion; other run kinds keep their status label. A legacy row (`completed`, no conclusion)
 keeps the plain `completed` label. The KG page's last-refresh line shows the same three outcomes for live
-refreshes (`ok`, plus `warnings`, or `failed`); dry runs appear only as Pipelines rows.
+refreshes (**passed**, **completed with warnings**, or **failed**, as above); dry runs appear only as Pipelines rows.
 
 ## KG-refresh outcome visibility (AII-496)
 
