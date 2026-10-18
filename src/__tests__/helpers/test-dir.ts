@@ -1,7 +1,7 @@
 // Temporary directories for tests (AII-925). A test that needs a scratch directory calls
 // testDir() here rather than mkdtempSync: the directory and everything in it are removed
 // when the test finishes, whether it passed or failed. testTempRoot() also points the OS
-// temp directory at one (AII-1073). See docs/unit-tests.md § Harnesses.
+// temp directory at one (AII-1073). See README.md in this directory.
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";

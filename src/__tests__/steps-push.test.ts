@@ -7,8 +7,8 @@ import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import type { FailureRecord } from "../pipeline/failure-classification.js";
 import { makeContext as makeBaseContext, makeFeedbackLoopOutputs } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type ReplyInit, type Routes } from "./helpers/fake-fetch.js";
-import { githubError } from "./helpers/github-replies.js";
-import { makeSnapshot } from "./configured-run-fixture.js";
+import { githubError } from "./helpers/replies/github.js";
+import { makeSnapshot } from "./helpers/fixtures/configured-run.js";
 
 vi.mock("node:child_process", () => ({
   spawnSync: vi.fn(),

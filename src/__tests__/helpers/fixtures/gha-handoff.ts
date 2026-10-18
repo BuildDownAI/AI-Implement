@@ -9,9 +9,9 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { parse } from "yaml";
 import { vi } from "vitest";
-import type { ResolvedAgentSnapshotV1, RunConfigV1 } from "../run-config.js";
-import type { ModelAuthContextV1, ModelAuthGrantBootstrapV1 } from "../model-auth-contract.js";
-import { makeGrant } from "./configured-run-fixture.js";
+import type { ResolvedAgentSnapshotV1, RunConfigV1 } from "../../../run-config.js";
+import type { ModelAuthContextV1, ModelAuthGrantBootstrapV1 } from "../../../model-auth-contract.js";
+import { makeGrant } from "./configured-run.js";
 
 export const GHA_IMPLEMENT_WORKFLOWS = ["workflows/claude-implement.yml", ".github/workflows/claude-implement.yml"];
 export const GHA_PLAN_WORKFLOWS = ["workflows/claude-plan.yml", ".github/workflows/claude-plan.yml"];

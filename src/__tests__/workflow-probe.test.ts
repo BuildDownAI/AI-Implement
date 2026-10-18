@@ -5,7 +5,7 @@ import {
   __clearWorkflowProbeCacheForTests,
 } from "../workflow-probe.js";
 import { fakeFetch, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
-import { githubFile } from "./helpers/github-replies.js";
+import { githubFile } from "./helpers/replies/github.js";
 
 const ENVELOPE_YML =
   "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n";

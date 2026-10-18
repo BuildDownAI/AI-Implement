@@ -11,7 +11,7 @@ import type * as AdmissionModule from "../dispatch-admission.js";
 import type * as RestateStatusModule from "../restate/status.js";
 import type { RepoMapping } from "../config.js";
 import type { TicketingProvider } from "../providers/types.js";
-import { makeGrant, makeSnapshot } from "./configured-run-fixture.js";
+import { makeGrant, makeSnapshot } from "./helpers/fixtures/configured-run.js";
 import { makeAppConfig, makeAppendLogEntry, makeIssue, makeMapping, makeProvider, makeRegistry } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type Reply, type Routes } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";

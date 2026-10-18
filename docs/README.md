@@ -38,7 +38,7 @@ Two tiers, distinguished by what a file *is* rather than what it covers.
 | [unit-tests.md](unit-tests.md) | The default test suite: where tests live, what `npm test` runs, isolation from the machine (the environment scrub and its allowlist), how test files are type-checked, fakes, fixture builders and harnesses, and the CI jobs |
 | [bug-fix-tests.md](bug-fix-tests.md) | The bug-fix pattern: reproduce with a failing test before the fix, ship both in one pull request, which tier of test to write, and two worked examples |
 
-Two references live outside this directory because they are consumed directly rather than read: `.env.example` is the canonical list of orchestrator environment variables, and `CLAUDE.md` is the index that points at everything here.
+Three references live outside this directory because they are consumed where the work happens rather than read on demand: `.env.example` is the canonical list of orchestrator environment variables, `CLAUDE.md` is the index that points at everything here, and `src/__tests__/helpers/README.md` lists the shared test helpers and where a new one goes, beside the code a test author is changing.
 
 ## Diagram conventions
 

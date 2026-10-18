@@ -36,7 +36,7 @@ import { NoopStepReporter } from "../pipeline/reporter.js";
 import { DEFAULT_RETRY_POLICY, computeBackoffMs } from "../pipeline/retry-backoff.js";
 import type { FailureRecord } from "../pipeline/failure-classification.js";
 import type { LLMExecutor, Step, StepReporter } from "../pipeline/types.js";
-import { makeSnapshot } from "./configured-run-fixture.js";
+import { makeSnapshot } from "./helpers/fixtures/configured-run.js";
 import { makeContext } from "./helpers/builders.js";
 import { testDir } from "./helpers/test-dir.js";
 

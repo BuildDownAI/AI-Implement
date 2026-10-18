@@ -11,11 +11,6 @@ vi.mock("../github-app-auth.js", () => ({
   clearTokenCache: vi.fn(),
 }));
 
-vi.mock("../linear-app-auth.js", () => ({
-  isLinearAuthConfigured: vi.fn(),
-  withLinearToken: vi.fn(),
-}));
-
 class MockRequest extends EventEmitter {
   url?: string;
   method?: string;

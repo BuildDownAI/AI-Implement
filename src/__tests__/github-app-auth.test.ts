@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { generateKeyPairSync } from "node:crypto";
 import { getInstallationToken, getInstallationId, refreshInstallationToken, getInstallation, getAppSlug, installationIncludesRepo, clearTokenCache, createAppJwt, getScopedInstallationToken, mintSourceTokenOrJwt } from "../github-app-auth.js";
 import { fakeFetch, type Reply, type ReplyInit } from "./helpers/fake-fetch.js";
-import { githubError } from "./helpers/github-replies.js";
+import { githubError } from "./helpers/replies/github.js";
 
 // Generate a real RSA key pair for tests so JWT signing works correctly
 const { privateKey } = generateKeyPairSync("rsa", {

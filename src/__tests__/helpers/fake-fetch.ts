@@ -1,7 +1,7 @@
 // A fake fetch for tests (AII-925). A test describes the HTTP API it expects as a route table
 // and passes `fake.fetch` wherever a module takes `fetchImpl`, or calls `fake.install()` for code
 // that calls the global fetch. Every request is recorded, and a request the table does not expect
-// fails the test, even when the code under test catches the error. See docs/unit-tests.md § Harnesses.
+// fails the test, even when the code under test catches the error. See README.md in this directory.
 import { onTestFinished } from "vitest";
 
 export type Method = "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE";

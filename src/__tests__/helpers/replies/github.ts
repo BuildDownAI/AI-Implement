@@ -1,6 +1,6 @@
 // fakeFetch replies shaped like GitHub's REST API (AII-1073), for the responses several test files fake
-// the same way. See docs/unit-tests.md § Harnesses.
-import type { Reply } from "./fake-fetch.js";
+// the same way. See ../README.md.
+import type { Reply } from "../fake-fetch.js";
 
 /** The contents API's answer for a file (`GET /repos/{owner}/{repo}/contents/{path}`): its text, base64-encoded. */
 export function githubFile(text: string): Reply {

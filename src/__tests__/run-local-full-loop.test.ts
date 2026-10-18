@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { encodeRunConfig, encodeTrustedRunConfig } from "../run-config.js";
 import { formatLocalFullLoopEntrypointError, runLocalFullLoopFromEnv } from "../run-local-full-loop.js";
-import { makeGrant, makeSnapshot } from "./configured-run-fixture.js";
+import { makeGrant, makeSnapshot } from "./helpers/fixtures/configured-run.js";
 
 describe("runLocalFullLoopFromEnv", () => {
   it("runs planning and implementation from the dev-run task envelope", async () => {

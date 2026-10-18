@@ -11,7 +11,7 @@ import { buildEnvelopeDispatchInputs } from "../github.js";
 import { resolveRunnerImageForDispatch, __clearRepoImageCacheForTests } from "../repo-image.js";
 import { makeContext as makeBaseContext, makeExecutor, makeMapping } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type Reply, type Routes } from "./helpers/fake-fetch.js";
-import { githubFile } from "./helpers/github-replies.js";
+import { githubFile } from "./helpers/replies/github.js";
 import { testDir } from "./helpers/test-dir.js";
 
 // Pass-through spy: every test keeps the real refresh unless it overrides the
@@ -6164,7 +6164,7 @@ describe("makeDevHarnessDependencyAuthStep", () => {
 
 // ── runKgRefresh() with stage configuration (AII-960) ─────────────────────────
 
-import { NOW, SENTINEL_BEARER, envelopeEnv, fakeClient, makeGrant, makeSnapshot } from "./configured-run-fixture.js";
+import { NOW, SENTINEL_BEARER, envelopeEnv, fakeClient, makeGrant, makeSnapshot } from "./helpers/fixtures/configured-run.js";
 import type { LLMExecutor, PipelineContext } from "../pipeline/types.js";
 
 describe("runKgRefresh stage configuration", () => {
