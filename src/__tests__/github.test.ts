@@ -1,11 +1,11 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import { dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime, getDefaultBranchFileText, listPrComments } from "../github.js";
 import { decodeRunConfig } from "../run-config.js";
 import { buildIssueBranchName } from "../pipeline/branch-name.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { makeMapping } from "./helpers/builders.js";
 import { fakeFetch, type ReplyInit } from "./helpers/fake-fetch.js";
-import { githubError } from "./helpers/github-replies.js";
+import { githubError, githubFile } from "./helpers/github-replies.js";
 
 const mockMapping = makeMapping();
 
@@ -167,6 +167,49 @@ describe("postWorkflowDispatch — returnRunDetails opt-in", () => {
       runId: 555,
       runUrl: "https://github.com/acme/widgets/actions/runs/555",
     });
+  });
+
+  it.each([
+    { workflow_run_id: 555 },
+    { workflow_run_id: 555, id: 555 },
+    { run: { id: 555 } },
+  ])("accepts documented dispatch IDs and compatible historical IDs: %j", async (fields) => {
+    const urls = {
+      run_url: "https://api.github.com/repos/acme/widgets/actions/runs/555",
+      html_url: "https://github.com/acme/widgets/actions/runs/555",
+    };
+    const body = "run" in fields ? { run: { ...fields.run, ...urls } } : { ...fields, ...urls };
+    fakeFetch({ [DISPATCHES]: { status: 200, json: body } }).install();
+
+    expect(await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true })).toEqual({
+      success: true, status: 200, outcome: "accepted", runId: 555, runUrl: urls.html_url,
+    });
+  });
+
+  it.each([
+    { name: "conflicting identity fields", fields: { id: 556 } },
+    { name: "a string run ID", fields: { workflow_run_id: "555" } },
+    { name: "a nonpositive run ID", fields: { workflow_run_id: 0 } },
+    { name: "an unsafe run ID", fields: { workflow_run_id: Number.MAX_SAFE_INTEGER + 1 } },
+    { name: "a different HTML run ID", fields: { html_url: "https://github.com/acme/widgets/actions/runs/556" } },
+    { name: "a different HTML repository", fields: { html_url: "https://github.com/other/widgets/actions/runs/555" } },
+    { name: "a different API run ID", fields: { run_url: "https://api.github.com/repos/acme/widgets/actions/runs/556" } },
+    { name: "a different API repository", fields: { run_url: "https://api.github.com/repos/other/widgets/actions/runs/555" } },
+  ])("does not bind $name in a documented response", async ({ fields }) => {
+    fakeFetch({
+      [DISPATCHES]: {
+        status: 200,
+        json: {
+          workflow_run_id: 555,
+          run_url: "https://api.github.com/repos/acme/widgets/actions/runs/555",
+          html_url: "https://github.com/acme/widgets/actions/runs/555",
+          ...fields,
+        },
+      },
+    }).install();
+
+    expect(await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true }))
+      .toEqual({ success: true, status: 200, outcome: "unknown" });
   });
 
   it("204 → accepted with unresolved identity, distinct from rejected", async () => {
@@ -957,29 +1000,28 @@ describe("listPullRequestFiles (AII-639)", () => {
 });
 
 describe("listPullRequestCommits (AII-1302)", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.unstubAllGlobals(); });
+  const COMMITS = "GET /repos/o/r/pulls/7/commits";
 
   it("follows Link rel=\"next\" and returns SHAs oldest first across pages", async () => {
     const page1 = Array.from({ length: 100 }, (_, i) => ({ sha: `sha-${i}` }));
     const page2 = [{ sha: "head" }];
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(new Response(JSON.stringify(page1), {
-        status: 200,
-        headers: { link: '<https://api.github.com/repos/o/r/pulls/7/commits?per_page=100&page=2>; rel="next"' },
-      }))
-      .mockResolvedValueOnce(new Response(JSON.stringify(page2), { status: 200 }));
+    const fake = fakeFetch({
+      [COMMITS]: [
+        { json: page1, headers: { link: '<https://api.github.com/repos/o/r/pulls/7/commits?per_page=100&page=2>; rel="next"' } },
+        { json: page2 },
+      ],
+    }).install();
     const shas = await listPullRequestCommits("tok", "o", "r", 7);
     expect(shas).toHaveLength(101);
     expect(shas[0]).toBe("sha-0");
     expect(shas[100]).toBe("head");
-    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
-    expect(String(vi.mocked(fetch).mock.calls[0][0])).toContain("/pulls/7/commits?per_page=100");
-    expect(String(vi.mocked(fetch).mock.calls[1][0])).toContain("page=2");
+    expect(fake.calls).toHaveLength(2);
+    expect(fake.calls[0].url.href).toContain("/pulls/7/commits?per_page=100");
+    expect(fake.calls[1].url.href).toContain("page=2");
   });
 
   it("throws on a non-OK page rather than reading it as no commits", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(new Response("nope", { status: 502 }));
+    fakeFetch({ [COMMITS]: githubError(502, "Server Error") }).install();
     await expect(listPullRequestCommits("tok", "o", "r", 7)).rejects.toThrow(/listPullRequestCommits failed: HTTP 502/);
   });
 });
@@ -1075,52 +1117,51 @@ describe("getCommitTime", () => {
 });
 
 describe("getDefaultBranchFileText", () => {
-  afterEach(() => { vi.unstubAllGlobals(); });
-  const stub = (res: unknown) => vi.stubGlobal("fetch", vi.fn(async () => res));
+  const X = "GET /repos/o/r/contents/x";
 
   it("decodes a base64 file and encodes each path segment", async () => {
-    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ type: "file", encoding: "base64", content: Buffer.from("a: 1\n").toString("base64") }) }));
-    vi.stubGlobal("fetch", fetchMock);
+    const fake = fakeFetch({ "GET /repos/o/r/contents/.ai-implement/my%20file%231.yml": githubFile("a: 1\n") }).install();
     expect(await getDefaultBranchFileText("t", "o", "r", ".ai-implement/my file#1.yml")).toBe("a: 1\n");
-    expect((fetchMock.mock.calls[0] as unknown as [string])[0]).toBe("https://api.github.com/repos/o/r/contents/.ai-implement/my%20file%231.yml");
+    expect(fake.calls[0].url.href).toBe("https://api.github.com/repos/o/r/contents/.ai-implement/my%20file%231.yml");
   });
 
   it("returns null on 404", async () => {
-    stub({ ok: false, status: 404, json: async () => ({}) });
+    fakeFetch({ [X]: githubError(404, "Not Found") }).install();
     expect(await getDefaultBranchFileText("t", "o", "r", "x")).toBeNull();
   });
 
   it("throws on other non-ok responses", async () => {
-    stub({ ok: false, status: 500, json: async () => ({}) });
+    fakeFetch({ [X]: githubError(500, "Server Error") }).install();
     await expect(getDefaultBranchFileText("t", "o", "r", "x")).rejects.toThrow(/500/);
   });
 
   it("returns null when the path is not a file", async () => {
-    stub({ ok: true, status: 200, json: async () => ({ type: "dir" }) });
+    // GitHub answers a directory with an array of its entries, not a file object.
+    fakeFetch({ [X]: { json: [{ type: "file", name: "a.yml", path: "x/a.yml" }] } }).install();
     expect(await getDefaultBranchFileText("t", "o", "r", "x")).toBeNull();
   });
 });
 
 describe("listPrComments strict option (AII-1309)", () => {
-  afterEach(() => { vi.unstubAllGlobals(); });
-  const page = (status: number, body: unknown, link?: string) =>
-    new Response(JSON.stringify(body), { status, ...(link ? { headers: { link } } : {}) });
+  const COMMENTS = "GET /repos/o/r/issues/5/comments";
 
   it("stops quietly on a non-ok response by default", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => page(502, {})));
+    fakeFetch({ [COMMENTS]: githubError(502, "Server Error") }).install();
     expect(await listPrComments("t", "o", "r", 5)).toEqual([]);
   });
 
   it.each([502, 403])("throws on a %s when strict", async (status) => {
-    vi.stubGlobal("fetch", vi.fn(async () => page(status, {})));
+    fakeFetch({ [COMMENTS]: githubError(status, "Request failed") }).install();
     await expect(listPrComments("t", "o", "r", 5, { strict: true })).rejects.toThrow(new RegExp(String(status)));
   });
 
   it("throws when strict and a later page fails", async () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(page(200, [{ id: 1, body: "a" }], '<https://api.github.com/next>; rel="next"'))
-      .mockResolvedValueOnce(page(502, {}));
-    vi.stubGlobal("fetch", fetchMock);
+    fakeFetch({
+      [COMMENTS]: [
+        { json: [{ id: 1, body: "a" }], headers: { link: '<https://api.github.com/repos/o/r/issues/5/comments?per_page=100&page=2>; rel="next"' } },
+        githubError(502, "Server Error"),
+      ],
+    }).install();
     await expect(listPrComments("t", "o", "r", 5, { strict: true })).rejects.toThrow(/502/);
   });
 });

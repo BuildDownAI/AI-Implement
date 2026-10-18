@@ -98,3 +98,10 @@ export interface LocalArtifactInput {
 export function readSummaryAttribution(parsed: { attribution?: unknown } | null | undefined): InvocationAttributionV1 | null {
   return sanitizeAttribution(parsed?.attribution);
 }
+
+/**
+ * Workspace-relative file (under git-excluded `ai-output/`) where the local full loop records the
+ * latest invocation's sanitized attribution: `{ latestAttribution }`. Not whole-run spend and not
+ * per-stage — only the last attribution the loop returned.
+ */
+export const LOCAL_FULL_LOOP_RESULT_FILE = "ai-output/local-full-loop-result.json";

@@ -180,6 +180,10 @@ export async function postRunnerResult(params: {
   guardVerdict?: "clean" | "refused" | "held";
   /** Per-part {part, prev, new} table from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
   partTable?: Array<{ part: string; prev: string; new: string }>;
+  /** Why a held kg-refresh waits: a content shrink or missing tracker data. */
+  cause?: "shrink" | "tracker-missing";
+  /** Teams whose tracker fetch failed, for a held kg-refresh. */
+  failedTeams?: string[];
   /**
    * Optional pilot marker (AII-769 Restate review-fix pilot; AII-770 contract).
    * Present only when this result comes from a Restate-owned review-fix
@@ -247,6 +251,8 @@ export async function postRunnerResult(params: {
   if (params.snapshotBranch) body.snapshotBranch = params.snapshotBranch;
   if (params.guardVerdict) body.guardVerdict = params.guardVerdict;
   if (params.partTable) body.partTable = params.partTable;
+  if (params.cause) body.cause = params.cause;
+  if (params.failedTeams) body.failedTeams = params.failedTeams;
   if (params.reviewFix) body.reviewFix = params.reviewFix;
   const url = `${callbackUrl.replace(/\/$/, "")}/runner/result`;
   const headers = { "Content-Type": "application/json", Authorization: `Bearer ${runToken}` };

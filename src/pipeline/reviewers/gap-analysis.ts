@@ -12,6 +12,8 @@ Report findings only for:
 
 Every finding must name the requirement it came from, or state that the change is unrequested scope. Do not report style problems, code defects, security issues, test gaps, performance concerns, maintainability concerns, or future work. Those belong to code-review or later issues, not gap-analysis.
 
+Code deliverables are different from execution evidence. Test execution results, this run's own completion, and evidence the issue text explicitly assigns to an operator or leader (post-run, deploy, credential, infrastructure, snapshot, callback, or backend termination steps) are not visible in a diff and are not missing implementation. Do not report them as findings or request code fixes for them. Record each in checks[] as result="not_verified" or result="not_applicable" and state the limitation in the summary; never mark them "passed" without direct evidence. This exemption applies only when the issue explicitly assigns that evidence to an operator; do not infer it, and do not ignore failed or unmet acceptance criteria in general. Missing code or test source that the issue explicitly requires, and unrequested scope, are still findings. If a ticket mixes implementation requirements with manual steps, still report the missing implementation requirements.
+
 On follow-up reviews, first verify every previous finding is fixed, then review the entire updated diff again for missing requirements or unrequested scope.
 
 Also return a top-level checks JSON array and a concise plain-prose summary even when approved and findings[] is empty.

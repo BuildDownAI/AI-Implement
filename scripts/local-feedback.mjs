@@ -357,7 +357,7 @@ function delay(ms, value) {
   return { promise, clear: () => clearTimeout(timer) };
 }
 
-export function makeCliDeps({ cliModule, localFeedback, artifactsDir, logsPath, signalProcess = process }) {
+export function makeCliDeps({ cliModule, localFeedback, artifactsDir, logsPath, signalProcess = process, echoStderr }) {
   const out = [];
   const err = [];
   const controller = new AbortController();
@@ -399,7 +399,7 @@ export function makeCliDeps({ cliModule, localFeedback, artifactsDir, logsPath, 
     stopContainer: async (handle) => { await execFileWithTimeout("docker", ["stop", "--time", "2", handle.containerName], 15_000); },
     spawnDocker: (args, stdio) => spawnSync("docker", args, { stdio }).status ?? 1,
     writeStdout: (text) => { out.push(text); if (logsPath) writeFileSync(logsPath, out.join("")); },
-    writeStderr: (text) => { err.push(text); },
+    writeStderr: (text) => { err.push(text); echoStderr?.(text); },
     now: () => Date.now(),
     cancelSignal: controller.signal,
   };
@@ -1007,10 +1007,27 @@ function summarizeResolvedStages(loaded) {
 }
 
 /** Final live evidence: result.json plus a summary that replaces the preflight one with the finished run's outcome. */
-export function writeLiveResult({ artifactsDir, exitCode, source, image, stages }) {
+export function writeLiveResult({ artifactsDir, exitCode, source, image, stages, runnerStarted = true, stderrArtifact }) {
   writeJson(join(artifactsDir, "result.json"), { exitCode, live: true });
-  const note = `Live production full loop finished with exit code ${exitCode}; runner.log and run/ hold the stage outcomes.`;
+  const where = runnerStarted
+    ? "runner.log and run/ hold the stage outcomes"
+    : "no runner was started, so there is no runner.log or run/ outcome";
+  const diagnostics = stderrArtifact ? `; ${stderrArtifact} holds the CLI diagnostics` : "";
+  const note = `Live production full loop finished with exit code ${exitCode}; ${where}${diagnostics}.`;
   writeFileSync(join(artifactsDir, "summary.md"), summarizeResult({ ok: exitCode === 0, mode: "live", source, image, artifactsDir, stages, note }), { mode: 0o600 });
+}
+
+const WITHHELD_NOTICE = "[local:feedback] CLI diagnostics withheld: they matched a sensitive-output pattern.\n";
+
+/** Persists the CLI's stderr diagnostics, withholding them when they match a sensitive-proof pattern. Returns the artifact name, or undefined when there was nothing to write. */
+export function writeLiveStderrArtifact({ artifactsDir, err }) {
+  const text = err.join("");
+  if (!text) return undefined;
+  const name = "runner.stderr.log";
+  const scan = assertNoSensitiveProofLeak([{ name, text }]);
+  const body = scan.ok ? text : WITHHELD_NOTICE;
+  writeFileSync(join(artifactsDir, name), body, { mode: 0o600 });
+  return name;
 }
 
 /**
@@ -1040,6 +1057,42 @@ export async function finishLiveRun({ runHarness, dispose, writeResult }) {
   return exitCode;
 }
 
+/** The post-gate live orchestration: runs the production CLI with captured, echoed stderr and records the result. */
+export async function runLiveHarness({ cliModule, artifactsDir, workspace, task, imageId, agentConfig, source, stages, signalProcess, echoStderr = (text) => process.stderr.write(text) }) {
+  // Nothing is echoed while the CLI runs: the sensitive-proof scan needs the whole text, so a marker split across writeStderr calls is still caught.
+  const { deps, err, dispose, getHandle } = makeCliDeps({ cliModule, artifactsDir: join(artifactsDir, "run"), logsPath: join(artifactsDir, "runner.log"), signalProcess });
+  const echoCaptured = () => {
+    const text = err.join("");
+    if (text) echoStderr(assertNoSensitiveProofLeak([{ name: "runner.stderr.log", text }]).ok ? text : WITHHELD_NOTICE);
+  };
+  let exitCode;
+  try {
+    exitCode = await finishLiveRun({
+      runHarness: () => cliModule.runDevHarnessCli(buildDevHarnessArgs({ workspace, task, imageId, agentConfig }), deps),
+      dispose,
+      // A harness that throws still leaves a failure summary rather than the preflight one.
+      writeResult: (code) => {
+        let stderrArtifact;
+        try {
+          stderrArtifact = writeLiveStderrArtifact({ artifactsDir, err });
+        } finally {
+          writeLiveResult({ artifactsDir, exitCode: code, source, image: imageId, stages, runnerStarted: getHandle() !== undefined, stderrArtifact });
+        }
+      },
+    });
+  } catch (error) {
+    // The run's own error outranks a broken diagnostic writer.
+    try {
+      echoCaptured();
+    } catch (echoError) {
+      console.error(`[local:feedback] could not echo the live diagnostics: ${echoError instanceof Error ? echoError.message : String(echoError)}`);
+    }
+    throw error;
+  }
+  echoCaptured();
+  return exitCode;
+}
+
 async function runLive(options) {
   ensureNode24();
   dockerAvailable();
@@ -1065,14 +1118,8 @@ async function runLive(options) {
   writeFileSync(join(artifactsDir, "summary.md"), summarizeResult({ ok: false, mode: "live-preflight", source, image: prior.imageId, artifactsDir, stages, note: "Live run manually requested; launching production full loop using the prior synthetic-gated runner image." }), { mode: 0o600 });
   console.error("[local:feedback] live stage selections:");
   console.error(JSON.stringify(stages, null, 2));
-  const { deps, dispose } = makeCliDeps({ cliModule, artifactsDir: join(artifactsDir, "run"), logsPath: join(artifactsDir, "runner.log") });
   const imageId = options.image ?? prior.imageId;
-  const exitCode = await finishLiveRun({
-    runHarness: () => cliModule.runDevHarnessCli(buildDevHarnessArgs({ workspace, task, imageId, agentConfig }), deps),
-    dispose,
-    // A harness that throws still leaves a failure summary rather than the preflight one.
-    writeResult: (code) => writeLiveResult({ artifactsDir, exitCode: code, source, image: imageId, stages }),
-  });
+  const exitCode = await runLiveHarness({ cliModule, artifactsDir, workspace, task, imageId, agentConfig, source, stages });
   return { ok: exitCode === 0, exitCode, artifactsDir };
 }
 

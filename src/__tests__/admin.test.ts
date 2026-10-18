@@ -60,6 +60,16 @@ vi.mock("../deploy-availability.js", async (importOriginal) => ({
 }));
 
 const mintSourceTokenOrJwtMock = vi.hoisted(() => vi.fn());
+const getScopedInstallationTokenMock = vi.hoisted(() => vi.fn());
+const fetchRepoTarballMock = vi.hoisted(() => vi.fn());
+const extractSourceMock = vi.hoisted(() => vi.fn());
+vi.mock("../deploy.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../deploy.js")>();
+  return {
+    ...actual,
+    extractSource: extractSourceMock,
+  };
+});
 const getInstallationTokenMock = vi.hoisted(() =>
   vi.fn<typeof import("../github-app-auth.js").getInstallationToken>(async () => "gh-token-mock"),
 );
@@ -67,6 +77,7 @@ vi.mock("../github-app-auth.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../github-app-auth.js")>()),
   mintSourceTokenOrJwt: mintSourceTokenOrJwtMock,
   getInstallationToken: getInstallationTokenMock,
+  getScopedInstallationToken: getScopedInstallationTokenMock,
 }));
 
 const listRepoBranchesAndTagsMock = vi.hoisted(() => vi.fn());
@@ -76,15 +87,8 @@ vi.mock("../github.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../github.js")>()),
   listRepoBranchesAndTags: listRepoBranchesAndTagsMock,
   getRepoDefaultBranch: getRepoDefaultBranchMock,
+  fetchRepoTarball: fetchRepoTarballMock,
   cancelWorkflowRun: cancelWorkflowRunMock,
-}));
-
-const isLinearAuthConfiguredMock = vi.hoisted(() => vi.fn(() => false));
-const withLinearTokenMock = vi.hoisted(() => vi.fn());
-vi.mock("../linear-app-auth.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../linear-app-auth.js")>()),
-  isLinearAuthConfigured: isLinearAuthConfiguredMock,
-  withLinearToken: withLinearTokenMock,
 }));
 
 const readLocalJobLogsMock = vi.hoisted(() => vi.fn());
@@ -168,6 +172,7 @@ const loaders = {
   retention: () => import("../restate/retention.js"),
   githubErrors: () => import("../github-errors.js"),
   toolsClient: () => import("../restate/tools-client.js"),
+  agentConfigStore: () => import("../agent-config-store.js"),
 };
 
 type Modules = LoadedModules<typeof loaders>;
@@ -189,6 +194,8 @@ let provider: FakeProvider;
 beforeEach(async () => {
   // Nothing here reaches the network: a test whose code does gets this empty table and fails.
   fakeFetch({}).install();
+  // Armed per test by the KG-manifest tests; reset so one test's answers never reach the next.
+  for (const mock of [getScopedInstallationTokenMock, getRepoDefaultBranchMock, fetchRepoTarballMock, extractSourceMock]) mock.mockReset();
   db = await testDb({ modules: loaders });
   modules = db.modules;
   ({ admin, config, dedup, log, installState, queue, adminSession, accessEntries, accessAudit, accessGrants } = modules);
@@ -5549,17 +5556,26 @@ describe("GET /api/deploy-refs", () => {
   });
 });
 
-// ---------- GET /api/kg/tracker-data (AII-597) ----------
+// ---------- GET /api/kg/tracker-data (AII-597, AII-1463) ----------
 
-/** One page of Linear's issues query, as `withLinearToken` returns it. */
-function linearPage(issues: unknown[], pageInfo: { hasNextPage: boolean; endCursor: string | null }): Response {
-  return Response.json({ data: { issues: { nodes: issues, pageInfo } } });
+type TrackerPageResult =
+  | { ok: true; page: { issues: unknown[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } } }
+  | { ok: false; code: "tracker-unavailable" | "tracker-failed" | "unavailable" };
+
+function trackerOk(
+  issues: unknown[],
+  pageInfo: { hasNextPage: boolean; endCursor: string | null } = { hasNextPage: false, endCursor: null },
+): TrackerPageResult {
+  return { ok: true, page: { issues, pageInfo } };
 }
 
 describe("GET /api/kg/tracker-data", () => {
+  const page = vi.fn();
+
   async function trackerDataRequest(
     qs: string,
     token?: string,
+    deps: Record<string, unknown> = { trackerExport: { page } },
   ): Promise<{ statusCode: number; body: string }> {
     const req = new MockRequest(
       `/api/kg/tracker-data${qs}`,
@@ -5567,14 +5583,13 @@ describe("GET /api/kg/tracker-data", () => {
       token ? { authorization: `Bearer ${token}` } : {},
     );
     const res = new MockResponse();
-    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider));
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps as never);
     await res.done;
     return { statusCode: res.statusCode, body: res.body };
   }
 
   beforeEach(() => {
-    isLinearAuthConfiguredMock.mockReset();
-    withLinearTokenMock.mockReset();
+    page.mockReset();
   });
 
   it("returns 401 when unauthenticated", async () => {
@@ -5586,69 +5601,73 @@ describe("GET /api/kg/tracker-data", () => {
     const token = await login("secret");
     const res = await trackerDataRequest("?team=ZZZ", token);
     expect(res.statusCode).toBe(403);
+    expect(page).not.toHaveBeenCalled();
   });
 
-  it("treats a missing team as the default all-teams scope rather than 403 — 503 here since Linear is unconfigured", async () => {
+  it("answers 503 unavailable when no tracker client is injected", async () => {
     const token = await login("secret");
-    isLinearAuthConfiguredMock.mockReturnValue(false);
-    const res = await trackerDataRequest("", token);
-    expect(res.statusCode).toBe(503);
+    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
+    const single = await trackerDataRequest("?team=AII", token, {});
+    const all = await trackerDataRequest("", token, {});
+    expect(single.statusCode).toBe(503);
+    expect(JSON.parse(single.body)).toEqual({ error: "unavailable" });
+    expect(all.statusCode).toBe(503);
   });
 
   it("returns the flat array of issues for a single-page team — the shape the kg-refresh dev harness's --tracker-data file expects", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
-    isLinearAuthConfiguredMock.mockReturnValue(true);
     const issues = [{ id: "1", identifier: "AII-1", title: "Test issue" }];
-    withLinearTokenMock.mockResolvedValueOnce(linearPage(issues, { hasNextPage: false, endCursor: null }));
+    page.mockResolvedValueOnce(trackerOk(issues));
 
     const res = await trackerDataRequest("?team=AII", token);
 
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual(issues);
+    expect(page).toHaveBeenCalledWith({ team: "AII", cursor: null });
   });
 
-  it("aggregates issues across multiple pages via the same builder the runner route uses", async () => {
+  it("loops pages through the client, passing each endCursor on", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
-    isLinearAuthConfiguredMock.mockReturnValue(true);
     const page1 = [{ id: "1", identifier: "AII-1" }];
     const page2 = [{ id: "2", identifier: "AII-2" }];
-    withLinearTokenMock
-      .mockResolvedValueOnce(linearPage(page1, { hasNextPage: true, endCursor: "cursor-1" }))
-      .mockResolvedValueOnce(linearPage(page2, { hasNextPage: false, endCursor: null }));
+    page
+      .mockResolvedValueOnce(trackerOk(page1, { hasNextPage: true, endCursor: "cursor-1" }))
+      .mockResolvedValueOnce(trackerOk(page2));
 
     const res = await trackerDataRequest("?team=AII", token);
 
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual([...page1, ...page2]);
+    expect(page).toHaveBeenCalledTimes(2);
+    expect(page).toHaveBeenNthCalledWith(2, { team: "AII", cursor: "cursor-1" });
   });
 
-  it("returns 503 when Linear is not configured", async () => {
-    const token = await login("secret");
-    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
-    isLinearAuthConfiguredMock.mockReturnValue(false);
+  it.each(["tracker-unavailable", "tracker-failed", "unavailable"] as const)(
+    "answers 503 %s and sends no partial array when a page is not OK",
+    async (code) => {
+      const token = await login("secret");
+      await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
+      page
+        .mockResolvedValueOnce(trackerOk([{ id: "1" }], { hasNextPage: true, endCursor: "c1" }))
+        .mockResolvedValueOnce({ ok: false, code });
 
-    const res = await trackerDataRequest("?team=AII", token);
+      const res = await trackerDataRequest("?team=AII", token);
 
-    expect(res.statusCode).toBe(503);
-  });
-
-  it("propagates an upstream Linear failure as the same status the runner route would return", async () => {
-    const token = await login("secret");
-    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
-    isLinearAuthConfiguredMock.mockReturnValue(true);
-    withLinearTokenMock.mockResolvedValueOnce(Response.json({}, { status: 500 }));
-
-    const res = await trackerDataRequest("?team=AII", token);
-
-    expect(res.statusCode).toBe(502);
-  });
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body)).toEqual({ error: code });
+    },
+  );
 });
 
 // ---------- GET /api/kg/tracker-data — no-team default scope (AII-608) ----------
 
 describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () => {
+  const page = vi.fn();
+  /** The scoped mint for the KG source repository, as `getScopedInstallationToken` returns it. */
+  const manifestRepoToken = () => ({ token: "ghs_kg_manifest", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 1 });
+
   async function trackerDataRequest(
     qs: string,
     token?: string,
@@ -5665,19 +5684,18 @@ describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () =>
       res as never,
       { ...adminConfig("secret"), ...overrides },
       makeFakeRegistry(provider),
+      { trackerExport: { page } } as never,
     );
     await res.done;
     return { statusCode: res.statusCode, body: res.body };
   }
 
   beforeEach(() => {
-    isLinearAuthConfiguredMock.mockReset();
-    withLinearTokenMock.mockReset();
+    page.mockReset();
   });
 
   it("returns 200 with an empty array when no teams are in scope", async () => {
     const token = await login("secret");
-    isLinearAuthConfiguredMock.mockReturnValue(true);
 
     const res = await trackerDataRequest("", token);
 
@@ -5685,27 +5703,13 @@ describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () =>
     expect(JSON.parse(res.body)).toEqual([]);
   });
 
-  it("returns 503 when Linear is not configured, before any per-team fetch is attempted", async () => {
-    const token = await login("secret");
-    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
-    isLinearAuthConfiguredMock.mockReturnValue(false);
-
-    const res = await trackerDataRequest("", token);
-
-    expect(res.statusCode).toBe(503);
-    expect(withLinearTokenMock).not.toHaveBeenCalled();
-  });
-
   it("unions issues across every Linear-mapped team", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
     await request("/api/mappings", "POST", "secret", { teamKey: "BUI", owner: "org", repo: "bui" }, token);
-    isLinearAuthConfiguredMock.mockReturnValue(true);
     const aiiIssues = [{ id: "1", identifier: "AII-1" }];
     const buiIssues = [{ id: "2", identifier: "BUI-1" }];
-    withLinearTokenMock
-      .mockResolvedValueOnce(linearPage(aiiIssues, { hasNextPage: false, endCursor: null }))
-      .mockResolvedValueOnce(linearPage(buiIssues, { hasNextPage: false, endCursor: null }));
+    page.mockResolvedValueOnce(trackerOk(aiiIssues)).mockResolvedValueOnce(trackerOk(buiIssues));
 
     const res = await trackerDataRequest("", token);
 
@@ -5719,11 +5723,8 @@ describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () =>
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
     await request("/api/mappings", "POST", "secret", { teamKey: "BUI", owner: "org", repo: "bui" }, token);
-    isLinearAuthConfiguredMock.mockReturnValue(true);
     const shared = { id: "shared-1", identifier: "AII-1" };
-    withLinearTokenMock
-      .mockResolvedValueOnce(linearPage([shared], { hasNextPage: false, endCursor: null }))
-      .mockResolvedValueOnce(linearPage([shared], { hasNextPage: false, endCursor: null }));
+    page.mockResolvedValueOnce(trackerOk([shared])).mockResolvedValueOnce(trackerOk([shared]));
 
     const res = await trackerDataRequest("", token);
 
@@ -5731,7 +5732,7 @@ describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () =>
     expect(JSON.parse(res.body)).toEqual([shared]);
   });
 
-  it("excludes a Jira-mapped team from the union without failing the whole request", async () => {
+  it("includes a Jira-mapped team in the union", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
     await request("/api/mappings", "POST", "secret", {
@@ -5739,35 +5740,83 @@ describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () =>
       ticketingProvider: "jira",
       ticketingConfig: { kind: "jira", jql: "project = ACME", repoFieldValue: "org/jira-app" },
     }, token);
-    isLinearAuthConfiguredMock.mockReturnValue(true);
     const aiiIssues = [{ id: "1", identifier: "AII-1" }];
-    withLinearTokenMock.mockResolvedValueOnce(linearPage(aiiIssues, { hasNextPage: false, endCursor: null }));
+    const jiraIssues = [{ id: "10001", identifier: "ACME-1" }];
+    page.mockResolvedValueOnce(trackerOk(aiiIssues)).mockResolvedValueOnce(trackerOk(jiraIssues));
 
     const res = await trackerDataRequest("", token);
 
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual(aiiIssues);
-    expect(withLinearTokenMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(res.body)).toEqual(expect.arrayContaining([...aiiIssues, ...jiraIssues]));
+    expect(page).toHaveBeenCalledTimes(2);
+    expect(page.mock.calls.map((c) => c[0].team).sort()).toEqual(["AII", "JIRA1"]);
   });
 
-  it("short-circuits with a single coherent error when one team's fetch fails upstream, rather than a partial 200", async () => {
+  it("short-circuits with 503 and the code when one team's page is not OK, rather than a partial 200", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
     await request("/api/mappings", "POST", "secret", { teamKey: "BUI", owner: "org", repo: "bui" }, token);
-    isLinearAuthConfiguredMock.mockReturnValue(true);
-    withLinearTokenMock.mockImplementation(async () => Response.json({}, { status: 500 }));
+    page.mockResolvedValue({ ok: false, code: "tracker-failed" });
 
     const res = await trackerDataRequest("", token);
 
-    expect(res.statusCode).toBe(502);
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "tracker-failed" });
+    expect(page).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips a manifest team with no mapping, logs it, and still answers 200 with the mapped team's issues", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
+    const dir = testDir("kg-manifest");
+    fs.writeFileSync(path.join(dir, "sources.yml"), "trackers:\n  - team: GHOST\n  - team: AII\n");
+    getScopedInstallationTokenMock.mockResolvedValue(manifestRepoToken());
+    getRepoDefaultBranchMock.mockResolvedValue("main");
+    fetchRepoTarballMock.mockResolvedValue(Buffer.from(""));
+    extractSourceMock.mockResolvedValue(dir);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const aiiIssues = [{ id: "1", identifier: "AII-1" }];
+    page.mockResolvedValue(trackerOk(aiiIssues));
+    try {
+      const res = await trackerDataRequest("", token, { kgSourceRepo: "org/kg" });
+
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual(aiiIssues);
+      expect(page.mock.calls.map((c) => c[0].team)).toEqual(["AII"]);
+      const skipLines = warn.mock.calls.map((c) => String(c[0])).filter((l) => l.includes("no orchestrator mapping"));
+      expect(skipLines).toHaveLength(1);
+      expect(skipLines[0]).toContain("GHOST");
+      expect(skipLines[0]).not.toContain("AII,");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("emits no skip line when every manifest team is mapped", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
+    const dir = testDir("kg-manifest");
+    fs.writeFileSync(path.join(dir, "sources.yml"), "trackers:\n  - team: AII\n");
+    getScopedInstallationTokenMock.mockResolvedValue(manifestRepoToken());
+    getRepoDefaultBranchMock.mockResolvedValue("main");
+    fetchRepoTarballMock.mockResolvedValue(Buffer.from(""));
+    extractSourceMock.mockResolvedValue(dir);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    page.mockResolvedValue(trackerOk([]));
+    try {
+      const res = await trackerDataRequest("", token, { kgSourceRepo: "org/kg" });
+      expect(res.statusCode).toBe(200);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("no orchestrator mapping"))).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("degrades to mapped-teams-only when the KG manifest fetch fails (e.g. a malformed kgSourceRepo)", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
-    isLinearAuthConfiguredMock.mockReturnValue(true);
     const aiiIssues = [{ id: "1", identifier: "AII-1" }];
-    withLinearTokenMock.mockResolvedValueOnce(linearPage(aiiIssues, { hasNextPage: false, endCursor: null }));
+    page.mockResolvedValueOnce(trackerOk(aiiIssues));
 
     const res = await trackerDataRequest("", token, { kgSourceRepo: "not-a-valid-repo-slug" });
 
@@ -6116,7 +6165,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
   it("keeps old revisions on PATCH and refuses new grants for a disabled profile", async () => {
     const t = await seed();
-    const store = await import("../agent-config-store.js");
+    const store = modules.agentConfigStore;
     const patched = await call("/api/model-accounts/oai-1", "PATCH", t, { identity: "Renamed" });
     expect(patched.json).toMatchObject({ revision: 2, identity: "Renamed", profileStatus: "active" });
     expect(store.getAccountProfileRevision("oai-1", 1)?.identity).toBe("OpenAI team key");
@@ -6218,7 +6267,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
     it("inspects the candidate without publishing it: nothing is stored while inspection is pending or after a refusal", async () => {
       const t = await seed();
-      const store = await import("../agent-config-store.js");
+      const store = modules.agentConfigStore;
       const revs = count("stage_agent_config_revisions");
       let release!: () => void;
       let entered!: () => void;
@@ -6244,7 +6293,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
     it("refuses to commit readiness when the defaults, a profile or the project head moved during inspection", async () => {
       const t = await seed();
-      const store = await import("../agent-config-store.js");
+      const store = modules.agentConfigStore;
       const moves: Array<[string, () => void]> = [
         ["defaults", () => store.setOrchestratorDefaults({ version: 1, ...defaults, stages: { ...defaults.stages, review: { ...defaults.stages.review, model: "gpt-y" } } } as never)],
         ["profile", () => void store.saveAccountProfileRevision({ profileId: "oai-1", revision: store.getAccountProfile("oai-1")!.revision + 1, identity: "renamed", agent: "codex", provider: "openai", authMode: "openai-api-key", allowedProjectKeys: ["APP"], metadata: { credentialRef: SENTINEL } } as never)],
@@ -6267,7 +6316,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
     it("keeps legacy, disabled and Claude-subscription candidates fail-closed without storing them", async () => {
       const t = await seed();
-      const store = await import("../agent-config-store.js");
+      const store = modules.agentConfigStore;
       const inspect = vi.fn(async () => ({ status: "ready", profiles: [] }));
       const r = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true, stages: { review: { accountProfileId: "missing" } } }, readyDeps(inspect));
       expect(r.status).toBe(400);
@@ -6323,7 +6372,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
   it("keeps ordinary mapping CRUD from touching agent configuration", async () => {
     const t = await seed();
-    const store = await import("../agent-config-store.js");
+    const store = modules.agentConfigStore;
     const body = { enabled: true, agentConfig: { mode: "configured" } };
     await request("/api/mappings", "POST", "secret", { teamKey: "APP", owner: "org", repo: "app", ...body }, t);
     await request("/api/mappings/APP", "PATCH", "secret", body, t);

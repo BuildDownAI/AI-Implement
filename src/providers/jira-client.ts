@@ -27,6 +27,7 @@ export interface JiraComment {
   id: string;
   body: unknown; // ADF JSON
   created?: string; // ISO 8601 timestamp
+  author?: { displayName?: string } | null;
 }
 
 export interface JiraField {
@@ -50,6 +51,8 @@ export class JiraFieldNotSelectError extends Error {
     this.name = "JiraFieldNotSelectError";
   }
 }
+
+const SEARCH_PAGE_SIZE = 100;
 
 export class JiraClient {
   private readonly apiBase: string;
@@ -139,7 +142,7 @@ export class JiraClient {
    * GET /search is deprecated). Pages with nextPageToken. Caps at MAX_PAGES.
    */
   async searchJql(jql: string, fields: string[]): Promise<JiraIssue[]> {
-    const PAGE_SIZE = 100;
+    const PAGE_SIZE = SEARCH_PAGE_SIZE;
     const MAX_PAGES = 20;
     const all: JiraIssue[] = [];
     let nextPageToken: string | undefined;
@@ -160,6 +163,24 @@ export class JiraClient {
     } while (nextPageToken);
 
     return all;
+  }
+
+  /**
+   * One page of POST /rest/api/3/search/jql. The caller owns the loop: pass the
+   * previous page's `nextPageToken` (omit for the first page); an absent token in
+   * the result means the last page. Same request body as `searchJql`.
+   */
+  async searchJqlPage(
+    jql: string,
+    fields: string[],
+    nextPageToken?: string,
+  ): Promise<{ issues: JiraIssue[]; nextPageToken?: string }> {
+    const body: Record<string, unknown> = { jql, fields, maxResults: SEARCH_PAGE_SIZE };
+    if (nextPageToken) body.nextPageToken = nextPageToken;
+    const res = await this.requestJson<{ issues?: JiraIssue[]; nextPageToken?: string }>(
+      "POST", "/rest/api/3/search/jql", body,
+    );
+    return { issues: res.issues ?? [], nextPageToken: res.nextPageToken || undefined };
   }
 
   /** Validate JQL without executing it via /rest/api/3/jql/parse. */

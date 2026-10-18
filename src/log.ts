@@ -998,6 +998,11 @@ function readAttributionsByDispatch(dispatchIds: Array<string | null>): Map<stri
   return out;
 }
 
+/** The same bounded projection as Job.attribution, also for dispatches without a legacy job. */
+export function getInvocationAttribution(dispatchId: string): InvocationAttributionV1 | null {
+  return readAttributionsByDispatch([dispatchId]).get(dispatchId) ?? null;
+}
+
 const INVOCATION_STATUS: Record<InvocationUsageRow["outcome"], string> = {
   success: "succeeded",
   max_turns: "failed",

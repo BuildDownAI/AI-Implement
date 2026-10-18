@@ -284,6 +284,8 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
         failureReason: "KG_SNAPSHOT_HELD: content regression detected",
         guardVerdict: "held",
         partTable,
+        cause: "tracker-missing",
+        failedTeams: ["X"],
         snapshotPr: 21,
         snapshotCommit: "abc",
         snapshotBranch: "kg-refresh/20260912T100000Z",
@@ -304,6 +306,8 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
         snapshotCommit: "abc",
         snapshotBranch: "kg-refresh/20260912T100000Z",
         partTable,
+        cause: "tracker-missing",
+        failedTeams: ["X"],
       }),
       { idempotencyKey: dispatchId },
     );

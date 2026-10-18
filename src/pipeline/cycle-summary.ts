@@ -53,7 +53,7 @@ export interface CycleSummary {
    *  different content is rejected (the first-recorded summary wins) rather than silently
    *  replacing it — see `appendCycleSummary`. */
   id: string;
-  stage: "feedback-loop" | "post-push-review-fix";
+  stage: "feedback-loop" | "post-push-review-fix" | "publication";
   cycle: number;
   inputCommit: string | null;
   outputCommit: string | null;
@@ -158,7 +158,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export function isCycleSummary(value: unknown): value is CycleSummary {
   if (!isRecord(value)) return false;
   if (typeof value.id !== "string" || value.id.length === 0 || value.id.length > 128) return false;
-  if (value.stage !== "feedback-loop" && value.stage !== "post-push-review-fix") return false;
+  if (value.stage !== "feedback-loop" && value.stage !== "post-push-review-fix" && value.stage !== "publication") return false;
   if (!Number.isSafeInteger(value.cycle) || (value.cycle as number) <= 0) return false;
   if ((value.inputCommit !== null && (typeof value.inputCommit !== "string" || value.inputCommit.length > 40))
     || (value.outputCommit !== null && (typeof value.outputCommit !== "string" || value.outputCommit.length > 40))) return false;
@@ -262,6 +262,74 @@ function appendCycleSummary(workspaceDir: string, record: CycleSummary): void {
   }
   const all = [...existing, record];
   fs.writeFileSync(filePath, `${all.map((s) => JSON.stringify(s)).join("\n")}\n`, "utf-8");
+}
+
+export const PUBLICATION_CYCLE_ID = "publication.1";
+
+/**
+ * Builds the one distinct publication record emitted after the pipeline-owned push succeeds. The
+ * immutable pre-push `feedback-loop.N` records stay `pending_push`/`outputCommit:null`; this record
+ * carries the actual pushed commit and the agent's validated dispositions, and reuses the final
+ * feedback-loop cycle's tests and verdict verbatim (missing stays missing) and carries null usage.
+ * Only a successful runner result with an explicitly approving source verdict yields a record.
+ * Returns null without a feedback-loop source cycle or a pushed commit. `completedAt` is derived from
+ * the source cycle, so every delivery of the same run is byte-identical (idempotent, never a 409).
+ */
+export function buildPublicationCycleSummary(
+  summaries: readonly CycleSummary[],
+  outputCommit: string | null,
+  dispositions: readonly CycleDisposition[],
+  resultOutcome: "success" | "failure",
+): CycleSummary | null {
+  if (resultOutcome !== "success") return null;
+  if (!outputCommit || outputCommit.length > 40) return null;
+  const feedback = summaries.filter((s) => s.stage === "feedback-loop");
+  const source = feedback.reduce<CycleSummary | null>((best, s) => (!best || s.cycle > best.cycle ? s : best), null);
+  // Approval-bearing coverage needs an explicit approving native verdict; a false/null verdict keeps
+  // only the truthful pre-push records (the job's green exit never stands in for review success).
+  if (!source || source.verdict.approved !== true) return null;
+  const full: CycleSummary = {
+    id: PUBLICATION_CYCLE_ID,
+    stage: "publication",
+    cycle: 1,
+    inputCommit: source.inputCommit,
+    outputCommit,
+    outputCommitStatus: "committed",
+    dispositions: dispositions.slice(0, MAX_DISPOSITION_ENTRIES).map((d) => ({
+      key: d.key.slice(0, MAX_DISPOSITION_FIELD_CHARS), disposition: d.disposition.slice(0, MAX_DISPOSITION_FIELD_CHARS),
+    })),
+    tests: source.tests,
+    verdict: source.verdict,
+    // Publication is not a model invocation: measured usage stays on the source cycle, never duplicated.
+    usage: { tokensIn: null, tokensOut: null, costUsd: null },
+    truncated: source.truncated,
+    limitReached: source.limitReached,
+    completedAt: source.completedAt,
+  };
+  const fits = (r: CycleSummary): boolean => isCycleSummary(r as unknown);
+  if (fits(full)) return full;
+  const record: CycleSummary = full;
+  // Over the byte cap: shed non-coverage evidence first (tests, then verdict detail), keeping the
+  // dispositions the approval gate needs; flag the loss via truncated/limitReached.
+  const shrunk: CycleSummary[] = [
+    { ...record, tests: record.tests.slice(0, OVERFLOW_ENTRY_CAP) },
+    { ...record, tests: [SIZE_LIMIT_TEST_PLACEHOLDER], verdict: { approved: record.verdict.approved, reason: record.verdict.reason } },
+  ].map((r) => ({ ...r, truncated: true, limitReached: true }));
+  for (const candidate of shrunk) if (fits(candidate)) return candidate;
+  // Dispositions alone overflow: keep as many as fit rather than publishing nothing.
+  let fallback: CycleSummary = shrunk[1];
+  while (fallback.dispositions.length > 0 && !fits(fallback)) {
+    fallback = { ...fallback, dispositions: fallback.dispositions.slice(0, Math.floor(fallback.dispositions.length * 0.9)) };
+  }
+  if (fits(fallback)) {
+    console.warn(
+      `[cycle-summary] publication record exceeded the ${CYCLE_SUMMARY_MAX_BYTES}-byte cap; ` +
+        `kept ${fallback.dispositions.length}/${record.dispositions.length} dispositions`,
+    );
+    return fallback;
+  }
+  console.warn(`[cycle-summary] publication record could not be bounded to ${CYCLE_SUMMARY_MAX_BYTES} bytes; omitting it`);
+  return null;
 }
 
 /** Redacts, then caps `value` to `maxChars`; `truncated` is explicit rather than inferred from

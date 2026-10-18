@@ -221,6 +221,46 @@ describe("production managed GHA review-fix launch", () => {
     expect(response.headers.get("cache-control")).toBe("no-store");
   });
 
+  it("checks out after the actual dispatch helper reads GitHub's documented acknowledgement", async () => {
+    const github = await import("../github.js");
+    const actual = await vi.importActual<typeof import("../github.js")>("../github.js");
+    vi.spyOn(github, "postWorkflowDispatch").mockImplementation(actual.postWorkflowDispatch);
+    const fixtureFetch = globalThis.fetch;
+    vi.stubGlobal("fetch", async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      if (String(input).includes("/actions/workflows/") && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { inputs: DispatchInputs; return_run_details: boolean };
+        expect(body.return_run_details).toBe(true);
+        sent.push(body.inputs);
+        return Response.json({
+          workflow_run_id: 9100,
+          run_url: "https://api.github.com/repos/acme/app/actions/runs/9100",
+          html_url: "https://github.com/acme/app/actions/runs/9100",
+        });
+      }
+      return fixtureFetch(input, init);
+    });
+    const { worker, plan } = await launch();
+    const result = await worker.launch(plan);
+    const grant = (await decode()).credentials?.modelAuthGrant;
+    if (!grant || !("bearer" in grant)) throw new Error("expected plain GHA bootstrap");
+    const { createModelAuthRoutes } = await import("../model-auth-routes.js");
+    const routes = createModelAuthRoutes({ runtime, onFly: false, requestPlanRefresh: async () => {} });
+    server = http.createServer((req, res) => { void routes.handle(req, res); });
+    await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
+    const response = await nativeFetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/runner/model-auth/checkout`, {
+      method: "POST", headers: { authorization: `Bearer ${grant.bearer}`, "content-type": "application/json" },
+      body: JSON.stringify({ version: 1, profileId: "cdx" }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain(ACCESS);
+    expect(result).toEqual({ status: "accepted", execution: { githubRunId: 9100, githubRunAttempt: 1 } });
+    expect(revoked()).toBeNull();
+    expect(sent).toHaveLength(1);
+    expect(count("run_agent_config_snapshots")).toBe(1);
+    expect(count("model_credential_grants")).toBe(1);
+    for (const data of [plan, result]) expect(JSON.stringify(data)).not.toContain(grant.bearer);
+  });
+
   it.each(["codex-subscription", "openai-api-key"] as const)("runs the actual configured implementation executor with selected %s credentials", async (authMode) => {
     if (authMode === "openai-api-key") {
       profiles.saveAccountProfileRevision({ profileId: "api", identity: "api", revision: 1, agent: "codex", provider: "openai",

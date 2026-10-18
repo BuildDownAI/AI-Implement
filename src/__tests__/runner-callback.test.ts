@@ -9,6 +9,8 @@ import type * as ReviewLedgerStoreModule from "../review-ledger-store.js";
 import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
 import type * as ReviewFixEvidenceModule from "../review-fix-evidence.js";
+import type * as ReviewFixAttemptStoreModule from "../review-fix-attempt-store.js";
+import type * as ReviewFixAdminFacadeModule from "../review-fix-admin-facade.js";
 import type { CycleSummary } from "../pipeline/cycle-summary.js";
 import { formatFailureComment, boundStatusText } from "../runner-callback.js";
 import { FakeProvider } from "./providers/fake.js";
@@ -22,7 +24,7 @@ import type {
   ReviewFixResultMetadataV1,
   ResultIntakeOutcome,
 } from "../review-fix-contract.js";
-import { makeIssue, makeReviewFixResult } from "./helpers/builders.js";
+import { makeAppendLogEntry, makeIssue, makeReviewFixResult } from "./helpers/builders.js";
 import { testDb } from "./helpers/test-db.js";
 
 // ---------- Hoisted mocks for AII-749 lease-rejected handling ----------
@@ -71,11 +73,14 @@ let reviewStore: typeof ReviewLedgerStoreModule;
 let reviewFixQueue: typeof ReviewFixQueueModule;
 let commentGapfillQueue: typeof CommentGapfillQueueModule;
 let reviewFixEvidence: typeof ReviewFixEvidenceModule;
+let reviewFixAttemptStore: typeof ReviewFixAttemptStoreModule;
+let reviewFixAdminFacade: typeof ReviewFixAdminFacadeModule;
 
 beforeEach(async () => {
   ({
     dedup, log, dispatchAdmission, runnerTokens, runnerCallback, stepLog,
     reviewStore, reviewFixQueue, commentGapfillQueue, reviewFixEvidence,
+    reviewFixAttemptStore, reviewFixAdminFacade,
   } = (await testDb({
     modules: {
       dedup: () => import("../dedup.js"),
@@ -88,6 +93,8 @@ beforeEach(async () => {
       reviewFixQueue: () => import("../review-fix-queue.js"),
       commentGapfillQueue: () => import("../comment-gapfill-queue.js"),
       reviewFixEvidence: () => import("../review-fix-evidence.js"),
+      reviewFixAttemptStore: () => import("../review-fix-attempt-store.js"),
+      reviewFixAdminFacade: () => import("../review-fix-admin-facade.js"),
     },
   })).modules);
 });
@@ -1364,16 +1371,14 @@ describe("handleRunnerResult — implementation", () => {
     const HOUR = 3600_000;
     function pendingRow(id: string, over: { phase?: string; prUrl?: string | null; agoMs?: number } = {}) {
       const dispatchId = `d-${id}`;
-      const rowId = log.appendLog({
-        issueId: id, issueIdentifier: "ENG-9", teamKey: "ENG", repo: "o/r", dispatchId,
-        executionMode: "github-actions", phase: over.phase ?? "gap-analysis",
-      });
+      const rowId = log.appendLog(makeAppendLogEntry({
+        issueId: id, repo: "o/r", dispatchId, phase: over.phase ?? "gap-analysis",
+      }));
       log.updateJobStatus(rowId, "completed", "external_review_pending", over.prUrl === undefined ? "https://github.com/o/r/pull/7" : over.prUrl);
       return { rowId, dispatchId };
     }
     async function setCompleted(rowId: number, at: number) {
-      const { getDb } = await import("../dedup.js");
-      getDb().prepare("UPDATE dispatch_log SET completed_at = ? WHERE id = ?").run(at, rowId);
+      dedup.getDb().prepare("UPDATE dispatch_log SET completed_at = ? WHERE id = ?").run(at, rowId);
     }
 
     it("a not-ready callback leaves the row pending; the next ready tick submits once, a second submits nothing", async () => {
@@ -2443,7 +2448,7 @@ describe("handleRunnerResult — gap-analysis", () => {
       issueId: "i", mappingTeamKey: "ENG", phase: "gap-analysis",
       ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
     });
-    const jobId = log.appendLog({ issueId: "i", issueIdentifier: "ENG-7", repo: "org/repo", dispatchId });
+    const jobId = log.appendLog(makeAppendLogEntry({ issueId: "i", issueIdentifier: "ENG-7", repo: "org/repo", dispatchId, phase: "gap-analysis" }));
     log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
     const hook = vi.fn(async () => {});
 
@@ -2474,7 +2479,7 @@ describe("handleRunnerResult — gap-analysis", () => {
         issueId: id, mappingTeamKey: "ENG", phase: "gap-analysis",
         ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
       });
-      const jobId = log.appendLog({ issueId: id, repo: "org/repo", dispatchId });
+      const jobId = log.appendLog(makeAppendLogEntry({ issueId: id, repo: "org/repo", dispatchId, phase: "gap-analysis" }));
       log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
       const res = await runnerCallback.handleRunnerResult({
         authorization: `Bearer ${token}`,
@@ -4947,6 +4952,28 @@ describe("handleRunnerCycleSummary — independent pilot evidence", () => {
     expect(reviewFixEvidence.getReviewFixCycleSummary(attemptId, 1)?.completedAt).toBe(summary.completedAt);
   });
 
+  it("records the publication cycle after pre-push cycles, idempotently, without touching them", () => {
+    const token = preparedToken();
+    const post = (entry: CycleSummary) => runnerCallback.handleRunnerCycleSummary({
+      authorization: `Bearer ${token}`, secret: SECRET, body: { summary: entry },
+    });
+    const head = "b".repeat(40);
+    const key = "c".repeat(64);
+    const pending: CycleSummary = { ...summary, outputCommitStatus: "pending_push", tests: [{ name: "test execution", status: "missing" }] };
+    const publication: CycleSummary = {
+      ...pending, id: "publication.1", stage: "publication", cycle: 1, outputCommit: head, outputCommitStatus: "committed",
+      dispositions: [{ key, disposition: "fixed" }],
+    };
+    expect(post(pending)).toMatchObject({ status: 200, body: { outcome: "recorded" } });
+    expect(post(publication)).toMatchObject({ status: 200, body: { outcome: "recorded" } });
+    expect(post(publication)).toMatchObject({ status: 200, body: { outcome: "duplicate" } });
+    expect(post({ ...publication, outputCommit: "d".repeat(40) }).status).toBe(409);
+    const rows = reviewFixEvidence.listReviewFixCycleSummaries(attemptId);
+    expect(rows.map((r) => r.outputCommit)).toEqual([null, head]);
+    expect(rows.at(-1)?.dispositions).toEqual([{ findingKey: key, disposition: "addressed" }]);
+    expect(rows[0]?.tests).toEqual([{ name: "test execution", status: "missing" }]);
+  });
+
   it("strips malformed attribution and still records the cycle summary", () => {
     const token = preparedToken();
     const res = runnerCallback.handleRunnerCycleSummary({
@@ -5364,7 +5391,7 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
       ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET, dispatchId,
     });
     if (!log.findLogIdByDispatchId(dispatchId)) {
-      log.appendLog({ issueId: "i", issueIdentifier: "ENG-1", issueTitle: "t", teamKey: "ENG", repo: "o/r", dispatchId, executionMode: "github-actions", phase: "implementation" });
+      log.appendLog(makeAppendLogEntry({ issueId: "i", repo: "o/r", dispatchId }));
     }
     if (opts.snapshot !== false && !dedup.getDb().prepare("SELECT 1 FROM run_agent_config_snapshots WHERE dispatch_id = ?").get(dispatchId)) {
       storeSnapshot(dispatchId, `snap-${dispatchId}`);
@@ -5380,6 +5407,109 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
       resolveProvider: makeResolve(new FakeProvider()),
     });
   }
+
+  async function managedResult() {
+    const attemptId = "attempt-managed-attr";
+    const token = preparedResultToken(attemptId);
+    storeSnapshot(attemptId, "snap-managed-attr");
+    const store = new reviewFixAttemptStore.SqliteReviewFixAttemptStore();
+    await store.bindExecution(attemptId, { githubRunId: 555, githubRunAttempt: 1 }, Date.now());
+    const marker = makeReviewFixResult({ attemptId, repository: "acme/widgets", deadlineAt: DEADLINE_AT });
+    const fake = new FakeProvider({ recordCalls: true });
+    const deliver = (attribution: unknown = claim({ snapshotId: "snap-managed-attr", usage: {
+      availability: "complete", tokensIn: 100, tokensOut: 10, costUsd: null, costStatus: "unavailable",
+    } }), result = marker, bearer = token) => runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${bearer}`, secret: SECRET,
+      body: { phase: "gap-analysis", outcome: "success", comments: [], reviewFix: result, attribution: attribution as never },
+      resolveProvider: makeResolve(fake),
+      onReviewFixResult: (value) => store.recordResult(value.attemptId, value, Date.now()),
+    });
+    return { attemptId, store, marker, deliver, fake };
+  }
+
+  it("retains managed attribution through real accepted intake and admin detail without a legacy job", async () => {
+    const c = await managedResult();
+    expect(await c.deliver()).toMatchObject({ status: 200, body: { outcome: "stored" } });
+    expect(log.getJobByDispatchId(c.attemptId)).toBeNull();
+    expect(rows()).toHaveLength(1);
+    expect(rows()[0]).toMatchObject({dispatch_id: c.attemptId, snapshot_id: "snap-managed-attr", model: "m-implementation", profile_id: "p-implementation"});
+    const facade = reviewFixAdminFacade.createReviewFixAdminFacade(c.store, {reconcile: async () => ({status: "unknown"})}, {cancel: async () => ({status: "accepted"})});
+    expect(await facade.getAttempt(c.attemptId, {role: "admin", email: "operator@example.com"})).toMatchObject({status: "ok", attempt: {
+      attribution: {snapshotId: "snap-managed-attr", invocationId: "inv-1", agent: "codex", model: "m-implementation", profileId: "p-implementation",
+        usage: {tokensIn: 100, tokensOut: 10, costUsd: null, costStatus: "unavailable"}},
+    }});
+    expect(await facade.getAttempt(c.attemptId, {role: "user", email: "user@example.com"})).toEqual({status: "not_found"});
+    expect(c.fake.recordedCalls()).toEqual([]);
+  });
+
+  it("repairs missing managed attribution on duplicate delivery without duplicating spend or legacy effects", async () => {
+    const c = await managedResult();
+    expect(await c.deliver()).toMatchObject({status: 200, body: {outcome: "stored"}});
+    dedup.getDb().prepare("DELETE FROM model_invocation_attribution").run();
+    expect(await c.deliver()).toMatchObject({status: 200, body: {outcome: "duplicate"}});
+    expect(await c.deliver()).toMatchObject({status: 200, body: {outcome: "duplicate"}});
+    expect(rows()).toHaveLength(1);
+    expect(c.fake.recordedCalls()).toEqual([]);
+  });
+
+  it.each([
+    ["another snapshot", {snapshotId: "another-snapshot"}],
+    ["another profile", {profileId: "another-profile"}],
+    ["another model", {model: "another-model"}],
+    ["another provider", {provider: "anthropic"}],
+    ["malformed", {version: 99}],
+  ])("keeps managed terminal delivery but drops attribution claiming %s", async (_label, overrides) => {
+    const c = await managedResult();
+    expect(await c.deliver(claim({snapshotId: "snap-managed-attr", ...overrides}))).toMatchObject({status: 200, body: {outcome: "stored"}});
+    expect(rows()).toHaveLength(0);
+  });
+
+  it("keeps a managed result without diagnostic attribution", async () => {
+    const c = await managedResult();
+    expect(await c.deliver(null)).toMatchObject({status: 200, body: {outcome: "stored"}});
+    expect(rows()).toHaveLength(0);
+  });
+
+  it("keeps managed delivery when its frozen snapshot is unavailable", async () => {
+    const c = await managedResult();
+    dedup.getDb().prepare("DELETE FROM run_agent_config_snapshots WHERE dispatch_id = ?").run(c.attemptId);
+    expect(await c.deliver()).toMatchObject({status: 200, body: {outcome: "stored"}});
+    expect(rows()).toHaveLength(0);
+  });
+
+  it("does not retain managed attribution from forged scope or wrong-token callbacks", async () => {
+    const c = await managedResult();
+    expect((await c.deliver(claim(), {...c.marker, repository: "other/repo"})).status).toBe(410);
+    expect((await c.deliver(claim(), c.marker, "invalid-token")).status).toBe(401);
+    expect(rows()).toHaveLength(0);
+  });
+
+  it("cannot repair attribution after a result conflict or released-owner stale result", async () => {
+    const c = await managedResult();
+    await c.deliver();
+    dedup.getDb().prepare("DELETE FROM model_invocation_attribution").run();
+    expect((await c.deliver(claim(), {...c.marker, outputCommit: "b".repeat(40)})).status).toBe(409);
+    expect(await c.deliver()).toMatchObject({status: 200, body: {outcome: "duplicate"}});
+    expect(rows()).toHaveLength(0);
+    await c.store.releaseOwner(c.attemptId, "finalized");
+    expect((await c.deliver()).status).toBe(401);
+    expect(rows()).toHaveLength(0);
+  });
+
+  it("keeps accepted managed delivery when diagnostic storage fails, without logging its error text", async () => {
+    const c = await managedResult();
+    const db = dedup.getDb();
+    const prepare = db.prepare.bind(db);
+    vi.spyOn(db, "prepare").mockImplementation(((sql: string) => {
+      if (sql.includes("INSERT OR IGNORE INTO model_invocation_attribution")) throw new Error(PLANTED);
+      return prepare(sql);
+    }) as never);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    expect(await c.deliver()).toMatchObject({status: 200, body: {outcome: "stored"}});
+    expect((await c.store.getAcceptedResult(c.attemptId))?.result).toEqual(c.marker);
+    expect(warn).toHaveBeenCalledWith("[runner-callback] Could not persist 1 managed attribution record (count only)");
+    expect(warn.mock.calls.join(" ")).not.toContain(PLANTED);
+  });
 
   const rows = () => dedup.getDb().prepare("SELECT * FROM model_invocation_attribution").all() as Array<Record<string, string | number | null>>;
 

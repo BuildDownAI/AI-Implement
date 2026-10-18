@@ -1,13 +1,15 @@
 // Managed Codex review-fix on GHA (AII-1444), against the real `restate-server` binary and the *production*
 // composition: `createProductionReviewFixServices` (PR coordinator, attempt workflow, SQLite store, finalizer, GitHub
 // adapter, `GithubReviewFixWorker` with the protected managed preparation) and a real model-auth runtime. Only the
-// external boundaries are synthetic: GitHub's HTTP surface and workflow dispatch. It proves the runtime wiring
+// external boundaries are synthetic: GitHub's HTTP surface. The dispatch helper is real. It proves the runtime wiring
 // ReviewFixPR admission -> protected worker -> authenticated result -> current-head check -> finalizer, that a stale
 // head, a cancelled attempt and a late result never approve, that occupancy is held until the run is confirmed
 // terminal, and that no grant, bearer, run token or credential reaches a journal value.
 //
 // Engine evidence, not live-pilot evidence: the live TEST rollout is a separate step after merge.
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { DispatchInputs } from "../../github.js";
@@ -25,7 +27,9 @@ import { decodeTrustedRunConfig } from "../../run-config.js";
 import { upsertReviewFinding } from "../../review-ledger-store.js";
 import { enqueueReviewFix } from "../../review-fix-queue.js";
 import { recordReviewFixCycleSummary } from "../../review-fix-evidence.js";
-import { handleRunnerResult, ReviewFixIntakeUnavailableError } from "../../runner-callback.js";
+import { buildPublicationCycleSummary, readCycleSummaries, writeCycleSummary } from "../../pipeline/cycle-summary.js";
+import { DISPOSITIONS_FILE, readFindingDispositions } from "../../pipeline/finding-dispositions.js";
+import { handleRunnerCycleSummary, handleRunnerResult, ReviewFixIntakeUnavailableError } from "../../runner-callback.js";
 import type { ResultIntakeOutcome, ReviewFixResultMetadataV1, ScopedPrIdentity } from "../../review-fix-contract.js";
 import { createReviewFixIngressClient, reviewFixResultForwardKey, reviewFixResultIntakeFromForward } from "../../restate/review-fix-client.js";
 import type { ReviewFixAttemptCompletion } from "../../restate/review-fix-attempt.js";
@@ -57,11 +61,6 @@ vi.mock("../../github.js", async (importOriginal) => ({
   getDefaultBranchFileText: async (_t: string, _o: string, _r: string, file: string) =>
     file === ".github/workflows/claude-implement.yml" ? state.workflow : null,
   getPullRequestState: async () => ({ state: "open", merged: false }),
-  postWorkflowDispatch: async ({ inputs }: { inputs: DispatchInputs }) => {
-    state.dispatched.push(inputs as unknown as Record<string, unknown>);
-    const runId = state.nextRunId++;
-    return state.omitRunId ? { success: true, status: 204, outcome: "accepted" as const } : { success: true, status: 204, outcome: "accepted" as const, runId };
-  },
 }));
 
 const realFetch = globalThis.fetch;
@@ -104,7 +103,19 @@ const githubFetch: typeof fetch = async (input, init) => {
     const run = runs.get(Number(m[1])) ?? { status: "in_progress", conclusion: null };
     return json({ ...run, run_attempt: 1 });
   }
-  if (/\/actions\/workflows\//.test(path)) return json({ workflow_runs: state.listed });
+  if (/\/actions\/workflows\//.test(path)) {
+    if (method === "POST") {
+      const body = JSON.parse(String(init?.body)) as { inputs: DispatchInputs };
+      state.dispatched.push(body.inputs as unknown as Record<string, unknown>);
+      const runId = state.nextRunId++;
+      return state.omitRunId ? new Response(null, { status: 204 }) : json({
+        workflow_run_id: runId,
+        run_url: `https://api.github.com/repos/acme/app/actions/runs/${runId}`,
+        html_url: `https://github.com/acme/app/actions/runs/${runId}`,
+      });
+    }
+    return json({ workflow_runs: state.listed });
+  }
   if (path.includes("/contents/.github/workflows/")) {
     return json({ type: "file", encoding: "base64", content: Buffer.from(state.workflow).toString("base64") });
   }
@@ -165,11 +176,12 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
   });
 
   /** Seeds one real open finding plus its queue event, then delivers feedback through the real ingress client. */
-  async function admit(prNumber: number): Promise<{ attemptId: string; prepared: NonNullable<Awaited<ReturnType<typeof store.getPreparedAttempt>>> }> {
+  async function admit(prNumber: number, findingCount = 1): Promise<{ attemptId: string; prepared: NonNullable<Awaited<ReturnType<typeof store.getPreparedAttempt>>> }> {
     heads.set(prNumber, sha(`head-${prNumber}`));
-    const findingId = upsertReviewFinding({ repo: "acme/app", prNumber, source: "review-contract", severity: "medium", body: `finding for ${prNumber}` });
+    const findingIds = Array.from({ length: findingCount }, (_, i) =>
+      upsertReviewFinding({ repo: "acme/app", prNumber, source: "review-contract", severity: "medium", body: `finding ${i} for ${prNumber}` }));
     enqueueReviewFix({ issueId: `acme/app#${prNumber}`, issueIdentifier: null, repo: "acme/app", prNumber, reason: "changes_requested",
-      findingIds: [findingId], sourceEventId: `managed-${prNumber}` });
+      findingIds, sourceEventId: `managed-${prNumber}` });
     const out = await createReviewFixIngressClient(env.baseUrl()).feedback(scope(prNumber), undefined, { idempotencyKey: `managed-feedback-${prNumber}` });
     expect(out.status).toBe("accepted");
     const attemptId = await eventually(
@@ -218,6 +230,58 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
       dispositions: prepared.findings.map((f) => ({ findingKey: f.findingKey, disposition: "addressed" as const })),
       tests: { passed: 1 }, verdict: "passed", usage: { tokens: 10 }, completedAt: Date.now(),
     }).status).toBe("recorded");
+  }
+
+  /** Real producers and callbacks: the feedback-loop summary writer (pre-push, `pending_push`), the validated
+   *  dispositions file, the publication builder, then the authenticated `/runner/cycle-summary` intake.
+   *  Returns the status of every delivery in order. */
+  function streamRunnerEvidence(prepared: { findings: ReadonlyArray<{ findingKey: string }> }, progressToken: string, commit: string,
+    opts: { dispositions: "all" | "partial" | "invalid" | "none"; publish?: boolean; deliveries?: number; conflictingPublication?: boolean;
+      sourceApproved?: boolean | null; resultOutcome?: "success" | "failure" }): number[] {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rf-evidence-"));
+    try {
+      writeCycleSummary(dir, { id: "feedback-loop.1", stage: "feedback-loop", cycle: 1, inputCommit: sha("input"), outputCommit: null,
+        outputCommitStatus: "pending_push", dispositions: [], tests: [{ name: "test execution", status: "missing" }],
+        verdict: { approved: opts.sourceApproved === undefined ? true : opts.sourceApproved, reason: "approved" },
+        usage: { tokensIn: 120, tokensOut: 30, costUsd: 0.05 } });
+      const keys = prepared.findings.map((f) => f.findingKey);
+      const entries = opts.dispositions === "all" ? keys.map((k) => ({ findingKey: k, disposition: "fixed", reason: "done" }))
+        : opts.dispositions === "partial" ? keys.slice(0, 1).map((k) => ({ findingKey: k, disposition: "fixed", reason: "done" }))
+        : opts.dispositions === "invalid" ? keys.map((k) => ({ findingKey: k, disposition: "bogus", reason: "done" }))
+        : null;
+      if (entries) {
+        fs.mkdirSync(path.join(dir, "ai-output"), { recursive: true });
+        fs.writeFileSync(path.join(dir, DISPOSITIONS_FILE), JSON.stringify(entries));
+      }
+      const pending = readCycleSummaries(dir);
+      const publication = opts.publish === false ? null : buildPublicationCycleSummary(pending, commit,
+        readFindingDispositions(dir).valid.map((d) => ({ key: d.findingKey, disposition: d.disposition })), opts.resultOutcome ?? "success");
+      const batch = [...pending, ...(publication ? [publication] : [])];
+      const post = (summary: unknown) => handleRunnerCycleSummary({ authorization: `Bearer ${progressToken}`, secret: SECRET, body: { summary } }).status;
+      const statuses = Array.from({ length: opts.deliveries ?? 1 }, () => batch).flat().map(post);
+      if (opts.conflictingPublication) {
+        // Same immutable identity, different (complete) payload: must be rejected, never merged over the first.
+        statuses.push(post(buildPublicationCycleSummary(pending, commit, keys.map((k) => ({ key: k, disposition: "fixed" })), "success")));
+      }
+      return statuses;
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+
+  /** Delivers the authenticated result, marks the run terminal and returns the attempt's completion. */
+  async function finish(attemptId: string, prepared: Parameters<typeof resultFor>[0], launch: Awaited<ReturnType<typeof launched>>, commit: string,
+    conclusion = "success") {
+    await deliver(launch.config.credentials!.resultToken!, resultFor(prepared, launch.runId, commit));
+    runs.set(launch.runId, { status: "completed", conclusion });
+    return attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
+  }
+
+  async function runCase(pr: number, opts: Parameters<typeof streamRunnerEvidence>[3], findingCount = 1) {
+    const before = state.dispatched.length;
+    const { attemptId, prepared } = await admit(pr, findingCount);
+    const launch = await launched(before + 1);
+    const commit = heads.get(pr)!;
+    const statuses = streamRunnerEvidence(prepared, launch.config.credentials!.progressToken!, commit, opts);
+    return { attemptId, prepared, launch, commit, statuses };
   }
 
   async function journalsOf(attemptId: string, prNumber: number): Promise<string> {
@@ -275,6 +339,102 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
 
     const finalText = await journalsOf(attemptId, 42);
     for (const secret of [launch.bearer, ...launch.tokens, ACCESS, SECRET]) expect(finalText).not.toContain(secret);
+  }, 90_000);
+
+  it("approves the exact pushed head from the real runner evidence adapter, leaves pre-push cycles immutable, and withholds approval on incomplete coverage", async () => {
+    const before = state.dispatched.length;
+    const { attemptId, prepared } = await admit(50);
+    const launch = await launched(before + 1);
+    const commit = heads.get(50)!;
+    streamRunnerEvidence(prepared, launch.config.credentials!.progressToken!, commit, { dispositions: "all", deliveries: 2 }); // second delivery is idempotent
+    const cycles = getDb().prepare("SELECT cycle, output_commit FROM review_fix_cycles WHERE attempt_id = ? ORDER BY cycle").all(attemptId);
+    expect(cycles).toEqual([{ cycle: 1, output_commit: null }, { cycle: 50_001, output_commit: commit }]);
+    expect(await deliver(launch.config.credentials!.resultToken!, resultFor(prepared, launch.runId, commit)))
+      .toMatchObject({ status: 200, body: { outcome: "stored" } });
+    runs.set(launch.runId, { status: "completed", conclusion: "success" });
+    const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
+    expect(done).toMatchObject({ status: "finalized", approval: "applied" });
+    expect(comments.get(50) ?? []).toHaveLength(1);
+  }, 90_000);
+
+  const withheld = { status: "finalized", approval: "withheld" };
+
+  it("reproduces TEST-5: pre-push feedback-loop summaries alone leave no output commit or dispositions, and approval is withheld", async () => {
+    const c = await runCase(52, { dispositions: "all", publish: false });
+    expect(getDb().prepare("SELECT cycle, output_commit FROM review_fix_cycles WHERE attempt_id = ?").all(c.attemptId))
+      .toEqual([{ cycle: 1, output_commit: null }]);
+    expect(await finish(c.attemptId, c.prepared, c.launch, c.commit)).toMatchObject(withheld);
+    expect(comments.get(52) ?? []).toHaveLength(0);
+  }, 90_000);
+
+  it("withholds approval when the runner evidence has no dispositions file", async () => {
+    const c = await runCase(51, { dispositions: "none" });
+    expect(await finish(c.attemptId, c.prepared, c.launch, c.commit)).toMatchObject(withheld);
+    expect(comments.get(51) ?? []).toHaveLength(0);
+  }, 90_000);
+
+  it("withholds approval when the dispositions cover only part of the admitted findings", async () => {
+    const c = await runCase(53, { dispositions: "partial" }, 2);
+    expect(c.prepared.findings).toHaveLength(2);
+    expect(c.statuses).toEqual([200, 200]);
+    expect(await finish(c.attemptId, c.prepared, c.launch, c.commit)).toMatchObject(withheld);
+    expect(comments.get(53) ?? []).toHaveLength(0);
+  }, 90_000);
+
+  it("withholds approval when every disposition is invalid and dropped by the validator", async () => {
+    const c = await runCase(54, { dispositions: "invalid" });
+    expect(getDb().prepare("SELECT cycle, output_commit FROM review_fix_cycles WHERE attempt_id = ? ORDER BY cycle").all(c.attemptId))
+      .toEqual([{ cycle: 1, output_commit: null }, { cycle: 50_001, output_commit: c.commit }]);
+    expect(await finish(c.attemptId, c.prepared, c.launch, c.commit)).toMatchObject(withheld);
+    expect(comments.get(54) ?? []).toHaveLength(0);
+  }, 90_000);
+
+  it("keeps the first-recorded publication when a conflicting same-identity record arrives, so approval stays withheld", async () => {
+    const c = await runCase(55, { dispositions: "none", conflictingPublication: true });
+    expect(c.statuses).toEqual([200, 200, 409]);
+    expect(await finish(c.attemptId, c.prepared, c.launch, c.commit)).toMatchObject(withheld);
+    expect(comments.get(55) ?? []).toHaveLength(0);
+  }, 90_000);
+
+  it("never approves after a push failure: no publication is built and a failed run is not a success", async () => {
+    const before = state.dispatched.length;
+    const { attemptId, prepared } = await admit(56);
+    const launch = await launched(before + 1);
+    expect(buildPublicationCycleSummary([], null, [], "success")).toBeNull();
+    streamRunnerEvidence(prepared, launch.config.credentials!.progressToken!, heads.get(56)!, { dispositions: "all", publish: false });
+    runs.set(launch.runId, { status: "completed", conclusion: "failure" });
+    const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
+    expect(done).toMatchObject({ status: "finalized", approval: "not_applicable" });
+    expect(getDb().prepare("SELECT cycle, output_commit FROM review_fix_cycles WHERE attempt_id = ?").all(attemptId))
+      .toEqual([{ cycle: 1, output_commit: null }]);
+    expect(comments.get(56) ?? []).toHaveLength(0);
+  }, 90_000);
+
+  it("withholds approval when the native review rejected the change, even with fixed dispositions and a pushed commit", async () => {
+    const c = await runCase(70, { dispositions: "all", sourceApproved: false });
+    const done = await finish(c.attemptId, c.prepared, c.launch, c.commit);
+    expect(done).toMatchObject({ status: "finalized" });
+    expect(done).not.toMatchObject({ approval: "applied" });
+    expect(comments.get(70) ?? []).toHaveLength(0);
+    expect(getDb().prepare("SELECT count(*) AS n FROM review_fix_cycles WHERE attempt_id = ? AND output_commit IS NOT NULL").get(c.attemptId))
+      .toEqual({ n: 0 });
+  }, 90_000);
+
+  it("withholds approval when the PR head moved after the evidence was published", async () => {
+    const c = await runCase(57, { dispositions: "all" });
+    heads.set(57, sha("someone-pushed"));
+    // The observed head no longer equals the accepted result's commit, so the attempt is not a success to approve.
+    expect(await finish(c.attemptId, c.prepared, c.launch, c.commit)).toMatchObject({ status: "finalized", approval: "not_applicable" });
+    expect(comments.get(57) ?? []).toHaveLength(0);
+  }, 90_000);
+
+  it("withholds approval when the attempt's authority was revoked", async () => {
+    const c = await runCase(58, { dispositions: "all" });
+    await store.revokeAuthority(c.attemptId as never, Date.now());
+    const done = await finish(c.attemptId, c.prepared, c.launch, c.commit);
+    expect(done).toMatchObject({ status: "finalized" });
+    expect((done as { approval: string }).approval).not.toBe("applied");
+    expect(comments.get(58) ?? []).toHaveLength(0);
   }, 90_000);
 
   it("keeps the model-auth grant for an accepted 204 with no run id, reconciles the exact run, and finalizes", async () => {
