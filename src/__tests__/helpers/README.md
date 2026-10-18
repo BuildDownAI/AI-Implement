@@ -84,6 +84,7 @@ Pass `fake.fetch` where a module takes `fetchImpl`, or call `fake.install()` whe
 A reply shaped like one service's API that several test files need lives beside `fakeFetch`, not in it, in `replies/<service>.ts`:
 
 - `replies/github.ts`: `githubFile(text)` answers as GitHub's contents API does for a file, with the text base64-encoded; `githubError(status, message)` answers with the status and GitHub's error body (`message`, `documentation_url`, and the status as a string).
+- `replies/fly.ts`: `flySecretsUpdated(version)` answers as the Machines API's `POST /v1/apps/{app_name}/secrets` does, with the new secrets version under both `version` and the deprecated `Version`.
 - `replies/linear.ts`: `linearGraphql(...replies)` serves Linear's GraphQL endpoint one reply per request, each built with `linearData(data)`.
 
 ## Subsystem fixtures

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import crypto from "node:crypto";
 import { readFileSync } from "node:fs";
 import {
@@ -34,6 +34,7 @@ import { sealModelAuthBootstrap } from "../model-auth-seal.js";
 import { MODEL_AUTH_ENV } from "../model-auth-contract.js";
 import { makeMapping } from "./helpers/builders.js";
 import { fakeFetch, type ReplyInit } from "./helpers/fake-fetch.js";
+import { flySecretsUpdated } from "./helpers/replies/fly.js";
 
 const TOKEN = "fly-test-token";
 const APP = "ai-implement-sessions-test";
@@ -923,58 +924,52 @@ describe("fetchMachineLogs", () => {
   // The app-wide logs endpoint on api.fly.io; the machine is picked by the ?instance= query.
   const LOGS = `GET /api/v1/apps/${APP}/logs` as const;
 
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   const entry = (message: unknown, timestamp?: string) => ({
     type: "logs",
     attributes: { message, ...(timestamp ? { timestamp } : {}) },
   });
-  const ok = (data: unknown[]) =>
-    ({ ok: true, json: async () => ({ data }) }) as unknown as Response;
+  /** The logs endpoint answering one request with `data`. */
+  const logs = (data: unknown[]) => fakeFetch({ [LOGS]: { json: { data } } }).install();
 
   it("requests the api.fly.io logs endpoint filtered by instance", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(ok([entry("hello")]));
+    const fly = logs([entry("hello")]);
 
     await fetchMachineLogs("FlyV1 abc", APP, "m1");
 
-    const [url] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.fly.io/api/v1/apps/${APP}/logs?instance=m1`);
+    expect(fly.calls[0]!.url.href).toBe(`https://api.fly.io/api/v1/apps/${APP}/logs?instance=m1`);
   });
 
   it("sends a FlyV1 token unchanged, not as Bearer", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(ok([]));
+    const fly = logs([]);
     await fetchMachineLogs("FlyV1 abc", APP, "m1");
-    const [, opts] = vi.mocked(fetch).mock.calls[0];
-    expect((opts as RequestInit).headers).toMatchObject({ Authorization: "FlyV1 abc" });
+    expect(fly.calls[0]!.headers.get("authorization")).toBe("FlyV1 abc");
   });
 
   it("adds the FlyV1 prefix to a bare token", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(ok([]));
+    const fly = logs([]);
     await fetchMachineLogs("fm2_xyz", APP, "m1");
-    const [, opts] = vi.mocked(fetch).mock.calls[0];
-    expect((opts as RequestInit).headers).toMatchObject({ Authorization: "FlyV1 fm2_xyz" });
+    expect(fly.calls[0]!.headers.get("authorization")).toBe("FlyV1 fm2_xyz");
   });
 
   it("parses data[].attributes.message", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(ok([entry("a"), entry("b")]));
+    logs([entry("a"), entry("b")]);
     expect(await fetchMachineLogs(TOKEN, APP, "m1")).toBe("a\nb");
   });
 
   it("skips entries without a string message", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(ok([entry("a"), { attributes: {} }, null, entry(5), entry("b")]));
+    logs([entry("a"), { attributes: {} }, null, entry(5), entry("b")]);
     expect(await fetchMachineLogs(TOKEN, APP, "m1")).toBe("a\nb");
   });
 
   it("returns empty string for empty data", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(ok([]));
+    logs([]);
     expect(await fetchMachineLogs(TOKEN, APP, "m1")).toBe("");
   });
 
   it("keeps the last lastN messages in chronological order", async () => {
     const data = Array.from({ length: 150 }, (_, i) =>
       entry(`l${i}`, `2026-10-15T00:00:00.${String(i).padStart(3, "0")}Z`));
-    vi.mocked(fetch).mockResolvedValueOnce(ok(data));
+    logs(data);
     const lines = (await fetchMachineLogs(TOKEN, APP, "m1", 50)).split("\n");
     expect(lines).toHaveLength(50);
     expect(lines[0]).toBe("l100");
@@ -982,19 +977,17 @@ describe("fetchMachineLogs", () => {
   });
 
   it("orders newest-first responses by timestamp", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(ok([
+    logs([
       entry("c", "2026-10-15T00:00:03Z"),
       entry("b", "2026-10-15T00:00:02Z"),
       entry("a", "2026-10-15T00:00:01Z"),
-    ]));
+    ]);
     expect(await fetchMachineLogs(TOKEN, APP, "m1", 2)).toBe("b\nc");
   });
 
   it("throws on a non-JSON 200 body", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => { throw new SyntaxError("bad json"); },
-    } as unknown as Response);
+    // JSON.parse's message quotes the body it could not parse.
+    fakeFetch({ [LOGS]: { text: "bad json" } }).install();
     await expect(fetchMachineLogs(TOKEN, APP, "m1")).rejects.toThrow("bad json");
   });
 
@@ -1522,20 +1515,18 @@ describe("buildSessionMachineConfig — legacy config and protection key hiding 
 });
 
 describe("putAppSecretsVersioned", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
+  const SECRETS = "POST /v1/apps/app/secrets" as const;
 
   it("POSTs values to the REST secrets endpoint and returns the version", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, json: async () => ({ version: 12 }) } as Response);
+    const fly = fakeFetch({ [SECRETS]: flySecretsUpdated(12) }).install();
     await expect(putAppSecretsVersioned("tok", "app", { A: "b" })).resolves.toBe(12);
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe("https://api.machines.dev/v1/apps/app/secrets");
-    expect(JSON.parse((opts as RequestInit).body as string)).toEqual({ values: { A: "b" } });
+    expect(fly.calls[0]!.url.href).toBe("https://api.machines.dev/v1/apps/app/secrets");
+    expect(JSON.parse(fly.calls[0]!.body)).toEqual({ values: { A: "b" } });
   });
 
   it("throws value-free errors on non-2xx or a missing version", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 403, text: async () => "echo SECRETVALUE" } as Response);
+    fakeFetch({ [SECRETS]: [{ status: 403, text: "echo SECRETVALUE" }, { json: { version: "x" } }] }).install();
     await expect(putAppSecretsVersioned("tok", "app", { A: "SECRETVALUE" })).rejects.toThrow(/403/);
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, json: async () => ({ version: "x" }) } as Response);
     const err = await putAppSecretsVersioned("tok", "app", { A: "SECRETVALUE" }).catch((e: Error) => e);
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).message).not.toContain("SECRETVALUE");

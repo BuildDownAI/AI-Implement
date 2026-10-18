@@ -5,13 +5,10 @@
  * `codex-subscription` profile, no network.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
 import fs from "node:fs";
-import crypto from "node:crypto";
+import { serializeChatGptPlanRecord } from "../chatgpt-plan-token.js";
 import type * as DedupModule from "../dedup.js";
 import type * as StoreModule from "../agent-config-store.js";
-import type * as OwnershipModule from "../model-session-ownership.js";
 import type * as IndexModule from "../index.js";
 import type * as RepoImageModule from "../repo-image.js";
 import type * as GithubModule from "../github.js";
@@ -19,10 +16,13 @@ import type * as WorkflowProbeModule from "../workflow-probe.js";
 import type { ModelAuthRuntime } from "../model-auth-runtime.js";
 import type { RepoMapping } from "../config.js";
 import type { AppConfig } from "../index.js";
-import type { TicketIssue, TicketingProvider } from "../providers/types.js";
 import { decodeTrustedRunConfig } from "../run-config.js";
+import { createModelSessionKeyProvider } from "../model-session-keys.js";
+import { makeAppConfig, makeChatGptPlanRecord, makeIssue, makeMapping, makeProvider } from "./helpers/builders.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
+import { testDb } from "./helpers/test-db.js";
+import { testTempRoot } from "./helpers/test-dir.js";
 
-const KEY = crypto.createHash("sha256").update("synthetic-dispatch-key").digest();
 const RUNNER_SECRET = "runner-token-secret-synthetic-0123456789";
 const holder = vi.hoisted(() => ({ runtime: undefined as unknown }));
 const dockerHolder = vi.hoisted(() => ({ execFile: vi.fn() }));
@@ -53,7 +53,6 @@ vi.mock("../github.js", async (importOriginal) => {
   return { ...actual, postWorkflowDispatch: vi.fn(), getRepoDefaultBranch: vi.fn() };
 });
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let store: typeof StoreModule;
 let index: typeof IndexModule;
@@ -64,27 +63,19 @@ let visibility: "public" | "private";
 let planRecord = true;
 let logs: string[];
 
-const issue = { id: "issue-1389", identifier: "AII-1389", title: "T", description: "d", scopeKey: "AII", nativeStatus: "Todo" } as unknown as TicketIssue;
-const mapping = {
-  owner: "acme", repo: "app", workflowFile: "claude-implement.yml", planningWorkflowFile: "claude-plan.yml",
-  defaultBranch: "main", maxInProgressAiIssues: 1, provider: "anthropic", sessionMode: "default",
-  machineCpus: 1, machineMemoryMb: 512, extraEnv: {},
-} as unknown as RepoMapping;
+// A Jira project AII mapped to acme/app; the issue is one its provider returns.
+const issue = makeIssue({ identifier: "AII-1389", scopeKey: "AII", nativeStatus: "Plan Approved" });
+const mapping = makeMapping({
+  owner: "acme", repo: "app",
+  ticketingProvider: "jira",
+  ticketingConfig: {
+    kind: "jira", jql: "project = AII", repoFieldValue: "acme/app",
+    statusFieldOverride: null, repoFieldOverride: null, profilesFieldOverride: null, baseBranchFieldOverride: null,
+  },
+});
 const prior = { count: 0, lastDispatchedAt: null };
-const config = {
-  localRunnerImage: "runner:local", localRunnerOrchestratorUrl: undefined,
-  githubAppId: "id", githubAppPrivateKey: "key", anthropicApiKey: null, claudeOAuthToken: null,
-  flySessionsToken: "fly-token", flySessionsApp: "fly-app", runnerCallbackBaseUrl: "https://orch.example",
-  runnerTokenSecret: RUNNER_SECRET, healthPort: 8080,
-} as unknown as AppConfig;
-const provider = {
-  id: "jira",
-  issueUrl: vi.fn().mockReturnValue("https://example.test/AII-1389"),
-  markImplementationFailed: vi.fn().mockResolvedValue(true),
-  markPlanningFailed: vi.fn().mockResolvedValue(true),
-  markImplementing: vi.fn().mockResolvedValue(undefined),
-  postComment: vi.fn().mockResolvedValue(undefined),
-} as unknown as TicketingProvider;
+const config = makeAppConfig({ runnerCallbackBaseUrl: "https://orch.example", runnerTokenSecret: RUNNER_SECRET });
+const provider = makeProvider({ id: "jira" });
 
 function count(table: string): number {
   return (dedup.getDb().prepare(`SELECT count(*) AS n FROM ${table}`).get() as { n: number }).n;
@@ -116,37 +107,38 @@ function envFileValue(content: string, key: string): string {
 }
 
 beforeEach(async () => {
-  dbPath = path.join(os.tmpdir(), `dispatch-fly-protected-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  vi.resetModules();
-  process.env.DEDUP_DB_PATH = dbPath;
-  process.env.RUNNER_TOKEN_SECRET = RUNNER_SECRET;
+  // The launch writes its secret env file under os.tmpdir().
+  testTempRoot("dispatch-local-protected");
+  vi.stubEnv("RUNNER_TOKEN_SECRET", RUNNER_SECRET);
   visibility = "private";
   planRecord = true;
   logs = [];
   for (const m of ["log", "warn", "error"] as const) {
     vi.spyOn(console, m).mockImplementation((...a: unknown[]) => { logs.push(a.map(String).join(" ")); });
   }
-  dedup = await import("../dedup.js");
-  store = await import("../agent-config-store.js");
-  const own: typeof OwnershipModule = await import("../model-session-ownership.js");
-  const sessionMod = await import("../model-session-store.js");
-  dedup.getDb();
-  (await import("../dispatch-breaker.js")).initDispatchBreakerTable();
-  (await import("../log.js")).initLogTable();
-  (await import("../config.js")).initMappingsTable();
+  const modules = (await testDb({
+    modules: {
+      dedup: () => import("../dedup.js"),
+      store: () => import("../agent-config-store.js"),
+      own: () => import("../model-session-ownership.js"),
+      sessionMod: () => import("../model-session-store.js"),
+      index: () => import("../index.js"),
+      repoImage: () => import("../repo-image.js"),
+      github: () => import("../github.js"),
+      probe: () => import("../workflow-probe.js"),
+      auth: () => import("../github-app-auth.js"),
+    },
+  })).modules;
+  ({ dedup, store, index, repoImage, github, probe } = modules);
+  const { own, sessionMod, auth } = modules;
   const sessions = sessionMod.createModelSessionStore({
-    keys: { current: () => ({ keyId: "k1", key: KEY }), get: (id) => (id === "k1" ? KEY : undefined) },
+    keys: createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: "synthetic-dispatch-secret" }),
     verifyOwner: own.sessionOwnerVerifier,
     authorizeOperator: () => false,
   });
   const ownership = own.createModelSessionOwnership({ store: sessions, probe: () => "terminated" });
   if (planRecord) {
-    sessions.writePlanRecord({ profileId: "cdx", expectedSequence: null, sessionData: JSON.stringify({
-      version: 1, email: "u@example.com", issuer: "https://auth.openai.com", subject: "s", clientId: "c",
-      extAgentHostId: "h", idToken: "synthetic-id", accessToken: "synthetic-access", refreshToken: "synthetic-refresh",
-      tokenType: "Bearer", scopes: ["chatgpt.tokens.use.direct"], accessTokenExpiresAt: Date.now() + 3_600_000,
-      earliestRefreshAt: null, savedAt: Date.now(),
-    }) });
+    sessions.writePlanRecord({ profileId: "cdx", expectedSequence: null, sessionData: serializeChatGptPlanRecord(makeChatGptPlanRecord()) });
   }
   store.saveAccountProfileRevision({
     profileId: "cdx", identity: "Cdx", revision: 1, agent: "codex", provider: "openai",
@@ -170,15 +162,11 @@ beforeEach(async () => {
     }),
   } as unknown as ModelAuthRuntime;
 
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({ version: 7 }) } as Response));
+  // A local launch reaches no HTTP API: everything it calls is mocked above.
+  fakeFetch({}).install();
 
-  index = await import("../index.js");
-  repoImage = await import("../repo-image.js");
-  github = await import("../github.js");
-  probe = await import("../workflow-probe.js");
-  const auth = await import("../github-app-auth.js");
   vi.mocked(auth.getInstallationToken).mockResolvedValue("broad-token");
-  vi.mocked(auth.getScopedInstallationToken).mockResolvedValue({ token: "scoped-token", expiresAt: "", installationId: 1 } as never);
+  vi.mocked(auth.getScopedInstallationToken).mockResolvedValue({ token: "scoped-token", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 1 });
   vi.mocked(repoImage.resolveSessionImage).mockReset().mockResolvedValue({ image: "session-image", source: "default" } as never);
   dockerCalls = [];
   dockerHolder.execFile.mockReset();
@@ -190,13 +178,8 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  vi.unstubAllGlobals();
   vi.restoreAllMocks();
-  delete process.env.RUNNER_TOKEN_SECRET;
-  for (const suffix of ["", "-wal", "-shm"]) {
-    try { fs.unlinkSync(dbPath + suffix); } catch { /* ignore */ }
-  }
+  vi.unstubAllEnvs();
 });
 
 describe("opted-in local Docker implementation", () => {
@@ -223,12 +206,12 @@ describe("opted-in local Docker implementation", () => {
   });
 
   it("falls back to the host-gateway URL when no orchestrator URL is configured", async () => {
-    await dispatchLocal(mapping, { ...config, runnerCallbackBaseUrl: null } as unknown as AppConfig);
+    await dispatchLocal(mapping, { ...config, runnerCallbackBaseUrl: null });
     expect(envFileValue(dockerCalls[0]!.envFile, "AI_IMPLEMENT_MODEL_AUTH_URL")).toBe("http://host.docker.internal:8080");
   });
 
   it("uses the configured local orchestrator URL as the model-auth URL", async () => {
-    await dispatchLocal(mapping, { ...config, localRunnerOrchestratorUrl: "http://host.docker.internal:9000" } as unknown as AppConfig);
+    await dispatchLocal(mapping, { ...config, localRunnerOrchestratorUrl: "http://host.docker.internal:9000" });
     expect(envFileValue(dockerCalls[0]!.envFile, "AI_IMPLEMENT_MODEL_AUTH_URL")).toBe("http://host.docker.internal:9000");
   });
 
@@ -278,7 +261,7 @@ describe("opted-out local Docker implementation", () => {
 
   it("keeps the legacy shape: raw credential and run config in argv", async () => {
     store.setProjectOptIn("AII", false);
-    await dispatchLocal(mapping, { ...config, anthropicApiKey: "sk-ant-synthetic" } as unknown as AppConfig);
+    await dispatchLocal(mapping, { ...config, anthropicApiKey: "sk-ant-synthetic" });
     const { args, envFile } = dockerCalls[0]!;
     expect(envFile).toContain("ANTHROPIC_API_KEY=sk-ant-synthetic");
     expect(args.some((a) => a.startsWith("AI_IMPLEMENT_RUN_CONFIG="))).toBe(true);
