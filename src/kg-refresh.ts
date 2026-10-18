@@ -1,3 +1,4 @@
+import type { SourceResult } from "./kg-source-results.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { existsSync, statfsSync } from "node:fs";
 import { join } from "node:path";
@@ -78,6 +79,8 @@ export interface RefreshOutcome {
   partTable?: Array<{ part: string; prev: string; new: string }>;
   cause?: "shrink" | "tracker-missing";
   failedTeams?: string[];
+  /** Per-source results (tracker teams, repos, docs sites); absent on older records. */
+  sources?: SourceResult[];
   /** Every runner step the workflow saw, in pipeline order (AII-1134); absent when the runner reported none. */
   steps?: KgRefreshStepRecord[];
   /** Why the run ended (`operator_cancelled`, `decision_timeout`, `merge_failed`, …); absent on success and on older records. */
@@ -197,7 +200,7 @@ export interface KgRefreshStatus {
     triggerId: string;
     step: string | null;
     decisions: Array<"accept" | "cancel">;
-    held: { snapshotPr: number; snapshotPrUrl?: string; partTable: Array<{ part: string; prev: string; new: string }>; cause: "shrink" | "tracker-missing"; failedTeams: string[]; decideBy: number } | null;
+    held: { snapshotPr: number; snapshotPrUrl?: string; partTable: Array<{ part: string; prev: string; new: string }>; cause: "shrink" | "tracker-missing"; failedTeams: string[]; sources: SourceResult[]; decideBy: number } | null;
   } | null;
   /** The runner step in flight, when the workflow has one (AII-1134). */
   runnerStep?: { id: string; status: StepStatus };

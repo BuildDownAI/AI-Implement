@@ -16,6 +16,7 @@
  * asynchronously. kg-refresh has one owner, so none of the pilot's admission/selector
  * machinery is needed here — see `docs/adr/032-a-fully-migrated-run-kind-coordinates-through-a-virtual-object.md`.
  */
+import type { SourceResult } from "../kg-source-results.js";
 import * as restate from "@restatedev/restate-sdk";
 import type { WorkflowContext, WorkflowSharedContext } from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
@@ -107,6 +108,8 @@ export interface KgRefreshReportBody {
   /** Absent on a report from a runner that predates the field; reads as "shrink". */
   cause?: "shrink" | "tracker-missing";
   failedTeams?: string[];
+  /** Per-source results; absent from a runner that predates the field. */
+  sources?: SourceResult[];
 }
 
 export interface KgDispatchInput {
@@ -151,6 +154,8 @@ export interface KgRefreshHeldView {
   cause: "shrink" | "tracker-missing";
   /** Teams whose tracker fetch failed; empty for a shrink. */
   failedTeams: string[];
+  /** Per-source results of the run, so the operator decides from them. */
+  sources: SourceResult[];
   decideBy: number;
 }
 
@@ -169,6 +174,8 @@ export interface KgRefreshStatusResult {
   decisions: Array<"accept" | "cancel">;
   /** The held snapshot PR and its part table while step is `decision`; `null` otherwise. */
   held: KgRefreshHeldView | null;
+  /** Per-source results the runner reported; `[]` before the report and for runners that send none. */
+  sources: SourceResult[];
 }
 
 export interface KgDispatchResult {
@@ -390,7 +397,11 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
 
     // Built once, after `report`; pre-report failures (timeout, lost) carry no table.
     let stepTable: KgRefreshStepRecord[] = [];
-    const withSteps = (o: RefreshOutcome): RefreshOutcome => (stepTable.length > 0 && !o.steps ? { ...o, steps: stepTable } : o);
+    let reportedSources: SourceResult[] = [];
+    const withSteps = (o: RefreshOutcome): RefreshOutcome => {
+      const withTable = stepTable.length > 0 && !o.steps ? { ...o, steps: stepTable } : o;
+      return reportedSources.length > 0 && !withTable.sources ? { ...withTable, sources: reportedSources } : withTable;
+    };
 
     // Set once the run reaches the decision gate; unlike `heldPr` it survives the merge, so every later end is marked held.
     let heldGate = false;
@@ -869,6 +880,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           stampBefore: railCtx.stampBefore ?? null, stampAfter: railCtx.stampAfter ?? null,
         };
         if (stepTable.length > 0) successOutcome.steps = stepTable;
+        if (reportedSources.length > 0) successOutcome.sources = reportedSources;
         if (heldGate) successOutcome.held = true;
         await ctx.run("persist", () => deps.persistLastRefresh({ ...successOutcome, dispatchId }));
         ctx.set("step", "close-row");
@@ -915,6 +927,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       // waitResult.kind === "report"
       const report = waitResult.value;
       reported = true;
+      reportedSources = report.sources ?? [];
+      ctx.set("sources", reportedSources);
       // Journaled peeks, so a replay rebuilds the same table.
       stepTable = [];
       for (const id of KG_REFRESH_RUNNER_STEPS) {
@@ -930,6 +944,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           stampBefore: null, stampAfter: null, dryRun: true, partTable: report.partTable,
         };
         if (stepTable.length > 0) outcome.steps = stepTable;
+        if (reportedSources.length > 0) outcome.sources = reportedSources;
         if (input.report) {
           // Stored on `KgRepo` so the outcome can be re-reported; journaled, so a replay sends once.
           ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).recordDryRunOutcome({ report: input.report, outcome });
@@ -968,6 +983,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           partTable: report.partTable,
           cause: report.cause ?? "shrink",
           failedTeams: report.failedTeams ?? [],
+          sources: reportedSources,
           decideBy,
         });
         ctx.console.log(`[KgRefresh] held: dispatch ${dispatchId} snapshot PR #${heldPrNumber} awaits a decision until ${new Date(decideBy).toISOString()}`);
@@ -1176,12 +1192,13 @@ function toStepRecord(step: Step): KgRefreshStepRecord {
   }
 
   async function status(ctx: WorkflowSharedContext): Promise<KgRefreshStatusResult> {
-    const [step, startedAt, triggerId, runId, dryRun] = await Promise.all([
+    const [step, startedAt, triggerId, runId, dryRun, sources] = await Promise.all([
       ctx.get<string>("step"),
       ctx.get<number>("startedAt"),
       ctx.get<string>("triggerId"),
       ctx.get<number>("runId"),
       ctx.get<boolean>("dryRun"),
+      ctx.get<SourceResult[]>("sources"),
     ]);
     let runnerStep: KgRefreshStatusResult["runnerStep"] = null;
     for (const id of KG_REFRESH_RUNNER_STEPS) {
@@ -1196,11 +1213,11 @@ function toStepRecord(step: Step): KgRefreshStepRecord {
     let decisions: KgRefreshStatusResult["decisions"] = [];
     let held: KgRefreshStatusResult["held"] = null;
     if (step === "decision") {
-      const stored = await ctx.get<{ snapshotPr: number; partTable?: KgRefreshHeldView["partTable"]; cause?: KgRefreshHeldView["cause"]; failedTeams?: string[]; decideBy: number }>("held");
-      if (stored) held = { snapshotPr: stored.snapshotPr, partTable: stored.partTable ?? [], cause: stored.cause ?? "shrink", failedTeams: stored.failedTeams ?? [], decideBy: stored.decideBy };
+      const stored = await ctx.get<{ snapshotPr: number; partTable?: KgRefreshHeldView["partTable"]; cause?: KgRefreshHeldView["cause"]; failedTeams?: string[]; sources?: SourceResult[]; decideBy: number }>("held");
+      if (stored) held = { snapshotPr: stored.snapshotPr, partTable: stored.partTable ?? [], cause: stored.cause ?? "shrink", failedTeams: stored.failedTeams ?? [], sources: stored.sources ?? [], decideBy: stored.decideBy };
       if ((await ctx.promise<KgRefreshDecideInput>("decide").peek()) === undefined) decisions = ["accept", "cancel"];
     }
-    return { step: step ?? null, startedAt: startedAt ?? null, triggerId: triggerId ?? null, runId: runId ?? null, dryRun: dryRun === true, runnerStep, decisions, held };
+    return { step: step ?? null, startedAt: startedAt ?? null, triggerId: triggerId ?? null, runId: runId ?? null, dryRun: dryRun === true, runnerStep, decisions, held, sources: sources ?? [] };
   }
 
   return restate.workflow({

@@ -1,4 +1,6 @@
 import { spawnSync } from "node:child_process";
+import { parseSourceResults } from "../../kg-source-results.js";
+import type { SourceResult } from "../../kg-source-results.js";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
@@ -58,6 +60,8 @@ export class KgSnapshotHeldError extends Error {
   readonly cause: "shrink" | "tracker-missing";
   /** Teams whose tracker fetch failed; empty for a shrink. */
   readonly failedTeams: string[];
+  /** Per-source results (tracker + ingest) for the operator's decision. */
+  readonly sources: SourceResult[];
   constructor(
     detail: string,
     partTable: Array<{ part: string; prev: string; new: string }>,
@@ -66,6 +70,7 @@ export class KgSnapshotHeldError extends Error {
     branchName: string,
     cause: "shrink" | "tracker-missing" = "shrink",
     failedTeams: string[] = [],
+    sources: SourceResult[] = [],
   ) {
     super(`KG_SNAPSHOT_HELD: ${detail}`);
     this.partTable = partTable;
@@ -74,6 +79,7 @@ export class KgSnapshotHeldError extends Error {
     this.branchName = branchName;
     this.cause = cause;
     this.failedTeams = failedTeams;
+    this.sources = sources;
   }
 }
 
@@ -249,11 +255,23 @@ function readCodeRepoOutcome(workspaceDir: string): { slug: string; empty: boole
   return { slug: codeRepo.slug, empty };
 }
 
+/** Escape a value for a Markdown table cell. */
+function cell(value: string): string {
+  return value.replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+}
+
+/** Tracker entries win over ingest entries for the same source: only the tracker step saw the fetch. */
+function mergeSources(trackerPart: SourceResult[], ingestPart: SourceResult[]): SourceResult[] {
+  const trackerKeys = new Set(trackerPart.map((r) => r.source));
+  return [...ingestPart.filter((r) => !trackerKeys.has(r.source)), ...trackerPart];
+}
+
 interface RefreshReportInputs {
   stampCompact: string;
   quads: number | null;
   partRows: Array<{ part: string; prev: string; next: string; delta: string }>;
   teamCounts: Array<{ team: string; count: number }>;
+  sources: SourceResult[];
   secondaryRepos: Array<{ slug: string; branch: string; commit: string }>;
   ingestWarnings: string[];
   guardVerdict: string;
@@ -291,6 +309,16 @@ function buildRefreshReport(data: RefreshReportInputs): string {
     lines.push("_(no tracker data fetched this run)_");
   } else {
     for (const tc of data.teamCounts) lines.push(`- ${tc.team}: ${tc.count}`);
+  }
+  lines.push("", "### Sources", "");
+  if (data.sources.length === 0) {
+    lines.push("_(no per-source results reported)_");
+  } else {
+    lines.push("| Source | Status | Reason | Counts |", "|---|---|---|---|");
+    for (const r of data.sources) {
+      const counts = Object.entries(r.counts).map(([k, v]) => `${k}: ${v}`).join(", ");
+      lines.push(`| ${cell(r.source)} | ${r.status} | ${cell(r.reason)} | ${cell(counts)} |`);
+    }
   }
   lines.push("", "### Secondary repositories", "");
   if (data.secondaryRepos.length === 0) {
@@ -723,6 +751,10 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     // so the two can never disagree about counts.
     const secondaryRepoOutcomes = readSecondaryRepoOutcomes(workspaceDir);
     const ingestWarnings = readIngestWarnings(workspaceDir);
+    const sources = mergeSources(
+      parseSourceResults(trackerOutputs.teamResults),
+      parseSourceResults(context.getOutputs("kg-ingest").sourceResults),
+    );
     const scope = inputs.scope ?? { addedRepos: [], addedTeams: [], mappedProjectCount: 0 };
     const guardVerdictText = held
       ? heldCause === "tracker-missing"
@@ -736,6 +768,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       quads: stats?.quads ?? null,
       partRows,
       teamCounts,
+      sources,
       secondaryRepos: secondaryRepoOutcomes,
       ingestWarnings,
       guardVerdict: guardVerdictText,
@@ -760,6 +793,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
         branchName: null,
         guardVerdict: "clean",
         partTable: partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })),
+        sources,
       };
     }
 
@@ -840,8 +874,8 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       // Dev/test scenario with no target repo identity: the branch pushed, but there is
       // nothing to build a GitHub API URL from, so the refresh PR cannot be opened.
       console.warn("[kg-snapshot-push] repoOwner/repoRepo absent — pushed the branch but skipped opening the refresh PR");
-      if (held) throw new KgSnapshotHeldError(heldDetail, partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })), null, commitSha, branchName, heldCause, failedTeams);
-      return { snapshotPushed: true, commitSha, prNumber: null, branchName };
+      if (held) throw new KgSnapshotHeldError(heldDetail, partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })), null, commitSha, branchName, heldCause, failedTeams, sources);
+      return { snapshotPushed: true, commitSha, prNumber: null, branchName, sources };
     }
 
     const quadsLabel = stats?.quads != null ? String(stats.quads) : "?";
@@ -880,10 +914,10 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     }
 
     if (held) {
-      throw new KgSnapshotHeldError(heldDetail, partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })), pr.number, commitSha, branchName, heldCause, failedTeams);
+      throw new KgSnapshotHeldError(heldDetail, partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })), pr.number, commitSha, branchName, heldCause, failedTeams, sources);
     }
 
-    return { snapshotPushed: true, commitSha, prNumber: pr.number, branchName };
+    return { snapshotPushed: true, commitSha, prNumber: pr.number, branchName, sources };
   },
 };
 

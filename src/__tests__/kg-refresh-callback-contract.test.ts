@@ -290,6 +290,7 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
     const savedToken = process.env.RUN_TOKEN;
     process.env.RUN_TOKEN = token;
     const partTable = [{ part: "comment.nt", prev: "9995", new: "3793" }];
+    const sources = [{ source: "tracker:X", kind: "tracker", status: "failed" as const, reason: "503", counts: {} }];
     try {
       await postRunnerResult({
         phase: "kg-refresh",
@@ -301,6 +302,7 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
         partTable,
         cause: "tracker-missing",
         failedTeams: ["X"],
+        sources,
         snapshotPr: 21,
         snapshotCommit: "abc",
         snapshotBranch: "kg-refresh/20260912T100000Z",
@@ -324,6 +326,7 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
         partTable,
         cause: "tracker-missing",
         failedTeams: ["X"],
+        sources,
       }),
       { idempotencyKey: dispatchId },
     );
