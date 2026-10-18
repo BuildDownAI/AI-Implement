@@ -2,20 +2,23 @@
  * Behavioral tests for `src/model-session-ownership.ts` (AII-949) against a temp SQLite
  * file with the real session store. Synthetic keys and session data only; no network.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
-import crypto from "node:crypto";
+import { describe, it, expect, beforeEach } from "vitest";
 import type * as DedupModule from "../dedup.js";
 import type * as OwnershipModule from "../model-session-ownership.js";
 import type * as StoreModule from "../model-session-store.js";
+import { createModelSessionKeyProvider } from "../model-session-keys.js";
+import { testDb, type TestDb } from "./helpers/test-db.js";
 
 const SENTINEL = "SYNTH-SESSION-TOKEN-xyz789";
-const KEY = crypto.createHash("sha256").update("synthetic-ownership-key").digest();
+const KEYS = createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: "synthetic-ownership-secret" });
 const OPERATOR = { synthetic: "operator" };
+const MODULES = {
+  dedup: () => import("../dedup.js"),
+  own: () => import("../model-session-ownership.js"),
+  storeMod: () => import("../model-session-store.js"),
+};
 
-let dbPath: string;
+let db: TestDb<typeof MODULES>;
 let dedup: typeof DedupModule;
 let own: typeof OwnershipModule;
 let storeMod: typeof StoreModule;
@@ -27,37 +30,27 @@ const sub = (profileId: string): OwnershipModule.ProfileRequest => ({ profileId,
 
 function build(): OwnershipModule.ModelSessionOwnership {
   store = storeMod.createModelSessionStore({
-    keys: { current: () => ({ keyId: "k1", key: KEY }), get: (id) => (id === "k1" ? KEY : undefined) },
+    keys: KEYS,
     verifyOwner: own.sessionOwnerVerifier,
     authorizeOperator: (op) => op === OPERATOR,
   });
   return own.createModelSessionOwnership({ store, probe: () => probeResult(), now: () => clock });
 }
 
-async function boot(): Promise<OwnershipModule.ModelSessionOwnership> {
-  vi.resetModules();
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  own = await import("../model-session-ownership.js");
-  storeMod = await import("../model-session-store.js");
-  dedup.getDb();
+/** A process restart against the same database file. */
+async function restart(): Promise<OwnershipModule.ModelSessionOwnership> {
+  ({ dedup, own, storeMod } = await db.reopen());
   return build();
 }
 
 let o: OwnershipModule.ModelSessionOwnership;
 
 beforeEach(async () => {
-  dbPath = path.join(os.tmpdir(), `model-session-ownership-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
   probeResult = () => "terminated";
   clock = 1_000;
-  o = await boot();
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  for (const suffix of ["", "-wal", "-shm"]) {
-    try { fs.unlinkSync(dbPath + suffix); } catch { /* ignore */ }
-  }
+  db = await testDb({ modules: MODULES });
+  ({ dedup, own, storeMod } = db.modules);
+  o = build();
 });
 
 function reserve1(dispatchId: string, profileId = "p1"): ref {
@@ -154,8 +147,7 @@ describe("state transitions", () => {
     expect(o.beginStop(r).status).toBe("ok");
     expect(o.beginStop(r)).toEqual({ status: "ok", state: "stopping", idempotent: true });
 
-    dedup.closeDb();
-    o = await boot();
+    o = await restart();
     expect(o.snapshot("p1")).toMatchObject({ state: "stopping", generation: r.generation });
     expect(o.reserve({ dispatchId: "d2", profiles: [sub("p1")] }).status).toBe("queued");
   });
@@ -283,7 +275,7 @@ describe("release after termination", () => {
   it("an unusable key requires reauthentication, not release", async () => {
     const r = stopped();
     const other = storeMod.createModelSessionStore({
-      keys: { current: () => undefined, get: () => undefined },
+      keys: createModelSessionKeyProvider({}),
       verifyOwner: own.sessionOwnerVerifier,
       authorizeOperator: () => false,
     });
@@ -361,8 +353,7 @@ describe("stale owners", () => {
       const before = allRows();
       expect(o.reserve({ dispatchId: "d1", profiles: [sub("pb"), sub("pa"), sub("pa")] })).toEqual(first);
       expect(allRows()).toEqual(before);
-      dedup.closeDb();
-      o = await boot();
+      o = await restart();
       expect(o.reserve({ dispatchId: "d1", profiles: [sub("pb"), sub("pa")] })).toEqual(first);
       expect(o.reserve({ dispatchId: "d1", profiles: [sub("pa")] })).toEqual(changed);
       expect(allRows()).toEqual(before);

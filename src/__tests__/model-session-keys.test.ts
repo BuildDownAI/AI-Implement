@@ -1,9 +1,7 @@
-import { describe, it, expect, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
+import { describe, it, expect, vi } from "vitest";
 import crypto from "node:crypto";
 import { createModelSessionKeyProvider, deriveModelAuthProtectionKey, deriveModelProtectedSecretKey, MODEL_SESSION_KEY_ID } from "../model-session-keys.js";
+import { testDb } from "./helpers/test-db.js";
 
 const SECRET = "SENTINEL-RUNNER-TOKEN-SECRET-abc123";
 
@@ -76,18 +74,8 @@ describe("createModelSessionKeyProvider", () => {
 });
 
 describe("store integration", () => {
-  const dbPath = path.join(os.tmpdir(), `model-session-keys-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  afterEach(() => {
-    for (const suffix of ["", "-wal", "-shm"]) {
-      try { fs.unlinkSync(dbPath + suffix); } catch { /* ignore */ }
-    }
-  });
-
   it("fails key_unavailable without a secret and key_mismatch under another secret", async () => {
-    vi.resetModules();
-    process.env.DEDUP_DB_PATH = dbPath;
-    const dedup = await import("../dedup.js");
-    const { createModelSessionStore } = await import("../model-session-store.js");
+    const { createModelSessionStore } = (await testDb({ modules: { store: () => import("../model-session-store.js") } })).modules.store;
     const env: NodeJS.ProcessEnv = {};
     const store = createModelSessionStore({
       keys: createModelSessionKeyProvider(env),
@@ -101,7 +89,6 @@ describe("store integration", () => {
     expect(store.readPlanRecord("acct").ok).toBe(true);
     env.RUNNER_TOKEN_SECRET = "rotated-secret";
     expect(store.readPlanRecord("acct")).toMatchObject({ ok: false, reason: "key_mismatch" });
-    dedup.closeDb();
   });
 });
 
