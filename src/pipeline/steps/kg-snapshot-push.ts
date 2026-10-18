@@ -8,7 +8,7 @@ import { refreshRunnerGithubCredentials } from "../../runner-token.js";
 import { getPublicationCredential } from "../../publication-credential.js";
 import { openOrFindPullRequest } from "../step-utils.js";
 import { postPrComment } from "../../github.js";
-import { readCodeRepoFromSourcesYml, readSecondaryReposFromSourcesYml } from "./kg-tracker-data.js";
+import { readCodeRepoFromSourcesYml, readSecondaryReposFromSourcesYml, readTrackerRecords } from "./kg-tracker-data.js";
 
 /** Head-branch prefix of the rail's own snapshot PRs; the PR-check webhook ignores PRs from it. */
 export const KG_SNAPSHOT_BRANCH_PREFIX = "kg-refresh/";
@@ -108,6 +108,17 @@ function countTeamIssues(issueNt: string, team: string): number {
   const escaped = team.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const re = new RegExp(`onto#trackerTeam>?\\s+"${escaped}"`);
   return issueNt.split("\n").filter((line) => re.test(line)).length;
+}
+
+/** The distinct `trackerTeam "<literal>"` values in an issue.nt body. */
+function servedTeamLiterals(issueNt: string): Set<string> {
+  const out = new Set<string>();
+  const re = /onto#trackerTeam>?\s+"([^"]*)"/;
+  for (const line of issueNt.split("\n")) {
+    const m = re.exec(line);
+    if (m) out.add(m[1]);
+  }
+  return out;
 }
 
 /** Refuse a part that shrinks below this fraction of its previous line count. */
@@ -625,8 +636,13 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
         const hasServedIssueNt = previousTrackerFiles.some((f) => f.trim().endsWith("/issue.nt"));
         const readFailed = hasServedIssueNt && (issueShow.status !== 0 || issueShow.error != null);
         const servedIssueNt = hasServedIssueNt && !readFailed ? issueShow.stdout.toString() : "";
+        // A snapshot written by an older ingest holds the identifier prefix, not the sources.yml key. A zero
+        // count is then unreliable: with any served literal that is no tracker key, an empty team is unknown.
+        const trackerKeys = new Set(readTrackerRecords(workspaceDir).map((r) => r.team));
+        const hasForeignLiteral = [...servedTeamLiterals(servedIssueNt)].some((l) => !trackerKeys.has(l));
         for (const team of affectedTeams) {
-          const servedIssues = readFailed ? -1 : countTeamIssues(servedIssueNt, team);
+          let servedIssues = readFailed ? -1 : countTeamIssues(servedIssueNt, team);
+          if (servedIssues === 0 && hasForeignLiteral) servedIssues = -1;
           if (servedIssues !== 0) lostTeams.push({ team, servedIssues });
           else emptyTeams.push(team);
         }

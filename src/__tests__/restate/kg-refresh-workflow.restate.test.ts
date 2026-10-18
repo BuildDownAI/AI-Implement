@@ -3364,10 +3364,27 @@ describe("KgRefresh durable workflow", () => {
     const shortHeldWorkflow = createKgRefreshWorkflow({
       ...workflowDeps, bootstrapDeadlineMs: 30_000, totalDeadlineMs: 60_000, decisionTimeoutMs: SHORT_DECISION_TIMEOUT_MS,
     });
+    // The same workflow plus a test-only handler that resolves the `decide` promise directly, so an accept reaches the run
+    // handler without passing `decide`'s own acceptBlocked check.
+    const forceDecideHandlers = (restate.workflow({
+      name: "KgRefresh",
+      handlers: {
+        run: restate.handlers.workflow.workflow(async () => undefined),
+        forceDecide: restate.handlers.workflow.shared(async (ctx: restate.WorkflowSharedContext, input: { action: string; actor: string }) => {
+          await ctx.promise<{ action: string; actor: string }>("decide").resolve(input);
+        }),
+      },
+    }) as unknown as { workflow: Record<string, unknown> }).workflow;
+    const forceDecideWorkflow = {
+      ...heldWorkflow,
+      workflow: { ...(heldWorkflow as unknown as { workflow: object }).workflow, forceDecide: forceDecideHandlers.forceDecide },
+    } as unknown as typeof heldWorkflow;
     let heldEnvs: Map<string, RestateEnvironment>;
     let shortHeldEnvs: Map<string, RestateEnvironment>;
+    let forceEnvs: Map<string, RestateEnvironment>;
     beforeAll(async () => {
       heldEnvs = await startVariants([heldWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile, orchestratorTools]);
+      forceEnvs = await startVariants([forceDecideWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
       setKgRefreshToolDeps({ kgSourceRepo: KG_SOURCE_REPO } as unknown as KgRefreshToolDeps);
       shortHeldEnvs = await startVariants([shortHeldWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
     }, 120_000);
@@ -3375,6 +3392,7 @@ describe("KgRefresh durable workflow", () => {
       setKgRefreshToolDeps(null);
       await stopAll(heldEnvs);
       await stopAll(shortHeldEnvs);
+      await stopAll(forceEnvs);
     });
 
     const readStatus = (baseUrl: string, triggerId: string) =>
@@ -3564,9 +3582,52 @@ describe("KgRefresh durable workflow", () => {
           callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ada@example.com" }),
         ).rejects.toThrow(/409.*accept-blocked/);
         const after = await callWorkflow<{ step: string; decisions: string[] }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
-        expect(after).toMatchObject({ step: "decision", decisions: ["cancel"] });
+        expect(after).toMatchObject({ step: "decision", decisions: ["cancel"], held: { acceptBlocked: true, decideBy: expect.any(Number) } });
         expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
 
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ada@example.com" });
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        await closeRowFor(triggerId);
+      },
+      60_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "the run handler never merges an acceptBlocked report, even when an accept reaches it past decide (%s)",
+      async (label) => {
+        const env = forceEnvs.get(label)!;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env, { report: BLOCKED_REPORT });
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "forceDecide", { action: "accept", actor: "ada@example.com" });
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        expect(outcome.ok).toBe(false);
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        await closeRowFor(triggerId);
+      },
+      60_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "status never shows step decision without held and decideBy, and accept answers accept-blocked from the first such read (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const triggerId = await holdRun(env, { report: BLOCKED_REPORT, awaitGate: false });
+        let sawDecision = false;
+        const stop = Date.now() + 30_000;
+        while (!sawDecision && Date.now() < stop) {
+          const st = await callWorkflow<{ step: string | null; held: { decideBy: number | null } | null }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
+          if (st.step === "decision") {
+            sawDecision = true;
+            expect(st.held).not.toBeNull();
+            expect(st.held?.decideBy).toEqual(expect.any(Number));
+            await expect(
+              callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ada@example.com" }),
+            ).rejects.toThrow(/409.*accept-blocked/);
+          }
+        }
+        expect(sawDecision).toBe(true);
         await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ada@example.com" });
         await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
         await closeRowFor(triggerId);

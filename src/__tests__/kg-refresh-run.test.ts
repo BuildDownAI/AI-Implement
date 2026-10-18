@@ -1115,6 +1115,11 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
     return Array.from({ length: n }, (_, i) => `<urn:issue:${team}-${i}> <https://example.com/onto#trackerTeam> "${team}" .\n`).join("");
   }
 
+  /** Write the sources.yml whose tracker keys the lost-team literal check compares against. */
+  function writeSourcesYml(...keys: string[]): void {
+    writeFileSync(join(tmpDir, "sources.yml"), `trackers:\n${keys.map((k) => `  - team: ${k}\n    kind: linear\n`).join("")}`);
+  }
+
   function setupShrink(parts: Record<string, string>, shrunk: Record<string, string>): string {
     initGitRepo(tmpDir);
     commitPreviousSnapshot(parts);
@@ -1318,6 +1323,7 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
       { "issue.nt": teamIssues("OTHER", 5), "doc.nt": makeLines(10) },
     );
     stubPrCreate(41, "https://github.com/acme/kg-repo/pull/41");
+    writeSourcesYml("X", "OTHER");
     const ctx = makeContext();
     ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X"], issueCount: 0 });
     const result = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter);
@@ -1327,6 +1333,48 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
     expect(result.warnings?.[0]).toContain("X");
     const init = vi.mocked(fetch).mock.calls[0][1] as RequestInit;
     expect((JSON.parse(init.body as string) as { body: string }).body).toContain("X");
+  });
+
+  it("a zero count with a served literal that is no sources.yml key is unknown: lost, Accept blocked", async () => {
+    const clonedRef = setupShrink(
+      { "issue.nt": teamIssues("TOP", 5), "doc.nt": makeLines(10) },
+      { "issue.nt": teamIssues("TOP", 5), "doc.nt": makeLines(10) },
+    );
+    stubPrCreate(61, "https://github.com/acme/kg-repo/pull/61");
+    writeSourcesYml("topia-mobile", "other");
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["topia-mobile"], issueCount: 0 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotHeldError);
+    expect(err.cause).toBe("tracker-missing");
+    expect(err.acceptBlocked).toBe(true);
+    expect(err.lostTeams).toEqual([{ team: "topia-mobile", servedIssues: -1 }]);
+  });
+
+  it("an unreadable sources.yml fails closed: every zero-count team is unknown", async () => {
+    const clonedRef = setupShrink(
+      { "issue.nt": teamIssues("OTHER", 5), "doc.nt": makeLines(10) },
+      { "issue.nt": teamIssues("OTHER", 5), "doc.nt": makeLines(10) },
+    );
+    stubPrCreate(62, "https://github.com/acme/kg-repo/pull/62");
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X"], issueCount: 0 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotHeldError);
+    expect(err.lostTeams).toEqual([{ team: "X", servedIssues: -1 }]);
+  });
+
+  it("a positive count is unchanged when another served literal is no sources.yml key", async () => {
+    const clonedRef = setupShrink(
+      { "issue.nt": teamIssues("X", 4) + teamIssues("TOP", 2), "doc.nt": makeLines(10) },
+      { "issue.nt": teamIssues("X", 4) + teamIssues("TOP", 2), "doc.nt": makeLines(10) },
+    );
+    stubPrCreate(63, "https://github.com/acme/kg-repo/pull/63");
+    writeSourcesYml("X");
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X"], issueCount: 0 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err.lostTeams).toEqual([{ team: "X", servedIssues: 4 }]);
   });
 
   it("a skipped team (in teamResults only) with served issues holds with Accept blocked; the count reads the clone, not the working tree", async () => {
@@ -1388,6 +1436,7 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
       { "issue.nt": teamIssues("OTHER", 30), "doc.nt": makeLines(10) },
     );
     stubPrCreate(44, "https://github.com/acme/kg-repo/pull/44");
+    writeSourcesYml("X", "OTHER");
     const ctx = makeContext();
     ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X"], issueCount: 0 });
     const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
@@ -1403,6 +1452,7 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
       { "issue.nt": teamIssues("A", 3), "doc.nt": makeLines(10) },
     );
     stubPrCreate(43, "https://github.com/acme/kg-repo/pull/43");
+    writeSourcesYml("A", "B");
     const ctx = makeContext();
     ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["A", "B"], issueCount: 0 });
     const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
