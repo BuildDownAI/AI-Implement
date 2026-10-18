@@ -54,6 +54,26 @@ describe("JiraClient", () => {
     expect(JSON.parse(fake.calls[1].body).nextPageToken).toBe("p2");
   });
 
+  it("searchJqlPage sends nextPageToken only when given and returns the next one", async () => {
+    const fake = fakeFetch({
+      [`POST ${GATEWAY}/search/jql`]: [
+        { json: { issues: [{ id: "1", key: "X-1", fields: {} }], nextPageToken: "p2" } },
+        { json: { issues: [{ id: "2", key: "X-2", fields: {} }] } },
+      ],
+    }).install();
+    const client = new JiraClient(config);
+    const first = await client.searchJqlPage("project = X", ["summary"]);
+    expect(first.nextPageToken).toBe("p2");
+    expect(first.issues.map((i) => i.key)).toEqual(["X-1"]);
+    const second = await client.searchJqlPage("project = X", ["summary"], "p2");
+    expect(second.nextPageToken).toBeUndefined();
+    expect(fake.calls).toHaveLength(2);
+    const firstBody = JSON.parse(fake.calls[0].body);
+    expect(firstBody).not.toHaveProperty("nextPageToken");
+    expect(firstBody.maxResults).toBe(100);
+    expect(JSON.parse(fake.calls[1].body).nextPageToken).toBe("p2");
+  });
+
   it("validateJql returns valid:true on success", async () => {
     fakeFetch({ [`POST ${GATEWAY}/jql/parse`]: { json: {} } }).install();
     const client = new JiraClient(config);

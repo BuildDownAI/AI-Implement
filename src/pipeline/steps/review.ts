@@ -66,6 +66,7 @@ const REVIEW_PROMPT = (
   if (installFailed) {
     prompt += `\n\n## Dependency install failed\n\nDependencies did not install in this workspace, so the implementer could not run build or test commands. Do not reject the change only because it lacks test-run evidence — still review the tests it wrote for correctness.`;
   }
+  prompt += `\n\n## Source inspection versus executed checks\n\nYou review read-only and cannot run commands. Evaluate every code and test claim by inspecting the source and diff, and say which claims you established by inspection and which by an executed check.\n- Do not set approved=false SOLELY because you cannot run a test or build command, or cannot observe runtime facts owned by the leader. Record such a claim as "unverified (not executed)" in feedback; inspection must still support the claim.\n- Never state or imply that a command was run or passed unless it was. Do not invent passed execution.\n- A missing or incorrect required source change or test, or an observed failure, still belongs in blocking_issues[] with approved=false.`;
   if (diff) prompt += `\n\n## Implementation Diff\n\`\`\`diff\n${capDiff(diff)}\n\`\`\``;
 
   prompt += `\n\nRespond with a JSON object only:

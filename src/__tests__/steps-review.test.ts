@@ -508,6 +508,21 @@ describe("reviewStep", () => {
     expect(call.prompt).toContain("Dependencies did not install");
   });
 
+  it("tells the reviewer to keep unverified execution honest without waiving source defects", async () => {
+    const executor = reviewExecutor(APPROVED_VERDICT);
+    const bar = "1. Unicode words are handled in src/words.py\n2. `python3 -m unittest discover -s tests -v` passes";
+    await reviewStep.run(makeContext({}, executor), { acceptanceBar: bar }, new NoopStepReporter());
+
+    const prompt = vi.mocked(executor.invoke).mock.calls[0][0].prompt;
+    expect(prompt).toContain("SOLELY because you cannot run a test or build command");
+    expect(prompt).toContain("unverified (not executed)");
+    expect(prompt).toContain("Do not invent passed execution");
+    expect(prompt).toContain("still belongs in blocking_issues[] with approved=false");
+    expect(prompt).toContain("Approval contract");
+    expect(prompt).toContain("python3 -m unittest discover -s tests -v");
+    expect(prompt.indexOf("Source inspection versus executed checks")).toBeGreaterThan(prompt.indexOf(bar));
+  });
+
   it("does not include the dependency install note when installFailed is false or absent", async () => {
     const executor = reviewExecutor(APPROVED_VERDICT);
     await reviewStep.run(makeContext({}, executor), {}, new NoopStepReporter());

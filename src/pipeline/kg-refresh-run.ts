@@ -381,6 +381,8 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
             ...(held.prNumber !== null ? { snapshotPr: held.prNumber } : {}),
             ...(held.commitSha ? { snapshotCommit: held.commitSha } : {}),
             snapshotBranch: held.branchName,
+            cause: held.cause,
+            failedTeams: held.failedTeams,
           }
         : {}),
       callbackUrl,

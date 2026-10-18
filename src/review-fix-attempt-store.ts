@@ -169,6 +169,17 @@ function hashResult(result: ReviewFixResultMetadataV1): string {
   return createHash("sha256").update(JSON.stringify(result)).digest("hex");
 }
 
+/** Diagnostic writes may only name the dispatch owning this exact, durably accepted result.
+ * A conflict prevents late duplicate delivery from adding attribution to disputed evidence. */
+export function acceptedReviewFixDispatchId(result: ReviewFixResultMetadataV1): string | null {
+  const row = getDb().prepare(`SELECT a.dispatch_id FROM review_fix_attempts a
+    JOIN dispatch_admissions d ON d.dispatch_id = a.dispatch_id
+    WHERE a.attempt_id = ? AND a.accepted_result_hash = ? AND a.result_conflict_at IS NULL
+      AND d.lifecycle_owner = 'restate:' || a.attempt_id`)
+    .get(result.attemptId, hashResult(result)) as { dispatch_id: string } | undefined;
+  return row?.dispatch_id ?? null;
+}
+
 function mapDeferReason(reason: Extract<DispatchAdmissionDecision, { ok: false }>["reason"]): "paused" | "occupied" | "at_capacity" | "budget_exhausted" {
   return reason === "parked" ? "paused" : reason;
 }

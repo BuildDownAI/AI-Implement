@@ -826,3 +826,70 @@ describe("SqliteReviewFixAttemptStore: journaled timestamps", () => {
     expect(clockReads).toEqual([]);
   });
 });
+
+describe("review-fix admin facade: cycle evidence projection", () => {
+  const admin = { role: "admin" as const, email: "operator@example.com" };
+
+  async function attemptWithFacade() {
+    seedMapping();
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const admitted = await store.admit(admissionRequest());
+    if (admitted.status !== "prepared") throw new Error("expected prepared");
+    const facade = adminFacade.createReviewFixAdminFacade(store, { reconcile: async () => ({ status: "unknown" }) },
+      { cancel: async () => ({ status: "accepted" }) });
+    return { attemptId: admitted.attempt.attemptId, facade };
+  }
+
+  /** Stored exactly as `recordOneCycleSummary` writes a runner summary (verdict is the JSON object). */
+  async function record(attemptId: string, cycle: number, fields: {
+    outputCommit: string | null; tests: unknown; verdict: string; usage: unknown; dispositions?: Array<{ findingKey: string; disposition: "addressed" }>;
+  }) {
+    const evidence = await import("../review-fix-evidence.js");
+    expect(evidence.recordReviewFixCycleSummary({ attemptId, cycle, inputCommit: "a".repeat(40), outputCommit: fields.outputCommit,
+      dispositions: fields.dispositions ?? [], tests: fields.tests as never, verdict: fields.verdict, usage: fields.usage as never,
+      completedAt: 1000 + cycle }).status).toBe("recorded");
+  }
+
+  it("distinguishes the pending pre-push cycle from the published one and projects the structured verdict", async () => {
+    const { attemptId, facade } = await attemptWithFacade();
+    const verdict = JSON.stringify({ approved: true, reason: "approved" });
+    const tests = [{ name: "test execution", status: "missing" }];
+    const usage = { tokensIn: null, tokensOut: null, costUsd: null };
+    await record(attemptId, 1, { outputCommit: null, tests, verdict, usage });
+    await record(attemptId, 50_001, { outputCommit: "b".repeat(40), tests, verdict, usage,
+      dispositions: [{ findingKey: "k1", disposition: "addressed" }] });
+    const detail = await facade.getAttempt(attemptId as never, admin);
+    if (detail.status !== "ok") throw new Error("expected ok");
+    const [pending, published] = detail.attempt.cycles;
+    expect(pending).toMatchObject({ cycle: 1, outputCommit: null, dispositions: [] });
+    expect(published).toMatchObject({ cycle: 50_001, outputCommit: "b".repeat(40), dispositions: [{ key: "k1", disposition: "addressed" }] });
+    for (const cycle of [pending, published]) expect(cycle.verdict).toEqual({ approved: true, reason: "approved" });
+  });
+
+  it("keeps missing tests missing and null usage null instead of inventing success or zero cost", async () => {
+    const { attemptId, facade } = await attemptWithFacade();
+    await record(attemptId, 1, { outputCommit: null, tests: [{ name: "test execution", status: "missing" }],
+      verdict: JSON.stringify({ approved: null, reason: "x" }), usage: { tokensIn: null, tokensOut: null, costUsd: null } });
+    await record(attemptId, 2, { outputCommit: null, tests: null, verdict: "legacy text", usage: null });
+    await record(attemptId, 3, { outputCommit: null, tests: [{ name: "unit", status: "passed" }],
+      verdict: "{broken", usage: { tokensIn: 5, tokensOut: null, costUsd: 0.25 } });
+    const detail = await facade.getAttempt(attemptId as never, admin);
+    if (detail.status !== "ok") throw new Error("expected ok");
+    const [missing, noTests, observed] = detail.attempt.cycles;
+    expect(missing.tests).toEqual([{ name: "test execution", status: "missing" }]);
+    expect(missing.usage).toEqual({ tokensIn: null, tokensOut: null, costUsd: null });
+    expect(noTests.tests).toEqual([]);
+    expect(noTests.usage).toEqual({ tokensIn: null, tokensOut: null, costUsd: null });
+    expect(noTests.verdict).toEqual({ approved: null, reason: "legacy text" });
+    expect(observed.tests).toEqual([{ name: "unit", status: "passed" }]);
+    expect(observed.usage).toEqual({ tokensIn: 5, tokensOut: null, costUsd: 0.25 });
+    expect(observed.verdict).toEqual({ approved: null, reason: "{broken" });
+  });
+
+  it("reports missing invocation attribution explicitly without inventing a job or usage", async () => {
+    const { attemptId, facade } = await attemptWithFacade();
+    const detail = await facade.getAttempt(attemptId as never, admin);
+    if (detail.status !== "ok") throw new Error("expected ok");
+    expect(detail.attempt.attribution).toBeNull();
+  });
+});

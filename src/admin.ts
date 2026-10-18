@@ -1,5 +1,6 @@
 import { hasEphemeralFullAccessOptIn, EPHEMERAL_FULL_ACCESS_ASSERTION, EPHEMERAL_FULL_ACCESS_EXTRA_ENV, EXECUTION_POLICY_ENV, isEphemeralPolicyEnvName } from "./model-auth-contract.js";
 import http from "node:http";
+import type { InvocationAttributionV1 } from "./pipeline/types.js";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -123,10 +124,9 @@ import { enqueueWorkflowSync, runWorkflowSync, getWorkflowSyncById } from "./wor
 import { isBareWorkflowFileName, workflowFileNamesCollide } from "./workflow-sync.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import { normalizeGitHubRepo, normalizeReferenceRepos, type ReferenceRepo } from "./reference-repos.js";
-import { fetchTrackerIssuesPage } from "./runner-callback.js";
-import { isLinearAuthConfigured } from "./linear-app-auth.js";
 import { resolveWorkflowCapabilities } from "./workflow-probe.js";
 import type { callTool } from "./restate/tools-client.js";
+import type { TrackerExportIngressClient } from "./restate/tracker-export.js";
 import type { RestateStatus } from "./restate/status.js";
 import type { Caller } from "./mcp-identity.js";
 import picomatch from "picomatch";
@@ -336,28 +336,22 @@ export function clearDedupEntryAction(issueId: string): { status: number; body: 
 }
 
 /**
- * Loops fetchTrackerIssuesPage across every page for a team, returning the flat
+ * Loops `TrackerExport.page` across every page for a team, returning the flat
  * issue array the kg-refresh dev harness's `--tracker-data` file expects
  * (`Array.isArray(parsed) ? parsed.length : 0` in kg-tracker-data.ts). A
- * non-200 page short-circuits and its status/error propagate to the caller.
+ * non-OK page short-circuits and its code propagates to the caller.
  */
 async function fetchAllTrackerIssuesForTeam(
+  trackerExport: TrackerExportIngressClient,
   teamKey: string,
-): Promise<{ ok: true; issues: unknown[] } | { ok: false; status: number; error: string }> {
+): Promise<{ ok: true; issues: unknown[] } | { ok: false; code: string }> {
   const issues: unknown[] = [];
   let cursor: string | null = null;
   do {
-    const page = await fetchTrackerIssuesPage(teamKey, cursor);
-    if (page.status !== 200) {
-      const error = (page.body as { error?: string }).error ?? "Upstream tracker error";
-      return { ok: false, status: page.status, error };
-    }
-    const body = page.body as {
-      issues: unknown[];
-      pageInfo: { hasNextPage: boolean; endCursor: string | null };
-    };
-    issues.push(...body.issues);
-    cursor = body.pageInfo.hasNextPage ? body.pageInfo.endCursor : null;
+    const result = await trackerExport.page({ team: teamKey, cursor });
+    if (!result.ok) return { ok: false, code: result.code };
+    issues.push(...result.page.issues);
+    cursor = result.page.pageInfo.hasNextPage ? result.page.pageInfo.endCursor : null;
   } while (cursor !== null);
   return { ok: true, issues };
 }
@@ -443,9 +437,8 @@ async function resolveKgManifestTeams(
 
 /**
  * Union of every team currently in scope for the KG: the KG repo's sources.yml
- * trackers: manifest, plus every mapped team with a Linear ticketing provider (the
- * only provider fetchAllTrackerIssuesForTeam supports). Jira-mapped teams are
- * silently excluded rather than attempted and failed.
+ * trackers: manifest, plus every mapped team whose tracker `TrackerExport` can read
+ * (Linear and Jira; a filesystem mapping has no tracker).
  */
 async function resolveKgScopeTeams(
   kgSourceRepo: string | null | undefined,
@@ -453,10 +446,18 @@ async function resolveKgScopeTeams(
   githubAppPrivateKey: string,
 ): Promise<string[]> {
   const manifestTeams = await resolveKgManifestTeams(kgSourceRepo, githubAppId, githubAppPrivateKey);
-  const linearMappedTeams = Object.entries(getMappings())
-    .filter(([, m]) => m.ticketingProvider === "linear")
+  const mappings = getMappings();
+  const mappedManifestTeams = manifestTeams.filter((t) => Object.hasOwn(mappings, t));
+  const skippedTeams = manifestTeams.filter((t) => !Object.hasOwn(mappings, t));
+  if (skippedTeams.length > 0) {
+    console.warn(
+      `[admin] KG scope: skipping manifest teams with no orchestrator mapping (no tracker to read): ${skippedTeams.join(", ")}`,
+    );
+  }
+  const trackerMappedTeams = Object.entries(mappings)
+    .filter(([, m]) => m.ticketingProvider === "linear" || m.ticketingProvider === "jira")
     .map(([key]) => key);
-  return [...new Set([...manifestTeams, ...linearMappedTeams])];
+  return [...new Set([...mappedManifestTeams, ...trackerMappedTeams])];
 }
 
 function shapeIssue(i: TicketIssue, bucket: "ready" | "needs-planning") {
@@ -551,6 +552,8 @@ export interface AdminDeps {
   };
   /** The tools-service ingress caller (src/restate/tools-client.ts, AII-710). Absent only in tests that don't exercise POST /api/tools/<name>. */
   callTool?: typeof callTool;
+  /** The `TrackerExport` ingress client (AII-1463), bound in src/index.ts. Absent only in tests that don't exercise GET /api/kg/tracker-data; the route answers 503 `unavailable` then. */
+  trackerExport?: TrackerExportIngressClient;
   /** Re-reads `RunnerBackend/fly-machines` into the cache after a Settings write. Defaults to `refreshRunnerBackendCache`; a test seam. */
   refreshRunnerBackendCache?: () => Promise<void>;
   /**
@@ -630,6 +633,8 @@ export interface ReviewFixAttemptDetail {
   /** False whenever a requested cancellation or deadline has not yet been confirmed
    *  stopped on GitHub's side — explicit, never inferred from an absent field. */
   terminationConfirmed: boolean;
+  /** Latest snapshot-validated invocation for this attempt's own dispatch; absent on older servers. */
+  attribution?: InvocationAttributionV1 | null;
   cycles: ReviewFixAttemptCycleSummary[];
 }
 
@@ -919,10 +924,11 @@ export function handleAdminRequest(
     }
 
     // Admin-authenticated export of tracker data for the kg-refresh dev harness's
-    // --tracker-data flag — same underlying Linear read as the runner-only
-    // POST /api/runner/kg-tracker-data, aggregated across pages for one team.
+    // --tracker-data flag — both this route and the runner-only
+    // POST /api/runner/kg-tracker-data call TrackerExport through one ingress client;
+    // this one aggregates the pages for a team.
     // With no ?team=, exports the union of every team in scope (the KG repo's
-    // sources.yml manifest plus every Linear-mapped team), deduplicated by issue id —
+    // sources.yml manifest plus every Linear- or Jira-mapped team), deduplicated by issue id —
     // the harness's default fetch when no --tracker-data file is given (AII-608).
     if (url.startsWith("/api/kg/tracker-data") && method === "GET") {
       const qs = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
@@ -934,14 +940,14 @@ export function handleAdminRequest(
           json(res, 403, { error: "Unauthorized" });
           return true;
         }
-        if (!isLinearAuthConfigured()) {
-          json(res, 503, { error: "Tracker not configured" });
+        if (!deps.trackerExport) {
+          json(res, 503, { error: "unavailable" });
           return true;
         }
-        fetchAllTrackerIssuesForTeam(team).then(
+        fetchAllTrackerIssuesForTeam(deps.trackerExport, team).then(
           (result) => {
             if (!result.ok) {
-              json(res, result.status, { error: result.error });
+              json(res, 503, { error: result.code });
             } else {
               json(res, 200, result.issues);
             }
@@ -951,8 +957,9 @@ export function handleAdminRequest(
         return true;
       }
 
-      if (!isLinearAuthConfigured()) {
-        json(res, 503, { error: "Tracker not configured" });
+      const trackerExport = deps.trackerExport;
+      if (!trackerExport) {
+        json(res, 503, { error: "unavailable" });
         return true;
       }
       (async () => {
@@ -960,9 +967,9 @@ export function handleAdminRequest(
           const scopeTeams = await resolveKgScopeTeams(config.kgSourceRepo, config.githubAppId, config.githubAppPrivateKey);
           const byId = new Map<string, unknown>();
           for (const scopeTeam of scopeTeams) {
-            const result = await fetchAllTrackerIssuesForTeam(scopeTeam);
+            const result = await fetchAllTrackerIssuesForTeam(trackerExport, scopeTeam);
             if (!result.ok) {
-              json(res, result.status, { error: result.error });
+              json(res, 503, { error: result.code });
               return;
             }
             for (const issue of result.issues) {

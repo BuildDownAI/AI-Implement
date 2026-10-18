@@ -1044,7 +1044,10 @@ describe("runAutonomous", () => {
       };
       mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
       writeFileSync(join(workspaceDir, CYCLE_SUMMARY_FILE), `${JSON.stringify(cycleSummary)}\n`);
+      writeFileSync(join(workspaceDir, "ai-output", "finding-dispositions.json"),
+        JSON.stringify([{ findingKey: "f".repeat(64), disposition: "fixed", reason: "done" }]));
 
+      const publishedCommit = "b".repeat(40);
       const fake = fakeFetch({
         [PLANNING_CONTEXT]: noPlanningContext,
         [CYCLE_SUMMARY]: cycleSummaryRecorded,
@@ -1052,7 +1055,7 @@ describe("runAutonomous", () => {
       });
       const { pipeline, runner } = makeStepsPipeline([
         ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
-        ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
+        ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha: publishedCommit })) }],
       ]);
 
       const result = await runAutonomous({
@@ -1066,10 +1069,96 @@ describe("runAutonomous", () => {
       });
 
       expect(result.exitCode).toBe(0);
-      expect(routesRequested(fake)).toEqual([PLANNING_CONTEXT, CYCLE_SUMMARY, RESULT]);
+      expect(routesRequested(fake)).toEqual([PLANNING_CONTEXT, CYCLE_SUMMARY, CYCLE_SUMMARY, RESULT]);
       expect(JSON.parse(fake.calls[1].body)).toEqual({ summary: cycleSummary });
+      // The pre-push record is forwarded unchanged; a distinct publication record follows with the
+      // real pushed commit and the validated dispositions file, then the result.
+      const findingKey = "f".repeat(64);
+      const publication = (JSON.parse(fake.calls[2].body) as { summary: CycleSummary }).summary;
+      expect(publication).toMatchObject({ id: "publication.1", stage: "publication", outputCommit: publishedCommit,
+        outputCommitStatus: "committed", dispositions: [{ key: findingKey, disposition: "fixed" }],
+        tests: cycleSummary.tests, verdict: cycleSummary.verdict,
+        usage: { tokensIn: null, tokensOut: null, costUsd: null } });
+      // Measured usage stays on the source cycle; the publication record never duplicates it.
+      expect((JSON.parse(fake.calls[1].body) as { summary: CycleSummary }).summary.usage).toEqual(cycleSummary.usage);
       const body = resultBody(fake) as { cycleSummaries?: CycleSummary[] };
-      expect(body.cycleSummaries).toEqual([cycleSummary]);
+      expect(body.cycleSummaries).toEqual([cycleSummary, publication]);
+    });
+
+    it("emits no approval-bearing publication when the native review rejected a pushed change", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "999888");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
+      const rejected: CycleSummary = {
+        id: "feedback-loop.1", stage: "feedback-loop", cycle: 1, inputCommit: "a".repeat(40), outputCommit: null,
+        outputCommitStatus: "pending_push", dispositions: [], tests: [{ name: "test execution", status: "missing" }],
+        verdict: { approved: false, reason: "rejected" }, usage: { tokensIn: 5, tokensOut: 6, costUsd: 0.02 },
+        truncated: false, limitReached: false, completedAt: 1_700_000_000_000,
+      };
+      mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
+      writeFileSync(join(workspaceDir, CYCLE_SUMMARY_FILE), `${JSON.stringify(rejected)}\n`);
+      writeFileSync(join(workspaceDir, "ai-output", "finding-dispositions.json"),
+        JSON.stringify([{ findingKey: "f".repeat(64), disposition: "fixed", reason: "done" }]));
+      const fake = fakeFetch({
+        [PLANNING_CONTEXT]: noPlanningContext,
+        [CYCLE_SUMMARY]: cycleSummaryRecorded,
+        [RESULT]: pilotResultStored,
+      });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: false }) }],
+        ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/acme/app/pull/42", prNumber: 42,
+          branchPushed: true, commitSha: "b".repeat(40), draft: false }) }],
+      ]);
+      await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch, ghSpawn: noReviewThreads });
+      const bodies = fake.calls.filter((c) => c.method === "POST")
+        .map((c) => JSON.parse(c.body) as { summary?: CycleSummary; outcome?: string; cycleSummaries?: CycleSummary[] });
+      expect(bodies.filter((b) => b.summary).map((b) => b.summary!.id)).toEqual(["feedback-loop.1"]);
+      expect(bodies.find((b) => b.outcome)?.outcome).toBe("failure");
+      expect(bodies.find((b) => b.outcome)?.cycleSummaries?.map((c) => c.id)).toEqual(["feedback-loop.1"]);
+    });
+
+    it("publishes only validated dispositions: invalid entries are dropped and an unpushed run emits no publication record", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "999888");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
+      const pending: CycleSummary = {
+        id: "feedback-loop.1", stage: "feedback-loop", cycle: 1, inputCommit: "a".repeat(40), outputCommit: null,
+        outputCommitStatus: "pending_push", dispositions: [], tests: [{ name: "test execution", status: "missing" }],
+        verdict: { approved: true, reason: "approved" }, usage: { tokensIn: null, tokensOut: null, costUsd: null },
+        truncated: false, limitReached: false, completedAt: 1_700_000_000_000,
+      };
+      mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
+      writeFileSync(join(workspaceDir, CYCLE_SUMMARY_FILE), `${JSON.stringify(pending)}\n`);
+      writeFileSync(join(workspaceDir, "ai-output", "finding-dispositions.json"), JSON.stringify([
+        { findingKey: "f".repeat(64), disposition: "bogus", reason: "done" },
+        { findingKey: "", disposition: "fixed", reason: "done" },
+      ]));
+      const pushed = { prUrl: "https://github.com/acme/app/pull/42", prNumber: 42, branchPushed: true, commitSha: "b".repeat(40), draft: false };
+      const routes = { [PLANNING_CONTEXT]: noPlanningContext, [CYCLE_SUMMARY]: cycleSummaryRecorded, [RESULT]: pilotResultStored };
+      const summariesSent = (fake: FakeFetch) => fake.calls.filter((c) => `${c.method} ${c.path}` === CYCLE_SUMMARY)
+        .map((c) => (JSON.parse(c.body) as { summary: CycleSummary }).summary);
+      const first = fakeFetch(routes);
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["push", { run: vi.fn().mockResolvedValue(pushed) }],
+      ]);
+      await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(),
+        fetchImpl: first.fetch, ghSpawn: noReviewThreads });
+      const publication = summariesSent(first)[1];
+      expect(publication).toMatchObject({ id: "publication.1", outputCommit: "b".repeat(40), dispositions: [] });
+
+      // Nothing was pushed (no commit): the pending record alone is forwarded and no publication is built.
+      const second = fakeFetch(routes);
+      const none = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["push", { run: vi.fn().mockResolvedValue({ ...pushed, commitSha: undefined }) }],
+      ]);
+      await runAutonomous({ workspaceDir, pipeline: none.pipeline, runner: none.runner, reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(), fetchImpl: second.fetch, ghSpawn: noReviewThreads });
+      expect(summariesSent(second).map((s) => s.id)).toEqual(["feedback-loop.1"]);
     });
 
     it("delivers a failed cycle before no-output pilot result is skipped", async () => {

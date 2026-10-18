@@ -225,7 +225,23 @@ export const kgPipelinesScript = `
 
   // The card shows the one current run: its step, and a button per open decision. Cells are
   // set with textContent, never innerHTML; the PR link goes through safeUrl().
+  // The held view last rendered, so the Accept prompt reads the cause without another request.
+  let renderedHeld = null;
+
+  function heldTeams(held) {
+    return Array.isArray(held && held.failedTeams) ? held.failedTeams.map(String) : [];
+  }
+
+  function heldWhy(held) {
+    if (held.cause !== 'tracker-missing') return 'Why: a snapshot part shrank past the guard.';
+    const teams = heldTeams(held);
+    return teams.length
+      ? 'Why: tracker data could not be read for ' + teams.join(', ') + '. The tracker parts of this snapshot are missing or reduced.'
+      : 'Why: tracker data was not fetched this run.';
+  }
+
   function renderKgCurrentRun(run, stage) {
+    renderedHeld = null;
     const el = document.getElementById('kg-current-run');
     const decisions = run && Array.isArray(run.decisions) ? run.decisions : [];
     document.getElementById('kg-refresh-btn').hidden = !!run;
@@ -243,8 +259,12 @@ export const kgPipelinesScript = `
       appendRestateLink(el, run);
       return;
     }
+    renderedHeld = held;
     head.textContent = 'Held for a decision until ' + new Date(held.decideBy).toLocaleString();
     el.appendChild(head);
+    const why = document.createElement('div');
+    why.textContent = heldWhy(held);
+    el.appendChild(why);
     appendRestateLink(el, run);
     if (held.snapshotPrUrl) {
       const link = document.createElement('a');
@@ -306,8 +326,13 @@ export const kgPipelinesScript = `
 
   // Both decisions act on the current run through a route that takes no trigger id.
   window.decideKgRefresh = async function (action) {
+    const missing = renderedHeld && renderedHeld.cause === 'tracker-missing';
+    const teams = missing ? heldTeams(renderedHeld) : [];
+    const acceptPrompt = missing
+      ? 'Accept the new baseline? This serves a graph whose tracker parts are missing or reduced' + (teams.length ? ' for ' + teams.join(', ') : '') + '. Review the part table first.'
+      : 'Accept the new baseline? This lands the held snapshot even though a tracked part shrank, overriding the zero-shrink/50% guard for this run. Review the part table first.';
     const prompt = action === 'accept'
-      ? 'Accept the new baseline? This lands the held snapshot even though a tracked part shrank, overriding the zero-shrink/50% guard for this run. Review the part table first.'
+      ? acceptPrompt
       : 'Cancel the current refresh? The run stops, and a held PR, if there is one, is closed.';
     if (!confirm(prompt)) return;
     const accept = document.getElementById('kg-accept-btn');

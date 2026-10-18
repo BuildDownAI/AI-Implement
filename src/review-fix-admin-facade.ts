@@ -4,6 +4,7 @@
  * never free capacity without the workflow's backend-terminal confirmation. */
 import type { ReviewFixAttemptsFacade, ReviewFixAttemptCaller, ReviewFixAttemptCycleSummary } from "./admin.js";
 import { getDb } from "./dedup.js";
+import { getInvocationAttribution } from "./log.js";
 import { getReviewFixActivityGaps, isReviewFixEvidenceTombstoned,
   listReviewFixActivity, listReviewFixCycleSummaries } from "./review-fix-evidence.js";
 import type { ReviewFixCancelForwarder } from "./review-fix-close.js";
@@ -32,13 +33,27 @@ function allowed(caller: ReviewFixAttemptCaller): boolean {
   return caller.role === "admin";
 }
 
+/** Projects the stored JSON verdict; a legacy plain string or malformed value keeps `approved: null` and the raw text. */
+export function parseStoredVerdict(raw: string): { approved: boolean | null; reason: string } {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const { approved, reason } = parsed as { approved?: unknown; reason?: unknown };
+      if ((approved === null || typeof approved === "boolean") && typeof reason === "string") return { approved, reason };
+    }
+  } catch {
+    // fall through to the raw text
+  }
+  return { approved: null, reason: raw };
+}
+
 function normalizeCycles(attemptId: string): ReviewFixAttemptCycleSummary[] {
   return listReviewFixCycleSummaries(attemptId).map((cycle) => ({
     cycle: cycle.cycle, inputCommit: cycle.inputCommit, outputCommit: cycle.outputCommit,
     dispositions: cycle.dispositions.map((item) => ({ key: item.findingKey, disposition: item.disposition })),
     tests: Array.isArray(cycle.tests) ? cycle.tests.filter((test): test is { name: string; status: string } =>
       !!test && typeof test === "object" && typeof test.name === "string" && typeof test.status === "string") : [],
-    verdict: { approved: null, reason: cycle.verdict },
+    verdict: parseStoredVerdict(cycle.verdict),
     usage: cycle.usage && typeof cycle.usage === "object" ? {
       tokensIn: typeof (cycle.usage as { tokensIn?: unknown }).tokensIn === "number"
         ? (cycle.usage as { tokensIn: number }).tokensIn : null,
@@ -102,6 +117,7 @@ export function createReviewFixAdminFacade(
         state: terminal ? terminal.terminal.status : row.result_conflict_at !== null ? "conflict" : row.state,
         evidenceComplete: evidenceComplete(attemptId, cycles),
         terminationConfirmed: row.released_at !== null,
+        attribution: getInvocationAttribution(row.dispatch_id),
         cycles,
       } };
     },

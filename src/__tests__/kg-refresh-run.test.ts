@@ -6,6 +6,7 @@ import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseDocument } from "yaml";
 import { encodeRunConfig, decodeRunConfig, buildKgRefreshRunConfig, type KgRefreshRunConfigInput, type RunConfigV1 } from "../run-config.js";
 import { buildEnvelopeDispatchInputs } from "../github.js";
 import { resolveRunnerImageForDispatch, __clearRepoImageCacheForTests } from "../repo-image.js";
@@ -624,7 +625,7 @@ describe("kgSnapshotPushStep — tracker regression guard", () => {
     };
   }
 
-  it("throws KgSnapshotTrackerRegressionError when tracker not fetched and previous snapshot has issue.nt/comment.nt", async () => {
+  it("throws KgSnapshotTrackerRegressionError in a dry run when tracker not fetched and previous snapshot has issue.nt/comment.nt", async () => {
     initGitRepo(tmpDir);
     // Commit tracker-derived .nt files so the previous ref has tracker parts.
     mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
@@ -640,7 +641,7 @@ describe("kgSnapshotPushStep — tracker regression guard", () => {
     ctx.setOutputs("kg-tracker-data", { fetched: false, issueCount: 0 });
 
     await expect(
-      kgSnapshotPushStep.run(ctx, makeGuardInputs({ clonedRef }), noopReporter),
+      kgSnapshotPushStep.run(ctx, makeGuardInputs({ clonedRef, dryRun: true }), noopReporter),
     ).rejects.toBeInstanceOf(KgSnapshotTrackerRegressionError);
   });
 
@@ -722,7 +723,7 @@ describe("kgSnapshotPushStep — tracker regression guard", () => {
     // Intentionally do NOT set kg-tracker-data outputs → getOutputs returns {}
 
     await expect(
-      kgSnapshotPushStep.run(ctx, makeGuardInputs({ clonedRef }), noopReporter),
+      kgSnapshotPushStep.run(ctx, makeGuardInputs({ clonedRef, dryRun: true }), noopReporter),
     ).rejects.toBeInstanceOf(KgSnapshotTrackerRegressionError);
   });
 });
@@ -1080,6 +1081,8 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
     expect(err.branchName).toMatch(/^kg-refresh\//);
     expect(err.commitSha).toMatch(/^[0-9a-f]{40}$/);
     expect(err.partTable).toEqual([{ part: "comment.nt", prev: "9995", new: "3793" }]);
+    expect(err.cause).toBe("shrink");
+    expect(err.failedTeams).toEqual([]);
     // The branch really reached the remote.
     const refs = execSync("git for-each-ref --format='%(refname)'", { cwd: bareDir }).toString();
     expect(refs).toContain(`refs/heads/${err.branchName}`);
@@ -1155,15 +1158,80 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
     expect(unrouted.calls).toEqual([]);
   });
 
-  it("guard 0 (tracker fetch failed) still refuses with no push", async () => {
+  it("tracker data missing (fetched=false) pushes, opens the PR with a warning naming the failed teams, and holds", async () => {
+    const clonedRef = setupShrink(
+      { "issue.nt": makeLines(100), "comment.nt": makeLines(50) },
+      { "issue.nt": makeLines(100), "comment.nt": makeLines(50) },
+    );
+    const github = refreshPrApi(31);
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X"], issueCount: 0 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotHeldError);
+    expect(err.cause).toBe("tracker-missing");
+    expect(err.failedTeams).toEqual(["X"]);
+    expect(err.prNumber).toBe(31);
+    expect(err.partTable).toEqual(expect.arrayContaining([
+      { part: "comment.nt", prev: "50", new: "50" },
+      { part: "issue.nt", prev: "100", new: "100" },
+    ]));
+    const prCall = github.calls.find((c) => c.path.endsWith("/pulls"));
+    const prBody = (JSON.parse(prCall!.body) as { body: string }).body;
+    expect(prBody.split("\n")[0]).toContain("X");
+    expect(prBody.split("\n")[0]).toContain("⚠️");
+    expect(prBody).toContain("| comment.nt |");
+  });
+
+  it("a tracker part missing from the new tree counts as held when tracker data is missing", async () => {
+    const clonedRef = setupShrink(
+      { "issue.nt": makeLines(100), "docs.nt": makeLines(10) },
+      { "docs.nt": makeLines(10) },
+    );
+    rmSync(join(tmpDir, "snapshot", "parts", "issue.nt"));
+    refreshPrApi(32);
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X", "Y"], issueCount: 0 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotHeldError);
+    expect(err.cause).toBe("tracker-missing");
+    expect(err.partTable).toContainEqual({ part: "issue.nt", prev: "100", new: "missing" });
+  });
+
+  it("a missing non-tracker part still refuses when tracker data is missing", async () => {
+    const clonedRef = setupShrink(
+      { "issue.nt": makeLines(100), "docs.nt": makeLines(10) },
+      { "issue.nt": makeLines(100) },
+    );
+    rmSync(join(tmpDir, "snapshot", "parts", "docs.nt"));
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X"], issueCount: 0 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(unrouted.calls).toEqual([]);
+  });
+
+  it("a missing tracker part is still a hard refusal when fetched=true", async () => {
+    const clonedRef = setupShrink(
+      { "issue.nt": makeLines(100), "docs.nt": makeLines(10) },
+      { "docs.nt": makeLines(10) },
+    );
+    rmSync(join(tmpDir, "snapshot", "parts", "issue.nt"));
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 5 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+  });
+
+  it("tracker data missing in a dry run refuses with the part table and pushes nothing", async () => {
     initGitRepo(tmpDir);
     commitPreviousSnapshot({ "issue.nt": makeLines(100) });
     const clonedRef = resolveHead(tmpDir);
     writeWorkingTree({ "issue.nt": makeLines(100) });
     const ctx = makeContext();
-    ctx.setOutputs("kg-tracker-data", { fetched: false });
-    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X"], issueCount: 0 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef, dryRun: true }), noopReporter).catch((e) => e);
     expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(err.partTable).toEqual([{ part: "issue.nt", prev: "100", new: "100" }]);
     expect(unrouted.calls).toEqual([]);
   });
 
@@ -1318,7 +1386,7 @@ describe("kgTrackerDataStep", () => {
       { callbackUrl: null, workspaceDir: tmpDir, fetchImpl },
       noopReporter,
     );
-    expect(result).toEqual({ fetched: false, issueCount: 0, teamCounts: [] });
+    expect(result).toEqual({ fetched: false, failedTeams: [], issueCount: 0, teamCounts: [] });
     expect(unrouted.calls).toHaveLength(0);
   });
 
@@ -1331,7 +1399,7 @@ describe("kgTrackerDataStep", () => {
       { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl },
       noopReporter,
     );
-    expect(result).toEqual({ fetched: false, issueCount: 0, teamCounts: [] });
+    expect(result).toEqual({ fetched: false, failedTeams: [], issueCount: 0, teamCounts: [] });
     expect(unrouted.calls).toHaveLength(0);
   });
 
@@ -1350,7 +1418,7 @@ describe("kgTrackerDataStep", () => {
       },
       noopReporter,
     );
-    expect(result).toEqual({ fetched: true, issueCount: 1, teamCounts: [{ team: "AII", count: 1 }] });
+    expect(result).toEqual({ fetched: true, failedTeams: [], issueCount: 1, teamCounts: [{ team: "AII", count: 1 }] });
     expect(written).toHaveLength(1);
     expect(written[0][0]).toBe(join(tmpDir, "tracker-data.json"));
     expect(JSON.parse(written[0][1])).toEqual(issues);
@@ -1376,7 +1444,7 @@ describe("kgTrackerDataStep", () => {
       },
       noopReporter,
     );
-    expect(result).toEqual({ fetched: true, issueCount: 2, teamCounts: [{ team: "AII", count: 2 }] });
+    expect(result).toEqual({ fetched: true, failedTeams: [], issueCount: 2, teamCounts: [{ team: "AII", count: 2 }] });
     const fetchCalls = tracker.calls.map((c) => JSON.parse(c.body) as { cursor?: string; teamKey?: string });
     expect(fetchCalls).toHaveLength(2);
     expect(fetchCalls[0].cursor).toBeUndefined();
@@ -1386,7 +1454,111 @@ describe("kgTrackerDataStep", () => {
     expect(JSON.parse(written[0][1])).toEqual([...page1Issues, ...page2Issues]);
   });
 
-  it("throws KgTrackerDataFetchError when endpoint returns non-2xx", async () => {
+  it("records a team answering non-2xx as failed and returns fetched: false", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      {
+        callbackUrl: "http://orch",
+        workspaceDir: tmpDir,
+        fetchImpl: trackerApi({ status: 502 }).fetch,
+        writeFileSyncImpl: () => {},
+        sourcesYmlReaderImpl: () => ["AII"],
+      },
+      noopReporter,
+    );
+    expect(result).toEqual({ fetched: false, failedTeams: ["AII"], issueCount: 0, teamCounts: [] });
+  });
+
+  it("continues past a 503 team and writes the issues of the teams that succeeded", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    const fetchImpl = trackerApi(({ body }) => {
+      const { teamKey } = JSON.parse(body) as { teamKey?: string };
+      if (teamKey === "BAD") return { status: 503, json: { error: "tracker-unavailable" } };
+      return { json: makeTrackerPage([{ id: "a" }, { id: "b" }], false) };
+    }).fetch;
+    const written: Array<[string, string]> = [];
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      {
+        callbackUrl: "http://orch",
+        workspaceDir: tmpDir,
+        fetchImpl,
+        writeFileSyncImpl: (p, d) => written.push([p, d]),
+        sourcesYmlReaderImpl: () => ["BAD", "AII"],
+      },
+      noopReporter,
+    );
+    expect(result).toEqual({ fetched: false, failedTeams: ["BAD"], issueCount: 2, teamCounts: [{ team: "AII", count: 2 }] });
+    expect(JSON.parse(written[0][1])).toEqual([{ id: "a" }, { id: "b" }]);
+  });
+
+  it("skips a 404 team without counting it as failed, and keeps fetched true", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    const fetchImpl = trackerApi(({ body }) => {
+      const { teamKey } = JSON.parse(body) as { teamKey?: string };
+      if (teamKey === "GHOST") return { status: 404, json: { error: "unmapped-team" } };
+      return { json: makeTrackerPage([{ id: "a" }], false) };
+    }).fetch;
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const written: Array<[string, string]> = [];
+    try {
+      const result = await kgTrackerDataStep.run(
+        makeContext(),
+        {
+          callbackUrl: "http://orch",
+          workspaceDir: tmpDir,
+          fetchImpl,
+          writeFileSyncImpl: (p, d) => written.push([p, d]),
+          sourcesYmlReaderImpl: () => ["GHOST", "AII"],
+        },
+        noopReporter,
+      );
+      expect(result).toEqual({ fetched: true, failedTeams: [], issueCount: 1, teamCounts: [{ team: "AII", count: 1 }] });
+      expect(JSON.parse(written[0][1])).toEqual([{ id: "a" }]);
+      expect(logSpy).toHaveBeenCalledWith("[kg-tracker-data] team GHOST: skipped (no orchestrator mapping)");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it.each([401, 403])("throws KgTrackerDataFetchError on a %i answer and writes nothing", async (status) => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    const written: Array<[string, string]> = [];
+    await expect(
+      kgTrackerDataStep.run(
+        makeContext(),
+        {
+          callbackUrl: "http://orch",
+          workspaceDir: tmpDir,
+          fetchImpl: trackerApi({ status, json: { error: "Unauthorized" } }).fetch,
+          writeFileSyncImpl: (p, d) => written.push([p, d]),
+          sourcesYmlReaderImpl: () => ["AII"],
+        },
+        noopReporter,
+      ),
+    ).rejects.toMatchObject({ code: "KG_TRACKER_DATA_FETCH_FAILED" });
+    expect(written).toEqual([]);
+  });
+
+  it("records a 500 team as failed", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      {
+        callbackUrl: "http://orch",
+        workspaceDir: tmpDir,
+        fetchImpl: trackerApi({ status: 500, json: { error: "Internal server error" } }).fetch,
+        writeFileSyncImpl: () => {},
+        sourcesYmlReaderImpl: () => ["AII"],
+      },
+      noopReporter,
+    );
+    expect(result.fetched).toBe(false);
+    expect(result.failedTeams).toEqual(["AII"]);
+  });
+
+  it("throws KgTrackerDataFetchError when an OK response has a malformed body", async () => {
     process.env.RUN_PROGRESS_TOKEN = "test-token";
     await expect(
       kgTrackerDataStep.run(
@@ -1394,7 +1566,8 @@ describe("kgTrackerDataStep", () => {
         {
           callbackUrl: "http://orch",
           workspaceDir: tmpDir,
-          fetchImpl: trackerApi({ status: 502, json: { error: "Upstream tracker error" } }).fetch,
+          fetchImpl: trackerApi({ json: { nope: true } }).fetch,
+          writeFileSyncImpl: () => {},
           sourcesYmlReaderImpl: () => ["AII"],
         },
         noopReporter,
@@ -1402,31 +1575,16 @@ describe("kgTrackerDataStep", () => {
     ).rejects.toBeInstanceOf(KgTrackerDataFetchError);
   });
 
-  it("returns { fetched: false } when endpoint returns 503 (tracker not configured)", async () => {
-    process.env.RUN_PROGRESS_TOKEN = "test-token";
-    const result = await kgTrackerDataStep.run(
-      makeContext(),
-      {
-        callbackUrl: "http://orch",
-        workspaceDir: tmpDir,
-        fetchImpl: trackerApi({ status: 503, json: { error: "Tracker not configured" } }).fetch,
-        sourcesYmlReaderImpl: () => ["AII"],
-      },
-      noopReporter,
-    );
-    expect(result).toEqual({ fetched: false, issueCount: 0, teamCounts: [] });
-  });
-
-  it("throws KgTrackerDataFetchError when fetchImpl rejects (network error)", async () => {
+  it("records a team whose fetch rejects as failed (network error)", async () => {
     process.env.RUN_PROGRESS_TOKEN = "test-token";
     const fetchImpl = trackerApi(() => { throw new Error("network error"); }).fetch;
-    await expect(
-      kgTrackerDataStep.run(
-        makeContext(),
-        { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl, sourcesYmlReaderImpl: () => ["AII"] },
-        noopReporter,
-      ),
-    ).rejects.toBeInstanceOf(KgTrackerDataFetchError);
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl, writeFileSyncImpl: () => {}, sourcesYmlReaderImpl: () => ["AII"] },
+      noopReporter,
+    );
+    expect(result.fetched).toBe(false);
+    expect(result.failedTeams).toEqual(["AII"]);
   });
 
   it("sends Authorization: Bearer <token> and teamKey on each request", async () => {
@@ -1469,7 +1627,7 @@ describe("kgTrackerDataStep", () => {
       },
       noopReporter,
     );
-    expect(result).toEqual({ fetched: true, issueCount: 3, teamCounts: [{ team: "AII", count: 1 }, { team: "BDS", count: 2 }] });
+    expect(result).toEqual({ fetched: true, failedTeams: [], issueCount: 3, teamCounts: [{ team: "AII", count: 1 }, { team: "BDS", count: 2 }] });
     const requestBodies = tracker.calls.map((c) => JSON.parse(c.body) as { teamKey?: string; cursor?: string });
     expect(requestBodies).toHaveLength(2);
     expect(requestBodies[0].teamKey).toBe("AII");
@@ -1477,26 +1635,29 @@ describe("kgTrackerDataStep", () => {
     expect(JSON.parse(written[0][1])).toEqual([...aiiIssues, ...bdsIssues]);
   });
 
-  it("throws KgTrackerDataFetchError when any configured team returns zero issues", async () => {
+  it("treats a team answering OK with zero issues as valid data, not a failure", async () => {
     process.env.RUN_PROGRESS_TOKEN = "test-token";
-    const aiiIssues = [{ id: "aii-1" }, { id: "aii-2" }];
     const fetchImpl = trackerApi(({ body }) => {
       const { teamKey } = JSON.parse(body) as { teamKey?: string };
-      return { json: makeTrackerPage(teamKey === "AII" ? aiiIssues : [], false) };
+      return { json: makeTrackerPage(teamKey === "AII" ? [{ id: "aii-1" }, { id: "aii-2" }] : [], false) };
     }).fetch;
-    await expect(
-      kgTrackerDataStep.run(
-        makeContext(),
-        {
-          callbackUrl: "http://orch",
-          workspaceDir: tmpDir,
-          fetchImpl,
-          writeFileSyncImpl: () => {},
-          sourcesYmlReaderImpl: () => ["AII", "BDS"],
-        },
-        noopReporter,
-      ),
-    ).rejects.toBeInstanceOf(KgTrackerDataFetchError);
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      {
+        callbackUrl: "http://orch",
+        workspaceDir: tmpDir,
+        fetchImpl,
+        writeFileSyncImpl: () => {},
+        sourcesYmlReaderImpl: () => ["AII", "BDS"],
+      },
+      noopReporter,
+    );
+    expect(result).toEqual({
+      fetched: true,
+      failedTeams: [],
+      issueCount: 2,
+      teamCounts: [{ team: "AII", count: 2 }, { team: "BDS", count: 0 }],
+    });
   });
 
   it("returns { fetched: false } when sources.yml is absent or has no teams", async () => {
@@ -1513,7 +1674,7 @@ describe("kgTrackerDataStep", () => {
       },
       noopReporter,
     );
-    expect(result).toEqual({ fetched: false, issueCount: 0, teamCounts: [] });
+    expect(result).toEqual({ fetched: false, failedTeams: [], issueCount: 0, teamCounts: [] });
     expect(unrouted.calls).toHaveLength(0);
   });
 
@@ -1588,7 +1749,7 @@ trackers:
       { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl },
       noopReporter,
     );
-    expect(result).toEqual({ fetched: false, issueCount: 0, teamCounts: [] });
+    expect(result).toEqual({ fetched: false, failedTeams: [], issueCount: 0, teamCounts: [] });
     expect(unrouted.calls).toHaveLength(0);
   });
 
@@ -1616,7 +1777,7 @@ trackers:
       { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl },
       noopReporter,
     );
-    expect(result).toEqual({ fetched: false, issueCount: 0, teamCounts: [] });
+    expect(result).toEqual({ fetched: false, failedTeams: [], issueCount: 0, teamCounts: [] });
     expect(unrouted.calls).toHaveLength(0);
   });
 
@@ -1718,9 +1879,181 @@ describe("kgScopeReconcileStep", () => {
     }
     expect(result!.addedRepoSlugs).toEqual(["Acme/docs"]);
     expect(readSources()).not.toContain("knowledge-graph-app");
+    expect(parseDocument(readSources()).errors).toHaveLength(0);
     expect(printed).toContain("skipping acme/knowledge-graph-app: it is this KG repo");
     // The self repo's team is still a valid tracker to add.
     expect(result!.addedTeamNames).toEqual(["KGA", "DOC"]);
+  });
+
+  const SCOPE_MAPPINGS: ScopeMapping[] = [
+    { teamKey: "T0", repo: "org/r0", defaultBranch: "main", ticketingProvider: "linear" },
+    { teamKey: "T1", repo: "org/r1", defaultBranch: "dev", ticketingProvider: "linear" },
+    { teamKey: "T2", repo: "org/r2", defaultBranch: "main", ticketingProvider: "linear" },
+  ];
+
+  function templateManifest(trackersEmpty: string, reposEmpty: string): string {
+    return [
+      "# Knowledge graph sources",
+      "# Edit with care.",
+      "namespace: https://example.org/kg/",
+      "code_repo:",
+      "  slug: org/code",
+      "  path: .",
+      `trackers:${trackersEmpty}`,
+      "#  - kind: linear",
+      "#    team: ABC",
+      "self_ingest: false",
+      `secondary_repos:${reposEmpty}`,
+      "#  - slug: owner/repo",
+      "#    branch: main",
+      "",
+    ].join("\n");
+  }
+
+  async function runScope(
+    mappings: ScopeMapping[],
+    writeFileSyncImpl?: (path: string, data: string) => void,
+  ): Promise<Record<string, unknown>> {
+    return (await kgScopeReconcileStep.run(
+      makeContext(),
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl: makeMappingFetch(mappings), writeFileSyncImpl },
+      noopReporter,
+    )) as unknown as Record<string, unknown>;
+  }
+
+  function expectScopeWritten(out: string, before: string): void {
+    const doc = parseDocument(out);
+    expect(doc.errors).toHaveLength(0);
+    const json = doc.toJS() as { trackers: Array<{ team: string }>; secondary_repos: Array<{ slug: string }> };
+    expect(json.trackers.map((t) => t.team)).toEqual(["T0", "T1", "T2"]);
+    expect(json.secondary_repos.map((r) => r.slug)).toEqual(["org/r0", "org/r1", "org/r2"]);
+    const comments = (s: string) => s.split("\n").filter((l) => l.startsWith("#"));
+    expect(comments(out)).toEqual(comments(before));
+  }
+
+  for (const [label, empty] of [["flow-empty `[]`", " []"], ["block-empty", ""]] as const) {
+    it(`fills template ${label} trackers and secondary_repos so the file parses`, async () => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      try {
+        const before = templateManifest(empty, empty);
+        writeSources(before);
+        await runScope(SCOPE_MAPPINGS);
+        const out = readSources();
+        expectScopeWritten(out, before);
+        expect(out).toContain(
+          "trackers:\n  - kind: linear\n    team: T0\n    tier: secondary\n  - kind: linear\n    team: T1\n" +
+            "    tier: secondary\n  - kind: linear\n    team: T2\n    tier: secondary\n#  - kind: linear\n",
+        );
+        expect(out).toContain("self_ingest: false\nsecondary_repos:\n  - slug: org/r0\n");
+      } finally {
+        vi.restoreAllMocks();
+      }
+    });
+  }
+
+  it("keeps unchanged lines byte-for-byte when both keys have entries and other values are empty", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const before = [
+        "# header",
+        "code_repo:",
+        "  slug: org/code",
+        "extra: []",
+        "empty_block:",
+        "trackers:",
+        "    - kind: linear   # keep alignment",
+        "      team: T0",
+        "self_ingest: false",
+        "secondary_repos:",
+        "    - slug: org/r0    # trailing",
+        "      branch: main",
+        "# footer",
+        "",
+      ].join("\n");
+      writeSources(before);
+      await runScope(SCOPE_MAPPINGS);
+      const out = readSources();
+      const doc = parseDocument(out);
+      expect(doc.errors).toHaveLength(0);
+      const json = doc.toJS() as { trackers: Array<{ team: string }>; secondary_repos: Array<{ slug: string }> };
+      expect(json.trackers.map((t) => t.team)).toEqual(["T0", "T1", "T2"]);
+      expect(json.secondary_repos.map((r) => r.slug)).toEqual(["org/r0", "org/r1", "org/r2"]);
+      const beforeLines = before.split("\n");
+      const outLines = out.split("\n");
+      // Every original line survives in order; only new entries are interleaved.
+      let i = 0;
+      for (const line of outLines) if (line === beforeLines[i]) i++;
+      expect(i).toBe(beforeLines.length);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("adds only repos and leaves a bare `trackers:` alone when no team needs adding", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      writeSources(templateManifest("", " []"));
+      await runScope(SCOPE_MAPPINGS.map((m) => ({ ...m, teamKey: "" })));
+      const out = readSources();
+      const doc = parseDocument(out);
+      expect(doc.errors).toHaveLength(0);
+      const json = doc.toJS() as { secondary_repos: Array<{ slug: string }> };
+      expect(json.secondary_repos.map((r) => r.slug)).toEqual(["org/r0", "org/r1", "org/r2"]);
+      expect(out).toContain("trackers:\n#  - kind: linear\n");
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("moves a same-line comment after `[]` onto its own line instead of the last entry", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      writeSources(templateManifest(" []  # pending", " []"));
+      await runScope(SCOPE_MAPPINGS);
+      const out = readSources();
+      expect(parseDocument(out).errors).toHaveLength(0);
+      expect(out).toContain("    team: T2\n    tier: secondary\n  # pending\n");
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("is idempotent: a second run on its own output logs 'scope in sync' and writes nothing", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      writeSources(templateManifest(" []", " []"));
+      await runScope(SCOPE_MAPPINGS);
+      const first = readSources();
+      logSpy.mockClear();
+      const writeSpy = vi.fn();
+      await runScope(SCOPE_MAPPINGS, writeSpy);
+      expect(logSpy).toHaveBeenCalledWith("[kg-scope-reconcile] scope in sync");
+      expect(writeSpy).not.toHaveBeenCalled();
+      expect(readSources()).toBe(first);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("throws, logs the generated text, and does not write when the output fails the parse check", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      // A scalar `trackers` is skipped by the splice, so the team additions never land.
+      const before = "code_repo:\n  slug: org/code\ntrackers: nope\n";
+      writeSources(before);
+      const writeSpy = vi.fn();
+      await expect(runScope(SCOPE_MAPPINGS, writeSpy)).rejects.toThrow(/kg-scope-reconcile/);
+      expect(writeSpy).not.toHaveBeenCalled();
+      const logged = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(logged).toContain("[kg-scope-reconcile]");
+      expect(logged).toContain("trackers: nope");
+      expect(warnSpy).toHaveBeenCalled();
+      expect(readSources()).toBe(before);
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 
   it("returns zero outputs and skips the fetch when RUN_PROGRESS_TOKEN is absent", async () => {
@@ -5465,7 +5798,7 @@ describe("kgTrackerDataStep — KG_TRACKER_DATA_FILE preload", () => {
       noopReporter,
     );
 
-    expect(result).toEqual({ fetched: true, issueCount: 3, teamCounts: [] });
+    expect(result).toEqual({ fetched: true, failedTeams: [], issueCount: 3, teamCounts: [] });
     expect(written).toHaveLength(1);
     expect(written[0][0]).toBe(join(tmpDir, "tracker-data.json"));
     expect(JSON.parse(written[0][1])).toEqual(issues);
@@ -5481,7 +5814,7 @@ describe("kgTrackerDataStep — KG_TRACKER_DATA_FILE preload", () => {
       noopReporter,
     );
 
-    expect(result).toEqual({ fetched: true, issueCount: 0, teamCounts: [] });
+    expect(result).toEqual({ fetched: true, failedTeams: [], issueCount: 0, teamCounts: [] });
   });
 
   it("falls through to normal flow when KG_TRACKER_DATA_FILE points to a non-existent file", async () => {
@@ -5494,7 +5827,7 @@ describe("kgTrackerDataStep — KG_TRACKER_DATA_FILE preload", () => {
     );
 
     // callbackUrl is null → normal flow returns fetched=false
-    expect(result).toEqual({ fetched: false, issueCount: 0, teamCounts: [] });
+    expect(result).toEqual({ fetched: false, failedTeams: [], issueCount: 0, teamCounts: [] });
   });
 });
 

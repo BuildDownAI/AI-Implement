@@ -71,3 +71,27 @@ describe("readAttributionsByDispatch failures", () => {
     expect(warn).not.toHaveBeenCalled();
   });
 });
+
+describe("selected invocation attribution through the Job read model", () => {
+  function insert(invocationId: string, dispatchId: string, model: string, tokensIn: number) {
+    dedup.getDb().prepare(`INSERT INTO model_invocation_attribution
+      (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode,
+       config_revision_id, snapshot_id, status, started_at, completed_at, usage_json)
+      VALUES (?, ?, 'implementation', 'p1', 1, 'codex', 'openai', ?, 'openai-api-key', NULL, ?, 'succeeded', 1, 2, ?)`)
+      .run(invocationId, dispatchId, model, `snap-${dispatchId}`, JSON.stringify({
+        availability: "complete", tokensIn, tokensOut: 1, costUsd: null, costStatus: "unavailable", outcome: "success",
+      }));
+  }
+
+  it("projects the selected dispatch's own latest invocation and never another dispatch's", () => {
+    job("d-selected");
+    job("d-other");
+    insert("inv-old", "d-selected", "model-old", 10);
+    insert("inv-new", "d-selected", "model-new", 20);
+    insert("inv-other", "d-other", "model-other", 99);
+
+    const selected = log.getJobByDispatchId("d-selected")!.attribution;
+    expect(selected).toMatchObject({ invocationId: "inv-new", model: "model-new", usage: { tokensIn: 20, costUsd: null } });
+    expect(log.getJobByDispatchId("d-other")!.attribution).toMatchObject({ invocationId: "inv-other", model: "model-other" });
+  });
+});

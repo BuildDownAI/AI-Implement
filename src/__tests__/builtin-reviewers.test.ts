@@ -95,6 +95,21 @@ describe("built-in reviewers", () => {
     expect(prompt).toContain(input.diff);
   });
 
+  it("gap-analysis prompt separates code deliverables from operator-owned execution evidence", async () => {
+    const gap = await resolveReviewer("gap-analysis", { customRoot: "/workspace", existsSyncImpl: () => false });
+    const prompt = gap!.buildPrompt(input);
+
+    expect(prompt).toContain("Code deliverables are different from execution evidence");
+    expect(prompt).toContain("not visible in a diff and are not missing implementation");
+    expect(prompt).toContain("explicitly assigns that evidence to an operator");
+    expect(prompt).toContain("Do not report them as findings or request code fixes");
+    expect(prompt).toContain("result=\"not_verified\" or result=\"not_applicable\"");
+    expect(prompt).toContain("never mark them \"passed\"");
+    expect(prompt).toContain("do not infer it, and do not ignore failed or unmet acceptance criteria in general");
+    expect(prompt).toContain("Missing code or test source that the issue explicitly requires");
+    expect(prompt).toContain("still report the missing implementation requirements");
+  });
+
   it("code-review prompt keeps defect review wording without requirements coverage", async () => {
     const code = await resolveReviewer("code-review", { customRoot: "/workspace", existsSyncImpl: () => false });
     const prompt = code!.buildPrompt(input);

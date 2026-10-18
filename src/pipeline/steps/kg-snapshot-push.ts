@@ -54,18 +54,26 @@ export class KgSnapshotHeldError extends Error {
   readonly prNumber: number | null;
   readonly commitSha: string | null;
   readonly branchName: string;
+  /** Why the run waits: a content shrink, or tracker data that could not be read. */
+  readonly cause: "shrink" | "tracker-missing";
+  /** Teams whose tracker fetch failed; empty for a shrink. */
+  readonly failedTeams: string[];
   constructor(
     detail: string,
     partTable: Array<{ part: string; prev: string; new: string }>,
     prNumber: number | null,
     commitSha: string | null,
     branchName: string,
+    cause: "shrink" | "tracker-missing" = "shrink",
+    failedTeams: string[] = [],
   ) {
     super(`KG_SNAPSHOT_HELD: ${detail}`);
     this.partTable = partTable;
     this.prNumber = prNumber;
     this.commitSha = commitSha;
     this.branchName = branchName;
+    this.cause = cause;
+    this.failedTeams = failedTeams;
   }
 }
 
@@ -250,6 +258,8 @@ interface RefreshReportInputs {
   ingestWarnings: string[];
   guardVerdict: string;
   scope: { addedRepos: string[]; addedTeams: string[]; mappedProjectCount: number };
+  /** Blockquote warning placed above the heading (tracker data missing). */
+  warning?: string;
 }
 
 /**
@@ -259,6 +269,7 @@ interface RefreshReportInputs {
  */
 function buildRefreshReport(data: RefreshReportInputs): string {
   const lines: string[] = [
+    ...(data.warning ? [data.warning, ""] : []),
     `## kg-refresh report — ${data.stampCompact}`,
     "",
     `**Guard verdict:** ${data.guardVerdict}`,
@@ -494,6 +505,11 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     /** Set by guard 0b on a soft-only shrink in a real run: push and open the PR, then throw KgSnapshotHeldError. */
     let held = false;
     let heldDetail = "";
+    let heldCause: "shrink" | "tracker-missing" = "shrink";
+    /** Teams whose tracker fetch failed; set with heldCause "tracker-missing". */
+    let failedTeams: string[] = [];
+    /** True when fetched=false and the cloned snapshot has a tracker part: tracker parts may be missing or smaller. */
+    let trackerMissing = false;
 
     // ── 0. Tracker regression guard ──────────────────────────────────────────
     // If the tracker-data step did not fetch (fetched=false) and the previous
@@ -513,9 +529,13 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
           })
         : [];
       if (previousTrackerFiles.length > 0) {
-        throw new KgSnapshotTrackerRegressionError(
-          `tracker-data step reported fetched=false but previous snapshot has tracker file(s) (${previousTrackerFiles.join(", ")}) — refusing to push a docs-only graph`,
-        );
+        // Not a refusal: guard 0b computes the part table and the run ends held so an
+        // operator decides. A dry run has no PR to hold and keeps the refusal there.
+        trackerMissing = true;
+        const rawFailed = trackerOutputs.failedTeams;
+        failedTeams = Array.isArray(rawFailed) ? rawFailed.filter((t): t is string => typeof t === "string") : [];
+        heldCause = "tracker-missing";
+        heldDetail = `tracker-data step reported fetched=false${failedTeams.length > 0 ? ` (failed teams: ${failedTeams.join(", ")})` : ""} but previous snapshot has tracker file(s) (${previousTrackerFiles.join(", ")})`;
       }
     }
 
@@ -570,7 +590,11 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
           if (!existsSync(newPartPath)) {
             partLogLines.push(`${partName} prev=${prevLines} new=missing`);
             partRows.push({ part: partName, prev: String(prevLines), next: "missing", delta: "—" });
-            hardRegressions.push(`${partName}: missing (was ${prevLines} lines)`);
+            if (trackerMissing && TRACKER_NT_FILES.has(partName)) {
+              softRegressions.push(`${partName}: missing (was ${prevLines} lines; tracker data missing)`);
+            } else {
+              hardRegressions.push(`${partName}: missing (was ${prevLines} lines)`);
+            }
             continue;
           }
 
@@ -578,6 +602,13 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
           partLogLines.push(`${partName} prev=${prevLines} new=${newLines}`);
           const delta = newLines - prevLines;
           partRows.push({ part: partName, prev: String(prevLines), next: String(newLines), delta: `${delta >= 0 ? "+" : ""}${delta}` });
+
+          if (trackerMissing && TRACKER_NT_FILES.has(partName) && newLines < prevLines) {
+            softRegressions.push(
+              `${partName}: shrank from ${prevLines} to ${newLines} lines (tracker data missing)`,
+            );
+            continue;
+          }
 
           if (TRACKER_NT_FILES.has(partName) && issueCount > 0 && newLines < prevLines) {
             softRegressions.push(
@@ -603,8 +634,10 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
           );
         }
 
-        if (softRegressions.length > 0) {
-          const detail = `content regression detected — ${softRegressions.join("; ")}`;
+        if (trackerMissing || softRegressions.length > 0) {
+          const detail = trackerMissing
+            ? [heldDetail, ...softRegressions].join("; ")
+            : `content regression detected — ${softRegressions.join("; ")}`;
           // A dry run pushes nothing, so there is no PR to hold: it keeps the refusal.
           if (dryRun) throw new KgSnapshotTrackerRegressionError(detail, partTable);
           // A shrink still ships its snapshot PR; the run ends held (thrown after the PR opens).
@@ -692,7 +725,9 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     const ingestWarnings = readIngestWarnings(workspaceDir);
     const scope = inputs.scope ?? { addedRepos: [], addedTeams: [], mappedProjectCount: 0 };
     const guardVerdictText = held
-      ? "held — a shrink waits for an operator decision"
+      ? heldCause === "tracker-missing"
+        ? "held — tracker data is missing and the run waits for an operator decision"
+        : "held — a shrink waits for an operator decision"
       : dryRun
         ? "clean (dry-run — no push)"
         : "clean";
@@ -705,6 +740,11 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       ingestWarnings,
       guardVerdict: guardVerdictText,
       scope,
+      warning: held && heldCause === "tracker-missing"
+        ? failedTeams.length > 0
+          ? `> ⚠️ Tracker data could not be read for team(s): ${failedTeams.join(", ")}. The tracker parts of this snapshot are missing or reduced.`
+          : "> ⚠️ Tracker data was not fetched this run. The tracker parts of this snapshot are missing or reduced."
+        : undefined,
     });
 
     // ── dry-run exit ─────────────────────────────────────────────────────────
@@ -800,7 +840,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       // Dev/test scenario with no target repo identity: the branch pushed, but there is
       // nothing to build a GitHub API URL from, so the refresh PR cannot be opened.
       console.warn("[kg-snapshot-push] repoOwner/repoRepo absent — pushed the branch but skipped opening the refresh PR");
-      if (held) throw new KgSnapshotHeldError(heldDetail, partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })), null, commitSha, branchName);
+      if (held) throw new KgSnapshotHeldError(heldDetail, partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })), null, commitSha, branchName, heldCause, failedTeams);
       return { snapshotPushed: true, commitSha, prNumber: null, branchName };
     }
 
@@ -840,7 +880,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     }
 
     if (held) {
-      throw new KgSnapshotHeldError(heldDetail, partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })), pr.number, commitSha, branchName);
+      throw new KgSnapshotHeldError(heldDetail, partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })), pr.number, commitSha, branchName, heldCause, failedTeams);
     }
 
     return { snapshotPushed: true, commitSha, prNumber: pr.number, branchName };

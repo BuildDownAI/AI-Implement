@@ -857,7 +857,7 @@ function reviewFixCaller(input: { caller: { role: AccessRole | null; email: stri
 }
 
 export const GET_REVIEW_FIX_ATTEMPT_DESCRIPTION =
-  "Returns one Restate review-fix attempt detail by attemptId: owner, execution, deadline, pending feedback, snapshot, state, evidenceComplete, terminationConfirmed, and cycle summaries. Admin read.";
+  "Returns one Restate review-fix attempt detail by attemptId: owner, execution, deadline, pending feedback, snapshot, state, evidenceComplete, terminationConfirmed, cycle summaries, and nullable snapshot-validated invocation attribution. Admin read.";
 
 export const getReviewFixAttemptTool = tool(
   {

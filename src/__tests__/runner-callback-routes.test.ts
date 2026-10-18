@@ -14,6 +14,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type * as RunnerCallbackModule from "../runner-callback.js";
+import type { TrackerExportIngressClient } from "../restate/tracker-export.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { TicketingProvider } from "../providers/types.js";
@@ -89,6 +90,7 @@ async function callKgTrackerDataRoute(opts: {
   authorization?: string;
   rawBody: string;
   getMappings?: () => Record<string, unknown>;
+  trackerExport?: TrackerExportIngressClient;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
   if (!opts.runnerTokenSecret) {
     return { status: 501, body: { error: "Runner callback not configured" } };
@@ -110,6 +112,7 @@ async function callKgTrackerDataRoute(opts: {
     cursor,
     teamKey,
     getMappings: opts.getMappings ?? (() => ({})),
+    trackerExport: opts.trackerExport ?? { page: vi.fn() },
   });
 }
 
@@ -132,7 +135,73 @@ describe("/runner/kg-tracker-data route wrapper", () => {
     expect(res.body.error).toBe("Invalid JSON");
   });
 
-  it("returns 403 when bearer is missing (after parse) — unchanged after the fetchTrackerIssuesPage extraction", async () => {
+  const kgToken = (phase: "kg-refresh" | "implementation" = "kg-refresh") => runnerTokens.mintRunToken({
+    issueId: "i",
+    mappingTeamKey: "AII",
+    phase,
+    audience: "progress",
+    ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+    secret: "secret",
+  }).token;
+
+  it("returns 403 for a wrong phase (even for an unmapped team) and 404 unmapped-team for a valid token, without calling the client", async () => {
+    const page = vi.fn();
+    const wrongPhase = await callKgTrackerDataRoute({
+      runnerTokenSecret: "secret",
+      authorization: `Bearer ${kgToken("implementation")}`,
+      rawBody: JSON.stringify({ teamKey: "EVIL" }),
+      getMappings: () => ({ AII: {} }),
+      trackerExport: { page },
+    });
+    const badToken = await callKgTrackerDataRoute({
+      runnerTokenSecret: "secret",
+      authorization: "Bearer not-a-token",
+      rawBody: JSON.stringify({ teamKey: "EVIL" }),
+      getMappings: () => ({ AII: {} }),
+      trackerExport: { page },
+    });
+    const unmapped = await callKgTrackerDataRoute({
+      runnerTokenSecret: "secret",
+      authorization: `Bearer ${kgToken()}`,
+      rawBody: JSON.stringify({ teamKey: "EVIL" }),
+      getMappings: () => ({ AII: {} }),
+      trackerExport: { page },
+    });
+    expect(wrongPhase.status).toBe(403);
+    expect(badToken.status).toBe(403);
+    expect(unmapped.status).toBe(404);
+    expect(unmapped.body).toEqual({ error: "unmapped-team" });
+    expect(page).not.toHaveBeenCalled();
+  });
+
+  it("returns 200 with the page for ok:true", async () => {
+    const pageData = { issues: [{ id: "1" }], pageInfo: { hasNextPage: false, endCursor: null } };
+    const page = vi.fn().mockResolvedValue({ ok: true, page: pageData });
+    const res = await callKgTrackerDataRoute({
+      runnerTokenSecret: "secret",
+      authorization: `Bearer ${kgToken()}`,
+      rawBody: JSON.stringify({ teamKey: "AII", cursor: "c1" }),
+      getMappings: () => ({ AII: {} }),
+      trackerExport: { page },
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(pageData);
+    expect(page).toHaveBeenCalledWith({ team: "AII", cursor: "c1" });
+  });
+
+  it.each(["tracker-unavailable", "tracker-failed", "unavailable"] as const)("returns 503 %s for ok:false", async (code) => {
+    const res = await callKgTrackerDataRoute({
+      runnerTokenSecret: "secret",
+      authorization: `Bearer ${kgToken()}`,
+      rawBody: JSON.stringify({ teamKey: "AII" }),
+      getMappings: () => ({ AII: {} }),
+      trackerExport: { page: vi.fn().mockResolvedValue({ ok: false, code }) },
+    });
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual({ error: code });
+  });
+
+  it("returns 403 when bearer is missing (after parse)", async () => {
     const res = await callKgTrackerDataRoute({
       runnerTokenSecret: "secret",
       rawBody: JSON.stringify({ teamKey: "AII" }),

@@ -3332,12 +3332,12 @@ describe("KgRefresh durable workflow", () => {
       )).length;
 
     /** Triggers through the real KgRepo, delivers the held report, and returns once the run sits at the gate. */
-    async function holdRun(env: RestateEnvironment, opts: { awaitGate?: boolean } = {}): Promise<string> {
+    async function holdRun(env: RestateEnvironment, opts: { awaitGate?: boolean; report?: KgRefreshReportBody } = {}): Promise<string> {
       const triggered = await triggerViaKgRepo(env.baseUrl());
       const triggerId = (triggered as { triggerId: string }).triggerId;
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
       await workflowDispatched(triggerId);
-      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", HELD_REPORT);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", opts.report ?? HELD_REPORT);
       // The short-timer scenario skips this: on a slow runner the timer can fire before a poll sees `decision`.
       if (opts.awaitGate !== false) await waitForStep(() => readStatus(env.baseUrl(), triggerId), "decision");
       return triggerId;
@@ -3423,6 +3423,25 @@ describe("KgRefresh durable workflow", () => {
         expect(mergePullRequestFn).toHaveBeenCalled();
         expect(outcomesFor(triggerId).map((c) => c.kind)).toEqual(["success"]);
         expect(gateOrder).toEqual(["fetch", "stage", "swap", "verify"]);
+        await closeRowFor(triggerId);
+      },
+      60_000,
+    );
+
+    it.each(VARIANTS.map(([label]) => label))(
+      "a tracker-missing held report opens the gate, status shows the cause and failed teams, and accept merges (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env, { report: { ...HELD_REPORT, cause: "tracker-missing", failedTeams: ["X", "Y"] } });
+        const open = await callWorkflow<{ decisions: string[]; held: { cause: string; failedTeams: string[] } }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
+        expect(open.decisions).toEqual(["accept", "cancel"]);
+        expect(open.held).toMatchObject({ snapshotPr: 77, cause: "tracker-missing", failedTeams: ["X", "Y"] });
+
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ada@example.com" });
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        expect(outcome.ok).toBe(true);
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
         await closeRowFor(triggerId);
       },
       60_000,
@@ -3699,7 +3718,7 @@ describe("KgRefresh durable workflow", () => {
         await waitForStep(() => readStatus(env.baseUrl(), triggerId), "decision");
         const open = await callWorkflow<{ decisions: string[]; held: unknown }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
         expect(open.decisions).toEqual(["accept", "cancel"]);
-        expect(open.held).toEqual({ snapshotPr: 77, partTable: [{ part: "graph", prev: "100", new: "40" }], decideBy: expect.any(Number) });
+        expect(open.held).toEqual({ snapshotPr: 77, partTable: [{ part: "graph", prev: "100", new: "40" }], cause: "shrink", failedTeams: [], decideBy: expect.any(Number) });
 
         await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ada@example.com" });
         const after = await callWorkflow<{ decisions: string[] }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
