@@ -141,13 +141,19 @@ export interface RunnerResultBody {
   /** The `kg-refresh/<stamp>` branch behind snapshotPr; deleted by the orchestrator after merge or close. */
   snapshotBranch?: string;
   /** Guard verdict from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
-  guardVerdict?: "clean" | "refused" | "held";
+  guardVerdict?: "clean" | "warnings" | "refused" | "held";
   /** Per-part {part, prev, new} table from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
   partTable?: Array<{ part: string; prev: string; new: string }>;
   /** Why a `KG_SNAPSHOT_HELD` run waits; absent from runners that predate the field. */
   cause?: "shrink" | "tracker-missing";
   /** Teams whose tracker fetch failed, for a `tracker-missing` hold. */
   failedTeams?: string[];
+  /** True when accepting a `tracker-missing` hold would drop a skipped or failed team's served issues. */
+  acceptBlocked?: boolean;
+  /** Skipped or failed teams with issues in the served snapshot. */
+  lostTeams?: Array<{ team: string; servedIssues: number }>;
+  /** Warnings on a completed refresh; absent from runners that predate the field. */
+  warnings?: string[];
   /** Per-source results of the refresh; absent from runners that predate the field. */
   sources?: SourceResult[];
   /** Reference repository clone outcomes, present only when the run declared entries. */
@@ -818,6 +824,9 @@ export async function handleRunnerResult(
         cause: input.body.cause,
         failedTeams: input.body.failedTeams,
         sources: input.body.sources,
+        acceptBlocked: input.body.acceptBlocked,
+        lostTeams: input.body.lostTeams,
+        warnings: input.body.warnings,
       },
       { idempotencyKey: dispatchId },
     );

@@ -255,6 +255,20 @@ has `issue.nt` or `comment.nt`). A `tracker-missing` PR body starts with a warni
 failed teams, and `held.failedTeams` lists them. The KG Pipelines page shows `held.cause` and
 `held.failedTeams` in the current-run card, and the Accept prompt names the cause.
 
+A skipped (404, no mapping) or failed tracker team is judged by what the served snapshot already holds
+(AII-1471). `kg-snapshot-push` counts that team's issues in the **cloned** `snapshot/parts/issue.nt`
+(`git show <clonedRef>:…`, one `onto#trackerTeam "<team>"` literal per issue; the working tree's file is
+already the reduced one). A dry run ends **completed with warnings** (`guardVerdict: "warnings"`, no push)
+whenever the tracker is the only problem. A live run has two outcomes:
+
+| A skipped or failed team has served issues | Outcome |
+|---|---|
+| yes | The PR opens and the run holds (`KG_SNAPSHOT_HELD`, cause `tracker-missing`) with `acceptBlocked: true` and `lostTeams: [{ team, servedIssues }]`: accepting would publish a graph without those issues. `status.decisions` is `["cancel"]`, and `decide({ action: "accept" })` answers a 409 `accept-blocked` and leaves the run at the gate. |
+| no | The snapshot publishes through the normal gates with a warning in the PR body and `warnings` (the team names) on the outcome. |
+
+A fetch that failed with no team named, and a shrink, still hold with both decisions offered. A `held`
+state stored before `acceptBlocked` existed reads as unblocked.
+
 When the runner's `report` is `failureCode: "KG_SNAPSHOT_HELD"` with a `snapshotPr`, `KgRefresh` stops
 at a gate (`src/restate/kg-refresh-workflow.ts`):
 

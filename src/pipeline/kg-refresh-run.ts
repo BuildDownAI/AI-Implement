@@ -384,6 +384,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
             snapshotBranch: held.branchName,
             cause: held.cause,
             failedTeams: held.failedTeams,
+            ...(held.acceptBlocked ? { acceptBlocked: true, lostTeams: held.lostTeams } : {}),
             ...(held.sources.length > 0 ? { sources: held.sources } : {}),
           }
         : {}),
@@ -396,6 +397,9 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
   await configured?.finish("completed");
   const snapshotPushOutputs = context.getOutputs("kg-snapshot-push");
   const sources = parseSourceResults(snapshotPushOutputs.sources);
+  const warnings = Array.isArray(snapshotPushOutputs.warnings)
+    ? snapshotPushOutputs.warnings.filter((w): w is string => typeof w === "string")
+    : [];
   await postRunnerResult({
     phase: "kg-refresh",
     workspaceDir,
@@ -403,10 +407,11 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     snapshotCommit: typeof snapshotPushOutputs.commitSha === "string" ? snapshotPushOutputs.commitSha : undefined,
     snapshotPr: typeof snapshotPushOutputs.prNumber === "number" ? snapshotPushOutputs.prNumber : undefined,
     snapshotBranch: typeof snapshotPushOutputs.branchName === "string" ? snapshotPushOutputs.branchName : undefined,
-    ...(kgDryRun && snapshotPushOutputs.guardVerdict === "clean"
-      ? { guardVerdict: "clean" as const, partTable: snapshotPushOutputs.partTable as Array<{ part: string; prev: string; new: string }> | undefined }
+    ...(kgDryRun && (snapshotPushOutputs.guardVerdict === "clean" || snapshotPushOutputs.guardVerdict === "warnings")
+      ? { guardVerdict: snapshotPushOutputs.guardVerdict, partTable: snapshotPushOutputs.partTable as Array<{ part: string; prev: string; new: string }> | undefined }
       : {}),
     ...(sources.length > 0 ? { sources } : {}),
+    ...(warnings.length > 0 ? { warnings } : {}),
     callbackUrl,
     fetchImpl: opts.fetchImpl,
   });
