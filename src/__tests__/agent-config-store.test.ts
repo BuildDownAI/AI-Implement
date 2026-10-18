@@ -1,30 +1,18 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { beforeEach, describe, expect, it } from "vitest";
 import type * as StoreModule from "../agent-config-store.js";
 import type * as DedupModule from "../dedup.js";
 import type { StageAgentConfigurationV1 } from "../agent-config.js";
+import { testDb, type TestDb } from "./helpers/test-db.js";
 
-let dbPath: string;
+const MODULES = { dedup: () => import("../dedup.js"), store: () => import("../agent-config-store.js") };
+
+let db: TestDb<typeof MODULES>;
 let store: typeof StoreModule;
 let dedup: typeof DedupModule;
 
-async function load(): Promise<void> {
-  vi.resetModules();
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  store = await import("../agent-config-store.js");
-}
-
 beforeEach(async () => {
-  dbPath = path.join(os.tmpdir(), `agent-config-store-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  await load();
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  db = await testDb({ modules: MODULES });
+  ({ dedup, store } = db.modules);
 });
 
 const TABLES = [
@@ -264,8 +252,7 @@ describe("stage configuration", () => {
     const defaultsRow = store.getOrchestratorDefaults();
     const projectRow = store.getProjectStageConfig("AII");
     const resolved = store.resolveProjectStageConfig("AII");
-    dedup.closeDb();
-    await load();
+    ({ dedup, store } = await db.reopen());
     expect(store.listAccountProfiles()).toEqual(profiles);
     expect(store.getOrchestratorDefaults()).toEqual(defaultsRow);
     expect(store.getProjectStageConfig("AII")).toEqual(projectRow);

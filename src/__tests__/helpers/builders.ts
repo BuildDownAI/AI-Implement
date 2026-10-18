@@ -5,6 +5,7 @@
 // never quietly changes every test that builds a mapping.
 import { vi } from "vitest";
 import type { RepoMapping } from "../../config.js";
+import type { ChatGptPlanRecordV1 } from "../../chatgpt-plan-token.js";
 import type { AppConfig } from "../../index.js";
 import type { Job, appendLog } from "../../log.js";
 import { DefaultPipelineContext } from "../../pipeline/context.js";
@@ -354,6 +355,29 @@ export function makeAppConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     kgSourceRepo: null,
     memoryProviderId: null,
     selfDeployTarget: null,
+    ...overrides,
+  };
+}
+
+// The record a ChatGPT plan sign-in saves (login, src/chatgpt-plan-login.ts), saved when it is built. As there, the
+// access token's expiry follows savedAt: an hour later, the lifetime refreshChatGptPlanRecord assumes by default.
+export function makeChatGptPlanRecord(overrides: Partial<ChatGptPlanRecordV1> = {}): ChatGptPlanRecordV1 {
+  const savedAt = overrides.savedAt ?? Date.now();
+  return {
+    version: 1,
+    email: "user@example.com",
+    issuer: "https://auth.openai.com",
+    subject: "user-1",
+    clientId: "client-1",
+    extAgentHostId: "urn:uuid:00000000-0000-4000-8000-000000000001",
+    idToken: "id-token-1",
+    accessToken: "access-token-1",
+    refreshToken: "refresh-token-1",
+    tokenType: "Bearer",
+    scopes: ["chatgpt.tokens.use.direct"],
+    accessTokenExpiresAt: savedAt + 60 * 60_000,
+    earliestRefreshAt: null,
+    savedAt,
     ...overrides,
   };
 }

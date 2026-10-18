@@ -3,27 +3,27 @@
  * with the real session store and ownership module. Synthetic credentials only; no
  * network and no model calls.
  */
-import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
-import crypto from "node:crypto";
+import { describe, it, expect, beforeEach, vi, type Mock } from "vitest";
+import { serializeChatGptPlanRecord } from "../chatgpt-plan-token.js";
 import type * as DedupModule from "../dedup.js";
 import type * as OwnershipModule from "../model-session-ownership.js";
 import type * as StoreModule from "../model-session-store.js";
 import type * as ServerModule from "../model-auth-server.js";
+import type { AccountAuthMode, AccountProfile } from "../agent-config.js";
 import type { ModelAuthGrantBinding } from "../model-auth-contract.js";
+import { createModelSessionKeyProvider } from "../model-session-keys.js";
+import { makeChatGptPlanRecord } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 
 const BEARER = "SYNTH_BEARER_" + "a".repeat(40);
 const API_KEY = "SYNTH-API-KEY-sk-12345";
 const SESSION = "SYNTH-SESSION-DATA-777";
 const STORE_ERROR = "SYNTH-STORE-ERROR-disk-exploded";
 const SENTINELS = [BEARER, API_KEY, SESSION, STORE_ERROR];
-const KEY = crypto.createHash("sha256").update("synthetic-server-key").digest();
+const KEYS = createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: "synthetic-server-secret" });
 const OPERATOR = { synthetic: "operator" };
 const NOW = 1_000_000;
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let own: typeof OwnershipModule;
 let storeMod: typeof StoreModule;
@@ -60,6 +60,14 @@ const ACCESS_TOKEN = "SYNTH-CHATGPT-ACCESS-TOKEN";
 const REFRESH_TOKEN = "SYNTH-CHATGPT-REFRESH-TOKEN";
 const ID_TOKEN = "SYNTH-CHATGPT-ID-TOKEN";
 const KEYB: ModelAuthGrantBinding = { stage: "review", profileId: "key1", profileRevision: 2, authMode: "openai-api-key" };
+// The one agent and provider each auth mode resolves with (validateAgentProvider, src/agent-config.ts).
+const AGENT_PROVIDER = {
+  "anthropic-api-key": { agent: "claude", provider: "anthropic" },
+  "claude-subscription": { agent: "claude", provider: "anthropic" },
+  bedrock: { agent: "claude", provider: "bedrock" },
+  "openai-api-key": { agent: "codex", provider: "openai" },
+  "codex-subscription": { agent: "codex", provider: "openai" },
+} as const satisfies Record<AccountAuthMode, Pick<AccountProfile, "agent" | "provider">>;
 
 function build(): ServerModule.ModelAuthHandlers {
   return server.createModelAuthHandlers(depsFrom());
@@ -67,7 +75,7 @@ function build(): ServerModule.ModelAuthHandlers {
 
 function depsFrom(): ServerModule.ModelAuthHandlerDeps {
   const realStore = storeMod.createModelSessionStore({
-    keys: { current: () => ({ keyId: "k1", key: KEY }), get: (id) => (id === "k1" ? KEY : undefined) },
+    keys: KEYS,
     verifyOwner: own.sessionOwnerVerifier,
     authorizeOperator: (op) => op === OPERATOR,
   });
@@ -84,8 +92,7 @@ function depsFrom(): ServerModule.ModelAuthHandlerDeps {
     profileId: id,
     identity: "id",
     revision: b.profileRevision,
-    agent: "codex" as const,
-    provider: "openai" as const,
+    ...AGENT_PROVIDER[b.authMode],
     authMode: b.authMode,
     allowedProjectKeys: ["proj"],
     status: "active" as const,
@@ -114,10 +121,11 @@ function depsFrom(): ServerModule.ModelAuthHandlerDeps {
         : undefined;
     },
     loadDispatchContext: () => ({ dispatchId: "d1", snapshotId: "s1", projectKey: "proj", backend: "fly", ...dispatchOverrides }),
-    getSnapshotSelection: (_s, profileId) =>
-      profileId in selections
-        ? selections[profileId]
-        : { provider: "openai", revision: all.find((b) => b.profileId === profileId)?.profileRevision ?? 1, authMode: all.find((b) => b.profileId === profileId)?.authMode ?? "openai-api-key" },
+    getSnapshotSelection: (_s, profileId) => {
+      if (profileId in selections) return selections[profileId];
+      const authMode = all.find((b) => b.profileId === profileId)?.authMode ?? "openai-api-key";
+      return { provider: AGENT_PROVIDER[authMode].provider, revision: all.find((b) => b.profileId === profileId)?.profileRevision ?? 1, authMode };
+    },
     credentials: {
       sessionStore,
       resolveProtectedSecret: () => { resolveSpy(); return secretValue as never; },
@@ -165,18 +173,7 @@ function expectNoLeak(res: ServerModule.ModelAuthResponse, allowed: string[] = [
   expect(JSON.stringify(logs)).not.toContain(API_KEY);
 }
 
-async function boot() {
-  vi.resetModules();
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  own = await import("../model-session-ownership.js");
-  storeMod = await import("../model-session-store.js");
-  server = await import("../model-auth-server.js");
-  dedup.getDb();
-}
-
 beforeEach(async () => {
-  dbPath = path.join(os.tmpdir(), `model-auth-server-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
   logs = [];
   bindings = [SUB, KEYB, CDX];
   grantOverrides = {};
@@ -198,7 +195,14 @@ beforeEach(async () => {
   snapshotSpy = vi.fn();
   refreshSpy = vi.fn();
   refreshImpl = async () => undefined;
-  await boot();
+  ({ dedup, own, storeMod, server } = (await testDb({
+    modules: {
+      dedup: () => import("../dedup.js"),
+      own: () => import("../model-session-ownership.js"),
+      storeMod: () => import("../model-session-store.js"),
+      server: () => import("../model-auth-server.js"),
+    },
+  })).modules);
   handlers = build();
   const r = ownership.reserve({ dispatchId: "d1", profiles: [{ profileId: "sub1", authMode: "subscription" }] });
   if (r.status !== "reserved") throw new Error("reserve failed");
@@ -207,13 +211,6 @@ beforeEach(async () => {
   expect(store.importSession({ profileId: "sub1", ownerGeneration: 1, sessionData: `${SESSION}-0`, operator: OPERATOR }).ok).toBe(true);
   expect(ownership.markRunning({ dispatchId: "d1", profileId: "sub1", generation: 1 }).status).toBe("ok");
   for (const spy of [resolveSpy, revisionSpy, readSpy, checkpointSpy, lookupSpy, transportSpy, planReadSpy, snapshotSpy, refreshSpy]) spy.mockClear();
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  for (const suffix of ["", "-wal", "-shm"]) {
-    try { fs.unlinkSync(dbPath + suffix); } catch { /* ignore */ }
-  }
 });
 
 describe("checkout", () => {
@@ -549,22 +546,9 @@ describe("revalidation after the asynchronous body read", () => {
 
 
 describe("codex-subscription (hosted ChatGPT access token)", () => {
-  const planRecord = (expiresAt: number) => JSON.stringify({
-    version: 1,
-    email: "user@example.com",
-    issuer: "https://auth.openai.com",
-    subject: "sub-1",
-    clientId: "client-1",
-    extAgentHostId: "host-1",
-    idToken: ID_TOKEN,
-    accessToken: ACCESS_TOKEN,
-    refreshToken: REFRESH_TOKEN,
-    tokenType: "Bearer",
-    scopes: ["chatgpt.tokens.use.direct"],
-    accessTokenExpiresAt: expiresAt,
-    earliestRefreshAt: null,
-    savedAt: NOW - 1000,
-  });
+  const planRecord = (expiresAt: number) => serializeChatGptPlanRecord(makeChatGptPlanRecord({
+    idToken: ID_TOKEN, accessToken: ACCESS_TOKEN, refreshToken: REFRESH_TOKEN, accessTokenExpiresAt: expiresAt, savedAt: NOW - 1000,
+  }));
   const seed = (data: string) =>
     expect(store.writePlanRecord({ profileId: "cdx1", expectedSequence: null, sessionData: data }).ok).toBe(true);
   const noTokenLeak = (res: ServerModule.ModelAuthResponse, allowAccess = false) => {

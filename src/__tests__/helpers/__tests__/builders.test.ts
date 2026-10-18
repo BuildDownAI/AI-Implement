@@ -1,4 +1,5 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { parseChatGptPlanRecord } from "../../../chatgpt-plan-token.js";
 import { getMappings, initMappingsTable, upsertMapping } from "../../../config.js";
 import { ProviderRegistry } from "../../../providers/registry.js";
 import { validateReviewFixResultMetadata, validateScopedPrIdentity } from "../../../review-fix-contract.js";
@@ -8,6 +9,7 @@ import { testDb } from "../test-db.js";
 import {
   makeAppConfig,
   makeAppendLogEntry,
+  makeChatGptPlanRecord,
   makeContext,
   makeExecutor,
   makeFeedbackLoopOutputs,
@@ -393,5 +395,33 @@ describe("makeAppConfig", () => {
     const fly = makeAppConfig({ flySessionsApp: "sessions" });
     expect(fly.flySessionsApp).toBe("sessions");
     expect({ ...fly, flySessionsApp: makeAppConfig().flySessionsApp }).toEqual(makeAppConfig());
+  });
+});
+
+describe("makeChatGptPlanRecord", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("builds a record the plan-record parser accepts unchanged, saved now with an hour of access left", () => {
+    const record = makeChatGptPlanRecord();
+    expect(parseChatGptPlanRecord(record)).toEqual({ ok: true, value: record });
+    expect(record.savedAt).toBe(Date.now());
+    expect(record.accessTokenExpiresAt).toBe(Date.now() + 60 * 60_000);
+  });
+
+  it("keeps the access token's expiry an hour after an overridden savedAt", () => {
+    expect(makeChatGptPlanRecord({ savedAt: 1_000_000 }).accessTokenExpiresAt).toBe(1_000_000 + 60 * 60_000);
+  });
+
+  it("replaces only the overridden field", () => {
+    const other = makeChatGptPlanRecord({ email: "other@example.com" });
+    expect(other.email).toBe("other@example.com");
+    expect({ ...other, email: makeChatGptPlanRecord().email }).toEqual(makeChatGptPlanRecord());
   });
 });

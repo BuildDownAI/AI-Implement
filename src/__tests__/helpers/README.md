@@ -25,6 +25,8 @@ Some defaults are not fixed literals. They change with each build, or they follo
 | `makeReviewFixRunConfig` | The attempt's `deadlineAt` | An hour after the object is built |
 | `makeReviewFixRunConfig` | The envelope's issue and PR number | The attempt it carries, as the review-fix worker derives them |
 | `makeAppendLogEntry` | `dispatchId` | Fresh for each build, as each real dispatch gets one |
+| `makeChatGptPlanRecord` | `savedAt` | The clock when the object is built |
+| `makeChatGptPlanRecord` | `accessTokenExpiresAt` | An hour after `savedAt`, as sign-in sets it from the token's lifetime |
 | `makeFeedbackLoopOutputs` | `passes`, `finalFeedback`, `terminationReason`, `failure` | `approved`, `iterations` and `terminationReason`: one pass per iteration, the last ending the way the step ends that kind of run (a `max_turns` pass is never reviewed, and a `provider_unavailable` run carries its `failure`) |
 
 Two builds of a clock or fresh-id field can differ, so a test that compares builds freezes the clock with `vi.setSystemTime` or overrides the field. A derived field agrees with the fields it follows from, so overriding those still yields a consistent object; a test that overrides the derived field itself describes a different object and owns its consistency.
