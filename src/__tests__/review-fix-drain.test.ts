@@ -11,7 +11,10 @@ import type * as AdmissionModule from "../dispatch-admission.js";
 import type * as RestateStatusModule from "../restate/status.js";
 import type { RepoMapping } from "../config.js";
 import type { TicketingProvider } from "../providers/types.js";
-import { makeGrant, makeSnapshot } from "./helpers/fixtures/configured-run.js";
+import type { WorkflowCapabilities } from "../workflow-probe.js";
+import type { ManagedDispatchDecision } from "../managed-dispatch-auth.js";
+import type { ModelAuthGrantBootstrapV1 } from "../model-auth-contract.js";
+import { makeGrant, makeLaunchDecision, makeSnapshot, type LaunchDecision } from "./helpers/fixtures/configured-run.js";
 import { makeAppConfig, makeAppendLogEntry, makeIssue, makeMapping, makeProvider, makeRegistry } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type Reply, type Routes } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
@@ -49,7 +52,7 @@ vi.mock("../local-gapfill.js", async (importOriginal) => {
 
 const managedMocks = vi.hoisted(() => ({
   isManagedProject: vi.fn<(key: string, dispatchId?: string) => boolean>(() => false),
-  prepareManagedDispatch: vi.fn<(...args: unknown[]) => Promise<unknown>>(),
+  prepareManagedDispatch: vi.fn<typeof import("../managed-dispatch-auth.js").prepareManagedDispatch>(),
   settleLaunch: vi.fn(),
 }));
 
@@ -142,6 +145,10 @@ function acmeBilling(overrides: Partial<RepoMapping> = {}): RepoMapping {
   return makeMapping({ owner: "acme", repo: "billing", ...overrides });
 }
 
+/** `dispatchWorkflow`'s answer to an accepted dispatch made with `returnRunDetails`, as the drain makes it: GitHub's 204
+ *  carries no run id, and the outcome is always set when run details were asked for. */
+const ACCEPTED_DISPATCH = { success: true, status: 204, outcome: "accepted" } as const;
+
 /** GitHub's pull request object, with the fields `getPullRequestState` reads. */
 function pullRequest(state: "open" | "closed", merged = false): Reply {
   return { json: { state, merged, head: { ref: "feature-branch", sha: "c".repeat(40) } } };
@@ -159,7 +166,7 @@ beforeEach(async () => {
   managedMocks.isManagedProject.mockReset();
   managedMocks.prepareManagedDispatch.mockReset();
   managedMocks.settleLaunch.mockReset();
-  process.env.RUNNER_MODE = "local";
+  vi.stubEnv("RUNNER_MODE", "local");
   ({
     dedup, log, breaker, configModule, reviewFixQueue, admission, restateStatus,
     reviewLedgerStore, github, workflowProbe, repoImage, indexModule,
@@ -172,7 +179,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-  delete process.env.RUNNER_MODE;
+  vi.unstubAllEnvs();
   restateStatus.resetRestateStatus();
   vi.restoreAllMocks();
   localGapfillMocks.dispatchLocalGapfill.mockReset();
@@ -191,7 +198,7 @@ describe("processReviewFixQueue — owner selection", () => {
   }
 
   it("nudges Restate ingress once per 30 s bucket for selected automatic GHA work and leaves Legacy dispatch inert", async () => {
-    process.env.RUNNER_MODE = "gha";
+    vi.stubEnv("RUNNER_MODE", "gha");
     configModule.upsertMapping("AII", acmeBilling({ reviewFixLifecycle: "restate" }));
     restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
     pulls({ 42: pullRequest("open") });
@@ -213,7 +220,7 @@ describe("processReviewFixQueue — owner selection", () => {
   });
 
   it("reuses the key inside a 30 s bucket, mints a new one in the next, and keeps the row pending on unavailable", async () => {
-    process.env.RUNNER_MODE = "gha";
+    vi.stubEnv("RUNNER_MODE", "gha");
     configModule.upsertMapping("AII", acmeBilling({ reviewFixLifecycle: "restate" }));
     restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
     pulls({ 42: pullRequest("open") });
@@ -239,7 +246,7 @@ describe("processReviewFixQueue — owner selection", () => {
   });
 
   it("keeps selected work pending when registration or the runner mode is unavailable", async () => {
-    process.env.RUNNER_MODE = "gha";
+    vi.stubEnv("RUNNER_MODE", "gha");
     configModule.upsertMapping("AII", acmeBilling({ reviewFixLifecycle: "restate" }));
     queueOne();
     await indexModule.processReviewFixQueue(config, registry);
@@ -247,14 +254,14 @@ describe("processReviewFixQueue — owner selection", () => {
     expect(ingressMocks.feedback).not.toHaveBeenCalled();
 
     restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
-    process.env.RUNNER_MODE = "fly";
+    vi.stubEnv("RUNNER_MODE", "fly");
     await indexModule.processReviewFixQueue(config, registry);
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
     expect(ingressMocks.feedback).not.toHaveBeenCalled();
   });
 
   it("keeps a local review-fix run on Legacy even when the project selects Restate for GHA", async () => {
-    process.env.RUNNER_MODE = "local";
+    vi.stubEnv("RUNNER_MODE", "local");
     configModule.upsertMapping("AII", acmeBilling({ reviewFixLifecycle: "restate" }));
     restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
     pulls({ 42: pullRequest("open") });
@@ -267,7 +274,7 @@ describe("processReviewFixQueue — owner selection", () => {
   });
 
   it("retires selected automatic feedback when GitHub confirms the PR is closed", async () => {
-    process.env.RUNNER_MODE = "gha";
+    vi.stubEnv("RUNNER_MODE", "gha");
     configModule.upsertMapping("AII", acmeBilling({ reviewFixLifecycle: "restate" }));
     restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
     queueOne();
@@ -432,14 +439,14 @@ describe("processReviewFixQueue — dispatch gate", () => {
 
   it("boots the local review-fix child with a repo-scoped token", async () => {
     const mapping = acmeBilling();
-    configModule.upsertMapping("TEAM", mapping);
+    configModule.upsertMapping("AII", mapping);
     pulls({ 42: pullRequest("open") });
     reviewFixQueue.enqueueReviewFix({
       issueId: "issue-scoped",
       issueIdentifier: "AII-90",
       repo: "acme/billing",
       prNumber: 42,
-      reason: "late review comment",
+      reason: "review_comment",
     });
 
     await indexModule.processReviewFixQueue(config, registry);
@@ -456,7 +463,7 @@ describe("processReviewFixQueue — dispatch gate", () => {
 
   it("aborts the local review-fix launch when the scoped mint fails, with no broad fallback", async () => {
     const mapping = acmeBilling();
-    configModule.upsertMapping("TEAM", mapping);
+    configModule.upsertMapping("AII", mapping);
     githubAppAuthMocks.getScopedInstallationToken.mockRejectedValue(new Error("mint failed"));
     pulls({ 42: pullRequest("open") });
     reviewFixQueue.enqueueReviewFix({
@@ -464,7 +471,7 @@ describe("processReviewFixQueue — dispatch gate", () => {
       issueIdentifier: "AII-91",
       repo: "acme/billing",
       prNumber: 42,
-      reason: "late review comment",
+      reason: "review_comment",
     });
 
     await indexModule.processReviewFixQueue(config, registry);
@@ -813,7 +820,7 @@ describe("guardOpenPrBeforeImplementationDispatch", () => {
 
 describe("processReviewFixQueue — GHA phase fix", () => {
   it("stamps the GHA dispatch_log row with phase='gap-analysis' and counts prior gap-analysis dispatches", async () => {
-    process.env.RUNNER_MODE = "default";
+    vi.stubEnv("RUNNER_MODE", "default");
     const mapping = acmeBilling({ executionMode: "github-actions" });
     configModule.upsertMapping("AII", mapping);
     pulls({ 42: pullRequest("open") });
@@ -852,27 +859,24 @@ describe("processReviewFixQueue — GHA phase fix", () => {
 
 describe("processReviewFixQueue — GHA publication token gate", () => {
   async function dispatchInputs(supportsRunPublicationToken: boolean): Promise<Record<string, unknown>> {
-    process.env.RUNNER_MODE = "default";
-    configModule.upsertMapping("TEAM", acmeBilling({ executionMode: "github-actions" }));
+    vi.stubEnv("RUNNER_MODE", "default");
+    configModule.upsertMapping("AII", acmeBilling({ executionMode: "github-actions" }));
     pulls({ 43: pullRequest("open") });
     reviewFixQueue.enqueueReviewFix({
       issueId: "issue-gate",
       issueIdentifier: "AII-11",
       repo: "acme/billing",
       prNumber: 43,
-      reason: "late review comment",
+      reason: "review_comment",
     });
 
-    const githubModule = await import("../github.js");
-    const workflowProbeModule = await import("../workflow-probe.js");
-    const repoImageModule = await import("../repo-image.js");
-    const dispatchWorkflowSpy = vi.spyOn(githubModule, "dispatchWorkflow").mockResolvedValue({ success: true, status: 204 });
-    vi.spyOn(workflowProbeModule, "resolveWorkflowCapabilities").mockResolvedValue({
+    const dispatchWorkflowSpy = vi.spyOn(github, "dispatchWorkflow").mockResolvedValue(ACCEPTED_DISPATCH);
+    vi.spyOn(workflowProbe, "resolveWorkflowCapabilities").mockResolvedValue({
       contract: "envelope",
       supportsRunPublicationToken,
       supportsAttemptCorrelation: false,
     });
-    vi.spyOn(repoImageModule, "resolveRunnerImageForDispatch").mockResolvedValue(undefined);
+    vi.spyOn(repoImage, "resolveRunnerImageForDispatch").mockResolvedValue(undefined);
 
     await indexModule.processReviewFixQueue(
       { ...config, runnerCallbackBaseUrl: "https://callback.example", runnerTokenSecret: "test-secret" },
@@ -952,21 +956,18 @@ describe("processReviewFixQueue — task description wiring", () => {
   });
 
   it("keeps an over-budget review pending: no dispatch, no dispatch record, no status change", async () => {
-    configModule.upsertMapping("TEAM", acmeBilling());
+    configModule.upsertMapping("AII", acmeBilling());
     pulls({ 62: pullRequest("open") });
     const queueId = reviewFixQueue.enqueueReviewFix({
-      issueId: "issue-over", issueIdentifier: "AII-12", repo: "acme/billing", prNumber: 62, reason: "late review comment",
+      issueId: "issue-over", issueIdentifier: "AII-12", repo: "acme/billing", prNumber: 62, reason: "review_comment",
     });
-    const reviewLedgerStore = await import("../review-ledger-store.js");
     for (let i = 0; i < 31; i++) {
       reviewLedgerStore.upsertReviewFinding({
         repo: "acme/billing", prNumber: 62, source: "github-review", severity: "blocking",
         body: `Finding ${i}`, path: `src/f${i}.ts`, line: i + 1,
       });
     }
-    findByKeyMock.mockResolvedValue({
-      id: "issue-over", identifier: "AII-12", title: "T", description: "d", scopeKey: "TEAM", nativeStatus: "In Progress",
-    });
+    findByKeyMock.mockResolvedValue(makeIssue({ id: "issue-over", identifier: "AII-12", scopeKey: "AII" }));
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
     await indexModule.processReviewFixQueue(config, registry);
@@ -979,22 +980,18 @@ describe("processReviewFixQueue — task description wiring", () => {
   });
 
   it("dispatches a full admitted set and records exactly the rendered finding ids", async () => {
-    configModule.upsertMapping("TEAM", acmeBilling());
+    configModule.upsertMapping("AII", acmeBilling());
     pulls({ 63: pullRequest("open") });
     reviewFixQueue.enqueueReviewFix({
-      issueId: "issue-full", issueIdentifier: "AII-13", repo: "acme/billing", prNumber: 63, reason: "late review comment",
+      issueId: "issue-full", issueIdentifier: "AII-13", repo: "acme/billing", prNumber: 63, reason: "review_comment",
     });
-    const reviewLedgerStore = await import("../review-ledger-store.js");
     for (let i = 0; i < 4; i++) {
       reviewLedgerStore.upsertReviewFinding({
         repo: "acme/billing", prNumber: 63, source: "github-review", severity: "blocking",
         body: `Finding ${i}\n\n${"detail ".repeat(150)}\nEND-${i}`, path: `src/f${i}.ts`, line: i + 1,
       });
     }
-    findByKeyMock.mockResolvedValue({
-      id: "issue-full", identifier: "AII-13", title: "T", description: "d", scopeKey: "TEAM", nativeStatus: "In Progress",
-    });
-    localGapfillMocks.dispatchLocalGapfill.mockResolvedValue({ containerId: "c", machineNonce: "n" } as never);
+    findByKeyMock.mockResolvedValue(makeIssue({ id: "issue-full", identifier: "AII-13", scopeKey: "AII" }));
 
     await indexModule.processReviewFixQueue(config, registry);
 
@@ -1007,7 +1004,7 @@ describe("processReviewFixQueue — task description wiring", () => {
   });
 
   it("uses buildReviewFixTaskDescription for the legacy issue_description dispatch field on the GHA path", async () => {
-    process.env.RUNNER_MODE = "default";
+    vi.stubEnv("RUNNER_MODE", "default");
     const mapping = acmeBilling({ executionMode: "github-actions" });
     configModule.upsertMapping("AII", mapping);
     pulls({ 55: pullRequest("open") });
@@ -1114,7 +1111,7 @@ describe("processReviewFixQueue — admission (AII-787)", () => {
     mapping: RepoMapping;
     dispatchWorkflowSpy: ReturnType<typeof vi.spyOn>;
   } {
-    process.env.RUNNER_MODE = "default";
+    vi.stubEnv("RUNNER_MODE", "default");
     const mapping = acmeBilling({ executionMode: "github-actions", ...overrides });
     configModule.upsertMapping("AII", mapping);
 
@@ -1376,27 +1373,24 @@ describe("processReviewFixQueue — legacy GHA writer private transport (AII-983
     ...config,
     runnerCallbackBaseUrl: "https://callback.example",
     runnerTokenSecret: "runner-token-secret-with-enough-entropy",
-  } as unknown as IndexModule.AppConfig;
+  };
 
-  async function run(caps: Record<string, unknown>, issueId: string) {
-    process.env.RUNNER_MODE = "default";
-    configModule.upsertMapping("TEAM", acmeBilling({ executionMode: "github-actions" }));
+  async function run(caps: WorkflowCapabilities, issueId: string) {
+    vi.stubEnv("RUNNER_MODE", "default");
+    configModule.upsertMapping("AII", acmeBilling({ executionMode: "github-actions" }));
     pulls({ 77: pullRequest("open") });
     reviewFixQueue.enqueueReviewFix({
-      issueId, issueIdentifier: `AII-${issueId}`, repo: "acme/billing", prNumber: 77, reason: "late review comment",
+      issueId, issueIdentifier: "AII-77", repo: "acme/billing", prNumber: 77, reason: "review_comment",
     });
-    const githubModule = await import("../github.js");
-    const workflowProbeModule = await import("../workflow-probe.js");
-    const repoImageModule = await import("../repo-image.js");
-    const dispatchWorkflowSpy = vi.spyOn(githubModule, "dispatchWorkflow").mockResolvedValue({ success: true, status: 204 });
-    vi.spyOn(workflowProbeModule, "resolveWorkflowCapabilities").mockResolvedValue(caps as never);
-    vi.spyOn(repoImageModule, "resolveRunnerImageForDispatch").mockResolvedValue(undefined);
+    const dispatchWorkflowSpy = vi.spyOn(github, "dispatchWorkflow").mockResolvedValue(ACCEPTED_DISPATCH);
+    vi.spyOn(workflowProbe, "resolveWorkflowCapabilities").mockResolvedValue(caps);
+    vi.spyOn(repoImage, "resolveRunnerImageForDispatch").mockResolvedValue(undefined);
     await indexModule.processReviewFixQueue(tokenConfig, registry);
     expect(dispatchWorkflowSpy).toHaveBeenCalledTimes(1);
     return dispatchWorkflowSpy.mock.calls[0]![2] as Record<string, string | undefined>;
   }
 
-  const envelope = (extra: Record<string, unknown> = {}) => ({
+  const envelope = (extra: Partial<WorkflowCapabilities> = {}): WorkflowCapabilities => ({
     contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: false, ...extra,
   });
 
@@ -1441,33 +1435,35 @@ describe("processReviewFixQueue — protected dispatch (AII-1392)", () => {
       issueIdentifier: "AII-900",
       repo: "acme/billing",
       prNumber: 42,
-      reason: "late review comment",
+      reason: "review_comment",
     });
   }
 
-  function launchDecision() {
-    return {
-      kind: "launch",
-      dispatchId: "d-1",
-      projectKey: "TEAM",
-      backend: "local-docker",
-      snapshot: { v: 1 },
-      grant: {},
-      takeBootstrap: vi.fn(() => ({ bootstrap: true })),
-    };
+  let decision: LaunchDecision;
+  let bootstrap: ModelAuthGrantBootstrapV1;
+
+  /** Opts the project in and answers each preparation as `prepareManagedDispatch` does: a launch decision for the
+   *  request's own dispatch, project and backend. `adjust` sees each decision before the drain receives it. */
+  function prepareLaunches(snapshot = makeSnapshot(), adjust: (d: LaunchDecision) => void = () => {}): void {
+    managedMocks.isManagedProject.mockReturnValue(true);
+    managedMocks.prepareManagedDispatch.mockImplementation(async (request) => {
+      ({ decision, bootstrap } = makeLaunchDecision(snapshot, request.backend, {
+        dispatchId: request.dispatchId, projectKey: request.projectKey,
+      }));
+      adjust(decision);
+      return decision;
+    });
   }
 
   it("opted-in local review-fix passes managed input and no Anthropic credentials", async () => {
-    configModule.upsertMapping("TEAM", acmeBilling());
-    managedMocks.isManagedProject.mockReturnValue(true);
-    const decision = launchDecision();
-    managedMocks.prepareManagedDispatch.mockResolvedValue(decision);
+    configModule.upsertMapping("AII", acmeBilling());
+    prepareLaunches();
     queueFix();
 
     await indexModule.processReviewFixQueue(config, registry);
 
     expect(managedMocks.prepareManagedDispatch).toHaveBeenCalledWith(
-      expect.objectContaining({ backend: "local-docker", projectKey: "TEAM" }),
+      expect.objectContaining({ backend: "local-docker", projectKey: "AII" }),
       expect.anything(),
     );
     const [call] = localGapfillMocks.dispatchLocalGapfill.mock.calls[0]!;
@@ -1479,7 +1475,7 @@ describe("processReviewFixQueue — protected dispatch (AII-1392)", () => {
   });
 
   it("opted-out local review-fix passes no managed input and never prepares", async () => {
-    configModule.upsertMapping("TEAM", acmeBilling());
+    configModule.upsertMapping("AII", acmeBilling());
     queueFix();
 
     await indexModule.processReviewFixQueue({ ...config, anthropicApiKey: "key" }, registry);
@@ -1491,25 +1487,23 @@ describe("processReviewFixQueue — protected dispatch (AII-1392)", () => {
   });
 
   it("a launch that throws before onBeforeLaunch settles rejected and releases the admission", async () => {
-    configModule.upsertMapping("TEAM", acmeBilling());
-    managedMocks.isManagedProject.mockReturnValue(true);
-    const decision = launchDecision();
-    managedMocks.prepareManagedDispatch.mockResolvedValue(decision);
-    localGapfillMocks.dispatchLocalGapfill.mockRejectedValue(new Error("managed dispatch refused: bootstrap unavailable"));
+    configModule.upsertMapping("AII", acmeBilling());
+    // A bootstrap already handed out: the real dispatchLocalGapfill refuses before its Docker launch.
+    prepareLaunches(makeSnapshot(), (d) => { d.takeBootstrap(); });
     queueFix();
 
     await indexModule.processReviewFixQueue(config, registry);
 
     expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "rejected", expect.anything());
-    expect(admission.count("TEAM")).toBe(0);
+    expect(admission.count("AII")).toBe(0);
   });
 
-  it.each([
+  it.each<[string, ManagedDispatchDecision, number]>([
     ["refuse", { kind: "refuse", category: "configuration-error", code: "bad" }, 0],
     ["leave-queued", { kind: "leave-queued", code: "profile_busy" }, 1],
     ["hold", { kind: "hold", code: "preparation_failed" }, 1],
   ])("a %s decision releases the admission and leaves %i pending", async (_name, decision, pending) => {
-    configModule.upsertMapping("TEAM", acmeBilling());
+    configModule.upsertMapping("AII", acmeBilling());
     managedMocks.isManagedProject.mockReturnValue(true);
     managedMocks.prepareManagedDispatch.mockResolvedValue(decision);
     queueFix();
@@ -1517,72 +1511,51 @@ describe("processReviewFixQueue — protected dispatch (AII-1392)", () => {
     await indexModule.processReviewFixQueue(config, registry);
 
     expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
-    expect(admission.count("TEAM")).toBe(0);
+    expect(admission.count("AII")).toBe(0);
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(pending);
   });
 
   it("opted-in GitHub Actions review-fix with a refused preparation is failed, releases its admission and dispatches nothing", async () => {
-    process.env.RUNNER_MODE = "default";
-    configModule.upsertMapping("TEAM", acmeBilling({ executionMode: "github-actions" }));
+    vi.stubEnv("RUNNER_MODE", "default");
+    configModule.upsertMapping("AII", acmeBilling({ executionMode: "github-actions" }));
     managedMocks.isManagedProject.mockReturnValue(true);
     managedMocks.prepareManagedDispatch.mockResolvedValue({ kind: "refuse", category: "configuration-error", code: "runner_incompatible" });
     queueFix();
-    const githubModule = await import("../github.js");
-    const dispatch = vi.spyOn(githubModule, "dispatchWorkflow").mockResolvedValue({ success: true, status: 204 });
+    const dispatch = vi.spyOn(github, "dispatchWorkflow").mockResolvedValue(ACCEPTED_DISPATCH);
 
     await indexModule.processReviewFixQueue(config, registry);
 
     expect(dispatch).not.toHaveBeenCalled();
     expect(managedMocks.prepareManagedDispatch).toHaveBeenCalledWith(expect.objectContaining({ backend: "github-actions" }), expect.anything());
-    expect(admission.count("TEAM")).toBe(0);
+    expect(admission.count("AII")).toBe(0);
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
   });
   describe("opted-in GitHub Actions review-fix with a capable workflow (AII-1420)", () => {
     const snapshot = makeSnapshot("codex-subscription");
-    const bootstrap = makeGrant(snapshot, { backend: "gha", dispatchId: "d-1", projectKey: "TEAM" });
     const tokenConfig = {
       ...config,
       runnerCallbackBaseUrl: "https://callback.example",
       runnerTokenSecret: "runner-token-secret-with-enough-entropy",
-    } as unknown as IndexModule.AppConfig;
-    const caps = (supportsPrivateRunConfig: boolean) => ({
+    };
+    const caps = (supportsPrivateRunConfig: boolean): WorkflowCapabilities => ({
       contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: false, supportsPrivateRunConfig,
     });
-    let decision: ReturnType<typeof ghaDecision>;
 
-    function ghaDecision() {
-      return {
-        kind: "launch",
-        dispatchId: "d-1",
-        projectKey: "TEAM",
-        backend: "github-actions",
-        snapshot,
-        grant: {},
-        takeBootstrap: vi.fn(() => bootstrap),
-      };
-    }
-
-    async function setup(supportsPrivateRunConfig = true) {
-      process.env.RUNNER_MODE = "default";
-      configModule.upsertMapping("TEAM", acmeBilling({ executionMode: "github-actions" }));
-      managedMocks.isManagedProject.mockReturnValue(true);
-      decision = ghaDecision();
-      managedMocks.prepareManagedDispatch.mockResolvedValue(decision);
+    async function setup(supportsPrivateRunConfig = true, adjust?: (d: LaunchDecision) => void) {
+      vi.stubEnv("RUNNER_MODE", "default");
+      configModule.upsertMapping("AII", acmeBilling({ executionMode: "github-actions" }));
+      prepareLaunches(snapshot, adjust);
       queueFix();
-      const githubModule = await import("../github.js");
-      const workflowProbeModule = await import("../workflow-probe.js");
-      const repoImageModule = await import("../repo-image.js");
-      vi.spyOn(workflowProbeModule, "resolveWorkflowCapabilities").mockResolvedValue(caps(supportsPrivateRunConfig) as never);
-      vi.spyOn(repoImageModule, "resolveRunnerImageForDispatch").mockResolvedValue(undefined);
-      return vi.spyOn(githubModule, "dispatchWorkflow");
+      vi.spyOn(workflowProbe, "resolveWorkflowCapabilities").mockResolvedValue(caps(supportsPrivateRunConfig));
+      vi.spyOn(repoImage, "resolveRunnerImageForDispatch").mockResolvedValue(undefined);
+      return vi.spyOn(github, "dispatchWorkflow");
     }
 
     it("the launch context is the request's own values, never read from a grant whose dispatch, project and backend differ", async () => {
       const { decodeTrustedRunConfig } = await import("../run-config.js");
-      const dispatch = await setup();
-      dispatch.mockResolvedValue({ success: true, status: 204 });
       const divergent = makeGrant(snapshot, { backend: "fly", dispatchId: "grant-dispatch", projectKey: "grant-project" });
-      decision.takeBootstrap = vi.fn(() => divergent);
+      const dispatch = await setup(true, (d) => { d.takeBootstrap.mockReturnValueOnce(divergent); });
+      dispatch.mockResolvedValue(ACCEPTED_DISPATCH);
 
       await indexModule.processReviewFixQueue(tokenConfig, registry);
 
@@ -1598,7 +1571,7 @@ describe("processReviewFixQueue — protected dispatch (AII-1392)", () => {
     it("accepted launch carries the frozen snapshot and protected bootstrap privately and keeps the grant", async () => {
       const { decodeTrustedRunConfig, decodeRunConfig } = await import("../run-config.js");
       const dispatch = await setup();
-      dispatch.mockResolvedValue({ success: true, status: 204 });
+      dispatch.mockResolvedValue(ACCEPTED_DISPATCH);
 
       await indexModule.processReviewFixQueue(tokenConfig, registry);
 
@@ -1618,7 +1591,7 @@ describe("processReviewFixQueue — protected dispatch (AII-1392)", () => {
       }
       expect(decision.takeBootstrap).toHaveBeenCalledTimes(1);
       expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "accepted", expect.anything());
-      expect(admission.count("TEAM")).toBe(1);
+      expect(admission.count("AII")).toBe(1);
     });
 
     it("rejected dispatch revokes the grant and releases the admission", async () => {
@@ -1628,7 +1601,7 @@ describe("processReviewFixQueue — protected dispatch (AII-1392)", () => {
       await indexModule.processReviewFixQueue(tokenConfig, registry);
 
       expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "rejected", expect.anything());
-      expect(admission.count("TEAM")).toBe(0);
+      expect(admission.count("AII")).toBe(0);
     });
 
     it("uncertain dispatch revokes the grant but keeps the admission", async () => {
@@ -1638,7 +1611,7 @@ describe("processReviewFixQueue — protected dispatch (AII-1392)", () => {
       await indexModule.processReviewFixQueue(tokenConfig, registry);
 
       expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "unknown", expect.anything());
-      expect(admission.count("TEAM")).toBe(1);
+      expect(admission.count("AII")).toBe(1);
     });
 
     it("a throwing dispatch revokes the grant and keeps the admission", async () => {
@@ -1648,7 +1621,7 @@ describe("processReviewFixQueue — protected dispatch (AII-1392)", () => {
       await indexModule.processReviewFixQueue(tokenConfig, registry);
 
       expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "unknown", expect.anything());
-      expect(admission.count("TEAM")).toBe(1);
+      expect(admission.count("AII")).toBe(1);
     });
 
     it("a workflow without the private transport revokes the grant before any dispatch and releases the admission", async () => {
@@ -1658,7 +1631,7 @@ describe("processReviewFixQueue — protected dispatch (AII-1392)", () => {
 
       expect(dispatch).not.toHaveBeenCalled();
       expect(managedMocks.settleLaunch).toHaveBeenCalledWith(decision, "rejected", expect.anything());
-      expect(admission.count("TEAM")).toBe(0);
+      expect(admission.count("AII")).toBe(0);
     });
   });
 });
