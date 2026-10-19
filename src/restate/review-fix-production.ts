@@ -4,11 +4,10 @@
 import { getMappings, resolveReviewFixLifecycle, type RepoMapping } from "../config.js";
 import { randomUUID } from "node:crypto";
 import { getDb } from "../dedup.js";
-import { hasEphemeralFullAccessOptIn } from "../model-auth-contract.js";
 import type { ModelAuthRuntime } from "../model-auth-runtime.js";
-import { isManagedProject, prepareManagedDispatch, ghaManagedCredentials, settleLaunch } from "../managed-dispatch-auth.js";
+import { isManagedProject, selectsCodexImplementation, prepareManagedDispatch, ghaManagedCredentials, settleLaunch } from "../managed-dispatch-auth.js";
 import { getInstallationId, getInstallationToken } from "../github-app-auth.js";
-import { getPullRequestState } from "../github.js";
+import { assertExecutionPolicyCapability, getPullRequestState } from "../github.js";
 import { listReviewFixCycleSummaries } from "../review-fix-evidence.js";
 import { createReviewFixFinalizer } from "../review-fix-finalize.js";
 import { createReviewFixGithubAdapter } from "../review-fix-github-adapter.js";
@@ -109,7 +108,7 @@ async function decideAdmission(
     || capabilities.supportsRunPublicationToken !== true || capabilities.supportsStageAgentConfig !== true || capabilities.supportsPrivateRunConfig !== true) {
     return { verdict: "configuration_error", reason: "workflow_capability_missing" };
   }
-  if (hasEphemeralFullAccessOptIn(mapping.extraEnv) && capabilities.supportsExecutionPolicy !== true) {
+  if (selectsCodexImplementation(key) && capabilities.supportsExecutionPolicy !== true) {
     return { verdict: "configuration_error", reason: "execution_policy_missing" };
   }
   const repository = `${mapping.owner}/${mapping.repo}`;
@@ -293,7 +292,7 @@ export function createProductionReviewFixWorker(
       if (!selectedEntry(plan.scope)) throw new Error("review-fix managed mapping unavailable");
       if (capabilities.supportsStageAgentConfig !== true) throw new Error("review-fix managed workflow unavailable");
       if (!runtime) throw new Error("review-fix model authentication unavailable");
-      if (hasEphemeralFullAccessOptIn(mapping.extraEnv) && capabilities.supportsExecutionPolicy !== true) {
+      if (selectsCodexImplementation(projectKey, plan.attemptId) && capabilities.supportsExecutionPolicy !== true) {
         throw new Error("review-fix execution policy transport unavailable");
       }
       const decision = await prepareManagedDispatch({ dispatchId: plan.attemptId, projectKey,
@@ -302,6 +301,8 @@ export function createProductionReviewFixWorker(
       try {
         const managedCredentials = ghaManagedCredentials(decision, config.runnerCallbackBaseUrl, { extraEnv: mapping.extraEnv });
         if (!managedCredentials) throw new Error("review-fix managed credentials unavailable");
+        // Recheck the frozen result: configuration may change while asynchronous preparation runs.
+        assertExecutionPolicyCapability(managedCredentials, capabilities, `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`);
         return { snapshot: decision.snapshot, credentials: managedCredentials,
           settle: (outcome) => { settleLaunch(decision, outcome, runtime); } };
       } catch {

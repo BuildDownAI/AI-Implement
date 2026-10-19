@@ -1571,6 +1571,7 @@ describe("processReviewFixQueue — protected dispatch (AII-1392)", () => {
     } as unknown as IndexModule.AppConfig;
     const caps = (supportsPrivateRunConfig: boolean) => ({
       contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: false, supportsPrivateRunConfig,
+      supportsExecutionPolicy: true,
     });
     let decision: ReturnType<typeof ghaDecision>;
 

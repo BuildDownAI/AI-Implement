@@ -128,6 +128,17 @@ for (const file of GHA_IMPLEMENT_WORKFLOWS) {
       expect(withPolicy.runEnv.AI_IMPLEMENT_EXECUTION_POLICY).toBe("v1:ephemeral-full-access:gha:disp-1:proj");
       const without = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: GHA_CONTEXT, callback: false });
       expect(without.runEnv.AI_IMPLEMENT_EXECUTION_POLICY).toBe("");
+      expect(ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: GHA_CONTEXT,
+        callback: false, runnerEnvironment: "self-hosted" }).bootStatus).toBe(0);
+    });
+
+    it.each(["self-hosted", "", "unknown", null])("rejects full access on runner environment %s", (runnerEnvironment) => {
+      const snapshot = makeSnapshot();
+      const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: GHA_CONTEXT,
+        policy: GHA_POLICY, callback: false, runnerEnvironment });
+      expect(handoff.bootStatus).not.toBe(0);
+      expect(handoff.runEnv).toEqual({});
+      expect(handoff.bootStderr).toContain("github-hosted");
     });
 
     const badPolicies: Array<[string, unknown]> = [

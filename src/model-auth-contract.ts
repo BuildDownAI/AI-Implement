@@ -991,16 +991,16 @@ export function parseModelAuthContext(raw: unknown): ValidationResult<ModelAuthC
  * Operator-approved execution policy (AII-1437). The only authority source for Codex implementation full access:
  * a versioned, dispatcher-authored value that travels in the protected credential namespace beside the model-auth
  * context and must match it. Never part of `agentConfig`, repository config, the generic run_config or diagnostics.
- * The operator's per-project opt-in is `EPHEMERAL_FULL_ACCESS_EXTRA_ENV` in the mapping `extraEnv`; setting it
- * asserts that the project's GHA runner is an ephemeral, disposable job. Nothing in code can prove that.
+ * Configured Codex implementation defaults to this policy on GHA. The v2 workflow proves the actual
+ * runner.environment is github-hosted before projection; executor non-root/socket admission still applies.
  */
 export const EXECUTION_POLICY_FIELD = "executionPolicy";
 export const EPHEMERAL_FULL_ACCESS_POLICY = "ephemeral-full-access";
-/** Reserved mapping `extraEnv` name; the value must equal `EPHEMERAL_FULL_ACCESS_ASSERTION`. Rejected on Fly and local. */
+/** Deprecated mapping opt-in, retained for stored mapping compatibility. No longer needed on GHA; rejected on Fly/local. */
 export const EPHEMERAL_FULL_ACCESS_EXTRA_ENV = "AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS";
 export const EPHEMERAL_FULL_ACCESS_ASSERTION = "ephemeral-runner-asserted-v1";
 /** Workflow capability marker a GHA template must carry to project the policy. */
-export const EXECUTION_POLICY_TEMPLATE_CAPABILITY = "ai-implement-capability: ephemeral-execution-policy-v1";
+export const EXECUTION_POLICY_TEMPLATE_CAPABILITY = "ai-implement-capability: github-hosted-execution-policy-v2";
 /** Protected launch variable the workflow Run step sets from the validated credentials; compared again by the runner. */
 export const EXECUTION_POLICY_ENV = "AI_IMPLEMENT_EXECUTION_POLICY";
 

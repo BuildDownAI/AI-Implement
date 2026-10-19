@@ -2,7 +2,7 @@
 # ai-implement-capability: private-run-config-v1
 # ai-implement-capability: stage-agent-config-v1
 # ai-implement-capability: stage-agent-launch-context-v1
-# ai-implement-capability: ephemeral-execution-policy-v1
+# ai-implement-capability: github-hosted-execution-policy-v2
 # All pipeline logic lives in the runner image (ghcr.io/builddownai/ai-implement-runner).
 # Do not edit in target repos.
 #
@@ -227,6 +227,9 @@ jobs:
       # prints those headers before executing the first add-mask command (AII-676).
       - name: Mask runner callback tokens
         id: bootstrap
+        env:
+          # GitHub supplies the actual runner class; project env and run_config cannot assert it.
+          AI_IMPLEMENT_GHA_RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
           set +x
           jq -r '
@@ -371,6 +374,15 @@ jobs:
             echo "::error::Private run_config bootstrap failed" >&2
             exit 1
           }
+
+          # Full access is the default only on disposable GitHub-hosted jobs. A runner label override
+          # must not silently move this authority onto a persistent self-hosted machine.
+          if printf '%s\n' "$bootstrap" | grep -q '^RUN_EXECUTION_POLICY=v1:'; then
+            if [ "${AI_IMPLEMENT_GHA_RUNNER_ENVIRONMENT:-}" != "github-hosted" ]; then
+              echo "::error::Codex full access requires a github-hosted runner; refusing this job" >&2
+              exit 1
+            fi
+          fi
 
           # Deliver the validated credentials as step outputs (AII-1000), mapped into the Run step's env only, never $GITHUB_ENV, so no other step sees them. A private
           # namespace is the single authority: a field it omits stays empty and is never
@@ -589,7 +601,7 @@ jobs:
           AI_IMPLEMENT_MODEL_AUTH_PROJECT_KEY: ${{ steps.bootstrap.outputs.run_model_auth_project_key }}
           AI_IMPLEMENT_MODEL_AUTH_BACKEND: ${{ steps.bootstrap.outputs.run_model_auth_backend }}
           AI_IMPLEMENT_MODEL_AUTH_URL: ${{ steps.bootstrap.outputs.run_model_auth_url }}
-          # Operator-approved ephemeral full-access policy (AII-1437): validated bootstrap output only, empty unless the
+          # Default eligible Codex implementation policy: validated github-hosted bootstrap output only; the
           # dispatcher projected it. The runner re-checks it against the model-auth dispatch id and project key.
           AI_IMPLEMENT_EXECUTION_POLICY: ${{ steps.bootstrap.outputs.run_execution_policy }}
           RUN_PUBLICATION_TOKEN: ${{ steps.bootstrap.outputs.run_publication_token }}

@@ -349,7 +349,7 @@ describe("GitHub Actions and both mode", () => {
 });
 
 describe("opted-in GitHub Actions implementation (AII-1420)", () => {
-  const capabilities = { contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: false, supportsPrivateRunConfig: true } as const;
+  const capabilities = { contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: false, supportsPrivateRunConfig: true, supportsExecutionPolicy: true } as const;
   const dispatchGha = () => index.dispatchGitHubActions(config, provider, issue, mapping, prior, "default", "main", null);
   const sent = () => {
     expect(github.postWorkflowDispatch).toHaveBeenCalledOnce();

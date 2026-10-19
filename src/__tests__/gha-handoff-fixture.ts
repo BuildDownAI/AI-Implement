@@ -47,7 +47,7 @@ export interface GhaHandoff {
   runEnv: Record<string, string>;
 }
 
-type HandoffInput = { runConfig?: string; snapshot?: ResolvedAgentSnapshotV1; grant?: ModelAuthGrantBootstrapV1; context?: unknown; callback?: boolean; policy?: unknown };
+type HandoffInput = { runConfig?: string; snapshot?: ResolvedAgentSnapshotV1; grant?: ModelAuthGrantBootstrapV1; context?: unknown; callback?: boolean; policy?: unknown; runnerEnvironment?: string | null };
 
 /** Wire form of the dispatch envelope, built directly so a deliberately invalid or missing context reaches the bootstrap, not the encoder. */
 export function ghaRunConfig(file: string, input: HandoffInput): string {
@@ -93,8 +93,11 @@ export function ghaRunStepEnv(
     writeFileSync(eventPath, JSON.stringify({ inputs }));
     writeFileSync(envPath, "");
     writeFileSync(outPath, "");
+    const runnerEnv = mask.env?.AI_IMPLEMENT_GHA_RUNNER_ENVIRONMENT === "${{ runner.environment }}"
+      ? { AI_IMPLEMENT_GHA_RUNNER_ENVIRONMENT: input.runnerEnvironment === undefined ? "github-hosted" : input.runnerEnvironment ?? "" }
+      : {};
     const boot = spawnSync("sh", ["-e", "-c", mask.run], {
-      env: { PATH: process.env.PATH, GITHUB_EVENT_PATH: eventPath, GITHUB_ENV: envPath, GITHUB_OUTPUT: outPath },
+      env: { PATH: process.env.PATH, GITHUB_EVENT_PATH: eventPath, GITHUB_ENV: envPath, GITHUB_OUTPUT: outPath, ...runnerEnv },
       encoding: "utf8",
     });
     const githubEnv = readFileSync(envPath, "utf8");
