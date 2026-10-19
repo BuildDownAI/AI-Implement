@@ -344,7 +344,7 @@ Because `feedback-loop` is step 5, `--until` with any earlier step is a token-fr
 
 ## kg-refresh phase
 
-The kg-refresh pipeline (`pipelines/kg-refresh.yml`) uses different step wiring from the autonomous pipeline. Its steps, in order: `clone` → `kg-base-merge` → `dependency-auth` → `clone-code-repo` → `clone-secondary-repos` → `kg-tracker-data` → `kg-ingest` → `feedback-loop` → `kg-snapshot-push`. The entry point is `src/pipeline/kg-refresh-run.ts` rather than `run-autonomous.js`.
+The kg-refresh pipeline (`pipelines/kg-refresh.yml`) uses different step wiring from the autonomous pipeline. Its steps, in order: `clone` → `kg-base-merge` → `kg-scope-reconcile` → `dependency-auth` → `clone-code-repo` → `clone-secondary-repos` → `kg-tracker-data` → `kg-ingest` → `feedback-loop` → `kg-snapshot-push`. The entry point is `src/pipeline/kg-refresh-run.ts` rather than `run-autonomous.js`.
 
 **`dryRun` input on `kg-snapshot-push`.** The step accepts an optional `dryRun?: boolean` input. When true, all regression guards and snapshot validation still run — a tracker regression or missing snapshot still throws — but the commit and push are skipped. The per-part line-count table (printed at the regression guard check) and a dry-run verdict line are the only output. The step returns `{ snapshotPushed: false, commitSha: null }`. This path is used by the dev-harness kg-refresh phase (see below) and is wired in `pipeline-loader.ts` via `dryRun: ctx.data.kgDryRun === true`.
 
