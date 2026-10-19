@@ -185,7 +185,7 @@ export function tool<I extends z.ZodType>(
 }
 
 export const GET_TENANT_HEALTH_DESCRIPTION =
-  "Returns an orchestrator health summary: runner mode, in-flight job count, pending gap-fill queue count, project count, and (when a KG source repo is configured) a live credential preflight for the kg-refresh rail (`kgRefreshPreflight` with one row per repo and grant). Use as a first-pass check before digging deeper.";
+  "Returns an orchestrator health summary: runner mode, in-flight job count, `awaitingDecisionCount` (kg-refresh rows held at the decision gate, which are not in flight), pending gap-fill queue count, project count, and (when a KG source repo is configured) a live credential preflight for the kg-refresh rail (`kgRefreshPreflight` with one row per repo and grant). Use as a first-pass check before digging deeper.";
 
 export const getTenantHealth = tool(
   {
@@ -200,6 +200,9 @@ export const getTenantHealth = tool(
     const { n: pendingGapfillCount } = db
       .prepare("SELECT COUNT(*) as n FROM comment_gapfill_queue WHERE status = 'pending'")
       .get() as { n: number };
+    const { n: awaitingDecisionCount } = db
+      .prepare("SELECT COUNT(*) as n FROM dispatch_log WHERE phase = 'kg-refresh' AND status = 'completed' AND conclusion = 'awaiting_decision'")
+      .get() as { n: number };
     const projectCount = Object.keys(getMappings()).length;
     const kgSourceRepo = readKgSourceRepo(process.env.KG_SOURCE_REPO);
     const kgRefreshPreflight = kgSourceRepo
@@ -213,6 +216,7 @@ export const getTenantHealth = tool(
     const result = {
       runnerMode: { mode, source },
       inFlightJobCount: inFlight.length,
+      awaitingDecisionCount,
       pendingGapfillCount,
       projectCount,
       kgDegraded: isKgDegraded(),
@@ -344,7 +348,7 @@ export const getProjectBinding = tool(
 );
 
 export const LIST_IN_FLIGHT_JOBS_DESCRIPTION =
-  "Lists all currently dispatching or running jobs with their issue identifier, repo, phase, and elapsed seconds since dispatch.";
+  "Lists all currently dispatching or running jobs with their issue identifier, repo, phase, and elapsed seconds since dispatch. A kg-refresh held for a decision is not in flight; it appears in `get_kg_status`.";
 
 export const listInFlightJobs = tool(
   { description: LIST_IN_FLIGHT_JOBS_DESCRIPTION, input: z.object({}), role: "user" },

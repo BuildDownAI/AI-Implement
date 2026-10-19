@@ -452,7 +452,7 @@ The `kg-ingest` step writes every line of the ingest subprocess's stdout and std
 
 ### `list_in_flight_jobs` MCP tool
 
-`src/mcp.ts`, tool `list_in_flight_jobs` — returns all rows from `getInFlightJobs()` including kg-refresh jobs. A kg-refresh row is distinguishable by `phase: "kg-refresh"` and `issueIdentifier: null`. This is the operator's primary tool for checking whether a refresh is in flight before an operation that the deploy interlock would block.
+`src/mcp.ts`, tool `list_in_flight_jobs` — returns all rows from `getInFlightJobs()` including kg-refresh jobs. A kg-refresh row is distinguishable by `phase: "kg-refresh"` and `issueIdentifier: null`. This is the operator's primary tool for checking whether a refresh is in flight before an operation that the deploy interlock would block. A refresh held at the decision gate closes its row (`completed` / `awaiting_decision`), so it is not listed; it appears in `get_kg_status` and counts as `awaitingDecisionCount` in `get_tenant_health`.
 
 ---
 

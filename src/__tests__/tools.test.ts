@@ -20,6 +20,7 @@ import {
   getKgStatusTool,
   setFlyMachineProfileTool,
   getTenantHealth,
+  listInFlightJobs,
   getIssueReportCardTool,
   getFleetReportTool,
   triggerKgRefreshTool,
@@ -50,7 +51,8 @@ import { getMappings } from "../config.js";
 import { setOrchestratorSetting } from "../orchestrator-settings.js";
 import { initSettingsTable } from "../runner-mode.js";
 import { FLY_MACHINE_PROFILE_DEFAULTS, mergeProfile, type FlyMachineProfileConfig } from "../restate/fly-machine-profile.js";
-import { initLogTable } from "../log.js";
+import { initLogTable, appendLog, updateJobStatus } from "../log.js";
+import { getDb } from "../dedup.js";
 import { getRestateStatus, setRestateStatus, resetRestateStatus } from "../restate/status.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import {
@@ -1089,6 +1091,34 @@ describe("get_tenant_health restate health field (AII-807)", () => {
     const parsed = JSON.parse(result.content[0].text) as { restate: unknown };
 
     expect(parsed.restate).toEqual({ sidecar: { state: "exited", code: 1, signal: null }, registration: { state: "unreachable" } });
+  });
+});
+
+describe("get_tenant_health awaitingDecisionCount (AII-1490)", () => {
+  const system: Caller = SYSTEM_ADMIN;
+  beforeAll(() => {
+    initLogTable();
+  });
+  afterEach(() => {
+    getDb().exec("DELETE FROM dispatch_log");
+  });
+
+  it("counts a held kg-refresh, not in flight, and drops it after the final close", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    const held = appendLog({ issueId: "kg-1", phase: "kg-refresh" });
+    updateJobStatus(held, "completed", "awaiting_decision");
+    const running = appendLog({ issueId: "kg-2", phase: "kg-refresh", status: "running" });
+    appendLog({ issueId: "impl-1", phase: "implementation", status: "completed" });
+    getDb().prepare("UPDATE dispatch_log SET status='completed', conclusion='awaiting_decision' WHERE issue_id='impl-1'").run();
+
+    const health = async () => JSON.parse((await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} })).content[0].text) as { awaitingDecisionCount: number; inFlightJobCount: number };
+    expect(await health()).toMatchObject({ awaitingDecisionCount: 1, inFlightJobCount: 1 });
+
+    const list = JSON.parse((await listInFlightJobs(fakeContext("list_in_flight_jobs"), { caller: system, args: {} })).content[0].text) as Array<{ id: number }>;
+    expect(list.map((j) => j.id)).toEqual([running]);
+
+    updateJobStatus(held, "completed", "passed");
+    expect(await health()).toMatchObject({ awaitingDecisionCount: 0 });
   });
 });
 
