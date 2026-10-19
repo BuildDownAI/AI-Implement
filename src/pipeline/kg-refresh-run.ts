@@ -12,6 +12,7 @@ import { cloneStep } from "./steps/clone.js";
 import { dependencyAuthStep } from "./steps/dependency-auth.js";
 import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError, KgSnapshotHeldError } from "./steps/kg-snapshot-push.js";
 import { kgTrackerDataStep, KgTrackerDataFetchError } from "./steps/kg-tracker-data.js";
+import { kgBaseMergeStep, KgBaseMergeError } from "./steps/kg-base-merge.js";
 import { kgScopeReconcileStep } from "./steps/kg-scope-reconcile.js";
 import { kgIngestStep, KgIngestError } from "./steps/kg-ingest.js";
 import { ClaudeCliExecutor } from "./executor.js";
@@ -22,7 +23,7 @@ import {
   resolveLogLevel,
   type ConfiguredRunOptions,
 } from "../run-autonomous.js";
-import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
+import type { ResolvedAgentSnapshotV1, RunConfigV1 } from "../run-config.js";
 import type { LLMExecutor, PipelineContext, StepReporter, StepModule } from "./types.js";
 
 
@@ -146,6 +147,7 @@ export interface RunKgRefreshOptions {
   stepsOverride?: {
     clone?: StepModule;
     dependencyAuth?: StepModule;
+    kgBaseMerge?: StepModule;
     kgScopeReconcile?: StepModule;
     kgTrackerData?: StepModule;
     kgIngest?: StepModule;
@@ -171,6 +173,7 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
   maxTurns: number | undefined;
   dependencyTokenScope: "installation" | undefined;
   kgDryRun: boolean;
+  kgBaseMerge: RunConfigV1["kgBaseMerge"];
   agentConfig: ResolvedAgentSnapshotV1 | undefined;
 } {
   const rawConfig = env.AI_IMPLEMENT_RUN_CONFIG;
@@ -182,6 +185,7 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
   let maxTurns: number | undefined;
   let dependencyTokenScope: "installation" | undefined;
   let kgDryRun = false;
+  let kgBaseMerge: RunConfigV1["kgBaseMerge"];
   let agentConfig: ResolvedAgentSnapshotV1 | undefined;
 
   if (rawConfig) {
@@ -197,6 +201,7 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
       }
       dependencyTokenScope = cfg.dependencyTokenScope;
       kgDryRun = cfg.kgDryRun === true;
+      kgBaseMerge = cfg.kgBaseMerge;
       agentConfig = cfg.agentConfig;
     } catch (err) {
       // An opted-in envelope is authoritative: malformed configured input never degrades to the legacy
@@ -229,6 +234,7 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
     maxTurns,
     dependencyTokenScope,
     kgDryRun,
+    kgBaseMerge,
     agentConfig,
   };
 }
@@ -251,6 +257,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     maxTurns,
     dependencyTokenScope,
     kgDryRun: kgDryRunFromConfig,
+    kgBaseMerge,
     agentConfig,
   } = resolveKgRefreshInputs(process.env);
 
@@ -292,6 +299,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
       callbackUrl: callbackUrl ?? undefined,
       dependencyTokenScope,
       kgDryRun,
+      kgBaseMerge,
     },
     configured
       ? configured.createExecutor({
@@ -322,6 +330,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     runner.register("clone", opts.stepsOverride?.clone ?? cloneStep);
     runner.register("dependency-auth", opts.stepsOverride?.dependencyAuth ?? dependencyAuthStep);
   }
+  runner.register("kg-base-merge", opts.stepsOverride?.kgBaseMerge ?? kgBaseMergeStep);
   runner.register("kg-scope-reconcile", opts.stepsOverride?.kgScopeReconcile ?? kgScopeReconcileStep);
   runner.register("kg-tracker-data", opts.stepsOverride?.kgTrackerData ?? kgTrackerDataStep);
   runner.register("kg-ingest", opts.stepsOverride?.kgIngest ?? kgIngestStep);
@@ -345,7 +354,10 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     const held = err instanceof KgSnapshotHeldError ? err : undefined;
     const isHeld = held !== undefined;
     const isIngestFailed = err instanceof KgIngestError;
-    const failureCode = isMissing
+    const baseMergeErr = err instanceof KgBaseMergeError ? err : undefined;
+    const failureCode = baseMergeErr
+      ? baseMergeErr.code
+      : isMissing
       ? "KG_SNAPSHOT_MISSING"
       : isStale
         ? "KG_SNAPSHOT_STALE"
@@ -359,6 +371,10 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
                 ? "KG_INGEST_FAILED"
                 : undefined;
     const failureReason = err instanceof Error ? err.message : String(err);
+    // A merge that succeeded before a later step failed must still be echoed, so the orchestrator can tell it from an old runner.
+    const mergedBeforeFailure = baseMergeErr
+      ? undefined
+      : (context.getOutputs("kg-base-merge").baseMerge as { headSha: string; result: "merged" } | undefined);
     console.error(`[kg-refresh] run failed: ${failureCode ?? "unknown"} — ${failureReason}`);
     await configured?.finish("failed");
     // A guard refusal from kg-snapshot-push carries its per-part table on the error
@@ -375,6 +391,17 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
       outcome: "failure",
       failureReason: failureReason.slice(-4000),
       ...(failureCode ? { failureCode } : {}),
+      ...(baseMergeErr?.result && kgBaseMerge
+        ? {
+            baseMerge: {
+              headSha: kgBaseMerge.headSha,
+              result: baseMergeErr.result,
+              ...(baseMergeErr.conflictPaths ? { conflictPaths: baseMergeErr.conflictPaths } : {}),
+            },
+          }
+        : mergedBeforeFailure
+          ? { baseMerge: mergedBeforeFailure }
+          : {}),
       ...(guardPartTable ? { guardVerdict: isHeld ? ("held" as const) : ("refused" as const), partTable: guardPartTable } : {}),
       // A held shrink already pushed its snapshot branch and opened the PR; report them so the orchestrator can act on it.
       ...(held
@@ -396,6 +423,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
 
   await configured?.finish("completed");
   const snapshotPushOutputs = context.getOutputs("kg-snapshot-push");
+  const baseMerge = context.getOutputs("kg-base-merge").baseMerge as { headSha: string; result: "merged" } | undefined;
   const sources = parseSourceResults(snapshotPushOutputs.sources);
   const warnings = Array.isArray(snapshotPushOutputs.warnings)
     ? snapshotPushOutputs.warnings.filter((w): w is string => typeof w === "string")
@@ -410,6 +438,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     ...(kgDryRun && (snapshotPushOutputs.guardVerdict === "clean" || snapshotPushOutputs.guardVerdict === "warnings")
       ? { guardVerdict: snapshotPushOutputs.guardVerdict, partTable: snapshotPushOutputs.partTable as Array<{ part: string; prev: string; new: string }> | undefined }
       : {}),
+    ...(baseMerge ? { baseMerge } : {}),
     ...(sources.length > 0 ? { sources } : {}),
     ...(warnings.length > 0 ? { warnings } : {}),
     callbackUrl,

@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import {
   fetchGate, stageGate, swapGate, verifyGate, revertRail,
   RailGateError, readServedStamp, readNamespace,
-  mergeSnapshotPr, deleteSnapshotBranch, closeSnapshotPr, postBaselineAcceptNote, postDryRunReport,
+  mergeSnapshotPr, deleteSnapshotBranch, closeSnapshotPr, postBaselineAcceptNote, postDryRunReport, baseMergeDetail,
   type KgRailDeps, type RailContext,
 } from "../kg-refresh-rail.js";
 import { COMPLETION_MARKER } from "../kg-sidecar.js";
@@ -511,6 +511,154 @@ describe("kg-refresh-rail", () => {
       await postDryRunReport(deps, report, outcome);
       expect(postOrUpdateStickyCommentFn).toHaveBeenCalledTimes(1);
       expect(setCommitStatusFn).toHaveBeenCalledWith("tok", "TestOrg", "test-kg", "sha123", expect.objectContaining({ state: "success" }));
+    });
+
+    describe("base-merge verdicts", () => {
+      const HEAD = "0123456789abcdef0123456789abcdef01234567";
+      const report: KgDryRunReportTarget = { repo: "TestOrg/test-kg", prNumber: 9, sha: "sha123" };
+      const base = { at: 0, stampBefore: null, stampAfter: null, dryRun: true } as const;
+      const run = async (outcome: RefreshOutcome) => {
+        const sticky = vi.fn(async () => {});
+        const status = vi.fn(async () => {});
+        await postDryRunReport(
+          makeDeps({ postOrUpdateStickyCommentFn: sticky as never, setCommitStatusFn: status as never }),
+          report, outcome,
+        );
+        const body = (sticky.mock.calls[0] as unknown[])[5] as string;
+        const st = (status.mock.calls[0] as unknown[])[4] as { state: string; description: string };
+        return { body, st };
+      };
+      const MERGED_LINE = "Base PR head 0123456789ab merged into TestOrg/test-kg@";
+
+      it("row 1: behind is Not checked and does not block", async () => {
+        const { body, st } = await run({
+          ...base, ok: false, failureCode: "KG_BASE_BEHIND", notChecked: true,
+          detail: "Not checked: the KG repo is behind the base template, so this PR could not be tested on its own. Merge the base into the KG repo first.",
+          baseMerge: { headSha: HEAD, result: "behind", conflictPaths: ["kg_ingest/cli.py"] },
+        });
+        expect(body).toContain("Not checked: the KG repo is behind the base template");
+        expect(body).toContain("- `kg_ingest/cli.py`");
+        expect(body).not.toContain("merged into");
+        expect(st).toEqual({ state: "success", context: "kg-refresh/dry-run", description: "Not checked: KG repo is behind base (upstream merge needed)" });
+      });
+
+      it("row 2: conflict fails with the file count, and lists at most 50 paths", async () => {
+        const conflictPaths = Array.from({ length: 60 }, (_, i) => `p${i}.py`);
+        const { body, st } = await run({
+          ...base, ok: false, failureCode: "KG_BASE_CONFLICT",
+          detail: "This PR conflicts with the KG repo's ingest code.",
+          baseMerge: { headSha: HEAD, result: "conflict", conflictPaths },
+        });
+        expect(body).toContain("This PR conflicts with the KG repo's ingest code.");
+        expect(body).toContain("- `p49.py`");
+        expect(body).not.toContain("`p50.py`");
+        expect(body).not.toContain("merged into");
+        expect(st.state).toBe("failure");
+        expect(st.description).toBe("PR conflicts with KG repo ingest code: 60 files");
+      });
+
+      it("row 2: missing conflictPaths renders 0 files", async () => {
+        const { st } = await run({ ...base, ok: false, failureCode: "KG_BASE_CONFLICT", detail: "x" });
+        expect(st.description).toBe("PR conflicts with KG repo ingest code: 0 files");
+      });
+
+      it("row 3: merged and ok keeps dry run passed with the part table", async () => {
+        const { body, st } = await run({
+          ...base, ok: true, detail: "dry run passed", baseMerge: { headSha: HEAD, result: "merged" },
+          partTable: [{ part: "a", prev: "1", new: "2" }],
+        });
+        expect(body).toContain("dry run passed");
+        expect(body).toContain("| a | 1 | 2 |");
+        expect(body).toContain(MERGED_LINE);
+        expect(st).toMatchObject({ state: "success", description: "dry run passed" });
+      });
+
+      it("row 4: merged guard refusal keeps the table and the shrink note", async () => {
+        const { body, st } = await run({
+          ...base, ok: false, detail: "dry run guard refused", baseMerge: { headSha: HEAD, result: "merged" },
+          partTable: [{ part: "a", prev: "9", new: "1" }],
+        });
+        expect(body).toContain("| a | 9 | 1 |");
+        expect(body).toContain("A shrink is accepted at the decision gate");
+        expect(body).toContain(MERGED_LINE);
+        expect(st).toMatchObject({ state: "failure", description: "dry run guard refused" });
+      });
+
+      it("row 5: another failure after a merge keeps its detail", async () => {
+        const { body, st } = await run({
+          ...base, ok: false, detail: "ingest crashed", failureCode: "KG_INGEST_FAILED",
+          baseMerge: { headSha: HEAD, result: "merged" },
+        });
+        expect(body).toContain("ingest crashed");
+        expect(body).toContain(MERGED_LINE);
+        expect(st).toMatchObject({ state: "failure", description: "ingest crashed" });
+      });
+
+      it("row 6: fetch failure fails, neutralizes the reason, and keeps the description short", async () => {
+        const { body, st } = await run({
+          ...base, ok: false, failureCode: "KG_BASE_FETCH_FAILED",
+          detail: `Could not fetch the base PR commits: \`${"bad `tick`\nline ".repeat(40).replace(/[`\n]+/g, " ")}\``,
+        });
+        expect(body).toContain("Could not fetch the base PR commits:");
+        expect(body).not.toContain("merged into");
+        expect(st).toEqual({ state: "failure", context: "kg-refresh/dry-run", description: "Base PR fetch failed" });
+      });
+
+      it("row 7: an old runner is Not checked and does not block", async () => {
+        const { body, st } = await run({
+          ...base, ok: true, notChecked: true,
+          detail: "Not checked: the runner image does not support base-template merges, so the KG repo ran without this PR.",
+        });
+        expect(body).toContain("Not checked: the runner image does not support base-template merges, so the KG repo ran without this PR.");
+        expect(body).not.toContain("dry run passed");
+        expect(body).not.toContain("merged into");
+        expect(st).toEqual({ state: "success", context: "kg-refresh/dry-run", description: "Not checked: runner image does not support base merges" });
+      });
+
+      it("row 7b: a failed run with no echo and no code fails before the base merge", async () => {
+        expect(baseMergeDetail({ ok: false, failureReason: "git clone failed (exit 128)" })).toEqual({
+          detail: "The dry run failed before it could test this PR: `git clone failed (exit 128)`",
+          baseMergeNotRun: true,
+        });
+        expect(baseMergeDetail({ ok: false })?.detail).toBe("The dry run failed before it could test this PR: `unknown`");
+        expect(baseMergeDetail({ ok: false, failureReason: "a`b`\nc" })?.detail).toBe("The dry run failed before it could test this PR: `a b c`");
+        expect(baseMergeDetail({ ok: false, failureCode: "KG_INGEST_FAILED", baseMerge: { result: "merged" } })).toBeNull();
+        expect(baseMergeDetail({ ok: true })).toMatchObject({ notChecked: true });
+        expect(baseMergeDetail({ ok: true })?.baseMergeNotRun).toBeUndefined();
+
+        const { body, st } = await run({
+          ...base, ok: false, baseMergeNotRun: true,
+          detail: "The dry run failed before it could test this PR: `git clone failed (exit 128)`",
+          partTable: [{ part: "a", prev: "1", new: "1" }],
+        });
+        expect(body).toContain("`git clone failed (exit 128)`");
+        expect(body).not.toContain("| part |");
+        expect(body).not.toContain("merged into");
+        expect(body).not.toContain("Not checked");
+        expect(st).toEqual({ state: "failure", context: "kg-refresh/dry-run", description: "Dry run failed before the base merge" });
+      });
+
+      it("row 8: a KG-repo PR failing without the marker keeps its part table and detail", async () => {
+        const { body, st } = await run({
+          ...base, ok: false, detail: "git clone failed (exit 128)", partTable: [{ part: "a", prev: "1", new: "1" }],
+        });
+        expect(body).toContain("| a | 1 | 1 |");
+        expect(st).toMatchObject({ state: "failure", description: "git clone failed (exit 128)" });
+      });
+
+      it("notChecked does not block, while a plain failure still does", async () => {
+        expect((await run({ ...base, ok: false, notChecked: true, detail: "x" })).st.state).toBe("success");
+        expect((await run({ ...base, ok: false, detail: "x" })).st.state).toBe("failure");
+      });
+
+      it("row 8: a KG-repo PR renders exactly as before", async () => {
+        const ok = await run({ ...base, ok: true, detail: "dry run passed", partTable: [{ part: "a", prev: "1", new: "1" }] });
+        expect(ok.body).toBe("## kg-refresh dry-run — sha123\n\ndry run passed\n\n| part | prev | new |\n| --- | --- | --- |\n| a | 1 | 1 |");
+        expect(ok.st).toEqual({ state: "success", context: "kg-refresh/dry-run", description: "dry run passed" });
+        const refused = await run({ ...base, ok: false, detail: "dry run guard refused", partTable: [{ part: "a", prev: "9", new: "1" }] });
+        expect(refused.body).toBe("## kg-refresh dry-run — sha123\n\ndry run guard refused\n\n| part | prev | new |\n| --- | --- | --- |\n| a | 9 | 1 |\n\nA shrink is accepted at the decision gate of the refresh that runs after this PR merges.");
+        expect(refused.st).toEqual({ state: "failure", context: "kg-refresh/dry-run", description: "dry run guard refused" });
+      });
     });
   });
 });

@@ -17,6 +17,22 @@ import type { FlyMachineProfileConfig } from "./fly-machine-profile.js";
 import { KG_REFRESH_WORKFLOW_FILE, launchKeptMachine, syncRowToMachineNonce, type KeptMachineFly } from "./kg-refresh-production.js";
 import type { KgDispatchResult } from "./kg-refresh-workflow.js";
 
+const MODEL_AUTH_REFUSED = "a KG refresh envelope carries model authentication";
+const MAX_DETAIL_LENGTH = 500;
+
+/** `HTTP <status>: <message>` from a GitHub 4xx. GitHub's body is untrusted text: take `message` from a JSON body,
+ *  else the raw body, and cap the whole detail. */
+function rejectionDetail(status: number | undefined, body: string | undefined): string {
+  let message = body ?? "";
+  try {
+    const parsed: unknown = JSON.parse(message);
+    if (parsed !== null && typeof parsed === "object" && typeof (parsed as { message?: unknown }).message === "string") {
+      message = (parsed as { message: string }).message;
+    }
+  } catch { /* not JSON: keep the raw body */ }
+  return `HTTP ${status}: ${message}`.slice(0, MAX_DETAIL_LENGTH);
+}
+
 export interface KgRefreshSendInput {
   envelope: RunConfigV1;
   tokens: { runToken: string; progressToken: string; publicationToken: string };
@@ -74,12 +90,12 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
     const executionMode = "fly-machines";
     if (input.envelope.agentConfig !== undefined || input.envelope.credentials?.modelAuthGrant !== undefined) {
       console.error("[kg-refresh] refused: a KG refresh envelope carries model authentication");
-      return { outcome: "rejected", jobId: null, executionMode: executionMode };
+      return { outcome: "rejected", jobId: null, executionMode, detail: MODEL_AUTH_REFUSED };
     }
     if (!config.flySessionsToken || !config.flySessionsApp) {
       // A definitive rejection: retrying cannot configure the app, and the workflow ends the run dispatch_rejected.
       console.error("[kg-refresh] fly-machines execution path selected but FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured");
-      return { outcome: "rejected", jobId: null, executionMode };
+      return { outcome: "rejected", jobId: null, executionMode, detail: "FLY_SESSIONS_TOKEN and FLY_SESSIONS_APP are not configured" };
     }
     const machineNonce = requireNonce(input);
     const repo = sourceRepo();
@@ -101,7 +117,7 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
         runnerImageExplicit: config.runnerImageExplicit,
       }) ?? config.sessionImage;
     } catch (err) {
-      if (err instanceof RunnerImageNotAllowedError) return { outcome: "rejected", jobId: null, executionMode };
+      if (err instanceof RunnerImageNotAllowedError) return { outcome: "rejected", jobId: null, executionMode, detail: err.message };
       throw err;
     }
     const machineConfig = buildSessionMachineConfig({
@@ -160,7 +176,7 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
     const executionMode = "local-docker";
     if (input.envelope.agentConfig !== undefined || input.envelope.credentials?.modelAuthGrant !== undefined) {
       console.error("[kg-refresh] refused: a KG refresh envelope carries model authentication");
-      return { outcome: "rejected", jobId: null, executionMode: executionMode };
+      return { outcome: "rejected", jobId: null, executionMode, detail: MODEL_AUTH_REFUSED };
     }
     if (!config.localRunnerImage) {
       throw new Error(
@@ -210,7 +226,7 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
     const executionMode = "github-actions";
     if (input.envelope.agentConfig !== undefined || input.envelope.credentials?.modelAuthGrant !== undefined) {
       console.error("[kg-refresh] refused: a KG refresh envelope carries model authentication");
-      return { outcome: "rejected", jobId: null, executionMode: executionMode };
+      return { outcome: "rejected", jobId: null, executionMode, detail: MODEL_AUTH_REFUSED };
     }
     const repo = sourceRepo();
     const encoded = encodeRunConfig(input.envelope);
@@ -223,7 +239,7 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
         defaultImage: config.sessionImage, runnerImageExplicit: config.runnerImageExplicit,
       });
     } catch (err) {
-      if (err instanceof RunnerImageNotAllowedError) return { outcome: "rejected", jobId: null, executionMode };
+      if (err instanceof RunnerImageNotAllowedError) return { outcome: "rejected", jobId: null, executionMode, detail: err.message };
       throw err;
     }
     const ref = input.envelope.kgSourceRef ?? defaultBranch ?? "main";
@@ -245,8 +261,15 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
       token, owner: repo.owner, repo: repo.repo, workflowFile: KG_REFRESH_WORKFLOW_FILE,
       ref, inputs, returnRunDetails: true,
     });
+    const outcome = result.outcome ?? (result.success ? "accepted" : "unknown");
+    let detail: string | undefined;
+    if (outcome === "rejected") {
+      detail = rejectionDetail(result.status, result.error);
+      console.error(`[kg-refresh] dispatch rejected by GitHub (HTTP ${result.status}) for ${repo.owner}/${repo.repo}@${ref}: ${detail}`);
+    }
     return {
-      outcome: result.outcome ?? (result.success ? "accepted" : "unknown"),
+      outcome,
+      ...(detail !== undefined && { detail }),
       runId: result.runId,
       runUrl: result.runUrl,
       // The GitHub run id once known; the workflow keys its own job row by dispatch id.

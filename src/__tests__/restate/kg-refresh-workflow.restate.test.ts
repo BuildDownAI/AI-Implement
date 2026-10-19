@@ -89,6 +89,8 @@ const GENERIC_FAILURE_REPORT: KgRefreshReportBody = {
 interface RunScenario {
   triggerId: string;
   dispatchOutcome: "accepted" | "rejected" | "unknown";
+  /** The rejection reason the sender reports. */
+  dispatchDetail?: string;
   runId?: number;
   executionMode: string;
   dispatchCalls: number;
@@ -476,6 +478,7 @@ describe("KgRefresh durable workflow", () => {
     }
     const result: KgDispatchResult = {
       outcome: scenario.dispatchOutcome, runId: scenario.runId,
+      ...(scenario.dispatchDetail !== undefined && { detail: scenario.dispatchDetail }),
       jobId: scenario.jobIdUnknown ? null : `job-${triggerId}`, executionMode: scenario.executionMode,
       ...(scenario.runId !== undefined ? { runUrl: `https://example.test/runs/${scenario.runId}` } : {}),
       ...(scenario.flyCreate ? { machineId: scenario.flyCreate.machineId, created: scenario.flyCreate.reused !== true, ...(scenario.flyCreate.app !== undefined && { app: scenario.flyCreate.app }) } : {}),
@@ -1980,10 +1983,11 @@ describe("KgRefresh durable workflow", () => {
     async (label) => {
       const env = envFor(label);
       const triggerId = newTriggerId();
-      makeScenario(triggerId, { dispatchOutcome: "rejected", executionMode: "github-actions" });
+      makeScenario(triggerId, { dispatchOutcome: "rejected", dispatchDetail: "HTTP 422: No ref found for: testing", executionMode: "github-actions" });
 
       const outcome = await runWorkflow(env.baseUrl(), triggerId);
       expect(outcome.ok).toBe(false);
+      expect(JSON.stringify(outcome)).toContain("dispatch was rejected: HTTP 422: No ref found for: testing");
       expect((await closeRowFor(triggerId)).conclusion).toBe("dispatch_rejected");
       const persisted = persistCalls.find((o) => o.dispatchId === triggerId);
       expect(persisted?.conclusion).toBe("dispatch_rejected");
@@ -2618,6 +2622,47 @@ describe("KgRefresh durable workflow", () => {
       expect((await closeRowFor(triggerId)).status).toBe("completed");
     },
     15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1482: a dry run with kgBaseMerge reports Not checked for a behind KG repo and for an old runner (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const kgBaseMerge = { repo: "Org/base", prNumber: 3, baseSha: "b".repeat(40), headSha: "c".repeat(40) };
+      const reportTarget = { repo: KG_SOURCE_REPO, prNumber: 8, sha: "d".repeat(40) };
+      const runCase = async (body: Record<string, unknown>) => {
+        const triggerId = newTriggerId();
+        makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+        const beforeStatus = setCommitStatusFn.mock.calls.length;
+        const beforeSticky = postOrUpdateStickyCommentFn.mock.calls.length;
+        const done = runWorkflow(env.baseUrl(), triggerId, { dryRun: true, report: reportTarget, kgBaseMerge });
+        await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", body);
+        await done;
+        return {
+          status: (setCommitStatusFn.mock.calls[beforeStatus] as unknown[])[4] as { state: string; description: string },
+          comment: (postOrUpdateStickyCommentFn.mock.calls[beforeSticky] as unknown[])[5] as string,
+        };
+      };
+
+      const behind = await runCase({
+        ok: false, failureCode: "KG_BASE_BEHIND",
+        baseMerge: { headSha: "c".repeat(40), result: "behind", conflictPaths: ["kg_ingest/cli.py"] },
+      });
+      expect(behind.status).toMatchObject({ state: "success", description: "Not checked: KG repo is behind base (upstream merge needed)" });
+      expect(behind.comment).toContain("`kg_ingest/cli.py`");
+
+      const old = await runCase({ ok: true });
+      expect(old.status).toMatchObject({ state: "success", description: "Not checked: runner image does not support base merges" });
+      expect(old.comment).toContain("the runner image does not support base-template merges");
+      expect(old.comment).not.toContain("dry run passed");
+
+      const early = await runCase({ ok: false, failureReason: "git clone failed (exit 128)" });
+      expect(early.status).toMatchObject({ state: "failure", description: "Dry run failed before the base merge" });
+      expect(early.comment).toContain("`git clone failed (exit 128)`");
+      expect(early.comment).not.toContain("Not checked");
+    },
+    30_000,
   );
 
   it.each(VARIANTS.map(([label]) => label))(

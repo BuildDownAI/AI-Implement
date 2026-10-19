@@ -30,7 +30,7 @@ flowchart TD
     O -->|"marker live"| O2["409 refresh-in-progress"]
     O -->|"one-way send"| W["KgRefresh.run\nreserve → dispatch"]
     W --> E["GitHub Actions, Fly Machine,\nor local Docker"]
-    E --> F["runner pipeline\nclone → kg-scope-reconcile → dependency-auth → clone-code-repo → clone-secondary-repos\n→ kg-tracker-data → kg-ingest → kg-snapshot-push"]
+    E --> F["runner pipeline\nclone → kg-base-merge → kg-scope-reconcile → dependency-auth → clone-code-repo → clone-secondary-repos\n→ kg-tracker-data → kg-ingest → kg-snapshot-push"]
     W --> T["wait: report | cancel | progress\nbootstrap deadline 10 min, total deadline 4 h\nGHA: watch the run's status;\nstarted evidence = status in_progress\nor the runner progress heartbeat, first wins"]
     F -->|"progress heartbeat"| T
     F -->|"POST /api/runner/result"| G["KgRefresh.report\nidempotency key = dispatch id"]
@@ -270,9 +270,20 @@ The `kg-ingest` step passes `--repos-root <workspaceDir>/repos` to `python -m kg
 
 The runner's `kg-snapshot-push` step pushes the snapshot branch with the primary token, exactly as the implement pipeline's `push` step does; there is no separate push-token endpoint. The publication token (§6) is the credential the runner exchanges for that scoped token.
 
+### Base merge step
+
+The `kg-base-merge` pipeline step (`src/pipeline/steps/kg-base-merge.ts`) runs right after `clone`. It answers a dry-run question for a PR on the base template repo: would the KG repo still build and pass the guards if it took this change? With no `kgBaseMerge` in the envelope it skips. With `kgBaseMerge` and a live run (`kgDryRun` not `true`) it throws `KG_BASE_MERGE_REFUSED` before any fetch, so a live run never builds a snapshot from code `main` lacks.
+
+Otherwise it fetches `baseSha` and `headSha` from the public base repo with no credential helper (failure: `KG_BASE_FETCH_FAILED`), then merges twice:
+
+1. **Baseline merge** of `baseSha`. An ingest-path conflict means the KG repo has drifted from base: `KG_BASE_BEHIND`, `baseMerge.result: "behind"`. The tree is then reset to `HEAD`.
+2. **PR merge** of `headSha`. An ingest-path conflict now belongs to the PR: `KG_BASE_CONFLICT`, `result: "conflict"`. Otherwise the merge is committed locally (never pushed) and the result is `merged`.
+
+A path rule applies after each merge. Ingest paths (`KG_BASE_INGEST_PATHS`: `kg_ingest/`, `kg_query/`, `ontology/`, `tests/`, `pyproject.toml`, `uv.lock`, `requirements.txt`, `requirements-oxigraph.txt`) keep their merged result and any conflict is reported. `sources.yml` and `snapshot/**` are always restored from `HEAD`, since they are per-repo content. Every other conflicted path (README, `.gitignore`, `.github/**`, docs) takes the KG repo's side. Reported conflict paths are capped at 50. The runner result echoes `baseMerge`, on failure as well as success.
+
 ### Scope endpoint
 
-The `kg-scope-reconcile` pipeline step (`src/pipeline/steps/kg-scope-reconcile.ts`) runs immediately after `clone`, before `dependency-auth`, and calls `POST /api/runner/kg-scope` once per refresh to fetch the orchestrator's full mapping set:
+The `kg-scope-reconcile` pipeline step (`src/pipeline/steps/kg-scope-reconcile.ts`) runs after `kg-base-merge` (order: `clone`, `kg-base-merge`, `kg-scope-reconcile`, `dependency-auth`) and calls `POST /api/runner/kg-scope` once per refresh to fetch the orchestrator's full mapping set:
 
 ```
 POST /api/runner/kg-scope
@@ -348,6 +359,12 @@ A scheduled refresh (AII-1432, [ADR 042](adr/042-a-pipeline-schedule-is-a-due-or
 
 PR-check dry runs (AII-730, AII-977) use the same object: `enqueueDryRun` runs one now or holds it in `pending`, and `release` submits the oldest held head. The verdict of a dry run is not stored: the workflow's `dry-run-report` step sets the commit status and posts its sticky comment on the PR's own head SHA, and nothing is read back. `forgetPr` clears the PR's held head on PR close. `forgetPr` also records the PR in a bounded `closedKeys` list, and `enqueueDryRun` answers `{ closed: true }` for a recorded PR (no state write, no send); the webhook never dry-runs the rail's own `kg-refresh/<stamp>` snapshot PRs (`rail_snapshot_pr`). The webhook has no sha dedup of its own: the delivery id is the `enqueueDryRun` idempotency key, and a held entry for the same PR is replaced. While the Restate registration is not `registered` (or the sidecar is not ready) the webhook does not send to `KgRepo` (AII-1405): `makeKgDryRunEnqueue` logs one line with the key and answers `unavailable`, so a PR push in that window gets no dry run and the next push runs one. There is no admin dry run: `POST /api/kg/refresh` and `trigger_kg_refresh` refuse `dryRun: true` and `acceptNewBaseline: true` with `option-removed` (400 / error), so a dry run always has a report target. Nothing is stored for a dry run without one; the `recordAdminDryRun` and `recordDryRunOutcome` handlers are no-ops kept until 2026-11-13 for dry-run workflows in flight at deploy, and `get_kg_status` has no `lastDryRun`. The `kg_refresh_dry_run_outcomes` settings row is deleted at boot (logged with its entry count).
 
+### Base-merge verdicts
+
+(AII-1482) For a dry run whose input carries `kgBaseMerge`, the workflow copies the runner's `failureCode` and `baseMerge` onto the outcome and derives the verdict (`baseMergeDetail`, `src/kg-refresh-rail.ts`): `KG_BASE_BEHIND` and a successful report with neither `baseMerge` nor a `KG_BASE_*` code (a runner that predates the merge) set `notChecked`, and the `kg-refresh/dry-run` status is `success` with a description starting `Not checked:` (a commit status has no neutral state, and a `failure` would block the base PR until the base is merged into the KG repo); `KG_BASE_CONFLICT` and `KG_BASE_FETCH_FAILED` are `failure`, and so is a failed report with neither echo nor code (a failure before `kg-base-merge`, or a non-conflict git error inside it): the status is `failure` with description `Dry run failed before the base merge`, and the comment shows the sanitized reason with no part table. A merged run keeps the ordinary passed/refused/failed rendering. A comment for a merged run names the merged commit (`Base PR head <12 chars> merged into <kgSourceRepo>@default branch`; the branch name is the literal text, as the rail does not know it); behind, conflict, fetch-failed and old-runner comments omit it, since the head was not merged. The runner echoes `baseMerge` on a failure that follows a successful merge (for example `KG_INGEST_FAILED`), so that failure is not mistaken for an old runner. Runner-supplied paths and reasons are rendered inside backticks, with at most 50 paths listed. A PR on the KG repo itself is unchanged.
+
+### Workflow steps
+
 `KgRefresh.run` then runs, each as a named `ctx.run`: `resolve` (computes the row record, including the one-time backend choice), `reserve` (inserts the `dispatch_log` row, §4), `envelope` (builds the `RunConfigV1`; the journaled envelope is the run's configuration record and every dispatch retry reuses it, and it carries no token), then per attempt `nonce-N` (container backends only: derives and arms the machine nonce), `dispatch-N` (mints the tokens, then dispatches through the sender table, up to three attempts, each preceded by an exact-title lookup), and `record-dispatch-N` (projects the journaled result onto the row). The dispatch uses `returnRunDetails: true`, so the workflow holds the **exact run identity** of the GitHub run; an `unknown` outcome is reconciled by exact run title, never by a second dispatch (§3). A `rejected` outcome ends the run with `dispatch_rejected`.
 
 ### The two deadlines and the watch
@@ -371,7 +388,7 @@ The runner's result callback reaches `KgRefresh.report` (§5, Callback). The fir
 
 | Report | Result |
 |---|---|
-| dry run (PR check only; the admin doors refuse `dryRun`) | `dry-run-report`, then `closed` (row `passed`, `warnings` for a dry run with skipped or failed sources, or `failed`); nothing is merged and the served graph is untouched. A dry run that fails before a report (rejected dispatch, timeout, lost run, cancel, workflow error) still records and posts a failure verdict for its PR, and writes neither the last-refresh record nor the operator notification |
+| dry run (PR check only; the admin doors refuse `dryRun`) | `dry-run-report`, then `closed` (row `passed`, `warnings` for a dry run with skipped or failed sources, or `failed`); nothing is merged and the served graph is untouched. A dry run that fails before a report (rejected dispatch, timeout, lost run, cancel, workflow error) still records and posts a failure verdict for its PR, and writes neither the last-refresh record nor the operator notification. A base-repo PR whose KG repo is behind base, or whose runner image predates `kg-base-merge`, ends with the "Not checked" verdict: commit status `success` with a description starting `Not checked:`, so it does not block the PR (see "Base-merge verdicts" below) |
 | `KG_SNAPSHOT_STALE` | `no-new-data`, a success outcome |
 | failure, or no `snapshotPr` / `snapshotCommit` | `failed`; a reported `snapshotPr` is closed unmerged and its branch deleted |
 | success with a snapshot | `merge` (merge commit, never squash), `delete-branch`, then the four rail gates |

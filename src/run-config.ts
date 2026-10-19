@@ -69,6 +69,16 @@ export interface RunConfigV1 {
   kgDryRun?: true;
   /** Branch to check out instead of the KG source repo's default branch (AII-633 PR-triggered dry-run). Absent = unchanged default-branch clone. */
   kgSourceRef?: string;
+  /**
+   * A base-template PR to merge into the KG scratch clone before ingest. Dry run only.
+   * The runner fetches both commits from the public repo with no token.
+   */
+  kgBaseMerge?: {
+    repo: string;     // owner/repo of the base template, e.g. "BuildDownAI/bd-knowledge-graph-base"
+    prNumber: number;
+    baseSha: string;  // pull_request.base.sha: the baseline merge
+    headSha: string;  // pull_request.head.sha: the PR under test
+  };
   branchPrefix?: string;
   skillsRepo?: string;
   runnerCallbackUrl?: string;
@@ -548,6 +558,7 @@ export interface KgRefreshRunConfigInput {
   dependencyTokenScope?: "installation";
   dryRun?: boolean;
   kgSourceRef?: string;
+  kgBaseMerge?: NonNullable<RunConfigV1["kgBaseMerge"]>;
 }
 
 /**
@@ -558,7 +569,10 @@ export interface KgRefreshRunConfigInput {
  */
 export function buildKgRefreshRunConfig(input: KgRefreshRunConfigInput): RunConfigV1 {
   const { kgSourceRepo, issueIdentifier, runnerCallbackUrl, dependencyTokenScope,
-    dryRun, kgSourceRef } = input;
+    dryRun, kgSourceRef, kgBaseMerge } = input;
+  if (kgBaseMerge && dryRun !== true) {
+    throw new Error("buildKgRefreshRunConfig: kgBaseMerge requires dryRun: a live refresh must not run on merged base code");
+  }
   return {
     v: 1,
     issue: { id: "kg-refresh", identifier: issueIdentifier, title: "KG ingest", description: "" },
@@ -568,7 +582,18 @@ export function buildKgRefreshRunConfig(input: KgRefreshRunConfigInput): RunConf
     ...(dependencyTokenScope != null ? { dependencyTokenScope } : {}),
     ...(dryRun ? { kgDryRun: true as const } : {}),
     ...(kgSourceRef ? { kgSourceRef } : {}),
+    ...(kgBaseMerge ? { kgBaseMerge } : {}),
   };
+}
+
+/** All-or-nothing: every member must be valid, or the whole field is dropped. */
+function isKgBaseMerge(value: unknown): value is NonNullable<RunConfigV1["kgBaseMerge"]> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const { repo, prNumber, baseSha, headSha } = value as Record<string, unknown>;
+  return typeof repo === "string" && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)
+    && typeof prNumber === "number" && Number.isInteger(prNumber) && prNumber > 0
+    && typeof baseSha === "string" && /^[0-9a-f]{40}$/.test(baseSha)
+    && typeof headSha === "string" && /^[0-9a-f]{40}$/.test(headSha);
 }
 
 function isNonEmptyStringArray(value: unknown): value is string[] {
@@ -598,7 +623,7 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   const { v, issue, prNumber, baseBranch, runnerPhase, branchPrefix, skillsRepo,
     runnerCallbackUrl, maxTurns, maxIterations, commentInstruction, sensitiveFiles,
     profiles, assigneeName, planningContext, groupingParent, dependencyTokenScope, kgSourceRepo,
-    kgDryRun, kgSourceRef, referenceRepos,
+    kgDryRun, kgSourceRef, kgBaseMerge, referenceRepos,
     reviewers, reviewProcess, trustedReviewAuthors, retryPolicy, reviewFix, agentConfig } = cfg;
   const out: RunConfigV1 = { v, issue };
   if (prNumber !== undefined) out.prNumber = prNumber;
@@ -619,6 +644,13 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   if (kgSourceRepo !== undefined) out.kgSourceRepo = kgSourceRepo;
   if (kgDryRun !== undefined) out.kgDryRun = kgDryRun;
   if (kgSourceRef !== undefined) out.kgSourceRef = kgSourceRef;
+  if (kgBaseMerge !== undefined) {
+    if (isKgBaseMerge(kgBaseMerge)) {
+      out.kgBaseMerge = { repo: kgBaseMerge.repo, prNumber: kgBaseMerge.prNumber, baseSha: kgBaseMerge.baseSha, headSha: kgBaseMerge.headSha };
+    } else {
+      console.warn("[run-config] Ignoring invalid kgBaseMerge field; no base PR will be merged");
+    }
+  }
   if (referenceRepos !== undefined) out.referenceRepos = referenceRepos;
   if (reviewers !== undefined) {
     if (isReviewerSelectionArray(reviewers)) {

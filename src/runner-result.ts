@@ -181,6 +181,13 @@ export async function postRunnerResult(params: {
   guardVerdict?: "clean" | "warnings" | "refused" | "held";
   /** Per-part {part, prev, new} table from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
   partTable?: Array<{ part: string; prev: string; new: string }>;
+  /** What the runner did with run_config.kgBaseMerge. Absent when the envelope had none, or the runner predates it. */
+  baseMerge?: {
+    headSha: string;
+    result: "merged" | "behind" | "conflict";
+    /** Ingest-path conflicts. Present for "behind" and "conflict". At most 50 entries. */
+    conflictPaths?: string[];
+  };
   /** Why a held kg-refresh waits: a content shrink or missing tracker data. */
   cause?: "shrink" | "tracker-missing" | "source-failed";
   /** Teams whose tracker fetch failed, for a held kg-refresh. */
@@ -260,6 +267,7 @@ export async function postRunnerResult(params: {
   if (params.snapshotBranch) body.snapshotBranch = params.snapshotBranch;
   if (params.guardVerdict) body.guardVerdict = params.guardVerdict;
   if (params.partTable) body.partTable = params.partTable;
+  if (params.baseMerge) body.baseMerge = params.baseMerge;
   if (params.cause) body.cause = params.cause;
   if (params.failedTeams) body.failedTeams = params.failedTeams;
   if (params.sources) body.sources = params.sources;

@@ -12,6 +12,7 @@ export type KgRepoDefinition = ReturnType<typeof createKgRepo>;
 /** The kg-refresh pipeline's step ids in order (`pipelines/kg-refresh.yml`); `status().runnerStep` reads one pair of step promises per id. */
 export const KG_REFRESH_RUNNER_STEPS = [
   "clone",
+  "kg-base-merge",
   "kg-scope-reconcile",
   "dependency-auth",
   "clone-code-repo",

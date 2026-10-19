@@ -33,6 +33,7 @@ import {
   discardStaging,
   mergeSnapshotPr,
   postDryRunReport,
+  baseMergeDetail,
   revertRail,
   stageGate,
   swapGate,
@@ -73,10 +74,21 @@ export const kgDryRunReportSchema = z.object({
   acceptBaseline: z.boolean().optional(), // tolerated for queued inputs; remove after 2026-12-01
 });
 
+/** A base-template PR to merge into the scratch clone (dry run only); mirrors `RunConfigV1.kgBaseMerge`. */
+export const kgBaseMergeSchema = z.object({
+  repo: z.string().min(1),
+  prNumber: z.number(),
+  baseSha: z.string().min(1),
+  headSha: z.string().min(1),
+}).strict();
+
+export type KgBaseMerge = z.infer<typeof kgBaseMergeSchema>;
+
 /** Options a caller may set on one refresh; `KgRepo.trigger` validates exactly these. */
 export const kgRefreshOptionsSchema = z.object({
   dryRun: z.boolean().optional(),
   kgSourceRef: z.string().optional(),
+  kgBaseMerge: kgBaseMergeSchema.optional(),
   acceptNewBaseline: z.boolean().optional(), // tolerated for in-flight inputs; remove after 2026-11-13
   actorEmail: z.string().optional(),
 }).strict();
@@ -105,6 +117,13 @@ export interface KgRefreshReportBody {
   snapshotCommit?: string;
   snapshotBranch?: string;
   partTable?: Array<{ part: string; prev: string; new: string }>;
+  /** What the runner did with run_config.kgBaseMerge. Absent when the envelope had none, or the runner predates it. */
+  baseMerge?: {
+    headSha: string;
+    result: "merged" | "behind" | "conflict";
+    /** Ingest-path conflicts. Present for "behind" and "conflict". At most 50 entries. */
+    conflictPaths?: string[];
+  };
   /** Absent on a report from a runner that predates the field; reads as "shrink". */
   cause?: "shrink" | "tracker-missing" | "source-failed";
   failedTeams?: string[];
@@ -196,6 +215,8 @@ export interface KgDispatchResult {
   /** The backend's job id when it reported one; `null` means unknown (the workflow keys its own row by dispatch id). */
   jobId: string | null;
   executionMode: string;
+  /** A human-readable rejection reason; set only when `outcome` is `"rejected"`. */
+  detail?: string;
   /** The kept Fly machine the run executes on; null or absent for GHA and local Docker. */
   machineId?: string | null;
   /** True when the dispatch created the machine, so the workflow must `attach` it. */
@@ -631,6 +652,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             outcome: result.outcome, runId: result.runId, runUrl: result.runUrl,
             jobId: result.jobId, executionMode: result.executionMode,
             machineId: result.machineId ?? null, created: result.created === true,
+            ...(result.detail !== undefined && { detail: result.detail }),
             ...(result.app !== undefined && { app: result.app }),
             ...(result.replaced !== undefined && { replaced: result.replaced }),
           };
@@ -661,7 +683,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       if (dispatchResult.outcome === "rejected") {
         ctx.set("step", "failed");
         const at = await ctx.date.now();
-        const outcome = await failurePath(buildFailureOutcome(at, "dispatch was rejected"), "dispatch_rejected");
+        const outcome = await failurePath(buildFailureOutcome(at, dispatchResult.detail !== undefined ? `dispatch was rejected: ${dispatchResult.detail}` : "dispatch was rejected"), "dispatch_rejected");
         return finish(outcome);
       }
 
@@ -960,6 +982,16 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           ok: report.ok, at, detail: report.failureReason ?? (report.ok ? "dry run passed" : "dry run guard refused"),
           stampBefore: null, stampAfter: null, dryRun: true, partTable: report.partTable,
         };
+        if (report.failureCode) outcome.failureCode = report.failureCode;
+        if (report.baseMerge) outcome.baseMerge = report.baseMerge;
+        if (input.kgBaseMerge) {
+          const verdict = baseMergeDetail(report);
+          if (verdict) {
+            outcome.detail = verdict.detail;
+            if (verdict.notChecked) outcome.notChecked = true;
+            if (verdict.baseMergeNotRun) outcome.baseMergeNotRun = true;
+          }
+        }
         if (stepTable.length > 0) outcome.steps = stepTable;
         if (reportedSources.length > 0) outcome.sources = reportedSources;
         if (reportedWarnings.length > 0) outcome.warnings = reportedWarnings;
