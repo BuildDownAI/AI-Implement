@@ -262,6 +262,7 @@ describe("kg-refresh schedule rules", () => {
     await s.w.setBusy({ busy: false });
     expect(await s.check()).toEqual({ action: "started" });
     expect(s.w.toolCalls).toHaveLength(2);
+    // A negative: no second cancel may follow. Nothing is awaitable for an event that must not happen.
     await settle(500);
     expect(s.w.cancels).toHaveLength(1);
   }, 30_000);
@@ -291,6 +292,7 @@ describe("kg-refresh schedule rules", () => {
     await eventually(() => s.w.cancels, (c) => c.length >= 1, { label: "resumed run started" });
     expect(await s.check()).toEqual({ action: "none" });
     expect(s.w.calls().filter((c) => c.startsWith("replace"))).toEqual([]);
+    // A negative: no superseding cancel may follow the accept's resume; there is no event to wait on.
     await settle(500);
     // Only the accept's own resume was recorded, with no superseded reason.
     expect(s.w.cancels).toEqual([{ runId, reason: undefined }]);
