@@ -45,7 +45,7 @@ import {
 import { queryNonCompletedInvocations } from "../../restate/endpoint.js";
 import { registerOwnedRunContract } from "./owned-run-contract.js";
 import {
-  VARIANTS, attachWorkflow, callObject, callService, callWorkflow, cancelInvocation, eventually, gate, queryInvocations, replaceEndpoint, settle,
+  VARIANTS, attachWorkflow, callObject, callService, callWorkflow, cancelInvocation, eventually, gate, queryInvocations, replaceEndpoint, setObjectStates, settle,
   startRetryEnabled, startVariants, stopAll, type Gate,
   journalEntries,
   waitForStep,
@@ -342,6 +342,7 @@ describe("KgRefresh durable workflow", () => {
   const persistCalls: RefreshOutcome[] = [];
   const onOutcomeCalls: Array<{ kind: "success" | "no-new-data" | "failure"; outcome: RefreshOutcome; meta: { failureCode?: string; timedOut?: boolean; dispatchId?: string } }> = [];
   let runIdCounter = 9_000;
+  let heldRowPark: { jobId: string; gate: ReturnType<typeof gate> } | null = null;
   /** This scenario's own close rows: the workflow closes its job log under the trigger id. */
   const closeRowsFor = (triggerId: string) => closeRowCalls.filter((c) => c.jobId === triggerId);
   /** Waits for this scenario's close row and returns the latest one, so another scenario's late close cannot be read. */
@@ -585,7 +586,11 @@ describe("KgRefresh durable workflow", () => {
       // The step awaits what its closure returns, so a parked reserve is a returned promise.
       if (reserveHold) return reserveHold as unknown as void;
     },
-    closeJobLog: (jobId, status, conclusion) => { closeRowCalls.push({ jobId, status, conclusion }); },
+    closeJobLog: async (jobId, status, conclusion) => {
+      closeRowCalls.push({ jobId, status, conclusion });
+      // Parks the gate run between `step = held` and the hold being stored, so a test acts inside that window.
+      if (conclusion === "awaiting_decision" && heldRowPark?.jobId === jobId) await heldRowPark.gate.wait();
+    },
     getWorkflowRunStatus: getWorkflowRunStatusFn,
     findRunByTitle: findRunByTitleFn,
     cancelWorkflowRun: cancelWorkflowRunFn,
@@ -3376,10 +3381,11 @@ describe("KgRefresh durable workflow", () => {
 
     const readStatus = (baseUrl: string, triggerId: string) =>
       callWorkflow<{ step: string | null }>(baseUrl, "KgRefresh", triggerId, "status", {});
+    /** Completed invocations of a handler: a send that was only enqueued does not count. */
     const countSends = async (env: RestateEnvironment, service: string, key: string, handler: string) =>
       (await queryInvocations(
         env.adminAPIBaseUrl(),
-        `target_service_name = '${service}' AND target_service_key = '${key}' AND target_handler_name = '${handler}'`,
+        `target_service_name = '${service}' AND target_service_key = '${key}' AND target_handler_name = '${handler}' AND status = 'completed'`,
       )).length;
     /** Invocations of one target that have not completed. */
     const openInvocations = (env: RestateEnvironment, where: string) =>
@@ -3391,9 +3397,20 @@ describe("KgRefresh durable workflow", () => {
         `target_service_name = 'KgRepo' AND target_service_key = '${KG_SOURCE_REPO}' AND target_handler_name = 'decide' AND status = 'scheduled'`,
       )).length;
 
+    /** Sent invocations of a handler, completed or not: a send the run journaled exists as soon as the run ends. */
+    const sentInvocations = async (env: RestateEnvironment, service: string, key: string, handler: string) =>
+      (await queryInvocations(
+        env.adminAPIBaseUrl(),
+        `target_service_name = '${service}' AND target_service_key = '${key}' AND target_handler_name = '${handler}'`,
+      )).length;
     /** `KgRepo.decide`, the one decision door. */
     const decideRepo = (env: RestateEnvironment, body: Record<string, unknown>) =>
       callObject<{ triggerId: string } | null>(env.baseUrl(), "KgRepo", KG_SOURCE_REPO, "decide", body);
+    /**
+     * A barrier on `KgRepo`'s exclusive queue: a stale timeout is a no-op, and it returns only after every handler already sent
+     * to the object (a run's `release`, a one-way `decide`) has run. Reading state after it needs no polling.
+     */
+    const afterReleases = (env: RestateEnvironment) => decideRepo(env, { action: "timeout", triggerId: "barrier" });
     /** Decides the hold `gateId` and waits for the resumed run to end; returns its trigger id and outcome. */
     async function decideAndAttach(env: RestateEnvironment, gateId: string, body: Record<string, unknown>) {
       const resumed = (await decideRepo(env, { triggerId: gateId, ...body }))!.triggerId;
@@ -3410,6 +3427,8 @@ describe("KgRefresh durable workflow", () => {
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", opts.report ?? HELD_REPORT);
       const gateOutcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
       expect(gateOutcome).toMatchObject({ ok: false, conclusion: "awaiting_decision", held: true });
+      // The gate run's `release` and the `watch` that follows the run are already sent: settle the queue before anything reads it.
+      await afterReleases(env);
       expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, held: { snapshotPr: 77 } });
       return triggerId;
     }
@@ -3422,19 +3441,16 @@ describe("KgRefresh durable workflow", () => {
         const beforeMerge = mergePullRequestFn.mock.calls.length;
         const beforePersist = persistCalls.length;
         const timersBefore = await scheduledDecides(env);
+        const repoReleasesBefore = await countSends(env, "KgRepo", KG_SOURCE_REPO, "release");
         const triggerId = await holdRun(env);
 
         expect(await openInvocations(env, `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}'`)).toEqual([]);
-        await eventually(
-          () => openInvocations(env, `target_service_name = 'KgRepo' AND target_handler_name = 'watch'`),
-          (open) => open.length === 0,
-          { label: "no watch stays open" },
-        );
         expect((await scheduledDecides(env)) - timersBefore).toBe(1);
-        await eventually(() => countSends(env, "FlyMachineProfile", "kg-refresh", "release"), (n) => n >= 1, { label: "machine release" });
-        // The gate run's own release reaches KgRepo and leaves the held lock alone.
-        await eventually(() => countSends(env, "KgRepo", KG_SOURCE_REPO, "release"), (n) => n >= 1, { label: "gate release" });
-        await settle(300);
+        // The gate run's `finally` release and the `watch` release both completed, and both left the held lock alone.
+        expect((await countSends(env, "KgRepo", KG_SOURCE_REPO, "release")) - repoReleasesBefore).toBe(2);
+        expect(await sentInvocations(env, "FlyMachineProfile", "kg-refresh", "release")).toBeGreaterThanOrEqual(1);
+        // The watch's release is its last act, so once both releases completed no watch is left open.
+        expect(await openInvocations(env, `target_service_name = 'KgRepo' AND target_handler_name = 'watch'`)).toEqual([]);
         expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, held: { snapshotPr: 77 } });
         expect(await triggerViaKgRepo(env.baseUrl())).toMatchObject({ status: "refresh-in-progress", triggerId });
         expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
@@ -3475,8 +3491,8 @@ describe("KgRefresh durable workflow", () => {
         expect(gateOrder).toEqual(["fetch", "stage", "swap", "verify"]);
         // The gate close came first and the final close last: a late awaiting_decision can never overwrite the result.
         expect(closeRowsFor(triggerId).map((r) => [r.status, r.conclusion])).toEqual([["completed", "awaiting_decision"], ["completed", "passed"]]);
-        await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "marker cleared" });
-        await settle(300);
+        await afterReleases(env);
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
         expect(await runReleases(env, resumed)).toBe(1);
       },
       60_000,
@@ -3491,10 +3507,15 @@ describe("KgRefresh durable workflow", () => {
         const first = await decideTool(env, "accept", { triggerId });
         expect(first.isError).toBe(false);
         expect(JSON.parse(first.text)).toEqual({ decided: "accept" });
+        // The accept resumed the hold as a new run, which holds the marker until it ends.
+        const resumed = (await kgRepoStatus(env.baseUrl()))!.triggerId;
+        expect(resumed).not.toBe(triggerId);
         expect(await decideTool(env, "accept", { triggerId })).toEqual({ isError: true, text: "no-decision-open" });
-        await eventually(() => closeRowsFor(triggerId).at(-1)?.conclusion, (c) => c === "passed", { label: "final row" });
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", resumed);
+        expect(closeRowsFor(triggerId).at(-1)?.conclusion).toBe("passed");
         expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
-        await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "marker cleared" });
+        await afterReleases(env);
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
         expect(await decideTool(env, "accept")).toEqual({ isError: true, text: "no-refresh-in-flight" });
       },
       60_000,
@@ -3519,8 +3540,8 @@ describe("KgRefresh durable workflow", () => {
         expect(await closeRowFor(triggerId)).toMatchObject({ status: "failed", conclusion: "operator_cancelled" });
         expect(persistCalls.at(-1)).toMatchObject({ ok: false, conclusion: "operator_cancelled", held: true });
         expect(outcomesFor(triggerId)).toHaveLength(0);
-        await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "marker cleared" });
-        await settle(300);
+        await afterReleases(env);
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
         expect(await runReleases(env, resumed)).toBe(1);
         expect(await countSends(env, "FlyMachineProfile", "kg-refresh", "release")).toBeGreaterThanOrEqual(1);
       },
@@ -3541,8 +3562,8 @@ describe("KgRefresh durable workflow", () => {
         expect(comment).toContain("decision_timeout");
         expect(closeRowsFor(triggerId).map((r) => r.conclusion)).toEqual(["awaiting_decision", "decision_timeout"]);
         expect(outcomesFor(triggerId).map((c) => c.meta.failureCode)).toEqual(["decision_timeout"]);
-        await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "marker cleared" });
-        await settle(300);
+        await afterReleases(env);
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
         expect(await runReleases(env, resumed)).toBe(1);
       },
       60_000,
@@ -3574,13 +3595,9 @@ describe("KgRefresh durable workflow", () => {
       const uri = `http://127.0.0.1:${env.endpointPort()}`;
       // The hold is state plus a scheduled timer: no run, no watch, and nothing the drain counts.
       expect(await openInvocations(env, `target_service_name = 'KgRefresh' AND target_service_key = '${gateId}'`)).toEqual([]);
-      await eventually(
-        () => openInvocations(env, `target_service_name = 'KgRepo' AND target_handler_name = 'watch'`),
-        (open) => open.length === 0,
-        { label: "no watch stays open" },
-      );
+      expect(await openInvocations(env, `target_service_name = 'KgRepo' AND target_handler_name = 'watch'`)).toEqual([]);
       expect(await scheduledDecides(env)).toBeGreaterThanOrEqual(1);
-      expect(await eventually(() => queryNonCompletedInvocations(fetch, env.adminAPIBaseUrl(), uri), (n) => n === 0, { label: "nothing to drain" })).toBe(0);
+      expect(await queryNonCompletedInvocations(fetch, env.adminAPIBaseUrl(), uri)).toBe(0);
       // The row-side drain signal (getInFlightWork) is covered against the real log in deploy.test.ts.
 
       const before = await deployedServices(env, uri);
@@ -3615,8 +3632,8 @@ describe("KgRefresh durable workflow", () => {
         expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
         expect(gateOrder).toEqual(["fetch", "stage", "swap", "verify"]);
         expect(closeRowsFor(triggerId).map((r) => [r.status, r.conclusion])).toEqual([["completed", "awaiting_decision"], ["completed", "passed"]]);
-        await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "marker cleared" });
-        await settle(300);
+        await afterReleases(env);
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
         expect(await runReleases(env, resumed)).toBe(1);
       },
       90_000,
@@ -3635,8 +3652,8 @@ describe("KgRefresh durable workflow", () => {
         expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
         expect(postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!).toContain("operator_cancelled");
         expect(closeRowsFor(triggerId).map((r) => r.conclusion)).toEqual(["awaiting_decision", "operator_cancelled"]);
-        await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "marker cleared" });
-        await settle(300);
+        await afterReleases(env);
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
         expect(await runReleases(env, resumed)).toBe(1);
       },
       90_000,
@@ -3655,8 +3672,8 @@ describe("KgRefresh durable workflow", () => {
         expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
         expect(postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!).toContain("decision_timeout");
         expect(closeRowsFor(triggerId).map((r) => r.conclusion)).toEqual(["awaiting_decision", "decision_timeout"]);
-        await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "marker cleared" });
-        await settle(300);
+        await afterReleases(env);
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
         expect(await runReleases(env, resumed)).toBe(1);
       },
       90_000,
@@ -3681,7 +3698,8 @@ describe("KgRefresh durable workflow", () => {
         expect(await decideRepo(env, { action: "timeout", triggerId: first })).toBeNull();
 
         // A newer hold is untouched by the first hold's timer.
-        await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "marker cleared" });
+        await afterReleases(env);
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
         const second = await holdRun(env);
         expect(await decideRepo(env, { action: "timeout", triggerId: first })).toBeNull();
         expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId: second, held: { snapshotPr: 77 } });
@@ -4055,14 +4073,14 @@ describe("KgRefresh durable workflow", () => {
       return held;
     };
     /** Accepts the hold with the note parked, runs `during` on the resumed run while it waits, then lets it go. */
-    async function acceptThenDuring(env: RestateEnvironment, during: (resumed: string) => Promise<void>) {
+    async function acceptThenDuring(env: RestateEnvironment, during: (resumed: string, dispatchId: string) => Promise<void>) {
       const dispatchId = await holdRun(env);
       const held = holdAcceptNote();
       let resumed!: string;
       try {
         resumed = (await decideRepo(env, { ...ACCEPT, triggerId: dispatchId }))!.triggerId;
         await held.reached();
-        await during(resumed);
+        await during(resumed, dispatchId);
       } finally {
         held.release();
       }
@@ -4124,11 +4142,13 @@ describe("KgRefresh durable workflow", () => {
       await expectStoppedBeforeMerge(env, resumed, dispatchId, beforeMerge, beforeClose);
     }, 60_000);
 
-    it.each(LABELS)("a schedule's superseded cancel after an accept does not stop the run: the person's accept wins and the merge runs (%s)", async (label) => {
+    it.each(LABELS)("a schedule's replace after an accept finds no hold: it answers no-decision-open and the merge runs (%s)", async (label) => {
       const env = heldEnvs.get(label)!;
       const beforeClose = closePullRequestFn.mock.calls.length;
       const beforeMerge = mergePullRequestFn.mock.calls.length;
-      const { dispatchId, resumed } = await acceptThenDuring(env, (r) => callWorkflow(env.baseUrl(), "KgRefresh", r, "cancel", { reason: "superseded_by_schedule" }));
+      const { dispatchId, resumed } = await acceptThenDuring(env, async (_r, gateId) => {
+        await expect(decideRepo(env, { action: "cancel", triggerId: gateId, reason: "superseded_by_schedule" })).rejects.toThrow(/409.*no-decision-open/);
+      });
       await expectRunSucceeded(env, resumed);
       expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
       expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(0);
@@ -4136,11 +4156,13 @@ describe("KgRefresh durable workflow", () => {
       expect(await closeRowFor(dispatchId)).toMatchObject({ status: "completed" });
     }, 60_000);
 
-    it.each(LABELS)("after the accept wins over a schedule's cancel, a later cancel and decide_kg_refresh cancel answer past-merge and the run succeeds (%s)", async (label) => {
+    it.each(LABELS)("after a schedule's replace finds no hold, a later cancel and decide_kg_refresh cancel answer past-merge and the run succeeds (%s)", async (label) => {
       const env = heldEnvs.get(label)!;
       mergeDelayMs = 1_500;
       const beforeMerge = mergePullRequestFn.mock.calls.length;
-      const { resumed } = await acceptThenDuring(env, (r) => callWorkflow(env.baseUrl(), "KgRefresh", r, "cancel", { reason: "superseded_by_schedule" }));
+      const { resumed } = await acceptThenDuring(env, async (_r, gateId) => {
+        await expect(decideRepo(env, { action: "cancel", triggerId: gateId, reason: "superseded_by_schedule" })).rejects.toThrow(/409.*no-decision-open/);
+      });
       await eventually(() => mergePullRequestFn.mock.calls.length - beforeMerge, (n) => n >= 1, { label: "the merge call" });
       await expect(callWorkflow(env.baseUrl(), "KgRefresh", resumed, "cancel", { reason: "stop" })).rejects.toThrow(/409.*past-merge/);
       expect(await decideTool(env, "cancel")).toEqual({ isError: true, text: "past-merge" });
@@ -4191,6 +4213,101 @@ describe("KgRefresh durable workflow", () => {
       // A finished run answers no-refresh-in-flight, not past-merge, so the Stop route can stamp a stuck row.
       await expect(callWorkflow(env.baseUrl(), "KgRefresh", resumed, "cancel", { reason: "stop" })).rejects.toThrow(/409.*no-refresh-in-flight/);
     }, 60_000);
+
+    it.each(LABELS)("a gate run whose lock was taken ends failed/workflow_error with its PR closed, never as an operator cancel (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const beforeComments = postPrCommentFn.mock.calls.length;
+      const triggerId = ((await triggerViaKgRepo(env.baseUrl())) as { triggerId: string }).triggerId;
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      await workflowDispatched(triggerId);
+      // Another trigger owns the marker, so `hold` answers lock-lost.
+      await setObjectStates(env.adminAPIBaseUrl(), "KgRepo", KG_SOURCE_REPO, { inFlight: { triggerId: "someone-else", startedAt: Date.now() } });
+      try {
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", HELD_REPORT);
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        expect(outcome.ok).toBe(false);
+        expect(outcome.conclusion).not.toBe("operator_cancelled");
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        expect(postPrCommentFn.mock.calls.slice(beforeComments).map((c) => String((c as unknown[])[4])).join("\n")).toContain("workflow_error");
+        expect(closeRowsFor(triggerId).map((r) => r.conclusion)).toEqual(["awaiting_decision", "workflow_error"]);
+        expect(persistCalls.at(-1)).toMatchObject({ ok: false });
+        expect(persistCalls.at(-1)?.conclusion).not.toBe("operator_cancelled");
+      } finally {
+        await setObjectStates(env.adminAPIBaseUrl(), "KgRepo", KG_SOURCE_REPO, {});
+      }
+    }, 60_000);
+
+    /** Reaches the window after `step` is held and before the hold is stored, runs `stop`, then lets the gate run finish. */
+    async function stopInsideGate(env: RestateEnvironment, stop: (triggerId: string) => Promise<void>): Promise<string> {
+      const triggerId = ((await triggerViaKgRepo(env.baseUrl())) as { triggerId: string }).triggerId;
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      await workflowDispatched(triggerId);
+      const park = gate("held row close");
+      heldRowPark = { jobId: triggerId, gate: park };
+      try {
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", HELD_REPORT);
+        await park.reached();
+        expect(await readStatus(env.baseUrl(), triggerId)).toMatchObject({ step: "held" });
+        await stop(triggerId);
+      } finally {
+        park.release();
+        heldRowPark = null;
+      }
+      await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+      return triggerId;
+    }
+
+    /** A Stop that reached the gate run is read after `hold` and sent through the decision door: the resumed run closes the hold. */
+    async function expectStoppedHold(env: RestateEnvironment, gateId: string, beforeClose: number): Promise<void> {
+      // The decide went out as a one-way send before the gate run ended, so the barrier returns after it ran: the marker names the resumed run.
+      await afterReleases(env);
+      const resumed = (await kgRepoStatus(env.baseUrl()))!.triggerId;
+      expect(resumed).not.toBe(gateId);
+      await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", resumed);
+      expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+      expect(closeRowsFor(gateId).map((r) => r.conclusion)).toEqual(["awaiting_decision", "operator_cancelled"]);
+    }
+
+    it.each(LABELS)("a Stop sent to the workflow once step is held cancels the hold through KgRepo.decide: PR closed, row closed once (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const gateId = await stopInsideGate(env, async (id) => {
+        await callWorkflow(env.baseUrl(), "KgRefresh", id, "cancel", { reason: "stop" });
+      });
+      await expectStoppedHold(env, gateId, beforeClose);
+    }, 60_000);
+
+    it.each(LABELS)("a tool Cancel with no triggerId that races the gate stops the hold and answers success (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const gateId = await stopInsideGate(env, async () => {
+        expect(JSON.parse((await decideTool(env, "cancel")).text)).toEqual({ cancelled: true });
+      });
+      await expectStoppedHold(env, gateId, beforeClose);
+    }, 60_000);
+
+    it("the timer a real KgRefresh armed fires by itself: a zero timeout decides the hold as decision_timeout in a new run", async () => {
+      const zero = createKgRefreshWorkflow({ ...workflowDeps, bootstrapDeadlineMs: 30_000, totalDeadlineMs: 60_000, decisionTimeoutMs: 0 });
+      const env = await startRetryEnabled([zero, kgRepo, starter, flyMachineProfile]);
+      try {
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const triggerId = ((await triggerViaKgRepo(env.baseUrl())) as { triggerId: string }).triggerId;
+        makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+        await workflowDispatched(triggerId);
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", HELD_REPORT);
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        // The timer is a scheduled send due at once: it fires with no caller, and the barrier returns after it ran.
+        await decideRepo(env, { action: "timeout", triggerId: "barrier" });
+        const resumed = (await kgRepoStatus(env.baseUrl()))!.triggerId;
+        expect(resumed).not.toBe(triggerId);
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", resumed);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        expect(closeRowsFor(triggerId).map((r) => r.conclusion)).toEqual(["awaiting_decision", "decision_timeout"]);
+      } finally {
+        await env.stop();
+      }
+    }, 90_000);
 
     it("a restart of the endpoint after the gate keeps the hold: no run to replay, the lock and the hold stay, and a decision still resumes it", async () => {
       const env = await startRetryEnabled([heldWorkflow, kgRepo, starter, flyMachineProfile]);

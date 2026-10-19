@@ -1539,6 +1539,15 @@ describe("migrated write handlers (AII-713)", () => {
       expect(cancel).not.toHaveBeenCalled();
     });
 
+    it("cancels a hold stored after the first decide through KgRepo.decide, not the workflow cancel", async () => {
+      decide.mockRejectedValueOnce(terminal(409, "no-decision-open")).mockResolvedValueOnce(undefined);
+      status.mockResolvedValue({ triggerId: "trig-1", startedAt: 1, held: { triggerId: "trig-1" } });
+      expect(answer(await call({ action: "cancel" }))).toEqual({ isError: false, text: JSON.stringify({ cancelled: true }, null, 2) });
+      expect(decide).toHaveBeenCalledTimes(2);
+      expect(decide).toHaveBeenLastCalledWith({ action: "cancel", actor: "ada@example.com", triggerId: "trig-1" });
+      expect(cancel).not.toHaveBeenCalled();
+    });
+
     it("does not report success or a conflict when Restate is unavailable", async () => {
       decide.mockRejectedValue(new Error("connect ECONNREFUSED"));
       await expect(call({ action: "accept" })).resolves.toMatchObject({ isError: true });
