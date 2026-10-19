@@ -10,20 +10,21 @@ vi.mock("node:child_process", () => ({
   spawnSync: vi.fn(),
 }));
 
-// Make existsSync return true for the workspace path.
+// Make existsSync return true for the workspace path. Each default is the spy's own implementation, so a reset
+// returns a spy to it.
 vi.mock("node:fs", () => ({
-  default: { existsSync: vi.fn().mockReturnValue(true) },
-  existsSync: vi.fn().mockReturnValue(true),
+  default: { existsSync: vi.fn(() => true) },
+  existsSync: vi.fn(() => true),
 }));
 
 // Prevent real filesystem writes for the artifacts directory.
 vi.mock("node:fs/promises", () => ({
-  chmod: vi.fn().mockResolvedValue(undefined),
-  mkdtemp: vi.fn().mockResolvedValue("/tmp/source-copy-root"),
-  mkdir: vi.fn().mockResolvedValue(undefined),
-  readFile: vi.fn().mockResolvedValue("{}"),
-  rm: vi.fn().mockResolvedValue(undefined),
-  writeFile: vi.fn().mockResolvedValue(undefined),
+  chmod: vi.fn(async () => undefined),
+  mkdtemp: vi.fn(async () => "/tmp/source-copy-root"),
+  mkdir: vi.fn(async () => undefined),
+  readFile: vi.fn(async () => "{}"),
+  rm: vi.fn(async () => undefined),
+  writeFile: vi.fn(async () => undefined),
 }));
 
 // Stub the session layer so startDevRun is tested in isolation.
@@ -114,7 +115,7 @@ function mockConfiguredSubscription(profileId = "sub-a") {
   });
 }
 
-function mockOwnership(acquire: ReturnType<typeof vi.fn> = vi.fn().mockResolvedValue({ profileId: "sub-a", used: false })) {
+function mockOwnership(acquire: ReturnType<typeof vi.fn> = vi.fn(async () => ({ profileId: "sub-a", used: false }))) {
   vi.mocked(LocalSessionOwnership).mockImplementation(function () {
     return { acquire, releaseUnused: vi.fn() } as never;
   });
@@ -805,30 +806,18 @@ describe("startDevRun — kg-refresh tracker-data source resolution (AII-608)", 
 
 import { runDevHarnessCli } from "../dev-harness/cli.js";
 import type { DevHarnessCliDependencies } from "../dev-harness/cli.js";
+import { makeDevHarnessCliDeps, makeDevRunHandle, makeTaskFile } from "./helpers/fixtures/dev-harness.js";
+
+// startDevRun's kg-refresh run: the built-in task, and no workspace mode, since the KG source is cloned, not mounted.
+const KG_REFRESH_HANDLE = makeDevRunHandle({
+  task: makeTaskFile({ identifier: "KG-DEV", title: "KG refresh (local dev)", description: "Local dev kg-refresh run" }),
+  workspace: "/tmp/repo",
+  phase: "kg-refresh",
+  workspaceMode: undefined,
+});
 
 function makeCliDeps(overrides: Partial<DevHarnessCliDependencies> = {}): DevHarnessCliDependencies {
-  return {
-    startDevRun: vi.fn().mockResolvedValue({
-      runId: "r1",
-      containerId: "cid",
-      containerName: "test-container",
-      artifactsDir: "/tmp/artifacts",
-      startedAt: new Date(),
-      task: { identifier: "KG-DEV", title: "KG refresh (local dev)" },
-      workspace: "/tmp/repo",
-      phase: "kg-refresh",
-    }),
-    streamLogs: vi.fn().mockResolvedValue(undefined),
-    streamLogsUntilShellReady: vi.fn().mockResolvedValue({ ready: false, exitCode: 0 }),
-    getRunStatus: vi.fn().mockResolvedValue({ exitCode: 0 }),
-    collectRunArtifacts: vi.fn().mockResolvedValue(undefined),
-    stopSession: vi.fn().mockResolvedValue(undefined),
-    spawnDocker: vi.fn().mockReturnValue(0),
-    writeStdout: vi.fn(),
-    writeStderr: vi.fn(),
-    now: () => Date.now(),
-    ...overrides,
-  };
+  return makeDevHarnessCliDeps({ startDevRun: vi.fn(async () => KG_REFRESH_HANDLE), ...overrides });
 }
 
 describe("runDevHarnessCli — kg-refresh phase", () => {

@@ -1,15 +1,15 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 vi.mock("node:child_process", () => ({ spawnSync: vi.fn() }));
 
 import { spawnSync } from "node:child_process";
 import { feedbackLoopStep } from "../pipeline/steps/feedback-loop.js";
-import { DefaultPipelineContext } from "../pipeline/context.js";
 import { parseCodexStream } from "../pipeline/codex-stream.js";
 import type { LLMExecutor, LLMResult, Step, StepReporter } from "../pipeline/types.js";
+import { makeContext } from "./helpers/builders.js";
+import { testDir } from "./helpers/test-dir.js";
 
 // Unmocked implement/review steps: parseCodexStream -> executor result -> implementStep ->
 // feedback loop (PassStat, sub-step outputs, cycle summary). Synthetic stream, no model call.
@@ -39,7 +39,7 @@ const reviewResult = (approved: boolean): LLMResult => ({
 describe("TEST-2 shape: pass 1 success/rejected, pass 2 error/approved", () => {
   let dir: string;
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "outcome-report-"));
+    dir = testDir("outcome-report");
     vi.mocked(spawnSync).mockImplementation(((_c: unknown, args?: readonly string[]) => ({
       status: 0,
       stdout: Buffer.from((args ?? [])[0] === "status" ? "" : "diff --git a/f.ts\n+x"),
@@ -47,7 +47,6 @@ describe("TEST-2 shape: pass 1 success/rejected, pass 2 error/approved", () => {
       pid: 0, output: [], signal: null, error: undefined,
     })) as never);
   });
-  afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
   it("keeps the invocation failure on PassStat, the implement sub-step and the cycle summary", async () => {
     const implementResults = [CLEAN(), ERRORED()];
@@ -55,10 +54,7 @@ describe("TEST-2 shape: pass 1 success/rejected, pass 2 error/approved", () => {
     const executor: LLMExecutor = {
       invoke: vi.fn(async (req) => (req.stage === "implement" ? implementResults.shift()! : reviewResult(reviewVerdicts.shift()!))),
     };
-    const ctx = new DefaultPipelineContext(
-      { jobId: 1, issueId: "i", issueIdentifier: "TEST-2", issueTitle: "t", issueDescription: "d", nonce: "n", orchestratorUrl: "http://localhost:8080" },
-      executor,
-    );
+    const ctx = makeContext({ issueTitle: "t", issueDescription: "d" }, executor);
     const reported: Step[] = [];
     const reporter: StepReporter = { report: async (s) => { reported.push(JSON.parse(JSON.stringify(s))); } };
 

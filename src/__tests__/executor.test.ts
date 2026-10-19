@@ -1,8 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 const isWindows = process.platform === "win32";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync, chmodSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
@@ -2676,10 +2675,9 @@ describe("suspendOriginWriteCredential (shared publication-credential guard)", (
   const originOf = (): string => execFileSync("git", ["remote", "get-url", "origin"], { cwd: repo, encoding: "utf-8" }).trim();
 
   beforeEach(() => {
-    repo = mkdtempSync(join(tmpdir(), "guard-"));
+    repo = testDir("guard");
     execFileSync("git", ["init", "-q"], { cwd: repo });
   });
-  afterEach(() => rmSync(repo, { recursive: true, force: true }));
 
   it("strips http(s) origin credentials and restores them exactly", () => {
     const tokenized = "https://x-access-token:secret-token@github.com/acme/app.git";

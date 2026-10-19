@@ -1,8 +1,9 @@
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { makeDevRunHandle } from "./helpers/fixtures/dev-harness.js";
+import { testDir } from "./helpers/test-dir.js";
 
 vi.mock("node:child_process", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:child_process")>()),
@@ -17,30 +18,15 @@ vi.mock("node:child_process", async (importOriginal) => ({
 }));
 
 import { collectRunArtifacts } from "../dev-harness/index.js";
-import type { DevRunHandle } from "../dev-harness/index.js";
 
 let dir: string;
 
-beforeEach(async () => {
-  dir = await mkdtemp(join(tmpdir(), "telemetry-"));
-});
-
-afterEach(async () => {
-  await rm(dir, { recursive: true, force: true });
+beforeEach(() => {
+  dir = testDir("telemetry");
 });
 
 async function telemetry(exitCode: number | null, cancelled?: boolean): Promise<Record<string, unknown>> {
-  const handle = {
-    artifactsDir: dir,
-    workspace: dir,
-    containerId: "c".repeat(64),
-    runId: "run-1",
-    task: { identifier: "T-1", title: "t" },
-    startedAt: new Date(),
-    phase: "implementation",
-    workspaceMode: "mounted",
-  } as unknown as DevRunHandle;
-  await collectRunArtifacts(handle, exitCode, cancelled);
+  await collectRunArtifacts(makeDevRunHandle({ artifactsDir: dir, workspace: dir }), exitCode, cancelled);
   return JSON.parse(await readFile(join(dir, "telemetry.json"), "utf8")) as Record<string, unknown>;
 }
 
