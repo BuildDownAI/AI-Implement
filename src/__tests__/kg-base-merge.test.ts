@@ -11,9 +11,16 @@ const reporter: StepReporter = { report: async () => undefined };
 const ctx = {} as PipelineContext;
 
 function git(cwd: string, ...args: string[]): string {
-  return execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "protocol.file.allow=always", ...args], {
+  return execFileSync("git", ["-c", "protocol.file.allow=always", ...args], {
     cwd,
     encoding: "utf8",
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: "t",
+      GIT_AUTHOR_EMAIL: "t@t",
+      GIT_COMMITTER_NAME: "t",
+      GIT_COMMITTER_EMAIL: "t@t",
+    },
   }).trim();
 }
 
@@ -222,6 +229,32 @@ describe("kgBaseMergeStep", () => {
     const e = await failure(run(baseSha, baseSha));
     expect(e.code).toBe("KG_BASE_BEHIND");
     expect(e.conflictPaths).toHaveLength(50);
+  });
+
+  it("works on a runner with no git identity (merge --no-commit still needs one)", async () => {
+    const keys = ["HOME", "GIT_CONFIG_NOSYSTEM", "GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"] as const;
+    const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+    const home = mkdtempSync(join(tmpdir(), "kgbm-home-"));
+    try {
+      put(kg, "kg_ingest/cli.py", "kg\nb\nc\n");
+      commitAll(kg, "kg edit");
+      const cleanBase = git(base, "rev-parse", "HEAD");
+      const clean = baseCommit(() => put(base, "kg_ingest/x.py", "new\n"));
+      const conflictBase = baseCommit(() => put(base, "kg_ingest/cli.py", "base\nb\nc\n"));
+      process.env.HOME = home;
+      process.env.GIT_CONFIG_NOSYSTEM = "1";
+      process.env.GIT_AUTHOR_NAME = "";
+      process.env.GIT_COMMITTER_NAME = "";
+      expect(await run(cleanBase, clean)).toEqual({ baseMerge: { headSha: clean, result: "merged" } });
+      const e = await failure(run(conflictBase, conflictBase));
+      expect(e.code).toBe("KG_BASE_BEHIND");
+    } finally {
+      for (const k of keys) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k];
+      }
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("exports the ingest path list", () => {

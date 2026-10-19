@@ -73,8 +73,22 @@ interface GitResult {
 const SHA_RE = /^[0-9a-f]{40}$/;
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
+// `git merge --no-commit` still needs a committer identity, and an empty GIT_COMMITTER_NAME in the
+// environment overrides `-c user.name`, so the identity goes through the environment for every call.
+const IDENTITY_ENV = {
+  GIT_AUTHOR_NAME: "ai-implement-kg-dry-run",
+  GIT_AUTHOR_EMAIL: "noreply@builddown.ai",
+  GIT_COMMITTER_NAME: "ai-implement-kg-dry-run",
+  GIT_COMMITTER_EMAIL: "noreply@builddown.ai",
+};
+
 function git(cwd: string, args: string[], env?: NodeJS.ProcessEnv): GitResult {
-  const r = spawnSync("git", args, { cwd, encoding: "utf8", env: env ?? process.env, maxBuffer: 64 * 1024 * 1024 });
+  const r = spawnSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    env: { ...process.env, ...IDENTITY_ENV, ...env },
+    maxBuffer: 64 * 1024 * 1024,
+  });
   return { status: r.status ?? 1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 
@@ -190,8 +204,6 @@ export const kgBaseMergeStep: StepModule<KgBaseMergeInputs, KgBaseMergeOutputs> 
     // A merge that was a no-op ("Already up to date") leaves no MERGE_HEAD and nothing to commit.
     if (existsSync(join(mustGit(workspaceDir, ["rev-parse", "--absolute-git-dir"]).trim(), "MERGE_HEAD"))) {
       mustGit(workspaceDir, [
-        "-c", "user.name=ai-implement-kg-dry-run",
-        "-c", "user.email=noreply@builddown.ai",
         "commit", "-m", `kg dry run: merge ${spec.repo}#${spec.prNumber} @ ${spec.headSha}`,
       ]);
     }
