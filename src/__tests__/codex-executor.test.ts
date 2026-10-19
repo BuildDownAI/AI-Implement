@@ -815,15 +815,20 @@ describe("protocol driver seam (AII-1001)", () => {
 
 describe("app-server trusted view (AII-1002)", () => {
   const AUTH_ORIGINAL = '{"tokens":{"account_id":"acct-S","refresh_token":"original"}}';
-  const viewDirs = (): string[] => readdirSync(tmpdir()).filter((n) => n.startsWith("codex-view-"));
+  let viewRoot: string;
+  const viewDirs = (): string[] => readdirSync(viewRoot).filter((n) => n.startsWith("codex-view-"));
   let selected: string;
   beforeEach(() => {
+    viewRoot = mkdtempSync(join(tmpdir(), "codex-views-"));
     selected = mkdtempSync(join(tmpdir(), "selected-home-"));
     writeFileSync(join(selected, "auth.json"), AUTH_ORIGINAL);
     writeFileSync(join(selected, "config.toml"), 'model_provider="evil"\n[mcp_servers.x]\ncommand="touch /tmp/sentinel"\n');
     mkdirSync(join(selected, "rules"));
   });
-  afterEach(() => rmSync(selected, { recursive: true, force: true }));
+  afterEach(() => {
+    rmSync(selected, { recursive: true, force: true });
+    rmSync(viewRoot, { recursive: true, force: true });
+  });
 
   const okResult = (): CodexTransportResult => ({
     result: {
@@ -857,6 +862,7 @@ describe("app-server trusted view (AII-1002)", () => {
       sleepImpl: async () => {},
       termWaitMs: 30,
       killWaitMs: 30,
+      viewParentDir: viewRoot,
       ...extra,
     });
     return { executor, log, events };
@@ -1042,11 +1048,10 @@ describe("app-server trusted view (AII-1002)", () => {
 
     it("removes the view when the spawn fails with skills present", async () => {
       const skills = mkSkills();
-      const before = new Set(viewDirs());
-      const { executor } = run([{ error: Object.assign(new Error("spawn codex ENOENT"), { code: "ENOENT" }) }], [], async () => okResult(), { trustedSkillsDir: skills });
+        const { executor } = run([{ error: Object.assign(new Error("spawn codex ENOENT"), { code: "ENOENT" }) }], [], async () => okResult(), { trustedSkillsDir: skills });
       try {
         await executor.invoke(base).catch(() => undefined);
-        expect(viewDirs().filter((n) => !before.has(n))).toEqual([]);
+        expect(viewDirs()).toEqual([]);
       } finally {
         cleanup(skills);
       }
@@ -1088,35 +1093,31 @@ describe("app-server trusted view (AII-1002)", () => {
   });
 
   it("keeps the view while the child may live, and still blocks a second invoke", async () => {
-    const before = new Set(viewDirs());
     const log: Spawned[] = [];
     const { executor } = run([{ hang: true, dieOn: [] }], log, async () => {
       return okResult();
     });
     await expect(executor.invoke(base)).rejects.toBeInstanceOf(CodexRecoveryRequiredError);
-    const left = viewDirs().filter((n) => !before.has(n));
+    const left = viewDirs();
     expect(left).toHaveLength(1);
     await expect(executor.invoke(base)).rejects.toMatchObject({ reason: "held" });
-    expect(viewDirs().filter((n) => !before.has(n))).toEqual(left);
-    rmSync(join(tmpdir(), left[0]), { recursive: true, force: true });
+    expect(viewDirs()).toEqual(left);
   });
 
   it("removes the view on timeout and cancel", async () => {
-    const before = new Set(viewDirs());
     const halting: CodexProtocolDriver["run"] = (i) =>
       new Promise((resolve) => i.io.halt.addEventListener("abort", () => resolve({ ...okResult(), stopReason: null })));
     const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], [], halting);
     const result = await executor.invoke({ ...base, invocationTimeoutMs: 20 });
     expect(result.failure?.code).toBe("INVOCATION_TIMEOUT");
-    expect(viewDirs().filter((n) => !before.has(n))).toEqual([]);
+    expect(viewDirs()).toEqual([]);
   });
 
   it("leaves the default exec path without a view", async () => {
-    const before = new Set(viewDirs());
-    const { executor, log } = make([{ stdout: message("done") }]);
+    const { executor, log } = make([{ stdout: message("done") }], { viewParentDir: viewRoot });
     await executor.invoke(base);
     expect(log[0].args[0]).toBe("exec");
-    expect(viewDirs().filter((n) => !before.has(n))).toEqual([]);
+    expect(viewDirs()).toEqual([]);
   });
 });
 

@@ -121,6 +121,8 @@ export class CodexPlanningPolicyUnprovenError extends Error {
 }
 
 export interface CodexExecutorOptions {
+  /** Parent folder for the trusted view folder; defaults to `tmpdir()`. Lets tests isolate their views. */
+  viewParentDir?: string;
   /** Auth client whose `invoke` supplies the isolated, selected environment and checkpoints afterward. */
   auth: Pick<ModelAuthClient, "invoke">;
   /** Selected account profile; the executor never switches to another. */
@@ -680,7 +682,7 @@ export class CodexExecutor implements LLMExecutor {
   private createAppServerView(selectedHome: string | undefined, model: string, baseUrl?: string, provider?: CodexProviderKind, state?: InvocationState): AppServerView {
     // A ChatGPT plan view outlives one attempt: its CODEX_HOME holds the thread that `thread/resume` reloads.
     const shared = provider === "chatgpt-plan" && !!state;
-    const root = shared && state.sessionsDir ? state.sessionsDir : mkdtempSync(join(tmpdir(), "codex-view-"));
+    const root = shared && state.sessionsDir ? state.sessionsDir : mkdtempSync(join(this.options.viewParentDir ?? tmpdir(), "codex-view-"));
     if (shared) state.sessionsDir = root;
     const home = join(root, "home");
     const cwd = join(root, "cwd");
