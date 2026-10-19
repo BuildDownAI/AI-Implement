@@ -466,7 +466,7 @@ export function assertExecutionPolicyCapability(
 ): void {
   if (credentials?.executionPolicy !== undefined && capabilities.supportsExecutionPolicy !== true) {
     throw new Error(
-      `ephemeral execution policy requires the ephemeral-execution-policy-v1 capability on ${target}; refusing to launch without it — re-sync workflows`,
+      `ephemeral execution policy requires the github-hosted-execution-policy-v2 capability on ${target}; refusing to launch without it — re-sync workflows`,
     );
   }
 }

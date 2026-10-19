@@ -131,7 +131,7 @@ describe("GHA workflow shims", () => {
 
     it(`${f} ${IMPLEMENT_WORKFLOWS.includes(f) ? "advertises" : "does not advertise"} the ephemeral execution policy capability`, () => {
       const yaml = readFileSync(f, "utf-8");
-      const marker = /^# ai-implement-capability: ephemeral-execution-policy-v1$/m;
+      const marker = /^# ai-implement-capability: github-hosted-execution-policy-v2$/m;
       // Only the implementation workflow projects the policy; planning rejects it as an unknown credential key.
       expect(marker.test(yaml)).toBe(IMPLEMENT_WORKFLOWS.includes(f));
       expect(yaml.includes("AI_IMPLEMENT_EXECUTION_POLICY")).toBe(IMPLEMENT_WORKFLOWS.includes(f));
@@ -418,7 +418,8 @@ describe("GHA workflow shims", () => {
       const containerJob = jobs.find((j: any) => j.container);
       const maskStep = containerJob.steps.find((s: any) => s.name === "Mask runner callback tokens");
       expect(maskStep).toBeDefined();
-      expect(maskStep.env).toBeUndefined();
+      expect(maskStep.env ?? {}).toEqual(f.includes("implement")
+        ? { AI_IMPLEMENT_GHA_RUNNER_ENVIRONMENT: "${{ runner.environment }}" } : {});
       expect(maskStep.run).toContain(".run_progress_token");
       expect(maskStep.run).toContain("GITHUB_EVENT_PATH");
       expect(maskStep.run).not.toContain("inputs.run_progress_token");
@@ -435,7 +436,8 @@ describe("GHA workflow shims", () => {
       const jobs = Object.values(doc.jobs) as any[];
       const containerJob = jobs.find((j: any) => j.container);
       const maskStep = containerJob.steps.find((s: any) => s.name === "Mask runner callback tokens");
-      expect(maskStep.env).toBeUndefined();
+      expect(maskStep.env ?? {}).toEqual(f.includes("implement")
+        ? { AI_IMPLEMENT_GHA_RUNNER_ENVIRONMENT: "${{ runner.environment }}" } : {});
       expect(maskStep.run).toContain(".run_publication_token");
       expect(maskStep.run).not.toContain("inputs.run_publication_token");
 

@@ -1875,6 +1875,7 @@ describe("protected dispatch for gap-fill (AII-1392)", () => {
     const SECRET_BEARER = bootstrap.bearer;
     const caps = (supportsPrivateRunConfig: boolean) => ({
       contract: "envelope" as const, supportsRunPublicationToken: true, supportsAttemptCorrelation: false, supportsPrivateRunConfig,
+      supportsExecutionPolicy: true,
     });
     function ghaDecision() {
       return {
