@@ -538,7 +538,7 @@ describe("kg-refresh-rail", () => {
         });
         expect(body).toContain("Not checked: the KG repo is behind the base template");
         expect(body).toContain("- `kg_ingest/cli.py`");
-        expect(body).toContain(MERGED_LINE);
+        expect(body).not.toContain("merged into");
         expect(st).toEqual({ state: "success", context: "kg-refresh/dry-run", description: "Not checked: KG repo is behind base (upstream merge needed)" });
       });
 
@@ -552,7 +552,7 @@ describe("kg-refresh-rail", () => {
         expect(body).toContain("This PR conflicts with the KG repo's ingest code.");
         expect(body).toContain("- `p49.py`");
         expect(body).not.toContain("`p50.py`");
-        expect(body).toContain(MERGED_LINE);
+        expect(body).not.toContain("merged into");
         expect(st.state).toBe("failure");
         expect(st.description).toBe("PR conflicts with KG repo ingest code: 60 files");
       });
@@ -600,7 +600,7 @@ describe("kg-refresh-rail", () => {
           detail: `Could not fetch the base PR commits: \`${"bad `tick`\nline ".repeat(40).replace(/[`\n]+/g, " ")}\``,
         });
         expect(body).toContain("Could not fetch the base PR commits:");
-        expect(body).toContain(MERGED_LINE);
+        expect(body).not.toContain("merged into");
         expect(st).toEqual({ state: "failure", context: "kg-refresh/dry-run", description: "Base PR fetch failed" });
       });
 
@@ -611,7 +611,7 @@ describe("kg-refresh-rail", () => {
         });
         expect(body).toContain("Not checked: the runner image does not support base-template merges, so the KG repo ran without this PR.");
         expect(body).not.toContain("dry run passed");
-        expect(body).toContain(MERGED_LINE);
+        expect(body).not.toContain("merged into");
         expect(st).toEqual({ state: "success", context: "kg-refresh/dry-run", description: "Not checked: runner image does not support base merges" });
       });
 

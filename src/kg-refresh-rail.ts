@@ -533,7 +533,7 @@ function dryRunStatusDescription(outcome: RefreshOutcome): string {
 /** Builds the sticky comment body for a dry-run outcome. */
 function buildDryRunCommentBody(report: KgDryRunReportTarget, outcome: RefreshOutcome, kgSourceRepo?: string | null): string {
   const header = `${KG_DRY_RUN_COMMENT_MARKER} — ${report.sha}\n\n${outcome.detail}`;
-  const headSha = outcome.baseMerge?.headSha ?? outcome.baseHeadSha;
+  const headSha = outcome.baseMerge?.result === "merged" ? outcome.baseMerge.headSha : undefined;
   const paths = outcome.baseMerge?.conflictPaths ?? [];
   const pathList = (outcome.failureCode === "KG_BASE_BEHIND" || outcome.failureCode === "KG_BASE_CONFLICT") && paths.length > 0
     ? `\n\n${paths.slice(0, MAX_LISTED_PATHS).map((p) => `- \`${sanitizeInline(p)}\``).join("\n")}`
