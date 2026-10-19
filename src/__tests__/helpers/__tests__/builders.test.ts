@@ -1,6 +1,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseChatGptPlanRecord } from "../../../chatgpt-plan-token.js";
 import { getMappings, initMappingsTable, upsertMapping } from "../../../config.js";
+import { parseModelAuthGrantBootstrap, toSafeGrantMetadata } from "../../../model-auth-contract.js";
 import { ProviderRegistry } from "../../../providers/registry.js";
 import { validateReviewFixResultMetadata, validateScopedPrIdentity } from "../../../review-fix-contract.js";
 import { decodeRunConfig, encodeRunConfig } from "../../../run-config.js";
@@ -22,6 +23,7 @@ import {
   makeReviewFixRunConfig,
   makeScopedPrIdentity,
 } from "../builders.js";
+import { makeLaunchDecision, makeSnapshot } from "../fixtures/configured-run.js";
 
 describe("makeMapping", () => {
   beforeAll(() => {
@@ -423,5 +425,34 @@ describe("makeChatGptPlanRecord", () => {
     const other = makeChatGptPlanRecord({ email: "other@example.com" });
     expect(other.email).toBe("other@example.com");
     expect({ ...other, email: makeChatGptPlanRecord().email }).toEqual(makeChatGptPlanRecord());
+  });
+});
+
+describe("makeLaunchDecision (fixtures/configured-run.ts)", () => {
+  it.each([
+    ["github-actions", "gha"],
+    ["fly-machines", "fly"],
+    ["local-docker", "local"],
+  ] as const)("on %s, mints a %s grant the parser accepts and carries its safe metadata", (backend, grantBackend) => {
+    const snapshot = makeSnapshot();
+    const { decision, bootstrap } = makeLaunchDecision(snapshot, backend);
+
+    expect(parseModelAuthGrantBootstrap(bootstrap)).toEqual({ ok: true, value: bootstrap });
+    expect(bootstrap.backend).toBe(grantBackend);
+    expect(decision).toMatchObject({ kind: "launch", backend, snapshot, dispatchId: bootstrap.dispatchId, projectKey: bootstrap.projectKey });
+    expect(decision.grant).toEqual(toSafeGrantMetadata(bootstrap));
+  });
+
+  it("hands the bootstrap out once, then undefined", () => {
+    const { decision, bootstrap } = makeLaunchDecision(makeSnapshot(), "fly-machines");
+    expect(decision.takeBootstrap()).toBe(bootstrap);
+    expect(decision.takeBootstrap()).toBeUndefined();
+  });
+
+  it("applies overrides to the grant and the decision alike", () => {
+    const { decision, bootstrap } = makeLaunchDecision(makeSnapshot(), "local-docker", { dispatchId: "d-9", projectKey: "AII" });
+    expect(bootstrap).toMatchObject({ dispatchId: "d-9", projectKey: "AII" });
+    expect(decision).toMatchObject({ dispatchId: "d-9", projectKey: "AII" });
+    expect(decision.grant).toMatchObject({ dispatchId: "d-9", projectKey: "AII" });
   });
 });

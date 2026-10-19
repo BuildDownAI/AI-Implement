@@ -2,10 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import { encodeRunConfig } from "../run-config.js";
 import { runPlanningLocally } from "../run-planning.js";
 import { runLocalPlanningFromEnv } from "../run-local-planning.js";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { makeSnapshot } from "./helpers/fixtures/configured-run.js";
 import { testDir } from "./helpers/test-dir.js";
 
 describe("runLocalPlanningFromEnv", () => {
@@ -79,17 +79,7 @@ describe("runLocalPlanningFromEnv", () => {
   });
 
   it("forwards planning context, agentConfig and configured-run sources to the planning runner", async () => {
-    const rev = { configRevisionId: "11111111-1111-4111-8111-111111111111", revision: 1 };
-    const st = { agent: "codex", provider: "openai", model: "gpt-plan", accountProfileId: "p", invocationTimeoutMs: 1000 };
-    const pr = { id: "p", identity: "a", revision: 1, agent: "codex", provider: "openai", authMode: "openai-api-key" };
-    const agentConfig = {
-      version: 1,
-      snapshotId: "s",
-      configRevisions: { orchestratorDefault: rev, project: rev },
-      stages: { planning: st, implementation: { ...st, agent: "claude", provider: "anthropic", model: "c", accountProfileId: "pi" }, review: { ...st, accountProfileId: "pr" } },
-      sources: Object.fromEntries(["planning", "implementation", "review"].map((n) => [n, { agent: "project", provider: "project", model: "project", accountProfileId: "project", invocationTimeoutMs: "job-deadline" }])),
-      profiles: { planning: pr, implementation: { ...pr, id: "pi", agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" }, review: { ...pr, id: "pr" } },
-    };
+    const agentConfig = makeSnapshot();
     const runPlanning = vi.fn().mockResolvedValue({ exitCode: 0, planningContext: "x", planFound: true, diagnostics: "" });
     const configured = { localCredentialPort: { load: vi.fn() } } as never;
     const runConfig = encodeRunConfig({
@@ -98,42 +88,27 @@ describe("runLocalPlanningFromEnv", () => {
       runnerPhase: "planning",
       planningContext: { parent: "P", siblings: "S", dependencies: "D2" },
       agentConfig,
-    } as never);
+    });
     const code = await runLocalPlanningFromEnv(
-      { AI_IMPLEMENT_RUN_CONFIG: runConfig, WORKSPACE_DIR: "/workspace" },
+      { AI_IMPLEMENT_RUN_CONFIG: runConfig, WORKSPACE_DIR: testDir("local-planning") },
       { runPlanning, writeStdout: vi.fn(), writeStderr: vi.fn(), configured },
     );
     expect(code).toBe(0);
     const arg = runPlanning.mock.calls[0][0];
     expect(arg).toMatchObject({ parent: "P", siblings: "S", dependencies: "D2", configured });
-    expect(arg.agentConfig.snapshotId).toBe("s");
+    expect(arg.agentConfig.snapshotId).toBe(agentConfig.snapshotId);
   });
 
   it("with the real planning runner and no credential source, a configured envelope fails closed before any model work", async () => {
-    const workspace = mkdtempSync(join(tmpdir(), "local-plan-cfg-"));
-    try {
-      const rev = { configRevisionId: "11111111-1111-4111-8111-111111111111", revision: 1 };
-      const st = { agent: "codex", provider: "openai", model: "gpt-plan", accountProfileId: "p", invocationTimeoutMs: 1000 };
-      const pr = { id: "p", identity: "a", revision: 1, agent: "codex", provider: "openai", authMode: "openai-api-key" };
-      const agentConfig = {
-        version: 1,
-        snapshotId: "s",
-        configRevisions: { orchestratorDefault: rev, project: rev },
-        stages: { planning: st, implementation: { ...st, accountProfileId: "pi" }, review: { ...st, accountProfileId: "pr" } },
-        sources: Object.fromEntries(["planning", "implementation", "review"].map((n) => [n, { agent: "project", provider: "project", model: "project", accountProfileId: "project", invocationTimeoutMs: "job-deadline" }])),
-        profiles: { planning: pr, implementation: { ...pr, id: "pi" }, review: { ...pr, id: "pr" } },
-      };
-      const runConfig = encodeRunConfig({ v: 1, issue: { id: "i", identifier: "L-3", title: "T", description: "D" }, runnerPhase: "planning", agentConfig } as never);
-      const writeStderr = vi.fn();
-      const code = await runLocalPlanningFromEnv(
-        { AI_IMPLEMENT_RUN_CONFIG: runConfig, WORKSPACE_DIR: workspace },
-        { runPlanning: runPlanningLocally, writeStdout: vi.fn(), writeStderr },
-      );
-      expect(code).toBe(1);
-      expect(writeStderr).toHaveBeenCalledWith("[dev:run] planning failed: Configured planning failed (bootstrap_missing)\n");
-    } finally {
-      rmSync(workspace, { recursive: true, force: true });
-    }
+    const workspace = testDir("local-plan-cfg");
+    const runConfig = encodeRunConfig({ v: 1, issue: { id: "i", identifier: "L-3", title: "T", description: "D" }, runnerPhase: "planning", agentConfig: makeSnapshot() });
+    const writeStderr = vi.fn();
+    const code = await runLocalPlanningFromEnv(
+      { AI_IMPLEMENT_RUN_CONFIG: runConfig, WORKSPACE_DIR: workspace },
+      { runPlanning: runPlanningLocally, writeStdout: vi.fn(), writeStderr },
+    );
+    expect(code).toBe(1);
+    expect(writeStderr).toHaveBeenCalledWith("[dev:run] planning failed: Configured planning failed (bootstrap_missing)\n");
   });
 
   it("forwards the envelope skillsRepo to planning", async () => {
@@ -145,7 +120,7 @@ describe("runLocalPlanningFromEnv", () => {
       skillsRepo: "org/skills",
     });
     await runLocalPlanningFromEnv(
-      { AI_IMPLEMENT_RUN_CONFIG: runConfig, WORKSPACE_DIR: "/workspace" },
+      { AI_IMPLEMENT_RUN_CONFIG: runConfig, WORKSPACE_DIR: testDir("local-planning") },
       { runPlanning, writeStdout: vi.fn(), writeStderr: vi.fn() },
     );
     expect(runPlanning).toHaveBeenCalledWith(expect.objectContaining({ skillsRepo: "org/skills" }));

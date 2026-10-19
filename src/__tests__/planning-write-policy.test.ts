@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, existsSync, readFileSync, realpathSync, readdirSync } from "node:fs";
+import { describe, it, expect, beforeEach } from "vitest";
+import { mkdirSync, writeFileSync, symlinkSync, rmSync, existsSync, readFileSync, realpathSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { spawnSync } from "node:child_process";
+import { testDir } from "./helpers/test-dir.js";
 import {
   decidePlanningWrite,
   decidePlanningWritePayload,
@@ -16,12 +17,8 @@ describe("planning write policy", () => {
   let ws: string;
   let outside: string;
   beforeEach(() => {
-    ws = mkdtempSync(join(tmpdir(), "pwp-ws-"));
-    outside = mkdtempSync(join(tmpdir(), "pwp-out-"));
-  });
-  afterEach(() => {
-    rmSync(ws, { recursive: true, force: true });
-    rmSync(outside, { recursive: true, force: true });
+    ws = testDir("pwp-ws");
+    outside = testDir("pwp-out");
   });
 
   const allow = (p: unknown) => decidePlanningWrite({ file_path: p }, ws).allow;
@@ -54,22 +51,17 @@ describe("planning write policy", () => {
   });
 
   it("allows valid writes through a symlinked workspace alias and its canonical spelling", () => {
-    const aliasParent = mkdtempSync(join(tmpdir(), "pwp-alias-"));
-    try {
-      const alias = join(aliasParent, "ws-link");
-      symlinkSync(ws, alias);
-      const real = realpathSync(ws);
-      for (const workspaceDir of [ws, alias, real]) {
-        for (const base of [ws, alias, real]) {
-          const p = join(base, "ai-output", "comments", "01-a.md");
-          expect(decidePlanningWrite({ file_path: p }, workspaceDir).allow, `${workspaceDir} <- ${p}`).toBe(true);
-        }
-        expect(decidePlanningWrite({ file_path: "ai-output/comments/01-a.md" }, workspaceDir).allow).toBe(true);
-        expect(decidePlanningWrite({ file_path: join(alias, "src", "a.md") }, workspaceDir).allow).toBe(false);
-        expect(decidePlanningWrite({ file_path: join(real, "ai-output", "comments-evil", "a.md") }, workspaceDir).allow).toBe(false);
+    const alias = join(testDir("pwp-alias"), "ws-link");
+    symlinkSync(ws, alias);
+    const real = realpathSync(ws);
+    for (const workspaceDir of [ws, alias, real]) {
+      for (const base of [ws, alias, real]) {
+        const p = join(base, "ai-output", "comments", "01-a.md");
+        expect(decidePlanningWrite({ file_path: p }, workspaceDir).allow, `${workspaceDir} <- ${p}`).toBe(true);
       }
-    } finally {
-      rmSync(aliasParent, { recursive: true, force: true });
+      expect(decidePlanningWrite({ file_path: "ai-output/comments/01-a.md" }, workspaceDir).allow).toBe(true);
+      expect(decidePlanningWrite({ file_path: join(alias, "src", "a.md") }, workspaceDir).allow).toBe(false);
+      expect(decidePlanningWrite({ file_path: join(real, "ai-output", "comments-evil", "a.md") }, workspaceDir).allow).toBe(false);
     }
   });
 
@@ -119,7 +111,7 @@ describe("planning write policy", () => {
   describe("selected skills plugin", () => {
     let home: string;
     beforeEach(() => {
-      home = mkdtempSync(join(tmpdir(), "pwp-home-"));
+      home = testDir("pwp-home");
       const skills = join(home, ".claude", "skills");
       mkdirSync(join(skills, "good", "refs"), { recursive: true });
       writeFileSync(join(skills, "good", "SKILL.md"), "---\nname: good\ndescription: d\nallowed-tools: Bash, Edit\n---\nbody");
@@ -137,7 +129,6 @@ describe("planning write policy", () => {
       mkdirSync(join(skills, "good", "hooks"));
       writeFileSync(join(skills, "good", "hooks", "hooks.json"), "{}");
     });
-    afterEach(() => rmSync(home, { recursive: true, force: true }));
 
     it("wraps only valid selected skills in a plugin outside the workspace and wires the flags", () => {
       const policy = setupPlanningWritePolicy(ws, {
@@ -202,12 +193,11 @@ describe("planning write policy", () => {
       expect(a.args).not.toContain("--plugin-dir");
       a.cleanup();
 
-      const alias = mkdtempSync(join(tmpdir(), "pwp-alias-"));
+      const alias = testDir("pwp-alias");
       symlinkSync(ws, join(alias, "ws"));
       const b = setupPlanningWritePolicy(ws, { homeDir: join(alias, "ws"), skillNames: ["repo-skill"] });
       expect(b.args).not.toContain("--plugin-dir");
       b.cleanup();
-      rmSync(alias, { recursive: true, force: true });
 
       // workspace nested inside the skill source (ancestor direction)
       const skills = join(home, ".claude", "skills");
@@ -293,8 +283,7 @@ describe("planning write policy", () => {
     });
 
     it("runs with lexical and canonical workspace spellings when the workspace is a symlink alias", () => {
-      const aliasParent = mkdtempSync(join(tmpdir(), "pwp-alias-"));
-      const alias = join(aliasParent, "ws-link");
+      const alias = join(testDir("pwp-alias"), "ws-link");
       symlinkSync(ws, alias);
       const policy = setupPlanningWritePolicy(alias);
       try {
@@ -306,7 +295,6 @@ describe("planning write policy", () => {
         }
       } finally {
         policy.cleanup();
-        rmSync(aliasParent, { recursive: true, force: true });
       }
     });
 
