@@ -283,7 +283,7 @@ A path rule applies after each merge. Ingest paths (`KG_BASE_INGEST_PATHS`: `kg_
 
 ### Scope endpoint
 
-The `kg-scope-reconcile` pipeline step (`src/pipeline/steps/kg-scope-reconcile.ts`) runs immediately after `clone`, before `dependency-auth`, and calls `POST /api/runner/kg-scope` once per refresh to fetch the orchestrator's full mapping set:
+The `kg-scope-reconcile` pipeline step (`src/pipeline/steps/kg-scope-reconcile.ts`) runs after `kg-base-merge` (order: `clone`, `kg-base-merge`, `kg-scope-reconcile`, `dependency-auth`) and calls `POST /api/runner/kg-scope` once per refresh to fetch the orchestrator's full mapping set:
 
 ```
 POST /api/runner/kg-scope
@@ -384,7 +384,7 @@ The runner's result callback reaches `KgRefresh.report` (§5, Callback). The fir
 
 | Report | Result |
 |---|---|
-| dry run (PR check only; the admin doors refuse `dryRun`) | `dry-run-report`, then `closed` (row `passed`, `warnings` for a dry run with skipped or failed sources, or `failed`); nothing is merged and the served graph is untouched. A dry run that fails before a report (rejected dispatch, timeout, lost run, cancel, workflow error) still records and posts a failure verdict for its PR, and writes neither the last-refresh record nor the operator notification |
+| dry run (PR check only; the admin doors refuse `dryRun`) | `dry-run-report`, then `closed` (row `passed`, `warnings` for a dry run with skipped or failed sources, or `failed`); nothing is merged and the served graph is untouched. A dry run that fails before a report (rejected dispatch, timeout, lost run, cancel, workflow error) still records and posts a failure verdict for its PR, and writes neither the last-refresh record nor the operator notification. A base-repo PR whose KG repo is behind base, or whose runner image predates `kg-base-merge`, ends with the "Not checked" verdict: commit status `success` with a description starting `Not checked:`, so it does not block the PR (see "Base-merge verdicts" below) |
 | `KG_SNAPSHOT_STALE` | `no-new-data`, a success outcome |
 | failure, or no `snapshotPr` / `snapshotCommit` | `failed`; a reported `snapshotPr` is closed unmerged and its branch deleted |
 | success with a snapshot | `merge` (merge commit, never squash), `delete-branch`, then the four rail gates |
