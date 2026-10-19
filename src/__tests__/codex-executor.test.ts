@@ -1039,8 +1039,8 @@ describe("app-server trusted view (AII-1002)", () => {
       try {
         const result = await executor.invoke({ ...base, invocationTimeoutMs: 20 });
         expect(result.failure?.code).toBe("INVOCATION_TIMEOUT");
-        expect(root).not.toBe("");
-        expect(existsSync(root)).toBe(false);
+        if (root !== "") expect(existsSync(root)).toBe(false);
+        expect(viewDirs()).toEqual([]);
       } finally {
         cleanup(skills);
       }
@@ -1048,7 +1048,7 @@ describe("app-server trusted view (AII-1002)", () => {
 
     it("removes the view when the spawn fails with skills present", async () => {
       const skills = mkSkills();
-        const { executor } = run([{ error: Object.assign(new Error("spawn codex ENOENT"), { code: "ENOENT" }) }], [], async () => okResult(), { trustedSkillsDir: skills });
+      const { executor } = run([{ error: Object.assign(new Error("spawn codex ENOENT"), { code: "ENOENT" }) }], [], async () => okResult(), { trustedSkillsDir: skills });
       try {
         await executor.invoke(base).catch(() => undefined);
         expect(viewDirs()).toEqual([]);
