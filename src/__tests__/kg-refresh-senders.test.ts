@@ -158,7 +158,7 @@ describe("fly-machines sender", () => {
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
     const result = await createKgRefreshSenders(deps)["fly-machines"](makeInput());
     err.mockRestore();
-    expect(result).toEqual({ outcome: "rejected", jobId: null, executionMode: "fly-machines" });
+    expect(result).toEqual({ outcome: "rejected", jobId: null, executionMode: "fly-machines", detail: "FLY_SESSIONS_TOKEN and FLY_SESSIONS_APP are not configured" });
     expect(deps.getInstallationToken).not.toHaveBeenCalled();
     expect(deps.keptMachineFly).not.toHaveBeenCalled();
   });
@@ -299,7 +299,7 @@ describe("model-auth refusal", () => {
         const { deps, fly } = makeDeps({}, mode === "local-docker" ? { localRunnerImage: undefined as never } : {});
         const err = vi.spyOn(console, "error").mockImplementation(() => {});
         const result = await createKgRefreshSenders(deps)[mode](makeInput({ envelope: { ...envelope, ...extra }, machineNonce: null }));
-        expect(result).toEqual({ outcome: "rejected", jobId: null, executionMode: mode });
+        expect(result).toEqual({ outcome: "rejected", jobId: null, executionMode: mode, detail: "a KG refresh envelope carries model authentication" });
         expect(err).toHaveBeenCalledWith("[kg-refresh] refused: a KG refresh envelope carries model authentication");
         for (const spy of [deps.getScopedInstallationToken, deps.getInstallationToken, deps.mintToken, deps.fetchDefaultBranch,
           deps.resolveRunnerImage, deps.postWorkflowDispatch, deps.keptMachineFly, deps.startLocalRunnerContainer]) {
@@ -316,5 +316,48 @@ describe("model-auth refusal", () => {
     const result = await createKgRefreshSenders(deps)["github-actions"](makeInput({
       machineNonce: null, envelope: { ...envelope, credentials: { version: 1 } as never } }));
     expect(result.outcome).toBe("accepted");
+  });
+});
+
+describe("GitHub Actions rejection detail", () => {
+  const rejectWith = async (error: string, status = 422) => {
+    const { deps } = makeDeps({
+      postWorkflowDispatch: vi.fn(async () => ({ success: false, status, error, outcome: "rejected" as const })) as never,
+    });
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const result = await createKgRefreshSenders(deps)["github-actions"](makeInput({ machineNonce: null }));
+    return { result, err };
+  };
+
+  it("carries GitHub's JSON message and logs one line", async () => {
+    const { result, err } = await rejectWith('{"message":"No ref found for: testing"}');
+    expect(result.outcome).toBe("rejected");
+    expect(result.detail).toBe("HTTP 422: No ref found for: testing");
+    const lines = err.mock.calls.map((c) => String(c[0])).filter((l) => l.includes("dispatch rejected by GitHub"));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/^\[kg-refresh\] dispatch rejected by GitHub \(HTTP 422\) for \S+\/\S+@\S+: HTTP 422: No ref found for: testing$/);
+    err.mockRestore();
+  });
+
+  it("falls back to the raw body when it is not JSON or has no string message", async () => {
+    const a = await rejectWith("Bad gateway text", 400);
+    expect(a.result.detail).toBe("HTTP 400: Bad gateway text");
+    const raw = '{"errors":["x"]}';
+    const b = await rejectWith(raw);
+    expect(b.result.detail).toBe(`HTTP 422: ${raw}`);
+    a.err.mockRestore();
+    b.err.mockRestore();
+  });
+
+  it("caps the detail at 500 characters", async () => {
+    const { result, err } = await rejectWith(JSON.stringify({ message: "x".repeat(2000) }));
+    expect(result.detail).toHaveLength(500);
+    err.mockRestore();
+  });
+
+  it("sets no detail on an accepted dispatch", async () => {
+    const { deps } = makeDeps();
+    const result = await createKgRefreshSenders(deps)["github-actions"](makeInput({ machineNonce: null }));
+    expect(result).not.toHaveProperty("detail");
   });
 });
