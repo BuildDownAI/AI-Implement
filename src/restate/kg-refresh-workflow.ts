@@ -196,6 +196,8 @@ export interface KgDispatchResult {
   /** The backend's job id when it reported one; `null` means unknown (the workflow keys its own row by dispatch id). */
   jobId: string | null;
   executionMode: string;
+  /** A human-readable rejection reason; set only when `outcome` is `"rejected"`. */
+  detail?: string;
   /** The kept Fly machine the run executes on; null or absent for GHA and local Docker. */
   machineId?: string | null;
   /** True when the dispatch created the machine, so the workflow must `attach` it. */
@@ -631,6 +633,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             outcome: result.outcome, runId: result.runId, runUrl: result.runUrl,
             jobId: result.jobId, executionMode: result.executionMode,
             machineId: result.machineId ?? null, created: result.created === true,
+            ...(result.detail !== undefined && { detail: result.detail }),
             ...(result.app !== undefined && { app: result.app }),
             ...(result.replaced !== undefined && { replaced: result.replaced }),
           };
@@ -661,7 +664,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       if (dispatchResult.outcome === "rejected") {
         ctx.set("step", "failed");
         const at = await ctx.date.now();
-        const outcome = await failurePath(buildFailureOutcome(at, "dispatch was rejected"), "dispatch_rejected");
+        const outcome = await failurePath(buildFailureOutcome(at, dispatchResult.detail !== undefined ? `dispatch was rejected: ${dispatchResult.detail}` : "dispatch was rejected"), "dispatch_rejected");
         return finish(outcome);
       }
 

@@ -89,6 +89,8 @@ const GENERIC_FAILURE_REPORT: KgRefreshReportBody = {
 interface RunScenario {
   triggerId: string;
   dispatchOutcome: "accepted" | "rejected" | "unknown";
+  /** The rejection reason the sender reports. */
+  dispatchDetail?: string;
   runId?: number;
   executionMode: string;
   dispatchCalls: number;
@@ -476,6 +478,7 @@ describe("KgRefresh durable workflow", () => {
     }
     const result: KgDispatchResult = {
       outcome: scenario.dispatchOutcome, runId: scenario.runId,
+      ...(scenario.dispatchDetail !== undefined && { detail: scenario.dispatchDetail }),
       jobId: scenario.jobIdUnknown ? null : `job-${triggerId}`, executionMode: scenario.executionMode,
       ...(scenario.runId !== undefined ? { runUrl: `https://example.test/runs/${scenario.runId}` } : {}),
       ...(scenario.flyCreate ? { machineId: scenario.flyCreate.machineId, created: scenario.flyCreate.reused !== true, ...(scenario.flyCreate.app !== undefined && { app: scenario.flyCreate.app }) } : {}),
@@ -1980,10 +1983,11 @@ describe("KgRefresh durable workflow", () => {
     async (label) => {
       const env = envFor(label);
       const triggerId = newTriggerId();
-      makeScenario(triggerId, { dispatchOutcome: "rejected", executionMode: "github-actions" });
+      makeScenario(triggerId, { dispatchOutcome: "rejected", dispatchDetail: "HTTP 422: No ref found for: testing", executionMode: "github-actions" });
 
       const outcome = await runWorkflow(env.baseUrl(), triggerId);
       expect(outcome.ok).toBe(false);
+      expect(JSON.stringify(outcome)).toContain("dispatch was rejected: HTTP 422: No ref found for: testing");
       expect((await closeRowFor(triggerId)).conclusion).toBe("dispatch_rejected");
       const persisted = persistCalls.find((o) => o.dispatchId === triggerId);
       expect(persisted?.conclusion).toBe("dispatch_rejected");
