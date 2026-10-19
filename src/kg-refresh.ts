@@ -83,6 +83,8 @@ export interface RefreshOutcome {
   baseMerge?: { headSha: string; result: "merged" | "behind" | "conflict"; conflictPaths?: string[] };
   /** The dry run did not test the PR; the commit status reports success so the PR is not blocked. */
   notChecked?: true;
+  /** A base-PR dry run failed with no merge echo (before or inside `kg-base-merge`); a failure, not `notChecked`. */
+  baseMergeNotRun?: true;
   cause?: "shrink" | "tracker-missing" | "source-failed";
   failedTeams?: string[];
   /** Skipped or failed teams that had served issues, when the run was held with Accept blocked. */

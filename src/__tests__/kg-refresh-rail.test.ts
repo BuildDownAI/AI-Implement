@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import {
   fetchGate, stageGate, swapGate, verifyGate, revertRail,
   RailGateError, readServedStamp, readNamespace,
-  mergeSnapshotPr, deleteSnapshotBranch, closeSnapshotPr, postBaselineAcceptNote, postDryRunReport,
+  mergeSnapshotPr, deleteSnapshotBranch, closeSnapshotPr, postBaselineAcceptNote, postDryRunReport, baseMergeDetail,
   type KgRailDeps, type RailContext,
 } from "../kg-refresh-rail.js";
 import { COMPLETION_MARKER } from "../kg-sidecar.js";
@@ -613,6 +613,37 @@ describe("kg-refresh-rail", () => {
         expect(body).not.toContain("dry run passed");
         expect(body).not.toContain("merged into");
         expect(st).toEqual({ state: "success", context: "kg-refresh/dry-run", description: "Not checked: runner image does not support base merges" });
+      });
+
+      it("row 7b: a failed run with no echo and no code fails before the base merge", async () => {
+        expect(baseMergeDetail({ ok: false, failureReason: "git clone failed (exit 128)" })).toEqual({
+          detail: "The dry run failed before it could test this PR: `git clone failed (exit 128)`",
+          baseMergeNotRun: true,
+        });
+        expect(baseMergeDetail({ ok: false })?.detail).toBe("The dry run failed before it could test this PR: `unknown`");
+        expect(baseMergeDetail({ ok: false, failureReason: "a`b`\nc" })?.detail).toBe("The dry run failed before it could test this PR: `a b c`");
+        expect(baseMergeDetail({ ok: false, failureCode: "KG_INGEST_FAILED", baseMerge: { result: "merged" } })).toBeNull();
+        expect(baseMergeDetail({ ok: true })).toMatchObject({ notChecked: true });
+        expect(baseMergeDetail({ ok: true })?.baseMergeNotRun).toBeUndefined();
+
+        const { body, st } = await run({
+          ...base, ok: false, baseMergeNotRun: true,
+          detail: "The dry run failed before it could test this PR: `git clone failed (exit 128)`",
+          partTable: [{ part: "a", prev: "1", new: "1" }],
+        });
+        expect(body).toContain("`git clone failed (exit 128)`");
+        expect(body).not.toContain("| part |");
+        expect(body).not.toContain("merged into");
+        expect(body).not.toContain("Not checked");
+        expect(st).toEqual({ state: "failure", context: "kg-refresh/dry-run", description: "Dry run failed before the base merge" });
+      });
+
+      it("row 8: a KG-repo PR failing without the marker keeps its part table and detail", async () => {
+        const { body, st } = await run({
+          ...base, ok: false, detail: "git clone failed (exit 128)", partTable: [{ part: "a", prev: "1", new: "1" }],
+        });
+        expect(body).toContain("| a | 1 | 1 |");
+        expect(st).toMatchObject({ state: "failure", description: "git clone failed (exit 128)" });
       });
 
       it("notChecked does not block, while a plain failure still does", async () => {

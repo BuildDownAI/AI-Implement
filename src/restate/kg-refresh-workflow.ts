@@ -989,6 +989,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           if (verdict) {
             outcome.detail = verdict.detail;
             if (verdict.notChecked) outcome.notChecked = true;
+            if (verdict.baseMergeNotRun) outcome.baseMergeNotRun = true;
           }
         }
         if (stepTable.length > 0) outcome.steps = stepTable;

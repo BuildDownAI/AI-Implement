@@ -477,6 +477,7 @@ const MAX_LISTED_PATHS = 50;
 const NOT_CHECKED_BEHIND_DESCRIPTION = "Not checked: KG repo is behind base (upstream merge needed)";
 const NOT_CHECKED_OLD_RUNNER_DESCRIPTION = "Not checked: runner image does not support base merges";
 const BASE_FETCH_FAILED_DESCRIPTION = "Base PR fetch failed";
+const BASE_MERGE_NOT_RUN_DESCRIPTION = "Dry run failed before the base merge";
 
 /** Neutralizes runner-supplied text for inline markdown: no backticks or line breaks. */
 function sanitizeInline(text: string): string {
@@ -484,7 +485,7 @@ function sanitizeInline(text: string): string {
 }
 
 /**
- * Verdict for a dry run whose input carried `kgBaseMerge` (rows 1, 2, 6, 7), or null when the
+ * Verdict for a dry run whose input carried `kgBaseMerge` (rows 1, 2, 6, 7, and the failed-before-merge row), or null when the
  * run tested the PR (merged) and the plain ok/failed rendering applies.
  */
 export function baseMergeDetail(report: {
@@ -492,7 +493,7 @@ export function baseMergeDetail(report: {
   failureCode?: string;
   failureReason?: string;
   baseMerge?: { result: "merged" | "behind" | "conflict" };
-}): { detail: string; notChecked?: true } | null {
+}): { detail: string; notChecked?: true; baseMergeNotRun?: true } | null {
   if (report.baseMerge?.result === "merged") return null;
   switch (report.failureCode) {
     case "KG_BASE_BEHIND":
@@ -506,6 +507,12 @@ export function baseMergeDetail(report: {
       return { detail: `Could not fetch the base PR commits: \`${sanitizeInline(report.failureReason ?? "unknown")}\`` };
   }
   if (report.baseMerge) return null;
+  if (!report.ok) {
+    return {
+      detail: `The dry run failed before it could test this PR: \`${sanitizeInline(report.failureReason ?? "unknown")}\``,
+      baseMergeNotRun: true,
+    };
+  }
   return {
     detail: "Not checked: the runner image does not support base-template merges, so the KG repo ran without this PR.",
     notChecked: true,
@@ -516,7 +523,8 @@ export function baseMergeDetail(report: {
 function isBaseMergeVerdict(outcome: RefreshOutcome): boolean {
   return outcome.notChecked === true
     || outcome.failureCode === "KG_BASE_CONFLICT"
-    || outcome.failureCode === "KG_BASE_FETCH_FAILED";
+    || outcome.failureCode === "KG_BASE_FETCH_FAILED"
+    || outcome.baseMergeNotRun === true;
 }
 
 /** Commit-status description: fixed text for base-merge verdicts, otherwise the detail. Max 140 chars. */
@@ -526,6 +534,7 @@ function dryRunStatusDescription(outcome: RefreshOutcome): string {
   else if (outcome.failureCode === "KG_BASE_CONFLICT") {
     description = `PR conflicts with KG repo ingest code: ${outcome.baseMerge?.conflictPaths?.length ?? 0} files`;
   } else if (outcome.failureCode === "KG_BASE_FETCH_FAILED") description = BASE_FETCH_FAILED_DESCRIPTION;
+  else if (outcome.baseMergeNotRun) description = BASE_MERGE_NOT_RUN_DESCRIPTION;
   else if (outcome.notChecked) description = NOT_CHECKED_OLD_RUNNER_DESCRIPTION;
   return description.slice(0, 140);
 }

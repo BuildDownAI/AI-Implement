@@ -2656,6 +2656,11 @@ describe("KgRefresh durable workflow", () => {
       expect(old.status).toMatchObject({ state: "success", description: "Not checked: runner image does not support base merges" });
       expect(old.comment).toContain("the runner image does not support base-template merges");
       expect(old.comment).not.toContain("dry run passed");
+
+      const early = await runCase({ ok: false, failureReason: "git clone failed (exit 128)" });
+      expect(early.status).toMatchObject({ state: "failure", description: "Dry run failed before the base merge" });
+      expect(early.comment).toContain("`git clone failed (exit 128)`");
+      expect(early.comment).not.toContain("Not checked");
     },
     30_000,
   );
