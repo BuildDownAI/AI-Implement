@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type * as WebhookModule from "../webhook.js";
 import type * as LogModule from "../log.js";
 import type * as ReconciliationModule from "../reconciliation.js";
@@ -12,6 +12,7 @@ import type { RepoMapping } from "../config.js";
 import type { KgPrCheckConfig } from "../webhook.js";
 import { makeAppendLogEntry, makeMapping } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
+import { githubError } from "./helpers/replies/github.js";
 import { testDb } from "./helpers/test-db.js";
 
 // ---------- Hoisted mocks for /ai-implement path ----------
@@ -1654,7 +1655,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("ignores an approve verdict with only minor findings as approved, without enqueueing", async () => {
-    const jobId = log.appendLog({ issueId: "issue-71", issueIdentifier: "AII-71", repo: "org/repo" });
+    const jobId = appendDispatch({ issueId: "issue-71", issueIdentifier: "AII-71", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/71");
 
     const { req, res } = makeRequest(SECRET, "issue_comment", {
@@ -1683,7 +1684,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("still enqueues a prose Claude summary whose medium findings sit beside a ready-to-merge line", async () => {
-    const jobId = log.appendLog({ issueId: "issue-73", issueIdentifier: "AII-73", repo: "org/repo" });
+    const jobId = appendDispatch({ issueId: "issue-73", issueIdentifier: "AII-73", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/73");
 
     const { req, res } = makeRequest(SECRET, "issue_comment", {
@@ -1709,7 +1710,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("still enqueues an approve verdict that carries a blocking finding", async () => {
-    const jobId = log.appendLog({ issueId: "issue-72", issueIdentifier: "AII-72", repo: "org/repo" });
+    const jobId = appendDispatch({ issueId: "issue-72", issueIdentifier: "AII-72", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/72");
 
     const { req, res } = makeRequest(SECRET, "issue_comment", {
@@ -1737,7 +1738,7 @@ describe("review feedback ingestion", () => {
   });
 
   it("still enqueues a changes_requested verdict with only a minor finding", async () => {
-    const jobId = log.appendLog({ issueId: "issue-73", issueIdentifier: "AII-73", repo: "org/repo" });
+    const jobId = appendDispatch({ issueId: "issue-73", issueIdentifier: "AII-73", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/73");
 
     const { req, res } = makeRequest(SECRET, "issue_comment", {
@@ -2384,29 +2385,19 @@ describe("/ai-implement comment trigger", () => {
   });
 
   describe("transient GitHub failures (AII-1292)", () => {
-    const mockFetch = vi.fn<typeof fetch>();
-    beforeEach(() => {
-      mockFetch.mockReset();
-      mockFetch.mockImplementation((url: string | URL | Request) => {
-        const urlStr = String(url);
-        if (urlStr.includes("/collaborators/")) {
-          return Promise.resolve(new Response(JSON.stringify({ permission: "write" }), { status: 200 }));
-        }
-        if (urlStr.includes("/reactions")) {
-          return Promise.resolve(new Response("", { status: 201 }));
-        }
-        return Promise.resolve(new Response("", { status: 404 }));
-      });
-      vi.stubGlobal("fetch", mockFetch);
-    });
-    afterEach(() => {
-      vi.unstubAllGlobals();
-    });
+    const WRITER: Reply = { json: { permission: "write", role_name: "write", user: { login: "alice", type: "User" } } };
+    /** GitHub's REST answers for the trigger on org/repo#1: the commenter's permission (one reply for every check,
+     *  or a list served in order), the 👀 reaction, and the reason comment the handler posts when it gives up. */
+    function triggerApi(permission: Reply | Reply[] = WRITER): FakeFetch {
+      return fakeFetch({
+        "GET /repos/org/repo/collaborators/alice/permission": permission,
+        "POST /repos/org/repo/issues/comments/9001/reactions": { status: 201, json: { id: 1, content: "eyes", user: { login: "ai-implement[bot]", type: "Bot" } } },
+        "POST /repos/org/repo/issues/1/comments": { status: 201, json: { id: 5001, html_url: "https://github.com/org/repo/pull/1#issuecomment-5001" } },
+      }).install();
+    }
 
-    const reasonComments = () => mockFetch.mock.calls.filter(([url, init]) =>
-      String(url).includes("/issues/1/comments") && (init as RequestInit | undefined)?.method === "POST");
-    const reactions = () => mockFetch.mock.calls.filter(([url]) => String(url).includes("/reactions"));
-    const permOk = () => new Response(JSON.stringify({ permission: "write" }), { status: 200 });
+    const reasonComments = (github: FakeFetch) => github.calls.filter((c) => c.method === "POST" && c.path === "/repos/org/repo/issues/1/comments");
+    const reactions = (github: FakeFetch) => github.calls.filter((c) => c.path.endsWith("/reactions"));
 
     async function post(): Promise<{ statusCode: number; body: Record<string, unknown> }> {
       const { req, res } = makeRequest(SECRET, "issue_comment", makeAiImplComment("/ai-implement fix it"));
@@ -2419,67 +2410,62 @@ describe("/ai-implement comment trigger", () => {
       hoisted.getMappings.mockReturnValue(orgRepoMapping());
       hoisted.resolveWorkflowContract.mockClear();
       hoisted.resolveWorkflowContract.mockRejectedValue(new Error("probe"));
-      mockFetch.mockImplementation(() => Promise.resolve(new Response("{}", { status: 201 })));
+      const github = triggerApi();
 
       const out = await post();
 
       expect(out.body).toMatchObject({ ignored: true, reason: "contract_probe_failed" });
       expect(hoisted.resolveWorkflowContract).toHaveBeenCalledTimes(2);
       expect((hoisted.resolveWorkflowContract.mock.calls[0] as unknown[])[0]).toMatchObject({ failOnTransient: true });
-      expect(reasonComments()).toHaveLength(1);
-      expect(reactions()).toHaveLength(0);
+      expect(reasonComments(github)).toHaveLength(1);
+      expect(reactions(github)).toHaveLength(0);
       expect(commentGapfillQueue.claimPendingCommentGapfills(10)).toHaveLength(0);
     });
 
     it("probe failing once then succeeding queues the comment with 👀", async () => {
       hoisted.getMappings.mockReturnValue(orgRepoMapping());
       hoisted.resolveWorkflowContract.mockRejectedValueOnce(new Error("probe")).mockResolvedValue("envelope");
+      const github = triggerApi();
 
       const out = await post();
 
       expect(out.body).toMatchObject({ queued: true });
-      expect(reasonComments()).toHaveLength(0);
-      expect(reactions()).toHaveLength(1);
+      expect(reasonComments(github)).toHaveLength(0);
+      // The handler sends the reaction without awaiting it.
+      await vi.waitFor(() => expect(reactions(github)).toHaveLength(1));
     });
 
     it("permission API errors twice give permission_check_failed with one comment", async () => {
       hoisted.getMappings.mockReturnValue(orgRepoMapping());
-      mockFetch.mockImplementation((url: string | URL | Request) =>
-        Promise.resolve(String(url).includes("/collaborators/") ? new Response("", { status: 503 }) : new Response("{}", { status: 201 })));
+      const github = triggerApi(githubError(503, "Service Unavailable"));
 
       const out = await post();
 
       expect(out.body).toMatchObject({ ignored: true, reason: "permission_check_failed" });
-      expect(reasonComments()).toHaveLength(1);
-      expect(reactions()).toHaveLength(0);
+      expect(reasonComments(github)).toHaveLength(1);
+      expect(reactions(github)).toHaveLength(0);
       expect(commentGapfillQueue.claimPendingCommentGapfills(10)).toHaveLength(0);
     });
 
     it("a permission error then a 200 queues the comment", async () => {
       hoisted.getMappings.mockReturnValue(orgRepoMapping());
-      let permCalls = 0;
-      mockFetch.mockImplementation((url: string | URL | Request) => {
-        if (String(url).includes("/collaborators/")) {
-          return Promise.resolve(++permCalls === 1 ? new Response("", { status: 500 }) : permOk());
-        }
-        return Promise.resolve(new Response("{}", { status: 201 }));
-      });
+      const github = triggerApi([githubError(500, "Internal Server Error"), WRITER]);
 
       const out = await post();
 
       expect(out.body).toMatchObject({ queued: true });
-      expect(reasonComments()).toHaveLength(0);
+      expect(reasonComments(github)).toHaveLength(0);
+      await vi.waitFor(() => expect(reactions(github)).toHaveLength(1));
     });
 
     it("a 404 from the permission API is a non-writer, not an error", async () => {
       hoisted.getMappings.mockReturnValue(orgRepoMapping());
-      mockFetch.mockImplementation((url: string | URL | Request) =>
-        Promise.resolve(String(url).includes("/collaborators/") ? new Response("", { status: 404 }) : new Response("{}", { status: 201 })));
+      const github = triggerApi(githubError(404, "Not Found"));
 
       const out = await post();
 
       expect(out.body).toMatchObject({ ignored: true, reason: "insufficient_permission" });
-      expect(reasonComments()).toHaveLength(0);
+      expect(reasonComments(github)).toHaveLength(0);
     });
   });
 
