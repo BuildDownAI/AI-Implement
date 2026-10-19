@@ -19,8 +19,9 @@
  *
  * A snapshot held at the decision gate (AII-1489) is also state here, not a suspended run: the gate run calls
  * `hold` and ends, `release` for the held trigger keeps the lock while `held` is set, and `decide` (accept,
- * cancel, or the timeout `hold` armed) clears the hold and calls `submit` with a `resume` input, so the decision
- * is a new `KgRefresh` run and the marker follows it.
+ * cancel, or the timeout `hold` armed) marks the hold `decided` and calls `submit` with a `resume` input, so the
+ * decision is a new `KgRefresh` run and the marker follows it. The hold stays until that run ends (AII-1493):
+ * `release` clears it when the run returned and reopens it when the run was killed.
  *
  * kg-refresh has one owner, unlike the review-fix pilot this pattern is anchored on
  * (`src/restate/review-fix-pr.ts`) — so this object carries none of the pilot's shared
@@ -89,6 +90,12 @@ const recordOutcomeInputSchema = z.object({
 }).strict();
 
 const leaseInputSchema = z.object({ triggerId: z.string().min(1) }).strict();
+
+/** `release`'s input. `ended` is how the run ended, from `watch` (AII-1493); the run's own `finally` sends none, which reads as `returned`. */
+const releaseInputSchema = z.object({
+  triggerId: z.string().min(1),
+  ended: z.enum(["returned", "killed"]).optional(),
+}).strict();
 
 export const kgRepoDecideSchema = z.object({
   action: z.enum(["accept", "cancel", "timeout"]),
@@ -224,7 +231,7 @@ export function createKgRepo(deps: KgRepoDependencies) {
   }
 
   /**
-   * The one decision door: accept, cancel, or the timeout the hold armed. It clears the hold and starts the
+   * The one decision door: accept, cancel, or the timeout the hold armed. It marks the hold decided and starts the
    * decision as a new `KgRefresh` run (`resume`), which takes over the lock. Exclusive, so two decisions never interleave.
    */
   async function decide(ctx: ObjectContext, input: KgRepoDecideInput): Promise<KgRepoDecideResult> {
@@ -233,7 +240,7 @@ export function createKgRepo(deps: KgRepoDependencies) {
     if (isTimeout && input.triggerId === undefined) {
       throw new restate.TerminalError("a timeout names its hold", { errorCode: 400 });
     }
-    if (!held || (input.triggerId !== undefined && input.triggerId !== held.triggerId)) {
+    if (!held || held.decided !== undefined || (input.triggerId !== undefined && input.triggerId !== held.triggerId)) {
       // A timer after a decision, or from an older hold, is not an error: it has nothing to decide.
       if (isTimeout) return null;
       throw new restate.TerminalError("no-decision-open", { errorCode: 409 });
@@ -242,17 +249,43 @@ export function createKgRepo(deps: KgRepoDependencies) {
       if (held.report.acceptBlocked === true) throw new restate.TerminalError("accept-blocked", { errorCode: 409 });
       if (input.actor === undefined) throw new restate.TerminalError("accept needs an actor", { errorCode: 400 });
     }
-    ctx.clear("held");
+    // The hold stays until the resumed run ends (AII-1493): `release` clears it when the run returns and reopens it when the run is killed.
     const triggerId = await submit(ctx, await ctx.date.now(), {}, {
       hold: held,
       action: input.action,
       ...(input.actor !== undefined ? { actor: input.actor } : {}),
       ...(input.reason !== undefined ? { reason: input.reason } : {}),
     });
+    ctx.set<KgHold>("held", { ...held, decided: { action: input.action, triggerId } });
     return { triggerId };
   }
 
-  async function release(ctx: ObjectContext, input: { triggerId: string }): Promise<void> {
+  /**
+   * Frees the lock of a run that ended. For the trigger a decision handed the hold to (AII-1493), `returned` clears the
+   * hold and drains; `killed` reopens it: the decision is cleared, the marker goes back to the hold's own trigger (lock kept),
+   * and a timeout is armed at `decideBy`, so the operator can decide again.
+   */
+  async function release(ctx: ObjectContext, input: { triggerId: string; ended?: "returned" | "killed" }): Promise<void> {
+    const held = await ctx.get<KgHold>("held");
+    if (held?.decided?.triggerId === input.triggerId) {
+      const inFlight = await ctx.get<InFlightMarker>("inFlight");
+      if (inFlight?.triggerId === input.triggerId) {
+        if (input.ended === "killed") {
+          const { decided: _decided, ...open } = held;
+          ctx.set<KgHold>("held", open);
+          ctx.set<InFlightMarker>("inFlight", { triggerId: held.triggerId, startedAt: await ctx.date.now() });
+          ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, ctx.key).decide(
+            { action: "timeout", triggerId: held.triggerId },
+            restate.rpc.sendOpts({ delay: Math.max(0, held.decideBy - (await ctx.date.now())) }),
+          );
+          return;
+        }
+        ctx.clear("held");
+      } else if (input.ended !== "killed") {
+        // The marker moved on; the hold is this run's to clear.
+        ctx.clear("held");
+      }
+    }
     await clearAndDrain(ctx, input.triggerId);
   }
 
@@ -263,13 +296,26 @@ export function createKgRepo(deps: KgRepoDependencies) {
    * `attach` throw; every error means the run is over, so all are swallowed and the release still goes out.
    */
   async function watch(ctx: ObjectSharedContext, input: { triggerId: string; invocationId: string }): Promise<void> {
+    let ended: "returned" | "killed" = "returned";
     try {
       await ctx.invocation(input.invocationId as InvocationId).attach();
     } catch (err) {
       if (restate.internal.isSuspendedError(err)) throw err;
       // The run ended by failure, kill or cancel; the release below is the point.
+      ended = "killed";
     }
-    ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, ctx.key).release({ triggerId: input.triggerId });
+    if (ended === "killed") {
+      // A run past its commit point may already have merged the snapshot PR: it counts as returned, so its hold is
+      // cleared and never reopened for a second merge (AII-1493). Any failed read errs the same safe way.
+      try {
+        const wf = await ctx.workflowClient<KgRefreshDefinition>({ name: deps.workflowName as "KgRefresh" }, input.triggerId).status();
+        if (wf.committed) ended = "returned";
+      } catch (err) {
+        if (restate.internal.isSuspendedError(err)) throw err;
+        ended = "returned";
+      }
+    }
+    ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, ctx.key).release({ triggerId: input.triggerId, ended });
   }
 
   /** Clears a legacy marker (no `invocationId`) that never released. A marker with an `invocationId` is held by its run, never by a clock. */
@@ -319,7 +365,7 @@ export function createKgRepo(deps: KgRepoDependencies) {
     const pending = (await ctx.get<Record<string, PendingDryRun>>("pending")) ?? {};
     // While a hold stands, the marker is the held trigger's and no run is in flight.
     const held = await ctx.get<KgHold>("held");
-    return { ...inFlight, pending: Object.keys(pending), held: held ? heldViewOf(held) : null };
+    return { ...inFlight, pending: Object.keys(pending), held: held && held.decided === undefined ? heldViewOf(held) : null };
   }
 
   return restate.object({
@@ -329,7 +375,7 @@ export function createKgRepo(deps: KgRepoDependencies) {
       enqueueDryRun: restate.handlers.object.exclusive({ input: serde.zod(enqueueInputSchema) }, enqueueDryRun),
       hold: restate.handlers.object.exclusive({ input: serde.zod(kgHoldSchema), ingressPrivate: true }, hold),
       decide: restate.handlers.object.exclusive({ input: serde.zod(kgRepoDecideSchema) }, decide),
-      release: restate.handlers.object.exclusive({ input: serde.zod(leaseInputSchema), ingressPrivate: true }, release),
+      release: restate.handlers.object.exclusive({ input: serde.zod(releaseInputSchema), ingressPrivate: true }, release),
       expire: restate.handlers.object.exclusive({ input: serde.zod(leaseInputSchema), ingressPrivate: true }, expire),
       watch: restate.handlers.object.shared({ input: serde.zod(watchInputSchema), ingressPrivate: true, explicitCancellation: true }, watch),
       recordDryRunOutcome: restate.handlers.object.exclusive({ input: serde.zod(recordOutcomeInputSchema), ingressPrivate: true }, recordDryRunOutcome),
