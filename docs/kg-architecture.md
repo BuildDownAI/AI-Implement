@@ -586,6 +586,16 @@ the way `failedTeams` does: `kg-refresh-run.ts` → `postRunnerResult` → `runn
 `status.held.sources` while the run waits at the decision gate. Only success, dry-run, and held reports
 carry it; other failures send none. A runner that predates the field sends none and reads as `[]`.
 
+### Base-repo PR dry runs (AII-1481)
+
+`handleKgPrCheckWebhook` admits PRs from `kgSourceRepo` and `kgBaseRepo`. A source-repo PR sends
+`{ ref: head.ref }`, so the run clones that branch. A base-repo PR's branch exists only in the base
+repo, so it sends `{ baseMerge: { repo, prNumber, baseSha, headSha } }` instead and the run uses the
+KG repo's default branch. A base-repo PR without `base.sha` is answered `missing_pr_fields`. Exactly
+one of `ref` and `baseMerge` reaches `KgRepo.enqueueDryRun`; `submit` and `clearAndDrain` turn it into
+`kgSourceRef` or `kgBaseMerge`, and `buildEnvelope` copies `kgBaseMerge` into the envelope. Dedup stays
+keyed on the head SHA, so a new base commit with an unchanged head does not re-run.
+
 ### Held-verdict plumbing (AII-1253, AII-1264)
 
 The run envelope carries one guard-related flag, `kgDryRun`, and it is set only by the KG-repo PR

@@ -385,6 +385,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     ref: string;
     sha: string;
     repo: string;
+    baseSha?: string;
     labels?: string[];
     /** The single label GitHub reports as added on a `labeled` action (distinct from the cumulative `labels` list). */
     label?: string;
@@ -395,6 +396,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
         number: opts.number,
         html_url: `https://github.com/${opts.repo}/pull/${opts.number}`,
         head: { ref: opts.ref, sha: opts.sha },
+        ...(opts.baseSha !== undefined ? { base: { ref: "main", sha: opts.baseSha } } : {}),
         labels: (opts.labels ?? []).map((name) => ({ name })),
       },
       ...(opts.label !== undefined ? { label: { name: opts.label } } : {}),
@@ -474,6 +476,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
         number: 5,
         ref: "kg-upstream/2026-09-13",
         sha: "sha-5",
+        baseSha: "base-5",
         repo: KG_BASE_REPO,
       }),
     );
@@ -483,10 +486,30 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     expect(enqueueDryRun).toHaveBeenCalledTimes(1);
     expect(enqueueDryRun).toHaveBeenCalledWith(
       `${KG_BASE_REPO}#5`,
-      { ref: "kg-upstream/2026-09-13", report: { repo: KG_BASE_REPO, prNumber: 5, sha: "sha-5" } },
+      {
+        baseMerge: { repo: KG_BASE_REPO, prNumber: 5, baseSha: "base-5", headSha: "sha-5" },
+        report: { repo: KG_BASE_REPO, prNumber: 5, sha: "sha-5" },
+      },
       undefined,
     );
+    expect(enqueueDryRun.mock.calls[0][1]).not.toHaveProperty("ref");
     expect(res.statusCode).toBe(202);
+  });
+
+  it("ignores a base-repo PR with no base sha", async () => {
+    const enqueueDryRun = vi.fn();
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "opened", number: 6, ref: "kg-upstream/x", sha: "sha-6", repo: KG_BASE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(enqueueDryRun).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "missing_pr_fields" });
   });
 
   it("does not trigger a synchronize touching only unrelated files", async () => {

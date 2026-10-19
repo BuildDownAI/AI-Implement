@@ -73,10 +73,21 @@ export const kgDryRunReportSchema = z.object({
   acceptBaseline: z.boolean().optional(), // tolerated for queued inputs; remove after 2026-12-01
 });
 
+/** A base-template PR to merge into the scratch clone (dry run only); mirrors `RunConfigV1.kgBaseMerge`. */
+export const kgBaseMergeSchema = z.object({
+  repo: z.string().min(1),
+  prNumber: z.number(),
+  baseSha: z.string().min(1),
+  headSha: z.string().min(1),
+}).strict();
+
+export type KgBaseMerge = z.infer<typeof kgBaseMergeSchema>;
+
 /** Options a caller may set on one refresh; `KgRepo.trigger` validates exactly these. */
 export const kgRefreshOptionsSchema = z.object({
   dryRun: z.boolean().optional(),
   kgSourceRef: z.string().optional(),
+  kgBaseMerge: kgBaseMergeSchema.optional(),
   acceptNewBaseline: z.boolean().optional(), // tolerated for in-flight inputs; remove after 2026-11-13
   actorEmail: z.string().optional(),
 }).strict();

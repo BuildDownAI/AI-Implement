@@ -15,7 +15,7 @@ const HOLD_MS = 24 * 60 * 60 * 1000;
 
 interface RunSend {
   key: string;
-  parameter: { triggerId: string; dryRun?: boolean; kgSourceRef?: string; acceptNewBaseline?: boolean; report?: { repo: string; prNumber: number; sha: string } };
+  parameter: { triggerId: string; dryRun?: boolean; kgSourceRef?: string; kgBaseMerge?: unknown; acceptNewBaseline?: boolean; report?: { repo: string; prNumber: number; sha: string } };
 }
 
 // release, expire and recordDryRunOutcome are ingressPrivate (AII-976): only another handler
@@ -372,6 +372,50 @@ describe("KgRepo durable single-flight lock", () => {
     },
   );
 
+  const baseMergeFor = (prNumber: number) => ({
+    repo: "org/kg-base", prNumber, baseSha: `base-${prNumber}`, headSha: `head-${prNumber}`,
+  });
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "enqueueDryRun with baseMerge on an idle object submits kgBaseMerge and no kgSourceRef (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      const before = runSends.length;
+      const result = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", slug, "enqueueDryRun", {
+        key: "org/kg-base#7", baseMerge: baseMergeFor(7), report: { repo: "org/kg-base", prNumber: 7, sha: "head-7" },
+      });
+      await eventually(() => runSends.length - before >= 1, (ok) => ok, { label: "durable effect" });
+      expect(runSends[runSends.length - 1]).toEqual({
+        key: result.triggerId,
+        parameter: {
+          dryRun: true,
+          kgBaseMerge: baseMergeFor(7),
+          report: { repo: "org/kg-base", prNumber: 7, sha: "head-7" },
+          triggerId: result.triggerId,
+        },
+      });
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "enqueueDryRun refuses both ref and baseMerge, neither, or a malformed baseMerge, leaving no state (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      const before = runSends.length;
+      const report = { repo: "org/kg-base", prNumber: 7, sha: "head-7" };
+      const call = (extra: Record<string, unknown>) =>
+        callObject(env.baseUrl(), "KgRepo", slug, "enqueueDryRun", { key: "org/kg-base#7", report, ...extra });
+      await expect(call({ ref: "br", baseMerge: baseMergeFor(7) })).rejects.toThrow();
+      await expect(call({})).rejects.toThrow();
+      await expect(call({ baseMerge: { ...baseMergeFor(7), headSha: undefined } })).rejects.toThrow();
+      await expect(call({ baseMerge: { ...baseMergeFor(7), prNumber: "7" } })).rejects.toThrow();
+      expect(await repoStatus(env.baseUrl(), slug)).toBeNull();
+      expect(runSends.length).toBe(before);
+    },
+  );
+
   it.each(VARIANTS.map(([label]) => label))(
     "enqueueDryRun rejects input missing its key, ref, or report, leaving no state (%s)",
     async (label) => {
@@ -529,11 +573,11 @@ describe("KgRepo durable single-flight lock", () => {
 });
 
 describe("KgRepo run-held lock", () => {
-  const sends: Array<{ key: string; parameter: { triggerId: string; kgSourceRef?: string } }> = [];
+  const sends: Array<{ key: string; parameter: { triggerId: string; kgSourceRef?: string; kgBaseMerge?: unknown } }> = [];
   const holdingKgRefresh = restate.object({
     name: FAKE_WORKFLOW_NAME,
     handlers: {
-      run: async (ctx: restate.ObjectContext, input: { triggerId: string; kgSourceRef?: string }): Promise<void> => {
+      run: async (ctx: restate.ObjectContext, input: { triggerId: string; kgSourceRef?: string; kgBaseMerge?: unknown }): Promise<void> => {
         sends.push({ key: ctx.key, parameter: input });
         await ctx.sleep(HOLD_MS);
       },
@@ -701,6 +745,29 @@ describe("KgRepo run-held lock", () => {
       expect(marker.triggerId).not.toBe(triggerId);
       expect(marker.invocationId).toEqual(expect.any(String));
       expect(sends.length - before).toBe(2);
+    },
+    60_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "a queued baseMerge dry run is submitted with kgBaseMerge and no kgSourceRef after the release (%s)",
+    async (label) => {
+      const env = pick(production, label);
+      const slug = slugOf();
+      const before = sends.length;
+      const { triggerId } = (await trigger(env, slug)) as { triggerId: string };
+      const baseMerge = { repo: "org/kg-base", prNumber: 3, baseSha: "base-3", headSha: "head-3" };
+      expect(await callObject(env.baseUrl(), "KgRepo", slug, "enqueueDryRun", {
+        key: "org/kg-base#3", baseMerge, report: { repo: "org/kg-base", prNumber: 3, sha: "head-3" },
+      })).toEqual({ queued: true });
+      await settle(MARKER_AGE_WAIT_MS);
+      expect(sends.length - before).toBe(1);
+
+      await killInvocation(env.adminAPIBaseUrl(), String((await runRow(env, FAKE_WORKFLOW_NAME, triggerId)).id));
+      await eventually(() => sends.slice(before).filter((s) => s.parameter.kgBaseMerge !== undefined).length, (n) => n === 1, { label: "queued baseMerge dry run submitted after the release", timeoutMs: 30_000, intervalMs: 50 });
+      const drained = sends.slice(before).find((s) => s.parameter.kgBaseMerge !== undefined)!;
+      expect(drained.parameter.kgBaseMerge).toEqual(baseMerge);
+      expect(drained.parameter).not.toHaveProperty("kgSourceRef");
     },
     60_000,
   );

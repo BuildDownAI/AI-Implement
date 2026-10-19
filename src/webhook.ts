@@ -15,6 +15,7 @@ import { enqueueCommentGapfill } from "./comment-gapfill-queue.js";
 import { addCommentReaction, listPullRequestFiles, postPrComment } from "./github.js";
 import { refreshAvailability, type SelfDeployTarget } from "./deploy-availability.js";
 import type { KgDryRunReportTarget } from "./kg-refresh.js";
+import type { KgBaseMerge } from "./restate/kg-refresh-workflow.js";
 import { KG_SNAPSHOT_BRANCH_PREFIX } from "./pipeline/steps/kg-snapshot-push.js";
 
 function readRawBody(req: http.IncomingMessage): Promise<Buffer> {
@@ -48,6 +49,7 @@ interface PullRequestPayload {
     merged?: boolean;
     html_url?: string;
     head?: { ref?: string; sha?: string };
+    base?: { ref?: string; sha?: string };
     merge_commit_sha?: string;
   };
   repository?: {
@@ -70,7 +72,7 @@ export interface KgPrCheckConfig {
    */
   enqueueDryRun: (
     key: string,
-    entry: { ref: string; report: KgDryRunReportTarget },
+    entry: { ref?: string; baseMerge?: KgBaseMerge; report: KgDryRunReportTarget },
     opts?: { idempotencyKey?: string },
   ) => Promise<
     | { status: "accepted"; value?: { triggerId: string } | { queued: true } | { duplicate: true } | { closed: true } }
@@ -145,7 +147,9 @@ async function handleKgPrCheckWebhook(
     return owns;
   };
 
-  if (!sha || !headRef) {
+  const baseSha = payload.pull_request?.base?.sha;
+  const isSourceRepo = repoFullName === kgPrCheck.kgSourceRepo;
+  if (!sha || !headRef || (!isSourceRepo && !baseSha)) {
     return answer(200, { ignored: true, reason: "missing_pr_fields" }, "missing PR fields");
   }
 
@@ -189,7 +193,10 @@ async function handleKgPrCheckWebhook(
   };
 
   const result = await kgPrCheck
-    .enqueueDryRun(key, { ref: headRef, report }, deliveryId ? { idempotencyKey: deliveryId } : undefined)
+    .enqueueDryRun(
+      key,
+      isSourceRepo ? { ref: headRef, report } : { baseMerge: { repo: repoFullName, prNumber, baseSha: baseSha!, headSha: sha }, report },
+      deliveryId ? { idempotencyKey: deliveryId } : undefined)
     .catch((err) => {
       console.error(`[webhook] kg-refresh dry-run enqueue failed for ${repoFullName}#${prNumber}:`, err);
       return { status: "unavailable" as const };
