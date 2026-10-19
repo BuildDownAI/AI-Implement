@@ -774,15 +774,15 @@ describe("kg current run card (AII-1260)", () => {
     expect(m.calls).toEqual([]);
   });
 
-  it("shows a tool error such as already-decided", async () => {
+  it("shows a tool error such as no-decision-open", async () => {
     const m = mount({
       currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held },
-      decideReply: { isError: true, content: [{ type: "text", text: "already-decided" }] },
+      decideReply: { isError: true, content: [{ type: "text", text: "no-decision-open" }] },
     });
     await m.win.decideKgRefresh("accept");
     const err = m.doc.getElementById("kg-pipelines-error") as HTMLElement;
     expect(err.hidden).toBe(false);
-    expect(err.textContent).toContain("already-decided");
+    expect(err.textContent).toContain("no-decision-open");
   });
 
   it("the page source drops the dry-run and trigger-time accept code", () => {
