@@ -370,7 +370,7 @@ How it works: `run` is registered with `explicitCancellation: true`, so Restate 
 | `await-progress` (GitHub run known) | run cancelled, row closed, released |
 | `await-progress` (Fly) | machine stopped, row closed, released |
 | held (a `KgRepo` record, no run) | `KgRepo.decide` cancel or timeout: a new run closes the PR and the row and releases |
-| accepted, before the merge starts (the baseline note) | PR closed, row `operator_cancelled`, released; no merge. Exception: reason `superseded_by_schedule` is overridden by the accept and the merge continues |
+| accepted, before the merge starts (the baseline note) | PR closed, row `operator_cancelled`, released; no merge |
 | `merge` / gates and after | no cleanup: the run finishes; the cancel answers `past-merge` |
 
 The journal shape changed in AII-1296 (the cancel arm in the races, the pre-dispatch and commit-point sleeps, the commit resolve), so deploy and revert only with no refresh in flight.
@@ -508,8 +508,8 @@ only; they carry no decision buttons). The card renders `GET /api/kg/status` and
 | set, no open decision | "Run in flight: <step>" and **Cancel** |
 | set, `accept` open (`awaiting-decision`) | "Held for a decision until <decideBy>", the part table (part / previous / new / delta), a link to the held PR, **Accept new baseline & refresh** and **Cancel** |
 
-Both decision buttons ask `confirm()` and post `{ args: { action } }` to `/api/tools/decide_kg_refresh`,
-which carries the `triggerId` of the hold the card shows, so a decision acts only on that hold; a
+Both decision buttons ask `confirm()` and post `{ args: { action, triggerId } }` to `/api/tools/decide_kg_refresh`
+when a hold is shown (`triggerId` is that hold's), so a decision acts only on that hold; a
 `no-decision-open` answer (the hold is gone or replaced) is shown in the page's message box. If the status call fails the card is hidden
 and offers no action. The same runs also appear on the Pipelines page with the `kg` badge, because that
 page is the complete dispatch log. Deployments keeps only the deploy-side signals: the drain tile counts an
