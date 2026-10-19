@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as restate from "@restatedev/restate-sdk";
+import { createEndpointHandler } from "@restatedev/restate-sdk/node";
 import type { RestateEnvironment } from "./harness.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CreateMachineOpts, Machine, MachineExit } from "../../fly-machines.js";
@@ -41,6 +42,7 @@ import {
   type KgDispatchResult,
   type KgRefreshReportBody,
 } from "../../restate/kg-refresh-workflow.js";
+import { queryNonCompletedInvocations } from "../../restate/endpoint.js";
 import { registerOwnedRunContract } from "./owned-run-contract.js";
 import {
   VARIANTS, attachWorkflow, callObject, callService, callWorkflow, cancelInvocation, eventually, gate, queryInvocations, replaceEndpoint, settle,
@@ -3544,6 +3546,120 @@ describe("KgRefresh durable workflow", () => {
         expect(await runReleases(env, resumed)).toBe(1);
       },
       60_000,
+    );
+
+    /** Names of the services registered at this variant's endpoint URI. */
+    const deployedServices = async (env: RestateEnvironment, uri: string): Promise<string[]> => {
+      const response = await fetch(`${env.adminAPIBaseUrl()}/deployments`);
+      const body = (await response.json()) as { deployments: Array<{ uri?: string; http?: { uri?: string }; services: Array<{ name: string }> }> };
+      return body.deployments
+        .filter((d) => (d.uri ?? d.http?.uri)?.replace(/\/+$/, "") === uri)
+        .flatMap((d) => d.services.map((svc) => svc.name));
+    };
+
+    let probeCounter = 0;
+    /**
+     * Ships a new build at the same address: the live server keeps its sessions, so only its request handler changes, to one
+     * with an extra service. Restate does not rediscover a duplicate URI on its own, which is why a deploy forces.
+     */
+    function swapEndpoint(env: RestateEnvironment): void {
+      const probe = restate.service({ name: `DeployProbe${probeCounter++}`, handlers: { ping: async () => "ok" } });
+      const handler = createEndpointHandler({ services: [heldWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile, orchestratorTools, probe] });
+      env.startedRestateHttpServer.removeAllListeners("request");
+      env.startedRestateHttpServer.on("request", handler as (...args: unknown[]) => void);
+    }
+
+    /** A deploy over a hold: proves nothing drains on the hold, then forces a re-registration at the same URI. */
+    async function deployOverHold(env: RestateEnvironment, gateId: string): Promise<void> {
+      const uri = `http://127.0.0.1:${env.endpointPort()}`;
+      // The hold is state plus a scheduled timer: no run, no watch, and nothing the drain counts.
+      expect(await openInvocations(env, `target_service_name = 'KgRefresh' AND target_service_key = '${gateId}'`)).toEqual([]);
+      await eventually(
+        () => openInvocations(env, `target_service_name = 'KgRepo' AND target_handler_name = 'watch'`),
+        (open) => open.length === 0,
+        { label: "no watch stays open" },
+      );
+      expect(await scheduledDecides(env)).toBeGreaterThanOrEqual(1);
+      expect(await eventually(() => queryNonCompletedInvocations(fetch, env.adminAPIBaseUrl(), uri), (n) => n === 0, { label: "nothing to drain" })).toBe(0);
+      // The row-side drain signal (getInFlightWork) is covered against the real log in deploy.test.ts.
+
+      const before = await deployedServices(env, uri);
+      swapEndpoint(env);
+      const forced = await fetch(`${env.adminAPIBaseUrl()}/deployments`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ uri, force: true }),
+      });
+      expect(forced.ok).toBe(true);
+      // The deployment was replaced (the new build's service set is registered), not answered as an unchanged duplicate.
+      const after = await deployedServices(env, uri);
+      const probe = `DeployProbe${probeCounter - 1}`;
+      expect(before).not.toContain(probe);
+      expect(after).toContain(probe);
+      // The hold and its timer came through untouched.
+      expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId: gateId, held: { snapshotPr: 77 } });
+      expect(await scheduledDecides(env)).toBeGreaterThanOrEqual(1);
+    }
+
+    it.each(LABELS)(
+      "a hold survives a forced re-registration: accept then merges and serves in a new run and releases the lock once (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env);
+        await deployOverHold(env, triggerId);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, ACCEPT);
+
+        expect(resumed).not.toBe(triggerId);
+        expect(outcome.ok).toBe(true);
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
+        expect(gateOrder).toEqual(["fetch", "stage", "swap", "verify"]);
+        expect(closeRowsFor(triggerId).map((r) => [r.status, r.conclusion])).toEqual([["completed", "awaiting_decision"], ["completed", "passed"]]);
+        await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "marker cleared" });
+        await settle(300);
+        expect(await runReleases(env, resumed)).toBe(1);
+      },
+      90_000,
+    );
+
+    it.each(LABELS)(
+      "a hold survives a forced re-registration: cancel then closes the PR once as operator_cancelled and releases the lock once (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env);
+        await deployOverHold(env, triggerId);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, { action: "cancel", actor: "ada@example.com" });
+
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        expect(postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!).toContain("operator_cancelled");
+        expect(closeRowsFor(triggerId).map((r) => r.conclusion)).toEqual(["awaiting_decision", "operator_cancelled"]);
+        await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "marker cleared" });
+        await settle(300);
+        expect(await runReleases(env, resumed)).toBe(1);
+      },
+      90_000,
+    );
+
+    it.each(LABELS)(
+      "a hold survives a forced re-registration: the timeout, sent as KgRepo.decide, closes the PR as decision_timeout and releases the lock once (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env);
+        await deployOverHold(env, triggerId);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, { action: "timeout" });
+
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        expect(postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!).toContain("decision_timeout");
+        expect(closeRowsFor(triggerId).map((r) => r.conclusion)).toEqual(["awaiting_decision", "decision_timeout"]);
+        await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "marker cleared" });
+        await settle(300);
+        expect(await runReleases(env, resumed)).toBe(1);
+      },
+      90_000,
     );
 
     it.each(LABELS)(

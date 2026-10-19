@@ -508,7 +508,9 @@ which takes no trigger id, so it can only act on the current run; an `already-de
 `no-decision-open` answer is shown in the page's message box. If the status call fails the card is hidden
 and offers no action. The same runs also appear on the Pipelines page with the `kg` badge, because that
 page is the complete dispatch log. Deployments keeps only the deploy-side signals: the drain tile counts an
-in-flight KG ingest run, and a release whose sidecar does not serve records "Released, but the knowledge
+in-flight KG ingest run (a held refresh is not one: it is `KgRepo` state plus a delayed `decide` message, so it does
+not hold a deploy, `waitForQuiet` ignores its `completed` / `awaiting_decision` row, and the endpoint drain does not
+count the scheduled timer), and a release whose sidecar does not serve records "Released, but the knowledge
 graph is not serving".
 
 ## Refresh rail implementation (AII-426, AII-495)
