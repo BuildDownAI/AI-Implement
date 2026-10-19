@@ -2625,6 +2625,42 @@ describe("KgRefresh durable workflow", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
+    "AII-1482: a dry run with kgBaseMerge reports Not checked for a behind KG repo and for an old runner (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const kgBaseMerge = { repo: "Org/base", prNumber: 3, baseSha: "b".repeat(40), headSha: "c".repeat(40) };
+      const reportTarget = { repo: KG_SOURCE_REPO, prNumber: 8, sha: "d".repeat(40) };
+      const runCase = async (body: Record<string, unknown>) => {
+        const triggerId = newTriggerId();
+        makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+        const beforeStatus = setCommitStatusFn.mock.calls.length;
+        const beforeSticky = postOrUpdateStickyCommentFn.mock.calls.length;
+        const done = runWorkflow(env.baseUrl(), triggerId, { dryRun: true, report: reportTarget, kgBaseMerge });
+        await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", body);
+        await done;
+        return {
+          status: (setCommitStatusFn.mock.calls[beforeStatus] as unknown[])[4] as { state: string; description: string },
+          comment: (postOrUpdateStickyCommentFn.mock.calls[beforeSticky] as unknown[])[5] as string,
+        };
+      };
+
+      const behind = await runCase({
+        ok: false, failureCode: "KG_BASE_BEHIND",
+        baseMerge: { headSha: "c".repeat(40), result: "behind", conflictPaths: ["kg_ingest/cli.py"] },
+      });
+      expect(behind.status).toMatchObject({ state: "success", description: "Not checked: KG repo is behind base (upstream merge needed)" });
+      expect(behind.comment).toContain("`kg_ingest/cli.py`");
+
+      const old = await runCase({ ok: true });
+      expect(old.status).toMatchObject({ state: "success", description: "Not checked: runner image does not support base merges" });
+      expect(old.comment).toContain("the runner image does not support base-template merges");
+      expect(old.comment).not.toContain("dry run passed");
+    },
+    30_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
     "W16: a KG_SNAPSHOT_STALE report closes the row completed with a success no-new-data outcome, no merge (%s)",
     async (label) => {
       const env = envFor(label);

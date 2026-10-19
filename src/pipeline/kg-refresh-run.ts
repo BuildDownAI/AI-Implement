@@ -371,6 +371,10 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
                 ? "KG_INGEST_FAILED"
                 : undefined;
     const failureReason = err instanceof Error ? err.message : String(err);
+    // A merge that succeeded before a later step failed must still be echoed, so the orchestrator can tell it from an old runner.
+    const mergedBeforeFailure = baseMergeErr
+      ? undefined
+      : (context.getOutputs("kg-base-merge").baseMerge as { headSha: string; result: "merged" } | undefined);
     console.error(`[kg-refresh] run failed: ${failureCode ?? "unknown"} — ${failureReason}`);
     await configured?.finish("failed");
     // A guard refusal from kg-snapshot-push carries its per-part table on the error
@@ -395,7 +399,9 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
               ...(baseMergeErr.conflictPaths ? { conflictPaths: baseMergeErr.conflictPaths } : {}),
             },
           }
-        : {}),
+        : mergedBeforeFailure
+          ? { baseMerge: mergedBeforeFailure }
+          : {}),
       ...(guardPartTable ? { guardVerdict: isHeld ? ("held" as const) : ("refused" as const), partTable: guardPartTable } : {}),
       // A held shrink already pushed its snapshot branch and opened the PR; report them so the orchestrator can act on it.
       ...(held

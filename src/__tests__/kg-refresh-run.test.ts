@@ -4063,6 +4063,26 @@ describe("runKgRefresh — KgBaseMergeError maps to its code and echoes baseMerg
     expect(body).toBeDefined();
     expect(body).not.toHaveProperty("baseMerge");
   });
+
+  it("echoes a merged baseMerge when a later step fails", async () => {
+    const posted: Array<Record<string, unknown>> = [];
+    const merged = { headSha: spec.headSha, result: "merged" as const };
+    const result = await runKgRefresh({
+      workspaceDir: tmpDir,
+      stepsOverride: {
+        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        kgBaseMerge: makeStepModule({ baseMerge: merged }),
+        kgIngest: makeStepModule({}, new KgIngestError(1, "tail")),
+      },
+      reporter: { report: async () => undefined },
+      fetchImpl: async (_url, init) => {
+        posted.push(init?.body ? (JSON.parse(init.body as string) as Record<string, unknown>) : {});
+        return new Response(JSON.stringify({ acknowledged: true }), { status: 200 });
+      },
+    });
+    expect(result.exitCode).toBe(1);
+    expect(posted.find((r) => r.failureCode === "KG_INGEST_FAILED")?.baseMerge).toEqual(merged);
+  });
 });
 
 // ── GHA kg-refresh dispatch — runner_image resolution ────────────────────────
