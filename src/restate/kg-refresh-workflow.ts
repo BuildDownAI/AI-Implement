@@ -105,6 +105,13 @@ export interface KgRefreshReportBody {
   snapshotCommit?: string;
   snapshotBranch?: string;
   partTable?: Array<{ part: string; prev: string; new: string }>;
+  /** What the runner did with run_config.kgBaseMerge. Absent when the envelope had none, or the runner predates it. */
+  baseMerge?: {
+    headSha: string;
+    result: "merged" | "behind" | "conflict";
+    /** Ingest-path conflicts. Present for "behind" and "conflict". At most 50 entries. */
+    conflictPaths?: string[];
+  };
   /** Absent on a report from a runner that predates the field; reads as "shrink". */
   cause?: "shrink" | "tracker-missing" | "source-failed";
   failedTeams?: string[];

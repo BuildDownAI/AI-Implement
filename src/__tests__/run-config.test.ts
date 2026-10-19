@@ -616,6 +616,48 @@ describe("buildImplRunConfig", () => {
   });
 });
 
+describe("kgBaseMerge", () => {
+  const SHA_A = "a".repeat(40);
+  const SHA_B = "b".repeat(40);
+  const valid = { repo: "BuildDownAI/bd-knowledge-graph-base", prNumber: 7, baseSha: SHA_A, headSha: SHA_B };
+  const cfg = (kgBaseMerge: unknown) =>
+    ({ v: 1, issue: { id: "i", identifier: "AII-1479", title: "t", description: "" }, kgSourceRepo: "org/kg", kgBaseMerge }) as unknown as RunConfigV1;
+
+  it("round-trips a valid kgBaseMerge unchanged", () => {
+    expect(decodeRunConfig(encodeRunConfig(cfg(valid))).kgBaseMerge).toEqual(valid);
+  });
+
+  it.each([
+    ["a bad repo", { ...valid, repo: "no-slash" }],
+    ["a prNumber of 0", { ...valid, prNumber: 0 }],
+    ["a fractional prNumber", { ...valid, prNumber: 1.5 }],
+    ["a string prNumber", { ...valid, prNumber: "7" }],
+    ["a short baseSha", { ...valid, baseSha: "abc1234" }],
+    ["a short headSha", { ...valid, headSha: "abc1234" }],
+    ["an uppercase SHA", { ...valid, headSha: "A".repeat(40) }],
+    ["a non-object", "nope"],
+  ])("drops the whole field for %s and keeps the rest", (_n, bad) => {
+    const decoded = decodeRunConfig(encodeRunConfig(cfg(bad)));
+    expect("kgBaseMerge" in decoded).toBe(false);
+    expect(decoded.kgSourceRepo).toBe("org/kg");
+  });
+
+  const input = { kgSourceRepo: "org/kg", issueIdentifier: "KG-REFRESH · t", kgBaseMerge: valid };
+
+  it("buildKgRefreshRunConfig throws without dryRun: true", () => {
+    expect(() => buildKgRefreshRunConfig({ ...input, dryRun: false })).toThrow(Error);
+    expect(() => buildKgRefreshRunConfig(input)).toThrow(Error);
+  });
+
+  it("buildKgRefreshRunConfig carries kgBaseMerge on a dry run, and omits the key otherwise", () => {
+    const built = buildKgRefreshRunConfig({ ...input, dryRun: true });
+    expect(built.kgBaseMerge).toEqual(valid);
+    expect(built.kgDryRun).toBe(true);
+    const { kgBaseMerge: _omit, ...rest } = input;
+    expect("kgBaseMerge" in buildKgRefreshRunConfig(rest)).toBe(false);
+  });
+});
+
 describe("buildKgRefreshRunConfig", () => {
   const fullInput = {
     kgSourceRepo: "org/kg",
