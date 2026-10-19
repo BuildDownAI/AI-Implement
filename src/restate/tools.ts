@@ -719,6 +719,16 @@ export const decideKgRefreshTool = tool(
     // No decision is open, so `cancel` stops the run in flight. Read it again: an accept may have resumed it as a new run.
     const current = await repo.status();
     if (current == null) return toolError("no-refresh-in-flight");
+    if (current.held) {
+      // The hold was stored after the first decide: the run has ended, so only the decision door can stop it.
+      try {
+        await repo.decide({ action: "cancel", actor, triggerId: current.triggerId });
+      } catch (err) {
+        if (err instanceof restate.TerminalError && err.code === 409) return toolError("no-decision-open");
+        throw err;
+      }
+      return reply({ cancelled: true });
+    }
     try {
       await ctx.workflowClient(KgRefresh, current.triggerId).cancel({ reason: "operator_cancelled" });
     } catch (err) {

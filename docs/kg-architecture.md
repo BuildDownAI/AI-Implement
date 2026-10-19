@@ -341,6 +341,11 @@ reads the hold from `KgRepo.status` (`busy`) and replaces its own held run with
 `KgRepo.decide({ action: "cancel", triggerId, reason: "superseded_by_schedule" })`; after an accept there is no
 hold, so the schedule never replaces a run a person accepted.
 
+A Stop that lands near the gate goes through the same door. Once the gate run's `step` is `held`, the workflow
+`cancel` handler also sends `KgRepo.decide({ action: "cancel", triggerId })`, and the run reads a Stop that arrived
+earlier from its `cancel` promise right after `hold`. The tool's no-`triggerId` cancel does the same when
+`KgRepo.status` shows a hold. A lost lock (`hold` answers `lock-lost`) is a workflow error, not a cancel.
+
 A held dry-run never reaches the gate. Any other report takes the unchanged success or failure paths; a
 `KG_SNAPSHOT_HELD` report with no `snapshotPr` takes the failure path.
 

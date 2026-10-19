@@ -649,10 +649,10 @@ describe("KgRepo durable single-flight lock", () => {
       const slug = newKey();
       const before = runSends.length;
       const triggerId = ((await trigger(env.baseUrl(), slug)) as { triggerId: string }).triggerId;
-      // A hold due almost at once: the delayed send itself fires, with no test-side call.
-      await callPrivate(env.baseUrl(), slug, "hold", { ...holdFor(triggerId), decideBy: Date.now() + 300 });
-      await eventually(() => status(env.baseUrl(), slug), (s) => s !== null && s.triggerId !== triggerId, { label: "the timer decides the hold" });
+      // A hold already due (delay 0): the scheduled send itself fires, with no test-side call and no wall-clock margin.
+      await callPrivate(env.baseUrl(), slug, "hold", { ...holdFor(triggerId), decideBy: Date.now() - 1 });
       await eventually(() => runSends.length - before >= 2, (ok) => ok, { label: "the timeout run send" });
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId: expect.not.stringMatching(triggerId), held: null });
       expect(runSends[runSends.length - 1].parameter).toMatchObject({ resume: { action: "timeout", hold: { triggerId } } });
       expect(await scheduledDecides(env, slug)).toBe(0);
     },
