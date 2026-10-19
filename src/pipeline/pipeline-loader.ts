@@ -366,6 +366,17 @@ function applyWiring(step: YamlStep): StepDefinition {
         }),
       };
 
+    case "kg-base-merge":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          workspaceDir: ctx.getOutputs("clone").workspaceDir,
+          dryRun: ctx.data.kgDryRun === true,
+          kgBaseMerge: ctx.data.kgBaseMerge,
+        }),
+        skip: (ctx: PipelineContext) => (ctx.data.kgBaseMerge ? false : "no base PR to merge (kgBaseMerge absent)"),
+      };
+
     case "kg-scope-reconcile":
       return {
         ...step,

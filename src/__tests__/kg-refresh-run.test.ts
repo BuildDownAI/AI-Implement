@@ -152,6 +152,7 @@ import {
   DEFAULT_BASE_REPO,
 } from "../pipeline/steps/kg-tracker-data.js";
 import { kgIngestStep, KgIngestError, isSignalLine } from "../pipeline/steps/kg-ingest.js";
+import { KgBaseMergeError } from "../pipeline/steps/kg-base-merge.js";
 import { kgScopeReconcileStep } from "../pipeline/steps/kg-scope-reconcile.js";
 import { refreshRunnerGithubCredentials } from "../runner-token.js";
 import { __resetPublicationCredentialForTests } from "../publication-credential.js";
@@ -3813,11 +3814,12 @@ describe("kgIngestStep — log file and signal echo", () => {
 // ── kg-refresh pipeline order ─────────────────────────────────────────────────
 
 describe("kg-refresh pipeline order", () => {
-  it("step IDs are clone → kg-scope-reconcile → dependency-auth → clone-code-repo → clone-secondary-repos → kg-tracker-data → kg-ingest → kg-snapshot-push (no agent step)", () => {
+  it("step IDs are clone → kg-base-merge → kg-scope-reconcile → dependency-auth → clone-code-repo → clone-secondary-repos → kg-tracker-data → kg-ingest → kg-snapshot-push (no agent step)", () => {
     const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml");
     const ids = pipeline.steps.map((s) => s.id);
     expect(ids).toEqual([
       "clone",
+      "kg-base-merge",
       "kg-scope-reconcile",
       "dependency-auth",
       "clone-code-repo",
@@ -3993,6 +3995,73 @@ describe("runKgRefresh — KgIngestError maps to KG_INGEST_FAILED", () => {
     });
     expect(result.exitCode).toBe(1);
     expect(capturedResults.some((r) => r.failureCode === "KG_INGEST_FAILED")).toBe(true);
+  });
+});
+
+// ── KgBaseMergeError → failureCode and baseMerge echo ────────────────────────
+
+describe("runKgRefresh — KgBaseMergeError maps to its code and echoes baseMerge", () => {
+  let tmpDir: string;
+  let originalEnv: NodeJS.ProcessEnv;
+  const spec = { repo: "org/base", prNumber: 69, baseSha: "a".repeat(40), headSha: "b".repeat(40) };
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgrun-basemerge-"));
+    originalEnv = { ...process.env };
+    process.env.GITHUB_OWNER = "org";
+    process.env.GITHUB_REPO = "kg-repo";
+    process.env.GITHUB_TOKEN = "tok";
+    process.env.GITHUB_DEFAULT_BRANCH = "main";
+    process.env.WORKSPACE_DIR = tmpDir;
+    process.env.RUNNER_CALLBACK_URL = "http://orch";
+    process.env.RUN_TOKEN = "run-tok";
+    process.env.AI_IMPLEMENT_RUN_CONFIG = encodeRunConfig({
+      v: 1,
+      issue: { id: "i", identifier: "KG-REFRESH", title: "t", description: "" },
+      kgDryRun: true,
+      kgBaseMerge: spec,
+    } as unknown as Parameters<typeof encodeRunConfig>[0]);
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+    for (const k of ["GITHUB_OWNER", "GITHUB_REPO", "GITHUB_TOKEN", "GITHUB_DEFAULT_BRANCH", "WORKSPACE_DIR", "RUN_TOKEN", "RUNNER_CALLBACK_URL", "AI_IMPLEMENT_RUN_CONFIG"]) {
+      if (originalEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = originalEnv[k];
+    }
+  });
+
+  async function runWith(error: Error): Promise<Array<Record<string, unknown>>> {
+    const posted: Array<Record<string, unknown>> = [];
+    const result = await runKgRefresh({
+      workspaceDir: tmpDir,
+      stepsOverride: {
+        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        kgBaseMerge: makeStepModule({}, error),
+      },
+      reporter: { report: async () => undefined },
+      fetchImpl: async (_url, init) => {
+        posted.push(init?.body ? (JSON.parse(init.body as string) as Record<string, unknown>) : {});
+        return new Response(JSON.stringify({ acknowledged: true }), { status: 200 });
+      },
+    });
+    expect(result.exitCode).toBe(1);
+    return posted;
+  }
+
+  it("posts KG_BASE_BEHIND with baseMerge.result behind and the conflict paths", async () => {
+    const posted = await runWith(
+      new KgBaseMergeError("KG_BASE_BEHIND", "drift", { result: "behind", conflictPaths: ["kg_ingest/cli.py"] }),
+    );
+    const body = posted.find((r) => r.failureCode === "KG_BASE_BEHIND");
+    expect(body?.baseMerge).toEqual({ headSha: spec.headSha, result: "behind", conflictPaths: ["kg_ingest/cli.py"] });
+  });
+
+  it("posts KG_BASE_FETCH_FAILED without a baseMerge echo", async () => {
+    const posted = await runWith(new KgBaseMergeError("KG_BASE_FETCH_FAILED", "nope"));
+    const body = posted.find((r) => r.failureCode === "KG_BASE_FETCH_FAILED");
+    expect(body).toBeDefined();
+    expect(body).not.toHaveProperty("baseMerge");
   });
 });
 
@@ -5057,6 +5126,7 @@ describe("kg-refresh pipeline definition step order", () => {
     const ids = pipeline.steps.map((s) => s.id);
     expect(ids).toEqual([
       "clone",
+      "kg-base-merge",
       "kg-scope-reconcile",
       "dependency-auth",
       "clone-code-repo",

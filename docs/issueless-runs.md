@@ -30,7 +30,7 @@ flowchart TD
     O -->|"marker live"| O2["409 refresh-in-progress"]
     O -->|"one-way send"| W["KgRefresh.run\nreserve → dispatch"]
     W --> E["GitHub Actions, Fly Machine,\nor local Docker"]
-    E --> F["runner pipeline\nclone → kg-scope-reconcile → dependency-auth → clone-code-repo → clone-secondary-repos\n→ kg-tracker-data → kg-ingest → kg-snapshot-push"]
+    E --> F["runner pipeline\nclone → kg-base-merge → kg-scope-reconcile → dependency-auth → clone-code-repo → clone-secondary-repos\n→ kg-tracker-data → kg-ingest → kg-snapshot-push"]
     W --> T["wait: report | cancel | progress\nbootstrap deadline 10 min, total deadline 4 h\nGHA: watch the run's status;\nstarted evidence = status in_progress\nor the runner progress heartbeat, first wins"]
     F -->|"progress heartbeat"| T
     F -->|"POST /api/runner/result"| G["KgRefresh.report\nidempotency key = dispatch id"]
@@ -269,6 +269,17 @@ The `kg-ingest` step passes `--repos-root <workspaceDir>/repos` to `python -m kg
 ### KG push token
 
 The runner's `kg-snapshot-push` step pushes the snapshot branch with the primary token, exactly as the implement pipeline's `push` step does; there is no separate push-token endpoint. The publication token (§6) is the credential the runner exchanges for that scoped token.
+
+### Base merge step
+
+The `kg-base-merge` pipeline step (`src/pipeline/steps/kg-base-merge.ts`) runs right after `clone`. It answers a dry-run question for a PR on the base template repo: would the KG repo still build and pass the guards if it took this change? With no `kgBaseMerge` in the envelope it skips. With `kgBaseMerge` and a live run (`kgDryRun` not `true`) it throws `KG_BASE_MERGE_REFUSED` before any fetch, so a live run never builds a snapshot from code `main` lacks.
+
+Otherwise it fetches `baseSha` and `headSha` from the public base repo with no credential helper (failure: `KG_BASE_FETCH_FAILED`), then merges twice:
+
+1. **Baseline merge** of `baseSha`. An ingest-path conflict means the KG repo has drifted from base: `KG_BASE_BEHIND`, `baseMerge.result: "behind"`. The tree is then reset to `HEAD`.
+2. **PR merge** of `headSha`. An ingest-path conflict now belongs to the PR: `KG_BASE_CONFLICT`, `result: "conflict"`. Otherwise the merge is committed locally (never pushed) and the result is `merged`.
+
+A path rule applies after each merge. Ingest paths (`KG_BASE_INGEST_PATHS`: `kg_ingest/`, `kg_query/`, `ontology/`, `tests/`, `pyproject.toml`, `uv.lock`, `requirements.txt`, `requirements-oxigraph.txt`) keep their merged result and any conflict is reported. `sources.yml` and `snapshot/**` are always restored from `HEAD`, since they are per-repo content. Every other conflicted path (README, `.gitignore`, `.github/**`, docs) takes the KG repo's side. Reported conflict paths are capped at 50. The runner result echoes `baseMerge`, on failure as well as success.
 
 ### Scope endpoint
 
