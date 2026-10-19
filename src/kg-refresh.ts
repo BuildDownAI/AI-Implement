@@ -77,6 +77,14 @@ export interface RefreshOutcome {
   dispatchId?: string;
   /** Per-part {part, prev, new} rows from the push guard. Present on a dry-run outcome or a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638) when the runner reported one. */
   partTable?: Array<{ part: string; prev: string; new: string }>;
+  /** Runner failure code on a dry-run outcome (`KG_BASE_BEHIND`, `KG_BASE_CONFLICT`, `KG_BASE_FETCH_FAILED`, …). */
+  failureCode?: string;
+  /** The runner's echo of the base-template merge it attempted; absent for a KG-repo PR or a runner that predates it. */
+  baseMerge?: { headSha: string; result: "merged" | "behind" | "conflict"; conflictPaths?: string[] };
+  /** Head SHA of the base PR the run was asked to merge; set whenever the input carried `kgBaseMerge`. */
+  baseHeadSha?: string;
+  /** The dry run did not test the PR; the commit status reports success so the PR is not blocked. */
+  notChecked?: true;
   cause?: "shrink" | "tracker-missing" | "source-failed";
   failedTeams?: string[];
   /** Skipped or failed teams that had served issues, when the run was held with Accept blocked. */

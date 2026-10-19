@@ -33,6 +33,7 @@ import {
   discardStaging,
   mergeSnapshotPr,
   postDryRunReport,
+  baseMergeDetail,
   revertRail,
   stageGate,
   swapGate,
@@ -981,6 +982,16 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           ok: report.ok, at, detail: report.failureReason ?? (report.ok ? "dry run passed" : "dry run guard refused"),
           stampBefore: null, stampAfter: null, dryRun: true, partTable: report.partTable,
         };
+        if (report.failureCode) outcome.failureCode = report.failureCode;
+        if (report.baseMerge) outcome.baseMerge = report.baseMerge;
+        if (input.kgBaseMerge) {
+          outcome.baseHeadSha = input.kgBaseMerge.headSha;
+          const verdict = baseMergeDetail(report);
+          if (verdict) {
+            outcome.detail = verdict.detail;
+            if (verdict.notChecked) outcome.notChecked = true;
+          }
+        }
         if (stepTable.length > 0) outcome.steps = stepTable;
         if (reportedSources.length > 0) outcome.sources = reportedSources;
         if (reportedWarnings.length > 0) outcome.warnings = reportedWarnings;

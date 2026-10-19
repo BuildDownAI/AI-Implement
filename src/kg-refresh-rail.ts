@@ -473,12 +473,80 @@ function isDryRunRefusal(outcome: RefreshOutcome): boolean {
   return outcome.dryRun === true && !outcome.ok && outcome.detail.includes("guard refused");
 }
 
+const MAX_LISTED_PATHS = 50;
+const NOT_CHECKED_BEHIND_DESCRIPTION = "Not checked: KG repo is behind base (upstream merge needed)";
+const NOT_CHECKED_OLD_RUNNER_DESCRIPTION = "Not checked: runner image does not support base merges";
+const BASE_FETCH_FAILED_DESCRIPTION = "Base PR fetch failed";
+
+/** Neutralizes runner-supplied text for inline markdown: no backticks or line breaks. */
+function sanitizeInline(text: string): string {
+  return text.replace(/[`\r\n]+/g, " ").trim();
+}
+
+/**
+ * Verdict for a dry run whose input carried `kgBaseMerge` (rows 1, 2, 6, 7), or null when the
+ * run tested the PR (merged) and the plain ok/failed rendering applies.
+ */
+export function baseMergeDetail(report: {
+  ok: boolean;
+  failureCode?: string;
+  failureReason?: string;
+  baseMerge?: { result: "merged" | "behind" | "conflict" };
+}): { detail: string; notChecked?: true } | null {
+  if (report.baseMerge?.result === "merged") return null;
+  switch (report.failureCode) {
+    case "KG_BASE_BEHIND":
+      return {
+        detail: "Not checked: the KG repo is behind the base template, so this PR could not be tested on its own. Merge the base into the KG repo first.",
+        notChecked: true,
+      };
+    case "KG_BASE_CONFLICT":
+      return { detail: "This PR conflicts with the KG repo's ingest code." };
+    case "KG_BASE_FETCH_FAILED":
+      return { detail: `Could not fetch the base PR commits: \`${sanitizeInline(report.failureReason ?? "unknown")}\`` };
+  }
+  if (report.baseMerge) return null;
+  return {
+    detail: "Not checked: the runner image does not support base-template merges, so the KG repo ran without this PR.",
+    notChecked: true,
+  };
+}
+
+/** True for outcomes rendered as a base-merge verdict (rows 1, 2, 6, 7): no part table applies. */
+function isBaseMergeVerdict(outcome: RefreshOutcome): boolean {
+  return outcome.notChecked === true
+    || outcome.failureCode === "KG_BASE_CONFLICT"
+    || outcome.failureCode === "KG_BASE_FETCH_FAILED";
+}
+
+/** Commit-status description: fixed text for base-merge verdicts, otherwise the detail. Max 140 chars. */
+function dryRunStatusDescription(outcome: RefreshOutcome): string {
+  let description = outcome.detail;
+  if (outcome.failureCode === "KG_BASE_BEHIND") description = NOT_CHECKED_BEHIND_DESCRIPTION;
+  else if (outcome.failureCode === "KG_BASE_CONFLICT") {
+    description = `PR conflicts with KG repo ingest code: ${outcome.baseMerge?.conflictPaths?.length ?? 0} files`;
+  } else if (outcome.failureCode === "KG_BASE_FETCH_FAILED") description = BASE_FETCH_FAILED_DESCRIPTION;
+  else if (outcome.notChecked) description = NOT_CHECKED_OLD_RUNNER_DESCRIPTION;
+  return description.slice(0, 140);
+}
+
 /** Builds the sticky comment body for a dry-run outcome. */
-function buildDryRunCommentBody(report: KgDryRunReportTarget, outcome: RefreshOutcome): string {
+function buildDryRunCommentBody(report: KgDryRunReportTarget, outcome: RefreshOutcome, kgSourceRepo?: string | null): string {
+  const header = `${KG_DRY_RUN_COMMENT_MARKER} — ${report.sha}\n\n${outcome.detail}`;
+  const headSha = outcome.baseMerge?.headSha ?? outcome.baseHeadSha;
+  const paths = outcome.baseMerge?.conflictPaths ?? [];
+  const pathList = (outcome.failureCode === "KG_BASE_BEHIND" || outcome.failureCode === "KG_BASE_CONFLICT") && paths.length > 0
+    ? `\n\n${paths.slice(0, MAX_LISTED_PATHS).map((p) => `- \`${sanitizeInline(p)}\``).join("\n")}`
+      + (paths.length > MAX_LISTED_PATHS ? `\n- … and ${paths.length - MAX_LISTED_PATHS} more` : "")
+    : "";
+  const mergedLine = headSha
+    ? `\n\nBase PR head ${sanitizeInline(headSha).slice(0, 12)} merged into ${kgSourceRepo ?? "the KG repo"}@default branch`
+    : "";
+  if (isBaseMergeVerdict(outcome)) return `${header}${pathList}${mergedLine}`;
   const note = isDryRunRefusal(outcome)
     ? "\n\nA shrink is accepted at the decision gate of the refresh that runs after this PR merges."
     : "";
-  return `${KG_DRY_RUN_COMMENT_MARKER} — ${report.sha}\n\n${outcome.detail}\n\n${renderPartTable(outcome.partTable)}${note}`;
+  return `${header}${mergedLine}\n\n${renderPartTable(outcome.partTable)}${note}`;
 }
 
 /**
@@ -488,7 +556,7 @@ function buildDryRunCommentBody(report: KgDryRunReportTarget, outcome: RefreshOu
  * problem cannot fail the refresh itself.
  */
 export async function postDryRunReport(
-  deps: Pick<KgRailDeps, "githubAppId" | "githubAppPrivateKey" | "mintToken" | "postOrUpdateStickyCommentFn" | "setCommitStatusFn">,
+  deps: Pick<KgRailDeps, "githubAppId" | "githubAppPrivateKey" | "mintToken" | "postOrUpdateStickyCommentFn" | "setCommitStatusFn"> & Partial<Pick<KgRailDeps, "kgSourceRepo">>,
   report: KgDryRunReportTarget,
   outcome: RefreshOutcome,
 ): Promise<void> {
@@ -503,7 +571,7 @@ export async function postDryRunReport(
     return;
   }
 
-  const body = buildDryRunCommentBody(report, outcome);
+  const body = buildDryRunCommentBody(report, outcome, deps.kgSourceRepo);
   try {
     const { token } = await deps.mintToken(deps.githubAppId, deps.githubAppPrivateKey, owner, {
       permissions: { pull_requests: "write" },
@@ -514,7 +582,7 @@ export async function postDryRunReport(
     console.error(`[kg-refresh] failed to post dry-run comment on ${report.repo}#${report.prNumber}: ${String(err)}`);
   }
 
-  const statusOk = outcome.ok;
+  const statusOk = outcome.ok || outcome.notChecked === true;
   try {
     const { token: statusToken } = await deps.mintToken(deps.githubAppId, deps.githubAppPrivateKey, owner, {
       permissions: { statuses: "write" },
@@ -523,7 +591,7 @@ export async function postDryRunReport(
     await deps.setCommitStatusFn(statusToken, owner, repoName, report.sha, {
       state: statusOk ? "success" : "failure",
       context: KG_DRY_RUN_STATUS_CONTEXT,
-      description: outcome.detail.slice(0, 140),
+      description: dryRunStatusDescription(outcome),
     });
   } catch (err) {
     // Not granted, or the mint/status call failed — the comment above already carries the
