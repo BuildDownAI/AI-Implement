@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { RepoMapping } from "../config.js";
 import type { PlanningRunDependencies, PlanningRunInput } from "../restate/planning-run-workflow.js";
+import { makeAppConfig, makeIssue, makeMapping, makeProvider } from "./helpers/builders.js";
+import { makeLaunchDecision, makeSnapshot } from "./helpers/fixtures/configured-run.js";
 
 // The managed (opted-in) paths of the production PlanningRun launch (AII-1391). The real
 // `preparePlanningLaunch` and `launchPlanningSession` run; only their collaborators are faked.
@@ -16,23 +17,23 @@ vi.mock("../github.js", async (importOriginal) => ({
   cancelWorkflowRun: vi.fn(),
 }));
 vi.mock("../github-app-auth.js", () => ({
-  getInstallationToken: vi.fn().mockResolvedValue("control-token"),
-  getScopedInstallationToken: vi.fn().mockResolvedValue({ token: "scoped-token" }),
+  getInstallationToken: vi.fn(async () => "control-token"),
+  getScopedInstallationToken: vi.fn(async () => ({ token: "scoped-token", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 1 })),
 }));
 vi.mock("../log.js", () => ({
   getJobByDispatchId: vi.fn(),
   updateJobStatus: vi.fn(),
-  findLogIdByDispatchId: vi.fn().mockReturnValue(7),
+  findLogIdByDispatchId: vi.fn(() => 7),
   updateJobRunId: vi.fn(),
-  getStuckAttemptStampedAt: vi.fn().mockReturnValue(null),
+  getStuckAttemptStampedAt: vi.fn(() => null),
   appendLog: vi.fn(),
   countPriorDispatches: vi.fn(),
 }));
 vi.mock("../fly-machines.js", () => ({
   getMachine: vi.fn(), destroyMachine: vi.fn(), listMachines: vi.fn(),
-  createMachine: vi.fn().mockResolvedValue({ id: "m-1", name: "mn" }),
+  createMachine: vi.fn(async () => ({ id: "m-1", name: "mn" })),
   buildSessionMachineConfig: vi.fn((input: unknown) => ({ config: {}, input })),
-  listAppSecrets: vi.fn().mockResolvedValue([]),
+  listAppSecrets: vi.fn(async () => []),
 }));
 vi.mock("../local-docker.js", () => ({
   inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn(), findLocalContainerIdByName: vi.fn(), removeLocalContainer: vi.fn(),
@@ -58,7 +59,7 @@ vi.mock("../model-auth-runtime.js", () => ({ getModelAuthRuntime: vi.fn(() => ({
 vi.mock("../fly-protection-key.js", () => ({ buildProtectedFlyBootstrap: vi.fn(async () => ({ sealed: "SEALED" })) }));
 vi.mock("../repo-image.js", () => ({ resolveSessionImage: vi.fn(async () => ({ image: "default-img", source: "default" })) }));
 vi.mock("../planning-context.js", () => ({
-  buildPlanningContextInputs: vi.fn().mockResolvedValue({ parent: "", siblings: "", dependencies: "" }),
+  buildPlanningContextInputs: vi.fn(async () => ({ parent: "", siblings: "", dependencies: "" })),
 }));
 vi.mock("../workflow-probe.js", () => ({ resolveWorkflowCapabilities: vi.fn() }));
 vi.mock("../runner-mode.js", async (importOriginal) => ({
@@ -76,27 +77,23 @@ import { buildProtectedFlyBootstrap } from "../fly-protection-key.js";
 import { launchPlanningSession, preparePlanningLaunch, launchPlanningRun } from "../planning-launch.js";
 import { createProductionPlanningRunServices, type PlanningRunProductionInput } from "../restate/planning-run-production.js";
 
-const MAPPING = { owner: "Org", repo: "repo", defaultBranch: "main", planningWorkflowFile: "claude-plan.yml", provider: "anthropic" } as unknown as RepoMapping;
+const MAPPING = makeMapping();
 const INPUT: PlanningRunInput = {
   dispatchId: "d-1", teamKey: "ENG", issueId: "i-1", issueIdentifier: "ENG-1", planningContext: {}, backend: "github-actions",
 };
-const issue = { id: "i-1", identifier: "ENG-1", title: "t", description: "d", scopeKey: "ENG", nativeStatus: "Todo" };
-const markPlanningFailed = vi.fn().mockResolvedValue(undefined);
-const provider = { id: "linear", findByKey: vi.fn(), markPlanningFailed, markPlanningStarted: vi.fn(), issueUrl: vi.fn() };
-const snapshot = { v: 1, marker: "SNAP" };
-const takeBootstrap = vi.fn();
-const fireBreakerTrip = vi.fn().mockResolvedValue(undefined);
+// The issue the workflow's input names, as its provider returns it.
+const issue = makeIssue({ id: "i-1", identifier: "ENG-1" });
+const provider = makeProvider();
+const snapshot = makeSnapshot("codex-subscription");
+const fireBreakerTrip = vi.fn(async () => {});
 const attempted = vi.fn();
 const dispatchSession = vi.fn();
 
 function compose() {
   const input: PlanningRunProductionInput = {
-    config: {
-      githubAppId: "1", githubAppPrivateKey: "k", notifyType: "slack", notifyWebhookUrl: null,
-      flySessionsToken: "fly-token", flySessionsApp: "fly-app", runnerCallbackBaseUrl: "https://orch.example.test", healthPort: 8080,
-    } as never,
+    config: makeAppConfig({ flySessionsToken: "fly-token", flySessionsApp: "fly-app", runnerCallbackBaseUrl: "https://orch.example.test" }),
     getMapping: (team) => (team === "ENG" ? MAPPING : undefined),
-    resolveProvider: async () => provider as never,
+    resolveProvider: async () => provider,
     resolveRunnerImage: async () => undefined,
     fireBreakerTrip,
     preparePlanningLaunch,
@@ -117,15 +114,16 @@ function compose() {
 describe("PlanningRun launch for an opted-in project (AII-1391)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    provider.findByKey.mockResolvedValue(issue);
+    vi.mocked(provider.findByKey).mockResolvedValue(issue);
     vi.mocked(readAdmission).mockReturnValue({ dispatchId: "d-1", generation: 3, releasedAt: null } as never);
     vi.mocked(recordDispatchFailure).mockReturnValue({ tripped: true, failures: 3 } as never);
-    takeBootstrap.mockReset().mockReturnValue({ grant: "PLAIN-GRANT" });
     vi.spyOn(console, "error").mockImplementation(() => {});
     dispatchSession.mockImplementation(async (_c, _p, _i, _m, _pr, _rm, opts) => {
+      // The decision prepareManagedDispatch returns for this launch's reservation, project and backend.
+      const { decision } = makeLaunchDecision(snapshot, opts.backendKind, { dispatchId: "d-1", projectKey: issue.scopeKey });
       const r = await opts.backend({
         sessionToken: "S", machineNonce: "N", runnerCallbackUrl: "https://orch.example.test", runToken: "R",
-        managedAuth: { kind: "launch", snapshot, dispatchId: "d-1", takeBootstrap }, markLaunchAttempted: attempted,
+        managedAuth: decision, markLaunchAttempted: attempted,
       });
       return { admitted: true, machineId: r.machineId, executionMode: r.executionMode };
     });
@@ -134,7 +132,7 @@ describe("PlanningRun launch for an opted-in project (AII-1391)", () => {
   it("GitHub Actions: returns rejected, refuses before any mint or dispatch, and forwards the breaker callback", async () => {
     const { d } = compose();
     expect(await d.launch(INPUT)).toEqual({ outcome: "rejected" });
-    expect(markPlanningFailed).toHaveBeenCalledTimes(1);
+    expect(provider.markPlanningFailed).toHaveBeenCalledTimes(1);
     expect(getInstallationToken).not.toHaveBeenCalled();
     expect(postWorkflowDispatch).not.toHaveBeenCalled();
     // The refusal was counted and the trip went through `input.fireBreakerTrip`.
