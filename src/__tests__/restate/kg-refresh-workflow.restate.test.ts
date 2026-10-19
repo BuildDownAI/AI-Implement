@@ -3564,13 +3564,26 @@ describe("KgRefresh durable workflow", () => {
         const beforeMerge = mergePullRequestFn.mock.calls.length;
         const triggerId = await holdRun(env);
         const known = await runKeys(env);
-        const first = await decideTool(env, "accept", { triggerId });
-        expect(first.isError).toBe(false);
-        expect(JSON.parse(first.text)).toEqual({ decided: "accept" });
-        // The accept resumed the hold as a new run; the marker may already be released, so find it in Restate.
-        const resumed = await resumedRunKey(env, known);
-        expect(resumed).not.toBe(triggerId);
-        expect(await decideTool(env, "accept", { triggerId })).toEqual({ isError: true, text: "no-decision-open" });
+        // Park the resumed run in its merge so it is still running, and the hold still decided, when the second accept lands.
+        let releaseMerge!: () => void;
+        const mergeParked = new Promise<void>((resolve) => {
+          releaseMerge = resolve;
+        });
+        mergePullRequestFn.mockImplementationOnce(async () => {
+          await mergeParked;
+          return "merged";
+        });
+        let resumed: string;
+        try {
+          const first = await decideTool(env, "accept", { triggerId });
+          expect(first.isError).toBe(false);
+          expect(JSON.parse(first.text)).toEqual({ decided: "accept" });
+          resumed = await resumedRunKey(env, known);
+          expect(resumed).not.toBe(triggerId);
+          expect(await decideTool(env, "accept", { triggerId })).toEqual({ isError: true, text: "no-decision-open" });
+        } finally {
+          releaseMerge();
+        }
         await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", resumed);
         expect(closeRowsFor(triggerId).at(-1)?.conclusion).toBe("passed");
         expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
