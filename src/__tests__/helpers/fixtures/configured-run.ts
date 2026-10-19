@@ -69,19 +69,24 @@ const GRANT_BACKEND: Record<DispatchAdmissionBackend, ModelAuthBackend> = {
   "local-docker": "local",
 };
 
+/** How long a grant the orchestrator mints lasts: `DEFAULT_GRANT_TTL_MS` in `agent-run-preparation.ts`, which no
+ *  production caller overrides. */
+const GRANT_TTL_MS = 4 * 60 * 60 * 1000;
+
 export type LaunchDecision = Extract<ManagedDispatchDecision, { kind: "launch" }> & {
   readonly takeBootstrap: Mock<() => ModelAuthGrantBootstrapV1 | undefined>;
 };
 
 /** The `launch` decision `prepareManagedDispatch` returns on `backend` for a fresh grant bound to `snapshot`, and that
- *  grant. The decision carries the grant's safe metadata, and `takeBootstrap` hands the bootstrap out once, then
- *  `undefined`, as the prepared run's does. */
+ *  grant. The grant is minted on the real clock, as the orchestrator mints one at launch, so it expires four hours
+ *  after the build. The decision carries the grant's safe metadata, and `takeBootstrap` hands the bootstrap out once,
+ *  then `undefined`, as the prepared run's does. */
 export function makeLaunchDecision(
   snapshot: ResolvedAgentSnapshotV1,
   backend: DispatchAdmissionBackend,
   over: Partial<ModelAuthGrantBootstrapV1> = {},
 ): { decision: LaunchDecision; bootstrap: ModelAuthGrantBootstrapV1 } {
-  const bootstrap = makeGrant(snapshot, { backend: GRANT_BACKEND[backend], ...over });
+  const bootstrap = makeGrant(snapshot, { backend: GRANT_BACKEND[backend], expiresAt: Date.now() + GRANT_TTL_MS, ...over });
   let pending: ModelAuthGrantBootstrapV1 | undefined = bootstrap;
   const decision: LaunchDecision = {
     kind: "launch",

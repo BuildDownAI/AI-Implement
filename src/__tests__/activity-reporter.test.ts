@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActivityReporter, type ActivityAlert } from "../pipeline/activity-reporter.js";
 import { fakeFetch, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
+import { activityAccepted } from "./helpers/replies/orchestrator.js";
 
-const ACCEPTED: Reply = { json: { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" } };
+const ACCEPTED = activityAccepted("attempt-1");
 
 /** The orchestrator's `/runner/activity` endpoint, answering with `reply` (a list is served one per request). */
 function activityEndpoint(reply: Reply | Reply[]): FakeFetch {
@@ -122,7 +123,7 @@ describe("ActivityReporter", () => {
   it("treats a resend of the same identity/payload as a no-op success (duplicate), and alerts on conflict without endless retry", async () => {
     // Duplicate: server reports 200/duplicate for a retried batch — success, buffer clears.
     {
-      const orchestrator = activityEndpoint({ json: { acknowledged: true, outcome: "duplicate", attemptId: "attempt-1" } });
+      const orchestrator = activityEndpoint({ json: { acknowledged: true, outcome: "duplicate", attemptId: "attempt-1", retryable: false } });
       const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
         fetchImpl: orchestrator.fetch,
         retryDelaysMs: [],
@@ -138,7 +139,7 @@ describe("ActivityReporter", () => {
       const alerts: ActivityAlert[] = [];
       const orchestrator = activityEndpoint({
         status: 409,
-        json: { acknowledged: false, outcome: "conflict", attemptId: "attempt-1", reason: "different payload already stored" },
+        json: { acknowledged: false, outcome: "conflict", attemptId: "attempt-1", reason: "different payload already stored", retryable: false },
       });
       const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
         fetchImpl: orchestrator.fetch,

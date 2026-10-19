@@ -33,6 +33,7 @@ import { MODEL_AUTH_ROUTES } from "../model-auth-contract.js";
 import type { ModelAuthTransport } from "../model-auth-client.js";
 import { makeExecutor, makeFeedbackLoopOutputs, makeIssue, makeMapping, makeReviewFixRunConfig } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type Reply, type ReplyInit } from "./helpers/fake-fetch.js";
+import { activityAccepted, cycleSummaryRecorded, noPlanningContext, progressAccepted, resultAccepted, reviewFixResultStored } from "./helpers/replies/orchestrator.js";
 import { testDir } from "./helpers/test-dir.js";
 
 // Passthrough except for the `codex` command while a test installs a fake child (see helpers/fixtures/codex-composition.ts).
@@ -45,20 +46,15 @@ vi.mock("node:child_process", async (importOriginal) => {
   return { ...real, spawn };
 });
 
-// The orchestrator's runner routes (src/index.ts), each answered as its handler answers success.
+// The orchestrator's runner routes (src/index.ts), answered with replies/orchestrator.ts.
 const RESULT = "POST /runner/result";
 const PLANNING_CONTEXT = "GET /runner/planning-context";
 const PROGRESS = "POST /runner/progress";
 const CYCLE_SUMMARY = "POST /runner/cycle-summary";
 const ACTIVITY = "POST /runner/activity";
 
-const legacyResultAccepted = { json: { acknowledged: true, warnings: [] } };
 // The result handler's answer to an implementation success that names no PR (handleRunnerResult, src/runner-callback.ts).
 const missingPrUrlRejected = { status: 400, json: { error: "missing_prUrl" } };
-const pilotResultStored = { json: { acknowledged: true, outcome: "stored", retryable: false } };
-const cycleSummaryRecorded = { json: { acknowledged: true, outcome: "recorded" } };
-const progressAccepted = { json: { acknowledged: true } };
-const noPlanningContext = { json: { planningContext: "" } };
 
 function routesRequested(fake: FakeFetch): string[] {
   return fake.calls.map((call) => `${call.method} ${call.path}`);
@@ -821,7 +817,7 @@ describe("runAutonomous", () => {
     writeFileSync(join(workspaceDir, "ai-output", "comments", "02-second.md"), "second");
     writeFileSync(join(workspaceDir, "ai-output", "comments", "01-first.md"), "first");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
       ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
       ["push", { run: vi.fn().mockResolvedValue(openedPr(1)) }],
@@ -864,7 +860,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", implEnvelope({ runnerCallbackUrl: "https://orchestrator.example" }));
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const mod: StepModule = { run: vi.fn().mockResolvedValue(openedPr(1)) };
     const { pipeline, runner } = makeSingleStepPipeline("push", mod);
 
@@ -928,7 +924,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example/");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const mod: StepModule = { run: vi.fn().mockRejectedValue(new Error("push failed")) };
     const { pipeline, runner } = makeSingleStepPipeline("push", mod);
 
@@ -984,7 +980,7 @@ describe("runAutonomous", () => {
       vi.stubEnv("GITHUB_SHA", "0".repeat(40));
 
       const publishedCommit = "b".repeat(40);
-      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: pilotResultStored });
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: reviewFixResultStored });
       const { pipeline, runner } = makeStepsPipeline([
         ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha: publishedCommit })) }],
@@ -1050,7 +1046,7 @@ describe("runAutonomous", () => {
       const fake = fakeFetch({
         [PLANNING_CONTEXT]: noPlanningContext,
         [CYCLE_SUMMARY]: cycleSummaryRecorded,
-        [RESULT]: pilotResultStored,
+        [RESULT]: reviewFixResultStored,
       });
       const { pipeline, runner } = makeStepsPipeline([
         ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
@@ -1102,7 +1098,7 @@ describe("runAutonomous", () => {
       const fake = fakeFetch({
         [PLANNING_CONTEXT]: noPlanningContext,
         [CYCLE_SUMMARY]: cycleSummaryRecorded,
-        [RESULT]: pilotResultStored,
+        [RESULT]: reviewFixResultStored,
       });
       const { pipeline, runner } = makeStepsPipeline([
         ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })) }],
@@ -1135,7 +1131,7 @@ describe("runAutonomous", () => {
         { findingKey: "", disposition: "fixed", reason: "done" },
       ]));
       const pushed = updatedPr(42, { commitSha: "b".repeat(40) });
-      const routes = { [PLANNING_CONTEXT]: noPlanningContext, [CYCLE_SUMMARY]: cycleSummaryRecorded, [RESULT]: pilotResultStored };
+      const routes = { [PLANNING_CONTEXT]: noPlanningContext, [CYCLE_SUMMARY]: cycleSummaryRecorded, [RESULT]: reviewFixResultStored };
       const summariesSent = (fake: FakeFetch) => fake.calls.filter((c) => `${c.method} ${c.path}` === CYCLE_SUMMARY)
         .map((c) => (JSON.parse(c.body) as { summary: CycleSummary }).summary);
       const first = fakeFetch(routes);
@@ -1195,7 +1191,7 @@ describe("runAutonomous", () => {
       vi.stubEnv("GITHUB_RUN_ID", "999888");
       vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
 
-      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: pilotResultStored });
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: reviewFixResultStored });
       const { pipeline, runner } = makeStepsPipeline([
         ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
@@ -1326,7 +1322,7 @@ describe("runAutonomous", () => {
       vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
 
       const publishedCommit = "d".repeat(40);
-      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: pilotResultStored });
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: reviewFixResultStored });
       // verify runs after push on an approved run; post-push review never runs on a gap-fill.
       const { pipeline, runner } = makeStepsPipeline([
         ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
@@ -1360,7 +1356,7 @@ describe("runAutonomous", () => {
       vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
 
       const publishedCommit = "f".repeat(40);
-      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: pilotResultStored });
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: reviewFixResultStored });
       const { pipeline, runner } = makeStepsPipeline([
         ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci" }) }],
         ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
@@ -1397,7 +1393,7 @@ describe("runAutonomous", () => {
       vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
       vi.stubEnv("RUN_TOKEN", "run-token");
 
-      const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+      const fake = fakeFetch({ [RESULT]: resultAccepted });
       const { pipeline, runner } = makeStepsPipeline([
         ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockResolvedValue(openedPr(1)) }],
@@ -1452,15 +1448,10 @@ describe("runAutonomous", () => {
       });
     });
 
-    // The activity route's answer to a stored batch for this attempt.
-    const activityAccepted = {
-      json: { acknowledged: true, outcome: "accepted", attemptId: "attempt-activity-1", retryable: false },
-    };
-
     describe("RunnerActivitySink", () => {
 
       it("delivers a buffered tool start/result batch plus the final marker to /runner/activity on shutdown()", async () => {
-        const fake = fakeFetch({ [ACTIVITY]: activityAccepted });
+        const fake = fakeFetch({ [ACTIVITY]: activityAccepted("attempt-activity-1") });
         const sink = new RunnerActivitySink("https://orchestrator.example", "ptok", "attempt-activity-1", fake.fetch);
 
         sink.toolStart(
@@ -1492,7 +1483,7 @@ describe("runAutonomous", () => {
       });
 
       it("delivers the empty-stream marker and final sequence for a producerId that recorded no tool events — an empty model invocation still gets a final marker", async () => {
-        const fake = fakeFetch({ [ACTIVITY]: activityAccepted });
+        const fake = fakeFetch({ [ACTIVITY]: activityAccepted("attempt-activity-1") });
         const sink = new RunnerActivitySink("https://orchestrator.example", "ptok", "attempt-activity-1", fake.fetch);
 
         sink.final({ attemptId: "attempt-activity-1", producerId: "never-touched", sequence: 0 }, 0);
@@ -1525,7 +1516,7 @@ describe("runAutonomous", () => {
       type Post = { path: string; body: { producerId?: string; events?: Array<{ kind: string; action: string; cycle: number; payload: string }>; finalSequence?: number } };
 
       /** The runner routes these runs reach, each answering as its handler does and recording what was posted. */
-      function recordingApi(posts: Post[], log?: string[], result: ReplyInit = pilotResultStored): FakeFetch {
+      function recordingApi(posts: Post[], log?: string[], result: ReplyInit = reviewFixResultStored): FakeFetch {
         const record = (reply: ReplyInit): Reply => (call) => {
           posts.push({ path: call.path, body: JSON.parse(call.body || "{}") as Post["body"] });
           log?.push(`post:${call.path}`);
@@ -1533,7 +1524,7 @@ describe("runAutonomous", () => {
         };
         return fakeFetch({
           [PLANNING_CONTEXT]: noPlanningContext,
-          [ACTIVITY]: record(activityAccepted),
+          [ACTIVITY]: record(activityAccepted(REVIEW_FIX_IDENTITY.attemptId)),
           [PROGRESS]: record(progressAccepted),
           [CYCLE_SUMMARY]: record(cycleSummaryRecorded),
           [RESULT]: record(result),
@@ -1609,7 +1600,7 @@ describe("runAutonomous", () => {
         const posts: Post[] = [];
         const { pipeline, runner } = makeSingleStepPipeline("do-work", { run: vi.fn().mockResolvedValue({}) });
 
-        await runAutonomous({ workspaceDir, pipeline, runner, llmExecutor: makeExecutor(), fetchImpl: recordingApi(posts, undefined, legacyResultAccepted).fetch });
+        await runAutonomous({ workspaceDir, pipeline, runner, llmExecutor: makeExecutor(), fetchImpl: recordingApi(posts, undefined, resultAccepted).fetch });
 
         expect(posts.some((p) => p.path === "/runner/progress")).toBe(true);
         expect(stepPosts(posts)).toHaveLength(0);
@@ -1684,7 +1675,7 @@ describe("runAutonomous", () => {
         vi.stubEnv("GITHUB_RUN_ID", "1");
         vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
 
-        const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: pilotResultStored });
+        const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: reviewFixResultStored });
         const { pipeline, runner } = makeStepsPipeline([
           ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
           ["push", { run: vi.fn().mockResolvedValue(updatedPr(7)) }],
@@ -1709,7 +1700,7 @@ describe("runAutonomous", () => {
         vi.stubEnv("RUN_PROGRESS_TOKEN", "ptok");
         vi.stubEnv("RUN_TOKEN", "run-token");
 
-        const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: legacyResultAccepted });
+        const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: resultAccepted });
         const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
         const { pipeline, runner } = makeSingleStepPipeline("do-work", mod);
 
@@ -1734,7 +1725,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
       ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
       ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
@@ -1802,7 +1793,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const mod: StepModule = {
       run: vi.fn().mockResolvedValue({ prUrl: null, prNumber: null, branchPushed: false, commitSha: null, draft: false }),
     };
@@ -1837,7 +1828,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
       [
         "feedback-loop",
@@ -1875,7 +1866,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUN_TOKEN", "run-token");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
       ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed: dependency conflict" }) }],
       ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
@@ -1927,7 +1918,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUN_TOKEN", "run-token");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
       ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed: dependency conflict" }) }],
       ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
@@ -1970,7 +1961,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUN_TOKEN", "run-token");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
       ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed: dependency conflict" }) }],
       ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
@@ -2013,7 +2004,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
       ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "conflict" }) }],
       [
@@ -2084,7 +2075,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const pushRun = vi.fn().mockResolvedValue(updatedPr(42));
     const runner = new PipelineRunner()
       .register("clone", {
@@ -2137,7 +2128,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const pushRun = vi.fn().mockResolvedValue(updatedPr(42));
     const pipeline: PipelineDefinition = {
       id: "test",
@@ -2186,7 +2177,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const pushRun = vi.fn().mockResolvedValue(updatedPr(42));
     const pipeline: PipelineDefinition = {
       id: "test",
@@ -2234,7 +2225,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const postPushReviewRun = vi.fn().mockRejectedValue(new Error("skipped step must not run"));
     const { pipeline, runner } = makeStepsPipeline([
       [
@@ -2275,7 +2266,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const providerFailure = {
       category: "transient" as const,
       code: "PROVIDER_UNAVAILABLE",
@@ -2327,7 +2318,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const reviewerFailure = {
       category: "invalid_output" as const,
       code: "REVIEWER_TURNS_EXHAUSTED",
@@ -2383,7 +2374,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
       [
         "feedback-loop",
@@ -2424,7 +2415,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
       [
         "feedback-loop",
@@ -2465,7 +2456,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const checksFailure = {
       category: "invalid_output" as const,
       code: "CHECKS_PERMISSION_DENIED",
@@ -2522,7 +2513,7 @@ describe("runAutonomous", () => {
 
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const reviewerFailure = {
       category: "invalid_output" as const,
       code: "REVIEWER_TURNS_EXHAUSTED",
@@ -2599,7 +2590,7 @@ describe("runAutonomous", () => {
       }),
     );
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
       [
         "feedback-loop",
@@ -2648,7 +2639,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUN_TOKEN", "run-token");
     vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", implEnvelope({ runnerCallbackUrl: "https://orchestrator.example" }));
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
       [
         "feedback-loop",
@@ -2725,7 +2716,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
       ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
       ["push", { run: vi.fn().mockResolvedValue(openedPr(11)) }],
@@ -2755,7 +2746,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
       ["feedback-loop", { run: vi.fn().mockResolvedValue({
         approved: true,
@@ -2794,7 +2785,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
       ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({
         passes: [{ iteration: 1, implementTurns: 5, implementOutcome: "success", costUsd: 0.20, reviewCostUsd: 0.05, reviewApproved: true }],
@@ -2823,7 +2814,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
       ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
       ["push", { run: vi.fn().mockResolvedValue(openedPr(12)) }],
@@ -2901,7 +2892,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const { pipeline, runner } = makeStepsPipeline([
       [
         "feedback-loop",
@@ -2935,7 +2926,7 @@ describe("runAutonomous", () => {
     mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
     writeFileSync(join(workspaceDir, "ai-output", "comments"), "not a directory");
 
-    const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
     const mod: StepModule = { run: vi.fn().mockResolvedValue(openedPr(1)) };
     const { pipeline, runner } = makeSingleStepPipeline("push", mod);
 
@@ -3295,7 +3286,7 @@ describe("runAutonomous", () => {
       );
 
       const { ghSpawn, calls } = makeGhSpawn(threadBody, threadPath, threadLine);
-      const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+      const fake = fakeFetch({ [RESULT]: resultAccepted });
       const { pipeline, runner } = makeStepsPipeline([
         ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
@@ -3344,7 +3335,7 @@ describe("runAutonomous", () => {
       );
 
       const { ghSpawn, calls } = makeGhSpawn(threadBody, threadPath, threadLine);
-      const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+      const fake = fakeFetch({ [RESULT]: resultAccepted });
       // No git change: push reports a no-op (existing-PR shape), mirroring push.ts's
       // branchPushed=false with no prUrl for an already-up-to-date PR branch.
       const { pipeline, runner } = makeStepsPipeline([
@@ -3395,7 +3386,7 @@ describe("runAutonomous", () => {
       );
 
       const { ghSpawn, calls } = makeGhSpawn(threadBody, threadPath, threadLine);
-      const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+      const fake = fakeFetch({ [RESULT]: resultAccepted });
       const { pipeline, runner } = makeStepsPipeline([
         ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockRejectedValue(new Error("push failed")) }],
@@ -3422,7 +3413,7 @@ describe("runAutonomous", () => {
       const dispositions: FindingDisposition[] = [
         { findingKey: "a".repeat(64), disposition: "fixed", reason: "Addressed in this pass." },
       ];
-      const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+      const fake = fakeFetch({ [RESULT]: resultAccepted });
       const { pipeline, runner } = makeStepsPipeline([
         ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockResolvedValue(openedPr(1)) }],
@@ -3452,7 +3443,7 @@ describe("runAutonomous", () => {
       vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
       vi.stubEnv("RUN_TOKEN", "run-token");
 
-      const fake = fakeFetch({ [RESULT]: legacyResultAccepted });
+      const fake = fakeFetch({ [RESULT]: resultAccepted });
       const { pipeline, runner } = makeStepsPipeline([
         ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockResolvedValue(openedPr(1)) }],

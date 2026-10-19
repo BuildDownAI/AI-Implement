@@ -7,7 +7,7 @@
 // `env.startedRestateServer.restart()`, which restarts the server child process.
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import * as http2 from "node:http2";
 import * as net from "node:net";
 import os from "node:os";
@@ -49,7 +49,7 @@ export interface BinaryEnvironment {
   identityKey(): string | undefined;
   /** Pid of the current child (test seam for the cleanup assertion). */
   childPid(): number | undefined;
-  /** Base directory holding the Restate store (test seam for the cleanup assertion). */
+  /** Temp directory holding the Restate store and the invoker's spill directory (test seam for the cleanup assertion). */
   baseDir(): string;
 }
 
@@ -103,7 +103,11 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
   const bin = (options.resolveBinary ?? resolvePlatformBinary)();
   if (!bin) throw new RestateBinaryNotFoundError();
 
-  const baseDir = await mkdtemp(path.join(os.tmpdir(), "restate-binary-env-"));
+  // One temp root holds the store and the invoker's spill directory, side by side: the server reads every
+  // directory under RESTATE_BASE_DIR as a node's data and refuses to restart with more than one.
+  const root = await mkdtemp(path.join(os.tmpdir(), "restate-binary-env-"));
+  const baseDir = path.join(root, "store");
+  await mkdir(baseDir);
   let adminUrl = "";
   let ingressUrl = "";
 
@@ -133,6 +137,8 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
     RESTATE_LISTEN_MODE: "tcp",
     RESTATE_DEFAULT_NUM_PARTITIONS,
     RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE,
+    // Unset, the invoker creates one spill directory per partition under TMPDIR at start and never removes them.
+    RESTATE_WORKER__INVOKER__TMP_DIR: path.join(root, "invoker"),
   });
   let identityKey: string | undefined;
   if (options.requestIdentity) {
@@ -220,7 +226,7 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
       for (const session of sessions) session.destroy();
     });
     if (child) await stopChildWithBackstop(child, STOP_TIMEOUT_MS);
-    await rm(baseDir, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
   };
 
   try {
@@ -274,6 +280,6 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
     endpointPort: () => (endpoint.address() as net.AddressInfo).port,
     identityKey: () => identityKey,
     childPid: () => (child as ChildProcess | null)?.pid,
-    baseDir: () => baseDir,
+    baseDir: () => root,
   };
 }

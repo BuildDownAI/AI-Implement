@@ -2,6 +2,7 @@
 // `npm run test:restate`.
 import { randomUUID } from "node:crypto";
 import { existsSync, readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
 import * as restate from "@restatedev/restate-sdk";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { RestateBinaryNotFoundError, startBinaryEnvironment, type BinaryEnvironment } from "./binary-environment.js";
@@ -114,5 +115,13 @@ describe("binary Restate environment (AII-914)", () => {
     expect(alive(pid!)).toBe(false);
     expect(existsSync(dir)).toBe(false);
     await expect(env.stop()).resolves.toBeUndefined();
+  }, 120_000);
+
+  it("leaves no invoker spill directory in the system temp directory", async () => {
+    const invokerDirs = () => new Set(readdirSync(tmpdir()).filter((name) => name.startsWith("invoker-")));
+    const before = invokerDirs();
+    const env = await startBinaryEnvironment({ services: [echo] });
+    await env.stop();
+    expect([...invokerDirs()].filter((name) => !before.has(name))).toEqual([]);
   }, 120_000);
 });
