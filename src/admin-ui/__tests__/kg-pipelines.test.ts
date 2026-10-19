@@ -758,13 +758,14 @@ describe("kg current run card (AII-1260)", () => {
     expect((m.doc.getElementById("kg-refresh-card") as HTMLElement).hidden).toBe(true);
   });
 
-  it("posts the exact decision bodies and reloads the status", async () => {
+  it("posts the exact decision bodies, naming the shown hold, and reloads the status", async () => {
     const m = mount({ currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held }, stage: "awaiting-decision" });
+    await m.win.loadKgStatus(); // the card shows the hold, so a decision names it
     await m.win.decideKgRefresh("accept");
     await m.win.decideKgRefresh("cancel");
     const posts = m.calls.filter((c) => c.url === "/api/tools/decide_kg_refresh");
-    expect(posts.map((c) => c.body)).toEqual([{ args: { action: "accept" } }, { args: { action: "cancel" } }]);
-    expect(m.calls.filter((c) => c.url === "/api/kg/status")).toHaveLength(2);
+    expect(posts.map((c) => c.body)).toEqual([{ args: { action: "accept", triggerId: "t" } }, { args: { action: "cancel", triggerId: "t" } }]);
+    expect(m.calls.filter((c) => c.url === "/api/kg/status")).toHaveLength(3);
   });
 
   it("a declined confirm makes no call", async () => {
