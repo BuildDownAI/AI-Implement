@@ -124,6 +124,13 @@ export async function attachWorkflow<T>(baseUrl: string, workflow: string, key: 
   });
 }
 
+/** Waits for one invocation, by id, to complete; a failed invocation rejects. Used where the id comes from the admin query, not a workflow key. */
+export async function attachInvocation(baseUrl: string, invocationId: string): Promise<void> {
+  const response = await fetch(`${baseUrl}/restate/invocation/${invocationId}/attach`);
+  const text = await response.text();
+  if (!response.ok) throw new Error(`attach ${invocationId} failed: ${response.status} ${text}`);
+}
+
 /** Poll `read` until `accept` approves the value, and return that value. On timeout the
  *  error names `label` and prints the last value read, so a flake reads as a diagnosis
  *  rather than a bare assertion diff. State produced by a one-way send, a schedule, or a
@@ -234,10 +241,16 @@ export async function killInvocation(adminBaseUrl: string, id: string): Promise<
 
 /** Overwrites one Virtual Object state entry through the admin API, to plant a marker shape an older release wrote. */
 export async function setObjectState(adminBaseUrl: string, service: string, key: string, stateKey: string, value: unknown): Promise<void> {
+  await setObjectStates(adminBaseUrl, service, key, { [stateKey]: value });
+}
+
+/** Replaces an object's whole state with these keys (the admin API's `new_state` is not a merge). */
+export async function setObjectStates(adminBaseUrl: string, service: string, key: string, state: Record<string, unknown>): Promise<void> {
+  const newState = Object.fromEntries(Object.entries(state).map(([k, v]) => [k, [...Buffer.from(JSON.stringify(v))]]));
   const response = await fetch(`${adminBaseUrl}/services/${encodeURIComponent(service)}/state`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ object_key: key, new_state: { [stateKey]: [...Buffer.from(JSON.stringify(value))] } }),
+    body: JSON.stringify({ object_key: key, new_state: newState }),
   });
   if (!response.ok) throw new Error(`state write for ${service}/${key} failed: HTTP ${response.status} ${await response.text()}`);
 }

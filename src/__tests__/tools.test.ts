@@ -20,6 +20,7 @@ import {
   getKgStatusTool,
   setFlyMachineProfileTool,
   getTenantHealth,
+  listInFlightJobs,
   getIssueReportCardTool,
   getFleetReportTool,
   triggerKgRefreshTool,
@@ -50,7 +51,8 @@ import { getMappings } from "../config.js";
 import { setOrchestratorSetting } from "../orchestrator-settings.js";
 import { initSettingsTable } from "../runner-mode.js";
 import { FLY_MACHINE_PROFILE_DEFAULTS, mergeProfile, type FlyMachineProfileConfig } from "../restate/fly-machine-profile.js";
-import { initLogTable } from "../log.js";
+import { initLogTable, appendLog, updateJobStatus } from "../log.js";
+import { getDb } from "../dedup.js";
 import { getRestateStatus, setRestateStatus, resetRestateStatus } from "../restate/status.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import {
@@ -837,7 +839,7 @@ describe("migrated read handlers (AII-711)", () => {
       ({ ok: false, at: 1, gate, detail: "d", stampBefore: "a", stampAfter: null }) as RefreshOutcome;
 
     async function stageFor(opts: {
-      last?: RefreshOutcome | null; inFlight?: { triggerId: string; startedAt: number } | null; step?: string | null; statusThrows?: boolean;
+      last?: RefreshOutcome | null; inFlight?: { triggerId: string; startedAt: number; held?: unknown } | null; step?: string | null; statusThrows?: boolean;
       runnerStep?: { id: string; status: string } | null;
       decisions?: string[]; held?: unknown; calls?: string[];
       readServedStamp?: () => Promise<string | null>;
@@ -922,6 +924,11 @@ describe("migrated read handlers (AII-711)", () => {
       const inFlight = { triggerId: "t1", startedAt: 1 };
       const held = { snapshotPr: 77, partTable: [{ part: "graph", prev: "100", new: "40" }], decideBy: 99 };
 
+      it("kgStageForStep maps held to awaiting-decision and resume to snapshot-landed", () => {
+        expect(kgStageForStep("held")).toBe("awaiting-decision");
+        expect(kgStageForStep("resume")).toBe("snapshot-landed");
+      });
+
       it("kgStageForStep maps decision to awaiting-decision", () => {
         expect(kgStageForStep("decision")).toBe("awaiting-decision");
       });
@@ -938,19 +945,23 @@ describe("migrated read handlers (AII-711)", () => {
         expect(status.stage).toBe("ingest-running");
       });
 
-      it("held and undecided: awaiting-decision wins over the finished runner step", async () => {
-        const status = await stageFor({
-          inFlight, step: "decision", decisions: ["accept", "cancel"], held,
-          runnerStep: { id: "kg-snapshot-push", status: "passed" },
-        });
+      it("held: the hold comes from KgRepo, awaiting-decision, and no workflow is read", async () => {
+        const calls: string[] = [];
+        const status = await stageFor({ inFlight: { ...inFlight, held }, calls });
         expect(status.stage).toBe("awaiting-decision");
         expect(status.currentRun).toEqual({ triggerId: "t1", step: "decision", decisions: ["accept", "cancel"], held: { ...held, snapshotPrUrl: "https://github.com/org/kg/pull/77" } });
+        expect(calls).not.toContain("KgRefresh.status");
       });
 
-      it("decided and still finishing: no decisions, stage as today for the step", async () => {
-        const status = await stageFor({ inFlight, step: "decision", decisions: [], held });
-        expect(status.stage).toBe("staging");
-        expect(status.currentRun.decisions).toEqual([]);
+      it("a blocked hold offers cancel only", async () => {
+        const status = await stageFor({ inFlight: { ...inFlight, held: { ...held, acceptBlocked: true } } });
+        expect(status.currentRun.decisions).toEqual(["cancel"]);
+      });
+
+      it("decided: the hold is gone and the resumed run's own status shows", async () => {
+        const status = await stageFor({ inFlight, step: "resume" });
+        expect(status.stage).toBe("snapshot-landed");
+        expect(status.currentRun).toEqual({ triggerId: "t1", step: "resume", decisions: [], held: null });
       });
 
       it("a run that has ended leaves currentRun null", async () => {
@@ -969,7 +980,7 @@ describe("migrated read handlers (AII-711)", () => {
 
       it("makes no Restate call beyond the existing reads", async () => {
         const calls: string[] = [];
-        await stageFor({ inFlight, step: "decision", decisions: ["accept", "cancel"], held, calls });
+        await stageFor({ inFlight, step: "await-progress", calls });
         expect(calls.filter((c) => c === "KgRefresh.status")).toHaveLength(1);
       });
 
@@ -1085,6 +1096,34 @@ describe("get_tenant_health restate health field (AII-807)", () => {
     const parsed = JSON.parse(result.content[0].text) as { restate: unknown };
 
     expect(parsed.restate).toEqual({ sidecar: { state: "exited", code: 1, signal: null }, registration: { state: "unreachable" } });
+  });
+});
+
+describe("get_tenant_health awaitingDecisionCount (AII-1490)", () => {
+  const system: Caller = SYSTEM_ADMIN;
+  beforeAll(() => {
+    initLogTable();
+  });
+  afterEach(() => {
+    getDb().exec("DELETE FROM dispatch_log");
+  });
+
+  it("counts a held kg-refresh, not in flight, and drops it after the final close", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    const held = appendLog({ issueId: "kg-1", phase: "kg-refresh" });
+    updateJobStatus(held, "completed", "awaiting_decision");
+    const running = appendLog({ issueId: "kg-2", phase: "kg-refresh", status: "running" });
+    appendLog({ issueId: "impl-1", phase: "implementation", status: "completed" });
+    getDb().prepare("UPDATE dispatch_log SET status='completed', conclusion='awaiting_decision' WHERE issue_id='impl-1'").run();
+
+    const health = async () => JSON.parse((await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} })).content[0].text) as { awaitingDecisionCount: number; inFlightJobCount: number };
+    expect(await health()).toMatchObject({ awaitingDecisionCount: 1, inFlightJobCount: 1 });
+
+    const list = JSON.parse((await listInFlightJobs(fakeContext("list_in_flight_jobs"), { caller: system, args: {} })).content[0].text) as Array<{ id: number }>;
+    expect(list.map((j) => j.id)).toEqual([running]);
+
+    updateJobStatus(held, "completed", "passed");
+    expect(await health()).toMatchObject({ awaitingDecisionCount: 0 });
   });
 });
 
@@ -1411,16 +1450,16 @@ describe("migrated write handlers (AII-713)", () => {
     const cancel = vi.fn();
     const ctx = () => ({
       ...fakeContext("decide_kg_refresh"),
-      objectClient: () => ({ status }),
-      workflowClient: () => ({ decide, cancel }),
+      objectClient: () => ({ status, decide }),
+      workflowClient: () => ({ cancel }),
     }) as unknown as restate.Context;
-    const call = (args: { action: "accept" | "cancel" }, caller: Caller = { kind: "human", email: "ada@example.com", role: "admin" }) =>
+    const call = (args: { action: "accept" | "cancel"; triggerId?: string }, caller: Caller = { kind: "human", email: "ada@example.com", role: "admin" }) =>
       decideKgRefreshTool(ctx(), { caller, args });
     const terminal = (code: number, message: string) => new restate.TerminalError(message, { errorCode: code });
 
     beforeEach(() => {
       status.mockReset().mockResolvedValue({ triggerId: "trig-1", startedAt: 1 });
-      decide.mockReset().mockResolvedValue(undefined);
+      decide.mockReset().mockResolvedValue({ triggerId: "trig-2" });
       cancel.mockReset().mockResolvedValue(undefined);
       setKgRefreshToolDeps(kgToolDeps());
     });
@@ -1434,7 +1473,7 @@ describe("migrated write handlers (AII-713)", () => {
       expect(decide).not.toHaveBeenCalled();
     });
 
-    it("answers no-refresh-in-flight with no run in flight, and calls no workflow", async () => {
+    it("answers no-refresh-in-flight with no run in flight, and decides nothing", async () => {
       status.mockResolvedValue(null);
       expect(answer(await call({ action: "accept" }))).toEqual({ isError: true, text: "no-refresh-in-flight" });
       expect(decide).not.toHaveBeenCalled();
@@ -1446,9 +1485,14 @@ describe("migrated write handlers (AII-713)", () => {
       expect(answer(await call({ action: "accept" }))).toEqual({ isError: true, text: "KG refresh is not configured" });
     });
 
-    it("decides the run KgRepo reports, with the caller's email as the actor", async () => {
+    it("decides through KgRepo.decide, with the caller's email as the actor", async () => {
       expect(answer(await call({ action: "accept" }))).toEqual({ isError: false, text: JSON.stringify({ decided: "accept" }, null, 2) });
       expect(decide).toHaveBeenCalledWith({ action: "accept", actor: "ada@example.com" });
+    });
+
+    it("passes the named hold's triggerId to KgRepo.decide", async () => {
+      await call({ action: "accept", triggerId: "trig-1" });
+      expect(decide).toHaveBeenCalledWith({ action: "accept", actor: "ada@example.com", triggerId: "trig-1" });
     });
 
     it("never sends an undefined actor when the caller has no email", async () => {
@@ -1456,14 +1500,21 @@ describe("migrated write handlers (AII-713)", () => {
       expect(decide).toHaveBeenCalledWith({ action: "accept", actor: "system" });
     });
 
-    it("answers no-decision-open for accept when the run is not at the gate", async () => {
+    it("answers no-decision-open for accept when no hold is open", async () => {
       decide.mockRejectedValue(terminal(409, "no-decision-open"));
       expect(answer(await call({ action: "accept" }))).toEqual({ isError: true, text: "no-decision-open" });
       expect(cancel).not.toHaveBeenCalled();
     });
 
-    it("sends the cancel signal for cancel when the run is not at the gate", async () => {
+    it("answers no-decision-open for a stale triggerId, and never cancels whatever runs now", async () => {
       decide.mockRejectedValue(terminal(409, "no-decision-open"));
+      expect(answer(await call({ action: "cancel", triggerId: "old" }))).toEqual({ isError: true, text: "no-decision-open" });
+      expect(cancel).not.toHaveBeenCalled();
+    });
+
+    it("sends the cancel signal to the run now in flight for cancel when no hold is open", async () => {
+      decide.mockRejectedValue(terminal(409, "no-decision-open"));
+      status.mockResolvedValueOnce({ triggerId: "trig-1", startedAt: 1 }).mockResolvedValueOnce({ triggerId: "trig-2", startedAt: 2 });
       expect(JSON.parse(answer(await call({ action: "cancel" })).text)).toEqual({ cancelled: true });
       expect(cancel).toHaveBeenCalledWith({ reason: "operator_cancelled" });
     });
@@ -1474,28 +1525,32 @@ describe("migrated write handlers (AII-713)", () => {
       expect(cancel).not.toHaveBeenCalled();
     });
 
-    it("answers past-merge from decide, and never falls through to cancel", async () => {
-      decide.mockRejectedValue(terminal(409, "past-merge"));
-      expect(answer(await call({ action: "cancel" }))).toEqual({ isError: true, text: "past-merge" });
-      expect(cancel).not.toHaveBeenCalled();
-    });
-
     it("answers past-merge, not no-refresh-in-flight, when the cancel signal is past the merge", async () => {
       decide.mockRejectedValue(terminal(409, "no-decision-open"));
       cancel.mockRejectedValue(terminal(409, "past-merge"));
       expect(answer(await call({ action: "cancel" }))).toEqual({ isError: true, text: "past-merge" });
     });
 
-    it("answers already-decided for a second decision, and never falls through to cancel", async () => {
-      decide.mockRejectedValue(terminal(409, "already-decided"));
-      expect(answer(await call({ action: "cancel" }))).toEqual({ isError: true, text: "already-decided" });
-      expect(cancel).not.toHaveBeenCalled();
-    });
-
     it("answers no-refresh-in-flight when the run finished before the cancel signal", async () => {
       decide.mockRejectedValue(terminal(409, "no-decision-open"));
       cancel.mockRejectedValue(terminal(404, "not found"));
       expect(answer(await call({ action: "cancel" }))).toEqual({ isError: true, text: "no-refresh-in-flight" });
+    });
+
+    it("answers no-refresh-in-flight when the run ended between the decision and the cancel", async () => {
+      decide.mockRejectedValue(terminal(409, "no-decision-open"));
+      status.mockResolvedValueOnce({ triggerId: "trig-1", startedAt: 1 }).mockResolvedValueOnce(null);
+      expect(answer(await call({ action: "cancel" }))).toEqual({ isError: true, text: "no-refresh-in-flight" });
+      expect(cancel).not.toHaveBeenCalled();
+    });
+
+    it("cancels a hold stored after the first decide through KgRepo.decide, not the workflow cancel", async () => {
+      decide.mockRejectedValueOnce(terminal(409, "no-decision-open")).mockResolvedValueOnce(undefined);
+      status.mockResolvedValue({ triggerId: "trig-1", startedAt: 1, held: { triggerId: "trig-1" } });
+      expect(answer(await call({ action: "cancel" }))).toEqual({ isError: false, text: JSON.stringify({ cancelled: true }, null, 2) });
+      expect(decide).toHaveBeenCalledTimes(2);
+      expect(decide).toHaveBeenLastCalledWith({ action: "cancel", actor: "ada@example.com", triggerId: "trig-1" });
+      expect(cancel).not.toHaveBeenCalled();
     });
 
     it("does not report success or a conflict when Restate is unavailable", async () => {

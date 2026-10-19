@@ -537,11 +537,22 @@ describe("kg-refresh production wiring (AII-901)", () => {
 
   it("cancel answers 409 for not-found and for a row without a dispatchId", async () => {
     const client = { repoStatus: vi.fn(), cancel: vi.fn().mockResolvedValue({ status: "not-found" }) };
-    const deps = idx.makeKgRefreshAdminDeps("Org/kg", client as never, vi.fn() as never, held(false));
+    const decide = vi.fn().mockResolvedValue({ status: "ok", isError: true, content: [{ type: "text", text: "no-decision-open" }] });
+    const deps = idx.makeKgRefreshAdminDeps("Org/kg", client as never, decide as never, held(false));
     expect(await deps.cancel({ jobId: 1, dispatchId: "t-1", reason: "r" })).toEqual({ status: 409, body: { error: "no-refresh-in-flight" } });
     client.cancel.mockClear();
+    decide.mockClear();
     expect(await deps.cancel({ jobId: 1, dispatchId: null, reason: "r" })).toEqual({ status: 409, body: { error: "no-refresh-in-flight" } });
     expect(client.cancel).not.toHaveBeenCalled();
+    expect(decide).not.toHaveBeenCalled();
+  });
+
+  it("a Stop on a held row, whose gate run has ended, cancels the hold through decide_kg_refresh with that row's trigger id", async () => {
+    const client = { repoStatus: vi.fn(), cancel: vi.fn().mockResolvedValue({ status: "conflict", error: "no-refresh-in-flight" }) };
+    const decide = vi.fn().mockResolvedValue({ status: "ok", content: [{ type: "text", text: "{\"decided\":\"cancel\"}" }] });
+    const deps = idx.makeKgRefreshAdminDeps("Org/kg", client as never, decide as never, held(false));
+    expect(await deps.cancel({ jobId: 1, dispatchId: "t-held", reason: "operator_cancelled" })).toEqual({ status: 200, body: { cancelled: true } });
+    expect(decide).toHaveBeenCalledWith("decide_kg_refresh", { action: "cancel", triggerId: "t-held" });
   });
 
   it("an unavailable Restate answers 409 deploy-in-progress during a hold", async () => {

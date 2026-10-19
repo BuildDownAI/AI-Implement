@@ -112,6 +112,9 @@ describe("stuck job badge", () => {
     expect(badge("failed", "KG_SNAPSHOT_REFUSED", null, "kg-refresh")).toMatchObject({ cls: "fail", label: "failed" });
     expect(badge("completed", "warnings", null, "implementation")).toEqual({ cls: "success", label: "completed", title: "warnings" });
     expect(badge("completed", null, null, "kg-refresh")).toEqual({ cls: "success", label: "completed" });
+    expect(badge("completed", "awaiting_decision", null, "kg-refresh")).toEqual({ cls: "warn", label: "awaiting decision", title: "awaiting_decision" });
+    expect(badge("completed", "awaiting_decision", null, "implementation")).toEqual({ cls: "success", label: "completed", title: "awaiting_decision" });
+    expect(badge("completed", "decision_timeout", null, "kg-refresh")).toMatchObject({ label: "completed" });
   });
   it("keeps grouped plan completion inference and passes each conclusion", () => {
     expect(pipelinesScript).toContain("statusBadge(planStatus, plan.conclusion, plan.failure)");

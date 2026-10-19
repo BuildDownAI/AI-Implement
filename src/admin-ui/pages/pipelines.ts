@@ -211,6 +211,7 @@ export const pipelinesScript = `
           if (phase === 'kg-refresh') {
             if (status === 'completed' && conclusion === 'warnings') return makeBadge('warn', 'completed with warnings', reason);
             if (status === 'completed' && conclusion === 'passed') return makeBadge('success', 'passed', reason);
+            if (status === 'completed' && conclusion === 'awaiting_decision') return makeBadge('warn', 'awaiting decision', reason);
             if (status === 'failed') return makeBadge('fail', 'failed', reason);
           }
           const label = isReviewIncomplete(status, conclusion, failure)

@@ -105,8 +105,8 @@ export async function toolCatalog(deps: DiscoverToolsDeps = {}): Promise<Discove
 
 /**
  * Tools that still answer during a deploy hold (AII-1401). Both are short invocations that finish in
- * milliseconds: `get_kg_status` is a read, and `decide_kg_refresh` resolves the durable promise a held
- * KG refresh waits on, which is what lets the drain finish. Exact names only, compared before
+ * milliseconds: `get_kg_status` is a read, and `decide_kg_refresh` decides a held KG refresh through
+ * `KgRepo.decide`, which starts the decision as a new run and so lets the drain finish. Exact names only, compared before
  * percent-encoding; every other tool answers `deploy-held`.
  */
 const DEPLOY_HOLD_ALLOWED_TOOLS: ReadonlySet<string> = new Set(["get_kg_status", "decide_kg_refresh"]);

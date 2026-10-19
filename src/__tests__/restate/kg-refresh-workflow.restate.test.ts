@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as restate from "@restatedev/restate-sdk";
+import { createEndpointHandler } from "@restatedev/restate-sdk/node";
 import type { RestateEnvironment } from "./harness.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CreateMachineOpts, Machine, MachineExit } from "../../fly-machines.js";
@@ -41,9 +42,10 @@ import {
   type KgDispatchResult,
   type KgRefreshReportBody,
 } from "../../restate/kg-refresh-workflow.js";
+import { queryNonCompletedInvocations } from "../../restate/endpoint.js";
 import { registerOwnedRunContract } from "./owned-run-contract.js";
 import {
-  VARIANTS, attachWorkflow, callObject, callService, callWorkflow, cancelInvocation, eventually, gate, queryInvocations, replaceEndpoint, settle,
+  VARIANTS, attachInvocation, attachWorkflow, callObject, callService, callWorkflow, cancelInvocation, eventually, gate, queryInvocations, replaceEndpoint, setObjectStates, settle,
   startRetryEnabled, startVariants, stopAll, type Gate,
   journalEntries,
   waitForStep,
@@ -340,6 +342,7 @@ describe("KgRefresh durable workflow", () => {
   const persistCalls: RefreshOutcome[] = [];
   const onOutcomeCalls: Array<{ kind: "success" | "no-new-data" | "failure"; outcome: RefreshOutcome; meta: { failureCode?: string; timedOut?: boolean; dispatchId?: string } }> = [];
   let runIdCounter = 9_000;
+  let heldRowPark: { jobId: string; gate: ReturnType<typeof gate> } | null = null;
   /** This scenario's own close rows: the workflow closes its job log under the trigger id. */
   const closeRowsFor = (triggerId: string) => closeRowCalls.filter((c) => c.jobId === triggerId);
   /** Waits for this scenario's close row and returns the latest one, so another scenario's late close cannot be read. */
@@ -583,7 +586,11 @@ describe("KgRefresh durable workflow", () => {
       // The step awaits what its closure returns, so a parked reserve is a returned promise.
       if (reserveHold) return reserveHold as unknown as void;
     },
-    closeJobLog: (jobId, status, conclusion) => { closeRowCalls.push({ jobId, status, conclusion }); },
+    closeJobLog: async (jobId, status, conclusion) => {
+      closeRowCalls.push({ jobId, status, conclusion });
+      // Parks the gate run between `step = held` and the hold being stored, so a test acts inside that window.
+      if (conclusion === "awaiting_decision" && heldRowPark?.jobId === jobId) await heldRowPark.gate.wait();
+    },
     getWorkflowRunStatus: getWorkflowRunStatusFn,
     findRunByTitle: findRunByTitleFn,
     cancelWorkflowRun: cancelWorkflowRunFn,
@@ -641,7 +648,7 @@ describe("KgRefresh durable workflow", () => {
     return callObject<KgRepoTriggerResult>(baseUrl, "KgRepo", KG_SOURCE_REPO, "trigger", opts);
   }
 
-  async function kgRepoStatus(baseUrl: string): Promise<{ triggerId: string; startedAt: number; invocationId?: string } | null> {
+  async function kgRepoStatus(baseUrl: string): Promise<{ triggerId: string; startedAt: number; invocationId?: string; held?: { snapshotPr: number; acceptBlocked: boolean; [k: string]: unknown } | null } | null> {
     return callObject(baseUrl, "KgRepo", KG_SOURCE_REPO, "status", {});
   }
 
@@ -3350,158 +3357,391 @@ describe("KgRefresh durable workflow", () => {
       }
     }, 90_000);
   });
-  describe("AII-1256: the decision gate", () => {
+  describe("AII-1489: a held snapshot is a KgRepo record, not a suspended run", () => {
     const DECISION_TIMEOUT_MS = 8 * 3_600_000;
-    const SHORT_DECISION_TIMEOUT_MS = 1_500;
     const HELD_REPORT: KgRefreshReportBody = {
       ok: false, failureCode: "KG_SNAPSHOT_HELD", failureReason: "snapshot shrank",
       snapshotPr: 77, snapshotCommit: "cafe1234", snapshotBranch: "kg-refresh/snapshot-77",
       partTable: [{ part: "graph", prev: "100", new: "40" }],
     };
+    const ACCEPT = { action: "accept", actor: "ada@example.com" } as const;
     const heldWorkflow = createKgRefreshWorkflow({
       ...workflowDeps, bootstrapDeadlineMs: 30_000, totalDeadlineMs: 60_000, decisionTimeoutMs: DECISION_TIMEOUT_MS,
     });
-    const shortHeldWorkflow = createKgRefreshWorkflow({
-      ...workflowDeps, bootstrapDeadlineMs: 30_000, totalDeadlineMs: 60_000, decisionTimeoutMs: SHORT_DECISION_TIMEOUT_MS,
-    });
-    // The same workflow plus a test-only handler that resolves the `decide` promise directly, so an accept reaches the run
-    // handler without passing `decide`'s own acceptBlocked check.
-    const forceDecideHandlers = (restate.workflow({
-      name: "KgRefresh",
-      handlers: {
-        run: restate.handlers.workflow.workflow(async () => undefined),
-        forceDecide: restate.handlers.workflow.shared(async (ctx: restate.WorkflowSharedContext, input: { action: string; actor: string }) => {
-          await ctx.promise<{ action: string; actor: string }>("decide").resolve(input);
-        }),
-      },
-    }) as unknown as { workflow: Record<string, unknown> }).workflow;
-    const forceDecideWorkflow = {
-      ...heldWorkflow,
-      workflow: { ...(heldWorkflow as unknown as { workflow: object }).workflow, forceDecide: forceDecideHandlers.forceDecide },
-    } as unknown as typeof heldWorkflow;
     let heldEnvs: Map<string, RestateEnvironment>;
-    let shortHeldEnvs: Map<string, RestateEnvironment>;
-    let forceEnvs: Map<string, RestateEnvironment>;
     beforeAll(async () => {
       heldEnvs = await startVariants([heldWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile, orchestratorTools]);
-      forceEnvs = await startVariants([forceDecideWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
       setKgRefreshToolDeps({ kgSourceRepo: KG_SOURCE_REPO } as unknown as KgRefreshToolDeps);
-      shortHeldEnvs = await startVariants([shortHeldWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
     }, 120_000);
     afterAll(async () => {
       setKgRefreshToolDeps(null);
       await stopAll(heldEnvs);
-      await stopAll(shortHeldEnvs);
-      await stopAll(forceEnvs);
     });
+    const LABELS = VARIANTS.map(([label]) => label);
 
     const readStatus = (baseUrl: string, triggerId: string) =>
       callWorkflow<{ step: string | null }>(baseUrl, "KgRefresh", triggerId, "status", {});
+    /** Completed invocations of a handler: a send that was only enqueued does not count. */
     const countSends = async (env: RestateEnvironment, service: string, key: string, handler: string) =>
+      (await queryInvocations(
+        env.adminAPIBaseUrl(),
+        `target_service_name = '${service}' AND target_service_key = '${key}' AND target_handler_name = '${handler}' AND status = 'completed'`,
+      )).length;
+    /** Invocations of one target that have not completed. */
+    const openInvocations = (env: RestateEnvironment, where: string) =>
+      queryInvocations(env.adminAPIBaseUrl(), `${where} AND status <> 'completed'`);
+    /** The decision timers `KgRepo.hold` armed: scheduled `KgRepo/decide` invocations. */
+    const scheduledDecides = async (env: RestateEnvironment) =>
+      (await queryInvocations(
+        env.adminAPIBaseUrl(),
+        `target_service_name = 'KgRepo' AND target_service_key = '${KG_SOURCE_REPO}' AND target_handler_name = 'decide' AND status = 'scheduled'`,
+      )).length;
+
+    /** Sent invocations of a handler, completed or not: a send the run journaled exists as soon as the run ends. */
+    const sentInvocations = async (env: RestateEnvironment, service: string, key: string, handler: string) =>
       (await queryInvocations(
         env.adminAPIBaseUrl(),
         `target_service_name = '${service}' AND target_service_key = '${key}' AND target_handler_name = '${handler}'`,
       )).length;
+    /** `KgRepo.decide`, the one decision door. */
+    const decideRepo = (env: RestateEnvironment, body: Record<string, unknown>) =>
+      callObject<{ triggerId: string } | null>(env.baseUrl(), "KgRepo", KG_SOURCE_REPO, "decide", body);
+    /**
+     * A barrier on `KgRepo`'s exclusive queue: a stale timeout is a no-op, and it returns only after every handler already sent
+     * to the object (a run's `release`, a one-way `decide`) has run. Reading state after it needs no polling.
+     */
+    const afterReleases = (env: RestateEnvironment) => decideRepo(env, { action: "timeout", triggerId: "barrier" });
+    /** Every `KgRepo/watch` invocation for the test repo, completed or not. */
+    const watchInvocations = (env: RestateEnvironment) =>
+      queryInvocations(
+        env.adminAPIBaseUrl(),
+        `target_service_name = 'KgRepo' AND target_service_key = '${KG_SOURCE_REPO}' AND target_handler_name = 'watch'`,
+      );
+    /** Decides the hold `gateId` and waits for the resumed run to end; returns its trigger id and outcome. */
+    async function decideAndAttach(env: RestateEnvironment, gateId: string, body: Record<string, unknown>) {
+      const resumed = (await decideRepo(env, { triggerId: gateId, ...body }))!.triggerId;
+      const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", resumed);
+      return { resumed, outcome };
+    }
 
-    /** Triggers through the real KgRepo, delivers the held report, and returns once the run sits at the gate. */
-    async function holdRun(env: RestateEnvironment, opts: { awaitGate?: boolean; report?: KgRefreshReportBody } = {}): Promise<string> {
+    /** Triggers through the real KgRepo, delivers the held report, and returns once the gate run has ended and `KgRepo` holds the snapshot. */
+    async function holdRun(env: RestateEnvironment, opts: { report?: KgRefreshReportBody } = {}): Promise<string> {
+      const watchesBefore = new Set((await watchInvocations(env)).map((w) => String(w.id)));
       const triggered = await triggerViaKgRepo(env.baseUrl());
       const triggerId = (triggered as { triggerId: string }).triggerId;
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
       await workflowDispatched(triggerId);
+      // `submit` sends the run's `watch`: the one invocation that was not there before this trigger.
+      const watchId = String((await eventually(
+        async () => (await watchInvocations(env)).filter((w) => !watchesBefore.has(String(w.id))),
+        (fresh) => fresh.length === 1,
+        { label: "watch sent" },
+      ))[0]!.id);
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", opts.report ?? HELD_REPORT);
-      // The short-timer scenario skips this: on a slow runner the timer can fire before a poll sees `decision`.
-      if (opts.awaitGate !== false) await waitForStep(() => readStatus(env.baseUrl(), triggerId), "decision");
+      const gateOutcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+      expect(gateOutcome).toMatchObject({ ok: false, conclusion: "awaiting_decision", held: true });
+      // The `release` the `watch` sends is journaled only once `watch` resumes: wait for it, then the barrier orders the rest.
+      await attachInvocation(env.baseUrl(), watchId);
+      await afterReleases(env);
+      expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, held: { snapshotPr: 77 } });
       return triggerId;
     }
 
-    it.each(VARIANTS.map(([label]) => label))(
-      "a held report stops at the gate: one release, no extend, no merge, no close, the run invocation holds the lock (%s)",
+    it.each(LABELS)(
+      "a held report ends the run at the gate: KgRepo holds the lock and the hold, no run or watch stays open, one timer is armed (%s)",
       async (label) => {
         const env = heldEnvs.get(label)!;
         const beforeClose = closePullRequestFn.mock.calls.length;
         const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const beforePersist = persistCalls.length;
+        const timersBefore = await scheduledDecides(env);
+        const repoReleasesBefore = await countSends(env, "KgRepo", KG_SOURCE_REPO, "release");
         const triggerId = await holdRun(env);
 
-        await eventually(() => countSends(env, "FlyMachineProfile", "kg-refresh", "release"), (n) => n === 1, { label: "one release" });
-        // The run invocation holds the lock (AII-1297): no lease, no extend.
-        expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, invocationId: expect.any(String) });
-        expect(await countSends(env, "KgRepo", KG_SOURCE_REPO, "extend")).toBe(0);
+        expect(await openInvocations(env, `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}'`)).toEqual([]);
+        expect((await scheduledDecides(env)) - timersBefore).toBe(1);
+        // The gate run's `finally` release and the `watch` release both completed, and both left the held lock alone.
+        expect((await countSends(env, "KgRepo", KG_SOURCE_REPO, "release")) - repoReleasesBefore).toBe(2);
+        expect(await sentInvocations(env, "FlyMachineProfile", "kg-refresh", "release")).toBeGreaterThanOrEqual(1);
+        // The watch's release is its last act, so once both releases completed no watch is left open.
+        expect(await openInvocations(env, `target_service_name = 'KgRepo' AND target_handler_name = 'watch'`)).toEqual([]);
+        expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, held: { snapshotPr: 77 } });
+        expect(await triggerViaKgRepo(env.baseUrl())).toMatchObject({ status: "refresh-in-progress", triggerId });
         expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
         expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(0);
+        expect(persistCalls.length - beforePersist).toBe(0);
+        expect(outcomesFor(triggerId)).toHaveLength(0);
+        expect(await closeRowFor(triggerId)).toMatchObject({ status: "completed", conclusion: "awaiting_decision" });
 
-        expect(await triggerViaKgRepo(env.baseUrl())).toMatchObject({ status: "refresh-in-progress" });
-
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "cleanup@example.com" });
-        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        await decideAndAttach(env, triggerId, { action: "cancel" });
       },
       60_000,
     );
 
-    const decideTool = async (env: RestateEnvironment, action: string) => {
-      const result = await callToolAsSystem("decide_kg_refresh", { action }, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true, restateReady: () => true });
+    const decideTool = async (env: RestateEnvironment, action: string, extra: Record<string, unknown> = {}) => {
+      const result = await callToolAsSystem("decide_kg_refresh", { action, ...extra }, { ingressBaseUrl: env.baseUrl(), permitsExternalCall: () => true, restateReady: () => true });
       if (result.status !== "ok") throw new Error("decide_kg_refresh unavailable");
       return { isError: result.isError === true, text: result.content[0].text };
     };
 
-    it.each(VARIANTS.map(([label]) => label))(
-      "contract: KgRefresh.decide — the real decide_kg_refresh tool decides a run held at the gate, the workflow merges, and a second decision is already-decided (%s)",
-      async (label) => {
-        const env = heldEnvs.get(label)!;
-        const beforeMerge = mergePullRequestFn.mock.calls.length;
-        const triggerId = await holdRun(env);
-        const first = await decideTool(env, "accept");
-        expect(first.isError).toBe(false);
-        expect(JSON.parse(first.text)).toEqual({ decided: "accept" });
-        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
-        expect(outcome.ok).toBe(true);
-        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
-        await closeRowFor(triggerId);
-      },
-      60_000,
-    );
-
-    it.each(VARIANTS.map(([label]) => label))(
-      "decide_kg_refresh cancel at the gate closes the held PR without a merge, and with no run in flight answers no-refresh-in-flight (%s)",
-      async (label) => {
-        const env = heldEnvs.get(label)!;
-        const beforeMerge = mergePullRequestFn.mock.calls.length;
-        const triggerId = await holdRun(env);
-        const answer = await decideTool(env, "cancel");
-        expect(JSON.parse(answer.text)).toEqual({ decided: "cancel" });
-        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
-        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
-        await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "marker cleared" });
-        expect(await decideTool(env, "accept")).toEqual({ isError: true, text: "no-refresh-in-flight" });
-        await closeRowFor(triggerId);
-      },
-      60_000,
-    );
-
-    it.each(VARIANTS.map(([label]) => label))(
-      "decide accept posts the baseline note naming the actor, merges and runs the gates to serving (%s)",
+    it.each(LABELS)(
+      "accept: the baseline note names the actor, the resumed run merges and serves, and the original row is closed completed after awaiting_decision, never before (%s)",
       async (label) => {
         const env = heldEnvs.get(label)!;
         const beforeComments = postPrCommentFn.mock.calls.length;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
         const triggerId = await holdRun(env);
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ada@example.com" });
-        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, ACCEPT);
 
+        expect(resumed).not.toBe(triggerId);
         expect(outcome.ok).toBe(true);
         const comments = postPrCommentFn.mock.calls.slice(beforeComments).map((c) => String((c as unknown[])[4]));
         expect(comments).toHaveLength(1);
         expect(comments[0]).toContain("### Baseline");
         expect(comments[0]).toContain("ada@example.com");
-        expect(mergePullRequestFn).toHaveBeenCalled();
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
         expect(outcomesFor(triggerId).map((c) => c.kind)).toEqual(["success"]);
+        expect(persistCalls.at(-1)).toMatchObject({ ok: true, held: true, dispatchId: triggerId });
         expect(gateOrder).toEqual(["fetch", "stage", "swap", "verify"]);
-        await closeRowFor(triggerId);
+        // The gate close came first and the final close last: a late awaiting_decision can never overwrite the result.
+        expect(closeRowsFor(triggerId).map((r) => [r.status, r.conclusion])).toEqual([["completed", "awaiting_decision"], ["completed", "passed"]]);
+        await afterReleases(env);
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
+        expect(await runReleases(env, resumed)).toBe(1);
       },
       60_000,
     );
 
-    it.each(VARIANTS.map(([label]) => label))(
-      "a tracker-missing held report opens the gate, status shows the cause and failed teams, and accept merges (%s)",
+    it.each(LABELS)(
+      "contract: the real decide_kg_refresh tool accepts a hold through KgRepo.decide, and a second accept answers no-decision-open (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env);
+        const first = await decideTool(env, "accept", { triggerId });
+        expect(first.isError).toBe(false);
+        expect(JSON.parse(first.text)).toEqual({ decided: "accept" });
+        // The accept resumed the hold as a new run, which holds the marker until it ends.
+        const resumed = (await kgRepoStatus(env.baseUrl()))!.triggerId;
+        expect(resumed).not.toBe(triggerId);
+        expect(await decideTool(env, "accept", { triggerId })).toEqual({ isError: true, text: "no-decision-open" });
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", resumed);
+        expect(closeRowsFor(triggerId).at(-1)?.conclusion).toBe("passed");
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
+        await afterReleases(env);
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
+        expect(await decideTool(env, "accept")).toEqual({ isError: true, text: "no-refresh-in-flight" });
+      },
+      60_000,
+    );
+
+    it.each(LABELS)(
+      "cancel closes the held PR as operator_cancelled in a new run, closes the row once, records it once and releases the lock once (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, { action: "cancel", actor: "ada@example.com" });
+
+        expect(resumed).not.toBe(triggerId);
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
+        const comment = postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!;
+        expect(comment).toContain("operator_cancelled");
+        expect(closeRowsFor(triggerId).map((r) => r.conclusion)).toEqual(["awaiting_decision", "operator_cancelled"]);
+        expect(await closeRowFor(triggerId)).toMatchObject({ status: "failed", conclusion: "operator_cancelled" });
+        expect(persistCalls.at(-1)).toMatchObject({ ok: false, conclusion: "operator_cancelled", held: true });
+        expect(outcomesFor(triggerId)).toHaveLength(0);
+        await afterReleases(env);
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
+        expect(await runReleases(env, resumed)).toBe(1);
+        expect(await countSends(env, "FlyMachineProfile", "kg-refresh", "release")).toBeGreaterThanOrEqual(1);
+      },
+      60_000,
+    );
+
+    it.each(LABELS)(
+      "the timeout the hold armed, sent as KgRepo.decide, closes the PR as decision_timeout, closes the row once and releases the lock (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, { action: "timeout" });
+
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        const comment = postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!;
+        expect(comment).toContain("decision_timeout");
+        expect(closeRowsFor(triggerId).map((r) => r.conclusion)).toEqual(["awaiting_decision", "decision_timeout"]);
+        expect(outcomesFor(triggerId).map((c) => c.meta.failureCode)).toEqual(["decision_timeout"]);
+        await afterReleases(env);
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
+        expect(await runReleases(env, resumed)).toBe(1);
+      },
+      60_000,
+    );
+
+    /** Names of the services registered at this variant's endpoint URI. */
+    const deployedServices = async (env: RestateEnvironment, uri: string): Promise<string[]> => {
+      const response = await fetch(`${env.adminAPIBaseUrl()}/deployments`);
+      const body = (await response.json()) as { deployments: Array<{ uri?: string; http?: { uri?: string }; services: Array<{ name: string }> }> };
+      return body.deployments
+        .filter((d) => (d.uri ?? d.http?.uri)?.replace(/\/+$/, "") === uri)
+        .flatMap((d) => d.services.map((svc) => svc.name));
+    };
+
+    let probeCounter = 0;
+    /**
+     * Ships a new build at the same address: the live server keeps its sessions, so only its request handler changes, to one
+     * with an extra service. Restate does not rediscover a duplicate URI on its own, which is why a deploy forces.
+     */
+    function swapEndpoint(env: RestateEnvironment): void {
+      const probe = restate.service({ name: `DeployProbe${probeCounter++}`, handlers: { ping: async () => "ok" } });
+      const handler = createEndpointHandler({ services: [heldWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile, orchestratorTools, probe] });
+      env.startedRestateHttpServer.removeAllListeners("request");
+      env.startedRestateHttpServer.on("request", handler as (...args: unknown[]) => void);
+    }
+
+    /** A deploy over a hold: proves nothing drains on the hold, then forces a re-registration at the same URI. */
+    async function deployOverHold(env: RestateEnvironment, gateId: string): Promise<void> {
+      const uri = `http://127.0.0.1:${env.endpointPort()}`;
+      // The hold is state plus a scheduled timer: no run, no watch, and nothing the drain counts.
+      expect(await openInvocations(env, `target_service_name = 'KgRefresh' AND target_service_key = '${gateId}'`)).toEqual([]);
+      expect(await openInvocations(env, `target_service_name = 'KgRepo' AND target_handler_name = 'watch'`)).toEqual([]);
+      expect(await scheduledDecides(env)).toBeGreaterThanOrEqual(1);
+      expect(await queryNonCompletedInvocations(fetch, env.adminAPIBaseUrl(), uri)).toBe(0);
+      // The row-side drain signal (getInFlightWork) is covered against the real log in deploy.test.ts.
+
+      const before = await deployedServices(env, uri);
+      swapEndpoint(env);
+      const forced = await fetch(`${env.adminAPIBaseUrl()}/deployments`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ uri, force: true }),
+      });
+      expect(forced.ok).toBe(true);
+      // The deployment was replaced (the new build's service set is registered), not answered as an unchanged duplicate.
+      const after = await deployedServices(env, uri);
+      const probe = `DeployProbe${probeCounter - 1}`;
+      expect(before).not.toContain(probe);
+      expect(after).toContain(probe);
+      // The hold and its timer came through untouched.
+      expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId: gateId, held: { snapshotPr: 77 } });
+      expect(await scheduledDecides(env)).toBeGreaterThanOrEqual(1);
+    }
+
+    it.each(LABELS)(
+      "a hold survives a forced re-registration: accept then merges and serves in a new run and releases the lock once (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeMerge = mergePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env);
+        await deployOverHold(env, triggerId);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, ACCEPT);
+
+        expect(resumed).not.toBe(triggerId);
+        expect(outcome.ok).toBe(true);
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
+        expect(gateOrder).toEqual(["fetch", "stage", "swap", "verify"]);
+        expect(closeRowsFor(triggerId).map((r) => [r.status, r.conclusion])).toEqual([["completed", "awaiting_decision"], ["completed", "passed"]]);
+        await afterReleases(env);
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
+        expect(await runReleases(env, resumed)).toBe(1);
+      },
+      90_000,
+    );
+
+    it.each(LABELS)(
+      "a hold survives a forced re-registration: cancel then closes the PR once as operator_cancelled and releases the lock once (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env);
+        await deployOverHold(env, triggerId);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, { action: "cancel", actor: "ada@example.com" });
+
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        expect(postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!).toContain("operator_cancelled");
+        expect(closeRowsFor(triggerId).map((r) => r.conclusion)).toEqual(["awaiting_decision", "operator_cancelled"]);
+        await afterReleases(env);
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
+        expect(await runReleases(env, resumed)).toBe(1);
+      },
+      90_000,
+    );
+
+    it.each(LABELS)(
+      "a hold survives a forced re-registration: the timeout, sent as KgRepo.decide, closes the PR as decision_timeout and releases the lock once (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const triggerId = await holdRun(env);
+        await deployOverHold(env, triggerId);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, { action: "timeout" });
+
+        expect(outcome.ok).toBe(false);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        expect(postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!).toContain("decision_timeout");
+        expect(closeRowsFor(triggerId).map((r) => r.conclusion)).toEqual(["awaiting_decision", "decision_timeout"]);
+        await afterReleases(env);
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
+        expect(await runReleases(env, resumed)).toBe(1);
+      },
+      90_000,
+    );
+
+    it.each(LABELS)(
+      "refusals: a stale triggerId, a second decision, a timeout after a decision and a timeout from an old hold all leave the hold or the result alone (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const beforeClose = closePullRequestFn.mock.calls.length;
+        const first = await holdRun(env);
+        // A stale page names a hold that is not the current one.
+        await expect(decideRepo(env, { action: "cancel", triggerId: "not-the-hold" })).rejects.toThrow(/409.*no-decision-open/);
+        expect(await decideRepo(env, { action: "timeout", triggerId: "not-the-hold" })).toBeNull();
+        expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId: first, held: { snapshotPr: 77 } });
+
+        await decideAndAttach(env, first, { action: "cancel" });
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        // The hold is gone: a second decision and the old timer do nothing.
+        await expect(decideRepo(env, { action: "accept", actor: "bob@example.com" })).rejects.toThrow(/409.*no-decision-open/);
+        await expect(decideRepo(env, { action: "cancel", triggerId: first })).rejects.toThrow(/409.*no-decision-open/);
+        expect(await decideRepo(env, { action: "timeout", triggerId: first })).toBeNull();
+
+        // A newer hold is untouched by the first hold's timer.
+        await afterReleases(env);
+        expect(await kgRepoStatus(env.baseUrl())).toBeNull();
+        const second = await holdRun(env);
+        expect(await decideRepo(env, { action: "timeout", triggerId: first })).toBeNull();
+        expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId: second, held: { snapshotPr: 77 } });
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        await decideAndAttach(env, second, { action: "cancel" });
+      },
+      90_000,
+    );
+
+    it.each(LABELS)(
+      "decide answers no-decision-open before the gate (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const triggered = await triggerViaKgRepo(env.baseUrl());
+        const triggerId = (triggered as { triggerId: string }).triggerId;
+        makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+        await workflowDispatched(triggerId);
+        await expect(decideRepo(env, ACCEPT)).rejects.toThrow(/409.*no-decision-open/);
+        expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, held: null });
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", HELD_REPORT);
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        await decideAndAttach(env, triggerId, { action: "cancel" });
+      },
+      60_000,
+    );
+
+    it.each(LABELS)(
+      "a tracker-missing hold shows the cause, failed teams and sources from KgRepo, and accept merges (%s)",
       async (label) => {
         const env = heldEnvs.get(label)!;
         const beforeMerge = mergePullRequestFn.mock.calls.length;
@@ -3510,16 +3750,12 @@ describe("KgRefresh durable workflow", () => {
           { source: "tracker:Z", kind: "tracker", status: "success", reason: "", counts: { issues: 12 } },
         ];
         const triggerId = await holdRun(env, { report: { ...HELD_REPORT, cause: "tracker-missing", failedTeams: ["X", "Y"], sources } as KgRefreshReportBody });
-        const open = await callWorkflow<{ decisions: string[]; held: { cause: string; failedTeams: string[]; sources: unknown[] }; sources: unknown[] }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
-        expect(open.decisions).toEqual(["accept", "cancel"]);
-        expect(open.held).toMatchObject({ snapshotPr: 77, cause: "tracker-missing", failedTeams: ["X", "Y"], sources });
-        expect(open.sources).toEqual(sources);
+        const open = await kgRepoStatus(env.baseUrl());
+        expect(open?.held).toMatchObject({ snapshotPr: 77, cause: "tracker-missing", failedTeams: ["X", "Y"], acceptBlocked: false, sources });
 
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ada@example.com" });
-        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        const { outcome } = await decideAndAttach(env, triggerId, ACCEPT);
         expect(outcome.ok).toBe(true);
         expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
-        await closeRowFor(triggerId);
       },
       60_000,
     );
@@ -3529,162 +3765,64 @@ describe("KgRefresh durable workflow", () => {
       lostTeams: [{ team: "X", servedIssues: 40 }],
     } as KgRefreshReportBody;
 
-    it.each(VARIANTS.map(([label]) => label))(
-      "an acceptBlocked held run offers only cancel, and cancel closes the held PR (%s)",
+    it.each(LABELS)(
+      "an acceptBlocked hold answers accept-blocked and stays open; cancel then closes the held PR (%s)",
       async (label) => {
         const env = heldEnvs.get(label)!;
         const beforeClose = closePullRequestFn.mock.calls.length;
         const beforeMerge = mergePullRequestFn.mock.calls.length;
         const triggerId = await holdRun(env, { report: BLOCKED_REPORT });
-        const open = await callWorkflow<{ decisions: string[]; held: { acceptBlocked: boolean; lostTeams: unknown[] } }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
-        expect(open.decisions).toEqual(["cancel"]);
-        expect(open.held).toMatchObject({ acceptBlocked: true, lostTeams: [{ team: "X", servedIssues: 40 }] });
+        expect((await kgRepoStatus(env.baseUrl()))?.held).toMatchObject({ acceptBlocked: true, lostTeams: [{ team: "X", servedIssues: 40 }] });
 
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ada@example.com" });
-        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        await expect(decideRepo(env, ACCEPT)).rejects.toThrow(/409.*accept-blocked/);
+        expect(await decideTool(env, "accept")).toEqual({ isError: true, text: "accept-blocked" });
+        expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, held: { acceptBlocked: true, decideBy: expect.any(Number) } });
+        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
+
+        const { outcome } = await decideAndAttach(env, triggerId, { action: "cancel", actor: "ada@example.com" });
         expect(outcome.ok).toBe(false);
         expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
         expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
-        await closeRowFor(triggerId);
       },
       60_000,
     );
 
-    it.each(VARIANTS.map(([label]) => label))(
-      "a source-failed hold offers only cancel, and cancel closes the held PR (%s)",
+    it.each(LABELS)(
+      "a source-failed hold is blocked, and cancel closes the held PR (%s)",
       async (label) => {
         const env = heldEnvs.get(label)!;
         const beforeClose = closePullRequestFn.mock.calls.length;
-        const beforeMerge = mergePullRequestFn.mock.calls.length;
         const sources = [{ source: "secondary_repo:x", kind: "secondary_repo", status: "failed", reason: "boom", counts: {} }];
         const triggerId = await holdRun(env, { report: { ...HELD_REPORT, cause: "source-failed", acceptBlocked: true, lostTeams: [], sources } as KgRefreshReportBody });
-        const open = await callWorkflow<{ decisions: string[]; held: { cause: string; acceptBlocked: boolean } }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
-        expect(open.decisions).toEqual(["cancel"]);
-        expect(open.held).toMatchObject({ cause: "source-failed", acceptBlocked: true, sources });
-
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ada@example.com" });
-        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        expect((await kgRepoStatus(env.baseUrl()))?.held).toMatchObject({ cause: "source-failed", acceptBlocked: true, sources });
+        await expect(decideRepo(env, ACCEPT)).rejects.toThrow(/409.*accept-blocked/);
+        const { outcome } = await decideAndAttach(env, triggerId, { action: "cancel", actor: "ada@example.com" });
         expect(outcome.ok).toBe(false);
         expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
-        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
-        await closeRowFor(triggerId);
       },
       60_000,
     );
 
-    it.each(VARIANTS.map(([label]) => label))(
-      "accept on an acceptBlocked run answers accept-blocked and the run stays at the gate (%s)",
-      async (label) => {
-        const env = heldEnvs.get(label)!;
-        const beforeMerge = mergePullRequestFn.mock.calls.length;
-        const triggerId = await holdRun(env, { report: BLOCKED_REPORT });
-        await expect(
-          callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ada@example.com" }),
-        ).rejects.toThrow(/409.*accept-blocked/);
-        const after = await callWorkflow<{ step: string; decisions: string[] }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
-        expect(after).toMatchObject({ step: "decision", decisions: ["cancel"], held: { acceptBlocked: true, decideBy: expect.any(Number) } });
-        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
-
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ada@example.com" });
-        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
-        await closeRowFor(triggerId);
-      },
-      60_000,
-    );
-
-    it.each(VARIANTS.map(([label]) => label))(
-      "the run handler never merges an acceptBlocked report, even when an accept reaches it past decide (%s)",
-      async (label) => {
-        const env = forceEnvs.get(label)!;
-        const beforeClose = closePullRequestFn.mock.calls.length;
-        const beforeMerge = mergePullRequestFn.mock.calls.length;
-        const triggerId = await holdRun(env, { report: BLOCKED_REPORT });
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "forceDecide", { action: "accept", actor: "ada@example.com" });
-        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
-        expect(outcome.ok).toBe(false);
-        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
-        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
-        await closeRowFor(triggerId);
-      },
-      60_000,
-    );
-
-    it.each(VARIANTS.map(([label]) => label))(
-      "status never shows step decision without held and decideBy, and accept answers accept-blocked from the first such read (%s)",
-      async (label) => {
-        const env = heldEnvs.get(label)!;
-        const triggerId = await holdRun(env, { report: BLOCKED_REPORT, awaitGate: false });
-        let sawDecision = false;
-        const stop = Date.now() + 30_000;
-        while (!sawDecision && Date.now() < stop) {
-          const st = await callWorkflow<{ step: string | null; held: { decideBy: number | null } | null }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
-          if (st.step === "decision") {
-            sawDecision = true;
-            expect(st.held).not.toBeNull();
-            expect(st.held?.decideBy).toEqual(expect.any(Number));
-            await expect(
-              callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ada@example.com" }),
-            ).rejects.toThrow(/409.*accept-blocked/);
-          }
-        }
-        expect(sawDecision).toBe(true);
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ada@example.com" });
-        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
-        await closeRowFor(triggerId);
-      },
-      60_000,
-    );
-
-    it.each(VARIANTS.map(([label]) => label))(
-      "a held shrink without acceptBlocked still offers both decisions (%s)",
+    it.each(LABELS)(
+      "status shows a shrink hold with both decisions' hold view, and none once decided (%s)",
       async (label) => {
         const env = heldEnvs.get(label)!;
         const triggerId = await holdRun(env);
-        const open = await callWorkflow<{ decisions: string[]; held: { acceptBlocked: boolean; lostTeams: unknown[] } }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
-        expect(open.decisions).toEqual(["accept", "cancel"]);
-        expect(open.held).toMatchObject({ acceptBlocked: false, lostTeams: [] });
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ada@example.com" });
-        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
-        await closeRowFor(triggerId);
+        expect((await kgRepoStatus(env.baseUrl()))?.held).toEqual({ snapshotPr: 77, partTable: [{ part: "graph", prev: "100", new: "40" }], cause: "shrink", failedTeams: [], acceptBlocked: false, lostTeams: [], sources: [], decideBy: expect.any(Number) });
+
+        const { resumed } = await decideAndAttach(env, triggerId, { action: "cancel" });
+        const after = await callWorkflow<{ decisions: string[]; held: unknown }>(env.baseUrl(), "KgRefresh", resumed, "status", {});
+        expect(after).toMatchObject({ decisions: [], held: null });
       },
       60_000,
     );
 
-    it.each(VARIANTS.flatMap(([label]) => [[label, "decide"], [label, "cancel"]] as const))(
-      "%s: a %s cancel closes the PR as operator_cancelled and records it once",
-      async (label, via) => {
-        const env = heldEnvs.get(label)!;
-        const beforeClose = closePullRequestFn.mock.calls.length;
-        const beforeMerge = mergePullRequestFn.mock.calls.length;
-        const triggerId = await holdRun(env);
-        if (via === "decide") {
-          await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ada@example.com" });
-        } else {
-          await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "stop" });
-        }
-        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
-
-        expect(outcome.ok).toBe(false);
-        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
-        expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
-        const comment = postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!;
-        expect(comment).toContain("operator_cancelled");
-        expect(await closeRowFor(triggerId)).toMatchObject({ status: "failed", conclusion: "operator_cancelled" });
-        expect(persistCalls.at(-1)).toMatchObject({ ok: false, conclusion: "operator_cancelled", held: true });
-        expect(outcomesFor(triggerId)).toHaveLength(0);
-        await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "marker cleared" });
-        expect(await countSends(env, "FlyMachineProfile", "kg-refresh", "release")).toBeGreaterThanOrEqual(1);
-      },
-      60_000,
-    );
-
-    it.each(VARIANTS.flatMap(([label]) => [[label, "superseded_by_schedule", "superseded_by_schedule"], [label, "cancelled", "operator_cancelled"], [label, "operator requested", "operator_cancelled"]] as const))(
-      "%s: a gate cancel with reason %s closes the PR with gate %s and the run stays operator_cancelled (AII-1432)",
+    it.each(LABELS.flatMap((label) => [[label, "superseded_by_schedule", "superseded_by_schedule"], [label, "cancelled", "operator_cancelled"]] as const))(
+      "%s: a decided cancel with reason %s closes the PR with gate %s and the run stays operator_cancelled (AII-1432)",
       async (label, reason, gate) => {
         const env = heldEnvs.get(label)!;
         const triggerId = await holdRun(env);
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason });
-        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        await decideAndAttach(env, triggerId, { action: "cancel", reason });
 
         const comment = postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!;
         expect(comment).toContain(gate);
@@ -3695,8 +3833,20 @@ describe("KgRefresh durable workflow", () => {
       60_000,
     );
 
-    it.each(VARIANTS.map(([label]) => label))(
-      "a Stop sent before the held report cancels the held run without a decide (%s)",
+    it.each(LABELS)(
+      "a gate run that has ended answers a cancel signal no-refresh-in-flight (%s)",
+      async (label) => {
+        const env = heldEnvs.get(label)!;
+        const triggerId = await holdRun(env);
+        await expect(callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "stop" })).rejects.toThrow(/409.*no-refresh-in-flight/);
+        expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, held: { snapshotPr: 77 } });
+        await decideAndAttach(env, triggerId, { action: "cancel" });
+      },
+      60_000,
+    );
+
+    it.each(LABELS)(
+      "a Stop sent before the held report is not lost: the hold is cancelled through the decision door (%s)",
       async (label) => {
         const env = heldEnvs.get(label)!;
         const beforeClose = closePullRequestFn.mock.calls.length;
@@ -3716,132 +3866,93 @@ describe("KgRefresh durable workflow", () => {
           release();
           detailsHold = null;
         }
-        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
-
-        expect(outcome.ok).toBe(false);
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        await eventually(() => closeRowsFor(triggerId).at(-1)?.conclusion, (c) => c === "operator_cancelled", { label: "the stop's resumed run closes the row" });
         expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
         expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
         const comment = postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!;
         expect(comment).toContain("operator_cancelled");
-        expect(await closeRowFor(triggerId)).toMatchObject({ status: "failed", conclusion: "operator_cancelled" });
         expect(outcomesFor(triggerId)).toHaveLength(0);
+        await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "marker cleared" });
       },
       60_000,
     );
 
-    it.each(VARIANTS.map(([label]) => label))(
-      "the decision timer closes the PR as decision_timeout (%s)",
-      async (label) => {
-        const env = shortHeldEnvs.get(label)!;
-        const beforeClose = closePullRequestFn.mock.calls.length;
-        const triggerId = await holdRun(env, { awaitGate: false });
-        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
-
-        expect(outcome.ok).toBe(false);
-        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
-        const comment = postPrCommentFn.mock.calls.map((c) => String((c as unknown[])[4])).at(-1)!;
-        expect(comment).toContain("decision_timeout");
-        expect(await closeRowFor(triggerId)).toMatchObject({ conclusion: "decision_timeout" });
-        expect(outcomesFor(triggerId).map((c) => c.meta.failureCode)).toEqual(["decision_timeout"]);
-      },
-      60_000,
-    );
-
-    it.each(VARIANTS.map(([label]) => label))(
+    it.each(LABELS)(
       "AII-1284: a timeout whose close GitHub refuses still ends decision_timeout with one comment (%s)",
       async (label) => {
-        const env = shortHeldEnvs.get(label)!;
+        const env = heldEnvs.get(label)!;
         const beforeComments = postPrCommentFn.mock.calls.length;
         closePullRequestFn.mockRejectedValueOnce(new Error("Pull request is already merged"));
-        const triggerId = await holdRun(env, { awaitGate: false });
-        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        const triggerId = await holdRun(env);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, { action: "timeout" });
 
         expect(outcome.ok).toBe(false);
-        expect(closePullRequestFn).toHaveBeenCalledTimes(1);
         expect(postPrCommentFn.mock.calls.length - beforeComments).toBe(1);
         expect(await closeRowFor(triggerId)).toMatchObject({ conclusion: "decision_timeout" });
-        await eventually(() => countSends(env, "FlyMachineProfile", "kg-refresh", "release"), (n) => n >= 1, { label: "release" });
+        await eventually(() => runReleases(env, resumed), (n) => n >= 1, { label: "release" });
       },
       60_000,
     );
 
-    it.each(VARIANTS.map(([label]) => label))(
+    it.each(LABELS)(
       "AII-1284: a timeout whose close keeps failing on an open PR still ends decision_timeout and releases (%s)",
       async (label) => {
-        const env = shortHeldEnvs.get(label)!;
+        const env = heldEnvs.get(label)!;
         pullRequestState = { merged: false, state: "open" };
         closePullRequestFn.mockRejectedValue(new Error("GitHub 502"));
-        const releasesBefore = await countSends(env, "FlyMachineProfile", "kg-refresh", "release");
-        const triggerId = await holdRun(env, { awaitGate: false });
-        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        const triggerId = await holdRun(env);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, { action: "timeout" });
 
         expect(outcome.ok).toBe(false);
         expect(closePullRequestFn.mock.calls.length).toBeGreaterThanOrEqual(1);
         expect(await closeRowFor(triggerId)).toMatchObject({ conclusion: "decision_timeout" });
         expect(outcomesFor(triggerId).map((c) => c.meta.failureCode)).toEqual(["decision_timeout"]);
-        // The held report's release plus the finally's release; a failing close adds none.
-        await eventually(() => countSends(env, "FlyMachineProfile", "kg-refresh", "release"), (n) => n >= releasesBefore + 1, { label: "release" });
+        await eventually(() => runReleases(env, resumed), (n) => n >= 1, { label: "release" });
       },
       60_000,
     );
 
-    it.each(VARIANTS.map(([label]) => label))(
+    it.each(LABELS)(
       "AII-1284: a cancel whose close keeps failing on an open PR still ends operator_cancelled and releases (%s)",
       async (label) => {
         const env = heldEnvs.get(label)!;
         pullRequestState = { merged: false, state: "open" };
         closePullRequestFn.mockRejectedValue(new Error("GitHub 502"));
         const triggerId = await holdRun(env);
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "stop" });
-        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, { action: "cancel" });
 
         expect(outcome.ok).toBe(false);
         expect(closePullRequestFn.mock.calls.length).toBeGreaterThanOrEqual(1);
         expect(await closeRowFor(triggerId)).toMatchObject({ status: "failed", conclusion: "operator_cancelled" });
-        await eventually(() => countSends(env, "FlyMachineProfile", "kg-refresh", "release"), (n) => n >= 1, { label: "release" });
+        await eventually(() => runReleases(env, resumed), (n) => n >= 1, { label: "release" });
       },
       60_000,
     );
 
-    it.each(VARIANTS.map(([label]) => label))(
-      "AII-1284: the gate wait of a held run journals O(1) sleep entries, not one per tick (%s)",
+    it.each(LABELS)(
+      "AII-1284: a decide while the timed-out run is still closing answers 409 no-decision-open (%s)",
       async (label) => {
-        const env = shortHeldEnvs.get(label)!;
-        const triggerId = await holdRun(env, { awaitGate: false });
-        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
-        const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`);
-        const entries = await journalEntries(env.adminAPIBaseUrl(), rows[0].id as string);
-        const sleeps = entries.filter((e) => /sleep/i.test(String(e.entry_type ?? e.type ?? "")));
-        // The 1.5 s hold at a 100 ms tick would journal ~15 sleeps if it still ticked; the fixed ones (bootstrap, lease) stay under 6.
-        expect(sleeps.length).toBeLessThanOrEqual(6);
-      },
-      60_000,
-    );
-
-    it.each(VARIANTS.map(([label]) => label))(
-      "AII-1284: a decide after the deadline fires answers 409 no-decision-open (%s)",
-      async (label) => {
-        const env = shortHeldEnvs.get(label)!;
+        const env = heldEnvs.get(label)!;
         let unblock!: () => void;
         const blocked = new Promise<void>((resolve) => { unblock = resolve; });
         closePullRequestFn.mockImplementationOnce(async () => { await blocked; });
-        const triggerId = await holdRun(env, { awaitGate: false });
+        const triggerId = await holdRun(env);
+        const resumed = (await decideRepo(env, { action: "timeout", triggerId }))!.triggerId;
         try {
-          await waitForStep(() => readStatus(env.baseUrl(), triggerId), "closing");
-          await expect(
-            callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ada@example.com" }),
-          ).rejects.toThrow(/409.*no-decision-open/);
+          await waitForStep(() => readStatus(env.baseUrl(), resumed), "closing");
+          await expect(decideRepo(env, ACCEPT)).rejects.toThrow(/409.*no-decision-open/);
         } finally {
           unblock();
         }
-        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", resumed);
         expect(outcome.ok).toBe(false);
         expect(await closeRowFor(triggerId)).toMatchObject({ conclusion: "decision_timeout" });
       },
       60_000,
     );
 
-    it.each(VARIANTS.map(([label]) => label))(
+    it.each(LABELS)(
       "AII-1284: an accept whose note fails three times still merges the PR (%s)",
       async (label) => {
         const env = heldEnvs.get(label)!;
@@ -3849,19 +3960,17 @@ describe("KgRefresh durable workflow", () => {
         const beforeClose = closePullRequestFn.mock.calls.length;
         for (let i = 0; i < 3; i++) postPrCommentFn.mockRejectedValueOnce(new Error("comment API down"));
         const triggerId = await holdRun(env);
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ada@example.com" });
-        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        const { resumed, outcome } = await decideAndAttach(env, triggerId, ACCEPT);
 
         expect(outcome.ok).toBe(true);
         expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
         expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(0);
-        await closeRowFor(triggerId);
-        await eventually(() => countSends(env, "FlyMachineProfile", "kg-refresh", "release"), (n) => n >= 1, { label: "release" });
+        await eventually(() => runReleases(env, resumed), (n) => n >= 1, { label: "release" });
       },
       90_000,
     );
 
-    it.each(VARIANTS.map(([label]) => label))(
+    it.each(LABELS)(
       "AII-1284: a held report with no snapshotPr deletes the pushed branch (%s)",
       async (label) => {
         const env = heldEnvs.get(label)!;
@@ -3882,55 +3991,6 @@ describe("KgRefresh durable workflow", () => {
       60_000,
     );
 
-    it.each(VARIANTS.map(([label]) => label))(
-      "decide answers 409 before the gate and 409 once decided (%s)",
-      async (label) => {
-        const env = heldEnvs.get(label)!;
-        const triggered = await triggerViaKgRepo(env.baseUrl());
-        const triggerId = (triggered as { triggerId: string }).triggerId;
-        makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
-        await workflowDispatched(triggerId);
-        await expect(
-          callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ada@example.com" }),
-        ).rejects.toThrow(/409.*no-decision-open/);
-
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", HELD_REPORT);
-        await waitForStep(() => readStatus(env.baseUrl(), triggerId), "decision");
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ada@example.com" });
-        await expect(
-          callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "bob@example.com" }),
-        ).rejects.toThrow(/409.*already-decided/);
-        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
-      },
-      60_000,
-    );
-
-    it.each(VARIANTS.map(([label]) => label))(
-      "status answers the open decisions and the held PR at the gate, and none after decide (%s)",
-      async (label) => {
-        const env = heldEnvs.get(label)!;
-        const triggered = await triggerViaKgRepo(env.baseUrl());
-        const triggerId = (triggered as { triggerId: string }).triggerId;
-        makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
-        await workflowDispatched(triggerId);
-        const before = await callWorkflow<{ decisions: string[]; held: unknown }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
-        expect(before.decisions).toEqual([]);
-        expect(before.held).toBeNull();
-
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", HELD_REPORT);
-        await waitForStep(() => readStatus(env.baseUrl(), triggerId), "decision");
-        const open = await callWorkflow<{ decisions: string[]; held: unknown }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
-        expect(open.decisions).toEqual(["accept", "cancel"]);
-        expect(open.held).toEqual({ snapshotPr: 77, partTable: [{ part: "graph", prev: "100", new: "40" }], cause: "shrink", failedTeams: [], acceptBlocked: false, lostTeams: [], sources: [], decideBy: expect.any(Number) });
-
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ada@example.com" });
-        const after = await callWorkflow<{ decisions: string[] }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
-        expect(after.decisions).toEqual([]);
-        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
-      },
-      60_000,
-    );
-
     // ---- AII-1259: a Restate cancel of `run` does the same cleanup as the `cancel` signal, at every step ----
     const runInvocation = async (env: RestateEnvironment, triggerId: string) =>
       (await eventually(
@@ -3945,15 +4005,18 @@ describe("KgRefresh durable workflow", () => {
         env.adminAPIBaseUrl(),
         `target_service_name = 'KgRepo' AND target_service_key = '${KG_SOURCE_REPO}' AND target_handler_name = 'release' AND invoked_by_target LIKE 'KgRefresh/${triggerId}/%'`,
       )).length;
-    const expectClosedAndReleasedOnce = async (env: RestateEnvironment, triggerId: string) => {
-      expect(await closeRowFor(triggerId)).toMatchObject({ status: "failed", conclusion: "operator_cancelled" });
-      await eventually(() => runReleases(env, triggerId), (n) => n >= 1, { label: "the release" });
+    /** `runId` is the run that ended; `dispatchId` is the row it closed (the held run's, for a resumed run). */
+    const expectClosedAndReleasedOnce = async (env: RestateEnvironment, runId: string, dispatchId = runId) => {
+      // A held run's row is closed awaiting_decision at the gate; the resumed run's close is the final one.
+      const finalRow = await eventually(() => closeRowsFor(dispatchId).at(-1), (row) => row !== undefined && row.conclusion !== "awaiting_decision", { label: `final close row for ${dispatchId}` });
+      expect(finalRow).toMatchObject({ status: "failed", conclusion: "operator_cancelled" });
+      await eventually(() => runReleases(env, runId), (n) => n >= 1, { label: "the release" });
       await settle(500);
-      expect(await runReleases(env, triggerId)).toBe(1);
-      expect(outcomesFor(triggerId)).toHaveLength(0);
+      expect(await runReleases(env, runId)).toBe(1);
+      expect(outcomesFor(dispatchId)).toHaveLength(0);
     };
 
-    it.each(VARIANTS.map(([label]) => label))("a Restate cancel before the dispatch closes the row and releases, with no stop call (%s)", async (label) => {
+    it.each(LABELS)("a Restate cancel before the dispatch closes the row and releases, with no stop call (%s)", async (label) => {
       const env = heldEnvs.get(label)!;
       const hold = boundedLatch(STATUS_LATCH_MAX_MS * 4);
       reserveHold = hold.promise;
@@ -3975,7 +4038,7 @@ describe("KgRefresh durable workflow", () => {
       expect(scenarios.get(triggerId)!.dispatchCalls).toBe(0);
     }, 60_000);
 
-    it.each(VARIANTS.map(([label]) => label))("a Restate cancel during await-progress on GitHub Actions cancels the run, closes the row and releases (%s)", async (label) => {
+    it.each(LABELS)("a Restate cancel during await-progress on GitHub Actions cancels the run, closes the row and releases (%s)", async (label) => {
       const env = heldEnvs.get(label)!;
       const triggered = await triggerViaKgRepo(env.baseUrl());
       const triggerId = (triggered as { triggerId: string }).triggerId;
@@ -3989,7 +4052,7 @@ describe("KgRefresh durable workflow", () => {
       expect(stopCalls).toEqual([]);
     }, 60_000);
 
-    it.each(VARIANTS.map(([label]) => label))("a Restate cancel during await-progress on Fly stops the machine, closes the row and releases (%s)", async (label) => {
+    it.each(LABELS)("a Restate cancel during await-progress on Fly stops the machine, closes the row and releases (%s)", async (label) => {
       const env = heldEnvs.get(label)!;
       const triggered = await triggerViaKgRepo(env.baseUrl());
       const triggerId = (triggered as { triggerId: string }).triggerId;
@@ -4003,7 +4066,7 @@ describe("KgRefresh durable workflow", () => {
       expect(scenario.cancelCalls).toBe(1);
     }, 60_000);
 
-    // ---- AII-1296: the start of the merge is the point of no return ----
+    // ---- AII-1296: the start of the merge is the point of no return (the resumed run is a normal KgRefresh run) ----
     const expectRunSucceeded = async (env: RestateEnvironment, triggerId: string) => {
       const row = await eventually(
         async () => runInvocation(env, triggerId),
@@ -4012,8 +4075,8 @@ describe("KgRefresh durable workflow", () => {
       );
       expect(row.completion_result).toBe("success");
     };
-    const expectStoppedBeforeMerge = async (env: RestateEnvironment, triggerId: string, beforeMerge: number, beforeClose: number) => {
-      await expectClosedAndReleasedOnce(env, triggerId);
+    const expectStoppedBeforeMerge = async (env: RestateEnvironment, resumed: string, dispatchId: string, beforeMerge: number, beforeClose: number) => {
+      await expectClosedAndReleasedOnce(env, resumed, dispatchId);
       expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
       expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
     };
@@ -4023,31 +4086,45 @@ describe("KgRefresh durable workflow", () => {
       postPrCommentFn.mockImplementationOnce(async () => { await held.wait(); });
       return held;
     };
+    /** Accepts the hold with the note parked, runs `during` on the resumed run while it waits, then lets it go. */
+    async function acceptThenDuring(env: RestateEnvironment, during: (resumed: string, dispatchId: string) => Promise<void>) {
+      const dispatchId = await holdRun(env);
+      const held = holdAcceptNote();
+      let resumed!: string;
+      try {
+        resumed = (await decideRepo(env, { ...ACCEPT, triggerId: dispatchId }))!.triggerId;
+        await held.reached();
+        await during(resumed, dispatchId);
+      } finally {
+        held.release();
+      }
+      return { dispatchId, resumed };
+    }
 
-    it.each(VARIANTS.map(([label]) => label))("a Restate cancel during the merge does not interrupt: the gates run, the row completes and the run succeeds (%s)", async (label) => {
+    it.each(LABELS)("a Restate cancel during the merge does not interrupt: the gates run, the row completes and the run succeeds (%s)", async (label) => {
       const env = heldEnvs.get(label)!;
       const beforeClose = closePullRequestFn.mock.calls.length;
       const beforeMerge = mergePullRequestFn.mock.calls.length;
       mergeDelayMs = 1_500; // parks `run` inside the merge step
-      const triggerId = await holdRun(env);
-      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
+      const dispatchId = await holdRun(env);
+      const resumed = (await decideRepo(env, { ...ACCEPT, triggerId: dispatchId }))!.triggerId;
       await eventually(() => mergePullRequestFn.mock.calls.length - beforeMerge, (n) => n >= 1, { label: "the merge call" });
-      // Mid-merge, past the gate: the run invocation still holds the lock.
-      expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, invocationId: expect.any(String) });
-      await restateCancel(env, triggerId);
-      await expectRunSucceeded(env, triggerId);
+      // Mid-merge, past the gate: the resumed run's invocation holds the lock.
+      expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId: resumed, invocationId: expect.any(String), held: null });
+      await restateCancel(env, resumed);
+      await expectRunSucceeded(env, resumed);
       expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
       expect(gateOrder).toEqual(["fetch", "stage", "swap", "verify"]);
       expect(persistCalls.at(-1)).toMatchObject({ ok: true });
       expect(servedStamp).toBe(NEW_STAMP);
-      expect(await closeRowFor(triggerId)).toMatchObject({ status: "completed" });
-      await eventually(() => runReleases(env, triggerId), (n) => n >= 1, { label: "the release" });
+      expect(await closeRowFor(dispatchId)).toMatchObject({ status: "completed", conclusion: "passed" });
+      await eventually(() => runReleases(env, resumed), (n) => n >= 1, { label: "the release" });
       await settle(500);
-      expect(await runReleases(env, triggerId)).toBe(1);
+      expect(await runReleases(env, resumed)).toBe(1);
       expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(0);
     }, 60_000);
 
-    it.each(VARIANTS.map(([label]) => label))("a Restate cancel during a held swap restart does not orphan it: one restart, verify runs, the run succeeds (%s)", async (label) => {
+    it.each(LABELS)("a Restate cancel during a held swap restart does not orphan it: one restart, verify runs, the run succeeds (%s)", async (label) => {
       const env = heldEnvs.get(label)!;
       const swapHeld = gate("AII-1296 swap restart held");
       let swapAttempts = 0;
@@ -4056,187 +4133,225 @@ describe("KgRefresh durable workflow", () => {
         if (swapAttempts === 1) await swapHeld.wait();
         servedStamp = NEW_STAMP;
       };
-      const triggerId = await holdRun(env);
-      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
+      const dispatchId = await holdRun(env);
+      const resumed = (await decideRepo(env, { ...ACCEPT, triggerId: dispatchId }))!.triggerId;
       try {
         await swapHeld.reached();
-        await restateCancel(env, triggerId);
+        await restateCancel(env, resumed);
       } finally {
         swapHeld.release();
       }
-      await expectRunSucceeded(env, triggerId);
+      await expectRunSucceeded(env, resumed);
       expect(restartCallCount).toBe(1);
       expect(gateOrder).toEqual(["fetch", "stage", "swap", "verify"]);
       expect(persistCalls.at(-1)).toMatchObject({ ok: true });
-      expect(await closeRowFor(triggerId)).toMatchObject({ status: "completed" });
+      expect(await closeRowFor(dispatchId)).toMatchObject({ status: "completed" });
     }, 60_000);
 
-    it.each(VARIANTS.map(([label]) => label))("a cancel signal between the accept and the commit stops the run: no merge, PR closed, operator_cancelled (%s)", async (label) => {
+    it.each(LABELS)("a cancel signal between the accept and the commit stops the run: no merge, PR closed, operator_cancelled (%s)", async (label) => {
       const env = heldEnvs.get(label)!;
       const beforeClose = closePullRequestFn.mock.calls.length;
       const beforeMerge = mergePullRequestFn.mock.calls.length;
-      const triggerId = await holdRun(env);
-      const held = holdAcceptNote();
-      try {
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
-        await held.reached();
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "stop" });
-      } finally {
-        held.release();
-      }
-      await expectStoppedBeforeMerge(env, triggerId, beforeMerge, beforeClose);
+      const { dispatchId, resumed } = await acceptThenDuring(env, (r) => callWorkflow(env.baseUrl(), "KgRefresh", r, "cancel", { reason: "stop" }));
+      await expectStoppedBeforeMerge(env, resumed, dispatchId, beforeMerge, beforeClose);
     }, 60_000);
 
-    it.each(VARIANTS.map(([label]) => label))("a schedule's superseded cancel after an accept does not stop the run: the person's accept wins and the merge runs (%s)", async (label) => {
+    it.each(LABELS)("a schedule's replace after an accept finds no hold: it answers no-decision-open and the merge runs (%s)", async (label) => {
       const env = heldEnvs.get(label)!;
       const beforeClose = closePullRequestFn.mock.calls.length;
       const beforeMerge = mergePullRequestFn.mock.calls.length;
-      const triggerId = await holdRun(env);
-      const held = holdAcceptNote();
-      try {
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
-        await held.reached();
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "superseded_by_schedule" });
-      } finally {
-        held.release();
-      }
-      await expectRunSucceeded(env, triggerId);
+      const { dispatchId, resumed } = await acceptThenDuring(env, async (_r, gateId) => {
+        await expect(decideRepo(env, { action: "cancel", triggerId: gateId, reason: "superseded_by_schedule" })).rejects.toThrow(/409.*no-decision-open/);
+      });
+      await expectRunSucceeded(env, resumed);
       expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
       expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(0);
       expect(gateOrder).toEqual(["fetch", "stage", "swap", "verify"]);
-      expect(await closeRowFor(triggerId)).toMatchObject({ status: "completed" });
+      expect(await closeRowFor(dispatchId)).toMatchObject({ status: "completed" });
     }, 60_000);
 
-    it.each(VARIANTS.map(([label]) => label))("after the accept wins over a schedule's cancel, a later cancel and decide cancel answer past-merge and the run succeeds (%s)", async (label) => {
+    it.each(LABELS)("after a schedule's replace finds no hold, a later cancel and decide_kg_refresh cancel answer past-merge and the run succeeds (%s)", async (label) => {
       const env = heldEnvs.get(label)!;
       mergeDelayMs = 1_500;
       const beforeMerge = mergePullRequestFn.mock.calls.length;
-      const triggerId = await holdRun(env);
-      const held = holdAcceptNote();
-      try {
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
-        await held.reached();
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "superseded_by_schedule" });
-      } finally {
-        held.release();
-      }
+      const { resumed } = await acceptThenDuring(env, async (_r, gateId) => {
+        await expect(decideRepo(env, { action: "cancel", triggerId: gateId, reason: "superseded_by_schedule" })).rejects.toThrow(/409.*no-decision-open/);
+      });
       await eventually(() => mergePullRequestFn.mock.calls.length - beforeMerge, (n) => n >= 1, { label: "the merge call" });
-      await expect(callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "stop" })).rejects.toThrow(/409.*past-merge/);
-      await expect(callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ops@example.com" })).rejects.toThrow(/409.*past-merge/);
-      await expectRunSucceeded(env, triggerId);
+      await expect(callWorkflow(env.baseUrl(), "KgRefresh", resumed, "cancel", { reason: "stop" })).rejects.toThrow(/409.*past-merge/);
+      expect(await decideTool(env, "cancel")).toEqual({ isError: true, text: "past-merge" });
+      await expectRunSucceeded(env, resumed);
     }, 60_000);
 
-    it.each(VARIANTS.map(([label]) => label))("an operator cancel with another reason after an accept still wins at the commit point (%s)", async (label) => {
+    it.each(LABELS)("an operator cancel with another reason after an accept still wins at the commit point (%s)", async (label) => {
       const env = heldEnvs.get(label)!;
       const beforeClose = closePullRequestFn.mock.calls.length;
       const beforeMerge = mergePullRequestFn.mock.calls.length;
-      const triggerId = await holdRun(env);
-      const held = holdAcceptNote();
-      try {
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
-        await held.reached();
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "operator requested" });
-      } finally {
-        held.release();
-      }
-      await expectStoppedBeforeMerge(env, triggerId, beforeMerge, beforeClose);
+      const { dispatchId, resumed } = await acceptThenDuring(env, (r) => callWorkflow(env.baseUrl(), "KgRefresh", r, "cancel", { reason: "operator requested" }));
+      await expectStoppedBeforeMerge(env, resumed, dispatchId, beforeMerge, beforeClose);
     }, 60_000);
 
-    it.each(VARIANTS.map(([label]) => label))("a Restate cancel between the accept and the commit stops the run: no merge, PR closed, operator_cancelled (%s)", async (label) => {
+    it.each(LABELS)("a Restate cancel between the accept and the commit stops the run: no merge, PR closed, operator_cancelled (%s)", async (label) => {
       const env = heldEnvs.get(label)!;
       const beforeClose = closePullRequestFn.mock.calls.length;
       const beforeMerge = mergePullRequestFn.mock.calls.length;
-      const triggerId = await holdRun(env);
-      const held = holdAcceptNote();
-      try {
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
-        await held.reached();
-        await restateCancel(env, triggerId);
-      } finally {
-        held.release();
-      }
-      await expectStoppedBeforeMerge(env, triggerId, beforeMerge, beforeClose);
+      const { dispatchId, resumed } = await acceptThenDuring(env, (r) => restateCancel(env, r));
+      await expectStoppedBeforeMerge(env, resumed, dispatchId, beforeMerge, beforeClose);
     }, 60_000);
 
-    it.each(VARIANTS.map(([label]) => label))("decide cancel between the accept and the commit succeeds and stops the run (%s)", async (label) => {
+    it.each(LABELS)("decide_kg_refresh cancel between the accept and the commit goes to the resumed run and stops it (%s)", async (label) => {
       const env = heldEnvs.get(label)!;
       const beforeClose = closePullRequestFn.mock.calls.length;
       const beforeMerge = mergePullRequestFn.mock.calls.length;
-      const triggerId = await holdRun(env);
-      const held = holdAcceptNote();
-      try {
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
-        await held.reached();
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ops@example.com" });
-      } finally {
-        held.release();
-      }
-      await expectStoppedBeforeMerge(env, triggerId, beforeMerge, beforeClose);
+      const { dispatchId, resumed } = await acceptThenDuring(env, async () => {
+        // KgRepo.decide has no hold to cancel now; the tool falls back to the run in flight, which is the resumed one.
+        await expect(decideRepo(env, { action: "cancel" })).rejects.toThrow(/409.*no-decision-open/);
+        expect(JSON.parse((await decideTool(env, "cancel")).text)).toEqual({ cancelled: true });
+      });
+      await expectStoppedBeforeMerge(env, resumed, dispatchId, beforeMerge, beforeClose);
     }, 60_000);
 
-    it.each(VARIANTS.map(([label]) => label))("after the merge starts, cancel and decide cancel answer past-merge, a second accept answers already-decided, and the run succeeds (%s)", async (label) => {
+    it.each(LABELS)("after the merge starts, cancel and decide_kg_refresh cancel answer past-merge, a second accept answers no-decision-open, and the run succeeds (%s)", async (label) => {
       const env = heldEnvs.get(label)!;
       mergeDelayMs = 1_500;
       const beforeMerge = mergePullRequestFn.mock.calls.length;
-      const triggerId = await holdRun(env);
-      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" });
+      const dispatchId = await holdRun(env);
+      const resumed = (await decideRepo(env, { ...ACCEPT, triggerId: dispatchId }))!.triggerId;
       await eventually(() => mergePullRequestFn.mock.calls.length - beforeMerge, (n) => n >= 1, { label: "the merge call" });
-      await expect(callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "stop" })).rejects.toThrow(/409.*past-merge/);
-      await expect(callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ops@example.com" })).rejects.toThrow(/409.*past-merge/);
-      await expect(callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "accept", actor: "ops@example.com" })).rejects.toThrow(/409.*already-decided/);
-      const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+      await expect(callWorkflow(env.baseUrl(), "KgRefresh", resumed, "cancel", { reason: "stop" })).rejects.toThrow(/409.*past-merge/);
+      expect(await decideTool(env, "cancel")).toEqual({ isError: true, text: "past-merge" });
+      expect(await decideTool(env, "accept")).toEqual({ isError: true, text: "no-decision-open" });
+      const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", resumed);
       expect(outcome.ok).toBe(true);
-      await expectRunSucceeded(env, triggerId);
+      await expectRunSucceeded(env, resumed);
       // A finished run answers no-refresh-in-flight, not past-merge, so the Stop route can stamp a stuck row.
-      await expect(callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "stop" })).rejects.toThrow(/409.*no-refresh-in-flight/);
+      await expect(callWorkflow(env.baseUrl(), "KgRefresh", resumed, "cancel", { reason: "stop" })).rejects.toThrow(/409.*no-refresh-in-flight/);
     }, 60_000);
 
-    it.each(VARIANTS.map(([label]) => label))("a Restate cancel at the gate and the cancel signal make the same calls and end operator_cancelled (%s)", async (label) => {
+    it.each(LABELS)("a gate run whose lock was taken ends failed/workflow_error with its PR closed, never as an operator cancel (%s)", async (label) => {
       const env = heldEnvs.get(label)!;
-      const observe = async (via: "restate" | "signal") => {
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const beforeComments = postPrCommentFn.mock.calls.length;
+      const triggerId = ((await triggerViaKgRepo(env.baseUrl())) as { triggerId: string }).triggerId;
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      await workflowDispatched(triggerId);
+      // Another trigger owns the marker, so `hold` answers lock-lost.
+      await setObjectStates(env.adminAPIBaseUrl(), "KgRepo", KG_SOURCE_REPO, { inFlight: { triggerId: "someone-else", startedAt: Date.now() } });
+      try {
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", HELD_REPORT);
+        const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        expect(outcome.ok).toBe(false);
+        expect(outcome.conclusion).not.toBe("operator_cancelled");
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        expect(postPrCommentFn.mock.calls.slice(beforeComments).map((c) => String((c as unknown[])[4])).join("\n")).toContain("workflow_error");
+        expect(closeRowsFor(triggerId).map((r) => r.conclusion)).toEqual(["awaiting_decision", "workflow_error"]);
+        expect(persistCalls.at(-1)).toMatchObject({ ok: false });
+        expect(persistCalls.at(-1)?.conclusion).not.toBe("operator_cancelled");
+      } finally {
+        await setObjectStates(env.adminAPIBaseUrl(), "KgRepo", KG_SOURCE_REPO, {});
+      }
+    }, 60_000);
+
+    /** Reaches the window after `step` is held and before the hold is stored, runs `stop`, then lets the gate run finish. */
+    async function stopInsideGate(env: RestateEnvironment, stop: (triggerId: string) => Promise<void>): Promise<string> {
+      const triggerId = ((await triggerViaKgRepo(env.baseUrl())) as { triggerId: string }).triggerId;
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      await workflowDispatched(triggerId);
+      const park = gate("held row close");
+      heldRowPark = { jobId: triggerId, gate: park };
+      try {
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", HELD_REPORT);
+        await park.reached();
+        expect(await readStatus(env.baseUrl(), triggerId)).toMatchObject({ step: "held" });
+        await stop(triggerId);
+      } finally {
+        park.release();
+        heldRowPark = null;
+      }
+      await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+      return triggerId;
+    }
+
+    /** A Stop that reached the gate run is read after `hold` and sent through the decision door: the resumed run closes the hold. */
+    async function expectStoppedHold(env: RestateEnvironment, gateId: string, beforeClose: number): Promise<void> {
+      // The decide went out as a one-way send before the gate run ended, so the barrier returns after it ran: the marker names the resumed run.
+      await afterReleases(env);
+      const resumed = (await kgRepoStatus(env.baseUrl()))!.triggerId;
+      expect(resumed).not.toBe(gateId);
+      await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", resumed);
+      expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+      expect(closeRowsFor(gateId).map((r) => r.conclusion)).toEqual(["awaiting_decision", "operator_cancelled"]);
+    }
+
+    it.each(LABELS)("a Stop sent to the workflow once step is held cancels the hold through KgRepo.decide: PR closed, row closed once (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const gateId = await stopInsideGate(env, async (id) => {
+        await callWorkflow(env.baseUrl(), "KgRefresh", id, "cancel", { reason: "stop" });
+      });
+      await expectStoppedHold(env, gateId, beforeClose);
+    }, 60_000);
+
+    it.each(LABELS)("a Restate cancel of the gate run while the held row closes cancels the hold through KgRepo.decide: PR closed, row closed once (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const gateId = await stopInsideGate(env, async (id) => {
+        const [run] = await queryInvocations(
+          env.adminAPIBaseUrl(),
+          `target_service_name = 'KgRefresh' AND target_service_key = '${id}' AND target_handler_name = 'run'`,
+        );
+        await cancelInvocation(env.adminAPIBaseUrl(), String(run!.id));
+      });
+      await expectStoppedHold(env, gateId, beforeClose);
+      expect(await runReleases(env, gateId)).toBe(1);
+    }, 60_000);
+
+    it.each(LABELS)("a tool Cancel with no triggerId that races the gate stops the hold and answers success (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const gateId = await stopInsideGate(env, async () => {
+        expect(JSON.parse((await decideTool(env, "cancel")).text)).toEqual({ cancelled: true });
+      });
+      await expectStoppedHold(env, gateId, beforeClose);
+    }, 60_000);
+
+    it("the timer a real KgRefresh armed fires by itself: a zero timeout decides the hold as decision_timeout in a new run", async () => {
+      const zero = createKgRefreshWorkflow({ ...workflowDeps, bootstrapDeadlineMs: 30_000, totalDeadlineMs: 60_000, decisionTimeoutMs: 0 });
+      const env = await startRetryEnabled([zero, kgRepo, starter, flyMachineProfile]);
+      try {
         const beforeClose = closePullRequestFn.mock.calls.length;
-        const beforeMerge = mergePullRequestFn.mock.calls.length;
-        const beforePersist = persistCalls.length;
-        stopCalls.length = 0;
-        const triggerId = await holdRun(env);
-        const scenario = scenarios.get(triggerId)!;
-        if (via === "restate") await restateCancel(env, triggerId);
-        else await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "stop" });
-        await expectClosedAndReleasedOnce(env, triggerId);
-        await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "marker cleared" });
-        return {
-          closed: closePullRequestFn.mock.calls.length - beforeClose,
-          merged: mergePullRequestFn.mock.calls.length - beforeMerge,
-          persists: persistCalls.slice(beforePersist).map((o) => ({ ok: o.ok, detail: o.detail })),
-          stops: stopCalls.length,
-          runCancels: scenario.cancelCalls,
-          row: await closeRowFor(triggerId),
-        };
-      };
-      const signal = await observe("signal");
-      const restateCancelled = await observe("restate");
-      expect({ ...restateCancelled, row: { ...restateCancelled.row, jobId: "" } }).toEqual({ ...signal, row: { ...signal.row, jobId: "" } });
-      expect(signal).toMatchObject({ closed: 1, merged: 0, stops: 0, runCancels: 0, row: { conclusion: "operator_cancelled" } });
+        const triggerId = ((await triggerViaKgRepo(env.baseUrl())) as { triggerId: string }).triggerId;
+        makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+        await workflowDispatched(triggerId);
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", HELD_REPORT);
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        // The timer is a scheduled send due at once: it fires with no caller, and the barrier returns after it ran.
+        await decideRepo(env, { action: "timeout", triggerId: "barrier" });
+        const resumed = (await kgRepoStatus(env.baseUrl()))!.triggerId;
+        expect(resumed).not.toBe(triggerId);
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", resumed);
+        expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+        expect(closeRowsFor(triggerId).map((r) => r.conclusion)).toEqual(["awaiting_decision", "decision_timeout"]);
+      } finally {
+        await env.stop();
+      }
     }, 90_000);
 
-    it("a restart of the endpoint during the wait replays to the same gate without a second release", async () => {
+    it("a restart of the endpoint after the gate keeps the hold: no run to replay, the lock and the hold stay, and a decision still resumes it", async () => {
       const env = await startRetryEnabled([heldWorkflow, kgRepo, starter, flyMachineProfile]);
       let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
       try {
         const triggerId = await holdRun(env);
-        expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, invocationId: expect.any(String) });
+        const releasesBefore = await countSends(env, "FlyMachineProfile", "kg-refresh", "release");
 
         replacement = await replaceEndpoint(env, [createKgRefreshWorkflow({
           ...workflowDeps, bootstrapDeadlineMs: 30_000, totalDeadlineMs: 60_000, decisionTimeoutMs: DECISION_TIMEOUT_MS,
         }), kgRepo, starter, flyMachineProfile]);
         await env.startedRestateServer.restart();
 
-        await waitForStep(() => readStatus(env.baseUrl(), triggerId), "decision");
-        expect(await countSends(env, "FlyMachineProfile", "kg-refresh", "release")).toBe(1);
-        expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, invocationId: expect.any(String) });
-
-        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "decide", { action: "cancel", actor: "ada@example.com" });
-        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        expect(await countSends(env, "FlyMachineProfile", "kg-refresh", "release")).toBe(releasesBefore);
+        await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker?.triggerId === triggerId && marker.held != null, { label: "the hold survives the restart" });
+        await decideAndAttach(env, triggerId, { action: "cancel", actor: "ada@example.com" });
       } finally {
         replacement?.close();
         await env.stop();
