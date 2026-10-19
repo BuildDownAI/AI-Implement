@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { repoProcessEnv, modelProcessEnv, gitProcessEnv, gitDependencyProcessEnv, isConfiguredModelRun, MODEL_SESSION_KEYS, RUNNER_CREDENTIAL_KEYS } from "../pipeline/process-env.js";
+import { testDir } from "./helpers/test-dir.js";
 
 const SAVED: Record<string, string | undefined> = {};
 
@@ -264,9 +264,6 @@ describe("gitProcessEnv dependency credentials", () => {
   });
 
   describe("git-credential-helper.sh cache", () => {
-    let dir: string;
-    afterEach(() => rmSync(dir, { recursive: true, force: true }));
-
     function runHelper(env: NodeJS.ProcessEnv) {
       return spawnSync("bash", [join(process.cwd(), "session", "git-credential-helper.sh"), "get"], {
         input: "protocol=https\nhost=github.com\n\n",
@@ -276,10 +273,10 @@ describe("gitProcessEnv dependency credentials", () => {
     }
 
     it("a missing progress bearer alone does not fence the cached token; gitProcessEnv does", () => {
-      dir = mkdtempSync(join(tmpdir(), "helper-cache-"));
-      const cache = join(dir, "cache.json");
-      writeFileSync(cache, JSON.stringify({ token: "SENTINEL-CACHED", expires_at: "2999-01-01T00:00:00Z" }));
-      process.env.GIT_DEPENDENCY_TOKEN_FILE = cache;
+      const cache = join(testDir("helper-cache"), "cache.json");
+      // A freshly vended token's hour, well past the helper's 10-minute refresh margin.
+      writeFileSync(cache, JSON.stringify({ token: "SENTINEL-CACHED", expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString() }));
+      saveAndSet("GIT_DEPENDENCY_TOKEN_FILE", cache);
       delete process.env.RUN_PROGRESS_TOKEN;
 
       const bearerOnly = { ...process.env };
@@ -493,7 +490,7 @@ describe("configured runs and selected authentication (AII-951)", () => {
   });
 
   it("selected auth never restores ambient GitHub or runner credentials for either write flag", () => {
-    process.env.GH_TOKEN = "SENTINEL-ambient-gh";
+    saveAndSet("GH_TOKEN", "SENTINEL-ambient-gh");
     process.env.RUN_PUBLICATION_TOKEN = "SENTINEL-publication";
     process.env.RUN_PROGRESS_TOKEN = "SENTINEL-progress";
     const selected = { PATH: "/usr/bin", CODEX_API_KEY: "SYNTHETIC-selected" };

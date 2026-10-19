@@ -2,6 +2,7 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { modelsAndProvidersHtml, modelsAndProvidersScript } from "../pages/models-and-providers.js";
 import { settingsHtml, settingsScript } from "../pages/settings.js";
+import { fakeFetch } from "../../__tests__/helpers/fake-fetch.js";
 
 type W = Window & Record<string, any>;
 const w = window as unknown as W;
@@ -17,7 +18,8 @@ const ACCOUNTS = [
 interface Stub { calls: { url: string; method: string; body?: any }[]; put?: { status: number; body: any } | "reject" }
 
 function stubFetch(stub: Stub, defaults: any = { configured: false, mode: "legacy", stages: {} }, accounts: any[] = ACCOUNTS) {
-  vi.stubGlobal("fetch", vi.fn());
+  // The pages reach the server only through window.api; any direct fetch fails the test.
+  fakeFetch({}).install();
   w.api = async (url: string, opts: any = {}) => {
     const method = opts.method ?? "GET";
     stub.calls.push({ url, method, body: opts.body ? JSON.parse(opts.body) : undefined });

@@ -1,6 +1,3 @@
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DedupModule from "../dedup.js";
 import type * as OrchestratorSettingsModule from "../orchestrator-settings.js";
@@ -369,15 +366,7 @@ describe("getRunnerImageAllowedPrefixes", () => {
   });
 
   it("returns [] when the database read throws", async () => {
-    vi.resetModules();
-    const dbPath2 = path.join(os.tmpdir(), `orch-settings-notable-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-    process.env.DEDUP_DB_PATH = dbPath2;
-    const dedup2 = await import("../dedup.js");
-    const settings2 = await import("../orchestrator-settings.js");
-    // initSettingsTable() deliberately skipped so the query throws.
-    expect(settings2.getRunnerImageAllowedPrefixes()).toEqual([]);
-    dedup2.closeDb();
-    try { fs.unlinkSync(dbPath2); } catch { /* ignore */ }
+    expect((await settingsWithoutTable()).getRunnerImageAllowedPrefixes()).toEqual([]);
   });
 });
 

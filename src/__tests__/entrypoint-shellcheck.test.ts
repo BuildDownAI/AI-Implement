@@ -1,17 +1,10 @@
-import { afterEach, beforeAll, describe, it, expect } from "vitest";
+import { beforeAll, describe, it, expect } from "vitest";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { testDir } from "./helpers/test-dir.js";
-
-const tempDirs: string[] = [];
-
-afterEach(() => {
-  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-});
 
 function writeShim(binDir: string, name: string, body: string): void {
   const shim = join(binDir, name);
@@ -662,11 +655,6 @@ describe("session/lib.sh verify_workspace_writable", () => {
 
 describe("session/entrypoint.sh configured model-auth bootstrap", () => {
   const BEARER = `SENTINEL-bearer-${"x".repeat(24)}${"B".repeat(32)}`;
-  const grant = {
-    version: 1, audience: "model-auth", grantId: "g1", dispatchId: "d1", snapshotId: "s1",
-    projectKey: "p", backend: "fly", expiresAt: 1_800_000_000_000, bearer: BEARER,
-    bindings: [{ stage: "planning", profileId: "pp", profileRevision: 1, authMode: "openai-api-key" }],
-  };
   const stage = (s: string) => ({
     sel: { agent: "codex", provider: "openai", model: "m", accountProfileId: `p-${s}`, invocationTimeoutMs: 60_000 },
     src: { agent: "project", provider: "project", model: "project", accountProfileId: "project", invocationTimeoutMs: "job-deadline" },
@@ -686,6 +674,14 @@ describe("session/entrypoint.sh configured model-auth bootstrap", () => {
       profiles: { planning: p.prof, implementation: i.prof, review: r.prof },
     };
   };
+  // The grant minted for agentConfig's snapshot: one binding per stage's profile, expiring an hour after the run starts.
+  const grant = {
+    version: 1, audience: "model-auth", grantId: "g1", dispatchId: "d1", snapshotId: "snap-1",
+    projectKey: "p", backend: "fly", expiresAt: Date.now() + 60 * 60_000, bearer: BEARER,
+    bindings: (["planning", "implementation", "review"] as const).map((s) => (
+      { stage: s, profileId: `p-${s}`, profileRevision: 2, authMode: "openai-api-key" }
+    )),
+  };
   const issue = { id: "1", identifier: "A-1", title: "t", description: "d" };
   const encode = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64");
   const configuredEnvelope = () => encode({ v: 1, issue, prNumber: "7", agentConfig: agentConfig(), credentials: { version: 1, modelAuthGrant: grant } });
@@ -699,8 +695,7 @@ describe("session/entrypoint.sh configured model-auth bootstrap", () => {
   }, 120_000);
 
   function run(env: Record<string, string>, opts: { failClone?: boolean; handoff?: boolean; launcherHome?: string | "fake-root" } = {}) {
-    const root = mkdtempSync(join(tmpdir(), "entrypoint-configured-"));
-    tempDirs.push(root);
+    const root = testDir("entrypoint-configured");
     const binDir = join(root, "bin");
     const workspace = join(root, "workspace");
     const log = join(root, "children.log");
@@ -777,8 +772,7 @@ printf 'protocol=https\\nhost=github.com\\n\\n' | env -i PATH="$PATH" HOME='${fa
     };
 
     it("copies the launcher HOME's gitconfig, not /root's, so the coder child gets the scoped helper", () => {
-      const home = mkdtempSync(join(tmpdir(), "entrypoint-launcher-home-"));
-      tempDirs.push(home);
+      const home = testDir("entrypoint-launcher-home");
       check(run({ AI_IMPLEMENT_RUN_CONFIG: configuredEnvelope() }, { handoff: true, launcherHome: home }));
     });
 
@@ -898,8 +892,7 @@ printf 'protocol=https\\nhost=github.com\\n\\n' | env -i PATH="$PATH" HOME='${fa
 
   describe("node preload/module-path controls", () => {
     const probe = () => {
-      const dir = mkdtempSync(join(tmpdir(), "entrypoint-preload-"));
-      tempDirs.push(dir);
+      const dir = testDir("entrypoint-preload");
       const marker = join(dir, "marker");
       const preload = join(dir, "preload.cjs");
       writeFileSync(preload, `require("node:fs").appendFileSync(${JSON.stringify(marker)}, "ran\\n");\n`);
