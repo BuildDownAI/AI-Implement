@@ -290,14 +290,15 @@ replays a held journal on new code. The gate run:
 
 1. Sends `FlyMachineProfile("kg-refresh").release({ dispatchId })`: the runner has finished, so the
    machine returns to the profile now.
-2. Closes the `dispatch_log` row `completed` with conclusion `awaiting_decision`, in a `ctx.run`. **The row
-   is closed first**, so a resumed run that finishes fast can never be overwritten by a late
-   `awaiting_decision` write.
-3. **Calls** `KgRepo.hold` and awaits it (a call, not a send), so the hold is stored before the run ends and
+2. **Calls** `KgRepo.hold` and awaits it (a call, not a send), so the hold is stored before the run ends and
    the `release` that `watch` sends afterwards always sees it. `KgRepo`'s exclusive handlers never call
    `KgRefresh` synchronously, so the call cannot deadlock. The stored hold is the original trigger and
    dispatch id, the report (snapshot PR, commit and branch, part table, `cause`, `failedTeams`,
    `acceptBlocked`, `lostTeams`, `sources`), the runner step table, and `decideBy` (now + 24 h).
+3. **Then** writes the `dispatch_log` row `completed` / `awaiting_decision` (AII-1493), in a `ctx.run`, through a
+   guarded write (`markJobAwaitingDecision`, `src/log.ts`) that lands only on a fresh `running` row, and only
+   if `KgRepo.status` still shows the hold undecided. The hold comes first so a kill between the two leaves a
+   hold with the row still `running`, which a decision closes, instead of an `awaiting_decision` row with no hold.
 4. Returns an `awaiting_decision` outcome. It does not write `lastRefresh` or notify: the resumed run does both.
    A Stop that arrived after the report was taken (so no run is left to read it) is forwarded as a cancel
    through `KgRepo.decide`.
@@ -315,12 +316,32 @@ branch), which `get_kg_status` surfaces as `currentRun.held` with `step: "decisi
 
 | Event | Answer / action |
 | -- | -- |
-| No hold, or a `triggerId` that is not the current hold's | 409 `no-decision-open`; a `timeout` answers `null` and does nothing, so a timer from an older hold or one that fires after a decision never decides anything |
+| No hold, a hold already `decided`, or a `triggerId` that is not the current hold's | 409 `no-decision-open`; a `timeout` answers `null` and does nothing, so a timer from an older hold or one that fires after a decision never decides anything |
 | `accept` on a blocked hold (`acceptBlocked`) | 409 `accept-blocked`; the hold stays open |
-| `accept` | Clears `held`, calls `submit` with `resume: { hold, action: "accept", actor }`: the resumed run posts a `### Baseline` comment naming the actor, then runs the normal merge, delete-branch and fetch/stage/swap/verify gates |
-| `cancel` | Clears `held`, resumes with `cancel`: closes the PR (gate `operator_cancelled`), closes the row, releases |
+| `accept` | Marks the hold `decided` (it stays), calls `submit` with `resume: { hold, action: "accept", actor }`: the resumed run posts a `### Baseline` comment naming the actor, then runs the normal merge, delete-branch and fetch/stage/swap/verify gates |
+| `cancel` | Marks the hold `decided`, resumes with `cancel`: closes the PR (gate `operator_cancelled`), closes the row, releases |
 | `cancel` with `reason: "superseded_by_schedule"` | Same, with the PR closed under gate `superseded_by_schedule`; the run's classification stays `operator_cancelled` |
 | `timeout` for the current hold (24 h, `KG_REFRESH_DECISION_TIMEOUT_MS`, fixed, no setting) | Resumes with `timeout`: closes the PR (gate `decision_timeout`), closes the row, releases |
+
+**The hold lives until the run that acts on it ends (AII-1493).** `decide` does not clear `held`: it records
+`decided: { action, triggerId }` on it, and `status` reports no open decisions (`held: null`) while `decided` is
+set. `watch` tells `release` how the run ended: `ended: "returned"` when `attach` resolves (any outcome, a Restate
+cancel included), `"killed"` when `attach` throws. The run's own `finally` sends no `ended`, read as `returned`.
+For the resumed trigger, `release` does this:
+
+| `ended` | Effect |
+| -- | -- |
+| `returned` (or absent) | Clears `held`, then `clearAndDrain` frees the lock and submits a queued dry-run, as before |
+| `killed` | Clears `decided` (the hold is open again), puts the marker back on the hold's own trigger (lock kept) and arms a timeout at `decideBy` (delay 0 if past). The operator can decide again; a repeated kill repeats this |
+
+`watch` reads the ended run's `KgRefresh.status` first. A run past its commit point (`committed`, AII-1296) counts as
+`returned` even if killed: the snapshot PR may already be merged, so nothing reopens and there is no second merge.
+A failed read errs the same way. A kill of the gate run itself leaves the hold, since `clearAndDrain` skips a held
+trigger. The resumed run's first step takes the row back (`reopenHeldJob`): `completed` / `awaiting_decision`
+becomes `running`, stamped `resumed`, a plain conditional write with none of `updateJobStatus`'s terminal side
+effects. A row therefore reads `awaiting_decision` only while a hold is open and undecided. The stamp also
+makes the gate's guarded write a no-op if it was parked while the decision was made. A killed resumed run leaves its
+row `running`, like any other killed run; the next decision closes it once.
 
 `decide` returns the resumed run's `triggerId`. `submit` replaces the `inFlight` marker with the resumed run's
 and starts its `watch`, so the lock follows the new run, and a late `release` from the gate run (its marker no
@@ -336,7 +357,8 @@ optional `triggerId`; the KG page passes the trigger of the hold it shows, so a 
 newer hold, and a named hold that is gone answers `no-decision-open` without falling back. With no `triggerId`
 and no hold open, `accept` answers `no-decision-open`, and `cancel` re-reads `KgRepo.status` and sends the
 `cancel` signal to the run now in flight (the resumed run after an accept, answering `past-merge` once it is
-past the commit point). A second accept answers `no-decision-open` (the hold is gone). The pipeline schedule
+past the commit point). If that signal answers 409 or 404 because the gate run stored its hold and ended in
+between, it reads `KgRepo.status` once more and cancels a hold it finds through `KgRepo.decide`. A second accept answers `no-decision-open` (the hold is gone). The pipeline schedule
 reads the hold from `KgRepo.status` (`busy`) and replaces its own held run with
 `KgRepo.decide({ action: "cancel", triggerId, reason: "superseded_by_schedule" })`; after an accept there is no
 hold, so the schedule never replaces a run a person accepted.

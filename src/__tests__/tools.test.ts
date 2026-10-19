@@ -1553,6 +1553,18 @@ describe("migrated write handlers (AII-713)", () => {
       expect(cancel).not.toHaveBeenCalled();
     });
 
+    it("cancels through KgRepo.decide when the gate run stored its hold and ended between the status read and the workflow cancel (AII-1493)", async () => {
+      decide.mockRejectedValueOnce(terminal(409, "no-decision-open")).mockResolvedValueOnce({ triggerId: "trig-2" });
+      status
+        .mockResolvedValueOnce({ triggerId: "trig-1", startedAt: 1 })
+        .mockResolvedValueOnce({ triggerId: "trig-1", startedAt: 1 })
+        .mockResolvedValueOnce({ triggerId: "trig-1", startedAt: 1, held: { snapshotPr: 7 } });
+      cancel.mockRejectedValue(terminal(409, "no-refresh-in-flight"));
+      expect(answer(await call({ action: "cancel" }))).toEqual({ isError: false, text: JSON.stringify({ cancelled: true }, null, 2) });
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(decide).toHaveBeenLastCalledWith({ action: "cancel", actor: "ada@example.com", triggerId: "trig-1" });
+    });
+
     it("does not report success or a conflict when Restate is unavailable", async () => {
       decide.mockRejectedValue(new Error("connect ECONNREFUSED"));
       await expect(call({ action: "accept" })).resolves.toMatchObject({ isError: true });

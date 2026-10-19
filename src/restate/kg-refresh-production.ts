@@ -32,7 +32,7 @@ import { readBackendRun, stopBackendRun } from "../backend-run.js";
 import { getRunnerMode, getKgExecutionMode, resolveKgBackend, type KgBackendResolution } from "../runner-mode.js";
 import { mintLaunchTokens } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
-import { appendLogIfAbsent, findLogIdByDispatchId, setJobMachineId, setJobMachineNonce, updateJobPrUrl, updateJobRunId } from "../log.js";
+import { appendLogIfAbsent, findLogIdByDispatchId, markJobAwaitingDecision, reopenHeldJob as reopenHeldJobRow, setJobMachineId, setJobMachineNonce, updateJobPrUrl, updateJobRunId } from "../log.js";
 import { clearMachineEnv, createMachine, destroyMachine, getMachine, listMachines, startMachine, updateMachine, waitForMachine, waitForMachineSettled, type CreateMachineOpts, type Machine, type MachineConfig, type SettleOptions } from "../fly-machines.js";
 import type { RestateService } from "./endpoint.js";
 import {
@@ -428,6 +428,16 @@ export function createProductionKgRefreshServices(
       const id = findJobId(jobId);
       if (id === undefined) return;
       input.updateJobStatus(id, status, conclusion);
+    },
+    markJobHeld: (jobId) => {
+      const id = findJobId(jobId);
+      if (id === undefined) return;
+      markJobAwaitingDecision(id);
+    },
+    reopenHeldJob: (jobId) => {
+      const id = findJobId(jobId);
+      if (id === undefined) return;
+      reopenHeldJobRow(id);
     },
     getWorkflowRunStatus: input.getWorkflowRunStatus,
     findRunByTitle: input.findRunByTitle,

@@ -76,10 +76,10 @@ describe("KgRepo.decide", () => {
     expect(runs).toEqual([]);
   });
 
-  it("clears the hold and starts the resumed run once; a second accept answers no-decision-open", async () => {
+  it("keeps the hold, decided, and starts the resumed run once; a second accept answers no-decision-open", async () => {
     const { ctx, state, runs } = fakeRepoCtx(HOLD);
     expect(await decide(ctx, { action: "accept", actor: "ada@example.com", triggerId: "t1" })).toEqual({ triggerId: "t2" });
-    expect(state.has("held")).toBe(false);
+    expect(state.get("held")).toMatchObject({ triggerId: "t1", decided: { action: "accept", triggerId: "t2" } });
     expect(runs).toHaveLength(1);
     expect(runs[0].input.resume).toMatchObject({ action: "accept", actor: "ada@example.com", hold: { triggerId: "t1" } });
     await expect(decide(ctx, { action: "accept", actor: "bob@example.com" })).rejects.toMatchObject({ message: "no-decision-open" });
