@@ -39,6 +39,30 @@ describe("kg-refresh callback-URL contract", () => {
 
   // ---- Runner-side client contracts ----
 
+  it("postRunnerResult carries baseMerge when given and omits the key otherwise", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const mockFetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response("{}", { status: 200 });
+    });
+    const baseMerge = { headSha: "b".repeat(40), result: "conflict" as const, conflictPaths: ["a.md"] };
+    const savedToken = process.env.RUN_TOKEN;
+    process.env.RUN_TOKEN = "tok-123";
+    try {
+      for (const extra of [{ baseMerge }, {}]) {
+        await postRunnerResult({
+          phase: "kg-refresh", workspaceDir: dataRoot, outcome: "success", callbackUrl: BASE,
+          fetchImpl: mockFetch as typeof fetch, ...extra,
+        });
+      }
+    } finally {
+      if (savedToken === undefined) delete process.env.RUN_TOKEN;
+      else process.env.RUN_TOKEN = savedToken;
+    }
+    expect(bodies[0].baseMerge).toEqual(baseMerge);
+    expect("baseMerge" in bodies[1]).toBe(false);
+  });
+
   it("postRunnerResult resolves to POST /runner/result — a served route", async () => {
     const captured: string[] = [];
     const mockFetch = vi.fn(async (url: string) => {
@@ -185,6 +209,60 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
     expect((await run(forged.token, c)).status).toBe(401);
     expect(c.repoStatus).not.toHaveBeenCalled();
     expect(c.report).not.toHaveBeenCalled();
+  });
+
+  describe("baseMerge", () => {
+    const HEAD = "b".repeat(40);
+    const reportArg = (c: ReturnType<typeof client>) => (c.report.mock.calls[0] as unknown as [string, Record<string, unknown>])[1];
+
+    it.each([
+      [{ headSha: HEAD, result: "merged" }],
+      [{ headSha: HEAD, result: "behind", conflictPaths: ["a.md"] }],
+      [{ headSha: HEAD, result: "conflict", conflictPaths: [] }],
+      [{ headSha: HEAD, result: "conflict", conflictPaths: Array.from({ length: 50 }, (_, i) => `p${i}`) }],
+    ])("forwards a valid baseMerge unchanged", async (baseMerge) => {
+      const c = client();
+      const res = await run(mint().token, c, { ...(resultBody as object), baseMerge } as never);
+      expect(res.status).toBe(200);
+      expect(reportArg(c).baseMerge).toEqual(baseMerge);
+    });
+
+    it.each([
+      [{ headSha: HEAD, result: "other" }],
+      [{ result: "merged" }],
+      [{ headSha: "short", result: "merged" }],
+      [{ headSha: HEAD, result: "behind", conflictPaths: "a.md" }],
+      [{ headSha: HEAD, result: "behind", conflictPaths: [1] }],
+      [{ headSha: HEAD, result: "behind", conflictPaths: Array.from({ length: 51 }, (_, i) => `p${i}`) }],
+      ["merged"],
+      [null],
+    ])("drops an invalid baseMerge, logs, still forwards the rest, answers 200", async (baseMerge) => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const { token, dispatchId } = mint();
+        const c = client();
+        const res = await run(token, c, { ...(resultBody as object), baseMerge } as never);
+        expect(res.status).toBe(200);
+        const arg = reportArg(c);
+        expect("baseMerge" in arg).toBe(false);
+        expect(arg).toMatchObject({ ok: true, snapshotPr: 7, snapshotCommit: "abc" });
+        expect(warn).toHaveBeenCalledWith(`[runner-callback] kg-refresh baseMerge dropped: invalid shape dispatch=${dispatchId}`);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("forwards a body without baseMerge with no key and no log", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const c = client();
+        await run(mint().token, c);
+        expect("baseMerge" in reportArg(c)).toBe(false);
+        expect(warn).not.toHaveBeenCalled();
+      } finally {
+        warn.mockRestore();
+      }
+    });
   });
 
   it("maps unavailable to 503 and conflict to 409", async () => {

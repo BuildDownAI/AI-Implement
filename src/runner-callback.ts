@@ -108,6 +108,16 @@ export function planningDispatchBlockReason(config: {
   );
 }
 
+/** Runner-supplied, so checked before it is forwarded: the closed `result` enum, a 40-hex `headSha`, at most 50 string paths. */
+function isBaseMergeEcho(value: unknown): value is NonNullable<RunnerResultBody["baseMerge"]> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const { headSha, result, conflictPaths } = value as Record<string, unknown>;
+  if (typeof headSha !== "string" || !/^[0-9a-f]{40}$/.test(headSha)) return false;
+  if (result !== "merged" && result !== "behind" && result !== "conflict") return false;
+  if (conflictPaths === undefined) return true;
+  return Array.isArray(conflictPaths) && conflictPaths.length <= 50 && conflictPaths.every((p) => typeof p === "string");
+}
+
 export interface RunnerResultBody {
   phase: RunnerPhase;
   outcome: "success" | "failure";
@@ -144,6 +154,13 @@ export interface RunnerResultBody {
   guardVerdict?: "clean" | "warnings" | "refused" | "held";
   /** Per-part {part, prev, new} table from kg-snapshot-push, present for a kg-refresh dry-run (AII-632), a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638), or a `KG_SNAPSHOT_HELD` shrink. */
   partTable?: Array<{ part: string; prev: string; new: string }>;
+  /** What the runner did with run_config.kgBaseMerge. Absent when the envelope had none, or the runner predates it. */
+  baseMerge?: {
+    headSha: string;
+    result: "merged" | "behind" | "conflict";
+    /** Ingest-path conflicts. Present for "behind" and "conflict". At most 50 entries. */
+    conflictPaths?: string[];
+  };
   /** Why a `KG_SNAPSHOT_HELD` run waits; absent from runners that predate the field. */
   cause?: "shrink" | "tracker-missing" | "source-failed";
   /** Teams whose tracker fetch failed, for a `tracker-missing` hold. */
@@ -811,6 +828,11 @@ export async function handleRunnerResult(
     if (kgVerified.claims.phase !== "kg-refresh") return bad(400, "phase_mismatch");
     const dispatchId = kgVerified.claims.dispatchId;
     if (!input.kgRefreshClient) return bad(503, "kg_refresh_unavailable");
+    let baseMerge: NonNullable<RunnerResultBody["baseMerge"]> | undefined;
+    if (input.body.baseMerge !== undefined) {
+      if (isBaseMergeEcho(input.body.baseMerge)) baseMerge = input.body.baseMerge;
+      else console.warn(`[runner-callback] kg-refresh baseMerge dropped: invalid shape dispatch=${dispatchId}`);
+    }
     const reported = await input.kgRefreshClient.report(
       dispatchId,
       {
@@ -828,6 +850,7 @@ export async function handleRunnerResult(
         lostTeams: input.body.lostTeams,
         warnings: input.body.warnings,
         guardVerdict: input.body.guardVerdict,
+        ...(baseMerge ? { baseMerge } : {}),
       },
       { idempotencyKey: dispatchId },
     );
