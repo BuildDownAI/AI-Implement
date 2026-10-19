@@ -805,9 +805,10 @@ Each of these shipped a degraded or blocked deploy, and each is now covered by a
 |---|---|---|
 | Success, no-new-data, clean dry run | `completed` | `passed` |
 | Ok with warnings (`guardVerdict: "warnings"` or a non-empty `warnings` list), live or dry run | `completed` | `warnings` |
+| Held at the decision gate (AII-1490) | `completed` | `awaiting_decision` until accept, cancel, or timeout re-closes the row |
 | Not ok, including a refused dry run | `failed` / `timed_out` | the failure code (`dry_run_refused` when the report carries none) |
 
-The Pipelines badge for a `kg-refresh` row reads **passed**, **completed with warnings**, or **failed** from
+The Pipelines badge for a `kg-refresh` row reads **awaiting decision** (warn style, also on the KG Pipelines dispatch log; counted as `awaitingDecisionCount` in `get_tenant_health`, not in `inFlightJobCount`), **passed**, **completed with warnings**, or **failed** from
 status and conclusion; other run kinds keep their status label. A legacy row (`completed`, no conclusion)
 keeps the plain `completed` label. The KG page's last-refresh line shows the same three outcomes for live
 refreshes (**passed**, **completed with warnings**, or **failed**, as above); dry runs appear only as Pipelines rows.
