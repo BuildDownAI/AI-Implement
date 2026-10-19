@@ -3443,6 +3443,19 @@ describe("KgRefresh durable workflow", () => {
      * to the object (a run's `release`, a one-way `decide`) has run. Reading state after it needs no polling.
      */
     const afterReleases = (env: RestateEnvironment) => decideRepo(env, { action: "timeout", triggerId: "barrier" });
+    /** The workflow keys of every `KgRefresh/run` invocation, completed or not. */
+    const runKeys = async (env: RestateEnvironment) =>
+      new Set((await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRefresh' AND target_handler_name = 'run'`)).map((r) => String(r.target_service_key)));
+    /**
+     * The one run started since `known`, found in Restate: the lock marker is released when the resumed run ends, so it can already be null.
+     * A finished run still counts, so the lookup never filters on status.
+     */
+    const resumedRunKey = async (env: RestateEnvironment, known: Set<string>) =>
+      (await eventually(
+        async () => [...(await runKeys(env))].filter((key) => !known.has(key)),
+        (fresh) => fresh.length === 1,
+        { label: "resumed run started" },
+      ))[0]!;
     /** Every `KgRepo/watch` invocation for the test repo, completed or not. */
     const watchInvocations = (env: RestateEnvironment) =>
       queryInvocations(
@@ -3550,11 +3563,12 @@ describe("KgRefresh durable workflow", () => {
         const env = heldEnvs.get(label)!;
         const beforeMerge = mergePullRequestFn.mock.calls.length;
         const triggerId = await holdRun(env);
+        const known = await runKeys(env);
         const first = await decideTool(env, "accept", { triggerId });
         expect(first.isError).toBe(false);
         expect(JSON.parse(first.text)).toEqual({ decided: "accept" });
-        // The accept resumed the hold as a new run, which holds the marker until it ends.
-        const resumed = (await kgRepoStatus(env.baseUrl()))!.triggerId;
+        // The accept resumed the hold as a new run; the marker may already be released, so find it in Restate.
+        const resumed = await resumedRunKey(env, known);
         expect(resumed).not.toBe(triggerId);
         expect(await decideTool(env, "accept", { triggerId })).toEqual({ isError: true, text: "no-decision-open" });
         await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", resumed);
@@ -4499,7 +4513,7 @@ describe("KgRefresh durable workflow", () => {
         await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
         // The timer is a scheduled send due at once: it fires with no caller, and the barrier returns after it ran.
         await decideRepo(env, { action: "timeout", triggerId: "barrier" });
-        const resumed = (await kgRepoStatus(env.baseUrl()))!.triggerId;
+        const resumed = await resumedRunKey(env, new Set([triggerId]));
         expect(resumed).not.toBe(triggerId);
         await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", resumed);
         expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
