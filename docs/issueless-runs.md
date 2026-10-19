@@ -30,7 +30,7 @@ flowchart TD
     O -->|"marker live"| O2["409 refresh-in-progress"]
     O -->|"one-way send"| W["KgRefresh.run\nreserve → dispatch"]
     W --> E["GitHub Actions, Fly Machine,\nor local Docker"]
-    E --> F["runner pipeline\nclone → kg-scope-reconcile → dependency-auth → clone-code-repo → clone-secondary-repos\n→ kg-tracker-data → kg-ingest → kg-snapshot-push"]
+    E --> F["runner pipeline\nclone → kg-base-merge → kg-scope-reconcile → dependency-auth → clone-code-repo → clone-secondary-repos\n→ kg-tracker-data → kg-ingest → kg-snapshot-push"]
     W --> T["wait: report | cancel | progress\nbootstrap deadline 10 min, total deadline 4 h\nGHA: watch the run's status;\nstarted evidence = status in_progress\nor the runner progress heartbeat, first wins"]
     F -->|"progress heartbeat"| T
     F -->|"POST /api/runner/result"| G["KgRefresh.report\nidempotency key = dispatch id"]

@@ -3,6 +3,9 @@ steps:
   - id: clone
     type: clone
     depth: full
+  - id: kg-base-merge
+    type: custom
+    moduleId: kg-base-merge
   - id: kg-scope-reconcile
     type: custom
     moduleId: kg-scope-reconcile

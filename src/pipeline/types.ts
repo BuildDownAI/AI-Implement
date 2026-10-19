@@ -115,6 +115,8 @@ export interface PipelineContextData {
   retryPolicy?: RetryPolicy;
   /** kg-refresh dev-harness: when true, kg-snapshot-push prints the guard table but skips commit and push. */
   kgDryRun?: boolean;
+  /** kg-refresh dry run: the base-template PR to merge into the scratch clone (read by the kg-base-merge step). */
+  kgBaseMerge?: { repo: string; prNumber: number; baseSha: string; headSha: string };
   /**
    * Optional runner-activity/cycle sink (AII-788). Mirrors `PipelineContext.activitySink`
    * so a context constructed from a plain `PipelineContextData` bag (e.g. the dev harness,

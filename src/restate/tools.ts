@@ -655,7 +655,7 @@ export function kgStageForStep(step: string | null): KgRefreshStage {
 
 /**
  * Maps the in-flight runner step onto a stage (AII-1134). Full table (id x status):
- *   clone, kg-scope-reconcile, dependency-auth, clone-code-repo,
+ *   clone, kg-base-merge, kg-scope-reconcile, dependency-auth, clone-code-repo,
  *   clone-secondary-repos, kg-tracker-data -> checking, for every status
  *   kg-ingest                              -> ingest-running, for every status
  *   kg-snapshot-push                       -> snapshot-landed when passed; ingest-running otherwise
@@ -664,6 +664,7 @@ export function kgStageForStep(step: string | null): KgRefreshStage {
 export function kgStageForRunnerStep(id: string, status: StepStatus): KgRefreshStage {
   switch (id) {
     case "clone":
+    case "kg-base-merge":
     case "kg-scope-reconcile":
     case "dependency-auth":
     case "clone-code-repo":
