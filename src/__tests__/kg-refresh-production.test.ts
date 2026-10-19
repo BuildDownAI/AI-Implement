@@ -420,6 +420,19 @@ describe("buildEnvelope", () => {
     expect(envelope).not.toHaveProperty("kgAccept" + "NewBaseline");
     expect(envelope).not.toHaveProperty("kgBaseline" + "Actor");
   });
+
+  it("carries kgBaseMerge and kgDryRun into the envelope, with no kgSourceRef", () => {
+    createProductionKgRefreshServices(makeInput());
+    const kgBaseMerge = {
+      repo: "acme/kg-base", prNumber: 3, baseSha: "a".repeat(40), headSha: "b".repeat(40),
+    };
+    const envelope = capturedWorkflowDeps.current!.buildEnvelope(
+      { triggerId: "t-1", dryRun: true, kgBaseMerge },
+      "KG-REFRESH · t-1",
+    );
+    expect(envelope).toMatchObject({ kgDryRun: true, kgBaseMerge });
+    expect(envelope).not.toHaveProperty("kgSourceRef");
+  });
 });
 
 describe("deriveMachineNonce", () => {

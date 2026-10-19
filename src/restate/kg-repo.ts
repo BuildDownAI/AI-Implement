@@ -29,8 +29,10 @@ import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import { MAX_TRACKED_PRS, type KgDryRunReportTarget, type RefreshOutcome } from "../kg-refresh.js";
 import {
+  kgBaseMergeSchema,
   kgDryRunReportSchema,
   kgRefreshOptionsSchema,
+  type KgBaseMerge,
   type KgRefreshRunInput,
 } from "./kg-refresh-workflow.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
@@ -44,7 +46,9 @@ interface InFlightMarker {
 
 /** One held PR-check dry-run request, keyed in state by `<repo>#<prNumber>`. */
 interface PendingDryRun {
-  ref: string;
+  /** Set on entries written before base-repo PRs sent `baseMerge`; exactly one of `ref` and `baseMerge` on new ones. */
+  ref?: string;
+  baseMerge?: KgBaseMerge;
   report: KgDryRunReportTarget;
   enqueuedAt: number;
 }
@@ -62,9 +66,12 @@ const triggerInputSchema = kgRefreshOptionsSchema.optional();
 
 const enqueueInputSchema = z.object({
   key: z.string().min(1),
-  ref: z.string().min(1),
+  ref: z.string().min(1).optional(),
+  baseMerge: kgBaseMergeSchema.optional(),
   report: kgDryRunReportSchema,
-}).strict();
+}).strict().refine((v) => (v.ref === undefined) !== (v.baseMerge === undefined), {
+  message: "exactly one of ref and baseMerge is required",
+});
 
 const prInputSchema = z.object({ repo: z.string().min(1), prNumber: z.number() }).strict();
 
@@ -82,6 +89,13 @@ export type KgRepoTriggerInput = z.infer<typeof kgRefreshOptionsSchema>;
 export type KgRepoPrInput = z.infer<typeof prInputSchema>;
 export type KgRepoRecordOutcomeInput = { report: KgDryRunReportTarget; outcome: RefreshOutcome };
 export type KgRepoEnqueueInput = z.infer<typeof enqueueInputSchema> & { report: KgDryRunReportTarget };
+
+/** The `submit` options for one held or immediate PR-check dry-run. */
+function dryRunOptions(entry: { ref?: string; baseMerge?: KgBaseMerge; report: KgDryRunReportTarget }): KgRepoTriggerInput & { report: KgDryRunReportTarget } {
+  return entry.baseMerge
+    ? { dryRun: true, kgBaseMerge: entry.baseMerge, report: entry.report }
+    : { dryRun: true, kgSourceRef: entry.ref, report: entry.report };
+}
 
 const outcomeStateKey = (repo: string, prNumber: number): string => `outcome:${repo}#${prNumber}`;
 const closedKey = (repo: string, prNumber: number): string => `${repo}#${prNumber}`;
@@ -128,7 +142,7 @@ export function createKgRepo(deps: KgRepoDependencies) {
   }
 
   async function enqueueDryRun(ctx: ObjectContext, input: KgRepoEnqueueInput): Promise<KgRepoEnqueueResult> {
-    const { key, ref, report } = input;
+    const { key, ref, baseMerge, report } = input;
     // The last head sha accepted for this PR: a second event for it (any delivery id) is absorbed here.
     const shaKey = shaStateKey(report.repo, report.prNumber);
     // A PR already closed (`forgetPr` ran first) must not be held: its branch may be gone by the
@@ -140,12 +154,12 @@ export function createKgRepo(deps: KgRepoDependencies) {
     ctx.set(shaKey, report.sha);
     const now = await ctx.date.now();
     const live = await liveInFlight(ctx);
-    if (!live) return { triggerId: await submit(ctx, now, { dryRun: true, kgSourceRef: ref, report }) };
+    if (!live) return { triggerId: await submit(ctx, now, dryRunOptions({ ref, baseMerge, report })) };
 
     const pending = (await ctx.get<Record<string, PendingDryRun>>("pending")) ?? {};
     // A newer head for the same PR replaces the held one and takes the back of the line.
     delete pending[key];
-    pending[key] = { ref, report, enqueuedAt: now };
+    pending[key] = { ...(baseMerge ? { baseMerge } : { ref }), report, enqueuedAt: now };
     while (Object.keys(pending).length > MAX_TRACKED_PRS) {
       const evictedKey = oldestPendingKey(pending)!;
       const evicted = pending[evictedKey].report;
@@ -166,11 +180,11 @@ export function createKgRepo(deps: KgRepoDependencies) {
     const pending = await ctx.get<Record<string, PendingDryRun>>("pending");
     const headKey = pending ? oldestPendingKey(pending) : undefined;
     if (!pending || headKey === undefined) return true;
-    const { ref, report } = pending[headKey];
+    const { enqueuedAt: _enqueuedAt, ...held } = pending[headKey];
     delete pending[headKey];
     if (Object.keys(pending).length === 0) ctx.clear("pending");
     else ctx.set("pending", pending);
-    await submit(ctx, await ctx.date.now(), { dryRun: true, kgSourceRef: ref, report });
+    await submit(ctx, await ctx.date.now(), dryRunOptions(held));
     return true;
   }
 
