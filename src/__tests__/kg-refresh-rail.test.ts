@@ -558,7 +558,7 @@ describe("kg-refresh-rail", () => {
       });
 
       it("row 2: missing conflictPaths renders 0 files", async () => {
-        const { st } = await run({ ...base, ok: false, failureCode: "KG_BASE_CONFLICT", detail: "x", baseHeadSha: HEAD });
+        const { st } = await run({ ...base, ok: false, failureCode: "KG_BASE_CONFLICT", detail: "x" });
         expect(st.description).toBe("PR conflicts with KG repo ingest code: 0 files");
       });
 
@@ -596,7 +596,7 @@ describe("kg-refresh-rail", () => {
 
       it("row 6: fetch failure fails, neutralizes the reason, and keeps the description short", async () => {
         const { body, st } = await run({
-          ...base, ok: false, failureCode: "KG_BASE_FETCH_FAILED", baseHeadSha: HEAD,
+          ...base, ok: false, failureCode: "KG_BASE_FETCH_FAILED",
           detail: `Could not fetch the base PR commits: \`${"bad `tick`\nline ".repeat(40).replace(/[`\n]+/g, " ")}\``,
         });
         expect(body).toContain("Could not fetch the base PR commits:");
@@ -606,7 +606,7 @@ describe("kg-refresh-rail", () => {
 
       it("row 7: an old runner is Not checked and does not block", async () => {
         const { body, st } = await run({
-          ...base, ok: true, notChecked: true, baseHeadSha: HEAD,
+          ...base, ok: true, notChecked: true,
           detail: "Not checked: the runner image does not support base-template merges, so the KG repo ran without this PR.",
         });
         expect(body).toContain("Not checked: the runner image does not support base-template merges, so the KG repo ran without this PR.");

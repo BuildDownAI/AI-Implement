@@ -81,8 +81,6 @@ export interface RefreshOutcome {
   failureCode?: string;
   /** The runner's echo of the base-template merge it attempted; absent for a KG-repo PR or a runner that predates it. */
   baseMerge?: { headSha: string; result: "merged" | "behind" | "conflict"; conflictPaths?: string[] };
-  /** Head SHA of the base PR the run was asked to merge; set whenever the input carried `kgBaseMerge`. */
-  baseHeadSha?: string;
   /** The dry run did not test the PR; the commit status reports success so the PR is not blocked. */
   notChecked?: true;
   cause?: "shrink" | "tracker-missing" | "source-failed";

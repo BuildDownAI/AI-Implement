@@ -985,7 +985,6 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         if (report.failureCode) outcome.failureCode = report.failureCode;
         if (report.baseMerge) outcome.baseMerge = report.baseMerge;
         if (input.kgBaseMerge) {
-          outcome.baseHeadSha = input.kgBaseMerge.headSha;
           const verdict = baseMergeDetail(report);
           if (verdict) {
             outcome.detail = verdict.detail;
