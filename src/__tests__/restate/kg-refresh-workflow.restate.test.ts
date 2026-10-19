@@ -45,7 +45,7 @@ import {
 import { queryNonCompletedInvocations } from "../../restate/endpoint.js";
 import { registerOwnedRunContract } from "./owned-run-contract.js";
 import {
-  VARIANTS, attachWorkflow, callObject, callService, callWorkflow, cancelInvocation, eventually, gate, queryInvocations, replaceEndpoint, setObjectStates, settle,
+  VARIANTS, attachInvocation, attachWorkflow, callObject, callService, callWorkflow, cancelInvocation, eventually, gate, queryInvocations, replaceEndpoint, setObjectStates, settle,
   startRetryEnabled, startVariants, stopAll, type Gate,
   journalEntries,
   waitForStep,
@@ -3411,6 +3411,12 @@ describe("KgRefresh durable workflow", () => {
      * to the object (a run's `release`, a one-way `decide`) has run. Reading state after it needs no polling.
      */
     const afterReleases = (env: RestateEnvironment) => decideRepo(env, { action: "timeout", triggerId: "barrier" });
+    /** Every `KgRepo/watch` invocation for the test repo, completed or not. */
+    const watchInvocations = (env: RestateEnvironment) =>
+      queryInvocations(
+        env.adminAPIBaseUrl(),
+        `target_service_name = 'KgRepo' AND target_service_key = '${KG_SOURCE_REPO}' AND target_handler_name = 'watch'`,
+      );
     /** Decides the hold `gateId` and waits for the resumed run to end; returns its trigger id and outcome. */
     async function decideAndAttach(env: RestateEnvironment, gateId: string, body: Record<string, unknown>) {
       const resumed = (await decideRepo(env, { triggerId: gateId, ...body }))!.triggerId;
@@ -3420,14 +3426,22 @@ describe("KgRefresh durable workflow", () => {
 
     /** Triggers through the real KgRepo, delivers the held report, and returns once the gate run has ended and `KgRepo` holds the snapshot. */
     async function holdRun(env: RestateEnvironment, opts: { report?: KgRefreshReportBody } = {}): Promise<string> {
+      const watchesBefore = new Set((await watchInvocations(env)).map((w) => String(w.id)));
       const triggered = await triggerViaKgRepo(env.baseUrl());
       const triggerId = (triggered as { triggerId: string }).triggerId;
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
       await workflowDispatched(triggerId);
+      // `submit` sends the run's `watch`: the one invocation that was not there before this trigger.
+      const watchId = String((await eventually(
+        async () => (await watchInvocations(env)).filter((w) => !watchesBefore.has(String(w.id))),
+        (fresh) => fresh.length === 1,
+        { label: "watch sent" },
+      ))[0]!.id);
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", opts.report ?? HELD_REPORT);
       const gateOutcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
       expect(gateOutcome).toMatchObject({ ok: false, conclusion: "awaiting_decision", held: true });
-      // The gate run's `release` and the `watch` that follows the run are already sent: settle the queue before anything reads it.
+      // The `release` the `watch` sends is journaled only once `watch` resumes: wait for it, then the barrier orders the rest.
+      await attachInvocation(env.baseUrl(), watchId);
       await afterReleases(env);
       expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, held: { snapshotPr: 77 } });
       return triggerId;
@@ -4276,6 +4290,20 @@ describe("KgRefresh durable workflow", () => {
         await callWorkflow(env.baseUrl(), "KgRefresh", id, "cancel", { reason: "stop" });
       });
       await expectStoppedHold(env, gateId, beforeClose);
+    }, 60_000);
+
+    it.each(LABELS)("a Restate cancel of the gate run while the held row closes cancels the hold through KgRepo.decide: PR closed, row closed once (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const beforeClose = closePullRequestFn.mock.calls.length;
+      const gateId = await stopInsideGate(env, async (id) => {
+        const [run] = await queryInvocations(
+          env.adminAPIBaseUrl(),
+          `target_service_name = 'KgRefresh' AND target_service_key = '${id}' AND target_handler_name = 'run'`,
+        );
+        await cancelInvocation(env.adminAPIBaseUrl(), String(run!.id));
+      });
+      await expectStoppedHold(env, gateId, beforeClose);
+      expect(await runReleases(env, gateId)).toBe(1);
     }, 60_000);
 
     it.each(LABELS)("a tool Cancel with no triggerId that races the gate stops the hold and answers success (%s)", async (label) => {

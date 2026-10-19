@@ -924,6 +924,11 @@ describe("migrated read handlers (AII-711)", () => {
       const inFlight = { triggerId: "t1", startedAt: 1 };
       const held = { snapshotPr: 77, partTable: [{ part: "graph", prev: "100", new: "40" }], decideBy: 99 };
 
+      it("kgStageForStep maps held to awaiting-decision and resume to snapshot-landed", () => {
+        expect(kgStageForStep("held")).toBe("awaiting-decision");
+        expect(kgStageForStep("resume")).toBe("snapshot-landed");
+      });
+
       it("kgStageForStep maps decision to awaiting-decision", () => {
         expect(kgStageForStep("decision")).toBe("awaiting-decision");
       });
@@ -955,7 +960,7 @@ describe("migrated read handlers (AII-711)", () => {
 
       it("decided: the hold is gone and the resumed run's own status shows", async () => {
         const status = await stageFor({ inFlight, step: "resume" });
-        expect(status.stage).toBe("staging");
+        expect(status.stage).toBe("snapshot-landed");
         expect(status.currentRun).toEqual({ triggerId: "t1", step: "resume", decisions: [], held: null });
       });
 

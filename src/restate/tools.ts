@@ -650,8 +650,9 @@ export function setKgRefreshToolDeps(deps: KgRefreshToolDeps | null): void {
 export function kgStageForStep(step: string | null): KgRefreshStage {
   if (step === null || step === "reserve" || step === "dispatch") return "checking";
   if (step === "await-progress" || step === "cancelling" || step === "dry-run-report") return "ingest-running";
-  if (step === "decision") return "awaiting-decision";
-  if (step === "merge" || step === "delete-branch") return "snapshot-landed";
+  if (step === "decision" || step === "held") return "awaiting-decision";
+  // `resume` is a decided hold's run: it merges, or closes the held PR.
+  if (step === "merge" || step === "delete-branch" || step === "resume") return "snapshot-landed";
   // fetch, stage, swap, verify, revert, persist, close-row, outcome, settled, and the
   // short-lived terminal steps (failed, closed, no-new-data) whose marker is about to clear.
   return "staging";

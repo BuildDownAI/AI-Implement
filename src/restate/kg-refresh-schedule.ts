@@ -48,7 +48,7 @@ export function createKgRefreshSchedulePipeline(kgSourceRepo: string): Scheduled
     async busy(ctx: ObjectContext): Promise<BusyRead> {
       const lease = await ctx.objectClient<KgRepoDefinition>(KG_REPO, kgSourceRepo).status();
       if (lease === null) return { busy: false };
-      return { busy: true, holder: lease.triggerId, awaitingDecision: lease.held !== null };
+      return { busy: true, holder: lease.triggerId, awaitingDecision: lease.held != null };
     },
 
     async replace(ctx: ObjectContext, runId: string): Promise<void> {

@@ -124,6 +124,13 @@ export async function attachWorkflow<T>(baseUrl: string, workflow: string, key: 
   });
 }
 
+/** Waits for one invocation, by id, to complete; a failed invocation rejects. Used where the id comes from the admin query, not a workflow key. */
+export async function attachInvocation(baseUrl: string, invocationId: string): Promise<void> {
+  const response = await fetch(`${baseUrl}/restate/invocation/${invocationId}/attach`);
+  const text = await response.text();
+  if (!response.ok) throw new Error(`attach ${invocationId} failed: ${response.status} ${text}`);
+}
+
 /** Poll `read` until `accept` approves the value, and return that value. On timeout the
  *  error names `label` and prints the last value read, so a flake reads as a diagnosis
  *  rather than a bare assertion diff. State produced by a one-way send, a schedule, or a

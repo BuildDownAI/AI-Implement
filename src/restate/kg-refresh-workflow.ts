@@ -1120,6 +1120,19 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         // A Stop that arrived after the report was taken (or while the hold was being stored) has no run to read it
         // any more. The hold exists now, so it goes through the one decision door.
         const stop = await ctx.promise<string>("cancel").peek();
+        // A Restate cancel during `close-row-held` or `hold` is seen only here: this run never races the arm there.
+        let restateCancelled = false;
+        try {
+          await restate.RestatePromise.race([cancelArm(), ctx.sleep(1)]);
+        } catch (err) {
+          if (restate.internal.isSuspendedError(err)) throw err;
+          if (!(err instanceof restate.TerminalError && err.code === 409)) throw err;
+          restateCancelled = true;
+        }
+        if (stop === undefined && restateCancelled) {
+          ctx.console.log(`[KgRefresh] cancelled by Restate at the gate: dispatch ${dispatchId}`);
+          ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).decide({ action: "cancel", triggerId });
+        }
         if (stop !== undefined) {
           ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).decide({
             action: "cancel", triggerId,
