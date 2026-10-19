@@ -1,5 +1,5 @@
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as devHarnessIndex from "../dev-harness/index.js";
 import { runDevHarnessCli } from "../dev-harness/cli.js";
+import { testDir, testTempRoot } from "./helpers/test-dir.js";
 
 // The local feedback command is a Node ESM script with pure helper exports.
 // @ts-ignore no declaration file for the repo-local .mjs command module
@@ -33,20 +34,12 @@ const {
   writeLiveStderrArtifact,
 } = localFeedbackCommand;
 
-const tempRoots: string[] = [];
-
-function tempDir(name: string) {
-  const root = mkdtempSync(join(tmpdir(), `${name}-`));
-  tempRoots.push(root);
-  return root;
-}
-
 function runGit(cwd: string, args: string[]) {
   return spawnSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 }
 
-afterEach(async () => {
-  await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+afterEach(() => {
+  vi.unstubAllEnvs();
 });
 
 describe("local feedback command helpers", () => {
@@ -75,24 +68,18 @@ describe("local feedback command helpers", () => {
   });
 
   it("refuses a live reference at Codex's own auth.json but accepts a chatgpt-sign-in record elsewhere", () => {
-    const home = tempDir("live-home");
+    const home = testDir("live-home");
     const codexDir = join(home, ".codex");
     const planDir = join(home, "plan");
     mkdirSync(codexDir);
     mkdirSync(planDir);
     writeFileSync(join(codexDir, "auth.json"), "{}");
     writeFileSync(join(planDir, "credentials.json"), "{}");
-    const saved = { HOME: process.env.HOME, CODEX_HOME: process.env.CODEX_HOME };
-    process.env.HOME = home;
-    delete process.env.CODEX_HOME;
-    try {
-      const ref = (canonicalPath: string) => new Map([["p", { profileId: "p", authMode: "codex-subscription", kind: "session", sessionSource: "chatgpt-sign-in", canonicalPath }]]);
-      expect(() => assertLiveReferencesOutsideActiveAuth(ref(join(codexDir, "auth.json")))).toThrow(/active app auth/);
-      expect(() => assertLiveReferencesOutsideActiveAuth(ref(join(planDir, "credentials.json")))).not.toThrow();
-    } finally {
-      if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
-      if (saved.CODEX_HOME !== undefined) process.env.CODEX_HOME = saved.CODEX_HOME;
-    }
+    vi.stubEnv("HOME", home);
+    vi.stubEnv("CODEX_HOME", undefined);
+    const ref = (canonicalPath: string) => new Map([["p", { profileId: "p", authMode: "codex-subscription", kind: "session", sessionSource: "chatgpt-sign-in", canonicalPath }]]);
+    expect(() => assertLiveReferencesOutsideActiveAuth(ref(join(codexDir, "auth.json")))).toThrow(/active app auth/);
+    expect(() => assertLiveReferencesOutsideActiveAuth(ref(join(planDir, "credentials.json")))).not.toThrow();
   });
 
   it("keeps the live gate marker outside the checkout", () => {
@@ -128,7 +115,7 @@ describe("local feedback command helpers", () => {
   });
 
   it("writes a three-stage synthetic local config with private key paths under the requested private root", () => {
-    const privateRoot = tempDir("lf-private");
+    const privateRoot = testDir("lf-private");
     const { configPath, config, profileIds } = buildSyntheticAgentConfig({ root: privateRoot });
     expect(configPath.startsWith(privateRoot)).toBe(true);
     expect(profileIds).toEqual(["local-feedback-planning", "local-feedback-implementation", "local-feedback-review"]);
@@ -142,7 +129,7 @@ describe("local feedback command helpers", () => {
   });
 
   it("rejects untracked source that would be missing from archive plus tracked patch proof", async () => {
-    const repo = tempDir("lf-source");
+    const repo = testDir("lf-source");
     await mkdir(join(repo, "represented"), { recursive: true });
     writeFileSync(join(repo, "represented", "file.txt"), "ok\n");
     const responses = new Map<string, { status: number; stdout: string; stderr: string }>([
@@ -156,7 +143,7 @@ describe("local feedback command helpers", () => {
 
 
   it("creates represented source contexts from git archive plus tracked diff without corrupting binary files", () => {
-    const repo = tempDir("lf-binary-source");
+    const repo = testDir("lf-binary-source");
     const binary = Buffer.from([0, 255, 1, 2, 128, 10, 13, 90]);
     writeFileSync(join(repo, "blob.bin"), binary);
     writeFileSync(join(repo, "text.txt"), "before\n");
@@ -167,8 +154,8 @@ describe("local feedback command helpers", () => {
     expect(runGit(repo, ["commit", "-m", "base"]).status).toBe(0);
     writeFileSync(join(repo, "text.txt"), "after\n");
     const source = resolveSourceIdentity(repo);
+    testTempRoot("lf-context");
     const context = createSourceContext({ repoRoot: repo, source });
-    tempRoots.push(context);
     expect(readFileSync(join(context, "blob.bin"))).toEqual(binary);
     expect(readFileSync(join(context, "text.txt"), "utf8")).toBe("after\n");
   });
@@ -237,7 +224,7 @@ describe("local feedback command helpers", () => {
     [0, "success"],
     [1, "failure"],
   ])("rewrites the live summary with the finished run's outcome (exit %i → %s)", (exitCode, outcome) => {
-    const artifactsDir = tempDir("live-result");
+    const artifactsDir = testDir("live-result");
     const input = {
       source: { head: "abc", trackedDiffSha256: "def" },
       image: "sha256:123",
@@ -262,8 +249,8 @@ describe("local feedback command helpers", () => {
     const FRONT_MATTER_ERROR = "Task file must begin with a YAML front matter block delimited by ---";
 
     function liveInput(task: string) {
-      const artifactsDir = tempDir("live-diag-artifacts");
-      const workspace = tempDir("live-diag-workspace");
+      const artifactsDir = testDir("live-diag-artifacts");
+      const workspace = testDir("live-diag-workspace");
       return {
         artifactsDir,
         input: {
@@ -281,7 +268,7 @@ describe("local feedback command helpers", () => {
     }
 
     it("reports a real pre-run validation failure, keeps exit 1, and does not promise runner artifacts", async () => {
-      const task = join(tempDir("live-diag-task"), "task.md");
+      const task = join(testDir("live-diag-task"), "task.md");
       writeFileSync(task, "no front matter here\n");
       const { artifactsDir, input } = liveInput(task);
       const echoed: string[] = [];
@@ -365,7 +352,7 @@ describe("local feedback command helpers", () => {
     });
 
     it("withholds stderr that matches a sensitive pattern", () => {
-      const artifactsDir = tempDir("live-diag-sensitive");
+      const artifactsDir = testDir("live-diag-sensitive");
       const name = writeLiveStderrArtifact({ artifactsDir, err: ["Authorization: Bearer abc\n"] });
       const text = readFileSync(join(artifactsDir, name), "utf8");
       expect(text).toContain("withheld");
@@ -373,7 +360,7 @@ describe("local feedback command helpers", () => {
     });
 
     it("writes no artifact when stderr is empty and keeps the runner wording when a runner started", () => {
-      const artifactsDir = tempDir("live-diag-empty");
+      const artifactsDir = testDir("live-diag-empty");
       expect(writeLiveStderrArtifact({ artifactsDir, err: [] })).toBeUndefined();
       writeLiveResult({ artifactsDir, exitCode: 0, source: { head: "a", trackedDiffSha256: "b" }, image: "i", stages: {} });
       expect(readFileSync(join(artifactsDir, "summary.md"), "utf8")).toContain("runner.log and run/ hold the stage outcomes");

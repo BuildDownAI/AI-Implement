@@ -1,12 +1,11 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import { PassThrough } from "node:stream";
 import { execFileSync, spawn } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { CodexExecutor, chatgptPlanProviderArgs } from "../pipeline/codex-executor.js";
 import type { ModelAuthClient, ModelInvocation } from "../model-auth-client.js";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   PLANNING_DYNAMIC_TOOLS,
@@ -18,16 +17,13 @@ import {
   runPlanningTool,
   type CodexTransportResult,
 } from "../pipeline/codex-planning-adapter.js";
+import { testDir } from "./helpers/test-dir.js";
 
 let ws: string;
 let outside: string;
 beforeEach(() => {
-  ws = mkdtempSync(join(tmpdir(), "planning-ws-"));
-  outside = mkdtempSync(join(tmpdir(), "planning-out-"));
-});
-afterEach(() => {
-  rmSync(ws, { recursive: true, force: true });
-  rmSync(outside, { recursive: true, force: true });
+  ws = testDir("planning-ws");
+  outside = testDir("planning-out");
 });
 
 describe("host tool handlers", () => {
@@ -1093,13 +1089,9 @@ describe.skipIf(!pinnedCodex && !pinnedRequired)("pinned codex app-server (synth
   let home: string;
   let userHome: string;
   beforeEach(() => {
-    home = mkdtempSync(join(tmpdir(), "planning-home-"));
-    userHome = mkdtempSync(join(tmpdir(), "planning-userhome-"));
+    home = testDir("planning-home");
+    userHome = testDir("planning-userhome");
     writeFileSync(join(home, "auth.json"), JSON.stringify({ OPENAI_API_KEY: FAKE_AUTH }));
-  });
-  afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
-    rmSync(userHome, { recursive: true, force: true });
   });
 
   async function runPinned(plan: PlannedCall[], opts: { model?: string; review?: boolean; finalText?: string; jsonSchema?: Record<string, unknown>; resumeAfter401?: boolean } = {}) {
@@ -1396,7 +1388,7 @@ describe.skipIf(!pinnedCodex && !pinnedRequired)("pinned codex accepts the chatg
   const CONFIG_REJECTION = /unknown (field|key|variant)|invalid (type|value|config)|error loading config|failed to (parse|load) config/i;
 
   function startup(args: string[]): Promise<{ exited: boolean; code: number | null; stderr: string }> {
-    const home = mkdtempSync(join(tmpdir(), "pinned-plan-home-"));
+    const home = testDir("pinned-plan-home");
     return new Promise((resolve) => {
       const child = spawn("codex", args, {
         cwd: home,
@@ -1408,7 +1400,6 @@ describe.skipIf(!pinnedCodex && !pinnedRequired)("pinned codex accepts the chatg
       child.stderr.on("data", (c: Buffer) => (stderr += c.toString("utf8")));
       const done = (code: number | null) => {
         clearTimeout(timer);
-        rmSync(home, { recursive: true, force: true });
         resolve({ exited, code, stderr });
       };
       child.on("close", (code) => {

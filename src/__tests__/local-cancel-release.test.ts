@@ -1,13 +1,12 @@
-import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createLocalCredentialPort, LocalSessionOwnership } from "../local/agent-config.js";
 import type { LocalCredentialReference } from "../local/agent-config.js";
 import { startLocalAuthBridge } from "../local/session.js";
 import { runDevHarnessCli } from "../dev-harness/cli.js";
-import type { DevHarnessCliDependencies } from "../dev-harness/cli.js";
-import type { DevRunHandle } from "../dev-harness/index.js";
+import { makeDevHarnessCliDeps, makeDevRunHandle } from "./helpers/fixtures/dev-harness.js";
+import { testDir } from "./helpers/test-dir.js";
 
 // Real bridge, real ownership, real protected record in a temp dir; only Docker is faked.
 let root: string;
@@ -16,7 +15,7 @@ let outside: string;
 let sessionPath: string;
 
 beforeEach(async () => {
-  root = await mkdtemp(join(tmpdir(), "cancel-release-"));
+  root = testDir("cancel-release");
   await chmod(root, 0o700);
   repo = join(root, "repo");
   outside = join(root, "outside");
@@ -26,10 +25,6 @@ beforeEach(async () => {
   sessionPath = join(outside, "session.json");
   await writeFile(sessionPath, '{"synthetic":"session-0000"}', { mode: 0o600 });
   await chmod(sessionPath, 0o600);
-});
-
-afterEach(async () => {
-  await rm(root, { recursive: true, force: true });
 });
 
 const reference = (): LocalCredentialReference => ({
@@ -77,30 +72,15 @@ function cancelledDeps(
   const controller = new AbortController();
   const stderr: string[] = [];
   const collect = vi.fn(async () => undefined);
-  const handle = {
-    containerName: "c",
-    containerId: "c".repeat(64),
-    artifactsDir: "/tmp/a",
-    workspace: "/tmp/w",
-    startedAt: new Date(),
-    task: { identifier: "T-1", title: "t" },
-    phase: "implementation",
-    localAuth: bridge,
-  } as unknown as DevRunHandle;
-  const deps: DevHarnessCliDependencies = {
-    startDevRun: vi.fn().mockResolvedValue(handle),
+  const handle = makeDevRunHandle({ localAuth: bridge });
+  const deps = makeDevHarnessCliDeps({
+    startDevRun: vi.fn(async () => handle),
     streamLogs: vi.fn(async () => { controller.abort(); }),
-    streamLogsUntilShellReady: vi.fn(),
-    getRunStatus: vi.fn().mockResolvedValue({ status: "exited", ...status }),
+    getRunStatus: vi.fn(async () => ({ status: status.running ? "running" : "exited", ...status })),
     collectRunArtifacts: collect,
-    stopSession: vi.fn().mockResolvedValue(undefined),
-    stopContainer: vi.fn().mockResolvedValue(undefined),
-    spawnDocker: vi.fn(),
-    writeStdout: vi.fn(),
     writeStderr: (t) => { stderr.push(t); },
-    now: () => Date.now(),
     cancelSignal: controller.signal,
-  };
+  });
   return { deps, stderr, collect };
 }
 

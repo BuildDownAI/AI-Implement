@@ -1,9 +1,10 @@
 import { EventEmitter } from "node:events";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { makeDevRunHandle } from "./helpers/fixtures/dev-harness.js";
+import { testDir } from "./helpers/test-dir.js";
 
 // Only docker (external boundary) is faked; git runs for real.
 vi.mock("node:child_process", async (importOriginal) => {
@@ -21,20 +22,13 @@ vi.mock("node:child_process", async (importOriginal) => {
 });
 
 import { collectRunArtifacts } from "../dev-harness/index.js";
-import type { DevRunHandle } from "../dev-harness/index.js";
 import { runLocalFullLoopFromEnv } from "../run-local-full-loop.js";
 import { encodeRunConfig } from "../run-config.js";
-
-const roots: string[] = [];
-afterEach(() => {
-  for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true });
-});
 
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" });
 
 function setup() {
-  const root = mkdtempSync(join(tmpdir(), "untracked-"));
-  roots.push(root);
+  const root = testDir("untracked");
   const ws = join(root, "ws");
   const art = join(root, "art");
   mkdirSync(ws);
@@ -46,16 +40,7 @@ function setup() {
   writeFileSync(join(ws, ".gitignore"), "generated.log\n");
   git(ws, "add", "-A");
   git(ws, "commit", "-qm", "init");
-  const handle = {
-    artifactsDir: art,
-    workspace: ws,
-    containerId: "c".repeat(64),
-    runId: "run-1",
-    task: { identifier: "T-1", title: "t" },
-    startedAt: new Date(),
-    phase: "implementation",
-    workspaceMode: "mounted",
-  } as unknown as DevRunHandle;
+  const handle = makeDevRunHandle({ artifactsDir: art, workspace: ws });
   return { ws, art, handle };
 }
 
@@ -161,9 +146,7 @@ describe("latest attribution round trip", () => {
   });
 
   it("keeps the exit code when the result file cannot be written", async () => {
-    const root = mkdtempSync(join(tmpdir(), "untracked-"));
-    roots.push(root);
-    const blocker = join(root, "file");
+    const blocker = join(testDir("untracked"), "file");
     writeFileSync(blocker, "x");
     expect(await runLoop(blocker, { attribution })).toBe(3);
   });

@@ -1,6 +1,8 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseChatGptPlanRecord } from "../../../chatgpt-plan-token.js";
 import { getMappings, initMappingsTable, upsertMapping } from "../../../config.js";
+import { runDevHarnessCli } from "../../../dev-harness/cli.js";
+import { parseTaskFile } from "../../../dev-harness/task-file.js";
 import { parseModelAuthGrantBootstrap, toSafeGrantMetadata } from "../../../model-auth-contract.js";
 import { ProviderRegistry } from "../../../providers/registry.js";
 import { validateReviewFixResultMetadata, validateScopedPrIdentity } from "../../../review-fix-contract.js";
@@ -24,6 +26,7 @@ import {
   makeScopedPrIdentity,
 } from "../builders.js";
 import { makeLaunchDecision, makeSnapshot } from "../fixtures/configured-run.js";
+import { makeDevHarnessCliDeps, makeDevRunHandle, makeTaskFile } from "../fixtures/dev-harness.js";
 
 describe("makeMapping", () => {
   beforeAll(() => {
@@ -454,5 +457,28 @@ describe("makeLaunchDecision (fixtures/configured-run.ts)", () => {
     expect(bootstrap).toMatchObject({ dispatchId: "d-9", projectKey: "AII" });
     expect(decision).toMatchObject({ dispatchId: "d-9", projectKey: "AII" });
     expect(decision.grant).toMatchObject({ dispatchId: "d-9", projectKey: "AII" });
+  });
+});
+
+describe("the dev harness fixtures (fixtures/dev-harness.ts)", () => {
+  it("makeTaskFile is what the task-file parser returns for its task", () => {
+    expect(parseTaskFile("---\nidentifier: DEV-1\ntitle: Test task\n---\n\nImplement the test task.\n")).toEqual(makeTaskFile());
+  });
+
+  it("makeDevRunHandle runs a mounted implementation of makeTaskFile's task, with overrides spread last", () => {
+    expect(makeDevRunHandle()).toMatchObject({ phase: "implementation", workspaceMode: "mounted", task: makeTaskFile() });
+    expect(makeDevRunHandle({ phase: "full" }).phase).toBe("full");
+  });
+
+  it("makeDevHarnessCliDeps describes a clean run the CLI completes with exit 0", async () => {
+    const deps = makeDevHarnessCliDeps();
+    expect(await runDevHarnessCli(["--workspace", "/dev-run/workspace", "--task", "/dev-run/task.md"], deps)).toBe(0);
+    expect(deps.collectRunArtifacts).toHaveBeenCalledWith(expect.objectContaining({ task: makeTaskFile() }), 0, expect.any(Function));
+  });
+
+  it("keeps each dependency's default through mockReset", async () => {
+    const deps = makeDevHarnessCliDeps();
+    vi.mocked(deps.getRunStatus).mockReset();
+    await expect(deps.getRunStatus(makeDevRunHandle())).resolves.toEqual({ status: "exited", running: false, exitCode: 0 });
   });
 });

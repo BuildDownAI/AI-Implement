@@ -10,7 +10,7 @@ import { runLocalFullLoop } from "../local/full-loop.js";
 import { PipelineRunner } from "../pipeline/runner.js";
 import type { LLMExecutor, PipelineDefinition, StepModule } from "../pipeline/types.js";
 import { getDiff } from "../pipeline/steps/feedback-loop.js";
-import { makeExecutor } from "./helpers/builders.js";
+import { makeExecutor, makeFeedbackLoopOutputs } from "./helpers/builders.js";
 import { testDir } from "./helpers/test-dir.js";
 import { fakeClient, makeGrant, makeSnapshot } from "./helpers/fixtures/configured-run.js";
 import { encodeTrustedRunConfig, type ResolvedAgentSnapshotV1 } from "../run-config.js";
@@ -103,13 +103,7 @@ describe("runLocalFullLoop", () => {
     };
 
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({
-        approved: true,
-        iterations: 1,
-        terminationReason: "approved",
-        passes: [],
-        finalFeedback: "",
-      }),
+      run: vi.fn(async () => makeFeedbackLoopOutputs()),
     });
 
     const result = await runLocalFullLoop({
@@ -132,7 +126,7 @@ describe("runLocalFullLoop", () => {
 
   it("returns exitCode 1 and classification 'plan_failed' when planning executor fails", async () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({ approved: true }),
+      run: vi.fn(async () => makeFeedbackLoopOutputs()),
     });
     const implRun = runner;
 
@@ -154,7 +148,7 @@ describe("runLocalFullLoop", () => {
   });
 
   it("does not call implementation when planning fails", async () => {
-    const implRun = vi.fn().mockResolvedValue({ approved: true });
+    const implRun = vi.fn(async () => makeFeedbackLoopOutputs());
     const { pipeline, runner } = makeFeedbackLoopPipeline({ run: implRun });
 
     await runLocalFullLoop({
@@ -224,13 +218,7 @@ describe("runLocalFullLoop", () => {
 
   it("returns exitCode 1 and classification 'max_turns_exhausted' when terminationReason is max_turns", async () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({
-        approved: false,
-        iterations: 1,
-        terminationReason: "max_turns",
-        passes: [],
-        finalFeedback: "ran out of turns",
-      }),
+      run: vi.fn(async () => makeFeedbackLoopOutputs({ terminationReason: "max_turns" })),
     });
 
     const result = await runLocalFullLoop({
@@ -259,13 +247,7 @@ describe("runLocalFullLoop", () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
       run: vi.fn().mockImplementation(async (ctx) => {
         capturedPlanningContext = ctx.data.planningContext;
-        return {
-          approved: true,
-          iterations: 1,
-          terminationReason: "approved",
-          passes: [],
-          finalFeedback: "",
-        };
+        return makeFeedbackLoopOutputs();
       }),
     });
 
@@ -296,13 +278,7 @@ describe("runLocalFullLoop", () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
       run: vi.fn().mockImplementation(async (ctx) => {
         reviewedDiff = getDiff(String(ctx.data.workspaceDir));
-        return {
-          approved: true,
-          iterations: 1,
-          terminationReason: "approved",
-          passes: [],
-          finalFeedback: "",
-        };
+        return makeFeedbackLoopOutputs();
       }),
     });
 
@@ -322,16 +298,10 @@ describe("runLocalFullLoop", () => {
 
   it("exposes phase outcomes, review status, limits, passes, and tokenSummary in the result", async () => {
     const passes = [
-      { iteration: 1, implementTurns: 8, implementOutcome: "ok", costUsd: 0.02, reviewApproved: true },
+      { iteration: 1, implementTurns: 8, implementOutcome: "success", costUsd: 0.02, reviewCostUsd: null, reviewApproved: true, attempts: 1, reviewAttempts: 1 },
     ];
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({
-        approved: true,
-        iterations: 1,
-        terminationReason: "approved",
-        passes,
-        finalFeedback: "",
-      }),
+      run: vi.fn(async () => makeFeedbackLoopOutputs({ passes })),
     });
 
     const result = await runLocalFullLoop({
@@ -376,7 +346,7 @@ describe("runLocalFullLoop", () => {
 
   it("returns plan_failed when planning exits 0 but writes no plan files", async () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", passes: [], finalFeedback: "" }),
+      run: vi.fn(async () => makeFeedbackLoopOutputs()),
     });
     const implRun = runner;
 
@@ -417,13 +387,7 @@ describe("runLocalFullLoop", () => {
 
   it("returns iterations_exhausted when terminationReason is iterations_exhausted", async () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({
-        approved: false,
-        iterations: 3,
-        terminationReason: "iterations_exhausted",
-        passes: [],
-        finalFeedback: "all iterations used",
-      }),
+      run: vi.fn(async () => makeFeedbackLoopOutputs({ terminationReason: "iterations_exhausted" })),
     });
 
     const result = await runLocalFullLoop({
@@ -444,13 +408,7 @@ describe("runLocalFullLoop", () => {
 
   it("returns review_error when terminationReason is review_error", async () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({
-        approved: false,
-        iterations: 1,
-        terminationReason: "review_error",
-        passes: [],
-        finalFeedback: "review threw an exception",
-      }),
+      run: vi.fn(async () => makeFeedbackLoopOutputs({ terminationReason: "review_error" })),
     });
 
     const result = await runLocalFullLoop({
@@ -470,13 +428,7 @@ describe("runLocalFullLoop", () => {
 
   it("returns effectiveMaxTurns and effectiveMaxIterations using defaults when not specified", async () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({
-        approved: true,
-        iterations: 1,
-        terminationReason: "approved",
-        passes: [],
-        finalFeedback: "",
-      }),
+      run: vi.fn(async () => makeFeedbackLoopOutputs()),
     });
 
     const result = await runLocalFullLoop({
@@ -496,17 +448,11 @@ describe("runLocalFullLoop", () => {
 
   it("returns tokenSummary with aggregated costUsd from passes", async () => {
     const passes = [
-      { iteration: 1, implementTurns: 5, implementOutcome: "ok", costUsd: 0.10, reviewApproved: false },
-      { iteration: 2, implementTurns: 5, implementOutcome: "ok", costUsd: 0.15, reviewApproved: true },
+      { iteration: 1, implementTurns: 5, implementOutcome: "success", costUsd: 0.10, reviewCostUsd: null, reviewApproved: false, attempts: 1, reviewAttempts: 1 },
+      { iteration: 2, implementTurns: 5, implementOutcome: "success", costUsd: 0.15, reviewCostUsd: null, reviewApproved: true, attempts: 1, reviewAttempts: 1 },
     ];
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({
-        approved: true,
-        iterations: 2,
-        terminationReason: "approved",
-        passes,
-        finalFeedback: "",
-      }),
+      run: vi.fn(async () => makeFeedbackLoopOutputs({ iterations: 2, passes })),
     });
 
     const result = await runLocalFullLoop({
@@ -531,13 +477,7 @@ describe("runLocalFullLoop", () => {
     writeFileSync(join(ws, "verify.sh"), "exit 1\n");
 
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({
-        approved: true,
-        iterations: 1,
-        terminationReason: "approved",
-        passes: [],
-        finalFeedback: "",
-      }),
+      run: vi.fn(async () => makeFeedbackLoopOutputs()),
     });
 
     const result = await runLocalFullLoop({
@@ -577,7 +517,7 @@ describe("runLocalFullLoop", () => {
     const snapshot = makeSnapshot();
     const planningExecutor = vi.fn(() => ({ status: 0 as const, stdout: "", stderr: "" }));
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", passes: [], finalFeedback: "" }),
+      run: vi.fn(async () => makeFeedbackLoopOutputs()),
     });
 
     const result = await runLocalFullLoop({
@@ -626,7 +566,7 @@ describe("runLocalFullLoop", () => {
     const client = fakeClient();
     const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", passes: [], finalFeedback: "" }),
+      run: vi.fn(async () => makeFeedbackLoopOutputs()),
     });
 
     const result = await runLocalFullLoop({
@@ -661,7 +601,7 @@ describe("runLocalFullLoop", () => {
       run: vi.fn().mockImplementation(async (ctx) => {
         await ctx.llmExecutor.invoke({ prompt: "implement", model: "caller", agentStage: "implementation" });
         await ctx.llmExecutor.invoke({ prompt: "review", model: "caller", agentStage: "review" });
-        return { approved: true, iterations: 1, terminationReason: "approved", passes: [], finalFeedback: "" };
+        return makeFeedbackLoopOutputs();
       }),
     });
 
@@ -699,7 +639,7 @@ describe("runLocalFullLoop", () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
       run: vi.fn().mockImplementation(async (ctx) => {
         await ctx.llmExecutor.invoke({ prompt: "implement", model: "caller", agentStage: "implementation" });
-        return { approved: true, iterations: 1, terminationReason: "approved", passes: [], finalFeedback: "" };
+        return makeFeedbackLoopOutputs();
       }),
     });
 

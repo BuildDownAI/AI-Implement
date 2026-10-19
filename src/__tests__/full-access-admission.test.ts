@@ -1,17 +1,11 @@
-import { constants, mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { constants, writeFileSync, chmodSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { checkFullAccessAdmission, CodexFullAccessRefusedError } from "../pipeline/full-access-admission.js";
+import { testDir } from "./helpers/test-dir.js";
 
-const dirs: string[] = [];
-afterEach(() => {
-  while (dirs.length) rmSync(dirs.pop() as string, { recursive: true, force: true });
-});
 const fixture = (mode?: number): string => {
-  const dir = mkdtempSync(join(tmpdir(), "socket-fixture-"));
-  dirs.push(dir);
-  const path = join(dir, "docker.sock");
+  const path = join(testDir("socket-fixture"), "docker.sock");
   if (mode !== undefined) {
     writeFileSync(path, "");
     chmodSync(path, mode);
