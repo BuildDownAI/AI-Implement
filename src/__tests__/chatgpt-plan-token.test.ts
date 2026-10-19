@@ -111,7 +111,8 @@ describe("expiry rule", () => {
 describe("refreshChatGptPlanRecord", () => {
   it("sends a form POST without scope and with an abort signal", async () => {
     const openai = tokenEndpoint({ json: { access_token: "a", refresh_token: "r", expires_in: 10 } });
-    await refreshChatGptPlanRecord(record(), { fetch: openai.fetch, now: () => NOW });
+    const rec = record();
+    await refreshChatGptPlanRecord(rec, { fetch: openai.fetch, now: () => NOW });
     const [call] = openai.calls;
     expect(call!.url.href).toBe(CHATGPT_TOKEN_ENDPOINT);
     expect(call!.method).toBe("POST");
@@ -119,7 +120,7 @@ describe("refreshChatGptPlanRecord", () => {
     const body = new URLSearchParams(call!.body);
     expect(Object.fromEntries(body)).toEqual({
       grant_type: "refresh_token",
-      client_id: "client-1",
+      client_id: rec.clientId,
       refresh_token: "old-refresh",
       resource: CHATGPT_RESOURCE,
     });

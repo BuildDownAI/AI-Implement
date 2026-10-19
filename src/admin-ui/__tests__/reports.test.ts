@@ -160,8 +160,10 @@ describe("reports page render", () => {
       version: 1, invocationId: "i", snapshotId: "s", stage: "implementation", agent: "codex", provider: "openai",
       model: "m1", profileId: "p1", authMode: "openai-api-key", limit: null, outcome: "success", usage, ...o,
     });
-    // A row as GET /api/log sends it (listLog's Job), carrying the attribution under test as the wire's JSON.
-    const job = (id: string, attribution: unknown) => ({ ...makeJob({ issueId: id, issueIdentifier: id, teamKey: "A" }), attribution });
+    // A row as GET /api/log sends it (listLog's Job), carrying the attribution under test as the wire's JSON. mapRows
+    // (src/log.ts) reads the attribution by the row's dispatch id and always sets the key, null for a legacy row.
+    const job = (id: string, attribution: unknown, dispatchId: string | null = attribution === null ? null : `dispatch-${id}`) =>
+      ({ ...makeJob({ issueId: id, issueIdentifier: id, teamKey: "A", dispatchId }), attribution });
     const render = async (jobs: unknown[]) => {
       const { win, doc } = mountPage(baseReport, jobs);
       await win.loadReports();
@@ -207,7 +209,8 @@ describe("reports page render", () => {
     });
 
     it("renders legacy rows with an explicit marker", async () => {
-      const body = await render([job("A-1", null), makeJob({ issueId: "A-2", issueIdentifier: "A-2", teamKey: "A" })]);
+      // Both legacy shapes: a row from before dispatch ids, and a dispatch with no attribution recorded.
+      const body = await render([job("A-1", null), job("A-2", null, "dispatch-A-2")]);
       expect(body.children.length).toBe(2);
       expect(body.children[0].textContent).toContain("No attribution (legacy)");
       expect(body.children[1].textContent).toContain("No attribution (legacy)");

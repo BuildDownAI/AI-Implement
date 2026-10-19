@@ -132,7 +132,7 @@ beforeEach(async () => {
   ({ dedup, store, index, repoImage, github, probe } = modules);
   const { own, sessionMod, auth } = modules;
   const sessions = sessionMod.createModelSessionStore({
-    keys: createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: "synthetic-dispatch-secret" }),
+    keys: createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: RUNNER_SECRET }),
     verifyOwner: own.sessionOwnerVerifier,
     authorizeOperator: () => false,
   });

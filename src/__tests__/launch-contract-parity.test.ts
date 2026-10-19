@@ -227,6 +227,7 @@ const MODULES = {
   index: () => import("../index.js"),
   dedup: () => import("../dedup.js"),
   log: () => import("../log.js"),
+  admission: () => import("../dispatch-admission.js"),
   config: () => import("../config.js"),
   settings: () => import("../orchestrator-settings.js"),
   queue: () => import("../comment-gapfill-queue.js"),
@@ -321,10 +322,24 @@ const planning = (execPath: Backend): LaunchPath => (w) =>
 
 const gapFill = (runnerMode: "gha" | "fly" | "local"): LaunchPath => async (w) => {
   w.queue.enqueueCommentGapfill({ owner: OWNER, repo: REPO, prNumber: PR_NUMBER, commentId: 9001, commenter: "sam", instruction: "please address the review" });
-  const jobId = w.log.appendLog(makeAppendLogEntry({
+  // The PR's originating implementation dispatch, admitted on the issue scope as acquireDispatch admits it, and
+  // released once it completed.
+  const entry = makeAppendLogEntry({
     issueId: ISSUE.id, issueIdentifier: ISSUE.identifier, issueTitle: ISSUE.title, teamKey: TEAM,
     repo: `${OWNER}/${REPO}`, issueState: ISSUE.nativeStatus, status: "completed",
-  }));
+  });
+  const taken = w.admission.acquire({
+    dispatchId: entry.dispatchId!,
+    mappingKey: TEAM,
+    scope: { kind: "issue", issueScope: TEAM, issueId: ISSUE.id },
+    kind: "implementation",
+    backend: "github-actions",
+    lifecycleOwner: { kind: "legacy" },
+    cap: 3,
+  });
+  if (!taken.ok) throw new Error(`seed admission refused: ${taken.reason}`);
+  w.admission.release(entry.dispatchId!, { kind: "legacy" }, taken.record.generation, "finalized");
+  const jobId = w.log.appendLog({ ...entry, admissionGeneration: taken.record.generation });
   w.log.updateJobPrUrl(jobId, `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`);
   const opts: DrainCommentGapfillsInput = {
     getMappings: () => ({ [TEAM]: MAPPING }),
@@ -422,7 +437,7 @@ const legacyReviewFix: Partial<Record<Backend, LaunchPath>> = {
 async function runLegacyReviewFixQueue(w: World): Promise<void> {
   w.reviewFixQueue.enqueueReviewFix({
     issueId: ISSUE.id, issueIdentifier: ISSUE.identifier, repo: `${OWNER}/${REPO}`, prNumber: PR_NUMBER,
-    reason: "review_feedback", sourceEventId: "parity-event-1",
+    reason: "changes_requested", sourceEventId: "parity-event-1",
   });
   await w.index.processReviewFixQueue(CONFIG, makeRegistry({ provider: provider(), mappings: { [TEAM]: MAPPING } }));
 }

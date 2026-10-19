@@ -224,14 +224,25 @@ function seedDispatchLog(
   return jobId;
 }
 
-/** Seeds a completed gap-analysis dispatch counted toward a PR's 24h budget.
+/** Seeds a completed gap-analysis dispatch counted toward a PR's 24h budget, carrying the originating dispatch's
+ *  identifier and title as the drain's rows do (comment-gapfill-drain.ts copies them from the PR's row).
  *  Terminal status keeps it out of the in_flight gate. */
-function seedGapAnalysisDispatch(issueId: string, owner: string, repo: string, prNumber: number): void {
+function seedGapAnalysisDispatch(
+  issueId: string,
+  issueIdentifier: string,
+  issueTitle: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+): void {
   const jobId = log.appendLog(makeAppendLogEntry({
     issueId,
+    issueIdentifier,
+    issueTitle,
     teamKey: "AII",
     repo: `${owner}/${repo}`,
     phase: "gap-analysis",
+    trigger: "comment",
     status: "completed",
   }));
   log.updateJobPrUrl(jobId, `https://github.com/${owner}/${repo}/pull/${prNumber}`);
@@ -1065,8 +1076,8 @@ describe("drainCommentGapfillQueue — PR dispatch budget", () => {
     const mapping = makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: 2 });
 
     seedDispatchLog("issue-20", "AII-200", "Budget test", "acme", "billing", 42);
-    seedGapAnalysisDispatch("issue-20", "acme", "billing", 42);
-    seedGapAnalysisDispatch("issue-20", "acme", "billing", 42);
+    seedGapAnalysisDispatch("issue-20", "AII-200", "Budget test", "acme", "billing", 42);
+    seedGapAnalysisDispatch("issue-20", "AII-200", "Budget test", "acme", "billing", 42);
 
     const queueId = queue.enqueueConflictResolution({
       owner: "acme", repo: "billing", prNumber: 42, featureBranch: "ai-implement/feature/foo",
@@ -1120,8 +1131,8 @@ describe("drainCommentGapfillQueue — PR dispatch budget", () => {
     const mapping = makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: 2 });
 
     seedDispatchLog("issue-20", "AII-200", "Budget test", "acme", "billing", 42);
-    seedGapAnalysisDispatch("issue-20", "acme", "billing", 42);
-    seedGapAnalysisDispatch("issue-20", "acme", "billing", 42);
+    seedGapAnalysisDispatch("issue-20", "AII-200", "Budget test", "acme", "billing", 42);
+    seedGapAnalysisDispatch("issue-20", "AII-200", "Budget test", "acme", "billing", 42);
 
     queue.enqueueConflictResolution({
       owner: "acme", repo: "billing", prNumber: 42, featureBranch: "ai-implement/feature/foo",
@@ -1150,8 +1161,8 @@ describe("drainCommentGapfillQueue — PR dispatch budget", () => {
     const mapping = makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: 2 });
 
     seedDispatchLog("issue-21", "AII-201", "Human bypass test", "acme", "billing", 42);
-    seedGapAnalysisDispatch("issue-21", "acme", "billing", 42);
-    seedGapAnalysisDispatch("issue-21", "acme", "billing", 42);
+    seedGapAnalysisDispatch("issue-21", "AII-201", "Human bypass test", "acme", "billing", 42);
+    seedGapAnalysisDispatch("issue-21", "AII-201", "Human bypass test", "acme", "billing", 42);
     // Simulate a PR already parked by an earlier tick.
     breaker.parkIssue("issue-21", "gap-analysis", "pr_budget");
 
@@ -1175,8 +1186,8 @@ describe("drainCommentGapfillQueue — PR dispatch budget", () => {
     const mapping = makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: 2 });
 
     seedDispatchLog("issue-22", "AII-202", "Synthetic no-bypass test", "acme", "billing", 42);
-    seedGapAnalysisDispatch("issue-22", "acme", "billing", 42);
-    seedGapAnalysisDispatch("issue-22", "acme", "billing", 42);
+    seedGapAnalysisDispatch("issue-22", "AII-202", "Synthetic no-bypass test", "acme", "billing", 42);
+    seedGapAnalysisDispatch("issue-22", "AII-202", "Synthetic no-bypass test", "acme", "billing", 42);
     // Simulate a PR already parked by an earlier tick.
     breaker.parkIssue("issue-22", "gap-analysis", "pr_budget");
 
@@ -1209,7 +1220,7 @@ describe("drainCommentGapfillQueue — PR dispatch budget", () => {
 describe("drainCommentGapfillQueue — push retry (AII-922)", () => {
   const setup = (budget: number, priorDispatches: number) => {
     seedDispatchLog("issue-30", "AII-300", "Push retry", "acme", "billing", 42);
-    for (let i = 0; i < priorDispatches; i++) seedGapAnalysisDispatch("issue-30", "acme", "billing", 42);
+    for (let i = 0; i < priorDispatches; i++) seedGapAnalysisDispatch("issue-30", "AII-300", "Push retry", "acme", "billing", 42);
     const id = queue.enqueueCommentGapfill({
       owner: "acme", repo: "billing", prNumber: 42, commentId: 7001, commenter: "alice", instruction: "fix it",
     });
@@ -1818,9 +1829,10 @@ describe("protected dispatch for gap-fill (AII-1392)", () => {
 
   it("opted-in local launch that throws before onBeforeLaunch settles rejected and releases", async () => {
     managedMocks.isManagedProject.mockReturnValue(true);
-    // A bootstrap already handed out: the real dispatchLocalGapfill refuses before its Docker launch.
-    prepareLaunches(makeSnapshot(), (d) => { d.takeBootstrap(); });
-    enqueue(54, "issue-m-nobootstrap");
+    prepareLaunches();
+    // Writing the secret env file fails before startLocalRunnerContainer calls onBeforeLaunch.
+    localGapfillMocks.startLocalRunnerContainer.mockRejectedValueOnce(new Error("ENOSPC: no space left on device"));
+    enqueue(54, "issue-m-prep-fails");
 
     await drain.drainCommentGapfillQueue(localOpts());
 
