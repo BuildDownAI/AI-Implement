@@ -77,18 +77,18 @@ describe("postRunnerCycleSummary", () => {
   });
 });
 
+// The orchestrator's result endpoint: one reply for every request, or a list served in order.
+function resultEndpoint(reply: Reply | Reply[] = {}) {
+  return fakeFetch({ "POST /runner/result": reply });
+}
+
+function sentBody(endpoint: ReturnType<typeof resultEndpoint>) {
+  return JSON.parse(endpoint.calls[0]!.body);
+}
+
 describe("postRunnerResult", () => {
   // The step reads ai-output/comments from its workspace, so each test gets an empty one.
   let workspaceDir: string;
-
-  // The orchestrator's result endpoint: one reply for every request, or a list served in order.
-  function resultEndpoint(reply: Reply | Reply[] = {}) {
-    return fakeFetch({ "POST /runner/result": reply });
-  }
-
-  function sentBody(endpoint: ReturnType<typeof resultEndpoint>) {
-    return JSON.parse(endpoint.calls[0]!.body);
-  }
 
   beforeEach(() => {
     vi.stubEnv("RUN_TOKEN", "run-token");
@@ -550,12 +550,12 @@ describe("postRunnerResult attribution", () => {
     authMode: "anthropic-api-key" as const, limit: null, outcome: "success" as const, usage: null,
   };
   const send = async (attribution: unknown) => {
-    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const endpoint = resultEndpoint();
     await postRunnerResult({
-      workspaceDir: "/tmp", phase: "implementation", outcome: "success", callbackUrl: "https://cb",
-      fetchImpl, attribution: attribution as never,
+      workspaceDir: testDir("runner-result"), phase: "implementation", outcome: "success", callbackUrl: "https://cb",
+      fetchImpl: endpoint.fetch, attribution: attribution as never,
     });
-    return JSON.parse(fetchImpl.mock.calls[0][1].body as string) as Record<string, unknown>;
+    return sentBody(endpoint) as Record<string, unknown>;
   };
 
   it("omits attribution for legacy bodies", async () => {
@@ -573,12 +573,12 @@ describe("postRunnerResult attribution", () => {
       ["failure", "MAX_TURNS_EXHAUSTED", { kind: "max_turns", value: 50 }],
       ["failure", "INVOCATION_TIMEOUT", { kind: "timeout_ms", value: 60000 }],
     ] as const) {
-      const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const endpoint = resultEndpoint();
       await postRunnerResult({
-        workspaceDir: "/tmp", phase: "implementation", outcome, failureCode, failureReason: "x", callbackUrl: "https://cb",
-        fetchImpl, attribution: { ...attr, outcome: "error", limit } as never,
+        workspaceDir: testDir("runner-result"), phase: "implementation", outcome, failureCode, failureReason: "x", callbackUrl: "https://cb",
+        fetchImpl: endpoint.fetch, attribution: { ...attr, outcome: "error", limit } as never,
       });
-      const body = JSON.parse(fetchImpl.mock.calls[0][1].body as string) as { attribution: { limit: unknown; outcome: string } };
+      const body = sentBody(endpoint) as { attribution: { limit: unknown; outcome: string } };
       expect(body.attribution.limit).toEqual(limit);
       expect(body.attribution.outcome).toBe("error");
       expect(JSON.stringify(body)).not.toContain("numTurns");

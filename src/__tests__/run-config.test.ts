@@ -289,7 +289,7 @@ describe("buildRunConfig", () => {
     sensitiveAddPatterns: ["*.secrets.toml"],
     sensitiveAllowPatterns: [".env"],
     dependencyTokenScope: "installation",
-    referenceRepos: [{ repo: "org/ref", ref: "main" }] as RepoMapping["referenceRepos"],
+    referenceRepos: [{ repo: "https://github.com/org/ref", path: "ref", ref: "main" }],
     reviewers: [{ id: "gap-analysis", gates: true }],
     reviewProcess: "claude-code-review",
     trustedReviewAuthors: ["octocat"],

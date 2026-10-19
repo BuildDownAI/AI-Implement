@@ -2,34 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveSessionImage, resolveDefaultRunnerImage, selectRunnerImageInput, resolveRunnerImageForDispatch, resolveChannelCommit, stripImageTag, isRunnerImageAllowed, RunnerImageNotAllowedError, __clearRepoImageCacheForTests } from "../repo-image.js";
 import * as settings from "../orchestrator-settings.js";
 import { fakeFetch, hangUntilAborted, type FakeFetch, type Reply, type Routes } from "./helpers/fake-fetch.js";
-import { githubFile } from "./helpers/replies/github.js";
+import { githubError, githubFile } from "./helpers/replies/github.js";
 
 const DEFAULT_IMAGE = "ghcr.io/builddownai/ai-implement-runner:latest";
 
 /** GitHub's contents API answering for acme/widgets' `.ai-implement/image.yml`. */
 function imageYml(reply: Reply): FakeFetch {
   return fakeFetch({ "GET /repos/acme/widgets/contents/.ai-implement/image.yml": reply });
-}
-
-function mockFetch(
-  status: number,
-  body: string | null,
-): ReturnType<typeof vi.fn> {
-  return vi.fn().mockResolvedValue({
-    ok: status >= 200 && status < 300,
-    status,
-    text: async () => body ?? "",
-    json: async () => (body ? JSON.parse(body) : null),
-  });
-}
-
-// GitHub contents API returns JSON with base64-encoded `content` for file blobs.
-function contentsApiResponse(fileBody: string): string {
-  return JSON.stringify({
-    type: "file",
-    encoding: "base64",
-    content: Buffer.from(fileBody, "utf8").toString("base64"),
-  });
 }
 
 describe("resolveSessionImage", () => {
@@ -459,8 +438,10 @@ describe("isRunnerImageAllowed", () => {
 describe("resolveSessionImage allowlist", () => {
   const EVIL = "evil.example/runner:1";
   let extra: string[];
-  const resolve = (fetchImpl: ReturnType<typeof vi.fn>, defaultImage = DEFAULT_IMAGE) =>
-    resolveSessionImage({ owner: "acme", repo: "widgets", token: "t", defaultImage, fetchImpl: fetchImpl as unknown as typeof fetch });
+  const resolve = (github: FakeFetch, defaultImage = DEFAULT_IMAGE) =>
+    resolveSessionImage({ owner: "acme", repo: "widgets", token: "t", defaultImage, fetchImpl: github.fetch });
+  const override = (image: string) => imageYml(githubFile(`image: ${image}\n`));
+  const noOverride = () => imageYml(githubError(404, "Not Found"));
 
   beforeEach(() => {
     __clearRepoImageCacheForTests();
@@ -471,48 +452,48 @@ describe("resolveSessionImage allowlist", () => {
   afterEach(() => vi.restoreAllMocks());
 
   it("returns an allowed override", async () => {
-    const result = await resolve(mockFetch(200, contentsApiResponse("image: ghcr.io/acme/r:1\n")));
+    const result = await resolve(override("ghcr.io/acme/r:1"));
     expect(result).toEqual({ image: "ghcr.io/acme/r:1", source: "override" });
   });
 
   it("returns an allowed default", async () => {
-    expect(await resolve(mockFetch(404, "no"))).toEqual({ image: DEFAULT_IMAGE, source: "default" });
+    expect(await resolve(noOverride())).toEqual({ image: DEFAULT_IMAGE, source: "default" });
   });
 
   it("returns an override under an extra prefix from Settings", async () => {
     extra = ["evil.example/"];
-    expect((await resolve(mockFetch(200, contentsApiResponse(`image: ${EVIL}\n`)))).image).toBe(EVIL);
+    expect((await resolve(override(EVIL))).image).toBe(EVIL);
   });
 
   it("returns a default under an extra prefix from Settings", async () => {
     extra = ["registry.example/"];
-    const result = await resolve(mockFetch(404, "no"), "registry.example/r:1");
+    const result = await resolve(noOverride(), "registry.example/r:1");
     expect(result).toEqual({ image: "registry.example/r:1", source: "default" });
   });
 
   it("refuses a disallowed override without falling back to the allowed default", async () => {
     const warn = vi.mocked(console.warn);
-    await expect(resolve(mockFetch(200, contentsApiResponse(`image: ${EVIL}\n`)))).rejects.toBeInstanceOf(RunnerImageNotAllowedError);
+    await expect(resolve(override(EVIL))).rejects.toBeInstanceOf(RunnerImageNotAllowedError);
     expect(warn.mock.calls.some((c) => String(c[0]).includes(`[repo-image] runner image ${EVIL} for acme/widgets is not allowed; allowed prefixes: `)
       && String(c[0]).endsWith("add a prefix at /admin#settings"))).toBe(true);
   });
 
   it("refuses a disallowed default", async () => {
-    await expect(resolve(mockFetch(404, "no"), EVIL)).rejects.toBeInstanceOf(RunnerImageNotAllowedError);
+    await expect(resolve(noOverride(), EVIL)).rejects.toBeInstanceOf(RunnerImageNotAllowedError);
   });
 
   it("checks the default after an invalid image.yml value falls back", async () => {
-    await expect(resolve(mockFetch(200, contentsApiResponse("image: not a ref\n")), EVIL)).rejects.toBeInstanceOf(RunnerImageNotAllowedError);
+    await expect(resolve(override("not a ref"), EVIL)).rejects.toBeInstanceOf(RunnerImageNotAllowedError);
     __clearRepoImageCacheForTests();
-    expect((await resolve(mockFetch(200, contentsApiResponse("image: bare\n")))).source).toBe("default");
+    expect((await resolve(override("bare"))).source).toBe("default");
   });
 
   it("refuses a cached allowed image once the Settings row that allowed it is removed", async () => {
     extra = ["evil.example/"];
-    const fetchImpl = mockFetch(200, contentsApiResponse(`image: ${EVIL}\n`));
-    await resolve(fetchImpl);
+    const github = override(EVIL);
+    await resolve(github);
     extra = [];
-    await expect(resolve(fetchImpl)).rejects.toBeInstanceOf(RunnerImageNotAllowedError);
-    expect(fetchImpl).toHaveBeenCalledOnce();
+    await expect(resolve(github)).rejects.toBeInstanceOf(RunnerImageNotAllowedError);
+    expect(github.calls).toHaveLength(1);
   });
 });

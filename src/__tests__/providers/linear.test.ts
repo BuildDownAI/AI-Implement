@@ -1,13 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { LinearProvider } from "../../providers/linear.js";
 import { MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
-import type { RepoMapping } from "../../config.js";
 import {
   configureLinearAuth,
   __setLinearTokenForTest,
   __resetLinearAuthForTest,
 } from "../../linear-app-auth.js";
-import { makeIssue } from "../helpers/builders.js";
+import { makeIssue, makeMapping } from "../helpers/builders.js";
 import type { FakeFetch, Reply } from "../helpers/fake-fetch.js";
 import { linearData as data, linearGraphql } from "../helpers/replies/linear.js";
 
@@ -1129,59 +1128,54 @@ describe("LinearProvider.findByKey", () => {
 });
 
 describe("LinearProvider.listIssuesPage", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
-  const mapping = { teamKey: "ENG", owner: "o", repo: "r" } as unknown as RepoMapping;
-  const recorded = {
-    data: {
-      issues: {
-        nodes: [{
-          id: "u1", identifier: "ENG-1", title: "T", description: "D", branchName: "eng-1",
-          state: { name: "Todo", type: "unstarted" }, labels: { nodes: [{ name: "AI-Implement" }] },
-          project: { name: "P" }, parent: { identifier: "ENG-0" },
-          comments: { nodes: [{ body: "hi", user: { name: "A" }, createdAt: "2026-01-01T00:00:00Z" }] },
-          relations: { nodes: [{ type: "blocks", relatedIssue: { identifier: "ENG-2" } }] },
-        }],
-        pageInfo: { hasNextPage: true, endCursor: "cur" },
-      },
+  // The tracker export passes the stored mapping with the requested team as its teamKey.
+  const mapping = makeMapping({ teamKey: "ENG" });
+  const page = {
+    issues: {
+      nodes: [{
+        id: "u1", identifier: "ENG-1", title: "T", description: "D", branchName: "eng-1",
+        state: { name: "Todo", type: "unstarted" }, labels: { nodes: [{ name: "AI-Implement" }] },
+        project: { name: "P" }, parent: { identifier: "ENG-0" },
+        comments: { nodes: [{ body: "hi", user: { name: "A" }, createdAt: "2026-01-01T00:00:00Z" }] },
+        relations: { nodes: [{ type: "blocks", relatedIssue: { identifier: "ENG-2" } }] },
+      }],
+      pageInfo: { hasNextPage: true, endCursor: "cur" },
     },
   };
-  const ok = (json: unknown) => ({ ok: true, json: async () => json }) as Response;
 
   it("does not stamp sourceSystem or team on the records", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(ok(recorded));
+    linear(data(page));
     const result = await new LinearProvider({}).listIssuesPage(mapping, null);
     expect(result.issues[0]).not.toHaveProperty("sourceSystem");
     expect(result.issues[0]).not.toHaveProperty("team");
   });
 
   it("sends first 50 and the cursor", async () => {
-    vi.mocked(fetch).mockResolvedValue(ok(recorded));
+    const fake = linear(data(page), data(page));
     const p = new LinearProvider({});
     await p.listIssuesPage(mapping, null);
     await p.listIssuesPage(mapping, "cur");
-    const vars = vi.mocked(fetch).mock.calls.map((c) => JSON.parse((c[1] as RequestInit).body as string).variables);
-    expect(vars).toEqual([
+    expect([variables(fake, 0), variables(fake, 1)]).toEqual([
       { teamKey: "ENG", first: 50, after: null },
       { teamKey: "ENG", first: 50, after: "cur" },
     ]);
   });
 
   it("throws on a non-OK response", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 500, statusText: "x", text: async () => "" } as Response);
+    linear({ status: 500, text: "Internal Server Error" });
     await expect(new LinearProvider({}).listIssuesPage(mapping, null)).rejects.toThrow(/Linear API error/);
   });
 
   it("throws on GraphQL errors instead of returning an empty page", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(ok({ errors: [{ message: "bad" }] }));
+    linear({ json: { data: null, errors: [{ message: "bad", path: ["issues"] }] } });
     await expect(new LinearProvider({}).listIssuesPage(mapping, null)).rejects.toThrow(/GraphQL error/);
   });
 
   it("throws TrackerUnavailableError without calling fetch when auth is unconfigured", async () => {
+    const fake = linear();
     const p = new LinearProvider({});
     __resetLinearAuthForTest();
     await expect(p.listIssuesPage(mapping, null)).rejects.toBeInstanceOf(TrackerUnavailableError);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(fake.calls).toHaveLength(0);
   });
 });

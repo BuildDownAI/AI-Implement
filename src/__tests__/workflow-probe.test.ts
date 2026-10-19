@@ -1,11 +1,11 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import {
   resolveWorkflowContract,
   resolveWorkflowCapabilities,
   __clearWorkflowProbeCacheForTests,
 } from "../workflow-probe.js";
 import { fakeFetch, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
-import { githubFile } from "./helpers/replies/github.js";
+import { githubError, githubFile } from "./helpers/replies/github.js";
 
 const ENVELOPE_YML =
   "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n";
@@ -24,27 +24,6 @@ function contents(reply: Reply, workflowFile = "claude-implement.yml"): FakeFetc
   return fakeFetch({ [`GET /repos/o/r/contents/.github/workflows/${workflowFile}`]: reply });
 }
 
-type FetchMock = typeof fetch & ReturnType<typeof vi.fn>;
-
-function mockContents(yamlBody: string): FetchMock {
-  return vi.fn().mockResolvedValue({
-    ok: true,
-    status: 200,
-    json: async () => ({
-      type: "file",
-      encoding: "base64",
-      content: Buffer.from(yamlBody, "utf8").toString("base64"),
-    }),
-  });
-}
-
-function mockFetch(status: number, body: unknown): FetchMock {
-  return vi.fn().mockResolvedValue({
-    ok: status >= 200 && status < 300,
-    status,
-    json: async () => body,
-  });
-}
 
 describe("resolveWorkflowContract", () => {
   beforeEach(() => {
@@ -448,38 +427,38 @@ describe("resolveWorkflowCapabilities — supportsAttemptCorrelation", () => {
 
 describe("resolveWorkflowCapabilities — supportsPrivateRunConfig", () => {
   const MARKER = "# ai-implement-capability: private-run-config-v1\n";
-  const probe = (fetchImpl: ReturnType<typeof vi.fn>) =>
+  const probe = (github: FakeFetch) =>
     resolveWorkflowCapabilities({
       owner: "o",
       repo: "r",
       workflowFile: "w.yml",
       token: "t",
       ref: "main",
-      fetchImpl: fetchImpl as unknown as typeof fetch,
+      fetchImpl: github.fetch,
     });
 
   beforeEach(() => __clearWorkflowProbeCacheForTests());
 
   it("is true only for an envelope workflow carrying the static marker", async () => {
-    expect((await probe(mockContents(MARKER + ENVELOPE_YML))).supportsPrivateRunConfig).toBe(true);
+    expect((await probe(contents(githubFile(MARKER + ENVELOPE_YML), "w.yml"))).supportsPrivateRunConfig).toBe(true);
   });
 
   it("is false for an envelope workflow without the marker", async () => {
-    expect((await probe(mockContents(ENVELOPE_YML))).supportsPrivateRunConfig).toBe(false);
+    expect((await probe(contents(githubFile(ENVELOPE_YML), "w.yml"))).supportsPrivateRunConfig).toBe(false);
   });
 
   it("stays false for a legacy workflow that mentions the marker", async () => {
-    expect((await probe(mockContents(MARKER + LEGACY_YML))).supportsPrivateRunConfig).toBe(false);
+    expect((await probe(contents(githubFile(MARKER + LEGACY_YML), "w.yml"))).supportsPrivateRunConfig).toBe(false);
   });
 
   it("is false for 404 and fetch errors", async () => {
-    expect((await probe(mockFetch(404, {}))).supportsPrivateRunConfig).toBe(false);
+    expect((await probe(contents(githubError(404, "Not Found"), "w.yml"))).supportsPrivateRunConfig).toBe(false);
     __clearWorkflowProbeCacheForTests();
-    expect((await probe(vi.fn().mockRejectedValue(new Error("boom")))).supportsPrivateRunConfig).toBe(false);
+    expect((await probe(contents(() => { throw new Error("boom"); }, "w.yml"))).supportsPrivateRunConfig).toBe(false);
   });
 
   it("does not imply stage-agent support from the private-envelope marker", async () => {
-    const caps = await probe(mockContents(MARKER + ENVELOPE_YML));
+    const caps = await probe(contents(githubFile(MARKER + ENVELOPE_YML), "w.yml"));
     expect(caps.supportsStageAgentConfig).toBe(false);
   });
 });
@@ -489,35 +468,36 @@ describe("transient probe failures (AII-1292)", () => {
     __clearWorkflowProbeCacheForTests();
   });
   const base = { owner: "o", repo: "r", workflowFile: "claude-implement.yml", token: "t", ref: "main" };
-  const transient: Array<[string, () => FetchMock]> = [
-    ["fetch throw", () => vi.fn().mockRejectedValue(new Error("net")) as FetchMock],
-    ["HTTP 500", () => mockFetch(500, {})],
-    ["bad JSON", () => vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => { throw new Error("bad"); } }) as FetchMock],
-    ["non-file body", () => mockFetch(200, { type: "dir" })],
+  // A path that names a directory answers with its listing, an array, rather than a file object.
+  const transient: Array<[string, () => FakeFetch]> = [
+    ["fetch throw", () => contents(() => { throw new Error("net"); })],
+    ["HTTP 500", () => contents(githubError(500, "Server Error"))],
+    ["bad JSON", () => contents({ text: "<html>upstream error</html>" })],
+    ["non-file body", () => contents({ json: [{ type: "file", name: "claude-implement.yml" }] })],
   ];
 
   it.each(transient)("%s is not cached and never throws by default", async (_n, make) => {
-    const fetchImpl = make();
-    const first = await resolveWorkflowCapabilities({ ...base, fetchImpl });
-    await resolveWorkflowCapabilities({ ...base, fetchImpl });
+    const github = make();
+    const first = await resolveWorkflowCapabilities({ ...base, fetchImpl: github.fetch });
+    await resolveWorkflowCapabilities({ ...base, fetchImpl: github.fetch });
     expect(first.contract).toBe("legacy");
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(github.calls).toHaveLength(2);
   });
 
   it.each(transient)("%s throws with failOnTransient", async (_n, make) => {
-    await expect(resolveWorkflowCapabilities({ ...base, fetchImpl: make(), failOnTransient: true })).rejects.toThrow();
+    await expect(resolveWorkflowCapabilities({ ...base, fetchImpl: make().fetch, failOnTransient: true })).rejects.toThrow();
   });
 
   it("a 404 and a real legacy workflow stay cached and do not throw with failOnTransient", async () => {
-    const notFound = mockFetch(404, {});
-    expect(await resolveWorkflowContract({ ...base, fetchImpl: notFound, failOnTransient: true })).toBe("legacy");
-    await resolveWorkflowContract({ ...base, fetchImpl: notFound, failOnTransient: true });
-    expect(notFound).toHaveBeenCalledOnce();
+    const notFound = contents(githubError(404, "Not Found"));
+    expect(await resolveWorkflowContract({ ...base, fetchImpl: notFound.fetch, failOnTransient: true })).toBe("legacy");
+    await resolveWorkflowContract({ ...base, fetchImpl: notFound.fetch, failOnTransient: true });
+    expect(notFound.calls).toHaveLength(1);
 
     __clearWorkflowProbeCacheForTests();
-    const legacy = mockContents(LEGACY_YML);
-    expect(await resolveWorkflowContract({ ...base, fetchImpl: legacy, failOnTransient: true })).toBe("legacy");
-    await resolveWorkflowContract({ ...base, fetchImpl: legacy });
-    expect(legacy).toHaveBeenCalledOnce();
+    const legacy = contents(githubFile(LEGACY_YML));
+    expect(await resolveWorkflowContract({ ...base, fetchImpl: legacy.fetch, failOnTransient: true })).toBe("legacy");
+    await resolveWorkflowContract({ ...base, fetchImpl: legacy.fetch });
+    expect(legacy.calls).toHaveLength(1);
   });
 });
