@@ -24,7 +24,7 @@ const run = (status: string, conclusion: string | null) => ({ name: "Claude Code
 const input = { dispatchId: "d", owner: "o", repo: "r", prNumber: 5, prUrl: "u", headSha: "a", followHead: true };
 
 beforeEach(() => {
-  vi.mocked(getPullRequestState).mockResolvedValue({ state: "open", merged: false, headSha: "b" } as never);
+  vi.mocked(getPullRequestState).mockResolvedValue({ state: "open", merged: false, headRef: "ai-implement/aii-5-x", headSha: "b" });
   vi.mocked(getCombinedChecksState).mockResolvedValue("success");
   vi.mocked(getCommitTime).mockResolvedValue(1000);
   vi.mocked(listOpenReviewFindings).mockReturnValue([]);

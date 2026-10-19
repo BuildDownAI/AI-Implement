@@ -8,7 +8,6 @@
 //
 // Engine evidence, not live-pilot evidence: the live TEST rollout is a separate step after merge.
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -33,14 +32,14 @@ import { handleRunnerCycleSummary, handleRunnerResult, ReviewFixIntakeUnavailabl
 import type { ResultIntakeOutcome, ReviewFixResultMetadataV1, ScopedPrIdentity } from "../../review-fix-contract.js";
 import { createReviewFixIngressClient, reviewFixResultForwardKey, reviewFixResultIntakeFromForward } from "../../restate/review-fix-client.js";
 import type { ReviewFixAttemptCompletion } from "../../restate/review-fix-attempt.js";
-import type { ProviderRegistry } from "../../providers/registry.js";
+import { makeAppConfig, makeChatGptPlanRecord, makeMapping, makeRegistry, makeReviewFixResult, makeScopedPrIdentity } from "../helpers/builders.js";
+import { testDir } from "../helpers/test-dir.js";
 import type { RestateEnvironment } from "./harness.js";
 import { attachWorkflow, callWorkflow, eventually, journalEntries, journalText, queryInvocations, startRetryEnabled } from "./harness.js";
 
 const SECRET = "SYNTHETIC-managed-token-secret";
 const ACCESS = "SYNTHETIC-managed-model-access";
-const CONFIG = { githubAppId: "1", githubAppPrivateKey: "synthetic-key", runnerTokenSecret: SECRET,
-  runnerCallbackBaseUrl: "https://orchestrator.example", sessionImage: "ghcr.io/builddownai/runner:next", runnerImageExplicit: false };
+const CONFIG = makeAppConfig({ runnerTokenSecret: SECRET, runnerCallbackBaseUrl: "https://orchestrator.example" });
 
 const state = vi.hoisted(() => ({
   dispatched: [] as Array<Record<string, unknown>>,
@@ -54,7 +53,9 @@ vi.mock("../../github-app-auth.js", () => ({
   getInstallation: async () => ({ token: "SYNTHETIC-github-token", installationId: 7 }),
   getInstallationToken: async () => "SYNTHETIC-github-token",
   getInstallationId: async () => 7,
-  getScopedInstallationToken: async () => ({ token: "SYNTHETIC-github-token", installationId: 7, expiresAt: "" }),
+  getScopedInstallationToken: async () => ({
+    token: "SYNTHETIC-github-token", installationId: 7, expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+  }),
 }));
 vi.mock("../../github.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../github.js")>()),
@@ -124,7 +125,7 @@ const githubFetch: typeof fetch = async (input, init) => {
 };
 
 function scope(prNumber: number): ScopedPrIdentity {
-  return { installationId: 7, repository: "acme/app", prNumber };
+  return makeScopedPrIdentity({ installationId: 7, repository: "acme/app", prNumber });
 }
 
 describe("Restate managed Codex review-fix on GHA: production composition", () => {
@@ -145,27 +146,15 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
     runtime = createModelAuthRuntime({ config: CONFIG, env: { RUNNER_TOKEN_SECRET: SECRET }, fetchImpl: githubFetch });
     profiles.saveAccountProfileRevision({ profileId: "cdx", identity: "cdx", revision: 1, agent: "codex", provider: "openai",
       authMode: "codex-subscription", allowedProjectKeys: ["AII"] });
-    expect(runtime.sessionStore.writePlanRecord({ profileId: "cdx", expectedSequence: null, sessionData: JSON.stringify({
-      version: 1, email: "synthetic@example.com", issuer: "https://auth.openai.com", subject: "cdx", clientId: "synthetic",
-      extAgentHostId: "synthetic", idToken: "synthetic-id", accessToken: ACCESS, refreshToken: "synthetic-refresh",
-      tokenType: "Bearer", scopes: ["chatgpt.tokens.use.direct"], accessTokenExpiresAt: Date.now() + 3_600_000,
-      earliestRefreshAt: null, savedAt: Date.now(),
-    }) }).ok).toBe(true);
+    expect(runtime.sessionStore.writePlanRecord({ profileId: "cdx", expectedSequence: null,
+      sessionData: JSON.stringify(makeChatGptPlanRecord({ accessToken: ACCESS })) }).ok).toBe(true);
     const stage = { agent: "codex" as const, provider: "openai" as const, model: "gpt-6-luna", accountProfileId: "cdx", invocationTimeoutMs: 60_000 };
     profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } });
     profiles.setProjectOptIn("AII", true);
-    upsertMapping("AII", {
-      workflowFile: "claude-implement.yml", defaultBranch: "main", maxInProgressAiIssues: 3, executionMode: "github-actions",
-      sessionMode: "autonomous", machineCpus: 2, machineMemoryMb: 4096, planningEnabled: false, planningWorkflowFile: "",
-      autoApprovePlans: true, autoMerge: false, extraEnv: {}, provider: "anthropic", ticketingProvider: "linear",
-      ticketingConfig: { kind: "linear" }, awsRegion: null, paused: false, maxTurns: null, maxIterations: null,
-      maxJobMinutes: null, branchPrefix: null, skillsRepo: null, sensitiveAddPatterns: null, sensitiveAllowPatterns: null,
-      dependencyTokenScope: null, memoryProviderId: null, referenceRepos: null, reviewers: null,
-      owner: "acme", repo: "app", reviewFixLifecycle: "restate",
-    });
+    upsertMapping("AII", makeMapping({ owner: "acme", repo: "app", reviewFixLifecycle: "restate" }));
     expect(getMappings().AII?.reviewFixLifecycle).toBe("restate");
     store = new SqliteReviewFixAttemptStore();
-    const services = createProductionReviewFixServices(CONFIG, {} as ProviderRegistry, store, undefined, runtime);
+    const services = createProductionReviewFixServices(CONFIG, makeRegistry(), store, undefined, runtime);
     env = await startRetryEnabled(services);
   }, 60_000);
 
@@ -204,8 +193,8 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
   }
 
   function resultFor(prepared: { attemptId: string; scope: ScopedPrIdentity; deadlineAt: number }, runId: number, outputCommit: string): ReviewFixResultMetadataV1 {
-    return { version: 1, attemptId: prepared.attemptId as ReviewFixResultMetadataV1["attemptId"], ...prepared.scope, deadlineAt: prepared.deadlineAt,
-      githubRunId: runId, githubRunAttempt: 1, outputCommit };
+    return makeReviewFixResult({ attemptId: prepared.attemptId as ReviewFixResultMetadataV1["attemptId"], ...prepared.scope,
+      deadlineAt: prepared.deadlineAt, githubRunId: runId, outputCommit });
   }
 
   /** The authenticated runner result callback, forwarded over the ingress exactly as `onReviewFixResult` does. */
@@ -238,33 +227,31 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
   function streamRunnerEvidence(prepared: { findings: ReadonlyArray<{ findingKey: string }> }, progressToken: string, commit: string,
     opts: { dispositions: "all" | "partial" | "invalid" | "none"; publish?: boolean; deliveries?: number; conflictingPublication?: boolean;
       sourceApproved?: boolean | null; resultOutcome?: "success" | "failure" }): number[] {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rf-evidence-"));
-    try {
-      writeCycleSummary(dir, { id: "feedback-loop.1", stage: "feedback-loop", cycle: 1, inputCommit: sha("input"), outputCommit: null,
-        outputCommitStatus: "pending_push", dispositions: [], tests: [{ name: "test execution", status: "missing" }],
-        verdict: { approved: opts.sourceApproved === undefined ? true : opts.sourceApproved, reason: "approved" },
-        usage: { tokensIn: 120, tokensOut: 30, costUsd: 0.05 } });
-      const keys = prepared.findings.map((f) => f.findingKey);
-      const entries = opts.dispositions === "all" ? keys.map((k) => ({ findingKey: k, disposition: "fixed", reason: "done" }))
-        : opts.dispositions === "partial" ? keys.slice(0, 1).map((k) => ({ findingKey: k, disposition: "fixed", reason: "done" }))
-        : opts.dispositions === "invalid" ? keys.map((k) => ({ findingKey: k, disposition: "bogus", reason: "done" }))
-        : null;
-      if (entries) {
-        fs.mkdirSync(path.join(dir, "ai-output"), { recursive: true });
-        fs.writeFileSync(path.join(dir, DISPOSITIONS_FILE), JSON.stringify(entries));
-      }
-      const pending = readCycleSummaries(dir);
-      const publication = opts.publish === false ? null : buildPublicationCycleSummary(pending, commit,
-        readFindingDispositions(dir).valid.map((d) => ({ key: d.findingKey, disposition: d.disposition })), opts.resultOutcome ?? "success");
-      const batch = [...pending, ...(publication ? [publication] : [])];
-      const post = (summary: unknown) => handleRunnerCycleSummary({ authorization: `Bearer ${progressToken}`, secret: SECRET, body: { summary } }).status;
-      const statuses = Array.from({ length: opts.deliveries ?? 1 }, () => batch).flat().map(post);
-      if (opts.conflictingPublication) {
-        // Same immutable identity, different (complete) payload: must be rejected, never merged over the first.
-        statuses.push(post(buildPublicationCycleSummary(pending, commit, keys.map((k) => ({ key: k, disposition: "fixed" })), "success")));
-      }
-      return statuses;
-    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    const dir = testDir("rf-evidence");
+    writeCycleSummary(dir, { id: "feedback-loop.1", stage: "feedback-loop", cycle: 1, inputCommit: sha("input"), outputCommit: null,
+      outputCommitStatus: "pending_push", dispositions: [], tests: [{ name: "test execution", status: "missing" }],
+      verdict: { approved: opts.sourceApproved === undefined ? true : opts.sourceApproved, reason: "approved" },
+      usage: { tokensIn: 120, tokensOut: 30, costUsd: 0.05 } });
+    const keys = prepared.findings.map((f) => f.findingKey);
+    const entries = opts.dispositions === "all" ? keys.map((k) => ({ findingKey: k, disposition: "fixed", reason: "done" }))
+      : opts.dispositions === "partial" ? keys.slice(0, 1).map((k) => ({ findingKey: k, disposition: "fixed", reason: "done" }))
+      : opts.dispositions === "invalid" ? keys.map((k) => ({ findingKey: k, disposition: "bogus", reason: "done" }))
+      : null;
+    if (entries) {
+      fs.mkdirSync(path.join(dir, "ai-output"), { recursive: true });
+      fs.writeFileSync(path.join(dir, DISPOSITIONS_FILE), JSON.stringify(entries));
+    }
+    const pending = readCycleSummaries(dir);
+    const publication = opts.publish === false ? null : buildPublicationCycleSummary(pending, commit,
+      readFindingDispositions(dir).valid.map((d) => ({ key: d.findingKey, disposition: d.disposition })), opts.resultOutcome ?? "success");
+    const batch = [...pending, ...(publication ? [publication] : [])];
+    const post = (summary: unknown) => handleRunnerCycleSummary({ authorization: `Bearer ${progressToken}`, secret: SECRET, body: { summary } }).status;
+    const statuses = Array.from({ length: opts.deliveries ?? 1 }, () => batch).flat().map(post);
+    if (opts.conflictingPublication) {
+      // Same immutable identity, different (complete) payload: must be rejected, never merged over the first.
+      statuses.push(post(buildPublicationCycleSummary(pending, commit, keys.map((k) => ({ key: k, disposition: "fixed" })), "success")));
+    }
+    return statuses;
   }
 
   /** Delivers the authenticated result, marks the run terminal and returns the attempt's completion. */
@@ -449,7 +436,9 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
     expect(grants(attemptId)).toBe(1);
     expect(getDb().prepare("SELECT count(*) AS n FROM model_credential_grants WHERE dispatch_id = ? AND revoked_at IS NOT NULL").get(attemptId)).toEqual({ n: 0 });
     expect(occupancy(attemptId)).toBeNull();
-    state.listed = [{ id: runId, run_attempt: 1, display_title: `Review fix · attempt ${attemptId}`, head_branch: "main" }];
+    // GitHub titles the run from the workflow's run-name: the dispatched identifier, then the attempt.
+    state.listed = [{ id: runId, run_attempt: 1, head_branch: "main",
+      display_title: `Claude AI Implementation — ${String(launch.config.issue.identifier)} · attempt ${attemptId}` }];
 
     const { createModelAuthRoutes } = await import("../../model-auth-routes.js");
     const routes = createModelAuthRoutes({ runtime, onFly: false, requestPlanRefresh: async () => {} });

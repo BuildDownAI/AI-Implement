@@ -18,6 +18,8 @@ import type { RepoMapping } from "../config.js";
 import type { ScopedPrIdentity } from "../review-fix-contract.js";
 import type { PreparedReviewFixAttempt } from "../review-fix-ports.js";
 import { makeMapping, makeScopedPrIdentity } from "./helpers/builders.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
+import { githubError } from "./helpers/replies/github.js";
 import { testDb } from "./helpers/test-db.js";
 
 let config: typeof ConfigModule;
@@ -143,6 +145,16 @@ const caps = (over: Record<string, unknown> = {}) => ({
 });
 const legacyProbe = async () => caps({ supportsPrivateRunConfig: false });
 const privateProbe = async () => caps({ supportsPrivateRunConfig: true });
+
+/** The real transport's dispatch route for the seeded mapping, and GitHub's 200 answer when run details are requested. */
+const DISPATCHES = "POST /repos/eudoxus/ai-implement/actions/workflows/claude-implement.yml/dispatches";
+const dispatchedRun = (id: number) => ({ json: {
+  workflow_run_id: id,
+  run_url: `https://api.github.com/repos/eudoxus/ai-implement/actions/runs/${id}`,
+  html_url: `https://github.com/eudoxus/ai-implement/actions/runs/${id}`,
+} });
+const UNEXPECTED_ISSUE_IDENTIFIER = githubError(422, 'Unexpected inputs provided: ["issue_identifier"]');
+const dispatchBodies = (calls: { body: string }[]) => calls.map((c) => JSON.parse(c.body) as { inputs: Record<string, string> });
 
 describe("GithubReviewFixWorker.launch private envelope capability", () => {
   it("dispatches a run_config whose description and commentInstruction both equal the admitted task text", async () => {
@@ -303,18 +315,10 @@ describe("GithubReviewFixWorker.launch private envelope capability", () => {
   it("keeps the private run_config byte-identical through the real optional-input retry", async () => {
     seedMapping();
     const { resolver } = makeCredentials();
-    const bodies: Array<{ inputs: Record<string, string> }> = [];
-    vi.stubGlobal("fetch", vi.fn(async (_u: unknown, init?: { body?: string }) => {
-      bodies.push(JSON.parse(init!.body as string));
-      if (bodies.length === 1) return new Response(JSON.stringify({ message: 'Unexpected inputs provided: ["issue_identifier"]' }), { status: 422 });
-      return new Response(JSON.stringify({ workflow_run_id: 9101, run_url: "https://api.github.com/repos/eudoxus/ai-implement/actions/runs/9101", html_url: "https://github.com/eudoxus/ai-implement/actions/runs/9101" }), { status: 200 });
-    }));
-    try {
-      const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, callbackInputs: tokens, resolveCapabilities: privateProbe });
-      await worker.launch(await worker.prepare(makeAttempt()));
-    } finally {
-      vi.unstubAllGlobals();
-    }
+    const api = fakeFetch({ [DISPATCHES]: [UNEXPECTED_ISSUE_IDENTIFIER, dispatchedRun(9101)] }).install();
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, callbackInputs: tokens, resolveCapabilities: privateProbe });
+    await worker.launch(await worker.prepare(makeAttempt()));
+    const bodies = dispatchBodies(api.calls);
     expect(bodies).toHaveLength(2);
     expect(bodies[1].inputs).not.toHaveProperty("issue_identifier");
     expect(bodies[1].inputs.run_config).toBe(bodies[0].inputs.run_config);
@@ -399,21 +403,10 @@ describe("GithubReviewFixWorker.launch", () => {
   it("keeps run_config byte-identical through the real optional-input retry", async () => {
     seedMapping();
     const { resolver } = makeCredentials();
-    const bodies: Array<{ inputs: Record<string, string> }> = [];
-    const fetchMock = vi.fn(async (_url: unknown, init?: { body?: string }) => {
-      bodies.push(JSON.parse(init!.body as string));
-      if (bodies.length === 1) {
-        return new Response(JSON.stringify({ message: 'Unexpected inputs provided: ["issue_identifier"]' }), { status: 422 });
-      }
-      return new Response(JSON.stringify({ workflow_run_id: 9012, run_url: "https://api.github.com/repos/eudoxus/ai-implement/actions/runs/9012", html_url: "https://github.com/eudoxus/ai-implement/actions/runs/9012" }), { status: 200 });
-    });
-    vi.stubGlobal("fetch", fetchMock);
-    try {
-      const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, callbackInputs: tokenInputs(), resolveCapabilities: legacyProbe });
-      await worker.launch(await worker.prepare(makeAttempt()));
-    } finally {
-      vi.unstubAllGlobals();
-    }
+    const api = fakeFetch({ [DISPATCHES]: [UNEXPECTED_ISSUE_IDENTIFIER, dispatchedRun(9012)] }).install();
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, callbackInputs: tokenInputs(), resolveCapabilities: legacyProbe });
+    await worker.launch(await worker.prepare(makeAttempt()));
+    const bodies = dispatchBodies(api.calls);
     expect(bodies).toHaveLength(2);
     expect(bodies[0].inputs).toHaveProperty("issue_identifier");
     expect(bodies[1].inputs).not.toHaveProperty("issue_identifier");
@@ -521,6 +514,7 @@ describe("GithubReviewFixWorker.launch", () => {
     }));
     const worker = new workerModule.GithubReviewFixWorker({
       credentials: resolver, transport: t.transport, callbackInputs, runnerCallbackUrl: "https://callback.example/runner",
+      resolveCapabilities: legacyProbe,
     });
     await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-cb-url" })));
 
@@ -556,6 +550,7 @@ describe("GithubReviewFixWorker.launch", () => {
     }));
     const worker = new workerModule.GithubReviewFixWorker({
       credentials: resolver, transport: t.transport, callbackInputs, runnerImage: async () => "ghcr.io/x/runner:next",
+      resolveCapabilities: legacyProbe,
     });
     await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-img2" })));
     expect((t.dispatchCalls[0] as { inputs: Record<string, unknown> }).inputs).toEqual(expect.objectContaining({
