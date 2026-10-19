@@ -279,7 +279,7 @@ Otherwise it fetches `baseSha` and `headSha` from the public base repo with no c
 1. **Baseline merge** of `baseSha`. An ingest-path conflict means the KG repo has drifted from base: `KG_BASE_BEHIND`, `baseMerge.result: "behind"`. The tree is then reset to `HEAD`.
 2. **PR merge** of `headSha`. An ingest-path conflict now belongs to the PR: `KG_BASE_CONFLICT`, `result: "conflict"`. Otherwise the merge is committed locally (never pushed) and the result is `merged`.
 
-A path rule applies after each merge. Ingest paths (`KG_BASE_INGEST_PATHS`: `kg_ingest/`, `kg_query/`, `ontology/`, `tests/`, `pyproject.toml`, `uv.lock`, `requirements*.txt`) keep their merged result and any conflict is reported. `sources.yml` and `snapshot/**` are always restored from `HEAD`, since they are per-repo content. Every other conflicted path (README, `.gitignore`, `.github/**`, docs) takes the KG repo's side. Reported conflict paths are capped at 50. The runner result echoes `baseMerge`, on failure as well as success.
+A path rule applies after each merge. Ingest paths (`KG_BASE_INGEST_PATHS`: `kg_ingest/`, `kg_query/`, `ontology/`, `tests/`, `pyproject.toml`, `uv.lock`, `requirements.txt`, `requirements-oxigraph.txt`) keep their merged result and any conflict is reported. `sources.yml` and `snapshot/**` are always restored from `HEAD`, since they are per-repo content. Every other conflicted path (README, `.gitignore`, `.github/**`, docs) takes the KG repo's side. Reported conflict paths are capped at 50. The runner result echoes `baseMerge`, on failure as well as success.
 
 ### Scope endpoint
 
