@@ -10,12 +10,12 @@ import { createKgRepo } from "../../restate/kg-repo.js";
 import type { BusyRead, FireAnswer, ScheduledPipeline } from "../../restate/pipeline-schedule.js";
 import { createPipelineSchedule } from "../../restate/pipeline-schedule.js";
 import type { RestateEnvironment } from "./harness.js";
-import { VARIANTS, callObject, callService, eventually, setObjectState, settle, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, callObject, callService, eventually, setObjectStates, settle, startVariants, stopAll } from "./harness.js";
 import type { PipelineScheduleAdapter, ScheduleWorld } from "./pipeline-schedule-contract.js";
 import { pipelineScheduleContractKeys, registerPipelineScheduleContract } from "./pipeline-schedule-contract.js";
 
 const LABELS = VARIANTS.map(([label]) => label);
-const KG_RULES = ["a", "b", "b2", "c", "d", "e", "f"];
+const KG_RULES = ["a", "b", "b2", "c", "d", "e", "f", "g"];
 const kgKey = (label: string, rule: string): string => `kg-${label}-${rule}`;
 const slugOf = (key: string): string => `owner/${key}`;
 
@@ -38,7 +38,6 @@ interface World extends ScheduleWorld {
   log: string[];
   toolCalls: ToolCall[];
   cancels: Array<{ runId: string; reason: string | undefined }>;
-  runs: Map<string, { step: string | null; decisions: string[] }>;
   /** Raw `{ status, body }` answers for the tool, consumed in order; empty means 202 with a fresh run id. */
   toolAnswers: Array<{ status: number; body: Record<string, unknown> } | "is-error">;
   crashNext: boolean;
@@ -53,7 +52,7 @@ let envs: Map<string, RestateEnvironment>;
 
 /** The newest world that knows a run id: a one-way cancel lands after its scenario's check returned, and both variants share these stand-ins. */
 const ownerOf = (runId: string): World | undefined =>
-  [...worlds.values()].reverse().find((w) => w.runs.has(runId) || w.ids.has(runId));
+  [...worlds.values()].reverse().find((w) => w.ids.has(runId));
 
 const world = (): World => {
   if (!current) throw new Error("no current world");
@@ -70,7 +69,6 @@ function newWorld(key: string): World {
     log: [],
     toolCalls: [],
     cancels: [],
-    runs: new Map(),
     toolAnswers: [],
     crashNext: false,
     started: 0,
@@ -86,13 +84,16 @@ function newWorld(key: string): World {
     setBusy: async (read: BusyRead) => {
       const admin = envs.get(label)!.adminAPIBaseUrl();
       if (!read.busy) {
-        await setObjectState(admin, "KgRepo", slugOf(key), "inFlight", null);
+        await setObjectStates(admin, "KgRepo", slugOf(key), { inFlight: null, held: null });
         return;
       }
       const holder = read.holder ?? "other-run";
       w.ids.add(holder);
-      w.runs.set(holder, read.awaitingDecision ? { step: "decision", decisions: ["accept", "cancel"] } : { step: "merge", decisions: [] });
-      await setObjectState(admin, "KgRepo", slugOf(key), "inFlight", { triggerId: holder, startedAt: 0 });
+      // A hold is `KgRepo` state (AII-1489): the marker plus the stored hold.
+      const held = read.awaitingDecision
+        ? { triggerId: holder, dispatchId: holder, decideBy: DUE + 10 * DAY, report: { ok: false, failureCode: "KG_SNAPSHOT_HELD", snapshotPr: 7 }, steps: [] }
+        : null;
+      await setObjectStates(admin, "KgRepo", slugOf(key), { inFlight: { triggerId: holder, startedAt: 0 }, held });
     },
     queueFire: (...answers) => {
       for (const a of answers) w.fromFire(a);
@@ -126,19 +127,18 @@ const standInTools = restate.service({
   },
 });
 
+/** Stands in for the resumed run `KgRepo.decide` starts: records the decision it carries, then stays in flight so the lock follows it. */
 const standInKgRefresh = restate.workflow({
   name: "KgRefresh",
   handlers: {
-    run: async (): Promise<void> => {},
-    status: restate.handlers.workflow.shared(async (ctx: restate.WorkflowSharedContext) => {
-      const run = await ctx.run("read", () => ownerOf(ctx.key)?.runs.get(ctx.key) ?? { step: null, decisions: [] });
-      return { step: run.step, decisions: run.decisions, startedAt: null, triggerId: ctx.key, runId: null, dryRun: false, runnerStep: null, held: null };
-    }),
-    cancel: restate.handlers.workflow.shared(async (ctx: restate.WorkflowSharedContext, input: { reason?: string }) => {
+    run: async (ctx: restate.WorkflowContext, input: { resume?: { hold: { triggerId: string }; reason?: string } }): Promise<void> => {
+      const resume = input?.resume;
+      if (!resume) return;
       await ctx.run("record", () => {
-        ownerOf(ctx.key)?.cancels.push({ runId: ctx.key, reason: input?.reason });
+        ownerOf(resume.hold.triggerId)?.cancels.push({ runId: resume.hold.triggerId, reason: resume.reason });
       });
-    }),
+      await ctx.promise<boolean>("never").get();
+    },
   },
 });
 
@@ -276,6 +276,24 @@ describe("kg-refresh schedule rules", () => {
     expect(await s.check()).toEqual({ action: "none" });
     expect(s.w.calls().filter((c) => c.startsWith("replace"))).toEqual([]);
     expect(s.w.cancels).toEqual([]);
+    expect(s.w.toolCalls).toHaveLength(1);
+  }, 30_000);
+
+  it.each(LABELS)("(g) a run a person accepted is never replaced: the hold is gone, so the schedule only waits (%s)", async (label) => {
+    const s = begin(label, "g");
+    await s.turnOnAndDue();
+    await s.check();
+    const runId = (await s.get()).lastStartedRunId!;
+    s.w.setClock(DUE + DAY);
+    await s.w.setBusy({ busy: true, holder: runId, awaitingDecision: true });
+    const baseUrl = envs.get(label)!.baseUrl();
+    await callObject(baseUrl, "KgRepo", slugOf(s.w.key), "decide", { action: "accept", actor: "ada@example.com", triggerId: runId });
+    await eventually(() => s.w.cancels, (c) => c.length >= 1, { label: "resumed run started" });
+    expect(await s.check()).toEqual({ action: "none" });
+    expect(s.w.calls().filter((c) => c.startsWith("replace"))).toEqual([]);
+    await settle(500);
+    // Only the accept's own resume was recorded, with no superseded reason.
+    expect(s.w.cancels).toEqual([{ runId, reason: undefined }]);
     expect(s.w.toolCalls).toHaveLength(1);
   }, 30_000);
 

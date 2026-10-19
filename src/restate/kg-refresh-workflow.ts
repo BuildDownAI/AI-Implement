@@ -81,18 +81,51 @@ export const kgRefreshOptionsSchema = z.object({
   actorEmail: z.string().optional(),
 }).strict();
 
-/** The `KgRefresh.run` input — `KgRepo.submit` sends `{ ...options, triggerId }`. */
+/** The `decide` actor: who decided, as it appears on the PR note and in the log. */
+export const kgDeciderSchema = z.string().min(1).max(200).regex(/^[^\x00-\x1f\x7f]+$/, "actor must not contain control characters");
+
+/**
+ * A snapshot held at the decision gate (AII-1489). The gate run ends after `KgRepo.hold` stores this;
+ * `KgRepo.decide` hands it back to a new `KgRefresh.run` as `resume.hold`. The object stores it verbatim.
+ */
+export const kgHoldSchema = z.object({
+  /** The gate run's trigger id: the lock holder while the hold stands, and the name a decision or timer gives. */
+  triggerId: z.string().min(1),
+  /** The gate run's dispatch id: the `dispatch_log` row the resumed run closes. */
+  dispatchId: z.string().min(1),
+  decideBy: z.number(),
+  report: z.custom<KgRefreshReportBody>((v) => typeof v === "object" && v !== null),
+  /** The runner's step table, built at the gate from the gate run's step promises. */
+  steps: z.array(z.custom<KgRefreshStepRecord>((v) => typeof v === "object" && v !== null)),
+}).strict();
+
+export type KgHold = z.infer<typeof kgHoldSchema>;
+
+/** What `KgRepo.decide` hands the resumed run: the hold, and how it was decided. */
+export const kgResumeSchema = z.object({
+  hold: kgHoldSchema,
+  action: z.enum(["accept", "cancel", "timeout"]),
+  /** Who accepted; required for `accept`, which names them on the PR. */
+  actor: kgDeciderSchema.optional(),
+  /** A cancel reason; only the schedule's `superseded_by_schedule` changes the gate close. */
+  reason: z.string().optional(),
+}).strict();
+
+export type KgRefreshResume = z.infer<typeof kgResumeSchema>;
+
+/** The `KgRefresh.run` input — `KgRepo.submit` sends `{ ...options, triggerId }`, plus `resume` for a held snapshot's decision. */
 export const kgRefreshRunInputSchema = kgRefreshOptionsSchema.extend({
   triggerId: z.string(),
   report: kgDryRunReportSchema.optional(),
+  resume: kgResumeSchema.optional(),
 }).strict();
 
 export type KgRefreshRunInput = z.infer<typeof kgRefreshRunInputSchema> & { report?: KgDryRunReportTarget };
 
-/** The `decide` handler's input: who decided, and whether the held snapshot lands or is dropped. */
+/** The decision a person makes on a held snapshot: who decided, and whether it lands or is dropped. */
 export const kgRefreshDecideSchema = z.object({
   action: z.enum(["accept", "cancel"]),
-  actor: z.string().min(1).max(200).regex(/^[^\x00-\x1f\x7f]+$/, "actor must not contain control characters"),
+  actor: kgDeciderSchema,
 }).strict();
 
 export type KgRefreshDecideInput = z.infer<typeof kgRefreshDecideSchema>;
@@ -168,6 +201,21 @@ export interface KgRefreshHeldView {
   /** Per-source results of the run, so the operator decides from them. */
   sources: SourceResult[];
   decideBy: number;
+}
+
+/** The status view of a hold: what a reader may see, without the commit and branch. */
+export function heldViewOf(hold: KgHold): KgRefreshHeldView {
+  const r = hold.report;
+  return {
+    snapshotPr: r.snapshotPr!,
+    partTable: r.partTable ?? [],
+    cause: r.cause ?? "shrink",
+    failedTeams: r.failedTeams ?? [],
+    acceptBlocked: r.acceptBlocked === true,
+    lostTeams: r.lostTeams ?? [],
+    sources: r.sources ?? [],
+    decideBy: hold.decideBy,
+  };
 }
 
 /** The cancel reason a pipeline schedule sends to replace its own run held at the decision gate (AII-1432). */
@@ -387,7 +435,9 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     ctx.set("step", "reserve");
 
     // The workflow key is the dispatch id, so a runner callback addresses `KgRefresh/{dispatchId}` directly.
-    const dispatchId = triggerId;
+    // A resumed run (AII-1489) has a key of its own but closes the held run's row, so its dispatch id is the hold's.
+    const resume = input.resume;
+    const dispatchId = resume ? resume.hold.dispatchId : triggerId;
     const jobId = dispatchId;
 
     async function finish(outcome: RefreshOutcome): Promise<RefreshOutcome> {
@@ -574,6 +624,10 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     // merge/delete-branch failure) returns through `finish` normally and never reaches
     // this catch.
     try {
+      // A decision on a held snapshot: no dispatch and no runner wait. `resumeFromHold` and the `mergeAndRunGates`
+      // it ends in are function declarations below, hoisted to the top of this block.
+      if (resume) return await resumeFromHold(resume);
+
       const record = await ctx.run("resolve", () => deps.resolveDispatchRecord(dispatchId));
       await ctx.run("reserve", () => deps.recordDispatchRow(record));
       const { executionMode } = record;
@@ -905,6 +959,54 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         return finish(successOutcome);
       }
 
+      /** The decision on a held snapshot, run as its own `KgRefresh` run: the commit point, `past-merge`, and `status` are the ordinary ones. */
+      async function resumeFromHold(resumed: KgRefreshResume): Promise<RefreshOutcome> {
+        const { hold, action, actor } = resumed;
+        const held = hold.report;
+        const heldPrNumber = held.snapshotPr!;
+        // The runner finished at the gate and its machine was released there: nothing is left to stop.
+        reported = true;
+        reportedSources = held.sources ?? [];
+        ctx.set("sources", reportedSources);
+        reportedWarnings = held.warnings ?? [];
+        reportedGuardVerdict = held.guardVerdict;
+        stepTable = hold.steps;
+        heldPr = { number: heldPrNumber, branch: held.snapshotBranch };
+        heldGate = true;
+        ctx.set("step", "resume");
+
+        if (action === "accept" && held.acceptBlocked === true) {
+          // Defence in depth: `KgRepo.decide` already refuses this. Treat it as a cancel.
+          ctx.console.error(`[KgRefresh] accept refused, snapshot is accept-blocked: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
+          return cleanupCancelled("signal");
+        }
+        if (action === "accept") {
+          ctx.console.log(`[KgRefresh] decided accept by ${actor ?? "unknown"}: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
+          // The note is best effort: the merge is what matters. The step is never interrupted by a Restate
+          // cancel; the commit point sees a cancel that arrives during it.
+          try {
+            await ctx.run("baseline-accept-note", () => postBaselineAcceptNote(deps.rail, owner, repoName, heldPrNumber, actor ?? "unknown"), { maxRetryAttempts: 3 });
+          } catch (err) {
+            if (restate.internal.isSuspendedError(err)) throw err;
+            ctx.console.error(`[KgRefresh] baseline accept note failed for PR #${heldPrNumber}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+          return await mergeAndRunGates(held, true);
+        }
+        if (action === "cancel") {
+          ctx.console.log(`[KgRefresh] decided cancel${actor ? ` by ${actor}` : ""}: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
+          // Only the gate close names the schedule; the run's failure classification stays operator_cancelled.
+          return cleanupCancelled("signal", resumed.reason === KG_REFRESH_SUPERSEDED_REASON ? KG_REFRESH_SUPERSEDED_REASON : undefined);
+        }
+
+        ctx.console.log(`[KgRefresh] decision timeout: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
+        ctx.set("step", "closing");
+        await closeHeldPr("decision_timeout");
+        ctx.set("step", "failed");
+        const at = await ctx.date.now();
+        const outcome = await failurePath(buildFailureOutcome(at, "no decision within the decision timeout"), "decision_timeout");
+        return finish(outcome);
+      }
+
       ctx.set("step", "await-progress");
       const waitResult = await waitForOutcome();
 
@@ -991,74 +1093,38 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
 
       // A held dry-run never reaches here: the dry-run branch above has already returned.
       if (!report.ok && report.failureCode === "KG_SNAPSHOT_HELD" && report.snapshotPr !== undefined) {
-        // Decision gate: the runner opened the snapshot PR and finished. Free the machine, keep the lease, wait for a decision.
+        // Decision gate: the runner opened the snapshot PR and finished. Free the machine, hand the hold to
+        // `KgRepo`, and end the run: nothing waits here, so a deploy need not drain it (AII-1489).
         const heldPrNumber = report.snapshotPr;
         heldPr = { number: heldPrNumber, branch: report.snapshotBranch };
         heldGate = true;
         const heldAt = await ctx.date.now();
         const decideBy = heldAt + decisionTimeoutMs;
-        ctx.set("held", {
-          snapshotPr: heldPrNumber,
-          snapshotCommit: report.snapshotCommit,
-          snapshotBranch: report.snapshotBranch,
-          partTable: report.partTable,
-          cause: report.cause ?? "shrink",
-          failedTeams: report.failedTeams ?? [],
-          acceptBlocked: report.acceptBlocked === true,
-          lostTeams: report.lostTeams ?? [],
-          sources: reportedSources,
-          decideBy,
-        });
-        // After `held`: `decide` must never see step "decision" without the acceptBlocked flag.
-        ctx.set("step", "decision");
         ctx.console.log(`[KgRefresh] held: dispatch ${dispatchId} snapshot PR #${heldPrNumber} awaits a decision until ${new Date(decideBy).toISOString()}`);
         ctx.objectSendClient(FlyMachineProfile, "kg-refresh").release({ dispatchId });
-
-        const decision = await awaitOwnedRun(ctx, {
-          signals: ["decide", "cancel"],
-          resultSignal: "decide",
-          totalDeadlineAt: decideBy,
-          cancelArm,
-          // One sleep to the deadline: a signal still wins the race at once.
-          tickMs: Math.max(1, decideBy - heldAt),
+        // The row first: a resumed run that finishes fast must not see this write land after its own close.
+        ctx.set("step", "held");
+        await ctx.run("close-row-held", () => deps.closeJobLog(jobId, "completed", "awaiting_decision"));
+        // A call, not a send: the hold is stored before this run ends, so the `release` that follows the run always sees it.
+        // `KgRepo`'s exclusive handlers never call this workflow synchronously, so the call cannot deadlock.
+        await ctx.objectClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).hold({
+          triggerId, dispatchId, decideBy, report, steps: stepTable,
         });
-
-        if (decision.kind === "signal" && decision.name === "decide") {
-          const decided = decision.value as KgRefreshDecideInput;
-          if (decided.action === "accept" && report.acceptBlocked === true) {
-            // Defence in depth: `decide` already refuses this. Treat it as a cancel.
-            ctx.console.error(`[KgRefresh] accept refused, snapshot is accept-blocked: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
-            return cleanupCancelled("signal");
-          }
-          if (decided.action === "accept") {
-            ctx.console.log(`[KgRefresh] decided accept by ${decided.actor}: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
-            // The note is best effort: the merge is what matters. The step is never interrupted by a Restate
-            // cancel; the commit point sees a cancel that arrives during it.
-            try {
-              await ctx.run("baseline-accept-note", () => postBaselineAcceptNote(deps.rail, owner, repoName, heldPrNumber, decided.actor), { maxRetryAttempts: 3 });
-            } catch (err) {
-              if (restate.internal.isSuspendedError(err)) throw err;
-              ctx.console.error(`[KgRefresh] baseline accept note failed for PR #${heldPrNumber}: ${err instanceof Error ? err.message : String(err)}`);
-            }
-            return await mergeAndRunGates(report, true);
-          }
-          ctx.console.log(`[KgRefresh] decided cancel by ${decided.actor}: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
-          return cleanupCancelled("signal");
+        heldPr = undefined; // the hold owns the PR now
+        // A Stop that arrived after the report was taken (or while the hold was being stored) has no run to read it
+        // any more. The hold exists now, so it goes through the one decision door.
+        const stop = await ctx.promise<string>("cancel").peek();
+        if (stop !== undefined) {
+          ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).decide({
+            action: "cancel", triggerId,
+            ...(stop === KG_REFRESH_SUPERSEDED_REASON ? { reason: KG_REFRESH_SUPERSEDED_REASON } : {}),
+          });
         }
-        if (decision.kind === "signal") {
-          ctx.console.log(`[KgRefresh] cancel signal while held: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
-          // Only the gate close names the schedule; the run's failure classification stays operator_cancelled.
-          return cleanupCancelled("signal", decision.value === KG_REFRESH_SUPERSEDED_REASON ? KG_REFRESH_SUPERSEDED_REASON : undefined);
-        }
-
-        ctx.console.log(`[KgRefresh] decision timeout: dispatch ${dispatchId} snapshot PR #${heldPrNumber}`);
-        // `decide` answers no-decision-open from here on.
-        ctx.set("step", "closing");
-        await closeHeldPr("decision_timeout");
-        ctx.set("step", "failed");
         const at = await ctx.date.now();
-        const outcome = await failurePath(buildFailureOutcome(at, "no decision within the decision timeout"), "decision_timeout");
-        return finish(outcome);
+        return finish({
+          ok: false, at, detail: `held for a decision until ${new Date(decideBy).toISOString()}`,
+          stampBefore: null, stampAfter: null, conclusion: "awaiting_decision", held: true,
+        });
       }
 
       if (!report.ok || report.snapshotPr === undefined || report.snapshotCommit === undefined) {
@@ -1201,30 +1267,6 @@ function toStepRecord(step: Step): KgRefreshStepRecord {
   };
 }
 
-  async function decide(ctx: WorkflowSharedContext, input: KgRefreshDecideInput): Promise<void> {
-    await requireStarted(ctx);
-    // Peek first: once decided the workflow may leave the decision step, and a second call must still answer already-decided.
-    // Producers: AII-1257. The value is the input object, never undefined, so the deadline peek sees it.
-    const promise = ctx.promise<KgRefreshDecideInput>("decide");
-    const recorded = await promise.peek();
-    if (recorded !== undefined) {
-      // A cancel after an accept still stops the run until the commit point, then answers past-merge.
-      if (recorded.action === "accept" && input.action === "cancel") {
-        await requestCancel(ctx, "cancelled");
-        return;
-      }
-      throw new restate.TerminalError("already-decided", { errorCode: 409 });
-    }
-    if ((await ctx.get<string>("step")) !== "decision") {
-      throw new restate.TerminalError("no-decision-open", { errorCode: 409 });
-    }
-    // The gate, not the page, enforces the rule: a blocked hold answers accept with 409 and stays open.
-    if (input.action === "accept" && (await ctx.get<{ acceptBlocked?: boolean }>("held"))?.acceptBlocked === true) {
-      throw new restate.TerminalError("accept-blocked", { errorCode: 409 });
-    }
-    await promise.resolve(input);
-  }
-
   async function status(ctx: WorkflowSharedContext): Promise<KgRefreshStatusResult> {
     const [step, startedAt, triggerId, runId, dryRun, sources] = await Promise.all([
       ctx.get<string>("step"),
@@ -1244,14 +1286,7 @@ function toStepRecord(step: Step): KgRefreshStepRecord {
       const running = await ctx.promise<Step>(`step:${id}:running`).peek();
       if (running !== undefined) runnerStep = { id, status: running.status };
     }
-    let decisions: KgRefreshStatusResult["decisions"] = [];
-    let held: KgRefreshStatusResult["held"] = null;
-    if (step === "decision") {
-      const stored = await ctx.get<{ snapshotPr: number; partTable?: KgRefreshHeldView["partTable"]; cause?: KgRefreshHeldView["cause"]; failedTeams?: string[]; acceptBlocked?: boolean; lostTeams?: KgRefreshHeldView["lostTeams"]; sources?: SourceResult[]; decideBy: number }>("held");
-      if (stored) held = { snapshotPr: stored.snapshotPr, partTable: stored.partTable ?? [], cause: stored.cause ?? "shrink", failedTeams: stored.failedTeams ?? [], acceptBlocked: stored.acceptBlocked === true, lostTeams: stored.lostTeams ?? [], sources: stored.sources ?? [], decideBy: stored.decideBy };
-      if ((await ctx.promise<KgRefreshDecideInput>("decide").peek()) === undefined) decisions = held?.acceptBlocked ? ["cancel"] : ["accept", "cancel"];
-    }
-    return { step: step ?? null, startedAt: startedAt ?? null, triggerId: triggerId ?? null, runId: runId ?? null, dryRun: dryRun === true, runnerStep, decisions, held, sources: sources ?? [] };
+    return { step: step ?? null, startedAt: startedAt ?? null, triggerId: triggerId ?? null, runId: runId ?? null, dryRun: dryRun === true, runnerStep, decisions: [], held: null, sources: sources ?? [] };
   }
 
   return restate.workflow({
@@ -1273,11 +1308,6 @@ function toStepRecord(step: Step): KgRefreshStepRecord {
         journalRetention: retentionMs,
         idempotencyRetention: retentionMs,
       }, cancel),
-      decide: restate.handlers.workflow.shared({
-        input: serde.zod(kgRefreshDecideSchema),
-        journalRetention: retentionMs,
-        idempotencyRetention: retentionMs,
-      }, decide),
       status: restate.handlers.workflow.shared(status),
     },
     options: {
