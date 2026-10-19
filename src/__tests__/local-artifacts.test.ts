@@ -1,7 +1,6 @@
-import { afterEach, describe, it, expect } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { describe, it, expect } from "vitest";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { symlink } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import {
   validateRunId,
@@ -321,13 +320,9 @@ describe("writeRunArtifacts attribution (AII-971)", () => {
     usage: { availability: "partial" as const, tokensIn: 5, tokensOut: null, costUsd: null, costStatus: "unavailable" as const },
   };
   const read = async (input: LocalArtifactInput) => {
-    const root = mkdtempSync(join(tmpdir(), "attr-art-"));
-    dirs.push(root);
-    const dir = await writeRunArtifacts({ ...input, outputRoot: root });
+    const dir = await writeRunArtifacts({ ...input, outputRoot: testDir("attr-art") });
     return JSON.parse(readFileSync(join(dir, "summary.json"), "utf-8")) as Record<string, unknown>;
   };
-  const dirs: string[] = [];
-  afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
 
   it("omits the key for legacy runs", async () => {
     expect(await read(baseInput())).not.toHaveProperty("attribution");

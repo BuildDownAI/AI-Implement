@@ -31,13 +31,12 @@ import { spawnSync } from "node:child_process";
 import { implementStep } from "../pipeline/steps/implement.js";
 import { reviewStep } from "../pipeline/steps/review.js";
 import { feedbackLoopStep, projectStageReport } from "../pipeline/steps/feedback-loop.js";
-import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import { DEFAULT_RETRY_POLICY, computeBackoffMs } from "../pipeline/retry-backoff.js";
 import type { FailureRecord } from "../pipeline/failure-classification.js";
 import type { LLMExecutor, Step, StepReporter } from "../pipeline/types.js";
 import { makeSnapshot } from "./helpers/fixtures/configured-run.js";
-import { makeContext } from "./helpers/builders.js";
+import { makeContext, makeExecutor } from "./helpers/builders.js";
 import { testDir } from "./helpers/test-dir.js";
 
 /** No-op sleep so a retry test never actually waits out the real backoff delay. */
@@ -1476,15 +1475,7 @@ describe("feedback-loop core isolation (AII-626)", () => {
 describe("feedbackLoopStep — configured stage reports (AII-964)", () => {
   // implementation = codex (timeout 2000), review = claude (timeout 3000)
   const snapshot = makeSnapshot();
-  const configured = (invoke: LLMExecutor["invoke"] = vi.fn()) =>
-    new DefaultPipelineContext(
-      {
-        jobId: 1, issueId: "issue-1", issueIdentifier: "ENG-1", issueTitle: "Test",
-        issueDescription: "Description", nonce: "nonce", orchestratorUrl: "http://localhost:8080",
-        agentConfig: snapshot,
-      },
-      { invoke },
-    );
+  const configured = (invoke: LLMExecutor["invoke"] = makeExecutor().invoke) => makeContext({ agentConfig: snapshot }, { invoke });
   const collect = () => {
     const steps: Step[] = [];
     const reporter: StepReporter = { report: vi.fn(async (step) => { steps.push(structuredClone(step)); }) };
@@ -1526,10 +1517,7 @@ describe("feedbackLoopStep — configured stage reports (AII-964)", () => {
     claudeImpl.stages.implementation = { ...claudeImpl.stages.implementation, agent: "claude", provider: "anthropic", model: "claude-impl" };
     vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
     const { steps, reporter } = collect();
-    const ctx = new DefaultPipelineContext(
-      { jobId: 1, issueId: "i", issueIdentifier: "E-1", issueTitle: "T", issueDescription: "D", nonce: "n", orchestratorUrl: "http://localhost:8080", agentConfig: claudeImpl },
-      { invoke: vi.fn() },
-    );
+    const ctx = makeContext({ agentConfig: claudeImpl }, makeExecutor());
 
     await feedbackLoopStep.run(ctx, { ...baseInputs, maxTurns: 40 }, reporter);
 
@@ -1565,13 +1553,13 @@ describe("feedbackLoopStep — configured stage reports (AII-964)", () => {
 
   it("runs the post-mortem with the review selection, agentStage review, and reports its own cap", async () => {
     vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
-    const invoke = vi.fn().mockResolvedValue({ stdout: "## Post-mortem\nout of turns", exitCode: 0, tokensUsed: 1 });
+    const { invoke } = makeExecutor({ stdout: "## Post-mortem\nout of turns", tokensUsed: 1 });
     const { steps, reporter } = collect();
 
     const outputs = await feedbackLoopStep.run(configured(invoke), { ...baseInputs, maxTurns: 40 }, reporter);
 
     expect(outputs.terminationReason).toBe("max_turns");
-    const call = invoke.mock.calls[0][0];
+    const call = vi.mocked(invoke).mock.calls[0][0];
     expect(call.agentStage).toBe("review");
     expect(call.stage).toBe("feedback-loop/post-mortem-1");
     expect(call.expectsStructuredOutput).toBe(false);
@@ -1595,27 +1583,19 @@ describe("feedbackLoopStep — configured stage reports (AII-964)", () => {
 
   it("legacy post-mortem sends agentStage review and keeps the existing report shape", async () => {
     vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
-    const invoke = vi.fn().mockResolvedValue({ stdout: "pm", exitCode: 0, tokensUsed: 1 });
+    const executor = makeExecutor({ stdout: "pm", tokensUsed: 1 });
     const { steps, reporter } = collect();
 
-    await feedbackLoopStep.run(makeContext({}, { invoke }), { ...baseInputs, maxTurns: 40 }, reporter);
+    await feedbackLoopStep.run(makeContext({}, executor), { ...baseInputs, maxTurns: 40 }, reporter);
 
-    expect(invoke.mock.calls[0][0].agentStage).toBe("review");
+    expect(vi.mocked(executor.invoke).mock.calls[0][0].agentStage).toBe("review");
     expect(steps.find((s) => s.id === "post-mortem.1")!.inputs).toEqual({ iteration: 1, maxTurns: 40 });
   });
 });
 
 describe("feedbackLoopStep — configured stage reports, coverage (AII-964)", () => {
   const snapshot = makeSnapshot();
-  const configured = (invoke: LLMExecutor["invoke"] = vi.fn()) =>
-    new DefaultPipelineContext(
-      {
-        jobId: 1, issueId: "issue-1", issueIdentifier: "ENG-1", issueTitle: "Test",
-        issueDescription: "Description", nonce: "nonce", orchestratorUrl: "http://localhost:8080",
-        agentConfig: snapshot,
-      },
-      { invoke },
-    );
+  const configured = (invoke: LLMExecutor["invoke"] = makeExecutor().invoke) => makeContext({ agentConfig: snapshot }, { invoke });
   const collect = () => {
     const steps: Step[] = [];
     const reporter: StepReporter = { report: vi.fn(async (step) => { steps.push(structuredClone(step)); }) };
@@ -1772,16 +1752,13 @@ describe("feedbackLoopStep — configured stage reports, coverage (AII-964)", ()
     const codexReview = makeSnapshot();
     codexReview.stages.review = { ...codexReview.stages.review, agent: "codex", provider: "openai", model: "gpt-rev" };
     vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
-    const invoke = vi.fn().mockResolvedValue({ stdout: "pm", exitCode: 0, tokensUsed: 1 });
+    const executor = makeExecutor({ stdout: "pm", tokensUsed: 1 });
     const { steps, reporter } = collect();
-    const ctx = new DefaultPipelineContext(
-      { jobId: 1, issueId: "i", issueIdentifier: "E-1", issueTitle: "T", issueDescription: "D", nonce: "n", orchestratorUrl: "http://localhost:8080", agentConfig: codexReview },
-      { invoke },
-    );
+    const ctx = makeContext({ agentConfig: codexReview }, executor);
 
     await feedbackLoopStep.run(ctx, baseInputs, reporter);
 
-    expect(invoke.mock.calls[0][0].agentStage).toBe("review");
+    expect(vi.mocked(executor.invoke).mock.calls[0][0].agentStage).toBe("review");
     for (const pm of steps.filter((s) => s.id === "post-mortem.1")) {
       expect(pm.inputs).toEqual({ iteration: 1, model: "gpt-rev", invocationTimeoutMs: 3000 });
     }
