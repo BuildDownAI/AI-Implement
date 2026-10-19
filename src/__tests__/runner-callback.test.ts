@@ -25,6 +25,7 @@ import type {
   ResultIntakeOutcome,
 } from "../review-fix-contract.js";
 import { makeAppendLogEntry, makeIssue, makeReviewFixResult } from "./helpers/builders.js";
+import { activityAccepted, cycleSummaryRecorded, noPlanningContext, progressAccepted, resultAccepted, reviewFixResultStored } from "./helpers/replies/orchestrator.js";
 import { testDb } from "./helpers/test-db.js";
 
 // ---------- Hoisted mocks for AII-749 lease-rejected handling ----------
@@ -289,6 +290,7 @@ describe("handleRunnerResult — planning", () => {
       resolveProvider: makeResolve(fake),
     });
     expect(res.status).toBe(200);
+    expect(res.body).toEqual(resultAccepted.json);
     expect(fake.commentsFor("i")).toEqual(["first", "second"]);
     expect(fake.getPhase("i")).toBe("plan_complete");
   });
@@ -817,6 +819,7 @@ describe("handleRunnerResult — implementation", () => {
       resolveProvider: makeResolve(fake),
     });
     expect(res.status).toBe(200);
+    expect(res.body).toEqual(resultAccepted.json);
     expect(fake.getPhase("i")).toBe("pr_ready");
     const calls = fake.recordedCalls();
     expect(calls.find((c) => c.method === "markPrReady")?.args).toEqual([
@@ -2013,7 +2016,7 @@ describe("handleRunnerProgress", () => {
       secret: SECRET,
     });
 
-    expect(first.status).toBe(200);
+    expect(first).toEqual({ status: 200, body: progressAccepted.json });
     expect(second.status).toBe(200);
     expect(stepLog.getStepsByJobId(jobId)).toMatchObject([
       {
@@ -2324,8 +2327,7 @@ describe("handleRunnerPlanningContext", () => {
       secret: SECRET,
       resolveProvider: makeResolve(null),
     });
-    expect(res.status).toBe(200);
-    expect(res.body.planningContext).toBe("");
+    expect(res).toEqual({ status: 200, body: noPlanningContext.json });
   });
 });
 
@@ -4945,7 +4947,7 @@ describe("handleRunnerCycleSummary — independent pilot evidence", () => {
     const post = (entry: CycleSummary) => runnerCallback.handleRunnerCycleSummary({
       authorization: `Bearer ${token}`, secret: SECRET, body: { summary: entry },
     });
-    expect(post(summary)).toMatchObject({ status: 200, body: { outcome: "recorded" } });
+    expect(post(summary)).toEqual({ status: 200, body: cycleSummaryRecorded.json });
     expect(reviewFixEvidence.getReviewFixCycleSummary(attemptId, 1)?.tests).toEqual(summary.tests);
     expect(post(summary)).toMatchObject({ status: 200, body: { outcome: "duplicate" } });
     expect(post({ ...summary, completedAt: summary.completedAt + 1 }).status).toBe(409);
@@ -5002,7 +5004,7 @@ describe("reviewFixResultIntakeResponse (AII-777)", () => {
       status: "stored",
       result: makeReviewFixResult(),
     });
-    expect(res).toEqual({ status: 200, body: { acknowledged: true, outcome: "stored", retryable: false } });
+    expect(res).toEqual({ status: 200, body: reviewFixResultStored.json });
   });
 
   it("maps 'duplicate' to 200 acknowledged, non-retryable, carrying attemptId", () => {
@@ -5132,7 +5134,7 @@ describe("handleRunnerActivity (AII-777/AII-803)", () => {
       },
       onReviewFixActivity: (batch) => ({ status: "accepted", attemptId: batch.attemptId }),
     });
-    expect(res.status).toBe(200);
+    expect(res).toEqual({ status: 200, body: activityAccepted("attempt-1").json });
   });
 
   it("rejects a non-object body", async () => {

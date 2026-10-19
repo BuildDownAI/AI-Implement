@@ -151,7 +151,8 @@ export function makeReviewFixResult(overrides: Partial<ReviewFixResultMetadataV1
 }
 
 // The envelope the review-fix worker launches a pilot attempt with (buildLaunchInputs, src/review-fix-worker.ts) for a mapping
-// with no optional settings: a gap-fill on the attempt's PR, whose issue and PR number derive from the attempt.
+// with no optional settings: a gap-fill on the attempt's PR, whose issue and PR number derive from the attempt, carrying
+// the orchestrator's retry policy as every non-planning envelope does (here the values of a never-edited Settings policy).
 export function makeReviewFixRunConfig(
   reviewFix: Partial<ReviewFixMetadataV1> = {},
   overrides: Partial<RunConfigV1> = {},
@@ -176,6 +177,7 @@ export function makeReviewFixRunConfig(
     runnerCallbackUrl: "https://orchestrator.example",
     prNumber: String(attempt.prNumber),
     commentInstruction: taskText,
+    retryPolicy: { requestRetries: 2, stageRetries: 1, pushRetries: 2, backoffInitialMs: 30_000, backoffMaxMs: 300_000, backoffJitter: 0.2, reviewMaxTurns: 30 },
     reviewFix: attempt,
     ...overrides,
   };

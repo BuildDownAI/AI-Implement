@@ -12,6 +12,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { postRunnerResult } from "../runner-result.js";
 import { kgTrackerDataStep } from "../pipeline/steps/kg-tracker-data.js";
 import { fakeFetch } from "./helpers/fake-fetch.js";
+import { kgRefreshResultAccepted, progressAccepted } from "./helpers/replies/orchestrator.js";
 import { testDb } from "./helpers/test-db.js";
 import { testDir } from "./helpers/test-dir.js";
 
@@ -39,7 +40,7 @@ describe("kg-refresh callback-URL contract", () => {
   // ---- Runner-side client contracts ----
 
   it("postRunnerResult resolves to POST /runner/result — a served route", async () => {
-    const orchestrator = fakeFetch({ "POST /runner/result": { json: { acknowledged: true } } });
+    const orchestrator = fakeFetch({ "POST /runner/result": kgRefreshResultAccepted });
 
     const savedToken = process.env.RUN_TOKEN;
     process.env.RUN_TOKEN = "tok-123";
@@ -149,9 +150,9 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
   it("accepts an identical callback twice without consuming the token", async () => {
     const { token, dispatchId } = mint();
     const c = client();
-    expect(await run(token, c)).toEqual({ status: 200, body: { acknowledged: true } });
+    expect(await run(token, c)).toEqual({ status: 200, body: kgRefreshResultAccepted.json });
     expect(consumedAt(dispatchId)).toBeNull();
-    expect(await run(token, c)).toEqual({ status: 200, body: { acknowledged: true } });
+    expect(await run(token, c)).toEqual({ status: 200, body: kgRefreshResultAccepted.json });
     expect(consumedAt(dispatchId)).toBeNull();
     expect(c.repoStatus).not.toHaveBeenCalled();
     expect(c.report).toHaveBeenCalledWith(
@@ -199,7 +200,7 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
     const out = await callback.handleRunnerProgress({
       authorization: `Bearer ${token}`, body: {}, secret: SECRET, kgRefreshClient: c as never, kgSourceRepo: SLUG,
     });
-    expect(out).toEqual({ status: 200, body: { acknowledged: true } });
+    expect(out).toEqual({ status: 200, body: progressAccepted.json });
     expect(c.progress).toHaveBeenCalledWith(dispatchId);
     expect(c.repoStatus).not.toHaveBeenCalled();
 

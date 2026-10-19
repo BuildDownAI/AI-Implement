@@ -6,6 +6,7 @@ import type Database from "better-sqlite3";
 import { testDir, testTempRoot } from "../test-dir.js";
 import { testDb } from "../test-db.js";
 import { fakeFetch, hangUntilAborted } from "../fake-fetch.js";
+import { putAppSecretsVersioned } from "../../../fly-machines.js";
 import { flySecretsUpdated } from "../replies/fly.js";
 import { githubError, githubFile } from "../replies/github.js";
 import { linearData, linearGraphql } from "../replies/linear.js";
@@ -466,6 +467,12 @@ describe("flySecretsUpdated", () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ Version: 7, version: 7 });
+  });
+
+  it("is a reply the Machines client reads the version from", async () => {
+    fakeFetch({ "POST /v1/apps/sessions/secrets": flySecretsUpdated(7) }).install();
+
+    expect(await putAppSecretsVersioned("fly-token", "sessions", { KEY: "value" })).toBe(7);
   });
 });
 

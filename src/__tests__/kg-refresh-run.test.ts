@@ -12,6 +12,7 @@ import { resolveRunnerImageForDispatch, __clearRepoImageCacheForTests } from "..
 import { makeContext as makeBaseContext, makeExecutor, makeMapping } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type Reply, type Routes } from "./helpers/fake-fetch.js";
 import { githubFile } from "./helpers/replies/github.js";
+import { kgRefreshResultAccepted, progressAccepted } from "./helpers/replies/orchestrator.js";
 import { testDir } from "./helpers/test-dir.js";
 
 // Pass-through spy: every test keeps the real refresh unless it overrides the
@@ -2520,11 +2521,10 @@ function makeStepModule(outputs: Record<string, unknown> = {}, throwErr?: Error)
 const RESULT = "POST /runner/result";
 const PROGRESS = "POST /runner/progress";
 const KG_SCOPE = "POST /api/runner/kg-scope";
-const acknowledged: Reply = { json: { acknowledged: true } };
 
-/** The orchestrator's runner routes for a kg-refresh run: the result route acknowledges, as the KgRefresh workflow's handler does. */
+/** The orchestrator's runner routes for a kg-refresh run: the result route accepts the report. */
 function runnerApi(routes: Routes = {}): FakeFetch {
-  return fakeFetch({ [RESULT]: acknowledged, ...routes });
+  return fakeFetch({ [RESULT]: kgRefreshResultAccepted, ...routes });
 }
 
 function resultBodies(orchestrator: FakeFetch): Array<Record<string, unknown>> {
@@ -2737,7 +2737,7 @@ describe("runKgRefresh", () => {
 
     /** The orchestrator for a run with a callback URL and a progress token. The real kg-scope-reconcile step reaches it
      *  through the global fetch, the reporter and the result post through `fetchImpl`; its mapping set is empty. */
-    function recorder(progress: Reply = acknowledged) {
+    function recorder(progress: Reply = progressAccepted) {
       const orchestrator = runnerApi({ [PROGRESS]: progress, [KG_SCOPE]: { json: [] } }).install();
       const calls = () => orchestrator.calls.map((c) => ({
         url: c.url.href,

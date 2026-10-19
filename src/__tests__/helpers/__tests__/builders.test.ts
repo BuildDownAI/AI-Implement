@@ -1,9 +1,10 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { parseChatGptPlanRecord } from "../../../chatgpt-plan-token.js";
 import { getMappings, initMappingsTable, upsertMapping } from "../../../config.js";
 import { runDevHarnessCli } from "../../../dev-harness/cli.js";
 import { parseTaskFile } from "../../../dev-harness/task-file.js";
 import { parseModelAuthGrantBootstrap, toSafeGrantMetadata } from "../../../model-auth-contract.js";
+import { normalizeRetryPolicy } from "../../../pipeline/retry-backoff.js";
 import { ProviderRegistry } from "../../../providers/registry.js";
 import { validateReviewFixResultMetadata, validateScopedPrIdentity } from "../../../review-fix-contract.js";
 import { decodeRunConfig, encodeRunConfig } from "../../../run-config.js";
@@ -165,6 +166,11 @@ describe("makeReviewFixRunConfig", () => {
     expect(decodeRunConfig(encodeRunConfig(config))).toEqual(config);
     expect(config.reviewFix).toMatchObject(makeScopedPrIdentity());
     expect(config.reviewFix!.deadlineAt).toBeGreaterThan(Date.now());
+  });
+
+  it("carries a retry policy the runner's guard keeps unchanged", () => {
+    const { retryPolicy } = makeReviewFixRunConfig();
+    expect(normalizeRetryPolicy(retryPolicy)).toEqual(retryPolicy);
   });
 
   it("derives the issue and PR number from the attempt", () => {
@@ -443,6 +449,15 @@ describe("makeLaunchDecision (fixtures/configured-run.ts)", () => {
     expect(parseModelAuthGrantBootstrap(bootstrap)).toEqual({ ok: true, value: bootstrap });
     expect(bootstrap.backend).toBe(grantBackend);
     expect(decision).toMatchObject({ kind: "launch", backend, snapshot, dispatchId: bootstrap.dispatchId, projectKey: bootstrap.projectKey });
+    expect(decision.grant).toEqual(toSafeGrantMetadata(bootstrap));
+  });
+
+  it("mints its grant on the real clock, expiring four hours after the build as the orchestrator's do", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    onTestFinished(() => void vi.useRealTimers());
+    const { decision, bootstrap } = makeLaunchDecision(makeSnapshot(), "github-actions");
+    expect(bootstrap.expiresAt).toBe(Date.now() + 4 * 60 * 60 * 1000);
     expect(decision.grant).toEqual(toSafeGrantMetadata(bootstrap));
   });
 

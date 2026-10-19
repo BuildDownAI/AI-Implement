@@ -6,6 +6,7 @@ import { dirname } from "node:path";
 import { runPlanning, runPlanningLocally } from "../run-planning.js";
 import { encodeRunConfig, encodeTrustedRunConfig, type ResolvedAgentSnapshotV1 } from "../run-config.js";
 import { fakeFetch, type FakeFetch, type FetchCall } from "./helpers/fake-fetch.js";
+import { resultAccepted } from "./helpers/replies/orchestrator.js";
 import { testDir } from "./helpers/test-dir.js";
 import { AgentRecoveryRequiredError } from "../pipeline/stage-executor.js";
 import { MODEL_AUTH_ROUTES } from "../model-auth-contract.js";
@@ -45,9 +46,6 @@ type RunnerResultPayload = {
   comments: Array<{ body: string }>;
   failureReason?: string;
 };
-
-/** The result route's answer to a planning result (`handleRunnerResult`, src/runner-callback.ts). */
-const RESULT_ACCEPTED = { json: { acknowledged: true, warnings: [] } };
 
 /** The legacy runner environment a planning run starts with. */
 function setEnv() {
@@ -92,7 +90,7 @@ describe("runPlanning", () => {
       );
       return { status: 0, stdout: "", stderr: "" };
     };
-    const orchestrator = fakeFetch({ "POST /runner/result": RESULT_ACCEPTED });
+    const orchestrator = fakeFetch({ "POST /runner/result": resultAccepted });
     vi.stubEnv("RUNNER_CALLBACK_URL", "http://orch");
     vi.stubEnv("RUN_TOKEN", "tok");
 
@@ -116,7 +114,7 @@ describe("runPlanning", () => {
     writeFileSync(join(ws, "PLANNING.md"), "---\nmodel: m\n---\nbody");
     vi.stubEnv("RUNNER_CALLBACK_URL", "http://orch");
     vi.stubEnv("RUN_TOKEN", "tok");
-    const orchestrator = fakeFetch({ "POST /runner/result": RESULT_ACCEPTED });
+    const orchestrator = fakeFetch({ "POST /runner/result": resultAccepted });
     const result = await runPlanning({
       workspaceDir: ws,
       executor: () => ({ status: 1, stdout: "", stderr: "boom" }),
@@ -168,7 +166,7 @@ describe("runPlanning", () => {
       issue: { id: "e-1", identifier: "AII-9", title: "Envelope issue", description: "From envelope." },
       runnerCallbackUrl: "https://orch.example/callback",
     }));
-    const orchestrator = fakeFetch({ "POST /callback/runner/result": RESULT_ACCEPTED });
+    const orchestrator = fakeFetch({ "POST /callback/runner/result": resultAccepted });
     const result = await runPlanning({
       workspaceDir: ws,
       executor: () => ({ status: 0, stdout: "", stderr: "" }),
@@ -409,7 +407,7 @@ describe("planning write policy wiring", () => {
     let ran = false;
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orch.example/callback");
     vi.stubEnv("RUN_TOKEN", "t");
-    const orchestrator = fakeFetch({ "POST /callback/runner/result": RESULT_ACCEPTED });
+    const orchestrator = fakeFetch({ "POST /callback/runner/result": resultAccepted });
     const r = await runPlanning({
       workspaceDir: join(testDir("plan-wire"), "does-not-exist"),
       executor: () => {
@@ -501,7 +499,7 @@ describe("configured planning (shared prepareConfiguredRun + selected stage exec
   const recordResult = (call: FetchCall) => {
     urls.push(call.url.href);
     posted.push(JSON.parse(call.body));
-    return RESULT_ACCEPTED;
+    return resultAccepted;
   };
   const legacy = vi.fn(() => ({ status: 0, stdout: "", stderr: "" }));
   const okResult: LLMResult = { stdout: "done", exitCode: 0, tokensUsed: 1 };
