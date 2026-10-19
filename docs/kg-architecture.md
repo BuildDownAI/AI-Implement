@@ -376,10 +376,49 @@ A PR that touches `kg_ingest/**`, `sources.yml`, `ontology/**`, or `snapshot/**`
 source repo (`kg.sourceRepo` in the `get_project_binding` answer) or the configured base template repo (Settings → KG Refresh · "Base
 template repo", seeded once from `KG_BASE_REPO`), or whose head branch matches `kg-upstream/*` or
 `sync/upstream-*` (an upstream merge, guard-relevant regardless of which files it happens to touch),
-gets the same dry run described above run against the PR's head instead of the default branch: the
-webhook (`opened` / `synchronize`) dispatches `trigger({ dryRun: true, ref: <head branch>, report })`,
-which runs `kg-snapshot-push`'s guards without committing or pushing. A PR that changes nothing guard-relevant — docs, an unrelated code path — gets no dispatch at
+gets a dry run: the webhook (`opened` / `synchronize`) dispatches a run that executes
+`kg-snapshot-push`'s guards without committing or pushing. A PR that changes nothing guard-relevant — docs, an unrelated code path — gets no dispatch at
 all.
+
+**KG-repo PRs are unchanged.** A PR on the KG source repo dispatches
+`trigger({ dryRun: true, ref: <head branch>, report })`, so the run clones the PR's head branch.
+
+**Base-repo PRs** run the KG repo's default branch with the PR merged in, because the PR's branch
+exists only in the base repo and GitHub rejects a dispatch on it (AII-735). The webhook sends
+`baseMerge: { repo, prNumber, baseSha, headSha }` instead of `ref` (see "Base-repo PR dry runs"
+below). The runner's `kg-base-merge` step, which runs between `clone` and `kg-scope-reconcile`,
+merges into the scratch clone only (never pushed); the rebuild then runs without saving the graph.
+It merges twice: first the PR's target commit (`baseSha`), and only when that is clean, the PR head
+(`headSha`). A conflict in ingest paths while merging the target means the KG repo has drifted from
+base, so the check reports "Not checked" and does not block. Step detail:
+[docs/issueless-runs.md](issueless-runs.md) § "Base merge step".
+
+| Path | Conflicted | Not conflicted |
+| -- | -- | -- |
+| `kg_ingest/`, `kg_query/`, `ontology/`, `tests/`, `pyproject.toml`, `uv.lock`, `requirements.txt`, `requirements-oxigraph.txt` | Reported as a conflict | Merged |
+| `sources.yml`, `snapshot/**` | KG repo's version kept | KG repo's version kept |
+| Every other path | KG repo's version kept | Merged |
+
+Verdicts on a base-repo PR (`baseMergeDetail` and `dryRunStatusDescription`, `src/kg-refresh-rail.ts`).
+A commit status has no neutral state, so "Not checked" is `success`; a `failure` would block the base
+PR until the base is merged into the KG repo.
+
+| # | Situation | Status |
+| -- | -- | -- |
+| 1 | The PR's target commit conflicts in ingest paths (the KG repo is behind) | `success`, `Not checked: KG repo is behind base (upstream merge needed)` |
+| 2 | The target is clean; the PR head conflicts in ingest paths | `failure`, `PR conflicts with KG repo ingest code: <n> files` |
+| 3 | Both clean; ingest and guards pass | `success` |
+| 4 | Both clean; a guard refuses | `failure` (ordinary rendering with the part table) |
+| 5 | Both clean; a later step fails (for example `KG_INGEST_FAILED`) | `failure` (ordinary failed rendering; the runner still echoes `baseMerge: merged`) |
+| 6 | The base commits cannot be fetched | `failure`, `Base PR fetch failed` |
+| 7 | The run succeeded but sent no merge echo (the runner image predates the merge step) | `success`, `Not checked: runner image does not support base merges` |
+| 7b | The run failed with no merge echo and no `KG_BASE_*` code (a failure before `kg-base-merge`, or a non-conflict git error inside it) | `failure`, `Dry run failed before the base merge` |
+| 8 | A KG-repo PR | unchanged |
+
+The sticky comment names the merged commit only on merged rows (3–5), as
+`Base PR head <12 chars> merged into <kgSourceRepo>@default branch`; the branch name is literal text.
+A live (non-dry) run carrying a base-merge request is refused (`KG_BASE_MERGE_REFUSED`). Verdict
+detail: [docs/issueless-runs.md](issueless-runs.md) § "Base-merge verdicts".
 
 The verdict always lands as a sticky PR comment headed `## kg-refresh dry-run — <sha>`, updated in
 place (not duplicated) on every subsequent push, carrying the per-part line-count table
