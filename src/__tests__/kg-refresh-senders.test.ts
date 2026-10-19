@@ -4,6 +4,7 @@ import { createKgRefreshSenders, type KgRefreshSendInput, type KgRefreshSenderDe
 import { syncRowToMachineNonce, type KeptMachineFly } from "../restate/kg-refresh-production.js";
 import type { CreateMachineOpts, Machine } from "../fly-machines.js";
 import { decodeRunConfig, type RunConfigV1 } from "../run-config.js";
+import { RunnerImageNotAllowedError } from "../repo-image.js";
 
 vi.mock("../restate/kg-refresh-production.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../restate/kg-refresh-production.js")>()),
@@ -360,4 +361,20 @@ describe("GitHub Actions rejection detail", () => {
     const result = await createKgRefreshSenders(deps)["github-actions"](makeInput({ machineNonce: null }));
     expect(result).not.toHaveProperty("detail");
   });
+});
+
+describe("runner image refusal detail", () => {
+  for (const mode of ["fly-machines", "github-actions"] as const) {
+    it(`${mode} rejects with the error message as detail`, async () => {
+      const error = new RunnerImageNotAllowedError("evil/image:1", "acme", ["ghcr.io/acme/"], "kg");
+      const { deps } = makeDeps({
+        resolveRunnerImage: vi.fn(async () => {
+          throw error;
+        }) as never,
+      });
+      const result = await createKgRefreshSenders(deps)[mode](makeInput({ machineNonce: mode === "fly-machines" ? "nonce" : null }));
+      expect(result.outcome).toBe("rejected");
+      expect(result.detail).toBe(error.message);
+    });
+  }
 });
