@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import os from "node:os";
 import { readFileSync } from "node:fs";
 import type * as DeployModule from "../deploy.js";
+import type * as InFlightModule from "../in-flight-work.js";
+import type * as LogModule from "../log.js";
 import { RestateDrainCoordinator } from "../restate/drain.js";
 import { fakeFetch } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
@@ -206,21 +208,27 @@ describe("endpoint drain barrier", () => {
 });
 
 describe("waitForQuiet and a held KG refresh", () => {
-  let closeDb: () => void;
+  // One test database for deploy, log and in-flight-work, so waitForQuiet reads the rows the test seeds.
+  let modules: { deploy: typeof DeployModule; log: typeof LogModule; inFlight: typeof InFlightModule };
 
   beforeEach(async () => {
-    // The outer beforeEach reset the module registry and pointed DEDUP_DB_PATH at a fresh file.
-    const log = await import("../log.js");
-    log.initLogTable();
-    closeDb = (await import("../dedup.js")).closeDb;
+    ({ modules } = await testDb({
+      modules: { deploy: () => import("../deploy.js"), log: () => import("../log.js"), inFlight: () => import("../in-flight-work.js") },
+    }));
   });
 
-  afterEach(() => closeDb?.());
-
-  async function seedKgRefreshRow(status: "completed" | "running", conclusion?: string): Promise<void> {
-    const log = await import("../log.js");
-    const id = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: `kg-${status}`, status: "running" });
-    if (status === "completed") log.updateJobStatus(id, "completed", conclusion);
+  function seedKgRefreshRow(state: "held" | "running"): void {
+    // The fields recordKgDispatchRow writes, at the running status a live run has.
+    const id = modules.log.appendLog({
+      issueId: "kg-refresh",
+      phase: "kg-refresh",
+      dispatchId: `kg-${state}`,
+      repo: "BuildDownAI/knowledge-graph-ai-implement",
+      executionMode: "github-actions",
+      status: "running",
+    });
+    // The gate closes its row as it holds the snapshot.
+    if (state === "held") modules.log.markJobAwaitingDecision(id);
   }
 
   function drained(): RestateDrainCoordinator {
@@ -230,16 +238,15 @@ describe("waitForQuiet and a held KG refresh", () => {
   }
 
   it("returns at once when the only KG refresh is held (completed / awaiting_decision)", async () => {
-    await seedKgRefreshRow("completed", "awaiting_decision");
-    const { getInFlightWork } = await import("../in-flight-work.js");
-    expect(getInFlightWork().filter((w) => w.kind === "kg-refresh")).toEqual([]);
+    seedKgRefreshRow("held");
+    expect(modules.inFlight.getInFlightWork().filter((w) => w.kind === "kg-refresh")).toEqual([]);
     // No injected in-flight getter: the real getInFlightWork runs against the log.
-    await deploy.waitForQuiet(0, 1, drained());
+    await modules.deploy.waitForQuiet(0, 1, drained());
   });
 
   it("control: a running KG refresh row does block, so the held case above can fail", async () => {
-    await seedKgRefreshRow("running");
-    await expect(deploy.waitForQuiet(0, 1, drained())).rejects.toThrow(/did not drain.*1 kg-refresh/);
+    seedKgRefreshRow("running");
+    await expect(modules.deploy.waitForQuiet(0, 1, drained())).rejects.toThrow(/did not drain.*1 kg-refresh/);
   });
 });
 

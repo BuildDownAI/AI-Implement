@@ -561,6 +561,18 @@ describe("production managed GHA review-fix launch", () => {
       expect(count("model_credential_grants")).toBe(0);
     });
 
+    it("admits a Claude-API implementation without the hosted execution-policy marker, and launches with no policy", async () => {
+      await writeKey("api", "claude", "anthropic", "anthropic-api-key");
+      const claude = { agent: "claude" as const, provider: "anthropic" as const, model: "claude-sonnet-5-5",
+        accountProfileId: "api", invocationTimeoutMs: 60_000 };
+      profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: claude, implementation: claude, review: claude } });
+      workflow = workflow.replaceAll("github-hosted-execution-policy-v2", "unsupported-policy");
+      expect(await admit()).toBe("admit");
+      const { worker, plan } = await launch();
+      expect((await worker.launch(plan)).status).toBe("accepted");
+      expect((await decode()).credentials?.executionPolicy).toBeUndefined();
+    });
+
     it("defers on uncertainty and retained gates instead of failing", async () => {
       expect(await production.canAdmit(SCOPE, CONFIG)).toBe("defer");
       installationId = 99;

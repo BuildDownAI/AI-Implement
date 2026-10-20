@@ -768,6 +768,28 @@ describe("kg current run card (AII-1260)", () => {
     expect(m.calls.filter((c) => c.url === "/api/kg/status")).toHaveLength(3);
   });
 
+  it("a Cancel with no hold shown names no hold, so the tool stops the run in flight", async () => {
+    const m = mount({ currentRun: { triggerId: "t", step: "await-progress", decisions: [], held: null } });
+    await m.win.loadKgStatus();
+    await m.win.decideKgRefresh("cancel");
+    const posts = m.calls.filter((c) => c.url === "/api/tools/decide_kg_refresh");
+    expect(posts.map((c) => c.body)).toEqual([{ args: { action: "cancel" } }]);
+  });
+
+  it("a Cancel after the shown hold was decided names no hold", async () => {
+    const opts: Parameters<typeof mount>[0] = { currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held }, stage: "awaiting-decision" };
+    const m = mount(opts);
+    await m.win.loadKgStatus();
+    await m.win.decideKgRefresh("accept");
+    // The accepted hold resumes as a new run, which the next status read shows in flight.
+    opts.currentRun = { triggerId: "t2", step: "resume", decisions: [], held: null };
+    opts.stage = "snapshot-landed";
+    await m.win.loadKgStatus();
+    await m.win.decideKgRefresh("cancel");
+    const posts = m.calls.filter((c) => c.url === "/api/tools/decide_kg_refresh");
+    expect(posts.map((c) => c.body)).toEqual([{ args: { action: "accept", triggerId: "t" } }, { args: { action: "cancel" } }]);
+  });
+
   it("a declined confirm makes no call", async () => {
     const m = mount({ currentRun: null, confirm: false });
     await m.win.decideKgRefresh("cancel");

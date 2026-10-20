@@ -1,9 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, truncateSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, truncateSync } from "node:fs";
 import { execSync, spawnSync } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseDocument } from "yaml";
@@ -1422,9 +1421,8 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
     const blob = execSync(`git rev-parse ${clonedRef}:snapshot/parts/issue.01.nt`, { cwd: tmpDir }).toString().trim();
     execSync("git repack -a -d -q", { cwd: tmpDir, stdio: "ignore" });
     const packDir = join(tmpDir, ".git", "objects", "pack");
-    const stash = mkdtempSync(join(tmpdir(), "kg-pack-"));
+    const stash = testDir("kg-pack");
     execSync(`mv "${packDir}"/* "${stash}"/ && for p in "${stash}"/*.pack; do git unpack-objects -q < "$p"; done`, { cwd: tmpDir, stdio: "ignore" });
-    rmSync(stash, { recursive: true, force: true });
     rmSync(join(tmpDir, ".git", "objects", blob.slice(0, 2), blob.slice(2)), { force: true });
     const ctx = makeContext();
     ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X"], issueCount: 0 });
@@ -1485,9 +1483,8 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
     const blob = execSync(`git rev-parse ${clonedRef}:snapshot/parts/issue.nt`, { cwd: tmpDir }).toString().trim();
     execSync("git repack -a -d -q", { cwd: tmpDir, stdio: "ignore" });
     const packDir = join(tmpDir, ".git", "objects", "pack");
-    const stash = mkdtempSync(join(tmpdir(), "kg-pack-"));
+    const stash = testDir("kg-pack");
     execSync(`mv "${packDir}"/* "${stash}"/ && for p in "${stash}"/*.pack; do git unpack-objects -q < "$p"; done`, { cwd: tmpDir, stdio: "ignore" });
-    rmSync(stash, { recursive: true, force: true });
     rmSync(join(tmpDir, ".git", "objects", blob.slice(0, 2), blob.slice(2)), { force: true });
     const ctx = makeContext();
     ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X"], issueCount: 0 });
@@ -1857,12 +1854,12 @@ describe("kgTrackerDataStep", () => {
 
   it("reports one per-source result per team: success with counts, skipped (no mapping), failed (status)", async () => {
     process.env.RUN_PROGRESS_TOKEN = "test-token";
-    const fetchImpl: typeof fetch = async (_, init) => {
-      const body = JSON.parse(init?.body as string) as { teamKey?: string };
-      if (body.teamKey === "GHOST") return { ok: false, status: 404, json: async () => ({}) } as Response;
-      if (body.teamKey === "BAD") return { ok: false, status: 503, json: async () => ({}) } as Response;
-      return { ok: true, status: 200, json: async () => makeTrackerPage(Array.from({ length: 12 }, (_, i) => ({ id: `i${i}` })), false) } as Response;
-    };
+    const fetchImpl = trackerApi(({ body }) => {
+      const { teamKey } = JSON.parse(body) as { teamKey?: string };
+      if (teamKey === "GHOST") return { status: 404, json: { error: "unmapped-team" } };
+      if (teamKey === "BAD") return { status: 503, json: { error: "tracker-unavailable" } };
+      return { json: makeTrackerPage(Array.from({ length: 12 }, (_, i) => ({ id: `i${i}` })), false) };
+    }).fetch;
     const result = await kgTrackerDataStep.run(
       makeContext(),
       { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl, writeFileSyncImpl: () => {}, sourcesYmlReaderImpl: () => ["AII", "GHOST", "BAD"] },
@@ -2690,24 +2687,19 @@ describe("kgScopeReconcileStep", () => {
   });
 
   it("dry run: the tracker step then fetches every reconciled team", async () => {
-    process.env.RUN_PROGRESS_TOKEN = "tok";
     writeSources("trackers: []\n");
     await kgScopeReconcileStep.run(
       makeContext(),
       { callbackUrl: "http://orch", workspaceDir: tmpDir, dryRun: true, fetchImpl: makeMappingFetch(SCOPE_MAPPINGS.slice(0, 2)) },
       noopReporter,
     );
-    let calls = 0;
-    const fetchImpl: typeof fetch = (async () => {
-      calls++;
-      return { ok: true, status: 200, json: async () => ({ issues: [], pageInfo: { hasNextPage: false, endCursor: null } }) } as Response;
-    }) as typeof fetch;
+    const tracker = fakeFetch({ "POST /api/runner/kg-tracker-data": { json: { issues: [], pageInfo: { hasNextPage: false, endCursor: null } } } });
     const result = await kgTrackerDataStep.run(
       makeContext(),
-      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl },
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl: tracker.fetch },
       noopReporter,
     );
-    expect(calls).toBe(2);
+    expect(tracker.calls).toHaveLength(2);
     expect(result.teamCounts.map((t: { team: string }) => t.team)).toEqual(["T0", "T1"]);
   });
 
@@ -3118,24 +3110,21 @@ describe("runKgRefresh", () => {
   it("maps KgSnapshotFileTooLargeError to failureCode KG_SNAPSHOT_FILE_TOO_LARGE (AII-1498)", async () => {
     process.env.RUNNER_CALLBACK_URL = "http://orch";
     process.env.RUN_TOKEN = "run-tok";
-    const capturedResults: Array<{ failureCode?: string }> = [];
+    const orchestrator = runnerApi();
     const result = await runKgRefresh({
       workspaceDir: tmpDir,
       stepsOverride: {
-        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "kg-repo", githubToken: "tok", clonedRef: "abc" }),
         kgIngest: makeStepModule({ statsFile: null }),
         kgSnapshotPush: makeStepModule({}, new KgSnapshotFileTooLargeError([{ path: "snapshot/parts/commit.nt", bytes: 96 * 1024 * 1024 }])),
       },
       reporter: { report: async () => undefined },
-      fetchImpl: async (_url, init) => {
-        capturedResults.push(init?.body ? JSON.parse(init.body as string) : {});
-        return new Response(JSON.stringify({ acknowledged: true }), { status: 200 });
-      },
+      fetchImpl: orchestrator.fetch,
     });
     delete process.env.RUNNER_CALLBACK_URL;
     delete process.env.RUN_TOKEN;
     expect(result.exitCode).toBe(1);
-    expect(capturedResults.some((r) => r.failureCode === "KG_SNAPSHOT_FILE_TOO_LARGE")).toBe(true);
+    expect(resultBodies(orchestrator).some((r) => r.failureCode === "KG_SNAPSHOT_FILE_TOO_LARGE")).toBe(true);
   });
 
   it("returns exitCode 1 when kgTrackerData throws KgTrackerDataFetchError", async () => {

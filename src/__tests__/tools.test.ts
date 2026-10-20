@@ -21,7 +21,6 @@ import {
   getKgStatusTool,
   setFlyMachineProfileTool,
   getTenantHealth,
-  listInFlightJobs,
   getIssueReportCardTool,
   getFleetReportTool,
   triggerKgRefreshTool,
@@ -32,9 +31,6 @@ import {
   addProjectArgsSchema,
   triggerWorkflowSyncTool,
   clearDispatchDedupTool,
-  listDispatchReservationsTool,
-  releaseDispatchReservationTool,
-  setAdmissionTerminationCheck,
   setProviderRegistry,
   setKgRefreshToolDeps,
   getReviewFixAttemptTool,
@@ -52,8 +48,7 @@ import { getMappings, type RepoMapping } from "../config.js";
 import { setOrchestratorSetting } from "../orchestrator-settings.js";
 import { initSettingsTable } from "../runner-mode.js";
 import { FLY_MACHINE_PROFILE_DEFAULTS, mergeProfile, type FlyMachineProfileConfig } from "../restate/fly-machine-profile.js";
-import { initLogTable, appendLog, updateJobStatus } from "../log.js";
-import { getDb } from "../dedup.js";
+import { initLogTable } from "../log.js";
 import { getRestateStatus, setRestateStatus, resetRestateStatus } from "../restate/status.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import {
@@ -63,8 +58,13 @@ import {
   triggerWorkflowSyncAction,
   clearDedupEntryAction,
 } from "../admin.js";
-import { makeMapping, makeRegistry } from "./helpers/builders.js";
+import type * as AdmissionModule from "../dispatch-admission.js";
+import type * as InFlightModule from "../in-flight-work.js";
+import type * as LogModule from "../log.js";
+import type * as ToolsModule from "../restate/tools.js";
+import { makeAppendLogEntry, makeMapping, makeRegistry } from "./helpers/builders.js";
 import { fakeFetch, hangUntilAborted } from "./helpers/fake-fetch.js";
+import { testDb } from "./helpers/test-db.js";
 
 vi.mock("../report-card.js", () => ({
   getIssueReportCard: vi.fn(),
@@ -1077,29 +1077,33 @@ describe("get_tenant_health restate health field (AII-807)", () => {
 
 describe("get_tenant_health awaitingDecisionCount (AII-1490)", () => {
   const system: Caller = SYSTEM_ADMIN;
-  beforeAll(() => {
-    initLogTable();
-  });
-  afterEach(() => {
-    getDb().exec("DELETE FROM dispatch_log");
+  let log: typeof LogModule;
+  let tools: typeof ToolsModule;
+
+  beforeEach(async () => {
+    ({ log, tools } = (await testDb({ modules: { log: () => import("../log.js"), tools: () => import("../restate/tools.js") } })).modules);
   });
 
-  it("counts a held kg-refresh, not in flight, and drops it after the final close", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
-    const held = appendLog({ issueId: "kg-1", phase: "kg-refresh" });
-    updateJobStatus(held, "completed", "awaiting_decision");
-    const running = appendLog({ issueId: "kg-2", phase: "kg-refresh", status: "running" });
-    appendLog({ issueId: "impl-1", phase: "implementation", status: "completed" });
-    getDb().prepare("UPDATE dispatch_log SET status='completed', conclusion='awaiting_decision' WHERE issue_id='impl-1'").run();
+  it("counts a held kg-refresh, not in flight, until its resumed run takes the row back", async () => {
+    vi.mocked(getMappings).mockReturnValue({});
+    // The row recordKgDispatchRow writes, closed at the gate as the hold's dispatch row.
+    const held = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "kg-1", repo: "BuildDownAI/knowledge-graph-ai-implement", executionMode: "github-actions", status: "running" });
+    log.markJobAwaitingDecision(held);
+    const dispatched = log.appendLog(makeAppendLogEntry());
+    // Only a kg-refresh row is ever held, so an implementation row in that state shows the count reads the phase.
+    log.updateJobStatus(log.appendLog(makeAppendLogEntry()), "completed", "awaiting_decision");
 
-    const health = async () => JSON.parse((await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} })).content[0].text) as { awaitingDecisionCount: number; inFlightJobCount: number };
+    const health = async () => JSON.parse((await tools.getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} })).content[0].text) as { awaitingDecisionCount: number; inFlightJobCount: number };
     expect(await health()).toMatchObject({ awaitingDecisionCount: 1, inFlightJobCount: 1 });
 
-    const list = JSON.parse((await listInFlightJobs(fakeContext("list_in_flight_jobs"), { caller: system, args: {} })).content[0].text) as Array<{ id: number }>;
-    expect(list.map((j) => j.id)).toEqual([running]);
+    const list = JSON.parse((await tools.listInFlightJobs(fakeContext("list_in_flight_jobs"), { caller: system, args: {} })).content[0].text) as Array<{ id: number }>;
+    expect(list.map((j) => j.id)).toEqual([dispatched]);
 
-    updateJobStatus(held, "completed", "passed");
-    expect(await health()).toMatchObject({ awaitingDecisionCount: 0 });
+    // A decided hold's resumed run takes the row back before it acts, then closes it (resumeFromHold).
+    log.reopenHeldJob(held);
+    expect(await health()).toMatchObject({ awaitingDecisionCount: 0, inFlightJobCount: 2 });
+    log.updateJobStatus(held, "completed", "passed");
+    expect(await health()).toMatchObject({ awaitingDecisionCount: 0, inFlightJobCount: 1 });
   });
 });
 
@@ -1829,46 +1833,57 @@ describe("add_project uses the registry the boot shares (AII-713 review)", () =>
 // ---- AII-1069: list_dispatch_reservations / release_dispatch_reservation.
 describe("dispatch reservation tools (AII-1069)", () => {
   const admin: Caller = { kind: "human", email: "op@example.com", role: "admin" };
-  let seq = 0;
   const parse = (r: { content: { text: string }[] }) => JSON.parse(r.content[0].text);
+  let admission: typeof AdmissionModule;
+  let log: typeof LogModule;
+  let inFlight: typeof InFlightModule;
+  let tools: typeof ToolsModule;
+  let issues = 0;
 
-  beforeAll(() => {
-    initLogTable();
+  beforeEach(async () => {
+    ({ admission, log, inFlight, tools } = (await testDb({
+      modules: {
+        admission: () => import("../dispatch-admission.js"),
+        log: () => import("../log.js"),
+        inFlight: () => import("../in-flight-work.js"),
+        tools: () => import("../restate/tools.js"),
+      },
+    })).modules);
+    issues = 0;
   });
   afterEach(() => {
-    setAdmissionTerminationCheck(null);
     vi.restoreAllMocks();
   });
 
-  async function hold(owner: { kind: "legacy" } | { kind: "restate"; attemptId: string } = { kind: "legacy" }, jobStatus?: "running" | "completed") {
-    const { acquire } = await import("../dispatch-admission.js");
-    const { appendLog, updateJobStatus } = await import("../log.js");
-    const dispatchId = `res-${Date.now()}-${seq++}`;
-    const decision = acquire({
+  // A GitHub Actions planning reservation for a new issue, owned as dispatchPlanning (Legacy) or PlanningRun's reserve (Restate) owns it.
+  // With a job status, the row launchPlanningRun writes once the run is dispatched.
+  async function hold(owner: "legacy" | "restate" = "legacy", jobStatus?: "running" | "completed") {
+    const n = ++issues;
+    const dispatchId = crypto.randomUUID();
+    const decision = admission.acquire({
       dispatchId,
       mappingKey: "AII",
-      scope: { kind: "issue", issueScope: "AII", issueId: dispatchId },
+      scope: { kind: "issue", issueScope: "AII", issueId: `issue-${n}` },
       kind: "planning",
       backend: "github-actions",
-      lifecycleOwner: owner,
+      lifecycleOwner: owner === "legacy" ? { kind: "legacy" } : { kind: "restate", attemptId: dispatchId },
       cap: 100,
     });
     if (!decision.ok) throw new Error("acquire failed");
     if (jobStatus) {
-      const id = appendLog({ issueId: dispatchId, issueIdentifier: "AII-1", repo: "o/r", dispatchId, admissionGeneration: decision.record.generation, executionMode: "github-actions" });
-      if (jobStatus === "completed") updateJobStatus(id, "completed", "success");
+      const id = log.appendLog(makeAppendLogEntry({ issueId: `issue-${n}`, issueIdentifier: `AII-${n}`, teamKey: "AII", dispatchId, admissionGeneration: decision.record.generation, phase: "planning" }));
+      if (jobStatus === "completed") log.updateJobStatus(id, "completed", "success");
     }
     return dispatchId;
   }
-  const heldNow = async (dispatchId: string) => (await import("../dispatch-admission.js")).read(dispatchId)?.releasedAt === null;
-  const runnerJobCount = async () =>
-    (await import("../in-flight-work.js")).getInFlightWork().find((w) => w.kind === "runner-job")?.count ?? 0;
+  const heldNow = async (dispatchId: string) => admission.read(dispatchId)?.releasedAt === null;
+  const runnerJobCount = async () => inFlight.getInFlightWork().find((w) => w.kind === "runner-job")?.count ?? 0;
 
   it("lists held rows and not released ones, for a user caller", async () => {
-    const held = await hold({ kind: "legacy" }, "running");
+    const held = await hold("legacy", "running");
     const gone = await hold();
-    (await import("../dispatch-admission.js")).releaseByDispatchId(gone, "finalized");
-    const result = await listDispatchReservationsTool(fakeContext("list_dispatch_reservations"), { caller: HUMAN_USER, args: {} });
+    admission.releaseByDispatchId(gone, "finalized");
+    const result = await tools.listDispatchReservationsTool(fakeContext("list_dispatch_reservations"), { caller: HUMAN_USER, args: {} });
     const rows = parse(result) as Array<Record<string, unknown>>;
     const row = rows.find((r) => r.dispatchId === held);
     expect(row).toMatchObject({ team: "AII", issueIdentifier: "AII-1", phase: "planning", backend: "github-actions", lifecycleOwner: "legacy", jobStatus: "dispatched", jobConclusion: null });
@@ -1878,16 +1893,16 @@ describe("dispatch reservation tools (AII-1069)", () => {
 
   it("refuses a user caller as forbidden and leaves the row held", async () => {
     const id = await hold();
-    const result = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: HUMAN_USER, args: { dispatchId: id, force: true } });
+    const result = await tools.releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: HUMAN_USER, args: { dispatchId: id, force: true } });
     expect(result.content[0].text).toBe("forbidden: release_dispatch_reservation requires the admin role");
     expect(await heldNow(id)).toBe(true);
   });
 
   it("refuses a row whose job is terminal without force, naming the status, and the row stays held", async () => {
-    const id = await hold({ kind: "restate", attemptId: "a" }, "completed");
-    setAdmissionTerminationCheck(async () => false);
+    const id = await hold("restate", "completed");
+    tools.setAdmissionTerminationCheck(async () => false);
     const before = await runnerJobCount();
-    const result = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id } });
+    const result = await tools.releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id } });
     expect(result.isError).toBe(true);
     expect(parse(result)).toMatchObject({ status: "refused", dispatchId: id });
     expect(parse(result).reason).toMatch(/completed/);
@@ -1897,43 +1912,43 @@ describe("dispatch reservation tools (AII-1069)", () => {
   });
 
   it("refuses without force while the run executes, then releases with force", async () => {
-    const id = await hold({ kind: "legacy" }, "running");
-    setAdmissionTerminationCheck(async () => false);
-    const refused = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id } });
+    const id = await hold("legacy", "running");
+    tools.setAdmissionTerminationCheck(async () => false);
+    const refused = await tools.releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id } });
     expect(refused.isError).toBe(true);
     expect(parse(refused)).toMatchObject({ status: "refused", dispatchId: id });
     expect(parse(refused).reason).toMatch(/force/);
     expect(await heldNow(id)).toBe(true);
 
-    const forced = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id, force: true } });
+    const forced = await tools.releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id, force: true } });
     expect(parse(forced)).toMatchObject({ status: "released", forced: true, basis: "forced" });
     expect(await heldNow(id)).toBe(false);
   });
 
   it("releases without force when the backend run is confirmed ended", async () => {
-    const id = await hold({ kind: "legacy" }, "running");
-    setAdmissionTerminationCheck(async (c) => c.dispatchId === id);
-    const result = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id } });
+    const id = await hold("legacy", "running");
+    tools.setAdmissionTerminationCheck(async (c) => c.dispatchId === id);
+    const result = await tools.releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id } });
     expect(parse(result)).toMatchObject({ status: "released", basis: "backend_confirmed" });
   });
 
   it("answers nothing_to_release for an unknown or already released id", async () => {
     const id = await hold();
-    await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id, force: true } });
+    await tools.releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id, force: true } });
     for (const dispatchId of [id, "no-such-dispatch"]) {
-      const result = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId, force: true } });
+      const result = await tools.releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId, force: true } });
       expect(result.isError).toBeUndefined();
       expect(parse(result)).toEqual({ status: "nothing_to_release", dispatchId });
     }
   });
 
   it("writes one audit line naming actor, dispatch id, owner and force", async () => {
-    const id = await hold({ kind: "restate", attemptId: "b" });
-    const log = vi.spyOn(console, "log").mockImplementation(() => {});
-    await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id, force: true } });
-    const lines = log.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith("[mcp] write tool=release_dispatch_reservation"));
+    const id = await hold("restate");
+    const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
+    await tools.releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id, force: true } });
+    const lines = consoleLog.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith("[mcp] write tool=release_dispatch_reservation"));
     expect(lines).toEqual([
-      `[mcp] write tool=release_dispatch_reservation actor=op@example.com role=admin result=ok kind=human dispatch=${id} owner=restate:b force=true`,
+      `[mcp] write tool=release_dispatch_reservation actor=op@example.com role=admin result=ok kind=human dispatch=${id} owner=restate:${id} force=true`,
     ]);
   });
 });
