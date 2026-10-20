@@ -275,7 +275,7 @@ describe("gitProcessEnv dependency credentials", () => {
 
     it("a missing progress bearer alone does not fence the cached token; gitProcessEnv does", () => {
       const cache = join(testDir("helper-cache"), "cache.json");
-      // A vended token as the endpoint caches it, with GitHub's expiry; without a progress bearer the helper never reads the expiry.
+      // A vended token as the endpoint caches it, with GitHub's expiry; without a progress bearer the helper never acts on the expiry.
       const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
       writeFileSync(cache, JSON.stringify({ token: "SENTINEL-CACHED", expires_at: expiresAt }));
       saveAndSet("GIT_DEPENDENCY_TOKEN_FILE", cache);

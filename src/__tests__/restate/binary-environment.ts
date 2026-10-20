@@ -103,8 +103,9 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
   const bin = (options.resolveBinary ?? resolvePlatformBinary)();
   if (!bin) throw new RestateBinaryNotFoundError();
 
-  // One temp root holds the store and the invoker's spill directory, side by side: the server reads every
-  // directory under RESTATE_BASE_DIR as a node's data and refuses to restart with more than one.
+  // One temp root holds the store and the invoker's spill directory, side by side.
+  // With no node name set, the server reads the directory under RESTATE_BASE_DIR as its node's data
+  // and refuses to start beside a second one, which the spill directory becomes once an invocation is in flight.
   const root = await mkdtemp(path.join(os.tmpdir(), "restate-binary-env-"));
   const baseDir = path.join(root, "store");
   await mkdir(baseDir);

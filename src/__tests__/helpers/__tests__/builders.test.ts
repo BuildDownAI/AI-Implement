@@ -1,7 +1,9 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { generateKeyPairSync } from "node:crypto";
 import { parseChatGptPlanRecord } from "../../../chatgpt-plan-token.js";
 import { getMappings, initMappingsTable, upsertMapping } from "../../../config.js";
 import { runDevHarnessCli } from "../../../dev-harness/cli.js";
+import { clearTokenCache, getScopedInstallationToken } from "../../../github-app-auth.js";
 import { parseTaskFile } from "../../../dev-harness/task-file.js";
 import { parseModelAuthGrantBootstrap, toSafeGrantMetadata } from "../../../model-auth-contract.js";
 import { normalizeRetryPolicy } from "../../../pipeline/retry-backoff.js";
@@ -9,6 +11,7 @@ import { ProviderRegistry } from "../../../providers/registry.js";
 import { validateReviewFixResultMetadata, validateScopedPrIdentity } from "../../../review-fix-contract.js";
 import { decodeRunConfig, encodeRunConfig } from "../../../run-config.js";
 import { FakeProvider } from "../../providers/fake.js";
+import { fakeFetch } from "../fake-fetch.js";
 import { testDb } from "../test-db.js";
 import {
   makeAppConfig,
@@ -24,6 +27,7 @@ import {
   makeRegistry,
   makeReviewFixResult,
   makeReviewFixRunConfig,
+  makeScopedInstallationToken,
   makeScopedPrIdentity,
 } from "../builders.js";
 import { makeLaunchDecision, makeSnapshot } from "../fixtures/configured-run.js";
@@ -130,6 +134,46 @@ describe("makeScopedPrIdentity", () => {
     const other = makeScopedPrIdentity({ prNumber: 43 });
     expect(other.prNumber).toBe(43);
     expect({ ...other, prNumber: makeScopedPrIdentity().prNumber }).toEqual(makeScopedPrIdentity());
+  });
+});
+
+describe("makeScopedInstallationToken", () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.500Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    clearTokenCache();
+  });
+
+  it("builds what getScopedInstallationToken returns for GitHub's mint reply", async () => {
+    const built = makeScopedInstallationToken();
+    fakeFetch({
+      "GET /orgs/acme/installation": { json: { id: built.installationId, repository_selection: "selected" } },
+      [`POST /app/installations/${built.installationId}/access_tokens`]: {
+        status: 201,
+        json: { token: built.token, expires_at: built.expiresAt },
+      },
+    }).install();
+    expect(await getScopedInstallationToken("1", privateKey, "acme", { forceRefresh: true })).toEqual(built);
+  });
+
+  it("expires an hour after it is built, in GitHub's form", () => {
+    expect(makeScopedInstallationToken().expiresAt).toBe("2026-01-01T01:00:00Z");
+  });
+
+  it("replaces only the overridden field", () => {
+    const other = makeScopedInstallationToken({ token: "other-token" });
+    expect(other.token).toBe("other-token");
+    expect({ ...other, token: makeScopedInstallationToken().token }).toEqual(makeScopedInstallationToken());
   });
 });
 

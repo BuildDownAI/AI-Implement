@@ -108,8 +108,8 @@ describe("findJob", () => {
     expect(await deps.findJob("d-1")).toStrictEqual({ id: 7, approved, inFlight: false });
   });
 
-  it.each(["dispatched", "running"])("reports a %s row as inFlight", async (status) => {
-    vi.mocked(getJobByDispatchId).mockReturnValue({ id: 7, approved: false, status } as never);
+  it.each(["dispatched", "running"] as const)("reports a %s row as inFlight", async (status) => {
+    vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ id: 7, approved: false, dispatchId: "d-1", status, prUrl: input.prUrl }));
     expect(await deps.findJob("d-1")).toStrictEqual({ id: 7, approved: false, inFlight: true });
   });
 });
@@ -130,7 +130,7 @@ describe("hasComment", () => {
   });
 
   it("reads strictly only when asked (AII-1361)", async () => {
-    vi.mocked(listPrComments).mockResolvedValue([] as never);
+    vi.mocked(listPrComments).mockResolvedValue([]);
     await deps.hasComment(input, "m", { strict: true });
     expect(listPrComments).toHaveBeenLastCalledWith("tok", "owner", "repo", 12, { strict: true });
   });

@@ -17,7 +17,7 @@ import type { RepoMapping } from "../config.js";
 import type { TicketIssue } from "../providers/types.js";
 import { decodeTrustedRunConfig } from "../run-config.js";
 import { createModelSessionKeyProvider } from "../model-session-keys.js";
-import { makeAppConfig, makeChatGptPlanRecord, makeIssue, makeMapping, makeProvider } from "./helpers/builders.js";
+import { makeAppConfig, makeChatGptPlanRecord, makeIssue, makeMapping, makeProvider, makeScopedInstallationToken } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 import { flySecretsUpdated } from "./helpers/replies/fly.js";
 import { testDb } from "./helpers/test-db.js";
@@ -175,7 +175,7 @@ beforeEach(async () => {
   }).install();
 
   vi.mocked(auth.getInstallationToken).mockResolvedValue("broad-token");
-  vi.mocked(auth.getScopedInstallationToken).mockResolvedValue({ token: "scoped-token", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 1 });
+  vi.mocked(auth.getScopedInstallationToken).mockResolvedValue(makeScopedInstallationToken());
   vi.mocked(repoImage.resolveSessionImage).mockReset().mockResolvedValue({ image: "session-image", source: "default" } as never);
   vi.mocked(fly.listAppSecrets).mockReset().mockResolvedValue([]);
   vi.mocked(fly.createMachine).mockReset().mockResolvedValue({ id: "m1", name: "machine-1" } as never);

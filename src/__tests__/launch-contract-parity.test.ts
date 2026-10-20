@@ -23,7 +23,7 @@ import type { ReviewFixWorkerTransport } from "../review-fix-worker.js";
 import { buildLocalRunnerEnv } from "../local-docker.js";
 import { decodeRunConfig, buildKgRefreshRunConfig, type RunConfigV1 } from "../run-config.js";
 import { DEFAULT_RETRY_POLICY, type RetryPolicy } from "../pipeline/retry-backoff.js";
-import { makeAppConfig, makeAppendLogEntry, makeIssue, makeMapping, makeProvider, makeRegistry } from "./helpers/builders.js";
+import { makeAppConfig, makeAppendLogEntry, makeIssue, makeMapping, makeProvider, makeRegistry, makeScopedInstallationToken } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 import { githubError, githubFile } from "./helpers/replies/github.js";
 import { testDb, type LoadedModules } from "./helpers/test-db.js";
@@ -130,7 +130,7 @@ const CONFIG = makeAppConfig({
   localRunnerOrchestratorUrl: "http://localhost:9000",
   kgSourceRepo: "acme/kg",
 });
-const SCOPED_TOKEN = () => ({ token: "gh-token", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 7 });
+const SCOPED_TOKEN = () => makeScopedInstallationToken({ installationId: INSTALLATION_ID });
 
 const CAPABILITIES: WorkflowCapabilities = {
   contract: "envelope",
@@ -195,7 +195,8 @@ vi.mock("../github-app-auth.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../github-app-auth.js")>()),
   getInstallationToken: async () => "gh-token",
   // Fly and local children boot with a target-repo scoped token on the feature side.
-  getScopedInstallationToken: async () => ({ token: "gh-token", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 7 }),
+  getScopedInstallationToken: async () =>
+    (await import("./helpers/builders.js")).makeScopedInstallationToken({ installationId: 7 }),
   getInstallationId: async () => 7,
 }));
 
@@ -468,7 +469,7 @@ function kgDeps(w: World, claim: boolean): KgRefreshSenderDeps {
     },
     getInstallationToken: async () => "gh-token",
     getScopedInstallationToken: async () => SCOPED_TOKEN(),
-    mintToken: async () => ({ token: "gh-token", expiresAt: SCOPED_TOKEN().expiresAt }),
+    mintToken: async () => SCOPED_TOKEN(),
     fetchDefaultBranch: async () => "trunk",
     // The real image resolution, as production injects it.
     resolveRunnerImage: w.repoImage.resolveRunnerImageForDispatch,

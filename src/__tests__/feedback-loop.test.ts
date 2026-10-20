@@ -320,7 +320,7 @@ describe("feedbackLoopStep — pass attribution (AII-971)", () => {
   const run = async () => {
     const out = await feedbackLoopStep.run(
       makeContext(),
-      { workspaceDir: "/tmp", issueTitle: "T", issueDescription: "D", planningContext: "", maxIterations: 1 },
+      { workspaceDir, issueTitle: "T", issueDescription: "D", planningContext: "", maxIterations: 1 },
       { report: vi.fn(async () => undefined) },
     );
     return out as { passes: Array<Record<string, unknown>> };

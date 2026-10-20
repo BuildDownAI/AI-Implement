@@ -6,6 +6,7 @@
 import { vi } from "vitest";
 import type { RepoMapping } from "../../config.js";
 import type { ChatGptPlanRecordV1 } from "../../chatgpt-plan-token.js";
+import type { ScopedInstallationToken } from "../../github-app-auth.js";
 import type { AppConfig } from "../../index.js";
 import type { Job, appendLog } from "../../log.js";
 import { DefaultPipelineContext } from "../../pipeline/context.js";
@@ -132,6 +133,17 @@ export function makeScopedPrIdentity(overrides: Partial<ScopedPrIdentity> = {}):
     installationId: 1,
     repository: "test-org/test-repo",
     prNumber: 42,
+    ...overrides,
+  };
+}
+
+// A token getScopedInstallationToken returns (src/github-app-auth.ts), minted when it is built: GitHub's expires_at,
+// passed through verbatim, an hour later in GitHub's form (no milliseconds).
+export function makeScopedInstallationToken(overrides: Partial<ScopedInstallationToken> = {}): ScopedInstallationToken {
+  return {
+    token: "scoped-token",
+    expiresAt: new Date(Date.now() + 60 * 60_000).toISOString().replace(/\.\d{3}Z$/, "Z"),
+    installationId: 1,
     ...overrides,
   };
 }

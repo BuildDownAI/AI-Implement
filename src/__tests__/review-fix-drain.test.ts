@@ -74,10 +74,8 @@ vi.mock("../model-auth-runtime.js", async (importOriginal) => {
 const githubAppAuthMocks = vi.hoisted(() => ({
   getInstallationToken: vi.fn<(appId: string, privateKey: string, owner: string) => Promise<string>>(async () => "gh-token"),
   getInstallationId: vi.fn<(appId: string, privateKey: string, owner: string) => Promise<number>>(async () => 778899),
-  // GitHub's answer to a repository-scoped mint: the token, its expiry an hour out, and the installation.
-  getScopedInstallationToken: vi.fn<typeof import("../github-app-auth.js").getScopedInstallationToken>(async () => ({
-    token: "scoped-token", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 778899,
-  })),
+  getScopedInstallationToken: vi.fn<typeof import("../github-app-auth.js").getScopedInstallationToken>(async () =>
+    (await import("./helpers/builders.js")).makeScopedInstallationToken({ installationId: 778899 })),
 }));
 
 vi.mock("../github-app-auth.js", async (importOriginal) => {

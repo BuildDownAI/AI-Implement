@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { __clearWorkflowProbeCacheForTests } from "../workflow-probe.js";
-import { makeAppConfig } from "./helpers/builders.js";
+import { makeAppConfig, makeScopedInstallationToken } from "./helpers/builders.js";
 import { fakeFetch, hangUntilAborted, type Reply, type Routes } from "./helpers/fake-fetch.js";
 import { githubFile } from "./helpers/replies/github.js";
 import { testDb } from "./helpers/test-db.js";
@@ -96,7 +96,7 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
       runnerCallbackBaseUrl: "https://orch.example", runnerTokenSecret: "secret",
       flySessionsToken: "fly-token", flySessionsApp: "fly-app",
     }),
-    mintToken: vi.fn(async () => ({ token: "gh-token", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 1 })),
+    mintToken: vi.fn(async () => makeScopedInstallationToken()),
     fetchTarball: noop as never,
     fetchDefaultBranch: vi.fn(async () => "main"),
     fetchSnapshotCommitSha: vi.fn(async () => null),
@@ -111,7 +111,7 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
     getPullRequestStateFn: noop as never,
     deleteBranchFn: noop as never,
     getInstallationToken: vi.fn(async () => "gh-token"),
-    getScopedInstallationToken: vi.fn(async () => ({ token: "scoped-gh-token", expiresAt: "", installationId: 1 })),
+    getScopedInstallationToken: vi.fn(async () => makeScopedInstallationToken({ token: "scoped-gh-token" })),
     resolveRunnerImage: vi.fn(async () => "runner:test"),
     postWorkflowDispatch: ((...args: unknown[]) => postWorkflowDispatch(...args)) as never,
     keptMachineFly: () => makeKeptFly(),

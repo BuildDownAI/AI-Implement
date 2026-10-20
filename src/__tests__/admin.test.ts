@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as AdminModule from "../admin.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { ProviderRegistry } from "../providers/registry.js";
-import { makeIssue, makeRegistry } from "./helpers/builders.js";
+import { makeIssue, makeRegistry, makeScopedInstallationToken } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 import { testDb, type LoadedModules, type TestDb } from "./helpers/test-db.js";
 import { testDir } from "./helpers/test-dir.js";
@@ -5665,8 +5665,6 @@ describe("GET /api/kg/tracker-data", () => {
 
 describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () => {
   const page = vi.fn();
-  /** The scoped mint for the KG source repository, as `getScopedInstallationToken` returns it. */
-  const manifestRepoToken = () => ({ token: "ghs_kg_manifest", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 1 });
 
   async function trackerDataRequest(
     qs: string,
@@ -5770,7 +5768,7 @@ describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () =>
     await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
     const dir = testDir("kg-manifest");
     fs.writeFileSync(path.join(dir, "sources.yml"), "trackers:\n  - team: GHOST\n  - team: AII\n");
-    getScopedInstallationTokenMock.mockResolvedValue(manifestRepoToken());
+    getScopedInstallationTokenMock.mockResolvedValue(makeScopedInstallationToken());
     getRepoDefaultBranchMock.mockResolvedValue("main");
     fetchRepoTarballMock.mockResolvedValue(Buffer.from(""));
     extractSourceMock.mockResolvedValue(dir);
@@ -5797,7 +5795,7 @@ describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () =>
     await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
     const dir = testDir("kg-manifest");
     fs.writeFileSync(path.join(dir, "sources.yml"), "trackers:\n  - team: AII\n");
-    getScopedInstallationTokenMock.mockResolvedValue(manifestRepoToken());
+    getScopedInstallationTokenMock.mockResolvedValue(makeScopedInstallationToken());
     getRepoDefaultBranchMock.mockResolvedValue("main");
     fetchRepoTarballMock.mockResolvedValue(Buffer.from(""));
     extractSourceMock.mockResolvedValue(dir);

@@ -21,6 +21,7 @@ Some defaults are not fixed literals. They change with each build, or they follo
 | Builder | Field | Its value |
 |---|---|---|
 | `makeJob` | `dispatchedAt` | The clock when the object is built |
+| `makeScopedInstallationToken` | `expiresAt` | An hour after the object is built, in GitHub's form (`2026-01-01T01:00:00Z`, no milliseconds), which the mint passes through verbatim |
 | `makeReviewFixResult` | `deadlineAt` | An hour after the object is built |
 | `makeReviewFixRunConfig` | The attempt's `deadlineAt` | An hour after the object is built |
 | `makeReviewFixRunConfig` | The envelope's issue and PR number | The attempt it carries, as the review-fix worker derives them |

@@ -383,11 +383,7 @@ describe("postPushReviewStep", () => {
     });
     const ghSpawn = vi.fn((args: string[]) => ({ stdout: args[0] === "pr" && args[1] === "diff" ? "diff" : "", exitCode: 0 }));
     const run = (ctx: any, maxIterations: number) =>
-      postPushReviewStep.run(
-        ctx,
-        { prNumber: "42", workspaceDir: "/tmp", maxIterations, ghSpawn, gitSpawn, refreshCredentials: vi.fn(async () => undefined) },
-        { report: vi.fn(async () => undefined) },
-      );
+      runReview(ctx, { prNumber: "42", workspaceDir, maxIterations, ghSpawn, gitSpawn }, { report: vi.fn(async () => undefined) });
 
     it("stamps review on reviewers and implementation on the fix call", async () => {
       const invoke = vi.fn()
@@ -427,7 +423,7 @@ describe("postPushReviewStep", () => {
         }),
       } as any;
       const executor = createStageExecutor({
-        workspaceDir: "/tmp",
+        workspaceDir,
         legacy: { invoke: vi.fn(async () => { throw new Error("legacy executor must not run"); }) } as any,
         snapshot,
         auth,
@@ -450,11 +446,7 @@ describe("postPushReviewStep", () => {
     const approvedVerdict = { approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "ok" };
     const advisoryBlocker = { approved: false, findings: [{ severity: "blocking", body: "Advisory concern" }] };
     const runWith = (ctx: any, maxIterations: number, extra: Record<string, unknown> = {}, ghs = ghSpawn) =>
-      postPushReviewStep.run(
-        ctx,
-        { prNumber: "42", workspaceDir: "/tmp", maxIterations, ghSpawn: ghs, gitSpawn, refreshCredentials: vi.fn(async () => undefined), ...extra },
-        { report: vi.fn(async () => undefined) },
-      );
+      runReview(ctx, { prNumber: "42", workspaceDir, maxIterations, ghSpawn: ghs, gitSpawn, ...extra }, { report: vi.fn(async () => undefined) });
 
     it("runs different agents and profiles for review and fix in one cycle through the real stage executor", async () => {
       // makeSnapshot: review = claude/p-rev, implementation = codex/p-impl.
@@ -525,9 +517,10 @@ describe("postPushReviewStep", () => {
       });
       const out: any = await runWith(makeCtx(vi.fn(async () => timedOut as any), { agentConfig: codex }), 1, {}, gh as any);
       expect(out.approved).toBe(false);
-      const text = comments.join("\n");
-      expect(text).toContain("ran out of its time budget (timeout 90s)");
-      expect(text).not.toContain("ran out of turns");
+      expect(comments.some((comment) => comment.includes(REVIEW_LINK))).toBe(true);
+      const report = submittedReview(gh);
+      expect(report).toContain("ran out of its time budget (timeout 90s)");
+      expect([...comments, report].join("\n")).not.toContain("ran out of turns");
     });
 
     it("keeps the Claude and legacy cap message in turns", async () => {
@@ -543,7 +536,8 @@ describe("postPushReviewStep", () => {
           return ghSpawn(args);
         });
         await runWith(makeCtx(vi.fn(async () => capped), data), 1, {}, gh as any);
-        expect(comments.join("\n")).toMatch(/ran out of turns at the configured cap \(\d+\)/);
+        expect(comments.some((comment) => comment.includes(REVIEW_LINK))).toBe(true);
+        expect(submittedReview(gh)).toMatch(/ran out of turns at the configured cap \(\d+\)/);
       }
     });
 
@@ -4002,9 +3996,9 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
     const ctx = makeCtx(invoke);
 
-    const out = await postPushReviewStep.run(
+    const out = await runReview(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );
 

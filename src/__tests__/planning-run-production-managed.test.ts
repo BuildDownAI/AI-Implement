@@ -18,7 +18,7 @@ vi.mock("../github.js", async (importOriginal) => ({
 }));
 vi.mock("../github-app-auth.js", () => ({
   getInstallationToken: vi.fn(async () => "control-token"),
-  getScopedInstallationToken: vi.fn(async () => ({ token: "scoped-token", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 1 })),
+  getScopedInstallationToken: vi.fn(async () => (await import("./helpers/builders.js")).makeScopedInstallationToken()),
 }));
 vi.mock("../log.js", () => ({
   getJobByDispatchId: vi.fn(),
