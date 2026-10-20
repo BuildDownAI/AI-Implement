@@ -2,14 +2,16 @@
  * worker; only GitHub's external boundary is synthetic. No runner/model credentials. */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import http from "node:http";
+import { makeAppConfig, makeChatGptPlanRecord, makeMapping, makeScopedInstallationToken, makeScopedPrIdentity } from "./helpers/builders.js";
+import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
+import { githubError, githubFile } from "./helpers/replies/github.js";
+import { testDb } from "./helpers/test-db.js";
+import { testDir } from "./helpers/test-dir.js";
 import type { spawn } from "node:child_process";
-import { ghaRunStepEnv, GHA_IMPLEMENT_WORKFLOWS, GHA_PLAN_WORKFLOWS } from "./gha-handoff-fixture.js";
-import { installCodexChild, codexChild, resetCodexChild } from "./codex-composition-fixture.js";
+import { ghaRunStepEnv, GHA_IMPLEMENT_WORKFLOWS, GHA_PLAN_WORKFLOWS } from "./helpers/fixtures/gha-handoff.js";
+import { installCodexChild, codexChild, resetCodexChild } from "./helpers/fixtures/codex-composition.js";
 import type { AddressInfo } from "node:net";
-import type { RepoMapping } from "../config.js";
 import type { DispatchInputs, DispatchResult } from "../github.js";
 import type { PreparedReviewFixAttempt } from "../review-fix-ports.js";
 import type { ModelAuthRuntime } from "../model-auth-runtime.js";
@@ -17,10 +19,11 @@ import type { ModelAuthRuntime } from "../model-auth-runtime.js";
 const nativeFetch = globalThis.fetch;
 const SECRET = "SYNTHETIC-reviewfix-token-secret";
 const ACCESS = "SYNTHETIC-reviewfix-model-access";
-const CONFIG = { githubAppId: "1", githubAppPrivateKey: "synthetic-key", runnerTokenSecret: SECRET,
-  runnerCallbackBaseUrl: "https://orchestrator.example", sessionImage: "ghcr.io/builddownai/runner:next", runnerImageExplicit: false };
-const SCOPE = { installationId: 7, repository: "acme/app", prNumber: 42 };
+const CONFIG = makeAppConfig({ runnerTokenSecret: SECRET, runnerCallbackBaseUrl: "https://orchestrator.example" });
+const SCOPE = makeScopedPrIdentity({ installationId: 7, repository: "acme/app" });
+const DISPATCHES = "POST /repos/acme/app/actions/workflows/claude-implement.yml/dispatches";
 let dbPath: string;
+let githubApi: FakeFetch;
 let dedup: typeof import("../dedup.js");
 let config: typeof import("../config.js");
 let profiles: typeof import("../agent-config-store.js");
@@ -62,9 +65,6 @@ async function decode(index = 0) {
 }
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `managed-review-fix-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  vi.stubEnv("DEDUP_DB_PATH", dbPath);
   vi.stubEnv("RUNNER_TOKEN_SECRET", SECRET);
   vi.stubEnv("RUNNER_MODE", "gha");
   installationId = 7;
@@ -72,13 +72,13 @@ beforeEach(async () => {
   candidateRuns = [];
   workflow = fs.readFileSync("workflows/claude-implement.yml", "utf8");
   sent = [];
-  dispatchResult = { success: true, status: 204, outcome: "accepted", runId: 9100 };
+  dispatchResult = { success: true, status: 200, outcome: "accepted", runId: 9100, runUrl: "https://github.com/acme/app/actions/runs/9100" };
   dispatchThrows = false;
   vi.doMock("../github-app-auth.js", () => ({
     getInstallation: async () => ({ token: "SYNTHETIC-github-token", installationId }),
     getInstallationToken: async () => "SYNTHETIC-github-token",
     getInstallationId: async () => installationId,
-    getScopedInstallationToken: async () => ({ token: "SYNTHETIC-github-token", installationId, expiresAt: "" }),
+    getScopedInstallationToken: async () => makeScopedInstallationToken({ token: "SYNTHETIC-github-token", installationId }),
   }));
   vi.doMock("../github.js", async () => {
     const actual = await vi.importActual<typeof import("../github.js")>("../github.js");
@@ -93,72 +93,46 @@ beforeEach(async () => {
       },
     };
   });
-  const fetchImpl: typeof fetch = async (input) => {
-    const url = String(input);
-    if (url.includes("/actions/workflows/")) return Response.json({ workflow_runs: candidateRuns });
-    if (url.includes("/actions/runs/")) return Response.json({ status: "completed", conclusion: "failure", run_attempt: 1 });
-    if (url.includes("/contents/.github/workflows/")) return Response.json({ type: "file", encoding: "base64", content: Buffer.from(workflow).toString("base64") });
-    if (url.includes("/contents/.ai-implement/image.yml")) return new Response(null, { status: 404 });
-    return Response.json({ visibility: "private" });
-  };
-  vi.stubGlobal("fetch", fetchImpl);
-  dedup = await import("../dedup.js");
-  dedup.getDb();
-  (await import("../runner-mode.js")).initSettingsTable();
-  config = await import("../config.js");
-  profiles = await import("../agent-config-store.js");
-  production = await import("../restate/review-fix-production.js");
-  const { createModelAuthRuntime } = await import("../model-auth-runtime.js");
-  runtime = createModelAuthRuntime({ config: CONFIG, env: { RUNNER_TOKEN_SECRET: SECRET }, fetchImpl });
+  // GitHub's side of the launch, for the runtime's reads and the global fetch alike. A dispatch reaches this route only
+  // where a test runs the real postWorkflowDispatch.
+  githubApi = fakeFetch({
+    "GET /repos/acme/app": { json: { full_name: "acme/app", private: true, visibility: "private" } },
+    "GET /repos/acme/app/contents/.github/workflows/claude-implement.yml": () => githubFile(workflow),
+    "GET /repos/acme/app/contents/.ai-implement/image.yml": githubError(404, "Not Found"),
+    "GET /repos/acme/app/actions/workflows/claude-implement.yml/runs": () => ({
+      json: { total_count: candidateRuns.length, workflow_runs: candidateRuns },
+    }),
+    "GET /repos/acme/app/actions/runs/9100": { json: { id: 9100, run_attempt: 1, status: "completed", conclusion: "failure" } },
+    [DISPATCHES]: ({ body }) => {
+      sent.push((JSON.parse(body) as { inputs: DispatchInputs }).inputs);
+      return { json: {
+        workflow_run_id: 9100,
+        run_url: "https://api.github.com/repos/acme/app/actions/runs/9100",
+        html_url: "https://github.com/acme/app/actions/runs/9100",
+      } };
+    },
+  }).install();
+  const db = await testDb({ modules: {
+    dedup: () => import("../dedup.js"),
+    config: () => import("../config.js"),
+    profiles: () => import("../agent-config-store.js"),
+    production: () => import("../restate/review-fix-production.js"),
+    modelAuthRuntime: () => import("../model-auth-runtime.js"),
+    attemptStore: () => import("../review-fix-attempt-store.js"),
+  } });
+  ({ dedup, config, profiles, production } = db.modules);
+  dbPath = db.path;
+  runtime = db.modules.modelAuthRuntime.createModelAuthRuntime({ config: CONFIG, env: { RUNNER_TOKEN_SECRET: SECRET }, fetchImpl: githubApi.fetch });
   for (const profileId of ["cdx", "other"]) {
     profiles.saveAccountProfileRevision({ profileId, identity: profileId, revision: 1, agent: "codex", provider: "openai",
       authMode: "codex-subscription", allowedProjectKeys: ["AII"] });
-    expect(runtime.sessionStore.writePlanRecord({ profileId, expectedSequence: null, sessionData: JSON.stringify({
-      version: 1, email: "synthetic@example.com", issuer: "https://auth.openai.com", subject: profileId, clientId: "synthetic",
-      extAgentHostId: "synthetic", idToken: "synthetic-id", accessToken: ACCESS, refreshToken: "synthetic-refresh",
-      tokenType: "Bearer", scopes: ["chatgpt.tokens.use.direct"], accessTokenExpiresAt: Date.now() + 3_600_000,
-      earliestRefreshAt: null, savedAt: Date.now(),
-    }) }).ok).toBe(true);
+    expect(runtime.sessionStore.writePlanRecord({ profileId, expectedSequence: null,
+      sessionData: JSON.stringify(makeChatGptPlanRecord({ subject: profileId, accessToken: ACCESS })) }).ok).toBe(true);
   }
   defaults();
   profiles.setProjectOptIn("AII", true);
-  config.initMappingsTable();
-  const mapping = (() => {
-  return {
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: false,
-    planningWorkflowFile: "",
-    autoApprovePlans: true,
-    autoMerge: false,
-    extraEnv: {},
-    provider: "anthropic",
-    ticketingProvider: "linear",
-    ticketingConfig: { kind: "linear" },
-    awsRegion: null,
-    paused: false,
-    maxTurns: null,
-    maxIterations: null,
-    maxJobMinutes: null,
-    branchPrefix: null,
-    skillsRepo: null,
-    sensitiveAddPatterns: null,
-    sensitiveAllowPatterns: null,
-    dependencyTokenScope: null,
-    memoryProviderId: null,
-    referenceRepos: null,
-    reviewers: null,
-    owner: "acme", repo: "app", reviewFixLifecycle: "restate",
-  };
-  })() satisfies RepoMapping;
-  config.upsertMapping("AII", mapping);
-  const { SqliteReviewFixAttemptStore } = await import("../review-fix-attempt-store.js");
-  attempts = new SqliteReviewFixAttemptStore();
+  config.upsertMapping("AII", makeMapping({ owner: "acme", repo: "app", reviewFixLifecycle: "restate" }));
+  attempts = new db.modules.attemptStore.SqliteReviewFixAttemptStore();
   const admitted = await attempts.admit({ scope: SCOPE, feedback: { taskText: "Fix the trusted review finding",
     findings: [{ findingKey: "f1", version: 1 }] }, jobTimeoutMinutes: 30 });
   if (admitted.status !== "prepared") throw new Error(`fixture admission: ${admitted.status}`);
@@ -168,11 +142,8 @@ beforeEach(async () => {
 afterEach(async () => {
   if (server) { await new Promise<void>((resolve) => server!.close(() => resolve())); server = undefined; }
   resetCodexChild();
-  dedup?.closeDb();
   vi.unstubAllEnvs();
-  vi.unstubAllGlobals();
   vi.restoreAllMocks();
-  for (const suffix of ["", "-wal", "-shm"]) { try { fs.unlinkSync(dbPath + suffix); } catch { /* absent */ } }
 });
 
 describe("production managed GHA review-fix launch", () => {
@@ -225,22 +196,10 @@ describe("production managed GHA review-fix launch", () => {
     const github = await import("../github.js");
     const actual = await vi.importActual<typeof import("../github.js")>("../github.js");
     vi.spyOn(github, "postWorkflowDispatch").mockImplementation(actual.postWorkflowDispatch);
-    const fixtureFetch = globalThis.fetch;
-    vi.stubGlobal("fetch", async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
-      if (String(input).includes("/actions/workflows/") && init?.method === "POST") {
-        const body = JSON.parse(String(init.body)) as { inputs: DispatchInputs; return_run_details: boolean };
-        expect(body.return_run_details).toBe(true);
-        sent.push(body.inputs);
-        return Response.json({
-          workflow_run_id: 9100,
-          run_url: "https://api.github.com/repos/acme/app/actions/runs/9100",
-          html_url: "https://github.com/acme/app/actions/runs/9100",
-        });
-      }
-      return fixtureFetch(input, init);
-    });
     const { worker, plan } = await launch();
     const result = await worker.launch(plan);
+    const dispatches = githubApi.calls.filter((call) => `${call.method} ${call.path}` === DISPATCHES);
+    expect(dispatches.map((call) => (JSON.parse(call.body) as { return_run_details?: boolean }).return_run_details)).toEqual([true]);
     const grant = (await decode()).credentials?.modelAuthGrant;
     if (!grant || !("bearer" in grant)) throw new Error("expected plain GHA bootstrap");
     const { createModelAuthRoutes } = await import("../model-auth-routes.js");
@@ -282,7 +241,7 @@ describe("production managed GHA review-fix launch", () => {
     await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
     const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     const children = installCodexChild("exec");
-    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "reviewfix-configured-"));
+    const workspace = testDir("reviewfix-configured");
     const { prepareConfiguredRun } = await import("../run-autonomous.js");
     const configured = await prepareConfiguredRun({ env: handoff.runEnv, snapshot: (await decode()).agentConfig, workspaceDir: workspace, options: {
       modelAuthTransport: { post: async (route, body) => {
@@ -305,7 +264,6 @@ describe("production managed GHA review-fix launch", () => {
       expect(children[0].args).toContain("--dangerously-bypass-approvals-and-sandbox");
     } finally {
       await configured?.finish("completed");
-      fs.rmSync(workspace, { recursive: true, force: true });
     }
   });
 
@@ -317,18 +275,19 @@ describe("production managed GHA review-fix launch", () => {
     const envelope = await decode();
     expect(envelope.runnerPhase).toBe("gap-analysis");
     expect(envelope.credentials?.executionPolicy?.dispatchId).toBe(prepared.attemptId);
+    const workspace = testDir("reviewfix-policy");
     for (const file of GHA_IMPLEMENT_WORKFLOWS) {
       const handoff = ghaRunStepEnv(file, { runConfig: sent[0].run_config });
       expect(handoff.bootStatus).toBe(0);
       expect(handoff.runEnv.AI_IMPLEMENT_EXECUTION_POLICY).toBe(`v1:ephemeral-full-access:gha:${prepared.attemptId}:AII`);
-      const configured = await prepareConfiguredRun({ env: handoff.runEnv, snapshot: envelope.agentConfig, workspaceDir: os.tmpdir(), options: { modelAuthTransport: { post: async () => ({ status: 200, body: { version: 1, ok: true, acknowledged: true } }) } } });
+      const configured = await prepareConfiguredRun({ env: handoff.runEnv, snapshot: envelope.agentConfig, workspaceDir: workspace, options: { modelAuthTransport: { post: async () => ({ status: 200, body: { version: 1, ok: true, acknowledged: true } }) } } });
       expect(configured?.snapshot.snapshotId).toBe(envelope.agentConfig?.snapshotId);
       await configured?.finish("completed");
-      await expect(prepareConfiguredRun({ env: { ...handoff.runEnv, AI_IMPLEMENT_EXECUTION_POLICY: "" }, snapshot: envelope.agentConfig, workspaceDir: os.tmpdir() }))
+      await expect(prepareConfiguredRun({ env: { ...handoff.runEnv, AI_IMPLEMENT_EXECUTION_POLICY: "" }, snapshot: envelope.agentConfig, workspaceDir: workspace }))
         .rejects.toMatchObject({ reason: "execution_policy_invalid" });
       const missing = { ...handoff.runEnv };
       delete missing.AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID;
-      await expect(prepareConfiguredRun({ env: missing, snapshot: envelope.agentConfig, workspaceDir: os.tmpdir() })).rejects.toBeDefined();
+      await expect(prepareConfiguredRun({ env: missing, snapshot: envelope.agentConfig, workspaceDir: workspace })).rejects.toBeDefined();
     }
     for (const file of GHA_PLAN_WORKFLOWS) expect(ghaRunStepEnv(file, { runConfig: sent[0].run_config }).bootStatus).not.toBe(0);
   });
@@ -381,7 +340,9 @@ describe("production managed GHA review-fix launch", () => {
       });
       expect(denied.status).not.toBe(200);
       expect(await denied.text()).not.toContain(ACCESS);
-      candidateRuns = [{ id: 9100, run_attempt: 1, display_title: `fix · attempt ${prepared.attemptId}`, head_branch: "main" }];
+      // GitHub titles the run from the workflow's run-name: the dispatched identifier, then the attempt.
+      candidateRuns = [{ id: 9100, run_attempt: 1, head_branch: "main",
+        display_title: `Claude AI Implementation — ${sent[0].issue_identifier ?? "review-fix"} · attempt ${prepared.attemptId}` }];
       const recovered = await second.worker.reconcile(prepared.attemptId, SCOPE);
       expect(recovered.status).toBe("found");
       if (recovered.status !== "found") throw new Error("missing exact run");
@@ -483,7 +444,7 @@ describe("production managed GHA review-fix launch", () => {
   });
 
   it("still revokes the grant when the dispatch outcome is genuinely ambiguous", async () => {
-    dispatchResult = { success: false, status: 500, outcome: "unknown" } as typeof dispatchResult;
+    dispatchResult = { success: false, status: 500, outcome: "unknown" };
     const { worker, plan } = await launch();
     expect(await worker.launch(plan)).toEqual({ status: "unknown" });
     expect(revoked()).not.toBeNull();
@@ -600,6 +561,18 @@ describe("production managed GHA review-fix launch", () => {
       expect(count("model_credential_grants")).toBe(0);
     });
 
+    it("admits a Claude-API implementation without the hosted execution-policy marker, and launches with no policy", async () => {
+      await writeKey("api", "claude", "anthropic", "anthropic-api-key");
+      const claude = { agent: "claude" as const, provider: "anthropic" as const, model: "claude-sonnet-5-5",
+        accountProfileId: "api", invocationTimeoutMs: 60_000 };
+      profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: claude, implementation: claude, review: claude } });
+      workflow = workflow.replaceAll("github-hosted-execution-policy-v2", "unsupported-policy");
+      expect(await admit()).toBe("admit");
+      const { worker, plan } = await launch();
+      expect((await worker.launch(plan)).status).toBe("accepted");
+      expect((await decode()).credentials?.executionPolicy).toBeUndefined();
+    });
+
     it("defers on uncertainty and retained gates instead of failing", async () => {
       expect(await production.canAdmit(SCOPE, CONFIG)).toBe("defer");
       installationId = 99;
@@ -618,11 +591,10 @@ describe("production managed GHA review-fix launch", () => {
     it("defers rather than fails when the repository visibility is unknown", async () => {
       expect(await admit()).toBe("admit");
       const { enqueueReviewFix, getPendingReviewFixes } = await import("../review-fix-queue.js");
-      const queueId = enqueueReviewFix({ issueId: "i1", issueIdentifier: "AII-1", repo: SCOPE.repository, prNumber: SCOPE.prNumber, reason: "review" });
-      const unknownVisibility: typeof fetch = async (input) => String(input).includes("/actions/") || String(input).includes("/contents/")
-        ? Response.json({ workflow_runs: [] }) : new Response("boom", { status: 500 });
+      const queueId = enqueueReviewFix({ issueId: "i1", issueIdentifier: "AII-1", repo: SCOPE.repository, prNumber: SCOPE.prNumber, reason: "review_comment" });
+      const unknownVisibility = fakeFetch({ "GET /repos/acme/app": githubError(500, "Server Error") });
       const { createModelAuthRuntime } = await import("../model-auth-runtime.js");
-      const uncertain = createModelAuthRuntime({ config: CONFIG, env: { RUNNER_TOKEN_SECRET: SECRET }, fetchImpl: unknownVisibility });
+      const uncertain = createModelAuthRuntime({ config: CONFIG, env: { RUNNER_TOKEN_SECRET: SECRET }, fetchImpl: unknownVisibility.fetch });
       const before = [...sideEffects(), count("model_profile_reservations"), count("review_fix_attempts")];
       expect(await admit(uncertain)).toBe("defer");
       expect(getPendingReviewFixes().map((row) => row.id)).toContain(queueId);
@@ -631,7 +603,7 @@ describe("production managed GHA review-fix launch", () => {
 
     it("defers on a real locked database, keeps the queue row pending, then admits after the lock clears", async () => {
       const { enqueueReviewFix, getPendingReviewFixes } = await import("../review-fix-queue.js");
-      const queueId = enqueueReviewFix({ issueId: "i1", issueIdentifier: "AII-1", repo: SCOPE.repository, prNumber: SCOPE.prNumber, reason: "review" });
+      const queueId = enqueueReviewFix({ issueId: "i1", issueIdentifier: "AII-1", repo: SCOPE.repository, prNumber: SCOPE.prNumber, reason: "review_comment" });
       const request = { scope: SCOPE, feedback: { taskText: "t", findings: [{ findingKey: "f1", version: 1 }], queueCursor: { queueId, eventId: 1 } },
         jobTimeoutMinutes: 30 };
       const before = [...sideEffects(), count("model_profile_reservations")];
@@ -663,7 +635,7 @@ describe("production managed GHA review-fix launch", () => {
         workflow = workflow.replace(new RegExp(`^(\\s{2,})${input}:\\s*$`, "m"), "$1renamed_input:");
         expect(workflow).not.toMatch(new RegExp(`^\\s{2,}${input}:\\s*$`, "m"));
         const { enqueueReviewFix, getPendingReviewFixes } = await import("../review-fix-queue.js");
-        const queueId = enqueueReviewFix({ issueId: "i1", issueIdentifier: "AII-1", repo: SCOPE.repository, prNumber: SCOPE.prNumber, reason: "review" });
+        const queueId = enqueueReviewFix({ issueId: "i1", issueIdentifier: "AII-1", repo: SCOPE.repository, prNumber: SCOPE.prNumber, reason: "review_comment" });
         expect(await admit()).toBe("configuration_error");
         const request = { scope: SCOPE, feedback: { taskText: "t", findings: [], queueCursor: { queueId, eventId: 1 } }, jobTimeoutMinutes: 30 };
         const attemptsBefore = count("review_fix_attempts");
@@ -700,7 +672,7 @@ describe("production managed GHA review-fix launch", () => {
 
     it("fails the queue row with a code-only log and reserves nothing on a bad configuration", async () => {
       const { enqueueReviewFix, getPendingReviewFixes } = await import("../review-fix-queue.js");
-      const queueId = enqueueReviewFix({ issueId: "i1", issueIdentifier: "AII-1", repo: SCOPE.repository, prNumber: SCOPE.prNumber, reason: "review" });
+      const queueId = enqueueReviewFix({ issueId: "i1", issueIdentifier: "AII-1", repo: SCOPE.repository, prNumber: SCOPE.prNumber, reason: "review_comment" });
       profiles.saveAccountProfileRevision({ profileId: "cdx", identity: "cdx", revision: 2, agent: "codex", provider: "openai",
         authMode: "codex-subscription", allowedProjectKeys: ["OTHER"] });
       const logged: string[] = [];

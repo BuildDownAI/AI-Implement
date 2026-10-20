@@ -1,18 +1,20 @@
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { get } from "node:http";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { main } from "../chatgpt-plan-login.js";
 import type { LoginDeps } from "../chatgpt-plan-login.js";
 import { parseChatGptPlanRecord } from "../chatgpt-plan-token.js";
+import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
+import { testDir } from "./helpers/test-dir.js";
 
 const ACCESS = "SENTINEL-ACCESS-TOKEN";
 const REFRESH = "SENTINEL-REFRESH-TOKEN";
 const NOW = 1_800_000_000_000;
 const ISSUED = "oaiapp_issuedclient123";
-const REVOKE_URL = "https://auth.openai.com/oauth/revoke";
+// As OpenAI's published OpenID configuration lists it.
+const REVOKE_URL = "https://auth.openai.com/api/accounts/oauth/revoke";
 const SCOPE = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
 
 const good = generateKeyPairSync("rsa", { modulusLength: 2048 });
@@ -42,6 +44,8 @@ let err: string[];
 let urls: URL[];
 let tokenBodies: URLSearchParams[];
 let revokeBodies: URLSearchParams[];
+/** Every OpenAI fake this test's harnesses built. */
+let openai: FakeFetch[];
 
 function hit(url: string): Promise<{ status: number }> {
   return new Promise((res) => {
@@ -54,6 +58,37 @@ function hit(url: string): Promise<{ status: number }> {
 
 function harness(s: Scenario = {}, extra: Partial<LoginDeps> = {}): LoginDeps {
   let nonce = "";
+  const fake = fakeFetch({
+    "GET /.well-known/openid-configuration": {
+      json: { issuer: "https://auth.openai.com", jwks_uri: "https://auth.openai.com/.well-known/jwks.json", revocation_endpoint: REVOKE_URL },
+    },
+    "GET /.well-known/jwks.json": { json: { keys: [jwk] } },
+    "POST /api/accounts/oauth/token": (call) => {
+      const body = new URLSearchParams(call.body);
+      tokenBodies.push(body);
+      const clientId = body.get("client_id")!;
+      const claims = s.claims
+        ? s.claims(nonce)
+        : { iss: "https://auth.openai.com", aud: [clientId], exp: NOW / 1000 + 3600, nonce, sub: "user-1", email: "a@b.co" };
+      return {
+        json: {
+          access_token: ACCESS,
+          refresh_token: REFRESH,
+          id_token: makeIdToken(claims, s.signer),
+          expires_in: 3600,
+          scope: SCOPE,
+          earliest_refresh_at: NOW / 1000 + 600,
+          ...s.tokenReply,
+        },
+      };
+    },
+    "POST /api/accounts/oauth/revoke": (call) => {
+      revokeBodies.push(new URLSearchParams(call.body));
+      if (s.revoke === "throw") throw new Error(`boom ${REFRESH}`);
+      return s.revoke === "500" ? { status: 500, text: "nope" } : { status: 200 };
+    },
+  });
+  openai.push(fake);
   return {
     now: () => NOW,
     port: 0,
@@ -69,39 +104,7 @@ function harness(s: Scenario = {}, extra: Partial<LoginDeps> = {}): LoginDeps {
       if (s.callback) q = s.callback(q);
       void hit(`${url.searchParams.get("redirect_uri")}?${q.toString()}`);
     },
-    fetch: (async (input: string | URL | Request, init?: RequestInit) => {
-      const u = String(input);
-      if (u.endsWith("/.well-known/openid-configuration")) {
-        return Response.json({
-          issuer: "https://auth.openai.com",
-          jwks_uri: "https://auth.openai.com/.well-known/jwks.json",
-          revocation_endpoint: REVOKE_URL,
-        });
-      }
-      if (u.endsWith("jwks.json")) return Response.json({ keys: [jwk] });
-      if (u === "https://auth.openai.com/api/accounts/oauth/token") {
-        tokenBodies.push(init!.body as URLSearchParams);
-        const clientId = (init!.body as URLSearchParams).get("client_id")!;
-        const claims = s.claims
-          ? s.claims(nonce)
-          : { iss: "https://auth.openai.com", aud: [clientId], exp: NOW / 1000 + 3600, nonce, sub: "user-1", email: "a@b.co" };
-        return Response.json({
-          access_token: ACCESS,
-          refresh_token: REFRESH,
-          id_token: makeIdToken(claims, s.signer),
-          expires_in: 3600,
-          scope: SCOPE,
-          earliest_refresh_at: NOW / 1000 + 600,
-          ...s.tokenReply,
-        });
-      }
-      if (u === REVOKE_URL) {
-        revokeBodies.push(init!.body as URLSearchParams);
-        if (s.revoke === "throw") throw new Error(`boom ${REFRESH}`);
-        return new Response(s.revoke === "500" ? "nope" : "", { status: s.revoke === "500" ? 500 : 200 });
-      }
-      throw new Error(`unexpected fetch ${u}`);
-    }) as typeof fetch,
+    fetch: fake.fetch,
     ...extra,
   };
 }
@@ -109,17 +112,19 @@ function harness(s: Scenario = {}, extra: Partial<LoginDeps> = {}): LoginDeps {
 const allOutput = () => [...out, ...err].join("\n");
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "chatgpt-login-"));
+  dir = testDir("chatgpt-login");
   record = join(dir, "credentials.json");
   out = [];
   err = [];
   urls = [];
   tokenBodies = [];
   revokeBodies = [];
+  openai = [];
 });
 afterEach(() => {
-  rmSync(dir, { recursive: true, force: true });
   vi.useRealTimers();
+  // Routes match on the path alone, so the host every request went to is checked here.
+  for (const call of openai.flatMap((fake) => fake.calls)) expect(call.url.host).toBe("auth.openai.com");
 });
 
 describe("login", () => {

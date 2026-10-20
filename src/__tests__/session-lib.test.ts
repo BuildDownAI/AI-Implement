@@ -1,10 +1,10 @@
-import { afterEach, describe, it, expect } from "vitest";
+import { describe, it, expect } from "vitest";
 
 const isWindows = process.platform === "win32";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { testDir } from "./helpers/test-dir.js";
 
 function runBash(script: string) {
   return spawnSync("bash", ["-lc", script], {
@@ -164,15 +164,8 @@ describe.skipIf(isWindows)("resolve_envelope_field / select_runner_entry", () =>
 });
 
 describe.skipIf(isWindows)("verify_workspace_writable", () => {
-  const cleanupDirs: string[] = [];
-
-  afterEach(() => {
-    for (const dir of cleanupDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-  });
-
   function makeEnv(): { binDir: string; workspace: string } {
-    const root = mkdtempSync(join(tmpdir(), "lib-ws-test-"));
-    cleanupDirs.push(root);
+    const root = testDir("lib-ws");
     const binDir = join(root, "bin");
     const workspace = join(root, "workspace");
     mkdirSync(binDir);
@@ -251,12 +244,10 @@ describe.skipIf(isWindows)("verify_workspace_writable", () => {
     // cannot contain /), so we reference it via $PROBE_SENTINEL and pass the real
     // path as an env var.  If the trap were to eval the probe path, it would run
     // `touch $PROBE_SENTINEL` and create the sentinel file.
-    const sentinelRoot = mkdtempSync(join(tmpdir(), "sentinel-test-"));
-    cleanupDirs.push(sentinelRoot);
+    const sentinelRoot = testDir("sentinel");
     const sentinel = join(sentinelRoot, "PWNED");
 
-    const wsRoot = mkdtempSync(join(tmpdir(), "hostile-ws-"));
-    cleanupDirs.push(wsRoot);
+    const wsRoot = testDir("hostile-ws");
     // $, (, ), and space are valid filename characters on Linux.
     const hostileWs = join(wsRoot, "ws-$(touch $PROBE_SENTINEL)");
     mkdirSync(hostileWs);
@@ -279,12 +270,10 @@ describe.skipIf(isWindows)("verify_workspace_writable", () => {
   });
 
   it("does not execute backtick syntax embedded in the workspace path during cleanup", () => {
-    const sentinelRoot = mkdtempSync(join(tmpdir(), "sentinel-test-"));
-    cleanupDirs.push(sentinelRoot);
+    const sentinelRoot = testDir("sentinel");
     const sentinel = join(sentinelRoot, "PWNED");
 
-    const wsRoot = mkdtempSync(join(tmpdir(), "hostile-ws-"));
-    cleanupDirs.push(wsRoot);
+    const wsRoot = testDir("hostile-ws");
     // Backtick is a valid filename character on Linux.
     const hostileWs = join(wsRoot, "ws-`touch $PROBE_SENTINEL`");
     mkdirSync(hostileWs);
@@ -308,15 +297,8 @@ describe.skipIf(isWindows)("verify_workspace_writable", () => {
 });
 
 describe.skipIf(isWindows)("local auth bootstrap ownership handoff", () => {
-  const cleanupDirs: string[] = [];
-
-  afterEach(() => {
-    for (const dir of cleanupDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-  });
-
   function makeEnv(): { root: string; binDir: string; bootstrapDir: string; bootstrapFile: string; log: string } {
-    const root = mkdtempSync(join(tmpdir(), "bootstrap-owner-test-"));
-    cleanupDirs.push(root);
+    const root = testDir("bootstrap-owner-test");
     const binDir = join(root, "bin");
     const bootstrapDir = join(root, "ai-implement-local-auth-abc");
     const bootstrapFile = join(bootstrapDir, "bootstrap.json");
@@ -443,24 +425,20 @@ describe.skipIf(isWindows)("session/lib.sh configured-run helpers (AII-951)", ()
     });
 
     it("git_authed puts the token only in the git child's environment, never in argv", () => {
-      const dir = mkdtempSync(join(tmpdir(), "git-authed-"));
+      const dir = testDir("git-authed");
       const log = join(dir, "log");
       writeFileSync(join(dir, "git"), `#!/bin/sh\n{ echo "argv: $*"; env; } > '${log}'\n`);
       chmodSync(join(dir, "git"), 0o755);
-      try {
-        const r = run('CONFIGURED=1; git_authed clone https://github.com/o/r.git /w', {
-          PATH: `${dir}:${process.env.PATH}`, HOME: "/h", GITHUB_TOKEN: "SYNTHETIC-token", OPENAI_API_KEY: "SENTINEL-openai",
-        });
-        expect(r.status, r.stderr).toBe(0);
-        const seen = readFileSync(log, "utf-8");
-        expect(seen).toContain("argv: clone https://github.com/o/r.git /w");
-        expect(seen.split("\n")[0]).not.toContain("SYNTHETIC-token");
-        expect(seen).toContain("GIT_PASSWORD=SYNTHETIC-token");
-        expect(seen).not.toContain("GITHUB_TOKEN");
-        expect(seen).not.toContain("SENTINEL-openai");
-      } finally {
-        rmSync(dir, { recursive: true, force: true });
-      }
+      const r = run('CONFIGURED=1; git_authed clone https://github.com/o/r.git /w', {
+        PATH: `${dir}:${process.env.PATH}`, HOME: "/h", GITHUB_TOKEN: "SYNTHETIC-token", OPENAI_API_KEY: "SENTINEL-openai",
+      });
+      expect(r.status, r.stderr).toBe(0);
+      const seen = readFileSync(log, "utf-8");
+      expect(seen).toContain("argv: clone https://github.com/o/r.git /w");
+      expect(seen.split("\n")[0]).not.toContain("SYNTHETIC-token");
+      expect(seen).toContain("GIT_PASSWORD=SYNTHETIC-token");
+      expect(seen).not.toContain("GITHUB_TOKEN");
+      expect(seen).not.toContain("SENTINEL-openai");
     });
   });
 
@@ -522,20 +500,16 @@ describe.skipIf(isWindows)("session/lib.sh configured-run helpers (AII-951)", ()
 
   describe("node decoders never start with ambient preload controls", () => {
     const withFixture = (fn: (fx: { dist: string; preload: string; marker: string }) => void) => {
-      const dir = mkdtempSync(join(tmpdir(), "session-node-"));
-      try {
-        const dist = join(dir, "dist");
-        mkdirSync(dist);
-        const marker = join(dir, "marker");
-        const preload = join(dir, "preload.cjs");
-        writeFileSync(preload, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, String(Boolean(process.env.AI_IMPLEMENT_RUN_CONFIG)));\n`);
-        // Stand-in trusted decoder: this suite probes launch hygiene, not decoding.
-        writeFileSync(join(dist, "run-config.js"),
-          'export function decodeTrustedRunConfig(e){ if (e === "BAD") throw new Error("bad"); return { agentConfig: {}, credentials: { modelAuthGrant: {} } }; }\n');
-        fn({ dist, preload, marker });
-      } finally {
-        rmSync(dir, { recursive: true, force: true });
-      }
+      const dir = testDir("session-node");
+      const dist = join(dir, "dist");
+      mkdirSync(dist);
+      const marker = join(dir, "marker");
+      const preload = join(dir, "preload.cjs");
+      writeFileSync(preload, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, String(Boolean(process.env.AI_IMPLEMENT_RUN_CONFIG)));\n`);
+      // Stand-in trusted decoder: this suite probes launch hygiene, not decoding.
+      writeFileSync(join(dist, "run-config.js"),
+        'export function decodeTrustedRunConfig(e){ if (e === "BAD") throw new Error("bad"); return { agentConfig: {}, credentials: { modelAuthGrant: {} } }; }\n');
+      fn({ dist, preload, marker });
     };
     const run = (script: string, env: Record<string, string>) =>
       spawnSync("bash", ["-c", `source session/lib.sh\n${script}`], { encoding: "utf-8", env: { PATH: process.env.PATH ?? "", ...env } });
@@ -576,18 +550,16 @@ describe.skipIf(isWindows)("session/lib.sh configured-run helpers (AII-951)", ()
 
 describe.skipIf(isWindows)("local configured bootstrap classification", () => {
   const classify = (envelope: string | undefined, pointer: string | undefined, grant = false) => {
-    const dir = mkdtempSync(join(tmpdir(), "local-classify-"));
-    try {
-      mkdirSync(join(dir, "local"));
-      writeFileSync(join(dir, "run-config.js"), `export function decodeTrustedRunConfig(e) { if(e === "bad") throw Error(); return {agentConfig:e === "snapshot" ? {} : undefined, credentials:${grant ? '{modelAuthGrant:{}}' : '{}'}}; }`);
-      writeFileSync(join(dir, "local/session.js"), 'export function validateLocalSessionBootstrap(p) { if (p !== "/private/valid") throw Error("private error"); }');
-      return spawnSync("bash", ["-c", "source session/lib.sh; classify_run_config"], {
-        encoding: "utf-8",
-        env: { PATH: process.env.PATH ?? "", AI_IMPLEMENT_DIST_DIR: dir,
-          ...(envelope ? { AI_IMPLEMENT_RUN_CONFIG: envelope } : {}),
-          ...(pointer ? { AI_IMPLEMENT_LOCAL_AUTH_BOOTSTRAP_FILE: pointer } : {}) },
-      });
-    } finally { rmSync(dir, { recursive: true, force: true }); }
+    const dir = testDir("local-classify");
+    mkdirSync(join(dir, "local"));
+    writeFileSync(join(dir, "run-config.js"), `export function decodeTrustedRunConfig(e) { if(e === "bad") throw Error(); return {agentConfig:e === "snapshot" ? {} : undefined, credentials:${grant ? '{modelAuthGrant:{}}' : '{}'}}; }`);
+    writeFileSync(join(dir, "local/session.js"), 'export function validateLocalSessionBootstrap(p) { if (p !== "/private/valid") throw Error("private error"); }');
+    return spawnSync("bash", ["-c", "source session/lib.sh; classify_run_config"], {
+      encoding: "utf-8",
+      env: { PATH: process.env.PATH ?? "", AI_IMPLEMENT_DIST_DIR: dir,
+        ...(envelope ? { AI_IMPLEMENT_RUN_CONFIG: envelope } : {}),
+        ...(pointer ? { AI_IMPLEMENT_LOCAL_AUTH_BOOTSTRAP_FILE: pointer } : {}) },
+    });
   };
 
   it("accepts snapshot plus validated local bootstrap without a hosted grant", () => {

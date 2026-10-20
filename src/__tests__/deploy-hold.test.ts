@@ -1,37 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import type * as DedupModule from "../dedup.js";
 import type * as DeployHoldModule from "../deploy-hold.js";
-import type * as RunnerModeModule from "../runner-mode.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
-let dedup: typeof DedupModule;
 let hold: typeof DeployHoldModule;
+let reopen: () => Promise<{ hold: typeof DeployHoldModule }>;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `deploy-hold-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  hold = await import("../deploy-hold.js");
-  const runnerMode: typeof RunnerModeModule = await import("../runner-mode.js");
-  runnerMode.initSettingsTable(); // the hold is a `settings` row; runner-mode owns that DDL
+  const db = await testDb({ modules: { hold: () => import("../deploy-hold.js") } });
+  ({ hold } = db.modules);
+  reopen = db.reopen;
 });
 
 afterEach(() => {
   vi.useRealTimers();
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
 });
+
+// A database that never had initSettingsTable() run against it.
+async function bareHold(): Promise<typeof DeployHoldModule> {
+  return (await testDb({ tables: "none", modules: { hold: () => import("../deploy-hold.js") } })).modules.hold;
+}
 
 describe("deploy hold", () => {
   it("is not held on a fresh database", () => {
@@ -58,35 +45,14 @@ describe("deploy hold", () => {
 
   it("reads false rather than throwing when the settings table is missing", async () => {
     // A read failure must not wedge dispatch: isDeployHeld swallows it and reports "not held".
-    // Simulated by a database that never had initSettingsTable() run against it.
-    vi.resetModules();
-    const bareDbPath = path.join(
-      os.tmpdir(),
-      `deploy-hold-bare-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-    );
-    process.env.DEDUP_DB_PATH = bareDbPath;
-    const bareDedup: typeof DedupModule = await import("../dedup.js");
-    const bareHold: typeof DeployHoldModule = await import("../deploy-hold.js");
-
-    expect(bareHold.isDeployHeld()).toBe(false);
-
-    bareDedup.closeDb();
-    try {
-      fs.unlinkSync(bareDbPath);
-    } catch {
-      /* ignore */
-    }
-    process.env.DEDUP_DB_PATH = dbPath;
+    expect((await bareHold()).isDeployHeld()).toBe(false);
   });
 
   it("survives a process boundary — the boot clear releases it, a restart alone does not", async () => {
     hold.setDeployHold();
-    dedup.closeDb();
 
     // A new process against the same volume: fresh modules, same sqlite file.
-    vi.resetModules();
-    dedup = await import("../dedup.js"); // reassigned so afterEach closes this handle
-    const hold2: typeof DeployHoldModule = await import("../deploy-hold.js");
+    const { hold: hold2 } = await reopen();
 
     expect(hold2.isDeployHeld()).toBe(true);
     expect(hold2.clearDeployHold()).toBe(true);
@@ -140,24 +106,7 @@ describe("deploy started-at clock", () => {
 
   it("reads null rather than throwing when the settings table is missing", async () => {
     // Same contract as isDeployHeld: a read failure must not wedge the page or the poll.
-    vi.resetModules();
-    const bareDbPath = path.join(
-      os.tmpdir(),
-      `deploy-hold-clock-bare-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-    );
-    process.env.DEDUP_DB_PATH = bareDbPath;
-    const bareDedup: typeof DedupModule = await import("../dedup.js");
-    const bareHold: typeof DeployHoldModule = await import("../deploy-hold.js");
-
-    expect(bareHold.getDeployStartedAt()).toBeNull();
-
-    bareDedup.closeDb();
-    try {
-      fs.unlinkSync(bareDbPath);
-    } catch {
-      /* ignore */
-    }
-    process.env.DEDUP_DB_PATH = dbPath;
+    expect((await bareHold()).getDeployStartedAt()).toBeNull();
   });
 
   // The elapsed time an operator reads has to span the deploy, not this process's uptime.
@@ -165,11 +114,8 @@ describe("deploy started-at clock", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-18T12:00:00.000Z"));
     hold.setDeployHold();
-    dedup.closeDb();
 
-    vi.resetModules();
-    dedup = await import("../dedup.js");
-    const hold2: typeof DeployHoldModule = await import("../deploy-hold.js");
+    const { hold: hold2 } = await reopen();
 
     expect(hold2.getDeployStartedAt()).toBe(Date.parse("2026-08-18T12:00:00.000Z"));
   });

@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
 import type * as DedupModule from "../dedup.js";
 import type * as Mod from "../model-protected-secrets.js";
+import { testDb } from "./helpers/test-db.js";
 
 const RTS = "SENTINEL-RUNNER-TOKEN-SECRET-mps";
 const ENV = { RUNNER_TOKEN_SECRET: RTS } as NodeJS.ProcessEnv;
@@ -14,7 +14,6 @@ const BEDROCK = { region: "us-east-1", accessKeyId: "AKIASENTINEL1", secretAcces
 const REF = "model-account:api";
 const OTHER = "model-account:other";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let mod: typeof Mod;
 let spies: ReturnType<typeof vi.spyOn>[];
@@ -28,12 +27,9 @@ function rows() {
 }
 
 beforeEach(async () => {
-  dbPath = path.join(os.tmpdir(), `mps-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  vi.resetModules();
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  mod = await import("../model-protected-secrets.js");
-  dedup.getDb();
+  ({ dedup, mod } = (await testDb({
+    modules: { dedup: () => import("../dedup.js"), mod: () => import("../model-protected-secrets.js") },
+  })).modules);
   logged = [];
   spies = (["log", "info", "warn", "error", "debug"] as const).map((m) =>
     vi.spyOn(console, m).mockImplementation((...a: unknown[]) => { logged.push(a.map(String).join(" ")); }),
@@ -42,9 +38,6 @@ beforeEach(async () => {
 
 afterEach(() => {
   spies.forEach((s) => s.mockRestore());
-  dedup.closeDb?.();
-  delete process.env.DEDUP_DB_PATH;
-  for (const s of ["", "-wal", "-shm"]) fs.rmSync(dbPath + s, { force: true });
 });
 
 describe("round trip", () => {

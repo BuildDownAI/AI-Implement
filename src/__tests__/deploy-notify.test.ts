@@ -1,11 +1,9 @@
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DedupModule from "../dedup.js";
 import type * as DeployNotifyModule from "../deploy-notify.js";
 import type * as NotifyModule from "../notify.js";
 import type * as KgProviderModule from "../kg-provider.js";
+import { testDb } from "./helpers/test-db.js";
 
 // The formatters are covered by notify.test.ts; here we only care that the right
 // payload reaches them, so the whole notify module is replaced by a spy.
@@ -20,29 +18,27 @@ const SIDECAR = "http://127.0.0.1:8765";
 
 const config = { notifyType: "slack", notifyWebhookUrl: "https://hook.example.com", kgSidecarUrl: SIDECAR };
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let deployNotify: typeof DeployNotifyModule;
 let notify: typeof NotifyModule;
 let kgProvider: typeof KgProviderModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `deploy-notify-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  const runnerMode = await import("../runner-mode.js");
-  runnerMode.initSettingsTable();
-  deployNotify = await import("../deploy-notify.js");
-  notify = await import("../notify.js");
-  kgProvider = await import("../kg-provider.js");
+  ({ dedup, deployNotify, notify, kgProvider } = (
+    await testDb({
+      modules: {
+        dedup: () => import("../dedup.js"),
+        deployNotify: () => import("../deploy-notify.js"),
+        notify: () => import("../notify.js"),
+        kgProvider: () => import("../kg-provider.js"),
+      },
+    })
+  ).modules);
 });
 
 afterEach(() => {
-  dedup.closeDb();
   vi.unstubAllEnvs();
   vi.clearAllMocks();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
 });
 
 /** Puts the process in "running as a Fly Machine on this image" state. */

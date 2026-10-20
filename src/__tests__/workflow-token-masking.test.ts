@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { parse } from "yaml";
 import { validateResolvedAgentSnapshot, validateRunCredentials } from "../run-config.js";
+import { testDir } from "./helpers/test-dir.js";
 
 const files = [
   "workflows/claude-implement.yml",
@@ -20,18 +20,13 @@ for (const file of files) {
     const mask = job.steps.find((step: { name: string }) => step.name === "Mask runner callback tokens");
 
     function execute(event: string | undefined) {
-      const dir = mkdtempSync(join(tmpdir(), "mask-event-"));
-      const eventPath = join(dir, "event.json");
+      const eventPath = join(testDir("mask-event"), "event.json");
       if (event !== undefined) writeFileSync(eventPath, event);
-      try {
-        return spawnSync("sh", ["-e", "-c", mask.run], {
-          // Deliberately do not inherit any live runner credentials.
-          env: { PATH: process.env.PATH, GITHUB_EVENT_PATH: eventPath },
-          encoding: "utf8",
-        });
-      } finally {
-        rmSync(dir, { recursive: true, force: true });
-      }
+      return spawnSync("sh", ["-e", "-c", mask.run], {
+        // Deliberately do not inherit any live runner credentials.
+        env: { PATH: process.env.PATH, GITHUB_EVENT_PATH: eventPath },
+        encoding: "utf8",
+      });
     }
 
     it("registers masks before any step header can expose a callback input", () => {
@@ -406,52 +401,48 @@ for (const file of files) {
 
     // Runs the bootstrap step, then the Run step against a stub entrypoint that dumps its env.
     function handoff(inputs: Record<string, unknown>) {
-      const dir = mkdtempSync(join(tmpdir(), "handoff-"));
-      try {
-        const eventPath = join(dir, "event.json");
-        const envPath = join(dir, "github.env");
-        const outPath = join(dir, "github.output");
-        const dump = join(dir, "env.json");
-        const stub = join(dir, "entrypoint.sh");
-        writeFileSync(eventPath, JSON.stringify({ inputs }));
-        writeFileSync(envPath, "");
-        writeFileSync(outPath, "");
-        writeFileSync(stub, `#!/bin/sh\nnode -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify(process.env))' "${dump}"\n`, { mode: 0o755 });
-        const boot = spawnSync("sh", ["-e", "-c", mask.run], {
-          env: { PATH: process.env.PATH, GITHUB_EVENT_PATH: eventPath, GITHUB_ENV: envPath, GITHUB_OUTPUT: outPath },
-          encoding: "utf8",
-        });
-        if (boot.status !== 0) return { boot, env: undefined, githubEnv: readFileSync(envPath, "utf8"), outputs: readFileSync(outPath, "utf8") };
-        // Nothing may reach later steps through $GITHUB_ENV; credentials are step outputs.
-        const githubEnv = readFileSync(envPath, "utf8");
-        // Parse the $GITHUB_OUTPUT heredoc format the way the Actions runner does.
-        const lines = readFileSync(outPath, "utf8").split("\n");
-        const outputs: Record<string, string> = {};
-        for (let i = 0; i < lines.length; i++) {
-          const m = /^([a-z_]+)<<(.+)$/.exec(lines[i]);
-          if (!m) continue;
-          const end = lines.indexOf(m[2], i + 1);
-          outputs[m[1]] = lines.slice(i + 1, end).join("\n");
-          i = end;
-        }
-        // Resolve the Run step's env: only bootstrap outputs are expressible; skip other expressions.
-        const stepEnv: Record<string, string> = {};
-        for (const [k, v] of Object.entries(run.env ?? {})) {
-          if (typeof v !== "string") continue;
-          const o = /^\$\{\{\s*steps\.bootstrap\.outputs\.(\w+)\s*\}\}$/.exec(v);
-          if (o) stepEnv[k] = outputs[o[1]] ?? "";
-          else if (/^\$\{\{\s*inputs\.run_config\s*\}\}$/.test(v)) stepEnv[k] = String(inputs.run_config ?? "");
-          else if (!v.includes("${{")) stepEnv[k] = v;
-        }
-        const done = spawnSync("sh", ["-e", "-c", run.run.replace("/opt/ai-implement/entrypoint.sh", stub)], {
-          env: { PATH: process.env.PATH, ...stepEnv },
-          encoding: "utf8",
-        });
-        const env = done.status === 0 ? JSON.parse(readFileSync(dump, "utf8")) : undefined;
-        return { boot, done, env, githubEnv, outputs };
-      } finally {
-        rmSync(dir, { recursive: true, force: true });
+      const dir = testDir("handoff");
+      const eventPath = join(dir, "event.json");
+      const envPath = join(dir, "github.env");
+      const outPath = join(dir, "github.output");
+      const dump = join(dir, "env.json");
+      const stub = join(dir, "entrypoint.sh");
+      writeFileSync(eventPath, JSON.stringify({ inputs }));
+      writeFileSync(envPath, "");
+      writeFileSync(outPath, "");
+      writeFileSync(stub, `#!/bin/sh\nnode -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify(process.env))' "${dump}"\n`, { mode: 0o755 });
+      const boot = spawnSync("sh", ["-e", "-c", mask.run], {
+        env: { PATH: process.env.PATH, GITHUB_EVENT_PATH: eventPath, GITHUB_ENV: envPath, GITHUB_OUTPUT: outPath },
+        encoding: "utf8",
+      });
+      if (boot.status !== 0) return { boot, env: undefined, githubEnv: readFileSync(envPath, "utf8"), outputs: readFileSync(outPath, "utf8") };
+      // Nothing may reach later steps through $GITHUB_ENV; credentials are step outputs.
+      const githubEnv = readFileSync(envPath, "utf8");
+      // Parse the $GITHUB_OUTPUT heredoc format the way the Actions runner does.
+      const lines = readFileSync(outPath, "utf8").split("\n");
+      const outputs: Record<string, string> = {};
+      for (let i = 0; i < lines.length; i++) {
+        const m = /^([a-z_]+)<<(.+)$/.exec(lines[i]);
+        if (!m) continue;
+        const end = lines.indexOf(m[2], i + 1);
+        outputs[m[1]] = lines.slice(i + 1, end).join("\n");
+        i = end;
       }
+      // Resolve the Run step's env: only bootstrap outputs are expressible; skip other expressions.
+      const stepEnv: Record<string, string> = {};
+      for (const [k, v] of Object.entries(run.env ?? {})) {
+        if (typeof v !== "string") continue;
+        const o = /^\$\{\{\s*steps\.bootstrap\.outputs\.(\w+)\s*\}\}$/.exec(v);
+        if (o) stepEnv[k] = outputs[o[1]] ?? "";
+        else if (/^\$\{\{\s*inputs\.run_config\s*\}\}$/.test(v)) stepEnv[k] = String(inputs.run_config ?? "");
+        else if (!v.includes("${{")) stepEnv[k] = v;
+      }
+      const done = spawnSync("sh", ["-e", "-c", run.run.replace("/opt/ai-implement/entrypoint.sh", stub)], {
+        env: { PATH: process.env.PATH, ...stepEnv },
+        encoding: "utf8",
+      });
+      const env = done.status === 0 ? JSON.parse(readFileSync(dump, "utf8")) : undefined;
+      return { boot, done, env, githubEnv, outputs };
     }
 
     const tokens = { resultToken: "res-$(touch${IFS}/tmp/pwn1000)-`x`-%0A-\"'-<<EOF", progressToken: "prog_%25_$HOME_\\n", publicationToken: "pub-sentinel-1000" };

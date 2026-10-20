@@ -1,14 +1,8 @@
-import { afterEach, describe, it, expect } from "vitest";
+import { describe, it, expect } from "vitest";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-
-const tempDirs: string[] = [];
-
-afterEach(() => {
-  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-});
+import { testDir } from "./helpers/test-dir.js";
 
 const scriptPath = resolve("scripts/image-equiv-check.sh");
 
@@ -52,8 +46,7 @@ describe("scripts/image-equiv-check.sh", () => {
   });
 
   it("exits 0 when only docs changed (no image-relevant paths differ)", () => {
-    const dir = mkdtempSync(join(tmpdir(), "image-equiv-"));
-    tempDirs.push(dir);
+    const dir = testDir("image-equiv");
     makeGitRepo(dir);
     const sha1 = gitCommit(dir, "initial", { "src/index.ts": "initial" });
     const sha2 = gitCommit(dir, "docs only", { "docs/foo.md": "docs change" });
@@ -63,8 +56,7 @@ describe("scripts/image-equiv-check.sh", () => {
   });
 
   it("exits 1 when a filtered path changed (src/ touched)", () => {
-    const dir = mkdtempSync(join(tmpdir(), "image-equiv-"));
-    tempDirs.push(dir);
+    const dir = testDir("image-equiv");
     makeGitRepo(dir);
     const sha1 = gitCommit(dir, "initial", { "src/index.ts": "initial" });
     const sha2 = gitCommit(dir, "code change", { "src/index.ts": "changed" });
@@ -74,8 +66,7 @@ describe("scripts/image-equiv-check.sh", () => {
   });
 
   it("exits 1 when both docs and a filtered path changed (session/ touched)", () => {
-    const dir = mkdtempSync(join(tmpdir(), "image-equiv-"));
-    tempDirs.push(dir);
+    const dir = testDir("image-equiv");
     makeGitRepo(dir);
     const sha1 = gitCommit(dir, "initial", {
       "docs/intro.md": "initial",
@@ -91,8 +82,7 @@ describe("scripts/image-equiv-check.sh", () => {
   });
 
   it("exits 1 when Dockerfile.session changed", () => {
-    const dir = mkdtempSync(join(tmpdir(), "image-equiv-"));
-    tempDirs.push(dir);
+    const dir = testDir("image-equiv");
     makeGitRepo(dir);
     const sha1 = gitCommit(dir, "initial", { "Dockerfile.session": "FROM ubuntu:20.04" });
     const sha2 = gitCommit(dir, "dockerfile change", { "Dockerfile.session": "FROM ubuntu:22.04" });
@@ -102,8 +92,7 @@ describe("scripts/image-equiv-check.sh", () => {
   });
 
   it("exits 0 for degenerate case: same SHA (trivially equivalent)", () => {
-    const dir = mkdtempSync(join(tmpdir(), "image-equiv-"));
-    tempDirs.push(dir);
+    const dir = testDir("image-equiv");
     makeGitRepo(dir);
     const sha1 = gitCommit(dir, "initial", { "src/index.ts": "initial" });
 
@@ -112,8 +101,7 @@ describe("scripts/image-equiv-check.sh", () => {
   });
 
   it("exits 2 when a SHA is not reachable and has no origin to fetch from", () => {
-    const dir = mkdtempSync(join(tmpdir(), "image-equiv-"));
-    tempDirs.push(dir);
+    const dir = testDir("image-equiv");
     makeGitRepo(dir);
     const sha1 = gitCommit(dir, "initial", { "src/index.ts": "initial" });
 
@@ -123,8 +111,7 @@ describe("scripts/image-equiv-check.sh", () => {
   });
 
   it("exits 2 when given fewer than two arguments", () => {
-    const dir = mkdtempSync(join(tmpdir(), "image-equiv-"));
-    tempDirs.push(dir);
+    const dir = testDir("image-equiv");
     makeGitRepo(dir);
 
     const r = spawnSync("bash", [scriptPath, "a".repeat(40)], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
@@ -132,8 +119,7 @@ describe("scripts/image-equiv-check.sh", () => {
   });
 
   it("exits 2 when a SHA has an invalid format", () => {
-    const dir = mkdtempSync(join(tmpdir(), "image-equiv-"));
-    tempDirs.push(dir);
+    const dir = testDir("image-equiv");
     makeGitRepo(dir);
 
     const r = spawnSync("bash", [scriptPath, "not-a-sha", "a".repeat(40)], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });

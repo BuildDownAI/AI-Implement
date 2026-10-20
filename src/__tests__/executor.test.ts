@@ -1,8 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 const isWindows = process.platform === "win32";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync, chmodSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
@@ -12,6 +11,7 @@ import { ClaudeCliExecutor, groupHasLiveMembers, isPossiblyLiveChild, readTeleme
 import { computeBackoffMs, DEFAULT_RETRY_POLICY, type RetryPolicy } from "../pipeline/retry-backoff.js";
 import type { ActivitySink, ActivityIdentity, ActivityToolResult } from "../pipeline/types.js";
 import { READ_ONLY_TOOL_PARAMS } from "../pipeline/steps/read-only-tools.js";
+import { testDir } from "./helpers/test-dir.js";
 
 interface FakeAttempt {
   stdoutLines?: string[];
@@ -177,14 +177,13 @@ const SUCCESS_LINES = [
 ];
 
 beforeEach(() => {
-  binDir = mkdtempSync(join(tmpdir(), "fakebin-"));
+  binDir = testDir("fakebin");
   vi.stubEnv("PATH", `${binDir}:${process.env.PATH ?? ""}`);
 });
 
 afterEach(() => {
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
-  rmSync(binDir, { recursive: true, force: true });
 });
 
 // Builds a fake ChildProcess whose stdout emits the given content string, then
@@ -2676,10 +2675,9 @@ describe("suspendOriginWriteCredential (shared publication-credential guard)", (
   const originOf = (): string => execFileSync("git", ["remote", "get-url", "origin"], { cwd: repo, encoding: "utf-8" }).trim();
 
   beforeEach(() => {
-    repo = mkdtempSync(join(tmpdir(), "guard-"));
+    repo = testDir("guard");
     execFileSync("git", ["init", "-q"], { cwd: repo });
   });
-  afterEach(() => rmSync(repo, { recursive: true, force: true }));
 
   it("strips http(s) origin credentials and restores them exactly", () => {
     const tokenized = "https://x-access-token:secret-token@github.com/acme/app.git";

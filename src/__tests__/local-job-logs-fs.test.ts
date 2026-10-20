@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { testDir } from "./helpers/test-dir.js";
 
 const dbName = vi.hoisted(() => ({ value: "" }));
 
@@ -16,16 +16,15 @@ async function mode(file: string): Promise<number> {
 describe("local job log storage filesystem behavior", () => {
   let tmp: string;
 
-  beforeEach(async () => {
-    tmp = await fs.mkdtemp(path.join(os.tmpdir(), "ai-implement-local-logs-"));
+  beforeEach(() => {
+    tmp = testDir("local-logs");
     dbName.value = path.join(tmp, "fallback.sqlite");
     vi.stubEnv("DEDUP_DB_PATH", path.join(tmp, "configured", "configured.sqlite"));
     vi.stubEnv("LOCAL_JOB_LOG_FS_SECRET", "secret-value-456");
   });
 
-  afterEach(async () => {
+  afterEach(() => {
     vi.unstubAllEnvs();
-    await fs.rm(tmp, { recursive: true, force: true });
   });
 
   it("archives and reads saved redacted logs beside the opened DB with private modes", async () => {

@@ -115,6 +115,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Admin SSO / OIDC, roles, page grants | `src/oauth/`, `src/admin-session.ts`, `src/access-entries.ts`, `src/access-page-grants.ts` | [docs/access-model.md](docs/access-model.md) |
 | Admin SPA | `src/admin-ui/` | |
 | Restate engine: sidecar, endpoint, workflows, test job | `src/restate/endpoint.ts`, `src/restate/planning-run-workflow.ts`, `src/restate/` | [docs/restate.md](docs/restate.md), [docs/restate-testing.md](docs/restate-testing.md) |
+| Unit test suite: setup files, the environment allowlist, shared fixture builders and harnesses, type checking, CI jobs | `src/__tests__/setup/`, `src/__tests__/helpers/`, `vitest.config.ts` | [docs/unit-tests.md](docs/unit-tests.md) |
 
 **Diagram convention:** flow diagrams in `docs/`, issue bodies, and PR descriptions are mermaid (validated with `mermaid-cli` before commit); tabular data is a table; ASCII only in this file. Full rule: [docs/README.md](docs/README.md).
 
@@ -183,6 +184,8 @@ npm run test:restate # src/__tests__/restate/**/*.restate.test.ts — one runtim
 ```
 
 **Vitest strips types without checking them, so `npm run typecheck` is what catches a type error in a test file.** Its second pass, `tsconfig.tests.json`, checks every `src/**/*.ts` file, test files included. A new test file is checked from the day it is added; never add a file to its `exclude` list, and keep the empty `exclude` key, since without it `extends` inherits `src/__tests__` from `tsconfig.json`.
+
+Build test fixtures with the shared builders in `src/__tests__/helpers/builders.ts`, and a test's database, fake `fetch` and temporary directories with the harnesses beside them (`testDb`, `fakeFetch`, `testDir`), not a new per-file copy; a type built as a fixture, or a harness need, that recurs in a third test file goes there ([src/__tests__/helpers/README.md](src/__tests__/helpers/README.md)).
 
 Fixing a bug: write the failing test first, then the fix, in one pull request — see [docs/bug-fix-tests.md](docs/bug-fix-tests.md).
 

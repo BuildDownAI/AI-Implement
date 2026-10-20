@@ -1,9 +1,11 @@
 /** Synthetic fixtures for opted-in runner tests. No real credential, network or paid model call. */
-import { vi } from "vitest";
-import type { ModelAuthClient, ModelInvocation } from "../model-auth-client.js";
-import type { ModelAuthGrantBootstrapV1 } from "../model-auth-contract.js";
-import { encodeTrustedRunConfig, type ResolvedAgentSnapshotV1 } from "../run-config.js";
-import type { AccountAuthMode } from "../agent-config.js";
+import { vi, type Mock } from "vitest";
+import type { ModelAuthClient, ModelInvocation } from "../../../model-auth-client.js";
+import { toSafeGrantMetadata, type ModelAuthBackend, type ModelAuthGrantBootstrapV1 } from "../../../model-auth-contract.js";
+import { encodeTrustedRunConfig, type ResolvedAgentSnapshotV1 } from "../../../run-config.js";
+import type { AccountAuthMode } from "../../../agent-config.js";
+import type { DispatchAdmissionBackend } from "../../../dispatch-admission.js";
+import type { ManagedDispatchDecision } from "../../../managed-dispatch-auth.js";
 
 export const SENTINEL_BEARER = "SENTINELbearer0123456789abcdefghijklmnop";
 export const NOW = 1_700_000_000_000;
@@ -58,6 +60,48 @@ export function makeGrant(snapshot: ResolvedAgentSnapshotV1, over: Partial<Model
     }),
     ...over,
   };
+}
+
+/** The grant backend each dispatch backend mints for, as `GRANT_BACKENDS` in `agent-run-preparation.ts` maps them. */
+const GRANT_BACKEND: Record<DispatchAdmissionBackend, ModelAuthBackend> = {
+  "github-actions": "gha",
+  "fly-machines": "fly",
+  "local-docker": "local",
+};
+
+/** How long a grant the orchestrator mints lasts: `DEFAULT_GRANT_TTL_MS` in `agent-run-preparation.ts`, which no
+ *  production caller overrides. */
+const GRANT_TTL_MS = 4 * 60 * 60 * 1000;
+
+export type LaunchDecision = Extract<ManagedDispatchDecision, { kind: "launch" }> & {
+  readonly takeBootstrap: Mock<() => ModelAuthGrantBootstrapV1 | undefined>;
+};
+
+/** The `launch` decision `prepareManagedDispatch` returns on `backend` for a fresh grant bound to `snapshot`, and that
+ *  grant. The grant is minted on the real clock, as the orchestrator mints one at launch, so it expires four hours
+ *  after the build. The decision carries the grant's safe metadata, and `takeBootstrap` hands the bootstrap out once,
+ *  then `undefined`, as the prepared run's does. */
+export function makeLaunchDecision(
+  snapshot: ResolvedAgentSnapshotV1,
+  backend: DispatchAdmissionBackend,
+  over: Partial<ModelAuthGrantBootstrapV1> = {},
+): { decision: LaunchDecision; bootstrap: ModelAuthGrantBootstrapV1 } {
+  const bootstrap = makeGrant(snapshot, { backend: GRANT_BACKEND[backend], expiresAt: Date.now() + GRANT_TTL_MS, ...over });
+  let pending: ModelAuthGrantBootstrapV1 | undefined = bootstrap;
+  const decision: LaunchDecision = {
+    kind: "launch",
+    dispatchId: bootstrap.dispatchId,
+    projectKey: bootstrap.projectKey,
+    backend,
+    snapshot,
+    grant: toSafeGrantMetadata(bootstrap),
+    takeBootstrap: vi.fn(() => {
+      const taken = pending;
+      pending = undefined;
+      return taken;
+    }),
+  };
+  return { decision, bootstrap };
 }
 
 export function envelopeEnv(snapshot: ResolvedAgentSnapshotV1 | undefined, grant: ModelAuthGrantBootstrapV1 | undefined): Record<string, string> {

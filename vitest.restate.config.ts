@@ -15,8 +15,13 @@ export default defineConfig({
       RESTATE_LOGGING: resolveRestateLogLevel(process.env.RESTATE_LOGGING),
     },
     pool: "forks",
-    setupFiles: ["src/__tests__/setup/clear-runner-credentials.ts"],
-    include: ["src/__tests__/restate/**/*.restate.test.ts"],
+    // The run's own temp directory; see vitest.config.ts.
+    globalSetup: ["src/__tests__/setup/run-temp-root.ts"],
+    // The scrub must finish before any other setup file loads; see vitest.config.ts.
+    sequence: { setupFiles: "list" },
+    setupFiles: ["src/__tests__/setup/scrub-ambient-env.ts", "src/__tests__/setup/clear-runner-credentials.ts"],
+    // The environment guard runs under both configs, so it checks the scrub each one loads.
+    include: ["src/__tests__/restate/**/*.restate.test.ts", "src/__tests__/setup/ambient-env.test.ts"],
     exclude: ["node_modules/**", "dist/**", ".worktrees/**"],
     testTimeout: 60000,
     hookTimeout: 60000,

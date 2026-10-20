@@ -1,13 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { testDb } from "./helpers/test-db.js";
 
-// dedup.ts freezes its DB path at import time, so each test sets a unique DEDUP_DB_PATH and
-// re-imports the modules fresh (the same isolation pattern the sibling suites use).
 let authEvents: typeof import("../mcp-auth-events.js");
 let dedup: typeof import("../dedup.js");
-let dbPath: string;
 
 const SECRET_TOKEN = "super-secret-access-token-value";
 const SECRET_REFRESH_TOKEN = "super-secret-refresh-token-value";
@@ -28,22 +23,13 @@ function baseEvent(over: Partial<Parameters<typeof authEvents.recordAuthEvent>[0
 }
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `mcp-auth-events-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  authEvents = await import("../mcp-auth-events.js");
-  dedup = await import("../dedup.js");
-  authEvents.initAuthEventsTable();
+  ({ authEvents, dedup } = (
+    await testDb({ modules: { authEvents: () => import("../mcp-auth-events.js"), dedup: () => import("../dedup.js") } })
+  ).modules);
 });
 
 afterEach(() => {
   vi.restoreAllMocks();
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
 });
 
 describe("recordAuthEvent", () => {

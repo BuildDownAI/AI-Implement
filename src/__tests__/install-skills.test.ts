@@ -6,35 +6,14 @@ vi.mock("node:child_process", async (importOriginal) => {
 });
 
 const isWindows = process.platform === "win32";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { installSkillsStep, skillAgentsForSnapshot } from "../pipeline/steps/install-skills.js";
-import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
-import type { LLMExecutor } from "../pipeline/types.js";
-
-const noopExec: LLMExecutor = {
-  async invoke() {
-    return { stdout: "", exitCode: 0, tokensUsed: 0 };
-  },
-};
-
-function ctx() {
-  return new DefaultPipelineContext(
-    {
-      jobId: 1,
-      issueId: "i",
-      issueIdentifier: "AII-1",
-      issueTitle: "T",
-      issueDescription: "D",
-      nonce: "n",
-      orchestratorUrl: "",
-    },
-    noopExec,
-  );
-}
+import { makeContext } from "./helpers/builders.js";
+import { testDir } from "./helpers/test-dir.js";
 
 function git(args: string[], cwd: string): void {
   const result = spawnSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
@@ -44,7 +23,8 @@ function git(args: string[], cwd: string): void {
 }
 
 function makeSkillsRepo(files: Record<string, string>): string {
-  const repoDir = mkdtempSync(join(tmpdir(), "skills-repo-"));
+  // No prefix starting "skills": a test scans the temp directory for the step's own "ai-implement-skills-" directories.
+  const repoDir = testDir("source-repo");
   git(["init"], repoDir);
   git(["config", "user.email", "test@test.com"], repoDir);
   git(["config", "user.name", "Test"], repoDir);
@@ -64,18 +44,7 @@ let homeDir: string;
 let repoDir: string | undefined;
 
 beforeEach(() => {
-  homeDir = mkdtempSync(join(tmpdir(), "skills-home-"));
-});
-
-afterEach(() => {
-  try {
-    rmSync(homeDir, { recursive: true, force: true });
-    if (repoDir) {
-      rmSync(repoDir, { recursive: true, force: true });
-    }
-  } catch {
-    // On Windows, git marks object files read-only; ignore cleanup failures
-  }
+  homeDir = testDir("home");
   repoDir = undefined;
 });
 
@@ -87,7 +56,7 @@ describe("installSkillsStep", () => {
     });
 
     const out = await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       { skillsRepoUrl: repoDir, githubToken: "x", homeDir },
       new NoopStepReporter(),
     );
@@ -101,7 +70,7 @@ describe("installSkillsStep", () => {
 
   it("returns skillsInstalled:0 and does not throw for a bad URL", async () => {
     const out = await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       {
         skillsRepoUrl: "https://github.com/nonexistent/repo-that-does-not-exist-xyz.git",
         githubToken: "x",
@@ -116,7 +85,7 @@ describe("installSkillsStep", () => {
 
   it("returns skillsInstalled:0 for a non-https (SSH) URL without attempting a clone", async () => {
     const out = await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       { skillsRepoUrl: "git@github.com:org/skills.git", githubToken: "x", homeDir },
       new NoopStepReporter(),
     );
@@ -128,7 +97,7 @@ describe("installSkillsStep", () => {
 
   it("returns skillsInstalled:0 for an empty skillsRepoUrl without throwing", async () => {
     const out = await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       { skillsRepoUrl: "", githubToken: "x", homeDir },
       new NoopStepReporter(),
     );
@@ -145,7 +114,7 @@ describe("installSkillsStep", () => {
     });
 
     const out = await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       { skillsRepoUrl: repoDir, githubToken: "x", homeDir },
       new NoopStepReporter(),
     );
@@ -160,7 +129,7 @@ describe("installSkillsStep", () => {
     repoDir = makeSkillsRepo({ "alpha/SKILL.md": "# Alpha" });
 
     await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       { skillsRepoUrl: repoDir, githubToken: "x", homeDir },
       new NoopStepReporter(),
     );
@@ -172,7 +141,7 @@ describe("installSkillsStep", () => {
   it("converts owner/repo shorthand to https://github.com URL and attempts clone", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const out = await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       { skillsRepoUrl: "acme/nonexistent-skills-repo-xyz", githubToken: "", homeDir },
       new NoopStepReporter(),
     );
@@ -190,7 +159,7 @@ describe("installSkillsStep", () => {
   it.skipIf(isWindows)("embeds the token only for github.com clones; cross-host https URLs get no credentials", async () => {
     // Shim `git` with a script that records its argv, so we can assert exactly what
     // remote URL the step hands to `git clone` for each host.
-    const shimDir = mkdtempSync(join(tmpdir(), "git-shim-"));
+    const shimDir = testDir("git-shim");
     const argsFile = join(shimDir, "git-args.txt");
     writeFileSync(
       join(shimDir, "git"),
@@ -202,7 +171,7 @@ describe("installSkillsStep", () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const cloneArgsFor = async (skillsRepoUrl: string): Promise<string> => {
       await installSkillsStep.run(
-        ctx(),
+        makeContext(),
         { skillsRepoUrl, githubToken: "sekret-token", homeDir },
         new NoopStepReporter(),
       );
@@ -226,7 +195,6 @@ describe("installSkillsStep", () => {
     } finally {
       process.env.PATH = origPath;
       warnSpy.mockRestore();
-      rmSync(shimDir, { recursive: true, force: true });
     }
   });
 
@@ -236,7 +204,7 @@ describe("installSkillsStep", () => {
     });
 
     const out = await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       { skillsRepoUrl: repoDir, githubToken: "x", homeDir },
       new NoopStepReporter(),
     );
@@ -254,7 +222,7 @@ describe("installSkillsStep", () => {
     });
 
     const out = await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       { skillsRepoUrl: repoDir, githubToken: "x", homeDir },
       new NoopStepReporter(),
     );
@@ -272,7 +240,7 @@ describe("installSkillsStep", () => {
     });
 
     const out = await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       { skillsRepoUrl: repoDir, githubToken: "x", homeDir },
       new NoopStepReporter(),
     );
@@ -290,7 +258,7 @@ describe("installSkillsStep", () => {
     });
 
     const out = await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       { skillsRepoUrl: repoDir, githubToken: "x", homeDir },
       new NoopStepReporter(),
     );
@@ -321,35 +289,19 @@ describe("installSkillsStep git subprocess environment", () => {
     GIT_DEPENDENCY_CALLBACK_URL: "https://sentinel.invalid",
     COMPOSER_AUTH: '{"sentinel":"composer"}',
   };
-  const saved: Record<string, string | undefined> = {};
-  let dir: string;
-  let home: string;
-
   beforeEach(() => {
-    dir = "";
-    home = mkdtempSync(join(tmpdir(), "skills-home-env-"));
-    for (const [k, v] of Object.entries(SENTINELS)) {
-      saved[k] = process.env[k];
-      process.env[k] = v;
-    }
+    for (const [k, v] of Object.entries(SENTINELS)) vi.stubEnv(k, v);
   });
   afterEach(() => {
-    for (const [k, v] of Object.entries(saved)) {
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
-    try {
-      rmSync(home, { recursive: true, force: true });
-      if (dir) rmSync(dir, { recursive: true, force: true });
-    } catch { /* ignore */ }
+    vi.unstubAllEnvs();
   });
 
   it("passes a sentinel-free env to the clone and rev-parse spawns", async () => {
-    dir = makeSkillsRepo({ "alpha/SKILL.md": "# Alpha" });
+    const dir = makeSkillsRepo({ "alpha/SKILL.md": "# Alpha" });
     vi.mocked(spawnSync).mockClear();
     await installSkillsStep.run(
-      ctx(),
-      { skillsRepoUrl: dir, githubToken: "x", homeDir: home },
+      makeContext(),
+      { skillsRepoUrl: dir, githubToken: "x", homeDir },
       new NoopStepReporter(),
     );
     const calls = vi.mocked(spawnSync).mock.calls.filter((c) => c[0] === "git");
@@ -367,12 +319,15 @@ describe("installSkillsStep git subprocess environment", () => {
 describe("installSkillsStep agent destinations", () => {
   const snap = (agents: Record<string, string>) =>
     ({ stages: Object.fromEntries(Object.entries(agents).map(([k, a]) => [k, { agent: a }])) }) as never;
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
 
   it("skillAgentsForSnapshot defaults to claude and dedups across stages", () => {
     expect(skillAgentsForSnapshot(undefined)).toEqual(["claude"]);
-    expect(skillAgentsForSnapshot(snap({ planning: "claude", implement: "claude", review: "claude" }))).toEqual(["claude"]);
-    expect(skillAgentsForSnapshot(snap({ planning: "codex", implement: "codex", review: "codex" }))).toEqual(["codex"]);
-    expect(skillAgentsForSnapshot(snap({ planning: "claude", implement: "codex", review: "claude" })).sort()).toEqual([
+    expect(skillAgentsForSnapshot(snap({ planning: "claude", implementation: "claude", review: "claude" }))).toEqual(["claude"]);
+    expect(skillAgentsForSnapshot(snap({ planning: "codex", implementation: "codex", review: "codex" }))).toEqual(["codex"]);
+    expect(skillAgentsForSnapshot(snap({ planning: "claude", implementation: "codex", review: "claude" })).sort()).toEqual([
       "claude",
       "codex",
     ]);
@@ -380,55 +335,43 @@ describe("installSkillsStep agent destinations", () => {
 
   it("default (Claude-only) install does not create the Codex directory", async () => {
     repoDir = makeSkillsRepo({ "alpha/SKILL.md": "# Alpha" });
-    await installSkillsStep.run(ctx(), { skillsRepoUrl: repoDir, githubToken: "x", homeDir }, new NoopStepReporter());
+    await installSkillsStep.run(makeContext(), { skillsRepoUrl: repoDir, githubToken: "x", homeDir }, new NoopStepReporter());
     expect(existsSync(join(homeDir, ".claude", "skills", "alpha", "SKILL.md"))).toBe(true);
     expect(existsSync(join(homeDir, ".agents"))).toBe(false);
   });
 
   it("installs identical content for both agents and ignores CODEX_HOME", async () => {
     repoDir = makeSkillsRepo({ "alpha/SKILL.md": "# Alpha\nbody" });
-    const codexHome = mkdtempSync(join(tmpdir(), "codex-home-"));
-    const prev = process.env.CODEX_HOME;
-    process.env.CODEX_HOME = codexHome;
-    try {
-      const out = await installSkillsStep.run(
-        ctx(),
-        { skillsRepoUrl: repoDir, githubToken: "x", homeDir, agents: ["claude", "codex", "codex"] },
-        new NoopStepReporter(),
-      );
-      expect(out.skillsInstalled).toBe(1);
-      for (const base of [".claude", ".agents"]) {
-        expect(readFileSync(join(homeDir, base, "skills", "alpha", "SKILL.md"), "utf-8")).toBe("# Alpha\nbody");
-      }
-      expect(readdirSync(codexHome)).toEqual([]);
-    } finally {
-      if (prev === undefined) delete process.env.CODEX_HOME;
-      else process.env.CODEX_HOME = prev;
-      rmSync(codexHome, { recursive: true, force: true });
+    const codexHome = testDir("codex-home");
+    vi.stubEnv("CODEX_HOME", codexHome);
+    const out = await installSkillsStep.run(
+      makeContext(),
+      { skillsRepoUrl: repoDir, githubToken: "x", homeDir, agents: ["claude", "codex", "codex"] },
+      new NoopStepReporter(),
+    );
+    expect(out.skillsInstalled).toBe(1);
+    for (const base of [".claude", ".agents"]) {
+      expect(readFileSync(join(homeDir, base, "skills", "alpha", "SKILL.md"), "utf-8")).toBe("# Alpha\nbody");
     }
+    expect(readdirSync(codexHome)).toEqual([]);
   });
 
   it("excludes synthetic model credentials from the clone child env", async () => {
     repoDir = makeSkillsRepo({ "alpha/SKILL.md": "# Alpha" });
-    const saved = { ...process.env };
-    process.env.OPENAI_API_KEY = "sk-synthetic-openai";
-    process.env.CODEX_API_KEY = "synthetic-codex";
-    process.env.AI_IMPLEMENT_RUN_CONFIG = "synthetic-run-config";
-    try {
-      const spy = vi.mocked(spawnSync);
-      spy.mockClear();
-      await installSkillsStep.run(
-        ctx(),
-        { skillsRepoUrl: repoDir, githubToken: "x", homeDir, agents: ["codex"] },
-        new NoopStepReporter(),
-      );
-      const clone = spy.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone");
-      const env = (clone?.[2] as { env?: Record<string, string> }).env ?? {};
-      expect(env.OPENAI_API_KEY).toBeUndefined();
-      expect(env.CODEX_API_KEY).toBeUndefined();
-      expect(env.AI_IMPLEMENT_RUN_CONFIG).toBeUndefined();
-    } finally {
-      process.env = saved;
-    }
+    vi.stubEnv("OPENAI_API_KEY", "sk-synthetic-openai");
+    vi.stubEnv("CODEX_API_KEY", "synthetic-codex");
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", "synthetic-run-config");
+    const spy = vi.mocked(spawnSync);
+    spy.mockClear();
+    await installSkillsStep.run(
+      makeContext(),
+      { skillsRepoUrl: repoDir, githubToken: "x", homeDir, agents: ["codex"] },
+      new NoopStepReporter(),
+    );
+    const clone = spy.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone");
+    const env = (clone?.[2] as { env?: Record<string, string> }).env ?? {};
+    expect(env.OPENAI_API_KEY).toBeUndefined();
+    expect(env.CODEX_API_KEY).toBeUndefined();
+    expect(env.AI_IMPLEMENT_RUN_CONFIG).toBeUndefined();
   });
 });

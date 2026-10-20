@@ -1,11 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import crypto from "node:crypto";
 import type http from "node:http";
 import type { AuthStart, VerifiedIdentity } from "../oauth/oidc.js";
 import type { OidcProviderConfig } from "../oauth/providers.js";
+import { testDb } from "./helpers/test-db.js";
 
 // Mock the OIDC engine so we don't need real network calls
 vi.mock("../oauth/oidc.js", () => ({
@@ -87,7 +85,6 @@ let access: typeof import("../access-entries.js");
 let oidc: typeof import("../oauth/oidc.js");
 let dedup: typeof import("../dedup.js");
 let authEvents: typeof import("../mcp-auth-events.js");
-let dbPath: string;
 
 /** Seed the list in force the way a pre-handover deployment does — from the env. */
 function setAllowedDomains(domains: string): void {
@@ -97,21 +94,20 @@ function setAllowedDomains(domains: string): void {
 }
 
 beforeEach(async () => {
-  vi.resetModules();
   vi.clearAllMocks();
-  dbPath = path.join(os.tmpdir(), `mcp-oauth-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
+  ({ mcpOauth, providers, access, oidc, dedup, authEvents } = (
+    await testDb({
+      modules: {
+        mcpOauth: () => import("../mcp-oauth.js"),
+        providers: () => import("../oauth/providers.js"),
+        access: () => import("../access-entries.js"),
+        oidc: () => import("../oauth/oidc.js"),
+        dedup: () => import("../dedup.js"),
+        authEvents: () => import("../mcp-auth-events.js"),
+      },
+    })
+  ).modules);
 
-  mcpOauth = await import("../mcp-oauth.js");
-  providers = await import("../oauth/providers.js");
-  access = await import("../access-entries.js");
-  oidc = await import("../oauth/oidc.js");
-  dedup = await import("../dedup.js");
-  authEvents = await import("../mcp-auth-events.js");
-
-  mcpOauth.initMcpOAuthTables();
-  access.initAccessEntriesTable();
-  authEvents.initAuthEventsTable();
   providers.configureOAuthProviders([googleProvider]);
   setAllowedDomains("eudoxus.ai");
   (oidc.buildAuthUrl as ReturnType<typeof vi.fn>).mockResolvedValue(OIDC_START);
@@ -125,12 +121,6 @@ beforeEach(async () => {
 
 afterEach(() => {
   vi.unstubAllEnvs();
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
 });
 
 // Helper to compute PKCE challenge from a verifier

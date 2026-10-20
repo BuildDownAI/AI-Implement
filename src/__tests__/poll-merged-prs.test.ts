@@ -1,26 +1,20 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-let dbPath: string;
-let dedup: typeof import("../dedup.js");
+import { describe, it, expect, vi, beforeEach, onTestFinished } from "vitest";
+import type { DetectDeps } from "../poll-merged-prs.js";
+import { makeMapping } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 let log: typeof import("../log.js");
 let recon: typeof import("../reconciliation.js");
 let mod: typeof import("../poll-merged-prs.js");
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `pollmerged-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  recon = await import("../reconciliation.js");
-  mod = await import("../poll-merged-prs.js");
-  log.initLogTable();
-  recon.initReconciliationTable();
-});
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  ({ log, recon, mod } = (
+    await testDb({
+      modules: {
+        log: () => import("../log.js"),
+        recon: () => import("../reconciliation.js"),
+        mod: () => import("../poll-merged-prs.js"),
+      },
+    })
+  ).modules);
 });
 
 /**
@@ -54,7 +48,7 @@ describe("detectMergedPrs", () => {
       getPullRequestState: vi.fn(async () => ({ merged: true, state: "closed" as const })),
       tokenForOwner: async () => "tok",
       finalizeGroupingParent: async () => true,
-      mappingForRepo: () => ({ owner: "o", repo: "r" } as never),
+      mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     });
     expect(recon.getPendingReconciliations()).toHaveLength(1);
     expect(recon.getPendingReconciliations()[0].issueIdentifier).toBe("OOL-183");
@@ -67,7 +61,7 @@ describe("detectMergedPrs", () => {
       getPullRequestState,
       tokenForOwner: async () => "tok",
       finalizeGroupingParent: async () => true,
-      mappingForRepo: () => ({ owner: "o", repo: "r" } as never),
+      mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     });
     expect(getPullRequestState).not.toHaveBeenCalled();
     expect(recon.getPendingReconciliations()).toHaveLength(0);
@@ -80,7 +74,7 @@ describe("detectMergedPrs", () => {
       getPullRequestState,
       tokenForOwner: async () => "tok",
       finalizeGroupingParent: async () => true,
-      mappingForRepo: () => ({ owner: "o", repo: "r" } as never),
+      mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     });
     expect(recon.getPendingReconciliations()).toHaveLength(1);
   });
@@ -91,7 +85,7 @@ describe("detectMergedPrs", () => {
       getPullRequestState,
       tokenForOwner: async () => "tok",
       finalizeGroupingParent: async () => true,
-      mappingForRepo: () => ({ owner: "o", repo: "r" } as never),
+      mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     };
     await mod.detectMergedPrs(deps);
     expect(recon.hasReconciliationForPr("o/r", 5)).toBe(true);
@@ -106,7 +100,7 @@ describe("detectMergedPrs", () => {
       getPullRequestState,
       tokenForOwner: async () => "tok",
       finalizeGroupingParent: async () => true,
-      mappingForRepo: () => ({ owner: "o", repo: "r" } as never),
+      mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     });
     expect(recon.hasReconciliationForPr("o/r", 5)).toBe(false);
   });
@@ -123,7 +117,7 @@ describe("detectMergedPrs", () => {
       getPullRequestState,
       tokenForOwner: async () => "tok",
       finalizeGroupingParent: async () => true,
-      mappingForRepo: () => ({ owner: "o", repo: "r" } as never),
+      mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     });
     expect(recon.getPendingReconciliations()).toHaveLength(1);
   });
@@ -135,7 +129,7 @@ describe("detectMergedPrs", () => {
       getPullRequestState,
       tokenForOwner: async () => "tok",
       finalizeGroupingParent: async () => true,
-      mappingForRepo: () => ({ owner: "o", repo: "r" } as never),
+      mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     });
     expect(getPullRequestState).not.toHaveBeenCalled();
   });
@@ -144,18 +138,18 @@ describe("detectMergedPrs", () => {
     const url = (n: number) => `https://github.com/o/r/pull/${n}`;
     function seedParent(prNumber: number, opts: { issueId?: string; groupingParent?: boolean } = {}) {
       const jobId = log.appendLog({
-        issueId: opts.issueId ?? "p1", issueIdentifier: "ENG-P", repo: "o/r",
+        issueId: opts.issueId ?? "p1", issueIdentifier: "ENG-40", repo: "o/r",
         groupingParent: opts.groupingParent ?? true,
       });
       log.updateJobStatus(jobId, "review_failed", "review_unapproved", url(prNumber));
     }
     const closed = { merged: false, state: "closed" as const };
-    function makeDeps(finalize: (job: unknown) => Promise<boolean>) {
+    function makeDeps(finalize: DetectDeps["finalizeGroupingParent"]) {
       return {
-        getPullRequestState: vi.fn(async () => closed),
+        getPullRequestState: vi.fn<DetectDeps["getPullRequestState"]>(async () => closed),
         tokenForOwner: async () => "tok",
-        mappingForRepo: () => ({ owner: "o", repo: "r" } as never),
-        finalizeGroupingParent: vi.fn(finalize) as never,
+        mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
+        finalizeGroupingParent: vi.fn(finalize),
       };
     }
 
@@ -171,7 +165,7 @@ describe("detectMergedPrs", () => {
 
     it("still applies when a newer gap-fill row has groupingParent false", async () => {
       seedParent(7);
-      const gap = log.appendLog({ issueId: "p1", issueIdentifier: "ENG-P", repo: "o/r", groupingParent: false });
+      const gap = log.appendLog({ issueId: "p1", issueIdentifier: "ENG-40", repo: "o/r", groupingParent: false });
       log.updateJobStatus(gap, "completed", "success", url(7));
       const deps = makeDeps(async () => true);
       await mod.detectMergedPrs(deps);
@@ -189,7 +183,7 @@ describe("detectMergedPrs", () => {
 
     it("writes nothing while a run for the issue is in flight", async () => {
       seedParent(7);
-      log.appendLog({ issueId: "p1", issueIdentifier: "ENG-P", repo: "o/r" }); // status dispatched
+      log.appendLog({ issueId: "p1", issueIdentifier: "ENG-40", repo: "o/r" }); // status dispatched
       const deps = makeDeps(async () => true);
       await mod.detectMergedPrs(deps);
       expect(deps.finalizeGroupingParent).not.toHaveBeenCalled();
@@ -198,11 +192,11 @@ describe("detectMergedPrs", () => {
 
     it("tombstones without finalizing when the closed PR is not the issue's latest", async () => {
       seedParent(7);
-      const newer = log.appendLog({ issueId: "p1", issueIdentifier: "ENG-P", repo: "o/r", groupingParent: true });
+      const newer = log.appendLog({ issueId: "p1", issueIdentifier: "ENG-40", repo: "o/r", groupingParent: true });
       log.updateJobStatus(newer, "completed", "success", url(8));
       const deps = makeDeps(async () => true);
-      deps.getPullRequestState.mockImplementation((async (_t: string, _o: string, _r: string, n: number) =>
-        n === 7 ? closed : { merged: false, state: "open" as const }) as never);
+      deps.getPullRequestState.mockImplementation(async (_t, _o, _r, n) =>
+        n === 7 ? closed : { merged: false, state: "open" as const });
       await mod.detectMergedPrs(deps);
       expect(deps.finalizeGroupingParent).not.toHaveBeenCalled();
       expect(recon.hasReconciliationForPr("o/r", 7)).toBe(true);
@@ -210,7 +204,8 @@ describe("detectMergedPrs", () => {
 
     it("writes no tombstone when finalize throws, and retries next poll", async () => {
       seedParent(7);
-      vi.spyOn(console, "error").mockImplementation(() => {});
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      onTestFinished(() => error.mockRestore());
       let fail = true;
       const deps = makeDeps(async () => { if (fail) throw new Error("boom"); return true; });
       await mod.detectMergedPrs(deps);

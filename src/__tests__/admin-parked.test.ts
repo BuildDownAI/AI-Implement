@@ -1,16 +1,12 @@
 import { EventEmitter } from "node:events";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type * as AdminModule from "../admin.js";
 import type * as ConfigModule from "../config.js";
 import type * as DedupModule from "../dedup.js";
-import type * as RunnerModeModule from "../runner-mode.js";
 import type * as LogModule from "../log.js";
 import type * as BreakerModule from "../dispatch-breaker.js";
-import { FakeProvider } from "./providers/fake.js";
-import type { ProviderRegistry } from "../providers/registry.js";
+import { makeMapping, makeRegistry } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 
 vi.mock("../notify.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../notify.js")>()),
@@ -28,14 +24,6 @@ vi.mock("../workflow-sync.js", () => ({
 vi.mock("../github-install-state.js", () => ({
   probeInstallState: vi.fn(),
 }));
-
-function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
-  return {
-    forMapping: async () => provider,
-    forAllMappings: async () => [provider],
-    invalidate: () => {},
-  } as unknown as ProviderRegistry;
-}
 
 class MockRequest extends EventEmitter {
   url?: string;
@@ -75,42 +63,24 @@ class MockResponse {
   }
 }
 
-let dbPath: string;
 let admin: typeof AdminModule;
 let config: typeof ConfigModule;
 let dedup: typeof DedupModule;
-let runnerMode: typeof RunnerModeModule;
 let log: typeof LogModule;
 let breaker: typeof BreakerModule;
-let provider: FakeProvider;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `admin-parked-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  provider = new FakeProvider();
-  admin = await import("../admin.js");
-  config = await import("../config.js");
-  dedup = await import("../dedup.js");
-  runnerMode = await import("../runner-mode.js");
-  log = await import("../log.js");
-  breaker = await import("../dispatch-breaker.js");
-  config.initMappingsTable();
-  log.initLogTable();
-  runnerMode.initSettingsTable();
-  breaker.initDispatchBreakerTable();
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
+  ({ admin, config, dedup, log, breaker } = (
+    await testDb({
+      modules: {
+        admin: () => import("../admin.js"),
+        config: () => import("../config.js"),
+        dedup: () => import("../dedup.js"),
+        log: () => import("../log.js"),
+        breaker: () => import("../dispatch-breaker.js"),
+      },
+    })
+  ).modules);
 });
 
 function adminConfig(): Parameters<typeof admin.handleAdminRequest>[2] {
@@ -137,7 +107,7 @@ async function makeRequest(
     body === undefined ? undefined : JSON.stringify(body),
   );
   const res = new MockResponse();
-  admin.handleAdminRequest(req as never, res as never, adminConfig(), makeFakeRegistry(provider));
+  admin.handleAdminRequest(req as never, res as never, adminConfig(), makeRegistry());
   await res.done;
   return { statusCode: res.statusCode, body: res.body };
 }
@@ -145,7 +115,7 @@ async function makeRequest(
 async function login(): Promise<string> {
   const req = new MockRequest("/api/auth", "POST", {}, JSON.stringify({ code: "secret" }));
   const res = new MockResponse();
-  admin.handleAdminRequest(req as never, res as never, adminConfig(), makeFakeRegistry(provider));
+  admin.handleAdminRequest(req as never, res as never, adminConfig(), makeRegistry());
   await res.done;
   return JSON.parse(res.body).token as string;
 }
@@ -233,28 +203,7 @@ describe("GET /api/parked", () => {
 
   it("falls back to the dispatched table and maps team_key to the repo", async () => {
     const token = await login();
-    config.initMappingsTable();
-    config.upsertMapping("AII", {
-      owner: "org",
-      repo: "mapped",
-      workflowFile: "claude-implement.yml",
-      defaultBranch: "main",
-      maxInProgressAiIssues: 3,
-      executionMode: "github-actions",
-      sessionMode: "autonomous",
-      machineCpus: 2,
-      machineMemoryMb: 4096,
-      planningEnabled: false,
-      planningWorkflowFile: "",
-      autoApprovePlans: true,
-      autoMerge: false,
-      extraEnv: {},
-      provider: "anthropic",
-      ticketingProvider: "linear",
-      ticketingConfig: { kind: "linear" },
-      awsRegion: null,
-      paused: false,
-    } as never);
+    config.upsertMapping("AII", makeMapping({ owner: "org", repo: "mapped" }));
     dedup.markDispatched("issue-d1", "AII", "AII-5", "From dispatched");
     dedup.markDispatched("issue-d2", "NOMAP", "AII-6", "No mapping");
     parkIssue("issue-d1");
@@ -370,7 +319,7 @@ describe("POST /api/parked/unpark", () => {
       "not-json",
     );
     const res = new MockResponse();
-    admin.handleAdminRequest(req as never, res as never, adminConfig(), makeFakeRegistry(provider));
+    admin.handleAdminRequest(req as never, res as never, adminConfig(), makeRegistry());
     await res.done;
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toContain("Invalid");

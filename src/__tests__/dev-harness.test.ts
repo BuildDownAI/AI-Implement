@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { splitLocalRunnerEnv } from "../local-docker.js";
 import { decodeRunConfig } from "../run-config.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
 
 // Prevent real git invocations for branch and origin detection.
 vi.mock("node:child_process", () => ({
@@ -9,20 +10,21 @@ vi.mock("node:child_process", () => ({
   spawnSync: vi.fn(),
 }));
 
-// Make existsSync return true for the workspace path.
+// Make existsSync return true for the workspace path. Each default is the spy's own implementation, so a reset
+// returns a spy to it.
 vi.mock("node:fs", () => ({
-  default: { existsSync: vi.fn().mockReturnValue(true) },
-  existsSync: vi.fn().mockReturnValue(true),
+  default: { existsSync: vi.fn(() => true) },
+  existsSync: vi.fn(() => true),
 }));
 
 // Prevent real filesystem writes for the artifacts directory.
 vi.mock("node:fs/promises", () => ({
-  chmod: vi.fn().mockResolvedValue(undefined),
-  mkdtemp: vi.fn().mockResolvedValue("/tmp/source-copy-root"),
-  mkdir: vi.fn().mockResolvedValue(undefined),
-  readFile: vi.fn().mockResolvedValue("{}"),
-  rm: vi.fn().mockResolvedValue(undefined),
-  writeFile: vi.fn().mockResolvedValue(undefined),
+  chmod: vi.fn(async () => undefined),
+  mkdtemp: vi.fn(async () => "/tmp/source-copy-root"),
+  mkdir: vi.fn(async () => undefined),
+  readFile: vi.fn(async () => "{}"),
+  rm: vi.fn(async () => undefined),
+  writeFile: vi.fn(async () => undefined),
 }));
 
 // Stub the session layer so startDevRun is tested in isolation.
@@ -113,7 +115,7 @@ function mockConfiguredSubscription(profileId = "sub-a") {
   });
 }
 
-function mockOwnership(acquire: ReturnType<typeof vi.fn> = vi.fn().mockResolvedValue({ profileId: "sub-a", used: false })) {
+function mockOwnership(acquire: ReturnType<typeof vi.fn> = vi.fn(async () => ({ profileId: "sub-a", used: false }))) {
   vi.mocked(LocalSessionOwnership).mockImplementation(function () {
     return { acquire, releaseUnused: vi.fn() } as never;
   });
@@ -730,21 +732,21 @@ describe("startDevRun — kg-refresh tracker-data source resolution (AII-608)", 
     vi.stubEnv("ORCHESTRATOR_URL", "https://orch.example.com");
     vi.stubEnv("ADMIN_ACCESS_CODE", "secret-code");
     vi.stubEnv("AI_IMPLEMENT_ADMIN_TOKEN", "");
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ token: "session-token" }) })
-      .mockResolvedValueOnce({ ok: true, text: async () => JSON.stringify([{ id: "1" }]) });
-    vi.stubGlobal("fetch", fetchMock);
+    const orchestrator = fakeFetch({
+      "POST /api/auth": { json: { token: "session-token" } },
+      "GET /api/kg/tracker-data": { json: [{ id: "1" }] },
+    });
+    orchestrator.install();
 
     const handle = await startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh", artifactsDir: "/tmp/artifacts" });
 
-    expect(fetchMock).toHaveBeenNthCalledWith(1, "https://orch.example.com/api/auth", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code: "secret-code" }),
-    });
-    expect(fetchMock).toHaveBeenNthCalledWith(2, "https://orch.example.com/api/kg/tracker-data", {
-      headers: { Authorization: "Bearer session-token" },
-    });
+    expect(orchestrator.calls.map((c) => `${c.method} ${c.url.href}`)).toEqual([
+      "POST https://orch.example.com/api/auth",
+      "GET https://orch.example.com/api/kg/tracker-data",
+    ]);
+    expect(Object.fromEntries(orchestrator.calls[0].headers)).toEqual({ "content-type": "application/json" });
+    expect(orchestrator.calls[0].body).toBe(JSON.stringify({ code: "secret-code" }));
+    expect(Object.fromEntries(orchestrator.calls[1].headers)).toEqual({ authorization: "Bearer session-token" });
     expect(vi.mocked(writeFile)).toHaveBeenCalledWith(
       "/tmp/artifacts/tracker-data.json",
       JSON.stringify([{ id: "1" }]),
@@ -758,26 +760,25 @@ describe("startDevRun — kg-refresh tracker-data source resolution (AII-608)", 
     vi.stubEnv("ORCHESTRATOR_URL", "https://orch.example.com");
     vi.stubEnv("ADMIN_ACCESS_CODE", "");
     vi.stubEnv("AI_IMPLEMENT_ADMIN_TOKEN", "bearer-token");
-    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: true, text: async () => JSON.stringify([]) });
-    vi.stubGlobal("fetch", fetchMock);
+    const orchestrator = fakeFetch({ "GET /api/kg/tracker-data": { json: [] } });
+    orchestrator.install();
 
     await startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh", artifactsDir: "/tmp/artifacts" });
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock).toHaveBeenCalledWith("https://orch.example.com/api/kg/tracker-data", {
-      headers: { Authorization: "Bearer bearer-token" },
-    });
+    expect(orchestrator.calls).toHaveLength(1);
+    expect(orchestrator.calls[0].url.href).toBe("https://orch.example.com/api/kg/tracker-data");
+    expect(Object.fromEntries(orchestrator.calls[0].headers)).toEqual({ authorization: "Bearer bearer-token" });
   });
 
   it("--tracker-data always wins over the orchestrator env when both are present", async () => {
     vi.stubEnv("ORCHESTRATOR_URL", "https://orch.example.com");
     vi.stubEnv("ADMIN_ACCESS_CODE", "secret-code");
-    const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
+    const orchestrator = fakeFetch({});
+    orchestrator.install();
 
     await startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh", trackerData: "/tmp/td.json" });
 
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(orchestrator.calls).toHaveLength(0);
     const opts = vi.mocked(launchLocalSession).mock.calls[0]![0];
     expect(opts.extraVolumes).toContain("/tmp/td.json:/dev-tracker-data.json:ro");
   });
@@ -785,8 +786,7 @@ describe("startDevRun — kg-refresh tracker-data source resolution (AII-608)", 
   it("rejects when the tracker-data fetch fails", async () => {
     vi.stubEnv("ORCHESTRATOR_URL", "https://orch.example.com");
     vi.stubEnv("AI_IMPLEMENT_ADMIN_TOKEN", "bearer-token");
-    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: false, status: 500 });
-    vi.stubGlobal("fetch", fetchMock);
+    fakeFetch({ "GET /api/kg/tracker-data": { status: 500 } }).install();
 
     await expect(
       startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh" }),
@@ -796,8 +796,7 @@ describe("startDevRun — kg-refresh tracker-data source resolution (AII-608)", 
   it("rejects when the admin session mint fails", async () => {
     vi.stubEnv("ORCHESTRATOR_URL", "https://orch.example.com");
     vi.stubEnv("ADMIN_ACCESS_CODE", "bad-code");
-    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: false, status: 403 });
-    vi.stubGlobal("fetch", fetchMock);
+    fakeFetch({ "POST /api/auth": { status: 403 } }).install();
 
     await expect(
       startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh" }),
@@ -807,30 +806,18 @@ describe("startDevRun — kg-refresh tracker-data source resolution (AII-608)", 
 
 import { runDevHarnessCli } from "../dev-harness/cli.js";
 import type { DevHarnessCliDependencies } from "../dev-harness/cli.js";
+import { makeDevHarnessCliDeps, makeDevRunHandle, makeTaskFile } from "./helpers/fixtures/dev-harness.js";
+
+// startDevRun's kg-refresh run: the built-in task, and no workspace mode, since the KG source is cloned, not mounted.
+const KG_REFRESH_HANDLE = makeDevRunHandle({
+  task: makeTaskFile({ identifier: "KG-DEV", title: "KG refresh (local dev)", description: "Local dev kg-refresh run" }),
+  workspace: "/tmp/repo",
+  phase: "kg-refresh",
+  workspaceMode: undefined,
+});
 
 function makeCliDeps(overrides: Partial<DevHarnessCliDependencies> = {}): DevHarnessCliDependencies {
-  return {
-    startDevRun: vi.fn().mockResolvedValue({
-      runId: "r1",
-      containerId: "cid",
-      containerName: "test-container",
-      artifactsDir: "/tmp/artifacts",
-      startedAt: new Date(),
-      task: { identifier: "KG-DEV", title: "KG refresh (local dev)" },
-      workspace: "/tmp/repo",
-      phase: "kg-refresh",
-    }),
-    streamLogs: vi.fn().mockResolvedValue(undefined),
-    streamLogsUntilShellReady: vi.fn().mockResolvedValue({ ready: false, exitCode: 0 }),
-    getRunStatus: vi.fn().mockResolvedValue({ exitCode: 0 }),
-    collectRunArtifacts: vi.fn().mockResolvedValue(undefined),
-    stopSession: vi.fn().mockResolvedValue(undefined),
-    spawnDocker: vi.fn().mockReturnValue(0),
-    writeStdout: vi.fn(),
-    writeStderr: vi.fn(),
-    now: () => Date.now(),
-    ...overrides,
-  };
+  return makeDevHarnessCliDeps({ startDevRun: vi.fn(async () => KG_REFRESH_HANDLE), ...overrides });
 }
 
 describe("runDevHarnessCli — kg-refresh phase", () => {

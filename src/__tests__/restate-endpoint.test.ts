@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveIdentityKeys, restateBindAddress, register, queryNonCompletedInvocations, RESTATE_SERVICES } from "../restate/endpoint.js";
 import { createProductionReviewFixServices } from "../restate/review-fix-production.js";
+import { makeRegistry } from "./helpers/builders.js";
+import { fakeFetch, hangUntilAborted, type Reply } from "./helpers/fake-fetch.js";
 
 // AII-727: a static pin, unit-tier only. Dropping either service from RESTATE_SERVICES
 // passes every other test in this file (they all fake the admin API), and a real container
@@ -16,7 +18,7 @@ describe("production review-fix services", () => {
   it("composes both durable services beside the operator and tool endpoint", () => {
     const services = createProductionReviewFixServices({ githubAppId: "test", githubAppPrivateKey: "test",
       runnerCallbackBaseUrl: null, runnerTokenSecret: null, sessionImage: "ghcr.io/x/runner:latest", runnerImageExplicit: false },
-      { forMapping: async () => null } as never);
+      makeRegistry());
     expect([...RESTATE_SERVICES, ...services].map((service) => service.name)).toEqual([
       "Operator", "orchestratorTools", "RunnerBackend", "ChatGptPlanAccount", "ReviewFixPR", "ReviewFixAttempt",
     ]);
@@ -55,30 +57,11 @@ describe("restateBindAddress", () => {
 // register()
 // ---------------------------------------------------------------------------
 
-function jsonResponse(status: number, body: unknown): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
+const META0004: Reply = { status: 409, json: { restate_code: "META0004", message: "conflict" } };
 
-/**
- * A fetchImpl that never settles unless its request's AbortSignal fires — the only way a
- * fixture can prove a fetch is actually bounded by `signal` rather than merely accepting an
- * ignored option (AII-728). Rejects with the signal's abort reason once the signal fires.
- */
-function hangingFetch(): typeof fetch {
-  return vi.fn((_url: unknown, init?: RequestInit) => {
-    return new Promise((_resolve, reject) => {
-      const signal = init?.signal;
-      if (!signal) return; // no signal given: hangs forever, same as before AII-728
-      if (signal.aborted) {
-        reject(signal.reason);
-        return;
-      }
-      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-    });
-  }) as unknown as typeof fetch;
+/** The admin API's deployments endpoint, answering each registration call in order. */
+function deployments(...replies: Reply[]) {
+  return fakeFetch({ "POST /deployments": replies });
 }
 
 /**
@@ -104,113 +87,109 @@ describe("register", () => {
   });
 
   it("posts the endpoint URI to POST /deployments without force", async () => {
-    const fetchImpl = vi.fn(async (_url: string, _init: RequestInit) => jsonResponse(201, { id: "dp_1" }));
+    const fake = deployments({ status: 201, json: { id: "dp_1" } });
     const result = await register({
       adminBaseUrl: "http://127.0.0.1:9070",
-      fetchImpl: fetchImpl as unknown as typeof fetch,
+      fetchImpl: fake.fetch,
     });
 
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
-    const [url, init] = fetchImpl.mock.calls[0];
-    expect(url).toBe("http://127.0.0.1:9070/deployments");
-    expect(init.method).toBe("POST");
-    expect(JSON.parse(init.body as string)).toEqual({ uri: "http://127.0.0.1:9080" });
+    expect(fake.calls).toHaveLength(1);
+    const [call] = fake.calls;
+    expect(call.url.href).toBe("http://127.0.0.1:9070/deployments");
+    expect(call.method).toBe("POST");
+    expect(JSON.parse(call.body)).toEqual({ uri: "http://127.0.0.1:9080" });
     expect(result).toEqual({ outcome: "registered-no-force" });
   });
 
   it("an existing URI (200) is re-discovered with force after a zero drain count", async () => {
-    const fetchImpl = vi.fn(async (_url: string, _init: RequestInit) => jsonResponse(200, { id: "dp_1" }));
+    const fake = deployments({ json: { id: "dp_1" } }, { json: { id: "dp_1" } });
     const result = await register({
       adminBaseUrl: "http://127.0.0.1:9070",
-      fetchImpl: fetchImpl as unknown as typeof fetch,
+      fetchImpl: fake.fetch,
       queryNonCompletedInvocations: async () => 0,
     });
 
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
-    expect(JSON.parse(fetchImpl.mock.calls[1][1].body as string)).toEqual({ uri: "http://127.0.0.1:9080", force: true });
+    expect(fake.calls).toHaveLength(2);
+    expect(JSON.parse(fake.calls[1].body)).toEqual({ uri: "http://127.0.0.1:9080", force: true });
     expect(result).toEqual({ outcome: "registered-drained-force" });
   });
 
   it("an existing URI (200) with active work declines force", async () => {
-    const fetchImpl = vi.fn(async (_url: string, _init: RequestInit) => jsonResponse(200, { id: "dp_1" }));
+    const fake = deployments({ json: { id: "dp_1" } });
     const result = await register({
       adminBaseUrl: "http://127.0.0.1:9070",
-      fetchImpl: fetchImpl as unknown as typeof fetch,
+      fetchImpl: fake.fetch,
       queryNonCompletedInvocations: async () => 1,
     });
 
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fake.calls).toHaveLength(1);
     expect(result.outcome).toBe("declined-conflict");
   });
 
   it("META0004 conflict with zero non-completed invocations on the old deployment retries with force:true and succeeds", async () => {
-    const fetchImpl = vi
-      .fn<(url: string, init: RequestInit) => Promise<Response>>()
-      .mockResolvedValueOnce(jsonResponse(409, { restate_code: "META0004", message: "conflict" }))
-      .mockResolvedValueOnce(jsonResponse(200, { id: "dp_1" }));
+    const fake = deployments(META0004, { json: { id: "dp_1" } });
 
     const result = await register({
       adminBaseUrl: "http://127.0.0.1:9070",
-      fetchImpl: fetchImpl as unknown as typeof fetch,
+      fetchImpl: fake.fetch,
       queryNonCompletedInvocations: async () => 0,
     });
 
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
-    const [, secondInit] = fetchImpl.mock.calls[1];
-    expect(JSON.parse(secondInit.body as string)).toEqual({ uri: "http://127.0.0.1:9080", force: true });
+    expect(fake.calls).toHaveLength(2);
+    expect(JSON.parse(fake.calls[1].body)).toEqual({ uri: "http://127.0.0.1:9080", force: true });
     expect(result).toEqual({ outcome: "registered-drained-force" });
   });
 
   it("META0004 conflict with a nonzero non-completed-invocation count declines force — no second call", async () => {
-    const fetchImpl = vi.fn(async () => jsonResponse(409, { restate_code: "META0004", message: "conflict" }));
+    const fake = deployments(META0004);
 
     const result = await register({
       adminBaseUrl: "http://127.0.0.1:9070",
-      fetchImpl: fetchImpl as unknown as typeof fetch,
+      fetchImpl: fake.fetch,
       queryNonCompletedInvocations: async () => 3,
     });
 
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fake.calls).toHaveLength(1);
     expect(result.outcome).toBe("declined-conflict");
   });
 
   it("META0004 conflict with an unknown non-completed-invocation count (null) declines force, fail-closed — no second call", async () => {
-    const fetchImpl = vi.fn(async () => jsonResponse(409, { restate_code: "META0004", message: "conflict" }));
+    const fake = deployments(META0004);
 
     const result = await register({
       adminBaseUrl: "http://127.0.0.1:9070",
-      fetchImpl: fetchImpl as unknown as typeof fetch,
+      fetchImpl: fake.fetch,
       queryNonCompletedInvocations: async () => null,
     });
 
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fake.calls).toHaveLength(1);
     expect(result.outcome).toBe("declined-conflict");
   });
 
   it("META0004 conflict with a throwing invocation-count query declines force, fail-closed — no second call", async () => {
-    const fetchImpl = vi.fn(async () => jsonResponse(409, { restate_code: "META0004", message: "conflict" }));
+    const fake = deployments(META0004);
 
     const result = await register({
       adminBaseUrl: "http://127.0.0.1:9070",
-      fetchImpl: fetchImpl as unknown as typeof fetch,
+      fetchImpl: fake.fetch,
       queryNonCompletedInvocations: async () => {
         throw new Error("admin API unreachable mid-query");
       },
     });
 
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fake.calls).toHaveLength(1);
     expect(result.outcome).toBe("declined-conflict");
   });
 
   it("a non-META0004 error does not retry with force", async () => {
-    const fetchImpl = vi.fn(async () => jsonResponse(500, { message: "internal error" }));
+    const fake = deployments({ status: 500, json: { message: "internal error" } });
 
     const result = await register({
       adminBaseUrl: "http://127.0.0.1:9070",
-      fetchImpl: fetchImpl as unknown as typeof fetch,
+      fetchImpl: fake.fetch,
     });
 
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fake.calls).toHaveLength(1);
     expect(result.outcome).toBe("unreachable");
   });
 
@@ -219,7 +198,7 @@ describe("register", () => {
     try {
       const result = await register({
         adminBaseUrl: "http://127.0.0.1:9070",
-        fetchImpl: hangingFetch(),
+        fetchImpl: deployments(hangUntilAborted).fetch,
       });
       expect(result.outcome).toBe("unreachable");
     } finally {
@@ -230,17 +209,15 @@ describe("register", () => {
   it("bounds the forced retry at 10s — a never-resolving fetch on the retry after a META0004 conflict degrades to unreachable (AII-728)", async () => {
     const timeoutSpy = stubAbortTimeout(10_000);
     try {
-      const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
-        const body = JSON.parse((init?.body as string) ?? "{}");
-        if (body.force) return hangingFetch()(url, init);
-        return jsonResponse(409, { restate_code: "META0004", message: "conflict" });
-      });
+      const fake = deployments(META0004, hangUntilAborted);
       const result = await register({
         adminBaseUrl: "http://127.0.0.1:9070",
-        fetchImpl: fetchImpl as unknown as typeof fetch,
+        fetchImpl: fake.fetch,
         queryNonCompletedInvocations: async () => 0,
       });
       expect(result.outcome).toBe("unreachable");
+      // The request that hung is the forced retry.
+      expect(JSON.parse(fake.calls[1].body)).toMatchObject({ force: true });
     } finally {
       timeoutSpy.mockRestore();
     }
@@ -248,13 +225,13 @@ describe("register", () => {
 
   it("an unreachable admin API logs one warning and returns unreachable", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const fetchImpl = vi.fn(async () => {
+    const fake = deployments(() => {
       throw new Error("connect ECONNREFUSED 127.0.0.1:9070");
     });
 
     const result = await register({
       adminBaseUrl: "http://127.0.0.1:9070",
-      fetchImpl: fetchImpl as unknown as typeof fetch,
+      fetchImpl: fake.fetch,
     });
 
     expect(result.outcome).toBe("unreachable");
@@ -267,25 +244,28 @@ describe("register", () => {
 // queryNonCompletedInvocations() — the drain check's own HTTP/parsing contract
 // ---------------------------------------------------------------------------
 
+/** The admin API's introspection endpoint, answering one query. */
+function introspection(reply: Reply) {
+  return fakeFetch({ "POST /query": [reply] });
+}
+
 describe("queryNonCompletedInvocations", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
   it("posts a SQL query to POST /query with an Accept: application/json header, and resolves the row's count", async () => {
-    const fetchImpl = vi
-      .fn<(url: string, init: RequestInit) => Promise<Response>>()
-      .mockImplementation(async () => jsonResponse(200, { rows: [{ count: 2 }] }));
+    const fake = introspection({ json: { rows: [{ count: 2 }] } });
 
-    const result = await queryNonCompletedInvocations(fetchImpl as unknown as typeof fetch, "http://127.0.0.1:9070", "http://127.0.0.1:9080");
+    const result = await queryNonCompletedInvocations(fake.fetch, "http://127.0.0.1:9070", "http://127.0.0.1:9080");
 
     expect(result).toBe(2);
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
-    const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe("http://127.0.0.1:9070/query");
-    expect(init.method).toBe("POST");
-    expect((init.headers as Record<string, string>).accept).toBe("application/json");
-    const body = JSON.parse(init.body as string) as { query: string };
+    expect(fake.calls).toHaveLength(1);
+    const [call] = fake.calls;
+    expect(call.url.href).toBe("http://127.0.0.1:9070/query");
+    expect(call.method).toBe("POST");
+    expect(call.headers.get("accept")).toBe("application/json");
+    const body = JSON.parse(call.body) as { query: string };
     expect(body.query).toContain("http://127.0.0.1:9080");
     expect(body.query).toContain("status != 'completed'");
     // A scheduled call has not started: no journal, no pinned deployment (AII-1031).
@@ -295,38 +275,38 @@ describe("queryNonCompletedInvocations", () => {
   });
 
   it("resolves 0 when the query returns no matching deployment (nothing registered yet at that URI)", async () => {
-    const fetchImpl = vi.fn(async () => jsonResponse(200, { rows: [{ count: 0 }] }));
-    const result = await queryNonCompletedInvocations(fetchImpl as unknown as typeof fetch, "http://127.0.0.1:9070", "http://127.0.0.1:9080");
+    const fake = introspection({ json: { rows: [{ count: 0 }] } });
+    const result = await queryNonCompletedInvocations(fake.fetch, "http://127.0.0.1:9070", "http://127.0.0.1:9080");
     expect(result).toBe(0);
   });
 
   it("resolves null (unknown) on a non-2xx response", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const fetchImpl = vi.fn(async () => jsonResponse(500, { message: "internal error" }));
-    const result = await queryNonCompletedInvocations(fetchImpl as unknown as typeof fetch, "http://127.0.0.1:9070", "http://127.0.0.1:9080");
+    const fake = introspection({ status: 500, json: { message: "internal error" } });
+    const result = await queryNonCompletedInvocations(fake.fetch, "http://127.0.0.1:9070", "http://127.0.0.1:9080");
     expect(result).toBeNull();
   });
 
   it("resolves null (unknown) on an unrecognized response shape — no rows array", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const fetchImpl = vi.fn(async () => jsonResponse(200, { data: [] }));
-    const result = await queryNonCompletedInvocations(fetchImpl as unknown as typeof fetch, "http://127.0.0.1:9070", "http://127.0.0.1:9080");
+    const fake = introspection({ json: { data: [] } });
+    const result = await queryNonCompletedInvocations(fake.fetch, "http://127.0.0.1:9070", "http://127.0.0.1:9080");
     expect(result).toBeNull();
   });
 
   it("resolves null (unknown) when the count column isn't a number", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const fetchImpl = vi.fn(async () => jsonResponse(200, { rows: [{ count: "2" }] }));
-    const result = await queryNonCompletedInvocations(fetchImpl as unknown as typeof fetch, "http://127.0.0.1:9070", "http://127.0.0.1:9080");
+    const fake = introspection({ json: { rows: [{ count: "2" }] } });
+    const result = await queryNonCompletedInvocations(fake.fetch, "http://127.0.0.1:9070", "http://127.0.0.1:9080");
     expect(result).toBeNull();
   });
 
   it("resolves null (unknown) when fetch itself throws", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const fetchImpl = vi.fn(async () => {
+    const fake = introspection(() => {
       throw new Error("connect ECONNREFUSED 127.0.0.1:9070");
     });
-    const result = await queryNonCompletedInvocations(fetchImpl as unknown as typeof fetch, "http://127.0.0.1:9070", "http://127.0.0.1:9080");
+    const result = await queryNonCompletedInvocations(fake.fetch, "http://127.0.0.1:9070", "http://127.0.0.1:9080");
     expect(result).toBeNull();
   });
 });

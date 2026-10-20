@@ -1,15 +1,18 @@
 /**
- * Tests for `src/model-auth-runtime.ts` (AII-1385) against a temp SQLite file, a stub `fetchImpl` and a mocked
- * installation token. `npm run typecheck` excludes `src/__tests__`, so type-check this file with a throwaway tsconfig.
+ * Tests for `src/model-auth-runtime.ts` (AII-1385) against a temp SQLite file, a fake GitHub API and a mocked
+ * installation token.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
+import { serializeChatGptPlanRecord } from "../chatgpt-plan-token.js";
 import type * as DedupModule from "../dedup.js";
 import type * as RuntimeModule from "../model-auth-runtime.js";
 import type * as StoreModule from "../agent-config-store.js";
 import type * as PrepModule from "../agent-run-preparation.js";
+import { createModelSessionKeyProvider } from "../model-session-keys.js";
+import { makeChatGptPlanRecord, makeScopedInstallationToken } from "./helpers/builders.js";
+import { fakeFetch, type FakeFetch, type ReplyInit } from "./helpers/fake-fetch.js";
+import { githubError, githubFile } from "./helpers/replies/github.js";
+import { testDb, type LoadedModules } from "./helpers/test-db.js";
 
 const SECRET = "SENTINEL-RUNNER-TOKEN-SECRET-xyz";
 const TOKEN = "SENTINEL-INSTALL-TOKEN-1";
@@ -17,36 +20,32 @@ const ACCESS = "SENTINEL-ACCESS-TOKEN-2";
 // Allowlisted (AII-1323): the built-in prefix ghcr.io/builddownai/ and the owner prefix ghcr.io/acme/.
 const DEFAULT_IMAGE = "ghcr.io/builddownai/runner:paired";
 const CONFIG = { githubAppId: "1", githubAppPrivateKey: "SENTINEL-APP-KEY", sessionImage: DEFAULT_IMAGE };
+const NOT_FOUND = githubError(404, "Not Found");
+const MODULES = {
+  dedup: () => import("../dedup.js"),
+  mod: () => import("../model-auth-runtime.js"),
+  store: () => import("../agent-config-store.js"),
+  prep: () => import("../agent-run-preparation.js"),
+  sessionStore: () => import("../model-session-store.js"),
+  protectedSecrets: () => import("../model-protected-secrets.js"),
+  credentials: () => import("../model-credentials.js"),
+};
 
-let dbPath: string;
+let modules: LoadedModules<typeof MODULES>;
 let dedup: typeof DedupModule;
 let mod: typeof RuntimeModule;
 let store: typeof StoreModule;
 let prep: typeof PrepModule;
 let logs: string[];
-let repoResponse: { status: number; body: unknown } | "throw";
-let imageResponse: { status: number; body: unknown };
-
-const fetchImpl = vi.fn(async (url: string | URL | Request) => {
-  const u = String(url);
-  if (u.endsWith("/contents/.ai-implement/image.yml")) {
-    return new Response(JSON.stringify(imageResponse.body), { status: imageResponse.status });
-  }
-  if (repoResponse === "throw") throw new Error(`network down ${TOKEN}`);
-  return new Response(JSON.stringify(repoResponse.body), { status: repoResponse.status });
-}) as unknown as typeof fetch;
+let repoReply: ReplyInit | "throw";
+let github: FakeFetch;
 
 function runtime() {
-  return mod.createModelAuthRuntime({ config: CONFIG, env: { RUNNER_TOKEN_SECRET: SECRET }, fetchImpl });
+  return mod.createModelAuthRuntime({ config: CONFIG, env: { RUNNER_TOKEN_SECRET: SECRET }, fetchImpl: github.fetch });
 }
 
 function planRecord() {
-  return JSON.stringify({
-    version: 1, email: "u@example.com", issuer: "https://auth.openai.com", subject: "s", clientId: "c",
-    extAgentHostId: "h", idToken: "synthetic-id", accessToken: ACCESS, refreshToken: "synthetic-refresh",
-    tokenType: "Bearer", scopes: ["chatgpt.tokens.use.direct"], accessTokenExpiresAt: Date.now() + 3_600_000,
-    earliestRefreshAt: null, savedAt: Date.now(),
-  });
+  return serializeChatGptPlanRecord(makeChatGptPlanRecord({ accessToken: ACCESS }));
 }
 
 function count(table: string): number {
@@ -58,18 +57,23 @@ function stage(profile: string, agent: "claude" | "codex", provider: "anthropic"
 }
 
 beforeEach(async () => {
-  dbPath = path.join(os.tmpdir(), `model-auth-runtime-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  vi.resetModules();
-  process.env.DEDUP_DB_PATH = dbPath;
-  process.env.RUNNER_TOKEN_SECRET = SECRET;
-  vi.doMock("../github-app-auth.js", () => ({ getScopedInstallationToken: async () => ({ token: TOKEN, expiresAt: "", installationId: 1 }) }));
-  dedup = await import("../dedup.js");
-  mod = await import("../model-auth-runtime.js");
-  store = await import("../agent-config-store.js");
-  prep = await import("../agent-run-preparation.js");
-  dedup.getDb();
-  repoResponse = { status: 200, body: { visibility: "private" } };
-  imageResponse = { status: 404, body: {} };
+  vi.doMock("../github-app-auth.js", () => ({
+    getScopedInstallationToken: async () => makeScopedInstallationToken({ token: TOKEN }),
+  }));
+  modules = (await testDb({ modules: MODULES })).modules;
+  ({ dedup, mod, store, prep } = modules);
+  repoReply = { json: { visibility: "private" } };
+  const repo = () => {
+    if (repoReply === "throw") throw new Error(`network down ${TOKEN}`);
+    return repoReply;
+  };
+  github = fakeFetch({
+    "GET /repos/acme/app": repo,
+    "GET /repos/acme/ready-repo": repo,
+    "GET /repos/acme/override-repo/contents/.ai-implement/image.yml": githubFile("image: ghcr.io/acme/custom:1\n"),
+    "GET /repos/acme/default-repo/contents/.ai-implement/image.yml": NOT_FOUND,
+    "GET /repos/acme/ready-repo/contents/.ai-implement/image.yml": NOT_FOUND,
+  });
   logs = [];
   for (const m of ["log", "warn", "error", "info", "debug"] as const) {
     vi.spyOn(console, m).mockImplementation((...a: unknown[]) => { logs.push(a.map(String).join(" ")); });
@@ -79,19 +83,13 @@ beforeEach(async () => {
 afterEach(() => {
   expect(logs.join("\n")).not.toMatch(/SENTINEL/);
   vi.restoreAllMocks();
-  dedup.closeDb();
-  for (const suffix of ["", "-wal", "-shm"]) {
-    try { fs.unlinkSync(dbPath + suffix); } catch { /* ignore */ }
-  }
+  vi.unstubAllEnvs();
 });
 
 describe("checkRunnerCapability", () => {
   it("is true on fly-machines for the default image and false for an override", async () => {
-    const yml = Buffer.from("image: ghcr.io/acme/custom:1\n").toString("base64");
-    imageResponse = { status: 200, body: { type: "file", encoding: "base64", content: yml } };
     const over = runtime().preparationDeps({ owner: "acme", repo: "override-repo", projectKey: "AII" });
     expect(await over.checkRunnerCapability!("fly-machines")).toBe(false);
-    imageResponse = { status: 404, body: {} };
     const def = runtime().preparationDeps({ owner: "acme", repo: "default-repo", projectKey: "AII" });
     expect(await def.checkRunnerCapability!("fly-machines")).toBe(true);
   });
@@ -125,24 +123,24 @@ describe("getRepoTrust", () => {
   it("never trusts public, internal or opted-out repos", async () => {
     store.setProjectOptIn("AII", true);
     for (const visibility of ["public", "internal"]) {
-      repoResponse = { status: 200, body: { visibility } };
+      repoReply = { json: { visibility } };
       expect(await deps().getRepoTrust("acme/app")).toEqual({ visibility, trustedForSubscription: false });
     }
     store.setProjectOptIn("AII", false);
-    repoResponse = { status: 200, body: { visibility: "private" } };
+    repoReply = { json: { visibility: "private" } };
     expect(await deps().getRepoTrust("acme/app")).toEqual({ visibility: "private", trustedForSubscription: false });
   });
 
   it("throws on a failed fetch, bad status, missing visibility or malformed repo", async () => {
     store.setProjectOptIn("AII", true);
-    repoResponse = "throw";
+    repoReply = "throw";
     await expect(deps().getRepoTrust("acme/app")).rejects.toThrow(/fetch failed/);
     await deps().getRepoTrust("acme/app").catch((e: Error) => expect(e.message).not.toContain(TOKEN));
-    repoResponse = { status: 404, body: {} };
+    repoReply = NOT_FOUND;
     await expect(deps().getRepoTrust("acme/app")).rejects.toThrow(/HTTP 404/);
-    repoResponse = { status: 200, body: {} };
+    repoReply = { json: {} };
     await expect(deps().getRepoTrust("acme/app")).rejects.toThrow(/visibility/);
-    repoResponse = { status: 200, body: { visibility: "weird" } };
+    repoReply = { json: { visibility: "weird" } };
     await expect(deps().getRepoTrust("acme/app")).rejects.toThrow(/visibility/);
     await expect(deps().getRepoTrust("not-a-repo")).rejects.toThrow(/malformed/);
   });
@@ -150,42 +148,41 @@ describe("getRepoTrust", () => {
   describe("readDefaultBranchWorkflows (AII-1420)", () => {
     const WF = ".github/workflows/claude-implement.yml";
     const RETIRED = ".github/workflows/comment-trigger.yml";
-    let seen: string[];
-    let files: Record<string, { status: number; text?: string } | "throw">;
+    let contents: FakeFetch;
+    let files: Record<string, ReplyInit | "throw">;
 
     beforeEach(() => {
-      seen = [];
       files = {};
-      vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
-        const u = String(url);
-        seen.push(`${u} ${JSON.stringify(init?.headers ?? {})}`);
-        const key = decodeURIComponent(u.split("/contents/")[1]!);
-        const f = files[key] ?? { status: 404 };
+      const file = (path: string) => () => {
+        const f = files[path] ?? NOT_FOUND;
         if (f === "throw") throw new Error(`network down ${TOKEN}`);
-        if (f.status !== 200) return new Response("{}", { status: f.status });
-        return new Response(JSON.stringify({ type: "file", encoding: "base64", content: Buffer.from(f.text ?? "").toString("base64") }), { status: 200 });
-      }));
+        return f;
+      };
+      // getDefaultBranchFileText calls the global fetch, not the runtime's fetchImpl.
+      contents = fakeFetch({
+        "GET /repos/acme/app/contents/.github/workflows/claude-implement.yml": file(WF),
+        "GET /repos/acme/app/contents/.github/workflows/comment-trigger.yml": file(RETIRED),
+      }).install();
     });
-    afterEach(() => { vi.unstubAllGlobals(); });
 
     it("returns text for present paths and null for 404 paths, reading the default branch with a repo-scoped token", async () => {
-      files[WF] = { status: 200, text: "# ai-implement-capability: stage-agent-config-v1\n" };
+      files[WF] = githubFile("# ai-implement-capability: stage-agent-config-v1\n");
       const out = await deps().readDefaultBranchWorkflows("acme/app", [WF, RETIRED]);
       expect(out).toEqual({ [WF]: "# ai-implement-capability: stage-agent-config-v1\n", [RETIRED]: null });
-      expect(seen).toHaveLength(2);
-      for (const call of seen) {
-        expect(call).toContain("https://api.github.com/repos/acme/app/contents/.github/workflows/");
-        expect(call).not.toContain("ref=");
-        expect(call).toContain(TOKEN);
+      expect(contents.calls).toHaveLength(2);
+      for (const call of contents.calls) {
+        expect(call.url.host).toBe("api.github.com");
+        expect(call.url.searchParams.has("ref")).toBe(false);
+        expect(call.headers.get("authorization")).toBe(`Bearer ${TOKEN}`);
       }
     });
 
     it("surfaces a non-404 error as delivery_unreadable, never as absent", async () => {
-      files[WF] = { status: 500 };
+      files[WF] = githubError(500, "Server Error");
       await expect(deps().readDefaultBranchWorkflows("acme/app", [WF])).rejects.toThrow(/HTTP 500/);
       files[WF] = "throw";
       await expect(deps().readDefaultBranchWorkflows("acme/app", [WF])).rejects.toThrow();
-      files[WF] = { status: 403 };
+      files[WF] = githubError(403, "Resource not accessible by integration");
       const result = await prep.prepareAgentRun(
         { dispatchId: "d-unreadable", projectKey: "AII", backend: "github-actions", workflowRepository: "acme/app", workflowFile: "claude-implement.yml", repositories: ["acme/app"] },
         runtime().preparationDeps({ owner: "acme", repo: "app", projectKey: "AII" }),
@@ -196,7 +193,7 @@ describe("getRepoTrust", () => {
 
     it("rejects a malformed repository without any request", async () => {
       await expect(deps().readDefaultBranchWorkflows("not-a-repo", [WF])).rejects.toThrow(/malformed/);
-      expect(seen).toHaveLength(0);
+      expect(contents.calls).toHaveLength(0);
     });
   });
 });
@@ -219,20 +216,14 @@ describe("ownership", () => {
 
 describe("credentials and session store", () => {
   it("resolves no protected secret without a stored row, and ignores ambient keys", () => {
-    process.env.ANTHROPIC_API_KEY = "AMBIENT";
-    try {
-      const { credentials } = runtime();
-      expect(credentials.resolveProtectedSecret("model-account:api")).toBeNull();
-      expect(credentials.resolveProtectedSecret("anything")).toBeNull();
-    } finally {
-      delete process.env.ANTHROPIC_API_KEY;
-    }
+    vi.stubEnv("ANTHROPIC_API_KEY", "AMBIENT");
+    const { credentials } = runtime();
+    expect(credentials.resolveProtectedSecret("model-account:api")).toBeNull();
+    expect(credentials.resolveProtectedSecret("anything")).toBeNull();
   });
 
-  it("reads a record written under the CLI key scheme", async () => {
-    const { createModelSessionKeyProvider } = await import("../model-session-keys.js");
-    const { createModelSessionStore } = await import("../model-session-store.js");
-    const cli = createModelSessionStore({
+  it("reads a record written under the CLI key scheme", () => {
+    const cli = modules.sessionStore.createModelSessionStore({
       keys: createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: SECRET }),
       verifyOwner: () => false,
       authorizeOperator: (op) => op === "model-account-cli",
@@ -265,9 +256,7 @@ describe("prepareAgentRun with the runtime deps", () => {
     });
     useStages("cdx", "codex", "openai");
     const rt = runtime();
-    const { createModelSessionKeyProvider } = await import("../model-session-keys.js");
-    const { createModelSessionStore } = await import("../model-session-store.js");
-    const writer = createModelSessionStore({
+    const writer = modules.sessionStore.createModelSessionStore({
       keys: createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: SECRET }),
       verifyOwner: () => false, authorizeOperator: () => true, db: () => dedup.getDb(),
     });
@@ -283,17 +272,16 @@ describe("prepareAgentRun with the runtime deps", () => {
       authMode: "anthropic-api-key", allowedProjectKeys: ["AII"], metadata: { credentialRef: "model-account:api" },
     });
     useStages("api", "claude", "anthropic");
-    const { createModelProtectedSecrets } = await import("../model-protected-secrets.js");
     const KEY = "sk-ant-SENTINEL-STORED-KEY";
-    expect(createModelProtectedSecrets({ env: { RUNNER_TOKEN_SECRET: SECRET } }).write("model-account:api", KEY).ok).toBe(true);
+    expect(modules.protectedSecrets.createModelProtectedSecrets({ env: { RUNNER_TOKEN_SECRET: SECRET } }).write("model-account:api", KEY).ok).toBe(true);
     const r = await prep.prepareAgentRun(request(), runtime().preparationDeps({ owner: "acme", repo: "ready-repo", projectKey: "AII" }));
     expect(r.status).toBe("ready");
     expect(JSON.stringify(r)).not.toContain(KEY);
   });
 
-  it("denies a disabled-project profile without consulting storage", async () => {
+  it("denies a disabled-project profile without consulting storage", () => {
     const spy = vi.fn(() => "sk-never");
-    const { resolveModelCredential } = await import("../model-credentials.js");
+    const { resolveModelCredential } = modules.credentials;
     store.saveAccountProfileRevision({
       profileId: "api", identity: "Api", revision: 1, agent: "claude", provider: "anthropic",
       authMode: "anthropic-api-key", allowedProjectKeys: ["OTHER"], metadata: { credentialRef: "model-account:api" },

@@ -1,8 +1,6 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import {
-  mkdtempSync,
   writeFileSync,
-  rmSync,
   symlinkSync,
   readFileSync,
   existsSync,
@@ -10,12 +8,12 @@ import {
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import {
   resolveRepository,
   createIsolatedWorkspace,
   WorkspaceError,
 } from "../local/workspace.js";
+import { testDir } from "./helpers/test-dir.js";
 
 // Full filesystem fixture: real git repos, no mocks.
 
@@ -35,15 +33,11 @@ function initRepo(dir: string): void {
 }
 
 beforeEach(() => {
-  repoDir = mkdtempSync(join(tmpdir(), "local-workspace-test-"));
+  repoDir = testDir("local-workspace");
   initRepo(repoDir);
   writeFileSync(join(repoDir, "file.txt"), "initial content\n");
   git(["add", "."]);
   git(["commit", "-m", "Initial commit"]);
-});
-
-afterEach(() => {
-  rmSync(repoDir, { recursive: true, force: true });
 });
 
 describe("resolveRepository", () => {
@@ -105,29 +99,21 @@ describe("resolveRepository", () => {
   });
 
   it("throws symlink-escape error when the path goes through a symlink", async () => {
-    const linkBase = mkdtempSync(join(tmpdir(), "symlink-test-"));
+    const linkBase = testDir("symlink");
     const linkPath = join(linkBase, "repo-link");
     symlinkSync(repoDir, linkPath);
-    try {
-      const err = await resolveRepository(linkPath).catch((e) => e);
-      expect(err).toBeInstanceOf(WorkspaceError);
-      expect((err as WorkspaceError).kind).toBe("symlink-escape");
-      expect(err.message).toMatch(/symlink/i);
-    } finally {
-      rmSync(linkBase, { recursive: true, force: true });
-    }
+    const err = await resolveRepository(linkPath).catch((e) => e);
+    expect(err).toBeInstanceOf(WorkspaceError);
+    expect((err as WorkspaceError).kind).toBe("symlink-escape");
+    expect(err.message).toMatch(/symlink/i);
   });
 
   it("throws not-git error for a plain directory that is not a git repo", async () => {
-    const plainDir = mkdtempSync(join(tmpdir(), "plain-dir-"));
-    try {
-      const err = await resolveRepository(plainDir).catch((e) => e);
-      expect(err).toBeInstanceOf(WorkspaceError);
-      expect((err as WorkspaceError).kind).toBe("not-git");
-      expect(err.message).toMatch(/git repository/i);
-    } finally {
-      rmSync(plainDir, { recursive: true, force: true });
-    }
+    const plainDir = testDir("plain-dir");
+    const err = await resolveRepository(plainDir).catch((e) => e);
+    expect(err).toBeInstanceOf(WorkspaceError);
+    expect((err as WorkspaceError).kind).toBe("not-git");
+    expect(err.message).toMatch(/git repository/i);
   });
 });
 

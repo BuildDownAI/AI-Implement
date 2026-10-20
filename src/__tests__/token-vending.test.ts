@@ -1,22 +1,14 @@
 import { EventEmitter } from "node:events";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as TokenVendingModule from "../token-vending.js";
 import type * as LogModule from "../log.js";
-import type * as DedupModule from "../dedup.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
 import type * as RunnerCallbackModule from "../runner-callback.js";
+import { testDb } from "./helpers/test-db.js";
 
 vi.mock("../github-app-auth.js", () => ({
   getScopedInstallationToken: vi.fn(),
   clearTokenCache: vi.fn(),
-}));
-
-vi.mock("../linear-app-auth.js", () => ({
-  isLinearAuthConfigured: vi.fn(),
-  withLinearToken: vi.fn(),
 }));
 
 class MockRequest extends EventEmitter {
@@ -55,10 +47,8 @@ class MockResponse {
   }
 }
 
-let dbPath: string;
 let tokenVending: typeof TokenVendingModule;
 let log: typeof LogModule;
-let dedup: typeof DedupModule;
 let runnerTokens: typeof RunnerTokensModule;
 let runnerCallback: typeof RunnerCallbackModule;
 
@@ -67,23 +57,23 @@ let mockGetScopedInstallationToken: ReturnType<typeof vi.fn>;
 const SECRET = "test-secret-with-enough-entropy-for-hmac";
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `token-vending-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  runnerTokens = await import("../runner-tokens.js");
-  tokenVending = await import("../token-vending.js");
-  runnerCallback = await import("../runner-callback.js");
-  const ghAuth = await import("../github-app-auth.js");
-  mockGetScopedInstallationToken = vi.mocked(ghAuth.getScopedInstallationToken);
-  log.initLogTable();
+  const modules = (
+    await testDb({
+      modules: {
+        log: () => import("../log.js"),
+        runnerTokens: () => import("../runner-tokens.js"),
+        tokenVending: () => import("../token-vending.js"),
+        runnerCallback: () => import("../runner-callback.js"),
+        ghAuth: () => import("../github-app-auth.js"),
+      },
+    })
+  ).modules;
+  ({ log, runnerTokens, tokenVending, runnerCallback } = modules);
+  mockGetScopedInstallationToken = vi.mocked(modules.ghAuth.getScopedInstallationToken);
 });
 
 afterEach(() => {
   vi.restoreAllMocks();
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
 });
 
 async function callTokenEndpoint(body: unknown): Promise<{ statusCode: number; body: string }> {

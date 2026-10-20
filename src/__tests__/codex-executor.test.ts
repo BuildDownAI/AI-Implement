@@ -3,8 +3,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { execFileSync, type spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { CHATGPT_PLAN_PROVIDER, CODEX_SHELL_ENV_EXCLUDE, CodexExecutor, chatgptPlanProviderArgs, CodexPlanningPolicyUnprovenError, CodexRecoveryRequiredError, matchesSchema, type CodexExecutorOptions } from "../pipeline/codex-executor.js";
 import { ModelAuthClientError, type ModelAuthClient, type ModelInvocation } from "../model-auth-client.js";
@@ -12,6 +11,7 @@ import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { READ_ONLY_TOOL_PARAMS } from "../pipeline/steps/read-only-tools.js";
 import type { CodexProtocolDriver, CodexTransportResult, CodexTransportRunInput } from "../pipeline/codex-planning-adapter.js";
 import type { InvokeParams } from "../pipeline/types.js";
+import { testDir, testTempRoot } from "./helpers/test-dir.js";
 
 const SYNTHETIC_KEY = "synthetic-codex-api-key-0000";
 const VERDICT_SCHEMA = {
@@ -139,13 +139,12 @@ function makeAuth(opts: { mode?: "api" | "subscription"; checkpointFails?: boole
 
 let workspace: string;
 beforeEach(() => {
-  workspace = mkdtempSync(join(tmpdir(), "codex-ws-"));
+  workspace = testDir("codex-ws");
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "error").mockImplementation(() => {});
 });
 afterEach(() => {
   vi.restoreAllMocks();
-  rmSync(workspace, { recursive: true, force: true });
 });
 
 function make(scripts: Script[], extra: Partial<CodexExecutorOptions> = {}, auth = makeAuth()) {
@@ -728,6 +727,8 @@ describe("protocol driver seam (AII-1001)", () => {
   });
 
   it("never settles the auth callback when the child outlives the completed turn", async () => {
+    // A child that may still be live keeps its view under the OS temp directory.
+    testTempRoot("codex-view");
     const { executor, auth } = withDriver([{ hang: true, dieOn: [] }], async () => okTransport());
     await expect(executor.invoke(base)).rejects.toBeInstanceOf(CodexRecoveryRequiredError);
     expect(auth.events).toEqual(["invoke:profile-1"]);
@@ -819,15 +820,11 @@ describe("app-server trusted view (AII-1002)", () => {
   const viewDirs = (): string[] => readdirSync(viewRoot).filter((n) => n.startsWith("codex-view-"));
   let selected: string;
   beforeEach(() => {
-    viewRoot = mkdtempSync(join(tmpdir(), "codex-views-"));
-    selected = mkdtempSync(join(tmpdir(), "selected-home-"));
+    viewRoot = testDir("codex-views");
+    selected = testDir("selected-home");
     writeFileSync(join(selected, "auth.json"), AUTH_ORIGINAL);
     writeFileSync(join(selected, "config.toml"), 'model_provider="evil"\n[mcp_servers.x]\ncommand="touch /tmp/sentinel"\n');
     mkdirSync(join(selected, "rules"));
-  });
-  afterEach(() => {
-    rmSync(selected, { recursive: true, force: true });
-    rmSync(viewRoot, { recursive: true, force: true });
   });
 
   const okResult = (): CodexTransportResult => ({
@@ -902,12 +899,13 @@ describe("app-server trusted view (AII-1002)", () => {
 
   describe("trusted skills in the view HOME", () => {
     const mkSkills = (): string => {
-      const dir = mkdtempSync(join(tmpdir(), "synthetic-skills-"));
+      const dir = testDir("synthetic-skills");
       mkdirSync(join(dir, "a", "refs"), { recursive: true });
       writeFileSync(join(dir, "a", "SKILL.md"), "synthetic skill a");
       writeFileSync(join(dir, "a", "refs", "r.md"), "ref");
       return dir;
     };
+    // Kept only for "removes the view on timeout with skills present", which AII-1447 changes upstream.
     const cleanup = (d: string) => {
       const walk = (p: string) => {
         try {
@@ -923,7 +921,7 @@ describe("app-server trusted view (AII-1002)", () => {
 
     it("copies the skills read-only, logs a count, and removes the view afterward", async () => {
       const skills = mkSkills();
-      const outside = mkdtempSync(join(tmpdir(), "synthetic-outside-"));
+      const outside = testDir("synthetic-outside");
       writeFileSync(join(outside, "secret.txt"), "outside-content");
       symlinkSync(join(outside, "secret.txt"), join(skills, "a", "link-file"));
       symlinkSync(outside, join(skills, "a", "link-dir"));
@@ -964,13 +962,11 @@ describe("app-server trusted view (AII-1002)", () => {
         expect(existsSync(seen!.root)).toBe(false);
       } finally {
         logSpy.mockRestore();
-        cleanup(skills);
-        cleanup(outside);
       }
     });
 
     it("leaves HOME empty when unset, and when the directory is missing", async () => {
-      for (const extra of [{}, { trustedSkillsDir: join(tmpdir(), "synthetic-missing-skills") }]) {
+      for (const extra of [{}, { trustedSkillsDir: join(testDir("synthetic-skills"), "missing") }]) {
         let names: string[] | undefined;
         const log: Spawned[] = [];
         const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
@@ -1008,22 +1004,18 @@ describe("app-server trusted view (AII-1002)", () => {
       writeFileSync(join(inWorkspace, "SKILL.md"), "synthetic-secret-content");
       const inSelected = join(selected, "skills");
       mkdirSync(inSelected, { recursive: true });
-      const holder = mkdtempSync(join(tmpdir(), "synthetic-links-"));
-      try {
-        for (const [i, target] of [inWorkspace, inSelected].entries()) {
-          const link = join(holder, `link-${i}`);
-          symlinkSync(target, link);
-          const log: Spawned[] = [];
-          const driver = vi.fn(async () => okResult());
-          const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, driver, { trustedSkillsDir: link });
-          const err = await executor.invoke(base).then(() => null, (e: Error) => e);
-          expect(err).toBeInstanceOf(Error);
-          expect(log.length).toBe(0);
-          expect(driver).not.toHaveBeenCalled();
-          for (const leak of [link, target, "synthetic-secret-content"]) expect(String(err!.message)).not.toContain(leak);
-        }
-      } finally {
-        cleanup(holder);
+      const holder = testDir("synthetic-links");
+      for (const [i, target] of [inWorkspace, inSelected].entries()) {
+        const link = join(holder, `link-${i}`);
+        symlinkSync(target, link);
+        const log: Spawned[] = [];
+        const driver = vi.fn(async () => okResult());
+        const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, driver, { trustedSkillsDir: link });
+        const err = await executor.invoke(base).then(() => null, (e: Error) => e);
+        expect(err).toBeInstanceOf(Error);
+        expect(log.length).toBe(0);
+        expect(driver).not.toHaveBeenCalled();
+        for (const leak of [link, target, "synthetic-secret-content"]) expect(String(err!.message)).not.toContain(leak);
       }
     });
 
@@ -1050,12 +1042,8 @@ describe("app-server trusted view (AII-1002)", () => {
     it("removes the view when the spawn fails with skills present", async () => {
       const skills = mkSkills();
       const { executor } = run([{ error: Object.assign(new Error("spawn codex ENOENT"), { code: "ENOENT" }) }], [], async () => okResult(), { trustedSkillsDir: skills });
-      try {
-        await executor.invoke(base).catch(() => undefined);
-        expect(viewDirs()).toEqual([]);
-      } finally {
-        cleanup(skills);
-      }
+      await executor.invoke(base).catch(() => undefined);
+      expect(viewDirs()).toEqual([]);
     });
 
     it("removes the view on a cancel path with skills present", async () => {
@@ -1068,13 +1056,9 @@ describe("app-server trusted view (AII-1002)", () => {
         ctl.abort();
         return okResult();
       }, { trustedSkillsDir: skills, cancelSignal: ctl.signal });
-      try {
-        await executor.invoke(base).catch(() => undefined);
-        expect(root).not.toBe("");
-        expect(existsSync(root)).toBe(false);
-      } finally {
-        cleanup(skills);
-      }
+      await executor.invoke(base).catch(() => undefined);
+      expect(root).not.toBe("");
+      expect(existsSync(root)).toBe(false);
     });
   });
 
@@ -1209,11 +1193,10 @@ describe("ChatGPT plan provider", () => {
   let selected: string;
   let calls: Array<{ opts: unknown }>;
   beforeEach(() => {
-    selected = mkdtempSync(join(tmpdir(), "selected-home-"));
+    selected = testDir("selected-home");
     writeFileSync(join(selected, "auth.json"), '{"tokens":{"account_id":"acct-S","refresh_token":"original"}}');
     calls = [];
   });
-  afterEach(() => rmSync(selected, { recursive: true, force: true }));
 
   const planAuth = (provider: boolean): Pick<ModelAuthClient, "invoke"> => ({
     async invoke<T>(_id: string, cb: (i: ModelInvocation) => Promise<T>, opts?: unknown): Promise<T> {
@@ -1331,12 +1314,12 @@ describe("ChatGPT plan provider", () => {
   });
 
   it("exec: leaves the sessions directory in place while a child may still be alive", async () => {
+    testTempRoot("codex-sessions");
     const { executor, log } = build(true, [{ hang: true, dieOn: [] }]);
     await expect(executor.invoke({ ...base, invocationTimeoutMs: 10 })).rejects.toMatchObject({ reason: "child_not_terminated" });
     const home = log[0].env.CODEX_HOME;
     expect(home).not.toBe(selected);
     expect(existsSync(home)).toBe(true);
-    rmSync(home, { recursive: true, force: true });
   });
 
   it("passes requiredMs to auth.invoke: the remaining deadline, or the invocation timeout", async () => {
@@ -1594,7 +1577,7 @@ describe("ChatGPT plan token expiry resume", () => {
     });
 
     it("populates a shared ChatGPT plan view with skills once: the second attempt keeps the copy and the view is removed", async () => {
-      const skills = mkdtempSync(join(tmpdir(), "synthetic-skills-"));
+      const skills = testDir("synthetic-skills");
       mkdirSync(join(skills, "a"), { recursive: true });
       writeFileSync(join(skills, "a", "SKILL.md"), "synthetic skill a");
       const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -1618,7 +1601,6 @@ describe("ChatGPT plan token expiry resume", () => {
         expect(logSpy.mock.calls.filter((c) => String(c[0]).includes("app-server skills copied="))).toHaveLength(1);
       } finally {
         logSpy.mockRestore();
-        rmSync(skills, { recursive: true, force: true });
       }
     });
 

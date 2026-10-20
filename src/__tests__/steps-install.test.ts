@@ -1,14 +1,16 @@
 import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
 import { installStep } from "../pipeline/steps/install.js";
-import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
+import { makeContext } from "./helpers/builders.js";
 import { EventEmitter } from "node:events";
 
 vi.mock("node:child_process", () => ({
   spawn: vi.fn(),
 }));
 
-vi.mock("node:fs", () => ({
+// The step reads through the default export; the named exports stay real for the modules the builders load.
+vi.mock("node:fs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:fs")>()),
   default: {
     existsSync: vi.fn(),
     readFileSync: vi.fn(),
@@ -56,18 +58,6 @@ function mockSpawnError(message = "spawn npm ENOENT") {
     const proc = createMockChildProcess();
     setImmediate(() => proc.emit("error", new Error(message)));
     return proc as unknown as ReturnType<typeof spawn>;
-  });
-}
-
-function makeContext(): DefaultPipelineContext {
-  return new DefaultPipelineContext({
-    jobId: 1,
-    issueId: "issue-1",
-    issueIdentifier: "ENG-1",
-    issueTitle: "Test",
-    issueDescription: "Desc",
-    nonce: "nonce",
-    orchestratorUrl: "http://localhost:8080",
   });
 }
 

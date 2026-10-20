@@ -2,11 +2,12 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadPipelineDefinition, dependenciesMissing } from "../pipeline/pipeline-loader.js";
-import { DefaultPipelineContext } from "../pipeline/context.js";
+import type { DefaultPipelineContext } from "../pipeline/context.js";
 import { PipelineRunner } from "../pipeline/runner.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
-import type { PipelineContextData, StepModule } from "../pipeline/types.js";
+import type { StepModule } from "../pipeline/types.js";
 import type { ReviewerDefinition } from "../pipeline/reviewers/registry.js";
+import { makeContext, makeFeedbackLoopOutputs } from "./helpers/builders.js";
 
 const CUSTOM_PIPELINE_YAML = `id: custom-loop
 steps:
@@ -57,19 +58,6 @@ steps:
 
 function makeModule(outputs: Record<string, unknown> = {}): StepModule {
   return { run: async () => outputs };
-}
-
-function makeContext(overrides: Partial<PipelineContextData> = {}): DefaultPipelineContext {
-  return new DefaultPipelineContext({
-    jobId: 1,
-    issueId: "issue-1",
-    issueIdentifier: "ENG-1",
-    issueTitle: "Test",
-    issueDescription: "Desc",
-    nonce: "nonce",
-    orchestratorUrl: "http://localhost:8080",
-    ...overrides,
-  });
 }
 
 describe("loadPipelineDefinition", () => {
@@ -316,11 +304,11 @@ describe("loadPipelineDefinition", () => {
     const preflightStep = pipeline.steps.find((s) => s.id === "preflight")!;
 
     const ctxApproved = makeContext();
-    ctxApproved.setOutputs("feedback-loop", { approved: true });
+    ctxApproved.setOutputs("feedback-loop", makeFeedbackLoopOutputs());
     expect(preflightStep.skip?.(ctxApproved)).toBe(false);
 
     const ctxRejected = makeContext();
-    ctxRejected.setOutputs("feedback-loop", { approved: false });
+    ctxRejected.setOutputs("feedback-loop", makeFeedbackLoopOutputs({ approved: false }));
     expect(preflightStep.skip?.(ctxRejected)).toBe(true);
   });
 
@@ -488,22 +476,22 @@ describe("loadPipelineDefinition", () => {
     const step = pipeline.steps.find((s) => s.id === "post-push-review")!;
 
     const ctxPushed = makeContext();
-    ctxPushed.setOutputs("feedback-loop", { approved: true });
+    ctxPushed.setOutputs("feedback-loop", makeFeedbackLoopOutputs());
     ctxPushed.setOutputs("push", { branchPushed: true, prNumber: 42 });
     expect(step.skip?.(ctxPushed)).toBe(false);
 
     const ctxSkipped = makeContext();
-    ctxSkipped.setOutputs("feedback-loop", { approved: true });
+    ctxSkipped.setOutputs("feedback-loop", makeFeedbackLoopOutputs());
     ctxSkipped.setOutputs("push", { branchPushed: false });
     expect(step.skip?.(ctxSkipped)).toBe(true);
 
     const ctxMissingPr = makeContext();
-    ctxMissingPr.setOutputs("feedback-loop", { approved: true });
+    ctxMissingPr.setOutputs("feedback-loop", makeFeedbackLoopOutputs());
     ctxMissingPr.setOutputs("push", { branchPushed: true, prNumber: null });
     expect(step.skip?.(ctxMissingPr)).toBe(true);
 
     const ctxGapFill = makeContext({ prNumber: "42" });
-    ctxGapFill.setOutputs("feedback-loop", { approved: true });
+    ctxGapFill.setOutputs("feedback-loop", makeFeedbackLoopOutputs());
     ctxGapFill.setOutputs("push", { branchPushed: true, prNumber: 42 });
     expect(step.skip?.(ctxGapFill)).toBe(true);
   });
@@ -517,7 +505,7 @@ describe("loadPipelineDefinition", () => {
     const step = pipeline.steps.find((s) => s.id === "post-push-review")!;
 
     const ctx = makeContext();
-    ctx.setOutputs("feedback-loop", { approved: false });
+    ctx.setOutputs("feedback-loop", makeFeedbackLoopOutputs({ approved: false }));
     ctx.setOutputs("push", { branchPushed: true, prNumber: 9 });
     expect(step.skip?.(ctx)).toBe(true);
   });
@@ -552,18 +540,18 @@ describe("loadPipelineDefinition", () => {
 
     // No hook -> skip even if approved.
     const ctxNoHook = makeContext();
-    ctxNoHook.setOutputs("feedback-loop", { approved: true });
+    ctxNoHook.setOutputs("feedback-loop", makeFeedbackLoopOutputs());
     expect(step.skip?.(ctxNoHook)).toBe(true);
 
     // Hook present but loop not approved -> skip.
     const ctxNotApproved = makeContext({ hooks: { verify: "scripts/verify.sh" } });
-    ctxNotApproved.setOutputs("feedback-loop", { approved: false });
+    ctxNotApproved.setOutputs("feedback-loop", makeFeedbackLoopOutputs({ approved: false }));
     expect(step.skip?.(ctxNotApproved)).toBe(true);
 
     // Hook present and approved -> run, with scriptPath wired.
     const ctxRun = makeContext({ hooks: { verify: "scripts/verify.sh" } });
     ctxRun.setOutputs("clone", { workspaceDir: "/tmp/repo" });
-    ctxRun.setOutputs("feedback-loop", { approved: true });
+    ctxRun.setOutputs("feedback-loop", makeFeedbackLoopOutputs());
     expect(step.skip?.(ctxRun)).toBe(false);
     const inputs = ctxRun.resolveInputs(step.inputs);
     expect(inputs.workspaceDir).toBe("/tmp/repo");
@@ -609,20 +597,14 @@ describe("loadPipelineDefinition", () => {
       const push = pipeline.steps.find((s) => s.id === "push")!;
 
       const ctx = makeContext();
-      ctx.setOutputs("feedback-loop", {
-        approved: false,
-        iterations: 3,
-        finalFeedback: "nope",
-        terminationReason: "iterations_exhausted",
-        passes: [{ iteration: 1, implementTurns: 98, implementOutcome: "success", costUsd: 1, reviewApproved: false }],
-      });
+      ctx.setOutputs("feedback-loop", makeFeedbackLoopOutputs({ approved: false, iterations: 3, finalFeedback: "nope" }));
       expect(push.skip?.(ctx)).toBe(false);
       const inputs = ctx.resolveInputs(push.inputs);
       expect(inputs.draft).toBe(true);
       expect((inputs.reviewSummary as { finalFeedback: string }).finalFeedback).toBe("nope");
       expect((inputs.reviewSummary as { terminationReason: string }).terminationReason).toBe("iterations_exhausted");
       expect((inputs.reviewSummary as { iterations: number }).iterations).toBe(3);
-      expect((inputs.reviewSummary as { passes: unknown[] }).passes).toHaveLength(1);
+      expect((inputs.reviewSummary as { passes: unknown[] }).passes).toHaveLength(3);
     });
 
     it("push wires draft=false and no reviewSummary when approved", () => {
@@ -633,7 +615,7 @@ describe("loadPipelineDefinition", () => {
 
       const push = pipeline.steps.find((s) => s.id === "push")!;
       const ctx = makeContext();
-      ctx.setOutputs("feedback-loop", { approved: true, iterations: 1, finalFeedback: "ok", terminationReason: "approved", passes: [] });
+      ctx.setOutputs("feedback-loop", makeFeedbackLoopOutputs());
       const inputs = ctx.resolveInputs(push.inputs);
       expect(inputs.draft).toBe(false);
       expect(inputs.reviewSummary).toBeUndefined();
@@ -647,7 +629,7 @@ describe("loadPipelineDefinition", () => {
 
       const ppr = pipeline.steps.find((s) => s.id === "post-push-review")!;
       const ctx = makeContext();
-      ctx.setOutputs("feedback-loop", { approved: false });
+      ctx.setOutputs("feedback-loop", makeFeedbackLoopOutputs({ approved: false }));
       ctx.setOutputs("push", { branchPushed: true, prNumber: 9 });
       expect(ppr.skip!(ctx)).toBe(true);
     });
@@ -662,7 +644,7 @@ describe("loadPipelineDefinition", () => {
 
       const push = pipeline.steps.find((s) => s.id === "push")!;
       const ctx = makeContext({ prNumber: "42" });
-      ctx.setOutputs("feedback-loop", { approved: false });
+      ctx.setOutputs("feedback-loop", makeFeedbackLoopOutputs({ approved: false }));
       expect(push.skip?.(ctx)).toBe(true);
     });
 
@@ -674,7 +656,7 @@ describe("loadPipelineDefinition", () => {
 
       const push = pipeline.steps.find((s) => s.id === "push")!;
       const ctx = makeContext({ prNumber: "42", branch: "feature/custom-existing-pr" });
-      ctx.setOutputs("feedback-loop", { approved: true });
+      ctx.setOutputs("feedback-loop", makeFeedbackLoopOutputs());
       ctx.setOutputs("clone", {
         workspaceDir: "/tmp/repo",
         repoOwner: "acme",
@@ -698,7 +680,7 @@ describe("loadPipelineDefinition", () => {
 
       const push = pipeline.steps.find((s) => s.id === "push")!;
       const ctx = makeContext({ prNumber: "42" });
-      ctx.setOutputs("feedback-loop", { approved: true });
+      ctx.setOutputs("feedback-loop", makeFeedbackLoopOutputs());
       ctx.setOutputs("clone", {
         workspaceDir: "/tmp/repo",
         repoOwner: "acme",
@@ -720,7 +702,7 @@ describe("loadPipelineDefinition", () => {
 
       const push = pipeline.steps.find((s) => s.id === "push")!;
       const ctx = makeContext({ prNumber: "42" });
-      ctx.setOutputs("feedback-loop", { approved: true });
+      ctx.setOutputs("feedback-loop", makeFeedbackLoopOutputs());
       expect(push.skip?.(ctx)).toBe(false);
     });
 
@@ -732,7 +714,7 @@ describe("loadPipelineDefinition", () => {
 
       const push = pipeline.steps.find((s) => s.id === "push")!;
       const ctx = makeContext();
-      ctx.setOutputs("feedback-loop", { approved: false });
+      ctx.setOutputs("feedback-loop", makeFeedbackLoopOutputs({ approved: false }));
       expect(push.skip?.(ctx)).toBe(false);
     });
   });
@@ -782,7 +764,7 @@ describe("loadPipelineDefinition", () => {
       const pipeline = buildPipeline();
       const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
       setInstallOutputs(ctx, { installFailed: false });
-      ctx.setOutputs("feedback-loop", { approved: true });
+      ctx.setOutputs("feedback-loop", makeFeedbackLoopOutputs());
       ctx.setOutputs("push", { branchPushed: true, prNumber: 1 });
 
       expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe(false);
@@ -796,7 +778,7 @@ describe("loadPipelineDefinition", () => {
       const pipeline = buildPipeline();
       const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
       setInstallOutputs(ctx, { installFailed: false });
-      ctx.setOutputs("feedback-loop", { approved: false });
+      ctx.setOutputs("feedback-loop", makeFeedbackLoopOutputs({ approved: false }));
       ctx.setOutputs("push", { branchPushed: true, prNumber: 1 });
 
       expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe(true);
@@ -810,7 +792,7 @@ describe("loadPipelineDefinition", () => {
       const pipeline = buildPipeline();
       const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
       ctx.setOutputs("install", { installFailed: false, installMethod: "skipped: no package.json" });
-      ctx.setOutputs("feedback-loop", { approved: true });
+      ctx.setOutputs("feedback-loop", makeFeedbackLoopOutputs());
       ctx.setOutputs("push", { branchPushed: true, prNumber: 1 });
 
       expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe(false);
@@ -824,7 +806,7 @@ describe("loadPipelineDefinition", () => {
       const pipeline = buildPipeline();
       const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
       setInstallOutputs(ctx, { installFailed: true, retryFailed: false });
-      ctx.setOutputs("feedback-loop", { approved: true });
+      ctx.setOutputs("feedback-loop", makeFeedbackLoopOutputs());
       ctx.setOutputs("push", { branchPushed: true, prNumber: 1 });
 
       expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe(false);
@@ -838,7 +820,7 @@ describe("loadPipelineDefinition", () => {
       const pipeline = buildPipeline();
       const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
       setInstallOutputs(ctx, { installFailed: true, retryFailed: false });
-      ctx.setOutputs("feedback-loop", { approved: false });
+      ctx.setOutputs("feedback-loop", makeFeedbackLoopOutputs({ approved: false }));
       ctx.setOutputs("push", { branchPushed: true, prNumber: 1 });
 
       expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe(true);
@@ -852,7 +834,7 @@ describe("loadPipelineDefinition", () => {
       const pipeline = buildPipeline();
       const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
       setInstallOutputs(ctx, { installFailed: true, retryFailed: true });
-      ctx.setOutputs("feedback-loop", { approved: true });
+      ctx.setOutputs("feedback-loop", makeFeedbackLoopOutputs());
       ctx.setOutputs("push", { branchPushed: true, prNumber: 1 });
 
       expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe("dependency install failed");
@@ -866,7 +848,7 @@ describe("loadPipelineDefinition", () => {
       const pipeline = buildPipeline();
       const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
       setInstallOutputs(ctx, { installFailed: true, retryFailed: true });
-      ctx.setOutputs("feedback-loop", { approved: false });
+      ctx.setOutputs("feedback-loop", makeFeedbackLoopOutputs({ approved: false }));
       ctx.setOutputs("push", { branchPushed: true, prNumber: 1 });
 
       expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe(true);
@@ -880,7 +862,7 @@ describe("loadPipelineDefinition", () => {
       const pipeline = buildPipeline();
       const ctx = makeContext({ prNumber: "42" });
       setInstallOutputs(ctx, { installFailed: true, retryFailed: true });
-      ctx.setOutputs("feedback-loop", { approved: true });
+      ctx.setOutputs("feedback-loop", makeFeedbackLoopOutputs());
 
       const push = pipeline.steps.find((s) => s.id === "push")!;
       expect(push.skip?.(ctx)).toBe(false);
@@ -890,7 +872,7 @@ describe("loadPipelineDefinition", () => {
       const pipeline = buildPipeline();
       const ctx = makeContext({ prNumber: "42", hooks: { verify: "scripts/verify.sh" } });
       setInstallOutputs(ctx, { installFailed: true, retryFailed: true });
-      ctx.setOutputs("feedback-loop", { approved: true });
+      ctx.setOutputs("feedback-loop", makeFeedbackLoopOutputs());
       ctx.setOutputs("push", { branchPushed: true, prNumber: 42 });
 
       expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe("dependency install failed");

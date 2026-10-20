@@ -1,34 +1,16 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
-import type * as DedupModule from "../dedup.js";
+import { describe, it, expect, beforeEach } from "vitest";
 import type * as StepLogModule from "../step-log.js";
 import type * as LogModule from "../log.js";
 import type { Step } from "../pipeline/types.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
-let dedup: typeof DedupModule;
 let stepLog: typeof StepLogModule;
 let log: typeof LogModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `step-log-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  stepLog = await import("../step-log.js");
-  log.initLogTable();
-  stepLog.initStepLogTable();
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  ({ log, stepLog } = (
+    await testDb({ modules: { log: () => import("../log.js"), stepLog: () => import("../step-log.js") } })
+  ).modules);
 });
 
 function makeStep(overrides: Partial<Step> = {}): Step {

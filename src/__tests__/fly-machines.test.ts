@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import crypto from "node:crypto";
 import { readFileSync } from "node:fs";
 import {
@@ -25,103 +25,135 @@ import {
   readMachineExit,
   ProtectedBootstrapError,
 } from "../fly-machines.js";
-import type { SessionMachineInput, CreateMachineOpts, ProtectedBootstrapSecretMetadata } from "../fly-machines.js";
-import { encodeRunConfig, decodeRunConfig, decodeTrustedRunConfig, type RunConfigV1 } from "../run-config.js";
+import type { Machine, MachineEvent, SessionMachineInput, SettleOptions, CreateMachineOpts, ProtectedBootstrapSecretMetadata } from "../fly-machines.js";
+import { buildImplRunConfig, buildKgRefreshRunConfig, encodeRunConfig, decodeRunConfig, decodeTrustedRunConfig, type RunConfigV1 } from "../run-config.js";
+import { branchPrefixRunnerEnv, capRunnerEnv, skillsRepoRunnerEnv } from "../github.js";
+import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
+import { DURABLE_UNTIL_KEY, SCRUB_SETTLE_MS } from "../restate/fly-machine-profile.js";
 import { sealModelAuthBootstrap } from "../model-auth-seal.js";
 import { MODEL_AUTH_ENV } from "../model-auth-contract.js";
+import { makeMapping } from "./helpers/builders.js";
+import { fakeFetch, type ReplyInit } from "./helpers/fake-fetch.js";
+import { flySecretsUpdated } from "./helpers/replies/fly.js";
 
 const TOKEN = "fly-test-token";
 const APP = "ai-implement-sessions-test";
+// The orchestrator's runner callback base URL, which production also passes as the orchestrator URL.
+const ORCH = "https://orchestrator.example";
 
-const mockMachine = {
-  id: "machine-123",
-  name: "session-eng-42",
-  state: "started",
-  region: "iad",
-  created_at: "2026-04-04T00:00:00Z",
-  updated_at: "2026-04-04T00:00:00Z",
-  config: {
-    image: "ghcr.io/builddownai/ai-implement-runner:latest",
-    env: {},
-    guest: { cpu_kind: "shared" as const, cpus: 1, memory_mb: 1024 },
-    auto_destroy: true,
-    restart: { policy: "no" as const },
-  },
+// Route keys match the path alone; the Machines API (api.machines.dev) and the GraphQL API
+// (api.fly.io) are told apart by each test's url.href assertion.
+const MACHINES = `/v1/apps/${APP}/machines`;
+const MACHINE = `${MACHINES}/machine-123`;
+const MACHINES_URL = `https://api.machines.dev${MACHINES}`;
+const MACHINE_URL = `https://api.machines.dev${MACHINE}`;
+
+// An implementation session for ENG-42, the input every issue dispatch builds its machine from.
+const baseInput: SessionMachineInput = {
+  image: "ghcr.io/builddownai/ai-implement-runner:latest",
+  issueId: "uuid-123",
+  issueIdentifier: "ENG-42",
+  issueTitle: "Add feature X",
+  issueDescription: "Implement the feature",
+  owner: "test-org",
+  repo: "test-repo",
+  defaultBranch: "main",
+  githubToken: "ghs_test_token",
+  sessionToken: "tok_abc",
+  machineNonce: "nonce_def",
+  anthropicApiKey: "sk-ant-test",
+};
+const session = buildSessionMachineConfig(baseInput);
+
+// The kg-refresh pipeline's kept runner, as its Fly sender builds it (src/restate/kg-refresh-senders.ts).
+const KG_ENVELOPE = buildKgRefreshRunConfig({ kgSourceRepo: "acme/kg", issueIdentifier: "KG-REFRESH · trigger-1", runnerCallbackUrl: ORCH });
+const kgRefreshInput: SessionMachineInput = {
+  image: "ghcr.io/builddownai/ai-implement-runner:latest",
+  issueId: "kg-refresh",
+  issueIdentifier: KG_ENVELOPE.issue.identifier,
+  issueTitle: "KG ingest",
+  issueDescription: "",
+  owner: "acme",
+  repo: "kg",
+  defaultBranch: "main",
+  anthropicApiKey: "sk-ant-test",
+  githubToken: "ghs_test_token",
+  sessionToken: "tok_abc",
+  machineNonce: "nonce_def",
+  phase: "kg-refresh",
+  orchestratorUrl: ORCH,
+  runnerCallbackUrl: ORCH,
+  runToken: "run-tok",
+  runProgressToken: "progress-tok",
+  runPublicationToken: "publication-tok",
+  expectedTtlSeconds: 4 * 60 * 60,
+  extraEnv: { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(KG_ENVELOPE) },
+  cpuKind: "performance",
+  cpus: 2,
+  memoryMb: 4096,
+  purpose: "durable-runner",
+  pipeline: "kg-refresh",
+  dispatchId: "d1",
 };
 
+// Fly's answer for a machine: the requested name, region and config, plus the id, state, instance and timestamps it assigns.
+const INSTANCE = "01G3SHPYE8XZ58GD4XRRF9CCKC";
+const UPDATED_INSTANCE = "01G3SHQ2W8QKV6C0R4XN9T5Z7M";
+function flyMachine(opts: ReturnType<typeof buildSessionMachineConfig>, state: string): Machine {
+  return {
+    id: "machine-123",
+    name: opts.name!,
+    region: opts.region!,
+    state,
+    instance_id: INSTANCE,
+    created_at: "2026-04-04T00:00:00Z",
+    updated_at: "2026-04-04T00:00:00Z",
+    config: opts.config,
+  };
+}
+const mockMachine = flyMachine(session, "started");
+
 describe("createMachine", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("sends POST with correct URL and body", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => mockMachine,
-    } as Response);
+    // Fly answers a create with the new machine in state "created".
+    const fly = fakeFetch({ [`POST ${MACHINES}`]: { json: flyMachine(session, "created") } }).install();
 
-    const opts = { name: "test-machine", region: "iad", config: mockMachine.config };
-    const result = await createMachine(TOKEN, APP, opts);
+    const result = await createMachine(TOKEN, APP, session);
 
     expect(result.id).toBe("machine-123");
-
-    const [url, reqOpts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines`);
-    expect((reqOpts as RequestInit).method).toBe("POST");
-
-    const body = JSON.parse((reqOpts as RequestInit).body as string);
-    expect(body.name).toBe("test-machine");
-    expect(body.region).toBe("iad");
-    expect(body.config.image).toBe("ghcr.io/builddownai/ai-implement-runner:latest");
+    expect(result.name).toBe(session.name);
+    expect(fly.calls[0].url.href).toBe(MACHINES_URL);
+    expect(JSON.parse(fly.calls[0].body)).toEqual(session);
   });
 
   it("sends correct auth header", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => mockMachine,
-    } as Response);
+    const fly = fakeFetch({ [`POST ${MACHINES}`]: { json: flyMachine(session, "created") } }).install();
 
-    await createMachine(TOKEN, APP, { config: mockMachine.config });
+    await createMachine(TOKEN, APP, session);
 
-    const opts = vi.mocked(fetch).mock.calls[0][1] as RequestInit;
-    expect((opts.headers as Record<string, string>)["Authorization"]).toBe("Bearer fly-test-token");
+    expect(fly.calls[0].headers.get("Authorization")).toBe("Bearer fly-test-token");
   });
 
   it("throws on error response", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 422,
-      text: async () => "invalid config",
-    } as Response);
+    fakeFetch({ [`POST ${MACHINES}`]: { status: 422, text: "invalid config" } }).install();
 
-    await expect(createMachine(TOKEN, APP, { config: mockMachine.config }))
+    await expect(createMachine(TOKEN, APP, session))
       .rejects.toThrow("Failed to create machine in ai-implement-sessions-test (422): invalid config");
   });
 });
 
 describe("getMachine", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("fetches machine by ID", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => mockMachine,
-    } as Response);
+    const fly = fakeFetch({ [`GET ${MACHINE}`]: { json: mockMachine } }).install();
 
     const result = await getMachine(TOKEN, APP, "machine-123");
     expect(result.id).toBe("machine-123");
     expect(result.state).toBe("started");
-
-    const [url] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123`);
+    expect(fly.calls[0].url.href).toBe(MACHINE_URL);
   });
 
   it("throws on 404", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 404,
-      text: async () => "not found",
-    } as Response);
+    fakeFetch({ [`GET ${MACHINES}/nonexistent`]: { status: 404, text: "not found" } }).install();
 
     await expect(getMachine(TOKEN, APP, "nonexistent"))
       .rejects.toThrow("Failed to get machine nonexistent (404)");
@@ -129,28 +161,17 @@ describe("getMachine", () => {
 });
 
 describe("listMachines", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("returns array of machines", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => [mockMachine],
-    } as Response);
+    const fly = fakeFetch({ [`GET ${MACHINES}`]: { json: [mockMachine] } }).install();
 
     const result = await listMachines(TOKEN, APP);
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("machine-123");
-
-    const [url] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines`);
+    expect(fly.calls[0].url.href).toBe(MACHINES_URL);
   });
 
   it("returns empty array when no machines", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => [],
-    } as Response);
+    fakeFetch({ [`GET ${MACHINES}`]: { json: [] } }).install();
 
     const result = await listMachines(TOKEN, APP);
     expect(result).toHaveLength(0);
@@ -158,25 +179,16 @@ describe("listMachines", () => {
 });
 
 describe("stopMachine", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("sends POST to stop endpoint", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true } as Response);
+    const fly = fakeFetch({ [`POST ${MACHINE}/stop`]: {} }).install();
 
     await stopMachine(TOKEN, APP, "machine-123");
 
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123/stop`);
-    expect((opts as RequestInit).method).toBe("POST");
+    expect(fly.calls[0].url.href).toBe(`${MACHINE_URL}/stop`);
   });
 
   it("throws on error", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 409,
-      text: async () => "machine not running",
-    } as Response);
+    fakeFetch({ [`POST ${MACHINE}/stop`]: { status: 409, text: "machine not running" } }).install();
 
     await expect(stopMachine(TOKEN, APP, "machine-123"))
       .rejects.toThrow("Failed to stop machine machine-123 (409)");
@@ -184,34 +196,24 @@ describe("stopMachine", () => {
 });
 
 describe("destroyMachine", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("sends DELETE with force=true by default", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true } as Response);
+    const fly = fakeFetch({ [`DELETE ${MACHINE}`]: {} }).install();
 
     await destroyMachine(TOKEN, APP, "machine-123");
 
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123?force=true`);
-    expect((opts as RequestInit).method).toBe("DELETE");
+    expect(fly.calls[0].url.href).toBe(`${MACHINE_URL}?force=true`);
   });
 
   it("sends DELETE with force=false when specified", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true } as Response);
+    const fly = fakeFetch({ [`DELETE ${MACHINE}`]: {} }).install();
 
     await destroyMachine(TOKEN, APP, "machine-123", false);
 
-    const [url] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123?force=false`);
+    expect(fly.calls[0].url.href).toBe(`${MACHINE_URL}?force=false`);
   });
 
   it("throws on error", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 404,
-      text: async () => "not found",
-    } as Response);
+    fakeFetch({ [`DELETE ${MACHINE}`]: { status: 404, text: "not found" } }).install();
 
     await expect(destroyMachine(TOKEN, APP, "machine-123"))
       .rejects.toThrow("Failed to destroy machine machine-123 (404)");
@@ -219,33 +221,25 @@ describe("destroyMachine", () => {
 });
 
 describe("waitForMachine", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("sends GET with state and timeout params", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true } as Response);
+    const fly = fakeFetch({ [`GET ${MACHINE}/wait`]: {} }).install();
 
     await waitForMachine(TOKEN, APP, "machine-123", "started", 30);
 
-    const [url] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123/wait?state=started&timeout=30`);
+    expect(fly.calls[0].url.href).toBe(`${MACHINE_URL}/wait?state=started&timeout=30`);
   });
 
   it("uses default 60s timeout", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true } as Response);
+    const fly = fakeFetch({ [`GET ${MACHINE}/wait`]: {} }).install();
 
-    await waitForMachine(TOKEN, APP, "machine-123", "stopped");
+    // As the kept runner's dispatch waits: for the replaced instance to stop. Fly requires the instance id for "stopped".
+    await waitForMachine(TOKEN, APP, "machine-123", "stopped", undefined, UPDATED_INSTANCE);
 
-    const [url] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toContain("timeout=60");
+    expect(fly.calls[0].url.href).toBe(`${MACHINE_URL}/wait?instance_id=${UPDATED_INSTANCE}&state=stopped&timeout=60`);
   });
 
   it("throws on timeout", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 408,
-      text: async () => "timeout",
-    } as Response);
+    fakeFetch({ [`GET ${MACHINE}/wait`]: { status: 408, text: "timeout" } }).install();
 
     await expect(waitForMachine(TOKEN, APP, "machine-123", "started"))
       .rejects.toThrow('Timeout waiting for machine machine-123 to reach state "started"');
@@ -281,57 +275,39 @@ describe("generateMachineNonce", () => {
 });
 
 describe("listAppSecrets", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("returns array of secrets with name/digest/created_at via GraphQL", async () => {
     const secrets = [
       { name: "ENG_DATABASE_URL", digest: "abc123", createdAt: "2026-01-01T00:00:00Z" },
       { name: "ENG_STRIPE_KEY", digest: "def456", createdAt: "2026-01-02T00:00:00Z" },
     ];
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ data: { app: { secrets } } }),
-    } as Response);
+    const fly = fakeFetch({ "POST /graphql": { json: { data: { app: { secrets } } } } }).install();
 
     const result = await listAppSecrets(TOKEN, APP);
     expect(result).toHaveLength(2);
     expect(result[0].name).toBe("ENG_DATABASE_URL");
     expect(result[0].created_at).toBe("2026-01-01T00:00:00Z");
 
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe("https://api.fly.io/graphql");
-    expect((opts as RequestInit).method).toBe("POST");
-    const body = JSON.parse((opts as RequestInit).body as string);
+    expect(fly.calls[0].url.href).toBe("https://api.fly.io/graphql");
+    const body = JSON.parse(fly.calls[0].body);
     expect(body.variables.appName).toBe(APP);
   });
 
   it("returns empty array when app has no secrets", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ data: { app: { secrets: [] } } }),
-    } as Response);
+    fakeFetch({ "POST /graphql": { json: { data: { app: { secrets: [] } } } } }).install();
 
     const result = await listAppSecrets(TOKEN, APP);
     expect(result).toEqual([]);
   });
 
   it("returns empty array when app is null", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ data: { app: null } }),
-    } as Response);
+    fakeFetch({ "POST /graphql": { json: { data: { app: null } } } }).install();
 
     const result = await listAppSecrets(TOKEN, APP);
     expect(result).toEqual([]);
   });
 
   it("throws on HTTP error response", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 403,
-      text: async () => "forbidden",
-    } as Response);
+    fakeFetch({ "POST /graphql": { status: 403, text: "forbidden" } }).install();
 
     await expect(listAppSecrets(TOKEN, APP))
       .rejects.toThrow("Fly API request failed (403): forbidden");
@@ -339,34 +315,22 @@ describe("listAppSecrets", () => {
 });
 
 describe("setAppSecrets", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("sends GraphQL mutation with secrets and returns null version", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ data: { setSecrets: { release: { version: 42 } } } }),
-    } as Response);
+    const fly = fakeFetch({ "POST /graphql": { json: { data: { setSecrets: { release: { version: 42 } } } } } }).install();
 
     const version = await setAppSecrets(TOKEN, APP, { ENG_DATABASE_URL: "postgres://localhost/db" });
 
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe("https://api.fly.io/graphql");
-    expect((opts as RequestInit).method).toBe("POST");
+    expect(fly.calls[0].url.href).toBe("https://api.fly.io/graphql");
     expect(version).toBeNull();
 
-    const body = JSON.parse((opts as RequestInit).body as string);
+    const body = JSON.parse(fly.calls[0].body);
     expect(body.variables.input.appId).toBe(APP);
     expect(body.variables.input.secrets[0].key).toBe("ENG_DATABASE_URL");
     expect(body.variables.input.secrets[0].value).toBe("postgres://localhost/db");
   });
 
   it("throws on HTTP error response", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 422,
-      text: async () => "invalid secret name",
-    } as Response);
+    fakeFetch({ "POST /graphql": { status: 422, text: "invalid secret name" } }).install();
 
     await expect(setAppSecrets(TOKEN, APP, { BAD: "val" }))
       .rejects.toThrow("Fly API request failed (422): invalid secret name");
@@ -374,53 +338,35 @@ describe("setAppSecrets", () => {
 });
 
 describe("unsetAppSecret", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("sends GraphQL mutation to unset secret and returns null version", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ data: { unsetSecrets: { release: { version: 43 } } } }),
-    } as Response);
+    const fly = fakeFetch({ "POST /graphql": { json: { data: { unsetSecrets: { release: { version: 43 } } } } } }).install();
 
     const version = await unsetAppSecret(TOKEN, APP, "ENG_DATABASE_URL");
 
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe("https://api.fly.io/graphql");
-    expect((opts as RequestInit).method).toBe("POST");
+    expect(fly.calls[0].url.href).toBe("https://api.fly.io/graphql");
     expect(version).toBeNull();
 
-    const body = JSON.parse((opts as RequestInit).body as string);
+    const body = JSON.parse(fly.calls[0].body);
     expect(body.variables.input.appId).toBe(APP);
     expect(body.variables.input.keys[0]).toBe("ENG_DATABASE_URL");
   });
 
   it("throws on HTTP error response", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 500,
-      text: async () => "internal server error",
-    } as Response);
+    fakeFetch({ "POST /graphql": { status: 500, text: "internal server error" } }).install();
 
     await expect(unsetAppSecret(TOKEN, APP, "MISSING_SECRET"))
       .rejects.toThrow("Fly API request failed (500): internal server error");
   });
 
   it("throws when GraphQL reports the secret was not found", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ errors: [{ message: "Could not find secret MISSING_SECRET" }] }),
-    } as Response);
+    fakeFetch({ "POST /graphql": { json: { errors: [{ message: "Could not find secret MISSING_SECRET" }] } } }).install();
 
     await expect(unsetAppSecret(TOKEN, APP, "MISSING_SECRET"))
       .rejects.toThrow("Could not find secret MISSING_SECRET");
   });
 
   it("throws on any GraphQL error", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ errors: [{ message: "Unauthorized" }] }),
-    } as Response);
+    fakeFetch({ "POST /graphql": { json: { errors: [{ message: "Unauthorized" }] } } }).install();
 
     await expect(unsetAppSecret(TOKEN, APP, "ENG_DATABASE_URL"))
       .rejects.toThrow("Unauthorized");
@@ -428,21 +374,6 @@ describe("unsetAppSecret", () => {
 });
 
 describe("buildSessionMachineConfig", () => {
-  const baseInput: SessionMachineInput = {
-    image: "ghcr.io/builddownai/ai-implement-runner:latest",
-    issueId: "uuid-123",
-    issueIdentifier: "ENG-42",
-    issueTitle: "Add feature X",
-    issueDescription: "Implement the feature",
-    owner: "test-org",
-    repo: "test-repo",
-    defaultBranch: "main",
-    githubToken: "ghs_test_token",
-    sessionToken: "tok_abc",
-    machineNonce: "nonce_def",
-    anthropicApiKey: "sk-ant-test",
-  };
-
   it("maps issue metadata to env vars", () => {
     const result = buildSessionMachineConfig(baseInput);
     const env = result.config.env!;
@@ -479,7 +410,8 @@ describe("buildSessionMachineConfig", () => {
   });
 
   it("allows performance cpu kind", () => {
-    const result = buildSessionMachineConfig({ ...baseInput, cpus: 2, memoryMb: 4096, cpuKind: "performance" });
+    // Only the kg-refresh sender passes a cpu kind, from the kept runner's profile.
+    const result = buildSessionMachineConfig(kgRefreshInput);
     expect(result.config.guest).toEqual({ cpu_kind: "performance", cpus: 2, memory_mb: 4096 });
   });
 
@@ -494,7 +426,8 @@ describe("buildSessionMachineConfig", () => {
   });
 
   it("uses an explicit machineName instead of the issue-key name", () => {
-    expect(buildSessionMachineConfig({ ...baseInput, machineName: "planning-d-1" }).name).toBe("planning-d-1");
+    // Only a planning launch names its machine, after its dispatch id (planningSessionName).
+    expect(buildSessionMachineConfig({ ...baseInput, phase: "planning", machineName: "planning-d-1" }).name).toBe("planning-d-1");
   });
 
   it("defaults region to iad", () => {
@@ -540,7 +473,7 @@ describe("buildSessionMachineConfig", () => {
   });
 
   it("stamps purpose, pipeline and dispatch_id for a durable runner", () => {
-    const result = buildSessionMachineConfig({ ...baseInput, purpose: "durable-runner", pipeline: "kg-refresh", dispatchId: "d1" });
+    const result = buildSessionMachineConfig(kgRefreshInput);
     expect(result.config.metadata).toMatchObject({ purpose: "durable-runner", pipeline: "kg-refresh", dispatch_id: "d1" });
   });
 
@@ -652,9 +585,11 @@ describe("buildSessionMachineConfig", () => {
   });
 
   it("injects runner callback env when provided", () => {
+    // Production sets the callback URL, the run token and the orchestrator URL together.
     const result = buildSessionMachineConfig({
       ...baseInput,
-      runnerCallbackUrl: "https://orchestrator.example",
+      orchestratorUrl: ORCH,
+      runnerCallbackUrl: ORCH,
       runToken: "run-token",
     });
     expect(result.config.env!.RUNNER_CALLBACK_URL).toBe("https://orchestrator.example");
@@ -723,28 +658,33 @@ describe("buildSessionMachineConfig", () => {
   });
 
   describe("AI_IMPLEMENT_RUN_CONFIG envelope", () => {
+    // An implementation dispatch's envelope and flat variables, built as the Fly dispatch builds them (src/index.ts).
+    const implMapping = makeMapping({
+      owner: "test-org", repo: "test-repo", defaultBranch: "main",
+      maxTurns: 30, maxIterations: 2, branchPrefix: "pr", skillsRepo: "https://github.com/org/skills",
+    });
+    const implEnvelope = buildImplRunConfig({
+      issue: { id: "uuid-123", identifier: "ENG-42", title: "Add feature X", description: "Implement the feature" },
+      mapping: implMapping,
+      baseBranch: implMapping.defaultBranch,
+      runnerCallbackUrl: ORCH,
+      retryPolicy: DEFAULT_RETRY_POLICY,
+    });
+    const implInput: SessionMachineInput = {
+      ...baseInput,
+      orchestratorUrl: ORCH,
+      runnerCallbackUrl: ORCH,
+      runToken: "run-tok",
+      extraEnv: {
+        ...capRunnerEnv(implMapping),
+        ...branchPrefixRunnerEnv(implMapping),
+        ...skillsRepoRunnerEnv(implMapping),
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(implEnvelope),
+      },
+    };
+
     it("passes through AI_IMPLEMENT_RUN_CONFIG from extraEnv and is decodable", () => {
-      const runConfig: RunConfigV1 = {
-        v: 1,
-        issue: { id: "uuid-123", identifier: "ENG-42", title: "Add feature X", description: "Implement the feature" },
-        runnerPhase: "implementation",
-        maxTurns: 30,
-        maxIterations: 2,
-        branchPrefix: "pr",
-        skillsRepo: "org/skills",
-        runnerCallbackUrl: "https://orchestrator.example.com/callback",
-      };
-      const result = buildSessionMachineConfig({
-        ...baseInput,
-        runnerCallbackUrl: "https://orchestrator.example.com/callback",
-        extraEnv: {
-          AI_IMPLEMENT_MAX_TURNS: "30",
-          AI_IMPLEMENT_MAX_ITERATIONS: "2",
-          AI_IMPLEMENT_BRANCH_PREFIX: "pr",
-          AI_IMPLEMENT_SKILLS_REPO: "org/skills",
-          AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(runConfig),
-        },
-      });
+      const result = buildSessionMachineConfig(implInput);
       const env = result.config.env!;
 
       expect(env.AI_IMPLEMENT_RUN_CONFIG).toBeDefined();
@@ -754,58 +694,45 @@ describe("buildSessionMachineConfig", () => {
       expect(decoded.maxTurns).toBe(30);
       expect(decoded.maxIterations).toBe(2);
       expect(decoded.branchPrefix).toBe("pr");
-      expect(decoded.skillsRepo).toBe("org/skills");
-      expect(decoded.runnerCallbackUrl).toBe("https://orchestrator.example.com/callback");
+      expect(decoded.skillsRepo).toBe("https://github.com/org/skills");
+      expect(decoded.runnerCallbackUrl).toBe(ORCH);
       expect(decoded.runnerPhase).toBe("implementation");
     });
 
     it("flat legacy vars remain alongside the envelope", () => {
-      const runConfig: RunConfigV1 = {
-        v: 1,
-        issue: { id: "uuid-123", identifier: "ENG-42", title: "Add feature X", description: "Implement the feature" },
-        runnerPhase: "implementation",
-        maxTurns: 30,
-        branchPrefix: "pr",
-        skillsRepo: "org/skills",
-        runnerCallbackUrl: "https://orchestrator.example.com/callback",
-      };
-      const result = buildSessionMachineConfig({
-        ...baseInput,
-        runnerCallbackUrl: "https://orchestrator.example.com/callback",
-        runToken: "run-tok",
-        extraEnv: {
-          AI_IMPLEMENT_MAX_TURNS: "30",
-          AI_IMPLEMENT_BRANCH_PREFIX: "pr",
-          AI_IMPLEMENT_SKILLS_REPO: "org/skills",
-          AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(runConfig),
-        },
-      });
+      const result = buildSessionMachineConfig(implInput);
       const env = result.config.env!;
 
       expect(env.ISSUE_ID).toBe("uuid-123");
-      expect(env.RUNNER_CALLBACK_URL).toBe("https://orchestrator.example.com/callback");
+      expect(env.RUNNER_CALLBACK_URL).toBe(ORCH);
       expect(env.AI_IMPLEMENT_MAX_TURNS).toBe("30");
       expect(env.AI_IMPLEMENT_BRANCH_PREFIX).toBe("pr");
-      expect(env.AI_IMPLEMENT_SKILLS_REPO).toBe("org/skills");
+      expect(env.AI_IMPLEMENT_SKILLS_REPO).toBe("https://github.com/org/skills");
       expect(env.AI_IMPLEMENT_RUN_CONFIG).toBeDefined();
     });
 
     it("planning session envelope has runnerPhase=planning and no branchPrefix/skillsRepo", () => {
+      // No exported builder makes the planning envelope (planning-launch.ts builds it inline); this mirrors that
+      // build, which always carries planningContext from the same source as the PARENT/SIBLINGS/DEPENDENCIES variables.
       const planningConfig: RunConfigV1 = {
         v: 1,
         issue: { id: "uuid-123", identifier: "ENG-42", title: "Add feature X", description: "Implement the feature" },
         runnerPhase: "planning",
         maxTurns: 20,
-        runnerCallbackUrl: "https://orchestrator.example.com/callback",
+        runnerCallbackUrl: ORCH,
+        planningContext: { parent: "ENG-40", siblings: "", dependencies: "" },
       };
       const result = buildSessionMachineConfig({
         ...baseInput,
         phase: "planning",
+        orchestratorUrl: ORCH,
+        runnerCallbackUrl: ORCH,
+        runToken: "run-tok",
         extraEnv: {
           PARENT: "ENG-40",
           SIBLINGS: "",
           DEPENDENCIES: "",
-          AI_IMPLEMENT_MAX_TURNS: "20",
+          ...capRunnerEnv(makeMapping({ maxTurns: 20 })),
           AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(planningConfig),
         },
       });
@@ -820,21 +747,12 @@ describe("buildSessionMachineConfig", () => {
     });
 
     it("secrets are not present in the decoded envelope", () => {
-      const runConfig: RunConfigV1 = {
-        v: 1,
-        issue: { id: "uuid-123", identifier: "ENG-42", title: "T", description: "D" },
-        runnerPhase: "implementation",
-      };
-      const result = buildSessionMachineConfig({
-        ...baseInput,
-        extraEnv: { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(runConfig) },
-      });
+      const result = buildSessionMachineConfig(implInput);
       const env = result.config.env!;
-      const decoded = decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG) as unknown as Record<string, unknown>;
-      expect(decoded.SESSION_TOKEN).toBeUndefined();
-      expect(decoded.GITHUB_TOKEN).toBeUndefined();
-      expect(decoded.ANTHROPIC_API_KEY).toBeUndefined();
-      expect(decoded.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+      const decoded = decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG);
+      for (const secret of ["SESSION_TOKEN", "GITHUB_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]) {
+        expect(decoded).not.toHaveProperty(secret);
+      }
     });
   });
 
@@ -971,35 +889,26 @@ describe("buildSessionMachineConfig", () => {
 });
 
 describe("updateMachineMetadata", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("sends POST to the metadata key endpoint with JSON value body", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true } as Response);
+    const fly = fakeFetch({ [`POST ${MACHINE}/metadata/pr_number`]: {} }).install();
 
     await updateMachineMetadata(TOKEN, APP, "machine-123", "pr_number", "42");
 
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123/metadata/pr_number`);
-    expect((opts as RequestInit).method).toBe("POST");
-    expect((opts as RequestInit).body).toBe(JSON.stringify({ value: "42" }));
-    expect(((opts as RequestInit).headers as Record<string, string>)["Content-Type"]).toBe("application/json");
-    expect(((opts as RequestInit).headers as Record<string, string>)["Authorization"]).toBe(`Bearer ${TOKEN}`);
+    expect(fly.calls[0].url.href).toBe(`${MACHINE_URL}/metadata/pr_number`);
+    expect(fly.calls[0].body).toBe(JSON.stringify({ value: "42" }));
+    expect(fly.calls[0].headers.get("Content-Type")).toBe("application/json");
+    expect(fly.calls[0].headers.get("Authorization")).toBe(`Bearer ${TOKEN}`);
   });
 
   it("throws on error response", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 404,
-      text: async () => "machine not found",
-    } as Response);
+    fakeFetch({ [`POST ${MACHINES}/machine-xyz/metadata/pr_number`]: { status: 404, text: "machine not found" } }).install();
 
     await expect(updateMachineMetadata(TOKEN, APP, "machine-xyz", "pr_number", "7"))
       .rejects.toThrow("updateMachineMetadata failed (404)");
   });
 
   it("stamps pr_number extracted from a GitHub PR URL", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true } as Response);
+    const fly = fakeFetch({ [`POST ${MACHINE}/metadata/pr_number`]: {} }).install();
 
     const prUrl = "https://github.com/org/repo/pull/99";
     const prNumberMatch = prUrl.match(/\/pull\/(\d+)$/);
@@ -1007,64 +916,60 @@ describe("updateMachineMetadata", () => {
 
     await updateMachineMetadata(TOKEN, APP, "machine-123", "pr_number", prNumberMatch![1]);
 
-    const [, opts] = vi.mocked(fetch).mock.calls[0];
-    expect((opts as RequestInit).body).toBe(JSON.stringify({ value: "99" }));
+    expect(fly.calls[0].body).toBe(JSON.stringify({ value: "99" }));
   });
 });
 
 describe("fetchMachineLogs", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
+  // The app-wide logs endpoint on api.fly.io; the machine is picked by the ?instance= query.
+  const LOGS = `GET /api/v1/apps/${APP}/logs` as const;
 
   const entry = (message: unknown, timestamp?: string) => ({
     type: "logs",
     attributes: { message, ...(timestamp ? { timestamp } : {}) },
   });
-  const ok = (data: unknown[]) =>
-    ({ ok: true, json: async () => ({ data }) }) as unknown as Response;
+  /** The logs endpoint answering one request with `data`. */
+  const logs = (data: unknown[]) => fakeFetch({ [LOGS]: { json: { data } } }).install();
 
   it("requests the api.fly.io logs endpoint filtered by instance", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(ok([entry("hello")]));
+    const fly = logs([entry("hello")]);
 
     await fetchMachineLogs("FlyV1 abc", APP, "m1");
 
-    const [url] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.fly.io/api/v1/apps/${APP}/logs?instance=m1`);
+    expect(fly.calls[0]!.url.href).toBe(`https://api.fly.io/api/v1/apps/${APP}/logs?instance=m1`);
   });
 
   it("sends a FlyV1 token unchanged, not as Bearer", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(ok([]));
+    const fly = logs([]);
     await fetchMachineLogs("FlyV1 abc", APP, "m1");
-    const [, opts] = vi.mocked(fetch).mock.calls[0];
-    expect((opts as RequestInit).headers).toMatchObject({ Authorization: "FlyV1 abc" });
+    expect(fly.calls[0]!.headers.get("authorization")).toBe("FlyV1 abc");
   });
 
   it("adds the FlyV1 prefix to a bare token", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(ok([]));
+    const fly = logs([]);
     await fetchMachineLogs("fm2_xyz", APP, "m1");
-    const [, opts] = vi.mocked(fetch).mock.calls[0];
-    expect((opts as RequestInit).headers).toMatchObject({ Authorization: "FlyV1 fm2_xyz" });
+    expect(fly.calls[0]!.headers.get("authorization")).toBe("FlyV1 fm2_xyz");
   });
 
   it("parses data[].attributes.message", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(ok([entry("a"), entry("b")]));
+    logs([entry("a"), entry("b")]);
     expect(await fetchMachineLogs(TOKEN, APP, "m1")).toBe("a\nb");
   });
 
   it("skips entries without a string message", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(ok([entry("a"), { attributes: {} }, null, entry(5), entry("b")]));
+    logs([entry("a"), { attributes: {} }, null, entry(5), entry("b")]);
     expect(await fetchMachineLogs(TOKEN, APP, "m1")).toBe("a\nb");
   });
 
   it("returns empty string for empty data", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(ok([]));
+    logs([]);
     expect(await fetchMachineLogs(TOKEN, APP, "m1")).toBe("");
   });
 
   it("keeps the last lastN messages in chronological order", async () => {
     const data = Array.from({ length: 150 }, (_, i) =>
       entry(`l${i}`, `2026-10-15T00:00:00.${String(i).padStart(3, "0")}Z`));
-    vi.mocked(fetch).mockResolvedValueOnce(ok(data));
+    logs(data);
     const lines = (await fetchMachineLogs(TOKEN, APP, "m1", 50)).split("\n");
     expect(lines).toHaveLength(50);
     expect(lines[0]).toBe("l100");
@@ -1072,28 +977,22 @@ describe("fetchMachineLogs", () => {
   });
 
   it("orders newest-first responses by timestamp", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(ok([
+    logs([
       entry("c", "2026-10-15T00:00:03Z"),
       entry("b", "2026-10-15T00:00:02Z"),
       entry("a", "2026-10-15T00:00:01Z"),
-    ]));
+    ]);
     expect(await fetchMachineLogs(TOKEN, APP, "m1", 2)).toBe("b\nc");
   });
 
   it("throws on a non-JSON 200 body", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => { throw new SyntaxError("bad json"); },
-    } as unknown as Response);
+    // JSON.parse's message quotes the body it could not parse.
+    fakeFetch({ [LOGS]: { text: "bad json" } }).install();
     await expect(fetchMachineLogs(TOKEN, APP, "m1")).rejects.toThrow("bad json");
   });
 
   it("throws on error response", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 404,
-      text: async () => "not found",
-    } as Response);
+    fakeFetch({ [LOGS]: { status: 404, text: "not found" } }).install();
 
     await expect(fetchMachineLogs(TOKEN, APP, "machine-123"))
       .rejects.toThrow("Failed to fetch logs for machine machine-123 (404)");
@@ -1101,8 +1000,7 @@ describe("fetchMachineLogs", () => {
 });
 
 describe("readMachineExit", () => {
-  const withEvents = (events?: Array<Record<string, unknown>>) =>
-    ({ ...mockMachine, events }) as unknown as Parameters<typeof readMachineExit>[0];
+  const withEvents = (events?: MachineEvent[]): Machine => ({ ...mockMachine, events });
   const nulls = { exitCode: null, signal: null, oomKilled: null, timestamp: null };
 
   it("returns all-null for missing or empty events", () => {
@@ -1126,257 +1024,215 @@ describe("readMachineExit", () => {
 });
 
 describe("startMachine / updateMachine (AII-1123)", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("startMachine posts to /start with no body", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true } as Response);
+    const fly = fakeFetch({ [`POST ${MACHINE}/start`]: {} }).install();
     await startMachine(TOKEN, APP, "machine-123");
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123/start`);
-    expect((opts as RequestInit).method).toBe("POST");
-    expect((opts as RequestInit).body).toBeUndefined();
+    expect(fly.calls[0].url.href).toBe(`${MACHINE_URL}/start`);
+    expect(fly.calls[0].body).toBe("");
   });
 
   it("startMachine throws with status and body", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 412, text: async () => "bad state" } as Response);
-    await expect(startMachine(TOKEN, APP, "machine-123")).rejects.toThrow("Failed to start machine machine-123 (412): bad state");
+    // The 412 Fly sends a start during the replace window (docs/fly-machine-lifecycle.md), which its caller matches on.
+    fakeFetch({ [`POST ${MACHINE}/start`]: { status: 412, text: "machine getting replaced" } }).install();
+    await expect(startMachine(TOKEN, APP, "machine-123"))
+      .rejects.toThrow("Failed to start machine machine-123 (412): machine getting replaced");
   });
 
   it("updateMachine posts { config } and returns the machine", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, json: async () => mockMachine } as Response);
-    const result = await updateMachine(TOKEN, APP, "machine-123", mockMachine.config as never);
+    // Fly answers an update with the machine on its new instance, which its caller then waits on.
+    const fly = fakeFetch({ [`POST ${MACHINE}`]: { json: { ...mockMachine, state: "starting", instance_id: UPDATED_INSTANCE } } }).install();
+    const result = await updateMachine(TOKEN, APP, "machine-123", mockMachine.config);
     expect(result.id).toBe("machine-123");
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123`);
-    expect((opts as RequestInit).method).toBe("POST");
-    expect(JSON.parse((opts as RequestInit).body as string)).toEqual({ config: mockMachine.config });
+    expect(result.instance_id).toBe(UPDATED_INSTANCE);
+    expect(fly.calls[0].url.href).toBe(MACHINE_URL);
+    expect(JSON.parse(fly.calls[0].body)).toEqual({ config: mockMachine.config });
   });
 
   it("updateMachine throws with status and body", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 422, text: async () => "invalid config" } as Response);
-    await expect(updateMachine(TOKEN, APP, "machine-123", mockMachine.config as never))
+    fakeFetch({ [`POST ${MACHINE}`]: { status: 422, text: "invalid config" } }).install();
+    await expect(updateMachine(TOKEN, APP, "machine-123", mockMachine.config))
       .rejects.toThrow("Failed to update machine machine-123 (422): invalid config");
   });
 });
 
+// clearMachineEnv reads the machine (GET), updates it (POST) and reads it back (GET), all on the machine's path,
+// so each test lists the GET replies in read order and the POST replies in update order.
+// Its one production caller, FlyMachineProfile.release, scrubs the kg-refresh pipeline's kept runner once it has
+// stopped, stamping a durable_until in epoch seconds, with the settle options below.
 describe("clearMachineEnv", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
 
-  const url = `https://api.machines.dev/v1/apps/${APP}/machines/machine-123`;
-  const ok = (body: unknown) => ({ ok: true, status: 200, json: async () => body }) as Response;
-  const fail = (status: number, text: string, headers: Record<string, string> = {}) =>
-    ({ ok: false, status, text: async () => text, headers: new Headers(headers) }) as Response;
-  const posts = () => vi.mocked(fetch).mock.calls.filter(([, o]) => (o as RequestInit | undefined)?.method === "POST");
-  const fast = { intervalMs: 1, timeoutMs: 1000 };
+  const READ = `GET ${MACHINE}` as const;
+  const UPDATE = `POST ${MACHINE}` as const;
+  const ok = (body: unknown): ReplyInit => ({ json: body });
+  const fail = (status: number, text: string, headers: Record<string, string> = {}): ReplyInit => ({ status, text, headers });
+  const SCRUB: SettleOptions = { until: ["stopped", "destroyed"], timeoutMs: SCRUB_SETTLE_MS, intervalMs: 1 };
+  const DURABLE = { [DURABLE_UNTIL_KEY]: "1792000000" };
+  // The kept runner after its run: stopped, its env still holding the run's credentials.
+  const kept = flyMachine(buildSessionMachineConfig(kgRefreshInput), "stopped");
+  // The same machine once Fly has applied a scrub carrying `metadata`.
+  const scrubbed = (m: Machine, metadata: Record<string, string> = DURABLE): Machine =>
+    ({ ...m, config: { ...m.config, env: {}, metadata: { ...m.config.metadata, ...metadata } } });
 
   it("settles, posts the same config with env: {}, reads back; never starts it", async () => {
-    const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { GITHUB_TOKEN: "x" } } };
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok(withEnv))
-      .mockResolvedValueOnce(ok(mockMachine))
-      .mockResolvedValueOnce(ok({ ...mockMachine, config: { ...mockMachine.config, env: {} } }));
+    const fly = fakeFetch({
+      [READ]: [ok(kept), ok(scrubbed(kept))],
+      [UPDATE]: [ok(kept)],
+    }).install();
 
-    await clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast);
+    await clearMachineEnv(TOKEN, APP, "machine-123", DURABLE, SCRUB);
 
-    const calls = vi.mocked(fetch).mock.calls;
-    expect(calls).toHaveLength(3);
-    expect(calls[0][0]).toBe(url);
-    expect((calls[0][1] as RequestInit | undefined)?.method).toBeUndefined();
-    expect(posts()).toHaveLength(1);
-    expect(JSON.parse((posts()[0][1] as RequestInit).body as string)).toEqual({ config: { ...withEnv.config, env: {} } });
-    expect(calls.some(([u]) => String(u).endsWith("/start"))).toBe(false);
+    // The strict routes also prove nothing called /start.
+    expect(fly.calls.map((c) => c.method)).toEqual(["GET", "POST", "GET"]);
+    expect(fly.calls[0].url.href).toBe(MACHINE_URL);
+    expect(JSON.parse(fly.calls[1].body)).toEqual({ config: scrubbed(kept).config });
   });
 
   it("waits out `replacing` reads, then makes exactly one update", async () => {
-    const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { GITHUB_TOKEN: "x" } } };
-    const replacing = { ...withEnv, state: "replacing" };
-    const stopped = { ...withEnv, state: "stopped" };
-    const cleared = { ...mockMachine, state: "stopped", config: { ...mockMachine.config, env: {} } };
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok(replacing))
-      .mockResolvedValueOnce(ok(replacing))
-      .mockResolvedValueOnce(ok(stopped))
-      .mockResolvedValueOnce(ok(cleared))
-      .mockResolvedValueOnce(ok(cleared));
-    await clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast);
-    expect(posts()).toHaveLength(1);
+    const replacing = { ...kept, state: "replacing" };
+    const fly = fakeFetch({
+      [READ]: [ok(replacing), ok(replacing), ok(kept), ok(scrubbed(kept))],
+      [UPDATE]: [ok(kept)],
+    }).install();
+    await clearMachineEnv(TOKEN, APP, "machine-123", DURABLE, SCRUB);
+    expect(fly.calls.map((c) => c.method)).toEqual(["GET", "GET", "GET", "POST", "GET"]);
   });
 
   it("merges metadata into the one update, never calls the metadata endpoint, and verifies it", async () => {
-    const m = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" }, metadata: { purpose: "durable-runner", durable_until: "1" } } };
-    const done = { ...m, config: { ...m.config, env: {}, metadata: { purpose: "durable-runner", durable_until: "123" } } };
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok(m))
-      .mockResolvedValueOnce(ok(m))
-      .mockResolvedValueOnce(ok(done));
+    // A runner kept before: its metadata already carries an earlier durable_until, which the scrub replaces.
+    const m = { ...kept, config: { ...kept.config, metadata: { ...kept.config.metadata, [DURABLE_UNTIL_KEY]: "1791000000" } } };
+    const fly = fakeFetch({ [READ]: [ok(m), ok(scrubbed(m))], [UPDATE]: [ok(m)] }).install();
 
-    await clearMachineEnv(TOKEN, APP, "machine-123", { durable_until: "123" }, fast);
+    await clearMachineEnv(TOKEN, APP, "machine-123", DURABLE, SCRUB);
 
-    expect(vi.mocked(fetch).mock.calls.some(([u]) => String(u).includes("/metadata"))).toBe(false);
-    expect(JSON.parse((posts()[0][1] as RequestInit).body as string)).toEqual({
-      config: { ...m.config, env: {}, metadata: { purpose: "durable-runner", durable_until: "123" } },
+    // No /metadata route exists, so a call to it would fail the test.
+    expect(JSON.parse(fly.calls[1].body)).toEqual({
+      config: { ...m.config, env: {}, metadata: { ...kept.config.metadata, [DURABLE_UNTIL_KEY]: "1792000000" } },
     });
   });
 
   it("adds metadata when the machine has none", async () => {
-    const m = { ...mockMachine, config: { ...mockMachine.config, metadata: undefined } };
-    const done = { ...m, config: { ...m.config, env: {}, metadata: { durable_until: "5" } } };
-    vi.mocked(fetch).mockResolvedValueOnce(ok(m)).mockResolvedValueOnce(ok(m)).mockResolvedValueOnce(ok(done));
-    await clearMachineEnv(TOKEN, APP, "m", { durable_until: "5" }, fast);
-    const body = JSON.parse((posts()[0][1] as RequestInit).body as string);
-    expect(body.config.metadata).toEqual({ durable_until: "5" });
+    const m = { ...kept, config: { ...kept.config, metadata: undefined } };
+    const fly = fakeFetch({ [READ]: [ok(m), ok(scrubbed(m))], [UPDATE]: [ok(m)] }).install();
+    await clearMachineEnv(TOKEN, APP, "machine-123", DURABLE, SCRUB);
+    const body = JSON.parse(fly.calls[1].body);
+    expect(body.config.metadata).toEqual(DURABLE);
   });
 
   it("treats a 409 concurrent update as a wait and succeeds once the env is clear", async () => {
-    const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
-    const cleared = { ...mockMachine, config: { ...mockMachine.config, env: {} } };
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok(withEnv))
-      .mockResolvedValueOnce(fail(409, '{"error":"aborted: machine is replacing: concurrent update in progress"}'))
-      .mockResolvedValueOnce(ok(cleared));
-    await expect(clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast)).resolves.toBeUndefined();
-    expect(posts()).toHaveLength(1);
+    const fly = fakeFetch({
+      [READ]: [ok(kept), ok(scrubbed(kept))],
+      [UPDATE]: [fail(409, '{"error":"aborted: machine is replacing: concurrent update in progress"}')],
+    }).install();
+    await expect(clearMachineEnv(TOKEN, APP, "machine-123", DURABLE, SCRUB)).resolves.toBeUndefined();
+    expect(fly.calls.filter((c) => c.method === "POST")).toHaveLength(1);
   });
 
   it("waits the retry-after interval on a 429, then re-reads", async () => {
     vi.useFakeTimers();
-    const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
-    const cleared = { ...mockMachine, config: { ...mockMachine.config, env: {} } };
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok(withEnv))
-      .mockResolvedValueOnce(fail(429, "resource_exhausted: rate limit exceeded", { "retry-after": "7" }))
-      .mockResolvedValueOnce(ok(cleared));
-    const p = clearMachineEnv(TOKEN, APP, "machine-123");
+    const fly = fakeFetch({
+      [READ]: [ok(kept), ok(scrubbed(kept))],
+      [UPDATE]: [fail(429, "resource_exhausted: rate limit exceeded", { "retry-after": "7" })],
+    }).install();
+    const p = clearMachineEnv(TOKEN, APP, "machine-123", DURABLE, SCRUB);
     await vi.advanceTimersByTimeAsync(6_900);
-    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+    expect(fly.calls).toHaveLength(2);
     await vi.advanceTimersByTimeAsync(200);
     await expect(p).resolves.toBeUndefined();
   });
 
   it("caps a 429 retry-after at the maximum wait", async () => {
     vi.useFakeTimers();
-    const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
-    const cleared = { ...mockMachine, config: { ...mockMachine.config, env: {} } };
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok(withEnv))
-      .mockResolvedValueOnce(fail(429, "rate limit", { "retry-after": "3600" }))
-      .mockResolvedValueOnce(ok(cleared));
-    const p = clearMachineEnv(TOKEN, APP, "machine-123");
+    const fly = fakeFetch({
+      [READ]: [ok(kept), ok(scrubbed(kept))],
+      [UPDATE]: [fail(429, "rate limit", { "retry-after": "3600" })],
+    }).install();
+    const p = clearMachineEnv(TOKEN, APP, "machine-123", DURABLE, SCRUB);
     await vi.advanceTimersByTimeAsync(MAX_RATE_LIMIT_WAIT_MS - 100);
-    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+    expect(fly.calls).toHaveLength(2);
     await vi.advanceTimersByTimeAsync(200);
     await expect(p).resolves.toBeUndefined();
   });
 
   it("treats a 409 'machine is replacing' without the concurrent-update text as a wait", async () => {
-    const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
-    const cleared = { ...mockMachine, config: { ...mockMachine.config, env: {} } };
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok(withEnv))
-      .mockResolvedValueOnce(fail(409, '{"error":"machine is replacing"}'))
-      .mockResolvedValueOnce(ok(cleared));
-    await expect(clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast)).resolves.toBeUndefined();
+    fakeFetch({ [READ]: [ok(kept), ok(scrubbed(kept))], [UPDATE]: [fail(409, '{"error":"machine is replacing"}')] }).install();
+    await expect(clearMachineEnv(TOKEN, APP, "machine-123", DURABLE, SCRUB)).resolves.toBeUndefined();
   });
 
   it("still throws on an unrelated 409", async () => {
-    const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok(withEnv))
-      .mockResolvedValueOnce(fail(409, '{"error":"something else"}'));
-    await expect(clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast)).rejects.toThrow(/409/);
+    fakeFetch({ [READ]: [ok(kept)], [UPDATE]: [fail(409, '{"error":"something else"}')] }).install();
+    await expect(clearMachineEnv(TOKEN, APP, "machine-123", DURABLE, SCRUB)).rejects.toThrow(/409/);
   });
 
   it("waits 2 s on a 429 without retry-after", async () => {
     vi.useFakeTimers();
-    const withEnv = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" } } };
-    const cleared = { ...mockMachine, config: { ...mockMachine.config, env: {} } };
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok(withEnv))
-      .mockResolvedValueOnce(fail(429, "rate limit"))
-      .mockResolvedValueOnce(ok(cleared));
-    const p = clearMachineEnv(TOKEN, APP, "machine-123");
+    const fly = fakeFetch({ [READ]: [ok(kept), ok(scrubbed(kept))], [UPDATE]: [fail(429, "rate limit")] }).install();
+    const p = clearMachineEnv(TOKEN, APP, "machine-123", DURABLE, SCRUB);
     await vi.advanceTimersByTimeAsync(1_900);
-    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+    expect(fly.calls).toHaveLength(2);
     await vi.advanceTimersByTimeAsync(200);
     await expect(p).resolves.toBeUndefined();
   });
 
   it("with until: stopped, sends the update only after the machine reads stopped", async () => {
-    const started = { ...mockMachine, state: "started", config: { ...mockMachine.config, env: { A: "1" } } };
-    const stopped = { ...started, state: "stopped" };
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok(started))
-      .mockResolvedValueOnce(ok(stopped))
-      .mockResolvedValueOnce(ok(stopped))
-      .mockResolvedValueOnce(ok({ ...stopped, config: { ...stopped.config, env: {} } }));
+    const started = { ...kept, state: "started" };
+    const fly = fakeFetch({
+      [READ]: [ok(started), ok(kept), ok(scrubbed(kept))],
+      [UPDATE]: [ok(kept)],
+    }).install();
 
-    await clearMachineEnv(TOKEN, APP, "machine-123", undefined, { ...fast, until: ["stopped"] });
+    await clearMachineEnv(TOKEN, APP, "machine-123", DURABLE, SCRUB);
 
-    const calls = vi.mocked(fetch).mock.calls;
-    const updateIdx = calls.findIndex(([, o]) => (o as RequestInit | undefined)?.method === "POST");
-    expect(updateIdx).toBe(2);
-    expect(calls).toHaveLength(4);
+    expect(fly.calls.map((c) => c.method)).toEqual(["GET", "GET", "POST", "GET"]);
   });
 
   it("with until: stopped, a machine that stays started times out with no update sent", async () => {
-    const started = { ...mockMachine, state: "started", config: { ...mockMachine.config, env: { A: "1" } } };
-    vi.mocked(fetch).mockResolvedValue(ok(started));
+    const started = { ...kept, state: "started" };
+    // No update route: an update would fail the test.
+    const fly = fakeFetch({ [READ]: ok(started) }).install();
     await expect(
-      clearMachineEnv(TOKEN, APP, "machine-123", undefined, { intervalMs: 1, timeoutMs: 20, until: ["stopped"] }),
+      clearMachineEnv(TOKEN, APP, "machine-123", DURABLE, { ...SCRUB, timeoutMs: 20 }),
     ).rejects.toThrow(/machine-123.*state=started/);
-    expect(posts()).toHaveLength(0);
+    expect(fly.calls.every((c) => c.method === "GET")).toBe(true);
   });
 
   it("throws naming the machine and state when the env never clears", async () => {
-    const withEnv = { ...mockMachine, state: "stopped", config: { ...mockMachine.config, env: { A: "1" } } };
-    vi.mocked(fetch).mockResolvedValue(ok(withEnv));
-    await expect(clearMachineEnv(TOKEN, APP, "machine-123", undefined, fast)).rejects.toThrow(/machine-123.*state=stopped/);
+    fakeFetch({ [READ]: ok(kept), [UPDATE]: ok(kept) }).install();
+    await expect(clearMachineEnv(TOKEN, APP, "machine-123", DURABLE, SCRUB)).rejects.toThrow(/machine-123.*state=stopped/);
   });
 
   it("skips the update when the env is already clear and the metadata present", async () => {
-    const clean = { ...mockMachine, config: { ...mockMachine.config, env: {}, metadata: { durable_until: "5" } } };
-    vi.mocked(fetch).mockResolvedValueOnce(ok(clean));
-    await clearMachineEnv(TOKEN, APP, "machine-123", { durable_until: "5" }, fast);
-    expect(posts()).toHaveLength(0);
-    expect(fetch).toHaveBeenCalledTimes(1);
+    const fly = fakeFetch({ [READ]: [ok(scrubbed(kept))] }).install();
+    await clearMachineEnv(TOKEN, APP, "machine-123", DURABLE, SCRUB);
+    expect(fly.calls).toHaveLength(1);
   });
 
   it("throws when the read fails, without posting", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(fail(404, "gone"));
-    await expect(clearMachineEnv(TOKEN, APP, "m", undefined, fast)).rejects.toThrow("(404)");
-    expect(fetch).toHaveBeenCalledTimes(1);
+    const fly = fakeFetch({ [READ]: [fail(404, "gone")] }).install();
+    await expect(clearMachineEnv(TOKEN, APP, "machine-123", DURABLE, SCRUB)).rejects.toThrow("(404)");
+    expect(fly.calls).toHaveLength(1);
   });
 
   it("ends at once, without polling, on a machine Fly reports as destroyed", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(ok({ ...mockMachine, state: "destroyed" }));
-    await expect(
-      clearMachineEnv(TOKEN, APP, "m", undefined, { ...fast, until: ["stopped", "destroyed"] }),
-    ).rejects.toThrow(/gone before the scrub/);
-    expect(fetch).toHaveBeenCalledTimes(1);
-    expect(posts()).toHaveLength(0);
+    const fly = fakeFetch({ [READ]: [ok({ ...kept, state: "destroyed" })] }).install();
+    await expect(clearMachineEnv(TOKEN, APP, "machine-123", DURABLE, SCRUB)).rejects.toThrow(/gone before the scrub/);
+    expect(fly.calls).toHaveLength(1);
   });
 
   it("throws when the update fails with a non-wait status", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(ok({ ...mockMachine, config: { ...mockMachine.config, env: { A: "b" } } }))
-      .mockResolvedValueOnce(fail(500, "boom"));
-    await expect(clearMachineEnv(TOKEN, APP, "m", undefined, fast)).rejects.toThrow("(500)");
+    fakeFetch({ [READ]: [ok(kept)], [UPDATE]: [fail(500, "boom")] }).install();
+    await expect(clearMachineEnv(TOKEN, APP, "machine-123", DURABLE, SCRUB)).rejects.toThrow("(500)");
   });
 });
 
 describe("waitForMachineSettled", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   it("returns null when the machine is gone", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 404, text: async () => "nope", headers: new Headers() } as Response);
+    fakeFetch({ [`GET ${MACHINES}/m`]: { status: 404, text: "nope" } }).install();
     expect(await waitForMachineSettled(TOKEN, APP, "m", { intervalMs: 1 })).toBeNull();
   });
 
   it("throws on timeout naming the machine and the state", async () => {
-    vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200, json: async () => ({ ...mockMachine, state: "replacing" }) } as Response);
+    fakeFetch({ [`GET ${MACHINE}`]: { json: { ...mockMachine, state: "replacing" } } }).install();
     await expect(waitForMachineSettled(TOKEN, APP, "machine-123", { intervalMs: 5, timeoutMs: 20 })).rejects.toThrow(/machine-123.*replacing/);
   });
 });
@@ -1659,20 +1515,18 @@ describe("buildSessionMachineConfig — legacy config and protection key hiding 
 });
 
 describe("putAppSecretsVersioned", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
+  const SECRETS = "POST /v1/apps/app/secrets" as const;
 
   it("POSTs values to the REST secrets endpoint and returns the version", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, json: async () => ({ version: 12 }) } as Response);
+    const fly = fakeFetch({ [SECRETS]: flySecretsUpdated(12) }).install();
     await expect(putAppSecretsVersioned("tok", "app", { A: "b" })).resolves.toBe(12);
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe("https://api.machines.dev/v1/apps/app/secrets");
-    expect(JSON.parse((opts as RequestInit).body as string)).toEqual({ values: { A: "b" } });
+    expect(fly.calls[0]!.url.href).toBe("https://api.machines.dev/v1/apps/app/secrets");
+    expect(JSON.parse(fly.calls[0]!.body)).toEqual({ values: { A: "b" } });
   });
 
   it("throws value-free errors on non-2xx or a missing version", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 403, text: async () => "echo SECRETVALUE" } as Response);
+    fakeFetch({ [SECRETS]: [{ status: 403, text: "echo SECRETVALUE" }, { json: { version: "x" } }] }).install();
     await expect(putAppSecretsVersioned("tok", "app", { A: "SECRETVALUE" })).rejects.toThrow(/403/);
-    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, json: async () => ({ version: "x" }) } as Response);
     const err = await putAppSecretsVersioned("tok", "app", { A: "SECRETVALUE" }).catch((e: Error) => e);
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).message).not.toContain("SECRETVALUE");

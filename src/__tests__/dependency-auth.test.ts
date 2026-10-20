@@ -1,50 +1,28 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { dependencyAuthStep, fetchDependencyToken } from "../pipeline/steps/dependency-auth.js";
-import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
-import type { LLMExecutor } from "../pipeline/types.js";
 import { encodeRunConfig } from "../run-config.js";
 import { resolveRunnerInputs } from "../run-autonomous.js";
 import { loadPipelineDefinition } from "../pipeline/pipeline-loader.js";
 import { createDefaultRunner } from "../pipeline/default-pipeline.js";
 import type { PipelineRunner } from "../pipeline/runner.js";
 import type { StepModule } from "../pipeline/types.js";
+import { makeContext } from "./helpers/builders.js";
+import { fakeFetch, type Reply } from "./helpers/fake-fetch.js";
 
-const noopExec: LLMExecutor = {
-  async invoke() {
-    return { stdout: "", exitCode: 0, tokensUsed: 0 };
-  },
-};
+const TOKEN_ROUTE = "POST /api/runner/dependency-token";
 
-function ctx() {
-  return new DefaultPipelineContext(
-    {
-      jobId: 1,
-      issueId: "i",
-      issueIdentifier: "AII-1",
-      issueTitle: "T",
-      issueDescription: "D",
-      nonce: "n",
-      orchestratorUrl: "",
-    },
-    noopExec,
-  );
+/** The orchestrator's dependency-token endpoint, answering every request with `status` and `body`. */
+function tokenEndpoint(status: number, body: unknown): typeof fetch {
+  return fakeFetch({ [TOKEN_ROUTE]: { status, json: body } }).fetch;
 }
 
-function mockFetch(status: number, body: unknown): typeof fetch {
-  return async (_url, _init) => {
-    return {
-      ok: status >= 200 && status < 300,
-      status,
-      json: async () => body,
-    } as Response;
-  };
-}
-
-function throwingFetch(err: Error): typeof fetch {
-  return async (_url, _init) => {
+/** A dependency-token endpoint the request never reaches: it rejects with `err`, as `fetch` does on a network failure. */
+function unreachableTokenEndpoint(err: Error): typeof fetch {
+  const reply: Reply = () => {
     throw err;
   };
+  return fakeFetch({ [TOKEN_ROUTE]: reply }).fetch;
 }
 
 function registeredModule(runner: PipelineRunner, key: string): StepModule | undefined {
@@ -113,7 +91,7 @@ describe("dependencyAuthStep no-op conditions", () => {
   it("no-ops when dependencyTokenScope is absent", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const out = await dependencyAuthStep.run(
-      ctx(),
+      makeContext(),
       {
         dependencyTokenScope: undefined,
         callbackUrl: "https://orch.example",
@@ -128,7 +106,7 @@ describe("dependencyAuthStep no-op conditions", () => {
   it("no-ops when callbackUrl is absent", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const out = await dependencyAuthStep.run(
-      ctx(),
+      makeContext(),
       {
         dependencyTokenScope: "installation",
         callbackUrl: null,
@@ -144,7 +122,7 @@ describe("dependencyAuthStep no-op conditions", () => {
     vi.stubEnv("RUN_PROGRESS_TOKEN", "");
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const out = await dependencyAuthStep.run(
-      ctx(),
+      makeContext(),
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example",
@@ -162,36 +140,32 @@ describe("dependencyAuthStep no-op conditions", () => {
 describe("dependencyAuthStep successful fetch", () => {
   it("POSTs to <callbackBase>/api/runner/dependency-token with bearer header", async () => {
     vi.stubEnv("RUN_PROGRESS_TOKEN", "progress-tok");
-    const calls: Array<{ url: string; init: RequestInit }> = [];
-    const captureFetch: typeof fetch = async (url, init) => {
-      calls.push({ url: url as string, init: init ?? {} });
-      return { ok: true, status: 200, json: async () => ({ token: "dep-tok", expires_at: "2030-01-01T00:00:00Z" }) } as Response;
-    };
+    const orchestrator = fakeFetch({ [TOKEN_ROUTE]: { json: { token: "dep-tok", expires_at: "2030-01-01T00:00:00Z" } } });
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     await dependencyAuthStep.run(
-      ctx(),
+      makeContext(),
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example/",
-        fetchImpl: captureFetch,
+        fetchImpl: orchestrator.fetch,
       },
       new NoopStepReporter(),
     );
     logSpy.mockRestore();
-    expect(calls).toHaveLength(1);
-    expect(calls[0].url).toBe("https://orch.example/api/runner/dependency-token");
-    expect((calls[0].init.headers as Record<string, string>)["Authorization"]).toBe("Bearer progress-tok");
+    expect(orchestrator.calls).toHaveLength(1);
+    expect(orchestrator.calls[0].url.href).toBe("https://orch.example/api/runner/dependency-token");
+    expect(orchestrator.calls[0].headers.get("authorization")).toBe("Bearer progress-tok");
   });
 
   it("sets token on context.data and returns acquired=true with expiresAt", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    const context = ctx();
+    const context = makeContext();
     const out = await dependencyAuthStep.run(
       context,
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example",
-        fetchImpl: mockFetch(200, { token: "dep-tok-123", expires_at: "2030-06-01T12:00:00Z" }),
+        fetchImpl: tokenEndpoint(200, { token: "dep-tok-123", expires_at: "2030-06-01T12:00:00Z" }),
       },
       new NoopStepReporter(),
     );
@@ -209,11 +183,11 @@ describe("dependencyAuthStep failure handling", () => {
   it("warns and returns acquired=false on non-200 response", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const out = await dependencyAuthStep.run(
-      ctx(),
+      makeContext(),
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example",
-        fetchImpl: mockFetch(403, {}),
+        fetchImpl: tokenEndpoint(403, {}),
       },
       new NoopStepReporter(),
     );
@@ -227,11 +201,11 @@ describe("dependencyAuthStep failure handling", () => {
   it("warns and returns acquired=false on malformed JSON body", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const out = await dependencyAuthStep.run(
-      ctx(),
+      makeContext(),
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example",
-        fetchImpl: mockFetch(200, { not_a_token: true }),
+        fetchImpl: tokenEndpoint(200, { not_a_token: true }),
       },
       new NoopStepReporter(),
     );
@@ -244,11 +218,11 @@ describe("dependencyAuthStep failure handling", () => {
   it("warns and returns acquired=false on thrown network error", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const out = await dependencyAuthStep.run(
-      ctx(),
+      makeContext(),
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example",
-        fetchImpl: throwingFetch(new Error("ECONNREFUSED")),
+        fetchImpl: unreachableTokenEndpoint(new Error("ECONNREFUSED")),
       },
       new NoopStepReporter(),
     );
@@ -266,11 +240,11 @@ describe("dependencyAuthStep GitHub Actions masking", () => {
     vi.stubEnv("GITHUB_ACTIONS", "true");
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     await dependencyAuthStep.run(
-      ctx(),
+      makeContext(),
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example",
-        fetchImpl: mockFetch(200, { token: "secret-dep-tok", expires_at: "2030-01-01T00:00:00Z" }),
+        fetchImpl: tokenEndpoint(200, { token: "secret-dep-tok", expires_at: "2030-01-01T00:00:00Z" }),
       },
       new NoopStepReporter(),
     );
@@ -283,11 +257,11 @@ describe("dependencyAuthStep GitHub Actions masking", () => {
     vi.stubEnv("GITHUB_ACTIONS", "");
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     await dependencyAuthStep.run(
-      ctx(),
+      makeContext(),
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example",
-        fetchImpl: mockFetch(200, { token: "secret-dep-tok", expires_at: "2030-01-01T00:00:00Z" }),
+        fetchImpl: tokenEndpoint(200, { token: "secret-dep-tok", expires_at: "2030-01-01T00:00:00Z" }),
       },
       new NoopStepReporter(),
     );
@@ -339,13 +313,13 @@ describe("dependency-auth secret leakage regression", () => {
     const resolvedInputs = {
       dependencyTokenScope: "installation" as const,
       callbackUrl: "https://orch.example",
-      fetchImpl: mockFetch(200, { token: dependencyTokenValue, expires_at: "2030-01-01T00:00:00Z" }),
+      fetchImpl: tokenEndpoint(200, { token: dependencyTokenValue, expires_at: "2030-01-01T00:00:00Z" }),
       spawnSyncImpl: vi.fn().mockReturnValue({ status: 0, stdout: Buffer.from(""), stderr: Buffer.from("") }),
       writeFileSyncImpl: vi.fn(),
     };
 
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    const outputs = await dependencyAuthStep.run(ctx(), resolvedInputs, new NoopStepReporter());
+    const outputs = await dependencyAuthStep.run(makeContext(), resolvedInputs, new NoopStepReporter());
     logSpy.mockRestore();
 
     // Inputs must not carry the live progress token (it is read from env inside the step)
@@ -363,7 +337,7 @@ describe("fetchDependencyToken", () => {
       fetchDependencyToken({
         callbackBase: "https://orch.example",
         progressToken: "tok",
-        fetchImpl: mockFetch(500, {}),
+        fetchImpl: tokenEndpoint(500, {}),
       }),
     ).rejects.toThrow(/500/);
   });
@@ -373,7 +347,7 @@ describe("fetchDependencyToken", () => {
       fetchDependencyToken({
         callbackBase: "https://orch.example",
         progressToken: "tok",
-        fetchImpl: mockFetch(200, { expires_at: "2030-01-01T00:00:00Z" }),
+        fetchImpl: tokenEndpoint(200, { expires_at: "2030-01-01T00:00:00Z" }),
       }),
     ).rejects.toThrow(/missing token or expires_at/);
   });
@@ -383,23 +357,19 @@ describe("fetchDependencyToken", () => {
       fetchDependencyToken({
         callbackBase: "https://orch.example",
         progressToken: "tok",
-        fetchImpl: mockFetch(200, { token: "tok123" }),
+        fetchImpl: tokenEndpoint(200, { token: "tok123" }),
       }),
     ).rejects.toThrow(/missing token or expires_at/);
   });
 
   it("strips trailing slash from callbackBase before constructing URL", async () => {
-    const calls: string[] = [];
-    const captureFetch: typeof fetch = async (url) => {
-      calls.push(url as string);
-      return { ok: true, status: 200, json: async () => ({ token: "t", expires_at: "2030-01-01T00:00:00Z" }) } as Response;
-    };
+    const orchestrator = fakeFetch({ [TOKEN_ROUTE]: { json: { token: "t", expires_at: "2030-01-01T00:00:00Z" } } });
     await fetchDependencyToken({
       callbackBase: "https://orch.example/",
       progressToken: "tok",
-      fetchImpl: captureFetch,
+      fetchImpl: orchestrator.fetch,
     });
-    expect(calls[0]).toBe("https://orch.example/api/runner/dependency-token");
+    expect(orchestrator.calls[0].url.href).toBe("https://orch.example/api/runner/dependency-token");
   });
 });
 
@@ -437,11 +407,11 @@ describe("dependencyAuthStep credential helper registration", () => {
 
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     await dependencyAuthStep.run(
-      ctx(),
+      makeContext(),
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example",
-        fetchImpl: mockFetch(200, { token: "dep-tok", expires_at: "2030-01-01T00:00:00Z" }),
+        fetchImpl: tokenEndpoint(200, { token: "dep-tok", expires_at: "2030-01-01T00:00:00Z" }),
         spawnSyncImpl: mockSpawn,
         writeFileSyncImpl: vi.fn(),
         credentialHelperPath: "/opt/ai-implement/git-credential-helper.sh",
@@ -468,11 +438,11 @@ describe("dependencyAuthStep credential helper registration", () => {
 
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     await dependencyAuthStep.run(
-      ctx(),
+      makeContext(),
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example///",
-        fetchImpl: mockFetch(200, { token: "dep-tok-file", expires_at: "2030-06-01T12:00:00Z" }),
+        fetchImpl: tokenEndpoint(200, { token: "dep-tok-file", expires_at: "2030-06-01T12:00:00Z" }),
         spawnSyncImpl: vi.fn().mockReturnValue({ status: 0, stdout: Buffer.from(""), stderr: Buffer.from("") }),
         writeFileSyncImpl: mockWrite,
       },
@@ -492,11 +462,11 @@ describe("dependencyAuthStep credential helper registration", () => {
   it("exports COMPOSER_AUTH with valid JSON containing the token", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     await dependencyAuthStep.run(
-      ctx(),
+      makeContext(),
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example",
-        fetchImpl: mockFetch(200, { token: "composer-tok", expires_at: "2030-01-01T00:00:00Z" }),
+        fetchImpl: tokenEndpoint(200, { token: "composer-tok", expires_at: "2030-01-01T00:00:00Z" }),
         spawnSyncImpl: vi.fn().mockReturnValue({ status: 0, stdout: Buffer.from(""), stderr: Buffer.from("") }),
         writeFileSyncImpl: vi.fn(),
       },
@@ -515,7 +485,7 @@ describe("dependencyAuthStep credential helper registration", () => {
 
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     await dependencyAuthStep.run(
-      ctx(),
+      makeContext(),
       {
         dependencyTokenScope: undefined,
         callbackUrl: "https://orch.example",
@@ -538,11 +508,11 @@ describe("dependencyAuthStep credential helper registration", () => {
 
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     await dependencyAuthStep.run(
-      ctx(),
+      makeContext(),
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example",
-        fetchImpl: mockFetch(403, {}),
+        fetchImpl: tokenEndpoint(403, {}),
         spawnSyncImpl: mockSpawn,
         writeFileSyncImpl: mockWrite,
       },
@@ -560,11 +530,11 @@ describe("dependencyAuthStep credential helper registration", () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const out = await dependencyAuthStep.run(
-      ctx(),
+      makeContext(),
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example",
-        fetchImpl: mockFetch(200, { token: "tok", expires_at: "2030-01-01T00:00:00Z" }),
+        fetchImpl: tokenEndpoint(200, { token: "tok", expires_at: "2030-01-01T00:00:00Z" }),
         spawnSyncImpl: vi.fn().mockReturnValue({ status: 1, stdout: Buffer.from(""), stderr: Buffer.from("error") }),
         writeFileSyncImpl: vi.fn(),
       },
@@ -583,11 +553,11 @@ describe("dependencyAuthStep credential helper registration", () => {
 
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const outputs = await dependencyAuthStep.run(
-      ctx(),
+      makeContext(),
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example",
-        fetchImpl: mockFetch(200, { token: tokenValue, expires_at: "2030-01-01T00:00:00Z" }),
+        fetchImpl: tokenEndpoint(200, { token: tokenValue, expires_at: "2030-01-01T00:00:00Z" }),
         spawnSyncImpl: vi.fn().mockReturnValue({ status: 0, stdout: Buffer.from(""), stderr: Buffer.from("") }),
         writeFileSyncImpl: vi.fn(),
       },

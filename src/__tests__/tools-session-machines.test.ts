@@ -2,12 +2,12 @@
 // shapes they rely on. Handlers are called directly with a fake context, as in tools.test.ts.
 import type * as restate from "@restatedev/restate-sdk";
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
-import { getSessionMachine, listSessionMachines } from "../restate/tools.js";
+import type * as ToolsModule from "../restate/tools.js";
+import type * as LogModule from "../log.js";
 import type { Caller } from "../mcp-identity.js";
 import type { Machine } from "../fly-machines.js";
 import { getMachine, listMachines, fetchMachineLogs } from "../fly-machines.js";
-import { getJobById, getJobByMachineId } from "../log.js";
-import { getDb } from "../dedup.js";
+import { testDb } from "./helpers/test-db.js";
 
 vi.mock("../fly-machines.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../fly-machines.js")>()),
@@ -15,12 +15,6 @@ vi.mock("../fly-machines.js", async (importOriginal) => ({
   listMachines: vi.fn(),
   fetchMachineLogs: vi.fn(),
 }));
-vi.mock("../log.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../log.js")>()),
-  getJobById: vi.fn(),
-  getJobByMachineId: vi.fn(),
-}));
-vi.mock("../dedup.js", () => ({ getDb: vi.fn() }));
 
 const USER: Caller = { kind: "human", email: "u@example.com", role: "user" };
 const ctx = { request: () => ({ target: { handler: "x" } }) } as unknown as restate.Context;
@@ -45,19 +39,21 @@ const exitEvent = (exit: Record<string, unknown>) => ({
   request: { exit_event: exit },
 });
 
-const JOB = { id: 5, issueIdentifier: "AII-1", phase: "implementation", status: "completed", machineId: "m1" };
+let tools: typeof ToolsModule;
+let log: typeof LogModule;
 
 async function get(args: Record<string, unknown>) {
-  const res = await getSessionMachine(ctx, { caller: USER, args });
+  const res = await tools.getSessionMachine(ctx, { caller: USER, args });
   return { res, data: res.isError ? null : JSON.parse(res.content[0].text) };
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   process.env.FLY_SESSIONS_TOKEN = "tok";
   process.env.FLY_SESSIONS_APP = "sessions";
-  vi.mocked(getDb).mockReturnValue({ prepare: () => ({ get: () => ({ id: 5 }) }) } as never);
-  vi.mocked(getJobById).mockReturnValue(JOB as never);
-  vi.mocked(getJobByMachineId).mockReturnValue(null);
+  ({ tools, log } = (
+    await testDb({ modules: { tools: () => import("../restate/tools.js"), log: () => import("../log.js") } })
+  ).modules);
+  log.appendLog({ issueId: "issue-1", issueIdentifier: "AII-1", phase: "implementation", status: "completed", machineId: "m1" });
 });
 
 afterEach(() => {
@@ -132,8 +128,7 @@ describe("get_session_machine", () => {
   });
 
   it("errors when the issue has no machine", async () => {
-    vi.mocked(getJobById).mockReturnValue(null);
-    vi.mocked(getDb).mockReturnValue({ prepare: () => ({ get: () => undefined }) } as never);
+    log.appendLog({ issueId: "issue-9", issueIdentifier: "AII-9" });
     expect((await get({ issueIdentifier: "AII-9" })).res.isError).toBe(true);
   });
 
@@ -162,9 +157,8 @@ describe("list_session_machines", () => {
       machine({ id: "new", created_at: "2026-07-03T00:00:00Z", events: [exitEvent({ oom_killed: true })] }),
       machine({ id: "mid", created_at: "2026-07-02T00:00:00Z" }),
     ]);
-    vi.mocked(getJobByMachineId).mockImplementation(((id: string) =>
-      id === "new" ? { issueIdentifier: "AII-7" } : null) as never);
-    const res = await listSessionMachines(ctx, { caller: USER, args: { limit: 2 } });
+    log.appendLog({ issueId: "issue-7", issueIdentifier: "AII-7", machineId: "new" });
+    const res = await tools.listSessionMachines(ctx, { caller: USER, args: { limit: 2 } });
     const rows = JSON.parse(res.content[0].text);
     expect(rows.map((r: { machineId: string }) => r.machineId)).toEqual(["new", "mid"]);
     expect(rows[0]).toEqual({
@@ -178,7 +172,7 @@ describe("list_session_machines", () => {
     vi.mocked(listMachines).mockResolvedValue(
       Array.from({ length: 15 }, (_, i) => machine({ id: `m${i}`, created_at: `2026-07-${String(i + 1).padStart(2, "0")}T00:00:00Z` })),
     );
-    const res = await listSessionMachines(ctx, { caller: USER, args: {} });
+    const res = await tools.listSessionMachines(ctx, { caller: USER, args: {} });
     expect(JSON.parse(res.content[0].text)).toHaveLength(10);
   });
 });

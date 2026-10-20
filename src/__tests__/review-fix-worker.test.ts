@@ -8,83 +8,39 @@
  *
  * This file is type-checked by `npm run typecheck` (its `tsconfig.tests.json` pass).
  */
-import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
+import { describe, expect, it, beforeEach, vi } from "vitest";
 import path from "node:path";
 import fs from "node:fs";
-import type * as DedupModule from "../dedup.js";
 import type * as ConfigModule from "../config.js";
 import type * as WorkerModule from "../review-fix-worker.js";
 import type * as AttemptStoreModule from "../review-fix-attempt-store.js";
 import type { RepoMapping } from "../config.js";
 import type { ScopedPrIdentity } from "../review-fix-contract.js";
 import type { PreparedReviewFixAttempt } from "../review-fix-ports.js";
+import { makeMapping, makeScopedPrIdentity } from "./helpers/builders.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
+import { githubError } from "./helpers/replies/github.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
-let dedup: typeof DedupModule;
 let config: typeof ConfigModule;
 let workerModule: typeof WorkerModule;
 let attemptStoreModule: typeof AttemptStoreModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `review-fix-worker-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  config = await import("../config.js");
-  workerModule = await import("../review-fix-worker.js");
-  attemptStoreModule = await import("../review-fix-attempt-store.js");
+  ({ config, workerModule, attemptStoreModule } = (await testDb({
+    modules: {
+      config: () => import("../config.js"),
+      workerModule: () => import("../review-fix-worker.js"),
+      attemptStoreModule: () => import("../review-fix-attempt-store.js"),
+    },
+  })).modules);
 });
 
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
-});
-
-const SCOPE: ScopedPrIdentity = { installationId: 7, repository: "eudoxus/ai-implement", prNumber: 42 };
 const INSTALLATION_ID = 7;
-
-function mapping(overrides: Partial<RepoMapping> & Pick<RepoMapping, "owner" | "repo"> = { owner: "eudoxus", repo: "ai-implement" }): RepoMapping {
-  return {
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: false,
-    planningWorkflowFile: "",
-    autoApprovePlans: true,
-    autoMerge: false,
-    extraEnv: {},
-    provider: "anthropic",
-    ticketingProvider: "linear",
-    ticketingConfig: { kind: "linear" },
-    awsRegion: null,
-    paused: false,
-    maxTurns: null,
-    maxIterations: null,
-    maxJobMinutes: null,
-    branchPrefix: null,
-    skillsRepo: null,
-    sensitiveAddPatterns: null,
-    sensitiveAllowPatterns: null,
-    dependencyTokenScope: null,
-    memoryProviderId: null,
-    referenceRepos: null,
-    reviewers: null,
-    reviewFixLifecycle: null,
-    ...overrides,
-  };
-}
+const SCOPE = makeScopedPrIdentity({ installationId: INSTALLATION_ID, repository: "eudoxus/ai-implement" });
 
 function seedMapping(overrides: Partial<RepoMapping> = {}): void {
-  config.initMappingsTable();
-  config.upsertMapping("AII", mapping({ owner: "eudoxus", repo: "ai-implement", ...overrides }));
+  config.upsertMapping("AII", makeMapping({ owner: "eudoxus", repo: "ai-implement", ...overrides }));
 }
 
 function makeAttempt(overrides: Partial<PreparedReviewFixAttempt> = {}): PreparedReviewFixAttempt {
@@ -189,6 +145,16 @@ const caps = (over: Record<string, unknown> = {}) => ({
 });
 const legacyProbe = async () => caps({ supportsPrivateRunConfig: false });
 const privateProbe = async () => caps({ supportsPrivateRunConfig: true });
+
+/** The real transport's dispatch route for the seeded mapping, and GitHub's 200 answer when run details are requested. */
+const DISPATCHES = "POST /repos/eudoxus/ai-implement/actions/workflows/claude-implement.yml/dispatches";
+const dispatchedRun = (id: number) => ({ json: {
+  workflow_run_id: id,
+  run_url: `https://api.github.com/repos/eudoxus/ai-implement/actions/runs/${id}`,
+  html_url: `https://github.com/eudoxus/ai-implement/actions/runs/${id}`,
+} });
+const UNEXPECTED_ISSUE_IDENTIFIER = githubError(422, 'Unexpected inputs provided: ["issue_identifier"]');
+const dispatchBodies = (calls: { body: string }[]) => calls.map((c) => JSON.parse(c.body) as { inputs: Record<string, string> });
 
 describe("GithubReviewFixWorker.launch private envelope capability", () => {
   it("dispatches a run_config whose description and commentInstruction both equal the admitted task text", async () => {
@@ -349,18 +315,10 @@ describe("GithubReviewFixWorker.launch private envelope capability", () => {
   it("keeps the private run_config byte-identical through the real optional-input retry", async () => {
     seedMapping();
     const { resolver } = makeCredentials();
-    const bodies: Array<{ inputs: Record<string, string> }> = [];
-    vi.stubGlobal("fetch", vi.fn(async (_u: unknown, init?: { body?: string }) => {
-      bodies.push(JSON.parse(init!.body as string));
-      if (bodies.length === 1) return new Response(JSON.stringify({ message: 'Unexpected inputs provided: ["issue_identifier"]' }), { status: 422 });
-      return new Response(JSON.stringify({ workflow_run_id: 9101, run_url: "https://api.github.com/repos/eudoxus/ai-implement/actions/runs/9101", html_url: "https://github.com/eudoxus/ai-implement/actions/runs/9101" }), { status: 200 });
-    }));
-    try {
-      const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, callbackInputs: tokens, resolveCapabilities: privateProbe });
-      await worker.launch(await worker.prepare(makeAttempt()));
-    } finally {
-      vi.unstubAllGlobals();
-    }
+    const api = fakeFetch({ [DISPATCHES]: [UNEXPECTED_ISSUE_IDENTIFIER, dispatchedRun(9101)] }).install();
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, callbackInputs: tokens, resolveCapabilities: privateProbe });
+    await worker.launch(await worker.prepare(makeAttempt()));
+    const bodies = dispatchBodies(api.calls);
     expect(bodies).toHaveLength(2);
     expect(bodies[1].inputs).not.toHaveProperty("issue_identifier");
     expect(bodies[1].inputs.run_config).toBe(bodies[0].inputs.run_config);
@@ -445,21 +403,10 @@ describe("GithubReviewFixWorker.launch", () => {
   it("keeps run_config byte-identical through the real optional-input retry", async () => {
     seedMapping();
     const { resolver } = makeCredentials();
-    const bodies: Array<{ inputs: Record<string, string> }> = [];
-    const fetchMock = vi.fn(async (_url: unknown, init?: { body?: string }) => {
-      bodies.push(JSON.parse(init!.body as string));
-      if (bodies.length === 1) {
-        return new Response(JSON.stringify({ message: 'Unexpected inputs provided: ["issue_identifier"]' }), { status: 422 });
-      }
-      return new Response(JSON.stringify({ workflow_run_id: 9012, run_url: "https://api.github.com/repos/eudoxus/ai-implement/actions/runs/9012", html_url: "https://github.com/eudoxus/ai-implement/actions/runs/9012" }), { status: 200 });
-    });
-    vi.stubGlobal("fetch", fetchMock);
-    try {
-      const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, callbackInputs: tokenInputs(), resolveCapabilities: legacyProbe });
-      await worker.launch(await worker.prepare(makeAttempt()));
-    } finally {
-      vi.unstubAllGlobals();
-    }
+    const api = fakeFetch({ [DISPATCHES]: [UNEXPECTED_ISSUE_IDENTIFIER, dispatchedRun(9012)] }).install();
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, callbackInputs: tokenInputs(), resolveCapabilities: legacyProbe });
+    await worker.launch(await worker.prepare(makeAttempt()));
+    const bodies = dispatchBodies(api.calls);
     expect(bodies).toHaveLength(2);
     expect(bodies[0].inputs).toHaveProperty("issue_identifier");
     expect(bodies[1].inputs).not.toHaveProperty("issue_identifier");
@@ -567,6 +514,7 @@ describe("GithubReviewFixWorker.launch", () => {
     }));
     const worker = new workerModule.GithubReviewFixWorker({
       credentials: resolver, transport: t.transport, callbackInputs, runnerCallbackUrl: "https://callback.example/runner",
+      resolveCapabilities: legacyProbe,
     });
     await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-cb-url" })));
 
@@ -602,6 +550,7 @@ describe("GithubReviewFixWorker.launch", () => {
     }));
     const worker = new workerModule.GithubReviewFixWorker({
       credentials: resolver, transport: t.transport, callbackInputs, runnerImage: async () => "ghcr.io/x/runner:next",
+      resolveCapabilities: legacyProbe,
     });
     await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-img2" })));
     expect((t.dispatchCalls[0] as { inputs: Record<string, unknown> }).inputs).toEqual(expect.objectContaining({
@@ -719,8 +668,7 @@ describe("GithubReviewFixWorker.launch", () => {
   });
 
   it("returns unknown, never throws, when the mapping cannot be resolved", async () => {
-    // Table exists but carries no mapping for this repository.
-    config.initMappingsTable();
+    // The table exists (testDb creates every boot table) but carries no mapping for this repository.
     const { resolver } = makeCredentials();
     const t = makeTransport();
 

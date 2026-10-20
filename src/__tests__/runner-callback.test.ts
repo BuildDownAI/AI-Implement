@@ -1,7 +1,4 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
 import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
 import type * as DispatchAdmissionModule from "../dispatch-admission.js";
@@ -12,6 +9,8 @@ import type * as ReviewLedgerStoreModule from "../review-ledger-store.js";
 import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
 import type * as ReviewFixEvidenceModule from "../review-fix-evidence.js";
+import type * as ReviewFixAttemptStoreModule from "../review-fix-attempt-store.js";
+import type * as ReviewFixAdminFacadeModule from "../review-fix-admin-facade.js";
 import type { CycleSummary } from "../pipeline/cycle-summary.js";
 import { formatFailureComment, boundStatusText } from "../runner-callback.js";
 import { FakeProvider } from "./providers/fake.js";
@@ -25,6 +24,9 @@ import type {
   ReviewFixResultMetadataV1,
   ResultIntakeOutcome,
 } from "../review-fix-contract.js";
+import { makeAppendLogEntry, makeIssue, makeReviewFixResult } from "./helpers/builders.js";
+import { activityAccepted, cycleSummaryRecorded, noPlanningContext, progressAccepted, resultAccepted, reviewFixResultStored } from "./helpers/replies/orchestrator.js";
+import { testDb } from "./helpers/test-db.js";
 
 // ---------- Hoisted mocks for AII-749 lease-rejected handling ----------
 // Everything else in these two modules passes through to the real
@@ -58,8 +60,10 @@ vi.mock("../github.js", async (importOriginal) => {
 });
 
 const SECRET = "test-secret-with-enough-entropy-for-hmac";
+// Prepared attempts and their results share one deadline, an hour after the file loads:
+// minting a prepared review-fix credential refuses an attempt whose deadline has passed.
+const DEADLINE_AT = Date.now() + 60 * 60_000;
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let log: typeof LogModule;
 let dispatchAdmission: typeof DispatchAdmissionModule;
@@ -70,38 +74,35 @@ let reviewStore: typeof ReviewLedgerStoreModule;
 let reviewFixQueue: typeof ReviewFixQueueModule;
 let commentGapfillQueue: typeof CommentGapfillQueueModule;
 let reviewFixEvidence: typeof ReviewFixEvidenceModule;
+let reviewFixAttemptStore: typeof ReviewFixAttemptStoreModule;
+let reviewFixAdminFacade: typeof ReviewFixAdminFacadeModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `runner-callback-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  dispatchAdmission = await import("../dispatch-admission.js");
-  runnerTokens = await import("../runner-tokens.js");
-  runnerCallback = await import("../runner-callback.js");
-  stepLog = await import("../step-log.js");
-  reviewStore = await import("../review-ledger-store.js");
-  reviewFixQueue = await import("../review-fix-queue.js");
-  commentGapfillQueue = await import("../comment-gapfill-queue.js");
-  reviewFixEvidence = await import("../review-fix-evidence.js");
-  dedup.getDb();
-  log.initLogTable();
-  stepLog.initStepLogTable();
+  ({
+    dedup, log, dispatchAdmission, runnerTokens, runnerCallback, stepLog,
+    reviewStore, reviewFixQueue, commentGapfillQueue, reviewFixEvidence,
+    reviewFixAttemptStore, reviewFixAdminFacade,
+  } = (await testDb({
+    modules: {
+      dedup: () => import("../dedup.js"),
+      log: () => import("../log.js"),
+      dispatchAdmission: () => import("../dispatch-admission.js"),
+      runnerTokens: () => import("../runner-tokens.js"),
+      runnerCallback: () => import("../runner-callback.js"),
+      stepLog: () => import("../step-log.js"),
+      reviewStore: () => import("../review-ledger-store.js"),
+      reviewFixQueue: () => import("../review-fix-queue.js"),
+      commentGapfillQueue: () => import("../comment-gapfill-queue.js"),
+      reviewFixEvidence: () => import("../review-fix-evidence.js"),
+      reviewFixAttemptStore: () => import("../review-fix-attempt-store.js"),
+      reviewFixAdminFacade: () => import("../review-fix-admin-facade.js"),
+    },
+  })).modules);
 });
 
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllEnvs();
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
   vi.restoreAllMocks();
 });
 
@@ -122,7 +123,7 @@ function preparedResultToken(
   const installationId = String(scope.installationId ?? 1);
   const repository = scope.repository ?? "acme/widgets";
   const prNumber = scope.prNumber ?? 42;
-  const deadlineAt = scope.deadlineAt ?? 1_800_000_000_000;
+  const deadlineAt = scope.deadlineAt ?? DEADLINE_AT;
   const issueId = `${repository}#${prNumber}`;
   const existing = db.prepare("SELECT 1 FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId);
   if (!existing) {
@@ -275,14 +276,7 @@ describe("handleRunnerResult — planning", () => {
     const fake = new FakeProvider({
       recordCalls: true,
       initialIssues: [
-        {
-          id: "i",
-          identifier: "i",
-          title: "",
-          description: null,
-          scopeKey: "",
-          nativeStatus: "",
-        },
+        makeIssue({ id: "i" }),
       ],
     });
     const res = await runnerCallback.handleRunnerResult({
@@ -296,6 +290,7 @@ describe("handleRunnerResult — planning", () => {
       resolveProvider: makeResolve(fake),
     });
     expect(res.status).toBe(200);
+    expect(res.body).toEqual(resultAccepted.json);
     expect(fake.commentsFor("i")).toEqual(["first", "second"]);
     expect(fake.getPhase("i")).toBe("plan_complete");
   });
@@ -824,6 +819,7 @@ describe("handleRunnerResult — implementation", () => {
       resolveProvider: makeResolve(fake),
     });
     expect(res.status).toBe(200);
+    expect(res.body).toEqual(resultAccepted.json);
     expect(fake.getPhase("i")).toBe("pr_ready");
     const calls = fake.recordedCalls();
     expect(calls.find((c) => c.method === "markPrReady")?.args).toEqual([
@@ -1378,16 +1374,14 @@ describe("handleRunnerResult — implementation", () => {
     const HOUR = 3600_000;
     function pendingRow(id: string, over: { phase?: string; prUrl?: string | null; agoMs?: number } = {}) {
       const dispatchId = `d-${id}`;
-      const rowId = log.appendLog({
-        issueId: id, issueIdentifier: "ENG-9", teamKey: "ENG", repo: "o/r", dispatchId,
-        executionMode: "github-actions", phase: over.phase ?? "gap-analysis",
-      });
+      const rowId = log.appendLog(makeAppendLogEntry({
+        issueId: id, repo: "o/r", dispatchId, phase: over.phase ?? "gap-analysis",
+      }));
       log.updateJobStatus(rowId, "completed", "external_review_pending", over.prUrl === undefined ? "https://github.com/o/r/pull/7" : over.prUrl);
       return { rowId, dispatchId };
     }
     async function setCompleted(rowId: number, at: number) {
-      const { getDb } = await import("../dedup.js");
-      getDb().prepare("UPDATE dispatch_log SET completed_at = ? WHERE id = ?").run(at, rowId);
+      dedup.getDb().prepare("UPDATE dispatch_log SET completed_at = ? WHERE id = ?").run(at, rowId);
     }
 
     it("a not-ready callback leaves the row pending; the next ready tick submits once, a second submits nothing", async () => {
@@ -2022,7 +2016,7 @@ describe("handleRunnerProgress", () => {
       secret: SECRET,
     });
 
-    expect(first.status).toBe(200);
+    expect(first).toEqual({ status: 200, body: progressAccepted.json });
     expect(second.status).toBe(200);
     expect(stepLog.getStepsByJobId(jobId)).toMatchObject([
       {
@@ -2333,8 +2327,7 @@ describe("handleRunnerPlanningContext", () => {
       secret: SECRET,
       resolveProvider: makeResolve(null),
     });
-    expect(res.status).toBe(200);
-    expect(res.body.planningContext).toBe("");
+    expect(res).toEqual({ status: 200, body: noPlanningContext.json });
   });
 });
 
@@ -2457,7 +2450,7 @@ describe("handleRunnerResult — gap-analysis", () => {
       issueId: "i", mappingTeamKey: "ENG", phase: "gap-analysis",
       ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
     });
-    const jobId = log.appendLog({ issueId: "i", issueIdentifier: "ENG-7", repo: "org/repo", dispatchId });
+    const jobId = log.appendLog(makeAppendLogEntry({ issueId: "i", issueIdentifier: "ENG-7", repo: "org/repo", dispatchId, phase: "gap-analysis" }));
     log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
     const hook = vi.fn(async () => {});
 
@@ -2488,7 +2481,7 @@ describe("handleRunnerResult — gap-analysis", () => {
         issueId: id, mappingTeamKey: "ENG", phase: "gap-analysis",
         ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
       });
-      const jobId = log.appendLog({ issueId: id, repo: "org/repo", dispatchId });
+      const jobId = log.appendLog(makeAppendLogEntry({ issueId: id, repo: "org/repo", dispatchId, phase: "gap-analysis" }));
       log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
       const res = await runnerCallback.handleRunnerResult({
         authorization: `Bearer ${token}`,
@@ -2790,14 +2783,7 @@ describe("handleRunnerResult — body validation", () => {
   it("does NOT consume the token on body-validation failure", async () => {
     const fake = new FakeProvider({
       initialIssues: [
-        {
-          id: "i",
-          identifier: "ENG-1",
-          title: "t",
-          description: null,
-          scopeKey: "ENG",
-          nativeStatus: "Todo (unstarted)",
-        },
+        makeIssue({ id: "i" }),
       ],
       recordCalls: true,
     });
@@ -4219,17 +4205,7 @@ describe("handleRunnerResult — deferred findings (AII-756)", () => {
 // ── AII-777: reviewFix pilot result marker ─────────────────────────────────
 
 describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
-  const validReviewFix: ReviewFixResultMetadataV1 = {
-    version: 1,
-    attemptId: "attempt-1",
-    installationId: 1,
-    repository: "acme/widgets",
-    prNumber: 42,
-    deadlineAt: 1_800_000_000_000,
-    githubRunId: 555,
-    githubRunAttempt: 1,
-    outputCommit: "a".repeat(40),
-  };
+  const validReviewFix = makeReviewFixResult({ repository: "acme/widgets", deadlineAt: DEADLINE_AT });
 
   it("an unrelated unknown top-level field does not reject an old (no-reviewFix) result", async () => {
     const fake = new FakeProvider({ recordCalls: true });
@@ -4724,17 +4700,7 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
 });
 
 describe("handleRunnerResult — cycle summary durable evidence (AII-801)", () => {
-  const validReviewFix: ReviewFixResultMetadataV1 = {
-    version: 1,
-    attemptId: "attempt-cycles-1",
-    installationId: 1,
-    repository: "acme/widgets",
-    prNumber: 42,
-    deadlineAt: 1_800_000_000_000,
-    githubRunId: 555,
-    githubRunAttempt: 1,
-    outputCommit: "a".repeat(40),
-  };
+  const validReviewFix = makeReviewFixResult({ attemptId: "attempt-cycles-1", repository: "acme/widgets", deadlineAt: DEADLINE_AT });
 
   function baseCycleSummary(overrides: Partial<CycleSummary> = {}): CycleSummary {
     return {
@@ -4981,7 +4947,7 @@ describe("handleRunnerCycleSummary — independent pilot evidence", () => {
     const post = (entry: CycleSummary) => runnerCallback.handleRunnerCycleSummary({
       authorization: `Bearer ${token}`, secret: SECRET, body: { summary: entry },
     });
-    expect(post(summary)).toMatchObject({ status: 200, body: { outcome: "recorded" } });
+    expect(post(summary)).toEqual({ status: 200, body: cycleSummaryRecorded.json });
     expect(reviewFixEvidence.getReviewFixCycleSummary(attemptId, 1)?.tests).toEqual(summary.tests);
     expect(post(summary)).toMatchObject({ status: 200, body: { outcome: "duplicate" } });
     expect(post({ ...summary, completedAt: summary.completedAt + 1 }).status).toBe(409);
@@ -5036,19 +5002,9 @@ describe("reviewFixResultIntakeResponse (AII-777)", () => {
   it("maps 'stored' to 200 acknowledged, non-retryable", () => {
     const res = runnerCallback.reviewFixResultIntakeResponse({
       status: "stored",
-      result: {
-        version: 1,
-        attemptId: "a",
-        installationId: 1,
-        repository: "o/r",
-        prNumber: 1,
-        deadlineAt: 1,
-        githubRunId: 1,
-        githubRunAttempt: 1,
-        outputCommit: "a".repeat(40),
-      },
+      result: makeReviewFixResult(),
     });
-    expect(res).toEqual({ status: 200, body: { acknowledged: true, outcome: "stored", retryable: false } });
+    expect(res).toEqual({ status: 200, body: reviewFixResultStored.json });
   });
 
   it("maps 'duplicate' to 200 acknowledged, non-retryable, carrying attemptId", () => {
@@ -5178,7 +5134,7 @@ describe("handleRunnerActivity (AII-777/AII-803)", () => {
       },
       onReviewFixActivity: (batch) => ({ status: "accepted", attemptId: batch.attemptId }),
     });
-    expect(res.status).toBe(200);
+    expect(res).toEqual({ status: 200, body: activityAccepted("attempt-1").json });
   });
 
   it("rejects a non-object body", async () => {
@@ -5437,7 +5393,7 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
       ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET, dispatchId,
     });
     if (!log.findLogIdByDispatchId(dispatchId)) {
-      log.appendLog({ issueId: "i", issueIdentifier: "ENG-1", issueTitle: "t", teamKey: "ENG", repo: "o/r", dispatchId, executionMode: "github-actions", phase: "implementation" });
+      log.appendLog(makeAppendLogEntry({ issueId: "i", repo: "o/r", dispatchId }));
     }
     if (opts.snapshot !== false && !dedup.getDb().prepare("SELECT 1 FROM run_agent_config_snapshots WHERE dispatch_id = ?").get(dispatchId)) {
       storeSnapshot(dispatchId, `snap-${dispatchId}`);
@@ -5458,13 +5414,9 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
     const attemptId = "attempt-managed-attr";
     const token = preparedResultToken(attemptId);
     storeSnapshot(attemptId, "snap-managed-attr");
-    const { SqliteReviewFixAttemptStore } = await import("../review-fix-attempt-store.js");
-    const store = new SqliteReviewFixAttemptStore();
+    const store = new reviewFixAttemptStore.SqliteReviewFixAttemptStore();
     await store.bindExecution(attemptId, { githubRunId: 555, githubRunAttempt: 1 }, Date.now());
-    const marker: ReviewFixResultMetadataV1 = {
-      version: 1, attemptId, installationId: 1, repository: "acme/widgets", prNumber: 42,
-      deadlineAt: 1_800_000_000_000, githubRunId: 555, githubRunAttempt: 1, outputCommit: "a".repeat(40),
-    };
+    const marker = makeReviewFixResult({ attemptId, repository: "acme/widgets", deadlineAt: DEADLINE_AT });
     const fake = new FakeProvider({ recordCalls: true });
     const deliver = (attribution: unknown = claim({ snapshotId: "snap-managed-attr", usage: {
       availability: "complete", tokensIn: 100, tokensOut: 10, costUsd: null, costStatus: "unavailable",
@@ -5483,8 +5435,7 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
     expect(log.getJobByDispatchId(c.attemptId)).toBeNull();
     expect(rows()).toHaveLength(1);
     expect(rows()[0]).toMatchObject({dispatch_id: c.attemptId, snapshot_id: "snap-managed-attr", model: "m-implementation", profile_id: "p-implementation"});
-    const { createReviewFixAdminFacade } = await import("../review-fix-admin-facade.js");
-    const facade = createReviewFixAdminFacade(c.store, {reconcile: async () => ({status: "unknown"})}, {cancel: async () => ({status: "accepted"})});
+    const facade = reviewFixAdminFacade.createReviewFixAdminFacade(c.store, {reconcile: async () => ({status: "unknown"})}, {cancel: async () => ({status: "accepted"})});
     expect(await facade.getAttempt(c.attemptId, {role: "admin", email: "operator@example.com"})).toMatchObject({status: "ok", attempt: {
       attribution: {snapshotId: "snap-managed-attr", invocationId: "inv-1", agent: "codex", model: "m-implementation", profileId: "p-implementation",
         usage: {tokensIn: 100, tokensOut: 10, costUsd: null, costStatus: "unavailable"}},

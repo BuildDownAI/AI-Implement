@@ -10,7 +10,8 @@ import {
 } from "../run-autonomous.js";
 import { AgentStageError } from "../pipeline/stage-executor.js";
 import type { LLMExecutor } from "../pipeline/types.js";
-import { EXPECTED, NOW, SENTINEL_BEARER, envelopeEnv, fakeClient, makeGrant, makeSnapshot } from "./configured-run-fixture.js";
+import { EXPECTED, NOW, SENTINEL_BEARER, envelopeEnv, fakeClient, makeGrant, makeSnapshot } from "./helpers/fixtures/configured-run.js";
+import { makeExecutor } from "./helpers/builders.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { DEFAULT_REVIEWER_SELECTION } from "../config.js";
 
@@ -794,7 +795,7 @@ describe("prepareConfiguredRun", () => {
   it("checks out each profile once, on first use, and finishes then disposes it", async () => {
     const client = fakeClient();
     const run = (await prepare(envelopeEnv(snap, makeGrant(snap)), { modelAuthClient: client }))!;
-    const legacy: LLMExecutor = { invoke: vi.fn().mockResolvedValue({ stdout: "", exitCode: 0, tokensUsed: 0 }) };
+    const legacy = makeExecutor();
     const ex = run.createExecutor({ workspaceDir: "/tmp/ws-x", legacy });
     expect(client.checkout).not.toHaveBeenCalled();
     await ex.invoke({ prompt: "p", model: "caller", agentStage: "review" });
@@ -802,7 +803,7 @@ describe("prepareConfiguredRun", () => {
     expect(client.checkout).toHaveBeenCalledTimes(1);
     expect(client.checkout).toHaveBeenCalledWith({ profileId: "p-rev", authMode: "anthropic-api-key" });
     expect(client.invoke).toHaveBeenCalledTimes(2);
-    expect((legacy.invoke as ReturnType<typeof vi.fn>).mock.calls[0][0].model).toBe("claude-review");
+    expect(vi.mocked(legacy.invoke).mock.calls[0][0].model).toBe("claude-review");
     await expect(run.finish("completed")).resolves.toBe(true);
     await expect(run.finish("completed")).resolves.toBe(false);
     expect(client.finish).toHaveBeenCalledTimes(1);
@@ -812,7 +813,7 @@ describe("prepareConfiguredRun", () => {
 
   it("requires an explicit agentStage and never infers one", async () => {
     const run = (await prepare(envelopeEnv(snap, makeGrant(snap)), { modelAuthClient: fakeClient() }))!;
-    const ex = run.createExecutor({ workspaceDir: "/tmp/ws-x", legacy: { invoke: vi.fn() } });
+    const ex = run.createExecutor({ workspaceDir: "/tmp/ws-x", legacy: makeExecutor() });
     await expect(ex.invoke({ prompt: "p", model: "m", stage: "review" } as never)).rejects.toBeInstanceOf(AgentStageError);
   });
 
@@ -832,7 +833,7 @@ describe("prepareConfiguredRun", () => {
   it("does not dispose while a profile is still invoking or uncertain", async () => {
     const client = fakeClient();
     const run = (await prepare(envelopeEnv(snap, makeGrant(snap)), { modelAuthClient: client }))!;
-    const ex = run.createExecutor({ workspaceDir: "/tmp/ws-x", legacy: { invoke: vi.fn().mockResolvedValue({ stdout: "", exitCode: 0, tokensUsed: 0 }) } });
+    const ex = run.createExecutor({ workspaceDir: "/tmp/ws-x", legacy: makeExecutor() });
     await ex.invoke({ prompt: "p", model: "m", agentStage: "review" });
     client.states.set("p-rev", "uncertain");
     await expect(run.finish("failed")).resolves.toBe(false);

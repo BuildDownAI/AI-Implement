@@ -16,56 +16,17 @@ import { decodeRunConfig, decodeTrustedRunConfig } from "../run-config.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { surfaceDispatchFailure } from "../dispatch-failure.js";
 import { notify } from "../notify.js";
-import type { RepoMapping } from "../config.js";
 import { closeDb } from "../dedup.js";
 import { initLogTable, appendLog, listLog, getJobById } from "../log.js";
+import { makeMapping } from "./helpers/builders.js";
+import { fakeFetch, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
+import { makeGrant, makeSnapshot } from "./helpers/fixtures/configured-run.js";
+import { githubError } from "./helpers/replies/github.js";
 
 // Mock notify so surfaceDispatchFailure doesn't make real HTTP calls.
 vi.mock("../notify.js", () => ({
   notify: vi.fn().mockResolvedValue(undefined),
 }));
-
-function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
-  const base: RepoMapping = {
-    owner: "test-org",
-    repo: "test-repo",
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: false,
-    planningWorkflowFile: "",
-    autoApprovePlans: true,
-    extraEnv: {},
-    provider: "anthropic",
-    ticketingProvider: "linear",
-    ticketingConfig: { kind: "linear" },
-    awsRegion: null,
-    paused: false,
-    maxTurns: null,
-    maxIterations: null,
-    maxJobMinutes: null,
-    branchPrefix: null,
-    skillsRepo: null,
-    referenceRepos: null,
-    sensitiveAddPatterns: null,
-    sensitiveAllowPatterns: null,
-    autoMerge: false,
-    dependencyTokenScope: null,
-    reviewFixLifecycle: null,
-    memoryProviderId: null,
-    reviewers: null,
-  };
-  return {
-    ...base,
-    ...overrides,
-    referenceRepos: overrides.referenceRepos === undefined ? base.referenceRepos : overrides.referenceRepos,
-    reviewers: overrides.reviewers === undefined ? base.reviewers : overrides.reviewers,
-  };
-}
 
 const baseIssue = {
   id: "issue-uuid-1",
@@ -795,12 +756,10 @@ describe("appendLog with status and contract fields", () => {
 // for issue_identifier); the existing base_branch 422 attribution in src/index.ts:985-996.
 
 describe("postWorkflowDispatch — 422 strip-and-retry", () => {
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
-  function textResponse(status: number, body: string | null): Response {
-    return new Response(body, { status });
+  /** The dispatch endpoint of acme/`repo`, answering each request with the next reply in order;
+   *  a request past the last reply fails the test. */
+  function dispatches(repo: string, ...replies: Reply[]): FakeFetch {
+    return fakeFetch({ [`POST /repos/acme/${repo}/actions/workflows/claude-implement.yml/dispatches` as const]: replies }).install();
   }
 
   it("exposes exactly runner_phase, runner_callback_url, and issue_identifier as the optional-input list", () => {
@@ -811,8 +770,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     ["agentConfig", { agentConfig: { v: 1 } }],
     ["credentials.modelAuthGrant", { credentials: { version: 1, modelAuthGrant: {} } }],
   ])("does not downgrade a managed run (%s) on a rejected input", async (_name, extra) => {
-    const fetchMock = vi.fn().mockResolvedValue(textResponse(422, 'Unexpected inputs provided: ["runner_phase"]'));
-    vi.stubGlobal("fetch", fetchMock);
+    const github = dispatches("r", githubError(422, 'Unexpected inputs provided: ["runner_phase"]'));
     const runConfig = Buffer.from(JSON.stringify({ v: 1, ...extra }), "utf-8").toString("base64");
 
     const result = await postWorkflowDispatch({
@@ -824,16 +782,13 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       inputs: { run_config: runConfig, run_token: "", runner_phase: "implementation" },
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(github.calls).toHaveLength(1);
     expect(result.success).toBe(false);
     expect(result.status).toBe(422);
   });
 
   it("strips a single optional input named in the 422 body and retries once", async () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_phase"]'))
-      .mockResolvedValueOnce(textResponse(204, null));
-    vi.stubGlobal("fetch", fetchMock);
+    const github = dispatches("kg-repo", { status: 422, text: 'Unexpected inputs provided: ["runner_phase"]' }, { status: 204 });
 
     const result = await postWorkflowDispatch({
       token: "tok",
@@ -844,18 +799,15 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       inputs: { run_config: "cfg", run_token: "rt", runner_phase: "kg-refresh" },
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    const secondBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect(github.calls).toHaveLength(2);
+    const secondBody = JSON.parse(github.calls[1].body);
     expect("runner_phase" in secondBody.inputs).toBe(false);
     expect(secondBody.inputs.run_config).toBe("cfg");
     expect(result).toEqual({ success: true, status: 204 });
   });
 
   it("strips issue_identifier alone when the 422 names it on the envelope contract", async () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["issue_identifier"]'))
-      .mockResolvedValueOnce(textResponse(204, null));
-    vi.stubGlobal("fetch", fetchMock);
+    const github = dispatches("impl-repo", { status: 422, text: 'Unexpected inputs provided: ["issue_identifier"]' }, { status: 204 });
 
     const result = await postWorkflowDispatch({
       token: "tok",
@@ -866,8 +818,8 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       inputs: { run_config: "cfg", run_token: "rt", issue_identifier: "AII-656" },
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    const secondBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect(github.calls).toHaveLength(2);
+    const secondBody = JSON.parse(github.calls[1].body);
     expect("issue_identifier" in secondBody.inputs).toBe(false);
     expect(secondBody.inputs.run_config).toBe("cfg");
     expect(result).toEqual({ success: true, status: 204 });
@@ -876,9 +828,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
   it("does not retry on the legacy contract (no run_config) when the 422 names issue_identifier", async () => {
     // issue_identifier is authoritative issue data on the legacy contract, not a
     // compatibility duplicate, so stripping it there must not happen.
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["issue_identifier"]'));
-    vi.stubGlobal("fetch", fetchMock);
+    const github = dispatches("legacy-repo", { status: 422, text: 'Unexpected inputs provided: ["issue_identifier"]' });
 
     const result = await postWorkflowDispatch({
       token: "tok",
@@ -895,15 +845,16 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       },
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(github.calls).toHaveLength(1);
     expect(result.success).toBe(false);
   });
 
   it("strips both runner_phase and runner_callback_url when the 422 names both", async () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_phase", "runner_callback_url"]'))
-      .mockResolvedValueOnce(textResponse(204, null));
-    vi.stubGlobal("fetch", fetchMock);
+    const github = dispatches(
+      "kg-repo",
+      { status: 422, text: 'Unexpected inputs provided: ["runner_phase", "runner_callback_url"]' },
+      { status: 204 },
+    );
 
     const result = await postWorkflowDispatch({
       token: "tok",
@@ -919,17 +870,15 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       },
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    const secondBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect(github.calls).toHaveLength(2);
+    const secondBody = JSON.parse(github.calls[1].body);
     expect("runner_phase" in secondBody.inputs).toBe(false);
     expect("runner_callback_url" in secondBody.inputs).toBe(false);
     expect(result.success).toBe(true);
   });
 
   it("does not retry when the 422 names an input outside ENVELOPE_OPTIONAL_INPUTS", async () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["base_branch"]'));
-    vi.stubGlobal("fetch", fetchMock);
+    const github = dispatches("kg-repo", { status: 422, text: 'Unexpected inputs provided: ["base_branch"]' });
 
     const result = await postWorkflowDispatch({
       token: "tok",
@@ -940,16 +889,14 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       inputs: { run_config: "cfg", run_token: "rt", base_branch: "main" },
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(github.calls).toHaveLength(1);
     expect(result).toEqual({ success: false, status: 422, error: 'Unexpected inputs provided: ["base_branch"]' });
   });
 
   it("does not retry on the legacy contract (no run_config), even when the 422 names runner_phase", async () => {
     // Mirrors src/index.ts:985-996's guard: runner_phase is authoritative issue data on the
     // legacy contract, not a compatibility duplicate, so stripping it there must not happen.
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_phase"]'));
-    vi.stubGlobal("fetch", fetchMock);
+    const github = dispatches("legacy-repo", { status: 422, text: 'Unexpected inputs provided: ["runner_phase"]' });
 
     const result = await postWorkflowDispatch({
       token: "tok",
@@ -966,15 +913,16 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       },
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(github.calls).toHaveLength(1);
     expect(result.success).toBe(false);
   });
 
   it("a retry that 422s again returns failure with exactly 2 fetches (no loop)", async () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_phase"]'))
-      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_phase"]'));
-    vi.stubGlobal("fetch", fetchMock);
+    const github = dispatches(
+      "kg-repo",
+      { status: 422, text: 'Unexpected inputs provided: ["runner_phase"]' },
+      { status: 422, text: 'Unexpected inputs provided: ["runner_phase"]' },
+    );
 
     const result = await postWorkflowDispatch({
       token: "tok",
@@ -985,7 +933,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       inputs: { run_config: "cfg", run_token: "rt", runner_phase: "kg-refresh" },
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(github.calls).toHaveLength(2);
     expect(result.success).toBe(false);
     expect(result.status).toBe(422);
   });
@@ -995,10 +943,11 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     // the first 422 names runner_phase, the retry's own 422 names the *other* optional input,
     // runner_callback_url (still present in the stripped payload). The retry must be returned
     // as failure unconditionally rather than triggering a third request.
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_phase"]'))
-      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_callback_url"]'));
-    vi.stubGlobal("fetch", fetchMock);
+    const github = dispatches(
+      "kg-repo",
+      { status: 422, text: 'Unexpected inputs provided: ["runner_phase"]' },
+      { status: 422, text: 'Unexpected inputs provided: ["runner_callback_url"]' },
+    );
 
     const result = await postWorkflowDispatch({
       token: "tok",
@@ -1014,8 +963,8 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       },
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    const secondBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect(github.calls).toHaveLength(2);
+    const secondBody = JSON.parse(github.calls[1].body);
     expect("runner_phase" in secondBody.inputs).toBe(false);
     expect("runner_callback_url" in secondBody.inputs).toBe(true);
     expect(result).toEqual({
@@ -1026,9 +975,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
   });
 
   it("does not strip on a prefix collision (rejected name is a superstring of an optional input)", async () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_phase_extra"]'));
-    vi.stubGlobal("fetch", fetchMock);
+    const github = dispatches("kg-repo", { status: 422, text: 'Unexpected inputs provided: ["runner_phase_extra"]' });
 
     const result = await postWorkflowDispatch({
       token: "tok",
@@ -1039,14 +986,12 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       inputs: { run_config: "cfg", run_token: "rt", runner_phase: "kg-refresh" },
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(github.calls).toHaveLength(1);
     expect(result).toEqual({ success: false, status: 422, error: 'Unexpected inputs provided: ["runner_phase_extra"]' });
   });
 
   it("does not strip on a suffix collision (rejected name is a superstring of an optional input)", async () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["extra_runner_callback_url"]'));
-    vi.stubGlobal("fetch", fetchMock);
+    const github = dispatches("kg-repo", { status: 422, text: 'Unexpected inputs provided: ["extra_runner_callback_url"]' });
 
     const result = await postWorkflowDispatch({
       token: "tok",
@@ -1061,7 +1006,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       },
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(github.calls).toHaveLength(1);
     expect(result).toEqual({
       success: false,
       status: 422,
@@ -1070,10 +1015,11 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
   });
 
   it("still matches a fully-qualified input name inside a rejection naming several other inputs", async () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["base_branch", "runner_phase", "issue_identifier"]'))
-      .mockResolvedValueOnce(textResponse(204, null));
-    vi.stubGlobal("fetch", fetchMock);
+    const github = dispatches(
+      "kg-repo",
+      { status: 422, text: 'Unexpected inputs provided: ["base_branch", "runner_phase", "issue_identifier"]' },
+      { status: 204 },
+    );
 
     const result = await postWorkflowDispatch({
       token: "tok",
@@ -1084,8 +1030,8 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       inputs: { run_config: "cfg", run_token: "rt", runner_phase: "kg-refresh" },
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    const secondBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect(github.calls).toHaveLength(2);
+    const secondBody = JSON.parse(github.calls[1].body);
     expect("runner_phase" in secondBody.inputs).toBe(false);
     expect(result.success).toBe(true);
   });
@@ -1095,10 +1041,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       message: 'Unexpected inputs provided: ["runner_phase", "runner_callback_url"]',
       documentation_url: "https://docs.github.com/rest/actions/workflows#create-a-workflow-dispatch-event",
     });
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(textResponse(422, ghJsonBody))
-      .mockResolvedValueOnce(textResponse(204, null));
-    vi.stubGlobal("fetch", fetchMock);
+    const github = dispatches("kg-repo", { status: 422, text: ghJsonBody }, { status: 204 });
 
     const result = await postWorkflowDispatch({
       token: "tok",
@@ -1114,18 +1057,15 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       },
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    const secondBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect(github.calls).toHaveLength(2);
+    const secondBody = JSON.parse(github.calls[1].body);
     expect("runner_phase" in secondBody.inputs).toBe(false);
     expect("runner_callback_url" in secondBody.inputs).toBe(false);
     expect(result).toEqual({ success: true, status: 204 });
   });
 
   it("matches the unexpected-inputs marker case-insensitively", async () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(textResponse(422, 'UNEXPECTED INPUTS PROVIDED: ["runner_phase"]'))
-      .mockResolvedValueOnce(textResponse(204, null));
-    vi.stubGlobal("fetch", fetchMock);
+    const github = dispatches("kg-repo", { status: 422, text: 'UNEXPECTED INPUTS PROVIDED: ["runner_phase"]' }, { status: 204 });
 
     const result = await postWorkflowDispatch({
       token: "tok",
@@ -1136,7 +1076,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       inputs: { run_config: "cfg", run_token: "rt", runner_phase: "kg-refresh" },
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(github.calls).toHaveLength(2);
     expect(result.success).toBe(true);
   });
 
@@ -1144,9 +1084,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     // run_config: "" must not satisfy the envelope guard — an empty string is falsy data,
     // not evidence the caller is on the envelope contract, and runner_phase must stay
     // authoritative for whatever contract actually sent an empty run_config.
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_phase"]'));
-    vi.stubGlobal("fetch", fetchMock);
+    const github = dispatches("legacy-ish-repo", { status: 422, text: 'Unexpected inputs provided: ["runner_phase"]' });
 
     const result = await postWorkflowDispatch({
       token: "tok",
@@ -1157,13 +1095,12 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       inputs: { run_config: "", run_token: "rt", runner_phase: "implementation" },
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(github.calls).toHaveLength(1);
     expect(result.success).toBe(false);
   });
 
   it("does not retry on a non-422 failure", async () => {
-    const fetchMock = vi.fn().mockResolvedValueOnce(textResponse(500, "Internal Server Error"));
-    vi.stubGlobal("fetch", fetchMock);
+    const github = dispatches("kg-repo", { status: 500, text: "Internal Server Error" });
 
     const result = await postWorkflowDispatch({
       token: "tok",
@@ -1174,15 +1111,16 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       inputs: { run_config: "cfg", run_token: "rt", runner_phase: "kg-refresh" },
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(github.calls).toHaveLength(1);
     expect(result).toEqual({ success: false, status: 500, error: "Internal Server Error" });
   });
 
   it("the kg-refresh dispatch path (buildKgRefreshGhaDispatchBody + postWorkflowDispatch) retries on 422", async () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_phase", "runner_callback_url"]'))
-      .mockResolvedValueOnce(textResponse(204, null));
-    vi.stubGlobal("fetch", fetchMock);
+    const github = dispatches(
+      "kg-repo",
+      { status: 422, text: 'Unexpected inputs provided: ["runner_phase", "runner_callback_url"]' },
+      { status: 204 },
+    );
 
     const inputs = buildKgRefreshGhaDispatchBody({
       runConfig: "b64cfg",
@@ -1206,8 +1144,8 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       inputs,
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    const secondBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect(github.calls).toHaveLength(2);
+    const secondBody = JSON.parse(github.calls[1].body);
     expect("runner_phase" in secondBody.inputs).toBe(false);
     expect("runner_callback_url" in secondBody.inputs).toBe(false);
     expect(secondBody.inputs.run_config).toBe("b64cfg");
@@ -1281,18 +1219,16 @@ describe("buildEnvelopeDispatchInputs — private transport (AII-983)", () => {
 
   it("private retry sends two requests with byte-identical run_config and no bearer inputs", async () => {
     const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, { ...impl, privateTransport: true });
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(new Response('Unexpected inputs provided: ["issue_identifier"]', { status: 422 }))
-      .mockResolvedValueOnce(new Response('Unexpected inputs provided: ["runner_phase"]', { status: 422 }));
-    vi.stubGlobal("fetch", fetchMock);
-    try {
-      await postWorkflowDispatch({ token: "t", owner: "o", repo: "r", workflowFile: "w.yml", ref: "main", inputs });
-    } finally {
-      vi.unstubAllGlobals();
-    }
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    const first = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body)).inputs;
-    const second = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body)).inputs;
+    const github = fakeFetch({
+      "POST /repos/o/r/actions/workflows/w.yml/dispatches": [
+        githubError(422, 'Unexpected inputs provided: ["issue_identifier"]'),
+        githubError(422, 'Unexpected inputs provided: ["runner_phase"]'),
+      ],
+    }).install();
+    await postWorkflowDispatch({ token: "t", owner: "o", repo: "r", workflowFile: "w.yml", ref: "main", inputs });
+    expect(github.calls).toHaveLength(2);
+    const first = JSON.parse(github.calls[0].body).inputs;
+    const second = JSON.parse(github.calls[1].body).inputs;
     expect(second.run_config).toBe(first.run_config);
     expect(second.run_token).toBe("");
     expect("issue_identifier" in second).toBe(false);
@@ -1339,23 +1275,21 @@ describe("buildPrivateKgRefreshGhaDispatchBody (AII-983)", () => {
 
 describe("managed credentials on the GitHub Actions envelope (AII-1420)", () => {
   const BEARER = "SENTINEL-BEARER-" + "B".repeat(40);
-  const grant = {
-    version: 1 as const, audience: "model-auth" as const, grantId: "g1", dispatchId: "d1", snapshotId: "s1",
-    projectKey: "AII", backend: "gha" as const, expiresAt: 1_800_000_000_000, bearer: BEARER,
-    bindings: [{ stage: "planning", profileId: "pp", profileRevision: 1, authMode: "openai-api-key" }],
-  };
-  const textResponse = (status: number, body: string | null) => new Response(body, { status });
+  // A GitHub Actions grant for the issue's project; the dispatch carries it without reading its expiry.
+  const grant = makeGrant(makeSnapshot(), { projectKey: "AII", backend: "gha", bearer: BEARER });
+  // GitHub refusing the dispatch with the 422 it sends for an input the workflow does not declare.
+  const refusedDispatch = (input: string) => fakeFetch({
+    "POST /repos/o/r/actions/workflows/claude-implement.yml/dispatches": githubError(422, `Unexpected inputs provided: ["${input}"]`),
+  }).install();
   const managedInputs = () => buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
     runnerPhase: "implementation",
     runnerCallbackUrl: "https://orch.example",
     runToken: "RESULT-TOKEN-1",
     runProgressToken: "PROGRESS-TOKEN-1",
     privateTransport: true,
-    credentials: { version: 1, modelAuthGrant: grant as never },
+    credentials: { version: 1, modelAuthGrant: grant },
     retryPolicy: DEFAULT_RETRY_POLICY,
   });
-
-  afterEach(() => { vi.unstubAllGlobals(); });
 
   it("carries the grant only inside run_config.credentials and blanks the top-level run_token", () => {
     const inputs = managedInputs();
@@ -1370,25 +1304,23 @@ describe("managed credentials on the GitHub Actions envelope (AII-1420)", () => 
   it("refuses a managed grant on a reader without private transport rather than dropping it", () => {
     expect(() => buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
       runnerPhase: "implementation", runToken: "t", privateTransport: false,
-      credentials: { version: 1, modelAuthGrant: grant as never }, retryPolicy: DEFAULT_RETRY_POLICY,
+      credentials: { version: 1, modelAuthGrant: grant }, retryPolicy: DEFAULT_RETRY_POLICY,
     })).toThrow(/protected run transport/);
   });
 
   it("never retries a 422 that names run_config, and the failure text carries no bearer", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(textResponse(422, 'Unexpected inputs provided: ["run_config"]'));
-    vi.stubGlobal("fetch", fetchMock);
+    const github = refusedDispatch("run_config");
     const result = await postWorkflowDispatch({ token: "tok", owner: "o", repo: "r", workflowFile: "claude-implement.yml", ref: "main", inputs: managedInputs() });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(github.calls).toHaveLength(1);
     expect(result.success).toBe(false);
     expect(JSON.stringify(result)).not.toContain(BEARER);
   });
 
   it("never strips and retries a managed 422 naming an optional input, and the failure carries no bearer", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(textResponse(422, 'Unexpected inputs provided: ["runner_phase"]'));
-    vi.stubGlobal("fetch", fetchMock);
+    const github = refusedDispatch("runner_phase");
     const inputs = { ...managedInputs(), runner_phase: "implementation" as const };
     const result = await postWorkflowDispatch({ token: "tok", owner: "o", repo: "r", workflowFile: "claude-implement.yml", ref: "main", inputs });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(github.calls).toHaveLength(1);
     expect(result.success).toBe(false);
     expect(result.status).toBe(422);
     expect(JSON.stringify(result)).not.toContain(BEARER);

@@ -1,28 +1,26 @@
 /**
  * Behavioral tests for `src/model-auth-routes.ts` (AII-1387) on a real `http.Server` and a temp SQLite
- * file. Synthetic credentials only. `npm run typecheck` excludes `src/__tests__`, so type-check this file
- * explicitly with a throwaway tsconfig.
+ * file. Synthetic credentials only.
  */
 import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
 import http from "node:http";
 import crypto from "node:crypto";
 import type { AddressInfo } from "node:net";
+import { serializeChatGptPlanRecord } from "../chatgpt-plan-token.js";
 import type * as DedupModule from "../dedup.js";
 import type * as RoutesModule from "../model-auth-routes.js";
 import type { ModelAuthRuntime } from "../model-auth-runtime.js";
+import { createModelSessionKeyProvider } from "../model-session-keys.js";
+import { makeChatGptPlanRecord } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 
 const BEARER = "SYNTH_BEARER_" + "b".repeat(40);
 const ACCESS_TOKEN = "SYNTH-CHATGPT-ACCESS-TOKEN";
 const REFRESH_TOKEN = "SYNTH-CHATGPT-REFRESH-TOKEN";
 const ID_TOKEN = "SYNTH-CHATGPT-ID-TOKEN";
-const KEY = crypto.createHash("sha256").update("synthetic-routes-key").digest();
 const NOW = 1_000_000;
 const BINDING = { stage: "implementation", profileId: "cdx1", profileRevision: 4, authMode: "codex-subscription" };
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let routesMod: typeof RoutesModule;
 let runtime: ModelAuthRuntime;
@@ -64,12 +62,9 @@ function seedPlan(expiresAt: number) {
   const r = runtime.sessionStore.writePlanRecord({
     profileId: "cdx1",
     expectedSequence: null,
-    sessionData: JSON.stringify({
-      version: 1, email: "user@example.com", issuer: "https://auth.openai.com", subject: "sub-1", clientId: "client-1",
-      extAgentHostId: "host-1", idToken: ID_TOKEN, accessToken: ACCESS_TOKEN, refreshToken: REFRESH_TOKEN,
-      tokenType: "Bearer", scopes: ["chatgpt.tokens.use.direct"], accessTokenExpiresAt: expiresAt, earliestRefreshAt: null,
-      savedAt: NOW - 1000,
-    }),
+    sessionData: serializeChatGptPlanRecord(makeChatGptPlanRecord({
+      idToken: ID_TOKEN, accessToken: ACCESS_TOKEN, refreshToken: REFRESH_TOKEN, accessTokenExpiresAt: expiresAt, savedAt: NOW - 1000,
+    })),
   });
   expect(r.ok).toBe(true);
 }
@@ -97,16 +92,18 @@ const call = (base: string, route: string, init: { method?: string; headers?: Re
   });
 
 beforeEach(async () => {
-  dbPath = path.join(os.tmpdir(), `model-auth-routes-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  vi.resetModules();
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  dedup.getDb();
-  const own = await import("../model-session-ownership.js");
-  const storeMod = await import("../model-session-store.js");
-  routesMod = await import("../model-auth-routes.js");
+  const modules = (await testDb({
+    modules: {
+      dedup: () => import("../dedup.js"),
+      own: () => import("../model-session-ownership.js"),
+      storeMod: () => import("../model-session-store.js"),
+      routesMod: () => import("../model-auth-routes.js"),
+    },
+  })).modules;
+  ({ dedup, routesMod } = modules);
+  const { own, storeMod } = modules;
   const sessionStore = storeMod.createModelSessionStore({
-    keys: { current: () => ({ keyId: "k1", key: KEY }), get: (id) => (id === "k1" ? KEY : undefined) },
+    keys: createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: "synthetic-routes-secret" }),
     verifyOwner: own.sessionOwnerVerifier,
     authorizeOperator: () => false,
     db: () => dedup.getDb(),
@@ -138,8 +135,6 @@ afterEach(async () => {
   errSpy.mockRestore();
   await new Promise<void>((r) => (server ? server.close(() => r()) : r()));
   server = undefined;
-  dedup.closeDb();
-  for (const suffix of ["", "-wal", "-shm"]) fs.rmSync(dbPath + suffix, { force: true });
 });
 
 function noLeak() {

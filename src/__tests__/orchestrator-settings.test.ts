@@ -1,30 +1,21 @@
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DedupModule from "../dedup.js";
-import type * as RunnerModeModule from "../runner-mode.js";
 import type * as OrchestratorSettingsModule from "../orchestrator-settings.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
-let runnerMode: typeof RunnerModeModule;
 let settings: typeof OrchestratorSettingsModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `orch-settings-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  runnerMode = await import("../runner-mode.js");
-  settings = await import("../orchestrator-settings.js");
-  runnerMode.initSettingsTable();
+  ({ dedup, settings } = (await testDb({
+    modules: { dedup: () => import("../dedup.js"), settings: () => import("../orchestrator-settings.js") },
+  })).modules);
 });
 
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
-});
+// A database that never had initSettingsTable() run against it, so every settings query throws.
+async function settingsWithoutTable(): Promise<typeof OrchestratorSettingsModule> {
+  return (await testDb({ tables: "none", modules: { settings: () => import("../orchestrator-settings.js") } })).modules.settings;
+}
 
 describe("getOrchestratorSettings", () => {
   it("returns nulls when no DB entries exist", () => {
@@ -40,12 +31,7 @@ describe("getOrchestratorSettings", () => {
   });
 
   it("returns nulls gracefully when table does not exist yet", async () => {
-    vi.resetModules();
-    const dbPath2 = path.join(os.tmpdir(), `orch-settings-notable-${Date.now()}.sqlite`);
-    process.env.DEDUP_DB_PATH = dbPath2;
-    const dedup2 = await import("../dedup.js");
-    const settings2 = await import("../orchestrator-settings.js");
-    const result = settings2.getOrchestratorSettings();
+    const result = (await settingsWithoutTable()).getOrchestratorSettings();
     expect(result).toEqual({
       flySessionsApp: null,
       flySessionsRegion: null,
@@ -54,8 +40,6 @@ describe("getOrchestratorSettings", () => {
       linearPickupLabel: null,
       runnerImageAllowedPrefixes: null,
     });
-    dedup2.closeDb();
-    try { fs.unlinkSync(dbPath2); } catch { /* ignore */ }
   });
 });
 
@@ -118,15 +102,8 @@ describe("getLinearPickupLabel", () => {
   });
 
   it("returns the default when the settings table does not exist", async () => {
-    vi.resetModules();
-    const dbPath2 = path.join(os.tmpdir(), `orch-settings-notable-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-    process.env.DEDUP_DB_PATH = dbPath2;
-    const dedup2 = await import("../dedup.js");
-    const settings2 = await import("../orchestrator-settings.js");
-    // Deliberately skip runnerMode.initSettingsTable() so the query throws and the catch returns the default.
-    expect(settings2.getLinearPickupLabel()).toBe("AI-Implement");
-    dedup2.closeDb();
-    try { fs.unlinkSync(dbPath2); } catch { /* ignore */ }
+    // The query throws and the catch returns the default.
+    expect((await settingsWithoutTable()).getLinearPickupLabel()).toBe("AI-Implement");
   });
 });
 
@@ -198,16 +175,9 @@ describe("getRetryPolicy", () => {
   });
 
   it("returns defaults when the database throws (settings table missing)", async () => {
-    vi.resetModules();
-    const dbPath2 = path.join(os.tmpdir(), `orch-settings-notable-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-    process.env.DEDUP_DB_PATH = dbPath2;
-    const dedup2 = await import("../dedup.js");
-    const settings2 = await import("../orchestrator-settings.js");
-    // Deliberately skip runnerMode.initSettingsTable() so the `settings` table
-    // does not exist — getRetryPolicy's query throws and the catch returns defaults.
+    // getRetryPolicy's query throws and the catch returns defaults.
+    const settings2 = await settingsWithoutTable();
     expect(settings2.getRetryPolicy()).toEqual(settings2.DEFAULT_RETRY_POLICY);
-    dedup2.closeDb();
-    try { fs.unlinkSync(dbPath2); } catch { /* ignore */ }
   });
 });
 
@@ -396,15 +366,7 @@ describe("getRunnerImageAllowedPrefixes", () => {
   });
 
   it("returns [] when the database read throws", async () => {
-    vi.resetModules();
-    const dbPath2 = path.join(os.tmpdir(), `orch-settings-notable-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-    process.env.DEDUP_DB_PATH = dbPath2;
-    const dedup2 = await import("../dedup.js");
-    const settings2 = await import("../orchestrator-settings.js");
-    // initSettingsTable() deliberately skipped so the query throws.
-    expect(settings2.getRunnerImageAllowedPrefixes()).toEqual([]);
-    dedup2.closeDb();
-    try { fs.unlinkSync(dbPath2); } catch { /* ignore */ }
+    expect((await settingsWithoutTable()).getRunnerImageAllowedPrefixes()).toEqual([]);
   });
 });
 

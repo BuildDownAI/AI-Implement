@@ -1,8 +1,9 @@
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { makeDevHarnessCliDeps, makeDevRunHandle } from "./helpers/fixtures/dev-harness.js";
+import { testDir } from "./helpers/test-dir.js";
 
 const control = vi.hoisted(() => ({ onDockerLogs: () => undefined as void }));
 
@@ -22,46 +23,23 @@ vi.mock("node:child_process", async (importOriginal) => {
   };
 });
 
-import { runDevHarnessCli, type DevHarnessCliDependencies } from "../dev-harness/cli.js";
-import { collectRunArtifacts, type DevRunHandle } from "../dev-harness/index.js";
+import { runDevHarnessCli } from "../dev-harness/cli.js";
+import { collectRunArtifacts } from "../dev-harness/index.js";
 
 describe("cancellation arriving while artifacts are collected", () => {
   let dir: string;
-  beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "collect-cancel-")); });
-  afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
-
-  function handle(): DevRunHandle {
-    return {
-      runId: "run-1",
-      containerId: "container-123456789",
-      containerName: "dev-container",
-      artifactsDir: dir,
-      startedAt: new Date(),
-      task: { identifier: "DEV-1", title: "T", description: "T" },
-      workspace: dir,
-      phase: "implementation",
-    } as DevRunHandle;
-  }
+  beforeEach(() => { dir = testDir("collect-cancel"); });
 
   for (const shell of [false, true]) {
     it(`records cancellation with the backend exit kept separate (${shell ? "shell" : "non-shell"})`, async () => {
       const controller = new AbortController();
       control.onDockerLogs = () => controller.abort();
-      const h = handle();
-      const deps: DevHarnessCliDependencies = {
-        startDevRun: vi.fn().mockResolvedValue(h),
-        streamLogs: vi.fn().mockResolvedValue(undefined),
-        streamLogsUntilShellReady: vi.fn().mockResolvedValue({ ready: false, exitCode: 0 }),
-        getRunStatus: vi.fn().mockResolvedValue({ status: "exited", running: false, exitCode: 0 }),
+      const h = makeDevRunHandle({ artifactsDir: dir, workspace: dir });
+      const deps = makeDevHarnessCliDeps({
+        startDevRun: vi.fn(async () => h),
         collectRunArtifacts,
-        stopSession: vi.fn().mockResolvedValue(undefined),
-        stopContainer: vi.fn().mockResolvedValue(undefined),
-        spawnDocker: vi.fn(),
-        writeStdout: vi.fn(),
-        writeStderr: vi.fn(),
-        now: () => Date.now(),
         cancelSignal: controller.signal,
-      };
+      });
       // Not aborted yet: cancellation lands only once collection is under way.
       const args = ["--workspace", dir, "--task", "/tmp/task.md", ...(shell ? ["--shell"] : [])];
       const code = await runDevHarnessCli(args, deps);

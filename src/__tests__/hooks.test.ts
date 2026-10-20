@@ -1,19 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 
 const isWindows = process.platform === "win32";
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { runHookScript } from "../pipeline/steps/hooks.js";
+import { testDir } from "./helpers/test-dir.js";
 
 let dir: string;
-beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "hook-")); });
+beforeEach(() => { dir = testDir("hooks"); });
 afterEach(() => {
-  try {
-    rmSync(dir, { recursive: true, force: true });
-  } catch {
-    // On Windows, bash-created files may be locked briefly after the process exits
-  }
   // Clean up env the hook scripts export, so a failing assertion mid-test can't
   // leak a var into other tests sharing this Vitest worker's process.env.
   for (const k of ["FOO_TEST_VAR", "SIMPLE_TEST_VAR", "MULTI_TEST_VAR", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "AI_IMPLEMENT_FORWARDED_SECRETS", "QA_BASE_URL", "QA_TOKEN"]) {

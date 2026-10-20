@@ -1,34 +1,13 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { testDb } from "./helpers/test-db.js";
 
-// dedup.ts freezes its DB path at import time, so each test sets a unique DEDUP_DB_PATH and
-// re-imports the modules fresh (the same isolation pattern admin-session.test.ts uses).
 let access: typeof import("../access-entries.js");
-let audit: typeof import("../access-audit.js");
 let dedup: typeof import("../dedup.js");
-let dbPath: string;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `access-entries-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  access = await import("../access-entries.js");
-  audit = await import("../access-audit.js");
-  dedup = await import("../dedup.js");
-  access.initAccessEntriesTable();
-  // saveAccessEntries records every write, so the audit table is a hard requirement here.
-  audit.initAccessAuditTable();
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
+  ({ access, dedup } = (
+    await testDb({ modules: { access: () => import("../access-entries.js"), dedup: () => import("../dedup.js") } })
+  ).modules);
 });
 
 function rawRow(kind: string, value: string) {

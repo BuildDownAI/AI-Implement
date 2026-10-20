@@ -1,26 +1,23 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
+import { describe, it, expect, beforeEach } from "vitest";
 import type * as LogModule from "../log.js";
 import type * as DedupModule from "../dedup.js";
+import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let log: typeof LogModule;
 let dedup: typeof DedupModule;
+let queue: typeof CommentGapfillQueueModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `jobs-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  log.initLogTable();
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  ({ dedup, log, queue } = (
+    await testDb({
+      modules: {
+        dedup: () => import("../dedup.js"),
+        log: () => import("../log.js"),
+        queue: () => import("../comment-gapfill-queue.js"),
+      },
+    })
+  ).modules);
 });
 
 describe("jobs table", () => {
@@ -36,7 +33,6 @@ describe("jobs table", () => {
   });
 
   it("re-enqueues a gap-fill run that failed at push, once (AII-922)", async () => {
-    const queue = await import("../comment-gapfill-queue.js");
     const prUrl = "https://github.com/org/repo/pull/7";
     const fail = (jobId: number) => {
       log.updateJobFailure(jobId, {
@@ -62,7 +58,6 @@ describe("jobs table", () => {
   });
 
   it("does not re-enqueue a gap-fill run that failed outside push or with a conflict (AII-922)", async () => {
-    const queue = await import("../comment-gapfill-queue.js");
     const prUrl = "https://github.com/org/repo/pull/8";
     const failAt = (rowId: number, stage: "push" | "implement", category: "auth" | "transient" | "conflict") => {
       queue.markCommentGapfillProcessed(rowId, "dispatched");

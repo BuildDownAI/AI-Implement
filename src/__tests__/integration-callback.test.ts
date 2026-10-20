@@ -1,41 +1,25 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
-import type * as DedupModule from "../dedup.js";
-import type * as LogModule from "../log.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
 import type * as RunnerCallbackModule from "../runner-callback.js";
 import { FakeProvider } from "./providers/fake.js";
+import { makeIssue } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 
 const SECRET = "integration-test-secret";
 
-let dbPath: string;
-let dedup: typeof DedupModule;
-let log: typeof LogModule;
 let runnerTokens: typeof RunnerTokensModule;
 let runnerCallback: typeof RunnerCallbackModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `integration-callback-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  runnerTokens = await import("../runner-tokens.js");
-  runnerCallback = await import("../runner-callback.js");
-  dedup.getDb();
-  // The callback handler now reads dispatch_log (planning job finalization);
-  // production always creates it at startup via initLogTable().
-  log.initLogTable();
+  ({ runnerTokens, runnerCallback } = (await testDb({
+    modules: {
+      runnerTokens: () => import("../runner-tokens.js"),
+      runnerCallback: () => import("../runner-callback.js"),
+    },
+  })).modules);
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   vi.restoreAllMocks();
 });
 
@@ -43,10 +27,7 @@ describe("dispatch → callback round-trip", () => {
   it("planning happy path: mint, simulated dispatch, runner POSTs back, status transitions", async () => {
     // 1. Set up a fake provider pre-populated with the issue so commentsFor() survives transition.
     const fake = new FakeProvider({
-      initialIssues: [{
-        id: "uuid-1", identifier: "ENG-1", title: "t", description: null,
-        scopeKey: "ENG", nativeStatus: "Todo (unstarted)",
-      }],
+      initialIssues: [makeIssue({ id: "uuid-1" })],
       recordCalls: true,
     });
 
@@ -97,10 +78,7 @@ describe("dispatch → callback round-trip", () => {
 
   it("implementation failure path: status transitions to Implementation Failed; no PR required", async () => {
     const fake = new FakeProvider({
-      initialIssues: [{
-        id: "uuid-2", identifier: "ENG-2", title: "t", description: null,
-        scopeKey: "ENG", nativeStatus: "In Progress (started)",
-      }],
+      initialIssues: [makeIssue({ id: "uuid-2", nativeStatus: "In Progress (started)" })],
       recordCalls: true,
     });
     const { token } = runnerTokens.mintRunToken({

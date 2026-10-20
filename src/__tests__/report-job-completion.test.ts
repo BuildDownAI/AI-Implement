@@ -1,15 +1,12 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
 import type * as BreakerModule from "../dispatch-breaker.js";
-import type * as ConfigModule from "../config.js";
 import type * as IndexModule from "../index.js";
-import type * as RegistryModule from "../providers/registry.js";
 import type * as DispatchAdmissionModule from "../dispatch-admission.js";
 import type { FailureRecord } from "../pipeline/failure-classification.js";
+import { makeAppConfig, makeRegistry } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 
 // Integration coverage for BAC-27134 round-one item 7c: reportJobCompletion must not
 // let a transient terminal failure count toward the dispatch breaker (a provider outage
@@ -18,46 +15,11 @@ import type { FailureRecord } from "../pipeline/failure-classification.js";
 // AII-791 coverage (below): a runner callback's own terminal write must not, by itself,
 // release the admission reservation it holds — only a verified backend termination may.
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let log: typeof LogModule;
 let breaker: typeof BreakerModule;
 let dispatchAdmission: typeof DispatchAdmissionModule;
-let configModule: typeof ConfigModule;
 let indexModule: typeof IndexModule;
-let registryModule: typeof RegistryModule;
-
-const mockConfig = {
-  githubAppId: "test-app-id",
-  githubAppPrivateKey: "test-private-key",
-  notifyWebhookUrl: null,
-  notifyType: "slack",
-  adminAccessCode: null,
-  oauthRedirectBaseUrl: null,
-  pollIntervalMs: 60_000,
-  healthPort: 8080,
-  flySessionsToken: null,
-  flySessionsApp: null,
-  flySessionsRegion: null,
-  flyOrchestratorApp: null,
-  flyDeployToken: null,
-  tenantId: null,
-  sessionImage: "test-image",
-  sessionImageStatus: "unset",
-  runnerImageExplicit: false,
-  anthropicApiKey: null,
-  claudeOAuthToken: null,
-  githubWebhookSecret: null,
-  reaperDryRun: true,
-  reaperAlertThreshold: 5,
-  runnerCallbackBaseUrl: null,
-  runnerTokenSecret: null,
-  localRunnerImage: "test-local-image",
-  localRunnerOrchestratorUrl: null,
-  kgSidecarUrl: null,
-  kgSourceRepo: null,
-  selfDeployTarget: null,
-} as unknown as IndexModule.AppConfig;
 
 function makeFailure(category: FailureRecord["category"]): FailureRecord {
   return {
@@ -72,35 +34,26 @@ function makeFailure(category: FailureRecord["category"]): FailureRecord {
 }
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `report-job-completion-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
   delete process.env.DISPATCH_BREAKER_THRESHOLD;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  breaker = await import("../dispatch-breaker.js");
-  configModule = await import("../config.js");
-  registryModule = await import("../providers/registry.js");
-  indexModule = await import("../index.js");
-  dispatchAdmission = await import("../dispatch-admission.js");
-  log.initLogTable();
-  breaker.initDispatchBreakerTable();
-  configModule.initMappingsTable();
+  ({ dedup, log, breaker, indexModule, dispatchAdmission } = (
+    await testDb({
+      modules: {
+        dedup: () => import("../dedup.js"),
+        log: () => import("../log.js"),
+        breaker: () => import("../dispatch-breaker.js"),
+        indexModule: () => import("../index.js"),
+        dispatchAdmission: () => import("../dispatch-admission.js"),
+      },
+    })
+  ).modules);
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   delete process.env.DISPATCH_BREAKER_THRESHOLD;
 });
 
-function makeRegistry(): RegistryModule.ProviderRegistry {
-  return new registryModule.ProviderRegistry({} as never, () => configModule.getMappings());
-}
-
 async function runReportOnce(): Promise<void> {
-  const registry = makeRegistry();
-  await indexModule.reportJobCompletion(mockConfig, registry);
+  await indexModule.reportJobCompletion(makeAppConfig(), makeRegistry());
 }
 
 describe("reportJobCompletion breaker integration (BAC-27134)", () => {

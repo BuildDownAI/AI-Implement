@@ -3,9 +3,6 @@
 //
 // Run with `npm run test:restate` (binary runtime, no Docker); excluded from `npm test`.
 import { randomUUID } from "node:crypto";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { serializeChatGptPlanRecord, parseChatGptPlanRecord, type ChatGptPlanRecordV1 } from "../../chatgpt-plan-token.js";
@@ -14,6 +11,8 @@ import { closeDb } from "../../dedup.js";
 import { createModelSessionStore } from "../../model-session-store.js";
 import { createModelSessionKeyProvider } from "../../model-session-keys.js";
 import { createChatGptPlanAccount, type ChatGptPlanRefreshResult } from "../../restate/chatgpt-plan-account.js";
+import { makeChatGptPlanRecord } from "../helpers/builders.js";
+import { fakeFetch, type FakeFetch } from "../helpers/fake-fetch.js";
 import { VARIANTS, callObject, eventually, journalEntries, journalText, queryInvocations, startVariants, stopAll } from "./harness.js";
 
 const SENTINEL_ACCESS = "SENTINEL-ACCESS-TOKEN-xyz";
@@ -23,24 +22,12 @@ const NEW_REFRESH = "SENTINEL-NEW-REFRESH-TOKEN-xyz";
 const HOUR = 60 * 60_000;
 
 function record(overrides: Partial<ChatGptPlanRecordV1> = {}): ChatGptPlanRecordV1 {
-  const now = Date.now();
-  return {
-    version: 1,
-    email: "ada@example.com",
-    issuer: "https://auth.openai.com",
-    subject: "sub-1",
-    clientId: "app_client",
-    extAgentHostId: "host-1",
-    idToken: "id-token",
+  return makeChatGptPlanRecord({
     accessToken: SENTINEL_ACCESS,
     refreshToken: SENTINEL_REFRESH,
-    tokenType: "Bearer",
-    scopes: ["chatgpt.tokens.use.direct"],
-    accessTokenExpiresAt: now + 5 * 60_000, // inside the 10 minute window: refresh due
-    earliestRefreshAt: null,
-    savedAt: now,
+    accessTokenExpiresAt: Date.now() + 5 * 60_000, // inside the 10 minute window: refresh due
     ...overrides,
-  };
+  });
 }
 
 /** In-memory stand-in for the store's plan-record methods, with the same compare-and-set rule. */
@@ -66,18 +53,20 @@ function fakeStore() {
 }
 
 type FetchPlan = { status: number; body: unknown } | "throw";
-function fakeFetch(plan: FetchPlan, expiresInSec = 3600) {
-  const calls: string[] = [];
-  const impl = (async (_url: unknown, init?: RequestInit) => {
-    calls.push(String((init?.body as URLSearchParams | undefined)?.get("refresh_token")));
-    if (plan === "throw") throw new Error("network down");
-    const body = plan.status === 200
-      ? { access_token: NEW_ACCESS, refresh_token: NEW_REFRESH, expires_in: expiresInSec, scope: "chatgpt.tokens.use.direct" }
-      : plan.body;
-    return new Response(JSON.stringify(body), { status: plan.status });
-  }) as typeof fetch;
-  return { calls, impl };
+/** OpenAI's token endpoint answering by `plan`: a 200 rotates the tokens, as a refresh does. */
+function tokenEndpoint(plan: FetchPlan, expiresInSec = 3600): FakeFetch {
+  return fakeFetch({
+    "POST /api/accounts/oauth/token": () => {
+      if (plan === "throw") throw new Error("network down");
+      return plan.status === 200
+        ? { json: { access_token: NEW_ACCESS, refresh_token: NEW_REFRESH, expires_in: expiresInSec, scope: "chatgpt.tokens.use.direct" } }
+        : { status: plan.status, json: plan.body };
+    },
+  });
 }
+
+/** The refresh token each request to the token endpoint carried. */
+const refreshTokensSent = (openai: FakeFetch) => openai.calls.map((c) => new URLSearchParams(c.body).get("refresh_token"));
 
 function latest(rows: Array<{ data: string }>): ChatGptPlanRecordV1 {
   const parsed = parseChatGptPlanRecord(JSON.parse(rows[rows.length - 1]!.data));
@@ -87,18 +76,18 @@ function latest(rows: Array<{ data: string }>): ChatGptPlanRecordV1 {
 
 describe("ChatGptPlanAccount object", () => {
   let environments: Map<string, RestateEnvironment>;
-  const fake = fakeStore();
-  let current = { store: fake, fetch: fakeFetch({ status: 200, body: {} }) };
+  // Set by each test's setup(): the fake fetch is built inside the test, which owns its checks.
+  let current: { store: ReturnType<typeof fakeStore>; openai: FakeFetch } | undefined;
 
   beforeAll(async () => {
     // One object definition; each test swaps the store and fetch it closes over.
     const proxyStore = {
-      readPlanRecord: (...a: unknown[]) => (current.store.store.readPlanRecord as (...x: unknown[]) => SessionReadResult)(...a),
-      writePlanRecord: (...a: unknown[]) => (current.store.store.writePlanRecord as (...x: unknown[]) => SessionWriteResult)(...a),
+      readPlanRecord: (...a: unknown[]) => (current!.store.store.readPlanRecord as (...x: unknown[]) => SessionReadResult)(...a),
+      writePlanRecord: (...a: unknown[]) => (current!.store.store.writePlanRecord as (...x: unknown[]) => SessionWriteResult)(...a),
     } as unknown as ModelSessionStore;
     const object = createChatGptPlanAccount({
       store: proxyStore,
-      fetch: ((...a: Parameters<typeof fetch>) => current.fetch.impl(...a)) as typeof fetch,
+      fetch: ((...a: Parameters<typeof fetch>) => current!.openai.fetch(...a)) as typeof fetch,
       now: Date.now,
     });
     environments = await startVariants([object]);
@@ -111,9 +100,9 @@ describe("ChatGptPlanAccount object", () => {
   function setup(plan: FetchPlan, stored: ChatGptPlanRecordV1 | null, expiresInSec = 3600) {
     const store = fakeStore();
     if (stored) store.put(stored);
-    const f = fakeFetch(plan, expiresInSec);
-    current = { store, fetch: f };
-    return { store, f };
+    const openai = tokenEndpoint(plan, expiresInSec);
+    current = { store, openai };
+    return { store, openai };
   }
 
   const refreshCall = (env: RestateEnvironment, key: string) =>
@@ -130,33 +119,33 @@ describe("ChatGptPlanAccount object", () => {
 
     describe(label, () => {
       it("missing: no write, nothing scheduled", async () => {
-        const { f, store } = setup({ status: 200, body: {} }, null);
+        const { openai, store } = setup({ status: 200, body: {} }, null);
         const key = randomUUID();
         const res = await refreshCall(env(), key);
         expect(res).toEqual({ outcome: "missing", nextAt: null });
-        expect(f.calls).toHaveLength(0);
+        expect(openai.calls).toHaveLength(0);
         expect(store.rows).toHaveLength(0);
         expect(await invocations(env(), key)).toHaveLength(1);
       });
 
       it("fresh: no fetch, no write, next refresh scheduled", async () => {
         const rec = record({ accessTokenExpiresAt: Date.now() + 2 * HOUR });
-        const { f, store } = setup({ status: 200, body: {} }, rec);
+        const { openai, store } = setup({ status: 200, body: {} }, rec);
         const key = randomUUID();
         const res = await refreshCall(env(), key);
         expect(res.outcome).toBe("fresh");
         expect(res.nextAt).toBe(rec.accessTokenExpiresAt - 10 * 60_000);
-        expect(f.calls).toHaveLength(0);
+        expect(openai.calls).toHaveLength(0);
         expect(store.rows).toHaveLength(1);
         await eventually(() => invocations(env(), key), (rows) => rows.length === 2 && rows.some((r) => r.status === "scheduled"), { label: "scheduled refresh" });
       });
 
       it("refreshed: new sequence stored, nextAt from the new record", async () => {
-        const { f, store } = setup({ status: 200, body: {} }, record());
+        const { openai, store } = setup({ status: 200, body: {} }, record());
         const key = randomUUID();
         const res = await refreshCall(env(), key);
         expect(res.outcome).toBe("refreshed");
-        expect(f.calls).toEqual([SENTINEL_REFRESH]);
+        expect(refreshTokensSent(openai)).toEqual([SENTINEL_REFRESH]);
         expect(store.rows.map((r) => r.sequence)).toEqual([0, 1]);
         const saved = latest(store.rows);
         expect(saved.refreshToken).toBe(NEW_REFRESH);
@@ -225,11 +214,11 @@ describe("ChatGptPlanAccount object", () => {
       });
 
       it("two concurrent refresh calls make one OpenAI call", async () => {
-        const { f, store } = setup({ status: 200, body: {} }, record());
+        const { openai, store } = setup({ status: 200, body: {} }, record());
         const key = randomUUID();
         const [a, b] = await Promise.all([refreshCall(env(), key), refreshCall(env(), key)]);
         expect([a.outcome, b.outcome].sort()).toEqual(["fresh", "refreshed"]);
-        expect(f.calls).toHaveLength(1);
+        expect(openai.calls).toHaveLength(1);
         expect(store.rows).toHaveLength(2);
       });
 
@@ -259,8 +248,6 @@ describe("ChatGptPlanAccount object", () => {
 // AII-1355: the real store, keyed from RUNNER_TOKEN_SECRET, behind the same object.
 describe("ChatGptPlanAccount with the hosted session key", () => {
   const SECRET = "SENTINEL-RUNNER-TOKEN-SECRET-xyz";
-  const dbPath = path.join(os.tmpdir(), `chatgpt-plan-hosted-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  const previousDb = process.env.DEDUP_DB_PATH;
   let environments: Map<string, RestateEnvironment>;
   let fetchCalls = 0;
   const logs: string[] = [];
@@ -271,8 +258,8 @@ describe("ChatGptPlanAccount with the hosted session key", () => {
     authorizeOperator: () => false,
   });
 
+  // The store uses the database `dedup.ts` resolved at import: the Restate config's in-memory one.
   beforeAll(async () => {
-    process.env.DEDUP_DB_PATH = dbPath;
     for (const m of ["log", "info", "warn", "error"] as const) {
       vi.spyOn(console, m).mockImplementation((...a: unknown[]) => { logs.push(a.map(String).join(" ")); });
     }
@@ -289,10 +276,6 @@ describe("ChatGptPlanAccount with the hosted session key", () => {
     vi.restoreAllMocks();
     await stopAll(environments);
     closeDb();
-    if (previousDb === undefined) delete process.env.DEDUP_DB_PATH; else process.env.DEDUP_DB_PATH = previousDb;
-    for (const suffix of ["", "-wal", "-shm"]) {
-      try { fs.unlinkSync(dbPath + suffix); } catch { /* ignore */ }
-    }
   });
 
   const refreshCall = (env: RestateEnvironment, key: string) =>

@@ -6,17 +6,18 @@
  */
 import { execFileSync, type spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConfiguredRunError, prepareConfiguredRun } from "../run-autonomous.js";
-import { NOW, SENTINEL_BEARER, makeSnapshot } from "./configured-run-fixture.js";
-import { S_AMBIENT, S_CHATGPT, S_OPENAI, codexLoopback } from "./codex-composition-fixture.js";
+import { NOW, SENTINEL_BEARER, makeSnapshot } from "./helpers/fixtures/configured-run.js";
+import { S_AMBIENT, S_CHATGPT, S_OPENAI, codexLoopback } from "./helpers/fixtures/codex-composition.js";
 import { MODEL_AUTH_ROUTES } from "../model-auth-contract.js";
-import { GHA_CONTEXT, GHA_IMPLEMENT_WORKFLOWS, GHA_POLICY, ghaGrant, ghaRunStepEnv } from "./gha-handoff-fixture.js";
+import { GHA_CONTEXT, GHA_IMPLEMENT_WORKFLOWS, GHA_POLICY, ghaGrant, ghaRunStepEnv } from "./helpers/fixtures/gha-handoff.js";
 import type { InvokeParams } from "../pipeline/types.js";
+import { makeExecutor } from "./helpers/builders.js";
+import { testDir } from "./helpers/test-dir.js";
 
 const FLAG = "--dangerously-bypass-approvals-and-sandbox";
 const CANARIES = {
@@ -82,7 +83,7 @@ function scriptedSpawn(scripts: Array<{ stdout: string[]; exitCode: number; hang
 
 let workspace: string;
 beforeEach(() => {
-  workspace = mkdtempSync(join(tmpdir(), "policy-ws-"));
+  workspace = testDir("policy-ws");
   execFileSync("git", ["init", "-q"], { cwd: workspace });
   execFileSync("git", ["remote", "add", "origin", `https://x-access-token:${REMOTE_CANARY}@github.com/acme/app.git`], { cwd: workspace });
   vi.spyOn(console, "log").mockImplementation(() => {});
@@ -90,7 +91,6 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
-  rmSync(workspace, { recursive: true, force: true });
 });
 
 type Opts = { policy?: unknown; context?: unknown; env?: Record<string, string>; authMode?: "codex-subscription" | "openai-api-key"; scripts?: Array<{ stdout: string[]; exitCode: number }>; admission?: () => ReturnType<typeof admitted> };
@@ -179,10 +179,10 @@ for (const file of GHA_IMPLEMENT_WORKFLOWS) {
 
     it("review on a Claude-selected stage never reaches the Codex bypass path", async () => {
       const { run } = await compose(file, { policy: GHA_POLICY });
-      const claude = vi.fn(async () => ({ stdout: "", stderr: "", exitCode: 0, tokensUsed: 0 }));
-      const executor = run.createExecutor({ workspaceDir: workspace, legacy: { invoke: claude } as never, logLevel: "summary" });
+      const claude = makeExecutor();
+      const executor = run.createExecutor({ workspaceDir: workspace, legacy: claude, logLevel: "summary" });
       await executor.invoke({ prompt: "p", model: "m", stage: "review", agentStage: "review" });
-      expect(claude).toHaveBeenCalledTimes(1);
+      expect(claude.invoke).toHaveBeenCalledTimes(1);
     });
 
     it("default: no policy keeps workspace-write and no admission probe runs", async () => {
@@ -274,7 +274,7 @@ for (const file of GHA_IMPLEMENT_WORKFLOWS) {
 
 describe("planning workflow", () => {
   it("rejects a credentials namespace carrying the policy: planning can never be granted it", async () => {
-    const { GHA_PLAN_WORKFLOWS } = await import("./gha-handoff-fixture.js");
+    const { GHA_PLAN_WORKFLOWS } = await import("./helpers/fixtures/gha-handoff.js");
     for (const file of GHA_PLAN_WORKFLOWS) {
       const snapshot = makeSnapshot();
       const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: GHA_CONTEXT, policy: GHA_POLICY, callback: false });

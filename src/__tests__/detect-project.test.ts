@@ -1,12 +1,12 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 
 const isWindows = process.platform === "win32";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
+import { testDir } from "./helpers/test-dir.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -42,19 +42,7 @@ function parseOutput(stdout: string): Record<string, string> {
 let tmpDir: string;
 
 beforeEach(() => {
-  tmpDir = join(
-    tmpdir(),
-    `detect-project-test-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-  );
-  mkdirSync(tmpDir, { recursive: true });
-});
-
-afterEach(() => {
-  try {
-    rmSync(tmpDir, { recursive: true, force: true });
-  } catch {
-    // On Windows, bash-created files may be locked briefly after the process exits
-  }
+  tmpDir = testDir("detect-project");
 });
 
 // ── 1. Auto-detection: package.json with 'dev' script ─────────────────────────

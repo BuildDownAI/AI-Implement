@@ -9,6 +9,7 @@ import {
 } from "../local-docker.js";
 import type { LocalRunnerInput } from "../local-docker.js";
 import { encodeRunConfig, decodeRunConfig, decodeTrustedRunConfig, type RunConfigV1 } from "../run-config.js";
+import { testTempRoot } from "./helpers/test-dir.js";
 
 const baseInput: LocalRunnerInput = {
   image: "ai-implement-runner:local",
@@ -233,6 +234,8 @@ describe("buildDockerRunArgs default name", () => {
 
 describe("startLocalRunnerContainer", () => {
   it("calls the launch marker only after local preparation succeeds", async () => {
+    // The secret env file's directory is created under os.tmpdir(), which reads the temp variables per call.
+    testTempRoot("local-docker");
     let marked = false;
     await expect(startLocalRunnerContainer({
       ...baseInput,

@@ -13,8 +13,7 @@
 import { buildKgRefreshRunConfig } from "../../run-config.js";
 import { randomUUID } from "node:crypto";
 import { execSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as restate from "@restatedev/restate-sdk";
@@ -43,6 +42,7 @@ import {
   type KgRefreshReportBody,
 } from "../../restate/kg-refresh-workflow.js";
 import { queryNonCompletedInvocations } from "../../restate/endpoint.js";
+import { testDir } from "../helpers/test-dir.js";
 import { registerOwnedRunContract } from "./owned-run-contract.js";
 import {
   VARIANTS, attachInvocation, attachWorkflow, awaitSentInvocations, callObject, callService, callWorkflow, cancelInvocation, eventually, gate, killInvocation, queryInvocations, replaceEndpoint, setObjectStates, settle,
@@ -69,7 +69,7 @@ const WATCH_INTERVAL_MS = 100;
 
 /** extractSource strips one leading path component, so wrap the fixture in a top-level dir — copied from src/__tests__/kg-refresh-rail.test.ts. */
 function makeTarball(dir: string): Buffer {
-  const wrap = mkdtempSync(join(tmpdir(), "kgwftar-"));
+  const wrap = testDir("kgwftar");
   const top = join(wrap, "repo");
   mkdirSync(top, { recursive: true });
   execSync(`cp -R ${dir}/. ${top}/`);
@@ -263,8 +263,8 @@ describe("KgRefresh durable workflow", () => {
   };
 
   beforeEach(() => {
-    dataRoot = mkdtempSync(join(tmpdir(), "kgwfroot-"));
-    fixtureRepo = mkdtempSync(join(tmpdir(), "kgwfrepo-"));
+    dataRoot = testDir("kgwfroot");
+    fixtureRepo = testDir("kgwfrepo");
     writeFileSync(join(fixtureRepo, "sources.yml"), `namespace: ${NAMESPACE}\n`);
     mkdirSync(join(fixtureRepo, "snapshot"), { recursive: true });
     writeFileSync(join(fixtureRepo, "snapshot", "embeddings.npz"), "vectors");
@@ -313,8 +313,6 @@ describe("KgRefresh durable workflow", () => {
   });
 
   afterEach(() => {
-    rmSync(dataRoot, { recursive: true, force: true });
-    rmSync(fixtureRepo, { recursive: true, force: true });
     delete process.env.KG_SIDECAR_URL;
   });
 

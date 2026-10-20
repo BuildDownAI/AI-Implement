@@ -1,24 +1,17 @@
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createModelProtectedSecrets } from "../model-protected-secrets.js";
 import type * as AdminModule from "../admin.js";
-import type * as AdminSessionModule from "../admin-session.js";
-import type * as AccessEntriesModule from "../access-entries.js";
-import type * as ConfigModule from "../config.js";
-import type * as DedupModule from "../dedup.js";
-import type * as RunnerModeModule from "../runner-mode.js";
-import type * as LogModule from "../log.js";
-import type * as StepLogModule from "../step-log.js";
-import type * as InstallStateModule from "../github-install-state.js";
-import type * as WorkflowSyncQueueModule from "../workflow-sync-queue.js";
 import { FakeProvider } from "./providers/fake.js";
-import type { TicketIssue } from "../providers/types.js";
 import type { ProviderRegistry } from "../providers/registry.js";
+import { makeIssue, makeRegistry, makeScopedInstallationToken } from "./helpers/builders.js";
+import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
+import { testDb, type LoadedModules, type TestDb } from "./helpers/test-db.js";
+import { testDir } from "./helpers/test-dir.js";
 
-const notifyTextMock = vi.hoisted(() => vi.fn(async () => {}));
+const notifyTextMock = vi.hoisted(() => vi.fn(async (_webhookUrl: string, _message: string) => {}));
 vi.mock("../notify.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../notify.js")>()),
   notifyText: notifyTextMock,
@@ -27,11 +20,19 @@ vi.mock("../notify.js", async (importOriginal) => ({
 const fetchMachineLogsMock = vi.hoisted(() => vi.fn<() => Promise<string>>());
 const destroyMachineMock = vi.hoisted(() => vi.fn(async () => {}));
 const listMachinesMock = vi.hoisted(() => vi.fn<() => Promise<import("../fly-machines.js").Machine[]>>(async () => []));
+// An issue run's session machine as Fly's API returns it, created a minute ago; its age is what a destroy records.
+const getMachineMock = vi.hoisted(() => vi.fn(async (_t: string, _a: string, id: string): Promise<import("../fly-machines.js").Machine> => {
+  const createdAt = new Date(Date.now() - 60_000).toISOString();
+  return {
+    id, name: `session-${id}`, state: "stopped", region: "iad", created_at: createdAt, updated_at: createdAt,
+    config: { image: "registry.fly.io/ai-implement-sessions:latest", metadata: {} },
+  };
+}));
 vi.mock("../fly-machines.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../fly-machines.js")>()),
   fetchMachineLogs: fetchMachineLogsMock,
   destroyMachine: destroyMachineMock,
-  getMachine: vi.fn(async (_t: string, _a: string, id: string) => ({ id, state: "stopped", config: { metadata: {} } })),
+  getMachine: getMachineMock,
   listMachines: listMachinesMock,
 }));
 
@@ -70,7 +71,9 @@ vi.mock("../deploy.js", async (importOriginal) => {
     extractSource: extractSourceMock,
   };
 });
-const getInstallationTokenMock = vi.hoisted(() => vi.fn().mockResolvedValue("gh-token-mock"));
+const getInstallationTokenMock = vi.hoisted(() =>
+  vi.fn<typeof import("../github-app-auth.js").getInstallationToken>(async () => "gh-token-mock"),
+);
 vi.mock("../github-app-auth.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../github-app-auth.js")>()),
   mintSourceTokenOrJwt: mintSourceTokenOrJwtMock,
@@ -80,7 +83,7 @@ vi.mock("../github-app-auth.js", async (importOriginal) => ({
 
 const listRepoBranchesAndTagsMock = vi.hoisted(() => vi.fn());
 const getRepoDefaultBranchMock = vi.hoisted(() => vi.fn());
-const cancelWorkflowRunMock = vi.hoisted(() => vi.fn().mockResolvedValue(true));
+const cancelWorkflowRunMock = vi.hoisted(() => vi.fn(async () => true));
 vi.mock("../github.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../github.js")>()),
   listRepoBranchesAndTags: listRepoBranchesAndTagsMock,
@@ -149,56 +152,60 @@ class MockResponse {
   }
 }
 
-let dbPath: string;
-let admin: typeof AdminModule;
-let config: typeof ConfigModule;
-let dedup: typeof DedupModule;
-let runnerMode: typeof RunnerModeModule;
-let log: typeof LogModule;
-let stepLog: typeof StepLogModule;
-let installState: typeof InstallStateModule;
-let queue: typeof WorkflowSyncQueueModule;
-let adminSession: typeof AdminSessionModule;
-let accessEntries: typeof AccessEntriesModule;
-let accessAudit: typeof import("../access-audit.js");
-let accessGrants: typeof import("../access-page-grants.js");
+const loaders = {
+  admin: () => import("../admin.js"),
+  adminSession: () => import("../admin-session.js"),
+  accessEntries: () => import("../access-entries.js"),
+  accessAudit: () => import("../access-audit.js"),
+  accessGrants: () => import("../access-page-grants.js"),
+  config: () => import("../config.js"),
+  dedup: () => import("../dedup.js"),
+  log: () => import("../log.js"),
+  installState: () => import("../github-install-state.js"),
+  queue: () => import("../workflow-sync-queue.js"),
+  dispatchBreaker: () => import("../dispatch-breaker.js"),
+  dispatchAdmission: () => import("../dispatch-admission.js"),
+  orchestratorSettings: () => import("../orchestrator-settings.js"),
+  filesystemProvider: () => import("../providers/filesystem.js"),
+  deployHold: () => import("../deploy-hold.js"),
+  deployPolicy: () => import("../deploy-policy.js"),
+  deployNotify: () => import("../deploy-notify.js"),
+  retention: () => import("../restate/retention.js"),
+  githubErrors: () => import("../github-errors.js"),
+  toolsClient: () => import("../restate/tools-client.js"),
+  agentConfigStore: () => import("../agent-config-store.js"),
+};
+
+type Modules = LoadedModules<typeof loaders>;
+
+let db: TestDb<typeof loaders>;
+let modules: Modules;
+let admin: Modules["admin"];
+let config: Modules["config"];
+let dedup: Modules["dedup"];
+let log: Modules["log"];
+let installState: Modules["installState"];
+let queue: Modules["queue"];
+let adminSession: Modules["adminSession"];
+let accessEntries: Modules["accessEntries"];
+let accessAudit: Modules["accessAudit"];
+let accessGrants: Modules["accessGrants"];
 let provider: FakeProvider;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `admin-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
+  // Nothing here reaches the network: a test whose code does gets this empty table and fails.
+  fakeFetch({}).install();
+  // Armed per test by the KG-manifest tests; reset so one test's answers never reach the next.
+  for (const mock of [getScopedInstallationTokenMock, getRepoDefaultBranchMock, fetchRepoTarballMock, extractSourceMock]) mock.mockReset();
+  db = await testDb({ modules: loaders });
+  modules = db.modules;
+  ({ admin, config, dedup, log, installState, queue, adminSession, accessEntries, accessAudit, accessGrants } = modules);
   provider = new FakeProvider();
-  admin = await import("../admin.js");
-  adminSession = await import("../admin-session.js");
-  accessEntries = await import("../access-entries.js");
-  accessAudit = await import("../access-audit.js");
-  accessGrants = await import("../access-page-grants.js");
-  config = await import("../config.js");
-  dedup = await import("../dedup.js");
-  runnerMode = await import("../runner-mode.js");
-  log = await import("../log.js");
-  stepLog = await import("../step-log.js");
-  installState = await import("../github-install-state.js");
-  queue = await import("../workflow-sync-queue.js");
-  config.initMappingsTable();
-  log.initLogTable();
-  stepLog.initStepLogTable();
-  runnerMode.initSettingsTable();
-  accessEntries.initAccessEntriesTable();
-  accessAudit.initAccessAuditTable();
-  accessGrants.initAccessPageGrantsTable();
-  (await import("../dispatch-breaker.js")).initDispatchBreakerTable(); // /api/blockers reads park state
   // Every /api/* request re-checks the signed-in identity and requires Admin, and only a listed
   // address can be one — a domain-only list would admit the suite's identity as a user and 403 it.
   process.env.OAUTH_ALLOWED_DOMAINS = "eudoxus.ai";
   process.env.OAUTH_ALLOWED_EMAILS = "ada@eudoxus.ai";
   accessEntries.refreshEffectiveAllowlist();
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
 });
 
 function adminConfig(accessCode: string | null): Parameters<typeof admin.handleAdminRequest>[2] {
@@ -328,15 +335,7 @@ describe("admin auth", () => {
   it("session token survives a module reload (simulates server restart)", async () => {
     const token = await login("secret");
 
-    // Simulate a restart by reloading modules while keeping the same DB file
-    vi.resetModules();
-    const admin2 = await import("../admin.js");
-    const config2 = await import("../config.js");
-    const log2 = await import("../log.js");
-    const runnerMode2 = await import("../runner-mode.js");
-    config2.initMappingsTable();
-    log2.initLogTable();
-    runnerMode2.initSettingsTable();
+    const { admin: admin2 } = await db.reopen();
 
     const req = new MockRequest("/api/mappings", "GET", { authorization: `Bearer ${token}` });
     const res = new MockResponse();
@@ -356,14 +355,13 @@ describe("admin auth", () => {
     const token = await login("secret");
 
     // Manually expire the session in the DB
-    const { getDb } = await import("../dedup.js");
-    getDb().prepare("UPDATE admin_sessions SET expires_at = ? WHERE token = ?").run(Date.now() - 1, token);
+    dedup.getDb().prepare("UPDATE admin_sessions SET expires_at = ? WHERE token = ?").run(Date.now() - 1, token);
 
     const res = await request("/api/mappings", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(401);
 
     // Row should be deleted from DB
-    const row = getDb().prepare("SELECT * FROM admin_sessions WHERE token = ?").get(token);
+    const row = dedup.getDb().prepare("SELECT * FROM admin_sessions WHERE token = ?").get(token);
     expect(row).toBeUndefined();
   });
 });
@@ -2205,7 +2203,7 @@ describe("admin runner-mode", () => {
     await res.done;
     expect(res.statusCode).toBe(200);
     expect(notifyTextMock).toHaveBeenCalledTimes(1);
-    const [url, message] = notifyTextMock.mock.calls[0] as unknown as [string, string];
+    const [url, message] = notifyTextMock.mock.calls[0];
     expect(url).toBe("https://hooks.example/x");
     expect(message).toMatch(/default/);
     expect(message).toMatch(/fly/);
@@ -2372,8 +2370,9 @@ describe("admin kg materialize-mode", () => {
 });
 
 describe("admin kg refresh options removed (AII-1263)", () => {
+  // trigger_kg_refresh's answer to an accepted refresh (src/restate/tools.ts).
   const kgRefreshDeps = {
-    trigger: vi.fn(async (_opts?: { ref?: string; actorEmail?: string }) => ({ status: 202, body: { accepted: true } })),
+    trigger: vi.fn(async (_opts?: { ref?: string; actorEmail?: string }) => ({ status: 202, body: { refreshing: true, triggerId: "t-0" } })),
     status: vi.fn(),
     cancel: vi.fn(),
   };
@@ -2418,7 +2417,7 @@ describe("admin kg refresh options removed (AII-1263)", () => {
     expect(res.statusCode).toBe(202);
     expect(kgRefreshDeps.trigger).toHaveBeenCalledTimes(1);
     expect(kgRefreshDeps.trigger.mock.calls[0]).toHaveLength(0);
-    expect(JSON.parse(res.body)).toMatchObject({ accepted: true });
+    expect(JSON.parse(res.body)).toMatchObject({ refreshing: true });
   });
 
   it("POST /api/kg/refresh with { dryRun: false } is the real refresh", async () => {
@@ -2426,7 +2425,7 @@ describe("admin kg refresh options removed (AII-1263)", () => {
     const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: false });
     expect(res.statusCode).toBe(202);
     expect(kgRefreshDeps.trigger.mock.calls[0]).toHaveLength(0);
-    expect(JSON.parse(res.body)).toEqual({ accepted: true });
+    expect(JSON.parse(res.body)).toEqual({ refreshing: true, triggerId: "t-0" });
   });
 
   it("POST /api/kg/refresh with an invalid JSON body returns 400 and does not trigger", async () => {
@@ -2439,9 +2438,9 @@ describe("admin kg refresh options removed (AII-1263)", () => {
 
   it.each([
     [409, { error: "refresh-in-progress" }],
-    [501, { error: "kg-source-not-configured" }],
-    [422, { error: "preflight-failed", detail: "x" }],
-    [507, { error: "insufficient-storage" }],
+    [501, { error: "kg-source-repo-not-configured" }],
+    [422, { error: "preflight-failed", precondition: "preflight-failed", detail: "acme/kg — contents: read — HTTP 404" }],
+    [507, { error: "insufficient-storage", detail: "less than 209715200 bytes free on the volume" }],
   ])("POST /api/kg/refresh passes a %i tool answer through with its body (AII-901)", async (status, body) => {
     kgRefreshDeps.trigger.mockResolvedValueOnce({ status, body } as never);
     const token = await login("secret");
@@ -2492,10 +2491,16 @@ describe("admin kg refresh options removed (AII-1263)", () => {
   });
 });
 
-describe("admin secrets", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
+// Fly's GraphQL API, which carries app secrets (src/fly-machines.ts).
+const FLY_GRAPHQL = "POST /graphql";
 
+/** The variables of a Fly GraphQL request. */
+function flyVariables(fake: FakeFetch, index = 0): { input: { secrets?: Array<{ key: string; value: string }>; keys?: string[] } } {
+  expect(fake.calls[index].url.href).toBe("https://api.fly.io/graphql");
+  return JSON.parse(fake.calls[index].body).variables;
+}
+
+describe("admin secrets", () => {
   function secretsConfig(): Parameters<typeof admin.handleAdminRequest>[2] {
     return {
       adminAccessCode: "secret",
@@ -2539,7 +2544,6 @@ describe("admin secrets", () => {
   });
 
   it("GET secrets returns 404 for unknown team", async () => {
-    vi.mocked(fetch).mockResolvedValue({ ok: true, json: async () => [] } as Response);
     const token = await login("secret");
     const res = await requestFly("/api/mappings/NOPE/secrets", "GET", token);
     expect(res.statusCode).toBe(404);
@@ -2551,10 +2555,7 @@ describe("admin secrets", () => {
       { name: "ENG_STRIPE_KEY", digest: "def", createdAt: "2026-01-02T00:00:00Z" },
       { name: "OTHER_SECRET", digest: "ghi", createdAt: "2026-01-03T00:00:00Z" },
     ];
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: { app: { secrets: flySecrets } } }),
-    } as Response);
+    fakeFetch({ [FLY_GRAPHQL]: { json: { data: { app: { secrets: flySecrets } } } } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2568,10 +2569,7 @@ describe("admin secrets", () => {
   });
 
   it("POST secrets sets a secret with team prefix via GraphQL", async () => {
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: { setSecrets: { release: { version: 101 } } } }),
-    } as Response);
+    const fake = fakeFetch({ [FLY_GRAPHQL]: { json: { data: { setSecrets: { release: { version: 101 } } } } } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2580,16 +2578,12 @@ describe("admin secrets", () => {
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).name).toBe("DATABASE_URL");
 
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe("https://api.fly.io/graphql");
-    const body = JSON.parse((opts as RequestInit).body as string);
-    expect(body.variables.input.secrets[0].key).toBe("ENG_DATABASE_URL");
-    expect(body.variables.input.secrets[0].value).toBe("postgres://localhost/db");
+    const { input } = flyVariables(fake);
+    expect(input.secrets?.[0].key).toBe("ENG_DATABASE_URL");
+    expect(input.secrets?.[0].value).toBe("postgres://localhost/db");
   });
 
   it("POST secrets returns 400 when name is missing", async () => {
-    vi.mocked(fetch).mockResolvedValue({ ok: true } as Response);
-
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
 
@@ -2599,8 +2593,6 @@ describe("admin secrets", () => {
   });
 
   it("POST secrets returns 400 for invalid name characters", async () => {
-    vi.mocked(fetch).mockResolvedValue({ ok: true } as Response);
-
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
 
@@ -2610,10 +2602,7 @@ describe("admin secrets", () => {
   });
 
   it("POST secrets normalizes lowercase names to uppercase", async () => {
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: { setSecrets: { release: { version: 1 } } } }),
-    } as Response);
+    fakeFetch({ [FLY_GRAPHQL]: { json: { data: { setSecrets: { release: { version: 1 } } } } } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2624,10 +2613,7 @@ describe("admin secrets", () => {
   });
 
   it("DELETE secret unsets the team-prefixed secret via GraphQL", async () => {
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: { unsetSecrets: { release: { version: 102 } } } }),
-    } as Response);
+    const fake = fakeFetch({ [FLY_GRAPHQL]: { json: { data: { unsetSecrets: { release: { version: 102 } } } } } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2636,19 +2622,11 @@ describe("admin secrets", () => {
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).deleted).toBe(true);
 
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe("https://api.fly.io/graphql");
-    expect((opts as RequestInit).method).toBe("POST");
-    const body = JSON.parse((opts as RequestInit).body as string);
-    expect(body.variables.input.keys[0]).toBe("ENG_DATABASE_URL");
+    expect(flyVariables(fake).input.keys?.[0]).toBe("ENG_DATABASE_URL");
   });
 
   it("DELETE secret returns 404 when Fly returns HTTP 404 for unknown secret", async () => {
-    vi.mocked(fetch).mockResolvedValue({
-      ok: false,
-      status: 404,
-      text: async () => "not found",
-    } as Response);
+    fakeFetch({ [FLY_GRAPHQL]: { status: 404, text: "not found" } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2659,10 +2637,7 @@ describe("admin secrets", () => {
   });
 
   it("DELETE secret returns 404 when Fly GraphQL reports the secret was not found", async () => {
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      json: async () => ({ errors: [{ message: "Could not find secret ENG_NONEXISTENT" }] }),
-    } as Response);
+    fakeFetch({ [FLY_GRAPHQL]: { json: { errors: [{ message: "Could not find secret ENG_NONEXISTENT" }] } } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2791,8 +2766,7 @@ describe("admin settings", () => {
       return { status: "ok" as const, content: [{ type: "text", text: JSON.stringify(state) }] };
     });
     const refreshRunnerBackendCache = async () => {
-      const mod = await import("../orchestrator-settings.js");
-      await mod.refreshRunnerBackendCache({ readFlyMachines: async () => ({ ...state }) });
+      await modules.orchestratorSettings.refreshRunnerBackendCache({ readFlyMachines: async () => ({ ...state }) });
     };
     return { deps: { callTool: callTool as never, refreshRunnerBackendCache }, callTool, state };
   }
@@ -3005,9 +2979,6 @@ describe("admin settings", () => {
 });
 
 describe("admin global secrets", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   function globalSecretsConfig(): Parameters<typeof admin.handleAdminRequest>[2] {
     return {
       adminAccessCode: "secret",
@@ -3034,20 +3005,21 @@ describe("admin global secrets", () => {
   });
 
   it("GET lists secrets that have no team prefix", async () => {
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        data: {
-          app: {
-            secrets: [
-              { name: "ANTHROPIC_API_KEY", digest: "aaa", createdAt: "2026-01-01T00:00:00Z" },
-              { name: "ENG_DATABASE_URL",  digest: "bbb", createdAt: "2026-01-02T00:00:00Z" },
-              { name: "CLAUDE_CODE_OAUTH_TOKEN", digest: "ccc", createdAt: "2026-01-03T00:00:00Z" },
-            ],
+    fakeFetch({
+      [FLY_GRAPHQL]: {
+        json: {
+          data: {
+            app: {
+              secrets: [
+                { name: "ANTHROPIC_API_KEY", digest: "aaa", createdAt: "2026-01-01T00:00:00Z" },
+                { name: "ENG_DATABASE_URL",  digest: "bbb", createdAt: "2026-01-02T00:00:00Z" },
+                { name: "CLAUDE_CODE_OAUTH_TOKEN", digest: "ccc", createdAt: "2026-01-03T00:00:00Z" },
+              ],
+            },
           },
         },
-      }),
-    } as Response);
+      },
+    }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -3059,10 +3031,7 @@ describe("admin global secrets", () => {
   });
 
   it("POST sets a global secret", async () => {
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: { setSecrets: { release: { version: 5 } } } }),
-    } as Response);
+    fakeFetch({ [FLY_GRAPHQL]: { json: { data: { setSecrets: { release: { version: 5 } } } } } }).install();
 
     const token = await login("secret");
     const res = await requestFlyGlobal("/api/global-secrets", "POST", token, {
@@ -3092,10 +3061,7 @@ describe("admin global secrets", () => {
   });
 
   it("DELETE removes a global secret", async () => {
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: { unsetSecrets: { release: { version: 6 } } } }),
-    } as Response);
+    fakeFetch({ [FLY_GRAPHQL]: { json: { data: { unsetSecrets: { release: { version: 6 } } } } } }).install();
 
     const token = await login("secret");
     const res = await requestFlyGlobal("/api/global-secrets/ANTHROPIC_API_KEY", "DELETE", token);
@@ -3104,11 +3070,7 @@ describe("admin global secrets", () => {
   });
 
   it("DELETE returns 404 when Fly reports not found", async () => {
-    vi.mocked(fetch).mockResolvedValue({
-      ok: false,
-      text: async () => "could not find secret",
-      status: 422,
-    } as Response);
+    fakeFetch({ [FLY_GRAPHQL]: { status: 422, text: "could not find secret" } }).install();
 
     const token = await login("secret");
     const res = await requestFlyGlobal("/api/global-secrets/NONEXISTENT", "DELETE", token);
@@ -3174,7 +3136,7 @@ describe("admin sessions", () => {
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
     log.appendLog({ issueId: "issue-s1", issueIdentifier: "ENG-7", issueTitle: "Mapped", teamKey: "ENG", repo: "org/repo", machineId: "machine-mapped" });
     log.appendLog({ issueId: "issue-s2", issueIdentifier: "ZZZ-1", issueTitle: "Unmapped", teamKey: "ZZZ", repo: "org/other", machineId: "machine-unmapped" });
-    const machine = (id: string) => ({ id, name: id, state: "started", region: "iad", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", config: {} as never });
+    const machine = (id: string) => ({ id, name: id, state: "started", region: "iad", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", config: { image: "registry.fly.io/test-sessions-app:latest" } });
     listMachinesMock.mockResolvedValueOnce([machine("machine-mapped"), machine("machine-unmapped"), machine("machine-orphan")]);
 
     const res = await requestWithConfig("/api/sessions", "GET", token, {
@@ -3298,7 +3260,7 @@ describe("admin job-detail endpoint", () => {
       issueId: "issue-detail",
       issueIdentifier: "ENG-99",
       issueTitle: "Detail test",
-      teamKey: "eng",
+      teamKey: "ENG",
       repo: "org/repo",
     });
     const res = await request(`/api/jobs/${id}/steps`, "GET", "secret", undefined, token);
@@ -3332,7 +3294,7 @@ describe("admin filesystem issue detail endpoint", () => {
   ): Promise<T> {
     const previousMode = process.env.RUNNER_MODE;
     process.env.RUNNER_MODE = "local";
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "admin-fs-issue-"));
+    const dir = testDir("admin-fs-issue");
     try {
       const token = await login("secret");
       await request("/api/mappings", "POST", "secret", {
@@ -3342,18 +3304,10 @@ describe("admin filesystem issue detail endpoint", () => {
         ticketingProvider: "filesystem",
         ticketingConfig: { kind: "filesystem", directory: dir },
       }, token);
-      const { FilesystemProvider } = await import("../providers/filesystem.js");
-      const { initDispatchBreakerTable } = await import("../dispatch-breaker.js");
-      initDispatchBreakerTable();
-      const fsProvider = new FilesystemProvider(() => config.getMappings());
-      const registry = {
-        forMapping: async () => fsProvider,
-        forAllMappings: async () => [fsProvider],
-        invalidate: () => {},
-      } as unknown as ProviderRegistry;
+      const fsProvider = new modules.filesystemProvider.FilesystemProvider(() => config.getMappings());
+      const registry = makeRegistry({ provider: fsProvider });
       return await run({ dir, registry, token });
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
       if (previousMode === undefined) delete process.env.RUNNER_MODE;
       else process.env.RUNNER_MODE = previousMode;
     }
@@ -3599,7 +3553,7 @@ describe("admin local job logs endpoint", () => {
 describe("admin dedup", () => {
   it("lists dedup entries", async () => {
     const token = await login("secret");
-    dedup.markDispatched("issue-1", "TEAM", "T-1", "Test issue");
+    dedup.markDispatched("issue-1", "TEAM", "TEAM-1", "Test issue");
     const res = await request("/api/dedup", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
     const entries = JSON.parse(res.body);
@@ -3609,7 +3563,7 @@ describe("admin dedup", () => {
 
   it("deletes a dedup entry", async () => {
     const token = await login("secret");
-    dedup.markDispatched("issue-del", "TEAM");
+    dedup.markDispatched("issue-del", "TEAM", "TEAM-2", "Dispatched issue");
     const del = await request("/api/dedup/issue-del", "DELETE", "secret", undefined, token);
     expect(del.statusCode).toBe(200);
     expect(dedup.isAlreadyDispatched("issue-del")).toBe(false);
@@ -3637,22 +3591,8 @@ describe("admin issues endpoint", () => {
   });
 
   it("returns 200 with shaped issues on success", async () => {
-    const ready: TicketIssue = {
-      id: "issue-1",
-      identifier: "CORE-100",
-      title: "Implement feature X",
-      description: null,
-      scopeKey: "CORE",
-      nativeStatus: "Todo (unstarted)",
-    };
-    const needsPlan: TicketIssue = {
-      id: "issue-2",
-      identifier: "CORE-50",
-      title: "Plan something",
-      description: null,
-      scopeKey: "CORE",
-      nativeStatus: "Backlog (backlog)",
-    };
+    const ready = makeIssue({ identifier: "CORE-100", scopeKey: "CORE" });
+    const needsPlan = makeIssue({ id: "issue-2", identifier: "CORE-50", scopeKey: "CORE" });
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
       readyForImplementation: [ready],
       needsPlanning: [needsPlan],
@@ -3678,8 +3618,8 @@ describe("admin issues endpoint", () => {
   it("resolves issueUrl through the team's ticketing provider, null for unmapped teams", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", planningWorkflowFile: "claude-plan.yml" }, token);
-    const mapped: TicketIssue = { id: "issue-1", identifier: "CORE-100", title: "Mapped", description: null, scopeKey: "CORE", nativeStatus: "Todo" };
-    const unmapped: TicketIssue = { id: "issue-2", identifier: "ZZZ-1", title: "Unmapped", description: null, scopeKey: "ZZZ", nativeStatus: "Todo" };
+    const mapped = makeIssue({ identifier: "CORE-100", scopeKey: "CORE" });
+    const unmapped = makeIssue({ id: "issue-2", identifier: "ZZZ-1", scopeKey: "ZZZ" });
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
       readyForImplementation: [mapped],
       needsPlanning: [unmapped],
@@ -3779,14 +3719,7 @@ describe("admin blockers endpoint", () => {
   });
 
   it("returns 200 with shape — no-mapping blocker when issue team has no mapping", async () => {
-    const issue: TicketIssue = {
-      id: "issue-1",
-      identifier: "CORE-100",
-      title: "Implement feature X",
-      description: null,
-      scopeKey: "CORE",
-      nativeStatus: "Todo (unstarted)",
-    };
+    const issue = makeIssue({ identifier: "CORE-100", scopeKey: "CORE" });
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
       readyForImplementation: [issue],
       needsPlanning: [],
@@ -3808,13 +3741,16 @@ describe("admin blockers endpoint", () => {
   it("lists a parked issue as parked for the phase it would run next, and no other phase", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", planningWorkflowFile: "claude-plan.yml" }, token);
-    const { initDispatchBreakerTable, parkIssue } = await import("../dispatch-breaker.js");
-    initDispatchBreakerTable();
-    const mk = (id: string, identifier: string): TicketIssue => ({ id, identifier, title: identifier, description: null, scopeKey: "CORE", nativeStatus: "Todo" });
-    parkIssue("impl-1", "implementation", "x");
-    parkIssue("plan-1", "planning", "x");
-    parkIssue("plan-2", "implementation", "x"); // wrong phase for a needsPlanning issue
-    dedup.markDispatched("impl-1", "TEAM", "CORE-1", "t"); // parked wins over dedup
+    // Planning and implementation park only through the breaker: the third failed run in a row parks the phase.
+    const { recordDispatchFailure } = modules.dispatchBreaker;
+    const park = (issueId: string, phase: string) => {
+      for (let run = 0; run < 3; run++) recordDispatchFailure(issueId, phase, "failure");
+    };
+    const mk = (id: string, identifier: string) => makeIssue({ id, identifier, scopeKey: "CORE" });
+    park("impl-1", "implementation");
+    park("plan-1", "planning");
+    park("plan-2", "implementation"); // wrong phase for a needsPlanning issue
+    dedup.markDispatched("impl-1", "CORE", "CORE-1", "CORE-1"); // parked wins over dedup
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
       readyForImplementation: [mk("impl-1", "CORE-1")],
       needsPlanning: [mk("plan-1", "CORE-2"), mk("plan-2", "CORE-3")],
@@ -3828,6 +3764,7 @@ describe("admin blockers endpoint", () => {
       ["CORE-1", "parked"],
       ["CORE-2", "parked"],
     ]);
+    expect(body.blockers[0].detail).toContain("Parked after 3 failed runs");
     expect(body.totals.byReason.parked).toBe(2);
   });
 
@@ -3838,7 +3775,7 @@ describe("admin blockers endpoint", () => {
       ticketingProvider: "jira",
       ticketingConfig: { kind: "jira", jql: "project = ENG", repoFieldValue: "org/eng" },
     }, token);
-    const linearIssue: TicketIssue = { id: "lin-1", identifier: "ENG-7", title: "Linear issue", description: null, scopeKey: "ENG", nativeStatus: "Todo" };
+    const linearIssue = makeIssue({ identifier: "ENG-7" });
     const snapshot = { readyForImplementation: [linearIssue], needsPlanning: [], inProgressCountsByScope: {}, parentsToFinalize: [] };
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValue(snapshot);
     const res = await request("/api/blockers", "GET", "secret", undefined, token);
@@ -3859,9 +3796,9 @@ describe("admin blockers endpoint", () => {
   it("resolves issueUrl through the team's ticketing provider; a no-mapping blocker has none", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", planningWorkflowFile: "claude-plan.yml" }, token);
-    const dedupBlocked: TicketIssue = { id: "issue-1", identifier: "CORE-100", title: "Already dispatched", description: null, scopeKey: "CORE", nativeStatus: "Todo" };
-    const unmapped: TicketIssue = { id: "issue-2", identifier: "ZZZ-1", title: "No mapping", description: null, scopeKey: "ZZZ", nativeStatus: "Todo" };
-    dedup.markDispatched("issue-1", "TEAM", "CORE-100", "Already dispatched");
+    const dedupBlocked = makeIssue({ identifier: "CORE-100", scopeKey: "CORE" });
+    const unmapped = makeIssue({ id: "issue-2", identifier: "ZZZ-1", scopeKey: "ZZZ" });
+    dedup.markDispatched("issue-1", "CORE", "CORE-100", "Already dispatched");
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
       readyForImplementation: [dedupBlocked, unmapped],
       needsPlanning: [],
@@ -3881,8 +3818,7 @@ describe("admin blockers endpoint", () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", maxInProgressAiIssues: 1, planningWorkflowFile: "claude-plan.yml" }, token);
 
-    const admission = await import("../dispatch-admission.js");
-    const acquired = admission.acquire({
+    const acquired = modules.dispatchAdmission.acquire({
       dispatchId: "res-core-1",
       mappingKey: "CORE",
       scope: { kind: "issue", issueScope: "CORE", issueId: "issue-held" },
@@ -3893,7 +3829,7 @@ describe("admin blockers endpoint", () => {
     });
     expect(acquired.ok).toBe(true);
 
-    const candidate: TicketIssue = { id: "issue-2", identifier: "CORE-2", title: "Needs a slot", description: null, scopeKey: "CORE", nativeStatus: "Todo" };
+    const candidate = makeIssue({ identifier: "CORE-2", scopeKey: "CORE" });
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
       readyForImplementation: [candidate],
       needsPlanning: [],
@@ -3916,8 +3852,7 @@ describe("admin blockers endpoint", () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", maxInProgressAiIssues: 1, planningWorkflowFile: "claude-plan.yml" }, token);
 
-    const admission = await import("../dispatch-admission.js");
-    const acquired = admission.acquire({
+    const acquired = modules.dispatchAdmission.acquire({
       dispatchId: "res-core-kg",
       mappingKey: "CORE",
       scope: { kind: "issue", issueScope: "CORE", issueId: "issue-kg" },
@@ -4039,7 +3974,7 @@ describe("admin log", () => {
 
 describe("classifyTemplate", () => {
   it("flags a body that curls api.linear.app/graphql with LINEAR_API_KEY as stale", async () => {
-    const { classifyTemplate } = await import("../admin.js");
+    const { classifyTemplate } = admin;
     const stale = `
       Post comments to Linear:
       curl -X POST https://api.linear.app/graphql \\
@@ -4050,21 +3985,21 @@ describe("classifyTemplate", () => {
   });
 
   it("flags a body with only api.linear.app/graphql but no LINEAR_API_KEY as current", async () => {
-    const { classifyTemplate } = await import("../admin.js");
+    const { classifyTemplate } = admin;
     // Mention of the URL alone (e.g. in a comment or doc) isn't enough.
     const body = "// Background: this used to call api.linear.app/graphql before runner-callback.";
     expect(classifyTemplate(body)).toBe("current");
   });
 
   it("flags a body with only LINEAR_API_KEY but no api.linear.app/graphql as current", async () => {
-    const { classifyTemplate } = await import("../admin.js");
+    const { classifyTemplate } = admin;
     // env var mentioned somewhere without a direct curl.
     const body = "LINEAR_API_KEY is set on the runner for other reasons.";
     expect(classifyTemplate(body)).toBe("current");
   });
 
   it("treats a body using the ai-output/comments convention as current", async () => {
-    const { classifyTemplate } = await import("../admin.js");
+    const { classifyTemplate } = admin;
     const body = `
       Write planning comments to ai-output/comments/01-analysis.md.
       Do NOT post to Linear directly.
@@ -4297,34 +4232,34 @@ describe("POST /api/tools/<name>", () => {
   }
 
   it("answers 409 deploy-in-progress with deployStartedAt and never contacts the ingress during a hold", async () => {
-    const { setDeployHold, clearDeployHold } = await import("../deploy-hold.js");
-    const { callTool } = await vi.importActual<typeof import("../restate/tools-client.js")>("../restate/tools-client.js");
-    const fetchImpl = vi.fn();
+    const { setDeployHold, clearDeployHold } = modules.deployHold;
+    const { callTool } = modules.toolsClient;
+    const fake = fakeFetch({});
     setDeployHold();
     try {
       const token = await login("secret");
       const res = await toolRequest(token, { args: {} }, {
-        callTool: (name, args, caller) => callTool(name, args, caller, { fetchImpl: fetchImpl as unknown as typeof fetch }),
+        callTool: (name, args, caller) => callTool(name, args, caller, { fetchImpl: fake.fetch }),
       });
       expect(res.statusCode).toBe(409);
       expect(JSON.parse(res.body)).toEqual({ error: "deploy-in-progress", deployStartedAt: expect.any(Number) });
-      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(fake.calls).toEqual([]);
     } finally {
       clearDeployHold();
     }
   });
 
   it.each([
-    ["a refused connection", () => Promise.reject(new Error("ECONNREFUSED"))],
-    ["a 5xx answer", () => Promise.resolve(new Response("boom", { status: 503 }))],
-  ])("answers 503 restate-unavailable with no hold and %s", async (_label, fetchResult) => {
-    const { callTool } = await vi.importActual<typeof import("../restate/tools-client.js")>("../restate/tools-client.js");
-    const fetchImpl = vi.fn(fetchResult);
+    ["a refused connection", () => { throw new Error("ECONNREFUSED"); }],
+    ["a 5xx answer", () => new Response("boom", { status: 503 })],
+  ])("answers 503 restate-unavailable with no hold and %s", async (_label, reply) => {
+    const { callTool } = modules.toolsClient;
+    const fake = fakeFetch({ "POST /orchestratorTools/get_tenant_health": reply });
     const token = await login("secret");
     const res = await toolRequest(token, { args: {} }, {
-      callTool: (name, args, caller) => callTool(name, args, caller, { fetchImpl: fetchImpl as unknown as typeof fetch, permitsExternalCall: () => true, restateReady: () => true }),
+      callTool: (name, args, caller) => callTool(name, args, caller, { fetchImpl: fake.fetch, permitsExternalCall: () => true, restateReady: () => true }),
     });
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fake.calls.map((call) => `${call.method} ${call.path}`)).toEqual(["POST /orchestratorTools/get_tenant_health"]);
     expect(res.statusCode).toBe(503);
     expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
   });
@@ -4647,13 +4582,17 @@ describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
 
   describe("GET /api/review-fix/attempts/:attemptId", () => {
     it("is reachable by a non-admin user session (reads are open, scope is enforced inside the facade)", async () => {
+      // The production facade answers not_found to any caller who is not an admin (createReviewFixAdminFacade).
+      const getAttempt = vi.fn(async (_attemptId: string, caller: { role: string }) =>
+        caller.role === "admin" ? { status: "ok" as const, attempt: ATTEMPT_DETAIL } : { status: "not_found" as const });
       const res = await requestWithDeps(
         "/api/review-fix/attempts/attempt-1",
         "GET",
         userSession(),
-        { reviewFixAttempts: fakeFacade({ getAttempt: async () => ({ status: "ok", attempt: ATTEMPT_DETAIL }) }) },
+        { reviewFixAttempts: fakeFacade({ getAttempt }) },
       );
-      expect(res.statusCode).toBe(200);
+      expect(getAttempt).toHaveBeenCalledWith("attempt-1", expect.objectContaining({ role: "user" }));
+      expect(res.statusCode).toBe(404);
     });
 
     it("returns the attempt detail with explicit evidenceComplete/terminationConfirmed fields, never omitted", async () => {
@@ -5115,8 +5054,7 @@ describe("GET /api/deployment-status", () => {
   it("reports the hold and what is still executing", async () => {
     // Held with work executing is the draining state the page names, and the counts
     // come from the same inventory the deploy itself waits on.
-    const { setDeployHold } = await import("../deploy-hold.js");
-    setDeployHold();
+    modules.deployHold.setDeployHold();
     const { id } = queue.enqueueWorkflowSync("ENG");
     queue.updateWorkflowSyncStatus(id, "running");
 
@@ -5135,9 +5073,8 @@ describe("GET /api/deployment-status", () => {
   it("reports when the current deploy started, so the page can show elapsed time", async () => {
     // An eight-minute build with no moving number is indistinguishable from a hang.
     // The clock belongs to the hold, so it arrives on the same read as `held`.
-    const { setDeployHold } = await import("../deploy-hold.js");
     const before = Date.now();
-    setDeployHold();
+    modules.deployHold.setDeployHold();
 
     const token = await login("secret");
     const res = await statusRequest(token);
@@ -5162,20 +5099,18 @@ describe("GET /api/deployment-status", () => {
   });
 
   it("reports the last acted commit, so the page knows what automatic deploying already handled", async () => {
-    const { setLastActedCommit } = await import("../deploy-policy.js");
     const token = await login("secret");
 
     expect((await statusRequest(token)).body.lastActedCommit).toBeNull();
-    setLastActedCommit("def5678");
+    modules.deployPolicy.setLastActedCommit("def5678");
     expect((await statusRequest(token)).body.lastActedCommit).toBe("def5678");
   });
 
   it("reports the last deploy outcome, so the page can render deployed-ok and build-failed cards", async () => {
-    const { recordDeployOutcome } = await import("../deploy-notify.js");
     const token = await login("secret");
 
     expect((await statusRequest(token)).body.lastDeployOutcome).toBeNull();
-    recordDeployOutcome({ kind: "deployed-ok", commit: "abc1234", timestamp: 1_700_000_000_000 });
+    modules.deployNotify.recordDeployOutcome({ kind: "deployed-ok", commit: "abc1234", timestamp: 1_700_000_000_000 });
     const body = (await statusRequest(token)).body;
     expect(body.lastDeployOutcome).toMatchObject({ kind: "deployed-ok", commit: "abc1234", timestamp: 1_700_000_000_000 });
   });
@@ -5238,7 +5173,7 @@ describe("/api/retention", () => {
     body: unknown,
     apply = vi.fn(async (_days: number) => ({ applied: ["vol_1"], skipped: "" })),
   ): Promise<{ statusCode: number; body: Record<string, unknown>; apply: typeof apply }> {
-    const retention = await import("../restate/retention.js");
+    const { retention } = modules;
     const deps: Parameters<typeof admin.handleAdminRequest>[4] = {
       retention: {
         getRestateDays: retention.getRestateRetentionDays,
@@ -5301,7 +5236,7 @@ describe("/api/retention", () => {
 
   it("answers 400 naming restate_retention_days for 61 and stores nothing", async () => {
     const token = await login("secret");
-    const retention = await import("../restate/retention.js");
+    const { retention } = modules;
     const res = await retentionRequest(token, "POST", { restate: 61 });
     expect(res.statusCode).toBe(400);
     expect(String(res.body.error)).toContain("restate_retention_days");
@@ -5310,7 +5245,7 @@ describe("/api/retention", () => {
 
   it("stores neither value when one of two is bad, and rejects non-integers", async () => {
     const token = await login("secret");
-    const retention = await import("../restate/retention.js");
+    const { retention } = modules;
     const mixed = await retentionRequest(token, "POST", { restate: 10, volume: 99 });
     expect(mixed.statusCode).toBe(400);
     expect(String(mixed.body.error)).toContain("volume_snapshot_retention_days");
@@ -5322,7 +5257,7 @@ describe("/api/retention", () => {
 
   it("stores volume, applies it once, and reports lastApplied", async () => {
     const token = await login("secret");
-    const retention = await import("../restate/retention.js");
+    const { retention } = modules;
     const res = await retentionRequest(token, "POST", { volume: 20 });
     expect(res.statusCode).toBe(200);
     expect(retention.getVolumeSnapshotRetentionDays()).toBe(20);
@@ -5336,7 +5271,7 @@ describe("/api/retention", () => {
 
   it("stores restate without applying the volume", async () => {
     const token = await login("secret");
-    const retention = await import("../restate/retention.js");
+    const { retention } = modules;
     const res = await retentionRequest(token, "POST", { restate: 10 });
     expect(res.statusCode).toBe(200);
     expect(retention.getRestateRetentionDays()).toBe(10);
@@ -5456,8 +5391,7 @@ describe("per-page grants", () => {
     });
 
     it("lists no Journal page and still saves a grant while a stale journal row is stored", async () => {
-      const db = (await import("../dedup.js")).getDb();
-      db.prepare("INSERT INTO access_page_grants (page, granted_at, granted_by) VALUES ('journal', 'now', 'ada@eudoxus.ai')").run();
+      dedup.getDb().prepare("INSERT INTO access_page_grants (page, granted_at, granted_by) VALUES ('journal', 'now', 'ada@eudoxus.ai')").run();
       const token = adminSsoSession();
       const got = JSON.parse((await request("/api/access-grants", "GET", "secret", undefined, token)).body);
       expect(got.grantable).not.toContain("journal");
@@ -5592,7 +5526,7 @@ describe("GET /api/deploy-refs", () => {
   });
 
   it("returns 503 with install message when unauthenticated 404 indicates a private repo (public mode)", async () => {
-    const { GitHubApiError: GHError } = await import("../github-errors.js");
+    const { GitHubApiError: GHError } = modules.githubErrors;
     mintSourceTokenOrJwtMock.mockResolvedValue({ token: null, authMode: "public" });
     listRepoBranchesAndTagsMock.mockRejectedValue(new GHError({ status: 404, path: "/repos/foreign-org/private-repo/branches", bodyText: "" }));
     const token = await login("secret");
@@ -5602,7 +5536,7 @@ describe("GET /api/deploy-refs", () => {
   });
 
   it("returns 503 with install message on 403 regardless of auth mode", async () => {
-    const { GitHubApiError: GHError } = await import("../github-errors.js");
+    const { GitHubApiError: GHError } = modules.githubErrors;
     mintSourceTokenOrJwtMock.mockResolvedValue({ token: "inst-token", authMode: "installation" });
     listRepoBranchesAndTagsMock.mockRejectedValue(new GHError({ status: 403, path: "/repos/owner/repo/branches", bodyText: "Forbidden" }));
     const token = await login("secret");
@@ -5612,7 +5546,7 @@ describe("GET /api/deploy-refs", () => {
   });
 
   it("returns generic 503 on 404 in installation mode (not treated as private-repo indicator)", async () => {
-    const { GitHubApiError: GHError } = await import("../github-errors.js");
+    const { GitHubApiError: GHError } = modules.githubErrors;
     mintSourceTokenOrJwtMock.mockResolvedValue({ token: "inst-token", authMode: "installation" });
     listRepoBranchesAndTagsMock.mockRejectedValue(new GHError({ status: 404, path: "/repos/owner/repo/branches", bodyText: "" }));
     const token = await login("secret");
@@ -5833,9 +5767,9 @@ describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () =>
   it("skips a manifest team with no mapping, logs it, and still answers 200 with the mapped team's issues", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kg-manifest-test-"));
+    const dir = testDir("kg-manifest");
     fs.writeFileSync(path.join(dir, "sources.yml"), "trackers:\n  - team: GHOST\n  - team: AII\n");
-    getScopedInstallationTokenMock.mockResolvedValue({ token: "t" });
+    getScopedInstallationTokenMock.mockResolvedValue(makeScopedInstallationToken());
     getRepoDefaultBranchMock.mockResolvedValue("main");
     fetchRepoTarballMock.mockResolvedValue(Buffer.from(""));
     extractSourceMock.mockResolvedValue(dir);
@@ -5854,16 +5788,15 @@ describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () =>
       expect(skipLines[0]).not.toContain("AII,");
     } finally {
       warn.mockRestore();
-      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
   it("emits no skip line when every manifest team is mapped", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kg-manifest-test-"));
+    const dir = testDir("kg-manifest");
     fs.writeFileSync(path.join(dir, "sources.yml"), "trackers:\n  - team: AII\n");
-    getScopedInstallationTokenMock.mockResolvedValue({ token: "t" });
+    getScopedInstallationTokenMock.mockResolvedValue(makeScopedInstallationToken());
     getRepoDefaultBranchMock.mockResolvedValue("main");
     fetchRepoTarballMock.mockResolvedValue(Buffer.from(""));
     extractSourceMock.mockResolvedValue(dir);
@@ -5875,7 +5808,6 @@ describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () =>
       expect(warn.mock.calls.some((c) => String(c[0]).includes("no orchestrator mapping"))).toBe(false);
     } finally {
       warn.mockRestore();
-      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
@@ -5930,11 +5862,9 @@ describe("admin sessions — kg-refresh destroy", () => {
 
   beforeEach(() => {
     destroyMachineMock.mockReset();
-    destroyMachineMock.mockResolvedValue(undefined);
+    getMachineMock.mockReset();
     cancelWorkflowRunMock.mockReset();
-    cancelWorkflowRunMock.mockResolvedValue(true);
     getInstallationTokenMock.mockReset();
-    getInstallationTokenMock.mockResolvedValue("gh-token-mock");
     notifyTextMock.mockReset();
   });
 
@@ -5943,7 +5873,7 @@ describe("admin sessions — kg-refresh destroy", () => {
   const deps = (cancel: KgCancel) => ({ trigger: vi.fn(), status: vi.fn(), cancel });
 
   async function flyKgJob(machineId: string, dispatchId: string | null = "t-fly"): Promise<number> {
-    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines", ...(dispatchId ? { dispatchId } : {}) });
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines", repo: "TestOrg/test-kg", ...(dispatchId ? { dispatchId } : {}) });
     log.setJobMachineNonce(jobId, "nonce-kg");
     log.setJobMachineId(jobId, machineId);
     log.updateJobMachineId(jobId, machineId);
@@ -6062,7 +5992,6 @@ describe("admin sessions — kg-refresh destroy", () => {
   it("issue-keyed session destroy still calls provider.clearWorkingState (regression pin)", async () => {
     const token = await login("secret");
     // Create a mapping for the ENG team
-    config.initMappingsTable();
     await request("/api/mappings", "POST", "secret", {
       teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml",
     }, token);
@@ -6235,7 +6164,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
   it("keeps old revisions on PATCH and refuses new grants for a disabled profile", async () => {
     const t = await seed();
-    const store = await import("../agent-config-store.js");
+    const store = modules.agentConfigStore;
     const patched = await call("/api/model-accounts/oai-1", "PATCH", t, { identity: "Renamed" });
     expect(patched.json).toMatchObject({ revision: 2, identity: "Renamed", profileStatus: "active" });
     expect(store.getAccountProfileRevision("oai-1", 1)?.identity).toBe("OpenAI team key");
@@ -6337,7 +6266,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
     it("inspects the candidate without publishing it: nothing is stored while inspection is pending or after a refusal", async () => {
       const t = await seed();
-      const store = await import("../agent-config-store.js");
+      const store = modules.agentConfigStore;
       const revs = count("stage_agent_config_revisions");
       let release!: () => void;
       let entered!: () => void;
@@ -6363,7 +6292,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
     it("refuses to commit readiness when the defaults, a profile or the project head moved during inspection", async () => {
       const t = await seed();
-      const store = await import("../agent-config-store.js");
+      const store = modules.agentConfigStore;
       const moves: Array<[string, () => void]> = [
         ["defaults", () => store.setOrchestratorDefaults({ version: 1, ...defaults, stages: { ...defaults.stages, review: { ...defaults.stages.review, model: "gpt-y" } } } as never)],
         ["profile", () => void store.saveAccountProfileRevision({ profileId: "oai-1", revision: store.getAccountProfile("oai-1")!.revision + 1, identity: "renamed", agent: "codex", provider: "openai", authMode: "openai-api-key", allowedProjectKeys: ["APP"], metadata: { credentialRef: SENTINEL } } as never)],
@@ -6386,7 +6315,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
     it("keeps legacy, disabled and Claude-subscription candidates fail-closed without storing them", async () => {
       const t = await seed();
-      const store = await import("../agent-config-store.js");
+      const store = modules.agentConfigStore;
       const inspect = vi.fn(async () => ({ status: "ready", profiles: [] }));
       const r = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true, stages: { review: { accountProfileId: "missing" } } }, readyDeps(inspect));
       expect(r.status).toBe(400);
@@ -6442,7 +6371,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
   it("keeps ordinary mapping CRUD from touching agent configuration", async () => {
     const t = await seed();
-    const store = await import("../agent-config-store.js");
+    const store = modules.agentConfigStore;
     const body = { enabled: true, agentConfig: { mode: "configured" } };
     await request("/api/mappings", "POST", "secret", { teamKey: "APP", owner: "org", repo: "app", ...body }, t);
     await request("/api/mappings/APP", "PATCH", "secret", body, t);

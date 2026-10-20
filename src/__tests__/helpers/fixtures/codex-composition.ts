@@ -12,10 +12,10 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { vi } from "vitest";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { MODEL_AUTH_ROUTES } from "../model-auth-contract.js";
-import type { ModelAuthTransport } from "../model-auth-client.js";
-import type { CodexProtocolDriver, CodexTransportRunInput } from "../pipeline/codex-planning-adapter.js";
-import { NOW } from "./configured-run-fixture.js";
+import { MODEL_AUTH_ROUTES } from "../../../model-auth-contract.js";
+import type { ModelAuthTransport } from "../../../model-auth-client.js";
+import type { CodexProtocolDriver, CodexTransportRunInput } from "../../../pipeline/codex-planning-adapter.js";
+import { NOW } from "./configured-run.js";
 
 export const S_CHATGPT = "synthetic-chatgpt-plan-access-token-1234";
 export const S_OPENAI = "synthetic-openai-api-key-value-5678";

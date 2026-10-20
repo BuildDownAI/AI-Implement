@@ -1,17 +1,13 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { listCustomizations } from "../customizations.js";
+import { testDir } from "./helpers/test-dir.js";
 
 let tempDir: string;
 
 beforeEach(() => {
-  tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "customizations-test-"));
-});
-
-afterEach(() => {
-  fs.rmSync(tempDir, { recursive: true, force: true });
+  tempDir = testDir("customizations");
 });
 
 describe("listCustomizations", () => {

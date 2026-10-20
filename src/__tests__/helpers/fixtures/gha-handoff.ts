@@ -3,15 +3,15 @@
  * `env:` mapping and the bootstrap's step outputs (AII-1427). Nothing here adds a value the workflow fails
  * to provide, so a missing handoff surfaces as a missing variable in the production runner factory.
  */
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { parse } from "yaml";
 import { vi } from "vitest";
-import type { ResolvedAgentSnapshotV1, RunConfigV1 } from "../run-config.js";
-import type { ModelAuthContextV1, ModelAuthGrantBootstrapV1 } from "../model-auth-contract.js";
-import { makeGrant } from "./configured-run-fixture.js";
+import type { ResolvedAgentSnapshotV1, RunConfigV1 } from "../../../run-config.js";
+import type { ModelAuthContextV1, ModelAuthGrantBootstrapV1 } from "../../../model-auth-contract.js";
+import { testDir } from "../test-dir.js";
+import { makeGrant } from "./configured-run.js";
 
 export const GHA_IMPLEMENT_WORKFLOWS = ["workflows/claude-implement.yml", ".github/workflows/claude-implement.yml"];
 export const GHA_PLAN_WORKFLOWS = ["workflows/claude-plan.yml", ".github/workflows/claude-plan.yml"];
@@ -84,49 +84,46 @@ export function ghaRunStepEnv(
   const run = job.steps.find((s: { name: string }) => s.name === "Run pipeline" || s.name === "Run planning");
   const runConfig = input.runConfig ?? ghaRunConfig(file, input);
 
-  const dir = mkdtempSync(join(tmpdir(), "gha-handoff-"));
-  try {
-    const inputs = { run_config: runConfig, run_token: "", run_progress_token: "", run_attempt_token: "" };
-    const eventPath = join(dir, "event.json");
-    const envPath = join(dir, "github.env");
-    const outPath = join(dir, "github.output");
-    writeFileSync(eventPath, JSON.stringify({ inputs }));
-    writeFileSync(envPath, "");
-    writeFileSync(outPath, "");
-    const runnerEnv = mask.env?.AI_IMPLEMENT_GHA_RUNNER_ENVIRONMENT === "${{ runner.environment }}"
-      ? { AI_IMPLEMENT_GHA_RUNNER_ENVIRONMENT: input.runnerEnvironment === undefined ? "github-hosted" : input.runnerEnvironment ?? "" }
-      : {};
-    const boot = spawnSync("sh", ["-e", "-c", mask.run], {
-      env: { PATH: process.env.PATH, GITHUB_EVENT_PATH: eventPath, GITHUB_ENV: envPath, GITHUB_OUTPUT: outPath, ...runnerEnv },
-      encoding: "utf8",
-    });
-    const githubEnv = readFileSync(envPath, "utf8");
-    const base = { bootStatus: boot.status, bootStderr: boot.stderr, githubEnv };
-    if (boot.status !== 0) return { ...base, runEnv: {} };
-    const lines = readFileSync(outPath, "utf8").split("\n");
-    const outputs: Record<string, string> = {};
-    for (let i = 0; i < lines.length; i++) {
-      const m = /^([a-z_]+)<<(.+)$/.exec(lines[i]);
-      if (!m) continue;
-      const end = lines.indexOf(m[2], i + 1);
-      outputs[m[1]] = lines.slice(i + 1, end).join("\n");
-      i = end;
-    }
-    const runEnv: Record<string, string> = {};
-    for (const [k, v] of Object.entries(run.env ?? {})) {
-      if (typeof v !== "string") continue;
-      const o = /^\$\{\{\s*steps\.bootstrap\.outputs\.(\w+)\s*\}\}$/.exec(v);
-      if (o) runEnv[k] = outputs[o[1]] ?? "";
-      else if (/^\$\{\{\s*inputs\.run_config\s*\}\}$/.test(v)) runEnv[k] = runConfig;
-      else if (!v.includes("${{")) runEnv[k] = v;
-    }
-    return { ...base, runEnv };
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
+  const dir = testDir("gha-handoff");
+  const inputs = { run_config: runConfig, run_token: "", run_progress_token: "", run_attempt_token: "" };
+  const eventPath = join(dir, "event.json");
+  const envPath = join(dir, "github.env");
+  const outPath = join(dir, "github.output");
+  writeFileSync(eventPath, JSON.stringify({ inputs }));
+  writeFileSync(envPath, "");
+  writeFileSync(outPath, "");
+  const runnerEnv = mask.env?.AI_IMPLEMENT_GHA_RUNNER_ENVIRONMENT === "${{ runner.environment }}"
+    ? { AI_IMPLEMENT_GHA_RUNNER_ENVIRONMENT: input.runnerEnvironment === undefined ? "github-hosted" : input.runnerEnvironment ?? "" }
+    : {};
+  const boot = spawnSync("sh", ["-e", "-c", mask.run], {
+    env: { PATH: process.env.PATH, GITHUB_EVENT_PATH: eventPath, GITHUB_ENV: envPath, GITHUB_OUTPUT: outPath, ...runnerEnv },
+    encoding: "utf8",
+  });
+  const githubEnv = readFileSync(envPath, "utf8");
+  const base = { bootStatus: boot.status, bootStderr: boot.stderr, githubEnv };
+  if (boot.status !== 0) return { ...base, runEnv: {} };
+  const lines = readFileSync(outPath, "utf8").split("\n");
+  const outputs: Record<string, string> = {};
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^([a-z_]+)<<(.+)$/.exec(lines[i]);
+    if (!m) continue;
+    const end = lines.indexOf(m[2], i + 1);
+    outputs[m[1]] = lines.slice(i + 1, end).join("\n");
+    i = end;
   }
+  const runEnv: Record<string, string> = {};
+  for (const [k, v] of Object.entries(run.env ?? {})) {
+    if (typeof v !== "string") continue;
+    const o = /^\$\{\{\s*steps\.bootstrap\.outputs\.(\w+)\s*\}\}$/.exec(v);
+    if (o) runEnv[k] = outputs[o[1]] ?? "";
+    else if (/^\$\{\{\s*inputs\.run_config\s*\}\}$/.test(v)) runEnv[k] = runConfig;
+    else if (!v.includes("${{")) runEnv[k] = v;
+  }
+  return { ...base, runEnv };
 }
 
-/** Installs a Run step environment as the process environment (empty strings are treated as absent by the runner). */
+/** Installs a Run step environment as the process environment (empty strings are treated as absent by the runner).
+ *  The caller's file restores it with `vi.unstubAllEnvs()`. */
 export function stubRunEnv(env: Record<string, string>): void {
   for (const [k, v] of Object.entries(env)) vi.stubEnv(k, v);
 }

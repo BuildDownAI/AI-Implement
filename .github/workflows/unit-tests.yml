@@ -32,15 +32,9 @@ jobs:
       # (verified on AII-448: 28 unhandled rejections alone produced exit 1
       # while all tests passed — the exact signal this gate exists to catch).
       #
-      # Ambient Actions vars are scrubbed for the test step: orchestrator code
-      # branches on GITHUB_RUN_ID / GITHUB_ENV / etc., and the suite asserts
-      # the non-CI defaults (first run of this gate proved it: reporter tests
-      # picked up the job's own run id). The suite must see the same env shape
-      # locally and here.
-      - name: npm test (ambient CI vars scrubbed)
-        run: |
-          unset GITHUB_RUN_ID GITHUB_ENV GITHUB_REPOSITORY GITHUB_REF_NAME                 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS GITHUB_ACTION
-          npm test
+      # No unset step: the suite deletes ambient variables itself, the same way here as on any machine.
+      # Its allowlist, with the reason for each entry, is src/__tests__/setup/ambient-env.ts.
+      - run: npm test
       - run: npm run typecheck
 
   # Restate harness (AII-612): src/__tests__/restate/**/*.restate.test.ts on the
@@ -67,7 +61,5 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - name: npm run test:restate pass ${{ matrix.pass }} of 3 (ambient CI vars scrubbed)
-        run: |
-          unset GITHUB_RUN_ID GITHUB_ENV GITHUB_REPOSITORY GITHUB_REF_NAME                 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS GITHUB_ACTION
-          npm run test:restate
+      - name: npm run test:restate pass ${{ matrix.pass }} of 3
+        run: npm run test:restate

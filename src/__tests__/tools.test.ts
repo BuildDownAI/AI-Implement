@@ -21,7 +21,6 @@ import {
   getKgStatusTool,
   setFlyMachineProfileTool,
   getTenantHealth,
-  listInFlightJobs,
   getIssueReportCardTool,
   getFleetReportTool,
   triggerKgRefreshTool,
@@ -32,9 +31,6 @@ import {
   addProjectArgsSchema,
   triggerWorkflowSyncTool,
   clearDispatchDedupTool,
-  listDispatchReservationsTool,
-  releaseDispatchReservationTool,
-  setAdmissionTerminationCheck,
   setProviderRegistry,
   setKgRefreshToolDeps,
   getReviewFixAttemptTool,
@@ -48,12 +44,11 @@ import { setKgMemoryProvider } from "../kg-provider.js";
 import type { MemoryProvider } from "../kg-provider.js";
 import type { PreflightCheckResult, RefreshOutcome } from "../kg-refresh.js";
 import type { KgRefreshToolDeps } from "../restate/kg-refresh-production.js";
-import { getMappings } from "../config.js";
+import { getMappings, type RepoMapping } from "../config.js";
 import { setOrchestratorSetting } from "../orchestrator-settings.js";
 import { initSettingsTable } from "../runner-mode.js";
 import { FLY_MACHINE_PROFILE_DEFAULTS, mergeProfile, type FlyMachineProfileConfig } from "../restate/fly-machine-profile.js";
-import { initLogTable, appendLog, updateJobStatus } from "../log.js";
-import { getDb } from "../dedup.js";
+import { initLogTable } from "../log.js";
 import { getRestateStatus, setRestateStatus, resetRestateStatus } from "../restate/status.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import {
@@ -63,6 +58,13 @@ import {
   triggerWorkflowSyncAction,
   clearDedupEntryAction,
 } from "../admin.js";
+import type * as AdmissionModule from "../dispatch-admission.js";
+import type * as InFlightModule from "../in-flight-work.js";
+import type * as LogModule from "../log.js";
+import type * as ToolsModule from "../restate/tools.js";
+import { makeAppendLogEntry, makeMapping, makeRegistry } from "./helpers/builders.js";
+import { fakeFetch, hangUntilAborted } from "./helpers/fake-fetch.js";
+import { testDb } from "./helpers/test-db.js";
 
 vi.mock("../report-card.js", () => ({
   getIssueReportCard: vi.fn(),
@@ -115,24 +117,10 @@ function fakeContext(handlerName: string, runCalls: RunCall[] = []): restate.Con
   } as unknown as restate.Context;
 }
 
-/**
- * A fetchImpl that never settles unless its request's AbortSignal fires — the only way a
- * fixture can prove a fetch is actually bounded by `signal` rather than merely accepting an
- * ignored option (AII-728). Rejects with the signal's abort reason once the signal fires.
- */
-function hangingFetch(): typeof fetch {
-  return vi.fn((_url: unknown, init?: RequestInit) => {
-    return new Promise((_resolve, reject) => {
-      const signal = init?.signal;
-      if (!signal) return; // no signal given: hangs forever, same as before AII-728
-      if (signal.aborted) {
-        reject(signal.reason);
-        return;
-      }
-      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-    });
-  }) as unknown as typeof fetch;
-}
+// The admin API's service metadata read, and the ingress calls the tests below make.
+const DISCOVERY = "GET /services/orchestratorTools";
+const GET_WIDGET = "POST /orchestratorTools/get_widget";
+const GET_TENANT_HEALTH = "POST /orchestratorTools/get_tenant_health";
 
 /**
  * vitest's fake timers do not intercept Node's AbortSignal.timeout — verified empirically,
@@ -423,39 +411,33 @@ describe("review-fix read tools", () => {
 });
 
 describe("discoverTools", () => {
-  function jsonResponse(status: number, body: unknown): Response {
-    return {
-      ok: status >= 200 && status < 300,
-      status,
-      json: async () => body,
-    } as Response;
-  }
-
   it("projects one entry per handler carrying mcp.type: \"tool\", with args-only inputSchema", async () => {
-    const fetchImpl = vi.fn(async () =>
-      jsonResponse(200, {
-        handlers: [
-          {
-            name: "get_widget",
-            documentation: "Gets a widget",
-            metadata: { "mcp.type": "tool", "mcp.role": "user" },
-            input_json_schema: {
-              properties: {
-                caller: { type: "object" },
-                args: { type: "object", properties: { id: { type: "string" } } },
+    const fake = fakeFetch({
+      [DISCOVERY]: [{
+        json: {
+          handlers: [
+            {
+              name: "get_widget",
+              documentation: "Gets a widget",
+              metadata: { "mcp.type": "tool", "mcp.role": "user" },
+              input_json_schema: {
+                properties: {
+                  caller: { type: "object" },
+                  args: { type: "object", properties: { id: { type: "string" } } },
+                },
               },
             },
-          },
-          {
-            name: "internalOnly",
-            documentation: "Not a tool",
-            metadata: {},
-          },
-        ],
-      }),
-    );
+            {
+              name: "internalOnly",
+              documentation: "Not a tool",
+              metadata: {},
+            },
+          ],
+        },
+      }],
+    });
 
-    const tools = await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl });
+    const tools = await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl: fake.fetch });
 
     expect(tools).toEqual([
       {
@@ -468,32 +450,29 @@ describe("discoverTools", () => {
   });
 
   it("returns [] on a connection error", async () => {
-    const fetchImpl = vi.fn(async () => {
-      throw new Error("ECONNREFUSED");
+    const fake = fakeFetch({
+      [DISCOVERY]: [() => {
+        throw new Error("ECONNREFUSED");
+      }],
     });
-    expect(await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl })).toEqual([]);
+    expect(await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl: fake.fetch })).toEqual([]);
   });
 
   it("returns [] on a non-2xx response", async () => {
-    const fetchImpl = vi.fn(async () => jsonResponse(404, {}));
-    expect(await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl })).toEqual([]);
+    const fake = fakeFetch({ [DISCOVERY]: [{ status: 404, json: {} }] });
+    expect(await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl: fake.fetch })).toEqual([]);
   });
 
   it("returns [] on an unparsable body", async () => {
-    const fetchImpl = vi.fn(async () => ({
-      ok: true,
-      status: 200,
-      json: async () => {
-        throw new SyntaxError("not json");
-      },
-    })) as unknown as typeof fetch;
-    expect(await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl })).toEqual([]);
+    const fake = fakeFetch({ [DISCOVERY]: [{ text: "not json" }] });
+    expect(await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl: fake.fetch })).toEqual([]);
   });
 
   it("bounds admin discovery at 5s — a never-resolving fetch degrades to [] once the bound fires (AII-728)", async () => {
     const timeoutSpy = stubAbortTimeout(5_000);
     try {
-      const result = await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl: hangingFetch() });
+      const fake = fakeFetch({ [DISCOVERY]: [hangUntilAborted] });
+      const result = await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl: fake.fetch });
       expect(result).toEqual([]);
     } finally {
       timeoutSpy.mockRestore();
@@ -507,13 +486,13 @@ describe("callTool", () => {
 
   it("returns deploy-held without an ingress request even when Restate is not ready", async () => {
     resetRestateStatus();
-    const fetchImpl = vi.fn() as unknown as typeof fetch;
+    const ingress = fakeFetch({});
     const result = await callTool("get_widget", {}, HUMAN_USER, {
-      ingressBaseUrl: "http://ingress.example", fetchImpl,
+      ingressBaseUrl: "http://ingress.example", fetchImpl: ingress.fetch,
       permitsExternalCall: () => false,
     });
     expect(result).toEqual({ status: "deploy-held" });
-    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(ingress.calls).toHaveLength(0);
   });
 
   it.each([
@@ -526,150 +505,142 @@ describe("callTool", () => {
     ["registration not-attempted", { registration: { state: "not-attempted" } }],
   ] as const)("answers unavailable without an ingress request when %s (AII-1281)", async (_label, patch) => {
     setRestateStatus(patch as Parameters<typeof setRestateStatus>[0]);
-    const fetchImpl = vi.fn() as unknown as typeof fetch;
+    const ingress = fakeFetch({});
     const result = await callTool("get_widget", {}, HUMAN_USER, {
-      ingressBaseUrl: "http://ingress.example", fetchImpl,
+      ingressBaseUrl: "http://ingress.example", fetchImpl: ingress.fetch,
       permitsExternalCall: () => true,
     });
     expect(result).toEqual({ status: "unavailable" });
-    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(ingress.calls).toHaveLength(0);
   });
 
   it("answers unavailable for callToolAsSystem when registration is declined", async () => {
     setRestateStatus({ registration: { state: "declined-conflict" } });
-    const fetchImpl = vi.fn() as unknown as typeof fetch;
-    const result = await callToolAsSystem("get_widget", {}, { fetchImpl, permitsExternalCall: () => true });
+    const ingress = fakeFetch({});
+    const result = await callToolAsSystem("get_widget", {}, { fetchImpl: ingress.fetch, permitsExternalCall: () => true });
     expect(result).toEqual({ status: "unavailable" });
-    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(ingress.calls).toHaveLength(0);
   });
 
   it("lets an injected restateReady override the status default", async () => {
-    const fetchImpl = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ content: [] }) })) as unknown as typeof fetch;
+    const ingress = fakeFetch({ [GET_WIDGET]: { json: { content: [] } } });
     resetRestateStatus();
     const result = await callTool("get_widget", {}, HUMAN_USER, {
-      ingressBaseUrl: "http://ingress.example", fetchImpl, restateReady: () => true,
+      ingressBaseUrl: "http://ingress.example", fetchImpl: ingress.fetch, restateReady: () => true,
     });
     expect(result.status).toBe("ok");
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(ingress.calls).toHaveLength(1);
   });
 
   it("returns deploy-held without an ingress request when drain admission closes", async () => {
-    const fetchImpl = vi.fn() as unknown as typeof fetch;
+    const fake = fakeFetch({});
     const result = await callTool("get_widget", {}, HUMAN_USER, {
-      ingressBaseUrl: "http://ingress.example", fetchImpl,
+      ingressBaseUrl: "http://ingress.example", fetchImpl: fake.fetch,
       permitsExternalCall: () => false,
     });
     expect(result).toEqual({ status: "deploy-held" });
-    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(fake.calls).toHaveLength(0);
   });
   describe("deploy hold allowlist (AII-1401)", () => {
-    const okFetch = () => vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ content: [] }) }));
+    // The tool's ingress handler answering an empty ToolResponse.
+    const ingressFor = (name: string) => fakeFetch({ [`POST /orchestratorTools/${name}`]: { json: { content: [] } } });
     const held = { ingressBaseUrl: "http://ingress.example", permitsExternalCall: () => false };
 
     it.each(["decide_kg_refresh", "get_kg_status"])("%s reaches the ingress during a hold", async (name) => {
-      const fetchImpl = okFetch();
-      const result = await callTool(name, {}, HUMAN_USER, { ...held, fetchImpl: fetchImpl as unknown as typeof fetch });
+      const ingress = ingressFor(name);
+      const result = await callTool(name, {}, HUMAN_USER, { ...held, fetchImpl: ingress.fetch });
       expect(result.status).toBe("ok");
-      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      expect(ingress.calls).toHaveLength(1);
     });
 
     it.each(["trigger_kg_refresh", "get_widget", "decide_kg_refresh_x", "x_get_kg_status"])("%s is refused during a hold", async (name) => {
-      const fetchImpl = okFetch();
-      const result = await callTool(name, {}, HUMAN_USER, { ...held, fetchImpl: fetchImpl as unknown as typeof fetch });
+      const ingress = ingressFor(name);
+      const result = await callTool(name, {}, HUMAN_USER, { ...held, fetchImpl: ingress.fetch });
       expect(result).toEqual({ status: "deploy-held" });
-      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(ingress.calls).toHaveLength(0);
     });
 
     it.each(["decide_kg_refresh", "get_kg_status"])("%s still answers unavailable when Restate is not ready", async (name) => {
-      const fetchImpl = okFetch();
-      const result = await callTool(name, {}, HUMAN_USER, { ...held, fetchImpl: fetchImpl as unknown as typeof fetch, restateReady: () => false });
+      const ingress = ingressFor(name);
+      const result = await callTool(name, {}, HUMAN_USER, { ...held, fetchImpl: ingress.fetch, restateReady: () => false });
       expect(result).toEqual({ status: "unavailable" });
-      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(ingress.calls).toHaveLength(0);
     });
   });
 
   it("maps a 200 ToolResponse body to status: \"ok\"", async () => {
-    const fetchImpl = vi.fn(async () => ({
-      ok: true,
-      status: 200,
-      json: async () => ({ content: [{ type: "text", text: "hello" }] }),
-    })) as unknown as typeof fetch;
+    const fake = fakeFetch({ [GET_WIDGET]: [{ json: { content: [{ type: "text", text: "hello" }] } }] });
 
     const result = await callTool("get_widget", { id: "1" }, HUMAN_USER, {
       ingressBaseUrl: "http://ingress.example",
-      fetchImpl,
+      fetchImpl: fake.fetch,
     });
 
     expect(result).toEqual({ status: "ok", content: [{ type: "text", text: "hello" }], isError: undefined });
   });
 
   it("maps a thrown fetch to status: \"unavailable\"", async () => {
-    const fetchImpl = vi.fn(async () => {
-      throw new Error("ECONNREFUSED");
+    const fake = fakeFetch({
+      [GET_WIDGET]: [() => {
+        throw new Error("ECONNREFUSED");
+      }],
     });
     const result = await callTool("get_widget", {}, HUMAN_USER, {
       ingressBaseUrl: "http://ingress.example",
-      fetchImpl,
+      fetchImpl: fake.fetch,
     });
     expect(result).toEqual({ status: "unavailable" });
   });
 
   it("answers a 4xx as a tool error carrying the real status, not as \"unavailable\" (AII-711)", async () => {
-    const fetchImpl = vi.fn(async () => ({ ok: false, status: 400, text: async () => "bad args" })) as unknown as typeof fetch;
-    const result = await callTool("get_widget", {}, HUMAN_USER, { ingressBaseUrl: "http://ingress.example", fetchImpl });
+    const fake = fakeFetch({ [GET_WIDGET]: [{ status: 400, text: "bad args" }] });
+    const result = await callTool("get_widget", {}, HUMAN_USER, { ingressBaseUrl: "http://ingress.example", fetchImpl: fake.fetch });
     expect(result).toEqual({ status: "ok", isError: true, content: [{ type: "text", text: "400 bad args" }] });
   });
 
   it("maps a 503 response to status: \"unavailable\"", async () => {
-    const fetchImpl = vi.fn(async () => ({ ok: false, status: 503, json: async () => ({}) })) as unknown as typeof fetch;
+    const fake = fakeFetch({ [GET_WIDGET]: [{ status: 503, json: {} }] });
     const result = await callTool("get_widget", {}, HUMAN_USER, {
       ingressBaseUrl: "http://ingress.example",
-      fetchImpl,
+      fetchImpl: fake.fetch,
     });
     expect(result).toEqual({ status: "unavailable" });
   });
 
   it("posts a body of exactly { caller, args } with no Authorization header", async () => {
-    let capturedInit: RequestInit | undefined;
-    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-      capturedInit = init;
-      return { ok: true, status: 200, json: async () => ({ content: [] }) } as Response;
-    });
+    const fake = fakeFetch({ [GET_WIDGET]: [{ json: { content: [] } }] });
 
     await callTool("get_widget", { id: "1" }, HUMAN_USER, {
       ingressBaseUrl: "http://ingress.example",
-      fetchImpl: fetchImpl as unknown as typeof fetch,
+      fetchImpl: fake.fetch,
     });
 
-    expect(capturedInit).toBeDefined();
-    const headers = capturedInit?.headers as Record<string, string>;
-    expect(Object.keys(headers).some((k) => k.toLowerCase() === "authorization")).toBe(false);
-    const body = JSON.parse(capturedInit?.body as string);
+    expect(fake.calls).toHaveLength(1);
+    const [call] = fake.calls;
+    expect(call.headers.has("authorization")).toBe(false);
+    const body = JSON.parse(call.body);
     expect(body).toEqual({ caller: HUMAN_USER, args: { id: "1" } });
     expect(Object.keys(body)).toEqual(["caller", "args"]);
   });
 
   it("percent-encodes a path-traversal name so it stays one path segment (defense in depth)", async () => {
-    let capturedUrl: string | undefined;
-    const fetchImpl = vi.fn(async (url: string | URL | Request) => {
-      capturedUrl = String(url);
-      return { ok: true, status: 200, json: async () => ({ content: [] }) } as Response;
-    });
+    const fake = fakeFetch({ "POST /orchestratorTools/..%2FOperator%2Fx%2Frevoke": [{ json: { content: [] } }] });
 
     await callTool("../Operator/x/revoke", {}, HUMAN_USER, {
       ingressBaseUrl: "http://ingress.example",
-      fetchImpl: fetchImpl as unknown as typeof fetch,
+      fetchImpl: fake.fetch,
     });
 
-    expect(capturedUrl).toBe("http://ingress.example/orchestratorTools/..%2FOperator%2Fx%2Frevoke");
+    expect(fake.calls[0].url.href).toBe("http://ingress.example/orchestratorTools/..%2FOperator%2Fx%2Frevoke");
   });
 
   it("bounds tool ingress at 60s — a never-resolving fetch degrades to unavailable once the bound fires (AII-728)", async () => {
     const timeoutSpy = stubAbortTimeout(60_000);
     try {
+      const fake = fakeFetch({ [GET_WIDGET]: [hangUntilAborted] });
       const result = await callTool("get_widget", {}, HUMAN_USER, {
         ingressBaseUrl: "http://ingress.example",
-        fetchImpl: hangingFetch(),
+        fetchImpl: fake.fetch,
       });
       expect(result).toEqual({ status: "unavailable" });
     } finally {
@@ -683,39 +654,37 @@ describe("callToolAsSystem", () => {
   afterEach(() => resetRestateStatus());
 
   it("uses the same drain admission barrier", async () => {
-    const fetchImpl = vi.fn() as unknown as typeof fetch;
+    const fake = fakeFetch({});
     expect(await callToolAsSystem("get_tenant_health", {}, {
-      ingressBaseUrl: "http://ingress.example", fetchImpl,
+      ingressBaseUrl: "http://ingress.example", fetchImpl: fake.fetch,
       permitsExternalCall: () => false,
     })).toEqual({ status: "deploy-held" });
-    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(fake.calls).toHaveLength(0);
   });
   it("posts with a systemCaller() caller and returns the same result shape as callTool", async () => {
-    let capturedBody: unknown;
-    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-      capturedBody = JSON.parse(init?.body as string);
-      return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: "health" }] }) } as Response;
-    });
+    const fake = fakeFetch({ [GET_TENANT_HEALTH]: [{ json: { content: [{ type: "text", text: "health" }] } }] });
 
     const result = await callToolAsSystem("get_tenant_health", {}, {
       ingressBaseUrl: "http://ingress.example",
-      fetchImpl: fetchImpl as unknown as typeof fetch,
+      fetchImpl: fake.fetch,
     });
 
     expect(result).toEqual({ status: "ok", content: [{ type: "text", text: "health" }], isError: undefined });
-    expect(capturedBody).toEqual({
+    expect(JSON.parse(fake.calls[0].body)).toEqual({
       caller: { kind: "system", email: null, role: "admin" },
       args: {},
     });
   });
 
   it("maps a connection failure to status: \"unavailable\", same as callTool", async () => {
-    const fetchImpl = vi.fn(async () => {
-      throw new Error("ECONNREFUSED");
+    const fake = fakeFetch({
+      [GET_TENANT_HEALTH]: [() => {
+        throw new Error("ECONNREFUSED");
+      }],
     });
     const result = await callToolAsSystem("get_tenant_health", {}, {
       ingressBaseUrl: "http://ingress.example",
-      fetchImpl,
+      fetchImpl: fake.fetch,
     });
     expect(result).toEqual({ status: "unavailable" });
   });
@@ -723,22 +692,22 @@ describe("callToolAsSystem", () => {
 
 describe("toolCatalog", () => {
   it("returns the same discovered names and schemas as discoverTools, sourced from the registry", async () => {
-    const fetchImpl = vi.fn(async () => ({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        handlers: [
-          {
-            name: "get_tenant_health",
-            documentation: "Health summary",
-            metadata: { "mcp.type": "tool", "mcp.role": "user" },
-            input_json_schema: { properties: { args: { type: "object", properties: {} } } },
-          },
-        ],
-      }),
-    })) as unknown as typeof fetch;
+    const fake = fakeFetch({
+      [DISCOVERY]: [{
+        json: {
+          handlers: [
+            {
+              name: "get_tenant_health",
+              documentation: "Health summary",
+              metadata: { "mcp.type": "tool", "mcp.role": "user" },
+              input_json_schema: { properties: { args: { type: "object", properties: {} } } },
+            },
+          ],
+        },
+      }],
+    });
 
-    const catalog = await toolCatalog({ adminBaseUrl: "http://admin.example", fetchImpl });
+    const catalog = await toolCatalog({ adminBaseUrl: "http://admin.example", fetchImpl: fake.fetch });
 
     expect(catalog).toEqual([
       {
@@ -751,10 +720,12 @@ describe("toolCatalog", () => {
   });
 
   it("returns [] when discovery cannot reach the admin API", async () => {
-    const fetchImpl = vi.fn(async () => {
-      throw new Error("ECONNREFUSED");
+    const fake = fakeFetch({
+      [DISCOVERY]: [() => {
+        throw new Error("ECONNREFUSED");
+      }],
     });
-    expect(await toolCatalog({ adminBaseUrl: "http://admin.example", fetchImpl })).toEqual([]);
+    expect(await toolCatalog({ adminBaseUrl: "http://admin.example", fetchImpl: fake.fetch })).toEqual([]);
   });
 });
 
@@ -771,18 +742,11 @@ describe("migrated read handlers (AII-711)", () => {
   const system: Caller = SYSTEM_ADMIN;
 
   it("list_projects selects its fields explicitly — extraEnv never leaves the handler", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
-      BDS: {
-        owner: "BuildDownAI", repo: "skills", executionMode: "gha", provider: "anthropic", paused: false,
-        planningEnabled: true, maxInProgressAiIssues: 2, defaultBranch: "testing", workflowFile: "claude.yml",
-        sessionMode: "fresh", autoMerge: false, maxTurns: null, maxIterations: null, maxJobMinutes: null,
-        branchPrefix: null, skillsRepo: null, referenceRepos: [], dependencyTokenScope: null,
-        sensitiveAddPatterns: [], sensitiveAllowPatterns: [], machineCpus: 2, machineMemoryMb: 4096,
-        awsRegion: null, planningWorkflowFile: "claude-plan.yml", autoApprovePlans: true, reviewers: null,
-        trustedReviewAuthors: ["codex-reviewer[bot]"],
-        reviewProcess: "claude-code-review",
-        extraEnv: { SUPER_SECRET: "leak-me" },
-      },
+    vi.mocked(getMappings).mockReturnValue({
+      BDS: makeMapping({
+        owner: "BuildDownAI", repo: "skills", extraEnv: { SUPER_SECRET: "leak-me" },
+        trustedReviewAuthors: ["codex-reviewer[bot]"], reviewProcess: "claude-code-review",
+      }),
     });
     const result = await listProjects(fakeContext("list_projects"), { caller: system, args: {} });
     expect(result.isError).toBeUndefined();
@@ -1075,14 +1039,14 @@ describe("get_tenant_health restate health field (AII-807)", () => {
   });
 
   it("reports the not-attempted/starting default before any sidecar write", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    vi.mocked(getMappings).mockReturnValue({});
     const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
     const parsed = JSON.parse(result.content[0].text) as { restate: unknown };
     expect(parsed.restate).toEqual({ sidecar: { state: "starting" }, registration: { state: "not-attempted" } });
   });
 
   it("includes both retention settings", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    vi.mocked(getMappings).mockReturnValue({});
     const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
     const parsed = JSON.parse(result.content[0].text) as { restateRetentionDays: unknown; volumeSnapshotRetentionDays: unknown };
     expect(typeof parsed.restateRetentionDays).toBe("number");
@@ -1090,7 +1054,7 @@ describe("get_tenant_health restate health field (AII-807)", () => {
   });
 
   it("reflects a ready sidecar with a declined-conflict registration", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    vi.mocked(getMappings).mockReturnValue({});
     setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "declined-conflict" } });
 
     const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
@@ -1101,7 +1065,7 @@ describe("get_tenant_health restate health field (AII-807)", () => {
   });
 
   it("reflects an exited sidecar with code/signal and an unreachable registration", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    vi.mocked(getMappings).mockReturnValue({});
     setRestateStatus({ sidecar: { state: "exited", code: 1, signal: null }, registration: { state: "unreachable" } });
 
     const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
@@ -1113,29 +1077,33 @@ describe("get_tenant_health restate health field (AII-807)", () => {
 
 describe("get_tenant_health awaitingDecisionCount (AII-1490)", () => {
   const system: Caller = SYSTEM_ADMIN;
-  beforeAll(() => {
-    initLogTable();
-  });
-  afterEach(() => {
-    getDb().exec("DELETE FROM dispatch_log");
+  let log: typeof LogModule;
+  let tools: typeof ToolsModule;
+
+  beforeEach(async () => {
+    ({ log, tools } = (await testDb({ modules: { log: () => import("../log.js"), tools: () => import("../restate/tools.js") } })).modules);
   });
 
-  it("counts a held kg-refresh, not in flight, and drops it after the final close", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
-    const held = appendLog({ issueId: "kg-1", phase: "kg-refresh" });
-    updateJobStatus(held, "completed", "awaiting_decision");
-    const running = appendLog({ issueId: "kg-2", phase: "kg-refresh", status: "running" });
-    appendLog({ issueId: "impl-1", phase: "implementation", status: "completed" });
-    getDb().prepare("UPDATE dispatch_log SET status='completed', conclusion='awaiting_decision' WHERE issue_id='impl-1'").run();
+  it("counts a held kg-refresh, not in flight, until its resumed run takes the row back", async () => {
+    vi.mocked(getMappings).mockReturnValue({});
+    // The row recordKgDispatchRow writes, closed at the gate as the hold's dispatch row.
+    const held = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "kg-1", repo: "BuildDownAI/knowledge-graph-ai-implement", executionMode: "github-actions", status: "running" });
+    log.markJobAwaitingDecision(held);
+    const dispatched = log.appendLog(makeAppendLogEntry());
+    // Only a kg-refresh row is ever held, so an implementation row in that state shows the count reads the phase.
+    log.updateJobStatus(log.appendLog(makeAppendLogEntry()), "completed", "awaiting_decision");
 
-    const health = async () => JSON.parse((await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} })).content[0].text) as { awaitingDecisionCount: number; inFlightJobCount: number };
+    const health = async () => JSON.parse((await tools.getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} })).content[0].text) as { awaitingDecisionCount: number; inFlightJobCount: number };
     expect(await health()).toMatchObject({ awaitingDecisionCount: 1, inFlightJobCount: 1 });
 
-    const list = JSON.parse((await listInFlightJobs(fakeContext("list_in_flight_jobs"), { caller: system, args: {} })).content[0].text) as Array<{ id: number }>;
-    expect(list.map((j) => j.id)).toEqual([running]);
+    const list = JSON.parse((await tools.listInFlightJobs(fakeContext("list_in_flight_jobs"), { caller: system, args: {} })).content[0].text) as Array<{ id: number }>;
+    expect(list.map((j) => j.id)).toEqual([dispatched]);
 
-    updateJobStatus(held, "completed", "passed");
-    expect(await health()).toMatchObject({ awaitingDecisionCount: 0 });
+    // A decided hold's resumed run takes the row back before it acts, then closes it (resumeFromHold).
+    log.reopenHeldJob(held);
+    expect(await health()).toMatchObject({ awaitingDecisionCount: 0, inFlightJobCount: 2 });
+    log.updateJobStatus(held, "completed", "passed");
+    expect(await health()).toMatchObject({ awaitingDecisionCount: 0, inFlightJobCount: 1 });
   });
 });
 
@@ -1145,17 +1113,8 @@ describe("get_tenant_health awaitingDecisionCount (AII-1490)", () => {
 describe("get_project_binding (AII-715)", () => {
   const system: Caller = SYSTEM_ADMIN;
 
-  const fixtureMapping = (overrides: Record<string, unknown> = {}) => ({
-    owner: "BuildDownAI", repo: "skills", executionMode: "gha", provider: "anthropic", paused: false,
-    planningEnabled: true, maxInProgressAiIssues: 2, defaultBranch: "testing", workflowFile: "claude.yml",
-    sessionMode: "fresh", autoMerge: false, maxTurns: null, maxIterations: null, maxJobMinutes: null,
-    branchPrefix: null, skillsRepo: null, referenceRepos: [], dependencyTokenScope: null,
-    sensitiveAddPatterns: [], sensitiveAllowPatterns: [], machineCpus: 2, machineMemoryMb: 4096,
-    awsRegion: null, planningWorkflowFile: "claude-plan.yml", autoApprovePlans: true, reviewers: null,
-    extraEnv: { NPM_TOKEN: "leak-me" },
-    ticketingProvider: "linear", ticketingConfig: { kind: "linear" },
-    ...overrides,
-  });
+  const fixtureMapping = (overrides: Partial<RepoMapping> = {}) =>
+    makeMapping({ owner: "BuildDownAI", repo: "skills", defaultBranch: "testing", extraEnv: { NPM_TOKEN: "leak-me" }, ...overrides });
 
   beforeAll(() => {
     initSettingsTable();
@@ -1169,7 +1128,7 @@ describe("get_project_binding (AII-715)", () => {
   });
 
   it("resolves the BDS mapping by repo, with the live pickup label and orchestrator-wide kg binding (AC1, AC2, AC3)", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({ BDS: fixtureMapping() });
+    vi.mocked(getMappings).mockReturnValue({ BDS: fixtureMapping() });
     setOrchestratorSetting("linearPickupLabel", "AI-Implement-Custom");
     setOrchestratorSetting("kgBaseRepo", "BuildDownAI/bd-knowledge-graph-base");
     process.env.KG_SOURCE_REPO = "BuildDownAI/knowledge-graph-ai-implement";
@@ -1209,7 +1168,7 @@ describe("get_project_binding (AII-715)", () => {
   });
 
   it("reflects a pickup-label change on the very next call in the same process, no restart (AII-696 criterion 1)", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({ BDS: fixtureMapping() });
+    vi.mocked(getMappings).mockReturnValue({ BDS: fixtureMapping() });
     setOrchestratorSetting("linearPickupLabel", "First-Label");
 
     const first = await getProjectBinding(fakeContext("get_project_binding"), { caller: system, args: { team: "BDS" } });
@@ -1221,7 +1180,7 @@ describe("get_project_binding (AII-715)", () => {
   });
 
   it("never includes extraEnv or a token, in the single-project or the all-mappings shape (AC5)", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({ BDS: fixtureMapping() });
+    vi.mocked(getMappings).mockReturnValue({ BDS: fixtureMapping() });
 
     const single = await getProjectBinding(fakeContext("get_project_binding"), { caller: system, args: { team: "BDS" } });
     expect(single.content[0].text).not.toContain("extraEnv");
@@ -1233,7 +1192,7 @@ describe("get_project_binding (AII-715)", () => {
   });
 
   it("returns every mapping as an array when neither repo nor team is given (AC6)", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
+    vi.mocked(getMappings).mockReturnValue({
       BDS: fixtureMapping(),
       AII: fixtureMapping({ repo: "AI-Implement" }),
     });
@@ -1244,7 +1203,7 @@ describe("get_project_binding (AII-715)", () => {
   });
 
   it("answers isError for an unmatched repo or team, rather than silently returning every mapping (AC7)", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({ BDS: fixtureMapping() });
+    vi.mocked(getMappings).mockReturnValue({ BDS: fixtureMapping() });
 
     const byRepo = await getProjectBinding(fakeContext("get_project_binding"), { caller: system, args: { repo: "nope/nope" } });
     expect(byRepo.isError).toBe(true);
@@ -1254,8 +1213,20 @@ describe("get_project_binding (AII-715)", () => {
   });
 
   it("returns pickupLabel: null for a non-Linear (Jira) mapping, regardless of the Linear setting", async () => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
-      AII: fixtureMapping({ ticketingProvider: "jira", ticketingConfig: { kind: "jira" } }),
+    vi.mocked(getMappings).mockReturnValue({
+      // A Jira config as the mappings store reads one back: every field override present, unset as null.
+      AII: fixtureMapping({
+        ticketingProvider: "jira",
+        ticketingConfig: {
+          kind: "jira",
+          jql: "project = AII",
+          repoFieldValue: "BuildDownAI/skills",
+          statusFieldOverride: null,
+          repoFieldOverride: null,
+          profilesFieldOverride: null,
+          baseBranchFieldOverride: null,
+        },
+      }),
     });
     setOrchestratorSetting("linearPickupLabel", "AI-Implement-Custom");
 
@@ -1847,7 +1818,7 @@ describe("retryPolicy declarations (AII-717)", () => {
 
 describe("add_project uses the registry the boot shares (AII-713 review)", () => {
   it("passes the registry given to setProviderRegistry() to upsertMappingAction, so its invalidate() reaches the real one", async () => {
-    const registry = { invalidate: vi.fn() } as unknown as Parameters<typeof setProviderRegistry>[0];
+    const registry = makeRegistry();
     setProviderRegistry(registry);
     try {
       (upsertMappingAction as ReturnType<typeof vi.fn>).mockReturnValue({ status: 202, body: { teamKey: "AII" } });
@@ -1862,46 +1833,57 @@ describe("add_project uses the registry the boot shares (AII-713 review)", () =>
 // ---- AII-1069: list_dispatch_reservations / release_dispatch_reservation.
 describe("dispatch reservation tools (AII-1069)", () => {
   const admin: Caller = { kind: "human", email: "op@example.com", role: "admin" };
-  let seq = 0;
   const parse = (r: { content: { text: string }[] }) => JSON.parse(r.content[0].text);
+  let admission: typeof AdmissionModule;
+  let log: typeof LogModule;
+  let inFlight: typeof InFlightModule;
+  let tools: typeof ToolsModule;
+  let issues = 0;
 
-  beforeAll(() => {
-    initLogTable();
+  beforeEach(async () => {
+    ({ admission, log, inFlight, tools } = (await testDb({
+      modules: {
+        admission: () => import("../dispatch-admission.js"),
+        log: () => import("../log.js"),
+        inFlight: () => import("../in-flight-work.js"),
+        tools: () => import("../restate/tools.js"),
+      },
+    })).modules);
+    issues = 0;
   });
   afterEach(() => {
-    setAdmissionTerminationCheck(null);
     vi.restoreAllMocks();
   });
 
-  async function hold(owner: { kind: "legacy" } | { kind: "restate"; attemptId: string } = { kind: "legacy" }, jobStatus?: "running" | "completed") {
-    const { acquire } = await import("../dispatch-admission.js");
-    const { appendLog, updateJobStatus } = await import("../log.js");
-    const dispatchId = `res-${Date.now()}-${seq++}`;
-    const decision = acquire({
+  // A GitHub Actions planning reservation for a new issue, owned as dispatchPlanning (Legacy) or PlanningRun's reserve (Restate) owns it.
+  // With a job status, the row launchPlanningRun writes once the run is dispatched.
+  async function hold(owner: "legacy" | "restate" = "legacy", jobStatus?: "running" | "completed") {
+    const n = ++issues;
+    const dispatchId = crypto.randomUUID();
+    const decision = admission.acquire({
       dispatchId,
       mappingKey: "AII",
-      scope: { kind: "issue", issueScope: "AII", issueId: dispatchId },
+      scope: { kind: "issue", issueScope: "AII", issueId: `issue-${n}` },
       kind: "planning",
       backend: "github-actions",
-      lifecycleOwner: owner,
+      lifecycleOwner: owner === "legacy" ? { kind: "legacy" } : { kind: "restate", attemptId: dispatchId },
       cap: 100,
     });
     if (!decision.ok) throw new Error("acquire failed");
     if (jobStatus) {
-      const id = appendLog({ issueId: dispatchId, issueIdentifier: "AII-1", repo: "o/r", dispatchId, admissionGeneration: decision.record.generation, executionMode: "github-actions" });
-      if (jobStatus === "completed") updateJobStatus(id, "completed", "success");
+      const id = log.appendLog(makeAppendLogEntry({ issueId: `issue-${n}`, issueIdentifier: `AII-${n}`, teamKey: "AII", dispatchId, admissionGeneration: decision.record.generation, phase: "planning" }));
+      if (jobStatus === "completed") log.updateJobStatus(id, "completed", "success");
     }
     return dispatchId;
   }
-  const heldNow = async (dispatchId: string) => (await import("../dispatch-admission.js")).read(dispatchId)?.releasedAt === null;
-  const runnerJobCount = async () =>
-    (await import("../in-flight-work.js")).getInFlightWork().find((w) => w.kind === "runner-job")?.count ?? 0;
+  const heldNow = async (dispatchId: string) => admission.read(dispatchId)?.releasedAt === null;
+  const runnerJobCount = async () => inFlight.getInFlightWork().find((w) => w.kind === "runner-job")?.count ?? 0;
 
   it("lists held rows and not released ones, for a user caller", async () => {
-    const held = await hold({ kind: "legacy" }, "running");
+    const held = await hold("legacy", "running");
     const gone = await hold();
-    (await import("../dispatch-admission.js")).releaseByDispatchId(gone, "finalized");
-    const result = await listDispatchReservationsTool(fakeContext("list_dispatch_reservations"), { caller: HUMAN_USER, args: {} });
+    admission.releaseByDispatchId(gone, "finalized");
+    const result = await tools.listDispatchReservationsTool(fakeContext("list_dispatch_reservations"), { caller: HUMAN_USER, args: {} });
     const rows = parse(result) as Array<Record<string, unknown>>;
     const row = rows.find((r) => r.dispatchId === held);
     expect(row).toMatchObject({ team: "AII", issueIdentifier: "AII-1", phase: "planning", backend: "github-actions", lifecycleOwner: "legacy", jobStatus: "dispatched", jobConclusion: null });
@@ -1911,16 +1893,16 @@ describe("dispatch reservation tools (AII-1069)", () => {
 
   it("refuses a user caller as forbidden and leaves the row held", async () => {
     const id = await hold();
-    const result = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: HUMAN_USER, args: { dispatchId: id, force: true } });
+    const result = await tools.releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: HUMAN_USER, args: { dispatchId: id, force: true } });
     expect(result.content[0].text).toBe("forbidden: release_dispatch_reservation requires the admin role");
     expect(await heldNow(id)).toBe(true);
   });
 
   it("refuses a row whose job is terminal without force, naming the status, and the row stays held", async () => {
-    const id = await hold({ kind: "restate", attemptId: "a" }, "completed");
-    setAdmissionTerminationCheck(async () => false);
+    const id = await hold("restate", "completed");
+    tools.setAdmissionTerminationCheck(async () => false);
     const before = await runnerJobCount();
-    const result = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id } });
+    const result = await tools.releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id } });
     expect(result.isError).toBe(true);
     expect(parse(result)).toMatchObject({ status: "refused", dispatchId: id });
     expect(parse(result).reason).toMatch(/completed/);
@@ -1930,43 +1912,43 @@ describe("dispatch reservation tools (AII-1069)", () => {
   });
 
   it("refuses without force while the run executes, then releases with force", async () => {
-    const id = await hold({ kind: "legacy" }, "running");
-    setAdmissionTerminationCheck(async () => false);
-    const refused = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id } });
+    const id = await hold("legacy", "running");
+    tools.setAdmissionTerminationCheck(async () => false);
+    const refused = await tools.releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id } });
     expect(refused.isError).toBe(true);
     expect(parse(refused)).toMatchObject({ status: "refused", dispatchId: id });
     expect(parse(refused).reason).toMatch(/force/);
     expect(await heldNow(id)).toBe(true);
 
-    const forced = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id, force: true } });
+    const forced = await tools.releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id, force: true } });
     expect(parse(forced)).toMatchObject({ status: "released", forced: true, basis: "forced" });
     expect(await heldNow(id)).toBe(false);
   });
 
   it("releases without force when the backend run is confirmed ended", async () => {
-    const id = await hold({ kind: "legacy" }, "running");
-    setAdmissionTerminationCheck(async (c) => c.dispatchId === id);
-    const result = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id } });
+    const id = await hold("legacy", "running");
+    tools.setAdmissionTerminationCheck(async (c) => c.dispatchId === id);
+    const result = await tools.releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id } });
     expect(parse(result)).toMatchObject({ status: "released", basis: "backend_confirmed" });
   });
 
   it("answers nothing_to_release for an unknown or already released id", async () => {
     const id = await hold();
-    await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id, force: true } });
+    await tools.releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id, force: true } });
     for (const dispatchId of [id, "no-such-dispatch"]) {
-      const result = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId, force: true } });
+      const result = await tools.releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId, force: true } });
       expect(result.isError).toBeUndefined();
       expect(parse(result)).toEqual({ status: "nothing_to_release", dispatchId });
     }
   });
 
   it("writes one audit line naming actor, dispatch id, owner and force", async () => {
-    const id = await hold({ kind: "restate", attemptId: "b" });
-    const log = vi.spyOn(console, "log").mockImplementation(() => {});
-    await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id, force: true } });
-    const lines = log.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith("[mcp] write tool=release_dispatch_reservation"));
+    const id = await hold("restate");
+    const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
+    await tools.releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id, force: true } });
+    const lines = consoleLog.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith("[mcp] write tool=release_dispatch_reservation"));
     expect(lines).toEqual([
-      `[mcp] write tool=release_dispatch_reservation actor=op@example.com role=admin result=ok kind=human dispatch=${id} owner=restate:b force=true`,
+      `[mcp] write tool=release_dispatch_reservation actor=op@example.com role=admin result=ok kind=human dispatch=${id} owner=restate:${id} force=true`,
     ]);
   });
 });

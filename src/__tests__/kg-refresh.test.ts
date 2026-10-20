@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { postDryRunReport } from "../kg-refresh-rail.js";
 import { makeKgRefresh, runKgRefreshPreflight, materializeArgs, type KgRefreshHandle, type RefreshOutcome, migrateLegacyDryRunOutcomes } from "../kg-refresh.js";
+import { testDb } from "./helpers/test-db.js";
+import { testDir } from "./helpers/test-dir.js";
 
 const materializeState = vi.hoisted(() => ({ direct: false }));
 vi.mock("../runner-mode.js", async (orig) => ({
@@ -16,7 +17,7 @@ const NAMESPACE = "https://kg.test.example/";
 
 function makeTarball(dir: string): Buffer {
   // extractSource strips one leading component, so wrap in a top-level dir.
-  const wrap = mkdtempSync(join(tmpdir(), "kgtar-"));
+  const wrap = testDir("kgtar");
   const top = join(wrap, "repo");
   mkdirSync(top, { recursive: true });
   // `dir/.` copies CONTENTS on both BSD (macOS) and GNU (Linux) cp — a bare
@@ -217,7 +218,7 @@ describe("kg-refresh", () => {
 
     function buildPreflight() {
       // Build a fixture tarball whose sources.yml includes code_repo and a secondary repo.
-      const pfRepo = mkdtempSync(join(tmpdir(), "kgpf-"));
+      const pfRepo = testDir("kgpf");
       writeFileSync(
         join(pfRepo, "sources.yml"),
         [
@@ -229,7 +230,6 @@ describe("kg-refresh", () => {
       );
       mkdirSync(join(pfRepo, "snapshot"), { recursive: true });
       preflightTarball = makeTarball(pfRepo);
-      rmSync(pfRepo, { recursive: true, force: true });
 
       // mintTokenPf always succeeds; overrides can make specific calls fail.
       mintTokenPf = vi.fn(async () => ({ token: "tok", expiresAt: "" }));
@@ -369,7 +369,7 @@ describe("kg-refresh", () => {
     });
 
     it("custom base_repo: — row's repo field reflects the configured slug", async () => {
-      const pfRepo = mkdtempSync(join(tmpdir(), "kgpf-base-"));
+      const pfRepo = testDir("kgpf-base");
       writeFileSync(
         join(pfRepo, "sources.yml"),
         [
@@ -380,7 +380,6 @@ describe("kg-refresh", () => {
       );
       mkdirSync(join(pfRepo, "snapshot"), { recursive: true });
       const customTarball = makeTarball(pfRepo);
-      rmSync(pfRepo, { recursive: true, force: true });
 
       const result = await runKgRefreshPreflight({
         githubAppId: "1",
@@ -481,22 +480,19 @@ describe("kg-refresh production wiring (AII-901)", () => {
   let idx: IndexModule;
   let logMod: typeof import("../log.js");
   let dedupMod: typeof import("../dedup.js");
-  let dbPath: string;
+  let hold: typeof import("../deploy-hold.js");
 
   beforeEach(async () => {
-    vi.resetModules();
-    dbPath = join(tmpdir(), `kg-wiring-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-    process.env.DEDUP_DB_PATH = dbPath;
-    idx = await import("../index.js");
-    logMod = await import("../log.js");
-    dedupMod = await import("../dedup.js");
-    logMod.initLogTable();
-    dedupMod.getDb().exec("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-  });
-
-  afterEach(() => {
-    dedupMod.closeDb();
-    rmSync(dbPath, { force: true });
+    ({ idx, logMod, dedupMod, hold } = (
+      await testDb({
+        modules: {
+          idx: () => import("../index.js"),
+          logMod: () => import("../log.js"),
+          dedupMod: () => import("../dedup.js"),
+          hold: () => import("../deploy-hold.js"),
+        },
+      })
+    ).modules);
   });
 
 
@@ -574,8 +570,7 @@ describe("kg-refresh production wiring (AII-901)", () => {
     expect((await after.status()).status).toBe(503);
   });
 
-  it("deployHealth reports false/null with no hold and true/number once held", async () => {
-    const hold = await import("../deploy-hold.js");
+  it("deployHealth reports false/null with no hold and true/number once held", () => {
     expect(idx.deployHealth()).toEqual({ held: false, startedAt: null });
     hold.setDeployHold();
     try {

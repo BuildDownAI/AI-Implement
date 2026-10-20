@@ -78,7 +78,7 @@ Nothing here is a mock in the `vi.mock` sense. The handlers run their real code 
 - **The memory provider** is set to `null`, so every `kg_*` handler takes its "no memory provider is configured" branch. A scenario asserts that exact text.
 - **The server** starts last, after the tables exist, because the first scenario calls a handler that reads them. The hook has a 60 s cap.
 
-`vitest.restate.config.ts` also loads `src/__tests__/setup/clear-runner-credentials.ts`, which deletes `RUN_TOKEN`, `RUNNER_CALLBACK_URL` and the other runner credentials before each test, so a suite running inside a dispatched runner can never reach a real callback endpoint.
+`vitest.restate.config.ts` also loads two setup files, the same two the default suite loads. `scrub-ambient-env.ts` first deletes every environment variable the allowlist does not cover; the binary the scenarios start needs nothing more. Then `clear-runner-credentials.ts` deletes `RUN_TOKEN`, `RUNNER_CALLBACK_URL` and the other runner credentials before each test, so a suite running inside a dispatched runner can never reach a real callback endpoint. [unit-tests.md](unit-tests.md) § Isolation from the machine owns both.
 
 ### 5. The scenarios, by what only the engine can prove
 

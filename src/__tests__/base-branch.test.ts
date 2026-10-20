@@ -8,6 +8,7 @@ import {
   postBranchComment,
 } from "../base-branch.js";
 import { GitHubApiError } from "../github-errors.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
 
 describe("normalizeBaseBranch", () => {
   it("returns null for null input", () => {
@@ -175,29 +176,19 @@ describe("resolveIssueBaseBranch", () => {
   });
 
   it("defaults to the real getBranchSha and preserves slash separators over the wire", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({ object: { sha: "sha1" } }),
-    }));
-    try {
-      const result = await resolveIssueBaseBranch({ ...baseOpts, value: "ai-implement/feature/ool-78" });
-      expect(result).toEqual({ found: true, branch: "ai-implement/feature/ool-78", lookupCount: 1 });
-      const url = vi.mocked(fetch).mock.calls[0][0] as string;
-      expect(url).toBe("https://api.github.com/repos/acme/proj/git/ref/heads/ai-implement/feature/ool-78");
-      expect(url).not.toContain("%2F");
-    } finally {
-      vi.unstubAllGlobals();
-    }
+    const github = fakeFetch({ "GET /repos/acme/proj/git/ref/heads/ai-implement/feature/ool-78": { json: { object: { sha: "sha1" } } } });
+    github.install();
+
+    const result = await resolveIssueBaseBranch({ ...baseOpts, value: "ai-implement/feature/ool-78" });
+
+    expect(result).toEqual({ found: true, branch: "ai-implement/feature/ool-78", lookupCount: 1 });
+    expect(github.calls[0].url.href).toBe("https://api.github.com/repos/acme/proj/git/ref/heads/ai-implement/feature/ool-78");
   });
 
   it("defaults to the real getBranchSha, which throws on a non-404 status", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 403, text: async () => "forbidden" }));
-    try {
-      await expect(resolveIssueBaseBranch({ ...baseOpts, value: "main" })).rejects.toThrow(GitHubApiError);
-    } finally {
-      vi.unstubAllGlobals();
-    }
+    fakeFetch({ "GET /repos/acme/proj/git/ref/heads/main": { status: 403, text: "forbidden" } }).install();
+
+    await expect(resolveIssueBaseBranch({ ...baseOpts, value: "main" })).rejects.toThrow(GitHubApiError);
   });
 });
 

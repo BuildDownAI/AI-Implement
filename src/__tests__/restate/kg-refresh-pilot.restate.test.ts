@@ -66,6 +66,7 @@ import { callToolAsSystem } from "../../restate/tools-client.js";
 import { makeKgRefreshAdminDeps, sweepLegacyKgRefreshRows } from "../../index.js";
 import type { RestateService } from "../../restate/endpoint.js";
 import { VARIANTS, eventually, journalEntries, journalText, journaledRunResult, queryInvocations, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
+import { makeAppConfig, makeScopedInstallationToken } from "../helpers/builders.js";
 
 const KG_SOURCE_REPO = "TestOrg/test-kg-source";
 const NAMESPACE = "https://kg.test.example/";
@@ -84,15 +85,20 @@ const FAILURE_REPORT: Partial<RunnerResultBody> = {
   outcome: "failure", failureCode: "runner_crashed", failureReason: "the runner process died",
 };
 
-/** extractSource strips one leading path component, so wrap the fixture in a top-level dir. */
+/** extractSource strips one leading path component, so wrap the fixture in a top-level dir. The
+ *  wrapper is removed once the archive is read: this runs from beforeAll, where testDir() cannot. */
 function makeTarball(dir: string): Buffer {
   const wrap = mkdtempSync(join(tmpdir(), "kgpilottar-"));
-  const top = join(wrap, "repo");
-  mkdirSync(top, { recursive: true });
-  execSync(`cp -R ${dir}/. ${top}/`);
-  const out = join(wrap, "src.tar.gz");
-  execSync(`tar -czf ${out} -C ${wrap} repo`);
-  return readFileSync(out) as Buffer;
+  try {
+    const top = join(wrap, "repo");
+    mkdirSync(top, { recursive: true });
+    execSync(`cp -R ${dir}/. ${top}/`);
+    const out = join(wrap, "src.tar.gz");
+    execSync(`tar -czf ${out} -C ${wrap} repo`);
+    return readFileSync(out) as Buffer;
+  } finally {
+    rmSync(wrap, { recursive: true, force: true });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -160,7 +166,7 @@ function ensureCompose(): void {
 
   process.env.KG_SIDECAR_URL = "http://127.0.0.1:1/mcp";
   const railFakes = {
-    mintToken: (async () => ({ token: "tok", expiresAt: "" })) as unknown as KgRailDeps["mintToken"],
+    mintToken: (async () => makeScopedInstallationToken()) as KgRailDeps["mintToken"],
     fetchTarball: (async () => {
       railFetchCalls++;
       const gate = sim.fetchGate;
@@ -193,17 +199,14 @@ function ensureCompose(): void {
 
   compose = (over = {}) => createProductionKgRefreshServices({
     kgSourceRepo: KG_SOURCE_REPO,
-    config: {
-      githubAppId: "test-app-id", githubAppPrivateKey: "test-private-key", sessionImage: "runner:test",
-      runnerImageExplicit: false, runnerCallbackBaseUrl: "https://orchestrator.test", runnerTokenSecret: SECRET,
-      flySessionsToken: null, flySessionsApp: null, flySessionsRegion: null,
-      localRunnerImage: "local:img", localRunnerOrchestratorUrl: null, healthPort: 8080,
-      anthropicApiKey: null, claudeOAuthToken: null,
-    },
+    config: makeAppConfig({
+      githubAppId: "test-app-id", githubAppPrivateKey: "test-private-key",
+      runnerCallbackBaseUrl: "https://orchestrator.test", runnerTokenSecret: SECRET,
+    }),
     ...railFakes,
     // Sender deps: the GitHub Actions path uses the faked dispatch POST; the machine backends must not run.
     getInstallationToken: async () => "tok",
-    getScopedInstallationToken: async () => ({ token: "scoped-tok", expiresAt: "", installationId: 1 }),
+    getScopedInstallationToken: async () => makeScopedInstallationToken({ token: "scoped-tok" }),
     resolveRunnerImage: async () => undefined,
     postWorkflowDispatch: ((opts: { inputs: Record<string, string | undefined> }) => sim.postWorkflowDispatch(opts)) as never,
     keptMachineFly: () => { throw new Error("the Fly sender must not run on the GHA path"); },

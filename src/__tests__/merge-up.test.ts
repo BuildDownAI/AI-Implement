@@ -1,11 +1,14 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, onTestFinished } from "vitest";
 import { resetClosedVetoLogGuard, resetRollUpHandledMarkers, isRollUpHandled, markRollUpHandled, clearRollUpHandledMarkersByIdentifier, runMergeUps } from "../merge-up.js";
 import type { RepoMapping } from "../config.js";
 import type { FeatureNodeRollUp } from "../providers/types.js";
 import { LinearProvider } from "../providers/linear.js";
 import { JiraProvider } from "../providers/jira.js";
-import type { JiraClient } from "../providers/jira-client.js";
-import { configureLinearAuth, __setLinearTokenForTest } from "../linear-app-auth.js";
+import { JiraClient } from "../providers/jira-client.js";
+import { configureLinearAuth, clearLinearTokenCache, __resetLinearAuthForTest, __setLinearTokenForTest } from "../linear-app-auth.js";
+import { makeMapping } from "./helpers/builders.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
+import { linearData, linearGraphql } from "./helpers/replies/linear.js";
 
 vi.mock("../dedup.js", async () => {
   const Database = (await import("better-sqlite3")).default;
@@ -28,20 +31,8 @@ vi.mock("../github.js", () => ({
 
 import { compareBranches, createPullRequest, mergeBranch, findOpenPullRequest, findPullRequestByBranches, getBranchSha, deleteBranch } from "../github.js";
 
-function mapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
-  return {
-    owner: "jodwyer", repo: "alpacaWheel", workflowFile: "claude-implement.yml",
-    defaultBranch: "testing", maxInProgressAiIssues: 3, executionMode: "github-actions",
-    sessionMode: "autonomous", machineCpus: 2, machineMemoryMb: 4096, planningEnabled: false,
-    planningWorkflowFile: "", autoApprovePlans: true, extraEnv: {}, provider: "anthropic",
-    ticketingProvider: "linear", ticketingConfig: { kind: "linear" }, awsRegion: null, paused: false,
-    autoMerge: false, maxTurns: null, maxIterations: null, maxJobMinutes: null,
-    branchPrefix: null, skillsRepo: null, referenceRepos: null,
-    sensitiveAddPatterns: null, sensitiveAllowPatterns: null, dependencyTokenScope: null,
-    reviewFixLifecycle: null, memoryProviderId: null, reviewers: null,
-    ...overrides,
-  };
-}
+const mapping = (overrides: Partial<RepoMapping> = {}) =>
+  makeMapping({ owner: "jodwyer", repo: "alpacaWheel", defaultBranch: "testing", ...overrides });
 
 const deps = (resolve: (k: string) => RepoMapping | null, finalizeMerged = vi.fn(async () => {})) => ({
   githubAppId: "1", githubAppPrivateKey: "k", resolveMapping: resolve, finalizeMerged,
@@ -413,26 +404,20 @@ describe("fetchFeatureNodeRollUps — Done parent with a non-terminal designated
   it("Linear returns no roll-up", async () => {
     configureLinearAuth("client-id", "client-secret");
     __setLinearTokenForTest("test-token");
+    onTestFinished(() => { __resetLinearAuthForTest(); clearLinearTokenCache(); });
     const labels = { nodes: [{ name: "AI-Implement" }] };
-    vi.stubGlobal("fetch", vi.fn(async () => ({
-      ok: true,
-      json: async () => ({ data: { issues: { nodes: [
-        { identifier: "AII-1", team: { key: "AII" }, parent: null, children: { nodes: [
-          { identifier: "AII-2", state: { type: "completed" }, labels },
-          { identifier: "AII-3", state: { type: "started" }, labels },
-        ] } },
-      ] } } }),
-    } as Response)));
-    try {
-      expect(await new LinearProvider({}).fetchFeatureNodeRollUps()).toEqual([]);
-    } finally {
-      vi.unstubAllGlobals();
-    }
+    linearGraphql(linearData({ issues: { nodes: [
+      { identifier: "AII-1", team: { key: "AII" }, parent: null, children: { nodes: [
+        { identifier: "AII-2", state: { type: "completed" }, labels },
+        { identifier: "AII-3", state: { type: "started" }, labels },
+      ] } },
+    ] } })).install();
+    expect(await new LinearProvider({}).fetchFeatureNodeRollUps()).toEqual([]);
   });
 
   it("Jira returns no roll-up", async () => {
-    const issue = (key: string, status: string, parentKey: string | null) => ({
-      id: `id-${key}`, key,
+    const issue = (n: number, status: string, parentKey: string | null) => ({
+      id: String(10000 + n), key: `OOL-${n}`,
       fields: {
         parent: parentKey ? { key: parentKey } : null,
         customfield_10100: { value: status },
@@ -440,23 +425,31 @@ describe("fetchFeatureNodeRollUps — Done parent with a non-terminal designated
       },
     });
     const routes: Array<{ when: RegExp; issues: unknown[] }> = [
-      { when: /statusCategory = Done/, issues: [issue("OOL-1", "Merged", null)] },
-      { when: /parent in/, issues: [issue("OOL-2", "Merged", "OOL-1"), issue("OOL-3", "Implementing", "OOL-1")] },
+      { when: /statusCategory = Done/, issues: [issue(1, "Merged", null)] },
+      { when: /parent in/, issues: [issue(2, "Merged", "OOL-1"), issue(3, "Implementing", "OOL-1")] },
     ];
-    const client = {
-      async searchJql(jql: string) { return routes.find((r) => r.when.test(jql))?.issues ?? []; },
-    } as unknown as JiraClient;
+    // Jira's JQL search, answered by the JQL each request carries; a search no route names fails the test.
+    fakeFetch({
+      "POST /ex/jira/c/rest/api/3/search/jql": (call) => {
+        const { jql } = JSON.parse(call.body) as { jql: string };
+        const route = routes.find((r) => r.when.test(jql));
+        if (!route) throw new Error(`no route for ${jql}`);
+        return { json: { issues: route.issues, isLast: true } };
+      },
+    }).install();
     const provider = new JiraProvider({
-      client, cacheScope: "c", siteUrl: "https://x",
+      client: new JiraClient({ token: "t", cloudId: "c" }), cacheScope: "c", siteUrl: "https://x",
       getMappings: () => ({
-        m1: mapping({
+        m1: makeMapping({
+          owner: "acme",
+          repo: "x",
           ticketingProvider: "jira",
           ticketingConfig: {
             kind: "jira", jql: "project = OOL", repoFieldValue: "acme/x",
             statusFieldOverride: "customfield_10100", repoFieldOverride: "customfield_10101",
             profilesFieldOverride: "customfield_10200", baseBranchFieldOverride: "customfield_10300",
           },
-        } as Partial<RepoMapping>),
+        }),
       }),
     });
     expect(await provider.fetchFeatureNodeRollUps()).toEqual([]);

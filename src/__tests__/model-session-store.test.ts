@@ -1,17 +1,17 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
 import type * as DedupModule from "../dedup.js";
 import type * as StoreModule from "../model-session-store.js";
+import { testDb, type TestDb } from "./helpers/test-db.js";
 
 const SENTINEL = "SYNTH-SESSION-TOKEN-abc123";
 const KEY_A = crypto.createHash("sha256").update("synthetic-key-a").digest();
 const KEY_B = crypto.createHash("sha256").update("synthetic-key-b").digest();
 const OPERATOR = { synthetic: "operator" };
+const MODULES = { dedup: () => import("../dedup.js"), mod: () => import("../model-session-store.js") };
 
-let dbPath: string;
+let db: TestDb<typeof MODULES>;
 let dedup: typeof DedupModule;
 let mod: typeof StoreModule;
 let owners: Map<string, number>;
@@ -38,27 +38,15 @@ function session(n = 0) {
   return `${SENTINEL}-${n}`;
 }
 
-async function boot() {
-  vi.resetModules();
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  mod = await import("../model-session-store.js");
-  dedup.getDb();
-}
-
 beforeEach(async () => {
-  dbPath = path.join(os.tmpdir(), `model-session-store-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
   owners = new Map([["p1", 1], ["p2", 1]]);
   keys = new Map([["k1", KEY_A]]);
   currentKeyId = "k1";
-  await boot();
+  db = await testDb({ modules: MODULES });
+  ({ dedup, mod } = db.modules);
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  for (const suffix of ["", "-wal", "-shm"]) {
-    try { fs.unlinkSync(dbPath + suffix); } catch { /* ignore */ }
-  }
   vi.restoreAllMocks();
 });
 
@@ -77,8 +65,7 @@ describe("model session store", () => {
   it("survives restart and decrypts for its profile", async () => {
     const store = imported();
     expect(store.checkpoint({ profileId: "p1", ownerGeneration: 1, stateSequence: 1, sessionData: session(1) }).ok).toBe(true);
-    dedup.closeDb();
-    await boot();
+    ({ dedup, mod } = await db.reopen());
     const read = makeStore().read("p1", 1);
     expect(read).toMatchObject({ ok: true, stateSequence: 1, sessionData: session(1), ownerGeneration: 1 });
   });
@@ -91,7 +78,7 @@ describe("model session store", () => {
     for (const r of rows) expect(Buffer.from(r.encrypted_session_state as Buffer).includes(Buffer.from(SENTINEL))).toBe(false);
     dedup.getDb().pragma("wal_checkpoint(TRUNCATE)");
     for (const suffix of ["", "-wal"]) {
-      if (fs.existsSync(dbPath + suffix)) expect(fs.readFileSync(dbPath + suffix).includes(Buffer.from(SENTINEL))).toBe(false);
+      if (fs.existsSync(db.path + suffix)) expect(fs.readFileSync(db.path + suffix).includes(Buffer.from(SENTINEL))).toBe(false);
     }
   });
 

@@ -1,45 +1,35 @@
 // Unit tests for the review-fix Restate ingress client (src/restate/review-fix-client.ts).
 // No Docker, no live Restate server: the client runs against a faked fetch.
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import type * as ClientModule from "../restate/review-fix-client.js";
-import type { ScopedPrIdentity } from "../review-fix-contract.js";
+import { createReviewFixIngressClient, reviewFixResultForwardKey } from "../restate/review-fix-client.js";
+import { validateReviewFixResultMetadata } from "../review-fix-contract.js";
+import { makeReviewFixResult, makeScopedPrIdentity } from "./helpers/builders.js";
+import { fakeFetch, hangUntilAborted, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
 
-let client: typeof ClientModule;
+const destination = makeScopedPrIdentity({ installationId: 7, repository: "acme/app", prNumber: 42 });
+const FEEDBACK = `POST /ReviewFixPR/${encodeURIComponent(JSON.stringify([7, "acme/app", 42]))}/feedback` as const;
+/** What Restate's ingress answers for a handler that returns nothing. */
+const accepted: Reply = { json: null };
 
-beforeEach(async () => {
-  vi.resetModules();
-  client = await import("../restate/review-fix-client.js");
-});
-
-function makeDestination(overrides: Partial<ScopedPrIdentity> = {}): ScopedPrIdentity {
-  return { installationId: 7, repository: "acme/app", prNumber: 42, ...overrides };
-}
+const ingressFor = (fake: FakeFetch, timeoutMs?: number) =>
+  createReviewFixIngressClient("http://sidecar", { fetchImpl: fake.fetch, ...(timeoutMs ? { timeoutMs } : {}) });
 
 // ADR 034 rule 4 producer proof: the real ingress client ends at the exact request. The receiving
 // handler runs inside Restate (covered by the Restate tier), so the contract ends at the request
 // and the validator the `result` handler calls first.
 describe("createReviewFixIngressClient — producer contract", () => {
   it("contract: ReviewFixAttempt.wake — a result forward posts to the attempt's result handler with a body the handler's validator accepts", async () => {
-    const { validateReviewFixResultMetadata } = await import("../review-fix-contract.js");
-    const calls: Array<{ url: string; headers: Headers; body: string }> = [];
-    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const request = new Request(input, init);
-      calls.push({ url: request.url, headers: request.headers, body: await request.text() });
-      return new Response(JSON.stringify({ status: "stored" }), { status: 200, headers: { "content-type": "application/json" } });
-    });
-    const ingress = client.createReviewFixIngressClient("http://ingress.test", { fetchImpl: fetchImpl as unknown as typeof fetch });
-    const result = {
-      version: 1, attemptId: "attempt-wake", installationId: 7, repository: "acme/app", prNumber: 42,
-      deadlineAt: Date.now() + 60_000, githubRunId: 100, githubRunAttempt: 1, outputCommit: "b".repeat(40),
-    } as const;
+    const result = makeReviewFixResult({ attemptId: "attempt-wake", installationId: 7, repository: "acme/app", prNumber: 42, githubRunId: 100 });
+    const fake = fakeFetch({ "POST /ReviewFixAttempt/attempt-wake/result": { json: { status: "stored", result } } });
+    const ingress = createReviewFixIngressClient("http://ingress.test", { fetchImpl: fake.fetch });
 
-    await ingress.result("attempt-wake", result, { idempotencyKey: client.reviewFixResultForwardKey(result) });
+    await ingress.result("attempt-wake", result, { idempotencyKey: reviewFixResultForwardKey(result) });
 
-    expect(calls).toHaveLength(1);
-    expect(calls[0]!.url).toBe("http://ingress.test/ReviewFixAttempt/attempt-wake/result");
-    const sent = JSON.parse(calls[0]!.body);
+    expect(fake.calls).toHaveLength(1);
+    expect(fake.calls[0]!.url.href).toBe("http://ingress.test/ReviewFixAttempt/attempt-wake/result");
+    const sent = JSON.parse(fake.calls[0]!.body);
     expect(validateReviewFixResultMetadata(sent).ok).toBe(true);
     expect(sent.attemptId).toBe("attempt-wake");
   });
@@ -72,117 +62,86 @@ describe("createReviewFixIngressClient (AII-1184)", () => {
   };
 
   it("posts the event to /ReviewFixPR/<key>/feedback with the idempotency-key and maps a 2xx to accepted", async () => {
-    const calls: Array<{ url: string; headers: Headers }> = [];
-    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const request = new Request(input, init);
-      calls.push({ url: request.url, headers: request.headers });
-      return new Response("null", { status: 200, headers: { "content-type": "application/json" } });
-    });
-    const ingress = client.createReviewFixIngressClient("http://sidecar", { fetchImpl: fetchImpl as unknown as typeof fetch });
-    const outcome = await ingress.feedback(makeDestination(), event, { idempotencyKey: "d1" });
+    const fake = fakeFetch({ [FEEDBACK]: accepted });
+    const outcome = await ingressFor(fake).feedback(destination, event, { idempotencyKey: "d1" });
     expect(outcome).toEqual({ status: "accepted" });
-    expect(calls).toHaveLength(1);
-    expect(decodeURIComponent(calls[0]!.url)).toBe(`http://sidecar/ReviewFixPR/${JSON.stringify([7, "acme/app", 42])}/feedback`);
-    expect(calls[0]!.headers.get("idempotency-key")).toBe("d1");
+    expect(fake.calls).toHaveLength(1);
+    expect(decodeURIComponent(fake.calls[0]!.url.href)).toBe(`http://sidecar/ReviewFixPR/${JSON.stringify([7, "acme/app", 42])}/feedback`);
+    expect(fake.calls[0]!.headers.get("idempotency-key")).toBe("d1");
   });
 
   it("sends a nudge with no event under the supplied idempotency-key", async () => {
-    const calls: Array<{ url: string; headers: Headers }> = [];
-    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const request = new Request(input, init);
-      calls.push({ url: request.url, headers: request.headers });
-      return new Response("null", { status: 200, headers: { "content-type": "application/json" } });
-    });
-    const ingress = client.createReviewFixIngressClient("http://sidecar", { fetchImpl: fetchImpl as unknown as typeof fetch });
-    expect(await ingress.feedback(makeDestination(), undefined, { idempotencyKey: "9.4.100" })).toEqual({ status: "accepted" });
-    expect(calls[0]!.headers.get("idempotency-key")).toBe("9.4.100");
+    const fake = fakeFetch({ [FEEDBACK]: accepted });
+    expect(await ingressFor(fake).feedback(destination, undefined, { idempotencyKey: "9.4.100" })).toEqual({ status: "accepted" });
+    expect(fake.calls[0]!.headers.get("idempotency-key")).toBe("9.4.100");
   });
 
   it("maps a connection error to unavailable", async () => {
-    const fetchImpl = vi.fn(async () => { throw new Error("ECONNREFUSED"); });
-    const ingress = client.createReviewFixIngressClient("http://sidecar", { fetchImpl: fetchImpl as unknown as typeof fetch });
-    expect(await ingress.feedback(makeDestination(), event, { idempotencyKey: "d1" })).toEqual({ status: "unavailable" });
+    const fake = fakeFetch({ [FEEDBACK]: () => { throw new Error("ECONNREFUSED"); } });
+    expect(await ingressFor(fake).feedback(destination, event, { idempotencyKey: "d1" })).toEqual({ status: "unavailable" });
   });
 
   it("maps a timeout to unavailable", async () => {
-    const fetchImpl = vi.fn(
-      (_input: RequestInfo | URL, init?: RequestInit) =>
-        new Promise<Response>((_resolve, reject) => {
-          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
-        }),
-    );
-    const ingress = client.createReviewFixIngressClient("http://sidecar", { fetchImpl: fetchImpl as unknown as typeof fetch, timeoutMs: 20 });
-    expect(await ingress.feedback(makeDestination(), event, { idempotencyKey: "d1" })).toEqual({ status: "unavailable" });
+    const fake = fakeFetch({ [FEEDBACK]: hangUntilAborted });
+    expect(await ingressFor(fake, 20).feedback(destination, event, { idempotencyKey: "d1" })).toEqual({ status: "unavailable" });
   });
 
   it("maps a non-2xx to unavailable", async () => {
-    const fetchImpl = vi.fn(async () => new Response("boom", { status: 503 }));
-    const ingress = client.createReviewFixIngressClient("http://sidecar", { fetchImpl: fetchImpl as unknown as typeof fetch });
-    expect(await ingress.feedback(makeDestination(), event, { idempotencyKey: "d1" })).toEqual({ status: "unavailable" });
+    const fake = fakeFetch({ [FEEDBACK]: { status: 503, text: "boom" } });
+    expect(await ingressFor(fake).feedback(destination, event, { idempotencyKey: "d1" })).toEqual({ status: "unavailable" });
   });
 
   describe("cancel (AII-1186)", () => {
-    const run = async (respond: () => Response | Promise<Response>) => {
-      const calls: Array<{ url: string; headers: Headers; body: string }> = [];
-      const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const request = new Request(input, init);
-        calls.push({ url: request.url, headers: request.headers, body: await request.text() });
-        return respond();
-      });
-      const ingress = client.createReviewFixIngressClient("http://sidecar", { fetchImpl: fetchImpl as unknown as typeof fetch });
-      return { calls, outcome: await ingress.cancel("att-1", { idempotencyKey: "att-1.closed" }) };
+    const run = async (reply: Reply) => {
+      const fake = fakeFetch({ "POST /ReviewFixAttempt/att-1/cancel": reply });
+      return { calls: fake.calls, outcome: await ingressFor(fake).cancel("att-1", { idempotencyKey: "att-1.closed" }) };
     };
 
     it("contract: ReviewFixAttempt.cancel — the ingress client posts { attemptId } to the attempt's cancel handler with the idempotency key and maps a 2xx to accepted", async () => {
-      const { calls, outcome } = await run(() => new Response("null", { status: 200, headers: { "content-type": "application/json" } }));
+      const { calls, outcome } = await run(accepted);
       expect(outcome).toEqual({ status: "accepted" });
       expect(calls).toHaveLength(1);
-      expect(calls[0]!.url).toBe("http://sidecar/ReviewFixAttempt/att-1/cancel");
+      expect(calls[0]!.url.href).toBe("http://sidecar/ReviewFixAttempt/att-1/cancel");
       expect(calls[0]!.headers.get("idempotency-key")).toBe("att-1.closed");
       expect(JSON.parse(calls[0]!.body)).toEqual({ attemptId: "att-1" });
     });
 
     it("maps a non-2xx and a connection error to unavailable", async () => {
-      expect((await run(() => new Response("boom", { status: 503 }))).outcome).toEqual({ status: "unavailable" });
+      expect((await run({ status: 503, text: "boom" })).outcome).toEqual({ status: "unavailable" });
       expect((await run(() => { throw new Error("ECONNREFUSED"); })).outcome).toEqual({ status: "unavailable" });
     });
   });
 
   describe("result (AII-1185)", () => {
-    const stored = { status: "stored", result: { attemptId: "att-1" } };
-    const run = async (respond: () => Response | Promise<Response>) => {
-      const calls: Array<{ url: string; headers: Headers }> = [];
-      const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const request = new Request(input, init);
-        calls.push({ url: request.url, headers: request.headers });
-        return respond();
-      });
-      const ingress = client.createReviewFixIngressClient("http://sidecar", { fetchImpl: fetchImpl as unknown as typeof fetch });
-      const outcome = await ingress.result("att-1" as never, { attemptId: "att-1" } as never, { idempotencyKey: "att-1.result.k" });
-      return { outcome, calls };
+    const result = makeReviewFixResult({ attemptId: "att-1" });
+    const stored = { status: "stored", result };
+    const run = async (reply: Reply) => {
+      const fake = fakeFetch({ "POST /ReviewFixAttempt/att-1/result": reply });
+      const outcome = await ingressFor(fake).result("att-1", result, { idempotencyKey: "att-1.result.k" });
+      return { outcome, calls: fake.calls };
     };
 
     it("posts to /ReviewFixAttempt/<id>/result with the idempotency-key and returns the handler outcome", async () => {
-      const { outcome, calls } = await run(() => new Response(JSON.stringify(stored), { status: 200, headers: { "content-type": "application/json" } }));
+      const { outcome, calls } = await run({ json: stored });
       expect(outcome).toEqual({ status: "accepted", outcome: stored });
       expect(calls).toHaveLength(1);
-      expect(calls[0]!.url).toBe("http://sidecar/ReviewFixAttempt/att-1/result");
+      expect(calls[0]!.url.href).toBe("http://sidecar/ReviewFixAttempt/att-1/result");
       expect(calls[0]!.headers.get("idempotency-key")).toBe("att-1.result.k");
     });
 
     it("maps 409 to conflict, 404 to not-found, and other failures to unavailable", async () => {
-      expect((await run(() => new Response("x", { status: 409 }))).outcome).toEqual({ status: "conflict" });
-      expect((await run(() => new Response("x", { status: 404 }))).outcome).toEqual({ status: "not-found" });
-      expect((await run(() => new Response("x", { status: 503 }))).outcome).toEqual({ status: "unavailable" });
+      expect((await run({ status: 409, text: "x" })).outcome).toEqual({ status: "conflict" });
+      expect((await run({ status: 404, text: "x" })).outcome).toEqual({ status: "not-found" });
+      expect((await run({ status: 503, text: "x" })).outcome).toEqual({ status: "unavailable" });
       expect((await run(() => { throw new Error("ECONNREFUSED"); })).outcome).toEqual({ status: "unavailable" });
     });
 
     it("keys on attempt and body so a conflicting body never shares a key with the first", () => {
-      const a = { attemptId: "att-1", outputCommit: "a" } as never;
-      const b = { attemptId: "att-1", outputCommit: "b" } as never;
-      expect(client.reviewFixResultForwardKey(a)).toBe(client.reviewFixResultForwardKey({ ...(a as object) } as never));
-      expect(client.reviewFixResultForwardKey(a)).not.toBe(client.reviewFixResultForwardKey(b));
-      expect(client.reviewFixResultForwardKey(a)).toMatch(/^att-1\.result\.[0-9a-f]{64}$/);
+      const a = makeReviewFixResult({ attemptId: "att-1", outputCommit: "a".repeat(40) });
+      const b = makeReviewFixResult({ attemptId: "att-1", outputCommit: "b".repeat(40), deadlineAt: a.deadlineAt });
+      expect(reviewFixResultForwardKey(a)).toBe(reviewFixResultForwardKey({ ...a }));
+      expect(reviewFixResultForwardKey(a)).not.toBe(reviewFixResultForwardKey(b));
+      expect(reviewFixResultForwardKey(a)).toMatch(/^att-1\.result\.[0-9a-f]{64}$/);
     });
   });
 });

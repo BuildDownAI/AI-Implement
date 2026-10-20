@@ -1,37 +1,44 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import type { ChatGptPlanRecordV1 } from "../chatgpt-plan-token.js";
 import type * as DedupModule from "../dedup.js";
 import type * as CliModule from "../model-account-cli.js";
-import { createModelProtectedSecrets } from "../model-protected-secrets.js";
+import type * as ProtectedSecretsModule from "../model-protected-secrets.js";
 import { createModelSessionKeyProvider } from "../model-session-keys.js";
-import { createModelSessionStore } from "../model-session-store.js";
+import type * as SessionStoreModule from "../model-session-store.js";
 import type { ModelSessionStore } from "../model-session-store.js";
+import { makeChatGptPlanRecord } from "./helpers/builders.js";
+import { fakeFetch, type FakeFetch, type Routes } from "./helpers/fake-fetch.js";
+import { testDb } from "./helpers/test-db.js";
 
 const ACCESS = "SENTINEL-ACCESS-TOKEN-1";
 const REFRESH = "SENTINEL-REFRESH-TOKEN-2";
 const ID = "SENTINEL-ID-TOKEN-3";
 const SECRET = "test-runner-token-secret";
 const PROFILE = "chatgpt-main";
+// The fields revoke reads from OpenAI's published OpenID configuration, at their real URLs.
+const DISCOVERY = { issuer: "https://auth.openai.com", jwks_uri: "https://auth.openai.com/.well-known/jwks.json" };
+const OPENAI_REVOKES: Routes = {
+  "GET /.well-known/openid-configuration": { json: { ...DISCOVERY, revocation_endpoint: "https://auth.openai.com/api/accounts/oauth/revoke" } },
+  "POST /api/accounts/oauth/revoke": { status: 200 },
+};
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let cli: typeof CliModule;
+let protectedSecrets: typeof ProtectedSecretsModule;
+let sessionStore: typeof SessionStoreModule;
 let store: ModelSessionStore;
 let out: string[];
 let err: string[];
 let requestRefresh: ReturnType<typeof vi.fn>;
-let fetchMock: ReturnType<typeof vi.fn>;
+let openai: FakeFetch;
 let profile: { authMode: string; status: string } | null;
 
-function record(over: Record<string, unknown> = {}) {
-  return {
-    version: 1, email: "op@example.com", issuer: "https://auth.openai.com", subject: "sub-123",
-    clientId: "client_abcdefghijklmnop", extAgentHostId: "urn:uuid:laptop", idToken: ID, accessToken: ACCESS,
-    refreshToken: REFRESH, tokenType: "Bearer", scopes: ["openid", "chatgpt.tokens.use.direct"],
-    accessTokenExpiresAt: 1_000_000 + 3_600_000, earliestRefreshAt: null, savedAt: 1_000_000, ...over,
-  };
+// A record a laptop's sign-in saved, as `chatgpt-import` reads it from stdin.
+function record(over: Partial<ChatGptPlanRecordV1> = {}) {
+  return makeChatGptPlanRecord({
+    email: "op@example.com", subject: "sub-123", clientId: "client_abcdefghijklmnop",
+    idToken: ID, accessToken: ACCESS, refreshToken: REFRESH, savedAt: 1_000_000, ...over,
+  });
 }
 
 function deps(stdin: string, env: NodeJS.ProcessEnv = { RUNNER_TOKEN_SECRET: SECRET }): CliModule.CliDeps {
@@ -40,10 +47,10 @@ function deps(stdin: string, env: NodeJS.ProcessEnv = { RUNNER_TOKEN_SECRET: SEC
     hostId: () => cli.orchestratorHostId(),
     planSequence: (id) => cli.latestPlanSequence(id, () => dedup.getDb()),
     getProfile: (id) => (profile && id === PROFILE ? ({ profileId: id, ...profile } as never) : null),
-    secrets: () => createModelProtectedSecrets({ env, db: () => dedup.getDb() }),
+    secrets: () => protectedSecrets.createModelProtectedSecrets({ env, db: () => dedup.getDb() }),
     requestRefresh: requestRefresh as never,
     readState: async () => ({ lastOutcome: "refreshed" }),
-    fetch: fetchMock as never,
+    fetch: openai.fetch,
     readStdin: async () => stdin,
     now: () => 1_000_000,
     env,
@@ -64,14 +71,15 @@ const run = (argv: string[], stdin = JSON.stringify(record()), env?: NodeJS.Proc
   cli.main(argv, deps(stdin, env));
 
 beforeEach(async () => {
-  dbPath = path.join(os.tmpdir(), `model-account-cli-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  vi.resetModules();
-  process.env.DEDUP_DB_PATH = dbPath;
-  process.env.RUNNER_TOKEN_SECRET = SECRET;
-  dedup = await import("../dedup.js");
-  cli = await import("../model-account-cli.js");
-  dedup.getDb();
-  store = createModelSessionStore({
+  ({ dedup, cli, protectedSecrets, sessionStore } = (await testDb({
+    modules: {
+      dedup: () => import("../dedup.js"),
+      cli: () => import("../model-account-cli.js"),
+      protectedSecrets: () => import("../model-protected-secrets.js"),
+      sessionStore: () => import("../model-session-store.js"),
+    },
+  })).modules);
+  store = sessionStore.createModelSessionStore({
     keys: createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: SECRET }),
     verifyOwner: () => false,
     authorizeOperator: (op) => op === "model-account-cli",
@@ -80,15 +88,9 @@ beforeEach(async () => {
   out = [];
   err = [];
   requestRefresh = vi.fn(async () => {});
-  fetchMock = vi.fn();
+  // Only logout reaches OpenAI. These are its answers when revocation succeeds; logoutWith replaces them per case.
+  openai = fakeFetch(OPENAI_REVOKES);
   profile = { authMode: "codex-subscription", status: "active" };
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  for (const s of ["", "-wal", "-shm"]) {
-    try { fs.unlinkSync(dbPath + s); } catch { /* ignore */ }
-  }
 });
 
 describe("chatgpt-import", () => {
@@ -106,7 +108,7 @@ describe("chatgpt-import", () => {
   });
 
   it("replaces a row sealed under another RUNNER_TOKEN_SECRET", async () => {
-    const other = createModelSessionStore({
+    const other = sessionStore.createModelSessionStore({
       keys: createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: "another-secret" }),
       verifyOwner: () => false,
       authorizeOperator: (op) => op === "model-account-cli",
@@ -233,23 +235,23 @@ describe("status and logout on retired or mismatched profiles", () => {
 });
 
 describe("chatgpt-logout", () => {
-  const discovery = () => new Response(JSON.stringify({ issuer: "https://auth.openai.com", jwks_uri: "https://auth.openai.com/jwks", revocation_endpoint: "https://auth.openai.com/revoke" }), { status: 200 });
+  const discovery = OPENAI_REVOKES["GET /.well-known/openid-configuration"]!;
 
-  async function logoutWith(impl: (url: string) => Promise<Response>) {
+  async function logoutWith(routes: Routes) {
     await run(["chatgpt-import", "--profile", PROFILE]);
     out = [];
-    fetchMock.mockImplementation((url: string) => impl(String(url)));
+    openai = fakeFetch(routes);
     return run(["chatgpt-logout", "--profile", PROFILE]);
   }
 
-  const cases: Array<[string, (url: string) => Promise<Response>, boolean]> = [
-    ["confirmed", async (u) => (u.includes("openid-configuration") ? discovery() : new Response("", { status: 200 })), true],
-    ["non-200", async (u) => (u.includes("openid-configuration") ? discovery() : new Response("", { status: 500 })), false],
-    ["fetch throws", async () => { throw new Error(`net ${REFRESH}`); }, false],
-    ["no revocation endpoint", async () => new Response(JSON.stringify({ issuer: "https://auth.openai.com", jwks_uri: "https://auth.openai.com/jwks" }), { status: 200 }), false],
+  const cases: Array<[string, Routes, boolean]> = [
+    ["confirmed", OPENAI_REVOKES, true],
+    ["non-200", { "GET /.well-known/openid-configuration": discovery, "POST /api/accounts/oauth/revoke": { status: 500 } }, false],
+    ["fetch throws", { "GET /.well-known/openid-configuration": () => { throw new Error(`net ${REFRESH}`); } }, false],
+    ["no revocation endpoint", { "GET /.well-known/openid-configuration": { json: DISCOVERY } }, false],
   ];
-  it.each(cases)("removes all tokens when revocation is %s", async (_n, impl, confirmed) => {
-    expect(await logoutWith(impl)).toBe(0);
+  it.each(cases)("removes all tokens when revocation is %s", async (_n, routes, confirmed) => {
+    expect(await logoutWith(routes)).toBe(0);
     const data = stored()!.data;
     for (const k of ["accessToken", "refreshToken", "idToken"]) expect(data).not.toHaveProperty(k);
     expect(data.email).toBe("op@example.com");
@@ -259,8 +261,8 @@ describe("chatgpt-logout", () => {
 
   it("sends the refresh token only to the injected fetch", async () => {
     await logoutWith(cases[0]![1]);
-    const call = fetchMock.mock.calls.find((c) => String(c[0]).endsWith("/revoke"))!;
-    expect(String(call[1].body)).toContain(REFRESH);
+    const call = openai.calls.find((c) => c.path === "/api/accounts/oauth/revoke")!;
+    expect(call.body).toContain(REFRESH);
   });
 });
 
@@ -268,7 +270,7 @@ describe("secret-import / secret-delete", () => {
   const REF = "model-account:k1";
   const KEY = "SENTINEL-API-KEY-4";
   const B = { region: "us-east-1", accessKeyId: "SENTINEL-AKID-5", secretAccessKey: "SENTINEL-SAK-6", sessionToken: "SENTINEL-ST-7" };
-  const secrets = () => createModelProtectedSecrets({ env: { RUNNER_TOKEN_SECRET: SECRET }, db: () => dedup.getDb() });
+  const secrets = () => protectedSecrets.createModelProtectedSecrets({ env: { RUNNER_TOKEN_SECRET: SECRET }, db: () => dedup.getDb() });
   const rows = () => (dedup.getDb().prepare("SELECT COUNT(*) AS n FROM model_protected_secrets").get() as { n: number }).n;
   const leaks = () => {
     const text = [...out, ...err].join("\n");

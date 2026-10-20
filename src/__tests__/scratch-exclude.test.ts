@@ -1,9 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { prepareScratchExclusion, SCRATCH_PATHS } from "../pipeline/scratch-exclude.js";
+import { testDir } from "./helpers/test-dir.js";
 
 function git(cwd: string, args: string[]): { status: number | null; stdout: string; stderr: string } {
   const r = spawnSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
@@ -11,7 +11,7 @@ function git(cwd: string, args: string[]): { status: number | null; stdout: stri
 }
 
 function initRepo(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "scratch-exclude-"));
+  const dir = testDir("scratch-exclude");
   git(dir, ["init", "-q"]);
   git(dir, ["config", "user.email", "t@example.com"]);
   git(dir, ["config", "user.name", "Test"]);
@@ -27,13 +27,6 @@ describe("prepareScratchExclusion", () => {
   let dir: string;
   beforeEach(() => {
     dir = initRepo();
-  });
-  afterEach(() => {
-    try {
-      fs.rmSync(dir, { recursive: true, force: true });
-    } catch {
-      // On Windows, git marks object files read-only; ignore cleanup failures
-    }
   });
 
   it("keeps untracked ai-output/ out of the staged set after git add -A", () => {
@@ -68,7 +61,7 @@ describe("prepareScratchExclusion", () => {
   it("logs a warning when git rm --cached fails instead of swallowing it", () => {
     // A directory that is not a valid git repo: the exclude file still gets
     // seeded, but `git rm --cached` fails — which must not be silent.
-    const nonRepo = fs.mkdtempSync(path.join(os.tmpdir(), "scratch-nonrepo-"));
+    const nonRepo = testDir("scratch-nonrepo");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       prepareScratchExclusion(nonRepo);
@@ -77,7 +70,6 @@ describe("prepareScratchExclusion", () => {
       expect(warn.mock.calls.flat().join(" ")).toMatch(/scratch-exclude/);
     } finally {
       warn.mockRestore();
-      fs.rmSync(nonRepo, { recursive: true, force: true });
     }
   });
 

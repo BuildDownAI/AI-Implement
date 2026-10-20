@@ -6,14 +6,15 @@ vi.mock("node:child_process", () => ({
   spawn: vi.fn(),
 }));
 
+// Each default is the spy's own implementation, so vi.resetAllMocks() returns a spy to it.
 vi.mock("node:fs/promises", () => ({
-  mkdir: vi.fn().mockResolvedValue(undefined),
-  writeFile: vi.fn().mockResolvedValue(undefined),
-  chmod: vi.fn().mockResolvedValue(undefined),
-  unlink: vi.fn().mockResolvedValue(undefined),
-  readFile: vi.fn().mockRejectedValue(Object.assign(new Error("ENOENT"), { code: "ENOENT" })),
-  stat: vi.fn().mockResolvedValue({ isFile: () => true, mode: 0o600, uid: typeof process.getuid === "function" ? process.getuid() : 501 }),
-  lstat: vi.fn().mockResolvedValue({ isFile: () => true, isDirectory: () => false, mode: 0o600, uid: typeof process.getuid === "function" ? process.getuid() : 501 }),
+  mkdir: vi.fn(async () => undefined),
+  writeFile: vi.fn(async () => undefined),
+  chmod: vi.fn(async () => undefined),
+  unlink: vi.fn(async () => undefined),
+  readFile: vi.fn(async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); }),
+  stat: vi.fn(async () => ({ isFile: () => true, mode: 0o600, uid: typeof process.getuid === "function" ? process.getuid() : 501 })),
+  lstat: vi.fn(async () => ({ isFile: () => true, isDirectory: () => false, mode: 0o600, uid: typeof process.getuid === "function" ? process.getuid() : 501 })),
 }));
 
 vi.mock("../local-docker.js", () => ({
@@ -38,7 +39,8 @@ import {
   streamSessionLogsUntilShellReady,
   validateLocalSessionBootstrap,
 } from "../local/session.js";
-import { makeSnapshot } from "./configured-run-fixture.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
+import { makeSnapshot } from "./helpers/fixtures/configured-run.js";
 
 function makeExecFileMock(containerId = "abc123def456") {
   vi.mocked(rawExecFile).mockImplementation(
@@ -83,11 +85,8 @@ const BASE_OPTS = {
 
 describe("launchLocalSession", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.resetAllMocks();
     makeExecFileMock();
-    vi.mocked(readFile).mockImplementation(() =>
-      Promise.reject(Object.assign(new Error("ENOENT"), { code: "ENOENT" })),
-    );
   });
 
   it("returns a handle with the container id from docker output", async () => {
@@ -441,18 +440,17 @@ describe("startLocalAuthBridge release handling", () => {
 
 describe("local session bootstrap consumption", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.resetAllMocks();
     makeExecFileMock();
-    vi.mocked(stat).mockResolvedValue({ isFile: () => true, mode: 0o600, uid: typeof process.getuid === "function" ? process.getuid() : 501 } as never);
-    vi.mocked(lstat).mockResolvedValue({ isFile: () => true, isDirectory: () => false, mode: 0o600, uid: typeof process.getuid === "function" ? process.getuid() : 501 } as never);
   });
 
+  // The bootstrap startLocalAuthBridge writes: the bridge is reached from the container through host.docker.internal.
   function bootstrap(overrides: Record<string, unknown> = {}) {
     return {
       version: 1,
       snapshotId: "snap-1",
       projectKey: "owner/repo",
-      bridge: { baseUrl: "http://127.0.0.1:9", bearer: "b".repeat(40) },
+      bridge: { baseUrl: "http://host.docker.internal:4567", bearer: "b".repeat(40) },
       references: [{ profileId: "p-impl", authMode: "openai-api-key", kind: "api-key" }],
       trustedRepositories: ["owner/repo"],
       ...overrides,
@@ -583,12 +581,13 @@ describe("local session bootstrap consumption", () => {
       [LOCAL_AUTH_BOOTSTRAP_ENV]: path,
       AI_IMPLEMENT_HOST_UID: String(typeof process.getuid === "function" ? process.getuid() : 501),
     } as NodeJS.ProcessEnv;
-    const fetchMock = vi.fn().mockResolvedValue({ ok: false });
-    vi.stubGlobal("fetch", fetchMock);
+    // The bridge's answer to a bearer it did not issue.
+    const host = fakeFetch({ "POST /disposition": { status: 401, json: { error: "unauthorized" } } }).install();
 
     const result = await loadLocalSessionBootstrap({ env, snapshot: makeSnapshot("openai-api-key"), workspaceDir: "/workspace" });
 
     await expect(result.onConfiguredFinish(true)).rejects.toThrow("local configured disposition was not acknowledged");
+    expect(host.calls.map((c) => c.url.href)).toEqual(["http://host.docker.internal:4567/disposition"]);
   });
 });
 

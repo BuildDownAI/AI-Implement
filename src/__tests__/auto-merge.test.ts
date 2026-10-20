@@ -1,11 +1,13 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import os from "node:os";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import path from "node:path";
 import fs from "node:fs";
 import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
 import type * as AutoMergeModule from "../auto-merge.js";
+import type * as LedgerModule from "../review-ledger-store.js";
 import type { RepoMapping } from "../config.js";
+import { makeAppendLogEntry, makeMapping } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 
 vi.mock("../github-app-auth.js", () => ({
   getInstallationToken: vi.fn(async () => "tok"),
@@ -27,25 +29,23 @@ vi.mock("../comment-gapfill-queue.js", () => ({
 import { listOpenPullRequests, getCombinedChecksState, hasChangesRequestedReview, mergePullRequest, listCheckRuns, getCommitTime } from "../github.js";
 import { hasPendingConflictResolution, countConflictAttempts, enqueueConflictResolution } from "../comment-gapfill-queue.js";
 
-// Dynamic imports so auto-merge shares the same DB instance as the test (follows runner-callback.test.ts pattern)
-let dbPath: string;
 let dedup: typeof DedupModule;
 let log: typeof LogModule;
 let autoMerge: typeof AutoMergeModule;
+let ledger: typeof LedgerModule;
 
 beforeEach(async () => {
   vi.clearAllMocks();
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `auto-merge-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  autoMerge = await import("../auto-merge.js");
-  dedup.getDb();
-  log.initLogTable();
+  ({ dedup, log, autoMerge, ledger } = (
+    await testDb({
+      modules: {
+        dedup: () => import("../dedup.js"),
+        log: () => import("../log.js"),
+        autoMerge: () => import("../auto-merge.js"),
+        ledger: () => import("../review-ledger-store.js"),
+      },
+    })
+  ).modules);
 
   vi.mocked(listOpenPullRequests).mockResolvedValue([]);
   vi.mocked(getCombinedChecksState).mockResolvedValue("success");
@@ -58,24 +58,12 @@ beforeEach(async () => {
   vi.mocked(enqueueConflictResolution).mockReturnValue(1);
 });
 
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
-});
+const mapping = (overrides: Partial<RepoMapping> = {}) =>
+  makeMapping({ owner: "BuildDownAI", repo: "AI-Implement", autoMerge: true, ...overrides });
 
-function mapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
-  return {
-    owner: "BuildDownAI", repo: "AI-Implement", workflowFile: "claude-implement.yml",
-    defaultBranch: "main", maxInProgressAiIssues: 3, executionMode: "github-actions",
-    sessionMode: "autonomous", machineCpus: 2, machineMemoryMb: 4096, planningEnabled: false,
-    planningWorkflowFile: "", autoApprovePlans: true, extraEnv: {}, provider: "anthropic",
-    ticketingProvider: "linear", ticketingConfig: { kind: "linear" }, awsRegion: null, paused: false,
-    autoMerge: true, maxTurns: null, maxIterations: null, maxJobMinutes: null,
-    branchPrefix: null, skillsRepo: null, referenceRepos: null, sensitiveAddPatterns: null,
-    sensitiveAllowPatterns: null, dependencyTokenScope: null, reviewFixLifecycle: null,
-    memoryProviderId: null, reviewers: null,
-    ...overrides,
-  };
+/** The row an implementation run on the mapped repository leaves; its PR is titled `<identifier>: <title>`. */
+function appendDispatch(issueId: string, issueIdentifier: string, issueTitle: string): number {
+  return log.appendLog(makeAppendLogEntry({ issueId, issueIdentifier, issueTitle, teamKey: "AII", repo: "BuildDownAI/AI-Implement" }));
 }
 
 const deps = () => ({
@@ -83,9 +71,11 @@ const deps = () => ({
   githubAppPrivateKey: "k",
 });
 
-function pr(overrides: Record<string, unknown> = {}) {
+type OpenPullRequest = Awaited<ReturnType<typeof listOpenPullRequests>>[number];
+
+function pr(overrides: Partial<OpenPullRequest> = {}): OpenPullRequest {
   return {
-    number: 5, url: "https://github.com/o/r/pull/5", base: "ai-implement/feature/aii-200-feat",
+    number: 5, url: "https://github.com/BuildDownAI/AI-Implement/pull/5", base: "ai-implement/feature/aii-200-feat",
     head: "ai-implement/aii-300-add-thing", headSha: "sha5", draft: false,
     title: "AII-300: Add thing",
     ...overrides,
@@ -115,8 +105,8 @@ describe("runAutoMerges — repository-fix review process", () => {
     ({ name: "Claude Code Review", appSlug: "claude", status, conclusion });
 
   async function setup(): Promise<void> {
-    const id = log.appendLog({ issueId: "issue-aii-300", issueIdentifier: "AII-300", executionMode: "github-actions" });
-    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/o/r/pull/5");
+    const id = appendDispatch("issue-aii-300", "AII-300", "Add thing");
+    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/BuildDownAI/AI-Implement/pull/5");
     vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
   }
   const repoFix = () => mapping({ reviewProcess: "claude-code-review-repository-fix" });
@@ -141,7 +131,6 @@ describe("runAutoMerges — repository-fix review process", () => {
     await setup();
     vi.mocked(listCheckRuns).mockResolvedValue([claudeRun("completed", "success")]);
     vi.mocked(getCommitTime).mockResolvedValue(Date.now() - 60_000);
-    const ledger = await import("../review-ledger-store.js");
     ledger.upsertReviewFinding({ repo: "BuildDownAI/AI-Implement", prNumber: 5, source: "github-review", severity: "blocking", body: "bug" });
     await autoMerge.runAutoMerges([repoFix()], deps());
     expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
@@ -151,7 +140,6 @@ describe("runAutoMerges — repository-fix review process", () => {
     await setup();
     vi.mocked(listCheckRuns).mockResolvedValue([claudeRun("completed", "success")]);
     vi.mocked(getCommitTime).mockResolvedValue(Date.now() + 60_000);
-    const ledger = await import("../review-ledger-store.js");
     ledger.upsertReviewFinding({ repo: "BuildDownAI/AI-Implement", prNumber: 5, source: "github-review", severity: "blocking", body: "bug" });
     await autoMerge.runAutoMerges([repoFix()], deps());
     expect(vi.mocked(mergePullRequest)).toHaveBeenCalledWith("tok", "BuildDownAI", "AI-Implement", 5, "sha5", "merge");
@@ -199,8 +187,8 @@ describe("runAutoMerges — repository-fix review process", () => {
 
 describe("runAutoMerges", () => {
   it("merges a green PR whose base is a grouping branch when runner_approved", async () => {
-    const id = log.appendLog({ issueId: "issue-aii-300", issueIdentifier: "AII-300", executionMode: "github-actions" });
-    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/o/r/pull/5");
+    const id = appendDispatch("issue-aii-300", "AII-300", "Add thing");
+    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/BuildDownAI/AI-Implement/pull/5");
 
     vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
     await autoMerge.runAutoMerges([mapping()], deps());
@@ -255,14 +243,14 @@ describe("runAutoMerges", () => {
   });
 
   it("fail-soft: first PR merge rejects, second still merges (2 calls)", async () => {
-    const id1 = log.appendLog({ issueId: "i1", issueIdentifier: "AII-1", executionMode: "github-actions" });
-    const id2 = log.appendLog({ issueId: "i2", issueIdentifier: "AII-2", executionMode: "github-actions" });
-    log.updateJobStatus(id1, "completed", "runner_approved", "https://github.com/o/r/pull/1");
-    log.updateJobStatus(id2, "completed", "runner_approved", "https://github.com/o/r/pull/2");
+    const id1 = appendDispatch("i1", "AII-1", "thing");
+    const id2 = appendDispatch("i2", "AII-2", "other");
+    log.updateJobStatus(id1, "completed", "runner_approved", "https://github.com/BuildDownAI/AI-Implement/pull/1");
+    log.updateJobStatus(id2, "completed", "runner_approved", "https://github.com/BuildDownAI/AI-Implement/pull/2");
 
     vi.mocked(listOpenPullRequests).mockResolvedValue([
-      pr({ number: 1, url: "https://github.com/o/r/pull/1", headSha: "sha1", base: "ai-implement/feature/group-a", title: "AII-1: thing" }),
-      pr({ number: 2, url: "https://github.com/o/r/pull/2", headSha: "sha2", base: "ai-implement/feature/group-b", title: "AII-2: other" }),
+      pr({ number: 1, url: "https://github.com/BuildDownAI/AI-Implement/pull/1", headSha: "sha1", base: "ai-implement/feature/group-a", title: "AII-1: thing" }),
+      pr({ number: 2, url: "https://github.com/BuildDownAI/AI-Implement/pull/2", headSha: "sha2", base: "ai-implement/feature/group-b", title: "AII-2: other" }),
     ]);
     vi.mocked(mergePullRequest)
       .mockRejectedValueOnce(new Error("boom"))
@@ -290,16 +278,16 @@ describe("runAutoMerges", () => {
   });
 
   it("holds PR when run ended with conclusion=success and no approval stamp (AII-572 bug scenario)", async () => {
-    const id = log.appendLog({ issueId: "issue-aii-300", issueIdentifier: "AII-300", executionMode: "github-actions" });
-    log.updateJobStatus(id, "completed", "success", "https://github.com/o/r/pull/5");
+    const id = appendDispatch("issue-aii-300", "AII-300", "Add thing");
+    log.updateJobStatus(id, "completed", "success", "https://github.com/BuildDownAI/AI-Implement/pull/5");
     vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
     await autoMerge.runAutoMerges([mapping()], deps());
     expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
   });
 
   it("merges when approved column is set even if conclusion was overwritten to success (AII-572 fix)", async () => {
-    const id = log.appendLog({ issueId: "issue-aii-300", issueIdentifier: "AII-300", executionMode: "github-actions" });
-    log.stampJobApproved(id, "https://github.com/o/r/pull/5");
+    const id = appendDispatch("issue-aii-300", "AII-300", "Add thing");
+    log.stampJobApproved(id, "https://github.com/BuildDownAI/AI-Implement/pull/5");
     log.updateJobStatus(id, "completed", "success", null);
     vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
     await autoMerge.runAutoMerges([mapping()], deps());
@@ -307,8 +295,8 @@ describe("runAutoMerges", () => {
   });
 
   it("merges for rows with conclusion=runner_approved and approved=0 (backward compat — existing live rows)", async () => {
-    const id = log.appendLog({ issueId: "issue-aii-300", issueIdentifier: "AII-300", executionMode: "github-actions" });
-    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/o/r/pull/5");
+    const id = appendDispatch("issue-aii-300", "AII-300", "Add thing");
+    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/BuildDownAI/AI-Implement/pull/5");
     vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
     await autoMerge.runAutoMerges([mapping()], deps());
     expect(vi.mocked(mergePullRequest)).toHaveBeenCalledWith("tok", "BuildDownAI", "AI-Implement", 5, "sha5", "merge");
@@ -317,8 +305,8 @@ describe("runAutoMerges", () => {
 
 describe("runAutoMerges honours the Auto-merge setting", () => {
   it("does not merge or list PRs when autoMerge is false, and logs why", async () => {
-    const id = log.appendLog({ issueId: "issue-aii-300", issueIdentifier: "AII-300", executionMode: "github-actions" });
-    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/o/r/pull/5");
+    const id = appendDispatch("issue-aii-300", "AII-300", "Add thing");
+    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/BuildDownAI/AI-Implement/pull/5");
     vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
     const spy = vi.spyOn(console, "log").mockImplementation(() => {});
     await autoMerge.runAutoMerges([mapping({ autoMerge: false })], deps());
@@ -378,8 +366,8 @@ describe("classifyStalledChild", () => {
 describe("conflict detection in autoMergeRepo", () => {
   beforeEach(() => {
     // Insert an approved row for AII-300 so the gate passes
-    const id = log.appendLog({ issueId: "issue-aii-300", issueIdentifier: "AII-300", executionMode: "github-actions" });
-    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/o/r/pull/5");
+    const id = appendDispatch("issue-aii-300", "AII-300", "Add thing");
+    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/BuildDownAI/AI-Implement/pull/5");
   });
 
   it("enqueues conflict resolution when merge returns 'conflict' and no prior attempts", async () => {
@@ -445,11 +433,11 @@ describe("conflict detection in autoMergeRepo", () => {
 describe("cap-exhausted notify-once (AII-277 Finding 4)", () => {
   it("notifies once per PR across repeated cycles", async () => {
     autoMerge.resetCapExhaustedNotifications();
-    const id = log.appendLog({ issueId: "issue-aii-300", issueIdentifier: "AII-300", executionMode: "github-actions" });
-    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/o/r/pull/77");
+    const id = appendDispatch("issue-aii-300", "AII-300", "Add thing");
+    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/BuildDownAI/AI-Implement/pull/77");
 
-    vi.mocked(listOpenPullRequests).mockResolvedValue([pr({ number: 77, url: "https://github.com/o/r/pull/77", title: "AII-300: Add thing" })] as never);
-    vi.mocked(mergePullRequest).mockResolvedValue("conflict" as never);
+    vi.mocked(listOpenPullRequests).mockResolvedValue([pr({ number: 77, url: "https://github.com/BuildDownAI/AI-Implement/pull/77", title: "AII-300: Add thing" })]);
+    vi.mocked(mergePullRequest).mockResolvedValue("conflict");
     vi.mocked(hasPendingConflictResolution).mockReturnValue(false);
     vi.mocked(countConflictAttempts).mockReturnValue(autoMerge.MAX_CONFLICT_RESOLUTION_ATTEMPTS);
     const notify = vi.fn(async () => {});
@@ -463,7 +451,7 @@ describe("cap-exhausted notify-once (AII-277 Finding 4)", () => {
 
 describe("approval gate (AII-460) — run record verdict replaces hasInFlightJobForPr", () => {
   it("defers when run record is running (pr_url NULL)", async () => {
-    const id = log.appendLog({ issueId: "issue-aii-300", issueIdentifier: "AII-300", executionMode: "github-actions" });
+    const id = appendDispatch("issue-aii-300", "AII-300", "Add thing");
     dedup.getDb().prepare("UPDATE dispatch_log SET status = 'running' WHERE id = ?").run(id);
 
     vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
@@ -475,8 +463,8 @@ describe("approval gate (AII-460) — run record verdict replaces hasInFlightJob
   });
 
   it("holds (no merge) when run completed with 'success' conclusion (no approval mark)", async () => {
-    const id = log.appendLog({ issueId: "issue-aii-300", issueIdentifier: "AII-300", executionMode: "github-actions" });
-    log.updateJobStatus(id, "completed", "success", "https://github.com/o/r/pull/5");
+    const id = appendDispatch("issue-aii-300", "AII-300", "Add thing");
+    log.updateJobStatus(id, "completed", "success", "https://github.com/BuildDownAI/AI-Implement/pull/5");
 
     vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -487,8 +475,8 @@ describe("approval gate (AII-460) — run record verdict replaces hasInFlightJob
   });
 
   it("merges when run record has completed / runner_approved", async () => {
-    const id = log.appendLog({ issueId: "issue-aii-300", issueIdentifier: "AII-300", executionMode: "github-actions" });
-    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/o/r/pull/5");
+    const id = appendDispatch("issue-aii-300", "AII-300", "Add thing");
+    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/BuildDownAI/AI-Implement/pull/5");
 
     vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
     await autoMerge.runAutoMerges([mapping()], deps());
@@ -517,11 +505,11 @@ describe("approval gate (AII-460) — run record verdict replaces hasInFlightJob
 
   it("holds a second PR sharing the same issue key when the approval was for a different PR URL", async () => {
     // PR #5 (AII-300) was approved — a later PR #10 with the same title key must not inherit that approval
-    const id = log.appendLog({ issueId: "issue-aii-300", issueIdentifier: "AII-300", executionMode: "github-actions" });
-    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/o/r/pull/5");
+    const id = appendDispatch("issue-aii-300", "AII-300", "Add thing");
+    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/BuildDownAI/AI-Implement/pull/5");
 
     vi.mocked(listOpenPullRequests).mockResolvedValue([
-      pr({ number: 10, url: "https://github.com/o/r/pull/10", title: "AII-300: Add thing" }),
+      pr({ number: 10, url: "https://github.com/BuildDownAI/AI-Implement/pull/10", title: "AII-300: Add thing" }),
     ]);
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     await autoMerge.runAutoMerges([mapping()], deps());
@@ -531,14 +519,14 @@ describe("approval gate (AII-460) — run record verdict replaces hasInFlightJob
   });
 
   it("defers the in-flight PR and still merges the approved sibling", async () => {
-    const id300 = log.appendLog({ issueId: "i300", issueIdentifier: "AII-300", executionMode: "github-actions" });
+    const id300 = appendDispatch("i300", "AII-300", "Add thing");
     dedup.getDb().prepare("UPDATE dispatch_log SET status = 'running' WHERE id = ?").run(id300);
-    const id301 = log.appendLog({ issueId: "i301", issueIdentifier: "AII-301", executionMode: "github-actions" });
-    log.updateJobStatus(id301, "completed", "runner_approved", "https://github.com/o/r/pull/6");
+    const id301 = appendDispatch("i301", "AII-301", "Other thing");
+    log.updateJobStatus(id301, "completed", "runner_approved", "https://github.com/BuildDownAI/AI-Implement/pull/6");
 
     vi.mocked(listOpenPullRequests).mockResolvedValue([
       pr({ number: 5, headSha: "sha5", base: "ai-implement/feature/aii-200-feat", title: "AII-300: Add thing" }),
-      pr({ number: 6, url: "https://github.com/o/r/pull/6", headSha: "sha6", base: "ai-implement/feature/aii-201-feat", title: "AII-301: Other thing" }),
+      pr({ number: 6, url: "https://github.com/BuildDownAI/AI-Implement/pull/6", headSha: "sha6", base: "ai-implement/feature/aii-201-feat", title: "AII-301: Other thing" }),
     ]);
     await autoMerge.runAutoMerges([mapping()], deps());
     expect(vi.mocked(mergePullRequest)).toHaveBeenCalledTimes(1);

@@ -1,7 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createCipheriv, randomBytes } from "node:crypto";
-import { mkdirSync, mkdtempSync, symlinkSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, existsSync, realpathSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, symlinkSync, readdirSync, readFileSync, statSync, writeFileSync, existsSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import {
   ModelAuthClientError,
@@ -24,6 +23,8 @@ import {
   type SafeModelAuthDiagnostic,
 } from "../model-auth-contract.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
+import { testDir } from "./helpers/test-dir.js";
 
 // Synthetic sentinels only. No real credential, no network, no paid call.
 const S_API = "SENTINEL-api-key-0001";
@@ -149,6 +150,10 @@ const SAFE = {
 };
 const sentinelEnv = () => ({ ...SAFE, ...Object.fromEntries(UNLISTED.map((k) => [k, "synthetic-" + k])) });
 
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
 describe("buildModelInvocationEnv", () => {
   const inheritedEnv = {
     PATH: "/bin",
@@ -257,7 +262,7 @@ describe("client", () => {
   let sleeps: number[];
 
   beforeEach(() => {
-    root = mkdtempSync(join(tmpdir(), "model-auth-client-"));
+    root = testDir("model-auth-client");
     authRoot = join(root, "auth");
     workspace = join(root, "workspace");
     artifacts = join(workspace, "ai-output");
@@ -265,36 +270,26 @@ describe("client", () => {
     mkdirSync(workspace);
     sleeps = [];
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
 
   type Handler = (route: string, body: Record<string, unknown>) => { status: number; body: unknown } | Promise<never>;
   it("applies the allowlist to the process.env default", async () => {
-    const saved = { ...process.env };
-    Object.assign(process.env, sentinelEnv());
-    try {
-      const dir = mkdtempSync(join(tmpdir(), "model-auth-default-"));
-      try {
-        const { transport } = fakeTransport((route) => reply(route, ack()));
-        const client = createModelAuthClient({
-          source: { kind: "hosted", grant: grant(), transport },
-          authRoot: dir,
-          forbiddenRoots: [],
-          now: () => NOW,
-          sleep: async () => {},
-        });
-        await client.checkout({ profileId: "sub", authMode: "claude-subscription" as const });
-        await client.invoke("sub", async (inv) => {
-          for (const k of UNLISTED) expect(inv.env).not.toHaveProperty(k);
-          expect(JSON.stringify(inv.env)).not.toContain("synthetic-");
-          expect(inv.env.PATH).toBe(process.env.PATH);
-        });
-      } finally {
-        rmSync(dir, { recursive: true, force: true });
-      }
-    } finally {
-      for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
-      Object.assign(process.env, saved);
-    }
+    // Created before the stub, whose TMPDIR would otherwise place it.
+    const dir = testDir("model-auth-default");
+    for (const [key, value] of Object.entries(sentinelEnv())) vi.stubEnv(key, value);
+    const { transport } = fakeTransport((route) => reply(route, ack()));
+    const client = createModelAuthClient({
+      source: { kind: "hosted", grant: grant(), transport },
+      authRoot: dir,
+      forbiddenRoots: [],
+      now: () => NOW,
+      sleep: async () => {},
+    });
+    await client.checkout({ profileId: "sub", authMode: "claude-subscription" as const });
+    await client.invoke("sub", async (inv) => {
+      for (const k of UNLISTED) expect(inv.env).not.toHaveProperty(k);
+      expect(JSON.stringify(inv.env)).not.toContain("synthetic-");
+      expect(inv.env.PATH).toBe(process.env.PATH);
+    });
   });
 
   function fakeTransport(handler: Handler) {
@@ -758,58 +753,52 @@ describe("client", () => {
     });
 
     it("strips every authority leak by default and from the passed env only", () => {
-      const prev = process.env.AI_IMPLEMENT_FORWARDED_SECRETS;
-      process.env.AI_IMPLEMENT_FORWARDED_SECRETS = "UNRELATED";
-      try {
-        const leak = "SENTINEL-leak-0007";
-        const inheritedEnv = {
-          PATH: "/bin",
-          HOME: "/home/x",
-          SSL_CERT_FILE: "/etc/ca.pem",
-          HTTPS_PROXY: "http://proxy:3128",
-          RUNNER_CALLBACK_URL: leak,
-          RUNNER_CALLBACK_BASE_URL: leak,
-          RUN_TOKEN: leak,
-          RUN_PROGRESS_TOKEN: leak,
-          RUN_PUBLICATION_TOKEN: leak,
-          RUN_RESULT_TOKEN: leak,
-          GITHUB_TOKEN: leak,
-          GH_TOKEN: leak,
-          NPM_TOKEN: leak,
-          AI_IMPLEMENT_DEP_TOKEN_OVERRIDE: leak,
-          AI_IMPLEMENT_RUN_CONFIG: leak,
-          AI_IMPLEMENT_FORWARDED_SECRETS: "MY_FWD, OTHER_FWD",
-          MY_FWD: leak,
-          OTHER_FWD: leak,
-          UNRELATED: "kept",
-          MODEL_AUTH_KEY: leak,
-          OPENAI_BASE_URL: leak,
-          ANTHROPIC_BASE_URL: leak,
-          ANTHROPIC_BEDROCK_BASE_URL: leak,
-          CLAUDE_CODE_USE_VERTEX: "1",
-          ANTHROPIC_VERTEX_PROJECT_ID: leak,
-        };
-        for (const [authMode, secret] of [
-          ["openai-api-key", { kind: "api-key", apiKey: S_API }],
-          ["anthropic-api-key", { kind: "api-key", apiKey: S_API }],
-        ] as const) {
-          const { env, strippedKeys } = buildModelInvocationEnv({
-            authMode,
-            secret,
-            inheritedEnv,
-            protectedKeys: ["MODEL_AUTH_KEY"],
-          });
-          expect(JSON.stringify(env)).not.toContain(leak);
-          expect(JSON.stringify(strippedKeys)).not.toContain(leak);
-          expect(env).not.toHaveProperty("CLAUDE_CODE_USE_VERTEX");
-          expect(env).not.toHaveProperty("OPENAI_BASE_URL");
-          expect(env).not.toHaveProperty("MODEL_AUTH_KEY");
-          expect(env).toMatchObject({ PATH: "/bin", HOME: "/home/x", SSL_CERT_FILE: "/etc/ca.pem", HTTPS_PROXY: "http://proxy:3128" });
-          expect(env).not.toHaveProperty("UNRELATED");
-        }
-      } finally {
-        if (prev === undefined) delete process.env.AI_IMPLEMENT_FORWARDED_SECRETS;
-        else process.env.AI_IMPLEMENT_FORWARDED_SECRETS = prev;
+      vi.stubEnv("AI_IMPLEMENT_FORWARDED_SECRETS", "UNRELATED");
+      const leak = "SENTINEL-leak-0007";
+      const inheritedEnv = {
+        PATH: "/bin",
+        HOME: "/home/x",
+        SSL_CERT_FILE: "/etc/ca.pem",
+        HTTPS_PROXY: "http://proxy:3128",
+        RUNNER_CALLBACK_URL: leak,
+        RUNNER_CALLBACK_BASE_URL: leak,
+        RUN_TOKEN: leak,
+        RUN_PROGRESS_TOKEN: leak,
+        RUN_PUBLICATION_TOKEN: leak,
+        RUN_RESULT_TOKEN: leak,
+        GITHUB_TOKEN: leak,
+        GH_TOKEN: leak,
+        NPM_TOKEN: leak,
+        AI_IMPLEMENT_DEP_TOKEN_OVERRIDE: leak,
+        AI_IMPLEMENT_RUN_CONFIG: leak,
+        AI_IMPLEMENT_FORWARDED_SECRETS: "MY_FWD, OTHER_FWD",
+        MY_FWD: leak,
+        OTHER_FWD: leak,
+        UNRELATED: "kept",
+        MODEL_AUTH_KEY: leak,
+        OPENAI_BASE_URL: leak,
+        ANTHROPIC_BASE_URL: leak,
+        ANTHROPIC_BEDROCK_BASE_URL: leak,
+        CLAUDE_CODE_USE_VERTEX: "1",
+        ANTHROPIC_VERTEX_PROJECT_ID: leak,
+      };
+      for (const [authMode, secret] of [
+        ["openai-api-key", { kind: "api-key", apiKey: S_API }],
+        ["anthropic-api-key", { kind: "api-key", apiKey: S_API }],
+      ] as const) {
+        const { env, strippedKeys } = buildModelInvocationEnv({
+          authMode,
+          secret,
+          inheritedEnv,
+          protectedKeys: ["MODEL_AUTH_KEY"],
+        });
+        expect(JSON.stringify(env)).not.toContain(leak);
+        expect(JSON.stringify(strippedKeys)).not.toContain(leak);
+        expect(env).not.toHaveProperty("CLAUDE_CODE_USE_VERTEX");
+        expect(env).not.toHaveProperty("OPENAI_BASE_URL");
+        expect(env).not.toHaveProperty("MODEL_AUTH_KEY");
+        expect(env).toMatchObject({ PATH: "/bin", HOME: "/home/x", SSL_CERT_FILE: "/etc/ca.pem", HTTPS_PROXY: "http://proxy:3128" });
+        expect(env).not.toHaveProperty("UNRELATED");
       }
     });
 
@@ -913,13 +902,13 @@ describe("client", () => {
 
 describe("createModelAuthTransport", () => {
   it("sends the bearer to the model-auth route only and never surfaces raw text", async () => {
-    const fetchImpl = vi.fn(async () => new Response("not json SENTINEL", { status: 500 })) as unknown as typeof fetch;
-    const t = createModelAuthTransport({ baseUrl: "https://orch.example/", bearer: S_BEARER, fetchImpl });
+    const orchestrator = fakeFetch({ "POST /runner/model-auth/checkpoint": { status: 500, text: "not json SENTINEL" } });
+    const t = createModelAuthTransport({ baseUrl: "https://orch.example/", bearer: S_BEARER, fetchImpl: orchestrator.fetch });
     const res = await t.post(MODEL_AUTH_ROUTES.checkpoint, "{}");
     expect(res).toEqual({ status: 500, body: undefined });
-    const [url, init] = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
-    expect(url).toBe("https://orch.example/runner/model-auth/checkpoint");
-    expect((init.headers as Record<string, string>).Authorization).toBe(`Bearer ${S_BEARER}`);
+    expect(orchestrator.calls).toHaveLength(1);
+    expect(orchestrator.calls[0]!.url.href).toBe("https://orch.example/runner/model-auth/checkpoint");
+    expect(orchestrator.calls[0]!.headers.get("authorization")).toBe(`Bearer ${S_BEARER}`);
   });
 });
 
@@ -932,12 +921,11 @@ describe("ChatGPT plan access token (codex-subscription)", () => {
   let authRoot: string;
   let clock: number;
   beforeEach(() => {
-    root = mkdtempSync(join(tmpdir(), "model-auth-cg-"));
+    root = testDir("model-auth-cg");
     authRoot = join(root, "auth");
     mkdirSync(authRoot);
     clock = NOW;
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
 
   const tok = (accessToken: string, expiresAt: number) => ({ kind: "chatgpt-access-token" as const, accessToken, expiresAt });
   const diagnostics: unknown[] = [];

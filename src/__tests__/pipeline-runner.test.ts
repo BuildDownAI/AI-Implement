@@ -1,5 +1,4 @@
 import { describe, it, expect, vi } from "vitest";
-import { DefaultPipelineContext } from "../pipeline/context.js";
 import { PipelineRunner, type PipelineRunnerOptions } from "../pipeline/runner.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import type {
@@ -17,19 +16,7 @@ import type {
   StepModule,
   StepReporter,
 } from "../pipeline/types.js";
-
-function makeContext(overrides: Partial<ConstructorParameters<typeof DefaultPipelineContext>[0]> = {}): DefaultPipelineContext {
-  return new DefaultPipelineContext({
-    jobId: 1,
-    issueId: "issue-1",
-    issueIdentifier: "ENG-1",
-    issueTitle: "Test issue",
-    issueDescription: "Description",
-    nonce: "test-nonce",
-    orchestratorUrl: "http://localhost:8080",
-    ...overrides,
-  });
-}
+import { makeContext } from "./helpers/builders.js";
 
 function makeModule(outputs: Record<string, unknown> = {}): StepModule {
   return {

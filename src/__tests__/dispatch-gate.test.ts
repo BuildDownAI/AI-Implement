@@ -1,37 +1,36 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
 import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
 import type * as BreakerModule from "../dispatch-breaker.js";
 import type * as GateModule from "../dispatch-gate.js";
+import type * as AdmissionModule from "../dispatch-admission.js";
+import type * as StuckWatchdogModule from "../stuck-watchdog.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let log: typeof LogModule;
 let breaker: typeof BreakerModule;
 let gate: typeof GateModule;
+let admission: typeof AdmissionModule;
+let stuckWatchdog: typeof StuckWatchdogModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `dispatch-gate-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
   delete process.env.DISPATCH_BREAKER_THRESHOLD;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  breaker = await import("../dispatch-breaker.js");
-  gate = await import("../dispatch-gate.js");
-  log.initLogTable();
-  breaker.initDispatchBreakerTable();
+  ({ dedup, log, breaker, gate, admission, stuckWatchdog } = (
+    await testDb({
+      modules: {
+        dedup: () => import("../dedup.js"),
+        log: () => import("../log.js"),
+        breaker: () => import("../dispatch-breaker.js"),
+        gate: () => import("../dispatch-gate.js"),
+        admission: () => import("../dispatch-admission.js"),
+        stuckWatchdog: () => import("../stuck-watchdog.js"),
+      },
+    })
+  ).modules);
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   delete process.env.DISPATCH_BREAKER_THRESHOLD;
 });
 
@@ -453,8 +452,7 @@ describe("acquireDispatch — transactional final authority (AII-783)", () => {
     expect(decision).toEqual({ ok: false, reason: "parked", count: 0, cap: 5 });
   });
 
-  it("writes a Legacy owner when no lifecycleOwner is given, and the given owner otherwise", async () => {
-    const admission = await import("../dispatch-admission.js");
+  it("writes a Legacy owner when no lifecycleOwner is given, and the given owner otherwise", () => {
     expect(gate.acquireDispatch(req({ dispatchId: "owner-default", issueId: "issue-o1" })).ok).toBe(true);
     expect(admission.read("owner-default")?.lifecycleOwner).toEqual({ kind: "legacy" });
 
@@ -591,7 +589,6 @@ describe("remediateStuckJob — admission release only on confirmed stop (AII-78
   };
 
   it("a confirmed stopRunner (destroy succeeded) releases the reservation", async () => {
-    const stuckWatchdog = await import("../stuck-watchdog.js");
     const acquired = gate.acquireDispatch({
       dispatchId: "stuck-a",
       issueId: "issue-stuck-a",
@@ -637,7 +634,6 @@ describe("remediateStuckJob — admission release only on confirmed stop (AII-78
   });
 
   it("an unconfirmed stopRunner (destroy returned false) leaves the reservation held", async () => {
-    const stuckWatchdog = await import("../stuck-watchdog.js");
     const acquired = gate.acquireDispatch({
       dispatchId: "stuck-b",
       issueId: "issue-stuck-b",
@@ -682,7 +678,6 @@ describe("remediateStuckJob — admission release only on confirmed stop (AII-78
   });
 
   it("a stopRunner that throws (destroy call failed) also leaves the reservation held", async () => {
-    const stuckWatchdog = await import("../stuck-watchdog.js");
     const acquired = gate.acquireDispatch({
       dispatchId: "stuck-c",
       issueId: "issue-stuck-c",

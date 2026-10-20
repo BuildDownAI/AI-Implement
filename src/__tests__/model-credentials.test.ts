@@ -1,15 +1,12 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { beforeEach, describe, expect, it } from "vitest";
 import type * as StoreModule from "../agent-config-store.js";
-import type * as DedupModule from "../dedup.js";
+import { serializeChatGptPlanRecord, type ChatGptPlanRecordV1 } from "../chatgpt-plan-token.js";
 import type * as CredModule from "../model-credentials.js";
 import type { ModelSessionStore, SessionReadResult } from "../model-session-store.js";
+import { makeChatGptPlanRecord } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let store: typeof StoreModule;
-let dedup: typeof DedupModule;
 let cred: typeof CredModule;
 
 const API_SENTINEL = "sk-synthetic-api-SENTINEL-0001";
@@ -25,11 +22,9 @@ let planReads: string[];
 const ACCESS = "synthetic-access-SENTINEL-0004";
 const REFRESH = "synthetic-refresh-SENTINEL-0005";
 const IDTOK = "synthetic-id-SENTINEL-0006";
-const planJson = (over: Record<string, unknown> = {}) => JSON.stringify({
-  version: 1, email: "u@example.com", issuer: "https://auth.openai.com", subject: "s", clientId: "c",
-  extAgentHostId: "h", idToken: IDTOK, accessToken: ACCESS, refreshToken: REFRESH, tokenType: "Bearer",
-  scopes: ["chatgpt.tokens.use.direct"], accessTokenExpiresAt: 5_000_000, earliestRefreshAt: null, savedAt: 1, ...over,
-});
+const planJson = (over: Partial<ChatGptPlanRecordV1> = {}) => serializeChatGptPlanRecord(makeChatGptPlanRecord({
+  idToken: IDTOK, accessToken: ACCESS, refreshToken: REFRESH, savedAt: 1, accessTokenExpiresAt: 5_000_000, ...over,
+}));
 
 function deps(extra: Partial<CredModule.ModelCredentialDeps> = {}): CredModule.ModelCredentialDeps {
   const sessionStore: ModelSessionStore = {
@@ -76,23 +71,15 @@ const req = (over: Partial<CredModule.CredentialRequest> = {}): CredModule.Crede
 });
 
 beforeEach(async () => {
-  dbPath = path.join(os.tmpdir(), `model-credentials-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  vi.resetModules();
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  store = await import("../agent-config-store.js");
-  cred = await import("../model-credentials.js");
+  ({ store, cred } = (await testDb({
+    modules: { store: () => import("../agent-config-store.js"), cred: () => import("../model-credentials.js") },
+  })).modules);
   secrets = new Map([["model-account:anth", API_SENTINEL]]);
   resolverCalls = [];
   readCalls = [];
   planReads = [];
   planResult = { ok: true, profileId: "cdx", ownerGeneration: 1, stateSequence: 2, sessionData: planJson() };
   readResult = { ok: true, profileId: "sub", ownerGeneration: 1, stateSequence: 7, sessionData: SESSION_SENTINEL };
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
 });
 
 describe("codex-subscription (hosted ChatGPT plan record)", () => {

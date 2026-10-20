@@ -1,29 +1,15 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
+import { describe, it, expect, beforeEach } from "vitest";
 import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let log: typeof LogModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `log-phase-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  log.initLogTable();
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  ({ dedup, log } = (await testDb({
+    modules: { dedup: () => import("../dedup.js"), log: () => import("../log.js") },
+  })).modules);
 });
 
 describe("dispatch log phase column", () => {
@@ -38,28 +24,18 @@ describe("dispatch log phase column", () => {
   });
 
   it("backfills pre-existing rows to 'implementation'", async () => {
-    // Use a fresh file so the legacy CREATE TABLE runs against a schema without phase
-    const legacyDbPath = path.join(
-      os.tmpdir(),
-      `legacy-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
+    // A second, empty database, so the legacy CREATE TABLE runs against a schema without phase.
+    const { dedup: legacyDedup, log: legacyLog } = (await testDb({
+      tables: "none",
+      modules: { dedup: () => import("../dedup.js"), log: () => import("../log.js") },
+    })).modules;
+    legacyDedup.getDb().exec(
+      "CREATE TABLE IF NOT EXISTS dispatch_log (id INTEGER PRIMARY KEY AUTOINCREMENT, issue_id TEXT NOT NULL, dispatched_at INTEGER NOT NULL DEFAULT 0, dispatch_number INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'unknown')",
     );
-    vi.resetModules();
-    process.env.DEDUP_DB_PATH = legacyDbPath;
-    const legacyDedup = await import("../dedup.js");
-    const legacyLog = await import("../log.js");
-    try {
-      legacyDedup.getDb().exec(
-        "CREATE TABLE IF NOT EXISTS dispatch_log (id INTEGER PRIMARY KEY AUTOINCREMENT, issue_id TEXT NOT NULL, dispatched_at INTEGER NOT NULL DEFAULT 0, dispatch_number INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'unknown')",
-      );
-      legacyDedup.getDb().prepare("INSERT INTO dispatch_log (issue_id, dispatched_at) VALUES ('legacy', 1)").run();
-      legacyLog.initLogTable();
-      const row = legacyDedup.getDb().prepare("SELECT phase FROM dispatch_log WHERE issue_id = 'legacy'").get() as { phase: string };
-      expect(row.phase).toBe("implementation");
-    } finally {
-      legacyDedup.closeDb();
-      try { fs.unlinkSync(legacyDbPath); } catch { /* ignore */ }
-      process.env.DEDUP_DB_PATH = dbPath;
-    }
+    legacyDedup.getDb().prepare("INSERT INTO dispatch_log (issue_id, dispatched_at) VALUES ('legacy', 1)").run();
+    legacyLog.initLogTable();
+    const row = legacyDedup.getDb().prepare("SELECT phase FROM dispatch_log WHERE issue_id = 'legacy'").get() as { phase: string };
+    expect(row.phase).toBe("implementation");
   });
 });
 

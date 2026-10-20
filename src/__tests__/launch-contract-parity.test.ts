@@ -11,14 +11,7 @@
  * "Launch parity test".
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import type { AppConfig } from "../index.js";
-import type { RepoMapping } from "../config.js";
-import type { TicketIssue, TicketingProvider } from "../providers/types.js";
-import type { ProviderRegistry } from "../providers/index.js";
 import type { DrainCommentGapfillsInput } from "../comment-gapfill-drain.js";
 import type { KgRefreshSenderDeps } from "../restate/kg-refresh-senders.js";
 import type { KeptMachineFly } from "../restate/kg-refresh-production.js";
@@ -30,6 +23,10 @@ import type { ReviewFixWorkerTransport } from "../review-fix-worker.js";
 import { buildLocalRunnerEnv } from "../local-docker.js";
 import { decodeRunConfig, buildKgRefreshRunConfig, type RunConfigV1 } from "../run-config.js";
 import { DEFAULT_RETRY_POLICY, type RetryPolicy } from "../pipeline/retry-backoff.js";
+import { makeAppConfig, makeAppendLogEntry, makeIssue, makeMapping, makeProvider, makeRegistry, makeScopedInstallationToken } from "./helpers/builders.js";
+import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
+import { githubError, githubFile } from "./helpers/replies/github.js";
+import { testDb, type LoadedModules } from "./helpers/test-db.js";
 
 // ---------------------------------------------------------------------------
 // The cells, the expected tokens and the known gaps
@@ -90,27 +87,12 @@ const CALLBACK_URL = "https://orch.example";
 /** A non-default policy: a path that sends DEFAULT_RETRY_POLICY instead of getRetryPolicy() fails. */
 const STORED_RETRY_POLICY: RetryPolicy = { ...DEFAULT_RETRY_POLICY, requestRetries: 5, stageRetries: 3, reviewMaxTurns: 44 };
 
-/** A full RepoMapping with every field the envelope reads set to a non-default value. */
-const MAPPING: RepoMapping = {
+/** A mapping with every field the envelope reads set to a non-default value. */
+const MAPPING = makeMapping({
   owner: OWNER,
   repo: REPO,
-  workflowFile: "claude-implement.yml",
-  defaultBranch: "main",
   maxInProgressAiIssues: 5,
-  executionMode: "github-actions",
-  sessionMode: "autonomous",
-  machineCpus: 2,
-  machineMemoryMb: 4096,
   planningEnabled: true,
-  planningWorkflowFile: "claude-plan.yml",
-  autoApprovePlans: true,
-  autoMerge: false,
-  extraEnv: {},
-  provider: "anthropic",
-  ticketingProvider: "linear",
-  ticketingConfig: { kind: "linear" },
-  awsRegion: null,
-  paused: false,
   maxTurns: 37,
   maxIterations: 4,
   maxJobMinutes: 75,
@@ -120,46 +102,35 @@ const MAPPING: RepoMapping = {
   sensitiveAddPatterns: ["secrets/**"],
   sensitiveAllowPatterns: ["secrets/example.txt"],
   dependencyTokenScope: "installation",
-  reviewFixLifecycle: null,
-  memoryProviderId: null,
   reviewers: [{ id: "code-review", gates: true, maxTurns: 20 }],
   prDispatchBudget: 9,
   trustedReviewAuthors: ["trusted-reviewer"],
   reviewProcess: "claude-code-review",
-};
+});
 
-const ISSUE: TicketIssue = {
+const ISSUE = makeIssue({
   id: "issue-parity-1",
   identifier: "AII-1317",
   title: "Parity fixture",
   description: "Parity fixture body",
   scopeKey: TEAM,
-  nativeStatus: "Todo",
   profiles: ["frontend", "database"],
   assigneeName: "Sam Developer",
-};
+});
 
-const CONFIG = {
-  githubAppId: "1",
-  githubAppPrivateKey: "key",
-  notifyWebhookUrl: null,
-  notifyType: "slack",
-  healthPort: 8080,
+const CONFIG = makeAppConfig({
   flySessionsToken: "fly-token",
   flySessionsApp: "fly-app",
   flySessionsRegion: "iad",
-  flyOrchestratorApp: null,
-  tenantId: null,
   sessionImage: DEFAULT_IMAGE,
-  runnerImageExplicit: false,
   anthropicApiKey: "sk-test",
-  claudeOAuthToken: null,
   runnerCallbackBaseUrl: CALLBACK_URL,
   runnerTokenSecret: TOKEN_SECRET,
   localRunnerImage: "local-runner:img",
   localRunnerOrchestratorUrl: "http://localhost:9000",
   kgSourceRepo: "acme/kg",
-} as unknown as AppConfig;
+});
+const SCOPED_TOKEN = () => makeScopedInstallationToken({ installationId: INSTALLATION_ID });
 
 const CAPABILITIES: WorkflowCapabilities = {
   contract: "envelope",
@@ -180,7 +151,6 @@ type Launch =
 
 interface Recorder {
   launches: Launch[];
-  unplannedFetch: string[];
   /** When set, `.ai-implement/image.yml` names EVIL_IMAGE. */
   evilImage: boolean;
 }
@@ -225,7 +195,8 @@ vi.mock("../github-app-auth.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../github-app-auth.js")>()),
   getInstallationToken: async () => "gh-token",
   // Fly and local children boot with a target-repo scoped token on the feature side.
-  getScopedInstallationToken: async () => ({ token: "gh-token", expiresAt: "", installationId: 7 }),
+  getScopedInstallationToken: async () =>
+    (await import("./helpers/builders.js")).makeScopedInstallationToken({ installationId: 7 }),
   getInstallationId: async () => 7,
 }));
 
@@ -235,96 +206,63 @@ vi.mock("../workflow-probe.js", async (importOriginal) => ({
   resolveWorkflowContract: async () => "envelope",
 }));
 
-/** The global fetch fake. It serves only the two reads the cells plan for and records any other call. */
-function installFetchFake(rec: Recorder): void {
-  vi.stubGlobal("fetch", async (input: unknown) => {
-    const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as { url: string }).url;
-    if (url.endsWith("/contents/.ai-implement/image.yml")) {
-      if (!rec.evilImage) return new Response("not found", { status: 404 });
-      const content = Buffer.from(`image: ${EVIL_IMAGE}\n`).toString("base64");
-      return new Response(JSON.stringify({ type: "file", encoding: "base64", content }), { status: 200 });
-    }
-    if (/\/repos\/[^/]+\/[^/]+\/pulls\/\d+$/.test(url)) {
-      return new Response(JSON.stringify({ merged: false, state: "open", head: { ref: "ai-implement/aii-1317", sha: "a".repeat(40) } }), { status: 200 });
-    }
-    rec.unplannedFetch.push(url);
-    throw new Error(`launch-contract-parity: unplanned fetch ${url}`);
-  });
+/** The global fetch fake: the two reads the cells plan for. Any other request fails the test. */
+function installFetchFake(rec: Recorder): FakeFetch {
+  const imageYml = () => (rec.evilImage ? githubFile(`image: ${EVIL_IMAGE}\n`) : githubError(404, "Not Found"));
+  return fakeFetch({
+    [`GET /repos/${OWNER}/${REPO}/contents/.ai-implement/image.yml` as const]: imageYml,
+    "GET /repos/acme/kg/contents/.ai-implement/image.yml": imageYml,
+    [`GET /repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}` as const]: {
+      json: { merged: false, state: "open", head: { ref: "ai-implement/aii-1317", sha: "a".repeat(40) } },
+    },
+  }).install();
 }
 
-function provider(): TicketingProvider {
-  const noop = async () => undefined;
-  return {
-    id: "jira",
-    issueUrl: () => "https://example.test/AII-1317",
-    markImplementing: noop,
-    markImplementationFailed: noop,
-    markPlanningStarted: noop,
-    markPlanningFailed: noop,
-    postComment: noop,
-    findByKey: async () => null,
-  } as unknown as TicketingProvider;
-}
+const provider = () => makeProvider();
 
 // ---------------------------------------------------------------------------
 // The world: one fresh module graph, SQLite file and recorder per run
 // ---------------------------------------------------------------------------
 
-async function loadModules() {
-  return {
-    index: await import("../index.js"),
-    dedup: await import("../dedup.js"),
-    log: await import("../log.js"),
-    breaker: await import("../dispatch-breaker.js"),
-    config: await import("../config.js"),
-    settings: await import("../orchestrator-settings.js"),
-    runnerMode: await import("../runner-mode.js"),
-    queue: await import("../comment-gapfill-queue.js"),
-    drain: await import("../comment-gapfill-drain.js"),
-    reviewFixQueue: await import("../review-fix-queue.js"),
-    worker: await import("../review-fix-worker.js"),
-    runnerTokens: await import("../runner-tokens.js"),
-    repoImage: await import("../repo-image.js"),
-    kgSenders: await import("../restate/kg-refresh-senders.js"),
-  };
-}
-type Modules = Awaited<ReturnType<typeof loadModules>>;
+const MODULES = {
+  index: () => import("../index.js"),
+  dedup: () => import("../dedup.js"),
+  log: () => import("../log.js"),
+  admission: () => import("../dispatch-admission.js"),
+  config: () => import("../config.js"),
+  settings: () => import("../orchestrator-settings.js"),
+  queue: () => import("../comment-gapfill-queue.js"),
+  drain: () => import("../comment-gapfill-drain.js"),
+  reviewFixQueue: () => import("../review-fix-queue.js"),
+  worker: () => import("../review-fix-worker.js"),
+  runnerTokens: () => import("../runner-tokens.js"),
+  repoImage: () => import("../repo-image.js"),
+  kgSenders: () => import("../restate/kg-refresh-senders.js"),
+};
+type Modules = LoadedModules<typeof MODULES>;
 
 interface World extends Modules {
   rec: Recorder;
-  dbPath: string;
+  api: FakeFetch;
 }
 
 const CLEARED_ENV = ["RUN_TOKEN", "RUNNER_CALLBACK_URL", "RUN_PROGRESS_TOKEN", "RUN_PUBLICATION_TOKEN", "ORCHESTRATOR_URL", "RUNNER_MODE"] as const;
 
+/** A fresh world for one run of a cell: its own module graph and database, its own recorder and fetch fake. */
 async function boot(opts: { evilImage: boolean; runnerMode?: string }): Promise<World> {
-  vi.resetModules();
-  for (const key of CLEARED_ENV) delete process.env[key];
-  const rec: Recorder = { launches: [], unplannedFetch: [], evilImage: opts.evilImage };
+  for (const key of CLEARED_ENV) vi.stubEnv(key, undefined);
+  if (opts.runnerMode) vi.stubEnv("RUNNER_MODE", opts.runnerMode);
+  const rec: Recorder = { launches: [], evilImage: opts.evilImage };
   holder.current = rec;
-  installFetchFake(rec);
-  const dbPath = path.join(os.tmpdir(), `launch-parity-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  if (opts.runnerMode) process.env.RUNNER_MODE = opts.runnerMode;
-  const modules = await loadModules();
-  modules.dedup.getDb();
-  modules.log.initLogTable();
-  modules.breaker.initDispatchBreakerTable();
-  modules.config.initMappingsTable();
-  modules.runnerMode.initSettingsTable();
+  const api = installFetchFake(rec);
+  const modules = (await testDb({ modules: MODULES })).modules;
   modules.settings.setRetryPolicy(STORED_RETRY_POLICY);
   modules.config.upsertMapping(TEAM, MAPPING);
-  return { ...modules, rec, dbPath };
+  return { ...modules, rec, api };
 }
 
-function teardown(world: World | null): void {
-  world?.dedup.closeDb();
-  if (world) {
-    try { fs.unlinkSync(world.dbPath); } catch { /* ignore */ }
-  }
+function teardown(): void {
   holder.current = null;
-  vi.unstubAllGlobals();
-  for (const key of CLEARED_ENV) delete process.env[key];
 }
 
 // ---------------------------------------------------------------------------
@@ -385,10 +323,24 @@ const planning = (execPath: Backend): LaunchPath => (w) =>
 
 const gapFill = (runnerMode: "gha" | "fly" | "local"): LaunchPath => async (w) => {
   w.queue.enqueueCommentGapfill({ owner: OWNER, repo: REPO, prNumber: PR_NUMBER, commentId: 9001, commenter: "sam", instruction: "please address the review" });
-  const jobId = w.log.appendLog({
+  // The PR's originating implementation dispatch, admitted on the issue scope as acquireDispatch admits it, and
+  // released once it completed.
+  const entry = makeAppendLogEntry({
     issueId: ISSUE.id, issueIdentifier: ISSUE.identifier, issueTitle: ISSUE.title, teamKey: TEAM,
-    repo: `${OWNER}/${REPO}`, phase: "implementation", status: "completed",
+    repo: `${OWNER}/${REPO}`, issueState: ISSUE.nativeStatus, status: "completed",
   });
+  const taken = w.admission.acquire({
+    dispatchId: entry.dispatchId!,
+    mappingKey: TEAM,
+    scope: { kind: "issue", issueScope: TEAM, issueId: ISSUE.id },
+    kind: "implementation",
+    backend: "github-actions",
+    lifecycleOwner: { kind: "legacy" },
+    cap: 3,
+  });
+  if (!taken.ok) throw new Error(`seed admission refused: ${taken.reason}`);
+  w.admission.release(entry.dispatchId!, { kind: "legacy" }, taken.record.generation, "finalized");
+  const jobId = w.log.appendLog({ ...entry, admissionGeneration: taken.record.generation });
   w.log.updateJobPrUrl(jobId, `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`);
   const opts: DrainCommentGapfillsInput = {
     getMappings: () => ({ [TEAM]: MAPPING }),
@@ -486,10 +438,9 @@ const legacyReviewFix: Partial<Record<Backend, LaunchPath>> = {
 async function runLegacyReviewFixQueue(w: World): Promise<void> {
   w.reviewFixQueue.enqueueReviewFix({
     issueId: ISSUE.id, issueIdentifier: ISSUE.identifier, repo: `${OWNER}/${REPO}`, prNumber: PR_NUMBER,
-    reason: "review_feedback", sourceEventId: "parity-event-1",
+    reason: "changes_requested", sourceEventId: "parity-event-1",
   });
-  const registry = { forMapping: async () => provider() } as unknown as ProviderRegistry;
-  await w.index.processReviewFixQueue(CONFIG, registry);
+  await w.index.processReviewFixQueue(CONFIG, makeRegistry({ provider: provider(), mappings: { [TEAM]: MAPPING } }));
 }
 
 function kgDeps(w: World, claim: boolean): KgRefreshSenderDeps {
@@ -517,8 +468,8 @@ function kgDeps(w: World, claim: boolean): KgRefreshSenderDeps {
       anthropicApiKey: "sk-test", claudeOAuthToken: null, kgSourceRepo: "acme/kg",
     },
     getInstallationToken: async () => "gh-token",
-    getScopedInstallationToken: async () => ({ token: "gh-token", expiresAt: "", installationId: 7 }),
-    mintToken: async () => ({ token: "gh-token", expiresAt: "" }),
+    getScopedInstallationToken: async () => SCOPED_TOKEN(),
+    mintToken: async () => SCOPED_TOKEN(),
     fetchDefaultBranch: async () => "trunk",
     // The real image resolution, as production injects it.
     resolveRunnerImage: w.repoImage.resolveRunnerImageForDispatch,
@@ -596,11 +547,10 @@ async function launchOnce(cell: Cell, options: RunOptions = {}): Promise<Capture
   try {
     world = await boot({ evilImage: false, runnerMode: cell.runnerMode });
     await cell.run(world, options);
-    expect(world.rec.unplannedFetch, `${cell.kind} · ${cell.backend} made an unplanned fetch`).toEqual([]);
     expect(world.rec.launches, `${cell.kind} · ${cell.backend} should make exactly one launch call`).toHaveLength(1);
     return capture(world.rec.launches[0]!);
   } finally {
-    teardown(world);
+    teardown();
   }
 }
 
@@ -621,13 +571,12 @@ async function launchesWithEvilImage(cell: Cell, options: RunOptions): Promise<b
       if (!(err instanceof world.repoImage.RunnerImageNotAllowedError)) return true;
       refused = true;
     }
-    expect(world.rec.unplannedFetch, `${cell.kind} · ${cell.backend} made an unplanned fetch`).toEqual([]);
     const logged = vi.mocked(console.warn).mock.calls.some(
       (call) => typeof call[0] === "string" && call[0].includes(`runner image ${EVIL_IMAGE} for`) && call[0].includes("is not allowed"),
     );
     return world.rec.launches.length > 0 || !(refused || logged);
   } finally {
-    teardown(world);
+    teardown();
   }
 }
 
@@ -683,6 +632,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 describe("launch contract parity", () => {

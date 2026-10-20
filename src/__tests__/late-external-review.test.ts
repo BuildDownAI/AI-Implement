@@ -22,19 +22,27 @@ vi.mock("../review-ledger-store.js", () => ({
 import { getCombinedChecksState, getCommitTime, getPullRequestState, listPrComments, postPrComment } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { getJobByDispatchId, stampJobApproved } from "../log.js";
-import { listOpenReviewFindings } from "../review-ledger-store.js";
+import { listOpenReviewFindings, type StoredReviewFinding } from "../review-ledger-store.js";
+import type { ReviewLedgerSeverity } from "../pipeline/review-ledger.js";
 import {
   createProductionLateExternalReviewDependencies,
   LATE_EXTERNAL_APPROVAL_MARKER,
   type LateExternalReviewInput,
 } from "../restate/late-external-review.js";
+import { makeJob } from "./helpers/builders.js";
 
 const input: LateExternalReviewInput & { headSha: string } = {
-  dispatchId: "d-1", owner: "owner", repo: "repo", prNumber: 12, prUrl: "https://gh/pr/12", headSha: "sha-a",
+  dispatchId: "d-1", owner: "owner", repo: "repo", prNumber: 12, prUrl: "https://github.com/owner/repo/pull/12", headSha: "sha-a",
 };
 const deps = createProductionLateExternalReviewDependencies({ githubAppId: "1", githubAppPrivateKey: "k" });
-const prState = (state: string, headSha: string) => ({ state, headSha }) as never;
-const finding = (severity: string, lastSeenAt = 0) => ({ severity, lastSeenAt }) as never;
+/** What getPullRequestState reads back for the PR: never merged here, so "closed" means closed unmerged. */
+const prState = (state: "open" | "closed", headSha: string) => ({ merged: false, state, headRef: "ai-implement/feature", headSha });
+let findingId = 0;
+/** An open review-contract finding on owner/repo#12 as the review ledger stores it. */
+const finding = (severity: ReviewLedgerSeverity, lastSeenAt = 0): StoredReviewFinding => ({
+  id: ++findingId, repo: "owner/repo", prNumber: 12, findingKey: `key-${findingId}`, status: "open", revision: 1,
+  firstSeenAt: lastSeenAt, lastSeenAt, resolvedAt: null, source: "review-contract", severity, body: "Fix this.",
+});
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -88,18 +96,20 @@ describe("readTick", () => {
 
 describe("findJob", () => {
   it("returns null for an unknown dispatch id", () => {
-    vi.mocked(getJobByDispatchId).mockReturnValue(null as never);
+    vi.mocked(getJobByDispatchId).mockReturnValue(null);
     expect(deps.findJob("nope")).toBeNull();
     expect(getJobByDispatchId).toHaveBeenCalledWith("nope");
   });
 
   it.each([true, false])("returns only id, approved=%s and inFlight for a known job", async (approved) => {
-    vi.mocked(getJobByDispatchId).mockReturnValue({ id: 7, approved, status: "completed", extra: "x" } as never);
+    vi.mocked(getJobByDispatchId).mockReturnValue(
+      makeJob({ id: 7, approved, dispatchId: "d-1", status: "completed", completedAt: Date.now(), prUrl: input.prUrl }),
+    );
     expect(await deps.findJob("d-1")).toStrictEqual({ id: 7, approved, inFlight: false });
   });
 
-  it.each(["dispatched", "running"])("reports a %s row as inFlight", async (status) => {
-    vi.mocked(getJobByDispatchId).mockReturnValue({ id: 7, approved: false, status } as never);
+  it.each(["dispatched", "running"] as const)("reports a %s row as inFlight", async (status) => {
+    vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ id: 7, approved: false, dispatchId: "d-1", status, prUrl: input.prUrl }));
     expect(await deps.findJob("d-1")).toStrictEqual({ id: 7, approved: false, inFlight: true });
   });
 });
@@ -107,20 +117,20 @@ describe("findJob", () => {
 describe("hasComment", () => {
   it("finds the marker inside an existing comment", async () => {
     vi.mocked(listPrComments).mockResolvedValue([
-      { body: "unrelated" },
-      { body: `${LATE_EXTERNAL_APPROVAL_MARKER}\nThe external review passed.` },
-    ] as never);
+      { id: 1, body: "unrelated" },
+      { id: 2, body: `${LATE_EXTERNAL_APPROVAL_MARKER}\nThe external review passed.` },
+    ]);
     expect(await deps.hasComment(input, LATE_EXTERNAL_APPROVAL_MARKER)).toBe(true);
     expect(listPrComments).toHaveBeenCalledWith("tok", "owner", "repo", 12);
   });
 
   it("is false when no comment carries the marker", async () => {
-    vi.mocked(listPrComments).mockResolvedValue([{ body: "unrelated" }] as never);
+    vi.mocked(listPrComments).mockResolvedValue([{ id: 1, body: "unrelated" }]);
     expect(await deps.hasComment(input, LATE_EXTERNAL_APPROVAL_MARKER)).toBe(false);
   });
 
   it("reads strictly only when asked (AII-1361)", async () => {
-    vi.mocked(listPrComments).mockResolvedValue([] as never);
+    vi.mocked(listPrComments).mockResolvedValue([]);
     await deps.hasComment(input, "m", { strict: true });
     expect(listPrComments).toHaveBeenLastCalledWith("tok", "owner", "repo", 12, { strict: true });
   });

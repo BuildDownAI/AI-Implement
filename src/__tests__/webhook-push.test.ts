@@ -1,11 +1,8 @@
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type * as WebhookModule from "../webhook.js";
-import type * as DedupModule from "../dedup.js";
+import { testDb } from "./helpers/test-db.js";
 
 // ---------- Hoisted mocks ----------
 
@@ -86,31 +83,13 @@ function makeRequest(
 
 const SECRET = "test-webhook-secret";
 
-let dbPath: string;
 let webhook: typeof WebhookModule;
-let dedup: typeof DedupModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `webhook-push-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  webhook = await import("../webhook.js");
+  ({ webhook } = (await testDb({ modules: { webhook: () => import("../webhook.js") } })).modules);
 
   hoisted.refreshAvailability.mockReset();
   hoisted.refreshAvailability.mockResolvedValue({});
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    // ignore
-  }
 });
 
 // ---------- Push event handling ----------

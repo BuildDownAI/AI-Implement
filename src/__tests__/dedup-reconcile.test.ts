@@ -1,18 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { reconcileDispatched, type DedupReconcileDeps } from "../dedup-reconcile.js";
-import type { RepoMapping } from "../config.js";
+import type { IssueLifecycleState, TicketingProvider } from "../providers/types.js";
+import { makeMapping, makeProvider } from "./helpers/builders.js";
 
-type States = Map<string, "active" | "completed" | "cancelled">;
-
-function mapping(provider: string): RepoMapping {
-  return { ticketingProvider: provider } as unknown as RepoMapping;
-}
+type States = Map<string, IssueLifecycleState>;
 
 function stub(id: string, impl: (ids: string[]) => Promise<States>) {
-  return { id, fetchLifecycleStates: vi.fn(impl) } as unknown as {
-    id: string;
-    fetchLifecycleStates: ReturnType<typeof vi.fn>;
-  };
+  return makeProvider({ id, fetchLifecycleStates: vi.fn(impl) });
 }
 
 let clear: ReturnType<typeof vi.fn>;
@@ -29,14 +23,14 @@ beforeEach(() => {
 
 function run(
   rows: DedupReconcileDeps["rows"],
-  providers: Record<string, ReturnType<typeof stub>>,
+  providers: Record<string, TicketingProvider>,
   extra: Partial<DedupReconcileDeps> = {},
 ) {
   return reconcileDispatched({
     rows,
-    mappings: { LIN: mapping("linear"), LIN2: mapping("linear"), JIR: mapping("jira") },
+    mappings: { LIN: makeMapping(), LIN2: makeMapping(), JIR: makeMapping({ ticketingProvider: "jira" }) },
     latestJobTeamKey: () => null,
-    providerFor: async (m) => providers[m.ticketingProvider] as never,
+    providerFor: async (m) => providers[m.ticketingProvider],
     clear: clear as never,
     recordNotFound: recordNotFound as never,
     ...extra,

@@ -1,34 +1,21 @@
 /**
  * Behavioral tests for `src/dispatch-admission.ts` (AII-775). Exercises the module
- * directly against a temp SQLite file, matching `dispatch-gate.test.ts`'s harness.
+ * directly against a temp SQLite file from the shared `testDb` harness.
  * Vitest strips types without checking them, so the `prepare` synchronous-only
  * contract is type-checked by `npm run typecheck` (its `tsconfig.tests.json` pass).
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
-import type * as DedupModule from "../dedup.js";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import type * as AdmissionModule from "../dispatch-admission.js";
+import type * as LogModule from "../log.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
-let dedup: typeof DedupModule;
 let admission: typeof AdmissionModule;
+let log: typeof LogModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `dispatch-admission-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  admission = await import("../dispatch-admission.js");
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  ({ admission, log } = (
+    await testDb({ modules: { admission: () => import("../dispatch-admission.js"), log: () => import("../log.js") } })
+  ).modules);
 });
 
 const LEGACY = { kind: "legacy" as const };
@@ -586,13 +573,6 @@ describe("reconcileTerminalCallbackAdmissions", () => {
   const CONFIRM_ALL = async () => true;
   const CONFIRM_NONE = async () => false;
 
-  let log: typeof import("../log.js");
-
-  beforeEach(async () => {
-    log = await import("../log.js");
-    log.initLogTable();
-  });
-
   it("holds a generic callback success until the exact backend terminates, then releases it", async () => {
     const dispatchId = "dispatch-generic-success";
     const admitted = admission.acquire(issueRequest({ dispatchId }));
@@ -804,13 +784,8 @@ describe("reconcileTerminalCallbackAdmissions", () => {
 
 describe("listHeldReservations / releaseHeldReservation (AII-1069)", () => {
   const never = async () => false;
-  beforeEach(async () => {
-    (await import("../log.js")).initLogTable();
-  });
 
   it("lists only unreleased rows with job status and conclusion", async () => {
-    const log = await import("../log.js");
-    log.initLogTable();
     admission.acquire(issueRequest({ dispatchId: "held-1", scope: { kind: "issue", issueScope: "t", issueId: "i1" } }));
     admission.acquire(issueRequest({ dispatchId: "held-2", scope: { kind: "issue", issueScope: "t", issueId: "i2" }, lifecycleOwner: RESTATE_A }));
     admission.acquire(issueRequest({ dispatchId: "done", scope: { kind: "issue", issueScope: "t", issueId: "i3" } }));
@@ -839,8 +814,6 @@ describe("listHeldReservations / releaseHeldReservation (AII-1069)", () => {
   });
 
   it("does not trust a terminal job of an earlier generation", async () => {
-    const log = await import("../log.js");
-    log.initLogTable();
     admission.acquire(issueRequest());
     const id = log.appendLog({ issueId: "AII-1", dispatchId: "dispatch-1", admissionGeneration: 0, repo: "o/r" });
     log.updateJobStatus(id, "completed", "success");
@@ -854,8 +827,6 @@ describe("listHeldReservations / releaseHeldReservation (AII-1069)", () => {
   });
 
   it("refuses a terminal job row without confirmation, releases it once confirmed, and with force either way", async () => {
-    const log = await import("../log.js");
-    log.initLogTable();
     admission.acquire(issueRequest());
     const id = log.appendLog({ issueId: "AII-1", dispatchId: "dispatch-1", repo: "o/r" });
     log.updateJobStatus(id, "completed", "planning_callback");

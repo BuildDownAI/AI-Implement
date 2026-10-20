@@ -1,31 +1,26 @@
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DedupModule from "../dedup.js";
-import type * as RunnerModeModule from "../runner-mode.js";
 import type * as RetentionModule from "../restate/retention.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let retention: typeof RetentionModule;
 let warn: ReturnType<typeof vi.spyOn>;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `restate-retention-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  const runnerMode: typeof RunnerModeModule = await import("../runner-mode.js");
-  retention = await import("../restate/retention.js");
-  runnerMode.initSettingsTable();
+  ({ dedup, retention } = (
+    await testDb({
+      modules: {
+        dedup: () => import("../dedup.js"),
+        retention: () => import("../restate/retention.js"),
+      },
+    })
+  ).modules);
   warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 });
 
 afterEach(() => {
   warn.mockRestore();
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
 });
 
 function seed(key: string, value: string): void {

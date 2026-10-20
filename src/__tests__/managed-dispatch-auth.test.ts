@@ -1,13 +1,9 @@
 /**
  * Tests for `src/managed-dispatch-auth.ts` (AII-1386) against a temp SQLite file with the real config store,
- * ownership layer and session store. Synthetic runtime, no network. `npm run typecheck` excludes
- * `src/__tests__`, so type-check this file explicitly with a throwaway tsconfig.
+ * ownership layer and session store. Synthetic runtime, no network.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
-import crypto from "node:crypto";
+import { serializeChatGptPlanRecord } from "../chatgpt-plan-token.js";
 import type * as DedupModule from "../dedup.js";
 import type * as AdapterModule from "../managed-dispatch-auth.js";
 import type * as StoreModule from "../agent-config-store.js";
@@ -15,14 +11,16 @@ import type * as OwnershipModule from "../model-session-ownership.js";
 import type * as SessionModule from "../model-session-store.js";
 import type * as PrepModule from "../agent-run-preparation.js";
 import type { ModelAuthRuntime } from "../model-auth-runtime.js";
+import { createModelSessionKeyProvider } from "../model-session-keys.js";
+import { makeChatGptPlanRecord } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 
-const KEY = crypto.createHash("sha256").update("synthetic-managed-key").digest();
 const OPERATOR = { synthetic: "operator" };
 const REPO = { owner: "acme", repo: "app" };
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let adapter: typeof AdapterModule;
+let prepMod: typeof PrepModule;
 let store: typeof StoreModule;
 let own: typeof OwnershipModule;
 let sessions: SessionModule.ModelSessionStore;
@@ -75,17 +73,19 @@ function launchOf(d: AdapterModule.ManagedDispatchDecision) {
 }
 
 beforeEach(async () => {
-  dbPath = path.join(os.tmpdir(), `managed-dispatch-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  vi.resetModules();
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  adapter = await import("../managed-dispatch-auth.js");
-  store = await import("../agent-config-store.js");
-  own = await import("../model-session-ownership.js");
-  const sessionMod = await import("../model-session-store.js");
-  dedup.getDb();
-  sessions = sessionMod.createModelSessionStore({
-    keys: { current: () => ({ keyId: "k1", key: KEY }), get: (id) => (id === "k1" ? KEY : undefined) },
+  const modules = (await testDb({
+    modules: {
+      dedup: () => import("../dedup.js"),
+      adapter: () => import("../managed-dispatch-auth.js"),
+      store: () => import("../agent-config-store.js"),
+      own: () => import("../model-session-ownership.js"),
+      sessionMod: () => import("../model-session-store.js"),
+      prepMod: () => import("../agent-run-preparation.js"),
+    },
+  })).modules;
+  ({ dedup, adapter, store, own, prepMod } = modules);
+  sessions = modules.sessionMod.createModelSessionStore({
+    keys: createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: "synthetic-managed-secret" }),
     verifyOwner: own.sessionOwnerVerifier,
     authorizeOperator: (op) => op === OPERATOR,
   });
@@ -111,12 +111,7 @@ beforeEach(async () => {
       return prepDepsOverride ? prepDepsOverride(d) : d;
     },
   };
-  const seeded = sessions.writePlanRecord({ profileId: "cdx", expectedSequence: null, sessionData: JSON.stringify({
-    version: 1, email: "u@example.com", issuer: "https://auth.openai.com", subject: "s", clientId: "c",
-    extAgentHostId: "h", idToken: "synthetic-id", accessToken: "synthetic-access", refreshToken: "synthetic-refresh",
-    tokenType: "Bearer", scopes: ["chatgpt.tokens.use.direct"], accessTokenExpiresAt: Date.now() + 3_600_000,
-    earliestRefreshAt: null, savedAt: Date.now(),
-  }) });
+  const seeded = sessions.writePlanRecord({ profileId: "cdx", expectedSequence: null, sessionData: serializeChatGptPlanRecord(makeChatGptPlanRecord()) });
   if (!seeded.ok) throw new Error("plan record seed failed");
   store.saveAccountProfileRevision({
     profileId: "cdx", identity: "Cdx", revision: 1, agent: "codex", provider: "openai",
@@ -130,11 +125,10 @@ beforeEach(async () => {
   store.setProjectOptIn("AII", true);
 });
 
-afterEach(() => {
-  dedup.closeDb();
-  for (const suffix of ["", "-wal", "-shm"]) {
-    try { fs.unlinkSync(dbPath + suffix); } catch { /* ignore */ }
-  }
+afterEach(async () => {
+  // A test that resets the registry mid-test to apply a vi.doMock re-imports modules that open a second connection
+  // to the test's database file; close it so the directory can be removed (testDb closes its own).
+  (await import("../dedup.js")).closeDb();
 });
 
 describe("prepareManagedDispatch", () => {
@@ -421,7 +415,6 @@ describe("prepareManagedDispatch on github-actions (AII-1420)", () => {
     const second = await adapter.prepareManagedDispatch(ghaReq(), runtime);
     expect(second).toEqual({ kind: "hold", code: "bootstrap_consumed" });
     expect(count("model_credential_grants")).toBe(1);
-    const prepMod = await import("../agent-run-preparation.js");
     expect(prepMod.loadStoredSnapshot("d1")).toEqual(first.snapshot);
   });
 
