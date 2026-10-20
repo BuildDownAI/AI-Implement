@@ -651,6 +651,15 @@ describe("kg current run card (AII-1260)", () => {
     expect(m.doc.getElementById("kg-refresh-badge")?.textContent).toContain("awaiting decision");
   });
 
+  it("acceptBlocked held run (decisions: cancel only): held card renders, Accept hidden", async () => {
+    const m = mount({ currentRun: { triggerId: "t", step: "decision", decisions: ["cancel"], held }, stage: "awaiting-decision" });
+    await m.win.loadKgStatus();
+    const cur = m.doc.getElementById("kg-current-run") as HTMLElement;
+    expect(cur.textContent).toContain("Held for a decision until ");
+    expect(cur.querySelector("a[href^=\"https\"]")?.getAttribute("href")).toBe("https://github.com/o/kg/pull/7");
+    expect(m.visibleButtons()).toEqual(["Cancel"]);
+  });
+
   it("deployHeld 200 with a held run: Accept and Cancel stay enabled, Refresh disabled, deploy notice shown", async () => {
     const m = mount({ currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held }, stage: "awaiting-decision", deployHeld: true });
     await m.win.loadKgStatus();
@@ -709,6 +718,19 @@ describe("kg current run card (AII-1260)", () => {
       expect(text(m)).toBe("Last refresh: no decision within 24 h \u2014 the held PR was closed");
     });
 
+    it("shows passed, completed with warnings, and failed", async () => {
+      const ok = { ok: true, at: 1, detail: "refreshed", stampBefore: null, stampAfter: "x" };
+      const p = mount({ currentRun: null, stage: "serving", lastRefresh: ok });
+      await p.win.loadKgStatus();
+      expect(text(p)).toBe("Last refresh: passed \u2014 refreshed");
+      const w = mount({ currentRun: null, stage: "serving", lastRefresh: { ...ok, warnings: ["source x skipped"] } });
+      await w.win.loadKgStatus();
+      expect(text(w)).toBe("Last refresh: completed with warnings \u2014 refreshed");
+      const f = mount({ currentRun: null, stage: "failed", lastRefresh: { ...failed, gate: undefined } });
+      await f.win.loadKgStatus();
+      expect(text(f)).toBe("Last refresh: failed \u2014 git push failed (exit 128)");
+    });
+
     it("an old record without conclusion renders, omitting an empty gate", async () => {
       const m = mount({ currentRun: null, stage: "failed", lastRefresh: { ...failed, gate: undefined } });
       await m.win.loadKgStatus();
@@ -736,13 +758,14 @@ describe("kg current run card (AII-1260)", () => {
     expect((m.doc.getElementById("kg-refresh-card") as HTMLElement).hidden).toBe(true);
   });
 
-  it("posts the exact decision bodies and reloads the status", async () => {
+  it("posts the exact decision bodies, naming the shown hold, and reloads the status", async () => {
     const m = mount({ currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held }, stage: "awaiting-decision" });
+    await m.win.loadKgStatus(); // the card shows the hold, so a decision names it
     await m.win.decideKgRefresh("accept");
     await m.win.decideKgRefresh("cancel");
     const posts = m.calls.filter((c) => c.url === "/api/tools/decide_kg_refresh");
-    expect(posts.map((c) => c.body)).toEqual([{ args: { action: "accept" } }, { args: { action: "cancel" } }]);
-    expect(m.calls.filter((c) => c.url === "/api/kg/status")).toHaveLength(2);
+    expect(posts.map((c) => c.body)).toEqual([{ args: { action: "accept", triggerId: "t" } }, { args: { action: "cancel", triggerId: "t" } }]);
+    expect(m.calls.filter((c) => c.url === "/api/kg/status")).toHaveLength(3);
   });
 
   it("a declined confirm makes no call", async () => {
@@ -751,15 +774,15 @@ describe("kg current run card (AII-1260)", () => {
     expect(m.calls).toEqual([]);
   });
 
-  it("shows a tool error such as already-decided", async () => {
+  it("shows a tool error such as no-decision-open", async () => {
     const m = mount({
       currentRun: { triggerId: "t", step: "decision", decisions: ["accept", "cancel"], held },
-      decideReply: { isError: true, content: [{ type: "text", text: "already-decided" }] },
+      decideReply: { isError: true, content: [{ type: "text", text: "no-decision-open" }] },
     });
     await m.win.decideKgRefresh("accept");
     const err = m.doc.getElementById("kg-pipelines-error") as HTMLElement;
     expect(err.hidden).toBe(false);
-    expect(err.textContent).toContain("already-decided");
+    expect(err.textContent).toContain("no-decision-open");
   });
 
   it("the page source drops the dry-run and trigger-time accept code", () => {

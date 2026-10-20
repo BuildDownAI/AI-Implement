@@ -101,7 +101,7 @@ describe("dispatch writers", () => {
   });
 
   it("assertExecutionPolicyCapability refuses a workflow without the capability marker", () => {
-    expect(() => assertExecutionPolicyCapability(withPolicy.credentials, { supportsExecutionPolicy: false }, "o/r/w.yml@main")).toThrow(/ephemeral-execution-policy-v1/);
+    expect(() => assertExecutionPolicyCapability(withPolicy.credentials, { supportsExecutionPolicy: false }, "o/r/w.yml@main")).toThrow(/github-hosted-execution-policy-v2/);
     expect(() => assertExecutionPolicyCapability(withPolicy.credentials, {}, "o/r/w.yml@main")).toThrow();
     expect(() => assertExecutionPolicyCapability(withPolicy.credentials, { supportsExecutionPolicy: true }, "o/r/w.yml@main")).not.toThrow();
     // Dispatches that carry no policy are unaffected by an old workflow.
@@ -111,7 +111,7 @@ describe("dispatch writers", () => {
 });
 
 describe("workflow probe: supportsExecutionPolicy", () => {
-  const MARKER = "# ai-implement-capability: ephemeral-execution-policy-v1\n";
+  const MARKER = "# ai-implement-capability: github-hosted-execution-policy-v2\n";
   const ENVELOPE = "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n";
   const probe = (yaml: string) => {
     __clearWorkflowProbeCacheForTests();
@@ -121,6 +121,7 @@ describe("workflow probe: supportsExecutionPolicy", () => {
   it("is true only for an envelope workflow carrying the marker", async () => {
     expect((await probe(MARKER + ENVELOPE)).supportsExecutionPolicy).toBe(true);
     expect((await probe(ENVELOPE)).supportsExecutionPolicy).toBe(false);
+    expect((await probe("# ai-implement-capability: ephemeral-execution-policy-v1\n" + ENVELOPE)).supportsExecutionPolicy).toBe(false);
     expect((await probe(MARKER + "on: workflow_dispatch\n")).supportsExecutionPolicy).toBe(false);
   });
   it("is not implied by the private-run-config marker", async () => {
@@ -150,7 +151,7 @@ describe("every GHA dispatch writer agrees on the policy", () => {
   const read = (f: string) => readFileSync(f, "utf-8");
   const writers = ["src/index.ts", "src/comment-gapfill-drain.ts", "src/planning-launch.ts"];
 
-  it("implementation-phase writers pass the mapping opt-in and guard the workflow capability", () => {
+  it("implementation-phase writers mark their phase and guard the workflow capability", () => {
     for (const f of ["src/index.ts", "src/comment-gapfill-drain.ts"]) {
       const text = read(f);
       expect(text, f).toMatch(/ghaManagedCredentials\([^)]*\{ extraEnv: mapping\.extraEnv \}\)/);
@@ -158,7 +159,7 @@ describe("every GHA dispatch writer agrees on the policy", () => {
     }
   });
 
-  it("the planning writer never passes the mapping opt-in, so planning cannot carry the policy", () => {
+  it("the planning writer omits the implementation marker, so planning cannot carry the policy", () => {
     const text = read("src/planning-launch.ts");
     expect(text).toMatch(/ghaManagedCredentials\(managedDecision, config\.runnerCallbackBaseUrl\)/);
   });

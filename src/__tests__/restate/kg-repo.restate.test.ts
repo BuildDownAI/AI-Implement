@@ -7,7 +7,7 @@ import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { MAX_TRACKED_PRS } from "../../kg-refresh.js";
 import { createKgRepo, type KgRepoEnqueueResult, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
-import { VARIANTS, callObject, callService, cancelInvocation, eventually, killInvocation, queryInvocations, setObjectState, settle, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, attachInvocation, awaitSentInvocations, callObject, callService, cancelInvocation, eventually, killInvocation, queryInvocations, setObjectState, settle, startVariants, stopAll } from "./harness.js";
 
 const FAKE_WORKFLOW_NAME = "FakeKgRefresh";
 const MARKER_AGE_WAIT_MS = 1_500;
@@ -34,7 +34,7 @@ const privateCaller = restate.service({
       }),
   },
 });
-async function callPrivate(baseUrl: string, slug: string, handler: "release" | "expire" | "recordDryRunOutcome" | "recordAdminDryRun", body: unknown): Promise<unknown> {
+async function callPrivate(baseUrl: string, slug: string, handler: "release" | "expire" | "hold" | "recordDryRunOutcome" | "recordAdminDryRun", body: unknown): Promise<unknown> {
   return callService<unknown>(baseUrl, "KgRepoPrivateCaller", "call", { slug, handler, body });
 }
 
@@ -49,8 +49,14 @@ describe("KgRepo durable single-flight lock", () => {
         // The run invocation holds the lock (AII-1297): it stays live until a test releases, kills or cancels it.
         await ctx.sleep(HOLD_MS);
       },
+      // What `KgRepo.watch` reads of a run that ended: whether it passed its commit point (AII-1493).
+      status: restate.handlers.object.shared(async (ctx: restate.ObjectSharedContext): Promise<{ committed: boolean; holdConsumed: boolean }> => ({ committed: committedRuns.has(ctx.key), holdConsumed: consumedRuns.has(ctx.key) })),
     },
   });
+  /** Trigger ids whose fake run reports `committed`. */
+  const committedRuns = new Set<string>();
+  /** Trigger ids whose fake run reports `holdConsumed` (a resumed run that started closing the PR). */
+  const consumedRuns = new Set<string>();
 
   const kgRepo = createKgRepo({ workflowName: FAKE_WORKFLOW_NAME });
 
@@ -526,6 +532,252 @@ describe("KgRepo durable single-flight lock", () => {
       ).rejects.toThrow();
     },
   );
+
+  // ---- AII-1489: a held snapshot is KgRepo state; `decide` resumes it as a new run ----
+  const HOLD_REPORT = { ok: false, failureCode: "KG_SNAPSHOT_HELD", snapshotPr: 7, snapshotCommit: "c0ffee", snapshotBranch: "kg-refresh/snapshot-7" };
+  const holdFor = (triggerId: string, report: Record<string, unknown> = HOLD_REPORT) =>
+    ({ triggerId, dispatchId: triggerId, decideBy: Date.now() + HOLD_MS, report, steps: [] });
+  const decide = (baseUrl: string, slug: string, body: Record<string, unknown>) =>
+    callObject<{ triggerId: string } | null>(baseUrl, "KgRepo", slug, "decide", body);
+  const scheduledDecides = async (env: RestateEnvironment, slug: string) =>
+    (await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRepo' AND target_service_key = '${slug}' AND target_handler_name = 'decide' AND status = 'scheduled'`)).length;
+  const status = (baseUrl: string, slug: string) =>
+    callObject<{ triggerId: string; held: { snapshotPr: number; acceptBlocked: boolean } | null } | null>(baseUrl, "KgRepo", slug, "status", {});
+
+  async function triggerAndHold(env: RestateEnvironment, slug: string, report?: Record<string, unknown>): Promise<string> {
+    const triggerId = ((await trigger(env.baseUrl(), slug)) as { triggerId: string }).triggerId;
+    await callPrivate(env.baseUrl(), slug, "hold", holdFor(triggerId, report));
+    return triggerId;
+  }
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "H1: hold keeps the lock for its trigger: a release before or after it never frees it, a new trigger is refused, one timer is armed (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      const triggerId = ((await trigger(env.baseUrl(), slug)) as { triggerId: string }).triggerId;
+
+      // A release that beat the hold cleared the marker; the hold takes the lock back.
+      await release(env.baseUrl(), slug, triggerId);
+      expect(await status(env.baseUrl(), slug)).toBeNull();
+      await callPrivate(env.baseUrl(), slug, "hold", holdFor(triggerId));
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId, held: { snapshotPr: 7, acceptBlocked: false } });
+
+      await release(env.baseUrl(), slug, triggerId);
+      await release(env.baseUrl(), slug, triggerId);
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId, held: { snapshotPr: 7 } });
+      expect(await trigger(env.baseUrl(), slug)).toEqual({ status: "refresh-in-progress", triggerId });
+      expect(await scheduledDecides(env, slug)).toBe(1);
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "H2: hold for a trigger that is not the lock holder is refused with lock-lost (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      await trigger(env.baseUrl(), slug);
+      await expect(callPrivate(env.baseUrl(), slug, "hold", holdFor("someone-else"))).rejects.toThrow(/409.*lock-lost/);
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ held: null });
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "D1: accept clears the hold, starts one new run carrying it, and moves the lock to the new run; a late release for the held trigger does nothing (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      const before = runSends.length;
+      const held = await triggerAndHold(env, slug);
+
+      const resumed = (await decide(env.baseUrl(), slug, { action: "accept", actor: "ada@example.com", triggerId: held }))!.triggerId;
+      expect(resumed).not.toBe(held);
+      await eventually(() => runSends.length - before >= 2, (ok) => ok, { label: "the resumed run send" });
+      const send = runSends[runSends.length - 1];
+      expect(send.key).toBe(resumed);
+      expect(send.parameter).toMatchObject({ triggerId: resumed, resume: { action: "accept", actor: "ada@example.com", hold: { triggerId: held, dispatchId: held } } });
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId: resumed, held: null });
+
+      await release(env.baseUrl(), slug, held);
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId: resumed });
+      await release(env.baseUrl(), slug, resumed);
+      expect(await status(env.baseUrl(), slug)).toBeNull();
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "D2: refusals — no hold, a second decision, a stale triggerId and an accept on a blocked hold (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      await expect(decide(env.baseUrl(), slug, { action: "cancel" })).rejects.toThrow(/409.*no-decision-open/);
+      expect(await decide(env.baseUrl(), slug, { action: "timeout", triggerId: "t" })).toBeNull();
+      await expect(decide(env.baseUrl(), slug, { action: "timeout" })).rejects.toThrow(/400/);
+
+      const blocked = await triggerAndHold(env, slug, { ...HOLD_REPORT, acceptBlocked: true });
+      await expect(decide(env.baseUrl(), slug, { action: "accept", actor: "ada@example.com" })).rejects.toThrow(/409.*accept-blocked/);
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId: blocked, held: { acceptBlocked: true } });
+      await expect(decide(env.baseUrl(), slug, { action: "cancel", triggerId: "stale" })).rejects.toThrow(/409.*no-decision-open/);
+      expect(await decide(env.baseUrl(), slug, { action: "timeout", triggerId: "stale" })).toBeNull();
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId: blocked, held: { acceptBlocked: true } });
+
+      const resumed = (await decide(env.baseUrl(), slug, { action: "cancel", triggerId: blocked }))!.triggerId;
+      await expect(decide(env.baseUrl(), slug, { action: "cancel", triggerId: blocked })).rejects.toThrow(/409.*no-decision-open/);
+      expect(await decide(env.baseUrl(), slug, { action: "timeout", triggerId: blocked })).toBeNull();
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId: resumed, held: null });
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "D3: a timer from an old hold cannot decide a newer hold, and the current hold's timeout resumes as a timeout (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      const before = runSends.length;
+      const first = await triggerAndHold(env, slug);
+      const firstResume = (await decide(env.baseUrl(), slug, { action: "cancel", triggerId: first }))!.triggerId;
+      await release(env.baseUrl(), slug, firstResume);
+
+      const second = await triggerAndHold(env, slug);
+      expect(await decide(env.baseUrl(), slug, { action: "timeout", triggerId: first })).toBeNull();
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId: second, held: { snapshotPr: 7 } });
+
+      const resumed = (await decide(env.baseUrl(), slug, { action: "timeout", triggerId: second }))!.triggerId;
+      await eventually(() => runSends.length - before >= 4, (ok) => ok, { label: "the resumed run sends" });
+      expect(runSends[runSends.length - 1].parameter).toMatchObject({ triggerId: resumed, resume: { action: "timeout", hold: { triggerId: second } } });
+    },
+  );
+
+  // ---- AII-1493: the hold outlives the run that acts on it, so a killed run leaves a decidable hold ----
+  const release2 = (baseUrl: string, slug: string, triggerId: string, ended?: "returned" | "killed") =>
+    callPrivate(baseUrl, slug, "release", { triggerId, ...(ended ? { ended } : {}) });
+  const freshWatch = async (env: RestateEnvironment, slug: string, known: Set<string>) =>
+    String((await eventually(
+      async () => (await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRepo' AND target_service_key = '${slug}' AND target_handler_name = 'watch'`)).filter((w) => !known.has(String(w.id))),
+      (fresh) => fresh.length === 1,
+      { label: "watch sent" },
+    ))[0]!.id);
+  const knownWatches = async (env: RestateEnvironment, slug: string) =>
+    new Set((await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRepo' AND target_service_key = '${slug}' AND target_handler_name = 'watch'`)).map((w) => String(w.id)));
+  const killRunOf = async (env: RestateEnvironment, triggerId: string) => {
+    const [run] = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = '${FAKE_WORKFLOW_NAME}' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`);
+    await killInvocation(env.adminAPIBaseUrl(), String(run!.id));
+  };
+  /** A barrier on the object's exclusive queue: a stale timeout decides nothing and returns after every handler sent before it ran. */
+  /** Waits for the `release` a `watch` sent to run: a barrier on `KgRepo` does not order a send made by another invocation. */
+  const releaseFrom = (env: RestateEnvironment, slug: string, watchId: string) =>
+    awaitSentInvocations(env.adminAPIBaseUrl(), env.baseUrl(), { service: "KgRepo", key: slug, handler: "release" }, `invoked_by_id = '${watchId}'`);
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "K1: decide keeps the hold, decided; a returned release clears it once, and a killed one reopens it with a timer, repeatedly (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      const held = await triggerAndHold(env, slug);
+      const first = (await decide(env.baseUrl(), slug, { action: "cancel", triggerId: held }))!.triggerId;
+      // Decided: no open decisions, the marker is the resumed run's, and a second decision is refused.
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId: first, held: null });
+      await expect(decide(env.baseUrl(), slug, { action: "cancel", triggerId: held })).rejects.toThrow(/409.*no-decision-open/);
+      const timersDecided = await scheduledDecides(env, slug);
+
+      // The resumed run was killed: the hold is open again, the lock is the hold's, and a timer is armed.
+      await release2(env.baseUrl(), slug, first, "killed");
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId: held, held: { snapshotPr: 7 } });
+      expect(await scheduledDecides(env, slug)).toBe(timersDecided + 1);
+      expect(await trigger(env.baseUrl(), slug)).toEqual({ status: "refresh-in-progress", triggerId: held });
+
+      // A repeated kill repeats it.
+      const second = (await decide(env.baseUrl(), slug, { action: "accept", actor: "ada@example.com", triggerId: held }))!.triggerId;
+      expect(second).not.toBe(first);
+      await release2(env.baseUrl(), slug, second, "killed");
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId: held, held: { snapshotPr: 7 } });
+
+      // A run that returns clears the hold, once; a second release is a no-op.
+      const third = (await decide(env.baseUrl(), slug, { action: "cancel", triggerId: held }))!.triggerId;
+      await release2(env.baseUrl(), slug, third, "returned");
+      expect(await status(env.baseUrl(), slug)).toBeNull();
+      await release2(env.baseUrl(), slug, third);
+      expect(await status(env.baseUrl(), slug)).toBeNull();
+      const next = await trigger(env.baseUrl(), slug);
+      expect(next).not.toHaveProperty("status");
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "K2: a killed release for the gate run itself leaves the hold, and a stale reopen cannot revive a cleared hold (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      const held = await triggerAndHold(env, slug);
+      await release2(env.baseUrl(), slug, held, "killed");
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId: held, held: { snapshotPr: 7 } });
+
+      const resumed = (await decide(env.baseUrl(), slug, { action: "cancel", triggerId: held }))!.triggerId;
+      await release2(env.baseUrl(), slug, resumed);
+      await release2(env.baseUrl(), slug, resumed, "killed");
+      expect(await status(env.baseUrl(), slug)).toBeNull();
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "K3: watch of a killed resumed run reopens the hold; of one past its commit point it clears it and reopens nothing (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      const held = await triggerAndHold(env, slug);
+
+      let known = await knownWatches(env, slug);
+      const resumed = (await decide(env.baseUrl(), slug, { action: "cancel", triggerId: held }))!.triggerId;
+      let watchId = await freshWatch(env, slug, known);
+      await killRunOf(env, resumed);
+      await attachInvocation(env.baseUrl(), watchId);
+      await releaseFrom(env, slug, watchId);
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId: held, held: { snapshotPr: 7 } });
+
+      known = await knownWatches(env, slug);
+      const committed = (await decide(env.baseUrl(), slug, { action: "accept", actor: "ada@example.com", triggerId: held }))!.triggerId;
+      committedRuns.add(committed);
+      watchId = await freshWatch(env, slug, known);
+      await killRunOf(env, committed);
+      await attachInvocation(env.baseUrl(), watchId);
+      await releaseFrom(env, slug, watchId);
+      expect(await status(env.baseUrl(), slug)).toBeNull();
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "K4: watch of a killed resumed run that consumed the hold clears it and reopens nothing (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      const held = await triggerAndHold(env, slug);
+      const known = await knownWatches(env, slug);
+      const resumed = (await decide(env.baseUrl(), slug, { action: "cancel", triggerId: held }))!.triggerId;
+      consumedRuns.add(resumed);
+      const watchId = await freshWatch(env, slug, known);
+      await killRunOf(env, resumed);
+      await attachInvocation(env.baseUrl(), watchId);
+      await releaseFrom(env, slug, watchId);
+      expect(await status(env.baseUrl(), slug)).toBeNull();
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "D4: the timer armed by hold is one scheduled KgRepo decide, and it decides the hold when it fires (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      const before = runSends.length;
+      const triggerId = ((await trigger(env.baseUrl(), slug)) as { triggerId: string }).triggerId;
+      // A hold already due (delay 0): the scheduled send itself fires, with no test-side call and no wall-clock margin.
+      await callPrivate(env.baseUrl(), slug, "hold", { ...holdFor(triggerId), decideBy: Date.now() - 1 });
+      await eventually(() => runSends.length - before >= 2, (ok) => ok, { label: "the timeout run send" });
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId: expect.not.stringMatching(triggerId), held: null });
+      expect(runSends[runSends.length - 1].parameter).toMatchObject({ resume: { action: "timeout", hold: { triggerId } } });
+      expect(await scheduledDecides(env, slug)).toBe(0);
+    },
+  );
+
 });
 
 describe("KgRepo run-held lock", () => {
@@ -537,6 +789,8 @@ describe("KgRepo run-held lock", () => {
         sends.push({ key: ctx.key, parameter: input });
         await ctx.sleep(HOLD_MS);
       },
+      // What `KgRepo.watch` reads of a run that ended (AII-1493).
+      status: restate.handlers.object.shared(async (): Promise<{ committed: boolean }> => ({ committed: false })),
     },
   });
   // A run that fails with a retryable error and pauses instead of being killed (onMaxAttempts: "pause").
@@ -549,6 +803,8 @@ describe("KgRepo run-held lock", () => {
           throw new Error("boom");
         });
       },
+      // What `KgRepo.watch` reads of a run that ended (AII-1493).
+      status: restate.handlers.object.shared(async (): Promise<{ committed: boolean }> => ({ committed: false })),
     },
     options: { retryPolicy: { maxAttempts: 1, onMaxAttempts: "pause", initialInterval: 10 } },
   });
@@ -742,11 +998,11 @@ describe("KgRepo run-held lock", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
-    "release, expire, watch and recordDryRunOutcome are ingress-private; trigger and status stay public (%s)",
+    "release, expire, watch, hold and recordDryRunOutcome are ingress-private; trigger, decide and status stay public (%s)",
     async (label) => {
       const env = pick(production, label);
       const slug = slugOf();
-      for (const handler of ["release", "expire", "watch", "recordDryRunOutcome"]) {
+      for (const handler of ["release", "expire", "watch", "recordDryRunOutcome", "hold"]) {
         const response = await fetch(`${env.baseUrl()}/KgRepo/${encodeURIComponent(slug)}/${handler}`, {
           method: "POST",
           headers: { "content-type": "application/json" },

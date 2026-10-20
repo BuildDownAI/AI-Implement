@@ -31,8 +31,10 @@ for (const file of files) {
 
     it("registers masks before any step header can expose a callback input", () => {
       expect(job.steps[0]).toBe(mask);
-      expect(mask.env).toBeUndefined();
-      expect(JSON.stringify(mask)).not.toContain("${{");
+      // The only pre-mask context is GitHub's nonsecret runner class, never any token/input.
+      expect(mask.env ?? {}).toEqual(file.includes("implement")
+        ? { AI_IMPLEMENT_GHA_RUNNER_ENVIRONMENT: "${{ runner.environment }}" } : {});
+      expect(mask.run).not.toContain("${{");
       // Later env mappings are permitted only after the bootstrap registered masks.
       expect(job.env).toBeUndefined();
       expect(workflow.env).toBeUndefined();

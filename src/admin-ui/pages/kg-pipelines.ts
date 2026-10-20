@@ -160,7 +160,7 @@ export const kgPipelinesScript = `
       else if (last.gate === 'ingest-needed') lastText = 'Last refresh: ' + last.detail;
       else if (last.conclusion === 'operator_cancelled') lastText = 'Last refresh: cancelled by operator';
       else if (last.conclusion === 'decision_timeout') lastText = 'Last refresh: no decision within 24 h \u2014 the held PR was closed';
-      else lastText = 'Last refresh: ' + (last.ok ? 'ok' : 'failed' + (last.gate ? ' at gate "' + last.gate + '"' : '')) + ' \u2014 ' + last.detail;
+      else lastText = 'Last refresh: ' + (last.ok ? (last.warnings && last.warnings.length > 0 ? 'completed with warnings' : 'passed') : 'failed' + (last.gate ? ' at gate "' + last.gate + '"' : '')) + ' \u2014 ' + last.detail;
       // A run in flight owns the line: the previous run's result must never show beside it.
       if (data.currentRun && !progressText) {
         progressText = stage === 'awaiting-decision'
@@ -227,12 +227,18 @@ export const kgPipelinesScript = `
   // set with textContent, never innerHTML; the PR link goes through safeUrl().
   // The held view last rendered, so the Accept prompt reads the cause without another request.
   let renderedHeld = null;
+  // The trigger id of that hold, so a decision names the hold the page shows (AII-1489).
+  let renderedHeldTrigger = null;
 
   function heldTeams(held) {
     return Array.isArray(held && held.failedTeams) ? held.failedTeams.map(String) : [];
   }
 
   function heldWhy(held) {
+    if (held.cause === 'source-failed') {
+      const failed = (Array.isArray(held.sources) ? held.sources : []).filter(function (s) { return s.status === 'failed' && s.kind !== 'tracker'; }).map(function (s) { return String(s.source); });
+      return 'Why: ' + (failed.length ? failed.join(', ') : 'a source') + ' failed, so the graph may be partial. Accept is blocked.';
+    }
     if (held.cause !== 'tracker-missing') return 'Why: a snapshot part shrank past the guard.';
     const teams = heldTeams(held);
     return teams.length
@@ -242,6 +248,7 @@ export const kgPipelinesScript = `
 
   function renderKgCurrentRun(run, stage) {
     renderedHeld = null;
+    renderedHeldTrigger = null;
     const el = document.getElementById('kg-current-run');
     const decisions = run && Array.isArray(run.decisions) ? run.decisions : [];
     document.getElementById('kg-refresh-btn').hidden = !!run;
@@ -251,7 +258,7 @@ export const kgPipelinesScript = `
     el.textContent = '';
     if (!run) { el.hidden = true; return; }
     el.hidden = false;
-    const held = stage === 'awaiting-decision' && decisions.indexOf('accept') >= 0 && run.held ? run.held : null;
+    const held = stage === 'awaiting-decision' && run.held ? run.held : null;
     const head = document.createElement('div');
     if (!held) {
       head.textContent = 'Run in flight' + (run.step ? ': ' + run.step : '');
@@ -260,6 +267,7 @@ export const kgPipelinesScript = `
       return;
     }
     renderedHeld = held;
+    renderedHeldTrigger = run.triggerId || null;
     head.textContent = 'Held for a decision until ' + new Date(held.decideBy).toLocaleString();
     el.appendChild(head);
     const why = document.createElement('div');
@@ -324,7 +332,7 @@ export const kgPipelinesScript = `
     }
   }
 
-  // Both decisions act on the current run through a route that takes no trigger id.
+  // A decision names the hold the page shows, so a stale page cannot decide a newer hold; with no hold shown it acts on the current run.
   window.decideKgRefresh = async function (action) {
     const missing = renderedHeld && renderedHeld.cause === 'tracker-missing';
     const teams = missing ? heldTeams(renderedHeld) : [];
@@ -340,7 +348,7 @@ export const kgPipelinesScript = `
     accept.disabled = true;
     cancel.disabled = true;
     try {
-      const res = await window.api('/api/tools/decide_kg_refresh', { method: 'POST', body: JSON.stringify({ args: { action: action } }) });
+      const res = await window.api('/api/tools/decide_kg_refresh', { method: 'POST', body: JSON.stringify({ args: renderedHeldTrigger ? { action: action, triggerId: renderedHeldTrigger } : { action: action } }) });
       const out = unwrapToolAnswer(res, await res.json().catch(function () { return {}; }));
       if (out.status === 403) showMessage('warning', 'admin only');
       else if (!out.ok) showMessage('warning', 'Could not ' + action + ' the refresh \u2014 ' + (out.body.error || out.status));

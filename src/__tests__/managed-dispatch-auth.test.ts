@@ -320,24 +320,26 @@ describe("prepareManagedDispatch on github-actions (AII-1420)", () => {
     expect(adapter.ghaManagedCredentials({ kind: "legacy" }, "https://orch.example.com")).toBeUndefined();
   });
 
-  it("projects the ephemeral full-access policy only for an implementation writer with the exact mapping opt-in", async () => {
+  it("defaults the frozen Codex implementation to full access without an Extra Env flag", async () => {
     gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED });
     const d = launchOf(await adapter.prepareManagedDispatch(ghaReq(), runtime));
-    const creds = adapter.ghaManagedCredentials(d, "https://orch.example.com", { extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "ephemeral-runner-asserted-v1" } });
+    const creds = adapter.ghaManagedCredentials(d, "https://orch.example.com", {});
     expect(creds?.executionPolicy).toEqual({
       version: 1, implementationSandbox: "ephemeral-full-access", dispatchId: d.dispatchId, projectKey: d.projectKey,
       backend: "gha", ephemeralRunnerAsserted: true,
     });
-    // The policy is bound to the same identity as the model-auth context.
-    expect(creds?.executionPolicy?.dispatchId).toBe(creds?.modelAuthContext?.dispatchId);
-    expect(creds?.executionPolicy?.projectKey).toBe(creds?.modelAuthContext?.projectKey);
-
-    // Planning and every writer that passes nothing never carry it; neither do absent, malformed or mismatched opt-ins.
-    const stub = { kind: "launch", dispatchId: d.dispatchId, projectKey: d.projectKey, takeBootstrap: () => creds?.modelAuthGrant } as never;
-    for (const impl of [undefined, {}, { extraEnv: null }, { extraEnv: {} }, { extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "true" } },
-      { extraEnv: { ai_implement_ephemeral_full_access: "ephemeral-runner-asserted-v1" } }]) {
-      expect(adapter.ghaManagedCredentials(stub, "https://orch.example.com", impl as never)).not.toHaveProperty("executionPolicy");
-    }
+    const bootstrap = creds?.modelAuthGrant;
+    if (!bootstrap || !("bearer" in bootstrap)) throw new Error("expected private grant");
+    const stub = { ...d, takeBootstrap: () => bootstrap };
+    // Planning omits the implementation marker, even with a Codex implementation in its snapshot.
+    expect(adapter.ghaManagedCredentials(stub, "https://orch.example.com")).not.toHaveProperty("executionPolicy");
+    // Mutable defaults cannot replace the already frozen selection.
+    const claudeSnapshot = { ...d.snapshot, stages: { ...d.snapshot.stages,
+      implementation: { ...d.snapshot.stages.implementation, agent: "claude" as const } } };
+    expect(adapter.ghaManagedCredentials({ ...stub, snapshot: claudeSnapshot }, "https://orch.example.com", {}))
+      .not.toHaveProperty("executionPolicy");
+    expect(() => adapter.ghaManagedCredentials({ ...stub, backend: "fly-machines" }, "https://orch.example.com", {}))
+      .toThrow(/GitHub Actions/);
   });
 
   it.each([

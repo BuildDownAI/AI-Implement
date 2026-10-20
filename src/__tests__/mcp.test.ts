@@ -34,6 +34,7 @@ import {
   kgNeighbors,
   kgPath,
   kgProvenance,
+  kgRepoHistory,
   triggerKgRefreshTool,
   setRunnerModeTool,
   setFlyMachineProfileTool,
@@ -100,6 +101,7 @@ const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
   kg_neighbors: kgNeighbors,
   kg_path: kgPath,
   kg_provenance: kgProvenance,
+  kg_repo_history: kgRepoHistory,
   trigger_kg_refresh: triggerKgRefreshTool,
   set_runner_mode: setRunnerModeTool,
   set_fly_machine_profile: setFlyMachineProfileTool,
@@ -2676,7 +2678,7 @@ describe("handleMcpRequest", () => {
   });
 
   describe("kg_* reads through the tools service (AII-711)", () => {
-    const KG_TOOLS = ["kg_hybrid_search", "kg_search", "kg_semantic_search", "kg_neighbors", "kg_path", "kg_provenance"];
+    const KG_TOOLS = ["kg_hybrid_search", "kg_search", "kg_semantic_search", "kg_neighbors", "kg_path", "kg_provenance", "kg_repo_history"];
 
     it.each(KG_TOOLS)("%s returns the sidecar's result verbatim through /mcp, degraded flag intact", async (name) => {
       const callKgTool = vi.fn(async (): Promise<KgToolResult> => ({ ok: true, result: { degraded: true, tool: name } }));

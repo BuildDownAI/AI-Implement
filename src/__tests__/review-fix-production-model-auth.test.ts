@@ -8,7 +8,7 @@ const getInstallationToken = vi.fn(async () => "tok");
 const getInstallationId = vi.fn(async () => 1);
 const resolveWorkflowCapabilities = vi.fn(async () => ({
   contract: "envelope", supportsAttemptCorrelation: true, supportsRunPublicationToken: true,
-  supportsPrivateRunConfig: true, supportsStageAgentConfig: true }));
+  supportsPrivateRunConfig: true, supportsStageAgentConfig: true, supportsExecutionPolicy: true }));
 const inspectAgentReadiness = vi.fn();
 const getPullRequestState = vi.fn(async () => ({ state: "open", merged: false }));
 
@@ -24,7 +24,7 @@ vi.mock("../review-fix-queue.js", () => ({
   acceptReviewFixWebhookEvent: vi.fn(),
   updateReviewFixStatus: (...args: unknown[]) => updateReviewFixStatus(...args),
 }));
-vi.mock("../managed-dispatch-auth.js", () => ({ isManagedProject: (...a: unknown[]) => isManagedProject(...a) }));
+vi.mock("../managed-dispatch-auth.js", () => ({ isManagedProject: (...a: unknown[]) => isManagedProject(...a), selectsCodexImplementation: () => true }));
 vi.mock("../agent-run-preparation.js", () => ({ inspectAgentReadiness: (...a: unknown[]) => inspectAgentReadiness(...a) }));
 vi.mock("../github-app-auth.js", () => ({
   getInstallationToken: (...a: unknown[]) => getInstallationToken(...(a as [])),
@@ -98,12 +98,12 @@ describe("review-fix admission and model authentication", () => {
       getMappings.mockReturnValue({ k: mapping });
       isManagedProject.mockReturnValue(true);
       resolveWorkflowCapabilities.mockResolvedValueOnce({ contract: "envelope", supportsAttemptCorrelation: true,
-        supportsRunPublicationToken: true, supportsPrivateRunConfig: true, supportsStageAgentConfig: true,
+        supportsRunPublicationToken: true, supportsPrivateRunConfig: true, supportsStageAgentConfig: true, supportsExecutionPolicy: true,
         [missing]: false } as never);
       expect(await canAdmit(scope, config, runtime)).toBe("configuration_error");
       expect(inspectAgentReadiness).not.toHaveBeenCalled();
       resolveWorkflowCapabilities.mockResolvedValueOnce({ contract: "envelope", supportsAttemptCorrelation: true,
-        supportsRunPublicationToken: true, supportsPrivateRunConfig: true, supportsStageAgentConfig: true,
+        supportsRunPublicationToken: true, supportsPrivateRunConfig: true, supportsStageAgentConfig: true, supportsExecutionPolicy: true,
         [missing]: false } as never);
       getPullRequestState.mockResolvedValueOnce({ state: "closed", merged: false } as never);
       expect(await canAdmit(scope, config, runtime)).toBe("defer");

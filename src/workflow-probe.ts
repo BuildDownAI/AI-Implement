@@ -18,7 +18,7 @@ const RUN_ATTEMPT_TOKEN_RE = /^\s{2,}run_attempt_token:\s*$/m;
 const PRIVATE_RUN_CONFIG_RE = /^#\s*ai-implement-capability:\s*private-run-config-v1\s*$/m;
 
 /** Static marker for the ephemeral full-access execution policy projection (AII-1437). */
-const EXECUTION_POLICY_RE = /^#\s*ai-implement-capability:\s*ephemeral-execution-policy-v1\s*$/m;
+const EXECUTION_POLICY_RE = /^#\s*ai-implement-capability:\s*github-hosted-execution-policy-v2\s*$/m;
 
 /** Both markers are required on the exact dispatch ref, independently of private transport. */
 const STAGE_AGENT_CONFIG_RE = /^#\s*ai-implement-capability:\s*stage-agent-config-v1\s*$/m;
@@ -32,7 +32,7 @@ export interface WorkflowCapabilities {
   supportsAttemptCorrelation: boolean;
   /** True when an envelope workflow carries the private-envelope marker. Absent (older fixtures) = false. */
   supportsPrivateRunConfig?: boolean;
-  /** True when an envelope workflow carries the ephemeral-execution-policy-v1 marker. Absent = false. */
+  /** True when an envelope workflow carries the github-hosted-execution-policy-v2 marker. Absent = false. */
   supportsExecutionPolicy?: boolean;
   /** Configured stages and independent trusted launch context on this exact ref. Absent = false. */
   supportsStageAgentConfig?: boolean;

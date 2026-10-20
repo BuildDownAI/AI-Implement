@@ -100,7 +100,7 @@ import { createReviewFixIngressClient, reviewFixResultForwardKey, reviewFixResul
 import { appendReviewFixActivityBatch, isReviewFixEvidenceTombstoned } from "./review-fix-evidence.js";
 import type { ReviewFixResultMetadataV1, ResultIntakeOutcome } from "./review-fix-contract.js";
 import { handleMcpRequest } from "./mcp.js";
-import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, KG_TOOL_CAPABILITY, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider } from "./kg-provider.js";
+import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, REQUIRED_KG_TOOL_COUNT, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider } from "./kg-provider.js";
 import type { MemoryProvider } from "./kg-provider.js";
 import { withRequestErrorBoundary } from "./http-server.js";
 import {
@@ -4451,7 +4451,15 @@ export function makeKgRefreshAdminDeps(
       if (!dispatchId) return { status: 409, body: { error: "no-refresh-in-flight" } };
       const out = await client.cancel(dispatchId, reason);
       if (out.status === "unavailable") return kgUnavailableAnswer(deployHeld);
-      if (out.status === "not-found") return { status: 409, body: { error: "no-refresh-in-flight" } };
+      const noRun = out.status === "not-found" || (out.status === "conflict" && out.error === "no-refresh-in-flight");
+      if (noRun) {
+        // The gate run has ended once its snapshot is held, and the hold is a KgRepo record: the Stop goes through the
+        // decision door, naming this row's trigger id so it never stops a different hold.
+        const decided = await callAsSystem("decide_kg_refresh", { action: "cancel", triggerId: dispatchId });
+        if (decided.status === "unavailable" || decided.status === "deploy-held") return kgUnavailableAnswer(deployHeld);
+        if (!decided.isError) return { status: 200, body: { cancelled: true } };
+        return { status: 409, body: { error: "no-refresh-in-flight" } };
+      }
       if (out.status === "conflict") return { status: 409, body: { error: out.error ?? "conflict" } };
       return { status: 200, body: { cancelled: true } };
     },
@@ -5421,7 +5429,7 @@ async function main(): Promise<void> {
       sidecarProbeError = health.lastError;
       console.error(`[kg] sidecar probe FAILED: ${health.lastError}`);
     } else {
-      console.error(`[kg] sidecar probe: ok (${Object.keys(KG_TOOL_CAPABILITY).length} tools)`);
+      console.error(`[kg] sidecar probe: ok (${REQUIRED_KG_TOOL_COUNT} required tools)`);
     }
   }
 

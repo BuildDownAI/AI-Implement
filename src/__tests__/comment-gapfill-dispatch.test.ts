@@ -1874,6 +1874,7 @@ describe("protected dispatch for gap-fill (AII-1392)", () => {
     const snapshot = makeSnapshot("codex-subscription");
     const caps = (supportsPrivateRunConfig: boolean): WorkflowCapabilities => ({
       contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: false, supportsPrivateRunConfig,
+      supportsExecutionPolicy: true,
     });
     async function runGha(
       result: Awaited<ReturnType<DrainInput["dispatch"]>> | Error,

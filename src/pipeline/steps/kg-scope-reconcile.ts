@@ -20,7 +20,7 @@ interface KgScopeMapping {
 interface KgScopeReconcileInputs extends Record<string, unknown> {
   callbackUrl: string | null | undefined;
   workspaceDir: string;
-  /** Dev-harness / dry-run mode: compute and log the diff but never write sources.yml. */
+  /** Dev-harness / dry-run mode: reconcile into the run's scratch clone like a live run, so later steps test the same scope; the clone is never pushed. */
   dryRun?: boolean;
   /**
    * The KG source repo itself (`owner/name`, from the clone step). A KG repo is usually
@@ -331,11 +331,6 @@ export const kgScopeReconcileStep: StepModule<KgScopeReconcileInputs, KgScopeRec
     const addedRepoSlugs = repoAdditions.map((r) => r.slug);
     const addedTeamNames = teamAdditions.map((t) => t.team);
 
-    if (dryRun) {
-      console.log(`[kg-scope-reconcile] dry-run: would add repos=${repoAdditions.length} teams=${teamAdditions.length}`);
-      return { addedRepos: repoAdditions.length, addedTeams: teamAdditions.length, addedRepoSlugs, addedTeamNames, mappedProjectCount };
-    }
-
     const raw = readSourcesYmlRaw(workspaceDir);
     let doc = parseDocument(raw);
     let baseRaw = raw;
@@ -357,7 +352,11 @@ export const kgScopeReconcileStep: StepModule<KgScopeReconcileInputs, KgScopeRec
     }
 
     writeFn(join(workspaceDir, "sources.yml"), output);
-    console.log(`[kg-scope-reconcile] added repos=${repoAdditions.length} teams=${teamAdditions.length}`);
+    console.log(
+      dryRun
+        ? `[kg-scope-reconcile] dry-run: added repos=${repoAdditions.length} teams=${teamAdditions.length} to the scratch clone (not pushed)`
+        : `[kg-scope-reconcile] added repos=${repoAdditions.length} teams=${teamAdditions.length}`,
+    );
     return { addedRepos: repoAdditions.length, addedTeams: teamAdditions.length, addedRepoSlugs, addedTeamNames, mappedProjectCount };
   },
 };

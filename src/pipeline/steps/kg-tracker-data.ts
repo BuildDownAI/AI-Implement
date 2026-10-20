@@ -2,6 +2,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
+import type { SourceResult } from "../../kg-source-results.js";
 
 interface KgTrackerDataInputs extends Record<string, unknown> {
   callbackUrl: string | null | undefined;
@@ -22,6 +23,8 @@ interface KgTrackerDataOutputs extends Record<string, unknown> {
   issueCount: number;
   /** Per-team issue counts, for the kg-refresh report. Empty when fetched=false. */
   teamCounts: Array<{ team: string; count: number }>;
+  /** One per-source result per team in sources.yml (see kg-source-results.ts). */
+  teamResults: SourceResult[];
 }
 
 /**
@@ -361,6 +364,16 @@ export function readBaseRepoFromSourcesYml(workspaceDir: string): { slug: string
   return { slug: DEFAULT_BASE_REPO };
 }
 
+function trackerResult(team: string, status: SourceResult["status"], reason: string, issues?: number): SourceResult {
+  return {
+    source: `tracker:${team}`,
+    kind: "tracker",
+    status,
+    reason,
+    counts: issues === undefined ? {} : { issues },
+  };
+}
+
 export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOutputs> = {
   async run(
     _context: PipelineContext,
@@ -396,7 +409,8 @@ export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOut
       } catch {
         // malformed JSON — leave teamCounts empty
       }
-      return { fetched: true, failedTeams: [], issueCount, teamCounts };
+      const teamResults: SourceResult[] = teamCounts.map((t) => trackerResult(t.team, "success", "", t.count));
+      return { fetched: true, failedTeams: [], issueCount, teamCounts, teamResults };
     }
 
     // Read the bearer secret directly from the environment so it never appears
@@ -405,17 +419,23 @@ export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOut
 
     if (!callbackUrl) {
       console.log("[kg-tracker-data] no callback URL; skipping");
-      return { fetched: false, failedTeams: [], issueCount: 0, teamCounts: [] };
+      return { fetched: false, failedTeams: [], issueCount: 0, teamCounts: [], teamResults: [] };
     }
     if (!progressToken) {
       console.log("[kg-tracker-data] no progress token (RUN_PROGRESS_TOKEN); skipping");
-      return { fetched: false, failedTeams: [], issueCount: 0, teamCounts: [] };
+      return { fetched: false, failedTeams: [], issueCount: 0, teamCounts: [], teamResults: [] };
     }
 
     const teams = readTeams(workspaceDir);
     if (teams.length === 0) {
       console.warn("[kg-tracker-data] no teams found in sources.yml; skipping");
-      return { fetched: false, failedTeams: [], issueCount: 0, teamCounts: [] };
+      return {
+        fetched: false,
+        failedTeams: [],
+        issueCount: 0,
+        teamCounts: [],
+        teamResults: [{ source: "tracker", kind: "tracker", status: "skipped", reason: "no trackers in sources.yml", counts: {} }],
+      };
     }
     console.log(`[kg-tracker-data] teams from sources.yml: ${teams.join(", ")}`);
 
@@ -424,6 +444,7 @@ export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOut
     const allIssues: TrackerIssue[] = [];
     const teamCounts: Array<{ team: string; count: number }> = [];
     const failedTeams: string[] = [];
+    const teamResults: SourceResult[] = [];
 
     for (const team of teams) {
       let cursor: string | null = null;
@@ -475,22 +496,25 @@ export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOut
 
       if (skipped) {
         console.log(`[kg-tracker-data] team ${team}: skipped (no orchestrator mapping)`);
+        teamResults.push(trackerResult(team, "skipped", "no mapping"));
         continue;
       }
 
       if (failure !== null) {
         console.log(`[kg-tracker-data] team ${team}: failed (${failure})`);
         failedTeams.push(team);
+        teamResults.push(trackerResult(team, "failed", failure));
         continue;
       }
 
       console.log(`[kg-tracker-data] team ${team}: ${teamIssues.length} issues`);
       teamCounts.push({ team, count: teamIssues.length });
+      teamResults.push(trackerResult(team, "success", "", teamIssues.length));
       allIssues.push(...teamIssues);
     }
 
     writeFn(join(workspaceDir, "tracker-data.json"), JSON.stringify(allIssues));
     console.log(`[kg-tracker-data] fetched ${allIssues.length} issues`);
-    return { fetched: failedTeams.length === 0, failedTeams, issueCount: allIssues.length, teamCounts };
+    return { fetched: failedTeams.length === 0, failedTeams, issueCount: allIssues.length, teamCounts, teamResults };
   },
 };

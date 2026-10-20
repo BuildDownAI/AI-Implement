@@ -32,7 +32,7 @@ import { readBackendRun, stopBackendRun } from "../backend-run.js";
 import { getRunnerMode, getKgExecutionMode, resolveKgBackend, type KgBackendResolution } from "../runner-mode.js";
 import { mintLaunchTokens } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
-import { appendLogIfAbsent, findLogIdByDispatchId, setJobMachineId, setJobMachineNonce, updateJobPrUrl, updateJobRunId } from "../log.js";
+import { appendLogIfAbsent, findLogIdByDispatchId, markJobAwaitingDecision, reopenHeldJob as reopenHeldJobRow, setJobMachineId, setJobMachineNonce, updateJobPrUrl, updateJobRunId } from "../log.js";
 import { clearMachineEnv, createMachine, destroyMachine, getMachine, listMachines, startMachine, updateMachine, waitForMachine, waitForMachineSettled, type CreateMachineOpts, type Machine, type MachineConfig, type SettleOptions } from "../fly-machines.js";
 import type { RestateService } from "./endpoint.js";
 import {
@@ -41,7 +41,6 @@ import {
   type KgDispatchRecord,
   type KgDispatchResult,
   type KgDispatchRowDetails,
-  type KgRefreshDecideInput,
   type KgRefreshReportBody,
   type KgRefreshStatusResult,
   type KgRefreshWorkflowDependencies,
@@ -430,6 +429,16 @@ export function createProductionKgRefreshServices(
       if (id === undefined) return;
       input.updateJobStatus(id, status, conclusion);
     },
+    markJobHeld: (jobId) => {
+      const id = findJobId(jobId);
+      if (id === undefined) return;
+      markJobAwaitingDecision(id);
+    },
+    reopenHeldJob: (jobId) => {
+      const id = findJobId(jobId);
+      if (id === undefined) return;
+      reopenHeldJobRow(id);
+    },
     getWorkflowRunStatus: input.getWorkflowRunStatus,
     findRunByTitle: input.findRunByTitle,
     cancelWorkflowRun: input.cancelWorkflowRun,
@@ -516,8 +525,6 @@ export interface KgRefreshIngressClient {
   report(triggerId: string, body: KgRefreshReportBody, opts?: { idempotencyKey?: string }): Promise<KgIngressResult<{ status: "accepted" | "duplicate" }>>;
   progress(triggerId: string, step?: Step): Promise<KgIngressResult>;
   cancel(triggerId: string, reason: string): Promise<KgIngressResult>;
-  /** The operator's gate decision; `conflict` carries the handler's text (`no-decision-open` or `already-decided`). */
-  decide(triggerId: string, input: KgRefreshDecideInput): Promise<KgIngressResult>;
   status(triggerId: string): Promise<KgIngressResult<KgRefreshStatusResult>>;
   repoStatus(slug: string): Promise<KgIngressResult<{ triggerId: string; startedAt: number } | null>>;
   /** Hands a PR-check dry-run to the `KgRepo` object: it runs now (`{ triggerId }`) or is held (`{ queued }`). */
@@ -583,7 +590,6 @@ export function createKgRefreshIngressClient(
       invoke<{ status: "accepted" | "duplicate" }>(() => refresh(triggerId).report(body, callOpts(opts?.idempotencyKey)), { notFound: true, conflict: true }),
     progress: (triggerId, step) => invoke(() => refresh(triggerId).progress(step ? { step } : {}, callOpts()), { notFound: true }),
     cancel: (triggerId, reason) => invoke(() => refresh(triggerId).cancel({ reason }, callOpts()), { notFound: true, conflict: true, conflictText: true }),
-    decide: (triggerId, input) => invoke(() => refresh(triggerId).decide(input, callOpts()), { notFound: true, conflict: true, conflictText: true }),
     status: (triggerId) => invoke<KgRefreshStatusResult>(() => refresh(triggerId).status(callOpts()), { notFound: true }),
     repoStatus: (slug) => invoke<{ triggerId: string; startedAt: number } | null>(() => repo(slug).status(callOpts())),
     enqueueDryRun: (slug, entry, opts) =>
