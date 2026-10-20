@@ -6,6 +6,8 @@ export default defineConfig({
     // Never inherit a developer or runner application's database by default.
     env: { DEDUP_DB_PATH: ":memory:" },
     pool: "forks",
+    // Creates the run's own temp directory, which the scrub points TMPDIR, TMP and TEMP at, and fails the run if anything is left in it.
+    globalSetup: ["src/__tests__/setup/run-temp-root.ts"],
     // The scrub must finish before any other setup file loads.
     // "list" is vitest's runtime default, but its bundled types document "parallel", so it is stated here.
     sequence: { setupFiles: "list" },

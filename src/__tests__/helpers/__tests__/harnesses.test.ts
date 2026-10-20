@@ -96,18 +96,23 @@ describe("testDir", () => {
 describe("testTempRoot", () => {
   const TEMP_DIR_VARS = ["TMPDIR", "TEMP", "TMP"] as const;
   const tempVars = () => Object.fromEntries(TEMP_DIR_VARS.map((name) => [name, process.env[name]]));
-  const before = tempVars();
   let root: string;
   let realTemp: string;
-  let tmpAfterRestore: string | undefined;
+  let scrubbed: Record<string, string | undefined>;
+  let restored: Record<string, string | undefined>;
 
   it("points every temp variable, and so os.tmpdir(), at a fresh testDir until the test finishes", () => {
     realTemp = tmpdir();
-    // A variable set before the redirect: this cleanup is registered first, so it runs last and sees what was restored.
-    process.env.TMP = realTemp;
+    scrubbed = tempVars();
+    // The scrub sets all three, so TEMP is unset here for the restore to cover an unset variable as well as set ones.
+    // This cleanup is registered first, so it runs last: it records what was restored, then puts the scrub's values back.
+    delete process.env.TEMP;
     onTestFinished(() => {
-      tmpAfterRestore = process.env.TMP;
-      delete process.env.TMP;
+      restored = tempVars();
+      for (const [name, value] of Object.entries(scrubbed)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
     });
 
     root = testTempRoot("redirect");
@@ -118,8 +123,7 @@ describe("testTempRoot", () => {
   });
 
   it("restored each variable, set or unset, and removed the directory, when the test finished", () => {
-    expect(tmpAfterRestore).toBe(realTemp);
-    expect(tempVars()).toEqual(before);
+    expect(restored).toEqual({ TMPDIR: realTemp, TEMP: undefined, TMP: realTemp });
     expect(existsSync(root)).toBe(false);
   });
 });

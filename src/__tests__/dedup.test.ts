@@ -672,7 +672,7 @@ describe("runner_tokens table", () => {
 describe("getDispatchedRows", () => {
   it("returns teamKey null for legacy rows", () => {
     dedup.markDispatched("new-1", "TEAM");
-    new Database(dbPath).prepare("INSERT INTO dispatched (issue_id, dispatched_at) VALUES ('old-1', 1)").run();
+    dedup.getDb().prepare("INSERT INTO dispatched (issue_id, dispatched_at) VALUES ('old-1', 1)").run();
     const rows = dedup.getDispatchedRows();
     expect(rows.find((r) => r.issueId === "old-1")?.teamKey).toBeNull();
     expect(rows.find((r) => r.issueId === "new-1")?.teamKey).toBe("TEAM");
