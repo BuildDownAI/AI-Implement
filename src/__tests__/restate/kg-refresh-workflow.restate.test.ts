@@ -747,11 +747,7 @@ describe("KgRefresh durable workflow", () => {
     "W1/W11: a success report runs the full merge+gates+persist path exactly once (%s)",
     async (label) => {
       const env = envFor(label);
-      const triggered = await triggerViaKgRepo(env.baseUrl());
-      expect(triggered).not.toHaveProperty("status");
-      const triggerId = (triggered as { triggerId: string }).triggerId;
-      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
-
+      // Every "before" count is read before the trigger: the run starts by one-way send and can record its row at once.
       const beforePersist = persistCalls.length;
       const beforeMerge = mergePullRequestFn.mock.calls.length;
       const beforeDeleteBranch = deleteBranchFn.mock.calls.length;
@@ -760,7 +756,11 @@ describe("KgRefresh durable workflow", () => {
       const beforeRestart = restartCallCount;
       const beforeDispatched = dispatchedIds.length;
       const beforeMinted = mintedDispatchIds.length;
-      const beforeJobLog = appendJobLogCalls.length;
+
+      const triggered = await triggerViaKgRepo(env.baseUrl());
+      expect(triggered).not.toHaveProperty("status");
+      const triggerId = (triggered as { triggerId: string }).triggerId;
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
 
       await workflowDispatched(triggerId);
       const done = attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
@@ -778,7 +778,7 @@ describe("KgRefresh durable workflow", () => {
       expect(dispatchedTokens.slice(beforeDispatched)).toEqual([
         { runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" },
       ]);
-      expect(appendJobLogCalls.slice(beforeJobLog).map((c) => c.dispatchId)).toEqual([dispatchedId]);
+      expect(appendJobLogCalls.filter((c) => c.dispatchId === dispatchedId).map((c) => c.dispatchId)).toEqual([dispatchedId]);
       expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
       expect(deleteBranchFn.mock.calls.length - beforeDeleteBranch).toBe(1);
       // one run of each rail gate's own side effect: fetchGate calls fetchTarball once,
