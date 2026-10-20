@@ -104,6 +104,7 @@ const RESTATE_TOOL_NAMES = new Set([
   "kg_neighbors",
   "kg_provenance",
   "kg_path",
+  "kg_repo_history",
   "trigger_kg_refresh",
   "decide_kg_refresh",
   "set_runner_mode",

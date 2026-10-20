@@ -180,7 +180,7 @@ Every `MemoryProvider` maps to up to six MCP tool names. The provider declares w
 | `hybridSearch` | `kg_hybrid_search`, `kg_search`, `kg_semantic_search` | Tools are absent from `tools/list`; a `tools/call` for any of them returns a tool result with `isError: true` and the text `Tool not supported by this memory provider: <tool>` |
 | `neighbors` | `kg_neighbors` | Same — absent from list, `isError` on call |
 | `path` | `kg_path` | Same |
-| `provenance` | `kg_provenance` | Same |
+| `provenance` | `kg_provenance`, `kg_repo_history` | Same |
 | `stalenessStamp` | *(no dedicated tool — served via `kg_neighbors` on the spine IRI)* | Callers that check graph freshness skip the staleness check or treat the result as unknown |
 
 The `kg_*` handler enforces the capability filter (`src/restate/tools.ts`): a `tools/call` for a tool whose capability is `false` returns a tool result `{ isError: true, content: [{ type: "text", text: "Tool not supported by this memory provider: <tool>" }] }` at HTTP 200 — never a 503 and never a proxy error. Before AII-711 the same refusal travelled as a JSON-RPC `-32601` error; the text is unchanged and is what the skills layer's dual-target degradation rules key on.

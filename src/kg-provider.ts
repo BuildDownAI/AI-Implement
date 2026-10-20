@@ -47,7 +47,14 @@ export const KG_TOOL_CAPABILITY: Readonly<Record<string, keyof MemoryProviderCap
   kg_neighbors: "neighbors",
   kg_path: "path",
   kg_provenance: "provenance",
+  kg_repo_history: "provenance",
 };
+
+/**
+ * Tools the health probe does not require in the sidecar's `tools/list`: a KG repo
+ * on an older KGB legitimately lacks them, and that must not read as an outage.
+ */
+const OPTIONAL_KG_TOOLS: ReadonlySet<string> = new Set(["kg_repo_history"]);
 
 interface SidecarRpcResponse {
   result?: { tools?: unknown[] };
@@ -56,7 +63,7 @@ interface SidecarRpcResponse {
 
 /**
  * Result of the sidecar liveness probe (AII-648): a session-tolerant `tools/list`
- * that must return the six `kg_*` tools, followed by one cheap `kg_neighbors`
+ * that must return the six core `kg_*` tools, followed by one cheap `kg_neighbors`
  * call that must return a JSON-RPC result rather than an error.
  */
 export interface SidecarHealth {
@@ -441,7 +448,9 @@ export class SidecarMemoryProvider implements MemoryProvider {
 
     const tools = (listOutcome.parsed?.result?.tools ?? []) as Array<{ name?: unknown }>;
     const names = new Set(tools.map((t) => t.name).filter((n): n is string => typeof n === "string"));
-    const missing = Object.keys(KG_TOOL_CAPABILITY).filter((name) => !names.has(name));
+    const missing = Object.keys(KG_TOOL_CAPABILITY).filter(
+      (name) => !OPTIONAL_KG_TOOLS.has(name) && !names.has(name),
+    );
     if (missing.length > 0) {
       return recordSidecarHealth({
         reachable: true,
