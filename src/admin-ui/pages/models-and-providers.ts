@@ -44,19 +44,31 @@ export const modelsAndProvidersHtml = `
     <div class="card">
       <div class="card-header">
         <h2 class="card-title">Account profiles</h2>
-        <div class="card-subtitle">Read-only. No credential values are shown or entered here.</div>
+        <div class="card-subtitle">API keys are write-only: you can set or remove one here, but a saved value is never shown.</div>
       </div>
       <div class="card-body tight">
         <table class="tbl">
           <thead>
-            <tr><th>Profile</th><th>Identity</th><th>Agent</th><th>Provider</th><th>Authentication</th><th>Permitted projects</th><th>Profile</th><th>Readiness</th><th>Busy / recovery</th></tr>
+            <tr><th>Profile</th><th>Identity</th><th>Agent</th><th>Provider</th><th>Authentication</th><th>Permitted projects</th><th>Profile</th><th>Readiness</th><th>Busy / recovery</th><th>API key</th></tr>
           </thead>
           <tbody id="mp-account-rows"></tbody>
         </table>
         <div id="mp-account-empty" class="hidden text-tertiary" style="padding:12px">No account profiles yet. An operator provisions accounts on the host; see the instructions below.</div>
         <div id="mp-account-error" class="error hidden" style="padding:0 12px"></div>
+        <div id="mp-account-form" class="hidden" style="padding:12px">
+          <h3 style="font-size:13px;margin:0 0 6px">Add account profile</h3>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <input class="input" id="mp-new-profileId" placeholder="profileId">
+            <input class="input" id="mp-new-identity" placeholder="identity">
+            <select class="input" id="mp-new-agent"><option value="claude">claude</option><option value="codex">codex</option></select>
+            <select class="input" id="mp-new-provider"><option value="anthropic">anthropic</option><option value="openai">openai</option><option value="bedrock">bedrock</option></select>
+            <select class="input" id="mp-new-authMode"><option value="anthropic-api-key">anthropic-api-key</option><option value="openai-api-key">openai-api-key</option><option value="codex-subscription">codex-subscription</option><option value="claude-subscription">claude-subscription</option><option value="bedrock">bedrock</option></select>
+            <input class="input" id="mp-new-allowedProjectKeys" placeholder="allowed project keys (comma-separated)">
+            <button class="btn btn-primary btn-sm" onclick="mpAddAccount()">Add account profile</button>
+          </div>
+        </div>
         <div class="text-tertiary" style="font-size:11.5px;padding:12px">
-          <div><strong>Provisioning.</strong> Accounts are provisioned by an operator on the host, never typed into this page.</div>
+          <div><strong>Provisioning.</strong> Add a profile above and set an API key per profile; a key is encrypted on save and never shown again. Subscription sign-ins and Bedrock credentials are provisioned on the host.</div>
           <div>ChatGPT plan, <em>sign-in required</em> or <em>missing</em>: run <span class="mono">node dist/chatgpt-plan-login.js login</span>, or import an existing sign-in with <span class="mono">chatgpt-import</span>.</div>
           <div>Readiness is checked against the profile's first permitted project, so a profile with no permitted project shows <em>unknown</em>; that is not a credential fault.</div>
         </div>
@@ -277,6 +289,16 @@ export const modelsAndProvidersScript = `(function () {
           readyCell += '<div class="text-tertiary" style="font-size:11px">Run <span class="mono">node dist/chatgpt-plan-login.js login</span> or <span class="mono">chatgpt-import</span> on the host.</div>';
         }
       }
+      let keyCell = '<span class="text-tertiary">—</span>';
+      if (a.authMode === 'openai-api-key' || a.authMode === 'anthropic-api-key') {
+        const pid = window.escAttr(a.profileId);
+        keyCell = '<span class="badge ' + (a.credentialSet ? 'success' : 'neutral') + '">' + (a.credentialSet ? 'set' : 'not set') + '</span>' +
+          (mpCanEdit()
+            ? '<div style="display:flex;gap:4px;margin-top:4px"><input class="input" type="password" autocomplete="off" data-key-for="' + pid + '" placeholder="API key">' +
+              '<button class="btn btn-sm" data-act="set-key" data-profile="' + pid + '">Set key</button>' +
+              '<button class="btn btn-sm" data-act="remove-key" data-profile="' + pid + '">Remove key</button></div>'
+            : '');
+      }
       html += '<tr>' +
         '<td><span class="mono">' + window.esc(a.profileId) + '</span></td>' +
         '<td>' + window.esc(a.identity) + '</td>' +
@@ -287,9 +309,65 @@ export const modelsAndProvidersScript = `(function () {
         '<td><span class="badge ' + (a.profileStatus === 'active' ? 'success' : 'neutral') + '">' + window.esc(a.profileStatus || 'unknown') + '</span></td>' +
         '<td>' + readyCell + '</td>' +
         '<td>' + recoveryCell + '</td>' +
+        '<td>' + keyCell + '</td>' +
         '</tr>';
     }
     rowsEl.innerHTML = html;
+    document.getElementById('mp-account-form').classList.toggle('hidden', !mpCanEdit());
+  }
+
+  function mpAccountError(msg) {
+    const el = document.getElementById('mp-account-error');
+    el.textContent = msg || '';
+    el.classList.toggle('hidden', !msg);
+  }
+
+  async function mpCredentialCall(profileId, method, apiKey) {
+    mpAccountError('');
+    const url = '/api/model-accounts/' + encodeURIComponent(profileId) + '/credential';
+    try {
+      const res = await window.api(url, method === 'PUT' ? { method: method, body: JSON.stringify({ apiKey: apiKey }) } : { method: method });
+      if (!res.ok) { mpAccountError(await mpErrorText(res, 'Failed to update the key')); return; }
+    } catch (err) {
+      mpAccountError('Failed to update the key');
+      return;
+    }
+    await loadStageConfig(false);
+  }
+
+  async function mpAddAccount() {
+    if (!mpCanEdit()) return;
+    mpAccountError('');
+    const val = function (id) { return String(document.getElementById('mp-new-' + id).value || '').trim(); };
+    const keys = val('allowedProjectKeys').split(',').map(function (k) { return k.trim(); }).filter(Boolean);
+    const body = { profileId: val('profileId'), identity: val('identity'), agent: val('agent'), provider: val('provider'), authMode: val('authMode'), allowedProjectKeys: keys };
+    try {
+      const res = await window.api('/api/model-accounts', { method: 'POST', body: JSON.stringify(body) });
+      if (!res.ok) { mpAccountError(await mpErrorText(res, 'Failed to add account profile')); return; }
+    } catch (err) {
+      mpAccountError('Failed to add account profile');
+      return;
+    }
+    document.getElementById('mp-new-profileId').value = '';
+    document.getElementById('mp-new-identity').value = '';
+    document.getElementById('mp-new-allowedProjectKeys').value = '';
+    await loadStageConfig(false);
+  }
+
+  function mpWatchKeys() {
+    document.getElementById('mp-account-rows').onclick = async function (e) {
+      const btn = e.target && e.target.closest ? e.target.closest('button[data-act]') : null;
+      if (!btn) return;
+      const profileId = btn.getAttribute('data-profile');
+      if (btn.getAttribute('data-act') === 'remove-key') { await mpCredentialCall(profileId, 'DELETE'); return; }
+      const inputs = document.querySelectorAll('#mp-account-rows input[data-key-for]');
+      let input = null;
+      for (const el of inputs) { if (el.getAttribute('data-key-for') === profileId) input = el; }
+      if (!input || !input.value) { mpAccountError('Enter an API key first.'); return; }
+      const value = input.value;
+      input.value = '';
+      await mpCredentialCall(profileId, 'PUT', value);
+    };
   }
 
   async function loadStageConfig(force) {
@@ -445,6 +523,7 @@ export const modelsAndProvidersScript = `(function () {
 
   window.loadModelsAndProviders = loadModelsAndProviders;
   window.saveStageDefaults = saveStageDefaults;
+  window.mpAddAccount = mpAddAccount;
   window.resetStageDefaults = resetStageDefaults;
-  window.registerPage('models', function () { mpWatchDirty(); loadModelsAndProviders(); setInterval(loadModelsAndProviders, 60000); });
+  window.registerPage('models', function () { mpWatchDirty(); mpWatchKeys(); loadModelsAndProviders(); setInterval(loadModelsAndProviders, 60000); });
 })();`;

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createModelProtectedSecrets } from "../model-protected-secrets.js";
 import type * as AdminModule from "../admin.js";
 import type * as AdminSessionModule from "../admin-session.js";
 import type * as AccessEntriesModule from "../access-entries.js";
@@ -6447,5 +6448,115 @@ describe("model accounts and stage configuration (AII-962)", () => {
     await request("/api/mappings/APP", "PATCH", "secret", body, t);
     expect(store.getProjectOptIn("APP")).toBe(false);
     expect(store.getProjectStageConfig("APP")).toBeNull();
+  });
+
+  describe("browser API key entry (AII-1500)", () => {
+    const KEY = "sk-synthetic-sentinel-1500";
+    const SECRET_ENV = "test-runner-token-secret-1500";
+    const saved = process.env.RUNNER_TOKEN_SECRET;
+    beforeEach(() => { process.env.RUNNER_TOKEN_SECRET = SECRET_ENV; });
+    afterEach(() => {
+      if (saved === undefined) delete process.env.RUNNER_TOKEN_SECRET; else process.env.RUNNER_TOKEN_SECRET = saved;
+      vi.restoreAllMocks();
+    });
+    const store = () => createModelProtectedSecrets({ env: process.env, db: () => dedup.getDb() });
+    const url = (id: string) => `/api/model-accounts/${id}/credential`;
+    const REF = "model-account:oai-1";
+
+    async function seedProfile(over: Record<string, unknown> = {}) {
+      const t = adminTok();
+      const r = await call("/api/model-accounts", "POST", t, profileBody({ credentialRef: REF, ...over }));
+      expect(r.status).toBe(201);
+      return t;
+    }
+
+    it("round-trips a key like secret-import, never leaks it, and DELETE removes it", async () => {
+      const logs: string[] = [];
+      for (const m of ["log", "info", "warn", "error"] as const) vi.spyOn(console, m).mockImplementation((...a) => { logs.push(a.join(" ")); });
+      const t = await seedProfile();
+      const revs = count("model_account_profile_revisions");
+      const put = await call(url("oai-1"), "PUT", t, { apiKey: KEY });
+      expect(put.status).toBe(200);
+      expect(put.json).toEqual({ ref: REF, result: "set" });
+      expect(put.raw).not.toContain(KEY);
+      expect(store().resolve(REF)).toBe(KEY);
+      expect(count("model_account_profile_revisions")).toBe(revs);
+      const list = await call("/api/model-accounts", "GET", t);
+      const row = list.json.accounts.find((a: { profileId: string }) => a.profileId === "oai-1");
+      expect(row.credentialSet).toBe(true);
+      expect(typeof row.credentialUpdatedAt).toBe("number");
+      expect(list.raw).not.toContain(KEY);
+      expect(list.raw).not.toContain(REF);
+      const del = await call(url("oai-1"), "DELETE", t);
+      expect(del.json).toEqual({ ref: REF, result: "removed" });
+      expect(store().resolve(REF)).toBeNull();
+      expect(count("model_protected_secrets")).toBe(0);
+      expect((await call(url("oai-1"), "DELETE", t)).status).toBe(200);
+      const after = (await call("/api/model-accounts", "GET", t)).json.accounts[0];
+      expect(after.credentialSet).toBe(false);
+      expect(after.credentialUpdatedAt).toBeNull();
+      expect(logs.filter((l) => l.includes("[admin] model-account credential"))).toHaveLength(3);
+      expect(logs.join("\n")).not.toContain(KEY);
+    });
+
+    it("derives model-account:<id> and appends one revision for a profile without a ref", async () => {
+      const t = adminTok();
+      await call("/api/model-accounts", "POST", t, profileBody({ credentialRef: undefined }));
+      const revs = count("model_account_profile_revisions");
+      const put = await call(url("oai-1"), "PUT", t, { apiKey: KEY });
+      expect(put.json).toEqual({ ref: REF, result: "set" });
+      expect(count("model_account_profile_revisions")).toBe(revs + 1);
+      expect(store().resolve(REF)).toBe(KEY);
+      const acct = (await call("/api/model-accounts", "GET", t)).json.accounts[0];
+      expect(acct.credentialSet).toBe(true);
+      expect(acct.allowedProjectKeys).toEqual(["APP"]);
+    });
+
+    it("refuses bad refs, wrong modes, unknown profiles and bad bodies without writing", async () => {
+      const t = adminTok();
+      await call("/api/model-accounts", "POST", t, profileBody({ profileId: "Upper-1", credentialRef: undefined }));
+      await call("/api/model-accounts", "POST", t, profileBody({ profileId: "badref", credentialRef: SENTINEL }));
+      await call("/api/model-accounts", "POST", t, profileBody({ profileId: "plan-1", authMode: "codex-subscription", credentialRef: undefined }));
+      await call("/api/model-accounts", "POST", t, profileBody({ profileId: "bed", provider: "bedrock", agent: "claude", authMode: "bedrock", credentialRef: REF }));
+      await seedProfile();
+      const revs = count("model_account_profile_revisions");
+      const cases: Array<[string, unknown, number]> = [
+        ["Upper-1", { apiKey: KEY }, 400],
+        ["badref", { apiKey: KEY }, 400],
+        ["plan-1", { apiKey: KEY }, 400],
+        ["bed", { apiKey: KEY }, 400],
+        ["nope", { apiKey: KEY }, 404],
+        ["oai-1", { apiKey: "" }, 400],
+        ["oai-1", { apiKey: "   " }, 400],
+        ["oai-1", { apiKey: 5 }, 400],
+        ["oai-1", {}, 400],
+        ["oai-1", { apiKey: KEY, extra: 1 }, 400],
+      ];
+      for (const [id, body, status] of cases) {
+        const r = await call(url(id), "PUT", t, body);
+        expect(r.status, id).toBe(status);
+        expect(r.raw).not.toContain(KEY);
+      }
+      expect(count("model_protected_secrets")).toBe(0);
+      expect(count("model_account_profile_revisions")).toBe(revs);
+    });
+
+    it("answers 503 with fixed text when RUNNER_TOKEN_SECRET is unset", async () => {
+      const t = await seedProfile();
+      delete process.env.RUNNER_TOKEN_SECRET;
+      const r = await call(url("oai-1"), "PUT", t, { apiKey: KEY });
+      expect(r.status).toBe(503);
+      expect(r.raw).not.toContain(KEY);
+      expect(count("model_protected_secrets")).toBe(0);
+    });
+
+    it("refuses a non-admin with every page granted", async () => {
+      await seedProfile();
+      accessGrants.savePageGrants(Object.keys(accessGrants.PAGE_ROUTES), "ada@eudoxus.ai");
+      const u = userTok();
+      expect((await call(url("oai-1"), "PUT", u, { apiKey: KEY })).status).toBe(403);
+      expect((await call(url("oai-1"), "DELETE", u)).status).toBe(403);
+      expect(count("model_protected_secrets")).toBe(0);
+    });
   });
 });

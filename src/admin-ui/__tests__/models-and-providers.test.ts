@@ -23,9 +23,15 @@ describe("models-and-providers page", () => {
     expect(modelsAndProvidersHtml).toContain("Projects opt in separately");
     expect(modelsAndProvidersHtml).toContain("next run");
   });
-  it("has no credential input", () => {
-    expect(modelsAndProvidersHtml).not.toMatch(/type="password"/);
-    expect(modelsAndProvidersScript).not.toMatch(/credentialRef|type="password"/);
+  it("offers write-only key entry and an add-profile form, without the old read-only subtitle", () => {
+    expect(modelsAndProvidersHtml).not.toContain("No credential values are shown or entered here");
+    expect(modelsAndProvidersHtml).toContain("Add account profile");
+    expect(modelsAndProvidersScript).toContain('type="password"');
+    expect(modelsAndProvidersScript).toContain("Set key");
+    expect(modelsAndProvidersScript).toContain("Remove key");
+    expect(modelsAndProvidersScript).toContain("/credential");
+    expect(modelsAndProvidersScript).toContain("input.value = ''");
+    expect(modelsAndProvidersScript).not.toMatch(/credentialRef/);
   });
   it("uses window.api/window.esc only", () => {
     const stripped = modelsAndProvidersScript.replace(/window\.api\(/g, "").replace(/window\.esc\(/g, "");

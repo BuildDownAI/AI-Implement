@@ -209,7 +209,8 @@ Admin-only: none of these paths is in `PAGE_ROUTES`, so a granted non-admin gets
 
 | Route | Purpose |
 |---|---|
-| `GET` / `POST /api/model-accounts`, `PATCH /api/model-accounts/:id` | Profile list (safe projection plus readiness) and revision writes. Bodies carry metadata and a protected `credentialRef` only; any other key (`apiKey`, `session`, `token`, ...) is a 400. Reads never return `credentialRef`. |
+| `GET` / `POST /api/model-accounts`, `PATCH /api/model-accounts/:id` | Profile list (safe projection plus readiness, `credentialSet`, `credentialUpdatedAt`) and revision writes. Bodies carry metadata and a protected `credentialRef` only; any other key (`apiKey`, `session`, `token`, ...) is a 400. Reads never return `credentialRef`. |
+| `PUT` / `DELETE /api/model-accounts/:id/credential` | Write-only API key for `openai-api-key` / `anthropic-api-key` profiles; body `{ "apiKey" }`, response `{ ref, result }`, value never returned or logged. Admin-only. |
 | `GET` / `PUT /api/agent-defaults` | Orchestrator stage defaults. Validated against profiles in one transaction. |
 | `GET` / `PUT /api/mappings/:key/agent-config` | Project opt-in (`enabled`) and partial stage overrides. A supplied field replaces the stored one, `null` returns it to inheritance, omitted fields stay. |
 | `GET /api/mappings/:key/agent-config/resolved` | Actual values, per-field sources, resolution failure code, account readiness (`ready`, `sign-in required`, `refresh failed (transient)`, `missing`, `unknown`), and session recovery state for `claude-subscription` only. |
