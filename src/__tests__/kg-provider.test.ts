@@ -95,6 +95,10 @@ describe("KG_TOOL_CAPABILITY", () => {
   it("maps kg_provenance → provenance", () => {
     expect(KG_TOOL_CAPABILITY.kg_provenance).toBe("provenance");
   });
+
+  it("maps kg_repo_history → provenance", () => {
+    expect(KG_TOOL_CAPABILITY.kg_repo_history).toBe("provenance");
+  });
 });
 
 // ---- SidecarMemoryProvider ----
@@ -743,6 +747,17 @@ describe("SidecarMemoryProvider probe", () => {
     const sentBody = (writeSpy.mock.calls[0][0] as Buffer).toString();
     expect(sentBody).toContain(SPINE_IRI);
     expect(sentBody).toContain("kg_neighbors");
+  });
+
+  it("stays healthy when an older sidecar's tools/list lacks kg_repo_history", async () => {
+    queueResponse(200, toolsListResult(ALL_SIX_TOOLS.filter((t) => t.name !== "kg_repo_history")));
+    queueResponse(200, neighborsOk());
+
+    const health = await makeProvider().probe();
+
+    expect(health.toolsListed).toBe(true);
+    expect(health.lastError).toBeNull();
+    expect(isKgUnavailable()).toBe(false);
   });
 
   it("fails when tools/list is missing a required tool", async () => {

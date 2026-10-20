@@ -185,7 +185,7 @@ export function tool<I extends z.ZodType>(
 }
 
 export const GET_TENANT_HEALTH_DESCRIPTION =
-  "Returns an orchestrator health summary: runner mode, in-flight job count, pending gap-fill queue count, project count, and (when a KG source repo is configured) a live credential preflight for the kg-refresh rail (`kgRefreshPreflight` with one row per repo and grant). Use as a first-pass check before digging deeper.";
+  "Returns an orchestrator health summary: runner mode, in-flight job count, `awaitingDecisionCount` (kg-refresh rows held at the decision gate, which are not in flight), pending gap-fill queue count, project count, and (when a KG source repo is configured) a live credential preflight for the kg-refresh rail (`kgRefreshPreflight` with one row per repo and grant). Use as a first-pass check before digging deeper.";
 
 export const getTenantHealth = tool(
   {
@@ -200,6 +200,9 @@ export const getTenantHealth = tool(
     const { n: pendingGapfillCount } = db
       .prepare("SELECT COUNT(*) as n FROM comment_gapfill_queue WHERE status = 'pending'")
       .get() as { n: number };
+    const { n: awaitingDecisionCount } = db
+      .prepare("SELECT COUNT(*) as n FROM dispatch_log WHERE phase = 'kg-refresh' AND status = 'completed' AND conclusion = 'awaiting_decision'")
+      .get() as { n: number };
     const projectCount = Object.keys(getMappings()).length;
     const kgSourceRepo = readKgSourceRepo(process.env.KG_SOURCE_REPO);
     const kgRefreshPreflight = kgSourceRepo
@@ -213,6 +216,7 @@ export const getTenantHealth = tool(
     const result = {
       runnerMode: { mode, source },
       inFlightJobCount: inFlight.length,
+      awaitingDecisionCount,
       pendingGapfillCount,
       projectCount,
       kgDegraded: isKgDegraded(),
@@ -344,7 +348,7 @@ export const getProjectBinding = tool(
 );
 
 export const LIST_IN_FLIGHT_JOBS_DESCRIPTION =
-  "Lists all currently dispatching or running jobs with their issue identifier, repo, phase, and elapsed seconds since dispatch.";
+  "Lists all currently dispatching or running jobs with their issue identifier, repo, phase, and elapsed seconds since dispatch. A kg-refresh held for a decision is not in flight; it appears in `get_kg_status`.";
 
 export const listInFlightJobs = tool(
   { description: LIST_IN_FLIGHT_JOBS_DESCRIPTION, input: z.object({}), role: "user" },
@@ -624,7 +628,7 @@ export const getDeployPostureTool = tool(
 );
 
 export const GET_KG_STATUS_DESCRIPTION =
-  "Returns the KG refresh rail state: stage (idle | checking | ingest-running | snapshot-landed | awaiting-decision | staging | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), the last refresh outcome with its gate. The served stamp falls back to a live read when the last-refresh record carries none. currentRun is the in-flight run only (triggerId, step, decisions, held), or null with no run in flight; decisions is [\"accept\", \"cancel\"] only while the run waits at the decision gate (stage awaiting-decision), and held carries the snapshot PR, its part table, and the decide-by time. Poll it after `POST /api/kg/refresh`.";
+  "Returns the KG refresh rail state: stage (idle | checking | ingest-running | snapshot-landed | awaiting-decision | staging | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), the last refresh outcome with its gate. The served stamp falls back to a live read when the last-refresh record carries none. currentRun is the in-flight run only (triggerId, step, decisions, held), or null with no run in flight; decisions is [\"accept\", \"cancel\"] only while the run waits at the decision gate (stage awaiting-decision), or [\"cancel\"] for a blocked hold (held.acceptBlocked), and held carries the snapshot PR, its part table, and the decide-by time. Poll it after `POST /api/kg/refresh`.";
 
 // Type-only client handles: the real definitions are built with dependencies at boot
 // (createProductionKgRefreshServices); a client needs only the service name and handler types.
@@ -646,8 +650,9 @@ export function setKgRefreshToolDeps(deps: KgRefreshToolDeps | null): void {
 export function kgStageForStep(step: string | null): KgRefreshStage {
   if (step === null || step === "reserve" || step === "dispatch") return "checking";
   if (step === "await-progress" || step === "cancelling" || step === "dry-run-report") return "ingest-running";
-  if (step === "decision") return "awaiting-decision";
-  if (step === "merge" || step === "delete-branch") return "snapshot-landed";
+  if (step === "decision" || step === "held") return "awaiting-decision";
+  // `resume` is a decided hold's run: it merges, or closes the held PR.
+  if (step === "merge" || step === "delete-branch" || step === "resume") return "snapshot-landed";
   // fetch, stage, swap, verify, revert, persist, close-row, outcome, settled, and the
   // short-lived terminal steps (failed, closed, no-new-data) whose marker is about to clear.
   return "staging";
@@ -682,13 +687,14 @@ export function kgStageForRunnerStep(id: string, status: StepStatus): KgRefreshS
 const REVERT_GATES = new Set(["answers", "vectors", "canary", "stamp"]);
 
 export const DECIDE_KG_REFRESH_DESCRIPTION =
-  "Decide the current in-flight KG refresh (admin role). Acts only on the run KgRepo reports in flight; there is no trigger id argument, so a past run cannot be decided. `accept` lands the held snapshot, `cancel` drops it. When the run is not at the decision gate, `accept` answers no-decision-open and `cancel` stops the run through the cancel signal. A second decision answers already-decided, except that a `cancel` after an accept stops the run until the merge starts and answers past-merge from then on (the merge is the point of no return; the run finishes). With no run in flight the answer is no-refresh-in-flight.";
+  "Decide the current KG refresh (admin role). Acts only on the run KgRepo reports in flight; a past run cannot be decided. A snapshot held at the decision gate is a KgRepo record, not a running workflow: `accept` lands it and `cancel` drops it, each as a new KgRefresh run. Pass `triggerId` (the held run's trigger id from get_kg_status) to decide only that hold; a hold that is gone or replaced answers no-decision-open. When no decision is open, `accept` answers no-decision-open and `cancel` stops the run in flight through the cancel signal. `accept` on a blocked hold answers accept-blocked. A second accept answers no-decision-open (the hold is marked decided). A `cancel` after an accept stops the run until the merge starts and answers past-merge from then on (the merge is the point of no return; the run finishes). With no run in flight the answer is no-refresh-in-flight.";
 
 export const decideKgRefreshTool = tool(
   {
     description: DECIDE_KG_REFRESH_DESCRIPTION,
     input: z.object({
       action: z.enum(["accept", "cancel"]).describe("accept lands the held snapshot; cancel drops it (or stops the run when no decision is open)."),
+      triggerId: z.string().min(1).optional().describe("The trigger id of the hold being decided, as get_kg_status shows it. Omit to decide the current hold."),
     }),
     role: "admin",
     retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
@@ -697,28 +703,63 @@ export const decideKgRefreshTool = tool(
     const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
     const toolDeps = kgRefreshToolDeps;
     if (!toolDeps) return toolError("KG refresh is not configured");
-    const inFlight = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).status();
-    if (inFlight === null || inFlight === undefined) return toolError("no-refresh-in-flight");
-    const { triggerId } = inFlight;
-    const { action } = input.args;
+    const repo = ctx.objectClient(KgRepo, toolDeps.kgSourceRepo);
+    if ((await repo.status()) == null) return toolError("no-refresh-in-flight");
+    const { action, triggerId: heldTrigger } = input.args;
     const actor = input.caller.email ?? (input.caller.kind === "system" ? "system" : "unknown");
     try {
-      await ctx.workflowClient(KgRefresh, triggerId).decide({ action, actor });
+      await repo.decide({ action, actor, ...(heldTrigger !== undefined ? { triggerId: heldTrigger } : {}) });
       return reply({ decided: action });
     } catch (err) {
       if (!(err instanceof restate.TerminalError) || err.code !== 409) throw err;
-      if (err.message === "past-merge") return toolError("past-merge");
-      if (err.message === "already-decided") return toolError("already-decided");
+      if (err.message === "accept-blocked") return toolError("accept-blocked");
       if (err.message !== "no-decision-open") throw err;
     }
-    if (action === "accept") return toolError("no-decision-open");
+    // A caller that named a hold meant that hold only: never fall back to whatever runs now.
+    if (action === "accept" || heldTrigger !== undefined) return toolError("no-decision-open");
+    // No decision is open, so `cancel` stops the run in flight. Read it again: an accept may have resumed it as a new run.
+    const current = await repo.status();
+    if (current == null) return toolError("no-refresh-in-flight");
+    if (current.held) {
+      // The hold was stored after the first decide: the run has ended, so only the decision door can stop it.
+      try {
+        await repo.decide({ action: "cancel", actor, triggerId: current.triggerId });
+      } catch (err) {
+        if (err instanceof restate.TerminalError && err.code === 409) return toolError("no-decision-open");
+        throw err;
+      }
+      return reply({ cancelled: true });
+    }
     try {
-      await ctx.workflowClient(KgRefresh, triggerId).cancel({ reason: "operator_cancelled" });
+      await ctx.workflowClient(KgRefresh, current.triggerId).cancel({ reason: "operator_cancelled" });
     } catch (err) {
       if (err instanceof restate.TerminalError && err.code === 409 && err.message === "past-merge") return toolError("past-merge");
       // The run finished between the status read and the signal.
-      if (err instanceof restate.TerminalError && (err.code === 404 || err.code === 409)) return toolError("no-refresh-in-flight");
+      if (err instanceof restate.TerminalError && (err.code === 404 || err.code === 409)) {
+        // A gate run that stored its hold and ended in between left a hold, not nothing (AII-1493): the decision door stops it.
+        const after = await repo.status();
+        if (after?.held) {
+          try {
+            await repo.decide({ action: "cancel", actor, triggerId: after.triggerId });
+          } catch (decideErr) {
+            if (decideErr instanceof restate.TerminalError && decideErr.code === 409) return toolError("no-decision-open");
+            throw decideErr;
+          }
+          return reply({ cancelled: true });
+        }
+        return toolError("no-refresh-in-flight");
+      }
       throw err;
+    }
+    // A kill after the signal may have reopened a hold the signal never reached: the decision door stops it.
+    const reopened = await repo.status();
+    if (reopened?.held) {
+      try {
+        await repo.decide({ action: "cancel", actor, triggerId: reopened.triggerId });
+      } catch (err) {
+        if (err instanceof restate.TerminalError && err.code === 409) return toolError("no-decision-open");
+        throw err;
+      }
     }
     return reply({ cancelled: true });
   },
@@ -760,30 +801,34 @@ export const getKgStatusTool = tool(
     if (inFlight === null || inFlight === undefined) {
       stage = kgStageFromLastRefresh(lastRefresh);
     } else {
-      try {
-        const wf = await ctx.workflowClient(KgRefresh, inFlight.triggerId).status();
-        // Older in-flight workflows lack the decision fields during a deploy.
-        const decisions = wf.decisions ?? [];
-        currentRun = { triggerId: inFlight.triggerId, step: wf.step, decisions, held: wf.held ? { ...wf.held, snapshotPrUrl: `https://github.com/${toolDeps.kgSourceRepo}/pull/${wf.held.snapshotPr}` } : null };
-        if (wf.step === "decision" && decisions.length > 0) {
-          // The runner has finished by the gate, so its last step must not decide the stage.
-          stage = "awaiting-decision";
-        } else if (wf.step === "decision") {
-          // Decided, or timed out, and finishing: the step is not cleared until the next one is set.
-          stage = "staging";
-        } else if (wf.runnerStep) {
-          runnerStep = { id: wf.runnerStep.id, status: wf.runnerStep.status as StepStatus };
-          stage = kgStageForRunnerStep(runnerStep.id, runnerStep.status);
-        } else {
-          stage = kgStageForStep(wf.step);
+      if (inFlight.held) {
+        // A hold is a `KgRepo` record: no run is in flight, so there is no workflow to read.
+        const held = inFlight.held;
+        currentRun = {
+          triggerId: inFlight.triggerId,
+          step: "decision",
+          decisions: held.acceptBlocked ? ["cancel"] : ["accept", "cancel"],
+          held: { ...held, snapshotPrUrl: `https://github.com/${toolDeps.kgSourceRepo}/pull/${held.snapshotPr}` },
+        };
+        stage = "awaiting-decision";
+      } else {
+        try {
+          const wf = await ctx.workflowClient(KgRefresh, inFlight.triggerId).status();
+          currentRun = { triggerId: inFlight.triggerId, step: wf.step, decisions: [], held: null };
+          if (wf.runnerStep) {
+            runnerStep = { id: wf.runnerStep.id, status: wf.runnerStep.status as StepStatus };
+            stage = kgStageForRunnerStep(runnerStep.id, runnerStep.status);
+          } else {
+            stage = kgStageForStep(wf.step);
+          }
+        } catch (err) {
+          // A retained-but-finished or unreachable workflow: the marker is the truth.
+          if (!kgStatusFallbackLogged) {
+            kgStatusFallbackLogged = true;
+            console.warn(`[kg-refresh] workflow status unavailable for ${inFlight.triggerId}; reporting ingest-running: ${String(err)}`);
+          }
+          stage = "ingest-running";
         }
-      } catch (err) {
-        // A retained-but-finished or unreachable workflow: the marker is the truth.
-        if (!kgStatusFallbackLogged) {
-          kgStatusFallbackLogged = true;
-          console.warn(`[kg-refresh] workflow status unavailable for ${inFlight.triggerId}; reporting ingest-running: ${String(err)}`);
-        }
-        stage = "ingest-running";
       }
     }
     const restateKey = inFlight?.triggerId ?? lastRefresh?.dispatchId;
@@ -905,6 +950,8 @@ const KG_TOOL_DESCRIPTIONS: Record<string, string> = {
   kg_neighbors: "Returns the immediate neighbors of a graph node by IRI.",
   kg_path: "Returns a path between two graph nodes by IRI.",
   kg_provenance: "Returns the provenance (source commit/file) of a graph node by IRI.",
+  kg_repo_history:
+    "Returns a repository's commits and merged PRs. Args: repo, and optionally branch, since, until, pr, kind, limit.",
 };
 
 /**
@@ -944,6 +991,7 @@ export const kgSemanticSearch = kgTool("kg_semantic_search");
 export const kgNeighbors = kgTool("kg_neighbors");
 export const kgPath = kgTool("kg_path");
 export const kgProvenance = kgTool("kg_provenance");
+export const kgRepoHistory = kgTool("kg_repo_history");
 
 // ---- Writes (AII-713): moved verbatim off WRITE_TOOLS in src/mcp.ts. Each admin action
 // call, its args validation, and its status-to-text mapping are unchanged — only the caller
@@ -1485,6 +1533,7 @@ export const orchestratorTools = restate.service({
     kg_neighbors: kgNeighbors,
     kg_path: kgPath,
     kg_provenance: kgProvenance,
+    kg_repo_history: kgRepoHistory,
     trigger_kg_refresh: triggerKgRefreshTool,
     decide_kg_refresh: decideKgRefreshTool,
     set_runner_mode: setRunnerModeTool,

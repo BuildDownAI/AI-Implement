@@ -75,7 +75,7 @@ describe("claude-implement.yml template — runner_phase and runner_callback_url
   it("masks run_progress_token in the Mask runner callback tokens step (regression guard)", () => {
     const step = getMaskStep();
     expect(step).toBeDefined();
-    expect(step.env).toBeUndefined();
+    expect(step.env).toEqual({ AI_IMPLEMENT_GHA_RUNNER_ENVIRONMENT: "${{ runner.environment }}" });
     expect(step.run).toContain(".run_progress_token");
     expect(step.run).toContain("GITHUB_EVENT_PATH");
     expect(step.run).not.toContain("inputs.run_progress_token");

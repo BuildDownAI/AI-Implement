@@ -546,6 +546,40 @@ export function updateJobStatus(
 }
 
 /**
+ * Closes a kg-refresh gate row as `completed` / `awaiting_decision`, but only while it is still a fresh `running` row
+ * (AII-1493). A resumed run that took the row back (`reopenHeldJob` stamps it) or closed it is never overwritten, so a
+ * gate run that was parked here while a decision was made cannot leave the badge behind. Returns whether the row changed.
+ */
+export function markJobAwaitingDecision(jobId: number): boolean {
+  return getDb()
+    .prepare(
+      `UPDATE dispatch_log
+       SET status = 'completed', conclusion = 'awaiting_decision', completed_at = ?
+       WHERE id = ? AND status = 'running' AND conclusion IS NULL`,
+    )
+    .run(Date.now(), jobId).changes > 0;
+}
+
+/** The conclusion a resumed kg-refresh run stamps on its `running` row when it takes it back from the decision gate. */
+export const KG_RESUMED_CONCLUSION = "resumed";
+
+/**
+ * A resumed kg-refresh run takes its row back from the decision gate (AII-1493), so a killed run never leaves the
+ * "awaiting decision" badge and a late gate write cannot land after the decision. A `completed` / `awaiting_decision` row
+ * becomes `running`; a `running` row with no conclusion (the gate run was killed before its write) is only stamped.
+ * A plain conditional write with none of `updateJobStatus`'s terminal side effects. Returns whether the row changed.
+ */
+export function reopenHeldJob(jobId: number): boolean {
+  return getDb()
+    .prepare(
+      `UPDATE dispatch_log
+       SET status = 'running', conclusion = ?, completed_at = NULL
+       WHERE id = ? AND ((status = 'completed' AND conclusion = 'awaiting_decision') OR (status = 'running' AND conclusion IS NULL))`,
+    )
+    .run(KG_RESUMED_CONCLUSION, jobId).changes > 0;
+}
+
+/**
  * Durably stamps the run row as runner-approved. Sets both `approved = 1` and
  * `conclusion = 'runner_approved'` in a single SQL statement so no partial-stamp
  * window exists. Unlike updateJobStatus, subsequent monitor or watchdog writes

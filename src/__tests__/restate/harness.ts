@@ -124,6 +124,13 @@ export async function attachWorkflow<T>(baseUrl: string, workflow: string, key: 
   });
 }
 
+/** Waits for one invocation, by id, to complete; a failed invocation rejects. Used where the id comes from the admin query, not a workflow key. */
+export async function attachInvocation(baseUrl: string, invocationId: string): Promise<void> {
+  const response = await fetch(`${baseUrl}/restate/invocation/${invocationId}/attach`);
+  const text = await response.text();
+  if (!response.ok) throw new Error(`attach ${invocationId} failed: ${response.status} ${text}`);
+}
+
 /** Poll `read` until `accept` approves the value, and return that value. On timeout the
  *  error names `label` and prints the last value read, so a flake reads as a diagnosis
  *  rather than a bare assertion diff. State produced by a one-way send, a schedule, or a
@@ -161,6 +168,28 @@ export async function queryInvocations(adminBaseUrl: string, where: string): Pro
   });
   if (!response.ok) throw new Error(`POST /query failed: HTTP ${response.status}`);
   return ((await response.json()) as { rows: Array<Record<string, unknown>> }).rows;
+}
+
+/**
+ * Waits until `count` invocations of `handler` matching `invokedBy` (a `sys_invocation` condition on the sender,
+ * for example `invoked_by_id = '<id>'`) exist, then attaches to each so the caller reads state only after they ran.
+ * A barrier call to the target does not order a send another invocation made; waiting on the send itself does.
+ */
+export async function awaitSentInvocations(
+  adminBaseUrl: string,
+  baseUrl: string,
+  target: { service: string; key: string; handler: string },
+  invokedBy: string,
+  count = 1,
+): Promise<number> {
+  const rows = await eventually(
+    () => queryInvocations(adminBaseUrl, `target_service_name = '${target.service}' AND target_service_key = '${target.key}' AND target_handler_name = '${target.handler}' AND ${invokedBy}`),
+    (found) => found.length >= count,
+    { label: `${count} ${target.service}/${target.handler} sent by ${invokedBy}` },
+  );
+  // An invocation that ended in failure (for example a refused `decide` answering 409) has still run: only completion matters here.
+  for (const row of rows) await attachInvocation(baseUrl, String(row.id)).catch(() => undefined);
+  return rows.length;
 }
 
 /** The full `sys_journal` rows of one invocation. A test that must prove a value is absent from the journal searches these. */
@@ -234,10 +263,16 @@ export async function killInvocation(adminBaseUrl: string, id: string): Promise<
 
 /** Overwrites one Virtual Object state entry through the admin API, to plant a marker shape an older release wrote. */
 export async function setObjectState(adminBaseUrl: string, service: string, key: string, stateKey: string, value: unknown): Promise<void> {
+  await setObjectStates(adminBaseUrl, service, key, { [stateKey]: value });
+}
+
+/** Replaces an object's whole state with these keys (the admin API's `new_state` is not a merge). */
+export async function setObjectStates(adminBaseUrl: string, service: string, key: string, state: Record<string, unknown>): Promise<void> {
+  const newState = Object.fromEntries(Object.entries(state).map(([k, v]) => [k, [...Buffer.from(JSON.stringify(v))]]));
   const response = await fetch(`${adminBaseUrl}/services/${encodeURIComponent(service)}/state`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ object_key: key, new_state: { [stateKey]: [...Buffer.from(JSON.stringify(value))] } }),
+    body: JSON.stringify({ object_key: key, new_state: newState }),
   });
   if (!response.ok) throw new Error(`state write for ${service}/${key} failed: HTTP ${response.status} ${await response.text()}`);
 }

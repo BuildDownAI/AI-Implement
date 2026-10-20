@@ -350,6 +350,16 @@ did not test). Scenarios follow four rules, and
    );
    ```
 
+   A call to the target object is **not** a barrier for a send that **another** invocation made (for example the
+   `KgRepo.release` a `KgRepo.watch` sends after its attach resumes): the call can run first. Wait on the sent
+   invocation itself with `awaitSentInvocations`, which finds it with `eventually` + `queryInvocations` by its sender
+   (`invoked_by_id` or `invoked_by_target`) and attaches to it, then read the state once (AII-1497):
+
+   ```ts
+   await awaitSentInvocations(env.adminAPIBaseUrl(), env.baseUrl(), { service: "KgRepo", key: slug, handler: "release" }, `invoked_by_id = '${watchId}'`);
+   expect(await status(env.baseUrl(), slug)).toBeNull();
+   ```
+
 2. **A scenario never depends on wall-clock speed.** A shortened window is passed through the deps and asserted on the
    recorded delay, and a loop inside a window must be O(1) calls or concurrent (`Promise.all`), as Q5 in
    `kg-repo.restate.test.ts` does for its enqueues.

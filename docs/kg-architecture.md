@@ -235,7 +235,7 @@ or these steps by hand.
 | `checking` | Refresh triggered; comparing snapshot SHA against last recorded |
 | `ingest-running` | Runner job dispatched; waiting for callback |
 | `snapshot-landed` | Callback received; snapshot commit verified |
-| `awaiting-decision` | A run is held at the decision gate with its snapshot PR open; `currentRun.decisions` is `["accept", "cancel"]` |
+| `awaiting-decision` | A snapshot is held at the decision gate with its PR open. No run is in flight: the hold is `KgRepo` state (AII-1489). `currentRun.decisions` is `["accept", "cancel"]`, or `["cancel"]` when the hold is `acceptBlocked` |
 | `staging` | Local rail running (fetch → materialize → swap) |
 | `serving` | Rail succeeded; sidecar serving new graph |
 | `reverted` | Gate failed; rolled back to previous overlay |
@@ -255,60 +255,147 @@ has `issue.nt` or `comment.nt`). A `tracker-missing` PR body starts with a warni
 failed teams, and `held.failedTeams` lists them. The KG Pipelines page shows `held.cause` and
 `held.failedTeams` in the current-run card, and the Accept prompt names the cause.
 
-When the runner's `report` is `failureCode: "KG_SNAPSHOT_HELD"` with a `snapshotPr`, `KgRefresh` stops
-at a gate (`src/restate/kg-refresh-workflow.ts`):
+A skipped (404, no mapping) or failed tracker team is judged by what the served snapshot already holds
+(AII-1471). `kg-snapshot-push` counts that team's issues in the **cloned** `snapshot/parts/issue.nt`
+(`git show <clonedRef>:…`, one `onto#trackerTeam "<team>"` literal per issue; the working tree's file is
+already the reduced one). A dry run ends **completed with warnings** (`guardVerdict: "warnings"`, no push)
+whenever the tracker is the only problem. A live run has two outcomes:
 
-1. Sets step `decision` and stores `held` in workflow state: `snapshotPr`, `snapshotCommit`,
-   `snapshotBranch`, `partTable`, `cause`, `failedTeams`, and `decideBy` (now + 24 h). `status`
-   exposes `snapshotPr`, `partTable`, `cause`, `failedTeams`, and `decideBy` (not the commit or
-   branch) as `held`, which `get_kg_status` surfaces as `currentRun.held`. A report or stored state
-   with no `cause` (a run in flight at deploy) reads as `shrink` with no failed teams.
-2. Sends `FlyMachineProfile("kg-refresh").release({ dispatchId })`: the runner has finished, so the
-   machine returns to the profile now rather than after the wait.
-3. Keeps `KgRepo` held: no call is needed, because the `run` invocation holds the lock for its whole life
-   (AII-1297), so a `KgRepo.trigger` during the wait answers `refresh-in-progress`. `KgRepo.watch` attaches to
-   the invocation and releases the lock when it ends however it ends, including a Restate kill or cancel.
-   A paused run holds the lock until an operator cancels it in the Restate UI.
-4. Waits with `awaitOwnedRun` on the `decide` and `cancel` signals until `decideBy`.
+| A skipped or failed team has served issues | Outcome |
+|---|---|
+| yes | The PR opens and the run holds (`KG_SNAPSHOT_HELD`, cause `tracker-missing`) with `acceptBlocked: true` and `lostTeams: [{ team, servedIssues }]`: accepting would publish a graph without those issues. `status.decisions` is `["cancel"]`, and `decide({ action: "accept" })` answers a 409 `accept-blocked` and leaves the run at the gate. |
+| no | The snapshot publishes through the normal gates with a warning in the PR body and `warnings` (the team names) on the outcome. |
 
-| Event | Action | Outcome |
-| -- | -- | -- |
-| `decide { action: "accept", actor }` | Posts a `### Baseline` comment naming the actor on the PR, then runs the normal merge, delete-branch and fetch/stage/swap/verify gates | as a normal success |
-| `decide { action: "cancel", actor }` | Closes the PR (gate `operator_cancelled`), closes the row, releases | `operator_cancelled` |
-| `cancel` signal (the page's Stop) | Same as `decide` cancel | `operator_cancelled` |
-| `cancel` signal on a finished run, or on a dispatch no workflow knows | Refused with 409 `no-refresh-in-flight` (checked before `past-merge`, since a finished run's `cancel` promise also holds `COMMITTED`) | the route stamps the row |
-| `cancel` signal or `decide { action: "cancel" }` after the merge starts | Refused with 409 `past-merge`; the run finishes | as a normal success or gate failure |
-| 24 h elapse (`KG_REFRESH_DECISION_TIMEOUT_MS`, fixed, no setting) | Closes the PR (gate `decision_timeout`), closes the row, releases | `decision_timeout` |
+A zero count is trusted only when every `trackerTeam` literal in the served `issue.nt` is a `sources.yml`
+tracker key. A snapshot written before KGB-33 holds the identifier prefix (`"TOP"`) rather than the key
+(`topia-mobile`), so with any other literal present a zero-count team is unknown (`servedIssues: -1`) and
+counts as lost. A new team, where every literal matches a key, stays in the publish-with-warning row.
 
-`decide` is a shared handler with a zod-validated body; `actor` is required, and the PR note and the
-`[KgRefresh]` log line name it. It answers 409 `no-decision-open` unless the step is `decision`, and 409
-`already-decided` once a decision is recorded (except a `cancel` after an `accept`, which acts as the `cancel` signal: it stops the run before the merge starts and answers `past-merge` after). A cancel that lands at the very moment of the deadline
-is recorded as `decision_timeout`. A held dry-run never reaches the gate. Any other report takes the
-unchanged success or failure paths; a `KG_SNAPSHOT_HELD` report with no `snapshotPr` takes the failure path.
+A third cause, `source-failed` (AII-1474), covers any `failed` entry in `sources` whose `kind` is not
+`tracker` (`code_repo`, `secondary_repo`, `self`, `docs_site`, `ingest`). Since KGB-36 the ingest finishes
+every source it can and exits 0, and it does not roll back a source that raised, so a failed source can
+leave half-written triples in the graph. A live run opens the PR and holds with `acceptBlocked: true`
+(`decisions: ["cancel"]`, Accept answers `accept-blocked`); the failed rows are in `held.sources` and the PR
+body's warning names them. A dry run completes with `guardVerdict: "warnings"` and pushes nothing. A
+`skipped` non-tracker source stays a warning. When a tracker-missing or shrink hold is already set, that
+cause stays but Accept is blocked all the same.
 
-The deploy drain counts a suspended invocation, so a held run holds a deploy for up to 24 h. The operator can still decide it during the hold: `get_kg_status` and `decide_kg_refresh` are the two tools the deploy hold lets through, so Accept/Cancel on the KG page work, the run finishes, and the drain then completes. **Refresh graph now** stays refused.
+A fetch that failed with no team named, and a shrink, still hold with both decisions offered. A `held`
+state stored before `acceptBlocked` existed reads as unblocked.
+
+When the runner's `report` is `failureCode: "KG_SNAPSHOT_HELD"` with a `snapshotPr`, `KgRefresh` ends
+at a gate (`src/restate/kg-refresh-workflow.ts`). A held snapshot is a `KgRepo` record, not a suspended
+run (AII-1489): nothing waits during the hold, so a deploy does not wait for a person and Restate never
+replays a held journal on new code. The gate run:
+
+1. Sends `FlyMachineProfile("kg-refresh").release({ dispatchId })`: the runner has finished, so the
+   machine returns to the profile now.
+2. **Calls** `KgRepo.hold` and awaits it (a call, not a send), so the hold is stored before the run ends and
+   the `release` that `watch` sends afterwards always sees it. `KgRepo`'s exclusive handlers never call
+   `KgRefresh` synchronously, so the call cannot deadlock. The stored hold is the original trigger and
+   dispatch id, the report (snapshot PR, commit and branch, part table, `cause`, `failedTeams`,
+   `acceptBlocked`, `lostTeams`, `sources`), the runner step table, and `decideBy` (now + 24 h).
+3. **Then** writes the `dispatch_log` row `completed` / `awaiting_decision` (AII-1493), in a `ctx.run`, through a
+   guarded write (`markJobAwaitingDecision`, `src/log.ts`) that lands only on a fresh `running` row, and only
+   if `KgRepo.status` still shows the hold undecided. The hold comes first so a kill between the two leaves a
+   hold with the row still `running`, which a decision closes, instead of an `awaiting_decision` row with no hold.
+4. Returns an `awaiting_decision` outcome. It does not write `lastRefresh` or notify: the resumed run does both.
+   A Stop that arrived after the report was taken (so no run is left to read it) is forwarded as a cancel
+   through `KgRepo.decide`.
+
+`KgRepo.hold` (exclusive, ingress-private) stores `held` and sends a delayed
+`KgRepo.decide({ action: "timeout", triggerId })` at `decideBy`. **The lock stays while a hold exists:**
+`release` for the held trigger does not clear `inFlight` while `held` is set, whether it arrives before or
+after `hold` (a release that beat the hold cleared the marker, and `hold` takes the lock back), and a new
+`trigger` answers `refresh-in-progress`. `KgRepo.status` carries the hold as `held` (`snapshotPr`,
+`partTable`, `cause`, `failedTeams`, `acceptBlocked`, `lostTeams`, `sources`, `decideBy`; not the commit or
+branch), which `get_kg_status` surfaces as `currentRun.held` with `step: "decision"`.
+
+`KgRepo.decide` is the one decision door (exclusive, so two decisions never interleave). It takes
+`{ action: "accept" | "cancel" | "timeout", actor?, triggerId?, reason? }`:
+
+| Event | Answer / action |
+| -- | -- |
+| No hold, a hold already `decided`, or a `triggerId` that is not the current hold's | 409 `no-decision-open`; a `timeout` answers `null` and does nothing, so a timer from an older hold or one that fires after a decision never decides anything |
+| `accept` on a blocked hold (`acceptBlocked`) | 409 `accept-blocked`; the hold stays open |
+| `accept` | Marks the hold `decided` (it stays), calls `submit` with `resume: { hold, action: "accept", actor }`: the resumed run posts a `### Baseline` comment naming the actor, then runs the normal merge, delete-branch and fetch/stage/swap/verify gates |
+| `cancel` | Marks the hold `decided`, resumes with `cancel`: closes the PR (gate `operator_cancelled`), closes the row, releases |
+| `cancel` with `reason: "superseded_by_schedule"` | Same, with the PR closed under gate `superseded_by_schedule`; the run's classification stays `operator_cancelled` |
+| `timeout` for the current hold (24 h, `KG_REFRESH_DECISION_TIMEOUT_MS`, fixed, no setting) | Resumes with `timeout`: closes the PR (gate `decision_timeout`), closes the row, releases |
+
+**The hold lives until the run that acts on it ends (AII-1493).** `decide` does not clear `held`: it records
+`decided: { action, triggerId }` on it, and `status` reports no open decisions (`held: null`) while `decided` is
+set. `watch` tells `release` how the run ended: `ended: "returned"` when `attach` resolves (any outcome, a Restate
+cancel included), `"killed"` when `attach` throws. The run's own `finally` sends no `ended`, read as `returned`.
+For the resumed trigger, `release` does this:
+
+| `ended` | Effect |
+| -- | -- |
+| `returned` (or absent) | Clears `held`, then `clearAndDrain` frees the lock and submits a queued dry-run, as before |
+| `killed` | Clears `decided` (the hold is open again), puts the marker back on the hold's own trigger (lock kept) and arms a timeout at `decideBy` (delay 0 if past). The operator can decide again; a repeated kill repeats this |
+
+`watch` reads the ended run's `KgRefresh.status` first. A run past its commit point (`committed`, AII-1296) counts as
+`returned` even if killed: the snapshot PR may already be merged, so nothing reopens and there is no second merge.
+A failed read errs the same way. A kill of the gate run itself leaves the hold, since `clearAndDrain` skips a held
+trigger. The resumed run's first step takes the row back (`reopenHeldJob`): `completed` / `awaiting_decision`
+becomes `running`, stamped `resumed`, a plain conditional write with none of `updateJobStatus`'s terminal side
+effects. A row therefore reads `awaiting_decision` only while a hold is open and undecided. The stamp also
+makes the gate's guarded write a no-op if it was parked while the decision was made. A killed resumed run leaves its
+row `running`, like any other killed run; the next decision closes it once.
+
+`decide` returns the resumed run's `triggerId`. `submit` replaces the `inFlight` marker with the resumed run's
+and starts its `watch`, so the lock follows the new run, and a late `release` from the gate run (its marker no
+longer matches) does nothing. `KgRefresh.run` with `resume` skips the dispatch and the runner wait. It rebuilds
+the held PR and step table from the hold, uses the hold's dispatch id for the row, `lastRefresh` and the
+notification (its own key is only the workflow key and `KgRepo` trigger id), and goes straight to the accept
+note and `mergeAndRunGates`, or to `cleanupCancelled`, or to the timeout close. The commit point, `past-merge`,
+the schedule supersede and `status` are the ordinary ones, because it is a normal `KgRefresh` run. The
+workflow no longer has a `decide` handler.
+
+The `decide_kg_refresh` tool (admin) calls `KgRepo.decide` with the caller's email as `actor`. It takes an
+optional `triggerId`; the KG page passes the trigger of the hold it shows, so a stale page cannot decide a
+newer hold, and a named hold that is gone answers `no-decision-open` without falling back. With no `triggerId`
+and no hold open, `accept` answers `no-decision-open`, and `cancel` re-reads `KgRepo.status` and sends the
+`cancel` signal to the run now in flight (the resumed run after an accept, answering `past-merge` once it is
+past the commit point). If that signal answers 409 or 404 because the gate run stored its hold and ended in
+between, it reads `KgRepo.status` once more and cancels a hold it finds through `KgRepo.decide`. A second accept answers `no-decision-open` (the hold is marked decided, not gone). The pipeline schedule
+reads the hold from `KgRepo.status` (`busy`) and replaces its own held run with
+`KgRepo.decide({ action: "cancel", triggerId, reason: "superseded_by_schedule" })`; after an accept there is no
+hold, so the schedule never replaces a run a person accepted.
+
+A Stop that lands near the gate goes through the same door. Once the gate run's `step` is `held`, the workflow
+`cancel` handler also sends `KgRepo.decide({ action: "cancel", triggerId })`, and the run reads a Stop that arrived
+earlier from its `cancel` promise right after `hold`. The tool's no-`triggerId` cancel does the same when
+`KgRepo.status` shows a hold. A lost lock (`hold` answers `lock-lost`) is a workflow error, not a cancel.
+
+A held dry-run never reaches the gate. Any other report takes the unchanged success or failure paths; a
+`KG_SNAPSHOT_HELD` report with no `snapshotPr` takes the failure path.
+
+**Deploy order (AII-1489).** Ship when no refresh is held: `get_kg_status` stage is not `awaiting-decision`. A
+run held on the old code is a suspended `KgRefresh.run` with no `KgRepo` hold, and it cannot replay into the new
+gate. A hold created by this code must be decided before a revert. After the deploy a hold costs the drain
+nothing, and `decide_kg_refresh` is still one of the two tools the deploy hold lets through. **Refresh graph
+now** stays refused.
 
 The page's Stop route sends the workflow's `cancel` and returns its answer. On 200 it writes nothing and destroys nothing (the workflow stops the machine and closes the row; the notice says "stop requested"). On 409 `no-refresh-in-flight` it stamps `failed` / `operator_cancelled` once, because no workflow will. Any other answer (`past-merge`, 503) is returned unchanged and the row is left alone. The route writes a refresh row only when no workflow will; the other writers are the workflow (`closeJobLog`, `cleanupCancelled`) and the reaper's max-age sweep (`src/reaper.ts`), which also writes `timed_out`.
 
-A Stop sent before the gate opens also cancels the held run: the `cancel` promise is durable, so the gate sees it at once.
-
 **The start of the merge is the point of no return (AII-1296).** The merge cannot be undone (GitHub answers 405 on a merged PR), and a run that stopped after it would leave the repo snapshot and the served graph different. Two rules follow:
 
-1. **Before the merge starts, a cancel stops the run and closes the PR.** A Restate cancel of the `run` invocation (from the Restate UI or the admin API) does the full cleanup at every step, through the same function as the `cancel` signal (`cleanupCancelled`): cancel the GitHub run and stop the machine while the runner has not yet reported, close the held snapshot PR (`operator_cancelled`), run the failure path without a notification, and close the row. It logs `[KgRefresh] cancelled by Restate at step <step>`, and each step is best effort. `run` sends the `KgRepo` and `FlyMachineProfile` releases from one `finally` on every exit except a suspension.
-2. **After the merge starts, the run finishes.** The merge, the gates, `persist`, `close-row` and `outcome` run to the end. A `cancel` signal or `decide { action: "cancel" }` answers 409 `past-merge` (the `decide_kg_refresh` tool answers the error `past-merge`), and a Restate cancel has no effect: the invocation ends `succeeded` and `lastRefresh` shows the result. A Restate-UI cancel cannot answer `past-merge`, because the admin API accepts every cancel.
+1. **Before the merge starts, a cancel stops the run and closes the PR.** A Restate cancel of the `run` invocation (from the Restate UI or the admin API) does the full cleanup at every step, including the decision gate, through the same function as the `cancel` signal (`cleanupCancelled`): cancel the GitHub run and stop the machine while the runner has not yet reported, close the held snapshot PR (`operator_cancelled`), run the failure path without a notification, and close the row. It logs `[KgRefresh] cancelled by Restate at step <step>`, and each step is best effort. At the gate the run has handed the hold to `KgRepo` and is about to end, so a cancel that landed during `close-row-held` or the `hold` call is seen by one cancel-arm race right after `hold` returns: the run then sends `KgRepo.decide { action: "cancel", triggerId }`, and the resumed run closes the PR and the row once. `run` sends the `KgRepo` and `FlyMachineProfile` releases from one `finally` on every exit except a suspension.
+2. **After the merge starts, the run finishes.** The merge, the gates, `persist`, `close-row` and `outcome` run to the end. A `cancel` signal answers 409 `past-merge`, and the `decide_kg_refresh` tool passes that through as the error `past-merge` when its fallback cancel reaches a run past the merge (`KgRepo.decide { action: "cancel" }` itself answers `no-decision-open` when no hold is open), and a Restate cancel has no effect: the invocation ends `succeeded` and `lastRefresh` shows the result. A Restate-UI cancel cannot answer `past-merge`, because the admin API accepts every cancel.
 
-How it works: `run` is registered with `explicitCancellation: true`, so Restate never throws at a pending await or interrupts a `ctx.run` step. The run sees a Restate cancel only where it races a cancel arm (`ctx.cancellation()`, passed to `awaitOwnedRun` as `cancelArm`, plus a 1 ms check before the dispatch and one at the commit point); the arm throws a 409 that reaches the outer catch and `cleanupCancelled("restate")`. The commit point is the start of `mergeAndRunGates`: after the cancel check, `run` resolves its own `cancel` promise with the reserved value `COMMITTED` (the `cancel` handler refuses it as a reason). The durable promise decides: the first of that write and an operator cancel wins. If the operator won, `run` reads the operator's reason and takes `cleanupCancelled("signal")`; nothing is merged. One exception (AII-1441): when the commit point follows a person's accept and the recorded reason is `superseded_by_schedule`, the schedule's replace lost to the accept, so `run` does not cancel and the merge continues; because the promise then still holds `superseded_by_schedule`, `run` also records a durable `committed` state key at the commit point (on both paths) so a later cancel still answers `past-merge`. A cancel at the commit point without a prior accept passes that reason to the gate close. If `run` won, the `cancel` handler reads the `committed` key first, then peeks `COMMITTED`, and answers `past-merge`. After this point nothing races the cancel arm.
+How it works: `run` is registered with `explicitCancellation: true`, so Restate never throws at a pending await or interrupts a `ctx.run` step. The run sees a Restate cancel only where it races a cancel arm (`ctx.cancellation()`, passed to `awaitOwnedRun` as `cancelArm`, plus a 1 ms check before the dispatch and one at the commit point); the arm throws a 409 that reaches the outer catch and `cleanupCancelled("restate")`. The commit point is the start of `mergeAndRunGates`: after the cancel check, `run` resolves its own `cancel` promise with the reserved value `COMMITTED` (the `cancel` handler refuses it as a reason). The durable promise decides: the first of that write and an operator cancel wins. If the operator won, `run` reads the operator's reason and takes `cleanupCancelled("signal")`; nothing is merged. The operator's reason, `superseded_by_schedule` included, goes to the gate close. If `run` won, it records a durable `committed` state key, and the `cancel` handler reads that key first, then peeks `COMMITTED`, and answers `past-merge`. After this point nothing races the cancel arm.
 
 | Cancelled while | Cleanup |
 | -- | -- |
 | `reserve` / `dispatch` (no run id) | row closed, released; no stop call |
 | `await-progress` (GitHub run known) | run cancelled, row closed, released |
 | `await-progress` (Fly) | machine stopped, row closed, released |
-| `decision` (held PR) | PR closed, row closed, released |
-| accepted, before the merge starts (the baseline note) | PR closed, row `operator_cancelled`, released; no merge. Exception: reason `superseded_by_schedule` is overridden by the accept and the merge continues |
+| held (a `KgRepo` record, no run) | `KgRepo.decide` cancel or timeout: a new run closes the PR and the row and releases |
+| accepted, before the merge starts (the baseline note) | PR closed, row `operator_cancelled`, released; no merge |
 | `merge` / gates and after | no cleanup: the run finishes; the cancel answers `past-merge` |
 
-The journal shape changed in AII-1296 (the cancel arm in the races, the pre-dispatch and commit-point sleeps, the commit resolve), so deploy and revert only with no refresh in flight. The deploy drain already waits for a held run.
+The journal shape changed in AII-1296 (the cancel arm in the races, the pre-dispatch and commit-point sleeps, the commit resolve), so deploy and revert only with no refresh in flight.
 
 
 ### Dry run (AII-632)
@@ -443,12 +530,14 @@ only; they carry no decision buttons). The card renders `GET /api/kg/status` and
 | set, no open decision | "Run in flight: <step>" and **Cancel** |
 | set, `accept` open (`awaiting-decision`) | "Held for a decision until <decideBy>", the part table (part / previous / new / delta), a link to the held PR, **Accept new baseline & refresh** and **Cancel** |
 
-Both decision buttons ask `confirm()` and post `{ args: { action } }` to `/api/tools/decide_kg_refresh`,
-which takes no trigger id, so it can only act on the current run; an `already-decided` or
-`no-decision-open` answer is shown in the page's message box. If the status call fails the card is hidden
+Both decision buttons ask `confirm()` and post `{ args: { action, triggerId } }` to `/api/tools/decide_kg_refresh`
+when a hold is shown (`triggerId` is that hold's), so a decision acts only on that hold; a
+`no-decision-open` answer (the hold is gone or replaced) is shown in the page's message box. If the status call fails the card is hidden
 and offers no action. The same runs also appear on the Pipelines page with the `kg` badge, because that
 page is the complete dispatch log. Deployments keeps only the deploy-side signals: the drain tile counts an
-in-flight KG ingest run, and a release whose sidecar does not serve records "Released, but the knowledge
+in-flight KG ingest run (a held refresh is not one: it is `KgRepo` state plus a delayed `decide` message, so it does
+not hold a deploy, `waitForQuiet` ignores its `completed` / `awaiting_decision` row, and the endpoint drain does not
+count the scheduled timer), and a release whose sidecar does not serve records "Released, but the knowledge
 graph is not serving".
 
 ## Refresh rail implementation (AII-426, AII-495)
@@ -539,6 +628,25 @@ runtime control. The toggle only affects the *next*
 refresh, not whatever the sidecar is currently serving — `GET /api/kg/status` and the `get_kg_status`
 MCP tool both report the resolved setting as `materialize: "rdflib" | "direct"` for observability.
 
+### Per-source results (AII-1470)
+
+A refresh reports one result per source: `source`, `kind`, `status` (`success` / `skipped` /
+`failed`), `reason`, and `counts`. The type and the defensive parser are in `src/kg-source-results.ts`.
+Two steps supply the rows and `kg-snapshot-push` merges them:
+
+| Part | Produced by | Rows |
+|---|---|---|
+| Tracker | `kg-tracker-data` output `teamResults` | one `tracker:<team>` row per team in `sources.yml`: `success` with `counts.issues`, `skipped` (reason `no mapping`, a 404), or `failed` (reason the HTTP status or `error: …`). With no teams at all, one `skipped` row, reason `no trackers in sources.yml`. A 401/403 aborts the step, so those teams have no row |
+| Ingest | `kg-ingest` output `sourceResults`, read from `ai-output/source-results.json` | code repo, secondary repos, self-ingest, docs sites. The file is written by the KG repo's ingest and is optional: when it is absent or unparseable the output is `[]` (one log line) and malformed entries are dropped |
+
+For the same `source`, the tracker row wins, because the tracker step is the only place that saw the
+fetch. The merged list is `sources` in the `kg-snapshot-push` output and in `KgSnapshotHeldError`. It is
+rendered as the "Sources" table in the refresh report (the PR body, or the dry-run log), and travels
+the way `failedTeams` does: `kg-refresh-run.ts` → `postRunnerResult` → `runner-callback.ts` →
+`KgRefresh.report`. The workflow stores it on the outcome and returns it on `status` (`sources`), and on
+`status.held.sources` while the run waits at the decision gate. Only success, dry-run, and held reports
+carry it; other failures send none. A runner that predates the field sends none and reads as `[]`.
+
 ### Held-verdict plumbing (AII-1253, AII-1264)
 
 The run envelope carries one guard-related flag, `kgDryRun`, and it is set only by the KG-repo PR
@@ -551,7 +659,7 @@ var directly, with no envelope) keeps working. `pipeline-loader.ts` forwards it 
 `dryRun: true` and `acceptNewBaseline: true` with `option-removed`, and a decoder drops those keys from
 an envelope written by an older orchestrator. The `KgRefresh` and `KgRepo.trigger` options schema still
 tolerates `acceptNewBaseline` (optional, ignored) for inputs queued or journaled before the removal.
-An accept now travels in the `decide` signal, whose `actor` the PR note and log line name.
+An accept travels in `KgRepo.decide`, whose `actor` the resumed run's PR note and log line name.
 
 `kg-snapshot-push.ts` returns `guardVerdict` and `partTable` in its step output on the success path and,
 via `KgSnapshotTrackerRegressionError.partTable`, on a hard guard refusal. The runner's callback body
@@ -563,9 +671,11 @@ to the workflow. A held error also carries `cause` and `failedTeams`, which trav
 |---|---|---|
 | No regression | yes | success |
 | Hard regression (a part missing), with or without soft | no | failure `KG_SNAPSHOT_TRACKER_REGRESSION`, `guardVerdict: "refused"`, part table, no `snapshot*` fields |
+| A file under `snapshot/` over 95 MB (size check, runs before guard 0, so a dry run reports it too) | no | failure `KG_SNAPSHOT_FILE_TOO_LARGE`, no commit or push |
 | Soft only (zero-shrink or 50% rule) | yes | failure `KG_SNAPSHOT_HELD`, `guardVerdict: "held"`, part table, `snapshotPr`/`snapshotCommit`/`snapshotBranch` |
 | Guard 0 (tracker fetch failed, tracker part in the clone), real run | yes | failure `KG_SNAPSHOT_HELD`, `cause: "tracker-missing"`, `failedTeams`, part table; a missing or smaller `issue.nt` / `comment.nt` is held, any other missing part is hard |
-| Dry run (PR check), soft only or tracker data missing | no | `refused` with the table, never `held` |
+| Dry run (PR check), tracker data only: skipped or failed teams, missing tracker parts | no | completes with warnings (`guardVerdict: "warnings"`), never `held`; the report carries the guard table, the Sources table and the warnings |
+| Dry run (PR check), hard regression, or a soft shrink that tracker data does not explain (non-tracker zero-shrink or 50% rule, a tracker-file shrink no lost team explains) | no | failure `KG_SNAPSHOT_TRACKER_REGRESSION`, `guardVerdict: "refused"`, part table |
 
 A held run commits, pushes `kg-refresh/<stamp>` and opens the PR (body: `Guard verdict: held — a shrink
 waits for an operator decision`; for `tracker-missing`, the body starts with a `⚠️` line naming the
@@ -655,7 +765,11 @@ use the refreshed token.
 **Snapshot push contract — content-based, not flag-based.** `kg-snapshot-push` judges the
 snapshot by comparing the working tree's `snapshot/parts/*.nt` line counts against the cloned
 HEAD before committing. The push is refused with `KG_SNAPSHOT_TRACKER_REGRESSION` if any of the
-following hold:
+following hold. Rules apply per **logical part**: a piece `<part>.<NN>.nt` (a part the KGB
+export split to stay under GitHub's file limit) counts toward `<part>.nt`, and line counts are
+summed over the pieces on both sides, so a part that changes from one file to several pieces, or
+back, is not "missing". The part table lists logical parts. The tracker rules and the lost-team
+count read every `issue` / `comment` piece.
 
 | Rule | Condition |
 |---|---|
@@ -668,13 +782,21 @@ So does `fetched=false` with tracker parts in the cloned snapshot (cause `tracke
 missing or smaller `issue.nt` / `comment.nt` counts as held too. Any other missing part, and a
 missing tracker part when `fetched=true`, stays a hard refusal, since a part that vanishes for
 another reason is an ingest defect and holding it would invite an operator to accept a broken graph.
-A dry run pushes nothing and has no PR to hold, so it still refuses with
-`KG_SNAPSHOT_TRACKER_REGRESSION`. See
+A dry run pushes nothing and has no PR to hold, so a tracker-data problem alone (skipped or failed
+teams, missing tracker parts) completes it with warnings. A hard regression, or a soft shrink that
+tracker data does not explain (a non-tracker zero-shrink or 50% rule, a tracker-file shrink no lost
+team explains), still refuses it with `KG_SNAPSHOT_TRACKER_REGRESSION`. See
 [Held-verdict plumbing](#held-verdict-plumbing-aii-1253-aii-1264).
 
 For a shrink, an intentional change in what the ingest emits (a base-repo classification change, for
 example) also shrinks these files, and the guard cannot tell that from data loss on its own, so an
 operator decides.
+
+**Size check (`KG_SNAPSHOT_FILE_TOO_LARGE`).** Before any guard, and before the dry-run exit, the step
+scans every file under `snapshot/` (parts, `embeddings.npz`, anything nested). A file over 95 MB (a
+margin under GitHub's 100 MB per-file limit) fails the run with `KG_SNAPSHOT_FILE_TOO_LARGE`, the
+message naming each file and its size and telling the operator to update the KG repo to a KGB version
+that splits parts. Nothing is committed or pushed.
 
 One log line listing all parts with `prev=` and `new=` counts is emitted on every push attempt,
 pass or fail. The `fetched=false` flag check (which guards against a docs-only push replacing a
@@ -712,6 +834,22 @@ Each of these shipped a degraded or blocked deploy, and each is now covered by a
 | 2026-09-08 | With the report step gone, the stale-stamp gate read `snapshot/embeddings.stamp`, a file only hand edits and that agent ever wrote; the first guard-clean run (34270413381) failed `KG_SNAPSHOT_STALE` on it | The gate reads `age_stamp` from `snapshot/embeddings.meta.json` — the ingest's own stamp and the one the rail's materialize checks — with the legacy file as fallback |
 | 2026-09-08 | The kg-refresh report step (feedback-loop) re-ran the ingest by hand without a GitHub token and rewrote `snapshot/parts/` without `pr.nt`; the guard refused three runs | The report step is removed from `pipelines/kg-refresh.yml`; the ingest step's counters and `ai-output/kg-ingest.log` (AII-581) plus the snapshot-push guard are the report |
 | 2026-09-08 | Refresh rail's materialize OOM-killed at ~31.6k quads (271 MB RSS beside the serving sidecar on a 512 MB machine); the rail refused the swap and kept serving the old graph | `fly.toml` memory raised to 1 GB — the documented headroom figure, not a code change |
+
+### Row conclusions and dashboard outcomes (AII-1472)
+
+`KgRefresh` is the only writer of a kg-refresh job row, and every close carries a conclusion:
+
+| Close | Status | Conclusion |
+|---|---|---|
+| Success, no-new-data, clean dry run | `completed` | `passed` |
+| Ok with warnings (`guardVerdict: "warnings"` or a non-empty `warnings` list), live or dry run | `completed` | `warnings` |
+| Held at the decision gate (AII-1490) | `completed` | `awaiting_decision` until accept, cancel, or timeout re-closes the row |
+| Not ok, including a refused dry run | `failed` / `timed_out` | the failure code (`dry_run_refused` when the report carries none) |
+
+The Pipelines badge for a `kg-refresh` row reads **awaiting decision** (warn style, also on the KG Pipelines dispatch log; counted as `awaitingDecisionCount` in `get_tenant_health`, not in `inFlightJobCount`), **passed**, **completed with warnings**, or **failed** from
+status and conclusion; other run kinds keep their status label. A legacy row (`completed`, no conclusion)
+keeps the plain `completed` label. The KG page's last-refresh line shows the same three outcomes for live
+refreshes (**passed**, **completed with warnings**, or **failed**, as above); dry runs appear only as Pipelines rows.
 
 ## KG-refresh outcome visibility (AII-496)
 

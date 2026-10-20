@@ -165,7 +165,7 @@ describe("production managed GHA review-fix launch", () => {
     expect(envelope.credentials?.resultToken).toBeTruthy();
     expect(envelope.credentials?.progressToken).toBeTruthy();
     expect(envelope.credentials?.publicationToken).toBeTruthy();
-    expect(envelope.credentials?.executionPolicy).toBeUndefined();
+    expect(envelope.credentials?.executionPolicy).toMatchObject({ implementationSandbox: "ephemeral-full-access", dispatchId: prepared.attemptId });
     expect(revoked()).toBeNull();
     for (const key of ["run_token", "run_progress_token", "run_publication_token", "runner_callback_url"]) expect(sent[0][key as keyof DispatchInputs] ?? "").toBe("");
     for (const data of [plan, result, await attempts.getPreparedAttempt(prepared.attemptId)]) {
@@ -249,7 +249,8 @@ describe("production managed GHA review-fix launch", () => {
           headers: { authorization: `Bearer ${grant.bearer}`, "content-type": "application/json" } });
         return { status: response.status, body: await response.json() };
       } },
-      codexOptions: { spawnImpl: codexChild.spawn as typeof spawn, sleepImpl: async () => {} },
+      codexOptions: { spawnImpl: codexChild.spawn as typeof spawn, sleepImpl: async () => {},
+        fullAccessAdmission: () => ({ nonRoot: true, socketPresent: false, socketReadable: false, socketWritable: false, admitted: true }) },
     } });
     try {
       if (!configured) throw new Error("configured factory missing");
@@ -260,14 +261,14 @@ describe("production managed GHA review-fix launch", () => {
       expect(result.attribution?.profileId).toBe(authMode === "openai-api-key" ? "api" : "cdx");
       expect(children).toHaveLength(1);
       expect(children[0].args).toContain("gpt-6-luna");
+      expect(children[0].args).toContain("--dangerously-bypass-approvals-and-sandbox");
     } finally {
       await configured?.finish("completed");
     }
   });
 
-  it("hands the explicit gap-analysis implementation policy through actual workflows and factory, never planning", async () => {
-    const mapping = config.getMappings().AII;
-    config.upsertMapping("AII", { ...mapping, extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "ephemeral-runner-asserted-v1" } });
+  it("defaults gap-analysis implementation to full access through actual workflows and factory, never planning", async () => {
+    expect(config.getMappings().AII.extraEnv ?? {}).toEqual({});
     const { worker, plan } = await launch();
     expect((await worker.launch(plan)).status).toBe("accepted");
     const { prepareConfiguredRun } = await import("../run-autonomous.js");
@@ -396,11 +397,27 @@ describe("production managed GHA review-fix launch", () => {
   it("does not mint or dispatch a full-access grant when the exact workflow lacks policy support", async () => {
     config.upsertMapping("AII", { ...config.getMappings().AII,
       extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "ephemeral-runner-asserted-v1" } });
-    workflow = workflow.replaceAll("ephemeral-execution-policy-v1", "unsupported-policy");
+    workflow = workflow.replaceAll("github-hosted-execution-policy-v2", "unsupported-policy");
     const { worker, plan } = await launch();
     expect(await worker.launch(plan)).toEqual({ status: "unknown" });
     expect(sent).toHaveLength(0);
     expect(count("model_credential_grants")).toBe(0);
+  });
+
+  it("rechecks the frozen policy if selection changes after the early capability check", async () => {
+    workflow = workflow.replaceAll("github-hosted-execution-policy-v2", "unsupported-policy");
+    const adapter = await import("../managed-dispatch-auth.js");
+    // Simulate a preflight observation of Claude followed by actual preparation freezing Codex.
+    const early = vi.spyOn(adapter, "selectsCodexImplementation").mockReturnValue(false);
+    try {
+      const { worker, plan } = await launch();
+      expect(await worker.launch(plan)).toEqual({ status: "unknown" });
+      expect(sent).toHaveLength(0);
+      expect(count("model_credential_grants")).toBe(1);
+      expect(revoked()).not.toBeNull();
+    } finally {
+      early.mockRestore();
+    }
   });
 
   it("keeps the grant for an accepted 204 with no run id while the worker outcome stays unknown", async () => {
@@ -537,12 +554,11 @@ describe("production managed GHA review-fix launch", () => {
         expect(sent).toHaveLength(0);
       });
 
-    it("requires the execution-policy marker only under the full-access opt-in", async () => {
-      workflow = workflow.replaceAll("ephemeral-execution-policy-v1", "unsupported-policy");
-      expect(await admit()).toBe("admit");
-      const mapping = config.getMappings()["AII"]!;
-      config.upsertMapping("AII", { ...mapping, extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "ephemeral-runner-asserted-v1" } });
+    it("requires the hosted execution-policy marker for default Codex admission without Extra Env", async () => {
+      expect(config.getMappings().AII.extraEnv ?? {}).toEqual({});
+      workflow = workflow.replaceAll("github-hosted-execution-policy-v2", "unsupported-policy");
       expect(await admit()).toBe("configuration_error");
+      expect(count("model_credential_grants")).toBe(0);
     });
 
     it("defers on uncertainty and retained gates instead of failing", async () => {

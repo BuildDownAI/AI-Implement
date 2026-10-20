@@ -1,3 +1,4 @@
+import { parseSourceResults } from "../kg-source-results.js";
 import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -9,7 +10,7 @@ import { loadPipelineDefinition } from "./pipeline-loader.js";
 import { NoopStepReporter, TokenStepReporter } from "./reporter.js";
 import { cloneStep } from "./steps/clone.js";
 import { dependencyAuthStep } from "./steps/dependency-auth.js";
-import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError, KgSnapshotHeldError } from "./steps/kg-snapshot-push.js";
+import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotFileTooLargeError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError, KgSnapshotHeldError } from "./steps/kg-snapshot-push.js";
 import { kgTrackerDataStep, KgTrackerDataFetchError } from "./steps/kg-tracker-data.js";
 import { kgScopeReconcileStep } from "./steps/kg-scope-reconcile.js";
 import { kgIngestStep, KgIngestError } from "./steps/kg-ingest.js";
@@ -344,9 +345,12 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     const held = err instanceof KgSnapshotHeldError ? err : undefined;
     const isHeld = held !== undefined;
     const isIngestFailed = err instanceof KgIngestError;
+    const isTooLarge = err instanceof KgSnapshotFileTooLargeError;
     const failureCode = isMissing
       ? "KG_SNAPSHOT_MISSING"
-      : isStale
+      : isTooLarge
+        ? "KG_SNAPSHOT_FILE_TOO_LARGE"
+        : isStale
         ? "KG_SNAPSHOT_STALE"
         : isTrackerDataError
           ? "KG_TRACKER_DATA_FETCH_FAILED"
@@ -383,6 +387,8 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
             snapshotBranch: held.branchName,
             cause: held.cause,
             failedTeams: held.failedTeams,
+            ...(held.acceptBlocked ? { acceptBlocked: true, lostTeams: held.lostTeams } : {}),
+            ...(held.sources.length > 0 ? { sources: held.sources } : {}),
           }
         : {}),
       callbackUrl,
@@ -393,6 +399,10 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
 
   await configured?.finish("completed");
   const snapshotPushOutputs = context.getOutputs("kg-snapshot-push");
+  const sources = parseSourceResults(snapshotPushOutputs.sources);
+  const warnings = Array.isArray(snapshotPushOutputs.warnings)
+    ? snapshotPushOutputs.warnings.filter((w): w is string => typeof w === "string")
+    : [];
   await postRunnerResult({
     phase: "kg-refresh",
     workspaceDir,
@@ -400,9 +410,11 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     snapshotCommit: typeof snapshotPushOutputs.commitSha === "string" ? snapshotPushOutputs.commitSha : undefined,
     snapshotPr: typeof snapshotPushOutputs.prNumber === "number" ? snapshotPushOutputs.prNumber : undefined,
     snapshotBranch: typeof snapshotPushOutputs.branchName === "string" ? snapshotPushOutputs.branchName : undefined,
-    ...(kgDryRun && snapshotPushOutputs.guardVerdict === "clean"
-      ? { guardVerdict: "clean" as const, partTable: snapshotPushOutputs.partTable as Array<{ part: string; prev: string; new: string }> | undefined }
+    ...(kgDryRun && (snapshotPushOutputs.guardVerdict === "clean" || snapshotPushOutputs.guardVerdict === "warnings")
+      ? { guardVerdict: snapshotPushOutputs.guardVerdict, partTable: snapshotPushOutputs.partTable as Array<{ part: string; prev: string; new: string }> | undefined }
       : {}),
+    ...(sources.length > 0 ? { sources } : {}),
+    ...(warnings.length > 0 ? { warnings } : {}),
     callbackUrl,
     fetchImpl: opts.fetchImpl,
   });

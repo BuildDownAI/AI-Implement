@@ -205,6 +205,44 @@ describe("endpoint drain barrier", () => {
   });
 });
 
+describe("waitForQuiet and a held KG refresh", () => {
+  let closeDb: () => void;
+
+  beforeEach(async () => {
+    // The outer beforeEach reset the module registry and pointed DEDUP_DB_PATH at a fresh file.
+    const log = await import("../log.js");
+    log.initLogTable();
+    closeDb = (await import("../dedup.js")).closeDb;
+  });
+
+  afterEach(() => closeDb?.());
+
+  async function seedKgRefreshRow(status: "completed" | "running", conclusion?: string): Promise<void> {
+    const log = await import("../log.js");
+    const id = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: `kg-${status}`, status: "running" });
+    if (status === "completed") log.updateJobStatus(id, "completed", conclusion);
+  }
+
+  function drained(): RestateDrainCoordinator {
+    const drain = new RestateDrainCoordinator({ ...DRAINED_PROBES });
+    drain.begin();
+    return drain;
+  }
+
+  it("returns at once when the only KG refresh is held (completed / awaiting_decision)", async () => {
+    await seedKgRefreshRow("completed", "awaiting_decision");
+    const { getInFlightWork } = await import("../in-flight-work.js");
+    expect(getInFlightWork().filter((w) => w.kind === "kg-refresh")).toEqual([]);
+    // No injected in-flight getter: the real getInFlightWork runs against the log.
+    await deploy.waitForQuiet(0, 1, drained());
+  });
+
+  it("control: a running KG refresh row does block, so the held case above can fail", async () => {
+    await seedKgRefreshRow("running");
+    await expect(deploy.waitForQuiet(0, 1, drained())).rejects.toThrow(/did not drain.*1 kg-refresh/);
+  });
+});
+
 describe("makeStartDeploy", () => {
   const configured = {
     flyDeployToken: "fly-token",

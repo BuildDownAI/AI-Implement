@@ -1538,6 +1538,7 @@ describe("processReviewFixQueue — protected dispatch (AII-1392)", () => {
     };
     const caps = (supportsPrivateRunConfig: boolean): WorkflowCapabilities => ({
       contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: false, supportsPrivateRunConfig,
+      supportsExecutionPolicy: true,
     });
 
     async function setup(supportsPrivateRunConfig = true, adjust?: (d: LaunchDecision) => void) {
