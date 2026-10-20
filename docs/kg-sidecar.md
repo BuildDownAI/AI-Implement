@@ -104,7 +104,7 @@ A 401 proves the endpoint is alive and OAuth-gated. It does not prove the graph 
 
 The clone copies the KG's `sources.yml`, which pins the IRI namespace. Without it the server falls back to a placeholder namespace and every type-filtered `kg_*` tool returns empty — the graph loads, queries match nothing, and nothing errors. Verify a deploy with a real query (`kg_search` returning non-empty, or `degraded:false` in a `kg_hybrid_search` response), not just the 401.
 
-**The orchestrator now runs that verification itself at boot, rather than only telling an operator to do it by hand (AII-648).** Right after `sidecar.start()` sets `KG_SIDECAR_URL`, `main()` calls `SidecarMemoryProvider.probe()`: a session-tolerant `tools/list` (reusing the same `sendWithSessionRetry` handshake `listTools` and `proxyCall` use) that must return all six `kg_*` tool names, followed by one cheap `tools/call` — `kg_neighbors` on the served graph's spine IRI (`<namespace>resource/graph/spine`, namespace read from whichever `sources.yml` is actually being served — the runtime overlay if one is staged, else the baked image) with `limit: 1` — that must come back a JSON-RPC `result`, not an `error`. The boot log carries the outcome: `[kg] sidecar probe: ok (6 tools)` or `[kg] sidecar probe FAILED: <reason>`.
+**The orchestrator now runs that verification itself at boot, rather than only telling an operator to do it by hand (AII-648).** Right after `sidecar.start()` sets `KG_SIDECAR_URL`, `main()` calls `SidecarMemoryProvider.probe()`: a session-tolerant `tools/list` (reusing the same `sendWithSessionRetry` handshake `listTools` and `proxyCall` use) that must return the six required `kg_*` tool names (`kg_repo_history` is optional, so an older sidecar without it still probes healthy), followed by one cheap `tools/call` — `kg_neighbors` on the served graph's spine IRI (`<namespace>resource/graph/spine`, namespace read from whichever `sources.yml` is actually being served — the runtime overlay if one is staged, else the baked image) with `limit: 1` — that must come back a JSON-RPC `result`, not an `error`. The boot log carries the outcome: `[kg] sidecar probe: ok (6 required tools)` or `[kg] sidecar probe FAILED: <reason>`.
 
 The result lives in a module-level `sidecarHealth` record (`{ reachable, toolsListed, lastError, checkedAt }`, exported from `src/kg-provider.ts`) and `isKgUnavailable()`, which is `true` only when the *last completed* probe failed — a sidecar that has never been probed is not reported as unavailable. Every failed `listTools` or `proxyCall` also triggers a re-probe, throttled to at most one real sidecar round-trip per 60 seconds so a persistently down sidecar doesn't double every failing request's latency. The boot-time probe itself is never subject to that throttle — the first check always runs.
 
@@ -173,7 +173,7 @@ The orchestrator abstracts KG access behind a `MemoryProvider` interface (define
 
 ### The capability contract
 
-Every `MemoryProvider` maps to up to six MCP tool names. The provider declares which it can serve via a `MemoryProviderCapabilities` object; callers degrade gracefully when a capability flag is `false`.
+Every `MemoryProvider` maps to up to seven MCP tool names. The provider declares which it can serve via a `MemoryProviderCapabilities` object; callers degrade gracefully when a capability flag is `false`.
 
 | Capability flag | MCP tool names | Degradation when `false` |
 |---|---|---|

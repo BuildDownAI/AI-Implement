@@ -56,6 +56,9 @@ export const KG_TOOL_CAPABILITY: Readonly<Record<string, keyof MemoryProviderCap
  */
 const OPTIONAL_KG_TOOLS: ReadonlySet<string> = new Set(["kg_repo_history"]);
 
+/** Tools the boot probe requires: every mapped tool except the optional ones. */
+export const REQUIRED_KG_TOOL_COUNT = Object.keys(KG_TOOL_CAPABILITY).filter((n) => !OPTIONAL_KG_TOOLS.has(n)).length;
+
 interface SidecarRpcResponse {
   result?: { tools?: unknown[] };
   error?: unknown;
