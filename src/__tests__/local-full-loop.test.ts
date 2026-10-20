@@ -387,7 +387,8 @@ describe("runLocalFullLoop", () => {
 
   it("returns iterations_exhausted when terminationReason is iterations_exhausted", async () => {
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn(async () => makeFeedbackLoopOutputs({ terminationReason: "iterations_exhausted" })),
+      // The loop ends this way only after the run's cap, the default 3.
+      run: vi.fn(async () => makeFeedbackLoopOutputs({ terminationReason: "iterations_exhausted", iterations: 3 })),
     });
 
     const result = await runLocalFullLoop({

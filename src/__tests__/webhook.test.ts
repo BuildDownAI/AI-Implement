@@ -2250,18 +2250,28 @@ function orgRepoMapping(overrides: Partial<RepoMapping> = {}): Record<string, Re
   return { AII: makeMapping({ owner: "org", repo: "repo", ...overrides }) };
 }
 
-/** GitHub's REST answers for a comment trigger on org/repo: the commenter's permission, then the 👀 reaction
- *  (`reaction: null` leaves the reaction unrouted, so a test that expects none fails if one is sent). */
-function commentTriggerApi(opts: { permission?: string; reaction?: Reply | null; commentId?: number } = {}): FakeFetch {
+/** GitHub's answer to the collaborator-permission read for alice on org/repo. */
+function collaboratorPermission(permission: string): Reply {
+  return { json: { permission, role_name: permission, user: { login: "alice", type: "User" } } };
+}
+
+/** GitHub's REST answers for a comment trigger on org/repo: the commenter's permission (a role name, or the replies
+ *  themselves, a list served in order), then the 👀 reaction, and the reason comment the handler posts when it gives
+ *  up, routed only with `reasonComment`. `reaction: null` leaves the reaction unrouted, so a test that expects none
+ *  fails if one is sent, even after the test's own assertions, since the handler sends it without awaiting it. */
+function commentTriggerApi(
+  opts: { permission?: string | Reply | Reply[]; reaction?: Reply | null; reasonComment?: boolean; commentId?: number } = {},
+): FakeFetch {
   const { permission = "write", commentId = 9001 } = opts;
   const reaction: Reply | null = opts.reaction === undefined
     ? { status: 201, json: { id: 1, content: "eyes", user: { login: "ai-implement[bot]", type: "Bot" } } }
     : opts.reaction;
   return fakeFetch({
-    "GET /repos/org/repo/collaborators/alice/permission": {
-      json: { permission, role_name: permission, user: { login: "alice", type: "User" } },
-    },
+    "GET /repos/org/repo/collaborators/alice/permission": typeof permission === "string" ? collaboratorPermission(permission) : permission,
     ...(reaction ? { [`POST /repos/org/repo/issues/comments/${commentId}/reactions`]: reaction } : {}),
+    ...(opts.reasonComment
+      ? { "POST /repos/org/repo/issues/1/comments": { status: 201, json: { id: 5001, html_url: "https://github.com/org/repo/pull/1#issuecomment-5001" } } }
+      : {}),
   }).install();
 }
 
@@ -2385,17 +2395,6 @@ describe("/ai-implement comment trigger", () => {
   });
 
   describe("transient GitHub failures (AII-1292)", () => {
-    const WRITER: Reply = { json: { permission: "write", role_name: "write", user: { login: "alice", type: "User" } } };
-    /** GitHub's REST answers for the trigger on org/repo#1: the commenter's permission (one reply for every check,
-     *  or a list served in order), the 👀 reaction, and the reason comment the handler posts when it gives up. */
-    function triggerApi(permission: Reply | Reply[] = WRITER): FakeFetch {
-      return fakeFetch({
-        "GET /repos/org/repo/collaborators/alice/permission": permission,
-        "POST /repos/org/repo/issues/comments/9001/reactions": { status: 201, json: { id: 1, content: "eyes", user: { login: "ai-implement[bot]", type: "Bot" } } },
-        "POST /repos/org/repo/issues/1/comments": { status: 201, json: { id: 5001, html_url: "https://github.com/org/repo/pull/1#issuecomment-5001" } },
-      }).install();
-    }
-
     const reasonComments = (github: FakeFetch) => github.calls.filter((c) => c.method === "POST" && c.path === "/repos/org/repo/issues/1/comments");
     const reactions = (github: FakeFetch) => github.calls.filter((c) => c.path.endsWith("/reactions"));
 
@@ -2410,7 +2409,7 @@ describe("/ai-implement comment trigger", () => {
       hoisted.getMappings.mockReturnValue(orgRepoMapping());
       hoisted.resolveWorkflowContract.mockClear();
       hoisted.resolveWorkflowContract.mockRejectedValue(new Error("probe"));
-      const github = triggerApi();
+      const github = commentTriggerApi({ reaction: null, reasonComment: true });
 
       const out = await post();
 
@@ -2425,7 +2424,7 @@ describe("/ai-implement comment trigger", () => {
     it("probe failing once then succeeding queues the comment with 👀", async () => {
       hoisted.getMappings.mockReturnValue(orgRepoMapping());
       hoisted.resolveWorkflowContract.mockRejectedValueOnce(new Error("probe")).mockResolvedValue("envelope");
-      const github = triggerApi();
+      const github = commentTriggerApi();
 
       const out = await post();
 
@@ -2437,7 +2436,7 @@ describe("/ai-implement comment trigger", () => {
 
     it("permission API errors twice give permission_check_failed with one comment", async () => {
       hoisted.getMappings.mockReturnValue(orgRepoMapping());
-      const github = triggerApi(githubError(503, "Service Unavailable"));
+      const github = commentTriggerApi({ permission: githubError(503, "Service Unavailable"), reaction: null, reasonComment: true });
 
       const out = await post();
 
@@ -2449,7 +2448,7 @@ describe("/ai-implement comment trigger", () => {
 
     it("a permission error then a 200 queues the comment", async () => {
       hoisted.getMappings.mockReturnValue(orgRepoMapping());
-      const github = triggerApi([githubError(500, "Internal Server Error"), WRITER]);
+      const github = commentTriggerApi({ permission: [githubError(500, "Internal Server Error"), collaboratorPermission("write")] });
 
       const out = await post();
 
@@ -2460,7 +2459,7 @@ describe("/ai-implement comment trigger", () => {
 
     it("a 404 from the permission API is a non-writer, not an error", async () => {
       hoisted.getMappings.mockReturnValue(orgRepoMapping());
-      const github = triggerApi(githubError(404, "Not Found"));
+      const github = commentTriggerApi({ permission: githubError(404, "Not Found"), reaction: null });
 
       const out = await post();
 

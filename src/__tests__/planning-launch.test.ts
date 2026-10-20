@@ -1,8 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import type { RepoMapping } from "../config.js";
-import type { TicketIssue } from "../providers/types.js";
 import type { AppConfig } from "../index.js";
 import type { ModelAuthGrantBootstrapV1 } from "../model-auth-contract.js";
 import { decodeRunConfig, decodeTrustedRunConfig } from "../run-config.js";
@@ -37,7 +35,8 @@ vi.mock("../planning-context.js", () => ({
 }));
 vi.mock("../workflow-probe.js", () => ({ resolveWorkflowCapabilities: vi.fn() }));
 
-/** Opted-out regression fixtures, captured from the code before AII-1391. Set CAPTURE_FIXTURES=1 to regenerate. */
+/** Opted-out regression fixtures: the launch inputs an opted-out planning dispatch builds from the builders' issue,
+ *  mapping and config. Set CAPTURE_FIXTURES=1 to regenerate, then read the diff against planning-launch.ts. */
 const FIXTURE_FILE = path.join(import.meta.dirname, "fixtures", "planning-opted-out.json");
 function expectFixture(name: string, value: unknown): void {
   const actual = JSON.parse(JSON.stringify(value ?? null));
@@ -294,14 +293,21 @@ describe("launchPlanningSession", () => {
   const issue = makeIssue();
   const mapping = makeMapping();
   const provider = makeProvider();
-  const baseConfig = makeAppConfig({ anthropicApiKey: "sk" });
+  // Both callback settings, without which the poll loop never dispatches planning (planningDispatchBlockReason).
+  const baseConfig = makeAppConfig({
+    anthropicApiKey: "sk", runnerCallbackBaseUrl: "https://orch.example.test", runnerTokenSecret: "secret-with-enough-entropy-for-hmac",
+  });
   const reservation = { dispatchId: "d-1", admission: { ok: true, admissionGeneration: 3, release: vi.fn() } } as never;
-  // The partial fixtures fixtures/planning-opted-out.json was captured from, kept for the tests that compare against
-  // those captured values (merge of origin/testing; see the final sweep).
-  const capturedIssue = { id: "i-1", identifier: "AII-1053", title: "t", description: "d", scopeKey: "AII", nativeStatus: "Todo" } as unknown as TicketIssue;
-  const capturedMapping = { owner: "o", repo: "r", defaultBranch: "main", provider: "anthropic" } as unknown as RepoMapping;
-  const capturedConfig = { anthropicApiKey: "sk", githubAppId: "id", githubAppPrivateKey: "k", localRunnerImage: "img" } as unknown as AppConfig;
-  const captured = { issue: capturedIssue, mapping: capturedMapping, config: capturedConfig };
+
+  /** What the real dispatchSession (src/index.ts) hands its backend: the callback URL and minted run tokens only when
+   *  the config carries both callback settings, else empty. */
+  const backendArgs = (c: AppConfig) => {
+    const callback = Boolean(c.runnerCallbackBaseUrl && c.runnerTokenSecret);
+    return {
+      sessionToken: "SESSION", machineNonce: "NONCE",
+      runnerCallbackUrl: callback ? c.runnerCallbackBaseUrl! : "", runToken: callback ? "RUN" : "", runProgressToken: callback ? "PROGRESS" : "",
+    };
+  };
 
   let mod: typeof import("../planning-launch.js");
   let auth: typeof import("../github-app-auth.js");
@@ -345,8 +351,8 @@ describe("launchPlanningSession", () => {
     vi.mocked(managed.isManagedProject).mockReturnValue(false);
     vi.mocked(auth.getInstallationToken).mockResolvedValue("CONTROL-TOKEN-SECRET");
     vi.mocked(auth.getScopedInstallationToken).mockResolvedValue(scopedToken());
-    dispatchSession.mockImplementation(async (_c, _p, _i, _m, _pr, _rm, opts) => {
-      const r = await opts.backend({ sessionToken: "SESSION", machineNonce: "NONCE", runnerCallbackUrl: "", runToken: "RUN", managedAuth: { kind: "legacy" }, markLaunchAttempted: () => {} });
+    dispatchSession.mockImplementation(async (c, _p, _i, _m, _pr, _rm, opts) => {
+      const r = await opts.backend({ ...backendArgs(c), managedAuth: { kind: "legacy" }, markLaunchAttempted: () => {} });
       return { admitted: true, machineId: r.machineId, executionMode: r.executionMode };
     });
   });
@@ -374,10 +380,12 @@ describe("launchPlanningSession", () => {
     vi.mocked(auth.getScopedInstallationToken).mockResolvedValue(scopedToken());
     vi.mocked(docker.startLocalRunnerContainer).mockResolvedValue({ containerId: "c-1", containerName: "n" } as never);
 
-    await call({ ...captured, reservation });
+    await call({ reservation });
 
-    expect(auth.getInstallationToken).toHaveBeenCalledWith("id", "k", "o");
-    expect(auth.getScopedInstallationToken).toHaveBeenCalledWith("id", "k", "o", { repositories: ["r"] });
+    expect(auth.getInstallationToken).toHaveBeenCalledWith(baseConfig.githubAppId, baseConfig.githubAppPrivateKey, mapping.owner);
+    expect(auth.getScopedInstallationToken).toHaveBeenCalledWith(
+      baseConfig.githubAppId, baseConfig.githubAppPrivateKey, mapping.owner, { repositories: [mapping.repo] },
+    );
     expect(vi.mocked(docker.startLocalRunnerContainer).mock.calls[0][0]).toEqual(
       expect.objectContaining({ githubToken: "SCOPED-TOKEN-SECRET" }),
     );
@@ -436,13 +444,13 @@ describe("launchPlanningSession", () => {
       launches = [];
       bootstrapTaken = false;
       attempted = vi.fn();
-      dispatchSession.mockImplementation(async (_c, _p, _i, _m, _pr, _rm, opts) => {
+      dispatchSession.mockImplementation(async (c, _p, _i, _m, _pr, _rm, opts) => {
         expect(opts.managedAuth.workflowFile).toBe(mapping.planningWorkflowFile);
         // The decision prepareManagedDispatch returns for this launch's reservation, project and backend.
         const { decision, bootstrap } = makeLaunchDecision(snapshot, opts.backendKind, { dispatchId: "d-1", projectKey: issue.scopeKey });
         launches.push(bootstrap);
         if (bootstrapTaken) decision.takeBootstrap();
-        const r = await opts.backend({ sessionToken: "S", machineNonce: "N", runnerCallbackUrl: "https://orch.example.test", runToken: "R", managedAuth: decision, markLaunchAttempted: attempted });
+        const r = await opts.backend({ ...backendArgs(c), managedAuth: decision, markLaunchAttempted: attempted });
         return { admitted: true, machineId: r.machineId, executionMode: r.executionMode };
       });
       vi.mocked(docker.startLocalRunnerContainer).mockResolvedValue({ containerId: "c-1", containerName: "n" } as never);
@@ -505,16 +513,16 @@ describe("launchPlanningSession", () => {
     expect(input.protectedModelAuth).toBeUndefined();
   });
 
-  it("opted-out local launch: the container input matches the pre-change fixture", async () => {
+  it("opted-out local launch: the container input matches the fixture", async () => {
     vi.mocked(docker.startLocalRunnerContainer).mockResolvedValue({ containerId: "c-1", containerName: "n" } as never);
-    await call({ ...captured, reservation });
+    await call({ reservation });
     expectFixture("local", vi.mocked(docker.startLocalRunnerContainer).mock.calls[0][0]);
   });
 
-  it("opted-out Fly launch: the machine input matches the pre-change fixture", async () => {
+  it("opted-out Fly launch: the machine input matches the fixture", async () => {
     vi.mocked(flyMachines.createMachine).mockResolvedValue({ id: "m-1", name: "mn" } as never);
-    const flyConfig = { ...capturedConfig, flySessionsToken: "ft", flySessionsApp: "fa", runnerCallbackBaseUrl: "https://orch.example.test" } as unknown as AppConfig;
-    expect(await call({ ...captured, config: flyConfig, execPath: "fly-machines", reservation })).toMatchObject({ outcome: "accepted" });
+    const flyConfig = { ...baseConfig, flySessionsToken: "ft", flySessionsApp: "fa" };
+    expect(await call({ config: flyConfig, execPath: "fly-machines", reservation })).toMatchObject({ outcome: "accepted" });
     expectFixture("fly", vi.mocked(flyMachines.buildSessionMachineConfig).mock.calls[0][0]);
   });
 
@@ -631,7 +639,8 @@ describe("managed planning on GitHub Actions (AII-1420)", () => {
   const snapshot = makeSnapshot("codex-subscription");
   const issue = makeIssue({ identifier: "AII-1420", scopeKey: "AII" });
   const mapping = makeMapping({ planningWorkflowFile: "p.yml" });
-  const config = makeAppConfig({ runnerCallbackBaseUrl: "https://cb.example.test" });
+  // Both callback settings, without which the poll loop never dispatches planning (planningDispatchBlockReason).
+  const config = makeAppConfig({ runnerCallbackBaseUrl: "https://cb.example.test", runnerTokenSecret: "secret-with-enough-entropy-for-hmac" });
   const provider = makeProvider();
   const fireBreakerTrip = vi.fn();
   let decision: LaunchDecision;
@@ -703,6 +712,9 @@ describe("managed planning on GitHub Actions (AII-1420)", () => {
     expect(trusted.credentials?.modelAuthContext).toEqual({
       version: 1, dispatchId: "d-gha", projectKey: "AII", backend: "gha", modelAuthUrl: "https://cb.example.test",
     });
+    expect(trusted.runnerCallbackUrl).toBe("https://cb.example.test");
+    expect(trusted.credentials?.resultToken).toEqual(expect.any(String));
+    expect(trusted.credentials?.progressToken).toEqual(expect.any(String));
     expect(decodeRunConfig(inputs.run_config!).credentials).toBeUndefined();
     expect(inputs.run_token).toBe("");
     for (const [k, v] of Object.entries(inputs)) {

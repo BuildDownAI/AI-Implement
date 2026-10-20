@@ -23,8 +23,9 @@ import { flySecretsUpdated } from "./helpers/replies/fly.js";
 import { testDb } from "./helpers/test-db.js";
 
 const RUNNER_SECRET = "runner-token-secret-synthetic-0123456789";
-// The session store's key: production's provider, derived from a synthetic secret.
-const KEYS = createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: "synthetic-dispatch-secret" });
+// The session store's key: production's provider, derived from the same RUNNER_TOKEN_SECRET the run is configured with,
+// as createModelAuthRuntime derives it (src/model-auth-runtime.ts).
+const KEYS = createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: RUNNER_SECRET });
 const KEY = KEYS.current()!.key;
 const holder = vi.hoisted(() => ({ runtime: undefined as unknown }));
 

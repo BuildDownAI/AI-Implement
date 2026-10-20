@@ -1488,8 +1488,9 @@ describe("processReviewFixQueue — protected dispatch (AII-1392)", () => {
 
   it("a launch that throws before onBeforeLaunch settles rejected and releases the admission", async () => {
     configModule.upsertMapping("AII", acmeBilling());
-    // A bootstrap already handed out: the real dispatchLocalGapfill refuses before its Docker launch.
-    prepareLaunches(makeSnapshot(), (d) => { d.takeBootstrap(); });
+    prepareLaunches();
+    // Writing the secret env file fails before startLocalRunnerContainer calls onBeforeLaunch.
+    localGapfillMocks.startLocalRunnerContainer.mockRejectedValueOnce(new Error("ENOSPC: no space left on device"));
     queueFix();
 
     await indexModule.processReviewFixQueue(config, registry);

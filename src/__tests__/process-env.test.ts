@@ -7,8 +7,9 @@ import { testDir } from "./helpers/test-dir.js";
 
 const SAVED: Record<string, string | undefined> = {};
 
+/** Sets `key` for this test; the first save of a key keeps its value from before the test, which restoreAll puts back. */
 function saveAndSet(key: string, value: string | undefined): void {
-  SAVED[key] = process.env[key];
+  if (!(key in SAVED)) SAVED[key] = process.env[key];
   if (value === undefined) {
     delete process.env[key];
   } else {
@@ -274,8 +275,9 @@ describe("gitProcessEnv dependency credentials", () => {
 
     it("a missing progress bearer alone does not fence the cached token; gitProcessEnv does", () => {
       const cache = join(testDir("helper-cache"), "cache.json");
-      // A freshly vended token's hour, well past the helper's 10-minute refresh margin.
-      writeFileSync(cache, JSON.stringify({ token: "SENTINEL-CACHED", expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString() }));
+      // A vended token as the endpoint caches it, with GitHub's expiry; without a progress bearer the helper never reads the expiry.
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+      writeFileSync(cache, JSON.stringify({ token: "SENTINEL-CACHED", expires_at: expiresAt }));
       saveAndSet("GIT_DEPENDENCY_TOKEN_FILE", cache);
       delete process.env.RUN_PROGRESS_TOKEN;
 
