@@ -690,7 +690,12 @@ describe("session/entrypoint.sh configured model-auth bootstrap", () => {
   beforeAll(() => {
     // Real trusted decoder, compiled once; the shell imports it from AI_IMPLEMENT_DIST_DIR.
     distDir = join(process.cwd(), "node_modules", ".cache", "aii951-entrypoint-dist");
-    const r = spawnSync("npx", ["tsc", "--outDir", distDir], { encoding: "utf8" });
+    // tsc enables Node's compile cache, which goes under os.tmpdir() unless NODE_COMPILE_CACHE names a directory.
+    const compileCache = join(process.cwd(), "node_modules", ".cache", "aii951-entrypoint-compile-cache");
+    const r = spawnSync("npx", ["tsc", "--outDir", distDir], {
+      encoding: "utf8",
+      env: { ...process.env, NODE_COMPILE_CACHE: compileCache },
+    });
     expect(r.status, r.stdout + r.stderr).toBe(0);
   }, 120_000);
 
