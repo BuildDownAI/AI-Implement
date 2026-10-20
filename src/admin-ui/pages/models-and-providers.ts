@@ -55,6 +55,7 @@ export const modelsAndProvidersHtml = `
         </table>
         <div id="mp-account-empty" class="hidden text-tertiary" style="padding:12px">No account profiles yet. An operator provisions accounts on the host; see the instructions below.</div>
         <div id="mp-account-error" class="error hidden" style="padding:0 12px"></div>
+        <div id="mp-pairing" class="hidden" style="padding:12px"></div>
         <div id="mp-account-form" class="hidden" style="padding:12px">
           <h3 style="font-size:13px;margin:0 0 6px">Add account profile</h3>
           <div style="display:flex;gap:6px;flex-wrap:wrap">
@@ -68,7 +69,7 @@ export const modelsAndProvidersHtml = `
           </div>
         </div>
         <div class="text-tertiary" style="font-size:11.5px;padding:12px">
-          <div><strong>Provisioning.</strong> Add a profile above and set an API key per profile; a key is encrypted on save and never shown again. Subscription sign-ins and Bedrock credentials are provisioned on the host.</div>
+          <div><strong>Provisioning.</strong> Add a profile above and set an API key per profile; a key is encrypted on save and never shown again. Connect a ChatGPT plan from a laptop with a pairing code; other subscription sign-ins and Bedrock credentials are provisioned on the host.</div>
           <div>ChatGPT plan, <em>sign-in required</em> or <em>missing</em>: run <span class="mono">node dist/chatgpt-plan-login.js login</span>, or import an existing sign-in with <span class="mono">chatgpt-import</span>.</div>
           <div>Readiness is checked against the profile's first permitted project, so a profile with no permitted project shows <em>unknown</em>; that is not a credential fault.</div>
         </div>
@@ -106,6 +107,8 @@ export const modelsAndProvidersScript = `(function () {
   const MP_PROVIDERS = ['anthropic', 'bedrock', 'openai'];
   let mpDefaults = { mode: 'legacy', stages: {} };
   let mpAccounts = [];
+  // The pairing code lives only here: it is never written to storage and loadStageConfig does not re-render it.
+  let mpPairing = null;
   let mpDirty = false;
 
   function mpCanEdit() {
@@ -299,6 +302,9 @@ export const modelsAndProvidersScript = `(function () {
               '<button class="btn btn-sm" data-act="remove-key" data-profile="' + pid + '">Remove key</button></div>'
             : '');
       }
+      if (a.authMode === 'codex-subscription' && a.profileStatus === 'active' && mpCanEdit()) {
+        keyCell = '<button class="btn btn-sm" data-act="pair" data-profile="' + window.escAttr(a.profileId) + '">Connect ChatGPT plan</button>';
+      }
       html += '<tr>' +
         '<td><span class="mono">' + window.esc(a.profileId) + '</span></td>' +
         '<td>' + window.esc(a.identity) + '</td>' +
@@ -320,6 +326,55 @@ export const modelsAndProvidersScript = `(function () {
     const el = document.getElementById('mp-account-error');
     el.textContent = msg || '';
     el.classList.toggle('hidden', !msg);
+  }
+
+  function mpRenderPairing() {
+    const el = document.getElementById('mp-pairing');
+    if (!mpPairing) { el.classList.add('hidden'); el.textContent = ''; return; }
+    el.classList.remove('hidden');
+    el.textContent = '';
+    const add = function (tag, text, cls) {
+      const n = document.createElement(tag);
+      n.textContent = text;
+      if (cls) n.className = cls;
+      el.appendChild(n);
+      return n;
+    };
+    add('div', 'Connect ChatGPT plan: ' + mpPairing.profileId);
+    if (mpPairing.code) {
+      add('div', 'Shown once. Paste the code when the command asks for it; it works once for the next 15 minutes and is not stored in readable form.', 'text-tertiary');
+      add('div', mpPairing.code, 'mono');
+      add('div', 'Run on the laptop, from a repo checkout after npm run build:', 'text-tertiary');
+      add('div', mpPairing.command, 'mono');
+    }
+    if (mpPairing.status) add('div', 'Status: ' + mpPairing.status, 'text-tertiary');
+    const check = add('button', 'Check status', 'btn btn-sm');
+    check.setAttribute('data-act', 'pair-check');
+    const close = add('button', 'Dismiss', 'btn btn-sm');
+    close.setAttribute('data-act', 'pair-close');
+  }
+
+  async function mpPairingMint(profileId) {
+    mpAccountError('');
+    try {
+      const res = await window.api('/api/model-accounts/' + encodeURIComponent(profileId) + '/chatgpt-pairing', { method: 'POST' });
+      if (!res.ok) { mpAccountError(await mpErrorText(res, 'Failed to create a pairing code')); return; }
+      const data = await res.json();
+      mpPairing = { profileId: profileId, code: String(data.code || ''), command: String(data.command || ''), status: '' };
+    } catch (err) {
+      mpAccountError('Failed to create a pairing code');
+      return;
+    }
+    mpRenderPairing();
+  }
+
+  async function mpPairingCheck() {
+    if (!mpPairing) return;
+    await loadStageConfig(false);
+    const found = mpAccounts.filter(function (a) { return a.profileId === mpPairing.profileId; })[0];
+    const label = found && found.account ? mpReadinessLabel(found.account.readiness) : 'unknown';
+    if (mpPairing) mpPairing.status = label;
+    mpRenderPairing();
   }
 
   async function mpCredentialCall(profileId, method, apiKey) {
@@ -355,11 +410,20 @@ export const modelsAndProvidersScript = `(function () {
   }
 
   function mpWatchKeys() {
+    document.getElementById('mp-pairing').onclick = function (e) {
+      const btn = e.target && e.target.closest ? e.target.closest('button[data-act]') : null;
+      if (!btn) return;
+      const act = btn.getAttribute('data-act');
+      if (act === 'pair-close') { mpPairing = null; mpRenderPairing(); }
+      else if (act === 'pair-check') { mpPairingCheck(); }
+    };
     document.getElementById('mp-account-rows').onclick = async function (e) {
       const btn = e.target && e.target.closest ? e.target.closest('button[data-act]') : null;
       if (!btn) return;
       const profileId = btn.getAttribute('data-profile');
-      if (btn.getAttribute('data-act') === 'remove-key') { await mpCredentialCall(profileId, 'DELETE'); return; }
+      const act = btn.getAttribute('data-act');
+      if (act === 'pair') { await mpPairingMint(profileId); return; }
+      if (act === 'remove-key') { await mpCredentialCall(profileId, 'DELETE'); return; }
       const inputs = document.querySelectorAll('#mp-account-rows input[data-key-for]');
       let input = null;
       for (const el of inputs) { if (el.getAttribute('data-key-for') === profileId) input = el; }

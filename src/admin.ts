@@ -67,6 +67,7 @@ import {
 import type { AgentReadiness, AgentRunRequest } from "./agent-run-preparation.js";
 import { getCredentialStatus, MODEL_ACCOUNT_REF_PATTERN, type ModelCredentialDeps } from "./model-credentials.js";
 import { createModelProtectedSecrets, type ProtectedSecretFailure } from "./model-protected-secrets.js";
+import { mintPairingCode } from "./chatgpt-pairing.js";
 import type { OwnershipSnapshot } from "./model-session-ownership.js";
 import { getDb, listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { listParked, unpark } from "./dispatch-breaker.js";
@@ -1083,6 +1084,11 @@ export function handleAdminRequest(
     if (credentialMatch && (method === "PUT" || method === "DELETE")) {
       const actor = gate.identity?.email ?? "access-code";
       runAsync(res, handleModelAccountCredential(req, res, decodeURIComponent(credentialMatch[1]), method, actor));
+      return true;
+    }
+    const pairingMatch = url.match(/^\/api\/model-accounts\/([^/]+)\/chatgpt-pairing$/);
+    if (pairingMatch && method === "POST") {
+      handleChatGptPairingMint(req, res, decodeURIComponent(pairingMatch[1]), gate.identity?.email ?? "access-code");
       return true;
     }
     if (url === "/api/agent-defaults" && method === "GET") {
@@ -3889,6 +3895,35 @@ const CREDENTIAL_FAILURES: Record<ProtectedSecretFailure, string> = {
   decrypt_failed: "could not write the credential",
   write_failed: "could not write the credential",
 };
+
+/** Mints a single-use pairing code for the laptop helper (AII-1501). The code is in this response only; the table keeps its hash. */
+function handleChatGptPairingMint(req: http.IncomingMessage, res: http.ServerResponse, profileId: string, actor: string): void {
+  const head = getAccountProfile(profileId);
+  if (!head) {
+    json(res, 404, { error: "account profile not found" });
+    return;
+  }
+  if (head.authMode !== "codex-subscription") {
+    json(res, 400, { error: "only codex-subscription profiles take a ChatGPT pairing code" });
+    return;
+  }
+  if (head.status !== "active") {
+    json(res, 400, { error: "profile is not active" });
+    return;
+  }
+  if (!process.env.RUNNER_TOKEN_SECRET) {
+    json(res, 503, { error: "RUNNER_TOKEN_SECRET is not set; the session key derives from it" });
+    return;
+  }
+  const { code, expiresAt } = mintPairingCode(profileId, Date.now());
+  const base = (process.env.OAUTH_REDIRECT_BASE_URL || process.env.RUNNER_CALLBACK_BASE_URL || `https://${req.headers.host ?? "<host>"}`).replace(/\/+$/, "");
+  console.log(`[admin] chatgpt pairing mint actor=${actor} profile=${profileId}`);
+  json(res, 200, {
+    code,
+    expiresAt,
+    command: `node dist/chatgpt-plan-login.js connect --orchestrator ${base} --record ~/.ai-implement/chatgpt-plan.json`,
+  });
+}
 
 async function handleModelAccountCredential(
   req: http.IncomingMessage,

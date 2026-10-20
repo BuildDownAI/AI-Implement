@@ -1,5 +1,6 @@
 /**
- * ChatGPT plan sign-in CLI: `node dist/chatgpt-plan-login.js <login|status|logout> --record <path>`.
+ * ChatGPT plan sign-in CLI: `node dist/chatgpt-plan-login.js <login|status|logout> --record <path>`, plus
+ * `connect --orchestrator <https-url> --record <path>` (AII-1501), which logs in and uploads the record with a pairing code.
  * Runs on the operator's machine because OpenAI's callback goes to 127.0.0.1. The saved record is read by the
  * local refresher and uploaded by the hosted import command.
  * No token value reaches argv, stdout, stderr, or an error message; failures print fixed text. The authorize URL
@@ -44,6 +45,8 @@ export interface LoginDeps {
   stdout: (line: string) => void;
   stderr: (line: string) => void;
   randomBytes: (n: number) => Buffer;
+  /** Reads one secret line from the terminal without echo. Absent in tests that never call `connect`. */
+  readSecret?: (prompt: string) => Promise<string>;
 }
 
 /** An error whose message is safe to print: fixed text only, never remote or token data. */
@@ -457,10 +460,91 @@ export async function logout(recordPath: string, deps: LoginDeps): Promise<void>
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// connect: login, then upload with a pairing code
+// ---------------------------------------------------------------------------------------------------------------------
+
+/** `https://` only, except for `localhost`. No userinfo, so a lookalike such as `https://x@y` cannot pass. Returns the origin. */
+export function parseOrchestratorUrl(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new SignInError("--orchestrator must be an https:// URL");
+  }
+  if (url.username || url.password) throw new SignInError("--orchestrator must not contain credentials");
+  const local = url.protocol === "http:" && url.hostname === "localhost";
+  if (url.protocol !== "https:" && !local) throw new SignInError("--orchestrator must be an https:// URL (http:// is allowed only for localhost)");
+  return url.origin;
+}
+
+function describeUpload(body: unknown): string[] {
+  const b = asObject(body);
+  if (!b) return [];
+  const lines: string[] = [];
+  if (typeof b.email === "string") lines.push(`Email: ${b.email.slice(0, 200)}`);
+  if (typeof b.secondsLeft === "number" && Number.isFinite(b.secondsLeft)) lines.push(`Seconds left: ${Math.floor(b.secondsLeft)}`);
+  if (typeof b.lastRefresh === "string") lines.push(`Last refresh outcome: ${safeCode(b.lastRefresh.replace(/ /g, "_")).replace(/_/g, " ")}`);
+  return lines;
+}
+
+const UPLOAD_FAILURES: Record<number, string> = {
+  400: "the orchestrator rejected the record; the code was consumed, mint a new one",
+  401: "the pairing code is not valid (unknown, expired or already used); mint a new one",
+  403: "the profile cannot take an upload; mint a new code",
+  413: "the record is too large; the code was consumed, mint a new one",
+  503: "pairing is not configured on this orchestrator",
+};
+
+/**
+ * Signs in, uploads the record to the orchestrator, then removes the tokens from the laptop's record. The tokens are
+ * removed WITHOUT revoking them: revocation would also kill the orchestrator's copy, and a laptop that kept and
+ * refreshed them would make the orchestrator see a reused refresh token (`reauth_required`). `clientId`, the host id
+ * and the file stay, so the next login reauthorizes the same client.
+ */
+export async function connect(recordPath: string, orchestrator: string, deps: LoginDeps): Promise<void> {
+  const origin = parseOrchestratorUrl(orchestrator);
+  if (!deps.readSecret) throw new SignInError("no terminal is available to read the pairing code");
+  const code = (await deps.readSecret("Pairing code (input is hidden): ")).trim();
+  if (!code || /\s/.test(code)) throw new SignInError("no pairing code was entered");
+
+  await login(recordPath, deps);
+
+  const saved = readSaved(recordPath);
+  if (!saved || !hasTokens(saved)) throw new SignInError("no signed-in record to upload");
+  let res: Response;
+  try {
+    res = await deps.fetch(`${origin}/api/chatgpt-pairing/upload`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${code}`, "Content-Type": "application/json" },
+      body: JSON.stringify(saved),
+      redirect: "error",
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    });
+  } catch {
+    throw new SignInError("network error uploading the record; the tokens are kept on this machine");
+  }
+  if (!res.ok) {
+    throw new SignInError(`upload failed (HTTP ${res.status}): ${UPLOAD_FAILURES[res.status] ?? "unexpected response"}; the tokens are kept on this machine`);
+  }
+  let body: unknown = null;
+  try {
+    body = await res.json();
+  } catch {
+    body = null;
+  }
+  const { accessToken: _a, refreshToken: _r, idToken: _i, ...rest } = saved;
+  atomicWrite(recordPath, JSON.stringify(rest), deps);
+  deps.stdout("Uploaded. The orchestrator now owns this sign-in; the tokens were removed from this machine (not revoked).");
+  for (const line of describeUpload(body)) deps.stdout(line);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------------------------------------------------
 
-const USAGE = "usage: chatgpt-plan-login <login|status|logout> --record <path> [--port <n>]";
+const USAGE =
+  "usage: chatgpt-plan-login <login|status|logout> --record <path> [--port <n>]\n" +
+  "       chatgpt-plan-login connect --orchestrator <https-url> --record <path> [--port <n>]";
 
 function defaultOpenBrowser(url: string): void {
   // Not `cmd /c start`: cmd treats every `&` in the URL as a command separator.
@@ -469,6 +553,34 @@ function defaultOpenBrowser(url: string): void {
   const child = spawn(cmd, args, { stdio: "ignore", detached: true });
   child.on("error", () => {});
   child.unref();
+}
+
+/** Reads one line from the terminal with echo off. Refuses when stdin is not a TTY, which keeps the code out of pipes and shell history. */
+function readHiddenLine(prompt: string): Promise<string> {
+  const stdin = process.stdin;
+  if (!stdin.isTTY) return Promise.reject(new SignInError("the pairing code must be typed at a terminal (stdin is not a TTY)"));
+  return new Promise((resolveLine, rejectLine) => {
+    let text = "";
+    const done = (fn: () => void): void => {
+      stdin.removeListener("data", onData);
+      stdin.setRawMode(false);
+      stdin.pause();
+      process.stderr.write("\n");
+      fn();
+    };
+    const onData = (chunk: Buffer): void => {
+      for (const ch of chunk.toString("utf8")) {
+        if (ch === "\r" || ch === "\n") return done(() => resolveLine(text));
+        if (ch === "\u0003") return done(() => rejectLine(new SignInError("cancelled")));
+        if (ch === "\u007f" || ch === "\b") text = text.slice(0, -1);
+        else text += ch;
+      }
+    };
+    process.stderr.write(prompt);
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.on("data", onData);
+  });
 }
 
 export function defaultDeps(): LoginDeps {
@@ -480,6 +592,7 @@ export function defaultDeps(): LoginDeps {
     stdout: (l) => console.log(l),
     stderr: (l) => console.error(l),
     randomBytes: (n) => randomBytes(n),
+    readSecret: readHiddenLine,
   };
 }
 
@@ -488,8 +601,10 @@ export async function main(argv: string[], deps: LoginDeps = defaultDeps()): Pro
   const [command, ...rest] = argv;
   let record: string | undefined;
   let port = deps.port;
+  let orchestrator: string | undefined;
   for (let i = 0; i < rest.length; i++) {
     if (rest[i] === "--record") record = rest[++i];
+    else if (rest[i] === "--orchestrator") orchestrator = rest[++i];
     else if (rest[i] === "--port") {
       const n = Number(rest[++i]);
       if (!Number.isInteger(n) || n < 0 || n > 65535) {
@@ -502,7 +617,7 @@ export async function main(argv: string[], deps: LoginDeps = defaultDeps()): Pro
       return 2;
     }
   }
-  if (!record || !["login", "status", "logout"].includes(command ?? "")) {
+  if (!record || !["login", "status", "logout", "connect"].includes(command ?? "") || (command === "connect") !== (orchestrator !== undefined)) {
     deps.stderr(USAGE);
     return 2;
   }
@@ -510,6 +625,7 @@ export async function main(argv: string[], deps: LoginDeps = defaultDeps()): Pro
   const d = { ...deps, port };
   try {
     if (command === "login") await login(path, d);
+    else if (command === "connect") await connect(path, orchestrator as string, d);
     else if (command === "status") status(path, d);
     else await logout(path, d);
     return 0;

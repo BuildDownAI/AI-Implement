@@ -344,3 +344,109 @@ describe("usage", () => {
     expect(await main(["login"], harness())).toBe(2);
   });
 });
+
+describe("connect", () => {
+  const CODE = "SENTINEL-PAIRING-CODE";
+  let uploads: { url: string; init: RequestInit }[];
+  let secretPrompts: string[];
+
+  function connectDeps(reply: () => Response | Promise<Response>, s: Scenario = {}): LoginDeps {
+    const base = harness(s);
+    return {
+      ...base,
+      readSecret: async (p) => {
+        secretPrompts.push(p);
+        return `${CODE}\n`;
+      },
+      fetch: (async (input: string | URL | Request, init?: RequestInit) => {
+        if (String(input).endsWith("/api/chatgpt-pairing/upload")) {
+          uploads.push({ url: String(input), init: init! });
+          return reply();
+        }
+        return base.fetch(input, init);
+      }) as typeof fetch,
+    };
+  }
+  const args = ["connect", "--orchestrator", "https://orch.example.com", "--record"];
+
+  beforeEach(() => {
+    uploads = [];
+    secretPrompts = [];
+  });
+
+  it("uploads with the code in the Authorization header only, then removes tokens without revoking", async () => {
+    const d = connectDeps(() => Response.json({ email: "a@b.co", secondsLeft: 3500, lastRefresh: "never run" }));
+    expect(await main([...args, record], d)).toBe(0);
+    expect(uploads).toHaveLength(1);
+    const headers = uploads[0].init.headers as Record<string, string>;
+    expect(headers.Authorization).toBe(`Bearer ${CODE}`);
+    expect(uploads[0].url).not.toContain(CODE);
+    expect(JSON.parse(uploads[0].init.body as string).refreshToken).toBe(REFRESH);
+
+    const after = JSON.parse(readFileSync(record, "utf8"));
+    for (const k of ["accessToken", "refreshToken", "idToken"]) expect(after).not.toHaveProperty(k);
+    expect(after.clientId).toBe(ISSUED);
+    expect(existsSync(join(dir, "host-id"))).toBe(true);
+    expect(after.extAgentHostId).toBe(readFileSync(join(dir, "host-id"), "utf8").trim());
+    expect(revokeBodies).toHaveLength(0);
+    expect(out.join("\n")).toContain("Seconds left: 3500");
+    expect(allOutput()).not.toMatch(/SENTINEL/);
+
+    // The next login reauthorizes the existing client.
+    urls = [];
+    expect(await main(["login", "--record", record], harness())).toBe(0);
+    expect(urls[0].searchParams.get("client_id")).toBe(ISSUED);
+  });
+
+  it.each([[401], [400], [500]])("keeps the tokens when the upload answers %s", async (status) => {
+    const d = connectDeps(() => new Response(`SENTINEL-BODY ${CODE}`, { status }));
+    expect(await main([...args, record], d)).toBe(1);
+    expect(JSON.parse(readFileSync(record, "utf8")).refreshToken).toBe(REFRESH);
+    expect(revokeBodies).toHaveLength(0);
+    expect(allOutput()).not.toMatch(/SENTINEL/);
+  });
+
+  it("keeps the tokens on a network error", async () => {
+    const d = connectDeps(() => {
+      throw new Error(`boom ${CODE}`);
+    });
+    expect(await main([...args, record], d)).toBe(1);
+    expect(JSON.parse(readFileSync(record, "utf8")).refreshToken).toBe(REFRESH);
+    expect(allOutput()).not.toMatch(/SENTINEL/);
+  });
+
+  it.each([
+    ["http://orch.example.com"],
+    ["http://localhost.evil.com"],
+    ["https://x@y.example.com"],
+    ["https://user:pw@orch.example.com"],
+    ["ftp://orch.example.com"],
+    ["not a url"],
+  ])("rejects --orchestrator %s before prompting or signing in", async (url) => {
+    const d = connectDeps(() => Response.json({}));
+    expect(await main(["connect", "--orchestrator", url, "--record", record], d)).toBe(1);
+    expect(secretPrompts).toHaveLength(0);
+    expect(urls).toHaveLength(0);
+    expect(uploads).toHaveLength(0);
+  });
+
+  it("accepts http only for localhost", async () => {
+    const d = connectDeps(() => Response.json({}));
+    expect(await main(["connect", "--orchestrator", "http://localhost:8080", "--record", record], d)).toBe(0);
+    expect(uploads[0].url).toBe("http://localhost:8080/api/chatgpt-pairing/upload");
+  });
+
+  it("needs --orchestrator for connect and rejects it for other commands", async () => {
+    const d = connectDeps(() => Response.json({}));
+    expect(await main(["connect", "--record", record], d)).toBe(2);
+    expect(await main(["login", "--orchestrator", "https://x.example.com", "--record", record], d)).toBe(2);
+  });
+
+  it("fails without a terminal prompt and never takes the code from argv", async () => {
+    const d = connectDeps(() => Response.json({}));
+    delete d.readSecret;
+    expect(await main([...args, record], d)).toBe(1);
+    expect(urls).toHaveLength(0);
+    expect(await main([...args, record, "--code", CODE], connectDeps(() => Response.json({})))).toBe(2);
+  });
+});

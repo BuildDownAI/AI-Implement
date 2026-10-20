@@ -33,6 +33,15 @@ ignored), stores it encrypted, and requests one refresh. It writes nothing when 
 The session key derives from `RUNNER_TOKEN_SECRET`. If it is unset, import exits non-zero and names the variable.
 **Rotating `RUNNER_TOKEN_SECRET` makes stored records unreadable: sign in again and import again.**
 
+### 2b. Or connect with a pairing code (AII-1501)
+
+Instead of steps 1 and 2, an admin can open Models & providers, press **Connect ChatGPT plan** on the `codex-subscription` row, and run the command it shows on the laptop (`node dist/chatgpt-plan-login.js connect --orchestrator https://<host> --record <path>`). The helper asks for the code without echo (a terminal is required; the code never goes in argv), signs in, uploads the record, and removes the laptop's tokens **without revoking them**. Revoking would kill the orchestrator's copy, and tokens kept on the laptop would be refreshed there, so the orchestrator would see a reused refresh token and report `reauth_required`. `clientId`, `extAgentHostId` and `host-id` stay, so the next `login` reauthorizes the same client. `--orchestrator` must be `https://` (`http://` only for `localhost`).
+
+- **Mint.** `POST /api/model-accounts/:id/chatgpt-pairing` (admin-only, needs an active `codex-subscription` profile and `RUNNER_TOKEN_SECRET`) returns `{ code, expiresAt, command }` once. The table `chatgpt_pairing_codes` keeps the SHA-256 hash, profile id, expiry (15 minutes), and used time. Minting again invalidates that profile's unused codes.
+- **Upload.** `POST /api/chatgpt-pairing/upload` takes `Authorization: Bearer <code>` and the record JSON (64 KB limit). It sits outside the admin session gate; the code is its only authentication. The code is marked used in the lookup statement, before the body is read or the import runs, so **any refused upload (bad JSON, failed validation, wrong profile state, oversize) spends the code** and the operator mints another. Unknown, expired, used and superseded codes all get the same 401. At upload time the profile must still be active and `codex-subscription`. The import is the same function `chatgpt-import` uses, and the response carries only the `chatgpt-status` fields: `email`, `secondsLeft`, `lastRefresh`. If the refresh request fails, the record is still stored and `lastRefresh` is `not requested`.
+- **If the response is lost** after a successful upload, the laptop still holds tokens the orchestrator now owns. Run `logout` on the laptop or delete the record file; do not refresh it.
+- Sign-out stays on the CLI (`chatgpt-logout`).
+
 ### 3. Check status
 
 ```bash
