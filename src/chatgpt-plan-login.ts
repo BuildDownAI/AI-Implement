@@ -492,6 +492,7 @@ const UPLOAD_FAILURES: Record<number, string> = {
   401: "the pairing code is not valid (unknown, expired or already used); mint a new one",
   403: "the profile cannot take an upload; mint a new code",
   413: "the record is too large; the code was consumed, mint a new one",
+  500: "the orchestrator could not write the record; the code was consumed, mint a new one",
   503: "pairing is not configured on this orchestrator",
 };
 

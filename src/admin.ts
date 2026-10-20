@@ -70,7 +70,6 @@ import { createModelProtectedSecrets, type ProtectedSecretFailure } from "./mode
 import { mintPairingCode, readPairingStatus, PAIRING_OPERATOR } from "./chatgpt-pairing.js";
 import { createModelSessionStore } from "./model-session-store.js";
 import { createModelSessionKeyProvider } from "./model-session-keys.js";
-import { readChatGptPlanState } from "./restate/chatgpt-plan-account.js";
 import type { OwnershipSnapshot } from "./model-session-ownership.js";
 import { getDb, listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { listParked, unpark } from "./dispatch-breaker.js";
@@ -569,6 +568,8 @@ export interface AdminDeps {
    * Absent only in tests that don't exercise reviewFixLifecycle="restate" enablement.
    */
   getRestateStatus?: () => RestateStatus;
+  /** Reads a profile's ChatGPT refresh state (src/restate/chatgpt-plan-account.ts). Injected for the same reason as `getRestateStatus`; absent in tests, where the status reports `unknown`. */
+  readChatGptPlanState?: (profileId: string) => Promise<{ lastOutcome: string } | null>;
   /**
    * The review-fix attempt lifecycle facade (AII-806) — attempt detail/activity reads
    * and the reconcile/adopt/cancel recovery actions. A narrow injected interface
@@ -1096,7 +1097,7 @@ export function handleAdminRequest(
     }
     const pairingStatusMatch = url.match(/^\/api\/model-accounts\/([^/]+)\/chatgpt-status$/);
     if (pairingStatusMatch && method === "GET") {
-      runAsync(res, handleChatGptStatus(res, decodeURIComponent(pairingStatusMatch[1])));
+      runAsync(res, handleChatGptStatus(res, decodeURIComponent(pairingStatusMatch[1]), deps));
       return true;
     }
     if (url === "/api/agent-defaults" && method === "GET") {
@@ -3905,7 +3906,7 @@ const CREDENTIAL_FAILURES: Record<ProtectedSecretFailure, string> = {
 };
 
 /** Email, seconds left and last refresh outcome for a codex-subscription profile; the admin UI shows these after pairing. */
-async function handleChatGptStatus(res: http.ServerResponse, profileId: string): Promise<void> {
+async function handleChatGptStatus(res: http.ServerResponse, profileId: string, deps: AdminDeps): Promise<void> {
   const head = getAccountProfile(profileId);
   if (!head) {
     json(res, 404, { error: "account profile not found" });
@@ -3923,7 +3924,7 @@ async function handleChatGptStatus(res: http.ServerResponse, profileId: string):
         authorizeOperator: (operator) => operator === PAIRING_OPERATOR,
         db: () => getDb(),
       }),
-      readState: (id) => readChatGptPlanState(id),
+      readState: deps.readChatGptPlanState,
       now: () => Date.now(),
     });
     json(res, 200, status);

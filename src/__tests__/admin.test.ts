@@ -6495,6 +6495,22 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect((await call(url("gpt-1"), "POST", t)).status).toBe(400);
       expect(count("chatgpt_pairing_codes")).toBe(0);
     });
+
+    it("serves the status route to admins only, with status fields and no tokens", async () => {
+      const t = adminTok();
+      const status = (id: string) => `/api/model-accounts/${id}/chatgpt-status`;
+      await call("/api/model-accounts", "POST", t, codex());
+      await call("/api/model-accounts", "POST", t, profileBody({ credentialRef: "model-account:oai-1" }));
+      accessGrants.savePageGrants(Object.keys(accessGrants.PAGE_ROUTES), "ada@eudoxus.ai");
+      expect((await call(status("gpt-1"), "GET", userTok())).status).toBe(403);
+      expect((await call(status("nope"), "GET", t)).status).toBe(404);
+      expect((await call(status("oai-1"), "GET", t)).status).toBe(400);
+      const r = await call(status("gpt-1"), "GET", t);
+      expect(r.status).toBe(200);
+      expect(Object.keys(r.json).sort()).toEqual(["connected", "email", "lastRefresh", "secondsLeft"]);
+      expect(r.json.connected).toBe(false);
+      expect(r.raw).not.toMatch(/accessToken|refreshToken|idToken/);
+    });
   });
 
   describe("browser API key entry (AII-1500)", () => {
