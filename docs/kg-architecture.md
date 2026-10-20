@@ -649,6 +649,7 @@ to the workflow. A held error also carries `cause` and `failedTeams`, which trav
 |---|---|---|
 | No regression | yes | success |
 | Hard regression (a part missing), with or without soft | no | failure `KG_SNAPSHOT_TRACKER_REGRESSION`, `guardVerdict: "refused"`, part table, no `snapshot*` fields |
+| A file under `snapshot/` over 95 MB (size check, runs before guard 0, so a dry run reports it too) | no | failure `KG_SNAPSHOT_FILE_TOO_LARGE`, no commit or push |
 | Soft only (zero-shrink or 50% rule) | yes | failure `KG_SNAPSHOT_HELD`, `guardVerdict: "held"`, part table, `snapshotPr`/`snapshotCommit`/`snapshotBranch` |
 | Guard 0 (tracker fetch failed, tracker part in the clone), real run | yes | failure `KG_SNAPSHOT_HELD`, `cause: "tracker-missing"`, `failedTeams`, part table; a missing or smaller `issue.nt` / `comment.nt` is held, any other missing part is hard |
 | Dry run (PR check), tracker data only: skipped or failed teams, missing tracker parts | no | completes with warnings (`guardVerdict: "warnings"`), never `held`; the report carries the guard table, the Sources table and the warnings |
@@ -742,7 +743,11 @@ use the refreshed token.
 **Snapshot push contract — content-based, not flag-based.** `kg-snapshot-push` judges the
 snapshot by comparing the working tree's `snapshot/parts/*.nt` line counts against the cloned
 HEAD before committing. The push is refused with `KG_SNAPSHOT_TRACKER_REGRESSION` if any of the
-following hold:
+following hold. Rules apply per **logical part**: a piece `<part>.<NN>.nt` (a part the KGB
+export split to stay under GitHub's file limit) counts toward `<part>.nt`, and line counts are
+summed over the pieces on both sides, so a part that changes from one file to several pieces, or
+back, is not "missing". The part table lists logical parts. The tracker rules and the lost-team
+count read every `issue` / `comment` piece.
 
 | Rule | Condition |
 |---|---|
@@ -764,6 +769,12 @@ team explains), still refuses it with `KG_SNAPSHOT_TRACKER_REGRESSION`. See
 For a shrink, an intentional change in what the ingest emits (a base-repo classification change, for
 example) also shrinks these files, and the guard cannot tell that from data loss on its own, so an
 operator decides.
+
+**Size check (`KG_SNAPSHOT_FILE_TOO_LARGE`).** Before any guard, and before the dry-run exit, the step
+scans every file under `snapshot/` (parts, `embeddings.npz`, anything nested). A file over 95 MB (a
+margin under GitHub's 100 MB per-file limit) fails the run with `KG_SNAPSHOT_FILE_TOO_LARGE`, the
+message naming each file and its size and telling the operator to update the KG repo to a KGB version
+that splits parts. Nothing is committed or pushed.
 
 One log line listing all parts with `prev=` and `new=` counts is emitted on every push attempt,
 pass or fail. The `fetched=false` flag check (which guards against a docs-only push replacing a

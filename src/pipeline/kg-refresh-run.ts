@@ -10,7 +10,7 @@ import { loadPipelineDefinition } from "./pipeline-loader.js";
 import { NoopStepReporter, TokenStepReporter } from "./reporter.js";
 import { cloneStep } from "./steps/clone.js";
 import { dependencyAuthStep } from "./steps/dependency-auth.js";
-import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError, KgSnapshotHeldError } from "./steps/kg-snapshot-push.js";
+import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotFileTooLargeError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError, KgSnapshotHeldError } from "./steps/kg-snapshot-push.js";
 import { kgTrackerDataStep, KgTrackerDataFetchError } from "./steps/kg-tracker-data.js";
 import { kgScopeReconcileStep } from "./steps/kg-scope-reconcile.js";
 import { kgIngestStep, KgIngestError } from "./steps/kg-ingest.js";
@@ -345,9 +345,12 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     const held = err instanceof KgSnapshotHeldError ? err : undefined;
     const isHeld = held !== undefined;
     const isIngestFailed = err instanceof KgIngestError;
+    const isTooLarge = err instanceof KgSnapshotFileTooLargeError;
     const failureCode = isMissing
       ? "KG_SNAPSHOT_MISSING"
-      : isStale
+      : isTooLarge
+        ? "KG_SNAPSHOT_FILE_TOO_LARGE"
+        : isStale
         ? "KG_SNAPSHOT_STALE"
         : isTrackerDataError
           ? "KG_TRACKER_DATA_FETCH_FAILED"
