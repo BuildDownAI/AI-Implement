@@ -240,3 +240,21 @@ describe("pairing upload", () => {
     for (const s of [ACCESS, REFRESH, ID, "op@example.com", "garbage"]) expect(logs.join("\n")).not.toContain(s);
   });
 });
+
+describe("readPairingStatus", () => {
+  const fake = (sessionData: string | null) => () => ({
+    readPlanRecord: () => (sessionData === null ? { ok: false as const, reason: "no_state" } : { ok: true as const, sessionData }),
+  }) as unknown as ModelSessionStore;
+
+  it("reports email, seconds left and last refresh without tokens", async () => {
+    const rec = JSON.stringify({ email: "op@example.com", refreshToken: REFRESH, accessToken: ACCESS, accessTokenExpiresAt: T0 + 90_000 });
+    const s = await pairing.readPairingStatus(PROFILE, { store: fake(rec), readState: async () => ({ lastOutcome: "ok" }) as never, now: () => T0 });
+    expect(s).toEqual({ connected: true, email: "op@example.com", secondsLeft: 90, lastRefresh: "ok" });
+    expect(JSON.stringify(s)).not.toContain(REFRESH);
+  });
+
+  it("reports not connected when nothing is stored", async () => {
+    const s = await pairing.readPairingStatus(PROFILE, { store: fake(null), now: () => T0 });
+    expect(s).toEqual({ connected: false, email: null, secondsLeft: null, lastRefresh: "unknown" });
+  });
+});

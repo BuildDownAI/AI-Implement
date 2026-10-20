@@ -246,3 +246,41 @@ export async function handlePairingUpload(
   console.log(`[chatgpt-pairing] upload ok profile=${profileId} refresh=${result.refreshRequested ? "requested" : "not_requested"}`);
   reply(res, 200, JSON.stringify(result.status));
 }
+
+export interface PairingStatus {
+  connected: boolean;
+  email: string | null;
+  secondsLeft: number | null;
+  lastRefresh: string;
+}
+
+/** Read-only status for the admin UI: email, seconds left and last refresh outcome. Never returns a token. */
+export async function readPairingStatus(
+  profileId: string,
+  deps: { store: () => Pick<ModelSessionStore, "readPlanRecord">; readState?: ImportDeps["readState"]; now: () => number },
+): Promise<PairingStatus> {
+  let lastRefresh = "unknown";
+  try {
+    const state = await deps.readState?.(profileId);
+    if (state !== undefined) lastRefresh = state ? state.lastOutcome : "never run";
+  } catch {
+    /* ingress unreachable: leave unknown */
+  }
+  const read = deps.store().readPlanRecord(profileId);
+  if (!read.ok) return { connected: false, email: null, secondsLeft: null, lastRefresh };
+  let data: Record<string, unknown> = {};
+  try {
+    const v: unknown = JSON.parse(read.sessionData);
+    if (typeof v === "object" && v !== null && !Array.isArray(v)) data = v as Record<string, unknown>;
+  } catch {
+    /* unreadable record: report disconnected */
+  }
+  const signedIn = typeof data.refreshToken === "string" && data.refreshToken !== "";
+  const exp = data.accessTokenExpiresAt;
+  return {
+    connected: signedIn,
+    email: typeof data.email === "string" && data.email ? data.email : null,
+    secondsLeft: signedIn && typeof exp === "number" ? Math.floor((exp - deps.now()) / 1000) : null,
+    lastRefresh,
+  };
+}

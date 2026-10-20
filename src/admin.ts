@@ -67,7 +67,10 @@ import {
 import type { AgentReadiness, AgentRunRequest } from "./agent-run-preparation.js";
 import { getCredentialStatus, MODEL_ACCOUNT_REF_PATTERN, type ModelCredentialDeps } from "./model-credentials.js";
 import { createModelProtectedSecrets, type ProtectedSecretFailure } from "./model-protected-secrets.js";
-import { mintPairingCode } from "./chatgpt-pairing.js";
+import { mintPairingCode, readPairingStatus, PAIRING_OPERATOR } from "./chatgpt-pairing.js";
+import { createModelSessionStore } from "./model-session-store.js";
+import { createModelSessionKeyProvider } from "./model-session-keys.js";
+import { readChatGptPlanState } from "./restate/chatgpt-plan-account.js";
 import type { OwnershipSnapshot } from "./model-session-ownership.js";
 import { getDb, listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { listParked, unpark } from "./dispatch-breaker.js";
@@ -1089,6 +1092,11 @@ export function handleAdminRequest(
     const pairingMatch = url.match(/^\/api\/model-accounts\/([^/]+)\/chatgpt-pairing$/);
     if (pairingMatch && method === "POST") {
       handleChatGptPairingMint(req, res, decodeURIComponent(pairingMatch[1]), gate.identity?.email ?? "access-code");
+      return true;
+    }
+    const pairingStatusMatch = url.match(/^\/api\/model-accounts\/([^/]+)\/chatgpt-status$/);
+    if (pairingStatusMatch && method === "GET") {
+      runAsync(res, handleChatGptStatus(res, decodeURIComponent(pairingStatusMatch[1])));
       return true;
     }
     if (url === "/api/agent-defaults" && method === "GET") {
@@ -3895,6 +3903,34 @@ const CREDENTIAL_FAILURES: Record<ProtectedSecretFailure, string> = {
   decrypt_failed: "could not write the credential",
   write_failed: "could not write the credential",
 };
+
+/** Email, seconds left and last refresh outcome for a codex-subscription profile; the admin UI shows these after pairing. */
+async function handleChatGptStatus(res: http.ServerResponse, profileId: string): Promise<void> {
+  const head = getAccountProfile(profileId);
+  if (!head) {
+    json(res, 404, { error: "account profile not found" });
+    return;
+  }
+  if (head.authMode !== "codex-subscription") {
+    json(res, 400, { error: "only codex-subscription profiles have a ChatGPT status" });
+    return;
+  }
+  try {
+    const status = await readPairingStatus(profileId, {
+      store: () => createModelSessionStore({
+        keys: createModelSessionKeyProvider(),
+        verifyOwner: () => false,
+        authorizeOperator: (operator) => operator === PAIRING_OPERATOR,
+        db: () => getDb(),
+      }),
+      readState: (id) => readChatGptPlanState(id),
+      now: () => Date.now(),
+    });
+    json(res, 200, status);
+  } catch {
+    json(res, 500, { error: "could not read the status" });
+  }
+}
 
 /** Mints a single-use pairing code for the laptop helper (AII-1501). The code is in this response only; the table keeps its hash. */
 function handleChatGptPairingMint(req: http.IncomingMessage, res: http.ServerResponse, profileId: string, actor: string): void {

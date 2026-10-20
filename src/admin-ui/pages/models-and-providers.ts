@@ -370,10 +370,20 @@ export const modelsAndProvidersScript = `(function () {
 
   async function mpPairingCheck() {
     if (!mpPairing) return;
+    const profileId = mpPairing.profileId;
     await loadStageConfig(false);
-    const found = mpAccounts.filter(function (a) { return a.profileId === mpPairing.profileId; })[0];
-    const label = found && found.account ? mpReadinessLabel(found.account.readiness) : 'unknown';
-    if (mpPairing) mpPairing.status = label;
+    const found = mpAccounts.filter(function (a) { return a.profileId === profileId; })[0];
+    let label = found && found.account ? mpReadinessLabel(found.account.readiness) : 'unknown';
+    try {
+      const res = await window.api('/api/model-accounts/' + encodeURIComponent(profileId) + '/chatgpt-status');
+      const st = res.ok ? await res.json() : null;
+      if (st && st.connected) {
+        label += ' | Email: ' + (st.email || '-') + ' | Seconds left: ' + (st.secondsLeft === null ? '-' : st.secondsLeft) + ' | Last refresh: ' + (st.lastRefresh || 'unknown');
+      } else if (st) {
+        label += ' | Not connected yet | Last refresh: ' + (st.lastRefresh || 'unknown');
+      }
+    } catch (e) { /* keep the readiness label */ }
+    if (mpPairing && mpPairing.profileId === profileId) mpPairing.status = label;
     mpRenderPairing();
   }
 
