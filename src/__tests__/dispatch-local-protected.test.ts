@@ -18,7 +18,7 @@ import type { RepoMapping } from "../config.js";
 import type { AppConfig } from "../index.js";
 import { decodeTrustedRunConfig } from "../run-config.js";
 import { createModelSessionKeyProvider } from "../model-session-keys.js";
-import { makeAppConfig, makeChatGptPlanRecord, makeIssue, makeMapping, makeProvider } from "./helpers/builders.js";
+import { makeAppConfig, makeChatGptPlanRecord, makeIssue, makeMapping, makeProvider, makeScopedInstallationToken } from "./helpers/builders.js";
 import { fakeFetch } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
 import { testTempRoot } from "./helpers/test-dir.js";
@@ -166,7 +166,7 @@ beforeEach(async () => {
   fakeFetch({}).install();
 
   vi.mocked(auth.getInstallationToken).mockResolvedValue("broad-token");
-  vi.mocked(auth.getScopedInstallationToken).mockResolvedValue({ token: "scoped-token", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 1 });
+  vi.mocked(auth.getScopedInstallationToken).mockResolvedValue(makeScopedInstallationToken());
   vi.mocked(repoImage.resolveSessionImage).mockReset().mockResolvedValue({ image: "session-image", source: "default" } as never);
   dockerCalls = [];
   dockerHolder.execFile.mockReset();

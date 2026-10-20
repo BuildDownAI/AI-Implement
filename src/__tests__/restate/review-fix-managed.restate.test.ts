@@ -53,9 +53,8 @@ vi.mock("../../github-app-auth.js", () => ({
   getInstallation: async () => ({ token: "SYNTHETIC-github-token", installationId: 7 }),
   getInstallationToken: async () => "SYNTHETIC-github-token",
   getInstallationId: async () => 7,
-  getScopedInstallationToken: async () => ({
-    token: "SYNTHETIC-github-token", installationId: 7, expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
-  }),
+  getScopedInstallationToken: async () =>
+    (await import("../helpers/builders.js")).makeScopedInstallationToken({ installationId: 7 }),
 }));
 vi.mock("../../github.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../github.js")>()),

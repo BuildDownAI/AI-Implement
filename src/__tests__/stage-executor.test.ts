@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import type { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
@@ -12,6 +12,7 @@ import { normalizeInvocation } from "../agent-usage.js";
 import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
 import type { ModelAuthClient, ModelInvocation } from "../model-auth-client.js";
 import type { InvokeParams, LLMExecutor, LLMResult } from "../pipeline/types.js";
+import { testDir, testTempRoot } from "./helpers/test-dir.js";
 
 const codexCtorOptions = vi.hoisted(() => [] as Array<Record<string, unknown>>);
 vi.mock("../pipeline/codex-executor.js", async (orig) => {
@@ -67,7 +68,20 @@ function fakeExec(result: LLMResult | Error = ok) {
 
 const base: InvokeParams = { prompt: "p", model: "caller-model", invocationTimeoutMs: 99, maxTurns: 7 };
 
-afterEach(() => vi.restoreAllMocks());
+/**
+ * The world a real CodexExecutor runs in: its app-server views under a temp root the test removes (a view it holds for a
+ * possibly-live child is kept on purpose), and a home with no skills for planning and review to copy. Returns the workspace.
+ */
+function codexWorld(): string {
+  testTempRoot("stage-executor");
+  vi.stubEnv("HOME", testDir("home"));
+  return testDir("workspace");
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+});
 
 describe("createStageExecutor", () => {
   it("returns the exact injected executor without a snapshot", () => {
@@ -210,6 +224,11 @@ describe("labels", () => {
 });
 
 describe("real CodexExecutor behind the selector", () => {
+  let workspaceDir: string;
+  beforeEach(() => {
+    workspaceDir = codexWorld();
+  });
+
   const ev = (o: unknown) => JSON.stringify(o);
   const okLines = [
     ev({ type: "thread.started", thread_id: "t" }),
@@ -265,7 +284,7 @@ describe("real CodexExecutor behind the selector", () => {
 
   const make = (auth: ReturnType<typeof checkpointAuth>, spawnImpl: typeof spawn) =>
     createStageExecutor({
-      workspaceDir: "/tmp",
+      workspaceDir,
       legacy: fakeExec(),
       snapshot: execSnapshot,
       auth,
@@ -284,7 +303,7 @@ describe("real CodexExecutor behind the selector", () => {
       return { result: { ...ok, stdout: "review" }, sawUnsafe: false, stopReason: null as null };
     });
     const ex = createStageExecutor({
-      workspaceDir: "/tmp",
+      workspaceDir,
       legacy: fakeExec(),
       snapshot: execSnapshot,
       auth,
@@ -350,7 +369,7 @@ describe("real CodexExecutor behind the selector", () => {
       profiles: { ...snapshot.profiles, implementation: { ...snapshot.profiles.review } },
     };
     const ex = createStageExecutor({
-      workspaceDir: "/tmp",
+      workspaceDir,
       legacy: fakeExec(),
       snapshot: driverSnapshot,
       auth,
@@ -363,7 +382,7 @@ describe("real CodexExecutor behind the selector", () => {
     // Implementation/review use the exec path; they reuse the review-style spawn mock that completes.
     const execSpawn = codexSpawn({}, log);
     const exec = createStageExecutor({
-      workspaceDir: "/tmp",
+      workspaceDir,
       legacy: fakeExec(),
       snapshot: { ...driverSnapshot, stages: { ...driverSnapshot.stages, planning: { ...driverSnapshot.stages.review } }, profiles: { ...driverSnapshot.profiles, planning: { ...driverSnapshot.profiles.review } } },
       auth: checkpointAuth(),
@@ -372,7 +391,7 @@ describe("real CodexExecutor behind the selector", () => {
     });
     await exec.invoke({ ...base, agentStage: "implementation" });
     const reviewEx = createStageExecutor({
-      workspaceDir: "/tmp",
+      workspaceDir,
       legacy: fakeExec(),
       snapshot: driverSnapshot,
       auth: checkpointAuth(),
@@ -513,6 +532,16 @@ describe("held profiles across stages", () => {
 });
 
 describe("trustedSkillsDir wiring", () => {
+  let workspaceDir: string;
+  beforeEach(() => {
+    workspaceDir = codexWorld();
+  });
+
+  // Each stage's executor is built on its first call; the call itself then fails as it would with no codex binary installed.
+  const missingCodex: typeof spawn = () => {
+    throw Object.assign(new Error("spawn codex ENOENT"), { code: "ENOENT" });
+  };
+
   it("is passed to the planning and review Codex executors, not implementation", async () => {
     codexCtorOptions.length = 0;
     const allCodex: ResolvedAgentSnapshotV1 = {
@@ -520,7 +549,7 @@ describe("trustedSkillsDir wiring", () => {
       stages: { ...snapshot.stages, planning: { ...snapshot.stages.review }, implementation: { ...snapshot.stages.review } },
       profiles: { ...snapshot.profiles, planning: { ...snapshot.profiles.review }, implementation: { ...snapshot.profiles.review } },
     };
-    const ex = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot: allCodex, auth: fakeAuth() });
+    const ex = createStageExecutor({ workspaceDir, legacy: fakeExec(), snapshot: allCodex, auth: fakeAuth(), codexOptions: { spawnImpl: missingCodex } });
     for (const agentStage of ["planning", "review", "implementation"] as const) {
       await ex.invoke({ ...base, agentStage }).catch(() => undefined);
     }
@@ -537,7 +566,9 @@ describe("trustedSkillsDir wiring", () => {
       stages: { ...snapshot.stages, planning: { ...snapshot.stages.review }, implementation: { ...snapshot.stages.review } },
       profiles: { ...snapshot.profiles, planning: { ...snapshot.profiles.review }, implementation: { ...snapshot.profiles.review } },
     };
-    const ex = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot: sameProfile, auth: fakeAuth(), implementationFullAccess: true });
+    const ex = createStageExecutor({
+      workspaceDir, legacy: fakeExec(), snapshot: sameProfile, auth: fakeAuth(), implementationFullAccess: true, codexOptions: { spawnImpl: missingCodex },
+    });
     for (const agentStage of ["planning", "review", "implementation", "review"] as const) {
       await ex.invoke({ ...base, agentStage }).catch(() => undefined);
     }

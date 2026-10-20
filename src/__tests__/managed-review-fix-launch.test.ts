@@ -3,7 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import http from "node:http";
-import { makeAppConfig, makeChatGptPlanRecord, makeMapping, makeScopedPrIdentity } from "./helpers/builders.js";
+import { makeAppConfig, makeChatGptPlanRecord, makeMapping, makeScopedInstallationToken, makeScopedPrIdentity } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 import { githubError, githubFile } from "./helpers/replies/github.js";
 import { testDb } from "./helpers/test-db.js";
@@ -78,9 +78,7 @@ beforeEach(async () => {
     getInstallation: async () => ({ token: "SYNTHETIC-github-token", installationId }),
     getInstallationToken: async () => "SYNTHETIC-github-token",
     getInstallationId: async () => installationId,
-    getScopedInstallationToken: async () => ({
-      token: "SYNTHETIC-github-token", installationId, expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
-    }),
+    getScopedInstallationToken: async () => makeScopedInstallationToken({ token: "SYNTHETIC-github-token", installationId }),
   }));
   vi.doMock("../github.js", async () => {
     const actual = await vi.importActual<typeof import("../github.js")>("../github.js");

@@ -1269,13 +1269,14 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
 
     beforeEach(() => {
       __resetPublicationCredentialForTests();
-      delete process.env.RUN_PUBLICATION_TOKEN;
-      vi.mocked(refreshRunnerGithubCredentials).mockClear();
+      vi.stubEnv("RUN_PUBLICATION_TOKEN", undefined);
+      // A reset also drops a one-time reply a failed test never used; the spy keeps the real refresh as its implementation.
+      vi.mocked(refreshRunnerGithubCredentials).mockReset();
     });
 
     afterEach(() => {
       __resetPublicationCredentialForTests();
-      delete process.env.RUN_PUBLICATION_TOKEN;
+      vi.unstubAllEnvs();
     });
 
     function setupClean(): string {
@@ -1293,7 +1294,7 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
     }
 
     it("GHA mode: passes the publication token, pushes and opens the PR with the refreshed token", async () => {
-      process.env.RUN_PUBLICATION_TOKEN = "pub-tok";
+      vi.stubEnv("RUN_PUBLICATION_TOKEN", "pub-tok");
       vi.mocked(refreshRunnerGithubCredentials).mockResolvedValueOnce("fresh-tok");
       const clonedRef = setupClean();
 
@@ -1339,7 +1340,7 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
     });
 
     it("dry run returns before the refresh and leaves the publication credential unconsumed", async () => {
-      process.env.RUN_PUBLICATION_TOKEN = "pub-tok";
+      vi.stubEnv("RUN_PUBLICATION_TOKEN", "pub-tok");
       initGitRepo(tmpDir);
       const clonedRef = resolveHead(tmpDir);
       writeWorkingTree({ "docs.nt": makeLines(1) });
@@ -3840,6 +3841,11 @@ describe("pipeline/kg-refresh-run.ts module-load (entrypoint smoke test)", () =>
     // Prevent AI_IMPLEMENT_RUN_CONFIG from carrying a callbackUrl that could
     // cause a callback attempt before the env check fails.
     delete env["AI_IMPLEMENT_RUN_CONFIG"];
+    // tsx keeps its cache under the OS temp directory (tsx-<uid>), so the child's goes to this test's.
+    const childTmp = testDir("tsx-tmp");
+    env["TMPDIR"] = childTmp;
+    env["TEMP"] = childTmp;
+    env["TMP"] = childTmp;
 
     const result = spawnSync(
       join(workspaceRoot, "node_modules/.bin/tsx"),

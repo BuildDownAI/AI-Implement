@@ -61,10 +61,13 @@ vi.mock("../../workflow-probe.js", () => ({
   }),
 }));
 vi.mock("../../planning-context.js", () => ({ buildPlanningContextInputs: async () => ({}) }));
-vi.mock("../../github-app-auth.js", () => ({
-  getInstallationToken: async () => "sim-gh-token",
-  getScopedInstallationToken: async () => ({ token: "sim-gh-token", expiresAt: "", installationId: 1 }),
-}));
+vi.mock("../../github-app-auth.js", async () => {
+  const { makeScopedInstallationToken } = await import("../helpers/builders.js");
+  return {
+    getInstallationToken: async () => "sim-gh-token",
+    getScopedInstallationToken: async () => makeScopedInstallationToken(),
+  };
+});
 vi.mock("../../github.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../github.js")>()),
   getWorkflowRunStatus: (...args: [string, string, string, number]) => gh.status(args[3]),

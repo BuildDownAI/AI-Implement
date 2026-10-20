@@ -9,7 +9,7 @@ import type * as RuntimeModule from "../model-auth-runtime.js";
 import type * as StoreModule from "../agent-config-store.js";
 import type * as PrepModule from "../agent-run-preparation.js";
 import { createModelSessionKeyProvider } from "../model-session-keys.js";
-import { makeChatGptPlanRecord } from "./helpers/builders.js";
+import { makeChatGptPlanRecord, makeScopedInstallationToken } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type ReplyInit } from "./helpers/fake-fetch.js";
 import { githubError, githubFile } from "./helpers/replies/github.js";
 import { testDb, type LoadedModules } from "./helpers/test-db.js";
@@ -58,7 +58,7 @@ function stage(profile: string, agent: "claude" | "codex", provider: "anthropic"
 
 beforeEach(async () => {
   vi.doMock("../github-app-auth.js", () => ({
-    getScopedInstallationToken: async () => ({ token: TOKEN, expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 1 }),
+    getScopedInstallationToken: async () => makeScopedInstallationToken({ token: TOKEN }),
   }));
   modules = (await testDb({ modules: MODULES })).modules;
   ({ dedup, mod, store, prep } = modules);

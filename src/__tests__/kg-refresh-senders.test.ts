@@ -4,7 +4,7 @@ import { createKgRefreshSenders, type KgRefreshSendInput, type KgRefreshSenderDe
 import { syncRowToMachineNonce, type KeptMachineFly } from "../restate/kg-refresh-production.js";
 import type { CreateMachineOpts, Machine } from "../fly-machines.js";
 import { buildKgRefreshRunConfig, decodeRunConfig, type RunConfigV1 } from "../run-config.js";
-import { makeAppConfig } from "./helpers/builders.js";
+import { makeAppConfig, makeScopedInstallationToken } from "./helpers/builders.js";
 
 vi.mock("../restate/kg-refresh-production.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../restate/kg-refresh-production.js")>()),
@@ -55,8 +55,8 @@ function makeDeps(overrides: Partial<KgRefreshSenderDeps> = {}, configOverrides:
       ...configOverrides,
     }),
     getInstallationToken: vi.fn(async () => "gh-secret-token"),
-    getScopedInstallationToken: vi.fn(async () => ({ token: "scoped-boot-token", expiresAt: "", installationId: 1 })),
-    mintToken: vi.fn(async () => ({ token: "gh-secret-token", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 1 })),
+    getScopedInstallationToken: vi.fn(async () => makeScopedInstallationToken({ token: "scoped-boot-token" })),
+    mintToken: vi.fn(async () => makeScopedInstallationToken({ token: "gh-secret-token" })),
     fetchDefaultBranch: vi.fn(async () => "trunk"),
     resolveRunnerImage: vi.fn(async () => "runner:test"),
     resolveWorkflowCapabilities: vi.fn(async () => ({ contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: false })),

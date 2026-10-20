@@ -5,7 +5,7 @@ import type { AppConfig } from "../index.js";
 import type { ModelAuthGrantBootstrapV1 } from "../model-auth-contract.js";
 import { decodeRunConfig, decodeTrustedRunConfig } from "../run-config.js";
 import { makeLaunchDecision, makeSnapshot, type LaunchDecision } from "./helpers/fixtures/configured-run.js";
-import { makeAppConfig, makeIssue, makeMapping, makeProvider } from "./helpers/builders.js";
+import { makeAppConfig, makeIssue, makeMapping, makeProvider, makeScopedInstallationToken } from "./helpers/builders.js";
 import { testDb } from "./helpers/test-db.js";
 
 vi.mock("../github.js", async (importOriginal) => {
@@ -317,7 +317,7 @@ describe("launchPlanningSession", () => {
   let flyKey: typeof import("../fly-protection-key.js");
   let repoImage: typeof import("../repo-image.js");
   /** The target-repo token the mint returns, valid for an hour. */
-  const scopedToken = () => ({ token: "SCOPED-TOKEN-SECRET", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 1 });
+  const scopedToken = () => makeScopedInstallationToken({ token: "SCOPED-TOKEN-SECRET" });
 
   /** Fake dispatchSession: runs the backend like the real one and records the reservation. */
   const dispatchSession = vi.fn();

@@ -5,7 +5,7 @@
 // real container can only exercise with an actual 30-second wait. Concurrency and the
 // alwaysReplay equivalence are covered against a real Restate container in
 // operator-object.restate.test.ts, per the operator rule in docs/restate.md.
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 // Mocked so rotate()'s allowlist re-check and auth-event emission don't need the
 // access_entries table or a real event sink for every test in this file — most tests
@@ -374,23 +374,21 @@ describe("RestateRefreshAuthority — invoke() bounded at 10s (AII-728)", () => 
 
 describe("RestateRefreshAuthority — outcome mapping", () => {
   it("answers unavailable (cause restate) without calling refresh when no secret is available", async () => {
-    const saved = process.env.GITHUB_APP_PRIVATE_KEY;
-    delete process.env.GITHUB_APP_PRIVATE_KEY;
-    try {
-      const sidecar = ingress({ identity: identityOk, refresh: { json: {} } });
-      const authority = new RestateRefreshAuthority({
-        ingressBaseUrl: UNROUTABLE_INGRESS,
-        fetchImpl: sidecar.fetch,
-        accessTokenTtlMs: 3600_000,
-      });
-      await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({
-        status: "unavailable",
-        cause: "restate",
-      });
-      expect(sidecar.calls.some((call) => call.url.href.endsWith("/refresh"))).toBe(false);
-    } finally {
-      if (saved !== undefined) process.env.GITHUB_APP_PRIVATE_KEY = saved;
-    }
+    vi.stubEnv("GITHUB_APP_PRIVATE_KEY", undefined);
+    onTestFinished(() => {
+      vi.unstubAllEnvs();
+    });
+    const sidecar = ingress({ identity: identityOk, refresh: { json: {} } });
+    const authority = new RestateRefreshAuthority({
+      ingressBaseUrl: UNROUTABLE_INGRESS,
+      fetchImpl: sidecar.fetch,
+      accessTokenTtlMs: 3600_000,
+    });
+    await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({
+      status: "unavailable",
+      cause: "restate",
+    });
+    expect(sidecar.calls.some((call) => call.url.href.endsWith("/refresh"))).toBe(false);
   });
 
   it("maps a 5xx ingress response on the identity read to unavailable (cause restate), never reaching refresh", async () => {

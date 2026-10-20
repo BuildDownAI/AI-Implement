@@ -5,7 +5,7 @@ import type * as GateModule from "../dispatch-gate.js";
 import type { TicketingProvider } from "../providers/types.js";
 import type { RepoMapping } from "../config.js";
 import { shouldReleaseAdmissionOnDispatchError } from "../index.js";
-import { makeAppConfig, makeAppendLogEntry, makeIssue, makeMapping, makeProvider } from "./helpers/builders.js";
+import { makeAppConfig, makeAppendLogEntry, makeIssue, makeMapping, makeProvider, makeScopedInstallationToken } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 import { githubError } from "./helpers/replies/github.js";
 import { testDb } from "./helpers/test-db.js";
@@ -102,10 +102,6 @@ function jiraMapping(project: string, overrides: Partial<RepoMapping> = {}): Rep
 // Planning dispatches only with the runner callback configured (planningDispatchBlockReason, src/runner-callback.ts).
 const CALLBACK_CONFIG = { runnerCallbackBaseUrl: "https://orchestrator.example", runnerTokenSecret: "secret" };
 
-/** A repository-scoped installation token as the mint returns it, valid for an hour. */
-function scopedToken(token: string) {
-  return { token, expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 1 };
-}
 
 function jiraProvider(): TicketingProvider {
   return makeProvider({ id: "jira", issueUrl: (issue) => `https://example.atlassian.net/browse/${issue.identifier}` });
@@ -471,7 +467,7 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
   });
 
   it("dispatchLocalDocker: a throw after markLaunchAttempted (container launch failure) holds the reservation — docker's CLI response can be lost after the container was actually created (AII-783 review, second round, on PR #681)", async () => {
-    vi.mocked(githubAppAuth.getScopedInstallationToken).mockResolvedValue(scopedToken("gh-token"));
+    vi.mocked(githubAppAuth.getScopedInstallationToken).mockResolvedValue(makeScopedInstallationToken({ token: "gh-token" }));
     vi.mocked(localDocker.startLocalRunnerContainer).mockRejectedValue(new Error("docker run failed"));
     const config = makeAppConfig({ anthropicApiKey: "sk-test" });
 
@@ -612,7 +608,7 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
     })).modules);
 
     vi.mocked(githubAppAuth.getInstallationToken).mockReset().mockResolvedValue("broad-token");
-    vi.mocked(githubAppAuth.getScopedInstallationToken).mockReset().mockResolvedValue(scopedToken("scoped-token"));
+    vi.mocked(githubAppAuth.getScopedInstallationToken).mockReset().mockResolvedValue(makeScopedInstallationToken());
     vi.mocked(repoImage.resolveSessionImage).mockReset().mockResolvedValue({ image: "session-image", source: "default" } as never);
     vi.mocked(flyMachines.listAppSecrets).mockReset().mockResolvedValue([]);
     vi.mocked(flyMachines.createMachine).mockReset().mockResolvedValue({ id: "m1", name: "machine-1" } as never);

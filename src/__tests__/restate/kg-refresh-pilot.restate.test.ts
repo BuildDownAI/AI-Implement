@@ -66,7 +66,7 @@ import { callToolAsSystem } from "../../restate/tools-client.js";
 import { makeKgRefreshAdminDeps, sweepLegacyKgRefreshRows } from "../../index.js";
 import type { RestateService } from "../../restate/endpoint.js";
 import { VARIANTS, eventually, journalEntries, journalText, journaledRunResult, queryInvocations, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
-import { makeAppConfig } from "../helpers/builders.js";
+import { makeAppConfig, makeScopedInstallationToken } from "../helpers/builders.js";
 
 const KG_SOURCE_REPO = "TestOrg/test-kg-source";
 const NAMESPACE = "https://kg.test.example/";
@@ -166,7 +166,7 @@ function ensureCompose(): void {
 
   process.env.KG_SIDECAR_URL = "http://127.0.0.1:1/mcp";
   const railFakes = {
-    mintToken: (async () => ({ token: "tok", expiresAt: new Date(Date.now() + 3_600_000).toISOString(), installationId: 1 })) as KgRailDeps["mintToken"],
+    mintToken: (async () => makeScopedInstallationToken()) as KgRailDeps["mintToken"],
     fetchTarball: (async () => {
       railFetchCalls++;
       const gate = sim.fetchGate;
@@ -206,7 +206,7 @@ function ensureCompose(): void {
     ...railFakes,
     // Sender deps: the GitHub Actions path uses the faked dispatch POST; the machine backends must not run.
     getInstallationToken: async () => "tok",
-    getScopedInstallationToken: async () => ({ token: "scoped-tok", expiresAt: "", installationId: 1 }),
+    getScopedInstallationToken: async () => makeScopedInstallationToken({ token: "scoped-tok" }),
     resolveRunnerImage: async () => undefined,
     postWorkflowDispatch: ((opts: { inputs: Record<string, string | undefined> }) => sim.postWorkflowDispatch(opts)) as never,
     keptMachineFly: () => { throw new Error("the Fly sender must not run on the GHA path"); },
