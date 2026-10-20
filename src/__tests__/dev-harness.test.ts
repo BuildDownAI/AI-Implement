@@ -10,10 +10,14 @@ vi.mock("node:child_process", () => ({
 }));
 
 // Make existsSync return true for the workspace path.
-vi.mock("node:fs", () => ({
-  default: { existsSync: vi.fn().mockReturnValue(true) },
-  existsSync: vi.fn().mockReturnValue(true),
-}));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    default: { ...actual, existsSync: vi.fn().mockReturnValue(true) },
+    existsSync: vi.fn().mockReturnValue(true),
+  };
+});
 
 // Prevent real filesystem writes for the artifacts directory.
 vi.mock("node:fs/promises", () => ({

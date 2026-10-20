@@ -369,3 +369,16 @@ export function verifyPreparedReviewFixToken(
     return verified;
   })();
 }
+
+const RUN_CREDENTIAL_ENV_NAMES: ReadonlySet<string> = new Set([
+  "RUN_TOKEN",
+  "RUN_PROGRESS_TOKEN",
+  "RUN_PUBLICATION_TOKEN",
+  "SESSION_TOKEN",
+  "MACHINE_NONCE",
+]);
+
+/** True, ignoring case, for an env name a launch sets as a run credential; Extra Env may not replace it. */
+export function isRunCredentialEnvName(name: string): boolean {
+  return RUN_CREDENTIAL_ENV_NAMES.has(name.toUpperCase());
+}

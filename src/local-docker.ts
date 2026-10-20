@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { archiveLocalContainerLogsBestEffort } from "./local-job-logs.js";
+import { isRunCredentialEnvName } from "./runner-tokens.js";
 import { isEphemeralPolicyEnvName, MODEL_AUTH_ENV, type ModelAuthGrantBootstrapV1 } from "./model-auth-contract.js";
 import {
   MODEL_CREDENTIAL_KEYS,
@@ -109,6 +110,10 @@ export function buildLocalRunnerEnv(input: LocalRunnerInput): Record<string, str
   if (input.extraEnv && Object.keys(input.extraEnv).some(isEphemeralPolicyEnvName)) {
     // The ephemeral full-access opt-in is GHA-only (AII-1437).
     throw new Error("ephemeral full-access opt-in is not supported in local Docker");
+  }
+  const reservedCredentialKey = input.extraEnv ? Object.keys(input.extraEnv).find(isRunCredentialEnvName) : undefined;
+  if (reservedCredentialKey !== undefined) {
+    throw new Error(`extraEnv name ${reservedCredentialKey} is reserved`);
   }
   if (protectedAuth) validateProtectedLocalInput(input, protectedAuth);
   const env: Record<string, string> = {
