@@ -170,6 +170,28 @@ export async function queryInvocations(adminBaseUrl: string, where: string): Pro
   return ((await response.json()) as { rows: Array<Record<string, unknown>> }).rows;
 }
 
+/**
+ * Waits until `count` invocations of `handler` matching `invokedBy` (a `sys_invocation` condition on the sender,
+ * for example `invoked_by_id = '<id>'`) exist, then attaches to each so the caller reads state only after they ran.
+ * A barrier call to the target does not order a send another invocation made; waiting on the send itself does.
+ */
+export async function awaitSentInvocations(
+  adminBaseUrl: string,
+  baseUrl: string,
+  target: { service: string; key: string; handler: string },
+  invokedBy: string,
+  count = 1,
+): Promise<number> {
+  const rows = await eventually(
+    () => queryInvocations(adminBaseUrl, `target_service_name = '${target.service}' AND target_service_key = '${target.key}' AND target_handler_name = '${target.handler}' AND ${invokedBy}`),
+    (found) => found.length >= count,
+    { label: `${count} ${target.service}/${target.handler} sent by ${invokedBy}` },
+  );
+  // An invocation that ended in failure (for example a refused `decide` answering 409) has still run: only completion matters here.
+  for (const row of rows) await attachInvocation(baseUrl, String(row.id)).catch(() => undefined);
+  return rows.length;
+}
+
 /** The full `sys_journal` rows of one invocation. A test that must prove a value is absent from the journal searches these. */
 export async function journalEntries(adminBaseUrl: string, invocationId: string): Promise<Array<Record<string, unknown>>> {
   const response = await fetch(`${adminBaseUrl}/query`, { // restate-test-allow: sys_journal read, not an invocation lookup
