@@ -1544,6 +1544,26 @@ describe("migrated write handlers (AII-713)", () => {
       expect(cancel).not.toHaveBeenCalled();
     });
 
+    it("cancels through KgRepo.decide a hold that a kill reopened after the workflow cancel succeeded (AII-1496)", async () => {
+      decide.mockRejectedValueOnce(terminal(409, "no-decision-open")).mockResolvedValueOnce(undefined);
+      status
+        .mockResolvedValueOnce({ triggerId: "trig-1", startedAt: 1 })
+        .mockResolvedValueOnce({ triggerId: "trig-2", startedAt: 2 })
+        .mockResolvedValueOnce({ triggerId: "trig-1", startedAt: 1, held: { triggerId: "trig-1" } });
+      expect(answer(await call({ action: "cancel" }))).toEqual({ isError: false, text: JSON.stringify({ cancelled: true }, null, 2) });
+      expect(cancel).toHaveBeenCalledWith({ reason: "operator_cancelled" });
+      expect(decide).toHaveBeenLastCalledWith({ action: "cancel", actor: "ada@example.com", triggerId: "trig-1" });
+    });
+
+    it("answers no-decision-open when the reopened hold is decided by someone else first (AII-1496)", async () => {
+      decide.mockRejectedValueOnce(terminal(409, "no-decision-open")).mockRejectedValueOnce(terminal(409, "no-decision-open"));
+      status
+        .mockResolvedValueOnce({ triggerId: "trig-1", startedAt: 1 })
+        .mockResolvedValueOnce({ triggerId: "trig-2", startedAt: 2 })
+        .mockResolvedValueOnce({ triggerId: "trig-1", startedAt: 1, held: { triggerId: "trig-1" } });
+      expect(answer(await call({ action: "cancel" }))).toEqual({ isError: true, text: "no-decision-open" });
+    });
+
     it("cancels a hold stored after the first decide through KgRepo.decide, not the workflow cancel", async () => {
       decide.mockRejectedValueOnce(terminal(409, "no-decision-open")).mockResolvedValueOnce(undefined);
       status.mockResolvedValue({ triggerId: "trig-1", startedAt: 1, held: { triggerId: "trig-1" } });

@@ -358,7 +358,7 @@ newer hold, and a named hold that is gone answers `no-decision-open` without fal
 and no hold open, `accept` answers `no-decision-open`, and `cancel` re-reads `KgRepo.status` and sends the
 `cancel` signal to the run now in flight (the resumed run after an accept, answering `past-merge` once it is
 past the commit point). If that signal answers 409 or 404 because the gate run stored its hold and ended in
-between, it reads `KgRepo.status` once more and cancels a hold it finds through `KgRepo.decide`. A second accept answers `no-decision-open` (the hold is gone). The pipeline schedule
+between, it reads `KgRepo.status` once more and cancels a hold it finds through `KgRepo.decide`. A second accept answers `no-decision-open` (the hold is marked decided, not gone). The pipeline schedule
 reads the hold from `KgRepo.status` (`busy`) and replaces its own held run with
 `KgRepo.decide({ action: "cancel", triggerId, reason: "superseded_by_schedule" })`; after an accept there is no
 hold, so the schedule never replaces a run a person accepted.

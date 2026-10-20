@@ -687,7 +687,7 @@ export function kgStageForRunnerStep(id: string, status: StepStatus): KgRefreshS
 const REVERT_GATES = new Set(["answers", "vectors", "canary", "stamp"]);
 
 export const DECIDE_KG_REFRESH_DESCRIPTION =
-  "Decide the current KG refresh (admin role). Acts only on the run KgRepo reports in flight; a past run cannot be decided. A snapshot held at the decision gate is a KgRepo record, not a running workflow: `accept` lands it and `cancel` drops it, each as a new KgRefresh run. Pass `triggerId` (the held run's trigger id from get_kg_status) to decide only that hold; a hold that is gone or replaced answers no-decision-open. When no decision is open, `accept` answers no-decision-open and `cancel` stops the run in flight through the cancel signal. `accept` on a blocked hold answers accept-blocked. A second accept answers no-decision-open (the hold is gone). A `cancel` after an accept stops the run until the merge starts and answers past-merge from then on (the merge is the point of no return; the run finishes). With no run in flight the answer is no-refresh-in-flight.";
+  "Decide the current KG refresh (admin role). Acts only on the run KgRepo reports in flight; a past run cannot be decided. A snapshot held at the decision gate is a KgRepo record, not a running workflow: `accept` lands it and `cancel` drops it, each as a new KgRefresh run. Pass `triggerId` (the held run's trigger id from get_kg_status) to decide only that hold; a hold that is gone or replaced answers no-decision-open. When no decision is open, `accept` answers no-decision-open and `cancel` stops the run in flight through the cancel signal. `accept` on a blocked hold answers accept-blocked. A second accept answers no-decision-open (the hold is marked decided). A `cancel` after an accept stops the run until the merge starts and answers past-merge from then on (the merge is the point of no return; the run finishes). With no run in flight the answer is no-refresh-in-flight.";
 
 export const decideKgRefreshTool = tool(
   {
@@ -750,6 +750,16 @@ export const decideKgRefreshTool = tool(
         return toolError("no-refresh-in-flight");
       }
       throw err;
+    }
+    // A kill after the signal may have reopened a hold the signal never reached: the decision door stops it.
+    const reopened = await repo.status();
+    if (reopened?.held) {
+      try {
+        await repo.decide({ action: "cancel", actor, triggerId: reopened.triggerId });
+      } catch (err) {
+        if (err instanceof restate.TerminalError && err.code === 409) return toolError("no-decision-open");
+        throw err;
+      }
     }
     return reply({ cancelled: true });
   },

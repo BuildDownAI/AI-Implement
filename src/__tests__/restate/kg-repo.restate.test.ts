@@ -50,11 +50,13 @@ describe("KgRepo durable single-flight lock", () => {
         await ctx.sleep(HOLD_MS);
       },
       // What `KgRepo.watch` reads of a run that ended: whether it passed its commit point (AII-1493).
-      status: restate.handlers.object.shared(async (ctx: restate.ObjectSharedContext): Promise<{ committed: boolean }> => ({ committed: committedRuns.has(ctx.key) })),
+      status: restate.handlers.object.shared(async (ctx: restate.ObjectSharedContext): Promise<{ committed: boolean; holdConsumed: boolean }> => ({ committed: committedRuns.has(ctx.key), holdConsumed: consumedRuns.has(ctx.key) })),
     },
   });
   /** Trigger ids whose fake run reports `committed`. */
   const committedRuns = new Set<string>();
+  /** Trigger ids whose fake run reports `holdConsumed` (a resumed run that started closing the PR). */
+  const consumedRuns = new Set<string>();
 
   const kgRepo = createKgRepo({ workflowName: FAKE_WORKFLOW_NAME });
 
@@ -737,6 +739,23 @@ describe("KgRepo durable single-flight lock", () => {
       committedRuns.add(committed);
       watchId = await freshWatch(env, slug, known);
       await killRunOf(env, committed);
+      await attachInvocation(env.baseUrl(), watchId);
+      await releaseFrom(env, slug, watchId);
+      expect(await status(env.baseUrl(), slug)).toBeNull();
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "K4: watch of a killed resumed run that consumed the hold clears it and reopens nothing (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      const held = await triggerAndHold(env, slug);
+      const known = await knownWatches(env, slug);
+      const resumed = (await decide(env.baseUrl(), slug, { action: "cancel", triggerId: held }))!.triggerId;
+      consumedRuns.add(resumed);
+      const watchId = await freshWatch(env, slug, known);
+      await killRunOf(env, resumed);
       await attachInvocation(env.baseUrl(), watchId);
       await releaseFrom(env, slug, watchId);
       expect(await status(env.baseUrl(), slug)).toBeNull();
