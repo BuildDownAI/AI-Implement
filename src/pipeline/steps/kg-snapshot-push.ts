@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { parseSourceResults } from "../../kg-source-results.js";
 import type { SourceResult } from "../../kg-source-results.js";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, join, relative, sep } from "node:path";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { refreshRunnerGithubCredentials } from "../../runner-token.js";
 import { getPublicationCredential } from "../../publication-credential.js";
@@ -19,6 +19,46 @@ export class KgSnapshotMissingError extends Error {
   constructor(detail: string) {
     super(`KG_SNAPSHOT_MISSING: ${detail}`);
   }
+}
+
+/** GitHub rejects a pushed file over 100 MB; refuse above this margin under it. */
+export const SNAPSHOT_MAX_FILE_BYTES = 95 * 1024 * 1024;
+
+/** Coded failure raised when a file under snapshot/ is too large for GitHub to accept. */
+export class KgSnapshotFileTooLargeError extends Error {
+  readonly code = "KG_SNAPSHOT_FILE_TOO_LARGE";
+  readonly files: Array<{ path: string; bytes: number }>;
+  constructor(files: Array<{ path: string; bytes: number }>) {
+    const list = files.map((f) => `${f.path} (${(f.bytes / (1024 * 1024)).toFixed(2)} MB)`).join(", ");
+    super(
+      `KG_SNAPSHOT_FILE_TOO_LARGE: ${list} exceed${files.length === 1 ? "s" : ""} the ${SNAPSHOT_MAX_FILE_BYTES / (1024 * 1024)} MB per-file limit (GitHub rejects files over 100 MB). ` +
+        "Update the KG repo to a KGB version that splits oversized parts into numbered pieces.",
+    );
+    this.files = files;
+  }
+}
+
+/** Every regular file under `dir` (recursive) larger than the limit; a missing dir yields none. */
+function findOversizedFiles(root: string, dir: string): Array<{ path: string; bytes: number }> {
+  if (!existsSync(dir)) return [];
+  const out: Array<{ path: string; bytes: number }> = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      out.push(...findOversizedFiles(root, full));
+    } else if (entry.isFile()) {
+      const bytes = statSync(full).size;
+      if (bytes > SNAPSHOT_MAX_FILE_BYTES) out.push({ path: relative(root, full).split(sep).join("/"), bytes });
+    }
+  }
+  return out;
+}
+
+/** Logical part of a file name: a piece `<part>.<NN>.nt` maps to `<part>.nt`; any other name is its own part. */
+export function logicalPartName(file: string): string {
+  const base = file.split("/").pop() ?? file;
+  const m = /^(.+)\.\d{2,}\.nt$/.exec(base);
+  return m ? `${m[1]}.nt` : base;
 }
 
 /** Coded failure raised when the snapshot stamp is not newer than the previous one. */
@@ -574,6 +614,13 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     }
 
     const { workspaceDir, githubToken, defaultBranch, clonedRef, dryRun, repoOwner, repoRepo } = inputs;
+
+    // ── Size check ───────────────────────────────────────────────────────────
+    // Runs first (before the dry-run exit in guard 0b and before any commit): GitHub refuses
+    // files over 100 MB, so refuse here with a clear message rather than fail at push time.
+    const oversized = findOversizedFiles(workspaceDir, join(workspaceDir, "snapshot"));
+    if (oversized.length > 0) throw new KgSnapshotFileTooLargeError(oversized);
+
     /** Per-part "prev/new/delta" rows for the report table. Populated by guard 0b when a previous snapshot exists. */
     const partRows: Array<{ part: string; prev: string; next: string; delta: string }> = [];
     /** Set by guard 0b on a soft-only shrink in a real run: push and open the PR, then throw KgSnapshotHeldError. */
@@ -615,8 +662,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       );
       const previousTrackerFiles = lsTreeResult.status === 0
         ? lsTreeResult.stdout.toString().split("\n").filter((f) => {
-            const base = f.trim().split("/").pop() ?? "";
-            return TRACKER_NT_FILES.has(base);
+            return TRACKER_NT_FILES.has(logicalPartName(f.trim()));
           })
         : [];
       if (previousTrackerFiles.length > 0) {
@@ -627,15 +673,19 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
         heldCause = "tracker-missing";
         heldDetail = `tracker-data step reported ${trackerFetched ? "skipped" : "fetched=false"}${failedTeams.length > 0 ? ` (teams: ${failedTeams.join(", ")})` : ""} but previous snapshot has tracker file(s) (${previousTrackerFiles.join(", ")})`;
         // Count from the clone: the working tree already holds the new, reduced issue.nt.
-        const issueShow = spawnSync(
-          "git",
-          ["show", `${clonedRef}:snapshot/parts/issue.nt`],
-          { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 1024 * 1024 * 1024 },
+        // The served issue part may be split into pieces (issue.nt or issue.NN.nt); read them all.
+        const issuePieces = previousTrackerFiles.map((f) => f.trim()).filter((f) => logicalPartName(f) === "issue.nt");
+        const issueShows = issuePieces.map((f) =>
+          spawnSync(
+            "git",
+            ["show", `${clonedRef}:${f}`],
+            { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 1024 * 1024 * 1024 },
+          ),
         );
-        // Only a clone that carries issue.nt can serve issues; a failed read of one that does is unknown, and unknown counts as lost.
-        const hasServedIssueNt = previousTrackerFiles.some((f) => f.trim().endsWith("/issue.nt"));
-        const readFailed = hasServedIssueNt && (issueShow.status !== 0 || issueShow.error != null);
-        const servedIssueNt = hasServedIssueNt && !readFailed ? issueShow.stdout.toString() : "";
+        // Only a clone that carries issue.nt can serve issues; a failed read of any piece is unknown, and unknown counts as lost.
+        const hasServedIssueNt = issuePieces.length > 0;
+        const readFailed = hasServedIssueNt && issueShows.some((r) => r.status !== 0 || r.error != null);
+        const servedIssueNt = hasServedIssueNt && !readFailed ? issueShows.map((r) => r.stdout.toString()).join("\n") : "";
         // A snapshot written by an older ingest holds the identifier prefix, not the sources.yml key. A zero
         // count is then unreliable: with any served literal that is no tracker key, an empty team is unknown.
         const trackerKeys = new Set(readTrackerRecords(workspaceDir).map((r) => r.team));
@@ -680,16 +730,35 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
         const softRegressions: string[] = [];
         const partLogLines: string[] = [];
 
+        // Group by logical part so a part split into pieces (or merged back) compares as one.
+        const previousByPart = new Map<string, string[]>();
         for (const partPath of previousParts) {
-          const partName = partPath.split("/").pop()!;
+          const name = logicalPartName(partPath);
+          previousByPart.set(name, [...(previousByPart.get(name) ?? []), partPath]);
+        }
+        const newPartsDir = join(workspaceDir, "snapshot", "parts");
+        const newFiles = existsSync(newPartsDir) ? readdirSync(newPartsDir).filter((f) => f.endsWith(".nt")) : [];
+
+        for (const [partName, partPaths] of previousByPart) {
           // git show buffers the entire file in memory — adequate for current graph scale.
           // Switch to git cat-file --batch streaming if parts grow beyond tens of MB.
-          const prevShowResult = spawnSync(
-            "git",
-            ["show", `${clonedRef}:${partPath}`],
-            { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 1024 * 1024 * 1024 },
-          );
-          if (prevShowResult.status !== 0 || prevShowResult.error != null) {
+          let prevLines = 0;
+          let prevFailure: ReturnType<typeof spawnSync> | null = null;
+          let failedPath = "";
+          for (const partPath of partPaths) {
+            const prevShowResult = spawnSync(
+              "git",
+              ["show", `${clonedRef}:${partPath}`],
+              { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 1024 * 1024 * 1024 },
+            );
+            if (prevShowResult.status !== 0 || prevShowResult.error != null) {
+              prevFailure = prevShowResult;
+              failedPath = partPath;
+              break;
+            }
+            prevLines += prevShowResult.stdout.toString().split("\n").filter(Boolean).length;
+          }
+          if (prevFailure) {
             if (trackerMissing && TRACKER_NT_FILES.has(partName)) {
               // Unreadable served tracker part: the hold built from section 0 already counts it as lost, so
               // record it as a soft regression rather than crashing before the hold is raised.
@@ -699,13 +768,12 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
               continue;
             }
             throw new Error(
-              `git show failed reading previous ${partPath} (exit ${prevShowResult.status ?? "null"}): ${prevShowResult.stderr?.toString().trim() ?? ""}`,
+              `git show failed reading previous ${failedPath} (exit ${prevFailure.status ?? "null"}): ${prevFailure.stderr?.toString().trim() ?? ""}`,
             );
           }
-          const prevLines = prevShowResult.stdout.toString().split("\n").filter(Boolean).length;
 
-          const newPartPath = join(workspaceDir, "snapshot", "parts", partName);
-          if (!existsSync(newPartPath)) {
+          const newPieces = newFiles.filter((f) => logicalPartName(f) === partName);
+          if (newPieces.length === 0) {
             partLogLines.push(`${partName} prev=${prevLines} new=missing`);
             partRows.push({ part: partName, prev: String(prevLines), next: "missing", delta: "—" });
             if (trackerMissing && TRACKER_NT_FILES.has(partName)) {
@@ -716,7 +784,10 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
             continue;
           }
 
-          const newLines = readFileSync(newPartPath, "utf-8").split("\n").filter(Boolean).length;
+          const newLines = newPieces.reduce(
+            (sum, f) => sum + readFileSync(join(newPartsDir, f), "utf-8").split("\n").filter(Boolean).length,
+            0,
+          );
           partLogLines.push(`${partName} prev=${prevLines} new=${newLines}`);
           const delta = newLines - prevLines;
           partRows.push({ part: partName, prev: String(prevLines), next: String(newLines), delta: `${delta >= 0 ? "+" : ""}${delta}` });

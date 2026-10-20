@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, truncateSync } from "node:fs";
 import { execSync, spawnSync } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -142,6 +142,7 @@ import {
   KgSnapshotHeldError,
   classifyRefreshAnomaly,
   buildLearningsComment,
+  KgSnapshotFileTooLargeError,
 } from "../pipeline/steps/kg-snapshot-push.js";
 import {
   kgTrackerDataStep,
@@ -1037,6 +1038,84 @@ describe("kgSnapshotPushStep — content-based regression guard", () => {
       logSpy.mockRestore();
     }
   });
+
+  describe("size check and split parts (AII-1498)", () => {
+    const MiB = 1024 * 1024;
+
+    function sparse(rel: string, bytes: number): void {
+      const full = join(tmpDir, rel);
+      mkdirSync(join(full, ".."), { recursive: true });
+      writeFileSync(full, "");
+      truncateSync(full, bytes);
+    }
+
+    it.each([false, true])("refuses a 96 MiB part before any commit (dryRun=%s)", async (dryRun) => {
+      initGitRepo(tmpDir);
+      const head = resolveHead(tmpDir);
+      writeWorkingTree({ "doc.nt": makeLines(5) });
+      sparse("snapshot/parts/x.nt", 96 * MiB);
+      const err = await kgSnapshotPushStep.run(makeContext(), makeInputs({ clonedRef: head, dryRun }), noopReporter).catch((e) => e);
+      expect(err).toBeInstanceOf(KgSnapshotFileTooLargeError);
+      expect(err.code).toBe("KG_SNAPSHOT_FILE_TOO_LARGE");
+      expect(err.message).toContain("snapshot/parts/x.nt");
+      expect(err.message).toContain("96.00 MB");
+      expect(resolveHead(tmpDir)).toBe(head);
+      expect(execSync("git diff --cached --name-only", { cwd: tmpDir }).toString().trim()).toBe("");
+    });
+
+    it("covers embeddings.npz and nested files, and passes exactly 95 MiB", async () => {
+      initGitRepo(tmpDir);
+      const head = resolveHead(tmpDir);
+      sparse("snapshot/embeddings.npz", 96 * MiB);
+      sparse("snapshot/sub/deep.bin", 96 * MiB);
+      const err = await kgSnapshotPushStep.run(makeContext(), makeInputs({ clonedRef: head }), noopReporter).catch((e) => e);
+      expect(err).toBeInstanceOf(KgSnapshotFileTooLargeError);
+      expect(err.message).toContain("snapshot/embeddings.npz");
+      expect(err.message).toContain("snapshot/sub/deep.bin");
+
+      rmSync(join(tmpDir, "snapshot"), { recursive: true, force: true });
+      sparse("snapshot/embeddings.npz", 95 * MiB);
+      const err2 = await kgSnapshotPushStep.run(makeContext(), makeInputs({ clonedRef: head }), noopReporter).catch((e) => e);
+      expect(err2).not.toBeInstanceOf(KgSnapshotFileTooLargeError);
+    });
+
+    it("one file to pieces with the same total is not a regression", async () => {
+      initGitRepo(tmpDir);
+      commitPreviousSnapshot({ "commit.nt": makeLines(10), "doc.nt": makeLines(5) });
+      const clonedRef = resolveHead(tmpDir);
+      rmSync(join(tmpDir, "snapshot", "parts", "commit.nt"));
+      writeWorkingTree({ "commit.00.nt": makeLines(6), "commit.01.nt": makeLines(4), "doc.nt": makeLines(5) });
+      const out = await kgSnapshotPushStep.run(makeContext(), makeInputs({ clonedRef, dryRun: true }), noopReporter);
+      const rows = (out as { partTable?: Array<{ part: string; prev: string; new: string }> }).partTable ?? [];
+      expect(rows.filter((r) => r.part === "commit.nt")).toEqual([{ part: "commit.nt", prev: "10", new: "10" }]);
+    });
+
+    it("pieces to one file; fewer total lines uses the shrink rule on the logical part", async () => {
+      initGitRepo(tmpDir);
+      commitPreviousSnapshot({ "commit.00.nt": makeLines(6), "commit.01.nt": makeLines(4) });
+      const clonedRef = resolveHead(tmpDir);
+      rmSync(join(tmpDir, "snapshot", "parts", "commit.00.nt"));
+      rmSync(join(tmpDir, "snapshot", "parts", "commit.01.nt"));
+      writeWorkingTree({ "commit.nt": makeLines(4) });
+      const err = await kgSnapshotPushStep.run(makeContext(), makeInputs({ clonedRef, dryRun: true }), noopReporter).catch((e) => e);
+      expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+      expect(err.message).toContain("commit.nt: shrank from 10 to 4");
+      expect(err.message).not.toContain("missing");
+    });
+
+    it("issue pieces count as issue.nt for the tracker zero-shrink rule", async () => {
+      initGitRepo(tmpDir);
+      commitPreviousSnapshot({ "issue.nt": makeLines(10) });
+      const clonedRef = resolveHead(tmpDir);
+      rmSync(join(tmpDir, "snapshot", "parts", "issue.nt"));
+      writeWorkingTree({ "issue.00.nt": makeLines(5), "issue.01.nt": makeLines(4) });
+      const ctx = makeContext();
+      ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 9 });
+      const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef, dryRun: true }), noopReporter).catch((e) => e);
+      expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+      expect(err.message).toContain("issue.nt: shrank from 10 to 9");
+    });
+  });
 });
 
 describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
@@ -1361,6 +1440,45 @@ describe("kgSnapshotPushStep — soft shrink is held (AII-1253)", () => {
     ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X"], issueCount: 0 });
     const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
     expect(err).toBeInstanceOf(KgSnapshotHeldError);
+    expect(err.lostTeams).toEqual([{ team: "X", servedIssues: -1 }]);
+  });
+
+  it("fetched=false with previous issue pieces holds as tracker-missing and sums servedIssues across pieces (AII-1498)", async () => {
+    const clonedRef = setupShrink(
+      { "issue.00.nt": teamIssues("X", 3), "issue.01.nt": teamIssues("X", 4), "doc.nt": makeLines(10) },
+      { "issue.00.nt": teamIssues("X", 3), "issue.01.nt": teamIssues("X", 4), "doc.nt": makeLines(10) },
+    );
+    stubPrCreate(64, "https://github.com/acme/kg-repo/pull/64");
+    writeSourcesYml("X");
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X"], issueCount: 0 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotHeldError);
+    expect(err.cause).toBe("tracker-missing");
+    expect(err.lostTeams).toEqual([{ team: "X", servedIssues: 7 }]);
+  });
+
+  it("an unreadable previous issue piece gives servedIssues -1 (AII-1498)", async () => {
+    const clonedRef = setupShrink(
+      { "issue.00.nt": teamIssues("X", 3), "issue.01.nt": teamIssues("X", 4), "doc.nt": makeLines(10) },
+      { "issue.00.nt": teamIssues("X", 3), "issue.01.nt": teamIssues("X", 4), "doc.nt": makeLines(10) },
+    );
+    writeWorkingTree({ "issue.00.nt": teamIssues("X", 3), "issue.01.nt": teamIssues("X", 5), "doc.nt": makeLines(10) });
+    execSync("git add -A && git commit -q -m interim", { cwd: tmpDir, stdio: "ignore" });
+    writeWorkingTree({ "issue.00.nt": teamIssues("X", 3), "issue.01.nt": teamIssues("X", 6), "doc.nt": makeLines(10) });
+    stubPrCreate(65, "https://github.com/acme/kg-repo/pull/65");
+    const blob = execSync(`git rev-parse ${clonedRef}:snapshot/parts/issue.01.nt`, { cwd: tmpDir }).toString().trim();
+    execSync("git repack -a -d -q", { cwd: tmpDir, stdio: "ignore" });
+    const packDir = join(tmpDir, ".git", "objects", "pack");
+    const stash = mkdtempSync(join(tmpdir(), "kg-pack-"));
+    execSync(`mv "${packDir}"/* "${stash}"/ && for p in "${stash}"/*.pack; do git unpack-objects -q < "$p"; done`, { cwd: tmpDir, stdio: "ignore" });
+    rmSync(stash, { recursive: true, force: true });
+    rmSync(join(tmpDir, ".git", "objects", blob.slice(0, 2), blob.slice(2)), { force: true });
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: false, failedTeams: ["X"], issueCount: 0 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotHeldError);
+    expect(err.cause).toBe("tracker-missing");
     expect(err.lostTeams).toEqual([{ team: "X", servedIssues: -1 }]);
   });
 
@@ -3060,6 +3178,29 @@ describe("runKgRefresh", () => {
     const failureResult = capturedResults.find((r) => r.failureCode === "KG_SNAPSHOT_MISSING");
     expect(failureResult?.guardVerdict).toBeUndefined();
     expect(failureResult?.partTable).toBeUndefined();
+  });
+
+  it("maps KgSnapshotFileTooLargeError to failureCode KG_SNAPSHOT_FILE_TOO_LARGE (AII-1498)", async () => {
+    process.env.RUNNER_CALLBACK_URL = "http://orch";
+    process.env.RUN_TOKEN = "run-tok";
+    const capturedResults: Array<{ failureCode?: string }> = [];
+    const result = await runKgRefresh({
+      workspaceDir: tmpDir,
+      stepsOverride: {
+        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        kgIngest: makeStepModule({ statsFile: null }),
+        kgSnapshotPush: makeStepModule({}, new KgSnapshotFileTooLargeError([{ path: "snapshot/parts/commit.nt", bytes: 96 * 1024 * 1024 }])),
+      },
+      reporter: { report: async () => undefined },
+      fetchImpl: async (_url, init) => {
+        capturedResults.push(init?.body ? JSON.parse(init.body as string) : {});
+        return new Response(JSON.stringify({ acknowledged: true }), { status: 200 });
+      },
+    });
+    delete process.env.RUNNER_CALLBACK_URL;
+    delete process.env.RUN_TOKEN;
+    expect(result.exitCode).toBe(1);
+    expect(capturedResults.some((r) => r.failureCode === "KG_SNAPSHOT_FILE_TOO_LARGE")).toBe(true);
   });
 
   it("returns exitCode 1 when kgTrackerData throws KgTrackerDataFetchError", async () => {
