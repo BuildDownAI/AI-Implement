@@ -7,7 +7,7 @@ import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { MAX_TRACKED_PRS } from "../../kg-refresh.js";
 import { createKgRepo, type KgRepoEnqueueResult, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
-import { VARIANTS, callObject, callService, cancelInvocation, eventually, killInvocation, queryInvocations, setObjectState, settle, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, attachInvocation, awaitSentInvocations, callObject, callService, cancelInvocation, eventually, killInvocation, queryInvocations, setObjectState, settle, startVariants, stopAll } from "./harness.js";
 
 const FAKE_WORKFLOW_NAME = "FakeKgRefresh";
 const MARKER_AGE_WAIT_MS = 1_500;
@@ -49,8 +49,12 @@ describe("KgRepo durable single-flight lock", () => {
         // The run invocation holds the lock (AII-1297): it stays live until a test releases, kills or cancels it.
         await ctx.sleep(HOLD_MS);
       },
+      // What `KgRepo.watch` reads of a run that ended: whether it passed its commit point (AII-1493).
+      status: restate.handlers.object.shared(async (ctx: restate.ObjectSharedContext): Promise<{ committed: boolean }> => ({ committed: committedRuns.has(ctx.key) })),
     },
   });
+  /** Trigger ids whose fake run reports `committed`. */
+  const committedRuns = new Set<string>();
 
   const kgRepo = createKgRepo({ workflowName: FAKE_WORKFLOW_NAME });
 
@@ -642,6 +646,103 @@ describe("KgRepo durable single-flight lock", () => {
     },
   );
 
+  // ---- AII-1493: the hold outlives the run that acts on it, so a killed run leaves a decidable hold ----
+  const release2 = (baseUrl: string, slug: string, triggerId: string, ended?: "returned" | "killed") =>
+    callPrivate(baseUrl, slug, "release", { triggerId, ...(ended ? { ended } : {}) });
+  const freshWatch = async (env: RestateEnvironment, slug: string, known: Set<string>) =>
+    String((await eventually(
+      async () => (await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRepo' AND target_service_key = '${slug}' AND target_handler_name = 'watch'`)).filter((w) => !known.has(String(w.id))),
+      (fresh) => fresh.length === 1,
+      { label: "watch sent" },
+    ))[0]!.id);
+  const knownWatches = async (env: RestateEnvironment, slug: string) =>
+    new Set((await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRepo' AND target_service_key = '${slug}' AND target_handler_name = 'watch'`)).map((w) => String(w.id)));
+  const killRunOf = async (env: RestateEnvironment, triggerId: string) => {
+    const [run] = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = '${FAKE_WORKFLOW_NAME}' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`);
+    await killInvocation(env.adminAPIBaseUrl(), String(run!.id));
+  };
+  /** A barrier on the object's exclusive queue: a stale timeout decides nothing and returns after every handler sent before it ran. */
+  /** Waits for the `release` a `watch` sent to run: a barrier on `KgRepo` does not order a send made by another invocation. */
+  const releaseFrom = (env: RestateEnvironment, slug: string, watchId: string) =>
+    awaitSentInvocations(env.adminAPIBaseUrl(), env.baseUrl(), { service: "KgRepo", key: slug, handler: "release" }, `invoked_by_id = '${watchId}'`);
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "K1: decide keeps the hold, decided; a returned release clears it once, and a killed one reopens it with a timer, repeatedly (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      const held = await triggerAndHold(env, slug);
+      const first = (await decide(env.baseUrl(), slug, { action: "cancel", triggerId: held }))!.triggerId;
+      // Decided: no open decisions, the marker is the resumed run's, and a second decision is refused.
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId: first, held: null });
+      await expect(decide(env.baseUrl(), slug, { action: "cancel", triggerId: held })).rejects.toThrow(/409.*no-decision-open/);
+      const timersDecided = await scheduledDecides(env, slug);
+
+      // The resumed run was killed: the hold is open again, the lock is the hold's, and a timer is armed.
+      await release2(env.baseUrl(), slug, first, "killed");
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId: held, held: { snapshotPr: 7 } });
+      expect(await scheduledDecides(env, slug)).toBe(timersDecided + 1);
+      expect(await trigger(env.baseUrl(), slug)).toEqual({ status: "refresh-in-progress", triggerId: held });
+
+      // A repeated kill repeats it.
+      const second = (await decide(env.baseUrl(), slug, { action: "accept", actor: "ada@example.com", triggerId: held }))!.triggerId;
+      expect(second).not.toBe(first);
+      await release2(env.baseUrl(), slug, second, "killed");
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId: held, held: { snapshotPr: 7 } });
+
+      // A run that returns clears the hold, once; a second release is a no-op.
+      const third = (await decide(env.baseUrl(), slug, { action: "cancel", triggerId: held }))!.triggerId;
+      await release2(env.baseUrl(), slug, third, "returned");
+      expect(await status(env.baseUrl(), slug)).toBeNull();
+      await release2(env.baseUrl(), slug, third);
+      expect(await status(env.baseUrl(), slug)).toBeNull();
+      const next = await trigger(env.baseUrl(), slug);
+      expect(next).not.toHaveProperty("status");
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "K2: a killed release for the gate run itself leaves the hold, and a stale reopen cannot revive a cleared hold (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      const held = await triggerAndHold(env, slug);
+      await release2(env.baseUrl(), slug, held, "killed");
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId: held, held: { snapshotPr: 7 } });
+
+      const resumed = (await decide(env.baseUrl(), slug, { action: "cancel", triggerId: held }))!.triggerId;
+      await release2(env.baseUrl(), slug, resumed);
+      await release2(env.baseUrl(), slug, resumed, "killed");
+      expect(await status(env.baseUrl(), slug)).toBeNull();
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "K3: watch of a killed resumed run reopens the hold; of one past its commit point it clears it and reopens nothing (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      const held = await triggerAndHold(env, slug);
+
+      let known = await knownWatches(env, slug);
+      const resumed = (await decide(env.baseUrl(), slug, { action: "cancel", triggerId: held }))!.triggerId;
+      let watchId = await freshWatch(env, slug, known);
+      await killRunOf(env, resumed);
+      await attachInvocation(env.baseUrl(), watchId);
+      await releaseFrom(env, slug, watchId);
+      expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId: held, held: { snapshotPr: 7 } });
+
+      known = await knownWatches(env, slug);
+      const committed = (await decide(env.baseUrl(), slug, { action: "accept", actor: "ada@example.com", triggerId: held }))!.triggerId;
+      committedRuns.add(committed);
+      watchId = await freshWatch(env, slug, known);
+      await killRunOf(env, committed);
+      await attachInvocation(env.baseUrl(), watchId);
+      await releaseFrom(env, slug, watchId);
+      expect(await status(env.baseUrl(), slug)).toBeNull();
+    },
+  );
+
   it.each(VARIANTS.map(([label]) => label))(
     "D4: the timer armed by hold is one scheduled KgRepo decide, and it decides the hold when it fires (%s)",
     async (label) => {
@@ -669,6 +770,8 @@ describe("KgRepo run-held lock", () => {
         sends.push({ key: ctx.key, parameter: input });
         await ctx.sleep(HOLD_MS);
       },
+      // What `KgRepo.watch` reads of a run that ended (AII-1493).
+      status: restate.handlers.object.shared(async (): Promise<{ committed: boolean }> => ({ committed: false })),
     },
   });
   // A run that fails with a retryable error and pauses instead of being killed (onMaxAttempts: "pause").
@@ -681,6 +784,8 @@ describe("KgRepo run-held lock", () => {
           throw new Error("boom");
         });
       },
+      // What `KgRepo.watch` reads of a run that ended (AII-1493).
+      status: restate.handlers.object.shared(async (): Promise<{ committed: boolean }> => ({ committed: false })),
     },
     options: { retryPolicy: { maxAttempts: 1, onMaxAttempts: "pause", initialInterval: 10 } },
   });

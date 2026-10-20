@@ -97,6 +97,11 @@ export const kgHoldSchema = z.object({
   report: z.custom<KgRefreshReportBody>((v) => typeof v === "object" && v !== null),
   /** The runner's step table, built at the gate from the gate run's step promises. */
   steps: z.array(z.custom<KgRefreshStepRecord>((v) => typeof v === "object" && v !== null)),
+  /**
+   * Set by `KgRepo.decide` while the resumed run acts on the hold (AII-1493): the hold stays until that run ends, so a
+   * killed run leaves something to decide again. Absent on a hold nobody has decided.
+   */
+  decided: z.object({ action: z.enum(["accept", "cancel", "timeout"]), triggerId: z.string().min(1) }).strict().optional(),
 }).strict();
 
 export type KgHold = z.infer<typeof kgHoldSchema>;
@@ -235,6 +240,8 @@ export interface KgRefreshStatusResult {
   held: KgRefreshHeldView | null;
   /** Per-source results the runner reported; `[]` before the report and for runners that send none. */
   sources: SourceResult[];
+  /** True once the run passed its commit point (the merge started); `KgRepo.watch` never reopens a hold for such a run. */
+  committed: boolean;
 }
 
 export interface KgDispatchResult {
@@ -300,6 +307,10 @@ export interface KgRefreshWorkflowDependencies {
   /** Projects journaled dispatch or reconcile values onto the row. */
   recordDispatchDetails(dispatchId: string, details: KgDispatchRowDetails): void;
   closeJobLog(jobId: string, status: "completed" | "failed" | "timed_out", conclusion?: string): void;
+  /** Writes the gate row `completed` / `awaiting_decision`, only while it is still `running` (AII-1493): a resumed run that closed the row is never overwritten. */
+  markJobHeld(jobId: string): void | Promise<void>;
+  /** Takes a held row back to `running` (only from `completed` / `awaiting_decision`) before a resumed run acts, so a killed run never leaves the badge. */
+  reopenHeldJob(jobId: string): void | Promise<void>;
   getWorkflowRunStatus(runId: number): Promise<{ status: string; conclusion: string | null }>;
   findRunByTitle(title: string): Promise<{ runId: number; logsUrl?: string } | null>;
   cancelWorkflowRun(runId: number): Promise<boolean>;
@@ -971,6 +982,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         heldPr = { number: heldPrNumber, branch: held.snapshotBranch };
         heldGate = true;
         ctx.set("step", "resume");
+        // Take the row back first (AII-1493): the row reads `awaiting_decision` only while a hold is open and undecided.
+        await ctx.run("reopen-row", () => deps.reopenHeldJob(jobId));
 
         if (action === "accept" && held.acceptBlocked === true) {
           // Defence in depth: `KgRepo.decide` already refuses this. Treat it as a cancel.
@@ -1099,11 +1112,10 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         const decideBy = heldAt + decisionTimeoutMs;
         ctx.console.log(`[KgRefresh] held: dispatch ${dispatchId} snapshot PR #${heldPrNumber} awaits a decision until ${new Date(decideBy).toISOString()}`);
         ctx.objectSendClient(FlyMachineProfile, "kg-refresh").release({ dispatchId });
-        // The row first: a resumed run that finishes fast must not see this write land after its own close.
         ctx.set("step", "held");
-        await ctx.run("close-row-held", () => deps.closeJobLog(jobId, "completed", "awaiting_decision"));
         // A call, not a send: the hold is stored before this run ends, so the `release` that follows the run always sees it.
         // `KgRepo`'s exclusive handlers never call this workflow synchronously, so the call cannot deadlock.
+        // The hold goes first (AII-1493): a kill after it leaves a hold with the row still `running`, which a decision closes.
         try {
           await ctx.objectClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).hold({
             triggerId, dispatchId, decideBy, report, steps: stepTable,
@@ -1115,6 +1127,12 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             lockLost = true;
           }
           throw err;
+        }
+        // Then the row, guarded twice: not once a decision has been made on the hold (`status` reports no hold then, and the
+        // resumed run owns the row), and, in the write itself, only while the row is still `running`.
+        const heldNow = await ctx.objectClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).status();
+        if (heldNow?.held && heldNow.triggerId === triggerId) {
+          await ctx.run("close-row-held", () => deps.markJobHeld(jobId));
         }
         heldPr = undefined; // the hold owns the PR now
         // A Stop that arrived after the report was taken (or while the hold was being stored) has no run to read it
@@ -1295,13 +1313,14 @@ function toStepRecord(step: Step): KgRefreshStepRecord {
 }
 
   async function status(ctx: WorkflowSharedContext): Promise<KgRefreshStatusResult> {
-    const [step, startedAt, triggerId, runId, dryRun, sources] = await Promise.all([
+    const [step, startedAt, triggerId, runId, dryRun, sources, committed] = await Promise.all([
       ctx.get<string>("step"),
       ctx.get<number>("startedAt"),
       ctx.get<string>("triggerId"),
       ctx.get<number>("runId"),
       ctx.get<boolean>("dryRun"),
       ctx.get<SourceResult[]>("sources"),
+      ctx.get<boolean>("committed"),
     ]);
     let runnerStep: KgRefreshStatusResult["runnerStep"] = null;
     for (const id of KG_REFRESH_RUNNER_STEPS) {
@@ -1313,7 +1332,7 @@ function toStepRecord(step: Step): KgRefreshStepRecord {
       const running = await ctx.promise<Step>(`step:${id}:running`).peek();
       if (running !== undefined) runnerStep = { id, status: running.status };
     }
-    return { step: step ?? null, startedAt: startedAt ?? null, triggerId: triggerId ?? null, runId: runId ?? null, dryRun: dryRun === true, runnerStep, decisions: [], held: null, sources: sources ?? [] };
+    return { step: step ?? null, startedAt: startedAt ?? null, triggerId: triggerId ?? null, runId: runId ?? null, dryRun: dryRun === true, runnerStep, decisions: [], held: null, sources: sources ?? [], committed: committed === true };
   }
 
   return restate.workflow({

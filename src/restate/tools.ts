@@ -735,7 +735,20 @@ export const decideKgRefreshTool = tool(
     } catch (err) {
       if (err instanceof restate.TerminalError && err.code === 409 && err.message === "past-merge") return toolError("past-merge");
       // The run finished between the status read and the signal.
-      if (err instanceof restate.TerminalError && (err.code === 404 || err.code === 409)) return toolError("no-refresh-in-flight");
+      if (err instanceof restate.TerminalError && (err.code === 404 || err.code === 409)) {
+        // A gate run that stored its hold and ended in between left a hold, not nothing (AII-1493): the decision door stops it.
+        const after = await repo.status();
+        if (after?.held) {
+          try {
+            await repo.decide({ action: "cancel", actor, triggerId: after.triggerId });
+          } catch (decideErr) {
+            if (decideErr instanceof restate.TerminalError && decideErr.code === 409) return toolError("no-decision-open");
+            throw decideErr;
+          }
+          return reply({ cancelled: true });
+        }
+        return toolError("no-refresh-in-flight");
+      }
       throw err;
     }
     return reply({ cancelled: true });
