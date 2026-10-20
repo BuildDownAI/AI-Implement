@@ -1039,7 +1039,8 @@ describe("app-server trusted view (AII-1002)", () => {
       try {
         const result = await executor.invoke({ ...base, invocationTimeoutMs: 20 });
         expect(result.failure?.code).toBe("INVOCATION_TIMEOUT");
-        if (root !== "") expect(existsSync(root)).toBe(false);
+        expect(root).not.toBe("");
+        expect(existsSync(root)).toBe(false);
         expect(viewDirs()).toEqual([]);
       } finally {
         cleanup(skills);

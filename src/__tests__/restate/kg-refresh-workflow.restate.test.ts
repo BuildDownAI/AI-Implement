@@ -4452,10 +4452,9 @@ describe("KgRefresh durable workflow", () => {
       expect(await kgRepoStatus(env.baseUrl())).toBeNull();
     }, 60_000);
 
-    it.each(LABELS)("a resumed run killed inside its first step reopens the hold; the row never stays awaiting_decision, and a cancel then closes the row once and the PR (%s)", async (label) => {
+    it.each(LABELS)("a resumed cancel run killed while parked in the close-PR stub has consumed the hold: it stays cleared, the PR is closed once and the row never reopens (%s)", async (label) => {
       const env = heldEnvs.get(label)!;
       const beforeClose = closePullRequestFn.mock.calls.length;
-      const timersBefore = await scheduledDecides(env);
       const triggerId = await holdRun(env);
       expect(rowState.get(triggerId)).toEqual({ status: "completed", conclusion: "awaiting_decision" });
       const park = gate("resumed close of the held PR");
@@ -4468,23 +4467,16 @@ describe("KgRefresh durable workflow", () => {
       expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId: resumed, held: null });
       await expect(decideRepo(env, { action: "cancel", triggerId })).rejects.toThrow(/409.*no-decision-open/);
       expect(rowState.get(triggerId)).toEqual({ status: "running", conclusion: "resumed" });
+      expect((await callWorkflow(env.baseUrl(), "KgRefresh", resumed, "status", {}) as { holdConsumed: boolean }).holdConsumed).toBe(true);
 
       await killRun(env, resumed);
       park.release();
       await attachInvocation(env.baseUrl(), watchId);
       await afterReleases(env, sentBy(watchId));
-      expect(await kgRepoStatus(env.baseUrl())).toMatchObject({ triggerId, held: { snapshotPr: 77 } });
-      // The held row is not awaiting a decision any more; the hold is the open record, with a timer armed again.
-      expect(rowState.get(triggerId)).toEqual({ status: "running", conclusion: "resumed" });
-      expect((await scheduledDecides(env)) - timersBefore).toBe(2);
-
-      const second = await decideAndAttach(env, triggerId, { action: "cancel" });
-      expect(second.resumed).not.toBe(resumed);
-      expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(2);
-      expect(closeRowsFor(triggerId).map((r) => r.conclusion)).toEqual(["awaiting_decision", "operator_cancelled"]);
-      await afterReleases(env, sentByRun(second.resumed));
-      expect(await runReleases(env, second.resumed)).toBe(1);
+      // Cleared, not reopened: Accept is never offered on the closed PR.
       expect(await kgRepoStatus(env.baseUrl())).toBeNull();
+      expect(closePullRequestFn.mock.calls.length - beforeClose).toBe(1);
+      expect(rowState.get(triggerId)).toEqual({ status: "running", conclusion: "resumed" });
     }, 60_000);
 
     it.each(LABELS)("a resumed accept run killed after its commit point clears the hold and reopens nothing: one merge call, the row stays running (%s)", async (label) => {
@@ -4507,6 +4499,18 @@ describe("KgRefresh durable workflow", () => {
       expect(rowState.get(triggerId)).toEqual({ status: "running", conclusion: "resumed" });
       // The hold's own timer is all there is: nothing was re-armed.
       expect((await scheduledDecides(env)) - timersBefore).toBe(1);
+    }, 60_000);
+
+    it.each(LABELS)("status of a resumed accept run parked at its merge reports committed from the cancel promise (%s)", async (label) => {
+      const env = heldEnvs.get(label)!;
+      const triggerId = await holdRun(env);
+      const park = gate("resumed merge for status");
+      mergePullRequestFn.mockImplementationOnce(async () => { await park.wait(); return "merged"; });
+      const resumed = (await decideRepo(env, { ...ACCEPT, triggerId }))!.triggerId;
+      await park.reached();
+      expect((await callWorkflow(env.baseUrl(), "KgRefresh", resumed, "status", {}) as { committed: boolean }).committed).toBe(true);
+      park.release();
+      await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", resumed);
     }, 60_000);
 
     it.each(LABELS)("a decision made while the gate run is parked at its row write closes the row; the released write leaves the final row unchanged (%s)", async (label) => {

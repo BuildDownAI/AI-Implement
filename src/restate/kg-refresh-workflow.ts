@@ -242,6 +242,8 @@ export interface KgRefreshStatusResult {
   sources: SourceResult[];
   /** True once the run passed its commit point (the merge started); `KgRepo.watch` never reopens a hold for such a run. */
   committed: boolean;
+  /** True once a resumed run started closing the held PR; `KgRepo.watch` never reopens a hold for such a run. */
+  holdConsumed: boolean;
 }
 
 export interface KgDispatchResult {
@@ -554,6 +556,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       if (!heldPr) return;
       const { number, branch } = heldPr;
       heldPr = undefined;
+      // A resumed run that starts the close has consumed the hold: a kill must not reopen it for an Accept on a closed PR.
+      if (resume) ctx.set("holdConsumed", true);
       try {
         await ctx.run("close-snapshot-pr", () => closeSnapshotPr(deps.rail, owner, repoName, number, gate, branch), { maxRetryAttempts: 3 });
       } catch (err) {
@@ -1313,7 +1317,7 @@ function toStepRecord(step: Step): KgRefreshStepRecord {
 }
 
   async function status(ctx: WorkflowSharedContext): Promise<KgRefreshStatusResult> {
-    const [step, startedAt, triggerId, runId, dryRun, sources, committed] = await Promise.all([
+    const [step, startedAt, triggerId, runId, dryRun, sources, committed, holdConsumed, cancelPromise] = await Promise.all([
       ctx.get<string>("step"),
       ctx.get<number>("startedAt"),
       ctx.get<string>("triggerId"),
@@ -1321,6 +1325,9 @@ function toStepRecord(step: Step): KgRefreshStepRecord {
       ctx.get<boolean>("dryRun"),
       ctx.get<SourceResult[]>("sources"),
       ctx.get<boolean>("committed"),
+      ctx.get<boolean>("holdConsumed"),
+      // peek, never get: `status` is a shared handler and must not block.
+      ctx.promise<string>("cancel").peek(),
     ]);
     let runnerStep: KgRefreshStatusResult["runnerStep"] = null;
     for (const id of KG_REFRESH_RUNNER_STEPS) {
@@ -1332,7 +1339,7 @@ function toStepRecord(step: Step): KgRefreshStepRecord {
       const running = await ctx.promise<Step>(`step:${id}:running`).peek();
       if (running !== undefined) runnerStep = { id, status: running.status };
     }
-    return { step: step ?? null, startedAt: startedAt ?? null, triggerId: triggerId ?? null, runId: runId ?? null, dryRun: dryRun === true, runnerStep, decisions: [], held: null, sources: sources ?? [], committed: committed === true };
+    return { step: step ?? null, startedAt: startedAt ?? null, triggerId: triggerId ?? null, runId: runId ?? null, dryRun: dryRun === true, runnerStep, decisions: [], held: null, sources: sources ?? [], committed: committed === true || cancelPromise === KG_REFRESH_COMMITTED, holdConsumed: holdConsumed === true };
   }
 
   return restate.workflow({

@@ -6,9 +6,10 @@
  * second `trigger` while that marker is fresh is told a refresh is already in progress.
  *
  * Modeled on `Operator` (`src/restate/operator-object.ts:229`): only journaled context
- * calls, no `ctx.run` — there is no I/O here, only a durable marker. `KgRepo → KgRefresh`
- * and `KgRefresh → KgRepo` are both one-way sends, so no exclusive-handler cycle exists
- * between this object and the workflow it starts.
+ * calls, no `ctx.run` — there is no I/O here, only a durable marker. `KgRepo` calls the
+ * workflow only by one-way sends and the shared `KgRefresh.status` read (from `watch`); the workflow
+ * calls `KgRepo.hold` and `KgRepo.status` (from the gate). All of those are shared reads or sends, so no
+ * exclusive-handler cycle (deadlock) exists between this object and the workflow it starts.
  *
  * There is no lease clock (AII-1297): the `KgRefresh.run` invocation holds the lock for its whole
  * life. `submit` stores that invocation's id in the marker and sends the shared `watch`, which
@@ -305,11 +306,12 @@ export function createKgRepo(deps: KgRepoDependencies) {
       ended = "killed";
     }
     if (ended === "killed") {
-      // A run past its commit point may already have merged the snapshot PR: it counts as returned, so its hold is
-      // cleared and never reopened for a second merge (AII-1493). Any failed read errs the same safe way.
+      // A run past its commit point may already have merged the snapshot PR, and a resumed run that started closing it
+      // has consumed the hold: both count as returned, so the hold is cleared and never reopened (AII-1493, AII-1496).
+      // Any failed read errs the same safe way.
       try {
         const wf = await ctx.workflowClient<KgRefreshDefinition>({ name: deps.workflowName as "KgRefresh" }, input.triggerId).status();
-        if (wf.committed) ended = "returned";
+        if (wf.committed || wf.holdConsumed) ended = "returned";
       } catch (err) {
         if (restate.internal.isSuspendedError(err)) throw err;
         ended = "returned";
