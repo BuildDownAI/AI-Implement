@@ -100,7 +100,7 @@ import { createReviewFixIngressClient, reviewFixResultForwardKey, reviewFixResul
 import { appendReviewFixActivityBatch, isReviewFixEvidenceTombstoned } from "./review-fix-evidence.js";
 import type { ReviewFixResultMetadataV1, ResultIntakeOutcome } from "./review-fix-contract.js";
 import { handleMcpRequest } from "./mcp.js";
-import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, KG_TOOL_CAPABILITY, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider } from "./kg-provider.js";
+import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, REQUIRED_KG_TOOL_COUNT, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider } from "./kg-provider.js";
 import type { MemoryProvider } from "./kg-provider.js";
 import { withRequestErrorBoundary } from "./http-server.js";
 import {
@@ -5429,7 +5429,7 @@ async function main(): Promise<void> {
       sidecarProbeError = health.lastError;
       console.error(`[kg] sidecar probe FAILED: ${health.lastError}`);
     } else {
-      console.error(`[kg] sidecar probe: ok (${Object.keys(KG_TOOL_CAPABILITY).length} tools)`);
+      console.error(`[kg] sidecar probe: ok (${REQUIRED_KG_TOOL_COUNT} required tools)`);
     }
   }
 

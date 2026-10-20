@@ -950,6 +950,8 @@ const KG_TOOL_DESCRIPTIONS: Record<string, string> = {
   kg_neighbors: "Returns the immediate neighbors of a graph node by IRI.",
   kg_path: "Returns a path between two graph nodes by IRI.",
   kg_provenance: "Returns the provenance (source commit/file) of a graph node by IRI.",
+  kg_repo_history:
+    "Returns a repository's commits and merged PRs. Args: repo, and optionally branch, since, until, pr, kind, limit.",
 };
 
 /**
@@ -989,6 +991,7 @@ export const kgSemanticSearch = kgTool("kg_semantic_search");
 export const kgNeighbors = kgTool("kg_neighbors");
 export const kgPath = kgTool("kg_path");
 export const kgProvenance = kgTool("kg_provenance");
+export const kgRepoHistory = kgTool("kg_repo_history");
 
 // ---- Writes (AII-713): moved verbatim off WRITE_TOOLS in src/mcp.ts. Each admin action
 // call, its args validation, and its status-to-text mapping are unchanged — only the caller
@@ -1530,6 +1533,7 @@ export const orchestratorTools = restate.service({
     kg_neighbors: kgNeighbors,
     kg_path: kgPath,
     kg_provenance: kgProvenance,
+    kg_repo_history: kgRepoHistory,
     trigger_kg_refresh: triggerKgRefreshTool,
     decide_kg_refresh: decideKgRefreshTool,
     set_runner_mode: setRunnerModeTool,

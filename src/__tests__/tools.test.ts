@@ -13,6 +13,7 @@ import {
   listProjects,
   getProjectBinding,
   kgPath,
+  kgRepoHistory,
   kgHybridSearch,
   kgStageForRunnerStep,
   kgStageForStep,
@@ -817,6 +818,17 @@ describe("migrated read handlers (AII-711)", () => {
     expect(callKgTool).toHaveBeenCalledWith("kg_hybrid_search", { query: "x", k: 3 });
     expect(result.isError).toBeUndefined();
     expect(JSON.parse(result.content[0].text)).toEqual({ degraded: true, hits: [] });
+    setKgMemoryProvider(null);
+  });
+
+  it("kgRepoHistory forwards its args to callKgTool and returns the result", async () => {
+    const args = { repo: "o/r", branch: "main", since: "2026-01-01", until: "2026-02-01", pr: 7, kind: "pr", limit: 5 };
+    const callKgTool = vi.fn(async () => ({ ok: true as const, result: { items: [] } }));
+    setKgMemoryProvider(stubProvider({}, callKgTool));
+    const result = await kgRepoHistory(fakeContext("kg_repo_history"), { caller: system, args });
+    expect(callKgTool).toHaveBeenCalledWith("kg_repo_history", args);
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual({ items: [] });
     setKgMemoryProvider(null);
   });
 
