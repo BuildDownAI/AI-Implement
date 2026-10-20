@@ -65,9 +65,10 @@ import {
   type AccountProfileProjection,
 } from "./agent-config-store.js";
 import type { AgentReadiness, AgentRunRequest } from "./agent-run-preparation.js";
-import { getCredentialStatus, type ModelCredentialDeps } from "./model-credentials.js";
+import { getCredentialStatus, MODEL_ACCOUNT_REF_PATTERN, type ModelCredentialDeps } from "./model-credentials.js";
+import { createModelProtectedSecrets, type ProtectedSecretFailure } from "./model-protected-secrets.js";
 import type { OwnershipSnapshot } from "./model-session-ownership.js";
-import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
+import { getDb, listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { listParked, unpark } from "./dispatch-breaker.js";
 import { createSession, accessCodeMatches, authenticateAdminRequest, type AdminGate, type SessionIdentity } from "./admin-session.js";
 import { getEffectiveAllowlist, getEnvAllowlist, listAccessEntries, parseAccessEntries, saveAccessEntries, type AccessRole } from "./access-entries.js";
@@ -1076,6 +1077,12 @@ export function handleAdminRequest(
     const modelAccountMatch = url.match(/^\/api\/model-accounts\/([^/]+)$/);
     if (modelAccountMatch && method === "PATCH") {
       runAsync(res, handlePatchModelAccount(req, res, decodeURIComponent(modelAccountMatch[1]), deps));
+      return true;
+    }
+    const credentialMatch = url.match(/^\/api\/model-accounts\/([^/]+)\/credential$/);
+    if (credentialMatch && (method === "PUT" || method === "DELETE")) {
+      const actor = gate.identity?.email ?? "access-code";
+      runAsync(res, handleModelAccountCredential(req, res, decodeURIComponent(credentialMatch[1]), method, actor));
       return true;
     }
     if (url === "/api/agent-defaults" && method === "GET") {
@@ -3855,8 +3862,108 @@ function handleListModelAccounts(res: http.ServerResponse, deps: AdminDeps): voi
     allowedProjectKeys: p.allowedProjectKeys,
     profileStatus: p.status,
     account: accountStatus(p, deps),
+    ...credentialView(p),
   }));
   json(res, 200, { accounts });
+}
+
+/** `credentialSet` reads the row directly (not the resolver), so an unset or rotated RUNNER_TOKEN_SECRET cannot make a stored key look unset. Never returns the reference. */
+function credentialView(p: AccountProfileProjection): { credentialSet: boolean; credentialUpdatedAt: number | null } {
+  try {
+    const ref = lookupCredentialReference(p.profileId, p.revision);
+    if (ref === null) return { credentialSet: false, credentialUpdatedAt: null };
+    const row = getDb().prepare("SELECT updated_at FROM model_protected_secrets WHERE secret_ref = ?").get(ref) as { updated_at: number } | undefined;
+    return row ? { credentialSet: true, credentialUpdatedAt: row.updated_at } : { credentialSet: false, credentialUpdatedAt: null };
+  } catch {
+    return { credentialSet: false, credentialUpdatedAt: null };
+  }
+}
+
+const CREDENTIAL_AUTH_MODES: readonly string[] = ["openai-api-key", "anthropic-api-key"];
+
+const CREDENTIAL_FAILURES: Record<ProtectedSecretFailure, string> = {
+  invalid_ref: "the reference is not a valid model-account reference",
+  invalid_value: "the value is not a valid API key",
+  key_unavailable: "RUNNER_TOKEN_SECRET is not set; the encryption key derives from it",
+  row_missing: "could not write the credential",
+  decrypt_failed: "could not write the credential",
+  write_failed: "could not write the credential",
+};
+
+async function handleModelAccountCredential(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  profileId: string,
+  method: string,
+  actor: string,
+): Promise<void> {
+  const isPut = method === "PUT";
+  let apiKey = "";
+  if (isPut) {
+    const body = await readJsonObject(req, res);
+    if (!body) return;
+    const keys = Object.keys(body);
+    if (keys.length !== 1 || keys[0] !== "apiKey" || typeof body.apiKey !== "string" || body.apiKey.trim() === "") {
+      json(res, 400, { error: 'body must be exactly { "apiKey": "<non-empty string>" }' });
+      return;
+    }
+    apiKey = body.apiKey;
+  }
+  const head = getAccountProfile(profileId);
+  if (!head) {
+    json(res, 404, { error: "account profile not found" });
+    return;
+  }
+  if (!CREDENTIAL_AUTH_MODES.includes(head.authMode)) {
+    json(res, 400, { error: "only openai-api-key and anthropic-api-key profiles take a browser credential" });
+    return;
+  }
+  const existingRef = lookupCredentialReference(profileId, head.revision);
+  const ref = existingRef ?? `model-account:${profileId}`;
+  if (!MODEL_ACCOUNT_REF_PATTERN.test(ref)) {
+    json(res, 400, { error: "this profile has no usable credential reference; set a credentialRef by hand (model-account:<lowercase-name>)" });
+    return;
+  }
+  const store = createModelProtectedSecrets({ env: process.env });
+  if (!isPut) {
+    if (!store.delete(ref).ok) {
+      json(res, 500, { error: "could not delete the credential" });
+      return;
+    }
+    console.log(`[admin] model-account credential remove actor=${actor} profile=${profileId} ref=${ref}`);
+    json(res, 200, { ref, result: "removed" });
+    return;
+  }
+  if (!process.env.RUNNER_TOKEN_SECRET) {
+    json(res, 503, { error: CREDENTIAL_FAILURES.key_unavailable });
+    return;
+  }
+  const written = store.write(ref, apiKey as never);
+  if (!written.ok) {
+    json(res, written.code === "invalid_value" ? 400 : 500, { error: CREDENTIAL_FAILURES[written.code] });
+    return;
+  }
+  if (existingRef === null) {
+    try {
+      saveAccountProfileRevision({
+        profileId,
+        identity: head.identity,
+        revision: head.revision + 1,
+        agent: head.agent as never,
+        provider: head.provider as never,
+        authMode: head.authMode as never,
+        allowedProjectKeys: head.allowedProjectKeys,
+        status: head.status as never,
+        metadata: { credentialRef: ref },
+      });
+    } catch {
+      store.delete(ref);
+      json(res, 500, { error: "could not save the profile revision" });
+      return;
+    }
+  }
+  console.log(`[admin] model-account credential set actor=${actor} profile=${profileId} ref=${ref}`);
+  json(res, 200, { ref, result: "set" });
 }
 
 const ACCOUNT_WRITE_FIELDS = ["profileId", "identity", "agent", "provider", "authMode", "allowedProjectKeys", "credentialRef", "status"] as const;
