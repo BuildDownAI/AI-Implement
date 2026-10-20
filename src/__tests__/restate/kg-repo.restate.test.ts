@@ -7,7 +7,7 @@ import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { MAX_TRACKED_PRS } from "../../kg-refresh.js";
 import { createKgRepo, type KgRepoEnqueueResult, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
-import { VARIANTS, attachInvocation, callObject, callService, cancelInvocation, eventually, killInvocation, queryInvocations, setObjectState, settle, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, attachInvocation, awaitSentInvocations, callObject, callService, cancelInvocation, eventually, killInvocation, queryInvocations, setObjectState, settle, startVariants, stopAll } from "./harness.js";
 
 const FAKE_WORKFLOW_NAME = "FakeKgRefresh";
 const MARKER_AGE_WAIT_MS = 1_500;
@@ -662,7 +662,9 @@ describe("KgRepo durable single-flight lock", () => {
     await killInvocation(env.adminAPIBaseUrl(), String(run!.id));
   };
   /** A barrier on the object's exclusive queue: a stale timeout decides nothing and returns after every handler sent before it ran. */
-  const barrier = (env: RestateEnvironment, slug: string) => decide(env.baseUrl(), slug, { action: "timeout", triggerId: "barrier" });
+  /** Waits for the `release` a `watch` sent to run: a barrier on `KgRepo` does not order a send made by another invocation. */
+  const releaseFrom = (env: RestateEnvironment, slug: string, watchId: string) =>
+    awaitSentInvocations(env.adminAPIBaseUrl(), env.baseUrl(), { service: "KgRepo", key: slug, handler: "release" }, `invoked_by_id = '${watchId}'`);
 
   it.each(VARIANTS.map(([label]) => label))(
     "K1: decide keeps the hold, decided; a returned release clears it once, and a killed one reopens it with a timer, repeatedly (%s)",
@@ -727,7 +729,7 @@ describe("KgRepo durable single-flight lock", () => {
       let watchId = await freshWatch(env, slug, known);
       await killRunOf(env, resumed);
       await attachInvocation(env.baseUrl(), watchId);
-      await barrier(env, slug);
+      await releaseFrom(env, slug, watchId);
       expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId: held, held: { snapshotPr: 7 } });
 
       known = await knownWatches(env, slug);
@@ -736,7 +738,7 @@ describe("KgRepo durable single-flight lock", () => {
       watchId = await freshWatch(env, slug, known);
       await killRunOf(env, committed);
       await attachInvocation(env.baseUrl(), watchId);
-      await barrier(env, slug);
+      await releaseFrom(env, slug, watchId);
       expect(await status(env.baseUrl(), slug)).toBeNull();
     },
   );
