@@ -1087,7 +1087,7 @@ export function recordInvocationAttribution(
 }
 
 /** Best-effort parse: a malformed or pre-migration row reads as "no failure" rather than throwing. */
-function parseFailureJson(raw: string | null): FailureRecord | null {
+export function parseFailureJson(raw: string | null): FailureRecord | null {
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw) as unknown;

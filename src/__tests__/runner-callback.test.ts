@@ -4,6 +4,8 @@ import type * as LogModule from "../log.js";
 import type * as DispatchAdmissionModule from "../dispatch-admission.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
 import type * as RunnerCallbackModule from "../runner-callback.js";
+import type * as DispatchBreakerModule from "../dispatch-breaker.js";
+import type * as JiraClientModule from "../providers/jira-client.js";
 import type * as StepLogModule from "../step-log.js";
 import type * as ReviewLedgerStoreModule from "../review-ledger-store.js";
 import type * as ReviewFixQueueModule from "../review-fix-queue.js";
@@ -70,6 +72,8 @@ let dispatchAdmission: typeof DispatchAdmissionModule;
 let runnerTokens: typeof RunnerTokensModule;
 let runnerCallback: typeof RunnerCallbackModule;
 let stepLog: typeof StepLogModule;
+let dispatchBreaker: typeof DispatchBreakerModule;
+let jiraClient: typeof JiraClientModule;
 let reviewStore: typeof ReviewLedgerStoreModule;
 let reviewFixQueue: typeof ReviewFixQueueModule;
 let commentGapfillQueue: typeof CommentGapfillQueueModule;
@@ -79,7 +83,7 @@ let reviewFixAdminFacade: typeof ReviewFixAdminFacadeModule;
 
 beforeEach(async () => {
   ({
-    dedup, log, dispatchAdmission, runnerTokens, runnerCallback, stepLog,
+    dedup, log, dispatchAdmission, runnerTokens, runnerCallback, stepLog, dispatchBreaker, jiraClient,
     reviewStore, reviewFixQueue, commentGapfillQueue, reviewFixEvidence,
     reviewFixAttemptStore, reviewFixAdminFacade,
   } = (await testDb({
@@ -90,6 +94,8 @@ beforeEach(async () => {
       runnerTokens: () => import("../runner-tokens.js"),
       runnerCallback: () => import("../runner-callback.js"),
       stepLog: () => import("../step-log.js"),
+      dispatchBreaker: () => import("../dispatch-breaker.js"),
+      jiraClient: () => import("../providers/jira-client.js"),
       reviewStore: () => import("../review-ledger-store.js"),
       reviewFixQueue: () => import("../review-fix-queue.js"),
       commentGapfillQueue: () => import("../comment-gapfill-queue.js"),
@@ -319,7 +325,39 @@ describe("handleRunnerResult — planning", () => {
     expect(fake.getPhase("i")).toBe("plan_complete");
   });
 
-  it("a markPlanComplete throw still answers 200, posts one comment naming the status write, and completes the job", async () => {
+  it("a markPlanComplete throw answers 200, fails the row, parks the issue and writes Planning Failed with Jira's text", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i", mappingTeamKey: "ENG", phase: "planning", ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS, secret: SECRET,
+    });
+    log.appendLog({
+      issueId: "i", issueIdentifier: "ENG-1", issueTitle: "Plan it", teamKey: "ENG", repo: "o/r",
+      dispatchId, executionMode: "github-actions", phase: "planning",
+    });
+    const fake = new FakeProvider({ recordCalls: true, initialIssues: [makeIssue({ id: "i" })] });
+    vi.spyOn(fake, "markPlanComplete").mockRejectedValue(
+      new jiraClient.JiraApiError(400, "Option value 'Plan Approved' is not valid", "x"),
+    );
+    const failSpy = vi.spyOn(fake, "markPlanningFailed");
+    const commentSpy = vi.spyOn(fake, "postComment");
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "planning", outcome: "success", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+    expect(res.status).toBe(200);
+    expect(commentSpy).not.toHaveBeenCalled();
+    expect(failSpy).toHaveBeenCalledTimes(1);
+    const row = log.getJobByDispatchId(dispatchId);
+    expect(row).toMatchObject({ status: "failed", conclusion: "plan_status_write_failed" });
+    expect(row?.failure?.code).toBe("PLAN_STATUS_WRITE_FAILED");
+    expect(row?.failure?.message).toContain("Option value 'Plan Approved' is not valid");
+    expect(row?.failure?.message).toContain("Unpark at /admin#runners");
+    expect(row?.failureCommentedAt).toBeTruthy();
+    expect(dispatchBreaker.isParked("i", "planning")).toBe(true);
+  });
+
+  it("still parks the issue and answers 200 when the failure write is refused too", async () => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i", mappingTeamKey: "ENG", phase: "planning", ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS, secret: SECRET,
     });
@@ -329,6 +367,7 @@ describe("handleRunnerResult — planning", () => {
     });
     const fake = new FakeProvider({ recordCalls: true, initialIssues: [makeIssue({ id: "i" })] });
     vi.spyOn(fake, "markPlanComplete").mockRejectedValue(new Error("tracker down"));
+    vi.spyOn(fake, "markPlanningFailed").mockRejectedValue(new Error("still down"));
     const res = await runnerCallback.handleRunnerResult({
       authorization: `Bearer ${token}`,
       body: { phase: "planning", outcome: "success", comments: [] },
@@ -336,9 +375,26 @@ describe("handleRunnerResult — planning", () => {
       resolveProvider: makeResolve(fake),
     });
     expect(res.status).toBe(200);
-    expect(fake.commentsFor("i")).toHaveLength(1);
-    expect(fake.commentsFor("i")[0]).toMatch(/status write failed/);
-    expect(log.getJobByDispatchId(dispatchId)).toMatchObject({ status: "completed" });
+    const row = log.getJobByDispatchId(dispatchId);
+    expect(row).toMatchObject({ status: "failed", conclusion: "plan_status_write_failed" });
+    expect(row?.failureCommentedAt ?? null).toBeNull();
+    expect(dispatchBreaker.isParked("i", "planning")).toBe(true);
+  });
+
+  describe("describeTrackerWriteError", () => {
+    it("reports Jira's status and body with whitespace collapsed", () => {
+      expect(runnerCallback.describeTrackerWriteError(new jiraClient.JiraApiError(400, "a\n  b\t c", "m"))).toBe(
+        "Jira answered 400: a b c",
+      );
+    });
+    it("caps the Jira body at 500 characters", () => {
+      const out = runnerCallback.describeTrackerWriteError(new jiraClient.JiraApiError(500, "x".repeat(2000), "m"));
+      expect(out).toBe(`Jira answered 500: ${"x".repeat(500)}`);
+    });
+    it("returns the message of a plain Error and stringifies other throws", () => {
+      expect(runnerCallback.describeTrackerWriteError(new Error("boom"))).toBe("boom");
+      expect(runnerCallback.describeTrackerWriteError("odd")).toBe("odd");
+    });
   });
 
   it("finalizes the dispatch-log job as completed on planning success", async () => {

@@ -118,7 +118,7 @@ export function clearFieldCache(): void {
 export const STATUS_VALUES = {
   READY: "Ready",
   PLANNING: "Planning",
-  /** Reserved for a future approval-gating phase; never written by Phase 2's verbs. */
+  /** Written by `markPlanComplete` when the mapping's "Auto-approve plans" is off; the Jira field needs this option. */
   AWAITING_APPROVAL: "Awaiting Approval",
   APPROVED: "Plan Approved",
   IMPLEMENTING: "Implementing",

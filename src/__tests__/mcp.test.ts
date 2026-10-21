@@ -185,8 +185,9 @@ vi.mock("../config.js", async (importOriginal) => ({
   getMappings: vi.fn(() => ({})),
 }));
 
-vi.mock("../log.js", () => ({
+vi.mock("../log.js", async (importOriginal) => ({
   getInFlightJobs: vi.fn(),
+  parseFailureJson: (await importOriginal<typeof import("../log.js")>()).parseFailureJson,
 }));
 
 vi.mock("../dedup.js", () => ({
@@ -1244,6 +1245,41 @@ describe("handleMcpRequest", () => {
       expect(data.inFlight).toBe(true);
       expect(data.inDedupWindow).toBe(true);
       expect(data.recentDispatches).toHaveLength(1);
+    });
+
+    it("get_issue_dispatch_status returns failureMessage for a failed row, null otherwise", async () => {
+      const now = Date.now();
+      const failure = {
+        category: "config", code: "PLAN_STATUS_WRITE_FAILED", stage: "planning-callback", attempt: 1,
+        retryable: false, message: "Jira answered 400: bad option", evidence: { truncated: false },
+      };
+      (dedupMock.getDb as ReturnType<typeof vi.fn>).mockReturnValue({
+        prepare: (sql: string) => {
+          if (sql.includes("dispatch_log")) {
+            const base = { dispatched_at: now, repo: "org/repo", phase: "planning", pr_url: null };
+            return {
+              all: vi.fn(() => [
+                { ...base, id: 12, status: "failed", conclusion: "plan_status_write_failed", failure_json: JSON.stringify(failure) },
+                { ...base, id: 11, status: "failed", conclusion: "x", failure_json: "{not json" },
+                { ...base, id: 10, status: "completed", conclusion: null, failure_json: null },
+              ]),
+            };
+          }
+          return { get: vi.fn(() => undefined) };
+        },
+      });
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" }, true, null, BASE_URL, "POST",
+        JSON.stringify({
+          jsonrpc: "2.0", id: 7, method: "tools/call",
+          params: { name: "get_issue_dispatch_status", arguments: { identifier: "AII-98" } },
+        }),
+      );
+      const data = JSON.parse(JSON.parse(result.body).result.content[0].text);
+      expect(data.recentDispatches.map((d: { failureMessage: string | null }) => d.failureMessage)).toEqual([
+        "Jira answered 400: bad option", null, null,
+      ]);
     });
 
     it("handles get_issue_dispatch_status for an unknown issue", async () => {

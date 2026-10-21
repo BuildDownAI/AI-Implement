@@ -22,6 +22,8 @@ import type { TicketingProvider } from "./providers/types.js";
 import { remediateFailedJob, type StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { verifyAndConsumeRunToken, verifyPreparedReviewFixToken, verifyRunToken } from "./runner-tokens.js";
 import { getMappings } from "./config.js";
+import { parkIssue } from "./dispatch-breaker.js";
+import { JiraApiError } from "./providers/jira-client.js";
 import { read as readAdmission } from "./dispatch-admission.js";
 import { getStepsByJobId, upsertStepRecord } from "./step-log.js";
 import { acceptReviewFixWebhookEvent, getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
@@ -692,6 +694,14 @@ async function handleLeaseRejectedFailure(
   }
 }
 
+/** One-line description of a refused tracker write; a Jira error carries Jira's own status and body. */
+export function describeTrackerWriteError(err: unknown): string {
+  if (err instanceof JiraApiError) {
+    return `Jira answered ${err.status}: ${err.bodyText.replace(/\s+/g, " ").trim().slice(0, 500)}`;
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
 export async function handleRunnerResult(
   input: HandleRunnerResultInput,
 ): Promise<HandleRunnerResultOutput> {
@@ -1187,20 +1197,46 @@ export async function handleRunnerResult(
     }
     // gap-analysis failure: no status transition (PR already terminal)
   } else if (input.body.phase === "planning") {
+    let planStatusFailure: string | null = null;
+    // A missing mapping defaults to auto-approve.
+    const awaitApproval = getMappings()[mappingTeamKey]?.autoApprovePlans === false;
     try {
-      // A missing mapping defaults to auto-approve.
-      const awaitApproval = getMappings()[mappingTeamKey]?.autoApprovePlans === false;
       await provider.markPlanComplete(claims.issueId, mappingTeamKey, { awaitApproval });
     } catch (err) {
       warn("markPlanComplete", err);
-      // The plan comments are recorded, so the response stays 200; tell the operator the status write failed.
+      planStatusFailure =
+        `The plan was recorded, but the tracker refused the "${awaitApproval ? "Awaiting Approval" : "Plan Approved"}" status write. ` +
+        `${describeTrackerWriteError(err)}. Fix the status field, then use Unpark at /admin#runners.`;
+    }
+    if (planStatusFailure !== null) {
+      // The plan comments are recorded, so the response stays 200. Local writes come first so the
+      // park holds even when the tracker also refuses the failure write.
+      const failedJob = getJobByDispatchId(claims.dispatchId);
+      if (failedJob) {
+        updateJobStatus(failedJob.id, "failed", "plan_status_write_failed", undefined, { skipAdmissionRelease: true });
+        updateJobFailure(failedJob.id, {
+          category: "config",
+          code: "PLAN_STATUS_WRITE_FAILED",
+          stage: "planning-callback",
+          attempt: 1,
+          retryable: false,
+          message: planStatusFailure,
+          evidence: { truncated: false },
+        });
+      }
+      parkIssue(claims.issueId, "planning", "plan_status_write_failed");
       try {
-        await provider.postComment(
-          claims.issueId,
-          "⚠️ The plan was recorded, but the plan-complete status write failed. Set the issue status by hand (`Plan Approved` to start implementation).",
-        );
-      } catch (commentErr) {
-        warn("postComment(markPlanComplete-failed)", commentErr);
+        const commented = await provider.markPlanningFailed(claims.issueId, mappingTeamKey, planStatusFailure);
+        if (failedJob && commented) markJobFailureCommented(failedJob.id);
+      } catch (err) {
+        warn("markPlanningFailed(plan-status-write)", err);
+      }
+      if (failedJob && input.checkPlanningAdmissionTermination) {
+        try {
+          await input.checkPlanningAdmissionTermination(claims.dispatchId);
+        } catch (err) {
+          warn("checkPlanningAdmissionTermination", err);
+        }
       }
     }
     // Finalize the job row immediately: the issue stays excluded from dispatch
@@ -1216,7 +1252,7 @@ export async function handleRunnerResult(
     // third round) — checkPlanningAdmissionTermination immediately below is the fast
     // confirmation path that takes its place; a still-uncertain backend falls back to
     // the stale-admission sweep.
-    const job = getJobByDispatchId(claims.dispatchId);
+    const job = planStatusFailure === null ? getJobByDispatchId(claims.dispatchId) : null;
     if (job) {
       updateJobStatus(job.id, "completed", "planning_callback", undefined, { skipAdmissionRelease: true });
       if (input.checkPlanningAdmissionTermination) {
