@@ -179,6 +179,22 @@ describe("chatgpt-import", () => {
   });
 });
 
+describe("shared import (AII-1501)", () => {
+  it("stores the same record whether the CLI or the pairing upload path imports it", async () => {
+    expect(await run(["chatgpt-import", "--profile", PROFILE])).toBe(0);
+    const viaCli = stored()!.data;
+    const pairing = await import("../chatgpt-pairing.js");
+    const result = await pairing.importChatGptRecord(PROFILE, record(), {
+      store: () => store, hostId: () => cli.orchestratorHostId(), planSequence: (id) => cli.latestPlanSequence(id, () => dedup.getDb()),
+      getProfile: deps("").getProfile, requestRefresh: requestRefresh as never, now: () => 1_000_000, operator: "model-account-cli",
+    });
+    expect(result.ok).toBe(true);
+    expect(stored()!.data).toEqual(viaCli);
+    expect(requestRefresh).toHaveBeenCalledTimes(2);
+    noLeak();
+  });
+});
+
 describe("chatgpt-status", () => {
   it("prints identity fields and no token", async () => {
     await run(["chatgpt-import", "--profile", PROFILE]);

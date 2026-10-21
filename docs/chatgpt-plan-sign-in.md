@@ -27,6 +27,8 @@ node dist/chatgpt-plan-login.js logout --record ~/.ai-implement/chatgpt-plan/cre
 | `status` | Prints email, subject, the first 10 characters of the client id, host id, scopes, and seconds left. Never a token. A signed-out record prints `signed out`. |
 | `logout` | Revokes the refresh token, then removes `accessToken`, `refreshToken`, and `idToken`. Everything else stays, including `clientId` and `extAgentHostId`. If revocation is not confirmed the tokens are still removed, and you can disconnect the app in ChatGPT settings. |
 
+`connect --orchestrator https://<host> --record <path>` runs `login`, then uploads the record with a single-use pairing code that an admin mints on Models & providers (AII-1501; see [model-account-operations.md](model-account-operations.md#2b-or-connect-with-a-pairing-code-aii-1501)). The code is read from the terminal without echo and travels only in the `Authorization` header. After a 2xx answer the laptop's `accessToken`, `refreshToken` and `idToken` are removed **without revocation**, because revoking would also kill the orchestrator's copy and a refreshed laptop copy would make the orchestrator see a reused refresh token (`reauth_required`). `clientId`, `extAgentHostId` and `host-id` are kept, so the next `login` reauthorizes the existing client; that login still sends the laptop's `host-id`, as after a manual import. A failed or unanswered upload keeps the tokens so you can retry with a new code.
+
 `login` writes nothing unless every check passes: `state`, issued client id, token exchange, ID token signature (RS256, against the JWKS from OpenAI's OpenID configuration), `iss`, `aud`, `exp`, `nonce`, the same `sub` as the saved record, and the `chatgpt.tokens.use.direct` scope.
 
 ## Where the record lives

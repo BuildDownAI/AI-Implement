@@ -8,23 +8,22 @@
  * Trust boundary: the operator shell on this machine to the protected session store. The record enters only through
  * stdin (never argv). No token reaches stdout, stderr, or an error message; failures print fixed text.
  */
-import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAccountProfile } from "./agent-config-store.js";
 import type { AccountProfileProjection } from "./agent-config-store.js";
 import { revoke } from "./chatgpt-plan-login.js";
-import { parseChatGptPlanRecord, serializeChatGptPlanRecord } from "./chatgpt-plan-token.js";
+import { HOST_ID_KEY, SafeError, importChatGptRecord, latestPlanSequence, orchestratorHostId } from "./chatgpt-pairing.js";
 import { getDb } from "./dedup.js";
 import { createModelProtectedSecrets } from "./model-protected-secrets.js";
 import type { ModelProtectedSecrets, ProtectedSecretFailure } from "./model-protected-secrets.js";
 import { MODEL_ACCOUNT_REF_PATTERN } from "./model-credentials.js";
 import { createModelSessionKeyProvider } from "./model-session-keys.js";
-import { PLAN_RECORD_OWNER_GENERATION, createModelSessionStore } from "./model-session-store.js";
+import { createModelSessionStore } from "./model-session-store.js";
 import type { ModelSessionStore } from "./model-session-store.js";
 import { readChatGptPlanState, requestChatGptPlanRefresh } from "./restate/chatgpt-plan-account.js";
 
-export const HOST_ID_KEY = "chatgpt_plan_host_id";
+export { HOST_ID_KEY, latestPlanSequence, orchestratorHostId };
 const OPERATOR = "model-account-cli";
 const USAGE =
   "usage: model-account-cli <chatgpt-import|chatgpt-status|chatgpt-logout> --profile <id>   (import reads the record JSON from stdin)\n" +
@@ -50,24 +49,7 @@ export interface CliDeps {
 }
 
 /** An error whose message is safe to print: fixed text only. */
-class CliError extends Error {}
-
-/** `INSERT OR IGNORE` then read back, so concurrent first uses agree on one id. */
-export function orchestratorHostId(db: () => ReturnType<typeof getDb> = getDb): string {
-  const conn = db();
-  conn.exec("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-  conn.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)").run(HOST_ID_KEY, `urn:uuid:${randomUUID()}`);
-  const row = conn.prepare("SELECT value FROM settings WHERE key = ?").get(HOST_ID_KEY) as { value: string } | undefined;
-  if (!row) throw new CliError("could not read the orchestrator host id");
-  return row.value;
-}
-
-export function latestPlanSequence(profileId: string, db: () => ReturnType<typeof getDb> = getDb): number | null {
-  const row = db()
-    .prepare("SELECT MAX(checkpoint_sequence) AS seq FROM model_session_generations WHERE profile_id = ? AND owner_generation = ?")
-    .get(profileId, PLAN_RECORD_OWNER_GENERATION) as { seq: number | null } | undefined;
-  return row?.seq ?? null;
-}
+class CliError extends SafeError {}
 
 function operatorStore(): ModelSessionStore {
   return createModelSessionStore({
@@ -105,33 +87,27 @@ function readStored(store: ModelSessionStore, profileId: string): { data: Record
   return { data: parseJsonObject(read.sessionData), sequence: read.stateSequence };
 }
 
+const IMPORT_FAILURES: Record<string, string> = {
+  unknown_profile: "unknown profile",
+  wrong_type: "profile is not a codex-subscription profile",
+  inactive: "profile is not active",
+  not_object: "stdin is not a JSON object",
+  stale_sequence: "the record changed during import; run the import again",
+  write_failed: "could not write the record",
+};
+
 async function chatgptImport(profileId: string, deps: CliDeps): Promise<void> {
   if (!deps.env.RUNNER_TOKEN_SECRET) throw new CliError("RUNNER_TOKEN_SECRET is not set; the session key derives from it");
   requireProfile(profileId, deps);
-  const raw = parseJsonObject(await deps.readStdin());
-  if (!raw) throw new CliError("stdin is not a JSON object");
-  const parsed = parseChatGptPlanRecord(raw);
-  if (!parsed.ok) throw new CliError(`record failed validation: ${parsed.reason}`);
-  const record = { ...parsed.value, extAgentHostId: deps.hostId() };
-  const store = deps.store();
-  // The old row may be unreadable (rotated secret, corruption); import is the recovery path, so replace it
-  // using its sequence without decrypting.
-  const written = store.writePlanRecord({
-    profileId,
-    expectedSequence: deps.planSequence(profileId),
-    sessionData: serializeChatGptPlanRecord(record),
-    operator: OPERATOR,
-  });
-  if (!written.ok) {
-    throw new CliError(written.reason === "stale_sequence" ? "the record changed during import; run the import again" : "could not write the record");
+  const result = await importChatGptRecord(profileId, parseJsonObject(await deps.readStdin()), { ...deps, readState: undefined, operator: OPERATOR });
+  if (!result.ok) {
+    throw new CliError(result.code === "invalid_record" ? `record failed validation: ${result.reason}` : IMPORT_FAILURES[result.code]);
   }
-  try {
-    await deps.requestRefresh(profileId);
-  } catch {
+  if (!result.refreshRequested) {
     deps.stdout(`profile=${profileId} chatgpt-import imported, refresh not requested`);
     throw new CliError("imported, but the refresh request failed; check the Restate ingress");
   }
-  deps.stdout(`profile=${profileId} chatgpt-import ok host=${record.extAgentHostId}`);
+  deps.stdout(`profile=${profileId} chatgpt-import ok host=${result.hostId}`);
 }
 
 async function chatgptStatus(profileId: string, deps: CliDeps): Promise<void> {
@@ -232,7 +208,7 @@ export async function main(argv: string[], deps: CliDeps = defaultDeps()): Promi
       await secretRun(ref, deps);
       return 0;
     } catch (err) {
-      deps.stderr(`ref=${ref} ${command} failed: ${err instanceof CliError ? err.message : "unexpected failure"}`);
+      deps.stderr(`ref=${ref} ${command} failed: ${err instanceof SafeError ? err.message : "unexpected failure"}`);
       return 1;
     }
   }
@@ -247,7 +223,7 @@ export async function main(argv: string[], deps: CliDeps = defaultDeps()): Promi
     await run(profileId, deps);
     return 0;
   } catch (err) {
-    deps.stderr(`profile=${profileId} ${command} failed: ${err instanceof CliError ? err.message : "unexpected failure"}`);
+    deps.stderr(`profile=${profileId} ${command} failed: ${err instanceof SafeError ? err.message : "unexpected failure"}`);
     return 1;
   }
 }

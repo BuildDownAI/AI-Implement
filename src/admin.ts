@@ -67,6 +67,9 @@ import {
 import type { AgentReadiness, AgentRunRequest } from "./agent-run-preparation.js";
 import { getCredentialStatus, MODEL_ACCOUNT_REF_PATTERN, type ModelCredentialDeps } from "./model-credentials.js";
 import { createModelProtectedSecrets, type ProtectedSecretFailure } from "./model-protected-secrets.js";
+import { mintPairingCode, readPairingStatus, PAIRING_OPERATOR } from "./chatgpt-pairing.js";
+import { createModelSessionStore } from "./model-session-store.js";
+import { createModelSessionKeyProvider } from "./model-session-keys.js";
 import type { OwnershipSnapshot } from "./model-session-ownership.js";
 import { getDb, listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { listParked, unpark } from "./dispatch-breaker.js";
@@ -565,6 +568,8 @@ export interface AdminDeps {
    * Absent only in tests that don't exercise reviewFixLifecycle="restate" enablement.
    */
   getRestateStatus?: () => RestateStatus;
+  /** Reads a profile's ChatGPT refresh state (src/restate/chatgpt-plan-account.ts). Injected for the same reason as `getRestateStatus`; absent in tests, where the status reports `unknown`. */
+  readChatGptPlanState?: (profileId: string) => Promise<{ lastOutcome: string } | null>;
   /**
    * The review-fix attempt lifecycle facade (AII-806) — attempt detail/activity reads
    * and the reconcile/adopt/cancel recovery actions. A narrow injected interface
@@ -1083,6 +1088,16 @@ export function handleAdminRequest(
     if (credentialMatch && (method === "PUT" || method === "DELETE")) {
       const actor = gate.identity?.email ?? "access-code";
       runAsync(res, handleModelAccountCredential(req, res, decodeURIComponent(credentialMatch[1]), method, actor));
+      return true;
+    }
+    const pairingMatch = url.match(/^\/api\/model-accounts\/([^/]+)\/chatgpt-pairing$/);
+    if (pairingMatch && method === "POST") {
+      handleChatGptPairingMint(req, res, decodeURIComponent(pairingMatch[1]), gate.identity?.email ?? "access-code");
+      return true;
+    }
+    const pairingStatusMatch = url.match(/^\/api\/model-accounts\/([^/]+)\/chatgpt-status$/);
+    if (pairingStatusMatch && method === "GET") {
+      runAsync(res, handleChatGptStatus(res, decodeURIComponent(pairingStatusMatch[1]), deps));
       return true;
     }
     if (url === "/api/agent-defaults" && method === "GET") {
@@ -3889,6 +3904,63 @@ const CREDENTIAL_FAILURES: Record<ProtectedSecretFailure, string> = {
   decrypt_failed: "could not write the credential",
   write_failed: "could not write the credential",
 };
+
+/** Email, seconds left and last refresh outcome for a codex-subscription profile; the admin UI shows these after pairing. */
+async function handleChatGptStatus(res: http.ServerResponse, profileId: string, deps: AdminDeps): Promise<void> {
+  const head = getAccountProfile(profileId);
+  if (!head) {
+    json(res, 404, { error: "account profile not found" });
+    return;
+  }
+  if (head.authMode !== "codex-subscription") {
+    json(res, 400, { error: "only codex-subscription profiles have a ChatGPT status" });
+    return;
+  }
+  try {
+    const status = await readPairingStatus(profileId, {
+      store: () => createModelSessionStore({
+        keys: createModelSessionKeyProvider(),
+        verifyOwner: () => false,
+        authorizeOperator: (operator) => operator === PAIRING_OPERATOR,
+        db: () => getDb(),
+      }),
+      readState: deps.readChatGptPlanState,
+      now: () => Date.now(),
+    });
+    json(res, 200, status);
+  } catch {
+    json(res, 500, { error: "could not read the status" });
+  }
+}
+
+/** Mints a single-use pairing code for the laptop helper (AII-1501). The code is in this response only; the table keeps its hash. */
+function handleChatGptPairingMint(req: http.IncomingMessage, res: http.ServerResponse, profileId: string, actor: string): void {
+  const head = getAccountProfile(profileId);
+  if (!head) {
+    json(res, 404, { error: "account profile not found" });
+    return;
+  }
+  if (head.authMode !== "codex-subscription") {
+    json(res, 400, { error: "only codex-subscription profiles take a ChatGPT pairing code" });
+    return;
+  }
+  if (head.status !== "active") {
+    json(res, 400, { error: "profile is not active" });
+    return;
+  }
+  if (!process.env.RUNNER_TOKEN_SECRET) {
+    json(res, 503, { error: "RUNNER_TOKEN_SECRET is not set; the session key derives from it" });
+    return;
+  }
+  const { code, expiresAt } = mintPairingCode(profileId, Date.now());
+  const base = (process.env.OAUTH_REDIRECT_BASE_URL || process.env.RUNNER_CALLBACK_BASE_URL || `https://${req.headers.host ?? "<host>"}`).replace(/\/+$/, "");
+  console.log(`[admin] chatgpt pairing mint actor=${actor} profile=${profileId}`);
+  json(res, 200, {
+    code,
+    expiresAt,
+    command: `node dist/chatgpt-plan-login.js connect --orchestrator ${base} --record ~/.ai-implement/chatgpt-plan.json`,
+  });
+}
 
 async function handleModelAccountCredential(
   req: http.IncomingMessage,

@@ -669,6 +669,16 @@ export function getDb(): Database.Database {
     db.exec(`
       CREATE INDEX IF NOT EXISTS idx_reaper_created_at ON reaper_actions(created_at)
     `);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS chatgpt_pairing_codes (
+        code_hash  TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        used_at    INTEGER,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_chatgpt_pairing_profile ON chatgpt_pairing_codes(profile_id, used_at)`);
   }
   return db;
 }

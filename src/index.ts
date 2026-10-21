@@ -69,7 +69,11 @@ import {
   type ManagedDispatchDecision,
 } from "./managed-dispatch-auth.js";
 import { buildProtectedFlyBootstrap } from "./fly-protection-key.js";
-import { requestChatGptPlanRefresh } from "./restate/chatgpt-plan-account.js";
+import { readChatGptPlanState, requestChatGptPlanRefresh } from "./restate/chatgpt-plan-account.js";
+import { PAIRING_OPERATOR, handlePairingUpload, latestPlanSequence, orchestratorHostId } from "./chatgpt-pairing.js";
+import { getAccountProfile } from "./agent-config-store.js";
+import { createModelSessionStore } from "./model-session-store.js";
+import { createModelSessionKeyProvider } from "./model-session-keys.js";
 import { handleTokenRequest } from "./token-vending.js";
 import { handleDependencyTokenRequest } from "./dependency-token-vending.js";
 import { handlePublicationAuthorityCheck, handlePublicationTokenRequest } from "./publication-token-vending.js";
@@ -5151,6 +5155,36 @@ function startServer(
       return;
     }
 
+    // ChatGPT plan pairing upload (AII-1501): authenticated by the single-use bearer code alone, so it sits before the admin gate.
+    if (pathname === "/api/chatgpt-pairing/upload" && req.method === "POST") {
+      handlePairingUpload(req, res, {
+        env: process.env,
+        now: () => Date.now(),
+        import: {
+          store: () => createModelSessionStore({
+            keys: createModelSessionKeyProvider(),
+            verifyOwner: () => false,
+            authorizeOperator: (operator) => operator === PAIRING_OPERATOR,
+            db: () => getDb(),
+          }),
+          hostId: () => orchestratorHostId(),
+          planSequence: (id) => latestPlanSequence(id),
+          getProfile: getAccountProfile,
+          requestRefresh: (id) => requestChatGptPlanRefresh(id),
+          readState: (id) => readChatGptPlanState(id),
+          now: () => Date.now(),
+          operator: PAIRING_OPERATOR,
+        },
+      }).catch((err) => {
+        console.error("[chatgpt-pairing] Unhandled error:", err instanceof Error ? err.name : "unknown");
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
     // Restate UI, its admin API paths and ingress (AII-1261, ADR 040): admin role only.
     if (handleRestateUiRequest(req, res, { adminConfigured: Boolean(config.adminAccessCode) || isOAuthConfigured() })) return;
 
@@ -5178,7 +5212,7 @@ function startServer(
           return { started: getPollStats().pollCount > before };
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, getRestateStatus,
+      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, getRestateStatus, readChatGptPlanState,
         retention: {
           getRestateDays: getRestateRetentionDays,
           setRestateDays: setRestateRetentionDays,

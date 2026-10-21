@@ -41,4 +41,15 @@ describe("models-and-providers page", () => {
   it("uses const/let, not var", () => {
     expect(modelsAndProvidersScript).not.toMatch(/\bvar\s+\w/);
   });
+  it("offers Connect ChatGPT plan for codex-subscription rows, holding the code in memory only", () => {
+    expect(modelsAndProvidersScript).toContain("Connect ChatGPT plan");
+    expect(modelsAndProvidersScript).toContain("/chatgpt-pairing");
+    expect(modelsAndProvidersScript).toMatch(/a\.authMode === 'codex-subscription' && a\.profileStatus === 'active' && mpCanEdit\(\)/);
+    expect(modelsAndProvidersHtml).toContain('id="mp-pairing"');
+    // The code renders as text content into its own element, never into the account rows or storage.
+    expect(modelsAndProvidersScript).toContain("let mpPairing = null");
+    expect(modelsAndProvidersScript).not.toMatch(/(localStorage|sessionStorage)/);
+    const rows = modelsAndProvidersScript.slice(modelsAndProvidersScript.indexOf("function mpRenderAccounts"), modelsAndProvidersScript.indexOf("function mpAccountError"));
+    expect(rows).not.toContain("mpPairing");
+  });
 });

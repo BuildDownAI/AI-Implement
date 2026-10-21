@@ -6379,6 +6379,69 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(store.getProjectStageConfig("APP")).toBeNull();
   });
 
+  describe("ChatGPT pairing code mint (AII-1501)", () => {
+    const SECRET_ENV = "test-runner-token-secret-1501";
+    const saved = process.env.RUNNER_TOKEN_SECRET;
+    beforeEach(() => { process.env.RUNNER_TOKEN_SECRET = SECRET_ENV; });
+    afterEach(() => {
+      if (saved === undefined) delete process.env.RUNNER_TOKEN_SECRET; else process.env.RUNNER_TOKEN_SECRET = saved;
+    });
+    const url = (id: string) => `/api/model-accounts/${id}/chatgpt-pairing`;
+    const codex = (over: Record<string, unknown> = {}) =>
+      profileBody({ profileId: "gpt-1", agent: "codex", provider: "openai", authMode: "codex-subscription", credentialRef: undefined, ...over });
+
+    it("mints once for an active codex-subscription profile and stores only the hash", async () => {
+      const t = adminTok();
+      expect((await call("/api/model-accounts", "POST", t, codex())).status).toBe(201);
+      const r = await call(url("gpt-1"), "POST", t);
+      expect(r.status).toBe(200);
+      expect(r.json.code).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      expect(r.json.command).toContain("chatgpt-plan-login.js connect --orchestrator https://");
+      expect(r.json.command).not.toContain(r.json.code);
+      const rows = dedup.getDb().prepare("SELECT * FROM chatgpt_pairing_codes").all() as { code_hash: string; profile_id: string; used_at: number | null }[];
+      expect(rows).toHaveLength(1);
+      expect(rows[0].code_hash).toMatch(/^[0-9a-f]{64}$/);
+      expect(JSON.stringify(rows)).not.toContain(r.json.code);
+      expect(rows[0].used_at).toBeNull();
+      const list = await call("/api/model-accounts", "GET", t);
+      expect(list.raw).not.toContain(r.json.code);
+      expect(list.raw).not.toContain(rows[0].code_hash);
+      // A second mint invalidates the first.
+      expect((await call(url("gpt-1"), "POST", t)).status).toBe(200);
+      const after = dedup.getDb().prepare("SELECT used_at FROM chatgpt_pairing_codes ORDER BY created_at, rowid").all() as { used_at: number | null }[];
+      expect(after.filter((x) => x.used_at === null)).toHaveLength(1);
+    });
+
+    it("refuses non-admins, unknown, wrong-type and inactive profiles", async () => {
+      const t = adminTok();
+      await call("/api/model-accounts", "POST", t, codex());
+      await call("/api/model-accounts", "POST", t, profileBody({ credentialRef: "model-account:oai-1" }));
+      accessGrants.savePageGrants(Object.keys(accessGrants.PAGE_ROUTES), "ada@eudoxus.ai");
+      expect((await call(url("gpt-1"), "POST", userTok())).status).toBe(403);
+      expect((await call(url("nope"), "POST", t)).status).toBe(404);
+      expect((await call(url("oai-1"), "POST", t)).status).toBe(400);
+      expect((await call("/api/model-accounts/gpt-1", "PATCH", t, { status: "disabled" })).status).toBe(200);
+      expect((await call(url("gpt-1"), "POST", t)).status).toBe(400);
+      expect(count("chatgpt_pairing_codes")).toBe(0);
+    });
+
+    it("serves the status route to admins only, with status fields and no tokens", async () => {
+      const t = adminTok();
+      const status = (id: string) => `/api/model-accounts/${id}/chatgpt-status`;
+      await call("/api/model-accounts", "POST", t, codex());
+      await call("/api/model-accounts", "POST", t, profileBody({ credentialRef: "model-account:oai-1" }));
+      accessGrants.savePageGrants(Object.keys(accessGrants.PAGE_ROUTES), "ada@eudoxus.ai");
+      expect((await call(status("gpt-1"), "GET", userTok())).status).toBe(403);
+      expect((await call(status("nope"), "GET", t)).status).toBe(404);
+      expect((await call(status("oai-1"), "GET", t)).status).toBe(400);
+      const r = await call(status("gpt-1"), "GET", t);
+      expect(r.status).toBe(200);
+      expect(Object.keys(r.json).sort()).toEqual(["connected", "email", "lastRefresh", "secondsLeft"]);
+      expect(r.json.connected).toBe(false);
+      expect(r.raw).not.toMatch(/accessToken|refreshToken|idToken/);
+    });
+  });
+
   describe("browser API key entry (AII-1500)", () => {
     const KEY = "sk-synthetic-sentinel-1500";
     const SECRET_ENV = "test-runner-token-secret-1500";
