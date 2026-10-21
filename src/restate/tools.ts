@@ -18,7 +18,7 @@ import { z } from "zod";
 import type { AccessRole } from "../access-entries.js";
 import { getRunnerMode, getKgMaterializeDirect, getKgExecutionMode, resolveKgBackend } from "../runner-mode.js";
 import { getMappings, resolveReviewProcessId, type RepoMapping } from "../config.js";
-import { getInFlightJobs, getRunRecordMergeVerdict, getJobById, getJobByMachineId, type Job } from "../log.js";
+import { getInFlightJobs, getRunRecordMergeVerdict, getJobById, getJobByMachineId, parseFailureJson, type Job } from "../log.js";
 import {
   getMachine, listMachines, fetchMachineLogs, readMachineExit,
   type Machine,
@@ -537,7 +537,7 @@ export const getIssueDispatchStatus = tool(
     const db = getDb();
     const recentRows = db
       .prepare(
-        "SELECT id, status, dispatched_at, repo, phase, pr_url, conclusion FROM dispatch_log WHERE issue_identifier = ? ORDER BY dispatched_at DESC LIMIT 5",
+        "SELECT id, status, dispatched_at, repo, phase, pr_url, conclusion, failure_json FROM dispatch_log WHERE issue_identifier = ? ORDER BY dispatched_at DESC LIMIT 5",
       )
       .all(identifier) as Array<{
         id: number;
@@ -547,6 +547,7 @@ export const getIssueDispatchStatus = tool(
         phase: string | null;
         pr_url: string | null;
         conclusion: string | null;
+        failure_json: string | null;
       }>;
     const dedupRow = db
       .prepare("SELECT issue_id, dispatched_at FROM dispatched WHERE issue_identifier = ?")
@@ -570,6 +571,7 @@ export const getIssueDispatchStatus = tool(
         phase: j.phase,
         prUrl: j.pr_url,
         conclusion: j.conclusion,
+        failureMessage: parseFailureJson(j.failure_json)?.message ?? null,
       })),
     };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };

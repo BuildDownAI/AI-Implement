@@ -122,6 +122,7 @@ import { preparePlanningLaunch } from "../../planning-launch.js";
 import { resolveRunnerImageForDispatch } from "../../repo-image.js";
 import { resetRestateStatus, setRestateStatus } from "../../restate/status.js";
 import { getMappings, initMappingsTable } from "../../config.js";
+import { JiraApiError } from "../../providers/jira-client.js";
 import { initDispatchBreakerTable, isParked, recordDispatchFailure } from "../../dispatch-breaker.js";
 import { acquire, read as readAdmission, releaseHeldReservation, reconcileTerminalCallbackAdmissions, sweepStaleAdmissions } from "../../dispatch-admission.js";
 import { appendLog, getJobByDispatchId, getStuckAttempts, initLogTable, updateJobStatus } from "../../log.js";
@@ -665,6 +666,50 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       expectNoDispatchRounds(w.issue.id);
       trackerStatus.set(w.issue.id, "Plan Approved");
       expect(pollDispatches(w.issue.id)).toEqual({ planning: 0, implementation: 1 });
+    }, 60_000);
+  });
+
+  describe.each([false, true])("Jira refuses the plan-complete write (Jira also refuses the failure write: %s)", (alsoRefuseFailure) => {
+    const JIRA_TEXT = "Option value 'Awaiting Approval' is not valid";
+
+    it.each(labels)("fails the run, parks the issue and breaks the planning loop (%s)", async (label) => {
+      gh.statusGate = gate("first status read");
+      const w = await dispatch(label, "PLT-JIRA-5");
+      await gh.statusGate.reached();
+      await waitForStep(w.read, "wait");
+      const refusal = new JiraApiError(400, `{"errors":{"customfield_12308":"${JIRA_TEXT}"}}`, "Jira 400");
+      const failureWrites: string[] = [];
+      const res = await handleRunnerResult({
+        authorization: `Bearer ${mintedTokens.get(w.dispatchId)!}`,
+        body: { phase: "planning", outcome: "success", comments: [{ body: "plan" }] },
+        secret: JIRA_TOKEN_SECRET,
+        resolveProvider: async () => ({
+          postComment: async () => {},
+          markPlanComplete: async () => { throw refusal; },
+          markPlanningFailed: async (id: string, _k: string, reason: string) => {
+            failureWrites.push(reason);
+            if (alsoRefuseFailure) throw refusal;
+            trackerStatus.set(id, "Planning Failed");
+            return true;
+          },
+        }) as never,
+        checkPlanningAdmissionTermination: w.hook,
+      });
+      expect(res.status).toBe(200);
+      gh.runs[0].status = "completed";
+      gh.statusGate.release();
+      await untilReleased(w.dispatchId);
+
+      const row = getJobByDispatchId(w.dispatchId);
+      expect(row).toMatchObject({ status: "failed", conclusion: "plan_status_write_failed" });
+      expect(row?.failure?.message).toContain(JIRA_TEXT);
+      expect(isParked(w.issue.id, "planning")).toBe(true);
+      expect(failureWrites).toHaveLength(1);
+      expect(failureWrites[0]).toContain(JIRA_TEXT);
+      expect(trackerStatus.get(w.issue.id)).toBe(alsoRefuseFailure ? "Ready" : "Planning Failed");
+
+      trackerStatus.set(w.issue.id, "Ready");
+      expectNoDispatchRounds(w.issue.id);
     }, 60_000);
   });
 
