@@ -104,6 +104,11 @@ vi.mock("../../restate/planning-run-workflow.js", async (importOriginal) => {
     createPlanningRunWorkflow: (deps: Parameters<typeof actual.createPlanningRunWorkflow>[0]) =>
       actual.createPlanningRunWorkflow({
         ...deps,
+        // The real finishJob, then one throw: Restate retries the finish-job / finish-job-deadline step.
+        finishJob: async (dispatchId, outcome) => {
+          await deps.finishJob(dispatchId, outcome);
+          if (outcome.kind !== "cancelled" && sim.failAfterEffect.delete("finish")) throw new Error("injected: the finish effect ran, then the step failed");
+        },
         ...sim.timing,
       }),
   };
@@ -597,6 +602,17 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     expect(sim.remediateCalls).toBe(0);
     expect(comments).toHaveLength(1);
     expectNoDispatchRounds(w.issue.id);
+  }, 60_000);
+
+  it.each(labels)("a retried finish-job step posts no second comment (%s)", async (label) => {
+    sim.failAfterEffect = new Set(["finish"]);
+    const w = await endWithNoCallback(label, "PLT-4");
+    expect(sim.failAfterEffect.size).toBe(0);
+    expect(planningFailedCalls).toHaveLength(1);
+    expect(comments).toHaveLength(1);
+    expect(isParked(w.issue.id, "planning")).toBe(true);
+    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "failed", conclusion: "ended_without_callback" });
+    expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
   }, 60_000);
 
   it.each(labels)("a no-callback run with the tracker down is still parked and released, and the outcome step posts one comment (%s)", async (label) => {
