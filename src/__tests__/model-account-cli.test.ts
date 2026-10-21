@@ -184,7 +184,7 @@ describe("shared import (AII-1501)", () => {
     expect(await run(["chatgpt-import", "--profile", PROFILE])).toBe(0);
     const viaCli = stored()!.data;
     const pairing = await import("../chatgpt-pairing.js");
-    const result = await pairing.importChatGptRecord(PROFILE, record(), {
+    const result = await pairing.importChatGptRecord(PROFILE, { ...record() }, {
       store: () => store, hostId: () => cli.orchestratorHostId(), planSequence: (id) => cli.latestPlanSequence(id, () => dedup.getDb()),
       getProfile: deps("").getProfile, requestRefresh: requestRefresh as never, now: () => 1_000_000, operator: "model-account-cli",
     });
