@@ -69,7 +69,7 @@ describe("FilesystemProvider", () => {
       "filesystem:AII:AII-1",
       "## 🗺 AI Planning: Implementation Map\n\nTouch the local harness.",
     );
-    await p1.markPlanComplete("filesystem:AII:AII-1", "AII");
+    await p1.markPlanComplete("filesystem:AII:AII-1", "AII", { awaitApproval: false });
 
     const p2 = provider(mappings);
     snap = await p2.fetchAIImplementSnapshot();
@@ -235,9 +235,9 @@ describe("FilesystemProvider", () => {
     const first = provider(mappings);
     const second = provider(mappings);
     const id = "filesystem:LOCAL:LOCAL-3";
-    await first.markPlanComplete(id, "LOCAL");
+    await first.markPlanComplete(id, "LOCAL", { awaitApproval: false });
     await second.markImplementing(id, "LOCAL");
-    await first.markPlanComplete(id, "LOCAL");
+    await first.markPlanComplete(id, "LOCAL", { awaitApproval: false });
     await first.markPlanningFailed(id, "LOCAL", "stale");
     expect((await second.fetchAIImplementSnapshot()).inProgressCountsByScope).toEqual({ LOCAL: 1 });
     await Promise.all([first.postComment(id, "first"), second.postComment(id, "second")]);
@@ -420,7 +420,7 @@ describe("FilesystemProvider", () => {
     await p.markPlanningFailed(id, "LOCAL", "manual");
     await p.archiveFailed(id, "LOCAL", "planning");
     await p.markPlanningStarted(id, "LOCAL");
-    await p.markPlanComplete(id, "LOCAL");
+    await p.markPlanComplete(id, "LOCAL", { awaitApproval: false });
     await p.markImplementing(id, "LOCAL");
     await expect(p.clearWorkingState(id, "LOCAL")).resolves.toBe(false);
     await p.postComment(id, "late comment");

@@ -38,6 +38,19 @@ Comments: the search response embeds a capped comment list with its `total`. Onl
 
 Selection (`src/poll-selection.ts`) then matches each issue to a mapping by `scopeKey`.
 
+## Tracker state after each planning outcome
+
+| Outcome | Jira | Linear |
+|---|---|---|
+| Plan succeeded, "Auto-approve plans" on | `Plan Approved` (implementation starts on the next poll) | `AI-Planning` removed, `Plan-Complete` added |
+| Plan succeeded, "Auto-approve plans" off | `Awaiting Approval`; a person sets `Plan Approved` | Same as above: the option is ignored (approval is AII-131) |
+| Callback reported a failure | `Planning Failed` plus a comment | Planning-failed handling, comment |
+| No callback, or deadline | `Planning Failed` plus one comment; issue parked, not requeued | Label kept; issue parked, one comment; Unpark to retry |
+| Plan recorded but status write failed | Status unchanged; one comment asks the operator to set it | Same |
+| Operator cancel | Working state cleared | Working state cleared |
+
+The filesystem provider ignores `awaitApproval` as well. A parked issue needs **Unpark** at `/admin#runners` before it dispatches again.
+
 ## Mapping keys
 
 Mapping keys share one namespace across providers. A Linear mapping's key must equal the Linear team key. A Jira mapping's key is an operator-chosen label.

@@ -247,9 +247,16 @@ describe("JiraProvider lifecycle status setters", () => {
   it("markPlanComplete sets status to Plan Approved (single-mapping shortcut)", async () => {
     const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Implementing"), [STATUS_WRITE]: written }).install();
     const p = makeProvider({ cacheScope: "c2", mappings: { "acme/x": jiraMapping() } });
-    await p.markPlanComplete("10001", "acme/x");
+    await p.markPlanComplete("10001", "acme/x", { awaitApproval: false });
     expect(methods(fake)).toEqual(["GET", "GET", "PUT"]);
     expectStatusBody(fake, "Plan Approved");
+  });
+
+  it("markPlanComplete with awaitApproval writes Awaiting Approval", async () => {
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Planning"), [STATUS_WRITE]: written }).install();
+    const p = makeProvider({ cacheScope: "c2a", mappings: { "acme/x": jiraMapping() } });
+    await p.markPlanComplete("10001", "acme/x", { awaitApproval: true });
+    expectStatusBody(fake, "Awaiting Approval");
   });
 
   it("markPlanningFailed sets Planning Failed and posts a comment", async () => {
@@ -404,7 +411,7 @@ describe("JiraProvider lifecycle status setters", () => {
         "acme/y": jiraMapping({ repoFieldValue: "acme/y" }),
       },
     });
-    await p.markPlanComplete("10001", "acme/y");
+    await p.markPlanComplete("10001", "acme/y", { awaitApproval: false });
     expect(methods(fake)).toEqual(["GET", "GET", "PUT"]);
     // The guard pre-read asks for the status field only — no repo-field read-back.
     expect(fake.calls[1].url.searchParams.get("fields")).toBe("customfield_10100");
@@ -425,7 +432,7 @@ describe("JiraProvider lifecycle status setters", () => {
         "acme/y": jiraMapping({ repoFieldValue: "acme/y" }),
       },
     });
-    await p.markPlanComplete("10001", "acme/x");
+    await p.markPlanComplete("10001", "acme/x", { awaitApproval: false });
     expectStatusBody(fake, "Plan Approved");
   });
 });

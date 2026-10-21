@@ -26,7 +26,7 @@ const sim = vi.hoisted(() => ({
   remediateCalls: 0,
   /** Completion notices the simulated webhook received. */
   notices: [] as unknown[],
-  /** Effects (`finish`, `outcome`) that run, then throw once: a retry must not count twice. */
+  /** Effects (`outcome`) that run, then throw once: a retry must not count twice. */
   failAfterEffect: new Set<string>(),
   /** The intervals the next composed workflow uses. */
   timing: {} as Record<string, number>,
@@ -86,7 +86,6 @@ vi.mock("../../stuck-watchdog.js", async (importOriginal) => {
     remediateFailedJob: async (...args: Parameters<typeof actual.remediateFailedJob>) => {
       sim.remediateCalls++;
       await actual.remediateFailedJob(...args);
-      if (sim.failAfterEffect.delete("finish")) throw new Error("injected: the handling ran, then the step failed");
     },
   };
 });
@@ -111,13 +110,14 @@ vi.mock("../../restate/planning-run-workflow.js", async (importOriginal) => {
 });
 
 import { getDb } from "../../dedup.js";
-import { acquireDispatch } from "../../dispatch-gate.js";
+import { acquireDispatch, canDispatch } from "../../dispatch-gate.js";
+import { selectIssuesToDispatch } from "../../poll-selection.js";
 import { dispatchPlanning, dispatchSession, reportTerminalJob } from "../../index.js";
 import { preparePlanningLaunch } from "../../planning-launch.js";
 import { resolveRunnerImageForDispatch } from "../../repo-image.js";
 import { resetRestateStatus, setRestateStatus } from "../../restate/status.js";
-import { initMappingsTable } from "../../config.js";
-import { initDispatchBreakerTable, recordDispatchFailure } from "../../dispatch-breaker.js";
+import { getMappings, initMappingsTable } from "../../config.js";
+import { initDispatchBreakerTable, isParked, recordDispatchFailure } from "../../dispatch-breaker.js";
 import { acquire, read as readAdmission, releaseHeldReservation, reconcileTerminalCallbackAdmissions, sweepStaleAdmissions } from "../../dispatch-admission.js";
 import { appendLog, getJobByDispatchId, getStuckAttempts, initLogTable, updateJobStatus } from "../../log.js";
 import { planningSessionName } from "../../planning-launch.js";
@@ -223,6 +223,11 @@ let launchGate: Gate | undefined;
 /** Parks the `reserve` step after it took the reservation. */
 let reserveGate: Gate | undefined;
 const clearedIssues: string[] = [];
+/** Tracker status by issue id, as a Jira-style tracker holds it; the poll decision buckets on it. */
+const trackerStatus = new Map<string, string>();
+const planningFailedCalls: Array<{ issueId: string; reason: string }> = [];
+const planCompleteCalls: Array<{ issueId: string; opts: { awaitApproval: boolean } }> = [];
+let failPlanningFailed = false;
 const comments: string[] = [];
 /** Run tokens the simulated launch minted, by dispatch id (the real launch mints them in `buildPlanningLaunch`). */
 const mintedTokens = new Map<string, string>();
@@ -273,7 +278,17 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
         return found && key.startsWith("PLT-JIRA") ? { ...found, scopeKey: "" } : found ?? null;
       },
       clearWorkingState: async (issueId: string) => { clearedIssues.push(issueId); return true; },
-      markPlanComplete: async () => {},
+      markPlanComplete: async (issueId: string, _scopeKey: string, opts: { awaitApproval: boolean }) => {
+        planCompleteCalls.push({ issueId, opts });
+        trackerStatus.set(issueId, opts.awaitApproval ? "Awaiting Approval" : "Plan Approved");
+      },
+      markPlanningFailed: async (issueId: string, _scopeKey: string, reason: string) => {
+        planningFailedCalls.push({ issueId, reason });
+        if (failPlanningFailed) throw new Error("injected: tracker down");
+        trackerStatus.set(issueId, "Planning Failed");
+        comments.push(`Planning failed: ${reason}`);
+        return true;
+      },
       issueUrl: (issue: { identifier: string }) => `https://tracker.test/${issue.identifier}`,
       postComment: async (_issueId: string, body: string) => { comments.push(body); },
     };
@@ -356,6 +371,10 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     backends.reset();
     launches.length = 0;
     clearedIssues.length = 0;
+    trackerStatus.clear();
+    planningFailedCalls.length = 0;
+    planCompleteCalls.length = 0;
+    failPlanningFailed = false;
     comments.length = 0;
     sim.notices = [];
     sim.failAfterEffect = new Set();
@@ -382,6 +401,7 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     const dispatchId = `plan-${label}-${counter++}`;
     const issue = { id: `id-${dispatchId}`, identifier, title: `Issue ${identifier}`, scopeKey: TEAM, nativeStatus: "Todo" };
     issues.set(identifier, issue);
+    trackerStatus.set(issue.id, "Ready");
     const url = baseUrl(label, envs);
     const client = createPlanningRunIngressClient(url);
     const input: PlanningRunInput = {
@@ -401,6 +421,31 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
   const released = (dispatchId: string) => readAdmission(dispatchId)?.releasedAt != null;
   async function untilReleased(dispatchId: string): Promise<void> {
     await eventually(() => released(dispatchId), (ok) => ok, { label: `reservation ${dispatchId} released`, timeoutMs: 20_000 });
+  }
+
+  /** One poll decision as `poll()` makes it: bucket the issues by tracker status like `fetchAIImplementSnapshot`
+   *  (`Ready` plans, `Plan Approved` implements), then select with the real gate. */
+  function pollDispatches(issueId: string): { planning: number; implementation: number } {
+    const status = trackerStatus.get(issueId);
+    const issue = [...issues.values()].find((i) => i.id === issueId)!;
+    const needsPlanning = status === "Ready" ? [issue] : [];
+    const readyForImplementation = status === "Plan Approved" ? [issue] : [];
+    const planningIds = new Set(needsPlanning.map((i) => i.id));
+    const mappings = getMappings();
+    const selected = selectIssuesToDispatch(
+      [...readyForImplementation, ...needsPlanning] as never, mappings, {},
+      (id) => !canDispatch({
+        issueId: id, kind: planningIds.has(id) ? "planning" : "implementation", teamKey: TEAM,
+        maxInProgressAiIssues: mappings[TEAM].maxInProgressAiIssues,
+      }).ok,
+    );
+    return {
+      planning: selected.filter((i) => planningIds.has(i.id)).length,
+      implementation: selected.filter((i) => !planningIds.has(i.id)).length,
+    };
+  }
+  function expectNoDispatchRounds(issueId: string): void {
+    for (let i = 0; i < 5; i++) expect(pollDispatches(issueId)).toEqual({ planning: 0, implementation: 0 });
   }
 
   it.each(labels)("a callback-closed run releases the reservation and leaves the closed row alone (%s)", async (label) => {
@@ -508,38 +553,104 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "deadline_exceeded" });
     expect(breakerFailures(w.issue.id)).toBe(1);
     expect(comments).toHaveLength(1);
+    expect(planningFailedCalls).toHaveLength(1);
+    expect(planningFailedCalls[0].reason).toMatch(/deadline[\s\S]*Unpark[\s\S]*\/admin#runners/);
+    expect(isParked(w.issue.id, "planning")).toBe(true);
+    expect(clearedIssues).toEqual([]);
+    expectNoDispatchRounds(w.issue.id);
     expect(sim.notices).toHaveLength(1);
     expect(sim.notices[0]).toMatchObject({ status: "timed_out", phase: "planning", issueIdentifier: "PLT-21" });
     expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "timed_out", notifiedAt: expect.any(Number) });
   }, 60_000);
 
-  it.each(labels)("a retried outcome step counts one breaker failure and one stuck attempt (%s)", async (label) => {
-    // The first attempt of `finish-job-deadline` and of `outcome` run the real effect and then throw.
-    sim.failAfterEffect = new Set(["finish", "outcome"]);
+  it.each(labels)("a retried outcome step counts one breaker failure and the failure handling adds no stuck attempt (%s)", async (label) => {
+    // The first attempt of `outcome` runs the real effect and then throw.
+    sim.failAfterEffect = new Set(["outcome"]);
     const w = await dispatch(label, "PLT-22", "github-actions", deadlineEnvironments);
     await untilReleased(w.dispatchId);
     expect(breakerFailures(w.issue.id)).toBe(1);
-    expect(getStuckAttempts(w.issue.id)).toBe(1);
+    expect(getStuckAttempts(w.issue.id)).toBe(0);
     expect(sim.notices).toHaveLength(1);
     expect(sim.failAfterEffect.size).toBe(0);
   }, 60_000);
 
-  it.each(labels)("a run that ends with no callback closes the row as failed and handles the failure one time (%s)", async (label) => {
+  async function endWithNoCallback(label: string, identifier: string) {
     gh.statusGate = gate("first status read");
-    const w = await dispatch(label, "PLT-2");
+    const w = await dispatch(label, identifier);
     await gh.statusGate.reached();
     await waitForStep(w.read, "wait");
     expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "running" }); // in flight, bound to its run
-
     gh.runs[0].status = "completed";
     gh.statusGate.release();
     await untilReleased(w.dispatchId);
+    return w;
+  }
 
-    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "failed" });
+  it.each(labels)("a run that ends with no callback is failed and parked, with one failure comment and no requeue (%s)", async (label) => {
+    const w = await endWithNoCallback(label, "PLT-2");
+    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "failed", conclusion: "ended_without_callback" });
     expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
-    expect(sim.remediateCalls).toBe(1);
-    expect(clearedIssues).toEqual([w.issue.id]);
+    expect(planningFailedCalls).toHaveLength(1);
+    expect(planningFailedCalls[0].reason).toMatch(/no planning result[\s\S]*Unpark[\s\S]*\/admin#runners[\s\S]*Ready/);
+    expect(isParked(w.issue.id, "planning")).toBe(true);
+    expect(clearedIssues).toEqual([]);
+    expect(sim.remediateCalls).toBe(0);
+    expect(comments).toHaveLength(1);
+    expectNoDispatchRounds(w.issue.id);
   }, 60_000);
+
+  it.each(labels)("a no-callback run with the tracker down is still parked and released, and the outcome step posts one comment (%s)", async (label) => {
+    failPlanningFailed = true;
+    const w = await endWithNoCallback(label, "PLT-3");
+    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "failed", conclusion: "ended_without_callback", failureCommentedAt: null });
+    expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
+    expect(isParked(w.issue.id, "planning")).toBe(true);
+    expect(clearedIssues).toEqual([]);
+    expect(comments).toHaveLength(1);
+    // The status write failed, so the tracker still says Ready: only the park holds the loop.
+    expect(trackerStatus.get(w.issue.id)).toBe("Ready");
+    expectNoDispatchRounds(w.issue.id);
+  }, 60_000);
+
+  describe.each([false, true])("a successful plan (autoApprovePlans %s)", (autoApprove) => {
+    afterEach(() => {
+      getDb().prepare("UPDATE mappings SET auto_approve_plans = 1 WHERE team_key = ?").run(TEAM);
+    });
+
+    it.each(labels)(autoApprove ? "starts implementation at once (%s)" : "waits for a person before implementation (%s)", async (label) => {
+      getDb().prepare("UPDATE mappings SET auto_approve_plans = ? WHERE team_key = ?").run(autoApprove ? 1 : 0, TEAM);
+      gh.statusGate = gate("first status read");
+      const w = await dispatch(label, "PLT-JIRA-4");
+      await gh.statusGate.reached();
+      await waitForStep(w.read, "wait");
+      const res = await handleRunnerResult({
+        authorization: `Bearer ${mintedTokens.get(w.dispatchId)!}`,
+        body: { phase: "planning", outcome: "success", comments: [{ body: "plan" }] },
+        secret: JIRA_TOKEN_SECRET,
+        resolveProvider: async () => ({ postComment: async () => {}, markPlanComplete: async (id: string, _k: string, opts: { awaitApproval: boolean }) => {
+          planCompleteCalls.push({ issueId: id, opts });
+          trackerStatus.set(id, opts.awaitApproval ? "Awaiting Approval" : "Plan Approved");
+        } }) as never,
+        checkPlanningAdmissionTermination: w.hook,
+      });
+      expect(res.status).toBe(200);
+      gh.runs[0].status = "completed";
+      gh.statusGate.release();
+      await untilReleased(w.dispatchId);
+
+      expect(planCompleteCalls).toEqual([{ issueId: w.issue.id, opts: { awaitApproval: !autoApprove } }]);
+      expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "completed", conclusion: "planning_callback" });
+      expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
+      if (autoApprove) {
+        expect(pollDispatches(w.issue.id)).toEqual({ planning: 0, implementation: 1 });
+        return;
+      }
+      expect(trackerStatus.get(w.issue.id)).toBe("Awaiting Approval");
+      expectNoDispatchRounds(w.issue.id);
+      trackerStatus.set(w.issue.id, "Plan Approved");
+      expect(pollDispatches(w.issue.id)).toEqual({ planning: 0, implementation: 1 });
+    }, 60_000);
+  });
 
   it.each(labels)("two dispatches seconds apart bind their own runs by title and release their own reservations (%s)", async (label) => {
     launchAckLost = true;

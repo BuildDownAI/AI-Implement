@@ -145,7 +145,7 @@ export class FilesystemProvider implements TicketingProvider {
     ), { activeOnly: true });
   }
 
-  async markPlanComplete(issueId: string, scopeKey: string): Promise<void> {
+  async markPlanComplete(issueId: string, scopeKey: string, _opts: { awaitApproval: boolean }): Promise<void> {
     await this.updateTask(issueId, scopeKey, (state) => (
       isCallbackTerminal(state.status) || state.status === "implementing"
         ? null : { ...state, status: "plan-approved" }

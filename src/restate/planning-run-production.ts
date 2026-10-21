@@ -13,11 +13,12 @@ import { getRunnerMode } from "../runner-mode.js";
 import type { TicketIssue, TicketingProvider } from "../providers/types.js";
 import { defaultFetchSignal, cancelWorkflowRun, getWorkflowRunStatus } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
-import { findLogIdByDispatchId, getJobByDispatchId, getStuckAttemptStampedAt, updateJobRunId, updateJobStatus, type Job } from "../log.js";
+import { findLogIdByDispatchId, getJobByDispatchId, markJobFailureCommented, updateJobRunId, updateJobStatus, type Job } from "../log.js";
 import { planningSessionName, type launchPlanningRun, type launchPlanningSession, type preparePlanningLaunch } from "../planning-launch.js";
 import { listMachines } from "../fly-machines.js";
 import { findLocalContainerIdByName, removeLocalContainer } from "../local-docker.js";
-import { remediateFailedJob, type StuckWatchdogConfig } from "../stuck-watchdog.js";
+import { parkIssue } from "../dispatch-breaker.js";
+import { buildRunUrl } from "../completion-classification.js";
 import type { RestateService } from "./endpoint.js";
 import type { OwnedRunStatus } from "./owned-run-wait.js";
 import {
@@ -121,12 +122,6 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
   const { config } = input;
   const getMapping = input.getMapping ?? ((teamKey: string) => getMappings()[teamKey]);
   const getToken = (owner: string) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
-  const watchdogConfig: StuckWatchdogConfig = {
-    githubAppId: config.githubAppId,
-    githubAppPrivateKey: config.githubAppPrivateKey,
-    notifyType: config.notifyType,
-    notifyWebhookUrl: config.notifyWebhookUrl,
-  };
 
   /** The run's mapping key is the source of truth: a provider's `findByKey` may return an empty `scopeKey` (Jira). */
   function withRunScope(issue: TicketIssue, run: PlanningRunInput): TicketIssue {
@@ -242,13 +237,27 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
     // means an earlier attempt closed it and then threw before the handling finished, so the retry runs it again.
     const closedByThisStep = job.conclusion === "deadline_exceeded" || job.conclusion === "ended_without_callback";
     if (TERMINAL_JOB_STATUSES.has(job.status) && !closedByThisStep) return;
-    // The handling counts one stuck attempt, and it is the first thing it does: an attempt stamped since this
-    // dispatch began means an earlier attempt of this step already ran it, so a retry must not count a second one.
-    if (closedByThisStep && job.issueId && (getStuckAttemptStampedAt(job.issueId) ?? 0) >= job.dispatchedAt) return;
+    // Local writes first (they cannot fail on the network): close the row, then park. From here no poll dispatches
+    // planning for the issue on any tracker, even if every tracker write below fails. Both are idempotent.
     if (!TERMINAL_JOB_STATUSES.has(job.status)) updateJobStatus(job.id, status, conclusion);
+    if (job.issueId) parkIssue(job.issueId, "planning", conclusion);
+    // A comment already recorded by an earlier attempt means the tracker write is done.
+    if (job.failureCommentedAt) return;
     const mapping = job.teamKey ? getMapping(job.teamKey) : undefined;
-    const provider = mapping ? await input.resolveProvider(mapping) : null;
-    await remediateFailedJob(watchdogConfig, provider, { ...job, status, conclusion }, conclusion, { ownerCall: true });
+    if (!mapping || !job.issueId) return;
+    const cause = outcome.kind === "deadline" ? "the run deadline passed before a planning result arrived" : "the run ended with no planning result";
+    const runUrl = buildRunUrl(job);
+    const reason =
+      `${cause}${runUrl ? ` (run: ${runUrl})` : ""}. The issue is parked and will not be retried by itself. ` +
+      "Next: press Unpark at /admin#runners, then set the status to `Ready` (Jira) or keep the AI-Implement label (Linear).";
+    try {
+      const provider = await input.resolveProvider(mapping);
+      const commented = await provider.markPlanningFailed(job.issueId, job.teamKey ?? "", reason);
+      if (commented) markJobFailureCommented(job.id);
+    } catch (err) {
+      // Visibility only: the issue is parked and the release must not wait on the tracker. The outcome step comments.
+      console.error(`[planning-run] markPlanningFailed failed dispatch=${dispatchId}:`, err);
+    }
   }
 
   async function cleanup(run: PlanningRunInput, jobId: string): Promise<void> {
