@@ -224,6 +224,17 @@ describe("GHA workflow shims", () => {
         expect(ref).toMatch(/@[0-9a-f]{40}$/);
       }
     });
+
+    // Dependabot reads the trailing version comment to know which release a SHA pin is; without it the
+    // synced template looks outdated in every target repo and Dependabot keeps reopening bump PRs there.
+    it(`${f} labels every pinned action with its release version`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      const usesLines = [...yaml.matchAll(/^\s*uses:\s*\S+@[0-9a-f]{40}.*$/gm)].map((m) => m[0].trim());
+      expect(usesLines.length).toBeGreaterThan(0);
+      for (const line of usesLines) {
+        expect(line).toMatch(/@[0-9a-f]{40} # v\d+\.\d+\.\d+$/);
+      }
+    });
   }
 
   for (const f of SYNCED_WORKFLOW_FILES) {
