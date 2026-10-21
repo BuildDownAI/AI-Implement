@@ -65,6 +65,9 @@ function sign(payload: string, secret: string): string {
 }
 
 export function mintRunToken(input: MintInput): MintOutput {
+  if (!input.mappingTeamKey?.trim()) {
+    throw new Error("Run tokens require a non-empty mapping key");
+  }
   const dispatchId = input.dispatchId ?? crypto.randomUUID();
   const audience = input.audience ?? "result";
   const repository = input.repository?.trim();
@@ -110,6 +113,9 @@ export interface LaunchTokens {
 /** Mints every token LAUNCH_TOKEN_AUDIENCES names for `phase`, after it deletes the unconsumed
  *  rows of `dispatchId`, so a retried launch step can mint again. */
 export function mintLaunchTokens(input: Omit<MintInput, "audience"> & { repository: string }): LaunchTokens {
+  if (!input.mappingTeamKey?.trim()) {
+    throw new Error("Run tokens require a non-empty mapping key");
+  }
   const dispatchId = input.dispatchId ?? crypto.randomUUID();
   const audiences = LAUNCH_TOKEN_AUDIENCES[input.phase];
   const base = { ...input, dispatchId };

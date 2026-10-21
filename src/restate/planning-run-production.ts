@@ -128,13 +128,19 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
     notifyWebhookUrl: config.notifyWebhookUrl,
   };
 
+  /** The run's mapping key is the source of truth: a provider's `findByKey` may return an empty `scopeKey` (Jira). */
+  function withRunScope(issue: TicketIssue, run: PlanningRunInput): TicketIssue {
+    return { ...issue, scopeKey: run.teamKey };
+  }
+
   async function launchSession(run: PlanningRunInput, execPath: "fly-machines" | "local-docker"): Promise<PlanningLaunchResult> {
     let ctx: { mapping: RepoMapping; provider: TicketingProvider; issue: TicketIssue; reservation: HeldReservation };
     try {
       const mapping = requireMapping(getMapping, run.teamKey);
       const provider = await input.resolveProvider(mapping);
-      const issue = await provider.findByKey(run.issueIdentifier);
-      if (!issue) throw new Error(`issue ${run.issueIdentifier} not found`);
+      const found = await provider.findByKey(run.issueIdentifier);
+      if (!found) throw new Error(`issue ${run.issueIdentifier} not found`);
+      const issue = withRunScope(found, run);
       const admission = readAdmission(run.dispatchId);
       if (!admission || admission.releasedAt !== null) throw new Error(`no active reservation for dispatch ${run.dispatchId}`);
       // The workflow owns the reservation: the `release` here is never called by the launch.
@@ -164,8 +170,9 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
     try {
       const mapping = requireMapping(getMapping, run.teamKey);
       const provider = await input.resolveProvider(mapping);
-      const issue = await provider.findByKey(run.issueIdentifier);
-      if (!issue) throw new Error(`issue ${run.issueIdentifier} not found`);
+      const found = await provider.findByKey(run.issueIdentifier);
+      if (!found) throw new Error(`issue ${run.issueIdentifier} not found`);
+      const issue = withRunScope(found, run);
       const admission = readAdmission(run.dispatchId);
       if (!admission || admission.releasedAt !== null) throw new Error(`no active reservation for dispatch ${run.dispatchId}`);
       ctx = { mapping, provider, issue, generation: admission.generation };

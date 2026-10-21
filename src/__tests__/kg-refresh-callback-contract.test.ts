@@ -125,7 +125,7 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
 
   function mint(audience: "result" | "progress" = "result", phase: "kg-refresh" | "planning" = "kg-refresh") {
     return tokens.mintRunToken({
-      issueId: "kg", phase, audience, secret: SECRET, ttlSeconds: 600, mappingTeamKey: "",
+      issueId: "kg", phase, audience, secret: SECRET, ttlSeconds: 600, mappingTeamKey: "KG",
     } as never);
   }
 
@@ -167,7 +167,7 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
     const { token } = mint();
     expect((await run(`${token}x`, c)).status).toBe(401);
     expect((await run(mint("progress").token, c)).status).toBe(401);
-    const forged = tokens.mintRunToken({ issueId: "kg", phase: "kg-refresh", audience: "result", secret: SECRET, ttlSeconds: 600, mappingTeamKey: "" } as never);
+    const forged = tokens.mintRunToken({ issueId: "kg", phase: "kg-refresh", audience: "result", secret: SECRET, ttlSeconds: 600, mappingTeamKey: "KG" } as never);
     dedup.getDb().prepare("DELETE FROM runner_tokens WHERE dispatch_id = ?").run(forged.dispatchId);
     expect((await run(forged.token, c)).status).toBe(401);
     expect(c.repoStatus).not.toHaveBeenCalled();
