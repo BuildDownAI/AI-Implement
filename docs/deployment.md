@@ -303,6 +303,26 @@ When the sidecar starts and the marker is present (or `out/embeddings.npz` is ab
 
 To repair a degraded image, re-deploy with `--no-cache` and a working `--build-secret kg_token`. A cached layer from a previous degraded build will reuse the bad output even when the underlying problem is fixed — `--no-cache` is not optional for this recovery.
 
+## The health body (`GET /`)
+
+`GET /` needs no authentication and always answers 200 while the process serves HTTP
+(`src/index.ts`). Monitors read it; it carries no secret.
+
+| Field | Meaning |
+|---|---|
+| `status` | Always `"ok"` |
+| `polls` | Poll cycles since boot |
+| `lastPollStartedAt`, `lastPollFinishedAt` | ISO times, or `null` before the first poll |
+| `kgDegraded` | Embeddings missing; search is lexical only |
+| `kgUnavailable` | The last KG sidecar probe failed (`false` when never probed) |
+| `sidecar` | `{ reachable, toolsListed, lastError, checkedAt }` for the KG sidecar (`checkedAt` is epoch milliseconds, `null` before the first probe) |
+| `restate.sidecar.state` | `starting`, `ready`, `timeout`, `exited` (with `code`, `signal`), or `missing-binary` |
+| `restate.registration.state` | `registered`, `declined-conflict`, `unreachable`, or `not-attempted` |
+| `deploy` | `{ held, startedAt }`: a self-deploy hold, so a deploy is not mistaken for an outage (`startedAt` is epoch milliseconds, or `null` when nothing is held) |
+
+A healthy orchestrator shows `restate.sidecar.state: "ready"`,
+`restate.registration.state: "registered"`, and a recent `lastPollFinishedAt`.
+
 ## KG sidecar health
 
 `kgDegraded` only says whether embeddings are present. A sidecar can also be up and still reject every call — on 2026-09-13 it answered `400 Missing session ID` to each proxied request while every health read stayed green (AII-648, KGB-28). The orchestrator now probes the sidecar after it reports ready (`tools/list` must list the six `kg_*` tools, then one `kg_neighbors` on the spine) and surfaces the result beside `kgDegraded` on every health read (AII-650):

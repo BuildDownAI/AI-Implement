@@ -1,11 +1,11 @@
 /**
- * OAuth/OIDC provider registry — the seam that makes Google, Microsoft, and any future OIDC issuer just configuration.
+ * OAuth/OIDC provider registry — the seam that makes Google, Microsoft, BuildDown, and any future OIDC issuer just configuration.
  * Seeded once at startup from env, read by the OAuth routes and the login screen.
  */
 
 /** A configured OIDC identity provider. `issuer` is the discovery URL openid-client resolves metadata from. */
 export interface OidcProviderConfig {
-  id: string;       // stable key used in routes and the provider tag, e.g. "google", "microsoft"
+  id: string;       // stable key used in routes and the provider tag, e.g. "google", "microsoft", "builddown"
   label: string;    // human label for the login button, e.g. "Google"
   issuer: string;   // OIDC issuer / discovery base URL
   clientId: string;
@@ -36,10 +36,30 @@ export function isOAuthConfigured(): boolean {
   return providers.length > 0;
 }
 
-/** Build the provider list from env — Google and/or Microsoft, each included only when fully credentialed. */
+/**
+ * Build the provider list from env — BuildDown, Google and/or Microsoft, each included only when fully credentialed.
+ * BuildDown comes first: `/mcp/authorize` uses `providers[0]` when the client names no provider.
+ */
 export function providersFromEnv(env: NodeJS.ProcessEnv): OidcProviderConfig[] {
   const scopes = ["openid", "email", "profile"];
   const list: OidcProviderConfig[] = [];
+  const bdIssuer = env.BUILDDOWN_OIDC_ISSUER;
+  if (bdIssuer && env.BUILDDOWN_OIDC_CLIENT_ID && env.BUILDDOWN_OIDC_CLIENT_SECRET) {
+    // Strict prefix, no trimming or case-folding: an http:// issuer lets a network attacker swap the JWKS.
+    // The issuer is stored as given — openid-client matches it against the token's `iss` claim.
+    if (bdIssuer.startsWith("https://")) {
+      list.push({
+        id: "builddown",
+        label: "BuildDown",
+        issuer: bdIssuer,
+        clientId: env.BUILDDOWN_OIDC_CLIENT_ID,
+        clientSecret: env.BUILDDOWN_OIDC_CLIENT_SECRET,
+        scopes,
+      });
+    } else {
+      console.warn("[main] BUILDDOWN_OIDC_ISSUER must start with https:// — BuildDown SSO disabled.");
+    }
+  }
   if (env.GOOGLE_OAUTH_CLIENT_ID && env.GOOGLE_OAUTH_CLIENT_SECRET) {
     list.push({
       id: "google",

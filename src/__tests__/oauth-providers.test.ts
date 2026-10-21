@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   configureOAuthProviders,
   getProvider,
@@ -93,5 +93,57 @@ describe("providersFromEnv", () => {
       MICROSOFT_OAUTH_TENANT: "t",
     });
     expect(list.map((p) => p.id)).toEqual(["google", "microsoft"]);
+  });
+});
+
+describe("providersFromEnv — BuildDown", () => {
+  const scopes = ["openid", "email", "profile"];
+  const bd = {
+    BUILDDOWN_OIDC_ISSUER: "https://cp.example.com",
+    BUILDDOWN_OIDC_CLIENT_ID: "bid",
+    BUILDDOWN_OIDC_CLIENT_SECRET: "bsecret",
+  };
+  const goog = { GOOGLE_OAUTH_CLIENT_ID: "g", GOOGLE_OAUTH_CLIENT_SECRET: "gs" };
+  const ms = { MICROSOFT_OAUTH_CLIENT_ID: "m", MICROSOFT_OAUTH_CLIENT_SECRET: "ms", MICROSOFT_OAUTH_TENANT: "t" };
+  let warn: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+  afterEach(() => warn.mockRestore());
+
+  it("builds the BuildDown entry", () => {
+    expect(providersFromEnv(bd)).toEqual([
+      { id: "builddown", label: "BuildDown", issuer: "https://cp.example.com", clientId: "bid", clientSecret: "bsecret", scopes },
+    ]);
+  });
+
+  it("lists builddown first, ahead of google and microsoft, including after configuration", () => {
+    const list = providersFromEnv({ ...goog, ...ms, ...bd });
+    expect(list.map((p) => p.id)).toEqual(["builddown", "google", "microsoft"]);
+    configureOAuthProviders(list);
+    expect(listConfiguredProviders().map((p) => p.id)).toEqual(["builddown", "google", "microsoft"]);
+  });
+
+  it.each(Object.keys(bd))("omits builddown when %s is missing or empty, leaving others unchanged", (key) => {
+    const baseline = providersFromEnv({ ...goog, ...ms });
+    for (const value of [undefined, ""]) {
+      const env: Record<string, string | undefined> = { ...goog, ...ms, ...bd, [key]: value };
+      expect(providersFromEnv(env)).toEqual(baseline);
+    }
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it.each(["http://cp.example.com", "HTTPS://cp.example.com", " https://cp.example.com"])(
+    "rejects issuer %j with one warning that omits the secret",
+    (issuer) => {
+      expect(providersFromEnv({ ...goog, ...bd, BUILDDOWN_OIDC_ISSUER: issuer }).map((p) => p.id)).toEqual(["google"]);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).not.toContain("bsecret");
+    },
+  );
+
+  it("stores the issuer as given, trailing slash included", () => {
+    expect(providersFromEnv({ ...bd, BUILDDOWN_OIDC_ISSUER: "https://cp.example.com/" })[0].issuer).toBe("https://cp.example.com/");
   });
 });

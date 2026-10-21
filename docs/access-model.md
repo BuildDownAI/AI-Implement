@@ -30,6 +30,26 @@ The handover is deliberately operator-driven, never a boot-time migration. Two c
 - An existing deployment that never opens the Access page behaves exactly as it did before the page existed.
 - The fallback is a safety net, not a revert. An empty stored table means the environment values apply again, so a lost volume degrades to the seed rather than locking everyone out. Emptying the list deliberately is refused: the self-lockout guard sees a stored list that no longer admits its author.
 
+## Sign-in providers
+
+`providersFromEnv` (`src/oauth/providers.ts`) builds the list of OIDC providers once at boot,
+and `configureOAuthProviders` seeds it. Each provider is an `OidcProviderConfig`: `id`,
+`label`, `issuer` (the discovery base URL), `clientId`, `clientSecret`, `scopes`
+(`openid email profile`). A provider is included only when it is fully credentialed, and
+BuildDown is listed first because `/mcp/authorize` uses the first provider when the client names none:
+
+| Provider | Env vars | Issuer |
+|---|---|---|
+| BuildDown | `BUILDDOWN_OIDC_ISSUER`, `BUILDDOWN_OIDC_CLIENT_ID`, `BUILDDOWN_OIDC_CLIENT_SECRET` | `BUILDDOWN_OIDC_ISSUER`, which must start with `https://` (otherwise the provider is left out with one boot warning) |
+| Google | `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` | `https://accounts.google.com` |
+| Microsoft | `MICROSOFT_OAUTH_CLIENT_ID`, `MICROSOFT_OAUTH_CLIENT_SECRET`, `MICROSOFT_OAUTH_TENANT` | `https://login.microsoftonline.com/<tenant>/v2.0` |
+
+The control plane's set-up writes the BuildDown variables; a customer configures no SSO for it.
+`loadConfig` (`src/index.ts`) drops Microsoft when `MICROSOFT_OAUTH_TENANT` is `common`,
+`organizations` or `consumers`, because the email-verified rule holds only for a single-tenant
+issuer. SSO also needs `OAUTH_REDIRECT_BASE_URL`; without it redirect URIs cannot be built.
+A provider only proves who a person is. The allowlist above decides whether they get in.
+
 ## How a request is decided
 
 ```mermaid
@@ -193,7 +213,9 @@ Adding an address already on the list **promotes** it rather than failing as a d
 
 The deprecated `ADMIN_ACCESS_CODE` path remains for local development. Such a session carries no address, so it is **exempt from the re-check** — there is nothing to match — is treated as `admin`, and is **read-only on the Access page**, enforced server-side rather than only hidden in the UI.
 
-It holds no architectural responsibility, which is what keeps the deprecated path deletable.
+On a BuildDown-managed orchestrator, `ADMIN_ACCESS_CODE` is a break-glass code that only BuildDown holds, for sign-in while the control plane is down. Removing the access-code path needs a replacement for that role (see [AII-856](https://linear.app/eudoxus/issue/AII-856/no-scripting-credential-for-the-admin-api-survives-the-access-code)).
+
+Apart from that role, it holds no architectural responsibility, which is what keeps the deprecated path deletable.
 
 ## Not yet built
 
