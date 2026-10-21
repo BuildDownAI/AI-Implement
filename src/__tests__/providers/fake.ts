@@ -99,7 +99,7 @@ export class FakeProvider implements TicketingProvider {
     await this.tick("markPlanningStarted", [issueId, scopeKey]);
     this.transition(issueId, "planning");
   }
-  async markPlanComplete(issueId: string, scopeKey: string): Promise<void> {
+  async markPlanComplete(issueId: string, scopeKey: string, _opts: { awaitApproval: boolean }): Promise<void> {
     await this.tick("markPlanComplete", [issueId, scopeKey]);
     this.transition(issueId, "plan_complete");
   }

@@ -794,7 +794,7 @@ export class LinearProvider implements TicketingProvider {
     await this.transitionToInProgressIfMovable(issueId, teamKey);
   }
 
-  async markPlanComplete(issueId: string, _scopeKey: string): Promise<void> {
+  async markPlanComplete(issueId: string, _scopeKey: string, _opts: { awaitApproval: boolean }): Promise<void> {
     await this.removeLabelByName(issueId, "AI-Planning");
     const teamKey = await this.getTeamKeyForIssue(issueId);
     const labelId = await this.ensureTeamLabel(

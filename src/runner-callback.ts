@@ -21,6 +21,7 @@ import { describeReferenceRepoCause, type ReferenceRepoResult } from "./referenc
 import type { TicketingProvider } from "./providers/types.js";
 import { remediateFailedJob, type StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { verifyAndConsumeRunToken, verifyPreparedReviewFixToken, verifyRunToken } from "./runner-tokens.js";
+import { getMappings } from "./config.js";
 import { read as readAdmission } from "./dispatch-admission.js";
 import { getStepsByJobId, upsertStepRecord } from "./step-log.js";
 import { acceptReviewFixWebhookEvent, getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
@@ -1187,9 +1188,20 @@ export async function handleRunnerResult(
     // gap-analysis failure: no status transition (PR already terminal)
   } else if (input.body.phase === "planning") {
     try {
-      await provider.markPlanComplete(claims.issueId, mappingTeamKey);
+      // A missing mapping defaults to auto-approve.
+      const awaitApproval = getMappings()[mappingTeamKey]?.autoApprovePlans === false;
+      await provider.markPlanComplete(claims.issueId, mappingTeamKey, { awaitApproval });
     } catch (err) {
       warn("markPlanComplete", err);
+      // The plan comments are recorded, so the response stays 200; tell the operator the status write failed.
+      try {
+        await provider.postComment(
+          claims.issueId,
+          "⚠️ The plan was recorded, but the plan-complete status write failed. Set the issue status by hand (`Plan Approved` to start implementation).",
+        );
+      } catch (commentErr) {
+        warn("postComment(markPlanComplete-failed)", commentErr);
+      }
     }
     // Finalize the job row immediately: the issue stays excluded from dispatch
     // while its planning job is in flight, so waiting for the GHA monitor to

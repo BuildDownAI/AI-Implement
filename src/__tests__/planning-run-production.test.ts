@@ -21,8 +21,9 @@ vi.mock("../log.js", () => ({
   updateJobStatus: vi.fn(),
   findLogIdByDispatchId: vi.fn().mockReturnValue(7),
   updateJobRunId: vi.fn(),
-  getStuckAttemptStampedAt: vi.fn().mockReturnValue(null),
+  markJobFailureCommented: vi.fn(),
 }));
+vi.mock("../dispatch-breaker.js", () => ({ parkIssue: vi.fn() }));
 vi.mock("../fly-machines.js", () => ({ getMachine: vi.fn(), destroyMachine: vi.fn(), listMachines: vi.fn() }));
 vi.mock("../local-docker.js", () => ({ inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn(), findLocalContainerIdByName: vi.fn(), removeLocalContainer: vi.fn() }));
 vi.mock("../stuck-watchdog.js", () => ({ remediateFailedJob: vi.fn().mockResolvedValue(undefined) }));
@@ -35,7 +36,8 @@ vi.mock("../dispatch-gate.js", () => ({ acquireDispatch: vi.fn() }));
 
 import { acquireDispatch } from "../dispatch-gate.js";
 import { cancelWorkflowRun, getWorkflowRunStatus } from "../github.js";
-import { getJobByDispatchId, getStuckAttemptStampedAt, updateJobRunId, updateJobStatus } from "../log.js";
+import { getJobByDispatchId, markJobFailureCommented, updateJobRunId, updateJobStatus } from "../log.js";
+import { parkIssue } from "../dispatch-breaker.js";
 import { read as readAdmission, releaseByDispatchId } from "../dispatch-admission.js";
 import { remediateFailedJob } from "../stuck-watchdog.js";
 import { destroyMachine, getMachine, listMachines } from "../fly-machines.js";
@@ -171,7 +173,7 @@ describe("production deps", () => {
   const launchResult = { outcome: "accepted" as const, runId: 4242 };
   const prepared = { ghToken: "secret-gh-token", runnerImage: undefined, planningSentBaseBranch: false, planningContract: "envelope", planningDispatchInputs: {} };
   const issue = { id: "i-1", identifier: "ENG-1", scopeKey: "ENG" };
-  const provider = { findByKey: vi.fn(), clearWorkingState: vi.fn().mockResolvedValue(true) };
+  const provider = { findByKey: vi.fn(), clearWorkingState: vi.fn().mockResolvedValue(true), markPlanningFailed: vi.fn().mockResolvedValue(true) };
 
   function deps(overrides: Partial<PlanningRunProductionInput> = {}) {
     const input: PlanningRunProductionInput = {
@@ -457,15 +459,16 @@ describe("production deps", () => {
       expect(remediateFailedJob).not.toHaveBeenCalled();
     });
 
-    it("closes an in-flight row as failed and runs the failure handling with the owner option", async () => {
+    it("closes an in-flight row as failed, parks the issue, and writes the tracker failure once", async () => {
       vi.mocked(getJobByDispatchId).mockReturnValue(row as never);
       const { d } = compose();
       await d.finishJob("d-1", { kind: "run_ended" });
-      expect(updateJobStatus).toHaveBeenCalledWith(7, "failed", expect.any(String));
-      expect(remediateFailedJob).toHaveBeenCalledTimes(1);
-      const call = vi.mocked(remediateFailedJob).mock.calls[0];
-      expect(call[1]).toBe(provider);
-      expect(call[4]).toEqual({ ownerCall: true });
+      expect(updateJobStatus).toHaveBeenCalledWith(7, "failed", "ended_without_callback");
+      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", "ended_without_callback");
+      expect(provider.markPlanningFailed).toHaveBeenCalledWith("i-1", "ENG", expect.stringContaining("Unpark"));
+      expect(markJobFailureCommented).toHaveBeenCalledWith(7);
+      expect(remediateFailedJob).not.toHaveBeenCalled();
+      expect(provider.clearWorkingState).not.toHaveBeenCalled();
     });
 
     it("closes an in-flight row as operator_cancelled after an invocation cancel, clears the working state, and runs no failure handling", async () => {
@@ -478,37 +481,31 @@ describe("production deps", () => {
       expect(provider.clearWorkingState).toHaveBeenCalledTimes(1);
     });
 
-    it("does not count a second stuck attempt when a retry finds one stamped since the dispatch began", async () => {
+    it("skips the tracker write on a retry when the failure comment is already recorded", async () => {
       vi.mocked(getJobByDispatchId).mockReturnValue(
-        { ...row, status: "failed", conclusion: "ended_without_callback", dispatchedAt: 1_000 } as never,
+        { ...row, status: "failed", conclusion: "ended_without_callback", failureCommentedAt: 2_000 } as never,
       );
-      vi.mocked(getStuckAttemptStampedAt).mockReturnValueOnce(2_000);
       const { d } = compose();
       await d.finishJob("d-1", { kind: "run_ended" });
-      expect(remediateFailedJob).not.toHaveBeenCalled();
+      expect(parkIssue).toHaveBeenCalledTimes(1);
+      expect(provider.markPlanningFailed).not.toHaveBeenCalled();
     });
 
-    it("closes an in-flight row as timed_out at a deadline", async () => {
+    it("closes an in-flight row as timed_out at a deadline and parks it", async () => {
       vi.mocked(getJobByDispatchId).mockReturnValue(row as never);
       const { d } = compose();
       await d.finishJob("d-1", { kind: "deadline" });
-      expect(updateJobStatus).toHaveBeenCalledWith(7, "timed_out", expect.any(String));
-      expect(remediateFailedJob).toHaveBeenCalledTimes(1);
+      expect(updateJobStatus).toHaveBeenCalledWith(7, "timed_out", "deadline_exceeded");
+      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", "deadline_exceeded");
     });
 
-    it("re-runs the failure handling on retry when an earlier attempt closed the row then threw", async () => {
-      vi.mocked(remediateFailedJob).mockRejectedValueOnce(new Error("tracker down"));
-      vi.mocked(getJobByDispatchId).mockReturnValueOnce(row as never);
+    it("does not throw when the tracker write fails, and leaves the failure comment unrecorded", async () => {
+      provider.markPlanningFailed.mockRejectedValueOnce(new Error("tracker down"));
+      vi.mocked(getJobByDispatchId).mockReturnValue(row as never);
       const { d } = compose();
-      await expect(d.finishJob("d-1", { kind: "run_ended" })).rejects.toThrow("tracker down");
-      expect(updateJobStatus).toHaveBeenCalledTimes(1);
-
-      vi.mocked(getJobByDispatchId).mockReturnValueOnce(
-        { ...row, status: "failed", conclusion: "ended_without_callback" } as never,
-      );
-      await d.finishJob("d-1", { kind: "run_ended" });
-      expect(updateJobStatus).toHaveBeenCalledTimes(1);
-      expect(remediateFailedJob).toHaveBeenCalledTimes(2);
+      await expect(d.finishJob("d-1", { kind: "run_ended" })).resolves.toBeUndefined();
+      expect(parkIssue).toHaveBeenCalledTimes(1);
+      expect(markJobFailureCommented).not.toHaveBeenCalled();
     });
   });
 });

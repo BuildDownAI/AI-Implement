@@ -319,6 +319,28 @@ describe("handleRunnerResult — planning", () => {
     expect(fake.getPhase("i")).toBe("plan_complete");
   });
 
+  it("a markPlanComplete throw still answers 200, posts one comment naming the status write, and completes the job", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i", mappingTeamKey: "ENG", phase: "planning", ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS, secret: SECRET,
+    });
+    log.appendLog({
+      issueId: "i", issueIdentifier: "ENG-1", issueTitle: "Plan it", teamKey: "ENG", repo: "o/r",
+      dispatchId, executionMode: "github-actions", phase: "planning",
+    });
+    const fake = new FakeProvider({ recordCalls: true, initialIssues: [makeIssue({ id: "i" })] });
+    vi.spyOn(fake, "markPlanComplete").mockRejectedValue(new Error("tracker down"));
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "planning", outcome: "success", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+    expect(res.status).toBe(200);
+    expect(fake.commentsFor("i")).toHaveLength(1);
+    expect(fake.commentsFor("i")[0]).toMatch(/status write failed/);
+    expect(log.getJobByDispatchId(dispatchId)).toMatchObject({ status: "completed" });
+  });
+
   it("finalizes the dispatch-log job as completed on planning success", async () => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i",

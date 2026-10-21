@@ -803,7 +803,7 @@ describe("LinearProvider.markPlanComplete", () => {
     );
 
     const p = new LinearProvider({});
-    await p.markPlanComplete("issue-1", "ENG");
+    await p.markPlanComplete("issue-1", "ENG", { awaitApproval: false });
 
     expect(fake.calls).toHaveLength(7);
     expect(variables(fake, 1)).toEqual({ issueId: "issue-1", labelIds: ["lo"] });

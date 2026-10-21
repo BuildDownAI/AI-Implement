@@ -324,7 +324,7 @@ describe("makeProvider", () => {
     expect(await provider.fetchLifecycleStates(["issue-1"])).toEqual(new Map());
     expect(await provider.fetchFeatureNodeRollUps()).toEqual([]);
     await expect(provider.markPlanningStarted("issue-1", "ENG")).resolves.toBeUndefined();
-    await expect(provider.markPlanComplete("issue-1", "ENG")).resolves.toBeUndefined();
+    await expect(provider.markPlanComplete("issue-1", "ENG", { awaitApproval: false })).resolves.toBeUndefined();
     await expect(provider.markPlanningFailed("issue-1", "ENG", "reason")).resolves.toBe(true);
     await expect(provider.markImplementing("issue-1", "ENG")).resolves.toBeUndefined();
     await expect(provider.markPrReady("issue-1", "ENG", "https://github.com/test-org/test-repo/pull/1")).resolves.toBe(true);

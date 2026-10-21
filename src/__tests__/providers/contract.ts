@@ -29,7 +29,7 @@ export function runProviderContract(label: string, factory: ContractProviderFact
         const a = sampleIssue({ id: "a", identifier: "TEST-A" });
         const b = sampleIssue({ id: "b", identifier: "TEST-B" });
         const provider = await factory({ initialIssues: [a, b] });
-        await provider.markPlanComplete("b", "TEAM");
+        await provider.markPlanComplete("b", "TEAM", { awaitApproval: false });
         const snap = await provider.fetchAIImplementSnapshot();
         expect(snap.needsPlanning.map((i) => i.id)).toEqual(["a"]);
         expect(snap.readyForImplementation.map((i) => i.id)).toEqual(["b"]);

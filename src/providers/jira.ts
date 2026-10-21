@@ -846,8 +846,9 @@ export class JiraProvider implements TicketingProvider {
   async markPlanningStarted(issueId: string, scopeKey: string): Promise<void> {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.PLANNING);
   }
-  async markPlanComplete(issueId: string, scopeKey: string): Promise<void> {
-    await this.setStatus(issueId, scopeKey, STATUS_VALUES.APPROVED);
+  async markPlanComplete(issueId: string, scopeKey: string, opts: { awaitApproval: boolean }): Promise<void> {
+    // `Awaiting Approval` is outside the poll bucket: implementation starts only when a person sets `Plan Approved`.
+    await this.setStatus(issueId, scopeKey, opts.awaitApproval ? STATUS_VALUES.AWAITING_APPROVAL : STATUS_VALUES.APPROVED);
   }
   async markPlanningFailed(issueId: string, scopeKey: string, reason: string): Promise<boolean> {
     // Same misleading-late-comment rule as the implementation setters: when the write

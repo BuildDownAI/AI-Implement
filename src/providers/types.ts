@@ -147,7 +147,7 @@ export interface TicketingProvider {
   // ignores it (it resolves the team from the issue itself); Jira needs it to
   // pick the right mapping without a fragile repo-field read-back.
   markPlanningStarted(issueId: string, scopeKey: string): Promise<void>;
-  markPlanComplete(issueId: string, scopeKey: string): Promise<void>;
+  markPlanComplete(issueId: string, scopeKey: string, opts: { awaitApproval: boolean }): Promise<void>;
   /** Returns whether a failure comment was actually posted — false when the status write
    *  was refused (issue already Merged) and no comment follows it. Callers must stamp
    *  their own "did we already comment" bookkeeping only on true, or a refusal silently
