@@ -973,7 +973,14 @@ export async function handleRunnerResult(
     console.warn(
       `[runner-callback] mapping deleted between mint and callback: ${mappingTeamKey}`,
     );
-    return { status: 200, body: { acknowledged: true, warnings: ["mapping_deleted"] } };
+    // A 2xx means the callback was recorded; nothing can be recorded without a mapping.
+    return { status: 409, body: { error: "mapping_not_found", mappingTeamKey } };
+  }
+
+  // Look the planning job row up before any side effect: a callback with no row records nothing, so it must not answer 2xx.
+  if (input.body.phase === "planning" && !getJobByDispatchId(claims.dispatchId)) {
+    console.warn(`[runner-callback] planning callback with no job row dispatch=${claims.dispatchId}`);
+    return bad(404, "job_not_found");
   }
 
   const warnings: string[] = [];

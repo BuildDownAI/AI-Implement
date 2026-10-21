@@ -162,13 +162,16 @@ describe("filesystem tickets through the local PR loop", () => {
 
     const issueId = snapshot.needsPlanning[0]!.id;
     await provider.markPlanningStarted(issueId, "FS");
-    const planningToken = runnerTokens.mintRunToken({
+    const planningMint = runnerTokens.mintRunToken({
       issueId,
       mappingTeamKey: "FS",
       phase: "planning",
       ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
       secret: SECRET,
-    }).token;
+    });
+    const planningToken = planningMint.token;
+    log.appendLog({ issueId, issueIdentifier: "FS-1", teamKey: "FS", repo: "BuildDownAI/AI-Implement",
+      dispatchId: planningMint.dispatchId, phase: "planning" });
     const planningResult = await runnerCallback.handleRunnerResult({
       authorization: `Bearer ${planningToken}`,
       body: { phase: "planning", outcome: "success", comments: [{ body: "## ✅ AI Planning: Acceptance Bar\n\nChange one file." }] },

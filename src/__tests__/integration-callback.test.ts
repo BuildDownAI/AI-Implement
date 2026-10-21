@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type * as RunnerTokensModule from "../runner-tokens.js";
+import type * as LogModule from "../log.js";
 import type * as RunnerCallbackModule from "../runner-callback.js";
 import { FakeProvider } from "./providers/fake.js";
 import { makeIssue } from "./helpers/builders.js";
@@ -9,12 +10,14 @@ const SECRET = "integration-test-secret";
 
 let runnerTokens: typeof RunnerTokensModule;
 let runnerCallback: typeof RunnerCallbackModule;
+let log: typeof LogModule;
 
 beforeEach(async () => {
-  ({ runnerTokens, runnerCallback } = (await testDb({
+  ({ runnerTokens, runnerCallback, log } = (await testDb({
     modules: {
       runnerTokens: () => import("../runner-tokens.js"),
       runnerCallback: () => import("../runner-callback.js"),
+      log: () => import("../log.js"),
     },
   })).modules);
 });
@@ -32,13 +35,14 @@ describe("dispatch → callback round-trip", () => {
     });
 
     // 2. Simulate orchestrator-side mint at dispatch time.
-    const { token } = runnerTokens.mintRunToken({
+    const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "uuid-1",
       mappingTeamKey: "ENG",
       phase: "planning",
       ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
       secret: SECRET,
     });
+    log.appendLog({ issueId: "uuid-1", issueIdentifier: "ENG-1", teamKey: "ENG", repo: "o/r", dispatchId, phase: "planning" });
 
     // 3. Simulate runner-side POST back after planning succeeds.
     const result = await runnerCallback.handleRunnerResult({

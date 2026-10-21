@@ -24,6 +24,8 @@ sequenceDiagram
     R->>O: POST /runner/result (result token, consumed on first use)
 ```
 
+**A 2xx from `/runner/result` means the callback was recorded.** A result that cannot be recorded answers a coded 4xx, which the runner logs as `POST failed`: `409 mapping_not_found` (the token's mapping key resolves to no mapping; the body names the key) and, for planning, `404 job_not_found` (no job row for the dispatch; checked before any comment is posted). Either answer follows token consumption, so a retry gets `already_consumed`. A duplicate callback for an already closed row stays 200. `mintRunToken` refuses an empty mapping key, so no token is minted that could hit this.
+
 ## Credentials
 
 | Name | Audience | Minted | Carried by | Read by | Verified by | Consumed |

@@ -20,6 +20,15 @@ afterEach(() => {
 });
 
 describe("mintRunToken", () => {
+  it.each(["", "   "])("refuses an empty mapping key %j and inserts no row", (key) => {
+    const count = () => (dedup.getDb().prepare("SELECT COUNT(*) AS n FROM runner_tokens").get() as { n: number }).n;
+    const before = count();
+    expect(() => runnerTokens.mintRunToken({
+      issueId: "i", mappingTeamKey: key, phase: "planning", ttlSeconds: 60, secret: SECRET,
+    })).toThrow(/mapping key/);
+    expect(count()).toBe(before);
+  });
+
   it("a stale publication release cannot clear a newer claim, even within one millisecond", () => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "issue-1", mappingTeamKey: "ENG", phase: "implementation",

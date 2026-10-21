@@ -245,7 +245,7 @@ describe("handleRunnerResult — validation", () => {
 });
 
 describe("handleRunnerResult — mapping resolution", () => {
-  it("returns 200 with mapping_deleted warning when provider resolution returns null", async () => {
+  it("returns 409 mapping_not_found naming the key when provider resolution returns null", async () => {
     const { token } = runnerTokens.mintRunToken({
       issueId: "i",
       mappingTeamKey: "ENG",
@@ -259,19 +259,43 @@ describe("handleRunnerResult — mapping resolution", () => {
       secret: SECRET,
       resolveProvider: makeResolve(null),
     });
-    expect(res.status).toBe(200);
-    expect(res.body.warnings).toContain("mapping_deleted");
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("mapping_not_found");
+    expect(res.body.mappingTeamKey).toBe("ENG");
   });
-});
 
-describe("handleRunnerResult — planning", () => {
-  it("posts comments and calls markPlanComplete on success", async () => {
+  it("returns 404 job_not_found for a planning callback with no job row, posting nothing", async () => {
     const { token } = runnerTokens.mintRunToken({
       issueId: "i",
       mappingTeamKey: "ENG",
       phase: "planning",
       ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
       secret: SECRET,
+    });
+    const provider = new FakeProvider();
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "planning", outcome: "success", comments: [{ body: "ok" }] },
+      secret: SECRET,
+      resolveProvider: makeResolve(provider),
+    });
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("job_not_found");
+  });
+});
+
+describe("handleRunnerResult — planning", () => {
+  it("posts comments and calls markPlanComplete on success", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+    log.appendLog({
+      issueId: "i", issueIdentifier: "ENG-1", issueTitle: "Plan it", teamKey: "ENG", repo: "o/r",
+      dispatchId, executionMode: "github-actions", phase: "planning",
     });
     const fake = new FakeProvider({
       recordCalls: true,
@@ -620,12 +644,16 @@ describe("handleRunnerResult — planning", () => {
   });
 
   it("calls markPlanningFailed on failure", async () => {
-    const { token } = runnerTokens.mintRunToken({
+    const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i",
       mappingTeamKey: "ENG",
       phase: "planning",
       ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
       secret: SECRET,
+    });
+    log.appendLog({
+      issueId: "i", issueIdentifier: "ENG-1", issueTitle: "Plan it", teamKey: "ENG", repo: "o/r",
+      dispatchId, executionMode: "github-actions", phase: "planning",
     });
     const fake = new FakeProvider({ recordCalls: true });
     const res = await runnerCallback.handleRunnerResult({
@@ -2146,7 +2174,7 @@ describe("handleRunnerProgress", () => {
         audience: "progress",
         secret: SECRET,
         ttlSeconds: 600,
-        mappingTeamKey: "",
+        mappingTeamKey: "KG",
       });
     }
     const kgStep = (extra: Record<string, unknown> = {}) => ({
@@ -2698,12 +2726,16 @@ describe("handleRunnerResult — gap-analysis", () => {
 
 describe("handleRunnerResult — provider errors", () => {
   it("returns 200 with warnings when provider.postComment throws", async () => {
-    const { token } = runnerTokens.mintRunToken({
+    const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i",
       mappingTeamKey: "ENG",
       phase: "planning",
       ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
       secret: SECRET,
+    });
+    log.appendLog({
+      issueId: "i", issueIdentifier: "ENG-1", issueTitle: "Plan it", teamKey: "ENG", repo: "o/r",
+      dispatchId, executionMode: "github-actions", phase: "planning",
     });
     const fake = new FakeProvider();
     fake.postComment = async () => {
@@ -2787,12 +2819,16 @@ describe("handleRunnerResult — body validation", () => {
       ],
       recordCalls: true,
     });
-    const { token } = runnerTokens.mintRunToken({
+    const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i",
       mappingTeamKey: "ENG",
       phase: "planning",
       ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
       secret: SECRET,
+    });
+    log.appendLog({
+      issueId: "i", issueIdentifier: "ENG-1", issueTitle: "Plan it", teamKey: "ENG", repo: "o/r",
+      dispatchId, executionMode: "github-actions", phase: "planning",
     });
     // First call: bad body, valid bearer — token must NOT be consumed.
     const first = await runnerCallback.handleRunnerResult({
@@ -3502,6 +3538,10 @@ describe("handleRunnerResult — call attribution", () => {
       ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
       secret: SECRET,
     });
+    log.appendLog({
+      issueId: "i", issueIdentifier: "ENG-1", issueTitle: "Plan it", teamKey: "ENG", repo: "o/r",
+      dispatchId, executionMode: "github-actions", phase: "planning",
+    });
     const provider = new FakeProvider();
     const post = (body: Record<string, unknown>) =>
       runnerCallback.handleRunnerResult({
@@ -3580,12 +3620,16 @@ describe("handleRunnerResult — call attribution", () => {
 
   it("lets only one of two concurrent valid posts win", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
-    const { token } = runnerTokens.mintRunToken({
+    const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i",
       mappingTeamKey: "ENG",
       phase: "planning",
       ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
       secret: SECRET,
+    });
+    log.appendLog({
+      issueId: "i", issueIdentifier: "ENG-1", issueTitle: "Plan it", teamKey: "ENG", repo: "o/r",
+      dispatchId, executionMode: "github-actions", phase: "planning",
     });
     const post = () =>
       runnerCallback.handleRunnerResult({

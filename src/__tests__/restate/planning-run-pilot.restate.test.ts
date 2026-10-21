@@ -127,7 +127,8 @@ import type { PlanningRunInput, PlanningRunStatusResult } from "../../restate/pl
 import { createReviewFixAdminFacade } from "../../review-fix-admin-facade.js";
 import { SqliteReviewFixAttemptStore } from "../../review-fix-attempt-store.js";
 import { listActiveRestateReviewFixPrs, queueReviewFixCancellationForClosedPr } from "../../review-fix-close.js";
-import { mintPreparedReviewFixToken } from "../../runner-tokens.js";
+import { mintPreparedReviewFixToken, mintRunToken } from "../../runner-tokens.js";
+import { handleRunnerResult } from "../../runner-callback.js";
 import { VARIANTS, journalEntries, journalEntryNames, journalText, journaledRunResult, callWorkflow, cancelInvocation, eventually, queryInvocations, gate, startVariants, stopAll, waitForStep, type Gate } from "./harness.js";
 
 const OWNER = "TestOrg";
@@ -223,6 +224,9 @@ let launchGate: Gate | undefined;
 let reserveGate: Gate | undefined;
 const clearedIssues: string[] = [];
 const comments: string[] = [];
+/** Run tokens the simulated launch minted, by dispatch id (the real launch mints them in `buildPlanningLaunch`). */
+const mintedTokens = new Map<string, string>();
+const JIRA_TOKEN_SECRET = "jira-planning-token-secret-with-entropy";
 const issues = new Map<string, { id: string; identifier: string; title: string; scopeKey: string; nativeStatus: string }>();
 
 describe("Restate PlanningRun pilot: production-composition proof", () => {
@@ -263,8 +267,13 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
 
     const provider = {
       id: "linear",
-      findByKey: async (key: string) => issues.get(key) ?? null,
+      findByKey: async (key: string) => {
+        const found = issues.get(key);
+        // Jira answers an empty scopeKey from `findByKey` on purpose.
+        return found && key.startsWith("PLT-JIRA") ? { ...found, scopeKey: "" } : found ?? null;
+      },
       clearWorkingState: async (issueId: string) => { clearedIssues.push(issueId); return true; },
+      markPlanComplete: async () => {},
       issueUrl: (issue: { identifier: string }) => `https://tracker.test/${issue.identifier}`,
       postComment: async (_issueId: string, body: string) => { comments.push(body); },
     };
@@ -281,6 +290,11 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       launchPlanningRun: (async (args: { issue: { id: string; identifier: string; title: string; scopeKey: string; nativeStatus: string }; dispatchId: string; admissionGeneration: number }) => {
         launches.push(args.issue.identifier);
         if (launchGate) await launchGate.wait();
+        // As `buildPlanningLaunch` does: the token carries the issue's scopeKey as its mapping key.
+        mintedTokens.set(args.dispatchId, mintRunToken({
+          issueId: args.issue.id, mappingTeamKey: args.issue.scopeKey, phase: "planning", dispatchId: args.dispatchId,
+          ttlSeconds: 600, secret: JIRA_TOKEN_SECRET,
+        }).token);
         // The real function writes the row after the dispatch call succeeds.
         appendLog({
           issueId: args.issue.id, issueIdentifier: args.issue.identifier, issueTitle: args.issue.title, teamKey: args.issue.scopeKey,
@@ -411,6 +425,34 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     expect(getJobByDispatchId(w.dispatchId)).toEqual({ ...closed, notifiedAt: expect.any(Number) });
     expect(sim.remediateCalls).toBe(0);
     expect(clearedIssues).toEqual([]);
+  }, 60_000);
+
+  it.each(labels)("a Jira-style provider (findByKey scopeKey empty) still completes: the callback lands and report resolves (%s)", async (label) => {
+    gh.statusGate = gate("first status read");
+    const w = await dispatch(label, "PLT-JIRA");
+    await gh.statusGate.reached();
+    await waitForStep(w.read, "wait");
+    const token = mintedTokens.get(w.dispatchId)!;
+    expect(token).toBeDefined();
+    expect(getDb().prepare("SELECT mapping_team_key AS k FROM runner_tokens WHERE dispatch_id = ?").get(w.dispatchId)).toEqual({ k: TEAM });
+
+    const res = await handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "planning", outcome: "success", comments: [{ body: "plan" }] },
+      secret: JIRA_TOKEN_SECRET,
+      resolveProvider: async () => ({ postComment: async () => {}, markPlanComplete: async () => {} }) as never,
+      checkPlanningAdmissionTermination: w.hook,
+    });
+    expect(res.status).toBe(200);
+    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "completed", conclusion: "planning_callback" });
+    gh.runs[0].status = "completed";
+    gh.statusGate.release();
+
+    await untilReleased(w.dispatchId);
+    expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
+    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ conclusion: "planning_callback", teamKey: TEAM });
+    expect(sim.remediateCalls).toBe(0);
+    expect(launches).toEqual(["PLT-JIRA"]);
   }, 60_000);
 
   it.each(labels)("an operator release of the owned row leaves the workflow's later release answering not_owner, and the workflow ends (%s)", async (label) => {
