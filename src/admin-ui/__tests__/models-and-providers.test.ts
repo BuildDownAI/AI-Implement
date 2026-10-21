@@ -52,4 +52,16 @@ describe("models-and-providers page", () => {
     const rows = modelsAndProvidersScript.slice(modelsAndProvidersScript.indexOf("function mpRenderAccounts"), modelsAndProvidersScript.indexOf("function mpAccountError"));
     expect(rows).not.toContain("mpPairing");
   });
+  it("carries typed key values and focus across the account row rebuild, in the inputs only", () => {
+    const fn = modelsAndProvidersScript.slice(modelsAndProvidersScript.indexOf("function mpRenderAccounts"), modelsAndProvidersScript.indexOf("function mpAccountError"));
+    const read = fn.indexOf("input[data-key-for]");
+    const rebuild = fn.indexOf("rowsEl.innerHTML = html");
+    const restore = fn.indexOf("input[data-key-for]", rebuild);
+    expect(read).toBeGreaterThan(-1);
+    expect(read).toBeLessThan(rebuild);
+    expect(restore).toBeGreaterThan(rebuild);
+    expect(fn).toContain("inp.value = typed[id]");
+    expect(fn).toContain(".focus()");
+    expect(modelsAndProvidersScript).not.toMatch(/(localStorage|sessionStorage)/);
+  });
 });

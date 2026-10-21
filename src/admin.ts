@@ -3997,7 +3997,16 @@ async function handleModelAccountCredential(
     return;
   }
   const store = createModelProtectedSecrets({ env: process.env });
+  // The fallback reference is only this profile's when no other profile's head revision resolves to it.
+  const fallbackClash =
+    existingRef === null &&
+    listAccountProfiles().some((p) => p.profileId !== profileId && lookupCredentialReference(p.profileId, p.revision) === ref);
   if (!isPut) {
+    if (existingRef === null) {
+      // No reference of its own: nothing to remove, and the fallback row may belong to another profile.
+      json(res, 200, { ref, result: "removed" });
+      return;
+    }
     if (!store.delete(ref).ok) {
       json(res, 500, { error: "could not delete the credential" });
       return;
@@ -4010,6 +4019,11 @@ async function handleModelAccountCredential(
     json(res, 503, { error: CREDENTIAL_FAILURES.key_unavailable });
     return;
   }
+  if (fallbackClash) {
+    json(res, 409, { error: "another profile already uses this credential reference; set a credentialRef on this profile by hand" });
+    return;
+  }
+  const prior = store.open(ref);
   const written = store.write(ref, apiKey as never);
   if (!written.ok) {
     json(res, written.code === "invalid_value" ? 400 : 500, { error: CREDENTIAL_FAILURES[written.code] });
@@ -4029,7 +4043,9 @@ async function handleModelAccountCredential(
         metadata: { credentialRef: ref },
       });
     } catch {
-      store.delete(ref);
+      // Undo only this request's write: restore a row that existed, delete one it created.
+      if (prior.ok) store.write(ref, prior.value);
+      else if (prior.code === "row_missing") store.delete(ref);
       json(res, 500, { error: "could not save the profile revision" });
       return;
     }

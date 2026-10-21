@@ -3,6 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createModelProtectedSecrets } from "../model-protected-secrets.js";
+import { createModelSessionKeyProvider } from "../model-session-keys.js";
+import { createModelSessionStore } from "../model-session-store.js";
 import type * as AdminModule from "../admin.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { ProviderRegistry } from "../providers/registry.js";
@@ -105,6 +107,14 @@ vi.mock("../workflow-probe.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../workflow-probe.js")>()),
   resolveWorkflowCapabilities: resolveWorkflowCapabilitiesMock,
 }));
+
+// Calls through by default; the status-route 500 test makes the factory throw once.
+const createModelSessionStoreMock = vi.hoisted(() => vi.fn());
+vi.mock("../model-session-store.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../model-session-store.js")>();
+  createModelSessionStoreMock.mockImplementation(actual.createModelSessionStore);
+  return { ...actual, createModelSessionStore: createModelSessionStoreMock };
+});
 
 function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
   // Mappings default to the linear tracker; snapshot merging matches on provider id.
@@ -6440,6 +6450,61 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect(r.json.connected).toBe(false);
       expect(r.raw).not.toMatch(/accessToken|refreshToken|idToken/);
     });
+
+    it("reports a connected profile's real fields and no token value", async () => {
+      const t = adminTok();
+      await call("/api/model-accounts", "POST", t, codex());
+      const saved = process.env.RUNNER_TOKEN_SECRET;
+      process.env.RUNNER_TOKEN_SECRET = "test-runner-token-secret-1502";
+      try {
+        const sessions = createModelSessionStore({
+          keys: createModelSessionKeyProvider(),
+          verifyOwner: () => false,
+          authorizeOperator: (o) => o === "chatgpt-pairing",
+          db: () => dedup.getDb(),
+        });
+        const written = sessions.writePlanRecord({
+          profileId: "gpt-1",
+          expectedSequence: null,
+          operator: "chatgpt-pairing",
+          sessionData: JSON.stringify({
+            email: "op@example.com",
+            refreshToken: "SYNTH-REFRESH-1502",
+            accessToken: "SYNTH-ACCESS-1502",
+            idToken: "SYNTH-ID-1502",
+            accessTokenExpiresAt: Date.now() + 3_600_000,
+          }),
+        });
+        expect(written.ok).toBe(true);
+        const r = await call(`/api/model-accounts/gpt-1/chatgpt-status`, "GET", t);
+        expect(r.status).toBe(200);
+        expect(Object.keys(r.json).sort()).toEqual(["connected", "email", "lastRefresh", "secondsLeft"]);
+        expect(r.json.connected).toBe(true);
+        expect(r.json.email).toBe("op@example.com");
+        expect(Number.isInteger(r.json.secondsLeft)).toBe(true);
+        expect(r.json.secondsLeft).toBeGreaterThan(3500);
+        expect(typeof r.json.lastRefresh).toBe("string");
+        expect(r.raw).not.toMatch(/SYNTH-|accessToken|refreshToken|idToken/);
+      } finally {
+        if (saved === undefined) delete process.env.RUNNER_TOKEN_SECRET; else process.env.RUNNER_TOKEN_SECRET = saved;
+      }
+    });
+
+    it("answers 500 with a fixed error when the store read throws", async () => {
+      const t = adminTok();
+      await call("/api/model-accounts", "POST", t, codex());
+      const saved = process.env.RUNNER_TOKEN_SECRET;
+      process.env.RUNNER_TOKEN_SECRET = "test-runner-token-secret-1502";
+      createModelSessionStoreMock.mockImplementationOnce(() => { throw new Error("SYNTH-DB-DETAIL"); });
+      try {
+        const r = await call(`/api/model-accounts/gpt-1/chatgpt-status`, "GET", t);
+        expect(r.status).toBe(500);
+        expect(r.json).toEqual({ error: "could not read the status" });
+        expect(r.raw).not.toContain("SYNTH-DB-DETAIL");
+      } finally {
+        if (saved === undefined) delete process.env.RUNNER_TOKEN_SECRET; else process.env.RUNNER_TOKEN_SECRET = saved;
+      }
+    });
   });
 
   describe("browser API key entry (AII-1500)", () => {
@@ -6540,6 +6605,46 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect(r.status).toBe(503);
       expect(r.raw).not.toContain(KEY);
       expect(count("model_protected_secrets")).toBe(0);
+    });
+
+    it("refuses PUT with 409 and leaves another profile's key alone when the fallback ref is taken", async () => {
+      const t = adminTok();
+      await call("/api/model-accounts", "POST", t, profileBody({ profileId: "a", credentialRef: "model-account:b" }));
+      await call("/api/model-accounts", "POST", t, profileBody({ profileId: "b", credentialRef: undefined }));
+      expect(store().write("model-account:b", "sk-synthetic-owner-a" as never).ok).toBe(true);
+      const revs = count("model_account_profile_revisions");
+      const put = await call(url("b"), "PUT", t, { apiKey: KEY });
+      expect(put.status).toBe(409);
+      expect(put.raw).not.toContain(KEY);
+      expect(store().resolve("model-account:b")).toBe("sk-synthetic-owner-a");
+      expect(count("model_account_profile_revisions")).toBe(revs);
+      const del = await call(url("b"), "DELETE", t);
+      expect(del.status).toBe(200);
+      expect(store().resolve("model-account:b")).toBe("sk-synthetic-owner-a");
+      expect(count("model_protected_secrets")).toBe(1);
+    });
+
+    it("does not treat a non-head revision of another profile as a clash", async () => {
+      const t = adminTok();
+      await call("/api/model-accounts", "POST", t, profileBody({ profileId: "a", credentialRef: "model-account:b" }));
+      await call("/api/model-accounts/a", "PATCH", t, { credentialRef: "model-account:a" });
+      await call("/api/model-accounts", "POST", t, profileBody({ profileId: "b", credentialRef: undefined }));
+      expect((await call(url("b"), "PUT", t, { apiKey: KEY })).status).toBe(200);
+      expect(store().resolve("model-account:b")).toBe(KEY);
+    });
+
+    it("keeps a pre-existing row when the revision save fails, and removes a row it created", async () => {
+      const t = adminTok();
+      await call("/api/model-accounts", "POST", t, profileBody({ credentialRef: undefined }));
+      expect(store().write(REF, "sk-synthetic-prior" as never).ok).toBe(true);
+      const spy = vi.spyOn(modules.agentConfigStore, "saveAccountProfileRevision").mockImplementation(() => { throw new Error("boom"); });
+      const failed = await call(url("oai-1"), "PUT", t, { apiKey: KEY });
+      expect(failed.status).toBe(500);
+      expect(store().resolve(REF)).toBe("sk-synthetic-prior");
+      expect(store().delete(REF).ok).toBe(true);
+      expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY })).status).toBe(500);
+      expect(count("model_protected_secrets")).toBe(0);
+      spy.mockRestore();
     });
 
     it("refuses a non-admin with every page granted", async () => {

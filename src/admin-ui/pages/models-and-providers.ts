@@ -318,7 +318,19 @@ export const modelsAndProvidersScript = `(function () {
         '<td>' + keyCell + '</td>' +
         '</tr>';
     }
+    // Carry typed (unsubmitted) key values and focus across the rebuild; values live only in the inputs.
+    const typed = {};
+    rowsEl.querySelectorAll('input[data-key-for]').forEach(function (inp) {
+      if (inp.value) typed[inp.getAttribute('data-key-for')] = inp.value;
+    });
+    const focused = document.activeElement && document.activeElement.getAttribute
+      ? document.activeElement.getAttribute('data-key-for') : null;
     rowsEl.innerHTML = html;
+    rowsEl.querySelectorAll('input[data-key-for]').forEach(function (inp) {
+      const id = inp.getAttribute('data-key-for');
+      if (Object.prototype.hasOwnProperty.call(typed, id)) inp.value = typed[id];
+      if (focused !== null && id === focused) inp.focus();
+    });
     document.getElementById('mp-account-form').classList.toggle('hidden', !mpCanEdit());
   }
 
