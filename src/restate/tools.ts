@@ -59,7 +59,7 @@ import {
 import { providerConfigFromEnv, ProviderRegistry } from "../providers/index.js";
 
 const CallerSchema = z.object({
-  kind: z.enum(["human", "system"]),
+  kind: z.enum(["human", "system", "service"]),
   email: z.string().nullable(),
   role: z.enum(["user", "admin"]).nullable(),
 });
@@ -147,7 +147,7 @@ export function tool<I extends z.ZodType>(
       const operation = opts.operation ?? (opts.role === "admin" ? "write" : "read");
       const audit = (result: "forbidden" | "ok" | "error"): void => {
         if (operation !== "write") return;
-        const actor = input.caller.email ?? "system";
+        const actor = input.caller.email ?? (input.caller.kind === "service" ? "control-plane" : "system");
         let detail = "";
         try {
           detail = opts.auditDetail ? ` ${opts.auditDetail(input)}` : "";
@@ -708,7 +708,9 @@ export const decideKgRefreshTool = tool(
     const repo = ctx.objectClient(KgRepo, toolDeps.kgSourceRepo);
     if ((await repo.status()) == null) return toolError("no-refresh-in-flight");
     const { action, triggerId: heldTrigger } = input.args;
-    const actor = input.caller.email ?? (input.caller.kind === "system" ? "system" : "unknown");
+    const actor =
+      input.caller.email ??
+      (input.caller.kind === "system" ? "system" : input.caller.kind === "service" ? "control-plane" : "unknown");
     try {
       await repo.decide({ action, actor, ...(heldTrigger !== undefined ? { triggerId: heldTrigger } : {}) });
       return reply({ decided: action });

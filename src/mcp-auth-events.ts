@@ -180,7 +180,7 @@ function rowToEvent(row: AuthEventRow): AuthEvent {
     cause: row.cause as AuthEventCause,
     clientId: row.client_id,
     clientPath: row.client_path as ClientPath,
-    identityKind: row.identity_kind === "human" || row.identity_kind === "system" ? row.identity_kind : null,
+    identityKind: row.identity_kind === "human" || row.identity_kind === "system" || row.identity_kind === "service" ? row.identity_kind : null,
     email: row.email,
     familyId: row.family_id,
     latencyMs: row.latency_ms,
