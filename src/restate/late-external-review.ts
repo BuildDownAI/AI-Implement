@@ -18,7 +18,7 @@ import { parse as parseYaml } from "yaml";
 import { parseReviewCheckNamesConfig } from "../pipeline/steps/install.js";
 import { getCombinedChecksState, getCommitTime, getDefaultBranchFileText, getPullRequestState, listCheckRuns, listPrComments, listPullRequestCommits, postPrComment } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
-import { getJobByDispatchId, stampJobApproved } from "../log.js";
+import { getJobByDispatchId, getJobById, recordLateReviewEnding, stampJobApproved } from "../log.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
 import { getMappings } from "../config.js";
 import { classifyReviewIssueComment, type ReviewLedgerOptions } from "../pipeline/review-ledger.js";
@@ -73,6 +73,8 @@ export const lateExternalReviewInputSchema = z.object({
   followHead: z.boolean().optional(),
   /** A Restate review-fix attempt (AII-1307) submitted this review: the workflow key is `<dispatchId>-<attemptId>`, so an earlier workflow for the row that already ended does not block it. The mark is still stamped by `dispatchId`. */
   attemptId: z.string().min(1).optional(),
+  /** The `dispatch_log` id the sweep or the gap-fill callback selected (AII-1524). Every ending is written to that row; absent on a workflow submitted before it existed, which falls back to the newest row for the dispatch id and records no ending (the sweep settles it). */
+  rowId: z.number().int().positive().optional(),
 }).strict().refine((i) => i.gapFill === true || !!i.headSha, { message: "headSha is required unless gapFill", path: ["headSha"] });
 
 export type LateExternalReviewInput = z.infer<typeof lateExternalReviewInputSchema>;
@@ -117,8 +119,10 @@ export interface LateExternalReviewDependencies {
   /** Gap-fill only (AII-1302): `true` when any earlier commit of the PR (newest 20, head excluded) had a review check run. Throws when unreadable. */
   readReviewerExpected?(input: LateExternalReviewInput & { headSha: string }): Promise<boolean>;
   /** The dispatch row's id and whether it already carries the mark, or `null` when the row is gone. */
-  findJob(dispatchId: string): LateReviewJob | null | Promise<LateReviewJob | null>;
+  findJob(dispatchId: string, rowId?: number): LateReviewJob | null | Promise<LateReviewJob | null>;
   stampApproved(jobId: number, prUrl: string): void | Promise<void>;
+  /** Writes the workflow's ending to the row it was submitted for (AII-1524): `late_review_<outcome>`, and `approved = 1` only for `approved`. Never overwrites a row that left `external_review_pending`. */
+  recordEnding(rowId: number, outcome: LateExternalReviewOutcome): void | Promise<void>;
   /** `true` when a PR comment with `marker` exists already. */
   hasComment(input: LateExternalReviewInput, marker: string, opts?: { strict?: boolean }): Promise<boolean>;
   postComment(input: LateExternalReviewInput, body: string): Promise<void>;
@@ -164,6 +168,20 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
         if (!(err instanceof restate.TerminalError)) throw err;
         ctx.console.log(`[late-external-review] held comment failed dispatch=${input.dispatchId}: ${err.message}`);
       }
+      await record(outcome);
+      return result;
+    }
+
+    // Journaled, so a replay writes the row once. Only when the input names a row: a workflow submitted before `rowId` existed has no `record ending` entry to replay.
+    async function record(outcome: LateExternalReviewOutcome): Promise<void> {
+      const rowId = input.rowId;
+      if (rowId === undefined) return;
+      await ctx.run("record ending", async () => { await deps.recordEnding(rowId, outcome); }, { maxRetryAttempts: 5 });
+    }
+
+    async function finish(outcome: LateExternalReviewOutcome): Promise<LateExternalReviewResult> {
+      const result = end(outcome);
+      await record(outcome);
       return result;
     }
 
@@ -189,8 +207,8 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
     for (let i = 0; ; i++) {
       const tick = await ctx.run(`read-${i}`, () => deps.readTick(tickInput), { maxRetryAttempts: 5 });
       // Follow mode: the head moving is the expected result of the repository's auto-fix, so only a close ends it.
-      if (!tick.open || (!input.followHead && tick.headSha !== headSha)) return end("superseded");
-      if (tick.checks === "failure") return end("external-failed");
+      if (!tick.open || (!input.followHead && tick.headSha !== headSha)) return finish("superseded");
+      if (tick.checks === "failure") return finish("external-failed");
       // A finding last seen before the head was committed was not reported by a review of this head
       // (a fix pass may have fixed it); one seen at or after the commit time blocks.
       const commitMs = tick.headCommittedAtMs;
@@ -207,7 +225,7 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
 
     // One journaled step. A retry after a crash re-enters it, so each effect checks before it writes.
     const outcome = await ctx.run("approve", async (): Promise<LateExternalReviewOutcome> => {
-      const job = await deps.findJob(input.dispatchId);
+      const job = await deps.findJob(input.dispatchId, input.rowId);
       if (!job) return "no-job";
       // An attempt's submit picks the PR's newest row; a run that started since is not this review's to mark (AII-1307).
       if (input.attemptId && job.inFlight && !job.approved) return "superseded";
@@ -220,7 +238,7 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
       }
       return "approved";
     }, { maxRetryAttempts: 5 });
-    return end(outcome);
+    return finish(outcome);
   }
 
   return restate.workflow({
@@ -342,11 +360,12 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
       const heldBy = rejected ?? (blockingLastSeenAtMs.some((seen) => seen >= headCommittedAtMs) ? "ledger" as const : undefined);
       return { open, headSha: pr.headSha, checks, headCommittedAtMs, blockingLastSeenAtMs, ...(heldBy ? { heldBy } : {}) };
     },
-    findJob(dispatchId) {
-      const job = getJobByDispatchId(dispatchId);
+    findJob(dispatchId, rowId) {
+      const job = rowId === undefined ? getJobByDispatchId(dispatchId) : getJobById(rowId);
       return job ? { id: job.id, approved: job.approved, inFlight: job.status === "dispatched" || job.status === "running" } : null;
     },
     stampApproved: (jobId, prUrl) => stampJobApproved(jobId, prUrl),
+    recordEnding: (rowId, outcome) => { recordLateReviewEnding(rowId, outcome); },
     async hasComment(input, marker, opts) {
       const t = await token(input.owner);
       const comments = opts?.strict
@@ -369,7 +388,15 @@ export type LateExternalReviewSubmitResult = "accepted" | "conflict" | "unavaila
 export interface LateExternalReviewIngressClient {
   /** Starts the workflow keyed by `lateExternalReviewWorkflowKey(input)`; the workflow key is the idempotency. */
   submit(input: LateExternalReviewInput): Promise<LateExternalReviewSubmitResult>;
+  /** The workflow's state without waiting (AII-1524). `unavailable` on any error other than "no such workflow". */
+  getState(key: string): Promise<LateExternalReviewState>;
 }
+
+export type LateExternalReviewState =
+  | { state: "running" }
+  | { state: "finished"; outcome: LateExternalReviewOutcome }
+  | { state: "absent" }
+  | { state: "unavailable" };
 
 /** Never throws: a connection error or timeout resolves `unavailable`. */
 export function createLateExternalReviewIngressClient(
@@ -388,6 +415,18 @@ export function createLateExternalReviewIngressClient(
       } catch (err) {
         if (err instanceof restateClients.HttpCallError && err.status === 409) return "conflict";
         return "unavailable";
+      }
+    },
+    async getState(key) {
+      try {
+        const out = await ingress
+          .workflowClient<LateExternalReviewDefinition>({ name: "LateExternalReview" }, key)
+          .workflowOutput(restateClients.rpc.opts({ timeout }));
+        if (!out.ready) return { state: "running" };
+        return { state: "finished", outcome: out.result.outcome };
+      } catch (err) {
+        if (err instanceof restateClients.HttpCallError && err.status === 404) return { state: "absent" };
+        return { state: "unavailable" };
       }
     },
   };

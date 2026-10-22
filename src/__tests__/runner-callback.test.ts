@@ -1500,7 +1500,7 @@ describe("handleRunnerResult — implementation", () => {
       await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
       expect(submit).toHaveBeenCalledTimes(1);
       expect(submit).toHaveBeenCalledWith({
-        dispatchId, owner: "o", repo: "r", prNumber: 7, prUrl: "https://github.com/o/r/pull/7", gapFill: true,
+        dispatchId, owner: "o", repo: "r", prNumber: 7, prUrl: "https://github.com/o/r/pull/7", gapFill: true, rowId,
       });
       // Idempotent through the workflow key: the real hook answers `conflict` and the row is unchanged.
     });
@@ -1535,6 +1535,85 @@ describe("handleRunnerResult — implementation", () => {
       await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
       expect(submit).toHaveBeenCalledTimes(1);
       expect(submit).toHaveBeenCalledWith(expect.objectContaining({ dispatchId: fresh.dispatchId }));
+    });
+
+    describe("settles a row before it submits (AII-1524)", () => {
+      const conclusionOf = (rowId: number) => log.getJobById(rowId)?.conclusion;
+
+      it("a finished workflow settles the row with its ending, logs once, and submits nothing", async () => {
+        const { rowId, dispatchId } = pendingRow("i-fin");
+        await setCompleted(rowId, NOW - HOUR);
+        const submit = vi.fn(async () => {});
+        const getState = vi.fn(async () => ({ state: "finished", outcome: "timed-out" }) as const);
+        const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+        await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, getState, now: NOW });
+        await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, getState, now: NOW });
+        const lines = logSpy.mock.calls.map((c) => String(c[0])).filter((l) => l.includes("settled"));
+        logSpy.mockRestore();
+        expect(getState).toHaveBeenCalledWith(dispatchId);
+        expect(submit).not.toHaveBeenCalled();
+        expect(conclusionOf(rowId)).toBe("late_review_timed-out");
+        expect(log.getJobById(rowId)?.approved).toBe(false);
+        expect(lines).toEqual([`[late-review-sweep] row ${rowId} settled: timed-out`]);
+      });
+
+      it("a finished approved workflow marks the row approved", async () => {
+        const { rowId } = pendingRow("i-fin-ok");
+        await setCompleted(rowId, NOW - HOUR);
+        const submit = vi.fn(async () => {});
+        await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, getState: async () => ({ state: "finished", outcome: "approved" }), now: NOW });
+        expect(submit).not.toHaveBeenCalled();
+        expect(conclusionOf(rowId)).toBe("late_review_approved");
+        expect(log.getJobById(rowId)?.approved).toBe(true);
+      });
+
+      it("a running workflow submits nothing and leaves the row", async () => {
+        const { rowId } = pendingRow("i-run");
+        await setCompleted(rowId, NOW - HOUR);
+        const submit = vi.fn(async () => {});
+        await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, getState: async () => ({ state: "running" }), now: NOW });
+        expect(submit).not.toHaveBeenCalled();
+        expect(conclusionOf(rowId)).toBe("external_review_pending");
+      });
+
+      it("an unreadable state or PR changes nothing and submits nothing", async () => {
+        const { rowId } = pendingRow("i-unk");
+        await setCompleted(rowId, NOW - HOUR);
+        const submit = vi.fn(async () => {});
+        await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, getState: async () => ({ state: "unavailable" }), getPrClosed: async () => false, now: NOW });
+        await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, getState: async () => ({ state: "absent" }), getPrClosed: async () => null, now: NOW });
+        expect(submit).not.toHaveBeenCalled();
+        expect(conclusionOf(rowId)).toBe("external_review_pending");
+      });
+
+      it("an absent workflow on an open PR submits once, with the row id", async () => {
+        const { rowId, dispatchId } = pendingRow("i-abs");
+        await setCompleted(rowId, NOW - HOUR);
+        const submit = vi.fn(async () => {});
+        await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, getState: async () => ({ state: "absent" }), getPrClosed: async () => false, now: NOW });
+        expect(submit).toHaveBeenCalledTimes(1);
+        expect(submit).toHaveBeenCalledWith({ dispatchId, owner: "o", repo: "r", prNumber: 7, prUrl: "https://github.com/o/r/pull/7", gapFill: true, rowId });
+      });
+
+      it("a merged or closed PR marks the row late_review_pr_closed without a state read or a submit", async () => {
+        const merged = pendingRow("i-merged");
+        await setCompleted(merged.rowId, NOW - HOUR);
+        const submit = vi.fn(async () => {});
+        const getState = vi.fn(async () => ({ state: "absent" }) as const);
+        await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, getState, getPrClosed: async () => true, now: NOW });
+        expect(conclusionOf(merged.rowId)).toBe("late_review_pr_closed");
+        expect(submit).not.toHaveBeenCalled();
+        expect(getState).not.toHaveBeenCalled();
+        // Settled: the next sweep does not select it.
+        expect(log.getGapFillRowsAwaitingLateReview(NOW - 24 * HOUR)).toEqual([]);
+      });
+
+      it("recordLateReviewEnding never replaces a mark a later write set", () => {
+        const { rowId } = pendingRow("i-guard");
+        log.stampJobApproved(rowId, "https://github.com/o/r/pull/7");
+        expect(log.recordLateReviewEnding(rowId, "superseded")).toBe(false);
+        expect(conclusionOf(rowId)).toBe("runner_approved");
+      });
     });
 
     it("skips approved, non-gap-fill, and PR-less rows", async () => {
@@ -2576,7 +2655,7 @@ describe("handleRunnerResult — gap-analysis", () => {
     expect(log.getRunRecordMergeVerdict("ENG-7", "https://github.com/org/repo/pull/12")).toBe("hold");
     expect(hook).toHaveBeenCalledTimes(1);
     expect(hook).toHaveBeenCalledWith({
-      dispatchId, owner: "org", repo: "repo", prNumber: 12, prUrl: "https://github.com/org/repo/pull/12", gapFill: true,
+      dispatchId, owner: "org", repo: "repo", prNumber: 12, prUrl: "https://github.com/org/repo/pull/12", gapFill: true, rowId: expect.any(Number),
     });
   });
 
