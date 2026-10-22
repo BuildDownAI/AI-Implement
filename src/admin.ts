@@ -734,6 +734,15 @@ function grantedRouteAllows(url: string, method: string, grantedPages: string[])
 /** Matches POST /api/tools/<name> — the tools-service entry point (AII-712). */
 const TOOL_CALL_ROUTE = /^\/api\/tools\/([^/]+)$/;
 
+/** decodeURIComponent that answers null on malformed percent-encoding instead of throwing. */
+function safeDecode(segment: string): string | null {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return null;
+  }
+}
+
 /** Review-fix attempt routes (AII-806). Matched against the path with any query string
  *  stripped — the activity route takes cursor/pageSize as query params. */
 const REVIEW_FIX_ATTEMPT_ROUTE = /^\/api\/review-fix\/attempts\/([^/]+)$/;
@@ -825,9 +834,10 @@ export function handleAdminRequest(
     method === "POST" &&
     TOOL_CALL_ROUTE.test(url) &&
     req.headers.authorization?.startsWith("Bearer ") &&
-    controlPlaneTokenActive()
+    controlPlaneTokenActive() &&
+    safeDecode(TOOL_CALL_ROUTE.exec(url)![1]) !== null
   ) {
-    const toolName = decodeURIComponent(TOOL_CALL_ROUTE.exec(url)![1]);
+    const toolName = safeDecode(TOOL_CALL_ROUTE.exec(url)![1])!;
     void verifyControlPlaneToken(req.headers.authorization)
       .then((caller) => {
         if (caller) return handleToolCall(req, res, caller, "control-plane", toolName, deps);

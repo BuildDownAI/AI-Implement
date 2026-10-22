@@ -4604,6 +4604,13 @@ describe("control-plane token on /api (AII-1514)", () => {
     expect(callTool.mock.calls[0]?.[2]).toMatchObject({ kind: "human", role: "admin" });
   });
 
+  it("answers 401, not 500, for a malformed percent-encoded tool name with a Bearer header", async () => {
+    const callTool = vi.fn<NonNullable<AdminModule.AdminDeps["callTool"]>>(async () => ({ status: "ok" as const, content: [] }));
+    const res = await call("/api/tools/%E0", "POST", "x", { callTool });
+    expect(res.statusCode).toBe(401);
+    expect(callTool).not.toHaveBeenCalled();
+  });
+
   it("ignores the token when BUILDDOWN_OIDC_ISSUER is unset", async () => {
     const t = await cpToken();
     delete process.env.BUILDDOWN_OIDC_ISSUER;
