@@ -708,9 +708,7 @@ export const decideKgRefreshTool = tool(
     const repo = ctx.objectClient(KgRepo, toolDeps.kgSourceRepo);
     if ((await repo.status()) == null) return toolError("no-refresh-in-flight");
     const { action, triggerId: heldTrigger } = input.args;
-    const actor =
-      input.caller.email ??
-      (input.caller.kind === "system" ? "system" : input.caller.kind === "service" ? "control-plane" : "unknown");
+    const actor = input.caller.email ?? (input.caller.kind === "system" ? "system" : "unknown");
     try {
       await repo.decide({ action, actor, ...(heldTrigger !== undefined ? { triggerId: heldTrigger } : {}) });
       return reply({ decided: action });
