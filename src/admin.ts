@@ -74,7 +74,7 @@ import type { OwnershipSnapshot } from "./model-session-ownership.js";
 import { getDb, listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { listParked, unpark } from "./dispatch-breaker.js";
 import { createSession, accessCodeMatches, authenticateAdminRequest, type AdminGate, type SessionIdentity } from "./admin-session.js";
-import { getEffectiveAllowlist, getEnvAllowlist, clearAccessBindings, listAccessEntries, parseAccessEntries, saveAccessEntries, type AccessRole } from "./access-entries.js";
+import { getEffectiveAllowlist, getEnvAllowlist, listAccessEntries, parseAccessEntries, saveAccessEntries, type AccessRole } from "./access-entries.js";
 import { listAccessChanges } from "./access-audit.js";
 import { listGrantedPages, PAGE_ROUTES, savePageGrants } from "./access-page-grants.js";
 import type { DeployStart } from "./deploy.js";
@@ -569,6 +569,12 @@ export interface AdminDeps {
    * Absent only in tests that don't exercise reviewFixLifecycle="restate" enablement.
    */
   getRestateStatus?: () => RestateStatus;
+  /**
+   * Clears an address's bindings through the `AccessBinding` object (src/restate/access-binding.ts), which is the only
+   * writer of bindings. Injected for the same reason as `getRestateStatus`; bound in src/index.ts. Absent in tests that
+   * don't exercise the route, where it answers 503. There is no direct-delete fallback.
+   */
+  clearAccessBindings?: (address: string, actor: string | null) => Promise<number>;
   /** Reads a profile's ChatGPT refresh state (src/restate/chatgpt-plan-account.ts). Injected for the same reason as `getRestateStatus`; absent in tests, where the status reports `unknown`. */
   readChatGptPlanState?: (profileId: string) => Promise<{ lastOutcome: string } | null>;
   /**
@@ -1367,7 +1373,7 @@ export function handleAdminRequest(
     }
 
     if (url === "/api/access/clear-bindings" && method === "POST") {
-      handleClearAccessBindings(req, res, gate.identity);
+      handleClearAccessBindings(req, res, gate.identity, deps);
       return true;
     }
 
@@ -3093,6 +3099,7 @@ async function handleClearAccessBindings(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   identity: SessionIdentity | null,
+  deps: AdminDeps,
 ): Promise<void> {
   if (!identity) {
     json(res, 403, { error: "Clearing bindings requires a signed-in identity" });
@@ -3110,9 +3117,10 @@ async function handleClearAccessBindings(
     return;
   }
   try {
-    clearAccessBindings(address, identity.email);
+    if (!deps.clearAccessBindings) throw new Error("the binding service is not available");
+    await deps.clearAccessBindings(address, identity.email);
   } catch (err) {
-    json(res, 500, { error: err instanceof Error ? err.message : "the bindings could not be cleared" });
+    json(res, 500, { error: err instanceof Error ? `the bindings could not be cleared: ${err.message}` : "the bindings could not be cleared" });
     return;
   }
   handleGetAccess(res, identity);

@@ -52,6 +52,7 @@ import { getInstallationToken, getInstallationId, getAppSlug, getScopedInstallat
 import { configureLinearAuth } from "./linear-app-auth.js";
 import { configureOAuthProviders, isOAuthConfigured, providersFromEnv } from "./oauth/providers.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
+import { clearAccessBindingsViaObject } from "./restate/access-binding.js";
 import { allowlistHasNoAdmin, initAccessEntriesTable } from "./access-entries.js";
 import { initAccessAuditTable } from "./access-audit.js";
 import { initAuthEventsTable } from "./mcp-auth-events.js";
@@ -5212,7 +5213,7 @@ function startServer(
           return { started: getPollStats().pollCount > before };
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, getRestateStatus, readChatGptPlanState,
+      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, getRestateStatus, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject,
         retention: {
           getRestateDays: getRestateRetentionDays,
           setRestateDays: setRestateRetentionDays,

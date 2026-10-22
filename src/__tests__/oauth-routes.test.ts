@@ -244,6 +244,23 @@ describe("handleOAuthCallback binding (AII-1523)", () => {
     }
   });
 
+  it("never calls the Restate ingress for an identity already bound to its provider", async () => {
+    allowAddress();
+    dedup.getDb().prepare("INSERT INTO access_entry_bindings (value, provider, subject, bound_at) VALUES (?, ?, ?, ?)")
+      .run("ada@eudoxus.ai", "google", "google|1", Date.now());
+    access.refreshEffectiveAllowlist();
+    const fetchMock = vi.fn().mockRejectedValue(new Error("ingress must not be called"));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const res = await callback();
+      expect(res.headers["Location"]).toBe("/admin");
+      expect(sessionCount()).toBe(1);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("denies the sign-in on a subject conflict", async () => {
     allowAddress();
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ status: "conflict" }), {
