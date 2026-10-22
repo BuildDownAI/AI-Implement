@@ -878,7 +878,16 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   // AII-1304: retry LateExternalReview for gap-fill rows submitted while Restate was not ready.
   try {
-    await resubmitPendingGapFillReviews({ ready: restateReady, submit: lateExternalReviewSubmitHook });
+    await resubmitPendingGapFillReviews({
+      ready: restateReady,
+      submit: lateExternalReviewSubmitHook,
+      getState: (key) => lateExternalReviewIngress.getState(key),
+      getPrClosed: async ({ owner, repo, prNumber }) => {
+        const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+        const pr = await getPullRequestState(token, owner, repo, prNumber);
+        return pr ? pr.merged || pr.state !== "open" : null;
+      },
+    });
   } catch (err) {
     console.error("[poll] late-review sweep failed:", err);
   }
@@ -4363,8 +4372,9 @@ function restateReady(): boolean {
   const restate = getRestateStatus();
   return restate.sidecar.state === "ready" && restate.registration.state === "registered";
 }
+const lateExternalReviewIngress = createLateExternalReviewIngressClient();
 const submitLateExternalReview = createLateExternalReviewSubmitHook({
-  ingress: createLateExternalReviewIngressClient(),
+  ingress: lateExternalReviewIngress,
   restateReady,
 });
 // A repository-fix project's workflow follows the auto-fix to its new head (ADR 038); the mode rides the input.

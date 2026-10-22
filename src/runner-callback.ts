@@ -12,6 +12,7 @@ import {
   getGapFillRowsAwaitingLateReview,
   getPendingLateReviews,
   clearPendingLateReview,
+  recordLateReviewEnding,
   recordPendingLateReview,
 } from "./log.js";
 import { redactStepCredentials } from "./pipeline/step-redaction.js";
@@ -54,7 +55,7 @@ import { normalizeInvocation } from "./agent-usage.js";
 import { acceptedReviewFixDispatchId } from "./review-fix-attempt-store.js";
 import { sanitizeAttribution, type InvocationAttributionV1 } from "./pipeline/types.js";
 import { isCycleSummary, stripCycleAttribution, sanitizeCycleSummaries, type CycleSummary, type CycleDisposition } from "./pipeline/cycle-summary.js";
-import { lateExternalReviewWorkflowKey, type LateExternalReviewInput } from "./restate/late-external-review.js";
+import { lateExternalReviewWorkflowKey, type LateExternalReviewInput, type LateExternalReviewState } from "./restate/late-external-review.js";
 import { recordReviewFixCycleSummary, type ReviewFixCycleSummaryOutcome } from "./review-fix-evidence.js";
 import type { ReviewFixFindingDisposition } from "./review-fix-ports.js";
 import {
@@ -1314,6 +1315,7 @@ export async function handleRunnerResult(
             ...target,
             prUrl: job.prUrl!,
             gapFill: true,
+            rowId: job.id,
           });
         } catch (err) {
           warn("submitLateExternalReview", err);
@@ -1723,7 +1725,11 @@ const LATE_REVIEW_RESUBMIT_WINDOW_MS = 24 * 60 * 60 * 1000;
  */
 export async function resubmitPendingGapFillReviews(opts: {
   ready: () => boolean;
-  submit: (input: { dispatchId: string; owner: string; repo: string; prNumber: number; prUrl: string; gapFill?: true; attemptId?: string; headSha?: string }) => Promise<boolean | void> | boolean | void;
+  submit: (input: { dispatchId: string; owner: string; repo: string; prNumber: number; prUrl: string; gapFill?: true; attemptId?: string; headSha?: string; rowId?: number }) => Promise<boolean | void> | boolean | void;
+  /** The workflow's state by key (AII-1524). Absent: every candidate row is submitted, as before. */
+  getState?: (key: string) => Promise<LateExternalReviewState>;
+  /** Whether the PR is merged or closed; `null` when unreadable. Absent: the PR is not checked. */
+  getPrClosed?: (target: { owner: string; repo: string; prNumber: number }) => Promise<boolean | null>;
   now?: number;
 }): Promise<number> {
   if (!opts.ready()) return 0;
@@ -1731,9 +1737,27 @@ export async function resubmitPendingGapFillReviews(opts: {
   for (const job of getGapFillRowsAwaitingLateReview((opts.now ?? Date.now()) - LATE_REVIEW_RESUBMIT_WINDOW_MS)) {
     const target = parsePrUrlTarget(job.prUrl!);
     if (!target) continue;
+    const settle = (ending: string) => {
+      if (recordLateReviewEnding(job.id, ending)) console.log(`[late-review-sweep] row ${job.id} settled: ${ending}`);
+    };
+    try {
+      if (opts.getPrClosed) {
+        const closed = await opts.getPrClosed(target);
+        if (closed === true) { settle("pr_closed"); continue; }
+        if (closed === null) continue; // unreadable PR: not evidence either way
+      }
+      if (opts.getState) {
+        const state = await opts.getState(job.dispatchId!);
+        if (state.state === "finished") { settle(state.outcome); continue; }
+        if (state.state === "running" || state.state === "unavailable") continue;
+      }
+    } catch (err) {
+      console.warn(`[late-review-sweep] state read failed dispatch=${job.dispatchId}:`, err);
+      continue;
+    }
     console.log(`[late-review-sweep] re-submitting LateExternalReview dispatch=${job.dispatchId} pr=${job.prUrl}`);
     try {
-      await opts.submit({ dispatchId: job.dispatchId!, ...target, prUrl: job.prUrl!, gapFill: true });
+      await opts.submit({ dispatchId: job.dispatchId!, ...target, prUrl: job.prUrl!, gapFill: true, rowId: job.id });
       submitted++;
     } catch (err) {
       console.warn(`[late-review-sweep] submit failed dispatch=${job.dispatchId}:`, err);

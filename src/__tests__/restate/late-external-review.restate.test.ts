@@ -6,6 +6,7 @@ import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   LATE_EXTERNAL_APPROVAL_MARKER,
+  createLateExternalReviewIngressClient,
   createLateExternalReviewWorkflow,
   lateExternalReviewWorkflowKey,
   type LateExternalReviewDependencies,
@@ -13,7 +14,7 @@ import {
   type LateExternalReviewResult,
   type LateReviewTick,
 } from "../../restate/late-external-review.js";
-import { VARIANTS, callWorkflow, crashAfterFirstCall, startRetryEnabled, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, callWorkflow, eventually, crashAfterFirstCall, startRetryEnabled, startVariants, stopAll } from "./harness.js";
 
 const SHA = "a".repeat(40);
 const OTHER_SHA = "b".repeat(40);
@@ -38,6 +39,13 @@ interface Scenario {
   /** What `readReviewerExpected` returns; counts the reads. */
   reviewerExpected: boolean;
   reviewerReads: number;
+  /** Row-keyed dispatch_log stand-in (AII-1524): `newest` is what a dispatch-id lookup returns, like `getJobByDispatchId`. */
+  rows?: Map<number, { conclusion: string; approved: boolean }>;
+  newestRowId?: number;
+  /** `findJob` answers null for this row id (the row vanished after the sweep selected it). */
+  goneRowId?: number;
+  /** Every `recordEnding` call, in order. */
+  recorded: Array<[number, string]>;
 }
 
 const scenarios = new Map<string, Scenario>();
@@ -86,13 +94,29 @@ function makeDeps(): LateExternalReviewDependencies {
       sc.reads++;
       return tick;
     },
-    findJob(dispatchId) {
+    findJob(dispatchId, rowId) {
       const sc = scenarioOf(dispatchId);
+      if (sc.rows) {
+        const row = rowId === sc.goneRowId ? undefined : sc.rows.get(rowId ?? sc.newestRowId!);
+        return row ? { id: rowId ?? sc.newestRowId!, approved: row.approved } : null;
+      }
       return sc.hasJob ? { id: sc.jobId, approved: sc.jobApproved, inFlight: sc.jobInFlight } : null;
+    },
+    recordEnding(rowId, outcome) {
+      // Mirrors recordLateReviewEnding: only a pending, unapproved row changes.
+      const sc = [...scenarios.values()].find((c) => c.rows?.has(rowId) || c.jobId === rowId)!;
+      sc.recorded.push([rowId, outcome]);
+      const row = sc.rows?.get(rowId);
+      if (row && row.conclusion === "external_review_pending" && !row.approved) {
+        row.conclusion = `late_review_${outcome}`;
+        row.approved = outcome === "approved";
+      }
     },
     stampApproved(jobId) {
       // The fake mirrors stampJobApproved's effect: the row now carries the mark.
-      const sc = [...scenarios.values()].find((c) => c.jobId === jobId)!;
+      const sc = [...scenarios.values()].find((c) => c.rows?.has(jobId) || c.jobId === jobId)!;
+      const row = sc.rows?.get(jobId);
+      if (row) { row.approved = true; row.conclusion = "runner_approved"; }
       sc.stamps.push(jobId);
       sc.jobApproved = true;
     },
@@ -115,6 +139,7 @@ describe("LateExternalReview workflow", () => {
   let envs: Map<string, RestateEnvironment>;
   let retryEnv: RestateEnvironment;
   let counter = 0;
+  let rowSeq = 0;
 
   beforeAll(async () => {
     const services = [createLateExternalReviewWorkflow(makeDeps())];
@@ -125,15 +150,16 @@ describe("LateExternalReview workflow", () => {
     await Promise.all([stopAll(envs), retryEnv?.stop()]);
   });
 
-  async function runScenario(url: string, overrides: Partial<Scenario>, follow = false, gapFill = false, fixedDispatchId?: string, attemptId?: string) {
+  async function runScenario(url: string, overrides: Partial<Scenario>, follow = false, gapFill = false, fixedDispatchId?: string, attemptId?: string, rowId?: number) {
     const dispatchId = fixedDispatchId ?? `late-${counter++}`;
-    const sc: Scenario = { ticks: [passed], reads: 0, jobApproved: false, hasJob: true, jobId: 1000 + counter, stamps: [], comments: [], head: SHA, headReads: 0, reviewerExpected: false, reviewerReads: 0, ...overrides };
+    const sc: Scenario = { ticks: [passed], reads: 0, jobApproved: false, hasJob: true, jobId: 1000 + counter, stamps: [], comments: [], recorded: [], head: SHA, headReads: 0, reviewerExpected: false, reviewerReads: 0, ...overrides };
     scenarios.set(dispatchId, sc);
     const input: LateExternalReviewInput = {
       dispatchId, owner: "o", repo: "r", prNumber: 5, prUrl: "https://github.com/o/r/pull/5",
       ...(gapFill ? { gapFill: true } : { headSha: SHA }),
       ...(follow ? { followHead: true } : {}),
       ...(attemptId ? { attemptId } : {}),
+      ...(rowId !== undefined ? { rowId } : {}),
     };
     const result = await callWorkflow<LateExternalReviewResult>(url, "LateExternalReview", lateExternalReviewWorkflowKey(input), "run", input);
     return { result, sc };
@@ -434,8 +460,75 @@ describe("LateExternalReview workflow", () => {
         expect(result.outcome).toBe("no-job");
         expect(sc.comments).toEqual([]);
       });
+
+      describe("records the ending on the submitted row (AII-1524)", () => {
+        // An older pending row (A) and a newer, already approved row (B) share one dispatch id.
+        // Row ids are unique per call: every scenario stays in the shared map.
+        let A = 0, B = 0;
+        const nextIds = () => { A = 10_000 + (rowSeq += 2); B = A + 1; };
+        const twoRows = () => (nextIds(), {
+          rows: new Map([[A, { conclusion: "external_review_pending", approved: false }], [B, { conclusion: "runner_approved", approved: true }]]),
+          newestRowId: B,
+        });
+        // What the sweep's query asks of a row.
+        const stillAwaiting = (sc: Scenario, id: number) => {
+          const r = sc.rows!.get(id)!;
+          return r.conclusion === "external_review_pending" && !r.approved;
+        };
+
+        it("approved: stamps the older row by rowId, leaves the newer row, and the sweep no longer selects it", async () => {
+          const { result, sc } = await runScenario(url(), twoRows(), false, true, undefined, undefined, A);
+          expect(result).toEqual({ outcome: "approved" });
+          expect(sc.rows!.get(A)!.approved).toBe(true);
+          expect(sc.rows!.get(B)).toEqual({ conclusion: "runner_approved", approved: true });
+          expect(stillAwaiting(sc, A)).toBe(false);
+          expect(sc.recorded).toEqual([[A, "approved"]]);
+        });
+
+        it("without rowId the newest row is the target (the bug this fixes)", async () => {
+          const { sc } = await runScenario(url(), twoRows(), false, true);
+          expect(sc.rows!.get(A)!.approved).toBe(false);
+          expect(sc.recorded).toEqual([]);
+        });
+
+        const endings: Array<[string, Partial<Scenario>]> = [
+          ["superseded", { ticks: [{ ...pending, open: false }] }],
+          ["findings", { ticks: [{ ...passed, blockingLastSeenAtMs: [COMMIT_MS + 1] }] }],
+          ["timed-out", { ticks: [pending] }],
+          ["external-failed", { ticks: [{ ...pending, checks: "failure" }] }],
+          ["no-job", { ticks: [passed] }],
+        ];
+        for (const [ending, over] of endings) {
+          it(`${ending}: the row becomes late_review_${ending}, unapproved, and the sweep no longer selects it`, async () => {
+            const rows = ending === "no-job"
+              ? (nextIds(), { rows: new Map([[A, { conclusion: "external_review_pending", approved: false }]]), newestRowId: A, goneRowId: A })
+              : twoRows();
+            const { result, sc } = await runScenario(url(), { ...rows, ...over }, false, true, undefined, undefined, A);
+            expect(result.outcome).toBe(ending);
+            expect(sc.recorded).toEqual([[A, ending]]);
+            if (ending === "no-job") return; // the row is gone: nothing to update
+            expect(sc.rows!.get(A)).toEqual({ conclusion: `late_review_${ending}`, approved: false });
+            expect(stillAwaiting(sc, A)).toBe(false);
+          });
+        }
+      });
     });
   }
+
+  it("ingress getState reads absent, running, then finished without waiting (AII-1524)", async () => {
+    const client = createLateExternalReviewIngressClient(retryEnv.baseUrl());
+    expect(await client.getState("late-state-none")).toEqual({ state: "absent" });
+    const dispatchId = "late-state-1";
+    scenarios.set(dispatchId, {
+      ticks: [pending, pending, { ...pending, open: false }], reads: 0, jobApproved: false, hasJob: true, jobId: 9001, stamps: [],
+      comments: [], head: SHA, headReads: 0, reviewerExpected: false, reviewerReads: 0, recorded: [],
+    });
+    const input: LateExternalReviewInput = { dispatchId, owner: "o", repo: "r", prNumber: 5, prUrl: "https://github.com/o/r/pull/5", headSha: SHA };
+    expect(await client.submit(input)).toBe("accepted");
+    expect(await client.getState(dispatchId)).toEqual({ state: "running" });
+    const state = await eventually(() => client.getState(dispatchId), (v) => v.state !== "running", { label: "finished workflow" });
+    expect(state).toEqual({ state: "finished", outcome: "superseded" });
+  });
 
   it("approves on replay after a crash with an old blocking finding present", async () => {
     const { result, sc } = await runScenario(retryEnv.baseUrl(), {

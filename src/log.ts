@@ -601,6 +601,21 @@ export function stampJobApproved(jobId: number, prUrl: string): void {
 }
 
 /**
+ * Writes how a LateExternalReview ended to the gap-fill row it was submitted for (AII-1524):
+ * `conclusion = late_review_<ending>`, and `approved = 1` only for `approved`. Guarded on the row
+ * still being `external_review_pending` and unapproved, so it never replaces a later mark
+ * (including the `runner_approved` the workflow's own stamp wrote). Returns whether a row changed.
+ */
+export function recordLateReviewEnding(rowId: number, ending: string): boolean {
+  return getDb()
+    .prepare(
+      `UPDATE dispatch_log SET conclusion = ?, approved = ?
+       WHERE id = ? AND conclusion = 'external_review_pending' AND approved = 0`,
+    )
+    .run(`late_review_${ending}`, ending === "approved" ? 1 : 0, rowId).changes > 0;
+}
+
+/**
  * Finalizes planning jobs left in 'unknown' (the boot-time reset for GHA jobs whose
  * run was never attached — e.g. the orchestrator restarted mid-run). Called when the
  * same issue's IMPLEMENTATION phase dispatches: implementation only follows plan
