@@ -209,6 +209,60 @@ describe("handleOAuthCallback", () => {
   });
 });
 
+describe("handleOAuthCallback binding (AII-1523)", () => {
+  function allowAddress(): void {
+    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
+  }
+  const bindingCount = () =>
+    (dedup.getDb().prepare("SELECT COUNT(*) AS c FROM access_entry_bindings").get() as { c: number }).c;
+  const sessionCount = () => (dedup.getDb().prepare("SELECT COUNT(*) AS c FROM admin_sessions").get() as { c: number }).c;
+
+  async function callback(): Promise<MockResponse> {
+    providers.configureOAuthProviders([googleProvider]);
+    store.putTransaction({ state: "bn", provider: "google", codeVerifier: "v", nonce: "n", redirectTo: "/admin" });
+    vi.mocked(oidc.completeAuth).mockResolvedValue(identity());
+    const res = new MockResponse();
+    await routes.handleOAuthCallback(mkReq("/api/auth/google/callback?state=bn&code=c"), asRes(res), "google", baseUrl, false);
+    return res;
+  }
+
+  it("denies the sign-in and binds nothing when the Restate ingress is unreachable", async () => {
+    allowAddress();
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("ECONNREFUSED")));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const res = await callback();
+      expect(res.headers["Location"]).toBe("/admin?auth_error=denied");
+      expect(res.headers["Set-Cookie"]).toBeUndefined();
+      expect(sessionCount()).toBe(0);
+      expect(bindingCount()).toBe(0);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("binding unavailable"))).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("denies the sign-in on a subject conflict", async () => {
+    allowAddress();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ status: "conflict" }), {
+      status: 200, headers: { "content-type": "application/json" },
+    })));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const res = await callback();
+      expect(res.headers["Location"]).toBe("/admin?auth_error=denied");
+      expect(sessionCount()).toBe(0);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("subject mismatch for google"))).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
+});
+
 describe("handleOAuthLogout", () => {
   it("revokes the session and clears the cookie", () => {
     const token = session.createSession({ email: "ada@eudoxus.ai", sub: "s", provider: "google", name: "Ada" });

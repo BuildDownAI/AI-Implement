@@ -3,8 +3,9 @@
  *
  * One row per entry — a whole email domain, or one address.
  * - A domain admits as`user`; only a listed address may carry `admin`
- * - `provider`/`subject` bind on first successful sign-in and match from then on, so a rename keeps its role
- * and a reassigned address inherits nothing.
+ * - An address binds once per sign-in provider, on first successful sign-in through it (`access_entry_bindings`,
+ * written by the `AccessBinding` Restate object). A bound provider matches on its subject alone, so a rename
+ * keeps its role and a reassigned address inherits nothing; an unbound provider matches on the email.
  */
 
 import { recordAccessChange, type AccessAuditAction } from "./access-audit.js";
@@ -36,10 +37,14 @@ export interface AccessEntry {
   kind: AccessEntryKind;
   value: string;
   role: AccessRole;
-  provider: string | null;
-  subject: string | null;
+  bindings: AccessBinding[];
   addedAt: number;
   addedBy: string | null;
+}
+
+export interface AccessBinding {
+  provider: string;
+  subject: string;
 }
 
 export interface AccessEntryInput {
@@ -52,8 +57,6 @@ interface AccessEntryRow {
   kind: string;
   value: string;
   role: string;
-  provider: string | null;
-  subject: string | null;
   added_at: number;
   added_by: string | null;
 }
@@ -89,6 +92,22 @@ export function initAccessEntriesTable(): void {
       PRIMARY KEY (kind, value)
     )
   `);
+  // No foreign key: access_entries is keyed (kind, value), and an env-seeded address has no row there.
+  getDb().exec(`
+    CREATE TABLE IF NOT EXISTS access_entry_bindings (
+      value    TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      subject  TEXT NOT NULL,
+      bound_at INTEGER NOT NULL,
+      PRIMARY KEY (value, provider)
+    )
+  `);
+  // The legacy columns stay for rollback but are read only here, once per entry.
+  getDb().exec(`
+    INSERT OR IGNORE INTO access_entry_bindings (value, provider, subject, bound_at)
+    SELECT value, provider, subject, added_at FROM access_entries
+    WHERE kind = 'address' AND provider IS NOT NULL AND subject IS NOT NULL
+  `);
 }
 
 /** Re-check a persisted identity against the list in force. */
@@ -107,10 +126,12 @@ export function matchAccessEntry(identity: MatchableIdentity, entries: AccessEnt
   // An address outranks a domain: it is the more specific grant and the only one carrying a role.
   for (const entry of entries) {
     if (entry.kind !== "address") continue;
-    if (entry.provider && entry.subject) {
-      // Bound entries match on the provider identity alone, so a reassigned address inherits nothing.
-      if (entry.provider === identity.provider && entry.subject === identity.sub) return entry;
+    const bound = entry.bindings.find((b) => b.provider === identity.provider);
+    if (bound) {
+      // A bound provider matches on its subject alone, so a reassigned address inherits nothing there.
+      if (bound.subject === identity.sub) return entry;
     } else if (entry.value === email) {
+      // Unbound for this provider: the caller binds it through AccessBinding.
       return entry;
     }
   }
@@ -145,7 +166,7 @@ export function refreshEffectiveAllowlist(): void {
     const stored = listAccessEntries();
     cached = stored.length > 0
       ? { entries: stored, source: "db" }
-      : { entries: allowlistFromEnv(process.env), source: "env" };
+      : { entries: withBindings(allowlistFromEnv(process.env), loadBindings()), source: "env" };
     cachedAt = Date.now();
   } catch (err) {
     if (cached) {
@@ -167,10 +188,10 @@ function allowlistFromEnv(env: NodeJS.ProcessEnv): AccessEntry[] {
   // addedAt 0: env entries are synthesized per read and carry no provenance.
   return [
     ...split(env.OAUTH_ALLOWED_DOMAINS).map((value): AccessEntry => ({
-      kind: "domain", value, role: "user", provider: null, subject: null, addedAt: 0, addedBy: null,
+      kind: "domain", value, role: "user", bindings: [], addedAt: 0, addedBy: null,
     })),
     ...split(env.OAUTH_ALLOWED_EMAILS).map((value): AccessEntry => ({
-      kind: "address", value, role: "admin", provider: null, subject: null, addedAt: 0, addedBy: null,
+      kind: "address", value, role: "admin", bindings: [], addedAt: 0, addedBy: null,
     })),
   ];
 }
@@ -180,19 +201,36 @@ export function getEnvAllowlist(): AccessEntry[] {
   return allowlistFromEnv(process.env);
 }
 
+function loadBindings(): Map<string, AccessBinding[]> {
+  const rows = getDb()
+    .prepare("SELECT value, provider, subject FROM access_entry_bindings ORDER BY provider")
+    .all() as { value: string; provider: string; subject: string }[];
+  const map = new Map<string, AccessBinding[]>();
+  for (const r of rows) {
+    const list = map.get(r.value) ?? [];
+    list.push({ provider: r.provider, subject: r.subject });
+    map.set(r.value, list);
+  }
+  return map;
+}
+
+function withBindings(entries: AccessEntry[], map: Map<string, AccessBinding[]>): AccessEntry[] {
+  return entries.map((e) => (e.kind === "address" ? { ...e, bindings: map.get(e.value) ?? [] } : e));
+}
+
 /** Every stored entry. Zero rows means the env->DB handover has not happened and the env list still applies. */
 export function listAccessEntries(): AccessEntry[] {
   const rows = getDb()
-    .prepare("SELECT kind, value, role, provider, subject, added_at, added_by FROM access_entries ORDER BY kind, value")
+    .prepare("SELECT kind, value, role, added_at, added_by FROM access_entries ORDER BY kind, value")
     .all() as AccessEntryRow[];
+  const bindings = loadBindings();
   // Both checks name the permissive value, so an unreadable row falls back to the restrictive one
   // ('domain' admits a whole company, 'address' admits one person)
   return rows.map((r) => ({
     kind: r.kind === "domain" ? "domain" : "address",
     value: r.value,
     role: r.role === "admin" ? "admin" : "user",
-    provider: r.provider,
-    subject: r.subject,
+    bindings: r.kind === "domain" ? [] : bindings.get(r.value) ?? [],
     addedAt: r.added_at,
     addedBy: r.added_by,
   }));
@@ -254,6 +292,8 @@ export function saveAccessEntries(
     for (const entry of before) {
       if (!keep.has(`${entry.kind}:${entry.value}`)) {
         db.prepare("DELETE FROM access_entries WHERE kind = ? AND value = ?").run(entry.kind, entry.value);
+        // A re-added address must start unbound, or it inherits the previous holder's subjects.
+        if (entry.kind === "address") db.prepare("DELETE FROM access_entry_bindings WHERE value = ?").run(entry.value);
       }
     }
     const upsert = db.prepare(
@@ -280,16 +320,20 @@ export function saveAccessEntries(
   refreshEffectiveAllowlist();
 }
 
-/** Record the provider identity an address resolved to, the first time it signs in. */
-export function bindAccessEntry(value: string, provider: string, subject: string): void {
-  const result = getDb()
-    .prepare(
-      "UPDATE access_entries SET provider = ?, subject = ? WHERE kind = 'address' AND value = ? AND provider IS NULL",
-    )
-    .run(provider, subject, value.trim().toLowerCase());
-  // Without this the binding is written but never consulted: the cache still holds the entry as
-  // unbound, so matching keeps taking the address branch and admits whoever holds it.
-  if (result.changes > 0) refreshEffectiveAllowlist();
+/** Delete every binding of an address, so its next sign-in through each provider binds afresh. */
+export function clearAccessBindings(value: string, actor: string | null): number {
+  const key = value.trim().toLowerCase();
+  const db = getDb();
+  const removed = db.transaction(() => {
+    const result = db.prepare("DELETE FROM access_entry_bindings WHERE value = ?").run(key);
+    if (result.changes > 0) {
+      const entries = listAccessEntries().map(({ kind, value: v, role }) => ({ kind, value: v, role }));
+      recordAccessChange({ actor, action: "clear-bindings", before: entries, after: entries, subject: key });
+    }
+    return result.changes;
+  })();
+  refreshEffectiveAllowlist();
+  return removed;
 }
 
 /** Test hook: drop the cached list. */

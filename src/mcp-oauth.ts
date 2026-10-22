@@ -22,7 +22,8 @@ import { getDb } from "./dedup.js";
 import { getProvider, listConfiguredProviders } from "./oauth/providers.js";
 import { buildAuthUrl, completeAuth } from "./oauth/oidc.js";
 import { authorize } from "./oauth/authorize.js";
-import { bindAccessEntry, getEffectiveAllowlist, matchAccessEntry } from "./access-entries.js";
+import { getEffectiveAllowlist, matchAccessEntry } from "./access-entries.js";
+import { bindAccessIdentity } from "./restate/access-binding.js";
 import type { DescribeOutcome, IssueInput, IssueOutcome, RefreshAuthority, RefreshInput, RefreshOutcome } from "./mcp-identity.js";
 import { recordAuthEvent, resolveClientPath, isLoopbackHost, type AuthEventCause, type ClientPath } from "./mcp-auth-events.js";
 import { RestateRefreshAuthority } from "./restate/operator-object.js";
@@ -460,8 +461,17 @@ export async function handleMcpOidcCallback(
     return redirectWithError(res, stateRow.redirect_uri, stateRow.client_state, "access_denied");
   }
 
+  // Fail closed: an identity is never admitted without a recorded binding.
   if (decision.entry.kind === "address") {
-    bindAccessEntry(decision.entry.value, identity.provider, identity.sub);
+    const bound = await bindAccessIdentity(decision.entry.value, identity.provider, identity.sub);
+    if (bound === "conflict") {
+      console.warn(`[mcp-oauth] denied ${identity.email ?? "?"} via ${providerId}: subject mismatch for ${providerId}`);
+      return redirectWithError(res, stateRow.redirect_uri, stateRow.client_state, "access_denied");
+    }
+    if (bound === "unavailable") {
+      console.warn(`[mcp-oauth] denied ${identity.email ?? "?"} via ${providerId}: binding unavailable`);
+      return redirectWithError(res, stateRow.redirect_uri, stateRow.client_state, "server_error");
+    }
   }
 
   db.prepare("UPDATE mcp_clients SET used_at = ? WHERE client_id = ?").run(Date.now(), stateRow.client_id);

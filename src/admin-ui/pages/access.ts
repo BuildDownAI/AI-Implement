@@ -41,7 +41,7 @@ export const accessHtml = `
       </div>
       <div class="card-body tight">
         <table class="tbl">
-          <thead><tr><th>Type</th><th>Email / Domain</th><th>Role</th><th>Added</th><th></th></tr></thead>
+          <thead><tr><th>Type</th><th>Email / Domain</th><th>Role</th><th>Bound providers</th><th>Added</th><th></th></tr></thead>
           <tbody id="access-body"></tbody>
         </table>
         <div id="access-empty" class="empty hidden">No entries.</div>
@@ -177,6 +177,24 @@ export const accessScript = `
     return new Date(match.addedAt).toLocaleDateString();
   }
 
+  function storedEntry(e) {
+    for (var i = 0; i < state.stored.length; i++) {
+      if (state.stored[i].kind === e.kind && state.stored[i].value === e.value) return state.stored[i];
+    }
+    return null;
+  }
+
+  function boundLabel(e) {
+    var match = storedEntry(e);
+    var list = match && match.bindings ? match.bindings : [];
+    return list.length ? list.map(function (b) { return b.provider; }).join(', ') : '\u2014';
+  }
+
+  function hasBindings(e) {
+    var match = storedEntry(e);
+    return !!(match && match.bindings && match.bindings.length);
+  }
+
   function renderBanner(blocked) {
     var banner = document.getElementById('access-banner');
     var title = document.getElementById('access-banner-title');
@@ -231,8 +249,10 @@ export const accessScript = `
         + '<td>' + window.esc(TYPE_LABEL[e.kind] || e.kind) + '</td>'
         + '<td class="mono">' + window.esc(e.value) + '</td>'
         + '<td>' + role + '</td>'
+        + '<td class="text-tertiary">' + window.esc(boundLabel(e)) + '</td>'
         + '<td class="text-tertiary">' + window.esc(addedLabel(e)) + '</td>'
         + '<td style="text-align:right;white-space:nowrap">'
+        + (readOnly || !hasBindings(e) ? '' : '<button class="btn btn-sm" style="margin-right:6px" data-value="' + window.escAttr(e.value) + '" onclick="clearAccessBindings(this.dataset.value)">Clear bindings</button>')
         + (readOnly ? '' : '<button class="btn btn-sm btn-danger" onclick="removeAccessEntry(' + i + ')">Remove</button>')
         + '</td>'
         + '</tr>';
@@ -271,6 +291,13 @@ export const accessScript = `
     document.getElementById('access-changes-empty').classList.toggle('hidden', state.changes.length > 0);
     body.innerHTML = state.changes.map(function (c) {
       var who = c.actor || (c.action === 'recover' ? 'host recovery' : 'unattributed');
+      if (c.action === 'clear-bindings') {
+        return '<tr>'
+          + '<td class="text-tertiary">' + window.esc(new Date(c.createdAt).toLocaleString()) + '</td>'
+          + '<td>' + window.esc(who) + '</td>'
+          + '<td>cleared bindings for ' + window.esc(c.subject || '') + '</td>'
+          + '</tr>';
+      }
       return '<tr>'
         + '<td class="text-tertiary">' + window.esc(new Date(c.createdAt).toLocaleString()) + '</td>'
         + '<td>' + window.esc(who) + '</td>'
@@ -450,6 +477,21 @@ export const accessScript = `
     apply(payload);
   }
   window.saveAccess = saveAccess;
+
+  async function clearAccessBindings(value) {
+    if (!confirm('Clear the bound sign-in providers for ' + value + '? Its next sign-in through each provider binds afresh.')) return;
+    showError('');
+    var payload;
+    try {
+      var res = await window.api('/api/access/clear-bindings', { method: 'POST', body: JSON.stringify({ value: value }) });
+      payload = await res.json();
+      if (!res.ok) return window.alert(payload.error || 'The bindings could not be cleared.');
+    } catch (e) {
+      return window.alert('The bindings could not be cleared.');
+    }
+    apply(payload);
+  }
+  window.clearAccessBindings = clearAccessBindings;
 
   async function loadAccess() {
     var payload;

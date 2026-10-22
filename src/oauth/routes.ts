@@ -10,7 +10,8 @@ import { authorize } from "./authorize.js";
 import { putTransaction, takeTransaction } from "./state-store.js";
 import { createSession, revokeSession, getRequestToken, SESSION_TTL_MS } from "../admin-session.js";
 import { serializeSessionCookie, clearSessionCookie } from "../cookies.js";
-import { allowlistHasNoAdmin, bindAccessEntry, getEffectiveAllowlist } from "../access-entries.js";
+import { allowlistHasNoAdmin, getEffectiveAllowlist } from "../access-entries.js";
+import { bindAccessIdentity } from "../restate/access-binding.js";
 
 function json(res: http.ServerResponse, status: number, data: unknown): void {
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -107,9 +108,18 @@ export async function handleOAuthCallback(
     return redirect(res, "/admin?auth_error=denied");
   }
 
-  // First sign-in binds the entry; the provider identity is what matches from then on.
+  // First sign-in through a provider binds the entry for it; that subject is what matches from then on.
+  // Fail closed: an identity is never admitted without a recorded binding.
   if (decision.entry.kind === "address") {
-    bindAccessEntry(decision.entry.value, identity.provider, identity.sub);
+    const bound = await bindAccessIdentity(decision.entry.value, identity.provider, identity.sub);
+    if (bound === "conflict") {
+      console.warn(`[oauth] denied ${identity.email ?? "?"} via ${providerId}: subject mismatch for ${providerId}`);
+      return redirect(res, "/admin?auth_error=denied");
+    }
+    if (bound === "unavailable") {
+      console.warn(`[oauth] denied ${identity.email ?? "?"} via ${providerId}: binding unavailable`);
+      return redirect(res, "/admin?auth_error=denied");
+    }
   }
 
   const token = createSession({

@@ -10,6 +10,21 @@ beforeEach(async () => {
   ).modules);
 });
 
+function bind(value: string, provider: string, subject: string) {
+  dedup
+    .getDb()
+    .prepare("INSERT OR IGNORE INTO access_entry_bindings (value, provider, subject, bound_at) VALUES (?, ?, ?, ?)")
+    .run(value, provider, subject, 1);
+  access.refreshEffectiveAllowlist();
+}
+
+function bindingRows(value: string) {
+  return dedup
+    .getDb()
+    .prepare("SELECT provider, subject FROM access_entry_bindings WHERE value = ? ORDER BY provider")
+    .all(value) as { provider: string; subject: string }[];
+}
+
 function rawRow(kind: string, value: string) {
   return dedup
     .getDb()
@@ -62,8 +77,7 @@ describe("saveAccessEntries", () => {
       kind: "address",
       value: "ada@eudoxus.ai",
       role: "admin",
-      provider: null,
-      subject: null,
+      bindings: [],
       addedBy: "ricardo@eudoxus.ai",
     });
     expect(entry.addedAt).toBeGreaterThan(0);
@@ -90,7 +104,7 @@ describe("saveAccessEntries", () => {
     // keeper carries the admin role throughout, so ada is free to start as a user.
     const keeper = { kind: "address" as const, value: "keeper@eudoxus.ai", role: "admin" as const };
     access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "user" }, keeper], "first@eudoxus.ai");
-    access.bindAccessEntry("ada@eudoxus.ai", "google", "google|123");
+    bind("ada@eudoxus.ai", "google", "google|123");
     dedup.getDb().prepare("UPDATE access_entries SET added_at = ? WHERE value = ?").run(1000, "ada@eudoxus.ai");
 
     access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }, keeper], "second@eudoxus.ai");
@@ -98,8 +112,7 @@ describe("saveAccessEntries", () => {
     const row = rawRow("address", "ada@eudoxus.ai")!;
     expect(row.role).toBe("admin");
     // A save must not unbind or re-attribute someone who has already signed in.
-    expect(row.provider).toBe("google");
-    expect(row.subject).toBe("google|123");
+    expect(bindingRows("ada@eudoxus.ai")).toEqual([{ provider: "google", subject: "google|123" }]);
     expect(row.added_at).toBe(1000);
     expect(row.added_by).toBe("first@eudoxus.ai");
   });
@@ -207,61 +220,76 @@ describe("saveAccessEntries — the last-admin guard", () => {
   });
 });
 
-describe("bindAccessEntry", () => {
-  it("records the provider identity an address resolved to", () => {
-    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
-    access.bindAccessEntry("Ada@Eudoxus.ai", "google", "google|123");
+describe("access_entry_bindings", () => {
+  const ada = (provider: string, sub: string) => ({ provider, sub, email: "ada@eudoxus.ai" });
+  const adaEntry = () => access.listAccessEntries().find((e) => e.value === "ada@eudoxus.ai")!;
 
-    const row = rawRow("address", "ada@eudoxus.ai")!;
-    expect(row.provider).toBe("google");
-    expect(row.subject).toBe("google|123");
+  it("admits an entry bound to google through builddown, and both match after the bind", () => {
+    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
+    bind("ada@eudoxus.ai", "google", "g-1");
+
+    expect(access.recheckIdentity(ada("builddown", "u-9")).status).toBe("ok");
+    bind("ada@eudoxus.ai", "builddown", "u-9");
+    expect(access.recheckIdentity(ada("builddown", "u-9")).status).toBe("ok");
+    expect(access.recheckIdentity(ada("google", "g-1")).status).toBe("ok");
   });
 
-  it("binds once — a later sign-in cannot re-point an entry at another subject", () => {
+  it("refuses a second identity for a bound provider, and leaves unbound providers open", () => {
     access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
-    access.bindAccessEntry("ada@eudoxus.ai", "google", "google|123");
-    access.bindAccessEntry("ada@eudoxus.ai", "microsoft", "ms|999");
+    bind("ada@eudoxus.ai", "google", "g-1");
 
-    const row = rawRow("address", "ada@eudoxus.ai")!;
-    expect(row.provider).toBe("google");
-    expect(row.subject).toBe("google|123");
+    expect(access.recheckIdentity(ada("google", "g-2")).status).toBe("denied");
+    expect(access.recheckIdentity(ada("microsoft", "m-1")).status).toBe("ok");
   });
 
-  it("ignores domain entries, which admit many identities and bind to none", () => {
-    access.saveAccessEntries(
-      [
-        { kind: "domain", value: "eudoxus.ai", role: "user" },
-        { kind: "address", value: "keeper@eudoxus.ai", role: "admin" },
-      ],
-      null,
-    );
-    access.bindAccessEntry("eudoxus.ai", "google", "google|123");
-
-    const row = rawRow("domain", "eudoxus.ai")!;
-    expect(row.provider).toBeNull();
-    expect(row.subject).toBeNull();
+  it("loads bindings into the cached allowlist", () => {
+    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
+    bind("ada@eudoxus.ai", "google", "g-1");
+    bind("ada@eudoxus.ai", "builddown", "u-9");
+    expect(access.getEffectiveAllowlist()!.entries[0].bindings.map((b) => b.provider)).toEqual(["builddown", "google"]);
   });
 
-  // The three above assert on the stored row. Authorization reads the cache instead, so a binding
-  // that reaches the database and not the cache passes all of them while doing nothing.
-  it("takes effect against the live allowlist, without a refresh in between", () => {
+  it("migrates a legacy provider/subject once, leaving the columns alone", () => {
     access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
-    // Warms the cache with the entry still unbound, and pins the pre-bind behaviour. Skip it and
-    // the assertion below passes vacuously, because a cold cache re-reads and sees the binding.
-    expect(access.recheckIdentity({ provider: "google", sub: "google|123", email: "ada@eudoxus.ai" }).status).toBe("ok");
+    dedup.getDb().prepare("UPDATE access_entries SET provider = 'google', subject = 'g-1' WHERE value = 'ada@eudoxus.ai'").run();
 
-    access.bindAccessEntry("ada@eudoxus.ai", "google", "google|123");
+    access.initAccessEntriesTable();
+    access.initAccessEntriesTable();
 
-    const reassigned = access.recheckIdentity({ provider: "microsoft", sub: "ms|999", email: "ada@eudoxus.ai" });
-    expect(reassigned.status).toBe("denied");
+    expect(bindingRows("ada@eudoxus.ai")).toEqual([{ provider: "google", subject: "g-1" }]);
+    expect(rawRow("address", "ada@eudoxus.ai")!.provider).toBe("google");
   });
 
-  it("keeps admitting the identity it bound to", () => {
+  it("does not migrate an unbound entry", () => {
     access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
-    access.recheckIdentity({ provider: "google", sub: "google|123", email: "ada@eudoxus.ai" });
-    access.bindAccessEntry("ada@eudoxus.ai", "google", "google|123");
+    access.initAccessEntriesTable();
+    expect(bindingRows("ada@eudoxus.ai")).toEqual([]);
+  });
 
-    expect(access.recheckIdentity({ provider: "google", sub: "google|123", email: "ada@eudoxus.ai" }).status).toBe("ok");
+  it("drops an address's bindings when the entry is removed, so a re-add starts unbound", () => {
+    const keeper = { kind: "address" as const, value: "keeper@eudoxus.ai", role: "admin" as const };
+    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "user" }, keeper], null);
+    bind("ada@eudoxus.ai", "google", "g-1");
+    access.saveAccessEntries([keeper], null);
+    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "user" }, keeper], null);
+
+    expect(bindingRows("ada@eudoxus.ai")).toEqual([]);
+    expect(adaEntry().bindings).toEqual([]);
+  });
+
+  it("clears an address's bindings, audits it, and refreshes the cache", () => {
+    const keeper = { kind: "address" as const, value: "keeper@eudoxus.ai", role: "admin" as const };
+    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "user" }, keeper], null);
+    bind("ada@eudoxus.ai", "google", "g-1");
+    bind("keeper@eudoxus.ai", "google", "k-1");
+
+    expect(access.clearAccessBindings("Ada@Eudoxus.ai", "admin@eudoxus.ai")).toBe(1);
+
+    expect(bindingRows("ada@eudoxus.ai")).toEqual([]);
+    expect(bindingRows("keeper@eudoxus.ai")).toHaveLength(1);
+    expect(adaEntry().bindings).toEqual([]);
+    const row = dedup.getDb().prepare("SELECT actor, action, subject FROM access_audit ORDER BY id DESC LIMIT 1").get();
+    expect(row).toEqual({ actor: "admin@eudoxus.ai", action: "clear-bindings", subject: "ada@eudoxus.ai" });
   });
 });
 
@@ -351,8 +379,7 @@ describe("matchAccessEntry", () => {
     kind: "address" as const,
     value: "ada@eudoxus.ai",
     role: "admin" as const,
-    provider: null as string | null,
-    subject: null as string | null,
+    bindings: [] as { provider: string; subject: string }[],
     addedAt: 0,
     addedBy: null as string | null,
     ...over,
@@ -372,24 +399,24 @@ describe("matchAccessEntry", () => {
   });
 
   it("keeps matching a bound entry after the address changes — a rename does not cost the role", () => {
-    const address = entry({ provider: "google", subject: "google|123" });
+    const address = entry({ bindings: [{ provider: "google", subject: "google|123" }] });
     const renamed = { provider: "google", sub: "google|123", email: "a.lovelace@eudoxus.ai" };
     expect(access.matchAccessEntry(renamed, [address])).toBe(address);
   });
 
   it("refuses a bound entry to a different subject, so a reassigned address inherits nothing", () => {
     const domain = entry({ kind: "domain", value: "eudoxus.ai", role: "user" });
-    const address = entry({ provider: "google", subject: "google|123", role: "admin" });
+    const address = entry({ bindings: [{ provider: "google", subject: "google|123" }], role: "admin" });
     const newHolder = { provider: "google", sub: "google|999", email: "ada@eudoxus.ai" };
 
     // Falls through to ordinary domain admission rather than inheriting admin.
     expect(access.matchAccessEntry(newHolder, [domain, address])).toBe(domain);
   });
 
-  it("does not match a bound entry through a second provider — the known cost of binding", () => {
-    const address = entry({ provider: "google", subject: "google|123" });
+  it("matches a bound entry through a second, unbound provider on the email", () => {
+    const address = entry({ bindings: [{ provider: "google", subject: "google|123" }] });
     const viaMicrosoft = { provider: "microsoft", sub: "ms|123", email: "ada@eudoxus.ai" };
-    expect(access.matchAccessEntry(viaMicrosoft, [address])).toBeNull();
+    expect(access.matchAccessEntry(viaMicrosoft, [address])).toBe(address);
   });
 
   it("returns null when nothing matches", () => {
@@ -412,9 +439,9 @@ describe("getEffectiveAllowlist", () => {
     const effective = access.getEffectiveAllowlist()!;
     expect(effective.source).toBe("env");
     expect(effective.entries).toEqual([
-      { kind: "domain", value: "eudoxus.ai", role: "user", provider: null, subject: null, addedAt: 0, addedBy: null },
-      { kind: "address", value: "cameron@theaboutbox.com", role: "admin", provider: null, subject: null, addedAt: 0, addedBy: null },
-      { kind: "address", value: "john@oolidata.ai", role: "admin", provider: null, subject: null, addedAt: 0, addedBy: null },
+      { kind: "domain", value: "eudoxus.ai", role: "user", bindings: [], addedAt: 0, addedBy: null },
+      { kind: "address", value: "cameron@theaboutbox.com", role: "admin", bindings: [], addedAt: 0, addedBy: null },
+      { kind: "address", value: "john@oolidata.ai", role: "admin", bindings: [], addedAt: 0, addedBy: null },
     ]);
   });
 

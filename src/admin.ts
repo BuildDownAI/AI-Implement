@@ -74,7 +74,7 @@ import type { OwnershipSnapshot } from "./model-session-ownership.js";
 import { getDb, listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { listParked, unpark } from "./dispatch-breaker.js";
 import { createSession, accessCodeMatches, authenticateAdminRequest, type AdminGate, type SessionIdentity } from "./admin-session.js";
-import { getEffectiveAllowlist, getEnvAllowlist, listAccessEntries, parseAccessEntries, saveAccessEntries, type AccessRole } from "./access-entries.js";
+import { getEffectiveAllowlist, getEnvAllowlist, clearAccessBindings, listAccessEntries, parseAccessEntries, saveAccessEntries, type AccessRole } from "./access-entries.js";
 import { listAccessChanges } from "./access-audit.js";
 import { listGrantedPages, PAGE_ROUTES, savePageGrants } from "./access-page-grants.js";
 import type { DeployStart } from "./deploy.js";
@@ -1363,6 +1363,11 @@ export function handleAdminRequest(
 
     if (url === "/api/access" && method === "POST") {
       handlePostAccess(req, res, gate.identity);
+      return true;
+    }
+
+    if (url === "/api/access/clear-bindings" && method === "POST") {
+      handleClearAccessBindings(req, res, gate.identity);
       return true;
     }
 
@@ -3081,6 +3086,35 @@ async function handlePostAccess(
     return;
   }
 
+  handleGetAccess(res, identity);
+}
+
+async function handleClearAccessBindings(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  identity: SessionIdentity | null,
+): Promise<void> {
+  if (!identity) {
+    json(res, 403, { error: "Clearing bindings requires a signed-in identity" });
+    return;
+  }
+  let address: unknown;
+  try {
+    address = (JSON.parse(await readBody(req)) as { value?: unknown } | null)?.value;
+  } catch {
+    json(res, 400, { error: "Invalid request body" });
+    return;
+  }
+  if (typeof address !== "string" || !address.trim()) {
+    json(res, 400, { error: "value must be an email address" });
+    return;
+  }
+  try {
+    clearAccessBindings(address, identity.email);
+  } catch (err) {
+    json(res, 500, { error: err instanceof Error ? err.message : "the bindings could not be cleared" });
+    return;
+  }
   handleGetAccess(res, identity);
 }
 

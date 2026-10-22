@@ -17,6 +17,7 @@ import { operatorObject } from "./operator-object.js";
 import { orchestratorTools } from "./tools.js";
 import { runnerBackend } from "./runner-backend.js";
 import { chatGptPlanAccount } from "./chatgpt-plan-account.js";
+import { accessBinding } from "./access-binding.js";
 
 export type RestateService =
   | ServiceDefinition<string, unknown>
@@ -26,7 +27,7 @@ export type RestateService =
 // `Operator` (AII-709) is the first bound object, `orchestratorTools` (AII-710) the first
 // bound service; a run kind's workflow module joins them here once one migrates (ADR 018
 // case 1: kg-refresh). `ChatGptPlanAccount` (AII-1200) refreshes hosted ChatGPT plan tokens.
-export const RESTATE_SERVICES: RestateService[] = [operatorObject, orchestratorTools, runnerBackend, chatGptPlanAccount];
+export const RESTATE_SERVICES: RestateService[] = [operatorObject, orchestratorTools, runnerBackend, chatGptPlanAccount, accessBinding];
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 9080;
