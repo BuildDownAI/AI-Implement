@@ -133,6 +133,7 @@ import type { callTool } from "./restate/tools-client.js";
 import type { TrackerExportIngressClient } from "./restate/tracker-export.js";
 import type { RestateStatus } from "./restate/status.js";
 import type { Caller } from "./mcp-identity.js";
+import { controlPlaneTokenActive, verifyControlPlaneToken } from "./control-plane-token.js";
 import picomatch from "picomatch";
 
 function normalizeSkillsRepo(raw: unknown): string | null {
@@ -817,6 +818,30 @@ export function handleAdminRequest(
     return true;
   }
 
+  // The BuildDown control plane's token is accepted on the tools route only (AII-1514): every
+  // other /api route assumes a human admin session. A token that does not verify falls through
+  // to the admin gate, so an admin session sent as a Bearer still works.
+  if (
+    method === "POST" &&
+    TOOL_CALL_ROUTE.test(url) &&
+    req.headers.authorization?.startsWith("Bearer ") &&
+    controlPlaneTokenActive()
+  ) {
+    const toolName = decodeURIComponent(TOOL_CALL_ROUTE.exec(url)![1]);
+    void verifyControlPlaneToken(req.headers.authorization)
+      .then((caller) => {
+        if (caller) return handleToolCall(req, res, caller, "control-plane", toolName, deps);
+        const gate = authorizeApiRequest(req, res, url, method);
+        if (!gate) return;
+        return handleToolCall(req, res, { kind: "human", email: gate.identity?.email ?? null, role: gate.role }, gate.identity?.email ?? "session", toolName, deps);
+      })
+      .catch((err) => {
+        console.error("[admin] tool call failed:", err);
+        if (!res.headersSent) json(res, 500, { error: "Internal server error" });
+      });
+    return true;
+  }
+
   // All other /api routes require auth
   if (url.startsWith("/api/")) {
     const gate = authorizeApiRequest(req, res, url, method);
@@ -839,7 +864,7 @@ export function handleAdminRequest(
 
     const toolCallMatch = TOOL_CALL_ROUTE.exec(url);
     if (toolCallMatch && method === "POST") {
-      handleToolCall(req, res, gate, decodeURIComponent(toolCallMatch[1]), deps);
+      handleToolCall(req, res, { kind: "human", email: gate.identity?.email ?? null, role: gate.role }, gate.identity?.email ?? "session", decodeURIComponent(toolCallMatch[1]), deps);
       return true;
     }
 
@@ -2234,7 +2259,8 @@ const TOOL_NAME_SHAPE = /^[a-z][a-z0-9_]{0,63}$/;
 async function handleToolCall(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  gate: Extract<AdminGate, { ok: true }>,
+  caller: Caller,
+  idempotencyScope: string,
   toolName: string,
   deps: AdminDeps,
 ): Promise<void> {
@@ -2259,7 +2285,7 @@ async function handleToolCall(
         json(res, 400, { error: "Idempotency-Key must match ^[A-Za-z0-9._:-]{1,128}$" });
         return;
       }
-      idempotencyKey = scopeIdempotencyKey(gate.identity?.email ?? "session", supplied);
+      idempotencyKey = scopeIdempotencyKey(idempotencyScope, supplied);
     }
   }
   const raw = await readBody(req);
@@ -2275,7 +2301,6 @@ async function handleToolCall(
       return;
     }
   }
-  const caller: Caller = { kind: "human", email: gate.identity?.email ?? null, role: gate.role };
   try {
     const result = await deps.callTool(toolName, args, caller, idempotencyKey ? { idempotencyKey } : undefined);
     if (result.status === "deploy-held") {
