@@ -8,7 +8,7 @@ import { getDb } from "./dedup.js";
 import type { AccessEntryInput } from "./access-entries.js";
 
 /** How the change was made. An access-code save and a host recovery both have no attributable person. */
-export type AccessAuditAction = "save" | "recover";
+export type AccessAuditAction = "save" | "recover" | "clear-bindings";
 
 export interface AccessChange {
   id: number;
@@ -17,6 +17,8 @@ export interface AccessChange {
   action: AccessAuditAction;
   before: AccessEntryInput[];
   after: AccessEntryInput[];
+  /** The address a `clear-bindings` change applied to. */
+  address?: string | null;
 }
 
 interface AccessChangeRow {
@@ -26,6 +28,7 @@ interface AccessChangeRow {
   action: string;
   before_json: string;
   after_json: string;
+  address: string | null;
 }
 
 /** An audit snapshot is what an operator edited — never the binding or provenance they didn't. */
@@ -41,35 +44,40 @@ export function initAccessAuditTable(): void {
       actor       TEXT,
       action      TEXT NOT NULL,
       before_json TEXT NOT NULL,
-      after_json  TEXT NOT NULL
+      after_json  TEXT NOT NULL,
+      address     TEXT
     )
   `);
+  const columns = db.prepare("PRAGMA table_info(access_audit)").all() as { name: string }[];
+  if (!columns.some((c) => c.name === "address")) db.exec("ALTER TABLE access_audit ADD COLUMN address TEXT");
   db.exec("CREATE INDEX IF NOT EXISTS idx_access_audit_created_at ON access_audit(created_at)");
 }
 
 export function recordAccessChange(change: Omit<AccessChange, "id" | "createdAt">): void {
   getDb()
-    .prepare("INSERT INTO access_audit (created_at, actor, action, before_json, after_json) VALUES (?, ?, ?, ?, ?)")
+    .prepare("INSERT INTO access_audit (created_at, actor, action, before_json, after_json, address) VALUES (?, ?, ?, ?, ?, ?)")
     .run(
       Date.now(),
       change.actor,
       change.action,
       JSON.stringify(snapshot(change.before)),
       JSON.stringify(snapshot(change.after)),
+      change.address ?? null,
     );
 }
 
 export function listAccessChanges(limit = 20): AccessChange[] {
   const rows = getDb()
     .prepare(
-      "SELECT id, created_at, actor, action, before_json, after_json FROM access_audit ORDER BY created_at DESC, id DESC LIMIT ?",
+      "SELECT id, created_at, actor, action, before_json, after_json, address FROM access_audit ORDER BY created_at DESC, id DESC LIMIT ?",
     )
     .all(limit) as AccessChangeRow[];
   return rows.map((r) => ({
     id: r.id,
     createdAt: r.created_at,
     actor: r.actor,
-    action: r.action === "recover" ? "recover" : "save",
+    action: r.action === "recover" || r.action === "clear-bindings" ? r.action : "save",
+    address: r.address,
     before: parseSnapshot(r.before_json),
     after: parseSnapshot(r.after_json),
   }));

@@ -569,6 +569,12 @@ export interface AdminDeps {
    * Absent only in tests that don't exercise reviewFixLifecycle="restate" enablement.
    */
   getRestateStatus?: () => RestateStatus;
+  /**
+   * Clears an address's bindings through the `AccessBinding` object (src/restate/access-binding.ts), which is the only
+   * writer of bindings. Injected for the same reason as `getRestateStatus`; bound in src/index.ts. Absent in tests that
+   * don't exercise the route, where it answers 503. There is no direct-delete fallback.
+   */
+  clearAccessBindings?: (address: string, actor: string | null) => Promise<number>;
   /** Reads a profile's ChatGPT refresh state (src/restate/chatgpt-plan-account.ts). Injected for the same reason as `getRestateStatus`; absent in tests, where the status reports `unknown`. */
   readChatGptPlanState?: (profileId: string) => Promise<{ lastOutcome: string } | null>;
   /**
@@ -1363,6 +1369,11 @@ export function handleAdminRequest(
 
     if (url === "/api/access" && method === "POST") {
       handlePostAccess(req, res, gate.identity);
+      return true;
+    }
+
+    if (url === "/api/access/clear-bindings" && method === "POST") {
+      handleClearAccessBindings(req, res, gate.identity, deps);
       return true;
     }
 
@@ -3081,6 +3092,37 @@ async function handlePostAccess(
     return;
   }
 
+  handleGetAccess(res, identity);
+}
+
+async function handleClearAccessBindings(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  identity: SessionIdentity | null,
+  deps: AdminDeps,
+): Promise<void> {
+  if (!identity) {
+    json(res, 403, { error: "Clearing bindings requires a signed-in identity" });
+    return;
+  }
+  let address: unknown;
+  try {
+    address = (JSON.parse(await readBody(req)) as { value?: unknown } | null)?.value;
+  } catch {
+    json(res, 400, { error: "Invalid request body" });
+    return;
+  }
+  if (typeof address !== "string" || !address.trim()) {
+    json(res, 400, { error: "value must be an email address" });
+    return;
+  }
+  try {
+    if (!deps.clearAccessBindings) throw new Error("the binding service is not available");
+    await deps.clearAccessBindings(address, identity.email);
+  } catch (err) {
+    json(res, 500, { error: err instanceof Error ? `the bindings could not be cleared: ${err.message}` : "the bindings could not be cleared" });
+    return;
+  }
   handleGetAccess(res, identity);
 }
 

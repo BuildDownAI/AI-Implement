@@ -9,8 +9,8 @@ import { fakeFetch, hangUntilAborted, type Reply } from "./helpers/fake-fetch.js
 // only catches it in endpoint.restate.test.ts — this is the fast, no-Docker half of that
 // same regression.
 describe("RESTATE_SERVICES", () => {
-  it("names exactly Operator, orchestratorTools, RunnerBackend and ChatGptPlanAccount", () => {
-    expect(RESTATE_SERVICES.map((service) => service.name)).toEqual(["Operator", "orchestratorTools", "RunnerBackend", "ChatGptPlanAccount"]);
+  it("names exactly Operator, orchestratorTools, RunnerBackend, ChatGptPlanAccount and AccessBinding", () => {
+    expect(RESTATE_SERVICES.map((service) => service.name)).toEqual(["Operator", "orchestratorTools", "RunnerBackend", "ChatGptPlanAccount", "AccessBinding"]);
   });
 });
 
@@ -20,7 +20,7 @@ describe("production review-fix services", () => {
       runnerCallbackBaseUrl: null, runnerTokenSecret: null, sessionImage: "ghcr.io/x/runner:latest", runnerImageExplicit: false },
       makeRegistry());
     expect([...RESTATE_SERVICES, ...services].map((service) => service.name)).toEqual([
-      "Operator", "orchestratorTools", "RunnerBackend", "ChatGptPlanAccount", "ReviewFixPR", "ReviewFixAttempt",
+      "Operator", "orchestratorTools", "RunnerBackend", "ChatGptPlanAccount", "AccessBinding", "ReviewFixPR", "ReviewFixAttempt",
     ]);
   });
 });

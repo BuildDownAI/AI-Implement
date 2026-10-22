@@ -13,7 +13,7 @@ One row per entry in `access_entries`, keyed on `(kind, value)`:
 | `kind` | `domain` (a whole email domain) or `address` (one person) |
 | `value` | The domain or address, lowercased and trimmed on write |
 | `role` | `user` or `admin` |
-| `provider` / `subject` | The OIDC identity this entry bound to on first sign-in; null until then |
+| `provider` / `subject` | Legacy. No longer read; kept so a rollback keeps working. Bindings live in `access_entry_bindings` (below) |
 | `added_at` / `added_by` | When it was written, and the address of whoever wrote it |
 
 Two rules are enforced at write time rather than left to the caller:
@@ -71,8 +71,8 @@ Matching runs in precedence order, and stops at the first hit:
 
 | Order | Entry | Matches when |
 |-------|-------|--------------|
-| 1 | Address, bound | `provider` **and** `subject` both equal the identity's |
-| 2 | Address, unbound | The entry's value equals the verified email |
+| 1 | Address, bound for the identity's provider | The binding's `subject` equals the identity's `sub` |
+| 2 | Address, unbound for the identity's provider | The entry's value equals the verified email; the callback then binds |
 | 3 | Domain | The email's domain equals the entry's value |
 
 An address entry outranks a domain entry: it is the more specific grant, and the only one that can carry `admin`. A malformed identifier with no `@` has a domain equal to itself, and is excluded from rule 3 so it cannot match a domain entry.
@@ -137,25 +137,27 @@ Three behaviors are worth knowing before reading `src/admin-ui/`:
 
 ## Binding
 
-An entry is **declared** by address and **matched** by provider identity once bound. The first successful sign-in against an unbound address records the provider and the OIDC `sub`; from then on that entry matches on those two alone.
+An entry is **declared** by address and **matched** per provider once bound. `access_entry_bindings` holds one row per `(address, provider)` with the OIDC `sub`. The first successful sign-in through a provider binds that provider; from then on that provider matches on the `sub` alone, while a provider not yet bound still matches on the verified email. So one address can sign in through Google, BuildDown and Microsoft, each bound once.
 
 - A **rename** keeps its role — the `sub` is stable across an address change.
-- A **reassigned address inherits nothing** — a new person holding an old address presents a different `sub` and does not match.
-- **Binding happens once.** A later sign-in cannot re-point an entry at another subject.
-- Known cost: the same person arriving via a second provider presents a different `sub` and will not match their bound entry. They need a fresh entry.
+- A **reassigned address inherits nothing** — per provider, a new holder presents a different `sub` and does not match.
+- **Each provider binds once.** A later sign-in cannot re-point it at another subject.
+- Domain entries never bind, because they admit many identities.
 
-Domain entries never bind, because they admit many identities.
+Binds go through the `AccessBinding` Restate virtual object (`src/restate/access-binding.ts`), keyed by the address. Its exclusive `bind` handler serializes two first sign-ins: the first returns `bound`, the second `conflict` and is refused (log `subject mismatch for <provider>`). **Fail closed:** if the Restate ingress is unreachable, sign-in is denied (log `binding unavailable`) and nothing is admitted without a recorded binding. Already-bound identities still match from the cache, but a first sign-in through a provider needs Restate. Each result logs one line (`bound`, `already-bound`, `conflict`, `unavailable`) with address and provider only. Entries that already carried a legacy `provider`/`subject` are copied into the table once at startup.
+
+**The object is the single writer of bindings, for bind and for clear.** Its exclusive `clear` handler deletes the address's rows, nulls the legacy `provider`/`subject` columns and writes the `clear-bindings` audit entry in one `ctx.run` and one SQLite transaction, so a `bind` in flight when an admin clears is ordered before or after it, never interleaved. The admin route calls `clear` through the ingress and fails with an error if Restate is unreachable; it never falls back to a direct delete. Both `bound` and `already-bound` refresh this process's cached list (a stale cache would otherwise send the same identity through the ingress on every sign-in until the TTL expires); `conflict` and `unavailable` do not. Removing an entry deletes its bindings in the same transaction. The Access page lists each address's bound providers and has a **Clear bindings** action (admin only, audited as `clear-bindings`).
 
 ### Re-pointing a bound entry
 
 When an address changes hands — someone leaves and their address is reassigned — the entry stays bound to the departed person's subject and the new holder matches nothing. They fall through to domain admission as `user`, or are denied outright.
 
-**One save cannot fix it.** A save updates the role of a surviving entry and leaves its binding alone, by design, since that is what lets a rename keep its role. The fix is two saves:
+**One save cannot fix it.** A save updates the role of a surviving entry and leaves its bindings alone, by design, since that is what lets a rename keep its role. The fix is two saves:
 
-1. Remove the entry, and save. The row is deleted, binding and all.
+1. Remove the entry, and save. The row and its bindings are deleted. (Or use **Clear bindings** on the Access page to reset every provider at once.)
 2. Add the address back, and save. It is inserted fresh and unbound, and binds again on the new holder's first sign-in.
 
-This is easy to miss because nothing on the page shows it: `provider` and `subject` are stored and never rendered, so the address reads as `admin` while the person holding it is not one. Check the audit trail or the row itself if a newly-admitted person is being refused a role the list appears to give them.
+The page shows the bound providers, but not their subjects. Check the audit trail or the `access_entry_bindings` rows if a newly-admitted person is being refused a role the list appears to give them.
 
 ## Re-checking, and freshness
 

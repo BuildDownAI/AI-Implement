@@ -456,6 +456,25 @@ describe("handleMcpOidcCallback", () => {
     expect(new URL(location).searchParams.get("state")).toBe("clientstate");
   });
 
+  it("never calls the Restate ingress for an identity already bound to its provider (AII-1523)", async () => {
+    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
+    dedup.getDb().prepare("INSERT INTO access_entry_bindings (value, provider, subject, bound_at) VALUES (?, ?, ?, ?)")
+      .run("ada@eudoxus.ai", "google", "google|1", Date.now());
+    access.refreshEffectiveAllowlist();
+    const fetchMock = vi.fn().mockRejectedValue(new Error("ingress must not be called"));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const clientId = await registerClient();
+      await startAuthorize(clientId);
+      const { res, code } = await doCallback();
+      expect(res.statusCode).toBe(302);
+      expect(code).toBeTruthy();
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("redirects with error=access_denied when identity is not on allowlist", async () => {
     const clientId = await registerClient();
     await startAuthorize(clientId);

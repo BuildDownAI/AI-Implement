@@ -132,7 +132,8 @@ describe("saveAccessEntries auditing", () => {
     // keeper holds the admin role throughout, so ada is free to start as a user.
     const keeper = { kind: "address" as const, value: "keeper@eudoxus.ai", role: "admin" as const };
     access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "user" }, keeper], null);
-    access.bindAccessEntry("ada@eudoxus.ai", "google", "google|123");
+    dedup.getDb().prepare("INSERT INTO access_entry_bindings (value, provider, subject, bound_at) VALUES (?, ?, ?, ?)").run("ada@eudoxus.ai", "google", "google|123", 1);
+    access.refreshEffectiveAllowlist();
     access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }, keeper], null);
 
     const [latest] = audit.listAccessChanges();

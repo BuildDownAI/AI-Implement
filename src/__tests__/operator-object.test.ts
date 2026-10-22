@@ -39,8 +39,7 @@ const ADMITTING_ENTRY: AccessEntriesModule.AccessEntry = {
   kind: "address",
   value: "ada@eudoxus.ai",
   role: "user",
-  provider: null,
-  subject: null,
+  bindings: [],
   addedAt: 0,
   addedBy: null,
 };
