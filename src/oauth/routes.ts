@@ -10,7 +10,7 @@ import { authorize } from "./authorize.js";
 import { putTransaction, takeTransaction } from "./state-store.js";
 import { createSession, revokeSession, getRequestToken, SESSION_TTL_MS } from "../admin-session.js";
 import { serializeSessionCookie, clearSessionCookie } from "../cookies.js";
-import { allowlistHasNoAdmin, getEffectiveAllowlist } from "../access-entries.js";
+import { allowlistHasNoAdmin, getEffectiveAllowlist, isBoundTo } from "../access-entries.js";
 import { bindAccessIdentity } from "../restate/access-binding.js";
 
 function json(res: http.ServerResponse, status: number, data: unknown): void {
@@ -110,7 +110,7 @@ export async function handleOAuthCallback(
 
   // First sign-in through a provider binds the entry for it; that subject is what matches from then on.
   // Fail closed: an identity is never admitted without a recorded binding.
-  if (decision.entry.kind === "address") {
+  if (decision.entry.kind === "address" && !isBoundTo(decision.entry, identity)) {
     const bound = await bindAccessIdentity(decision.entry.value, identity.provider, identity.sub);
     if (bound === "conflict") {
       console.warn(`[oauth] denied ${identity.email ?? "?"} via ${providerId}: subject mismatch for ${providerId}`);

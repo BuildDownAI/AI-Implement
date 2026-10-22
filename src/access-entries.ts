@@ -118,6 +118,11 @@ export function recheckIdentity(identity: MatchableIdentity): RecheckResult {
   return entry ? { status: "ok", entry } : { status: "denied" };
 }
 
+/** True when the entry already holds this identity's binding, so a sign-in needs no write (and no Restate). */
+export function isBoundTo(entry: AccessEntry, identity: { provider: string; sub: string }): boolean {
+  return entry.bindings.some((b) => b.provider === identity.provider && b.subject === identity.sub);
+}
+
 /** The entry admitting this identity, or null. Entries arrive normalized; only the identity is folded here. */
 export function matchAccessEntry(identity: MatchableIdentity, entries: AccessEntry[]): AccessEntry | null {
   const email = (identity.email ?? "").trim().toLowerCase();
@@ -326,9 +331,11 @@ export function clearAccessBindings(value: string, actor: string | null): number
   const db = getDb();
   const removed = db.transaction(() => {
     const result = db.prepare("DELETE FROM access_entry_bindings WHERE value = ?").run(key);
+    // The startup migration copies the legacy columns; null them so a cleared binding cannot return on restart.
+    db.prepare("UPDATE access_entries SET provider = NULL, subject = NULL WHERE kind = 'address' AND value = ?").run(key);
     if (result.changes > 0) {
       const entries = listAccessEntries().map(({ kind, value: v, role }) => ({ kind, value: v, role }));
-      recordAccessChange({ actor, action: "clear-bindings", before: entries, after: entries, subject: key });
+      recordAccessChange({ actor, action: "clear-bindings", before: entries, after: entries, address: key });
     }
     return result.changes;
   })();

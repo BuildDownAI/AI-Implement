@@ -295,7 +295,7 @@ export const accessScript = `
         return '<tr>'
           + '<td class="text-tertiary">' + window.esc(new Date(c.createdAt).toLocaleString()) + '</td>'
           + '<td>' + window.esc(who) + '</td>'
-          + '<td>cleared bindings for ' + window.esc(c.subject || '') + '</td>'
+          + '<td>cleared bindings for ' + window.esc(c.address || '') + '</td>'
           + '</tr>';
       }
       return '<tr>'

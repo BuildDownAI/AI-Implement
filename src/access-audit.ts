@@ -18,7 +18,7 @@ export interface AccessChange {
   before: AccessEntryInput[];
   after: AccessEntryInput[];
   /** The address a `clear-bindings` change applied to. */
-  subject?: string | null;
+  address?: string | null;
 }
 
 interface AccessChangeRow {
@@ -28,7 +28,7 @@ interface AccessChangeRow {
   action: string;
   before_json: string;
   after_json: string;
-  subject: string | null;
+  address: string | null;
 }
 
 /** An audit snapshot is what an operator edited — never the binding or provenance they didn't. */
@@ -45,31 +45,31 @@ export function initAccessAuditTable(): void {
       action      TEXT NOT NULL,
       before_json TEXT NOT NULL,
       after_json  TEXT NOT NULL,
-      subject     TEXT
+      address     TEXT
     )
   `);
   const columns = db.prepare("PRAGMA table_info(access_audit)").all() as { name: string }[];
-  if (!columns.some((c) => c.name === "subject")) db.exec("ALTER TABLE access_audit ADD COLUMN subject TEXT");
+  if (!columns.some((c) => c.name === "address")) db.exec("ALTER TABLE access_audit ADD COLUMN address TEXT");
   db.exec("CREATE INDEX IF NOT EXISTS idx_access_audit_created_at ON access_audit(created_at)");
 }
 
 export function recordAccessChange(change: Omit<AccessChange, "id" | "createdAt">): void {
   getDb()
-    .prepare("INSERT INTO access_audit (created_at, actor, action, before_json, after_json, subject) VALUES (?, ?, ?, ?, ?, ?)")
+    .prepare("INSERT INTO access_audit (created_at, actor, action, before_json, after_json, address) VALUES (?, ?, ?, ?, ?, ?)")
     .run(
       Date.now(),
       change.actor,
       change.action,
       JSON.stringify(snapshot(change.before)),
       JSON.stringify(snapshot(change.after)),
-      change.subject ?? null,
+      change.address ?? null,
     );
 }
 
 export function listAccessChanges(limit = 20): AccessChange[] {
   const rows = getDb()
     .prepare(
-      "SELECT id, created_at, actor, action, before_json, after_json, subject FROM access_audit ORDER BY created_at DESC, id DESC LIMIT ?",
+      "SELECT id, created_at, actor, action, before_json, after_json, address FROM access_audit ORDER BY created_at DESC, id DESC LIMIT ?",
     )
     .all(limit) as AccessChangeRow[];
   return rows.map((r) => ({
@@ -77,7 +77,7 @@ export function listAccessChanges(limit = 20): AccessChange[] {
     createdAt: r.created_at,
     actor: r.actor,
     action: r.action === "recover" || r.action === "clear-bindings" ? r.action : "save",
-    subject: r.subject,
+    address: r.address,
     before: parseSnapshot(r.before_json),
     after: parseSnapshot(r.after_json),
   }));

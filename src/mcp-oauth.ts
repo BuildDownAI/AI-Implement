@@ -22,7 +22,7 @@ import { getDb } from "./dedup.js";
 import { getProvider, listConfiguredProviders } from "./oauth/providers.js";
 import { buildAuthUrl, completeAuth } from "./oauth/oidc.js";
 import { authorize } from "./oauth/authorize.js";
-import { getEffectiveAllowlist, matchAccessEntry } from "./access-entries.js";
+import { getEffectiveAllowlist, isBoundTo, matchAccessEntry } from "./access-entries.js";
 import { bindAccessIdentity } from "./restate/access-binding.js";
 import type { DescribeOutcome, IssueInput, IssueOutcome, RefreshAuthority, RefreshInput, RefreshOutcome } from "./mcp-identity.js";
 import { recordAuthEvent, resolveClientPath, isLoopbackHost, type AuthEventCause, type ClientPath } from "./mcp-auth-events.js";
@@ -462,7 +462,7 @@ export async function handleMcpOidcCallback(
   }
 
   // Fail closed: an identity is never admitted without a recorded binding.
-  if (decision.entry.kind === "address") {
+  if (decision.entry.kind === "address" && !isBoundTo(decision.entry, identity)) {
     const bound = await bindAccessIdentity(decision.entry.value, identity.provider, identity.sub);
     if (bound === "conflict") {
       console.warn(`[mcp-oauth] denied ${identity.email ?? "?"} via ${providerId}: subject mismatch for ${providerId}`);

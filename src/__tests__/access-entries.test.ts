@@ -260,6 +260,17 @@ describe("access_entry_bindings", () => {
     expect(rawRow("address", "ada@eudoxus.ai")!.provider).toBe("google");
   });
 
+  it("does not resurrect cleared bindings from the legacy columns on the next init", () => {
+    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
+    dedup.getDb().prepare("UPDATE access_entries SET provider = 'google', subject = 'g-1' WHERE value = 'ada@eudoxus.ai'").run();
+    access.initAccessEntriesTable();
+
+    access.clearAccessBindings("ada@eudoxus.ai", null);
+    access.initAccessEntriesTable();
+
+    expect(bindingRows("ada@eudoxus.ai")).toEqual([]);
+  });
+
   it("does not migrate an unbound entry", () => {
     access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
     access.initAccessEntriesTable();
@@ -288,8 +299,8 @@ describe("access_entry_bindings", () => {
     expect(bindingRows("ada@eudoxus.ai")).toEqual([]);
     expect(bindingRows("keeper@eudoxus.ai")).toHaveLength(1);
     expect(adaEntry().bindings).toEqual([]);
-    const row = dedup.getDb().prepare("SELECT actor, action, subject FROM access_audit ORDER BY id DESC LIMIT 1").get();
-    expect(row).toEqual({ actor: "admin@eudoxus.ai", action: "clear-bindings", subject: "ada@eudoxus.ai" });
+    const row = dedup.getDb().prepare("SELECT actor, action, address FROM access_audit ORDER BY id DESC LIMIT 1").get();
+    expect(row).toEqual({ actor: "admin@eudoxus.ai", action: "clear-bindings", address: "ada@eudoxus.ai" });
   });
 });
 
