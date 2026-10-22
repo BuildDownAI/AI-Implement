@@ -25,6 +25,7 @@ import {
   getFleetReportTool,
   triggerKgRefreshTool,
   decideKgRefreshTool,
+  auditActor,
   setRunnerModeTool,
   pauseProjectTool,
   addProjectTool,
@@ -297,6 +298,12 @@ describe("tool()", () => {
       expect(logSpy).toHaveBeenCalledWith(
         "[mcp] write tool=my_write actor=control-plane role=user result=forbidden kind=service",
       );
+    });
+
+    it("auditActor maps a service caller to control-plane at every site, keeping the email and the fallback otherwise", () => {
+      expect(auditActor(serviceCaller(), "unknown")).toBe("control-plane");
+      expect(auditActor({ kind: "oauth", email: "a@b.c" }, "unknown")).toBe("a@b.c");
+      expect(auditActor({ kind: "system", email: null }, "system")).toBe("system");
     });
 
     it("lets a service caller call a read tool", async () => {

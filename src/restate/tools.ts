@@ -129,6 +129,11 @@ export type WireInput<I extends z.ZodType> = z.infer<ReturnType<typeof wireInput
  * `role: "admin"` handlers default to writes for compatibility; privileged reads set
  * `operation: "read"` explicitly.
  */
+/** The audit actor for a caller: its email, `control-plane` for a service caller, else `fallback`. */
+export function auditActor(caller: { email: string | null; kind: string }, fallback: string): string {
+  return caller.email ?? (caller.kind === "service" ? "control-plane" : fallback);
+}
+
 export function tool<I extends z.ZodType>(
   opts: ToolOptions<I>,
   handler: (ctx: restate.Context, input: WireInput<I>) => Promise<ToolResponse>,
@@ -147,7 +152,7 @@ export function tool<I extends z.ZodType>(
       const operation = opts.operation ?? (opts.role === "admin" ? "write" : "read");
       const audit = (result: "forbidden" | "ok" | "error"): void => {
         if (operation !== "write") return;
-        const actor = input.caller.email ?? (input.caller.kind === "service" ? "control-plane" : "system");
+        const actor = auditActor(input.caller, "system");
         let detail = "";
         try {
           detail = opts.auditDetail ? ` ${opts.auditDetail(input)}` : "";
@@ -708,7 +713,7 @@ export const decideKgRefreshTool = tool(
     const repo = ctx.objectClient(KgRepo, toolDeps.kgSourceRepo);
     if ((await repo.status()) == null) return toolError("no-refresh-in-flight");
     const { action, triggerId: heldTrigger } = input.args;
-    const actor = input.caller.email ?? (input.caller.kind === "system" ? "system" : "unknown");
+    const actor = auditActor(input.caller, input.caller.kind === "system" ? "system" : "unknown");
     try {
       await repo.decide({ action, actor, ...(heldTrigger !== undefined ? { triggerId: heldTrigger } : {}) });
       return reply({ decided: action });
