@@ -108,6 +108,11 @@ function wireInputSchema<I extends z.ZodType>(input: I) {
  */
 export type WireInput<I extends z.ZodType> = z.infer<ReturnType<typeof wireInputSchema<I>>>;
 
+/** The audit actor for a caller: its email, `control-plane` for a service caller, else `fallback`. */
+export function auditActor(caller: { email: string | null; kind: string }, fallback: string): string {
+  return caller.email ?? (caller.kind === "service" ? "control-plane" : fallback);
+}
+
 /**
  * Wraps `restate.handlers.handler` with a zod input/output serde and the discovery
  * metadata (`mcp.type`, `mcp.role`) tools-client.ts's discoverTools() reads back. The
@@ -129,11 +134,6 @@ export type WireInput<I extends z.ZodType> = z.infer<ReturnType<typeof wireInput
  * `role: "admin"` handlers default to writes for compatibility; privileged reads set
  * `operation: "read"` explicitly.
  */
-/** The audit actor for a caller: its email, `control-plane` for a service caller, else `fallback`. */
-export function auditActor(caller: { email: string | null; kind: string }, fallback: string): string {
-  return caller.email ?? (caller.kind === "service" ? "control-plane" : fallback);
-}
-
 export function tool<I extends z.ZodType>(
   opts: ToolOptions<I>,
   handler: (ctx: restate.Context, input: WireInput<I>) => Promise<ToolResponse>,
