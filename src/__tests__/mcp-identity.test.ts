@@ -1,11 +1,17 @@
 import { describe, it, expect } from "vitest";
 import type http from "node:http";
-import { systemCaller, type DescribeOutcome, type IssueOutcome, type RefreshAuthority, type RefreshOutcome } from "../mcp-identity.js";
+import { serviceCaller, systemCaller, type DescribeOutcome, type IssueOutcome, type RefreshAuthority, type RefreshOutcome } from "../mcp-identity.js";
 import { handleMcpTokenRequest, setRefreshAuthority } from "../mcp-oauth.js";
 
 describe("systemCaller", () => {
   it("returns kind system, no email, and the admin role", () => {
     expect(systemCaller()).toEqual({ kind: "system", email: null, role: "admin" });
+  });
+});
+
+describe("serviceCaller", () => {
+  it("returns kind service, no email, and the read-only user role", () => {
+    expect(serviceCaller()).toEqual({ kind: "service", email: null, role: "user" });
   });
 });
 

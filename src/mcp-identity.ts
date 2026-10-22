@@ -1,7 +1,8 @@
 /**
  * The identity contract every caller of the orchestrator's tools is resolved to.
  *
- * `IdentityKind` distinguishes a human sign-in from in-process/system code today;
+ * `IdentityKind` distinguishes a human sign-in, in-process/system code, and a
+ * read-only trusted machine (`service`) today;
  * AII-702 adds `"run"` for a Restate-issued run capability. `Caller` is the shape
  * every tool handler receives (from AII-707 step 6 on) regardless of which kind
  * produced it.
@@ -14,7 +15,7 @@
 
 import type { AccessRole } from "./access-entries.js";
 
-export type IdentityKind = "human" | "system";
+export type IdentityKind = "human" | "system" | "service";
 
 export interface Caller {
   kind: IdentityKind;
@@ -25,6 +26,11 @@ export interface Caller {
 /** The identity in-process/system code acts under: unrestricted, unattributed to a person. */
 export function systemCaller(): Caller {
   return { kind: "system", email: null, role: "admin" };
+}
+
+/** The identity a trusted machine (the BuildDown control plane) acts under: read-only, never `admin`. */
+export function serviceCaller(): Caller {
+  return { kind: "service", email: null, role: "user" };
 }
 
 export interface RefreshInput {

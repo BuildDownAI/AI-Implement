@@ -25,6 +25,7 @@ import {
   getFleetReportTool,
   triggerKgRefreshTool,
   decideKgRefreshTool,
+  auditActor,
   setRunnerModeTool,
   pauseProjectTool,
   addProjectTool,
@@ -39,7 +40,7 @@ import {
 } from "../restate/tools.js";
 import { KG_REFRESH_RUNNER_STEPS } from "../restate/kg-refresh-types.js";
 import { discoverTools, callTool, callToolAsSystem, toolCatalog } from "../restate/tools-client.js";
-import type { Caller } from "../mcp-identity.js";
+import { serviceCaller, type Caller } from "../mcp-identity.js";
 import { setKgMemoryProvider } from "../kg-provider.js";
 import type { MemoryProvider } from "../kg-provider.js";
 import type { PreflightCheckResult, RefreshOutcome } from "../kg-refresh.js";
@@ -282,6 +283,37 @@ describe("tool()", () => {
       expect(logSpy).toHaveBeenCalledWith(
         "[mcp] write tool=my_write actor=system role=admin result=error kind=system",
       );
+    });
+
+    it("refuses a service caller on a write tool and audits actor=control-plane", async () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const handlerBody = vi.fn(async () => ({ content: [{ type: "text", text: "done" }] }));
+      const myWrite = tool({ description: "d", input: z.object({}), role: "admin" }, handlerBody);
+
+      const res = await myWrite(fakeContext("my_write"), { caller: serviceCaller(), args: {} });
+
+      expect(handlerBody).not.toHaveBeenCalled();
+      expect(res.isError).toBe(true);
+      expect(res.content[0]).toEqual({ type: "text", text: "forbidden: my_write requires the admin role" });
+      expect(logSpy).toHaveBeenCalledWith(
+        "[mcp] write tool=my_write actor=control-plane role=user result=forbidden kind=service",
+      );
+    });
+
+    it("auditActor maps a service caller to control-plane at every site, keeping the email and the fallback otherwise", () => {
+      expect(auditActor(serviceCaller(), "unknown")).toBe("control-plane");
+      expect(auditActor({ kind: "oauth", email: "a@b.c" }, "unknown")).toBe("a@b.c");
+      expect(auditActor({ kind: "system", email: null }, "system")).toBe("system");
+    });
+
+    it("lets a service caller call a read tool", async () => {
+      const handlerBody = vi.fn(async () => ({ content: [{ type: "text", text: "done" }] }));
+      const myRead = tool({ description: "d", input: z.object({}), role: "user" }, handlerBody);
+
+      const res = await myRead(fakeContext("my_read"), { caller: serviceCaller(), args: {} });
+
+      expect(res.isError).toBeUndefined();
+      expect(handlerBody).toHaveBeenCalled();
     });
 
     it("never logs for a role: \"user\" tool, success or refusal", async () => {

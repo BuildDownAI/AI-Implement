@@ -48,6 +48,11 @@ describe("recordAuthEvent", () => {
     });
   });
 
+  it("reads a service identity kind back as service", () => {
+    authEvents.recordAuthEvent(baseEvent({ cause: "ok", identityKind: "service" }));
+    expect(authEvents.listAuthEvents()[0].identityKind).toBe("service");
+  });
+
   it("logs a single console line with the fixed [mcp-auth] prefix", () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     authEvents.recordAuthEvent(baseEvent({ cause: "ok", kind: "refresh" }));
