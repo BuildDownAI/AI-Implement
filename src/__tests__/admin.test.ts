@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { SignJWT, exportJWK, generateKeyPair } from "jose";
 import { createModelProtectedSecrets } from "../model-protected-secrets.js";
 import { createModelSessionKeyProvider } from "../model-session-keys.js";
 import { createModelSessionStore } from "../model-session-store.js";
@@ -136,10 +137,17 @@ class MockRequest extends EventEmitter {
     this.url = url;
     this.method = method;
     this.headers = headers;
-    process.nextTick(() => {
-      if (body) this.emit("data", Buffer.from(body));
-      this.emit("end");
-    });
+    // Like a paused real stream, hold the body until a reader attaches: an async gate (the
+    // control-plane token check) reads it several ticks after construction.
+    const release = (event: string | symbol): void => {
+      if (event !== "data" && event !== "end") return;
+      this.off("newListener", release);
+      process.nextTick(() => {
+        if (body) this.emit("data", Buffer.from(body));
+        this.emit("end");
+      });
+    };
+    this.on("newListener", release);
   }
 }
 
@@ -4507,6 +4515,109 @@ describe("POST /api/tools/<name>", () => {
     );
     expect(res.statusCode).toBe(200);
     expect(capturedDeps).toBeUndefined();
+  });
+});
+
+describe("control-plane token on /api (AII-1514)", () => {
+  const ISSUER = "https://cp.builddown.test";
+  const BASE_URL = "https://orch-a.example.com";
+  let signingKey: CryptoKey;
+  let cpModule: typeof import("../control-plane-token.js");
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(async () => {
+    cpModule = await import("../control-plane-token.js");
+    cpModule.resetControlPlaneTokenCache();
+    const pair = await generateKeyPair("ES256");
+    signingKey = pair.privateKey;
+    const jwk = { ...(await exportJWK(pair.publicKey)), kid: "k1", alg: "ES256", use: "sig" };
+    fakeFetch({
+      "GET /.well-known/openid-configuration": { json: { jwks_uri: `${ISSUER}/jwks` } },
+      "GET /jwks": { json: { keys: [jwk] } },
+    }).install();
+    saved = { i: process.env.BUILDDOWN_OIDC_ISSUER, b: process.env.OAUTH_REDIRECT_BASE_URL };
+    process.env.BUILDDOWN_OIDC_ISSUER = ISSUER;
+    process.env.OAUTH_REDIRECT_BASE_URL = BASE_URL;
+  });
+
+  afterEach(() => {
+    if (saved.i === undefined) delete process.env.BUILDDOWN_OIDC_ISSUER;
+    else process.env.BUILDDOWN_OIDC_ISSUER = saved.i;
+    if (saved.b === undefined) delete process.env.OAUTH_REDIRECT_BASE_URL;
+    else process.env.OAUTH_REDIRECT_BASE_URL = saved.b;
+  });
+
+  async function cpToken(aud = BASE_URL): Promise<string> {
+    const now = Math.floor(Date.now() / 1000);
+    return new SignJWT({ scope: "orchestrator:read" })
+      .setProtectedHeader({ alg: "ES256", kid: "k1" })
+      .setIssuer(ISSUER)
+      .setAudience(aud)
+      .setIssuedAt(now)
+      .setExpirationTime(now + 300)
+      .sign(signingKey);
+  }
+
+  async function call(url: string, method: string, tokenValue: string, deps: AdminModule.AdminDeps = {}) {
+    const req = new MockRequest(url, method, { authorization: `Bearer ${tokenValue}` }, method === "POST" ? JSON.stringify({ args: {} }) : undefined);
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps);
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body };
+  }
+
+  it("runs a tool as the read-only service caller", async () => {
+    const callTool = vi.fn<NonNullable<AdminModule.AdminDeps["callTool"]>>(async () => ({ status: "ok" as const, content: [] }));
+    const res = await call("/api/tools/get_tenant_health", "POST", await cpToken(), { callTool });
+    expect(res.statusCode).toBe(200);
+    expect(callTool).toHaveBeenCalledWith("get_tenant_health", {}, { kind: "service", email: null, role: "user" }, undefined);
+  });
+
+  it("hands a write tool the user-role service caller, which the tool() wrapper refuses", async () => {
+    const callTool = vi.fn<NonNullable<AdminModule.AdminDeps["callTool"]>>(async () => ({ status: "ok" as const, content: [] }));
+    await call("/api/tools/set_runner_mode", "POST", await cpToken(), { callTool });
+    expect(callTool.mock.calls[0]?.[2]).toEqual({ kind: "service", email: null, role: "user" });
+  });
+
+  it("answers 401 for a token for another orchestrator, without running the tool", async () => {
+    const callTool = vi.fn<NonNullable<AdminModule.AdminDeps["callTool"]>>(async () => ({ status: "ok" as const, content: [] }));
+    const res = await call("/api/tools/get_tenant_health", "POST", await cpToken("https://orch-b.example.com"), { callTool });
+    expect(res.statusCode).toBe(401);
+    expect(callTool).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["/api/session-identity", "GET"],
+    ["/api/mappings", "GET"],
+    ["/api/mappings", "POST"],
+    ["/api/deploy", "POST"],
+    ["/api/tools/get_tenant_health", "GET"],
+  ])("answers 401 to the token on %s %s", async (url, method) => {
+    const res = await call(url, method, await cpToken());
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("still accepts an admin session sent as a Bearer on the tools route", async () => {
+    const callTool = vi.fn<NonNullable<AdminModule.AdminDeps["callTool"]>>(async () => ({ status: "ok" as const, content: [] }));
+    const res = await call("/api/tools/get_tenant_health", "POST", await login("secret"), { callTool });
+    expect(res.statusCode).toBe(200);
+    expect(callTool.mock.calls[0]?.[2]).toMatchObject({ kind: "human", role: "admin" });
+  });
+
+  it("answers 401, not 500, for a malformed percent-encoded tool name with a Bearer header", async () => {
+    const callTool = vi.fn<NonNullable<AdminModule.AdminDeps["callTool"]>>(async () => ({ status: "ok" as const, content: [] }));
+    const res = await call("/api/tools/%E0", "POST", "x", { callTool });
+    expect(res.statusCode).toBe(401);
+    expect(callTool).not.toHaveBeenCalled();
+  });
+
+  it("ignores the token when BUILDDOWN_OIDC_ISSUER is unset", async () => {
+    const t = await cpToken();
+    delete process.env.BUILDDOWN_OIDC_ISSUER;
+    const callTool = vi.fn<NonNullable<AdminModule.AdminDeps["callTool"]>>(async () => ({ status: "ok" as const, content: [] }));
+    const res = await call("/api/tools/get_tenant_health", "POST", t, { callTool });
+    expect(res.statusCode).toBe(401);
+    expect(callTool).not.toHaveBeenCalled();
   });
 });
 
