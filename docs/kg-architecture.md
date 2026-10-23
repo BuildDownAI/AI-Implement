@@ -491,9 +491,10 @@ installation accepts it — so this is two clicks by an org owner, not a per-rep
 
 This is not requestable through code, and there is no way to detect the gap from inside the PR
 itself. Until granted, the sticky comment is the only signal; nothing errors or blocks in the
-meantime. The preflight's `statuses:write` rows probe this grant against the same two repos the
-webhook actually posts to — the KG source repo, and whichever repo is configured as "Base template
-repo" (see the note on the two "base repo" notions below), not sources.yml's `base_repo:`. The
+meantime. The preflight's `statuses:write` rows probe this grant on the KG source repo, which the
+webhook posts to, and on whichever repo is configured as "Base template repo" (see the note on the
+two "base repo" notions below), not sources.yml's `base_repo:`. The webhook skips PRs on the base
+repo (see above), so the base row is advisory only and kept for settings that read it. The
 "Base template repo" field is seeded once from `KG_BASE_REPO` on first boot; a deployment that
 never set that variable has an empty field and must set it by hand under Settings → KG Refresh
 (the preflight then falls back to sources.yml's `base_repo:` for its probe until it is set).
@@ -502,8 +503,8 @@ never set that variable has an empty field and must set it by hand under Setting
 by itself it is advisory and a PR can be merged straight through it regardless of the guard's verdict.
 The ticket's "required check" only exists once a repo admin adds `kg-refresh/dry-run` as a required
 context in that repo's branch protection settings (Settings → Branches → Branch protection rule →
-"Require status checks to pass" → add `kg-refresh/dry-run`), on both the KG source repo and the base
-template repo. Nothing in this codebase calls GitHub's branch-protection API to do this automatically
+"Require status checks to pass" → add `kg-refresh/dry-run`), on the KG source repo. The base
+template repo gets no `kg-refresh/dry-run` status, since the webhook skips its PRs. Nothing in this codebase calls GitHub's branch-protection API to do this automatically
 — it stays a one-time, per-repo manual step alongside the App's **Commit statuses: Read and write** permission (`statuses: write` in API terms) described above. Until that step is
 done on a given repo, `kg-refresh/dry-run` is informational only there, no matter how the guard votes.
 

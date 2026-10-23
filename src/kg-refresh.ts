@@ -482,7 +482,8 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
     results.push({ repo: kgRepoSlug, grant: "contents:write", ok: false, status: 0 });
   }
 
-  // Advisory `statuses:write` rows for the PR-triggered dry-run check (AII-633): the
+  // Advisory `statuses:write` rows for the PR-triggered dry-run check (AII-633). The webhook
+  // skips PRs on the base template repo (AII-1529), so the base row is advisory only. The
   // commit status is additive to the always-posted sticky PR comment, so a repo that
   // hasn't granted the App `statuses: write` yet must never fail the whole preflight —
   // `ok` is always true here, same convention as the `base:drift` row above, with the
