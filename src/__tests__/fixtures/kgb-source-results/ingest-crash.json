@@ -1,0 +1,42 @@
+[
+  {
+    "source": "code_repo:your-org/your-project",
+    "kind": "code_repo",
+    "status": "success",
+    "reason": null,
+    "counts": {
+      "files": 2,
+      "commits": 1,
+      "people": 1,
+      "prs": 0,
+      "pr_comments": 0,
+      "commit_cap": 5,
+      "pr_cap": 0,
+      "history_branch": "main",
+      "is_default_branch": false,
+      "first_commit_date": "1970-01-01T00:00:00+00:00",
+      "last_commit_date": "1970-01-01T00:00:00+00:00"
+    }
+  },
+  {
+    "source": "docs_site:*",
+    "kind": "docs_site",
+    "status": "skipped",
+    "reason": "--no-docs-sites",
+    "counts": {}
+  },
+  {
+    "source": "self:*",
+    "kind": "self",
+    "status": "skipped",
+    "reason": "self_ingest: false",
+    "counts": {}
+  },
+  {
+    "source": "ingest:*",
+    "kind": "ingest",
+    "status": "failed",
+    "reason": "deliberate post-loop failure for contract test",
+    "counts": {}
+  }
+]
