@@ -304,6 +304,7 @@ describe("handleOAuthCallback org role claim (AII-1526)", () => {
       const res = await callback("member");
       expect(res.headers["Location"]).toBe("/admin?auth_error=denied");
       expect(sessionCount()).toBe(0);
+      expect(dedup.getDb().prepare("SELECT COUNT(*) AS c FROM org_claim_roles").get()).toEqual({ c: 0 });
       expect(log.mock.calls.some((c) => String(c[0]).includes("source: org-claim"))).toBe(true);
     } finally {
       vi.unstubAllGlobals();

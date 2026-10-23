@@ -563,12 +563,18 @@ describe("handleMcpOidcCallback org role claim (AII-1526)", () => {
     const db = dedup.getDb();
     const who = { email: "ada@eudoxus.ai", sub: "bd|1", provider: "builddown" };
     expect(access.recheckIdentity(who).status).toBe("denied");
-    access.recordOrgClaimRole(who, "user");
+    access.recordOrgClaimRole(who, "user", Date.now() + 1e6);
     expect(access.recheckIdentity(who)).toMatchObject({ status: "ok", entry: { role: "user" } });
     expect(access.recheckIdentity({ ...who, sub: "bd|2" }).status).toBe("denied");
     expect(access.recheckIdentity({ ...who, provider: "google" }).status).toBe("denied");
     access.clearOrgClaimRole(who);
     expect(access.recheckIdentity(who).status).toBe("denied");
+    // An expired row is ignored, so a claim-only identity is refused once the window passes.
+    access.recordOrgClaimRole(who, "user", 1000);
+    const entries = access.getEffectiveAllowlist()!.entries;
+    expect(access.matchAccessEntryOrOrgClaim(who, entries, 999)).toMatchObject({ role: "user" });
+    expect(access.matchAccessEntryOrOrgClaim(who, entries, 1000)).toBeNull();
+    access.clearOrgClaimRole(who);
     expect(db.prepare("SELECT COUNT(*) AS c FROM access_entries").get()).toEqual({ c: 0 });
   });
 });

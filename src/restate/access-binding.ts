@@ -9,7 +9,8 @@ import type { ObjectContext } from "@restatedev/restate-sdk";
 import * as restateClients from "@restatedev/restate-sdk-clients";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
-import { clearAccessBindings, refreshEffectiveAllowlist } from "../access-entries.js";
+import type { AccessRole } from "../access-entries.js";
+import { clearAccessBindings, clearOrgClaimRole, recordOrgClaimRole, refreshEffectiveAllowlist } from "../access-entries.js";
 import { getDb } from "../dedup.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 
@@ -21,6 +22,19 @@ type BindInput = z.infer<typeof bindSchema>;
 
 const clearSchema = z.object({ actor: z.string().nullable() }).strict();
 type ClearInput = z.infer<typeof clearSchema>;
+
+const recordClaimSchema = z
+  .object({
+    provider: z.string().min(1),
+    subject: z.string().min(1),
+    role: z.enum(["admin", "user"]),
+    expiresAt: z.number().int(),
+  })
+  .strict();
+type RecordClaimInput = z.infer<typeof recordClaimSchema>;
+
+const clearClaimSchema = z.object({ provider: z.string().min(1) }).strict();
+type ClearClaimInput = z.infer<typeof clearClaimSchema>;
 
 const INGRESS_TIMEOUT_MS = 5_000;
 
@@ -56,6 +70,25 @@ export const accessBinding = restate.object({
         const value = ctx.key.trim().toLowerCase();
         // One SQLite transaction (rows, legacy columns, audit entry); a replay after commit deletes nothing.
         const removed = await ctx.run("clear", () => clearAccessBindings(value, input.actor));
+        return { removed };
+      },
+    ),
+    // The single writer of `org_claim_roles`. The row is keyed (address, provider), so a replay overwrites itself.
+    recordClaimRole: restate.handlers.object.exclusive(
+      { input: serde.zod(recordClaimSchema) },
+      async (ctx: ObjectContext, input: RecordClaimInput): Promise<{ recorded: true }> => {
+        const email = ctx.key.trim().toLowerCase();
+        await ctx.run("record-claim-role", () =>
+          recordOrgClaimRole({ email, provider: input.provider, sub: input.subject }, input.role as AccessRole, input.expiresAt),
+        );
+        return { recorded: true };
+      },
+    ),
+    clearClaimRole: restate.handlers.object.exclusive(
+      { input: serde.zod(clearClaimSchema) },
+      async (ctx: ObjectContext, input: ClearClaimInput): Promise<{ removed: number }> => {
+        const email = ctx.key.trim().toLowerCase();
+        const removed = await ctx.run("clear-claim-role", () => clearOrgClaimRole({ email, provider: input.provider }));
         return { removed };
       },
     ),
@@ -115,4 +148,46 @@ export async function clearAccessBindingsViaObject(
   const result = await ingress.objectClient<AccessBindingDefinition>({ name: "AccessBinding" }, key).clear({ actor });
   refreshEffectiveAllowlist();
   return result.removed;
+}
+
+/** Records a claim-granted role through the object. Never throws: `false` means the ingress was unreachable and callers must deny. */
+export async function recordClaimRoleViaObject(
+  address: string,
+  input: { provider: string; subject: string; role: AccessRole; expiresAt: number },
+  deps: { baseUrl?: string; fetchImpl?: typeof fetch } = {},
+): Promise<boolean> {
+  const key = address.trim().toLowerCase();
+  const base = deps.fetchImpl ?? ((...args: Parameters<typeof fetch>) => fetch(...args));
+  try {
+    const ingress = restateClients.connect({
+      url: deps.baseUrl ?? RESTATE_INGRESS_BASE_URL,
+      fetch: (i, init) => base(i as never, { ...init, signal: AbortSignal.timeout(INGRESS_TIMEOUT_MS) }),
+    });
+    await ingress.objectClient<AccessBindingDefinition>({ name: "AccessBinding" }, key).recordClaimRole(input);
+    return true;
+  } catch {
+    console.warn(`[access-binding] record-claim-role unavailable ${key} via ${input.provider}`);
+    return false;
+  }
+}
+
+/** Clears a claim-granted role through the object. Never throws: `false` means the ingress was unreachable and callers must deny. */
+export async function clearClaimRoleViaObject(
+  address: string,
+  provider: string,
+  deps: { baseUrl?: string; fetchImpl?: typeof fetch } = {},
+): Promise<boolean> {
+  const key = address.trim().toLowerCase();
+  const base = deps.fetchImpl ?? ((...args: Parameters<typeof fetch>) => fetch(...args));
+  try {
+    const ingress = restateClients.connect({
+      url: deps.baseUrl ?? RESTATE_INGRESS_BASE_URL,
+      fetch: (i, init) => base(i as never, { ...init, signal: AbortSignal.timeout(INGRESS_TIMEOUT_MS) }),
+    });
+    await ingress.objectClient<AccessBindingDefinition>({ name: "AccessBinding" }, key).clearClaimRole({ provider });
+    return true;
+  } catch {
+    console.warn(`[access-binding] clear-claim-role unavailable ${key} via ${provider}`);
+    return false;
+  }
 }

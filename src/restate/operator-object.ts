@@ -281,6 +281,8 @@ export interface RestateRefreshAuthorityOptions {
   refreshKeySecret?: string;
   /** The access token's TTL, minted here in SQLite alongside a successful rotation. */
   accessTokenTtlMs: number;
+  /** The clock a claim-granted role's expiry is judged against; injectable for tests. */
+  now?: () => number;
 }
 
 /**
@@ -294,12 +296,14 @@ export class RestateRefreshAuthority implements RefreshAuthority {
   private readonly accessTokenTtlMs: number;
   private readonly permitsExternalCall: () => boolean;
   private readonly refreshKeySecret: string | undefined;
+  private readonly now: () => number;
 
   constructor(options: RestateRefreshAuthorityOptions) {
     this.baseUrl = options.ingressBaseUrl ?? `http://${RESTATE_INGRESS_BIND_ADDRESS}`;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.accessTokenTtlMs = options.accessTokenTtlMs;
     this.refreshKeySecret = options.refreshKeySecret;
+    this.now = options.now ?? Date.now;
     this.permitsExternalCall = options.permitsExternalCall ?? (() => !isDeployHeld());
   }
 
@@ -413,7 +417,7 @@ export class RestateRefreshAuthority implements RefreshAuthority {
       emit("unavailable", knownIdentity);
       return { status: "unavailable", cause: "allowlist" };
     }
-    if (!matchAccessEntryOrOrgClaim({ email: who.email, sub: who.sub ?? "", provider: who.provider ?? "" }, allowlist.entries)) {
+    if (!matchAccessEntryOrOrgClaim({ email: who.email, sub: who.sub ?? "", provider: who.provider ?? "" }, allowlist.entries, this.now())) {
       await this.invoke(clientId, "revoke", {});
       console.warn(`[mcp-oauth] refresh denied: ${who.email ?? "unknown identity"} no longer on allowlist`);
       emit("allowlist", knownIdentity);

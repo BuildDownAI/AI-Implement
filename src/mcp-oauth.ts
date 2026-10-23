@@ -22,8 +22,8 @@ import { getDb } from "./dedup.js";
 import { getProvider, listConfiguredProviders } from "./oauth/providers.js";
 import { buildAuthUrl, completeAuth } from "./oauth/oidc.js";
 import { authorize } from "./oauth/authorize.js";
-import { clearOrgClaimRole, getEffectiveAllowlist, isBoundTo, matchAccessEntryOrOrgClaim, recordOrgClaimRole } from "./access-entries.js";
-import { bindAccessIdentity } from "./restate/access-binding.js";
+import { getEffectiveAllowlist, hasOrgClaimRole, isBoundTo, matchAccessEntryOrOrgClaim, ORG_CLAIM_ROLE_TTL_MS } from "./access-entries.js";
+import { bindAccessIdentity, clearClaimRoleViaObject, recordClaimRoleViaObject } from "./restate/access-binding.js";
 import type { DescribeOutcome, IssueInput, IssueOutcome, RefreshAuthority, RefreshInput, RefreshOutcome } from "./mcp-identity.js";
 import { recordAuthEvent, resolveClientPath, isLoopbackHost, type AuthEventCause, type ClientPath } from "./mcp-auth-events.js";
 import { RestateRefreshAuthority } from "./restate/operator-object.js";
@@ -457,7 +457,10 @@ export async function handleMcpOidcCallback(
 
   const decision = authorize(identity, allowlist.entries);
   if (!decision.ok) {
-    if (identity.provider === "builddown") clearOrgClaimRole(identity);
+    // Best-effort: the denial stands either way, and an unreachable ingress leaves a row that expires.
+    if (identity.provider === "builddown" && identity.email && hasOrgClaimRole(identity)) {
+      await clearClaimRoleViaObject(identity.email, identity.provider);
+    }
     console.warn(`[mcp-oauth] denied ${identity.email ?? "?"} via ${providerId}: ${decision.reason}`);
     return redirectWithError(res, stateRow.redirect_uri, stateRow.client_state, "access_denied");
   }
@@ -476,9 +479,21 @@ export async function handleMcpOidcCallback(
     }
   }
 
+  // The claim-role row is written through the AccessBinding object; fail closed when it cannot be.
   if (identity.provider === "builddown") {
-    if (decision.source === "org-claim") recordOrgClaimRole(identity, decision.entry.role);
-    else clearOrgClaimRole(identity);
+    const recorded =
+      decision.source === "org-claim"
+        ? await recordClaimRoleViaObject(identity.email!, {
+            provider: identity.provider,
+            subject: identity.sub,
+            role: decision.entry.role,
+            expiresAt: Date.now() + ORG_CLAIM_ROLE_TTL_MS,
+          })
+        : !hasOrgClaimRole(identity) || (await clearClaimRoleViaObject(identity.email!, identity.provider));
+    if (!recorded) {
+      console.warn(`[mcp-oauth] denied ${identity.email ?? "?"} via ${providerId}: claim role unavailable`);
+      return redirectWithError(res, stateRow.redirect_uri, stateRow.client_state, "server_error");
+    }
   }
 
   db.prepare("UPDATE mcp_clients SET used_at = ? WHERE client_id = ?").run(Date.now(), stateRow.client_id);

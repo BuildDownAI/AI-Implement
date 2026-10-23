@@ -10,8 +10,8 @@ import { authorize } from "./authorize.js";
 import { putTransaction, takeTransaction } from "./state-store.js";
 import { createSession, revokeSession, getRequestToken, SESSION_TTL_MS } from "../admin-session.js";
 import { serializeSessionCookie, clearSessionCookie } from "../cookies.js";
-import { allowlistHasNoAdmin, clearOrgClaimRole, getEffectiveAllowlist, isBoundTo, recordOrgClaimRole } from "../access-entries.js";
-import { bindAccessIdentity } from "../restate/access-binding.js";
+import { allowlistHasNoAdmin, getEffectiveAllowlist, hasOrgClaimRole, isBoundTo, ORG_CLAIM_ROLE_TTL_MS } from "../access-entries.js";
+import { bindAccessIdentity, clearClaimRoleViaObject, recordClaimRoleViaObject } from "../restate/access-binding.js";
 
 function json(res: http.ServerResponse, status: number, data: unknown): void {
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -104,7 +104,10 @@ export async function handleOAuthCallback(
 
   const decision = authorize(identity, allowlist.entries);
   if (!decision.ok) {
-    if (identity.provider === "builddown") clearOrgClaimRole(identity);
+    // Best-effort: the denial stands either way, and an unreachable ingress leaves a row that expires.
+    if (identity.provider === "builddown" && identity.email && hasOrgClaimRole(identity)) {
+      await clearClaimRoleViaObject(identity.email, identity.provider);
+    }
     console.warn(`[oauth] denied ${identity.email ?? "?"} via ${providerId}: ${decision.reason}`);
     return redirect(res, "/admin?auth_error=denied");
   }
@@ -124,9 +127,21 @@ export async function handleOAuthCallback(
     }
   }
 
+  // The claim-role row is written through the AccessBinding object; fail closed when it cannot be.
   if (identity.provider === "builddown") {
-    if (decision.source === "org-claim") recordOrgClaimRole(identity, decision.entry.role);
-    else clearOrgClaimRole(identity);
+    const recorded =
+      decision.source === "org-claim"
+        ? await recordClaimRoleViaObject(identity.email!, {
+            provider: identity.provider,
+            subject: identity.sub,
+            role: decision.entry.role,
+            expiresAt: Date.now() + ORG_CLAIM_ROLE_TTL_MS,
+          })
+        : !hasOrgClaimRole(identity) || (await clearClaimRoleViaObject(identity.email!, identity.provider));
+    if (!recorded) {
+      console.warn(`[oauth] denied ${identity.email ?? "?"} via ${providerId}: claim role unavailable`);
+      return redirect(res, "/admin?auth_error=denied");
+    }
   }
 
   const token = createSession({

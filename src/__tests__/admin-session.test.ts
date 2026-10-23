@@ -179,9 +179,9 @@ describe("authenticateAdminRequest", () => {
     expect(session.authenticateAdminRequest(withToken(token))).toMatchObject({ ok: false, status: 401 });
 
     const again = session.createSession({ ...bd, name: "Cam" });
-    access.recordOrgClaimRole(bd, "user");
+    access.recordOrgClaimRole(bd, "user", Date.now() + 1e6);
     expect(session.authenticateAdminRequest(withToken(again))).toMatchObject({ ok: true, role: "user" });
-    access.recordOrgClaimRole(bd, "admin");
+    access.recordOrgClaimRole(bd, "admin", Date.now() + 1e6);
     expect(session.authenticateAdminRequest(withToken(again))).toMatchObject({ ok: true, role: "admin" });
 
     access.clearOrgClaimRole(bd);
