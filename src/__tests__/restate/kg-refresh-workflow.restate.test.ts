@@ -24,6 +24,7 @@ import type { CreateMachineOpts, Machine, MachineExit } from "../../fly-machines
 import type { RefreshOutcome } from "../../kg-refresh.js";
 import { RailGateError, type KgRailDeps } from "../../kg-refresh-rail.js";
 import { COMPLETION_MARKER } from "../../kg-sidecar.js";
+import { parseSourceResults } from "../../kg-source-results.js";
 import { orchestratorTools, setKgRefreshToolDeps } from "../../restate/tools.js";
 import type { KgRefreshToolDeps } from "../../restate/kg-refresh-production.js";
 import { callToolAsSystem } from "../../restate/tools-client.js";
@@ -3859,7 +3860,7 @@ describe("KgRefresh durable workflow", () => {
       async (label) => {
         const env = heldEnvs.get(label)!;
         const beforeClose = closePullRequestFn.mock.calls.length;
-        const sources = [{ source: "secondary_repo:x", kind: "secondary_repo", status: "failed", reason: "boom", counts: {} }];
+        const sources = parseSourceResults(JSON.parse(readFileSync(fileURLToPath(new URL("../fixtures/kgb-source-results/failed.json", import.meta.url)), "utf8")));
         const triggerId = await holdRun(env, { report: { ...HELD_REPORT, cause: "source-failed", acceptBlocked: true, lostTeams: [], sources } as KgRefreshReportBody });
         expect((await kgRepoStatus(env.baseUrl()))?.held).toMatchObject({ cause: "source-failed", acceptBlocked: true, sources });
         await expect(decideRepo(env, ACCEPT)).rejects.toThrow(/409.*accept-blocked/);
