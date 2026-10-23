@@ -248,6 +248,8 @@ export interface KgRefreshStatusResult {
 
 export interface KgDispatchResult {
   outcome: "accepted" | "rejected" | "unknown";
+  /** Short, safe text saying why a `rejected` dispatch was refused; shown in the dry-run comment and status. */
+  reason?: string;
   runId?: number;
   runUrl?: string;
   /** The backend's job id when it reported one; `null` means unknown (the workflow keys its own row by dispatch id). */
@@ -699,6 +701,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           const result = await deps.dispatch({ envelope, tokens: minted, dispatchId, machine, jobTimeoutMinutes, machineId: claim.machineId, executionMode, machineNonce });
           return {
             outcome: result.outcome, runId: result.runId, runUrl: result.runUrl,
+            ...(result.reason !== undefined && { reason: result.reason }),
             jobId: result.jobId, executionMode: result.executionMode,
             machineId: result.machineId ?? null, created: result.created === true,
             ...(result.app !== undefined && { app: result.app }),
@@ -731,7 +734,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       if (dispatchResult.outcome === "rejected") {
         ctx.set("step", "failed");
         const at = await ctx.date.now();
-        const outcome = await failurePath(buildFailureOutcome(at, "dispatch was rejected"), "dispatch_rejected");
+        const outcome = await failurePath(buildFailureOutcome(at, dispatchResult.reason ? `dispatch was rejected: ${dispatchResult.reason}` : "dispatch was rejected"), "dispatch_rejected");
         return finish(outcome);
       }
 

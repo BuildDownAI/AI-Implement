@@ -145,6 +145,12 @@ async function handleKgPrCheckWebhook(
     return owns;
   };
 
+  // A base template PR's head branch exists only in the base repo, so a dry run (dispatched on the
+  // source repo) can never succeed. Base changes get their dry run on the source repo's upstream-merge PR.
+  if (repoFullName === kgPrCheck.kgBaseRepo && repoFullName !== kgPrCheck.kgSourceRepo) {
+    return answer(200, { ignored: true, reason: "base_repo_pr" }, "base template PR: dry-run runs on the source repo's upstream-merge PR");
+  }
+
   if (!sha || !headRef) {
     return answer(200, { ignored: true, reason: "missing_pr_fields" }, "missing PR fields");
   }

@@ -432,12 +432,23 @@ reloadable on its own; here it rides a release, so the release has to be sequenc
 ### PR check (AII-633)
 
 A PR that touches `kg_ingest/**`, `sources.yml`, `ontology/**`, or `snapshot/**` on the bound KG
-source repo (`kg.sourceRepo` in the `get_project_binding` answer) or the configured base template repo (Settings → KG Refresh · "Base
-template repo", seeded once from `KG_BASE_REPO`), or whose head branch matches `kg-upstream/*` or
-`sync/upstream-*` (an upstream merge, guard-relevant regardless of which files it happens to touch),
-gets the same dry run described above run against the PR's head instead of the default branch: the
-webhook (`opened` / `synchronize`) dispatches `trigger({ dryRun: true, ref: <head branch>, report })`,
-which runs `kg-snapshot-push`'s guards without committing or pushing. A PR that changes nothing guard-relevant — docs, an unrelated code path — gets no dispatch at
+source repo (`kg.sourceRepo` in the `get_project_binding` answer), or whose head branch matches
+`kg-upstream/*` or `sync/upstream-*` (an upstream merge, guard-relevant regardless of which files it
+happens to touch), gets the same dry run described above run against the PR's head instead of the
+default branch: the webhook (`opened` / `synchronize`) dispatches
+`trigger({ dryRun: true, ref: <head branch>, report })`, which runs `kg-snapshot-push`'s guards
+without committing or pushing.
+
+A PR on the base template repo (Settings → KG Refresh · "Base template repo", seeded once from
+`KG_BASE_REPO`) is **skipped**: the webhook answers `{ ignored: true, reason: "base_repo_pr" }`, enqueues
+nothing, and posts no status or comment. The dry run dispatches the source repo's workflow at the PR's
+head branch, and that branch exists only in the base repo, so the dispatch can never succeed. Base
+changes get their dry run one step later, on the source repo's upstream-merge PR (`kg-upstream/*`,
+`sync/upstream-*`). A repo configured as both source and base is treated as the source. A rejected
+dispatch ends the run `dispatch_rejected` with `dispatch was rejected: <reason>`, and that text
+reaches the sticky comment and the commit status description.
+
+A PR that changes nothing guard-relevant — docs, an unrelated code path — gets no dispatch at
 all.
 
 The verdict always lands as a sticky PR comment headed `## kg-refresh dry-run — <sha>`, updated in
@@ -480,9 +491,10 @@ installation accepts it — so this is two clicks by an org owner, not a per-rep
 
 This is not requestable through code, and there is no way to detect the gap from inside the PR
 itself. Until granted, the sticky comment is the only signal; nothing errors or blocks in the
-meantime. The preflight's `statuses:write` rows probe this grant against the same two repos the
-webhook actually posts to — the KG source repo, and whichever repo is configured as "Base template
-repo" (see the note on the two "base repo" notions below), not sources.yml's `base_repo:`. The
+meantime. The preflight's `statuses:write` rows probe this grant on the KG source repo, which the
+webhook posts to, and on whichever repo is configured as "Base template repo" (see the note on the
+two "base repo" notions below), not sources.yml's `base_repo:`. The webhook skips PRs on the base
+repo (see above), so the base row is advisory only and kept for settings that read it. The
 "Base template repo" field is seeded once from `KG_BASE_REPO` on first boot; a deployment that
 never set that variable has an empty field and must set it by hand under Settings → KG Refresh
 (the preflight then falls back to sources.yml's `base_repo:` for its probe until it is set).
@@ -491,8 +503,8 @@ never set that variable has an empty field and must set it by hand under Setting
 by itself it is advisory and a PR can be merged straight through it regardless of the guard's verdict.
 The ticket's "required check" only exists once a repo admin adds `kg-refresh/dry-run` as a required
 context in that repo's branch protection settings (Settings → Branches → Branch protection rule →
-"Require status checks to pass" → add `kg-refresh/dry-run`), on both the KG source repo and the base
-template repo. Nothing in this codebase calls GitHub's branch-protection API to do this automatically
+"Require status checks to pass" → add `kg-refresh/dry-run`), on the KG source repo. The base
+template repo gets no `kg-refresh/dry-run` status, since the webhook skips its PRs. Nothing in this codebase calls GitHub's branch-protection API to do this automatically
 — it stays a one-time, per-repo manual step alongside the App's **Commit statuses: Read and write** permission (`statuses: write` in API terms) described above. Until that step is
 done on a given repo, `kg-refresh/dry-run` is informational only there, no matter how the guard votes.
 

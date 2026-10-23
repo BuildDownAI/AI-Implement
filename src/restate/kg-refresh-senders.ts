@@ -74,12 +74,12 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
     const executionMode = "fly-machines";
     if (input.envelope.agentConfig !== undefined || input.envelope.credentials?.modelAuthGrant !== undefined) {
       console.error("[kg-refresh] refused: a KG refresh envelope carries model authentication");
-      return { outcome: "rejected", jobId: null, executionMode: executionMode };
+      return { outcome: "rejected", jobId: null, executionMode, reason: "envelope carries model authentication" };
     }
     if (!config.flySessionsToken || !config.flySessionsApp) {
       // A definitive rejection: retrying cannot configure the app, and the workflow ends the run dispatch_rejected.
       console.error("[kg-refresh] fly-machines execution path selected but FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured");
-      return { outcome: "rejected", jobId: null, executionMode };
+      return { outcome: "rejected", jobId: null, executionMode, reason: "FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP is not configured" };
     }
     const machineNonce = requireNonce(input);
     const repo = sourceRepo();
@@ -101,7 +101,7 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
         runnerImageExplicit: config.runnerImageExplicit,
       }) ?? config.sessionImage;
     } catch (err) {
-      if (err instanceof RunnerImageNotAllowedError) return { outcome: "rejected", jobId: null, executionMode };
+      if (err instanceof RunnerImageNotAllowedError) return { outcome: "rejected", jobId: null, executionMode, reason: "runner image not allowed" };
       throw err;
     }
     const machineConfig = buildSessionMachineConfig({
@@ -160,7 +160,7 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
     const executionMode = "local-docker";
     if (input.envelope.agentConfig !== undefined || input.envelope.credentials?.modelAuthGrant !== undefined) {
       console.error("[kg-refresh] refused: a KG refresh envelope carries model authentication");
-      return { outcome: "rejected", jobId: null, executionMode: executionMode };
+      return { outcome: "rejected", jobId: null, executionMode, reason: "envelope carries model authentication" };
     }
     if (!config.localRunnerImage) {
       throw new Error(
@@ -210,7 +210,7 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
     const executionMode = "github-actions";
     if (input.envelope.agentConfig !== undefined || input.envelope.credentials?.modelAuthGrant !== undefined) {
       console.error("[kg-refresh] refused: a KG refresh envelope carries model authentication");
-      return { outcome: "rejected", jobId: null, executionMode: executionMode };
+      return { outcome: "rejected", jobId: null, executionMode, reason: "envelope carries model authentication" };
     }
     const repo = sourceRepo();
     const encoded = encodeRunConfig(input.envelope);
@@ -223,7 +223,7 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
         defaultImage: config.sessionImage, runnerImageExplicit: config.runnerImageExplicit,
       });
     } catch (err) {
-      if (err instanceof RunnerImageNotAllowedError) return { outcome: "rejected", jobId: null, executionMode };
+      if (err instanceof RunnerImageNotAllowedError) return { outcome: "rejected", jobId: null, executionMode, reason: "runner image not allowed" };
       throw err;
     }
     const ref = input.envelope.kgSourceRef ?? defaultBranch ?? "main";
@@ -245,8 +245,11 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
       token, owner: repo.owner, repo: repo.repo, workflowFile: KG_REFRESH_WORKFLOW_FILE,
       ref, inputs, returnRunDetails: true,
     });
+    const outcome = result.outcome ?? (result.success ? "accepted" : "unknown");
     return {
-      outcome: result.outcome ?? (result.success ? "accepted" : "unknown"),
+      outcome,
+      // GitHub's 4xx response body, bounded; carries no credential.
+      ...(outcome === "rejected" && result.error ? { reason: result.error.slice(0, 200) } : {}),
       runId: result.runId,
       runUrl: result.runUrl,
       // The GitHub run id once known; the workflow keys its own job row by dispatch id.

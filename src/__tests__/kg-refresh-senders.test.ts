@@ -154,7 +154,7 @@ describe("fly-machines sender", () => {
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
     const result = await createKgRefreshSenders(deps)["fly-machines"](makeInput());
     err.mockRestore();
-    expect(result).toEqual({ outcome: "rejected", jobId: null, executionMode: "fly-machines" });
+    expect(result).toEqual({ outcome: "rejected", jobId: null, executionMode: "fly-machines", reason: "FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP is not configured" });
     expect(deps.getInstallationToken).not.toHaveBeenCalled();
     expect(deps.keptMachineFly).not.toHaveBeenCalled();
   });
@@ -295,7 +295,7 @@ describe("model-auth refusal", () => {
         const { deps, fly } = makeDeps({}, mode === "local-docker" ? { localRunnerImage: undefined as never } : {});
         const err = vi.spyOn(console, "error").mockImplementation(() => {});
         const result = await createKgRefreshSenders(deps)[mode](makeInput({ envelope: { ...envelope, ...extra }, machineNonce: null }));
-        expect(result).toEqual({ outcome: "rejected", jobId: null, executionMode: mode });
+        expect(result).toEqual({ outcome: "rejected", jobId: null, executionMode: mode, reason: "envelope carries model authentication" });
         expect(err).toHaveBeenCalledWith("[kg-refresh] refused: a KG refresh envelope carries model authentication");
         for (const spy of [deps.getScopedInstallationToken, deps.getInstallationToken, deps.mintToken, deps.fetchDefaultBranch,
           deps.resolveRunnerImage, deps.postWorkflowDispatch, deps.keptMachineFly, deps.startLocalRunnerContainer]) {

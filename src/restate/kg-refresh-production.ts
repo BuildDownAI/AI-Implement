@@ -342,7 +342,7 @@ export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispa
   });
   return async (dispatch) => {
     const send = (senders as Record<string, KgRefreshSender | undefined>)[dispatch.executionMode];
-    if (!send) return { outcome: "rejected", jobId: null, executionMode: dispatch.executionMode };
+    if (!send) return { outcome: "rejected", jobId: null, executionMode: dispatch.executionMode, reason: `unknown execution mode ${dispatch.executionMode}` };
     return send(dispatch);
   };
 }
