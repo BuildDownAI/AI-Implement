@@ -342,7 +342,7 @@ describe("non-GHA dispatch", () => {
   it("rejects an unknown execution mode without throwing and without calling a backend", async () => {
     const input = makeInput();
     const result = await createKgRefreshDispatch(input)({ ...dispatchInput, executionMode: "carrier-pigeon" });
-    expect(result).toEqual({ outcome: "rejected", jobId: null, executionMode: "carrier-pigeon" });
+    expect(result).toEqual({ outcome: "rejected", jobId: null, executionMode: "carrier-pigeon", reason: "unknown execution mode carrier-pigeon" });
     expect(postWorkflowDispatch).not.toHaveBeenCalled();
     expect(input.startLocalRunnerContainer).not.toHaveBeenCalled();
   });
@@ -604,6 +604,16 @@ describe("GHA dispatch wrapper", () => {
     const result = await createKgRefreshDispatch(makeInput())(dispatchInput);
     expect(result.outcome).toBe("rejected");
     expect(result.runId).toBeUndefined();
+  });
+
+  it("carries GitHub's 4xx text as the reason, bounded to 200 characters", async () => {
+    postWorkflowDispatch.mockResolvedValue({ success: false, status: 422, error: "No ref found for: x", outcome: "rejected" });
+    const result = await createKgRefreshDispatch(makeInput())(dispatchInput);
+    expect(result.reason).toContain("No ref found for: x");
+
+    postWorkflowDispatch.mockResolvedValue({ success: false, status: 422, error: "e".repeat(500), outcome: "rejected" });
+    const long = await createKgRefreshDispatch(makeInput())(dispatchInput);
+    expect(long.reason).toHaveLength(200);
   });
 
   it("surfaces a transport failure as unknown rather than throwing", async () => {

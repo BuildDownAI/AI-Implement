@@ -432,12 +432,23 @@ reloadable on its own; here it rides a release, so the release has to be sequenc
 ### PR check (AII-633)
 
 A PR that touches `kg_ingest/**`, `sources.yml`, `ontology/**`, or `snapshot/**` on the bound KG
-source repo (`kg.sourceRepo` in the `get_project_binding` answer) or the configured base template repo (Settings → KG Refresh · "Base
-template repo", seeded once from `KG_BASE_REPO`), or whose head branch matches `kg-upstream/*` or
-`sync/upstream-*` (an upstream merge, guard-relevant regardless of which files it happens to touch),
-gets the same dry run described above run against the PR's head instead of the default branch: the
-webhook (`opened` / `synchronize`) dispatches `trigger({ dryRun: true, ref: <head branch>, report })`,
-which runs `kg-snapshot-push`'s guards without committing or pushing. A PR that changes nothing guard-relevant — docs, an unrelated code path — gets no dispatch at
+source repo (`kg.sourceRepo` in the `get_project_binding` answer), or whose head branch matches
+`kg-upstream/*` or `sync/upstream-*` (an upstream merge, guard-relevant regardless of which files it
+happens to touch), gets the same dry run described above run against the PR's head instead of the
+default branch: the webhook (`opened` / `synchronize`) dispatches
+`trigger({ dryRun: true, ref: <head branch>, report })`, which runs `kg-snapshot-push`'s guards
+without committing or pushing.
+
+A PR on the base template repo (Settings → KG Refresh · "Base template repo", seeded once from
+`KG_BASE_REPO`) is **skipped**: the webhook answers `{ ignored: true, reason: "base_repo_pr" }`, enqueues
+nothing, and posts no status or comment. The dry run dispatches the source repo's workflow at the PR's
+head branch, and that branch exists only in the base repo, so the dispatch can never succeed. Base
+changes get their dry run one step later, on the source repo's upstream-merge PR (`kg-upstream/*`,
+`sync/upstream-*`). A repo configured as both source and base is treated as the source. A rejected
+dispatch ends the run `dispatch_rejected` with `dispatch was rejected: <reason>`, and that text
+reaches the sticky comment and the commit status description.
+
+A PR that changes nothing guard-relevant — docs, an unrelated code path — gets no dispatch at
 all.
 
 The verdict always lands as a sticky PR comment headed `## kg-refresh dry-run — <sha>`, updated in

@@ -437,7 +437,41 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     expect(res.statusCode).toBe(202);
   });
 
-  it("dispatches on the base template repo when the head branch matches an upstream-merge pattern, even with no guard-path change", async () => {
+  it("skips a base-repo-only PR touching a guarded path without enqueueing", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+    prFiles(6, ["kg_ingest/loader.py"]);
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "opened", number: 6, ref: "ai-implement/kgb-46", sha: "sha-6", repo: KG_BASE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(enqueueDryRun).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "base_repo_pr" });
+  });
+
+  it("still enqueues when the base repo is also the source repo", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun, kgBaseRepo: KG_SOURCE_REPO });
+    prFiles(8, ["kg_ingest/loader.py"]);
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "opened", number: 8, ref: "feature/y", sha: "sha-8", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(enqueueDryRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("dispatches on the source repo when the head branch matches an upstream-merge pattern, even with no guard-path change", async () => {
     const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
     const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
 
@@ -449,7 +483,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
         number: 5,
         ref: "kg-upstream/2026-09-13",
         sha: "sha-5",
-        repo: KG_BASE_REPO,
+        repo: KG_SOURCE_REPO,
       }),
     );
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
@@ -457,8 +491,8 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
 
     expect(enqueueDryRun).toHaveBeenCalledTimes(1);
     expect(enqueueDryRun).toHaveBeenCalledWith(
-      `${KG_BASE_REPO}#5`,
-      { ref: "kg-upstream/2026-09-13", report: { repo: KG_BASE_REPO, prNumber: 5, sha: "sha-5" } },
+      `${KG_SOURCE_REPO}#5`,
+      { ref: "kg-upstream/2026-09-13", report: { repo: KG_SOURCE_REPO, prNumber: 5, sha: "sha-5" } },
       { idempotencyKey: deliveryId },
     );
     expect(res.statusCode).toBe(202);

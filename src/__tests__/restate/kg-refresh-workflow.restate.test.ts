@@ -92,6 +92,7 @@ const GENERIC_FAILURE_REPORT: KgRefreshReportBody = {
 interface RunScenario {
   triggerId: string;
   dispatchOutcome: "accepted" | "rejected" | "unknown";
+  dispatchReason?: string;
   runId?: number;
   executionMode: string;
   dispatchCalls: number;
@@ -506,6 +507,7 @@ describe("KgRefresh durable workflow", () => {
     }
     const result: KgDispatchResult = {
       outcome: scenario.dispatchOutcome, runId: scenario.runId,
+      ...(scenario.dispatchReason !== undefined ? { reason: scenario.dispatchReason } : {}),
       jobId: scenario.jobIdUnknown ? null : `job-${triggerId}`, executionMode: scenario.executionMode,
       ...(scenario.runId !== undefined ? { runUrl: `https://example.test/runs/${scenario.runId}` } : {}),
       ...(scenario.flyCreate ? { machineId: scenario.flyCreate.machineId, created: scenario.flyCreate.reused !== true, ...(scenario.flyCreate.app !== undefined && { app: scenario.flyCreate.app }) } : {}),
@@ -2025,6 +2027,25 @@ describe("KgRefresh durable workflow", () => {
       expect(persisted?.conclusion).toBe("dispatch_rejected");
       expect(persisted?.held).toBeUndefined();
       expect(scenarios.get(triggerId)!.findByTitleCalls).toBe(1);
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "W9b: a rejected dry-run dispatch carries its reason into the outcome and the report (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "rejected", dispatchReason: "No ref found for: x", executionMode: "github-actions" });
+      const report = { repo: KG_SOURCE_REPO, prNumber: 9, sha: "c".repeat(40) };
+      const beforeSticky = postOrUpdateStickyCommentFn.mock.calls.length;
+
+      const outcome = await runWorkflow(env.baseUrl(), triggerId, { dryRun: true, report });
+
+      expect(outcome.ok).toBe(false);
+      expect(outcome.detail).toBe("dispatch was rejected: No ref found for: x");
+      expect(postOrUpdateStickyCommentFn.mock.calls.length - beforeSticky).toBe(1);
+      expect(JSON.stringify(postOrUpdateStickyCommentFn.mock.calls.at(-1))).toContain("dispatch was rejected: No ref found for: x");
     },
     15_000,
   );
