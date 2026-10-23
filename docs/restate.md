@@ -229,6 +229,12 @@ Each internal call never throws: a connection failure, a non-2xx response, or an
 
 After each run the object sends itself a delayed `refresh` carrying `scheduledFor: nextAt`; a scheduled run whose `scheduledFor` no longer matches state is a superseded timer and does nothing, so a `requested` refresh (`requestChatGptPlanRefresh`) does not multiply timers. `transient` retries in 2 minutes; `reauth_required`, `invalid_client`, and `missing` schedule nothing. A corrupt record maps to `reauth_required`, an unavailable key to `transient`. A crash between OpenAI's rotation and the store write loses the session; the profile then needs a new sign-in. The bound object uses a fail-closed store until a session key provider is provisioned.
 
+## The KgSidecarHealth object
+
+`KgSidecarHealth` (`src/restate/kg-sidecar-health.ts`) is a Virtual Object with one key, `sidecar`, no state, and one exclusive handler, `check`. It runs the existing KG sidecar probe (`probeWithTimeout`) in one `ctx.run("probe")` step and returns the `SidecarHealth` record, which is therefore in the journal. Exclusive means a second `check` queues behind the first, so this object never runs two probes at once.
+
+The production probe returns `null` and sends nothing when `isKgUnavailable()` is false, so a `check` queued after a recovery is a no-op. `checkKgSidecarHealth()` is the poll-loop caller, under the same `kgScheduleBound` guard as `checkPipelineSchedules`: one one-way `POST KgSidecarHealth/sidecar/check/send` per cycle while the sidecar is unavailable. It makes no call during a deploy hold or unless the sidecar is `ready` and registration is `registered`, and a failed call logs one line and never throws.
+
 ## Pipeline schedules
 
 `PipelineSchedule` (`src/restate/pipeline-schedule.ts`, AII-1431, [ADR 042](adr/042-a-pipeline-schedule-is-a-due-or-fired-state-checked-by-the-poll-loop.md)) is a Virtual Object, one per scheduled pipeline, that fires the pipeline once a day at a local time. Restate 1.7.10 has no native cron, and a delayed self-send brings back cancel-and-re-arm, so a schedule is a state: each day has one occurrence, and `lastFiredOccurrence` records whether it fired. The poll loop is the tick. KG refresh is the first consumer (AII-1432; `docs/issueless-runs.md` § Reserve and dispatch).

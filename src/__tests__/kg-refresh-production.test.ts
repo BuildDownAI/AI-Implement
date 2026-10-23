@@ -164,7 +164,7 @@ beforeEach(() => {
 describe("createProductionKgRefreshServices", () => {
   it("returns the KgRepo and KgRefresh services and the nine tool deps", () => {
     const { services, toolDeps } = createProductionKgRefreshServices(makeInput());
-    expect(services.map((s) => s.name)).toEqual(["KgRepo", "FlyMachineProfile", "GhaRunProfile", "KgRefresh", "PipelineSchedule"]);
+    expect(services.map((s) => s.name)).toEqual(["KgRepo", "FlyMachineProfile", "GhaRunProfile", "KgRefresh", "PipelineSchedule", "KgSidecarHealth"]);
     expect(Object.keys(toolDeps).sort()).toEqual([
       "callbackConfigured", "freeBytes", "isDeployHeld", "kgSourceRepo", "mappingExists",
       "persistPreflightFailure", "readServedStamp", "readStatusRecord", "runPreflight",
