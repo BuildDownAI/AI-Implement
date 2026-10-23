@@ -9,6 +9,7 @@ import * as restateClients from "@restatedev/restate-sdk-clients";
 import { getMappings } from "../config.js";
 import type { AppConfig } from "../index.js";
 import { createPipelineSchedule } from "./pipeline-schedule.js";
+import { createKgSidecarHealth, probeKgSidecarIfUnavailable } from "./kg-sidecar-health.js";
 import { createKgRefreshSchedulePipeline } from "./kg-refresh-schedule.js";
 import { getFlySessionsConfig } from "../orchestrator-settings.js";
 import {
@@ -481,7 +482,7 @@ export function createProductionKgRefreshServices(
   };
 
   return {
-    services: [createKgRepo({ workflowName: "KgRefresh" }), createFlyMachineProfile(buildFlyMachineProfileDeps()), createGhaRunProfile(), createKgRefreshWorkflow(deps), createPipelineSchedule({ pipelines: { "kg-refresh": createKgRefreshSchedulePipeline(input.kgSourceRepo) } })],
+    services: [createKgRepo({ workflowName: "KgRefresh" }), createFlyMachineProfile(buildFlyMachineProfileDeps()), createGhaRunProfile(), createKgRefreshWorkflow(deps), createPipelineSchedule({ pipelines: { "kg-refresh": createKgRefreshSchedulePipeline(input.kgSourceRepo) } }), createKgSidecarHealth({ probe: probeKgSidecarIfUnavailable })],
     toolDeps,
   };
 }

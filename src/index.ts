@@ -171,6 +171,7 @@ import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANN
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
 import { checkPipelineSchedules } from "./restate/pipeline-schedule.js";
+import { checkKgSidecarHealth } from "./restate/kg-sidecar-health.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { resolveReviewProcess } from "./review-process.js";
 import { createProductionTrackerExportServices, createTrackerExportIngressClient } from "./restate/tracker-export.js";
@@ -468,7 +469,10 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   await refreshRunnerBackendCache();
   // Outside the cycle deadline: the check has its own timeout and never throws. Only bound when the KG composition exists.
-  if (kgScheduleBound) await checkPipelineSchedules(["kg-refresh"]);
+  if (kgScheduleBound) {
+    await checkPipelineSchedules(["kg-refresh"]);
+    await checkKgSidecarHealth();
+  }
   await runWithDeadline(
     cycleId,
     started,

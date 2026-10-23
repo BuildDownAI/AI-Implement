@@ -331,7 +331,7 @@ A healthy orchestrator shows `restate.sidecar.state: "ready"`,
 - The **Knowledge Graph Pipelines page** KG card shows _⚠️ KG sidecar not serving — <lastError>_ when `kgUnavailable` is true, and a one-line "KG sidecar: reachable" once a probe has succeeded. The Deployments page keeps the deploy record.
 - The **`deployed` / `restarted` deploy notification** adds _⚠️ KG sidecar not serving — <lastError>_ next to the embeddings warning, and the deploy record reads `deployed-not-serving` instead of `deployed-ok` when the boot probe fails.
 
-A failed probe re-runs in the background (throttled) on the next proxied failure, so the fields recover on their own once the sidecar does. The boot probe has one overall deadline (30 s); a timeout is recorded as a failed probe.
+The sidecar is probed at boot and on a failed proxied call (throttled). While it is marked unavailable, the poll also sends `KgSidecarHealth.check` each cycle (60 s) until a probe succeeds, so the fields recover on their own once the sidecar does, even when no further call fails (AII-1527; [docs/restate.md](restate.md) § "The KgSidecarHealth object"). The boot probe has one overall deadline (30 s); a timeout is recorded as a failed probe.
 
 ## Restate sidecar
 
