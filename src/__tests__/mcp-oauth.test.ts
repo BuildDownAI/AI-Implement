@@ -529,6 +529,50 @@ describe("handleMcpOidcCallback", () => {
   });
 });
 
+describe("handleMcpOidcCallback org role claim (AII-1526)", () => {
+  const builddownProvider: OidcProviderConfig = { ...googleProvider, id: "builddown", label: "BuildDown", issuer: "https://bd.example" };
+
+  it("denies a claim-admitted first sign-in when the Restate ingress is unreachable, minting no code", async () => {
+    providers.configureOAuthProviders([builddownProvider]);
+    setAllowedDomains("unrelated.example");
+    const clientId = await registerClient();
+    await startAuthorize(clientId);
+    (oidc.completeAuth as ReturnType<typeof vi.fn>).mockResolvedValue(
+      identity({ provider: "builddown", sub: "bd|1", rawClaims: { builddown_org_role: "member" } }),
+    );
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("ECONNREFUSED")));
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const res = new MockResponse();
+      await mcpOauth.handleMcpOidcCallback(mkReq("/mcp/callback/builddown?state=oidcstate&code=c"), asRes(res), "builddown", BASE_URL);
+      const location = new URL(res.headers["Location"] as string);
+      expect(location.searchParams.get("error")).toBe("server_error");
+      expect(location.searchParams.get("code")).toBeNull();
+      expect(dedup.getDb().prepare("SELECT COUNT(*) AS c FROM mcp_auth_codes").get()).toEqual({ c: 0 });
+      expect(log.mock.calls.some((c) => String(c[0]).includes("[mcp-oauth]") && String(c[0]).includes("source: org-claim"))).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("rechecks a claim-admitted identity by its recorded role, and not after the claim is cleared", async () => {
+    providers.configureOAuthProviders([builddownProvider]);
+    setAllowedDomains("unrelated.example");
+    const db = dedup.getDb();
+    const who = { email: "ada@eudoxus.ai", sub: "bd|1", provider: "builddown" };
+    expect(access.recheckIdentity(who).status).toBe("denied");
+    access.recordOrgClaimRole(who, "user");
+    expect(access.recheckIdentity(who)).toMatchObject({ status: "ok", entry: { role: "user" } });
+    expect(access.recheckIdentity({ ...who, sub: "bd|2" }).status).toBe("denied");
+    expect(access.recheckIdentity({ ...who, provider: "google" }).status).toBe("denied");
+    access.clearOrgClaimRole(who);
+    expect(access.recheckIdentity(who).status).toBe("denied");
+    expect(db.prepare("SELECT COUNT(*) AS c FROM access_entries").get()).toEqual({ c: 0 });
+  });
+});
+
 // Top-level helper: full code-exchange flow returning client_id + both tokens
 async function fullFlow(): Promise<{ code: string; codeVerifier: string; clientId: string }> {
   const clientId = await registerClient();

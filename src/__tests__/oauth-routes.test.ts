@@ -280,6 +280,51 @@ describe("handleOAuthCallback binding (AII-1523)", () => {
   });
 });
 
+describe("handleOAuthCallback org role claim (AII-1526)", () => {
+  const builddownProvider: OidcProviderConfig = { ...googleProvider, id: "builddown", label: "BuildDown", issuer: "https://bd.example" };
+  const sessionCount = () => (dedup.getDb().prepare("SELECT COUNT(*) AS c FROM admin_sessions").get() as { c: number }).c;
+
+  async function callback(claim?: string): Promise<MockResponse> {
+    allowDomain("unrelated.example"); // a non-empty list that does not admit ada@eudoxus.ai
+    providers.configureOAuthProviders([builddownProvider]);
+    store.putTransaction({ state: "cl", provider: "builddown", codeVerifier: "v", nonce: "n", redirectTo: "/admin" });
+    vi.mocked(oidc.completeAuth).mockResolvedValue(
+      identity({ provider: "builddown", sub: "bd|1", rawClaims: claim ? { builddown_org_role: claim } : {} }),
+    );
+    const res = new MockResponse();
+    await routes.handleOAuthCallback(mkReq("/api/auth/builddown/callback?state=cl&code=c"), asRes(res), "builddown", baseUrl, false);
+    return res;
+  }
+
+  it("denies a claim-admitted first sign-in when the Restate ingress is unreachable", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("ECONNREFUSED")));
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const res = await callback("member");
+      expect(res.headers["Location"]).toBe("/admin?auth_error=denied");
+      expect(sessionCount()).toBe(0);
+      expect(log.mock.calls.some((c) => String(c[0]).includes("source: org-claim"))).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("refuses an identity whose token no longer carries the claim, even with a binding row left behind", async () => {
+    dedup.getDb().prepare("INSERT INTO access_entry_bindings (value, provider, subject, bound_at) VALUES (?, ?, ?, ?)")
+      .run("ada@eudoxus.ai", "builddown", "bd|1", Date.now());
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const res = await callback();
+      expect(res.headers["Location"]).toBe("/admin?auth_error=denied");
+      expect(sessionCount()).toBe(0);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+});
+
 describe("handleOAuthLogout", () => {
   it("revokes the session and clears the cookie", () => {
     const token = session.createSession({ email: "ada@eudoxus.ai", sub: "s", provider: "google", name: "Ada" });

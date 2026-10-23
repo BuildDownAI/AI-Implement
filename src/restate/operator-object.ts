@@ -24,7 +24,7 @@ import crypto from "node:crypto";
 import * as restate from "@restatedev/restate-sdk";
 import type { ObjectContext, ObjectSharedContext } from "@restatedev/restate-sdk";
 import { getDb } from "../dedup.js";
-import { getEffectiveAllowlist, matchAccessEntry } from "../access-entries.js";
+import { getEffectiveAllowlist, matchAccessEntryOrOrgClaim } from "../access-entries.js";
 import { recordAuthEvent, resolveClientPath, type AuthEventCause } from "../mcp-auth-events.js";
 import type { DescribeOutcome, IssueInput, IssueOutcome, RefreshAuthority, RefreshInput, RefreshOutcome } from "../mcp-identity.js";
 import { RESTATE_INGRESS_BIND_ADDRESS } from "./server.js";
@@ -413,7 +413,7 @@ export class RestateRefreshAuthority implements RefreshAuthority {
       emit("unavailable", knownIdentity);
       return { status: "unavailable", cause: "allowlist" };
     }
-    if (!matchAccessEntry({ email: who.email, sub: who.sub ?? "", provider: who.provider ?? "" }, allowlist.entries)) {
+    if (!matchAccessEntryOrOrgClaim({ email: who.email, sub: who.sub ?? "", provider: who.provider ?? "" }, allowlist.entries)) {
       await this.invoke(clientId, "revoke", {});
       console.warn(`[mcp-oauth] refresh denied: ${who.email ?? "unknown identity"} no longer on allowlist`);
       emit("allowlist", knownIdentity);

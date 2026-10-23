@@ -9,6 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { closeDb, getDb } from "../../dedup.js";
 import { initAccessAuditTable } from "../../access-audit.js";
 import { clearAccessBindings, getEffectiveAllowlist, initAccessEntriesTable, isBoundTo, saveAccessEntries, refreshEffectiveAllowlist } from "../../access-entries.js";
+import { authorize } from "../../oauth/authorize.js";
 import { initMcpOAuthTables } from "../../mcp-oauth.js";
 import { RestateRefreshAuthority } from "../../restate/operator-object.js";
 import { operatorObject } from "../../restate/operator-object.js";
@@ -55,6 +56,23 @@ describe("AccessBinding object", () => {
       ]);
       expect(results.map((r) => r.status).sort()).toEqual(["bound", "conflict"]);
       expect(rows(key, "google")).toHaveLength(1);
+    });
+
+    it("a claim-admitted first sign-in binds builddown without an access_entries row, and a second sub conflicts", async () => {
+      const key = `${randomUUID()}@eudoxus.ai`;
+      const bd = (sub: string) => ({
+        provider: "builddown", sub, email: key, emailVerified: true, name: null, hd: null, tid: null,
+        rawClaims: { builddown_org_role: "member" },
+      });
+      const first = authorize(bd("u-1"), []);
+      expect(first).toMatchObject({ ok: true, source: "org-claim", entry: { role: "user" } });
+      if (!first.ok) return;
+      const bind = (sub: string) =>
+        callObject<{ status: AccessBindStatus }>(env().baseUrl(), "AccessBinding", first.entry.value, "bind", { provider: "builddown", subject: sub });
+      expect((await bind("u-1")).status).toBe("bound");
+      expect(rows(key, "builddown")).toEqual([{ subject: "u-1" }]);
+      expect(getDb().prepare("SELECT COUNT(*) AS c FROM access_entries WHERE value = ?").get(key)).toEqual({ c: 0 });
+      expect((await bind("u-2")).status).toBe("conflict");
     });
 
     it("binds each provider once, and the same subject again is already-bound", async () => {

@@ -102,6 +102,16 @@ export function initAccessEntriesTable(): void {
       PRIMARY KEY (value, provider)
     )
   `);
+  // Roles granted by the BuildDown organization claim, so the per-request re-check can honour them.
+  getDb().exec(`
+    CREATE TABLE IF NOT EXISTS org_claim_roles (
+      email    TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      subject  TEXT NOT NULL,
+      role     TEXT NOT NULL,
+      PRIMARY KEY (email, provider)
+    )
+  `);
   // The legacy columns stay for rollback but are read only here, once per entry.
   getDb().exec(`
     INSERT OR IGNORE INTO access_entry_bindings (value, provider, subject, bound_at)
@@ -110,12 +120,39 @@ export function initAccessEntriesTable(): void {
   `);
 }
 
-/** Re-check a persisted identity against the list in force. */
+/** Re-check a persisted identity against the list in force, and the organization role its last sign-in recorded. */
 export function recheckIdentity(identity: MatchableIdentity): RecheckResult {
   const allowlist = getEffectiveAllowlist();
   if (!allowlist) return { status: "unavailable" };
-  const entry = matchAccessEntry(identity, allowlist.entries);
+  const entry = matchAccessEntryOrOrgClaim(identity, allowlist.entries);
   return entry ? { status: "ok", entry } : { status: "denied" };
+}
+
+/** Record the role the organization claim granted at sign-in; the next sign-in rewrites or clears it. */
+export function recordOrgClaimRole(identity: MatchableIdentity, role: AccessRole): void {
+  getDb()
+    .prepare("INSERT OR REPLACE INTO org_claim_roles (email, provider, subject, role) VALUES (?, ?, ?, ?)")
+    .run((identity.email ?? "").trim().toLowerCase(), identity.provider, identity.sub, role);
+}
+
+/** Forget the claim-granted role: a sign-in without the claim ends the access it gave. */
+export function clearOrgClaimRole(identity: MatchableIdentity): void {
+  getDb()
+    .prepare("DELETE FROM org_claim_roles WHERE email = ? AND provider = ?")
+    .run((identity.email ?? "").trim().toLowerCase(), identity.provider);
+}
+
+/** A stored match, or the synthetic entry for a recorded claim role (same subject only); the higher role wins. */
+export function matchAccessEntryOrOrgClaim(identity: MatchableIdentity, entries: AccessEntry[]): AccessEntry | null {
+  const stored = matchAccessEntry(identity, entries);
+  if (identity.provider !== "builddown" || stored?.role === "admin") return stored;
+  const email = (identity.email ?? "").trim().toLowerCase();
+  const row = getDb()
+    .prepare("SELECT role FROM org_claim_roles WHERE email = ? AND provider = ? AND subject = ?")
+    .get(email, identity.provider, identity.sub) as { role: string } | undefined;
+  if (!row || (row.role !== "admin" && row.role !== "user")) return stored;
+  if (stored && row.role === "user") return stored;
+  return { kind: "address", value: email, role: row.role, bindings: [], addedAt: 0, addedBy: null };
 }
 
 /** True when the entry already holds this identity's binding, so a sign-in needs no write (and no Restate). */

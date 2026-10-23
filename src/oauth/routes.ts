@@ -10,7 +10,7 @@ import { authorize } from "./authorize.js";
 import { putTransaction, takeTransaction } from "./state-store.js";
 import { createSession, revokeSession, getRequestToken, SESSION_TTL_MS } from "../admin-session.js";
 import { serializeSessionCookie, clearSessionCookie } from "../cookies.js";
-import { allowlistHasNoAdmin, getEffectiveAllowlist, isBoundTo } from "../access-entries.js";
+import { allowlistHasNoAdmin, clearOrgClaimRole, getEffectiveAllowlist, isBoundTo, recordOrgClaimRole } from "../access-entries.js";
 import { bindAccessIdentity } from "../restate/access-binding.js";
 
 function json(res: http.ServerResponse, status: number, data: unknown): void {
@@ -104,12 +104,14 @@ export async function handleOAuthCallback(
 
   const decision = authorize(identity, allowlist.entries);
   if (!decision.ok) {
+    if (identity.provider === "builddown") clearOrgClaimRole(identity);
     console.warn(`[oauth] denied ${identity.email ?? "?"} via ${providerId}: ${decision.reason}`);
     return redirect(res, "/admin?auth_error=denied");
   }
 
   // First sign-in through a provider binds the entry for it; that subject is what matches from then on.
   // Fail closed: an identity is never admitted without a recorded binding.
+  console.log(`[oauth] admitting ${identity.email} via ${providerId} as ${decision.entry.role} (source: ${decision.source})`);
   if (decision.entry.kind === "address" && !isBoundTo(decision.entry, identity)) {
     const bound = await bindAccessIdentity(decision.entry.value, identity.provider, identity.sub);
     if (bound === "conflict") {
@@ -120,6 +122,11 @@ export async function handleOAuthCallback(
       console.warn(`[oauth] denied ${identity.email ?? "?"} via ${providerId}: binding unavailable`);
       return redirect(res, "/admin?auth_error=denied");
     }
+  }
+
+  if (identity.provider === "builddown") {
+    if (decision.source === "org-claim") recordOrgClaimRole(identity, decision.entry.role);
+    else clearOrgClaimRole(identity);
   }
 
   const token = createSession({
