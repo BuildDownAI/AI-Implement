@@ -22,8 +22,8 @@ import { getDb } from "./dedup.js";
 import { getProvider, listConfiguredProviders } from "./oauth/providers.js";
 import { buildAuthUrl, completeAuth } from "./oauth/oidc.js";
 import { authorize } from "./oauth/authorize.js";
-import { getEffectiveAllowlist, isBoundTo, matchAccessEntry } from "./access-entries.js";
-import { bindAccessIdentity } from "./restate/access-binding.js";
+import { getEffectiveAllowlist, hasOrgClaimRole, isBoundTo, matchAccessEntryOrOrgClaim, ORG_CLAIM_ROLE_TTL_MS } from "./access-entries.js";
+import { bindAccessIdentity, clearClaimRoleViaObject, recordClaimRoleViaObject } from "./restate/access-binding.js";
 import type { DescribeOutcome, IssueInput, IssueOutcome, RefreshAuthority, RefreshInput, RefreshOutcome } from "./mcp-identity.js";
 import { recordAuthEvent, resolveClientPath, isLoopbackHost, type AuthEventCause, type ClientPath } from "./mcp-auth-events.js";
 import { RestateRefreshAuthority } from "./restate/operator-object.js";
@@ -457,11 +457,16 @@ export async function handleMcpOidcCallback(
 
   const decision = authorize(identity, allowlist.entries);
   if (!decision.ok) {
+    // Best-effort: the denial stands either way, and an unreachable ingress leaves a row that expires.
+    if (identity.provider === "builddown" && identity.email && hasOrgClaimRole(identity)) {
+      await clearClaimRoleViaObject(identity.email, identity.provider);
+    }
     console.warn(`[mcp-oauth] denied ${identity.email ?? "?"} via ${providerId}: ${decision.reason}`);
     return redirectWithError(res, stateRow.redirect_uri, stateRow.client_state, "access_denied");
   }
 
   // Fail closed: an identity is never admitted without a recorded binding.
+  console.log(`[mcp-oauth] admitting ${identity.email} via ${providerId} as ${decision.entry.role} (source: ${decision.source})`);
   if (decision.entry.kind === "address" && !isBoundTo(decision.entry, identity)) {
     const bound = await bindAccessIdentity(decision.entry.value, identity.provider, identity.sub);
     if (bound === "conflict") {
@@ -470,6 +475,23 @@ export async function handleMcpOidcCallback(
     }
     if (bound === "unavailable") {
       console.warn(`[mcp-oauth] denied ${identity.email ?? "?"} via ${providerId}: binding unavailable`);
+      return redirectWithError(res, stateRow.redirect_uri, stateRow.client_state, "server_error");
+    }
+  }
+
+  // The claim-role row is written through the AccessBinding object; fail closed when it cannot be.
+  if (identity.provider === "builddown") {
+    const recorded =
+      decision.source === "org-claim"
+        ? await recordClaimRoleViaObject(identity.email!, {
+            provider: identity.provider,
+            subject: identity.sub,
+            role: decision.entry.role,
+            expiresAt: Date.now() + ORG_CLAIM_ROLE_TTL_MS,
+          })
+        : !hasOrgClaimRole(identity) || (await clearClaimRoleViaObject(identity.email!, identity.provider));
+    if (!recorded) {
+      console.warn(`[mcp-oauth] denied ${identity.email ?? "?"} via ${providerId}: claim role unavailable`);
       return redirectWithError(res, stateRow.redirect_uri, stateRow.client_state, "server_error");
     }
   }
@@ -690,7 +712,7 @@ export class SqliteRefreshAuthority implements RefreshAuthority {
       emit("unavailable");
       return { status: "unavailable", cause: "allowlist" };
     }
-    if (!matchAccessEntry(row, allowlist.entries)) {
+    if (!matchAccessEntryOrOrgClaim(row, allowlist.entries)) {
       await this.revokeFamily(row.family_id);
       console.warn(`[mcp-oauth] refresh denied: ${row.email} no longer on allowlist`);
       emit("allowlist");

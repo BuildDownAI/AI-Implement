@@ -12,7 +12,7 @@ import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 // exercise paths before either is reached. Individual tests override the return value.
 vi.mock("../access-entries.js", () => ({
   getEffectiveAllowlist: vi.fn(),
-  matchAccessEntry: vi.fn(),
+  matchAccessEntryOrOrgClaim: vi.fn(),
 }));
 vi.mock("../mcp-auth-events.js", () => ({
   recordAuthEvent: vi.fn(),
@@ -48,7 +48,7 @@ const ADMITTING_ENTRY: AccessEntriesModule.AccessEntry = {
 // configures the mocked modules the authority actually imports.
 let RestateRefreshAuthority: typeof OperatorObjectModule.RestateRefreshAuthority;
 let getEffectiveAllowlist: typeof AccessEntriesModule.getEffectiveAllowlist;
-let matchAccessEntry: typeof AccessEntriesModule.matchAccessEntry;
+let matchAccessEntryOrOrgClaim: typeof AccessEntriesModule.matchAccessEntryOrOrgClaim;
 let recordAuthEvent: typeof AuthEventsModule.recordAuthEvent;
 let getDb: typeof DedupModule.getDb;
 let deployHold: typeof DeployHoldModule;
@@ -64,7 +64,7 @@ beforeEach(async () => {
     },
   });
   ({ RestateRefreshAuthority } = modules.operator);
-  ({ getEffectiveAllowlist, matchAccessEntry } = modules.accessEntries);
+  ({ getEffectiveAllowlist, matchAccessEntryOrOrgClaim } = modules.accessEntries);
   ({ recordAuthEvent } = modules.authEvents);
   ({ getDb } = modules.dedup);
   deployHold = modules.deployHold;
@@ -72,7 +72,7 @@ beforeEach(async () => {
   // Default: the allowlist admits whoever is presented. Tests of the allowlist re-check
   // itself override this with mockReturnValueOnce.
   vi.mocked(getEffectiveAllowlist).mockReturnValue({ entries: [], source: "env" });
-  vi.mocked(matchAccessEntry).mockReturnValue(ADMITTING_ENTRY);
+  vi.mocked(matchAccessEntryOrOrgClaim).mockReturnValue(ADMITTING_ENTRY);
   vi.mocked(recordAuthEvent).mockClear();
 });
 
@@ -544,7 +544,7 @@ describe("RestateRefreshAuthority.rotate — allowlist re-check (AII-687 parity)
 
   it("revokes the family and returns denied, without calling refresh, when the allowlist no longer admits the identity", async () => {
     vi.mocked(getEffectiveAllowlist).mockReturnValue({ entries: [], source: "env" });
-    vi.mocked(matchAccessEntry).mockReturnValue(null);
+    vi.mocked(matchAccessEntryOrOrgClaim).mockReturnValue(null);
     // No refresh route: a denied identity must not be rotated.
     const sidecar = ingress({ identity: identityOk, revoke: {} });
     const authority = authorityWithFetch(sidecar.fetch);

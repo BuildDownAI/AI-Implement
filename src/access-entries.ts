@@ -102,6 +102,21 @@ export function initAccessEntriesTable(): void {
       PRIMARY KEY (value, provider)
     )
   `);
+  // Roles granted by the BuildDown organization claim, so the per-request re-check can honour them.
+  getDb().exec(`
+    CREATE TABLE IF NOT EXISTS org_claim_roles (
+      email    TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      subject  TEXT NOT NULL,
+      role     TEXT NOT NULL,
+      PRIMARY KEY (email, provider)
+    )
+  `);
+  // Added after the table first shipped; rows from before it expire at once, so they cost one re-sign-in.
+  const claimCols = getDb().prepare("PRAGMA table_info(org_claim_roles)").all() as { name: string }[];
+  if (!claimCols.some((c) => c.name === "expires_at")) {
+    getDb().exec("ALTER TABLE org_claim_roles ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0");
+  }
   // The legacy columns stay for rollback but are read only here, once per entry.
   getDb().exec(`
     INSERT OR IGNORE INTO access_entry_bindings (value, provider, subject, bound_at)
@@ -110,12 +125,57 @@ export function initAccessEntriesTable(): void {
   `);
 }
 
-/** Re-check a persisted identity against the list in force. */
+/** Re-check a persisted identity against the list in force, and the organization role its last sign-in recorded. */
 export function recheckIdentity(identity: MatchableIdentity): RecheckResult {
   const allowlist = getEffectiveAllowlist();
   if (!allowlist) return { status: "unavailable" };
-  const entry = matchAccessEntry(identity, allowlist.entries);
+  const entry = matchAccessEntryOrOrgClaim(identity, allowlist.entries);
   return entry ? { status: "ok", entry } : { status: "denied" };
+}
+
+/**
+ * How long a claim-granted role outlives the sign-in that read it. Refresh families live for weeks, so
+ * without a bound a person removed from the organization would keep access until they chose to sign in
+ * again; after this window refresh fails and the client must sign in through BuildDown, re-reading the role.
+ */
+export const ORG_CLAIM_ROLE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Record the role the organization claim granted at sign-in; the next sign-in rewrites or clears it. Called only by `AccessBinding`. */
+export function recordOrgClaimRole(identity: MatchableIdentity, role: AccessRole, expiresAt: number): void {
+  getDb()
+    .prepare("INSERT OR REPLACE INTO org_claim_roles (email, provider, subject, role, expires_at) VALUES (?, ?, ?, ?, ?)")
+    .run((identity.email ?? "").trim().toLowerCase(), identity.provider, identity.sub, role, expiresAt);
+}
+
+/** Forget the claim-granted role: a sign-in without the claim ends the access it gave. Called only by `AccessBinding`. */
+export function clearOrgClaimRole(identity: { email: string | null; provider: string }): number {
+  return getDb()
+    .prepare("DELETE FROM org_claim_roles WHERE email = ? AND provider = ?")
+    .run((identity.email ?? "").trim().toLowerCase(), identity.provider).changes;
+}
+
+/** True when a claim-role row exists for the identity (expired or not), so a sign-in knows whether a clear is needed. */
+export function hasOrgClaimRole(identity: { email: string | null; provider: string }): boolean {
+  return !!getDb()
+    .prepare("SELECT 1 FROM org_claim_roles WHERE email = ? AND provider = ?")
+    .get((identity.email ?? "").trim().toLowerCase(), identity.provider);
+}
+
+/** A stored match, or the synthetic entry for an unexpired recorded claim role (same subject only); the higher role wins. */
+export function matchAccessEntryOrOrgClaim(
+  identity: MatchableIdentity,
+  entries: AccessEntry[],
+  now: number = Date.now(),
+): AccessEntry | null {
+  const stored = matchAccessEntry(identity, entries);
+  if (identity.provider !== "builddown" || stored?.role === "admin") return stored;
+  const email = (identity.email ?? "").trim().toLowerCase();
+  const row = getDb()
+    .prepare("SELECT role FROM org_claim_roles WHERE email = ? AND provider = ? AND subject = ? AND expires_at > ?")
+    .get(email, identity.provider, identity.sub, now) as { role: string } | undefined;
+  if (!row || (row.role !== "admin" && row.role !== "user")) return stored;
+  if (stored && row.role === "user") return stored;
+  return { kind: "address", value: email, role: row.role, bindings: [], addedAt: 0, addedBy: null };
 }
 
 /** True when the entry already holds this identity's binding, so a sign-in needs no write (and no Restate). */

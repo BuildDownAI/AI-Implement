@@ -75,6 +75,8 @@ Matching runs in precedence order, and stops at the first hit:
 | 2 | Address, unbound for the identity's provider | The entry's value equals the verified email; the callback then binds |
 | 3 | Domain | The email's domain equals the entry's value |
 
+A `builddown` identity may also be admitted by its organization role claim, which sits outside this table: see [Organization role from BuildDown](#organization-role-from-builddown).
+
 An address entry outranks a domain entry: it is the more specific grant, and the only one that can carry `admin`. A malformed identifier with no `@` has a domain equal to itself, and is excluded from rule 3 so it cannot match a domain entry.
 
 ## Roles
@@ -90,6 +92,27 @@ An access-code session has no entry to take a role from and is treated as `admin
 A deployment configured with `OAUTH_ALLOWED_DOMAINS` alone admits everyone as `user`, so signing in succeeds and the whole admin UI answers 403. That is a **misconfiguration, not a lockout** — the recovery command is not involved, and the fix is to set `OAUTH_ALLOWED_EMAILS` and restart.
 
 It is surfaced three ways, because the symptom otherwise looks like a broken UI rather than a setting: a `[main]` warning at boot, a banner on the sign-in page, and this document. A stored list cannot reach that state at all — the last-admin guard refuses a save that would leave it without one.
+
+## Organization role from BuildDown
+
+A person who signs in through the `builddown` provider is admitted on the `builddown_org_role` claim the control plane puts in the ID token when they belong to the organization that owns this orchestrator. `authorize()` (`src/oauth/authorize.ts`) turns it into a synthetic address entry for the verified email.
+
+| Claim | Admitted as |
+|-------|-------------|
+| `owner` | `admin` |
+| `admin` | `admin` |
+| `member` | `user` |
+
+- **`builddown` only.** The same claim from any other provider is ignored. `provider` is set by the callback route, never by the token.
+- **Exact values only.** Any other value (wrong case, empty, a non-string, absent) is ignored, and the identity then needs a stored entry as before. The email must be verified.
+- **A stored entry wins unless the claim is higher.** A stored `admin` entry plus a `member` claim admits as `admin`; a stored `user` entry or domain entry plus an `admin` claim admits as `admin`. Equal roles use the stored entry. This is the one route to `admin` without an address entry.
+- **Never persisted as an entry.** Sign-in still binds through `AccessBinding` before admission and writes only the address's `builddown` row in `access_entry_bindings`, not an `access_entries` row. The fail-closed rules are the stored path's: `conflict` (a different `sub` for the same address) and `unavailable` (Restate unreachable) deny. Because the synthetic entry carries no bindings, every claim sign-in makes one `AccessBinding` call, so repeat sign-ins are also denied while Restate is down.
+- **Removal takes effect at the next sign-in.** A token without the claim and without a stored entry is refused, even though the binding row remains. A role change likewise lands at the next sign-in.
+- **Observability.** The `[oauth]` and `[mcp-oauth]` admit lines name the source, `stored` or `org-claim`.
+
+- **Later requests.** Without this, a claim-admitted session would be revoked on its first request, because every re-check matches against stored entries only and the synthetic entry is not one. Sign-in records the claim-granted role in `org_claim_roles` (keyed by address and provider, holding the `sub` and an `expires_at`) after the binding succeeds. `recheckIdentity` (admin sessions, `/mcp`), MCP refresh rotation and the Restate refresh authority consult it for `builddown` identities with the same `sub`, so a claim-admitted session is not refused on its next request. A sign-in through `builddown` without the claim, or a refusal, clears the row. It is a role cache, not an allowlist entry: it is never listed or edited at `/admin#access`.
+- **The role expires after 24 hours** (`ORG_CLAIM_ROLE_TTL_MS`, counted from the sign-in that wrote it). MCP refresh families live for weeks, so without a bound a person removed from the organization would keep access until they happened to sign in again. `matchAccessEntryOrOrgClaim` ignores an expired row: refresh then fails for a claim-only identity, the client signs in through BuildDown again, and that sign-in re-reads the current organization role. A stored entry is unaffected. An admin session or `/mcp` request from a claim-only identity is refused on its first request after expiry, for the same reason.
+- **One writer.** `org_claim_roles` is written only by the exclusive `recordClaimRole` and `clearClaimRole` handlers on the `AccessBinding` object (keyed by address), each in one named `ctx.run`, so a record and a clear for one address never interleave. The sign-in routes call them through the Restate ingress and fail closed: an unreachable ingress denies the sign-in and no row is written. A sign-in that is refused clears the row best-effort (the denial stands either way, and an uncleared row expires). Refresh reads the table directly.
 
 ## Page grants
 

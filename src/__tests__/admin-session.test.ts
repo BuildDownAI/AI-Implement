@@ -172,6 +172,22 @@ describe("authenticateAdminRequest", () => {
     }
   });
 
+  it("keeps a claim-admitted builddown session valid, with the claim's role, and ends it once the claim is cleared", () => {
+    allow("unrelated.example");
+    const bd = { email: "cam@eudoxus.ai", sub: "bd|1", provider: "builddown" };
+    const token = session.createSession({ ...bd, name: "Cam" });
+    expect(session.authenticateAdminRequest(withToken(token))).toMatchObject({ ok: false, status: 401 });
+
+    const again = session.createSession({ ...bd, name: "Cam" });
+    access.recordOrgClaimRole(bd, "user", Date.now() + 1e6);
+    expect(session.authenticateAdminRequest(withToken(again))).toMatchObject({ ok: true, role: "user" });
+    access.recordOrgClaimRole(bd, "admin", Date.now() + 1e6);
+    expect(session.authenticateAdminRequest(withToken(again))).toMatchObject({ ok: true, role: "admin" });
+
+    access.clearOrgClaimRole(bd);
+    expect(session.authenticateAdminRequest(withToken(again))).toMatchObject({ ok: false, status: 401 });
+  });
+
   it("revokes the session when the identity is no longer admitted, so a removal takes effect at once", () => {
     allow("eudoxus.ai");
     const token = session.createSession(ada);

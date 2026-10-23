@@ -9,10 +9,13 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { closeDb, getDb } from "../../dedup.js";
 import { initAccessAuditTable } from "../../access-audit.js";
 import { clearAccessBindings, getEffectiveAllowlist, initAccessEntriesTable, isBoundTo, saveAccessEntries, refreshEffectiveAllowlist } from "../../access-entries.js";
+import { authorize } from "../../oauth/authorize.js";
 import { initMcpOAuthTables } from "../../mcp-oauth.js";
 import { RestateRefreshAuthority } from "../../restate/operator-object.js";
 import { operatorObject } from "../../restate/operator-object.js";
 import { vi } from "vitest";
+import { recordClaimRoleViaObject, clearClaimRoleViaObject } from "../../restate/access-binding.js";
+import { ORG_CLAIM_ROLE_TTL_MS } from "../../access-entries.js";
 import { bindAccessIdentity, bindStep, clearAccessBindingsViaObject, type AccessBindStatus } from "../../restate/access-binding.js";
 import { accessBinding } from "../../restate/access-binding.js";
 import { VARIANTS, callObject, crashAfterFirstCall, startRetryEnabled, startVariants, stopAll } from "./harness.js";
@@ -56,6 +59,60 @@ describe("AccessBinding object", () => {
       expect(results.map((r) => r.status).sort()).toEqual(["bound", "conflict"]);
       expect(rows(key, "google")).toHaveLength(1);
     });
+
+    it("a claim-admitted first sign-in binds builddown without an access_entries row, and a second sub conflicts", async () => {
+      const key = `${randomUUID()}@eudoxus.ai`;
+      const bd = (sub: string) => ({
+        provider: "builddown", sub, email: key, emailVerified: true, name: null, hd: null, tid: null,
+        rawClaims: { builddown_org_role: "member" },
+      });
+      const first = authorize(bd("u-1"), []);
+      expect(first).toMatchObject({ ok: true, source: "org-claim", entry: { role: "user" } });
+      if (!first.ok) return;
+      const bind = (sub: string) =>
+        callObject<{ status: AccessBindStatus }>(env().baseUrl(), "AccessBinding", first.entry.value, "bind", { provider: "builddown", subject: sub });
+      expect((await bind("u-1")).status).toBe("bound");
+      expect(rows(key, "builddown")).toEqual([{ subject: "u-1" }]);
+      expect(getDb().prepare("SELECT COUNT(*) AS c FROM access_entries WHERE value = ?").get(key)).toEqual({ c: 0 });
+      expect((await bind("u-2")).status).toBe("conflict");
+    });
+
+    const claimRows = (email: string) =>
+      getDb().prepare("SELECT role, subject, expires_at FROM org_claim_roles WHERE email = ? AND provider = 'builddown'").all(email) as {
+        role: string; subject: string; expires_at: number;
+      }[];
+
+    it("recordClaimRole writes one row, and recording again replaces it rather than adding one", async () => {
+      const key = `${randomUUID()}@eudoxus.ai`;
+      const exp = Date.now() + ORG_CLAIM_ROLE_TTL_MS;
+      const call = (role: string) =>
+        callObject(env().baseUrl(), "AccessBinding", key, "recordClaimRole", { provider: "builddown", subject: "u-1", role, expiresAt: exp });
+      await call("user");
+      await call("user");
+      expect(claimRows(key)).toEqual([{ role: "user", subject: "u-1", expires_at: exp }]);
+      await call("admin");
+      expect(claimRows(key)).toEqual([{ role: "admin", subject: "u-1", expires_at: exp }]);
+    });
+
+    it("a clearClaimRole racing a recordClaimRole leaves one of the two valid states", async () => {
+      const key = `${randomUUID()}@eudoxus.ai`;
+      const base = env().baseUrl();
+      const exp = Date.now() + ORG_CLAIM_ROLE_TTL_MS;
+      const seen = new Set<number>();
+      for (let i = 0; i < 20; i++) {
+        getDb().prepare("DELETE FROM org_claim_roles WHERE email = ?").run(key);
+        await Promise.all([
+          callObject(base, "AccessBinding", key, "recordClaimRole", { provider: "builddown", subject: "u-1", role: "user", expiresAt: exp }),
+          callObject(base, "AccessBinding", key, "clearClaimRole", { provider: "builddown" }),
+        ]);
+        const left = claimRows(key);
+        // cleared-then-recorded: one row; recorded-then-cleared: none. Never a partial row.
+        expect([0, 1]).toContain(left.length);
+        if (left.length === 1) expect(left[0]).toEqual({ role: "user", subject: "u-1", expires_at: exp });
+        seen.add(left.length);
+      }
+      expect(seen.size).toBeGreaterThan(0);
+    }, 60_000);
 
     it("binds each provider once, and the same subject again is already-bound", async () => {
       const key = `${randomUUID()}@eudoxus.ai`;
@@ -161,6 +218,54 @@ describe("AccessBinding object", () => {
     const bad = await issue("someone-else");
     expect(await authority.rotate(bad)).toEqual({ status: "denied", description: "Identity no longer authorized" });
   }, 30_000);
+
+  it("a claim-only identity's refresh succeeds before the role expires and is denied after, until it signs in again", async () => {
+    const env = environments.get("disableRetries");
+    if (!env) throw new Error('environment "disableRetries" did not start');
+    const email = `${randomUUID()}@eudoxus.ai`;
+    saveAccessEntries([{ kind: "address", value: "unrelated@example.com", role: "admin" }], null);
+    refreshEffectiveAllowlist();
+    initMcpOAuthTables();
+
+    let clock = Date.now();
+    const authority = new RestateRefreshAuthority({
+      ingressBaseUrl: env.baseUrl(),
+      accessTokenTtlMs: 3600_000,
+      refreshKeySecret: "test-secret",
+      now: () => clock,
+    });
+    const deps = { baseUrl: env.baseUrl() };
+    const record = () =>
+      recordClaimRoleViaObject(email, { provider: "builddown", subject: "u-1", role: "user", expiresAt: clock + ORG_CLAIM_ROLE_TTL_MS }, deps);
+    expect(await record()).toBe(true);
+
+    const clientId = randomUUID();
+    const issued = await authority.issue({ clientId, email, sub: "u-1", provider: "builddown" });
+    if (issued.status !== "ok") throw new Error("issue failed");
+
+    const first = await authority.rotate({ clientId, refreshToken: issued.refreshToken });
+    expect(first.status).toBe("ok");
+    if (first.status !== "ok") return;
+
+    clock += ORG_CLAIM_ROLE_TTL_MS + 1;
+    expect(await authority.rotate({ clientId, refreshToken: first.refreshToken })).toEqual({
+      status: "denied",
+      description: "Identity no longer authorized",
+    });
+
+    // A fresh BuildDown sign-in re-reads the role and writes a new expiry; a new family refreshes again.
+    expect(await record()).toBe(true);
+    const newClient = randomUUID();
+    const again = await authority.issue({ clientId: newClient, email, sub: "u-1", provider: "builddown" });
+    if (again.status !== "ok") throw new Error("issue failed");
+    expect((await authority.rotate({ clientId: newClient, refreshToken: again.refreshToken })).status).toBe("ok");
+    expect(await clearClaimRoleViaObject(email, "builddown", deps)).toBe(true);
+    expect(claimRows(email)).toEqual([]);
+  }, 30_000);
+
+  function claimRows(email: string) {
+    return getDb().prepare("SELECT role FROM org_claim_roles WHERE email = ?").all(email);
+  }
 });
 
 describe("AccessBinding replay", () => {

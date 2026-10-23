@@ -14,7 +14,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import * as restate from "@restatedev/restate-sdk";
 import { scrubOperatorLegacyTokens } from "../../restate/operator-legacy-scrub.js";
 import { operatorObject, RestateRefreshAuthority } from "../../restate/operator-object.js";
-import { getEffectiveAllowlist, matchAccessEntry } from "../../access-entries.js";
+import { getEffectiveAllowlist, matchAccessEntryOrOrgClaim } from "../../access-entries.js";
 import { VARIANTS, callObject, eventually, journalEntries, journalText, queryInvocations, startRetryEnabled, startVariants, stopAll } from "./harness.js";
 
 // Mocked so RestateRefreshAuthority.rotate's allowlist re-check and auth-event emission
@@ -23,7 +23,7 @@ import { VARIANTS, callObject, eventually, journalEntries, journalText, queryInv
 // deauthorized-identity scenario below configures the allowlist mock.
 vi.mock("../../access-entries.js", () => ({
   getEffectiveAllowlist: vi.fn(),
-  matchAccessEntry: vi.fn(),
+  matchAccessEntryOrOrgClaim: vi.fn(),
 }));
 vi.mock("../../mcp-auth-events.js", () => ({
   recordAuthEvent: vi.fn(),
@@ -367,7 +367,7 @@ describe("Operator object", () => {
       await callObject(env.baseUrl(), "Operator", key, "issue", issueBody({ hash, email: "denied@eudoxus.ai" }));
 
       vi.mocked(getEffectiveAllowlist).mockReturnValue({ entries: [], source: "env" });
-      vi.mocked(matchAccessEntry).mockReturnValue(null);
+      vi.mocked(matchAccessEntryOrOrgClaim).mockReturnValue(null);
 
       const revokeCalls: string[] = [];
       const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
