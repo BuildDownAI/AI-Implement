@@ -1,15 +1,23 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
-import { selectIssuesToDispatch, selectBlockers, mappingForProvider, mergeProviderSnapshots, selectForeignTrackerBlockers, parseDeclaredFiles, selectFileOverlapDeferrals, rememberCandidates, diffSkipReasons, logSkipReasons, resetSkipReasons, resolveInFlightSiblings, resetSeenCandidates, getCachedPlanningContext, setCachedPlanningContext, resetPlanningContextCache, needsPlanningContextFetch, getPlanningContextCacheSize, PLANNING_CONTEXT_CACHE_MAX } from "../poll-selection.js";
+import { selectIssuesToDispatch, selectBlockers, mappingForProvider, fetchProviderSnapshots, mergeProviderSnapshots, selectForeignTrackerBlockers, parseDeclaredFiles, selectFileOverlapDeferrals, rememberCandidates, diffSkipReasons, logSkipReasons, resetSkipReasons, resolveInFlightSiblings, resetSeenCandidates, getCachedPlanningContext, setCachedPlanningContext, resetPlanningContextCache, needsPlanningContextFetch, getPlanningContextCacheSize, PLANNING_CONTEXT_CACHE_MAX } from "../poll-selection.js";
 import type { RepoMapping } from "../config.js";
-import type { AIImplementSnapshot, TicketIssue } from "../providers/types.js";
+import type { AIImplementSnapshot, TicketIssue, TicketingProvider } from "../providers/types.js";
 import type * as GateModule from "../dispatch-gate.js";
 import type * as AdmissionModule from "../dispatch-admission.js";
-import { makeIssue, makeMapping } from "./helpers/builders.js";
+import { makeIssue, makeMapping, makeProvider } from "./helpers/builders.js";
 import { testDb } from "./helpers/test-db.js";
 
 function issueOf(id: string, identifier: string, teamKey: string, overrides?: Partial<TicketIssue>): TicketIssue {
   return makeIssue({ id, identifier, title: identifier, scopeKey: teamKey, ...overrides });
 }
+
+const snap = (over: Partial<AIImplementSnapshot> = {}): AIImplementSnapshot => ({
+  needsPlanning: [],
+  readyForImplementation: [],
+  inProgressCountsByScope: {},
+  parentsToFinalize: [],
+  ...over,
+});
 
 function featureIssueOf(
   id: string,
@@ -746,13 +754,6 @@ describe("tracker-scoped mapping match", () => {
     ticketingConfig: { kind: "jira", jql: "project = ENG", repoFieldValue: "test-org/test-repo" },
   });
   const mappings = { ENG: jiraEng, APP: makeMapping() };
-  const snap = (over: Partial<AIImplementSnapshot> = {}): AIImplementSnapshot => ({
-    needsPlanning: [],
-    readyForImplementation: [],
-    inProgressCountsByScope: {},
-    parentsToFinalize: [],
-    ...over,
-  });
 
   it("mappingForProvider returns the mapping only for its own tracker", () => {
     expect(mappingForProvider("jira", "ENG", mappings)).toBe(jiraEng);
@@ -846,6 +847,54 @@ describe("tracker-scoped mapping match", () => {
   });
 });
 
+describe("fetchProviderSnapshots — one provider's failure stays its own (AII-1549)", () => {
+  const mappings = {
+    APP: makeMapping(),
+    ENG: makeMapping({
+      ticketingProvider: "jira",
+      ticketingConfig: { kind: "jira", jql: "project = ENG", repoFieldValue: "test-org/test-repo" },
+    }),
+  };
+  const answering = (id: string, snapshot: AIImplementSnapshot) =>
+    makeProvider({ id, fetchAIImplementSnapshot: vi.fn<TicketingProvider["fetchAIImplementSnapshot"]>(async () => snapshot) });
+  const failing = (id: string, error: Error) =>
+    makeProvider({ id, fetchAIImplementSnapshot: vi.fn<TicketingProvider["fetchAIImplementSnapshot"]>(async () => { throw error; }) });
+
+  it("keeps the answering provider's issues when another provider's snapshot rejects", async () => {
+    const ready = issueOf("1", "APP-1", "APP");
+    const linear = answering("linear", snap({ readyForImplementation: [ready] }));
+    const fieldMissing = new Error('Custom field "AI-Implement Status" not found in Jira instance');
+    const jira = failing("jira", fieldMissing);
+
+    const result = await fetchProviderSnapshots([jira, linear], mappings);
+
+    expect(result.snapshot.readyForImplementation).toEqual([ready]);
+    expect(result.entries.map((e) => e.provider)).toEqual([linear]);
+    expect(result.failed).toEqual([{ providerId: "jira", error: fieldMissing }]);
+  });
+
+  it("reports every provider when all of them fail, leaving nothing to select", async () => {
+    const mintFailed = new Error("Linear token mint failed (401)");
+    const fieldMissing = new Error('Custom field "AI-Implement Status" not found in Jira instance');
+
+    const result = await fetchProviderSnapshots([failing("linear", mintFailed), failing("jira", fieldMissing)], mappings);
+
+    expect(result.snapshot).toEqual(snap());
+    expect(result.entries).toEqual([]);
+    expect(result.failed).toEqual([
+      { providerId: "linear", error: mintFailed },
+      { providerId: "jira", error: fieldMissing },
+    ]);
+  });
+
+  it("reports no failures when every provider answers", async () => {
+    const result = await fetchProviderSnapshots([answering("linear", snap()), answering("jira", snap())], mappings);
+
+    expect(result.failed).toEqual([]);
+    expect(result.entries).toHaveLength(2);
+  });
+});
+
 describe("selectBlockers parked", () => {
   it("lists a parked issue with its failure count, not also as dedup or concurrency", () => {
     const blockers = selectBlockers(
@@ -891,6 +940,14 @@ describe("diffSkipReasons", () => {
     expect(diffSkipReasons(last, [])).toEqual([]);
     expect(last.size).toBe(0);
     expect(diffSkipReasons(last, [{ ...parked, reason: "in_flight" }])).toEqual(["[poll] Skipping AII-737: in_flight"]);
+  });
+
+  it("keeps an absent issue's reason when pruning is off, so its return logs nothing (AII-1549)", () => {
+    const last = new Map();
+    diffSkipReasons(last, [{ ...parked, reason: "in_flight" }]);
+    expect(diffSkipReasons(last, [], { pruneAbsent: false })).toEqual([]);
+    expect(last.size).toBe(1);
+    expect(diffSkipReasons(last, [{ ...parked, reason: "in_flight" }])).toEqual([]);
   });
 
   it("keeps module-level state until reset", () => {

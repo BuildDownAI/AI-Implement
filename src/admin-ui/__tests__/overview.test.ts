@@ -1,83 +1,56 @@
-import { JSDOM } from "jsdom";
 import { describe, expect, it } from "vitest";
 import { overviewHtml, overviewScript } from "../pages/overview.js";
 import { blockersHtml, blockersScript } from "../pages/blockers.js";
+import { mountAdminPage } from "../../__tests__/helpers/fixtures/admin-ui.js";
 
 type CapacityByMapping = Record<string, { used: number; cap: number; source: "reservations" }>;
 
-function escapeText(value: unknown): string {
-  return String(value == null ? "" : value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function mountOverview(fixtures: {
   log?: unknown[];
   mappings?: Record<string, unknown>;
   capacityOk?: boolean;
   capacityReject?: boolean;
   capacityByMapping?: CapacityByMapping | null;
-}): { win: any; doc: Document } {
+}) {
   const { log = [], mappings = {}, capacityOk = true, capacityReject = false, capacityByMapping = {} } = fixtures;
-  const dom = new JSDOM(`<!DOCTYPE html><body>${overviewHtml}</body>`, {
-    runScripts: "dangerously",
-    url: "http://localhost/admin#overview",
+  return mountAdminPage({
+    html: overviewHtml,
+    script: overviewScript,
+    route: "overview",
+    api: async (url) => {
+      if (url === "/api/log") return { ok: true, status: 200, json: async () => log };
+      if (url === "/api/mappings") return { ok: true, status: 200, json: async () => mappings };
+      if (url === "/api/reaper/summary") return { ok: true, status: 200, json: async () => ({ lastSweepAt: null }) };
+      if (url === "/api/blockers") {
+        if (capacityReject) throw new Error("network unavailable");
+        if (!capacityOk) return { ok: false, status: 503, json: async () => ({ error: "unavailable" }) };
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ blockers: [], totals: { teams: 0, issues: 0, byReason: {} }, capacityByMapping }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    },
   });
-  const win = dom.window as any;
-  win.esc = escapeText;
-  win.escAttr = escapeText;
-  win.safeUrl = (value: unknown) => String(value == null ? "#" : value);
-  win.registerPage = () => {};
-  win.navigate = () => {};
-  win.openJobDrawer = () => {};
-  win.api = async (url: string) => {
-    if (url === "/api/log") return { ok: true, status: 200, json: async () => log };
-    if (url === "/api/mappings") return { ok: true, status: 200, json: async () => mappings };
-    if (url === "/api/reaper/summary") return { ok: true, status: 200, json: async () => ({ lastSweepAt: null }) };
-    if (url === "/api/blockers") {
-      if (capacityReject) throw new Error("network unavailable");
-      if (!capacityOk) return { ok: false, status: 503, json: async () => ({ error: "unavailable" }) };
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({ blockers: [], totals: { teams: 0, issues: 0, byReason: {} }, capacityByMapping }),
-      };
-    }
-    return { ok: true, status: 200, json: async () => ({}) };
-  };
-  const script = dom.window.document.createElement("script");
-  script.textContent = overviewScript;
-  dom.window.document.head.appendChild(script);
-  return { win, doc: dom.window.document as Document };
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function mountBlockers(fixtures: {
   totals?: { teams: number; issues: number; byReason: Record<string, number> };
   capacityByMapping?: CapacityByMapping | null;
-}): { win: any; doc: Document } {
+}) {
   const { totals = { teams: 0, issues: 0, byReason: {} }, capacityByMapping = {} } = fixtures;
-  const dom = new JSDOM(`<!DOCTYPE html><body>${blockersHtml}</body>`, {
-    runScripts: "dangerously",
-    url: "http://localhost/admin#blockers",
+  return mountAdminPage({
+    html: blockersHtml,
+    script: blockersScript,
+    route: "blockers",
+    api: async (url) => {
+      if (url === "/api/blockers") {
+        return { ok: true, status: 200, json: async () => ({ blockers: [], totals, capacityByMapping }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    },
   });
-  const win = dom.window as any;
-  win.esc = escapeText;
-  win.escAttr = escapeText;
-  win.safeUrl = (value: unknown) => String(value == null ? "#" : value);
-  win.registerPage = () => {};
-  win.api = async (url: string) => {
-    if (url === "/api/blockers") {
-      return { ok: true, status: 200, json: async () => ({ blockers: [], totals, capacityByMapping }) };
-    }
-    return { ok: true, status: 200, json: async () => ({}) };
-  };
-  const script = dom.window.document.createElement("script");
-  script.textContent = blockersScript;
-  dom.window.document.head.appendChild(script);
-  return { win, doc: dom.window.document as Document };
 }
 
 describe("overview page", () => {

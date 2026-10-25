@@ -1,64 +1,41 @@
-import { JSDOM } from "jsdom";
 import { describe, expect, it } from "vitest";
 import { projectsHtml, projectsScript } from "../pages/projects.js";
 import type { RepoMapping } from "../../config.js";
 import { makeMapping } from "../../__tests__/helpers/builders.js";
+import { mountAdminPage } from "../../__tests__/helpers/fixtures/admin-ui.js";
 
 type Mapping = Record<string, unknown>;
 
-function escapeText(value: unknown): string {
-  return String(value == null ? "" : value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-function escapeAttr(value: unknown): string {
-  return escapeText(value)
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#x27;");
-}
-
-function mountProjects(mapping: RepoMapping = makeMapping()): {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  win: any;
-  doc: Document;
-  posts: unknown[];
-} {
-  const dom = new JSDOM(`<!DOCTYPE html><body>${projectsHtml}</body>`, {
-    runScripts: "dangerously",
-    url: "http://localhost/admin#projects",
-  });
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const win = dom.window as any;
+function mountProjects(mapping: RepoMapping = makeMapping()) {
   const posts: unknown[] = [];
-  win.esc = escapeText;
-  win.escAttr = escapeAttr;
-  win.safeUrl = (value: unknown) => String(value == null ? "#" : value);
-  win.registerPage = () => {};
-  win.api = async (url: string, init?: { method?: string; body?: string }) => {
-    if (url === "/api/mappings" && init?.method === "POST") {
-      posts.push(JSON.parse(init.body || "{}"));
-      return { ok: true, status: 200, json: async () => ({ syncJobId: null }) };
-    }
-    if (url === "/api/mappings") {
-      return { ok: true, status: 200, json: async () => ({ AII: mapping }) };
-    }
-    if (url === "/api/admin/config-status") {
-      return { ok: true, status: 200, json: async () => ({ linear: true, jira: false }) };
-    }
-    return { ok: true, status: 200, json: async () => ({}) };
-  };
-  win.HTMLDialogElement.prototype.showModal = function showModal() {
-    this.open = true;
-  };
-  win.HTMLDialogElement.prototype.close = function close() {
-    this.open = false;
-  };
-  const script = dom.window.document.createElement("script");
-  script.textContent = projectsScript;
-  dom.window.document.head.appendChild(script);
-  return { win, doc: dom.window.document as Document, posts };
+  const mounted = mountAdminPage({
+    html: projectsHtml,
+    script: projectsScript,
+    route: "projects",
+    api: async (url, init) => {
+      if (url === "/api/mappings" && init?.method === "POST") {
+        posts.push(JSON.parse(init.body || "{}"));
+        return { ok: true, status: 200, json: async () => ({ syncJobId: null }) };
+      }
+      if (url === "/api/mappings") {
+        return { ok: true, status: 200, json: async () => ({ AII: mapping }) };
+      }
+      if (url === "/api/admin/config-status") {
+        return { ok: true, status: 200, json: async () => ({ linear: true, jira: false }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    },
+    // jsdom has no dialog methods, and the page opens its edit dialog with them.
+    before: (win) => {
+      win.HTMLDialogElement.prototype.showModal = function showModal(this: { open: boolean }) {
+        this.open = true;
+      };
+      win.HTMLDialogElement.prototype.close = function close(this: { open: boolean }) {
+        this.open = false;
+      };
+    },
+  });
+  return { ...mounted, posts };
 }
 
 async function save(win: { saveMappingDialog: () => Promise<void> }): Promise<void> {

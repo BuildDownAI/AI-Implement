@@ -11,6 +11,7 @@ export const issuesHtml = `
   </header>
   <div class="page-body">
     <div id="issues-error" class="alert fail" hidden></div>
+    <div id="issues-partial" class="alert warn" hidden></div>
 
     <div class="card">
       <div class="card-header">
@@ -106,6 +107,15 @@ export const issuesScript = `
     if (el) el.textContent = issues.length + ' matched \xb7 ' + inProgress + ' currently implementing';
   }
 
+  // A tracker whose snapshot failed: its issues, and the counts for its teams, are missing from this load.
+  function renderPartial(failedTrackers) {
+    const el = document.getElementById('issues-partial');
+    if (!failedTrackers || failedTrackers.length === 0) { el.hidden = true; return; }
+    const named = failedTrackers.map(function (t) { return window.esc(t.provider) + ': ' + window.esc(t.error); }).join('; ');
+    el.innerHTML = '<div style="flex:1"><div class="alert-title">Some trackers did not answer</div><div class="alert-desc">' + named + '. Their issues, and the in-progress counts for their teams, are missing below until they answer.</div></div>';
+    el.hidden = false;
+  }
+
   async function loadIssues() {
     const errorEl = document.getElementById('issues-error');
     errorEl.hidden = true;
@@ -118,6 +128,7 @@ export const issuesScript = `
       } catch (_) { /* ignore parse errors */ }
       errorEl.innerHTML = '<div style="flex:1"><div class="alert-title">Failed to load issues</div><div class="alert-desc">' + window.esc(errorMsg) + '</div></div>';
       errorEl.hidden = false;
+      document.getElementById('issues-partial').hidden = true;
       document.getElementById('issues-body').innerHTML = '';
       document.getElementById('issues-progress-body').innerHTML = '';
       document.getElementById('issues-empty').classList.add('hidden');
@@ -130,6 +141,7 @@ export const issuesScript = `
     renderInbox(data.issues);
     renderProgress(data.inProgressCountsByTeam);
     renderSubtitle(data.issues, data.inProgressCountsByTeam);
+    renderPartial(data.failedTrackers);
   }
 
   window.loadIssues = loadIssues;

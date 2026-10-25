@@ -92,7 +92,7 @@ import { destroyMachineRecorded } from "./backend-run.js";
 import { listMachines, listAppSecrets, setAppSecrets, unsetAppSecret, fetchMachineLogs } from "./fly-machines.js";
 import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
-import { resolveInFlightSiblings, selectBlockers, mergeProviderSnapshots, selectForeignTrackerBlockers, type ForeignTrackerIssue, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
+import { resolveInFlightSiblings, selectBlockers, fetchProviderSnapshots, selectForeignTrackerBlockers, type ForeignTrackerIssue, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { count as countReservedCapacity } from "./dispatch-admission.js";
 import { read as readDispatchAdmission, listHeldReservations } from "./dispatch-admission.js";
 import { RESTATE_WRITE_TOOL_NAMES, IDEMPOTENCY_KEY_SHAPE, scopeIdempotencyKey } from "./mcp.js";
@@ -1527,20 +1527,14 @@ async function handleUnparkIssue(req: http.IncomingMessage, res: http.ServerResp
 
 async function fetchMergedSnapshot(
   registry: ProviderRegistry,
-): Promise<{ snapshot: AIImplementSnapshot; foreign: ForeignTrackerIssue[] }> {
-  const allMappings = Object.values(getMappings());
-  const providers = await registry.forAllMappings(allMappings);
-  if (providers.length === 0) {
-    return {
-      snapshot: { needsPlanning: [], readyForImplementation: [], inProgressCountsByScope: {}, parentsToFinalize: [] },
-      foreign: [],
-    };
-  }
-  const snapshots = await Promise.all(providers.map((p) => p.fetchAIImplementSnapshot()));
-  return mergeProviderSnapshots(
-    providers.map((p, i) => ({ providerId: p.id, snapshot: snapshots[i] })),
-    getMappings(),
-  );
+): Promise<{ snapshot: AIImplementSnapshot; foreign: ForeignTrackerIssue[]; failedTrackers: Array<{ provider: string; error: string }> }> {
+  const providers = await registry.forAllMappings(Object.values(getMappings()));
+  const { snapshot, foreign, failed } = await fetchProviderSnapshots(providers, getMappings());
+  const failedTrackers = failed.map(({ providerId, error }) => ({
+    provider: providerId,
+    error: error instanceof Error ? error.message : String(error),
+  }));
+  return { snapshot, foreign, failedTrackers };
 }
 
 async function resolveIssueUrl(
@@ -1654,7 +1648,7 @@ async function handleListBlockers(
   registry: ProviderRegistry,
 ): Promise<void> {
   try {
-    const { snapshot, foreign } = await fetchMergedSnapshot(registry);
+    const { snapshot, foreign, failedTrackers } = await fetchMergedSnapshot(registry);
     const allIssues = [...snapshot.readyForImplementation, ...snapshot.needsPlanning];
     const teamRepoMap = getMappings();
     const dispatchedSet = new Set(getDispatchedIds());
@@ -1713,6 +1707,7 @@ async function handleListBlockers(
       blockers,
       totals: { teams: teams.size, issues: blockers.length, byReason },
       capacityByMapping,
+      failedTrackers,
     });
   } catch (err) {
     json(res, 502, { error: err instanceof Error ? err.message : String(err) });
@@ -1724,7 +1719,7 @@ async function handleListIssues(
   registry: ProviderRegistry,
 ): Promise<void> {
   try {
-    const { snapshot } = await fetchMergedSnapshot(registry);
+    const { snapshot, failedTrackers } = await fetchMergedSnapshot(registry);
     const allIssues: { issue: TicketIssue; bucket: "ready" | "needs-planning" }[] = [
       ...snapshot.readyForImplementation.map((i) => ({ issue: i, bucket: "ready" as const })),
       ...snapshot.needsPlanning.map((i) => ({ issue: i, bucket: "needs-planning" as const })),
@@ -1739,6 +1734,7 @@ async function handleListIssues(
     json(res, 200, {
       issues,
       inProgressCountsByTeam: snapshot.inProgressCountsByScope,
+      failedTrackers,
     });
   } catch (err) {
     json(res, 502, { error: err instanceof Error ? err.message : String(err) });

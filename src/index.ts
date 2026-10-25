@@ -33,7 +33,7 @@ import { dispatchLocalGapfill } from "./local-gapfill.js";
 import { getLatestDispatchForPr, getLatestPrUrlForIssue, getLatestTeamKeyForIssue } from "./log.js";
 import type { TicketingProvider, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
-import { logSkipReasons, rememberCandidates, mappingForProvider, mergeProviderSnapshots, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
+import { logSkipReasons, rememberCandidates, mappingForProvider, fetchProviderSnapshots, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText, notifyKgRefreshOutcome } from "./notify.js";
 import type { KgRefreshOutcomeNotification } from "./notify.js";
 import { isKgDegraded, postAvailableNotice, postBootNotice, postShutdownNotice, recordDeployOutcome, recordShutdown } from "./deploy-notify.js";
@@ -570,30 +570,28 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   }
 
   try {
-    const snapshots = providers.length === 0
-      ? []
-      : await Promise.all(providers.map((p) => p.fetchAIImplementSnapshot()));
-
-    const entries = providers.map((p, i) => ({ providerId: p.id, snapshot: snapshots[i] }));
+    const { entries, snapshot: mergedSnapshot, foreign, failed } = await fetchProviderSnapshots(providers, getMappings());
+    for (const { providerId, error } of failed) {
+      console.error(`[poll] ${providerId} snapshot failed, its issues sit out this cycle:`, error);
+    }
 
     // Finalize empty grouping parents (all children terminal, blank spec) — markMerged so the
     // existing roll-up path opens the top-of-tree PR without dispatching a junk implement pass.
-    for (let i = 0; i < providers.length; i++) {
-      for (const entry of snapshots[i].parentsToFinalize) {
+    for (const { provider, snapshot } of entries) {
+      for (const entry of snapshot.parentsToFinalize) {
         // An entry whose key belongs to another tracker's mapping must not touch that repo.
-        if (getMappings()[entry.scopeKey] && !mappingForProvider(providers[i].id, entry.scopeKey, getMappings())) continue;
-        console.log(`[${providers[i].id}] Finalizing empty grouping parent ${entry.identifier} (no own work)`);
+        if (getMappings()[entry.scopeKey] && !mappingForProvider(provider.id, entry.scopeKey, getMappings())) continue;
+        console.log(`[${provider.id}] Finalizing empty grouping parent ${entry.identifier} (no own work)`);
         // AII-349 reopen re-arm: clear any stale handled markers so merge-up re-runs and opens
         // a new roll-up PR when the parent was previously finalized and then reopened.
         const m = getMappings()[entry.scopeKey];
         if (m) clearRollUpHandledMarkersByIdentifier(m.owner, m.repo, entry.identifier);
-        await providers[i].markMerged(entry.issueId, entry.scopeKey).catch((err) => {
-          console.error(`[${providers[i].id}] Failed to finalize empty grouping parent ${entry.identifier}:`, err);
+        await provider.markMerged(entry.issueId, entry.scopeKey).catch((err) => {
+          console.error(`[${provider.id}] Failed to finalize empty grouping parent ${entry.identifier}:`, err);
         });
       }
     }
 
-    const { snapshot: mergedSnapshot, foreign } = mergeProviderSnapshots(entries, getMappings());
     for (const f of foreign) {
       console.log(`[poll] ${f.issue.identifier} (${f.providerId}) matches ${f.mappingProvider} mapping ${f.issue.scopeKey}; skipped`);
     }
@@ -717,8 +715,8 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
           phase: kind === "planning" ? "planning" : "implementation",
           reason,
           failures: parkedRows.find((p) => p.issueId === issue.id && p.phase === kind)?.failures,
-        })),
-      )) console.log(line);
+        })), { pruneAbsent: failed.length === 0 })
+      ) console.log(line);
     }
 
     // AII-278 Finding 3: in-flight issues carry AI-Working and drop OUT of the
