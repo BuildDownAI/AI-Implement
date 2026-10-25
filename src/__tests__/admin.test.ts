@@ -9,7 +9,8 @@ import { createModelSessionStore } from "../model-session-store.js";
 import type * as AdminModule from "../admin.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { ProviderRegistry } from "../providers/registry.js";
-import { makeIssue, makeRegistry, makeScopedInstallationToken } from "./helpers/builders.js";
+import type { AIImplementSnapshot } from "../providers/types.js";
+import { makeIssue, makeMapping, makeProvider, makeRegistry, makeScopedInstallationToken } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 import { testDb, type LoadedModules, type TestDb } from "./helpers/test-db.js";
 import { testDir } from "./helpers/test-dir.js";
@@ -3588,9 +3589,41 @@ describe("admin dedup", () => {
   });
 });
 
+// A Linear team answering with `snapshot` beside a Jira team whose snapshot rejects (AII-1549).
+function oneTrackerFailing(snapshot: AIImplementSnapshot): ProviderRegistry {
+  config.upsertMapping("CORE", makeMapping({ owner: "org", repo: "core" }));
+  config.upsertMapping("ENG", makeMapping({
+    owner: "org",
+    repo: "eng",
+    ticketingProvider: "jira",
+    ticketingConfig: { kind: "jira", jql: "project = ENG", repoFieldValue: "org/eng" },
+  }));
+  const linear = makeProvider({ id: "linear", fetchAIImplementSnapshot: vi.fn(async () => snapshot) });
+  const jira = makeProvider({ id: "jira", fetchAIImplementSnapshot: vi.fn(async () => { throw new Error("Jira search failed (500)"); }) });
+  return makeRegistry({ providers: { linear, jira }, mappings: config.getMappings() });
+}
+
 describe("admin issues endpoint", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it("answers 200 with the answering tracker's issues and names the tracker whose snapshot failed (AII-1549)", async () => {
+    const token = await login("secret");
+    const ready = makeIssue({ identifier: "CORE-100", scopeKey: "CORE" });
+    const registry = oneTrackerFailing({
+      readyForImplementation: [ready],
+      needsPlanning: [],
+      inProgressCountsByScope: { CORE: 1 },
+      parentsToFinalize: [],
+    });
+
+    const res = await requestWithRegistry("/api/issues", "GET", token, registry);
+
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.issues.map((i: { identifier: string }) => i.identifier)).toEqual(["CORE-100"]);
+    expect(body.failedTrackers).toEqual([{ provider: "jira", error: "Jira search failed (500)" }]);
   });
 
   it("returns 401 without auth token", async () => {
@@ -3598,14 +3631,16 @@ describe("admin issues endpoint", () => {
     expect(res.statusCode).toBe(401);
   });
 
-  it("returns 502 on provider failure", async () => {
+  it("answers 200 with no issues and names the tracker when the only provider fails (AII-1549)", async () => {
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockRejectedValueOnce(
       new Error("Linear API error: 401"),
     );
     const token = await login("secret");
     const res = await request("/api/issues", "GET", "secret", undefined, token);
-    expect(res.statusCode).toBe(502);
-    expect(JSON.parse(res.body).error).toContain("Linear API error");
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.issues).toEqual([]);
+    expect(body.failedTrackers).toEqual([{ provider: "linear", error: "Linear API error: 401" }]);
   });
 
   it("returns 200 with shaped issues on success", async () => {
@@ -3721,19 +3756,40 @@ describe("admin blockers endpoint", () => {
     vi.restoreAllMocks();
   });
 
+  it("answers 200 with the answering tracker's blockers and names the tracker whose snapshot failed (AII-1549)", async () => {
+    const token = await login("secret");
+    // A team with no mapping is the simplest blocker to produce.
+    const unmapped = makeIssue({ identifier: "ZZZ-1", scopeKey: "ZZZ" });
+    const registry = oneTrackerFailing({
+      readyForImplementation: [unmapped],
+      needsPlanning: [],
+      inProgressCountsByScope: {},
+      parentsToFinalize: [],
+    });
+
+    const res = await requestWithRegistry("/api/blockers", "GET", token, registry);
+
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.blockers.map((b: { issueIdentifier: string; reason: string }) => [b.issueIdentifier, b.reason])).toEqual([["ZZZ-1", "no-mapping"]]);
+    expect(body.failedTrackers).toEqual([{ provider: "jira", error: "Jira search failed (500)" }]);
+  });
+
   it("returns 401 without auth token", async () => {
     const res = await request("/api/blockers", "GET", "secret");
     expect(res.statusCode).toBe(401);
   });
 
-  it("returns 502 on provider failure", async () => {
+  it("answers 200 with no blockers and names the tracker when the only provider fails (AII-1549)", async () => {
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockRejectedValueOnce(
       new Error("boom"),
     );
     const token = await login("secret");
     const res = await request("/api/blockers", "GET", "secret", undefined, token);
-    expect(res.statusCode).toBe(502);
-    expect(JSON.parse(res.body).error).toContain("boom");
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.blockers).toEqual([]);
+    expect(body.failedTrackers).toEqual([{ provider: "linear", error: "boom" }]);
   });
 
   it("returns 200 with shape — no-mapping blocker when issue team has no mapping", async () => {

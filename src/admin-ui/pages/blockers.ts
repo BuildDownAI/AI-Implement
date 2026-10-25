@@ -11,6 +11,7 @@ export const blockersHtml = `
   </header>
   <div class="page-body">
     <div id="blockers-error" class="alert fail" hidden></div>
+    <div id="blockers-partial" class="alert warn" hidden></div>
 
     <div class="kpi-grid" id="blockers-kpis" hidden>
       <div class="kpi"><div class="kpi-label">Total blocked</div><div class="kpi-value" id="kpi-blocked-total">0</div></div>
@@ -103,6 +104,15 @@ export const blockersScript = `
     }
   }
 
+  // A tracker whose snapshot failed: its issues are missing from this load.
+  function renderPartial(failedTrackers) {
+    const el = document.getElementById('blockers-partial');
+    if (!failedTrackers || failedTrackers.length === 0) { el.hidden = true; return; }
+    const named = failedTrackers.map(function (t) { return window.esc(t.provider) + ': ' + window.esc(t.error); }).join('; ');
+    el.innerHTML = '<div style="flex:1"><div class="alert-title">Some trackers did not answer</div><div class="alert-desc">' + named + '. Their issues are missing below until they answer.</div></div>';
+    el.hidden = false;
+  }
+
   async function loadBlockers() {
     const errorEl = document.getElementById('blockers-error');
     errorEl.hidden = true;
@@ -122,6 +132,7 @@ export const blockersScript = `
       }
       errorEl.innerHTML = '<div style="flex:1"><div class="alert-title">Failed to load blockers</div><div class="alert-desc">' + window.esc(errorMsg) + '</div></div>';
       errorEl.hidden = false;
+      document.getElementById('blockers-partial').hidden = true;
       document.getElementById('blockers-kpis').hidden = true;
       document.getElementById('blockers-body').innerHTML = '';
       document.getElementById('blockers-empty').classList.add('hidden');
@@ -135,6 +146,7 @@ export const blockersScript = `
     renderKpis(data.totals, capacityByMapping);
     renderRows(data.blockers);
     renderSubtitle(data.blockers, data.totals);
+    renderPartial(data.failedTrackers);
   }
 
   window.loadBlockers = loadBlockers;

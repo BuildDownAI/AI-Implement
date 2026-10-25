@@ -1,5 +1,5 @@
 import type { RepoMapping } from "./config.js";
-import type { AIImplementSnapshot, TicketIssue } from "./providers/types.js";
+import type { AIImplementSnapshot, TicketIssue, TicketingProvider } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import { parsePlanningBlock } from "./planning-block.js";
 import type { DispatchBlockReason } from "./dispatch-gate.js";
@@ -78,11 +78,14 @@ export interface SkipCandidate {
 }
 
 /** Log lines for candidates whose skip reason is new or changed, or that are no longer blocked.
- *  Updates `last` in place; ids absent from `candidates` (left the snapshot) are dropped silently. */
+ *  Updates `last` in place; ids absent from `candidates` (left the snapshot) are dropped silently,
+ *  unless `pruneAbsent` is false: a cycle missing a provider's snapshot cannot tell an issue that left from one it never fetched. */
 export function diffSkipReasons(
   last: Map<string, { identifier: string; reason: DispatchBlockReason }>,
   candidates: SkipCandidate[],
+  options: { pruneAbsent?: boolean } = {},
 ): string[] {
+  const { pruneAbsent = true } = options;
   const lines: string[] = [];
   const present = new Set<string>();
   for (const c of candidates) {
@@ -103,13 +106,13 @@ export function diffSkipReasons(
         : `[poll] Skipping ${c.identifier}: ${c.reason}`,
     );
   }
-  for (const id of [...last.keys()]) if (!present.has(id)) last.delete(id);
+  if (pruneAbsent) for (const id of [...last.keys()]) if (!present.has(id)) last.delete(id);
   return lines;
 }
 
 /** Poll entry point: diff this cycle's reasons against the module-level map. */
-export function logSkipReasons(candidates: SkipCandidate[]): string[] {
-  return diffSkipReasons(lastSkipReasons, candidates);
+export function logSkipReasons(candidates: SkipCandidate[], options: { pruneAbsent?: boolean } = {}): string[] {
+  return diffSkipReasons(lastSkipReasons, candidates, options);
 }
 
 /** Test hook: clear the last-skip-reason map. */
@@ -402,6 +405,38 @@ export interface ForeignTrackerIssue {
   providerId: string;
   /** ticketingProvider of the mapping holding its key. */
   mappingProvider: string;
+}
+
+/** One provider's snapshot, kept with its provider so a caller can act on that provider's own entries. */
+export interface ProviderSnapshotEntry {
+  provider: TicketingProvider;
+  snapshot: AIImplementSnapshot;
+}
+
+/** A provider whose snapshot rejected this cycle: its issues sit out, and nothing reads them as gone. */
+export interface FailedProvider {
+  providerId: string;
+  error: unknown;
+}
+
+/** Every provider's snapshot and their merge, shared by the poll and the admin pages.
+ *  A provider whose snapshot rejects is reported in `failed` instead of failing the rest. */
+export async function fetchProviderSnapshots(
+  providers: TicketingProvider[],
+  mappings: Record<string, RepoMapping>,
+): Promise<{ entries: ProviderSnapshotEntry[]; snapshot: AIImplementSnapshot; foreign: ForeignTrackerIssue[]; failed: FailedProvider[] }> {
+  const settled = await Promise.allSettled(providers.map((p) => p.fetchAIImplementSnapshot()));
+  const entries: ProviderSnapshotEntry[] = [];
+  const failed: FailedProvider[] = [];
+  settled.forEach((result, i) => {
+    if (result.status === "fulfilled") entries.push({ provider: providers[i], snapshot: result.value });
+    else failed.push({ providerId: providers[i].id, error: result.reason });
+  });
+  const { snapshot, foreign } = mergeProviderSnapshots(
+    entries.map((e) => ({ providerId: e.provider.id, snapshot: e.snapshot })),
+    mappings,
+  );
+  return { entries, snapshot, foreign, failed };
 }
 
 /** Merge per-provider snapshots, dropping every entry whose scopeKey belongs to another tracker's mapping. */
