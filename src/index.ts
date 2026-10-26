@@ -41,11 +41,12 @@ import { refreshAvailability, readStampedTarget, resolveDeployTarget, type SelfD
 import { clearDeployHold, getDeployStartedAt, isDeployHeld } from "./deploy-hold.js";
 import { decideAvailabilityAction, getDeployPolicy, getLastActedCommit, setLastActedCommit } from "./deploy-policy.js";
 import { canSelfDeploy, makeStartDeploy, readKgSourceRepo, parseKgSourceRepo } from "./deploy.js";
-import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
+import { remediateStuckJob } from "./stuck-watchdog.js";
+import { finalizeImplementation } from "./implementation-finalize.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
 import type { AdminDeps } from "./admin.js";
-import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
+import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, getRecentFailedRunUrls } from "./log.js";
 import { listParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getInstallationId, getAppSlug, getScopedInstallationToken } from "./github-app-auth.js";
@@ -87,7 +88,7 @@ import { isDurableRunnerMachine, safeDestroyMachine, sweepOrphanedMachines } fro
 import type { ReaperHelpers } from "./reaper.js";
 import { seedKgMaterializeDirectFromEnv, seedKgExecutionModeFromEnv, getRunnerMode, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
 import { handleGitHubWebhook, type KgPrCheckConfig } from "./webhook.js";
-import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable } from "./reconciliation.js";
+import { initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
 import { resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
@@ -2537,7 +2538,7 @@ async function monitorGitHubActionsJob(
     // AII-264 r6: the run's PR already merged (auto-merge beat this check) — route straight
     // to the Done-reconcile so the ticket completes even if the merge-poll never sees it.
     if (fallbackPrMatch?.merged && prUrl) {
-      reconcileAlreadyMergedPr(job, prUrl);
+      await finalizeImplementation({ kind: "merged", prUrl }, null, watchdogConfig, job);
     }
 
     // AII-264 r5: a grouping parent's clean GHA run with no PR is Case-B (the runner's push
@@ -2546,13 +2547,13 @@ async function monitorGitHubActionsJob(
     if (jobStatus === "completed" && !prUrl && job.phase !== "planning" && job.groupingParent) {
       const provider = await providerForJob(registry, job);
       if (!isMonitorRunIdStillCurrent(job)) return;
-      await finalizeNoOpGroupingParent(provider, job);
+      await finalizeImplementation({ kind: "no_work" }, provider, watchdogConfig, job);
     }
 
     if (jobStatus === "failed") {
       const provider = await providerForJob(registry, job);
       if (!isMonitorRunIdStillCurrent(job)) return;
-      await remediateFailedJob(watchdogConfig, provider, job, runStatus.conclusion ?? "failure");
+      await finalizeImplementation({ kind: "failed", conclusion: runStatus.conclusion ?? "failure" }, provider, watchdogConfig, job);
     }
   }
   // If status is queued or in_progress, ensure job is marked running
@@ -2758,8 +2759,14 @@ async function monitorFlyMachineJob(
     invalidateNonce(job.id);
     clearPrNotFoundGrace(job.id);
     console.log(`[monitor] Fly machine ${job.machineId} (${job.issueIdentifier}) → ${jobStatus} (${machineConclusion}, PR: ${prUrl || "none"})`);
+    const flyWatchdogConfig: StuckWatchdogConfig = {
+      githubAppId: config.githubAppId,
+      githubAppPrivateKey: config.githubAppPrivateKey,
+      notifyType: config.notifyType,
+      notifyWebhookUrl: config.notifyWebhookUrl,
+    };
     if (decision.finalizeGroupingParent) {
-      await finalizeNoOpGroupingParent(provider, job);
+      await finalizeImplementation({ kind: "no_work" }, provider, flyWatchdogConfig, job);
     }
 
     // Post machine_destroyed status comment to Linear (best-effort, skip shadow jobs)
@@ -2776,7 +2783,7 @@ async function monitorFlyMachineJob(
     if (matchedPr?.merged && prUrl) {
       // AII-264 r6: the PR already merged — Ready for Review would be a lie and a reset
       // would loop an already-landed child. Route straight to the Done-reconcile.
-      reconcileAlreadyMergedPr(job, prUrl);
+      await finalizeImplementation({ kind: "merged", prUrl }, provider, flyWatchdogConfig, job);
     } else if ((jobStatus === "completed" || jobStatus === "review_failed") && prUrl) {
       if (isDraftPr) {
         // Unapproved run: the runner callback (or, absent one, this job row + the
@@ -2789,16 +2796,10 @@ async function monitorFlyMachineJob(
         // label for Ready for Review, post a PR-link comment). The poller won't
         // re-dispatch issues with Ready for Review, so we don't need to clear
         // the dedup entry.
-        await markReadyForReview(provider, job, prUrl);
+        await finalizeImplementation({ kind: "ready", prUrl }, provider, flyWatchdogConfig, job);
       }
     } else if (jobStatus === "failed") {
-      const flyWatchdogConfig: StuckWatchdogConfig = {
-        githubAppId: config.githubAppId,
-        githubAppPrivateKey: config.githubAppPrivateKey,
-        notifyType: config.notifyType,
-        notifyWebhookUrl: config.notifyWebhookUrl,
-      };
-      await remediateFailedJob(flyWatchdogConfig, provider, job, machineConclusion);
+      await finalizeImplementation({ kind: "failed", conclusion: machineConclusion }, provider, flyWatchdogConfig, job);
     }
   }
 }
@@ -2911,95 +2912,28 @@ async function monitorLocalDockerJob(
     });
   }
 
+  const localWatchdogConfig: StuckWatchdogConfig = {
+    githubAppId: config.githubAppId,
+    githubAppPrivateKey: config.githubAppPrivateKey,
+    notifyType: config.notifyType,
+    notifyWebhookUrl: config.notifyWebhookUrl,
+  };
   if (decision.finalizeGroupingParent) {
-    await finalizeNoOpGroupingParent(provider, job);
+    await finalizeImplementation({ kind: "no_work" }, provider, localWatchdogConfig, job);
   } else if (matchedPr?.merged && prUrl) {
     // AII-264 r6: the PR already merged — route straight to the Done-reconcile,
     // never Ready for Review, never reset.
-    reconcileAlreadyMergedPr(job, prUrl);
+    await finalizeImplementation({ kind: "merged", prUrl }, provider, localWatchdogConfig, job);
   } else if ((jobStatus === "completed" || jobStatus === "review_failed") && prUrl) {
     if (isDraftPr) {
       // Unapproved run: the runner callback (or, absent one, this job row + the
       // status comment already posted above) owns the ticket transition for a
       // draft PR — don't override it with Ready for Review.
     } else {
-      await markReadyForReview(provider, job, prUrl);
+      await finalizeImplementation({ kind: "ready", prUrl }, provider, localWatchdogConfig, job);
     }
   } else {
-    const localWatchdogConfig: StuckWatchdogConfig = {
-      githubAppId: config.githubAppId,
-      githubAppPrivateKey: config.githubAppPrivateKey,
-      notifyType: config.notifyType,
-      notifyWebhookUrl: config.notifyWebhookUrl,
-    };
-    await remediateFailedJob(localWatchdogConfig, provider, job, `exit_${state.exitCode}`);
-  }
-}
-
-/**
- * AII-264 r5: finalize a grouping parent whose closing run produced no changes (Case B).
- * Mirrors the runner-callback `noWork` path: markMerged clears AI-Working and completes the
- * issue, so fetchFeatureNodeRollUps finds the feature node done and merge-up.ts opens the
- * feature→base roll-up PR — after which the r3 roll-up hold keeps the parent parked. The
- * stuck-attempt counter is reset so a prior pr_not_found streak can't re-arm the watchdog.
- */
-async function finalizeNoOpGroupingParent(provider: TicketingProvider | null, job: Job): Promise<void> {
-  if (!provider || !job.issueId) return;
-  if (!job.teamKey) {
-    console.error(`[monitor] Cannot finalize grouping parent ${job.issueIdentifier}: job has no teamKey`);
-    return;
-  }
-  try {
-    await provider.markMerged(job.issueId, job.teamKey);
-    resetStuckAttempts(job.issueId);
-    console.log(`[monitor] Grouping parent ${job.issueIdentifier}: closing run produced no changes — finalized for roll-up (no reset)`);
-  } catch (err) {
-    console.error(`[monitor] Failed to finalize grouping parent ${job.issueIdentifier}:`, err);
-  }
-}
-
-/**
- * AII-264 r6: the run's PR was already merged (auto-merge beat the monitor's first
- * post-exit check — routine for fast children). That is a SUCCESS with the review stage
- * already over: route straight to the Done-reconcile (same queue the merge-poll and
- * webhook feed) instead of markReadyForReview, and never reset. Keyed by repo+PR, so a
- * later job-row mangling cannot orphan the ticket — the queue row survives independently.
- */
-function reconcileAlreadyMergedPr(job: Job, prUrl: string): void {
-  const prNumber = prNumberFromUrl(prUrl);
-  if (prNumber === null || !job.repo) return;
-  if (hasReconciliationForPr(job.repo, prNumber)) return;
-  enqueueReconciliation({
-    issueId: job.issueId,
-    issueIdentifier: job.issueIdentifier,
-    prNumber,
-    repo: job.repo,
-    mergeCommitSha: "",
-  });
-  resetStuckAttempts(job.issueId);
-  console.log(`[monitor] PR #${prNumber} for ${job.issueIdentifier} already merged — queued Done-reconcile (no reset)`);
-}
-
-/** Mark a Linear issue as Ready for Review after a successful job. */
-async function markReadyForReview(provider: TicketingProvider, job: Job, prUrl: string): Promise<void> {
-  if (!job.issueId) return;
-  // teamKey is the authoritative scope (set to issue.scopeKey at job creation).
-  // It's always present here, but guard rather than pass "" — an empty scope
-  // makes Jira's fields("") throw and leaves the ticket stuck.
-  if (!job.teamKey) {
-    console.error(`[monitor] Cannot mark ${job.issueIdentifier} as Ready for Review: job has no teamKey`);
-    return;
-  }
-  try {
-    const applied = await provider.markPrReady(job.issueId, job.teamKey, prUrl);
-    resetStuckAttempts(job.issueId);
-    if (applied) {
-      console.log(`[monitor] Marked ${job.issueIdentifier} as Ready for Review (PR: ${prUrl})`);
-    } else {
-      console.log(`[monitor] ${job.issueIdentifier} already Merged — Ready for Review suppressed (PR: ${prUrl})`);
-    }
-  } catch (err) {
-    console.error(`[monitor] Failed to mark ${job.issueIdentifier} as Ready for Review:`, err);
+    await finalizeImplementation({ kind: "failed", conclusion: `exit_${state.exitCode}` }, provider, localWatchdogConfig, job);
   }
 }
 
