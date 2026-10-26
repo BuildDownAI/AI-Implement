@@ -14,7 +14,7 @@ export interface RunEntry {
   costUsd: number | null;
   maxTurnsHits: number;
   /** The Restate workflow/object this run is keyed by, the lookup key for the Restate UI link `/ui/workflows/<service>/<key>`; null when not Restate-owned. */
-  restate: { service: "KgRefresh" | "PlanningRun" | "ReviewFixAttempt"; key: string } | null;
+  restate: { service: "KgRefresh" | "PlanningRun" | "ImplementationRun" | "ReviewFixAttempt"; key: string } | null;
 }
 
 export interface IssueReportCard {
@@ -265,8 +265,8 @@ function isRestateOwned(dispatchId: string): boolean {
 function restateRefForRow(d: DispatchRow): RunEntry["restate"] {
   if (!d.dispatch_id) return null;
   if (d.phase === "kg-refresh") return { service: "KgRefresh", key: d.dispatch_id };
-  if (d.phase === "implementation") return null;
   if (!isRestateOwned(d.dispatch_id)) return null;
+  if (d.phase === "implementation") return { service: "ImplementationRun", key: d.dispatch_id };
   return { service: d.phase === "planning" ? "PlanningRun" : "ReviewFixAttempt", key: d.dispatch_id };
 }
 

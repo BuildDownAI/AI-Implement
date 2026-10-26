@@ -238,6 +238,14 @@ export interface HandleRunnerResultInput {
    */
   checkPlanningAdmissionTermination?: (dispatchId: string) => Promise<void>;
   /**
+   * Sends `report` to the `ImplementationRun` workflow of a Restate-owned implementation attempt (AII-1557),
+   * after the outcome branch has written the job row and made its ticket moves. The hook itself tells a
+   * Restate-owned reservation from a Legacy one; a Legacy dispatch gets no `report`. The callback never
+   * releases the reservation either way: the workflow confirms the run ended first. An error it throws is
+   * logged and does not change the response.
+   */
+  checkImplementationAdmissionTermination?: (dispatchId: string) => Promise<void>;
+  /**
    * Starts the `LateExternalReview` workflow (AII-1227) for a failed implementation or gap-analysis
    * result that ended `external_review_pending`. The hook itself decides whether Restate is ready;
    * an error it throws is logged and does not change the response.
@@ -1004,6 +1012,15 @@ export async function handleRunnerResult(
     );
     warnings.push(`${op}: ${msg}`);
   };
+  /** One `report` per implementation outcome; the callback never releases the reservation (AII-1557). */
+  const sendImplementationReport = async (): Promise<void> => {
+    if (!input.checkImplementationAdmissionTermination) return;
+    try {
+      await input.checkImplementationAdmissionTermination(claims.dispatchId);
+    } catch (err) {
+      warn("checkImplementationAdmissionTermination", err);
+    }
+  };
 
   for (const c of input.body.comments) {
     try {
@@ -1195,6 +1212,7 @@ export async function handleRunnerResult(
           }
         }
       }
+      await sendImplementationReport();
     }
     // gap-analysis failure: no status transition (PR already terminal)
   } else if (input.body.phase === "planning") {
@@ -1291,6 +1309,7 @@ export async function handleRunnerResult(
         console.warn(`[runner-callback] no job row for dispatch=${claims.dispatchId} — approval mark not written`);
       }
     }
+    await sendImplementationReport();
   } else if (input.body.phase === "gap-analysis") {
     const job = getJobByDispatchId(claims.dispatchId);
     const prNumber = parsePrNumber(job?.prUrl ?? null);
