@@ -165,6 +165,8 @@ import { applyVolumeSnapshotRetention, applyVolumeSnapshotRetentionAtBoot } from
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
 import { sweepOnRegistered } from "./webhook-redelivery.js";
 import { createKgFindRunByTitle, createProductionKgRefreshServices, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
+import { createProductionImplementationRunServices } from "./restate/implementation-run-production.js";
+import { createImplementationAdmissionTerminationHook, createImplementationRunIngressClient } from "./restate/implementation-run-client.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
@@ -4510,6 +4512,11 @@ function startServer(
             ingress: createPlanningRunIngressClient(),
             legacy: (dispatchId) => tryFastReleasePlanningAdmission(config, dispatchId),
           }),
+          checkImplementationAdmissionTermination: createImplementationAdmissionTerminationHook({
+            ingress: createImplementationRunIngressClient(),
+            // The Legacy monitors own a reservation no workflow holds; the callback never releases it.
+            legacy: async () => {},
+          }),
           submitLateExternalReview: lateExternalReviewSubmitHook,
           onReviewFixResult,
           kgRefreshClient: kgRefreshIngressClient,
@@ -5172,6 +5179,22 @@ async function main(): Promise<void> {
     reportTerminalJob: (job) => reportTerminalJob(config, registry, job, { ownerCall: true }),
     sessionDeps: { dispatchSession, isDefinitiveFlyRejectionError, isDefinitiveLocalDockerLaunchFailure, shouldReleaseAdmissionOnDispatchError },
   }).services;
+  // The ImplementationRun workflow (AII-1557): registered, but no dispatch path submits it yet (AII-1555, AII-1554).
+  const implementationRunServices = createProductionImplementationRunServices({
+    config,
+    resolveProvider: (mapping) => registry.forMapping(mapping),
+    resolveRunnerImage: resolveDispatchRunnerImage,
+    isGroupingParentDispatch,
+    fireBreakerTrip,
+    prepareImplementationLaunch,
+    launchImplementationRun,
+    launchImplementationFlySession,
+    launchImplementationLocalSession,
+    postDispatch,
+    finalizeImplementation,
+    remediateStuckJob,
+    reportTerminalJob: (job) => reportTerminalJob(config, registry, job, { ownerCall: true }),
+  }).services;
   const lateExternalReviewServices = createProductionLateExternalReviewServices(config).services;
   const trackerExportServices = createProductionTrackerExportServices().services;
   const bootReconciliation = createBootReconciliation(
@@ -5179,7 +5202,7 @@ async function main(): Promise<void> {
     () => getRunnerBackendSource(),
   );
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
-    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...lateExternalReviewServices, ...trackerExportServices], restateSidecar.identityKey),
+    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, ...trackerExportServices], restateSidecar.identityKey),
     registerRestateEndpoint,
     onRegistered: async () => {
       sweepOnRegistered(config);
