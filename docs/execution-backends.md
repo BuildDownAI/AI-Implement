@@ -10,7 +10,7 @@ Every cell is a real entry point. The test drives it with fakes at the outermost
 
 | Run kind | github-actions | fly-machines | local-docker |
 |---|---|---|---|
-| implementation | `dispatchGitHubActions` (`src/index.ts`) | `dispatchFlyMachine` (`src/index.ts`) | `dispatchLocalDocker` (`src/index.ts`) |
+| implementation | `dispatchGitHubActions` (`src/index.ts`) then `prepareImplementationLaunch` and `launchImplementationRun` (`src/implementation-launch.ts`) | `dispatchFlyMachine` (`src/index.ts`) then `launchImplementationFlySession` (`src/implementation-launch.ts`) | `dispatchLocalDocker` (`src/index.ts`) then `launchImplementationLocalSession` (`src/implementation-launch.ts`) |
 | gap-fill (`/ai-implement` comment) | `drainCommentGapfillQueue` (`src/comment-gapfill-drain.ts`), GitHub Actions branch | same function, Fly branch | same function, local branch, through `dispatchLocalGapfill` (`src/local-gapfill.ts`) |
 | planning | `dispatchPlanning` (`src/index.ts`) then `preparePlanningLaunch` (`src/planning-launch.ts`) and `launchPlanningRun` | `dispatchPlanning` then `launchPlanningSession` (`src/planning-launch.ts`) | same as Fly |
 | review-fix attempt (Restate pilot) | `GithubReviewFixWorker.launch` (`src/review-fix-worker.ts`); callback tokens from `callbackInputs` (`src/restate/review-fix-production.ts`) | none yet | none yet |
