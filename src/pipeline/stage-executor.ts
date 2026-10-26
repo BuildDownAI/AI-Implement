@@ -169,6 +169,8 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
       // Codex has a timeout, not a native turn cap: never forward one.
       if (selection.agent === "codex") delete call.maxTurns;
 
+      // False until the guards pass: a hold rejection never reached an executor, so it is not a model call.
+      let reachedExecutor = false;
       try {
         const profileId = selection.accountProfileId;
         const heldBy = heldProfiles.get(profileId);
@@ -178,6 +180,7 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
             : new AgentRecoveryRequiredError("held", profileId);
         }
         if (selection.agent === "claude" && claudeHeld) throw claudeHeld;
+        reachedExecutor = true;
         let result: LLMResult;
         if (selection.agent === "claude") {
           // If the child cannot be proven dead the callback must never settle: the client checkpoints on both
@@ -221,7 +224,7 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
           const attribution = attribute("error", carried);
           Object.assign(err, { attribution });
           if (carried) carried.attribution = attribution;
-          recordInvocationOf(attribution, carried, (err as { attempts?: number }).attempts);
+          if (reachedExecutor) recordInvocationOf(attribution, carried, (err as { attempts?: number }).attempts);
         }
         throw err;
       }

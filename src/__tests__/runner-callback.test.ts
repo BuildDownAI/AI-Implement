@@ -5627,9 +5627,9 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
     const fake = new FakeProvider({ recordCalls: true });
     const deliver = (attribution: unknown = claim({ snapshotId: "snap-managed-attr", usage: {
       availability: "complete", tokensIn: 100, tokensOut: 10, costUsd: null, costStatus: "unavailable",
-    } }), result = marker, bearer = token) => runnerCallback.handleRunnerResult({
+    } }), result = marker, bearer = token, extra: Record<string, unknown> = {}) => runnerCallback.handleRunnerResult({
       authorization: `Bearer ${bearer}`, secret: SECRET,
-      body: { phase: "gap-analysis", outcome: "success", comments: [], reviewFix: result, attribution: attribution as never },
+      body: { phase: "gap-analysis", outcome: "success", comments: [], reviewFix: result, attribution: attribution as never, ...extra },
       resolveProvider: makeResolve(fake),
       onReviewFixResult: (value) => store.recordResult(value.attemptId, value, Date.now()),
     });
@@ -5649,6 +5649,24 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
     }});
     expect(await facade.getAttempt(c.attemptId, {role: "user", email: "user@example.com"})).toEqual({status: "not_found"});
     expect(c.fake.recordedCalls()).toEqual([]);
+  });
+
+  it("stores the managed invocation list and pushed SHAs, drops snapshot mismatches, and is idempotent (AII-1562)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const c = await managedResult();
+    const rec = (id: string, over: Record<string, unknown> = {}) => ({
+      attribution: claim({ invocationId: id, snapshotId: "snap-managed-attr", ...over }),
+      cacheReadTokens: 5, cacheCreationTokens: 2, attempts: 2,
+    });
+    const sha = "c".repeat(40);
+    const extra = { invocations: [rec("m-1"), rec("m-2"), rec("m-bad", { model: "another-model" })], pushedCommits: [sha] };
+    expect(await c.deliver(undefined, undefined, undefined, extra)).toMatchObject({ status: 200, body: { outcome: "stored" } });
+    expect(rows().map((r) => r.invocation_id).sort()).toEqual(["inv-1", "m-1", "m-2"]);
+    expect(JSON.parse(rows().find((r) => r.invocation_id === "m-1")!.usage_json as string)).toMatchObject({ cacheReadTokens: 5, cacheCreationTokens: 2, attempts: 2 });
+    expect(log.getPushedCommits(c.attemptId)).toEqual([sha]);
+    expect(warn.mock.calls.map((x) => x.join(" ")).join("\n")).toContain("Dropped 1 managed attribution record(s)");
+    await c.deliver(undefined, undefined, undefined, extra);
+    expect(rows()).toHaveLength(3);
   });
 
   it("repairs missing managed attribution on duplicate delivery without duplicating spend or legacy effects", async () => {

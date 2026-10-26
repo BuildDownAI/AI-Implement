@@ -484,6 +484,9 @@ describe("static attribution validation", () => {
 });
 
 describe("held profiles across stages", () => {
+  beforeEach(() => resetJobAccounting());
+  afterEach(() => resetJobAccounting());
+
   /** A Claude child that never exits and cannot be killed: death stays unproven. */
   function liveChildSpawn() {
     return vi.fn(() => {
@@ -545,6 +548,8 @@ describe("held profiles across stages", () => {
     expect(second).toBeInstanceOf(CodexRecoveryRequiredError);
     expect(second.reason).toBe("held");
     expect(review.invoke).toHaveBeenCalledTimes(1);
+    // Only the call that reached the executor is a model call; the hold rejection is not accounted.
+    expect(collectedInvocations()).toHaveLength(1);
   });
 
   it("holds a Claude profile after an uncertain checkpoint", async () => {

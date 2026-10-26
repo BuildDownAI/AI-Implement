@@ -183,6 +183,17 @@ export interface RunnerResultBody {
    */
   attribution?: InvocationAttributionV1;
   /**
+   * Every model invocation of the job (AII-1562), sanitized per record in handleRunnerResult; invalid
+   * records are dropped with a count-only warning and never fail the callback. Stored one row per
+   * invocation id. Absent from runners that predate the field.
+   */
+  invocations?: InvocationRecordV1[];
+  /**
+   * SHAs the job pushed, oldest first (AII-1562); `[]` when nothing was pushed. Absent when the runner
+   * did not report, which is distinct from empty. Dropped with a warning when malformed.
+   */
+  pushedCommits?: string[];
+  /**
    * Optional pilot marker (AII-769 Restate review-fix pilot; shape defined by
    * AII-770's review-fix-contract.ts). Present only on a result reported by a
    * Restate-owned review-fix attempt — absent means Legacy. A present-but-

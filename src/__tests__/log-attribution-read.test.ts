@@ -63,6 +63,30 @@ describe("readAttributionsByDispatch failures", () => {
   });
 });
 
+describe("getPushedCommits failures", () => {
+  it("reads a thrown database error as unknown, warning by class name only", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const db = dedup.getDb();
+    const prepare = db.prepare.bind(db);
+    vi.spyOn(db, "prepare").mockImplementation(((sql: string) => {
+      if (sql.includes("dispatch_pushed_commits")) throw new TypeError("PLANTED-SECRET-MESSAGE");
+      return prepare(sql);
+    }) as never);
+    expect(log.getPushedCommits("d1")).toBeNull();
+    expect(warn.mock.calls.join(" ")).not.toContain("PLANTED-SECRET-MESSAGE");
+  });
+
+  it.each([["an object", `{"a":1}`], ["a non-string array", `[1,2]`], ["invalid JSON", `not json`]])(
+    "reads %s in shas_json as unknown",
+    (_name, payload) => {
+      vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      log.recordPushedCommits("d-bad", []);
+      dedup.getDb().prepare("UPDATE dispatch_pushed_commits SET shas_json = ? WHERE dispatch_id = ?").run(payload, "d-bad");
+      expect(log.getPushedCommits("d-bad")).toBeNull();
+    },
+  );
+});
+
 describe("selected invocation attribution through the Job read model", () => {
   function insertStage(invocationId: string, dispatchId: string, stage: string) {
     dedup.getDb().prepare(`INSERT INTO model_invocation_attribution
