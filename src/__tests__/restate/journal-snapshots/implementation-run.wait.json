@@ -1,0 +1,62 @@
+[
+  {
+    "type": "Input",
+    "name": ""
+  },
+  {
+    "type": "SetState",
+    "name": ""
+  },
+  {
+    "type": "SetState",
+    "name": ""
+  },
+  {
+    "type": "Run",
+    "name": "reserve"
+  },
+  {
+    "type": "SetState",
+    "name": ""
+  },
+  {
+    "type": "Run",
+    "name": ""
+  },
+  {
+    "type": "Run",
+    "name": "dispatch"
+  },
+  {
+    "type": "SetState",
+    "name": ""
+  },
+  {
+    "type": "SetState",
+    "name": ""
+  },
+  {
+    "type": "GetPromise",
+    "name": ""
+  },
+  {
+    "type": "Run",
+    "name": "read-0"
+  },
+  {
+    "type": "SetState",
+    "name": ""
+  },
+  {
+    "type": "GetPromise",
+    "name": ""
+  },
+  {
+    "type": "Run",
+    "name": ""
+  },
+  {
+    "type": "Sleep",
+    "name": ""
+  }
+]
