@@ -3,6 +3,7 @@ import { expect, it, vi } from "vitest";
 const restateRetentionMs = vi.hoisted(() => vi.fn(() => 30 * 24 * 60 * 60 * 1000));
 vi.mock("../restate/retention.js", () => ({ restateRetentionMs }));
 
+import { createImplementationRunWorkflow } from "../restate/implementation-run-workflow.js";
 import { createPlanningRunWorkflow } from "../restate/planning-run-workflow.js";
 import { createReviewFixAttempt } from "../restate/review-fix-attempt.js";
 
@@ -20,6 +21,7 @@ function retentions(def: unknown): number[] {
 
 const factories = [
   { name: "PlanningRun", build: (extra: object) => createPlanningRunWorkflow({ ...extra } as never) },
+  { name: "ImplementationRun", build: (extra: object) => createImplementationRunWorkflow({ ...extra } as never) },
   { name: "ReviewFixAttempt", build: (extra: object) => createReviewFixAttempt({ ...extra } as never) },
 ];
 

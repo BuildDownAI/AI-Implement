@@ -170,12 +170,17 @@ export async function remediateStuckJob(
   job: Job,
   lastRunStatus: string,
   stopRunner?: () => Promise<boolean>,
+  opts?: {
+    /** The `ImplementationRun` workflow running the handling for the job it owns. A Legacy monitor
+     *  leaves this unset, because it must never re-arm a job that a workflow owns. */
+    ownerCall?: boolean;
+  },
 ): Promise<boolean> {
   if (!job.issueId) return false;
   // kg-refresh jobs have their own outcome rail — never re-arm or clear dedup for them.
   if (job.phase === "kg-refresh") return false;
   // Restate finalizes its own attempts — never re-arm or clear dedup for them (AII-791).
-  if (isRestateOwnedJob(job)) return false;
+  if (!opts?.ownerCall && isRestateOwnedJob(job)) return false;
   // Re-read conclusion from DB: the runner callback may have set "operator_cancelled"
   // after the monitor tick started reading the job, so the passed-in job may be stale.
   const freshConclusionStuck = getJobById(job.id)?.conclusion;

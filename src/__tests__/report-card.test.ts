@@ -964,6 +964,24 @@ describe("getIssueReportCard restate (AII-1129)", () => {
     ]);
   });
 
+  it("maps a restate-owned implementation row to ImplementationRun and a legacy one to null", async () => {
+    const admission = await import("../dispatch-admission.js");
+    for (const [id, lifecycleOwner] of [["impl-r", { kind: "restate", attemptId: "att-ir" }], ["impl-l", { kind: "legacy" }]] as const) {
+      admission.acquire({
+        dispatchId: id,
+        mappingKey: "m",
+        scope: { kind: "issue", issueScope: "s", issueId: `issue-${id}` },
+        kind: "implementation",
+        backend: "github-actions",
+        lifecycleOwner,
+        cap: 5,
+      });
+    }
+    insertDispatch({ issueIdentifier: "AII-IR", phase: "implementation", dispatchId: "impl-r", dispatchedAt: 1 });
+    insertDispatch({ issueIdentifier: "AII-IR", phase: "implementation", dispatchId: "impl-l", dispatchedAt: 2 });
+    expect(rc.getIssueReportCard("AII-IR")!.runs.map((r) => r.restate)).toEqual([{ service: "ImplementationRun", key: "impl-r" }, null]);
+  });
+
   it("maps a restate-owned non-planning row to ReviewFixAttempt", async () => {
     const admission = await import("../dispatch-admission.js");
     admission.acquire({

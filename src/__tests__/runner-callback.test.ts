@@ -16,6 +16,7 @@ import type * as ReviewFixAdminFacadeModule from "../review-fix-admin-facade.js"
 import type { CycleSummary } from "../pipeline/cycle-summary.js";
 import { formatFailureComment, boundStatusText } from "../runner-callback.js";
 import { FakeProvider } from "./providers/fake.js";
+import { createImplementationAdmissionTerminationHook } from "../restate/implementation-run-client.js";
 import { STUCK_JOB_MAX_ATTEMPTS } from "../stuck-watchdog.js";
 import type { TicketingProvider } from "../providers/types.js";
 import type { Step } from "../pipeline/types.js";
@@ -5793,5 +5794,72 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
     await deliver(claim({ apiKey: PLANTED }), { dispatchId: "d2" });
     expect(JSON.stringify(rows())).not.toContain(PLANTED);
     expect(rows()).toHaveLength(0);
+  });
+});
+
+// AII-1557: a Restate-owned implementation attempt gets one `report` per outcome branch, and the callback never releases the reservation.
+describe("handleRunnerResult — implementation report hook (AII-1557)", () => {
+  type Branch = { name: string; body: Record<string, unknown>; setup?: () => void };
+  const branches: Branch[] = [
+    { name: "operator cancel", body: { outcome: "failure", failureCode: "OPERATOR_CANCELLED" } },
+    { name: "other failure", body: { outcome: "failure", failureCode: "REVIEW_UNAPPROVED", failureReason: "no", prUrl: "https://github.com/o/r/pull/5" } },
+    { name: "no work", body: { outcome: "success", noWork: true } },
+    { name: "success", body: { outcome: "success", prUrl: "https://github.com/o/r/pull/6" } },
+  ];
+
+  async function run(owner: "restate" | "legacy", body: Record<string, unknown>, hookThrows = false) {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const admitted = dispatchAdmission.acquire({
+      dispatchId,
+      mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "ENG", issueId: "i" },
+      kind: "implementation",
+      backend: "github-actions",
+      lifecycleOwner: owner === "restate" ? { kind: "restate", attemptId: dispatchId } : { kind: "legacy" },
+      cap: 1,
+    });
+    expect(admitted.ok).toBe(true);
+    log.appendLog({ issueId: "i", issueIdentifier: "ENG-1", issueTitle: "Implement it", teamKey: "ENG", repo: "o/r", dispatchId, executionMode: "github-actions" });
+    const report = vi.fn(async () => {
+      if (hookThrows) throw new Error("ingress down");
+      return { status: "accepted" as const };
+    });
+    const legacy = vi.fn(async () => {});
+    const hook = createImplementationAdmissionTerminationHook({ ingress: { report }, legacy, readAdmission: (id) => dispatchAdmission.read(id) });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "implementation", comments: [], ...body } as never,
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+      checkImplementationAdmissionTermination: hook,
+    });
+    return { res, report, legacy, dispatchId };
+  }
+
+  it.each(branches)("sends report once and keeps the reservation held: $name", async ({ body }) => {
+    const { res, report, legacy, dispatchId } = await run("restate", body);
+    expect(res.status).toBe(200);
+    expect(report).toHaveBeenCalledTimes(1);
+    expect(report).toHaveBeenCalledWith(dispatchId);
+    expect(legacy).not.toHaveBeenCalled();
+    expect(dispatchAdmission.read(dispatchId)?.releasedAt).toBeNull();
+  });
+
+  it.each(branches)("sends no report for a legacy attempt: $name", async ({ body }) => {
+    const { res, report, dispatchId } = await run("legacy", body);
+    expect(res.status).toBe(200);
+    expect(report).not.toHaveBeenCalled();
+    expect(dispatchAdmission.read(dispatchId)?.releasedAt).toBeNull();
+  });
+
+  it("does not fail the callback when the hook throws", async () => {
+    const throwing = await run("restate", { outcome: "success", prUrl: "https://github.com/o/r/pull/7" }, true);
+    expect(throwing.res.status).toBe(200);
   });
 });

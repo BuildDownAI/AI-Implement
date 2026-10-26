@@ -312,6 +312,21 @@ check that `workflows/claude-plan.yml`'s `run-name` contains `PLANNING_RUN_TITLE
 
 **Adding the suite to a run kind's scenario file:** start the environments with `startVariants` in `beforeAll`, write the adapter over the run kind's workflow and its recording fakes, and call `registerOwnedRunContract(adapter, (label) => environments.get(label)!)` at the top level of the file. `owned-run-lifecycle.restate.test.ts` is the worked example, with a small fixture workflow. Each effect the adapter passes must be safe to run twice.
 
+## Journal snapshots for pause points (AII-1558)
+
+A workflow that pauses for a long time (an `ImplementationRun` waits for its run for up to the job timeout) resumes on new code after a deploy and replays its journal. If a change adds, removes or reorders a journaled action (`ctx.run`, `ctx.set`, `ctx.sleep`, `ctx.date.now`, a promise) before a pause point, the replay does not match and the invocation retries for ever. A journal snapshot test fails CI on such a change. The control plane has the same check (CON-61).
+
+**The worked example** is `src/__tests__/restate/implementation-run-journal.restate.test.ts`:
+
+* It drives the workflow with fakes to each pause point (`wait`, the durable sleep that races the `report` promise, and `confirm`, the first status read after a `report`, held by a `gate`). The tick seams are set to hours, so no tick adds an entry while the journal is read.
+* It reads the journal with `journalEntries` and keeps only the commands (`entry_type` "Command: ..." and `name`), in order. Completion notifications are dropped, because their position depends on timing. No ids, payloads or times are stored.
+* It compares each list with a committed file in `src/__tests__/restate/journal-snapshots/` (`implementation-run.wait.json`, `implementation-run.confirm.json`). It checks both points before it fails, so a change before the wait fails both. A missing snapshot fails.
+* The failure message states the rule: do not change journaled actions before a pause point; put new work after the last pause point or in a new handler; if the change is unavoidable, drain paused invocations before the deploy and regenerate the snapshots.
+
+**Regenerate** only on purpose: `UPDATE_JOURNAL_SNAPSHOTS=1 npm run test:restate -- implementation-run-journal`. The variable is in the ambient-env allowlist (`src/__tests__/setup/ambient-env.ts`). Commit the new files with the change that needed them, and say in the PR how paused invocations were drained.
+
+**Add one for another workflow** when it pauses across deploys for longer than a deploy takes (for example `PlanningRun`, which is built the same way): copy the example, name the snapshots `<workflow>.<point>.json`, and capture each point where the workflow suspends.
+
 ## Testing a journal projection (two tiers)
 
 A run kind that follows the [journal projection rule](restate.md#journal-projections) (ADR 018 amendment, 2026-10-08) tests it in two tiers. The worked example is kg-refresh (AII-1150).

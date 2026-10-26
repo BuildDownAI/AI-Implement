@@ -95,7 +95,7 @@ const MAPPING = makeMapping({
   planningEnabled: true,
   maxTurns: 37,
   maxIterations: 4,
-  maxJobMinutes: 75,
+  maxJobMinutes: 240,
   branchPrefix: "pr",
   skillsRepo: "acme/skills",
   referenceRepos: [{ repo: "https://github.com/acme/reference", path: "reference", ref: "main" }],
@@ -672,6 +672,29 @@ describe("launch contract parity", () => {
         "fails but is not in KNOWN_GAPS": actual.filter((check) => !known.includes(check)),
         "is in KNOWN_GAPS but passes (remove the row)": known.filter((check) => !actual.includes(check)),
       }).toEqual({ "fails but is not in KNOWN_GAPS": [], "is in KNOWN_GAPS but passes (remove the row)": [] });
+    });
+  });
+
+  // MAPPING sets maxJobMinutes 240: (240 + 15 grace) * 60 = 15300 s, above the 2 h floor.
+  const TTL_CELLS = CELLS.filter((c) => ["implementation", "gap-fill", "legacy-review-fix"].includes(c.kind));
+  describe.each(TTL_CELLS.map((cell) => [`${cell.kind} · ${cell.backend}`, cell] as const))("callback token TTL: %s", (_name, cell) => {
+    it("expires the minted tokens at the job timeout plus grace", { timeout: 60_000 }, async () => {
+      let world: World | null = null;
+      try {
+        world = await boot({ evilImage: false, runnerMode: cell.runnerMode });
+        const before = Date.now();
+        await cell.run(world, {});
+        const after = Date.now();
+        const rows = world.dedup.getDb().prepare("SELECT phase, expires_at FROM runner_tokens").all() as Array<{ phase: string; expires_at: number }>;
+        const minted = rows.filter((r) => r.phase === "implementation" || r.phase === "gap-analysis");
+        expect(minted.length).toBeGreaterThan(0);
+        for (const row of minted) {
+          expect(row.expires_at).toBeGreaterThanOrEqual(before + 15300 * 1000);
+          expect(row.expires_at).toBeLessThanOrEqual(after + 15300 * 1000);
+        }
+      } finally {
+        teardown();
+      }
     });
   });
 });

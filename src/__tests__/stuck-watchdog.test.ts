@@ -274,3 +274,44 @@ describe("remediateFailedJob — Restate-owned job (AII-1020)", () => {
     expect(incrementStuckAttempts).not.toHaveBeenCalled();
   });
 });
+
+describe("remediateStuckJob — Restate-owned job", () => {
+  const provider = makeProvider();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    vi.mocked(getJobById).mockReturnValue(null as never);
+    vi.mocked(readAdmission).mockReturnValue({ lifecycleOwner: { kind: "restate", attemptId: "d-1" } } as never);
+  });
+
+  it("returns false and changes nothing without ownerCall", async () => {
+    const result = await remediateStuckJob(mockConfig, provider, stuckJob({ dispatchId: "d-1" }), "ttl_expired");
+    expect(result).toBe(false);
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+    expect(updateJobStatus).not.toHaveBeenCalled();
+    expect(deleteDispatched).not.toHaveBeenCalled();
+  });
+
+  it("requeues with ownerCall while attempts are within the bound", async () => {
+    await remediateStuckJob(mockConfig, provider, stuckJob({ dispatchId: "d-1" }), "ttl_expired", undefined, { ownerCall: true });
+    expect(incrementStuckAttempts).toHaveBeenCalledWith("issue-abc");
+    expect(provider.clearWorkingState).toHaveBeenCalledOnce();
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued", undefined, expect.anything());
+  });
+
+  it("gives up with ownerCall above the attempt bound", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(4);
+    await remediateStuckJob(mockConfig, provider, stuckJob({ dispatchId: "d-1" }), "ttl_expired", undefined, { ownerCall: true });
+    expect(provider.postComment).toHaveBeenCalledOnce();
+    expect(vi.mocked(provider.postComment).mock.calls[0]![1]).toContain("Stuck — Needs Human");
+    expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_giveup", undefined, expect.anything());
+  });
+
+  it("ownerCall still skips kg-refresh and operator_cancelled jobs", async () => {
+    expect(await remediateStuckJob(mockConfig, provider, stuckJob({ dispatchId: "d-1", phase: "kg-refresh" }), "x", undefined, { ownerCall: true })).toBe(false);
+    expect(await remediateStuckJob(mockConfig, provider, stuckJob({ dispatchId: "d-1", conclusion: "operator_cancelled" }), "x", undefined, { ownerCall: true })).toBe(false);
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+  });
+});

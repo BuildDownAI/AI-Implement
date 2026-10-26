@@ -541,6 +541,66 @@ The failure branch of the planning callback also calls the termination hook, so 
 
 **A reservation that stays held.** If a reservation stays held in spite of the workflow, an operator lists it and releases it (AII-1069). The MCP tools `list_dispatch_reservations` and `release_dispatch_reservation` (`src/restate/tools.ts`) call `listHeldReservations` and `releaseHeldReservation` in `src/dispatch-admission.ts`. `GET /api/dispatch-reservations` and the held-reservations card on `/admin#deployments` use the same functions. Without `force`, a release needs a backend run confirmed ended; a terminal job row alone is refused (the planning callback closes the row before the run is known to have ended), and a Restate-owned reservation with no job row needs `force`.
 
+## The implementation run
+
+`ImplementationRun` (`src/restate/implementation-run-workflow.ts`, AII-1553) owns one implementation attempt, from its reservation to its release, on GitHub Actions, Fly Machines and local Docker. It is built the same way as `PlanningRun` (kit steps `reserve`, `cleanup`, `outcome`; `awaitOwnedRun`; the `find-escape-N` escape path; a `finally` release). The production deps are composed by `createProductionImplementationRunServices` (`src/restate/implementation-run-production.ts`, AII-1557) and passed to `startRestateEndpoint` in `src/index.ts`. **No dispatch path submits the workflow yet**: first-time implementation switches in AII-1555 and gap-fill in AII-1554, so the service is registered and idle. Step names and the duty each Legacy function hands over are in [implementation-lifecycle.md](implementation-lifecycle.md). Three rules differ from planning:
+
+- **One workflow per attempt** ([ADR 044](adr/044-one-implementationrun-per-attempt.md)). At its deadline it stops the run and calls the bounded stuck cleanup; the next poll starts a new attempt under a new dispatch id.
+- **The deadline is the job timeout** ([ADR 045](adr/045-implementationrun-deadline-from-the-job-timeout.md)): `input.maxJobMinutes`, normalized by the caller at dispatch, plus the 10-minute stop margin after the stop. The bootstrap deadline is 10 minutes.
+- **`report` has no payload.** The callback writes the outcome to SQLite; `finish-job` (`finishImplementationJob`, `src/restate/implementation-run-finish.ts`) reads the `dispatch_log` row and does what the callback did not, through `finalizeImplementation`. The sender is `src/restate/implementation-run-client.ts`.
+
+### Handlers
+
+| Handler | Kind | What it does |
+|---|---|---|
+| `run` | workflow (exclusive) | The lifecycle above. The workflow key is the dispatch id, and the input (`implementationRunInputSchema`) holds no token. |
+| `report` | shared | Resolves the `report` promise. It throws a 404 `TerminalError` for a key no `run` has started under. |
+| `status` | shared | Reads `step`, `dispatchId` and `jobId` from the workflow state. |
+
+### Deadlines
+
+All constants are exported from `implementation-run-workflow.ts`.
+
+| Constant | Value | Meaning |
+|---|---|---|
+| total deadline | `input.maxJobMinutes` (from the dispatch time) | The run is stopped when it passes. |
+| `IMPLEMENTATION_RUN_STOP_MARGIN_MS` | 10 min | How long the workflow waits for `ended` after it stops a run at a deadline. |
+| `IMPLEMENTATION_RUN_BOOTSTRAP_MS` | 10 min | How long a run may show no started evidence. |
+| `IMPLEMENTATION_RUN_TICK_MS` | 30 s | The status read interval of the wait. |
+| `IMPLEMENTATION_RUN_CONFIRM_WINDOW_MS` / `_CONFIRM_TICK_MS` | 2 min / 5 s | After a `report`, how long and how often the confirm phase reads the status for `ended`. |
+| `IMPLEMENTATION_RUN_ESCAPE_WAIT_MS` / `_ESCAPE_TICK_MS` | 60 s / 5 s | How long the escape path looks for a run whose launch may still complete after a cancel. |
+
+### The deps (`implementation-run-production.ts`)
+
+- `reserve` calls `acquireDispatch` with `kind: "implementation"` and `lifecycleOwner: { kind: "restate", attemptId: dispatchId }`; a repeat call returns the active row.
+- `launch` returns `{ outcome, jobId? }` and never a token. A throw before the launch call (mapping, provider, reservation, managed-auth decision, `prepareImplementationLaunch`, token mint, a session launch classified `rejected`) returns `rejected`; the workflow then releases. A throw after the launch call propagates, so the `dispatch` step retries and `findExistingRun` reconciles. After an accepted launch it writes the `dispatch_log` row (`appendLogIfAbsent`, idempotent per dispatch id; the launch functions write none of it), then marks the dedup row, suppresses stale notifications, runs `postDispatch` and posts the base-branch comment. A failure after the row exists is logged, not thrown.
+- `launchContext` carries `baseBranch`, `baseBranchFieldValue` and `runnerMode` as strings (the `IMPLEMENTATION_CONTEXT_*` constants). The submitter resolves the base branch once at dispatch; absent values default to the mapping's default branch, no field value, and the runner mode at launch.
+- `findExistingRun` takes the id on the job row first (`machineId`, or `runId`). Otherwise Fly matches the machine named `session-<issue key>` created at or after the dispatch time, and GitHub Actions matches the run titled `Claude AI Implementation — <issue key>` created at or after it that no other row holds. **Known limit:** the implementation launches set no per-dispatch name, so a lookup without a recorded id can adopt another attempt's run for the same issue, and a started local container that was not recorded cannot be found (its name carries a timestamp).
+- `readStatus` ("ended") is `classifyFlyMachine`, `classifyLocalContainer`, or a GitHub run with `status === "completed"`. A `started` read moves a `dispatched` row to `running`.
+- `finishJob` is `finishImplementationJob` with `finalizeImplementation(..., { ownerCall: true })` and, at the deadline, `remediateStuckJob(..., { ownerCall: true })`. A missing job row returns `{}`.
+- `cleanup` destroys the Fly machine (`destroyMachineRecorded`) or removes the local container; GitHub Actions does nothing; a 404 or "no such container" counts as done. Session logs and the `machine_destroyed` status comment of the Legacy monitors are not posted.
+- `onOutcome` is `reportTerminalJob(job, { ownerCall: true })`, once; it does nothing without a job row.
+
+### The callback hook
+
+`handleRunnerResult` (`src/runner-callback.ts`) calls `checkImplementationAdmissionTermination` after each implementation outcome branch has written the row and made its ticket moves: operator cancel, other failure, no-work, success. The hook (`createImplementationAdmissionTerminationHook`) sends `report` for a reservation whose `lifecycleOwner.kind` is `restate` and does nothing for a Legacy one. The callback never releases the reservation. A hook error, or Restate not being ready, is logged and the callback answers as before; the workflow's own wait still sees `ended` within one tick.
+
+### The final-state table
+
+What `finish-job` does for the row it reads (`finishImplementationJob`), and the release reason that follows.
+
+| Row and outcome | Row write | Ticket move | Release reason |
+|---|---|---|---|
+| Conclusion `operator_cancelled` | none | `clearWorkingState` | `cancelled` |
+| Restate cancel or error (`cancelled`) | `failed` / `workflow_cancelled` if not terminal, no admission release | `finalize` as failed | `cancelled` (escape path) |
+| Deadline, no callback seen | the bounded stuck cleanup (`remediateStuckJob`, `ttl_expired`) | its requeue or give-up | `deadline_exceeded` |
+| Run ended, no callback seen | `failed` / `ended_without_callback` | `finalize` as failed | `finalized` |
+| Callback reported a failure | `failed` if not terminal | `finalize` as failed only when the row has no PR | `finalized` |
+| Callback reported success, no PR | `completed` if not terminal | `finalize` as no-work for a grouping parent | `finalized` |
+| Callback reported success, PR merged | `completed` if not terminal | `finalize` as merged | `finalized` |
+| Callback reported success, PR open, no transition made yet | `completed` if not terminal | `finalize` as ready | `finalized` |
+| Callback reported success, transition already made (approved, or `external_review_pending`) | `completed` if not terminal | none | `finalized` |
+
 ## Reading a run's journal
 
 Reading a run's journal in the Restate UI works once the AII-1287 scrub row exists and this process's legacy-token check has confirmed none left (AII-1306): the UI is served at `/ui/` (admin only, § "Restate UI through the orchestrator"), and its journal and invocation views load data through `POST /query`, which the proxy forwards to admins from then on and answers 403 before it (AII-1286, AII-1299). The orchestrator has no journal route of its own (AII-1265 removed `GET /api/restate/journal` and `src/restate/journal-query.ts`; the route now answers 404). The admin UI shows an "Open in Restate UI" link to `/ui/workflows/<service>/<key>`:
