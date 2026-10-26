@@ -541,6 +541,14 @@ The failure branch of the planning callback also calls the termination hook, so 
 
 **A reservation that stays held.** If a reservation stays held in spite of the workflow, an operator lists it and releases it (AII-1069). The MCP tools `list_dispatch_reservations` and `release_dispatch_reservation` (`src/restate/tools.ts`) call `listHeldReservations` and `releaseHeldReservation` in `src/dispatch-admission.ts`. `GET /api/dispatch-reservations` and the held-reservations card on `/admin#deployments` use the same functions. Without `force`, a release needs a backend run confirmed ended; a terminal job row alone is refused (the planning callback closes the row before the run is known to have ended), and a Restate-owned reservation with no job row needs `force`.
 
+## The implementation run
+
+`ImplementationRun` (`src/restate/implementation-run-workflow.ts`, AII-1553) owns one implementation attempt, from its reservation to its release, on GitHub Actions, Fly Machines and local Docker. It is built the same way as `PlanningRun` (kit steps `reserve`, `cleanup`, `outcome`; `awaitOwnedRun`; the `find-escape-N` escape path; a `finally` release) and no production path starts it yet; AII-1557 wires it. Step names and the duty each Legacy function hands over are in [implementation-lifecycle.md](implementation-lifecycle.md). Three rules differ from planning:
+
+- **One workflow per attempt** ([ADR 044](adr/044-one-implementationrun-per-attempt.md)). At its deadline it stops the run and calls the bounded stuck cleanup; the next poll starts a new attempt under a new dispatch id.
+- **The deadline is the job timeout** ([ADR 045](adr/045-implementationrun-deadline-from-the-job-timeout.md)): `input.maxJobMinutes`, normalized by the caller at dispatch, plus the 10-minute stop margin after the stop. The bootstrap deadline is 10 minutes.
+- **`report` has no payload.** The callback writes the outcome to SQLite; `finish-job` (`finishImplementationJob`, `src/restate/implementation-run-finish.ts`) reads the `dispatch_log` row and does what the callback did not, through `finalizeImplementation`. The sender is `src/restate/implementation-run-client.ts`.
+
 ## Reading a run's journal
 
 Reading a run's journal in the Restate UI works once the AII-1287 scrub row exists and this process's legacy-token check has confirmed none left (AII-1306): the UI is served at `/ui/` (admin only, § "Restate UI through the orchestrator"), and its journal and invocation views load data through `POST /query`, which the proxy forwards to admins from then on and answers 403 before it (AII-1286, AII-1299). The orchestrator has no journal route of its own (AII-1265 removed `GET /api/restate/journal` and `src/restate/journal-query.ts`; the route now answers 404). The admin UI shows an "Open in Restate UI" link to `/ui/workflows/<service>/<key>`:
