@@ -5604,9 +5604,14 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
     if (attribution && typeof attribution === "object" && (attribution as { snapshotId?: string }).snapshotId === "snap-1") {
       attribution = { ...(attribution as object), snapshotId: `snap-${dispatchId}` };
     }
+    const extra = { ...(opts.extra ?? {}) };
+    if (Array.isArray(extra.invocations)) {
+      extra.invocations = extra.invocations.map((r: { attribution: { snapshotId?: string } }) =>
+        r.attribution?.snapshotId === "snap-1" ? { ...r, attribution: { ...r.attribution, snapshotId: `snap-${dispatchId}` } } : r);
+    }
     return runnerCallback.handleRunnerResult({
       authorization: `Bearer ${token}`,
-      body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1", attribution: attribution as never, ...(opts.extra ?? {}) },
+      body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1", attribution: attribution as never, ...extra },
       secret: SECRET,
       resolveProvider: makeResolve(new FakeProvider()),
     });
@@ -5622,9 +5627,9 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
     const fake = new FakeProvider({ recordCalls: true });
     const deliver = (attribution: unknown = claim({ snapshotId: "snap-managed-attr", usage: {
       availability: "complete", tokensIn: 100, tokensOut: 10, costUsd: null, costStatus: "unavailable",
-    } }), result = marker, bearer = token) => runnerCallback.handleRunnerResult({
+    } }), result = marker, bearer = token, extra: Record<string, unknown> = {}) => runnerCallback.handleRunnerResult({
       authorization: `Bearer ${bearer}`, secret: SECRET,
-      body: { phase: "gap-analysis", outcome: "success", comments: [], reviewFix: result, attribution: attribution as never },
+      body: { phase: "gap-analysis", outcome: "success", comments: [], reviewFix: result, attribution: attribution as never, ...extra },
       resolveProvider: makeResolve(fake),
       onReviewFixResult: (value) => store.recordResult(value.attemptId, value, Date.now()),
     });
@@ -5644,6 +5649,24 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
     }});
     expect(await facade.getAttempt(c.attemptId, {role: "user", email: "user@example.com"})).toEqual({status: "not_found"});
     expect(c.fake.recordedCalls()).toEqual([]);
+  });
+
+  it("stores the managed invocation list and pushed SHAs, drops snapshot mismatches, and is idempotent (AII-1562)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const c = await managedResult();
+    const rec = (id: string, over: Record<string, unknown> = {}) => ({
+      attribution: claim({ invocationId: id, snapshotId: "snap-managed-attr", ...over }),
+      cacheReadTokens: 5, cacheCreationTokens: 2, attempts: 2,
+    });
+    const sha = "c".repeat(40);
+    const extra = { invocations: [rec("m-1"), rec("m-2"), rec("m-bad", { model: "another-model" })], pushedCommits: [sha] };
+    expect(await c.deliver(undefined, undefined, undefined, extra)).toMatchObject({ status: 200, body: { outcome: "stored" } });
+    expect(rows().map((r) => r.invocation_id).sort()).toEqual(["inv-1", "m-1", "m-2"]);
+    expect(JSON.parse(rows().find((r) => r.invocation_id === "m-1")!.usage_json as string)).toMatchObject({ cacheReadTokens: 5, cacheCreationTokens: 2, attempts: 2 });
+    expect(log.getPushedCommits(c.attemptId)).toEqual([sha]);
+    expect(warn.mock.calls.map((x) => x.join(" ")).join("\n")).toContain("Dropped 1 managed attribution record(s)");
+    await c.deliver(undefined, undefined, undefined, extra);
+    expect(rows()).toHaveLength(3);
   });
 
   it("repairs missing managed attribution on duplicate delivery without duplicating spend or legacy effects", async () => {
@@ -5772,6 +5795,83 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
     await deliver(claim());
     await deliver(claim(), { dispatchId: "disp-2" });
     expect(rows()).toHaveLength(1);
+  });
+
+  describe("job accounting lists (AII-1562)", () => {
+    const SHA_A = "a".repeat(40);
+    const SHA_B = "b".repeat(40);
+    const record = (id: string, stageName: string, over: Record<string, unknown> = {}, rec: Record<string, unknown> = {}) => ({
+      attribution: claim({ invocationId: id, stage: stageName, ...over }),
+      cacheReadTokens: 7,
+      cacheCreationTokens: 3,
+      attempts: 1,
+      ...rec,
+    });
+    const threePass = () => [
+      record("impl-1", "implementation"),
+      record("review-1", "review"),
+      record("impl-2", "implementation", {}, { attempts: 2 }),
+      record("review-2", "review"),
+      record("impl-3", "implementation"),
+    ];
+    const usageOf = (id: string) => JSON.parse(rows().find((r) => r.invocation_id === id)!.usage_json as string);
+
+    it("stores every invocation with cache tokens and attempts, and keeps the legacy read on the implement row", async () => {
+      const res = await deliver(claim({ invocationId: "impl-3" }), { extra: { invocations: threePass(), pushedCommits: [SHA_A, SHA_B] } });
+      expect(res.status).toBe(200);
+      expect(rows().map((r) => r.invocation_id)).toEqual(["impl-1", "review-1", "impl-2", "review-2", "impl-3"]);
+      expect(usageOf("impl-2")).toMatchObject({ cacheReadTokens: 7, cacheCreationTokens: 3, attempts: 2 });
+      expect(usageOf("impl-1")).toMatchObject({ cacheReadTokens: 7, cacheCreationTokens: 3, attempts: 1 });
+      expect(log.getJobByDispatchId("disp-attr")!.attribution).toMatchObject({ invocationId: "impl-3", stage: "implementation" });
+    });
+
+    it("stores nothing twice when the same body is delivered again", async () => {
+      const extra = { invocations: threePass(), pushedCommits: [SHA_A, SHA_B] };
+      await deliver(claim({ invocationId: "impl-3" }), { extra });
+      dedup.getDb().prepare("DELETE FROM runner_tokens").run();
+      await deliver(claim({ invocationId: "impl-3" }), { extra });
+      expect(rows()).toHaveLength(5);
+      expect(log.getPushedCommits("disp-attr")).toEqual([SHA_A, SHA_B]);
+    });
+
+    it("stores an invocation without usage as unavailable with null cost, never zero", async () => {
+      await deliver(undefined, { extra: { invocations: [record("no-usage", "review", { usage: null, outcome: "error" }, { cacheReadTokens: null, cacheCreationTokens: null })] } });
+      expect(usageOf("no-usage")).toMatchObject({ availability: "unavailable", tokensIn: null, tokensOut: null, costUsd: null, costStatus: "unavailable" });
+    });
+
+    it("keeps pushed SHAs in order, an empty list as empty, and an absent field as unknown", async () => {
+      await deliver(undefined, { dispatchId: "d-two", extra: { pushedCommits: [SHA_B, SHA_A] } });
+      await deliver(undefined, { dispatchId: "d-none", extra: { pushedCommits: [] } });
+      await deliver(undefined, { dispatchId: "d-old" });
+      expect(log.getPushedCommits("d-two")).toEqual([SHA_B, SHA_A]);
+      expect(log.getPushedCommits("d-none")).toEqual([]);
+      expect(log.getPushedCommits("d-old")).toBeNull();
+    });
+
+    it("drops malformed and snapshot-mismatched entries by count without failing the callback", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const res = await deliver(undefined, {
+        extra: {
+          invocations: [
+            record("ok-1", "implementation"),
+            { attribution: { ...claim(), apiKey: PLANTED }, cacheReadTokens: 0, cacheCreationTokens: 0, attempts: 1 },
+            record("bad-attempts", "implementation", {}, { attempts: 0 }),
+            record("other-snap", "implementation", { snapshotId: "other-snap" }),
+          ],
+          pushedCommits: ["not-a-sha"],
+        },
+      });
+      expect(res.status).toBe(200);
+      expect(rows().map((r) => r.invocation_id)).toEqual(["ok-1"]);
+      expect(log.getPushedCommits("disp-attr")).toBeNull();
+      expect(warn.mock.calls.join(" ")).not.toContain(PLANTED);
+    });
+
+    it("stores a body with only the legacy attribution as one row", async () => {
+      await deliver(claim());
+      expect(rows()).toHaveLength(1);
+      expect(usageOf("inv-1")).toMatchObject({ cacheReadTokens: null, cacheCreationTokens: null, attempts: 1 });
+    });
   });
 
   it("keeps legacy dispatches (no snapshot) readable with no row and no inferred cost", async () => {

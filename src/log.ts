@@ -1052,6 +1052,29 @@ export function getInvocationAttribution(dispatchId: string): InvocationAttribut
   return readAttributionsByDispatch([dispatchId]).get(dispatchId) ?? null;
 }
 
+/** Stores the SHAs a job pushed (oldest first; may be empty). Insert-or-ignore, so a retried callback never rewrites them. */
+export function recordPushedCommits(dispatchId: string, shas: readonly string[], now: number = Date.now()): boolean {
+  const info = getDb()
+    .prepare(`INSERT OR IGNORE INTO dispatch_pushed_commits (dispatch_id, shas_json, recorded_at) VALUES (?, ?, ?)`)
+    .run(dispatchId, JSON.stringify(shas), now);
+  return info.changes > 0;
+}
+
+/** The SHAs stored for a dispatch, in push order; `null` when the runner never reported them (distinct from `[]`). */
+export function getPushedCommits(dispatchId: string): string[] | null {
+  try {
+    const row = getDb().prepare(`SELECT shas_json FROM dispatch_pushed_commits WHERE dispatch_id = ?`).get(dispatchId) as
+      | { shas_json: string }
+      | undefined;
+    if (!row) return null;
+    const parsed: unknown = JSON.parse(row.shas_json);
+    return Array.isArray(parsed) && parsed.every((v) => typeof v === "string") ? (parsed as string[]) : null;
+  } catch (err) {
+    warnAttributionReadFailure(err);
+    return null;
+  }
+}
+
 const INVOCATION_STATUS: Record<InvocationUsageRow["outcome"], string> = {
   success: "succeeded",
   max_turns: "failed",
