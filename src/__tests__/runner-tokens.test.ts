@@ -595,3 +595,20 @@ describe("mintLaunchTokens", () => {
     expect(() => runnerTokens.mintLaunchTokens({ ...base, phase: "implementation", dispatchId: "d-4", repository: "bad" })).toThrow(/owner\/repository/);
   });
 });
+
+describe("implementationTtlSeconds", () => {
+  it("keeps the 2 h floor for the default, null and invalid timeouts", () => {
+    for (const v of [undefined, null, 0, -5, 1.5, NaN]) {
+      expect(runnerTokens.implementationTtlSeconds(v)).toBe(runnerTokens.IMPLEMENTATION_TTL_SECONDS);
+    }
+  });
+
+  it("adds the grace to a long job timeout", () => {
+    expect(runnerTokens.implementationTtlSeconds(240)).toBe(15300);
+  });
+
+  it("is exactly the floor at 105 minutes and grows past it", () => {
+    expect(runnerTokens.implementationTtlSeconds(105)).toBe(7200);
+    expect(runnerTokens.implementationTtlSeconds(106)).toBe(7260);
+  });
+});

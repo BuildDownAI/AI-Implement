@@ -96,7 +96,7 @@ import { getOrchestratorSettings, getRunnerBackendSource, getFlySessionsConfig, 
 import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, resubmitPendingGapFillReviews, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
-import { mintLaunchTokens, IMPLEMENTATION_TTL_SECONDS, type LaunchTokens } from "./runner-tokens.js";
+import { mintLaunchTokens, implementationTtlSeconds, type LaunchTokens } from "./runner-tokens.js";
 import { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
 import { createReviewFixAdminFacade } from "./review-fix-admin-facade.js";
 import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "./review-fix-worker.js";
@@ -1863,7 +1863,7 @@ export async function dispatchFlyMachine(
 
   await dispatchSession(config, provider, issue, mapping, prior, runnerMode, {
     phase: "implementation",
-    tokenTtlSeconds: IMPLEMENTATION_TTL_SECONDS,
+    tokenTtlSeconds: implementationTtlSeconds(mapping.maxJobMinutes),
     doMarkDispatched: !shadow,
     shadow,
     backendKind: "fly-machines",
@@ -1906,7 +1906,7 @@ export async function dispatchLocalDocker(
 
   await dispatchSession(config, provider, issue, mapping, prior, runnerMode, {
     phase: "implementation",
-    tokenTtlSeconds: IMPLEMENTATION_TTL_SECONDS,
+    tokenTtlSeconds: implementationTtlSeconds(mapping.maxJobMinutes),
     doMarkDispatched: true,
     shadow: false,
     backendKind: "local-docker",
@@ -3515,7 +3515,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           mappingTeamKey: scopeKey,
           phase: "gap-analysis",
           dispatchId,
-          ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+          ttlSeconds: implementationTtlSeconds(mapping.maxJobMinutes),
           secret: config.runnerTokenSecret,
           repository: `${mapping.owner}/${mapping.repo}`,
         });

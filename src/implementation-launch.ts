@@ -27,7 +27,7 @@ import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-p
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { recordDispatchFailure } from "./dispatch-breaker.js";
 import { getInstallationToken, getScopedInstallationToken } from "./github-app-auth.js";
-import { mintLaunchTokens, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
+import { mintLaunchTokens, implementationTtlSeconds } from "./runner-tokens.js";
 import { createMachine, buildSessionMachineConfig, listAppSecrets } from "./fly-machines.js";
 import { startLocalRunnerContainer, validateProtectedLocalInput, type LocalRunnerInput, type StartLocalContainerInput } from "./local-docker.js";
 import type { ModelAuthRuntime } from "./model-auth-runtime.js";
@@ -101,7 +101,7 @@ export async function prepareImplementationLaunch(args: PrepareImplementationLau
         phase: "implementation",
         dispatchId,
         repository: `${mapping.owner}/${mapping.repo}`,
-        ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+        ttlSeconds: implementationTtlSeconds(mapping.maxJobMinutes),
         secret: config.runnerTokenSecret,
       });
       runnerCallbackUrl = config.runnerCallbackBaseUrl;

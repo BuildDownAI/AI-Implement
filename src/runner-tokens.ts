@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { getDb } from "./dedup.js";
+import { JOB_TTL_GRACE_MINUTES, normalizeGithubActionsJobTimeoutMinutes } from "./github-actions-watchdog.js";
 
 export type RunTokenAudience = "result" | "progress" | "publication";
 
@@ -42,6 +43,12 @@ export type VerifyResult =
 export const PLANNING_TTL_SECONDS = 30 * 60;
 export const IMPLEMENTATION_TTL_SECONDS = 2 * 60 * 60;
 export const GAP_ANALYSIS_TTL_SECONDS = 30 * 60;
+
+/** Implementation token TTL: outlives the project's job timeout plus grace, never below the 2 h floor. */
+export function implementationTtlSeconds(maxJobMinutes: number | null | undefined): number {
+  const minutes = normalizeGithubActionsJobTimeoutMinutes(maxJobMinutes) + JOB_TTL_GRACE_MINUTES;
+  return Math.max(IMPLEMENTATION_TTL_SECONDS, minutes * 60);
+}
 
 // Distinguish consecutive claims even if they occur in the same millisecond.
 // The claim stamp is a consumed-at timestamp, not a token or a secret.

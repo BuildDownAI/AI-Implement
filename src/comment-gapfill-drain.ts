@@ -13,7 +13,7 @@ import { claimPendingCommentGapfills, markCommentGapfillProcessed } from "./comm
 import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getInFlightJobs, appendLog, countPriorDispatches, updateJobPrUrl, suppressStaleNotifications, type Job } from "./log.js";
 import { hasEphemeralFullAccessOptIn } from "./model-auth-contract.js";
 import { checkForcedPathEligibility, resolveExecutionPath, getFlySecretsMinVersion, getFlyProcessLevelSecrets, type RunnerMode } from "./runner-mode.js";
-import { mintLaunchTokens, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
+import { mintLaunchTokens, implementationTtlSeconds } from "./runner-tokens.js";
 import { buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, capRunnerEnv, branchPrefixRunnerEnv, skillsRepoRunnerEnv, getPullRequestState, type DispatchResult } from "./github.js";
 import { buildRunConfig, encodeRunConfig, type RunConfigV1, type RunCredentialsV1 } from "./run-config.js";
 import { getRetryPolicy } from "./orchestrator-settings.js";
@@ -375,7 +375,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           mappingTeamKey: scopeKey,
           phase: "gap-analysis",
           dispatchId,
-          ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+          ttlSeconds: implementationTtlSeconds(mapping.maxJobMinutes),
           secret: opts.runnerTokenSecret,
           repository: `${mapping.owner}/${mapping.repo}`,
         });
