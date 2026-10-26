@@ -305,6 +305,15 @@ function createAgentConfigurationTables(): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_model_invocation_attribution_dispatch
     ON model_invocation_attribution(dispatch_id, stage)`);
+  // The SHAs a job pushed, oldest first, as a JSON array (AII-1562). No row = the runner did not
+  // report; '[]' = it reported that nothing was pushed.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS dispatch_pushed_commits (
+      dispatch_id TEXT PRIMARY KEY,
+      shas_json TEXT NOT NULL,
+      recorded_at INTEGER NOT NULL
+    )
+  `);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trg_model_profile_reservations_owner_immutable
     BEFORE UPDATE OF profile_id, dispatch_id, owner_generation, owner_kind ON model_profile_reservations
     WHEN NEW.profile_id <> OLD.profile_id

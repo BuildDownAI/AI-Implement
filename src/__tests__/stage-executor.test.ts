@@ -8,6 +8,7 @@ import { CODEX_SKILLS_SUBDIR } from "../pipeline/steps/install-skills.js";
 import { AgentRecoveryRequiredError, AgentStageError, createStageExecutor, safeLimitLabel, safeModelLabel } from "../pipeline/stage-executor.js";
 import { ClaudeCliExecutor } from "../pipeline/executor.js";
 import { CodexRecoveryRequiredError } from "../pipeline/codex-executor.js";
+import { collectedInvocations, resetJobAccounting } from "../pipeline/job-accounting.js";
 import { normalizeInvocation } from "../agent-usage.js";
 import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
 import type { ModelAuthClient, ModelInvocation } from "../model-auth-client.js";
@@ -120,6 +121,32 @@ describe("createStageExecutor", () => {
     expect(claude.invoke.mock.calls[0][0]).toMatchObject({ model: "claude-impl", invocationTimeoutMs: 2000, maxTurns: 7 });
     // Codex wraps its own auth; only Claude goes through the selector's single auth.invoke.
     expect(events).toEqual(["invoke:p-impl", "checkpoint"]);
+  });
+
+  it("records every invocation for job accounting, including repeated stage calls, failures and missing usage", async () => {
+    resetJobAccounting();
+    const withCache: LLMResult = {
+      ...ok,
+      attempts: 2,
+      telemetry: { outcome: "success", numTurns: 1, durationMs: 5, costUsd: 0.25, tokensIn: 20, tokensOut: 4, cacheReadTokens: 12, cacheCreationTokens: 6 },
+    };
+    const noUsage: LLMResult = { stdout: "ok", exitCode: 0, tokensUsed: 0 };
+    const results = [withCache, withCache, noUsage];
+    const claude = { invoke: vi.fn(async () => results.shift()!) };
+    const ex = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot, auth: fakeAuth(), createClaude: () => claude as never });
+    await ex.invoke({ ...base, agentStage: "implementation" });
+    await ex.invoke({ ...base, agentStage: "implementation" });
+    await ex.invoke({ ...base, agentStage: "implementation" });
+    claude.invoke.mockRejectedValueOnce(Object.assign(new Error("boom"), { attempts: 3 }));
+    await expect(ex.invoke({ ...base, agentStage: "implementation" })).rejects.toThrow("boom");
+
+    const recorded = collectedInvocations();
+    expect(recorded).toHaveLength(4);
+    expect(new Set(recorded.map((r) => r.attribution.invocationId)).size).toBe(4);
+    expect(recorded[0]).toMatchObject({ cacheReadTokens: 12, cacheCreationTokens: 6, attempts: 2, attribution: { usage: { costUsd: 0.25, tokensIn: 20 } } });
+    expect(recorded[2]).toMatchObject({ cacheReadTokens: null, attempts: 1, attribution: { usage: null } });
+    expect(recorded[3]).toMatchObject({ attempts: 3, attribution: { outcome: "error" } });
+    resetJobAccounting();
   });
 
   it.each([undefined, "bogus", "implement", "Planning"])("rejects agentStage %s before any auth or executor call", async (agentStage) => {

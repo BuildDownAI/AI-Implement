@@ -64,6 +64,34 @@ describe("readAttributionsByDispatch failures", () => {
 });
 
 describe("selected invocation attribution through the Job read model", () => {
+  function insertStage(invocationId: string, dispatchId: string, stage: string) {
+    dedup.getDb().prepare(`INSERT INTO model_invocation_attribution
+      (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode,
+       config_revision_id, snapshot_id, status, started_at, completed_at, usage_json)
+      VALUES (?, ?, ?, 'p1', 1, 'codex', 'openai', 'm', 'openai-api-key', NULL, ?, 'succeeded', 1, 2, ?)`)
+      .run(invocationId, dispatchId, stage, `snap-${dispatchId}`, JSON.stringify({
+        availability: "complete", tokensIn: 1, tokensOut: 1, costUsd: null, costStatus: "unavailable", outcome: "success",
+      }));
+  }
+
+  it("keeps the last stored row as the Job attribution when many rows exist for a dispatch", () => {
+    job("d-many");
+    for (const [id, stage] of [["i1", "implementation"], ["r1", "review"], ["i2", "implementation"], ["r2", "review"], ["i3", "implementation"]]) {
+      insertStage(id, "d-many", stage);
+    }
+    expect(log.getJobByDispatchId("d-many")!.attribution).toMatchObject({ invocationId: "i3", stage: "implementation" });
+    expect(log.getInvocationAttribution("d-many")).toMatchObject({ invocationId: "i3" });
+  });
+
+  it("stores pushed commits once per dispatch and tells an empty list from an unreported one", () => {
+    expect(log.recordPushedCommits("d-sha", ["a".repeat(40)])).toBe(true);
+    expect(log.recordPushedCommits("d-sha", ["b".repeat(40)])).toBe(false);
+    expect(log.recordPushedCommits("d-empty", [])).toBe(true);
+    expect(log.getPushedCommits("d-sha")).toEqual(["a".repeat(40)]);
+    expect(log.getPushedCommits("d-empty")).toEqual([]);
+    expect(log.getPushedCommits("d-never")).toBeNull();
+  });
+
   function insert(invocationId: string, dispatchId: string, model: string, tokensIn: number) {
     dedup.getDb().prepare(`INSERT INTO model_invocation_attribution
       (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode,

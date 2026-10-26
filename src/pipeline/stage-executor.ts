@@ -12,6 +12,7 @@ import { CodexExecutor, CodexRecoveryRequiredError, type CodexExecutorOptions } 
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { CODEX_SKILLS_SUBDIR } from "./steps/install-skills.js";
+import { recordInvocation } from "./job-accounting.js";
 import { createCodexPlanningDriver, createCodexReviewDriver } from "./codex-planning-adapter.js";
 import {
   sanitizeAttribution,
@@ -204,7 +205,9 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
         } else {
           result = await getCodex(profileId, stage).invoke(call);
         }
-        return withAttribution(result, attribute(result.failure ? "error" : "success", result.telemetry));
+        const attribution = attribute(result.failure ? "error" : "success", result.telemetry);
+        recordInvocationOf(attribution, result.telemetry, result.attempts);
+        return withAttribution(result, attribution);
       } catch (err) {
         // A Codex executor that holds (child not terminated, auth sync or checkpoint uncertain) holds the
         // profile for every stage; the error itself propagates unchanged.
@@ -218,11 +221,23 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
           const attribution = attribute("error", carried);
           Object.assign(err, { attribution });
           if (carried) carried.attribution = attribution;
+          recordInvocationOf(attribution, carried, (err as { attempts?: number }).attempts);
         }
         throw err;
       }
     },
   };
+}
+
+/** Adds one finished (or failed) invocation to the job's accounting list; missing usage stays null, never 0. */
+function recordInvocationOf(attribution: InvocationAttributionV1, telemetry: RunTelemetry | undefined, attempts: number | undefined): void {
+  const count = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null);
+  recordInvocation({
+    attribution,
+    cacheReadTokens: count(telemetry?.cacheReadTokens),
+    cacheCreationTokens: count(telemetry?.cacheCreationTokens),
+    attempts: Number.isSafeInteger(attempts) && (attempts as number) >= 1 ? (attempts as number) : 1,
+  });
 }
 
 function requireStage(value: unknown): StageName {
