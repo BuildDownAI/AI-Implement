@@ -149,10 +149,10 @@ describe("Fly and local never accept the opt-in or the launch variable", () => {
 
 describe("every GHA dispatch writer agrees on the policy", () => {
   const read = (f: string) => readFileSync(f, "utf-8");
-  const writers = ["src/index.ts", "src/comment-gapfill-drain.ts", "src/planning-launch.ts"];
+  const writers = ["src/index.ts", "src/comment-gapfill-drain.ts", "src/implementation-launch.ts", "src/planning-launch.ts"];
 
   it("implementation-phase writers mark their phase and guard the workflow capability", () => {
-    for (const f of ["src/index.ts", "src/comment-gapfill-drain.ts"]) {
+    for (const f of ["src/index.ts", "src/comment-gapfill-drain.ts", "src/implementation-launch.ts"]) {
       const text = read(f);
       expect(text, f).toMatch(/ghaManagedCredentials\([^)]*\{ extraEnv: mapping\.extraEnv \}\)/);
       expect(text, f).toContain("assertExecutionPolicyCapability(");
