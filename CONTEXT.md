@@ -164,6 +164,12 @@ A review-fix attempt is one authorized runner execution that addresses review fe
 
 **Not to be confused with:** A review-fix run, which is the orchestrator dispatch that may contain a Restate-tracked attempt; or an internal review/fix cycle within the runner.
 
+## Implementation attempt
+
+An implementation attempt is one dispatch of one issue for implementation: one dispatch id, one reservation, and, on a `restate` project, one `ImplementationRun`. A stuck attempt is stopped; a retry is a new attempt with a new dispatch id.
+
+**Not to be confused with:** An implementation pass, which is one implement-and-review cycle inside the runner; or a gap-fill run, which is dispatched from a PR comment.
+
 ## Lifecycle owner
 
 The lifecycle owner is the system responsible for coordinating one attempt from admission to its final outcome. An attempt keeps its owner when an operator changes the setting for future attempts.
