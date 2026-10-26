@@ -31,6 +31,10 @@ export const BASE_ENV_ALLOWLIST: EnvAllowlist = {
       "An operator switch, not machine state. " +
       "Set, planning-launch.test.ts rewrites fixtures/planning-opted-out.json instead of comparing against it. " +
       "Deleted, a regeneration run only compares.",
+    UPDATE_JOURNAL_SNAPSHOTS:
+      "An operator switch, not machine state. " +
+      "Set to 1, implementation-run-journal.restate.test.ts rewrites its journal snapshots instead of comparing against them. " +
+      "Deleted, a regeneration run only compares.",
   },
   prefixes: {},
   pinned: {
