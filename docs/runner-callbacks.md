@@ -24,6 +24,8 @@ sequenceDiagram
     R->>O: POST /runner/result (result token, consumed on first use)
 ```
 
+**Token lifetime.** Implementation and gap-analysis launch tokens (`RUN_TOKEN`, `RUN_PROGRESS_TOKEN`, `RUN_PUBLICATION_TOKEN`) expire after `implementationTtlSeconds(mapping.maxJobMinutes)` (`src/runner-tokens.ts`): the larger of 2 hours and the normalized job timeout plus the 15-minute grace (`JOB_TTL_GRACE_MINUTES`). The default 90-minute timeout therefore still gives 2 hours, and `maxJobMinutes` 240 gives 4 h 15 min, so a long run can still report. An invalid timeout falls back to the 90-minute default. Planning tokens keep `PLANNING_TTL_SECONDS`. The mint sites are `src/implementation-launch.ts`, `dispatchFlyMachine` and `dispatchLocalDocker` (through `tokenTtlSeconds`) and `processReviewFixQueue` in `src/index.ts`, and `src/comment-gapfill-drain.ts`.
+
 **A 2xx from `/runner/result` means the callback was recorded.** A result that cannot be recorded answers a coded 4xx, which the runner logs as `POST failed`: `409 mapping_not_found` (the token's mapping key resolves to no mapping; the body names the key) and, for planning, `404 job_not_found` (no job row for the dispatch; checked before any comment is posted). Either answer follows token consumption, so a retry gets `already_consumed`. A duplicate callback for an already closed row stays 200. `mintRunToken` refuses an empty mapping key, so no token is minted that could hit this.
 
 ## Credentials
