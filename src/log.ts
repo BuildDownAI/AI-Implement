@@ -8,6 +8,8 @@ import { read as readAdmission, release as releaseAdmission } from "./dispatch-a
 import { REVIEW_FIX_EVIDENCE_RETENTION_MS } from "./review-fix-evidence.js";
 
 const MAX_LOG_ENTRIES = 500;
+/** A finished dispatch_log row is never pruned for this long, so its accounting record can be pulled. */
+const FINISHED_JOB_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 export type JobStatus =
   | "unknown"
@@ -333,11 +335,14 @@ export function appendLog(entry: {
   // dispatch_id) that is still unresolved (review_fix_attempts.completed_at IS
   // NULL) or completed within the last 7 days (AII-795). A terminal attempt
   // stays exempt while reservation, result conflict, or execution
-  // identity is unresolved, matching review-fix-evidence's retention guard.
+  // identity is unresolved, matching review-fix-evidence's retention guard. A finished row
+  // (completed_at set) younger than 7 days is also kept, so the control plane can pull its
+  // accounting record (AII-1564); that guard can hold the table above MAX_LOG_ENTRIES.
   db.prepare(
     `DELETE FROM dispatch_log
      WHERE machine_nonce IS NULL
        AND id NOT IN (SELECT id FROM dispatch_log ORDER BY dispatched_at DESC LIMIT ?)
+       AND NOT (completed_at IS NOT NULL AND completed_at >= ?)
        AND (
          dispatch_id IS NULL
          OR NOT EXISTS (
@@ -351,7 +356,7 @@ export function appendLog(entry: {
              )
          )
        )`,
-  ).run(MAX_LOG_ENTRIES, Date.now() - REVIEW_FIX_EVIDENCE_RETENTION_MS);
+  ).run(MAX_LOG_ENTRIES, Date.now() - FINISHED_JOB_RETENTION_MS, Date.now() - REVIEW_FIX_EVIDENCE_RETENTION_MS);
 
   return Number(result.lastInsertRowid);
 }

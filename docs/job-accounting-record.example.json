@@ -1,0 +1,63 @@
+{
+  "records": [
+    {
+      "dispatchId": "7f3c2a10-5b8e-4d1f-9a6c-0e2b4c8d1a55",
+      "phase": "implementation",
+      "status": "completed",
+      "conclusion": "runner_approved",
+      "lifecycleOwner": "restate",
+      "dispatchedAt": 1793000000000,
+      "completedAt": 1793000900000,
+      "issue": {
+        "identifier": "AII-1234",
+        "title": "Example issue",
+        "repo": "BuildDownAI/example",
+        "trackerKind": "linear",
+        "url": "https://linear.app/eudoxus/issue/AII-1234"
+      },
+      "pr": { "url": "https://github.com/BuildDownAI/example/pull/42", "number": 42 },
+      "pushedShas": ["0123456789abcdef0123456789abcdef01234567"],
+      "usage": "reported",
+      "invocations": [
+        {
+          "stage": "implementation",
+          "agent": "claude",
+          "provider": "anthropic",
+          "model": "claude-sonnet-5-5",
+          "status": "succeeded",
+          "tokensIn": 120000,
+          "tokensOut": 8000,
+          "cacheReadTokens": 90000,
+          "cacheCreationTokens": 20000,
+          "costUsd": 1.25,
+          "costStatus": "reported",
+          "attempts": 1
+        },
+        {
+          "stage": "review",
+          "agent": "codex",
+          "provider": "openai",
+          "model": "example-review-model",
+          "status": "succeeded",
+          "tokensIn": null,
+          "tokensOut": null,
+          "cacheReadTokens": null,
+          "cacheCreationTokens": null,
+          "costUsd": null,
+          "costStatus": "unavailable",
+          "attempts": 2
+        }
+      ],
+      "compute": {
+        "backend": "fly-machines",
+        "cpuKind": "shared",
+        "cpus": 4,
+        "memoryMb": 8192,
+        "startedAt": 1793000010000,
+        "stoppedAt": 1793000890000
+      }
+    }
+  ],
+  "nextCursor": { "completedAt": 1793000900000, "dispatchId": "7f3c2a10-5b8e-4d1f-9a6c-0e2b4c8d1a55" },
+  "oldestRetainedCompletedAt": 1792400000000
+}
