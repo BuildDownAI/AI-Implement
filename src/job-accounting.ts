@@ -36,13 +36,14 @@ export function trackerAccounting(
   return { trackerKind: mapping.ticketingProvider, issueUrl };
 }
 
-/** A job must have finished this long ago before it is returned, so a late status write does not change a read record. */
+/** A record is returned only this long after its last change (`changed_at`), so a burst of late writes settles first. */
 export const JOB_ACCOUNTING_SETTLE_MS = 10 * 60 * 1000;
 export const JOB_ACCOUNTING_DEFAULT_PAGE_SIZE = 100;
 export const JOB_ACCOUNTING_MAX_PAGE_SIZE = 200;
 
+/** Position in the walk: records are ordered by `(changedAt, dispatchId)`; a changed job comes back after the cursor. */
 export const JobAccountingCursorSchema = z.object({
-  completedAt: z.number().int().nonnegative().safe(),
+  changedAt: z.number().int().nonnegative().safe(),
   dispatchId: z.string().min(1).max(200),
 });
 export type JobAccountingCursor = z.infer<typeof JobAccountingCursorSchema>;
@@ -80,6 +81,8 @@ export const JobAccountingRecordSchema = z.object({
   lifecycleOwner: z.enum(["legacy", "restate"]),
   dispatchedAt: z.number().int(),
   completedAt: z.number().int(),
+  /** When this record last changed (epoch ms). A job that changes is served again; the newest copy replaces older ones. */
+  changedAt: z.number().int(),
   issue: z.object({
     identifier: nullableString,
     title: nullableString,
@@ -90,8 +93,11 @@ export const JobAccountingRecordSchema = z.object({
   pr: z.object({ url: nullableString, number: nullableInt }),
   /** Null when the runner never reported the pushed SHAs; `[]` when it reported that nothing was pushed. */
   pushedShas: z.array(z.string()).nullable(),
-  /** `unknown` when no invocation row exists — an empty `invocations` list must never be read as $0. */
-  usage: z.enum(["unknown", "reported"]),
+  /**
+   * `reported` only when the runner's `invocations` list arrived whole; `partial` when some invocation rows exist
+   * without that (cost may be too low); `unknown` when none exist — an empty `invocations` list must never be read as $0.
+   */
+  usage: z.enum(["unknown", "partial", "reported"]),
   invocations: z.array(JobAccountingInvocationSchema),
   compute: z.object({
     backend: nullableString,
@@ -108,24 +114,27 @@ export const JobAccountingPageSchema = z.object({
   records: z.array(JobAccountingRecordSchema),
   /** The cursor to pass for the next page; null when this page was not full (the walk is at the end). */
   nextCursor: JobAccountingCursorSchema.nullable(),
-  /** The oldest finished job the orchestrator still holds (settled or not); null when it holds none. */
+  /** The oldest finished job the orchestrator still holds (settled or not); null when it holds none. Information only. */
   oldestRetainedCompletedAt: nullableInt,
+  /** The newest `(changedAt, dispatchId)` of any finished job that was pruned; null when none was. A cursor behind it may have missed records. */
+  prunedThrough: JobAccountingCursorSchema.nullable(),
 });
 export type JobAccountingPage = z.infer<typeof JobAccountingPageSchema>;
 
-// The union of the two finished-job sources, keyed by (completed_at, dispatch_id). A dispatch_log row
+// The union of the two finished-job sources, keyed by (changed_at, dispatch_id); a row with no changed_at
+// (inserted already finished) is keyed by completed_at. A dispatch_log row
 // without a dispatch_id (old rows) gets the synthetic id `log-<id>`. A review-fix attempt that also has a
 // dispatch_log row is reported once, from the dispatch_log side.
 const FINISHED_SOURCES = `
-  SELECT 'log' AS src, id AS row_id, COALESCE(dispatch_id, 'log-' || id) AS jid, completed_at AS done_at
+  SELECT 'log' AS src, id AS row_id, COALESCE(dispatch_id, 'log-' || id) AS jid, completed_at AS done_at, COALESCE(changed_at, completed_at) AS changed
     FROM dispatch_log WHERE completed_at IS NOT NULL
   UNION ALL
-  SELECT 'fix' AS src, 0 AS row_id, dispatch_id AS jid, completed_at AS done_at
+  SELECT 'fix' AS src, 0 AS row_id, dispatch_id AS jid, completed_at AS done_at, COALESCE(changed_at, completed_at) AS changed
     FROM review_fix_attempts a
     WHERE completed_at IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM dispatch_log l WHERE l.dispatch_id = a.dispatch_id)`;
 
-interface KeyRow { src: "log" | "fix"; row_id: number; jid: string; done_at: number }
+interface KeyRow { src: "log" | "fix"; row_id: number; jid: string; done_at: number; changed: number }
 
 interface LogRow {
   id: number;
@@ -216,7 +225,7 @@ function parseShas(raw: string): string[] | null {
   }
 }
 
-/** One page of finished-job accounting records, oldest first, strictly after `cursor`. */
+/** One page of finished-job accounting records by last change, oldest first, strictly after `cursor`. A changed job is served again. */
 export function listJobAccounting(
   opts: { cursor?: JobAccountingCursor; pageSize?: number; now?: number } = {},
 ): JobAccountingPage {
@@ -227,16 +236,20 @@ export function listJobAccounting(
 
   const oldest = db.prepare(`SELECT MIN(done_at) AS oldest FROM (${FINISHED_SOURCES})`).get() as { oldest: number | null };
 
+  const pruned = db.prepare(`SELECT changed_at, jid FROM job_accounting_pruned WHERE id = 1`).get() as
+    | { changed_at: number; jid: string }
+    | undefined;
+
   const params: unknown[] = [settledBefore];
   let after = "";
   if (opts.cursor) {
-    after = "AND (done_at > ? OR (done_at = ? AND jid > ?))";
-    params.push(opts.cursor.completedAt, opts.cursor.completedAt, opts.cursor.dispatchId);
+    after = "AND (changed > ? OR (changed = ? AND jid > ?))";
+    params.push(opts.cursor.changedAt, opts.cursor.changedAt, opts.cursor.dispatchId);
   }
   const keys = db
     .prepare(
-      `SELECT src, row_id, jid, done_at FROM (${FINISHED_SOURCES})
-       WHERE done_at <= ? ${after} ORDER BY done_at ASC, jid ASC LIMIT ?`,
+      `SELECT src, row_id, jid, done_at, changed FROM (${FINISHED_SOURCES})
+       WHERE changed <= ? ${after} ORDER BY changed ASC, jid ASC LIMIT ?`,
     )
     .all(...params, pageSize) as KeyRow[];
 
@@ -269,7 +282,7 @@ export function listJobAccounting(
 
   const invocations = new Map<string, InvocationRow[]>();
   const owners = new Map<string, string>();
-  const shas = new Map<string, string[] | null>();
+  const reports = new Map<string, { shas: string[] | null; complete: boolean }>();
   if (jids.length > 0) {
     const marks = placeholders(jids.length);
     for (const r of db
@@ -288,21 +301,26 @@ export function listJobAccounting(
       owners.set(r.dispatch_id, r.lifecycle_owner);
     }
     for (const r of db
-      .prepare(`SELECT dispatch_id, shas_json FROM dispatch_pushed_commits WHERE dispatch_id IN (${marks})`)
-      .all(...jids) as Array<{ dispatch_id: string; shas_json: string }>) {
-      shas.set(r.dispatch_id, parseShas(r.shas_json));
+      .prepare(`SELECT dispatch_id, pushed_shas_json, invocations_complete FROM dispatch_job_report WHERE dispatch_id IN (${marks})`)
+      .all(...jids) as Array<{ dispatch_id: string; pushed_shas_json: string | null; invocations_complete: number }>) {
+      reports.set(r.dispatch_id, {
+        shas: r.pushed_shas_json === null ? null : parseShas(r.pushed_shas_json),
+        complete: r.invocations_complete === 1,
+      });
     }
   }
 
   const records: JobAccountingRecord[] = [];
   for (const key of keys) {
     const rows = (invocations.get(key.jid) ?? []).map(toInvocation);
+    const report = reports.get(key.jid);
     const common = {
       dispatchId: key.jid,
       completedAt: key.done_at,
-      usage: rows.length > 0 ? ("reported" as const) : ("unknown" as const),
+      changedAt: key.changed,
+      usage: rows.length === 0 ? ("unknown" as const) : report?.complete ? ("reported" as const) : ("partial" as const),
       invocations: rows,
-      pushedShas: shas.get(key.jid) ?? null,
+      pushedShas: report?.shas ?? null,
     };
     if (key.src === "log") {
       const r = logRows.get(key.row_id);
@@ -357,11 +375,11 @@ export function listJobAccounting(
     }
   }
 
-  const last = records[records.length - 1];
+  const lastKey = keys[keys.length - 1];
   return {
     records,
-    nextCursor:
-      last && keys.length === pageSize ? { completedAt: last.completedAt, dispatchId: last.dispatchId } : null,
+    nextCursor: lastKey && keys.length === pageSize ? { changedAt: lastKey.changed, dispatchId: lastKey.jid } : null,
     oldestRetainedCompletedAt: oldest.oldest,
+    prunedThrough: pruned ? { changedAt: pruned.changed_at, dispatchId: pruned.jid } : null,
   };
 }

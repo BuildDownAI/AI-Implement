@@ -952,7 +952,7 @@ export const getReviewFixActivityTool = tool(
 );
 
 export const LIST_JOB_ACCOUNTING_DESCRIPTION =
-  "Returns one page of finished-job accounting records, oldest first: dispatch id, phase, status, conclusion, lifecycle owner, times, issue, PR, pushed SHAs, every model invocation (tokens, cost, cost status, attempts) and compute (backend, size, start, stop). Args: optional cursor { completedAt, dispatchId }, optional pageSize 1..200 (default 100). Returns records, nextCursor and oldestRetainedCompletedAt. Only jobs finished at least 10 minutes ago are returned. Read.";
+  "Returns one page of finished-job accounting records, oldest change first: dispatch id, phase, status, conclusion, lifecycle owner, times, changedAt, issue, PR, pushed SHAs, every model invocation (tokens, cost, cost status, attempts) and compute (backend, size, start, stop). A job that changes after it was served (a second terminal write, a late review conclusion, a late invocation row) is served again with a newer changedAt: the newest copy of a job replaces older ones. usage is reported only when the runner's invocation list arrived whole, partial when some invocation rows exist without that, unknown when none exist. Args: optional cursor { changedAt, dispatchId }, optional pageSize 1..200 (default 100). Returns records, nextCursor, oldestRetainedCompletedAt (information only) and prunedThrough ({ changedAt, dispatchId } of the newest finished job pruned, or null). A record is returned 10 minutes after its last change. Read.";
 
 export const listJobAccountingTool = tool(
   {

@@ -10,6 +10,7 @@ import type { InvocationAttributionV1, InvokeParams, LLMResult } from "./pipelin
 import { DEFAULT_MODEL } from "./pipeline/default-model.js";
 import { installSkills, skillAgentsForSnapshot } from "./pipeline/steps/install-skills.js";
 import { setupPlanningWritePolicy, type PlanningSkillInput, type PlanningWritePolicy } from "./planning-write-policy.js";
+import { resetJobAccounting } from "./pipeline/job-accounting.js";
 
 export type PlanningExecutor = (
   prompt: string,
@@ -369,6 +370,8 @@ function recoverCallbackUrl(encoded: string): string | undefined {
 }
 
 export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exitCode: number; attribution?: InvocationAttributionV1 }> {
+  // A runner process reports one job; drop any invocations or SHAs a previous run in this process collected.
+  resetJobAccounting();
   const workspaceDir = opts.workspaceDir ?? process.env.WORKSPACE_DIR ?? "/workspace";
 
   // Resolve issue fields + planning context + callback URL: prefer the envelope,

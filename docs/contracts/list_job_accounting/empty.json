@@ -1,0 +1,11 @@
+{
+  "request": {
+    "args": {}
+  },
+  "response": {
+    "records": [],
+    "nextCursor": null,
+    "oldestRetainedCompletedAt": null,
+    "prunedThrough": null
+  }
+}

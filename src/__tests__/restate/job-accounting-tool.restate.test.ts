@@ -27,6 +27,8 @@ describe("list_job_accounting on the orchestratorTools service", () => {
       // pairs share a completed_at
       dedup.getDb().prepare("UPDATE dispatch_log SET status = 'completed', conclusion = 'success', completed_at = ? WHERE id = ?")
         .run(done + Math.floor(i / 2) * 1000, id);
+      // The trigger stamps changed_at with the wall clock; pin it to the completion time so the job is settled.
+      dedup.getDb().prepare("UPDATE dispatch_log SET changed_at = completed_at WHERE id = ?").run(id);
     }
     env = await startRetryEnabled([orchestratorTools]);
   }, 120_000);

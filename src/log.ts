@@ -132,6 +132,7 @@ export function initLogTable(): void {
     db.exec("DELETE FROM attempt_review_pending");
   })();
   ensureLogColumns();
+  ensureAccountingTriggers();
 }
 
 /** Nullable per-job accounting columns, saved on the row when the job runs (the mapping can change later). */
@@ -143,7 +144,59 @@ const ACCOUNTING_COLUMNS: ReadonlyArray<readonly [string, string]> = [
   ["machine_memory_mb", "INTEGER"],
   ["compute_started_at", "INTEGER"],
   ["compute_stopped_at", "INTEGER"],
+  ["changed_at", "INTEGER"],
 ];
+
+const CHANGED_NOW = "CAST(unixepoch('subsec') * 1000 AS INTEGER)";
+
+/**
+ * AII-1566: `changed_at` (epoch ms, set by SQLite) moves when a column a job accounting record shows is
+ * written, or when an invocation row or runner report arrives; bookkeeping columns (`notified_at`,
+ * `machine_nonce`, ...) do not move it. `changed_at` is deliberately absent from the `UPDATE OF` lists,
+ * so these triggers never re-fire themselves. Pruning a finished row raises the one-row high-water mark
+ * and drops the invocation and report rows the row owned.
+ */
+function ensureAccountingTriggers(): void {
+  const db = getDb();
+  // Once: rows that existed before the column get their completion time. A later NULL stays NULL.
+  db.exec("UPDATE dispatch_log SET changed_at = completed_at WHERE changed_at IS NULL AND completed_at IS NOT NULL");
+  db.exec("UPDATE review_fix_attempts SET changed_at = completed_at WHERE changed_at IS NULL AND completed_at IS NOT NULL");
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_dispatch_log_changed_at
+    AFTER UPDATE OF status, conclusion, completed_at, pr_url, issue_identifier, issue_title, tracker_kind, issue_url,
+      machine_cpu_kind, machine_cpus, machine_memory_mb, compute_started_at, compute_stopped_at ON dispatch_log
+    BEGIN UPDATE dispatch_log SET changed_at = ${CHANGED_NOW} WHERE id = NEW.id; END`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_invocation_attribution_changed_at
+    AFTER INSERT ON model_invocation_attribution
+    BEGIN
+      UPDATE dispatch_log SET changed_at = ${CHANGED_NOW} WHERE dispatch_id = NEW.dispatch_id;
+      UPDATE review_fix_attempts SET changed_at = ${CHANGED_NOW} WHERE dispatch_id = NEW.dispatch_id;
+    END`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_job_report_insert_changed_at
+    AFTER INSERT ON dispatch_job_report
+    BEGIN
+      UPDATE dispatch_log SET changed_at = ${CHANGED_NOW} WHERE dispatch_id = NEW.dispatch_id;
+      UPDATE review_fix_attempts SET changed_at = ${CHANGED_NOW} WHERE dispatch_id = NEW.dispatch_id;
+    END`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_job_report_update_changed_at
+    AFTER UPDATE ON dispatch_job_report
+    WHEN OLD.pushed_shas_json IS NOT NEW.pushed_shas_json OR OLD.invocations_complete <> NEW.invocations_complete
+    BEGIN
+      UPDATE dispatch_log SET changed_at = ${CHANGED_NOW} WHERE dispatch_id = NEW.dispatch_id;
+      UPDATE review_fix_attempts SET changed_at = ${CHANGED_NOW} WHERE dispatch_id = NEW.dispatch_id;
+    END`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_dispatch_log_pruned
+    AFTER DELETE ON dispatch_log
+    WHEN OLD.completed_at IS NOT NULL
+    BEGIN
+      INSERT INTO job_accounting_pruned (id, changed_at, jid)
+        VALUES (1, COALESCE(OLD.changed_at, OLD.completed_at), COALESCE(OLD.dispatch_id, 'log-' || OLD.id))
+        ON CONFLICT (id) DO UPDATE SET changed_at = excluded.changed_at, jid = excluded.jid
+        WHERE excluded.changed_at > job_accounting_pruned.changed_at
+          OR (excluded.changed_at = job_accounting_pruned.changed_at AND excluded.jid > job_accounting_pruned.jid);
+      DELETE FROM model_invocation_attribution WHERE dispatch_id = OLD.dispatch_id;
+      DELETE FROM dispatch_job_report WHERE dispatch_id = OLD.dispatch_id;
+    END`);
+}
 
 function ensureLogColumns(): void {
   const db = getDb();
@@ -1091,22 +1144,42 @@ export function getInvocationAttribution(dispatchId: string): InvocationAttribut
   return readAttributionsByDispatch([dispatchId]).get(dispatchId) ?? null;
 }
 
-/** Stores the SHAs a job pushed (oldest first; may be empty). Insert-or-ignore, so a retried callback never rewrites them. */
+/**
+ * Stores the SHAs a job pushed (oldest first; may be empty) on the dispatch's runner report. The first
+ * report wins, so a retried callback never rewrites them. Returns whether the SHAs were stored now.
+ */
 export function recordPushedCommits(dispatchId: string, shas: readonly string[], now: number = Date.now()): boolean {
   const info = getDb()
-    .prepare(`INSERT OR IGNORE INTO dispatch_pushed_commits (dispatch_id, shas_json, recorded_at) VALUES (?, ?, ?)`)
+    .prepare(
+      `INSERT INTO dispatch_job_report (dispatch_id, pushed_shas_json, recorded_at) VALUES (?, ?, ?)
+       ON CONFLICT (dispatch_id) DO UPDATE SET pushed_shas_json = excluded.pushed_shas_json
+       WHERE dispatch_job_report.pushed_shas_json IS NULL`,
+    )
     .run(dispatchId, JSON.stringify(shas), now);
   return info.changes > 0;
+}
+
+/**
+ * Marks a dispatch's `invocations` list as having arrived whole: the result carried it, none was dropped,
+ * and every record was stored (AII-1566). Only ever sets the flag, so a retried callback cannot clear it.
+ */
+export function recordInvocationsComplete(dispatchId: string, now: number = Date.now()): void {
+  getDb()
+    .prepare(
+      `INSERT INTO dispatch_job_report (dispatch_id, invocations_complete, recorded_at) VALUES (?, 1, ?)
+       ON CONFLICT (dispatch_id) DO UPDATE SET invocations_complete = 1`,
+    )
+    .run(dispatchId, now);
 }
 
 /** The SHAs stored for a dispatch, in push order; `null` when the runner never reported them (distinct from `[]`). */
 export function getPushedCommits(dispatchId: string): string[] | null {
   try {
-    const row = getDb().prepare(`SELECT shas_json FROM dispatch_pushed_commits WHERE dispatch_id = ?`).get(dispatchId) as
-      | { shas_json: string }
+    const row = getDb().prepare(`SELECT pushed_shas_json FROM dispatch_job_report WHERE dispatch_id = ?`).get(dispatchId) as
+      | { pushed_shas_json: string | null }
       | undefined;
-    if (!row) return null;
-    const parsed: unknown = JSON.parse(row.shas_json);
+    if (!row || row.pushed_shas_json === null) return null;
+    const parsed: unknown = JSON.parse(row.pushed_shas_json);
     return Array.isArray(parsed) && parsed.every((v) => typeof v === "string") ? (parsed as string[]) : null;
   } catch (err) {
     warnAttributionReadFailure(err);
