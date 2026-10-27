@@ -302,6 +302,32 @@ describe("a job that changes is served again (AII-1566)", () => {
     expect(changedAtOf("book")).toBe(PAST);
   });
 
+  it("leaves changed_at alone for a write that stores the same values, and moves it for a real change", () => {
+    const db = dedup.getDb();
+    const id = log.appendLog({ issueId: "same", dispatchId: "same", executionMode: "github-actions" });
+    db.prepare("UPDATE dispatch_log SET run_id = 77 WHERE id = ?").run(id);
+    log.updateJobStatus(id, "running");
+    const pin = () => setChanged("same", PAST);
+    // recordGhaRunCompleted COALESCEs onto a started time that is already set.
+    const run = { status: "completed", run_started_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:05:00Z" };
+    log.recordGhaRunCompleted(77, run);
+    pin();
+    log.recordGhaRunCompleted(77, run);
+    log.recordGhaRunCompleted(77, { ...run, updated_at: "2026-01-02T00:00:00Z" });
+    expect(changedAtOf("same")).toBe(PAST);
+    log.updateJobStatus(id, "running");
+    expect(changedAtOf("same")).toBe(PAST);
+    // NULL -> value moves it.
+    db.prepare("UPDATE dispatch_log SET conclusion = NULL, pr_url = NULL WHERE id = ?").run(id);
+    pin();
+    db.prepare("UPDATE dispatch_log SET conclusion = 'success' WHERE id = ?").run(id);
+    expect(changedAtOf("same")).not.toBe(PAST);
+    // value -> different value moves it.
+    pin();
+    db.prepare("UPDATE dispatch_log SET conclusion = 'failure' WHERE id = ?").run(id);
+    expect(changedAtOf("same")).not.toBe(PAST);
+  });
+
   it("withholds a record until its last change settles, not its completion", () => {
     finishedJob("rewritten", PAST);
     dedup.getDb().prepare("UPDATE dispatch_log SET changed_at = ? WHERE dispatch_id = 'rewritten'").run(NOW - 60 * MS);
@@ -417,6 +443,48 @@ describe("pruning (AII-1566)", () => {
     expect(dedup.getDb().prepare("SELECT 1 FROM dispatch_log WHERE id = ?").get(young)).toBeTruthy();
     expect(dedup.getDb().prepare("SELECT COUNT(*) AS n FROM dispatch_log").get()).toMatchObject({ n: 506 - 5 });
     expect(acc.listJobAccounting({ now: NOW }).prunedThrough).toBeNull();
+  });
+});
+
+describe("prune guard reads the change time (AII-1577)", () => {
+  const DAY = 24 * 3600 * MS;
+  function oldRow(name: string, completedAgo: number, changedAgo: number | null): number {
+    const now = Date.now();
+    const id = finishedJob(name, now - completedAgo);
+    dedup.getDb().prepare("UPDATE dispatch_log SET dispatched_at = 1, changed_at = ? WHERE id = ?").run(changedAgo === null ? null : now - changedAgo, id);
+    return id;
+  }
+  const exists = (id: number) => !!dedup.getDb().prepare("SELECT 1 FROM dispatch_log WHERE id = ?").get(id);
+
+  it("keeps a row that completed 8 days ago and changed 1 day ago, and prunes one that changed 8 days ago", () => {
+    const recent = oldRow("recent-change", 8 * DAY, 1 * DAY);
+    const stale = oldRow("stale-change", 8 * DAY, 8 * DAY);
+    for (let i = 0; i < 505; i++) log.appendLog({ issueId: `x${i}`, dispatchId: `x${i}` });
+    expect(exists(recent)).toBe(true);
+    expect(exists(stale)).toBe(false);
+    expect(acc.listJobAccounting({ now: Date.now() }).prunedThrough).toMatchObject({ dispatchId: "stale-change" });
+  });
+
+  it("falls back to completed_at when changed_at is NULL", () => {
+    const young = oldRow("null-changed", 1 * DAY, null);
+    for (let i = 0; i < 505; i++) log.appendLog({ issueId: `x${i}`, dispatchId: `x${i}` });
+    expect(exists(young)).toBe(true);
+  });
+});
+
+describe("guarded trigger (AII-1577)", () => {
+  it("replaces an unguarded trigger at boot", () => {
+    const db = dedup.getDb();
+    const sqlOf = () => (db.prepare("SELECT sql FROM sqlite_master WHERE name = 'trg_dispatch_log_changed_at'").get() as { sql: string }).sql;
+    db.exec("DROP TRIGGER trg_dispatch_log_changed_at");
+    db.exec(`CREATE TRIGGER trg_dispatch_log_changed_at AFTER UPDATE OF status, conclusion ON dispatch_log
+      BEGIN UPDATE dispatch_log SET changed_at = 12345 WHERE id = NEW.id; END`);
+    expect(sqlOf()).not.toContain("WHEN");
+    log.initLogTable();
+    expect(sqlOf()).toContain("WHEN");
+    const id = finishedJob("guard", PAST);
+    db.prepare("UPDATE dispatch_log SET status = 'completed', conclusion = 'success' WHERE id = ?").run(id);
+    expect(changedAtOf("guard")).toBe(PAST);
   });
 });
 

@@ -13,7 +13,7 @@ import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
 import type * as ToolsModule from "../restate/tools.js";
 import { callTool } from "../restate/tools-client.js";
-import { JobAccountingArgsSchema } from "../job-accounting.js";
+import { JOB_ACCOUNTING_MAX_PAGE_SIZE, JobAccountingArgsSchema } from "../job-accounting.js";
 import { z } from "zod";
 import { fakeFetch } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
@@ -294,5 +294,74 @@ describe("recorded list_job_accounting exchanges", () => {
     expect(recorded.response.isError).toBe(true);
     expect(recorded.response.content[0].text).toContain("400");
     check("invalid-args", recorded);
+  });
+});
+
+describe("list_job_accounting args.schema.json", () => {
+  const schemaFile = new URL("args.schema.json", DIR);
+  const schemaText = `${JSON.stringify(z.toJSONSchema(JobAccountingArgsSchema), null, 2)}\n`;
+  const hint = "Regenerate with UPDATE_CONTRACT_FIXTURES=1 npx vitest run src/__tests__/job-accounting-contract.test.ts, and tell the control plane: it copies this file.";
+
+  /** The subset of JSON Schema that args.schema.json uses; no validator library is a dependency. */
+  function validate(schema: any, value: unknown, root: any = schema): boolean {
+    if (schema.$ref) return validate(root, value, root);
+    switch (schema.type) {
+      case "object": {
+        if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+        const v = value as Record<string, unknown>;
+        if ((schema.required ?? []).some((k: string) => !(k in v))) return false;
+        if (schema.additionalProperties === false && Object.keys(v).some((k) => !(k in (schema.properties ?? {})))) return false;
+        return Object.entries(schema.properties ?? {}).every(([k, sub]) => !(k in v) || validate(sub, v[k], root));
+      }
+      case "string":
+        return typeof value === "string" && value.length >= (schema.minLength ?? 0) && value.length <= (schema.maxLength ?? Infinity);
+      case "integer":
+      case "number":
+        return typeof value === "number" && Number.isFinite(value) && (schema.type !== "integer" || Number.isInteger(value))
+          && value >= (schema.minimum ?? -Infinity) && value <= (schema.maximum ?? Infinity);
+      case "boolean":
+        return typeof value === "boolean";
+      default:
+        throw new Error(`args.schema.json uses an unsupported schema: ${JSON.stringify(schema)}`);
+    }
+  }
+
+  const load = () => JSON.parse(readFileSync(schemaFile, "utf8"));
+
+  it("matches the schema in code", () => {
+    if (process.env.UPDATE_CONTRACT_FIXTURES === "1") {
+      mkdirSync(DIR, { recursive: true });
+      writeFileSync(schemaFile, schemaText);
+      return;
+    }
+    if (!existsSync(schemaFile)) throw new Error(`docs/contracts/list_job_accounting/args.schema.json is missing. ${hint}`);
+    if (readFileSync(schemaFile, "utf8") !== schemaText) throw new Error(`args.schema.json differs from JobAccountingArgsSchema. ${hint}\nActual:\n${schemaText}`);
+  });
+
+  it("rejects what the tool rejects", () => {
+    const schema = load();
+    const ok = { cursor: { changedAt: 1, dispatchId: "a" } };
+    expect(validate(schema, ok)).toBe(true);
+    for (const bad of [
+      { cursor: { changedAt: 1, dispatchId: "" } },
+      { cursor: { changedAt: 1, dispatchId: "x".repeat(201) } },
+      { cursor: { changedAt: 1.5, dispatchId: "a" } },
+      { cursor: { dispatchId: "a" } },
+      { pageSize: 0 },
+      { pageSize: JOB_ACCOUNTING_MAX_PAGE_SIZE + 1 },
+      { includeUnsettled: "yes" },
+    ]) {
+      expect(validate(schema, bad), JSON.stringify(bad)).toBe(false);
+      expect(JobAccountingArgsSchema.safeParse(bad).success, JSON.stringify(bad)).toBe(false);
+    }
+  });
+
+  it("accepts the request.args of every valid recorded exchange and rejects the invalid-args one", () => {
+    const schema = load();
+    const scenarios = ["first-page", "next-page", "short-page", "empty", "changed-again", "partial-usage", "pruned", "final-pull", "invalid-args"];
+    for (const scenario of scenarios) {
+      const args = JSON.parse(readFileSync(new URL(`${scenario}.json`, DIR), "utf8")).request.args;
+      expect(validate(schema, args), scenario).toBe(scenario !== "invalid-args");
+    }
   });
 });

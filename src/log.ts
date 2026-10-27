@@ -156,14 +156,24 @@ const CHANGED_NOW = "CAST(unixepoch('subsec') * 1000 AS INTEGER)";
  * so these triggers never re-fire themselves. Pruning a finished row raises the one-row high-water mark
  * and drops the invocation and report rows the row owned.
  */
+const DISPATCH_LOG_CHANGE_COLUMNS = [
+  "status", "conclusion", "completed_at", "pr_url", "issue_identifier", "issue_title", "tracker_kind", "issue_url",
+  "machine_cpu_kind", "machine_cpus", "machine_memory_mb", "compute_started_at", "compute_stopped_at",
+];
+
 function ensureAccountingTriggers(): void {
   const db = getDb();
   // Once: rows that existed before the column get their completion time. A later NULL stays NULL.
   db.exec("UPDATE dispatch_log SET changed_at = completed_at WHERE changed_at IS NULL AND completed_at IS NOT NULL");
   db.exec("UPDATE review_fix_attempts SET changed_at = completed_at WHERE changed_at IS NULL AND completed_at IS NOT NULL");
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_dispatch_log_changed_at
-    AFTER UPDATE OF status, conclusion, completed_at, pr_url, issue_identifier, issue_title, tracker_kind, issue_url,
-      machine_cpu_kind, machine_cpus, machine_memory_mb, compute_started_at, compute_stopped_at ON dispatch_log
+  // Dropped and recreated so a database that has the unguarded form gets the guarded one at boot. The WHEN
+  // compares OLD and NEW per column: a write that stores the same values (a COALESCE that keeps its value, a
+  // repeated status) must not move `changed_at`, or a polled job never settles.
+  const when = DISPATCH_LOG_CHANGE_COLUMNS.map((c) => `OLD.${c} IS NOT NEW.${c}`).join(" OR ");
+  db.exec("DROP TRIGGER IF EXISTS trg_dispatch_log_changed_at");
+  db.exec(`CREATE TRIGGER trg_dispatch_log_changed_at
+    AFTER UPDATE OF ${DISPATCH_LOG_CHANGE_COLUMNS.join(", ")} ON dispatch_log
+    WHEN ${when}
     BEGIN UPDATE dispatch_log SET changed_at = ${CHANGED_NOW} WHERE id = NEW.id; END`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trg_invocation_attribution_changed_at
     AFTER INSERT ON model_invocation_attribution
@@ -389,13 +399,14 @@ export function appendLog(entry: {
   // NULL) or completed within the last 7 days (AII-795). A terminal attempt
   // stays exempt while reservation, result conflict, or execution
   // identity is unresolved, matching review-fix-evidence's retention guard. A finished row
-  // (completed_at set) younger than 7 days is also kept, so the control plane can pull its
-  // accounting record (AII-1564); that guard can hold the table above MAX_LOG_ENTRIES.
+  // (completed_at set) whose last change (changed_at, else completed_at) is younger than 7 days is also kept,
+  // so the control plane can pull its newest accounting record (AII-1564); that guard can hold the table
+  // above MAX_LOG_ENTRIES.
   db.prepare(
     `DELETE FROM dispatch_log
      WHERE machine_nonce IS NULL
        AND id NOT IN (SELECT id FROM dispatch_log ORDER BY dispatched_at DESC LIMIT ?)
-       AND NOT (completed_at IS NOT NULL AND completed_at >= ?)
+       AND NOT (completed_at IS NOT NULL AND COALESCE(changed_at, completed_at) >= ?)
        AND (
          dispatch_id IS NULL
          OR NOT EXISTS (
