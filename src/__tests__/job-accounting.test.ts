@@ -174,6 +174,30 @@ describe("listJobAccounting", () => {
     expect(r.pushedShas).toEqual(["abc"]);
   });
 
+  it("reads pushedShas as null when unreported or malformed, [] when none pushed, and the list otherwise", () => {
+    for (const id of ["unreported", "none", "some", "bad"]) finishedJob(id, OLD);
+    const ins = dedup.getDb().prepare("INSERT INTO dispatch_pushed_commits (dispatch_id, shas_json, recorded_at) VALUES (?, ?, 1)");
+    ins.run("none", "[]");
+    ins.run("some", '["a","b"]');
+    ins.run("bad", "not json");
+    const by = new Map(acc.listJobAccounting({ now: NOW }).records.map((r) => [r.dispatchId, r.pushedShas]));
+    expect(by.get("unreported")).toBeNull();
+    expect(by.get("none")).toEqual([]);
+    expect(by.get("some")).toEqual(["a", "b"]);
+    expect(by.get("bad")).toBeNull();
+  });
+
+  it("gives a legacy row with no dispatch_id the id log-<id> and pages past it exactly once", () => {
+    finishedJob("a", OLD - 3);
+    const legacy = log.appendLog({ issueId: "issue-legacy", executionMode: "fly-machines" });
+    dedup.getDb().prepare("UPDATE dispatch_log SET dispatch_id = NULL, status = 'completed', conclusion = 'success', completed_at = ? WHERE id = ?").run(OLD - 2, legacy);
+    finishedJob("c", OLD - 1);
+    const first = acc.listJobAccounting({ pageSize: 2, now: NOW });
+    expect(first.records.map((r) => r.dispatchId)).toEqual(["a", `log-${legacy}`]);
+    const second = acc.listJobAccounting({ cursor: first.nextCursor ?? undefined, pageSize: 2, now: NOW });
+    expect(second.records.map((r) => r.dispatchId)).toEqual(["c"]);
+  });
+
   it("leaks no sentinel from sensitive columns", () => {
     const id = finishedJob("leak", OLD);
     reviewFixAttempt("leakfix", OLD);
