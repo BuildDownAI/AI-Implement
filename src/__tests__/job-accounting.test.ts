@@ -534,6 +534,12 @@ describe("record text cap and dropped records", () => {
     expect(rec.issue.title).toHaveLength(acc.RECORD_TEXT_MAX);
   });
 
+  it("does not leave half a surrogate pair when the cut falls inside one", () => {
+    finishedJob("s", PAST, { issueTitle: "a".repeat(acc.RECORD_TEXT_MAX - 1) + "😀" + "b".repeat(10) });
+    const title = acc.listJobAccounting({ now: Date.now() }).records[0].issue.title as string;
+    expect(title).toBe("a".repeat(acc.RECORD_TEXT_MAX - 1));
+  });
+
   it("cuts every served string of a log record and of a review-fix record", () => {
     const id = finishedJob("all", PAST);
     dedup.getDb().prepare(
