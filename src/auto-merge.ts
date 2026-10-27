@@ -1,7 +1,7 @@
-import type { RepoMapping } from "./config.js";
+import { resolveReviewFixLifecycle, type RepoMapping } from "./config.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import {
-  listOpenPullRequests, getCombinedChecksState, hasChangesRequestedReview, mergePullRequest,
+  listOpenPullRequests, getCombinedChecksState, hasChangesRequestedReview, mergePullRequest, mergeBranch,
 } from "./github.js";
 import {
   countConflictAttempts, enqueueConflictResolution, hasPendingConflictResolution,
@@ -22,7 +22,41 @@ export const MAX_CONFLICT_RESOLUTION_ATTEMPTS = 2;
 // same PR (observed ~60s Slack spam). Notify once per PR per process; a restart
 // re-notifies at most once more. The log line stays every cycle (cheap, greppable).
 const capExhaustedNotified = new Set<string>();
-export function resetCapExhaustedNotifications(): void { capExhaustedNotified.clear(); }
+// Same once-per-process rule for a default-branch sync conflict, keyed per feature branch.
+const syncConflictNotified = new Set<string>();
+export function resetCapExhaustedNotifications(): void {
+  capExhaustedNotified.clear();
+  syncConflictNotified.clear();
+}
+
+/** No issue key and no branch name: a key in the commit makes Linear's GitHub integration mark the parent Done (AII-1412). */
+export const SYNC_DEFAULT_COMMIT_MESSAGE = "Merge default branch into feature branch";
+
+/** Merge the default branch into a grouping branch after a child merged. Never throws. */
+async function syncDefaultIntoFeature(
+  token: string, mapping: RepoMapping, featureBranch: string, deps: AutoMergeDeps,
+): Promise<void> {
+  const { owner, repo, defaultBranch } = mapping;
+  try {
+    const result = await mergeBranch(token, owner, repo, featureBranch, defaultBranch, SYNC_DEFAULT_COMMIT_MESSAGE);
+    if (result === "merged") {
+      console.log(`[auto-merge] Synced ${defaultBranch} into ${featureBranch}`);
+    } else if (result === "conflict") {
+      console.log(`[auto-merge] Conflict syncing ${defaultBranch} into ${featureBranch} (${owner}/${repo}) — leaving the branch as is`);
+      const key = `${owner}/${repo}:${featureBranch}`;
+      if (!syncConflictNotified.has(key)) {
+        syncConflictNotified.add(key);
+        if (deps.notify) {
+          await deps.notify(
+            `Conflict syncing \`${defaultBranch}\` into \`${featureBranch}\` (${owner}/${repo}) — needs a manual merge.`
+          ).catch(() => {});
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`[auto-merge] Failed syncing ${defaultBranch} into ${featureBranch} (${owner}/${repo}):`, err);
+  }
+}
 export type StalledChildKind = "conflict" | "other";
 
 /** Named seam: AII-263 (max_turns/draft stalls) extends this classification later. */
@@ -113,6 +147,10 @@ async function autoMergeRepo(mapping: RepoMapping, deps: AutoMergeDeps): Promise
         console.log(`[auto-merge] Merged PR #${pr.number} -> ${pr.base} (${owner}/${repo})`);
         if (deps.notify) {
           await deps.notify(`Auto-merged child PR #${pr.number} into \`${pr.base}\` (${owner}/${repo})`).catch(() => {});
+        }
+        // After the child merge, not before: moving the base first can make the child look blocked.
+        if (resolveReviewFixLifecycle(mapping) === "restate") {
+          await syncDefaultIntoFeature(token, mapping, pr.base, deps);
         }
       } else {
         const kind = classifyStalledChild(result);

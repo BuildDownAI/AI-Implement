@@ -309,6 +309,17 @@ Recovery for a capped or unapproved child is tracked in [AII-263](https://linear
 
 ---
 
+### Default-branch sync after each auto-merged child (AII-934)
+
+A feature branch is cut from the default branch once, then collects child PRs while the default branch moves. For a project on the **Restate review-fix lifecycle** (`reviewFixLifecycle = restate`; `legacy` or unset is unchanged), `autoMergeRepo` merges the default branch into the grouping branch right after each child merge returns `merged` — after, not before, because moving the base first can make the child PR look blocked and send it to the conflict rail for nothing. It applies to every grouping base (`feature/*` and `multi-issue/*`), since the same drift applies.
+
+- It is a direct `mergeBranch` call (no PR, no new branch) with the message `Merge default branch into feature branch`, which carries no issue key and no branch name.
+- `merged` logs `[auto-merge] Synced <default> into <base>`; `noop` does nothing.
+- `conflict` is logged, notified once per feature branch per process (`deps.notify`), and the branch is left as it is. It never blocks or retries the child merge; the conflict surfaces at the roll-up as before.
+- A thrown error is logged and the loop over the other PRs continues.
+
+**No issue key in any sync merge (AII-1412).** Linear's GitHub integration marks an issue Done when a merged PR or commit carries its key. A hand-made `testing` → feature sync PR (BuildDownAI/AI-Implement#1077) carried the parent key in its title and branch and closed AII-939 on merge. So: prefer a direct merge with no key; a sync PR's title and head branch must not contain the parent key; and if a parent is closed by mistake, recover by moving it back to In Progress.
+
 ## 9. Where each part lives
 
 | Concern | File |
@@ -322,6 +333,7 @@ Recovery for a capped or unapproved child is tracked in [AII-263](https://linear
 | Planning-base resolution (read-only, no branch creation) | `src/feature-branch.ts` (`resolvePlanningBranch`), wired in `src/index.ts` (`preparePlanningDispatch`) |
 | Roll-up (direct merge / human PR) | `src/merge-up.ts` (`runMergeUps`) |
 | GitHub helpers (branch/compare/merge/PR/merged-state) | `src/github.ts` (`ensureBranchExists`, `compareBranches`, `getBranchSha`, `mergeBranch`, `createPullRequest`, `findOpenPullRequest`, `findPullRequestByBranches`, `deleteBranch`) — `findPullRequestByBranches` detects the top-of-tree PR's merged state (robust to any merge method) and returns its head SHA; `getBranchSha` fetches the branch's current tip for the SHA-equality safety check; `deleteBranch` removes the feature branch after merge |
+| Child auto-merge and default-branch sync (Restate lifecycle) | `src/auto-merge.ts` (`runAutoMerges`, `syncDefaultIntoFeature`) |
 | Plan-Complete transition | `src/runner-callback.ts` → `markPlanComplete` |
 | Poll-loop wiring (roll-up before dispatch; base resolved per issue) | `src/index.ts` |
 
