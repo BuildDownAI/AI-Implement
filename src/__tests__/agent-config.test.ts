@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  ALL_PROJECTS_KEY,
+  isProjectPermitted,
   describeInvocationLimit,
   resolveStageAgentConfig,
   type AccountProfile,
@@ -400,6 +402,28 @@ describe("resolveStageAgentConfig", () => {
         }),
       /not authorized/,
     );
+  });
+
+  it("honours a * grant as every project, and treats an empty list as none", () => {
+    const resolveWith = (keys: string[], over: Partial<AccountProfile> = {}, projectKey = "OTHER") =>
+      resolveStageAgentConfig({
+        projectKey,
+        orchestratorDefaults,
+        projectConfig: configuredProject(),
+        accountProfiles: accountProfiles.map((p) => ({ ...p, allowedProjectKeys: keys, ...(p.id === "openai-api" ? over : {}) })),
+      });
+    expect(ALL_PROJECTS_KEY).toBe("*");
+    expect(isProjectPermitted([], "P")).toBe(false);
+    expect(isProjectPermitted(["P"], "P")).toBe(true);
+    expect(isProjectPermitted(["Q"], "P")).toBe(false);
+    expect(isProjectPermitted(["*"], "P")).toBe(true);
+    expect(isProjectPermitted(["*", "Q"], "P")).toBe(true);
+    expect(() => resolveWith(["OTHER"])).not.toThrow();
+    expect(() => resolveWith(["*"])).not.toThrow();
+    expect(() => resolveWith(["*", "Q"])).not.toThrow();
+    expectError(() => resolveWith([]), /not authorized/);
+    expectError(() => resolveWith(["Q"]), /not authorized/);
+    expectError(() => resolveWith(["*"], { disabled: true }), /disabled/);
   });
 
   it("rejects malformed profile metadata and duplicate profile ids", () => {

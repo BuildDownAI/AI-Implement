@@ -21,7 +21,7 @@ import {
   type ModelAuthFailureCategory,
   type ModelAuthSecret,
 } from "./model-auth-contract.js";
-import type { AccountAuthMode, ModelProvider } from "./agent-config.js";
+import { isProjectPermitted, type AccountAuthMode, type ModelProvider } from "./agent-config.js";
 import type { ModelSessionStore } from "./model-session-store.js";
 import { parseChatGptPlanRecord, type ChatGptPlanRecordV1 } from "./chatgpt-plan-token.js";
 import {
@@ -144,7 +144,7 @@ function authorize(
   }
   if (!profile) return fail("unauthorized", "profile_not_found");
   if (profile.status !== "active") return { ...fail("unauthorized", "profile_disabled"), profile };
-  if (!profile.allowedProjectKeys.includes(req.projectKey)) {
+  if (!isProjectPermitted(profile.allowedProjectKeys, req.projectKey)) {
     return { ...fail("unauthorized", "project_not_permitted"), profile };
   }
   if (profile.provider !== req.provider || profile.authMode !== req.authMode) {
@@ -326,7 +326,7 @@ export function getCredentialStatus(req: CredentialRequest, deps: ModelCredentia
     provider: profile.provider,
     authMode: profile.authMode,
     profileStatus: profile.status,
-    projectPermitted: profile.allowedProjectKeys.includes(req.projectKey),
+    projectPermitted: isProjectPermitted(profile.allowedProjectKeys, req.projectKey),
     matchesRequest: profile.provider === req.provider && profile.authMode === req.authMode,
     referenceConfigured,
     usable: failure === null,
