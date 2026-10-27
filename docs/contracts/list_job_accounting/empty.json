@@ -2,10 +2,13 @@
   "request": {
     "args": {}
   },
+  "status": 200,
   "response": {
-    "records": [],
-    "nextCursor": null,
-    "oldestRetainedCompletedAt": null,
-    "prunedThrough": null
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"records\":[],\"nextCursor\":null,\"oldestRetainedCompletedAt\":null,\"prunedThrough\":null}"
+      }
+    ]
   }
 }

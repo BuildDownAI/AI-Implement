@@ -8,61 +8,13 @@
       "pageSize": 1
     }
   },
+  "status": 200,
   "response": {
-    "records": [
+    "content": [
       {
-        "dispatchId": "job-b",
-        "completedAt": 1700000002000,
-        "changedAt": 1700000002000,
-        "usage": "reported",
-        "invocations": [
-          {
-            "stage": "implementation",
-            "agent": "claude",
-            "provider": "anthropic",
-            "model": "claude-model",
-            "status": "succeeded",
-            "tokensIn": 1000,
-            "tokensOut": 100,
-            "cacheReadTokens": null,
-            "cacheCreationTokens": null,
-            "costUsd": 0.25,
-            "costStatus": "reported",
-            "attempts": 1
-          }
-        ],
-        "pushedShas": [],
-        "phase": "implementation",
-        "status": "completed",
-        "conclusion": "success",
-        "lifecycleOwner": "legacy",
-        "dispatchedAt": 1699999402000,
-        "issue": {
-          "identifier": "AII-job-b",
-          "title": "Job job-b",
-          "repo": "acme/widgets",
-          "trackerKind": "linear",
-          "url": "https://linear.app/acme/issue/AII-job-b"
-        },
-        "pr": {
-          "url": "https://github.com/acme/widgets/pull/5",
-          "number": 5
-        },
-        "compute": {
-          "backend": "fly-machines",
-          "cpuKind": null,
-          "cpus": null,
-          "memoryMb": null,
-          "startedAt": 1699999502000,
-          "stoppedAt": 1700000001000
-        }
+        "type": "text",
+        "text": "{\"records\":[{\"dispatchId\":\"job-b\",\"completedAt\":1700000002000,\"changedAt\":1700000002000,\"usage\":\"reported\",\"invocations\":[{\"stage\":\"implementation\",\"agent\":\"claude\",\"provider\":\"anthropic\",\"model\":\"claude-model\",\"status\":\"succeeded\",\"tokensIn\":1000,\"tokensOut\":100,\"cacheReadTokens\":null,\"cacheCreationTokens\":null,\"costUsd\":0.25,\"costStatus\":\"reported\",\"attempts\":1}],\"pushedShas\":[],\"phase\":\"implementation\",\"status\":\"completed\",\"conclusion\":\"success\",\"lifecycleOwner\":\"legacy\",\"dispatchedAt\":1699999402000,\"issue\":{\"identifier\":\"AII-job-b\",\"title\":\"Job job-b\",\"repo\":\"acme/widgets\",\"trackerKind\":\"linear\",\"url\":\"https://linear.app/acme/issue/AII-job-b\"},\"pr\":{\"url\":\"https://github.com/acme/widgets/pull/5\",\"number\":5},\"compute\":{\"backend\":\"fly-machines\",\"cpuKind\":null,\"cpus\":null,\"memoryMb\":null,\"startedAt\":1699999502000,\"stoppedAt\":1700000001000}}],\"nextCursor\":{\"changedAt\":1700000002000,\"dispatchId\":\"job-b\"},\"oldestRetainedCompletedAt\":1700000001000,\"prunedThrough\":null}"
       }
-    ],
-    "nextCursor": {
-      "changedAt": 1700000002000,
-      "dispatchId": "job-b"
-    },
-    "oldestRetainedCompletedAt": 1700000001000,
-    "prunedThrough": null
+    ]
   }
 }

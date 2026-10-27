@@ -51,6 +51,8 @@ export type JobAccountingCursor = z.infer<typeof JobAccountingCursorSchema>;
 export const JobAccountingArgsSchema = z.object({
   cursor: JobAccountingCursorSchema.optional(),
   pageSize: z.number().int().min(1).max(JOB_ACCOUNTING_MAX_PAGE_SIZE).optional(),
+  /** Serve finished jobs that have not settled too. Only a caller about to lose the orchestrator should send it. */
+  includeUnsettled: z.boolean().optional(),
 });
 
 const nullableInt = z.number().int().nullable();
@@ -225,9 +227,10 @@ function parseShas(raw: string): string[] | null {
   }
 }
 
-/** One page of finished-job accounting records by last change, oldest first, strictly after `cursor`. A changed job is served again. */
+/** One page of finished-job accounting records by last change, oldest first, strictly after `cursor`. A changed job is served again.
+ * `includeUnsettled` skips the settle filter, so a job that changed in the last 10 minutes is served too. */
 export function listJobAccounting(
-  opts: { cursor?: JobAccountingCursor; pageSize?: number; now?: number } = {},
+  opts: { cursor?: JobAccountingCursor; pageSize?: number; now?: number; includeUnsettled?: boolean } = {},
 ): JobAccountingPage {
   const db = getDb();
   const now = opts.now ?? Date.now();
@@ -240,7 +243,12 @@ export function listJobAccounting(
     | { changed_at: number; jid: string }
     | undefined;
 
-  const params: unknown[] = [settledBefore];
+  const params: unknown[] = [];
+  let settled = "";
+  if (!opts.includeUnsettled) {
+    settled = "AND changed <= ?";
+    params.push(settledBefore);
+  }
   let after = "";
   if (opts.cursor) {
     after = "AND (changed > ? OR (changed = ? AND jid > ?))";
@@ -249,7 +257,7 @@ export function listJobAccounting(
   const keys = db
     .prepare(
       `SELECT src, row_id, jid, done_at, changed FROM (${FINISHED_SOURCES})
-       WHERE changed <= ? ${after} ORDER BY changed ASC, jid ASC LIMIT ?`,
+       WHERE 1 = 1 ${settled} ${after} ORDER BY changed ASC, jid ASC LIMIT ?`,
     )
     .all(...params, pageSize) as KeyRow[];
 

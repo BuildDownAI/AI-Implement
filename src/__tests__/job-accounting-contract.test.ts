@@ -1,16 +1,20 @@
 // The recorded exchanges of `list_job_accounting` (AII-1566): each docs/contracts/list_job_accounting/<scenario>.json
-// holds one `{ request, response }` made through the real route as the control-plane `service` caller. The control
+// holds one `{ request, status, response }` made through the real route as the control-plane `service` caller:
+// the request body, the HTTP status, and the exact response body the route returns (the MCP envelope included). The control
 // plane copies these files, so a change to the response must change them on purpose:
 // regenerate with UPDATE_CONTRACT_FIXTURES=1 npx vitest run src/__tests__/job-accounting-contract.test.ts
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SignJWT, exportJWK, generateKeyPair } from "jose";
 import type * as restate from "@restatedev/restate-sdk";
 import type * as AdminModule from "../admin.js";
 import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
 import type * as ToolsModule from "../restate/tools.js";
+import { callTool } from "../restate/tools-client.js";
+import { JobAccountingArgsSchema } from "../job-accounting.js";
+import { z } from "zod";
 import { fakeFetch } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
 
@@ -86,8 +90,33 @@ beforeEach(async () => {
   vi.stubEnv("OAUTH_REDIRECT_BASE_URL", BASE_URL);
 });
 
-/** `POST /api/tools/list_job_accounting` as the control plane, through the real route and the real tool handler. */
-async function exchange(body: { args: Record<string, unknown> }): Promise<{ request: unknown; response: unknown }> {
+interface Exchange {
+  request: { args: Record<string, unknown> };
+  status: number;
+  response: { content: Array<{ type: string; text: string }>; isError?: boolean };
+}
+
+/**
+ * The Restate ingress in front of the handler: it checks the wire input with the handler's zod serde and answers a
+ * rejection 400 `{ code, message, source }`, which `callTool` turns into an `isError` result. Anything it accepts
+ * reaches the real handler. The 400 body is built here, but job-accounting-tool.restate.test.ts (`npm run test:restate`)
+ * sends the same rejected argument to the real restate-server and asserts its body equals invalid-args.json. The
+ * message embeds zod's error text, so a zod upgrade can change it: both tests then fail and the fixture is regenerated.
+ */
+function ingress(handlerName: string, caller: Parameters<typeof tools.listJobAccountingTool>[1]["caller"]): typeof fetch {
+  return (async (_url: unknown, init?: { body?: string }) => {
+    const wire = z.object({ caller: z.unknown(), args: JobAccountingArgsSchema }).safeParse(JSON.parse(init?.body ?? "{}"));
+    if (!wire.success) {
+      const body = { code: 400, message: `Failed to deserialize input: ${wire.error.message}`, source: "invocation" };
+      return new Response(JSON.stringify(body), { status: 400 });
+    }
+    const res = await tools.listJobAccountingTool(fakeContext(handlerName), { caller, args: wire.data.args });
+    return new Response(JSON.stringify(res), { status: 200 });
+  }) as typeof fetch;
+}
+
+/** `POST /api/tools/list_job_accounting` as the control plane, through the real route, `callTool` and the real tool handler. */
+async function exchange(body: { args: Record<string, unknown> }): Promise<Exchange> {
   const now = Math.floor(Date.now() / 1000);
   const token = await new SignJWT({ scope: "orchestrator:read" })
     .setProtectedHeader({ alg: "ES256", kid: "k1" })
@@ -99,8 +128,12 @@ async function exchange(body: { args: Record<string, unknown> }): Promise<{ requ
   const deps: AdminModule.AdminDeps = {
     callTool: async (name, args, caller) => {
       expect(caller).toEqual({ kind: "service", email: null, role: "user" });
-      const res = await tools.listJobAccountingTool(fakeContext(name), { caller, args });
-      return { status: "ok" as const, content: res.content, isError: res.isError };
+      return callTool(name, args, caller, {
+        restateReady: () => true,
+        permitsExternalCall: () => true,
+        ingressBaseUrl: "http://restate.test",
+        fetchImpl: ingress(name, caller),
+      });
     },
   };
   const req = new MockRequest("/api/tools/list_job_accounting", "POST", { authorization: `Bearer ${token}` }, JSON.stringify(body));
@@ -109,13 +142,20 @@ async function exchange(body: { args: Record<string, unknown> }): Promise<{ requ
   const registry = { forMapping: async () => null, forAllMappings: async () => [], invalidate: () => {} };
   admin.handleAdminRequest(req as never, res as never, config as never, registry as never, deps);
   await res.done;
-  expect(res.statusCode).toBe(200);
-  const payload = JSON.parse(res.body) as { content: Array<{ text: string }>; isError?: boolean };
-  expect(payload.isError).toBeFalsy();
-  return { request: body, response: JSON.parse(payload.content[0].text) };
+  return { request: body, status: res.statusCode, response: JSON.parse(res.body) };
 }
 
-function check(scenario: string, recorded: { request: unknown; response: unknown }): void {
+/** The page inside a successful exchange; the body is compact JSON, so re-serialising the parse gives the text back. */
+function pageOf(recorded: Exchange): any {
+  expect(recorded.status).toBe(200);
+  expect(recorded.response.isError).toBeFalsy();
+  const text = recorded.response.content[0].text;
+  const page = JSON.parse(text);
+  expect(text).toBe(JSON.stringify(page));
+  return page;
+}
+
+function check(scenario: string, recorded: Exchange): void {
   const file = new URL(`${scenario}.json`, DIR);
   const text = `${JSON.stringify(recorded, null, 2)}\n`;
   if (process.env.UPDATE_CONTRACT_FIXTURES === "1") {
@@ -175,31 +215,35 @@ function seedThree(): void {
   seed({ id: "job-c", at: T + 3000, invocations: 1, complete: true, shas: [SHA_2] });
 }
 
+afterEach(() => {
+  vi.useRealTimers();
+});
+
 describe("recorded list_job_accounting exchanges", () => {
   it("first-page", async () => {
     seedThree();
     const recorded = await exchange({ args: { pageSize: 2 } });
-    expect((recorded.response as { nextCursor: unknown }).nextCursor).not.toBeNull();
+    expect(pageOf(recorded).nextCursor).not.toBeNull();
     check("first-page", recorded);
   });
 
   it("next-page", async () => {
     seedThree();
     const recorded = await exchange({ args: { cursor: { changedAt: T + 1000, dispatchId: "job-a" }, pageSize: 1 } });
-    expect((recorded.response as { nextCursor: unknown }).nextCursor).not.toBeNull();
+    expect(pageOf(recorded).nextCursor).not.toBeNull();
     check("next-page", recorded);
   });
 
   it("short-page", async () => {
     seedThree();
     const recorded = await exchange({ args: { cursor: { changedAt: T + 1000, dispatchId: "job-a" }, pageSize: 5 } });
-    expect((recorded.response as { nextCursor: unknown }).nextCursor).toBeNull();
+    expect(pageOf(recorded).nextCursor).toBeNull();
     check("short-page", recorded);
   });
 
   it("empty", async () => {
     const recorded = await exchange({ args: {} });
-    expect((recorded.response as { records: unknown[] }).records).toEqual([]);
+    expect(pageOf(recorded).records).toEqual([]);
     check("empty", recorded);
   });
 
@@ -209,7 +253,7 @@ describe("recorded list_job_accounting exchanges", () => {
     dedup.getDb().prepare("UPDATE dispatch_log SET conclusion = 'approved_late' WHERE dispatch_id = 'job-a'").run();
     pin("job-a", T + 9000);
     const recorded = await exchange({ args: { cursor: { changedAt: T + 3000, dispatchId: "job-c" }, pageSize: 5 } });
-    const records = (recorded.response as { records: Array<{ dispatchId: string; changedAt: number }> }).records;
+    const records = pageOf(recorded).records as Array<{ dispatchId: string; changedAt: number }>;
     expect(records.map((r) => [r.dispatchId, r.changedAt])).toEqual([["job-a", T + 9000]]);
     check("changed-again", recorded);
   });
@@ -219,7 +263,7 @@ describe("recorded list_job_accounting exchanges", () => {
     seed({ id: "job-legacy", at: T + 2000, invocations: 1 });
     seed({ id: "job-none", at: T + 3000 });
     const recorded = await exchange({ args: { pageSize: 5 } });
-    const usage = (recorded.response as { records: Array<{ usage: string }> }).records.map((r) => r.usage);
+    const usage = (pageOf(recorded).records as Array<{ usage: string }>).map((r) => r.usage);
     expect(usage).toEqual(["reported", "partial", "unknown"]);
     check("partial-usage", recorded);
   });
@@ -228,7 +272,27 @@ describe("recorded list_job_accounting exchanges", () => {
     seedThree();
     dedup.getDb().prepare("DELETE FROM dispatch_log WHERE dispatch_id = 'job-b'").run();
     const recorded = await exchange({ args: { pageSize: 5 } });
-    expect((recorded.response as { prunedThrough: unknown }).prunedThrough).toEqual({ changedAt: T + 2000, dispatchId: "job-b" });
+    expect(pageOf(recorded).prunedThrough).toEqual({ changedAt: T + 2000, dispatchId: "job-b" });
     check("pruned", recorded);
+  });
+
+  it("final-pull", async () => {
+    // The clock is pinned a minute after job-fresh finished; job-old settled long before.
+    const now = T + 10_000_000;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(now);
+    seed({ id: "job-old", at: T + 1000, invocations: 1, complete: true, shas: [SHA_1] });
+    seed({ id: "job-fresh", at: now - 60_000, invocations: 1, complete: true, shas: [SHA_2] });
+    expect(pageOf(await exchange({ args: {} })).records.map((r: { dispatchId: string }) => r.dispatchId)).toEqual(["job-old"]);
+    const recorded = await exchange({ args: { includeUnsettled: true } });
+    expect(pageOf(recorded).records.map((r: { dispatchId: string }) => r.dispatchId)).toEqual(["job-old", "job-fresh"]);
+    check("final-pull", recorded);
+  });
+
+  it("invalid-args", async () => {
+    const recorded = await exchange({ args: { includeUnsettled: "yes" } });
+    expect(recorded.response.isError).toBe(true);
+    expect(recorded.response.content[0].text).toContain("400");
+    check("invalid-args", recorded);
   });
 });
