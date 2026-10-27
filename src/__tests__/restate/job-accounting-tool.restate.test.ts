@@ -1,6 +1,7 @@
 // The control-plane (service) caller pages through list_job_accounting on the real orchestratorTools
 // service, on the binary runtime (AII-1564). Run with `npm run test:restate`.
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { afterAll,beforeAll, describe, expect, it } from "vitest";
 import { orchestratorTools } from "../../restate/tools.js";
 import * as dedup from "../../dedup.js";
 import { appendLog, initLogTable } from "../../log.js";
@@ -54,6 +55,21 @@ describe("list_job_accounting on the orchestratorTools service", () => {
     expect(seen).toHaveLength(25);
     expect(new Set(seen).size).toBe(25);
     expect(seen).toEqual([...seen].sort());
+  });
+
+  it("answers a rejected argument with the 400 that docs/contracts/list_job_accounting/invalid-args.json records", async () => {
+    const res = await fetch(`${env.baseUrl()}/orchestratorTools/list_job_accounting`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ caller: SERVICE_CALLER, args: { includeUnsettled: "yes" } }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { code: number; message: string; source?: string };
+    const fixture = JSON.parse(
+      readFileSync(new URL("../../../docs/contracts/list_job_accounting/invalid-args.json", import.meta.url), "utf8"),
+    ) as { response: { content: Array<{ text: string }> } };
+    const recorded = JSON.parse(fixture.response.content[0].text.replace(/^400 /, "")) as typeof body;
+    expect(body).toEqual(recorded);
   });
 
   it("rejects page sizes 0 and 201", async () => {

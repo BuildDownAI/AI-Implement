@@ -97,6 +97,29 @@ describe("listJobAccounting", () => {
     expect(later.records.map((r) => r.dispatchId)).toEqual(["fresh"]);
   });
 
+  it("serves a job finished a minute ago only with includeUnsettled", () => {
+    finishedJob("fresh", NOW - 60 * MS);
+    expect(acc.listJobAccounting({ now: NOW }).records).toEqual([]);
+    expect(acc.listJobAccounting({ now: NOW, includeUnsettled: true }).records.map((r) => r.dispatchId)).toEqual(["fresh"]);
+  });
+
+  it("still applies the cursor and page size with includeUnsettled", () => {
+    finishedJob("u1", NOW - 120 * MS);
+    finishedJob("u2", NOW - 60 * MS);
+    const first = acc.listJobAccounting({ pageSize: 1, now: NOW, includeUnsettled: true });
+    expect(first.records.map((r) => r.dispatchId)).toEqual(["u1"]);
+    expect(first.nextCursor).toEqual({ changedAt: NOW - 120 * MS, dispatchId: "u1" });
+    const second = acc.listJobAccounting({ pageSize: 5, cursor: first.nextCursor ?? undefined, now: NOW, includeUnsettled: true });
+    expect(second.records.map((r) => r.dispatchId)).toEqual(["u2"]);
+    expect(second.nextCursor).toBeNull();
+  });
+
+  it("accepts includeUnsettled only as a boolean", () => {
+    expect(acc.JobAccountingArgsSchema.safeParse({}).success).toBe(true);
+    expect(acc.JobAccountingArgsSchema.safeParse({ includeUnsettled: true }).success).toBe(true);
+    expect(acc.JobAccountingArgsSchema.safeParse({ includeUnsettled: "yes" }).success).toBe(false);
+  });
+
   it("gives one record each for success, failure, timeout, cancel, planning, kg-refresh and review-fix", () => {
     const outcomes: Array<[string, string, string, string]> = [
       ["ok", "completed", "success", "implementation"],
