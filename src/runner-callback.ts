@@ -189,6 +189,8 @@ export interface RunnerResultBody {
    * invocation id. Absent from runners that predate the field.
    */
   invocations?: InvocationRecordV1[];
+  /** How many invocation records the runner dropped (malformed or past the cap) before sending; absent when none. */
+  invocationsDropped?: number;
   /**
    * SHAs the job pushed, oldest first (AII-1562); `[]` when nothing was pushed. Absent when the runner
    * did not report, which is distinct from empty. Dropped with a warning when malformed.
@@ -617,23 +619,24 @@ function recordResultInvocations(
 }
 
 /** Sanitizes the result body's accounting lists with count-only warnings. */
-function sanitizeAccountingLists(body: { invocations?: unknown; pushedCommits?: unknown }): {
+function sanitizeAccountingLists(body: { invocations?: unknown; invocationsDropped?: unknown; pushedCommits?: unknown }): {
   records: InvocationRecordV1[];
   pushedCommits: string[] | null;
-  /** The result carried an `invocations` list and none of it was dropped (malformed or past the cap). */
+  /** The result carried an `invocations` list and none of it was dropped here or by the runner (malformed or past the cap). */
   listWhole: boolean;
 } {
   const { valid, dropped } = sanitizeInvocationRecords(body.invocations);
   if (dropped > 0) console.warn(`[runner-callback] Dropped ${dropped} invalid invocation record(s)`);
   const pushedCommits = sanitizePushedCommits(body.pushedCommits);
   if (body.pushedCommits !== undefined && pushedCommits === null) console.warn("[runner-callback] Dropped invalid pushed commit list");
-  return { records: valid, pushedCommits, listWhole: Array.isArray(body.invocations) && dropped === 0 };
+  const runnerDropped = typeof body.invocationsDropped === "number" && body.invocationsDropped > 0;
+  return { records: valid, pushedCommits, listWhole: Array.isArray(body.invocations) && dropped === 0 && !runnerDropped };
 }
 
 /** Best-effort diagnostics only: accepted result identity and frozen configuration remain authoritative. */
 function recordManagedResultAttribution(
   result: ReviewFixResultMetadataV1,
-  body: { attribution?: unknown; invocations?: unknown; pushedCommits?: unknown; failure?: unknown; failureCode?: unknown },
+  body: { attribution?: unknown; invocations?: unknown; invocationsDropped?: unknown; pushedCommits?: unknown; failure?: unknown; failureCode?: unknown },
 ): void {
   if (body.attribution == null && body.invocations == null && body.pushedCommits == null) return;
   try {
@@ -808,6 +811,7 @@ export async function handleRunnerResult(
     cycleSummaries?: unknown;
     attribution?: unknown;
     invocations?: unknown;
+    invocationsDropped?: unknown;
     pushedCommits?: unknown;
     reviewFix?: unknown;
     externalReviewPending?: unknown;

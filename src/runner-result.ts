@@ -264,6 +264,8 @@ export async function postRunnerResult(params: {
   const invocations = sanitizeInvocationRecords(params.invocations ?? collectedInvocations());
   if (invocations.dropped > 0) console.warn(`[runner-callback] dropping ${invocations.dropped} invalid invocation record(s) before delivery`);
   if (invocations.valid.length > 0) body.invocations = invocations.valid;
+  // The orchestrator cannot see a cut or a drop, so the runner says so: the job's usage is then `partial`.
+  if (invocations.dropped > 0) body.invocationsDropped = invocations.dropped;
   const pushedCommits = sanitizePushedCommits(params.pushedCommits ?? collectedPushedCommits());
   if (pushedCommits) body.pushedCommits = pushedCommits;
   if (params.externalReviewPending) body.externalReviewPending = params.externalReviewPending;

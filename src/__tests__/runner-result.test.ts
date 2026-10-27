@@ -119,6 +119,43 @@ describe("postRunnerResult", () => {
     expect(endpoint.calls).toHaveLength(1);
   });
 
+  describe("invocationsDropped", () => {
+    const rec = (i: number) => ({
+      attribution: {
+        version: 1, invocationId: `inv-${i}`, stage: "implementation", snapshotId: "snap-1", agent: "codex", provider: "openai",
+        model: "m", profileId: "p", authMode: "openai-api-key", limit: null, outcome: "success", usage: null,
+      },
+      attempts: 1,
+    });
+    const post = async (invocations: unknown[]) => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      const endpoint = resultEndpoint();
+      await postRunnerResult({
+        workspaceDir, phase: "implementation", outcome: "success", callbackUrl: "https://cb",
+        invocations: invocations as never, fetchImpl: endpoint.fetch,
+      });
+      return sentBody(endpoint);
+    };
+
+    it("reports the records past the 200 cap", async () => {
+      const body = await post(Array.from({ length: 250 }, (_, i) => rec(i)));
+      expect(body.invocations).toHaveLength(200);
+      expect(body.invocationsDropped).toBe(50);
+    });
+
+    it("reports malformed records", async () => {
+      const body = await post([...Array.from({ length: 5 }, (_, i) => rec(i)), ...Array.from({ length: 3 }, () => ({ bad: true }))]);
+      expect(body.invocations).toHaveLength(5);
+      expect(body.invocationsDropped).toBe(3);
+    });
+
+    it("leaves the key out when nothing was dropped", async () => {
+      const body = await post(Array.from({ length: 5 }, (_, i) => rec(i)));
+      expect(body.invocations).toHaveLength(5);
+      expect("invocationsDropped" in body).toBe(false);
+    });
+  });
+
   it("logs the phase and outcome when the post succeeds", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const endpoint = resultEndpoint();
