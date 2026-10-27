@@ -73,6 +73,7 @@ import {
 import { buildPublicationCycleSummary, readCycleSummaries } from "./pipeline/cycle-summary.js";
 import type { GhSpawn } from "./pipeline/review-ledger.js";
 import { DEFAULT_MODEL } from "./pipeline/default-model.js";
+import { resetJobAccounting } from "./pipeline/job-accounting.js";
 
 /**
  * Runner-activity wiring for one autonomous run (AII-798). `sink` is handed to the
@@ -1216,6 +1217,8 @@ function buildConfiguredRun(
 }
 
 export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<RunAutonomousResult> {
+  // A runner process reports one job; drop any invocations or SHAs a previous run in this process collected.
+  resetJobAccounting();
   // Move the one-use publication bearer out of the inherited environment
   // before hooks, package installs, repository scripts, or model subprocesses
   // can run. Runner-owned publication steps retrieve it from private memory.

@@ -7,6 +7,7 @@ import {
   updateJobFailure,
   recordInvocationAttribution,
   recordPushedCommits,
+  recordInvocationsComplete,
   updateJobPrUrl,
   updateJobStatus,
   type Job,
@@ -576,7 +577,7 @@ function recordOneCycleSummary(attemptId: string, summary: CycleSummary): Review
  * `attribution`. List records go in first and the legacy attribution last, so the "latest row per dispatch"
  * read keeps resolving to the same row it did before the list existed (insert-or-ignore never reorders).
  * An invocation with no usage is stored with availability "unavailable" and null cost, never dropped or zeroed.
- * Returns how many records did not match the dispatch snapshot.
+ * Returns how many records were not stored (not matching the dispatch snapshot, or without an invocation id).
  */
 function recordResultInvocations(
   dispatchId: string,
@@ -602,7 +603,8 @@ function recordResultInvocations(
       },
       ...(record ? { attempts: record.attempts } : {}),
     });
-    if (row && opts.accepts(row)) recordInvocationAttribution(dispatchId, row, { timedOut });
+    // A row with no invocation id cannot be stored, so it counts as unstored; a repeat of a stored row does not.
+    if (row && row.invocationId !== null && opts.accepts(row)) recordInvocationAttribution(dispatchId, row, { timedOut });
     else mismatched++;
   };
   const legacyRecord = legacy ? records.find((r) => r.attribution.invocationId === legacy.invocationId) : undefined;
@@ -618,12 +620,14 @@ function recordResultInvocations(
 function sanitizeAccountingLists(body: { invocations?: unknown; pushedCommits?: unknown }): {
   records: InvocationRecordV1[];
   pushedCommits: string[] | null;
+  /** The result carried an `invocations` list and none of it was dropped (malformed or past the cap). */
+  listWhole: boolean;
 } {
   const { valid, dropped } = sanitizeInvocationRecords(body.invocations);
   if (dropped > 0) console.warn(`[runner-callback] Dropped ${dropped} invalid invocation record(s)`);
   const pushedCommits = sanitizePushedCommits(body.pushedCommits);
   if (body.pushedCommits !== undefined && pushedCommits === null) console.warn("[runner-callback] Dropped invalid pushed commit list");
-  return { records: valid, pushedCommits };
+  return { records: valid, pushedCommits, listWhole: Array.isArray(body.invocations) && dropped === 0 };
 }
 
 /** Best-effort diagnostics only: accepted result identity and frozen configuration remain authoritative. */
@@ -638,11 +642,14 @@ function recordManagedResultAttribution(
       attribution = sanitizeAttribution(body.attribution) ?? undefined;
       if (!attribution) console.warn("[runner-callback] Dropped 1 invalid managed attribution record(s)");
     }
-    const { records, pushedCommits } = sanitizeAccountingLists(body);
+    const { records, pushedCommits, listWhole } = sanitizeAccountingLists(body);
     const dispatchId = acceptedReviewFixDispatchId(result);
     if (!dispatchId) return;
     if (pushedCommits) recordPushedCommits(dispatchId, pushedCommits);
-    if (!attribution && records.length === 0) return;
+    if (!attribution && records.length === 0) {
+      if (listWhole) recordInvocationsComplete(dispatchId);
+      return;
+    }
     const snapshot = loadStoredSnapshot(dispatchId);
     const mismatched = snapshot
       ? recordResultInvocations(dispatchId, snapshot, records, attribution, {
@@ -653,7 +660,7 @@ function recordManagedResultAttribution(
       : 1;
     if (mismatched > 0) {
       console.warn(`[runner-callback] Dropped ${mismatched} managed attribution record(s) not matching accepted snapshot`);
-    }
+    } else if (listWhole) recordInvocationsComplete(dispatchId);
   } catch {
     console.warn("[runner-callback] Could not persist 1 managed attribution record (count only)");
   }
@@ -1024,9 +1031,10 @@ export async function handleRunnerResult(
   // Job accounting (AII-1562): every invocation plus the pushed SHAs. A body without the lists (older
   // runner) stores just the single attribution above; malformed entries are dropped, never fatal.
   const accounting = sanitizeAccountingLists(body);
-  if (input.body.attribution || accounting.records.length > 0 || accounting.pushedCommits) {
+  if (input.body.attribution || accounting.records.length > 0 || accounting.pushedCommits || accounting.listWhole) {
     try {
       if (accounting.pushedCommits) recordPushedCommits(claims.dispatchId, accounting.pushedCommits);
+      let complete = accounting.listWhole;
       if (input.body.attribution || accounting.records.length > 0) {
         const snapshot = loadStoredSnapshot(claims.dispatchId);
         if (snapshot) {
@@ -1034,9 +1042,13 @@ export async function handleRunnerResult(
             timedOut: input.body.failureCode === "INVOCATION_TIMEOUT" || failure?.code === "INVOCATION_TIMEOUT",
             accepts: (row) => row.attribution !== "rejected",
           });
-          if (mismatched > 0) console.warn(`[runner-callback] Dropped ${mismatched} attribution record(s) not matching the dispatch snapshot`);
-        }
+          if (mismatched > 0) {
+            complete = false;
+            console.warn(`[runner-callback] Dropped ${mismatched} attribution record(s) not matching the dispatch snapshot`);
+          }
+        } else complete = false;
       }
+      if (complete) recordInvocationsComplete(claims.dispatchId);
     } catch {
       console.warn("[runner-callback] Could not persist 1 attribution record (count only)");
     }

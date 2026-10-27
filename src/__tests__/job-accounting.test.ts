@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { describe, it, expect, beforeEach } from "vitest";
 import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
@@ -27,6 +26,8 @@ beforeEach(async () => {
 function finishedJob(dispatchId: string, completedAt: number, extra: Record<string, unknown> = {}): number {
   const id = log.appendLog({ issueId: `issue-${dispatchId}`, dispatchId, executionMode: "fly-machines", ...extra });
   dedup.getDb().prepare("UPDATE dispatch_log SET status = 'completed', conclusion = 'success', completed_at = ? WHERE id = ?").run(completedAt, id);
+  // The trigger stamps the wall clock; pin changed_at to the completion time like a job that never changed again.
+  dedup.getDb().prepare("UPDATE dispatch_log SET changed_at = ? WHERE id = ?").run(completedAt, id);
   return id;
 }
 
@@ -35,10 +36,10 @@ function reviewFixAttempt(dispatchId: string, completedAt: number | null): void 
     .getDb()
     .prepare(
       `INSERT INTO review_fix_attempts (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number, issue_scope,
-         issue_id, owner, state, created_at, deadline_at, task_snapshot_json, finding_versions_json, completed_at)
-       VALUES (?, ?, 'm', '1', 'o/r', 7, 's', 'i', 'o', 'succeeded', ?, ?, ?, '[]', ?)`,
+         issue_id, owner, state, created_at, deadline_at, task_snapshot_json, finding_versions_json, completed_at, changed_at)
+       VALUES (?, ?, 'm', '1', 'o/r', 7, 's', 'i', 'o', 'succeeded', ?, ?, ?, '[]', ?, ?)`,
     )
-    .run(`att-${dispatchId}`, dispatchId, OLD - 1000, NOW, "SENTINEL-task-snapshot", completedAt);
+    .run(`att-${dispatchId}`, dispatchId, OLD - 1000, NOW, "SENTINEL-task-snapshot", completedAt, completedAt);
 }
 
 function pageAll(pageSize: number): string[] {
@@ -74,7 +75,7 @@ describe("listJobAccounting", () => {
     const all = acc.listJobAccounting({ pageSize: 200, now: NOW }).records;
     for (let i = 1; i < all.length; i++) {
       const a = all[i - 1], b = all[i];
-      expect(a.completedAt < b.completedAt || (a.completedAt === b.completedAt && a.dispatchId < b.dispatchId)).toBe(true);
+      expect(a.changedAt < b.changedAt || (a.changedAt === b.changedAt && a.dispatchId < b.dispatchId)).toBe(true);
     }
   });
 
@@ -82,7 +83,7 @@ describe("listJobAccounting", () => {
     finishedJob("a", OLD);
     const page = acc.listJobAccounting({ pageSize: 5, now: NOW });
     expect(page.nextCursor).toBeNull();
-    expect(acc.listJobAccounting({ cursor: { completedAt: OLD, dispatchId: "a" }, now: NOW }).records).toEqual([]);
+    expect(acc.listJobAccounting({ cursor: { changedAt: OLD, dispatchId: "a" }, now: NOW }).records).toEqual([]);
   });
 
   it("holds back a job finished less than 10 minutes ago and does not skip it later", () => {
@@ -152,9 +153,10 @@ describe("listJobAccounting", () => {
          auth_mode, status, started_at, completed_at, usage_json)
        VALUES ('inv1', 'some', 'implementation', 'p', 1, 'claude', 'anthropic', 'm1', 'api_key', 'succeeded', 1, 2, ?)`,
     ).run(JSON.stringify({ tokensIn: 10, tokensOut: 5, costUsd: null, costStatus: "unavailable", attempts: 2, prompt: "SENTINEL-prompt" }));
-    const [none, some] = acc.listJobAccounting({ now: NOW }).records;
+    const by = new Map(acc.listJobAccounting({ now: NOW }).records.map((r) => [r.dispatchId, r]));
+    const none = by.get("none")!, some = by.get("some")!;
     expect(none).toMatchObject({ usage: "unknown", invocations: [] });
-    expect(some.usage).toBe("reported");
+    expect(some.usage).toBe("partial");
     expect(some.invocations[0]).toMatchObject({
       stage: "implementation", agent: "claude", provider: "anthropic", model: "m1", tokensIn: 10, tokensOut: 5,
       cacheReadTokens: null, costUsd: null, costStatus: "unavailable", attempts: 2,
@@ -167,7 +169,7 @@ describe("listJobAccounting", () => {
       machineSize: { cpuKind: "shared", cpus: 4, memoryMb: 8192 }, computeStartedAt: OLD - 5,
     });
     dedup.getDb().prepare("UPDATE dispatch_log SET compute_stopped_at = ?").run(OLD - 1);
-    dedup.getDb().prepare("INSERT INTO dispatch_pushed_commits (dispatch_id, shas_json, recorded_at) VALUES ('sized', '[\"abc\"]', 1)").run();
+    dedup.getDb().prepare("INSERT INTO dispatch_job_report (dispatch_id, pushed_shas_json, recorded_at) VALUES ('sized', '[\"abc\"]', 1)").run();
     const [r] = acc.listJobAccounting({ now: NOW }).records;
     expect(r.compute).toEqual({ backend: "fly-machines", cpuKind: "shared", cpus: 4, memoryMb: 8192, startedAt: OLD - 5, stoppedAt: OLD - 1 });
     expect(r.issue).toMatchObject({ trackerKind: "linear", url: "https://linear.app/x/issue/A-1" });
@@ -176,7 +178,7 @@ describe("listJobAccounting", () => {
 
   it("reads pushedShas as null when unreported or malformed, [] when none pushed, and the list otherwise", () => {
     for (const id of ["unreported", "none", "some", "bad"]) finishedJob(id, OLD);
-    const ins = dedup.getDb().prepare("INSERT INTO dispatch_pushed_commits (dispatch_id, shas_json, recorded_at) VALUES (?, ?, 1)");
+    const ins = dedup.getDb().prepare("INSERT INTO dispatch_job_report (dispatch_id, pushed_shas_json, recorded_at) VALUES (?, ?, 1)");
     ins.run("none", "[]");
     ins.run("some", '["a","b"]');
     ins.run("bad", "not json");
@@ -191,6 +193,7 @@ describe("listJobAccounting", () => {
     finishedJob("a", OLD - 3);
     const legacy = log.appendLog({ issueId: "issue-legacy", executionMode: "fly-machines" });
     dedup.getDb().prepare("UPDATE dispatch_log SET dispatch_id = NULL, status = 'completed', conclusion = 'success', completed_at = ? WHERE id = ?").run(OLD - 2, legacy);
+    dedup.getDb().prepare("UPDATE dispatch_log SET changed_at = ? WHERE id = ?").run(OLD - 2, legacy);
     finishedJob("c", OLD - 1);
     const first = acc.listJobAccounting({ pageSize: 2, now: NOW });
     expect(first.records.map((r) => r.dispatchId)).toEqual(["a", `log-${legacy}`]);
@@ -217,10 +220,199 @@ describe("listJobAccounting", () => {
   });
 });
 
-describe("docs/job-accounting-record.example.json", () => {
-  it("parses with the tool's output schema and shows a call with unknown cost", () => {
-    const raw = JSON.parse(readFileSync(new URL("../../docs/job-accounting-record.example.json", import.meta.url), "utf8"));
-    const page = acc.JobAccountingPageSchema.strict().parse(raw);
-    expect(page.records[0].invocations.some((i) => i.costStatus === "unavailable" && i.costUsd === null)).toBe(true);
+const MS = 1000;
+// The triggers stamp the wall clock, so the changing-job tests live in real time rather than at NOW.
+const PAST = Date.now() - 2 * 3600 * MS;
+
+function reportJob(dispatchId: string, opts: { complete: boolean; rows?: number }): void {
+  const db = dedup.getDb();
+  for (let i = 0; i < (opts.rows ?? 1); i++) {
+    db.prepare(
+      `INSERT INTO model_invocation_attribution (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model,
+         auth_mode, status, started_at, completed_at, usage_json)
+       VALUES (?, ?, 'implementation', 'p', 1, 'claude', 'anthropic', 'm', 'api_key', 'succeeded', 1, 2, '{}')`,
+    ).run(`${dispatchId}-inv-${i}`, dispatchId);
+  }
+  if (opts.complete) log.recordInvocationsComplete(dispatchId);
+}
+
+function setChanged(dispatchId: string, at: number): void {
+  dedup.getDb().prepare("UPDATE dispatch_log SET changed_at = ? WHERE dispatch_id = ?").run(at, dispatchId);
+  dedup.getDb().prepare("UPDATE review_fix_attempts SET changed_at = ? WHERE dispatch_id = ?").run(at, dispatchId);
+}
+
+function changedAtOf(dispatchId: string): number {
+  return (dedup.getDb().prepare("SELECT changed_at AS c FROM dispatch_log WHERE dispatch_id = ?").get(dispatchId) as { c: number }).c;
+}
+
+describe("a job that changes is served again (AII-1566)", () => {
+  it.each([
+    ["a second terminal write", (id: number) => log.updateJobStatus(id, "completed", "success", null)],
+    ["a late conclusion", (id: number) => dedup.getDb().prepare("UPDATE dispatch_log SET conclusion = 'late' WHERE id = ?").run(id)],
+    ["a compute stop", (id: number) => dedup.getDb().prepare("UPDATE dispatch_log SET compute_stopped_at = 5 WHERE id = ?").run(id)],
+  ])("serves the job again after %s, with a newer changedAt", async (_name, change) => {
+    const id = finishedJob("j", PAST);
+    const before = acc.listJobAccounting({ now: Date.now() + 3600 * MS }).records[0].changedAt;
+    expect(before).toBe(PAST);
+    await new Promise((r) => setTimeout(r, 5));
+    change(id);
+    const wallLater = Date.now() + 3600 * MS;
+    const page = acc.listJobAccounting({ cursor: { changedAt: before, dispatchId: "j" }, now: wallLater });
+    expect(page.records.map((r) => r.dispatchId)).toEqual(["j"]);
+    expect(page.records[0].changedAt).toBeGreaterThan(before);
+  });
+
+  it("serves the job again after a late invocation row or runner report", () => {
+    finishedJob("inv", PAST);
+    finishedJob("rep", PAST);
+    const cursor = { changedAt: PAST, dispatchId: "rep" };
+    reportJob("inv", { complete: false });
+    log.recordPushedCommits("rep", []);
+    const page = acc.listJobAccounting({ cursor, now: Date.now() + 3600 * MS });
+    expect(page.records.map((r) => r.dispatchId).sort()).toEqual(["inv", "rep"]);
+  });
+
+  it("does not move changed_at for a bookkeeping write", () => {
+    const id = finishedJob("book", PAST);
+    const db = dedup.getDb();
+    db.prepare("UPDATE dispatch_log SET notified_at = 5, machine_nonce = 'n', failure_commented_at = 6, failure_json = '{}' WHERE id = ?").run(id);
+    expect(changedAtOf("book")).toBe(PAST);
+  });
+
+  it("withholds a record until its last change settles, not its completion", () => {
+    finishedJob("rewritten", PAST);
+    dedup.getDb().prepare("UPDATE dispatch_log SET changed_at = ? WHERE dispatch_id = 'rewritten'").run(NOW - 60 * MS);
+    expect(acc.listJobAccounting({ now: NOW }).records).toEqual([]);
+    expect(acc.listJobAccounting({ now: NOW + acc.JOB_ACCOUNTING_SETTLE_MS }).records).toHaveLength(1);
+  });
+
+  it("serves a review-fix attempt whose completed_at is behind the cursor but was written after it", () => {
+    reviewFixAttempt("late-fix", PAST - 5000);
+    const first = acc.listJobAccounting({ now: NOW });
+    expect(first.records).toHaveLength(1);
+    const cursor = { changedAt: first.records[0].changedAt, dispatchId: "late-fix" };
+    dedup.getDb().prepare("UPDATE review_fix_attempts SET state = 'failed', completed_at = ? WHERE dispatch_id = 'late-fix'").run(PAST - 4000);
+    const page = acc.listJobAccounting({ cursor, now: Date.now() + 3600 * MS });
+    expect(page.records.map((r) => r.dispatchId)).toEqual(["late-fix"]);
+    expect(page.records[0].changedAt).toBeGreaterThan(PAST);
+    // A runner report for an attempt moves it too.
+    setChanged("late-fix", PAST);
+    log.recordPushedCommits("late-fix", []);
+    const again = acc.listJobAccounting({ cursor: { changedAt: PAST, dispatchId: "late-fix" }, now: Date.now() + 3600 * MS });
+    expect(again.records.map((r) => r.dispatchId)).toEqual(["late-fix"]);
+  });
+
+  it("reports an attempt with a dispatch_log row once", () => {
+    reviewFixAttempt("both", PAST);
+    finishedJob("both", PAST);
+    reportJob("both", { complete: true });
+    expect(acc.listJobAccounting({ now: Date.now() + 3600 * MS }).records.filter((r) => r.dispatchId === "both")).toHaveLength(1);
+  });
+
+  it("pages 250 jobs with changes between pages: none skipped, the newest version last", () => {
+    for (let i = 0; i < 250; i++) finishedJob(`p-${String(i).padStart(3, "0")}`, PAST + i * MS);
+    const later = Date.now() + 3600 * MS;
+    const last = new Map<string, number>();
+    const seen: string[] = [];
+    const first = acc.listJobAccounting({ pageSize: 100, now: later });
+    for (const r of first.records) { seen.push(r.dispatchId); last.set(r.dispatchId, r.changedAt); }
+    // Two already-served jobs change, and one not yet served.
+    dedup.getDb().prepare("UPDATE dispatch_log SET conclusion = 'late' WHERE dispatch_id IN ('p-003', 'p-050', 'p-220')").run();
+    let cursor = first.nextCursor ?? undefined;
+    for (let i = 0; i < 20 && cursor; i++) {
+      const page = acc.listJobAccounting({ cursor, pageSize: 100, now: later });
+      for (const r of page.records) { seen.push(r.dispatchId); last.set(r.dispatchId, r.changedAt); }
+      cursor = page.nextCursor ?? undefined;
+    }
+    expect(new Set(seen).size).toBe(250);
+    for (const id of ["p-003", "p-050", "p-220"]) expect(last.get(id)).toBe(changedAtOf(id));
+    expect(seen.filter((id) => id === "p-003")).toHaveLength(2);
+  });
+});
+
+describe("usage completeness (AII-1566)", () => {
+  it("is reported only with a complete list, partial with rows alone, unknown with none", () => {
+    finishedJob("whole", PAST);
+    finishedJob("legacy", PAST + 1);
+    finishedJob("none", PAST + 2);
+    finishedJob("flag-only", PAST + 3);
+    reportJob("whole", { complete: true, rows: 3 });
+    reportJob("legacy", { complete: false });
+    log.recordInvocationsComplete("flag-only");
+    const by = new Map(acc.listJobAccounting({ now: Date.now() + 3600 * MS }).records.map((r) => [r.dispatchId, r.usage]));
+    expect(by.get("whole")).toBe("reported");
+    expect(by.get("legacy")).toBe("partial");
+    expect(by.get("none")).toBe("unknown");
+    expect(by.get("flag-only")).toBe("unknown");
+  });
+
+  it("keeps the pushed SHAs and the complete flag apart, and a retry never clears either", () => {
+    finishedJob("r", PAST);
+    log.recordInvocationsComplete("r");
+    log.recordPushedCommits("r", ["a".repeat(40)]);
+    log.recordPushedCommits("r", ["b".repeat(40)]);
+    expect(log.getPushedCommits("r")).toEqual(["a".repeat(40)]);
+    const row = dedup.getDb().prepare("SELECT invocations_complete AS c FROM dispatch_job_report WHERE dispatch_id = 'r'").get() as { c: number };
+    expect(row.c).toBe(1);
+  });
+});
+
+describe("pruning (AII-1566)", () => {
+  it("sets prunedThrough to the newest pruned finished row and drops its invocation and report rows", () => {
+    const a = finishedJob("old", PAST);
+    const b = finishedJob("newer", PAST + 10);
+    finishedJob("kept", PAST + 20);
+    reportJob("old", { complete: true });
+    reportJob("newer", { complete: true });
+    reportJob("kept", { complete: true });
+    setChanged("old", PAST);
+    setChanged("newer", PAST + 10);
+    setChanged("kept", PAST + 20);
+    const db = dedup.getDb();
+    expect(acc.listJobAccounting({ now: NOW }).prunedThrough).toBeNull();
+    db.prepare("DELETE FROM dispatch_log WHERE id = ?").run(b);
+    expect(acc.listJobAccounting({ now: NOW }).prunedThrough).toEqual({ changedAt: PAST + 10, dispatchId: "newer" });
+    db.prepare("DELETE FROM dispatch_log WHERE id = ?").run(a);
+    expect(acc.listJobAccounting({ now: NOW }).prunedThrough).toEqual({ changedAt: PAST + 10, dispatchId: "newer" });
+    for (const t of ["model_invocation_attribution", "dispatch_job_report"]) {
+      const ids = (db.prepare(`SELECT dispatch_id AS d FROM ${t}`).all() as Array<{ d: string }>).map((r) => r.d);
+      expect(ids.every((d) => d.startsWith("kept"))).toBe(true);
+      expect(ids.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("ignores an unfinished row", () => {
+    const id = log.appendLog({ issueId: "open", dispatchId: "open" });
+    dedup.getDb().prepare("DELETE FROM dispatch_log WHERE id = ?").run(id);
+    expect(acc.listJobAccounting({ now: NOW }).prunedThrough).toBeNull();
+  });
+
+  it("keeps a finished row younger than 7 days through the prune", () => {
+    const young = finishedJob("young", Date.now() - 60 * MS);
+    dedup.getDb().prepare("UPDATE dispatch_log SET dispatched_at = 1 WHERE id = ?").run(young);
+    for (let i = 0; i < 505; i++) log.appendLog({ issueId: `x${i}`, dispatchId: `x${i}` });
+    expect(dedup.getDb().prepare("SELECT 1 FROM dispatch_log WHERE id = ?").get(young)).toBeTruthy();
+    expect(dedup.getDb().prepare("SELECT COUNT(*) AS n FROM dispatch_log").get()).toMatchObject({ n: 506 - 5 });
+    expect(acc.listJobAccounting({ now: NOW }).prunedThrough).toBeNull();
+  });
+});
+
+describe("upgrade (AII-1566)", () => {
+  it("backfills changed_at once and a second boot changes nothing", () => {
+    const db = dedup.getDb();
+    finishedJob("up", PAST);
+    reviewFixAttempt("up-fix", PAST + 1);
+    db.prepare("UPDATE dispatch_log SET changed_at = NULL").run();
+    db.prepare("UPDATE review_fix_attempts SET changed_at = NULL").run();
+    log.initLogTable();
+    expect(changedAtOf("up")).toBe(PAST);
+    db.prepare("UPDATE dispatch_log SET changed_at = ?").run(PAST + 99);
+    log.initLogTable();
+    expect(changedAtOf("up")).toBe(PAST + 99);
+    const triggers = () => db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name").all();
+    const before = triggers();
+    log.initLogTable();
+    expect(triggers()).toEqual(before);
+    expect((db.prepare("SELECT changed_at AS c FROM review_fix_attempts").get() as { c: number }).c).toBe(PAST + 1);
   });
 });

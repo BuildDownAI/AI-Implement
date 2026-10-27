@@ -5867,6 +5867,47 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
       expect(warn.mock.calls.join(" ")).not.toContain(PLANTED);
     });
 
+    describe("invocations_complete (AII-1566)", () => {
+      const complete = (id = "disp-attr") =>
+        (dedup.getDb().prepare("SELECT invocations_complete AS c FROM dispatch_job_report WHERE dispatch_id = ?").get(id) as { c: number } | undefined)?.c ?? 0;
+
+      it("is set when the whole list was stored", async () => {
+        await deliver(claim({ invocationId: "impl-3" }), { extra: { invocations: threePass() } });
+        expect(complete()).toBe(1);
+        // Still set after a repeated delivery.
+        dedup.getDb().prepare("DELETE FROM runner_tokens").run();
+        await deliver(claim({ invocationId: "impl-3" }), { extra: { invocations: threePass() } });
+        expect(complete()).toBe(1);
+      });
+
+      it("stays unset without an invocations list, with a legacy attribution alone, or with pushedCommits alone", async () => {
+        await deliver(claim());
+        await deliver(undefined, { dispatchId: "d-sha", extra: { pushedCommits: [SHA_A] } });
+        expect(complete()).toBe(0);
+        expect(complete("d-sha")).toBe(0);
+        expect(log.getPushedCommits("d-sha")).toEqual([SHA_A]);
+      });
+
+      it("stays unset when an entry was dropped as malformed", async () => {
+        vi.spyOn(console, "warn").mockImplementation(() => undefined);
+        await deliver(undefined, { extra: { invocations: [record("ok-1", "implementation"), record("bad", "implementation", {}, { attempts: 0 })] } });
+        expect(complete()).toBe(0);
+      });
+
+      it("stays unset when an entry did not match the snapshot", async () => {
+        vi.spyOn(console, "warn").mockImplementation(() => undefined);
+        await deliver(undefined, { extra: { invocations: [record("ok-1", "implementation"), record("other", "implementation", { snapshotId: "other-snap" })] } });
+        expect(complete()).toBe(0);
+      });
+
+      it("stays unset when the list is past the cap", async () => {
+        vi.spyOn(console, "warn").mockImplementation(() => undefined);
+        const many = Array.from({ length: 201 }, (_, i) => record(`inv-${i}`, "implementation"));
+        await deliver(undefined, { extra: { invocations: many } });
+        expect(complete()).toBe(0);
+      });
+    });
+
     it("stores a body with only the legacy attribution as one row", async () => {
       await deliver(claim());
       expect(rows()).toHaveLength(1);
@@ -5883,7 +5924,7 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
 
   it("still completes the terminal callback when persistence throws, without echoing payload", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    dedup.getDb().exec("DROP TABLE model_invocation_attribution");
+    dedup.getDb().exec("CREATE TRIGGER boom BEFORE INSERT ON model_invocation_attribution BEGIN SELECT RAISE(ABORT, 'boom'); END");
     const res = await deliver(claim({ model: "m-implementation" }));
     expect(res.status).toBe(200);
     expect(warn.mock.calls.map((c) => c.join(" ")).join("\n")).toContain("Could not persist 1 attribution record");

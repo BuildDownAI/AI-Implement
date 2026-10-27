@@ -305,13 +305,23 @@ function createAgentConfigurationTables(): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_model_invocation_attribution_dispatch
     ON model_invocation_attribution(dispatch_id, stage)`);
-  // The SHAs a job pushed, oldest first, as a JSON array (AII-1562). No row = the runner did not
-  // report; '[]' = it reported that nothing was pushed.
+  // What the runner reported about one job beyond the single attribution (AII-1562, AII-1566): the SHAs it
+  // pushed, oldest first, as a JSON array (null = not reported, '[]' = nothing pushed), and whether its
+  // `invocations` list arrived whole (1 only when the result carried the list and none was dropped or unstored).
   db.exec(`
-    CREATE TABLE IF NOT EXISTS dispatch_pushed_commits (
+    CREATE TABLE IF NOT EXISTS dispatch_job_report (
       dispatch_id TEXT PRIMARY KEY,
-      shas_json TEXT NOT NULL,
+      pushed_shas_json TEXT,
+      invocations_complete INTEGER NOT NULL DEFAULT 0 CHECK (invocations_complete IN (0, 1)),
       recorded_at INTEGER NOT NULL
+    )
+  `);
+  // The newest (changed_at, jid) of any finished job the prune deleted (AII-1566); one row, never moves back.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS job_accounting_pruned (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      changed_at INTEGER NOT NULL,
+      jid TEXT NOT NULL
     )
   `);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trg_model_profile_reservations_owner_immutable
@@ -505,12 +515,22 @@ export function getDb(): Database.Database {
         result_conflict_at INTEGER,
         terminal_outcome_json TEXT,
         completed_at INTEGER,
+        changed_at INTEGER,
         CHECK ((github_run_id IS NULL) = (github_run_attempt IS NULL)),
         CHECK ((accepted_result_json IS NULL) = (accepted_result_hash IS NULL))
       )
     `);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_attempts_pr_history
       ON review_fix_attempts(installation_id, repository, pr_number, created_at)`);
+    // AII-1566: when a record the control plane reads last changed (epoch ms, set by SQLite).
+    const fixCols = db.prepare("PRAGMA table_info(review_fix_attempts)").all() as Array<{ name: string }>;
+    if (!fixCols.some((c) => c.name === "changed_at")) {
+      db.exec("ALTER TABLE review_fix_attempts ADD COLUMN changed_at INTEGER");
+    }
+    db.exec(`CREATE TRIGGER IF NOT EXISTS trg_review_fix_attempts_changed_at
+      AFTER UPDATE OF state, terminal_outcome_json, completed_at ON review_fix_attempts
+      BEGIN UPDATE review_fix_attempts SET changed_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
+        WHERE attempt_id = NEW.attempt_id; END`);
     db.exec(`CREATE TRIGGER IF NOT EXISTS trg_review_fix_attempt_owner_immutable
       BEFORE UPDATE OF owner ON review_fix_attempts
       WHEN NEW.owner <> OLD.owner

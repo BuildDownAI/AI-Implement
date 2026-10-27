@@ -69,7 +69,7 @@ describe("getPushedCommits failures", () => {
     const db = dedup.getDb();
     const prepare = db.prepare.bind(db);
     vi.spyOn(db, "prepare").mockImplementation(((sql: string) => {
-      if (sql.includes("dispatch_pushed_commits")) throw new TypeError("PLANTED-SECRET-MESSAGE");
+      if (sql.includes("dispatch_job_report")) throw new TypeError("PLANTED-SECRET-MESSAGE");
       return prepare(sql);
     }) as never);
     expect(log.getPushedCommits("d1")).toBeNull();
@@ -77,11 +77,11 @@ describe("getPushedCommits failures", () => {
   });
 
   it.each([["an object", `{"a":1}`], ["a non-string array", `[1,2]`], ["invalid JSON", `not json`]])(
-    "reads %s in shas_json as unknown",
+    "reads %s in pushed_shas_json as unknown",
     (_name, payload) => {
       vi.spyOn(console, "warn").mockImplementation(() => undefined);
       log.recordPushedCommits("d-bad", []);
-      dedup.getDb().prepare("UPDATE dispatch_pushed_commits SET shas_json = ? WHERE dispatch_id = ?").run(payload, "d-bad");
+      dedup.getDb().prepare("UPDATE dispatch_job_report SET pushed_shas_json = ? WHERE dispatch_id = ?").run(payload, "d-bad");
       expect(log.getPushedCommits("d-bad")).toBeNull();
     },
   );

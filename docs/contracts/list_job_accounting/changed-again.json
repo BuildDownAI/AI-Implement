@@ -1,0 +1,81 @@
+{
+  "request": {
+    "args": {
+      "cursor": {
+        "changedAt": 1700000003000,
+        "dispatchId": "job-c"
+      },
+      "pageSize": 5
+    }
+  },
+  "response": {
+    "records": [
+      {
+        "dispatchId": "job-a",
+        "completedAt": 1700000001000,
+        "changedAt": 1700000009000,
+        "usage": "reported",
+        "invocations": [
+          {
+            "stage": "implementation",
+            "agent": "claude",
+            "provider": "anthropic",
+            "model": "claude-model",
+            "status": "succeeded",
+            "tokensIn": 1000,
+            "tokensOut": 100,
+            "cacheReadTokens": null,
+            "cacheCreationTokens": null,
+            "costUsd": 0.25,
+            "costStatus": "reported",
+            "attempts": 1
+          },
+          {
+            "stage": "review",
+            "agent": "claude",
+            "provider": "anthropic",
+            "model": "claude-model",
+            "status": "succeeded",
+            "tokensIn": 2000,
+            "tokensOut": 200,
+            "cacheReadTokens": null,
+            "cacheCreationTokens": null,
+            "costUsd": 0.5,
+            "costStatus": "reported",
+            "attempts": 1
+          }
+        ],
+        "pushedShas": [
+          "1111111111111111111111111111111111111111"
+        ],
+        "phase": "implementation",
+        "status": "completed",
+        "conclusion": "approved_late",
+        "lifecycleOwner": "legacy",
+        "dispatchedAt": 1699999401000,
+        "issue": {
+          "identifier": "AII-job-a",
+          "title": "Job job-a",
+          "repo": "acme/widgets",
+          "trackerKind": "linear",
+          "url": "https://linear.app/acme/issue/AII-job-a"
+        },
+        "pr": {
+          "url": "https://github.com/acme/widgets/pull/5",
+          "number": 5
+        },
+        "compute": {
+          "backend": "fly-machines",
+          "cpuKind": null,
+          "cpus": null,
+          "memoryMb": null,
+          "startedAt": 1699999501000,
+          "stoppedAt": 1700000000000
+        }
+      }
+    ],
+    "nextCursor": null,
+    "oldestRetainedCompletedAt": 1700000001000,
+    "prunedThrough": null
+  }
+}
