@@ -132,6 +132,17 @@ export function initLogTable(): void {
   ensureLogColumns();
 }
 
+/** Nullable per-job accounting columns, saved on the row when the job runs (the mapping can change later). */
+const ACCOUNTING_COLUMNS: ReadonlyArray<readonly [string, string]> = [
+  ["tracker_kind", "TEXT"],
+  ["issue_url", "TEXT"],
+  ["machine_cpu_kind", "TEXT"],
+  ["machine_cpus", "INTEGER"],
+  ["machine_memory_mb", "INTEGER"],
+  ["compute_started_at", "INTEGER"],
+  ["compute_stopped_at", "INTEGER"],
+];
+
 function ensureLogColumns(): void {
   const db = getDb();
   const info = db.prepare("PRAGMA table_info(dispatch_log)").all() as Array<{ name: string }>;
@@ -203,6 +214,9 @@ function ensureLogColumns(): void {
   if (!names.has("failure_commented_at")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN failure_commented_at INTEGER");
   }
+  for (const [column, type] of ACCOUNTING_COLUMNS) {
+    if (!names.has(column)) db.exec(`ALTER TABLE dispatch_log ADD COLUMN ${column} ${type}`);
+  }
   db.exec("CREATE INDEX IF NOT EXISTS idx_dispatch_log_run_id ON dispatch_log(run_id)");
 
   // Migrate legacy rows: jobs that were never actually tracked by the run
@@ -238,6 +252,13 @@ export function appendLogIfAbsent(entry: Parameters<typeof appendLog>[0] & { dis
   return findLogIdByDispatchId(entry.dispatchId) ?? appendLog(entry);
 }
 
+/** The Fly guest a job was launched with. */
+export interface MachineSize {
+  cpuKind: string;
+  cpus: number;
+  memoryMb: number;
+}
+
 export function appendLog(entry: {
   issueId: string;
   issueIdentifier?: string;
@@ -263,12 +284,19 @@ export function appendLog(entry: {
   trigger?: string;
   /** True when this dispatch is a grouping parent's own closing-work run (AII-264 r5). */
   groupingParent?: boolean;
+  /** Ticketing provider kind of the mapping at dispatch time. */
+  trackerKind?: string | null;
+  issueUrl?: string | null;
+  /** Guest size actually requested from the backend; absent for GitHub Actions. */
+  machineSize?: MachineSize | null;
+  /** Epoch ms the compute started (Fly/local launch time). */
+  computeStartedAt?: number | null;
 }): number {
   const db = getDb();
   const dispatchNumber = entry.dispatchNumber ?? countPriorDispatches(entry.issueId, entry.phase ?? "implementation").count + 1;
 
   const result = db.prepare(
-    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, admission_generation, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract, trigger, grouping_parent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, admission_generation, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract, trigger, grouping_parent, tracker_kind, issue_url, machine_cpu_kind, machine_cpus, machine_memory_mb, compute_started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   ).run(
     entry.issueId,
     entry.issueIdentifier ?? null,
@@ -290,6 +318,12 @@ export function appendLog(entry: {
     entry.contract ?? null,
     entry.trigger ?? null,
     entry.groupingParent ? 1 : 0,
+    entry.trackerKind ?? null,
+    entry.issueUrl ?? null,
+    entry.machineSize?.cpuKind ?? null,
+    entry.machineSize?.cpus ?? null,
+    entry.machineSize?.memoryMb ?? null,
+    entry.computeStartedAt ?? null,
   );
 
   // Keep only the most recent MAX_LOG_ENTRIES rows, but never evict a row while
@@ -1243,6 +1277,53 @@ export function setJobMachineId(jobId: number, machineId: string): void {
   getDb()
     .prepare("UPDATE dispatch_log SET machine_id = ? WHERE id = ?")
     .run(machineId, jobId);
+}
+
+/** Records the guest size and compute start of a job whose row already exists. */
+export function setJobCompute(jobId: number, size: MachineSize | null, startedAt: number): void {
+  getDb()
+    .prepare("UPDATE dispatch_log SET machine_cpu_kind = ?, machine_cpus = ?, machine_memory_mb = ?, compute_started_at = COALESCE(compute_started_at, ?) WHERE id = ?")
+    .run(size?.cpuKind ?? null, size?.cpus ?? null, size?.memoryMb ?? null, startedAt, jobId);
+}
+
+/** Stamps the stop time on the newest open row of a machine or container. The first stop wins; `gone` (the
+ *  backend answered 404 / no such container) falls back to the row's `completed_at`. */
+export function recordComputeStoppedByMachine(machineId: string, opts: { gone?: boolean; at?: number } = {}): void {
+  const now = opts.at ?? Date.now();
+  getDb()
+    .prepare(
+      `UPDATE dispatch_log SET compute_stopped_at = ${opts.gone ? "COALESCE(completed_at, ?)" : "?"}
+       WHERE id = (SELECT id FROM dispatch_log WHERE machine_id = ? AND compute_stopped_at IS NULL ORDER BY dispatched_at DESC, id DESC LIMIT 1)`,
+    )
+    .run(now, machineId);
+}
+
+/** Best-effort accounting stamp: never throws into a destroy path. */
+export function stampComputeStopped(machineId: string, gone: boolean): void {
+  try {
+    recordComputeStoppedByMachine(machineId, { gone });
+  } catch (err) {
+    console.error(`[log] Failed to record compute stop for ${machineId}:`, err);
+  }
+}
+
+/** Records a GitHub Actions run's API start and end times (epoch ms) on the row holding that run id. First write wins. */
+function recordGhaComputeTimes(runId: number, startedAt: number | null, stoppedAt: number | null): void {
+  getDb()
+    .prepare(
+      "UPDATE dispatch_log SET compute_started_at = COALESCE(compute_started_at, ?), compute_stopped_at = COALESCE(compute_stopped_at, ?) WHERE run_id = ?",
+    )
+    .run(startedAt, stoppedAt, runId);
+}
+
+/** Writes a GitHub Actions run's API times onto the job row holding that run id, only once the run is `completed`. */
+export function recordGhaRunCompleted(runId: number, run: { status: string; run_started_at?: string | null; updated_at?: string | null }): void {
+  if (run.status !== "completed") return;
+  const ms = (iso?: string | null) => {
+    const t = iso ? Date.parse(iso) : NaN;
+    return Number.isNaN(t) ? null : t;
+  };
+  recordGhaComputeTimes(runId, ms(run.run_started_at), ms(run.updated_at));
 }
 
 /** Writes only the nonce, leaving machine_id and the rest of the row untouched. */

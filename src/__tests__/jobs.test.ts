@@ -795,3 +795,76 @@ describe("stuck_attempts counter", () => {
     expect(log.getStuckAttempts(id)).toBe(0);
   });
 });
+
+describe("per-job accounting columns", () => {
+  const NEW_COLUMNS = ["tracker_kind", "issue_url", "machine_cpu_kind", "machine_cpus", "machine_memory_mb", "compute_started_at", "compute_stopped_at"];
+  const columns = () => (dedup.getDb().prepare("PRAGMA table_info(dispatch_log)").all() as Array<{ name: string; notnull: number }>);
+  const row = (id: number) => dedup.getDb().prepare("SELECT * FROM dispatch_log WHERE id = ?").get(id) as Record<string, unknown>;
+
+  it("creates nullable columns, and a second init changes nothing", () => {
+    const before = columns();
+    for (const name of NEW_COLUMNS) expect(before.find((c) => c.name === name)?.notnull).toBe(0);
+    log.initLogTable();
+    expect(columns()).toEqual(before);
+  });
+
+  it("adds the columns to an old table, leaving old rows null", () => {
+    const db = dedup.getDb();
+    for (const name of NEW_COLUMNS) db.exec(`ALTER TABLE dispatch_log DROP COLUMN ${name}`);
+    db.prepare("INSERT INTO dispatch_log (issue_id, dispatched_at) VALUES ('old', ?)").run(Date.now());
+    log.initLogTable();
+    log.initLogTable();
+    const names = columns().map((c) => c.name);
+    for (const name of NEW_COLUMNS) expect(names).toContain(name);
+    const old = db.prepare("SELECT * FROM dispatch_log WHERE issue_id = 'old'").get() as Record<string, unknown>;
+    for (const name of NEW_COLUMNS) expect(old[name]).toBeNull();
+  });
+
+  it("saves tracker kind, issue URL, size and start on append", () => {
+    const id = log.appendLog({
+      issueId: "i", trackerKind: "linear", issueUrl: "https://linear.app/x/issue/A-1",
+      machineSize: { cpuKind: "shared", cpus: 4, memoryMb: 8192 }, computeStartedAt: 1000,
+    });
+    expect(row(id)).toMatchObject({
+      tracker_kind: "linear", issue_url: "https://linear.app/x/issue/A-1",
+      machine_cpu_kind: "shared", machine_cpus: 4, machine_memory_mb: 8192, compute_started_at: 1000, compute_stopped_at: null,
+    });
+    expect(row(log.appendLog({ issueId: "j" })).tracker_kind).toBeNull();
+  });
+
+  it("stamps the stop once per machine; a gone backend falls back to completed_at", () => {
+    const id = log.appendLog({ issueId: "i", machineId: "m1", computeStartedAt: 1000 });
+    log.recordComputeStoppedByMachine("m1", { at: 5000 });
+    log.recordComputeStoppedByMachine("m1", { at: 9000 });
+    log.recordComputeStoppedByMachine("m1", { gone: true, at: 9500 });
+    expect(row(id).compute_stopped_at).toBe(5000);
+
+    const other = log.appendLog({ issueId: "k", machineId: "m2" });
+    dedup.getDb().prepare("UPDATE dispatch_log SET completed_at = 7000 WHERE id = ?").run(other);
+    log.recordComputeStoppedByMachine("m2", { gone: true, at: 9500 });
+    expect(row(other).compute_stopped_at).toBe(7000);
+  });
+
+  it("stamps only the newest open row of a reused machine", () => {
+    const first = log.appendLog({ issueId: "i", machineId: "m" });
+    log.recordComputeStoppedByMachine("m", { at: 100 });
+    const second = log.appendLog({ issueId: "i", machineId: "m" });
+    log.recordComputeStoppedByMachine("m", { at: 200 });
+    expect(row(first).compute_stopped_at).toBe(100);
+    expect(row(second).compute_stopped_at).toBe(200);
+  });
+
+  it("records GHA times as epoch ms only once the run is completed, first stop wins", () => {
+    const id = log.appendLog({ issueId: "i" });
+    log.updateJobRunId(id, 77);
+    const times = { run_started_at: "2026-10-26T10:00:00Z", updated_at: "2026-10-26T10:05:00Z" };
+    log.recordGhaRunCompleted(77, { status: "in_progress", ...times });
+    expect(row(id).compute_stopped_at).toBeNull();
+    log.recordGhaRunCompleted(77, { status: "completed", ...times });
+    log.recordGhaRunCompleted(77, { status: "completed", run_started_at: times.run_started_at, updated_at: "2026-10-26T11:00:00Z" });
+    expect(row(id)).toMatchObject({
+      compute_started_at: Date.parse(times.run_started_at), compute_stopped_at: Date.parse(times.updated_at),
+      machine_cpus: null, machine_memory_mb: null,
+    });
+  });
+});

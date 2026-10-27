@@ -189,6 +189,8 @@ export interface KgDispatchRowDetails {
   machineId?: string;
   logsUrl?: string;
   workflowRunId?: number;
+  /** The Fly guest the dispatch requested; saved with the compute start when a machine id is. */
+  machineSize?: { cpuKind: string; cpus: number; memoryMb: number };
 }
 
 /** What a status reader may see of the held snapshot; the commit and branch stay inside the workflow. */
@@ -263,6 +265,8 @@ export interface KgDispatchResult {
   app?: string;
   /** The kept machine id the dispatch found destroyed or 404 and replaced; sent as `replaces` on `attach`. */
   replaced?: string;
+  /** The Fly guest the dispatch requested, for the job row. */
+  machineSize?: { cpuKind: string; cpus: number; memoryMb: number };
 }
 
 /** What a status read that failed every attempt reports: not completed, not started — no new evidence. */
@@ -726,6 +730,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         ...(dispatchResult.jobId && dispatchResult.executionMode !== GHA_EXECUTION_MODE ? { machineId: dispatchResult.jobId } : {}),
         ...(dispatchResult.runUrl ? { logsUrl: dispatchResult.runUrl } : {}),
         ...(dispatchResult.runId !== undefined ? { workflowRunId: dispatchResult.runId } : {}),
+        ...(dispatchResult.machineSize ? { machineSize: dispatchResult.machineSize } : {}),
       }));
 
       if (dispatchResult.runId !== undefined) ctx.set("runId", dispatchResult.runId);

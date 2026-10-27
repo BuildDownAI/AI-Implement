@@ -96,6 +96,7 @@ describe("fly-machines sender", () => {
     expect(result).toEqual({
       outcome: "accepted", jobId: "m-new", machineId: "m-new", created: true, app: "fly-app",
       runUrl: "https://fly.io/apps/fly-app/machines/m-new", executionMode: "fly-machines",
+      machineSize: { cpuKind: "performance", cpus: 4, memoryMb: 16384 },
     });
   });
 

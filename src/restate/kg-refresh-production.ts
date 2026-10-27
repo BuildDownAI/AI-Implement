@@ -33,7 +33,7 @@ import { readBackendRun, stopBackendRun } from "../backend-run.js";
 import { getRunnerMode, getKgExecutionMode, resolveKgBackend, type KgBackendResolution } from "../runner-mode.js";
 import { mintLaunchTokens } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
-import { appendLogIfAbsent, findLogIdByDispatchId, markJobAwaitingDecision, reopenHeldJob as reopenHeldJobRow, setJobMachineId, setJobMachineNonce, updateJobPrUrl, updateJobRunId } from "../log.js";
+import { appendLogIfAbsent, findLogIdByDispatchId, markJobAwaitingDecision, reopenHeldJob as reopenHeldJobRow, setJobCompute, setJobMachineId, setJobMachineNonce, updateJobPrUrl, updateJobRunId } from "../log.js";
 import { clearMachineEnv, createMachine, destroyMachine, getMachine, listMachines, startMachine, updateMachine, waitForMachine, waitForMachineSettled, type CreateMachineOpts, type Machine, type MachineConfig, type SettleOptions } from "../fly-machines.js";
 import type { RestateService } from "./endpoint.js";
 import {
@@ -227,7 +227,11 @@ export function syncRowToMachineNonce(dispatchId: string, derivedNonce: string, 
 export function recordKgDispatchDetails(dispatchId: string, d: KgDispatchRowDetails): void {
   const jobId = findLogIdByDispatchId(dispatchId);
   if (jobId === undefined) return;
-  if (d.machineId) setJobMachineId(jobId, d.machineId);
+  if (d.machineId) {
+    setJobMachineId(jobId, d.machineId);
+    // The start is this run's dispatch, not the kept machine's creation.
+    setJobCompute(jobId, d.machineSize ?? null, Date.now());
+  }
   if (d.logsUrl) updateJobPrUrl(jobId, d.logsUrl);
   if (d.workflowRunId !== undefined) updateJobRunId(jobId, d.workflowRunId);
 }
