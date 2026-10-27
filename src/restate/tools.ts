@@ -967,7 +967,7 @@ export const listJobAccountingTool = tool(
       pageSize: input.args.pageSize,
       includeUnsettled: input.args.includeUnsettled,
     });
-    // Compact: a page of 200-invocation jobs must stay under the consumer's 2 MiB body limit.
+    // Compact, to keep the page small. A full page can still pass the consumer's 2 MiB limit; it halves the page size.
     return { content: [{ type: "text", text: JSON.stringify(page) }] };
   },
 );
