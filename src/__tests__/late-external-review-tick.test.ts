@@ -13,10 +13,16 @@ vi.mock("../github.js", () => ({
   postPrComment: vi.fn(),
 }));
 vi.mock("../config.js", () => ({ getMappings: vi.fn(() => ({})) }));
-vi.mock("../review-ledger-store.js", () => ({ listOpenReviewFindings: vi.fn(() => []) }));
+vi.mock("../review-ledger-store.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../review-ledger-store.js")>()),
+  listOpenReviewFindings: vi.fn(() => []),
+  getReviewFindingsByKeys: vi.fn(() => []),
+}));
 
 import { getCombinedChecksState, getCommitTime, getDefaultBranchFileText, getPullRequestState, listCheckRuns, listPrComments, listPullRequestCommits } from "../github.js";
-import { listOpenReviewFindings } from "../review-ledger-store.js";
+import { getReviewFindingsByKeys, listOpenReviewFindings } from "../review-ledger-store.js";
+import { classifyReviewIssueComment } from "../pipeline/review-ledger.js";
+import { stableReviewFindingKey } from "../pipeline/finding-dispositions.js";
 import { decodeReadHead, heldCommentBody, createProductionLateExternalReviewDependencies, LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS } from "../restate/late-external-review.js";
 import { headReviewedClean } from "../review-head-clean.js";
 
@@ -28,6 +34,7 @@ beforeEach(() => {
   vi.mocked(getCombinedChecksState).mockResolvedValue("success");
   vi.mocked(getCommitTime).mockResolvedValue(1000);
   vi.mocked(listOpenReviewFindings).mockReturnValue([]);
+  vi.mocked(getReviewFindingsByKeys).mockReset().mockReturnValue([]);
   vi.mocked(listPrComments).mockReset().mockResolvedValue([]);
   vi.mocked(getDefaultBranchFileText).mockReset().mockResolvedValue(null);
 });
@@ -303,5 +310,75 @@ describe("heldCommentBody (AII-1361)", () => {
     expect(body.split("\n").every((l) => !l.startsWith("/ai-implement"))).toBe(true);
     expect(body).not.toContain("/claude-review");
     expect(body).toContain("<!-- ai-implement late-external-held key=k -->");
+  });
+});
+
+describe("readTick heldBy for a deferred changes_requested verdict (AII-1583)", () => {
+  const COMMIT_MS = 1_700_000_000_000;
+  const gapInput = { dispatchId: "d", owner: "o", repo: "r", prNumber: 5, prUrl: "u", headSha: "b", gapFill: true };
+  const tickOf = (extra: Record<string, unknown> = {}) =>
+    createProductionLateExternalReviewDependencies({ githubAppId: "1", githubAppPrivateKey: "k" }).readTick({ ...gapInput, ...extra } as never);
+  const findings = [
+    { severity: "blocking", path: "src/a.ts", line: 3, body: "first problem" },
+    { severity: "blocking", path: "src/b.ts", line: 9, body: "second problem" },
+  ];
+  const comment = (verdict: string, list: unknown[] | "bad", atMs = COMMIT_MS + 1000) => {
+    const block = list === "bad" ? "{ not json" : JSON.stringify({ schema: "review-findings/v1", verdict, findings: list });
+    return { id: 1, body: "Review\n\n```json review-findings\n" + block + "\n```\n", user: { login: "claude[bot]", type: "Bot" }, createdAt: new Date(atMs).toISOString() };
+  };
+  // The keys the runner would store: from the same parse the workflow reads.
+  const keysOf = (c: ReturnType<typeof comment>) =>
+    classifyReviewIssueComment({ body: c.body, user: c.user }, undefined)!.findings.map((f) => stableReviewFindingKey(f));
+  const rows = (keys: string[], statuses: string[]) => keys.map((findingKey, i) => ({ findingKey, status: statuses[i] })) as never;
+
+  beforeEach(() => {
+    vi.mocked(getCommitTime).mockResolvedValue(COMMIT_MS);
+    vi.mocked(listCheckRuns).mockResolvedValue([run("completed", "success")]);
+  });
+
+  it("approve: not held, whatever the ledger holds", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([comment("approve", findings)] as never);
+    expect(await tickOf()).not.toHaveProperty("heldBy");
+  });
+  it("changes_requested with no findings: changes_requested-empty", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([comment("changes_requested", [])] as never);
+    expect((await tickOf()).heldBy).toBe("changes_requested-empty");
+  });
+  it("changes_requested with every finding recorded as deferred: not held", async () => {
+    const c = comment("changes_requested", findings);
+    vi.mocked(listPrComments).mockResolvedValue([c] as never);
+    vi.mocked(getReviewFindingsByKeys).mockReturnValue(rows(keysOf(c), ["deferred", "deferred"]));
+    expect(await tickOf()).not.toHaveProperty("heldBy");
+    expect(getReviewFindingsByKeys).toHaveBeenCalledWith("o/r", 5, keysOf(c));
+  });
+  it("changes_requested with one key missing from the ledger: held", async () => {
+    const c = comment("changes_requested", findings);
+    vi.mocked(listPrComments).mockResolvedValue([c] as never);
+    vi.mocked(getReviewFindingsByKeys).mockReturnValue(rows(keysOf(c).slice(0, 1), ["deferred"]));
+    expect((await tickOf()).heldBy).toBe("changes_requested");
+  });
+  it("changes_requested with no ledger rows at all: held", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([comment("changes_requested", findings)] as never);
+    expect((await tickOf()).heldBy).toBe("changes_requested");
+  });
+  it.each(["open", "resolved"])("changes_requested with one %s row: held", async (status) => {
+    const c = comment("changes_requested", findings);
+    vi.mocked(listPrComments).mockResolvedValue([c] as never);
+    vi.mocked(getReviewFindingsByKeys).mockReturnValue(rows(keysOf(c), ["deferred", status]));
+    expect((await tickOf()).heldBy).toBe("changes_requested");
+  });
+  it("incomplete: held even when the ledger holds deferred rows", async () => {
+    const c = comment("incomplete", findings);
+    vi.mocked(listPrComments).mockResolvedValue([c] as never);
+    vi.mocked(getReviewFindingsByKeys).mockReturnValue(rows(keysOf(c), ["deferred", "deferred"]));
+    expect((await tickOf()).heldBy).toBe("incomplete");
+  });
+  it("unreadable findings: held", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([comment("changes_requested", "bad")] as never);
+    expect((await tickOf()).heldBy).toBe("unreadable");
+  });
+  it("a review older than the head's commit: not held", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([comment("changes_requested", findings, COMMIT_MS - 1000)] as never);
+    expect(await tickOf()).not.toHaveProperty("heldBy");
   });
 });

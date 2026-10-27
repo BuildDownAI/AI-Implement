@@ -4148,11 +4148,13 @@ describe("postPushReviewStep", () => {
     );
 
     expect(out.approved).toBe(false);
-    expect(out.terminationReason).toBe("invalid_review");
+    expect(out.terminationReason).toBe("external_review_pending");
     expect(invoke).toHaveBeenCalledTimes(1);
     const reviewComment = ghComments.find((c) => c.includes("invalid-external-review"));
     expect(reviewComment).toContain("external review verdict was unavailable or incomplete");
-    expect(reviewComment).toContain("Manual review required");
+    expect(reviewComment).toContain("the late external review now decides");
+    expect(reviewComment).not.toContain("Manual review required");
+    expect(out.reviewedHeadSha).toBeDefined();
   });
 
   it("does not include minor external findings in the approval comment when there are none", async () => {
@@ -5075,7 +5077,7 @@ describe("postPushReviewStep", () => {
     expect(sleep).toHaveBeenCalled();
     expect(checkProbes).toBeGreaterThanOrEqual(2);
     expect(out.approved).toBe(false);
-    expect(out.terminationReason).toBe("invalid_review");
+    expect(out.terminationReason).toBe("external_review_pending");
   });
 
   describe("a review check that finished without a verdict (AII-1103)", () => {
@@ -5128,10 +5130,10 @@ describe("postPushReviewStep", () => {
 
     function expectVerdictUnavailableEnding(out: { approved: boolean; terminationReason: string; finalFeedback: string }, ghComments: string[]) {
       expect(out.approved).toBe(false);
-      expect(out.terminationReason).toBe("invalid_review");
+      expect(out.terminationReason).toBe("external_review_pending");
       expect(out.finalFeedback).toContain("finished without a verdict");
       const comment = ghComments.find((c) => c.includes("invalid-external-review"));
-      expect(comment).toContain("Manual review required; external review verdict unavailable.");
+      expect(comment).toContain("Waiting for the late external review to decide.");
       expect(comment).not.toContain("could not be parsed");
       expect(ghComments.some((c) => c.includes("Ready to merge"))).toBe(false);
     }
@@ -5416,11 +5418,11 @@ describe("postPushReviewStep", () => {
     );
 
     expect(out.approved).toBe(false);
-    expect(out.terminationReason).toBe("invalid_review");
+    expect(out.terminationReason).toBe("external_review_pending");
     expect(invoke).toHaveBeenCalledTimes(1);
     const approvalComment = ghComments.find((c) => c.includes("invalid-external-review"));
     expect(approvalComment).toBeDefined();
-    expect(approvalComment).toContain("Manual review required");
+    expect(approvalComment).toContain("the late external review now decides");
     expect(approvalComment).toContain("findings could not be parsed");
     expect(approvalComment).not.toContain("External review findings are blocking");
   });
@@ -6441,6 +6443,7 @@ Minor issue worth addressing.
     // Still gating on iteration 2: internal review is clean, so approval hinges entirely on
     // whether the finding still gates. It does, so the run stops on the review cap instead.
     expect(out.approved).toBe(false);
+    expect(out.terminationReason).not.toBe("external_review_pending");
     expect(invokePrompt(invoke, 1)).toContain(findingKey);
   });
 
