@@ -43,6 +43,7 @@ import {
   type RunnerMode,
 } from "./runner-mode.js";
 import {
+  ALL_PROJECTS_KEY,
   STAGE_AGENT_CONFIG_VERSION,
   STAGE_NAMES,
   STAGE_SELECTION_FIELDS,
@@ -3917,7 +3918,10 @@ function accountStatus(profile: AccountProfileProjection, deps: AdminDeps, proje
     return view;
   }
   if (!deps.agentConfig) return view;
-  const probe = projectKey ?? profile.allowedProjectKeys[0];
+  // A "*" grant has no project of its own to probe: use the first mapped team key instead.
+  const probe = projectKey ?? (profile.allowedProjectKeys.includes(ALL_PROJECTS_KEY)
+    ? Object.keys(getMappings()).sort()[0]
+    : profile.allowedProjectKeys[0]);
   if (!probe) return view; // credential status is project-scoped; an unpermitted profile has nothing to probe
   let status;
   try {

@@ -154,11 +154,18 @@ function validateAgentProvider(stage: StageName, selection: StageSelection, prof
   throw new Error(`${stage} has unsupported Codex provider/authentication combination`);
 }
 
+/** A single entry of this key in a profile's permitted-projects list grants every project. An empty list still means no project. */
+export const ALL_PROJECTS_KEY = "*";
+
+export function isProjectPermitted(keys: readonly string[], projectKey: string): boolean {
+  return keys.includes(projectKey) || keys.includes(ALL_PROJECTS_KEY);
+}
+
 function assertProfileAuthorized(stage: StageName, selection: StageSelection, profile: AccountProfile, projectKey: string): void {
   if (!Array.isArray(profile.allowedProjectKeys)) {
     throw new Error(`${stage}.accountProfileId permission metadata is required`);
   }
-  if (!profile.allowedProjectKeys.includes(projectKey)) {
+  if (!isProjectPermitted(profile.allowedProjectKeys, projectKey)) {
     throw new Error(`${stage}.accountProfileId is not authorized for this project`);
   }
   validateAgentProvider(stage, selection, profile);

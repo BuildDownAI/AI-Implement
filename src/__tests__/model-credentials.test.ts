@@ -204,6 +204,28 @@ describe("resolveModelCredential", () => {
     expect(resolverCalls).toEqual([]);
   });
 
+  it.each([
+    [[], false],
+    [["OTHER"], true],
+    [["Q"], false],
+    [["*"], true],
+    [["*", "Q"], true],
+  ])("allowedProjectKeys %j for OTHER: permitted=%s in resolver and status", (keys, permitted) => {
+    save({ allowedProjectKeys: keys });
+    const r = cred.resolveModelCredential(req({ projectKey: "OTHER" }), deps());
+    if (permitted) expect(r).toMatchObject({ ok: true });
+    else expect(r).toMatchObject({ ok: false, category: "unauthorized", code: "project_not_permitted" });
+    expect(cred.getCredentialStatus(req({ projectKey: "OTHER" }), deps())).toMatchObject({ projectPermitted: permitted });
+  });
+
+  it("refuses a * grant on a disabled or archived profile", () => {
+    save({ allowedProjectKeys: ["*"] });
+    store.retireAccountProfile("anth", "disabled");
+    expect(cred.resolveModelCredential(req({ projectKey: "OTHER" }), deps())).toMatchObject({ ok: false, code: "profile_disabled" });
+    store.retireAccountProfile("anth", "archived");
+    expect(cred.resolveModelCredential(req({ projectKey: "OTHER" }), deps())).toMatchObject({ ok: false, code: "profile_disabled" });
+  });
+
   it("denies a disabled permission, disabled profile and archived profile", () => {
     save({ allowedProjectKeys: [] });
     expect(cred.resolveModelCredential(req(), deps())).toMatchObject({ ok: false, code: "project_not_permitted" });
