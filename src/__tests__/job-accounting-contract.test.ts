@@ -13,7 +13,7 @@ import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
 import type * as ToolsModule from "../restate/tools.js";
 import { callTool } from "../restate/tools-client.js";
-import { JOB_ACCOUNTING_MAX_PAGE_SIZE, JobAccountingArgsSchema } from "../job-accounting.js";
+import { JOB_ACCOUNTING_MAX_PAGE_SIZE, JobAccountingArgsSchema, JobAccountingCursorSchema, JobAccountingRecordSchema, RECORD_TEXT_MAX } from "../job-accounting.js";
 import { z } from "zod";
 import { fakeFetch } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
@@ -363,5 +363,90 @@ describe("list_job_accounting args.schema.json", () => {
       const args = JSON.parse(readFileSync(new URL(`${scenario}.json`, DIR), "utf8")).request.args;
       expect(validate(schema, args), scenario).toBe(scenario !== "invalid-args");
     }
+  });
+});
+
+describe("list_job_accounting strict arguments", () => {
+  it("rejects unknown keys in the arguments and the cursor", () => {
+    expect(JobAccountingArgsSchema.safeParse({ pageSize: 5, foo: 1 }).success).toBe(false);
+    expect(JobAccountingArgsSchema.safeParse({ cursor: { changedAt: 1, dispatchId: "a", x: 1 } }).success).toBe(false);
+    expect(JobAccountingCursorSchema.safeParse({ changedAt: 1, dispatchId: "a", x: 1 }).success).toBe(false);
+  });
+
+  it("answers an unknown argument with the same isError as invalid-args", async () => {
+    const recorded = await exchange({ args: { pageSize: 5, foo: 1 } });
+    expect(recorded.response.isError).toBe(true);
+    expect(recorded.response.content[0].text).toContain("400");
+  });
+});
+
+describe("list_job_accounting record.schema.json", () => {
+  const schemaFile = new URL("record.schema.json", DIR);
+  const schemaText = `${JSON.stringify(z.toJSONSchema(JobAccountingRecordSchema), null, 2)}\n`;
+  const hint = "Regenerate with UPDATE_CONTRACT_FIXTURES=1 npx vitest run src/__tests__/job-accounting-contract.test.ts, and tell the control plane: it copies this file.";
+
+  /** The subset of JSON Schema that record.schema.json uses; no validator library is a dependency. */
+  function validate(schema: any, value: unknown): boolean {
+    if (schema.anyOf) return schema.anyOf.some((s: any) => validate(s, value));
+    if (schema.enum) return schema.enum.includes(value);
+    if (Array.isArray(schema.type)) return schema.type.some((type: string) => validate({ ...schema, type }, value));
+    switch (schema.type) {
+      case "null":
+        return value === null;
+      case "array":
+        return Array.isArray(value) && value.length <= (schema.maxItems ?? Infinity) && value.every((v) => validate(schema.items, v));
+      case "object": {
+        if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+        const v = value as Record<string, unknown>;
+        if ((schema.required ?? []).some((k: string) => !(k in v))) return false;
+        if (schema.additionalProperties === false && Object.keys(v).some((k) => !(k in (schema.properties ?? {})))) return false;
+        return Object.entries(schema.properties ?? {}).every(([k, sub]) => !(k in v) || validate(sub, v[k]));
+      }
+      case "string":
+        return typeof value === "string" && value.length >= (schema.minLength ?? 0) && value.length <= (schema.maxLength ?? Infinity);
+      case "integer":
+      case "number":
+        return typeof value === "number" && Number.isFinite(value) && (schema.type !== "integer" || Number.isInteger(value))
+          && value >= (schema.minimum ?? -Infinity) && value <= (schema.maximum ?? Infinity);
+      default:
+        throw new Error(`record.schema.json uses an unsupported schema: ${JSON.stringify(schema)}`);
+    }
+  }
+
+  const load = () => JSON.parse(readFileSync(schemaFile, "utf8"));
+
+  it("matches the schema in code", () => {
+    if (process.env.UPDATE_CONTRACT_FIXTURES === "1") {
+      mkdirSync(DIR, { recursive: true });
+      writeFileSync(schemaFile, schemaText);
+      return;
+    }
+    if (!existsSync(schemaFile)) throw new Error(`docs/contracts/list_job_accounting/record.schema.json is missing. ${hint}`);
+    if (readFileSync(schemaFile, "utf8") !== schemaText) throw new Error(`record.schema.json differs from JobAccountingRecordSchema. ${hint}\nActual:\n${schemaText}`);
+  });
+
+  it("validates every record of the recorded exchanges", () => {
+    const schema = load();
+    const scenarios = ["first-page", "next-page", "short-page", "empty", "changed-again", "partial-usage", "pruned", "final-pull"];
+    let seen = 0;
+    for (const scenario of scenarios) {
+      const recorded = JSON.parse(readFileSync(new URL(`${scenario}.json`, DIR), "utf8")) as Exchange;
+      for (const record of JSON.parse(recorded.response.content[0].text).records) {
+        expect(validate(schema, record), `${scenario} ${record.dispatchId}`).toBe(true);
+        seen++;
+      }
+    }
+    expect(seen).toBeGreaterThan(0);
+  });
+
+  it("rejects text over the cap, too many invocations and unknown keys", () => {
+    const schema = load();
+    const recorded = JSON.parse(readFileSync(new URL("first-page.json", DIR), "utf8")) as Exchange;
+    const record = JSON.parse(recorded.response.content[0].text).records[0];
+    expect(validate(schema, record)).toBe(true);
+    const long = "x".repeat(RECORD_TEXT_MAX + 1);
+    expect(validate(schema, { ...record, issue: { ...record.issue, title: long } })).toBe(false);
+    expect(validate(schema, { ...record, pushedShas: [long] })).toBe(false);
+    expect(validate(schema, { ...record, invocations: Array.from({ length: 201 }, () => record.invocations[0]) })).toBe(false);
   });
 });

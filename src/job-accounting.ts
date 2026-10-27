@@ -5,6 +5,7 @@ import type { RepoMapping } from "./config.js";
 import type { TicketingProvider } from "./providers/types.js";
 import { z } from "zod";
 import { getDb } from "./dedup.js";
+import { INVOCATION_RECORDS_MAX } from "./pipeline/types.js";
 
 /** The tracker facts a job row saves at dispatch time, since the mapping can change after the job. */
 export interface TrackerAccounting {
@@ -40,12 +41,14 @@ export function trackerAccounting(
 export const JOB_ACCOUNTING_SETTLE_MS = 10 * 60 * 1000;
 export const JOB_ACCOUNTING_DEFAULT_PAGE_SIZE = 100;
 export const JOB_ACCOUNTING_MAX_PAGE_SIZE = 200;
+/** The longest text (UTF-16 units, as zod measures it) a served record string may have; longer text is cut. Published in record.schema.json. */
+export const RECORD_TEXT_MAX = 2000;
 
 /** Position in the walk: records are ordered by `(changedAt, dispatchId)`; a changed job comes back after the cursor. */
 export const JobAccountingCursorSchema = z.object({
   changedAt: z.number().int().nonnegative().safe(),
   dispatchId: z.string().min(1).max(200),
-});
+}).strict();
 export type JobAccountingCursor = z.infer<typeof JobAccountingCursorSchema>;
 
 export const JobAccountingArgsSchema = z.object({
@@ -53,17 +56,18 @@ export const JobAccountingArgsSchema = z.object({
   pageSize: z.number().int().min(1).max(JOB_ACCOUNTING_MAX_PAGE_SIZE).optional(),
   /** Serve finished jobs that have not settled too. Only a caller about to lose the orchestrator should send it. */
   includeUnsettled: z.boolean().optional(),
-});
+}).strict();
 
 const nullableInt = z.number().int().nullable();
-const nullableString = z.string().nullable();
+const text = z.string().max(RECORD_TEXT_MAX);
+const nullableString = text.nullable();
 
 export const JobAccountingInvocationSchema = z.object({
-  stage: z.string(),
-  agent: z.string(),
-  provider: z.string(),
-  model: z.string(),
-  status: z.string(),
+  stage: text,
+  agent: text,
+  provider: text,
+  model: text,
+  status: text,
   tokensIn: nullableInt,
   tokensOut: nullableInt,
   cacheReadTokens: nullableInt,
@@ -77,8 +81,8 @@ export const JobAccountingInvocationSchema = z.object({
 
 export const JobAccountingRecordSchema = z.object({
   dispatchId: z.string(),
-  phase: z.string(),
-  status: z.string(),
+  phase: text,
+  status: text,
   conclusion: nullableString,
   lifecycleOwner: z.enum(["legacy", "restate"]),
   dispatchedAt: z.number().int(),
@@ -94,13 +98,13 @@ export const JobAccountingRecordSchema = z.object({
   }),
   pr: z.object({ url: nullableString, number: nullableInt }),
   /** Null when the runner never reported the pushed SHAs; `[]` when it reported that nothing was pushed. */
-  pushedShas: z.array(z.string()).nullable(),
+  pushedShas: z.array(text).nullable(),
   /**
-   * `reported` only when the runner's `invocations` list arrived whole; `partial` when some invocation rows exist
+   * `reported` only when the runner's `invocations` list arrived whole (none dropped or cut by the runner); `partial` when some invocation rows exist
    * without that (cost may be too low); `unknown` when none exist — an empty `invocations` list must never be read as $0.
    */
   usage: z.enum(["unknown", "partial", "reported"]),
-  invocations: z.array(JobAccountingInvocationSchema),
+  invocations: z.array(JobAccountingInvocationSchema).max(INVOCATION_RECORDS_MAX),
   compute: z.object({
     backend: nullableString,
     cpuKind: nullableString,
@@ -183,6 +187,15 @@ function placeholders(n: number): string {
   return Array.from({ length: n }, () => "?").join(",");
 }
 
+/** Cuts text to RECORD_TEXT_MAX without leaving half a surrogate pair at the end. */
+function cut(v: string): string;
+function cut(v: string | null): string | null;
+function cut(v: string | null): string | null {
+  if (v === null || v.length <= RECORD_TEXT_MAX) return v;
+  const end = RECORD_TEXT_MAX - ((v.charCodeAt(RECORD_TEXT_MAX - 1) & 0xfc00) === 0xd800 ? 1 : 0);
+  return v.slice(0, end);
+}
+
 function intOrNull(v: unknown): number | null {
   return typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : null;
 }
@@ -198,11 +211,11 @@ function toInvocation(row: InvocationRow): z.infer<typeof JobAccountingInvocatio
   const costUsd = typeof u.costUsd === "number" && Number.isFinite(u.costUsd) && u.costUsd >= 0 ? u.costUsd : null;
   const attempts = typeof u.attempts === "number" && Number.isSafeInteger(u.attempts) && u.attempts >= 1 ? u.attempts : 1;
   return {
-    stage: row.stage,
-    agent: row.agent,
-    provider: row.provider,
-    model: row.model,
-    status: row.status,
+    stage: cut(row.stage),
+    agent: cut(row.agent),
+    provider: cut(row.provider),
+    model: cut(row.model),
+    status: cut(row.status),
     tokensIn: intOrNull(u.tokensIn),
     tokensOut: intOrNull(u.tokensOut),
     cacheReadTokens: intOrNull(u.cacheReadTokens),
@@ -221,7 +234,7 @@ function prNumber(url: string | null): number | null {
 function parseShas(raw: string): string[] | null {
   try {
     const parsed: unknown = JSON.parse(raw);
-    return Array.isArray(parsed) && parsed.every((v) => typeof v === "string") ? (parsed as string[]) : null;
+    return Array.isArray(parsed) && parsed.every((v) => typeof v === "string") ? (parsed as string[]).map((v) => cut(v)) : null;
   } catch {
     return null;
   }
@@ -336,22 +349,22 @@ export function listJobAccounting(
       const owner = owners.get(key.jid) ?? "legacy";
       records.push({
         ...common,
-        phase: r.phase ?? "implementation",
-        status: r.status,
-        conclusion: r.conclusion,
+        phase: cut(r.phase ?? "implementation"),
+        status: cut(r.status),
+        conclusion: cut(r.conclusion),
         lifecycleOwner: owner.startsWith("restate") ? "restate" : "legacy",
         dispatchedAt: r.dispatched_at,
         issue: {
-          identifier: r.issue_identifier,
-          title: r.issue_title,
-          repo: r.repo,
-          trackerKind: r.tracker_kind,
-          url: r.issue_url,
+          identifier: cut(r.issue_identifier),
+          title: cut(r.issue_title),
+          repo: cut(r.repo),
+          trackerKind: cut(r.tracker_kind),
+          url: cut(r.issue_url),
         },
-        pr: { url: r.pr_url, number: prNumber(r.pr_url) },
+        pr: { url: cut(r.pr_url), number: prNumber(r.pr_url) },
         compute: {
-          backend: r.execution_mode,
-          cpuKind: r.machine_cpu_kind,
+          backend: cut(r.execution_mode),
+          cpuKind: cut(r.machine_cpu_kind),
           cpus: r.machine_cpus,
           memoryMb: r.machine_memory_mb,
           startedAt: r.compute_started_at,
@@ -365,11 +378,11 @@ export function listJobAccounting(
         ...common,
         phase: "review-fix",
         status: "completed",
-        conclusion: r.state,
+        conclusion: cut(r.state),
         lifecycleOwner: "restate",
         dispatchedAt: r.created_at,
-        issue: { identifier: null, title: null, repo: r.repository, trackerKind: null, url: null },
-        pr: { url: `https://github.com/${r.repository}/pull/${r.pr_number}`, number: r.pr_number },
+        issue: { identifier: null, title: null, repo: cut(r.repository), trackerKind: null, url: null },
+        pr: { url: cut(`https://github.com/${r.repository}/pull/${r.pr_number}`), number: r.pr_number },
         // Run start/end are not stored for an attempt: created_at and completed_at stand in (queue time included).
         compute: {
           backend: "github-actions",

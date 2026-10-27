@@ -5900,6 +5900,13 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
         expect(complete()).toBe(0);
       });
 
+      it("stays unset when the runner reports it dropped records, and is set for a whole list without the key", async () => {
+        await deliver(undefined, { extra: { invocations: [record("ok-1", "implementation")], invocationsDropped: 3 } });
+        expect(complete()).toBe(0);
+        await deliver(undefined, { dispatchId: "d-whole", extra: { invocations: [record("ok-2", "implementation")] } });
+        expect(complete("d-whole")).toBe(1);
+      });
+
       it("stays unset when the list is past the cap", async () => {
         vi.spyOn(console, "warn").mockImplementation(() => undefined);
         const many = Array.from({ length: 201 }, (_, i) => record(`inv-${i}`, "implementation"));

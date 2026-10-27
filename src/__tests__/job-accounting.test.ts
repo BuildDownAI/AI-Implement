@@ -507,3 +507,59 @@ describe("upgrade (AII-1566)", () => {
     expect((db.prepare("SELECT changed_at AS c FROM review_fix_attempts").get() as { c: number }).c).toBe(PAST + 1);
   });
 });
+
+describe("record text cap and dropped records", () => {
+  const long = (n = 5000) => "é".repeat(n);
+
+  function strings(value: unknown, out: string[] = []): string[] {
+    if (typeof value === "string") out.push(value);
+    else if (Array.isArray(value)) for (const v of value) strings(v, out);
+    else if (value && typeof value === "object") for (const v of Object.values(value)) strings(v, out);
+    return out;
+  }
+
+  it("serves a job with 200 stored rows and no complete flag as partial", () => {
+    finishedJob("capped", PAST);
+    reportJob("capped", { complete: false, rows: 200 });
+    setChanged("capped", PAST);
+    const rec = acc.listJobAccounting({ now: Date.now() }).records[0];
+    expect(rec.invocations).toHaveLength(200);
+    expect(rec.usage).toBe("partial");
+    expect(acc.JobAccountingRecordSchema.safeParse(rec).success).toBe(true);
+  });
+
+  it("cuts a 5,000-character title to RECORD_TEXT_MAX", () => {
+    finishedJob("t", PAST, { issueTitle: long() });
+    const rec = acc.listJobAccounting({ now: Date.now() }).records[0];
+    expect(rec.issue.title).toHaveLength(acc.RECORD_TEXT_MAX);
+  });
+
+  it("cuts every served string of a log record and of a review-fix record", () => {
+    const id = finishedJob("all", PAST);
+    dedup.getDb().prepare(
+      `UPDATE dispatch_log SET issue_identifier = ?, issue_title = ?, repo = ?, issue_url = ?, tracker_kind = ?, pr_url = ?, phase = ?,
+         status = ?, conclusion = ?, execution_mode = ?, machine_cpu_kind = ? WHERE id = ?`,
+    ).run(...Array.from({ length: 11 }, () => long()), id);
+    dedup.getDb().prepare(
+      `INSERT INTO model_invocation_attribution (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model,
+         auth_mode, status, started_at, completed_at, usage_json)
+       VALUES ('i', 'all', 'review', 'p', 1, 'claude', 'anthropic', ?, 'api_key', 'succeeded', 1, 2, '{}')`,
+    ).run(long());
+    log.recordPushedCommits("all", [long(), "a".repeat(40)]);
+    reviewFixAttempt("fix", PAST);
+    dedup.getDb().prepare("UPDATE review_fix_attempts SET repository = ?, state = ?").run(`${long()}/r`, long());
+    setChanged("all", PAST);
+    setChanged("fix", PAST);
+
+    const records = acc.listJobAccounting({ now: Date.now() }).records;
+    expect(records.map((r) => r.dispatchId).sort()).toEqual(["all", "fix"]);
+    for (const rec of records) {
+      expect(Math.max(...strings({ ...rec, dispatchId: "" }).map((s) => s.length))).toBeLessThanOrEqual(acc.RECORD_TEXT_MAX);
+      expect(acc.JobAccountingRecordSchema.safeParse(rec).success).toBe(true);
+    }
+    const all = records.find((r) => r.dispatchId === "all")!;
+    expect(all.issue.title).toHaveLength(acc.RECORD_TEXT_MAX);
+    expect(all.pushedShas![0]).toHaveLength(acc.RECORD_TEXT_MAX);
+    expect(all.invocations[0].model).toHaveLength(acc.RECORD_TEXT_MAX);
+  });
+});
