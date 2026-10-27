@@ -580,6 +580,22 @@ describe("projects page agents tab", () => {
     expect(m.doc.getElementById("md-agents-error")!.textContent).toContain("positive whole number");
   });
 
+  it("treats a * grant as permitting any project in both the profile list and the stage select", async () => {
+    const m = mountAgents({
+      accounts: [
+        account({ profileId: "acct-all", allowedProjectKeys: ["*"] }),
+        account({ profileId: "acct-other", allowedProjectKeys: ["OTHER"] }),
+        account({ profileId: "acct-none", allowedProjectKeys: [] }),
+        account({ profileId: "acct-off", allowedProjectKeys: ["*"], profileStatus: "inactive" }),
+      ],
+    });
+    await open(m);
+    const listed = [...m.doc.querySelectorAll("[data-ag-profile]")].map((e) => e.getAttribute("data-ag-profile"));
+    expect(listed).toEqual(["acct-all"]);
+    const options = [...m.doc.querySelectorAll('select[data-stage="review"][data-field="accountProfileId"] option')].map((o) => (o as HTMLOptionElement).value);
+    expect(options).toContain("acct-all");
+    for (const id of ["acct-other", "acct-none", "acct-off"]) expect(options).not.toContain(id);
+  });
   it("lists only active, permitted, compatible profiles and shows readiness and recovery", async () => {
     const m = mountAgents({
       accounts: [

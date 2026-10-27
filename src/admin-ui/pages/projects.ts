@@ -821,12 +821,17 @@ export const projectsScript = `
     return dv === undefined ? { value: undefined, source: 'unset' } : { value: dv, source: 'orchestrator default' };
   }
 
+  function agPermits(a) {
+    return Array.isArray(a.allowedProjectKeys)
+      && (a.allowedProjectKeys.indexOf('*') !== -1 || a.allowedProjectKeys.indexOf(agentState.key) !== -1);
+  }
+
   function agEligibleProfiles(stage) {
     var agent = agEffective(stage, 'agent').value;
     var provider = agEffective(stage, 'provider').value;
     return agentState.accounts.filter(function (a) {
       return a.profileStatus === 'active'
-        && Array.isArray(a.allowedProjectKeys) && a.allowedProjectKeys.indexOf(agentState.key) !== -1
+        && agPermits(a)
         && a.authMode !== 'claude-subscription'
         && a.agent === agent && a.provider === provider;
     });
@@ -882,7 +887,7 @@ export const projectsScript = `
   function agRenderProfiles() {
     var el = document.getElementById('md-agents-profiles');
     var rows = agentState.accounts.filter(function (a) {
-      return a.profileStatus === 'active' && Array.isArray(a.allowedProjectKeys) && a.allowedProjectKeys.indexOf(agentState.key) !== -1;
+      return a.profileStatus === 'active' && agPermits(a);
     });
     if (!rows.length) {
       el.innerHTML = '<div class="field-hint">No active account profile is permitted for this project. Permit one under model accounts first.</div>';
