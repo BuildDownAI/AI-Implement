@@ -431,6 +431,8 @@ describe("jobs table", () => {
     const terminalId = log.appendLog({ issueId: "terminal-run", machineNonce: "terminal-nonce" });
     log.updateJobStatus(terminalId, "failed", "failure");
     dedup.getDb().prepare("UPDATE dispatch_log SET dispatched_at = 0, completed_at = 0 WHERE id = ?").run(terminalId);
+    // The trigger stamps the wall clock on the write above; pin the change time afterwards.
+    dedup.getDb().prepare("UPDATE dispatch_log SET changed_at = 0 WHERE id = ?").run(terminalId);
 
     expect(log.getJobByNonce("terminal-nonce")).toBeNull();
     for (let i = 0; i < 501; i++) {
@@ -810,6 +812,8 @@ describe("per-job accounting columns", () => {
 
   it("adds the columns to an old table, leaving old rows null", () => {
     const db = dedup.getDb();
+    // The guarded trigger's WHEN names these columns, so SQLite refuses to drop them while it exists; boot recreates it.
+    db.exec("DROP TRIGGER trg_dispatch_log_changed_at");
     for (const name of NEW_COLUMNS) db.exec(`ALTER TABLE dispatch_log DROP COLUMN ${name}`);
     db.prepare("INSERT INTO dispatch_log (issue_id, dispatched_at) VALUES ('old', ?)").run(Date.now());
     log.initLogTable();
