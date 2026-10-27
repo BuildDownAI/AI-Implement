@@ -14,10 +14,11 @@ import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getInFligh
 import { hasEphemeralFullAccessOptIn } from "./model-auth-contract.js";
 import { checkForcedPathEligibility, resolveExecutionPath, getFlySecretsMinVersion, getFlyProcessLevelSecrets, type RunnerMode } from "./runner-mode.js";
 import { mintLaunchTokens, implementationTtlSeconds } from "./runner-tokens.js";
+import { trackerAccounting as defaultTrackerAccounting, type TrackerAccounting } from "./job-accounting.js";
 import { buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, capRunnerEnv, branchPrefixRunnerEnv, skillsRepoRunnerEnv, getPullRequestState, type DispatchResult } from "./github.js";
 import { buildRunConfig, encodeRunConfig, type RunConfigV1, type RunCredentialsV1 } from "./run-config.js";
 import { getRetryPolicy } from "./orchestrator-settings.js";
-import { createMachine, listAppSecrets, generateSessionToken, generateMachineNonce, buildSessionMachineConfig } from "./fly-machines.js";
+import { createMachine, listAppSecrets, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, guestSize } from "./fly-machines.js";
 import { resolveSessionImage } from "./repo-image.js";
 import { dispatchLocalGapfill } from "./local-gapfill.js";
 import {
@@ -37,6 +38,21 @@ import type { WorkflowCapabilities, WorkflowContract } from "./workflow-probe.js
 
 type ContractProbeResult = WorkflowContract | WorkflowCapabilities;
 
+/** Row fields for tracker kind and issue URL; a lookup failure never blocks the job row. */
+async function gapfillAccounting(
+  opts: DrainCommentGapfillsInput,
+  mapping: RepoMapping,
+  issue: { issueId: string; issueIdentifier?: string | null; issueTitle?: string | null },
+): Promise<TrackerAccounting> {
+  const ref = { id: issue.issueId, identifier: issue.issueIdentifier, title: issue.issueTitle };
+  try {
+    if (opts.trackerAccounting) return await opts.trackerAccounting(mapping, ref);
+  } catch (err) {
+    console.error(`[comment-gapfill] tracker accounting lookup failed for ${issue.issueId}:`, err);
+  }
+  return defaultTrackerAccounting(mapping, null, ref);
+}
+
 export interface DrainCommentGapfillsInput {
   getMappings(): Record<string, RepoMapping>;
   runnerMode: RunnerMode;
@@ -53,6 +69,8 @@ export interface DrainCommentGapfillsInput {
   dispatch(token: string, mapping: RepoMapping, inputs: Record<string, string | undefined>, opts?: { returnRunDetails?: boolean }): Promise<DispatchResult>;
   postComment(token: string, owner: string, repo: string, prNumber: number, body: string): Promise<void>;
   postTrackerComment(mapping: RepoMapping, issueId: string, body: string): Promise<void>;
+  /** Tracker kind and issue URL for the job row; absent, the row keeps the kind and a null URL. */
+  trackerAccounting?(mapping: RepoMapping, issue: { id: string; identifier?: string | null; title?: string | null }): Promise<TrackerAccounting>;
   onDispatchFailure(failure: { status: number; error?: string }, notifyType: string, notifyWebhookUrl: string | null, ctx: DispatchFailureContext): Promise<void>;
   // Fly Machines config
   flySessionsToken: string | null;
@@ -480,10 +498,12 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           executionMode: "local-docker",
           machineNonce: local.machineNonce,
           machineId: local.containerId,
+          computeStartedAt: Date.now(),
           runnerMode: opts.runnerMode,
           sessionImage: opts.localRunnerImage,
           phase: "gap-analysis",
           trigger: "comment",
+          ...(await gapfillAccounting(opts, mapping, prLog)),
         });
         updateJobPrUrl(jobId, `https://github.com/${fullRepo}/pull/${item.prNumber}`);
         suppressStaleNotifications(prLog.issueId, jobId);
@@ -681,10 +701,13 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           executionMode: "fly-machines",
           machineNonce,
           machineId: machine.id,
+          machineSize: guestSize(machineConfig) ?? null,
+          computeStartedAt: Date.now(),
           runnerMode: opts.runnerMode,
           sessionImage: resolvedImage,
           phase: "gap-analysis",
           trigger: "comment",
+          ...(await gapfillAccounting(opts, mapping, prLog)),
         });
         updateJobPrUrl(jobId, `https://github.com/${fullRepo}/pull/${item.prNumber}`);
         suppressStaleNotifications(prLog.issueId, jobId);
@@ -823,6 +846,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
               contract,
               phase: "gap-analysis",
               trigger: "comment",
+              ...(await gapfillAccounting(opts, mapping, prLog)),
             });
             updateJobPrUrl(jobId, `https://github.com/${fullRepo}/pull/${item.prNumber}`);
             suppressStaleNotifications(prLog.issueId, jobId);
@@ -842,6 +866,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
                   workflowFile: mapping.workflowFile,
                   contract,
                   phase: "gap-analysis",
+                  ...(await gapfillAccounting(opts, mapping, prLog)),
                 },
               );
             } catch (err) {
@@ -869,6 +894,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           contract,
           phase: "gap-analysis",
           trigger: "comment",
+          ...(await gapfillAccounting(opts, mapping, prLog)),
         });
         updateJobPrUrl(jobId, `https://github.com/${fullRepo}/pull/${item.prNumber}`);
         suppressStaleNotifications(prLog.issueId, jobId);

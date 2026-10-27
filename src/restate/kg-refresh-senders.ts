@@ -6,7 +6,7 @@
 import type { AppConfig } from "../index.js";
 import { parseKgSourceRepo } from "../deploy.js";
 import { buildKgRefreshGhaDispatchBody, buildPrivateKgRefreshGhaDispatchBody, postWorkflowDispatch } from "../github.js";
-import { buildSessionMachineConfig, generateSessionToken } from "../fly-machines.js";
+import { buildSessionMachineConfig, generateSessionToken, guestSize } from "../fly-machines.js";
 import type { startLocalRunnerContainer } from "../local-docker.js";
 import type { getInstallationToken, getScopedInstallationToken } from "../github-app-auth.js";
 import { RunnerImageNotAllowedError, type resolveRunnerImageForDispatch } from "../repo-image.js";
@@ -151,6 +151,7 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
       executionMode,
       machineId: launched.machineId,
       created: launched.created,
+      machineSize: guestSize(machineConfig),
       app,
       ...(launched.created && launched.replaced !== undefined && { replaced: launched.replaced }),
     };

@@ -48,6 +48,8 @@ vi.mock("../log.js", () => ({
   getClaimedRunIds: vi.fn().mockReturnValue(new Set()),
   markJobNotified: vi.fn(),
   invalidateNonce: vi.fn(),
+  stampComputeStopped: vi.fn(),
+  recordGhaRunCompleted: vi.fn(),
 }));
 
 vi.mock("../config.js", () => ({

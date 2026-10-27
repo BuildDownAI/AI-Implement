@@ -172,7 +172,19 @@ describe("getWorkflowRunStatus", () => {
       status: "completed",
       conclusion: "success",
       html_url: "https://github.com/org/repo/actions/runs/123",
+      run_started_at: null,
+      updated_at: null,
     });
+  });
+
+  it("parses run_started_at and updated_at", async () => {
+    fakeFetch({
+      "GET /repos/org/repo/actions/runs/124": {
+        json: { status: "completed", conclusion: "success", html_url: "u", run_started_at: "2026-10-26T10:00:00Z", updated_at: "2026-10-26T10:05:00Z" },
+      },
+    }).install();
+    const result = await getWorkflowRunStatus("token", "org", "repo", 124);
+    expect(result).toMatchObject({ run_started_at: "2026-10-26T10:00:00Z", updated_at: "2026-10-26T10:05:00Z" });
   });
 
   it("returns in_progress status with null conclusion", async () => {

@@ -22,6 +22,8 @@ vi.mock("../log.js", () => ({
   findLogIdByDispatchId: vi.fn().mockReturnValue(7),
   updateJobRunId: vi.fn(),
   markJobFailureCommented: vi.fn(),
+  stampComputeStopped: vi.fn(),
+  recordGhaRunCompleted: vi.fn(),
 }));
 vi.mock("../dispatch-breaker.js", () => ({ parkIssue: vi.fn() }));
 vi.mock("../fly-machines.js", () => ({ getMachine: vi.fn(), destroyMachine: vi.fn(), listMachines: vi.fn() }));
