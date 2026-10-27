@@ -24,6 +24,7 @@ import {
   type Machine,
 } from "../fly-machines.js";
 import { getDb } from "../dedup.js";
+import { JobAccountingArgsSchema, listJobAccounting } from "../job-accounting.js";
 import {
   listHeldReservations,
   read as readDispatchAdmission,
@@ -950,6 +951,22 @@ export const getReviewFixActivityTool = tool(
   },
 );
 
+export const LIST_JOB_ACCOUNTING_DESCRIPTION =
+  "Returns one page of finished-job accounting records, oldest first: dispatch id, phase, status, conclusion, lifecycle owner, times, issue, PR, pushed SHAs, every model invocation (tokens, cost, cost status, attempts) and compute (backend, size, start, stop). Args: optional cursor { completedAt, dispatchId }, optional pageSize 1..200 (default 100). Returns records, nextCursor and oldestRetainedCompletedAt. Only jobs finished at least 10 minutes ago are returned. Read.";
+
+export const listJobAccountingTool = tool(
+  {
+    description: LIST_JOB_ACCOUNTING_DESCRIPTION,
+    input: JobAccountingArgsSchema,
+    role: "user",
+    operation: "read",
+  },
+  async (_ctx, input): Promise<ToolResponse> => {
+    const page = listJobAccounting({ cursor: input.args.cursor, pageSize: input.args.pageSize });
+    return { content: [{ type: "text", text: JSON.stringify(page, null, 2) }] };
+  },
+);
+
 const KG_TOOL_DESCRIPTIONS: Record<string, string> = {
   kg_hybrid_search: "Hybrid (lexical + vector) search over the knowledge graph. Falls back to lexical-only when embeddings are degraded (see get_tenant_health's kgDegraded).",
   kg_search: "Lexical search over the knowledge graph.",
@@ -1534,6 +1551,7 @@ export const orchestratorTools = restate.service({
     get_kg_status: getKgStatusTool,
     get_review_fix_attempt: getReviewFixAttemptTool,
     get_review_fix_activity: getReviewFixActivityTool,
+    list_job_accounting: listJobAccountingTool,
     kg_hybrid_search: kgHybridSearch,
     kg_search: kgSearch,
     kg_semantic_search: kgSemanticSearch,

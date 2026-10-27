@@ -430,7 +430,7 @@ describe("jobs table", () => {
   it("clears terminal nonces and allows their rows to be pruned", () => {
     const terminalId = log.appendLog({ issueId: "terminal-run", machineNonce: "terminal-nonce" });
     log.updateJobStatus(terminalId, "failed", "failure");
-    dedup.getDb().prepare("UPDATE dispatch_log SET dispatched_at = 0 WHERE id = ?").run(terminalId);
+    dedup.getDb().prepare("UPDATE dispatch_log SET dispatched_at = 0, completed_at = 0 WHERE id = ?").run(terminalId);
 
     expect(log.getJobByNonce("terminal-nonce")).toBeNull();
     for (let i = 0; i < 501; i++) {
