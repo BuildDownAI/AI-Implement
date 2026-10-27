@@ -17,6 +17,7 @@ vi.mock("../github.js", () => ({
   getCombinedChecksState: vi.fn(),
   hasChangesRequestedReview: vi.fn(),
   mergePullRequest: vi.fn(),
+  mergeBranch: vi.fn(),
   listCheckRuns: vi.fn(),
   getCommitTime: vi.fn(),
 }));
@@ -26,7 +27,7 @@ vi.mock("../comment-gapfill-queue.js", () => ({
   enqueueConflictResolution: vi.fn(),
 }));
 
-import { listOpenPullRequests, getCombinedChecksState, hasChangesRequestedReview, mergePullRequest, listCheckRuns, getCommitTime } from "../github.js";
+import { listOpenPullRequests, getCombinedChecksState, hasChangesRequestedReview, mergePullRequest, mergeBranch, listCheckRuns, getCommitTime } from "../github.js";
 import { hasPendingConflictResolution, countConflictAttempts, enqueueConflictResolution } from "../comment-gapfill-queue.js";
 
 let dedup: typeof DedupModule;
@@ -51,6 +52,7 @@ beforeEach(async () => {
   vi.mocked(getCombinedChecksState).mockResolvedValue("success");
   vi.mocked(hasChangesRequestedReview).mockResolvedValue(false);
   vi.mocked(mergePullRequest).mockResolvedValue("merged");
+  vi.mocked(mergeBranch).mockResolvedValue("noop");
   vi.mocked(listCheckRuns).mockResolvedValue([]);
   vi.mocked(getCommitTime).mockResolvedValue(Date.now());
   vi.mocked(hasPendingConflictResolution).mockReturnValue(false);
@@ -344,6 +346,111 @@ describe("runAutoMerges honours the Auto-merge setting", () => {
   });
 });
 
+describe("default-branch sync after an auto-merged child (Restate lifecycle)", () => {
+  const MSG = "Merge default branch into feature branch";
+  const restate = () => mapping({ reviewFixLifecycle: "restate" });
+  const baseA = "ai-implement/feature/aii-200-feat";
+  const baseB = "ai-implement/feature/aii-400-other";
+
+  function approve(id: string, ident: string, url: string): void {
+    const rid = appendDispatch(id, ident, "Add thing");
+    log.updateJobStatus(rid, "completed", "runner_approved", url);
+  }
+  const prUrl = (n: number) => `https://github.com/BuildDownAI/AI-Implement/pull/${n}`;
+  function setupOne(): void {
+    approve("issue-aii-300", "AII-300", prUrl(5));
+    vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
+  }
+  function setupTwo(secondBase = baseA): void {
+    approve("issue-aii-300", "AII-300", prUrl(5));
+    approve("issue-aii-301", "AII-301", prUrl(6));
+    vi.mocked(listOpenPullRequests).mockResolvedValue([
+      pr(),
+      pr({ number: 6, url: prUrl(6), base: secondBase, headSha: "sha6", title: "AII-301: Add thing" }),
+    ]);
+  }
+
+  beforeEach(() => { autoMerge.resetCapExhaustedNotifications(); });
+
+  it.each(["legacy", undefined] as const)("does not sync for lifecycle %s", async (lc) => {
+    setupOne();
+    await autoMerge.runAutoMerges([mapping({ reviewFixLifecycle: lc })], deps());
+    expect(mergePullRequest).toHaveBeenCalledTimes(1);
+    expect(mergeBranch).not.toHaveBeenCalled();
+  });
+
+  it.each(["blocked", "conflict", "error"] as const)("does not sync when the child merge result is %s", async (res) => {
+    setupOne();
+    vi.mocked(mergePullRequest).mockResolvedValue(res as never);
+    await autoMerge.runAutoMerges([restate()], deps());
+    expect(mergeBranch).not.toHaveBeenCalled();
+  });
+
+  it("syncs the default branch with a key-free message, after the child merge", async () => {
+    setupOne();
+    vi.mocked(mergeBranch).mockResolvedValue("merged");
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const m = restate();
+    await autoMerge.runAutoMerges([m], deps());
+    expect(mergeBranch).toHaveBeenCalledTimes(1);
+    expect(mergeBranch).toHaveBeenCalledWith("tok", "BuildDownAI", "AI-Implement", baseA, m.defaultBranch, MSG);
+    expect(MSG).not.toMatch(/[A-Z][A-Z0-9]*-\d+/);
+    expect(vi.mocked(mergePullRequest).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(mergeBranch).mock.invocationCallOrder[0]);
+    expect(logSpy).toHaveBeenCalledWith(`[auto-merge] Synced ${m.defaultBranch} into ${baseA}`);
+    logSpy.mockRestore();
+  });
+
+  it("noop: no sync log and no sync notification", async () => {
+    setupOne();
+    const notify = vi.fn(async (_m: string) => {});
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    await autoMerge.runAutoMerges([restate()], { ...deps(), notify });
+    expect(mergeBranch).toHaveBeenCalledTimes(1);
+    expect(logSpy.mock.calls.some((c) => String(c[0]).includes("Synced"))).toBe(false);
+    expect(notify).toHaveBeenCalledTimes(1); // only the child-merge notice
+    logSpy.mockRestore();
+  });
+
+  it("conflict: logged, notified once per feature branch, nothing enqueued", async () => {
+    setupTwo();
+    vi.mocked(mergeBranch).mockResolvedValue("conflict");
+    const notify = vi.fn(async (_m: string) => {});
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    await autoMerge.runAutoMerges([restate()], { ...deps(), notify });
+    expect(mergePullRequest).toHaveBeenCalledTimes(2);
+    expect(mergeBranch).toHaveBeenCalledTimes(2);
+    const syncNotes = () => notify.mock.calls.filter((c) => String(c[0]).includes("Conflict syncing"));
+    expect(syncNotes()).toHaveLength(1);
+    expect(logSpy.mock.calls.some((c) => String(c[0]).includes(`Conflict syncing`))).toBe(true);
+    expect(enqueueConflictResolution).not.toHaveBeenCalled();
+    await autoMerge.runAutoMerges([restate()], { ...deps(), notify });
+    expect(syncNotes()).toHaveLength(1);
+    logSpy.mockRestore();
+  });
+
+  it("conflict on a different feature branch notifies again", async () => {
+    setupTwo(baseB);
+    vi.mocked(mergeBranch).mockResolvedValue("conflict");
+    const notify = vi.fn(async (_m: string) => {});
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    await autoMerge.runAutoMerges([restate()], { ...deps(), notify });
+    expect(notify.mock.calls.filter((c) => String(c[0]).includes("Conflict syncing"))).toHaveLength(2);
+  });
+
+  it("a throw is logged and the loop continues", async () => {
+    setupTwo();
+    vi.mocked(mergeBranch).mockRejectedValueOnce(new Error("boom")).mockResolvedValue("merged");
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    await autoMerge.runAutoMerges([restate()], deps());
+    expect(mergePullRequest).toHaveBeenCalledTimes(2);
+    expect(mergeBranch).toHaveBeenCalledTimes(2);
+    expect(errSpy.mock.calls.some((c) => String(c[0]).includes("Failed syncing"))).toBe(true);
+    errSpy.mockRestore();
+  });
+});
+
 describe("classifyStalledChild", () => {
   it("classifies 'conflict' (HTTP 409) as conflict", () => {
     expect(autoMerge.classifyStalledChild("conflict")).toBe("conflict");
@@ -423,7 +530,7 @@ describe("conflict detection in autoMergeRepo", () => {
   });
 
   it("non-conflict non-merged result keeps original log-only behavior (no enqueue, no notify)", () => {
-    const notify = vi.fn(async () => {});
+    const notify = vi.fn(async (_m: string) => {});
     expect(autoMerge.classifyStalledChild("some-future-result")).toBe("other");
     expect(vi.mocked(enqueueConflictResolution)).not.toHaveBeenCalled();
     expect(notify).not.toHaveBeenCalled();
@@ -440,7 +547,7 @@ describe("cap-exhausted notify-once (AII-277 Finding 4)", () => {
     vi.mocked(mergePullRequest).mockResolvedValue("conflict");
     vi.mocked(hasPendingConflictResolution).mockReturnValue(false);
     vi.mocked(countConflictAttempts).mockReturnValue(autoMerge.MAX_CONFLICT_RESOLUTION_ATTEMPTS);
-    const notify = vi.fn(async () => {});
+    const notify = vi.fn(async (_m: string) => {});
     for (let i = 0; i < 3; i++) {
       await autoMerge.runAutoMerges([mapping()], { ...deps(), notify });
     }
