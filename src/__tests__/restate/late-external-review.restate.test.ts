@@ -198,6 +198,23 @@ describe("LateExternalReview workflow", () => {
         expect(sc.stamps).toEqual([]);
       });
 
+      // The tick is injected, so the deferred-findings rule itself is covered in late-external-review-tick.test.ts
+      // (AII-1583); these two pin what the workflow does with the tick that rule produces.
+      it("approves and writes the mark when Claude's newest changes_requested review has only deferred findings (AII-1583)", async () => {
+        const { result, sc } = await runScenario(url(), { ticks: [pending, passed] });
+        expect(result).toEqual({ outcome: "approved" });
+        expect(sc.stamps).toEqual([sc.jobId]);
+        expect(sc.jobApproved).toBe(true);
+      });
+
+      it("ends findings with no mark when the same review has an open finding (AII-1583)", async () => {
+        const { result, sc } = await runScenario(url(), { ticks: [pending, { ...passed, heldBy: "changes_requested", blockingLastSeenAtMs: [COMMIT_MS + 60_000] }] });
+        expect(result).toEqual({ outcome: "findings" });
+        expect(sc.stamps).toEqual([]);
+        expect(sc.jobApproved).toBe(false);
+        expectOneHeld(sc, "A blocking finding is open");
+      });
+
       it("ends findings on a blocking finding last seen after the head's commit time", async () => {
         const { result, sc } = await runScenario(url(), { ticks: [{ ...passed, blockingLastSeenAtMs: [COMMIT_MS + 1] }] });
         expect(result).toEqual({ outcome: "findings" });

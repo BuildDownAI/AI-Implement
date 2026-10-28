@@ -19,7 +19,7 @@ import { parseReviewCheckNamesConfig } from "../pipeline/steps/install.js";
 import { getCombinedChecksState, getCommitTime, getDefaultBranchFileText, getPullRequestState, listCheckRuns, listPrComments, listPullRequestCommits, postPrComment } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { getJobByDispatchId, getJobById, recordLateReviewEnding, stampJobApproved } from "../log.js";
-import { listOpenReviewFindings } from "../review-ledger-store.js";
+import { getReviewFindingsByKeys, listOpenReviewFindings, stableReviewFindingKey } from "../review-ledger-store.js";
 import { getMappings } from "../config.js";
 import { classifyReviewIssueComment, type ReviewLedgerOptions } from "../pipeline/review-ledger.js";
 import { isReviewCheckRun, resolveReviewProcess, REVIEW_PROCESSES } from "../review-process.js";
@@ -298,7 +298,15 @@ async function newestReviewRejectsHead(token: string, input: { owner: string; re
     if (at < headCommittedAtMs) return undefined;
     if (classified.findingsUnavailable) return "unreadable";
     if (classified.verdict === "incomplete") return "incomplete";
-    if (classified.verdict === "changes_requested") return classified.findings.length === 0 ? "changes_requested-empty" : "changes_requested";
+    if (classified.verdict === "changes_requested") {
+      if (classified.findings.length === 0) return "changes_requested-empty";
+      // ADR 028: a finding the fix pass deferred does not gate the merge. Fail closed: every listed finding
+      // needs a ledger row and every row must be `deferred`; a missing row means the deferral was never recorded.
+      const keys = [...new Set(classified.findings.map((f) => stableReviewFindingKey(f)))];
+      const rows = getReviewFindingsByKeys(`${input.owner}/${input.repo}`, input.prNumber, keys);
+      const byKey = new Map(rows.map((r) => [r.findingKey, r.status]));
+      return keys.every((k) => byKey.get(k) === "deferred") ? undefined : "changes_requested";
+    }
     return undefined;
   }
   return undefined;
