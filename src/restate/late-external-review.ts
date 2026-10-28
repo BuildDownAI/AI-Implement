@@ -29,6 +29,8 @@ import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 
 /** How often the PR is read. */
 export const LATE_EXTERNAL_REVIEW_INTERVAL_MS = 60 * 1000;
+/** A gap-fill that names its pushed head waits up to this long for the PR to show that head before it ends `superseded`. At least one tick interval. */
+export const LATE_EXTERNAL_REVIEW_HEAD_GRACE_MS = 2 * 60 * 1000;
 /** How long the workflow keeps looking before it ends `timed-out`. */
 export const LATE_EXTERNAL_REVIEW_DEADLINE_MS = 30 * 60 * 1000;
 /** A gap-fill head with no review check run at all, older than this, has no reviewer; the check counts as passed. Applies only when no earlier commit of the PR had a review run (AII-1302). */
@@ -65,9 +67,9 @@ export const lateExternalReviewInputSchema = z.object({
   repo: z.string().min(1),
   prNumber: z.number().int().positive(),
   prUrl: z.string().min(1),
-  /** Required unless `gapFill`, which reads the PR head in its first journaled step. */
+  /** Required unless `gapFill`, which reads the PR head in its first journaled step. A gap-fill may name the head it pushed (Restate lifecycle); the workflow then waits up to `LATE_EXTERNAL_REVIEW_HEAD_GRACE_MS` for the PR to show it. */
   headSha: z.string().min(1).optional(),
-  /** A gap-fill run (AII-1291): the head is whatever the PR holds when the workflow starts, and a head with no review check run for 5 min has no reviewer. */
+  /** A gap-fill run (AII-1291): with no `headSha` the head is whatever the PR holds when the workflow starts, and a head with no review check run for 5 min has no reviewer. */
   gapFill: z.boolean().optional(),
   /** Repository-fix review process: follow the PR's head past the reviewed commit instead of ending `superseded`. Optional so an in-flight workflow still parses. */
   followHead: z.boolean().optional(),
@@ -129,6 +131,7 @@ export interface LateExternalReviewDependencies {
   /** Test seams; production leaves them unset. */
   intervalMs?: number;
   deadlineMs?: number;
+  headGraceMs?: number;
 }
 
 /** Decodes the `read-head` journal entry. A bare SHA string was journaled before AII-1302; it reads as "reviewer expected" (fail closed, no grace). */
@@ -140,6 +143,7 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
   const retentionMs = deps.retentionMs ?? restateRetentionMs();
   const intervalMs = deps.intervalMs ?? LATE_EXTERNAL_REVIEW_INTERVAL_MS;
   const deadlineMs = deps.deadlineMs ?? LATE_EXTERNAL_REVIEW_DEADLINE_MS;
+  const headGraceMs = deps.headGraceMs ?? LATE_EXTERNAL_REVIEW_HEAD_GRACE_MS;
 
   async function run(ctx: WorkflowContext, input: LateExternalReviewInput): Promise<LateExternalReviewResult> {
     if (!input?.dispatchId || lateExternalReviewWorkflowKey(input) !== ctx.key) {
@@ -202,12 +206,32 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
       }, { maxRetryAttempts: 5 });
       ({ headSha, reviewerExpected } = decodeReadHead(read));
     }
+    // A gap-fill that names its pushed head: no head read, but the reviewer decision (AII-1302) is journaled for that head.
+    // Reachable only for `gapFill && headSha && !followHead`, so every other input keeps its `ctx.run` sequence.
+    const namesHead = !!input.gapFill && !!input.headSha && !input.followHead;
+    if (namesHead && deps.readReviewerExpected) {
+      reviewerExpected = await ctx.run("reviewer-expected", () => deps.readReviewerExpected!({ ...input, headSha: headSha! }), { maxRetryAttempts: 5 });
+    }
+    let headSeen = false;
     const tickInput = { ...input, headSha, ...(reviewerExpected === undefined ? {} : { reviewerExpected }) };
     let approvedHeadSha = headSha;
     for (let i = 0; ; i++) {
       const tick = await ctx.run(`read-${i}`, () => deps.readTick(tickInput), { maxRetryAttempts: 5 });
       // Follow mode: the head moving is the expected result of the repository's auto-fix, so only a close ends it.
-      if (!tick.open || (!input.followHead && tick.headSha !== headSha)) return finish("superseded");
+      if (namesHead) {
+        if (!tick.open) return finish("superseded");
+        if (tick.headSha === headSha) {
+          // The first sighting counts only inside the grace; a read that lands after it never approves.
+          if (!headSeen && await ctx.date.now() - startedAt >= headGraceMs) return finish("superseded");
+          headSeen = true;
+        } else if (headSeen) return finish("superseded");
+        else {
+          // The PR does not show the pushed head yet: keep polling until the grace passes.
+          if (await ctx.date.now() - startedAt >= headGraceMs) return finish("superseded");
+          await ctx.sleep(intervalMs);
+          continue;
+        }
+      } else if (!tick.open || (!input.followHead && tick.headSha !== headSha)) return finish("superseded");
       if (tick.checks === "failure") return finish("external-failed");
       // A finding last seen before the head was committed was not reported by a review of this head
       // (a fix pass may have fixed it); one seen at or after the commit time blocks.

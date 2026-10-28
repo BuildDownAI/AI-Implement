@@ -6,6 +6,7 @@ import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   LATE_EXTERNAL_APPROVAL_MARKER,
+  LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS,
   createLateExternalReviewIngressClient,
   createLateExternalReviewWorkflow,
   lateExternalReviewWorkflowKey,
@@ -20,6 +21,7 @@ const SHA = "a".repeat(40);
 const OTHER_SHA = "b".repeat(40);
 const INTERVAL_MS = 50;
 const DEADLINE_MS = 1_500;
+const HEAD_GRACE_MS = 400;
 
 interface Scenario {
   /** One tick per read; the last one repeats. */
@@ -39,6 +41,12 @@ interface Scenario {
   /** What `readReviewerExpected` returns; counts the reads. */
   reviewerExpected: boolean;
   reviewerReads: number;
+  /** Every `reviewerExpected` the tick was read with. */
+  tickReviewerExpected?: Array<boolean | undefined>;
+  /** When set, the tick models a head with no review run: `checks` follows the absent-review grace (AII-1302). */
+  noReviewRun?: { headCommittedAtMs: number };
+  /** The gap-fill input's `headSha` (AII-1484); absent: the gap-fill names no head. */
+  pushedHead?: string;
   /** Row-keyed dispatch_log stand-in (AII-1524): `newest` is what a dispatch-id lookup returns, like `getJobByDispatchId`. */
   rows?: Map<number, { conclusion: string; approved: boolean }>;
   newestRowId?: number;
@@ -78,6 +86,7 @@ function makeDeps(): LateExternalReviewDependencies {
   return {
     intervalMs: INTERVAL_MS,
     deadlineMs: DEADLINE_MS,
+    headGraceMs: HEAD_GRACE_MS,
     async readHead(input) {
       const sc = scenarioOf(input.dispatchId);
       sc.headReads++;
@@ -92,6 +101,12 @@ function makeDeps(): LateExternalReviewDependencies {
       const sc = scenarioOf(input.dispatchId);
       const tick = sc.ticks[Math.min(sc.reads, sc.ticks.length - 1)];
       sc.reads++;
+      sc.tickReviewerExpected?.push(input.reviewerExpected);
+      if (sc.noReviewRun) {
+        // Mirrors readTick: no review run and no earlier reviewer reads success only after the absent-review grace.
+        const noReviewer = !input.reviewerExpected && Date.now() - sc.noReviewRun.headCommittedAtMs >= LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS;
+        return { ...tick, headCommittedAtMs: sc.noReviewRun.headCommittedAtMs, checks: noReviewer ? "success" : "pending" };
+      }
       return tick;
     },
     findJob(dispatchId, rowId) {
@@ -156,7 +171,7 @@ describe("LateExternalReview workflow", () => {
     scenarios.set(dispatchId, sc);
     const input: LateExternalReviewInput = {
       dispatchId, owner: "o", repo: "r", prNumber: 5, prUrl: "https://github.com/o/r/pull/5",
-      ...(gapFill ? { gapFill: true } : { headSha: SHA }),
+      ...(gapFill ? { gapFill: true, ...(sc.pushedHead ? { headSha: sc.pushedHead } : {}) } : { headSha: SHA }),
       ...(follow ? { followHead: true } : {}),
       ...(attemptId ? { attemptId } : {}),
       ...(rowId !== undefined ? { rowId } : {}),
@@ -403,6 +418,98 @@ describe("LateExternalReview workflow", () => {
           const { result, sc } = await gap({ ticks: [pending, { ...pending, headSha: OTHER_SHA }] });
           expect(result).toEqual({ outcome: "superseded" });
           expect(sc.stamps).toEqual([]);
+        });
+      });
+
+      describe("gap-fill naming its pushed head (AII-1484)", () => {
+        const gap = (overrides: Partial<Scenario>) => runScenario(url(), { pushedHead: OTHER_SHA, ...overrides }, false, true);
+        const onA: LateReviewTick = pending;
+        const onB: LateReviewTick = { ...pending, headSha: OTHER_SHA };
+        const THIRD_SHA = "c".repeat(40);
+
+        it("keeps polling while the PR shows the old head, then approves once the pushed head is read and stamps the supplied row", async () => {
+          const rowId = 20_000 + (rowSeq += 2);
+          const other = rowId + 1;
+          const rows = new Map([
+            [rowId, { conclusion: "external_review_pending", approved: false }],
+            [other, { conclusion: "external_review_pending", approved: false }],
+          ]);
+          const { result, sc } = await runScenario(url(), {
+            pushedHead: OTHER_SHA, ticks: [onA, { ...onB, checks: "success" }], rows, newestRowId: other,
+          }, false, true, undefined, undefined, rowId);
+          expect(result).toEqual({ outcome: "approved" });
+          expect(sc.stamps).toEqual([rowId]);
+          expect(sc.rows!.get(rowId)!.approved).toBe(true);
+          expect(sc.rows!.get(other)!.approved).toBe(false);
+          expect(sc.recorded).toEqual([[rowId, "approved"]]);
+          expect(sc.comments).toHaveLength(1);
+          expect(sc.headReads).toBe(0);
+        });
+
+        it("ends superseded with no mark when the pushed head never shows within the grace", async () => {
+          const { result, sc } = await gap({ ticks: [onA] });
+          expect(result).toEqual({ outcome: "superseded" });
+          expect(sc.stamps).toEqual([]);
+          expect(sc.comments).toEqual([]);
+          expect(sc.reads).toBeGreaterThan(1);
+        });
+
+        it("ends superseded with no mark when the pushed head first shows after the grace", async () => {
+          const stale = Array.from({ length: 12 }, () => onA);
+          const { result, sc } = await gap({ ticks: [...stale, { ...onB, checks: "success" }] });
+          expect(result).toEqual({ outcome: "superseded" });
+          expect(sc.stamps).toEqual([]);
+          expect(sc.comments).toEqual([]);
+        });
+
+        it("ends superseded with no mark when the head moves on after the pushed head was read", async () => {
+          const { result, sc } = await gap({ ticks: [onB, { ...pending, headSha: THIRD_SHA, checks: "success" }] });
+          expect(result).toEqual({ outcome: "superseded" });
+          expect(sc.stamps).toEqual([]);
+        });
+
+        it("decides reviewerExpected once for the pushed head, without reading the head (AII-1302)", async () => {
+          const { result, sc } = await gap({ ticks: [onB], reviewerExpected: true });
+          expect(result).toEqual({ outcome: "timed-out" });
+          expect(sc.reviewerReads).toBe(1);
+          expect(sc.headReads).toBe(0);
+        });
+
+        it("a head with no review run on a PR with no earlier reviewer stays pending inside the five-minute grace", async () => {
+          const { result, sc } = await gap({
+            ticks: [onB], reviewerExpected: false, tickReviewerExpected: [], noReviewRun: { headCommittedAtMs: Date.now() },
+          });
+          expect(result).toEqual({ outcome: "timed-out" });
+          expect(sc.stamps).toEqual([]);
+          expect(sc.reviewerReads).toBe(1);
+          expect(sc.tickReviewerExpected!.length).toBeGreaterThan(1);
+          expect(sc.tickReviewerExpected!.every((v) => v === false)).toBe(true);
+        });
+
+        it("the same head proceeds to approval once the five-minute absent-review grace has passed", async () => {
+          const { result, sc } = await gap({
+            ticks: [onB], reviewerExpected: false, tickReviewerExpected: [],
+            noReviewRun: { headCommittedAtMs: Date.now() - LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS - 1_000 },
+          });
+          expect(result).toEqual({ outcome: "approved" });
+          expect(sc.stamps).toEqual([sc.jobId]);
+          expect(sc.tickReviewerExpected).toEqual([false]);
+        });
+
+        it("an earlier reviewer on the PR keeps the head pending even past the grace", async () => {
+          const { result, sc } = await gap({
+            ticks: [onB], reviewerExpected: true, tickReviewerExpected: [],
+            noReviewRun: { headCommittedAtMs: Date.now() - LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS - 1_000 },
+          });
+          expect(result).toEqual({ outcome: "timed-out" });
+          expect(sc.stamps).toEqual([]);
+          expect(sc.tickReviewerExpected!.every((v) => v === true)).toBe(true);
+        });
+
+        it("a gap-fill with no headSha still reads the head and ends superseded on a moved head", async () => {
+          const { result, sc } = await runScenario(url(), { ticks: [pending, onB] }, false, true);
+          expect(result).toEqual({ outcome: "superseded" });
+          expect(sc.headReads).toBe(1);
         });
       });
 

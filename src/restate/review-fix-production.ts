@@ -206,6 +206,7 @@ export async function submitLateReviewForAttempt(
   scope: ScopedPrIdentity,
   attemptId: string,
   submit: ((input: LateExternalReviewInput) => Promise<boolean | void>) | undefined,
+  headSha?: string,
 ): Promise<void> {
   if (!submit) return;
   try {
@@ -225,7 +226,7 @@ export async function submitLateReviewForAttempt(
     // Held for the poll sweep (resubmitPendingGapFillReviews) in case Restate is not ready and the hook only logs.
     const workflowKey = lateExternalReviewWorkflowKey({ dispatchId: row.dispatchId, attemptId });
     recordPendingLateReview({ workflowKey, dispatchId: row.dispatchId, prUrl, attemptId });
-    const settled = await submit({ dispatchId: row.dispatchId, owner, repo, prNumber: scope.prNumber, prUrl, gapFill: true, attemptId });
+    const settled = await submit({ dispatchId: row.dispatchId, owner, repo, prNumber: scope.prNumber, prUrl, gapFill: true, attemptId, ...(headSha ? { headSha } : {}) });
     // Accepted or already running: the workflow key is the idempotency, so the retry record is spent.
     if (settled !== false) clearPendingLateReview(workflowKey);
   } catch (err) {
@@ -265,7 +266,7 @@ export function createProductionFinalizer(deps: {
         return { status: "withheld", reason: "current PR head or merge policy changed" };
       }
       // Submitted before the policy read: a transient GitHub error there must not block it. Never throws.
-      await submitLateReviewForAttempt(input.scope, input.attemptId, submitLateExternalReview);
+      await submitLateReviewForAttempt(input.scope, input.attemptId, submitLateExternalReview, input.result.outputCommit);
       if (!input.policyAllows || !await github.evaluateMergePolicy(input.scope, input.findingDispositions)) {
         if (submitLateExternalReview) {
           console.log(`[review-fix] Approval effect withheld for attempt ${input.attemptId} (merge policy not yet satisfied); late external review submitted`);
