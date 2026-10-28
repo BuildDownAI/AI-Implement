@@ -9,14 +9,24 @@ For the `dispatched` table, see [dispatch-dedup.md](dispatch-dedup.md).
 
 ## 1. How the schema changes at boot
 
-Two functions change the schema:
+Each table has an init step that runs at boot. Two of them hold most of the schema:
 
 - `getDb()` (`src/dedup.ts`) opens the one database handle and creates most tables,
   indexes and triggers.
 - `initLogTable()` (`src/log.ts`) creates `dispatch_log`. Then it runs `ensureLogColumns()`
   and `ensureAccountingTriggers()`, in that order.
 
-`initLogTable()` is called early in startup (`src/index.ts`), before `loadConfig()`. It runs
+Other modules own their tables and run their own `CREATE TABLE IF NOT EXISTS` and
+`ALTER TABLE` statements from an init function that `main()` in `src/index.ts` calls at boot:
+`initMappingsTable()`, `initDispatchBreakerTable()`, `initSettingsTable()`,
+`initAccessEntriesTable()` (`src/access-entries.ts`), `initReconciliationTable()`,
+`initStepLogTable()` (`src/step-log.ts`), `initMcpOAuthTables()` (`src/mcp-oauth.ts`),
+`initAccessAuditTable()`, `initAccessPageGrantsTable()`, `initAuthEventsTable()`
+(`src/mcp-auth-events.ts`) and `initReviewFixEvidenceTable()` (`src/review-fix-evidence.ts`).
+To change a table, find the module that creates it: search for `CREATE TABLE IF NOT EXISTS <name>`.
+The rest of this page describes `dispatch_log` and `review_fix_attempts`.
+
+`main()` calls these init functions before `loadConfig()`. They run
 before the Restate endpoint opens (`restateRegistration.attempt()` is called later) and before
 the first poll.
 
@@ -93,17 +103,23 @@ stays in the database.
 
 ## 5. Rule: changing a column that a trigger names
 
-- SQLite refuses to drop or rename a column that a trigger names. `trg_dispatch_log_changed_at`
+- SQLite refuses to drop a column that a trigger names. A rename does not fail: SQLite rewrites
+  the trigger to use the new name. `trg_dispatch_log_changed_at`
   names 13 `dispatch_log` columns (`DISPATCH_LOG_CHANGE_COLUMNS` in `src/log.ts`): `status`,
   `conclusion`, `completed_at`, `pr_url`, `issue_identifier`, `issue_title`, `tracker_kind`,
   `issue_url`, `machine_cpu_kind`, `machine_cpus`, `machine_memory_mb`, `compute_started_at`
-  and `compute_stopped_at`.
-- This matters only for a change that removes or renames one of those columns.
-- That change must first drop the trigger, then change the column, then create the trigger again.
+  and `compute_stopped_at`. `trg_dispatch_log_pruned` also names `dispatch_log` columns
+  (`id`, `dispatch_id`, `changed_at` and `completed_at`).
+- This matters only for a change that removes one of those columns. A rename also needs the
+  trigger SQL and `DISPATCH_LOG_CHANGE_COLUMNS` updated to the new name in the same change.
+- A removal must first drop every trigger that names the column, then drop the column, then create
+  those triggers again with updated references. For `completed_at`, that includes
+  `trg_dispatch_log_pruned` as well as `trg_dispatch_log_changed_at`.
 - The orchestrator already drops and creates this trigger at every boot. So the column change
   only needs to run before that step (before `ensureAccountingTriggers()` in `initLogTable()`),
-  and the trigger's column list must be updated in the same change.
-- If someone forgets, the column change fails at boot, and that orchestrator does not start. The
+  and the trigger's column list must be updated in the same change. `trg_dispatch_log_pruned` is
+  created with `IF NOT EXISTS`, so the change must drop it itself and recreate it.
+- If someone forgets, the column drop fails at boot, and that orchestrator does not start. The
   test `adds the columns to an old table, leaving old rows null` in `src/__tests__/jobs.test.ts`
   drops the trigger first for exactly this reason.
 - The same rule applies to `review_fix_attempts` columns named by
@@ -121,6 +137,6 @@ Running the change before `ensureAccountingTriggers()` is not enough for this ta
 2. Make a new column nullable, or give it a default.
 3. Add a test that boots an old database (create the old shape, run `initLogTable()` twice,
    check the result). Use the test named in section 5 as the pattern.
-4. If the change drops or renames a column that a trigger names, follow section 5.
+4. If the change drops a column that a trigger names (or renames one), follow section 5.
 5. Read the deploy paths in [deployment.md](deployment.md#deploy-paths). Remember that a
    rollback keeps the schema change (section 3).
