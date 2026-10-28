@@ -38,6 +38,8 @@ export interface ReviewFixApprovalEvidence {
   currentPrHeadSha: string;
   findingDispositions: readonly ReviewFixFindingDisposition[];
   policyAllows: boolean;
+  /** Every required finding has a disposition. Kept apart from `policyAllows`, which is false while CI runs. */
+  dispositionsComplete: boolean;
 }
 
 export interface ReviewFixAttemptDependencies {
@@ -279,6 +281,7 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
           currentPrHeadSha: evidence.currentPrHeadSha,
           findingDispositions: evidence.findingDispositions,
           policyAllows: evidence.policyAllows,
+          dispositionsComplete: evidence.dispositionsComplete,
         }));
         approval = effect.status === "applied" || effect.status === "already_applied" ? "applied" : "withheld";
       } else {
