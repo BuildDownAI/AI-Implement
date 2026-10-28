@@ -124,7 +124,7 @@ An `openai-api-key` profile works for every Codex stage, including review and pl
 
 ## Check which profile a run used
 
-Open the run's GitHub Actions log (the `implement` or `plan` job, step `Run pipeline` or `Run planning`) and search for `[model-auth]`. `src/run-autonomous.ts` prints one line per credential checkout and finish:
+Open the run's GitHub Actions log (the `implement` or `plan` job, step `Run pipeline` or `Run planning`) and search for `[model-auth]`. `src/run-autonomous.ts` prints one line per credential checkout, checkpoint and finish:
 
 ```
 [model-auth] {"operation":"checkout","profileId":"anthropic-aii","status":"ok"}
@@ -141,7 +141,7 @@ Each line is one JSON object:
 
 `status: "ok"` on `checkout` means the credential reached the runner. It does not prove the provider accepted the key: a provider error, for example `401 Unauthorized`, appears later in the same log.
 
-`[model-auth] finish failed: <category>` and `[model-auth] dispose failed: <category>` report a failure to return the credential. They print a category, never a value.
+`[model-auth] finish failed: <category>` means returning one profile's credential failed. `[model-auth] dispose failed: <category>` is logged after every credential was returned, when closing the run's model-auth client fails. They print a category, never a value.
 
 These lines appear only for hosted credentials, so an empty search does not mean no profile was used.
 
