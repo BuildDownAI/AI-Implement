@@ -198,7 +198,7 @@ function dispositionsFor(attempt: PreparedReviewFixAttempt, result: ReviewFixRes
 }
 
 /**
- * After a review-fix attempt's approval effect applied (AII-1307), asks `LateExternalReview` to review the
+ * For a succeeded review-fix attempt whose facts hold (AII-1307, AII-1414), asks `LateExternalReview` to review the
  * pushed head and write the PR's mark. The mark is never stamped here. Never throws: this runs inside the
  * journaled `apply-approval-once` step, and a retry would re-run the approval effect.
  */
@@ -258,14 +258,22 @@ export function createProductionFinalizer(deps: {
         return { status: "withheld", reason: "current attempt authority or accepted result changed" };
       }
       const head = await github.getPrHeadSha(input.scope) ?? "";
-      if (head !== input.result.outputCommit || !input.policyAllows
-        || !await github.evaluateMergePolicy(input.scope, input.findingDispositions)) {
+      // The attempt facts alone decide the late review: LateExternalReview waits for the pushed head's review check and
+      // CI, so the instant merge policy (false while CI runs on a fresh push) must not gate the submit.
+      const dispositionsComplete = input.dispositionsComplete ?? input.policyAllows;
+      if (head !== input.result.outputCommit || !dispositionsComplete) {
+        return { status: "withheld", reason: "current PR head or merge policy changed" };
+      }
+      // Submitted before the policy read: a transient GitHub error there must not block it. Never throws.
+      await submitLateReviewForAttempt(input.scope, input.attemptId, submitLateExternalReview);
+      if (!input.policyAllows || !await github.evaluateMergePolicy(input.scope, input.findingDispositions)) {
+        if (submitLateExternalReview) {
+          console.log(`[review-fix] Approval effect withheld for attempt ${input.attemptId} (merge policy not yet satisfied); late external review submitted`);
+        }
         return { status: "withheld", reason: "current PR head or merge policy changed" };
       }
       const current = { ...input, currentAuthority: true, currentPrHeadSha: head };
-      const applied = await baseFinalizer.applyApproval(current);
-      if (applied.status === "applied") await submitLateReviewForAttempt(input.scope, input.attemptId, submitLateExternalReview);
-      return applied;
+      return baseFinalizer.applyApproval(current);
     },
   };
 }
@@ -378,7 +386,7 @@ export function createProductionReviewFixServices(
         && findingDispositions.every((disposition) => required.has(disposition.findingKey));
       const currentPrHeadSha = await github.getPrHeadSha(prepared.scope) ?? "";
       const policyAllows = full && await github.evaluateMergePolicy(prepared.scope, findingDispositions);
-      return { currentPrHeadSha, findingDispositions, policyAllows };
+      return { currentPrHeadSha, findingDispositions, policyAllows, dispositionsComplete: full };
     },
   });
   return [pr, attempt];

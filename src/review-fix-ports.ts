@@ -368,6 +368,9 @@ export interface ReviewFixApprovalInput {
    *  independently allows this PR to proceed. Backend success is one input among these, never
    *  sufficient alone. */
   readonly policyAllows: boolean;
+  /** Optional: every required finding has a disposition, independent of `policyAllows` (AII-1414). The production
+   *  finalizer reads it; the base finalizer ignores it. */
+  readonly dispositionsComplete?: boolean;
 }
 
 /**

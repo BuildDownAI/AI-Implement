@@ -364,7 +364,9 @@ const worker = new GithubReviewFixWorker({
 
 const baseFinalizer = createReviewFixFinalizer({ attemptStore: sqliteStore, github });
 // The production wrapper itself (review-fix-production.ts), with no late-review submit wired.
-const finalizer = createProductionFinalizer({ store: sqliteStore, github, baseFinalizer });
+const lateReviews: Array<{ dispatchId: string; prUrl: string; gapFill?: boolean; attemptId?: string }> = [];
+const finalizer = createProductionFinalizer({ store: sqliteStore, github, baseFinalizer,
+  submitLateExternalReview: async (input) => { lateReviews.push(input); return true; } });
 
 const alerts: Array<{ attemptId: string; reason: string }> = [];
 
@@ -418,7 +420,7 @@ const attemptWorkflow = createReviewFixAttempt({
     const currentPrHeadSha = (await github.getPrHeadSha(attempt.scope)) ?? "";
     const findingDispositions = attempt.findings.map((finding) => ({ findingKey: finding.findingKey, disposition: "addressed" as const }));
     const policyAllows = await github.evaluateMergePolicy(attempt.scope, findingDispositions);
-    return { currentPrHeadSha, findingDispositions, policyAllows };
+    return { currentPrHeadSha, findingDispositions, policyAllows, dispositionsComplete: true };
   },
 });
 
@@ -1002,6 +1004,32 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!);
     expect(done).toMatchObject({ status: "finalized", approval: "applied" });
     expect(fixture.commentPosts).toBe(1); // the crashed call's write landed; the retry's upsert did not post a second comment
+  }, 25_000);
+
+  // AII-1414: the push starts CI on the pushed head, so the merge policy is false at finalize; the late review
+  // (which does the waiting) must still be submitted, and the approval comment must not be posted.
+  it("a succeeded attempt whose checks are still running at finalize submits the late review once and posts no approval", async () => {
+    const env = envFor("alwaysReplay");
+    const fixture = freshScenario("checks-running");
+    fixture.checks = [{ status: "in_progress", conclusion: null }];
+    const jobId = appendLog({ issueId: "issue-checks-running", repo: fixture.scope.repository, dispatchId: "d-checks-running" });
+    updateJobStatus(jobId, "completed", "success", `https://github.com/${fixture.scope.repository}/pull/1`);
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    const attemptId = fixture.attemptId!;
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+    const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;
+    const result = resultOf(fixture, prepared);
+    await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "result", result);
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
+    const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
+    expect(done).toMatchObject({ status: "finalized", approval: "withheld" });
+    const mine = () => lateReviews.filter((review) => review.attemptId === attemptId);
+    expect(mine()).toEqual([expect.objectContaining({ dispatchId: "d-checks-running", gapFill: true, attemptId })]);
+    expect(fixture.commentPosts).toBe(0);
+    // A repeated finalize (re-attach, repeated result delivery) adds no submit.
+    await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
+    await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "result", result);
+    expect(mine()).toHaveLength(1);
   }, 25_000);
 
   it.each(VARIANTS.map(([label]) => label))("completed_at is the timestamp the record-success-outcome step journaled, and the journal holds no secret (%s)", async (label) => {
