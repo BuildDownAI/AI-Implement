@@ -60,7 +60,9 @@ Every step is idempotent, so a second boot changes nothing:
 **Backfill.** `ensureAccountingTriggers()` sets `changed_at = completed_at` on rows in
 `dispatch_log` and `review_fix_attempts` where `changed_at IS NULL AND completed_at IS NOT NULL`.
 This statement runs at every boot. It is idempotent, because it touches only rows with a NULL
-`changed_at`. A row that is still running keeps a NULL `changed_at`.
+`changed_at`. The backfill leaves the NULL of a running row unchanged. A running row can still
+get a `changed_at` later, because the triggers below set it when a tracked column changes or an
+invocation or report arrives.
 
 **Triggers:**
 
@@ -115,10 +117,17 @@ stays in the database.
 - A removal must first drop every trigger that names the column, then drop the column, then create
   those triggers again with updated references. For `completed_at`, that includes
   `trg_dispatch_log_pruned` as well as `trg_dispatch_log_changed_at`.
-- The orchestrator already drops and creates this trigger at every boot. So the column change
-  only needs to run before that step (before `ensureAccountingTriggers()` in `initLogTable()`),
-  and the trigger's column list must be updated in the same change. `trg_dispatch_log_pruned` is
-  created with `IF NOT EXISTS`, so the change must drop it itself and recreate it.
+- `changed_at` is named too. In `dispatch_log` and `review_fix_attempts`, it is written by
+  `trg_invocation_attribution_changed_at`, `trg_job_report_insert_changed_at` and
+  `trg_job_report_update_changed_at`. `trg_review_fix_attempts_changed_at` writes it in
+  `review_fix_attempts`, and `trg_dispatch_log_pruned` reads it in `dispatch_log`. Removing
+  `changed_at` from either table fails while any of these triggers remains.
+- The orchestrator already drops and creates `trg_dispatch_log_changed_at` at every boot. So the
+  column change only needs to run before that step (before `ensureAccountingTriggers()` in
+  `initLogTable()`), and the trigger's column list must be updated in the same change. All other
+  triggers are created with `IF NOT EXISTS`, so SQLite does not restore them after a drop. The
+  change must drop each affected trigger, update its definition, and create it again in the same
+  schema change.
 - If someone forgets, the column drop fails at boot, and that orchestrator does not start. The
   test `adds the columns to an old table, leaving old rows null` in `src/__tests__/jobs.test.ts`
   drops the trigger first for exactly this reason.
