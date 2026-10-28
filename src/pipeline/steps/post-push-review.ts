@@ -2504,10 +2504,18 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         break;
       }
 
-      if (cleanInternalNoGatingFindings && (findingsUnavailable || externalReviewVerdictBlocks || externalReviewNoVerdict)) {
+      // Only a real, readable, blocking verdict goes to the late gate: LateExternalReview re-reads it from
+      // Claude's review comment (ai-implement process), and does not require an initial run's own review
+      // check to have succeeded, so a no-verdict or unreadable ending would otherwise earn the mark (AII-1589).
+      const handOffToLateReview = cleanInternalNoGatingFindings
+        && externalReviewVerdictBlocks
+        && !findingsUnavailable
+        && !externalReviewNoVerdict
+        && reviewProcess.id === "ai-implement";
+      if (handOffToLateReview) {
         terminationReason = "external_review_pending";
         reviewedHeadSha = externalReviewResult.headSha || undefined;
-        feedback = externalVerdictUnavailableFeedback({ noVerdict: externalReviewNoVerdict, verdictBlocks: externalReviewVerdictBlocks });
+        feedback = externalVerdictUnavailableFeedback({ noVerdict: false, verdictBlocks: true });
         await reporter.report({
           id: `post-push-review.${iteration}`,
           type: "custom",
@@ -2528,7 +2536,36 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Internal review passed, but the external review verdict was unavailable or incomplete. Not approving here; the late external review now decides (a verdict whose findings are all deferred follow-ups does not hold the PR).${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Waiting for the late external review to decide.`,
+          `${marker}\n⚠️ Internal review passed, but the external review verdict was unavailable or incomplete. Not approving here; the late external review now decides (a verdict whose findings are all deferred follow-ups does not hold the PR).${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}\n\n**Merge readiness:** Waiting for the late external review to decide.`,
+          marker,
+        );
+        break;
+      }
+
+      if (cleanInternalNoGatingFindings && (findingsUnavailable || externalReviewVerdictBlocks || externalReviewNoVerdict)) {
+        terminationReason = "invalid_review";
+        feedback = externalVerdictUnavailableFeedback({ noVerdict: externalReviewNoVerdict, verdictBlocks: externalReviewVerdictBlocks });
+        await reporter.report({
+          id: `post-push-review.${iteration}`,
+          type: "custom",
+          status: "passed",
+          started_at: new Date().toISOString(),
+          ended_at: new Date().toISOString(),
+          parent_step_id: "post-push-review",
+          inputs: { iteration, prNumber },
+          outputs: { approved: false, feedback, issues: [], blockingIssues: [], telemetry: reviewResult.telemetry },
+          logs_url: null,
+        });
+        const marker = `<!-- ai-implement post-push iter=${iteration} invalid-external-review -->`;
+        const reviewUrl = submitPrReview(
+          ghSpawn,
+          prNumber,
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement internal review passed, but the external review verdict was unavailable or incomplete. Not auto-approving.${internalReviewSummaryBlock(verdict.feedback)}`,
+        );
+        postPrComment(
+          ghSpawn,
+          prNumber,
+          `${marker}\n⚠️ Internal review passed, but the external review verdict was unavailable or incomplete. Not auto-approving.${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Manual review required; external review verdict unavailable.`,
           marker,
         );
         break;
