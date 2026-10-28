@@ -726,7 +726,7 @@ describe("configured planning (shared prepareConfiguredRun + selected stage exec
             expect(env.CODEX_API_KEY).toBe(S_OPENAI);
             expect(env.CHATGPT_PLAN_ACCESS_TOKEN).toBeUndefined();
             expect(dump).not.toContain(S_CHATGPT);
-            expect(driverInputs[0].modelProvider).toBeUndefined();
+            expect(driverInputs[0].modelProvider).toBe("openai_api_key");
           }
           expect(env.OPENAI_API_KEY).toBeUndefined();
           expect(dump).not.toContain(S_AMBIENT);
