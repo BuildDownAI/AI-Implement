@@ -101,7 +101,8 @@ also deletes the `model_invocation_attribution` and `dispatch_job_report` rows w
 Every reader finds these rows through the job row, so nothing visible is lost. The control plane
 keeps the permanent copy for orchestrators it tracks. For an orchestrator it does not track, the
 raw per-call rows of pruned jobs are gone. A rollback does not bring them back, because the trigger
-stays in the database.
+stays in the database. This was decided on purpose (user decision, 2026-10-28): once the job row is
+gone, no reader can reach its call rows, so keeping them gave no value.
 
 ## 5. Rule: changing a column that a trigger names
 
@@ -130,9 +131,9 @@ stays in the database.
   schema change.
 - If someone forgets, the column drop fails at boot, and that orchestrator does not start. The
   test `adds the columns to an old table, leaving old rows null` in `src/__tests__/jobs.test.ts`
-  drops the trigger first for exactly this reason.
-- The same rule applies to `review_fix_attempts` columns named by
-  `trg_review_fix_attempts_changed_at` (`state`, `terminal_outcome_json`, `completed_at`).
+  drops the trigger first for exactly this reason. The same rule applies to `review_fix_attempts`
+  columns named by `trg_review_fix_attempts_changed_at` (`state`, `terminal_outcome_json`,
+  `completed_at`).
 
 One difference for `review_fix_attempts`: `getDb()` creates its trigger with
 `CREATE TRIGGER IF NOT EXISTS`, and boot does not recreate it. So the column change must drop
