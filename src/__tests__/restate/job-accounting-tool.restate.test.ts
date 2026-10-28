@@ -24,7 +24,7 @@ describe("list_job_accounting on the orchestratorTools service", () => {
     initLogTable();
     const done = Date.now() - 60 * 60 * 1000;
     for (let i = 0; i < 25; i++) {
-      const id = appendLog({ issueId: `i${i}`, dispatchId: `d-${String(i).padStart(2, "0")}` });
+      const id = appendLog({ issueId: `i${i}`, dispatchId: `00000000-0000-4000-8000-${String(i).padStart(12, "0")}` });
       // pairs share a completed_at
       dedup.getDb().prepare("UPDATE dispatch_log SET status = 'completed', conclusion = 'success', completed_at = ? WHERE id = ?")
         .run(done + Math.floor(i / 2) * 1000, id);

@@ -3,6 +3,7 @@
 // the request body, the HTTP status, and the exact response body the route returns (the MCP envelope included). The control
 // plane copies these files, so a change to the response must change them on purpose:
 // regenerate with UPDATE_CONTRACT_FIXTURES=1 npx vitest run src/__tests__/job-accounting-contract.test.ts
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -26,6 +27,12 @@ const DIR = new URL("../../docs/contracts/list_job_accounting/", import.meta.url
 const T = 1_700_000_000_000; // every stored time is an offset from here; all are long settled
 const SHA_1 = "1".repeat(40);
 const SHA_2 = "2".repeat(40);
+
+/** The readable name of a seeded job, and the UUID-shaped dispatch id stored for it (the only shape the tool serves). */
+function jid(name: string): string {
+  const h = createHash("sha1").update(name).digest("hex");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
 
 let admin: typeof AdminModule;
 let dedup: typeof DedupModule;
@@ -185,7 +192,7 @@ interface JobSeed {
 /** A finished implementation job with pinned times; `changed_at` is pinned last because the triggers stamp the wall clock. */
 function seed(job: JobSeed): void {
   const db = dedup.getDb();
-  const rowId = log.appendLog({ issueId: `issue-${job.id}`, dispatchId: job.id, executionMode: "fly-machines" });
+  const rowId = log.appendLog({ issueId: `issue-${job.id}`, dispatchId: jid(job.id), executionMode: "fly-machines" });
   db.prepare(
     `UPDATE dispatch_log SET dispatched_at = ?, status = 'completed', conclusion = 'success', completed_at = ?, issue_identifier = ?,
        issue_title = ?, repo = 'acme/widgets', pr_url = ?, tracker_kind = 'linear', issue_url = ?, compute_started_at = ?, compute_stopped_at = ?
@@ -200,17 +207,17 @@ function seed(job: JobSeed): void {
          auth_mode, status, started_at, completed_at, usage_json)
        VALUES (?, ?, ?, 'p', 1, 'claude', 'anthropic', 'claude-model', 'api_key', 'succeeded', ?, ?, ?)`,
     ).run(
-      `${job.id}-inv-${i}`, job.id, i === 0 ? "implementation" : "review", job.at - 400_000, job.at - 300_000,
+      `${job.id}-inv-${i}`, jid(job.id), i === 0 ? "implementation" : "review", job.at - 400_000, job.at - 300_000,
       JSON.stringify({ tokensIn: 1000 * (i + 1), tokensOut: 100 * (i + 1), costUsd: 0.25 * (i + 1), costStatus: "reported", attempts: 1 }),
     );
   }
-  if (job.shas) log.recordPushedCommits(job.id, job.shas, job.at);
-  if (job.complete) log.recordInvocationsComplete(job.id, job.at);
+  if (job.shas) log.recordPushedCommits(jid(job.id), job.shas, job.at);
+  if (job.complete) log.recordInvocationsComplete(jid(job.id), job.at);
   pin(job.id, job.at);
 }
 
-function pin(id: string, changedAt: number): void {
-  dedup.getDb().prepare("UPDATE dispatch_log SET changed_at = ? WHERE dispatch_id = ?").run(changedAt, id);
+function pin(name: string, changedAt: number): void {
+  dedup.getDb().prepare("UPDATE dispatch_log SET changed_at = ? WHERE dispatch_id = ?").run(changedAt, jid(name));
 }
 
 function seedThree(): void {
@@ -233,14 +240,14 @@ describe("recorded list_job_accounting exchanges", () => {
 
   it("next-page", async () => {
     seedThree();
-    const recorded = await exchange({ args: { cursor: { changedAt: T + 1000, dispatchId: "job-a" }, pageSize: 1 } });
+    const recorded = await exchange({ args: { cursor: { changedAt: T + 1000, dispatchId: jid("job-a") }, pageSize: 1 } });
     expect(pageOf(recorded).nextCursor).not.toBeNull();
     check("next-page", recorded);
   });
 
   it("short-page", async () => {
     seedThree();
-    const recorded = await exchange({ args: { cursor: { changedAt: T + 1000, dispatchId: "job-a" }, pageSize: 5 } });
+    const recorded = await exchange({ args: { cursor: { changedAt: T + 1000, dispatchId: jid("job-a") }, pageSize: 5 } });
     expect(pageOf(recorded).nextCursor).toBeNull();
     check("short-page", recorded);
   });
@@ -254,11 +261,11 @@ describe("recorded list_job_accounting exchanges", () => {
   it("changed-again", async () => {
     seedThree();
     // job-a was served before the cursor below; a late review conclusion then rewrote it.
-    dedup.getDb().prepare("UPDATE dispatch_log SET conclusion = 'approved_late' WHERE dispatch_id = 'job-a'").run();
+    dedup.getDb().prepare("UPDATE dispatch_log SET conclusion = 'approved_late' WHERE dispatch_id = ?").run(jid("job-a"));
     pin("job-a", T + 9000);
-    const recorded = await exchange({ args: { cursor: { changedAt: T + 3000, dispatchId: "job-c" }, pageSize: 5 } });
+    const recorded = await exchange({ args: { cursor: { changedAt: T + 3000, dispatchId: jid("job-c") }, pageSize: 5 } });
     const records = pageOf(recorded).records as Array<{ dispatchId: string; changedAt: number }>;
-    expect(records.map((r) => [r.dispatchId, r.changedAt])).toEqual([["job-a", T + 9000]]);
+    expect(records.map((r) => [r.dispatchId, r.changedAt])).toEqual([[jid("job-a"), T + 9000]]);
     check("changed-again", recorded);
   });
 
@@ -274,9 +281,9 @@ describe("recorded list_job_accounting exchanges", () => {
 
   it("pruned", async () => {
     seedThree();
-    dedup.getDb().prepare("DELETE FROM dispatch_log WHERE dispatch_id = 'job-b'").run();
+    dedup.getDb().prepare("DELETE FROM dispatch_log WHERE dispatch_id = ?").run(jid("job-b"));
     const recorded = await exchange({ args: { pageSize: 5 } });
-    expect(pageOf(recorded).prunedThrough).toEqual({ changedAt: T + 2000, dispatchId: "job-b" });
+    expect(pageOf(recorded).prunedThrough).toEqual({ changedAt: T + 2000, dispatchId: jid("job-b") });
     check("pruned", recorded);
   });
 
@@ -287,9 +294,9 @@ describe("recorded list_job_accounting exchanges", () => {
     vi.setSystemTime(now);
     seed({ id: "job-old", at: T + 1000, invocations: 1, complete: true, shas: [SHA_1] });
     seed({ id: "job-fresh", at: now - 60_000, invocations: 1, complete: true, shas: [SHA_2] });
-    expect(pageOf(await exchange({ args: {} })).records.map((r: { dispatchId: string }) => r.dispatchId)).toEqual(["job-old"]);
+    expect(pageOf(await exchange({ args: {} })).records.map((r: { dispatchId: string }) => r.dispatchId)).toEqual([jid("job-old")]);
     const recorded = await exchange({ args: { includeUnsettled: true } });
-    expect(pageOf(recorded).records.map((r: { dispatchId: string }) => r.dispatchId)).toEqual(["job-old", "job-fresh"]);
+    expect(pageOf(recorded).records.map((r: { dispatchId: string }) => r.dispatchId)).toEqual([jid("job-old"), jid("job-fresh")]);
     check("final-pull", recorded);
   });
 
@@ -318,11 +325,13 @@ describe("list_job_accounting args.schema.json", () => {
         return Object.entries(schema.properties ?? {}).every(([k, sub]) => !(k in v) || validate(sub, v[k], root));
       }
       case "string":
-        return typeof value === "string" && value.length >= (schema.minLength ?? 0) && value.length <= (schema.maxLength ?? Infinity);
+        return typeof value === "string" && value.length >= (schema.minLength ?? 0) && value.length <= (schema.maxLength ?? Infinity)
+          && (schema.pattern === undefined || new RegExp(schema.pattern).test(value));
       case "integer":
       case "number":
         return typeof value === "number" && Number.isFinite(value) && (schema.type !== "integer" || Number.isInteger(value))
-          && value >= (schema.minimum ?? -Infinity) && value <= (schema.maximum ?? Infinity);
+          && value >= (schema.minimum ?? -Infinity) && value <= (schema.maximum ?? Infinity)
+          && value < (schema.exclusiveMaximum ?? Infinity) && value > (schema.exclusiveMinimum ?? -Infinity);
       case "boolean":
         return typeof value === "boolean";
       default:
@@ -344,13 +353,19 @@ describe("list_job_accounting args.schema.json", () => {
 
   it("rejects what the tool rejects", () => {
     const schema = load();
-    const ok = { cursor: { changedAt: 1, dispatchId: "a" } };
+    const ok = { cursor: { changedAt: 1, dispatchId: jid("a") } };
     expect(validate(schema, ok)).toBe(true);
+    expect(validate(schema, { cursor: { changedAt: 8.64e15, dispatchId: "log-12" } })).toBe(true);
     for (const bad of [
       { cursor: { changedAt: 1, dispatchId: "" } },
       { cursor: { changedAt: 1, dispatchId: "x".repeat(201) } },
-      { cursor: { changedAt: 1.5, dispatchId: "a" } },
-      { cursor: { dispatchId: "a" } },
+      { cursor: { changedAt: 1, dispatchId: "a" } },
+      { cursor: { changedAt: 1, dispatchId: `${jid("a")}\u0000` } },
+      { cursor: { changedAt: 1, dispatchId: "\ud800" } },
+      { cursor: { changedAt: 8.64e15 + 1, dispatchId: jid("a") } },
+      { cursor: { changedAt: -1, dispatchId: jid("a") } },
+      { cursor: { changedAt: 1.5, dispatchId: jid("a") } },
+      { cursor: { dispatchId: jid("a") } },
       { pageSize: 0 },
       { pageSize: JOB_ACCOUNTING_MAX_PAGE_SIZE + 1 },
       { includeUnsettled: "yes" },
@@ -373,8 +388,8 @@ describe("list_job_accounting args.schema.json", () => {
 describe("list_job_accounting strict arguments", () => {
   it("rejects unknown keys in the arguments and the cursor", () => {
     expect(JobAccountingArgsSchema.safeParse({ pageSize: 5, foo: 1 }).success).toBe(false);
-    expect(JobAccountingArgsSchema.safeParse({ cursor: { changedAt: 1, dispatchId: "a", x: 1 } }).success).toBe(false);
-    expect(JobAccountingCursorSchema.safeParse({ changedAt: 1, dispatchId: "a", x: 1 }).success).toBe(false);
+    expect(JobAccountingArgsSchema.safeParse({ cursor: { changedAt: 1, dispatchId: jid("a"), x: 1 } }).success).toBe(false);
+    expect(JobAccountingCursorSchema.safeParse({ changedAt: 1, dispatchId: jid("a"), x: 1 }).success).toBe(false);
   });
 
   it("answers an unknown argument with the same isError as invalid-args", async () => {
@@ -412,7 +427,8 @@ describe("list_job_accounting record.schema.json", () => {
       case "integer":
       case "number":
         return typeof value === "number" && Number.isFinite(value) && (schema.type !== "integer" || Number.isInteger(value))
-          && value >= (schema.minimum ?? -Infinity) && value <= (schema.maximum ?? Infinity);
+          && value >= (schema.minimum ?? -Infinity) && value <= (schema.maximum ?? Infinity)
+          && value < (schema.exclusiveMaximum ?? Infinity) && value > (schema.exclusiveMinimum ?? -Infinity);
       default:
         throw new Error(`record.schema.json uses an unsupported schema: ${JSON.stringify(schema)}`);
     }
@@ -461,7 +477,8 @@ describe("list_job_accounting record.schema.json", () => {
 
   function served(): Array<{ case: string; record: unknown }> {
     const cases = seedBoundary(dedup, log);
-    const records = acc.listJobAccounting({ now: NOW, pageSize: JOB_ACCOUNTING_MAX_PAGE_SIZE }).records;
+    // includeUnsettled: one boundary job finished at the Date limit
+    const records = acc.listJobAccounting({ now: NOW, pageSize: JOB_ACCOUNTING_MAX_PAGE_SIZE, includeUnsettled: true }).records;
     return records.map((record) => ({ case: cases.find((c) => c.dispatchId === record.dispatchId)!.case, record }));
   }
 
@@ -479,7 +496,7 @@ describe("list_job_accounting record.schema.json", () => {
   it("boundary-records.json holds records that pass both the zod schema and record.schema.json", () => {
     const schema = JSON.parse(readFileSync(new URL("record.schema.json", DIR), "utf8"));
     const wrapped = JSON.parse(readFileSync(file, "utf8")) as Array<{ case: string; record: any }>;
-    expect(wrapped.length).toBeGreaterThanOrEqual(6);
+    expect(wrapped.length).toBeGreaterThanOrEqual(9);
     for (const { case: note, record } of wrapped) {
       expect(note.length).toBeGreaterThan(0);
       expect(JobAccountingRecordSchema.safeParse(record).success, note).toBe(true);
@@ -494,5 +511,41 @@ describe("list_job_accounting record.schema.json", () => {
     expect(validate(schema, { ...record, pr: { ...record.pr, number: -1 } })).toBe(false);
     expect(validate(schema, { ...record, dispatchId: "x".repeat(201) })).toBe(false);
     expect(validate(schema, { ...record, dispatchId: "" })).toBe(false);
+  });
+
+  it("rejects, by the JSON schema and zod alike, a time above 8.64e15, a cost outside 0 <= cost < 1e15 and an id of no known format", () => {
+    const schema = JSON.parse(readFileSync(new URL("record.schema.json", DIR), "utf8"));
+    const wrapped = JSON.parse(readFileSync(file, "utf8")) as Array<{ case: string; record: any }>;
+    const record = wrapped.find((w) => w.record.invocations.length > 0)!.record;
+    const cost = (costUsd: number) => ({ ...record, invocations: [{ ...record.invocations[0], costUsd }] });
+    const bad: Array<[string, unknown]> = [
+      ["dispatchedAt", { ...record, dispatchedAt: 8.64e15 + 1 }],
+      ["completedAt", { ...record, completedAt: 8.64e15 + 1 }],
+      ["changedAt", { ...record, changedAt: 8.64e15 + 1 }],
+      ["negative time", { ...record, changedAt: -1 }],
+      ["startedAt", { ...record, compute: { ...record.compute, startedAt: 8.64e15 + 1 } }],
+      ["stoppedAt", { ...record, compute: { ...record.compute, stoppedAt: 8.64e15 + 1 } }],
+      ["cost -1", cost(-1)],
+      ["cost 1e15", cost(1e15)],
+      ["id job-a", { ...record, dispatchId: "job-a" }],
+      ["id with NUL", { ...record, dispatchId: `${jid("a")}\u0000` }],
+      ["id with a lone surrogate", { ...record, dispatchId: "\ud800" }],
+      ["id with a space", { ...record, dispatchId: `${jid("a")} ` }],
+    ];
+    for (const [what, r] of bad) {
+      expect(validate(schema, r), what).toBe(false);
+      expect(JobAccountingRecordSchema.safeParse(r).success, what).toBe(false);
+    }
+    const good: Array<[string, unknown]> = [
+      ["time at 8.64e15", { ...record, completedAt: 8.64e15, compute: { ...record.compute, startedAt: 8.64e15, stoppedAt: null } }],
+      ["cost 0", cost(0)],
+      ["cost under 1e15", cost(999_999_999_999_999)],
+      ["log id", { ...record, dispatchId: "log-4" }],
+      ["review-fix id", { ...record, dispatchId: `reviewfix-${"a".repeat(64)}-999` }],
+    ];
+    for (const [what, r] of good) {
+      expect(validate(schema, r), what).toBe(true);
+      expect(JobAccountingRecordSchema.safeParse(r).success, what).toBe(true);
+    }
   });
 });

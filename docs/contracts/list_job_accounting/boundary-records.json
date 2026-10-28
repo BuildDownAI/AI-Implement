@@ -2,7 +2,7 @@
   {
     "case": "title of 5,000 characters with a NUL and an astral character at the cut point; NUL in a pushed SHA and a model name",
     "record": {
-      "dispatchId": "job-long-text",
+      "dispatchId": "00000000-0000-4000-8000-000000000001",
       "completedAt": 1700000001000,
       "changedAt": 1700000001000,
       "usage": "reported",
@@ -55,7 +55,7 @@
   {
     "case": "250 stored invocations: the first 200 are served and usage is partial",
     "record": {
-      "dispatchId": "job-many-calls",
+      "dispatchId": "00000000-0000-4000-8000-000000000002",
       "completedAt": 1700000002000,
       "changedAt": 1700000002000,
       "usage": "partial",
@@ -2891,7 +2891,7 @@
   {
     "case": "PR number 2^40 and token counts 2^40",
     "record": {
-      "dispatchId": "job-big-pr",
+      "dispatchId": "00000000-0000-4000-8000-000000000003",
       "completedAt": 1700000003000,
       "changedAt": 1700000003000,
       "usage": "reported",
@@ -2974,9 +2974,9 @@
     }
   },
   {
-    "case": "dispatch id of 200 characters",
+    "case": "dispatch id of 78 characters (reviewfix-<64 hex>-999, the longest format)",
     "record": {
-      "dispatchId": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "dispatchId": "reviewfix-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-999",
       "completedAt": 1700000005000,
       "changedAt": 1700000005000,
       "usage": "unknown",
@@ -3011,7 +3011,7 @@
   {
     "case": "review-fix attempt (no dispatch_log row) with a PR number of 2^40",
     "record": {
-      "dispatchId": "job-review-fix",
+      "dispatchId": "reviewfix-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "completedAt": 1700000006000,
       "changedAt": 1700000006000,
       "usage": "unknown",
@@ -3040,6 +3040,156 @@
         "memoryMb": null,
         "startedAt": 1699999905500,
         "stoppedAt": 1700000006000
+      }
+    }
+  },
+  {
+    "case": "cost of 999999999999999, just under the 1e15 limit",
+    "record": {
+      "dispatchId": "00000000-0000-4000-8000-000000000006",
+      "completedAt": 1700000008000,
+      "changedAt": 1700000008000,
+      "usage": "partial",
+      "invocations": [
+        {
+          "stage": "review",
+          "agent": "claude",
+          "provider": "anthropic",
+          "model": "claude-model",
+          "status": "succeeded",
+          "tokensIn": 1,
+          "tokensOut": null,
+          "cacheReadTokens": null,
+          "cacheCreationTokens": null,
+          "costUsd": 999999999999999,
+          "costStatus": "reported",
+          "attempts": 1
+        }
+      ],
+      "pushedShas": null,
+      "phase": "implementation",
+      "status": "completed",
+      "conclusion": "success",
+      "lifecycleOwner": "legacy",
+      "dispatchedAt": 1699999408000,
+      "issue": {
+        "identifier": "AII-1700000008000",
+        "title": "Cost under the limit",
+        "repo": "acme/widgets",
+        "trackerKind": "linear",
+        "url": "https://linear.app/acme/issue/X"
+      },
+      "pr": {
+        "url": "https://github.com/acme/widgets/pull/9",
+        "number": 9
+      },
+      "compute": {
+        "backend": "fly-machines",
+        "cpuKind": "shared",
+        "cpus": 4,
+        "memoryMb": 8192,
+        "startedAt": 1699999508000,
+        "stoppedAt": 1700000007000
+      }
+    }
+  },
+  {
+    "case": "cost of 0, reported",
+    "record": {
+      "dispatchId": "00000000-0000-4000-8000-000000000007",
+      "completedAt": 1700000009000,
+      "changedAt": 1700000009000,
+      "usage": "partial",
+      "invocations": [
+        {
+          "stage": "review",
+          "agent": "claude",
+          "provider": "anthropic",
+          "model": "claude-model",
+          "status": "succeeded",
+          "tokensIn": 1,
+          "tokensOut": null,
+          "cacheReadTokens": null,
+          "cacheCreationTokens": null,
+          "costUsd": 0,
+          "costStatus": "reported",
+          "attempts": 1
+        }
+      ],
+      "pushedShas": null,
+      "phase": "implementation",
+      "status": "completed",
+      "conclusion": "success",
+      "lifecycleOwner": "legacy",
+      "dispatchedAt": 1699999409000,
+      "issue": {
+        "identifier": "AII-1700000009000",
+        "title": "Cost of zero",
+        "repo": "acme/widgets",
+        "trackerKind": "linear",
+        "url": "https://linear.app/acme/issue/X"
+      },
+      "pr": {
+        "url": "https://github.com/acme/widgets/pull/10",
+        "number": 10
+      },
+      "compute": {
+        "backend": "fly-machines",
+        "cpuKind": "shared",
+        "cpus": 4,
+        "memoryMb": 8192,
+        "startedAt": 1699999509000,
+        "stoppedAt": 1700000008000
+      }
+    }
+  },
+  {
+    "case": "completedAt and changedAt at 8.64e15 (the Date limit)",
+    "record": {
+      "dispatchId": "00000000-0000-4000-8000-000000000005",
+      "completedAt": 8640000000000000,
+      "changedAt": 8640000000000000,
+      "usage": "partial",
+      "invocations": [
+        {
+          "stage": "review",
+          "agent": "claude",
+          "provider": "anthropic",
+          "model": "claude-model",
+          "status": "succeeded",
+          "tokensIn": 1,
+          "tokensOut": null,
+          "cacheReadTokens": null,
+          "cacheCreationTokens": null,
+          "costUsd": 0.5,
+          "costStatus": "reported",
+          "attempts": 1
+        }
+      ],
+      "pushedShas": null,
+      "phase": "implementation",
+      "status": "completed",
+      "conclusion": "success",
+      "lifecycleOwner": "legacy",
+      "dispatchedAt": 8639999999400000,
+      "issue": {
+        "identifier": "AII-8640000000000000",
+        "title": "Time at the Date limit",
+        "repo": "acme/widgets",
+        "trackerKind": "linear",
+        "url": "https://linear.app/acme/issue/X"
+      },
+      "pr": {
+        "url": "https://github.com/acme/widgets/pull/8",
+        "number": 8
+      },
+      "compute": {
+        "backend": "fly-machines",
+        "cpuKind": "shared",
+        "cpus": 4,
+        "memoryMb": 8192,
+        "startedAt": 8639999999500000,
+        "stoppedAt": 8639999999999000
       }
     }
   }

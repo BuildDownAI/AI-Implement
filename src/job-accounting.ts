@@ -44,13 +44,38 @@ export const JOB_ACCOUNTING_MAX_PAGE_SIZE = 200;
 /** The longest text (UTF-16 units, as zod measures it) a served record string may have; longer text is cut. Published in record.schema.json. */
 export const RECORD_TEXT_MAX = 2000;
 
-/** Longest dispatch id served: the cursor and the record schema share it. */
-const DISPATCH_ID_MAX = 200;
+/** Latest time a served record may hold: the JavaScript `Date` limit, so every `Date.now()` the orchestrator stored converts to a valid date. Published in record.schema.json. */
+export const MAX_TIME_MS = 8.64e15;
+/** Costs are served only below this (USD); the consumer stores 0 <= cost < 1e15. Published in record.schema.json. */
+export const COST_USD_LIMIT = 1e15;
+
+/**
+ * The dispatch ids the orchestrator makes, and the only ids served (the cursor and the record schema share the pattern):
+ * a `crypto.randomUUID()` (every dispatch and gap-fill run, runner tokens, kg-refresh), `log-<n>` (the synthetic id of a legacy
+ * dispatch_log row with no dispatch_id) and `reviewfix-<sha256 hex>` with an optional `-<1..999>` variant suffix (review_fix_attempts).
+ * The longest is 78 characters.
+ */
+export const DISPATCH_ID_PATTERN =
+  /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|log-[1-9][0-9]{0,15}|reviewfix-[0-9a-f]{64}(?:-[1-9][0-9]{0,2})?)$/;
+const dispatchId = z.string().regex(DISPATCH_ID_PATTERN);
+
+/** The key-query twin of DISPATCH_ID_PATTERN (SQLite has no regex); a test runs both over the same samples. */
+const hexGlob = (n: number): string => "[0-9a-f]".repeat(n);
+export const DISPATCH_ID_SQL = (col: string): string => `(
+    length(${col}) = length(CAST(${col} AS BLOB)) AND (
+      (length(${col}) = 36 AND ${col} GLOB '${hexGlob(8)}-${hexGlob(4)}-${hexGlob(4)}-${hexGlob(4)}-${hexGlob(12)}')
+      OR (length(${col}) BETWEEN 5 AND 20 AND ${col} GLOB 'log-[1-9]*' AND substr(${col}, 5) NOT GLOB '*[^0-9]*')
+      OR (length(${col}) BETWEEN 74 AND 78 AND substr(${col}, 1, 74) GLOB 'reviewfix-${hexGlob(64)}'
+          AND (length(${col}) = 74 OR (length(${col}) >= 76 AND substr(${col}, 75, 1) = '-' AND substr(${col}, 76) GLOB '[1-9]*'
+                                       AND substr(${col}, 76) NOT GLOB '*[^0-9]*')))
+    ))`;
+
+const time = z.number().int().min(0).max(MAX_TIME_MS);
 
 /** Position in the walk: records are ordered by `(changedAt, dispatchId)`; a changed job comes back after the cursor. */
 export const JobAccountingCursorSchema = z.object({
-  changedAt: z.number().int().nonnegative().safe(),
-  dispatchId: z.string().min(1).max(DISPATCH_ID_MAX),
+  changedAt: time,
+  dispatchId,
 }).strict();
 export type JobAccountingCursor = z.infer<typeof JobAccountingCursorSchema>;
 
@@ -63,6 +88,7 @@ export const JobAccountingArgsSchema = z.object({
 
 const count = z.number().int().nonnegative();
 const nullableInt = count.nullable();
+const nullableTime = time.nullable();
 /** Text a served record may hold: at most RECORD_TEXT_MAX units and no NUL (Postgres `text` cannot store it). */
 const text = z.string().max(RECORD_TEXT_MAX).regex(/^[^\u0000]*$/);
 const nullableString = text.nullable();
@@ -77,7 +103,7 @@ export const JobAccountingInvocationSchema = z.object({
   tokensOut: nullableInt,
   cacheReadTokens: nullableInt,
   cacheCreationTokens: nullableInt,
-  costUsd: z.number().nullable(),
+  costUsd: z.number().min(0).lt(COST_USD_LIMIT).nullable(),
   /** `reported` only when the executor reported a cost; otherwise `unavailable` with `costUsd` null. */
   costStatus: z.enum(["reported", "unavailable"]),
   /** Spawn attempts for this one invocation; minimum 1. */
@@ -85,15 +111,15 @@ export const JobAccountingInvocationSchema = z.object({
 });
 
 export const JobAccountingRecordSchema = z.object({
-  dispatchId: z.string().min(1).max(DISPATCH_ID_MAX),
+  dispatchId,
   phase: text,
   status: text,
   conclusion: nullableString,
   lifecycleOwner: z.enum(["legacy", "restate"]),
-  dispatchedAt: count,
-  completedAt: count,
+  dispatchedAt: time,
+  completedAt: time,
   /** When this record last changed (epoch ms). A job that changes is served again; the newest copy replaces older ones. */
-  changedAt: count,
+  changedAt: time,
   issue: z.object({
     identifier: nullableString,
     title: nullableString,
@@ -115,8 +141,8 @@ export const JobAccountingRecordSchema = z.object({
     cpuKind: nullableString,
     cpus: nullableInt,
     memoryMb: nullableInt,
-    startedAt: nullableInt,
-    stoppedAt: nullableInt,
+    startedAt: nullableTime,
+    stoppedAt: nullableTime,
   }),
 });
 export type JobAccountingRecord = z.infer<typeof JobAccountingRecordSchema>;
@@ -126,7 +152,7 @@ export const JobAccountingPageSchema = z.object({
   /** The cursor to pass for the next page; null when this page was not full (the walk is at the end). */
   nextCursor: JobAccountingCursorSchema.nullable(),
   /** The oldest finished job the orchestrator still holds (settled or not); null when it holds none. Information only. */
-  oldestRetainedCompletedAt: nullableInt,
+  oldestRetainedCompletedAt: nullableTime,
   /** The newest `(changedAt, dispatchId)` of any finished job that was pruned; null when none was. A cursor behind it may have missed records. */
   prunedThrough: JobAccountingCursorSchema.nullable(),
 });
@@ -207,6 +233,10 @@ function intOrNull(v: unknown): number | null {
   return typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : null;
 }
 
+function timeOrNull(v: unknown): number | null {
+  return typeof v === "number" && Number.isSafeInteger(v) && v >= 0 && v <= MAX_TIME_MS ? v : null;
+}
+
 function toInvocation(row: InvocationRow): z.infer<typeof JobAccountingInvocationSchema> {
   let u: Record<string, unknown> = {};
   try {
@@ -215,7 +245,7 @@ function toInvocation(row: InvocationRow): z.infer<typeof JobAccountingInvocatio
   } catch {
     // unreadable usage reads as no usage
   }
-  const costUsd = typeof u.costUsd === "number" && Number.isFinite(u.costUsd) && u.costUsd >= 0 ? u.costUsd : null;
+  const costUsd = typeof u.costUsd === "number" && Number.isFinite(u.costUsd) && u.costUsd >= 0 && u.costUsd < COST_USD_LIMIT ? u.costUsd : null;
   const attempts = typeof u.attempts === "number" && Number.isSafeInteger(u.attempts) && u.attempts >= 1 ? u.attempts : 1;
   return {
     stage: cut(row.stage),
@@ -277,7 +307,7 @@ export function listJobAccounting(
   const keys = db
     .prepare(
       `SELECT src, row_id, jid, done_at, changed FROM (${FINISHED_SOURCES})
-       WHERE length(CAST(jid AS BLOB)) BETWEEN 1 AND ${DISPATCH_ID_MAX} ${settled} ${after} ORDER BY changed ASC, jid ASC LIMIT ?`,
+       WHERE ${DISPATCH_ID_SQL("jid")} AND done_at BETWEEN 0 AND ${MAX_TIME_MS} AND changed BETWEEN 0 AND ${MAX_TIME_MS} ${settled} ${after} ORDER BY changed ASC, jid ASC LIMIT ?`,
     )
     .all(...params, pageSize) as KeyRow[];
 
@@ -355,7 +385,8 @@ export function listJobAccounting(
     };
     if (key.src === "log") {
       const r = logRows.get(key.row_id);
-      if (!r) continue;
+      const dispatchedAt = r ? timeOrNull(r.dispatched_at) : null;
+      if (!r || dispatchedAt === null) continue;
       const owner = owners.get(key.jid) ?? "legacy";
       records.push({
         ...common,
@@ -363,7 +394,7 @@ export function listJobAccounting(
         status: cut(r.status),
         conclusion: cut(r.conclusion),
         lifecycleOwner: owner.startsWith("restate") ? "restate" : "legacy",
-        dispatchedAt: r.dispatched_at,
+        dispatchedAt,
         issue: {
           identifier: cut(r.issue_identifier),
           title: cut(r.issue_title),
@@ -377,20 +408,21 @@ export function listJobAccounting(
           cpuKind: cut(r.machine_cpu_kind),
           cpus: intOrNull(r.machine_cpus),
           memoryMb: intOrNull(r.machine_memory_mb),
-          startedAt: intOrNull(r.compute_started_at),
-          stoppedAt: intOrNull(r.compute_stopped_at),
+          startedAt: timeOrNull(r.compute_started_at),
+          stoppedAt: timeOrNull(r.compute_stopped_at),
         },
       });
     } else {
       const r = fixRows.get(key.jid);
-      if (!r) continue;
+      const dispatchedAt = r ? timeOrNull(r.created_at) : null;
+      if (!r || dispatchedAt === null) continue;
       records.push({
         ...common,
         phase: "review-fix",
         status: "completed",
         conclusion: cut(r.state),
         lifecycleOwner: "restate",
-        dispatchedAt: r.created_at,
+        dispatchedAt,
         issue: { identifier: null, title: null, repo: cut(r.repository), trackerKind: null, url: null },
         pr: { url: cut(`https://github.com/${r.repository}/pull/${r.pr_number}`), number: intOrNull(r.pr_number) },
         // Run start/end are not stored for an attempt: created_at and completed_at stand in (queue time included).
@@ -399,7 +431,7 @@ export function listJobAccounting(
           cpuKind: null,
           cpus: null,
           memoryMb: null,
-          startedAt: r.created_at,
+          startedAt: dispatchedAt,
           stoppedAt: r.completed_at,
         },
       });
@@ -410,7 +442,7 @@ export function listJobAccounting(
   return {
     records,
     nextCursor: lastKey && keys.length === pageSize ? { changedAt: lastKey.changed, dispatchId: lastKey.jid } : null,
-    oldestRetainedCompletedAt: oldest.oldest,
-    prunedThrough: pruned ? { changedAt: pruned.changed_at, dispatchId: pruned.jid } : null,
+    oldestRetainedCompletedAt: timeOrNull(oldest.oldest),
+    prunedThrough: pruned && timeOrNull(pruned.changed_at) !== null && DISPATCH_ID_PATTERN.test(pruned.jid) ? { changedAt: pruned.changed_at, dispatchId: pruned.jid } : null,
   };
 }
