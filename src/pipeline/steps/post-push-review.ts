@@ -2505,7 +2505,8 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       }
 
       if (cleanInternalNoGatingFindings && (findingsUnavailable || externalReviewVerdictBlocks || externalReviewNoVerdict)) {
-        terminationReason = "invalid_review";
+        terminationReason = "external_review_pending";
+        reviewedHeadSha = externalReviewResult.headSha || undefined;
         feedback = externalVerdictUnavailableFeedback({ noVerdict: externalReviewNoVerdict, verdictBlocks: externalReviewVerdictBlocks });
         await reporter.report({
           id: `post-push-review.${iteration}`,
@@ -2515,19 +2516,19 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
           ended_at: new Date().toISOString(),
           parent_step_id: "post-push-review",
           inputs: { iteration, prNumber },
-          outputs: { approved: false, feedback, issues: [], blockingIssues: [], telemetry: reviewResult.telemetry },
+          outputs: { approved: false, feedback, issues: [], blockingIssues: [], telemetry: reviewResult.telemetry, ...(reviewedHeadSha ? { reviewedHeadSha } : {}) },
           logs_url: null,
         });
         const marker = `<!-- ai-implement post-push iter=${iteration} invalid-external-review -->`;
         const reviewUrl = submitPrReview(
           ghSpawn,
           prNumber,
-          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement internal review passed, but the external review verdict was unavailable or incomplete. Manual review required.${internalReviewSummaryBlock(verdict.feedback)}`,
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement internal review passed, but the external review verdict was unavailable or incomplete. The late external review now decides.${internalReviewSummaryBlock(verdict.feedback)}`,
         );
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Internal review passed, but the external review verdict was unavailable or incomplete. Not auto-approving.${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Manual review required; external review verdict unavailable.`,
+          `${marker}\n⚠️ Internal review passed, but the external review verdict was unavailable or incomplete. Not approving here; the late external review now decides (a verdict whose findings are all deferred follow-ups does not hold the PR).${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Waiting for the late external review to decide.`,
           marker,
         );
         break;
