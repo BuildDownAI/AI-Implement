@@ -118,6 +118,10 @@ Import and remove API-key and Bedrock credentials with `secret-import` and `secr
 - **Backup and restore.** Rows are sealed under a key derived from the current `RUNNER_TOKEN_SECRET` and bound to their reference. A restored database works only under the same secret, and a row copied to another reference fails authentication.
 - **Rotation.** Rotating `RUNNER_TOKEN_SECRET` orphans every stored credential. Re-import each one after the rotation.
 
+### API keys and Codex stages
+
+An `openai-api-key` profile works for every Codex stage, including review and planning, which run `codex app-server`. The invocation env carries the key as `CODEX_API_KEY`. `codex exec` reads that variable directly. The app-server path has no `auth.json`, and its built-in `openai` provider does not read the variable, so the executor selects a provider named `openai_api_key` whose `env_key` is `CODEX_API_KEY` (`base_url` is `OPENAI_BASE_URL` when the invocation sets an allowed one, else `https://api.openai.com/v1`). The provider is chosen the same way in the view's `config.toml`, the argv and the thread request. `CODEX_API_KEY` stays in the shell-environment exclusion list, so the Codex process has the key and the commands the model runs do not. A run without `CODEX_API_KEY` in its env keeps the built-in provider.
+
 ## Claude subscription accounts
 
 To be filled by [AII-963](https://linear.app/eudoxus/issue/AII-963/provision-accounts-and-recover-held-subscription-sessions).
