@@ -14,6 +14,7 @@ import { getProjectOptIn } from "./agent-config-store.js";
 import type { AgentConfigAdminDeps } from "./admin.js";
 import { inspectAgentReadiness, type AgentRunPreparationDeps } from "./agent-run-preparation.js";
 import { getDb } from "./dedup.js";
+import { getMappings } from "./config.js";
 import { getScopedInstallationToken } from "./github-app-auth.js";
 import { defaultFetchSignal, getDefaultBranchFileText } from "./github.js";
 import type { ModelCredentialDeps } from "./model-credentials.js";
@@ -132,14 +133,17 @@ export function createModelAuthRuntime(input: {
           const visibility = await fetchVisibility(repository);
           return { visibility, trustedForSubscription: visibility === "private" && getProjectOptIn(target.projectKey) };
         },
-        // Default-branch text, repo-scoped token. `null` is an absent file; any other failure throws, which
+        // Text at the mapping's branch (the one dispatch runs), else GitHub's default; repo-scoped token. `null` is an absent file; any other failure throws, which
         // preparation reports as `delivery_unreadable` (never as "absent").
         async readDefaultBranchWorkflows(repository, paths) {
           const m = REPO_REF.exec(repository);
           if (!m) throw new Error("malformed repository reference");
           const bearer = await token(m[1]!, m[2]!);
+          // One ref for every path, retired ones included. A lookup failure throws (-> delivery_unreadable)
+          // rather than falling back to the wrong branch.
+          const ref = getMappings()[target.projectKey]?.defaultBranch || undefined;
           const files: Record<string, string | null> = {};
-          for (const path of paths) files[path] = await getDefaultBranchFileText(bearer, m[1]!, m[2]!, path);
+          for (const path of paths) files[path] = await getDefaultBranchFileText(bearer, m[1]!, m[2]!, path, ref);
           return files;
         },
         async checkRunnerCapability(backend) {
