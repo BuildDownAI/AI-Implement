@@ -133,7 +133,7 @@ describe("ReviewFixPR durable coordination", () => {
       recordOutcome: async (_outcome, now) => ({ status: "recorded", completedAt: now } as const),
       applyApproval: async () => ({ status: "withheld", reason: "test" } as const),
     },
-    loadApprovalEvidence: async () => ({ currentPrHeadSha: SHA, findingDispositions: [], policyAllows: false }),
+    loadApprovalEvidence: async () => ({ currentPrHeadSha: SHA, findingDispositions: [], policyAllows: false, dispositionsComplete: true }),
   });
   const recorded: ReviewFixFeedbackEvent[] = [];
   const coordinator = createReviewFixPR({ attempts: store,
