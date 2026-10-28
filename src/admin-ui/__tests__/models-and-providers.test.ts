@@ -33,6 +33,31 @@ describe("models-and-providers page", () => {
     expect(modelsAndProvidersScript).toContain("input.value = ''");
     expect(modelsAndProvidersScript).not.toMatch(/credentialRef/);
   });
+  it("labels each add-form control and keeps its id", () => {
+    const labels: Record<string, string> = {
+      "mp-new-profileId": "Profile ID",
+      "mp-new-identity": "Identity",
+      "mp-new-agent": "Agent",
+      "mp-new-provider": "Provider",
+      "mp-new-authMode": "Authentication",
+      "mp-new-allowedProjectKeys": "Permitted projects",
+    };
+    for (const [id, text] of Object.entries(labels)) {
+      expect(modelsAndProvidersHtml).toContain(`<label for="${id}">${text}</label>`);
+      expect(modelsAndProvidersHtml).toContain(`id="${id}"`);
+    }
+    expect(modelsAndProvidersHtml).toContain('placeholder="Project keys, comma-separated. Leave blank for all projects."');
+  });
+  it("sends * for a blank permitted-projects field and shows all projects for a * grant", () => {
+    const add = modelsAndProvidersScript.slice(modelsAndProvidersScript.indexOf("async function mpAddAccount"));
+    expect(add).toMatch(/if \(!keys\.length\) keys\.push\('\*'\)/);
+    expect(modelsAndProvidersScript).toMatch(/indexOf\('\*'\) !== -1 \? 'all projects'/);
+    expect(modelsAndProvidersScript).toContain("<span class=\"text-tertiary\">none</span>");
+  });
+  it("wraps the account and stage tables in an overflow-x container", () => {
+    expect(modelsAndProvidersHtml).toMatch(/<div style="overflow-x:auto">\s*<table class="tbl">\s*<thead>\s*<tr><th>Profile<\/th><th>Identity/);
+    expect(modelsAndProvidersHtml).toMatch(/<div style="overflow-x:auto">\s*<table class="tbl">\s*<thead>\s*<tr><th>Stage<\/th>/);
+  });
   it("uses window.api/window.esc only", () => {
     const stripped = modelsAndProvidersScript.replace(/window\.api\(/g, "").replace(/window\.esc\(/g, "");
     expect(stripped).not.toMatch(/\bapi\(/);

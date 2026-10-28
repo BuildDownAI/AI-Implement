@@ -14,8 +14,8 @@
 name: unit-tests
 
 on:
+  # Every PR, whatever its base.
   pull_request:
-    branches: [testing, main, "ai-implement/feature/**", "ai-implement/multi-issue/**"]
 
 jobs:
   unit-tests:

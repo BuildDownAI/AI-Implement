@@ -156,7 +156,7 @@ describe("ReviewFixAttempt durable workflow", () => {
     },
     loadApprovalEvidence: async (attempt) => ({ currentPrHeadSha: SHA,
       findingDispositions: attempt.findings.map((finding) => ({ findingKey: finding.findingKey,
-        disposition: "addressed" as const })), policyAllows: true }),
+        disposition: "addressed" as const })), policyAllows: true, dispositionsComplete: true }),
   });
 
   let environments: Map<string, RestateEnvironment>;

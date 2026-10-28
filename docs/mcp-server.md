@@ -115,6 +115,15 @@ Writes, declared:
 | `clear_dispatch_dedup` | admin | Same as `DELETE /api/dedup/<issueId>`: clear a dedup entry so the issue can be re-dispatched. |
 | `release_dispatch_reservation` | admin | Release one stuck dispatch reservation (`{ dispatchId, force? }`, reason `cancelled`). Without `force` it releases only when `confirmAdmissionTerminated` confirms the backend run ended (a terminal job row alone is refused, with the job status in the reason, because the planning callback closes the row while the run may still execute), and otherwise refuses; `force: true` releases with no check. An unknown or already-released id answers `nothing_to_release` and changes nothing. The write audit line carries `dispatch=`, `owner=` and `force=`. A Restate-owned row's workflow later answers `not_owner` on its own release and ends. Also `POST /api/tools/release_dispatch_reservation` (the Release button on `/admin#deployments`). |
 
+## Tools the control plane calls (a cross-repo contract)
+
+A tool that the BuildDown control plane calls with its `service` token (for example `get_tenant_health`, `get_fleet_report`, `list_job_accounting`) is a contract between two repos. The control plane is built and tested in BuildDownAI/Control-Plane, so a change here can break it with every test green on both sides. The rules and the history are in Control-Plane `docs/cross-repo-contracts.md`. In short, for such a tool:
+
+* **The request:** `POST /api/tools/<name>` with the arguments inside `{ "args": { ... } }`. `handleToolCall` (`src/admin.ts`) reads nothing outside `args`. Document every argument name.
+* **The semantics:** write down every rule a consumer depends on: how paging ends (for example a `null` cursor on a page that is not full), what `null` means, units, ordering, and what can change after a read.
+* **Recorded exchanges:** a test calls the real handler through the real route for each scenario and writes the request and response bodies to `docs/contracts/<tool>/<scenario>.json`. It fails when the output differs, and rewrites only with an explicit environment variable. The control plane copies these files and its fake answers only from them.
+* **Changes:** a change to the request, the response or a rule regenerates the files, and the PR names the Control-Plane issue that takes the new files. Ship this repo first, then the control plane.
+
 ## Run identities
 
 Placeholder. [AII-702](https://linear.app/eudoxus/issue/AII-702/accept-a-run-capability-at-mcp-as-a-read-only-run-identity) adds a third `IdentityKind`, `"run"`: a Restate-issued, read-only capability a dispatched run carries so it can call `/mcp` reads (e.g. `kg_*`, `get_project_binding`) without an OAuth session. This section describes that identity's shape, how it's minted and verified, and which tools it may call once that issue lands.

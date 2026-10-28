@@ -3,6 +3,27 @@
 Operator procedures for hosted model accounts. The command is `src/model-account-cli.ts`, run on the orchestrator
 machine as `node dist/model-account-cli.js <command> --profile <id>`.
 
+## Add an account profile
+
+On Models & providers an admin adds a profile with the form (`POST /api/model-accounts`). Add the profile first, then set its key or connect its plan account ([API credentials](#api-credentials), [ChatGPT plan accounts](#chatgpt-plan-accounts)). The form has six fields:
+
+| Field | Meaning |
+|---|---|
+| Profile ID | The profile's name. Use lowercase letters, digits, `.`, `_` or `-`. The create route also accepts uppercase, but the fallback API-key reference `model-account:<profileId>` is lowercase-only (`MODEL_ACCOUNT_REF_PATTERN`, `src/model-credentials.ts`), so a mixed-case id cannot take a key unless the profile has its own `credentialRef` |
+| Identity | A label for the account behind the profile |
+| Agent | `claude` or `codex` |
+| Provider | `anthropic`, `openai` or `bedrock` |
+| Authentication | `anthropic-api-key`, `openai-api-key`, `codex-subscription`, `claude-subscription` or `bedrock` |
+| Permitted projects | Which projects may use the profile (below) |
+
+- **Permitted projects.** Three cases, stored in `allowedProjectKeys`:
+  - **Blank in the form = every project.** The form sends `["*"]` (`mpAddAccount`, `src/admin-ui/pages/models-and-providers.ts`). `*` is `ALL_PROJECTS_KEY`, and `isProjectPermitted` (`src/agent-config.ts`) accepts a project when the list holds its key or `*`.
+  - **A comma-separated list of keys = only those projects.**
+  - **An emptied list = no project.** An empty list never widens to all projects: it matches neither the key nor `*`. It is how to revoke a profile, and only `PATCH` can set it on an existing profile. The form cannot send one, but a plain `POST` that omits `allowedProjectKeys` also stores `[]` (a revoked profile), so a blank field is form behaviour only. Scripts that call the API must send `["*"]` for every project.
+- **Readiness probe.** Credential readiness is project-scoped (`accountStatus`, `src/admin.ts`). A `*` profile is probed against a mapped project (no mappings, no probe), a listed profile against its first key. An empty list reads `unknown`, which is not a credential fault.
+- **Every stage needs a profile.** A project that opts into configured runs needs a usable, permitted profile for each of planning, implementation and review (`STAGE_NAMES` loop in `resolveStageAgentConfig`, `src/agent-config.ts`). A stage with an unknown profile, or one the project may not use, throws. A project that wants Codex only for review must still give planning and implementation a profile.
+- **Editing permitted projects.** Use `PATCH /api/model-accounts/:id` with the full `allowedProjectKeys` list; there is no UI for it yet. A disabled or archived profile cannot gain new grants (409 `profile_not_active`); grants can only be removed or kept.
+
 ## ChatGPT plan accounts
 
 A `codex-subscription` profile uses a ChatGPT plan record. The profile must exist and be active. Following OpenAI's

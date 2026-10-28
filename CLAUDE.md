@@ -62,6 +62,8 @@ Three operator rules apply to every plan, issue, ADR, review, and change. **Full
 2. Prefer the design that needs no new GitHub or GitHub Actions right: runner image or orchestrator first, then a `run_config` field, then a template change, then an App permission last.
 3. As Restate use grows, re-check an ADR's rule and its rejection reasons before you rely on them; amend the ADR when a reason no longer holds.
 
+A tool the BuildDown control plane calls is a cross-repo contract: arguments arrive only inside `args`, its paging and `null` rules are documented, and its request and response are recorded from the real handler in `docs/contracts/<tool>/` for the control plane's tests. See `docs/mcp-server.md` § "Tools the control plane calls".
+
 ## Architecture
 
 ```

@@ -6356,6 +6356,35 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect((await call("/api/model-accounts/nope", "PATCH", t, { status: "disabled" })).status).toBe(404);
   });
 
+  it("probes a mapped project for a * profile and stays unknown with no mappings", async () => {
+    const t = await seed();
+    await request("/api/mappings", "POST", "secret", { teamKey: "AAA", owner: "org", repo: "aaa" }, t);
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "all-1", allowedProjectKeys: ["*", "Q"] }));
+    const deps: Deps = {
+      agentConfig: {
+        inspectReadiness: async () => ({ status: "ready", profiles: [] }),
+        credentials: {
+          sessionStore: {} as never,
+          resolveProtectedSecret: () => null,
+        },
+      },
+    };
+    const acct = async () => (await call("/api/model-accounts", "GET", t, undefined, deps)).json.accounts.find((a: Record<string, any>) => a.profileId === "all-1");
+    expect((await acct()).account.readiness).toBe("missing");
+    dedup.getDb().prepare("DELETE FROM mappings").run();
+    expect((await acct()).account.readiness).toBe("unknown");
+  });
+
+  it("refuses adding * to a disabled profile", async () => {
+    const t = await seed();
+    expect((await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" })).status).toBe(200);
+    const rev = modules.agentConfigStore.getAccountProfile("oai-1")?.revision;
+    const grant = await call("/api/model-accounts/oai-1", "PATCH", t, { allowedProjectKeys: ["*"] });
+    expect(grant.status).toBe(409);
+    expect(grant.json).toMatchObject({ code: "profile_not_active" });
+    expect(modules.agentConfigStore.getAccountProfile("oai-1")?.revision).toBe(rev);
+  });
+
   it("validates defaults atomically", async () => {
     const t = await seed();
     const revs = count("stage_agent_config_revisions");

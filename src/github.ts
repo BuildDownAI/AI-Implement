@@ -1632,11 +1632,13 @@ export async function compareCommits(
 }
 
 /**
- * A file's text from the repository's default branch (no `ref`), or `null` when it does not exist.
+ * A file's text from `ref` when given, else from the repository's GitHub default branch (no `ref` sent), or
+ * `null` when it does not exist.
  * Any other failure throws, so a caller inside a retried step never reads "no file" from an outage.
  */
-export async function getDefaultBranchFileText(token: string, owner: string, repo: string, path: string): Promise<string | null> {
-  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}`, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+export async function getDefaultBranchFileText(token: string, owner: string, repo: string, path: string, ref?: string): Promise<string | null> {
+  const query = ref ? `?ref=${encodeURIComponent(ref)}` : "";
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}${query}`, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`getDefaultBranchFileText ${path} failed: HTTP ${res.status}`);
   const body = (await res.json()) as { content?: string; encoding?: string; type?: string };

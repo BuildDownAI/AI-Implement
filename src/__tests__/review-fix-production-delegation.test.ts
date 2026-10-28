@@ -117,16 +117,21 @@ describe("review-fix production delegation", () => {
       const result = makeReviewFixResult({ attemptId: "att-1", ...scope, outputCommit: head });
       const input = { attemptId: "att-1", scope, result, findingDispositions: [], policyAllows: true } as never;
       type SubmitLateExternalReview = NonNullable<Parameters<typeof createProductionFinalizer>[0]["submitLateExternalReview"]>;
-      const build = (applied: { status: string }, submit: SubmitLateExternalReview) => createProductionFinalizer({
-        store: {
-          getAcceptedResult: async () => ({ result, hasConflict: false }),
-          getRecordedOutcome: async () => ({ terminal: { status: "succeeded" } }),
-          hasCurrentAuthority: async () => true,
-        } as never,
-        github: { getPrHeadSha: async () => head, evaluateMergePolicy: async () => true } as never,
-        baseFinalizer: { recordOutcome: vi.fn(), applyApproval: vi.fn().mockResolvedValue(applied) } as never,
-        submitLateExternalReview: submit,
-      });
+      type Overrides = { policy?: boolean; conflict?: boolean; status?: string; authority?: boolean; head?: string };
+      const baseApply = vi.fn();
+      const build = (applied: { status: string }, submit: SubmitLateExternalReview, o: Overrides = {}) => {
+        baseApply.mockReset().mockResolvedValue(applied);
+        return createProductionFinalizer({
+          store: {
+            getAcceptedResult: async () => ({ result, hasConflict: o.conflict ?? false }),
+            getRecordedOutcome: async () => ({ terminal: { status: o.status ?? "succeeded" } }),
+            hasCurrentAuthority: async () => o.authority ?? true,
+          } as never,
+          github: { getPrHeadSha: async () => o.head ?? head, evaluateMergePolicy: async () => o.policy ?? true } as never,
+          baseFinalizer: { recordOutcome: vi.fn(), applyApproval: baseApply } as never,
+          submitLateExternalReview: submit,
+        });
+      };
 
       it("submits once after an applied approval", async () => {
         getLatestWorkRowForPr.mockReturnValue(workRow);
@@ -136,11 +141,53 @@ describe("review-fix production delegation", () => {
         expect(stampJobApproved).not.toHaveBeenCalled();
       });
 
-      it("submits nothing when the approval is withheld", async () => {
+      it("submits once even when the base finalizer withholds, since the attempt facts hold", async () => {
         getLatestWorkRowForPr.mockReturnValue(workRow);
         const submit = vi.fn();
-        await build({ status: "withheld" }, submit).applyApproval(input);
+        await build({ status: "withheld" }, submit).applyApproval({ ...(input as object), dispositionsComplete: true } as never);
+        expect(submit).toHaveBeenCalledTimes(1);
+      });
+
+      it("submits the late review once when the merge policy is false (checks running), without the approval effect", async () => {
+        getLatestWorkRowForPr.mockReturnValue(workRow);
+        const log = vi.spyOn(console, "log").mockImplementation(() => {});
+        const submit = vi.fn().mockResolvedValue(true);
+        const policyFalse = { ...(input as object), policyAllows: false, dispositionsComplete: true } as never;
+        expect(await build({ status: "applied" }, submit, { policy: false }).applyApproval(policyFalse))
+          .toMatchObject({ status: "withheld" });
+        expect(submit).toHaveBeenCalledTimes(1);
+        expect(submit).toHaveBeenCalledWith({ dispatchId: "d-9", owner: "acme", repo: "app", prNumber: 7,
+          prUrl: "https://github.com/acme/app/pull/7", gapFill: true, attemptId: "att-1" });
+        expect(baseApply).not.toHaveBeenCalled();
+        expect(stampJobApproved).not.toHaveBeenCalled();
+        expect(log).toHaveBeenCalledWith(expect.stringContaining("late external review submitted"));
+        log.mockRestore();
+      });
+
+      it("submits when the policy is false at the instant read too", async () => {
+        getLatestWorkRowForPr.mockReturnValue(workRow);
+        const submit = vi.fn().mockResolvedValue(true);
+        const policyTrueInput = { ...(input as object), policyAllows: true, dispositionsComplete: true } as never;
+        await build({ status: "applied" }, submit, { policy: false }).applyApproval(policyTrueInput);
+        expect(submit).toHaveBeenCalledTimes(1);
+        expect(baseApply).not.toHaveBeenCalled();
+      });
+
+      it.each<[string, Overrides, Record<string, unknown>]>([
+        ["a recorded conflict", { conflict: true }, {}],
+        ["lost authority", { authority: false }, {}],
+        ["a head that is not the output commit", { head: "d".repeat(40) }, {}],
+        ["partial dispositions", {}, { policyAllows: true, dispositionsComplete: false }],
+        ["partial dispositions with a false policy", { policy: false }, { policyAllows: false, dispositionsComplete: false }],
+        ["an outcome that is not succeeded", { status: "failed" }, {}],
+      ])("submits nothing for %s", async (_label, overrides, inputOverrides) => {
+        getLatestWorkRowForPr.mockReturnValue(workRow);
+        const submit = vi.fn();
+        const applied = await build({ status: "applied" }, submit, overrides)
+          .applyApproval({ ...(input as object), dispositionsComplete: true, ...inputOverrides } as never);
+        expect(applied).toMatchObject({ status: "withheld" });
         expect(submit).not.toHaveBeenCalled();
+        expect(baseApply).not.toHaveBeenCalled();
       });
     });
   });
