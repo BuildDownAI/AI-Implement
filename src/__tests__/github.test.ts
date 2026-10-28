@@ -1125,6 +1125,14 @@ describe("getDefaultBranchFileText", () => {
     expect(fake.calls[0].url.href).toBe("https://api.github.com/repos/o/r/contents/.ai-implement/my%20file%231.yml");
   });
 
+  it("sends no ref by default and an encoded ref when given", async () => {
+    const fake = fakeFetch({ [X]: githubFile("a: 1\n") }).install();
+    await getDefaultBranchFileText("t", "o", "r", "x");
+    expect(fake.calls[0].url.search).toBe("");
+    await getDefaultBranchFileText("t", "o", "r", "x", "feature/x y");
+    expect(fake.calls[1].url.href).toBe("https://api.github.com/repos/o/r/contents/x?ref=feature%2Fx%20y");
+  });
+
   it("returns null on 404", async () => {
     fakeFetch({ [X]: githubError(404, "Not Found") }).install();
     expect(await getDefaultBranchFileText("t", "o", "r", "x")).toBeNull();
