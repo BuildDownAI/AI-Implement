@@ -122,6 +122,29 @@ Import and remove API-key and Bedrock credentials with `secret-import` and `secr
 
 An `openai-api-key` profile works for every Codex stage, including review and planning, which run `codex app-server`. The invocation env carries the key as `CODEX_API_KEY`. `codex exec` reads that variable directly. The app-server path has no `auth.json`, and its built-in `openai` provider does not read the variable, so the executor selects a provider named `openai_api_key` whose `env_key` is `CODEX_API_KEY` (`base_url` is `OPENAI_BASE_URL` when the invocation sets an allowed one, else `https://api.openai.com/v1`). The provider is chosen the same way in the view's `config.toml`, the argv and the thread request. `CODEX_API_KEY` stays in the shell-environment exclusion list, so the Codex process has the key and the commands the model runs do not. A run without `CODEX_API_KEY` in its env keeps the built-in provider.
 
+## Check which profile a run used
+
+Open the run's GitHub Actions log (the `implement` or `plan` job, step `Run pipeline` or `Run planning`) and search for `[model-auth]`. `src/run-autonomous.ts` prints one line per credential checkout, checkpoint and finish:
+
+```
+[model-auth] {"operation":"checkout","profileId":"anthropic-aii","status":"ok"}
+[model-auth] {"operation":"checkout","stage":"review","profileId":"openai-codex","status":"ok"}
+[model-auth] {"operation":"finish","stage":"review","profileId":"openai-codex","status":"ok"}
+```
+
+Each line is one JSON object:
+
+- `operation` is `checkout`, `checkpoint` or `finish`.
+- `profileId` is the account profile the credential came from. Compare it with the profile you configured for the stage (see [Add an account profile](#add-an-account-profile)). The log shows the id, not the provider or identity behind it.
+- `status` is `ok` or `failed`. A `failed` line also carries a `category`.
+- `stage` names the stage the credential was for, and appears only when exactly one stage binding in the run's grant uses that profile (the `review` lines above). A profile bound to several stages prints no `stage`, because the line cannot say which of them it served (the `anthropic-aii` line above). A line without `stage` therefore does not mean the main stage: to find which stage it served, check the stage bindings of the run's grant for that `profileId`.
+
+`status: "ok"` on `checkout` means the credential reached the runner. It does not prove the provider accepted the key: a provider error, for example `401 Unauthorized`, appears later in the same log.
+
+`[model-auth] finish failed: <category>` means returning one profile's credential failed. `[model-auth] dispose failed: <category>` is logged after every credential was returned, when closing the run's model-auth client fails. They print a category, never a value.
+
+These lines appear only for hosted credentials, so an empty search does not mean no profile was used.
+
 ## Claude subscription accounts
 
 To be filled by [AII-963](https://linear.app/eudoxus/issue/AII-963/provision-accounts-and-recover-held-subscription-sessions).
