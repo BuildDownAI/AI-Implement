@@ -44,10 +44,13 @@ export const JOB_ACCOUNTING_MAX_PAGE_SIZE = 200;
 /** The longest text (UTF-16 units, as zod measures it) a served record string may have; longer text is cut. Published in record.schema.json. */
 export const RECORD_TEXT_MAX = 2000;
 
+/** Longest dispatch id served: the cursor and the record schema share it. */
+const DISPATCH_ID_MAX = 200;
+
 /** Position in the walk: records are ordered by `(changedAt, dispatchId)`; a changed job comes back after the cursor. */
 export const JobAccountingCursorSchema = z.object({
   changedAt: z.number().int().nonnegative().safe(),
-  dispatchId: z.string().min(1).max(200),
+  dispatchId: z.string().min(1).max(DISPATCH_ID_MAX),
 }).strict();
 export type JobAccountingCursor = z.infer<typeof JobAccountingCursorSchema>;
 
@@ -82,7 +85,7 @@ export const JobAccountingInvocationSchema = z.object({
 });
 
 export const JobAccountingRecordSchema = z.object({
-  dispatchId: z.string().min(1).max(200),
+  dispatchId: z.string().min(1).max(DISPATCH_ID_MAX),
   phase: text,
   status: text,
   conclusion: nullableString,
@@ -274,7 +277,7 @@ export function listJobAccounting(
   const keys = db
     .prepare(
       `SELECT src, row_id, jid, done_at, changed FROM (${FINISHED_SOURCES})
-       WHERE 1 = 1 ${settled} ${after} ORDER BY changed ASC, jid ASC LIMIT ?`,
+       WHERE length(CAST(jid AS BLOB)) BETWEEN 1 AND ${DISPATCH_ID_MAX} ${settled} ${after} ORDER BY changed ASC, jid ASC LIMIT ?`,
     )
     .all(...params, pageSize) as KeyRow[];
 

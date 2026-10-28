@@ -610,6 +610,7 @@ describe("listJobAccounting served output meets the published schema", () => {
   it("parses every record of the boundary seed, with no NUL and no over-long text", () => {
     const cases = seedBoundary(dedup, log);
     const records = acc.listJobAccounting({ now: NOW, pageSize: 200 }).records;
+    // the seed also holds a 201-character id, which is left out rather than served against the schema
     expect(records.map((r) => r.dispatchId).sort()).toEqual(cases.map((c) => c.dispatchId).sort());
     for (const r of records) {
       expect(acc.JobAccountingRecordSchema.safeParse(r).success, r.dispatchId).toBe(true);

@@ -81,6 +81,9 @@ export function seedBoundary(dedup: typeof DedupModule, log: typeof LogModule): 
   ).run(BOUNDARY_T + 5500 - 100_000, BOUNDARY_T + 6000, BOUNDARY_T + 6000, BOUNDARY_T + 6000);
   cases.push({ case: "review-fix attempt (no dispatch_log row) with a PR number of 2^40", dispatchId: "job-review-fix" });
 
+  // 7. Jobs whose id is over the 200-character limit are not served at all (they could not be paged past); seeded so the test proves it.
+  logJob(db, log, "e".repeat(201), BOUNDARY_T + 7000, { title: "Over-long id", prUrl: "https://github.com/acme/widgets/pull/7" });
+
   // The triggers stamp the wall clock on every write above; pin changed_at last so the served records are the same on every run.
   db.prepare("UPDATE dispatch_log SET changed_at = completed_at").run();
   return cases;
