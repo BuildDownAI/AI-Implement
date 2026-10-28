@@ -3,7 +3,8 @@ import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { FailureRecord } from "./pipeline/failure-classification.js";
 import type { FindingDisposition } from "./pipeline/finding-dispositions.js";
-import { sanitizeAttribution, type InvocationAttributionV1 } from "./pipeline/types.js";
+import { sanitizeAttribution, sanitizeInvocationRecords, sanitizePushedCommits, type InvocationAttributionV1, type InvocationRecordV1 } from "./pipeline/types.js";
+import { collectedInvocations, collectedPushedCommits } from "./pipeline/job-accounting.js";
 import type { CycleSummary } from "./pipeline/cycle-summary.js";
 import type { ReferenceRepoResult } from "./reference-repos.js";
 import type { ReviewFixResultMetadataV1 } from "./review-fix-contract.js";
@@ -169,6 +170,10 @@ export async function postRunnerResult(params: {
   cycleSummaries?: CycleSummary[];
   /** Optional diagnostic attribution (AII-946). Sanitized before serialization; dropped if malformed. */
   attribution?: InvocationAttributionV1;
+  /** Every model invocation of the job (AII-1562). Defaults to those the stage executor collected in this process. */
+  invocations?: readonly InvocationRecordV1[];
+  /** SHAs the job pushed, oldest first; `[]` = nothing pushed. Defaults to what the push step reported. */
+  pushedCommits?: readonly string[];
   /** Head SHA the internal review approved when the run ended `external_review_pending`. */
   externalReviewPending?: { headSha: string };
   /** SHA of the snapshot commit pushed by a kg-refresh runner. Only meaningful for phase=kg-refresh. */
@@ -254,6 +259,15 @@ export async function postRunnerResult(params: {
     if (attribution) body.attribution = attribution;
     else console.warn("[runner-callback] dropping invalid attribution before delivery");
   }
+  // Job accounting (AII-1562): every model invocation and the pushed SHAs, beside the legacy single
+  // `attribution`. Defaults to what this runner process collected, so every result path reports them.
+  const invocations = sanitizeInvocationRecords(params.invocations ?? collectedInvocations());
+  if (invocations.dropped > 0) console.warn(`[runner-callback] dropping ${invocations.dropped} invalid invocation record(s) before delivery`);
+  if (invocations.valid.length > 0) body.invocations = invocations.valid;
+  // The orchestrator cannot see a cut or a drop, so the runner says so: the job's usage is then `partial`.
+  if (invocations.dropped > 0) body.invocationsDropped = invocations.dropped;
+  const pushedCommits = sanitizePushedCommits(params.pushedCommits ?? collectedPushedCommits());
+  if (pushedCommits) body.pushedCommits = pushedCommits;
   if (params.externalReviewPending) body.externalReviewPending = params.externalReviewPending;
   if (params.snapshotCommit) body.snapshotCommit = params.snapshotCommit;
   if (params.snapshotPr) body.snapshotPr = params.snapshotPr;

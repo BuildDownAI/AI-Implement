@@ -351,10 +351,20 @@ export async function sweepExitedLocalContainers(inFlightMachineIds: string[]): 
   return removed;
 }
 
+/** Accounting stamp for a container's stop; loaded lazily so this module stays free of the database. */
+async function stampComputeStopped(containerId: string, gone: boolean): Promise<void> {
+  try {
+    (await import("./log.js")).stampComputeStopped(containerId, gone);
+  } catch (err) {
+    console.error(`[local-docker] Failed to record compute stop for ${containerId}:`, err);
+  }
+}
+
 export async function removeLocalContainer(containerId: string): Promise<void> {
   try {
     await archiveLocalContainerLogsBestEffort(containerId);
     await execFile("docker", ["rm", "-f", containerId]);
+    await stampComputeStopped(containerId, false);
   } catch (err) {
     throw new Error(`Failed to remove local Docker runner ${containerId}: ${errorMessage(err)}`);
   }
@@ -364,9 +374,13 @@ export async function removeLocalContainer(containerId: string): Promise<void> {
 export async function stopLocalContainer(containerId: string): Promise<void> {
   try {
     await execFile("docker", ["rm", "-f", containerId]);
+    await stampComputeStopped(containerId, false);
   } catch (err) {
     const message = errorMessage(err);
-    if (/no such container/i.test(message)) return;
+    if (/no such container/i.test(message)) {
+      await stampComputeStopped(containerId, true);
+      return;
+    }
     throw new Error(`Failed to stop local Docker runner ${containerId}: ${message}`);
   }
 }

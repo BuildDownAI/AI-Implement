@@ -24,6 +24,7 @@ import {
   type Machine,
 } from "../fly-machines.js";
 import { getDb } from "../dedup.js";
+import { JobAccountingArgsSchema, listJobAccounting } from "../job-accounting.js";
 import {
   listHeldReservations,
   read as readDispatchAdmission,
@@ -950,6 +951,27 @@ export const getReviewFixActivityTool = tool(
   },
 );
 
+export const LIST_JOB_ACCOUNTING_DESCRIPTION =
+  "Returns one page of finished-job accounting records, oldest change first: dispatch id, phase, status, conclusion, lifecycle owner, times, changedAt, issue, PR, pushed SHAs, every model invocation (tokens, cost, cost status, attempts) and compute (backend, size, start, stop). A job that changes after it was served (a second terminal write, a late review conclusion, a late invocation row) is served again with a newer changedAt: the newest copy of a job replaces older ones. usage is reported only when the runner's invocation list arrived whole, partial when some invocation rows exist without that, unknown when none exist. Args: optional cursor { changedAt, dispatchId }, optional pageSize 1..200 (default 100), optional includeUnsettled (boolean; also serves jobs that changed in the last 10 minutes — only for a caller about to lose the orchestrator; such records may still change and are replaced by changedAt). Returns records, nextCursor, oldestRetainedCompletedAt (information only) and prunedThrough ({ changedAt, dispatchId } of the newest finished job pruned, or null). Without includeUnsettled a record is returned 10 minutes after its last change. Read.";
+
+export const listJobAccountingTool = tool(
+  {
+    description: LIST_JOB_ACCOUNTING_DESCRIPTION,
+    input: JobAccountingArgsSchema,
+    role: "user",
+    operation: "read",
+  },
+  async (_ctx, input): Promise<ToolResponse> => {
+    const page = listJobAccounting({
+      cursor: input.args.cursor,
+      pageSize: input.args.pageSize,
+      includeUnsettled: input.args.includeUnsettled,
+    });
+    // Compact, to keep the page small. A full page can still pass the consumer's 2 MiB limit; it halves the page size.
+    return { content: [{ type: "text", text: JSON.stringify(page) }] };
+  },
+);
+
 const KG_TOOL_DESCRIPTIONS: Record<string, string> = {
   kg_hybrid_search: "Hybrid (lexical + vector) search over the knowledge graph. Falls back to lexical-only when embeddings are degraded (see get_tenant_health's kgDegraded).",
   kg_search: "Lexical search over the knowledge graph.",
@@ -1534,6 +1556,7 @@ export const orchestratorTools = restate.service({
     get_kg_status: getKgStatusTool,
     get_review_fix_attempt: getReviewFixAttemptTool,
     get_review_fix_activity: getReviewFixActivityTool,
+    list_job_accounting: listJobAccountingTool,
     kg_hybrid_search: kgHybridSearch,
     kg_search: kgSearch,
     kg_semantic_search: kgSemanticSearch,

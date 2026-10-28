@@ -46,7 +46,8 @@ import { finalizeImplementation } from "./implementation-finalize.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
 import type { AdminDeps } from "./admin.js";
-import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, getRecentFailedRunUrls } from "./log.js";
+import { trackerAccounting, type TrackerAccounting } from "./job-accounting.js";
+import { initLogTable, appendLog, recordGhaRunCompleted, type MachineSize, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, getRecentFailedRunUrls } from "./log.js";
 import { listParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getInstallationId, getAppSlug, getScopedInstallationToken } from "./github-app-auth.js";
@@ -455,6 +456,16 @@ async function getTargetRepoToken(
 
 /** True once the KG composition (and so the `PipelineSchedule` service) is bound at boot. */
 let kgScheduleBound = false;
+
+/** Tracker kind and issue URL for a review-fix job row; a lookup failure never blocks the row. */
+async function reviewFixAccounting(
+  registry: ProviderRegistry,
+  mapping: RepoMapping,
+  fix: { issueId: string; issueIdentifier?: string | null },
+): Promise<TrackerAccounting> {
+  const provider = await registry.forMapping(mapping).catch(() => null);
+  return trackerAccounting(mapping, provider, { id: fix.issueId, identifier: fix.issueIdentifier });
+}
 
 async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const cycle = beginCycle();
@@ -1011,6 +1022,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
         const provider = await registry.forMapping(mapping);
         await provider.postComment(issueId, body);
       },
+      trackerAccounting: async (mapping, issue) => trackerAccounting(mapping, await registry.forMapping(mapping), issue),
       onDispatchFailure: surfaceDispatchFailure,
       flySessionsToken: config.flySessionsToken,
       flySessionsApp: config.flySessionsApp,
@@ -1291,6 +1303,8 @@ export async function dispatchGitHubActions(
     sessionImage: runnerImage ?? null,
     contract,
     groupingParent: isGroupingParentDispatch(issue),
+    trackerKind: mapping.ticketingProvider ?? null,
+    issueUrl: provider.issueUrl(issue),
   });
 
   // Suppress pending notifications for earlier failed attempts — they're stale.
@@ -1562,6 +1576,8 @@ interface SessionBackendResult {
   executionMode: "fly-machines" | "local-docker";
   statusComment: { machineName: string; logsUrl?: string } | null;
   dispatchedLogLine?: string;
+  machineSize?: MachineSize;
+  computeStartedAt?: number;
 }
 
 /**
@@ -1783,6 +1799,10 @@ export async function dispatchSession(
       sessionImage: result.sessionImage,
       phase: opts.phase,
       groupingParent: opts.phase === "implementation" && isGroupingParentDispatch(issue),
+      trackerKind: mapping.ticketingProvider ?? null,
+      issueUrl: provider.issueUrl(issue),
+      machineSize: result.machineSize ?? null,
+      computeStartedAt: result.computeStartedAt ?? null,
     });
 
     if (!opts.shadow) {
@@ -2243,6 +2263,7 @@ export async function confirmAdmissionTerminated(
 
     try {
       const status = await getWorkflowRunStatus(token, owner, repo, runId);
+      if (status) recordGhaRunCompleted(runId, status);
       return status?.status === "completed";
     } catch (err) {
       console.error(`[admission] Failed to check GHA run status for dispatch=${candidate.dispatchId}:`, err);
@@ -2483,6 +2504,7 @@ async function monitorGitHubActionsJob(
     return;
   }
   if (!isMonitorRunIdStillCurrent(job)) return;
+  recordGhaRunCompleted(job.runId, runStatus);
 
   // Detect stuck: non-terminal past the configured workflow timeout plus reconciliation grace.
   const watchdog = githubActionsWatchdogDecision({
@@ -3630,7 +3652,9 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           sessionImage: config.localRunnerImage,
           machineNonce: container.machineNonce,
           machineId: container.containerId,
+          computeStartedAt: Date.now(),
           phase: "gap-analysis",
+          ...(await reviewFixAccounting(registry, mapping, fix)),
         });
         updateJobPrUrl(jobId, `https://github.com/${fix.repo}/pull/${fix.prNumber}`);
         if (dispatchId) {
@@ -3798,6 +3822,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
             runnerMode: "default",
             contract: reviewFixContract,
             phase: "gap-analysis",
+            ...(await reviewFixAccounting(registry, mapping, fix)),
           });
           updateJobPrUrl(jobId, `https://github.com/${fix.repo}/pull/${fix.prNumber}`);
           recordReviewFixDispatch({ queueId: fix.id, dispatchId, repo: fix.repo,
@@ -3819,6 +3844,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
                 workflowFile: mapping.workflowFile,
                 contract: reviewFixContract,
                 phase: "gap-analysis",
+                ...(await reviewFixAccounting(registry, mapping, fix)),
               },
             );
           } catch (err) {
@@ -3845,6 +3871,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         runnerMode: "default",
         contract: reviewFixContract,
         phase: "gap-analysis",
+        ...(await reviewFixAccounting(registry, mapping, fix)),
       });
       updateJobPrUrl(jobId, `https://github.com/${fix.repo}/pull/${fix.prNumber}`);
       if (dispatchId) {
@@ -5148,6 +5175,7 @@ async function main(): Promise<void> {
       getWorkflowRunStatus: async (runId) => {
         const run = await getWorkflowRunStatus(await kgWorkflowToken(), kgSlug.owner, kgSlug.repo, runId);
         if (!run) throw new Error(`workflow run ${runId} status unavailable`);
+        recordGhaRunCompleted(runId, run);
         return { status: run.status, conclusion: run.conclusion };
       },
       findRunByTitle: createKgFindRunByTitle({ owner: kgSlug.owner, repo: kgSlug.repo, getToken: kgWorkflowToken }),

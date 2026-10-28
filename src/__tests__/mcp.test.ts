@@ -27,6 +27,7 @@ import {
   getKgStatusTool,
   getReviewFixAttemptTool,
   getReviewFixActivityTool,
+  listJobAccountingTool,
   setReviewFixAttemptsFacade,
   kgHybridSearch,
   kgSearch,
@@ -95,6 +96,7 @@ const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
   get_kg_status: getKgStatusTool,
   get_review_fix_attempt: getReviewFixAttemptTool,
   get_review_fix_activity: getReviewFixActivityTool,
+  list_job_accounting: listJobAccountingTool,
   kg_hybrid_search: kgHybridSearch,
   kg_search: kgSearch,
   kg_semantic_search: kgSemanticSearch,
@@ -2747,6 +2749,41 @@ describe("handleMcpRequest", () => {
       expect(toolsClientMock.callTool).toHaveBeenCalledWith(name, { q: "x" }, expect.objectContaining({ kind: "human" }), undefined);
       expect(mockHttpRequest).not.toHaveBeenCalled();
       setKgMemoryProvider(null);
+    });
+  });
+
+  describe("list_job_accounting through /mcp (AII-1564)", () => {
+    it("is listed for a user and a call reaches the tools service as a read", async () => {
+      mockRole("user");
+      const list = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      const names = JSON.parse(list.body).result.tools.map((t: { name: string }) => t.name);
+      expect(names).toContain("list_job_accounting");
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "list_job_accounting", arguments: { pageSize: 5 } } }),
+      );
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.error).toBeUndefined();
+      expect(parsed.result.isError).not.toBe(true);
+      expect(toolsClientMock.callTool).toHaveBeenCalledWith(
+        "list_job_accounting",
+        { pageSize: 5 },
+        expect.objectContaining({ kind: "human", role: "user" }),
+        undefined,
+      );
     });
   });
 

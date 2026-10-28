@@ -1018,6 +1018,9 @@ export interface WorkflowRunStatus {
   status: "queued" | "in_progress" | "completed" | string;
   conclusion: "success" | "failure" | "cancelled" | "timed_out" | string | null;
   html_url: string;
+  /** ISO timestamps from the API; `updated_at` can drift past the true end time. */
+  run_started_at?: string | null;
+  updated_at?: string | null;
 }
 
 /**
@@ -1037,12 +1040,16 @@ export async function getWorkflowRunStatus(
     status: string;
     conclusion: string | null;
     html_url: string;
+    run_started_at?: string | null;
+    updated_at?: string | null;
   };
 
   return {
     status: data.status,
     conclusion: data.conclusion,
     html_url: data.html_url,
+    run_started_at: data.run_started_at ?? null,
+    updated_at: data.updated_at ?? null,
   };
 }
 

@@ -2058,3 +2058,29 @@ describe("set_fly_machine_profile / get_kg_status flyMachine (AII-1130)", () => 
     expect(status.runProfile.backend).toBe(status.executionMode.effective);
   });
 });
+
+describe("list_job_accounting (AII-1564)", () => {
+  let log: typeof LogModule;
+  let tools: typeof ToolsModule;
+
+  beforeEach(async () => {
+    ({ log, tools } = (await testDb({
+      modules: { log: () => import("../log.js"), tools: () => import("../restate/tools.js") },
+    })).modules);
+  });
+
+  it("lets the service caller and a user page the finished jobs", async () => {
+    const id = log.appendLog({ issueId: "i", dispatchId: "00000000-0000-4000-8000-0000000000d1" });
+    const done = Date.now() - 3600_000;
+    log.updateJobStatus(id, "completed", "success", null);
+    (await import("../dedup.js")).getDb().prepare("UPDATE dispatch_log SET completed_at = ?").run(done);
+    (await import("../dedup.js")).getDb().prepare("UPDATE dispatch_log SET changed_at = ?").run(done);
+    for (const caller of [serviceCaller(), { kind: "human", email: "u@example.com", role: "user" } as Caller]) {
+      const res = await tools.listJobAccountingTool(fakeContext("list_job_accounting"), { caller, args: {} });
+      expect(res.isError).toBeUndefined();
+      const page = JSON.parse(res.content[0].text);
+      expect(page.records.map((r: { dispatchId: string }) => r.dispatchId)).toEqual(["00000000-0000-4000-8000-0000000000d1"]);
+      expect(page.oldestRetainedCompletedAt).toBe(done);
+    }
+  });
+});

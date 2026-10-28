@@ -427,3 +427,20 @@ describe("late_review_pending outbox (AII-1362)", () => {
     expect(rows()).toEqual([]);
   });
 });
+
+describe("prune keeps recently finished rows (AII-1564)", () => {
+  it("keeps a finished row younger than 7 days beyond 500 rows and prunes an older one", () => {
+    const db = dedup.getDb();
+    const recent = log.appendLog({ issueId: "recent", dispatchId: "recent" });
+    const old = log.appendLog({ issueId: "old", dispatchId: "old" });
+    const now = Date.now();
+    db.prepare("UPDATE dispatch_log SET completed_at = ?, status = 'completed' WHERE id = ?").run(now - 24 * 3600_000, recent);
+    db.prepare("UPDATE dispatch_log SET completed_at = ?, status = 'completed' WHERE id = ?").run(now - 8 * 24 * 3600_000, old);
+    // The trigger stamps the wall clock on the writes above; pin the change times afterwards.
+    db.prepare("UPDATE dispatch_log SET changed_at = ? WHERE id = ?").run(now - 24 * 3600_000, recent);
+    db.prepare("UPDATE dispatch_log SET changed_at = ? WHERE id = ?").run(now - 8 * 24 * 3600_000, old);
+    for (let i = 0; i < 510; i++) log.appendLog({ issueId: `n${i}` });
+    expect(log.getJobById(recent)).not.toBeNull();
+    expect(log.getJobById(old)).toBeNull();
+  });
+});

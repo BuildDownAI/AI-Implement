@@ -18,11 +18,14 @@ import {
   appendLogIfAbsent,
   getClaimedRunIds,
   getJobByDispatchId,
+  recordGhaRunCompleted,
   suppressStaleNotifications,
   updateJobRunId,
   updateJobStatus,
   type Job,
+  type MachineSize,
 } from "../log.js";
+import { trackerAccounting } from "../job-accounting.js";
 import { generateMachineNonce, generateSessionToken, listMachines } from "../fly-machines.js";
 import { removeLocalContainer } from "../local-docker.js";
 import { markDispatched } from "../dedup.js";
@@ -250,7 +253,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
   async function recordLaunch(
     run: ImplementationRunInput,
     ctx: Prelaunch,
-    launched: { executionMode: "github-actions" | "fly-machines" | "local-docker"; machineId?: string; machineNonce?: string; runId?: number; sessionImage?: string | null; contract?: "legacy" | "envelope"; ghToken: string; statusComment?: { machineName: string; logsUrl?: string } | null; logLine?: string },
+    launched: { executionMode: "github-actions" | "fly-machines" | "local-docker"; machineId?: string; machineNonce?: string; runId?: number; sessionImage?: string | null; contract?: "legacy" | "envelope"; ghToken: string; statusComment?: { machineName: string; logsUrl?: string } | null; logLine?: string; machineSize?: MachineSize; computeStartedAt?: number },
   ): Promise<void> {
     const { issue, mapping, provider } = ctx;
     const rowId = appendLogIfAbsent({
@@ -266,6 +269,9 @@ export function createProductionImplementationRunServices(input: ImplementationR
       runnerMode: ctx.runnerMode,
       sessionImage: launched.sessionImage ?? null,
       groupingParent: input.isGroupingParentDispatch(issue),
+      ...trackerAccounting(mapping, provider, issue),
+      machineSize: launched.machineSize ?? null,
+      computeStartedAt: launched.computeStartedAt ?? null,
       ...(launched.machineNonce ? { machineNonce: launched.machineNonce } : {}),
       ...(launched.machineId ? { machineId: launched.machineId } : {}),
       ...(launched.contract ? { contract: launched.contract } : {}),
@@ -341,6 +347,8 @@ export function createProductionImplementationRunServices(input: ImplementationR
       ghToken: "",
       statusComment: launched.statusComment,
       logLine: launched.dispatchedLogLine,
+      machineSize: launched.machineSize,
+      computeStartedAt: launched.computeStartedAt,
     });
     // Only the outcome and the machine id: the step result is journaled, so no nonce or token.
     return { outcome: "accepted", jobId: launched.machineId };
@@ -399,6 +407,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
     else {
       const mapping = requireMapping(getMapping, run.teamKey);
       const read = await getWorkflowRunStatus(await getToken(mapping.owner), mapping.owner, mapping.repo, Number(jobId));
+      if (read) recordGhaRunCompleted(Number(jobId), read);
       status = read?.status === "completed" ? "ended" : read?.status === "in_progress" ? "started" : "unknown";
     }
     if (status === "started") {

@@ -28,12 +28,15 @@ vi.mock("../log.js", () => ({
   getStuckAttemptStampedAt: vi.fn(() => null),
   appendLog: vi.fn(),
   countPriorDispatches: vi.fn(),
+  stampComputeStopped: vi.fn(),
+  recordGhaRunCompleted: vi.fn(),
 }));
 vi.mock("../fly-machines.js", () => ({
   getMachine: vi.fn(), destroyMachine: vi.fn(), listMachines: vi.fn(),
   createMachine: vi.fn(async () => ({ id: "m-1", name: "mn" })),
   buildSessionMachineConfig: vi.fn((input: unknown) => ({ config: {}, input })),
   listAppSecrets: vi.fn(async () => []),
+  guestSize: vi.fn(),
 }));
 vi.mock("../local-docker.js", () => ({
   inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn(), findLocalContainerIdByName: vi.fn(), removeLocalContainer: vi.fn(),

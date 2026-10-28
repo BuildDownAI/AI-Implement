@@ -13,7 +13,7 @@ import { getRunnerMode } from "../runner-mode.js";
 import type { TicketIssue, TicketingProvider } from "../providers/types.js";
 import { defaultFetchSignal, cancelWorkflowRun, getWorkflowRunStatus } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
-import { findLogIdByDispatchId, getJobByDispatchId, markJobFailureCommented, updateJobRunId, updateJobStatus, type Job } from "../log.js";
+import { findLogIdByDispatchId, getJobByDispatchId, markJobFailureCommented, recordGhaRunCompleted, updateJobRunId, updateJobStatus, type Job } from "../log.js";
 import { planningSessionName, type launchPlanningRun, type launchPlanningSession, type preparePlanningLaunch } from "../planning-launch.js";
 import { listMachines } from "../fly-machines.js";
 import { findLocalContainerIdByName, removeLocalContainer } from "../local-docker.js";
@@ -204,6 +204,7 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
     if (run.backend === "local-docker") return classifyLocalContainer(jobId);
     const mapping = requireMapping(getMapping, run.teamKey);
     const status = await getWorkflowRunStatus(await getToken(mapping.owner), mapping.owner, mapping.repo, Number(jobId));
+    if (status) recordGhaRunCompleted(Number(jobId), status);
     if (status?.status === "completed") return "ended";
     if (status?.status === "in_progress") return "started";
     return "unknown";

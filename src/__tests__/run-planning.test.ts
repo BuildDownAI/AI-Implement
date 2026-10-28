@@ -3,6 +3,7 @@ import { writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { collectedInvocations, collectedPushedCommits, recordInvocation, recordPushedCommits } from "../pipeline/job-accounting.js";
 import { runPlanning, runPlanningLocally } from "../run-planning.js";
 import { encodeRunConfig, encodeTrustedRunConfig, type ResolvedAgentSnapshotV1 } from "../run-config.js";
 import { fakeFetch, type FakeFetch, type FetchCall } from "./helpers/fake-fetch.js";
@@ -122,6 +123,20 @@ describe("runPlanning", () => {
     });
     expect(result.exitCode).toBe(1);
     expect(JSON.parse(orchestrator.calls[0].body)).toMatchObject({ phase: "planning", outcome: "failure" });
+  });
+
+  it("starts with no invocations or pushed SHAs left by an earlier run in the process (AII-1566)", async () => {
+    recordInvocation({ attribution: { invocationId: "stale" } as never, cacheReadTokens: null, cacheCreationTokens: null, attempts: 1 });
+    recordPushedCommits(["a".repeat(40)]);
+    let seen: { invocations: number; shas: readonly string[] | null } | null = null;
+    await runPlanning({
+      workspaceDir: ws,
+      executor: () => {
+        seen = { invocations: collectedInvocations().length, shas: collectedPushedCommits() };
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    expect(seen).toEqual({ invocations: 0, shas: null });
   });
 
   it("uses built-in prompt when PLANNING.md is absent", async () => {
