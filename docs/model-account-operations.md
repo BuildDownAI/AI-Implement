@@ -137,7 +137,7 @@ Each line is one JSON object:
 - `operation` is `checkout`, `checkpoint` or `finish`.
 - `profileId` is the account profile the credential came from. Compare it with the profile you configured for the stage (see [Add an account profile](#add-an-account-profile)). The log shows the id, not the provider or identity behind it.
 - `status` is `ok` or `failed`. A `failed` line also carries a `category`.
-- `stage` names the stage the credential was for, and appears only when exactly one stage binding in the run's grant uses that profile (the `review` lines above). A profile bound to several stages prints no `stage`, because the line cannot say which of them it served (the `anthropic-aii` line above).
+- `stage` names the stage the credential was for, and appears only when exactly one stage binding in the run's grant uses that profile (the `review` lines above). A profile bound to several stages prints no `stage`, because the line cannot say which of them it served (the `anthropic-aii` line above). A line without `stage` therefore does not mean the main stage: to find which stage it served, check the stage bindings of the run's grant for that `profileId`.
 
 `status: "ok"` on `checkout` means the credential reached the runner. It does not prove the provider accepted the key: a provider error, for example `401 Unauthorized`, appears later in the same log.
 
