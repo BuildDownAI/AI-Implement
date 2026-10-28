@@ -58,8 +58,10 @@ export const JobAccountingArgsSchema = z.object({
   includeUnsettled: z.boolean().optional(),
 }).strict();
 
-const nullableInt = z.number().int().nullable();
-const text = z.string().max(RECORD_TEXT_MAX);
+const count = z.number().int().nonnegative();
+const nullableInt = count.nullable();
+/** Text a served record may hold: at most RECORD_TEXT_MAX units and no NUL (Postgres `text` cannot store it). */
+const text = z.string().max(RECORD_TEXT_MAX).regex(/^[^\u0000]*$/);
 const nullableString = text.nullable();
 
 export const JobAccountingInvocationSchema = z.object({
@@ -76,19 +78,19 @@ export const JobAccountingInvocationSchema = z.object({
   /** `reported` only when the executor reported a cost; otherwise `unavailable` with `costUsd` null. */
   costStatus: z.enum(["reported", "unavailable"]),
   /** Spawn attempts for this one invocation; minimum 1. */
-  attempts: z.number().int().min(1),
+  attempts: count.min(1),
 });
 
 export const JobAccountingRecordSchema = z.object({
-  dispatchId: z.string(),
+  dispatchId: z.string().min(1).max(200),
   phase: text,
   status: text,
   conclusion: nullableString,
   lifecycleOwner: z.enum(["legacy", "restate"]),
-  dispatchedAt: z.number().int(),
-  completedAt: z.number().int(),
+  dispatchedAt: count,
+  completedAt: count,
   /** When this record last changed (epoch ms). A job that changes is served again; the newest copy replaces older ones. */
-  changedAt: z.number().int(),
+  changedAt: count,
   issue: z.object({
     identifier: nullableString,
     title: nullableString,
@@ -187,11 +189,13 @@ function placeholders(n: number): string {
   return Array.from({ length: n }, () => "?").join(",");
 }
 
-/** Cuts text to RECORD_TEXT_MAX without leaving half a surrogate pair at the end. */
+/** Removes every NUL, then cuts text to RECORD_TEXT_MAX without leaving half a surrogate pair at the end. */
 function cut(v: string): string;
 function cut(v: string | null): string | null;
 function cut(v: string | null): string | null {
-  if (v === null || v.length <= RECORD_TEXT_MAX) return v;
+  if (v === null) return v;
+  v = v.replaceAll("\u0000", "");
+  if (v.length <= RECORD_TEXT_MAX) return v;
   const end = RECORD_TEXT_MAX - ((v.charCodeAt(RECORD_TEXT_MAX - 1) & 0xfc00) === 0xd800 ? 1 : 0);
   return v.slice(0, end);
 }
@@ -228,7 +232,7 @@ function toInvocation(row: InvocationRow): z.infer<typeof JobAccountingInvocatio
 
 function prNumber(url: string | null): number | null {
   const m = url ? /\/pull\/(\d+)(?:[/?#].*)?$/.exec(url) : null;
-  return m ? Number(m[1]) : null;
+  return m ? intOrNull(Number(m[1])) : null;
 }
 
 function parseShas(raw: string): string[] | null {
@@ -333,13 +337,16 @@ export function listJobAccounting(
 
   const records: JobAccountingRecord[] = [];
   for (const key of keys) {
-    const rows = (invocations.get(key.jid) ?? []).map(toInvocation);
+    const stored = invocations.get(key.jid) ?? [];
+    // A published limit is enforced where the record is served: the first INVOCATION_RECORDS_MAX rows, `partial` if any were left out.
+    const rows = stored.slice(0, INVOCATION_RECORDS_MAX).map(toInvocation);
+    const truncated = stored.length > rows.length;
     const report = reports.get(key.jid);
     const common = {
       dispatchId: key.jid,
       completedAt: key.done_at,
       changedAt: key.changed,
-      usage: rows.length === 0 ? ("unknown" as const) : report?.complete ? ("reported" as const) : ("partial" as const),
+      usage: rows.length === 0 ? ("unknown" as const) : report?.complete && !truncated ? ("reported" as const) : ("partial" as const),
       invocations: rows,
       pushedShas: report?.shas ?? null,
     };
@@ -365,10 +372,10 @@ export function listJobAccounting(
         compute: {
           backend: cut(r.execution_mode),
           cpuKind: cut(r.machine_cpu_kind),
-          cpus: r.machine_cpus,
-          memoryMb: r.machine_memory_mb,
-          startedAt: r.compute_started_at,
-          stoppedAt: r.compute_stopped_at,
+          cpus: intOrNull(r.machine_cpus),
+          memoryMb: intOrNull(r.machine_memory_mb),
+          startedAt: intOrNull(r.compute_started_at),
+          stoppedAt: intOrNull(r.compute_stopped_at),
         },
       });
     } else {
@@ -382,7 +389,7 @@ export function listJobAccounting(
         lifecycleOwner: "restate",
         dispatchedAt: r.created_at,
         issue: { identifier: null, title: null, repo: cut(r.repository), trackerKind: null, url: null },
-        pr: { url: cut(`https://github.com/${r.repository}/pull/${r.pr_number}`), number: r.pr_number },
+        pr: { url: cut(`https://github.com/${r.repository}/pull/${r.pr_number}`), number: intOrNull(r.pr_number) },
         // Run start/end are not stored for an attempt: created_at and completed_at stand in (queue time included).
         compute: {
           backend: "github-actions",

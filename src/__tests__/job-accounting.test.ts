@@ -3,6 +3,7 @@ import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
 import type * as AccountingModule from "../job-accounting.js";
 import { testDb } from "./helpers/test-db.js";
+import { seedBoundary } from "./helpers/job-accounting-boundary.js";
 
 let dedup: typeof DedupModule;
 let log: typeof LogModule;
@@ -567,5 +568,69 @@ describe("record text cap and dropped records", () => {
     expect(all.issue.title).toHaveLength(acc.RECORD_TEXT_MAX);
     expect(all.pushedShas![0]).toHaveLength(acc.RECORD_TEXT_MAX);
     expect(all.invocations[0].model).toHaveLength(acc.RECORD_TEXT_MAX);
+  });
+});
+
+describe("listJobAccounting served output meets the published schema", () => {
+  function insertInvocations(dispatchId: string, n: number): void {
+    for (let i = 0; i < n; i++) {
+      dedup.getDb().prepare(
+        `INSERT INTO model_invocation_attribution (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model,
+           auth_mode, status, started_at, completed_at, usage_json)
+         VALUES (?, ?, 'review', 'p', 1, 'claude', 'anthropic', 'm', 'api_key', 'succeeded', 1, 2, '{"tokensIn":5}')`,
+      ).run(`${dispatchId}-${i}`, dispatchId);
+    }
+  }
+
+  function strings(v: unknown, out: string[] = []): string[] {
+    if (typeof v === "string") out.push(v);
+    else if (Array.isArray(v)) v.forEach((x) => strings(x, out));
+    else if (v && typeof v === "object") Object.values(v).forEach((x) => strings(x, out));
+    return out;
+  }
+
+  it("serves 200 of 201 stored calls as partial, even when the report is complete", () => {
+    finishedJob("many", OLD);
+    insertInvocations("many", 201);
+    log.recordInvocationsComplete("many", OLD);
+    const [rec] = acc.listJobAccounting({ now: NOW }).records;
+    expect(rec.invocations).toHaveLength(200);
+    expect(rec.usage).toBe("partial");
+  });
+
+  it("keeps a complete report with exactly 200 calls reported and no calls unknown", () => {
+    finishedJob("exact", OLD);
+    insertInvocations("exact", 200);
+    log.recordInvocationsComplete("exact", OLD);
+    finishedJob("none", OLD + 1);
+    const recs = acc.listJobAccounting({ now: NOW }).records;
+    expect(recs.map((r) => [r.dispatchId, r.invocations.length, r.usage])).toEqual([["exact", 200, "reported"], ["none", 0, "unknown"]]);
+  });
+
+  it("parses every record of the boundary seed, with no NUL and no over-long text", () => {
+    const cases = seedBoundary(dedup, log);
+    const records = acc.listJobAccounting({ now: NOW, pageSize: 200 }).records;
+    expect(records.map((r) => r.dispatchId).sort()).toEqual(cases.map((c) => c.dispatchId).sort());
+    for (const r of records) {
+      expect(acc.JobAccountingRecordSchema.safeParse(r).success, r.dispatchId).toBe(true);
+      for (const s of strings(r)) {
+        expect(s.includes("\u0000")).toBe(false);
+        expect(s.length <= acc.RECORD_TEXT_MAX).toBe(true);
+      }
+    }
+    const long = records.find((r) => r.dispatchId === "job-long-text")!;
+    expect(long.issue.title).toHaveLength(acc.RECORD_TEXT_MAX - 1); // the cut would split the astral pair, so it ends one unit early
+    expect(records.find((r) => r.dispatchId === "job-many-calls")!.usage).toBe("partial");
+    expect(records.find((r) => r.pr.number === 2 ** 40)).toBeDefined();
+  });
+
+  it("rejects a negative count, a NUL and a 201-character id", () => {
+    seedBoundary(dedup, log);
+    const rec = acc.listJobAccounting({ now: NOW }).records[0];
+    expect(acc.JobAccountingRecordSchema.safeParse({ ...rec, dispatchId: "x".repeat(201) }).success).toBe(false);
+    expect(acc.JobAccountingRecordSchema.safeParse({ ...rec, dispatchId: "" }).success).toBe(false);
+    expect(acc.JobAccountingRecordSchema.safeParse({ ...rec, issue: { ...rec.issue, title: "a\u0000b" } }).success).toBe(false);
+    expect(acc.JobAccountingRecordSchema.safeParse({ ...rec, pr: { ...rec.pr, number: -1 } }).success).toBe(false);
+    expect(acc.JobAccountingRecordSchema.safeParse({ ...rec, compute: { ...rec.compute, cpus: -1 } }).success).toBe(false);
   });
 });

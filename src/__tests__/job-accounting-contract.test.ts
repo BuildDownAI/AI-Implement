@@ -11,12 +11,14 @@ import type * as restate from "@restatedev/restate-sdk";
 import type * as AdminModule from "../admin.js";
 import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
+import type * as AccountingModule from "../job-accounting.js";
 import type * as ToolsModule from "../restate/tools.js";
 import { callTool } from "../restate/tools-client.js";
 import { JOB_ACCOUNTING_MAX_PAGE_SIZE, JobAccountingArgsSchema, JobAccountingCursorSchema, JobAccountingRecordSchema, RECORD_TEXT_MAX } from "../job-accounting.js";
 import { z } from "zod";
 import { fakeFetch } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
+import { seedBoundary } from "./helpers/job-accounting-boundary.js";
 
 const ISSUER = "https://cp.builddown.test";
 const BASE_URL = "https://orch-a.example.com";
@@ -29,6 +31,7 @@ let admin: typeof AdminModule;
 let dedup: typeof DedupModule;
 let log: typeof LogModule;
 let tools: typeof ToolsModule;
+let acc: typeof AccountingModule;
 let signingKey: CryptoKey;
 
 class MockRequest extends EventEmitter {
@@ -69,12 +72,13 @@ function fakeContext(handlerName: string): restate.Context {
 }
 
 beforeEach(async () => {
-  ({ admin, dedup, log, tools } = (await testDb({
+  ({ admin, dedup, log, tools, acc } = (await testDb({
     modules: {
       admin: () => import("../admin.js"),
       dedup: () => import("../dedup.js"),
       log: () => import("../log.js"),
       tools: () => import("../restate/tools.js"),
+      acc: () => import("../job-accounting.js"),
     },
   })).modules);
   const cp = await import("../control-plane-token.js");
@@ -403,7 +407,8 @@ describe("list_job_accounting record.schema.json", () => {
         return Object.entries(schema.properties ?? {}).every(([k, sub]) => !(k in v) || validate(sub, v[k]));
       }
       case "string":
-        return typeof value === "string" && value.length >= (schema.minLength ?? 0) && value.length <= (schema.maxLength ?? Infinity);
+        return typeof value === "string" && value.length >= (schema.minLength ?? 0) && value.length <= (schema.maxLength ?? Infinity)
+          && (schema.pattern === undefined || new RegExp(schema.pattern).test(value));
       case "integer":
       case "number":
         return typeof value === "number" && Number.isFinite(value) && (schema.type !== "integer" || Number.isInteger(value))
@@ -448,5 +453,46 @@ describe("list_job_accounting record.schema.json", () => {
     expect(validate(schema, { ...record, issue: { ...record.issue, title: long } })).toBe(false);
     expect(validate(schema, { ...record, pushedShas: [long] })).toBe(false);
     expect(validate(schema, { ...record, invocations: Array.from({ length: 201 }, () => record.invocations[0]) })).toBe(false);
+  });
+
+  // boundary-records.json
+  const file = new URL("boundary-records.json", DIR);
+  const NOW = 2_000_000_000_000;
+
+  function served(): Array<{ case: string; record: unknown }> {
+    const cases = seedBoundary(dedup, log);
+    const records = acc.listJobAccounting({ now: NOW, pageSize: JOB_ACCOUNTING_MAX_PAGE_SIZE }).records;
+    return records.map((record) => ({ case: cases.find((c) => c.dispatchId === record.dispatchId)!.case, record }));
+  }
+
+  it("boundary-records.json matches the records the code serves from the boundary seed", () => {
+    const text = `${JSON.stringify(served(), null, 2)}\n`;
+    if (process.env.UPDATE_CONTRACT_FIXTURES === "1") {
+      mkdirSync(DIR, { recursive: true });
+      writeFileSync(file, text);
+      return;
+    }
+    if (!existsSync(file)) throw new Error(`docs/contracts/list_job_accounting/boundary-records.json is missing. ${hint}`);
+    if (readFileSync(file, "utf8") !== text) throw new Error(`boundary-records.json differs from what the boundary seed serves. ${hint}`);
+  });
+
+  it("boundary-records.json holds records that pass both the zod schema and record.schema.json", () => {
+    const schema = JSON.parse(readFileSync(new URL("record.schema.json", DIR), "utf8"));
+    const wrapped = JSON.parse(readFileSync(file, "utf8")) as Array<{ case: string; record: any }>;
+    expect(wrapped.length).toBeGreaterThanOrEqual(6);
+    for (const { case: note, record } of wrapped) {
+      expect(note.length).toBeGreaterThan(0);
+      expect(JobAccountingRecordSchema.safeParse(record).success, note).toBe(true);
+      expect(validate(schema, record), note).toBe(true);
+    }
+  });
+
+  it("rejects, by the JSON schema, a record where a text has a NUL or a count is negative", () => {
+    const schema = JSON.parse(readFileSync(new URL("record.schema.json", DIR), "utf8"));
+    const [{ record }] = JSON.parse(readFileSync(file, "utf8")) as Array<{ record: any }>;
+    expect(validate(schema, { ...record, issue: { ...record.issue, title: "a\u0000b" } })).toBe(false);
+    expect(validate(schema, { ...record, pr: { ...record.pr, number: -1 } })).toBe(false);
+    expect(validate(schema, { ...record, dispatchId: "x".repeat(201) })).toBe(false);
+    expect(validate(schema, { ...record, dispatchId: "" })).toBe(false);
   });
 });
