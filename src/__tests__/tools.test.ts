@@ -2070,7 +2070,7 @@ describe("list_job_accounting (AII-1564)", () => {
   });
 
   it("lets the service caller and a user page the finished jobs", async () => {
-    const id = log.appendLog({ issueId: "i", dispatchId: "d1" });
+    const id = log.appendLog({ issueId: "i", dispatchId: "00000000-0000-4000-8000-0000000000d1" });
     const done = Date.now() - 3600_000;
     log.updateJobStatus(id, "completed", "success", null);
     (await import("../dedup.js")).getDb().prepare("UPDATE dispatch_log SET completed_at = ?").run(done);
@@ -2079,7 +2079,7 @@ describe("list_job_accounting (AII-1564)", () => {
       const res = await tools.listJobAccountingTool(fakeContext("list_job_accounting"), { caller, args: {} });
       expect(res.isError).toBeUndefined();
       const page = JSON.parse(res.content[0].text);
-      expect(page.records.map((r: { dispatchId: string }) => r.dispatchId)).toEqual(["d1"]);
+      expect(page.records.map((r: { dispatchId: string }) => r.dispatchId)).toEqual(["00000000-0000-4000-8000-0000000000d1"]);
       expect(page.oldestRetainedCompletedAt).toBe(done);
     }
   });
