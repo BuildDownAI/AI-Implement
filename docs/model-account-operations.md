@@ -134,10 +134,10 @@ Open the run's GitHub Actions log (the `implement` or `plan` job, step `Run pipe
 
 Each line is one JSON object:
 
-- `operation` is `checkout` or `finish`. A `checkpoint` line can also appear.
+- `operation` is `checkout`, `checkpoint` or `finish`.
 - `profileId` is the account profile the credential came from. Compare it with the profile you configured for the stage (see [Add an account profile](#add-an-account-profile)). The log shows the id, not the provider or identity behind it.
 - `status` is `ok` or `failed`. A `failed` line also carries a `category`.
-- `stage` appears only when exactly one stage's grant uses that profile, so a profile that serves several stages prints none (the `anthropic-aii` line above).
+- `stage` names the stage the credential was for, and appears only when exactly one stage binding in the run's grant uses that profile (the `review` lines above). A profile bound to several stages prints no `stage`, because the line cannot say which of them it served (the `anthropic-aii` line above).
 
 `status: "ok"` on `checkout` means the credential reached the runner. It does not prove the provider accepted the key: a provider error, for example `401 Unauthorized`, appears later in the same log.
 
