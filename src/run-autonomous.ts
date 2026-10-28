@@ -1563,6 +1563,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         prUrl,
         referenceRepoResults,
         findingDispositions,
+        ...(runnerPhase === "gap-analysis" && outputCommit ? { externalReviewPending: { headSha: outputCommit } } : {}),
         callbackUrl,
         retryPolicy,
         fetchImpl: opts.fetchImpl,

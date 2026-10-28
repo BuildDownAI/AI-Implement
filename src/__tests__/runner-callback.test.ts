@@ -27,7 +27,7 @@ import type {
   ReviewFixResultMetadataV1,
   ResultIntakeOutcome,
 } from "../review-fix-contract.js";
-import { makeAppendLogEntry, makeIssue, makeReviewFixResult } from "./helpers/builders.js";
+import { makeAppendLogEntry, makeIssue, makeMapping, makeReviewFixResult } from "./helpers/builders.js";
 import { activityAccepted, cycleSummaryRecorded, noPlanningContext, progressAccepted, resultAccepted, reviewFixResultStored } from "./helpers/replies/orchestrator.js";
 import { testDb } from "./helpers/test-db.js";
 
@@ -2658,6 +2658,39 @@ describe("handleRunnerResult — gap-analysis", () => {
     expect(hook).toHaveBeenCalledWith({
       dispatchId, owner: "org", repo: "repo", prNumber: 12, prUrl: "https://github.com/org/repo/pull/12", gapFill: true, rowId: expect.any(Number),
     });
+  });
+
+  it.each([
+    ["restate", "restate", true],
+    ["legacy", "legacy", false],
+    ["a body with no externalReviewPending", "restate", false],
+  ] as const)("a gap-analysis success submits with the pushed headSha only for a restate mapping and a reported head: %s (AII-1484)", async (name, lifecycle, withHead) => {
+    const config = await import("../config.js");
+    config.upsertMapping("ENG", makeMapping({ owner: "org", repo: "repo", reviewFixLifecycle: lifecycle }));
+    const pushed = "0123456789abcdef0123456789abcdef01234567";
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: `i-head-${name}`, mappingTeamKey: "ENG", phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+    });
+    const jobId = log.appendLog(makeAppendLogEntry({ issueId: `i-head-${name}`, issueIdentifier: "ENG-7", repo: "org/repo", dispatchId, phase: "gap-analysis" }));
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+    const hook = vi.fn(async () => {});
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "gap-analysis", outcome: "success", comments: [], ...(name.startsWith("a body") ? {} : { externalReviewPending: { headSha: pushed } }) },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+      submitLateExternalReview: hook as never,
+    });
+
+    expect(res.status).toBe(200);
+    expect(hook).toHaveBeenCalledTimes(1);
+    expect(hook).toHaveBeenCalledWith({
+      dispatchId, owner: "org", repo: "repo", prNumber: 12, prUrl: "https://github.com/org/repo/pull/12", gapFill: true, rowId: jobId,
+      ...(withHead ? { headSha: pushed } : {}),
+    });
+    expect(Object.keys((hook.mock.calls as unknown[][])[0]![0] as object).includes("headSha")).toBe(withHead);
   });
 
   it("still returns 200 and writes no mark when the LateExternalReview submit throws or is absent (AII-1291)", async () => {

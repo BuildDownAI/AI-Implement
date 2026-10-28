@@ -75,6 +75,16 @@ describe("review-fix production delegation", () => {
       expect(recordPendingLateReview).toHaveBeenCalledWith({ workflowKey: "d-9-att-1", dispatchId: "d-9", prUrl: "https://github.com/acme/app/pull/7", attemptId: "att-1" });
     });
 
+    it("submits the attempt's pushed head as headSha when given one (AII-1484)", async () => {
+      getLatestWorkRowForPr.mockReturnValue(workRow);
+      const submit = vi.fn().mockResolvedValue(undefined);
+      const outputCommit = "e".repeat(40);
+      await submitLateReviewForAttempt(scope, "att-1", submit, outputCommit);
+      expect(submit).toHaveBeenCalledWith({ dispatchId: "d-9", owner: "acme", repo: "app", prNumber: 7,
+        prUrl: "https://github.com/acme/app/pull/7", gapFill: true, attemptId: "att-1", headSha: outputCommit });
+      expect(recordPendingLateReview).toHaveBeenCalledWith({ workflowKey: "d-9-att-1", dispatchId: "d-9", prUrl: "https://github.com/acme/app/pull/7", attemptId: "att-1" });
+    });
+
     it("clears the pending record only when the submit settled, and keeps it when the hook reports false", async () => {
       getLatestWorkRowForPr.mockReturnValue(workRow);
       clearPendingLateReview.mockClear();
@@ -157,7 +167,7 @@ describe("review-fix production delegation", () => {
           .toMatchObject({ status: "withheld" });
         expect(submit).toHaveBeenCalledTimes(1);
         expect(submit).toHaveBeenCalledWith({ dispatchId: "d-9", owner: "acme", repo: "app", prNumber: 7,
-          prUrl: "https://github.com/acme/app/pull/7", gapFill: true, attemptId: "att-1" });
+          prUrl: "https://github.com/acme/app/pull/7", gapFill: true, attemptId: "att-1", headSha: "c".repeat(40) });
         expect(baseApply).not.toHaveBeenCalled();
         expect(stampJobApproved).not.toHaveBeenCalled();
         expect(log).toHaveBeenCalledWith(expect.stringContaining("late external review submitted"));

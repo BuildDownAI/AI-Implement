@@ -1752,6 +1752,62 @@ describe("runAutonomous", () => {
     });
   });
 
+  it("a gap-analysis success that pushed reports the push commit as externalReviewPending.headSha (AII-1484)", async () => {
+    vi.stubEnv("PR_NUMBER", "42");
+    vi.stubEnv("RUNNER_PHASE", "gap-analysis");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+      ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha: "b".repeat(40) })) }],
+    ]);
+    await runAutonomous({
+      workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch, ghSpawn: noReviewThreads,
+    });
+    expect(resultBody(fake)).toMatchObject({ outcome: "success", externalReviewPending: { headSha: "b".repeat(40) } });
+  });
+
+  it("a gap-analysis success with no push commit, and an implementation success, send no externalReviewPending (AII-1484)", async () => {
+    for (const [phase, commitSha] of [["gap-analysis", null], ["implementation", "b".repeat(40)]] as const) {
+      vi.stubEnv("PR_NUMBER", "42");
+      vi.stubEnv("RUNNER_PHASE", phase);
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      const fake = fakeFetch({ [RESULT]: resultAccepted });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+        ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha })) }],
+      ]);
+      await runAutonomous({
+        workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch, ghSpawn: noReviewThreads,
+      });
+      expect(resultBody(fake)).not.toHaveProperty("externalReviewPending");
+    }
+  });
+
+  it("a gap-analysis failure that pushed sends no externalReviewPending (AII-1484)", async () => {
+    vi.stubEnv("PR_NUMBER", "42");
+    vi.stubEnv("RUNNER_PHASE", "gap-analysis");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })) }],
+      ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha: "b".repeat(40) })) }],
+    ]);
+    await runAutonomous({
+      workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch, ghSpawn: noReviewThreads,
+    });
+    expect(resultBody(fake)).toMatchObject({ outcome: "failure" });
+    expect(resultBody(fake)).not.toHaveProperty("externalReviewPending");
+  });
+
   it("uses RUNNER_PHASE instead of inferring callback phase from PR_NUMBER", async () => {
     vi.stubEnv("PR_NUMBER", "42");
     vi.stubEnv("RUNNER_PHASE", "implementation");

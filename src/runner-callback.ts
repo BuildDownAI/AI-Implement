@@ -22,7 +22,7 @@ import { describeReferenceRepoCause, type ReferenceRepoResult } from "./referenc
 import type { TicketingProvider } from "./providers/types.js";
 import { remediateFailedJob, type StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { verifyAndConsumeRunToken, verifyPreparedReviewFixToken, verifyRunToken } from "./runner-tokens.js";
-import { getMappings } from "./config.js";
+import { getMappings, resolveReviewFixLifecycle } from "./config.js";
 import { parkIssue } from "./dispatch-breaker.js";
 import { JiraApiError } from "./providers/jira-client.js";
 import { read as readAdmission } from "./dispatch-admission.js";
@@ -1328,6 +1328,10 @@ export async function handleRunnerResult(
       updateJobStatus(job.id, "completed", "external_review_pending", job.prUrl!);
       const target = parsePrUrlTarget(job.prUrl!);
       if (input.submitLateExternalReview && target) {
+        // A Restate-lifecycle gap-fill names the head it pushed, so the workflow judges that head, not a racy read.
+        const mapping = getMappings()[mappingTeamKey];
+        const pushedHeadSha = input.body.externalReviewPending?.headSha;
+        const namesHead = !!pushedHeadSha && !!mapping && resolveReviewFixLifecycle(mapping) === "restate";
         try {
           await input.submitLateExternalReview({
             dispatchId: claims.dispatchId,
@@ -1335,6 +1339,7 @@ export async function handleRunnerResult(
             prUrl: job.prUrl!,
             gapFill: true,
             rowId: job.id,
+            ...(namesHead ? { headSha: pushedHeadSha } : {}),
           });
         } catch (err) {
           warn("submitLateExternalReview", err);
