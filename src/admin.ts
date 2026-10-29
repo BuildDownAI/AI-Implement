@@ -43,7 +43,6 @@ import {
   type RunnerMode,
 } from "./runner-mode.js";
 import {
-  ALL_PROJECTS_KEY,
   STAGE_AGENT_CONFIG_VERSION,
   STAGE_NAMES,
   STAGE_SELECTION_FIELDS,
@@ -3910,7 +3909,7 @@ interface AccountStatusView {
   sessionRecovery?: { state: string; recoveryRequired: boolean } | null;
 }
 
-function accountStatus(profile: AccountProfileProjection, deps: AdminDeps, projectKey?: string): AccountStatusView {
+function accountStatus(profile: AccountProfileProjection, deps: AdminDeps): AccountStatusView {
   const view: AccountStatusView = { readiness: "unknown", failureCode: null };
   if (profile.authMode === "claude-subscription") {
     const snap = deps.agentConfig?.sessionSnapshot?.(profile.profileId);
@@ -3918,15 +3917,10 @@ function accountStatus(profile: AccountProfileProjection, deps: AdminDeps, proje
     return view;
   }
   if (!deps.agentConfig) return view;
-  // A "*" grant has no project of its own to probe: use the first mapped team key instead.
-  const probe = projectKey ?? (profile.allowedProjectKeys.includes(ALL_PROJECTS_KEY)
-    ? Object.keys(getMappings()).sort()[0]
-    : profile.allowedProjectKeys[0]);
-  if (!probe) return view; // credential status is project-scoped; an unpermitted profile has nothing to probe
   let status;
   try {
     status = getCredentialStatus(
-      { projectKey: probe, profileId: profile.profileId, revision: profile.revision, provider: profile.provider, authMode: profile.authMode },
+      { profileId: profile.profileId, revision: profile.revision, provider: profile.provider, authMode: profile.authMode },
       deps.agentConfig.credentials,
     );
   } catch {
@@ -3951,7 +3945,6 @@ function handleListModelAccounts(res: http.ServerResponse, deps: AdminDeps): voi
     agent: p.agent,
     provider: p.provider,
     authMode: p.authMode,
-    allowedProjectKeys: p.allowedProjectKeys,
     profileStatus: p.status,
     account: accountStatus(p, deps),
     ...credentialView(p),
@@ -4115,7 +4108,6 @@ async function handleModelAccountCredential(
         agent: head.agent as never,
         provider: head.provider as never,
         authMode: head.authMode as never,
-        allowedProjectKeys: head.allowedProjectKeys,
         status: head.status as never,
         metadata: { credentialRef: ref },
       });
@@ -4131,7 +4123,7 @@ async function handleModelAccountCredential(
   json(res, 200, { ref, result: "set" });
 }
 
-const ACCOUNT_WRITE_FIELDS = ["profileId", "identity", "agent", "provider", "authMode", "allowedProjectKeys", "credentialRef", "status"] as const;
+const ACCOUNT_WRITE_FIELDS = ["profileId", "identity", "agent", "provider", "authMode", "credentialRef", "status"] as const;
 
 function accountWriteView(p: AccountProfileProjection, deps: AdminDeps): Record<string, unknown> {
   const { status, ...rest } = p;
@@ -4155,7 +4147,6 @@ async function handleCreateModelAccount(req: http.IncomingMessage, res: http.Ser
     json(res, 409, { error: "account profile already exists; PATCH it to append a revision" });
     return;
   }
-  if (body.allowedProjectKeys === undefined) body.allowedProjectKeys = [];
   if (body.status !== undefined && body.status !== "active") {
     json(res, 400, { error: "a new account profile must be created active" });
     return;
@@ -4181,7 +4172,6 @@ async function handlePatchModelAccount(req: http.IncomingMessage, res: http.Serv
     agent: head.agent,
     provider: head.provider,
     authMode: head.authMode,
-    allowedProjectKeys: head.allowedProjectKeys,
     status: head.status,
   };
   const currentRef = lookupCredentialReference(profileId, head.revision);
@@ -4189,15 +4179,6 @@ async function handlePatchModelAccount(req: http.IncomingMessage, res: http.Serv
   for (const [k, v] of Object.entries(body)) {
     if (k === "credentialRef" && v === null) delete merged.credentialRef;
     else merged[k] = v;
-  }
-  // A disabled or archived profile never gains a project grant: grants are only ever removed or kept.
-  const nextStatus = merged.status;
-  if (nextStatus !== "active" && Array.isArray(merged.allowedProjectKeys)) {
-    const added = (merged.allowedProjectKeys as unknown[]).filter((k) => typeof k === "string" && !head.allowedProjectKeys.includes(k));
-    if (added.length > 0) {
-      json(res, 409, { error: "a disabled or archived account profile cannot receive new project grants", code: "profile_not_active" });
-      return;
-    }
   }
   saveAccountWrite(res, deps, profileId, head.revision + 1, merged, 200);
 }
@@ -4218,7 +4199,6 @@ function saveAccountWrite(
       agent: fields.agent as never,
       provider: fields.provider as never,
       authMode: fields.authMode as never,
-      allowedProjectKeys: fields.allowedProjectKeys as string[],
       status: fields.status as never,
       metadata: fields.credentialRef === undefined ? {} : { credentialRef: fields.credentialRef as string },
     });
@@ -4483,7 +4463,7 @@ function handleGetResolvedAgentConfig(res: http.ServerResponse, projectKey: stri
   try {
     projection = resolveProjectStageConfig(projectKey);
   } catch (err) {
-    // Resolver messages are fixed text (disabled, unpermitted or incompatible profile); none carries a credential.
+    // Resolver messages are fixed text (disabled or incompatible profile); none carries a credential.
     json(res, 200, {
       ...base,
       mode: "configured",
@@ -4505,7 +4485,7 @@ function handleGetResolvedAgentConfig(res: http.ServerResponse, projectKey: stri
       values: resolution.stages[stage],
       sources: resolution.sources[stage],
       profile: { id: profile.id, identity: profile.identity, revision: profile.revision, agent: profile.agent, provider: profile.provider, authMode: profile.authMode },
-      account: projectionProfile ? accountStatus({ ...projectionProfile, revision: profile.revision }, deps, projectKey) : { readiness: "unknown", failureCode: "profile_not_found" },
+      account: projectionProfile ? accountStatus({ ...projectionProfile, revision: profile.revision }, deps) : { readiness: "unknown", failureCode: "profile_not_found" },
     };
   }
   json(res, 200, { ...base, mode: "configured", resolved: true, stages, configRevisions: projection.configReferences });

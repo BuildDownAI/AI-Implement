@@ -55,14 +55,12 @@ function save(over: Partial<StoreModule.SaveAccountProfileRevisionInput> = {}) {
     agent: "claude",
     provider: "anthropic",
     authMode: "anthropic-api-key",
-    allowedProjectKeys: ["AII"],
     metadata: { credentialRef: "model-account:anth" },
     ...over,
   });
 }
 
 const req = (over: Partial<CredModule.CredentialRequest> = {}): CredModule.CredentialRequest => ({
-  projectKey: "AII",
   profileId: "anth",
   revision: 1,
   provider: "anthropic",
@@ -197,43 +195,14 @@ describe("resolveModelCredential", () => {
     expect(readCalls).toEqual([]);
   });
 
-  it("denies another project, without touching secrets", () => {
-    save();
-    const r = cred.resolveModelCredential(req({ projectKey: "OTHER" }), deps());
-    expect(r).toMatchObject({ ok: false, category: "unauthorized", code: "project_not_permitted" });
-    expect(resolverCalls).toEqual([]);
-  });
-
-  it.each([
-    [[], false],
-    [["OTHER"], true],
-    [["Q"], false],
-    [["*"], true],
-    [["*", "Q"], true],
-  ])("allowedProjectKeys %j for OTHER: permitted=%s in resolver and status", (keys, permitted) => {
-    save({ allowedProjectKeys: keys });
-    const r = cred.resolveModelCredential(req({ projectKey: "OTHER" }), deps());
-    if (permitted) expect(r).toMatchObject({ ok: true });
-    else expect(r).toMatchObject({ ok: false, category: "unauthorized", code: "project_not_permitted" });
-    expect(cred.getCredentialStatus(req({ projectKey: "OTHER" }), deps())).toMatchObject({ projectPermitted: permitted });
-  });
-
-  it("refuses a * grant on a disabled or archived profile", () => {
-    save({ allowedProjectKeys: ["*"] });
-    store.retireAccountProfile("anth", "disabled");
-    expect(cred.resolveModelCredential(req({ projectKey: "OTHER" }), deps())).toMatchObject({ ok: false, code: "profile_disabled" });
-    store.retireAccountProfile("anth", "archived");
-    expect(cred.resolveModelCredential(req({ projectKey: "OTHER" }), deps())).toMatchObject({ ok: false, code: "profile_disabled" });
-  });
-
-  it("denies a disabled permission, disabled profile and archived profile", () => {
-    save({ allowedProjectKeys: [] });
-    expect(cred.resolveModelCredential(req(), deps())).toMatchObject({ ok: false, code: "project_not_permitted" });
+  it("denies a disabled profile and an archived profile", () => {
     save({ revision: 2 });
     store.retireAccountProfile("anth", "disabled");
     expect(cred.resolveModelCredential(req({ revision: 2 }), deps())).toMatchObject({ ok: false, code: "profile_disabled" });
+    expect(cred.getCredentialStatus(req({ revision: 2 }), deps())).toMatchObject({ usable: false, failure: { code: "profile_disabled" } });
     store.retireAccountProfile("anth", "archived");
     expect(cred.resolveModelCredential(req({ revision: 2 }), deps())).toMatchObject({ ok: false, code: "profile_disabled" });
+    expect(cred.getCredentialStatus(req({ revision: 2 }), deps())).toMatchObject({ usable: false, failure: { code: "profile_disabled" } });
     expect(resolverCalls).toEqual([]);
   });
 
@@ -294,7 +263,6 @@ describe("getCredentialStatus", () => {
       req(),
       req({ profileId: "bed", provider: "bedrock", authMode: "bedrock" }),
       req({ profileId: "sub", provider: "anthropic", authMode: "claude-subscription", ownerGeneration: 1 }),
-      req({ projectKey: "OTHER" }),
       req({ profileId: "missing" }),
     ];
     for (const r of requests) {
@@ -309,12 +277,7 @@ describe("getCredentialStatus", () => {
 
   it("reports usable and denial states", () => {
     save();
-    expect(cred.getCredentialStatus(req(), deps())).toMatchObject({ usable: true, referenceConfigured: true, projectPermitted: true, failure: null });
-    expect(cred.getCredentialStatus(req({ projectKey: "OTHER" }), deps())).toMatchObject({
-      usable: false,
-      projectPermitted: false,
-      failure: { code: "project_not_permitted" },
-    });
+    expect(cred.getCredentialStatus(req(), deps())).toMatchObject({ usable: true, referenceConfigured: true, failure: null });
     expect(cred.getCredentialStatus(req({ authMode: "bedrock" }), deps())).toMatchObject({ usable: false, matchesRequest: false });
   });
 });

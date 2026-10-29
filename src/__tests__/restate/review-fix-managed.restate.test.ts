@@ -144,7 +144,7 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
     initSettingsTable();
     runtime = createModelAuthRuntime({ config: CONFIG, env: { RUNNER_TOKEN_SECRET: SECRET }, fetchImpl: githubFetch });
     profiles.saveAccountProfileRevision({ profileId: "cdx", identity: "cdx", revision: 1, agent: "codex", provider: "openai",
-      authMode: "codex-subscription", allowedProjectKeys: ["AII"] });
+      authMode: "codex-subscription", });
     expect(runtime.sessionStore.writePlanRecord({ profileId: "cdx", expectedSequence: null,
       sessionData: JSON.stringify(makeChatGptPlanRecord({ accessToken: ACCESS })) }).ok).toBe(true);
     const stage = { agent: "codex" as const, provider: "openai" as const, model: "gpt-6-luna", accountProfileId: "cdx", invocationTimeoutMs: 60_000 };

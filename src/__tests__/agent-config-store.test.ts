@@ -18,7 +18,6 @@ beforeEach(async () => {
 const TABLES = [
   "model_account_profiles",
   "model_account_profile_revisions",
-  "model_account_profile_project_permissions",
   "stage_agent_config_revisions",
 ];
 
@@ -34,7 +33,6 @@ const claudeProfile = (over: Partial<StoreModule.SaveAccountProfileRevisionInput
   agent: "claude",
   provider: "anthropic",
   authMode: "anthropic-api-key",
-  allowedProjectKeys: ["AII"],
   metadata: { credentialRef: "vault/claude-main" },
   ...over,
 });
@@ -46,7 +44,6 @@ const codexProfile = (over: Partial<StoreModule.SaveAccountProfileRevisionInput>
   agent: "codex",
   provider: "openai",
   authMode: "openai-api-key",
-  allowedProjectKeys: ["AII"],
   ...over,
 });
 
@@ -71,6 +68,26 @@ function seed(): void {
   store.saveAccountProfileRevision(codexProfile());
   store.setOrchestratorDefaults(defaults());
 }
+
+describe("stage inputs fingerprint", () => {
+  it("changes with a profile revision, a retired profile and the project head", () => {
+    seed();
+    store.setProjectOptIn("AII", true);
+    const base = store.readStageInputsFingerprint("AII");
+    expect(store.readStageInputsFingerprint("AII")).toBe(base);
+
+    store.saveAccountProfileRevision(codexProfile({ revision: 2 }));
+    const afterRevision = store.readStageInputsFingerprint("AII");
+    expect(afterRevision).not.toBe(base);
+
+    store.setProjectStageConfig("AII", { version: 1, mode: "configured", stages: { planning: stage("codex-main", "codex", "openai") } } as StageAgentConfigurationV1);
+    const afterProject = store.readStageInputsFingerprint("AII");
+    expect(afterProject).not.toBe(afterRevision);
+
+    store.retireAccountProfile("claude-main", "disabled");
+    expect(store.readStageInputsFingerprint("AII")).not.toBe(afterProject);
+  });
+});
 
 describe("profiles", () => {
   it.each([
@@ -107,8 +124,6 @@ describe("profiles", () => {
       claudeProfile({ identity: " " }),
       claudeProfile({ identity: "sk-test-abc" }),
       claudeProfile({ profileId: "" }),
-      claudeProfile({ allowedProjectKeys: undefined as unknown as string[] }),
-      claudeProfile({ allowedProjectKeys: [""] }),
       claudeProfile({ revision: 2, metadata: { credentialRef: "sk-test-abcdef" } }),
       claudeProfile({ revision: 2, metadata: { apiKey: "x" } as never }),
     ]) {
@@ -130,16 +145,6 @@ describe("profiles", () => {
     expect(store.getAccountProfileRevision("claude-main", 1)?.identity).toBe("Claude Main");
     expect(store.listAccountProfiles().map((p) => p.profileId)).toEqual(["claude-main", "codex-main"]);
     expect(() => store.retireAccountProfile("missing")).toThrow();
-  });
-
-  it("empty allowedProjectKeys authorizes no project and permission changes bump revisions", () => {
-    seed();
-    store.saveAccountProfileRevision(claudeProfile({ revision: 2, allowedProjectKeys: [] }));
-    expect(store.getAccountProfile("claude-main")?.allowedProjectKeys).toEqual([]);
-    const row = dedup.getDb().prepare("SELECT permission_revision, status FROM model_account_profile_project_permissions WHERE profile_id='claude-main'").get();
-    expect(row).toEqual({ permission_revision: 2, status: "disabled" });
-    store.saveAccountProfileRevision(claudeProfile({ revision: 3, allowedProjectKeys: ["AII"] }));
-    expect(store.getAccountProfile("claude-main")?.allowedProjectKeys).toEqual(["AII"]);
   });
 
   it("projections never expose metadata or credential references", () => {
@@ -219,26 +224,14 @@ describe("stage configuration", () => {
     expect(dump()).toBe(before);
   });
 
-  it("rejects a profile not permitted for the project", () => {
-    seed();
-    store.saveAccountProfileRevision(codexProfile({ profileId: "codex-other", allowedProjectKeys: ["OTHER"] }));
-    const before = dump();
-    expect(() =>
-      store.setProjectStageConfig("AII", { version: 1, mode: "configured", stages: { review: { agent: "codex", provider: "openai", accountProfileId: "codex-other" } } }),
-    ).toThrow(/not authorized/);
-    expect(dump()).toBe(before);
-  });
-
-  it("disabled, archived or unpermitted profiles fail new resolution while retire still works", () => {
+  it("disabled or archived profiles fail new resolution while retire still works", () => {
     seed();
     store.setProjectOptIn("AII", true);
     store.retireAccountProfile("codex-main");
     expect(() => store.resolveProjectStageConfig("AII")).toThrow(/disabled/);
     expect(store.getAccountProfileRevision("codex-main", 1)?.status).toBe("disabled");
 
-    store.saveAccountProfileRevision(codexProfile({ revision: 2, status: "active", allowedProjectKeys: [] }));
-    expect(() => store.resolveProjectStageConfig("AII")).toThrow(/not authorized/);
-    store.saveAccountProfileRevision(codexProfile({ revision: 3, allowedProjectKeys: ["AII"] }));
+    store.saveAccountProfileRevision(codexProfile({ revision: 2, status: "active" }));
     expect(store.resolveProjectStageConfig("AII").resolution.mode).toBe("configured");
     store.retireAccountProfile("codex-main", "archived");
     expect(() => store.resolveProjectStageConfig("AII")).toThrow();

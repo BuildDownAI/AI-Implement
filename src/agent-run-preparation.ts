@@ -406,10 +406,9 @@ async function checkSelection(
   return checkCapability(request, deps);
 }
 
-function credentialRequest(projectKey: string, snapshot: ResolvedAgentSnapshotV1, p: PreparedProfile, ownerGeneration?: number) {
+function credentialRequest(snapshot: ResolvedAgentSnapshotV1, p: PreparedProfile, ownerGeneration?: number) {
   const profile = snapshot.profiles[p.stage];
   return {
-    projectKey,
     profileId: p.profileId,
     revision: p.revision,
     provider: profile.provider,
@@ -454,7 +453,7 @@ export async function inspectAgentReadiness(
     }
     let usable = false;
     try {
-      usable = getCredentialStatus(credentialRequest(request.projectKey, snapshot, p), deps.credentials).usable;
+      usable = getCredentialStatus(credentialRequest(snapshot, p), deps.credentials).usable;
     } catch {
       usable = false;
     }
@@ -621,7 +620,7 @@ export async function prepareAgentRun(request: AgentRunRequest, deps: AgentRunPr
 
   // API-key and Bedrock readiness needs no ownership, so prove it before reserving anything.
   for (const p of profiles.filter((x) => !reservesModelAccount(x.authMode))) {
-    const result = resolveModelCredential(credentialRequest(request.projectKey, snapshot, p), deps.credentials);
+    const result = resolveModelCredential(credentialRequest(snapshot, p), deps.credentials);
     if (!result.ok) return credentialFailure(result, p);
   }
 
@@ -656,7 +655,7 @@ export async function prepareAgentRun(request: AgentRunRequest, deps: AgentRunPr
     if (generation === undefined || !sessionOwnerVerifier(getDb(), p.profileId, generation)) {
       failed = { status: "recovery-required", code: "owner_not_current", profileId: p.profileId };
     } else {
-      const result = resolveModelCredential(credentialRequest(request.projectKey, snapshot, p, generation), deps.credentials);
+      const result = resolveModelCredential(credentialRequest(snapshot, p, generation), deps.credentials);
       if (!result.ok) failed = credentialFailure(result, p);
     }
     if (failed) {

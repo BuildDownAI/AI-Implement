@@ -9,10 +9,10 @@ const w = window as unknown as W;
 const SENT = '<img src=x onerror="window.__pwn=1">';
 
 const ACCOUNTS = [
-  { profileId: "p-claude", identity: SENT, agent: "claude", provider: "anthropic", authMode: "claude-subscription", allowedProjectKeys: [SENT], profileStatus: "active", credentialRef: "SECRET-REF", token: "SECRET-TOKEN", sessionState: "SECRET-STATE", account: { readiness: "unknown", failureCode: null, sessionRecovery: { state: "recovery_required", recoveryRequired: true } } },
-  { profileId: "p-gpt", identity: "gpt", agent: "codex", provider: "openai", authMode: "codex-subscription", allowedProjectKeys: ["AII"], profileStatus: "active", account: { readiness: "refresh failed (transient)", failureCode: "x", sessionRecovery: { state: "busy", recoveryRequired: true } } },
-  { profileId: "p-gpt2", identity: "gpt2", agent: "codex", provider: "openai", authMode: "codex-subscription", allowedProjectKeys: [], profileStatus: "active", account: { readiness: "sign-in required", failureCode: null } },
-  { profileId: "p-gpt3", identity: "gpt3", agent: "codex", provider: "openai", authMode: "codex-subscription", allowedProjectKeys: ["AII"], profileStatus: "active", account: { readiness: "missing", failureCode: null } },
+  { profileId: "p-claude", identity: SENT, agent: "claude", provider: "anthropic", authMode: "claude-subscription", profileStatus: "active", credentialRef: "SECRET-REF", token: "SECRET-TOKEN", sessionState: "SECRET-STATE", account: { readiness: "unknown", failureCode: null, sessionRecovery: { state: "recovery_required", recoveryRequired: true } } },
+  { profileId: "p-gpt", identity: "gpt", agent: "codex", provider: "openai", authMode: "codex-subscription", profileStatus: "active", account: { readiness: "refresh failed (transient)", failureCode: "x", sessionRecovery: { state: "busy", recoveryRequired: true } } },
+  { profileId: "p-gpt2", identity: "gpt2", agent: "codex", provider: "openai", authMode: "codex-subscription", profileStatus: "active", account: { readiness: "sign-in required", failureCode: null } },
+  { profileId: "p-gpt3", identity: "gpt3", agent: "codex", provider: "openai", authMode: "codex-subscription", profileStatus: "active", account: { readiness: "missing", failureCode: null } },
 ];
 
 interface Stub { calls: { url: string; method: string; body?: any }[]; put?: { status: number; body: any } | "reject" }

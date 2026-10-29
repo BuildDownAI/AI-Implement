@@ -36,7 +36,7 @@ let bindings: ModelAuthGrantBinding[];
 let grantOverrides: Partial<ServerModule.PersistedModelAuthGrant>;
 let dispatchOverrides: Partial<ServerModule.PersistedDispatchContext>;
 let selections: Record<string, ServerModule.SnapshotProfileSelection | undefined>;
-let profileOverrides: Record<string, Partial<{ status: "active" | "disabled" | "archived"; allowedProjectKeys: string[]; revision: number }>>;
+let profileOverrides: Record<string, Partial<{ status: "active" | "disabled" | "archived"; revision: number }>>;
 let trusted: boolean;
 let nowValue: number;
 let grantMissing: boolean;
@@ -94,7 +94,6 @@ function depsFrom(): ServerModule.ModelAuthHandlerDeps {
     revision: b.profileRevision,
     ...AGENT_PROVIDER[b.authMode],
     authMode: b.authMode,
-    allowedProjectKeys: ["proj"],
     status: "active" as const,
     ...profileOverrides[id],
   });
@@ -264,7 +263,6 @@ describe("checkout", () => {
     ["revision differs from snapshot", () => { selections = { key1: { provider: "openai", revision: 7, authMode: "openai-api-key" } }; }],
     ["auth mode differs from snapshot", () => { selections = { key1: { provider: "openai", revision: 2, authMode: "anthropic-api-key" } }; }],
     ["no snapshot selection", () => { selections = { key1: undefined }; }],
-    ["profile not permitted for project", () => { profileOverrides = { key1: { allowedProjectKeys: ["else"] } }; }, true],
     ["profile disabled", () => { profileOverrides = { key1: { status: "disabled" } }; }, true],
   ])("rejects %s without reaching the resolver or store", async (_name, setup, profileChecked = false) => {
     setup();

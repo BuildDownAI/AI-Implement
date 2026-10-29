@@ -8,7 +8,7 @@
  * profile, billing mode, or plaintext environment variable.
  *
  * Validation order, all before any secret read: immutable selected revision exists,
- * current head status is active, the project is currently permitted, and the
+ * current head status is active, and the
  * requested provider/auth mode match the stored revision. Failures carry a
  * `ModelAuthFailureCategory` plus a fixed redacted code, never a reference, value,
  * or raw error.
@@ -21,7 +21,7 @@ import {
   type ModelAuthFailureCategory,
   type ModelAuthSecret,
 } from "./model-auth-contract.js";
-import { isProjectPermitted, type AccountAuthMode, type ModelProvider } from "./agent-config.js";
+import type { AccountAuthMode, ModelProvider } from "./agent-config.js";
 import type { ModelSessionStore } from "./model-session-store.js";
 import { parseChatGptPlanRecord, type ChatGptPlanRecordV1 } from "./chatgpt-plan-token.js";
 import {
@@ -38,7 +38,6 @@ export type CredentialFailureCode =
   | "invalid_request"
   | "profile_not_found"
   | "profile_disabled"
-  | "project_not_permitted"
   | "account_mismatch"
   | "reference_missing"
   | "reference_rejected"
@@ -70,7 +69,6 @@ export interface ModelCredentialDeps {
 }
 
 export interface CredentialRequest {
-  projectKey: string;
   profileId: string;
   /** The prepared (immutable) revision, not the current head. */
   revision: number;
@@ -97,7 +95,6 @@ export interface CredentialStatus {
   readonly provider?: ModelProvider;
   readonly authMode?: AccountAuthMode;
   readonly profileStatus?: AccountProfileProjection["status"];
-  readonly projectPermitted: boolean;
   readonly matchesRequest: boolean;
   /** API/Bedrock: a reference inside the model-account namespace is stored. Null for subscriptions. */
   readonly referenceConfigured: boolean | null;
@@ -128,7 +125,6 @@ function authorize(
 ): { ok: true; profile: AccountProfileProjection } | (CredentialFailure & { profile?: AccountProfileProjection }) {
   if (
     !req ||
-    !isId(req.projectKey) ||
     !isId(req.profileId) ||
     !isPositiveInt(req.revision) ||
     typeof req.provider !== "string" ||
@@ -144,9 +140,6 @@ function authorize(
   }
   if (!profile) return fail("unauthorized", "profile_not_found");
   if (profile.status !== "active") return { ...fail("unauthorized", "profile_disabled"), profile };
-  if (!isProjectPermitted(profile.allowedProjectKeys, req.projectKey)) {
-    return { ...fail("unauthorized", "project_not_permitted"), profile };
-  }
   if (profile.provider !== req.provider || profile.authMode !== req.authMode) {
     return { ...fail("unauthorized", "account_mismatch"), profile };
   }
@@ -301,7 +294,6 @@ export function getCredentialStatus(req: CredentialRequest, deps: ModelCredentia
   if (!profile) {
     return {
       ...base,
-      projectPermitted: false,
       matchesRequest: false,
       referenceConfigured: null,
       usable: false,
@@ -326,7 +318,6 @@ export function getCredentialStatus(req: CredentialRequest, deps: ModelCredentia
     provider: profile.provider,
     authMode: profile.authMode,
     profileStatus: profile.status,
-    projectPermitted: isProjectPermitted(profile.allowedProjectKeys, req.projectKey),
     matchesRequest: profile.provider === req.provider && profile.authMode === req.authMode,
     referenceConfigured,
     usable: failure === null,

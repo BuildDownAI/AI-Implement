@@ -311,6 +311,8 @@ async function login(accessCode: string): Promise<string> {
   return JSON.parse(res.body).token as string;
 }
 
+const RETIRED_GRANT_FIELD = ["allowed", "Project", "Keys"].join("");
+
 describe("admin auth", () => {
   it("returns a token on correct access code", async () => {
     const res = await request("/api/auth", "POST", "secret", { code: "secret" });
@@ -6258,7 +6260,6 @@ describe("model accounts and stage configuration (AII-962)", () => {
     agent: "codex",
     provider: "openai",
     authMode: "openai-api-key",
-    allowedProjectKeys: ["APP"],
     credentialRef: SENTINEL,
     ...over,
   });
@@ -6285,7 +6286,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
   it("refuses every write to a non-admin, even with every page granted, and changes nothing", async () => {
     await seed();
     accessGrants.savePageGrants(Object.keys(accessGrants.PAGE_ROUTES), "ada@eudoxus.ai");
-    const before = [count("model_account_profile_revisions"), count("stage_agent_config_revisions"), count("model_account_profile_project_permissions")];
+    const before = [count("model_account_profile_revisions"), count("stage_agent_config_revisions")];
     const u = userTok();
     for (const [url, method, body] of [
       ["/api/model-accounts", "POST", profileBody({ profileId: "x1" })],
@@ -6295,7 +6296,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
     ] as const) {
       expect((await call(url, method, u, body, readyDeps())).status).toBe(403);
     }
-    expect([count("model_account_profile_revisions"), count("stage_agent_config_revisions"), count("model_account_profile_project_permissions")]).toEqual(before);
+    expect([count("model_account_profile_revisions"), count("stage_agent_config_revisions")]).toEqual(before);
   });
 
   it("rejects credential values and unknown keys without echoing them, and appends nothing", async () => {
@@ -6313,7 +6314,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
   it("reads only safe profile metadata and maps codex-subscription readiness", async () => {
     const t = await seed();
-    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "plan-1", authMode: "codex-subscription", credentialRef: undefined, allowedProjectKeys: ["APP"] }));
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "plan-1", authMode: "codex-subscription", credentialRef: undefined }));
     await call("/api/model-accounts", "POST", t, profileBody({ profileId: "cl-sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", credentialRef: undefined }));
     const mk = (readPlanRecord: () => unknown): Deps => ({
       agentConfig: {
@@ -6339,7 +6340,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(raw).not.toContain("metadata");
   });
 
-  it("keeps old revisions on PATCH and refuses new grants for a disabled profile", async () => {
+  it("keeps old revisions on PATCH of a disabled profile", async () => {
     const t = await seed();
     const store = modules.agentConfigStore;
     const patched = await call("/api/model-accounts/oai-1", "PATCH", t, { identity: "Renamed" });
@@ -6347,8 +6348,6 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(store.getAccountProfileRevision("oai-1", 1)?.identity).toBe("OpenAI team key");
     expect(store.lookupCredentialReference("oai-1", 2)).toBe(SENTINEL); // reference carried forward
     expect((await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" })).status).toBe(200);
-    const grant = await call("/api/model-accounts/oai-1", "PATCH", t, { allowedProjectKeys: ["APP", "OTHER"] });
-    expect(grant.status).toBe(409);
     expect(store.getAccountProfile("oai-1")?.revision).toBe(3);
     // A disabled profile is refused by a new project config.
     const put = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, readyDeps());
@@ -6356,10 +6355,9 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect((await call("/api/model-accounts/nope", "PATCH", t, { status: "disabled" })).status).toBe(404);
   });
 
-  it("probes a mapped project for a * profile and stays unknown with no mappings", async () => {
+  it("reads a profile's own readiness with no mapped project", async () => {
     const t = await seed();
-    await request("/api/mappings", "POST", "secret", { teamKey: "AAA", owner: "org", repo: "aaa" }, t);
-    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "all-1", allowedProjectKeys: ["*", "Q"] }));
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "free-1" }));
     const deps: Deps = {
       agentConfig: {
         inspectReadiness: async () => ({ status: "ready", profiles: [] }),
@@ -6369,20 +6367,20 @@ describe("model accounts and stage configuration (AII-962)", () => {
         },
       },
     };
-    const acct = async () => (await call("/api/model-accounts", "GET", t, undefined, deps)).json.accounts.find((a: Record<string, any>) => a.profileId === "all-1");
-    expect((await acct()).account.readiness).toBe("missing");
-    dedup.getDb().prepare("DELETE FROM mappings").run();
-    expect((await acct()).account.readiness).toBe("unknown");
+    const acct = (await call("/api/model-accounts", "GET", t, undefined, deps)).json.accounts.find((a: Record<string, any>) => a.profileId === "free-1");
+    expect(acct.account.readiness).toBe("missing");
+    expect(acct).not.toHaveProperty(RETIRED_GRANT_FIELD);
   });
 
-  it("refuses adding * to a disabled profile", async () => {
+  it("answers 400 for the retired grant field on POST and PATCH", async () => {
     const t = await seed();
-    expect((await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" })).status).toBe(200);
-    const rev = modules.agentConfigStore.getAccountProfile("oai-1")?.revision;
-    const grant = await call("/api/model-accounts/oai-1", "PATCH", t, { allowedProjectKeys: ["*"] });
-    expect(grant.status).toBe(409);
-    expect(grant.json).toMatchObject({ code: "profile_not_active" });
-    expect(modules.agentConfigStore.getAccountProfile("oai-1")?.revision).toBe(rev);
+    const retired = { [RETIRED_GRANT_FIELD]: ["*"] };
+    const post = await call("/api/model-accounts", "POST", t, profileBody({ profileId: "x2", ...retired }));
+    expect(post.status).toBe(400);
+    expect(post.json.error).toContain(`unsupported field(s): ${RETIRED_GRANT_FIELD}`);
+    const patch = await call("/api/model-accounts/oai-1", "PATCH", t, retired);
+    expect(patch.status).toBe(400);
+    expect(patch.json.error).toContain(`unsupported field(s): ${RETIRED_GRANT_FIELD}`);
   });
 
   it("validates defaults atomically", async () => {
@@ -6501,7 +6499,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
       const store = modules.agentConfigStore;
       const moves: Array<[string, () => void]> = [
         ["defaults", () => store.setOrchestratorDefaults({ version: 1, ...defaults, stages: { ...defaults.stages, review: { ...defaults.stages.review, model: "gpt-y" } } } as never)],
-        ["profile", () => void store.saveAccountProfileRevision({ profileId: "oai-1", revision: store.getAccountProfile("oai-1")!.revision + 1, identity: "renamed", agent: "codex", provider: "openai", authMode: "openai-api-key", allowedProjectKeys: ["APP"], metadata: { credentialRef: SENTINEL } } as never)],
+        ["profile", () => void store.saveAccountProfileRevision({ profileId: "oai-1", revision: store.getAccountProfile("oai-1")!.revision + 1, identity: "renamed", agent: "codex", provider: "openai", authMode: "openai-api-key", metadata: { credentialRef: SENTINEL } } as never)],
         ["project", () => void store.setProjectStageConfig("APP", { version: 1, mode: "legacy", stages: { review: { model: "newer" } } } as never)],
       ];
       for (const [, move] of moves) {
@@ -6546,7 +6544,6 @@ describe("model accounts and stage configuration (AII-962)", () => {
     it("inspects the Fly backend without GHA template checks", async () => {
       const t = await seed();
       await request("/api/mappings", "POST", "secret", { teamKey: "FLY", owner: "org", repo: "fly", executionMode: "fly-machines" }, t);
-      await call("/api/model-accounts/oai-1", "PATCH", t, { allowedProjectKeys: ["APP", "FLY"] });
       const seen: string[] = [];
       const r = await call("/api/mappings/FLY/agent-config", "PUT", t, { enabled: true }, readyDeps(async (req: any) => {
         seen.push(req.backend);
@@ -6762,7 +6759,6 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect(store().resolve(REF)).toBe(KEY);
       const acct = (await call("/api/model-accounts", "GET", t)).json.accounts[0];
       expect(acct.credentialSet).toBe(true);
-      expect(acct.allowedProjectKeys).toEqual(["APP"]);
     });
 
     it("refuses bad refs, wrong modes, unknown profiles and bad bodies without writing", async () => {

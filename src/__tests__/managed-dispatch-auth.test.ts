@@ -115,11 +115,11 @@ beforeEach(async () => {
   if (!seeded.ok) throw new Error("plan record seed failed");
   store.saveAccountProfileRevision({
     profileId: "cdx", identity: "Cdx", revision: 1, agent: "codex", provider: "openai",
-    authMode: "codex-subscription", allowedProjectKeys: ["AII"],
+    authMode: "codex-subscription",
   });
   store.saveAccountProfileRevision({
     profileId: "sub", identity: "Sub", revision: 1, agent: "claude", provider: "anthropic",
-    authMode: "claude-subscription", allowedProjectKeys: ["AII"],
+    authMode: "claude-subscription",
   });
   useCodex();
   store.setProjectOptIn("AII", true);
@@ -364,22 +364,10 @@ describe("prepareManagedDispatch on github-actions (AII-1420)", () => {
     noRunner();
   });
 
-  it("refuses an unauthorized account with no fallback to legacy", async () => {
-    store.saveAccountProfileRevision({
-      profileId: "cdx", identity: "Cdx", revision: 2, agent: "codex", provider: "openai",
-      authMode: "codex-subscription", allowedProjectKeys: ["OTHER"],
-    });
-    gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED });
-    const d = await adapter.prepareManagedDispatch(ghaReq(), runtime);
-    expect(d).toEqual({ kind: "refuse", category: "configuration-error", code: "resolution_failed" });
-    expect(d).not.toEqual({ kind: "legacy" });
-    noRunner();
-  });
-
   it("refuses a disabled account with no fallback to legacy", async () => {
     store.saveAccountProfileRevision({
       profileId: "cdx", identity: "Cdx", revision: 2, agent: "codex", provider: "openai",
-      authMode: "codex-subscription", allowedProjectKeys: ["AII"], status: "disabled",
+      authMode: "codex-subscription", status: "disabled",
     });
     gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED });
     const d = await adapter.prepareManagedDispatch(ghaReq(), runtime);
