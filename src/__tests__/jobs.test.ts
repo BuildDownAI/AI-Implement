@@ -824,6 +824,25 @@ describe("per-job accounting columns", () => {
     for (const name of NEW_COLUMNS) expect(old[name]).toBeNull();
   });
 
+  it("adds late_review_head_sha as a nullable column to an old table, idempotently, outside the accounting trigger (AII-1596)", () => {
+    const db = dedup.getDb();
+    db.exec("DROP TRIGGER trg_dispatch_log_changed_at");
+    db.exec("ALTER TABLE dispatch_log DROP COLUMN late_review_head_sha");
+    db.prepare("INSERT INTO dispatch_log (issue_id, dispatched_at) VALUES ('old-head', ?)").run(Date.now());
+    log.initLogTable();
+    log.initLogTable();
+    const col = columns().find((c) => c.name === "late_review_head_sha");
+    expect(col?.notnull).toBe(0);
+    expect((db.prepare("PRAGMA table_info(dispatch_log)").all() as Array<{ name: string; type: string }>).find((c) => c.name === "late_review_head_sha")?.type).toBe("TEXT");
+    const old = db.prepare("SELECT * FROM dispatch_log WHERE issue_id = 'old-head'").get() as Record<string, unknown>;
+    expect(old.late_review_head_sha).toBeNull();
+    const id = old.id as number;
+    db.prepare("UPDATE dispatch_log SET changed_at = 0 WHERE id = ?").run(id);
+    log.setLateReviewHeadSha(id, "a".repeat(40));
+    expect(row(id).late_review_head_sha).toBe("a".repeat(40));
+    expect(row(id).changed_at).toBe(0);
+  });
+
   it("saves tracker kind, issue URL, size and start on append", () => {
     const id = log.appendLog({
       issueId: "i", trackerKind: "linear", issueUrl: "https://linear.app/x/issue/A-1",

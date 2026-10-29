@@ -1491,6 +1491,22 @@ describe("handleRunnerResult — implementation", () => {
       dedup.getDb().prepare("UPDATE dispatch_log SET completed_at = ? WHERE id = ?").run(at, rowId);
     }
 
+    it("the sweep submits a row's stored head, and no headSha key for a row with none (AII-1596)", async () => {
+      const withHead = pendingRow("i-sweep-head");
+      const noHead = pendingRow("i-sweep-nohead");
+      const head = "0123456789abcdef0123456789abcdef01234567";
+      log.setLateReviewHeadSha(withHead.rowId, head);
+      await setCompleted(withHead.rowId, NOW - HOUR);
+      await setCompleted(noHead.rowId, NOW - HOUR);
+      const submit = vi.fn(async () => {});
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
+      const inputs = (submit.mock.calls as unknown as Record<string, unknown>[][]).map((c) => c[0]!);
+      const h = inputs.find((i) => i.rowId === withHead.rowId)!;
+      const n = inputs.find((i) => i.rowId === noHead.rowId)!;
+      expect(h.headSha).toBe(head);
+      expect(Object.keys(n).includes("headSha")).toBe(false);
+    });
+
     it("a not-ready callback leaves the row pending; the next ready tick submits once, a second submits nothing", async () => {
       const { rowId, dispatchId } = pendingRow("i-sweep");
       await setCompleted(rowId, NOW - HOUR);
@@ -1517,6 +1533,16 @@ describe("handleRunnerResult — implementation", () => {
       });
       await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
       expect(submit).toHaveBeenCalledTimes(1);
+    });
+
+    it("re-submits a pending review-fix attempt's stored head with gapFill and attemptId (AII-1596)", async () => {
+      const head = "c".repeat(40);
+      log.recordPendingLateReview({ workflowKey: "d-att3-att-3", dispatchId: "d-att3", prUrl: "https://github.com/o/r/pull/7", attemptId: "att-3", headSha: head }, NOW - HOUR);
+      const submit = vi.fn(async () => {});
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
+      expect(submit).toHaveBeenCalledWith({
+        dispatchId: "d-att3", owner: "o", repo: "r", prNumber: 7, prUrl: "https://github.com/o/r/pull/7", gapFill: true, attemptId: "att-3", headSha: head,
+      });
     });
 
     it("keeps a pending review-fix attempt when the hook reports the submit did not settle (AII-1307)", async () => {
@@ -2691,6 +2717,36 @@ describe("handleRunnerResult — gap-analysis", () => {
       ...(withHead ? { headSha: pushed } : {}),
     });
     expect(Object.keys((hook.mock.calls as unknown[][])[0]![0] as object).includes("headSha")).toBe(withHead);
+    expect(log.getJobById(jobId)?.lateReviewHeadSha).toBe(withHead ? pushed : null);
+  });
+
+  it.each([
+    ["throws", (async () => { throw new Error("boom"); }) as () => Promise<unknown>],
+    ["rejects", () => Promise.reject(new Error("rejected")) as Promise<unknown>],
+    ["returns false", (async () => false) as () => Promise<unknown>],
+  ] as const)("keeps the stored restate head when the submit %s (AII-1596)", async (name, impl) => {
+    const config = await import("../config.js");
+    config.upsertMapping("ENG", makeMapping({ owner: "org", repo: "repo", reviewFixLifecycle: "restate" }));
+    const pushed = "fedcba9876543210fedcba9876543210fedcba98";
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: `i-head-fail-${name}`, mappingTeamKey: "ENG", phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+    });
+    const jobId = log.appendLog(makeAppendLogEntry({ issueId: `i-head-fail-${name}`, issueIdentifier: "ENG-7", repo: "org/repo", dispatchId, phase: "gap-analysis" }));
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+    const hook = vi.fn(impl);
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "gap-analysis", outcome: "success", comments: [], externalReviewPending: { headSha: pushed } },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+      submitLateExternalReview: hook as never,
+    });
+
+    expect(res.status).toBe(200);
+    expect(hook).toHaveBeenCalledTimes(1);
+    expect(log.getJobById(jobId)?.lateReviewHeadSha).toBe(pushed);
   });
 
   it("still returns 200 and writes no mark when the LateExternalReview submit throws or is absent (AII-1291)", async () => {

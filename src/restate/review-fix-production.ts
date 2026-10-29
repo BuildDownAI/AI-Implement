@@ -225,7 +225,7 @@ export async function submitLateReviewForAttempt(
     }
     // Held for the poll sweep (resubmitPendingGapFillReviews) in case Restate is not ready and the hook only logs.
     const workflowKey = lateExternalReviewWorkflowKey({ dispatchId: row.dispatchId, attemptId });
-    recordPendingLateReview({ workflowKey, dispatchId: row.dispatchId, prUrl, attemptId });
+    recordPendingLateReview({ workflowKey, dispatchId: row.dispatchId, prUrl, attemptId, ...(headSha ? { headSha } : {}) });
     const settled = await submit({ dispatchId: row.dispatchId, owner, repo, prNumber: scope.prNumber, prUrl, gapFill: true, attemptId, ...(headSha ? { headSha } : {}) });
     // Accepted or already running: the workflow key is the idempotency, so the retry record is spent.
     if (settled !== false) clearPendingLateReview(workflowKey);
