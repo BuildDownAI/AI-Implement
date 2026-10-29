@@ -125,7 +125,7 @@ beforeEach(async () => {
   runtime = db.modules.modelAuthRuntime.createModelAuthRuntime({ config: CONFIG, env: { RUNNER_TOKEN_SECRET: SECRET }, fetchImpl: githubApi.fetch });
   for (const profileId of ["cdx", "other"]) {
     profiles.saveAccountProfileRevision({ profileId, identity: profileId, revision: 1, agent: "codex", provider: "openai",
-      authMode: "codex-subscription", allowedProjectKeys: ["AII"] });
+      authMode: "codex-subscription", });
     expect(runtime.sessionStore.writePlanRecord({ profileId, expectedSequence: null,
       sessionData: JSON.stringify(makeChatGptPlanRecord({ subject: profileId, accessToken: ACCESS })) }).ok).toBe(true);
   }
@@ -223,7 +223,7 @@ describe("production managed GHA review-fix launch", () => {
   it.each(["codex-subscription", "openai-api-key"] as const)("runs the actual configured implementation executor with selected %s credentials", async (authMode) => {
     if (authMode === "openai-api-key") {
       profiles.saveAccountProfileRevision({ profileId: "api", identity: "api", revision: 1, agent: "codex", provider: "openai",
-        authMode, allowedProjectKeys: ["AII"], metadata: { credentialRef: "model-account:api" } });
+        authMode, metadata: { credentialRef: "model-account:api" } });
       const { createModelProtectedSecrets } = await import("../model-protected-secrets.js");
       expect(createModelProtectedSecrets().write("model-account:api", "SYNTHETIC-selected-openai-key").ok).toBe(true);
       defaults("api");
@@ -292,10 +292,8 @@ describe("production managed GHA review-fix launch", () => {
     for (const file of GHA_PLAN_WORKFLOWS) expect(ghaRunStepEnv(file, { runConfig: sent[0].run_config }).bootStatus).not.toBe(0);
   });
 
-  it.each(["disabled", "unauthorized"])("does not dispatch a %s account", async (state) => {
-    if (state === "disabled") profiles.retireAccountProfile("cdx");
-    else profiles.saveAccountProfileRevision({ profileId: "cdx", identity: "cdx", revision: 2,
-      agent: "codex", provider: "openai", authMode: "codex-subscription", allowedProjectKeys: ["OTHER"] });
+  it("does not dispatch a disabled account", async () => {
+    profiles.retireAccountProfile("cdx");
     const { worker, plan } = await launch();
     expect(await worker.launch(plan)).toEqual({ status: "unknown" });
     expect(sent).toHaveLength(0);
@@ -369,7 +367,7 @@ describe("production managed GHA review-fix launch", () => {
 
   it("refuses unsupported Claude subscription stages without dispatch or grant", async () => {
     profiles.saveAccountProfileRevision({ profileId: "sub", identity: "sub", revision: 1, agent: "claude", provider: "anthropic",
-      authMode: "claude-subscription", allowedProjectKeys: ["AII"] });
+      authMode: "claude-subscription", });
     profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage(), review: stage(),
       implementation: { ...stage("sub"), agent: "claude", provider: "anthropic" } } });
     const { worker, plan } = await launch();
@@ -380,7 +378,7 @@ describe("production managed GHA review-fix launch", () => {
 
   it("prepares supported mixed Claude API and Codex plan stages", async () => {
     profiles.saveAccountProfileRevision({ profileId: "claude-api", identity: "claude-api", revision: 1, agent: "claude", provider: "anthropic",
-      authMode: "anthropic-api-key", allowedProjectKeys: ["AII"], metadata: { credentialRef: "model-account:claude-api" } });
+      authMode: "anthropic-api-key", metadata: { credentialRef: "model-account:claude-api" } });
     const { createModelProtectedSecrets } = await import("../model-protected-secrets.js");
     expect(createModelProtectedSecrets().write("model-account:claude-api", "SYNTHETIC-selected-claude-key").ok).toBe(true);
     profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { implementation: stage(),
@@ -493,7 +491,7 @@ describe("production managed GHA review-fix launch", () => {
 
     async function writeKey(profileId: string, agent: "claude" | "codex", provider: "anthropic" | "openai", authMode: string) {
       profiles.saveAccountProfileRevision({ profileId, identity: profileId, revision: 1, agent, provider,
-        authMode: authMode as "anthropic-api-key", allowedProjectKeys: ["AII"], metadata: { credentialRef: `model-account:${profileId}` } });
+        authMode: authMode as "anthropic-api-key", metadata: { credentialRef: `model-account:${profileId}` } });
       const { createModelProtectedSecrets } = await import("../model-protected-secrets.js");
       expect(createModelProtectedSecrets().write(`model-account:${profileId}`, `SYNTHETIC-${profileId}-key`).ok).toBe(true);
     }
@@ -528,17 +526,9 @@ describe("production managed GHA review-fix launch", () => {
       expect(snapshot.stages.implementation.accountProfileId).toBe("capi");
     });
 
-    it("fails an unauthorized project key without launching or granting", async () => {
-      profiles.saveAccountProfileRevision({ profileId: "cdx", identity: "cdx", revision: 2, agent: "codex", provider: "openai",
-        authMode: "codex-subscription", allowedProjectKeys: ["OTHER"] });
-      expect(await admit()).toBe("configuration_error");
-      expect(sent).toHaveLength(0);
-      expect(count("model_credential_grants")).toBe(0);
-    });
-
     it("refuses a managed Claude subscription stage", async () => {
       profiles.saveAccountProfileRevision({ profileId: "sub", identity: "sub", revision: 1, agent: "claude", provider: "anthropic",
-        authMode: "claude-subscription", allowedProjectKeys: ["AII"] });
+        authMode: "claude-subscription", });
       profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: {
         planning: { agent: "claude", provider: "anthropic", model: "claude-sonnet-5-5", accountProfileId: "sub", invocationTimeoutMs: 60_000 },
         implementation: stage(), review: stage(),
@@ -673,8 +663,8 @@ describe("production managed GHA review-fix launch", () => {
     it("fails the queue row with a code-only log and reserves nothing on a bad configuration", async () => {
       const { enqueueReviewFix, getPendingReviewFixes } = await import("../review-fix-queue.js");
       const queueId = enqueueReviewFix({ issueId: "i1", issueIdentifier: "AII-1", repo: SCOPE.repository, prNumber: SCOPE.prNumber, reason: "review_comment" });
-      profiles.saveAccountProfileRevision({ profileId: "cdx", identity: "cdx", revision: 2, agent: "codex", provider: "openai",
-        authMode: "codex-subscription", allowedProjectKeys: ["OTHER"] });
+      profiles.saveAccountProfileRevision({ profileId: "cdx", identity: "cdx", revision: 2, agent: "claude", provider: "anthropic",
+        authMode: "anthropic-api-key" });
       const logged: string[] = [];
       for (const method of ["error", "log", "warn"] as const) {
         vi.spyOn(console, method).mockImplementation((...args: unknown[]) => { logged.push(args.map(String).join(" ")); });

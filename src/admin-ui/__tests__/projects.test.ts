@@ -459,7 +459,6 @@ describe("projects page agents tab", () => {
     agent: "codex",
     provider: "openai",
     authMode: "openai-api-key",
-    allowedProjectKeys: ["AII"],
     profileStatus: "active",
     account: { readiness: "ready", failureCode: null },
     ...overrides,
@@ -580,28 +579,26 @@ describe("projects page agents tab", () => {
     expect(m.doc.getElementById("md-agents-error")!.textContent).toContain("positive whole number");
   });
 
-  it("treats a * grant as permitting any project in both the profile list and the stage select", async () => {
+  it("lists every active profile in both the profile list and the stage select", async () => {
     const m = mountAgents({
       accounts: [
-        account({ profileId: "acct-all", allowedProjectKeys: ["*"] }),
-        account({ profileId: "acct-other", allowedProjectKeys: ["OTHER"] }),
-        account({ profileId: "acct-none", allowedProjectKeys: [] }),
-        account({ profileId: "acct-off", allowedProjectKeys: ["*"], profileStatus: "inactive" }),
+        account({ profileId: "acct-a" }),
+        account({ profileId: "acct-b" }),
+        account({ profileId: "acct-off", profileStatus: "inactive" }),
       ],
     });
     await open(m);
     const listed = [...m.doc.querySelectorAll("[data-ag-profile]")].map((e) => e.getAttribute("data-ag-profile"));
-    expect(listed).toEqual(["acct-all"]);
+    expect(listed).toEqual(["acct-a", "acct-b"]);
     const options = [...m.doc.querySelectorAll('select[data-stage="review"][data-field="accountProfileId"] option')].map((o) => (o as HTMLOptionElement).value);
-    expect(options).toContain("acct-all");
-    for (const id of ["acct-other", "acct-none", "acct-off"]) expect(options).not.toContain(id);
+    expect(options).toEqual(expect.arrayContaining(["acct-a", "acct-b"]));
+    expect(options).not.toContain("acct-off");
   });
-  it("lists only active, permitted, compatible profiles and shows readiness and recovery", async () => {
+  it("lists only active, compatible profiles and shows readiness and recovery", async () => {
     const m = mountAgents({
       accounts: [
         account(),
         account({ profileId: "acct-off", profileStatus: "disabled" }),
-        account({ profileId: "acct-other", allowedProjectKeys: ["OTHER"] }),
         account({ profileId: "acct-claude", agent: "claude", provider: "anthropic", authMode: "claude-subscription", account: { readiness: "sign-in required", failureCode: "authentication_required", sessionRecovery: { state: "recovery_required", recoveryRequired: true } } }),
         account({ profileId: "acct-bad", identity: "<img src=x onerror=alert(1)>", account: { readiness: "missing", failureCode: "x" } }),
       ],
@@ -621,7 +618,7 @@ describe("projects page agents tab", () => {
   });
 
   it("blocks opt-in when a stage profile is not eligible", async () => {
-    const m = mountAgents({ accounts: [account({ allowedProjectKeys: ["OTHER"] })] });
+    const m = mountAgents({ accounts: [account({ profileStatus: "disabled" })] });
     await open(m);
     const box = m.doc.getElementById("md-agents-enabled") as HTMLInputElement;
     box.checked = true;

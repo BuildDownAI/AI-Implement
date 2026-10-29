@@ -278,7 +278,7 @@ const PROFILE_KEYS = [
   "trustedPrivateTesting",
 ] as const;
 
-function parseProfile(raw: unknown, index: number, projectKey: string): ParsedProfile {
+function parseProfile(raw: unknown, index: number): ParsedProfile {
   const ctx = `profiles[${index}]`;
   if (!isRecord(raw)) fail("config_invalid", `${ctx} must be an object`);
   assertKnownKeys(raw, PROFILE_KEYS, ctx);
@@ -336,7 +336,6 @@ function parseProfile(raw: unknown, index: number, projectKey: string): ParsedPr
       agent: raw.agent as StageAgent,
       provider: raw.provider as ModelProvider,
       authMode: authMode as AccountAuthMode,
-      allowedProjectKeys: [projectKey],
     },
     path,
     kind: isSubscription ? "session" : "api-key",
@@ -383,7 +382,7 @@ async function loadImpl(options: LocalAgentConfigOptions): Promise<LoadedLocalAg
   if (!Array.isArray(raw.profiles) || raw.profiles.length === 0 || raw.profiles.length > 32) {
     fail("config_invalid", "configuration.profiles must be a non-empty list");
   }
-  const parsed = raw.profiles.map((p, i) => parseProfile(p, i, options.projectKey));
+  const parsed = raw.profiles.map((p, i) => parseProfile(p, i));
   // Reject repository-contained references for every declared profile; only selected ones are opened.
   for (const entry of parsed) assertOutside(resolve(entry.path), resolve(entry.path), roots, "credential reference");
 
@@ -392,7 +391,6 @@ async function loadImpl(options: LocalAgentConfigOptions): Promise<LoadedLocalAg
   let resolution: StageConfigResolution;
   try {
     resolution = resolveStageAgentConfig({
-      projectKey: options.projectKey,
       orchestratorDefaults,
       projectConfig,
       accountProfiles: parsed.map((p) => p.profile),

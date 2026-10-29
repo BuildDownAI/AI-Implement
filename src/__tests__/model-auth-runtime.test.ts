@@ -110,7 +110,7 @@ describe("getRepoTrust", () => {
   beforeEach(() => {
     store.saveAccountProfileRevision({
       profileId: "cdx", identity: "Cdx", revision: 1, agent: "codex", provider: "openai",
-      authMode: "codex-subscription", allowedProjectKeys: ["AII"],
+      authMode: "codex-subscription",
     });
     store.setOrchestratorDefaults({
       version: 1, mode: "configured",
@@ -330,7 +330,7 @@ describe("prepareAgentRun with the runtime deps", () => {
   it("is ready for a codex-subscription profile with a stored plan record", async () => {
     store.saveAccountProfileRevision({
       profileId: "cdx", identity: "Cdx", revision: 1, agent: "codex", provider: "openai",
-      authMode: "codex-subscription", allowedProjectKeys: ["AII"],
+      authMode: "codex-subscription",
     });
     useStages("cdx", "codex", "openai");
     const rt = runtime();
@@ -347,7 +347,7 @@ describe("prepareAgentRun with the runtime deps", () => {
   it("is ready for an API-key profile with an encrypted stored key", async () => {
     store.saveAccountProfileRevision({
       profileId: "api", identity: "Api", revision: 1, agent: "claude", provider: "anthropic",
-      authMode: "anthropic-api-key", allowedProjectKeys: ["AII"], metadata: { credentialRef: "model-account:api" },
+      authMode: "anthropic-api-key", metadata: { credentialRef: "model-account:api" },
     });
     useStages("api", "claude", "anthropic");
     const KEY = "sk-ant-SENTINEL-STORED-KEY";
@@ -357,26 +357,10 @@ describe("prepareAgentRun with the runtime deps", () => {
     expect(JSON.stringify(r)).not.toContain(KEY);
   });
 
-  it("denies a disabled-project profile without consulting storage", () => {
-    const spy = vi.fn(() => "sk-never");
-    const { resolveModelCredential } = modules.credentials;
-    store.saveAccountProfileRevision({
-      profileId: "api", identity: "Api", revision: 1, agent: "claude", provider: "anthropic",
-      authMode: "anthropic-api-key", allowedProjectKeys: ["OTHER"], metadata: { credentialRef: "model-account:api" },
-    });
-    const rt = runtime();
-    const res = resolveModelCredential(
-      { projectKey: "AII", profileId: "api", revision: 1, provider: "anthropic", authMode: "anthropic-api-key" },
-      { ...rt.credentials, resolveProtectedSecret: spy },
-    );
-    expect(res.ok).toBe(false);
-    expect(spy).not.toHaveBeenCalled();
-  });
-
   it("is authentication-required for an API-key profile with no stored row and mints no grant", async () => {
     store.saveAccountProfileRevision({
       profileId: "api", identity: "Api", revision: 1, agent: "claude", provider: "anthropic",
-      authMode: "anthropic-api-key", allowedProjectKeys: ["AII"], metadata: { credentialRef: "model-account:api" },
+      authMode: "anthropic-api-key", metadata: { credentialRef: "model-account:api" },
     });
     useStages("api", "claude", "anthropic");
     const rt = runtime();

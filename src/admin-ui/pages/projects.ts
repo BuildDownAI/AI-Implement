@@ -821,17 +821,11 @@ export const projectsScript = `
     return dv === undefined ? { value: undefined, source: 'unset' } : { value: dv, source: 'orchestrator default' };
   }
 
-  function agPermits(a) {
-    return Array.isArray(a.allowedProjectKeys)
-      && (a.allowedProjectKeys.indexOf('*') !== -1 || a.allowedProjectKeys.indexOf(agentState.key) !== -1);
-  }
-
   function agEligibleProfiles(stage) {
     var agent = agEffective(stage, 'agent').value;
     var provider = agEffective(stage, 'provider').value;
     return agentState.accounts.filter(function (a) {
       return a.profileStatus === 'active'
-        && agPermits(a)
         && a.authMode !== 'claude-subscription'
         && a.agent === agent && a.provider === provider;
     });
@@ -841,7 +835,7 @@ export const projectsScript = `
     var profile = agEffective(stage, 'accountProfileId').value;
     if (profile === undefined) return 'No account profile is selected for ' + stage + '.';
     var ok = agEligibleProfiles(stage).some(function (a) { return a.profileId === profile; });
-    return ok ? '' : 'The profile for ' + stage + ' is not active, not permitted for this project, or does not match the agent and provider.';
+    return ok ? '' : 'The profile for ' + stage + ' is not active, or does not match the agent and provider.';
   }
 
   function agEnableProblem() {
@@ -887,13 +881,13 @@ export const projectsScript = `
   function agRenderProfiles() {
     var el = document.getElementById('md-agents-profiles');
     var rows = agentState.accounts.filter(function (a) {
-      return a.profileStatus === 'active' && agPermits(a);
+      return a.profileStatus === 'active';
     });
     if (!rows.length) {
-      el.innerHTML = '<div class="field-hint">No active account profile is permitted for this project. Permit one under model accounts first.</div>';
+      el.innerHTML = '<div class="field-hint">No active account profile exists. Add one under model accounts first.</div>';
       return;
     }
-    el.innerHTML = '<div style="font-size:12px;font-weight:500;color:var(--fg-secondary);margin-bottom:6px">Profiles permitted for this project</div>' + rows.map(function (a) {
+    el.innerHTML = '<div style="font-size:12px;font-weight:500;color:var(--fg-secondary);margin-bottom:6px">Active account profiles</div>' + rows.map(function (a) {
       var acct = a.account || {};
       var line = a.identity + ' (' + a.profileId + ') · ' + a.agent + '/' + a.provider + ' · ' + a.authMode + ' · readiness: ' + agText(acct.readiness || 'unknown');
       if (acct.failureCode) line += ' (' + acct.failureCode + ')';

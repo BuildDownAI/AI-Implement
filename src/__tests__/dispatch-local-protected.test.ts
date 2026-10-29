@@ -142,7 +142,7 @@ beforeEach(async () => {
   }
   store.saveAccountProfileRevision({
     profileId: "cdx", identity: "Cdx", revision: 1, agent: "codex", provider: "openai",
-    authMode: "codex-subscription", allowedProjectKeys: ["AII"],
+    authMode: "codex-subscription",
   });
   const stage = { agent: "codex", provider: "openai", model: "m", accountProfileId: "cdx", invocationTimeoutMs: 60_000 } as const;
   store.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } });

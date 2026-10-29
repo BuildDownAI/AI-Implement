@@ -67,23 +67,23 @@ function stage(profile: string, agent: "claude" | "codex", provider: "anthropic"
 function seedProfiles() {
   store.saveAccountProfileRevision({
     profileId: "api", identity: "Api", revision: 1, agent: "claude", provider: "anthropic",
-    authMode: "anthropic-api-key", allowedProjectKeys: ["AII"], metadata: { credentialRef: "model-account:api" },
+    authMode: "anthropic-api-key", metadata: { credentialRef: "model-account:api" },
   });
   store.saveAccountProfileRevision({
     profileId: "sub", identity: "Sub", revision: 1, agent: "claude", provider: "anthropic",
-    authMode: "claude-subscription", allowedProjectKeys: ["AII"],
+    authMode: "claude-subscription",
   });
   store.saveAccountProfileRevision({
     profileId: "sub2", identity: "Sub2", revision: 1, agent: "claude", provider: "anthropic",
-    authMode: "claude-subscription", allowedProjectKeys: ["AII"],
+    authMode: "claude-subscription",
   });
   store.saveAccountProfileRevision({
     profileId: "cdx", identity: "Cdx", revision: 1, agent: "codex", provider: "openai",
-    authMode: "codex-subscription", allowedProjectKeys: ["AII"],
+    authMode: "codex-subscription",
   });
   store.saveAccountProfileRevision({
     profileId: "brk", identity: "Brk", revision: 1, agent: "claude", provider: "bedrock",
-    authMode: "bedrock", allowedProjectKeys: ["AII"], metadata: { credentialRef: "model-account:brk" },
+    authMode: "bedrock", metadata: { credentialRef: "model-account:brk" },
   });
   store.setOrchestratorDefaults({
     version: 1, mode: "configured",
@@ -257,7 +257,7 @@ describe("snapshot immutability and idempotence", () => {
     store.setProjectStageConfig("AII", { version: 1, mode: "configured", stages: { review: { model: "changed" } } });
     store.saveAccountProfileRevision({
       profileId: "sub", identity: "Sub", revision: 2, agent: "claude", provider: "anthropic",
-      authMode: "claude-subscription", allowedProjectKeys: ["AII"],
+      authMode: "claude-subscription",
     });
     const again = ready(await prep.prepareAgentRun(request(), deps));
     expect(JSON.stringify(rows("run_agent_config_snapshots"))).toBe(before);
@@ -463,7 +463,7 @@ describe("delivery and runner capability", () => {
   it("rejects Bedrock off GitHub Actions and non-GHA backends without a capability check", async () => {
     store.saveAccountProfileRevision({
       profileId: "bed", identity: "Bed", revision: 1, agent: "claude", provider: "bedrock",
-      authMode: "bedrock", allowedProjectKeys: ["AII"], metadata: { credentialRef: "model-account:bed" },
+      authMode: "bedrock", metadata: { credentialRef: "model-account:bed" },
     });
     store.setOrchestratorDefaults({
       version: 1, mode: "configured",
@@ -497,7 +497,7 @@ describe("credential readiness", () => {
   it("returns authentication-required for missing session state and releases the fresh lease", async () => {
     store.saveAccountProfileRevision({
       profileId: "fresh", identity: "Fresh", revision: 1, agent: "claude", provider: "anthropic",
-      authMode: "claude-subscription", allowedProjectKeys: ["AII"],
+      authMode: "claude-subscription",
     });
     store.setOrchestratorDefaults({
       version: 1, mode: "configured",
@@ -514,7 +514,7 @@ describe("credential readiness", () => {
 
   it("does not accept usable status alone: a subscription needs readable session state", async () => {
     const status = testDatabase.modules.credentials.getCredentialStatus(
-      { projectKey: "AII", profileId: "sub", revision: 1, provider: "anthropic", authMode: "claude-subscription" },
+      { profileId: "sub", revision: 1, provider: "anthropic", authMode: "claude-subscription" },
       deps.credentials,
     );
     expect(status.usable).toBe(true);
@@ -701,7 +701,7 @@ describe("inspectAgentReadiness", () => {
   it("reports an unconfigured API credential reference as not ready", async () => {
     store.saveAccountProfileRevision({
       profileId: "api", identity: "Api", revision: 2, agent: "claude", provider: "anthropic",
-      authMode: "anthropic-api-key", allowedProjectKeys: ["AII"],
+      authMode: "anthropic-api-key",
     });
     store.setOrchestratorDefaults({
       version: 1, mode: "configured",

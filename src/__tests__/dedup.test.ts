@@ -260,9 +260,6 @@ describe("agent configuration and account ownership schema", () => {
     expect(() => db.prepare(`UPDATE model_account_profile_revisions
       SET display_name = 'rewrite' WHERE profile_id = 'profile-openai' AND profile_revision = 1`).run())
       .toThrow(/immutable/);
-    db.prepare(`INSERT INTO model_account_profile_project_permissions
-      (profile_id, project_key, permission_revision, status, created_at, updated_at)
-      VALUES ('profile-openai', 'AII', 1, 'allowed', 10, 10)`).run();
     db.prepare(`INSERT INTO stage_agent_config_revisions
       (config_revision_id, scope_kind, scope_key, version, revision, config_json, created_at)
       VALUES ('cfg-1', 'project', 'AII', 1, 1, '{"mode":"configured"}', 11)`).run();
@@ -306,7 +303,6 @@ describe("agent configuration and account ownership schema", () => {
         AND m.name IN (
           'model_account_profiles',
           'model_account_profile_revisions',
-          'model_account_profile_project_permissions',
           'stage_agent_config_revisions',
           'run_agent_config_snapshots',
           'model_profile_reservations',
@@ -338,6 +334,26 @@ describe("agent configuration and account ownership schema", () => {
       auth_mode: "codex-subscription",
       usage_json: "{\"inputTokens\":1}",
     });
+  });
+});
+
+const RETIRED_TABLE = ["model_account_profile", "project", "permissions"].join("_");
+
+describe("retired model account permissions table", () => {
+  it("leaves an existing table and its rows untouched on boot", () => {
+    const old = new Database(dbPath);
+    old.exec(`CREATE TABLE ${RETIRED_TABLE} (
+      profile_id TEXT NOT NULL, project_key TEXT NOT NULL, permission_revision INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'allowed', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      PRIMARY KEY (profile_id, project_key))`);
+    old.prepare(`INSERT INTO ${RETIRED_TABLE}
+      (profile_id, project_key, permission_revision, status, created_at, updated_at)
+      VALUES ('profile-openai', 'AII', 1, 'allowed', 10, 10)`).run();
+    old.close();
+
+    const db = dedup.getDb();
+    expect(db.prepare(`SELECT profile_id, project_key FROM ${RETIRED_TABLE}`).all())
+      .toEqual([{ profile_id: "profile-openai", project_key: "AII" }]);
   });
 });
 

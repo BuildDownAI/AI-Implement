@@ -160,18 +160,6 @@ function createAgentConfigurationTables(): void {
     BEFORE UPDATE ON model_account_profile_revisions
     BEGIN SELECT RAISE(ABORT, 'model account profile revisions are immutable'); END`);
   db.exec(`
-    CREATE TABLE IF NOT EXISTS model_account_profile_project_permissions (
-      profile_id TEXT NOT NULL,
-      project_key TEXT NOT NULL,
-      permission_revision INTEGER NOT NULL CHECK (permission_revision > 0),
-      status TEXT NOT NULL DEFAULT 'allowed',
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      PRIMARY KEY (profile_id, project_key),
-      CHECK (status IN ('allowed', 'disabled'))
-    )
-  `);
-  db.exec(`
     CREATE TABLE IF NOT EXISTS stage_agent_config_revisions (
       config_revision_id TEXT PRIMARY KEY,
       scope_kind TEXT NOT NULL,
