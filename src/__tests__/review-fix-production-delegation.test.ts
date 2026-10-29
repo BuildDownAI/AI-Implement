@@ -82,7 +82,7 @@ describe("review-fix production delegation", () => {
       await submitLateReviewForAttempt(scope, "att-1", submit, outputCommit);
       expect(submit).toHaveBeenCalledWith({ dispatchId: "d-9", owner: "acme", repo: "app", prNumber: 7,
         prUrl: "https://github.com/acme/app/pull/7", gapFill: true, attemptId: "att-1", headSha: outputCommit });
-      expect(recordPendingLateReview).toHaveBeenCalledWith({ workflowKey: "d-9-att-1", dispatchId: "d-9", prUrl: "https://github.com/acme/app/pull/7", attemptId: "att-1" });
+      expect(recordPendingLateReview).toHaveBeenCalledWith({ workflowKey: "d-9-att-1", dispatchId: "d-9", prUrl: "https://github.com/acme/app/pull/7", attemptId: "att-1", headSha: outputCommit });
     });
 
     it("clears the pending record only when the submit settled, and keeps it when the hook reports false", async () => {

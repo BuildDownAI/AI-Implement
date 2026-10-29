@@ -72,6 +72,8 @@ export interface Job {
    *  🟡 one. Distinct from `failure`, which is persisted for every phase (including
    *  gap-analysis, which the callback never comments for and so never stamps this field). */
   failureCommentedAt: number | null;
+  /** Head the gap-fill pushed, stored only for a Restate-lifecycle row so the sweep re-submits it (AII-1596). */
+  lateReviewHeadSha: string | null;
   /** Bounded safe projection of the latest persisted invocation record for this dispatch
    *  (`model_invocation_attribution`, AII-971); legacy dispatches read `null` with no inferred cost.
    *  Optional so undeclared `Job` literals keep compiling. */
@@ -278,6 +280,9 @@ function ensureLogColumns(): void {
   }
   if (!names.has("failure_commented_at")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN failure_commented_at INTEGER");
+  }
+  if (!names.has("late_review_head_sha")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN late_review_head_sha TEXT");
   }
   for (const [column, type] of ACCOUNTING_COLUMNS) {
     if (!names.has(column)) db.exec(`ALTER TABLE dispatch_log ADD COLUMN ${column} ${type}`);
@@ -703,6 +708,11 @@ export function stampJobApproved(jobId: number, prUrl: string): void {
     .run(prUrl, Date.now(), jobId);
 }
 
+/** Stores the head a Restate-lifecycle gap-fill pushed, for the late-review sweep to re-submit (AII-1596). */
+export function setLateReviewHeadSha(rowId: number, headSha: string): void {
+  getDb().prepare("UPDATE dispatch_log SET late_review_head_sha = ? WHERE id = ?").run(headSha, rowId);
+}
+
 /**
  * Writes how a LateExternalReview ended to the gap-fill row it was submitted for (AII-1524):
  * `conclusion = late_review_<ending>`, and `approved = 1` only for `approved`. Guarded on the row
@@ -790,7 +800,7 @@ export interface PendingLateReview {
 }
 
 /**
- * Records a LateExternalReview submit that still needs to settle (AII-1362). Idempotent per workflow key.
+ * Records a LateExternalReview submit that still needs to settle (AII-1362). Idempotent per workflow key; a repeat only fills a head the existing row lacks, never replaces one.
  * The caller computes `workflowKey` with `lateExternalReviewWorkflowKey` (importing it here would be circular).
  */
 export function recordPendingLateReview(
@@ -799,7 +809,8 @@ export function recordPendingLateReview(
 ): void {
   getDb()
     .prepare(
-      "INSERT OR IGNORE INTO late_review_pending (workflow_key, dispatch_id, pr_url, head_sha, attempt_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      "INSERT INTO late_review_pending (workflow_key, dispatch_id, pr_url, head_sha, attempt_id, created_at) VALUES (?, ?, ?, ?, ?, ?) " +
+        "ON CONFLICT(workflow_key) DO UPDATE SET head_sha = excluded.head_sha WHERE late_review_pending.head_sha IS NULL AND excluded.head_sha IS NOT NULL",
     )
     .run(input.workflowKey, input.dispatchId, input.prUrl, input.headSha ?? null, input.attemptId ?? null, now);
 }
@@ -1041,6 +1052,7 @@ interface RawRow {
   approved: number | null;
   failure_json: string | null;
   failure_commented_at: number | null;
+  late_review_head_sha: string | null;
 }
 
 function mapRows(rows: RawRow[]): Job[] {
@@ -1074,6 +1086,7 @@ function mapRows(rows: RawRow[]): Job[] {
     approved: row.approved === 1,
     failure: parseFailureJson(row.failure_json),
     failureCommentedAt: row.failure_commented_at ?? null,
+    lateReviewHeadSha: row.late_review_head_sha ?? null,
     attribution: (row.dispatch_id && attributions.get(row.dispatch_id)) || null,
   }));
 }

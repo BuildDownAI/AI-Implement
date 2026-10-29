@@ -428,6 +428,21 @@ describe("late_review_pending outbox (AII-1362)", () => {
   });
 });
 
+describe("late_review_pending head upgrade (AII-1596)", () => {
+  const head = (k: string) => log.getPendingLateReviews(0).find((r) => r.workflowKey === k)?.headSha;
+
+  it("fills a headless row from a repeat record and keeps an existing head", () => {
+    log.recordPendingLateReview({ workflowKey: "h", dispatchId: "h", prUrl: "u" }, 100);
+    expect(head("h")).toBeNull();
+    log.recordPendingLateReview({ workflowKey: "h", dispatchId: "h", prUrl: "u", headSha: "a".repeat(40) }, 200);
+    expect(head("h")).toBe("a".repeat(40));
+    log.recordPendingLateReview({ workflowKey: "h", dispatchId: "h", prUrl: "u", headSha: "b".repeat(40) }, 300);
+    expect(head("h")).toBe("a".repeat(40));
+    log.recordPendingLateReview({ workflowKey: "h", dispatchId: "h", prUrl: "u" }, 400);
+    expect(head("h")).toBe("a".repeat(40));
+  });
+});
+
 describe("prune keeps recently finished rows (AII-1564)", () => {
   it("keeps a finished row younger than 7 days beyond 500 rows and prunes an older one", () => {
     const db = dedup.getDb();

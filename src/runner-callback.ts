@@ -16,6 +16,7 @@ import {
   clearPendingLateReview,
   recordLateReviewEnding,
   recordPendingLateReview,
+  setLateReviewHeadSha,
 } from "./log.js";
 import { redactStepCredentials } from "./pipeline/step-redaction.js";
 import type { Step } from "./pipeline/types.js";
@@ -1427,6 +1428,7 @@ export async function handleRunnerResult(
         const mapping = getMappings()[mappingTeamKey];
         const pushedHeadSha = input.body.externalReviewPending?.headSha;
         const namesHead = !!pushedHeadSha && !!mapping && resolveReviewFixLifecycle(mapping) === "restate";
+        if (namesHead) setLateReviewHeadSha(job.id, pushedHeadSha);
         try {
           await input.submitLateExternalReview({
             dispatchId: claims.dispatchId,
@@ -1876,7 +1878,7 @@ export async function resubmitPendingGapFillReviews(opts: {
     }
     console.log(`[late-review-sweep] re-submitting LateExternalReview dispatch=${job.dispatchId} pr=${job.prUrl}`);
     try {
-      await opts.submit({ dispatchId: job.dispatchId!, ...target, prUrl: job.prUrl!, gapFill: true, rowId: job.id });
+      await opts.submit({ dispatchId: job.dispatchId!, ...target, prUrl: job.prUrl!, gapFill: true, rowId: job.id, ...(job.lateReviewHeadSha ? { headSha: job.lateReviewHeadSha } : {}) });
       submitted++;
     } catch (err) {
       console.warn(`[late-review-sweep] submit failed dispatch=${job.dispatchId}:`, err);
