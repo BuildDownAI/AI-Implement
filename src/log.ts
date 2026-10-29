@@ -800,7 +800,7 @@ export interface PendingLateReview {
 }
 
 /**
- * Records a LateExternalReview submit that still needs to settle (AII-1362). Idempotent per workflow key.
+ * Records a LateExternalReview submit that still needs to settle (AII-1362). Idempotent per workflow key; a repeat only fills a head the existing row lacks, never replaces one.
  * The caller computes `workflowKey` with `lateExternalReviewWorkflowKey` (importing it here would be circular).
  */
 export function recordPendingLateReview(
@@ -809,7 +809,8 @@ export function recordPendingLateReview(
 ): void {
   getDb()
     .prepare(
-      "INSERT OR IGNORE INTO late_review_pending (workflow_key, dispatch_id, pr_url, head_sha, attempt_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      "INSERT INTO late_review_pending (workflow_key, dispatch_id, pr_url, head_sha, attempt_id, created_at) VALUES (?, ?, ?, ?, ?, ?) " +
+        "ON CONFLICT(workflow_key) DO UPDATE SET head_sha = excluded.head_sha WHERE late_review_pending.head_sha IS NULL AND excluded.head_sha IS NOT NULL",
     )
     .run(input.workflowKey, input.dispatchId, input.prUrl, input.headSha ?? null, input.attemptId ?? null, now);
 }
