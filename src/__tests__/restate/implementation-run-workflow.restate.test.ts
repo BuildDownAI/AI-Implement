@@ -702,5 +702,5 @@ describe("ImplementationRun durable workflow", () => {
     const env = slow.get(label);
     if (!env) throw new Error(`missing Restate variant ${label}`);
     return env;
-  });
+  }, { pending: { 6: "Result intake adoption is deferred (AII-1622)" } });
 });

@@ -39,10 +39,15 @@ and handler types that the typed clients use are in `src/restate/kg-refresh-type
 
 ### Lifecycle kit and contract suite
 
-| Module | Role | `PlanningRun` | `KgRefresh` |
+| Run kind | Lifecycle kit use | Contract suite | Result intake |
 |---|---|---|---|
-| `src/restate/owned-run-lifecycle.ts` | the kit: `reserveOwnedRun`, `readOwnedRunStatus`, `readBoundedOwnedRun`, `cleanupOwnedRun`, `reportOwnedRunOutcome` | all five | `readBoundedOwnedRun` only |
-| `src/__tests__/restate/owned-run-contract.ts` | the contract suite, `registerOwnedRunContract` | scenarios 1 to 5 | scenario 1 |
+| `PlanningRun` | reserve, status/bounded read, cleanup, outcome | scenarios 1–5; 6 pending | deferred |
+| `ImplementationRun` | reserve, status/bounded read, cleanup, outcome | scenarios 1–5; 6 pending | deferred |
+| `KgRefresh` | bounded read | scenario 1; 6 pending | deferred |
+| `ReviewFixAttempt` | status read | adapter deferred | deferred |
+| Test fixture | lifecycle and `acceptOwnedRunReport` (`record-usage`) | scenarios 1–6, every variant | exercised |
+
+The kit is `src/restate/owned-run-lifecycle.ts`; the shared suite is `src/__tests__/restate/owned-run-contract.ts`. Result intake has no production callers yet (ADR 036).
 
 ## 2. Feature matrix
 
