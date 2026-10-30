@@ -41,7 +41,7 @@ import { refreshAvailability, readStampedTarget, resolveDeployTarget, type SelfD
 import { clearDeployHold, getDeployStartedAt, isDeployHeld, setDeployHold } from "./deploy-hold.js";
 import { decideAvailabilityAction, getDeployPolicy, getLastActedCommit, setLastActedCommit } from "./deploy-policy.js";
 import { canSelfDeploy, createRestateDrainProbes, readKgSourceRepo, parseKgSourceRepo, runSelfDeployFlyctl } from "./deploy.js";
-import { createSelfDeploy, createSelfDeployIngressClient, publishedImageManifestHead } from "./restate/self-deploy.js";
+import { createSelfDeploy, createSelfDeployIngressClient, publishedImageManifestHead, type SelfDeployClient } from "./restate/self-deploy.js";
 import { getInFlightWork } from "./in-flight-work.js";
 import { remediateStuckJob } from "./stuck-watchdog.js";
 import { finalizeImplementation } from "./implementation-finalize.js";
@@ -4917,7 +4917,7 @@ function restateRegistrationStatusFor(outcome: RestateRegisterOutcome): RestateR
 export interface RestateEndpointWireDeps {
   startRestateEndpoint: () => Promise<unknown>;
   registerRestateEndpoint: () => Promise<RestateRegisterResult>;
-  /** Runs after a registration that took effect (never after `declined-conflict`); must not throw. */
+  /** Runs after any non-conflict registration outcome, including `unreachable`; must not throw. */
   onRegistered?: () => Promise<void>;
 }
 
@@ -4949,6 +4949,20 @@ export function createBootReconciliation(
       await run("onRegistered (after runner backend refresh)");
     },
   };
+}
+
+/** Recover legacy/crashed deploys only after this boot has successfully registered with Restate. */
+export async function releaseUnownedDeployHoldAtBoot(
+  client: Pick<SelfDeployClient, "status"> = selfDeployClient,
+): Promise<void> {
+  if (!isDeployHeld()) return;
+  try {
+    const { deploy } = await client.status();
+    if (deploy && ["draining", "applying", "verifying"].includes(deploy.phase)) return;
+    if (clearDeployHold()) console.log("[self-deploy] released an unowned deploy hold at boot");
+  } catch (err) {
+    console.error("[self-deploy] keeping deploy hold at boot: status could not be read:", err);
+  }
 }
 
 /** How often a declined registration retries (AII-721) — the old deployment's non-completed invocations are expected to drain on their own; this just keeps checking back. */
@@ -5079,7 +5093,7 @@ async function main(): Promise<void> {
   }
 
   // The deploy hold is deliberately not cleared here: a boot during a drain would re-open dispatch
-  // in the middle of a deploy. Only SelfDeploy releases it (docs/deployment.md).
+  // in the middle of a deploy. After registration we check SelfDeploy ownership (docs/deployment.md).
 
   // Start sidecar before loadConfig() so KG_SIDECAR_URL and KG_EMBEDDINGS_DEGRADED are
   // in process.env when loadConfig() reads them. Failure is non-fatal (logged, /mcp degraded).
@@ -5253,6 +5267,9 @@ async function main(): Promise<void> {
     startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, ...trackerExportServices, ...selfDeployServices], restateSidecar.identityKey),
     registerRestateEndpoint,
     onRegistered: async () => {
+      if (getRestateStatus().registration.state === "registered") {
+        await releaseUnownedDeployHoldAtBoot();
+      }
       sweepOnRegistered(config);
       await scrubOperatorLegacyTokens();
       await seedRunnerBackends();
