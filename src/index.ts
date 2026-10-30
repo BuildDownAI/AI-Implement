@@ -51,7 +51,7 @@ import { listParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFa
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getInstallationId, getAppSlug, getScopedInstallationToken } from "./github-app-auth.js";
 import { configureLinearAuth } from "./linear-app-auth.js";
-import { configureOAuthProviders, isOAuthConfigured, providersFromEnv } from "./oauth/providers.js";
+import { configureOAuthProviders, isOAuthConfigured, resolveProviders } from "./oauth/providers.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
 import { clearAccessBindingsViaObject } from "./restate/access-binding.js";
 import { allowlistHasNoAdmin, initAccessEntriesTable } from "./access-entries.js";
@@ -86,13 +86,14 @@ import { classifyFlyMachine, classifyLocalContainer, destroyMachineRecorded } fr
 import { getMachine, listMachines, generateSessionToken, generateMachineNonce, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
 import { isDurableRunnerMachine, safeDestroyMachine, sweepOrphanedMachines } from "./reaper.js";
 import type { ReaperHelpers } from "./reaper.js";
-import { seedKgMaterializeDirectFromEnv, seedKgExecutionModeFromEnv, getRunnerMode, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
+import { getRunnerMode, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
 import { handleGitHubWebhook, type KgPrCheckConfig } from "./webhook.js";
 import { initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
 import { resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
-import { getOrchestratorSettings, getRunnerBackendSource, getFlySessionsConfig, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, seedRunnerImageAllowedPrefixesFromEnv, getRetryPolicy, seedRunnerBackends, refreshRunnerBackendCache } from "./orchestrator-settings.js";
+import { getOrchestratorSettings, getRunnerBackendSource, getFlySessionsConfig, getRetryPolicy, seedRunnerBackends, refreshRunnerBackendCache } from "./orchestrator-settings.js";
+import { seedSettingsFromEnv } from "./seed-once-settings.js";
 import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, resubmitPendingGapFillReviews, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
@@ -182,7 +183,8 @@ import { setAdmissionTerminationCheck, setProviderRegistry, setReviewFixAttempts
 import { callTool, callToolAsSystem } from "./restate/tools-client.js";
 import { makeKgRefresh, migrateLegacyDryRunOutcomes, runKgRefreshPreflight, defaultFetchDefaultBranch, defaultFetchSnapshotCommitSha, defaultMaterialize, defaultMcpToolCall, defaultPersistLastRefresh, defaultLoadLastRefresh } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
-import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
+import { beginCycle, isCurrentCycle, getPollStats, parsePollIntervalMs, runWithDeadline } from "./poll-cycle.js";
+import { effectiveAccessCode, PLACEHOLDER_ACCESS_CODE } from "./admin-session.js";
 import { scrubOperatorLegacyTokens } from "./restate/operator-legacy-scrub.js";
 
 /**
@@ -250,18 +252,14 @@ function loadConfig(): AppConfig {
     return val;
   };
   
-  // Microsoft's tid-based "email verified" only holds for a single-tenant issuer
-  // so it's dropped as an OAuth provider if a multi-tenant env value is provided
-  let oauthProviders = providersFromEnv(process.env);
-  const msMultiTenant = oauthProviders.some((p) => p.id === "microsoft") &&
-    ["common", "organizations", "consumers"].includes((process.env.MICROSOFT_OAUTH_TENANT || "").toLowerCase());
-  if (msMultiTenant) {
-    oauthProviders = oauthProviders.filter((p) => p.id !== "microsoft");
-    console.warn("[main] MICROSOFT_OAUTH_TENANT is a multi-tenant value — Microsoft SSO disabled. Pin a specific tenant GUID (single-tenant).");
-  }
+  const { providers: oauthProviders, dropped: droppedProviders } = resolveProviders(process.env);
+  for (const { id, reason } of droppedProviders) console.warn(`[main] ${id} sign-in disabled: ${reason}`);
   
   // Resolved admin-auth posture — now that both access-code and SSO are known.
-  const adminAccessCode = process.env.ADMIN_ACCESS_CODE || null;
+  const adminAccessCode = effectiveAccessCode(process.env.ADMIN_ACCESS_CODE);
+  if (process.env.ADMIN_ACCESS_CODE === PLACEHOLDER_ACCESS_CODE) {
+    console.warn("[main] ADMIN_ACCESS_CODE is the published .env.example placeholder, so it is refused. Set a real code, or sign in with SSO.");
+  }
   const oauthConfigured = oauthProviders.length > 0; // derive from the list, not the not-yet-seeded singleton
   if (!adminAccessCode && !oauthConfigured) {
     console.warn("[main] admin UI disabled — set ADMIN_ACCESS_CODE and/or configure OAuth providers");
@@ -326,7 +324,7 @@ function loadConfig(): AppConfig {
     notifyType,
     adminAccessCode,
     oauthRedirectBaseUrl,
-    pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "60000", 10),
+    pollIntervalMs: parsePollIntervalMs(process.env.POLL_INTERVAL_MS),
     pollCycleTimeoutMs: Number(process.env.POLL_CYCLE_TIMEOUT_MS) || 10 * 60 * 1000,
     healthPort: parseInt(process.env.PORT || "8080", 10),
     get flySessionsToken() {
@@ -5036,11 +5034,7 @@ async function main(): Promise<void> {
   initDispatchBreakerTable();
   sweepOrphanedGapfillRows(); // AII-279: heal rows wedged before the AII-277 terminal hook existed
   initSettingsTable();
-  seedKgBaseRepoFromEnv(process.env.KG_BASE_REPO); // AII-633: seeds once, inert thereafter
-  seedKgMaterializeDirectFromEnv(process.env.KG_MATERIALIZE_DIRECT); // AII-1109: seeds once, inert thereafter
-  seedKgExecutionModeFromEnv(process.env.KG_EXECUTION_MODE); // seeds once, inert thereafter
-  seedLinearPickupLabelFromEnv(process.env.LINEAR_PICKUP_LABEL); // AII-694: seeds once, inert thereafter
-  seedRunnerImageAllowedPrefixesFromEnv(process.env.RUNNER_IMAGE_ALLOWED_PREFIXES); // AII-1321: seeds once, inert thereafter
+  seedSettingsFromEnv(); // SEED_ONCE_SETTINGS: each seeds once, inert thereafter (ADR 022)
   initAccessEntriesTable();
   initReconciliationTable();
   initStepLogTable();

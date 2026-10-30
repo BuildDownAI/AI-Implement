@@ -1,8 +1,13 @@
 import { getDb } from "./dedup.js";
 import type { FailureCategory } from "./pipeline/failure-classification.js";
 
+/** `DISPATCH_BREAKER_THRESHOLD` as the breaker reads it: 3 only when unset, so a blank value is 0 and turns the breaker off. */
+export function parseBreakerThreshold(raw: string | undefined): number {
+  return Number(raw ?? 3);
+}
+
 function threshold(): number {
-  return Number(process.env.DISPATCH_BREAKER_THRESHOLD ?? 3);
+  return parseBreakerThreshold(process.env.DISPATCH_BREAKER_THRESHOLD);
 }
 
 /**

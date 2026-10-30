@@ -11,9 +11,9 @@ const FLY_SESSIONS_APP_KEY = "fly_sessions_app";
 const FLY_SESSIONS_REGION_KEY = "fly_sessions_region";
 const RETRY_POLICY_KEY = "retry_policy";
 const KG_REFRESH_REPORT_ISSUE_KEY = "kg_refresh_report_issue";
-const KG_BASE_REPO_KEY = "kg_base_repo";
-const LINEAR_PICKUP_LABEL_KEY = "linear_pickup_label";
-const RUNNER_IMAGE_ALLOWED_PREFIXES_KEY = "runner_image_allowed_prefixes";
+export const KG_BASE_REPO_KEY = "kg_base_repo";
+export const LINEAR_PICKUP_LABEL_KEY = "linear_pickup_label";
+export const RUNNER_IMAGE_ALLOWED_PREFIXES_KEY = "runner_image_allowed_prefixes";
 
 /** Default Linear pickup label when no `linear_pickup_label` row exists (AII-694). */
 export const DEFAULT_LINEAR_PICKUP_LABEL = "AI-Implement";
@@ -196,17 +196,6 @@ export async function seedRunnerBackends(deps: RunnerBackendSeedDeps = {}): Prom
 }
 
 /**
- * Seeds `kgBaseRepo` from KG_BASE_REPO on first boot only (AII-633) — a no-op once the
- * DB already holds a value, so a later env removal or edit at /admin#settings is never
- * clobbered. Call once during startup.
- */
-export function seedKgBaseRepoFromEnv(envValue: string | null | undefined): void {
-  if (!envValue?.trim()) return;
-  if (getOrchestratorSettings().kgBaseRepo !== null) return;
-  setOrchestratorSetting("kgBaseRepo", envValue.trim());
-}
-
-/**
  * Effective Linear pickup label: the trimmed stored value when present and non-empty,
  * else DEFAULT_LINEAR_PICKUP_LABEL. Falls back to the default on any DB error (missing
  * table, etc.) so pickup never stops because the settings table is unreadable.
@@ -222,17 +211,6 @@ export function getLinearPickupLabel(): string {
   } catch {
     return DEFAULT_LINEAR_PICKUP_LABEL;
   }
-}
-
-/**
- * Seeds `linearPickupLabel` from LINEAR_PICKUP_LABEL on first boot only (AII-694) — a
- * no-op once the DB already holds a value, so a later env removal or edit at
- * /admin#settings is never clobbered. Call once during startup.
- */
-export function seedLinearPickupLabelFromEnv(envValue: string | null | undefined): void {
-  if (!envValue?.trim()) return;
-  if (getOrchestratorSettings().linearPickupLabel !== null) return;
-  setOrchestratorSetting("linearPickupLabel", envValue.trim());
 }
 
 /**
@@ -279,22 +257,6 @@ export function validateRunnerImagePrefixes(raw: unknown): { value: string | nul
     }
   }
   return { value: entries.length > 0 ? entries.join(",") : null };
-}
-
-/**
- * Seeds `runnerImageAllowedPrefixes` from RUNNER_IMAGE_ALLOWED_PREFIXES on first boot only
- * (AII-1321) — a no-op once the DB already holds a value. Call once during startup.
- */
-export function seedRunnerImageAllowedPrefixesFromEnv(envValue: string | null | undefined): void {
-  if (!envValue?.trim()) return;
-  if (getOrchestratorSettings().runnerImageAllowedPrefixes !== null) return;
-  const parsed = validateRunnerImagePrefixes(envValue);
-  if ("error" in parsed) {
-    console.warn(`[settings] RUNNER_IMAGE_ALLOWED_PREFIXES is invalid (${parsed.error}); not seeded`);
-    return;
-  }
-  if (parsed.value === null) return;
-  setOrchestratorSetting("runnerImageAllowedPrefixes", parsed.value);
 }
 
 export function setOrchestratorSetting(key: SettingKey, value: string | null): void {

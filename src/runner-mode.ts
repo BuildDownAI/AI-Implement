@@ -17,7 +17,7 @@ declare global {
 export const VALID_RUNNER_MODES = ["default", "gha", "fly", "local", "shadow"] as const;
 export type RunnerMode = typeof VALID_RUNNER_MODES[number];
 export const DEFAULT_RUNNER_MODE: RunnerMode = "default";
-const RUNNER_MODE_SETTING_KEY = "runner_mode";
+export const RUNNER_MODE_SETTING_KEY = "runner_mode";
 const FLY_SECRETS_MIN_VERSION_SETTING_KEY = "fly_secrets_min_version";
 
 /** Type guard for narrowing an arbitrary string to RunnerMode. */
@@ -39,30 +39,32 @@ export function initSettingsTable(): void {
   `);
 }
 
+/** A settings row, or null when it is absent or the database is unavailable. */
+function readSettingRowOrNull(key: string): string | null {
+  try {
+    const row = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(key) as { value: string } | undefined;
+    return row?.value ?? null;
+  } catch {
+    return null; // DB unavailable — fall through to the default
+  }
+}
+
 /**
- * Returns the effective runner mode.
+ * The effective runner mode from the variable and the stored row.
  * Priority: RUNNER_MODE env var > DB setting > default ("default").
  * The env var acts as a break-glass override when the DB is unavailable.
  */
+export function resolveRunnerMode(envValue: string | undefined, rowValue: string | null): RunnerModeStatus {
+  if (isRunnerMode(envValue)) return { mode: envValue, source: "env" };
+  if (isRunnerMode(rowValue)) return { mode: rowValue, source: "db" };
+  return { mode: DEFAULT_RUNNER_MODE, source: "default" };
+}
+
+/** The effective runner mode in this process. The row is read only when the variable does not decide it. */
 export function getRunnerMode(): RunnerModeStatus {
   const envMode = process.env.RUNNER_MODE;
-  if (isRunnerMode(envMode)) {
-    return { mode: envMode, source: "env" };
-  }
-
-  try {
-    const row = getDb()
-      .prepare("SELECT value FROM settings WHERE key = ?")
-      .get(RUNNER_MODE_SETTING_KEY) as { value: string } | undefined;
-
-    if (row && isRunnerMode(row.value)) {
-      return { mode: row.value, source: "db" };
-    }
-  } catch {
-    // DB unavailable — fall through to default
-  }
-
-  return { mode: DEFAULT_RUNNER_MODE, source: "default" };
+  if (isRunnerMode(envMode)) return resolveRunnerMode(envMode, null);
+  return resolveRunnerMode(envMode, readSettingRowOrNull(RUNNER_MODE_SETTING_KEY));
 }
 
 /**
@@ -188,7 +190,7 @@ export interface FlyProcessLevelSecretsStatus {
   source: "env" | "db" | "default";
 }
 
-const FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY = "fly_process_level_secrets";
+export const FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY = "fly_process_level_secrets";
 
 /**
  * Returns true/false for recognised values (true/1/yes or false/0/no, case-insensitive),
@@ -202,29 +204,22 @@ export function parseFlyProcessLevelSecretsEnv(val: string | undefined): boolean
 }
 
 /**
- * Returns the effective Fly process-level secrets setting.
+ * The effective Fly process-level secrets setting from the variable and the stored row.
  * Priority: FLY_PROCESS_LEVEL_SECRETS env var > DB setting > default (true).
  * An explicit false/0/no env value is treated as a set override, not a fall-through.
  */
-export function getFlyProcessLevelSecrets(): FlyProcessLevelSecretsStatus {
-  const envVal = parseFlyProcessLevelSecretsEnv(process.env.FLY_PROCESS_LEVEL_SECRETS);
-  if (envVal !== undefined) {
-    return { enabled: envVal, source: "env" };
-  }
-
-  try {
-    const row = getDb()
-      .prepare("SELECT value FROM settings WHERE key = ?")
-      .get(FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY) as { value: string } | undefined;
-
-    if (row) {
-      return { enabled: row.value === "true", source: "db" };
-    }
-  } catch {
-    // DB unavailable — fall through to default
-  }
-
+export function resolveFlyProcessLevelSecrets(envValue: string | undefined, rowValue: string | null): FlyProcessLevelSecretsStatus {
+  const envVal = parseFlyProcessLevelSecretsEnv(envValue);
+  if (envVal !== undefined) return { enabled: envVal, source: "env" };
+  if (rowValue !== null) return { enabled: rowValue === "true", source: "db" };
   return { enabled: true, source: "default" };
+}
+
+/** The effective setting in this process. The row is read only when the variable does not decide it. */
+export function getFlyProcessLevelSecrets(): FlyProcessLevelSecretsStatus {
+  const envValue = process.env.FLY_PROCESS_LEVEL_SECRETS;
+  if (parseFlyProcessLevelSecretsEnv(envValue) !== undefined) return resolveFlyProcessLevelSecrets(envValue, null);
+  return resolveFlyProcessLevelSecrets(envValue, readSettingRowOrNull(FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY));
 }
 
 /** Persists the Fly process-level secrets setting to the DB. Env var override is unaffected. */
@@ -239,7 +234,7 @@ export interface KgMaterializeDirectStatus {
   source: "db" | "default";
 }
 
-const KG_MATERIALIZE_DIRECT_SETTING_KEY = "kg_materialize_direct";
+export const KG_MATERIALIZE_DIRECT_SETTING_KEY = "kg_materialize_direct";
 
 /**
  * Returns true/false for an explicit non-blank value ("true" → true, anything else → false,
@@ -255,7 +250,7 @@ export function parseKgMaterializeDirectEnv(val: string | undefined): boolean | 
 /**
  * Returns the effective KG materialize-direct setting (AII-602).
  * Priority: DB setting > default (false / rdflib). KG_MATERIALIZE_DIRECT is only a
- * first-boot seed (see seedKgMaterializeDirectFromEnv) and is never read here.
+ * first-boot seed (see SEED_ONCE_SETTINGS in seed-once-settings.ts) and is never read here.
  */
 export function getKgMaterializeDirect(): KgMaterializeDirectStatus {
   try {
@@ -273,19 +268,6 @@ export function getKgMaterializeDirect(): KgMaterializeDirectStatus {
   return { enabled: false, source: "default" };
 }
 
-/**
- * Seeds the materialize-direct row from KG_MATERIALIZE_DIRECT on first boot only — a no-op
- * when the var is blank or a row already exists, so a later toggle is never clobbered.
- * Call once during startup, after initSettingsTable().
- */
-export function seedKgMaterializeDirectFromEnv(envValue: string | undefined): void {
-  const parsed = parseKgMaterializeDirectEnv(envValue);
-  if (parsed === undefined) return;
-  getDb()
-    .prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)")
-    .run(KG_MATERIALIZE_DIRECT_SETTING_KEY, String(parsed));
-}
-
 /** Persists the KG materialize-direct setting to the DB. */
 export function setKgMaterializeDirect(enabled: boolean): void {
   getDb()
@@ -300,7 +282,7 @@ export interface KgExecutionModeStatus {
   source: "db" | "default";
 }
 
-const KG_EXECUTION_MODE_SETTING_KEY = "kg_execution_mode";
+export const KG_EXECUTION_MODE_SETTING_KEY = "kg_execution_mode";
 
 /** Accepts only the two backends; blank or unknown is undefined so an empty `KG_EXECUTION_MODE=` seeds nothing. */
 export function parseKgExecutionModeEnv(val: string | undefined): KgExecutionBackend | undefined {
@@ -311,7 +293,7 @@ export function parseKgExecutionModeEnv(val: string | undefined): KgExecutionBac
 /**
  * The KG refresh backend chosen on the KG page. Priority: DB row > default. The default is
  * today's behaviour: Fly when it is configured (`flyConfigured`), else GitHub Actions.
- * KG_EXECUTION_MODE only seeds the row (see seedKgExecutionModeFromEnv).
+ * KG_EXECUTION_MODE only seeds the row (see SEED_ONCE_SETTINGS in seed-once-settings.ts).
  */
 export function getKgExecutionMode(flyConfigured = false): KgExecutionModeStatus {
   try {
@@ -324,15 +306,6 @@ export function getKgExecutionMode(flyConfigured = false): KgExecutionModeStatus
     // DB unavailable — fall through to default
   }
   return { mode: flyConfigured ? "fly-machines" : "github-actions", source: "default" };
-}
-
-/** Seeds the row from KG_EXECUTION_MODE on first boot only; inert once a row exists. */
-export function seedKgExecutionModeFromEnv(envValue: string | undefined): void {
-  const parsed = parseKgExecutionModeEnv(envValue);
-  if (parsed === undefined) return;
-  getDb()
-    .prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)")
-    .run(KG_EXECUTION_MODE_SETTING_KEY, parsed);
 }
 
 export function setKgExecutionMode(mode: KgExecutionBackend): void {

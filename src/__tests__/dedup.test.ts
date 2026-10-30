@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, onTestFinished, vi } from "vitest";
 import Database from "better-sqlite3";
 import type * as DedupModule from "../dedup.js";
 import { testDb } from "./helpers/test-db.js";
@@ -676,5 +676,30 @@ describe("getDispatchedRows", () => {
     const rows = dedup.getDispatchedRows();
     expect(rows.find((r) => r.issueId === "old-1")?.teamKey).toBeNull();
     expect(rows.find((r) => r.issueId === "new-1")?.teamKey).toBe("TEAM");
+  });
+});
+
+describe("getDatabasePath", () => {
+  it("reports the configured path when its directory can be created", () => {
+    expect(dedup.getDatabasePath()).toEqual({ path: dbPath, configured: dbPath, fellBack: false });
+  });
+
+  // The path resolves when dedup.ts is first imported, so each case mocks fs and imports a fresh copy.
+  it.each(["EACCES", "ENOENT", "EPERM", "EROFS"])("falls back to /tmp, and says so, when creating the directory fails with %s", async (code) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.doMock("fs", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("fs")>()),
+      mkdirSync: () => {
+        throw Object.assign(new Error(code), { code });
+      },
+    }));
+    onTestFinished(() => {
+      vi.doUnmock("fs");
+      warn.mockRestore();
+    });
+    vi.resetModules();
+    const fresh = await import("../dedup.js");
+    expect(fresh.getDatabasePath()).toEqual({ path: "/tmp/ai-implement.sqlite", configured: dbPath, fellBack: true });
+    expect(String(warn.mock.calls[0][0])).toContain(`(${code}), falling back to /tmp/ai-implement.sqlite`);
   });
 });
