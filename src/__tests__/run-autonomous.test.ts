@@ -4114,7 +4114,6 @@ describe("runAutonomousLocally", () => {
   });
 });
 
-
 describe("configured (opted-in) autonomous runs", () => {
   let workspaceDir: string;
   const snap = makeSnapshot();
@@ -4170,7 +4169,6 @@ describe("configured (opted-in) autonomous runs", () => {
       pipeline: l.pipeline, runner: l.runner,
       configured: {
         agentConfig: snap, modelAuthClient: localClient, localCredentialPort: { load: vi.fn() },
-        repositories: ["acme/app"], repoTrust: async () => ({ visibility: "private", trustedForSubscription: true }),
       },
     });
     expect(managed.exitCode).toBe(0);
@@ -4453,37 +4451,12 @@ describe("configured (opted-in) autonomous runs", () => {
     });
   }
 
-  it("local: rejects a public repository or an untrusted subscription workspace before work", async () => {
-    const client = fakeClient();
-    const injected = makeExecutor();
-    for (const trust of [
-      { visibility: "public", trustedForSubscription: true },
-      { visibility: "private", trustedForSubscription: false },
-    ] as const) {
-      const l = capture();
-      await expect(
-        runAutonomousLocally({
-          workspaceDir, issueIdentifier: "AII-1", issueTitle: "t", issueDescription: "d", llmExecutor: injected,
-          pipeline: l.pipeline, runner: l.runner,
-          configured: {
-            agentConfig: makeSnapshot("codex-subscription"), modelAuthClient: client, localCredentialPort: { load: vi.fn() },
-            repositories: ["acme/app"], repoTrust: async () => trust,
-          },
-        }),
-      ).rejects.toThrow(/repository_untrusted/);
-      expect(l.seen.ctx).toBeUndefined();
-    }
-    expect(injected.invoke).not.toHaveBeenCalled();
-    expect(client.checkout).not.toHaveBeenCalled();
-  });
-
   it("local: cleans up on setup-hook failure and on a thrown pipeline", async () => {
     writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nsetup: exit 3\n---\nDo it.\n");
     const client = fakeClient();
     const l = capture();
     const configured = {
       agentConfig: snap, modelAuthClient: client, localCredentialPort: { load: vi.fn() },
-      repositories: ["acme/app"], repoTrust: async () => ({ visibility: "private" as const, trustedForSubscription: true }),
     };
     const r = await runAutonomousLocally({ workspaceDir, issueIdentifier: "AII-1", issueTitle: "t", issueDescription: "d", pipeline: l.pipeline, runner: l.runner, configured });
     expect(r.terminationReason).toBe("setup_failed");

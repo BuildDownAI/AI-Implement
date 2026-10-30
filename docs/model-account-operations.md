@@ -1,5 +1,7 @@
 # Model account operations
 
+A ChatGPT plan profile works on public and private repositories. Claude subscription profiles are still refused for managed runs.
+
 Operator procedures for hosted model accounts. The command is `src/model-account-cli.ts`, run on the orchestrator
 machine as `node dist/model-account-cli.js <command> --profile <id>`.
 

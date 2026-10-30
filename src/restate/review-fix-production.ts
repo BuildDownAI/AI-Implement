@@ -67,7 +67,7 @@ export type ReviewFixAdmission = "admit" | "defer" | "configuration_error";
  * `resolution_failed` is deliberately not here: an unauthorized, disabled or missing profile surfaces as that code,
  * whereas `resolution_unavailable` is an operational fault (such as a locked database) reading the inputs. */
 const DEFERRED_READINESS_CODES: ReadonlySet<string> = new Set([
-  "delivery_unreadable", "repository_visibility_unknown", "credential_unavailable", "session_unavailable",
+  "delivery_unreadable", "credential_unavailable", "session_unavailable",
   "resolution_unavailable",
 ]);
 
@@ -116,7 +116,7 @@ async function decideAdmission(
   try {
     readiness = await inspectAgentReadiness({ dispatchId: `admission-readiness-${randomUUID()}`, projectKey: key,
       backend: "github-actions", workflowRepository: repository, workflowFile: mapping.workflowFile,
-      repositories: [repository] }, runtime.preparationDeps({ owner: mapping.owner, repo: mapping.repo, projectKey: key }));
+    }, runtime.preparationDeps({ owner: mapping.owner, repo: mapping.repo, projectKey: key }));
   } catch { return { verdict: "defer", reason: "readiness_unavailable" }; }
   if (readiness.status === "legacy") return { verdict: "configuration_error", reason: "no_stage_configuration" };
   if (readiness.status === "not-ready") {

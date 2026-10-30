@@ -40,7 +40,6 @@ let store: typeof StoreModule;
 let prep: typeof PrepModule;
 let config: typeof ConfigModule;
 let logs: string[];
-let repoReply: ReplyInit | "throw";
 let github: FakeFetch;
 
 function runtime() {
@@ -65,14 +64,7 @@ beforeEach(async () => {
   }));
   modules = (await testDb({ modules: MODULES })).modules;
   ({ dedup, mod, store, prep, config } = modules);
-  repoReply = { json: { visibility: "private" } };
-  const repo = () => {
-    if (repoReply === "throw") throw new Error(`network down ${TOKEN}`);
-    return repoReply;
-  };
   github = fakeFetch({
-    "GET /repos/acme/app": repo,
-    "GET /repos/acme/ready-repo": repo,
     "GET /repos/acme/override-repo/contents/.ai-implement/image.yml": githubFile("image: ghcr.io/acme/custom:1\n"),
     "GET /repos/acme/default-repo/contents/.ai-implement/image.yml": NOT_FOUND,
     "GET /repos/acme/ready-repo/contents/.ai-implement/image.yml": NOT_FOUND,
@@ -104,7 +96,7 @@ describe("checkRunnerCapability", () => {
   });
 });
 
-describe("getRepoTrust", () => {
+describe("workflow preparation", () => {
   const deps = () => runtime().preparationDeps({ owner: "acme", repo: "app", projectKey: "AII" });
 
   beforeEach(() => {
@@ -116,36 +108,6 @@ describe("getRepoTrust", () => {
       version: 1, mode: "configured",
       stages: { planning: stage("cdx", "codex", "openai"), implementation: stage("cdx", "codex", "openai"), review: stage("cdx", "codex", "openai") },
     });
-  });
-
-  it("trusts only a private repo of an opted-in project", async () => {
-    store.setProjectOptIn("AII", true);
-    expect(await deps().getRepoTrust("acme/app")).toEqual({ visibility: "private", trustedForSubscription: true });
-  });
-
-  it("never trusts public, internal or opted-out repos", async () => {
-    store.setProjectOptIn("AII", true);
-    for (const visibility of ["public", "internal"]) {
-      repoReply = { json: { visibility } };
-      expect(await deps().getRepoTrust("acme/app")).toEqual({ visibility, trustedForSubscription: false });
-    }
-    store.setProjectOptIn("AII", false);
-    repoReply = { json: { visibility: "private" } };
-    expect(await deps().getRepoTrust("acme/app")).toEqual({ visibility: "private", trustedForSubscription: false });
-  });
-
-  it("throws on a failed fetch, bad status, missing visibility or malformed repo", async () => {
-    store.setProjectOptIn("AII", true);
-    repoReply = "throw";
-    await expect(deps().getRepoTrust("acme/app")).rejects.toThrow(/fetch failed/);
-    await deps().getRepoTrust("acme/app").catch((e: Error) => expect(e.message).not.toContain(TOKEN));
-    repoReply = NOT_FOUND;
-    await expect(deps().getRepoTrust("acme/app")).rejects.toThrow(/HTTP 404/);
-    repoReply = { json: {} };
-    await expect(deps().getRepoTrust("acme/app")).rejects.toThrow(/visibility/);
-    repoReply = { json: { visibility: "weird" } };
-    await expect(deps().getRepoTrust("acme/app")).rejects.toThrow(/visibility/);
-    await expect(deps().getRepoTrust("not-a-repo")).rejects.toThrow(/malformed/);
   });
 
   describe("readDefaultBranchWorkflows (AII-1420)", () => {
@@ -190,7 +152,7 @@ describe("getRepoTrust", () => {
       // No credential is stored, so a run that clears the capability check stops at "authentication-required".
       const prepare = () =>
         prep.prepareAgentRun(
-          { dispatchId: `d-${Math.random()}`, projectKey: "AII", backend: "github-actions", workflowRepository: "acme/app", workflowFile: "claude-implement.yml", repositories: ["acme/app"] },
+          { dispatchId: `d-${Math.random()}`, projectKey: "AII", backend: "github-actions", workflowRepository: "acme/app", workflowFile: "claude-implement.yml" },
           runtime().preparationDeps({ owner: "acme", repo: "app", projectKey: "AII" }),
         );
 
@@ -262,7 +224,7 @@ describe("getRepoTrust", () => {
       await expect(deps().readDefaultBranchWorkflows("acme/app", [WF])).rejects.toThrow();
       files[WF] = githubError(403, "Resource not accessible by integration");
       const result = await prep.prepareAgentRun(
-        { dispatchId: "d-unreadable", projectKey: "AII", backend: "github-actions", workflowRepository: "acme/app", workflowFile: "claude-implement.yml", repositories: ["acme/app"] },
+        { dispatchId: "d-unreadable", projectKey: "AII", backend: "github-actions", workflowRepository: "acme/app", workflowFile: "claude-implement.yml" },
         runtime().preparationDeps({ owner: "acme", repo: "app", projectKey: "AII" }),
       ).catch((e: Error) => ({ status: "threw", message: e.message }));
       expect(JSON.stringify(result)).not.toContain(TOKEN);
@@ -316,7 +278,7 @@ describe("credentials and session store", () => {
 describe("prepareAgentRun with the runtime deps", () => {
   const request = (): PrepModule.AgentRunRequest => ({
     dispatchId: "d1", projectKey: "AII", backend: "fly-machines", workflowRepository: "acme/ready-repo",
-    workflowFile: "claude-implement.yml", repositories: ["acme/ready-repo"],
+    workflowFile: "claude-implement.yml",
   });
 
   function useStages(profile: string, agent: "claude" | "codex", provider: "anthropic" | "openai") {

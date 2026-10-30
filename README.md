@@ -136,9 +136,7 @@ model behavior remains available.
 API profiles use `openai-api-key` or `anthropic-api-key` and an absolute
 `credentialPath`. Subscription profiles use `codex-subscription` or
 `claude-subscription`, an absolute `sessionPath`, `sessionSource: "local-login"`
-and `trustedPrivateTesting: true`. Subscription runs also require `gh repo view <owner/repo> --json visibility`
-to independently verify a private or internal GitHub repository. Authenticate the
-host GitHub CLI first; the configuration flag alone does not establish trust.
+and `trustedPrivateTesting: true`.
 Use a dedicated independently signed-in testing profile. A failed or cancelled
 run retains ownership when refreshed state or container termination cannot be
 confirmed; do not delete its lock to start a competing run.

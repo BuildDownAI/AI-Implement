@@ -33,7 +33,6 @@ const API_SENTINEL = "sk-synthetic-api-SENTINEL-0001";
 const SESSION_SENTINEL = "synthetic-session-SENTINEL-0002";
 const OPERATOR = { synthetic: "operator" };
 const REPO = "acme/app";
-const KG_REPO = "acme/knowledge";
 const WORKFLOW = `# ${"ai-implement-capability: stage-agent-config-v1"}\n# ${"ai-implement-capability: stage-agent-launch-context-v1"}\nname: implement\n`;
 
 const MODULES = {
@@ -53,12 +52,9 @@ let own: typeof OwnershipModule;
 let sessions: SessionModule.ModelSessionStore;
 let ownership: OwnershipModule.ModelSessionOwnership;
 let deps: PrepModule.AgentRunPreparationDeps;
-let trust: Record<string, PrepModule.RepoTrust | "throw">;
 let files: Record<string, string | null> | "throw";
 let secrets: Map<string, string | { region: string; accessKeyId: string; secretAccessKey: string }>;
 let secretReads: string[];
-
-const PRIVATE: PrepModule.RepoTrust = { visibility: "private", trustedForSubscription: true };
 
 function stage(profile: string, agent: "claude" | "codex", provider: "anthropic" | "openai") {
   return { agent, provider, model: "m", accountProfileId: profile, invocationTimeoutMs: 60_000 };
@@ -115,7 +111,7 @@ function seedSession(profileId: string) {
 function request(over: Partial<PrepModule.AgentRunRequest> = {}): PrepModule.AgentRunRequest {
   return {
     dispatchId: "d1", projectKey: "AII", backend: "github-actions", workflowRepository: REPO,
-    workflowFile: "claude-implement.yml", repositories: [REPO], ...over,
+    workflowFile: "claude-implement.yml", ...over,
   };
 }
 
@@ -150,7 +146,6 @@ beforeEach(async () => {
   // A stored ChatGPT plan record, so the real resolver proves the `cdx` profile.
   const seeded = sessions.writePlanRecord({ profileId: "cdx", expectedSequence: null, sessionData: serializeChatGptPlanRecord(makeChatGptPlanRecord()) });
   if (!seeded.ok) throw new Error("plan record seed failed");
-  trust = { [REPO]: PRIVATE, [KG_REPO]: PRIVATE };
   files = {
     ".github/workflows/claude-implement.yml": WORKFLOW,
     ".github/workflows/comment-trigger.yml": null,
@@ -166,11 +161,6 @@ beforeEach(async () => {
         return ownership.reserve(input);
       },
     } as typeof ownership,
-    getRepoTrust: async (repo) => {
-      const t = trust[repo];
-      if (t === "throw") throw new Error("boom");
-      return t ?? { visibility: "unknown", trustedForSubscription: false };
-    },
     readDefaultBranchWorkflows: async () => {
       if (files === "throw") throw new Error("boom");
       return files;
@@ -244,7 +234,7 @@ describe("ready", () => {
       version: 1, mode: "configured",
       stages: { planning: stage("api", "claude", "anthropic"), implementation: stage("api", "claude", "anthropic"), review: stage("api", "claude", "anthropic") },
     });
-    const r = ready(await prep.prepareAgentRun(request({ repositories: [REPO] }), deps));
+    const r = ready(await prep.prepareAgentRun(request(), deps));
     expect(r.reservations).toEqual([]);
     expect(rows("model_profile_reservations").filter((x) => x.dispatch_id === "d1")).toHaveLength(0);
   });
@@ -397,39 +387,6 @@ describe("queueing and recovery", () => {
     ready(await prep.prepareAgentRun(request(), deps));
     dedup.getDb().prepare("UPDATE model_credential_grants SET revoked_at = 1").run();
     expect(await prep.prepareAgentRun(request(), deps)).toMatchObject({ status: "recovery-required", code: "grant_revoked" });
-  });
-});
-
-describe("trust", () => {
-  it.each([
-    ["public", { visibility: "public", trustedForSubscription: true } as PrepModule.RepoTrust, "repository_public"],
-    ["unknown", { visibility: "unknown", trustedForSubscription: true } as PrepModule.RepoTrust, "repository_visibility_unknown"],
-    ["untrusted private", { visibility: "private", trustedForSubscription: false } as PrepModule.RepoTrust, "repository_not_trusted"],
-    ["lookup failure", "throw" as const, "repository_visibility_unknown"],
-  ])("fails a subscription target that is %s before any reservation", async (_name, value, code) => {
-    trust[REPO] = value;
-    expect(await prep.prepareAgentRun(request(), deps)).toEqual({ status: "configuration-error", code });
-    expect(counts().reservations).toBe(2); // only the seeding rows
-    expect(rows("model_credential_grants")).toHaveLength(0);
-  });
-
-  it("fails when only the KG source repo is public while the mapping is private", async () => {
-    trust[KG_REPO] = { visibility: "public", trustedForSubscription: true };
-    const r = await prep.prepareAgentRun(request({ repositories: [REPO, KG_REPO] }), deps);
-    expect(r).toEqual({ status: "configuration-error", code: "repository_public" });
-  });
-
-  it("requires at least one executed repository for subscriptions", async () => {
-    expect(await prep.prepareAgentRun(request({ repositories: [] }), deps)).toEqual({ status: "configuration-error", code: "no_repositories" });
-  });
-
-  it("does not apply to API-key targets", async () => {
-    store.setOrchestratorDefaults({
-      version: 1, mode: "configured",
-      stages: { planning: stage("api", "claude", "anthropic"), implementation: stage("api", "claude", "anthropic"), review: stage("api", "claude", "anthropic") },
-    });
-    trust[REPO] = { visibility: "public", trustedForSubscription: false };
-    expect(ready(await prep.prepareAgentRun(request(), deps)).reservations).toEqual([]);
   });
 });
 
@@ -685,15 +642,23 @@ describe("inspectAgentReadiness", () => {
     expect(secretReads).toEqual([]);
   });
 
+  it("reports ready for every stage on a Codex subscription on a public repository", async () => {
+    store.setOrchestratorDefaults({
+      version: 1, mode: "configured",
+      stages: { planning: stage("cdx", "codex", "openai"), implementation: stage("cdx", "codex", "openai"), review: stage("cdx", "codex", "openai") },
+    });
+    const before = counts();
+    expect(await prep.inspectAgentReadiness(request({ workflowRepository: "BuildDownAI/AI-Implement" }), deps)).toMatchObject({ status: "ready" });
+    expect(counts()).toEqual(before);
+    expect(secretReads).toEqual([]);
+  });
+
   it("reports legacy, and fails closed on unknown readiness", async () => {
     expect(await prep.inspectAgentReadiness(request({ projectKey: "OTHER" }), deps)).toEqual({ status: "legacy" });
     files = "throw";
     expect(await prep.inspectAgentReadiness(request(), deps)).toEqual({ status: "not-ready", code: "delivery_unreadable" });
     files = { ".github/workflows/claude-implement.yml": WORKFLOW, ".github/workflows/comment-trigger.yml": "x", ".github/workflows/claude-kg-refresh.yml": null };
     expect(await prep.inspectAgentReadiness(request(), deps)).toEqual({ status: "not-ready", code: "retired_workflow_present" });
-    trust[REPO] = "throw";
-    files = { ".github/workflows/claude-implement.yml": WORKFLOW, ".github/workflows/comment-trigger.yml": null, ".github/workflows/claude-kg-refresh.yml": null };
-    expect(await prep.inspectAgentReadiness(request(), deps)).toEqual({ status: "not-ready", code: "repository_visibility_unknown" });
     expect(counts().snapshots).toBe(0);
     expect(counts().grants).toBe(0);
   });
@@ -753,17 +718,6 @@ describe("codex-subscription is not reserved", () => {
     expect(ready(await prep.prepareAgentRun(request(), deps)).reused).toBe(true);
   });
 
-  it.each([
-    ["public", { visibility: "public", trustedForSubscription: true } as PrepModule.RepoTrust, "repository_public"],
-    ["unknown", { visibility: "unknown", trustedForSubscription: true } as PrepModule.RepoTrust, "repository_visibility_unknown"],
-    ["untrusted private", { visibility: "private", trustedForSubscription: false } as PrepModule.RepoTrust, "repository_not_trusted"],
-  ])("still fails the trust check on a %s repository", async (_n, value, code) => {
-    useStages(API, CODEX);
-    trust[REPO] = value;
-    expect(await prep.prepareAgentRun(request(), deps)).toEqual({ status: "configuration-error", code });
-    expect(rows("model_credential_grants")).toHaveLength(0);
-  });
-
   it("fails a codex credential proof as session_unavailable before reserving anything", async () => {
     useStages(API, CODEX);
     dedup.getDb().prepare("DELETE FROM model_session_generations WHERE profile_id = 'cdx'").run();
@@ -798,20 +752,14 @@ describe("codex-subscription is not reserved", () => {
 
 describe("auth mode state table", () => {
   const cases = [
-    { name: "claude-subscription", profile: ["sub", "claude", "anthropic"], trust: true, reserved: true },
-    { name: "codex-subscription", profile: ["cdx", "codex", "openai"], trust: true, reserved: false },
-    { name: "API key", profile: ["api", "claude", "anthropic"], trust: false, reserved: false },
-    { name: "bedrock", profile: ["brk", "claude", "bedrock"], trust: false, reserved: false },
+    { name: "claude-subscription", profile: ["sub", "claude", "anthropic"], reserved: true },
+    { name: "codex-subscription", profile: ["cdx", "codex", "openai"], reserved: false },
+    { name: "API key", profile: ["api", "claude", "anthropic"], reserved: false },
+    { name: "bedrock", profile: ["brk", "claude", "bedrock"], reserved: false },
   ] as const;
 
   it.each(cases)("$name", async (c) => {
     useStages(["api", "claude", "anthropic"], c.profile as never);
-    // Trust check applies only to plan-based credentials.
-    trust[REPO] = { visibility: "private", trustedForSubscription: false };
-    const untrusted = await prep.prepareAgentRun(request(), deps);
-    if (c.trust) expect(untrusted).toEqual({ status: "configuration-error", code: "repository_not_trusted" });
-    else expect(untrusted.status).toBe("ready");
-    trust[REPO] = PRIVATE;
     events.length = 0;
     const r = ready(await prep.prepareAgentRun(request({ dispatchId: "d9" }), deps));
     // Proof timing: the profile's credential is proven after reserve for Claude plans, before it otherwise.

@@ -4392,7 +4392,6 @@ async function optInRefusal(projectKey: string, candidate: StageAgentConfigurati
           backend,
           workflowRepository: `${mapping.owner}/${mapping.repo}`,
           workflowFile: mapping.workflowFile,
-          repositories: [`${mapping.owner}/${mapping.repo}`],
         },
         candidate,
       );

@@ -104,7 +104,6 @@ beforeEach(async () => {
       const d: PrepModule.AgentRunPreparationDeps = {
         ownership,
         credentials,
-        getRepoTrust: async () => ({ visibility: "private", trustedForSubscription: true }),
         readDefaultBranchWorkflows: async () => ({}),
         checkRunnerCapability: async () => true,
       };
@@ -204,7 +203,7 @@ describe("prepareManagedDispatch", () => {
   it.each([
     [{ status: "legacy" }, { kind: "legacy" }],
     [{ status: "queued", dispatchId: "d1", busyProfiles: ["sub"] }, { kind: "leave-queued", code: "profile_busy" }],
-    [{ status: "configuration-error", code: "repository_public" }, { kind: "refuse", category: "configuration-error", code: "repository_public" }],
+    [{ status: "configuration-error", code: "snapshot_invalid" }, { kind: "refuse", category: "configuration-error", code: "snapshot_invalid" }],
     [{ status: "authentication-required", code: "credential_unavailable", stage: "implementation", profileId: "p" }, { kind: "refuse", category: "authentication-required", code: "credential_unavailable" }],
     [{ status: "configuration-error", code: "resolution_unavailable" }, { kind: "hold", code: "resolution_unavailable" }],
     [{ status: "recovery-required", code: "grant_expired" }, { kind: "hold", code: "grant_expired" }],
@@ -272,12 +271,11 @@ describe("prepareManagedDispatch", () => {
 const CAPABLE = "name: Implement\n# ai-implement-capability: stage-agent-config-v1\n# ai-implement-capability: stage-agent-launch-context-v1\n";
 const WORKFLOW = ".github/workflows/claude-implement.yml";
 
-function gha(files: Record<string, string | null> | (() => Promise<Record<string, string | null>>), trust?: { visibility: "public" | "private"; trustedForSubscription: boolean }) {
-  const spies = { reads: 0, secrets: 0, trust: 0 };
+function gha(files: Record<string, string | null> | (() => Promise<Record<string, string | null>>)) {
+  const spies = { reads: 0, secrets: 0 };
   prepDepsOverride = (d) => ({
     ...d,
     credentials: { ...d.credentials, resolveProtectedSecret: (...a: Parameters<typeof d.credentials.resolveProtectedSecret>) => { spies.secrets++; return d.credentials.resolveProtectedSecret(...a); } },
-    getRepoTrust: async (...a) => { spies.trust++; return trust ?? (await d.getRepoTrust(...a)); },
     readDefaultBranchWorkflows: async () => {
       spies.reads++;
       return typeof files === "function" ? files() : files;
@@ -373,17 +371,6 @@ describe("prepareManagedDispatch on github-actions (AII-1420)", () => {
     const d = await adapter.prepareManagedDispatch(ghaReq(), runtime);
     expect(d).toEqual({ kind: "refuse", category: "configuration-error", code: "resolution_failed" });
     expect(d).not.toEqual({ kind: "legacy" });
-    noRunner();
-  });
-
-  it("refuses a subscription profile on a public repository before any credential is resolved or reserved", async () => {
-    const spies = gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED }, { visibility: "public", trustedForSubscription: false });
-    const reserve = vi.spyOn(ownership, "reserve");
-    const d = await adapter.prepareManagedDispatch(ghaReq(), runtime);
-    expect(d).toEqual({ kind: "refuse", category: "configuration-error", code: "repository_public" });
-    expect(spies.secrets).toBe(0);
-    expect(spies.reads).toBe(0);
-    expect(reserve).not.toHaveBeenCalled();
     noRunner();
   });
 
