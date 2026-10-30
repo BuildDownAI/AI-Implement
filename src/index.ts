@@ -4917,7 +4917,7 @@ function restateRegistrationStatusFor(outcome: RestateRegisterOutcome): RestateR
 export interface RestateEndpointWireDeps {
   startRestateEndpoint: () => Promise<unknown>;
   registerRestateEndpoint: () => Promise<RestateRegisterResult>;
-  /** Runs after a registration that took effect (never after `declined-conflict`); must not throw. */
+  /** Runs after any non-conflict registration outcome, including `unreachable`; must not throw. */
   onRegistered?: () => Promise<void>;
 }
 
@@ -5018,9 +5018,7 @@ export function createRestateRegistrationGate(
         }
       } else {
         clearRetry();
-        if (result.outcome === "registered-no-force" || result.outcome === "registered-drained-force") {
-          await deps.onRegistered?.();
-        }
+        await deps.onRegistered?.();
       }
     } catch (err) {
       if (isShuttingDown()) return;
@@ -5269,7 +5267,9 @@ async function main(): Promise<void> {
     startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, ...trackerExportServices, ...selfDeployServices], restateSidecar.identityKey),
     registerRestateEndpoint,
     onRegistered: async () => {
-      await releaseUnownedDeployHoldAtBoot();
+      if (getRestateStatus().registration.state === "registered") {
+        await releaseUnownedDeployHoldAtBoot();
+      }
       sweepOnRegistered(config);
       await scrubOperatorLegacyTokens();
       await seedRunnerBackends();

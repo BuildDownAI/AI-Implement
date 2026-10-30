@@ -1,4 +1,5 @@
 import { createRestateRegistrationGate, releaseUnownedDeployHoldAtBoot } from "../../index.js";
+import { getRestateStatus } from "../../restate/status.js";
 import { clearDeployHold, getDeployStartedAt, isDeployHeld, setDeployHold } from "../../deploy-hold.js";
 import { initSettingsTable } from "../../runner-mode.js";
 import { callToolAsSystem } from "../../restate/tools-client.js";
@@ -77,11 +78,23 @@ describe("SelfDeploy durable phase machine", () => {
       expect(isDeployHeld()).toBe(true);
       expect(error.mock.calls.flat().join(" ")).toContain("status unavailable");
       for (const outcome of ["unreachable", "declined-conflict"] as const) {
-        const onRegistered = vi.fn(async () => { await releaseUnownedDeployHoldAtBoot({ status }); });
+        const otherBootSteps = vi.fn(async () => {});
+        const onRegistered = vi.fn(async () => {
+          if (getRestateStatus().registration.state === "registered") {
+            await releaseUnownedDeployHoldAtBoot({ status });
+          }
+          await otherBootSteps();
+        });
         const registration = createRestateRegistrationGate(() => false, {
           startRestateEndpoint: async () => {}, registerRestateEndpoint: async () => ({ outcome }), onRegistered,
         });
-        try { await registration.attempt(); expect(onRegistered).not.toHaveBeenCalled(); }
+        try {
+          status.mockClear();
+          await registration.attempt();
+          expect(onRegistered).toHaveBeenCalledTimes(outcome === "unreachable" ? 1 : 0);
+          expect(otherBootSteps).toHaveBeenCalledTimes(outcome === "unreachable" ? 1 : 0);
+          expect(status).not.toHaveBeenCalled();
+        }
         finally { registration.stopRetrying(); }
         expect(isDeployHeld()).toBe(true);
       }
