@@ -105,7 +105,7 @@ const DRAIN_TIMEOUT_MS = 75 * 60 * 1000;
 
 /** Restate invocation state is independent of dispatch_log and reservations. All
  * four probes must prove zero before a replacement can begin. */
-export function createRestateDrainProbes(): RestateDrainProbes {
+export function createRestateDrainProbes(excludeInvocationId?: string): RestateDrainProbes {
   const { host, port } = restateBindAddress();
   const endpointUri = `http://${host}:${port}`;
   const count = (sql: string): number => {
@@ -113,7 +113,7 @@ export function createRestateDrainProbes(): RestateDrainProbes {
     return row.n;
   };
   return {
-    oldDeploymentInvocations: () => queryNonCompletedInvocations(fetch, RESTATE_ADMIN_BASE_URL, endpointUri),
+    oldDeploymentInvocations: () => queryNonCompletedInvocations(fetch, RESTATE_ADMIN_BASE_URL, endpointUri, excludeInvocationId),
     unresolvedLaunches: async () => count(`SELECT COUNT(*) AS n FROM review_fix_attempts a
       JOIN dispatch_admissions d ON d.dispatch_id = a.dispatch_id
       WHERE d.released_at IS NULL AND a.state = 'launch_intent' AND a.github_run_id IS NULL`),
