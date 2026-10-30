@@ -16,6 +16,12 @@ import { testDb } from "./helpers/test-db.js";
 import { recordExchange, checkExchange, type Exchange } from "./contract-recorder.js";
 import { seedBoundary } from "./helpers/job-accounting-boundary.js";
 
+type FixtureExchange = {
+  request: Exchange["request"]["body"];
+  status: number;
+  response: Exchange["response"]["body"];
+};
+
 const DIR = new URL("../../docs/contracts/list_job_accounting/", import.meta.url);
 const T = 1_700_000_000_000; // every stored time is an offset from here; all are long settled
 const SHA_1 = "1".repeat(40);
@@ -43,9 +49,9 @@ beforeEach(async () => {
 
 /** The page inside a successful exchange; the body is compact JSON, so re-serialising the parse gives the text back. */
 function pageOf(recorded: Exchange): any {
-  expect(recorded.status).toBe(200);
-  expect(recorded.response.isError).toBeFalsy();
-  const text = recorded.response.content[0].text;
+  expect(recorded.response.status).toBe(200);
+  expect(recorded.response.body.isError).toBeFalsy();
+  const text = recorded.response.body.content[0].text;
   const page = JSON.parse(text);
   expect(text).toBe(JSON.stringify(page));
   return page;
@@ -104,6 +110,7 @@ describe("recorded list_job_accounting exchanges", () => {
   it("first-page", async () => {
     seedThree();
     const recorded = await recordExchange("list_job_accounting", { args: { pageSize: 2 } });
+    expect(recorded.request).toEqual({ method: "POST", path: "/api/tools/list_job_accounting", body: { args: { pageSize: 2 } } });
     expect(pageOf(recorded).nextCursor).not.toBeNull();
     checkExchange("list_job_accounting", "first-page", recorded);
   });
@@ -172,8 +179,8 @@ describe("recorded list_job_accounting exchanges", () => {
 
   it("invalid-args", async () => {
     const recorded = await recordExchange("list_job_accounting", { args: { includeUnsettled: "yes" } });
-    expect(recorded.response.isError).toBe(true);
-    expect(recorded.response.content[0].text).toContain("400");
+    expect(recorded.response.body.isError).toBe(true);
+    expect(recorded.response.body.content[0].text).toContain("400");
     checkExchange("list_job_accounting", "invalid-args", recorded);
   });
 });
@@ -264,8 +271,8 @@ describe("list_job_accounting strict arguments", () => {
 
   it("answers an unknown argument with the same isError as invalid-args", async () => {
     const recorded = await recordExchange("list_job_accounting", { args: { pageSize: 5, foo: 1 } });
-    expect(recorded.response.isError).toBe(true);
-    expect(recorded.response.content[0].text).toContain("400");
+    expect(recorded.response.body.isError).toBe(true);
+    expect(recorded.response.body.content[0].text).toContain("400");
   });
 });
 
@@ -321,7 +328,7 @@ describe("list_job_accounting record.schema.json", () => {
     const scenarios = ["first-page", "next-page", "short-page", "empty", "changed-again", "partial-usage", "pruned", "final-pull"];
     let seen = 0;
     for (const scenario of scenarios) {
-      const recorded = JSON.parse(readFileSync(new URL(`${scenario}.json`, DIR), "utf8")) as Exchange;
+      const recorded = JSON.parse(readFileSync(new URL(`${scenario}.json`, DIR), "utf8")) as FixtureExchange;
       for (const record of JSON.parse(recorded.response.content[0].text).records) {
         expect(validate(schema, record), `${scenario} ${record.dispatchId}`).toBe(true);
         seen++;
@@ -332,7 +339,7 @@ describe("list_job_accounting record.schema.json", () => {
 
   it("rejects text over the cap, too many invocations and unknown keys", () => {
     const schema = load();
-    const recorded = JSON.parse(readFileSync(new URL("first-page.json", DIR), "utf8")) as Exchange;
+    const recorded = JSON.parse(readFileSync(new URL("first-page.json", DIR), "utf8")) as FixtureExchange;
     const record = JSON.parse(recorded.response.content[0].text).records[0];
     expect(validate(schema, record)).toBe(true);
     const long = "x".repeat(RECORD_TEXT_MAX + 1);
@@ -422,13 +429,13 @@ describe("list_job_accounting record.schema.json", () => {
 
 // Recorder coverage uses another registered tool without publishing additional contracts.
 describe("shared contract recorder", () => {
-  it("refuses missing or changed fixtures unless the update value is exactly 1", () => {
-    const recorded = JSON.parse(readFileSync(new URL("empty.json", DIR), "utf8")) as Exchange;
+  it("refuses missing or changed fixtures unless the update value is exactly 1", async () => {
+    const recorded = await recordExchange("list_job_accounting", { args: {} });
     for (const value of ["", "0", "true"]) {
       vi.stubEnv("UPDATE_CONTRACT_FIXTURES", value);
       expect(() => checkExchange("list_job_accounting", "empty", recorded)).not.toThrow();
       expect(() => checkExchange("list_job_accounting", "missing-recorder-scenario", recorded)).toThrow("is missing");
-      expect(() => checkExchange("list_job_accounting", "empty", { ...recorded, status: 418 })).toThrow("differs");
+      expect(() => checkExchange("list_job_accounting", "empty", { ...recorded, response: { ...recorded.response, status: 418 } })).toThrow("differs");
     }
   });
 
@@ -440,9 +447,10 @@ describe("shared contract recorder", () => {
     const first = await recordExchange("get_runner_mode", { args: {} });
     const explicit = await recordExchange("get_runner_mode", { args: {} }, { scope: "orchestrator:read" });
     expect(first).toEqual(explicit);
-    expect(first.status).toBe(200);
-    expect(first.response.isError).toBeFalsy();
-    expect(JSON.parse(first.response.content[0].text)).toHaveProperty("mode");
+    expect(first.request).toEqual({ method: "POST", path: "/api/tools/get_runner_mode", body: { args: {} } });
+    expect(first.response.status).toBe(200);
+    expect(first.response.body.isError).toBeFalsy();
+    expect(JSON.parse(first.response.body.content[0].text)).toHaveProperty("mode");
     await recordExchange("get_runner_mode", { args: {} }, { scope: "orchestrator:read custom:scope" });
     const claims = verify.mock.calls.map(([authorization]) => decodeJwt(authorization!.slice("Bearer ".length)));
     expect(claims).toHaveLength(3);

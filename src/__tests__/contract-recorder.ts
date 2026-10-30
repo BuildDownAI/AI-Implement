@@ -12,9 +12,11 @@ const ISSUER = "https://cp.builddown.test";
 const BASE_URL = "https://orch-a.example.com";
 
 export interface Exchange {
-  request: { args: Record<string, unknown> };
-  status: number;
-  response: { content: Array<{ type: string; text: string }>; isError?: boolean };
+  request: { method: string; path: string; body: { args: Record<string, unknown> } };
+  response: {
+    status: number;
+    body: { content: Array<{ type: string; text: string }>; isError?: boolean };
+  };
 }
 
 class MockRequest extends EventEmitter {
@@ -123,13 +125,19 @@ export async function recordExchange(tool: string, body: { args: Record<string, 
   const registry = { forMapping: async () => null, forAllMappings: async () => [], invalidate: () => {} };
   admin.handleAdminRequest(req as never, res as never, config as never, registry as never, deps);
   await res.done;
-  return { request: body, status: res.statusCode, response: JSON.parse(res.body) };
+  return {
+    request: { method: req.method, path: req.url, body },
+    response: { status: res.statusCode, body: JSON.parse(res.body) },
+  };
 }
 
 export function checkExchange(tool: string, scenario: string, recorded: Exchange): void {
   const DIR = new URL(`../../docs/contracts/${tool}/`, import.meta.url);
   const file = new URL(`${scenario}.json`, DIR);
-  const text = `${JSON.stringify(recorded, null, 2)}\n`;
+  // Control-Plane consumes the original body/status/body envelope. Keep this
+  // compatibility mapping at the fixture boundary, not in the public Exchange.
+  const fixture = { request: recorded.request.body, status: recorded.response.status, response: recorded.response.body };
+  const text = `${JSON.stringify(fixture, null, 2)}\n`;
   if (process.env.UPDATE_CONTRACT_FIXTURES === "1") {
     mkdirSync(DIR, { recursive: true });
     writeFileSync(file, text);

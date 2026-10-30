@@ -141,8 +141,10 @@ to `recordExchange` to set the scope explicitly (this is also the default); use 
 for a refused write scenario. The simulated Restate context supports `request` and
 `run`; handlers that call durable objects need additional test setup.
 
-`checkExchange` compares the complete exchange with `docs/contracts/<tool>/<scenario>.json`.
-It preserves the existing `{ request, status, response }` fixture envelope. Only the
+`recordExchange` returns `{ request: { method, path, body }, response: { status, body } }`.
+`checkExchange` compares the request body, response status, and response body with
+`docs/contracts/<tool>/<scenario>.json`, mapping them to the existing
+`{ request, status, response }` fixture envelope to preserve its bytes. Only the
 exact environment value `1` permits creation or rewriting. For example:
 
 ```bash
