@@ -436,6 +436,41 @@ describe("postRunnerResult", () => {
       expect(log).not.toHaveBeenCalledWith(expect.stringContaining("POST ok"));
     });
 
+    it.each([429, 503, 400, 401, 409])("handles HTTP %s without waiting for a stalled body or its cancellation", async (status) => {
+      const cancel = vi.fn(() => new Promise<void>(() => {}));
+      const response = new Response(new ReadableStream({ cancel }), { status });
+      const readBody = vi.spyOn(response, "text");
+      const fetchImpl = vi.fn<typeof fetch>()
+        .mockResolvedValueOnce(response)
+        .mockResolvedValue(new Response(null, { status: 201 }));
+      const sleepImpl = vi.fn(async () => {});
+
+      await postRunnerResult({ ...base(), fetchImpl, sleepImpl });
+
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(readBody).not.toHaveBeenCalled();
+      const retryable = status === 429 || status === 503;
+      expect(fetchImpl).toHaveBeenCalledTimes(retryable ? 2 : 1);
+      expect(sleepImpl).toHaveBeenCalledTimes(retryable ? 1 : 0);
+    });
+
+    it("preserves terminal status handling when body cancellation rejects", async () => {
+      const cancel = vi.fn(async () => { throw new Error("secret cancellation error"); });
+      const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(new ReadableStream({ cancel }), { status: 401 }),
+      );
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      const sleepImpl = vi.fn(async () => {});
+
+      await postRunnerResult({ ...base(), fetchImpl, sleepImpl });
+
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      expect(sleepImpl).not.toHaveBeenCalled();
+      expect(error).toHaveBeenCalledWith(expect.stringContaining("HTTP 401"));
+      expect(JSON.stringify(error.mock.calls)).not.toContain("secret cancellation error");
+    });
+
     it.each([undefined, 100_000_000])("stops after eight attempts with deadline %s", async (deadlineAt) => {
       const endpoint = resultEndpoint({ status: 503 });
       const sleepImpl = vi.fn(async () => {});

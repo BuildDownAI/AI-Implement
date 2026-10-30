@@ -313,9 +313,9 @@ export async function postRunnerResult(params: {
         console.log(`[runner-callback] POST ok phase=${params.phase} outcome=${params.outcome}${attemptContext}`);
         return;
       }
-      // Drain the body to free the connection without ever logging its contents — an untrusted
-      // server/transport string here could carry an echoed bearer or other request data.
-      await res.text().catch(() => "");
+      // The body is unused and may stall after headers. Cancel it without awaiting
+      // cleanup, which can itself stall; neither body data nor cancellation errors are logged.
+      void res.body?.cancel().catch(() => {});
       lastReason = classifyFailureReason(res.status, null);
       if (!isRetryableStatus(res.status)) {
         console.error(
