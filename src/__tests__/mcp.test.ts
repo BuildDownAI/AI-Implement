@@ -1772,7 +1772,7 @@ describe("handleMcpRequest", () => {
       expect(toolsClientMock.callTool).toHaveBeenLastCalledWith(
         "get_review_fix_attempt",
         { attemptId: "attempt-1" },
-        { kind: "human", email: "user@example.com", role: "admin" },
+        { kind: "human", email: "user@example.com", role: "admin", grants: [] },
         undefined,
       );
     });

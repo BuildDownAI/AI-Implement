@@ -157,9 +157,9 @@ function kgToolDeps(overrides: Partial<KgRefreshToolDeps> = {}): KgRefreshToolDe
   };
 }
 
-const SYSTEM_ADMIN: Caller = { kind: "system", email: null, role: "admin" };
-const HUMAN_USER: Caller = { kind: "human", email: "user@example.com", role: "user" };
-const NO_ROLE: Caller = { kind: "human", email: "user@example.com", role: null };
+const SYSTEM_ADMIN: Caller = { kind: "system", email: null, role: "admin", grants: [] };
+const HUMAN_USER: Caller = { kind: "human", email: "user@example.com", role: "user", grants: [] };
+const NO_ROLE: Caller = { kind: "human", email: "user@example.com", role: null, grants: [] };
 
 describe("tool()", () => {
   it("refuses a caller with role: null against a role: \"user\" tool without invoking the handler", async () => {
@@ -240,7 +240,7 @@ describe("tool()", () => {
   // written for every entry point (POST /api/tools/<name>, callToolAsSystem) a role: "admin"
   // tool is reached through, not only a call that happens to go through /mcp.
   describe("audit logging (AII-713)", () => {
-    const ADMIN: Caller = { kind: "human", email: "admin@example.com", role: "admin" };
+    const ADMIN: Caller = { kind: "human", email: "admin@example.com", role: "admin", grants: [] };
 
     afterEach(() => {
       vi.restoreAllMocks();
@@ -403,7 +403,7 @@ describe("review-fix read tools", () => {
     setReviewFixAttemptsFacade({ getAttempt: vi.fn(), getActivity });
 
     const result = await getReviewFixActivityTool(fakeContext("get_review_fix_activity"), {
-      caller: { kind: "human", email: "admin@example.com", role: "admin" },
+      caller: { kind: "human", email: "admin@example.com", role: "admin", grants: [] },
       args: { attemptId: "attempt-1", pageSize: 2, cursor: { producerId: "runner", sequence: 6 } },
     });
 
@@ -703,7 +703,7 @@ describe("callToolAsSystem", () => {
 
     expect(result).toEqual({ status: "ok", content: [{ type: "text", text: "health" }], isError: undefined });
     expect(JSON.parse(fake.calls[0].body)).toEqual({
-      caller: { kind: "system", email: null, role: "admin" },
+      caller: { kind: "system", email: null, role: "admin", grants: [] },
       args: {},
     });
   });
@@ -1404,7 +1404,7 @@ describe("migrated write handlers (AII-713)", () => {
     it("answers 202 { refreshing, triggerId } and forwards ref and the actor to KgRepo.trigger", async () => {
       const res = answer(await call(
         { ref: "feature/x" },
-        { kind: "human", email: "user@example.com", role: "admin" },
+        { kind: "human", email: "user@example.com", role: "admin", grants: [] },
       ));
       expect(res).toEqual({ status: 202, body: { refreshing: true, triggerId: "trig-1" } });
       expect(trigger).toHaveBeenCalledWith({ kgSourceRef: "feature/x", actorEmail: "user@example.com" });
@@ -1468,7 +1468,7 @@ describe("migrated write handlers (AII-713)", () => {
       objectClient: () => ({ status, decide }),
       workflowClient: () => ({ cancel }),
     }) as unknown as restate.Context;
-    const call = (args: { action: "accept" | "cancel"; triggerId?: string }, caller: Caller = { kind: "human", email: "ada@example.com", role: "admin" }) =>
+    const call = (args: { action: "accept" | "cancel"; triggerId?: string }, caller: Caller = { kind: "human", email: "ada@example.com", role: "admin", grants: [] }) =>
       decideKgRefreshTool(ctx(), { caller, args });
     const terminal = (code: number, message: string) => new restate.TerminalError(message, { errorCode: code });
 
@@ -1864,7 +1864,7 @@ describe("add_project uses the registry the boot shares (AII-713 review)", () =>
 
 // ---- AII-1069: list_dispatch_reservations / release_dispatch_reservation.
 describe("dispatch reservation tools (AII-1069)", () => {
-  const admin: Caller = { kind: "human", email: "op@example.com", role: "admin" };
+  const admin: Caller = { kind: "human", email: "op@example.com", role: "admin", grants: [] };
   const parse = (r: { content: { text: string }[] }) => JSON.parse(r.content[0].text);
   let admission: typeof AdmissionModule;
   let log: typeof LogModule;
@@ -2075,7 +2075,7 @@ describe("list_job_accounting (AII-1564)", () => {
     log.updateJobStatus(id, "completed", "success", null);
     (await import("../dedup.js")).getDb().prepare("UPDATE dispatch_log SET completed_at = ?").run(done);
     (await import("../dedup.js")).getDb().prepare("UPDATE dispatch_log SET changed_at = ?").run(done);
-    for (const caller of [serviceCaller(), { kind: "human", email: "u@example.com", role: "user" } as Caller]) {
+    for (const caller of [serviceCaller(), { kind: "human", email: "u@example.com", role: "user", grants: [] } as Caller]) {
       const res = await tools.listJobAccountingTool(fakeContext("list_job_accounting"), { caller, args: {} });
       expect(res.isError).toBeUndefined();
       const page = JSON.parse(res.content[0].text);

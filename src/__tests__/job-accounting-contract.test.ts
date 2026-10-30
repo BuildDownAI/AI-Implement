@@ -452,10 +452,13 @@ describe("shared contract recorder", () => {
     expect(first.response.body.isError).toBeFalsy();
     expect(JSON.parse(first.response.body.content[0].text)).toHaveProperty("mode");
     await recordExchange("get_runner_mode", { args: {} }, { scope: "orchestrator:read custom:scope" });
+    const deploy = await recordExchange("get_runner_mode", { args: {} }, { scope: "orchestrator:deploy" });
+    expect(deploy).toEqual(first);
     const claims = verify.mock.calls.map(([authorization]) => decodeJwt(authorization!.slice("Bearer ".length)));
-    expect(claims).toHaveLength(3);
+    expect(claims).toHaveLength(4);
     expect(claims[0]).toEqual(claims[1]);
     expect(claims[0].scope).toBe("orchestrator:read");
     expect(claims[2]).toEqual({ ...claims[0], scope: "orchestrator:read custom:scope" });
+    expect(claims[3]).toEqual({ ...claims[0], scope: "orchestrator:deploy" });
   });
 });

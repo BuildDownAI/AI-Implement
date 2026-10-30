@@ -66,8 +66,14 @@ async function token(o: TokenOptions = {}): Promise<string> {
 const bearer = (t: string) => `Bearer ${t}`;
 
 describe("verifyControlPlaneToken", () => {
-  it("maps a valid token to the read-only service caller", async () => {
-    expect(await cp.verifyControlPlaneToken(bearer(await token()))).toEqual({ kind: "service", email: null, role: "user" });
+  it.each([
+    ["orchestrator:read", []],
+    ["orchestrator:deploy", ["deploy"]],
+    ["orchestrator:read orchestrator:deploy", ["deploy"]],
+  ])("maps %s to service/user with only its explicit grants", async (scope, grants) => {
+    expect(await cp.verifyControlPlaneToken(bearer(await token({ scope })))).toEqual({
+      kind: "service", email: null, role: "user", grants,
+    });
   });
 
   it("accepts an audience array containing the base URL and a scope among several", async () => {
@@ -84,6 +90,8 @@ describe("verifyControlPlaneToken", () => {
     ["wrong iss", () => token({ iss: "https://evil.example.com" })],
     ["wrong aud", () => token({ aud: "https://orch-b.example.com" })],
     ["audience array without the base URL", () => token({ aud: ["https://orch-b.example.com"] })],
+    ["unknown write scope", () => token({ scope: "orchestrator:write" })],
+    ["deploy substring", () => token({ scope: "orchestrator:deployment" })],
     ["missing scope", () => token({ scope: "openid" })],
     ["scope that only contains the name as a substring", () => token({ scope: "orchestrator:readwrite" })],
     ["expired beyond leeway", () => token({ exp: Math.floor(Date.now() / 1000) - 120 })],

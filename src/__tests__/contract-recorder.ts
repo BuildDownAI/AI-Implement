@@ -110,7 +110,10 @@ export async function recordExchange(tool: string, body: { args: Record<string, 
     .sign(signingKey);
   const deps: AdminModule.AdminDeps = {
     callTool: async (name, args, caller) => {
-      expect(caller).toEqual({ kind: "service", email: null, role: "user" });
+      expect(caller).toEqual({
+        kind: "service", email: null, role: "user",
+        grants: (opts?.scope ?? "orchestrator:read").split(" ").includes("orchestrator:deploy") ? ["deploy"] : [],
+      });
       return callTool(name, args, caller, {
         restateReady: () => true,
         permitsExternalCall: () => true,

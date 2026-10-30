@@ -849,7 +849,7 @@ export function handleAdminRequest(
         if (caller) return handleToolCall(req, res, caller, "control-plane", toolName, deps);
         const gate = authorizeApiRequest(req, res, url, method);
         if (!gate) return;
-        return handleToolCall(req, res, { kind: "human", email: gate.identity?.email ?? null, role: gate.role }, gate.identity?.email ?? "session", toolName, deps);
+        return handleToolCall(req, res, { kind: "human", email: gate.identity?.email ?? null, role: gate.role, grants: [] }, gate.identity?.email ?? "session", toolName, deps);
       })
       .catch((err) => {
         console.error("[admin] tool call failed:", err);
@@ -880,7 +880,7 @@ export function handleAdminRequest(
 
     const toolCallMatch = TOOL_CALL_ROUTE.exec(url);
     if (toolCallMatch && method === "POST") {
-      handleToolCall(req, res, { kind: "human", email: gate.identity?.email ?? null, role: gate.role }, gate.identity?.email ?? "session", decodeURIComponent(toolCallMatch[1]), deps);
+      handleToolCall(req, res, { kind: "human", email: gate.identity?.email ?? null, role: gate.role, grants: [] }, gate.identity?.email ?? "session", decodeURIComponent(toolCallMatch[1]), deps);
       return true;
     }
 
@@ -2964,7 +2964,7 @@ async function handlePostSettings(
       json(res, 503, { error: "restate-unavailable" });
       return;
     }
-    const caller: Caller = { kind: "human", email: gate.identity?.email ?? null, role: gate.role };
+    const caller: Caller = { kind: "human", email: gate.identity?.email ?? null, role: gate.role, grants: [] };
     let result: Awaited<ReturnType<NonNullable<AdminDeps["callTool"]>>>;
     try {
       result = await deps.callTool("set_runner_backend", { backend: "fly-machines", patch: flyPatch }, caller);
