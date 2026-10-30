@@ -2,9 +2,10 @@
  * The sender side of `ImplementationRun` (AII-1553): an ingress client for the `submit` and `report`
  * calls, and a termination hook for the runner callback to call for an implementation result. The
  * hook is not wired here: `src/runner-callback.ts` and `src/index.ts` are AII-1557's. `report`
- * carries no body: the callback keeps writing the outcome to SQLite and the workflow reads the row.
+ * carries optional model usage: the callback keeps writing the outcome to SQLite and the workflow reads the row.
  * Sibling of `planning-run-client.ts`.
  */
+import type { RecordedUsage } from "../agent-usage.js";
 import * as restateClients from "@restatedev/restate-sdk-clients";
 import { read as readAdmission, type DispatchAdmissionRecord } from "../dispatch-admission.js";
 import type { ImplementationRunDefinition, ImplementationRunInput } from "./implementation-run-workflow.js";
@@ -20,7 +21,7 @@ export interface ImplementationRunIngressClient {
   /** Starts the workflow keyed by `dispatchId`; the workflow key is the idempotency (Restate rejects an idempotency key on a workflow handler with HTTP 400). */
   submit(dispatchId: string, input: ImplementationRunInput): Promise<ImplementationIngressResult>;
   /** Resolves the workflow's `report` promise. */
-  report(dispatchId: string): Promise<ImplementationIngressResult>;
+  report(dispatchId: string, body?: { usage?: RecordedUsage }): Promise<ImplementationIngressResult>;
 }
 
 export interface ImplementationRunIngressClientDeps {
@@ -55,7 +56,9 @@ export function createImplementationRunIngressClient(
   return {
     submit: (dispatchId, input) =>
       invoke(() => workflow(dispatchId).workflowSubmit(input, restateClients.rpc.sendOpts({ timeout }))),
-    report: (dispatchId) => invoke(() => workflow(dispatchId).report(restateClients.rpc.opts({ timeout }))),
+    // The SDK RemoveVoidArgument type cannot represent an optional JSON input. The handler
+    // accepts undefined at runtime; preserve it so existing callers send an empty HTTP body.
+    report: (dispatchId, body) => invoke(() => workflow(dispatchId).report(body!, restateClients.rpc.opts({ timeout }))),
   };
 }
 
@@ -74,14 +77,14 @@ export interface ImplementationAdmissionTerminationHookDeps {
  */
 export function createImplementationAdmissionTerminationHook(
   deps: ImplementationAdmissionTerminationHookDeps,
-): (dispatchId: string) => Promise<void> {
+): (dispatchId: string, usage?: RecordedUsage) => Promise<void> {
   const lookup = deps.readAdmission ?? readAdmission;
-  return async (dispatchId) => {
+  return async (dispatchId, usage) => {
     if (lookup(dispatchId)?.lifecycleOwner.kind !== "restate") {
       await deps.legacy(dispatchId);
       return;
     }
-    const result = await deps.ingress.report(dispatchId);
+    const result = await (usage ? deps.ingress.report(dispatchId, { usage }) : deps.ingress.report(dispatchId));
     if (result.status === "accepted") {
       console.log(`[implementation-run] report sent dispatch=${dispatchId}`);
     } else {
