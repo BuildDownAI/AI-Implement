@@ -2058,7 +2058,7 @@ function isIssueCommentsRequest(args: string[]): boolean {
 }
 
 describe("collectExternalReviewFindingsFromGh review process options (AII-1181)", () => {
-  function spawnWithThreads(threads: Array<{ login: string; body: string }>, reviews: unknown[] = []): GhSpawn {
+  function spawnWithThreads(threads: Array<{ login: string; body: string; commit?: string }>, reviews: unknown[] = []): GhSpawn {
     return (args) => {
       if (isPullReviewsRequest(args)) return { exitCode: 0, stdout: JSON.stringify(reviews) };
       if (isIssueCommentsRequest(args)) return { exitCode: 0, stdout: "[]" };
@@ -2074,7 +2074,7 @@ describe("collectExternalReviewFindingsFromGh review process options (AII-1181)"
                     isOutdated: false,
                     path: "src/x.ts",
                     line: i + 1,
-                    comments: { nodes: [{ body: t.body, url: `https://example.com/t${i}`, author: { login: t.login } }] },
+                    comments: { nodes: [{ body: t.body, url: `https://example.com/t${i}`, commit: { oid: t.commit }, author: { login: t.login } }] },
                   })),
                 },
               },
@@ -2100,6 +2100,26 @@ describe("collectExternalReviewFindingsFromGh review process options (AII-1181)"
       ["untagged", "minor"],
       ["🟡 nit", "minor"],
     ]);
+  });
+
+  it("retains Codex P2 as minor and P0/P1 as blocking, including the GraphQL login", () => {
+    const result = collectExternalReviewFindingsFromGh(spawnWithThreads([0, 1, 2].map((p) => ({
+      login: "chatgpt-codex-connector",
+      body: `**<sub><sub>![P${p} Badge](https://img.shields.io/badge/P${p}-yellow?style=flat)</sub></sub>  Finding**`,
+    }))), "42", { process: resolveReviewProcess("codex-code-review"), extraAuthors: [] });
+    expect(result.findings.map((f) => f.severity)).toEqual(["blocking", "blocking", "minor"]);
+  });
+
+  it.each([
+    { login: "chatgpt-codex-connector", commit: "old-head", expected: [] },
+    { login: "untrusted-codex", commit: "current-head", expected: ["medium"] },
+  ])("does not collect blocking Codex findings from $login at $commit", ({ login, commit, expected }) => {
+    const result = collectExternalReviewFindingsFromGh(spawnWithThreads([{
+      login, commit,
+      body: "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Bug**",
+    }]), "42", { process: resolveReviewProcess("codex-code-review"), extraAuthors: [], headSha: "current-head" });
+    expect(result.findings.map((finding) => finding.severity)).toEqual(expected);
+    expect(result.findings.some((finding) => finding.severity === "blocking")).toBe(false);
   });
 
   it("stays medium for every thread with no options", () => {

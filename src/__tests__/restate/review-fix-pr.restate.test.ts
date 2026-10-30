@@ -1,6 +1,6 @@
 // AII-800: the production PR object and attempt workflow on pinned Restate.
 // SQLite/worker doubles live outside the endpoint so replay cannot erase them.
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity, WorkerTerminalOutcome } from "../../review-fix-contract.js";
@@ -8,6 +8,11 @@ import type { PreparedReviewFixAttempt, ReviewFixFindingVersion } from "../../re
 import { createReviewFixAttempt } from "../../restate/review-fix-attempt.js";
 import { createReviewFixPR, reviewFixPRKey, REVIEW_FIX_COLLECTION_WINDOW_MS, REVIEW_FIX_EVENT_BODY_MAX_BYTES, type ReviewFixFeedbackEvent } from "../../restate/review-fix-pr.js";
 import { VARIANTS, eventually, settle, attachWorkflow, callObject, callWorkflow, journalEntries, journalEntryNames, journalText, queryInvocations, startVariants, stopAll } from "./harness.js";
+
+import { EventEmitter } from "node:events";
+import { testDb } from "../helpers/test-db.js";
+import { makeAppendLogEntry, makeMapping } from "../helpers/builders.js";
+import { createReviewFixIngressClient } from "../../restate/review-fix-client.js";
 
 const SHA = "a".repeat(40);
 interface PRState {
@@ -137,7 +142,10 @@ describe("ReviewFixPR durable coordination", () => {
   });
   const recorded: ReviewFixFeedbackEvent[] = [];
   const coordinator = createReviewFixPR({ attempts: store,
-    recordFeedback: async (event) => { recorded.push(event); return { status: "accepted", findingIds: [1], reviewFixId: 1 }; }, collectionWindowMs: async (scope) => stateFor(scope).windowMs,
+    recordFeedback: async (event) => { recorded.push(event);
+      const pr = [...prs.values()].find((p) => p.scope.repository === event.repo && p.scope.prNumber === event.prNumber);
+      if (pr) for (const [i] of (event.findings ?? []).entries()) pr.pending.push({ findingKey: `${event.eventId}-${i}`, version: 1 });
+      return { status: "accepted", findingIds: [1], reviewFixId: 1 }; }, collectionWindowMs: async (scope) => stateFor(scope).windowMs,
     recordDelegated: async (scope) => { stateFor(scope).delegated++; },
     load: async (scope) => {
     const pr = stateFor(scope);
@@ -173,6 +181,45 @@ describe("ReviewFixPR durable coordination", () => {
     await attachWorkflow(env.baseUrl(), "ReviewFixAttempt", prepared.attemptId);
     expect(state.released).toBe(true);
   }
+
+  it.each(VARIANTS.map(([label]) => label))("Codex webhook P1 starts an attempt; P2 does not (%s)", async (label) => {
+    const { modules: { config, log, webhook } } = await testDb({ modules: {
+      config: () => import("../../config.js"), log: () => import("../../log.js"), webhook: () => import("../../webhook.js"),
+    } });
+    const env = envFor(label);
+    config.upsertMapping("CODEX", makeMapping({ owner: "BuildDownAI", repo: "AI-Implement", reviewProcess: "codex-code-review", reviewFixLifecycle: "restate" }));
+    const ingress = createReviewFixIngressClient(env.baseUrl());
+    for (const priority of [1, 2]) {
+      const pr = makePR();
+      pr.windowMs = 100;
+      const jobId = log.appendLog(makeAppendLogEntry({ issueId: `codex-${pr.scope.prNumber}`, issueIdentifier: "AII-1617", repo: pr.scope.repository }));
+      log.updateJobStatus(jobId, "completed", "success", `https://github.com/${pr.scope.repository}/pull/${pr.scope.prNumber}`);
+      const secret = "codex-test";
+      const body = JSON.stringify({ action: "created", installation: { id: 7 }, repository: { full_name: pr.scope.repository },
+        pull_request: { number: pr.scope.prNumber, html_url: `https://github.com/${pr.scope.repository}/pull/${pr.scope.prNumber}`, head: { ref: "ai-implement/AII-1617", sha: SHA } },
+        comment: { id: pr.scope.prNumber, user: { login: "chatgpt-codex-connector[bot]", type: "Bot" }, commit_id: SHA,
+          body: `**<sub><sub>![P${priority} Badge](https://img.shields.io/badge/P${priority}-orange?style=flat)</sub></sub>  Bug**` },
+      });
+      const req = Object.assign(new EventEmitter(), { headers: {
+        "x-hub-signature-256": `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`,
+        "x-github-event": "pull_request_review_comment", "x-github-delivery": randomUUID(),
+      } });
+      process.nextTick(() => { req.emit("data", Buffer.from(body)); req.emit("end"); });
+      let status = 0;
+      const res = { writeHead: (code: number) => { status = code; }, end: () => {} };
+      await webhook.handleGitHubWebhook(req as never, res as never, secret, undefined, undefined, undefined, undefined, undefined, ingress);
+      if (priority === 1) {
+        expect(status).toBe(202);
+        await eventually(() => pr.launches, (n) => n === 1, { timeoutMs: 5000, label: "Codex attempt launches" });
+        await finish(env, pr, 0);
+      } else {
+        expect(status).toBe(200);
+        await settle(300);
+        expect(pr.launches).toBe(0);
+        expect(pr.pending).toEqual([]);
+      }
+    }
+  }, 20_000);
 
   it.each(VARIANTS.map(([label]) => label))("one fixed feedback window and one active attempt (%s)", async (label) => {
     const env = envFor(label);

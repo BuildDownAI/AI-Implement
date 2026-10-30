@@ -899,11 +899,11 @@ function collectReviewThreadFindings(
     if (authorLogin && blockingReviewerLogins.has(normalizeReviewerLogin(authorLogin))) {
       severity = "blocking";
     } else if (
-      options.process.claudeInlineMarkers
+      options.process.classifyInline
       && authorLogin
       && isTrustedReviewAuthor(authorLogin, options.process, options.extraAuthors)
     ) {
-      const marker = classifyClaudeInlineMarker(body);
+      const marker = options.process.classifyInline(body);
       if (marker === null) continue;
       severity = marker === "blocking" ? "blocking" : "minor";
     }

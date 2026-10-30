@@ -3,7 +3,7 @@
  * The definition is trusted input that can approve a PR, so every author and `appSlug` is spelled out. */
 import type { ReviewFindingsBlockResult, ReviewLedgerFinding } from "./pipeline/review-ledger.js";
 
-export type ReviewProcessId = "ai-implement" | "claude-code-review" | "claude-code-review-repository-fix";
+export type ReviewProcessId = "ai-implement" | "claude-code-review" | "claude-code-review-repository-fix" | "codex-code-review";
 export type ReviewFixer = "ai-implement" | "repository";
 
 export interface ReviewCheckPair {
@@ -17,13 +17,14 @@ export interface ReviewVerdictInput {
   headSha: string;
   checkRuns: Array<{ name: string; appSlug: string; status: string; conclusion: string | null; outputText: string | null }>;
   inlineComments: Array<{ authorLogin: string; authorType: string; body: string; path?: string; line?: number; commitId?: string; url?: string }>;
+  issueComments: Array<{ authorLogin: string; authorType: string; body: string; updatedAt?: string }>;
   /** Findings blocks (ADR 020) already extracted from trusted comments, newest first. */
   blocks: ReviewFindingsBlockResult[];
 }
 
 export interface ReviewVerdictResult {
   verdict: "approve" | "changes_requested" | "incomplete" | "no-real-verdict";
-  source: "review-contract" | "bughunter-severity" | "check-and-comments" | "none";
+  source: "review-contract" | "bughunter-severity" | "check-and-comments" | "codex-state" | "none";
   findings: ReviewLedgerFinding[];
 }
 
@@ -34,8 +35,8 @@ export interface ReviewProcessDefinition {
   checkPairs: readonly ReviewCheckPair[];
   readVerdict(input: ReviewVerdictInput): ReviewVerdictResult;
   fixer: ReviewFixer;
-  /** A trusted author's inline comment is classified by its 🔴/🟡/🟣 marker (webhook and review ledger). */
-  claudeInlineMarkers: boolean;
+  /** Optional per-process inline severity classifier, shared by webhook and ledger. */
+  classifyInline?: typeof classifyClaudeInlineMarker;
   /** A 🔴 finding in a trusted Claude summary comment gates the in-run approval. */
   summaryBlockingGates: boolean;
 }
@@ -68,6 +69,35 @@ export function classifyClaudeInlineMarker(body: string): "blocking" | "minor" |
   if (text.startsWith("🟡")) return "minor";
   if (text.startsWith("🟣")) return null;
   return "untagged";
+}
+
+export function classifyCodexBadge(body: string): "blocking" | "minor" | "untagged" {
+  const badge = /^\*\*<sub><sub>!\[P([012]) Badge\]\(https:\/\/img\.shields\.io\/badge\/P\1(?:-[a-z]+)?\?style=flat\)<\/sub><\/sub>/.exec(body.trimStart());
+  return badge ? (badge[1] === "2" ? "minor" : "blocking") : "untagged";
+}
+
+const CODEX_AUTHORS = ["chatgpt-codex-connector[bot]", "chatgpt-codex-connector"] as const;
+
+function codexVerdict(input: ReviewVerdictInput): ReviewVerdictResult {
+  const waiting: ReviewVerdictResult = { verdict: "incomplete", source: "codex-state", findings: [] };
+  const comments = [...input.issueComments].reverse().filter((c) => c.authorType === "Bot" && CODEX_AUTHORS.includes(c.authorLogin.toLowerCase() as typeof CODEX_AUTHORS[number]));
+  // GitHub lists comments oldest first; edits update the timestamp without changing that order.
+  comments.sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
+  for (const c of comments) {
+    const match = /<!--\s*codex-review-state:v1\s+(.*?)\s*-->/s.exec(c.body);
+    if (!match) continue;
+    let state;
+    try { state = JSON.parse(match[1]!).code_review; } catch { continue; }
+    if (!state || state.commit_sha !== input.headSha) continue;
+    if (state.status === "failed") return { ...waiting, verdict: "no-real-verdict" };
+    if (state.status !== "completed" || typeof state.has_unresolved_findings !== "boolean") return waiting;
+    return {
+      verdict: state.has_unresolved_findings ? "changes_requested" : "approve",
+      source: "codex-state",
+      findings: inlineFindings({ ...input, inlineComments: input.inlineComments.filter((c) => c.commitId === input.headSha && classifyCodexBadge(c.body) !== "untagged") }, CODEX_AUTHORS, classifyCodexBadge),
+    };
+  }
+  return waiting;
 }
 
 function matchesPair(run: { name: string; appSlug: string }, pair: ReviewCheckPair, configured?: readonly string[]): boolean {
@@ -107,13 +137,13 @@ const CLAUDE_CODE_REVIEW_AUTHORS = ["claude[bot]", "claude"] as const;
 const GITHUB_ACTIONS_PAIR: ReviewCheckPair = { names: "project-review-check-names", appSlug: "github-actions" };
 const CLAUDE_PAIR: ReviewCheckPair = { names: ["Claude Code Review"], appSlug: "claude" };
 
-function inlineFindings(input: ReviewVerdictInput, authors: readonly string[]): ReviewLedgerFinding[] {
+function inlineFindings(input: ReviewVerdictInput, authors: readonly string[], classifier = classifyClaudeInlineMarker): ReviewLedgerFinding[] {
   const findings: ReviewLedgerFinding[] = [];
   for (const c of input.inlineComments) {
     if (c.authorType !== "Bot") continue;
     if (!authors.includes(c.authorLogin.trim().toLowerCase())) continue;
     if (c.commitId !== undefined && c.commitId !== input.headSha) continue;
-    const marker = classifyClaudeInlineMarker(c.body);
+    const marker = classifier(c.body);
     if (marker === null) continue;
     findings.push({
       source: "github-review",
@@ -153,6 +183,11 @@ function claudeCodeReviewVerdict(input: ReviewVerdictInput): ReviewVerdictResult
 }
 
 export const REVIEW_PROCESSES: Record<ReviewProcessId, ReviewProcessDefinition> = {
+  "codex-code-review": {
+    id: "codex-code-review", label: "Codex Code Review", trustedAuthors: CODEX_AUTHORS,
+    checkPairs: [], readVerdict: codexVerdict, fixer: "ai-implement",
+    classifyInline: classifyCodexBadge, summaryBlockingGates: false,
+  },
   "ai-implement": {
     id: "ai-implement",
     label: "AI-Implement review",
@@ -160,7 +195,6 @@ export const REVIEW_PROCESSES: Record<ReviewProcessId, ReviewProcessDefinition> 
     checkPairs: [GITHUB_ACTIONS_PAIR],
     readVerdict: (input) => readBlock(input.blocks) ?? noBlock(),
     fixer: "ai-implement",
-    claudeInlineMarkers: false,
     summaryBlockingGates: false,
   },
   "claude-code-review": {
@@ -170,7 +204,7 @@ export const REVIEW_PROCESSES: Record<ReviewProcessId, ReviewProcessDefinition> 
     checkPairs: [GITHUB_ACTIONS_PAIR, CLAUDE_PAIR],
     readVerdict: claudeCodeReviewVerdict,
     fixer: "ai-implement",
-    claudeInlineMarkers: true,
+    classifyInline: classifyClaudeInlineMarker,
     summaryBlockingGates: true,
   },
   // Same reviewer as `claude-code-review`; the repository's own auto-fix is the only fixer for Claude's findings.
@@ -181,7 +215,7 @@ export const REVIEW_PROCESSES: Record<ReviewProcessId, ReviewProcessDefinition> 
     checkPairs: [GITHUB_ACTIONS_PAIR, CLAUDE_PAIR],
     readVerdict: claudeCodeReviewVerdict,
     fixer: "repository",
-    claudeInlineMarkers: true,
+    classifyInline: classifyClaudeInlineMarker,
     summaryBlockingGates: true,
   },
 };
