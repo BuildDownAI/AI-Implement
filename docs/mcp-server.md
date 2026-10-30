@@ -124,6 +124,33 @@ A tool that the BuildDown control plane calls with its `service` token (for exam
 * **Recorded exchanges:** a test calls the real handler through the real route for each scenario and writes the request and response bodies to `docs/contracts/<tool>/<scenario>.json`. It fails when the output differs, and rewrites only with an explicit environment variable. The control plane copies these files and its fake answers only from them.
 * **Changes:** a change to the request, the response or a rule regenerates the files, and the PR names the Control-Plane issue that takes the new files. Ship this repo first, then the control plane.
 
+### Recording a tool contract
+
+Add a scenario to `src/__tests__/<tool>-contract.test.ts`. Initialize its database and
+seed deterministic state with `testDb()`, then call the shared recorder:
+
+```ts
+const recorded = await recordExchange("my_tool", { args: { /* scenario arguments */ } });
+checkExchange("my_tool", "scenario-name", recorded);
+```
+
+Import both helpers from `./contract-recorder.js`. The recorder signs a real service
+token, calls the real admin route and tool handler, and validates input using the
+registered handler's serde. Pass `{ scope: "orchestrator:read" }` as the third argument
+to `recordExchange` to set the scope explicitly (this is also the default); use it
+for a refused write scenario. The simulated Restate context supports `request` and
+`run`; handlers that call durable objects need additional test setup.
+
+`checkExchange` compares the complete exchange with `docs/contracts/<tool>/<scenario>.json`.
+It preserves the existing `{ request, status, response }` fixture envelope. Only the
+exact environment value `1` permits creation or rewriting. For example:
+
+```bash
+UPDATE_CONTRACT_FIXTURES=1 npx vitest run src/__tests__/job-accounting-contract.test.ts
+```
+
+Review the fixture diff and coordinate changed contracts with Control-Plane as above.
+
 ## Run identities
 
 Placeholder. [AII-702](https://linear.app/eudoxus/issue/AII-702/accept-a-run-capability-at-mcp-as-a-read-only-run-identity) adds a third `IdentityKind`, `"run"`: a Restate-issued, read-only capability a dispatched run carries so it can call `/mcp` reads (e.g. `kg_*`, `get_project_binding`) without an OAuth session. This section describes that identity's shape, how it's minted and verified, and which tools it may call once that issue lands.
