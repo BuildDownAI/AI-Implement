@@ -4,19 +4,30 @@ import { dirname } from "path";
 
 const FALLBACK_DB_PATH = "/tmp/ai-implement.sqlite";
 
-function resolveDbPath(): string {
+/** Where the database lives, and whether creating its directory failed so `/tmp` was used instead. */
+export interface DatabasePath {
+  path: string;
+  configured: string;
+  fellBack: boolean;
+}
+
+function resolveDbPath(): DatabasePath {
   const configured = process.env.DEDUP_DB_PATH || "/data/dedup.sqlite";
   try {
     mkdirSync(dirname(configured), { recursive: true });
-    return configured;
+    return { path: configured, configured, fellBack: false };
   } catch (err: any) {
     if (!["EACCES", "ENOENT", "EPERM", "EROFS"].includes(err.code)) throw err;
     console.warn(`[db] Cannot create ${dirname(configured)} (${err.code}), falling back to ${FALLBACK_DB_PATH}`);
-    return FALLBACK_DB_PATH;
+    return { path: FALLBACK_DB_PATH, configured, fellBack: true };
   }
 }
 
 const DB_PATH = resolveDbPath();
+
+export function getDatabasePath(): DatabasePath {
+  return { ...DB_PATH };
+}
 
 let db: Database.Database | null = null;
 
@@ -316,7 +327,7 @@ function createAgentConfigurationTables(): void {
 
 export function getDb(): Database.Database {
   if (!db) {
-    db = new Database(DB_PATH);
+    db = new Database(DB_PATH.path);
     db.pragma("journal_mode = WAL");
     db.exec(`
       CREATE TABLE IF NOT EXISTS dispatched (

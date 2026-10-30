@@ -186,6 +186,15 @@ describe("saveAccessEntries — the last-admin guard", () => {
     expect(access.listAccessEntries().map((e) => e.value)).toEqual(["ada@eudoxus.ai"]);
   });
 
+  it("refuses a save whose addresses are all users, since only an admin address can administer", () => {
+    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
+
+    expect(() =>
+      access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "user" }], null),
+    ).toThrow(/nobody able to administer/);
+    expect(access.listAccessEntries().map((e) => e.role)).toEqual(["admin"]);
+  });
+
   it("allows demoting yourself while another admin remains", () => {
     access.saveAccessEntries(
       [

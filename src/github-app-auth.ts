@@ -67,6 +67,11 @@ function parsePrivateKey(pem: string): crypto.KeyObject {
   return crypto.createPrivateKey(normalized);
 }
 
+/** The App key as configured: literal `\n` sequences unescaped, then parsed. Throws when it is not a private key. */
+export function parseAppPrivateKey(raw: string): crypto.KeyObject {
+  return parsePrivateKey(raw.replace(/\\n/g, "\n"));
+}
+
 // exp is minted this many seconds below GitHub's 600s cap (and iat backdated the same)
 // so a host clock running ahead of GitHub still validates. Larger drift needs a clock resync (NTP).
 const CLOCK_SKEW_TOLERANCE_S = 300;
@@ -88,7 +93,7 @@ export function createAppJwt(appId: string, privateKey: string): string {
   const signing = `${header}.${payload}`;
   const sign = crypto.createSign("RSA-SHA256");
   sign.update(signing);
-  const keyObject = parsePrivateKey(privateKey);
+  const keyObject = parseAppPrivateKey(privateKey);
   const sig = sign.sign(keyObject, "base64url");
   return `${signing}.${sig}`;
 }

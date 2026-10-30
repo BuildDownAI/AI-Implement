@@ -16,6 +16,7 @@ import * as restate from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { AccessRole } from "../access-entries.js";
+import { effectiveAccessCode } from "../admin-session.js";
 import { getRunnerMode, getKgMaterializeDirect, getKgExecutionMode, resolveKgBackend } from "../runner-mode.js";
 import { getMappings, resolveReviewProcessId, type RepoMapping } from "../config.js";
 import { getInFlightJobs, getRunRecordMergeVerdict, getJobById, getJobByMachineId, parseFailureJson, type Job } from "../log.js";
@@ -1015,7 +1016,7 @@ export const kgRepoHistory = kgTool("kg_repo_history");
 function mcpAdminConfig(): AdminConfig {
   const fly = getFlySessionsConfig();
   return {
-    adminAccessCode: process.env.ADMIN_ACCESS_CODE || null,
+    adminAccessCode: effectiveAccessCode(process.env.ADMIN_ACCESS_CODE),
     flySessionsToken: fly.token,
     flySessionsApp: fly.app,
     flySessionsRegion: fly.region,

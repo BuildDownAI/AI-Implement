@@ -4,6 +4,7 @@
 // Defaults are neutral literals, not the production DEFAULT_* constants, so a changed product default
 // never quietly changes every test that builds a mapping.
 import { vi } from "vitest";
+import type { AccessEntry } from "../../access-entries.js";
 import type { RepoMapping } from "../../config.js";
 import type { ChatGptPlanRecordV1 } from "../../chatgpt-plan-token.js";
 import type { ScopedInstallationToken } from "../../github-app-auth.js";
@@ -392,6 +393,19 @@ export function makeChatGptPlanRecord(overrides: Partial<ChatGptPlanRecordV1> = 
     accessTokenExpiresAt: savedAt + 60 * 60_000,
     earliestRefreshAt: null,
     savedAt,
+    ...overrides,
+  };
+}
+
+// An admin address saved at /admin#access by that admin when it is built, not yet bound to a sign-in.
+export function makeAccessEntry(overrides: Partial<AccessEntry> = {}): AccessEntry {
+  return {
+    kind: "address",
+    value: "admin@example.com",
+    role: "admin",
+    bindings: [],
+    addedAt: Date.now(),
+    addedBy: "admin@example.com",
     ...overrides,
   };
 }

@@ -71,6 +71,17 @@ import {
 
 export type RunnerPhase = "planning" | "implementation" | "gap-analysis" | "kg-refresh";
 
+/** The runner-callback variables that are unset, by name; empty when the callback path is configured. */
+export function missingRunnerCallbackConfig(config: {
+  runnerCallbackBaseUrl: string | null;
+  runnerTokenSecret: string | null;
+}): string[] {
+  return [
+    config.runnerCallbackBaseUrl ? null : "RUNNER_CALLBACK_BASE_URL",
+    config.runnerTokenSecret ? null : "RUNNER_TOKEN_SECRET",
+  ].filter((name): name is string => name !== null);
+}
+
 /**
  * AII-430: planning depends entirely on the runner callback to advance.
  *
@@ -98,11 +109,7 @@ export function planningDispatchBlockReason(config: {
   runnerCallbackBaseUrl: string | null;
   runnerTokenSecret: string | null;
 }): string | null {
-  const missing = [
-    config.runnerCallbackBaseUrl ? null : "RUNNER_CALLBACK_BASE_URL",
-    config.runnerTokenSecret ? null : "RUNNER_TOKEN_SECRET",
-  ].filter((name): name is string => name !== null);
-
+  const missing = missingRunnerCallbackConfig(config);
   if (missing.length === 0) return null;
 
   return (

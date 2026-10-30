@@ -32,11 +32,7 @@ The handover is deliberately operator-driven, never a boot-time migration. Two c
 
 ## Sign-in providers
 
-`providersFromEnv` (`src/oauth/providers.ts`) builds the list of OIDC providers once at boot,
-and `configureOAuthProviders` seeds it. Each provider is an `OidcProviderConfig`: `id`,
-`label`, `issuer` (the discovery base URL), `clientId`, `clientSecret`, `scopes`
-(`openid email profile`). A provider is included only when it is fully credentialed, and
-BuildDown is listed first because `/mcp/authorize` uses the first provider when the client names none:
+`resolveProviders` (`src/oauth/providers.ts`) builds the list of OIDC providers once at boot from its `PROVIDER_SPECS` table, and `configureOAuthProviders` seeds it. Each provider is an `OidcProviderConfig`: `id`, `label`, `issuer` (the discovery base URL), `clientId`, `clientSecret`, `scopes` (`openid email profile`). A provider is included only when it is fully credentialed, and BuildDown is listed first because `/mcp/authorize` uses the first provider when the client names none:
 
 | Provider | Env vars | Issuer |
 |---|---|---|
@@ -44,11 +40,7 @@ BuildDown is listed first because `/mcp/authorize` uses the first provider when 
 | Google | `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` | `https://accounts.google.com` |
 | Microsoft | `MICROSOFT_OAUTH_CLIENT_ID`, `MICROSOFT_OAUTH_CLIENT_SECRET`, `MICROSOFT_OAUTH_TENANT` | `https://login.microsoftonline.com/<tenant>/v2.0` |
 
-The control plane's set-up writes the BuildDown variables; a customer configures no SSO for it.
-`loadConfig` (`src/index.ts`) drops Microsoft when `MICROSOFT_OAUTH_TENANT` is `common`,
-`organizations` or `consumers`, because the email-verified rule holds only for a single-tenant
-issuer. SSO also needs `OAUTH_REDIRECT_BASE_URL`; without it redirect URIs cannot be built.
-A provider only proves who a person is. The allowlist above decides whether they get in.
+The control plane's set-up writes the BuildDown variables; a customer configures no SSO for it. `resolveProviders` drops Microsoft when `MICROSOFT_OAUTH_TENANT` is `common`, `organizations` or `consumers` (in any case), because the email-verified rule holds only for a single-tenant issuer. A provider with only some of its variables set is dropped too. Every dropped provider is named in a boot warning, `[main] <id> sign-in disabled: <reason>`; a provider with none of its variables set is simply absent. SSO also needs `OAUTH_REDIRECT_BASE_URL`; without it redirect URIs cannot be built. A provider only proves who a person is. The allowlist above decides whether they get in.
 
 ## How a request is decided
 

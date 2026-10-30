@@ -108,3 +108,14 @@ export function _resetPollCycleState(): void {
   _lastPollStartedAt = null;
   _lastPollFinishedAt = null;
 }
+
+/** `POLL_INTERVAL_MS` as `loadConfig` reads it: `parseInt` with a 60000 default, so trailing text is dropped and a non-number is `NaN`. */
+export function parsePollIntervalMs(raw: string | undefined): number {
+  return parseInt(raw || "60000", 10);
+}
+
+/**
+ * Node's largest timer delay: `setInterval` runs any longer delay every millisecond instead.
+ * True of Node 24, the pinned major (`engines`, `.tool-versions`); re-check it when the pin moves.
+ */
+export const MAX_POLL_INTERVAL_MS = 2_147_483_647;
