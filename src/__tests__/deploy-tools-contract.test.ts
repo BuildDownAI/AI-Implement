@@ -40,8 +40,9 @@ function textOf(recorded: Exchange): string {
   return recorded.response.body.content[0].text;
 }
 
+let setDeployHold: () => void;
 beforeEach(async () => {
-  await testDb({ modules: {} });
+  ({ modules: { setDeployHold } } = await testDb({ modules: { setDeployHold: async () => (await import("../deploy-hold.js")).setDeployHold } }));
 });
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -120,6 +121,8 @@ describe("recorded get_deploy_posture exchanges", () => {
   };
 
   it("draining", async () => {
+    // SelfDeploy.start claims the global hold before the record reads draining, so a real draining posture has deploy.held true.
+    setDeployHold();
     const { recorded, body } = await posture(record());
     expect(body.selfDeploy).toEqual(record());
     checkExchange("get_deploy_posture", "draining", recorded);

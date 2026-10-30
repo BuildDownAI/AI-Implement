@@ -585,7 +585,7 @@ describe("callTool", () => {
       expect(ingress.calls).toHaveLength(1);
     });
 
-    it.each(["trigger_kg_refresh", "get_widget", "decide_kg_refresh_x", "x_get_kg_status"])("%s is refused during a hold", async (name) => {
+    it.each(["trigger_kg_refresh", "get_widget", "decide_kg_refresh_x", "x_get_kg_status", "start_deploy", "get_deploy_posture"])("%s is refused during a hold", async (name) => {
       const ingress = ingressFor(name);
       const result = await callTool(name, {}, HUMAN_USER, { ...held, fetchImpl: ingress.fetch });
       expect(result).toEqual({ status: "deploy-held" });

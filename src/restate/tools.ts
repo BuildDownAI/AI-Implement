@@ -651,7 +651,7 @@ export const getDeployPostureTool = tool(
 );
 
 export const START_DEPLOY_DESCRIPTION =
-  "Start a self-deploy of this orchestrator to the published build of the head of `branch` (testing | main) (admin role, or the control plane's deploy-scoped token). Args: branch, requestedBy (1..200 characters). Returns { deployId, commit, image, alreadyActive }; a second start while a deploy is active returns the same deployId with alreadyActive true. A refusal is one fixed code as the error text: image-not-published, head-unknown or not-configured. Poll progress with get_deploy_posture's selfDeploy record.";
+  "Start a self-deploy of this orchestrator to the published build of the head of `branch` (testing | main) (admin role, or the control plane's deploy-scoped token). Args: branch, requestedBy (1..200 characters). Returns { deployId, commit, image, alreadyActive }; a second start that reaches the handler while a deploy is active returns the same deployId with alreadyActive true (through the HTTP door a second call during the deploy hold is refused first with 409 deploy-in-progress). A refusal is one fixed code as the error text: image-not-published, head-unknown or not-configured. Progress is get_deploy_posture's selfDeploy record, readable once the deploy hold clears (the door answers 409 deploy-in-progress while it is set).";
 
 /** The SelfDeploy object key: the same fallback as createSelfDeployIngressClient, so the tool and the admin routes address one object. */
 const selfDeployKey = (): string => process.env.FLY_APP_NAME ?? "orchestrator";
