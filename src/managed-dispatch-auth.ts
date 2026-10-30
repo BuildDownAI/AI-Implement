@@ -27,7 +27,7 @@ export interface ManagedDispatchRequest {
   /** Mapping key (`issue.scopeKey`). */
   projectKey: string;
   backend: DispatchAdmissionBackend;
-  /** The only repository sent for trust (operator decision 3). */
+  /** Repository used for the workflow-capability probe and credential scoping. */
   owner: string;
   repo: string;
   workflowFile: string;
