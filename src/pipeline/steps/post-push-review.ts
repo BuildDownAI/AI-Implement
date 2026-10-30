@@ -752,6 +752,7 @@ function probeExternalReviewCheck(
   warnOnce: WarnOnce,
 ): ExternalReviewProbe {
   const { configuredCheckNames, process } = opts;
+  if (process.checkPairs.length === 0) return readProcessVerdict(ghSpawn, prNumber, headSha, [], opts);
   // --paginate --slurp, not a bare per_page=100: on a busy SHA the review check can fall
   // outside the first page, and a truncated page is indistinguishable from "no reviewer" —
   // which resolves to "absent" and fails OPEN. parseCheckRuns already accepts the array-of-
@@ -833,7 +834,10 @@ function readProcessVerdict(
   if (blocks === null) return { state: "unreadable" };
 
   let payload: unknown;
+  let issuePayload: unknown;
   try {
+    issuePayload = JSON.parse(issueComments.stdout);
+    if (!Array.isArray(issuePayload)) return { state: "unreadable" };
     payload = JSON.parse(commentsRes.stdout);
   } catch {
     return { state: "unreadable" };
@@ -863,10 +867,15 @@ function readProcessVerdict(
     headSha,
     checkRuns: matchedRuns.map((run) => ({ ...run, conclusion: run.conclusion || null })),
     inlineComments,
+    issueComments: (issuePayload as unknown[]).flat().map((item) => {
+      const c = asRecord(item);
+      const user = recordProp(c, "user");
+      return { authorLogin: stringProp(user, "login"), authorType: stringProp(user, "type"), body: stringProp(c, "body"), updatedAt: stringProp(c, "updated_at") || stringProp(c, "created_at") };
+    }),
     blocks,
   });
   if (verdict.verdict === "approve" || verdict.verdict === "changes_requested") return { state: "completed", verdict, issueComments };
-  if (verdict.verdict === "incomplete" && verdict.source !== "none") return { state: "running", verdict, issueComments };
+  if (verdict.verdict === "incomplete" && (verdict.source !== "none" || opts.process.checkPairs.length === 0)) return { state: "running", verdict, issueComments };
   return { state: "no-real-verdict", verdict, issueComments };
 }
 
@@ -2331,8 +2340,14 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       const summaryBlockingGates = reviewProcess.summaryBlockingGates;
       const contractVerdict = externalFindingsResult.verdictSource === "review-contract" ? externalFindingsResult.verdict : undefined;
       const reviewLedger = buildReviewLedger(internalIssues, [...selectedInternalFindings, ...externalFindings], effectiveReviewerPolicy, summaryBlockingGates, contractVerdict);
-      const gatingReviewFindings = reviewLedger.filter((finding) => isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates, contractVerdict));
-      const advisoryReviewFindings = reviewLedger.filter((finding) => !isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates, contractVerdict));
+      const findingGates = (finding: PostPushReviewLedgerFinding): boolean => {
+        // Codex P2/untagged comments are advisory even though other processes gate by source.
+        if (reviewProcess.id === "codex-code-review" && finding.severity === "minor"
+          && (finding.source === "github-review" || finding.source === "github-review-thread")) return false;
+        return isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates, contractVerdict);
+      };
+      const gatingReviewFindings = reviewLedger.filter(findingGates);
+      const advisoryReviewFindings = reviewLedger.filter((finding) => !findingGates(finding));
       // A finding the fix agent disposed as "follow-up" on an earlier iteration is dropped here,
       // before the merge-readiness decision and before it can reappear in the next fix prompt.
       // An "invalid" disposition is not filtered — it stays gating so the next review decides.

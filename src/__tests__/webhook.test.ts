@@ -2796,6 +2796,39 @@ describe("Restate review-fix lifecycle forwards instead of writing (AII-1184)", 
     return { status: res.statusCode, body: JSON.parse(res.body) as Record<string, unknown> };
   }
 
+  it.each([0, 1, 2])("Codex P%s forwards only blocking findings", async (priority) => {
+    hoisted.getMappings.mockReturnValue(orgRepoMapping({ reviewFixLifecycle: "restate", reviewProcess: "codex-code-review" }));
+    seedDispatch(90 + priority);
+    const ingress = fakeIngress();
+    const { event, payload } = payloads.reviewComment!(90 + priority,
+      `**<sub><sub>![P${priority} Badge](https://img.shields.io/badge/P${priority}-orange?style=flat)</sub></sub>  Bug**`);
+    (payload as { comment: { user: unknown } }).comment.user = { login: "chatgpt-codex-connector[bot]", type: "Bot" };
+    const { req, res } = makeRequest(SECRET, event, payload, undefined, { "x-github-delivery": `codex-${priority}` });
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, undefined, undefined, ingress as never);
+    expect(ingress.feedback).toHaveBeenCalledTimes(priority === 2 ? 0 : 1);
+    if (priority !== 2) expect(ingress.feedback.mock.calls[0]![1]).toMatchObject({ findings: [{ severity: "blocking" }] });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 90 + priority)).toEqual([]);
+  });
+
+  it.each([
+    { login: "chatgpt-codex-connector[bot]", commit: "sha-old", reason: "stale_head" },
+    { login: "untrusted-codex[bot]", commit: "sha-current", reason: "untrusted_author" },
+  ])("rejects Codex P1 intake: $reason", async ({ login, commit, reason }) => {
+    hoisted.getMappings.mockReturnValue(orgRepoMapping({ reviewFixLifecycle: "restate", reviewProcess: "codex-code-review" }));
+    seedDispatch(95);
+    const ingress = fakeIngress();
+    const { event, payload } = payloads.reviewComment!(95,
+      "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Bug**", commit);
+    (payload as { comment: { user: unknown } }).comment.user = { login, type: "Bot" };
+    const { req, res } = makeRequest(SECRET, event, payload, undefined, { "x-github-delivery": `codex-${reason}` });
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, undefined, undefined, ingress as never);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason });
+    expect(ingress.feedback).not.toHaveBeenCalled();
+    expect(reviewStore.listOpenReviewFindings("org/repo", 95)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
   it.each(["review", "reviewComment", "issueComment"])("%s: forwards with the delivery id, answers 202, writes nothing", async (kind) => {
     mapRepo("restate");
     seedDispatch(10);

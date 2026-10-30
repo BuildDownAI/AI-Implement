@@ -297,7 +297,7 @@ export const listProjects = tool(
 );
 
 export const GET_PROJECT_BINDING_DESCRIPTION =
-  "Returns the binding a skill needs for its own project: team key, repo, default branch, tracker kind, the resolved review process (reviewProcess: ai-implement or claude-code-review), the effective pickup label (the live ADR 022 settings value, not a hardcoded default), and the knowledge-graph binding (present, orchestratorUrl, sourceRepo, baseRepo, searchTool). Pass `repo` (owner/repo) or `team` to select one project, returned as a single object; omit both to list every mapping as an array. Never includes extraEnv or a token.";
+  "Returns the binding a skill needs for its own project: team key, repo, default branch, tracker kind, the resolved review process (reviewProcess: ai-implement, claude-code-review, claude-code-review-repository-fix, or codex-code-review), the effective pickup label (the live ADR 022 settings value, not a hardcoded default), and the knowledge-graph binding (present, orchestratorUrl, sourceRepo, baseRepo, searchTool). Pass `repo` (owner/repo) or `team` to select one project, returned as a single object; omit both to list every mapping as an array. Never includes extraEnv or a token.";
 
 export const getProjectBinding = tool(
   {
@@ -1454,8 +1454,8 @@ export const addProjectArgsSchema = z.object({
   trustedReviewAuthors: z.array(z.string()).nullable().optional().describe(
     "Extra GitHub logins trusted as review authors for this project, additive to the built-in trusted authors (ai-implement, ai-implement[bot], and the Claude logins — github-actions[bot] is trusted separately). Omit to keep the stored value; pass null to reset to built-ins only.",
   ),
-  reviewProcess: z.enum(["ai-implement", "claude-code-review", "claude-code-review-repository-fix"]).nullable().optional().describe(
-    "The project's review process. Omit to keep the stored value; pass null or \"ai-implement\" for the default. It applies to every project; only the forward to the Restate fix attempt needs the Restate lifecycle.",
+  reviewProcess: z.enum(["ai-implement", "claude-code-review", "claude-code-review-repository-fix", "codex-code-review"]).nullable().optional().describe(
+    "The project's review process. codex-code-review requires the Restate lifecycle. Omit to keep the stored value; pass null or \"ai-implement\" for the default. Claude and AI-Implement apply to every project; Codex Code Review is Restate-only.",
   ),
 });
 

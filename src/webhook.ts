@@ -8,7 +8,7 @@ import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, classifyReviewIssueComment, reviewCo
 import { getMappings, resolveReviewFixLifecycle } from "./config.js";
 import type { ReviewFixIngressClient } from "./restate/review-fix-client.js";
 import { REVIEW_FIX_EVENT_BODY_MAX_BYTES, type ReviewFixFeedbackEvent } from "./restate/review-fix-pr.js";
-import { classifyClaudeInlineMarker, isTrustedReviewAuthor, resolveReviewProcess } from "./review-process.js";
+import { isTrustedReviewAuthor, resolveReviewProcess } from "./review-process.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { resolveWorkflowContract, type WorkflowContract } from "./workflow-probe.js";
 import { enqueueCommentGapfill } from "./comment-gapfill-queue.js";
@@ -682,7 +682,7 @@ async function handleReviewCommentWebhook(
     return;
   }
 
-  // Marker severity is a `claude-code-review` rule: the internal reviewers emit the ADR 020 block. Humans stay
+  // Inline severity comes from the selected process; internal reviewers emit the ADR 020 block. Humans stay
   // `medium`; an unlisted bot is ignored under every process.
   const reviewProcess = resolveRepoReviewProcess(repoFullName);
   let severity: ReviewLedgerFinding["severity"] = "medium";
@@ -692,8 +692,8 @@ async function handleReviewCommentWebhook(
     res.end(JSON.stringify({ ignored: true, reason: "untrusted_author" }));
     return;
   }
-  if (reviewProcess.process.claudeInlineMarkers && isBotAuthor) {
-    const marker = classifyClaudeInlineMarker(body);
+  if (reviewProcess.process.classifyInline && isBotAuthor) {
+    const marker = reviewProcess.process.classifyInline(body);
     if (marker === null) {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ignored: true, reason: "pre_existing" }));
@@ -742,6 +742,11 @@ async function handleReviewCommentWebhook(
     actor: payload.comment?.user?.login,
     findings: [finding],
   };
+  if (reviewProcess.process.id === "codex-code-review" && severity !== "blocking") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "advisory_finding" }));
+    return;
+  }
   if (reviewProcess.restate) {
     await forwardReviewFixEvent(res, ingress, input, deliveryId, payload.installation?.id);
     return;

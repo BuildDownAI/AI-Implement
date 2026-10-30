@@ -10,7 +10,7 @@ import {
   type ReviewVerdictInput,
 } from "../review-process.js";
 
-const HEAD = "abc123";
+const HEAD = "502838ec1958f0b6795ae777106587865f9f6f8e";
 const claude = REVIEW_PROCESSES["claude-code-review"];
 const aiImplement = REVIEW_PROCESSES["ai-implement"];
 
@@ -21,7 +21,7 @@ const comment = (over: Partial<ReviewVerdictInput["inlineComments"][number]> = {
   authorLogin: "claude[bot]", authorType: "Bot", body: "Rename this.", path: "a.ts", line: 3, commitId: HEAD, ...over,
 });
 const input = (over: Partial<ReviewVerdictInput> = {}): ReviewVerdictInput => ({
-  headSha: HEAD, checkRuns: [check()], inlineComments: [comment(), comment({ line: 9 })], blocks: [], ...over,
+  headSha: HEAD, checkRuns: [check()], inlineComments: [comment(), comment({ line: 9 })], blocks: [], issueComments: [], ...over,
 });
 const hosted = (normal: number) =>
   `Details\n<!-- bughunter-severity: {"normal":${normal},"nit":1,"pre_existing":0} -->`;
@@ -47,11 +47,11 @@ describe("definitions", () => {
     expect(repoFix.trustedAuthors).toEqual(claude.trustedAuthors);
     expect(repoFix.checkPairs).toEqual(claude.checkPairs);
     expect(repoFix.readVerdict).toBe(claude.readVerdict);
-    expect(repoFix.claudeInlineMarkers).toBe(true);
+    expect(repoFix.classifyInline).toBe(classifyClaudeInlineMarker);
     expect(repoFix.summaryBlockingGates).toBe(true);
     expect(claude.fixer).toBe("ai-implement");
     expect(aiImplement.summaryBlockingGates).toBe(false);
-    expect(aiImplement.claudeInlineMarkers).toBe(false);
+    expect(aiImplement.classifyInline).toBeUndefined();
   });
 
   it("keeps trusted authors lowercase", () => {
@@ -179,5 +179,52 @@ describe("DEFAULT_REVIEW_CHECK_NAMES drift guard", () => {
     const original = literal("../pipeline/steps/post-push-review.ts");
     expect(original.length).toBeGreaterThan(0);
     expect(literal("../review-process.ts")).toEqual(original);
+  });
+});
+
+const codex = REVIEW_PROCESSES["codex-code-review"];
+const codexBadge = (p: number) => `**<sub><sub>![P${p} Badge](https://img.shields.io/badge/P${p}-yellow?style=flat)</sub></sub>  Handle multi-team history without inventing a winning team**`;
+const stateComment = (status = "completed", unresolved: boolean = false, commit = HEAD) => ({
+  authorLogin: "chatgpt-codex-connector[bot]", authorType: "Bot",
+  body: `<!-- codex-pull-request-review-summary -->
+<!-- codex-review-state:v1 {"code_review":{"commit_sha":"${commit}","has_any_findings":true,"has_unresolved_findings":${unresolved},"status":"${status}"},"security_review":{"commit_sha":null,"has_any_findings":null,"has_unresolved_findings":null,"status":null}} -->`,
+});
+describe("Codex Code Review", () => {
+  it("defines only the Codex authors, with no check pairs and the AI fixer", () => {
+    expect(codex.trustedAuthors).toEqual(["chatgpt-codex-connector[bot]", "chatgpt-codex-connector"]);
+    expect(codex.checkPairs).toEqual([]);
+    expect(codex.fixer).toBe("ai-implement");
+  });
+  it.each([[0, "blocking"], [1, "blocking"], [2, "minor"]])("classifies P%s", (p, severity) => {
+    expect(codex.classifyInline!(codexBadge(Number(p)))).toBe(severity);
+    expect(codex.classifyInline!("no badge")).toBe("untagged");
+  });
+  it.each([
+    ["completed", false, "approve"], ["completed", true, "changes_requested"],
+    ["running", false, "incomplete"], ["failed", false, "no-real-verdict"],
+  ] as const)("reads %s unresolved=%s", (status, unresolved, verdict) => {
+    expect(codex.readVerdict(input({ issueComments: [stateComment(status, unresolved)] })).verdict).toBe(verdict);
+  });
+  it("includes only trusted badge findings on the exact head", () => {
+    const comments = [0, 1, 2].map((p) => comment({ authorLogin: "chatgpt-codex-connector[bot]", body: codexBadge(p) }));
+    const result = codex.readVerdict(input({ issueComments: [stateComment("completed", true)], inlineComments: [
+      ...comments, { ...comments[0]!, commitId: "old" }, { ...comments[0]!, authorLogin: "evil[bot]" },
+      { ...comments[0]!, body: "no badge" }, { ...comments[0]!, commitId: undefined },
+    ] }));
+    expect(result.findings.map((f) => f.severity)).toEqual(["blocking", "blocking", "minor"]);
+  });
+  it("ignores stale, untrusted, human and malformed state; silence waits", () => {
+    for (const issueComments of [[], [stateComment("completed", false, "old")],
+      [{ ...stateComment(), authorLogin: "evil[bot]" }], [{ ...stateComment(), authorType: "User" }],
+      [{ ...stateComment(), body: "<!-- codex-review-state:v1 {oops} -->" }]]) {
+      expect(codex.readVerdict(input({ issueComments })).verdict).toBe("incomplete");
+    }
+  });
+  it("uses the newest matching state, including edits and the GraphQL login", () => {
+    expect(codex.readVerdict(input({ issueComments: [stateComment(), stateComment("running")] })).verdict).toBe("incomplete");
+    expect(codex.readVerdict(input({ issueComments: [
+      { ...stateComment(), authorLogin: "chatgpt-codex-connector", updatedAt: "2026-10-30T12:00:00Z" },
+      { ...stateComment("running"), updatedAt: "2026-10-30T11:00:00Z" },
+    ] })).verdict).toBe("approve");
   });
 });
