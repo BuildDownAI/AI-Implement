@@ -7,7 +7,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import type { SelfDeployClient, SelfDeployRecord, SelfDeployStartResult, SelfDeployStatus } from "../restate/self-deploy.js";
-import { StartDeployArgsSchema } from "../restate/tools.js";
+import { GetDeployPostureArgsSchema, StartDeployArgsSchema } from "../restate/tools.js";
 import { testDb } from "./helpers/test-db.js";
 import { recordExchange, checkExchange, type Exchange } from "./contract-recorder.js";
 
@@ -80,7 +80,9 @@ describe("recorded start_deploy exchanges", () => {
   it.each(["head-unknown", "not-configured"] as const)("answers the refusal %s as the bare code", async (reason) => {
     const recorded = await recordExchange("start_deploy", { args: ARGS }, { ...DEPLOY, objectClient: selfDeploy({ reason }).objectClient });
     expect(recorded.response.body.isError).toBe(true);
+    expect(recorded.response.status).toBe(200);
     expect(textOf(recorded)).toBe(reason);
+    checkExchange("start_deploy", reason, recorded);
   });
 
   it("read-scope-refused", async () => {
@@ -130,6 +132,23 @@ describe("recorded get_deploy_posture exchanges", () => {
     checkExchange("get_deploy_posture", "draining", recorded);
   });
 
+  it.each(["applying", "verifying"] as const)("%s", async (phase) => {
+    setDeployHold();
+    const active = record({ phase });
+    const { recorded, body } = await posture(active);
+    expect(body.selfDeploy).toEqual(active);
+    expect(body.deploy.held).toBe(true);
+    checkExchange("get_deploy_posture", phase, recorded);
+  });
+
+  it("cancelled", async () => {
+    const cancelled = record({ phase: "cancelled", finishedAt: T + 600_000 });
+    const { recorded, body } = await posture(cancelled);
+    expect(body.selfDeploy).toEqual(cancelled);
+    expect(body.deploy.held).toBe(false);
+    checkExchange("get_deploy_posture", "cancelled", recorded);
+  });
+
   it("succeeded", async () => {
     const done = record({ phase: "succeeded", finishedAt: T + 600_000 });
     const { recorded, body } = await posture(done);
@@ -145,7 +164,9 @@ describe("recorded get_deploy_posture exchanges", () => {
   });
 
   it("serves selfDeploy: null when no deploy was recorded", async () => {
-    expect((await posture(null)).body.selfDeploy).toBeNull();
+    const { recorded, body } = await posture(null);
+    expect(body.selfDeploy).toBeNull();
+    checkExchange("get_deploy_posture", "no-deploy", recorded);
   });
 });
 
@@ -203,9 +224,27 @@ describe("start_deploy args.schema.json", () => {
 
   it("accepts the request.args of every recorded start_deploy exchange except invalid-args", () => {
     const schema = load();
-    for (const scenario of ["started", "already-active", "image-not-published", "read-scope-refused", "invalid-args"]) {
+    for (const scenario of ["started", "already-active", "image-not-published", "head-unknown", "not-configured", "read-scope-refused", "invalid-args"]) {
       const args = JSON.parse(readFileSync(new URL(`${scenario}.json`, DIR), "utf8")).request.args;
       expect(validate(schema, args), scenario).toBe(scenario !== "invalid-args");
     }
+  });
+});
+
+
+describe("get_deploy_posture args.schema.json", () => {
+  const dir = new URL("../../docs/contracts/get_deploy_posture/", import.meta.url);
+  const schemaFile = new URL("args.schema.json", dir);
+  const schemaText = `${JSON.stringify(z.toJSONSchema(GetDeployPostureArgsSchema), null, 2)}\n`;
+  const hint = "Regenerate with UPDATE_CONTRACT_FIXTURES=1 npx vitest run src/__tests__/deploy-tools-contract.test.ts, and tell the control plane: it copies this file.";
+
+  it("matches the schema in code", () => {
+    if (process.env.UPDATE_CONTRACT_FIXTURES === "1") {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(schemaFile, schemaText);
+      return;
+    }
+    if (!existsSync(schemaFile)) throw new Error(`docs/contracts/get_deploy_posture/args.schema.json is missing. ${hint}`);
+    if (readFileSync(schemaFile, "utf8") !== schemaText) throw new Error(`args.schema.json differs from the get_deploy_posture input. ${hint}\nActual:\n${schemaText}`);
   });
 });
