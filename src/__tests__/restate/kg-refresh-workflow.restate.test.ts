@@ -1656,7 +1656,7 @@ describe("KgRefresh durable workflow", () => {
   registerOwnedRunContract(
     {
       name: "KgRefresh",
-      scenarios: [1],
+      scenarios: [1, 6],
       hasCleanup: false,
       start(baseUrl, _key, { faults }) {
         const recorded: string[] = [];
@@ -1683,6 +1683,7 @@ describe("KgRefresh durable workflow", () => {
       calls: () => lastContractCalls,
     },
     deadlineEnvFor,
+    { pending: { 6: "Result intake adoption is deferred (AII-1622)" } },
   );
 
   it.each(VARIANTS.map(([label]) => label))("AII-1046: a GitHub Actions timeout never calls stopMachineRun (%s)", async (label) => {

@@ -12,20 +12,21 @@ A fact about `ctx.run` (confirmed for SDK 1.17.1): a step with no `maxRetryAttem
 
 ## Decision
 
-**1. One kit holds the steps.** `src/restate/owned-run-lifecycle.ts` has four functions. Each runs a plain function the caller passes in one named `ctx.run` step with `maxRetryAttempts: 3`, and re-throws a suspension.
+**1. One kit holds the steps.** `src/restate/owned-run-lifecycle.ts` holds the lifecycle functions. Each runs a plain function the caller passes in one named `ctx.run` step with `maxRetryAttempts: 3`, and re-throws a suspension.
 
 | Function | Step | When all attempts fail |
 | -- | -- | -- |
+| `acceptOwnedRunReport` | `record-usage` | throws; report remains unresolved |
 | `reserveOwnedRun` | `reserve` | throws; nothing is held |
 | `readOwnedRunStatus` | caller's name | logs, returns `unknown` |
 | `cleanupOwnedRun` | `cleanup` | logs, returns |
 | `reportOwnedRunOutcome` | `outcome` | logs, returns |
 
-**2. One error rule.** A best-effort step swallows every error except a suspension, because the release must run. The reservation is the one step that does not swallow.
+**2. One error rule.** A best-effort step swallows every error except a suspension or invocation cancellation (409), because the release must run. Reservation and report intake do not swallow failures.
 
 **3. The caller's function must be safe to run twice.** The kit fixes the step name and the bound. It cannot make an effect idempotent. The reservation is check-then-take, keyed by the dispatch id, so a retry after a commit returns `true`. The launch checks for an existing run in the same step.
 
-**4. One contract suite proves the lifecycle.** `src/__tests__/restate/owned-run-contract.ts` exports `registerOwnedRunContract(adapter, envFor)`. An adapter says how to start the workflow, how to inject each fault, and how to read the calls it recorded. The five scenarios: a status read that fails on each attempt still reaches the deadline, stops, and releases; a crash after the launch adopts the run; a normal end runs `cleanup` with the run id, `outcome` once, then the release; a refused reservation launches nothing, cleans up nothing, and releases nothing; a failed `cleanup` and `outcome` still release. Each run kind runs the suite against its own workflow.
+**4. One contract suite proves the lifecycle.** `src/__tests__/restate/owned-run-contract.ts` exports `registerOwnedRunContract(adapter, envFor)`. An adapter says how to start the workflow, how to inject each fault, and how to read the calls it recorded. The first five scenarios: a status read that fails on each attempt still reaches the deadline, stops, and releases; a crash after the launch adopts the run; a normal end runs `cleanup` with the run id, `outcome` once, then the release; a refused reservation launches nothing, cleans up nothing, and releases nothing; a failed `cleanup` and `outcome` still release. Each run kind runs the suite against its own workflow.
 
 ## The rule for a new run kind
 
@@ -51,9 +52,15 @@ Easier: a new run kind calls four functions and runs one suite. A step with no b
 
 Harder: an adapter must supply fault injection, and the caller must write each effect to be safe to run twice.
 
+## Result intake
+
+`acceptOwnedRunReport(ctx, "report", value, onAccept?)` accepts plain JSON without secrets. It compares recursively sorted object keys (array order matters): the first value is accepted, an equal value is a duplicate, and a different value throws 409, including after the owning run completes. Resolved `null` is a value. The optional callback runs in bounded `record-usage` before resolution; exhausted failures propagate without resolving. Completed steps replay from the journal, including a crash before resolution. As with other kit effects, an unfinished step may retry, so the callback must be idempotent. A reserved companion promise (`owned-run-report-owner:<promiseName>`) atomically elects one reporting invocation before any callback runs. Concurrent reports attach to that invocation before comparing the resolved value, so equal reports are duplicates and different reports conflict without recording usage again. If attaching proves the owner definitively failed, contenders advance to the next numbered companion promise and elect a new owner atomically. A later report can therefore recover an unresolved result after exhausted storage attempts; a crash or suspension retains the current owner and its journal.
+
+Scenario 6 checks accepted, duplicate, conflict and one callback on every harness variant. Consumers register it through `options.pending` until adoption.
+
 ## Status after adoption
 
-Two run kinds adopted the kit and the suite: `PlanningRun` (AII-1064, AII-1065, AII-1068) and `KgRefresh` (AII-1066). `PlanningRun` runs all five scenarios. `KgRefresh` runs scenario 1 only. Four scenarios do not apply to it:
+The original kit adopters are: `PlanningRun` (AII-1064, AII-1065, AII-1068) and `KgRefresh` (AII-1066). `PlanningRun` runs scenarios 1–5. `KgRefresh` runs scenario 1 only. Four scenarios do not apply to it:
 
 * **Scenario 2** (a crash after the launch adopts the run): the `dispatch` step already looks the run up by title before it dispatches.
 * **Scenario 3** (a normal end runs `cleanup`, `outcome`, then the release): a normal end runs the rail gates, and `KgRefresh` has no `cleanup` step.
@@ -61,3 +68,5 @@ Two run kinds adopted the kit and the suite: `PlanningRun` (AII-1064, AII-1065, 
 * **Scenario 5** (a failed `cleanup` and `outcome` still release): `KgRefresh` has no `cleanup` step to fail.
 
 The AII-1058 gaps are closed in `PlanningRun`. The table above lists each fenced Legacy function by call site in [restate.md](../restate.md#the-owned-run-lifecycle-kit).
+
+`ImplementationRun` also uses the lifecycle kit and scenarios 1–5. `ReviewFixAttempt` uses `readOwnedRunStatus`, with no shared contract adapter yet. The new result intake has no production callers: scenario 6 is pending for PlanningRun, ImplementationRun and KgRefresh; ReviewFixAttempt intake and contract adoption are deferred. The kit fixture executes all six scenarios.
