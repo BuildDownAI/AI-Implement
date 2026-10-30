@@ -8,6 +8,7 @@ export function deployFixture() {
   const state = { held: false, work: true, commit: COMMIT, status: 200, head: COMMIT as string | null, outcomes: [] as SelfDeployRecord[], reads: 0 };
   const deps: SelfDeployDeps = {
     config: () => config,
+    getDeployPolicy: vi.fn(() => ({ watchedRepo: null, watchedRef: null })),
     head: vi.fn(async () => state.head),
     registryHead: vi.fn(async () => state.status),
     fly: {

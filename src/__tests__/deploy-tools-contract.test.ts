@@ -20,7 +20,7 @@ const DEPLOY = { scope: "orchestrator:deploy" };
 const ARGS = { branch: "testing", requestedBy: "control-plane" };
 
 const record = (over: Partial<SelfDeployRecord> = {}): SelfDeployRecord => ({
-  deployId: DEPLOY_ID, phase: "draining", target: { branch: "testing", commit: COMMIT, image: IMAGE, source: "published" },
+  deployId: DEPLOY_ID, phase: "draining", target: { repo: "owner/repo", branch: "testing", commit: COMMIT, image: IMAGE, source: "published" },
   requestedBy: "control-plane", startedAt: T, finishedAt: null, reason: null, ...over,
 });
 
