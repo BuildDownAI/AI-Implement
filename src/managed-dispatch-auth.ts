@@ -27,7 +27,7 @@ export interface ManagedDispatchRequest {
   /** Mapping key (`issue.scopeKey`). */
   projectKey: string;
   backend: DispatchAdmissionBackend;
-  /** The only repository sent for trust (operator decision 3). */
+  /** Repository used for the workflow-capability probe and credential scoping. */
   owner: string;
   repo: string;
   workflowFile: string;
@@ -112,7 +112,6 @@ export async function prepareManagedDispatch(
         backend: req.backend,
         workflowRepository: repository,
         workflowFile: req.workflowFile,
-        repositories: [repository],
       },
       runtime.preparationDeps({ owner: req.owner, repo: req.repo, projectKey: req.projectKey }),
     );

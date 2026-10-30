@@ -59,7 +59,6 @@ let index: typeof IndexModule;
 let repoImage: typeof RepoImageModule;
 let github: typeof GithubModule;
 let probe: typeof WorkflowProbeModule;
-let visibility: "public" | "private";
 let planRecord = true;
 let logs: string[];
 
@@ -110,7 +109,6 @@ beforeEach(async () => {
   // The launch writes its secret env file under os.tmpdir().
   testTempRoot("dispatch-local-protected");
   vi.stubEnv("RUNNER_TOKEN_SECRET", RUNNER_SECRET);
-  visibility = "private";
   planRecord = true;
   logs = [];
   for (const m of ["log", "warn", "error"] as const) {
@@ -156,7 +154,6 @@ beforeEach(async () => {
     preparationDeps: () => ({
       ownership,
       credentials,
-      getRepoTrust: async () => ({ visibility, trustedForSubscription: true }),
       readDefaultBranchWorkflows: async () => ({}),
       checkRunnerCapability: async () => true,
     }),
@@ -243,13 +240,6 @@ describe("opted-in local Docker implementation", () => {
     expect(fs.existsSync(file)).toBe(false);
   });
 
-  it("a public repo refuses without launching", async () => {
-    visibility = "public";
-    await dispatchLocal();
-    expect(dockerCalls).toHaveLength(0);
-    expect(admissions()).toBe(0);
-    expect(provider.markImplementationFailed).toHaveBeenCalledOnce();
-  });
 });
 
 describe("opted-out local Docker implementation", () => {

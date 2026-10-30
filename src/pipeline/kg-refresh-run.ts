@@ -260,7 +260,6 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     env: process.env,
     snapshot: agentConfig,
     workspaceDir,
-    repositories: [`${githubOwner}/${githubRepo}`],
     options: opts.configured,
   });
 

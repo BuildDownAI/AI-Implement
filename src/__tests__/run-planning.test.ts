@@ -1076,8 +1076,6 @@ describe("configured planning (shared prepareConfiguredRun + selected stage exec
   // ---- Local entrypoint ----
 
   const localBase = () => ({ workspaceDir: ws, issueIdentifier: "L-1", issueTitle: "T", issueDescription: "D", executor: legacy });
-  // The snapshot's review profile is a subscription, so a local run needs an explicit trust source for the target repo.
-  const localTrust = { repositories: ["o/r"], repoTrust: async () => ({ visibility: "private" as const, trustedForSubscription: true }) };
   const apiPort = () => ({
     load: vi.fn(async ({ profileId, authMode }: { profileId: string; authMode: string }) => ({ kind: "api-key" as const, apiKey: S_API, profileId, authMode })),
   });
@@ -1089,7 +1087,7 @@ describe("configured planning (shared prepareConfiguredRun + selected stage exec
       ...localBase(),
       model: "opts-model",
       agentConfig: snapshotFor("codex"),
-      configured: { localCredentialPort: apiPort() as never, modelAuthClient: client, createCodex: codex.createCodex, ...localTrust },
+      configured: { localCredentialPort: apiPort() as never, modelAuthClient: client, createCodex: codex.createCodex },
     });
     expect(r.diagnostics).toBe("");
     expect(r).toMatchObject({ exitCode: 0, planFound: true });
@@ -1106,7 +1104,7 @@ describe("configured planning (shared prepareConfiguredRun + selected stage exec
       ...localBase(),
       agentConfig: snapshotFor("claude"),
       spawnImpl: impl,
-      configured: { localCredentialPort: port as never, modelAuthRoot: authRoot, ...localTrust },
+      configured: { localCredentialPort: port as never, modelAuthRoot: authRoot },
     });
     expect(r.diagnostics).toBe("");
     expect(r).toMatchObject({ exitCode: 0, planFound: true });

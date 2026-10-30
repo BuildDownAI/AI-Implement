@@ -10,13 +10,12 @@
  * No secret reaches a log or a thrown message: failures use fixed text.
  */
 import { randomUUID } from "node:crypto";
-import { getProjectOptIn } from "./agent-config-store.js";
 import type { AgentConfigAdminDeps } from "./admin.js";
 import { inspectAgentReadiness, type AgentRunPreparationDeps } from "./agent-run-preparation.js";
 import { getDb } from "./dedup.js";
 import { getMappings } from "./config.js";
 import { getScopedInstallationToken } from "./github-app-auth.js";
-import { defaultFetchSignal, getDefaultBranchFileText } from "./github.js";
+import { getDefaultBranchFileText } from "./github.js";
 import type { ModelCredentialDeps } from "./model-credentials.js";
 import { createModelProtectedSecrets } from "./model-protected-secrets.js";
 import { createModelSessionKeyProvider } from "./model-session-keys.js";
@@ -25,7 +24,6 @@ import type { ModelSessionOwnership } from "./model-session-ownership.js";
 import { createModelSessionStore } from "./model-session-store.js";
 import type { ModelSessionStore } from "./model-session-store.js";
 import { resolveSessionImage } from "./repo-image.js";
-import type { RepoTrust, RepoVisibility } from "./repo-trust.js";
 import type { AppConfig } from "./index.js";
 
 type RuntimeConfig = Pick<AppConfig, "githubAppId" | "githubAppPrivateKey" | "sessionImage">;
@@ -40,7 +38,6 @@ export interface ModelAuthRuntime {
   preparationDeps(target: { owner: string; repo: string; projectKey: string }): AgentRunPreparationDeps;
 }
 
-const VISIBILITIES: readonly RepoVisibility[] = ["public", "private", "internal"];
 const REPO_REF = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/;
 
 export function createModelAuthRuntime(input: {
@@ -89,38 +86,6 @@ export function createModelAuthRuntime(input: {
     }
   }
 
-  async function fetchVisibility(repository: string): Promise<RepoVisibility> {
-    const m = REPO_REF.exec(repository);
-    if (!m) throw new Error("malformed repository reference");
-    const bearer = await token(m[1]!, m[2]!);
-    let res: Response;
-    try {
-      res = await fetchImpl(`https://api.github.com/repos/${m[1]}/${m[2]}`, {
-        headers: {
-          Accept: "application/vnd.github+json",
-          "X-GitHub-Api-Version": "2022-11-28",
-          "User-Agent": "linear-dispatch-worker",
-          Authorization: `Bearer ${bearer}`,
-        },
-        signal: defaultFetchSignal(),
-      });
-    } catch {
-      throw new Error("repository visibility fetch failed");
-    }
-    if (!res.ok) throw new Error(`repository visibility fetch returned HTTP ${res.status}`);
-    let data: { visibility?: unknown };
-    try {
-      data = (await res.json()) as { visibility?: unknown };
-    } catch {
-      throw new Error("repository visibility response was not JSON");
-    }
-    const v = data.visibility;
-    if (typeof v !== "string" || !VISIBILITIES.includes(v as RepoVisibility)) {
-      throw new Error("repository visibility missing or unrecognised");
-    }
-    return v as RepoVisibility;
-  }
-
   return {
     sessionStore,
     ownership,
@@ -129,10 +94,6 @@ export function createModelAuthRuntime(input: {
       return {
         ownership,
         credentials,
-        async getRepoTrust(repository): Promise<RepoTrust> {
-          const visibility = await fetchVisibility(repository);
-          return { visibility, trustedForSubscription: visibility === "private" && getProjectOptIn(target.projectKey) };
-        },
         // Text at the mapping's branch (the one dispatch runs), else GitHub's default; repo-scoped token. `null` is an absent file; any other failure throws, which
         // preparation reports as `delivery_unreadable` (never as "absent").
         async readDefaultBranchWorkflows(repository, paths) {

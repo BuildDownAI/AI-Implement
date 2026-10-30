@@ -578,19 +578,6 @@ describe("production managed GHA review-fix launch", () => {
       expect(await admit()).toBe("admit");
     });
 
-    it("defers rather than fails when the repository visibility is unknown", async () => {
-      expect(await admit()).toBe("admit");
-      const { enqueueReviewFix, getPendingReviewFixes } = await import("../review-fix-queue.js");
-      const queueId = enqueueReviewFix({ issueId: "i1", issueIdentifier: "AII-1", repo: SCOPE.repository, prNumber: SCOPE.prNumber, reason: "review_comment" });
-      const unknownVisibility = fakeFetch({ "GET /repos/acme/app": githubError(500, "Server Error") });
-      const { createModelAuthRuntime } = await import("../model-auth-runtime.js");
-      const uncertain = createModelAuthRuntime({ config: CONFIG, env: { RUNNER_TOKEN_SECRET: SECRET }, fetchImpl: unknownVisibility.fetch });
-      const before = [...sideEffects(), count("model_profile_reservations"), count("review_fix_attempts")];
-      expect(await admit(uncertain)).toBe("defer");
-      expect(getPendingReviewFixes().map((row) => row.id)).toContain(queueId);
-      expect([...sideEffects(), count("model_profile_reservations"), count("review_fix_attempts")]).toEqual(before);
-    });
-
     it("defers on a real locked database, keeps the queue row pending, then admits after the lock clears", async () => {
       const { enqueueReviewFix, getPendingReviewFixes } = await import("../review-fix-queue.js");
       const queueId = enqueueReviewFix({ issueId: "i1", issueIdentifier: "AII-1", repo: SCOPE.repository, prNumber: SCOPE.prNumber, reason: "review_comment" });
