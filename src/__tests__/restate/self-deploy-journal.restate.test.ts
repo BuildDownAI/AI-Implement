@@ -11,7 +11,7 @@ describe("SelfDeploy delayed-send journal boundaries", () => {
   let envs: Map<string, RestateEnvironment>;
   beforeAll(async () => { envs = await startVariants([createSelfDeploy(f.deps)]); }, 60_000);
   afterAll(async () => stopAll(envs));
-  it("matches checkDrain and verify command snapshots in both variants", async () => {
+  it("matches checkDrain, apply and verify command snapshots in both variants", async () => {
     for (const env of envs.values()) {
       f.state.work = true;
       f.state.commit = "old";
@@ -30,8 +30,9 @@ describe("SelfDeploy delayed-send journal boundaries", () => {
       f.state.work = false;
       await callObject(env.baseUrl(), "SelfDeploy", "test-app", "start", { branch: "main", requestedBy: "owner" });
       await eventually(() => callObject<SelfDeployStatus>(env.baseUrl(), "SelfDeploy", "test-app", "status", {}), r => r.deploy?.phase === "verifying", { label: "verifying" });
+      const atApply = await eventually(() => capture("apply"), c => c.some(e => e.type === "Output"), { label: "completed apply" });
       const atVerify = await eventually(() => capture("verify"), c => c.some(e => e.type === "OneWayCall"), { label: "verify delayed send" });
-      for (const [point, commands] of [["check-drain", atDrain], ["verify", atVerify]] as const) {
+      for (const [point, commands] of [["check-drain", atDrain], ["apply", atApply], ["verify", atVerify]] as const) {
         expect(commands.some(e => e.type === "Sleep")).toBe(false);
         const file = join(import.meta.dirname, "journal-snapshots", `self-deploy.${point}.json`);
         if (process.env.UPDATE_JOURNAL_SNAPSHOTS === "1") writeFileSync(file, `${JSON.stringify(commands, null, 2)}\n`);
