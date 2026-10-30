@@ -62,7 +62,9 @@ describe("recorded start_deploy exchanges", () => {
 
   it("already-active", async () => {
     const active = { ...started, alreadyActive: true };
-    const recorded = await recordExchange("start_deploy", { args: ARGS }, { ...DEPLOY, objectClient: selfDeploy(active, record()).objectClient });
+    // SelfDeploy.start sets the hold, so a retry during a drain goes through the real gate.
+    setDeployHold();
+    const recorded = await recordExchange("start_deploy", { args: ARGS }, { ...DEPLOY, objectClient: selfDeploy(active, record()).objectClient, realHoldGate: true });
     // A second start while a deploy drains returns the same deployId.
     expect(JSON.parse(textOf(recorded))).toEqual({ ...started, alreadyActive: true });
     checkExchange("start_deploy", "already-active", recorded);
@@ -109,7 +111,7 @@ describe("recorded start_deploy exchanges", () => {
 describe("recorded get_deploy_posture exchanges", () => {
   const posture = async (deploy: SelfDeployRecord | null) => {
     vi.stubEnv("AI_IMPLEMENT_SOURCE_COMMIT", "");
-    const recorded = await recordExchange("get_deploy_posture", { args: {} }, { objectClient: selfDeploy(started, deploy).objectClient });
+    const recorded = await recordExchange("get_deploy_posture", { args: {} }, { objectClient: selfDeploy(started, deploy).objectClient, realHoldGate: true });
     expect(recorded.response.status).toBe(200);
     expect(recorded.response.body.isError).toBeFalsy();
     const body = JSON.parse(textOf(recorded));

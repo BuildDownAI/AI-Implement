@@ -89,6 +89,8 @@ export interface RecordOptions {
   scope?: string;
   /** Stands in for `ctx.objectClient` in handlers that call a Restate object; absent, the context has none. */
   objectClient?: (definition: unknown, key: string) => unknown;
+  /** Use the real deploy-hold gate instead of always admitting; pair with `setDeployHold()` to record an answer during a drain. */
+  realHoldGate?: boolean;
 }
 
 export async function recordExchange(tool: string, body: { args: Record<string, unknown> }, opts?: RecordOptions): Promise<Exchange> {
@@ -123,7 +125,7 @@ export async function recordExchange(tool: string, body: { args: Record<string, 
       });
       return callTool(name, args, caller, {
         restateReady: () => true,
-        permitsExternalCall: () => true,
+        ...(opts?.realHoldGate ? {} : { permitsExternalCall: () => true }),
         ingressBaseUrl: "http://restate.test",
         fetchImpl: ingress(tools, name, opts?.objectClient),
       });
