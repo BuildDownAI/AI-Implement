@@ -2,7 +2,7 @@ import * as restate from "@restatedev/restate-sdk";
 import { queryNonCompletedInvocations } from "../../restate/endpoint.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createSelfDeploy, type SelfDeployRecord, type SelfDeployStartResult } from "../../restate/self-deploy.js";
-import { callObject, callService, killInvocation, gate, eventually, queryInvocations, replaceEndpoint, startRetryEnabled, setObjectState, startVariants, stopAll, VARIANTS, type RestateEnvironment } from "./harness.js";
+import { callObject, callService, killInvocation, gate, eventually, queryInvocations, replaceEndpoint, setObjectState, startVariants, stopAll, VARIANTS, type RestateEnvironment } from "./harness.js";
 import { COMMIT, deployFixture } from "./self-deploy-fixture.js";
 
 describe("SelfDeploy durable phase machine", () => {
@@ -118,8 +118,57 @@ describe("SelfDeploy durable phase machine", () => {
     f.config.kgSourceRepo = "owner/kg"; f.state.work = false;
     await start(env); await terminal(env, f, "succeeded");
     expect(f.deps.registryHead).not.toHaveBeenCalled();
-    expect(f.deps.flyctl).toHaveBeenCalledWith(expect.anything(), expect.arrayContaining(["--build-only", "--push", "--image-label", "deploy-abcdef0", "kg_token=secret-kg", `SOURCE_COMMIT=${COMMIT}`, "SOURCE_REPO=owner/repo", "SOURCE_BRANCH=testing"]), "secret-fly");
+    expect(f.deps.flyctl).toHaveBeenCalledWith(expect.anything(), expect.arrayContaining(["--build-only", "--push", "--image-label", "deploy-abcdef0", "kg_token=secret-kg", `SOURCE_COMMIT=${COMMIT}`, "SOURCE_REPO=owner/repo", "SOURCE_BRANCH=testing"]), "secret-fly", expect.any(AbortSignal));
   });
+  it.each(VARIANTS)("exhausts non-HTTP build failures and releases the hold (%s)", async label => {
+    f = deployFixture(); const env = envs.get(label)!;
+    f.config.kgSourceRepo = "owner/kg"; f.state.work = false;
+    vi.mocked(f.deps.flyctl).mockRejectedValue(new Error("target commit does not compile"));
+    await start(env); await terminal(env, f, "failed", "apply-failed");
+    expect(f.deps.flyctl).toHaveBeenCalledTimes(3);
+    expect(f.deps.fly.updateMachine).not.toHaveBeenCalled();
+    expect(f.state.held).toBe(false);
+    // The exclusive lock is released, so another request can be handled.
+    expect(await call(env, "cancel", { requestedBy: "owner" })).toEqual({ cancelled: false, reason: "no-active-deploy" });
+  });
+  it("bounds stalled builds and aborts their executors in both variants", async () => {
+    const fixture = deployFixture(); fixture.config.kgSourceRepo = "owner/kg"; fixture.state.work = false;
+    fixture.deps.limits!.flyctlTimeoutMs = 50;
+    const signals: AbortSignal[] = [];
+    fixture.deps.flyctl = vi.fn(async (_record, _args, _token, signal) => {
+      signals.push(signal);
+      await new Promise(() => {});
+    });
+    const local = await startVariants([createSelfDeploy(fixture.deps)]);
+    try { for (const env of local.values()) {
+      signals.length = 0;
+      await start(env); await terminal(env, fixture, "failed", "apply-failed");
+      expect(signals).toHaveLength(3);
+      expect(signals.every(signal => signal.aborted)).toBe(true);
+      expect(fixture.state.held).toBe(false);
+    } } finally { await stopAll(local); }
+  }, 60_000);
+  it("keeps a build running beyond the default inactivity and abort timeouts in both variants", async () => {
+    const fixture = deployFixture(); fixture.config.kgSourceRepo = "owner/kg"; fixture.state.work = false;
+    const local = await startVariants([createSelfDeploy(fixture.deps)]);
+    try { for (const env of local.values()) {
+      fixture.machine.config.image = "old";
+      const build = gate("long build");
+      fixture.deps.flyctl = vi.fn(() => build.wait());
+      await start(env); await build.reached();
+      try {
+        const started = Date.now();
+        // Default inactivity + abort timeouts are one minute each. The CLI stays opaque throughout.
+        await eventually(() => Date.now() - started, elapsed => elapsed >= 125_000, { timeoutMs: 130_000, intervalMs: 500, label: "build beyond default timeouts" });
+        expect((await read(env))?.phase).toBe("applying");
+        expect(fixture.state.held).toBe(true);
+        expect(fixture.deps.flyctl).toHaveBeenCalledOnce();
+      } finally { build.release(); }
+      await terminal(env, fixture, "succeeded");
+      expect(fixture.deps.flyctl).toHaveBeenCalledOnce();
+      expect(fixture.state.held).toBe(false);
+    } } finally { await stopAll(local); }
+  }, 300_000);
   it.each(VARIANTS)("a Fly 4xx ends failed and clears the hold (%s)", async label => {
     f = deployFixture(); const env = envs.get(label)!; f.state.work = false;
     vi.mocked(f.deps.fly.updateMachine).mockRejectedValue(Object.assign(new Error("denied"), { status: 403 }));
@@ -130,7 +179,7 @@ describe("SelfDeploy durable phase machine", () => {
     f = deployFixture(); const env = envs.get(label)!; f.state.work = false; f.state.toml = true;
     await start(env); await terminal(env, f, "succeeded");
     expect(f.deps.fly.updateMachine).not.toHaveBeenCalled();
-    expect(f.deps.flyctl).toHaveBeenCalledWith(expect.anything(), ["deploy", "--image", "registry.fly.io/builddown-orchestrator-image:testing-abcdef0", "--detach", "--app", "test-app"], "secret-fly");
+    expect(f.deps.flyctl).toHaveBeenCalledWith(expect.anything(), ["deploy", "--image", "registry.fly.io/builddown-orchestrator-image:testing-abcdef0", "--detach", "--app", "test-app"], "secret-fly", expect.any(AbortSignal));
   });
   it.each(VARIANTS)("already-target machines need no update (%s)", async label => {
     f = deployFixture(); const env = envs.get(label)!; f.state.work = false;
@@ -222,7 +271,8 @@ describe("SelfDeploy durable phase machine", () => {
       await eventually(() => queryNonCompletedInvocations(fetch, env.adminAPIBaseUrl(), uri), count => count === 1, { label: "default query still counts blocker" });
       await killInvocation(env.adminAPIBaseUrl(), String(blockers[0].id));
       await terminal(env, fixture, "succeeded");
-      expect(observations.some(r => r.excluded === 0 && r.defaultCount === 1)).toBe(true);
+      // Concurrent shared status reads can also appear in the second query.
+      expect(observations.some(r => r.excluded === 0 && r.defaultCount !== null && r.defaultCount >= 1)).toBe(true);
       expect(fixture.deps.drainProbes).toHaveBeenCalledWith(expect.stringMatching(/^inv_/));
     } } finally { await stopAll(local); }
   }, 60_000);
@@ -240,11 +290,12 @@ describe("SelfDeploy durable phase machine", () => {
       expect((await read(env))?.reason).toBe("drain-timeout"); expect(fixture.state.held).toBe(false);
     } } finally { await stopAll(local); }
   }, 60_000);
-  it.each(["drain", "accepted update"])("survives endpoint and server restart during %s", async point => {
+  it.each(VARIANTS.flatMap(([variant]) => (["drain", "accepted update"] as const).map(point => [variant, point] as const)))("survives endpoint and server restart (%s, %s)", async (variant, point) => {
     const fixture = deployFixture();
     fixture.deps.limits!.verifyInitialMs = 2_000;
     const obj = createSelfDeploy(fixture.deps);
-    const env = await startRetryEnabled([obj]);
+    const local = await startVariants([obj]);
+    const env = local.get(variant)!;
     let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
     let accepted = false;
     const originalUpdate = fixture.deps.fly.updateMachine;
@@ -269,6 +320,6 @@ describe("SelfDeploy durable phase machine", () => {
       await terminal(env, fixture, "succeeded");
       expect(fixture.deps.fly.updateMachine).toHaveBeenCalledOnce();
       expect(fixture.state.held).toBe(false);
-    } finally { replacement?.close(); await env.stop(); }
+    } finally { replacement?.close(); await stopAll(local); }
   }, 120_000);
 });

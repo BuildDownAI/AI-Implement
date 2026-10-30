@@ -35,8 +35,9 @@ export interface SelfDeployDeps {
     getMachine(token: string, app: string, id: string): Promise<Machine>;
     updateMachine(token: string, app: string, id: string, config: MachineConfig): Promise<unknown>;
   };
-  /** Execute against the source tarball at record.target.commit, without logging argv/secrets. */
-  flyctl(record: SelfDeployRecord, args: string[], token: string): Promise<void>;
+  /** Execute against the source tarball at record.target.commit, without logging argv/secrets.
+   * Stop the subprocess when signal aborts (including any remote build polling). */
+  flyctl(record: SelfDeployRecord, args: string[], token: string, signal: AbortSignal): Promise<void>;
   kgToken(): Promise<string>;
   applyFlyToml(): boolean | Promise<boolean>;
   getInFlightWork(): readonly unknown[];
@@ -45,7 +46,7 @@ export interface SelfDeployDeps {
   /** Read this process's AI_IMPLEMENT_SOURCE_COMMIT inside the verify effect. */
   sourceCommit(): string | undefined;
   onOutcome(record: SelfDeployRecord): Promise<void>;
-  limits?: { drainTimeoutMs?: number; drainPollMs?: number; verifyInitialMs?: number; verifyPollMs?: number };
+  limits?: { drainTimeoutMs?: number; drainPollMs?: number; verifyInitialMs?: number; verifyPollMs?: number; flyctlTimeoutMs?: number };
 }
 export type SelfDeployStartResult = { deployId: string; commit: string; image: string; alreadyActive: boolean }
   | { reason: "not-configured" | "head-unknown" | "image-not-published" };
@@ -55,7 +56,23 @@ const active = (r: SelfDeployRecord | null): r is SelfDeployRecord => r !== null
 const read = (ctx: restate.ObjectSharedContext) => ctx.get<SelfDeployRecord>("deploy");
 
 export function createSelfDeploy(deps: SelfDeployDeps) {
-  const limits = { drainTimeoutMs: 75 * 60_000, drainPollMs: 30_000, verifyInitialMs: 180_000, verifyPollMs: 60_000, ...deps.limits };
+  const limits = { drainTimeoutMs: 75 * 60_000, drainPollMs: 30_000, verifyInitialMs: 180_000, verifyPollMs: 60_000, flyctlTimeoutMs: 10 * 60_000, ...deps.limits };
+  // Bound each CLI call independently; the injected executor must also stop its subprocess.
+  async function flyctl(record: SelfDeployRecord, args: string[], token: string) {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            reject(new Error("SelfDeploy flyctl deadline exceeded"));
+          }, limits.flyctlTimeoutMs);
+        }),
+        deps.flyctl(record, args, token, controller.signal),
+      ]);
+    } finally { clearTimeout(timer); }
+  }
   function write(ctx: restate.ObjectContext, record: SelfDeployRecord) {
     ctx.set("deploy", record);
     ctx.console.info(`[self-deploy] ${record.deployId} ${record.phase} ${record.reason ?? ""}`);
@@ -128,29 +145,36 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
     });
     // Outside the retried effect so a partially applied multi-machine update logs this only once.
     if (policy === "refused") ctx.console.warn("[self-deploy] deploy_apply_fly_toml refused: control plane owns machine config");
-    const accepted = await ctx.run("apply image", async () => {
-      const config = deps.config();
-      const token = config.flyDeployToken!;
-      try {
-        // Reread inside the same retried effect: an accepted update may have killed this process.
-        const machines = await deps.fly.listMachines(token, ctx.key);
-        const fresh = await Promise.all(machines.map(m => deps.fly.getMachine(token, ctx.key, m.id)));
-        if (fresh.length > 0 && fresh.every(m => m.config.image === record.target.image)) return true;
-        if (record.target.source === "built") {
-          const args = deployArgs({ app: ctx.key, sourceCommit: record.target.commit, sourceRepo: `${config.selfDeployTarget!.owner}/${config.selfDeployTarget!.repo}`, sourceBranch: record.target.branch, kgSourceRepo: config.kgSourceRepo!, kgToken: await deps.kgToken() });
-          await deps.flyctl(record, [...args, "--build-only", "--push", "--image-label", `deploy-${record.target.commit.slice(0, 7)}`], token);
+    let accepted: boolean;
+    try {
+      accepted = await ctx.run("apply image", async () => {
+        const config = deps.config();
+        const token = config.flyDeployToken!;
+        try {
+          // Reread inside the same retried effect: an accepted update may have killed this process.
+          const machines = await deps.fly.listMachines(token, ctx.key);
+          const fresh = await Promise.all(machines.map(m => deps.fly.getMachine(token, ctx.key, m.id)));
+          if (fresh.length > 0 && fresh.every(m => m.config.image === record.target.image)) return true;
+          if (record.target.source === "built") {
+            const args = deployArgs({ app: ctx.key, sourceCommit: record.target.commit, sourceRepo: `${config.selfDeployTarget!.owner}/${config.selfDeployTarget!.repo}`, sourceBranch: record.target.branch, kgSourceRepo: config.kgSourceRepo!, kgToken: await deps.kgToken() });
+            await flyctl(record, [...args, "--build-only", "--push", "--image-label", `deploy-${record.target.commit.slice(0, 7)}`], token);
+          }
+          if (policy === "toml") await flyctl(record, ["deploy", "--image", record.target.image, "--detach", "--app", ctx.key], token);
+          else for (const machine of fresh) {
+            if (machine.config.image !== record.target.image) await deps.fly.updateMachine(token, ctx.key, machine.id, { ...machine.config, image: record.target.image });
+          }
+          return true;
+        } catch (error) {
+          const status = (error as { status?: number }).status;
+          if ((status && status >= 400 && status < 500) || (error instanceof Error && /\(4\d\d\)/.test(error.message))) return false;
+          throw error;
         }
-        if (policy === "toml") await deps.flyctl(record, ["deploy", "--image", record.target.image, "--detach", "--app", ctx.key], token);
-        else for (const machine of fresh) {
-          if (machine.config.image !== record.target.image) await deps.fly.updateMachine(token, ctx.key, machine.id, { ...machine.config, image: record.target.image });
-        }
-        return true;
-      } catch (error) {
-        const status = (error as { status?: number }).status;
-        if ((status && status >= 400 && status < 500) || (error instanceof Error && /\(4\d\d\)/.test(error.message))) return false;
-        throw error;
-      }
-    });
+      }, { maxRetryAttempts: 3, initialRetryInterval: 100, maxRetryInterval: 1_000 });
+    } catch (error) {
+      // A bounded run journals exhaustion as TerminalError. Never swallow replay suspension.
+      if (!(error instanceof restate.TerminalError)) throw error;
+      accepted = false;
+    }
     if (!accepted) await finish(ctx, record, "failed", "apply-failed");
     else write(ctx, { ...record, phase: "verifying" });
   }
@@ -172,7 +196,9 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
   return restate.object({ name: "SelfDeploy", handlers: {
     start: restate.handlers.object.exclusive({ input: serde.zod(startSchema) }, start),
     checkDrain: restate.handlers.object.exclusive({ ingressPrivate: true }, checkDrain),
-    apply: restate.handlers.object.exclusive({ ingressPrivate: true }, apply),
+    // A KG build and optional detached deploy can each take ten minutes per attempt.
+    // Leave room for three attempts and retry delays before the server aborts the effect.
+    apply: restate.handlers.object.exclusive({ ingressPrivate: true, inactivityTimeout: 65 * 60_000, abortTimeout: 70 * 60_000 }, apply),
     verify: restate.handlers.object.exclusive({ ingressPrivate: true, input: serde.zod(z.object({ attempt: z.number().int().min(1).max(5) }).strict()) }, verify),
     cancel: restate.handlers.object.exclusive({ input: serde.zod(z.object({ requestedBy: requester }).strict()) }, cancel),
     status: restate.handlers.object.shared(read),
