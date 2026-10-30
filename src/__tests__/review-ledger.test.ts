@@ -2058,7 +2058,7 @@ function isIssueCommentsRequest(args: string[]): boolean {
 }
 
 describe("collectExternalReviewFindingsFromGh review process options (AII-1181)", () => {
-  function spawnWithThreads(threads: Array<{ login: string; body: string; commit?: string }>, reviews: unknown[] = []): GhSpawn {
+  function spawnWithThreads(threads: Array<{ login: string; body: string; commit?: string; origin?: { body: string; author: { login: string }; commit: { oid: string } } }>, reviews: unknown[] = []): GhSpawn {
     return (args) => {
       if (isPullReviewsRequest(args)) return { exitCode: 0, stdout: JSON.stringify(reviews) };
       if (isIssueCommentsRequest(args)) return { exitCode: 0, stdout: "[]" };
@@ -2074,6 +2074,7 @@ describe("collectExternalReviewFindingsFromGh review process options (AII-1181)"
                     isOutdated: false,
                     path: "src/x.ts",
                     line: i + 1,
+                    originatingComment: t.origin ? { nodes: [t.origin] } : undefined,
                     comments: { nodes: [{ body: t.body, url: `https://example.com/t${i}`, commit: { oid: t.commit }, author: { login: t.login } }] },
                   })),
                 },
@@ -2100,6 +2101,26 @@ describe("collectExternalReviewFindingsFromGh review process options (AII-1181)"
       ["untagged", "minor"],
       ["🟡 nit", "minor"],
     ]);
+  });
+
+  it.each([0, 1, 2])("preserves Codex P%s severity and reply context from the originating head finding", (priority) => {
+    const origin = {
+      body: `**<sub><sub>![P${priority} Badge](https://img.shields.io/badge/P${priority}-yellow?style=flat)</sub></sub> Original finding**`,
+      author: { login: "chatgpt-codex-connector" },
+      commit: { oid: "current-head" },
+    };
+    const spawn = spawnWithThreads([{ login: "human", body: "Please investigate", origin }]);
+    const result = collectExternalReviewFindingsFromGh(spawn, "42", {
+      process: resolveReviewProcess("codex-code-review"), extraAuthors: [], headSha: "current-head",
+    });
+    expect(result.findings).toEqual([expect.objectContaining({
+      severity: priority === 2 ? "minor" : "blocking",
+      body: `${origin.body}\n\nLatest reply:\nPlease investigate`,
+    })]);
+    origin.commit.oid = "old-head";
+    expect(collectExternalReviewFindingsFromGh(spawn, "42", {
+      process: resolveReviewProcess("codex-code-review"), extraAuthors: [], headSha: "current-head",
+    }).findings).toEqual([]);
   });
 
   it("retains Codex P2 as minor and P0/P1 as blocking, including the GraphQL login", () => {

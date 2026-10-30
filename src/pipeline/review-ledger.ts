@@ -881,19 +881,32 @@ function collectReviewThreadFindings(
     const comments = getCommentNodes(thread);
     const latestComment = comments?.at(-1);
     if (!isRecord(latestComment) || typeof latestComment.body !== "string") continue;
+    // Codex severity belongs to the originating finding, even after a human reply.
+    // Keep the latest-comment behavior for all other processes.
+    const originNodes = isRecord(thread.originatingComment) ? thread.originatingComment.nodes : undefined;
+    const origin = Array.isArray(originNodes) ? originNodes[0] : comments?.[0];
+    const findingComment = options.process.id === "codex-code-review"
+      && isRecord(origin) && isRecord(origin.author)
+      && typeof origin.author.login === "string"
+      && isTrustedReviewAuthor(origin.author.login, options.process, options.extraAuthors)
+      ? origin : latestComment;
+    if (typeof findingComment.body !== "string") continue;
     if (options.headSha) {
-      const commit = latestComment.commit;
+      const commit = findingComment.commit;
       const oid = isRecord(commit) && typeof commit.oid === "string" ? commit.oid : "";
       if (oid && oid !== options.headSha) continue;
     }
 
-    const body = latestComment.body.trim();
+    const findingBody = findingComment.body.trim();
+    const replyBody = latestComment.body.trim();
+    const body = findingComment !== latestComment && replyBody && replyBody !== findingBody
+      ? `${findingBody}\n\nLatest reply:\n${replyBody}` : findingBody;
     if (!body) continue;
 
     // An unresolved inline thread only blocks when its author's current verdict is
     // CHANGES_REQUESTED. Otherwise (approved, commented, or no formal review) it is a
     // non-blocking nit that should not override the reviewer's approval.
-    const author = latestComment.author;
+    const author = findingComment.author;
     const authorLogin = isRecord(author) && typeof author.login === "string" ? author.login : "";
     let severity: ReviewLedgerSeverity = "medium";
     if (authorLogin && blockingReviewerLogins.has(normalizeReviewerLogin(authorLogin))) {
@@ -903,7 +916,7 @@ function collectReviewThreadFindings(
       && authorLogin
       && isTrustedReviewAuthor(authorLogin, options.process, options.extraAuthors)
     ) {
-      const marker = options.process.classifyInline(body);
+      const marker = options.process.classifyInline(findingBody);
       if (marker === null) continue;
       severity = marker === "blocking" ? "blocking" : "minor";
     }
@@ -1062,6 +1075,13 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
           isOutdated
           path
           line
+          originatingComment: comments(first: 1) {
+            nodes {
+              body
+              commit { oid }
+              author { login }
+            }
+          }
           comments(last: 1) {
             nodes {
               body

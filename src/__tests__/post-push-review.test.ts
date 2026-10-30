@@ -6961,10 +6961,14 @@ describe("postPushReviewStep review process gate", () => {
     expect(JSON.stringify(invoke.mock.calls)).toContain("Fix the head bug");
   });
 
-  it.each([false, true])("Codex P2 threads stay advisory with unresolved=%s and do not start an in-run fix", async (unresolved) => {
+  it.each([[false, false], [true, false], [false, true], [true, true]])("Codex P2 threads stay advisory with unresolved=%s, human reply=%s and do not start an in-run fix", async (unresolved, reply) => {
     const body = "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Advisory**";
     const t = thread(body);
     t.comments.nodes[0]!.author.login = "chatgpt-codex-connector";
+    if (reply) {
+      Object.assign(t, { originatingComment: { nodes: [t.comments.nodes[0]] } });
+      t.comments.nodes = [{ ...t.comments.nodes[0]!, body: "Can we revisit this later?", author: { login: "human-reviewer" } }];
+    }
     const comment = inline(body);
     comment.user.login = "chatgpt-codex-connector[bot]";
     const f = fixture({ runs: [], threads: [t], inlineComments: [comment], issueComments: [{

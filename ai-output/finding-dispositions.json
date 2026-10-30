@@ -1,0 +1,12 @@
+[
+  {
+    "findingKey": "cd52f0abe8d20026960dfd9f8272af5269d7fd1b03ea839df1a32921fb7dba67",
+    "disposition": "fixed",
+    "reason": "Added the lifecycle selector, validation, and submitted lifecycle so new Codex projects can be created with Restate."
+  },
+  {
+    "findingKey": "e1d5f68cd2cfcd01b61dfe44592b3e9c65d490b70eb582ad562bb5b3475dfea1",
+    "disposition": "fixed",
+    "reason": "Updated the severity documentation to reference the per-process classifyInline classifier."
+  }
+]

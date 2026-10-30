@@ -1391,6 +1391,8 @@ describe.skipIf(!pinnedCodex && !pinnedRequired)("pinned codex accepts the chatg
     const home = testDir("pinned-plan-home");
     return new Promise((resolve) => {
       const child = spawn("codex", args, {
+        // The CLI wrapper spawns a native binary. Kill both before temp-dir cleanup.
+        detached: process.platform !== "win32",
         cwd: home,
         env: { PATH: process.env.PATH ?? "/usr/bin", HOME: home, CODEX_HOME: home, CHATGPT_PLAN_ACCESS_TOKEN: "fake-chatgpt-plan-token" },
         stdio: ["pipe", "ignore", "pipe"],
@@ -1406,7 +1408,15 @@ describe.skipIf(!pinnedCodex && !pinnedRequired)("pinned codex accepts the chatg
         exited = true;
         done(code);
       });
-      const timer = setTimeout(() => child.kill("SIGKILL"), 3_000);
+      const timer = setTimeout(() => {
+        if (process.platform !== "win32" && child.pid) {
+          try { process.kill(-child.pid, "SIGKILL"); } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+          }
+        } else {
+          child.kill("SIGKILL");
+        }
+      }, 3_000);
     });
   }
 
