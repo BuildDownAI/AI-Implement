@@ -143,6 +143,13 @@ export async function recordExchange(tool: string, body: { args: Record<string, 
   };
 }
 
+// Tools whose contract test file does not follow the `<tool>-contract.test.ts` convention.
+const CONTRACT_TEST_FILES: Record<string, string> = {
+  list_job_accounting: "src/__tests__/job-accounting-contract.test.ts",
+  start_deploy: "src/__tests__/deploy-tools-contract.test.ts",
+  get_deploy_posture: "src/__tests__/deploy-tools-contract.test.ts",
+};
+
 export function checkExchange(tool: string, scenario: string, recorded: Exchange): void {
   const DIR = new URL(`../../docs/contracts/${tool}/`, import.meta.url);
   const file = new URL(`${scenario}.json`, DIR);
@@ -155,7 +162,7 @@ export function checkExchange(tool: string, scenario: string, recorded: Exchange
     writeFileSync(file, text);
     return;
   }
-  const hint = `Regenerate with UPDATE_CONTRACT_FIXTURES=1 npx vitest run ${tool === "list_job_accounting" ? "src/__tests__/job-accounting-contract.test.ts" : `src/__tests__/${tool.replaceAll("_", "-")}-contract.test.ts`}, and tell the control plane: it copies these files.`;
+  const hint = `Regenerate with UPDATE_CONTRACT_FIXTURES=1 npx vitest run ${CONTRACT_TEST_FILES[tool] ?? `src/__tests__/${tool.replaceAll("_", "-")}-contract.test.ts`}, and tell the control plane: it copies these files.`;
   if (!existsSync(file)) throw new Error(`Recorded exchange docs/contracts/${tool}/${scenario}.json is missing. ${hint}`);
   if (readFileSync(file, "utf8") !== text) {
     throw new Error(`The ${tool} response for "${scenario}" differs from docs/contracts/${tool}/${scenario}.json. ${hint}\nActual:\n${text}`);
