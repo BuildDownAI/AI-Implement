@@ -79,13 +79,24 @@ describe("PlanningRun report sender", () => {
 
     expect(res.status).toBe(200);
     expect(legacy).not.toHaveBeenCalled();
-    // The `report` handler declares no input: the request must address it by service, key and
-    // handler name, and carry no body for a schema to reject.
+    // Existing callback producers omit usage and retain the empty request body.
     const workflow = createPlanningRunWorkflow({} as never);
     expect(ingress.calls).toHaveLength(1);
     expect(ingress.calls[0].url.href).toBe(`${INGRESS}/${workflow.name}/${dispatchId}/report`);
     expect(ingress.calls[0].method).toBe("POST");
     expect(ingress.calls[0].body).toBe("");
+  });
+
+  it("forwards supplied usage through the SDK as the report body", async () => {
+    const { dispatchId } = plantPlanningDispatch({ kind: "restate", attemptId: "attempt-1" });
+    const ingress = fakeFetch({ [`POST /PlanningRun/${dispatchId}/report`]: [{ status: 200, json: { status: "accepted" } }] });
+    const hook = client.createPlanningAdmissionTerminationHook({
+      ingress: client.createPlanningRunIngressClient(INGRESS, { fetchImpl: ingress.fetch }),
+      legacy: vi.fn(async () => {}),
+    });
+    const usage = { records: [], attribution: null, pushedCommits: null, listWhole: true, timedOut: false };
+    await hook(dispatchId, usage);
+    expect(JSON.parse(ingress.calls[0].body)).toEqual({ usage });
   });
 
   it("a Legacy-owned reservation calls legacy and sends no request", async () => {
