@@ -104,12 +104,12 @@ export async function toolCatalog(deps: DiscoverToolsDeps = {}): Promise<Discove
 }
 
 /**
- * Tools that still answer during a deploy hold (AII-1401). `get_deploy_posture` and `start_deploy` must: a deploy sets the hold, and the control plane polls the posture and repeats `start_deploy` while it drains. The KG tools are short invocations that finish in
+ * Tools that still answer during a deploy hold (AII-1401). Both are short invocations that finish in
  * milliseconds: `get_kg_status` is a read, and `decide_kg_refresh` decides a held KG refresh through
  * `KgRepo.decide`, which starts the decision as a new run and so lets the drain finish. Exact names only, compared before
  * percent-encoding; every other tool answers `deploy-held`.
  */
-const DEPLOY_HOLD_ALLOWED_TOOLS: ReadonlySet<string> = new Set(["get_kg_status", "decide_kg_refresh", "get_deploy_posture", "start_deploy"]);
+const DEPLOY_HOLD_ALLOWED_TOOLS: ReadonlySet<string> = new Set(["get_kg_status", "decide_kg_refresh"]);
 
 export type CallToolResult =
   | { status: "ok"; content: Array<{ type: string; text: string }>; isError?: boolean }
