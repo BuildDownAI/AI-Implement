@@ -63,6 +63,7 @@ const CallerSchema = z.object({
   kind: z.enum(["human", "system", "service"]),
   email: z.string().nullable(),
   role: z.enum(["user", "admin"]).nullable(),
+  grants: z.array(z.literal("deploy")).readonly().default([]),
 });
 
 const ToolResponse = z.object({
@@ -82,6 +83,8 @@ interface ToolOptions<I extends z.ZodType> {
   description: string;
   input: I;
   role: AccessRole;
+  /** Alternate authority, accepted only by tools that explicitly request it. */
+  grant?: "deploy";
   /** Declares mutability for wrapper write-audit logging. Defaults preserve the original rule: admin-role tools are writes. */
   operation?: "read" | "write";
   /**
@@ -118,8 +121,8 @@ export function auditActor(caller: { email: string | null; kind: string }, fallb
  * Wraps `restate.handlers.handler` with a zod input/output serde and the discovery
  * metadata (`mcp.type`, `mcp.role`) tools-client.ts's discoverTools() reads back. The
  * wire input is `{ caller, args }` — the credential never travels with the request
- * (the ingress journals bodies), only the already-verified `Caller`. A caller whose role
- * doesn't satisfy `role` (equal, or admin) is refused before `handler` runs. A handler
+ * (the ingress journals bodies), only the already-verified `Caller`. A caller must satisfy
+ * `role` (equal, or admin) or hold the explicitly requested grant before `handler` runs. A handler
  * that throws is caught here and returned as an `isError` result rather than rethrown —
  * Restate retries a thrown non-terminal error indefinitely, which would turn a bug or a
  * transient failure into a hanging `tools/call` instead of the error result `/mcp` expects.
@@ -164,7 +167,7 @@ export function tool<I extends z.ZodType>(
           `[mcp] write tool=${name} actor=${actor} role=${input.caller.role ?? "null"} result=${result} kind=${input.caller.kind}${detail}`,
         );
       };
-      if (!roleAllows(input.caller.role, opts.role)) {
+      if (!roleAllows(input.caller.role, opts.role) && !(opts.grant && input.caller.grants.includes(opts.grant))) {
         audit("forbidden");
         return {
           isError: true,
