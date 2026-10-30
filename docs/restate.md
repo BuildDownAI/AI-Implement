@@ -235,6 +235,10 @@ After each run the object sends itself a delayed `refresh` carrying `scheduledFo
 
 The production probe returns `null` and sends nothing when `isKgUnavailable()` is false, so a `check` queued after a recovery is a no-op. `checkKgSidecarHealth()` is the poll-loop caller, under the same `kgScheduleBound` guard as `checkPipelineSchedules`: one one-way `POST KgSidecarHealth/sidecar/check/send` per cycle while the sidecar is unavailable. It makes no call during a deploy hold or unless the sidecar is `ready` and registration is `registered`, and a failed call logs one line and never throws.
 
+## A self-deploy never keeps an invocation open across its own restart
+
+`SelfDeploy` (`src/restate/self-deploy.ts`, [ADR 046](adr/046-self-deploy-is-a-restate-object-that-never-spans-its-own-restart.md)) replaces the machine that runs this orchestrator's Restate server, so the rule is the same as the KG hold's: no invocation stays open across the restart. The drain (`queryNonCompletedInvocations`) and the boot registration both count every invocation that is not `completed` and not `scheduled`. A `ctx.sleep` inside one deploy workflow would keep it open and block both. So each step (`start`, `checkDrain`, `apply`, `verify`) is a short handler that hands over with a delayed send, and only a `scheduled` call exists between steps. `apply` schedules `verify` before it changes the image and returns before Fly stops the machine; `verify` runs on the new code. Do not add `ctx.sleep` or a long-running call to this object.
+
 ## Pipeline schedules
 
 `PipelineSchedule` (`src/restate/pipeline-schedule.ts`, AII-1431, [ADR 042](adr/042-a-pipeline-schedule-is-a-due-or-fired-state-checked-by-the-poll-loop.md)) is a Virtual Object, one per scheduled pipeline, that fires the pipeline once a day at a local time. Restate 1.7.10 has no native cron, and a delayed self-send brings back cancel-and-re-arm, so a schedule is a state: each day has one occurrence, and `lastFiredOccurrence` records whether it fired. The poll loop is the tick. KG refresh is the first consumer (AII-1432; `docs/issueless-runs.md` § Reserve and dispatch).
