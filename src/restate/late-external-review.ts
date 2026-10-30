@@ -22,7 +22,7 @@ import { getJobByDispatchId, getJobById, recordLateReviewEnding, stampJobApprove
 import { getReviewFindingsByKeys, listOpenReviewFindings, stableReviewFindingKey } from "../review-ledger-store.js";
 import { getMappings } from "../config.js";
 import { classifyReviewIssueComment, type ReviewLedgerOptions } from "../pipeline/review-ledger.js";
-import { isReviewCheckRun, resolveReviewProcess } from "../review-process.js";
+import { isReviewCheckRun, resolveReviewProcess, REVIEW_PROCESSES } from "../review-process.js";
 import type { RestateService } from "./endpoint.js";
 import { restateRetentionMs } from "./retention.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
@@ -355,7 +355,7 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
       const names = await readReviewCheckNames(t, input.owner, input.repo);
       for (const sha of earlier) {
         const runs = await listCheckRuns(t, input.owner, input.repo, sha);
-        if (runs.some((r) => isReviewCheckRun(r, process, names))) return true;
+        if (runs.some((r) => isReviewCheckRun(r, REVIEW_PROCESSES["claude-code-review-repository-fix"], names))) return true;
       }
       return false;
     },
@@ -393,7 +393,7 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
         // A head pushed a moment ago has no check runs yet, which reads as "success". Its own review must
         // have completed with `success` before the head can count as clean (a skipped run is not a review).
         const reviewRuns = (await listCheckRuns(t, input.owner, input.repo, pr.headSha))
-          .filter((r) => isReviewCheckRun(r, process, names));
+          .filter((r) => isReviewCheckRun(r, REVIEW_PROCESSES["claude-code-review-repository-fix"], names));
         const succeeded = reviewRuns.some((r) => r.status === "completed" && r.conclusion === "success");
         // A gap-fill whose head has no review run after the grace belongs to a repo with no reviewer.
         const noReviewer = input.gapFill && !input.followHead && !input.reviewerExpected && reviewRuns.length === 0

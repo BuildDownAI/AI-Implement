@@ -88,7 +88,20 @@ describe("Codex late review", () => {
   });
 });
 
-describe("project review check pairs", () => {
+describe("shared Claude repository-fix review check pairs", () => {
+  it.each(["ai-implement", "claude-code-review", "claude-code-review-repository-fix"] as const)("%s counts the hosted Claude check on earlier commits and the head", async (reviewProcess) => {
+    vi.mocked(getMappings).mockReturnValue({ test: { owner: "o", repo: "r", reviewProcess } } as never);
+    vi.mocked(listPullRequestCommits).mockResolvedValue(["earlier", "b"]);
+    vi.mocked(listCheckRuns).mockReset().mockResolvedValue([run("completed", "success")]);
+    const deps = createProductionLateExternalReviewDependencies({ githubAppId: "1", githubAppPrivateKey: "k" });
+    const tickInput = { ...input, headSha: "b", followHead: false, gapFill: true };
+    expect(await deps.readReviewerExpected!(tickInput)).toBe(true);
+    expect(listCheckRuns).toHaveBeenLastCalledWith("tok", "o", "r", "earlier");
+    const tick = await deps.readTick({ ...tickInput, reviewerExpected: true });
+    expect(tick.checks).toBe("success");
+    expect(listCheckRuns).toHaveBeenLastCalledWith("tok", "o", "r", "b");
+  });
+
   it.each(["claude-code-review", "ai-implement"] as const)("%s uses the configured name and posting app", async (reviewProcess) => {
     vi.mocked(getMappings).mockReturnValue({ test: { owner: "o", repo: "r", reviewProcess } } as never);
     vi.mocked(getDefaultBranchFileText).mockResolvedValue("reviewCheckNames: [custom-review]");
