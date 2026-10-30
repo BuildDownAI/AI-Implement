@@ -192,6 +192,13 @@ describe("LateExternalReview workflow", () => {
         expect(sc.comments[0]).toContain(LATE_EXTERNAL_APPROVAL_MARKER);
       });
 
+      it("holds a failed Codex review and posts recovery instructions", async () => {
+        const { result, sc } = await runScenario(url(), { ticks: [{ ...passed, heldBy: "review-failed", blockingLastSeenAtMs: [COMMIT_MS + 1] }] });
+        expect(result).toEqual({ outcome: "findings" });
+        expect(sc.stamps).toEqual([]);
+        expectOneHeld(sc, "The Codex review of this commit failed (for example a usage limit). Re-run it with an `@codex review` comment; when it approves, post `/ai-implement verify only, make no code change`; or merge by hand.");
+      });
+
       it("approves when no blocking finding is open", async () => {
         const { result } = await runScenario(url(), { ticks: [passed] });
         expect(result.outcome).toBe("approved");
@@ -299,7 +306,7 @@ describe("LateExternalReview workflow", () => {
 
       it("names the verdict reason and the tick's head in the held comment", async () => {
         const { sc } = await runScenario(url(), { ticks: [{ ...passed, blockingLastSeenAtMs: [COMMIT_MS + 1], heldBy: "incomplete" }] });
-        expectOneHeld(sc, "Re-run the Claude review");
+        expectOneHeld(sc, "Re-run the external review");
       });
 
       it("a tick journaled without heldBy posts the generic text", async () => {
