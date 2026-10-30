@@ -305,7 +305,7 @@ export async function handleMcpRequest(
     }
 
     if (RESTATE_TOOL_NAMES.has(toolName)) {
-      const caller: Caller = { kind: identity.kind, email: identity.email, role };
+      const caller: Caller = { kind: identity.kind, email: identity.email, role, grants: [] };
       // A write carries an idempotency key only when the caller states one explicitly via
       // the MCP `_meta` extension point (see IDEMPOTENCY_KEY_SHAPE above) — the server never
       // derives one, but it does scope the caller's key by the caller's identity

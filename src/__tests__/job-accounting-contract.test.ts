@@ -138,7 +138,7 @@ async function exchange(body: { args: Record<string, unknown> }): Promise<Exchan
     .sign(signingKey);
   const deps: AdminModule.AdminDeps = {
     callTool: async (name, args, caller) => {
-      expect(caller).toEqual({ kind: "service", email: null, role: "user" });
+      expect(caller).toEqual({ kind: "service", email: null, role: "user", grants: [] });
       return callTool(name, args, caller, {
         restateReady: () => true,
         permitsExternalCall: () => true,

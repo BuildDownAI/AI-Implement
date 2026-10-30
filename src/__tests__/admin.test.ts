@@ -4426,7 +4426,7 @@ describe("POST /api/tools/<name>", () => {
     expect(captured).toEqual({
       name: "get_tenant_health",
       args: { foo: "bar" },
-      caller: { kind: "human", email: null, role: "admin" },
+      caller: { kind: "human", email: null, role: "admin", grants: [] },
     });
   });
 
@@ -4452,7 +4452,7 @@ describe("POST /api/tools/<name>", () => {
       },
     }, "some_write_tool");
     expect(res.statusCode).toBe(200);
-    expect(capturedCaller).toEqual({ kind: "human", email: "reader@eudoxus.ai", role: "user" });
+    expect(capturedCaller).toEqual({ kind: "human", email: "reader@eudoxus.ai", role: "user", grants: [] });
     expect(JSON.parse(res.body)).toEqual({
       content: [{ type: "text", text: "forbidden: some_write_tool requires the admin role" }],
       isError: true,
@@ -4628,13 +4628,13 @@ describe("control-plane token on /api (AII-1514)", () => {
     const callTool = vi.fn<NonNullable<AdminModule.AdminDeps["callTool"]>>(async () => ({ status: "ok" as const, content: [] }));
     const res = await call("/api/tools/get_tenant_health", "POST", await cpToken(), { callTool });
     expect(res.statusCode).toBe(200);
-    expect(callTool).toHaveBeenCalledWith("get_tenant_health", {}, { kind: "service", email: null, role: "user" }, undefined);
+    expect(callTool).toHaveBeenCalledWith("get_tenant_health", {}, { kind: "service", email: null, role: "user", grants: [] }, undefined);
   });
 
   it("hands a write tool the user-role service caller, which the tool() wrapper refuses", async () => {
     const callTool = vi.fn<NonNullable<AdminModule.AdminDeps["callTool"]>>(async () => ({ status: "ok" as const, content: [] }));
     await call("/api/tools/set_runner_mode", "POST", await cpToken(), { callTool });
-    expect(callTool.mock.calls[0]?.[2]).toEqual({ kind: "service", email: null, role: "user" });
+    expect(callTool.mock.calls[0]?.[2]).toEqual({ kind: "service", email: null, role: "user", grants: [] });
   });
 
   it("answers 401 for a token for another orchestrator, without running the tool", async () => {
