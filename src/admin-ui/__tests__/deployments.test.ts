@@ -158,9 +158,9 @@ describe("deployments page", () => {
     for (const gone of ["Deployed OK", "Not serving", "Build failed"]) {
       expect(deploymentsScript).not.toContain(gone);
     }
-    // One write per outcome state: the empty state plus the three kinds.
+    // One write per outcome state: the empty state plus the four badge treatments.
     const outcomeWrites = deploymentsScript.match(/setBadge\(outcomeBadge,/g) ?? [];
-    expect(outcomeWrites).toHaveLength(4);
+    expect(outcomeWrites).toHaveLength(5);
   });
 
   it("keeps the commit links at value size rather than using .mono", () => {
@@ -695,5 +695,179 @@ describe("Retention card", () => {
     expect(posts).toEqual([{ url: "/api/retention", body: { restate: 10 } }]);
     expect(el("deployments-retention-restate").value).toBe("10");
     expect(el("deployments-retention-save").disabled).toBe(true);
+  });
+});
+
+describe("self-deploy panel", () => {
+  type Deploy = Record<string, unknown> | null;
+  const record = (phase: string, extra: Record<string, unknown> = {}) => ({
+    deployId: "d1",
+    phase,
+    target: { branch: "testing", commit: "abcdef1234567890", image: "registry.fly.io/app:deployment-1", source: "published" },
+    requestedBy: "ops@example.com",
+    startedAt: Date.UTC(2026, 0, 2, 3, 4, 5),
+    finishedAt: null,
+    reason: null,
+    ...extra,
+  });
+
+  function mount(status: { deploy: Deploy; flyAllowed?: boolean; flyToml?: boolean; outcome?: unknown }, cancelBody: unknown = { cancelled: true }) {
+    const dom = new JSDOM(`<!DOCTYPE html><body>${deploymentsHtml}</body>`, {
+      runScripts: "dangerously",
+      url: "http://localhost/admin#deployments",
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const win = dom.window as any;
+    const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+    const esc = (s: unknown) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    win.registerPage = () => {};
+    win.esc = esc;
+    win.escAttr = (s: unknown) => esc(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    win.confirm = () => true;
+    win.api = async (url: string, init?: { method?: string; body?: string }) => {
+      calls.push({ url, method: init?.method, body: init?.body ? JSON.parse(init.body) : undefined });
+      if (url === "/api/deployment-status") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            configured: true,
+            available: true,
+            held: false,
+            inFlight: [],
+            repo: "o/r",
+            branch: "testing",
+            autoDeploy: false,
+            notifyConfigured: false,
+            lastDeployOutcome: status.outcome ?? null,
+            selfDeploy: { deploy: status.deploy, options: { applyFlyToml: status.flyToml ?? false } },
+            applyFlyTomlAllowed: status.flyAllowed ?? true,
+          }),
+        };
+      }
+      if (url === "/api/deploy-cancel") return { ok: true, status: 200, json: async () => cancelBody };
+      if (url === "/api/deploy-policy") return { ok: true, status: 200, json: async () => ({}) };
+      return { ok: true, status: 200, json: async () => ({ reservations: [] }) };
+    };
+    const script = dom.window.document.createElement("script");
+    script.textContent = deploymentsScript;
+    dom.window.document.head.appendChild(script);
+    const doc = dom.window.document;
+    const el = (id: string) => doc.getElementById(id) as HTMLInputElement & HTMLButtonElement;
+    return { win, doc, el, calls };
+  }
+
+  const rows: Array<{ phase: string | null; deployDisabled: boolean; cancel: boolean; panel: "none" | "active" | "last" }> = [
+    { phase: null, deployDisabled: false, cancel: false, panel: "none" },
+    { phase: "draining", deployDisabled: true, cancel: true, panel: "active" },
+    { phase: "applying", deployDisabled: true, cancel: false, panel: "active" },
+    { phase: "verifying", deployDisabled: true, cancel: false, panel: "active" },
+    { phase: "succeeded", deployDisabled: false, cancel: false, panel: "last" },
+    { phase: "failed", deployDisabled: false, cancel: false, panel: "last" },
+    { phase: "cancelled", deployDisabled: false, cancel: false, panel: "last" },
+  ];
+
+  for (const row of rows) {
+    it(`state table: selfDeploy ${row.phase ?? "null"}`, async () => {
+      const finished = row.panel === "last" ? { finishedAt: Date.UTC(2026, 0, 2, 4, 0, 0), reason: row.phase === "failed" ? "drain-timeout" : null } : {};
+      const { win, el } = mount({ deploy: row.phase ? record(row.phase, finished) : null });
+      await win.loadDeployments();
+      expect(el("deployments-deploy-btn").disabled).toBe(row.deployDisabled);
+      expect(el("deployments-cancel-btn").hidden).toBe(!row.cancel);
+      expect(el("deployments-active").hidden).toBe(row.panel !== "active");
+      expect(el("deployments-last-result").hidden).toBe(row.panel !== "last");
+    });
+  }
+
+  it("active panel shows phase, branch, 7-char commit, image, requester and start time", async () => {
+    const { win, doc } = mount({ deploy: record("applying") });
+    await win.loadDeployments();
+    const text = (doc.getElementById("deployments-active") as HTMLElement).textContent ?? "";
+    expect(text).toContain("applying");
+    expect(text).toContain("testing");
+    expect(text).toContain("abcdef1");
+    expect(text).not.toContain("abcdef12");
+    expect(text).toContain("registry.fly.io/app:deployment-1");
+    expect(text).toContain("ops@example.com");
+    expect(text).toContain(new Date(Date.UTC(2026, 0, 2, 3, 4, 5)).toLocaleString());
+  });
+
+  it("last result shows reason and finish time, and never the text null", async () => {
+    const finishedAt = Date.UTC(2026, 0, 2, 4, 0, 0);
+    const failed = mount({ deploy: record("failed", { finishedAt, reason: "drain-timeout" }) });
+    await failed.win.loadDeployments();
+    const failedText = failed.el("deployments-last-result").textContent ?? "";
+    expect(failedText).toContain("failed");
+    expect(failedText).toContain("drain-timeout");
+    expect(failedText).toContain(new Date(finishedAt).toLocaleString());
+
+    const ok = mount({ deploy: record("succeeded", { finishedAt }) });
+    await ok.win.loadDeployments();
+    expect(ok.el("deployments-last-result").textContent).not.toContain("null");
+  });
+
+  it("cancel posts, then re-fetches status", async () => {
+    const { win, calls } = mount({ deploy: record("draining") });
+    await win.loadDeployments();
+    calls.length = 0;
+    await win.cancelDeploy();
+    const urls = calls.map((c) => `${c.method ?? "GET"} ${c.url}`);
+    expect(urls.indexOf("POST /api/deploy-cancel")).toBeGreaterThanOrEqual(0);
+    expect(urls.indexOf("GET /api/deployment-status")).toBeGreaterThan(urls.indexOf("POST /api/deploy-cancel"));
+  });
+
+  it("cancel says so when the deploy is past the drain", async () => {
+    const { win, el } = mount({ deploy: record("draining") }, { cancelled: false, reason: "too-late" });
+    await win.loadDeployments();
+    await win.cancelDeploy();
+    expect(el("deployments-error").hidden).toBe(false);
+    expect(el("deployments-error").textContent).toBe("The deploy is past the drain and cannot be cancelled.");
+  });
+
+  it("fly.toml toggle is enabled and its saved value is sent when allowed", async () => {
+    const { win, el, calls } = mount({ deploy: null, flyToml: false });
+    await win.loadDeployments();
+    expect(el("deployments-fly-toml").disabled).toBe(false);
+    expect(el("deployments-fly-toml-hint").textContent).not.toContain("owns its config");
+    el("deployments-fly-toml").checked = true;
+    win.refreshPolicyDirty();
+    expect(el("deployments-policy-save").disabled).toBe(false);
+    await win.saveDeployPolicy();
+    const post = calls.find((c) => c.url === "/api/deploy-policy");
+    expect((post?.body as Record<string, unknown>).applyFlyToml).toBe(true);
+  });
+
+  it("fly.toml toggle is disabled with the explanation when the control plane owns the config", async () => {
+    const { win, el, calls } = mount({ deploy: null, flyAllowed: false, flyToml: true });
+    await win.loadDeployments();
+    expect(el("deployments-fly-toml").disabled).toBe(true);
+    expect(el("deployments-fly-toml-hint").textContent).toBe("The control plane created this machine and owns its config.");
+    expect(el("deployments-policy-save").disabled).toBe(true);
+    await win.saveDeployPolicy();
+    const post = calls.find((c) => c.url === "/api/deploy-policy");
+    expect(post?.body).not.toHaveProperty("applyFlyToml");
+  });
+
+  it("a dirty fly.toml toggle survives a poll", async () => {
+    const { win, el } = mount({ deploy: null });
+    await win.loadDeployments();
+    el("deployments-fly-toml").checked = true;
+    win.refreshPolicyDirty();
+    await win.loadDeployments();
+    expect(el("deployments-fly-toml").checked).toBe(true);
+    expect(el("deployments-policy-save").disabled).toBe(false);
+  });
+
+  it("renders deploy-failed and deploy-cancelled outcomes", async () => {
+    const failed = mount({ deploy: null, outcome: { kind: "deploy-failed", commit: "abcdef1234567", timestamp: 1, detail: "apply-failed" } });
+    await failed.win.loadDeployments();
+    expect(failed.el("deployments-outcome-alert").textContent).toContain("apply-failed");
+    expect(failed.el("deployments-outcome-alert").className).toContain("fail");
+
+    const cancelled = mount({ deploy: null, outcome: { kind: "deploy-cancelled", commit: "abcdef1234567", timestamp: 1 } });
+    await cancelled.win.loadDeployments();
+    expect(cancelled.el("kpi-deploy-outcome-badge").textContent).toContain("Cancelled");
+    expect(cancelled.el("deployments-outcome-alert").className).not.toContain("fail");
+    expect(cancelled.el("deployments-outcome-alert").textContent).toContain("cancelled");
   });
 });
