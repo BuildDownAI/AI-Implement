@@ -22,7 +22,7 @@ import { getJobByDispatchId, getJobById, recordLateReviewEnding, stampJobApprove
 import { getReviewFindingsByKeys, listOpenReviewFindings, stableReviewFindingKey } from "../review-ledger-store.js";
 import { getMappings } from "../config.js";
 import { classifyReviewIssueComment, type ReviewLedgerOptions } from "../pipeline/review-ledger.js";
-import { isReviewCheckRun, resolveReviewProcess, REVIEW_PROCESSES } from "../review-process.js";
+import { isReviewCheckRun, resolveReviewProcess } from "../review-process.js";
 import type { RestateService } from "./endpoint.js";
 import { restateRetentionMs } from "./retention.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
@@ -43,13 +43,14 @@ export function lateExternalHeldMarker(key: string): string {
   return `<!-- ai-implement late-external-held key=${key} -->`;
 }
 
-/** Why Claude's newest review of the head blocks it. */
-export type HeldReason = "incomplete" | "unreadable" | "changes_requested" | "changes_requested-empty";
+/** Why the external review of the head blocks it. */
+export type HeldReason = "incomplete" | "unreadable" | "changes_requested" | "changes_requested-empty" | "review-failed";
 
 const HELD_ACTIONS: Record<HeldReason | "ledger" | "timed-out" | "generic", string> = {
-  incomplete: "Claude's review of this commit did not finish. Re-run the Claude review on this commit (re-run its check, or push a commit); when it approves, post `/ai-implement verify only, make no code change`; or merge by hand.",
-  unreadable: "Claude's review of this commit could not be read. Re-run the Claude review on this commit (re-run its check, or push a commit); when it approves, post `/ai-implement verify only, make no code change`; or merge by hand.",
-  "changes_requested-empty": "Claude requested changes but listed no finding, so no fix run starts. Read the review, then post `/ai-implement <what to change>`; or merge by hand.",
+  incomplete: "The external review of this commit did not finish. Re-run the external review on this commit (re-run its check, or push a commit); when it approves, post `/ai-implement verify only, make no code change`; or merge by hand.",
+  unreadable: "The external review of this commit could not be read. Re-run the external review on this commit (re-run its check, or push a commit); when it approves, post `/ai-implement verify only, make no code change`; or merge by hand.",
+  "changes_requested-empty": "The external review requested changes but listed no finding, so no fix run starts. Read the review, then post `/ai-implement <what to change>`; or merge by hand.",
+  "review-failed": "The Codex review of this commit failed (for example a usage limit). Re-run it with an `@codex review` comment; when it approves, post `/ai-implement verify only, make no code change`; or merge by hand.",
   changes_requested: "A blocking finding is open. If a review-fix run starts, do nothing; if none starts, post `/ai-implement <what to change>`.",
   ledger: "A blocking finding is open. If a review-fix run starts, do nothing; if none starts, post `/ai-implement <what to change>`.",
   "timed-out": "The external review did not finish within 30 minutes. When it approves, post `/ai-implement verify only, make no code change`; or merge by hand.",
@@ -346,13 +347,15 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
       return pr.headSha;
     },
     async readReviewerExpected(input) {
+      const { process } = reviewLedgerOptionsFor(input.owner, input.repo);
+      if (process.checkPairs.length === 0) return true;
       const t = await token(input.owner);
       const commits = await listPullRequestCommits(t, input.owner, input.repo, input.prNumber);
       const earlier = commits.filter((sha) => sha !== input.headSha).slice(-20).reverse();
       const names = await readReviewCheckNames(t, input.owner, input.repo);
       for (const sha of earlier) {
         const runs = await listCheckRuns(t, input.owner, input.repo, sha);
-        if (runs.some((r) => isReviewCheckRun(r, REVIEW_PROCESSES["claude-code-review-repository-fix"], names))) return true;
+        if (runs.some((r) => isReviewCheckRun(r, process, names))) return true;
       }
       return false;
     },
@@ -368,13 +371,29 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
       let checks = await getCombinedChecksState(t, input.owner, input.repo, pr.headSha);
       // Throws on an unreadable commit, so the step retries rather than reading "no findings".
       const headCommittedAtMs = await getCommitTime(t, input.owner, input.repo, pr.headSha);
+      const { process } = reviewLedgerOptionsFor(input.owner, input.repo);
+      const commentVerdict = process.checkPairs.length === 0;
+      let rejected: HeldReason | undefined;
+      if (commentVerdict) {
+        const comments = await listPrComments(t, input.owner, input.repo, input.prNumber, { strict: true });
+        const { verdict } = process.readVerdict({
+          headSha: pr.headSha, checkRuns: [], inlineComments: [], blocks: [],
+          issueComments: comments.map((c) => ({
+            body: c.body, authorLogin: c.user?.login ?? "", authorType: c.user?.type ?? "",
+            updatedAt: c.updatedAt ?? c.createdAt,
+          })),
+        });
+        if (verdict === "incomplete" && checks === "success") checks = "pending";
+        if (verdict === "changes_requested") rejected = "changes_requested";
+        if (verdict === "no-real-verdict") rejected = "review-failed";
+      }
       const lateGapFill = input.gapFill === true && !input.followHead;
-      if ((input.followHead || input.gapFill) && checks === "success") {
+      if (!commentVerdict && (input.followHead || input.gapFill) && checks === "success") {
         const names = lateGapFill ? await readReviewCheckNames(t, input.owner, input.repo) : [];
         // A head pushed a moment ago has no check runs yet, which reads as "success". Its own review must
         // have completed with `success` before the head can count as clean (a skipped run is not a review).
         const reviewRuns = (await listCheckRuns(t, input.owner, input.repo, pr.headSha))
-          .filter((r) => isReviewCheckRun(r, REVIEW_PROCESSES["claude-code-review-repository-fix"], names));
+          .filter((r) => isReviewCheckRun(r, process, names));
         const succeeded = reviewRuns.some((r) => r.status === "completed" && r.conclusion === "success");
         // A gap-fill whose head has no review run after the grace belongs to a repo with no reviewer.
         const noReviewer = input.gapFill && !input.followHead && !input.reviewerExpected && reviewRuns.length === 0
@@ -387,7 +406,7 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
       // A late head (initial run or gap-fill) is never judged in-run, and the ledger has no verdict: read Claude's
       // own (AII-1303). The tick reports it as a blocking finding seen now, which the workflow ends `findings` on.
       // The read throws when the comment list is unreadable, so the step retries rather than reading "no review".
-      const rejected = input.followHead ? undefined : await newestReviewRejectsHead(t, input, headCommittedAtMs);
+      if (!commentVerdict && !input.followHead) rejected = await newestReviewRejectsHead(t, input, headCommittedAtMs);
       if (rejected) blockingLastSeenAtMs.push(Date.now());
       const heldBy = rejected ?? (blockingLastSeenAtMs.some((seen) => seen >= headCommittedAtMs) ? "ledger" as const : undefined);
       return { open, headSha: pr.headSha, checks, headCommittedAtMs, blockingLastSeenAtMs, ...(heldBy ? { heldBy } : {}) };
