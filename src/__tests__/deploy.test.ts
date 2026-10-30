@@ -555,3 +555,31 @@ describe("makeStartDeploy — public mode (no App installation on source owner)"
     expect(hold.isDeployHeld()).toBe(false);
   });
 });
+
+
+describe("self-deploy drain exclusion", () => {
+  it("excludes only the supplied invocation and preserves the default query", async () => {
+    const { queryNonCompletedInvocations } = await import("../restate/endpoint.js");
+    const fake = fakeFetch({ "POST /query": { json: { rows: [{ count: 0 }] } } });
+    await queryNonCompletedInvocations(fake.fetch, "http://admin", "http://endpoint", "inv'123");
+    const excluded = JSON.parse(fake.calls[0].body).query as string;
+    expect(excluded).toContain("id != 'inv''123'");
+    expect(excluded).toContain("status != 'completed' AND status != 'scheduled'");
+    expect(excluded).not.toContain("target_service_name !=");
+    await queryNonCompletedInvocations(fake.fetch, "http://admin", "http://endpoint");
+    expect(JSON.parse(fake.calls[1].body).query).not.toContain("id !=");
+  });
+
+  it("passes the exclusion through the drain factory", async () => {
+    const fake = fakeFetch({ "POST /query": { json: { rows: [{ count: 0 }] } } }).install();
+    expect(await deploy.createRestateDrainProbes("inv-123").oldDeploymentInvocations()).toBe(0);
+    expect(JSON.parse(fake.calls[0].body).query).toContain("id != 'inv-123'");
+  });
+
+  it("checks published manifests with HEAD and returns auth failures without guessing", async () => {
+    const { publishedImageManifestHead } = await import("../restate/self-deploy.js");
+    const fake = fakeFetch({ "HEAD /v2/images/manifests/main-abcdef0": { status: 403 } });
+    expect(await publishedImageManifestHead("registry.fly.io/images:main-abcdef0", "deploy-token", fake.fetch)).toBe(403);
+    expect(fake.calls[0].headers.get("authorization")).toBe("Bearer deploy-token");
+  });
+});
