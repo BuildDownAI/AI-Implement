@@ -1,10 +1,14 @@
 /** Durable self-deploy. Delayed sends leave no sleeping invocation pinned to the old endpoint. */
 import * as restate from "@restatedev/restate-sdk";
+import * as restateClients from "@restatedev/restate-sdk-clients";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import { deployArgs } from "../deploy.js";
 import type { Machine, MachineConfig } from "../fly-machines.js";
+import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 import { RestateDrainCoordinator, type RestateDrainProbes } from "./drain.js";
+
+const INGRESS_TIMEOUT_MS = 15_000;
 
 export type SelfDeployPhase = "draining" | "applying" | "verifying" | "succeeded" | "failed" | "cancelled";
 export interface SelfDeployRecord {
@@ -39,7 +43,6 @@ export interface SelfDeployDeps {
    * Stop the subprocess when signal aborts (including any remote build polling). */
   flyctl(record: SelfDeployRecord, args: string[], token: string, signal: AbortSignal): Promise<void>;
   kgToken(): Promise<string>;
-  applyFlyToml(): boolean | Promise<boolean>;
   getInFlightWork(): readonly unknown[];
   drainProbes(excludeInvocationId: string): RestateDrainProbes;
   setHold(held: boolean): Promise<void>;
@@ -48,12 +51,17 @@ export interface SelfDeployDeps {
   onOutcome(record: SelfDeployRecord): Promise<void>;
   limits?: { drainTimeoutMs?: number; drainPollMs?: number; verifyInitialMs?: number; verifyPollMs?: number; flyctlTimeoutMs?: number };
 }
+export interface SelfDeployOptions { applyFlyToml: boolean }
+export interface SelfDeployStatus { deploy: SelfDeployRecord | null; options: SelfDeployOptions }
+export type SelfDeploySetOptionsResult = { ok: true; options: SelfDeployOptions } | { ok: false; reason: "apply-fly-toml-refused" };
+const DEFAULT_OPTIONS: SelfDeployOptions = { applyFlyToml: false };
 export type SelfDeployStartResult = { deployId: string; commit: string; image: string; alreadyActive: boolean }
   | { reason: "not-configured" | "head-unknown" | "image-not-published" };
 const requester = z.string().min(1).max(200);
 const startSchema = z.object({ branch: z.enum(["testing", "main"]), requestedBy: requester }).strict();
 const active = (r: SelfDeployRecord | null): r is SelfDeployRecord => r !== null && ["draining", "applying", "verifying"].includes(r.phase);
 const read = (ctx: restate.ObjectSharedContext) => ctx.get<SelfDeployRecord>("deploy");
+const readOptions = async (ctx: restate.ObjectSharedContext): Promise<SelfDeployOptions> => ({ ...DEFAULT_OPTIONS, ...await ctx.get<SelfDeployOptions>("options") });
 
 export function createSelfDeploy(deps: SelfDeployDeps) {
   const limits = { drainTimeoutMs: 75 * 60_000, drainPollMs: 30_000, verifyInitialMs: 180_000, verifyPollMs: 60_000, flyctlTimeoutMs: 10 * 60_000, ...deps.limits };
@@ -139,12 +147,13 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
     const record = await read(ctx);
     if (!current(ctx, record, "applying")) return;
     send(ctx, record, "verify", limits.verifyInitialMs, { attempt: 1 });
+    const wantToml = (await readOptions(ctx)).applyFlyToml;
     const policy = await ctx.run("apply policy", async () => {
-      if (!await deps.applyFlyToml()) return "image";
+      if (!wantToml) return "image";
       return deps.config().imageApp ? "refused" : "toml";
     });
     // Outside the retried effect so a partially applied multi-machine update logs this only once.
-    if (policy === "refused") ctx.console.warn("[self-deploy] deploy_apply_fly_toml refused: control plane owns machine config");
+    if (policy === "refused") ctx.console.warn("[self-deploy] apply fly.toml refused: control plane owns machine config");
     let accepted: boolean;
     try {
       accepted = await ctx.run("apply image", async () => {
@@ -193,6 +202,17 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
     await finish(ctx, record, "cancelled");
     return { cancelled: true };
   }
+  async function setOptions(ctx: restate.ObjectContext, input: SelfDeployOptions): Promise<SelfDeploySetOptionsResult> {
+    // The control plane owns that machine's config; fly.toml would change its VM size and mount.
+    if (input.applyFlyToml && await ctx.run("read image app", () => deps.config().imageApp ?? null)) {
+      return { ok: false, reason: "apply-fly-toml-refused" };
+    }
+    ctx.set("options", input);
+    return { ok: true, options: input };
+  }
+  async function status(ctx: restate.ObjectSharedContext): Promise<SelfDeployStatus> {
+    return { deploy: await read(ctx) ?? null, options: await readOptions(ctx) };
+  }
   return restate.object({ name: "SelfDeploy", handlers: {
     start: restate.handlers.object.exclusive({ input: serde.zod(startSchema) }, start),
     checkDrain: restate.handlers.object.exclusive({ ingressPrivate: true }, checkDrain),
@@ -201,7 +221,8 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
     apply: restate.handlers.object.exclusive({ ingressPrivate: true, inactivityTimeout: 65 * 60_000, abortTimeout: 70 * 60_000 }, apply),
     verify: restate.handlers.object.exclusive({ ingressPrivate: true, input: serde.zod(z.object({ attempt: z.number().int().min(1).max(5) }).strict()) }, verify),
     cancel: restate.handlers.object.exclusive({ input: serde.zod(z.object({ requestedBy: requester }).strict()) }, cancel),
-    status: restate.handlers.object.shared(read),
+    setOptions: restate.handlers.object.exclusive({ input: serde.zod(z.object({ applyFlyToml: z.boolean() }).strict()) }, setOptions),
+    status: restate.handlers.object.shared(status),
   } });
 }
 
@@ -213,4 +234,25 @@ export async function publishedImageManifestHead(image: string, token: string, f
     method: "HEAD", headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" },
   });
   return response.status;
+}
+
+export type SelfDeployDefinition = ReturnType<typeof createSelfDeploy>;
+
+/** The ingress surface the poll loop and the admin routes depend on; each call may throw when Restate is unreachable. */
+export interface SelfDeployClient {
+  start(input: { branch: "testing" | "main"; requestedBy: string }): Promise<SelfDeployStartResult>;
+  cancel(input: { requestedBy: string }): Promise<{ cancelled: boolean; reason?: string }>;
+  status(): Promise<SelfDeployStatus>;
+  setOptions(input: SelfDeployOptions): Promise<SelfDeploySetOptionsResult>;
+}
+
+export function createSelfDeployIngressClient(key: () => string = () => process.env.FLY_APP_NAME ?? "orchestrator", baseUrl: string = RESTATE_INGRESS_BASE_URL): SelfDeployClient {
+  const obj = () => restateClients.connect({ url: baseUrl, fetch: (input, init) => fetch(input as never, { ...init, signal: AbortSignal.timeout(INGRESS_TIMEOUT_MS) }) })
+    .objectClient<SelfDeployDefinition>({ name: "SelfDeploy" }, key());
+  return {
+    start: async (input) => await obj().start(input),
+    cancel: async (input) => await obj().cancel(input),
+    status: async () => await obj().status(),
+    setOptions: async (input) => await obj().setOptions(input),
+  };
 }

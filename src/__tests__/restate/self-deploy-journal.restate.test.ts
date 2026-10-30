@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createSelfDeploy, type SelfDeployRecord } from "../../restate/self-deploy.js";
+import { createSelfDeploy, type SelfDeployStatus } from "../../restate/self-deploy.js";
 import { callObject, eventually, journalEntries, journalText, queryInvocations, startVariants, stopAll, type RestateEnvironment } from "./harness.js";
 import { deployFixture } from "./self-deploy-fixture.js";
 
@@ -29,7 +29,7 @@ describe("SelfDeploy delayed-send journal boundaries", () => {
       await callObject(env.baseUrl(), "SelfDeploy", "test-app", "cancel", { requestedBy: "owner" });
       f.state.work = false;
       await callObject(env.baseUrl(), "SelfDeploy", "test-app", "start", { branch: "main", requestedBy: "owner" });
-      await eventually(() => callObject<SelfDeployRecord>(env.baseUrl(), "SelfDeploy", "test-app", "status", {}), r => r.phase === "verifying", { label: "verifying" });
+      await eventually(() => callObject<SelfDeployStatus>(env.baseUrl(), "SelfDeploy", "test-app", "status", {}), r => r.deploy?.phase === "verifying", { label: "verifying" });
       const atVerify = await eventually(() => capture("verify"), c => c.some(e => e.type === "OneWayCall"), { label: "verify delayed send" });
       for (const [point, commands] of [["check-drain", atDrain], ["verify", atVerify]] as const) {
         expect(commands.some(e => e.type === "Sleep")).toBe(false);
