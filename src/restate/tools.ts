@@ -631,8 +631,10 @@ type DeployPostureReport = DeployPosture & { selfDeploy: SelfDeployRecord | null
 export const GET_DEPLOY_POSTURE_DESCRIPTION =
   "Returns the current deploy posture: selfDeploy (the SelfDeploy record: deployId, phase, target, requestedBy, times, reason; null when none or unreadable), whether autoDeploy is on, the watched repo/branch, running vs head commit, deploy hold and in-flight state, runner channel image and commit, and a mergeCost field summarising the landing cost of a merge (deploy+image / image / none). Use this before filing or merging to understand the blast radius.";
 
+export const GetDeployPostureArgsSchema = z.object({});
+
 export const getDeployPostureTool = tool(
-  { description: GET_DEPLOY_POSTURE_DESCRIPTION, input: z.object({}), role: "user" },
+  { description: GET_DEPLOY_POSTURE_DESCRIPTION, input: GetDeployPostureArgsSchema, role: "user" },
   async (ctx): Promise<ToolResponse> => {
     // No defaultImage passed: getDeployPosture's own fallback re-derives it from
     // process.env the same way config.sessionImage was computed at boot (AII-711) — a
