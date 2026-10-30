@@ -49,15 +49,16 @@ class MockResponse {
   }
 }
 
-function fakeContext(handlerName: string): restate.Context {
+function fakeContext(handlerName: string, objectClient?: (definition: unknown, key: string) => unknown): restate.Context {
   return {
+    ...(objectClient ? { objectClient } : {}),
     request: () => ({ target: { handler: handlerName } }),
     run: async (name: unknown, action?: unknown) => (typeof name === "function" ? (name as () => unknown) : (action as () => unknown))(),
   } as unknown as restate.Context;
 }
 
 /** Simulate ingress deserialization with the registered handler's own input serde. */
-function ingress(tools: typeof ToolsModule, handlerName: string): typeof fetch {
+function ingress(tools: typeof ToolsModule, handlerName: string, objectClient?: RecordOptions["objectClient"]): typeof fetch {
   // Legacy service() definitions retain their implementation in `service` at runtime;
   // the SDK's public definition type hides it from clients.
   const definition = tools.orchestratorTools as unknown as {
@@ -80,11 +81,19 @@ function ingress(tools: typeof ToolsModule, handlerName: string): typeof fetch {
       return Response.json({ code: 400, message: `Failed to deserialize input: ${(error as Error).message}`, source: "invocation" }, { status: 400 });
     }
     const invoke = handler as (ctx: restate.Context, input: unknown) => Promise<unknown>;
-    return Response.json(await invoke(fakeContext(handlerName), input));
+    return Response.json(await invoke(fakeContext(handlerName, objectClient), input));
   }) as typeof fetch;
 }
 
-export async function recordExchange(tool: string, body: { args: Record<string, unknown> }, opts?: { scope?: string }): Promise<Exchange> {
+export interface RecordOptions {
+  scope?: string;
+  /** Stands in for `ctx.objectClient` in handlers that call a Restate object; absent, the context has none. */
+  objectClient?: (definition: unknown, key: string) => unknown;
+  /** Use the real deploy-hold gate instead of always admitting; pair with `setDeployHold()` to record an answer during a drain. */
+  realHoldGate?: boolean;
+}
+
+export async function recordExchange(tool: string, body: { args: Record<string, unknown> }, opts?: RecordOptions): Promise<Exchange> {
   // Resolve after testDb() resets modules so handlers use the current database.
   const admin = await import("../admin.js");
   const tools = await import("../restate/tools.js");
@@ -116,9 +125,9 @@ export async function recordExchange(tool: string, body: { args: Record<string, 
       });
       return callTool(name, args, caller, {
         restateReady: () => true,
-        permitsExternalCall: () => true,
+        ...(opts?.realHoldGate ? {} : { permitsExternalCall: () => true }),
         ingressBaseUrl: "http://restate.test",
-        fetchImpl: ingress(tools, name),
+        fetchImpl: ingress(tools, name, opts?.objectClient),
       });
     },
   };
@@ -134,6 +143,13 @@ export async function recordExchange(tool: string, body: { args: Record<string, 
   };
 }
 
+// Tools whose contract test file does not follow the `<tool>-contract.test.ts` convention.
+const CONTRACT_TEST_FILES: Record<string, string> = {
+  list_job_accounting: "src/__tests__/job-accounting-contract.test.ts",
+  start_deploy: "src/__tests__/deploy-tools-contract.test.ts",
+  get_deploy_posture: "src/__tests__/deploy-tools-contract.test.ts",
+};
+
 export function checkExchange(tool: string, scenario: string, recorded: Exchange): void {
   const DIR = new URL(`../../docs/contracts/${tool}/`, import.meta.url);
   const file = new URL(`${scenario}.json`, DIR);
@@ -146,7 +162,7 @@ export function checkExchange(tool: string, scenario: string, recorded: Exchange
     writeFileSync(file, text);
     return;
   }
-  const hint = `Regenerate with UPDATE_CONTRACT_FIXTURES=1 npx vitest run ${tool === "list_job_accounting" ? "src/__tests__/job-accounting-contract.test.ts" : `src/__tests__/${tool.replaceAll("_", "-")}-contract.test.ts`}, and tell the control plane: it copies these files.`;
+  const hint = `Regenerate with UPDATE_CONTRACT_FIXTURES=1 npx vitest run ${CONTRACT_TEST_FILES[tool] ?? `src/__tests__/${tool.replaceAll("_", "-")}-contract.test.ts`}, and tell the control plane: it copies these files.`;
   if (!existsSync(file)) throw new Error(`Recorded exchange docs/contracts/${tool}/${scenario}.json is missing. ${hint}`);
   if (readFileSync(file, "utf8") !== text) {
     throw new Error(`The ${tool} response for "${scenario}" differs from docs/contracts/${tool}/${scenario}.json. ${hint}\nActual:\n${text}`);
