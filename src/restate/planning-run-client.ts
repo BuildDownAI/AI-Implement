@@ -5,6 +5,7 @@
  * that existing input; `runner-callback.ts` itself does not change. Sibling of
  * `createKgRefreshIngressClient` in `kg-refresh-production.ts`.
  */
+import type { RecordedUsage } from "../agent-usage.js";
 import * as restateClients from "@restatedev/restate-sdk-clients";
 import { read as readAdmission, type DispatchAdmissionRecord } from "../dispatch-admission.js";
 import type { PlanningRunDefinition, PlanningRunInput } from "./planning-run-workflow.js";
@@ -20,7 +21,7 @@ export interface PlanningRunIngressClient {
   /** Starts the workflow keyed by `dispatchId`; the workflow key is the idempotency (Restate rejects an idempotency key on a workflow handler with HTTP 400). */
   submit(dispatchId: string, input: PlanningRunInput): Promise<PlanningIngressResult>;
   /** Resolves the workflow's `report` promise. */
-  report(dispatchId: string): Promise<PlanningIngressResult>;
+  report(dispatchId: string, body?: { usage?: RecordedUsage }): Promise<PlanningIngressResult>;
 }
 
 export interface PlanningRunIngressClientDeps {
@@ -55,7 +56,9 @@ export function createPlanningRunIngressClient(
   return {
     submit: (dispatchId, input) =>
       invoke(() => workflow(dispatchId).workflowSubmit(input, restateClients.rpc.sendOpts({ timeout }))),
-    report: (dispatchId) => invoke(() => workflow(dispatchId).report(restateClients.rpc.opts({ timeout }))),
+    // The SDK RemoveVoidArgument type cannot represent an optional JSON input. The handler
+    // accepts undefined at runtime; preserve it so existing callers send an empty HTTP body.
+    report: (dispatchId, body) => invoke(() => workflow(dispatchId).report(body!, restateClients.rpc.opts({ timeout }))),
   };
 }
 
@@ -74,14 +77,14 @@ export interface PlanningAdmissionTerminationHookDeps {
  */
 export function createPlanningAdmissionTerminationHook(
   deps: PlanningAdmissionTerminationHookDeps,
-): (dispatchId: string) => Promise<void> {
+): (dispatchId: string, usage?: RecordedUsage) => Promise<void> {
   const lookup = deps.readAdmission ?? readAdmission;
-  return async (dispatchId) => {
+  return async (dispatchId, usage) => {
     if (lookup(dispatchId)?.lifecycleOwner.kind !== "restate") {
       await deps.legacy(dispatchId);
       return;
     }
-    const result = await deps.ingress.report(dispatchId);
+    const result = await (usage ? deps.ingress.report(dispatchId, { usage }) : deps.ingress.report(dispatchId));
     if (result.status === "accepted") {
       console.log(`[planning-run] report sent dispatch=${dispatchId}`);
     } else {
