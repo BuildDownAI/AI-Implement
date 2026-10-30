@@ -64,7 +64,6 @@ let fly: typeof FlyModule;
 let repoImage: typeof RepoImageModule;
 let github: typeof GithubModule;
 let probe: typeof WorkflowProbeModule;
-let visibility: "public" | "private";
 let planRecord = true;
 let logs: string[];
 let workflows: Record<string, string | null> = {};
@@ -112,7 +111,6 @@ function machineBody() {
 
 beforeEach(async () => {
   vi.stubEnv("RUNNER_TOKEN_SECRET", RUNNER_SECRET);
-  visibility = "private";
   planRecord = true;
   workflows = {};
   logs = [];
@@ -161,7 +159,6 @@ beforeEach(async () => {
     preparationDeps: () => ({
       ownership,
       credentials,
-      getRepoTrust: async () => ({ visibility, trustedForSubscription: true }),
       readDefaultBranchWorkflows: async () => workflows,
       checkRunnerCapability: async () => true,
     }),
@@ -257,17 +254,8 @@ describe("opted-in Fly implementation", () => {
     expect(grantRevoked()).toBe(true);
   });
 
-  it("a public repo refuses: no machine, admission released, one tracker failure", async () => {
-    visibility = "public";
-    await dispatchFly();
-    expect(fly.createMachine).not.toHaveBeenCalled();
-    expect(admissions()).toBe(0);
-    expect(provider.markImplementationFailed).toHaveBeenCalledOnce();
-    expect(vi.mocked(provider.markImplementationFailed).mock.calls[0]![2]).toMatch(/Managed dispatch refused/);
-  });
-
   it("repeated refusals trip the breaker and park the issue", async () => {
-    visibility = "public";
+    dedup.getDb().prepare("DELETE FROM model_session_generations").run();
     for (let i = 0; i < 3; i++) await dispatchFly();
     const row = dedup.getDb().prepare("SELECT consecutive_failures, parked_at FROM dispatch_breaker WHERE issue_id = ?").get(issue.id) as { consecutive_failures: number; parked_at: number | null };
     expect(row.consecutive_failures).toBe(3);
@@ -421,15 +409,6 @@ describe("opted-in GitHub Actions implementation (AII-1420)", () => {
     expect(vi.mocked(provider.markImplementationFailed).mock.calls[0]![2]).toContain(code);
     const row = dedup.getDb().prepare("SELECT consecutive_failures FROM dispatch_breaker WHERE issue_id = ?").get(issue.id) as { consecutive_failures: number };
     expect(row.consecutive_failures).toBe(1);
-  });
-
-  it("refuses a public repository before any credential is resolved", async () => {
-    visibility = "public";
-    await dispatchGha();
-    expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
-    expect(count("model_credential_grants")).toBe(0);
-    expect(count("model_profile_reservations")).toBe(0);
-    expect(vi.mocked(provider.markImplementationFailed).mock.calls[0]![2]).toContain("repository_public");
   });
 
   it("refuses when the target workflow lacks the private transport and revokes the grant", async () => {

@@ -112,7 +112,6 @@ export async function prepareManagedDispatch(
         backend: req.backend,
         workflowRepository: repository,
         workflowFile: req.workflowFile,
-        repositories: [repository],
       },
       runtime.preparationDeps({ owner: req.owner, repo: req.repo, projectKey: req.projectKey }),
     );

@@ -16,7 +16,7 @@
  * Order (every step fails closed, and nothing is reserved before the last
  * pre-reservation check passes):
  *   stored snapshot (reuse) -> persisted opt-in -> resolve + persist immutable snapshot
- *   -> agent/provider/auth/backend matrix -> workspace trust for every executed repo
+ *   -> agent/provider/auth/backend matrix
  *   -> runner/template capability -> credential readiness for unreserved profiles
  *   (API key, bedrock, codex-subscription) -> atomic reservation of the reserved set
  *   (`claude-subscription` only) -> owner-state inspection
@@ -38,7 +38,6 @@
  */
 import crypto from "node:crypto";
 import { getDb } from "./dedup.js";
-import { repoTrustRejection, type RepoTrust, type RepoVisibility } from "./repo-trust.js";
 import {
   STAGE_NAMES,
   type AccountAuthMode,
@@ -101,12 +100,8 @@ const GRANT_BACKENDS: Record<DispatchAdmissionBackend, ModelAuthBackend> = {
 
 // --- public types ---
 
-export type { RepoVisibility, RepoTrust };
-
 /** Shared by preparation and inspection: injected reads only, no writes. */
 export interface AgentReadinessDeps {
-  /** Actual visibility/trust of one executed repository. A throw is treated as unknown. */
-  getRepoTrust(repository: string): Promise<RepoTrust>;
   /** Default-branch contents of each path, `null` when absent. A throw means unreadable. */
   readDefaultBranchWorkflows(repository: string, paths: readonly string[]): Promise<Record<string, string | null>>;
   /** Runner-image capability for backends that do not read a workflow. Absent means unknown (fail closed). */
@@ -128,8 +123,6 @@ export interface AgentRunRequest {
   /** `owner/repo` whose trusted default branch carries the workflow (GitHub Actions). */
   workflowRepository: string;
   workflowFile: string;
-  /** Every repository the agent will execute against, including a KG source and secondary repos. */
-  repositories: readonly string[];
   remainingJobMs?: number;
 }
 
@@ -140,10 +133,6 @@ export type ConfigurationErrorCode =
   | "snapshot_invalid"
   | "project_mismatch"
   | "unsupported_combination"
-  | "no_repositories"
-  | "repository_public"
-  | "repository_visibility_unknown"
-  | "repository_not_trusted"
   | "delivery_unreadable"
   | "retired_workflow_present"
   | "runner_incompatible"
@@ -334,30 +323,9 @@ function profileList(snapshot: ResolvedAgentSnapshotV1): PreparedProfile[] {
   });
 }
 
-function hasSubscription(snapshot: ResolvedAgentSnapshotV1): boolean {
-  return profileList(snapshot).some((p) => isSubscriptionAuthMode(p.authMode));
-}
-
 /** Bedrock credentials are only forwarded by GitHub Actions; every other combination is validated by the snapshot. */
 function backendSupported(snapshot: ResolvedAgentSnapshotV1, backend: DispatchAdmissionBackend): boolean {
   return backend === "github-actions" || !profileList(snapshot).some((p) => p.authMode === "bedrock");
-}
-
-async function checkTrust(request: AgentRunRequest, deps: AgentReadinessDeps): Promise<ConfigurationErrorCode | null> {
-  const repos = [...new Set(request.repositories ?? [])];
-  if (repos.length === 0) return "no_repositories";
-  if (repos.some((r) => typeof r !== "string" || !REPO_PATTERN.test(r))) return "invalid_request";
-  for (const repo of repos) {
-    let trust: RepoTrust | undefined;
-    try {
-      trust = await deps.getRepoTrust(repo);
-    } catch {
-      trust = undefined;
-    }
-    const rejection = repoTrustRejection(trust);
-    if (rejection) return rejection;
-  }
-  return null;
 }
 
 async function checkCapability(request: AgentRunRequest, deps: AgentReadinessDeps): Promise<ConfigurationErrorCode | null> {
@@ -392,17 +360,13 @@ async function checkCapability(request: AgentRunRequest, deps: AgentReadinessDep
     : "runner_incompatible";
 }
 
-/** Matrix, trust and capability: everything decidable without credentials or reservations. */
+/** Matrix and capability: everything decidable without credentials or reservations. */
 async function checkSelection(
   snapshot: ResolvedAgentSnapshotV1,
   request: AgentRunRequest,
   deps: AgentReadinessDeps,
 ): Promise<ConfigurationErrorCode | null> {
   if (!backendSupported(snapshot, request.backend)) return "unsupported_combination";
-  if (hasSubscription(snapshot)) {
-    const trust = await checkTrust(request, deps);
-    if (trust) return trust;
-  }
   return checkCapability(request, deps);
 }
 

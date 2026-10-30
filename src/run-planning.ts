@@ -419,13 +419,10 @@ export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exit
   if (malformedConfiguredIntent) return failConfigured(INVALID_SNAPSHOT_REASON);
   let configured: ConfiguredRun | undefined;
   try {
-    const owner = process.env.GITHUB_OWNER?.trim();
-    const repo = process.env.GITHUB_REPO?.trim();
     configured = await prepareConfiguredRun({
       env: process.env,
       snapshot: agentConfig,
       workspaceDir,
-      repositories: owner && repo ? [`${owner}/${repo}`] : [],
       options: opts.configured,
     });
   } catch (err) {
