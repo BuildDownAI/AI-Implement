@@ -343,6 +343,65 @@ describe("recorded usage", () => {
     expect(rows()).toEqual(before);
   });
 
+  it.each([
+    { managed: true, mismatch: null },
+    { managed: true, mismatch: "model" },
+    { managed: true, mismatch: "profileId" },
+    { managed: false, mismatch: "model" },
+    { managed: false, mismatch: "profileId" },
+  ] as const)("applies managed acceptance policy (managed=$managed, mismatch=$mismatch)", async ({ managed, mismatch }) => {
+    const { testDb } = await import("./helpers/test-db.js");
+    const { modules: { usage, dedup } } = await testDb({ modules: {
+      usage: () => import("../agent-usage.js"), dedup: () => import("../dedup.js"),
+    } });
+    const db = dedup.getDb();
+    const dispatchId = "policy-dispatch";
+    db.prepare(`INSERT INTO run_agent_config_snapshots
+      (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+      VALUES (?, ?, 'ENG', ?, ?, ?, 1)`).run(snap.snapshotId, dispatchId,
+      JSON.stringify({ stages: snap.stages, profiles: snap.profiles }), JSON.stringify(snap.sources), JSON.stringify(snap.configRevisions));
+    if (managed) {
+      // Durable attempt ownership must enforce the policy even without an active admission.
+      db.prepare(`INSERT INTO review_fix_attempts
+        (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number, issue_scope,
+         issue_id, owner, state, created_at, deadline_at, task_snapshot_json, finding_versions_json)
+        VALUES ('policy-attempt', ?, 'ENG', '1', 'acme/widgets', 42, 'pr',
+                'acme/widgets#42', 'policy-attempt', 'prepared', 1, 60001, '{}', '[]')`).run(dispatchId);
+    }
+    const overrides = mismatch ? { [mismatch]: "different-selection" } : {};
+    // Distinct ids exercise both the invocation list and the legacy attribution path.
+    const input = usage.toRecordedUsage({
+      invocations: [{ attribution: claim("implementation", { ...overrides, invocationId: "policy-list" }) }],
+      attribution: claim("implementation", { ...overrides, invocationId: "policy-legacy" }),
+      pushedCommits: [],
+    });
+    expect(input.listWhole).toBe(true);
+    const rejected = managed && mismatch !== null;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const rows = () => db.prepare("SELECT * FROM model_invocation_attribution WHERE dispatch_id = ? ORDER BY rowid")
+        .all(dispatchId) as { invocation_id: string; model: string; profile_id: string; usage_json: string }[];
+      const report = () => db.prepare("SELECT invocations_complete FROM dispatch_job_report WHERE dispatch_id = ?").get(dispatchId);
+      expect(usage.recordUsage(dispatchId, input)).toBe(rejected ? 2 : 0);
+      const stored = rows();
+      expect(stored.map((row) => row.invocation_id)).toEqual(rejected ? [] : ["policy-list", "policy-legacy"]);
+      for (const row of stored) {
+        expect(row).toMatchObject({ model: snap.stages.implementation.model, profile_id: snap.profiles.implementation.id });
+        expect(JSON.parse(row.usage_json)).toMatchObject({
+          attribution: mismatch ? "mismatch" : "verified",
+          mismatches: mismatch ? [mismatch] : [],
+          tokensIn: 100, tokensOut: 10, costUsd: 0.5,
+        });
+      }
+      expect(report()).toEqual({ invocations_complete: rejected ? 0 : 1 });
+      expect(usage.recordUsage(dispatchId, JSON.parse(JSON.stringify(input)))).toBe(rejected ? 2 : 0);
+      expect(rows()).toEqual(stored);
+      expect(report()).toEqual({ invocations_complete: rejected ? 0 : 1 });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("stores capped lists without marking them complete", async () => {
     const { testDb } = await import("./helpers/test-db.js");
     const { modules: { usage, dedup } } = await testDb({ modules: {
