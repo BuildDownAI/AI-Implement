@@ -3,6 +3,8 @@ import * as restate from "@restatedev/restate-sdk";
 import * as restateClients from "@restatedev/restate-sdk-clients";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
+import { resolveDeployTarget } from "../deploy-availability.js";
+import type { DeployPolicy } from "../deploy-policy.js";
 import { deployArgs } from "../deploy.js";
 import type { Machine, MachineConfig } from "../fly-machines.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
@@ -14,7 +16,7 @@ export type SelfDeployPhase = "draining" | "applying" | "verifying" | "succeeded
 export interface SelfDeployRecord {
   deployId: string;
   phase: SelfDeployPhase;
-  target: { branch: "testing" | "main"; commit: string; image: string; source: "published" | "built" };
+  target: { repo: string; branch: "testing" | "main"; commit: string; image: string; source: "published" | "built" };
   requestedBy: string;
   startedAt: number;
   finishedAt: number | null;
@@ -31,6 +33,7 @@ export interface SelfDeployConfig {
 export interface SelfDeployDeps {
   /** Read credentials only inside effects; this value is never returned to the journal. */
   config(): SelfDeployConfig;
+  getDeployPolicy(): Pick<DeployPolicy, "watchedRepo" | "watchedRef">;
   head(target: { owner: string; repo: string }, branch: "testing" | "main"): Promise<string | null>;
   /** Manifest HEAD, returning its HTTP status. */
   registryHead(image: string, token: string): Promise<number>;
@@ -83,7 +86,7 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
   }
   function write(ctx: restate.ObjectContext, record: SelfDeployRecord) {
     ctx.set("deploy", record);
-    ctx.console.info(`[self-deploy] ${record.deployId} ${record.phase} ${record.reason ?? ""}`);
+    ctx.console.info(`[self-deploy] ${record.deployId} ${record.phase}${record.phase === "draining" ? ` ${record.target.repo}` : ""} ${record.reason ?? ""}`);
   }
   function send(ctx: restate.ObjectContext, record: SelfDeployRecord, handler: "checkDrain" | "apply" | "verify", delay: number, input: { attempt: number } | undefined = undefined) {
     const self = ctx.objectSendClient({ name: "SelfDeploy" } as restate.VirtualObjectDefinition<"SelfDeploy", unknown>, ctx.key) as unknown as
@@ -105,7 +108,8 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
     const found = await ctx.run("find target", async (): Promise<SelfDeployRecord["target"] | { reason: "not-configured" | "head-unknown" | "image-not-published" }> => {
       const config = deps.config();
       if (!config.flyDeployToken || !config.flyOrchestratorApp || !config.selfDeployTarget) return { reason: "not-configured" };
-      const commit = await deps.head(config.selfDeployTarget, input.branch);
+      const target = resolveDeployTarget({ ...config.selfDeployTarget, branch: input.branch, runningCommit: null }, deps.getDeployPolicy())!;
+      const commit = await deps.head(target, input.branch);
       if (!commit) return { reason: "head-unknown" };
       const source = config.kgSourceRepo ? "built" : "published";
       const image = source === "built" ? `registry.fly.io/${ctx.key}:deploy-${commit.slice(0, 7)}`
@@ -117,7 +121,7 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
           return { reason: "image-not-published" };
         }
       }
-      return { branch: input.branch, commit, image, source };
+      return { repo: `${target.owner}/${target.repo}`, branch: input.branch, commit, image, source };
     });
     if ("reason" in found) return found;
     const record: SelfDeployRecord = { deployId: ctx.rand.uuidv4(), phase: "draining", target: found, requestedBy: input.requestedBy, startedAt: await ctx.date.now(), finishedAt: null, reason: null };
@@ -165,7 +169,7 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
           const fresh = await Promise.all(machines.map(m => deps.fly.getMachine(token, ctx.key, m.id)));
           if (fresh.length > 0 && fresh.every(m => m.config.image === record.target.image)) return true;
           if (record.target.source === "built") {
-            const args = deployArgs({ app: ctx.key, sourceCommit: record.target.commit, sourceRepo: `${config.selfDeployTarget!.owner}/${config.selfDeployTarget!.repo}`, sourceBranch: record.target.branch, kgSourceRepo: config.kgSourceRepo!, kgToken: await deps.kgToken() });
+            const args = deployArgs({ app: ctx.key, sourceCommit: record.target.commit, sourceRepo: record.target.repo, sourceBranch: record.target.branch, kgSourceRepo: config.kgSourceRepo!, kgToken: await deps.kgToken() });
             await flyctl(record, [...args, "--build-only", "--push", "--image-label", `deploy-${record.target.commit.slice(0, 7)}`], token);
           }
           if (policy === "toml") await flyctl(record, ["deploy", "--image", record.target.image, "--detach", "--app", ctx.key], token);

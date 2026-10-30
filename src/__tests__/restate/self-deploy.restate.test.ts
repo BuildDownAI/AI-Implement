@@ -1,3 +1,4 @@
+import { decideAvailabilityAction } from "../../deploy-policy.js";
 import * as restate from "@restatedev/restate-sdk";
 import { queryNonCompletedInvocations } from "../../restate/endpoint.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -33,6 +34,8 @@ describe("SelfDeploy durable phase machine", () => {
     const first = await start(env);
     expect(first).toMatchObject({ alreadyActive: false, commit: COMMIT });
     expect(f.state.held).toBe(true);
+    expect((await read(env))?.target.repo).toBe("owner/repo");
+    expect(f.deps.head).toHaveBeenCalledWith(expect.objectContaining({ owner: "owner", repo: "repo" }), "testing");
     expect(await start(env)).toEqual({ ...first, alreadyActive: true });
     await eventually(() => queryInvocations(env.adminAPIBaseUrl(), "target_service_name = 'SelfDeploy' AND target_handler_name = 'checkDrain' AND status = 'scheduled'"), r => r.length > 0, { label: "scheduled drain" });
     const open = await queryInvocations(env.adminAPIBaseUrl(), "target_service_name = 'SelfDeploy' AND status != 'completed' AND status != 'scheduled'");
@@ -46,6 +49,28 @@ describe("SelfDeploy durable phase machine", () => {
     expect(f.state.held).toBe(false);
     expect(f.state.outcomes).toHaveLength(1);
     expect(f.deps.fly.updateMachine).toHaveBeenCalledExactlyOnceWith("secret-fly", "test-app", "m1", { ...before, image: (first as { image: string }).image });
+  });
+  it.each(VARIANTS.flatMap(([variant]) => (["testing", "main"] as const).map(branch => [variant, branch] as const)))("resolves the watched repo, pins it through apply and honors the requested branch (%s, %s)", async (label, branch) => {
+    f = deployFixture(); const env = envs.get(label)!;
+    const watchedHead = "fedcba9876543210";
+    const watchedPolicy = { autoDeploy: true, notifyAvailable: true, watchedRepo: "fork-owner/AI-Implement", watchedRef: "testing" };
+    f.deps.getDeployPolicy = vi.fn(() => watchedPolicy);
+    f.config.kgSourceRepo = "owner/kg";
+    vi.mocked(f.deps.head).mockImplementation(async (target, requestedBranch) => target.owner === "fork-owner" && target.repo === "AI-Implement" && requestedBranch === branch ? watchedHead : COMMIT);
+    const poll = { configured: true, available: true, headCommit: watchedHead, held: false, policy: watchedPolicy, lastActedCommit: null as string | null };
+    expect(decideAvailabilityAction(poll)).toBe("deploy");
+    const result = await call<SelfDeployStartResult>(env, "start", { branch, requestedBy: "auto-deploy" });
+    expect(result).toMatchObject({ commit: watchedHead, alreadyActive: false });
+    expect(f.deps.head).toHaveBeenCalledWith(expect.objectContaining({ owner: "fork-owner", repo: "AI-Implement" }), branch);
+    expect((await read(env))?.target).toMatchObject({ repo: "fork-owner/AI-Implement", branch, commit: watchedHead });
+    if (!("commit" in result)) throw new Error("deploy did not start");
+    expect(decideAvailabilityAction({ ...poll, lastActedCommit: result.commit })).toBe("none");
+    expect(decideAvailabilityAction({ ...poll, lastActedCommit: result.commit, headCommit: "next-head" })).toBe("deploy");
+    watchedPolicy.watchedRepo = "other/repo";
+    f.state.commit = watchedHead; f.state.work = false;
+    await terminal(env, f, "succeeded");
+    expect(f.deps.getDeployPolicy).toHaveBeenCalledOnce();
+    expect(f.deps.flyctl).toHaveBeenCalledWith(expect.objectContaining({ target: expect.objectContaining({ repo: "fork-owner/AI-Implement" }) }), expect.arrayContaining(["SOURCE_REPO=fork-owner/AI-Implement", `SOURCE_COMMIT=${watchedHead}`, `SOURCE_BRANCH=${branch}`]), "secret-fly", expect.any(AbortSignal));
   });
   it.each(VARIANTS)("refuses missing images/auth, unknown head and missing configuration without hold or Fly (%s)", async label => {
     f = deployFixture(); const env = envs.get(label)!;
@@ -207,7 +232,7 @@ describe("SelfDeploy durable phase machine", () => {
   });
   it.each(VARIANTS)("applying is deduplicated and cannot be cancelled (%s)", async label => {
     f = deployFixture(); const env = envs.get(label)!;
-    const record: SelfDeployRecord = { deployId: "seed-applying", phase: "applying", target: { branch: "testing", commit: COMMIT, image: "image", source: "published" }, requestedBy: "owner", startedAt: 1, finishedAt: null, reason: null };
+    const record: SelfDeployRecord = { deployId: "seed-applying", phase: "applying", target: { repo: "owner/repo", branch: "testing", commit: COMMIT, image: "image", source: "published" }, requestedBy: "owner", startedAt: 1, finishedAt: null, reason: null };
     await setObjectState(env.adminAPIBaseUrl(), "SelfDeploy", "test-app", "deploy", record);
     expect(await start(env)).toEqual({ deployId: record.deployId, commit: COMMIT, image: "image", alreadyActive: true });
     expect(await call(env, "cancel", { requestedBy: "owner" })).toEqual({ cancelled: false, reason: "too-late" });
@@ -240,7 +265,7 @@ describe("SelfDeploy durable phase machine", () => {
     try { for (const env of local.values()) {
       for (const current of [null, "draining", "applying", "verifying", "succeeded", "failed", "cancelled"] as const) {
         const key = `matrix-${current}`;
-        const record: SelfDeployRecord | null = current === null ? null : { deployId: "matrix", phase: current, target: { branch: "testing", commit: COMMIT, image: "image", source: "published" }, requestedBy: "owner", startedAt: 1, finishedAt: null, reason: null };
+        const record: SelfDeployRecord | null = current === null ? null : { deployId: "matrix", phase: current, target: { repo: "owner/repo", branch: "testing", commit: COMMIT, image: "image", source: "published" }, requestedBy: "owner", startedAt: 1, finishedAt: null, reason: null };
         if (record) await setObjectState(env.adminAPIBaseUrl(), "SelfDeploy", key, "deploy", record);
         for (const handler of ["checkDrain", "apply", "verify"] as const) {
           if ((handler === "checkDrain" && current === "draining") || (handler === "apply" && current === "applying") || (handler === "verify" && current === "verifying")) continue;

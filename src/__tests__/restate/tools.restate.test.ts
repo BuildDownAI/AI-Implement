@@ -127,7 +127,7 @@ const authorizationTools = restate.service({
 let selfDeployStarts = 0;
 let selfDeployStatusThrows = false;
 const stubDeployRecord: SelfDeployRecord = {
-  deployId: "deploy-1", phase: "draining", target: { branch: "testing", commit: "a".repeat(40), image: "registry.fly.io/img:testing-aaaaaaa", source: "published" },
+  deployId: "deploy-1", phase: "draining", target: { repo: "owner/repo", branch: "testing", commit: "a".repeat(40), image: "registry.fly.io/img:testing-aaaaaaa", source: "published" },
   requestedBy: "cp", startedAt: 1, finishedAt: null, reason: null,
 };
 const selfDeployStub = restate.object({

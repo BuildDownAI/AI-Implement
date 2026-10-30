@@ -122,7 +122,7 @@ describe("outcomeFromDeployRecord and onSelfDeployOutcome", () => {
   const record = (phase: "succeeded" | "failed" | "cancelled", reason: "drain-timeout" | "apply-failed" | "verify-timeout" | null = null) => ({
     deployId: "d1",
     phase,
-    target: { branch: "testing" as const, commit: "abc1234def", image: "registry.fly.io/app:testing-abc1234", source: "published" as const },
+    target: { repo: "owner/repo", branch: "testing" as const, commit: "abc1234def", image: "registry.fly.io/app:testing-abc1234", source: "published" as const },
     requestedBy: "admin@example.com",
     startedAt: 1_700_000_000_000,
     finishedAt: 1_700_000_100_000,

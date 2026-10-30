@@ -5228,11 +5228,12 @@ async function main(): Promise<void> {
       const { token } = await mintSourceTokenOrJwt(config.githubAppId, config.githubAppPrivateKey, target.owner, { permissions: { contents: "read" }, repositories: [target.repo] });
       return getRefSha(token, target.owner, target.repo, branch);
     },
+    getDeployPolicy,
     registryHead: publishedImageManifestHead,
     fly: { listMachines, getMachine, updateMachine },
     flyctl: async (record, args, token, signal) => {
-      const target = config.selfDeployTarget!;
-      await runSelfDeployFlyctl({ owner: target.owner, repo: target.repo, commit: record.target.commit, githubAppId: config.githubAppId, githubAppPrivateKey: config.githubAppPrivateKey, args, flyDeployToken: token, signal });
+      const [owner, repo] = record.target.repo.split("/");
+      await runSelfDeployFlyctl({ owner, repo, commit: record.target.commit, githubAppId: config.githubAppId, githubAppPrivateKey: config.githubAppPrivateKey, args, flyDeployToken: token, signal });
     },
     kgToken: async () => {
       const kg = parseKgSourceRepo(config.kgSourceRepo);
