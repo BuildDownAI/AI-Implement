@@ -392,20 +392,73 @@ describe("postRunnerResult", () => {
     expect(sentBody(endpoint)).not.toHaveProperty("reviewFix");
   });
 
-  it("does not retry a legacy (no reviewFix) call on a transient 503 — single-attempt behavior is unchanged (AII-794)", async () => {
-    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const endpoint = resultEndpoint({ status: 503, text: "unavailable" });
+  describe("result delivery without reviewFix", () => {
+    const base = () => ({ workspaceDir, phase: "implementation", outcome: "success", callbackUrl: "https://cb" } as const);
 
-    await postRunnerResult({
-      workspaceDir,
-      phase: "implementation",
-      outcome: "failure",
-      callbackUrl: "https://cb",
-      fetchImpl: endpoint.fetch,
+    it.each(["planning", "implementation", "kg-refresh"] as const)("retries transport, 429 and 503 then stops at the first 2xx for %s", async (phase) => {
+      const secret = "secret-response-and-transport-message";
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      const sleepImpl = vi.fn(async (_ms: number) => {});
+      const endpoint = resultEndpoint((call) => {
+        const index = endpoint.calls.indexOf(call);
+        if (index === 0) throw new Error(secret);
+        return { status: [0, 429, 503, 201][index] ?? 400, text: secret };
+      });
+      const invocations = [{
+        attribution: {
+          version: 1 as const, invocationId: "inv-1", stage: "implementation" as const, snapshotId: "snap-1",
+          agent: "codex" as const, provider: "openai" as const, model: "m", profileId: "p",
+          authMode: "openai-api-key" as const, limit: null, outcome: "success" as const,
+          usage: { availability: "complete" as const, tokensIn: 10, tokensOut: 5, costUsd: 0.01, costStatus: "reported" as const },
+        }, attempts: 1, cacheReadTokens: null, cacheCreationTokens: null,
+      }];
+      await postRunnerResult({ ...base(), phase, invocations, fetchImpl: endpoint.fetch, sleepImpl });
+      expect(endpoint.calls).toHaveLength(4);
+      expect(new Set(endpoint.calls.map((call) => call.body)).size).toBe(1);
+      expect(sentBody(endpoint).invocations).toEqual(invocations);
+      expect(sleepImpl).toHaveBeenCalledTimes(3);
+      expect(error.mock.calls.map(([line]) => line)).toEqual([
+        expect.stringContaining("attempt 1 status=transport_error"),
+        expect.stringContaining("attempt 2 status=429"),
+        expect.stringContaining("attempt 3 status=503"),
+      ]);
+      expect(JSON.stringify(error.mock.calls)).not.toContain(secret);
+      expect(JSON.stringify(error.mock.calls)).not.toContain(process.env.RUN_TOKEN);
     });
 
-    expect(endpoint.calls).toHaveLength(1);
-    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("POST failed HTTP 503"));
+    it.each([400, 401, 409])("stops immediately on HTTP %s", async (status) => {
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      const sleepImpl = vi.fn(async () => {});
+      const endpoint = resultEndpoint({ status });
+      await postRunnerResult({ ...base(), fetchImpl: endpoint.fetch, sleepImpl });
+      expect(endpoint.calls).toHaveLength(1);
+      expect(sleepImpl).not.toHaveBeenCalled();
+      expect(log).not.toHaveBeenCalledWith(expect.stringContaining("POST ok"));
+    });
+
+    it.each([undefined, 100_000_000])("stops after eight attempts with deadline %s", async (deadlineAt) => {
+      const endpoint = resultEndpoint({ status: 503 });
+      const sleepImpl = vi.fn(async () => {});
+      await postRunnerResult({ ...base(), deadlineAt, now: () => 0, fetchImpl: endpoint.fetch, sleepImpl });
+      expect(endpoint.calls).toHaveLength(8);
+      expect(sleepImpl).toHaveBeenCalledTimes(7);
+    });
+
+    it("clips backoff to deadline plus grace and sends no request at the boundary", async () => {
+      const deadlineAt = 1_000_000;
+      let now = deadlineAt + 15 * 60_000 - 10;
+      const endpoint = resultEndpoint({ status: 503 });
+      const sleepImpl = vi.fn(async (ms: number) => { now += ms; });
+      await postRunnerResult({ ...base(), deadlineAt, now: () => now, fetchImpl: endpoint.fetch, sleepImpl });
+      expect(endpoint.calls).toHaveLength(1);
+      expect(sleepImpl).toHaveBeenCalledExactlyOnceWith(10);
+    });
+
+    it("makes no attempt when deadline plus grace has already expired", async () => {
+      const endpoint = resultEndpoint();
+      await postRunnerResult({ ...base(), deadlineAt: 0, now: () => 15 * 60_000, fetchImpl: endpoint.fetch });
+      expect(endpoint.calls).toHaveLength(0);
+    });
   });
 
   describe("pilot bounded retry/backoff (AII-794)", () => {
