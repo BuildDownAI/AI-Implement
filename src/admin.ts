@@ -3565,7 +3565,7 @@ export async function upsertMappingAction(
     }
   }
 
-  // No enablement check: the process and its trusted authors apply to every project; only the forward to `ReviewFixPR.feedback` needs the Restate lifecycle.
+  // Validate the effective saved pair, including updates that omit either field.
   let reviewProcess: ReviewProcessId | null;
   if (body.reviewProcess === undefined) {
     reviewProcess = existingMapping?.reviewProcess ?? null;
@@ -3574,7 +3574,10 @@ export async function upsertMappingAction(
   } else if (isReviewProcessId(body.reviewProcess)) {
     reviewProcess = body.reviewProcess;
   } else {
-    return { status: 400, body: { error: `reviewProcess invalid: must be null, "ai-implement", "claude-code-review", or "claude-code-review-repository-fix"` } };
+    return { status: 400, body: { error: `reviewProcess invalid: must be null, "ai-implement", "claude-code-review", "claude-code-review-repository-fix", or "codex-code-review"` } };
+  }
+  if (reviewProcess === "codex-code-review" && reviewFixLifecycle !== "restate") {
+    return { status: 400, body: { error: 'reviewProcess "codex-code-review" requires reviewFixLifecycle "restate"' } };
   }
 
   const mapping: RepoMapping = {

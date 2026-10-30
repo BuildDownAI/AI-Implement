@@ -2066,6 +2066,23 @@ describe("admin mappings", () => {
     expect(JSON.parse(reset.body).reviewProcess).toBeNull();
   });
 
+  it("requires Restate for Codex, including lifecycle-only saves", async () => {
+    const token = await login("secret");
+    for (const reviewFixLifecycle of [undefined, null, "legacy"]) {
+      const res = await request("/api/mappings", "POST", "secret", {
+        teamKey: "CODEX", owner: "org", repo: "app", reviewProcess: "codex-code-review", reviewFixLifecycle,
+      }, token);
+      expect(res.statusCode).toBe(400);
+    }
+    resolveWorkflowCapabilitiesMock.mockResolvedValueOnce({ contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: true });
+    const saved = await requestWithDeps("/api/mappings", "POST", token, {
+      getRestateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
+    }, { teamKey: "CODEX", owner: "org", repo: "app", defaultBranch: "main", executionMode: "github-actions", reviewProcess: "codex-code-review", reviewFixLifecycle: "restate" });
+    expect(saved.statusCode).toBe(202);
+    const moved = await request("/api/mappings", "POST", "secret", { teamKey: "CODEX", owner: "org", repo: "app", reviewFixLifecycle: "legacy" }, token);
+    expect(moved.statusCode).toBe(400);
+  });
+
   it("stores reviewProcess claude-code-review-repository-fix", async () => {
     const token = await login("secret");
     const res = await request("/api/mappings", "POST", "secret", {
@@ -2087,7 +2104,7 @@ describe("admin mappings", () => {
       teamKey: "RP3", owner: "org", repo: "app", reviewProcess: "github",
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toBe('reviewProcess invalid: must be null, "ai-implement", "claude-code-review", or "claude-code-review-repository-fix"');
+    expect(JSON.parse(res.body).error).toBe('reviewProcess invalid: must be null, "ai-implement", "claude-code-review", "claude-code-review-repository-fix", or "codex-code-review"');
   });
 
   it("resets trustedReviewAuthors to the null default via an explicit null", async () => {

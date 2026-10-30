@@ -6937,6 +6937,51 @@ describe("postPushReviewStep review process gate", () => {
     }
   }
 
+  it.each(["silence", "running", "failed", "completed"])("Codex gates on %s without a check run", async (status) => {
+    const issueComments = status === "silence" ? [] : [{
+      user: { login: "chatgpt-codex-connector[bot]", type: "Bot" },
+      body: `<!-- codex-review-state:v1 {"code_review":{"commit_sha":"${SHA}","status":"${status}","has_unresolved_findings":false}} -->`,
+    }];
+    const { out } = await run(fixture({ runs: [], issueComments }), { reviewProcess: "codex-code-review" });
+    expect(out.approved).toBe(status === "completed");
+  });
+
+  it.each([0, 1])("Codex unresolved P%s head findings block approval and start a fix", async (priority) => {
+    const body = `**<sub><sub>![P${priority} Badge](https://img.shields.io/badge/P${priority}-orange?style=flat)</sub></sub>  Fix the head bug**`;
+    const comment = inline(body);
+    comment.user.login = "chatgpt-codex-connector[bot]";
+    const f = fixture({ runs: [], inlineComments: [comment], issueComments: [{
+      user: { login: "chatgpt-codex-connector[bot]", type: "Bot" },
+      body: `<!-- codex-review-state:v1 {"code_review":{"commit_sha":"${SHA}","status":"completed","has_unresolved_findings":true}} -->`,
+    }] });
+    const { out, invoke } = await run(f, { reviewProcess: "codex-code-review", maxIterations: 2 });
+    expect(out.approved).toBe(false);
+    expect(f.posted.join("\n")).toContain("starting fix pass");
+    expect(invoke).toHaveBeenCalled();
+    expect(JSON.stringify(invoke.mock.calls)).toContain("Fix the head bug");
+  });
+
+  it.each([[false, false], [true, false], [false, true], [true, true]])("Codex P2 threads stay advisory with unresolved=%s, human reply=%s and do not start an in-run fix", async (unresolved, reply) => {
+    const body = "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Advisory**";
+    const t = thread(body);
+    t.comments.nodes[0]!.author.login = "chatgpt-codex-connector";
+    if (reply) {
+      Object.assign(t, { originatingComment: { nodes: [t.comments.nodes[0]] } });
+      t.comments.nodes = [{ ...t.comments.nodes[0]!, body: "Can we revisit this later?", author: { login: "human-reviewer" } }];
+    }
+    const comment = inline(body);
+    comment.user.login = "chatgpt-codex-connector[bot]";
+    const f = fixture({ runs: [], threads: [t], inlineComments: [comment], issueComments: [{
+      user: { login: "chatgpt-codex-connector[bot]", type: "Bot" },
+      body: `<!-- codex-review-state:v1 {"code_review":{"commit_sha":"${SHA}","status":"completed","has_unresolved_findings":${unresolved}}} -->`,
+    }] });
+    const { out, invoke, logs } = await run(f, { reviewProcess: "codex-code-review" });
+    expect(out.approved).toBe(!unresolved);
+    expect(logs).toContain("[post-push-review] Review ledger findings: gating=0 advisory=1");
+    expect(invoke).not.toHaveBeenCalled();
+    expect(f.posted.join("\n")).not.toContain("starting fix pass");
+  });
+
   const actions = (conclusion: string | null): Run => ({ name: "review", app: "github-actions", conclusion });
 
   it("approves: review/github-actions success with no findings", async () => {

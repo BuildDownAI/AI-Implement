@@ -101,7 +101,7 @@ describe("new-project stepper", () => {
 });
 
 describe("new-project stepper — filesystem ticketing behavior", () => {
-  it("submits the filesystem provider, absolute directory config, and existing reviewer settings", async () => {
+  it.each(["ai-implement", "codex-code-review"])("submits filesystem config and %s reviewer settings", async (reviewProcess) => {
     const dom = new JSDOM(`<!doctype html><body>${stepperHtml}</body>`, { runScripts: "outside-only" });
     const win = dom.window as unknown as Record<string, any>;
     const doc = dom.window.document;
@@ -140,6 +140,12 @@ describe("new-project stepper — filesystem ticketing behavior", () => {
     win.stepperNext();
     win.stepperNext();
     win.stepperNext();
+    (doc.getElementById("np-review-process") as HTMLSelectElement).value = reviewProcess;
+    if (reviewProcess === "codex-code-review") {
+      await win.stepperSubmit();
+      expect(posts).toHaveLength(0);
+      (doc.getElementById("np-review-fix-lifecycle") as HTMLSelectElement).value = "restate";
+    }
     await win.stepperSubmit();
 
     expect(posts).toHaveLength(1);
@@ -155,6 +161,8 @@ describe("new-project stepper — filesystem ticketing behavior", () => {
       provider: "anthropic",
       planningEnabled: true,
       autoApprovePlans: true,
+      reviewProcess,
+      reviewFixLifecycle: reviewProcess === "codex-code-review" ? "restate" : "legacy",
     });
     // The actual submitted key must also be usable by the filesystem provider.
     const { ProviderRegistry } = await import("../../providers/registry.js");

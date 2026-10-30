@@ -31,6 +31,12 @@ The `issue_comment` path calls the same `classifyReviewIssueComment` function po
 
 Every path additionally requires a **matching dispatch record**: the orchestrator looks up the PR against its own dispatch log, and ignores anything it did not create. Reviews on unrelated PRs in the same repo are not picked up.
 
+### Codex Code Review
+
+The `codex-code-review` process is available only with the Restate lifecycle. It trusts `chatgpt-codex-connector[bot]` and the GraphQL login `chatgpt-codex-connector`. Inline intake applies the same current-head bot rule below, then the process's badge classifier: P0/P1 are `blocking` and forward to `ReviewFixPR.feedback`; P2 and untagged comments are `minor` and do not forward. The ledger retains advisory threads as `github-review-thread` findings, classifying the originating Codex finding and keeping the latest reply as context; Codex minor inline findings also stay advisory in the in-run gate and start no fix pass. Claude marker classification and forwarding remain unchanged.
+
+Codex posts no check run. The in-run gate polls paginated issue comments for the newest trusted bot `codex-review-state:v1` JSON comment whose nested `code_review.commit_sha` equals the PR head. Completed with `has_unresolved_findings: false` approves; `true` requests changes with the head's badge findings. Running, silence, stale state, and malformed state keep waiting and fail closed at the timeout; failed state is no real verdict. Security-review state and receipt reviews do not supply the code-review verdict. The summary comment is edited in place: `issue_comment` intake still handles creation only, so polling observes edits. Approval marks through LateExternalReview remain follow-up work.
+
 ### The bot-review rule
 
 Past the matching-dispatch check, `shouldEnqueueReviewEvent` (`src/webhook.ts:998-1035`) gates all three events one more way. A **bot-authored** event (`user.type == "Bot"`) can loop — a bot reviewing the fix run's own push would otherwise enqueue another run — so it enqueues only when it describes the PR's *current* head and no run has started since:
@@ -121,7 +127,7 @@ A `review-contract` finding gates when it is `blocking`, or when the verdict is 
 
 **A reviewer's latest formal verdict is authoritative.** Only reviewers whose most recent actionable review is `CHANGES_REQUESTED` contribute blocking findings. Unresolved inline threads authored by someone who has since approved are recorded as `medium` advisory context unless their reviewer still has a changes-requested verdict. Without that rule, a stale nit thread from an approving reviewer would keep the PR blocked forever.
 
-The `pull_request_review_comment` webhook records `medium` for the same reason from the other direction: that event carries no parent review state, so an inline comment alone cannot be assumed to block. A genuine changes-requested verdict arrives separately via `pull_request_review` and records the blocking finding itself.
+Under the default AI-Implement process, the `pull_request_review_comment` webhook records `medium` for the same reason from the other direction: that event carries no parent review state, so an inline comment alone cannot be assumed to block. A genuine changes-requested verdict arrives separately via `pull_request_review` and records the blocking finding itself.
 
 Unresolved threads are collected via GraphQL with pagination, and a thread is only collected when it is both **unresolved and not outdated**.
 
@@ -134,7 +140,7 @@ Findings are collected from bot comments, and the rail itself posts bot comments
 
 Trusted comment authors come from the project's review process (`src/review-process.ts`, ADR 038) plus the project's `trustedReviewAuthors`, through `isTrustedReviewAuthor`. The webhook reads both from the project mapping; the in-run ledger receives them as the `{ process, extraAuthors }` options argument, defaulting to the `ai-implement` process. The built-in authors stay trusted whatever the extra list holds, and `webhook.ts` and `review-ledger.ts` hold no author list of their own.
 
-Inline-comment severity follows the process. `ai-implement` keeps `medium` for every inline webhook comment. `claude-code-review` and `claude-code-review-repository-fix` (the definition's `claudeInlineMarkers`) classify a trusted bot's comment by its leading marker: 🔴 `blocking`, 🟡 or untagged `minor`, and 🟣 is skipped (the webhook answers `{ ignored: true, reason: "pre_existing" }` and stores nothing). Under that process a bot that is not trusted is ignored (`untrusted_author`). A human's inline comment is always `medium` and always enqueues (ADR 027), and a CHANGES_REQUESTED author's thread stays `blocking` whatever its marker.
+Inline-comment severity follows the process. `ai-implement` keeps `medium` for every inline webhook comment. `claude-code-review` and `claude-code-review-repository-fix` (the definition's `classifyInline` classifier) classify a trusted bot's comment by its leading marker: 🔴 `blocking`, 🟡 or untagged `minor`, and 🟣 is skipped (the webhook answers `{ ignored: true, reason: "pre_existing" }` and stores nothing). Under that process a bot that is not trusted is ignored (`untrusted_author`). A human's inline comment is always `medium` and always enqueues (ADR 027), and a CHANGES_REQUESTED author's thread stays `blocking` whatever its marker.
 
 **An approve verdict with only non-gating findings starts no fix run.** In the `issue_comment` summary path, when the `review-findings` block's verdict is `approve` and no finding gates under `reviewContractFindingGates` (`src/pipeline/review-ledger.ts`; only `blocking` gates under `approve`), the webhook answers `{ ignored: true, reason: "approved" }` before any queue entry, `ReviewFixPR.feedback` forward, or ledger row. A `blocking` finding under `approve`, or any finding under `changes_requested`, still enqueues. The inline-comment rail above is unchanged: a 🟡 `minor` inline comment still queues a fix.
 
