@@ -1,7 +1,7 @@
-import { describe, it, expect } from "vitest";
-import { aggregateUsage, normalizeInvocation, summarizeInvocations } from "../agent-usage.js";
+import { describe, it, expect, vi } from "vitest";
+import { aggregateUsage, normalizeInvocation, summarizeInvocations, toRecordedUsage } from "../agent-usage.js";
 import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
-import type { InvocationAttributionV1, RunTelemetry } from "../pipeline/types.js";
+import { INVOCATION_RECORDS_MAX, type InvocationAttributionV1, type RunTelemetry } from "../pipeline/types.js";
 
 const mk = (stage: string, agent: "claude" | "codex", provider: "anthropic" | "openai", authMode: string) => ({
   sel: { agent, provider, model: `m-${stage}`, accountProfileId: `p-${stage}`, invocationTimeoutMs: 60_000 },
@@ -282,4 +282,190 @@ describe("summarizeInvocations", () => {
     expect(out.invocations).toBe(1);
     expect(out.unattributable).toBe(1);
   });
+});
+
+
+describe("recorded usage", () => {
+  it("projects only sanitized JSON, preserving zero usage, cache counts and attempts", () => {
+    const attribution = claim("implementation", { usage: { availability: "complete", tokensIn: 0, tokensOut: 0, costUsd: 0, costStatus: "reported" } });
+    const usage = toRecordedUsage({ attribution, invocations: [{ attribution, cacheReadTokens: 0, cacheCreationTokens: 4, attempts: 2 }], pushedCommits: [], failureCode: "INVOCATION_TIMEOUT" });
+    expect(JSON.parse(JSON.stringify(usage))).toEqual(usage);
+    expect(usage).toMatchObject({ attribution, pushedCommits: [], listWhole: true, timedOut: true, records: [{ cacheReadTokens: 0, cacheCreationTokens: 4, attempts: 2 }] });
+    expect(toRecordedUsage({})).toEqual({ records: [], attribution: null, pushedCommits: null, listWhole: false, timedOut: false });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const invalid = toRecordedUsage({ attribution: { ...attribution, model: "sk-abcdefghijklmnop" }, invocations: [{ secret: "sk-abcdefghijklmnop" }], failure: { code: "INVOCATION_TIMEOUT" } });
+    expect(JSON.stringify(invalid)).not.toContain("sk-");
+    expect(invalid).toMatchObject({ attribution: null, records: [], listWhole: false, timedOut: false });
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("sk-");
+    warn.mockRestore();
+  });
+
+  it("persists list-first and legacy-last exactly once on replay", async () => {
+    const { testDb } = await import("./helpers/test-db.js");
+    const { modules: { usage, dedup } } = await testDb({ modules: {
+      usage: () => import("../agent-usage.js"), dedup: () => import("../dedup.js"),
+    } });
+    const db = dedup.getDb();
+    db.prepare(`INSERT INTO run_agent_config_snapshots
+      (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+      VALUES (?, ?, 'ENG', ?, ?, ?, 1)`).run(snap.snapshotId, "usage-dispatch",
+      JSON.stringify({ stages: snap.stages, profiles: snap.profiles }), JSON.stringify(snap.sources), JSON.stringify(snap.configRevisions));
+    const legacy = claim("implementation", { usage: { availability: "complete", tokensIn: 0, tokensOut: 0, costUsd: 0, costStatus: "reported" } });
+    const input = usage.toRecordedUsage({ attribution: legacy, invocations: [
+      { attribution: legacy, cacheReadTokens: 3, attempts: 2 },
+      { attribution: claim("review", { usage: null }) },
+    ], pushedCommits: ["a".repeat(40)], failure: {
+      category: "cancelled", code: "INVOCATION_TIMEOUT", stage: "implementation", attempt: 1,
+      retryable: false, message: "private failure detail", evidence: { truncated: false },
+    } });
+    expect(input.timedOut).toBe(true);
+    expect(JSON.stringify(input)).not.toContain("private failure detail");
+    expect(JSON.parse(JSON.stringify(input))).toEqual(input);
+    expect(usage.recordUsage("usage-dispatch", JSON.parse(JSON.stringify(input)))).toBe(0);
+    const rows = () => db.prepare("SELECT * FROM model_invocation_attribution WHERE dispatch_id = 'usage-dispatch' ORDER BY rowid").all();
+    const report = () => db.prepare("SELECT * FROM dispatch_job_report WHERE dispatch_id = ?").get("usage-dispatch");
+    const reportBefore = report();
+    expect(reportBefore).toMatchObject({ pushed_shas_json: JSON.stringify(["a".repeat(40)]), invocations_complete: 1 });
+    const before = rows();
+    expect(before).toHaveLength(2);
+    const stored = db.prepare("SELECT usage_json FROM model_invocation_attribution ORDER BY rowid").all() as { usage_json: string }[];
+    expect(stored.map((r) => JSON.parse(r.usage_json))).toMatchObject([
+      { availability: "unavailable", tokensIn: null, tokensOut: null, costUsd: null, costStatus: "unavailable" },
+      { availability: "complete", tokensIn: 0, tokensOut: 0, costUsd: 0, costStatus: "reported" },
+    ]);
+    expect(before).toMatchObject([{ invocation_id: "inv-review" }, { invocation_id: "inv-implementation", status: "timed_out" }]);
+    expect(usage.recordUsage("usage-dispatch", JSON.parse(JSON.stringify(input)))).toBe(0);
+    expect(rows()).toEqual(before);
+    expect(report()).toEqual(reportBefore);
+    const rejected = usage.toRecordedUsage({ invocations: [{ attribution: claim("review", { snapshotId: "other" }) }] });
+    expect(usage.recordUsage("usage-dispatch", rejected)).toBe(1);
+    expect(usage.recordUsage("usage-dispatch", rejected)).toBe(1);
+    expect(rows()).toEqual(before);
+  });
+
+  it.each([
+    { managed: true, mismatch: null },
+    { managed: true, mismatch: "model" },
+    { managed: true, mismatch: "profileId" },
+    { managed: false, mismatch: "model" },
+    { managed: false, mismatch: "profileId" },
+  ] as const)("applies managed acceptance policy (managed=$managed, mismatch=$mismatch)", async ({ managed, mismatch }) => {
+    const { testDb } = await import("./helpers/test-db.js");
+    const { modules: { usage, dedup } } = await testDb({ modules: {
+      usage: () => import("../agent-usage.js"), dedup: () => import("../dedup.js"),
+    } });
+    const db = dedup.getDb();
+    const dispatchId = "policy-dispatch";
+    db.prepare(`INSERT INTO run_agent_config_snapshots
+      (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+      VALUES (?, ?, 'ENG', ?, ?, ?, 1)`).run(snap.snapshotId, dispatchId,
+      JSON.stringify({ stages: snap.stages, profiles: snap.profiles }), JSON.stringify(snap.sources), JSON.stringify(snap.configRevisions));
+    if (managed) {
+      // Durable attempt ownership must enforce the policy even without an active admission.
+      db.prepare(`INSERT INTO review_fix_attempts
+        (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number, issue_scope,
+         issue_id, owner, state, created_at, deadline_at, task_snapshot_json, finding_versions_json)
+        VALUES ('policy-attempt', ?, 'ENG', '1', 'acme/widgets', 42, 'pr',
+                'acme/widgets#42', 'policy-attempt', 'prepared', 1, 60001, '{}', '[]')`).run(dispatchId);
+    }
+    const overrides = mismatch ? { [mismatch]: "different-selection" } : {};
+    // Distinct ids exercise both the invocation list and the legacy attribution path.
+    const input = usage.toRecordedUsage({
+      invocations: [{ attribution: claim("implementation", { ...overrides, invocationId: "policy-list" }) }],
+      attribution: claim("implementation", { ...overrides, invocationId: "policy-legacy" }),
+      pushedCommits: [],
+    });
+    expect(input.listWhole).toBe(true);
+    const rejected = managed && mismatch !== null;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const rows = () => db.prepare("SELECT * FROM model_invocation_attribution WHERE dispatch_id = ? ORDER BY rowid")
+        .all(dispatchId) as { invocation_id: string; model: string; profile_id: string; usage_json: string }[];
+      const report = () => db.prepare("SELECT invocations_complete FROM dispatch_job_report WHERE dispatch_id = ?").get(dispatchId);
+      expect(usage.recordUsage(dispatchId, input)).toBe(rejected ? 2 : 0);
+      const stored = rows();
+      expect(stored.map((row) => row.invocation_id)).toEqual(rejected ? [] : ["policy-list", "policy-legacy"]);
+      for (const row of stored) {
+        expect(row).toMatchObject({ model: snap.stages.implementation.model, profile_id: snap.profiles.implementation.id });
+        expect(JSON.parse(row.usage_json)).toMatchObject({
+          attribution: mismatch ? "mismatch" : "verified",
+          mismatches: mismatch ? [mismatch] : [],
+          tokensIn: 100, tokensOut: 10, costUsd: 0.5,
+        });
+      }
+      expect(report()).toEqual({ invocations_complete: rejected ? 0 : 1 });
+      expect(usage.recordUsage(dispatchId, JSON.parse(JSON.stringify(input)))).toBe(rejected ? 2 : 0);
+      expect(rows()).toEqual(stored);
+      expect(report()).toEqual({ invocations_complete: rejected ? 0 : 1 });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("stores capped lists without marking them complete", async () => {
+    const { testDb } = await import("./helpers/test-db.js");
+    const { modules: { usage, dedup } } = await testDb({ modules: {
+      usage: () => import("../agent-usage.js"), dedup: () => import("../dedup.js"),
+    } });
+    const db = dedup.getDb();
+    db.prepare(`INSERT INTO run_agent_config_snapshots
+      (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+      VALUES (?, ?, 'ENG', ?, ?, ?, 1)`).run(snap.snapshotId, "capped-dispatch",
+      JSON.stringify({ stages: snap.stages, profiles: snap.profiles }), JSON.stringify(snap.sources), JSON.stringify(snap.configRevisions));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const capped = usage.toRecordedUsage({ invocations: Array.from({ length: INVOCATION_RECORDS_MAX + 1 }, (_, i) => ({
+      attribution: claim("review", { invocationId: `capped-${i}` }),
+    })) });
+    expect(capped.records).toHaveLength(INVOCATION_RECORDS_MAX);
+    expect(capped.listWhole).toBe(false);
+    expect(JSON.parse(JSON.stringify(capped))).toEqual(capped);
+    expect(warn).toHaveBeenCalledWith("[runner-callback] Dropped 1 invalid invocation record(s)");
+    expect(usage.recordUsage("capped-dispatch", JSON.parse(JSON.stringify(capped)))).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM model_invocation_attribution WHERE dispatch_id = ?").get("capped-dispatch"))
+      .toEqual({ count: INVOCATION_RECORDS_MAX });
+    expect(db.prepare("SELECT invocations_complete FROM dispatch_job_report WHERE dispatch_id = ?").get("capped-dispatch"))
+      .toBeUndefined();
+    warn.mockRestore();
+  });
+
+  it("persists empty pushed commits distinctly from absent commits", async () => {
+    const { testDb } = await import("./helpers/test-db.js");
+    const { modules: { usage, dedup } } = await testDb({ modules: {
+      usage: () => import("../agent-usage.js"), dedup: () => import("../dedup.js"),
+    } });
+    for (const [dispatchId, body, expected] of [
+      ["absent-commits", { invocations: [] }, null],
+      ["empty-commits", { invocations: [], pushedCommits: [] }, "[]"],
+    ] as const) {
+      const projection = usage.toRecordedUsage(body);
+      expect(projection.pushedCommits).toEqual(expected === null ? null : []);
+      expect(JSON.parse(JSON.stringify(projection))).toEqual(projection);
+      expect(usage.recordUsage(dispatchId, JSON.parse(JSON.stringify(projection)))).toBe(0);
+      expect(dedup.getDb().prepare("SELECT pushed_shas_json FROM dispatch_job_report WHERE dispatch_id = ?").get(dispatchId))
+        .toEqual({ pushed_shas_json: expected });
+    }
+  });
+
+  it("marks only whole lists complete, allowing empty lists without a snapshot", async () => {
+    const { testDb } = await import("./helpers/test-db.js");
+    const { modules: { usage, dedup } } = await testDb({ modules: {
+      usage: () => import("../agent-usage.js"), dedup: () => import("../dedup.js"),
+    } });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const cases = [
+      { body: {}, complete: false, mismatched: 0 },
+      { body: { invocations: [] }, complete: true, mismatched: 0 },
+      { body: { invocations: [], invocationsDropped: 1 }, complete: false, mismatched: 0 },
+      { body: { invocations: [{}] }, complete: false, mismatched: 0 },
+      { body: { invocations: [{ attribution: claim("review") }] }, complete: false, mismatched: 1 },
+    ];
+    for (const [i, c] of cases.entries()) {
+      const dispatchId = `completeness-${i}`;
+      expect(usage.recordUsage(dispatchId, usage.toRecordedUsage(c.body))).toBe(c.mismatched);
+      const row = dedup.getDb().prepare("SELECT invocations_complete FROM dispatch_job_report WHERE dispatch_id = ?").get(dispatchId);
+      expect(row ?? null).toEqual(c.complete ? { invocations_complete: 1 } : null);
+    }
+    warn.mockRestore();
+  });
+
 });
