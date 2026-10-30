@@ -1,0 +1,18 @@
+{
+  "request": {
+    "args": {
+      "branch": "testing",
+      "requestedBy": "control-plane"
+    }
+  },
+  "status": 200,
+  "response": {
+    "content": [
+      {
+        "type": "text",
+        "text": "forbidden: start_deploy requires the admin role"
+      }
+    ],
+    "isError": true
+  }
+}

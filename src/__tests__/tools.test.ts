@@ -578,7 +578,7 @@ describe("callTool", () => {
     const ingressFor = (name: string) => fakeFetch({ [`POST /orchestratorTools/${name}`]: { json: { content: [] } } });
     const held = { ingressBaseUrl: "http://ingress.example", permitsExternalCall: () => false };
 
-    it.each(["decide_kg_refresh", "get_kg_status"])("%s reaches the ingress during a hold", async (name) => {
+    it.each(["decide_kg_refresh", "get_kg_status", "get_deploy_posture", "start_deploy"])("%s reaches the ingress during a hold", async (name) => {
       const ingress = ingressFor(name);
       const result = await callTool(name, {}, HUMAN_USER, { ...held, fetchImpl: ingress.fetch });
       expect(result.status).toBe("ok");

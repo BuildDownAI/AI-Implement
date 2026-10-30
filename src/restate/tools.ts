@@ -46,7 +46,8 @@ import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { getOrchestratorSettings, getFlySessionsConfig, getLinearPickupLabel } from "../orchestrator-settings.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
-import { getDeployPosture } from "../deploy-posture.js";
+import { getDeployPosture, type DeployPosture } from "../deploy-posture.js";
+import type { SelfDeployDefinition, SelfDeployRecord } from "./self-deploy.js";
 import {
   setRunnerModeAction,
   pauseProjectAction,
@@ -624,17 +625,53 @@ export const getFleetReportTool = tool(
   },
 );
 
+/** What `get_deploy_posture` serves: the posture plus the SelfDeploy record (null when none or unreadable). */
+type DeployPostureReport = DeployPosture & { selfDeploy: SelfDeployRecord | null };
+
 export const GET_DEPLOY_POSTURE_DESCRIPTION =
-  "Returns the current deploy posture: whether autoDeploy is on, the watched repo/branch, running vs head commit, deploy hold and in-flight state, runner channel image and commit, and a mergeCost field summarising the landing cost of a merge (deploy+image / image / none). Use this before filing or merging to understand the blast radius.";
+  "Returns the current deploy posture: selfDeploy (the SelfDeploy record: deployId, phase, target, requestedBy, times, reason; null when none or unreadable), whether autoDeploy is on, the watched repo/branch, running vs head commit, deploy hold and in-flight state, runner channel image and commit, and a mergeCost field summarising the landing cost of a merge (deploy+image / image / none). Use this before filing or merging to understand the blast radius.";
 
 export const getDeployPostureTool = tool(
   { description: GET_DEPLOY_POSTURE_DESCRIPTION, input: z.object({}), role: "user" },
-  async (): Promise<ToolResponse> => {
+  async (ctx): Promise<ToolResponse> => {
     // No defaultImage passed: getDeployPosture's own fallback re-derives it from
     // process.env the same way config.sessionImage was computed at boot (AII-711) — a
     // Restate handler has no per-request injection the way handleMcpRequest did.
-    const result = await getDeployPosture({});
+    const posture = await getDeployPosture({});
+    // Additive: an unreadable SelfDeploy object must not take the whole posture down, so it reads as null.
+    let selfDeploy: SelfDeployRecord | null = null;
+    try {
+      selfDeploy = (await ctx.objectClient(SelfDeploy, selfDeployKey()).status()).deploy;
+    } catch (err) {
+      if (restate.internal.isSuspendedError(err)) throw err;
+    }
+    const result: DeployPostureReport = { ...posture, selfDeploy };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const START_DEPLOY_DESCRIPTION =
+  "Start a self-deploy of this orchestrator to the published build of the head of `branch` (testing | main) (admin role, or the control plane's deploy-scoped token). Args: branch, requestedBy (1..200 characters). Returns { deployId, commit, image, alreadyActive }; a second start while a deploy is active returns the same deployId with alreadyActive true. A refusal is one fixed code as the error text: image-not-published, head-unknown or not-configured. Poll progress with get_deploy_posture's selfDeploy record.";
+
+/** The SelfDeploy object key: the same fallback as createSelfDeployIngressClient, so the tool and the admin routes address one object. */
+const selfDeployKey = (): string => process.env.FLY_APP_NAME ?? "orchestrator";
+
+export const StartDeployArgsSchema = z.object({ branch: z.enum(["testing", "main"]), requestedBy: z.string().min(1).max(200) }).strict();
+
+export const startDeployTool = tool(
+  {
+    description: START_DEPLOY_DESCRIPTION,
+    input: StartDeployArgsSchema,
+    role: "admin",
+    grant: "deploy",
+    operation: "write",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+    auditDetail: (input) => `branch=${input.args.branch}`,
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const result = await ctx.objectClient(SelfDeploy, selfDeployKey()).start(input.args);
+    if ("reason" in result) return toolError(result.reason);
+    return { content: [{ type: "text", text: JSON.stringify(result) }] };
   },
 );
 
@@ -643,6 +680,7 @@ export const GET_KG_STATUS_DESCRIPTION =
 
 // Type-only client handles: the real definitions are built with dependencies at boot
 // (createProductionKgRefreshServices); a client needs only the service name and handler types.
+const SelfDeploy: SelfDeployDefinition = { name: "SelfDeploy" } as SelfDeployDefinition;
 const KgRepo: KgRepoDefinition = { name: "KgRepo" } as KgRepoDefinition;
 const KgRefresh: KgRefreshDefinition = { name: "KgRefresh" } as KgRefreshDefinition;
 
@@ -1577,6 +1615,7 @@ export const orchestratorTools = restate.service({
     set_pipeline_schedule: setPipelineScheduleTool,
     get_pipeline_schedule: getPipelineScheduleTool,
     pause_project: pauseProjectTool,
+    start_deploy: startDeployTool,
     add_project: addProjectTool,
     trigger_workflow_sync: triggerWorkflowSyncTool,
     clear_dispatch_dedup: clearDispatchDedupTool,
