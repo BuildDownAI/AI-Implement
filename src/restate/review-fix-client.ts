@@ -5,6 +5,7 @@
  * (ADR 018 rule 6, ADR 031). Nothing is stored here; an `unavailable` outcome is the
  * caller's to retry or surface.
  */
+import type { RecordedUsage } from "../agent-usage.js";
 import type { AttemptId, ResultIntakeOutcome, ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
 import { createHash } from "node:crypto";
 import * as restateClients from "@restatedev/restate-sdk-clients";
@@ -29,7 +30,7 @@ export interface ReviewFixIngressClient {
    * `reviewFixResultForwardKey(result)`. `accepted` carries the handler's own outcome (`stored`, `duplicate`, `conflict`,
    * `stale`); the transport-level `conflict` (409) and `not-found` (404) are separate. Never throws.
    */
-  result(attemptId: AttemptId, result: ReviewFixResultMetadataV1, opts: { idempotencyKey: string }): Promise<ReviewFixResultForwardOutcome>;
+  result(attemptId: AttemptId, result: ReviewFixResultMetadataV1 & { usage?: RecordedUsage }, opts: { idempotencyKey: string }): Promise<ReviewFixResultForwardOutcome>;
   /**
    * Forwards a cancellation to `ReviewFixAttempt.cancel` (AII-1186); `idempotencyKey` is `<attemptId>.closed` for a
    * closed PR and `<attemptId>.cancel` for an operator cancel. Any error resolves `unavailable`. Never throws.
@@ -69,7 +70,7 @@ export function createReviewFixIngressClient(
     },
     async result(attemptId, result, opts) {
       try {
-        const rpc = restateClients.rpc.opts<ReviewFixResultMetadataV1, ResultIntakeOutcome>({ timeout, idempotencyKey: opts.idempotencyKey });
+        const rpc = restateClients.rpc.opts<ReviewFixResultMetadataV1 & { usage?: RecordedUsage }, ResultIntakeOutcome>({ timeout, idempotencyKey: opts.idempotencyKey });
         const outcome = await ingress
           .workflowClient<ReviewFixAttemptDefinition>({ name: "ReviewFixAttempt" }, attemptId)
           .result(result, rpc);

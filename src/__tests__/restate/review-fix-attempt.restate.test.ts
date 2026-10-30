@@ -1,12 +1,15 @@
 // Real Restate 1.7.10 coordination tests for AII-796. The fake business state is
 // outside the SDK endpoint, as the later SQLite adapters will be in production.
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ReviewFixResultMetadataV1, WorkerTerminalOutcome } from "../../review-fix-contract.js";
 import type { PreparedReviewFixAttempt } from "../../review-fix-ports.js";
 import { createReviewFixAttempt, type ReviewFixAttemptCompletion } from "../../restate/review-fix-attempt.js";
 import { VARIANTS, eventually, gate, type Gate, attachWorkflow, callWorkflow, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
+import { getDb } from "../../dedup.js";
+import { toRecordedUsage } from "../../agent-usage.js";
+import { registerOwnedRunContract, type OwnedRunAdapter } from "./owned-run-contract.js";
 import { makeReviewFixResult } from "../helpers/builders.js";
 
 const SHA = "a".repeat(40);
@@ -30,6 +33,7 @@ interface FakeAttempt {
   holdBinding: Gate | null;
   loadFailures: number;
   loadCalls: number;
+  usageDispatchId?: string;
 }
 
 function newFake(mode: LaunchMode, deadlineMs = 4_000): FakeAttempt {
@@ -56,6 +60,28 @@ function resultOf(fake: FakeAttempt, overrides: Partial<ReviewFixResultMetadataV
     ...EXECUTION, outputCommit: SHA, ...overrides,
   });
 }
+
+function seedUsage(dispatchId: string, tokens = 12, cost = 1, items = [1, 2]) {
+  const snapshotId = `snapshot-${dispatchId}`;
+  const selection = { agent: "claude", provider: "anthropic", model: "claude-model", accountProfileId: "planning-profile", invocationTimeoutMs: 60_000 };
+  const profile = { id: "planning-profile", identity: "account", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" };
+  getDb().prepare(`INSERT OR IGNORE INTO run_agent_config_snapshots
+    (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+    VALUES (?, ?, 'ENG', ?, ?, ?, 1)`).run(snapshotId, dispatchId,
+      JSON.stringify({ stages: { planning: selection, implementation: selection, review: selection }, profiles: { planning: profile, implementation: profile, review: profile } }),
+      JSON.stringify(Object.fromEntries(["planning", "implementation", "review"].map((stage) => [stage, Object.fromEntries(Object.keys(selection).map((field) => [field, "project"]))]))),
+      JSON.stringify({ orchestratorDefault: { configRevisionId: "r1", revision: 1 }, project: { configRevisionId: "r2", revision: 1 } }));
+  return toRecordedUsage({ invocations: items.map((item) => ({ attribution: {
+    version: 1, invocationId: `${dispatchId}-inv-${item}`, snapshotId, stage: "planning",
+    agent: selection.agent, provider: selection.provider, model: selection.model,
+    profileId: profile.id, authMode: profile.authMode, limit: null, outcome: "success",
+    usage: { availability: "complete", tokensIn: tokens, tokensOut: 2, costUsd: cost, costStatus: "reported" },
+  } })) });
+}
+
+const storedRows = (dispatchId: string) => getDb().prepare(
+  "SELECT * FROM model_invocation_attribution WHERE dispatch_id = ? ORDER BY invocation_id",
+).all(dispatchId);
 
 describe("ReviewFixAttempt durable workflow", () => {
   const attempts = new Map<string, FakeAttempt>();
@@ -100,6 +126,10 @@ describe("ReviewFixAttempt durable workflow", () => {
             : { status: "conflict", attemptId: id, reason: "different result" } as const;
         }
         fake.result = result;
+        if (fake.usageDispatchId) {
+          getDb().prepare("UPDATE review_fix_attempts SET accepted_result_json = ?, accepted_result_hash = ? WHERE attempt_id = ?")
+            .run(JSON.stringify(result), createHash("sha256").update(JSON.stringify(result)).digest("hex"), id);
+        }
         return { status: "stored", result } as const;
       },
       releaseOwner: async (id) => {
@@ -168,6 +198,123 @@ describe("ReviewFixAttempt durable workflow", () => {
     if (!env) throw new Error(`missing Restate variant ${label}`);
     return env;
   }
+
+  // Scenarios 1–5 wait for AII-1627's owned-run lifecycle migration.
+  const contractAdapter: OwnedRunAdapter = {
+    name: "ReviewFixAttempt",
+    scenarios: [6],
+    start(baseUrl, key) {
+      const fake = newFake("accepted", 60_000);
+      fake.prepared = { ...fake.prepared, attemptId: key, owner: key };
+      const dispatchId = `dispatch-${key}`;
+      fake.usageDispatchId = dispatchId;
+      attempts.set(key, fake);
+      const db = getDb();
+      db.prepare(`INSERT INTO dispatch_admissions
+        (dispatch_id, mapping_key, issue_scope, issue_id, lifecycle_owner, phase, backend, created_at)
+        VALUES (?, 'test', 'test', ?, ?, 'review_fix', 'github-actions', 1)`)
+        .run(dispatchId, key, `restate:${key}`);
+      db.prepare(`INSERT INTO review_fix_attempts
+        (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
+         issue_scope, issue_id, owner, state, created_at, deadline_at, task_snapshot_json, finding_versions_json)
+        VALUES (?, ?, 'test', '7', 'BuildDownAI/AI-Implement', 42, 'test', ?, ?, 'running', 1, ?, '{}', '[]')`)
+        .run(key, dispatchId, key, key, fake.prepared.deadlineAt);
+      // Exercise only the shared handler: retain admission after done for the
+      // contract's duplicate/conflict probes, without changing production stale rules.
+      let finish!: () => void;
+      const done = new Promise<void>((resolve) => { finish = resolve; });
+      return {
+        runId: dispatchId, done,
+        read: async () => ({ step: "waiting" }),
+        finish: async () => { finish(); },
+        report: async (value) => {
+          const { usage, items } = value as { usage: { tokens: number; cost: number }; items: number[] };
+          const recorded = seedUsage(dispatchId, usage.tokens, usage.cost, [items.reduce((a, b) => a + b, 0)]);
+          // Scenario 6 reverses the source usage keys on its equivalent repeat.
+          // Carry that difference through the actual RecordedUsage wire payload.
+          const reverseKeys = (value: unknown): unknown => {
+            if (Array.isArray(value)) return value.map(reverseKeys);
+            if (value !== null && typeof value === "object") {
+              return Object.fromEntries(Object.entries(value).reverse().map(([key, item]) => [key, reverseKeys(item)]));
+            }
+            return value;
+          };
+          const reordered = reverseKeys(recorded);
+          expect(JSON.stringify(reordered)).not.toBe(JSON.stringify(recorded));
+          expect(reordered).toEqual(recorded);
+          const payload = Object.keys(usage)[0] === "cost" ? reordered : recorded;
+          const before = storedRows(dispatchId);
+          const result = await callWorkflow<{ status: string }>(baseUrl, "ReviewFixAttempt", key, "result",
+            { ...resultOf(fake), usage: payload });
+          if (before.length) {
+            expect(result.status).toBe("duplicate");
+            expect(storedRows(dispatchId)).toEqual(before);
+          }
+          finish();
+          return { status: result.status === "stored" ? "accepted" : "duplicate" };
+        },
+        acceptedCount: () => storedRows(dispatchId).length,
+      };
+    },
+    calls: () => [],
+  };
+  registerOwnedRunContract(contractAdapter, envFor);
+
+  it.each(VARIANTS.map(([label]) => label))("refused and metadata-conflicting results record no usage (%s)", async (label) => {
+    const key = `refused-${label}-${randomUUID()}`;
+    const url = envFor(label).baseUrl();
+    const handle = contractAdapter.start(url, key, { faults: {}, totalMs: 60_000 });
+    const fake = get(key);
+    const body = { ...resultOf(fake), usage: seedUsage(handle.runId) };
+    await expect(callWorkflow(url, "ReviewFixAttempt", key, "result", { ...body, version: 99 }))
+      .rejects.toThrow();
+    await expect(callWorkflow(url, "ReviewFixAttempt", key, "result", { ...body, attemptId: "another-attempt" }))
+      .rejects.toThrow();
+    fake.occupied = false;
+    expect(await callWorkflow(url, "ReviewFixAttempt", key, "result", body)).toMatchObject({ status: "stale" });
+    fake.occupied = true;
+    await callWorkflow(url, "ReviewFixAttempt", key, "result", resultOf(fake));
+    expect(await callWorkflow(url, "ReviewFixAttempt", key, "result", { ...body, outputCommit: "b".repeat(40) }))
+      .toMatchObject({ status: "conflict" });
+    expect(fake.authority).toBe(false);
+    expect(storedRows(handle.runId)).toEqual([]);
+  }, 20_000);
+
+  it("usage storage failure propagates and a retry records usage once", async () => {
+    const key = `usage-failure-${randomUUID()}`;
+    const env = envFor("disableRetries");
+    const url = env.baseUrl();
+    // Observe durable promise state directly: the adapter's done is synthetic
+    // and cannot prove that the result handler withheld the workflow wake.
+    const resolvedPromises = async (): Promise<string[]> => {
+      const response = await fetch(`${env.adminAPIBaseUrl()}/query`, { // restate-test-allow: durable promise state read
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ query: `SELECT key, completed FROM sys_promise WHERE service_name = 'ReviewFixAttempt' AND service_key = '${key}'` }),
+      });
+      expect(response.ok).toBe(true);
+      const { rows } = await response.json() as { rows: Array<{ key: string; completed: boolean }> };
+      return rows.filter((row) => row.completed).map((row) => row.key).filter((name) => name === "report" || name === "wake").sort();
+    };
+    const handle = contractAdapter.start(url, key, { faults: {}, totalMs: 60_000 });
+    const body = { ...resultOf(get(key)), usage: seedUsage(handle.runId) };
+    getDb().exec(`CREATE TRIGGER fail_review_fix_usage BEFORE INSERT ON model_invocation_attribution
+      BEGIN SELECT RAISE(ABORT, 'injected usage storage failure'); END`);
+    try {
+      await expect(callWorkflow(url, "ReviewFixAttempt", key, "result", body)).rejects.toThrow();
+      expect(storedRows(handle.runId)).toEqual([]);
+      expect(await resolvedPromises()).toEqual([]);
+    } finally {
+      getDb().exec("DROP TRIGGER fail_review_fix_usage");
+    }
+    expect(await callWorkflow(url, "ReviewFixAttempt", key, "result", body)).toMatchObject({ status: "duplicate" });
+    expect(await resolvedPromises()).toEqual(["report", "wake"]);
+    const recorded = storedRows(handle.runId);
+    expect(recorded).toHaveLength(2);
+    expect(await callWorkflow(url, "ReviewFixAttempt", key, "result", body)).toMatchObject({ status: "duplicate" });
+    expect(storedRows(handle.runId)).toEqual(recorded);
+  }, 30_000);
+
 
   it.each(VARIANTS.map(([label]) => label))("response loss reconciles one execution and one launch effect (%s)", async (label) => {
     const fake = newFake("response_lost");
