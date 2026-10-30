@@ -1,37 +1,16 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import os from "node:os";
 import { readFileSync } from "node:fs";
 import type * as DeployModule from "../deploy.js";
-import type * as InFlightModule from "../in-flight-work.js";
-import type * as LogModule from "../log.js";
-import { RestateDrainCoordinator } from "../restate/drain.js";
 import { fakeFetch } from "./helpers/fake-fetch.js";
-import { testDb } from "./helpers/test-db.js";
-import { testTempRoot } from "./helpers/test-dir.js";
 
 let deploy: typeof DeployModule;
 
-const DRAINED_PROBES = {
-  oldDeploymentInvocations: async () => 0,
-  unresolvedLaunches: async () => 0,
-  unresolvedTerminations: async () => 0,
-  activeOwners: async () => 0,
-};
 
 beforeEach(async () => {
   vi.resetModules();
   deploy = await import("../deploy.js");
 });
-
-/** Prepares a test whose deploy runs past `start()` in the background: its scratch directory goes
- *  under a `testTempRoot` instead of the OS temp directory, and its flyctl download gets a 404, so it
- *  fails before any subprocess. The download is a stubbed global, not a `fakeFetch` route, because
- *  its URL embeds an unexported version and the runtime arch; `vi.unstubAllGlobals()` undoes it. */
-function containBackgroundDeploy(): void {
-  // deployScratch() creates its directory under os.tmpdir(), which reads the temp variables per call.
-  testTempRoot("deploy");
-  vi.stubGlobal("fetch", vi.fn(async () => new Response("nope", { status: 404 })));
-}
 
 const ARGS = {
   app: "orchestrator",
@@ -160,163 +139,6 @@ describe("Dockerfile KG source repo wiring", () => {
   });
 });
 
-describe("drainPollMs", () => {
-  it("samples twice per poll so a drain never sits a full interval on stale state", () => {
-    // The in-flight set is only mutated by the poll loop, so checking faster than it
-    // runs observes nothing new — but checking at exactly its rate can lock into a
-    // phase that is always just-before the update.
-    expect(deploy.drainPollMs(60_000)).toBe(30_000);
-    expect(deploy.drainPollMs(15_000)).toBe(7_500);
-  });
-
-  it("floors at 5s so a very short configured interval cannot spin the database", () => {
-    expect(deploy.drainPollMs(1_000)).toBe(5_000);
-    expect(deploy.drainPollMs(0)).toBe(5_000);
-  });
-});
-
-describe("endpoint drain barrier", () => {
-  function coordinator(invocations: () => Promise<number | null>) {
-    return new RestateDrainCoordinator({
-      oldDeploymentInvocations: invocations,
-      unresolvedLaunches: async () => 0,
-      unresolvedTerminations: async () => 0,
-      activeOwners: async () => 0,
-    });
-  }
-
-  it("refuses a quiet dispatch log when the old endpoint is unknown", async () => {
-    const drain = coordinator(async () => null);
-    drain.begin();
-    await expect(deploy.waitForQuiet(0, 1, drain, () => [])).rejects.toThrow(/did not drain/);
-  });
-
-  it("returns when no old-deployment invocation counts and nothing else is in flight", async () => {
-    const drain = coordinator(async () => 0);
-    drain.begin();
-    await deploy.waitForQuiet(1000, 1, drain, () => []);
-    expect(drain.snapshot().state).toBe("drained");
-  });
-
-  it("waits for old-deployment invocations separately from runner occupancy", async () => {
-    let count = 1;
-    const drain = coordinator(async () => count-- > 0 ? 1 : 0);
-    drain.begin();
-    await deploy.waitForQuiet(1000, 1, drain, () => []);
-    expect(drain.snapshot().state).toBe("drained");
-  });
-});
-
-describe("waitForQuiet and a held KG refresh", () => {
-  // One test database for deploy, log and in-flight-work, so waitForQuiet reads the rows the test seeds.
-  let modules: { deploy: typeof DeployModule; log: typeof LogModule; inFlight: typeof InFlightModule };
-
-  beforeEach(async () => {
-    ({ modules } = await testDb({
-      modules: { deploy: () => import("../deploy.js"), log: () => import("../log.js"), inFlight: () => import("../in-flight-work.js") },
-    }));
-  });
-
-  function seedKgRefreshRow(state: "held" | "running"): void {
-    // The fields recordKgDispatchRow writes, at the running status a live run has.
-    const id = modules.log.appendLog({
-      issueId: "kg-refresh",
-      phase: "kg-refresh",
-      dispatchId: `kg-${state}`,
-      repo: "BuildDownAI/knowledge-graph-ai-implement",
-      executionMode: "github-actions",
-      status: "running",
-    });
-    // The gate closes its row as it holds the snapshot.
-    if (state === "held") modules.log.markJobAwaitingDecision(id);
-  }
-
-  function drained(): RestateDrainCoordinator {
-    const drain = new RestateDrainCoordinator({ ...DRAINED_PROBES });
-    drain.begin();
-    return drain;
-  }
-
-  it("returns at once when the only KG refresh is held (completed / awaiting_decision)", async () => {
-    seedKgRefreshRow("held");
-    expect(modules.inFlight.getInFlightWork().filter((w) => w.kind === "kg-refresh")).toEqual([]);
-    // No injected in-flight getter: the real getInFlightWork runs against the log.
-    await modules.deploy.waitForQuiet(0, 1, drained());
-  });
-
-  it("control: a running KG refresh row does block, so the held case above can fail", async () => {
-    seedKgRefreshRow("running");
-    await expect(modules.deploy.waitForQuiet(0, 1, drained())).rejects.toThrow(/did not drain.*1 kg-refresh/);
-  });
-});
-
-describe("makeStartDeploy", () => {
-  const configured = {
-    flyDeployToken: "fly-token",
-    flyOrchestratorApp: "orchestrator",
-    selfDeployTarget: { owner: "Owner", repo: "Repo", branch: "testing", runningCommit: "abc" },
-    pollIntervalMs: 60_000,
-    restateDrainProbes: DRAINED_PROBES,
-    githubAppId: "1",
-    githubAppPrivateKey: "key",
-    kgSourceRepo: "BuildDownAI/knowledge-graph-ai-implement",
-  };
-
-  it("returns a starter when everything a deploy needs is present", () => {
-    expect(typeof deploy.makeStartDeploy(configured)).toBe("function");
-  });
-
-  it.each(["flyDeployToken", "flyOrchestratorApp", "selfDeployTarget"] as const)(
-    "returns undefined when %s is missing, so the route answers 501",
-    (field) => {
-      // Undefined here is what distinguishes "cannot deploy" from "deploy failed" —
-      // an unconfigured orchestrator must refuse up front, not part-way through.
-      expect(deploy.makeStartDeploy({ ...configured, [field]: null })).toBeUndefined();
-    },
-  );
-
-  it("returns a starter when kgSourceRepo is null — deploy proceeds without KG", () => {
-    // An operator running a KG-less orchestrator can still self-deploy; the KG token
-    // mint is skipped and the build receives no KG build-arg, producing a sidecar-less image.
-    expect(typeof deploy.makeStartDeploy({ ...configured, kgSourceRepo: null })).toBe("function");
-  });
-
-  /** The hold lives in the database, so these tests take deploy.js and deploy-hold.js over one of their own. */
-  async function withDatabase(): Promise<typeof import("../deploy-hold.js")> {
-    let hold: typeof import("../deploy-hold.js");
-    ({ deploy, hold } = (
-      await testDb({ modules: { deploy: () => import("../deploy.js"), hold: () => import("../deploy-hold.js") } })
-    ).modules);
-    return hold;
-  }
-
-  it("clears the hold when resolving HEAD throws, rather than pausing dispatch forever", async () => {
-    const hold = await withDatabase();
-
-    // Only a 404 is soft on these calls; anything else throws. `configured` carries a
-    // stub private key so the App-token mint throws before any request, standing in
-    // for the 5xx or 422 this has to survive — the hold is claimed by then.
-    const start = deploy.makeStartDeploy(configured)!;
-    await expect(start()).rejects.toThrow();
-    expect(hold.isDeployHeld()).toBe(false);
-  });
-
-  it("refuses while a deploy already holds, before reaching the network", async () => {
-    const hold = await withDatabase();
-    hold.setDeployHold();
-
-    // Asserting that nothing is fetched is the point: it is the only observable
-    // difference between claiming the hold before the awaits and after them, and the
-    // "after" ordering is the one that lets two triggers both start a deploy.
-    const network = fakeFetch({});
-    network.install();
-
-    const start = deploy.makeStartDeploy(configured)!;
-    await expect(start()).resolves.toEqual({ started: false, reason: "deploy-in-progress" });
-    expect(network.calls).toHaveLength(0);
-  });
-});
-
 describe("resolveFlyctl", () => {
   it("rejects a download whose digest does not match the pin", async () => {
     // The digest check runs before anything is written, so a tampered or truncated
@@ -342,10 +164,6 @@ describe("canSelfDeploy", () => {
     flyDeployToken: "fly-token",
     flyOrchestratorApp: "orchestrator",
     selfDeployTarget: { owner: "Owner", repo: "Repo", branch: "testing", runningCommit: "abc" },
-    pollIntervalMs: 60_000,
-    githubAppId: "1",
-    githubAppPrivateKey: "key",
-    kgSourceRepo: "BuildDownAI/knowledge-graph-ai-implement",
   };
 
   it("is true when a token, an app and build stamps are all present", () => {
@@ -356,206 +174,12 @@ describe("canSelfDeploy", () => {
     "is false without %s",
     (field) => {
       // The predicate is the single definition of "can this orchestrator deploy itself",
-      // asserted directly here rather than only through makeStartDeploy's return. A type
+      // asserted directly here. A type
       // predicate's body is not verified by the compiler, so this table is what holds it honest.
       expect(deploy.canSelfDeploy({ ...configured, [field]: null })).toBe(false);
     },
   );
-
-  it("is true when kgSourceRepo is null — KG is optional for self-deploy", () => {
-    // An operator intentionally running without a KG can still self-deploy.
-    expect(deploy.canSelfDeploy({ ...configured, kgSourceRepo: null })).toBe(true);
-  });
-
-  it("agrees with whether makeStartDeploy produces a starter", () => {
-    // They must never disagree: the route answers 501 on the starter's absence while
-    // the poll passenger gates on the predicate.
-    expect(deploy.canSelfDeploy(configured)).toBe(deploy.makeStartDeploy(configured) !== undefined);
-    const unconfigured = { ...configured, flyDeployToken: null };
-    expect(deploy.canSelfDeploy(unconfigured)).toBe(deploy.makeStartDeploy(unconfigured) !== undefined);
-  });
 });
-
-describe("makeStartDeploy onBuildFailure callback", () => {
-  // Needs real SQLite (deploy-hold.ts writes to it), but mocks the two GitHub helpers
-  // so we can control what commit is returned and skip the App-token mint.
-  let localDeploy: typeof DeployModule;
-
-  beforeEach(async () => {
-    vi.doMock("../github-app-auth.js", () => ({
-      getScopedInstallationToken: vi.fn().mockResolvedValue({ token: "tok", expiresAt: "" }),
-      mintSourceTokenOrJwt: vi.fn().mockResolvedValue({ token: "tok", authMode: "installation" }),
-    }));
-    vi.doMock("../github.js", () => ({
-      fetchRepoTarball: vi.fn(),
-      getRefSha: vi.fn().mockResolvedValue("def5678"),
-    }));
-
-    // testDb resets the module registry, so deploy.js is imported with the mocks above.
-    ({ deploy: localDeploy } = (await testDb({ modules: { deploy: () => import("../deploy.js") } })).modules);
-    containBackgroundDeploy();
-  });
-
-  afterEach(() => {
-    vi.doUnmock("../github-app-auth.js");
-    vi.doUnmock("../github.js");
-    vi.unstubAllGlobals();
-  });
-
-  it("uses the installation token path by default (auth=installation)", async () => {
-    let signalCalled = () => {};
-    const called = new Promise<void>((resolve) => { signalCalled = resolve; });
-    const onBuildFailure = vi.fn(() => signalCalled());
-    const start = localDeploy.makeStartDeploy({
-      flyDeployToken: "fly-token",
-      flyOrchestratorApp: "orchestrator",
-      selfDeployTarget: { owner: "Owner", repo: "Repo", branch: "testing", runningCommit: "abc" },
-      pollIntervalMs: 60_000,
-      githubAppId: "1",
-      githubAppPrivateKey: "key",
-      kgSourceRepo: null,
-      onBuildFailure,
-      restateDrainProbes: DRAINED_PROBES,
-    })!;
-
-    const result = await start();
-    // HEAD resolved → started even though runDeploy will fail later at flyctl
-    expect(result).toMatchObject({ started: true, commit: "def5678" });
-    await called; // the deploy runs on in the background; it must end inside this test
-  });
-
-  it("calls onBuildFailure when runDeploy rejects", async () => {
-    // Resolved by the callback itself rather than waited out: runDeploy is fire-and-forget,
-    // so the test needs a signal, and a fixed sleep is a guess that gets tighter under load.
-    let signalCalled = () => {};
-    const called = new Promise<void>((resolve) => { signalCalled = resolve; });
-    const onBuildFailure = vi.fn(() => signalCalled());
-    const start = localDeploy.makeStartDeploy({
-      flyDeployToken: "fly-token",
-      flyOrchestratorApp: "orchestrator",
-      selfDeployTarget: { owner: "Owner", repo: "Repo", branch: "testing", runningCommit: "abc" },
-      pollIntervalMs: 60_000,
-      githubAppId: "1",
-      githubAppPrivateKey: "key",
-      kgSourceRepo: "BuildDownAI/knowledge-graph-ai-implement",
-      onBuildFailure,
-      restateDrainProbes: DRAINED_PROBES,
-    })!;
-
-    const result = await start();
-    expect(result).toMatchObject({ started: true, commit: "def5678" });
-
-    await called;
-
-    expect(onBuildFailure).toHaveBeenCalledWith("def5678", expect.any(Error));
-  });
-});
-
-describe("makeStartDeploy — public mode (no App installation on source owner)", () => {
-  // Re-setup with public auth mode: App not installed on source owner; reads are unauthenticated.
-  let localDeploy: typeof DeployModule;
-  let hold: typeof import("../deploy-hold.js");
-  let github: typeof import("../github.js");
-  let githubAuth: typeof import("../github-app-auth.js");
-
-  beforeEach(async () => {
-    vi.doMock("../github-app-auth.js", () => ({
-      getScopedInstallationToken: vi.fn().mockResolvedValue({ token: "kg-tok", expiresAt: "" }),
-      mintSourceTokenOrJwt: vi.fn().mockResolvedValue({ token: null, authMode: "public" }),
-    }));
-    vi.doMock("../github.js", () => ({
-      fetchRepoTarball: vi.fn().mockResolvedValue(Buffer.alloc(0)),
-      getRefSha: vi.fn().mockResolvedValue("def5678"),
-    }));
-
-    // testDb resets the module registry, so deploy.js and these loaders get the mocks above.
-    ({ deploy: localDeploy, hold, github, githubAuth } = (
-      await testDb({
-        modules: {
-          deploy: () => import("../deploy.js"),
-          hold: () => import("../deploy-hold.js"),
-          github: () => import("../github.js"),
-          githubAuth: () => import("../github-app-auth.js"),
-        },
-      })
-    ).modules);
-    containBackgroundDeploy();
-  });
-
-  afterEach(() => {
-    vi.doUnmock("../github-app-auth.js");
-    vi.doUnmock("../github.js");
-    vi.unstubAllGlobals();
-  });
-
-  it("resolves HEAD and returns started:true when the source uses public (unauthenticated) fallback", async () => {
-    let signalCalled = () => {};
-    const called = new Promise<void>((resolve) => { signalCalled = resolve; });
-    const start = localDeploy.makeStartDeploy({
-      flyDeployToken: "fly-token",
-      flyOrchestratorApp: "orchestrator",
-      selfDeployTarget: { owner: "BuildDownAI", repo: "AI-Implement", branch: "main", runningCommit: null },
-      pollIntervalMs: 60_000,
-      githubAppId: "1",
-      githubAppPrivateKey: "key",
-      kgSourceRepo: null,
-      onBuildFailure: vi.fn(() => signalCalled()),
-      restateDrainProbes: DRAINED_PROBES,
-    })!;
-
-    const result = await start();
-    expect(result).toMatchObject({ started: true, commit: "def5678" });
-    await called; // the deploy runs on in the background; it must end inside this test
-  });
-
-  it("surfaces a fix message via onBuildFailure when tarball fails in public mode (private out-of-installation repo)", async () => {
-    // fetchRepoTarball fails: private repo returns error when accessed without auth
-    vi.mocked(github.fetchRepoTarball).mockRejectedValue(new Error("fetchRepoTarball failed: HTTP 404"));
-
-    let signalCalled = () => {};
-    const called = new Promise<void>((resolve) => { signalCalled = resolve; });
-    let capturedError: unknown;
-    const onBuildFailure = vi.fn((_, err: unknown) => { capturedError = err; signalCalled(); });
-
-    const start = localDeploy.makeStartDeploy({
-      flyDeployToken: "fly-token",
-      flyOrchestratorApp: "orchestrator",
-      selfDeployTarget: { owner: "BuildDownAI", repo: "AI-Implement", branch: "main", runningCommit: null },
-      pollIntervalMs: 60_000,
-      githubAppId: "1",
-      githubAppPrivateKey: "key",
-      kgSourceRepo: null,
-      onBuildFailure,
-      restateDrainProbes: DRAINED_PROBES,
-    })!;
-
-    const result = await start();
-    expect(result).toMatchObject({ started: true, commit: "def5678" });
-
-    await called;
-
-    expect(onBuildFailure).toHaveBeenCalledWith("def5678", expect.any(Error));
-    expect((capturedError as Error).message).toMatch(/Install the App|add the repository to the existing installation/);
-  });
-
-  it("does not fall back when a non-404 mint error occurs — clears the hold and rethrows", async () => {
-    vi.mocked(githubAuth.mintSourceTokenOrJwt).mockRejectedValue(new Error("GitHub 422 Unprocessable Entity"));
-
-    const start = localDeploy.makeStartDeploy({
-      flyDeployToken: "fly-token",
-      flyOrchestratorApp: "orchestrator",
-      selfDeployTarget: { owner: "BuildDownAI", repo: "AI-Implement", branch: "main", runningCommit: null },
-      pollIntervalMs: 60_000,
-      githubAppId: "1",
-      githubAppPrivateKey: "key",
-      kgSourceRepo: null,
-    })!;
-
-    await expect(start()).rejects.toThrow("422");
-    expect(hold.isDeployHeld()).toBe(false);
-  });
-});
-
 
 describe("self-deploy drain exclusion", () => {
   it("excludes only the supplied invocation and preserves the default query", async () => {
@@ -581,5 +205,13 @@ describe("self-deploy drain exclusion", () => {
     const fake = fakeFetch({ "HEAD /v2/images/manifests/main-abcdef0": { status: 403 } });
     expect(await publishedImageManifestHead("registry.fly.io/images:main-abcdef0", "deploy-token", fake.fetch)).toBe(403);
     expect(fake.calls[0].headers.get("authorization")).toBe("Bearer deploy-token");
+  });
+});
+
+describe("the in-memory deploy is gone", () => {
+  it("exports no runDeploy, makeStartDeploy or in-process drain wait", () => {
+    for (const name of ["runDeploy", "makeStartDeploy", "waitForQuiet", "drainPollMs"]) {
+      expect(name in deploy).toBe(false);
+    }
   });
 });

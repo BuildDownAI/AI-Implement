@@ -1,7 +1,7 @@
 import * as restate from "@restatedev/restate-sdk";
 import { queryNonCompletedInvocations } from "../../restate/endpoint.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { createSelfDeploy, type SelfDeployRecord, type SelfDeployStartResult } from "../../restate/self-deploy.js";
+import { createSelfDeploy, type SelfDeployRecord, type SelfDeployStartResult, type SelfDeployStatus, type SelfDeploySetOptionsResult } from "../../restate/self-deploy.js";
 import { callObject, callService, killInvocation, gate, eventually, queryInvocations, replaceEndpoint, setObjectState, startVariants, stopAll, VARIANTS, type RestateEnvironment } from "./harness.js";
 import { COMMIT, deployFixture } from "./self-deploy-fixture.js";
 
@@ -14,7 +14,8 @@ describe("SelfDeploy durable phase machine", () => {
   afterAll(async () => stopAll(envs));
   const call = <T>(env: RestateEnvironment, handler: string, body: unknown = {}) => callObject<T>(env.baseUrl(), "SelfDeploy", "test-app", handler, body);
   const start = (env: RestateEnvironment) => call<SelfDeployStartResult>(env, "start", { branch: "testing", requestedBy: "owner" });
-  const read = (env: RestateEnvironment) => call<SelfDeployRecord | null>(env, "status");
+  const read = async (env: RestateEnvironment) => (await call<SelfDeployStatus>(env, "status")).deploy;
+  const setOptions = (env: RestateEnvironment, applyFlyToml: boolean) => call<SelfDeploySetOptionsResult>(env, "setOptions", { applyFlyToml });
   const terminal = async (env: RestateEnvironment, fixture: ReturnType<typeof deployFixture>, expected: string, reason: SelfDeployRecord["reason"] = null) => {
     const record = await phase(env, expected);
     await eventually(async () => fixture.state.outcomes, outcomes => outcomes.some(r => r.deployId === record!.deployId), { label: "terminal callback" });
@@ -102,11 +103,13 @@ describe("SelfDeploy durable phase machine", () => {
   it.each(VARIANTS)("honors control plane config ownership and verify times out after five reads (%s)", async label => {
     f = deployFixture(); const env = envs.get(label)!;
     const warnings = vi.spyOn(console, "warn");
-    f.config.imageApp = "owned-images"; f.state.toml = true; f.state.work = false; f.state.commit = "old";
+    await setOptions(env, true);
+    f.config.imageApp = "owned-images"; f.state.work = false; f.state.commit = "old";
     await start(env);
     await terminal(env, f, "failed", "verify-timeout");
-    expect(warnings.mock.calls.flat().filter(line => String(line).includes("deploy_apply_fly_toml refused: control plane owns machine config"))).toHaveLength(1);
+    expect(warnings.mock.calls.flat().filter(line => String(line).includes("apply fly.toml refused: control plane owns machine config"))).toHaveLength(1);
     warnings.mockRestore();
+    await setOptions(env, false);
     expect((await read(env))?.reason).toBe("verify-timeout");
     expect(f.state.reads).toBe(5);
     expect(f.deps.flyctl).not.toHaveBeenCalled();
@@ -176,10 +179,25 @@ describe("SelfDeploy durable phase machine", () => {
     expect((await read(env))?.reason).toBe("apply-failed"); expect(f.state.held).toBe(false);
   });
   it.each(VARIANTS)("uses detached fly.toml mode only for independently owned machines (%s)", async label => {
-    f = deployFixture(); const env = envs.get(label)!; f.state.work = false; f.state.toml = true;
+    f = deployFixture(); const env = envs.get(label)!; f.state.work = false;
+    await setOptions(env, true);
     await start(env); await terminal(env, f, "succeeded");
+    await setOptions(env, false);
     expect(f.deps.fly.updateMachine).not.toHaveBeenCalled();
     expect(f.deps.flyctl).toHaveBeenCalledWith(expect.anything(), ["deploy", "--image", "registry.fly.io/builddown-orchestrator-image:testing-abcdef0", "--detach", "--app", "test-app"], "secret-fly", expect.any(AbortSignal));
+  });
+  it.each(VARIANTS)("setOptions defaults off, persists across a restart and is refused when the control plane owns the machine (%s)", async label => {
+    f = deployFixture(); const env = envs.get(label)!;
+    expect((await call<SelfDeployStatus>(env, "status")).options).toEqual({ applyFlyToml: false });
+    f.config.imageApp = "owned-images";
+    expect(await setOptions(env, true)).toEqual({ ok: false, reason: "apply-fly-toml-refused" });
+    expect((await call<SelfDeployStatus>(env, "status")).options).toEqual({ applyFlyToml: false });
+    expect(await setOptions(env, false)).toEqual({ ok: true, options: { applyFlyToml: false } });
+    delete f.config.imageApp;
+    expect(await setOptions(env, true)).toEqual({ ok: true, options: { applyFlyToml: true } });
+    await replaceEndpoint(env, [object()]);
+    expect((await call<SelfDeployStatus>(env, "status")).options).toEqual({ applyFlyToml: true });
+    await setOptions(env, false);
   });
   it.each(VARIANTS)("already-target machines need no update (%s)", async label => {
     f = deployFixture(); const env = envs.get(label)!; f.state.work = false;
@@ -227,7 +245,7 @@ describe("SelfDeploy durable phase machine", () => {
         for (const handler of ["checkDrain", "apply", "verify"] as const) {
           if ((handler === "checkDrain" && current === "draining") || (handler === "apply" && current === "applying") || (handler === "verify" && current === "verifying")) continue;
           await callService(env.baseUrl(), "PhaseDriver", "invoke", { key, handler });
-          expect(await callObject(env.baseUrl(), "SelfDeploy", key, "status", {})).toEqual(record);
+          expect(await callObject(env.baseUrl(), "SelfDeploy", key, "status", {})).toEqual({ deploy: record, options: { applyFlyToml: false } });
         }
         if (current !== "draining") expect(await callObject(env.baseUrl(), "SelfDeploy", key, "cancel", { requestedBy: "owner" })).toEqual({ cancelled: false, reason: current === "applying" || current === "verifying" ? "too-late" : "no-active-deploy" });
       }

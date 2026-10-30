@@ -68,12 +68,32 @@ curl -X POST https://<app-name>.fly.dev/api/deploy -H "Authorization: Bearer <se
 
 | Response | Meaning |
 |---|---|
-| `202 {"deploying":"<sha>"}` | Accepted. The deploy has started, not finished. |
-| `409 deploy-in-progress` | A deploy is already running. |
+| `202 {"deployId","commit","image","alreadyActive"}` | Accepted. The deploy has started, not finished. A call while one is active returns the active deploy's id with `alreadyActive: true`. |
+| `409 image-not-published` | The image for that commit is not in the registry yet (see "The image rule"). |
 | `503 head-unknown` | The watched branch's HEAD could not be read. |
+| `400 unsupported-branch` | The watched ref is not `testing` or `main`, the two with published image channels. |
 | `501` | This orchestrator is not configured to deploy itself. |
 
-It pauses dispatch, waits for in-flight work to drain, fetches the source at the branch HEAD, builds with the sidecar secret and the source stamps, then releases. **The release replaces the machine running the deploy**, so the process is killed partway through and the 202 is the last thing it can tell you. The *incoming* process reports the outcome instead: at boot it records whether the release completed, came up without a working knowledge graph, or never released at all, and `/admin#deployments` shows that record. A build failure is recorded by the process that survived it, since a build that fails never replaces anything.
+`POST /api/deploy-cancel` (admin only) cancels a deploy still in `draining`; later phases answer `{ "cancelled": false, "reason": "too-late" }`.
+
+**The `SelfDeploy` object.** Both the admin Deploy button and the auto-deploy loop call `SelfDeploy.start` (a Restate virtual object keyed by `FLY_APP_NAME`, `src/restate/self-deploy.ts`). It is durable, so the deploy survives the process being replaced, and its state is the one source of truth. Its phases:
+
+| Phase | What happens |
+|---|---|
+| `draining` | The deploy hold is set, so dispatch stops. A delayed `checkDrain` re-checks in-flight work and the old Restate endpoint until quiet; after 75 minutes it ends `failed` with reason `drain-timeout`. This is the only phase `cancel` works in. |
+| `applying` | The image is applied: each machine is updated to the target image, or `flyctl deploy --image` runs when the fly.toml option is on. A rejected apply ends `failed` / `apply-failed`. |
+| `verifying` | The new process reports its `AI_IMPLEMENT_SOURCE_COMMIT`; five polls without a match end `failed` / `verify-timeout`. |
+| `succeeded`, `failed`, `cancelled` | Terminal. The hold is released and the outcome is recorded. |
+
+**The image rule.** Without `KG_SOURCE_REPO` the deploy applies the published image `registry.fly.io/<FLY_IMAGE_APP or builddown-orchestrator-image>:<branch>-<sha7>`, and refuses with `image-not-published` when the registry has no manifest for it. With `KG_SOURCE_REPO` set it builds `registry.fly.io/<app>:deploy-<sha7>` from the source tarball with the KG build secret, then applies that.
+
+**Outcome.** The object's terminal record is written to `deploy_last_outcome` and announced on the notice webhook (failures and cancellations; a success is announced by the new process's boot notice). `succeeded` is `deployed-ok`, `failed` is `deploy-failed` and `cancelled` is `deploy-cancelled`, the latter two with the reason code in `detail`. `/admin#deployments`, `get_deploy_posture` (`lastOutcome`) and `GET /api/deployment-status` (`lastDeployOutcome`, plus `selfDeploy` and `applyFlyTomlAllowed`) read it. Log lines read `[self-deploy] <deployId> <phase> <reason>`. Boot no longer guesses an outcome, so the old `deployed-not-serving` signal (sidecar missing or failing its probe) is no longer written; sidecar health is reported by `GET /` and `get_kg_status`.
+
+**Apply fly.toml on deploy.** A deploy only changes each machine's image by default. A VM size or mount change needs the "Apply fly.toml on deploy" option, or a manual `fly deploy`. The option is `options.applyFlyToml` in the `SelfDeploy` object's state (default off, no env seed, no SQLite key), set with `POST /api/deploy-policy {"applyFlyToml": true}`. It is refused with `409 apply-fly-toml-refused` when `FLY_IMAGE_APP` is set, because the control plane owns that machine's config and `fly.toml` would change its VM size and mount.
+
+**The hold and recovery.** Boot does not clear the deploy hold: a boot during a drain would re-open dispatch in the middle of a deploy. Only the object releases it, at a terminal phase. `cancel` works only in `draining`. A deploy in `applying` or `verifying` ends on its own: the apply fails, or `verify-timeout` follows five polls without the new commit, and either releases the hold. A crash between setting the hold and the object's first journaled write is the one case with no automatic release; there, a manual `fly deploy` (the new process does not clear the hold either) needs the hold reset in the database by an operator.
+
+**First release.** The first release containing this change is still deployed by the old in-memory deploy, which clears the hold at boot; the next deploy is the first to go through `SelfDeploy`.
 
 Four things must be true, and they are not all reported the same way:
 
