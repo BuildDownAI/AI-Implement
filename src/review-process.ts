@@ -91,10 +91,13 @@ function codexVerdict(input: ReviewVerdictInput): ReviewVerdictResult {
     if (!state || state.commit_sha !== input.headSha) continue;
     if (state.status === "failed") return { ...waiting, verdict: "no-real-verdict" };
     if (state.status !== "completed" || typeof state.has_unresolved_findings !== "boolean") return waiting;
+    const findings = inlineFindings({ ...input, inlineComments: input.inlineComments.filter((c) => c.commitId === input.headSha && classifyCodexBadge(c.body) !== "untagged") }, CODEX_AUTHORS, classifyCodexBadge);
+    // An unresolved state approves only when readable head badges establish P2-only advice.
+    const minorOnly = findings.length > 0 && findings.every((f) => f.severity === "minor");
     return {
-      verdict: state.has_unresolved_findings ? "changes_requested" : "approve",
+      verdict: state.has_unresolved_findings && !minorOnly ? "changes_requested" : "approve",
       source: "codex-state",
-      findings: inlineFindings({ ...input, inlineComments: input.inlineComments.filter((c) => c.commitId === input.headSha && classifyCodexBadge(c.body) !== "untagged") }, CODEX_AUTHORS, classifyCodexBadge),
+      findings,
     };
   }
   return waiting;

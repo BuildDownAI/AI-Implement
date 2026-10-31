@@ -1,8 +1,10 @@
+import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 import { readFileSync } from "node:fs";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn(async () => "tok") }));
-vi.mock("../github.js", () => ({
+vi.mock("../github.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../github.js")>()),
   getCombinedChecksState: vi.fn(),
   getCommitTime: vi.fn(),
   getPullRequestState: vi.fn(),
@@ -49,9 +51,39 @@ describe("Codex late review", () => {
     user: { login: "chatgpt-codex-connector[bot]", type: "Bot" },
     updatedAt: new Date(2000).toISOString(),
   });
+  let inlineFetch: FakeFetch;
+  const inlinePath = "GET /repos/o/r/pulls/5/comments" as const;
   beforeEach(() => {
+    inlineFetch = fakeFetch({ [inlinePath]: { json: [] } }).install();
     vi.mocked(getMappings).mockReturnValue({ test: { owner: "o", repo: "r", reviewProcess: "codex-code-review" } } as never);
     vi.mocked(listCheckRuns).mockReset().mockResolvedValue([]);
+  });
+  const badge = (p: number) => ({
+    user: { login: "chatgpt-codex-connector[bot]", type: "Bot" }, commit_id: "b",
+    body: `**<sub><sub>![P${p} Badge](https://img.shields.io/badge/P${p}-yellow?style=flat)</sub></sub> advice`,
+  });
+  it.each([1, 2])("maps P%s head badges into the shared verdict", async (priority) => {
+    vi.mocked(listPrComments).mockResolvedValue([state("completed", true)]);
+    inlineFetch = fakeFetch({ [inlinePath]: { json: [
+      { ...badge(1), commit_id: "old" }, { ...badge(1), user: { login: "human", type: "User" } },
+      { ...badge(1), user: { login: "untrusted", type: "Bot" } }, badge(priority),
+    ] } }).install();
+    const tick = await deps().readTick({ ...input, headSha: "b", followHead: false });
+    expect(tick.checks).toBe("success");
+    expect(tick.heldBy).toBe(priority === 1 ? "changes_requested" : undefined);
+    expect(tick.blockingLastSeenAtMs).toHaveLength(priority === 1 ? 1 : 0);
+    expect(inlineFetch.calls[0]!.url.href).toBe("https://api.github.com/repos/o/r/pulls/5/comments?per_page=100");
+  });
+  it("reads later inline pages before approving and throws on an unreadable page", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([state("completed", true)]);
+    const firstPage = { json: [badge(2)],
+      headers: { link: '<https://api.github.com/repos/o/r/pulls/5/comments?page=2>; rel="next"' },
+    };
+    inlineFetch = fakeFetch({ [inlinePath]: [firstPage, { json: [badge(1)] }] }).install();
+    expect((await deps().readTick({ ...input, headSha: "b", followHead: false })).heldBy).toBe("changes_requested");
+    expect(inlineFetch.calls[1]!.url.href).toBe("https://api.github.com/repos/o/r/pulls/5/comments?page=2");
+    fakeFetch({ [inlinePath]: [firstPage, { status: 503 }] }).install();
+    await expect(deps().readTick({ ...input, headSha: "b", followHead: false })).rejects.toThrow("inline comments unreadable");
   });
   it("expects the reviewer without check runs", async () => {
     expect(await deps().readReviewerExpected!({ ...input, headSha: "b" })).toBe(true);

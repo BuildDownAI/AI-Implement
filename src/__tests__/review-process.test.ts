@@ -205,6 +205,22 @@ describe("Codex Code Review", () => {
   ] as const)("reads %s unresolved=%s", (status, unresolved, verdict) => {
     expect(codex.readVerdict(input({ issueComments: [stateComment(status, unresolved)] })).verdict).toBe(verdict);
   });
+  it.each([[0], [1], [1, 2], [2], [2, 2]])("gates unresolved badges %j", (...priorities) => {
+    const inlineComments = priorities.map((p) => comment({ authorLogin: "chatgpt-codex-connector[bot]", body: codexBadge(p) }));
+    const result = codex.readVerdict(input({ issueComments: [stateComment("completed", true)], inlineComments }));
+    expect(result.verdict).toBe(priorities.every((p) => p === 2) ? "approve" : "changes_requested");
+    expect(result.findings.map((f) => f.severity)).toEqual(priorities.map((p) => p === 2 ? "minor" : "blocking"));
+  });
+  it("ignores old P1 alongside head P2 and fails closed without readable head badges", () => {
+    const minor = comment({ authorLogin: "chatgpt-codex-connector[bot]", body: codexBadge(2) });
+    const old = { ...minor, body: codexBadge(1), commitId: "old" };
+    const read = (inlineComments: ReviewVerdictInput["inlineComments"]) => codex.readVerdict(input({ issueComments: [stateComment("completed", true)], inlineComments }));
+    expect(read([old, minor]).verdict).toBe("approve");
+    for (const comments of [[], [old], [{ ...minor, body: "no badge" }], [{ ...minor, authorType: "User" }],
+      [{ ...minor, authorLogin: "evil[bot]" }], [{ ...minor, commitId: undefined }]]) {
+      expect(read(comments).verdict).toBe("changes_requested");
+    }
+  });
   it("includes only trusted badge findings on the exact head", () => {
     const comments = [0, 1, 2].map((p) => comment({ authorLogin: "chatgpt-codex-connector[bot]", body: codexBadge(p) }));
     const result = codex.readVerdict(input({ issueComments: [stateComment("completed", true)], inlineComments: [

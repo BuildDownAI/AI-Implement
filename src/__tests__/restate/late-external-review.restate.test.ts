@@ -192,6 +192,16 @@ describe("LateExternalReview workflow", () => {
         expect(sc.comments[0]).toContain(LATE_EXTERNAL_APPROVAL_MARKER);
       });
 
+      it("approves a Codex P2-only clean tick and writes the approval mark", async () => {
+        // Production mapping is covered in late-external-review-tick.test.ts: completed,
+        // unresolved, trusted P2-only head badges and green CI produce this clean tick.
+        const { result, sc } = await runScenario(url(), { ticks: [pending, passed] });
+        expect(result).toEqual({ outcome: "approved" });
+        expect(sc.stamps).toEqual([sc.jobId]);
+        expect(sc.comments).toHaveLength(1);
+        expect(sc.comments[0]).toContain(LATE_EXTERNAL_APPROVAL_MARKER);
+      });
+
       it("holds a failed Codex review and posts recovery instructions", async () => {
         const { result, sc } = await runScenario(url(), { ticks: [{ ...passed, heldBy: "review-failed", blockingLastSeenAtMs: [COMMIT_MS + 1] }] });
         expect(result).toEqual({ outcome: "findings" });
