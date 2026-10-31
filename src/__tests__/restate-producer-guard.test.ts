@@ -14,7 +14,10 @@ const SELF = "restate-producer-guard.test.ts";
 export function findPromisePairs(source: string): string[] {
   const workflow = /restate\.workflow\(\s*\{\s*name:\s*"(\w+)"/.exec(source)?.[1];
   if (!workflow) return [];
-  const names = [...source.matchAll(/ctx\.promise(?:<[^>]*>)?\(\s*"([^"]+)"\s*\)/g)].map((m) => m[1]);
+  const names = [
+    ...source.matchAll(/ctx\.promise(?:<[^>]*>)?\(\s*"([^"]+)"\s*\)/g),
+    ...source.matchAll(/acceptOwnedRunReport(?:<[^>]*>)?\(\s*ctx\s*,\s*"([^"]+)"/g),
+  ].map((m) => m[1]);
   return [...new Set(names)].map((name) => `${workflow}.${name}`);
 }
 
@@ -44,7 +47,7 @@ describe("restate producer guard (ADR 034 rule 4)", () => {
     const pairs = sources.flatMap((s) => findPromisePairs(s.source)).sort();
     expect(pairs).toEqual([
       "ImplementationRun.report", "KgRefresh.cancel", "KgRefresh.progress", "KgRefresh.report", "PlanningRun.report",
-      "ReviewFixAttempt.cancel", "ReviewFixAttempt.wake",
+      "ReviewFixAttempt.cancel", "ReviewFixAttempt.report", "ReviewFixAttempt.wake",
     ]);
   });
 
@@ -61,12 +64,15 @@ describe("restate producer guard (ADR 034 rule 4)", () => {
       'const a = ctx.promise<boolean>("alpha");',
       'const a2 = ctx.promise<boolean>("alpha");',
       'const b = ctx.promise("beta");',
+      'await acceptOwnedRunReport(ctx, "alpha", {});',
+      'await acceptOwnedRunReport(ctx, "report", {});',
       'objectSendClient({ name: "Other" });',
     ].join("\n");
     const title = ["contract:", "Demo.alpha — covered"].join(" ");
     const titleSource = `it("${title}", () => {});`;
     expect(findMissingContracts("x.ts", src, findContractTitles(titleSource))).toEqual([
       'x.ts: Demo.beta has no "contract: Demo.beta" test',
+      'x.ts: Demo.report has no "contract: Demo.report" test',
     ]);
   });
 });

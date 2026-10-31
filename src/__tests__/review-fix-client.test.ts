@@ -130,12 +130,19 @@ describe("createReviewFixIngressClient (AII-1184)", () => {
       expect(calls[0]!.headers.get("idempotency-key")).toBe("att-1.result.k");
     });
 
-    it("forwards optional usage with the supplied idempotency key", async () => {
-      const body = { ...result, usage: toRecordedUsage({ invocations: [] }) };
+    it("contract: ReviewFixAttempt.report", async () => {
+      // The result handler passes this usage separately from validated metadata to
+      // acceptOwnedRunReport(ctx, "report", ...); the producer must preserve both.
+      const body = { ...result, usage: toRecordedUsage({ invocations: [], pushedCommits: ["a".repeat(40)] }) };
       const fake = fakeFetch({ "POST /ReviewFixAttempt/att-1/result": { json: stored } });
       expect(await ingressFor(fake).result("att-1", body, { idempotencyKey: "usage-key" }))
         .toEqual({ status: "accepted", outcome: stored });
-      expect(JSON.parse(fake.calls[0]!.body)).toEqual(body);
+      expect(fake.calls).toHaveLength(1);
+      expect(fake.calls[0]!.url.href).toBe("http://sidecar/ReviewFixAttempt/att-1/result");
+      const sent = JSON.parse(fake.calls[0]!.body);
+      expect(sent).toEqual(body);
+      expect(validateReviewFixResultMetadata(sent)).toEqual({ ok: true, value: result });
+      expect(sent.usage).toEqual(body.usage);
       expect(fake.calls[0]!.headers.get("idempotency-key")).toBe("usage-key");
     });
 
