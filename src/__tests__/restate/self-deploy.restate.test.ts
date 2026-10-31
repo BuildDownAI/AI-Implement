@@ -1,5 +1,4 @@
-import { createRestateRegistrationGate, releaseUnownedDeployHoldAtBoot } from "../../index.js";
-import { getRestateStatus } from "../../restate/status.js";
+import { createRestateRegistrationGate, onRestateRegistered, releaseUnownedDeployHoldAtBoot } from "../../index.js";
 import { clearDeployHold, getDeployStartedAt, isDeployHeld, setDeployHold } from "../../deploy-hold.js";
 import { initSettingsTable } from "../../runner-mode.js";
 import { callToolAsSystem } from "../../restate/tools-client.js";
@@ -7,7 +6,7 @@ import { decideAvailabilityAction } from "../../deploy-policy.js";
 import * as restate from "@restatedev/restate-sdk";
 import { queryNonCompletedInvocations } from "../../restate/endpoint.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { createSelfDeploy, type SelfDeployRecord, type SelfDeployStartResult, type SelfDeployStatus, type SelfDeploySetOptionsResult } from "../../restate/self-deploy.js";
+import { selfDeployRecovery, createSelfDeploy, createSelfDeployIngressClient, type SelfDeployRecord, type SelfDeployStartResult, type SelfDeployStatus, type SelfDeploySetOptionsResult } from "../../restate/self-deploy.js";
 import { callObject, callService, killInvocation, gate, eventually, queryInvocations, replaceEndpoint, setObjectState, startVariants, stopAll, VARIANTS, type RestateEnvironment } from "./harness.js";
 import { COMMIT, deployFixture } from "./self-deploy-fixture.js";
 
@@ -16,7 +15,7 @@ describe("SelfDeploy durable phase machine", () => {
   // Each scenario resets its fakes; the object factory still reads the current injected dependencies.
   const object = () => createSelfDeploy(new Proxy({} as typeof f.deps, { get: (_t, key) => f.deps[key as keyof typeof f.deps] }));
   let envs: Map<string, RestateEnvironment>;
-  beforeAll(async () => { envs = await startVariants([object()]); }, 60_000);
+  beforeAll(async () => { envs = await startVariants([object(), selfDeployRecovery]); }, 60_000);
   afterAll(async () => stopAll(envs));
   const call = <T>(env: RestateEnvironment, handler: string, body: unknown = {}) => callObject<T>(env.baseUrl(), "SelfDeploy", "test-app", handler, body);
   const start = (env: RestateEnvironment) => call<SelfDeployStartResult>(env, "start", { branch: "testing", requestedBy: "owner" });
@@ -32,9 +31,38 @@ describe("SelfDeploy durable phase machine", () => {
     return record;
   };
   const phase = (env: RestateEnvironment, value: string) => eventually(() => read(env), r => r?.phase === value, { label: value });
+  it.each(VARIANTS)("serializes hold recovery with start in both lock orders (%s)", async label => {
+    const env = envs.get(label)!;
+    for (const first of ["start", "releaseUnownedHold"] as const) {
+      f = deployFixture();
+      const key = `race-${first}`;
+      const entered = gate("first exclusive effect");
+      const original = first === "start" ? f.deps.head : f.deps.setHold;
+      if (first === "start") f.deps.head = vi.fn(async (target, branch) => { await entered.wait(); return (original as typeof f.deps.head)(target, branch); });
+      else f.deps.setHold = vi.fn(async held => { await entered.wait(); await (original as typeof f.deps.setHold)(held); });
+      const invoke = (handler: string) => handler === "releaseUnownedHold" ? createSelfDeployIngressClient(() => key, env.baseUrl()).releaseUnownedHold() : callObject(env.baseUrl(), "SelfDeploy", key, handler,
+        handler === "start" ? { branch: "testing", requestedBy: "owner" } : {});
+      const pending = invoke(first);
+      await entered.reached();
+      const second = invoke(first === "start" ? "releaseUnownedHold" : "start");
+      try {
+        await eventually(() => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'SelfDeploy' AND target_service_key = '${key}' AND target_handler_name = '${first === "start" ? "releaseUnownedHold" : "start"}' AND status = 'pending'`),
+          rows => rows.length > 0, { label: "second exclusive handler queued" });
+      } finally { entered.release(); }
+      await Promise.all([pending, second]);
+      expect(f.state.held).toBe(true);
+      expect((await callObject<SelfDeployStatus>(env.baseUrl(), "SelfDeploy", key, "status", {})).deploy?.phase).toBe("draining");
+      await callObject(env.baseUrl(), "SelfDeploy", key, "cancel", { requestedBy: "owner" });
+    }
+  });
   it.each(VARIANTS)("recovers only unowned holds after successful boot registration (%s)", async label => {
     initSettingsTable();
     const env = envs.get(label)!;
+    f = deployFixture();
+    f.deps.setHold = vi.fn(async held => { if (held) setDeployHold(); else clearDeployHold(); });
+    const boot = (releaseHold: () => Promise<void>, step = vi.fn(async () => {})) => onRestateRegistered({
+      releaseHold, sweep: step, scrub: step, seed: step, refresh: step, reconcile: step,
+    });
     const log = vi.spyOn(console, "log");
     const error = vi.spyOn(console, "error");
     try {
@@ -45,17 +73,17 @@ describe("SelfDeploy durable phase machine", () => {
           requestedBy: "owner", startedAt: 1, finishedAt: null, reason: null,
         } satisfies SelfDeployRecord);
         setDeployHold();
-        const status = vi.fn(() => callObject<SelfDeployStatus>(env.baseUrl(), "SelfDeploy", key, "status", {}));
+        const releaseUnownedHold = vi.fn(() => createSelfDeployIngressClient(() => key, env.baseUrl()).releaseUnownedHold());
         const registered = gate("registration");
         const registration = createRestateRegistrationGate(() => false, {
           startRestateEndpoint: async () => {},
           registerRestateEndpoint: async () => { await registered.wait(); return { outcome: "registered-no-force" }; },
-          onRegistered: () => releaseUnownedDeployHoldAtBoot({ status }),
+          onRegistered: () => boot(() => releaseUnownedDeployHoldAtBoot({ releaseUnownedHold })),
         });
         const pending = registration.attempt();
         await registered.reached();
         expect(isDeployHeld()).toBe(true);
-        expect(status).not.toHaveBeenCalled();
+        expect(releaseUnownedHold).not.toHaveBeenCalled();
         expect(await callToolAsSystem("list_projects", {})).toEqual({ status: "deploy-held" });
         registered.release();
         await pending;
@@ -70,30 +98,25 @@ describe("SelfDeploy durable phase machine", () => {
         clearDeployHold();
       }
       expect(log.mock.calls.filter(c => c[0] === "[self-deploy] released an unowned deploy hold at boot")).toHaveLength(4);
-      const status = vi.fn(async (): Promise<SelfDeployStatus> => { throw new Error("status unavailable"); });
-      await releaseUnownedDeployHoldAtBoot({ status });
-      expect(status).not.toHaveBeenCalled();
+      const releaseUnownedHold = vi.fn(async (): Promise<{ released: boolean }> => { throw new Error("release unavailable"); });
+      await boot(() => releaseUnownedDeployHoldAtBoot({ releaseUnownedHold }));
+      expect(releaseUnownedHold).not.toHaveBeenCalled();
       setDeployHold();
-      await releaseUnownedDeployHoldAtBoot({ status });
+      await boot(() => releaseUnownedDeployHoldAtBoot({ releaseUnownedHold }));
       expect(isDeployHeld()).toBe(true);
-      expect(error.mock.calls.flat().join(" ")).toContain("status unavailable");
+      expect(error.mock.calls.flat().join(" ")).toContain("release unavailable");
       for (const outcome of ["unreachable", "declined-conflict"] as const) {
         const otherBootSteps = vi.fn(async () => {});
-        const onRegistered = vi.fn(async () => {
-          if (getRestateStatus().registration.state === "registered") {
-            await releaseUnownedDeployHoldAtBoot({ status });
-          }
-          await otherBootSteps();
-        });
+        const onRegistered = vi.fn(() => boot(() => releaseUnownedDeployHoldAtBoot({ releaseUnownedHold }), otherBootSteps));
         const registration = createRestateRegistrationGate(() => false, {
           startRestateEndpoint: async () => {}, registerRestateEndpoint: async () => ({ outcome }), onRegistered,
         });
         try {
-          status.mockClear();
+          releaseUnownedHold.mockClear();
           await registration.attempt();
           expect(onRegistered).toHaveBeenCalledTimes(outcome === "unreachable" ? 1 : 0);
-          expect(otherBootSteps).toHaveBeenCalledTimes(outcome === "unreachable" ? 1 : 0);
-          expect(status).not.toHaveBeenCalled();
+          expect(otherBootSteps).toHaveBeenCalledTimes(outcome === "unreachable" ? 5 : 0);
+          expect(releaseUnownedHold).not.toHaveBeenCalled();
         }
         finally { registration.stopRetrying(); }
         expect(isDeployHeld()).toBe(true);

@@ -41,7 +41,7 @@ import { refreshAvailability, readStampedTarget, resolveDeployTarget, type SelfD
 import { clearDeployHold, getDeployStartedAt, isDeployHeld, setDeployHold } from "./deploy-hold.js";
 import { decideAvailabilityAction, getDeployPolicy, getLastActedCommit, setLastActedCommit } from "./deploy-policy.js";
 import { canSelfDeploy, createRestateDrainProbes, readKgSourceRepo, parseKgSourceRepo, runSelfDeployFlyctl } from "./deploy.js";
-import { createSelfDeploy, createSelfDeployIngressClient, publishedImageManifestHead, type SelfDeployClient } from "./restate/self-deploy.js";
+import { selfDeployRecovery, createSelfDeploy, createSelfDeployIngressClient, publishedImageManifestHead, type SelfDeployClient } from "./restate/self-deploy.js";
 import { getInFlightWork } from "./in-flight-work.js";
 import { remediateStuckJob } from "./stuck-watchdog.js";
 import { finalizeImplementation } from "./implementation-finalize.js";
@@ -4953,16 +4953,34 @@ export function createBootReconciliation(
 
 /** Recover legacy/crashed deploys only after this boot has successfully registered with Restate. */
 export async function releaseUnownedDeployHoldAtBoot(
-  client: Pick<SelfDeployClient, "status"> = selfDeployClient,
+  client: Pick<SelfDeployClient, "releaseUnownedHold"> = selfDeployClient,
 ): Promise<void> {
   if (!isDeployHeld()) return;
   try {
-    const { deploy } = await client.status();
-    if (deploy && ["draining", "applying", "verifying"].includes(deploy.phase)) return;
-    if (clearDeployHold()) console.log("[self-deploy] released an unowned deploy hold at boot");
+    const { released } = await client.releaseUnownedHold();
+    if (released) console.log("[self-deploy] released an unowned deploy hold at boot");
   } catch (err) {
-    console.error("[self-deploy] keeping deploy hold at boot: status could not be read:", err);
+    console.error("[self-deploy] keeping deploy hold at boot: hold ownership could not be checked:", err);
   }
+}
+
+/** Production registration hook; only successful registration may recover the hold. */
+export async function onRestateRegistered(deps: {
+  releaseHold?: () => Promise<void>;
+  sweep: () => void;
+  scrub: () => Promise<void>;
+  seed: () => Promise<void>;
+  refresh: () => Promise<void>;
+  reconcile: () => Promise<void>;
+}): Promise<void> {
+  if (getRestateStatus().registration.state === "registered") {
+    await (deps.releaseHold ?? releaseUnownedDeployHoldAtBoot)();
+  }
+  deps.sweep();
+  await deps.scrub();
+  await deps.seed();
+  await deps.refresh();
+  await deps.reconcile();
 }
 
 /** How often a declined registration retries (AII-721) — the old deployment's non-completed invocations are expected to drain on their own; this just keeps checking back. */
@@ -5230,7 +5248,7 @@ async function main(): Promise<void> {
   }).services;
   const lateExternalReviewServices = createProductionLateExternalReviewServices(config).services;
   const trackerExportServices = createProductionTrackerExportServices().services;
-  const selfDeployServices = [createSelfDeploy({
+  const selfDeployServices = [selfDeployRecovery, createSelfDeploy({
     config: () => ({
       flyDeployToken: config.flyDeployToken ?? undefined,
       flyOrchestratorApp: config.flyOrchestratorApp ?? undefined,
@@ -5266,16 +5284,13 @@ async function main(): Promise<void> {
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
     startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, ...trackerExportServices, ...selfDeployServices], restateSidecar.identityKey),
     registerRestateEndpoint,
-    onRegistered: async () => {
-      if (getRestateStatus().registration.state === "registered") {
-        await releaseUnownedDeployHoldAtBoot();
-      }
-      sweepOnRegistered(config);
-      await scrubOperatorLegacyTokens();
-      await seedRunnerBackends();
-      await refreshRunnerBackendCache();
-      await bootReconciliation.onRegistered();
-    },
+    onRegistered: () => onRestateRegistered({
+      sweep: () => sweepOnRegistered(config),
+      scrub: async () => { await scrubOperatorLegacyTokens(); },
+      seed: seedRunnerBackends,
+      refresh: refreshRunnerBackendCache,
+      reconcile: () => bootReconciliation.onRegistered(),
+    }),
   });
   // A sidecar which becomes ready after its initial timeout still registers the
   // same fully composed service set; the gate starts the endpoint only once.
