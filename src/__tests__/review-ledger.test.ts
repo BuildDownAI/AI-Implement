@@ -2175,7 +2175,7 @@ describe("collectClosedReviewThreadCommentUrls", () => {
   const thread = (isResolved: boolean, isOutdated: boolean, urls: string[]) => ({
     isResolved,
     isOutdated,
-    comments: { nodes: urls.map((url) => ({ url })) },
+    comments: { pageInfo: { hasNextPage: false }, nodes: urls.map((url) => ({ url })) },
   });
 
   it("collects every comment URL on resolved or outdated threads and skips open ones", () => {
@@ -2190,6 +2190,26 @@ describe("collectClosedReviewThreadCommentUrls", () => {
         ? page([thread(true, false, ["p2"])])
         : page([thread(true, false, ["p1"])], true, "c1");
     expect(collectClosedReviewThreadCommentUrls(spawn, "42")).toEqual(new Set(["p1", "p2"]));
+  });
+
+  it.each([
+    { nodes: [] },
+    { nodes: [], pageInfo: { hasNextPage: null } },
+    { nodes: [null], pageInfo: { hasNextPage: false } },
+    { nodes: [{ isResolved: true, isOutdated: false, comments: { nodes: [] } }], pageInfo: { hasNextPage: false } },
+    { nodes: [{ isResolved: true, isOutdated: false, comments: { nodes: [], pageInfo: { hasNextPage: true } } }], pageInfo: { hasNextPage: false } },
+  ])("rejects incomplete thread snapshots: %j", (reviewThreads) => {
+    expect(collectClosedReviewThreadCommentUrls(() => ({
+      exitCode: 0,
+      stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads } } } }),
+    }), "42")).toBeUndefined();
+  });
+
+  it("rejects partial GraphQL data and repeated pagination cursors", () => {
+    const partial = JSON.parse(page([]).stdout);
+    partial.errors = [{ message: "Partial data" }];
+    expect(collectClosedReviewThreadCommentUrls(() => ({ exitCode: 0, stdout: JSON.stringify(partial) }), "42")).toBeUndefined();
+    expect(collectClosedReviewThreadCommentUrls(() => page([], true, "same"), "42")).toBeUndefined();
   });
 
   it("returns undefined when the read fails, errors, or cannot page on", () => {
