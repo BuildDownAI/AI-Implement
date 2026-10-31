@@ -1,0 +1,17 @@
+[
+  {
+    "findingKey": "5edecf92285aa5f517b3686e3841b880d5b41d2e2d39541ba893722cd09b98af",
+    "disposition": "fixed",
+    "reason": "Updated the tool description and MCP contract documentation to describe the immediate shared-status response and the retained start race fallback."
+  },
+  {
+    "findingKey": "3919f3e0c60a7379dd0b704231487928698a352dfd8aa92eaefd7905ee6bfa82",
+    "disposition": "fixed",
+    "reason": "Exported and reused the SelfDeploy active-phase predicate in start_deploy to keep both paths consistent."
+  },
+  {
+    "findingKey": "3c0a62adf2534350137e99bf9a2d0049c2c3d2e9c0a44aa01772dfc7b9666ee3",
+    "disposition": "follow-up",
+    "reason": "Requests the same status pre-check for the separate admin Trigger Deploy route; AII-1638 requires this behavior only for start_deploy."
+  }
+]

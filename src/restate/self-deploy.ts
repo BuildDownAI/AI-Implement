@@ -62,7 +62,7 @@ export type SelfDeployStartResult = { deployId: string; commit: string; image: s
   | { reason: "not-configured" | "head-unknown" | "image-not-published" };
 const requester = z.string().min(1).max(200);
 const startSchema = z.object({ branch: z.enum(["testing", "main"]), requestedBy: requester }).strict();
-const active = (r: SelfDeployRecord | null): r is SelfDeployRecord => r !== null && ["draining", "applying", "verifying"].includes(r.phase);
+export const isActiveSelfDeploy = (r: SelfDeployRecord | null): r is SelfDeployRecord => r !== null && ["draining", "applying", "verifying"].includes(r.phase);
 const read = (ctx: restate.ObjectSharedContext) => ctx.get<SelfDeployRecord>("deploy");
 const readOptions = async (ctx: restate.ObjectSharedContext): Promise<SelfDeployOptions> => ({ ...DEFAULT_OPTIONS, ...await ctx.get<SelfDeployOptions>("options") });
 
@@ -104,7 +104,7 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
   }
   async function start(ctx: restate.ObjectContext, input: z.infer<typeof startSchema>): Promise<SelfDeployStartResult> {
     const existing = await read(ctx);
-    if (active(existing)) return { deployId: existing.deployId, commit: existing.target.commit, image: existing.target.image, alreadyActive: true };
+    if (isActiveSelfDeploy(existing)) return { deployId: existing.deployId, commit: existing.target.commit, image: existing.target.image, alreadyActive: true };
     const found = await ctx.run("find target", async (): Promise<SelfDeployRecord["target"] | { reason: "not-configured" | "head-unknown" | "image-not-published" }> => {
       const config = deps.config();
       if (!config.flyDeployToken || !config.flyOrchestratorApp || !config.selfDeployTarget) return { reason: "not-configured" };
@@ -201,13 +201,13 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
   }
   async function cancel(ctx: restate.ObjectContext, _input: { requestedBy: string }) {
     const record = await read(ctx);
-    if (!active(record)) return { cancelled: false, reason: "no-active-deploy" };
+    if (!isActiveSelfDeploy(record)) return { cancelled: false, reason: "no-active-deploy" };
     if (record.phase !== "draining") return { cancelled: false, reason: "too-late" };
     await finish(ctx, record, "cancelled");
     return { cancelled: true };
   }
   async function releaseUnownedHold(ctx: restate.ObjectContext) {
-    if (active(await read(ctx))) return { released: false };
+    if (isActiveSelfDeploy(await read(ctx))) return { released: false };
     await ctx.run("clear unowned hold", () => deps.setHold(false));
     return { released: true };
   }
