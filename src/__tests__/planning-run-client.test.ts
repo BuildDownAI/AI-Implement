@@ -1,3 +1,4 @@
+import { ownedRunReportFingerprint } from "../restate/owned-run-report-fingerprint.js";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type * as LogModule from "../log.js";
 import type * as DispatchAdmissionModule from "../dispatch-admission.js";
@@ -7,7 +8,7 @@ import type * as ClientModule from "../restate/planning-run-client.js";
 import type { RecordedUsage } from "../agent-usage.js";
 import { FakeProvider } from "./providers/fake.js";
 import { createPlanningRunWorkflow, type PlanningRunInput } from "../restate/planning-run-workflow.js";
-import { fakeFetch, hangUntilAborted } from "./helpers/fake-fetch.js";
+import { fakeFetch, hangUntilAborted, type FetchCall, type ReplyInit } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
 
 const SECRET = "test-secret-with-enough-entropy-for-hmac";
@@ -63,7 +64,7 @@ function plantPlanningDispatch(owner: DispatchAdmissionModule.LifecycleOwner): {
 describe("PlanningRun report sender", () => {
   it("contract: PlanningRun.report — the hook's request is one the real handler accepts", async () => {
     const { token, dispatchId } = plantPlanningDispatch({ kind: "restate", attemptId: "attempt-1" });
-    const ingress = fakeFetch({ [`POST /PlanningRun/${dispatchId}/report`]: [{ status: 200, text: "" }] });
+    const ingress = fakeFetch({ [`POST /PlanningRun/${dispatchId}/report`]: [({ body }: FetchCall): ReplyInit => ({ status: 200, json: { status: "accepted", fingerprint: ownedRunReportFingerprint(JSON.parse(body)) } })] });
     const legacy = vi.fn(async () => {});
     const hook = client.createPlanningAdmissionTerminationHook({
       ingress: client.createPlanningRunIngressClient(INGRESS, { fetchImpl: ingress.fetch }),
@@ -85,12 +86,20 @@ describe("PlanningRun report sender", () => {
     expect(ingress.calls).toHaveLength(1);
     expect(ingress.calls[0].url.href).toBe(`${INGRESS}/${workflow.name}/${dispatchId}/report`);
     expect(ingress.calls[0].method).toBe("POST");
-    expect(ingress.calls[0].body).toBe("");
+    expect(JSON.parse(ingress.calls[0].body!)).toMatchObject({ usage: { records: [] } });
+  });
+
+  it("refuses an unverifiable cached acknowledgement for usage", async () => {
+    const ingress = fakeFetch({ "POST /PlanningRun/d-1/report": [{ status: 200, json: { status: "accepted" } }] });
+    const sender = client.createPlanningRunIngressClient(INGRESS, { fetchImpl: ingress.fetch });
+    expect(await sender.report("d-1", {
+      usage: { records: [], attribution: null, pushedCommits: null, listWhole: false, timedOut: false },
+    })).toEqual({ status: "unavailable" });
   });
 
   it("forwards supplied usage through the SDK as the report body", async () => {
     const { dispatchId } = plantPlanningDispatch({ kind: "restate", attemptId: "attempt-1" });
-    const ingress = fakeFetch({ [`POST /PlanningRun/${dispatchId}/report`]: [{ status: 200, json: { status: "accepted" } }] });
+    const ingress = fakeFetch({ [`POST /PlanningRun/${dispatchId}/report`]: [({ body }: FetchCall): ReplyInit => ({ status: 200, json: { status: "accepted", fingerprint: ownedRunReportFingerprint(JSON.parse(body)) } })] });
     const hook = client.createPlanningAdmissionTerminationHook({
       ingress: client.createPlanningRunIngressClient(INGRESS, { fetchImpl: ingress.fetch }),
       legacy: vi.fn(async () => {}),
@@ -147,7 +156,7 @@ describe("PlanningRun report sender", () => {
       legacy: vi.fn(async () => {}),
     });
 
-    await expect(hook(dispatchId)).resolves.toBeUndefined();
+    await expect(hook(dispatchId)).resolves.toEqual({ status: "unavailable" });
     expect(warn).toHaveBeenCalledTimes(1);
     expect(String(warn.mock.calls[0][0])).toContain(dispatchId);
   });

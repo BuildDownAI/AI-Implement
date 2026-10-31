@@ -134,9 +134,9 @@ export function registerOwnedRunContract(
       const run = begin(label, { faults: {}, totalMs: LONG_MS });
       await waitForStep(run.read, "waiting");
       if (!run.report || !run.acceptedCount) throw new Error("scenario 6 requires report and acceptedCount");
-      expect(await run.report({ usage: { tokens: 12, cost: 1 }, items: [1, 2] })).toEqual({ status: "accepted" });
+      expect(await run.report({ usage: { tokens: 12, cost: 1 }, items: [1, 2] })).toMatchObject({ status: "accepted" });
       await run.done;
-      expect(await run.report({ items: [1, 2], usage: { cost: 1, tokens: 12 } })).toEqual({ status: "duplicate" });
+      expect(await run.report({ items: [1, 2], usage: { cost: 1, tokens: 12 } })).toMatchObject({ status: "duplicate" });
       await expect(run.report({ usage: { tokens: 13, cost: 1 }, items: [1, 2] })).rejects.toThrow(/409/);
       expect(run.acceptedCount()).toBe(1);
     }, 30_000);

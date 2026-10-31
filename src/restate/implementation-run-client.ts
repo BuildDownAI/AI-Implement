@@ -5,6 +5,7 @@
  * carries optional model usage: the callback keeps writing the outcome to SQLite and the workflow reads the row.
  * Sibling of `planning-run-client.ts`.
  */
+import { ownedRunReportFingerprint } from "./owned-run-report-fingerprint.js";
 import type { RecordedUsage } from "../agent-usage.js";
 import * as restateClients from "@restatedev/restate-sdk-clients";
 import { read as readAdmission, type DispatchAdmissionRecord } from "../dispatch-admission.js";
@@ -21,7 +22,7 @@ export interface ImplementationRunIngressClient {
   /** Starts the workflow keyed by `dispatchId`; the workflow key is the idempotency (Restate rejects an idempotency key on a workflow handler with HTTP 400). */
   submit(dispatchId: string, input: ImplementationRunInput): Promise<ImplementationIngressResult>;
   /** Resolves the workflow's `report` promise. */
-  report(dispatchId: string, body?: { usage?: RecordedUsage }): Promise<ImplementationIngressResult>;
+  report(dispatchId: string, body?: { usage?: RecordedUsage }, opts?: { idempotencyKey: string }): Promise<ImplementationIngressResult>;
 }
 
 export interface ImplementationRunIngressClientDeps {
@@ -40,9 +41,11 @@ export function createImplementationRunIngressClient(
   const timeout = deps.timeoutMs ?? INGRESS_TIMEOUT_MS;
   const workflow = (dispatchId: string) => ingress.workflowClient<ImplementationRunDefinition>({ name: "ImplementationRun" }, dispatchId);
 
-  async function invoke(call: () => PromiseLike<unknown>): Promise<ImplementationIngressResult> {
+  async function invoke(call: () => PromiseLike<unknown>, body?: { usage?: RecordedUsage }): Promise<ImplementationIngressResult> {
     try {
-      await call();
+      const result = await call() as { fingerprint?: string } | undefined;
+      if (body?.usage && !result?.fingerprint) return { status: "unavailable" };
+      if (result?.fingerprint && result.fingerprint !== ownedRunReportFingerprint(body ?? {})) return { status: "conflict" };
       return { status: "accepted" };
     } catch (err) {
       if (err instanceof restateClients.HttpCallError) {
@@ -58,7 +61,7 @@ export function createImplementationRunIngressClient(
       invoke(() => workflow(dispatchId).workflowSubmit(input, restateClients.rpc.sendOpts({ timeout }))),
     // The SDK RemoveVoidArgument type cannot represent an optional JSON input. The handler
     // accepts undefined at runtime; preserve it so existing callers send an empty HTTP body.
-    report: (dispatchId, body) => invoke(() => workflow(dispatchId).report(body!, restateClients.rpc.opts({ timeout }))),
+    report: (dispatchId, body, opts) => invoke(() => workflow(dispatchId).report(body!, restateClients.rpc.opts({ timeout, ...(opts ? { idempotencyKey: opts.idempotencyKey } : {}) })), body),
   };
 }
 
@@ -73,22 +76,23 @@ export interface ImplementationAdmissionTerminationHookDeps {
 /**
  * Has the signature of `checkImplementationAdmissionTermination`. A Restate-owned reservation gets a
  * `report` to its workflow (the workflow key is the dispatch id); anything else is Legacy-owned and left to the monitors.
- * One attempt, no retry: the workflow still finds the end of the run on its own tick.
+ * Returns the ingress outcome to the callback so an unavailable report can be retried.
  */
 export function createImplementationAdmissionTerminationHook(
   deps: ImplementationAdmissionTerminationHookDeps,
-): (dispatchId: string, usage?: RecordedUsage) => Promise<void> {
+): (dispatchId: string, usage?: RecordedUsage) => Promise<void | ImplementationIngressResult> {
   const lookup = deps.readAdmission ?? readAdmission;
   return async (dispatchId, usage) => {
     if (lookup(dispatchId)?.lifecycleOwner.kind !== "restate") {
       await deps.legacy(dispatchId);
       return;
     }
-    const result = await (usage ? deps.ingress.report(dispatchId, { usage }) : deps.ingress.report(dispatchId));
+    const result = await (usage ? deps.ingress.report(dispatchId, { usage }, { idempotencyKey: dispatchId }) : deps.ingress.report(dispatchId));
     if (result.status === "accepted") {
       console.log(`[implementation-run] report sent dispatch=${dispatchId}`);
     } else {
       console.warn(`[implementation-run] report not accepted dispatch=${dispatchId} status=${result.status}`);
     }
+    return result;
   };
 }

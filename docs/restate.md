@@ -426,12 +426,14 @@ A run kind's services live in `src/restate/<kind>-workflow.ts` and `src/restate/
 
 ### Journal projections
 
+For runner results, [ADR 046](adr/046-an-owned-run-takes-its-result-through-one-kit-intake.md) defines the check-only credential and workflow-owned accounting handoff. Legacy callbacks retain direct accounting until their dispatch paths are removed.
+
 A run kind writes its SQLite row from the journal. The rule: a value is a journaled step result unless it is a credential. Four steps, in this order:
 
 1. **`resolve` journals the record.** It computes the row's values (issue id, phase, repo, backend) from config and the environment and does no I/O to the store. Its result is the record.
-2. **A `record-*` step projects a journaled value.** It writes the journaled record or result to the store and reads nothing else, so it is idempotent on the dispatch id and a replay repeats it harmlessly. `reserve` projects the `resolve` record; `record-dispatch-N` projects the dispatch result (machine id, logs URL, run id); `record-reconcile-N` projects a run a reconcile read found. A read (`reconcile-N`, `watch-N`) writes nothing.
+2. **A `record-*` step projects a journaled value.** It writes the journaled record or result to the store and reads nothing else, so it is idempotent on the dispatch id and a replay repeats it harmlessly. `reserve` projects the `resolve` record; `record-dispatch-N` projects the dispatch result (machine id, logs URL, run id); `record-reconcile-N` projects a run a reconcile read found. `record-usage` projects sanitized model invocations from the accepted report through the kit intake. A read (`reconcile-N`, `watch-N`) writes nothing.
 3. **A credential is produced and written inside one step and never returned.** A run token (`mintRunTokens` inside `dispatch-N`) or a machine nonce (derived from the token secret, the dispatch id, and the attempt in `nonce-N`) is not a step result, because a step result is journaled. The step that hands it to a backend derives it again inside its own function. Derivation, not a stored random value, lets a later step get the same credential from journaled inputs.
-4. **Step names.** `resolve`, `reserve`, `envelope`, `nonce-N`, `dispatch-N`, `record-dispatch-N`, `record-reconcile-N`, `close-row`, `persist`, with `-N` for an attempt-scoped step (`N` is the attempt, or the reconcile index for `record-reconcile-N`). `close-row` and `persist` project the terminal outcome the workflow derived from journaled results. `envelope` journals the run's `RunConfigV1`, built by a pure builder with no token, and every dispatch retry sends that same envelope.
+4. **Step names.** `resolve`, `reserve`, `envelope`, `nonce-N`, `dispatch-N`, `record-dispatch-N`, `record-reconcile-N`, `record-usage`, `close-row`, `persist`, with `-N` for an attempt-scoped step (`N` is the attempt, or the reconcile index for `record-reconcile-N`). `close-row` and `persist` project the terminal outcome the workflow derived from journaled results. `envelope` journals the run's `RunConfigV1`, built by a pure builder with no token, and every dispatch retry sends that same envelope.
 
 The kg-refresh workflow is the worked example (`src/restate/kg-refresh-workflow.ts`); [restate-testing.md](restate-testing.md) § "Testing a journal projection (two tiers)" is the matching test recipe.
 
@@ -547,7 +549,7 @@ The failure branch of the planning callback also calls the termination hook, so 
 
 - **One workflow per attempt** ([ADR 044](adr/044-one-implementationrun-per-attempt.md)). At its deadline it stops the run and calls the bounded stuck cleanup; the next poll starts a new attempt under a new dispatch id.
 - **The deadline is the job timeout** ([ADR 045](adr/045-implementationrun-deadline-from-the-job-timeout.md)): `input.maxJobMinutes`, normalized by the caller at dispatch, plus the 10-minute stop margin after the stop. The bootstrap deadline is 10 minutes.
-- **`report` has no payload.** The callback writes the outcome to SQLite; `finish-job` (`finishImplementationJob`, `src/restate/implementation-run-finish.ts`) reads the `dispatch_log` row and does what the callback did not, through `finalizeImplementation`. The sender is `src/restate/implementation-run-client.ts`.
+- **`report` carries optional model usage.** The callback writes the outcome to SQLite; `finish-job` (`finishImplementationJob`, `src/restate/implementation-run-finish.ts`) reads the `dispatch_log` row and does what the callback did not, through `finalizeImplementation`. The sender is `src/restate/implementation-run-client.ts`.
 
 ### Handlers
 

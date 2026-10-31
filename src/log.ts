@@ -278,6 +278,9 @@ function ensureLogColumns(): void {
   if (!names.has("failure_json")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN failure_json TEXT");
   }
+  if (!names.has("callback_lifecycle_completed_at")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN callback_lifecycle_completed_at INTEGER");
+  }
   if (!names.has("failure_commented_at")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN failure_commented_at INTEGER");
   }
@@ -1273,6 +1276,19 @@ export function parseFailureJson(raw: string | null): FailureRecord | null {
   } catch {
     return null;
   }
+}
+
+/** Callback lifecycle completion is independent of the owning workflow closing the job. */
+export function hasCompletedCallbackLifecycle(dispatchId: string): boolean {
+  return getDb().prepare(
+    "SELECT 1 FROM dispatch_log WHERE dispatch_id = ? AND callback_lifecycle_completed_at IS NOT NULL",
+  ).get(dispatchId) !== undefined;
+}
+
+export function markCallbackLifecycleCompleted(dispatchId: string): void {
+  getDb().prepare(
+    "UPDATE dispatch_log SET callback_lifecycle_completed_at = COALESCE(callback_lifecycle_completed_at, ?) WHERE dispatch_id = ?",
+  ).run(Date.now(), dispatchId);
 }
 
 /** Persists the structured terminal failure reported by the runner callback. */

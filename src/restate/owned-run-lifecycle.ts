@@ -92,7 +92,7 @@ export async function reportOwnedRunOutcome(ctx: WorkflowContext, outcome: () =>
 }
 
 /** The first accepted value wins. The same value again is a duplicate; a different value is a conflict. */
-export type OwnedRunReportResult = { status: "accepted" | "duplicate" };
+export type OwnedRunReportResult = { status: "accepted" | "duplicate"; fingerprint?: string };
 
 // Sort object keys recursively; array order remains significant. Values must be plain JSON.
 function canonicalJson(value: unknown): string {

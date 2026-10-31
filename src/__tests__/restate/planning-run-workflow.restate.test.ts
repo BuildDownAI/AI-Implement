@@ -228,10 +228,10 @@ describe("PlanningRun durable workflow", () => {
     const id = appendLog({ dispatchId: w.dispatchId, issueId: "usage-issue", phase: "planning" });
     const usage = seedUsage(w.dispatchId);
     w.sc.status = "ended";
-    expect(await w.report(usage)).toEqual({ status: "accepted" });
+    expect(await w.report(usage)).toMatchObject({ status: "accepted" });
     const first = storedRows(w.dispatchId);
     expect(first).toHaveLength(2);
-    expect(await w.report(usage)).toEqual({ status: "duplicate" });
+    expect(await w.report(usage)).toMatchObject({ status: "duplicate" });
     expect(storedRows(w.dispatchId)).toEqual(first);
     w.sc.status = "ended";
     await w.done;
@@ -251,7 +251,7 @@ describe("PlanningRun durable workflow", () => {
     await waitForStep(w.read, "wait");
     const response = await fetch(`${baseUrl(slow, label)}/PlanningRun/${w.dispatchId}/report`, { method: "POST" });
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ status: "accepted" });
+    expect(await response.json()).toMatchObject({ status: "accepted" });
     w.sc.status = "ended";
     await w.done;
   });

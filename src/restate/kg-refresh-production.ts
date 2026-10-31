@@ -4,6 +4,7 @@
  * `review-fix-production.ts` and `review-fix-client.ts`. `src/index.ts` composes and registers
  * the services; this file is the allowed SDK boundary where the orchestrator's existing
  * kg-refresh closures become Restate services. */
+import { ownedRunReportFingerprint } from "./owned-run-report-fingerprint.js";
 import { createHmac } from "node:crypto";
 import * as restateClients from "@restatedev/restate-sdk-clients";
 import { getMappings } from "../config.js";
@@ -591,8 +592,13 @@ export function createKgRefreshIngressClient(
   }
 
   return {
-    report: (triggerId, body, opts) =>
-      invoke<{ status: "accepted" | "duplicate" }>(() => refresh(triggerId).report(body, callOpts(opts?.idempotencyKey)), { notFound: true, conflict: true }),
+    report: async (triggerId, body, opts): Promise<KgIngressResult<{ status: "accepted" | "duplicate" }>> => {
+      const result = await invoke<{ status: "accepted" | "duplicate"; fingerprint?: string }>(() => refresh(triggerId).report(body, callOpts(opts?.idempotencyKey)), { notFound: true, conflict: true });
+      if (result.status === "accepted" && body.usage && !result.value?.fingerprint) return { status: "unavailable" };
+      if (result.status === "accepted" && result.value?.fingerprint &&
+          result.value.fingerprint !== ownedRunReportFingerprint(body)) return { status: "conflict" };
+      return result;
+    },
     progress: (triggerId, step) => invoke(() => refresh(triggerId).progress(step ? { step } : {}, callOpts()), { notFound: true }),
     cancel: (triggerId, reason) => invoke(() => refresh(triggerId).cancel({ reason }, callOpts()), { notFound: true, conflict: true, conflictText: true }),
     status: (triggerId) => invoke<KgRefreshStatusResult>(() => refresh(triggerId).status(callOpts()), { notFound: true }),

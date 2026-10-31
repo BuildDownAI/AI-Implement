@@ -9,6 +9,7 @@
  * `finally` release. Contract: ADR 034 / ADR 035, `docs/restate.md` § "The owned-run wait".
  * No production path calls it yet; a later change supplies the real deps and registers it.
  */
+import { ownedRunReportFingerprint } from "./owned-run-report-fingerprint.js";
 import * as restate from "@restatedev/restate-sdk";
 import type { WorkflowContext, WorkflowSharedContext } from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
@@ -406,12 +407,13 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
     }
   }
 
-  async function report(ctx: WorkflowSharedContext, body?: { usage?: RecordedUsage }) {
+  async function report(ctx: WorkflowSharedContext, body?: { usage?: RecordedUsage }): Promise<OwnedRunReportResult> {
     await requireStarted(ctx);
     // Producer: handleRunnerResult in src/runner-callback.ts, through createPlanningAdmissionTerminationHook.
     // The promise resolves with a body: awaitOwnedRun reads `undefined` as "not resolved".
-    return acceptOwnedRunReport(ctx, "report", { ok: true, ...(body?.usage ? { usage: body.usage } : {}) },
+    const result = await acceptOwnedRunReport(ctx, "report", { ok: true, ...(body?.usage ? { usage: body.usage } : {}) },
       (value) => value.usage && recordUsage(ctx.key, value.usage));
+    return { ...result, fingerprint: ownedRunReportFingerprint(body ?? {}) };
   }
 
   async function status(ctx: WorkflowSharedContext): Promise<PlanningRunStatusResult> {
