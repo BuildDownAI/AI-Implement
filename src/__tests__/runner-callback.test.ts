@@ -5674,7 +5674,7 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
     ...over,
   });
 
-  async function deliver(attribution: unknown, opts: { snapshot?: boolean; extra?: Record<string, unknown> } = {}) {
+  async function deliver(attribution: unknown, opts: { snapshot?: boolean; extra?: Record<string, unknown>; dispatchId?: string } = {}) {
     const dispatchId = opts.dispatchId ?? "disp-attr";
     const { token } = runnerTokens.mintRunToken({
       issueId: "i", mappingTeamKey: "ENG", phase: "implementation",

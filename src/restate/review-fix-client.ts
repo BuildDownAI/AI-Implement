@@ -76,7 +76,15 @@ export function createReviewFixIngressClient(
           .result(result, rpc);
         // Ingress can return the first response for this dispatch even when the body changes.
         if (!outcome.fingerprint) return { status: "unavailable" };
-        if (outcome.fingerprint !== ownedRunReportFingerprint(result)) return { status: "conflict" };
+        if (outcome.fingerprint !== ownedRunReportFingerprint(result)) {
+          // The dispatch key has already acknowledged another body. Bypass its cached
+          // response so the owner durably records the conflict and revokes authority.
+          // Await completion: transport failures must remain retryable by the runner.
+          await ingress
+            .workflowClient<ReviewFixAttemptDefinition>({ name: "ReviewFixAttempt" }, attemptId)
+            .result(result, restateClients.rpc.opts({ timeout }));
+          return { status: "conflict" };
+        }
         const { fingerprint: _fingerprint, ...intake } = outcome;
         return { status: "accepted", outcome: intake as ResultIntakeOutcome };
       } catch (err) {

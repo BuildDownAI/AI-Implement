@@ -49,7 +49,7 @@ and handler types that the typed clients use are in `src/restate/kg-refresh-type
 
 The kit is `src/restate/owned-run-lifecycle.ts`; the shared suite is `src/__tests__/restate/owned-run-contract.ts`. All four runner workflows call `acceptOwnedRunReport` from their shared result handler, recording usage in `record-usage` before resolving the report promise (ADR 036). The authenticated callback checks the token without consuming it and forwards sanitized usage with a dispatch-scoped idempotency key; it does not write usage for Restate-owned runs. KgRefresh excludes scenarios 2–5 for the lifecycle reasons documented in ADR 036.
 
-Every owned-run result uses the authenticated dispatch id as its forwarding idempotency key, including ReviewFixAttempt. Identical retries reuse the cached acknowledgement, including after admission release. The review-fix client compares the returned result fingerprint with the forwarded metadata and usage, rejecting changed bodies even when ingress returns a cached acknowledgement.
+Every owned-run result uses the authenticated dispatch id as its forwarding idempotency key, including ReviewFixAttempt. Identical retries reuse the cached acknowledgement, including after admission release. The review-fix client compares the returned result fingerprint with the forwarded metadata and usage, detecting changed bodies even when ingress returns a cached acknowledgement. On a mismatch it awaits a fresh, unkeyed result invocation so the owning workflow persists metadata conflicts and revokes approval authority before the callback returns 409; a transport failure remains retryable.
 
 ## 2. Feature matrix
 

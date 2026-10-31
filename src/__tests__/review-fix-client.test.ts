@@ -158,7 +158,22 @@ describe("createReviewFixIngressClient (AII-1184)", () => {
       expect(await client.result("att-1", body, opts)).toEqual({ status: "accepted", outcome: stored });
       expect(await client.result("att-1", { ...body, outputCommit: "b".repeat(40) }, opts)).toEqual({ status: "conflict" });
       expect(await client.result("att-1", { ...body, usage: toRecordedUsage({ invocations: [] }) }, opts)).toEqual({ status: "conflict" });
-      expect(fake.calls.every((call) => call.headers.get("idempotency-key") === "dispatch-1")).toBe(true);
+      expect(fake.calls.map((call) => call.headers.get("idempotency-key")))
+        .toEqual(["dispatch-1", "dispatch-1", null, "dispatch-1", null]);
+      expect(JSON.parse(fake.calls[2]!.body)).toEqual({ ...body, outputCommit: "b".repeat(40) });
+      expect(JSON.parse(fake.calls[4]!.body)).toEqual({ ...body, usage: toRecordedUsage({ invocations: [] }) });
+    });
+
+    it("keeps conflict persistence failures retryable", async () => {
+      const changed = { ...result, outputCommit: "b".repeat(40) };
+      const fake = fakeFetch({ "POST /ReviewFixAttempt/att-1/result": [
+        { json: { ...stored, fingerprint: ownedRunReportFingerprint(result) } },
+        { status: 503, text: "unavailable" },
+      ] });
+      expect(await ingressFor(fake).result("att-1", changed, { idempotencyKey: "dispatch-1" }))
+        .toEqual({ status: "unavailable" });
+      expect(fake.calls).toHaveLength(2);
+      expect(fake.calls[1]!.headers.get("idempotency-key")).toBeNull();
     });
 
     it("fails closed when the acknowledgement has no fingerprint", async () => {

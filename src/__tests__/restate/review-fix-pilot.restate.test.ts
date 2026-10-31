@@ -823,8 +823,8 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect(fixture.commentPosts).toBe(1);
   }, 25_000);
 
-  it("authenticated result callback forwards over the ingress keyed by dispatch id, writes only through store-result, classifies retries/conflicts, and never approves", async () => {
-    const env = envFor("alwaysReplay");
+  it.each(VARIANTS.map(([label]) => label))("authenticated result callback persists conflicts through dispatch-keyed ingress and prevents approval (%s)", async (label) => {
+    const env = envFor(label);
     const fixture = freshScenario("result-ingress");
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
     await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
@@ -869,12 +869,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect(await intake(resultOf(fixture, prepared, { outputCommit: sha("callback-conflict") })))
       .toMatchObject({ status: 409, body: { outcome: "conflict" } });
     expect(legacyProviderLookups).toBe(0);
-    // A cached response refuses the changed body without entering the handler.
-    expect(rowOf().result_conflict_at).toBeNull();
-    // A fresh invocation still exercises the handler's durable conflict/revocation path.
-    expect(await callWorkflow<ResultIntakeOutcome>(env.baseUrl(), "ReviewFixAttempt", attemptId, "result",
-      resultOf(fixture, prepared, { outputCommit: sha("callback-conflict") })))
-      .toMatchObject({ status: "conflict" });
+    // The production forwarding path persists the conflict before answering 409.
     expect(rowOf().result_conflict_at).not.toBeNull();
 
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: fixture.runAttempt };
