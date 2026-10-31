@@ -1729,8 +1729,18 @@ describe("KgRefresh durable workflow", () => {
               // Preserve the contract's reordered delivery through the KG-specific mapping,
               // including nested usage objects, without changing array order.
               const reordered = Object.keys(value as object)[0] === "items";
-              return callWorkflow<{ status: "accepted" | "duplicate" }>(url, "KgRefresh", key, "report",
+              const result = await callWorkflow<{ status: "accepted" | "duplicate" }>(url, "KgRefresh", key, "report",
                 reordered ? reverseObjectKeys(body) : body);
+              if (result.status === "duplicate") {
+                // Row uniqueness alone could hide a second usage write. Inspect the real
+                // shared-handler journals to prove intake journaled the effect only once.
+                const reports = await queryInvocations(envFor(label).adminAPIBaseUrl(),
+                  `target_service_name = 'KgRefresh' AND target_service_key = '${key}' AND target_handler_name = 'report'`);
+                const steps = (await Promise.all(reports.map((row) =>
+                  journalEntryNames(envFor(label).adminAPIBaseUrl(), String(row.id))))).flat();
+                expect(steps.filter((step) => step === "record-usage")).toHaveLength(1);
+              }
+              return result;
             },
             acceptedCount: () => storedRows(key).length,
           };

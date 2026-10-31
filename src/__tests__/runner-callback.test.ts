@@ -4723,7 +4723,7 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
     });
 
     expect(res.status).toBe(200);
-    expect(onReviewFixResult).toHaveBeenCalledWith({ ...validReviewFix, usage: expect.any(Object) });
+    expect(onReviewFixResult).toHaveBeenCalledWith({ ...validReviewFix, usage: expect.any(Object) }, { idempotencyKey: validReviewFix.attemptId });
     expect(fake.getPhase("i")).toBeUndefined();
     expect(fake.recordedCalls()).toEqual([]);
     expect(stampApprovedSpy).not.toHaveBeenCalled();
@@ -5775,7 +5775,9 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
     expect(await c.deliver()).toMatchObject({status: 200, body: {outcome: "duplicate"}});
     expect(rows()).toHaveLength(0);
     await c.store.releaseOwner(c.attemptId, "finalized");
-    expect((await c.deliver()).status).toBe(401);
+    // This store-only seam has no transport idempotency cache: authentication
+    // succeeds after release, then the store rejects the stale result.
+    expect(await c.deliver()).toMatchObject({ status: 410, body: { outcome: "stale" } });
     expect(rows()).toHaveLength(0);
   });
 
@@ -6091,7 +6093,7 @@ describe("owned result accounting boundary", () => {
       expect(result.status).toBe(200);
       expect(record).not.toHaveBeenCalled();
       expect(consume).not.toHaveBeenCalled();
-      if (kind === "review-fix") expect(review).toHaveBeenCalledWith(expect.objectContaining({ usage: expect.objectContaining({ listWhole: true }) }));
+      if (kind === "review-fix") expect(review).toHaveBeenCalledWith(expect.objectContaining({ usage: expect.objectContaining({ listWhole: true }) }), { idempotencyKey: "boundary-attempt" });
       else expect(report).toHaveBeenCalledTimes(1);
     },
   );

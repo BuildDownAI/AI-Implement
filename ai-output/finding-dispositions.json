@@ -1,0 +1,7 @@
+[
+  {
+    "findingKey": "379c5d6c376f58b407aa4cee64249ac3eb8856811e7a262abdaf23d28ae5f3f9",
+    "disposition": "fixed",
+    "reason": "Restored the callback attribution helper dispatchId option, which its implementation and callers require, so the test TypeScript configuration can compile."
+  }
+]

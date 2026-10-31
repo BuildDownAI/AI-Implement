@@ -41,13 +41,15 @@ and handler types that the typed clients use are in `src/restate/kg-refresh-type
 
 | Run kind | Lifecycle kit use | Contract suite | Result intake |
 |---|---|---|---|
-| `PlanningRun` | reserve, status/bounded read, cleanup, outcome | scenarios 1–5; 6 pending | deferred |
-| `ImplementationRun` | reserve, status/bounded read, cleanup, outcome | scenarios 1–5; 6 pending | deferred |
-| `KgRefresh` | bounded read | scenario 1; 6 pending | deferred |
-| `ReviewFixAttempt` | status read | adapter deferred | deferred |
+| `PlanningRun` | reserve, status/bounded read, cleanup, outcome | scenarios 1–6, every variant | shared `report` handler |
+| `ImplementationRun` | reserve, status/bounded read, cleanup, outcome | scenarios 1–6, every variant | shared `report` handler |
+| `KgRefresh` | bounded read | [scenarios 1 and 6](../src/__tests__/restate/kg-refresh-workflow.restate.test.ts), every variant | shared `report` handler |
+| `ReviewFixAttempt` | status read | scenario 6, every variant; 1–5 deferred to AII-1627 | shared `result` handler |
 | Test fixture | lifecycle and `acceptOwnedRunReport` (`record-usage`) | scenarios 1–6, every variant | exercised |
 
-The kit is `src/restate/owned-run-lifecycle.ts`; the shared suite is `src/__tests__/restate/owned-run-contract.ts`. Result intake has no production callers yet (ADR 036).
+The kit is `src/restate/owned-run-lifecycle.ts`; the shared suite is `src/__tests__/restate/owned-run-contract.ts`. All four runner workflows call `acceptOwnedRunReport` from their shared result handler, recording usage in `record-usage` before resolving the report promise (ADR 036). The authenticated callback checks the token without consuming it and forwards sanitized usage with a dispatch-scoped idempotency key; it does not write usage for Restate-owned runs. KgRefresh excludes scenarios 2–5 for the lifecycle reasons documented in ADR 036.
+
+Every owned-run result uses the authenticated dispatch id as its forwarding idempotency key, including ReviewFixAttempt. Identical retries reuse the cached acknowledgement, including after admission release. The review-fix client compares the returned result fingerprint with the forwarded metadata and usage, detecting changed bodies even when ingress returns a cached acknowledgement. On a mismatch it awaits a fresh, unkeyed result invocation so the owning workflow persists metadata conflicts and revokes approval authority before the callback returns 409; a transport failure remains retryable.
 
 ## 2. Feature matrix
 
@@ -76,7 +78,7 @@ The kit is `src/restate/owned-run-lifecycle.ts`; the shared suite is `src/__test
 | `TerminalError` with `errorCode` | yes: 404 and 409 (AII-975) | no | no | |
 | Invocation cancellation (`ctx.cancel`, admin cancel) | no (own `cancel` promise) | no (own `cancel` promise) | no | § 5.1 |
 | `ctx.attach` / `/restate/attach` | tests only | no | no | |
-| Ingress `idempotency-key` | yes: runner report (dispatch id), webhook enqueue (delivery id) | yes: webhook delivery id, attempt result key (`<attemptId>.result.<body hash>`), cancel keys (`<attemptId>.closed`, `<attemptId>.cancel`), drain nudge (`<queue id>.<event id>.<30 s bucket>`) | when the caller supplies one | |
+| Ingress `idempotency-key` | yes: runner report (dispatch id), webhook enqueue (delivery id) | yes: webhook delivery id, attempt result key (dispatch id), cancel keys (`<attemptId>.closed`, `<attemptId>.cancel`), drain nudge (`<queue id>.<event id>.<30 s bucket>`) | when the caller supplies one | |
 | SDK ingress client (`@restatedev/restate-sdk-clients`) | yes: `createKgRefreshIngressClient` (AII-975) | no | no | |
 | Service options: `workflowRetention`, `journalRetention` | yes | yes | no | |
 | Service options: `idempotencyRetention` | on `report`, `cancel` | on `result`, `cancel` | no | KG `status` and `progress` carry no retention (AII-973) |

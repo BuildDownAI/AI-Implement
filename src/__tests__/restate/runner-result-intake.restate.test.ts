@@ -17,7 +17,7 @@ import { createReviewFixAttempt, type ReviewFixAttemptDependencies } from "../..
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "../../restate/planning-run-client.js";
 import { createImplementationAdmissionTerminationHook, createImplementationRunIngressClient } from "../../restate/implementation-run-client.js";
 import { createKgRefreshIngressClient } from "../../restate/kg-refresh-production.js";
-import { createReviewFixIngressClient, reviewFixResultForwardKey, reviewFixResultIntakeFromForward } from "../../restate/review-fix-client.js";
+import { createReviewFixIngressClient, reviewFixResultIntakeFromForward } from "../../restate/review-fix-client.js";
 import { orchestratorTools } from "../../restate/tools.js";
 import { JobAccountingPageSchema } from "../../job-accounting.js";
 import { makeReviewFixResult } from "../helpers/builders.js";
@@ -178,9 +178,10 @@ describe("runner result to workflow accounting", () => {
           checkPlanningAdmissionTermination: createPlanningAdmissionTerminationHook({ ingress: planning, legacy: async () => {}, readAdmission: read }),
           checkImplementationAdmissionTermination: createImplementationAdmissionTerminationHook({ ingress: implementation, legacy: async () => {}, readAdmission: read }),
           kgRefreshClient: kg,
-          onReviewFixResult: async (result) => {
+          onReviewFixResult: async (result, opts) => {
+            expect(opts.idempotencyKey).toBe(dispatchId);
             const outcome = reviewFixResultIntakeFromForward(result.attemptId,
-              await review.result(result.attemptId, result, { idempotencyKey: reviewFixResultForwardKey(result) }));
+              await review.result(result.attemptId, result, opts));
             if (!outcome) throw new ReviewFixIntakeUnavailableError();
             return outcome;
           },
@@ -212,6 +213,17 @@ describe("runner result to workflow accounting", () => {
         expect(getDb().prepare("SELECT * FROM model_invocation_attribution WHERE dispatch_id = ?").all(dispatchId)).toEqual(beforeConflict);
         calls[0].attribution.usage.tokensIn = 10;
         expect((await post()).status).toBe(200);
+        if (kind === "review-fix") {
+          const beforeRelease = getDb().prepare("SELECT * FROM model_invocation_attribution WHERE dispatch_id = ?").all(dispatchId);
+          expect(beforeRelease).toHaveLength(2);
+          expect(await store.releaseOwner(dispatchId, "finalized")).toEqual({ status: "released" });
+          expect(read(dispatchId)?.releasedAt).toEqual(expect.any(Number));
+          // Keep the production forwarding key: a retry after release may be
+          // answered by transport idempotency without re-entering the handler.
+          const retried = await post();
+          expect(retried.ok, await retried.text()).toBe(true);
+          expect(getDb().prepare("SELECT * FROM model_invocation_attribution WHERE dispatch_id = ?").all(dispatchId)).toEqual(beforeRelease);
+        }
         const rows = getDb().prepare("SELECT invocation_id FROM model_invocation_attribution WHERE dispatch_id = ?").all(dispatchId);
         expect(rows).toHaveLength(2);
         // Lifecycle work is parked above; project a finished job before querying

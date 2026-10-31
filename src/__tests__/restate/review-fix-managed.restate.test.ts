@@ -30,7 +30,7 @@ import { buildPublicationCycleSummary, readCycleSummaries, writeCycleSummary } f
 import { DISPOSITIONS_FILE, readFindingDispositions } from "../../pipeline/finding-dispositions.js";
 import { handleRunnerCycleSummary, handleRunnerResult, ReviewFixIntakeUnavailableError } from "../../runner-callback.js";
 import type { ResultIntakeOutcome, ReviewFixResultMetadataV1, ScopedPrIdentity } from "../../review-fix-contract.js";
-import { createReviewFixIngressClient, reviewFixResultForwardKey, reviewFixResultIntakeFromForward } from "../../restate/review-fix-client.js";
+import { createReviewFixIngressClient, reviewFixResultIntakeFromForward } from "../../restate/review-fix-client.js";
 import type { ReviewFixAttemptCompletion } from "../../restate/review-fix-attempt.js";
 import { makeAppConfig, makeChatGptPlanRecord, makeMapping, makeRegistry, makeReviewFixResult, makeScopedPrIdentity } from "../helpers/builders.js";
 import { testDir } from "../helpers/test-dir.js";
@@ -203,8 +203,8 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
       authorization: `Bearer ${resultToken}`, secret: SECRET,
       body: { phase: "gap-analysis", outcome: "success", comments: [], reviewFix: result },
       resolveProvider: async () => null,
-      onReviewFixResult: async (validated): Promise<ResultIntakeOutcome> => {
-        const out = await ingress.result(validated.attemptId, validated, { idempotencyKey: reviewFixResultForwardKey(validated) });
+      onReviewFixResult: async (validated, opts): Promise<ResultIntakeOutcome> => {
+        const out = await ingress.result(validated.attemptId, validated, opts);
         const outcome = reviewFixResultIntakeFromForward(validated.attemptId, out);
         if (!outcome) throw new ReviewFixIntakeUnavailableError();
         return outcome;

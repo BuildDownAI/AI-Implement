@@ -230,7 +230,8 @@ export interface HandleRunnerResultInput {
    * `handleRunnerResult`'s reviewFix branch, which returns directly. An absent
    * seam fails closed: a pilot result cannot be acknowledged without storage.
    */
-  onReviewFixResult?: (result: ReviewFixResultMetadataV1 & { usage?: RecordedUsage }) => ResultIntakeOutcome | Promise<ResultIntakeOutcome>;
+  // Forwarding keys come from authenticated claims, never from result metadata.
+  onReviewFixResult?: (result: ReviewFixResultMetadataV1 & { usage?: RecordedUsage }, opts: { idempotencyKey: string }) => ResultIntakeOutcome | Promise<ResultIntakeOutcome>;
   /**
    * Ingress client for the `KgRefresh` workflow. The kg-refresh result branch is
    * verify-only and hands the report here (AII-899). Absent → 503 so the runner retries.
@@ -815,7 +816,7 @@ async function handleRunnerResultInternal(
     }
     let outcome: ResultIntakeOutcome;
     try {
-      outcome = await input.onReviewFixResult({ ...validated.value, usage: toRecordedUsage(body) });
+      outcome = await input.onReviewFixResult({ ...validated.value, usage: toRecordedUsage(body) }, { idempotencyKey: authenticated.claims.dispatchId });
     } catch (e) {
       console.warn(`[runner-callback] forward failed kind=review-fix dispatch=${authenticated.claims.dispatchId}`);
       if (e instanceof ReviewFixIntakeUnavailableError) return bad(503, "reviewfix_result_intake_unavailable");

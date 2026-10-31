@@ -26,6 +26,7 @@ import {
 import { awaitOwnedRun } from "./owned-run-wait.js";
 import { recordUsage, type RecordedUsage } from "../agent-usage.js";
 import { acceptedReviewFixDispatchId } from "../review-fix-attempt-store.js";
+import { ownedRunReportFingerprint } from "./owned-run-report-fingerprint.js";
 import { acceptOwnedRunReport, readOwnedRunStatus } from "./owned-run-lifecycle.js";
 import { reviewFixPRKey } from "./review-fix-pr.js";
 import { restateRetentionMs } from "./retention.js";
@@ -315,7 +316,7 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
     return completion;
   }
 
-  async function result(ctx: WorkflowSharedContext, raw: ReviewFixResultMetadataV1 & { usage?: RecordedUsage }): Promise<ResultIntakeOutcome> {
+  async function result(ctx: WorkflowSharedContext, raw: ReviewFixResultMetadataV1 & { usage?: RecordedUsage }): Promise<ResultIntakeOutcome & { fingerprint: string }> {
     const checked = validateReviewFixResultMetadata(raw);
     // Validator details can contain an attacker-supplied field value. Keep the
     // journal-visible error generic; authenticated callback logs can use a
@@ -350,7 +351,7 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
       // durable state beyond the alert itself, which is the only required signal.
       await alert(ctx, attemptId, `stale result rejected: ${outcome.reason}`, "alert-stale-result");
     }
-    return outcome;
+    return { ...outcome, fingerprint: ownedRunReportFingerprint(raw) };
   }
 
   async function cancel(ctx: WorkflowSharedContext, raw: { attemptId: string }): Promise<void> {
