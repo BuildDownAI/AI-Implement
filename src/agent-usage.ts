@@ -384,6 +384,35 @@ export function toRecordedUsage(body: {
   };
 }
 
+/** KG dispatches deliberately have no managed configuration. Keep reported calls without
+ * treating runner-supplied profile or snapshot identifiers as verified configuration. */
+function recordUnconfiguredKgUsage(dispatchId: string, usage: RecordedUsage): void {
+  const store = (claim: InvocationAttributionV1, record?: InvocationRecordV1, timedOut = false): void => {
+    const u = claim.usage;
+    recordInvocationAttribution(dispatchId, {
+      snapshotId: null, configRevisions: null,
+      // Reserved placeholders for the non-null legacy schema fields; no account is attributed.
+      profileId: "unconfigured", profileRevision: 1, authMode: "unknown",
+      invocationId: claim.invocationId, stage: claim.stage,
+      agent: claim.agent, provider: claim.provider, model: claim.model,
+      limit: claim.limit, outcome: claim.outcome,
+      usage: {
+        availability: availabilityOf(u?.tokensIn ?? null, u?.tokensOut ?? null),
+        tokensIn: u?.tokensIn ?? null, tokensOut: u?.tokensOut ?? null,
+        costUsd: u?.costUsd ?? null, costStatus: u?.costUsd == null ? "unavailable" : "reported",
+        cacheReadTokens: record?.cacheReadTokens ?? null,
+        cacheCreationTokens: record?.cacheCreationTokens ?? null,
+      },
+      attempts: record?.attempts ?? 1, attribution: "absent", mismatches: [],
+    }, { timedOut });
+  };
+  for (const record of usage.records) {
+    if (record.attribution.invocationId !== usage.attribution?.invocationId) store(record.attribution, record);
+  }
+  if (usage.attribution) store(usage.attribution,
+    usage.records.find((r) => r.attribution.invocationId === usage.attribution!.invocationId), usage.timedOut);
+}
+
 /** Writes are replay-safe. Acceptance policy comes from trusted dispatch ownership, never the payload. */
 export function recordUsage(dispatchId: string, usage: RecordedUsage): number {
   if (usage.pushedCommits) recordPushedCommits(dispatchId, usage.pushedCommits);
@@ -392,6 +421,14 @@ export function recordUsage(dispatchId: string, usage: RecordedUsage): number {
     // Managed review-fix attempts have their own durable identity, even after admission release.
     const managed = getDb().prepare("SELECT 1 FROM review_fix_attempts WHERE dispatch_id = ?").get(dispatchId) !== undefined;
     const snapshot = loadStoredSnapshot(dispatchId);
+    if (!snapshot && !managed
+      && getDb().prepare(`SELECT 1 FROM dispatch_log WHERE dispatch_id = ? AND phase = 'kg-refresh'
+        AND NOT EXISTS (SELECT 1 FROM run_agent_config_snapshots WHERE dispatch_id = ?)`)
+        .get(dispatchId, dispatchId)) {
+      recordUnconfiguredKgUsage(dispatchId, usage);
+      if (usage.listWhole) recordInvocationsComplete(dispatchId);
+      return 0;
+    }
     if (!snapshot) {
       if (managed) console.warn("[runner-callback] Dropped 1 managed attribution record(s) not matching accepted snapshot");
       return 1;

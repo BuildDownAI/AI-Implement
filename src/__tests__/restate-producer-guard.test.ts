@@ -64,15 +64,15 @@ describe("restate producer guard (ADR 034 rule 4)", () => {
       'const a = ctx.promise<boolean>("alpha");',
       'const a2 = ctx.promise<boolean>("alpha");',
       'const b = ctx.promise("beta");',
-      'await acceptOwnedRunReport(ctx, "alpha", {});',
-      'await acceptOwnedRunReport(ctx, "report", {});',
+      'acceptOwnedRunReport(ctx, "gamma", { ok: true });',
+      'acceptOwnedRunReport(ctx, "alpha", { ok: true });',
       'objectSendClient({ name: "Other" });',
     ].join("\n");
     const title = ["contract:", "Demo.alpha — covered"].join(" ");
     const titleSource = `it("${title}", () => {});`;
     expect(findMissingContracts("x.ts", src, findContractTitles(titleSource))).toEqual([
       'x.ts: Demo.beta has no "contract: Demo.beta" test',
-      'x.ts: Demo.report has no "contract: Demo.report" test',
+      'x.ts: Demo.gamma has no "contract: Demo.gamma" test',
     ]);
   });
 });
