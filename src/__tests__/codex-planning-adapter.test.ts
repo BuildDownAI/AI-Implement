@@ -206,7 +206,71 @@ const completeTurn = (s: FakeServer): void => {
   s.send(completed());
 };
 
+// Captured from codex-cli 0.159.2 in the pinned-binary planning run below
+// against its synthetic loopback provider; only thread/turn identifiers are sanitized.
+const capturedTokenUsage = {
+  "method": "thread/tokenUsage/updated",
+  "params": {
+    "threadId": "th1",
+    "turnId": "tu1",
+    "tokenUsage": {
+      "total": {
+        "totalTokens": 49,
+        "inputTokens": 35,
+        "cachedInputTokens": 0,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 14,
+        "reasoningOutputTokens": 0
+      },
+      "last": {
+        "totalTokens": 7,
+        "inputTokens": 5,
+        "cachedInputTokens": 0,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 2,
+        "reasoningOutputTokens": 0
+      },
+      "modelContextWindow": 258400
+    }
+  },
+  "emittedAtMs": 1793483083761
+};
+
 describe("planning protocol driver", () => {
+  for (const [policy, driver] of [["planning", createCodexPlanningDriver], ["review", createCodexReviewDriver]] as const) {
+    it(`${policy}: preserves inclusive input and replaces cumulative cached usage`, async () => {
+      const server = new FakeServer((m, s) => {
+        if (handshake(m, s)) return;
+        if (m.method === "turn/start") {
+          ack(m, s);
+          s.send(capturedTokenUsage);
+          const total = { ...capturedTokenUsage.params.tokenUsage.total, inputTokens: 100, cachedInputTokens: 80, outputTokens: 7, totalTokens: 107 };
+          const note = { ...capturedTokenUsage, params: bound({ tokenUsage: { ...capturedTokenUsage.params.tokenUsage, total } }) };
+          s.send(note);
+          s.send(note);
+          s.send(completed());
+        }
+      });
+      const out = await drive(server, undefined, undefined, undefined, driver());
+      expect(out.result.telemetry).toMatchObject({ tokensIn: 100, cacheReadTokens: 80, tokensOut: 7, cacheCreationTokens: null });
+      expect(out.result.tokensUsed).toBe(107);
+    });
+
+    it.each([undefined, null, "80", -1, NaN, Infinity, 0])(`${policy}: validates cached count %s`, async (cached) => {
+      const server = new FakeServer((m, s) => {
+        if (handshake(m, s)) return;
+        if (m.method === "turn/start") {
+          ack(m, s);
+          s.send(tokens(100, 7, { tokenUsage: { total: { inputTokens: 100, outputTokens: 7, ...(cached === undefined ? {} : { cachedInputTokens: cached }) } } }));
+          s.send(completed());
+        }
+      });
+      const out = await drive(server, undefined, undefined, undefined, driver());
+      expect(out.result.telemetry?.cacheReadTokens).toBe(cached === 0 ? 0 : null);
+      expect(out.result.telemetry).toMatchObject({ tokensIn: 100, tokensOut: 7 });
+    });
+  }
+
   it("omits ephemeral for the ChatGPT plan provider so the thread can resume", async () => {
     const server = new FakeServer((m, s) => {
       if (handshake(m, s)) return;
@@ -225,7 +289,7 @@ describe("planning protocol driver", () => {
       if (handshake(m, s)) return;
       if (m.method === "turn/start") {
         ack(m, s);
-        s.send(tokens(4, 2));
+        s.send(tokens(4, 2, { tokenUsage: { total: { inputTokens: 4, cachedInputTokens: 3, outputTokens: 2 } } }));
         s.send(completed({ status: "failed", error: { message: "unauthorized", codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 401 } } } }));
       }
     });
@@ -233,6 +297,7 @@ describe("planning protocol driver", () => {
     expect(out.tokenExpired).toBe(true);
     expect(out.threadId).toBe("th1");
     expect(out.result.telemetry?.tokensIn).toBe(4);
+    expect(out.result.telemetry?.cacheReadTokens).toBe(3);
     expect(out.result.tokensUsed).toBe(6);
   });
 
