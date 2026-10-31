@@ -16,7 +16,7 @@ export function findPromisePairs(source: string): string[] {
   if (!workflow) return [];
   const names = [
     ...source.matchAll(/ctx\.promise(?:<[^>]*>)?\(\s*"([^"]+)"\s*\)/g),
-    ...source.matchAll(/acceptOwnedRunReport(?:<[^>]*>)?\(\s*ctx\s*,\s*"([^"]+)"/g),
+    ...source.matchAll(/acceptOwnedRunReport\(\s*ctx\s*,\s*"([^"]+)"/g),
   ].map((m) => m[1]);
   return [...new Set(names)].map((name) => `${workflow}.${name}`);
 }
